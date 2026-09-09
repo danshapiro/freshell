@@ -10,6 +10,7 @@ import { WS_PROTOCOL_VERSION } from '@shared/ws-version'
 import type { ReadyCapabilities, ServerMessage, SessionLocator } from '@shared/ws-protocol'
 import type { TerminalInterestSnapshot } from '@/lib/terminal-interest'
 import { createLogger } from '@/lib/client-logger'
+import { getTerminalCreateStagger, type TerminalCreateStagger } from '@/lib/terminal-create-stagger'
 
 const log = createLogger('WsClient')
 
@@ -114,6 +115,11 @@ function isCreateMessage(msg: unknown): msg is CreateClientMessage {
     && candidate.requestId.length > 0
 }
 
+function isTerminalCreateMessage(msg: unknown): boolean {
+  if (!msg || typeof msg !== 'object') return false
+  return (msg as { type?: unknown }).type === 'terminal.create'
+}
+
 function isTerminalAttachMessage(msg: unknown): msg is TerminalAttachClientMessage {
   if (!msg || typeof msg !== 'object') return false
   const candidate = msg as { type?: unknown; terminalId?: unknown }
@@ -166,6 +172,7 @@ export class WsClient {
   // socket; reset on disconnect so a downgraded server is honored.
   private serverCapabilities: NonNullable<ReadyCapabilities> = {}
   private terminalInterestRevision = 0
+  private terminalCreateStagger: TerminalCreateStagger = getTerminalCreateStagger()
 
   // Bumped for every new WebSocket; each socket's handlers capture their
   // generation and no-op once superseded (a late event from an abandoned socket
@@ -207,7 +214,7 @@ export class WsClient {
       if (pendingSet.has(requestId)) continue
       this.heldCreates.delete(requestId)
       if (!this.inFlightCreates.has(requestId)) continue
-      this.sendNow(msg)
+      this.sendCreateNow(msg)
     }
   }
 
@@ -228,7 +235,7 @@ export class WsClient {
     for (const [requestId, msg] of held.entries()) {
       if (!this.inFlightCreates.has(requestId)) continue
       if (this._state === 'ready' && this.ws?.readyState === WebSocket.OPEN) {
-        this.sendNow(msg)
+        this.sendCreateNow(msg)
       } else {
         // Socket gone mid-flush: re-enter the normal pre-ready path so the
         // create is delivered exactly once on the next connection.
@@ -261,6 +268,7 @@ export class WsClient {
     this.lastInboundAt = Date.now()
     this.probeSentAt = null
     if (msg.type === 'ready') {
+      this.terminalCreateStagger.clear()
       this._serverInstanceId = typeof msg.serverInstanceId === 'string' && msg.serverInstanceId.trim()
         ? msg.serverInstanceId
         : undefined
@@ -317,7 +325,7 @@ export class WsClient {
       } else {
         for (const [requestId, createMsg] of this.preReadyCreateQueue.entries()) {
           if (!this.inFlightCreates.has(requestId)) continue
-          this.sendNow(createMsg)
+          this.sendCreateNow(createMsg)
           createRequestIdsFlushed.add(requestId)
         }
       }
@@ -353,7 +361,7 @@ export class WsClient {
             entry.lastResendEpoch = this.reconnectEpoch
             continue
           }
-          this.sendNow(entry.message)
+          this.sendCreateNow(entry.message)
           entry.lastResendEpoch = this.reconnectEpoch
         }
       }
@@ -551,6 +559,7 @@ export class WsClient {
         if (gen !== this.socketGen || this.ws !== socket) return
         this.clearReadyTimeout()
         this.clearLivenessWatch()
+        this.terminalCreateStagger.clear()
         const wasReady = this._state === 'ready'
         const closedBeforeReady = !wasReady
         this._state = 'disconnected'
@@ -631,6 +640,7 @@ export class WsClient {
 
       this.ws.onerror = () => {
         if (gen !== this.socketGen || this.ws !== socket) return
+        this.terminalCreateStagger.clear()
         // onclose will fire with details; if still connecting, reject quickly.
         if (this._state === 'connecting') {
           finishReject(new Error('WebSocket error'))
@@ -691,6 +701,7 @@ export class WsClient {
     this.clearReconnectTimer()
     this.clearReadyTimeout()
     this.clearLivenessWatch()
+    this.terminalCreateStagger.clear()
     // Bump the generation so a torn-down socket's late events are inert.
     this.socketGen += 1
     this.ws?.close()
@@ -770,6 +781,7 @@ export class WsClient {
     this.ws = null
     this._state = 'disconnected'
     this.serverCapabilities = {}
+    this.terminalCreateStagger.clear()
     this.resetReconcileHold({ requeueHeld: true })
     this.clearLivenessWatch()
     // A normal close notifies disconnectHandlers (App flips Redux
@@ -849,7 +861,7 @@ export class WsClient {
         this.heldCreates.set(msg.requestId, msg)
         return
       }
-      this.sendNow(msg)
+      this.sendCreateNow(msg)
       return
     }
 
@@ -941,6 +953,18 @@ export class WsClient {
 
   receiveMessageForTest(msg: ServerMessage): void {
     this.handleIncomingMessage(msg)
+  }
+
+  private sendCreateNow(msg: unknown) {
+    if (!isTerminalCreateMessage(msg)) {
+      this.sendNow(msg)
+      return
+    }
+    const requestId = (msg as { requestId?: string }).requestId
+    this.terminalCreateStagger.enqueue(() => {
+      if (requestId && !this.inFlightCreates.has(requestId)) return
+      this.sendNow(msg)
+    })
   }
 
   private sendNow(msg: unknown) {

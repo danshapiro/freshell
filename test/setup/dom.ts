@@ -3,6 +3,7 @@ import { afterEach, beforeEach, vi } from 'vitest'
 import { enableMapSet } from 'immer'
 import { resetWsClientForTests } from '@/lib/ws-client'
 import { resetTerminalReleaseMarks } from '@/lib/terminal-release-marks'
+import { resetTerminalCreateStaggerForTests } from '@/lib/terminal-create-stagger'
 
 enableMapSet()
 
@@ -125,6 +126,7 @@ beforeEach(() => {
 afterEach(() => {
   resetWsClientForTests()
   resetTerminalReleaseMarks()
+  resetTerminalCreateStaggerForTests()
   errorSpy?.mockRestore()
   errorSpy = null
 

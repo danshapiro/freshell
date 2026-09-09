@@ -56,6 +56,7 @@ export interface FreshellTestHarness {
   unregisterTerminalBuffer: (terminalId: string) => void
   getPerfAuditSnapshot: () => PerfAuditSnapshot | null
   getSentWsMessages?: () => unknown[]
+  getSentWsMessagesWithTimestamps?: () => Array<{ __sentAt?: number; type?: string; requestId?: string }>
   clearSentWsMessages?: () => void
   recordSentWsMessage?: (msg: unknown) => void
   recordTerminalWrite?: (event: TerminalWriteEvent) => void
@@ -115,8 +116,11 @@ export function installTestHarness(
   let terminalWriteEventBytes = 0
   const recordSentWsMessage = (msg: unknown) => {
     try {
-      sentWsMessages.push(JSON.parse(JSON.stringify(msg)))
+      const copy = JSON.parse(JSON.stringify(msg))
+      ;(copy as { __sentAt?: number }).__sentAt = Date.now()
+      sentWsMessages.push(copy)
     } catch {
+      ;(msg as { __sentAt?: number }).__sentAt = Date.now()
       sentWsMessages.push(msg)
     }
     if (sentWsMessages.length > 500) sentWsMessages.shift()
@@ -187,7 +191,11 @@ export function installTestHarness(
       terminalModes.delete(terminalId)
     },
     getPerfAuditSnapshot: resolvedGetPerfAuditSnapshot,
-    getSentWsMessages: () => [...sentWsMessages],
+    getSentWsMessages: () => sentWsMessages.map((msg) => {
+      const { __sentAt, ...rest } = msg as { __sentAt?: number }
+      return rest
+    }),
+    getSentWsMessagesWithTimestamps: () => [...sentWsMessages] as Array<{ __sentAt?: number; type?: string; requestId?: string }>,
     clearSentWsMessages: () => {
       sentWsMessages.length = 0
     },
