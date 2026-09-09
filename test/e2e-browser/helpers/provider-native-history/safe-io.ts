@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto'
 import fs from 'node:fs'
 import path from 'node:path'
 
@@ -89,18 +90,60 @@ export function readBoundedRegularFile(filePath: string, label: string): Buffer 
   }
 }
 
-export function readBoundedJsonl(filePath: string, label: string): Record<string, any>[] {
+export type PositionedJsonlRecord = {
+  value: Record<string, any>
+  recordIndex: number
+  byteStart: number
+  byteEnd: number
+  recordSha256: string
+  prefixSha256Before: string
+}
+
+/**
+ * Parse bounded JSONL while retaining the provider's actual append position.
+ * The evidence describes persisted bytes; it does not synthesize message IDs.
+ */
+export function readBoundedJsonlWithPositions(filePath: string, label: string): PositionedJsonlRecord[] {
   const bytes = readBoundedRegularFile(filePath, label)
-  const lines = bytes.toString('utf8').split(/\r?\n/).filter((line) => line.trim())
-  if (lines.length > MAX_JSONL_LINES) throw new Error(`${label} exceeds the row bound`)
-  return lines.map((line, index) => {
-    if (Buffer.byteLength(line, 'utf8') > MAX_JSONL_LINE_BYTES) throw new Error(`${label} line ${index + 1} exceeds the line bound`)
-    try {
-      const parsed = JSON.parse(line)
-      if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw new Error('row is not an object')
-      return parsed
-    } catch (error) {
-      throw new Error(`${label} line ${index + 1} is not valid JSON: ${String(error)}`)
+  const records: PositionedJsonlRecord[] = []
+  const prefix = createHash('sha256')
+  let start = 0
+  let physicalLine = 0
+  while (start <= bytes.length) {
+    const newline = bytes.indexOf(0x0a, start)
+    const end = newline === -1 ? bytes.length : newline
+    const raw = bytes.subarray(start, end)
+    physicalLine += 1
+    const prefixSha256Before = prefix.copy().digest('hex')
+    if (raw.toString('utf8').trim()) {
+      if (raw.length > MAX_JSONL_LINE_BYTES) throw new Error(`${label} line ${physicalLine} exceeds the line bound`)
+      if (records.length >= MAX_JSONL_LINES) throw new Error(`${label} exceeds the row bound`)
+      let parsed: unknown
+      try {
+        parsed = JSON.parse(raw.toString('utf8'))
+      } catch {
+        throw new Error(`${label} line ${physicalLine} is not valid JSON`)
+      }
+      if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+        throw new Error(`${label} line ${physicalLine} is not a JSON object`)
+      }
+      records.push({
+        value: parsed as Record<string, any>,
+        recordIndex: records.length,
+        byteStart: start,
+        byteEnd: end,
+        recordSha256: createHash('sha256').update(raw).digest('hex'),
+        prefixSha256Before,
+      })
     }
-  })
+    prefix.update(raw)
+    if (newline === -1) break
+    prefix.update(Buffer.from([0x0a]))
+    start = newline + 1
+  }
+  return records
+}
+
+export function readBoundedJsonl(filePath: string, label: string): Record<string, any>[] {
+  return readBoundedJsonlWithPositions(filePath, label).map((record) => record.value)
 }

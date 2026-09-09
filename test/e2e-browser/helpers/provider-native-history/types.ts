@@ -9,10 +9,32 @@ export type NativeToolCall = {
   name?: string
 }
 
-export type NativeAssistantTurn = {
+export type IdentifiedMessageEvidence = {
+  kind: 'identified_message'
   turnId: string
   messageId: string
   parentMessageId: string | null
+}
+
+export type AppendOnlyRecordEvidence = {
+  kind: 'append_only_record'
+  recordIndex: number
+  byteStart: number
+  byteEnd: number
+  recordSha256: string
+  prefixSha256Before: string
+  completionEventOrdinal: number
+  completionEventSha256: string
+}
+
+export type NativeTurnEvidence = IdentifiedMessageEvidence | AppendOnlyRecordEvidence
+
+export type NativeAssistantTurn = {
+  nativeEvidence: NativeTurnEvidence
+  /** Convenience mirrors for providers that actually expose identifiers. */
+  turnId?: string
+  messageId?: string
+  parentMessageId?: string | null
   completedAt: string | number
   text: string
   toolCalls: NativeToolCall[]

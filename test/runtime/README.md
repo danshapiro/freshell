@@ -106,15 +106,22 @@ Provider qualification receipts use schema v2. A v2 receipt names its exact
 provider version/model/reasoning-effort/native-session identity observed by the
 live browser run. Every real-provider row also carries exactly three ordered
 provider-native turn proofs (`initial`, `after_session_host_crash`, and
-`after_provider_process_crash`). Each proof binds the exact native session,
-distinct native turn/message ids, parent id when the native format has one,
-completion time, native provider/model/effort plus field-level provenance,
-zero tool calls, nonce containment, and a SHA-256 response digest. Retained
-evidence contains neither prompt/response text nor the nonce; only the nonce
-digest is retained. Flat-file stores are read only after the provider is
+`after_provider_process_crash`). The semantic contract is common: exact native
+session, a new completed native assistant response, native
+provider/model/effort provenance, zero tool calls, nonce containment, and a
+SHA-256 response digest. The evidence authority is deliberately provider
+specific. Claude, Codex, and OpenCode expose stable native turn/message
+identifiers, so their proofs require distinct identified-message evidence.
+Amplifier's pinned native store does not promise those identifiers, so its
+proofs instead require strictly increasing append-only transcript byte/record
+positions plus exact record and persisted-completion-event digests. Freshell
+never fabricates a provider identifier merely to fit a certificate schema.
+Retained evidence contains neither prompt/response text nor the nonce; only the
+nonce digest is retained. Flat-file stores are read only after the provider is
 stopped; OpenCode uses a query-only SQLite snapshot. Readers are bounded and
 reject malformed schemas, ambiguous exact-session matches, symlinks, unsafe
-paths, and incomplete responses instead of manufacturing a pass.
+paths, incomplete responses, or ambiguous concurrent append order instead of
+manufacturing a pass.
 
 Its assertion, broker, and cleanup artifact references each
 carry a SHA-256 digest. Certification resolves those references only inside
