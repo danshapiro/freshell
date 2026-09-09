@@ -4222,6 +4222,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
             ? msg.streamId
             : null
           const previousStreamId = getTerminalCheckpointStreamId()
+          if (msg.reason === 'new_pty_session' && nextStreamId === previousStreamId) return
           const activeAttach = currentAttachRef.current
           if (activeAttach?.terminalId === tid && activeAttach.requestId === msg.attachRequestId) {
             currentAttachRef.current = {
@@ -4236,6 +4237,17 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
             }
           } else if (previousStreamId) {
             updateContent({ streamId: undefined })
+          }
+          if (msg.reason === 'new_pty_session' && nextStreamId && previousStreamId !== nextStreamId) {
+            // Physical recovery starts a new host sequence domain. Reuse the
+            // full-hydration handshake: it retires queued parser writes by
+            // attach generation and prevents late old-epoch frames from
+            // poisoning the replacement's cursor. This never creates a PTY.
+            clearTerminalCursor(tid)
+            if (contentRef.current) contentRef.current = { ...contentRef.current, streamId: nextStreamId }
+            attachTerminal(tid, 'viewport_hydrate', {
+              sinceSeq: 0, clearViewportFirst: true, skipPreAttachFit: true,
+            })
           }
         }
 

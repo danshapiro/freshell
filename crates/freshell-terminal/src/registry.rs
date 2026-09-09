@@ -46,14 +46,14 @@ use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::future::Future;
 use std::io;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use freshell_platform::SpawnSpec;
 use freshell_protocol::{
     GeometryAuthority, InventoryTerminal, OutputSource, ServerMessage, SessionLocator,
     TerminalAttachIntent, TerminalAttachReady, TerminalExit, TerminalModesSync, TerminalOutput,
-    TerminalRunStatus,
+    TerminalRunStatus, TerminalStreamChanged, TerminalStreamChangedReason,
 };
 
 use crate::barrier_scanner::{BarrierReason, BarrierScanner, ScannerState};
@@ -408,6 +408,10 @@ pub struct ManagedOutputChunk {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ManagedOutputRead {
+    /// The session host's durable output epoch, not the web's launch-time ID.
+    /// None denotes a coalesced/in-flight read with no source observation.
+    pub stream_epoch: Option<String>,
+    pub incarnation_id: Option<String>,
     pub reset_required: bool,
     pub truncated: bool,
     pub retained_from_seq: i64,
@@ -461,6 +465,24 @@ struct TerminalHandle {
     shared: Arc<Mutex<TerminalShared>>,
     pty: Option<PtyTerminal>,
     managed: Option<ManagedTerminalDescriptor>,
+    managed_read_in_flight: Arc<AtomicBool>,
+}
+
+/// A nonblocking per-facade claim. Coalescing refreshes prevents a slow old
+/// epoch read from applying after a new epoch. Drop also releases the claim
+/// when a websocket timeout cancels the RPC; no executor dependency is needed.
+struct ManagedReadClaim(Arc<AtomicBool>);
+impl ManagedReadClaim {
+    fn acquire(flag: Arc<AtomicBool>) -> Option<Self> {
+        flag.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .ok()
+            .map(|_| Self(flag))
+    }
+}
+impl Drop for ManagedReadClaim {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
 }
 
 /// Registration options for a terminal record with NO backing PTY.
@@ -1253,6 +1275,7 @@ impl TerminalRegistry {
                 shared,
                 pty: Some(pty),
                 managed: None,
+                managed_read_in_flight: Arc::new(AtomicBool::new(false)),
             },
         );
         inner.revision += 1;
@@ -2228,6 +2251,7 @@ impl TerminalRegistry {
                 shared,
                 pty: None,
                 managed: Some(descriptor),
+                managed_read_in_flight: Arc::new(AtomicBool::new(false)),
             },
         );
         inner.revision += 1;
@@ -2356,9 +2380,38 @@ impl TerminalRegistry {
         terminal_id: &str,
         max_bytes: u64,
     ) -> Result<ManagedOutputRead, String> {
+        let (terminal, flag) = {
+            let inner = self.inner.lock().expect("registry lock");
+            let handle = inner
+                .terminals
+                .get(terminal_id)
+                .ok_or_else(|| "managed terminal not found".to_string())?;
+            (
+                handle
+                    .managed
+                    .clone()
+                    .ok_or_else(|| "terminal is not managed".to_string())?,
+                Arc::clone(&handle.managed_read_in_flight),
+            )
+        };
+        let Some(claim) = ManagedReadClaim::acquire(flag) else {
+            return Ok(ManagedOutputRead {
+                stream_epoch: None,
+                incarnation_id: None,
+                reset_required: false,
+                truncated: false,
+                retained_from_seq: self.managed_output_cursor(terminal_id).unwrap_or(0),
+                head_seq: self.managed_output_cursor(terminal_id).unwrap_or(0),
+                exit_code: None,
+                native_session_id: terminal.resume_session_id,
+                chunks: Vec::new(),
+            });
+        };
+        // The previous claimant may have completed after our first snapshot
+        // but before acquisition. Read the descriptor only under our claim.
         let terminal = self
             .managed_descriptor(terminal_id)
-            .ok_or_else(|| "managed terminal not found".to_string())?;
+            .ok_or_else(|| "managed terminal disappeared before read".to_string())?;
         let after_seq = self.managed_output_cursor(terminal_id).unwrap_or(0);
         let controller = self
             .managed_controller
@@ -2369,20 +2422,41 @@ impl TerminalRegistry {
         let mut read = controller
             .read_output(terminal, after_seq, max_bytes)
             .await?;
-        if read.reset_required {
-            // The host's retained window moved past our cursor. Reset only the
-            // web-side replay projection; the durable host spool remains
-            // authoritative. Prefix a visible marker to the first retained
-            // frame so a reconnect never silently pretends continuity.
-            let shared = {
-                let inner = self.inner.lock().expect("registry lock");
-                inner
-                    .terminals
-                    .get(terminal_id)
-                    .map(|handle| Arc::clone(&handle.shared))
-            };
-            if let Some(shared) = shared {
-                let mut state = shared.lock().expect("terminal lock");
+        let mut announcements = Vec::new();
+        let mut epoch_changed = false;
+        {
+            let mut inner = self.inner.lock().expect("registry lock");
+            let handle = inner
+                .terminals
+                .get_mut(terminal_id)
+                .ok_or_else(|| "managed facade disappeared during output read".to_string())?;
+            if !Arc::ptr_eq(&claim.0, &handle.managed_read_in_flight) {
+                return Err("managed facade was replaced during output read".into());
+            }
+            let descriptor = handle
+                .managed
+                .as_mut()
+                .ok_or_else(|| "managed facade ownership changed during output read".to_string())?;
+            // A terminal facade may learn the first provider-observed identity,
+            // but recovery must never silently substitute another conversation.
+            if let (Some(expected), Some(observed)) =
+                (&descriptor.resume_session_id, &read.native_session_id)
+            {
+                if expected != observed {
+                    return Err("managed output native identity mismatch".into());
+                }
+            }
+            match (&read.stream_epoch, &read.incarnation_id) {
+                (Some(epoch), Some(incarnation))
+                    if !epoch.is_empty() && !incarnation.is_empty() =>
+                {
+                    epoch_changed = descriptor.stream_id != *epoch;
+                }
+                (None, None) if read.chunks.is_empty() && !read.reset_required => {}
+                _ => return Err("managed output has incomplete source identity".into()),
+            }
+            let mut state = handle.shared.lock().expect("terminal lock");
+            if epoch_changed || read.reset_required {
                 state.replay.clear();
                 state.replay_chars = 0;
                 state.head_seq = read.retained_from_seq.saturating_sub(1);
@@ -2390,9 +2464,41 @@ impl TerminalRegistry {
                 state.modes = ModeTracker::new();
                 state.noise = NoiseScanner::new();
             }
+            if epoch_changed {
+                let epoch = read.stream_epoch.as_ref().expect("validated source epoch");
+                descriptor.stream_id.clone_from(epoch);
+                descriptor
+                    .incarnation_id
+                    .clone_from(read.incarnation_id.as_ref().expect("validated incarnation"));
+                state.stream_id.clone_from(epoch);
+                state.geometry_epoch = state.geometry_epoch.saturating_add(1);
+                for subscriber in state.subscribers.values() {
+                    announcements.push((
+                        Arc::clone(&subscriber.sink),
+                        ServerMessage::TerminalStreamChanged(TerminalStreamChanged {
+                            reason: TerminalStreamChangedReason::NewPtySession,
+                            stream_id: epoch.clone(),
+                            terminal_id: terminal_id.to_string(),
+                            attach_request_id: subscriber.attach_request_id.clone(),
+                        }),
+                    ));
+                }
+            }
+            if let Some(native) = &read.native_session_id {
+                descriptor.resume_session_id = Some(native.clone());
+                state.resume_session_id = Some(native.clone());
+            }
+        }
+        // Control announcements are emitted before any replacement frames. A
+        // reattach in between observes the already-updated epoch in attach.ready.
+        for (sink, message) in announcements {
+            sink(message);
+        }
+        if epoch_changed || read.reset_required {
+            read.reset_required = true;
             if let Some(first) = read.chunks.first_mut() {
                 first.data = format!(
-                    "\r\n[Earlier terminal output was truncated while Freshell was disconnected.]\r\n{}",
+                    "\r\n[Terminal output resumed in a new retained window; earlier output may be truncated.]\r\n{}",
                     first.data
                 );
             }
@@ -2518,6 +2624,7 @@ impl TerminalRegistry {
                     shared,
                     pty: None,
                     managed: None,
+                    managed_read_in_flight: Arc::new(AtomicBool::new(false)),
                 },
             );
             inner.revision += 1;
@@ -6380,3 +6487,7 @@ mod tests {
         assert_eq!(registry.managed_output_cursor("T-output"), Some(2));
     }
 }
+
+#[cfg(test)]
+#[path = "managed_output_tests.rs"]
+mod managed_output_tests;
