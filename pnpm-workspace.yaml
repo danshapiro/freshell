@@ -7,6 +7,10 @@ enablePrePostScripts: true
 resolvePeersFromWorkspaceRoot: false
 packageManagerStrictVersion: true
 managePackageManagerVersions: false
+overrides:
+  fast-uri: 3.1.7
+  hono: 4.13.7
+  qs: 6.16.0
 allowBuilds:
   electron: true
   esbuild: true
