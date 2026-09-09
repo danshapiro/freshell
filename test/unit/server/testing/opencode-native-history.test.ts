@@ -5,7 +5,7 @@ import os from 'node:os'
 import path from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
-import { OPENCODE_NATIVE_HISTORY_SCRIPT, nativeAssistantProof } from '../../../e2e-browser/helpers/opencode-native-history.js'
+import { OPENCODE_NATIVE_HISTORY_SCRIPT, nativeAssistantProof, openCodeTerminalReady } from '../../../e2e-browser/helpers/opencode-native-history.js'
 
 let root: string
 let filename: string
@@ -72,5 +72,23 @@ describe('live recovery proves new native assistant responses, never TUI echo or
     expect(proof).toMatchObject({ nativeSessionId: 'ses_owned', messageId: 'answer', parentMessageId: 'user-request', completedAt: 200, toolPartCount: 0 })
     expect(proof.responseSha256).toBe(createHash('sha256').update('private fixture answer').digest('hex'))
     expect(JSON.stringify(proof)).not.toContain('private fixture answer')
+  })
+})
+
+describe('resumed OpenCode readiness is an input-mode signal, not a home-screen placeholder', () => {
+  it('recognizes a resumed conversation that renders no Ask anything placeholder', () => {
+    expect(openCodeTerminalReady('\x1b[?2004h\x1b[24;1HBuild  Big Pickle  OpenCode Zen')).toBe(true)
+  })
+
+  it('does not treat echoed text or a disabled input mode as a ready TUI', () => {
+    expect(openCodeTerminalReady('Build Big Pickle')).toBe(false)
+    expect(openCodeTerminalReady('\x1b[?2004hBuild Big Pickle\x1b[?2004l')).toBe(false)
+    expect(openCodeTerminalReady('\x1b[?2004h')).toBe(false)
+    expect(openCodeTerminalReady('')).toBe(false)
+  })
+
+  it('keeps the free-tier model banner part of readiness and handles ANSI styling', () => {
+    expect(openCodeTerminalReady('\x1b[?2004hBuild Expensive model')).toBe(false)
+    expect(openCodeTerminalReady('\x1b[?2004h\x1b[32mBuild\x1b[0m \x1b[31mBig Pickle\x1b[0m')).toBe(true)
   })
 })
