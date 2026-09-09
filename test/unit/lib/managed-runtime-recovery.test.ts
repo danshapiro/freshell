@@ -1,6 +1,7 @@
 import { configureStore } from '@reduxjs/toolkit'
 import { describe, expect, it } from 'vitest'
-import tabsReducer from '@/store/tabsSlice'
+import tabsReducer, { addTab, setActiveTab, updateTab } from '@/store/tabsSlice'
+import { handleUiCommand } from '@/lib/ui-commands'
 import panesReducer from '@/store/panesSlice'
 import managedRuntimeReducer from '@/store/managedRuntimeSlice'
 import {
@@ -153,6 +154,47 @@ function storeWithState(state = baseState()) {
 }
 
 describe('managed runtime recovery merge', () => {
+  it.each(['inventory-first', 'api-first'] as const)('coalesces one REST-created managed view when %s wins the race', (order) => {
+    const store = storeWithState()
+    const current = snapshot()
+    const command = { type: 'ui.command', command: 'tab.create', payload: {
+      id: 'tab-recovered-one', paneId: 'pane-recovered-one', title: 'Created shell',
+      terminalId: 'terminal-one', mode: 'opencode',
+      paneContent: { kind: 'terminal', terminalId: 'terminal-one', createRequestId: 'create-one',
+        status: 'running', mode: 'opencode', shell: 'system' },
+    } }
+    const commandRuntime = { dispatch: store.dispatch, getState: () => store.getState() as any }
+    const reconcile = () => applyManagedRuntimeMergePlan(store as any, buildManagedRuntimeMergePlan(current, store.getState() as any))
+    if (order === 'inventory-first') { reconcile(); handleUiCommand(command, commandRuntime) }
+    else { handleUiCommand(command, commandRuntime); reconcile() }
+    expect(store.getState().tabs.tabs.map((tab) => tab.id)).toEqual(['user-tab', 'tab-recovered-one'])
+    expect(Object.keys(store.getState().panes.layouts)).toHaveLength(2)
+    const recovered = store.getState().panes.layouts['tab-recovered-one']
+    expect(recovered.type).toBe('leaf')
+    if (recovered.type !== 'leaf') throw new Error('expected recovered leaf')
+    expect(recovered.id).toBe('pane-recovered-one')
+    expect(recovered.content).toMatchObject({ terminalId: 'terminal-one', soulId: 'soul-one', viewIntentId: 'view-one' })
+    // Redelivery after a user changes focus/title is not a new create intent.
+    store.dispatch(updateTab({ id: 'tab-recovered-one', updates: { title: 'My retained title', titleSetByUser: true } }))
+    store.dispatch(setActiveTab('user-tab'))
+    for (let replay = 0; replay < 4; replay += 1) { handleUiCommand(command, commandRuntime); reconcile() }
+    expect(store.getState().tabs.tabs).toHaveLength(2)
+    expect(store.getState().tabs.activeTabId).toBe('user-tab')
+    expect(store.getState().tabs.tabs[1].title).toBe('My retained title')
+    expect(store.getState().panes.layouts['tab-recovered-one']).toEqual(recovered)
+  })
+
+  it('makes explicit tab identity idempotent without suppressing genuinely new tabs', () => {
+    const store = storeWithState()
+    const original = structuredClone(store.getState().tabs.tabs[0])
+    store.dispatch(addTab({ id: 'user-tab', title: 'duplicate must not replace title', activate: true }))
+    expect(store.getState().tabs.tabs).toEqual([original])
+    store.dispatch(addTab({ title: 'Fresh one' }))
+    store.dispatch(addTab({ title: 'Fresh two' }))
+    expect(store.getState().tabs.tabs).toHaveLength(3)
+    expect(new Set(store.getState().tabs.tabs.map((tab) => tab.id)).size).toBe(3)
+  })
+
   it('adopts a pane whose managed terminal is still being created', () => {
     // The originating pane knows its createRequestId long before the server
     // answers with a terminalId. Matching only on terminalId/soulId therefore
