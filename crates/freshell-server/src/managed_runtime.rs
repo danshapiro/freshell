@@ -20,10 +20,12 @@ use std::{
 };
 use tokio::sync::Mutex;
 
+#[path = "managed_output_validation.rs"]
+mod managed_output_validation;
+
 #[derive(Default)]
 struct ManagedRecoveryState {
     in_flight: Mutex<HashSet<String>>,
-    reset_pending: Mutex<HashSet<String>>,
     blocked: Mutex<HashMap<String, String>>,
 }
 
@@ -67,10 +69,6 @@ impl ServerManagedRuntimeController {
         self.recovery.in_flight.lock().await.contains(soul_id)
     }
 
-    async fn take_recovery_reset(&self, soul_id: &str) -> bool {
-        self.recovery.reset_pending.lock().await.remove(soul_id)
-    }
-
     async fn blocked_recovery(&self, soul_id: &str) -> Option<String> {
         self.recovery.blocked.lock().await.get(soul_id).cloned()
     }
@@ -92,11 +90,14 @@ impl ServerManagedRuntimeController {
             }
             let result = recover_with_policy(&client, soul, trigger).await;
             match result {
-                Ok(result) if result.outcome == RecoveryOutcome::Replaced => {
-                    state.reset_pending.lock().await.insert(key.clone());
-                    state.blocked.lock().await.remove(&key);
-                }
-                Ok(result) if result.outcome == RecoveryOutcome::Reattached => {
+                Ok(result)
+                    if matches!(
+                        result.outcome,
+                        RecoveryOutcome::Replaced
+                            | RecoveryOutcome::Reattached
+                            | RecoveryOutcome::AlreadyLive
+                    ) =>
+                {
                     state.blocked.lock().await.remove(&key);
                 }
                 Ok(result) => {
@@ -275,16 +276,10 @@ impl ManagedTerminalController for ServerManagedRuntimeController {
                     .await
                     .map_err(|error| error.to_string())?;
                 match recovered.outcome {
-                    RecoveryOutcome::Reattached => {
+                    RecoveryOutcome::Reattached
+                    | RecoveryOutcome::Replaced
+                    | RecoveryOutcome::AlreadyLive => {
                         self.recovery.blocked.lock().await.remove(&soul_key);
-                    }
-                    RecoveryOutcome::Replaced => {
-                        self.recovery.blocked.lock().await.remove(&soul_key);
-                        self.recovery
-                            .reset_pending
-                            .lock()
-                            .await
-                            .insert(soul_key.clone());
                     }
                     _ => {
                         let message = format!(
@@ -334,7 +329,6 @@ impl ManagedTerminalController for ServerManagedRuntimeController {
             match self.client.stop(soul).await.map_err(|e| e.to_string())? {
                 StopOutcome::VerifiedEmpty => {
                     self.recovery.in_flight.lock().await.remove(&soul_key);
-                    self.recovery.reset_pending.lock().await.remove(&soul_key);
                     self.recovery.blocked.lock().await.remove(&soul_key);
                     Ok(())
                 }
@@ -359,6 +353,8 @@ impl ManagedTerminalController for ServerManagedRuntimeController {
             }
             if self.recovery_in_flight(&soul_key).await {
                 return Ok(ManagedOutputRead {
+                    stream_epoch: None,
+                    incarnation_id: None,
                     reset_required: false,
                     truncated: false,
                     retained_from_seq: after_seq,
@@ -368,16 +364,29 @@ impl ManagedTerminalController for ServerManagedRuntimeController {
                     chunks: Vec::new(),
                 });
             }
-            let output = match self
-                .client
-                .read_output(soul.clone(), after_seq.max(0) as u64, max_bytes)
-                .await
+            let output = match async {
+                let output = self
+                    .client
+                    .read_output(soul.clone(), after_seq.max(0) as u64, max_bytes)
+                    .await?;
+                // A supervisor may replace a host independently of this web
+                // process. Compare the host's source epoch on EVERY read; a
+                // web-local recovery flag cannot establish stream continuity.
+                if output.stream_epoch != terminal.stream_id && after_seq > 0 {
+                    self.client.read_output(soul.clone(), 0, max_bytes).await
+                } else {
+                    Ok(output)
+                }
+            }
+            .await
             {
                 Ok(output) => output,
                 Err(error) if recoverable_host_error(&error) => {
                     self.schedule_recovery(soul, RecoveryTrigger::HostUnreachable)
                         .await;
                     return Ok(ManagedOutputRead {
+                        stream_epoch: None,
+                        incarnation_id: None,
                         reset_required: false,
                         truncated: false,
                         retained_from_seq: after_seq,
@@ -389,6 +398,7 @@ impl ManagedTerminalController for ServerManagedRuntimeController {
                 }
                 Err(error) => return Err(error.to_string()),
             };
+            managed_output_validation::validate(&output, &terminal.terminal_id)?;
             if output.exited {
                 // Never hold the WS poll's 500ms timeout across stop/start or
                 // retry backoff. A single per-soul background task owns the
@@ -396,12 +406,13 @@ impl ManagedTerminalController for ServerManagedRuntimeController {
                 self.schedule_recovery(soul, RecoveryTrigger::ProviderExit)
                     .await;
             }
-            let recovered = self.take_recovery_reset(&soul_key).await;
             Ok(ManagedOutputRead {
+                stream_epoch: Some(output.stream_epoch.clone()),
+                incarnation_id: Some(output.incarnation_id.to_string()),
                 // Replacement starts a new durable output epoch. Force the
                 // consumer to reset its cursor instead of interpreting the new
                 // incarnation as a gap in the old stream.
-                reset_required: output.reset_required || recovered,
+                reset_required: output.reset_required || output.stream_epoch != terminal.stream_id,
                 truncated: output.truncated,
                 retained_from_seq: output.retained_from_seq.min(i64::MAX as u64) as i64,
                 head_seq: output.head_seq.min(i64::MAX as u64) as i64,
@@ -1169,3 +1180,7 @@ mod tests {
         assert!(!json.contains("oauth-secret-bytes"));
     }
 }
+
+#[cfg(all(test, unix))]
+#[path = "managed_output_rpc_tests.rs"]
+mod managed_output_rpc_tests;
