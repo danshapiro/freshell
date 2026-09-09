@@ -650,34 +650,15 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn nonce_snippet_is_all_digits_even_without_gnu_date() {
-        let dir =
-            std::env::temp_dir().join(format!("freshell-bsd-date-stub-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let stub = dir.join("date");
-        std::fs::write(
-            &stub,
-            "#!/bin/sh\nif [ \"$1\" = \"+%s%N\" ]; then echo 1769000000N; else echo 1769000000; fi\n",
-        )
-        .unwrap();
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
-        }
-        let out = std::process::Command::new("sh")
-            .arg("-c")
-            .arg(format!(
-                "PATH=\"{}:$PATH\"; {}; printf %s \"$n\"",
-                dir.display(),
-                CLAUDE_SIGNAL_NONCE_SNIPPET
-            ))
-            .output()
-            .unwrap();
-        let n = String::from_utf8(out.stdout).unwrap();
+        // A shell function models BSD date without executing a file from
+        // /tmp, which is deliberately noexec in the destructive sandbox.
+        let out = run_nonce_with_date_function(
+            r#"if [ "$1" = "+%s%N" ]; then echo 1769000000N; else echo 1769000000; fi"#,
+        );
         assert_eq!(
-            n, "1769000000000000000",
+            out, "1769000000000000000",
             "BSD fallback: seconds + 9 zero digits"
         );
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -709,36 +690,30 @@ mod tests {
         assert!(!pred("gemini", None, false, None));
     }
 
+    #[cfg(unix)]
+    fn run_nonce_with_date_function(date_body: &str) -> String {
+        let out = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(format!(
+                r#"date() {{ {date_body}; }}; {CLAUDE_SIGNAL_NONCE_SNIPPET}; printf %s "$n""#,
+            ))
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8(out.stdout).unwrap()
+    }
+
     /// GNU date passthrough: full nanosecond precision is preserved.
     #[cfg(unix)]
     #[test]
     fn nonce_snippet_preserves_gnu_precision() {
-        let dir =
-            std::env::temp_dir().join(format!("freshell-gnu-date-stub-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let stub = dir.join("date");
-        std::fs::write(
-            &stub,
-            "#!/bin/sh\nif [ \"$1\" = \"+%s%N\" ]; then echo 1769000000123456789; else echo 1769000000; fi\n",
-        )
-        .unwrap();
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
-        }
-        let out = std::process::Command::new("sh")
-            .arg("-c")
-            .arg(format!(
-                "PATH=\"{}:$PATH\"; {}; printf %s \"$n\"",
-                dir.display(),
-                CLAUDE_SIGNAL_NONCE_SNIPPET
-            ))
-            .output()
-            .unwrap();
-        assert_eq!(
-            String::from_utf8(out.stdout).unwrap(),
-            "1769000000123456789"
+        let out = run_nonce_with_date_function(
+            r#"if [ "$1" = "+%s%N" ]; then echo 1769000000123456789; else echo 1769000000; fi"#,
         );
-        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(out, "1769000000123456789");
     }
 }
