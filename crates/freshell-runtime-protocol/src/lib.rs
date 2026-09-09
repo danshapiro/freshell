@@ -1068,7 +1068,6 @@ pub struct AgentEventBatch {
     pub events: Vec<AgentJournalEvent>,
 }
 
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TerminalLaunchSpec {
@@ -1268,6 +1267,60 @@ pub struct TerminalInputRequest {
     pub expected_control_epoch: Option<u64>,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FreshAgentTurnSettings {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub permission_mode: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sandbox: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FreshAgentSendRequest {
+    pub soul_id: SoulId,
+    pub text: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub settings: Option<FreshAgentTurnSettings>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expected_control_epoch: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FreshAgentResolveRequest {
+    pub soul_id: SoulId,
+    pub decision_id: String,
+    pub decision: serde_json::Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expected_control_epoch: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FreshAgentInterruptRequest {
+    pub soul_id: SoulId,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expected_control_epoch: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FreshAgentReadEventsRequest {
+    pub soul_id: SoulId,
+    pub after_sequence: u64,
+    pub max_events: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expected_control_epoch: Option<u64>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TerminalResizeRequest {
@@ -1362,6 +1415,8 @@ pub struct LaunchRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub terminal: Option<TerminalLaunchSpec>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fresh_agent: Option<FreshAgentLaunchSpec>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub view_intent: Option<ViewIntentRequest>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub expected_control_epoch: Option<u64>,
@@ -1373,12 +1428,26 @@ fn default_project_key() -> String {
 
 impl LaunchRequest {
     pub fn validate_workload(&self) -> Result<(), RuntimeError> {
-        match (&self.fixture, &self.terminal) {
-            (Some(_), None) => Ok(()),
-            (None, Some(terminal)) => terminal.validate(),
+        match (&self.fixture, &self.terminal, &self.fresh_agent) {
+            (Some(_), None, None) => Ok(()),
+            (None, Some(terminal), None) => terminal.validate(),
+            (None, None, Some(agent)) => {
+                agent.validate()?;
+                if self.provider != agent.provider.as_str()
+                    || self.provider_store_id != agent.provider_store_id
+                    || (self.native_session_id.is_some()
+                        && self.native_session_id != agent.native_session_id)
+                {
+                    return Err(RuntimeError::new(
+                        RuntimeErrorCode::InvalidRequest,
+                        "fresh-agent workload identity disagrees with its soul launch",
+                    ));
+                }
+                Ok(())
+            }
             _ => Err(RuntimeError::new(
                 RuntimeErrorCode::InvalidRequest,
-                "launch must specify exactly one fixture or terminal workload",
+                "launch must specify exactly one fixture, terminal, or fresh-agent workload",
             )),
         }
     }
@@ -1529,6 +1598,10 @@ pub enum AdminCommand {
     TerminalInput(TerminalInputRequest),
     TerminalResize(TerminalResizeRequest),
     TerminalReadOutput(TerminalReadOutputRequest),
+    FreshAgentSend(FreshAgentSendRequest),
+    FreshAgentResolve(FreshAgentResolveRequest),
+    FreshAgentInterrupt(FreshAgentInterruptRequest),
+    FreshAgentReadEvents(FreshAgentReadEventsRequest),
     RuntimeMetrics(RuntimeMetricsRequest),
     ProbeRecovery(RecoveryProbeRequest),
     Recover(RecoverRequest),
@@ -1565,6 +1638,12 @@ pub struct RuntimeView {
     pub terminal_create_request_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub terminal_resume_session_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fresh_agent_session_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fresh_agent_session_type: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fresh_agent_runtime_variant: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub project_key: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1666,6 +1745,11 @@ pub enum AdminResult {
     },
     TerminalResize,
     TerminalOutput(RuntimeOutputBatch),
+    FreshAgentCommand {
+        state: CommandState,
+    },
+    FreshAgentInterrupted,
+    FreshAgentEvents(AgentEventBatch),
     RuntimeMetrics(RuntimeMetrics),
     RecoveryProbe(RecoveryProbe),
     Recovery(RecoveryResult),
@@ -1697,6 +1781,8 @@ pub enum HostCommand {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         terminal: Option<Box<TerminalLaunchSpec>>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        fresh_agent: Option<Box<FreshAgentLaunchSpec>>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         resume_spec: Option<Box<ResumeSpec>>,
     },
     Stop {
@@ -1724,6 +1810,26 @@ pub enum HostCommand {
         incarnation_id: IncarnationId,
         after_seq: u64,
         max_bytes: u64,
+    },
+    FreshAgentSend {
+        incarnation_id: IncarnationId,
+        request_id: RequestId,
+        text: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        settings: Option<FreshAgentTurnSettings>,
+    },
+    FreshAgentResolve {
+        incarnation_id: IncarnationId,
+        decision_id: String,
+        decision: serde_json::Value,
+    },
+    FreshAgentInterrupt {
+        incarnation_id: IncarnationId,
+    },
+    FreshAgentReadEvents {
+        incarnation_id: IncarnationId,
+        after_sequence: u64,
+        max_events: u32,
     },
     RuntimeMetrics {
         incarnation_id: IncarnationId,
@@ -1753,6 +1859,8 @@ pub enum HostResult {
         worker_pid: u32,
         worker_launch_count: u64,
         fixture_evidence: serde_json::Value,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        native_session_id: Option<String>,
     },
     Stopped,
     SecurityProbe(serde_json::Value),
@@ -1761,6 +1869,15 @@ pub enum HostResult {
     },
     TerminalResize,
     TerminalOutput(RuntimeOutputBatch),
+    FreshAgentCommand {
+        state: CommandState,
+        /// Provider identity observed and durably recorded by the host actor
+        /// at the same acceptance boundary as this acknowledgement.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        native_session_id: Option<String>,
+    },
+    FreshAgentInterrupted,
+    FreshAgentEvents(AgentEventBatch),
     RuntimeMetrics(RuntimeMetrics),
     Status {
         host_boot_id: HostBootId,
@@ -2042,6 +2159,106 @@ mod tests {
         spec.provider_reasoning_effort = None;
         spec.provider_permission_mode = Some("line\nbreak".into());
         assert!(spec.validate().is_err());
+    }
+
+    fn fresh_agent_launch(provider: FreshProvider, session_type: &str) -> FreshAgentLaunchSpec {
+        FreshAgentLaunchSpec {
+            session_id: "presentation-one".into(),
+            provider,
+            session_type: session_type.into(),
+            runtime_variant: "pinned-runtime-variant".into(),
+            provider_store_id: "soul-store-one".into(),
+            cwd: "/workspace/project".into(),
+            workspace_path: "/workspace/project".into(),
+            git_common_dir: Some("/workspace/project/.git".into()),
+            run_as_uid: 65_534,
+            run_as_gid: 0,
+            model: Some("model-one".into()),
+            effort: Some("high".into()),
+            permission_mode: Some("ask".into()),
+            sandbox: Some("workspace-write".into()),
+            native_session_id: Some("native-one".into()),
+            provider_bootstrap_files: vec![ProviderBootstrapFile {
+                source_path: "/credential-reference-only".into(),
+                provider_relative_path: ".provider/config.json".into(),
+            }],
+        }
+    }
+
+    #[test]
+    fn fresh_agent_launch_and_event_rpc_round_trip_without_secret_material() {
+        for (provider, session_type) in [
+            (FreshProvider::Claude, "freshclaude"),
+            (FreshProvider::Kilroy, "kilroy"),
+            (FreshProvider::Codex, "freshcodex"),
+            (FreshProvider::Opencode, "freshopencode"),
+        ] {
+            let launch = fresh_agent_launch(provider, session_type);
+            assert!(launch.validate().is_ok());
+            let encoded = serde_json::to_string(&launch).unwrap();
+            assert!(!encoded.contains("secret-token-value"));
+            assert_eq!(
+                serde_json::from_str::<FreshAgentLaunchSpec>(&encoded).unwrap(),
+                launch
+            );
+        }
+
+        let request = HostCommand::FreshAgentResolve {
+            incarnation_id: IncarnationId::parse("incarnation-agent-rpc").unwrap(),
+            decision_id: "decision-7".into(),
+            decision: serde_json::json!({"behavior":"allow"}),
+        };
+        let encoded = serde_json::to_value(&request).unwrap();
+        assert_eq!(encoded["method"], "fresh_agent_resolve");
+        let decoded = serde_json::from_value::<HostCommand>(encoded).unwrap();
+        assert!(matches!(
+            decoded,
+            HostCommand::FreshAgentResolve { decision_id, .. }
+                if decision_id == "decision-7"
+        ));
+    }
+
+    #[test]
+    fn fresh_agent_validation_rejects_provider_type_mismatch_and_mixed_workloads() {
+        let agent = fresh_agent_launch(FreshProvider::Codex, "freshclaude");
+        assert_eq!(
+            agent.validate().unwrap_err().code,
+            RuntimeErrorCode::InvalidRequest
+        );
+        let mut request = LaunchRequest {
+            soul_id: SoulId::parse("soul-agent-validation").unwrap(),
+            provider: "codex".into(),
+            provider_store_id: "soul-store-one".into(),
+            creation_seed_ref: "seed-agent-validation".into(),
+            limits: RuntimeLimits {
+                cpu_milli: 1000,
+                memory_bytes: 1024 * 1024 * 1024,
+                swap_bytes: 0,
+                pids_max: 128,
+            },
+            profile: RuntimeProfile::DefaultAgent,
+            project_key: "project-agent-validation".into(),
+            native_session_id: None,
+            fixture: None,
+            terminal: None,
+            fresh_agent: Some(fresh_agent_launch(FreshProvider::Codex, "freshcodex")),
+            view_intent: None,
+            expected_control_epoch: None,
+        };
+        assert!(request.validate_workload().is_ok());
+        request.fixture = Some(FixtureKind::Heartbeat);
+        assert_eq!(
+            request.validate_workload().unwrap_err().code,
+            RuntimeErrorCode::InvalidRequest
+        );
+
+        let mut unsafe_agent = fresh_agent_launch(FreshProvider::Opencode, "freshopencode");
+        unsafe_agent.provider_bootstrap_files[0].provider_relative_path =
+            "../../run/freshell/secret".into();
+        assert_eq!(
+            unsafe_agent.validate().unwrap_err().code,
+            RuntimeErrorCode::InvalidRequest
+        );
     }
 
     #[test]
