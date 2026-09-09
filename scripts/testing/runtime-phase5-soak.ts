@@ -1,6 +1,8 @@
+import { execFileSync } from 'node:child_process'
 import fs from 'node:fs'
 import path from 'node:path'
 
+import { candidateIntegrityFailures, captureRuntimeCandidate } from './runtime-gate-integrity.js'
 import { defaultReceiptFileName } from './runtime-receipts.js'
 import {
   runtimeSoakEvidenceRun,
@@ -11,27 +13,36 @@ import {
   SOAK_MAX_TERMINAL_SPOOL_BYTES,
   SOAK_MIN_DURATION_MS,
   SOAK_SAMPLES_FILE,
+  SOAK_TERMINAL_SPOOL_CONFIGURED_BYTES,
   type RuntimeSoakReceipt,
   type RuntimeSoakSample,
   type SoakFixture,
   type SoakWorkload,
+  validateRuntimeSoakBaseline,
   validateRuntimeSoakReceipt,
 } from './runtime-soak-evidence.js'
 import { newRequest, newSoul, RuntimeHarness, type SupervisorInstance } from './runtime-sandbox.js'
 
 const SAMPLE_INTERVAL_MS = 5_000
+const BASELINE_SETTLE_MS = 5_000
+const METRIC_CONCURRENCY = 10
 const desiredDuration = Number(process.env.FRESHELL_RUNTIME_PHASE5_SOAK_MS ?? SOAK_MIN_DURATION_MS)
-if (!Number.isFinite(desiredDuration) || !Number.isInteger(desiredDuration) || desiredDuration < SOAK_MIN_DURATION_MS) {
+if (!Number.isSafeInteger(desiredDuration) || desiredDuration < SOAK_MIN_DURATION_MS) {
   throw new Error(`Phase 5 qualification soak must run for at least ${SOAK_MIN_DURATION_MS}ms`)
 }
 
 const h = new RuntimeHarness(process.cwd(), undefined, 5)
 let supervisor: SupervisorInstance | undefined
 let failure: unknown
+let prepared = false
 let controlEpoch: number | undefined
+let terminalInputProof: RuntimeSoakReceipt['terminalInput'] | undefined
+let shellSpoolConfiguredBytes: number | undefined
 const workloads: SoakWorkload[] = []
 const samples: RuntimeSoakSample[] = []
 const samplesPath = path.join(h.evidenceDir, SOAK_SAMPLES_FILE)
+const target = process.env.FRESHELL_RUNTIME_PHASE5_SOAK_RECEIPT
+  || path.join(h.evidenceDir, defaultReceiptFileName('FRESHELL_RUNTIME_PHASE5_SOAK_RECEIPT'))
 
 function dataOf(result: any, expected: string): any {
   if (!result || result.kind !== expected) throw new Error(`expected ${expected}, received a different runtime response`)
@@ -42,24 +53,40 @@ async function epoch(): Promise<number> {
   return dataOf(await h.adminOk(supervisor!, { method: 'health' }), 'health').controlEpoch
 }
 
+function monotonicNow(): number {
+  return Math.floor(performance.now())
+}
+
 function workloadFixture(index: number): SoakFixture {
+  if (index === 46) return 'shell_output'
   if (index === 47) return 'cpu_burner'
   if (index === 48) return 'memory_allocator'
   if (index === 49) return 'descendant_spawner'
   return 'heartbeat'
 }
 
+/** Fixed proposals: the authentic calibration may reject them but never weakens acceptance or retries looser values. */
 function limitsFor(fixture: SoakFixture) {
+  if (fixture === 'shell_output') {
+    return { cpuMilli: 100, memoryBytes: 128 * 1024 * 1024, swapBytes: 0, pidsMax: 16 }
+  }
   if (fixture === 'cpu_burner') {
-    return { cpuMilli: 500, memoryBytes: 96 * 1024 * 1024, swapBytes: 0, pidsMax: 16 }
+    // host + fixture worker + four bounded burners; each Rust process has a
+    // main task and the checked-in four-thread Tokio floor.
+    return { cpuMilli: 500, memoryBytes: 96 * 1024 * 1024, swapBytes: 0, pidsMax: 32 }
   }
   if (fixture === 'memory_allocator') {
-    return { cpuMilli: 100, memoryBytes: 64 * 1024 * 1024, swapBytes: 0, pidsMax: 8 }
+    // The worker touches 32 MiB. The authentic baseline must still prove that
+    // host overhead brings current occupancy to the >=80% acceptance floor.
+    return { cpuMilli: 100, memoryBytes: 48 * 1024 * 1024, swapBytes: 0, pidsMax: 12 }
   }
   if (fixture === 'descendant_spawner') {
-    return { cpuMilli: 100, memoryBytes: 64 * 1024 * 1024, swapBytes: 0, pidsMax: 8 }
+    // host, worker, child, and grandchild at five tasks each occupy at least
+    // 20/24 slots without an unbounded fork workload.
+    return { cpuMilli: 100, memoryBytes: 64 * 1024 * 1024, swapBytes: 0, pidsMax: 24 }
   }
-  return { cpuMilli: 50, memoryBytes: 64 * 1024 * 1024, swapBytes: 0, pidsMax: 8 }
+  // host + heartbeat worker need ten baseline tasks at the four-thread floor.
+  return { cpuMilli: 50, memoryBytes: 64 * 1024 * 1024, swapBytes: 0, pidsMax: 12 }
 }
 
 function currentSoul(rows: any[], soulId: string): any | undefined {
@@ -72,7 +99,16 @@ function currentSoul(rows: any[], soulId: string): any | undefined {
     .at(-1)
 }
 
-function retainedBytes(instance: SupervisorInstance): { terminalSpools: number; runtimeLogs: number } {
+function regularFileBytes(filePath: string): number {
+  if (!fs.existsSync(filePath)) return 0
+  const stat = fs.lstatSync(filePath)
+  return stat.isFile() && !stat.isSymbolicLink() ? stat.size : 0
+}
+
+function retainedBytes(
+  instance: SupervisorInstance,
+  terminalIncarnationId: string,
+): RuntimeSoakSample['retainedBytes'] & { terminalOutput: RuntimeSoakSample['terminalOutput'] } {
   let terminalSpools = 0
   let runtimeLogs = 0
   const stack = [path.dirname(instance.runtimeRoot)]
@@ -92,10 +128,30 @@ function retainedBytes(instance: SupervisorInstance): { terminalSpools: number; 
       runtimeLogs += stat.size
     }
   }
-  return { terminalSpools, runtimeLogs }
+  const runtimeDir = h.runtimeDir(instance, terminalIncarnationId)
+  const currentBytes = regularFileBytes(path.join(runtimeDir, 'terminal-spool-current.jsonl'))
+  const previousBytes = regularFileBytes(path.join(runtimeDir, 'terminal-spool-previous.jsonl'))
+  if (currentBytes + previousBytes !== terminalSpools) {
+    throw new Error('terminal spool inventory contains bytes outside the single owned shell workload')
+  }
+  return { terminalSpools, runtimeLogs, terminalOutput: { currentBytes, previousBytes } }
 }
 
-async function collectSample(sequence: number, startedAtMs?: number): Promise<RuntimeSoakSample> {
+async function mapConcurrent<T, R>(values: T[], concurrency: number, map: (value: T) => Promise<R>): Promise<R[]> {
+  const results = new Array<R>(values.length)
+  let cursor = 0
+  await Promise.all(Array.from({ length: Math.min(concurrency, values.length) }, async () => {
+    while (cursor < values.length) {
+      const index = cursor
+      cursor += 1
+      results[index] = await map(values[index])
+    }
+  }))
+  return results
+}
+
+async function collectSample(sequence: number, baselineMonotonicMs?: number): Promise<RuntimeSoakSample> {
+  const collectionStartedMonotonicMs = monotonicNow()
   const instance = supervisor!
   const expectedEpoch = controlEpoch!
   const snapshot = dataOf(await h.adminOk(instance, h.inventorySnapshotBody()), 'inventory_snapshot')
@@ -114,16 +170,16 @@ async function collectSample(sequence: number, startedAtMs?: number): Promise<Ru
       lostIncarnations: rows.filter((row: any) => row.recoveryState === 'lost').length,
     }
   })
-  const metrics = []
-  for (const workload of workloads) {
-    const soul = souls.find((row) => row.soulId === workload.soulId)!
+  const soulById = new Map(souls.map((soul) => [soul.soulId, soul]))
+  const metrics = await mapConcurrent(workloads, METRIC_CONCURRENCY, async (workload) => {
+    const soul = soulById.get(workload.soulId)!
     const raw = dataOf(await h.adminOk(
       instance,
       h.runtimeMetricsBody(workload.soulId, expectedEpoch),
       { requestId: newRequest() },
     ), 'runtime_metrics')
     const current = currentSoul(snapshot.souls, workload.soulId)
-    metrics.push({
+    return {
       soulId: workload.soulId,
       fixture: workload.fixture,
       incarnationId: soul.incarnationId,
@@ -137,8 +193,8 @@ async function collectSample(sequence: number, startedAtMs?: number): Promise<Ru
       memoryOomKill: raw.memoryOomKill,
       pidsCurrent: raw.pidsCurrent,
       pidsMax: raw.pidsMax,
-    })
-  }
+    }
+  })
   const notices = dataOf(await h.adminOk(
     instance,
     h.pendingNoticesBody('profile:phase5-soak', 100, expectedEpoch),
@@ -146,19 +202,24 @@ async function collectSample(sequence: number, startedAtMs?: number): Promise<Ru
   ), 'pending_notices')
   if (!Array.isArray(notices)) throw new Error('pending notice response was incomplete')
   if (h.broker.unsafeAttempts().length > 0) throw new Error('soak broker recorded an unsafe request')
-  const capturedAtMs = Date.now()
-  const anchor = startedAtMs ?? capturedAtMs
+  const shell = souls.find(({ fixture }) => fixture === 'shell_output')!
+  const retained = retainedBytes(instance, shell.incarnationId)
+  const collectionEndedMonotonicMs = monotonicNow()
+  const anchor = baselineMonotonicMs ?? collectionEndedMonotonicMs
   return {
-    schemaVersion: 1,
+    schemaVersion: 2,
     sequence,
-    capturedAtMs,
-    elapsedMs: capturedAtMs - anchor,
+    capturedAtMs: Date.now(),
+    collectionStartedMonotonicMs,
+    collectionEndedMonotonicMs,
+    monotonicElapsedMs: collectionEndedMonotonicMs - anchor,
     inventoryRevision: snapshot.revision,
     desiredSoulIds,
     souls,
     metrics,
     pendingLossNotices: notices.length,
-    retainedBytes: retainedBytes(instance),
+    retainedBytes: { terminalSpools: retained.terminalSpools, runtimeLogs: retained.runtimeLogs },
+    terminalOutput: retained.terminalOutput,
   }
 }
 
@@ -167,170 +228,271 @@ function appendSample(sample: RuntimeSoakSample): void {
   fs.appendFileSync(samplesPath, `${JSON.stringify(sample)}\n`, { mode: 0o600 })
   h.recordLifecycle('phase5.soak.sample', {
     sequence: sample.sequence,
-    elapsedMs: sample.elapsedMs,
+    monotonicElapsedMs: sample.monotonicElapsedMs,
+    collectionMs: sample.collectionEndedMonotonicMs - sample.collectionStartedMonotonicMs,
     desiredSouls: sample.desiredSoulIds.length,
     terminalSpoolBytes: sample.retainedBytes.terminalSpools,
     runtimeLogBytes: sample.retainedBytes.runtimeLogs,
   })
 }
 
+function terminalSpec(projectKey: string): Record<string, unknown> {
+  const workspace = h.repoRoot
+  const rawGitCommon = execFileSync('git', ['rev-parse', '--git-common-dir'], { cwd: workspace, encoding: 'utf8' }).trim()
+  const gitCommonDir = fs.realpathSync(path.isAbsolute(rawGitCommon) ? rawGitCommon : path.resolve(workspace, rawGitCommon))
+  return {
+    terminalId: `terminal-${newRequest()}`,
+    streamId: `stream-${newRequest()}`,
+    mode: 'shell',
+    program: '/bin/bash',
+    args: ['--noprofile', '--norc'],
+    env: {
+      PATH: '/usr/local/bin:/usr/bin:/bin',
+      TERM: 'xterm-256color',
+      LANG: 'C.UTF-8',
+      HOME: '/home/freshell/provider',
+    },
+    cwd: workspace,
+    runAsUid: 65_534,
+    runAsGid: 0,
+    cols: 100,
+    rows: 30,
+    projectKey,
+    workspacePath: workspace,
+    gitCommonDir,
+    createRequestId: `create-${newRequest()}`,
+  }
+}
+
 function safeError(error: unknown): string {
   return error instanceof Error ? error.message : String(error)
 }
 
-try {
-  await h.prepare()
-  supervisor = await h.startSupervisor({
-    scenarioId: 'phase5-30m-soak',
-    installationBudget: {
-      cpuMilli: 4_000,
-      memoryBytes: 4 * 1024 * 1024 * 1024,
-      swapBytes: 0,
-      pidsMax: 2_048,
-    },
-    projectBudget: {
-      cpuMilli: 1_200,
-      memoryBytes: 1024 * 1024 * 1024,
-      swapBytes: 0,
-      pidsMax: 512,
-    },
-    env: {
-      FRESHELL_RUNTIME_OUTPUT_SPOOL_BYTES: String(1024 * 1024),
-    },
-  })
-  controlEpoch = await epoch()
-  await h.adminOk(supervisor, h.migrationPlanBody({
-    requestedMode: 'managed-opt-in',
-    apply: true,
-    expectedControlEpoch: controlEpoch,
-  }), { requestId: newRequest() })
+function readEvidence(fileName: string): Buffer {
+  const file = path.join(h.evidenceDir, fileName)
+  return fs.existsSync(file) ? fs.readFileSync(file) : Buffer.alloc(0)
+}
 
-  for (let index = 0; index < 50; index += 1) {
-    const fixture = workloadFixture(index)
-    const workload = { soulId: newSoul(), fixture }
-    workloads.push(workload)
-    await h.adminOk(supervisor, h.launchBody({
-      soulId: workload.soulId,
-      fixture,
-      limits: limitsFor(fixture),
-      profile: 'test_fixture',
-      projectKey: `soak-project-${Math.floor(index / 10)}`,
-      expectedControlEpoch: controlEpoch,
-      viewIntent: {
-        ownerId: 'phase5-soak',
-        workspaceId: `soak-project-${Math.floor(index / 10)}`,
-        kind: 'automatic_primary',
-        preferredTabId: `soak-tab-${index}`,
-        preferredPaneId: `soak-pane-${index}`,
-        title: `Soak fixture ${index}`,
-        placementGroup: 'Recovered agents',
-        visibility: 'visible',
-      },
-    }), { requestId: newRequest() })
-  }
-
-  // Setup/build/launch time is deliberately outside the measured window.
-  // The first complete inventory+metric sample establishes the baseline only
-  // after all 50 launches have returned and are independently observable.
-  fs.writeFileSync(samplesPath, '', { mode: 0o600 })
-  const first = await collectSample(0)
-  appendSample(first)
-  const measurementStartedAtMs = first.capturedAtMs
-  while (true) {
-    const remaining = desiredDuration - (Date.now() - measurementStartedAtMs)
-    if (remaining <= 0) break
-    await new Promise((resolve) => setTimeout(resolve, Math.min(SAMPLE_INTERVAL_MS, remaining)))
-    appendSample(await collectSample(samples.length, measurementStartedAtMs))
-  }
-  if (samples.at(-1)!.elapsedMs < desiredDuration) {
-    appendSample(await collectSample(samples.length, measurementStartedAtMs))
-  }
-} catch (error) {
-  failure = error
-} finally {
-  const cleanup = await h.cleanup()
-  fs.mkdirSync(h.evidenceDir, { recursive: true })
-  if (!fs.existsSync(samplesPath)) fs.writeFileSync(samplesPath, '', { mode: 0o600 })
-  const sampleEvidenceBytes = fs.readFileSync(samplesPath)
-  const brokerPath = path.join(h.evidenceDir, SOAK_BROKER_FILE)
-  const cleanupPath = path.join(h.evidenceDir, SOAK_CLEANUP_FILE)
-  if (!fs.existsSync(brokerPath)) fs.writeFileSync(brokerPath, '', { mode: 0o600 })
-  const brokerEvidenceBytes = fs.readFileSync(brokerPath)
-  const cleanupEvidenceBytes = fs.readFileSync(cleanupPath)
-  const unsafeBrokerAttempts = h.broker?.unsafeAttempts?.().length ?? 0
-  const evidenceRun = runtimeSoakEvidenceRun(h.candidateSha, h.runId)
-  const first = samples[0]
-  const last = samples.at(-1)
-  const errors = [failure ? safeError(failure) : null, ...cleanup.errors].filter((value): value is string => !!value)
-  const receipt: RuntimeSoakReceipt = {
-    schemaVersion: 2,
-    status: 'FAIL',
-    candidateSha: h.candidateSha,
-    runtimeImage: h.imageRef,
-    receiptRunId: h.runId,
-    evidenceRun,
-    desiredWorkloads: workloads,
-    measurement: {
-      startedAtMs: first?.capturedAtMs ?? 0,
-      endedAtMs: last?.capturedAtMs ?? 0,
-      durationMs: first && last ? last.capturedAtMs - first.capturedAtMs : 0,
-      sampleIntervalMs: SAMPLE_INTERVAL_MS,
-    },
-    retentionBounds: {
-      terminalSpoolsBytes: SOAK_MAX_TERMINAL_SPOOL_BYTES,
-      runtimeLogsBytes: SOAK_MAX_RUNTIME_LOG_BYTES,
-    },
-    artifacts: {
-      samples: {
-        path: `${evidenceRun}/${SOAK_SAMPLES_FILE}`,
-        sha256: sampleDigest(sampleEvidenceBytes),
-      },
-      broker: {
-        path: `${evidenceRun}/${SOAK_BROKER_FILE}`,
-        sha256: sampleDigest(brokerEvidenceBytes),
-      },
-      cleanup: {
-        path: `${evidenceRun}/${SOAK_CLEANUP_FILE}`,
-        sha256: sampleDigest(cleanupEvidenceBytes),
-      },
-    },
-    cleanup: {
-      verified: cleanup.ok,
-      unsafeBrokerAttempts,
-      errors: cleanup.errors,
-    },
-    errors,
-  }
-  if (errors.length === 0 && cleanup.ok && unsafeBrokerAttempts === 0) {
-    try {
-      receipt.status = 'PASS'
-      receipt.summary = validateRuntimeSoakReceipt({
-        candidateSha: h.candidateSha,
-        runtimeImage: h.imageRef,
-        receipt,
-        sampleEvidenceBytes,
-        brokerEvidenceBytes,
-        cleanupEvidenceBytes,
-      }).summary
-      validateRuntimeSoakReceipt({
-        candidateSha: h.candidateSha,
-        runtimeImage: h.imageRef,
-        receipt,
-        sampleEvidenceBytes,
-        brokerEvidenceBytes,
-        cleanupEvidenceBytes,
-      })
-    } catch (error) {
-      receipt.status = 'FAIL'
-      receipt.errors.push(safeError(error))
-      delete receipt.summary
-    }
-  }
-  const target = process.env.FRESHELL_RUNTIME_PHASE5_SOAK_RECEIPT
-    || path.join(h.evidenceDir, defaultReceiptFileName('FRESHELL_RUNTIME_PHASE5_SOAK_RECEIPT'))
+function writeReceipt(receipt: unknown): void {
   fs.mkdirSync(path.dirname(target), { recursive: true })
   fs.writeFileSync(target, JSON.stringify(receipt, null, 2), { mode: 0o600 })
   console.log(`[phase5-soak] receipt: ${target}`)
-  console.log(`[phase5-soak] status=${receipt.status} samples=${samples.length} durationMs=${receipt.measurement.durationMs}`)
-  if (receipt.status !== 'PASS') process.exitCode = 1
+}
+
+const candidateBefore = captureRuntimeCandidate(h.repoRoot)
+const preflightFailures = candidateIntegrityFailures(h.candidateSha, candidateBefore, candidateBefore)
+
+if (preflightFailures.length > 0) {
+  const candidateAfter = captureRuntimeCandidate(h.repoRoot)
+  const failures = candidateIntegrityFailures(h.candidateSha, candidateBefore, candidateAfter)
+  writeReceipt({
+    schemaVersion: 3,
+    status: 'BLOCKED',
+    candidateSha: h.candidateSha,
+    receiptRunId: h.runId,
+    evidenceRun: runtimeSoakEvidenceRun(h.candidateSha, h.runId),
+    preflightOnly: true,
+    candidateIntegrity: { before: candidateBefore, after: candidateAfter, failures },
+    cleanup: { verified: true, unsafeBrokerAttempts: 0, errors: [] },
+    errors: failures,
+  })
+  console.error(`[phase5-soak] status=BLOCKED preflight=${failures.join('; ')}`)
+  process.exitCode = 2
+} else {
+  try {
+    // Once clean preflight passes, any partial prepare may own resources and
+    // therefore requires the harness cleanup path.
+    prepared = true
+    await h.prepare()
+    supervisor = await h.startSupervisor({
+      scenarioId: 'phase5-30m-soak',
+      installationBudget: {
+        cpuMilli: 4_000,
+        memoryBytes: 4 * 1024 * 1024 * 1024,
+        swapBytes: 0,
+        pidsMax: 2_048,
+      },
+      projectBudget: {
+        cpuMilli: 1_200,
+        memoryBytes: 1024 * 1024 * 1024,
+        swapBytes: 0,
+        pidsMax: 512,
+      },
+      env: {
+        FRESHELL_RUNTIME_OUTPUT_SPOOL_BYTES: String(SOAK_TERMINAL_SPOOL_CONFIGURED_BYTES),
+      },
+    })
+    controlEpoch = await epoch()
+    await h.adminOk(supervisor, h.migrationPlanBody({
+      requestedMode: 'managed-opt-in',
+      apply: true,
+      expectedControlEpoch: controlEpoch,
+    }), { requestId: newRequest() })
+
+    for (let index = 0; index < 50; index += 1) {
+      const fixture = workloadFixture(index)
+      const workload = { soulId: newSoul(), fixture }
+      workloads.push(workload)
+      const projectKey = `soak-project-${Math.floor(index / 10)}`
+      const limits = limitsFor(fixture)
+      const launch = dataOf(await h.adminOk(supervisor, h.launchBody({
+        soulId: workload.soulId,
+        ...(fixture === 'shell_output'
+          ? { provider: 'shell', terminal: terminalSpec(projectKey) }
+          : { fixture }),
+        limits,
+        profile: 'custom',
+        projectKey,
+        expectedControlEpoch: controlEpoch,
+        viewIntent: {
+          ownerId: 'phase5-soak',
+          workspaceId: projectKey,
+          kind: 'automatic_primary',
+          preferredTabId: `soak-tab-${index}`,
+          preferredPaneId: `soak-pane-${index}`,
+          title: `Soak fixture ${index}`,
+          placementGroup: 'Recovered agents',
+          visibility: 'visible',
+        },
+      }), { requestId: newRequest() }), 'launch')
+      if (Object.entries(limits).some(([field, value]) => launch.effectiveLimits?.[field] !== value)) {
+        throw new Error(`owned ${fixture} workload did not receive its fixed calibrated limits`)
+      }
+      if (fixture === 'shell_output') {
+        const observed = h.execOwnedContainerExact(
+          String(launch.view.containerId),
+          ['sh', '-lc', 'printf "%s" "$FRESHELL_RUNTIME_OUTPUT_SPOOL_BYTES"'],
+        ).trim()
+        shellSpoolConfiguredBytes = Number(observed)
+        if (shellSpoolConfiguredBytes !== SOAK_TERMINAL_SPOOL_CONFIGURED_BYTES) {
+          throw new Error('owned shell workload did not receive the required 1 MiB terminal spool configuration')
+        }
+      }
+    }
+
+    const shell = workloads.find(({ fixture }) => fixture === 'shell_output')!
+    const inputRequestId = newRequest()
+    const boundedOutputCommand = `while :; do printf 'SOAK_OUTPUT %0240d\\n' 0; sleep 1; done\n`
+    await h.adminOk(
+      supervisor,
+      h.terminalInputBody(shell.soulId, boundedOutputCommand, controlEpoch),
+      { requestId: inputRequestId },
+    )
+    terminalInputProof = {
+      soulId: shell.soulId,
+      requestId: inputRequestId,
+      dispatchCount: 1,
+      spoolConfiguredBytesObserved: shellSpoolConfiguredBytes!,
+    }
+
+    await new Promise((resolve) => setTimeout(resolve, BASELINE_SETTLE_MS))
+    fs.writeFileSync(samplesPath, '', { mode: 0o600 })
+    const first = await collectSample(0)
+    appendSample(first)
+    validateRuntimeSoakBaseline(first, workloads)
+    const measurementStartedMonotonicMs = first.collectionEndedMonotonicMs
+
+    while (true) {
+      const remaining = desiredDuration - (monotonicNow() - measurementStartedMonotonicMs)
+      if (remaining <= 0) break
+      await new Promise((resolve) => setTimeout(resolve, Math.min(SAMPLE_INTERVAL_MS, remaining)))
+      appendSample(await collectSample(samples.length, measurementStartedMonotonicMs))
+    }
+    if (samples.at(-1)!.monotonicElapsedMs < desiredDuration) {
+      appendSample(await collectSample(samples.length, measurementStartedMonotonicMs))
+    }
+  } catch (error) {
+    failure = error
+  } finally {
+    let cleanup = { ok: true, errors: [] as string[] }
+    if (prepared) {
+      try {
+        cleanup = await h.cleanup()
+      } catch (error) {
+        const message = `cleanup failed: ${safeError(error)}`
+        cleanup = { ok: false, errors: [message] }
+        failure ??= error
+      }
+    }
+    const candidateAfter = captureRuntimeCandidate(h.repoRoot)
+    const integrityFailures = candidateIntegrityFailures(h.candidateSha, candidateBefore, candidateAfter)
+    fs.mkdirSync(h.evidenceDir, { recursive: true })
+    if (!fs.existsSync(samplesPath)) fs.writeFileSync(samplesPath, '', { mode: 0o600 })
+    const sampleEvidenceBytes = readEvidence(SOAK_SAMPLES_FILE)
+    const brokerEvidenceBytes = readEvidence(SOAK_BROKER_FILE)
+    const cleanupEvidenceBytes = readEvidence(SOAK_CLEANUP_FILE)
+    const manifestEvidenceBytes = readEvidence('manifest.json')
+    const buildEvidenceBytes = readEvidence('build.json')
+    const unsafeBrokerAttempts = h.broker?.unsafeAttempts?.().length ?? 0
+    const evidenceRun = runtimeSoakEvidenceRun(h.candidateSha, h.runId)
+    const first = samples[0]
+    const last = samples.at(-1)
+    const errors = [
+      failure ? safeError(failure) : null,
+      ...cleanup.errors,
+      ...integrityFailures,
+      terminalInputProof ? null : 'shell output input was not dispatched',
+    ].filter((value): value is string => !!value)
+    const receipt: RuntimeSoakReceipt = {
+      schemaVersion: 3,
+      status: 'FAIL',
+      candidateSha: h.candidateSha,
+      runtimeImage: h.imageRef,
+      receiptRunId: h.runId,
+      evidenceRun,
+      desiredWorkloads: workloads,
+      candidateIntegrity: { before: candidateBefore, after: candidateAfter, failures: integrityFailures },
+      measurement: {
+        startedAtMs: first?.capturedAtMs ?? 0,
+        endedAtMs: last?.capturedAtMs ?? 0,
+        monotonicStartedMs: first?.collectionEndedMonotonicMs ?? 0,
+        monotonicEndedMs: last?.collectionEndedMonotonicMs ?? 0,
+        monotonicDurationMs: last?.monotonicElapsedMs ?? 0,
+        sampleIntervalMs: SAMPLE_INTERVAL_MS,
+      },
+      retentionBounds: {
+        terminalSpoolConfiguredBytes: SOAK_TERMINAL_SPOOL_CONFIGURED_BYTES,
+        terminalSpoolsBytes: SOAK_MAX_TERMINAL_SPOOL_BYTES,
+        runtimeLogsBytes: SOAK_MAX_RUNTIME_LOG_BYTES,
+      },
+      artifacts: {
+        samples: { path: `${evidenceRun}/${SOAK_SAMPLES_FILE}`, sha256: sampleDigest(sampleEvidenceBytes) },
+        broker: { path: `${evidenceRun}/${SOAK_BROKER_FILE}`, sha256: sampleDigest(brokerEvidenceBytes) },
+        cleanup: { path: `${evidenceRun}/${SOAK_CLEANUP_FILE}`, sha256: sampleDigest(cleanupEvidenceBytes) },
+        manifest: { path: `${evidenceRun}/manifest.json`, sha256: sampleDigest(manifestEvidenceBytes) },
+        build: { path: `${evidenceRun}/build.json`, sha256: sampleDigest(buildEvidenceBytes) },
+      },
+      terminalInput: terminalInputProof ?? {
+        soulId: '',
+        requestId: 'not-dispatched',
+        dispatchCount: 1,
+        spoolConfiguredBytesObserved: 0,
+      },
+      cleanup: { verified: cleanup.ok, unsafeBrokerAttempts, errors: cleanup.errors },
+      errors,
+    }
+    if (errors.length === 0 && cleanup.ok && unsafeBrokerAttempts === 0) {
+      try {
+        receipt.status = 'PASS'
+        const validated = validateRuntimeSoakReceipt({
+          candidateSha: h.candidateSha,
+          runtimeImage: h.imageRef,
+          receipt,
+          sampleEvidenceBytes,
+          brokerEvidenceBytes,
+          cleanupEvidenceBytes,
+          manifestEvidenceBytes,
+          buildEvidenceBytes,
+        })
+        receipt.summary = validated.summary
+      } catch (error) {
+        receipt.status = 'FAIL'
+        receipt.errors.push(safeError(error))
+        delete receipt.summary
+      }
+    }
+    writeReceipt(receipt)
+    console.log(`[phase5-soak] status=${receipt.status} samples=${samples.length} monotonicDurationMs=${receipt.measurement.monotonicDurationMs}`)
+    if (receipt.status !== 'PASS') process.exitCode = 1
+  }
 }
