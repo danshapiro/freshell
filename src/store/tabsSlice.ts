@@ -303,6 +303,10 @@ export const tabsSlice = createSlice({
       const payload = action.payload || {}
 
       const id = payload.id || nanoid()
+      // API tab.create delivery and the durable inventory projection can race
+      // or be redelivered after reconnect. An explicit tab ID denotes one view,
+      // not another request to append/activate it or overwrite user state.
+      if (state.tabs.some((existing) => existing.id === id)) return
       const codingCliProvider = payload.codingCliProvider
       const sessionRef = sanitizeSessionRef(payload.sessionRef)
       const tab: Tab = {
