@@ -48,8 +48,14 @@ assets/
 .vscode/
 .idea/
 
-# Secrets — NEVER include in the image
+# Secrets — NEVER include in the image or upload to a remote build service.
 .env
+/.env.*
+# Runtime receipts can contain native conversations, provider diagnostics,
+# private bootstrap mounts and exact ownership handles. They are qualification
+# artifacts, not build inputs; keep both evidence and scratch binaries local.
+/.runtime-evidence/
+/.runtime-build/
 
 # Caches and temp files
 .eslintcache
