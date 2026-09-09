@@ -18,6 +18,13 @@ export type ProviderQualificationRow = {
   nativeStateCaptured: boolean
   runtimeOwned: boolean
   limitsVerified: boolean
+  swapMaxVerified: boolean
+  limitEvidence: {
+    cpuMax: string
+    memoryMax: string
+    swapMax: string
+    pidsMax: string
+  }
   automaticResume: boolean
   profileVerified: boolean
   releaseBinary: boolean
@@ -26,7 +33,22 @@ export type ProviderQualificationRow = {
   sameNativeSession: boolean
   followUpCompleted: boolean
   onlyOneWriter: boolean
+  writerClaim: {
+    provider: string
+    providerStoreId: string
+    nativeSessionId: string
+    soulId: string
+    incarnationId: string
+    activeClaimCount: number
+    globalConflictingClaimCount: number
+  }
   oldEnclosureVerifiedEmpty: boolean
+  verifiedEmptyOrdering: {
+    stopOutcome: 'verified_empty'
+    activeClaimCountAfterStop: number
+    globalConflictingClaimCountAfterStop: number
+    oldContainerRunningAfterStop: boolean
+  }
   lostNoticeCount: number
   crashKinds: string[]
   [key: string]: unknown
@@ -37,6 +59,17 @@ export type QualificationArtifactReference = {
   sha256: string
 }
 
+export type ProviderQualificationBuildEvidence = {
+  kind: 'production' | 'qualification_fixture'
+  serverFeatures: string[]
+  supervisorFeatures: string[]
+  qualificationProviders: string[]
+  binaries: {
+    server: { path: string, sha256: string, bytes: number }
+    supervisor: { path: string, sha256: string, bytes: number }
+  }
+}
+
 export type ProviderQualificationReceiptV2 = {
   schemaVersion: 2
   status: 'PASS'
@@ -44,6 +77,7 @@ export type ProviderQualificationReceiptV2 = {
   receiptRunId: string
   evidenceRun: string
   runtimeImage: string
+  qualificationBuild: ProviderQualificationBuildEvidence
   providers: ProviderQualificationRow[]
   artifacts: {
     assertions: QualificationArtifactReference
@@ -67,6 +101,8 @@ export type ValidateProviderQualificationReceiptInput = {
   expectedRuntimeImage: string
   receipt: unknown
   allowLegacyV1ForProviders?: readonly string[]
+  /** Preliminary evidence consumers must opt in explicitly; final gates omit this. */
+  acceptedBuildKinds?: readonly ProviderQualificationBuildEvidence['kind'][]
 }
 
 export type ValidatedProviderQualificationReceipt = {
@@ -90,13 +126,14 @@ export function buildProviderQualificationReceipt(
   if (fs.realpathSync(input.evidenceDir) !== expectedDir) {
     throw new Error(`qualification evidence directory must be the candidate-bound run ${evidenceRun}`)
   }
-  assertCandidateAndImageArtifacts(
+  const qualificationBuild = assertCandidateAndImageArtifacts(
     expectedDir,
     input.candidateSha,
     input.receiptRunId,
     input.runtimeImage,
   )
   validateProviderRows(input.providers)
+  assertQualificationProviderSelection(qualificationBuild, input.providers)
   assertPinnedProviderVersions(repoRoot, input.providers)
   assertBrokerSafe(path.join(expectedDir, PROVIDER_QUALIFICATION_BROKER_FILE))
   assertCleanupOk(path.join(expectedDir, PROVIDER_QUALIFICATION_CLEANUP_FILE))
@@ -107,6 +144,7 @@ export function buildProviderQualificationReceipt(
     candidateSha: input.candidateSha,
     receiptRunId: input.receiptRunId,
     runtimeImage: input.runtimeImage,
+    qualificationBuild,
     providers: input.providers,
   }, null, 2))
 
@@ -121,6 +159,7 @@ export function buildProviderQualificationReceipt(
     receiptRunId: input.receiptRunId,
     evidenceRun,
     runtimeImage: input.runtimeImage,
+    qualificationBuild,
     providers: input.providers,
     artifacts: {
       assertions: artifact(PROVIDER_QUALIFICATION_ASSERTIONS_FILE),
@@ -133,6 +172,7 @@ export function buildProviderQualificationReceipt(
     candidateSha: input.candidateSha,
     expectedRuntimeImage: input.runtimeImage,
     receipt,
+    acceptedBuildKinds: [qualificationBuild.kind],
   })
   return receipt
 }
@@ -166,12 +206,19 @@ export function validateProviderQualificationReceipt(
   if (fs.realpathSync(evidenceDir) !== evidenceDir) {
     throw new Error(`qualification evidence run must not traverse a symlink: ${evidenceRun}`)
   }
-  assertCandidateAndImageArtifacts(
+  const qualificationBuild = assertCandidateAndImageArtifacts(
     evidenceDir,
     input.candidateSha,
     receipt.receiptRunId,
     input.expectedRuntimeImage,
   )
+  const acceptedBuildKinds = new Set(input.acceptedBuildKinds ?? ['production'])
+  if (!acceptedBuildKinds.has(qualificationBuild.kind)) {
+    throw new Error(`qualification ${qualificationBuild.kind} build cannot satisfy this production receipt gate`)
+  }
+  if (stableJson(receipt.qualificationBuild) !== stableJson(qualificationBuild)) {
+    throw new Error('receipt qualification build differs from the candidate-bound build artifact')
+  }
 
   const artifacts = object(receipt.artifacts, 'receipt artifacts')
   const assertionsBytes = validateArtifact(
@@ -198,10 +245,14 @@ export function validateProviderQualificationReceipt(
   stringEqual(assertions.candidateSha, input.candidateSha, 'assertion artifact candidate SHA')
   stringEqual(assertions.receiptRunId, receipt.receiptRunId, 'assertion artifact run id')
   stringEqual(assertions.runtimeImage, input.expectedRuntimeImage, 'assertion artifact runtime image')
+  if (stableJson(assertions.qualificationBuild) !== stableJson(qualificationBuild)) {
+    throw new Error('qualification assertion build differs from the candidate-bound build artifact')
+  }
   if (stableJson(assertions.providers) !== stableJson(receipt.providers)) {
     throw new Error('receipt provider summary differs from the hashed assertion artifact')
   }
   validateProviderRows(assertions.providers)
+  assertQualificationProviderSelection(qualificationBuild, assertions.providers)
   assertPinnedProviderVersions(repoRoot, assertions.providers)
   assertBrokerSafeBytes(brokerBytes)
   assertCleanupOkBytes(cleanupBytes)
@@ -254,6 +305,7 @@ function validateProviderRows(value: unknown): asserts value is ProviderQualific
       'nativeStateCaptured',
       'runtimeOwned',
       'limitsVerified',
+      'swapMaxVerified',
       'automaticResume',
       'profileVerified',
       'releaseBinary',
@@ -265,6 +317,29 @@ function validateProviderRows(value: unknown): asserts value is ProviderQualific
       'oldEnclosureVerifiedEmpty',
     ] as const) {
       if (row[field] !== true) throw new Error(`${provider}.${field} must be true in qualification evidence`)
+    }
+    const limits = object(row.limitEvidence, `${provider}.limitEvidence`)
+    for (const field of ['cpuMax', 'memoryMax', 'swapMax', 'pidsMax'] as const) {
+      nonEmptyString(limits[field], `${provider}.limitEvidence.${field}`)
+    }
+    if (limits.swapMax !== '0') {
+      throw new Error(`${provider}.limitEvidence.swapMax must prove swap is disabled`)
+    }
+    const claim = object(row.writerClaim, `${provider}.writerClaim`)
+    stringEqual(claim.provider, provider, `${provider}.writerClaim.provider`)
+    stringEqual(claim.nativeSessionId, row.nativeSessionId, `${provider}.writerClaim.nativeSessionId`)
+    for (const field of ['providerStoreId', 'soulId', 'incarnationId'] as const) {
+      nonEmptyString(claim[field], `${provider}.writerClaim.${field}`)
+    }
+    if (claim.activeClaimCount !== 1 || claim.globalConflictingClaimCount !== 0) {
+      throw new Error(`${provider}.writerClaim must prove exactly one global tuple owner`)
+    }
+    const ordering = object(row.verifiedEmptyOrdering, `${provider}.verifiedEmptyOrdering`)
+    if (ordering.stopOutcome !== 'verified_empty'
+      || ordering.activeClaimCountAfterStop !== 0
+      || ordering.globalConflictingClaimCountAfterStop !== 0
+      || ordering.oldContainerRunningAfterStop !== false) {
+      throw new Error(`${provider}.verifiedEmptyOrdering must prove claim release and enclosure emptiness after stop`)
     }
     if (row.lostNoticeCount !== 0) {
       throw new Error(`${provider}.lostNoticeCount must be zero in qualification evidence`)
@@ -281,7 +356,7 @@ function assertCandidateAndImageArtifacts(
   candidateSha: string,
   receiptRunId: string,
   runtimeImage: string,
-): void {
+): ProviderQualificationBuildEvidence {
   const manifest = readJsonObject(path.join(evidenceDir, 'manifest.json'), 'run manifest')
   const execution = object(manifest.execution, 'run manifest execution')
   stringEqual(execution.candidateSha, candidateSha, 'run manifest candidate SHA')
@@ -289,6 +364,78 @@ function assertCandidateAndImageArtifacts(
   const build = readJsonObject(path.join(evidenceDir, 'build.json'), 'run build artifact')
   stringEqual(build.candidateSha, candidateSha, 'build artifact candidate SHA')
   stringEqual(build.runtimeImage, runtimeImage, 'build artifact runtime image')
+  return validateQualificationBuild(build.qualificationBuild)
+}
+
+function validateQualificationBuild(value: unknown): ProviderQualificationBuildEvidence {
+  const build = object(value, 'qualification build evidence')
+  if (build.kind !== 'production' && build.kind !== 'qualification_fixture') {
+    throw new Error('qualification build kind must be production or qualification_fixture')
+  }
+  const stringArray = (candidate: unknown, label: string): string[] => {
+    if (!Array.isArray(candidate) || candidate.some((item) => typeof item !== 'string' || !item)) {
+      throw new Error(`${label} must be an array of non-empty strings`)
+    }
+    if (new Set(candidate).size !== candidate.length) throw new Error(`${label} must not contain duplicates`)
+    return candidate
+  }
+  const serverFeatures = stringArray(build.serverFeatures, 'qualification server features')
+  const supervisorFeatures = stringArray(build.supervisorFeatures, 'qualification supervisor features')
+  const qualificationProviders = stringArray(build.qualificationProviders, 'qualification providers')
+  const binaries = object(build.binaries, 'qualification binaries')
+  const validateBinary = (candidate: unknown, label: string) => {
+    const binary = object(candidate, label)
+    nonEmptyString(binary.path, `${label} path`)
+    if (typeof binary.sha256 !== 'string' || !/^[a-f0-9]{64}$/.test(binary.sha256)) {
+      throw new Error(`${label} must include a SHA-256 digest`)
+    }
+    if (!Number.isSafeInteger(binary.bytes) || binary.bytes <= 0) {
+      throw new Error(`${label} must include a positive byte size`)
+    }
+    return binary as ProviderQualificationBuildEvidence['binaries']['server']
+  }
+  const result: ProviderQualificationBuildEvidence = {
+    kind: build.kind,
+    serverFeatures,
+    supervisorFeatures,
+    qualificationProviders,
+    binaries: {
+      server: validateBinary(binaries.server, 'qualification server binary'),
+      supervisor: validateBinary(binaries.supervisor, 'qualification supervisor binary'),
+    },
+  }
+  if (result.kind === 'production') {
+    if (qualificationProviders.length !== 0
+      || stableJson([...serverFeatures].sort()) !== stableJson(['managed-runtime-v1'])
+      || supervisorFeatures.length !== 0) {
+      throw new Error('production qualification build must use only managed-runtime-v1 with no qualification policy')
+    }
+  } else {
+    const allowedPending = new Set(['claude', 'codex', 'amplifier'])
+    if (qualificationProviders.length === 0
+      || qualificationProviders.some((provider) => !allowedPending.has(provider))
+      || stableJson([...serverFeatures].sort()) !== stableJson(['managed-provider-qualification'])
+      || stableJson([...supervisorFeatures].sort()) !== stableJson(['provider-qualification'])) {
+      throw new Error('qualification fixture must pin its feature set and selected providers')
+    }
+  }
+  return result
+}
+
+function assertQualificationProviderSelection(
+  build: ProviderQualificationBuildEvidence,
+  providers: ProviderQualificationRow[],
+): void {
+  if (build.kind !== 'qualification_fixture') return
+  const pending = new Set(['claude', 'codex', 'amplifier'])
+  const rows = providers
+    .map((row) => row.provider)
+    .filter((provider) => pending.has(provider))
+    .sort()
+  const selected = [...build.qualificationProviders].sort()
+  if (stableJson(rows) !== stableJson(selected)) {
+    throw new Error('qualification fixture provider rows must exactly match its pending-provider allowlist')
+  }
 }
 
 function assertPinnedProviderVersions(repoRoot: string, providers: ProviderQualificationRow[]): void {

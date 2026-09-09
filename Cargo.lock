@@ -1422,6 +1422,7 @@ dependencies = [
  "base64 0.22.1",
  "chrono",
  "dotenvy",
+ "freshell-agent-runtime",
  "freshell-api",
  "freshell-codex",
  "freshell-extensions",

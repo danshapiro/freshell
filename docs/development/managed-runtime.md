@@ -307,15 +307,16 @@ real Claude credential can instead be supplied by exact
 file read-only and the host copies its bytes into the soul-owned provider volume.
 Codex and OpenCode use the analogous
 `FRESHELL_MANAGED_CODEX_AUTH_FILE` and
-`FRESHELL_MANAGED_OPENCODE_AUTH_FILE` references. Amplifier accepts two
-independent references:
-`FRESHELL_MANAGED_AMPLIFIER_SETTINGS_FILE`, copied to
-`.amplifier/settings.yaml`, and `FRESHELL_MANAGED_AMPLIFIER_OAUTH_FILE`, copied
-to `.amplifier/openai-chatgpt-oauth.json`. When those Amplifier variables are
-unset, existing regular files at the same two paths under `~/.amplifier` are
-used. Every source is canonicalized and admitted by the runtime broker as an
-exact read-only single-file mount. The registry and Docker create JSON contain
-only canonical references, never file bytes.
+`FRESHELL_MANAGED_OPENCODE_AUTH_FILE` references. Amplifier instead accepts one
+typed `FRESHELL_MANAGED_AMPLIFIER_ONECLI_KEYS_FILE` reference, restricted to
+the approved private `~/.amplifier/keys.env` used by `amplifier-onecli`. The
+runtime does not source or execute that file: the session host parses a bounded
+allowlist, checks the explicit non-secret OneCLI endpoint, and injects the
+resolved credentials only into the Amplifier child. The pinned runtime image
+installs and verifies its own Haiku/low settings in the soul-private home. Raw
+OAuth conflicts fail closed. Every source is canonicalized and admitted by the
+runtime broker as an exact read-only single-file mount. The registry and Docker
+create JSON contain only canonical references, never secret bytes.
 
 The supported Phase 2 backend is rootless Docker. Its bind-mount ownership maps
 the host user's workspace to container uid/gid 0. Freshell therefore keeps the

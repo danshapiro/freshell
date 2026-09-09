@@ -69,21 +69,31 @@ evidence contains those exact values. Codex must show
 `-c model_reasoning_effort="minimal"`, not a synthesized flag or provider
 default.
 
-Amplifier campaigns provide its lowest-cost selection and OAuth credentials as
-two separate files:
+Amplifier qualification uses the approved
+`/home/sentinelx/sentinelx-tools/amplifier-onecli` credential source model,
+but never executes that wrapper or sources shell text. The web process stores
+only a canonical reference to the private `~/.amplifier/keys.env`; the session
+host's bounded parser resolves its allowlisted names immediately before spawn
+and adds them only to the unprivileged Amplifier child. The runtime image owns
+the exact `claude-haiku-4-5-20251001` / `low` settings and wrapper. Supply the
+non-secret approved endpoint explicitly:
 
 ```bash
-export FRESHELL_MANAGED_AMPLIFIER_SETTINGS_FILE=/absolute/path/to/settings.yaml
-export FRESHELL_MANAGED_AMPLIFIER_OAUTH_FILE=/absolute/path/to/openai-chatgpt-oauth.json
+export FRESHELL_MANAGED_AMPLIFIER_ONECLI_KEYS_FILE="$HOME/.amplifier/keys.env"
+export FRESHELL_MANAGED_AMPLIFIER_ONECLI_ENDPOINT='https://approved-onecli-endpoint.example/v1'
+export FRESHELL_RUNTIME_AMPLIFIER_MODEL='claude-haiku-4-5-20251001'
+export FRESHELL_RUNTIME_AMPLIFIER_REASONING_EFFORT='low'
 ```
 
-If omitted, the harness/runtime resolves regular files at
-`~/.amplifier/settings.yaml` and
-`~/.amplifier/openai-chatgpt-oauth.json`. The restricted broker allowlist must
-contain both canonical paths. Evidence may record those references and their
-destinations, but must never record either file's bytes. These instructions
-prepare a campaign only; all three providers remain deferred and
-release-disabled until their separate certification change lands.
+The keys-file variable may be omitted only when the canonical approved default
+exists with mode `0600` or stricter. A different keys file, a placeholder,
+unknown key, malformed assignment, endpoint mismatch, expensive model/effort,
+or any raw OAuth file fails closed with an actionable error. Secret bytes are
+absent from launch specs, the registry, Docker environment, logs, and receipts.
+Model and effort evidence comes from Amplifier's native redacted
+`session:config` event, never imagined resume flags. These instructions prepare
+a campaign only; all three providers remain deferred and release-disabled until
+their separate certification change lands.
 
 Receipt paths may be supplied through the `FRESHELL_RUNTIME_PHASE5_*_RECEIPT`
 environment variables. The gate validates schema, exact candidate SHA, measured
@@ -98,19 +108,32 @@ live browser run. Its assertion, broker, and cleanup artifact references each
 carry a SHA-256 digest. Certification resolves those references only inside
 `.runtime-evidence/<candidate-sha>/<receipt-run-id>/`, verifies the run manifest
 and build record, hashes the files again, and derives provider, cleanup, and
-unsafe-attempt verdicts from those artifacts. A stale, missing, path-escaped, or
-tampered artifact fails certification. Schema v1 remains a narrow migration
+unsafe-attempt verdicts from those artifacts. The build artifact and receipt
+also pin production versus `qualification_fixture`, exact feature sets,
+selected providers, and server/supervisor binary hashes. Final gates accept
+production only; a preliminary qualification-fixture receipt must be requested
+explicitly and can never promote a production capability. A stale, missing,
+path-escaped, or tampered artifact fails certification. Schema v1 remains a narrow migration
 exception for an OpenCode-only receipt; adding any newly promoted provider
 requires schema v2.
 
-The combined live producer is explicit opt-in and is excluded from the default
-landing campaign until the checked-in capability flags are promoted:
+The live producer requires an explicit per-provider selection. Claude or Codex
+can therefore qualify without Amplifier credentials, and Amplifier setup cannot
+turn a missing provider into a blanket skip:
 
 ```bash
 FRESHELL_RUNTIME_MANAGED_PROVIDER_QUALIFICATION_LIVE=1 \
-FRESHELL_RUNTIME_AMPLIFIER_MODEL='<exact-live-model>' \
-FRESHELL_RUNTIME_AMPLIFIER_REASONING_EFFORT='<exact-live-effort>' \
+FRESHELL_RUNTIME_MANAGED_PROVIDER_QUALIFICATION_PROVIDERS='claude,codex' \
 npm run test:runtime:campaign -- --only managed-provider-qualification
+```
+
+For an isolated receipt producer, select exactly one provider (no implicit
+Amplifier prerequisite is evaluated for the other providers):
+
+```bash
+npm run test:runtime:provider-qualification -- --provider claude
+npm run test:runtime:provider-qualification -- --provider codex
+npm run test:runtime:provider-qualification -- --provider amplifier
 ```
 
 The campaign refuses to treat a missing live flag or a Playwright skip as a

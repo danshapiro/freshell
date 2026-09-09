@@ -29,6 +29,8 @@
       "commit": "1873aa980535c99a743b17172e4231833f6c8741",
       "version": "0.1.1",
       "foundationCommit": "0d5c5204befc33febfc2bdb8cd8d72ff0a3e6c84",
+      "anthropicProviderCommit": "4cf78c792dd214233d16b373e824135de5687957",
+      "anthropicSdkVersion": "1.0.0",
       "uvVersion": "0.8.22"
     }
   }

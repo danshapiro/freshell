@@ -1,3 +1,4 @@
+import { execFileSync } from 'node:child_process'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
@@ -66,6 +67,21 @@ describe('checked-in provider certification manifest', () => {
 
   it('has no durable-souls claim for an uncertified provider', () => {
     expect(capabilityClaimViolations(loadCapabilityManifest(repoRoot))).toEqual([])
+  })
+
+  it('pins managed Amplifier to the image-owned Haiku/low profile without changing legacy launch', () => {
+    const settings = fs.readFileSync(
+      path.join(repoRoot, 'docker/runtime/amplifier-onecli-haiku-low.yaml'),
+      'utf8',
+    )
+    expect(settings).toContain('default_model: claude-haiku-4-5-20251001')
+    expect(settings).toContain('reasoning_effort: low')
+    expect(settings).not.toMatch(/fable|gpt-5\.6-sol|max/i)
+    execFileSync('sh', ['-n', path.join(repoRoot, 'docker/runtime/amplifier-onecli')])
+    const manifest = JSON.parse(
+      fs.readFileSync(path.join(repoRoot, 'extensions/amplifier/freshell.json'), 'utf8'),
+    )
+    expect(manifest.cli.command).toBe('amplifier')
   })
 
   it('reports a violation when a deferred provider is silently promoted', () => {
@@ -240,6 +256,13 @@ describe('provider qualification receipt v2', () => {
       nativeStateCaptured: true,
       runtimeOwned: true,
       limitsVerified: true,
+      swapMaxVerified: true,
+      limitEvidence: {
+        cpuMax: '50000 100000',
+        memoryMax: '134217728',
+        swapMax: '0',
+        pidsMax: '64',
+      },
       automaticResume: true,
       profileVerified: true,
       releaseBinary: true,
@@ -248,13 +271,31 @@ describe('provider qualification receipt v2', () => {
       sameNativeSession: true,
       followUpCompleted: true,
       onlyOneWriter: true,
+      writerClaim: {
+        provider,
+        providerStoreId: 'store-qualified',
+        nativeSessionId: '11111111-1111-4111-8111-111111111111',
+        soulId: 'soul-qualified',
+        incarnationId: 'inc-qualified',
+        activeClaimCount: 1,
+        globalConflictingClaimCount: 0,
+      },
       oldEnclosureVerifiedEmpty: true,
+      verifiedEmptyOrdering: {
+        stopOutcome: 'verified_empty',
+        activeClaimCountAfterStop: 0,
+        globalConflictingClaimCountAfterStop: 0,
+        oldContainerRunningAfterStop: false,
+      },
       lostNoticeCount: 0,
       crashKinds: ['session_host', 'provider_process'],
     }
   }
 
-  function evidenceFixture(providers = [providerRow()]): {
+  function evidenceFixture(
+    providers = [providerRow()],
+    buildKind: 'production' | 'qualification_fixture' = 'production',
+  ): {
     repoRoot: string
     evidenceDir: string
     receipt: ReturnType<typeof buildProviderQualificationReceipt>
@@ -270,7 +311,22 @@ describe('provider qualification receipt v2', () => {
     fs.writeFileSync(path.join(evidenceDir, 'manifest.json'), JSON.stringify({
       execution: { candidateSha, runId: receiptRunId },
     }))
-    fs.writeFileSync(path.join(evidenceDir, 'build.json'), JSON.stringify({ candidateSha, runtimeImage }))
+    const fakeBinary = { path: '/candidate/freshell', sha256: 'c'.repeat(64), bytes: 123 }
+    fs.writeFileSync(path.join(evidenceDir, 'build.json'), JSON.stringify({
+      candidateSha,
+      runtimeImage,
+      qualificationBuild: {
+        kind: buildKind,
+        serverFeatures: [buildKind === 'qualification_fixture'
+          ? 'managed-provider-qualification'
+          : 'managed-runtime-v1'],
+        supervisorFeatures: buildKind === 'qualification_fixture' ? ['provider-qualification'] : [],
+        qualificationProviders: buildKind === 'qualification_fixture'
+          ? providers.map((row) => row.provider)
+          : [],
+        binaries: { server: fakeBinary, supervisor: fakeBinary },
+      },
+    }))
     fs.writeFileSync(path.join(evidenceDir, 'broker.jsonl'), [
       JSON.stringify({ decision: 'forward', destructive: false, unsafeAttempt: false }),
       JSON.stringify({ decision: 'forward', destructive: true, unsafeAttempt: false }),
@@ -322,6 +378,62 @@ describe('provider qualification receipt v2', () => {
       receipt: fixture.receipt,
       allowLegacyV1ForProviders: ['opencode'],
     }).providers).toEqual([providerRow()])
+  })
+
+  it('never lets a qualification-only fixture receipt satisfy a production gate', () => {
+    const fixture = evidenceFixture([providerRow()], 'qualification_fixture')
+    expect(fixture.receipt.qualificationBuild.kind).toBe('qualification_fixture')
+    expect(() => validateProviderQualificationReceipt({
+      repoRoot: fixture.repoRoot,
+      candidateSha,
+      expectedRuntimeImage: runtimeImage,
+      receipt: fixture.receipt,
+    })).toThrow(/qualification_fixture.*production/i)
+    expect(validateProviderQualificationReceipt({
+      repoRoot: fixture.repoRoot,
+      candidateSha,
+      expectedRuntimeImage: runtimeImage,
+      receipt: fixture.receipt,
+      acceptedBuildKinds: ['qualification_fixture'],
+    }).providers).toEqual([providerRow()])
+  })
+
+  it('binds qualification-fixture rows to the exact pending-provider allowlist', () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'freshell-qualification-selection-'))
+    tempRoots.push(root)
+    const evidenceDir = path.join(root, '.runtime-evidence', candidateSha, receiptRunId)
+    fs.mkdirSync(evidenceDir, { recursive: true })
+    fs.mkdirSync(path.join(root, 'docker/runtime'), { recursive: true })
+    fs.writeFileSync(path.join(root, 'docker/runtime/provider-versions.json'), JSON.stringify({
+      providers: { claude: { version: '2.1.263' } },
+    }))
+    fs.writeFileSync(path.join(evidenceDir, 'manifest.json'), JSON.stringify({
+      execution: { candidateSha, runId: receiptRunId },
+    }))
+    const fakeBinary = { path: '/candidate/freshell', sha256: 'c'.repeat(64), bytes: 123 }
+    fs.writeFileSync(path.join(evidenceDir, 'build.json'), JSON.stringify({
+      candidateSha,
+      runtimeImage,
+      qualificationBuild: {
+        kind: 'qualification_fixture',
+        serverFeatures: ['managed-provider-qualification'],
+        supervisorFeatures: ['provider-qualification'],
+        qualificationProviders: ['codex'],
+        binaries: { server: fakeBinary, supervisor: fakeBinary },
+      },
+    }))
+    fs.writeFileSync(path.join(evidenceDir, 'broker.jsonl'), `${JSON.stringify({ unsafeAttempt: false })}\n`)
+    fs.writeFileSync(path.join(evidenceDir, 'cleanup.json'), JSON.stringify({
+      ok: true, errors: [], unsafeBrokerAttempts: [],
+    }))
+    expect(() => buildProviderQualificationReceipt({
+      repoRoot: root,
+      evidenceDir,
+      candidateSha,
+      receiptRunId,
+      runtimeImage,
+      providers: [providerRow('claude')],
+    })).toThrow(/allowlist/i)
   })
 
   it.each([
@@ -415,11 +527,30 @@ describe('provider qualification receipt v2', () => {
     ['followUpCompleted', false],
     ['onlyOneWriter', false],
     ['limitsVerified', false],
+    ['swapMaxVerified', false],
     ['oldEnclosureVerifiedEmpty', false],
     ['lostNoticeCount', 1],
   ] as const)('rejects provider evidence when %s is not qualifying', (field, value) => {
     const row = { ...providerRow(), [field]: value }
     expect(() => evidenceFixture([row])).toThrow(new RegExp(field, 'i'))
+  })
+
+  it('requires measured swap.max, a globally unique writer tuple, and post-stop ordering', () => {
+    expect(() => evidenceFixture([{
+      ...providerRow(),
+      limitEvidence: { ...providerRow().limitEvidence, swapMax: 'max' },
+    }])).toThrow(/swapMax/i)
+    expect(() => evidenceFixture([{
+      ...providerRow(),
+      writerClaim: { ...providerRow().writerClaim, globalConflictingClaimCount: 1 },
+    }])).toThrow(/writerClaim/i)
+    expect(() => evidenceFixture([{
+      ...providerRow(),
+      verifiedEmptyOrdering: {
+        ...providerRow().verifiedEmptyOrdering,
+        activeClaimCountAfterStop: 1,
+      },
+    }])).toThrow(/verifiedEmptyOrdering/i)
   })
 
   it.each(['providerVersion', 'model', 'reasoningEffort', 'nativeSessionId'] as const)(

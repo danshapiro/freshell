@@ -114,7 +114,7 @@
       "resumeCommand": "amplifier session resume --full-history <exact-id>",
       "zeroTurnPolicy": "stub-is-not-durable-conversation-proof",
       "checkpointPolicy": "provider-session-directory",
-      "bootstrap": ".amplifier/settings.yaml and .amplifier/openai-chatgpt-oauth.json copied before privilege drop",
+      "bootstrap": "approved private keys.env reference resolved into child-only env plus image-pinned OneCLI Haiku/low profile; raw OAuth forbidden",
       "liveGate": "provider-approved-lowest-cost-model",
       "blockedReason": "PENDING_LIVE_QUALIFICATION",
       "recoveryPaths": [

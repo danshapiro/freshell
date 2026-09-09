@@ -269,6 +269,9 @@ export class RestrictedDockerBroker {
       if (terminalWorkload && /^\/run\/freshell-bootstrap\/provider-\d+$/.test(destination) && mode === 'ro' && this.policy.allowedBootstrapFiles?.has(source)) {
         continue
       }
+      if (terminalWorkload && /^\/run\/freshell-secrets\/provider-\d+$/.test(destination) && mode === 'ro' && this.policy.allowedBootstrapFiles?.has(source)) {
+        continue
+      }
       return { ok: false, reason: `unapproved bind ${bind}` }
     }
     if (!binaryBind || !runtimeDir || !providerVolumeName) return { ok: false, reason: 'required binary/runtime/provider-volume bind topology missing' }

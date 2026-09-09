@@ -1944,6 +1944,7 @@ mod tests {
                 source_path: "/first-boot/auth.json".into(),
                 provider_relative_path: ".local/share/opencode/auth.json".into(),
             }],
+            provider_secret_references: Vec::new(),
         };
 
         let replacement = terminal_without_first_boot_state(Some(terminal.clone())).unwrap();

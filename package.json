@@ -93,7 +93,8 @@
     "test:runtime": "tsx scripts/testing/test-coordinator.ts run test:runtime",
     "test:runtime:raw": "tsx scripts/testing/runtime-gate.ts",
     "test:runtime:phase5:soak": "tsx scripts/testing/runtime-phase5-soak.ts",
-    "test:runtime:campaign": "tsx scripts/testing/runtime-landing-campaign.ts"
+    "test:runtime:campaign": "tsx scripts/testing/runtime-landing-campaign.ts",
+    "test:runtime:provider-qualification": "tsx scripts/testing/runtime-provider-qualification.ts"
   },
   "dependencies": {
     "@ai-sdk/google": "^3.0.29",

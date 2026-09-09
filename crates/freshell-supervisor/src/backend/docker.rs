@@ -9,6 +9,7 @@ pub struct TerminalMounts {
     pub workspace: PathBuf,
     pub git_common_dir: Option<PathBuf>,
     pub provider_bootstrap_files: Vec<PathBuf>,
+    pub provider_secret_files: Vec<PathBuf>,
 }
 
 pub fn terminal_mounts(spec: &TerminalLaunchSpec) -> Result<TerminalMounts, String> {
@@ -48,10 +49,21 @@ pub fn terminal_mounts(spec: &TerminalLaunchSpec) -> Result<TerminalMounts, Stri
         reject_management_path(&source)?;
         provider_bootstrap_files.push(source);
     }
+    let mut provider_secret_files = Vec::with_capacity(spec.provider_secret_references.len());
+    for secret in &spec.provider_secret_references {
+        let source = std::fs::canonicalize(&secret.source_path)
+            .map_err(|error| format!("provider secret reference: {error}"))?;
+        if !source.is_file() || source != Path::new(&secret.source_path) {
+            return Err("provider secret reference must be a canonical regular file".into());
+        }
+        reject_management_path(&source)?;
+        provider_secret_files.push(source);
+    }
     Ok(TerminalMounts {
         workspace,
         git_common_dir,
         provider_bootstrap_files,
+        provider_secret_files,
     })
 }
 

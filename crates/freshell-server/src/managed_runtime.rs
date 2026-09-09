@@ -40,6 +40,7 @@ impl ServerManagedRuntimeController {
         if std::env::var("FRESHELL_MANAGED_RUNTIME_V1").ok().as_deref() != Some("1") {
             return Ok(None);
         }
+        freshell_agent_runtime::process_qualification_policy()?;
         let socket = std::env::var("FRESHELL_RUNTIME_CONTROL_SOCKET").map_err(|_| {
             "FRESHELL_MANAGED_RUNTIME_V1=1 requires FRESHELL_RUNTIME_CONTROL_SOCKET".to_string()
         })?;
@@ -161,23 +162,32 @@ impl ManagedTerminalController for ServerManagedRuntimeController {
             let git_common_dir = git_common_dir(&workspace);
             let project_key = stable_project_key(&workspace);
             let inventory = self.client.inventory().await.map_err(|e| e.to_string())?;
-            if let Some(view) = reusable_running_view(&inventory, &soul_id, &request.terminal_id)? {
-                return Ok(ManagedTerminalDescriptor {
-                    soul_id: view.soul_id.to_string(),
-                    incarnation_id: view.incarnation_id.to_string(),
-                    terminal_id: request.terminal_id,
-                    stream_id: request.stream_id,
-                    mode: request.mode,
-                    cwd: cwd.to_string_lossy().into_owned(),
-                    resume_session_id: request.resume_session_id,
-                    create_request_id: request.create_request_id,
-                });
+            if let Some(descriptor) = reused_running_descriptor(
+                &inventory,
+                &soul_id,
+                &request.terminal_id,
+                request.create_request_id.clone(),
+            )? {
+                return Ok(descriptor);
             }
             // Phase 2 persists the launch spec in the supervisor registry.
             // Persist ONLY an explicit non-secret allowlist — never the web
             // server's resolved child environment wholesale (which can carry
             // AUTH_TOKEN, provider API keys, cloud credentials, proxy creds, ...).
             let env = managed_provider_env(&request.mode, &request.env);
+            let provider_secret_references = if request.mode == "amplifier" {
+                crate::managed_provider_bootstrap::amplifier_secret_references(
+                    request.provider_model.as_deref(),
+                    request.provider_reasoning_effort.as_deref(),
+                )?
+            } else {
+                Vec::new()
+            };
+            let program = if request.mode == "amplifier" {
+                crate::managed_provider_bootstrap::AMPLIFIER_PROGRAM.to_string()
+            } else {
+                request.spec.program
+            };
             let launch = LaunchRequest {
                 soul_id: soul_id.clone(),
                 provider: request.mode.clone(),
@@ -197,7 +207,7 @@ impl ManagedTerminalController for ServerManagedRuntimeController {
                     terminal_id: request.terminal_id.clone(),
                     stream_id: request.stream_id.clone(),
                     mode: request.mode.clone(),
-                    program: request.spec.program,
+                    program,
                     // Phase 2's managed provider has no durable Freshell MCP
                     // tool-router yet. The legacy --mcp-config file is web-owned
                     // temporary state and its child server needs FRESHELL_TOKEN;
@@ -221,6 +231,7 @@ impl ManagedTerminalController for ServerManagedRuntimeController {
                     provider_sandbox: request.provider_sandbox.clone(),
                     provider_permission_mode: request.provider_permission_mode.clone(),
                     provider_bootstrap_files: provider_bootstrap_files(&request.mode)?,
+                    provider_secret_references,
                 }),
                 view_intent: Some(ViewIntentRequest {
                     owner_id: String::new(),
@@ -601,6 +612,22 @@ fn reusable_running_view(
     Ok(Some(view.clone()))
 }
 
+/// Reconstruct a retry result exclusively from the already-committed runtime
+/// view. A web crash after launch but before acknowledgment can retry with a
+/// newly assembled request whose stream/native identity is stale or absent;
+/// only the durable view identifies the one existing writer.
+fn reused_running_descriptor(
+    views: &[RuntimeView],
+    soul_id: &SoulId,
+    terminal_id: &str,
+    reconcile_create_request_id: Option<String>,
+) -> Result<Option<ManagedTerminalDescriptor>, String> {
+    reusable_running_view(views, soul_id, terminal_id)?
+        .as_ref()
+        .map(|view| managed_descriptor_from_view(view, reconcile_create_request_id))
+        .transpose()
+}
+
 fn managed_env_allowlist(
     source: &std::collections::BTreeMap<String, String>,
 ) -> std::collections::BTreeMap<String, String> {
@@ -772,30 +799,7 @@ fn provider_bootstrap_files(mode: &str) -> Result<Vec<ProviderBootstrapFile>, St
                 provider_relative_path: ".codex/auth.json",
             }]
         }
-        "amplifier" => {
-            let amplifier_home = std::env::var("HOME")
-                .ok()
-                .filter(|home| !home.trim().is_empty())
-                .map(PathBuf::from)
-                .map(|home| home.join(".amplifier"));
-            vec![
-                BootstrapSpec {
-                    env_key: "FRESHELL_MANAGED_AMPLIFIER_SETTINGS_FILE",
-                    fallbacks: amplifier_home
-                        .as_ref()
-                        .map(|home| vec![home.join("settings.yaml")])
-                        .unwrap_or_default(),
-                    provider_relative_path: ".amplifier/settings.yaml",
-                },
-                BootstrapSpec {
-                    env_key: "FRESHELL_MANAGED_AMPLIFIER_OAUTH_FILE",
-                    fallbacks: amplifier_home
-                        .map(|home| vec![home.join("openai-chatgpt-oauth.json")])
-                        .unwrap_or_default(),
-                    provider_relative_path: ".amplifier/openai-chatgpt-oauth.json",
-                },
-            ]
-        }
+        "amplifier" => Vec::new(),
         _ => return Ok(Vec::new()),
     };
 
@@ -833,10 +837,9 @@ fn provider_bootstrap_files_from_candidate(
         "claude" => ".claude/.credentials.json",
         "opencode" => ".local/share/opencode/auth.json",
         "codex" => ".codex/auth.json",
-        "amplifier" => ".amplifier/settings.yaml",
         _ => return Ok(Vec::new()),
     };
-    provider_bootstrap_files_from_candidates(vec![(candidate, provider_relative_path)])
+    provider_bootstrap_file_from_candidate(candidate, provider_relative_path).map(|file| vec![file])
 }
 
 fn provider_bootstrap_file_from_candidate(
@@ -852,18 +855,6 @@ fn provider_bootstrap_file_from_candidate(
         source_path: canonical.to_string_lossy().into_owned(),
         provider_relative_path: provider_relative_path.to_string(),
     })
-}
-
-#[cfg(test)]
-fn provider_bootstrap_files_from_candidates(
-    candidates: Vec<(PathBuf, &str)>,
-) -> Result<Vec<ProviderBootstrapFile>, String> {
-    candidates
-        .into_iter()
-        .map(|(candidate, destination)| {
-            provider_bootstrap_file_from_candidate(candidate, destination)
-        })
-        .collect()
 }
 
 fn provider_label(provider: &str) -> &str {
@@ -998,7 +989,7 @@ mod tests {
             terminal_mode: Some("opencode".into()),
             terminal_cwd: Some("/workspace".into()),
             terminal_create_request_id: Some("create-stable".into()),
-            terminal_resume_session_id: None,
+            terminal_resume_session_id: Some("request-time-session".into()),
             project_key: Some("project-test".into()),
             profile: Some(RuntimeProfile::DefaultAgent),
             desired_state: freshell_runtime_protocol::DesiredState::Running,
@@ -1006,7 +997,7 @@ mod tests {
             durability_state: freshell_runtime_protocol::DurabilityState::Unknown,
             allocation_state: freshell_runtime_protocol::AllocationState::Allocated,
             provider: Some("opencode".into()),
-            native_session_id: None,
+            native_session_id: Some("provider-materialized-session".into()),
             recovery_reason: None,
             incident_id: None,
             prior_incarnation_id: None,
@@ -1027,6 +1018,28 @@ mod tests {
                 .unwrap()
                 .expect("running soul should be reused");
         assert_eq!(reused.incarnation_id, running.incarnation_id);
+
+        let descriptor = reused_running_descriptor(
+            std::slice::from_ref(&running),
+            &soul,
+            "terminal-stable",
+            Some("retry-after-web-crash".into()),
+        )
+        .unwrap()
+        .expect("launch-before-ack retry reuses the existing writer");
+        assert_eq!(
+            descriptor.incarnation_id,
+            running.incarnation_id.to_string()
+        );
+        assert_eq!(descriptor.stream_id, "stream-stable");
+        assert_eq!(
+            descriptor.resume_session_id.as_deref(),
+            Some("provider-materialized-session")
+        );
+        assert_eq!(
+            descriptor.create_request_id.as_deref(),
+            Some("retry-after-web-crash")
+        );
 
         assert!(
             reusable_running_view(std::slice::from_ref(&running), &soul, "terminal-other").is_err()
@@ -1146,38 +1159,6 @@ mod tests {
         assert_eq!(files.len(), 1);
         assert_eq!(files[0].provider_relative_path, ".codex/auth.json");
         assert!(!files[0].source_path.contains("secret-bytes"));
-    }
-
-    #[test]
-    fn amplifier_bootstrap_references_target_settings_and_oauth_without_persisting_bytes() {
-        let dir = tempfile::tempdir().unwrap();
-        let settings = dir.path().join("settings.yaml");
-        let oauth = dir.path().join("openai-chatgpt-oauth.json");
-        std::fs::write(&settings, "bundle:\n  active: foundation\n").unwrap();
-        std::fs::write(&oauth, r#"{"access_token":"oauth-secret-bytes"}"#).unwrap();
-        let expected_settings = std::fs::canonicalize(&settings).unwrap();
-        let expected_oauth = std::fs::canonicalize(&oauth).unwrap();
-        let files = provider_bootstrap_files_from_candidates(vec![
-            (settings, ".amplifier/settings.yaml"),
-            (oauth, ".amplifier/openai-chatgpt-oauth.json"),
-        ])
-        .unwrap();
-        assert_eq!(files.len(), 2);
-        assert_eq!(
-            files[0].source_path,
-            expected_settings.to_string_lossy().into_owned()
-        );
-        assert_eq!(
-            files[1].source_path,
-            expected_oauth.to_string_lossy().into_owned()
-        );
-        assert_eq!(files[0].provider_relative_path, ".amplifier/settings.yaml");
-        assert_eq!(
-            files[1].provider_relative_path,
-            ".amplifier/openai-chatgpt-oauth.json"
-        );
-        let json = serde_json::to_string(&files).unwrap();
-        assert!(!json.contains("oauth-secret-bytes"));
     }
 }
 

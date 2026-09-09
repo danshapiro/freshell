@@ -18,6 +18,14 @@ use std::{
     path::Path,
 };
 
+mod provider_inventory;
+pub use provider_inventory::pinned_provider_version;
+mod qualification_policy;
+pub use qualification_policy::{
+    process_qualification_policy, qualification_managed_provider_enabled,
+    qualification_policy_from_value, QualificationPolicy, QUALIFICATION_PROVIDER_ENV,
+};
+
 pub const PROVIDER_HOME: &str = "/home/freshell/provider";
 pub const MAX_SUCCESSFUL_RECOVERIES_PER_HOUR: u64 = 5;
 pub const RECOVERY_WINDOW_MS: i64 = 60 * 60 * 1_000;
@@ -187,7 +195,7 @@ pub const PROVIDER_CAPABILITIES: &[ProviderCapability] = &[
         resume_command: Some("amplifier session resume --full-history <exact-id>"),
         zero_turn_policy: "stub-is-not-durable-conversation-proof",
         checkpoint_policy: "provider-session-directory",
-        bootstrap: ".amplifier/settings.yaml and .amplifier/openai-chatgpt-oauth.json copied before privilege drop",
+        bootstrap: "approved private keys.env reference resolved into child-only env plus image-pinned OneCLI Haiku/low profile; raw OAuth forbidden",
         live_gate: "provider-approved-lowest-cost-model",
         blocked_reason: Some("PENDING_LIVE_QUALIFICATION"),
     },
@@ -295,6 +303,7 @@ pub fn managed_recovery_enabled(provider: &str) -> bool {
 
 pub fn managed_provider_enabled(provider: &str) -> bool {
     capability(provider).is_some_and(|candidate| candidate.managed_enabled)
+        || qualification_managed_provider_enabled(provider)
 }
 
 /// True only when the provider may make a production durable-soul promise:
@@ -1144,6 +1153,7 @@ mod tests {
             provider_sandbox: None,
             provider_permission_mode: None,
             provider_bootstrap_files: Vec::<ProviderBootstrapFile>::new(),
+            provider_secret_references: Vec::new(),
         }
     }
 

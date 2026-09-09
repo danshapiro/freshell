@@ -20,13 +20,24 @@ publish.workspace = true
 # process launch to be described as managed. Phase 2/3 will attach the runtime
 # client only after their live continuity/provider gates pass.
 default = []
-managed-runtime-v1 = ["dep:freshell-runtime-client", "dep:freshell-runtime-protocol"]
+managed-runtime-v1 = [
+  "dep:freshell-agent-runtime",
+  "dep:freshell-runtime-client",
+  "dep:freshell-runtime-protocol",
+]
+managed-provider-qualification = [
+  "managed-runtime-v1",
+  "freshell-agent-runtime/provider-qualification",
+  "freshell-ws/provider-qualification",
+  "freshell-freshagent/provider-qualification",
+]
 
 [[bin]]
 name = "freshell-server"
 path = "src/main.rs"
 
 [dependencies]
+freshell-agent-runtime = { path = "../freshell-agent-runtime", optional = true }
 freshell-protocol = { path = "../freshell-protocol" }
 freshell-ws = { path = "../freshell-ws" }
 freshell-api = { path = "../freshell-api" }

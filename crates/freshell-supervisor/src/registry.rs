@@ -2685,17 +2685,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn amplifier_bootstrap_persists_references_never_secret_bytes() {
+    async fn amplifier_onecli_persists_only_the_secret_reference() {
         let dir = tempfile::tempdir().unwrap();
         let workspace = tempfile::tempdir().unwrap();
-        let settings = workspace.path().join("amplifier-settings.yaml");
-        let oauth = workspace.path().join("amplifier-oauth.json");
-        let settings_secret = "amplifier-settings-secret-never-persist";
-        let oauth_secret = "amplifier-oauth-secret-never-persist";
-        std::fs::write(&settings, format!("api_key: {settings_secret}\n")).unwrap();
-        std::fs::write(&oauth, format!(r#"{{"token":"{oauth_secret}"}}"#)).unwrap();
-        let settings = std::fs::canonicalize(settings).unwrap();
-        let oauth = std::fs::canonicalize(oauth).unwrap();
+        let keys = workspace.path().join("keys.env");
+        let secret = "amplifier-onecli-secret-never-persist";
+        std::fs::write(&keys, format!("ANTHROPIC_API_KEY={secret}\n")).unwrap();
+        let keys = std::fs::canonicalize(keys).unwrap();
         let workspace_path = std::fs::canonicalize(workspace.path()).unwrap();
 
         let registry = Registry::open(dir.path(), None).unwrap();
@@ -2722,14 +2718,12 @@ mod tests {
             provider_reasoning_effort: None,
             provider_sandbox: None,
             provider_permission_mode: None,
-            provider_bootstrap_files: vec![
-                freshell_runtime_protocol::ProviderBootstrapFile {
-                    source_path: settings.to_string_lossy().into_owned(),
-                    provider_relative_path: ".amplifier/settings.yaml".into(),
-                },
-                freshell_runtime_protocol::ProviderBootstrapFile {
-                    source_path: oauth.to_string_lossy().into_owned(),
-                    provider_relative_path: ".amplifier/openai-chatgpt-oauth.json".into(),
+            provider_bootstrap_files: Vec::new(),
+            provider_secret_references: vec![
+                freshell_runtime_protocol::ProviderSecretReference {
+                    source_path: keys.to_string_lossy().into_owned(),
+                    profile: freshell_runtime_protocol::ProviderSecretProfile::AmplifierOnecliAnthropicHaikuLow,
+                    approved_endpoint: "https://onecli.example.invalid/v1".into(),
                 },
             ],
         });
@@ -2743,10 +2737,9 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert!(terminal_json.contains(&settings.to_string_lossy().to_string()));
-        assert!(terminal_json.contains(&oauth.to_string_lossy().to_string()));
-        assert!(!terminal_json.contains(settings_secret));
-        assert!(!terminal_json.contains(oauth_secret));
+        assert!(terminal_json.contains(&keys.to_string_lossy().to_string()));
+        assert!(terminal_json.contains("onecli.example.invalid"));
+        assert!(!terminal_json.contains(secret));
         drop(conn);
 
         let mut durable_bytes = Vec::new();
@@ -2759,9 +2752,8 @@ mod tests {
             }
         }
         assert!(
-            !String::from_utf8_lossy(&durable_bytes).contains(settings_secret)
-                && !String::from_utf8_lossy(&durable_bytes).contains(oauth_secret),
-            "bootstrap secret bytes must never enter supervisor durable state"
+            !String::from_utf8_lossy(&durable_bytes).contains(secret),
+            "OneCLI secret bytes must never enter supervisor durable state"
         );
     }
 
@@ -2994,6 +2986,7 @@ mod tests {
             provider_sandbox: None,
             provider_permission_mode: None,
             provider_bootstrap_files: Vec::new(),
+            provider_secret_references: Vec::new(),
         };
         let mut launch = prep(soul.clone(), RequestId::new(), "exact-resume");
         launch.provider = "opencode".into();

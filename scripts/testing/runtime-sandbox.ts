@@ -47,6 +47,15 @@ export type AssertionRecord = {
   evidence?: unknown
 }
 
+export type ProviderQualificationBuildRecord = {
+  kind: 'production' | 'qualification_fixture'
+  serverFeatures: string[]
+  supervisorFeatures: string[]
+  qualificationProviders: string[]
+  serverBinary: string
+  supervisorBinary: string
+}
+
 export class RuntimeGateAssertionError extends Error {
   constructor(
     readonly caseId: string,
@@ -229,6 +238,22 @@ export class RuntimeHarness {
     return { ok: cleanup.ok, errors }
   }
 
+  recordProviderQualificationBuild(record: ProviderQualificationBuildRecord): void {
+    const buildPath = path.join(this.evidenceDir, 'build.json')
+    const build = JSON.parse(fs.readFileSync(buildPath, 'utf8'))
+    const qualificationBuild = {
+      kind: record.kind,
+      serverFeatures: [...record.serverFeatures].sort(),
+      supervisorFeatures: [...record.supervisorFeatures].sort(),
+      qualificationProviders: [...record.qualificationProviders].sort(),
+      binaries: {
+        server: fileBuild(this.validateRunBuildBinary(record.serverBinary, 'qualification server')),
+        supervisor: fileBuild(this.validateRunBuildBinary(record.supervisorBinary, 'qualification supervisor')),
+      },
+    }
+    fs.writeFileSync(buildPath, JSON.stringify({ ...build, qualificationBuild }, null, 2))
+  }
+
   assert(caseId: string, condition: unknown, message: string, evidence?: unknown): asserts condition {
     const record: AssertionRecord = { at: new Date().toISOString(), caseId, pass: Boolean(condition), message, ...(evidence === undefined ? {} : { evidence }) }
     this.assertions.push(record)
@@ -285,6 +310,8 @@ export class RuntimeHarness {
     installationBudget?: RuntimeLimits
     projectBudget?: RuntimeLimits
     env?: Record<string, string>
+    /** Exact harness-built supervisor binary; must live under this run's build directory. */
+    binaryPath?: string
   }): Promise<SupervisorInstance> {
     const scenarioId = sanitizeName(options.scenarioId)
     const scenarioRoot = this.scenarioPath(scenarioId)
@@ -312,7 +339,10 @@ export class RuntimeHarness {
       this.trackedVolumes.add(volumeName)
     }
     const binaryKind = options.binaryKind ?? 'test'
-    const supervisorBinary = binaryKind === 'test' ? this.testSupervisorBinary : this.releaseSupervisorBinary
+    const defaultSupervisorBinary = binaryKind === 'test' ? this.testSupervisorBinary : this.releaseSupervisorBinary
+    const supervisorBinary = options.binaryPath
+      ? this.validateRunBuildBinary(options.binaryPath, 'supervisor')
+      : defaultSupervisorBinary
     const hostBinary = binaryKind === 'test' ? this.testHostBinary : this.releaseHostBinary
     const name = `freshell-p${this.phase}-supervisor-${this.runId.slice(0, 8)}-${scenarioId}-${randomUUID().slice(0, 8)}`
     const args = [
@@ -372,6 +402,15 @@ export class RuntimeHarness {
     this.recordLifecycle('supervisor.started', { scenarioId, containerId, binaryKind, crashPoint: options.crashPoint, dbFailpoint: options.dbFailpoint, volumeName })
     if (options.waitForHealth !== false) await this.waitForSupervisorHealth(instance)
     return instance
+  }
+
+  private validateRunBuildBinary(candidate: string, label: string): string {
+    const resolved = fs.realpathSync(candidate)
+    const buildRoot = `${fs.realpathSync(this.buildDir)}${path.sep}`
+    if (!resolved.startsWith(buildRoot) || !fs.statSync(resolved).isFile()) {
+      throw new Error(`${label} binary override must be a regular file under this run's build directory`)
+    }
+    return resolved
   }
 
   async waitForSupervisorHealth(instance: SupervisorInstance, timeoutMs = 12_000): Promise<any> {
@@ -915,15 +954,13 @@ export class RuntimeHarness {
       'FRESHELL_MANAGED_CLAUDE_CREDENTIAL_FILE',
       'FRESHELL_MANAGED_OPENCODE_AUTH_FILE',
       'FRESHELL_MANAGED_CODEX_AUTH_FILE',
-      'FRESHELL_MANAGED_AMPLIFIER_SETTINGS_FILE',
-      'FRESHELL_MANAGED_AMPLIFIER_OAUTH_FILE',
+      'FRESHELL_MANAGED_AMPLIFIER_ONECLI_KEYS_FILE',
     ]) {
       const configured = process.env[key]?.trim()
       addRegularFile(configured)
     }
     const amplifierHome = path.join(os.homedir(), '.amplifier')
-    addRegularFile(path.join(amplifierHome, 'settings.yaml'))
-    addRegularFile(path.join(amplifierHome, 'openai-chatgpt-oauth.json'))
+    addRegularFile(path.join(amplifierHome, 'keys.env'))
     return [...files]
   }
 
