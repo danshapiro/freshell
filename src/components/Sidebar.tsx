@@ -810,7 +810,7 @@ export default function Sidebar({
             <span
               role="status"
               data-testid="search-loading"
-              className="inline-flex min-w-0 max-w-[80px] shrink items-center gap-[4px] overflow-hidden text-xs text-muted-foreground"
+              className="inline-flex min-w-0 shrink items-center gap-[4px] overflow-hidden text-xs text-muted-foreground"
             >
               <Loader2 className="h-[14px] w-[14px] shrink-0 animate-spin" aria-hidden="true" />
               <span className="sidebar-search-loading-text min-w-0 truncate">Searching...</span>

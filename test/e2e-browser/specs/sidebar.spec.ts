@@ -264,9 +264,12 @@ test.describe('Sidebar', () => {
 
     const loadingText = loadingIndicator.locator('.sidebar-search-loading-text')
     await expect(loadingText).toBeVisible()
-    const loadingTextRect = await loadingText.boundingBox()
-    expect(loadingTextRect).not.toBeNull()
-    expect(loadingTextRect!.width).toBeGreaterThan(10)
+    const loadingTextWidths = await loadingText.evaluate((el) => ({
+      clientWidth: el.clientWidth,
+      scrollWidth: el.scrollWidth,
+    }))
+    expect(loadingTextWidths.clientWidth).toBeGreaterThan(10)
+    expect(loadingTextWidths.scrollWidth).toBeLessThanOrEqual(loadingTextWidths.clientWidth + 1)
 
     const pendingWidth = await searchInput.evaluate(measureVisibleInputContentWidth)
     expect(pendingWidth).toBeGreaterThan(inputFontSize)

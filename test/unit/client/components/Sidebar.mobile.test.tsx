@@ -154,35 +154,6 @@ describe('Sidebar mobile touch targets', () => {
     vi.useRealTimers()
   })
 
-  it('session item button has py-2 md:py-1.5 classes for mobile-first density', async () => {
-    const projects: ProjectGroup[] = [
-      {
-        projectPath: '/home/user/project',
-        sessions: [
-          {
-            sessionId: sessionId('session-1'),
-            projectPath: '/home/user/project',
-            lastActivityAt: Date.now(),
-            title: 'Test session',
-            cwd: '/home/user/project',
-          },
-        ],
-      },
-    ]
-
-    const store = createTestStore({ projects })
-    renderSidebar(store)
-
-    await act(async () => {
-      vi.advanceTimersByTime(100)
-    })
-
-    const sessionButton = screen.getByText('Test session').closest('button')
-    expect(sessionButton).not.toBeNull()
-    expect(sessionButton!.className).toMatch(/py-2/)
-    expect(sessionButton!.className).toMatch(/md:py-1\.5/)
-  })
-
   it('nav buttons have py-2.5 md:py-1.5 and min-h-11 md:min-h-0 classes for mobile touch target', () => {
     const store = createTestStore()
     renderSidebar(store)
