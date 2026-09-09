@@ -8,7 +8,7 @@
  * until their corresponding live campaign can produce the same receipt.
  */
 import { execFileSync } from 'node:child_process'
-import { randomBytes } from 'node:crypto'
+import { createHash, randomBytes } from 'node:crypto'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
@@ -25,7 +25,7 @@ import {
 import { openPanePicker } from '../helpers/pane-picker.js'
 import { TerminalHelper } from '../helpers/terminal-helpers.js'
 import { TestHarness } from '../helpers/test-harness.js'
-import { OPENCODE_NATIVE_HISTORY_SCRIPT, nativeAssistantProof, openCodeTerminalReady, selectNativeAssistantTurn, type NativeAssistantTurn } from '../helpers/opencode-native-history.js'
+import { nativeTurnProof, openCodeTerminalReady, selectNativeAssistantTurn, type NativeAssistantTurn } from '../helpers/opencode-native-history.js'
 import type { ProviderQualificationRow } from '../../../scripts/testing/provider-qualification-receipt.js'
 
 function leavesByMode(node: any, mode: string): any[] {
@@ -272,14 +272,16 @@ async function paneSessionId(
 
 function nativeAssistantTurns(rig: ManagedRuntimeBrowserRig, view: ManagedRuntimeView, sessionId: string): NativeAssistantTurn[] {
   if (!view.containerId) throw new Error('native evidence probe has no exact owned container')
+  const probe = path.join(rig.repoRoot, 'test/e2e-browser/helpers/provider-native-history/probe-cli.ts')
+  const tsxLoader = path.join(rig.repoRoot, 'node_modules/tsx/dist/loader.mjs')
   const raw = rig.ownedProviderExec(view.containerId, [
-    'node', '--no-warnings', '-e', OPENCODE_NATIVE_HISTORY_SCRIPT,
+    'node', '--no-warnings', '--import', tsxLoader, probe, 'opencode',
     '/home/freshell/provider/.local/share/opencode/opencode.db', sessionId,
   ])
   const evidence = JSON.parse(raw)
   expect(evidence.schemaVersion).toBe(1)
-  expect(evidence.sessionId).toBe(sessionId)
-  return evidence.available ? evidence.turns : []
+  expect(evidence.nativeSessionId).toBe(sessionId)
+  return evidence.turns
 }
 
 async function nextNativeAssistantTurn(
@@ -292,8 +294,8 @@ async function nextNativeAssistantTurn(
 }
 
 function verifyMemoryAnswer(turn: NativeAssistantTurn, projectName: string): void {
-  expect(turn.toolPartCount, 'conversation recall must not consult workspace files or tools').toBe(0)
-  expect(`${turn.providerId}/${turn.modelId}`).toBe(P2_OPENCODE_FREE_MODEL)
+  expect(turn.toolCalls, 'conversation recall must not consult workspace files or tools').toEqual([])
+  expect(`${turn.resolvedProvider}/${turn.resolvedModel}`).toBe(P2_OPENCODE_FREE_MODEL)
   expect(turn.text).toContain(projectName)
 }
 
@@ -404,7 +406,7 @@ test.describe.serial('OpenCode provider qualification', () => {
       expect(nativeSessionId).toMatch(/^ses_/)
       const firstAnswer = await nextNativeAssistantTurn(rig, first.view, nativeSessionId, new Set(), nonce)
       verifyMemoryAnswer(firstAnswer, nonce)
-      const nativeConversationProofs = [nativeAssistantProof(nativeSessionId, firstAnswer)]
+      const nativeTurnProofs = [nativeTurnProof('initial', nativeSessionId, firstAnswer, nonce)]
 
       // Session-host/container loss: exact old enclosure must be empty before
       // the new incarnation becomes the sole writer.
@@ -434,7 +436,7 @@ test.describe.serial('OpenCode provider qualification', () => {
       const recalledAnswer = await nextNativeAssistantTurn(rig, afterHostCrash, nativeSessionId, beforeRecall, nonce)
       verifyMemoryAnswer(recalledAnswer, nonce)
       expect(recalledAnswer.messageId).not.toBe(firstAnswer.messageId)
-      nativeConversationProofs.push(nativeAssistantProof(nativeSessionId, recalledAnswer))
+      nativeTurnProofs.push(nativeTurnProof('after_session_host_crash', nativeSessionId, recalledAnswer, nonce))
       const recalledNonce = true
 
       // Provider-process loss: kill only the exact host-recorded worker PID,
@@ -468,7 +470,7 @@ test.describe.serial('OpenCode provider qualification', () => {
       const providerAnswer = await nextNativeAssistantTurn(rig, afterProviderCrash, nativeSessionId, beforeProviderFollowup, nonce)
       verifyMemoryAnswer(providerAnswer, nonce)
       expect(providerAnswer.messageId).not.toBe(recalledAnswer.messageId)
-      nativeConversationProofs.push(nativeAssistantProof(nativeSessionId, providerAnswer))
+      nativeTurnProofs.push(nativeTurnProof('after_provider_process_crash', nativeSessionId, providerAnswer, nonce))
       const providerFollowUpCompleted = true
 
       // A second OpenCode soul is independently owned, while an explicit
@@ -485,7 +487,6 @@ test.describe.serial('OpenCode provider qualification', () => {
       const secondAnswer = await nextNativeAssistantTurn(rig, second.view, secondSessionId, new Set(), secondNonce)
       verifyMemoryAnswer(secondAnswer, secondNonce)
       expect(secondAnswer.text).not.toContain(nonce)
-      nativeConversationProofs.push(nativeAssistantProof(secondSessionId, secondAnswer))
       expect(second.view.soulId).not.toBe(first.view.soulId)
       expect(second.view.containerId).not.toBe(afterProviderCrash.containerId)
       expect(secondSessionId).not.toBe(nativeSessionId)
@@ -565,7 +566,8 @@ test.describe.serial('OpenCode provider qualification', () => {
         model: P2_OPENCODE_FREE_MODEL,
         reasoningEffort: 'provider-default',
         completedTurn: true,
-        nativeConversationProofs,
+        nonceSha256: createHash('sha256').update(nonce).digest('hex'),
+        nativeTurnProofs,
         nativeStateCaptured: true,
         nativeSessionId,
         runtimeOwned: true,
@@ -579,7 +581,7 @@ test.describe.serial('OpenCode provider qualification', () => {
           oldEnclosureVerifiedEmpty: !rig.runtime.isContainerRunning(first.view.containerId),
           recalledNonce,
           followUpCompleted: providerFollowUpCompleted,
-          workspaceOrToolReadUsed: false,
+          workspaceOrToolReadUsed: nativeTurnProofs.some((proof) => proof.toolCallCount > 0),
         },
         crashKinds: ['session_host', 'provider_process'],
         automaticResume: true,
@@ -614,7 +616,7 @@ test.describe.serial('OpenCode provider qualification', () => {
         followUpCompleted: providerFollowUpCompleted,
         releaseBinary: rig.supervisor.binaryKind === 'release',
       }
-      expect(providerRow.nonceRecovery.recalledNonce).toBe(true)
+      expect((providerRow.nonceRecovery as { recalledNonce: boolean }).recalledNonce).toBe(true)
       expect(providerRow.onlyOneWriter).toBe(true)
       expect(providerRow.nativeRecovery).toBe(true)
       expect(providerRow.exactNativeRecovery).toBe(true)

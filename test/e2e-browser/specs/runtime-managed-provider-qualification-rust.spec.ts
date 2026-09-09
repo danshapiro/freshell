@@ -9,6 +9,7 @@
  * conditional assertions, or provider-specific skips below.
  */
 import fs from 'node:fs'
+import { createHash, randomBytes } from 'node:crypto'
 import path from 'node:path'
 
 import { expect, type Page } from '@playwright/test'
@@ -26,6 +27,8 @@ import {
   type ManagedRuntimeView,
 } from '../helpers/managed-runtime.js'
 import { openPanePicker } from '../helpers/pane-picker.js'
+import { nativeTurnProof } from '../helpers/provider-native-history/proof.js'
+import type { NativeAssistantTurn, NativeHistory } from '../helpers/provider-native-history/types.js'
 import { TestHarness } from '../helpers/test-harness.js'
 
 const LIVE_ENV = 'FRESHELL_RUNTIME_MANAGED_PROVIDER_QUALIFICATION_LIVE'
@@ -157,31 +160,6 @@ function providerDefinitions(): ProviderDefinition[] {
   })
 }
 
-function amplifierNativeProfileEvidence(
-  rig: ManagedRuntimeBrowserRig,
-  containerId: string,
-  nativeSessionId: string,
-): { provider: string, model: string, reasoningEffort: string, source: string } {
-  const script = [
-    'import glob,json,sys',
-    'matches=glob.glob("/home/freshell/provider/.amplifier/projects/*/sessions/"+sys.argv[1]+"/events.jsonl")',
-    'assert len(matches)==1, f"expected one native session event log, found {len(matches)}"',
-    'found=None',
-    'for line in open(matches[0], encoding="utf-8"):',
-    ' event=json.loads(line)',
-    ' if event.get("event") != "session:config" and event.get("type") != "session:config": continue',
-    ' raw=event.get("data",{}).get("raw",{})',
-    ' for provider in raw.get("providers",[]):',
-    '  if provider.get("id")=="freshell-onecli-anthropic" or provider.get("instance_id")=="freshell-onecli-anthropic": found=provider',
-    'assert found is not None, "native session:config lacks Freshell OneCLI provider"',
-    'config=found.get("config",{})',
-    'print(json.dumps({"provider":found.get("id") or found.get("instance_id"),"model":config.get("default_model"),"reasoningEffort":config.get("reasoning_effort"),"source":"native-session-config"}))',
-  ].join('\n')
-  return JSON.parse(rig.ownedProviderExec(containerId, [
-    '/opt/amplifier-src/.venv/bin/python', '-c', script, nativeSessionId,
-  ]))
-}
-
 function leavesByMode(node: any, mode: string): any[] {
   if (!node) return []
   if (node.type === 'leaf') return node.content?.mode === mode ? [node] : []
@@ -230,28 +208,70 @@ function expectActualProviderProcess(processTable: string, binary: string): void
   expect(processTable).toMatch(new RegExp(`(?:^|\\s)(?:/[^\\s]*/)?${regexEscape(binary)}(?:$|\\s)`, 'm'))
 }
 
-async function executeAndRequireUnechoedOutput(
+async function executeAndAwaitNonceOutput(
   page: Page,
   paneId: string,
   terminalId: string,
   command: string,
-  responseMarker: string,
+  nonce: string,
   timeoutMs = 240_000,
 ): Promise<void> {
-  if (command.includes(responseMarker)) {
-    throw new Error('qualification response marker must not appear in the echoed input')
-  }
-  const before = occurrences(await terminalBuffer(page, terminalId), responseMarker)
+  const before = occurrences(await terminalBuffer(page, terminalId), nonce)
+  const expectedIncrease = command.includes(nonce) ? 2 : 1
   const terminal = page.locator(`[data-pane-id="${paneId}"] .xterm:visible`).last()
   await terminal.waitFor({ state: 'visible', timeout: 90_000 })
   await terminal.click()
   await page.keyboard.insertText(command)
   await page.keyboard.press('Enter')
-  // The marker is deliberately absent from the instruction, so one new exact
-  // occurrence proves provider output rather than terminal input echo/redraw.
-  await waitForValue(`provider response ${responseMarker}`, async () => (
-    occurrences(await terminalBuffer(page, terminalId), responseMarker) > before ? true : null
+  // This is only a sequencing signal. The stopped provider-native transcript,
+  // not terminal output or occurrence count, is the qualification authority.
+  await waitForValue('provider response sequencing signal', async () => (
+    occurrences(await terminalBuffer(page, terminalId), nonce) >= before + expectedIncrease ? true : null
   ), timeoutMs)
+}
+
+function nativeHistorySource(provider: ProviderDefinition['provider']): string {
+  if (provider === 'claude') return '/home/freshell/provider/.claude/projects'
+  if (provider === 'codex') return '/home/freshell/provider/.codex/sessions'
+  if (provider === 'opencode') return '/home/freshell/provider/.local/share/opencode/opencode.db'
+  return '/home/freshell/provider/.amplifier/projects'
+}
+
+function stoppedNativeHistory(
+  rig: ManagedRuntimeBrowserRig,
+  providerVolumeName: string,
+  definition: ProviderDefinition,
+  nativeSessionId: string,
+): NativeHistory {
+  if (!/^freshell-provider-[A-Za-z0-9_.-]+$/.test(providerVolumeName)) {
+    throw new Error('provider history probe requires an exact managed provider volume')
+  }
+  const probe = path.join(rig.repoRoot, 'test/e2e-browser/helpers/provider-native-history/probe-cli.ts')
+  const tsxLoader = path.join(rig.repoRoot, 'node_modules/tsx/dist/loader.mjs')
+  const raw = rig.runtime.runCommand('docker', [
+    'run', '--rm', '--network', 'none', '--read-only', '--cap-drop', 'ALL',
+    '--security-opt', 'no-new-privileges', '--user', '65534:0',
+    '--tmpfs', '/tmp:rw,noexec,nosuid,nodev,size=16m',
+    '-v', `${providerVolumeName}:/home/freshell/provider:ro`,
+    '-v', `${rig.repoRoot}:${rig.repoRoot}:ro`,
+    '--workdir', rig.repoRoot,
+    rig.runtime.imageRef,
+    'node', '--no-warnings', '--import', tsxLoader, probe,
+    definition.provider, nativeHistorySource(definition.provider), nativeSessionId,
+  ])
+  const history = JSON.parse(raw) as NativeHistory
+  expect(history.schemaVersion).toBe(1)
+  expect(history.provider).toBe(definition.provider)
+  expect(history.nativeSessionId).toBe(nativeSessionId)
+  return history
+}
+
+function nonceTurns(history: NativeHistory, nonce: string): NativeAssistantTurn[] {
+  const turns = history.turns.filter((turn) => turn.text.includes(nonce))
+  if (turns.length !== 3) {
+    throw new Error(`native exact-session history must contain exactly three nonce-bearing completed assistant responses; found ${turns.length}`)
+  }
+  return turns
 }
 
 async function paneNativeId(
@@ -352,14 +372,13 @@ async function qualifyProvider(
   const exactLimits = limitEvidence(rig, created.view)
   expect(exactLimits.swapMax).toBe('0')
 
-  const nonce = `QUALIFY_${definition.provider.toUpperCase()}_${Date.now()}_${Math.random().toString(36).slice(2)}`
-  const storedMarker = `STORED_${definition.provider.toUpperCase()}`
-  await executeAndRequireUnechoedOutput(
+  const nonce = `codename-${randomBytes(16).toString('hex')}`
+  await executeAndAwaitNonceOutput(
     page,
     created.paneId,
     created.terminalId,
-    `Remember ${nonce} only in this conversation. Use no tools. Reply with STORED, then one underscore, then ${definition.provider.toUpperCase()}.`,
-    storedMarker,
+    `The private project codename for this conversation is ${nonce}. Without using tools or files, what codename did I just give you?`,
+    nonce,
   )
   const nativeSessionId = await waitForValue('exact native session id', async () => (
     await paneNativeId(harness, tabId, created.paneId, definition.provider)
@@ -369,34 +388,19 @@ async function qualifyProvider(
     (await rig.runningViewForTerminal(created.terminalId))?.nativeSessionId
   ), 120_000)
   expect(inventoryNativeId).toBe(nativeSessionId)
-  const nativeProfileEvidence = definition.provider === 'amplifier'
-    ? amplifierNativeProfileEvidence(rig, created.view.containerId, nativeSessionId)
-    : undefined
-  if (nativeProfileEvidence) {
-    expect(nativeProfileEvidence).toEqual({
-      provider: 'freshell-onecli-anthropic',
-      model: definition.model,
-      reasoningEffort: definition.reasoningEffort,
-      source: 'native-session-config',
-    })
-  }
-
   rig.runtime.killOwnedRuntimeExact(created.view.containerId)
   const afterHostLoss = await waitForReplacement(rig, created.terminalId, created.view.incarnationId)
   expect(afterHostLoss.soulId).toBe(created.view.soulId)
   expect(afterHostLoss.nativeSessionId).toBe(nativeSessionId)
   expect(rig.runtime.isContainerRunning(created.view.containerId)).toBe(false)
 
-  const nonceBeforeRecall = occurrences(await terminalBuffer(page, created.terminalId), nonce)
-  const terminal = page.locator(`[data-pane-id="${created.paneId}"] .xterm:visible`).last()
-  await terminal.click()
-  await page.keyboard.insertText('Without tools or files, reply with exactly the nonce from my first instruction.')
-  await page.keyboard.press('Enter')
-  await waitForValue('same-conversation nonce recall', async () => (
-    occurrences(await terminalBuffer(page, created.terminalId), nonce) > nonceBeforeRecall
-      ? true
-      : null
-  ), 240_000)
+  await executeAndAwaitNonceOutput(
+    page,
+    created.paneId,
+    created.terminalId,
+    'Without using tools or files, what private project codename did I give you earlier?',
+    nonce,
+  )
 
   if (!afterHostLoss.containerId) throw new Error('host-loss replacement has no owned container')
   const pid = workerPid(rig, afterHostLoss)
@@ -408,14 +412,12 @@ async function qualifyProvider(
   expect(afterProviderLoss.profile).toBe(created.view.profile)
   expect(rig.runtime.isContainerRunning(afterHostLoss.containerId)).toBe(false)
 
-  const followUpMarker = `FOLLOWUP_${definition.provider.toUpperCase()}_${Date.now()}`
-  const [followPrefix, followProvider, followTimestamp] = followUpMarker.split('_')
-  await executeAndRequireUnechoedOutput(
+  await executeAndAwaitNonceOutput(
     page,
     created.paneId,
     created.terminalId,
-    `Continue this same conversation without tools. Reply by joining ${followPrefix}, ${followProvider}, and ${followTimestamp} with underscores and no other text.`,
-    followUpMarker,
+    'Please remind me of the private project codename from the start of this same conversation. Do not use tools or files.',
+    nonce,
   )
 
   const snapshot = await rig.inventorySnapshot()
@@ -451,6 +453,24 @@ async function qualifyProvider(
   const oldContainerRunningAfterStop = rig.runtime.isContainerRunning(afterProviderLoss.containerId!)
   expect(oldContainerRunningAfterStop).toBe(false)
   expect(rig.runtime.broker.unsafeAttempts()).toHaveLength(0)
+  const providerReceipt = rig.runtime.broker.receipts()
+    .find((candidate) => candidate.containerId === afterProviderLoss.containerId)
+  if (!providerReceipt?.providerVolumeName) throw new Error('stopped soul has no exact provider-volume receipt')
+  const nativeHistory = stoppedNativeHistory(
+    rig,
+    providerReceipt.providerVolumeName,
+    definition,
+    nativeSessionId,
+  )
+  const [initialTurn, hostCrashTurn, providerCrashTurn] = nonceTurns(nativeHistory, nonce)
+  const nativeTurnProofs = [
+    nativeTurnProof('initial', nativeSessionId, initialTurn, nonce),
+    nativeTurnProof('after_session_host_crash', nativeSessionId, hostCrashTurn, nonce),
+    nativeTurnProof('after_provider_process_crash', nativeSessionId, providerCrashTurn, nonce),
+  ]
+  expect(new Set(nativeTurnProofs.map((proof) => proof.messageId)).size).toBe(3)
+  expect(new Set(nativeTurnProofs.map((proof) => proof.turnId)).size).toBe(3)
+  expect(nativeTurnProofs.every((proof) => proof.toolCallCount === 0)).toBe(true)
 
   return {
     provider: definition.provider,
@@ -459,6 +479,8 @@ async function qualifyProvider(
     model: definition.model,
     reasoningEffort: definition.reasoningEffort,
     nativeSessionId,
+    nonceSha256: createHash('sha256').update(nonce).digest('hex'),
+    nativeTurnProofs,
     actualProviderBinary: true,
     completedTurn: true,
     nativeStateCaptured: true,
@@ -467,7 +489,17 @@ async function qualifyProvider(
     swapMaxVerified: exactLimits.swapMax === '0',
     limitEvidence: exactLimits,
     automaticResume: true,
-    profileVerified: afterProviderLoss.profile === created.view.profile,
+    profileVerified: nativeTurnProofs.every((proof) => (
+      proof.resolvedReasoningEffort === definition.reasoningEffort
+      && (definition.provider !== 'codex' || proof.resolvedModel === definition.model)
+      && (definition.provider !== 'amplifier' || (
+        proof.resolvedProvider === 'freshell-onecli-anthropic'
+        && proof.resolvedModel === definition.model
+      ))
+      && (definition.provider !== 'claude' || proof.resolvedModel.toLowerCase().includes('haiku'))
+      && (definition.provider !== 'opencode'
+        || `${proof.resolvedProvider}/${proof.resolvedModel}` === definition.model)
+    )),
     releaseBinary: rig.supervisor.binaryKind === 'release',
     nativeRecovery: true,
     exactNativeRecovery: afterHostLoss.nativeSessionId === nativeSessionId
@@ -493,11 +525,10 @@ async function qualifyProvider(
       oldEnclosureVerifiedEmpty: !rig.runtime.isContainerRunning(created.view.containerId),
       recalledNonce: true,
       followUpCompleted: true,
-      workspaceOrToolReadUsed: false,
+      workspaceOrToolReadUsed: nativeTurnProofs.some((proof) => proof.toolCallCount > 0),
     },
     repairedSameSoul: afterProviderLoss.soulId === created.view.soulId,
     repairedSameNativeSession: afterProviderLoss.nativeSessionId === nativeSessionId,
-    ...(nativeProfileEvidence ? { nativeProfileEvidence } : {}),
   }
 }
 

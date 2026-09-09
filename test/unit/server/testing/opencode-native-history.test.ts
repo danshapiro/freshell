@@ -1,11 +1,11 @@
-import { execFileSync } from 'node:child_process'
 import { createHash } from 'node:crypto'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
-import { OPENCODE_NATIVE_HISTORY_SCRIPT, nativeAssistantProof, openCodeTerminalReady, selectNativeAssistantTurn } from '../../../e2e-browser/helpers/opencode-native-history.js'
+import { nativeTurnProof, openCodeTerminalReady, selectNativeAssistantTurn } from '../../../e2e-browser/helpers/opencode-native-history.js'
+import { readOpenCodeNativeHistory } from '../../../e2e-browser/helpers/provider-native-history/opencode.js'
 
 let root: string
 let filename: string
@@ -14,8 +14,11 @@ beforeEach(() => {
   root = fs.mkdtempSync(path.join(os.tmpdir(), 'opencode-native-proof-'))
   filename = path.join(root, 'opencode.db')
   db = new DatabaseSync(filename)
-  db.exec(`CREATE TABLE message (id TEXT PRIMARY KEY, session_id TEXT, time_created INTEGER, data TEXT);
+  db.exec(`CREATE TABLE session (id TEXT PRIMARY KEY);
+    CREATE TABLE message (id TEXT PRIMARY KEY, session_id TEXT, time_created INTEGER, data TEXT);
     CREATE TABLE part (id TEXT PRIMARY KEY, session_id TEXT, message_id TEXT, time_created INTEGER, data TEXT);`)
+  db.prepare('INSERT INTO session (id) VALUES (?)').run('ses_owned')
+  db.prepare('INSERT INTO session (id) VALUES (?)').run('ses_other')
 })
 afterEach(() => { db.close(); fs.rmSync(root, { recursive: true, force: true }) })
 
@@ -28,7 +31,7 @@ function message(id: string, session: string, role: string, text: string, comple
 }
 
 function read(session = 'ses_owned') {
-  return JSON.parse(execFileSync(process.execPath, ['--no-warnings', '-e', OPENCODE_NATIVE_HISTORY_SCRIPT, filename, session], { encoding: 'utf8' }))
+  return readOpenCodeNativeHistory(filename, session)
 }
 
 describe('live recovery proves new native assistant responses, never TUI echo or replay', () => {
@@ -37,15 +40,15 @@ describe('live recovery proves new native assistant responses, never TUI echo or
     message('unfinished', 'ses_owned', 'assistant', 'nonce-unfinished', null)
     message('foreign', 'ses_other', 'assistant', 'nonce-foreign')
     message('answer', 'ses_owned', 'assistant', 'nonce-in-real-answer')
-    expect(read()).toMatchObject({ sessionId: 'ses_owned', available: true, turns: [{ messageId: 'answer', text: 'nonce-in-real-answer', toolPartCount: 0 }] })
+    expect(read()).toMatchObject({ nativeSessionId: 'ses_owned', turns: [{ messageId: 'answer', text: 'nonce-in-real-answer', toolCalls: [] }] })
     expect(read().turns).toHaveLength(1)
   })
 
   it('waits past unrelated completed assistant rows for the correlated no-tool answer', () => {
     const turns = [
-      { messageId: 'intro', parentMessageId: 'u0', completedAt: 1, text: 'Freshell.', toolPartCount: 0, modelId: 'big-pickle', providerId: 'opencode' },
-      { messageId: 'tool', parentMessageId: 'u1', completedAt: 2, text: 'p-target', toolPartCount: 1, modelId: 'big-pickle', providerId: 'opencode' },
-      { messageId: 'answer', parentMessageId: 'u1', completedAt: 3, text: 'The project is p-target.', toolPartCount: 0, modelId: 'big-pickle', providerId: 'opencode' },
+      { turnId: 'intro', messageId: 'intro', parentMessageId: 'u0', completedAt: 1, text: 'Freshell.', toolCalls: [], resolvedProvider: 'opencode', resolvedModel: 'big-pickle', resolvedReasoningEffort: 'provider-default', providerProvenance: 'opencode-message.providerID', modelProvenance: 'opencode-message.modelID', reasoningEffortProvenance: 'opencode-native-default' },
+      { turnId: 'tool', messageId: 'tool', parentMessageId: 'u1', completedAt: 2, text: 'p-target', toolCalls: [{ type: 'tool', name: 'read' }], resolvedProvider: 'opencode', resolvedModel: 'big-pickle', resolvedReasoningEffort: 'provider-default', providerProvenance: 'opencode-message.providerID', modelProvenance: 'opencode-message.modelID', reasoningEffortProvenance: 'opencode-native-default' },
+      { turnId: 'answer', messageId: 'answer', parentMessageId: 'u1', completedAt: 3, text: 'The project is p-target.', toolCalls: [], resolvedProvider: 'opencode', resolvedModel: 'big-pickle', resolvedReasoningEffort: 'provider-default', providerProvenance: 'opencode-message.providerID', modelProvenance: 'opencode-message.modelID', reasoningEffortProvenance: 'opencode-native-default' },
     ]
     expect(selectNativeAssistantTurn(turns, new Set(['old']), 'p-target')?.messageId).toBe('answer')
     expect(selectNativeAssistantTurn(turns, new Set(['answer']), 'p-target')).toBeNull()
@@ -53,13 +56,13 @@ describe('live recovery proves new native assistant responses, never TUI echo or
 
   it('keeps tool activity visible so a memory-only claim cannot hide a filesystem lookup', () => {
     message('answer', 'ses_owned', 'assistant', 'nonce', 200, true)
-    expect(read().turns[0].toolPartCount).toBe(1)
+    expect(read().turns[0].toolCalls).toEqual([{ type: 'tool', name: 'read' }])
   })
 
   it('does not guess the newest session or interpret a session ID as SQL', () => {
     message('foreign', 'ses_other', 'assistant', 'nonce-foreign')
-    expect(read('ses_missing').turns).toEqual([])
-    expect(read("' OR 1=1 --").turns).toEqual([])
+    expect(() => read('ses_missing')).toThrow(/exact native session/i)
+    expect(() => read("' OR 1=1 --")).toThrow(/safe opaque session id/i)
   })
 
   it('reads in query-only mode without modifying the native database', () => {
@@ -71,15 +74,14 @@ describe('live recovery proves new native assistant responses, never TUI echo or
 
   it('reports an unmaterialized provider store without fabricating a turn', () => {
     const missing = path.join(root, 'not-created.db')
-    const output = JSON.parse(execFileSync(process.execPath, ['--no-warnings', '-e', OPENCODE_NATIVE_HISTORY_SCRIPT, missing, 'ses_owned'], { encoding: 'utf8' }))
-    expect(output).toEqual({ schemaVersion: 1, sessionId: 'ses_owned', available: false, turns: [] })
+    expect(() => readOpenCodeNativeHistory(missing, 'ses_owned')).toThrow(/missing|ENOENT/i)
     expect(fs.existsSync(missing)).toBe(false)
   })
 
   it('retains message/parent identity and a digest without copying response text into receipts', () => {
     message('answer', 'ses_owned', 'assistant', 'private fixture answer')
-    const proof = nativeAssistantProof('ses_owned', read().turns[0])
-    expect(proof).toMatchObject({ nativeSessionId: 'ses_owned', messageId: 'answer', parentMessageId: 'user-request', completedAt: 200, toolPartCount: 0 })
+    const proof = nativeTurnProof('initial', 'ses_owned', read().turns[0], 'private fixture answer')
+    expect(proof).toMatchObject({ nativeSessionId: 'ses_owned', messageId: 'answer', parentMessageId: 'user-request', completedAt: 200, toolCallCount: 0 })
     expect(proof.responseSha256).toBe(createHash('sha256').update('private fixture answer').digest('hex'))
     expect(JSON.stringify(proof)).not.toContain('private fixture answer')
   })
