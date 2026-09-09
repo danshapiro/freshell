@@ -1,4 +1,5 @@
 import { useMemo, useState } from 'react'
+import { selectManagedRuntime } from '@/store/managedRuntimeSlice'
 import type { ManagedRuntimeSoul, ManagedRuntimeViewIntent } from '@shared/managed-runtime'
 import { useAppDispatch, useAppSelector, useAppStore } from '@/store/hooks'
 import {
@@ -63,7 +64,7 @@ export function ManagedAgentRecoveryStatus() {
   const dispatch = useAppDispatch()
   const store = useAppStore()
   const connectionStatus = useAppSelector((state) => state.connection.status)
-  const runtime = useAppSelector((state) => state.managedRuntime)
+  const runtime = useAppSelector(selectManagedRuntime)
   const tabs = useAppSelector((state) => state.tabs.tabs)
   const [pending, setPending] = useState<string>()
   const [message, setMessage] = useState<string>()

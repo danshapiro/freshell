@@ -97,4 +97,20 @@ export const {
   managedRuntimeDisconnected,
 } = managedRuntimeSlice.actions
 
+/**
+ * Read the managed-runtime slice, treating an absent slice as "this client has
+ * no managed runtime".
+ *
+ * That is the same answer a non-negotiated client gets, and it is the honest
+ * one: managed availability is asserted only when the server negotiates
+ * `managedRuntimeV1`. Reading `state.managedRuntime.x` directly would instead
+ * crash the whole App tree for any store composed without this slice, turning
+ * a legacy-shaped store into a blank screen rather than legacy behaviour.
+ */
+export function selectManagedRuntime(state: {
+  managedRuntime?: ManagedRuntimeClientState
+}): ManagedRuntimeClientState {
+  return state.managedRuntime ?? initialState
+}
+
 export default managedRuntimeSlice.reducer

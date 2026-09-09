@@ -89,6 +89,9 @@ export async function runProviderCertificationGate(
     actualIds,
   })
 
+  caseResults.push({ caseId: 'PC-SCOPE', status: 'PASS' })
+  h.recordLifecycle('gate.case.passed', { caseId: 'PC-SCOPE' })
+
   const receipt = readProviderReceipt(h, 'PC-RECEIPT')
 
   for (const row of eligible) {
