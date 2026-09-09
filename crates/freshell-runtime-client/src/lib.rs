@@ -589,6 +589,17 @@ impl RuntimeClient {
         after_seq: u64,
         max_bytes: u64,
     ) -> Result<freshell_runtime_protocol::RuntimeOutputBatch, ClientError> {
+        self.read_output_for_epoch(soul_id, after_seq, max_bytes, None)
+            .await
+    }
+
+    pub async fn read_output_for_epoch(
+        &self,
+        soul_id: SoulId,
+        after_seq: u64,
+        max_bytes: u64,
+        expected_stream_epoch: Option<String>,
+    ) -> Result<freshell_runtime_protocol::RuntimeOutputBatch, ClientError> {
         let epoch = self.current_epoch().await?;
         match self
             .request(
@@ -597,6 +608,7 @@ impl RuntimeClient {
                     soul_id,
                     after_seq,
                     max_bytes,
+                    expected_stream_epoch,
                     expected_control_epoch: Some(epoch),
                 }),
             )
