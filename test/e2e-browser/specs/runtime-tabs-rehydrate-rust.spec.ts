@@ -59,9 +59,15 @@ async function prunePersistedLayoutToTab(page: Page, keepTabId: string): Promise
       ? value : null
   }, 15_000)
   const pruned = pruneRuntimeBrowserLayout(persisted, keepTabId)
-  await page.evaluate(({ key, value }) => localStorage.setItem(key, JSON.stringify(value)), {
-    key: LAYOUT_STORAGE_KEY, value: pruned,
-  })
+  const marker = `freshell-runtime-pruned-layout-${keepTabId}`
+  // The outgoing page's pagehide handler deliberately flushes live Redux state.
+  // Install the isolated fixture mutation in the next top-level document before
+  // application modules read storage, rather than racing that safety flush.
+  await page.addInitScript(({ key, raw, marker }) => {
+    if (window.top !== window || sessionStorage.getItem(marker) === 'installed') return
+    localStorage.setItem(key, raw)
+    sessionStorage.setItem(marker, 'installed')
+  }, { key: LAYOUT_STORAGE_KEY, raw: JSON.stringify(pruned), marker })
   return LAYOUT_STORAGE_KEY
 }
 
