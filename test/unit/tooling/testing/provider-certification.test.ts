@@ -244,13 +244,41 @@ describe('provider qualification receipt v2', () => {
   const runtimeImage = `sha256:${'b'.repeat(64)}`
 
   function providerRow(provider = 'claude'): ProviderQualificationRow {
+    const profile = provider === 'codex'
+      ? { providerVersion: '0.147.0', model: 'gpt-5.6-luna', reasoningEffort: 'low', nativeProvider: 'openai' }
+      : provider === 'opencode'
+        ? { providerVersion: '1.18.21', model: 'opencode/big-pickle', reasoningEffort: 'provider-default', nativeProvider: 'opencode' }
+        : provider === 'amplifier'
+          ? { providerVersion: '0.1.1', model: 'claude-haiku-4-5-20251001', reasoningEffort: 'low', nativeProvider: 'freshell-onecli-anthropic' }
+          : { providerVersion: '2.1.263', model: 'haiku', reasoningEffort: 'low', nativeProvider: 'anthropic' }
+    const stages = ['initial', 'after_session_host_crash', 'after_provider_process_crash'] as const
     return {
       provider,
       modes: [provider],
-      providerVersion: '2.1.263',
-      model: 'haiku',
-      reasoningEffort: 'lowest',
+      providerVersion: profile.providerVersion,
+      model: profile.model,
+      reasoningEffort: profile.reasoningEffort,
       nativeSessionId: '11111111-1111-4111-8111-111111111111',
+      nonceSha256: 'd'.repeat(64),
+      nativeTurnProofs: stages.map((stage, index) => ({
+        schemaVersion: 1 as const,
+        stage,
+        nativeSessionId: '11111111-1111-4111-8111-111111111111',
+        turnId: `turn-${index + 1}`,
+        messageId: `message-${index + 1}`,
+        parentMessageId: index === 0 ? 'user-1' : `user-${index + 1}`,
+        completedAt: `2026-09-01T00:00:0${index + 1}.000Z`,
+        responseSha256: String(index + 1).repeat(64),
+        responseContainsNonce: true as const,
+        toolCallCount: 0,
+        toolCallTypes: [],
+        resolvedProvider: profile.nativeProvider,
+        resolvedModel: profile.model === 'haiku' ? 'claude-haiku-4-5-20251001' : profile.model.replace(/^opencode\//, ''),
+        resolvedReasoningEffort: profile.reasoningEffort,
+        providerProvenance: `${provider}-native.provider`,
+        modelProvenance: `${provider}-native.model`,
+        reasoningEffortProvenance: `${provider}-native.effort`,
+      })),
       actualProviderBinary: true,
       completedTurn: true,
       nativeStateCaptured: true,
@@ -363,7 +391,7 @@ describe('provider qualification receipt v2', () => {
         provider: 'claude',
         providerVersion: '2.1.263',
         model: 'haiku',
-        reasoningEffort: 'lowest',
+        reasoningEffort: 'low',
         nativeSessionId: '11111111-1111-4111-8111-111111111111',
       }],
     })
@@ -560,6 +588,52 @@ describe('provider qualification receipt v2', () => {
     },
   )
 
+  it('requires three cryptographic native completed-turn proofs for the exact session', () => {
+    const row = providerRow()
+    expect(() => evidenceFixture([{ ...row, nativeTurnProofs: undefined } as any])).toThrow(/nativeTurnProofs/i)
+    expect(() => evidenceFixture([{
+      ...row,
+      nativeTurnProofs: row.nativeTurnProofs.slice(0, 2),
+    }])).toThrow(/three|required stages/i)
+    expect(() => evidenceFixture([{
+      ...row,
+      nativeTurnProofs: row.nativeTurnProofs.map((proof, index) => index === 2
+        ? { ...proof, nativeSessionId: 'different-session' }
+        : proof),
+    }])).toThrow(/nativeSessionId|exact session/i)
+    expect(() => evidenceFixture([{
+      ...row,
+      nativeTurnProofs: row.nativeTurnProofs.map((proof, index) => index === 2
+        ? { ...proof, messageId: row.nativeTurnProofs[1].messageId }
+        : proof),
+    }])).toThrow(/distinct.*message/i)
+  })
+
+  it('requires zero native tool calls for recall and native model/effort provenance', () => {
+    const row = providerRow('codex')
+    expect(() => evidenceFixture([{
+      ...row,
+      nativeTurnProofs: row.nativeTurnProofs.map((proof, index) => index === 1
+        ? { ...proof, toolCallCount: 1, toolCallTypes: ['function_call:read_file'] }
+        : proof),
+    }])).toThrow(/tool/i)
+    expect(() => evidenceFixture([{
+      ...row,
+      nativeTurnProofs: row.nativeTurnProofs.map((proof) => ({
+        ...proof,
+        reasoningEffortProvenance: 'process-args',
+      })),
+    }])).toThrow(/provenance|process-args/i)
+  })
+
+  it('rejects raw prompts, raw responses, nonce values, and synthetic secrets before writing evidence', () => {
+    const row = providerRow()
+    expect(() => evidenceFixture([{ ...row, responseText: 'harmless raw response' }])).toThrow(/redact|responseText/i)
+    expect(() => evidenceFixture([{ ...row, nonce: '00112233445566778899aabbccddeeff' }])).toThrow(/redact|nonce/i)
+    expect(() => evidenceFixture([{ ...row, diagnostic: 'Bearer synthetic-secret-value' }])).toThrow(/secret|redact/i)
+    expect(() => evidenceFixture([{ ...row, diagnostic: 'sk-synthetic-secret-value' }])).toThrow(/secret|redact/i)
+  })
+
   it('rejects a provider version that differs from the pinned runtime manifest', () => {
     const fixture = evidenceFixture()
     fs.writeFileSync(path.join(fixture.repoRoot, 'docker/runtime/provider-versions.json'), JSON.stringify({
@@ -589,20 +663,20 @@ describe('provider qualification receipt v2', () => {
     })).toThrow(/provider.*artifact|summary/i)
   })
 
-  it('allows legacy schema v1 only for an OpenCode-only receipt', () => {
+  it('never lets a legacy terminal-only schema v1 receipt certify production', () => {
     const legacyBase = {
       schemaVersion: 1,
       status: 'PASS',
       candidateSha,
       runtimeImage,
     }
-    expect(validateProviderQualificationReceipt({
+    expect(() => validateProviderQualificationReceipt({
       repoRoot,
       candidateSha,
       expectedRuntimeImage: runtimeImage,
       receipt: { ...legacyBase, providers: [{ provider: 'opencode' }] },
       allowLegacyV1ForProviders: ['opencode'],
-    }).legacyV1).toBe(true)
+    })).toThrow(/schema v2|legacy/i)
     expect(() => validateProviderQualificationReceipt({
       repoRoot,
       candidateSha,

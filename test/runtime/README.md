@@ -104,7 +104,19 @@ receipt from another commit or image.
 Provider qualification receipts use schema v2. A v2 receipt names its exact
 `receiptRunId`, candidate-bound `evidenceRun`, pinned `runtimeImage`, and the
 provider version/model/reasoning-effort/native-session identity observed by the
-live browser run. Its assertion, broker, and cleanup artifact references each
+live browser run. Every real-provider row also carries exactly three ordered
+provider-native turn proofs (`initial`, `after_session_host_crash`, and
+`after_provider_process_crash`). Each proof binds the exact native session,
+distinct native turn/message ids, parent id when the native format has one,
+completion time, native provider/model/effort plus field-level provenance,
+zero tool calls, nonce containment, and a SHA-256 response digest. Retained
+evidence contains neither prompt/response text nor the nonce; only the nonce
+digest is retained. Flat-file stores are read only after the provider is
+stopped; OpenCode uses a query-only SQLite snapshot. Readers are bounded and
+reject malformed schemas, ambiguous exact-session matches, symlinks, unsafe
+paths, and incomplete responses instead of manufacturing a pass.
+
+Its assertion, broker, and cleanup artifact references each
 carry a SHA-256 digest. Certification resolves those references only inside
 `.runtime-evidence/<candidate-sha>/<receipt-run-id>/`, verifies the run manifest
 and build record, hashes the files again, and derives provider, cleanup, and
@@ -113,9 +125,9 @@ also pin production versus `qualification_fixture`, exact feature sets,
 selected providers, and server/supervisor binary hashes. Final gates accept
 production only; a preliminary qualification-fixture receipt must be requested
 explicitly and can never promote a production capability. A stale, missing,
-path-escaped, or tampered artifact fails certification. Schema v1 remains a narrow migration
-exception for an OpenCode-only receipt; adding any newly promoted provider
-requires schema v2.
+path-escaped, or tampered artifact fails certification. Schema v1 and v2 rows
+without the cryptographic native-turn contract cannot certify production,
+including historical terminal-only OpenCode receipts.
 
 The live producer requires an explicit per-provider selection. Claude or Codex
 can therefore qualify without Amplifier credentials, and Amplifier setup cannot
