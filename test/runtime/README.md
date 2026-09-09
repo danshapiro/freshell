@@ -68,6 +68,31 @@ counts/duration, provider/mode coverage, cleanup, and zero unsafe broker
 attempts, then copies the receipt into its own evidence directory. Never reuse a
 receipt from another commit or image.
 
+Provider qualification receipts use schema v2. A v2 receipt names its exact
+`receiptRunId`, candidate-bound `evidenceRun`, pinned `runtimeImage`, and the
+provider version/model/reasoning-effort/native-session identity observed by the
+live browser run. Its assertion, broker, and cleanup artifact references each
+carry a SHA-256 digest. Certification resolves those references only inside
+`.runtime-evidence/<candidate-sha>/<receipt-run-id>/`, verifies the run manifest
+and build record, hashes the files again, and derives provider, cleanup, and
+unsafe-attempt verdicts from those artifacts. A stale, missing, path-escaped, or
+tampered artifact fails certification. Schema v1 remains a narrow migration
+exception for an OpenCode-only receipt; adding any newly promoted provider
+requires schema v2.
+
+The combined live producer is explicit opt-in and is excluded from the default
+landing campaign until the checked-in capability flags are promoted:
+
+```bash
+FRESHELL_RUNTIME_MANAGED_PROVIDER_QUALIFICATION_LIVE=1 \
+FRESHELL_RUNTIME_AMPLIFIER_MODEL='<exact-live-model>' \
+FRESHELL_RUNTIME_AMPLIFIER_REASONING_EFFORT='<exact-live-effort>' \
+npm run test:runtime:campaign -- --only managed-provider-qualification
+```
+
+The campaign refuses to treat a missing live flag or a Playwright skip as a
+qualification pass.
+
 The gate includes crash failpoints around incident commit, cleanup, export, and
 notice projection. Failpoints are available only in the test supervisor built
 with `runtime-test-faults`. The release-binary case passes the same environment

@@ -33,6 +33,11 @@ type Step = {
   title: string
   /** Receipt env vars this step produces. */
   produces: string[]
+  /** Providers emitted together by a qualification receipt producer. */
+  qualificationProviders?: string[]
+  /** Omitted from the default landing campaign until explicitly selected. */
+  explicitLiveOnly?: boolean
+  requiredLiveEnv?: string
   run?: (env: NodeJS.ProcessEnv, logPath: string) => number
   /**
    * Gate steps are judged by the summary they write, not by an exit code that
@@ -103,9 +108,19 @@ const STEPS: Step[] = [
     id: 'opencode-qualification',
     title: 'OpenCode free-tier provider certification receipt',
     produces: ['FRESHELL_RUNTIME_PHASE3_PROVIDER_RECEIPT', 'FRESHELL_RUNTIME_PHASE5_PROVIDER_RECEIPT'],
+    qualificationProviders: ['opencode'],
     run: playwright('test/e2e-browser/specs/runtime-opencode-provider-qualification-rust.spec.ts', {
       FRESHELL_RUNTIME_OPENCODE_QUALIFICATION_LIVE: '1',
     }),
+  },
+  {
+    id: 'managed-provider-qualification',
+    title: 'Combined Claude/Codex/OpenCode/Amplifier provider certification receipt',
+    produces: ['FRESHELL_RUNTIME_PHASE3_PROVIDER_RECEIPT', 'FRESHELL_RUNTIME_PHASE5_PROVIDER_RECEIPT'],
+    qualificationProviders: ['claude', 'codex', 'opencode', 'amplifier'],
+    explicitLiveOnly: true,
+    requiredLiveEnv: 'FRESHELL_RUNTIME_MANAGED_PROVIDER_QUALIFICATION_LIVE',
+    run: playwright('test/e2e-browser/specs/runtime-managed-provider-qualification-rust.spec.ts', {}),
   },
   {
     id: 'rehydrate',
@@ -171,6 +186,10 @@ function main(): number {
     return 1
   }
 
+  const selectedSteps = only
+    ? STEPS.filter((step) => only.includes(step.id))
+    : STEPS.filter((step) => !step.explicitLiveOnly)
+
   const dirty = git(['status', '--porcelain', '--untracked-files=no'])
   if (dirty && !args.includes('--allow-dirty')) {
     console.error('BLOCKED: tracked modifications present. Every receipt is bound to the exact candidate SHA;')
@@ -187,7 +206,7 @@ function main(): number {
   fs.mkdirSync(logDir, { recursive: true })
 
   const receiptEnv: Record<string, string> = {}
-  for (const step of STEPS) {
+  for (const step of selectedSteps) {
     for (const name of step.produces) {
       receiptEnv[name] = path.join(receiptDir, `${name.toLowerCase()}.json`)
     }
@@ -199,14 +218,30 @@ function main(): number {
     exitCode: number
     ok: boolean
     log: string
+    qualificationProviders?: string[]
     gate?: { status: string; blockedReason: string | null; expected: string; summaryPath: string } | { error: string }
   }
   const results: StepResult[] = []
-  for (const step of STEPS) {
-    if (only && !only.includes(step.id)) continue
+  for (const step of selectedSteps) {
     const logPath = path.join(logDir, `${step.id}.log`)
     console.log(`\n### ${step.id}: ${step.title}`)
     const env = { ...process.env, ...receiptEnv }
+
+    if (step.requiredLiveEnv && process.env[step.requiredLiveEnv] !== '1') {
+      const message = `step ${step.id} requires ${step.requiredLiveEnv}=1; a skipped live qualification is never a pass`
+      fs.mkdirSync(path.dirname(logPath), { recursive: true })
+      fs.writeFileSync(logPath, `${message}\n`)
+      console.error(message)
+      results.push({
+        id: step.id,
+        title: step.title,
+        exitCode: 2,
+        ok: false,
+        log: path.relative(repoRoot, logPath),
+        ...(step.qualificationProviders ? { qualificationProviders: step.qualificationProviders } : {}),
+      })
+      break
+    }
 
     if (step.expectGateStatus) {
       const before = gateSummaryPaths(candidateSha)
@@ -235,7 +270,15 @@ function main(): number {
           && (!step.expectGateStatus.blockedReason
             || summary.blockedReason === step.expectGateStatus.blockedReason)
       }
-      results.push({ id: step.id, title: step.title, exitCode, ok, log: path.relative(repoRoot, logPath), gate })
+      results.push({
+        id: step.id,
+        title: step.title,
+        exitCode,
+        ok,
+        log: path.relative(repoRoot, logPath),
+        gate,
+        ...(step.qualificationProviders ? { qualificationProviders: step.qualificationProviders } : {}),
+      })
       if (!ok) {
         console.error(`step ${step.id}: gate outcome ${JSON.stringify(gate)} is not the expected ${step.expectGateStatus.status}`)
         break
@@ -245,7 +288,14 @@ function main(): number {
 
     const exitCode = step.run!(env, logPath)
     const ok = exitCode === 0
-    results.push({ id: step.id, title: step.title, exitCode, ok, log: path.relative(repoRoot, logPath) })
+    results.push({
+      id: step.id,
+      title: step.title,
+      exitCode,
+      ok,
+      log: path.relative(repoRoot, logPath),
+      ...(step.qualificationProviders ? { qualificationProviders: step.qualificationProviders } : {}),
+    })
     if (!ok) {
       console.error(`step ${step.id} exited ${exitCode}`)
       break
@@ -264,7 +314,7 @@ function main(): number {
       ]),
     ),
     steps: results,
-    status: results.every((row) => row.ok) && (!only ? results.length === STEPS.length : true) ? 'PASS' : 'FAIL',
+    status: results.every((row) => row.ok) && results.length === selectedSteps.length ? 'PASS' : 'FAIL',
   }
   fs.writeFileSync(path.join(campaignRoot, 'campaign.json'), JSON.stringify(campaign, null, 2))
   console.log(JSON.stringify(campaign, null, 2))

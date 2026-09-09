@@ -24,6 +24,7 @@ import {
 import { openPanePicker } from '../helpers/pane-picker.js'
 import { TerminalHelper } from '../helpers/terminal-helpers.js'
 import { TestHarness } from '../helpers/test-harness.js'
+import type { ProviderQualificationRow } from '../../../scripts/testing/provider-qualification-receipt.js'
 
 function leavesByMode(node: any, mode: string): any[] {
   if (!node) return []
@@ -275,6 +276,7 @@ test.describe.serial('OpenCode provider qualification', () => {
       { FRESHELL_RUNTIME_OBSERVER_INTERVAL_MS: '750' },
       'release',
     )
+    let providerRow: ProviderQualificationRow | undefined
     try {
       const info = await rig.start()
       const rollout = dataOf(await rig.runtime.adminOk(
@@ -316,12 +318,19 @@ test.describe.serial('OpenCode provider qualification', () => {
       expect(limitsVerified).toBe(true)
 
       const nonce = `P3_NATIVE_MEMORY_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`
+      const storedSuffix = Math.random().toString(36).slice(2, 10).toUpperCase()
+      const storedMarker = `P3_STORED_${storedSuffix}`
+      const storedBefore = occurrenceCount(await terminalBuffer(page, first.terminalId), storedMarker)
       await executeInPane(
         page,
         first.paneId,
-        `Remember this exact nonce only in our conversation: ${nonce}. Use no tools. Reply with exactly STORED.`,
+        `Remember this exact nonce only in our conversation: ${nonce}. Use no tools. Reply by joining P3, STORED, and ${storedSuffix} with underscores and no other text.`,
       )
-      await terminal.waitForOutput('STORED', { terminalId: first.terminalId, timeout: 180_000 })
+      await waitForValue('an unechoed completed-turn marker', async () => (
+        occurrenceCount(await terminalBuffer(page, first.terminalId), storedMarker) > storedBefore
+          ? true
+          : null
+      ), 180_000)
       const nativeSessionId = await waitForValue('first exact OpenCode session id', async () => (
         await paneSessionId(harness, tabId, first.paneId)
       ), 120_000)
@@ -389,15 +398,19 @@ test.describe.serial('OpenCode provider qualification', () => {
         first.paneId,
         afterProviderCrash.incarnationId,
       )
+      const providerMarker = `P3_PROVIDER_PROCESS_RECOVERED_${Math.random().toString(36).slice(2, 10).toUpperCase()}`
+      const providerMarkerParts = providerMarker.split('_')
+      const providerMarkerBefore = occurrenceCount(await terminalBuffer(page, first.terminalId), providerMarker)
       await executeInPane(
         page,
         first.paneId,
-        'Reply with exactly P3_PROVIDER_PROCESS_RECOVERED and use no tools.',
+        `Use no tools. Reply by joining ${providerMarkerParts.join(', ')} with underscores and no other text.`,
       )
-      await terminal.waitForOutput('P3_PROVIDER_PROCESS_RECOVERED', {
-        terminalId: first.terminalId,
-        timeout: 180_000,
-      })
+      await waitForValue('an unechoed provider-recovery follow-up marker', async () => (
+        occurrenceCount(await terminalBuffer(page, first.terminalId), providerMarker) > providerMarkerBefore
+          ? true
+          : null
+      ), 180_000)
       const providerFollowUpCompleted = true
 
       // A second OpenCode soul is independently owned, while an explicit
@@ -405,15 +418,19 @@ test.describe.serial('OpenCode provider qualification', () => {
       const prior = new Set(leavesByMode(await harness.getPaneLayout(tabId), 'opencode').map((leaf) => leaf.id))
       const second = await createOpencodePane(page, harness, terminal, rig, tabId, prior)
       if (!second.view.containerId) throw new Error('second OpenCode view lacks container')
+      const secondMarker = `P3_SECOND_SOUL_READY_${Math.random().toString(36).slice(2, 10).toUpperCase()}`
+      const secondMarkerParts = secondMarker.split('_')
+      const secondMarkerBefore = occurrenceCount(await terminalBuffer(page, second.terminalId), secondMarker)
       await executeInPane(
         page,
         second.paneId,
-        'Reply with exactly P3_SECOND_SOUL_READY and use no tools.',
+        `Use no tools. Reply by joining ${secondMarkerParts.join(', ')} with underscores and no other text.`,
       )
-      await terminal.waitForOutput('P3_SECOND_SOUL_READY', {
-        terminalId: second.terminalId,
-        timeout: 180_000,
-      })
+      await waitForValue('an unechoed second-soul marker', async () => (
+        occurrenceCount(await terminalBuffer(page, second.terminalId), secondMarker) > secondMarkerBefore
+          ? true
+          : null
+      ), 180_000)
       const secondSessionId = await waitForValue('second exact OpenCode session id', async () => (
         await paneSessionId(harness, tabId, second.paneId)
       ), 120_000)
@@ -470,12 +487,13 @@ test.describe.serial('OpenCode provider qualification', () => {
       expect(secondStop.outcome).toBe('verified_empty')
       expect(rig.runtime.broker.unsafeAttempts()).toHaveLength(0)
 
-      const providerRow = {
+      providerRow = {
         provider: 'opencode',
         modes: ['opencode'],
         actualProviderBinary: true,
-        version: P2_OPENCODE_VERSION,
+        providerVersion: P2_OPENCODE_VERSION,
         model: P2_OPENCODE_FREE_MODEL,
+        reasoningEffort: 'provider-default',
         completedTurn: true,
         nativeStateCaptured: true,
         nativeSessionId,
@@ -495,6 +513,8 @@ test.describe.serial('OpenCode provider qualification', () => {
         onlyOneWriter: firstRunning.length === 1,
         profileVerified: firstSoul.profile === (first.view as any).profile,
         sameNativeSession: afterProviderCrash.nativeSessionId === nativeSessionId,
+        exactNativeRecovery: afterHostCrash.nativeSessionId === nativeSessionId
+          && afterProviderCrash.nativeSessionId === nativeSessionId,
         blockers: [
           'credentials_expired',
           'rate_limited',
@@ -513,39 +533,23 @@ test.describe.serial('OpenCode provider qualification', () => {
           && !rig.runtime.isContainerRunning(afterHostCrash.containerId),
         followUpCompleted: providerFollowUpCompleted,
         releaseBinary: rig.supervisor.binaryKind === 'release',
-        cleanupVerified: firstStop.outcome === 'verified_empty'
-          && secondStop.outcome === 'verified_empty',
-        unsafeAttempts: rig.runtime.broker.unsafeAttempts().length,
-      }
-      const receipt = {
-        schemaVersion: 1,
-        status: 'PASS',
-        candidateSha: rig.runtime.candidateSha,
-        runtimeImage: rig.runtime.imageRef,
-        providers: [providerRow],
-        isolation: {
-          opencode: {
-            twoSoulsIndependent: second.view.soulId !== first.view.soulId
-              && second.view.containerId !== afterProviderCrash.containerId,
-            oneWriterPerSoul: firstRunning.length === 1,
-          },
-        },
       }
       expect(providerRow.nonceRecovery.recalledNonce).toBe(true)
       expect(providerRow.onlyOneWriter).toBe(true)
       expect(providerRow.nativeRecovery).toBe(true)
+      expect(providerRow.exactNativeRecovery).toBe(true)
       expect(providerRow.lostNoticeCount).toBe(0)
       expect(providerRow.releaseBinary).toBe(true)
-      expect(providerRow.cleanupVerified).toBe(true)
-      expect(providerRow.unsafeAttempts).toBe(0)
-      expect(receipt.isolation.opencode.twoSoulsIndependent).toBe(true)
-      expect(receipt.isolation.opencode.oneWriterPerSoul).toBe(true)
-      const receiptPaths = rig.writeProviderQualificationReceipt(receipt)
-      // eslint-disable-next-line no-console
-      console.log(`[provider-qualification] OpenCode receipts: ${receiptPaths.join(', ')}`)
+      expect(second.view.soulId).not.toBe(first.view.soulId)
+      expect(second.view.containerId).not.toBe(afterProviderCrash.containerId)
     } finally {
       const cleanup = await rig.stop()
       expect(cleanup.ok, cleanup.errors.join('\n')).toBe(true)
     }
+    if (!providerRow) throw new Error('OpenCode qualification produced no provider evidence')
+    const finalized = rig.finalizeProviderQualificationReceipt([providerRow])
+    expect(finalized.receipt.schemaVersion).toBe(2)
+    // eslint-disable-next-line no-console
+    console.log(`[provider-qualification] OpenCode receipts: ${finalized.paths.join(', ')}`)
   })
 })

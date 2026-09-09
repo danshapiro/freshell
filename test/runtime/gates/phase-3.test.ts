@@ -11,6 +11,7 @@ import {
   type SupervisorInstance,
 } from '../../../scripts/testing/runtime-sandbox.js'
 import { receiptArtifactName } from '../../../scripts/testing/runtime-receipts.js'
+import { validateProviderQualificationReceipt } from '../../../scripts/testing/provider-qualification-receipt.js'
 
 export const PHASE3_CASE_IDS = [
   'P3-G01', 'P3-G02', 'P3-G03', 'P3-G04', 'P3-G05', 'P3-G06',
@@ -131,7 +132,7 @@ async function gate01EnabledProviderMatrixReceipt(h: RuntimeHarness): Promise<vo
     const row = rows.find((candidate: any) => candidate.provider === capability.provider)
     h.assert(caseId, row !== undefined, `receipt covers durable provider ${capability.provider}`, { capability, rows })
     h.assert(caseId, row.actualProviderBinary === true, `${capability.provider} used its actual provider binary/SDK`, row)
-    h.assert(caseId, typeof row.version === 'string' && row.version.length > 0, `${capability.provider} records a provider version`, row)
+    h.assert(caseId, typeof (row.providerVersion ?? row.version) === 'string' && (row.providerVersion ?? row.version).length > 0, `${capability.provider} records a provider version`, row)
     h.assert(caseId, row.completedTurn === true, `${capability.provider} completed a real turn`, row)
     h.assert(caseId, row.nativeStateCaptured === true, `${capability.provider} captured scoped durable state`, row)
     h.assert(caseId, typeof row.nativeSessionId === 'string' && row.nativeSessionId.length > 0, `${capability.provider} captured an exact native identity`, row)
@@ -738,10 +739,17 @@ function requiredProviderReceipt(caseId: string, h: RuntimeHarness, instruction:
     process.env.FRESHELL_RUNTIME_PHASE3_PROVIDER_RECEIPT,
     instruction,
   )
-  h.assert(caseId, receipt.schemaVersion === 1 && receipt.status === 'PASS', 'provider receipt is an explicit schema-v1 PASS', receipt)
+  const validated = validateProviderQualificationReceipt({
+    repoRoot: h.repoRoot,
+    candidateSha: h.candidateSha,
+    expectedRuntimeImage: h.imageRef,
+    receipt,
+    allowLegacyV1ForProviders: ['opencode'],
+  })
+  h.assert(caseId, receipt.status === 'PASS', 'provider receipt is an explicit PASS', receipt)
   h.assert(caseId, receipt.candidateSha === h.candidateSha, 'provider receipt belongs to the exact candidate commit', receipt)
   h.writeBrowserArtifact(receiptArtifactName('FRESHELL_RUNTIME_PHASE3_PROVIDER_RECEIPT', caseId), receipt)
-  return receipt
+  return { ...receipt, providers: validated.providers }
 }
 
 function requiredExternalReceipt(caseId: string, raw: string | undefined, instruction: string): ProviderReceipt {

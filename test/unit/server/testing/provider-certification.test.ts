@@ -20,6 +20,11 @@ import {
   RELEASE_SCOPE_CASE_ID,
   resolveGateOutcome,
 } from '../../../../scripts/testing/provider-certification.js'
+import {
+  buildProviderQualificationReceipt,
+  validateProviderQualificationReceipt,
+  type ProviderQualificationRow,
+} from '../../../../scripts/testing/provider-qualification-receipt.js'
 import { parseGateArgs } from '../../../../scripts/testing/runtime-gate-args.js'
 
 const repoRoot = path.resolve(__dirname, '../../../..')
@@ -214,6 +219,266 @@ describe('manifest loading', () => {
       JSON.stringify({ schemaVersion: 1, providers: [], doorways: [] }),
     )
     expect(() => loadCapabilityManifest(dir)).toThrow(/certification/i)
+  })
+})
+
+describe('provider qualification receipt v2', () => {
+  const candidateSha = 'a'.repeat(40)
+  const receiptRunId = 'qualification-run-001'
+  const runtimeImage = `sha256:${'b'.repeat(64)}`
+
+  function providerRow(provider = 'claude'): ProviderQualificationRow {
+    return {
+      provider,
+      modes: [provider],
+      providerVersion: '2.1.263',
+      model: 'haiku',
+      reasoningEffort: 'lowest',
+      nativeSessionId: '11111111-1111-4111-8111-111111111111',
+      actualProviderBinary: true,
+      completedTurn: true,
+      nativeStateCaptured: true,
+      runtimeOwned: true,
+      limitsVerified: true,
+      automaticResume: true,
+      profileVerified: true,
+      releaseBinary: true,
+      nativeRecovery: true,
+      exactNativeRecovery: true,
+      sameNativeSession: true,
+      followUpCompleted: true,
+      onlyOneWriter: true,
+      oldEnclosureVerifiedEmpty: true,
+      lostNoticeCount: 0,
+      crashKinds: ['session_host', 'provider_process'],
+    }
+  }
+
+  function evidenceFixture(providers = [providerRow()]): {
+    repoRoot: string
+    evidenceDir: string
+    receipt: ReturnType<typeof buildProviderQualificationReceipt>
+  } {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'freshell-qualification-'))
+    tempRoots.push(root)
+    const evidenceDir = path.join(root, '.runtime-evidence', candidateSha, receiptRunId)
+    fs.mkdirSync(evidenceDir, { recursive: true })
+    fs.mkdirSync(path.join(root, 'docker/runtime'), { recursive: true })
+    fs.writeFileSync(path.join(root, 'docker/runtime/provider-versions.json'), JSON.stringify({
+      providers: Object.fromEntries(providers.map((row) => [row.provider, { version: row.providerVersion }])),
+    }))
+    fs.writeFileSync(path.join(evidenceDir, 'manifest.json'), JSON.stringify({
+      execution: { candidateSha, runId: receiptRunId },
+    }))
+    fs.writeFileSync(path.join(evidenceDir, 'build.json'), JSON.stringify({ candidateSha, runtimeImage }))
+    fs.writeFileSync(path.join(evidenceDir, 'broker.jsonl'), [
+      JSON.stringify({ decision: 'forward', destructive: false, unsafeAttempt: false }),
+      JSON.stringify({ decision: 'forward', destructive: true, unsafeAttempt: false }),
+    ].join('\n') + '\n')
+    fs.writeFileSync(path.join(evidenceDir, 'cleanup.json'), JSON.stringify({
+      ok: true,
+      errors: [],
+      unsafeBrokerAttempts: [],
+    }))
+    return {
+      repoRoot: root,
+      evidenceDir,
+      receipt: buildProviderQualificationReceipt({
+        repoRoot: root,
+        evidenceDir,
+        candidateSha,
+        receiptRunId,
+        runtimeImage,
+        providers,
+      }),
+    }
+  }
+
+  it('builds a candidate/run/image-bound v2 receipt with hashed evidence artifacts', () => {
+    const fixture = evidenceFixture()
+    expect(fixture.receipt).toMatchObject({
+      schemaVersion: 2,
+      status: 'PASS',
+      candidateSha,
+      receiptRunId,
+      evidenceRun: `.runtime-evidence/${candidateSha}/${receiptRunId}`,
+      runtimeImage,
+      providers: [{
+        provider: 'claude',
+        providerVersion: '2.1.263',
+        model: 'haiku',
+        reasoningEffort: 'lowest',
+        nativeSessionId: '11111111-1111-4111-8111-111111111111',
+      }],
+    })
+    for (const artifact of Object.values(fixture.receipt.artifacts)) {
+      expect(artifact.path).toMatch(new RegExp(`^\\.runtime-evidence/${candidateSha}/${receiptRunId}/`))
+      expect(artifact.sha256).toMatch(/^[a-f0-9]{64}$/)
+    }
+    expect(validateProviderQualificationReceipt({
+      repoRoot: fixture.repoRoot,
+      candidateSha,
+      expectedRuntimeImage: runtimeImage,
+      receipt: fixture.receipt,
+      allowLegacyV1ForProviders: ['opencode'],
+    }).providers).toEqual([providerRow()])
+  })
+
+  it.each([
+    ['assertions', 'provider-qualification-assertions.json'],
+    ['broker', 'broker.jsonl'],
+    ['cleanup', 'cleanup.json'],
+  ] as const)('rejects a tampered %s artifact', (_name, fileName) => {
+    const fixture = evidenceFixture()
+    fs.appendFileSync(path.join(fixture.evidenceDir, fileName), '\nTAMPERED\n')
+    expect(() => validateProviderQualificationReceipt({
+      repoRoot: fixture.repoRoot,
+      candidateSha,
+      expectedRuntimeImage: runtimeImage,
+      receipt: fixture.receipt,
+      allowLegacyV1ForProviders: ['opencode'],
+    })).toThrow(/digest|sha-256/i)
+  })
+
+  it('rejects stale, missing, and path-escaped evidence runs', () => {
+    const fixture = evidenceFixture()
+    const validate = (receipt: any) => validateProviderQualificationReceipt({
+      repoRoot: fixture.repoRoot,
+      candidateSha,
+      expectedRuntimeImage: runtimeImage,
+      receipt,
+      allowLegacyV1ForProviders: ['opencode'],
+    })
+    expect(() => validate({ ...fixture.receipt, candidateSha: 'c'.repeat(40) })).toThrow(/candidate/i)
+    expect(() => validate({ ...fixture.receipt, receiptRunId: 'another-run' })).toThrow(/evidence run|run id/i)
+    expect(() => validate({
+      ...fixture.receipt,
+      artifacts: {
+        ...fixture.receipt.artifacts,
+        cleanup: { ...fixture.receipt.artifacts.cleanup, path: '../cleanup.json' },
+      },
+    })).toThrow(/artifact path|evidence run/i)
+    fs.rmSync(path.join(fixture.evidenceDir, 'cleanup.json'))
+    expect(() => validate(fixture.receipt)).toThrow(/missing|not found/i)
+  })
+
+  it('rejects an evidence directory whose manifest belongs to another run', () => {
+    const fixture = evidenceFixture()
+    fs.writeFileSync(path.join(fixture.evidenceDir, 'manifest.json'), JSON.stringify({
+      execution: { candidateSha, runId: 'stale-run' },
+    }))
+    expect(() => validateProviderQualificationReceipt({
+      repoRoot: fixture.repoRoot,
+      candidateSha,
+      expectedRuntimeImage: runtimeImage,
+      receipt: fixture.receipt,
+      allowLegacyV1ForProviders: ['opencode'],
+    })).toThrow(/manifest run id|candidate-bound/i)
+  })
+
+  it('derives cleanup and broker safety from evidence instead of receipt booleans', () => {
+    const failedCleanup = evidenceFixture()
+    fs.writeFileSync(path.join(failedCleanup.evidenceDir, 'cleanup.json'), JSON.stringify({
+      ok: false,
+      errors: ['still running'],
+      unsafeBrokerAttempts: [],
+    }))
+    expect(() => buildProviderQualificationReceipt({
+      repoRoot: failedCleanup.repoRoot,
+      evidenceDir: failedCleanup.evidenceDir,
+      candidateSha,
+      receiptRunId,
+      runtimeImage,
+      providers: [providerRow()],
+    })).toThrow(/cleanup/i)
+
+    const unsafeBroker = evidenceFixture()
+    fs.appendFileSync(path.join(unsafeBroker.evidenceDir, 'broker.jsonl'), `${JSON.stringify({
+      decision: 'block', destructive: true, unsafeAttempt: true,
+    })}\n`)
+    expect(() => buildProviderQualificationReceipt({
+      repoRoot: unsafeBroker.repoRoot,
+      evidenceDir: unsafeBroker.evidenceDir,
+      candidateSha,
+      receiptRunId,
+      runtimeImage,
+      providers: [providerRow()],
+    })).toThrow(/unsafe/i)
+  })
+
+  it.each([
+    ['actualProviderBinary', false],
+    ['completedTurn', false],
+    ['nativeRecovery', false],
+    ['exactNativeRecovery', false],
+    ['sameNativeSession', false],
+    ['followUpCompleted', false],
+    ['onlyOneWriter', false],
+    ['limitsVerified', false],
+    ['oldEnclosureVerifiedEmpty', false],
+    ['lostNoticeCount', 1],
+  ] as const)('rejects provider evidence when %s is not qualifying', (field, value) => {
+    const row = { ...providerRow(), [field]: value }
+    expect(() => evidenceFixture([row])).toThrow(new RegExp(field, 'i'))
+  })
+
+  it.each(['providerVersion', 'model', 'reasoningEffort', 'nativeSessionId'] as const)(
+    'requires the exact provider %s identity',
+    (field) => {
+      expect(() => evidenceFixture([{ ...providerRow(), [field]: '' }])).toThrow(new RegExp(field, 'i'))
+    },
+  )
+
+  it('rejects a provider version that differs from the pinned runtime manifest', () => {
+    const fixture = evidenceFixture()
+    fs.writeFileSync(path.join(fixture.repoRoot, 'docker/runtime/provider-versions.json'), JSON.stringify({
+      providers: { claude: { version: 'different-version' } },
+    }))
+    expect(() => validateProviderQualificationReceipt({
+      repoRoot: fixture.repoRoot,
+      candidateSha,
+      expectedRuntimeImage: runtimeImage,
+      receipt: fixture.receipt,
+      allowLegacyV1ForProviders: ['opencode'],
+    })).toThrow(/pinned.*version|providerVersion/i)
+  })
+
+  it('rejects receipts whose provider summary differs from the hashed assertion artifact', () => {
+    const fixture = evidenceFixture()
+    const forged = {
+      ...fixture.receipt,
+      providers: [{ ...fixture.receipt.providers[0], model: 'more-expensive-model' }],
+    }
+    expect(() => validateProviderQualificationReceipt({
+      repoRoot: fixture.repoRoot,
+      candidateSha,
+      expectedRuntimeImage: runtimeImage,
+      receipt: forged,
+      allowLegacyV1ForProviders: ['opencode'],
+    })).toThrow(/provider.*artifact|summary/i)
+  })
+
+  it('allows legacy schema v1 only for an OpenCode-only receipt', () => {
+    const legacyBase = {
+      schemaVersion: 1,
+      status: 'PASS',
+      candidateSha,
+      runtimeImage,
+    }
+    expect(validateProviderQualificationReceipt({
+      repoRoot,
+      candidateSha,
+      expectedRuntimeImage: runtimeImage,
+      receipt: { ...legacyBase, providers: [{ provider: 'opencode' }] },
+      allowLegacyV1ForProviders: ['opencode'],
+    }).legacyV1).toBe(true)
+    expect(() => validateProviderQualificationReceipt({
+      repoRoot,
+      candidateSha,
+      expectedRuntimeImage: runtimeImage,
+      receipt: { ...legacyBase, providers: [{ provider: 'claude' }] },
+      allowLegacyV1ForProviders: ['opencode'],
+    })).toThrow(/schema v2|legacy/i)
   })
 })
 
