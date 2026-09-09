@@ -468,8 +468,16 @@ async function qualifyProvider(
     nativeTurnProof('after_session_host_crash', nativeSessionId, hostCrashTurn, nonce),
     nativeTurnProof('after_provider_process_crash', nativeSessionId, providerCrashTurn, nonce),
   ]
-  expect(new Set(nativeTurnProofs.map((proof) => proof.messageId)).size).toBe(3)
-  expect(new Set(nativeTurnProofs.map((proof) => proof.turnId)).size).toBe(3)
+  if (definition.provider === 'amplifier') {
+    const evidence = nativeTurnProofs.map((proof) => proof.nativeEvidence)
+    expect(evidence.every((value) => value.kind === 'append_only_record')).toBe(true)
+    expect(new Set(evidence.map((value) => value.kind === 'append_only_record' ? value.recordSha256 : '')).size).toBe(3)
+  } else {
+    const evidence = nativeTurnProofs.map((proof) => proof.nativeEvidence)
+    expect(evidence.every((value) => value.kind === 'identified_message')).toBe(true)
+    expect(new Set(evidence.map((value) => value.kind === 'identified_message' ? value.messageId : '')).size).toBe(3)
+    expect(new Set(evidence.map((value) => value.kind === 'identified_message' ? value.turnId : '')).size).toBe(3)
+  }
   expect(nativeTurnProofs.every((proof) => proof.toolCallCount === 0)).toBe(true)
 
   return {

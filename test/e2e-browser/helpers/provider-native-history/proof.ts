@@ -15,12 +15,10 @@ export function nativeTurnProof(
   if (!turn.text.includes(nonce)) throw new Error(`${stage} native assistant response does not contain the nonce`)
   const toolCallTypes = turn.toolCalls.map((call) => call.name ? `${call.type}:${call.name}` : call.type)
   return {
-    schemaVersion: 1,
+    schemaVersion: 2,
     stage,
     nativeSessionId,
-    turnId: turn.turnId,
-    messageId: turn.messageId,
-    parentMessageId: turn.parentMessageId,
+    nativeEvidence: turn.nativeEvidence,
     completedAt: turn.completedAt,
     responseSha256: createHash('sha256').update(turn.text).digest('hex'),
     responseContainsNonce: true,

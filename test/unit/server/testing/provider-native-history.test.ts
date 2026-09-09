@@ -50,7 +50,13 @@ describe('Claude native history proof', () => {
       schemaVersion: 1,
       provider: 'claude',
       nativeSessionId: sessionId,
-      turns: [{
+      turns: [expect.objectContaining({
+        nativeEvidence: {
+          kind: 'identified_message',
+          turnId: 'msg_01',
+          messageId: 'assistant-row-1',
+          parentMessageId: 'user-1',
+        },
         turnId: 'msg_01',
         messageId: 'assistant-row-1',
         parentMessageId: 'user-1',
@@ -63,7 +69,7 @@ describe('Claude native history proof', () => {
         providerProvenance: 'claude-assistant-message',
         modelProvenance: 'claude-assistant-message.model',
         reasoningEffortProvenance: 'claude-transcript.effort',
-      }],
+      })],
     })
   })
 
@@ -245,7 +251,11 @@ describe('Amplifier native history proof', () => {
     }])
 
     expect(readAmplifierNativeHistory(root, sessionId).turns).toEqual([expect.objectContaining({
-      turnId: 'turn-1', messageId: 'assistant-1', parentMessageId: 'user-1',
+      nativeEvidence: expect.objectContaining({
+        kind: 'append_only_record',
+        recordIndex: 0,
+        completionEventOrdinal: 1,
+      }),
       completedAt: '2026-09-01T00:00:01.100Z', toolCalls: [],
       resolvedProvider: 'freshell-onecli-anthropic', resolvedModel: 'claude-haiku-4-5-20251001',
       resolvedReasoningEffort: 'low', providerProvenance: 'amplifier-session:config.provider',
@@ -282,22 +292,31 @@ describe('Amplifier native history proof', () => {
     fs.symlinkSync(outside, path.join(symlinkRoot, 'project', 'sessions', sessionId), 'dir')
     expect(() => readAmplifierNativeHistory(symlinkRoot, sessionId)).toThrow(/symlink/i)
 
-    // This is the pinned app-cli/core shape: Message declares role/content/
-    // metadata but no native message id, while these hook emissions carry
-    // session_id only. Qualification must BLOCK rather than derive an id from
-    // ordinal position, text, timestamp, or digest.
+    // The pinned product does not promise message/request IDs. Certify the
+    // native append-only session semantics it actually exposes instead of
+    // inventing an identity purely for Freshell's test harness.
     const pinnedRoot = tempRoot('amplifier-pinned-shape')
     const pinnedDir = path.join(pinnedRoot, 'project', 'sessions', sessionId)
     writeJsonl(path.join(pinnedDir, 'events.jsonl'), [
       { ts: '2026-09-01T00:00:00.000Z', schema: { name: 'amplifier.log', ver: '1.0.0' }, event: 'session:config', session_id: sessionId, data: { raw: { providers: [{ id: 'freshell-onecli-anthropic', config: { default_model: 'claude-haiku-4-5-20251001', reasoning_effort: 'low' } }] } } },
       { ts: '2026-09-01T00:00:01.000Z', schema: { name: 'amplifier.log', ver: '1.0.0' }, event: 'prompt:complete', session_id: sessionId, data: {} },
       { ts: '2026-09-01T00:00:01.100Z', schema: { name: 'amplifier.log', ver: '1.0.0' }, event: 'cleanup:store_end', session_id: sessionId, data: {} },
+      { ts: '2026-09-01T00:00:02.000Z', schema: { name: 'amplifier.log', ver: '1.0.0' }, event: 'prompt:complete', session_id: sessionId, data: {} },
+      { ts: '2026-09-01T00:00:02.100Z', schema: { name: 'amplifier.log', ver: '1.0.0' }, event: 'cleanup:store_end', session_id: sessionId, data: {} },
     ])
-    writeJsonl(path.join(pinnedDir, 'transcript.jsonl'), [{
-      role: 'assistant', content: '00112233445566778899aabbccddeeff',
-      metadata: { timestamp: '2026-09-01T00:00:01.000Z' },
-    }])
-    expect(() => readAmplifierNativeHistory(pinnedRoot, sessionId)).toThrow(/request.*id|span.*id/i)
+    writeJsonl(path.join(pinnedDir, 'transcript.jsonl'), [
+      { role: 'user', content: 'remember it' },
+      { role: 'assistant', content: '00112233445566778899aabbccddeeff', metadata: { timestamp: '2026-09-01T00:00:01.000Z' } },
+      { role: 'user', content: 'recall it' },
+      { role: 'assistant', content: 'still 00112233445566778899aabbccddeeff', metadata: { timestamp: '2026-09-01T00:00:02.000Z' } },
+    ])
+    const pinned = readAmplifierNativeHistory(pinnedRoot, sessionId) as any
+    expect(pinned.turns).toHaveLength(2)
+    expect(pinned.turns.map((turn: any) => turn.nativeEvidence.kind)).toEqual(['append_only_record', 'append_only_record'])
+    expect(pinned.turns.map((turn: any) => turn.nativeEvidence.recordIndex)).toEqual([1, 3])
+    expect(pinned.turns.every((turn: any) => /^[a-f0-9]{64}$/.test(turn.nativeEvidence.recordSha256))).toBe(true)
+    expect(pinned.turns[0].messageId).toBeUndefined()
+    expect(pinned.turns[0].turnId).toBeUndefined()
   })
 })
 

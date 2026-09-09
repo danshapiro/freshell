@@ -81,7 +81,12 @@ describe('live recovery proves new native assistant responses, never TUI echo or
   it('retains message/parent identity and a digest without copying response text into receipts', () => {
     message('answer', 'ses_owned', 'assistant', 'private fixture answer')
     const proof = nativeTurnProof('initial', 'ses_owned', read().turns[0], 'private fixture answer')
-    expect(proof).toMatchObject({ nativeSessionId: 'ses_owned', messageId: 'answer', parentMessageId: 'user-request', completedAt: 200, toolCallCount: 0 })
+    expect(proof).toMatchObject({
+      nativeSessionId: 'ses_owned',
+      nativeEvidence: { kind: 'identified_message', messageId: 'answer', parentMessageId: 'user-request' },
+      completedAt: 200,
+      toolCallCount: 0,
+    })
     expect(proof.responseSha256).toBe(createHash('sha256').update('private fixture answer').digest('hex'))
     expect(JSON.stringify(proof)).not.toContain('private fixture answer')
   })

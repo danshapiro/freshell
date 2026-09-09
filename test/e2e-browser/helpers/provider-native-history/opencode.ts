@@ -89,10 +89,13 @@ export function readOpenCodeNativeHistory(filename: string, exactSessionId: stri
         .filter((part) => part.type === 'tool')
         .map((part) => ({ type: 'tool', ...(optionalString(part.tool ?? part.name) ? { name: optionalString(part.tool ?? part.name)! } : {}) })),
       'OpenCode native tool calls')
+      const messageId = requiredString(row.id, 'OpenCode assistant message id')
+      const parentMessageId = optionalString(message.parentID)
       turns.push({
-        turnId: requiredString(row.id, 'OpenCode assistant message id'),
-        messageId: requiredString(row.id, 'OpenCode assistant message id'),
-        parentMessageId: optionalString(message.parentID),
+        nativeEvidence: { kind: 'identified_message', turnId: messageId, messageId, parentMessageId },
+        turnId: messageId,
+        messageId,
+        parentMessageId,
         completedAt: message.time.completed,
         text,
         toolCalls,

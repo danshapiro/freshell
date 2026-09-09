@@ -8,13 +8,31 @@ export const PROVIDER_QUALIFICATION_CLEANUP_FILE = 'cleanup.json'
 
 export type NativeProofStage = 'initial' | 'after_session_host_crash' | 'after_provider_process_crash'
 
-export type ProviderNativeTurnProof = {
-  schemaVersion: 1
-  stage: NativeProofStage
-  nativeSessionId: string
+export type ProviderIdentifiedMessageEvidence = {
+  kind: 'identified_message'
   turnId: string
   messageId: string
   parentMessageId: string | null
+}
+
+export type ProviderAppendOnlyRecordEvidence = {
+  kind: 'append_only_record'
+  recordIndex: number
+  byteStart: number
+  byteEnd: number
+  recordSha256: string
+  prefixSha256Before: string
+  completionEventOrdinal: number
+  completionEventSha256: string
+}
+
+export type ProviderNativeEvidence = ProviderIdentifiedMessageEvidence | ProviderAppendOnlyRecordEvidence
+
+export type ProviderNativeTurnProof = {
+  schemaVersion: 2
+  stage: NativeProofStage
+  nativeSessionId: string
+  nativeEvidence: ProviderNativeEvidence
   completedAt: string | number
   responseSha256: string
   responseContainsNonce: true
@@ -381,21 +399,63 @@ function validateNativeTurnProofs(provider: string, row: Record<string, any>): v
   }
   const messageIds = new Set<string>()
   const turnIds = new Set<string>()
+  const recordDigests = new Set<string>()
+  const completionDigests = new Set<string>()
   let priorCompletion = -Infinity
+  let priorRecordIndex = -1
+  let priorByteEnd = -1
+  let priorCompletionOrdinal = 0
   for (const [index, candidate] of row.nativeTurnProofs.entries()) {
     const proof = object(candidate, `${provider}.nativeTurnProofs[${index}]`)
-    if (proof.schemaVersion !== 1) throw new Error(`${provider}.nativeTurnProofs[${index}] has an unsupported schema`)
+    if (proof.schemaVersion !== 2) throw new Error(`${provider}.nativeTurnProofs[${index}] has an unsupported schema`)
     if (proof.stage !== REQUIRED_NATIVE_STAGES[index]) {
       throw new Error(`${provider}.nativeTurnProofs must contain the required stages in chronological order`)
     }
     stringEqual(proof.nativeSessionId, row.nativeSessionId, `${provider}.nativeTurnProofs[${index}].nativeSessionId`)
-    const turnId = boundedEvidenceId(proof.turnId, `${provider}.nativeTurnProofs[${index}].turnId`)
-    const messageId = boundedEvidenceId(proof.messageId, `${provider}.nativeTurnProofs[${index}].messageId`)
-    if (turnIds.has(turnId)) throw new Error(`${provider}.nativeTurnProofs must use distinct native turn ids`)
-    if (messageIds.has(messageId)) throw new Error(`${provider}.nativeTurnProofs must use distinct native assistant message ids`)
-    turnIds.add(turnId)
-    messageIds.add(messageId)
-    if (proof.parentMessageId !== null) boundedEvidenceId(proof.parentMessageId, `${provider}.nativeTurnProofs[${index}].parentMessageId`)
+    const evidence = object(proof.nativeEvidence, `${provider}.nativeTurnProofs[${index}].nativeEvidence`)
+    if (provider === 'amplifier') {
+      if (evidence.kind !== 'append_only_record') {
+        throw new Error('Amplifier qualification requires native append-only record evidence, not fabricated message ids')
+      }
+      const integer = (value: unknown, label: string, minimum: number): number => {
+        if (!Number.isSafeInteger(value) || (value as number) < minimum) throw new Error(`${label} must be a bounded integer`)
+        return value as number
+      }
+      const recordIndex = integer(evidence.recordIndex, `${provider}.nativeTurnProofs[${index}].recordIndex`, 0)
+      const byteStart = integer(evidence.byteStart, `${provider}.nativeTurnProofs[${index}].byteStart`, 0)
+      const byteEnd = integer(evidence.byteEnd, `${provider}.nativeTurnProofs[${index}].byteEnd`, 1)
+      const completionOrdinal = integer(evidence.completionEventOrdinal, `${provider}.nativeTurnProofs[${index}].completionEventOrdinal`, 1)
+      if (byteEnd <= byteStart) throw new Error(`${provider}.nativeTurnProofs[${index}] has an invalid native append byte range`)
+      if (recordIndex <= priorRecordIndex || byteStart <= priorByteEnd || completionOrdinal <= priorCompletionOrdinal) {
+        throw new Error(`${provider}.nativeTurnProofs must prove strictly increasing native append and completion positions`)
+      }
+      for (const field of ['recordSha256', 'prefixSha256Before', 'completionEventSha256'] as const) {
+        if (typeof evidence[field] !== 'string' || !/^[a-f0-9]{64}$/.test(evidence[field])) {
+          throw new Error(`${provider}.nativeTurnProofs[${index}].${field} must be a SHA-256 digest`)
+        }
+      }
+      if (recordDigests.has(evidence.recordSha256) || completionDigests.has(evidence.completionEventSha256)) {
+        throw new Error(`${provider}.nativeTurnProofs must identify distinct native append/completion records`)
+      }
+      recordDigests.add(evidence.recordSha256)
+      completionDigests.add(evidence.completionEventSha256)
+      priorRecordIndex = recordIndex
+      priorByteEnd = byteEnd
+      priorCompletionOrdinal = completionOrdinal
+    } else {
+      if (evidence.kind !== 'identified_message') {
+        throw new Error(`${provider}.nativeTurnProofs require provider-native identified-message evidence`)
+      }
+      const turnId = boundedEvidenceId(evidence.turnId, `${provider}.nativeTurnProofs[${index}].turnId`)
+      const messageId = boundedEvidenceId(evidence.messageId, `${provider}.nativeTurnProofs[${index}].messageId`)
+      if (turnIds.has(turnId)) throw new Error(`${provider}.nativeTurnProofs must use distinct native turn ids`)
+      if (messageIds.has(messageId)) throw new Error(`${provider}.nativeTurnProofs must use distinct native assistant message ids`)
+      turnIds.add(turnId)
+      messageIds.add(messageId)
+      if (evidence.parentMessageId !== null) {
+        boundedEvidenceId(evidence.parentMessageId, `${provider}.nativeTurnProofs[${index}].parentMessageId`)
+      }
+    }
     const completedAt = nativeCompletionMillis(proof.completedAt, `${provider}.nativeTurnProofs[${index}].completedAt`)
     if (completedAt <= priorCompletion) throw new Error(`${provider}.nativeTurnProofs completion timestamps must increase`)
     priorCompletion = completedAt
