@@ -9,8 +9,12 @@
     "envVar": "CLAUDE_CMD",
     "resumeArgs": ["--resume", "{{sessionId}}"],
     "createSessionArgs": ["--session-id", "{{sessionId}}"],
+    "modelArgs": ["--model", "{{model}}"],
+    "effortArgs": ["--effort", "{{effort}}"],
     "permissionModeArgs": ["--permission-mode", "{{permissionMode}}"],
-    "supportsPermissionMode": true
+    "supportsPermissionMode": true,
+    "supportsModel": true,
+    "supportsEffort": true
   },
   "picker": {
     "shortcut": "L",

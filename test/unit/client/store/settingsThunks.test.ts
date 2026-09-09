@@ -365,6 +365,7 @@ describe('settingsThunks', () => {
           codex: {
             cwd: '/workspace',
             model: 'gpt-5-codex',
+            effort: 'minimal',
             sandbox: 'workspace-write',
           },
         },
@@ -379,6 +380,7 @@ describe('settingsThunks', () => {
           codex: {
             cwd: undefined,
             model: undefined,
+            effort: undefined,
             sandbox: undefined,
           },
         },
@@ -391,6 +393,7 @@ describe('settingsThunks', () => {
           codex: {
             cwd: null,
             model: null,
+            effort: null,
             sandbox: null,
           },
         },
@@ -398,6 +401,7 @@ describe('settingsThunks', () => {
     })
     expect(store.getState().settings.settings.codingCli.providers.codex?.cwd).toBeUndefined()
     expect(store.getState().settings.settings.codingCli.providers.codex?.model).toBeUndefined()
+    expect(store.getState().settings.settings.codingCli.providers.codex?.effort).toBeUndefined()
     expect(store.getState().settings.settings.codingCli.providers.codex?.sandbox).toBeUndefined()
   })
 

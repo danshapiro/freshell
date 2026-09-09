@@ -14,8 +14,9 @@
 
 use freshell_protocol::{
     DefaultNewPane, ExternalEditor, NetworkHost, ServerSettings, SettingsAi, SettingsCodingCli,
-    SettingsEditor, SettingsExtensions, SettingsFreshAgent, SettingsLogging, SettingsNetwork,
-    SettingsPanes, SettingsSafety, SettingsSidebar, SettingsTerminal,
+    SettingsCodingCliProvider, SettingsEditor, SettingsExtensions, SettingsFreshAgent,
+    SettingsLogging, SettingsNetwork, SettingsPanes, SettingsSafety, SettingsSidebar,
+    SettingsTerminal,
 };
 use serde_json::json;
 
@@ -46,7 +47,30 @@ pub fn default_server_settings() -> ServerSettings {
                 "amplifier".to_string(),
             ],
             mcp_server: true,
-            providers: json!({ "claude": { "permissionMode": "default" }, "codex": {} }),
+            providers: std::collections::BTreeMap::from([
+                (
+                    "claude".to_string(),
+                    SettingsCodingCliProvider {
+                        model: None,
+                        effort: None,
+                        sandbox: None,
+                        permission_mode: Some("default".into()),
+                        max_turns: None,
+                        cwd: None,
+                    },
+                ),
+                (
+                    "codex".to_string(),
+                    SettingsCodingCliProvider {
+                        model: None,
+                        effort: None,
+                        sandbox: None,
+                        permission_mode: None,
+                        max_turns: None,
+                        cwd: None,
+                    },
+                ),
+            ]),
             known_providers: Some(Vec::new()),
         },
         editor: SettingsEditor {

@@ -47,6 +47,7 @@ fn codex_capture_spec() -> freshell_platform::CliCommandSpec {
         resume_args: Some(vec!["resume".to_string(), "{{sessionId}}".to_string()]),
         create_session_args: None,
         model_args: None,
+        effort_args: None,
         sandbox_args: None,
         permission_mode_args: None,
     }

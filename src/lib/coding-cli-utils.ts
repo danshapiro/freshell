@@ -8,6 +8,7 @@ export type CodingCliProviderConfig = {
   name: CodingCliProviderName
   label: string
   supportsModel?: boolean
+  supportsEffort?: boolean
   supportsSandbox?: boolean
   supportsPermissionMode?: boolean
 }
@@ -20,6 +21,7 @@ export function getCliProviderConfigs(extensions: ClientExtensionEntry[]): Codin
       label: e.label,
       supportsPermissionMode: e.cli?.supportsPermissionMode,
       supportsModel: e.cli?.supportsModel,
+      supportsEffort: e.cli?.supportsEffort,
       supportsSandbox: e.cli?.supportsSandbox,
     }))
 }

@@ -62,6 +62,29 @@ FRESHELL_RUNTIME_PHASE5_CHAOS_LIVE=1 npm run test:e2e:local -- \
   node_modules/.bin/tsx scripts/testing/runtime-phase5-soak.ts
 ```
 
+Deferred-provider certification campaigns must pin their low-cost launch
+policy before starting. Use `haiku` plus Claude effort `low`, and
+`gpt-5.6-luna` plus Codex effort `minimal`; verify the captured launch/resume
+evidence contains those exact values. Codex must show
+`-c model_reasoning_effort="minimal"`, not a synthesized flag or provider
+default.
+
+Amplifier campaigns provide its lowest-cost selection and OAuth credentials as
+two separate files:
+
+```bash
+export FRESHELL_MANAGED_AMPLIFIER_SETTINGS_FILE=/absolute/path/to/settings.yaml
+export FRESHELL_MANAGED_AMPLIFIER_OAUTH_FILE=/absolute/path/to/openai-chatgpt-oauth.json
+```
+
+If omitted, the harness/runtime resolves regular files at
+`~/.amplifier/settings.yaml` and
+`~/.amplifier/openai-chatgpt-oauth.json`. The restricted broker allowlist must
+contain both canonical paths. Evidence may record those references and their
+destinations, but must never record either file's bytes. These instructions
+prepare a campaign only; all three providers remain deferred and
+release-disabled until their separate certification change lands.
+
 Receipt paths may be supplied through the `FRESHELL_RUNTIME_PHASE5_*_RECEIPT`
 environment variables. The gate validates schema, exact candidate SHA, measured
 counts/duration, provider/mode coverage, cleanup, and zero unsafe broker

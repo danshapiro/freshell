@@ -34,6 +34,7 @@ export interface ClientExtensionEntry {
   cli?: {
     supportsPermissionMode?: boolean
     supportsModel?: boolean
+    supportsEffort?: boolean
     supportsSandbox?: boolean
     supportsResume?: boolean
     resumeCommandTemplate?: string[]  // e.g., ["claude", "--resume", "{{sessionId}}"]

@@ -32,6 +32,8 @@ const claudeExt: ClientExtensionEntry = {
   description: 'Claude Code agent',
   category: 'cli',
   cli: {
+    supportsModel: true,
+    supportsEffort: true,
     supportsPermissionMode: true,
     supportsResume: true,
   },
@@ -45,6 +47,7 @@ const codexExt: ClientExtensionEntry = {
   category: 'cli',
   cli: {
     supportsModel: true,
+    supportsEffort: true,
     supportsSandbox: true,
     supportsResume: true,
   },
@@ -130,10 +133,10 @@ describe('selectManagedItems', () => {
     expect(pmConfig!.options).toHaveLength(4)
   })
 
-  it('builds config fields for CLI with model and sandbox support', () => {
+  it('builds config fields for CLI with model, effort, and sandbox support', () => {
     const state = makeState({
       entries: [codexExt],
-      providers: { codex: { model: 'gpt-5', sandbox: 'read-only' } },
+      providers: { codex: { model: 'gpt-5', effort: 'minimal', sandbox: 'read-only' } },
     })
     const items = selectManagedItems(state)
 
@@ -141,6 +144,11 @@ describe('selectManagedItems', () => {
     expect(modelConfig).toBeDefined()
     expect(modelConfig!.type).toBe('text')
     expect(modelConfig!.value).toBe('gpt-5')
+
+    const effortConfig = items[0].config.find((c) => c.key === 'effort')
+    expect(effortConfig).toBeDefined()
+    expect(effortConfig!.type).toBe('text')
+    expect(effortConfig!.value).toBe('minimal')
 
     const sandboxConfig = items[0].config.find((c) => c.key === 'sandbox')
     expect(sandboxConfig).toBeDefined()
