@@ -163,10 +163,6 @@ export async function runProviderCertificationGate(
       candidateSha: h.candidateSha,
       expectedRuntimeImage: h.imageRef,
       receipt,
-      // Temporary migration exception: OpenCode is already certified and its
-      // original qualification lane predates evidence-bound schema v2. A v1
-      // receipt containing any newly promoted provider is rejected.
-      allowLegacyV1ForProviders: ['opencode'],
     })
     const providerRow = validated.providers
       .find((candidate: any) => candidate.provider === row.provider)
@@ -175,7 +171,7 @@ export async function runProviderCertificationGate(
     h.assert(caseId, receipt.status === 'PASS', 'live receipt is an explicit PASS', receipt)
     h.assert(
       caseId,
-      validated.schemaVersion === 2 || row.provider === 'opencode',
+      validated.schemaVersion === 2,
       `${row.provider} production promotion requires evidence-bound schema v2`,
       { schemaVersion: validated.schemaVersion, provider: row.provider },
     )
@@ -191,16 +187,10 @@ export async function runProviderCertificationGate(
     h.assert(caseId, providerRow?.actualProviderBinary === true, `${row.provider} receipt used the real provider binary`, providerRow)
     h.assert(caseId, providerRow?.completedTurn === true, `${row.provider} receipt contains a completed live turn`, providerRow)
     h.assert(caseId, providerRow?.nativeRecovery === true, `${row.provider} recovered through its native path`, providerRow)
-    if (validated.schemaVersion === 2) {
-      h.assert(caseId, providerRow?.exactNativeRecovery === true, `${row.provider} recovered the exact native identity`, providerRow)
-    }
+    h.assert(caseId, providerRow?.exactNativeRecovery === true, `${row.provider} recovered the exact native identity`, providerRow)
     h.assert(caseId, providerRow?.sameNativeSession === true, `${row.provider} kept its exact native session across recovery`, providerRow)
     h.assert(caseId, providerRow?.followUpCompleted === true, `${row.provider} follow-up worked after recovery`, providerRow)
     h.assert(caseId, providerRow?.lostNoticeCount === 0, `${row.provider} produced no false loss notice`, providerRow)
-    if (validated.schemaVersion === 1) {
-      h.assert(caseId, providerRow?.cleanupVerified === true, `${row.provider} cleanup verified empty`, providerRow)
-      h.assert(caseId, providerRow?.unsafeAttempts === 0, `${row.provider} made zero unsafe broker attempts`, providerRow)
-    }
     caseResults.push({ caseId, status: 'PASS', provider: row.provider })
     h.recordLifecycle('gate.case.passed', { caseId, provider: row.provider })
   }

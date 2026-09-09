@@ -186,7 +186,16 @@ async function gate02NonceSurvivesHostAndControllerLoss(h: RuntimeHarness): Prom
     h.assert(caseId, proof?.sameNativeSession === true, `${row.provider} preserves the exact native conversation`, proof)
     h.assert(caseId, proof?.newIncarnation === true && proof?.oldEnclosureVerifiedEmpty === true, `${row.provider} replaces only after proving the old enclosure empty`, proof)
     h.assert(caseId, proof?.recalledNonce === true && proof?.followUpCompleted === true, `${row.provider} recalls the hidden nonce and accepts a follow-up`, proof)
-    h.assert(caseId, proof?.workspaceOrToolReadUsed !== true, `${row.provider} did not recover the nonce from gate files/tools`, proof)
+    const nativeProofs = Array.isArray(row.nativeTurnProofs) ? row.nativeTurnProofs : []
+    const recallProofs = nativeProofs.filter((native: any) => (
+      native.stage === 'after_session_host_crash' || native.stage === 'after_provider_process_crash'
+    ))
+    h.assert(caseId, recallProofs.length === 2
+      && recallProofs.every((native: any) => native.responseContainsNonce === true
+        && native.toolCallCount === 0
+        && Array.isArray(native.toolCallTypes)
+        && native.toolCallTypes.length === 0),
+    `${row.provider} native recall turns prove nonce recovery with zero tools`, recallProofs)
   }
 }
 
@@ -837,7 +846,6 @@ function requiredProviderReceipt(caseId: string, h: RuntimeHarness, instruction:
     candidateSha: h.candidateSha,
     expectedRuntimeImage: h.imageRef,
     receipt,
-    allowLegacyV1ForProviders: ['opencode'],
   })
   h.assert(caseId, receipt.status === 'PASS', 'provider receipt is an explicit PASS', receipt)
   h.assert(caseId, receipt.candidateSha === h.candidateSha, 'provider receipt belongs to the exact candidate commit', receipt)

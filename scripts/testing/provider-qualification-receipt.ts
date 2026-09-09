@@ -6,6 +6,28 @@ export const PROVIDER_QUALIFICATION_ASSERTIONS_FILE = 'provider-qualification-as
 export const PROVIDER_QUALIFICATION_BROKER_FILE = 'broker.jsonl'
 export const PROVIDER_QUALIFICATION_CLEANUP_FILE = 'cleanup.json'
 
+export type NativeProofStage = 'initial' | 'after_session_host_crash' | 'after_provider_process_crash'
+
+export type ProviderNativeTurnProof = {
+  schemaVersion: 1
+  stage: NativeProofStage
+  nativeSessionId: string
+  turnId: string
+  messageId: string
+  parentMessageId: string | null
+  completedAt: string | number
+  responseSha256: string
+  responseContainsNonce: true
+  toolCallCount: number
+  toolCallTypes: string[]
+  resolvedProvider: string
+  resolvedModel: string
+  resolvedReasoningEffort: string
+  providerProvenance: string
+  modelProvenance: string
+  reasoningEffortProvenance: string
+}
+
 export type ProviderQualificationRow = {
   provider: string
   modes: string[]
@@ -13,6 +35,8 @@ export type ProviderQualificationRow = {
   model: string
   reasoningEffort: string
   nativeSessionId: string
+  nonceSha256: string
+  nativeTurnProofs: ProviderNativeTurnProof[]
   actualProviderBinary: boolean
   completedTurn: boolean
   nativeStateCaptured: boolean
@@ -100,14 +124,15 @@ export type ValidateProviderQualificationReceiptInput = {
   candidateSha: string
   expectedRuntimeImage: string
   receipt: unknown
+  /** @deprecated Legacy terminal-only receipts never certify production. */
   allowLegacyV1ForProviders?: readonly string[]
   /** Preliminary evidence consumers must opt in explicitly; final gates omit this. */
   acceptedBuildKinds?: readonly ProviderQualificationBuildEvidence['kind'][]
 }
 
 export type ValidatedProviderQualificationReceipt = {
-  schemaVersion: 1 | 2
-  legacyV1: boolean
+  schemaVersion: 2
+  legacyV1: false
   providers: any[]
   receipt: any
 }
@@ -140,7 +165,7 @@ export function buildProviderQualificationReceipt(
 
   const assertionsPath = path.join(expectedDir, PROVIDER_QUALIFICATION_ASSERTIONS_FILE)
   fs.writeFileSync(assertionsPath, JSON.stringify({
-    schemaVersion: 1,
+    schemaVersion: 2,
     candidateSha: input.candidateSha,
     receiptRunId: input.receiptRunId,
     runtimeImage: input.runtimeImage,
@@ -179,8 +204,8 @@ export function buildProviderQualificationReceipt(
 
 /**
  * Validate a supplied receipt against the original candidate-bound evidence
- * directory. Schema v1 is a narrow migration exception and can never certify
- * a provider outside the caller's explicit allowlist.
+ * directory. Schema v1 predates cryptographic native-turn proof and can never
+ * certify production, even if a caller still passes the deprecated allowlist.
  */
 export function validateProviderQualificationReceipt(
   input: ValidateProviderQualificationReceiptInput,
@@ -241,7 +266,7 @@ export function validateProviderQualificationReceipt(
   )
 
   const assertions = parseJsonObject(assertionsBytes, 'qualification assertion artifact')
-  if (assertions.schemaVersion !== 1) throw new Error('qualification assertion artifact has an unsupported schema')
+  if (assertions.schemaVersion !== 2) throw new Error('qualification assertion artifact has an unsupported schema')
   stringEqual(assertions.candidateSha, input.candidateSha, 'assertion artifact candidate SHA')
   stringEqual(assertions.receiptRunId, receipt.receiptRunId, 'assertion artifact run id')
   stringEqual(assertions.runtimeImage, input.expectedRuntimeImage, 'assertion artifact runtime image')
@@ -265,22 +290,10 @@ export function validateProviderQualificationReceipt(
 }
 
 function validateLegacyV1(
-  input: ValidateProviderQualificationReceiptInput,
-  receipt: Record<string, any>,
+  _input: ValidateProviderQualificationReceiptInput,
+  _receipt: Record<string, any>,
 ): ValidatedProviderQualificationReceipt {
-  if (receipt.status !== 'PASS') throw new Error('legacy provider qualification receipt is not PASS')
-  stringEqual(receipt.candidateSha, input.candidateSha, 'legacy receipt candidate SHA')
-  stringEqual(receipt.runtimeImage, input.expectedRuntimeImage, 'legacy receipt runtime image')
-  const providers = Array.isArray(receipt.providers) ? receipt.providers : []
-  if (providers.length === 0) throw new Error('legacy provider qualification receipt has no provider rows')
-  const allowed = new Set(input.allowLegacyV1ForProviders ?? [])
-  const forbidden = providers
-    .map((row) => row?.provider)
-    .filter((provider) => typeof provider !== 'string' || !allowed.has(provider))
-  if (forbidden.length) {
-    throw new Error(`legacy schema v1 cannot certify ${forbidden.join(', ')}; production promotion requires schema v2`)
-  }
-  return { schemaVersion: 1, legacyV1: true, providers, receipt }
+  throw new Error('legacy schema v1 cannot certify production; cryptographic native-turn proof requires schema v2')
 }
 
 function validateProviderRows(value: unknown): asserts value is ProviderQualificationRow[] {
@@ -290,6 +303,7 @@ function validateProviderRows(value: unknown): asserts value is ProviderQualific
   const seen = new Set<string>()
   for (const candidate of value) {
     const row = object(candidate, 'qualification provider row')
+    assertEvidenceRedacted(row, 'qualification provider row')
     const provider = nonEmptyString(row.provider, 'provider')
     if (seen.has(provider)) throw new Error(`qualification provider row ${provider} is duplicated`)
     seen.add(provider)
@@ -297,8 +311,12 @@ function validateProviderRows(value: unknown): asserts value is ProviderQualific
       throw new Error(`${provider}.modes must contain exact provider modes`)
     }
     for (const field of ['providerVersion', 'model', 'reasoningEffort', 'nativeSessionId'] as const) {
-      nonEmptyString(row[field], `${provider}.${field}`)
+      boundedEvidenceString(row[field], `${provider}.${field}`)
     }
+    if (typeof row.nonceSha256 !== 'string' || !/^[a-f0-9]{64}$/.test(row.nonceSha256)) {
+      throw new Error(`${provider}.nonceSha256 must be a SHA-256 digest`)
+    }
+    validateNativeTurnProofs(provider, row)
     for (const field of [
       'actualProviderBinary',
       'completedTurn',
@@ -349,6 +367,133 @@ function validateProviderRows(value: unknown): asserts value is ProviderQualific
       if (!crashKinds.has(required)) throw new Error(`${provider}.crashKinds must include ${required}`)
     }
   }
+}
+
+const REQUIRED_NATIVE_STAGES: readonly NativeProofStage[] = [
+  'initial',
+  'after_session_host_crash',
+  'after_provider_process_crash',
+]
+
+function validateNativeTurnProofs(provider: string, row: Record<string, any>): void {
+  if (!Array.isArray(row.nativeTurnProofs) || row.nativeTurnProofs.length !== REQUIRED_NATIVE_STAGES.length) {
+    throw new Error(`${provider}.nativeTurnProofs must contain exactly the three required stages`)
+  }
+  const messageIds = new Set<string>()
+  const turnIds = new Set<string>()
+  let priorCompletion = -Infinity
+  for (const [index, candidate] of row.nativeTurnProofs.entries()) {
+    const proof = object(candidate, `${provider}.nativeTurnProofs[${index}]`)
+    if (proof.schemaVersion !== 1) throw new Error(`${provider}.nativeTurnProofs[${index}] has an unsupported schema`)
+    if (proof.stage !== REQUIRED_NATIVE_STAGES[index]) {
+      throw new Error(`${provider}.nativeTurnProofs must contain the required stages in chronological order`)
+    }
+    stringEqual(proof.nativeSessionId, row.nativeSessionId, `${provider}.nativeTurnProofs[${index}].nativeSessionId`)
+    const turnId = boundedEvidenceId(proof.turnId, `${provider}.nativeTurnProofs[${index}].turnId`)
+    const messageId = boundedEvidenceId(proof.messageId, `${provider}.nativeTurnProofs[${index}].messageId`)
+    if (turnIds.has(turnId)) throw new Error(`${provider}.nativeTurnProofs must use distinct native turn ids`)
+    if (messageIds.has(messageId)) throw new Error(`${provider}.nativeTurnProofs must use distinct native assistant message ids`)
+    turnIds.add(turnId)
+    messageIds.add(messageId)
+    if (proof.parentMessageId !== null) boundedEvidenceId(proof.parentMessageId, `${provider}.nativeTurnProofs[${index}].parentMessageId`)
+    const completedAt = nativeCompletionMillis(proof.completedAt, `${provider}.nativeTurnProofs[${index}].completedAt`)
+    if (completedAt <= priorCompletion) throw new Error(`${provider}.nativeTurnProofs completion timestamps must increase`)
+    priorCompletion = completedAt
+    if (typeof proof.responseSha256 !== 'string' || !/^[a-f0-9]{64}$/.test(proof.responseSha256)) {
+      throw new Error(`${provider}.nativeTurnProofs[${index}] must include a response SHA-256 digest`)
+    }
+    if (proof.responseContainsNonce !== true) {
+      throw new Error(`${provider}.nativeTurnProofs[${index}] must prove native response nonce containment`)
+    }
+    if (proof.toolCallCount !== 0 || !Array.isArray(proof.toolCallTypes) || proof.toolCallTypes.length !== 0) {
+      throw new Error(`${provider}.nativeTurnProofs[${index}] must prove zero native tool calls`)
+    }
+    for (const field of [
+      'resolvedProvider',
+      'resolvedModel',
+      'resolvedReasoningEffort',
+      'providerProvenance',
+      'modelProvenance',
+      'reasoningEffortProvenance',
+    ] as const) boundedEvidenceString(proof[field], `${provider}.nativeTurnProofs[${index}].${field}`)
+    for (const field of ['providerProvenance', 'modelProvenance', 'reasoningEffortProvenance'] as const) {
+      if (/(?:process|argv|command)[-_ ]?(?:args?|line)?|launch[-_ ]?policy|picker|configured[-_ ]?value/i.test(proof[field])) {
+        throw new Error(`${provider}.nativeTurnProofs[${index}].${field} is not native provenance`)
+      }
+    }
+    validateNativeProfile(provider, row, proof, index)
+  }
+}
+
+function validateNativeProfile(provider: string, row: Record<string, any>, proof: Record<string, any>, index: number): void {
+  const label = `${provider}.nativeTurnProofs[${index}]`
+  if (proof.resolvedReasoningEffort !== row.reasoningEffort) {
+    throw new Error(`${label} native reasoning effort does not match the qualified profile`)
+  }
+  if (provider === 'claude') {
+    if (proof.resolvedProvider !== 'anthropic' || !String(proof.resolvedModel).toLowerCase().includes('haiku')
+      || !String(row.model).toLowerCase().includes('haiku')) {
+      throw new Error(`${label} does not prove the native Claude Haiku profile`)
+    }
+    return
+  }
+  if (provider === 'codex') {
+    if (proof.resolvedProvider !== 'openai' || proof.resolvedModel !== row.model) {
+      throw new Error(`${label} does not prove the native Codex model profile`)
+    }
+    return
+  }
+  if (provider === 'opencode') {
+    const qualified = proof.resolvedModel.includes('/')
+      ? proof.resolvedModel
+      : `${proof.resolvedProvider}/${proof.resolvedModel}`
+    if (qualified !== row.model) throw new Error(`${label} does not prove the native OpenCode model profile`)
+    return
+  }
+  if (provider === 'amplifier') {
+    if (proof.resolvedProvider !== 'freshell-onecli-anthropic' || proof.resolvedModel !== row.model) {
+      throw new Error(`${label} does not prove the approved native Amplifier OneCLI profile`)
+    }
+    return
+  }
+  throw new Error(`${provider} has no native profile validation contract`)
+}
+
+function nativeCompletionMillis(value: unknown, label: string): number {
+  if (typeof value === 'number' && Number.isSafeInteger(value) && value > 0) return value
+  if (typeof value === 'string') {
+    const parsed = Date.parse(value)
+    if (Number.isFinite(parsed)) return parsed
+  }
+  throw new Error(`${label} must be a positive epoch millisecond or timestamp`)
+}
+
+const FORBIDDEN_EVIDENCE_KEYS = new Set([
+  'nonce', 'prompt', 'prompttext', 'rawprompt', 'response', 'responsetext', 'rawresponse',
+  'authorization', 'cookie', 'credentials', 'apikey', 'accesstoken', 'refreshtoken', 'password',
+])
+const SECRET_VALUE_PATTERN = /(?:\bBearer\s+[A-Za-z0-9._~+\/-]{8,}|\b(?:sk|ghp|github_pat|xox[baprs])[-_][A-Za-z0-9_-]{8,}|\bAIza[A-Za-z0-9_-]{8,})/i
+
+function assertEvidenceRedacted(value: unknown, label: string): void {
+  const visit = (candidate: unknown, trail: string): void => {
+    if (typeof candidate === 'string') {
+      if (SECRET_VALUE_PATTERN.test(candidate)) throw new Error(`${label} contains an unredacted synthetic-secret pattern at ${trail}`)
+      return
+    }
+    if (Array.isArray(candidate)) {
+      candidate.forEach((item, index) => visit(item, `${trail}[${index}]`))
+      return
+    }
+    if (!candidate || typeof candidate !== 'object') return
+    for (const [key, item] of Object.entries(candidate as Record<string, unknown>)) {
+      const normalized = key.toLowerCase().replace(/[^a-z]/g, '')
+      if (FORBIDDEN_EVIDENCE_KEYS.has(normalized)) {
+        throw new Error(`${label} must redact forbidden evidence field ${key}`)
+      }
+      visit(item, `${trail}.${key}`)
+    }
+  }
+  visit(value, label)
 }
 
 function assertCandidateAndImageArtifacts(
@@ -553,6 +698,20 @@ function object(value: unknown, label: string): Record<string, any> {
 function nonEmptyString(value: unknown, label: string): string {
   if (typeof value !== 'string' || !value.trim()) throw new Error(`${label} must be a non-empty string`)
   return value
+}
+
+function boundedEvidenceString(value: unknown, label: string): string {
+  const result = nonEmptyString(value, label)
+  if (result.length > 256) throw new Error(`${label} exceeds the retained evidence bound`)
+  return result
+}
+
+function boundedEvidenceId(value: unknown, label: string): string {
+  const result = boundedEvidenceString(value, label)
+  if (!/^[A-Za-z0-9][A-Za-z0-9._:/-]{0,255}$/.test(result)) {
+    throw new Error(`${label} is not a bounded native identifier`)
+  }
+  return result
 }
 
 function stringEqual(actual: unknown, expected: string, label: string): void {

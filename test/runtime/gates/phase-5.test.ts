@@ -805,7 +805,6 @@ function requiredReceipt(
       candidateSha: h.candidateSha,
       expectedRuntimeImage: h.imageRef,
       receipt,
-      allowLegacyV1ForProviders: ['opencode'],
     })
     providers = validated.providers
   } else if (envName === 'FRESHELL_RUNTIME_PHASE5_SOAK_RECEIPT') {
