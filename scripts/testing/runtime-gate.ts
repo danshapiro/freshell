@@ -29,6 +29,7 @@ import {
   resolveGateOutcome,
 } from './provider-certification.js'
 import { parseGateArgs } from './runtime-gate-args.js'
+import { parseRuntimeGateLink } from './runtime-campaign-policy.js'
 import { certificationScopeForPhase, type PhaseCertificationScope } from './runtime-phase-scope.js'
 import { auditRuntimeArtifacts, candidateIntegrityFailures, captureRuntimeCandidate, type RuntimeCandidate } from './runtime-gate-integrity.js'
 import { PHASE1_CASE_IDS, runPhase1Gate, validateRequiredCoverage } from '../../test/runtime/gates/phase-1.test.js'
@@ -85,11 +86,32 @@ async function main(): Promise<number> {
   }
   const declaredCertificationCases = certificationScope.caseIds
 
+  let gateLink
+  try {
+    gateLink = parseRuntimeGateLink({
+      gateRunId: process.env.FRESHELL_RUNTIME_GATE_RUN_ID,
+      campaignRunId: process.env.FRESHELL_RUNTIME_CAMPAIGN_RUN_ID,
+      campaignStepId: process.env.FRESHELL_RUNTIME_CAMPAIGN_STEP_ID,
+    })
+  } catch (error) {
+    console.error(`FAIL: ${error instanceof Error ? error.message : String(error)}`)
+    return 1
+  }
   const harness: RuntimeHarness = new RuntimeHarness(
     repoRoot,
-    undefined,
+    gateLink.gateRunId,
     phase === 'phase-5' ? 5 : phase === 'phase-4' ? 4 : phase === 'phase-3' ? 3 : phase === 'phase-2' ? 2 : 1,
   )
+  try {
+    fs.mkdirSync(path.dirname(harness.evidenceDir), { recursive: true })
+    fs.mkdirSync(harness.evidenceDir)
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'EEXIST') {
+      console.error(`FAIL: refusing to overwrite existing runtime evidence run ${harness.runId}`)
+      return 1
+    }
+    throw error
+  }
   const candidateBefore = captureRuntimeCandidate(repoRoot)
   if (candidateBefore.dirty || candidateBefore.sha !== harness.candidateSha) {
     // Do not spend provider budget or create containers for evidence that
@@ -102,6 +124,7 @@ async function main(): Promise<number> {
       blockedReason: 'uncommitted_or_changed_candidate',
       candidateSha: harness.candidateSha,
       runId: harness.runId,
+      campaign: gateLink.campaign,
       preflightOnly: true,
       candidate: candidateBefore,
       requiredCases,
@@ -249,6 +272,7 @@ async function main(): Promise<number> {
     finishedAt: new Date().toISOString(),
     candidateSha: harness.candidateSha,
     runId: harness.runId,
+    campaign: gateLink.campaign,
     imageRef: harness.imageRef,
     requiredCases,
     providerCertificationCases: declaredCertificationCases,

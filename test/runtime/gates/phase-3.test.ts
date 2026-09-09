@@ -414,6 +414,28 @@ async function gate08OneWriterStopAndControllerCrashRaces(h: RuntimeHarness): Pr
   h.assert(caseId, latestStopped?.desiredState === 'stopped', 'durable Stop intent wins the recovery race', latestStopped)
   h.assert(caseId, !stoppedViews.some((view: any) => view.soulId === stopSoul.soulId && view.launchState === 'running'), 'stop race leaves no active writer', stoppedViews)
 
+  await exercisePhase3StartupReplacementCrash(h)
+  runFocusedRustTest(h, 'freshell-supervisor', 'stop_intent_fences_a_recovery_attempt_before_replacement')
+  runFocusedRustTest(h, 'freshell-supervisor', 'one_recovery_attempt_cannot_create_two_active_incarnations')
+}
+
+export type Phase3StartupCrashProof = {
+  crashEvent: { event: 'supervisor.test_crash'; point: string }
+  recoveryOutcome: string
+  nativeSessionStable: boolean
+  stopOutcome: string
+}
+
+/**
+ * Exercise the startup-timed P3-G08 failure in isolation as well as from the
+ * cumulative gate. Startup reconciliation begins before the control socket is
+ * healthy, so the faulted instance must deliberately skip its health wait.
+ */
+export async function exercisePhase3StartupReplacementCrash(
+  h: RuntimeHarness,
+): Promise<Phase3StartupCrashProof> {
+  const caseId = 'P3-G08'
+  const crashPoint = 'after_docker_create'
   const crashScenario = `p3-g08-crash-${randomUUID().slice(0, 8)}`
   const beforeCrash = await h.startSupervisor({ scenarioId: crashScenario })
   const crashSoul = await launchMaterializedNativeSoul(h, beforeCrash, caseId, 'controller-crash')
@@ -421,27 +443,82 @@ async function gate08OneWriterStopAndControllerCrashRaces(h: RuntimeHarness): Pr
   h.stopSupervisorExact(beforeCrash)
   h.removeContainerExact(beforeCrash.containerId)
   h.killOwnedRuntimeExact(crashSoul.containerId)
+
+  const receiptsBeforeCrash = h.broker.receiptIds()
   const crashing = await h.startSupervisor({
     scenarioId: crashScenario,
     volumeName: beforeCrash.volumeName,
-    crashPoint: 'after_docker_create',
+    crashPoint,
+    waitForHealth: false,
   })
-  try {
-    await h.adminOk(crashing, h.recoverBody(crashSoul.soulId, 'startup_reconcile'))
-  } catch {
-    // The named fault deliberately terminates the controller mid-transaction.
-  }
-  await waitUntil(() => !h.isContainerRunning(crashing.containerId), 8_000)
+  await h.waitForContainerExit(crashing.containerId, 8_000)
+  const crashEvent = supervisorCrashEvent(h.containerLogs(crashing.containerId), crashPoint)
+  h.assert(caseId, crashEvent !== null, `startup reconciliation emitted the exact named ${crashPoint} crash event`)
+  const crashReceipts = h.brokerReceiptsSince(receiptsBeforeCrash)
+  h.assert(
+    caseId,
+    crashReceipts.length === 1 && h.inspectContainer(crashReceipts[0].containerId).State.Running === false,
+    'startup crash leaves exactly one stopped, receipt-owned replacement candidate',
+    crashReceipts,
+  )
   h.removeContainerExact(crashing.containerId)
-  const reconciled = await h.startSupervisor({ scenarioId: crashScenario, volumeName: beforeCrash.volumeName })
+
+  const reconciled = await h.startSupervisor({
+    scenarioId: crashScenario,
+    volumeName: beforeCrash.volumeName,
+  })
   const final = dataOf(
     await h.adminOk(reconciled, h.recoverBody(crashSoul.soulId, 'startup_reconcile')),
     'recovery',
   )
-  h.assert(caseId, ['replaced', 'reattached'].includes(final.outcome), 'restart reconciles a mid-replacement crash', final)
-  assertSingleRunningWriter(h, caseId, await inventory(h, reconciled), crashSoul.soulId)
-  runFocusedRustTest(h, 'freshell-supervisor', 'stop_intent_fences_a_recovery_attempt_before_replacement')
-  runFocusedRustTest(h, 'freshell-supervisor', 'one_recovery_attempt_cannot_create_two_active_incarnations')
+  h.assert(caseId, ['replaced', 'reattached'].includes(final.outcome), 'restart reconciles a startup-timed mid-replacement crash', final)
+  const views = await inventory(h, reconciled)
+  assertSingleRunningWriter(h, caseId, views, crashSoul.soulId)
+  const liveView = latestSoulView(views, crashSoul.soulId)
+  const nativeSessionStable = liveView?.nativeSessionId === crashSoul.sessionId
+  h.assert(caseId, nativeSessionStable, 'startup crash recovery preserves the exact provider-native identity', {
+    expectedNativeSessionId: crashSoul.sessionId,
+    liveView,
+  })
+  const history = await h.nativeFixtureCall(reconciled, liveView.incarnationId, { method: 'history' })
+  h.assert(
+    caseId,
+    history.ok === true && history.sessionId === crashSoul.sessionId && history.history?.[0] === 'create' && history.history?.includes('resume'),
+    'the replacement reconnects to the original materialized native session',
+    history,
+  )
+  const stop = dataOf(
+    await h.adminOk(reconciled, h.stopBody(crashSoul.soulId, await controlEpoch(h, reconciled))),
+    'stop',
+  )
+  h.assert(caseId, stop.outcome === 'verified_empty', 'startup crash replacement terminates with verified-empty cleanup', stop)
+
+  return {
+    crashEvent,
+    recoveryOutcome: final.outcome,
+    nativeSessionStable,
+    stopOutcome: stop.outcome,
+  }
+}
+
+export function supervisorCrashEvent(
+  logs: string,
+  expectedPoint: string,
+): { event: 'supervisor.test_crash'; point: string } | null {
+  for (const line of logs.split(/\r?\n/)) {
+    let record: unknown
+    try {
+      record = JSON.parse(line)
+    } catch {
+      continue
+    }
+    if (record && typeof record === 'object'
+      && (record as any).event === 'supervisor.test_crash'
+      && (record as any).point === expectedPoint) {
+      return { event: 'supervisor.test_crash', point: expectedPoint }
+    }
+  }
+  return null
 }
 
 async function gate09IndependentSoulsAndViews(h: RuntimeHarness): Promise<void> {
@@ -488,11 +565,12 @@ async function gate09IndependentSoulsAndViews(h: RuntimeHarness): Promise<void> 
 
 async function gate10PermissionPromptBrowserReceipt(h: RuntimeHarness): Promise<void> {
   const caseId = 'P3-G10'
-  const receipt = requiredExternalReceipt(
+  const receipt = loadRequiredPhase3Receipt(
     caseId,
     process.env.FRESHELL_RUNTIME_PHASE3_BROWSER_RECEIPT,
     'Run runtime-provider-resurrection-rust.spec.ts with a real provider permission/tool prompt, then set FRESHELL_RUNTIME_PHASE3_BROWSER_RECEIPT to its JSON receipt.',
   )
+  requirePhase3ReceiptCandidate(caseId, receipt, h.candidateSha)
   h.assert(caseId, receipt.schemaVersion === 1 && receipt.status === 'PASS', 'browser receipt is an explicit schema-v1 PASS', receipt)
   h.assert(caseId, receipt.candidateSha === h.candidateSha, 'browser receipt belongs to the exact candidate commit', receipt)
   const browser = receipt.browser ?? receipt
@@ -734,11 +812,12 @@ function durableProviderRows(h: RuntimeHarness, receipt: ProviderReceipt): any[]
 }
 
 function requiredProviderReceipt(caseId: string, h: RuntimeHarness, instruction: string): ProviderReceipt {
-  const receipt = requiredExternalReceipt(
+  const receipt = loadRequiredPhase3Receipt(
     caseId,
     process.env.FRESHELL_RUNTIME_PHASE3_PROVIDER_RECEIPT,
     instruction,
   )
+  requirePhase3ReceiptCandidate(caseId, receipt, h.candidateSha)
   const validated = validateProviderQualificationReceipt({
     repoRoot: h.repoRoot,
     candidateSha: h.candidateSha,
@@ -752,7 +831,7 @@ function requiredProviderReceipt(caseId: string, h: RuntimeHarness, instruction:
   return { ...receipt, providers: validated.providers }
 }
 
-function requiredExternalReceipt(caseId: string, raw: string | undefined, instruction: string): ProviderReceipt {
+export function loadRequiredPhase3Receipt(caseId: string, raw: string | undefined, instruction: string): ProviderReceipt {
   if (!raw?.trim()) {
     throw new RuntimeGateBlockedError(caseId, instruction, { requiredEnvironmentVariable: caseId === 'P3-G10' ? 'FRESHELL_RUNTIME_PHASE3_BROWSER_RECEIPT' : 'FRESHELL_RUNTIME_PHASE3_PROVIDER_RECEIPT' })
   }
@@ -764,6 +843,16 @@ function requiredExternalReceipt(caseId: string, raw: string | undefined, instru
     throw new Error(`${caseId} receipt is not valid JSON or a readable JSON path: ${String(error)}`)
   }
   return receipt
+}
+
+export function requirePhase3ReceiptCandidate(
+  caseId: string,
+  receipt: ProviderReceipt,
+  candidateSha: string,
+): void {
+  if (receipt.candidateSha !== candidateSha) {
+    throw new Error(`${caseId} receipt does not belong to the exact candidate commit`)
+  }
 }
 
 function dataOf(result: any, expectedKind: string): any {
