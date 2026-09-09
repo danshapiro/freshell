@@ -17,11 +17,11 @@ async fn read_fixture(
     let source_epoch = source_epoch.to_string();
     let expected_epoch = expected_epoch.to_string();
     let source_for_server = source_epoch.clone();
-    let changed = source_epoch != expected_epoch;
+    let expected_for_server = expected_epoch.clone();
     let server = tokio::spawn(async move {
         let incarnation = IncarnationId::new();
-        let mut cursors = Vec::new();
-        for index in 0..if changed { 3 } else { 2 } {
+        let mut reads = Vec::new();
+        for index in 0..2 {
             let (mut socket, _) = listener.accept().await.unwrap();
             let request: Envelope<AdminCommand> = read_frame(&mut socket).await.unwrap();
             assert_eq!(request.auth.as_deref(), Some("synthetic-epoch-test-secret"));
@@ -35,8 +35,10 @@ async fn read_fixture(
                 let AdminCommand::TerminalReadOutput(read) = request.body else {
                     panic!("unexpected command")
                 };
-                cursors.push(read.after_seq);
-                let seq = read.after_seq + 1;
+                reads.push((read.after_seq, read.expected_stream_epoch.clone()));
+                let changed =
+                    read.expected_stream_epoch.as_deref() != Some(source_for_server.as_str());
+                let seq = if changed { 1 } else { read.after_seq + 1 };
                 let terminal = if foreign_terminal {
                     "another-terminal"
                 } else {
@@ -48,8 +50,8 @@ async fn read_fixture(
                     stream_epoch: source_for_server.clone(),
                     retained_from_seq: 1,
                     head_seq: 300,
-                    reset_required: false,
-                    truncated: false,
+                    reset_required: changed,
+                    truncated: changed,
                     exited: false,
                     exit_code: None,
                     native_session_id: Some("native-owned".into()),
@@ -77,7 +79,7 @@ async fn read_fixture(
             .await
             .unwrap();
         }
-        assert_eq!(cursors, if changed { vec![206, 0] } else { vec![206] });
+        assert_eq!(reads, vec![(206, Some(expected_for_server))]);
     });
     let controller = ServerManagedRuntimeController {
         client: RuntimeClient::new(&socket, "synthetic-epoch-test-secret"),
@@ -107,7 +109,7 @@ async fn read_fixture(
 }
 
 #[tokio::test]
-async fn changed_host_epoch_replays_from_zero_even_if_new_head_exceeds_old_cursor() {
+async fn changed_host_epoch_replays_from_zero_in_one_supervisor_round_trip() {
     let output = read_fixture("new-epoch", "old-epoch", false).await.unwrap();
     assert!(output.reset_required);
     assert_eq!(output.stream_epoch.as_deref(), Some("new-epoch"));

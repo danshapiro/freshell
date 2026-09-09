@@ -376,21 +376,15 @@ impl ManagedTerminalController for ServerManagedRuntimeController {
                     chunks: Vec::new(),
                 });
             }
-            let output = match async {
-                let output = self
-                    .client
-                    .read_output(soul.clone(), after_seq.max(0) as u64, max_bytes)
-                    .await?;
-                // A supervisor may replace a host independently of this web
-                // process. Compare the host's source epoch on EVERY read; a
-                // web-local recovery flag cannot establish stream continuity.
-                if output.stream_epoch != terminal.stream_id && after_seq > 0 {
-                    self.client.read_output(soul.clone(), 0, max_bytes).await
-                } else {
-                    Ok(output)
-                }
-            }
-            .await
+            let output = match self
+                .client
+                .read_output_for_epoch(
+                    soul.clone(),
+                    after_seq.max(0) as u64,
+                    max_bytes,
+                    Some(terminal.stream_id.clone()),
+                )
+                .await
             {
                 Ok(output) => output,
                 Err(error) if recoverable_host_error(&error) => {

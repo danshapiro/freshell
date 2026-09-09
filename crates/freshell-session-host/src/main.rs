@@ -396,6 +396,7 @@ async fn dispatch(
                     incarnation_id,
                     after_seq,
                     max_bytes,
+                    expected_stream_epoch,
                 } => {
                     ensure_incarnation(&incarnation_id, state)?;
                     let pty = state.pty.lock().await;
@@ -407,7 +408,12 @@ async fn dispatch(
                                 "incarnation is not a managed terminal",
                             )
                         })?
-                        .read_output(incarnation_id, after_seq, max_bytes)?;
+                        .read_output(
+                            incarnation_id,
+                            after_seq,
+                            max_bytes,
+                            expected_stream_epoch.as_deref(),
+                        )?;
                     Ok(HostResult::TerminalOutput(batch))
                 }
                 HostCommand::FreshAgentSend {

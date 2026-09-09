@@ -319,7 +319,12 @@ impl Supervisor {
                     .assert_epoch(request.expected_control_epoch)
                     .map_err(map_registry)?;
                 let output = self
-                    .terminal_read_output(request.soul_id, request.after_seq, request.max_bytes)
+                    .terminal_read_output(
+                        request.soul_id,
+                        request.after_seq,
+                        request.max_bytes,
+                        request.expected_stream_epoch,
+                    )
                     .await?;
                 Ok(AdminResult::TerminalOutput(output))
             }
@@ -1086,6 +1091,7 @@ impl Supervisor {
         soul_id: SoulId,
         after_seq: u64,
         max_bytes: u64,
+        expected_stream_epoch: Option<String>,
     ) -> Result<RuntimeOutputBatch, RuntimeError> {
         let handle = self
             .registry
@@ -1104,6 +1110,7 @@ impl Supervisor {
                     incarnation_id: handle.incarnation_id().clone(),
                     after_seq,
                     max_bytes,
+                    expected_stream_epoch,
                 },
             )
             .await?

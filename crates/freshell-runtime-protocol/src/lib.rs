@@ -1337,6 +1337,10 @@ pub struct TerminalReadOutputRequest {
     pub soul_id: SoulId,
     pub after_seq: u64,
     pub max_bytes: u64,
+    /// Source epoch the caller has already rendered. Older clients omit it;
+    /// the host then preserves cursor-only behavior for wire compatibility.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_stream_epoch: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub expected_control_epoch: Option<u64>,
 }
@@ -1810,6 +1814,8 @@ pub enum HostCommand {
         incarnation_id: IncarnationId,
         after_seq: u64,
         max_bytes: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expected_stream_epoch: Option<String>,
     },
     FreshAgentSend {
         incarnation_id: IncarnationId,
@@ -2183,6 +2189,52 @@ mod tests {
                 provider_relative_path: ".provider/config.json".into(),
             }],
         }
+    }
+
+    #[test]
+    fn terminal_output_epoch_hint_is_additive_and_round_trips() {
+        let legacy: TerminalReadOutputRequest = serde_json::from_value(serde_json::json!({
+            "soulId": "soul-output-compatibility",
+            "afterSeq": 41,
+            "maxBytes": 65536,
+            "expectedControlEpoch": 7
+        }))
+        .unwrap();
+        assert_eq!(legacy.expected_stream_epoch, None);
+
+        let hinted = TerminalReadOutputRequest {
+            soul_id: SoulId::parse("soul-output-compatibility").unwrap(),
+            after_seq: 41,
+            max_bytes: 65_536,
+            expected_stream_epoch: Some("host-epoch-one".into()),
+            expected_control_epoch: Some(7),
+        };
+        let encoded = serde_json::to_value(&hinted).unwrap();
+        assert_eq!(encoded["expectedStreamEpoch"], "host-epoch-one");
+        assert_eq!(
+            serde_json::from_value::<TerminalReadOutputRequest>(encoded).unwrap(),
+            hinted
+        );
+
+        let current_host = HostCommand::TerminalReadOutput {
+            incarnation_id: IncarnationId::parse("incarnation-output-compatibility").unwrap(),
+            after_seq: 41,
+            max_bytes: 65_536,
+            expected_stream_epoch: Some("host-epoch-one".into()),
+        };
+        let mut legacy_host = serde_json::to_value(current_host).unwrap();
+        let params = legacy_host["params"].as_object_mut().unwrap();
+        assert_eq!(
+            params.remove("expected_stream_epoch"),
+            Some(serde_json::json!("host-epoch-one"))
+        );
+        assert!(matches!(
+            serde_json::from_value::<HostCommand>(legacy_host).unwrap(),
+            HostCommand::TerminalReadOutput {
+                expected_stream_epoch: None,
+                ..
+            }
+        ));
     }
 
     #[test]

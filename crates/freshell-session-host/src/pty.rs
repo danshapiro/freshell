@@ -223,7 +223,10 @@ impl HostedPty {
         incarnation_id: IncarnationId,
         after_seq: u64,
         max_bytes: u64,
+        expected_stream_epoch: Option<&str>,
     ) -> Result<RuntimeOutputBatch, RuntimeError> {
+        let (effective_after, source_changed) =
+            output_read_position(&self.stream_epoch, expected_stream_epoch, after_seq);
         let mut batch = self
             .output
             .lock()
@@ -233,9 +236,13 @@ impl HostedPty {
                     "output journal lock poisoned",
                 )
             })?
-            .read(after_seq, max_bytes)
+            .read(effective_after, max_bytes)
             .map_err(|e| RuntimeError::new(RuntimeErrorCode::HostUnreachable, e))?;
         batch.incarnation_id = incarnation_id;
+        if source_changed {
+            batch.reset_required = true;
+            batch.truncated = true;
+        }
         batch.exited = self.exited();
         batch.exit_code = self.exited().then(|| self.exit_code());
         batch.native_session_id = self
@@ -408,6 +415,37 @@ fn select_opencode_session(
         return None;
     }
     Some(first.session_id.clone())
+}
+
+fn output_read_position(
+    current_stream_epoch: &str,
+    expected_stream_epoch: Option<&str>,
+    after_seq: u64,
+) -> (u64, bool) {
+    let source_changed = expected_stream_epoch.is_some_and(|epoch| epoch != current_stream_epoch);
+    (if source_changed { 0 } else { after_seq }, source_changed)
+}
+
+#[cfg(test)]
+mod output_epoch_tests {
+    use super::output_read_position;
+
+    #[test]
+    fn obsolete_source_epoch_forces_one_call_full_replay() {
+        assert_eq!(
+            output_read_position("new-host", Some("old-host"), 206),
+            (0, true)
+        );
+    }
+
+    #[test]
+    fn matching_or_legacy_callers_preserve_their_cursor() {
+        assert_eq!(
+            output_read_position("same-host", Some("same-host"), 206),
+            (206, false)
+        );
+        assert_eq!(output_read_position("same-host", None, 206), (206, false));
+    }
 }
 
 fn paths_equivalent(left: &str, right: &str) -> bool {
