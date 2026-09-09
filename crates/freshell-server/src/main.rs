@@ -35,6 +35,8 @@ mod legacy_local_seed;
 mod logging;
 mod managed_ports;
 #[cfg(feature = "managed-runtime-v1")]
+mod managed_provider_bootstrap;
+#[cfg(feature = "managed-runtime-v1")]
 mod managed_runtime;
 #[cfg(feature = "managed-runtime-v1")]
 mod managed_runtime_api;

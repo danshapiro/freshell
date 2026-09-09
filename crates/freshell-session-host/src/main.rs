@@ -1,6 +1,7 @@
 mod command_journal;
 mod control;
 mod output_journal;
+mod provider_secret_resolution;
 mod providers;
 mod pty;
 
@@ -567,10 +568,18 @@ async fn grant_execution(
                     )
                 })?;
             let terminal = prepared.terminal;
+            let child_secret_env = provider_secret_resolution::resolve_child_environment(&terminal)
+                .map_err(|error| {
+                    RuntimeError::new(
+                        RuntimeErrorCode::HostUnreachable,
+                        format!("resolve managed provider credentials: {error}"),
+                    )
+                })?;
             let hosted = HostedPty::spawn(
                 &state.state_dir,
                 state.incarnation_id.clone(),
                 &terminal,
+                child_secret_env,
                 prepared.codex,
             )
             .await
@@ -1607,6 +1616,7 @@ mod tests {
                 source_path: "/source-is-deliberately-absent".into(),
                 provider_relative_path: ".local/share/opencode/auth.json".into(),
             }],
+            provider_secret_references: Vec::new(),
         };
         let resume_spec = ResumeSpec {
             schema_version: freshell_runtime_protocol::RESUME_SPEC_SCHEMA_VERSION,

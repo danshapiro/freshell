@@ -150,6 +150,13 @@ impl Supervisor {
                     .await
                     .map_err(map_registry)?,
             )),
+            AdminCommand::QualificationWriterClaim(request) => {
+                Ok(AdminResult::QualificationWriterClaim(
+                    crate::qualification_evidence::writer_claim_evidence(&self.registry, request)
+                        .await
+                        .map_err(map_registry)?,
+                ))
+            }
             AdminCommand::PendingViewProjections(request) => {
                 self.registry
                     .assert_epoch(request.expected_control_epoch)

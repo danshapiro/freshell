@@ -7,6 +7,8 @@
   "include": [
     "scripts/testing/provider-certification.ts",
     "scripts/testing/provider-qualification-receipt.ts",
+    "scripts/testing/provider-qualification-selection.ts",
+    "scripts/testing/runtime-provider-qualification.ts",
     "scripts/testing/runtime-gate.ts",
     "scripts/testing/runtime-gate-args.ts",
     "scripts/testing/runtime-sandbox.ts",

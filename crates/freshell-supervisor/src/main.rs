@@ -18,6 +18,7 @@ async fn main() {
 }
 
 async fn run() -> Result<(), String> {
+    freshell_agent_runtime::process_qualification_policy()?;
     let args: Vec<String> = std::env::args().collect();
     if args.get(1).map(String::as_str) != Some("serve") {
         return Err("usage: freshell-supervisor serve --registry-root PATH --control-socket PATH --control-secret-file PATH --docker-socket PATH --runtime-root PATH --host-binary PATH --image-ref sha256:... --test-run-id ID [--installation-id ID]".into());

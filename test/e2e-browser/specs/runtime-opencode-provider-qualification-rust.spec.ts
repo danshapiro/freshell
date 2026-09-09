@@ -297,22 +297,24 @@ function verifyMemoryAnswer(turn: NativeAssistantTurn, projectName: string): voi
   expect(turn.text).toContain(projectName)
 }
 
-function cgroupLimitsVerified(rig: ManagedRuntimeBrowserRig, view: ManagedRuntimeView): boolean {
-  if (!view.containerId) return false
+function cgroupLimitEvidence(rig: ManagedRuntimeBrowserRig, view: ManagedRuntimeView): ProviderQualificationRow['limitEvidence'] {
+  if (!view.containerId) throw new Error('OpenCode view has no container for limit evidence')
   const expected = (view as any).effectiveLimits
-  if (!expected) return false
+  if (!expected) throw new Error('OpenCode view has no effective limits')
   const raw = rig.ownedContainerExec(view.containerId, [
     'sh', '-lc',
-    `printf '{"cpu":"%s","memory":"%s","pids":"%s"}' "$(cat /sys/fs/cgroup/cpu.max)" "$(cat /sys/fs/cgroup/memory.max)" "$(cat /sys/fs/cgroup/pids.max)"`,
+    `printf '{"cpuMax":"%s","memoryMax":"%s","swapMax":"%s","pidsMax":"%s"}' "$(cat /sys/fs/cgroup/cpu.max)" "$(cat /sys/fs/cgroup/memory.max)" "$(cat /sys/fs/cgroup/memory.swap.max)" "$(cat /sys/fs/cgroup/pids.max)"`,
   ])
   const actual = JSON.parse(raw)
-  const [quotaRaw, periodRaw] = String(actual.cpu).trim().split(/\s+/)
+  const [quotaRaw, periodRaw] = String(actual.cpuMax).trim().split(/\s+/)
   const cpuMilli = quotaRaw === 'max'
     ? Number.POSITIVE_INFINITY
     : Math.round((Number(quotaRaw) / Number(periodRaw)) * 1_000)
-  return cpuMilli === expected.cpuMilli
-    && Number(actual.memory) === expected.memoryBytes
-    && Number(actual.pids) === expected.pidsMax
+  expect(cpuMilli).toBe(expected.cpuMilli)
+  expect(Number(actual.memoryMax)).toBe(expected.memoryBytes)
+  expect(Number(actual.swapMax)).toBe(expected.swapBytes)
+  expect(Number(actual.pidsMax)).toBe(expected.pidsMax)
+  return actual
 }
 
 function runBlockerMatrixTests(repoRoot: string): string[] {
@@ -385,8 +387,8 @@ test.describe.serial('OpenCode provider qualification', () => {
         .toBe(P2_OPENCODE_VERSION)
       const processArgs = rig.ownedContainerProcessTable(first.view.containerId)
       expect(processArgs).toContain(P2_OPENCODE_FREE_MODEL)
-      const limitsVerified = cgroupLimitsVerified(rig, first.view)
-      expect(limitsVerified).toBe(true)
+      const exactLimits = cgroupLimitEvidence(rig, first.view)
+      expect(exactLimits.swapMax).toBe('0')
 
       // A plain conversation task avoids synthetic marker-assembly prompts.
       // Proof comes from NEW provider-native assistant rows, never echoed input
@@ -487,7 +489,7 @@ test.describe.serial('OpenCode provider qualification', () => {
       expect(second.view.soulId).not.toBe(first.view.soulId)
       expect(second.view.containerId).not.toBe(afterProviderCrash.containerId)
       expect(secondSessionId).not.toBe(nativeSessionId)
-      expect(cgroupLimitsVerified(rig, second.view)).toBe(true)
+      expect(cgroupLimitEvidence(rig, second.view).swapMax).toBe('0')
 
       let snapshot = await rig.inventorySnapshot()
       const firstSoul = snapshot.souls
@@ -520,6 +522,14 @@ test.describe.serial('OpenCode provider qualification', () => {
       ))
       expect(firstRunning).toHaveLength(1)
       expect(firstViews).toHaveLength(2)
+      const writerClaim = await rig.qualificationWriterClaim({
+        provider: 'opencode',
+        nativeSessionId,
+        soulId: first.view.soulId,
+        incarnationId: afterProviderCrash.incarnationId,
+      })
+      expect(writerClaim.activeClaimCount).toBe(1)
+      expect(writerClaim.globalConflictingClaimCount).toBe(0)
 
       const notices = dataOf(await rig.runtime.adminOk(
         rig.supervisor,
@@ -535,6 +545,16 @@ test.describe.serial('OpenCode provider qualification', () => {
       const secondStop = await rig.stopSoul(second.view.soulId)
       expect(firstStop.outcome).toBe('verified_empty')
       expect(secondStop.outcome).toBe('verified_empty')
+      const claimAfterStop = await rig.qualificationWriterClaim({
+        provider: 'opencode',
+        nativeSessionId,
+        soulId: first.view.soulId,
+        incarnationId: afterProviderCrash.incarnationId,
+      })
+      expect(claimAfterStop.activeClaimCount).toBe(0)
+      expect(claimAfterStop.globalConflictingClaimCount).toBe(0)
+      const oldContainerRunningAfterStop = rig.runtime.isContainerRunning(afterProviderCrash.containerId!)
+      expect(oldContainerRunningAfterStop).toBe(false)
       expect(rig.runtime.broker.unsafeAttempts()).toHaveLength(0)
 
       providerRow = {
@@ -549,7 +569,9 @@ test.describe.serial('OpenCode provider qualification', () => {
         nativeStateCaptured: true,
         nativeSessionId,
         runtimeOwned: true,
-        limitsVerified,
+        limitsVerified: true,
+        swapMaxVerified: exactLimits.swapMax === '0',
+        limitEvidence: exactLimits,
         nonceRecovery: {
           sameSoul: afterHostCrash.soulId === first.view.soulId,
           sameNativeSession: afterHostCrash.nativeSessionId === nativeSessionId,
@@ -562,6 +584,7 @@ test.describe.serial('OpenCode provider qualification', () => {
         crashKinds: ['session_host', 'provider_process'],
         automaticResume: true,
         onlyOneWriter: firstRunning.length === 1,
+        writerClaim,
         profileVerified: firstSoul.profile === (first.view as any).profile,
         sameNativeSession: afterProviderCrash.nativeSessionId === nativeSessionId,
         exactNativeRecovery: afterHostCrash.nativeSessionId === nativeSessionId
@@ -582,6 +605,12 @@ test.describe.serial('OpenCode provider qualification', () => {
         lostNoticeCount: notices.length,
         oldEnclosureVerifiedEmpty: !rig.runtime.isContainerRunning(first.view.containerId)
           && !rig.runtime.isContainerRunning(afterHostCrash.containerId),
+        verifiedEmptyOrdering: {
+          stopOutcome: firstStop.outcome,
+          activeClaimCountAfterStop: claimAfterStop.activeClaimCount,
+          globalConflictingClaimCountAfterStop: claimAfterStop.globalConflictingClaimCount,
+          oldContainerRunningAfterStop,
+        },
         followUpCompleted: providerFollowUpCompleted,
         releaseBinary: rig.supervisor.binaryKind === 'release',
       }

@@ -891,6 +891,23 @@ pub struct ProviderBootstrapFile {
     pub provider_relative_path: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderSecretProfile {
+    AmplifierOnecliAnthropicHaikuLow,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderSecretReference {
+    /// Canonical private host file. Only this reference is durable; the
+    /// session host reads its read-only mount immediately before child spawn.
+    pub source_path: String,
+    pub profile: ProviderSecretProfile,
+    /// Approved non-secret endpoint. Secret resolution must match it exactly.
+    pub approved_endpoint: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TerminalLaunchSpec {
@@ -931,6 +948,8 @@ pub struct TerminalLaunchSpec {
     pub provider_permission_mode: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub provider_bootstrap_files: Vec<ProviderBootstrapFile>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub provider_secret_references: Vec<ProviderSecretReference>,
 }
 
 impl TerminalLaunchSpec {
@@ -951,7 +970,10 @@ impl TerminalLaunchSpec {
                 "managed terminal launch has an empty/root-uid required field",
             ));
         }
-        if self.env.len() > 512 || self.args.len() > 512 || self.provider_bootstrap_files.len() > 16
+        if self.env.len() > 512
+            || self.args.len() > 512
+            || self.provider_bootstrap_files.len() > 16
+            || self.provider_secret_references.len() > 4
         {
             return Err(RuntimeError::new(
                 RuntimeErrorCode::InvalidRequest,
@@ -998,6 +1020,20 @@ impl TerminalLaunchSpec {
                 return Err(RuntimeError::new(
                     RuntimeErrorCode::InvalidRequest,
                     "managed provider bootstrap file path is unsafe",
+                ));
+            }
+        }
+        for secret in &self.provider_secret_references {
+            let source = std::path::Path::new(&secret.source_path);
+            if self.mode != "amplifier"
+                || !source.is_absolute()
+                || secret.approved_endpoint.len() > 2048
+                || !secret.approved_endpoint.starts_with("https://")
+                || secret.approved_endpoint.chars().any(char::is_control)
+            {
+                return Err(RuntimeError::new(
+                    RuntimeErrorCode::InvalidRequest,
+                    "managed provider secret reference is unsafe or unsupported",
                 ));
             }
         }
@@ -1288,6 +1324,27 @@ pub struct UpdateLimitsRequest {
     pub expected_control_epoch: Option<u64>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct QualificationWriterClaimRequest {
+    pub provider: String,
+    pub native_session_id: String,
+    pub soul_id: SoulId,
+    pub incarnation_id: IncarnationId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct QualificationWriterClaimEvidence {
+    pub provider: String,
+    pub provider_store_id: String,
+    pub native_session_id: String,
+    pub soul_id: SoulId,
+    pub incarnation_id: IncarnationId,
+    pub active_claim_count: u64,
+    pub global_conflicting_claim_count: u64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "method", content = "params", rename_all = "snake_case")]
 pub enum AdminCommand {
@@ -1301,6 +1358,7 @@ pub enum AdminCommand {
     UpdateViewVisibility(UpdateViewVisibilityRequest),
     UpsertViewIntent(UpsertViewIntentRequest),
     UpdateLimits(UpdateLimitsRequest),
+    QualificationWriterClaim(QualificationWriterClaimRequest),
     PendingNotices(PendingNoticesRequest),
     NoticeReceipt(NoticeReceiptRequest),
     IncidentSummary(IncidentSummaryRequest),
@@ -1435,6 +1493,7 @@ pub enum AdminResult {
     ViewProjectionAcknowledged,
     ViewIntent(ViewIntent),
     UpdateLimits(UpdateLimitsResult),
+    QualificationWriterClaim(QualificationWriterClaimEvidence),
     PendingNotices(Vec<RuntimeNotice>),
     NoticeReceiptRecorded,
     IncidentSummary(LossIncidentSummary),
@@ -1809,6 +1868,7 @@ mod tests {
             provider_sandbox: Some("workspace-write".into()),
             provider_permission_mode: Some("on-request".into()),
             provider_bootstrap_files: Vec::new(),
+            provider_secret_references: Vec::new(),
         };
         assert!(spec.validate().is_ok());
         spec.provider_model = Some("bad\0model".into());

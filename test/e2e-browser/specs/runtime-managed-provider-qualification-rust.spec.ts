@@ -14,6 +14,10 @@ import path from 'node:path'
 import { expect, type Page } from '@playwright/test'
 
 import type { ProviderQualificationRow } from '../../../scripts/testing/provider-qualification-receipt.js'
+import {
+  QUALIFICATION_PROVIDER_SELECTION_ENV,
+  parseQualificationProviderSelection,
+} from '../../../scripts/testing/provider-qualification-selection.js'
 import { test } from '../helpers/fixtures.js'
 import {
   ManagedRuntimeBrowserRig,
@@ -25,6 +29,8 @@ import { openPanePicker } from '../helpers/pane-picker.js'
 import { TestHarness } from '../helpers/test-harness.js'
 
 const LIVE_ENV = 'FRESHELL_RUNTIME_MANAGED_PROVIDER_QUALIFICATION_LIVE'
+const AMPLIFIER_MODEL = 'claude-haiku-4-5-20251001'
+const AMPLIFIER_EFFORT = 'low'
 
 type ProviderDefinition = {
   provider: 'claude' | 'codex' | 'opencode' | 'amplifier'
@@ -44,13 +50,41 @@ function requiredAmplifierSetting(name: 'MODEL' | 'REASONING_EFFORT'): string {
   const key = `FRESHELL_RUNTIME_AMPLIFIER_${name}`
   const value = process.env[key]?.trim()
   if (!value) throw new Error(`${key} must name the exact non-secret live Amplifier identity`)
+  const expected = name === 'MODEL' ? AMPLIFIER_MODEL : AMPLIFIER_EFFORT
+  if (value !== expected) {
+    throw new Error(`${key} must be ${expected}; qualification refuses an unapproved or more expensive profile`)
+  }
   return value
 }
 
+function requireAmplifierOnecliBootstrap(): void {
+  const endpoint = process.env.FRESHELL_MANAGED_AMPLIFIER_ONECLI_ENDPOINT?.trim()
+  if (!endpoint?.startsWith('https://')
+    || endpoint.includes('@')
+    || endpoint.includes('#')
+    || endpoint.includes('?')) {
+    throw new Error('FRESHELL_MANAGED_AMPLIFIER_ONECLI_ENDPOINT must be an explicit credential-free https URL')
+  }
+  const keys = process.env.FRESHELL_MANAGED_AMPLIFIER_ONECLI_KEYS_FILE?.trim()
+    || path.join(process.env.HOME ?? '', '.amplifier', 'keys.env')
+  let regular = false
+  try {
+    regular = fs.statSync(keys).isFile()
+  } catch {}
+  if (!path.isAbsolute(keys) || !regular) {
+    throw new Error(`Amplifier OneCLI keys reference is missing or not an absolute regular file: ${keys}`)
+  }
+}
+
 function providerDefinitions(): ProviderDefinition[] {
-  const amplifierModel = requiredAmplifierSetting('MODEL')
-  const amplifierEffort = requiredAmplifierSetting('REASONING_EFFORT')
-  return [
+  const rawSelection = process.env[QUALIFICATION_PROVIDER_SELECTION_ENV]?.trim()
+  if (!rawSelection) {
+    throw new Error(
+      `${QUALIFICATION_PROVIDER_SELECTION_ENV} must explicitly select each live provider to qualify`,
+    )
+  }
+  const selected = parseQualificationProviderSelection(rawSelection)
+  const definitions: ProviderDefinition[] = [
     {
       provider: 'claude',
       pickerName: /^Claude CLI$/i,
@@ -90,13 +124,18 @@ function providerDefinitions(): ProviderDefinition[] {
       processIdentityNeedles: [P2_OPENCODE_FREE_MODEL],
       nativeIdPattern: /^ses_/,
     },
-    {
+  ]
+  if (selected.includes('amplifier')) {
+    requireAmplifierOnecliBootstrap()
+    const model = requiredAmplifierSetting('MODEL')
+    const effort = requiredAmplifierSetting('REASONING_EFFORT')
+    definitions.push({
       provider: 'amplifier',
       pickerName: /^Amplifier$/i,
       directoryName: /Starting directory for Amplifier/i,
       providerVersion: '0.1.1',
-      model: amplifierModel,
-      reasoningEffort: amplifierEffort,
+      model,
+      reasoningEffort: effort,
       versionCommand: [
         '/opt/amplifier-src/.venv/bin/python',
         '-c',
@@ -104,10 +143,43 @@ function providerDefinitions(): ProviderDefinition[] {
       ],
       versionPattern: /^0\.1\.1\s*$/,
       processBinary: 'amplifier',
-      processIdentityNeedles: [amplifierModel, amplifierEffort],
+      // Amplifier's resume command has no model/effort flags. Native
+      // session:config evidence below is the provider-effective authority.
+      processIdentityNeedles: [],
       nativeIdPattern: /^[A-Za-z0-9][A-Za-z0-9._-]+$/,
-    },
-  ]
+    })
+  }
+  const byProvider = new Map(definitions.map((definition) => [definition.provider, definition]))
+  return selected.map((provider) => {
+    const definition = byProvider.get(provider)
+    if (!definition) throw new Error(`no qualification definition for ${provider}`)
+    return definition
+  })
+}
+
+function amplifierNativeProfileEvidence(
+  rig: ManagedRuntimeBrowserRig,
+  containerId: string,
+  nativeSessionId: string,
+): { provider: string, model: string, reasoningEffort: string, source: string } {
+  const script = [
+    'import glob,json,sys',
+    'matches=glob.glob("/home/freshell/provider/.amplifier/projects/*/sessions/"+sys.argv[1]+"/events.jsonl")',
+    'assert len(matches)==1, f"expected one native session event log, found {len(matches)}"',
+    'found=None',
+    'for line in open(matches[0], encoding="utf-8"):',
+    ' event=json.loads(line)',
+    ' if event.get("event") != "session:config" and event.get("type") != "session:config": continue',
+    ' raw=event.get("data",{}).get("raw",{})',
+    ' for provider in raw.get("providers",[]):',
+    '  if provider.get("id")=="freshell-onecli-anthropic" or provider.get("instance_id")=="freshell-onecli-anthropic": found=provider',
+    'assert found is not None, "native session:config lacks Freshell OneCLI provider"',
+    'config=found.get("config",{})',
+    'print(json.dumps({"provider":found.get("id") or found.get("instance_id"),"model":config.get("default_model"),"reasoningEffort":config.get("reasoning_effort"),"source":"native-session-config"}))',
+  ].join('\n')
+  return JSON.parse(rig.ownedProviderExec(containerId, [
+    '/opt/amplifier-src/.venv/bin/python', '-c', script, nativeSessionId,
+  ]))
 }
 
 function leavesByMode(node: any, mode: string): any[] {
@@ -223,17 +295,19 @@ async function createProviderPane(
   return { paneId: leaf.id, terminalId: leaf.content.terminalId, view }
 }
 
-function limitsVerified(rig: ManagedRuntimeBrowserRig, view: ManagedRuntimeView): boolean {
-  if (!view.containerId) return false
+function limitEvidence(rig: ManagedRuntimeBrowserRig, view: ManagedRuntimeView): ProviderQualificationRow['limitEvidence'] {
+  if (!view.containerId) throw new Error('managed runtime has no container for limit evidence')
   const expected = (view as any).effectiveLimits
-  if (!expected) return false
+  if (!expected) throw new Error('managed runtime has no effective limits')
   const actual = JSON.parse(rig.ownedContainerExec(view.containerId, [
     'sh', '-lc',
-    `printf '{"cpu":"%s","memory":"%s","pids":"%s"}' "$(cat /sys/fs/cgroup/cpu.max)" "$(cat /sys/fs/cgroup/memory.max)" "$(cat /sys/fs/cgroup/pids.max)"`,
+    `printf '{"cpuMax":"%s","memoryMax":"%s","swapMax":"%s","pidsMax":"%s"}' "$(cat /sys/fs/cgroup/cpu.max)" "$(cat /sys/fs/cgroup/memory.max)" "$(cat /sys/fs/cgroup/memory.swap.max)" "$(cat /sys/fs/cgroup/pids.max)"`,
   ]))
-  return actual.cpu === `${expected.cpuMilli * 100} 100000`
-    && actual.memory === String(expected.memoryBytes)
-    && actual.pids === String(expected.pidsMax)
+  expect(actual.cpuMax).toBe(`${expected.cpuMilli * 100} 100000`)
+  expect(actual.memoryMax).toBe(String(expected.memoryBytes))
+  expect(actual.swapMax).toBe(String(expected.swapBytes))
+  expect(actual.pidsMax).toBe(String(expected.pidsMax))
+  return actual
 }
 
 async function waitForReplacement(
@@ -275,8 +349,8 @@ async function qualifyProvider(
   if (definition.reasoningEffort === 'provider-default') {
     expect(processTable).not.toMatch(/(?:^|\s)--(?:reasoning-)?effort(?:=|\s)/m)
   }
-  const exactLimits = limitsVerified(rig, created.view)
-  expect(exactLimits).toBe(true)
+  const exactLimits = limitEvidence(rig, created.view)
+  expect(exactLimits.swapMax).toBe('0')
 
   const nonce = `QUALIFY_${definition.provider.toUpperCase()}_${Date.now()}_${Math.random().toString(36).slice(2)}`
   const storedMarker = `STORED_${definition.provider.toUpperCase()}`
@@ -295,6 +369,17 @@ async function qualifyProvider(
     (await rig.runningViewForTerminal(created.terminalId))?.nativeSessionId
   ), 120_000)
   expect(inventoryNativeId).toBe(nativeSessionId)
+  const nativeProfileEvidence = definition.provider === 'amplifier'
+    ? amplifierNativeProfileEvidence(rig, created.view.containerId, nativeSessionId)
+    : undefined
+  if (nativeProfileEvidence) {
+    expect(nativeProfileEvidence).toEqual({
+      provider: 'freshell-onecli-anthropic',
+      model: definition.model,
+      reasoningEffort: definition.reasoningEffort,
+      source: 'native-session-config',
+    })
+  }
 
   rig.runtime.killOwnedRuntimeExact(created.view.containerId)
   const afterHostLoss = await waitForReplacement(rig, created.terminalId, created.view.incarnationId)
@@ -338,6 +423,14 @@ async function qualifyProvider(
     row.soulId === created.view.soulId && row.launchState === 'running'
   ))
   expect(runningWriters).toHaveLength(1)
+  const writerClaim = await rig.qualificationWriterClaim({
+    provider: definition.provider,
+    nativeSessionId,
+    soulId: created.view.soulId,
+    incarnationId: afterProviderLoss.incarnationId,
+  })
+  expect(writerClaim.activeClaimCount).toBe(1)
+  expect(writerClaim.globalConflictingClaimCount).toBe(0)
   const notices = await rig.runtime.adminOk(rig.supervisor, rig.runtime.pendingNoticesBody(
     `profile:managed-provider-qualification:${definition.provider}`,
     100,
@@ -347,6 +440,16 @@ async function qualifyProvider(
   expect(notices.data).toHaveLength(0)
   const stopped = await rig.stopSoul(created.view.soulId)
   expect(stopped.outcome).toBe('verified_empty')
+  const claimAfterStop = await rig.qualificationWriterClaim({
+    provider: definition.provider,
+    nativeSessionId,
+    soulId: created.view.soulId,
+    incarnationId: afterProviderLoss.incarnationId,
+  })
+  expect(claimAfterStop.activeClaimCount).toBe(0)
+  expect(claimAfterStop.globalConflictingClaimCount).toBe(0)
+  const oldContainerRunningAfterStop = rig.runtime.isContainerRunning(afterProviderLoss.containerId!)
+  expect(oldContainerRunningAfterStop).toBe(false)
   expect(rig.runtime.broker.unsafeAttempts()).toHaveLength(0)
 
   return {
@@ -360,7 +463,9 @@ async function qualifyProvider(
     completedTurn: true,
     nativeStateCaptured: true,
     runtimeOwned: true,
-    limitsVerified: exactLimits,
+    limitsVerified: true,
+    swapMaxVerified: exactLimits.swapMax === '0',
+    limitEvidence: exactLimits,
     automaticResume: true,
     profileVerified: afterProviderLoss.profile === created.view.profile,
     releaseBinary: rig.supervisor.binaryKind === 'release',
@@ -370,8 +475,15 @@ async function qualifyProvider(
     sameNativeSession: afterProviderLoss.nativeSessionId === nativeSessionId,
     followUpCompleted: true,
     onlyOneWriter: runningWriters.length === 1,
+    writerClaim,
     oldEnclosureVerifiedEmpty: !rig.runtime.isContainerRunning(created.view.containerId)
       && !rig.runtime.isContainerRunning(afterHostLoss.containerId),
+    verifiedEmptyOrdering: {
+      stopOutcome: stopped.outcome,
+      activeClaimCountAfterStop: claimAfterStop.activeClaimCount,
+      globalConflictingClaimCountAfterStop: claimAfterStop.globalConflictingClaimCount,
+      oldContainerRunningAfterStop,
+    },
     lostNoticeCount: notices.data.length,
     crashKinds: ['session_host', 'provider_process'],
     nonceRecovery: {
@@ -385,11 +497,12 @@ async function qualifyProvider(
     },
     repairedSameSoul: afterProviderLoss.soulId === created.view.soulId,
     repairedSameNativeSession: afterProviderLoss.nativeSessionId === nativeSessionId,
+    ...(nativeProfileEvidence ? { nativeProfileEvidence } : {}),
   }
 }
 
-test.describe.serial('combined managed-provider qualification', () => {
-  test('Claude, Codex, OpenCode, and Amplifier produce evidence-bound live rows', async ({ page, e2eServerKind }) => {
+test.describe.serial('selectable managed-provider qualification', () => {
+  test('each explicitly selected provider produces an independent evidence-bound live row', async ({ page, e2eServerKind }) => {
     test.skip(
       process.env[LIVE_ENV] !== '1',
       `set ${LIVE_ENV}=1 only for a live candidate-bound managed-provider campaign`,
@@ -423,15 +536,17 @@ test.describe.serial('combined managed-provider qualification', () => {
       for (const definition of definitions) {
         providers.push(await qualifyProvider(page, harness, rig, tabId, definition))
       }
-      expect(providers.map((row) => row.provider)).toEqual(['claude', 'codex', 'opencode', 'amplifier'])
+      expect(providers.map((row) => row.provider)).toEqual(
+        definitions.map((definition) => definition.provider),
+      )
     } finally {
       const cleanup = await rig.stop()
       expect(cleanup.ok, cleanup.errors.join('\n')).toBe(true)
     }
     const finalized = rig.finalizeProviderQualificationReceipt(providers)
     expect(finalized.receipt.schemaVersion).toBe(2)
-    expect(finalized.receipt.providers).toHaveLength(4)
+    expect(finalized.receipt.providers).toHaveLength(definitions.length)
     // eslint-disable-next-line no-console
-    console.log(`[provider-qualification] combined receipts: ${finalized.paths.join(', ')}`)
+    console.log(`[provider-qualification] selected-provider receipts: ${finalized.paths.join(', ')}`)
   })
 })
