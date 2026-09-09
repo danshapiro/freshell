@@ -4,7 +4,9 @@
 
 **Prepared:** September 6, 2026.  
 **Inspected repository:** `/home/sentinelx/workspace/freshell`, clean `main`, commit `78b8d9d7ae6c02f81646fe22f11bd7e286f0054c`.  
-**Status:** Implementation specification, not an implementation or a test-pass report. No repository files, agents, or services were modified during preparation. Paths marked **NEW** and all `test:runtime` commands are deliverables to create, not existing features. The companion `freshell-runtime-gate-manifest.json` freezes the required gate IDs and assertions; install it at `test/runtime/gate-manifest.json` during Phase 1.
+**Preparation status (September 6):** This document was prepared as an implementation specification, not a test-pass report. No repository files, agents, or services were modified during that preparation. Its original **NEW** path labels describe planned deliverables. The companion `freshell-runtime-gate-manifest.json` freezes the required gate IDs and assertions and has since been installed at `test/runtime/gate-manifest.json`.
+
+**Production readiness (September 9): BLOCKED.** Code and gate harnesses for all five phases are present, and the latest ordinary regression check passes with 11,896 tests passed and 27 optional tests skipped. Exact-resume bootstrap and release-gate integrity fixes are committed. This does **not** establish a production runtime PASS: Claude, Codex, and Amplifier live certification remains pending; the required Docker-backed browser qualification lane needs resolution under the configured cloud-backend policy; and the final clean-candidate cumulative chaos/soak campaign has not been qualified. See [the production-readiness record](freshell-durable-souls-production-readiness.md) for commits, evidence, and remaining ship gates. The acceptance contract below is unchanged.
 
 ### Outcome
 
