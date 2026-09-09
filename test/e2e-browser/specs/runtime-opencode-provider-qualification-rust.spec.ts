@@ -255,7 +255,7 @@ async function waitForReplacementPrompt(
     }, 120_000)
   } catch (error) {
     // Keep identity/readiness facts, never conversation text, in failure receipts.
-    rig.runtime.writeEvidence('browser/opencode-replacement-readiness.json', diagnostic)
+    rig.runtime.writeBrowserArtifact('opencode-replacement-readiness', diagnostic)
     throw error
   }
 }
