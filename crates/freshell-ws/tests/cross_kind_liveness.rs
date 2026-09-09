@@ -160,6 +160,7 @@ fn sleeper_cli_spec(name: &str) -> freshell_platform::CliCommandSpec {
             "{{sessionId}}".to_string(),
         ]),
         model_args: None,
+        effort_args: None,
         sandbox_args: None,
         permission_mode_args: None,
     }

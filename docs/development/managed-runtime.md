@@ -259,8 +259,18 @@ For managed OpenCode, strict per-soul resource isolation requires **one OpenCode
 Routine real-provider tests use these cost controls:
 
 - OpenCode: free-tier path first/default, with the resolved provider/model recorded.
-- Claude: **Haiku**, lowest available thinking/reasoning setting.
-- Codex: **GPT-5.6 Luna**, lowest available thinking/reasoning setting.
+- Claude: `codingCli.providers.claude.model = "haiku"` and
+  `codingCli.providers.claude.effort = "low"`.
+- Codex: `codingCli.providers.codex.model = "gpt-5.6-luna"` and
+  `codingCli.providers.codex.effort = "minimal"`. The CLI receives the latter
+  as the exact argument pair `-c model_reasoning_effort="minimal"`.
+- Amplifier: the provider-approved lowest-cost model in the explicitly
+  referenced settings file; record the resolved model in the receipt.
+
+The model and effort fields are durable launch policy. They are copied into
+the managed terminal spec and resume spec as typed fields, in addition to the
+manifest-rendered provider argv, so recovery cannot silently return to a
+provider default.
 
 No gate may silently upgrade to a more expensive model or higher reasoning level. If the required low-cost model/configuration is unavailable, the lane is `BLOCKED` unless the test is explicitly about another model; such an override must be named in the scenario and recorded in evidence. Provider receipts record the actual model and reasoning/thinking setting when exposed by the provider.
 
@@ -295,7 +305,17 @@ and proxy credentials are never serialized into the supervisor registry. A
 real Claude credential can instead be supplied by exact
 `FRESHELL_MANAGED_CLAUDE_CREDENTIAL_FILE` reference; Docker mounts only that
 file read-only and the host copies its bytes into the soul-owned provider volume.
-The persisted spec contains paths, not secret bytes.
+Codex and OpenCode use the analogous
+`FRESHELL_MANAGED_CODEX_AUTH_FILE` and
+`FRESHELL_MANAGED_OPENCODE_AUTH_FILE` references. Amplifier accepts two
+independent references:
+`FRESHELL_MANAGED_AMPLIFIER_SETTINGS_FILE`, copied to
+`.amplifier/settings.yaml`, and `FRESHELL_MANAGED_AMPLIFIER_OAUTH_FILE`, copied
+to `.amplifier/openai-chatgpt-oauth.json`. When those Amplifier variables are
+unset, existing regular files at the same two paths under `~/.amplifier` are
+used. Every source is canonicalized and admitted by the runtime broker as an
+exact read-only single-file mount. The registry and Docker create JSON contain
+only canonical references, never file bytes.
 
 The supported Phase 2 backend is rootless Docker. Its bind-mount ownership maps
 the host user's workspace to container uid/gid 0. Freshell therefore keeps the

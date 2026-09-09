@@ -261,7 +261,8 @@ impl Serialize for ServerConfig {
 /// `CliConfigSchema` (`extension-manifest.ts:50-66`) — the full launch/
 /// capability surface: command override, args/env, create/resume identity
 /// (`createSessionArgs`/`resumeArgs` `{{sessionId}}` templates), models
-/// (`modelArgs`/`supportsModel`), sandbox (`sandboxArgs`/`supportsSandbox`),
+/// (`modelArgs`/`supportsModel`), effort (`effortArgs`/`supportsEffort`),
+/// sandbox (`sandboxArgs`/`supportsSandbox`),
 /// permissions (`permissionModeArgs`/`permissionModeEnvVar`/
 /// `permissionModeValues`/`supportsPermissionMode`), and terminal behavior.
 #[derive(Debug, Clone, PartialEq)]
@@ -278,6 +279,8 @@ pub struct CliConfig {
     pub create_session_args: Option<Vec<String>>,
     /// `{{model}}` template.
     pub model_args: Option<Vec<String>>,
+    /// `{{effort}}` template.
+    pub effort_args: Option<Vec<String>>,
     /// `{{sandbox}}` template.
     pub sandbox_args: Option<Vec<String>>,
     /// `{{permissionMode}}` template.
@@ -286,6 +289,7 @@ pub struct CliConfig {
     pub permission_mode_values: Option<IndexMap<String, String>>,
     pub supports_permission_mode: Option<bool>,
     pub supports_model: Option<bool>,
+    pub supports_effort: Option<bool>,
     pub supports_sandbox: Option<bool>,
     pub terminal_behavior: Option<TerminalBehavior>,
 }
@@ -322,6 +326,12 @@ impl Serialize for CliConfig {
                 serde_json::to_value(v).unwrap_or(Value::Null),
             );
         }
+        if let Some(v) = &self.effort_args {
+            m.insert(
+                "effortArgs".into(),
+                serde_json::to_value(v).unwrap_or(Value::Null),
+            );
+        }
         if let Some(v) = &self.sandbox_args {
             m.insert(
                 "sandboxArgs".into(),
@@ -348,6 +358,9 @@ impl Serialize for CliConfig {
         }
         if let Some(v) = self.supports_model {
             m.insert("supportsModel".into(), Value::Bool(v));
+        }
+        if let Some(v) = self.supports_effort {
+            m.insert("supportsEffort".into(), Value::Bool(v));
         }
         if let Some(v) = self.supports_sandbox {
             m.insert("supportsSandbox".into(), Value::Bool(v));

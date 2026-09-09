@@ -688,12 +688,14 @@ impl Validator {
             let resume_args = v.opt_str_array(m, "resumeArgs");
             let create_session_args = v.opt_str_array(m, "createSessionArgs");
             let model_args = v.opt_str_array(m, "modelArgs");
+            let effort_args = v.opt_str_array(m, "effortArgs");
             let sandbox_args = v.opt_str_array(m, "sandboxArgs");
             let permission_mode_args = v.opt_str_array(m, "permissionModeArgs");
             let permission_mode_env_var = v.opt_str(m, "permissionModeEnvVar");
             let permission_mode_values = v.opt_str_record(m, "permissionModeValues");
             let supports_permission_mode = v.opt_bool(m, "supportsPermissionMode");
             let supports_model = v.opt_bool(m, "supportsModel");
+            let supports_effort = v.opt_bool(m, "supportsEffort");
             let supports_sandbox = v.opt_bool(m, "supportsSandbox");
             let terminal_behavior = v
                 .opt_object(m, "terminalBehavior", |v, m| {
@@ -721,12 +723,14 @@ impl Validator {
                     "resumeArgs",
                     "createSessionArgs",
                     "modelArgs",
+                    "effortArgs",
                     "sandboxArgs",
                     "permissionModeArgs",
                     "permissionModeEnvVar",
                     "permissionModeValues",
                     "supportsPermissionMode",
                     "supportsModel",
+                    "supportsEffort",
                     "supportsSandbox",
                     "terminalBehavior",
                 ],
@@ -739,12 +743,14 @@ impl Validator {
                 resume_args,
                 create_session_args,
                 model_args,
+                effort_args,
                 sandbox_args,
                 permission_mode_args,
                 permission_mode_env_var,
                 permission_mode_values,
                 supports_permission_mode,
                 supports_model,
+                supports_effort,
                 supports_sandbox,
                 terminal_behavior
             ) {
@@ -762,12 +768,14 @@ impl Validator {
                 resume_args: opt_out(resume_args),
                 create_session_args: opt_out(create_session_args),
                 model_args: opt_out(model_args),
+                effort_args: opt_out(effort_args),
                 sandbox_args: opt_out(sandbox_args),
                 permission_mode_args: opt_out(permission_mode_args),
                 permission_mode_env_var: opt_out(permission_mode_env_var),
                 permission_mode_values: opt_out(permission_mode_values),
                 supports_permission_mode: opt_out(supports_permission_mode),
                 supports_model: opt_out(supports_model),
+                supports_effort: opt_out(supports_effort),
                 supports_sandbox: opt_out(supports_sandbox),
                 terminal_behavior: opt_out(terminal_behavior),
             })

@@ -71,6 +71,15 @@ function buildCliConfig(
     })
   }
 
+  if (cli?.supportsEffort) {
+    config.push({
+      key: 'effort',
+      label: `${ext.label} effort`,
+      type: 'text',
+      value: (providerSettings.effort as string) || '',
+    })
+  }
+
   if (cli?.supportsSandbox) {
     config.push({
       key: 'sandbox',

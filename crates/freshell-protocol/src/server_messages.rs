@@ -785,6 +785,8 @@ pub struct ExtensionCli {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub supports_model: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub supports_effort: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub supports_permission_mode: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub supports_resume: Option<bool>,

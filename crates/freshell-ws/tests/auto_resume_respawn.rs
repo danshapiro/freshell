@@ -60,6 +60,7 @@ fn recording_crashing_claude_spec(capture: &std::path::Path) -> freshell_platfor
             "{{sessionId}}".to_string(),
         ]),
         model_args: None,
+        effort_args: None,
         sandbox_args: None,
         permission_mode_args: None,
     }

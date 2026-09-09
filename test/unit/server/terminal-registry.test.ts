@@ -1078,6 +1078,38 @@ describe('buildSpawnSpec Unix paths', () => {
       expect(spec.args).toContain('gpt-5-codex')
     })
 
+    it('includes model and effort flags for claude when provided', () => {
+      delete process.env.CLAUDE_CMD
+
+      const spec = buildSpawnSpec('claude', '/Users/john/project', 'system', undefined, {
+        model: 'haiku',
+        effort: 'low',
+      })
+
+      expect(spec.args).toEqual(expect.arrayContaining([
+        '--model',
+        'haiku',
+        '--effort',
+        'low',
+      ]))
+    })
+
+    it('uses the exact codex model_reasoning_effort config argument', () => {
+      delete process.env.CODEX_CMD
+
+      const spec = buildSpawnSpec('codex', '/Users/john/project', 'system', undefined, {
+        model: 'gpt-5.6-luna',
+        effort: 'minimal',
+      })
+
+      expect(spec.args).toEqual(expect.arrayContaining([
+        '--model',
+        'gpt-5.6-luna',
+        '-c',
+        'model_reasoning_effort="minimal"',
+      ]))
+    })
+
     it('includes --sandbox flag for codex when provided', () => {
       delete process.env.CODEX_CMD
 

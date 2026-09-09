@@ -82,6 +82,7 @@ describe('ExtensionManifestSchema', () => {
         resumeArgs: ['--session', '{{sessionId}}'],
         createSessionArgs: ['--session-id', '{{sessionId}}'],
         modelArgs: ['--model', '{{model}}'],
+        effortArgs: ['--effort', '{{effort}}'],
         sandboxArgs: ['--sandbox', '{{sandbox}}'],
         permissionModeArgs: ['--permission-mode', '{{permissionMode}}'],
         permissionModeEnvVar: 'AGENT_PERMISSION_MODE',
@@ -90,12 +91,15 @@ describe('ExtensionManifestSchema', () => {
         },
         supportsPermissionMode: true,
         supportsModel: true,
+        supportsEffort: true,
         supportsSandbox: true,
       },
     })
     expect(result.success).toBe(true)
     if (result.success) {
       expect(result.data.cli?.createSessionArgs).toEqual(['--session-id', '{{sessionId}}'])
+      expect(result.data.cli?.effortArgs).toEqual(['--effort', '{{effort}}'])
+      expect(result.data.cli?.supportsEffort).toBe(true)
     }
   })
 

@@ -126,6 +126,7 @@ export type DeepPartial<T> = T extends readonly (infer U)[]
 
 export type CodingCliProviderConfig = {
   model?: string
+  effort?: string
   sandbox?: CodexSandboxMode
   permissionMode?: ClaudePermissionMode
   maxTurns?: number
@@ -699,6 +700,7 @@ function createCodingCliProviderConfigSchema() {
   return z
     .object({
       model: z.string().optional(),
+      effort: z.string().optional(),
       sandbox: z.enum(CODEX_SANDBOX_VALUES).optional(),
       permissionMode: z.enum(CLAUDE_PERMISSION_MODE_VALUES).optional(),
       maxTurns: z.coerce.number().optional(),
@@ -711,6 +713,7 @@ function createCodingCliProviderConfigPatchSchema() {
   return z
     .object({
       model: z.string().nullable().optional(),
+      effort: z.string().nullable().optional(),
       sandbox: z.enum(CODEX_SANDBOX_VALUES).nullable().optional(),
       permissionMode: z.enum(CLAUDE_PERMISSION_MODE_VALUES).optional(),
       maxTurns: z.coerce.number().optional(),
@@ -1133,7 +1136,7 @@ function sanitizeServerSettingsPatch(patch: ServerSettingsPatch): ServerSettings
           continue
         }
         const pickedProviderPatch = isRecord(providerPatch)
-          ? pickOwnKeysPreservingUndefined(providerPatch, ['model', 'sandbox', 'permissionMode', 'maxTurns', 'cwd'])
+          ? pickOwnKeysPreservingUndefined(providerPatch, ['model', 'effort', 'sandbox', 'permissionMode', 'maxTurns', 'cwd'])
           : providerPatch
         const parsed = codingCliProviderConfigPatchSchema.safeParse(
           pickedProviderPatch,
@@ -1142,6 +1145,9 @@ function sanitizeServerSettingsPatch(patch: ServerSettingsPatch): ServerSettings
           const normalizedProviderPatch: Partial<CodingCliProviderConfig> = {}
           if (hasOwn(pickedProviderPatch, 'model')) {
             normalizedProviderPatch.model = parsed.data.model ?? undefined
+          }
+          if (hasOwn(pickedProviderPatch, 'effort')) {
+            normalizedProviderPatch.effort = parsed.data.effort ?? undefined
           }
           if (hasOwn(pickedProviderPatch, 'sandbox')) {
             normalizedProviderPatch.sandbox = parsed.data.sandbox ?? undefined

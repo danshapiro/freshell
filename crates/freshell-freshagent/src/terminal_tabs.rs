@@ -1564,6 +1564,25 @@ async fn settle_gated_create(inputs: GatedSettleInputs) -> Result<TerminalSpawnR
     let mut codex_launch: Option<freshell_codex::launch_lifecycle::CodexTerminalLaunch> = None;
     let spec: SpawnSpec;
     let child_env: BTreeMap<String, String>;
+    // Explicit REST overrides are also copied into ManagedTerminalLaunch so
+    // the durable resume spec can preserve provider policy independently of
+    // the rendered argv.
+    let permission_mode = body
+        .get("permissionMode")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let model = body
+        .get("model")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let effort = body
+        .get("effort")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let sandbox = body
+        .get("sandbox")
+        .and_then(Value::as_str)
+        .map(str::to_string);
 
     if mode == "shell" {
         // `host_os`/`is_wsl` arrive from `spawn_terminal_pane` (hoisted, Task
@@ -1637,19 +1656,6 @@ async fn settle_gated_create(inputs: GatedSettleInputs) -> Result<TerminalSpawnR
         // so there is no settings-derived fallback layer here; a client that
         // wants non-default provider settings must pass them explicitly on
         // the create call).
-        let permission_mode = body
-            .get("permissionMode")
-            .and_then(Value::as_str)
-            .map(str::to_string);
-        let model = body
-            .get("model")
-            .and_then(Value::as_str)
-            .map(str::to_string);
-        let sandbox = body
-            .get("sandbox")
-            .and_then(Value::as_str)
-            .map(str::to_string);
-
         // D-C-REVISIT(FRESHELL_CODEX_MANAGED_LAUNCH) — RESOLVED 2026-07-30
         // (DEV-0006 S5.e precondition): this plan no longer runs under the
         // held spawn permit (acquire moved below the plan, WS-auto-resume
@@ -1692,7 +1698,6 @@ async fn settle_gated_create(inputs: GatedSettleInputs) -> Result<TerminalSpawnR
             None
         };
         let managed_codex = codex_launch.is_some();
-        let host_managed_codex = use_managed_runtime && mode == "codex";
         // The resumeSessionId ECHO (`router.ts:177`): the registry record and every
         // downstream identity consumer carry the echoed value.
         if let Some(launch) = &codex_launch {
@@ -1786,18 +1791,16 @@ async fn settle_gated_create(inputs: GatedSettleInputs) -> Result<TerminalSpawnR
             } else {
                 launch_intent
             },
-            // Managed codex (flag ON): model/sandbox/permissionMode route through the
-            // PLAN, not argv (legacy's spawn providerSettings for codex carry ONLY
-            // `codexAppServer`, `router.ts:178-193`).
-            permission_mode: (!(managed_codex || host_managed_codex))
+            // The legacy web-owned Codex sidecar consumes these through its
+            // launch plan. Reasoning effort remains the exact CLI config argv.
+            // A Durable Soul's host-owned sidecar also receives the typed
+            // fields, so model and reasoning policy survive recovery.
+            permission_mode: (!managed_codex)
                 .then_some(())
                 .and(permission_mode.as_deref()),
-            model: (!(managed_codex || host_managed_codex))
-                .then_some(())
-                .and(model.as_deref()),
-            sandbox: (!(managed_codex || host_managed_codex))
-                .then_some(())
-                .and(sandbox.as_deref()),
+            model: (!managed_codex).then_some(()).and(model.as_deref()),
+            effort: effort.as_deref(),
+            sandbox: (!managed_codex).then_some(()).and(sandbox.as_deref()),
             // DEV-0006 S4 inc.2: the PROXY's ws URL when the flag-gated managed launch
             // planned one; `None` (today's shipped shape) otherwise.
             codex_remote_ws_url: codex_launch
@@ -2024,18 +2027,10 @@ async fn settle_gated_create(inputs: GatedSettleInputs) -> Result<TerminalSpawnR
             stream_id: stream_id.clone(),
             mode: mode.clone(),
             resume_session_id: resume_session_id.clone(),
-            provider_model: body
-                .get("model")
-                .and_then(Value::as_str)
-                .map(str::to_string),
-            provider_sandbox: body
-                .get("sandbox")
-                .and_then(Value::as_str)
-                .map(str::to_string),
-            provider_permission_mode: body
-                .get("permissionMode")
-                .and_then(Value::as_str)
-                .map(str::to_string),
+            provider_model: model.clone(),
+            provider_reasoning_effort: effort.clone(),
+            provider_sandbox: sandbox.clone(),
+            provider_permission_mode: permission_mode.clone(),
             view_tab_id: Some(tab_id.clone()),
             view_pane_id: Some(pane_id.clone()),
             create_request_id: Some(create_request_id.clone()),
@@ -3702,6 +3697,7 @@ mod tests {
             resume_args: Some(vec!["--resume".to_string(), "{{sessionId}}".to_string()]),
             create_session_args: None,
             model_args: None,
+            effort_args: None,
             sandbox_args: None,
             permission_mode_args: None,
         }
@@ -3799,6 +3795,7 @@ mod tests {
             default_cmd: "codex".to_string(),
             resume_args: Some(vec!["resume".to_string(), "{{sessionId}}".to_string()]),
             model_args: Some(vec!["--model".to_string(), "{{model}}".to_string()]),
+            effort_args: None,
             sandbox_args: Some(vec!["--sandbox".to_string(), "{{sandbox}}".to_string()]),
             ..Default::default()
         }
@@ -4922,6 +4919,42 @@ if (args.includes('app-server')) {{
             msg.contains("sessionRef") && msg.contains("resumeSessionId"),
             "{msg}"
         );
+        let _ = std::fs::remove_file(&argv_file);
+    }
+
+    #[tokio::test]
+    async fn rest_codex_effort_uses_exact_reasoning_config_argv() {
+        let _codex_environment = crate::codex::tests::ENV_LOCK.lock().await;
+        let _environment = TestEnvRestore::capture(&["FRESHELL_CODEX_MANAGED_LAUNCH"]);
+        std::env::set_var("FRESHELL_CODEX_MANAGED_LAUNCH", "0");
+        let argv_file = unique_argv_file("codex-effort");
+        let mut cli = recording_cli_spec("codex", &argv_file);
+        cli.effort_args = Some(vec![
+            "-c".to_string(),
+            "model_reasoning_effort=\"{{effort}}\"".to_string(),
+        ]);
+        let state = state_with_registry().with_cli_commands(Arc::new(vec![cli]));
+        let registry = state.terminal_registry.clone().unwrap();
+        let (status, body) = post(
+            app(state),
+            "/api/tabs",
+            json!({
+                "mode": "codex",
+                "cwd": std::env::temp_dir().to_string_lossy(),
+                "effort": "minimal"
+            }),
+            true,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let terminal_id = body["data"]["terminalId"].as_str().unwrap();
+        let argv = read_argv_file_eventually(&argv_file).await;
+        assert!(
+            argv.lines()
+                .any(|arg| arg == "model_reasoning_effort=\"minimal\""),
+            "codex argv did not preserve exact effort config: {argv}"
+        );
+        registry.kill(terminal_id);
         let _ = std::fs::remove_file(&argv_file);
     }
 

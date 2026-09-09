@@ -411,12 +411,14 @@ describe('ExtensionManager', () => {
           command: 'opencode',
           resumeArgs: ['--session', '{{sessionId}}'],
           modelArgs: ['--model', '{{model}}'],
+          effortArgs: ['--effort', '{{effort}}'],
           permissionModeEnvVar: 'AGENT_PERMISSION_MODE',
           permissionModeValues: {
             plan: '{"edit":"ask","bash":"ask"}',
           },
           supportsPermissionMode: true,
           supportsModel: true,
+          supportsEffort: true,
         },
       }))
 
@@ -427,6 +429,7 @@ describe('ExtensionManager', () => {
       expect(entry.cli).toEqual({
         supportsPermissionMode: true,
         supportsModel: true,
+        supportsEffort: true,
         supportsSandbox: undefined,
         supportsResume: true,
         resumeCommandTemplate: ['opencode', '--session', '{{sessionId}}'],

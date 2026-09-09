@@ -86,6 +86,7 @@ fn state(probe: Arc<ParkedProbe>, missing_program: &std::path::Path) -> WsState 
         resume_args: Some(vec!["--resume".into(), "{{sessionId}}".into()]),
         create_session_args: Some(vec!["--session-id".into(), "{{sessionId}}".into()]),
         model_args: None,
+        effort_args: None,
         sandbox_args: None,
         permission_mode_args: None,
     };

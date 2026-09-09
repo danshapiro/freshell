@@ -221,11 +221,12 @@ fn cli_full_surface_round_trips_key_for_key() {
         "resumeArgs": ["--session", "{{sessionId}}"],
         "createSessionArgs": ["--session-id", "{{sessionId}}"],
         "modelArgs": ["--model", "{{model}}"],
+        "effortArgs": ["--effort", "{{effort}}"],
         "sandboxArgs": ["--sandbox", "{{sandbox}}"],
         "permissionModeArgs": ["--permission-mode", "{{permissionMode}}"],
         "permissionModeEnvVar": "AGENT_PERMISSION_MODE",
         "permissionModeValues": { "plan": "{}" },
-        "supportsPermissionMode": true, "supportsModel": true, "supportsSandbox": false,
+        "supportsPermissionMode": true, "supportsModel": true, "supportsEffort": true, "supportsSandbox": false,
         "terminalBehavior": { "preferredRenderer": "canvas", "scrollInputPolicy": "native" }
       }
     }"#;
@@ -243,11 +244,17 @@ fn cli_full_surface_round_trips_key_for_key() {
         &["--session-id", "{{sessionId}}"]
     );
     assert_eq!(cli.model_args.as_ref().unwrap(), &["--model", "{{model}}"]);
+    assert_eq!(
+        cli.effort_args.as_ref().unwrap(),
+        &["--effort", "{{effort}}"]
+    );
+    assert_eq!(cli.supports_effort, Some(true));
     assert_eq!(cli.permission_mode_values.as_ref().unwrap()["plan"], "{}");
     assert_eq!(cli.supports_sandbox, Some(false)); // explicit false preserved
                                                    // input had args → no default injection anywhere else:
     let out = manifest.to_zod_output_value();
     assert_eq!(out["cli"]["supportsSandbox"], serde_json::json!(false));
+    assert_eq!(out["cli"]["supportsEffort"], serde_json::json!(true));
     assert!(out["cli"].get("serverRunning").is_none());
 }
 

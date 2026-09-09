@@ -1052,7 +1052,7 @@ export class WsHandler {
   private async planCodexLaunch(
     cwd: string | undefined,
     resumeSessionId: string | undefined,
-    providerSettings: { model?: string; sandbox?: string; permissionMode?: string } | undefined,
+    providerSettings: { model?: string; effort?: string; sandbox?: string; permissionMode?: string } | undefined,
     attempts = 1,
   ) {
     if (!this.codexLaunchPlanner) {
@@ -2682,10 +2682,11 @@ export class WsHandler {
                 providerSettings
                   ? {
                     ...(m.mode === 'codex'
-                      ? {}
+                      ? { effort: providerSettings.effort }
                       : {
                         permissionMode: providerSettings.permissionMode,
                         model: providerSettings.model,
+                        effort: providerSettings.effort,
                         sandbox: providerSettings.sandbox,
                       }),
                     ...(m.mode === 'opencode'

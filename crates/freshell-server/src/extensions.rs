@@ -215,6 +215,7 @@ impl ExtensionRegistry {
                 resume_args: cli.resume_args.clone(),
                 create_session_args: cli.create_session_args.clone(),
                 model_args: cli.model_args.clone(),
+                effort_args: cli.effort_args.clone(),
                 sandbox_args: cli.sandbox_args.clone(),
                 permission_mode_args: cli.permission_mode_args.clone(),
             })
@@ -285,6 +286,9 @@ fn client_entry(m: &ExtensionManifest) -> Value {
             }
             if let Some(v) = cli.supports_model {
                 c.insert("supportsModel".into(), json!(v));
+            }
+            if let Some(v) = cli.supports_effort {
+                c.insert("supportsEffort".into(), json!(v));
             }
             if let Some(v) = cli.supports_sandbox {
                 c.insert("supportsSandbox".into(), json!(v));

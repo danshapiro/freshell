@@ -114,7 +114,7 @@
       "resumeCommand": "amplifier session resume --full-history <exact-id>",
       "zeroTurnPolicy": "stub-is-not-durable-conversation-proof",
       "checkpointPolicy": "provider-session-directory",
-      "bootstrap": ".amplifier/settings.yaml copied before privilege drop",
+      "bootstrap": ".amplifier/settings.yaml and .amplifier/openai-chatgpt-oauth.json copied before privilege drop",
       "liveGate": "provider-approved-lowest-cost-model",
       "blockedReason": "PENDING_LIVE_QUALIFICATION",
       "recoveryPaths": [
