@@ -12,7 +12,9 @@
     "scripts/testing/runtime-sandbox.ts",
     "scripts/testing/runtime-test-broker.ts",
     "scripts/testing/runtime-phase5-soak.ts",
+    "scripts/testing/runtime-soak-evidence.ts",
     "scripts/testing/runtime-landing-campaign.ts",
+    "test/unit/server/testing/runtime-soak-evidence.test.ts",
     "test/runtime/**/*.ts",
     "shared/**/*.ts"
   ]
