@@ -160,6 +160,10 @@ test.describe.serial('Phase 4 managed-runtime tab rehydration', () => {
       const harness = new TestHarness(page)
       await harness.waitForHarness()
       await harness.waitForConnection()
+      const emptyStartup = await browserState(page)
+      const startupTabCount = emptyStartup.tabs.tabs.length
+      expect(visibleManagedTabs(emptyStartup)).toHaveLength(0)
+      expect((await rig.inventorySnapshot()).souls).toHaveLength(0)
 
       const browser = await apiPost<any>(page, info.token, '/api/tabs', {
         browser: 'about:blank',
@@ -168,7 +172,7 @@ test.describe.serial('Phase 4 managed-runtime tab rehydration', () => {
       expect(browser.tabId).toEqual(expect.any(String))
       expect(browser.paneId).toEqual(expect.any(String))
       const browserTabId: string = browser.tabId
-      await expect.poll(() => harness.getTabCount(), { timeout: 30_000 }).toBe(1)
+      await expect.poll(() => harness.getTabCount(), { timeout: 30_000 }).toBe(startupTabCount + 1)
 
       const created: any[] = []
       for (let index = 1; index <= 3; index += 1) {
@@ -181,7 +185,7 @@ test.describe.serial('Phase 4 managed-runtime tab rehydration', () => {
         expect(response.paneId).toEqual(expect.any(String))
         created.push(response)
       }
-      await expect.poll(() => harness.getTabCount(), { timeout: 60_000 }).toBe(4)
+      await expect.poll(() => harness.getTabCount(), { timeout: 60_000 }).toBe(startupTabCount + 4)
 
       const initialSnapshot = await waitForValue('three managed souls and views', async () => {
         const snapshot = await rig.inventorySnapshot()
@@ -210,7 +214,13 @@ test.describe.serial('Phase 4 managed-runtime tab rehydration', () => {
         .map((view: any) => view.preferredPaneId)
         .sort()
 
-      await page.getByRole('button', { name: 'Existing saved layout', exact: true }).click()
+      // Set the saved-layout focus as fixture state. All subsequent restoration,
+      // close-view and stop-agent checks still run through the live browser.
+      await page.evaluate((tabId) => {
+        const testHarness = window.__FRESHELL_TEST_HARNESS__
+        if (!testHarness) throw new Error('Freshell test harness is unavailable')
+        testHarness.dispatch({ type: 'tabs/setActiveTab', payload: tabId })
+      }, browserTabId)
       await expect.poll(() => harness.getActiveTabId()).toBe(browserTabId)
       const activePaneBefore = (await browserState(page)).panes.activePane[browserTabId]
       const layoutStorageKey = await prunePersistedLayoutToTab(page, browserTabId)
