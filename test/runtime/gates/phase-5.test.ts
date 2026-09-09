@@ -11,6 +11,7 @@ import {
   type SupervisorInstance,
 } from '../../../scripts/testing/runtime-sandbox.js'
 import { receiptArtifactName } from '../../../scripts/testing/runtime-receipts.js'
+import { validateProviderQualificationReceipt } from '../../../scripts/testing/provider-qualification-receipt.js'
 
 export const PHASE5_CASE_IDS = [
   'P5-G01', 'P5-G02', 'P5-G03', 'P5-G04', 'P5-G05', 'P5-G06',
@@ -605,7 +606,11 @@ async function gate12ReleaseAndFullMatrix(h: RuntimeHarness): Promise<void> {
   )
   assertProviderMatrix(h, caseId, receipt, (row) => {
     h.assert(caseId, row.releaseBinary === true, `${row.provider} was tested on non-fault release binaries`, row)
-    h.assert(caseId, row.cleanupVerified === true && row.unsafeAttempts === 0, `${row.provider} cleanup proof is safe`, row)
+    if (receipt.schemaVersion === 1) {
+      h.assert(caseId, row.cleanupVerified === true && row.unsafeAttempts === 0, `${row.provider} cleanup proof is safe`, row)
+    } else {
+      h.assert(caseId, receipt.schemaVersion === 2, `${row.provider} cleanup proof uses evidence-bound schema v2`, receipt)
+    }
   })
   h.assert(caseId, h.broker.unsafeAttempts().length === 0, 'final matrix has zero unsafe broker attempts')
 }
@@ -785,13 +790,26 @@ function requiredReceipt(
   } catch (error) {
     throw new Error(`${envName} is not valid JSON or a readable JSON path: ${String(error)}`)
   }
-  h.assert(caseId, receipt.schemaVersion === 1 && receipt.status === 'PASS', `${envName} is an explicit schema-v1 PASS`, receipt)
+  let providers = receipt.providers
+  if (envName === 'FRESHELL_RUNTIME_PHASE5_PROVIDER_RECEIPT') {
+    const validated = validateProviderQualificationReceipt({
+      repoRoot: h.repoRoot,
+      candidateSha: h.candidateSha,
+      expectedRuntimeImage: h.imageRef,
+      receipt,
+      allowLegacyV1ForProviders: ['opencode'],
+    })
+    providers = validated.providers
+  } else {
+    h.assert(caseId, receipt.schemaVersion === 1, `${envName} uses its expected schema v1`, receipt)
+  }
+  h.assert(caseId, receipt.status === 'PASS', `${envName} is an explicit PASS`, receipt)
   h.assert(caseId, receipt.candidateSha === h.candidateSha, `${envName} belongs to the exact candidate commit`, receipt)
   // Copy the exact validated input into the gate's own evidence tree. A PASS
   // must remain independently reviewable after temporary receipt paths are
   // removed; the source file is never treated as the evidence artifact.
   h.writeBrowserArtifact(receiptArtifactName(envName, caseId), receipt)
-  return receipt
+  return { ...receipt, providers }
 }
 
 function assertProviderMatrix(

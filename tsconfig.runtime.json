@@ -6,6 +6,7 @@
   },
   "include": [
     "scripts/testing/provider-certification.ts",
+    "scripts/testing/provider-qualification-receipt.ts",
     "scripts/testing/runtime-gate.ts",
     "scripts/testing/runtime-gate-args.ts",
     "scripts/testing/runtime-sandbox.ts",
