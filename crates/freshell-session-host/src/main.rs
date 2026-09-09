@@ -543,29 +543,21 @@ async fn grant_execution(
             (pid, evidence)
         }
         (None, Some(terminal)) => {
+            let exact_resume = resume_spec.is_some();
             let mut terminal = match resume_spec.as_ref() {
                 Some(resume) => prepare_terminal_for_resume(&terminal, resume)
                     .map_err(|error| error.runtime_error())?,
                 None => terminal,
             };
-            providers::prepare_provider_state_before_bootstrap(&mut terminal).map_err(|error| {
-                RuntimeError::new(
-                    RuntimeErrorCode::HostUnreachable,
-                    format!("prepare managed provider state: {error}"),
-                )
-            })?;
-            transfer_host_created_provider_state(&terminal).map_err(|error| {
-                RuntimeError::new(
-                    RuntimeErrorCode::HostUnreachable,
-                    format!("transfer managed provider state: {error}"),
-                )
-            })?;
-            prepare_provider_bootstrap_files(&terminal).map_err(|error| {
-                RuntimeError::new(
-                    RuntimeErrorCode::HostUnreachable,
-                    format!("prepare provider bootstrap: {error}"),
-                )
-            })?;
+            // First boot transfers the durable provider-home inode to the
+            // unprivileged provider. An exact-resume host deliberately lacks
+            // FOWNER/DAC_OVERRIDE, and must consume that verified store as-is:
+            // re-running bootstrap would both violate the store boundary and
+            // fail before worker launch. Docker's ownership proof pins the
+            // same soul-scoped volume on this replacement.
+            if !exact_resume {
+                prepare_provider_state_for_fresh_launch(&mut terminal)?;
+            }
             let prepared = providers::prepare_terminal(terminal)
                 .await
                 .map_err(|error| {
@@ -618,6 +610,29 @@ async fn grant_execution(
         worker_pid: pid,
         worker_launch_count: persisted.worker_launch_count,
         fixture_evidence: persisted.fixture_evidence.clone(),
+    })
+}
+
+fn prepare_provider_state_for_fresh_launch(
+    terminal: &mut TerminalLaunchSpec,
+) -> Result<(), RuntimeError> {
+    providers::prepare_provider_state_before_bootstrap(terminal).map_err(|error| {
+        RuntimeError::new(
+            RuntimeErrorCode::HostUnreachable,
+            format!("prepare managed provider state: {error}"),
+        )
+    })?;
+    transfer_host_created_provider_state(terminal).map_err(|error| {
+        RuntimeError::new(
+            RuntimeErrorCode::HostUnreachable,
+            format!("transfer managed provider state: {error}"),
+        )
+    })?;
+    prepare_provider_bootstrap_files(terminal).map_err(|error| {
+        RuntimeError::new(
+            RuntimeErrorCode::HostUnreachable,
+            format!("prepare provider bootstrap: {error}"),
+        )
     })
 }
 
@@ -1541,6 +1556,127 @@ mod tests {
         let error = dispatch(envelope, &state).await.unwrap_err();
         assert_eq!(error.code, RuntimeErrorCode::OwnershipMismatch);
         assert!(state.child.lock().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn exact_resume_grant_reuses_provider_home_and_launches_one_real_worker() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let state = test_host_state();
+        let workspace = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(workspace.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+        let launcher = workspace.path().join("exact-resume-provider");
+        std::fs::write(&launcher, "#!/bin/sh\nexec sleep 60\n").unwrap();
+        std::fs::set_permissions(&launcher, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let current_uid = unsafe { libc::geteuid() };
+        let current_gid = unsafe { libc::getegid() };
+        let run_as_uid = if current_uid == 0 {
+            65_534
+        } else {
+            current_uid
+        };
+        let native_session_id = "ses_exact_recovery";
+        let environment = std::collections::BTreeMap::from([
+            ("HOME".into(), "/home/freshell/provider".into()),
+            ("PATH".into(), "/usr/bin:/bin".into()),
+        ]);
+        let terminal = TerminalLaunchSpec {
+            terminal_id: "terminal-exact-resume".into(),
+            stream_id: "stream-exact-resume".into(),
+            mode: "opencode".into(),
+            program: launcher.to_string_lossy().into_owned(),
+            args: vec!["--continue".into(), "--model".into(), "free-model".into()],
+            env: environment.clone(),
+            cwd: workspace.path().to_string_lossy().into_owned(),
+            run_as_uid,
+            run_as_gid: current_gid,
+            cols: 80,
+            rows: 24,
+            project_key: "project-exact-resume".into(),
+            workspace_path: workspace.path().to_string_lossy().into_owned(),
+            git_common_dir: None,
+            create_request_id: Some("create-exact-resume".into()),
+            resume_session_id: None,
+            provider_model: Some("free-model".into()),
+            provider_sandbox: None,
+            provider_permission_mode: None,
+            provider_bootstrap_files: vec![freshell_runtime_protocol::ProviderBootstrapFile {
+                // Exact recovery consumes the copy already in the durable
+                // provider volume; this first-boot source must not be read.
+                source_path: "/source-is-deliberately-absent".into(),
+                provider_relative_path: ".local/share/opencode/auth.json".into(),
+            }],
+        };
+        let resume_spec = ResumeSpec {
+            schema_version: freshell_runtime_protocol::RESUME_SPEC_SCHEMA_VERSION,
+            provider_session: freshell_runtime_protocol::ProviderSessionRef {
+                provider: "opencode".into(),
+                provider_store_id: "store-exact-resume".into(),
+                native_session_id: native_session_id.into(),
+            },
+            mode: "opencode".into(),
+            runtime_variant: "managed_terminal_pty".into(),
+            program: launcher.to_string_lossy().into_owned(),
+            resume_argv: vec!["--continue".into(), "--model".into(), "free-model".into()],
+            provider_home: "/home/freshell/provider".into(),
+            provider_volume: None,
+            cwd: workspace.path().to_string_lossy().into_owned(),
+            workspace_path: workspace.path().to_string_lossy().into_owned(),
+            project_key: Some("project-exact-resume".into()),
+            runtime_profile: None,
+            environment,
+            model: Some("free-model".into()),
+            reasoning_effort: None,
+            permission_mode: None,
+            image_ref: None,
+            provider_version: Some("test".into()),
+            credential_references: Vec::new(),
+            identity_provenance: freshell_runtime_protocol::IdentityProvenance::ProviderObserved,
+            durable_position: freshell_runtime_protocol::DurablePosition::default(),
+            checkpoint_references: Vec::new(),
+            creation_seed_ref: "seed-exact-resume".into(),
+            checkpoint_revision: 0,
+            allocation_state: freshell_runtime_protocol::AllocationState::VerifiedDurable,
+            evidence_revision: 1,
+            never_dispatched: false,
+        };
+        let exact_launch = prepare_terminal_for_resume(&terminal, &resume_spec).unwrap();
+        assert!(exact_launch
+            .args
+            .windows(2)
+            .any(|pair| pair == ["--session", native_session_id]));
+        assert!(!exact_launch.args.iter().any(|arg| arg == "--continue"));
+        let envelope = authenticated_host_envelope(
+            &state,
+            HostCommand::GrantExecution {
+                incarnation_id: state.incarnation_id.clone(),
+                soul_id: SoulId::new(),
+                host_boot_id: state.host_boot_id.clone(),
+                control_epoch: 1,
+                execution_generation: 1,
+                grant_id: GrantId::new(),
+                fixture: None,
+                terminal: Some(Box::new(terminal)),
+                resume_spec: Some(Box::new(resume_spec)),
+            },
+        );
+
+        let result = dispatch(envelope, &state)
+            .await
+            .expect("the exact-resume grant must launch");
+        assert!(matches!(
+            result,
+            HostResult::GrantAccepted {
+                worker_launch_count: 1,
+                ..
+            }
+        ));
+        assert_eq!(state.persisted.lock().await.worker_launch_count, 1);
+        assert!(state.pty.lock().await.is_some());
+        let mut launched_pty = state.pty.lock().await.take();
+        if let Some(mut pty) = launched_pty.take() {
+            pty.stop().await;
+        }
     }
 
     #[test]

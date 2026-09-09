@@ -413,7 +413,9 @@ impl Supervisor {
     ) -> Result<LaunchResult, RuntimeError> {
         let mut state = prepared.state;
         if state == LaunchState::Prepared {
-            let runtime_dir = self.ensure_incarnation_dir(&prepared)?;
+            let runtime_dir = self.ensure_incarnation_dir(&prepared).map_err(|error| {
+                self.activation_failure(&prepared, state, "ensure_runtime_directory", error)
+            })?;
             let created = self
                 .backend
                 .create_stopped(&CreateRuntimeSpec {
@@ -432,7 +434,10 @@ impl Supervisor {
                     ),
                 })
                 .await
-                .map_err(map_backend)?;
+                .map_err(map_backend)
+                .map_err(|error| {
+                    self.activation_failure(&prepared, state, "create_stopped_runtime", error)
+                })?;
             append_event(
                 &self.config.lifecycle_log,
                 "supervisor.container_created_stopped",
@@ -452,7 +457,10 @@ impl Supervisor {
                     },
                 )
                 .await
-                .map_err(map_registry)?;
+                .map_err(map_registry)
+                .map_err(|error| {
+                    self.activation_failure(&prepared, state, "commit_backend_identity", error)
+                })?;
             state = LaunchState::Created;
             crash_if("after_created_commit");
         }
@@ -461,30 +469,53 @@ impl Supervisor {
             .registry
             .owned_handle(prepared.incarnation_id.clone())
             .await
-            .map_err(map_registry)?;
+            .map_err(map_registry)
+            .map_err(|error| {
+                self.activation_failure(&prepared, state, "load_owned_handle", error)
+            })?;
 
         if state == LaunchState::Running {
             let authenticated = self
                 .authenticate_host(handle.incarnation_id(), handle.runtime_dir())
-                .await?;
+                .await
+                .map_err(|error| {
+                    self.activation_failure(&prepared, state, "authenticate_running_host", error)
+                })?;
             let status = self
                 .host_status(
                     handle.incarnation_id().clone(),
                     handle.runtime_dir(),
                     &authenticated,
                 )
-                .await?;
+                .await
+                .map_err(|error| {
+                    self.activation_failure(&prepared, state, "read_running_host_status", error)
+                })?;
             return self
-                .launch_result_from_status(prepared.incarnation_id, soul_id, authenticated, status)
-                .await;
+                .launch_result_from_status(
+                    prepared.incarnation_id.clone(),
+                    soul_id,
+                    authenticated,
+                    status,
+                )
+                .await
+                .map_err(|error| {
+                    self.activation_failure(&prepared, state, "adopt_running_worker", error)
+                });
         }
         if matches!(
             state,
             LaunchState::Stopping | LaunchState::Stopped | LaunchState::Failed
         ) {
-            return Err(RuntimeError::new(
+            let error = RuntimeError::new(
                 RuntimeErrorCode::InvalidRequest,
                 format!("launch request is bound to incarnation in state {state:?}"),
+            );
+            return Err(self.activation_failure(
+                &prepared,
+                state,
+                "reject_terminal_lifecycle_state",
+                error,
             ));
         }
 
@@ -492,7 +523,10 @@ impl Supervisor {
             self.backend
                 .start_host(&handle)
                 .await
-                .map_err(map_backend)?;
+                .map_err(map_backend)
+                .map_err(|error| {
+                    self.activation_failure(&prepared, state, "start_session_host", error)
+                })?;
             append_event(
                 &self.config.lifecycle_log,
                 "supervisor.host_started",
@@ -503,7 +537,10 @@ impl Supervisor {
 
         let authenticated = self
             .authenticate_host(handle.incarnation_id(), handle.runtime_dir())
-            .await?;
+            .await
+            .map_err(|error| {
+                self.activation_failure(&prepared, state, "authenticate_started_host", error)
+            })?;
         crash_if("before_grant_commit");
         let grant = self
             .registry
@@ -513,12 +550,19 @@ impl Supervisor {
                 authenticated.effective_limits,
             )
             .await
-            .map_err(map_registry)?;
+            .map_err(map_registry)
+            .map_err(|error| {
+                self.activation_failure(&prepared, state, "commit_execution_grant", error)
+            })?;
+        state = LaunchState::Starting;
         crash_if("after_grant_commit");
         self.backend
             .enable_long_lived(&handle)
             .await
-            .map_err(map_backend)?;
+            .map_err(map_backend)
+            .map_err(|error| {
+                self.activation_failure(&prepared, state, "enable_long_lived_runtime", error)
+            })?;
         let accepted = self
             .send_grant(
                 &handle,
@@ -529,18 +573,28 @@ impl Supervisor {
                 &authenticated,
                 &grant,
             )
-            .await?;
+            .await
+            .map_err(|error| {
+                self.activation_failure(&prepared, state, "deliver_execution_grant", error)
+            })?;
         crash_if("after_grant_delivery");
         self.registry
             .mark_running(handle.incarnation_id().clone())
             .await
-            .map_err(map_registry)?;
+            .map_err(map_registry)
+            .map_err(|error| {
+                self.activation_failure(&prepared, state, "commit_running_state", error)
+            })?;
         append_event(
             &self.config.lifecycle_log,
             "supervisor.launch_running",
             serde_json::json!({"soulId":soul_id,"incarnationId":handle.incarnation_id(),"containerId":handle.container_id(),"workerPid":accepted.worker_pid,"workerLaunchCount":accepted.worker_launch_count}),
         );
-        let view = find_view(&self.registry, handle.incarnation_id()).await?;
+        let view = find_view(&self.registry, handle.incarnation_id())
+            .await
+            .map_err(|error| {
+                self.activation_failure(&prepared, state, "load_running_view", error)
+            })?;
         Ok(LaunchResult {
             view,
             worker_pid: accepted.worker_pid,
@@ -549,6 +603,21 @@ impl Supervisor {
             effective_limits: authenticated.effective_limits,
             fixture_evidence: accepted.fixture_evidence,
         })
+    }
+
+    fn activation_failure(
+        &self,
+        prepared: &PreparedLaunch,
+        state: LaunchState,
+        stage: &'static str,
+        error: RuntimeError,
+    ) -> RuntimeError {
+        append_event(
+            &self.config.lifecycle_log,
+            "supervisor.activation_failed",
+            activation_failure_data(prepared, state, stage, &error),
+        );
+        error
     }
 
     async fn terminal_input(
@@ -1354,7 +1423,13 @@ mod host_ipc_timeout_tests {
 
 #[cfg(test)]
 mod release_scope_tests {
-    use super::{append_event, lifecycle_secrets, release_qualified_workload};
+    use super::{
+        activation_failure_data, append_event, lifecycle_secrets, release_qualified_workload,
+    };
+    use crate::registry::PreparedLaunch;
+    use freshell_runtime_protocol::{
+        IncarnationId, LaunchNonce, LaunchState, RuntimeError, RuntimeErrorCode, SoulId,
+    };
 
     #[test]
     fn direct_terminal_launch_cannot_bypass_live_qualification_scope() {
@@ -1402,6 +1477,52 @@ mod release_scope_tests {
         assert!(!second_log.contains("second-secret-value"));
         assert!(first_log.contains("***REDACTED***"));
         assert!(second_log.contains("***REDACTED***"));
+    }
+
+    #[test]
+    fn activation_failure_diagnostic_names_the_exact_stage_and_redacts_detail() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("activation.jsonl");
+        let secret = "activation-secret-never-persist";
+        lifecycle_secrets()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(log.clone(), secret.into());
+        let prepared = PreparedLaunch {
+            soul_id: SoulId::new(),
+            incarnation_id: IncarnationId::new(),
+            launch_nonce: LaunchNonce::new(),
+            state: LaunchState::Created,
+            intent_revision: 7,
+            existing_request: false,
+        };
+        let error = RuntimeError::new(
+            RuntimeErrorCode::HostUnreachable,
+            format!("prepare provider bootstrap failed: {secret}"),
+        );
+
+        append_event(
+            &log,
+            "supervisor.activation_failed",
+            activation_failure_data(
+                &prepared,
+                LaunchState::Starting,
+                "deliver_execution_grant",
+                &error,
+            ),
+        );
+
+        let contents = std::fs::read_to_string(log).unwrap();
+        assert!(!contents.contains(secret));
+        let event: serde_json::Value = serde_json::from_str(contents.trim()).unwrap();
+        assert_eq!(event["event"], "supervisor.activation_failed");
+        assert_eq!(event["data"]["stage"], "deliver_execution_grant");
+        assert_eq!(event["data"]["launchState"], "starting");
+        assert_eq!(event["data"]["errorCode"], "HOST_UNREACHABLE");
+        assert!(event["data"]["errorMessage"]
+            .as_str()
+            .unwrap()
+            .contains("***REDACTED***"));
     }
 }
 
@@ -1530,6 +1651,23 @@ pub(crate) fn append_event(path: &Path, event: &str, data: serde_json::Value) {
         }
         Err(error) => eprintln!("supervisor lifecycle log unavailable: {error}"),
     }
+}
+
+fn activation_failure_data(
+    prepared: &PreparedLaunch,
+    state: LaunchState,
+    stage: &'static str,
+    error: &RuntimeError,
+) -> serde_json::Value {
+    serde_json::json!({
+        "soulId": prepared.soul_id,
+        "incarnationId": prepared.incarnation_id,
+        "intentRevision": prepared.intent_revision,
+        "launchState": state,
+        "stage": stage,
+        "errorCode": error.code,
+        "errorMessage": error.message,
+    })
 }
 
 fn set_mode(path: &Path, mode: u32) -> Result<(), String> {

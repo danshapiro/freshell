@@ -2950,6 +2950,132 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn exact_resume_replacement_requires_verified_empty_and_keeps_one_writer() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry = Registry::open(dir.path(), None).unwrap();
+        let soul = SoulId::new();
+        let native_session_id = "ses_exact_recovery";
+        let terminal = TerminalLaunchSpec {
+            terminal_id: "terminal-exact-resume".into(),
+            stream_id: "stream-exact-resume".into(),
+            mode: "opencode".into(),
+            program: "opencode".into(),
+            args: vec!["--model".into(), "opencode/big-pickle".into()],
+            env: std::collections::BTreeMap::from([(
+                "HOME".into(),
+                "/home/freshell/provider".into(),
+            )]),
+            cwd: "/workspace".into(),
+            run_as_uid: 65_534,
+            run_as_gid: 0,
+            cols: 80,
+            rows: 24,
+            project_key: "project-exact-resume".into(),
+            workspace_path: "/workspace".into(),
+            git_common_dir: None,
+            create_request_id: Some("create-exact-resume".into()),
+            resume_session_id: None,
+            provider_model: Some("opencode/big-pickle".into()),
+            provider_sandbox: None,
+            provider_permission_mode: None,
+            provider_bootstrap_files: Vec::new(),
+        };
+        let mut launch = prep(soul.clone(), RequestId::new(), "exact-resume");
+        launch.provider = "opencode".into();
+        launch.provider_store_id = "store-exact-resume".into();
+        launch.native_session_id = Some(native_session_id.into());
+        launch.terminal = Some(terminal.clone());
+        let original = registry.prepare_launch(launch).await.unwrap();
+        let conn = open_connection(&registry.inner.db_path).unwrap();
+        conn.execute(
+            "UPDATE incarnations SET docker_daemon_id=?1,container_id=?2,image_ref='phase3-test-image',runtime_dir=?3,host_binary_path=?4,immutable_config_digest='sha256:phase3-test',launch_state='running' WHERE incarnation_id=?5",
+            params![
+                DockerDaemonId::new().as_str(),
+                format!("container-{}", original.incarnation_id),
+                format!("/tmp/freshell-runtime-test/{}", original.incarnation_id),
+                format!("/tmp/freshell-runtime-test/{}/host", original.incarnation_id),
+                original.incarnation_id.as_str(),
+            ],
+        )
+        .unwrap();
+        drop(conn);
+        let resume_spec =
+            freshell_agent_runtime::build_resume_spec(freshell_agent_runtime::ResumeSpecInput {
+                provider: "opencode",
+                provider_store_id: "store-exact-resume",
+                native_session_id,
+                terminal: &terminal,
+                provider_version: Some("1.18.21".into()),
+                creation_seed_ref: "seed".into(),
+                checkpoint_revision: 0,
+                evidence_revision: 0,
+                never_dispatched: false,
+            })
+            .unwrap();
+        let resume_spec = registry
+            .store_verified_resume_spec(soul.clone(), resume_spec)
+            .await
+            .unwrap();
+        let start = registry
+            .begin_recovery(
+                soul.clone(),
+                RecoveryTrigger::ProviderExit,
+                RecoveryPath::NativeResume,
+            )
+            .await
+            .unwrap();
+
+        let not_empty = registry
+            .prepare_replacement(
+                start.clone(),
+                Some(terminal.clone()),
+                Some(resume_spec.clone()),
+                RecoveryPath::NativeResume,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            not_empty,
+            RegistryError::RecoveryBlocked { ref reason, .. }
+                if reason == "OLD_RUNTIME_NOT_VERIFIED_EMPTY"
+        ));
+
+        registry
+            .mark_stop_outcome(original.incarnation_id.clone(), StopOutcome::VerifiedEmpty)
+            .await
+            .unwrap();
+        let replacement = registry
+            .prepare_replacement(
+                start,
+                Some(terminal),
+                Some(resume_spec),
+                RecoveryPath::NativeResume,
+            )
+            .await
+            .unwrap();
+        assert_eq!(replacement.prior_incarnation_id, original.incarnation_id);
+        assert_eq!(
+            replacement
+                .resume_spec
+                .as_ref()
+                .unwrap()
+                .provider_session
+                .native_session_id,
+            native_session_id
+        );
+        assert!(replacement.terminal.is_some());
+        let conn = open_connection(&registry.inner.db_path).unwrap();
+        let claims: u64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM writer_claims WHERE soul_id=?1 AND native_session_id=?2",
+                params![soul.as_str(), native_session_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(claims, 1, "exact recovery keeps one native-session writer");
+    }
+
+    #[tokio::test]
     async fn interrupted_prepared_replacement_is_retired_without_claiming_unknown_docker_object() {
         let dir = tempfile::tempdir().unwrap();
         let registry = Registry::open(dir.path(), None).unwrap();
