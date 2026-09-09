@@ -20,7 +20,7 @@ on the wrong platform.
   and Python 3 — required for `node-gyp` to compile `node-pty`.
 - No extra download tools are needed: `scripts/prepare-bundled-node.ts` fetches
   the standalone Node binary and headers over Node's own `http`/`https` and
-  extracts them with the bundled `tar` and `extract-zip` packages (not external
+  extracts them with the bundled `tar` package and a member-only `yauzl` reader (not external
   `curl`/`tar`/`unzip`).
 
 ## Option A — from a native Windows shell

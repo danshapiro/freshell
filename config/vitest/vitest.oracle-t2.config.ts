@@ -48,11 +48,8 @@ export default defineConfig({
     testTimeout: 240000,
     hookTimeout: 240000,
     pool: 'forks',
-    poolOptions: {
-      forks: {
-        singleFork: true,
-      },
-    },
+    minWorkers: 1,
+    maxWorkers: 1,
     fileParallelism: false,
   },
 })

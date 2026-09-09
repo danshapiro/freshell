@@ -48,12 +48,7 @@ export default defineConfig({
     hookTimeout: 30000,
     // Maximum parallelization settings
     pool: 'threads',
-    poolOptions: {
-      threads: {
-        singleThread: false,
-        isolate: true,
-      },
-    },
+    isolate: true,
     fileParallelism: true,
     maxConcurrency: 10,
     sequence: {
