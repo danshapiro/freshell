@@ -9,7 +9,6 @@
  */
 import { execFileSync } from 'node:child_process'
 import { randomBytes } from 'node:crypto'
-import { stripVTControlCharacters } from 'node:util'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
@@ -26,7 +25,7 @@ import {
 import { openPanePicker } from '../helpers/pane-picker.js'
 import { TerminalHelper } from '../helpers/terminal-helpers.js'
 import { TestHarness } from '../helpers/test-harness.js'
-import { OPENCODE_NATIVE_HISTORY_SCRIPT, nativeAssistantProof, type NativeAssistantTurn } from '../helpers/opencode-native-history.js'
+import { OPENCODE_NATIVE_HISTORY_SCRIPT, nativeAssistantProof, openCodeTerminalReady, type NativeAssistantTurn } from '../helpers/opencode-native-history.js'
 import type { ProviderQualificationRow } from '../../../scripts/testing/provider-qualification-receipt.js'
 
 function leavesByMode(node: any, mode: string): any[] {
@@ -209,10 +208,14 @@ async function waitForReplacementPrompt(
   paneId: string,
   view: ManagedRuntimeView,
 ): Promise<void> {
+  const terminalId = view.terminalId
+  if (!terminalId) throw new Error('replacement provider has no terminal identity')
+  let diagnostic: Record<string, unknown> = { soulId: view.soulId, incarnationId: view.incarnationId, terminalId }
   let sourceEpoch = ''
   let cursor = 0
   let sourceText = ''
-  await waitForValue('replacement provider prompt in its actual source epoch and browser', async () => {
+  try {
+    await waitForValue('replacement provider input readiness in its actual source epoch and browser', async () => {
     // Inventory RUNNING means the process exists, not that its TUI has begun
     // reading input. Observe the NEW host's own output before typing: otherwise
     // a pre-raw-mode PTY echo can swallow the recall request at startup.
@@ -220,32 +223,41 @@ async function waitForReplacementPrompt(
       rig.supervisor,
       rig.runtime.terminalReadOutputBody(view.soulId, cursor, 256 * 1024, await rig.controlEpoch()),
     ), 'terminal_output')
-    if (output.incarnationId !== view.incarnationId || !output.streamEpoch) return null
+    diagnostic = { ...diagnostic, sourceIncarnationId: output.incarnationId, sourceStreamEpoch: output.streamEpoch, sourceTerminalId: output.terminalId, sourceExited: output.exited }
+    if (output.incarnationId !== view.incarnationId || output.terminalId !== terminalId || !output.streamEpoch || output.exited) return null
     if (output.streamEpoch !== sourceEpoch || output.resetRequired) {
       sourceEpoch = output.streamEpoch
       sourceText = ''
       cursor = 0
     }
     for (const frame of output.frames ?? []) {
-      if (frame.streamEpoch !== sourceEpoch || frame.terminalId !== view.terminalId) {
+      if (frame.streamEpoch !== sourceEpoch || frame.terminalId !== terminalId) {
         throw new Error('replacement prompt frame has mismatched ownership')
       }
-      sourceText = (sourceText + stripVTControlCharacters(frame.data)).slice(-512 * 1024)
+      sourceText = (sourceText + frame.data).slice(-512 * 1024)
       cursor = Math.max(cursor, frame.seqEnd)
     }
-    if (!sourceText.includes('Ask anything')) return null
+    diagnostic = { ...diagnostic, sourceReady: openCodeTerminalReady(sourceText), cursor }
+    if (!openCodeTerminalReady(sourceText)) return null
     const leaf = leavesByMode(await harness.getPaneLayout(tabId), 'opencode').find((row) => row.id === paneId)
+    diagnostic = { ...diagnostic, paneStreamId: leaf?.content?.streamId, paneIncarnationId: leaf?.content?.incarnationId }
     if (leaf?.content?.streamId !== sourceEpoch || leaf?.content?.incarnationId !== view.incarnationId) return null
     const rendered = await page.evaluate((terminalId) => {
       const h = window.__FRESHELL_TEST_HARNESS__
       return { text: h?.getTerminalBuffer(terminalId), modes: h?.getTerminalModes?.(terminalId) }
-    }, view.terminalId)
-    if (!rendered.text?.includes('Ask anything') || !rendered.modes?.bracketedPasteMode) return null
+    }, terminalId)
+    diagnostic = { ...diagnostic, browserInputReady: rendered.modes?.bracketedPasteMode, browserModelBanner: rendered.text?.includes('Big Pickle') }
+    if (!rendered.text?.includes('Build') || !rendered.text?.includes('Big Pickle') || !rendered.modes?.bracketedPasteMode) return null
     rig.runtime.assert('PC-OPENCODE', true, 'replacement TUI prompt is source-observed and rendered before input', {
       soulId: view.soulId, incarnationId: view.incarnationId, terminalId: view.terminalId, streamEpoch: sourceEpoch, cursor,
     })
     return true
-  }, 120_000)
+    }, 120_000)
+  } catch (error) {
+    // Keep identity/readiness facts, never conversation text, in failure receipts.
+    rig.runtime.writeEvidence('browser/opencode-replacement-readiness.json', diagnostic)
+    throw error
+  }
 }
 
 async function paneSessionId(
