@@ -68,6 +68,7 @@ export function readClaudeNativeHistory(projectsRoot: string, exactSessionId: st
     const model = requiredString(message.model, 'Claude assistant model')
     const effort = requiredString(row.effort ?? message.effort, 'Claude assistant reasoning effort')
     turns.push({
+      nativeEvidence: { kind: 'identified_message', turnId, messageId, parentMessageId: optionalString(row.parentUuid) },
       turnId,
       messageId,
       parentMessageId: optionalString(row.parentUuid),

@@ -1,6 +1,6 @@
 import path from 'node:path'
 
-import { findExactSessionDirectories, readBoundedJsonl, safeOpaqueId } from './safe-io.js'
+import { findExactSessionDirectories, readBoundedJsonlWithPositions, safeOpaqueId } from './safe-io.js'
 import {
   MAX_NATIVE_TURNS,
   NATIVE_HISTORY_SCHEMA_VERSION,
@@ -66,8 +66,11 @@ function contentTextAndTools(message: Record<string, any>): { text: string; call
 }
 
 /**
- * Reads Amplifier app-cli 0.1.1's exact session directory after provider stop.
- * transcript.jsonl is content authority; prompt/store events prove completed persistence.
+ * Reads Amplifier's exact durable session after provider stop. The pinned
+ * product exposes ordered transcript and lifecycle records, but does not
+ * promise a message/turn identifier. We therefore prove continuity using its
+ * native append positions and exact persisted record digests rather than
+ * fabricating IDs for Freshell's certificate.
  */
 export function readAmplifierNativeHistory(projectsRoot: string, exactSessionId: string): NativeHistory {
   const sessionId = safeOpaqueId(exactSessionId, 'Amplifier native session id')
@@ -78,7 +81,9 @@ export function readAmplifierNativeHistory(projectsRoot: string, exactSessionId:
   if (path.basename(sessionDir) !== sessionId || path.basename(path.dirname(sessionDir)) !== 'sessions') {
     throw new Error('Amplifier session path does not exactly bind the native session id')
   }
-  const events = readBoundedJsonl(path.join(sessionDir, 'events.jsonl'), 'Amplifier native events')
+
+  const positionedEvents = readBoundedJsonlWithPositions(path.join(sessionDir, 'events.jsonl'), 'Amplifier native events')
+  const events = positionedEvents.map((record) => record.value)
   for (const event of events) {
     if (event.session_id !== sessionId) throw new Error('Amplifier native event has a conflicting exact session id')
     const schema = object(event.schema, 'Amplifier event schema')
@@ -92,68 +97,74 @@ export function readAmplifierNativeHistory(projectsRoot: string, exactSessionId:
       const name = optionalString(event.tool_name ?? data.tool_name ?? data.name)
       return { type: 'tool:pre', ...(name ? { name } : {}) }
     }), 'Amplifier native tool events')
-  const completions = new Map<string, { completedAt: string }>()
-  const promptCompletions = new Set<string>()
-  for (const event of events) {
-    const eventId = optionalString(event.request_id ?? event.span_id)
-    if (event.event === 'prompt:complete') {
-      if (!eventId) throw new Error('Amplifier prompt:complete lacks a native request/span id')
-      if (event.status !== undefined && event.status !== 'ok') continue
-      promptCompletions.add(eventId)
-    }
-    if (event.event === 'cleanup:store_end') {
-      if (!eventId) throw new Error('Amplifier cleanup:store_end lacks a native request/span id')
-      if (event.status !== undefined && event.status !== 'ok') continue
-      if (!promptCompletions.has(eventId)) throw new Error('Amplifier stored completion is not correlated to prompt:complete')
-      if (completions.has(eventId)) throw new Error('Amplifier duplicates a native completed turn id')
-      completions.set(eventId, { completedAt: validTimestamp(event.ts, 'Amplifier stored completion timestamp') })
-    }
-  }
-  if (completions.size === 0) throw new Error('Amplifier exact native session has no stored completed prompt')
 
-  const transcript = readBoundedJsonl(path.join(sessionDir, 'transcript.jsonl'), 'Amplifier native transcript')
-  const turns: NativeAssistantTurn[] = []
-  const messageIds = new Set<string>()
-  let pendingCalls: NativeToolCall[] = []
-  for (const message of transcript) {
-    if (message.role === 'user') {
-      pendingCalls = []
+  type Completion = { completedAt: string, ordinal: number, eventSha256: string }
+  const completions: Completion[] = []
+  let pendingPromptId: string | null | undefined
+  let promptPending = false
+  for (const record of positionedEvents) {
+    const event = record.value
+    if (event.event === 'prompt:complete') {
+      if (event.status !== undefined && event.status !== 'ok') continue
+      if (promptPending) throw new Error('Amplifier native events contain overlapping successful prompts; ordinal continuity is ambiguous')
+      pendingPromptId = optionalString(event.request_id ?? event.span_id)
+      promptPending = true
       continue
     }
-    if (message.role === 'tool') {
-      pendingCalls.push({ type: 'tool', ...(optionalString(message.name) ? { name: optionalString(message.name)! } : {}) })
-      continue
+    if (event.event !== 'cleanup:store_end' || (event.status !== undefined && event.status !== 'ok')) continue
+    if (!promptPending) throw new Error('Amplifier stored completion lacks a preceding successful prompt')
+    const cleanupId = optionalString(event.request_id ?? event.span_id)
+    if (pendingPromptId && cleanupId && pendingPromptId !== cleanupId) {
+      throw new Error('Amplifier stored completion conflicts with the provider-supplied prompt identity')
     }
-    if (message.role !== 'assistant') continue
+    // Missing IDs are legitimate in the pinned schema. Event order is native
+    // evidence because qualification serializes prompt dispatch in one writer.
+    completions.push({
+      completedAt: validTimestamp(event.ts, 'Amplifier stored completion timestamp'),
+      ordinal: completions.length + 1,
+      eventSha256: record.recordSha256,
+    })
+    promptPending = false
+    pendingPromptId = undefined
+  }
+  if (promptPending) throw new Error('Amplifier native events end with an unpersisted successful prompt')
+  if (completions.length === 0) throw new Error('Amplifier exact native session has no stored completed prompt')
+
+  const transcript = readBoundedJsonlWithPositions(path.join(sessionDir, 'transcript.jsonl'), 'Amplifier native transcript')
+  const assistantRecords = transcript.filter((record) => record.value.role === 'assistant')
+  if (assistantRecords.length !== completions.length) {
+    throw new Error('Amplifier completed prompts do not map one-to-one to append-only assistant records')
+  }
+  if (assistantRecords.length > MAX_NATIVE_TURNS) throw new Error('Amplifier native completed turns exceed the evidence bound')
+
+  const turns: NativeAssistantTurn[] = assistantRecords.map((record, index) => {
+    const message = record.value
     const materialized = contentTextAndTools(message)
-    pendingCalls.push(...materialized.calls)
-    const metadata = message.metadata === undefined ? {} : object(message.metadata, 'Amplifier assistant metadata')
-    const turnId = optionalString(message.request_id ?? message.turn_id ?? metadata.request_id ?? metadata.turn_id)
-    if (!turnId || !completions.has(turnId)) continue
-    const messageId = requiredString(message.id ?? message.message_id ?? metadata.id ?? metadata.message_id, 'Amplifier assistant message id')
-    if (messageIds.has(messageId)) throw new Error(`Amplifier duplicates assistant message id ${messageId}`)
-    messageIds.add(messageId)
-    turns.push({
-      turnId,
-      messageId,
-      parentMessageId: optionalString(message.parent_id ?? metadata.parent_id),
-      completedAt: completions.get(turnId)!.completedAt,
+    const completion = completions[index]
+    return {
+      nativeEvidence: {
+        kind: 'append_only_record',
+        recordIndex: record.recordIndex,
+        byteStart: record.byteStart,
+        byteEnd: record.byteEnd,
+        recordSha256: record.recordSha256,
+        prefixSha256Before: record.prefixSha256Before,
+        completionEventOrdinal: completion.ordinal,
+        completionEventSha256: completion.eventSha256,
+      },
+      completedAt: completion.completedAt,
       text: materialized.text,
-      // The pinned hook schema does not guarantee a turn correlation id on
-      // tool:pre. Conservatively attach every exact-session invocation so a
-      // no-tools qualification can never hide one.
-      toolCalls: boundedToolCalls([...pendingCalls, ...eventToolCalls], 'Amplifier native tool calls'),
+      // The pinned hook schema does not correlate tool:pre to a specific turn.
+      // Conservatively attach every exact-session invocation so no-tools
+      // certification can never hide provider-native tool activity.
+      toolCalls: boundedToolCalls([...materialized.calls, ...eventToolCalls], 'Amplifier native tool calls'),
       resolvedProvider: profile.provider,
       resolvedModel: profile.model,
       resolvedReasoningEffort: profile.effort,
       providerProvenance: 'amplifier-session:config.provider',
       modelProvenance: 'amplifier-session:config.default_model',
       reasoningEffortProvenance: 'amplifier-session:config.reasoning_effort',
-    })
-    pendingCalls = []
-    if (turns.length > MAX_NATIVE_TURNS) throw new Error('Amplifier native completed turns exceed the evidence bound')
-  }
-  if (turns.length === 0) throw new Error('Amplifier exact native session has no correlated completed assistant response with native ids')
-  if (turns.length !== completions.size) throw new Error('Amplifier completed prompts do not map one-to-one to stored assistant messages')
+    }
+  })
   return { schemaVersion: NATIVE_HISTORY_SCHEMA_VERSION, provider: 'amplifier', nativeSessionId: sessionId, turns }
 }

@@ -107,6 +107,7 @@ export function readCodexNativeHistory(sessionsRoot: string, exactThreadId: stri
     // Codex rollouts do not promise a response_item id; the native completed turn UUID is authoritative.
     const messageId = response?.id ?? turnId
     turns.push({
+      nativeEvidence: { kind: 'identified_message', turnId, messageId, parentMessageId: optionalString(response?.parent) },
       turnId,
       messageId,
       parentMessageId: response?.parent ?? null,

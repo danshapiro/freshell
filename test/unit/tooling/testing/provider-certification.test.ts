@@ -261,12 +261,26 @@ describe('provider qualification receipt v2', () => {
       nativeSessionId: '11111111-1111-4111-8111-111111111111',
       nonceSha256: 'd'.repeat(64),
       nativeTurnProofs: stages.map((stage, index) => ({
-        schemaVersion: 1 as const,
+        schemaVersion: 2 as const,
         stage,
         nativeSessionId: '11111111-1111-4111-8111-111111111111',
-        turnId: `turn-${index + 1}`,
-        messageId: `message-${index + 1}`,
-        parentMessageId: index === 0 ? 'user-1' : `user-${index + 1}`,
+        nativeEvidence: provider === 'amplifier'
+          ? {
+              kind: 'append_only_record' as const,
+              recordIndex: index * 2 + 1,
+              byteStart: 100 + index * 100,
+              byteEnd: 180 + index * 100,
+              recordSha256: String(index + 4).repeat(64),
+              prefixSha256Before: String(index + 7).repeat(64),
+              completionEventOrdinal: index + 1,
+              completionEventSha256: String(index + 1).repeat(64),
+            }
+          : {
+              kind: 'identified_message' as const,
+              turnId: `turn-${index + 1}`,
+              messageId: `message-${index + 1}`,
+              parentMessageId: index === 0 ? 'user-1' : `user-${index + 1}`,
+            },
         completedAt: `2026-09-01T00:00:0${index + 1}.000Z`,
         responseSha256: String(index + 1).repeat(64),
         responseContainsNonce: true as const,
@@ -604,9 +618,57 @@ describe('provider qualification receipt v2', () => {
     expect(() => evidenceFixture([{
       ...row,
       nativeTurnProofs: row.nativeTurnProofs.map((proof, index) => index === 2
-        ? { ...proof, messageId: row.nativeTurnProofs[1].messageId }
+        ? { ...proof, nativeEvidence: { ...proof.nativeEvidence, messageId: (row.nativeTurnProofs[1].nativeEvidence as any).messageId } }
         : proof),
     }])).toThrow(/distinct.*message/i)
+  })
+
+
+  it('accepts Amplifier continuity from native append positions without fabricated message ids', () => {
+    const row = providerRow('amplifier') as any
+    row.nativeTurnProofs = row.nativeTurnProofs.map((proof: any, index: number) => ({
+      ...proof,
+      schemaVersion: 2,
+      nativeEvidence: {
+        kind: 'append_only_record',
+        recordIndex: 2 * index + 1,
+        byteStart: 100 + index * 100,
+        byteEnd: 180 + index * 100,
+        recordSha256: String(index + 4).repeat(64),
+        prefixSha256Before: String(index + 7).repeat(64),
+        completionEventOrdinal: index + 1,
+        completionEventSha256: String(index + 1).repeat(64),
+      },
+    }))
+    for (const proof of row.nativeTurnProofs) {
+      delete proof.turnId
+      delete proof.messageId
+      delete proof.parentMessageId
+    }
+    expect(() => evidenceFixture([row])).not.toThrow()
+  })
+
+  it('still requires provider-native IDs where the provider actually exposes them', () => {
+    const row = providerRow('codex') as any
+    row.nativeTurnProofs[1] = {
+      ...row.nativeTurnProofs[1],
+      nativeEvidence: { ...row.nativeTurnProofs[1].nativeEvidence, messageId: undefined },
+    }
+    expect(() => evidenceFixture([row])).toThrow(/message.*id|identified/i)
+  })
+
+  it('rejects fabricated Amplifier IDs in place of append-position evidence', () => {
+    const row = providerRow('amplifier') as any
+    row.nativeTurnProofs = row.nativeTurnProofs.map((proof: any, index: number) => ({
+      ...proof,
+      nativeEvidence: {
+        kind: 'identified_message',
+        turnId: `invented-turn-${index}`,
+        messageId: `invented-message-${index}`,
+        parentMessageId: null,
+      },
+    }))
+    expect(() => evidenceFixture([row])).toThrow(/append|native evidence|Amplifier/i)
   })
 
   it('requires zero native tool calls for recall and native model/effort provenance', () => {
