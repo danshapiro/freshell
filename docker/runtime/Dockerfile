@@ -45,5 +45,12 @@ RUN apt-get update \
 COPY --chmod=0755 docker/runtime/amplifier-onecli /usr/local/bin/freshell-amplifier-onecli
 COPY --chmod=0644 docker/runtime/amplifier-onecli-haiku-low.yaml /etc/freshell/amplifier-onecli-haiku-low.yaml
 
+# FreshClaude/Kilroy run inside the soul host, so their JS SDK bridge and its
+# pinned dependency must be part of the workload image rather than resolved
+# through a web-server worktree path.
+COPY crates/freshell-claude-sidecar/package.json crates/freshell-claude-sidecar/package-lock.json /opt/freshell-claude-sidecar/
+RUN cd /opt/freshell-claude-sidecar && npm ci --omit=dev --ignore-scripts
+COPY crates/freshell-claude-sidecar/*.mjs /opt/freshell-claude-sidecar/
+
 WORKDIR /workspace
 CMD ["/bin/bash"]
