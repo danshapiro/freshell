@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto'
+import { stripVTControlCharacters } from 'node:util'
 
 export type NativeAssistantTurn = {
   messageId: string
@@ -61,4 +62,12 @@ export function nativeAssistantProof(nativeSessionId: string, turn: NativeAssist
     providerId: turn.providerId,
     responseSha256: createHash('sha256').update(turn.text).digest('hex'),
   }
+}
+
+/** Resumed conversations omit the home-screen placeholder. Observe actual TUI input mode. */
+export function openCodeTerminalReady(rawOutput: string): boolean {
+  const modes = [...rawOutput.matchAll(/\x1b\[\?2004([hl])/g)]
+  if (modes.at(-1)?.[1] !== 'h') return false
+  const rendered = stripVTControlCharacters(rawOutput)
+  return rendered.includes('Build') && rendered.includes('Big Pickle')
 }
