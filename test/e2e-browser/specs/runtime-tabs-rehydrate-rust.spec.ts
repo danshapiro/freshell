@@ -286,8 +286,9 @@ test.describe.serial('Phase 4 managed-runtime tab rehydration', () => {
 
       const statusPanel = page.getByRole('complementary', { name: 'Managed agent recovery' })
       await expect(statusPanel).toBeVisible({ timeout: 30_000 })
-      const summary = statusPanel.locator('summary')
-      if (!(await statusPanel.locator('details').evaluate((details) => details.open))) {
+      const panelDetails = statusPanel.locator(':scope > details')
+      const summary = panelDetails.locator(':scope > summary')
+      if (!(await panelDetails.evaluate((details: HTMLDetailsElement) => details.open))) {
         await summary.click()
       }
 
