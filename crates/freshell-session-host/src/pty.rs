@@ -46,6 +46,7 @@ impl HostedPty {
         state_dir: &Path,
         incarnation_id: IncarnationId,
         launch: &TerminalLaunchSpec,
+        child_secret_env: BTreeMap<String, String>,
         prepared_codex: Option<PreparedCodexLaunch>,
     ) -> Result<Self, String> {
         launch.validate().map_err(|e| e.message)?;
@@ -109,6 +110,7 @@ impl HostedPty {
             rows: launch.rows,
         };
         let mut provider_env = launch.env.clone();
+        provider_env.extend(child_secret_env);
         // Rootless Docker maps the host user's bind-mounted workspace to
         // container uid 0, while the provider intentionally runs as uid
         // 65534. Tell Git that this one already-approved workspace is safe

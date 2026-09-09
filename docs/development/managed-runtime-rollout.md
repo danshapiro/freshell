@@ -104,14 +104,14 @@ policy rather than relying on a provider default:
 }
 ```
 
-For Amplifier, point
-`FRESHELL_MANAGED_AMPLIFIER_SETTINGS_FILE` at the settings file that selects
-the approved lowest-cost model and point
-`FRESHELL_MANAGED_AMPLIFIER_OAUTH_FILE` at its separate OAuth token file.
-Defaults are `~/.amplifier/settings.yaml` and
-`~/.amplifier/openai-chatgpt-oauth.json`. Both are canonical, reference-only
-bootstrap inputs; do not inline their contents in settings, commands, or test
-evidence.
+For Amplifier, optionally point
+`FRESHELL_MANAGED_AMPLIFIER_ONECLI_KEYS_FILE` at the approved private
+`~/.amplifier/keys.env` (that canonical file is the default), and set the
+credential-free `FRESHELL_MANAGED_AMPLIFIER_ONECLI_ENDPOINT` explicitly. The
+runtime image pins `claude-haiku-4-5-20251001` with `low` reasoning; the native
+`session:config` event must prove both. The keys file is parsed, never sourced,
+and its resolved values exist only in the provider child environment. A raw
+OAuth file, a different reference, or an unapproved profile fails closed.
 
 These values and bootstrap paths make a live campaign reproducible. They do
 not certify or enable Claude, Codex, or Amplifier; the capability manifest

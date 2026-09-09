@@ -6,6 +6,7 @@ pub mod limits;
 pub mod loss_report;
 pub mod migration;
 pub mod notice_outbox;
+pub mod qualification_evidence;
 pub mod recovery;
 pub mod registry;
 pub mod repair;

@@ -5,7 +5,9 @@
 //! terminal launch or the deterministic native-session fixture.
 
 use crate::registry::RecoveryContext;
-use freshell_agent_runtime::{build_resume_spec, ResumeSpecInput, PROVIDER_HOME};
+use freshell_agent_runtime::{
+    build_resume_spec, pinned_provider_version, ResumeSpecInput, PROVIDER_HOME,
+};
 use freshell_runtime_protocol::{
     AllocationState, CheckpointReference, CredentialReference, DurablePosition, IdentityProvenance,
     ProviderSessionRef, ProviderVolumeRef, RecoveryBlockReason, RecoveryPath, RecoveryProbe,
@@ -176,14 +178,6 @@ fn enrich_resume_spec(
     spec
 }
 
-fn pinned_provider_version(provider: &str) -> Option<String> {
-    match provider {
-        "claude" => Some("2.1.263".into()),
-        "opencode" => Some("1.18.21".into()),
-        _ => None,
-    }
-}
-
 fn blocked(reason: RecoveryBlockReason, message: String) -> RecoveryProbe {
     RecoveryProbe::Blocked {
         path: RecoveryPath::NativeResume,
@@ -284,5 +278,23 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn every_terminal_resume_adapter_uses_the_checked_in_provider_pin() {
+        assert_eq!(
+            pinned_provider_version("claude").as_deref(),
+            Some("2.1.263")
+        );
+        assert_eq!(pinned_provider_version("codex").as_deref(), Some("0.147.0"));
+        assert_eq!(
+            pinned_provider_version("opencode").as_deref(),
+            Some("1.18.21")
+        );
+        assert_eq!(
+            pinned_provider_version("amplifier").as_deref(),
+            Some("0.1.1")
+        );
+        assert_eq!(pinned_provider_version("not-a-provider"), None);
     }
 }

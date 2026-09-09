@@ -383,6 +383,12 @@ impl RuntimeBackend for DockerEngineBackend {
                     source.display()
                 ));
             }
+            for (index, source) in mounts.provider_secret_files.iter().enumerate() {
+                binds.push(format!(
+                    "{}:/run/freshell-secrets/provider-{index}:ro",
+                    source.display()
+                ));
+            }
         }
         let host_env = runtime_host_environment(spec.terminal.as_ref())?;
         let cap_add: Vec<&str> = if spec.terminal.is_some() {
@@ -924,6 +930,21 @@ fn verify_inspect_config(handle: &OwnedRuntimeHandle, value: &Value) -> Result<(
                 ));
             }
         }
+        for (index, source) in expected.provider_secret_files.iter().enumerate() {
+            let source_text = source.to_string_lossy();
+            let destination = format!("/run/freshell-secrets/provider-{index}");
+            let found = mounts.iter().any(|mount| {
+                mount.get("Source").and_then(Value::as_str) == Some(source_text.as_ref())
+                    && mount.get("Destination").and_then(Value::as_str)
+                        == Some(destination.as_str())
+                    && mount.get("RW").and_then(Value::as_bool) == Some(false)
+            });
+            if !found {
+                return Err(BackendError::OwnershipMismatch(
+                    "provider secret-reference mount changed".into(),
+                ));
+            }
+        }
     }
     Ok(())
 }
@@ -1111,6 +1132,7 @@ mod tests {
             provider_sandbox: None,
             provider_permission_mode: None,
             provider_bootstrap_files: Vec::new(),
+            provider_secret_references: Vec::new(),
         };
         let env = runtime_host_environment(Some(&terminal)).unwrap();
         assert!(env
@@ -1124,19 +1146,15 @@ mod tests {
     }
 
     #[test]
-    fn amplifier_bootstrap_mounts_are_reference_only_in_docker_json() {
-        use freshell_runtime_protocol::ProviderBootstrapFile;
+    fn amplifier_onecli_secret_mount_is_reference_only_in_docker_json() {
+        use freshell_runtime_protocol::{ProviderSecretProfile, ProviderSecretReference};
 
         let root = tempfile::tempdir().unwrap();
         let workspace = tempfile::tempdir().unwrap();
-        let settings = root.path().join("settings.yaml");
-        let oauth = root.path().join("openai-chatgpt-oauth.json");
-        let settings_secret = "amplifier-settings-secret-sentinel";
-        let oauth_secret = "amplifier-oauth-secret-sentinel";
-        std::fs::write(&settings, format!("api_key: {settings_secret}\n")).unwrap();
-        std::fs::write(&oauth, format!(r#"{{"access_token":"{oauth_secret}"}}"#)).unwrap();
-        let settings = std::fs::canonicalize(settings).unwrap();
-        let oauth = std::fs::canonicalize(oauth).unwrap();
+        let keys = root.path().join("keys.env");
+        let secret = "amplifier-onecli-secret-sentinel";
+        std::fs::write(&keys, format!("ANTHROPIC_API_KEY={secret}\n")).unwrap();
+        let keys = std::fs::canonicalize(keys).unwrap();
         let workspace = std::fs::canonicalize(workspace.path()).unwrap();
         let terminal = TerminalLaunchSpec {
             terminal_id: "terminal-amplifier".into(),
@@ -1159,25 +1177,21 @@ mod tests {
             provider_reasoning_effort: None,
             provider_sandbox: None,
             provider_permission_mode: None,
-            provider_bootstrap_files: vec![
-                ProviderBootstrapFile {
-                    source_path: settings.to_string_lossy().into_owned(),
-                    provider_relative_path: ".amplifier/settings.yaml".into(),
-                },
-                ProviderBootstrapFile {
-                    source_path: oauth.to_string_lossy().into_owned(),
-                    provider_relative_path: ".amplifier/openai-chatgpt-oauth.json".into(),
-                },
-            ],
+            provider_bootstrap_files: Vec::new(),
+            provider_secret_references: vec![ProviderSecretReference {
+                source_path: keys.to_string_lossy().into_owned(),
+                profile: ProviderSecretProfile::AmplifierOnecliAnthropicHaikuLow,
+                approved_endpoint: "https://onecli.example.invalid/v1".into(),
+            }],
         };
         let mounts = docker::terminal_mounts(&terminal).unwrap();
         let binds: Vec<String> = mounts
-            .provider_bootstrap_files
+            .provider_secret_files
             .iter()
             .enumerate()
             .map(|(index, source)| {
                 format!(
-                    "{}:/run/freshell-bootstrap/provider-{index}:ro",
+                    "{}:/run/freshell-secrets/provider-{index}:ro",
                     source.display()
                 )
             })
@@ -1209,10 +1223,12 @@ mod tests {
             spec.limits.memory_bytes,
         );
         let durable_json = serde_json::to_string(&body).unwrap();
-        assert!(durable_json.contains(&settings.to_string_lossy().to_string()));
-        assert!(durable_json.contains(&oauth.to_string_lossy().to_string()));
-        assert!(!durable_json.contains(settings_secret));
-        assert!(!durable_json.contains(oauth_secret));
+        assert!(durable_json.contains(&keys.to_string_lossy().to_string()));
+        // Docker needs only the exact read-only mount. The approved endpoint is
+        // durable in the authenticated launch spec and must not be copied into
+        // the daemon's create request or labels.
+        assert!(!durable_json.contains("onecli.example.invalid"));
+        assert!(!durable_json.contains(secret));
     }
 
     #[test]

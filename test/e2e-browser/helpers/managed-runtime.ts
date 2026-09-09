@@ -13,6 +13,7 @@ import {
 import { RuntimeHarness, type SupervisorInstance } from '../../../scripts/testing/runtime-sandbox.js'
 import { RustServer } from './rust-server.js'
 import type { TestServerInfo } from './test-server.js'
+import type { QualifiableTerminalProvider } from '../../../scripts/testing/provider-qualification-selection.js'
 
 export const P2_OPENCODE_VERSION = '1.18.21'
 export const P2_OPENCODE_FREE_MODEL = 'opencode/big-pickle'
@@ -62,6 +63,7 @@ export class ManagedRuntimeBrowserRig {
   private readonly supervisorBinaryKind: 'test' | 'release'
   private readonly enabledProviders: string[]
   private readonly providerSettings: Record<string, Record<string, unknown>>
+  private qualificationSupervisorBin: string | undefined
 
   constructor(
     repoRoot = process.cwd(),
@@ -85,12 +87,26 @@ export class ManagedRuntimeBrowserRig {
 
   async start(): Promise<TestServerInfo> {
     await this.runtime.prepare()
+    this.qualificationSupervisorBin = this.buildQualificationSupervisor()
+    this.serverBin = this.buildManagedServer()
+    const selected = this.pendingQualificationProviders()
+    this.runtime.recordProviderQualificationBuild({
+      kind: selected.length ? 'qualification_fixture' : 'production',
+      serverFeatures: [selected.length ? 'managed-provider-qualification' : 'managed-runtime-v1'],
+      supervisorFeatures: selected.length ? ['provider-qualification'] : [],
+      qualificationProviders: selected,
+      serverBinary: this.serverBin,
+      supervisorBinary: this.qualificationSupervisorBin
+        ?? (this.supervisorBinaryKind === 'test'
+          ? this.runtime.testSupervisorBinary
+          : this.runtime.releaseSupervisorBinary),
+    })
     this.supervisor = await this.runtime.startSupervisor({
       scenarioId: 'browser-managed-runtime',
       binaryKind: this.supervisorBinaryKind,
-      env: this.supervisorEnv,
+      env: { ...this.supervisorEnv, ...this.qualificationEnvironment() },
+      binaryPath: this.qualificationSupervisorBin,
     })
-    this.serverBin = this.buildManagedServer()
     this.web = new RustServer({
       preserveHomeOnStop: true,
       env: {
@@ -98,6 +114,7 @@ export class ManagedRuntimeBrowserRig {
         FRESHELL_RUNTIME_CONTROL_SOCKET: this.supervisor.controlSocket,
         FRESHELL_RUNTIME_CONTROL_SECRET_FILE: this.supervisor.controlSecretFile,
         ...this.serverEnv,
+        ...this.qualificationEnvironment(),
       },
       setupHome: async (homeDir) => {
         const freshell = path.join(homeDir, '.freshell')
@@ -155,7 +172,8 @@ export class ManagedRuntimeBrowserRig {
       volumeName: previous.volumeName,
       binaryKind: previous.binaryKind,
       reuseSecret: true,
-      env: this.supervisorEnv,
+      env: { ...this.supervisorEnv, ...this.qualificationEnvironment() },
+      binaryPath: this.qualificationSupervisorBin,
     })
     return this.supervisor
   }
@@ -189,6 +207,19 @@ export class ManagedRuntimeBrowserRig {
   async inventorySnapshot(): Promise<any> {
     const result = await this.runtime.adminOk(this.supervisor, { method: 'inventory_snapshot' })
     return this.dataOf(result, 'inventory_snapshot')
+  }
+
+  async qualificationWriterClaim(input: {
+    provider: string
+    nativeSessionId: string
+    soulId: string
+    incarnationId: string
+  }): Promise<any> {
+    const result = await this.runtime.adminOk(this.supervisor, {
+      method: 'qualification_writer_claim',
+      params: input,
+    })
+    return this.dataOf(result, 'qualification_writer_claim')
   }
 
   async runningViewForTerminal(terminalId: string): Promise<ManagedRuntimeView | null> {
@@ -310,15 +341,48 @@ export class ManagedRuntimeBrowserRig {
 
   private buildManagedServer(): string {
     const mise = path.join(os.homedir(), '.local', 'bin', 'mise')
+    const qualification = this.pendingQualificationProviders()
     execFileSync(mise, [
       'exec', 'rust@1.96', '--', 'cargo', 'build', '--release', '-p', 'freshell-server',
-      '--features', 'managed-runtime-v1',
+      '--features', qualification.length ? 'managed-provider-qualification' : 'managed-runtime-v1',
     ], { cwd: this.repoRoot, stdio: 'inherit' })
     const source = path.join(this.repoRoot, 'target', 'release', 'freshell-server')
     const target = path.join(this.runtime.buildDir, 'freshell-server-managed')
     fs.copyFileSync(source, target)
     fs.chmodSync(target, 0o755)
     return target
+  }
+
+  private buildQualificationSupervisor(): string | undefined {
+    if (this.pendingQualificationProviders().length === 0) return undefined
+    const mise = path.join(os.homedir(), '.local', 'bin', 'mise')
+    execFileSync(mise, [
+      'exec', 'rust@1.96', '--', 'cargo', 'build', '--release', '-p', 'freshell-supervisor',
+      '--features', 'provider-qualification',
+    ], { cwd: this.repoRoot, stdio: 'inherit' })
+    const target = path.join(this.runtime.buildDir, 'freshell-supervisor-qualification')
+    fs.copyFileSync(path.join(this.repoRoot, 'target', 'release', 'freshell-supervisor'), target)
+    fs.chmodSync(target, 0o755)
+    return target
+  }
+
+  private pendingQualificationProviders(): QualifiableTerminalProvider[] {
+    return this.enabledProviders.filter(
+      (provider): provider is QualifiableTerminalProvider => (
+        provider === 'claude' || provider === 'codex' || provider === 'amplifier'
+      ),
+    )
+  }
+
+  private qualificationEnvironment(): Record<string, string> {
+    const selected = this.pendingQualificationProviders()
+    if (selected.length === 0) return {}
+    return {
+      FRESHELL_MANAGED_PROVIDER_QUALIFICATION: selected.join(','),
+      ...(selected.includes('amplifier')
+        ? { FRESHELL_MANAGED_AMPLIFIER_PROFILE: 'onecli-anthropic-haiku-low' }
+        : {}),
+    }
   }
 
   private async withManagedBin<T>(operation: () => Promise<T>): Promise<T> {
