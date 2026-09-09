@@ -91,7 +91,7 @@ class RawWsClient {
 
   static async connect(baseUrl: string, token: string): Promise<RawWsClient> {
     const origin = baseUrl
-    const url = `${baseUrl.replace(/^http/, 'ws')}/ws?token=${encodeURIComponent(token)}`
+    const url = `${baseUrl.replace(/^http/, 'ws')}/ws`
     const socket = new WebSocket(url, { headers: { Origin: origin } })
     const client = new RawWsClient(socket)
     await new Promise<void>((resolve, reject) => {
@@ -107,6 +107,7 @@ class RawWsClient {
     })
     socket.send(JSON.stringify({
       type: 'hello',
+      token,
       protocolVersion: WS_PROTOCOL_VERSION,
       clientId: `phase4-old-client-${Date.now()}`,
       capabilities: {
