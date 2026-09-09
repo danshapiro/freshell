@@ -5,6 +5,40 @@
 
 use super::tests::{app, create_shell_tab, delete, get, patch, post, state_with_registry};
 use super::*;
+use crate::hosted_rest;
+
+struct HostedRestFake {
+    creates: std::sync::atomic::AtomicUsize,
+    sends: std::sync::atomic::AtomicUsize,
+}
+
+#[async_trait::async_trait]
+impl hosted_rest::HostedFreshAgentRestGateway for HostedRestFake {
+    async fn create_opencode(
+        self: Arc<Self>,
+        request: hosted_rest::HostedRestCreate,
+    ) -> Result<hosted_rest::HostedRestCreated, ()> {
+        assert_eq!(request.cwd.as_deref(), Some("/workspace"));
+        self.creates
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(hosted_rest::HostedRestCreated {
+            session_id: "managed-rest-session".into(),
+        })
+    }
+
+    async fn send_opencode(
+        &self,
+        request: hosted_rest::HostedRestSend,
+    ) -> Result<hosted_rest::HostedRestSendResult, ()> {
+        assert_eq!(request.session_id, "managed-rest-session");
+        assert_eq!(request.text, "continue");
+        self.sends.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(hosted_rest::HostedRestSendResult {
+            session_id: request.session_id,
+            completed: true,
+        })
+    }
+}
 
 /// Seed the shared layout store the way Task 13's WS ingestion does: a
 /// `ui.layout.sync` payload folded via `update_from_ui` (pattern from the
@@ -661,6 +695,38 @@ async fn fresh_agent_rest_create_registers_tab_and_pane_in_the_layout_store() {
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["data"]["activeTabId"], json!(tab_id));
     assert_eq!(body["data"]["tabs"][0]["id"], json!(tab_id));
+}
+
+#[tokio::test]
+async fn hosted_rest_create_and_send_never_start_the_web_owned_opencode_transport() {
+    let state = state_with_registry();
+    let gateway = Arc::new(HostedRestFake {
+        creates: std::sync::atomic::AtomicUsize::new(0),
+        sends: std::sync::atomic::AtomicUsize::new(0),
+    });
+    state.set_hosted_rest_gateway(gateway.clone()).unwrap();
+    let router = app(state.clone());
+    let (status, created) = post(
+        router.clone(),
+        "/api/tabs",
+        json!({"agent":"opencode","cwd":"/workspace"}),
+        true,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{created}");
+    let pane_id = created["data"]["paneId"].as_str().unwrap();
+    let (status, sent) = post(
+        router,
+        &format!("/api/panes/{pane_id}/send-keys"),
+        json!({"text":"continue","timeout":1}),
+        true,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{sent}");
+    assert_eq!(sent["data"]["status"], "idle");
+    assert_eq!(gateway.creates.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert_eq!(gateway.sends.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert!(state.opencode.lock().await.is_none());
 }
 
 #[tokio::test]

@@ -63,6 +63,7 @@ freshell-sessions = { path = "../freshell-sessions" }
 freshell-platform = { path = "../freshell-platform" }
 # The REST router + JSON extraction.
 axum = "0.8"
+async-trait = "0.1"
 serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = "0.10"

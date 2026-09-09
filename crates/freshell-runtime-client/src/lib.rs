@@ -6,8 +6,9 @@
 
 use freshell_runtime_protocol::{
     read_frame, write_frame, AcknowledgeViewProjectionRequest, AdminCommand, AdminReply,
-    AdminResult, ControlRole, Envelope, IncidentId, IncidentSummaryRequest, LaunchRequest,
-    LossIncidentSummary, ManagedRolloutMode, MigrationPlan, MigrationPlanRequest,
+    AdminResult, ControlRole, Envelope, FreshAgentInterruptRequest, FreshAgentReadEventsRequest,
+    FreshAgentResolveRequest, FreshAgentSendRequest, IncidentId, IncidentSummaryRequest,
+    LaunchRequest, LossIncidentSummary, ManagedRolloutMode, MigrationPlan, MigrationPlanRequest,
     NoticeDeliveryState, NoticeId, NoticeReceiptRequest, PendingNoticesRequest,
     PendingViewProjectionsRequest, RecoverRequest, RecoveryProbeRequest, RecoveryTrigger,
     RepairAudit, RepairRequest, RequestId, RuntimeError, RuntimeErrorCode,
@@ -602,6 +603,96 @@ impl RuntimeClient {
             .await?
         {
             AdminResult::TerminalOutput(output) => Ok(output),
+            _ => Err(ClientError::UnexpectedResult),
+        }
+    }
+
+    pub async fn fresh_agent_send(
+        &self,
+        request_id: RequestId,
+        soul_id: SoulId,
+        text: String,
+        settings: Option<freshell_runtime_protocol::FreshAgentTurnSettings>,
+    ) -> Result<freshell_runtime_protocol::CommandState, ClientError> {
+        let epoch = self.current_epoch().await?;
+        match self
+            .request(
+                request_id,
+                AdminCommand::FreshAgentSend(FreshAgentSendRequest {
+                    soul_id,
+                    text,
+                    settings,
+                    expected_control_epoch: Some(epoch),
+                }),
+            )
+            .await?
+        {
+            AdminResult::FreshAgentCommand { state } => Ok(state),
+            _ => Err(ClientError::UnexpectedResult),
+        }
+    }
+
+    pub async fn fresh_agent_resolve(
+        &self,
+        soul_id: SoulId,
+        decision_id: String,
+        decision: serde_json::Value,
+    ) -> Result<freshell_runtime_protocol::CommandState, ClientError> {
+        let epoch = self.current_epoch().await?;
+        match self
+            .request(
+                RequestId::new(),
+                AdminCommand::FreshAgentResolve(FreshAgentResolveRequest {
+                    soul_id,
+                    decision_id,
+                    decision,
+                    expected_control_epoch: Some(epoch),
+                }),
+            )
+            .await?
+        {
+            AdminResult::FreshAgentCommand { state } => Ok(state),
+            _ => Err(ClientError::UnexpectedResult),
+        }
+    }
+
+    pub async fn fresh_agent_interrupt(&self, soul_id: SoulId) -> Result<(), ClientError> {
+        let epoch = self.current_epoch().await?;
+        match self
+            .request(
+                RequestId::new(),
+                AdminCommand::FreshAgentInterrupt(FreshAgentInterruptRequest {
+                    soul_id,
+                    expected_control_epoch: Some(epoch),
+                }),
+            )
+            .await?
+        {
+            AdminResult::FreshAgentInterrupted => Ok(()),
+            _ => Err(ClientError::UnexpectedResult),
+        }
+    }
+
+    pub async fn fresh_agent_events(
+        &self,
+        soul_id: SoulId,
+        after_sequence: u64,
+        max_events: u32,
+    ) -> Result<freshell_runtime_protocol::AgentEventBatch, ClientError> {
+        let epoch = self.current_epoch().await?;
+        match self
+            .request(
+                RequestId::new(),
+                AdminCommand::FreshAgentReadEvents(FreshAgentReadEventsRequest {
+                    soul_id,
+                    after_sequence,
+                    max_events,
+                    expected_control_epoch: Some(epoch),
+                }),
+            )
+            .await?
+        {
+            AdminResult::FreshAgentEvents(events) => Ok(events),
             _ => Err(ClientError::UnexpectedResult),
         }
     }

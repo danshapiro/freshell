@@ -3,7 +3,8 @@ pub mod docker;
 use crate::registry::OwnedRuntimeHandle;
 use async_trait::async_trait;
 use freshell_runtime_protocol::{
-    DockerDaemonId, IncarnationId, InstallationId, RuntimeLimits, SoulId, TerminalLaunchSpec,
+    DockerDaemonId, FreshAgentLaunchSpec, IncarnationId, InstallationId, RuntimeLimits, SoulId,
+    TerminalLaunchSpec,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -44,6 +45,7 @@ pub struct CreateRuntimeSpec {
     pub limits: RuntimeLimits,
     pub test_run_id: String,
     pub terminal: Option<TerminalLaunchSpec>,
+    pub fresh_agent: Option<FreshAgentLaunchSpec>,
     pub provider_volume_name: String,
 }
 
@@ -257,7 +259,7 @@ fn docker_create_body(
         },
         "HostConfig": {
             "AutoRemove": false,
-            "NetworkMode": if spec.terminal.is_some() { "bridge" } else { "none" },
+            "NetworkMode": if spec.terminal.is_some() || spec.fresh_agent.is_some() { "bridge" } else { "none" },
             "PidMode": "",
             "ReadonlyRootfs": true,
             "Privileged": false,
@@ -277,6 +279,7 @@ fn docker_create_body(
 
 fn runtime_host_environment(
     terminal: Option<&TerminalLaunchSpec>,
+    fresh_agent: Option<&FreshAgentLaunchSpec>,
 ) -> Result<Vec<String>, BackendError> {
     let mut values = BTreeMap::new();
     for key in [
@@ -285,6 +288,55 @@ fn runtime_host_environment(
     ] {
         if let Ok(value) = std::env::var(key) {
             values.insert(key.to_string(), value);
+        }
+    }
+    if let Some(agent) = fresh_agent {
+        values.extend([
+            ("HOME".into(), "/home/freshell/provider".into()),
+            (
+                "CLAUDE_CONFIG_DIR".into(),
+                "/home/freshell/provider/.claude".into(),
+            ),
+            ("CODEX_HOME".into(), "/home/freshell/provider/.codex".into()),
+            (
+                "XDG_DATA_HOME".into(),
+                "/home/freshell/provider/.local/share".into(),
+            ),
+            (
+                "XDG_CONFIG_HOME".into(),
+                "/home/freshell/provider/.config".into(),
+            ),
+            (
+                "FRESHELL_HOSTED_FRESH_AGENT".into(),
+                agent.provider.as_str().into(),
+            ),
+            (
+                "FRESHELL_PROVIDER_RUN_AS_UID".into(),
+                agent.run_as_uid.to_string(),
+            ),
+            (
+                "FRESHELL_PROVIDER_RUN_AS_GID".into(),
+                agent.run_as_gid.to_string(),
+            ),
+        ]);
+        if matches!(
+            agent.provider,
+            freshell_runtime_protocol::FreshProvider::Claude
+                | freshell_runtime_protocol::FreshProvider::Kilroy
+        ) {
+            values.insert(
+                "FRESHELL_CLAUDE_SIDECAR".into(),
+                "/opt/freshell-claude-sidecar/index.mjs".into(),
+            );
+        }
+        if agent.provider == freshell_runtime_protocol::FreshProvider::Codex {
+            values.insert(
+                "CODEX_CMD".into(),
+                format!(
+                    "/usr/bin/setpriv --reuid {} --regid {} --clear-groups --no-new-privs -- codex",
+                    agent.run_as_uid, agent.run_as_gid
+                ),
+            );
         }
     }
     if let Some(terminal) = terminal.filter(|terminal| terminal.mode == "codex") {
@@ -345,12 +397,18 @@ impl RuntimeBackend for DockerEngineBackend {
                 "provider volume name is not installation-scoped".into(),
             ));
         }
-        let terminal_mounts = spec
-            .terminal
-            .as_ref()
-            .map(docker::terminal_mounts)
-            .transpose()
-            .map_err(BackendError::InvalidConfig)?;
+        let terminal_mounts = match (&spec.terminal, &spec.fresh_agent) {
+            (Some(terminal), None) => Some(docker::terminal_mounts(terminal)),
+            (None, Some(agent)) => Some(docker::fresh_agent_mounts(agent)),
+            (None, None) => None,
+            (Some(_), Some(_)) => {
+                return Err(BackendError::InvalidConfig(
+                    "runtime cannot host terminal and fresh-agent workloads together".into(),
+                ))
+            }
+        }
+        .transpose()
+        .map_err(BackendError::InvalidConfig)?;
         let expected = ExpectedConfig::new(spec, &binary, &runtime_dir);
         let immutable_config_digest = digest_expected(&expected)?;
         let daemon_id = self.daemon_id().await?;
@@ -390,17 +448,22 @@ impl RuntimeBackend for DockerEngineBackend {
                 ));
             }
         }
-        let host_env = runtime_host_environment(spec.terminal.as_ref())?;
-        let cap_add: Vec<&str> = if spec.terminal.is_some() {
+        let host_env = runtime_host_environment(spec.terminal.as_ref(), spec.fresh_agent.as_ref())?;
+        let cap_add: Vec<&str> = if spec.terminal.is_some() || spec.fresh_agent.is_some() {
             vec!["CHOWN", "SETGID", "SETUID"]
         } else {
             Vec::new()
         };
-        let runtime_tmpfs_config = runtime_tmpfs(
-            spec.terminal
-                .as_ref()
-                .map(|terminal| terminal.mode.as_str()),
-        );
+        let runtime_mode = spec
+            .terminal
+            .as_ref()
+            .map(|terminal| terminal.mode.as_str())
+            .or_else(|| {
+                spec.fresh_agent
+                    .as_ref()
+                    .map(|agent| agent.provider.as_str())
+            });
+        let runtime_tmpfs_config = runtime_tmpfs(runtime_mode);
         let body = docker_create_body(
             spec,
             binds,
@@ -668,6 +731,7 @@ struct ExpectedConfig {
     runtime_dir: String,
     limits: RuntimeLimits,
     terminal: Option<TerminalLaunchSpec>,
+    fresh_agent: Option<FreshAgentLaunchSpec>,
     provider_volume_name: String,
 }
 
@@ -682,6 +746,7 @@ impl ExpectedConfig {
             runtime_dir: runtime_dir.to_string_lossy().into_owned(),
             limits: spec.limits,
             terminal: spec.terminal.clone(),
+            fresh_agent: spec.fresh_agent.clone(),
             provider_volume_name: spec.provider_volume_name.clone(),
         }
     }
@@ -697,6 +762,7 @@ fn immutable_digest_from_handle(handle: &OwnedRuntimeHandle) -> Result<String, B
         runtime_dir: handle.runtime_dir().to_string_lossy().into_owned(),
         limits: handle.requested_limits(),
         terminal: handle.terminal().cloned(),
+        fresh_agent: handle.fresh_agent().cloned(),
         provider_volume_name: handle.provider_volume_name().to_owned(),
     })
 }
@@ -779,13 +845,13 @@ fn verify_inspect_config(handle: &OwnedRuntimeHandle, value: &Value) -> Result<(
             )));
         }
     }
-    let expected_env = runtime_host_environment(handle.terminal())?;
+    let expected_env = runtime_host_environment(handle.terminal(), handle.fresh_agent())?;
     verify_runtime_environment(value, &expected_env)?;
 
     let host_config = value
         .get("HostConfig")
         .ok_or_else(|| BackendError::OwnershipMismatch("missing HostConfig".into()))?;
-    let expected_network = if handle.terminal().is_some() {
+    let expected_network = if handle.terminal().is_some() || handle.fresh_agent().is_some() {
         "bridge"
     } else {
         "none"
@@ -825,7 +891,7 @@ fn verify_inspect_config(handle: &OwnedRuntimeHandle, value: &Value) -> Result<(
                 .collect::<std::collections::BTreeSet<_>>()
         })
         .unwrap_or_default();
-    let expected_cap_add = if handle.terminal().is_some() {
+    let expected_cap_add = if handle.terminal().is_some() || handle.fresh_agent().is_some() {
         ["CHOWN", "SETGID", "SETUID"]
             .into_iter()
             .map(str::to_string)
@@ -838,7 +904,11 @@ fn verify_inspect_config(handle: &OwnedRuntimeHandle, value: &Value) -> Result<(
             "runtime capability set changed: {actual_cap_add:?}"
         )));
     }
-    let expected_tmpfs = runtime_tmpfs(handle.terminal().map(|terminal| terminal.mode.as_str()));
+    let expected_mode = handle
+        .terminal()
+        .map(|terminal| terminal.mode.as_str())
+        .or_else(|| handle.fresh_agent().map(|agent| agent.provider.as_str()));
+    let expected_tmpfs = runtime_tmpfs(expected_mode);
     let actual_tmpfs = host_config
         .get("Tmpfs")
         .and_then(Value::as_object)
@@ -891,42 +961,40 @@ fn verify_inspect_config(handle: &OwnedRuntimeHandle, value: &Value) -> Result<(
     if let Some(terminal) = handle.terminal() {
         let expected =
             docker::terminal_mounts(terminal).map_err(BackendError::OwnershipMismatch)?;
-        let workspace = expected.workspace.to_string_lossy();
-        let has_workspace = mounts.iter().any(|m| {
-            m.get("Source").and_then(Value::as_str) == Some(workspace.as_ref())
-                && m.get("Destination").and_then(Value::as_str) == Some(workspace.as_ref())
-        });
-        if !has_workspace {
-            return Err(BackendError::OwnershipMismatch(
-                "workspace mount changed".into(),
-            ));
-        }
-        if let Some(git) = expected.git_common_dir {
-            if !git.starts_with(&expected.workspace) {
-                let git_text = git.to_string_lossy();
-                let has_git = mounts.iter().any(|m| {
-                    m.get("Source").and_then(Value::as_str) == Some(git_text.as_ref())
-                        && m.get("Destination").and_then(Value::as_str) == Some(git_text.as_ref())
-                });
-                if !has_git {
-                    return Err(BackendError::OwnershipMismatch(
-                        "git common-dir mount changed".into(),
-                    ));
-                }
-            }
-        }
-        for (index, source) in expected.provider_bootstrap_files.iter().enumerate() {
-            let source_text = source.to_string_lossy();
-            let destination = format!("/run/freshell-bootstrap/provider-{index}");
-            let found = mounts.iter().any(|mount| {
-                mount.get("Source").and_then(Value::as_str) == Some(source_text.as_ref())
-                    && mount.get("Destination").and_then(Value::as_str)
-                        == Some(destination.as_str())
-                    && mount.get("RW").and_then(Value::as_bool) == Some(false)
+        verify_workload_mounts(mounts, &expected)?;
+    }
+    if let Some(agent) = handle.fresh_agent() {
+        let expected =
+            docker::fresh_agent_mounts(agent).map_err(BackendError::OwnershipMismatch)?;
+        verify_workload_mounts(mounts, &expected)?;
+    }
+    Ok(())
+}
+
+fn verify_workload_mounts(
+    mounts: &[Value],
+    expected: &docker::TerminalMounts,
+) -> Result<(), BackendError> {
+    let workspace = expected.workspace.to_string_lossy();
+    let has_workspace = mounts.iter().any(|mount| {
+        mount.get("Source").and_then(Value::as_str) == Some(workspace.as_ref())
+            && mount.get("Destination").and_then(Value::as_str) == Some(workspace.as_ref())
+    });
+    if !has_workspace {
+        return Err(BackendError::OwnershipMismatch(
+            "workspace mount changed".into(),
+        ));
+    }
+    if let Some(git) = expected.git_common_dir.as_ref() {
+        if !git.starts_with(&expected.workspace) {
+            let git_text = git.to_string_lossy();
+            let has_git = mounts.iter().any(|mount| {
+                mount.get("Source").and_then(Value::as_str) == Some(git_text.as_ref())
+                    && mount.get("Destination").and_then(Value::as_str) == Some(git_text.as_ref())
             });
-            if !found {
+            if !has_git {
                 return Err(BackendError::OwnershipMismatch(
-                    "provider bootstrap mount changed".into(),
+                    "git common-dir mount changed".into(),
                 ));
             }
         }
@@ -944,6 +1012,20 @@ fn verify_inspect_config(handle: &OwnedRuntimeHandle, value: &Value) -> Result<(
                     "provider secret-reference mount changed".into(),
                 ));
             }
+        }
+    }
+    for (index, source) in expected.provider_bootstrap_files.iter().enumerate() {
+        let source_text = source.to_string_lossy();
+        let destination = format!("/run/freshell-bootstrap/provider-{index}");
+        let found = mounts.iter().any(|mount| {
+            mount.get("Source").and_then(Value::as_str) == Some(source_text.as_ref())
+                && mount.get("Destination").and_then(Value::as_str) == Some(destination.as_str())
+                && mount.get("RW").and_then(Value::as_bool) == Some(false)
+        });
+        if !found {
+            return Err(BackendError::OwnershipMismatch(
+                "provider bootstrap mount changed".into(),
+            ));
         }
     }
     Ok(())
@@ -1134,7 +1216,7 @@ mod tests {
             provider_bootstrap_files: Vec::new(),
             provider_secret_references: Vec::new(),
         };
-        let env = runtime_host_environment(Some(&terminal)).unwrap();
+        let env = runtime_host_environment(Some(&terminal), None).unwrap();
         assert!(env
             .iter()
             .any(|value| value == "HOME=/home/freshell/provider"));
@@ -1211,6 +1293,7 @@ mod tests {
             },
             test_run_id: "reference-only".into(),
             terminal: Some(terminal),
+            fresh_agent: None,
             provider_volume_name: "freshell-provider-test".into(),
         };
         let body = docker_create_body(

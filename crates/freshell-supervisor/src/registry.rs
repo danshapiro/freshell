@@ -1,10 +1,10 @@
 use crate::admission::{AdmissionPolicy, ReservationTotals};
 use freshell_runtime_protocol::{
     AllocationState, CleanupState, DesiredState, DockerDaemonId, DurabilityState, FixtureKind,
-    GrantId, HostBootId, IncarnationId, IncidentId, InstallationId, LaunchNonce, LaunchState,
-    NoticeId, RecoveryAttemptId, RecoveryBlockReason, RecoveryPath, RecoveryState, RecoveryTrigger,
-    RequestId, ResumeSpec, RuntimeLimits, RuntimeProfile, RuntimeView, SoulId, StopOutcome,
-    TerminalLaunchSpec, ViewIntentRequest,
+    FreshAgentLaunchSpec, FreshAgentTurnSettings, GrantId, HostBootId, IncarnationId, IncidentId,
+    InstallationId, LaunchNonce, LaunchState, NoticeId, RecoveryAttemptId, RecoveryBlockReason,
+    RecoveryPath, RecoveryState, RecoveryTrigger, RequestId, ResumeSpec, RuntimeLimits,
+    RuntimeProfile, RuntimeView, SoulId, StopOutcome, TerminalLaunchSpec, ViewIntentRequest,
 };
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use serde::{Deserialize, Serialize};
@@ -17,7 +17,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-pub const SCHEMA_VERSION: u32 = 6;
+pub const SCHEMA_VERSION: u32 = 7;
 const ACTIVE_STATES: &str = "'prepared','created','starting','running','stopping'";
 
 #[derive(Debug, thiserror::Error)]
@@ -105,6 +105,7 @@ pub struct LaunchPreparation {
     pub project_key: String,
     pub fixture: Option<FixtureKind>,
     pub terminal: Option<TerminalLaunchSpec>,
+    pub fresh_agent: Option<FreshAgentLaunchSpec>,
     pub view_intent: Option<ViewIntentRequest>,
     pub admission: AdmissionPolicy,
 }
@@ -156,6 +157,7 @@ pub struct OwnedRuntimeHandle {
     requested_limits: RuntimeLimits,
     fixture: Option<FixtureKind>,
     terminal: Option<TerminalLaunchSpec>,
+    fresh_agent: Option<FreshAgentLaunchSpec>,
     provider_volume_name: String,
 }
 
@@ -175,6 +177,7 @@ impl OwnedRuntimeHandle {
         requested_limits: RuntimeLimits,
         fixture: Option<FixtureKind>,
         terminal: Option<TerminalLaunchSpec>,
+        fresh_agent: Option<FreshAgentLaunchSpec>,
         provider_volume_name: String,
     ) -> Self {
         Self {
@@ -191,6 +194,7 @@ impl OwnedRuntimeHandle {
             requested_limits,
             fixture,
             terminal,
+            fresh_agent,
             provider_volume_name,
         }
     }
@@ -234,6 +238,9 @@ impl OwnedRuntimeHandle {
     pub fn terminal(&self) -> Option<&TerminalLaunchSpec> {
         self.terminal.as_ref()
     }
+    pub fn fresh_agent(&self) -> Option<&FreshAgentLaunchSpec> {
+        self.fresh_agent.as_ref()
+    }
     pub fn provider_volume_name(&self) -> &str {
         &self.provider_volume_name
     }
@@ -259,6 +266,7 @@ pub struct RecoveryContext {
     pub profile: RuntimeProfile,
     pub fixture: Option<FixtureKind>,
     pub terminal: Option<TerminalLaunchSpec>,
+    pub fresh_agent: Option<FreshAgentLaunchSpec>,
     pub requested_limits: RuntimeLimits,
     pub accepted_command_count: u64,
     pub completed_command_count: u64,
@@ -278,6 +286,7 @@ pub struct ReplacementPreparation {
     pub prepared: PreparedLaunch,
     pub fixture: Option<FixtureKind>,
     pub terminal: Option<TerminalLaunchSpec>,
+    pub fresh_agent: Option<FreshAgentLaunchSpec>,
     pub resume_spec: Option<ResumeSpec>,
     pub prior_incarnation_id: IncarnationId,
     pub attempt_id: RecoveryAttemptId,
@@ -531,11 +540,16 @@ impl Registry {
             let launch_nonce = LaunchNonce::new();
             let limits_json = serde_json::to_string(&input.requested_limits)?;
             let terminal_json = input.terminal.as_ref().map(serde_json::to_string).transpose()?;
+            let fresh_agent_json = input
+                .fresh_agent
+                .as_ref()
+                .map(serde_json::to_string)
+                .transpose()?;
             let terminal_id = input.terminal.as_ref().map(|t| t.terminal_id.as_str());
             let fixture_kind = input.fixture.map(fixture_kind_name);
             tx.execute(
-                "INSERT INTO incarnations (incarnation_id,soul_id,launch_nonce,docker_daemon_id,container_id,image_ref,runtime_dir,host_binary_path,immutable_config_digest,launch_state,host_boot_id,execution_generation,grant_id,requested_limits,effective_limits,cleanup_state,fixture_kind,terminal_id,terminal_spec,prior_incarnation_id,recovery_attempt_id,exit_code,oom_killed,created_at,updated_at) VALUES (?1,?2,?3,NULL,NULL,NULL,NULL,NULL,NULL,'prepared',NULL,0,NULL,?4,NULL,'none',?5,?6,?7,NULL,NULL,NULL,0,?8,?8)",
-                params![incarnation_id.as_str(), input.soul_id.as_str(), launch_nonce.as_str(), limits_json, fixture_kind, terminal_id, terminal_json, now],
+                "INSERT INTO incarnations (incarnation_id,soul_id,launch_nonce,docker_daemon_id,container_id,image_ref,runtime_dir,host_binary_path,immutable_config_digest,launch_state,host_boot_id,execution_generation,grant_id,requested_limits,effective_limits,cleanup_state,fixture_kind,terminal_id,terminal_spec,fresh_agent_spec,prior_incarnation_id,recovery_attempt_id,exit_code,oom_killed,created_at,updated_at) VALUES (?1,?2,?3,NULL,NULL,NULL,NULL,NULL,NULL,'prepared',NULL,0,NULL,?4,NULL,'none',?5,?6,?7,?8,NULL,NULL,NULL,0,?9,?9)",
+                params![incarnation_id.as_str(), input.soul_id.as_str(), launch_nonce.as_str(), limits_json, fixture_kind, terminal_id, terminal_json, fresh_agent_json, now],
             )?;
             tx.execute(
                 "INSERT INTO admission_reservations (incarnation_id,project_key,cpu_milli,memory_bytes,pids_max,created_at) VALUES (?1,?2,?3,?4,?5,?6)",
@@ -791,8 +805,16 @@ impl Registry {
         soul_id: SoulId,
         request_id: RequestId,
         data: &[u8],
+        correlation: Option<&[u8]>,
     ) -> Result<(InputJournalDisposition, IncarnationId), RegistryError> {
-        let payload_digest = format!("sha256:{:x}", Sha256::digest(data));
+        let mut digest = Sha256::new();
+        digest.update((data.len() as u64).to_be_bytes());
+        digest.update(data);
+        if let Some(correlation) = correlation {
+            digest.update((correlation.len() as u64).to_be_bytes());
+            digest.update(correlation);
+        }
+        let payload_digest = format!("sha256:{:x}", digest.finalize());
         let protected_payload = data.to_vec();
         self.run_blocking(move |mut conn| {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -858,6 +880,68 @@ impl Registry {
             }
             tx.commit()?;
             Ok((InputJournalDisposition::Dispatch, incarnation_id))
+        })
+        .await
+    }
+
+    pub async fn update_fresh_agent_settings(
+        &self,
+        soul_id: SoulId,
+        incarnation_id: IncarnationId,
+        settings: FreshAgentTurnSettings,
+    ) -> Result<(), RegistryError> {
+        self.run_blocking(move |mut conn| {
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let encoded: String = tx
+                .query_row(
+                    "SELECT fresh_agent_spec FROM incarnations WHERE soul_id=?1 AND incarnation_id=?2 AND launch_state='running'",
+                    params![soul_id.as_str(), incarnation_id.as_str()],
+                    |row| row.get(0),
+                )
+                .optional()?
+                .ok_or_else(|| RegistryError::UnknownIncarnation(incarnation_id.clone()))?;
+            let mut spec: FreshAgentLaunchSpec = serde_json::from_str(&encoded)
+                .map_err(|_| RegistryError::Integrity("invalid fresh-agent launch spec".into()))?;
+            if let Some(value) = settings.cwd {
+                let cwd = std::fs::canonicalize(&value).map_err(|_| {
+                    RegistryError::InvalidState("fresh-agent cwd is unavailable".into())
+                })?;
+                let workspace = std::fs::canonicalize(&spec.workspace_path).map_err(|_| {
+                    RegistryError::InvalidState("fresh-agent workspace is unavailable".into())
+                })?;
+                if !cwd.is_dir() || !cwd.starts_with(&workspace) {
+                    return Err(RegistryError::InvalidState(
+                        "fresh-agent cwd is outside its workspace".into(),
+                    ));
+                }
+                spec.cwd = cwd.to_string_lossy().into_owned();
+            }
+            if let Some(value) = settings.model {
+                spec.model = Some(value);
+            }
+            if let Some(value) = settings.effort {
+                spec.effort = Some(value);
+            }
+            if let Some(value) = settings.permission_mode {
+                spec.permission_mode = Some(value);
+            }
+            if let Some(value) = settings.sandbox {
+                spec.sandbox = Some(value);
+            }
+            spec.validate().map_err(|error| {
+                RegistryError::InvalidState(error.message)
+            })?;
+            let encoded = serde_json::to_string(&spec)
+                .map_err(|_| RegistryError::Integrity("encode fresh-agent launch spec".into()))?;
+            let changed = tx.execute(
+                "UPDATE incarnations SET fresh_agent_spec=?1,updated_at=?2 WHERE soul_id=?3 AND incarnation_id=?4 AND launch_state='running'",
+                params![encoded, now_millis(), soul_id.as_str(), incarnation_id.as_str()],
+            )?;
+            if changed != 1 {
+                return Err(RegistryError::UnknownIncarnation(incarnation_id));
+            }
+            tx.commit()?;
+            Ok(())
         })
         .await
     }
@@ -967,6 +1051,9 @@ impl Registry {
         incarnation_id: IncarnationId,
         native_session_id: String,
     ) -> Result<(), RegistryError> {
+        if native_session_id.is_empty() || native_session_id.chars().any(char::is_control) {
+            return Err(RegistryError::NativeIdentityConflict);
+        }
         self.run_blocking(move |mut conn| {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
             let (provider, store, existing, intent): (String, String, Option<String>, u64) = tx
@@ -987,6 +1074,29 @@ impl Registry {
                 .ok_or_else(|| RegistryError::UnknownIncarnation(incarnation_id.clone()))?;
             if owner != soul_id.as_str() || existing.as_deref().is_some_and(|id| id != native_session_id) {
                 return Err(RegistryError::NativeIdentityConflict);
+            }
+            let fresh_agent_spec: Option<String> = tx.query_row(
+                "SELECT fresh_agent_spec FROM incarnations WHERE incarnation_id=?1",
+                params![incarnation_id.as_str()],
+                |row| row.get(0),
+            )?;
+            if let Some(encoded) = fresh_agent_spec {
+                let mut spec: FreshAgentLaunchSpec = serde_json::from_str(&encoded)
+                    .map_err(|_| RegistryError::Integrity("invalid fresh-agent launch spec".into()))?;
+                if spec
+                    .native_session_id
+                    .as_deref()
+                    .is_some_and(|native| native != native_session_id)
+                {
+                    return Err(RegistryError::NativeIdentityConflict);
+                }
+                if spec.native_session_id.is_none() {
+                    spec.native_session_id = Some(native_session_id.clone());
+                    tx.execute(
+                        "UPDATE incarnations SET fresh_agent_spec=?1,updated_at=?2 WHERE incarnation_id=?3",
+                        params![serde_json::to_string(&spec)?, now_millis(), incarnation_id.as_str()],
+                    )?;
+                }
             }
             let now = now_millis();
             tx.execute(
@@ -1238,6 +1348,7 @@ impl Registry {
         &self,
         start: RecoveryStart,
         terminal: Option<TerminalLaunchSpec>,
+        fresh_agent: Option<FreshAgentLaunchSpec>,
         resume_spec: Option<ResumeSpec>,
         path: RecoveryPath,
     ) -> Result<ReplacementPreparation, RegistryError> {
@@ -1284,11 +1395,15 @@ impl Registry {
             let launch_nonce = LaunchNonce::new();
             let limits_json = serde_json::to_string(&start.context.requested_limits)?;
             let terminal_json = terminal.as_ref().map(serde_json::to_string).transpose()?;
+            let fresh_agent_json = fresh_agent
+                .as_ref()
+                .map(serde_json::to_string)
+                .transpose()?;
             let terminal_id = terminal.as_ref().map(|value| value.terminal_id.as_str());
             let fixture_kind = start.context.fixture.map(fixture_kind_name);
             tx.execute(
-                "INSERT INTO incarnations (incarnation_id,soul_id,launch_nonce,docker_daemon_id,container_id,image_ref,runtime_dir,host_binary_path,immutable_config_digest,launch_state,host_boot_id,execution_generation,grant_id,requested_limits,effective_limits,cleanup_state,fixture_kind,terminal_id,terminal_spec,prior_incarnation_id,recovery_attempt_id,exit_code,oom_killed,created_at,updated_at) VALUES (?1,?2,?3,NULL,NULL,NULL,NULL,NULL,NULL,'prepared',NULL,0,NULL,?4,NULL,'none',?5,?6,?7,?8,?9,NULL,0,?10,?10)",
-                params![incarnation_id.as_str(), start.context.soul_id.as_str(), launch_nonce.as_str(), limits_json, fixture_kind, terminal_id, terminal_json, start.context.prior_handle.incarnation_id().as_str(), start.attempt_id.as_str(), now],
+                "INSERT INTO incarnations (incarnation_id,soul_id,launch_nonce,docker_daemon_id,container_id,image_ref,runtime_dir,host_binary_path,immutable_config_digest,launch_state,host_boot_id,execution_generation,grant_id,requested_limits,effective_limits,cleanup_state,fixture_kind,terminal_id,terminal_spec,fresh_agent_spec,prior_incarnation_id,recovery_attempt_id,exit_code,oom_killed,created_at,updated_at) VALUES (?1,?2,?3,NULL,NULL,NULL,NULL,NULL,NULL,'prepared',NULL,0,NULL,?4,NULL,'none',?5,?6,?7,?8,?9,?10,NULL,0,?11,?11)",
+                params![incarnation_id.as_str(), start.context.soul_id.as_str(), launch_nonce.as_str(), limits_json, fixture_kind, terminal_id, terminal_json, fresh_agent_json, start.context.prior_handle.incarnation_id().as_str(), start.attempt_id.as_str(), now],
             )?;
             tx.execute(
                 "INSERT INTO admission_reservations (incarnation_id,project_key,cpu_milli,memory_bytes,pids_max,created_at) VALUES (?1,?2,?3,?4,?5,?6)",
@@ -1316,6 +1431,7 @@ impl Registry {
                 },
                 fixture: start.context.fixture,
                 terminal,
+                fresh_agent,
                 resume_spec,
                 prior_incarnation_id: start.context.prior_handle.incarnation_id().clone(),
                 attempt_id: start.attempt_id,
@@ -1695,6 +1811,7 @@ fn create_schema(
             fixture_kind TEXT,
             terminal_id TEXT,
             terminal_spec TEXT,
+            fresh_agent_spec TEXT,
             prior_incarnation_id TEXT,
             recovery_attempt_id TEXT,
             exit_code INTEGER,
@@ -2117,6 +2234,21 @@ fn migrate_schema(conn: &mut Connection) -> Result<(), RegistryError> {
         tx.commit()?;
         schema = 6;
     }
+    if schema == 6 {
+        // Downgrade/restore drills can leave additive columns in place while
+        // restoring an older installation version. Keep this migration
+        // idempotent so opening that registry never destroys existing souls.
+        let add_fresh_agent_spec = !column_exists(conn, "incarnations", "fresh_agent_spec")?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if add_fresh_agent_spec {
+            tx.execute_batch("ALTER TABLE incarnations ADD COLUMN fresh_agent_spec TEXT;")?;
+        }
+        tx.execute_batch(
+            "UPDATE installation SET schema_version=7,inventory_revision=inventory_revision+1 WHERE singleton=1;",
+        )?;
+        tx.commit()?;
+        schema = 7;
+    }
     if schema != SCHEMA_VERSION {
         return Err(RegistryError::Integrity(format!(
             "unsupported older schema {schema}"
@@ -2189,12 +2321,13 @@ pub(crate) fn load_owned_handle(
         String,
         Option<String>,
         Option<String>,
+        Option<String>,
         String,
     );
     let raw: OwnedRow = conn.query_row(
-        "SELECT i.soul_id,i.launch_nonce,i.docker_daemon_id,i.container_id,i.image_ref,i.runtime_dir,i.host_binary_path,i.immutable_config_digest,i.requested_limits,i.launch_state,i.fixture_kind,i.terminal_spec,s.provider_volume_name FROM incarnations i JOIN souls s ON s.soul_id=i.soul_id WHERE i.incarnation_id=?1",
+        "SELECT i.soul_id,i.launch_nonce,i.docker_daemon_id,i.container_id,i.image_ref,i.runtime_dir,i.host_binary_path,i.immutable_config_digest,i.requested_limits,i.launch_state,i.fixture_kind,i.terminal_spec,i.fresh_agent_spec,s.provider_volume_name FROM incarnations i JOIN souls s ON s.soul_id=i.soul_id WHERE i.incarnation_id=?1",
         params![incarnation_id.as_str()],
-        |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?,row.get(6)?,row.get(7)?,row.get(8)?,row.get(9)?,row.get(10)?,row.get(11)?,row.get(12)?)),
+        |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?,row.get(6)?,row.get(7)?,row.get(8)?,row.get(9)?,row.get(10)?,row.get(11)?,row.get(12)?,row.get(13)?)),
     ).optional()?.ok_or_else(|| RegistryError::UnknownIncarnation(incarnation_id.clone()))?;
     if raw.9 == "prepared" {
         return Err(RegistryError::InvalidState(
@@ -2207,6 +2340,10 @@ pub(crate) fn load_owned_handle(
     let fixture = raw.10.as_deref().map(parse_fixture_kind).transpose()?;
     let terminal = raw
         .11
+        .map(|value| serde_json::from_str(&value))
+        .transpose()?;
+    let fresh_agent = raw
+        .12
         .map(|value| serde_json::from_str(&value))
         .transpose()?;
     Ok(OwnedRuntimeHandle::from_registry(
@@ -2225,7 +2362,8 @@ pub(crate) fn load_owned_handle(
         serde_json::from_str(&raw.8)?,
         fixture,
         terminal,
-        raw.12,
+        fresh_agent,
+        raw.13,
     ))
 }
 
@@ -2323,6 +2461,7 @@ fn load_recovery_context(
         profile: parse_runtime_profile(&row.13)?,
         fixture: prior_handle.fixture(),
         terminal: prior_handle.terminal().cloned(),
+        fresh_agent: prior_handle.fresh_agent().cloned(),
         requested_limits: row
             .16
             .map(|value| serde_json::from_str(&value))
@@ -2339,7 +2478,7 @@ fn load_recovery_context(
 
 pub(crate) fn load_inventory(conn: &Connection) -> Result<Vec<RuntimeView>, RegistryError> {
     let mut stmt = conn.prepare(
-        "SELECT i.soul_id,i.incarnation_id,i.launch_state,i.cleanup_state,s.intent_revision,i.container_id,i.host_boot_id,i.execution_generation,i.effective_limits,i.terminal_id,s.project_key,s.resource_profile,s.desired_state,s.recovery_state,s.durability_state,s.allocation_state,s.provider,s.native_session_id,s.recovery_reason,i.prior_incarnation_id,s.recovery_attempt_id,s.evidence_revision,s.successful_recoveries_in_window,i.terminal_spec,s.configured_limits,(SELECT MAX(v.revision) FROM view_intents v WHERE v.soul_id=i.soul_id),s.loss_incident_id FROM incarnations i JOIN souls s ON s.soul_id=i.soul_id ORDER BY i.created_at,i.incarnation_id",
+        "SELECT i.soul_id,i.incarnation_id,i.launch_state,i.cleanup_state,s.intent_revision,i.container_id,i.host_boot_id,i.execution_generation,i.effective_limits,i.terminal_id,s.project_key,s.resource_profile,s.desired_state,s.recovery_state,s.durability_state,s.allocation_state,s.provider,s.native_session_id,s.recovery_reason,i.prior_incarnation_id,s.recovery_attempt_id,s.evidence_revision,s.successful_recoveries_in_window,i.terminal_spec,s.configured_limits,(SELECT MAX(v.revision) FROM view_intents v WHERE v.soul_id=i.soul_id),s.loss_incident_id,i.fresh_agent_spec FROM incarnations i JOIN souls s ON s.soul_id=i.soul_id ORDER BY i.created_at,i.incarnation_id",
     )?;
     let mut rows = stmt.query([])?;
     let mut out = Vec::new();
@@ -2348,6 +2487,10 @@ pub(crate) fn load_inventory(conn: &Connection) -> Result<Vec<RuntimeView>, Regi
         let profile: String = row.get(11)?;
         let terminal_spec: Option<TerminalLaunchSpec> = row
             .get::<_, Option<String>>(23)?
+            .map(|value| serde_json::from_str(&value))
+            .transpose()?;
+        let fresh_agent_spec: Option<FreshAgentLaunchSpec> = row
+            .get::<_, Option<String>>(27)?
             .map(|value| serde_json::from_str(&value))
             .transpose()?;
         out.push(RuntimeView {
@@ -2381,6 +2524,15 @@ pub(crate) fn load_inventory(conn: &Connection) -> Result<Vec<RuntimeView>, Regi
             terminal_resume_session_id: terminal_spec
                 .as_ref()
                 .and_then(|spec| spec.resume_session_id.clone()),
+            fresh_agent_session_id: fresh_agent_spec
+                .as_ref()
+                .map(|spec| spec.session_id.clone()),
+            fresh_agent_session_type: fresh_agent_spec
+                .as_ref()
+                .map(|spec| spec.session_type.clone()),
+            fresh_agent_runtime_variant: fresh_agent_spec
+                .as_ref()
+                .map(|spec| spec.runtime_variant.clone()),
             project_key: Some(row.get(10)?),
             profile: Some(parse_runtime_profile(&profile)?),
             desired_state: parse_desired_state(&row.get::<_, String>(12)?)?,
@@ -2571,6 +2723,7 @@ mod tests {
             project_key: "test-project".into(),
             fixture: None,
             terminal: None,
+            fresh_agent: None,
             view_intent: None,
             admission: AdmissionPolicy::default(),
         }
@@ -2592,6 +2745,50 @@ mod tests {
                 format!("container-{}", prepared.incarnation_id),
                 runtime_dir,
                 host_binary,
+                prepared.incarnation_id.as_str()
+            ],
+        )
+        .unwrap();
+        prepared
+    }
+
+    async fn materialize_fresh_runtime(
+        registry: &Registry,
+        soul_id: SoulId,
+        workspace: &Path,
+    ) -> PreparedLaunch {
+        let mut launch = prep(soul_id, RequestId::new(), "fresh-materialized");
+        let workspace = std::fs::canonicalize(workspace).unwrap();
+        launch.provider = "claude".into();
+        launch.provider_store_id = "fresh-store".into();
+        launch.fresh_agent = Some(FreshAgentLaunchSpec {
+            session_id: "fresh-session".into(),
+            provider: freshell_runtime_protocol::FreshProvider::Claude,
+            session_type: "freshclaude".into(),
+            runtime_variant: "claude-sdk-sidecar".into(),
+            provider_store_id: "fresh-store".into(),
+            cwd: workspace.to_string_lossy().into_owned(),
+            workspace_path: workspace.to_string_lossy().into_owned(),
+            git_common_dir: None,
+            run_as_uid: 65_534,
+            run_as_gid: 0,
+            model: Some("initial-model".into()),
+            effort: Some("low".into()),
+            permission_mode: Some("ask".into()),
+            sandbox: Some("workspace-write".into()),
+            native_session_id: None,
+            provider_bootstrap_files: Vec::new(),
+        });
+        let prepared = registry.prepare_launch(launch).await.unwrap();
+        let runtime_dir = format!("/tmp/freshell-runtime-test/{}", prepared.incarnation_id);
+        let conn = open_connection(&registry.inner.db_path).unwrap();
+        conn.execute(
+            "UPDATE incarnations SET docker_daemon_id=?1,container_id=?2,image_ref='phase3-test-image',runtime_dir=?3,host_binary_path=?4,immutable_config_digest='sha256:phase3-test',launch_state='running' WHERE incarnation_id=?5",
+            params![
+                DockerDaemonId::new().as_str(),
+                format!("container-{}", prepared.incarnation_id),
+                runtime_dir,
+                format!("{runtime_dir}/freshell-session-host"),
                 prepared.incarnation_id.as_str()
             ],
         )
@@ -2821,7 +3018,7 @@ mod tests {
         let request = RequestId::new();
         let payload = b"queued prompt\n";
         let (disposition, incarnation) = registry
-            .begin_input(soul.clone(), request.clone(), payload)
+            .begin_input(soul.clone(), request.clone(), payload, None)
             .await
             .unwrap();
         assert_eq!(disposition, InputJournalDisposition::Dispatch);
@@ -2865,15 +3062,96 @@ mod tests {
         drop(conn);
 
         let (disposition, recorded_incarnation) = registry
-            .begin_input(soul.clone(), request.clone(), payload)
+            .begin_input(soul.clone(), request.clone(), payload, None)
             .await
             .unwrap();
         assert_eq!(disposition, InputJournalDisposition::Ambiguous);
         assert_eq!(recorded_incarnation, prepared.incarnation_id);
         assert!(matches!(
-            registry.begin_input(soul, request, b"different\n").await,
+            registry
+                .begin_input(soul, request, b"different\n", None)
+                .await,
             Err(RegistryError::InputConflict)
         ));
+    }
+
+    #[tokio::test]
+    async fn input_idempotency_digest_includes_fresh_agent_turn_settings() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry = Registry::open(dir.path(), None).unwrap();
+        let soul = SoulId::new();
+        materialize_test_runtime(&registry, soul.clone()).await;
+        let request = RequestId::new();
+
+        registry
+            .begin_input(
+                soul.clone(),
+                request.clone(),
+                b"same prompt",
+                Some(br#"{"model":"model-a"}"#),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            registry
+                .begin_input(
+                    soul,
+                    request,
+                    b"same prompt",
+                    Some(br#"{"model":"model-b"}"#),
+                )
+                .await,
+            Err(RegistryError::InputConflict)
+        ));
+    }
+
+    #[tokio::test]
+    async fn accepted_fresh_agent_turn_settings_are_part_of_exact_recovery_profile() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let nested = workspace.path().join("nested");
+        std::fs::create_dir(&nested).unwrap();
+        let nested = std::fs::canonicalize(nested).unwrap();
+        let registry = Registry::open(dir.path(), None).unwrap();
+        let soul = SoulId::new();
+        let prepared = materialize_fresh_runtime(&registry, soul.clone(), workspace.path()).await;
+
+        registry
+            .record_native_session(
+                soul.clone(),
+                prepared.incarnation_id.clone(),
+                "native-fresh-session".into(),
+            )
+            .await
+            .unwrap();
+
+        registry
+            .update_fresh_agent_settings(
+                soul.clone(),
+                prepared.incarnation_id,
+                FreshAgentTurnSettings {
+                    cwd: Some(nested.to_string_lossy().into_owned()),
+                    model: Some("recovery-model".into()),
+                    effort: Some("high".into()),
+                    permission_mode: Some("accept-edits".into()),
+                    sandbox: Some("danger-full-access".into()),
+                },
+            )
+            .await
+            .unwrap();
+
+        let context = registry.recovery_context(soul).await.unwrap();
+        let recovered = context.fresh_agent.expect("fresh-agent recovery spec");
+        assert_eq!(recovered.cwd, nested.to_string_lossy());
+        assert_eq!(recovered.model.as_deref(), Some("recovery-model"));
+        assert_eq!(recovered.effort.as_deref(), Some("high"));
+        assert_eq!(recovered.permission_mode.as_deref(), Some("accept-edits"));
+        assert_eq!(recovered.sandbox.as_deref(), Some("danger-full-access"));
+        assert_eq!(
+            recovered.native_session_id.as_deref(),
+            Some("native-fresh-session")
+        );
+        assert_eq!(recovered.provider_store_id, "fresh-store");
     }
 
     #[tokio::test]
@@ -2945,7 +3223,7 @@ mod tests {
             .unwrap();
         registry.begin_stop(soul).await.unwrap();
         let error = registry
-            .prepare_replacement(start, None, None, RecoveryPath::NativeResume)
+            .prepare_replacement(start, None, None, None, RecoveryPath::NativeResume)
             .await
             .unwrap_err();
         assert!(matches!(
@@ -3037,6 +3315,7 @@ mod tests {
             .prepare_replacement(
                 start.clone(),
                 Some(terminal.clone()),
+                None,
                 Some(resume_spec.clone()),
                 RecoveryPath::NativeResume,
             )
@@ -3056,6 +3335,7 @@ mod tests {
             .prepare_replacement(
                 start,
                 Some(terminal),
+                None,
                 Some(resume_spec),
                 RecoveryPath::NativeResume,
             )
@@ -3102,7 +3382,7 @@ mod tests {
             .await
             .unwrap();
         let replacement = registry
-            .prepare_replacement(start, None, None, RecoveryPath::PristineSeed)
+            .prepare_replacement(start, None, None, None, RecoveryPath::PristineSeed)
             .await
             .unwrap();
 
@@ -3154,13 +3434,13 @@ mod tests {
             .await
             .unwrap();
         let replacement = registry
-            .prepare_replacement(start.clone(), None, None, RecoveryPath::PristineSeed)
+            .prepare_replacement(start.clone(), None, None, None, RecoveryPath::PristineSeed)
             .await
             .unwrap();
         assert_ne!(replacement.prepared.incarnation_id, prepared.incarnation_id);
         assert!(matches!(
             registry
-                .prepare_replacement(start, None, None, RecoveryPath::PristineSeed)
+                .prepare_replacement(start, None, None, None, RecoveryPath::PristineSeed)
                 .await,
             Err(RegistryError::ActiveIncarnation(_))
         ));

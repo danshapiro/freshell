@@ -9,6 +9,7 @@ publish.workspace = true
 freshell-runtime-protocol = { path = "../freshell-runtime-protocol" }
 tokio = { version = "1", features = ["net", "sync", "fs", "io-util", "macros", "rt"] }
 thiserror = "2"
+serde_json = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"

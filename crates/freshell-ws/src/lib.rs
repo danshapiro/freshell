@@ -49,6 +49,7 @@ pub mod create_limit;
 pub mod existence;
 pub mod host_stats_collector;
 pub mod host_stats_interest;
+pub mod hosted_fresh_agent;
 pub mod identity;
 pub mod invariants;
 pub mod opencode_association;

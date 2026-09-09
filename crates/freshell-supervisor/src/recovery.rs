@@ -190,6 +190,12 @@ impl Supervisor {
             .terminal
             .as_ref()
             .map(|terminal| (terminal.run_as_uid, terminal.run_as_gid))
+            .or_else(|| {
+                context
+                    .fresh_agent
+                    .as_ref()
+                    .map(|agent| (agent.run_as_uid, agent.run_as_gid))
+            })
             // Test fixtures run as the host's workload user (root inside the
             // enclosure); real providers are always probed as their configured
             // unprivileged uid/gid above.
@@ -567,6 +573,7 @@ impl Supervisor {
             .prepare_replacement(
                 start.clone(),
                 replacement_terminal,
+                start.context.fresh_agent.clone(),
                 resume_spec.clone(),
                 path,
             )
@@ -603,6 +610,7 @@ impl Supervisor {
                 soul_id.clone(),
                 prepared.fixture,
                 prepared.terminal.clone(),
+                prepared.fresh_agent.clone(),
                 prepared.resume_spec.clone(),
                 start.context.requested_limits,
             )
@@ -1487,30 +1495,46 @@ impl Supervisor {
             else {
                 return Ok(());
             };
+            let request_id = command.request_id.clone();
+            let host_command = if let Some(agent) = handle.fresh_agent() {
+                HostCommand::FreshAgentSend {
+                    incarnation_id: incarnation_id.clone(),
+                    request_id: request_id.clone(),
+                    text: command.data,
+                    settings: Some(fresh_agent_replay_settings(agent)),
+                }
+            } else {
+                HostCommand::TerminalInput {
+                    incarnation_id: incarnation_id.clone(),
+                    request_id: request_id.clone(),
+                    data: command.data,
+                }
+            };
             let response = self
                 .send_authenticated_host_command(
                     incarnation_id.clone(),
                     handle.runtime_dir(),
                     &host,
-                    HostCommand::TerminalInput {
-                        incarnation_id: incarnation_id.clone(),
-                        request_id: command.request_id.clone(),
-                        data: command.data,
-                    },
+                    host_command,
                 )
                 .await;
             match response {
                 Ok(HostResult::TerminalInput {
                     state: CommandState::Completed,
+                })
+                | Ok(HostResult::FreshAgentCommand {
+                    state: CommandState::ProviderAcked | CommandState::Completed,
+                    ..
                 }) => {
                     self.registry
-                        .mark_input_completed(soul_id.clone(), command.request_id)
+                        .mark_input_completed(soul_id.clone(), request_id)
                         .await
                         .map_err(|error| error.to_string())?;
                 }
-                Ok(HostResult::TerminalInput { state }) => {
+                Ok(HostResult::TerminalInput { state })
+                | Ok(HostResult::FreshAgentCommand { state, .. }) => {
                     self.registry
-                        .mark_input_ambiguous(soul_id.clone(), command.request_id)
+                        .mark_input_ambiguous(soul_id.clone(), request_id)
                         .await
                         .map_err(|error| error.to_string())?;
                     return Err(format!(
@@ -1519,7 +1543,7 @@ impl Supervisor {
                 }
                 Ok(_) => {
                     self.registry
-                        .mark_input_ambiguous(soul_id.clone(), command.request_id)
+                        .mark_input_ambiguous(soul_id.clone(), request_id)
                         .await
                         .map_err(|error| error.to_string())?;
                     return Err(
@@ -1529,7 +1553,7 @@ impl Supervisor {
                 }
                 Err(error) => {
                     self.registry
-                        .mark_input_ambiguous(soul_id.clone(), command.request_id)
+                        .mark_input_ambiguous(soul_id.clone(), request_id)
                         .await
                         .map_err(|registry_error| registry_error.to_string())?;
                     return Err(format!(
@@ -1691,6 +1715,18 @@ impl Supervisor {
                     incarnation_id.to_string(),
                 )
             })
+    }
+}
+
+fn fresh_agent_replay_settings(
+    agent: &freshell_runtime_protocol::FreshAgentLaunchSpec,
+) -> freshell_runtime_protocol::FreshAgentTurnSettings {
+    freshell_runtime_protocol::FreshAgentTurnSettings {
+        cwd: Some(agent.cwd.clone()),
+        model: agent.model.clone(),
+        effort: agent.effort.clone(),
+        permission_mode: agent.permission_mode.clone(),
+        sandbox: agent.sandbox.clone(),
     }
 }
 
@@ -1881,7 +1917,36 @@ fn map_registry(error: RegistryError) -> RuntimeError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use freshell_runtime_protocol::IncarnationId;
+    use freshell_runtime_protocol::{FreshAgentLaunchSpec, FreshProvider, IncarnationId};
+
+    #[test]
+    fn queued_fresh_prompt_replays_with_the_exact_persisted_turn_profile() {
+        let agent = FreshAgentLaunchSpec {
+            session_id: "presentation".into(),
+            provider: FreshProvider::Codex,
+            session_type: "freshcodex".into(),
+            runtime_variant: "codex-app-server".into(),
+            provider_store_id: "store".into(),
+            cwd: "/workspace/nested".into(),
+            workspace_path: "/workspace".into(),
+            git_common_dir: None,
+            run_as_uid: 65_534,
+            run_as_gid: 0,
+            model: Some("model-exact".into()),
+            effort: Some("high".into()),
+            permission_mode: Some("ask".into()),
+            sandbox: Some("workspace-write".into()),
+            native_session_id: Some("thread-exact".into()),
+            provider_bootstrap_files: Vec::new(),
+        };
+
+        let settings = fresh_agent_replay_settings(&agent);
+        assert_eq!(settings.cwd.as_deref(), Some("/workspace/nested"));
+        assert_eq!(settings.model.as_deref(), Some("model-exact"));
+        assert_eq!(settings.effort.as_deref(), Some("high"));
+        assert_eq!(settings.permission_mode.as_deref(), Some("ask"));
+        assert_eq!(settings.sandbox.as_deref(), Some("workspace-write"));
+    }
 
     #[test]
     fn recovery_activation_diagnostic_links_generic_block_to_exact_failure() {

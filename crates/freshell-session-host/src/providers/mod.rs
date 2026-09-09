@@ -7,7 +7,10 @@
 mod claude;
 mod cli;
 mod codex;
+mod fresh_agent;
 mod opencode;
+
+pub(crate) use fresh_agent::open_hosted_fresh_agent;
 
 pub(crate) use codex::PreparedCodexLaunch;
 
@@ -74,7 +77,7 @@ pub async fn probe_resume(
 ) -> RecoveryProbe {
     let provider = resume_spec.provider_session.provider.clone();
     let result = match provider.as_str() {
-        "claude" => claude::probe(&resume_spec, run_as_uid, run_as_gid).await,
+        "claude" | "kilroy" => claude::probe(&resume_spec, run_as_uid, run_as_gid).await,
         "codex" => codex::probe(&resume_spec, run_as_uid, run_as_gid).await,
         "opencode" => opencode::probe(&resume_spec, run_as_uid, run_as_gid).await,
         "amplifier" | "phase1-fixture" | "native-session-fixture" => {

@@ -28,6 +28,8 @@ mod existence;
 mod existence_by_id;
 mod extensions;
 mod files;
+#[cfg(feature = "managed-runtime-v1")]
+mod fresh_agent_proxy;
 mod host_stats;
 mod identity_sink;
 mod instance_id;
@@ -386,6 +388,26 @@ async fn main() -> ExitCode {
     };
     #[cfg(not(feature = "managed-runtime-v1"))]
     let managed_runtime_available = false;
+    #[cfg(feature = "managed-runtime-v1")]
+    if let Some(gateway) = fresh_agent_proxy::HostedFreshAgentProxy::from_opt_in(
+        managed_runtime_client.clone(),
+        Arc::clone(&broadcast_tx),
+    )
+    .unwrap_or_else(|error| {
+        eprintln!("managed fresh-agent gateway initialization failed: {error}");
+        std::process::exit(1);
+    }) {
+        fresh_agent_state
+            .set_hosted_rest_gateway(gateway.clone())
+            .unwrap_or_else(|error| {
+                eprintln!("managed fresh-agent gateway initialization failed: {error}");
+                std::process::exit(1);
+            });
+        freshell_ws::hosted_fresh_agent::install_gateway(gateway).unwrap_or_else(|error| {
+            eprintln!("managed fresh-agent gateway initialization failed: {error}");
+            std::process::exit(1);
+        });
+    }
     // HOST-PRESSURE PANE (Task 9, docs/plans/2026-08-25-host-pressure-pane.md):
     // the Rust host-stats collector — freshell-platform readers over
     // freshell-ws's trait bridge. Constructed here (not at the ~1311

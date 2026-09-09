@@ -908,6 +908,167 @@ pub struct ProviderSecretReference {
     pub approved_endpoint: String,
 }
 
+/// Fresh-agent provider hosted inside one managed soul enclosure. Kilroy is
+/// deliberately distinct from Claude because its runtime bundle/configuration
+/// is part of the durable resume identity even though both use the Claude SDK.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FreshProvider {
+    Claude,
+    Kilroy,
+    Codex,
+    Opencode,
+}
+
+impl FreshProvider {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Claude => "claude",
+            Self::Kilroy => "kilroy",
+            Self::Codex => "codex",
+            Self::Opencode => "opencode",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FreshAgentLaunchSpec {
+    /// Stable presentation/session key used by the external Freshell wire.
+    pub session_id: String,
+    pub provider: FreshProvider,
+    /// `freshclaude`, `kilroy`, `freshcodex`, or `freshopencode`.
+    pub session_type: String,
+    /// Provider runtime/bundle variant; never inferred again during recovery.
+    pub runtime_variant: String,
+    pub provider_store_id: String,
+    pub cwd: String,
+    pub workspace_path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub git_common_dir: Option<String>,
+    pub run_as_uid: u32,
+    pub run_as_gid: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub permission_mode: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sandbox: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_session_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub provider_bootstrap_files: Vec<ProviderBootstrapFile>,
+}
+
+impl FreshAgentLaunchSpec {
+    pub fn validate(&self) -> Result<(), RuntimeError> {
+        let expected_type = match self.provider {
+            FreshProvider::Claude => "freshclaude",
+            FreshProvider::Kilroy => "kilroy",
+            FreshProvider::Codex => "freshcodex",
+            FreshProvider::Opencode => "freshopencode",
+        };
+        if self.session_id.is_empty()
+            || self.session_type != expected_type
+            || self.runtime_variant.is_empty()
+            || self.provider_store_id.is_empty()
+            || self.cwd.is_empty()
+            || self.workspace_path.is_empty()
+            || self.run_as_uid == 0
+            || self.native_session_id.as_deref().is_some_and(str::is_empty)
+            || self.provider_bootstrap_files.len() > 16
+        {
+            return Err(RuntimeError::new(
+                RuntimeErrorCode::InvalidRequest,
+                "managed fresh-agent launch has invalid required fields",
+            ));
+        }
+        for value in [
+            self.model.as_deref(),
+            self.effort.as_deref(),
+            self.permission_mode.as_deref(),
+            self.sandbox.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if value.len() > 256 || value.chars().any(char::is_control) {
+                return Err(RuntimeError::new(
+                    RuntimeErrorCode::InvalidRequest,
+                    "managed fresh-agent setting is oversized or contains control characters",
+                ));
+            }
+        }
+        for file in &self.provider_bootstrap_files {
+            let source = std::path::Path::new(&file.source_path);
+            let relative = std::path::Path::new(&file.provider_relative_path);
+            if !source.is_absolute()
+                || relative.is_absolute()
+                || file.provider_relative_path.is_empty()
+                || relative.components().any(|component| {
+                    matches!(
+                        component,
+                        std::path::Component::ParentDir
+                            | std::path::Component::RootDir
+                            | std::path::Component::Prefix(_)
+                    )
+                })
+            {
+                return Err(RuntimeError::new(
+                    RuntimeErrorCode::InvalidRequest,
+                    "managed provider bootstrap file path is unsafe",
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "data", rename_all = "snake_case")]
+pub enum AgentEvent {
+    Started {
+        native_session_id: String,
+    },
+    Provider {
+        payload: serde_json::Value,
+    },
+    PermissionRequested {
+        decision_id: String,
+        payload: serde_json::Value,
+    },
+    DecisionResolved {
+        decision_id: String,
+    },
+    CommandOutcome {
+        request_id: RequestId,
+        state: CommandState,
+    },
+    Interrupted,
+    Exited {
+        reason: String,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentJournalEvent {
+    pub sequence: u64,
+    pub event: AgentEvent,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentEventBatch {
+    pub retained_from: u64,
+    pub head: u64,
+    pub reset_required: bool,
+    pub events: Vec<AgentJournalEvent>,
+}
+
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TerminalLaunchSpec {

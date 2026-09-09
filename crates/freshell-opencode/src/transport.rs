@@ -226,7 +226,29 @@ pub struct TokioProcessSpawner;
 impl ProcessSpawner for TokioProcessSpawner {
     fn spawn(&self, req: SpawnRequest) -> Result<Box<dyn ServeProcess>, String> {
         use std::process::Stdio;
-        let mut cmd = tokio::process::Command::new(&req.command);
+        let run_as = std::env::var("FRESHELL_PROVIDER_RUN_AS_UID")
+            .ok()
+            .and_then(|uid| {
+                std::env::var("FRESHELL_PROVIDER_RUN_AS_GID")
+                    .ok()
+                    .map(|gid| (uid, gid))
+            });
+        let mut cmd = if let Some((uid, gid)) = run_as {
+            let mut command = tokio::process::Command::new("/usr/bin/setpriv");
+            command.args([
+                "--reuid",
+                &uid,
+                "--regid",
+                &gid,
+                "--clear-groups",
+                "--no-new-privs",
+                "--",
+                &req.command,
+            ]);
+            command
+        } else {
+            tokio::process::Command::new(&req.command)
+        };
         cmd.arg("serve");
         if req.pure {
             cmd.arg("--pure");
