@@ -51,6 +51,7 @@ freshell-terminal = { path = "../freshell-terminal" }
 # injected into every fresh-agent lane (plus the Starting-state watchdog).
 freshell-ownership = { path = "../freshell-ownership" }
 freshell-runtime-client = { path = "../freshell-runtime-client", optional = true }
+freshell-runtime-observability = { path = "../freshell-runtime-observability" }
 freshell-runtime-protocol = { path = "../freshell-runtime-protocol", optional = true }
 # `sync` = the shared broadcast bus; `signal` = graceful SIGTERM shutdown (serve
 # reaping); `time` = the bounded wait for the `ui.screenshot.result` round-trip;

@@ -70,6 +70,12 @@ string_id!(GrantId, "grant-");
 string_id!(RuntimeContainerId, "container-");
 string_id!(DockerDaemonId, "daemon-");
 string_id!(RecoveryAttemptId, "recovery-");
+string_id!(ViewIntentId, "view-");
+string_id!(ProjectionEventId, "projection-");
+string_id!(IncidentId, "incident-");
+string_id!(CorrelationId, "correlation-");
+string_id!(NoticeId, "notice-");
+string_id!(MigrationId, "migration-");
 
 #[derive(Debug, thiserror::Error, Clone, PartialEq, Eq)]
 pub enum IdentityError {
@@ -317,6 +323,8 @@ pub enum RecoveryProbe {
         reason: String,
         #[serde(default)]
         evidence: Vec<String>,
+        #[serde(default)]
+        store_state: EvidenceStoreState,
     },
     Blocked {
         path: RecoveryPath,
@@ -336,6 +344,299 @@ pub enum RecoveryOutcome {
     Lost,
     Stopped,
     AlreadyLive,
+}
+
+pub const LOSS_REPORT_SCHEMA_VERSION: u32 = 1;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RecoveryEvidenceVerdict {
+    DefinitiveNegative,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EvidenceStoreState {
+    #[default]
+    Unknown,
+    NotApplicable,
+    Missing,
+    PresentReadable,
+    PresentUnreadable,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RecoveryPathEvidence {
+    pub path: RecoveryPath,
+    pub verdict: RecoveryEvidenceVerdict,
+    pub reason_code: String,
+    #[serde(default)]
+    pub evidence_refs: Vec<String>,
+    pub store_state: EvidenceStoreState,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum LossDecisionState {
+    Lost,
+    NonResumableTerminalEnded,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LossDecisionSummary {
+    pub state: LossDecisionState,
+    pub reason_code: String,
+    pub unknown_paths: u32,
+    pub retained_recoverable_evidence: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LossBuildEvidence {
+    pub web_commit: String,
+    pub supervisor_commit: String,
+    pub host_image_digest: String,
+    pub provider_version: String,
+    pub protocol_version: u32,
+    pub registry_schema_version: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct IncidentTimelineEvent {
+    pub seq: u64,
+    pub at: String,
+    pub event: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub evidence_ref: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub oom_killed: Option<bool>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CleanupDecisionEvidence {
+    pub owned_handle_ref: String,
+    pub ownership_verified: bool,
+    pub incarnation_id: IncarnationId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LossCleanupReport {
+    pub owned_handle_ref: String,
+    pub ownership_verified: bool,
+    pub graceful_attempt: String,
+    pub forced_attempt: String,
+    pub verified_empty: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub verified_at: Option<String>,
+    pub foreign_objects_touched: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct IncidentAnalysis {
+    pub observed_cause: String,
+    pub missing_invariant: String,
+    #[serde(default)]
+    pub hypotheses: Vec<String>,
+    pub preventive_action: String,
+    pub regression_case: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LostDecisionCertificate {
+    pub schema_version: u32,
+    pub event: String,
+    pub incident_id: IncidentId,
+    pub correlation_id: CorrelationId,
+    pub installation_id: InstallationId,
+    pub soul_id: SoulId,
+    pub provider: String,
+    pub provider_store_id: String,
+    pub native_session_ref_hash: String,
+    pub intent_revision: u64,
+    #[serde(default)]
+    pub incarnations: Vec<IncarnationId>,
+    pub builds: LossBuildEvidence,
+    #[serde(default)]
+    pub timeline: Vec<IncidentTimelineEvent>,
+    #[serde(default)]
+    pub recovery_paths: Vec<RecoveryPathEvidence>,
+    pub decision: LossDecisionSummary,
+    pub cleanup_target: CleanupDecisionEvidence,
+    pub analysis: IncidentAnalysis,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LossIncidentState {
+    CleanupPending,
+    CleanupFailed,
+    Closed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LossIncidentSummary {
+    pub incident_id: IncidentId,
+    pub correlation_id: CorrelationId,
+    pub soul_id: SoulId,
+    pub provider: String,
+    pub state: LossIncidentState,
+    pub reason_code: String,
+    pub observed_cause: String,
+    pub cleanup: LossCleanupReport,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NoticeKind {
+    CleanupSucceeded,
+    CleanupFailed,
+    EndedWithoutProcess,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NoticeDeliveryState {
+    Pending,
+    Rendered,
+    Acknowledged,
+    Dismissed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RuntimeNotice {
+    pub notice_id: NoticeId,
+    pub kind: NoticeKind,
+    pub message: String,
+    pub reference: String,
+    #[serde(default)]
+    pub incident_ids: Vec<IncidentId>,
+    pub delivery_state: NoticeDeliveryState,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PendingNoticesRequest {
+    pub profile_id: String,
+    #[serde(default = "default_projection_limit")]
+    pub limit: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expected_control_epoch: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NoticeReceiptRequest {
+    pub notice_id: NoticeId,
+    pub profile_id: String,
+    pub state: NoticeDeliveryState,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expected_control_epoch: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct IncidentSummaryRequest {
+    pub incident_id: IncidentId,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expected_control_epoch: Option<u64>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RuntimeCounter {
+    pub name: String,
+    pub label: String,
+    pub value: u64,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RuntimeMetricsSnapshot {
+    #[serde(default)]
+    pub counters: Vec<RuntimeCounter>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ManagedRolloutMode {
+    #[default]
+    Legacy,
+    ManagedOptIn,
+    ManagedDefault,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MigrationPlanRequest {
+    pub requested_mode: ManagedRolloutMode,
+    #[serde(default)]
+    pub apply: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub backup_path: Option<String>,
+    /// Optional legacy metadata source inspected read-only. Phase 5 never
+    /// rewrites or deletes the source, even when applying the rollout mode.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub legacy_metadata_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expected_control_epoch: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MigrationPlan {
+    pub migration_id: MigrationId,
+    pub current_mode: ManagedRolloutMode,
+    pub requested_mode: ManagedRolloutMode,
+    pub dry_run: bool,
+    pub controller_ready: bool,
+    pub image_verified: bool,
+    pub registry_backup_required: bool,
+    pub registry_backup_verified: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub registry_backup_path: Option<String>,
+    pub managed_soul_count: u64,
+    pub legacy_metadata_count: u64,
+    pub projected_cpu_milli: u64,
+    pub projected_memory_bytes: u64,
+    pub projected_pids: u64,
+    #[serde(default)]
+    pub blockers: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RepairRequest {
+    #[serde(default)]
+    pub apply: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expected_control_epoch: Option<u64>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RepairAudit {
+    pub registry_integrity: String,
+    pub protected_receipt_count: u64,
+    pub unresolved_object_count: u64,
+    pub unknown_ownership_count: u64,
+    #[serde(default)]
+    pub blocked_objects: Vec<String>,
+    pub mutation_performed: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -389,6 +690,12 @@ pub enum RuntimeErrorCode {
     RegistryBusy,
     RegistryFailure,
     StaleControlEpoch,
+    StaleIntentRevision,
+    LossCertificationBlocked,
+    IncidentPersistenceFailed,
+    NoticeNotFound,
+    MigrationBlocked,
+    RepairBlocked,
     UnknownSoul,
     UnknownIncarnation,
     OwnershipMismatch,
@@ -450,6 +757,128 @@ pub enum RuntimeProfile {
     // terminal callers always send an explicit profile.
     #[default]
     Custom,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InitialScanState {
+    #[default]
+    Pending,
+    Scanning,
+    Complete,
+    Blocked,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ViewIntentKind {
+    #[default]
+    AutomaticPrimary,
+    Explicit,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ViewVisibilityIntent {
+    #[default]
+    Visible,
+    Detached,
+    Hidden,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ViewIntent {
+    pub view_id: ViewIntentId,
+    pub soul_id: SoulId,
+    pub owner_id: String,
+    pub workspace_id: String,
+    pub kind: ViewIntentKind,
+    pub preferred_tab_id: String,
+    pub preferred_pane_id: String,
+    pub title: String,
+    pub placement_group: String,
+    pub visibility: ViewVisibilityIntent,
+    pub revision: u64,
+    pub soul_intent_revision: u64,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ViewIntentRequest {
+    #[serde(default)]
+    pub owner_id: String,
+    #[serde(default)]
+    pub workspace_id: String,
+    #[serde(default)]
+    pub kind: ViewIntentKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preferred_tab_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preferred_pane_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub placement_group: Option<String>,
+    #[serde(default)]
+    pub visibility: ViewVisibilityIntent,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RuntimeReadiness {
+    pub inventory_revision: u64,
+    pub initial_scan_state: InitialScanState,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub initial_scan_started_at: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub initial_scan_finished_at: Option<i64>,
+    #[serde(default)]
+    pub blocked_subsystems: Vec<String>,
+    #[serde(default = "default_startup_recovery_concurrency")]
+    pub startup_recovery_concurrency_limit: u32,
+    #[serde(default)]
+    pub startup_recovery_peak: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub initial_scan_duration_ms: Option<u64>,
+}
+
+fn default_startup_recovery_concurrency() -> u32 {
+    4
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RuntimeInventorySnapshot {
+    pub revision: u64,
+    pub readiness: RuntimeReadiness,
+    #[serde(default)]
+    pub souls: Vec<RuntimeView>,
+    #[serde(default)]
+    pub view_intents: Vec<ViewIntent>,
+    #[serde(default)]
+    pub pending_projection_count: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ViewProjectionEvent {
+    pub event_id: ProjectionEventId,
+    pub event_kind: String,
+    pub view_intent: ViewIntent,
+    pub soul_intent_revision: u64,
+    #[serde(default)]
+    pub inventory_revision: u64,
+    pub created_at: i64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LimitApplication {
+    AppliedNow,
+    NextIncarnation,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -729,6 +1158,8 @@ pub struct LaunchRequest {
     pub fixture: Option<FixtureKind>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub terminal: Option<TerminalLaunchSpec>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub view_intent: Option<ViewIntentRequest>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub expected_control_epoch: Option<u64>,
 }
@@ -766,6 +1197,8 @@ pub enum FixtureKind {
 pub struct StopRequest {
     pub soul_id: SoulId,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub expected_intent_revision: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub expected_control_epoch: Option<u64>,
 }
 
@@ -784,11 +1217,69 @@ pub struct RecoverRequest {
     #[serde(default = "default_recovery_trigger")]
     pub trigger: RecoveryTrigger,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub expected_intent_revision: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub expected_control_epoch: Option<u64>,
 }
 
 fn default_recovery_trigger() -> RecoveryTrigger {
     RecoveryTrigger::ExplicitRequest
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PendingViewProjectionsRequest {
+    #[serde(default = "default_projection_limit")]
+    pub limit: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expected_control_epoch: Option<u64>,
+}
+
+fn default_projection_limit() -> u32 {
+    100
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AcknowledgeViewProjectionRequest {
+    pub event_id: ProjectionEventId,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expected_control_epoch: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateViewVisibilityRequest {
+    pub view_id: ViewIntentId,
+    pub visibility: ViewVisibilityIntent,
+    pub expected_revision: u64,
+    pub expected_soul_intent_revision: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expected_control_epoch: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpsertViewIntentRequest {
+    pub soul_id: SoulId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub view_id: Option<ViewIntentId>,
+    pub intent: ViewIntentRequest,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_revision: Option<u64>,
+    pub expected_soul_intent_revision: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expected_control_epoch: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateLimitsRequest {
+    pub soul_id: SoulId,
+    pub limits: RuntimeLimits,
+    pub expected_intent_revision: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expected_control_epoch: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -798,6 +1289,18 @@ pub enum AdminCommand {
     Launch(Box<LaunchRequest>),
     Stop(StopRequest),
     Inventory,
+    InventorySnapshot,
+    PendingViewProjections(PendingViewProjectionsRequest),
+    AcknowledgeViewProjection(AcknowledgeViewProjectionRequest),
+    UpdateViewVisibility(UpdateViewVisibilityRequest),
+    UpsertViewIntent(UpsertViewIntentRequest),
+    UpdateLimits(UpdateLimitsRequest),
+    PendingNotices(PendingNoticesRequest),
+    NoticeReceipt(NoticeReceiptRequest),
+    IncidentSummary(IncidentSummaryRequest),
+    MetricsSnapshot,
+    MigrationPlan(MigrationPlanRequest),
+    RepairAudit(RepairRequest),
     TerminalInput(TerminalInputRequest),
     TerminalResize(TerminalResizeRequest),
     TerminalReadOutput(TerminalReadOutputRequest),
@@ -806,7 +1309,7 @@ pub enum AdminCommand {
     Recover(RecoverRequest),
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RuntimeView {
     pub soul_id: SoulId,
@@ -821,6 +1324,10 @@ pub struct RuntimeView {
     pub execution_generation: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub effective_limits: Option<RuntimeLimits>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub configured_limits: Option<RuntimeLimits>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub view_intent_revision: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub terminal_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -852,6 +1359,8 @@ pub struct RuntimeView {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub recovery_reason: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub incident_id: Option<IncidentId>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub prior_incarnation_id: Option<IncarnationId>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub recovery_attempt_id: Option<RecoveryAttemptId>,
@@ -876,6 +1385,18 @@ pub struct RecoveryResult {
     pub expected_native_session_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub observed_native_session_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub incident_id: Option<IncidentId>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateLimitsResult {
+    pub view: RuntimeView,
+    pub application: LimitApplication,
+    pub configured_limits: RuntimeLimits,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub effective_limits: Option<RuntimeLimits>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -903,6 +1424,17 @@ pub enum AdminResult {
         view: RuntimeView,
     },
     Inventory(Vec<RuntimeView>),
+    InventorySnapshot(RuntimeInventorySnapshot),
+    PendingViewProjections(Vec<ViewProjectionEvent>),
+    ViewProjectionAcknowledged,
+    ViewIntent(ViewIntent),
+    UpdateLimits(UpdateLimitsResult),
+    PendingNotices(Vec<RuntimeNotice>),
+    NoticeReceiptRecorded,
+    IncidentSummary(LossIncidentSummary),
+    MetricsSnapshot(RuntimeMetricsSnapshot),
+    MigrationPlan(MigrationPlan),
+    RepairAudit(RepairAudit),
     TerminalInput {
         state: CommandState,
     },
@@ -1279,5 +1811,145 @@ mod tests {
         spec.provider_model = None;
         spec.provider_permission_mode = Some("line\nbreak".into());
         assert!(spec.validate().is_err());
+    }
+
+    #[test]
+    fn phase4_inventory_and_view_intent_contract_round_trips() {
+        let soul_id = SoulId::parse("soul-phase4-contract").unwrap();
+        let view = ViewIntent {
+            view_id: ViewIntentId::parse("view-phase4-contract").unwrap(),
+            soul_id: soul_id.clone(),
+            owner_id: "installation-owner".into(),
+            workspace_id: "project-one".into(),
+            kind: ViewIntentKind::AutomaticPrimary,
+            preferred_tab_id: "managed-tab-phase4".into(),
+            preferred_pane_id: "managed-pane-phase4".into(),
+            title: "Recovered Claude agent".into(),
+            placement_group: "Recovered agents".into(),
+            visibility: ViewVisibilityIntent::Visible,
+            revision: 3,
+            soul_intent_revision: 7,
+            created_at: 10,
+            updated_at: 20,
+        };
+        let snapshot = RuntimeInventorySnapshot {
+            revision: 11,
+            readiness: RuntimeReadiness {
+                inventory_revision: 11,
+                initial_scan_state: InitialScanState::Complete,
+                initial_scan_started_at: Some(5),
+                initial_scan_finished_at: Some(9),
+                blocked_subsystems: Vec::new(),
+                startup_recovery_concurrency_limit: 4,
+                startup_recovery_peak: 2,
+                initial_scan_duration_ms: Some(4),
+            },
+            souls: Vec::new(),
+            view_intents: vec![view],
+            pending_projection_count: 1,
+        };
+        let encoded = serde_json::to_value(&snapshot).unwrap();
+        assert_eq!(encoded["readiness"]["initialScanState"], "complete");
+        assert_eq!(encoded["viewIntents"][0]["kind"], "automatic_primary");
+        assert_eq!(encoded["viewIntents"][0]["visibility"], "visible");
+        assert_eq!(
+            serde_json::from_value::<RuntimeInventorySnapshot>(encoded)
+                .unwrap()
+                .view_intents[0]
+                .soul_id,
+            soul_id
+        );
+    }
+
+    #[test]
+    fn legacy_runtime_view_stays_readable_after_phase4_optional_expansion() {
+        let legacy = serde_json::json!({
+            "soulId": "soul-legacy-view",
+            "incarnationId": "incarnation-legacy-view",
+            "launchState": "running",
+            "cleanupState": "none",
+            "intentRevision": 1,
+            "executionGeneration": 1,
+            "desiredState": "running",
+            "recoveryState": "live",
+            "durabilityState": "unknown",
+            "allocationState": "allocated",
+            "evidenceRevision": 0,
+            "successfulRecoveriesInWindow": 0
+        });
+        let decoded: RuntimeView = serde_json::from_value(legacy).unwrap();
+        assert_eq!(decoded.configured_limits, None);
+        assert_eq!(decoded.view_intent_revision, None);
+    }
+
+    #[test]
+    fn phase5_loss_and_notice_contract_round_trips_without_raw_native_identity() {
+        let certificate = LostDecisionCertificate {
+            schema_version: LOSS_REPORT_SCHEMA_VERSION,
+            event: "soul.loss.finalized".into(),
+            incident_id: IncidentId::parse("incident-contract").unwrap(),
+            correlation_id: CorrelationId::parse("correlation-contract").unwrap(),
+            installation_id: InstallationId::parse("installation-contract").unwrap(),
+            soul_id: SoulId::parse("soul-contract").unwrap(),
+            provider: "claude".into(),
+            provider_store_id: "store-contract".into(),
+            native_session_ref_hash: "sha256:deadbeef".into(),
+            intent_revision: 7,
+            incarnations: vec![IncarnationId::parse("incarnation-contract").unwrap()],
+            builds: LossBuildEvidence {
+                web_commit: "unknown".into(),
+                supervisor_commit: "commit".into(),
+                host_image_digest: "sha256:image".into(),
+                provider_version: "1.0".into(),
+                protocol_version: CONTROL_PROTOCOL_VERSION,
+                registry_schema_version: 6,
+            },
+            timeline: vec![],
+            recovery_paths: vec![RecoveryPathEvidence {
+                path: RecoveryPath::NativeResume,
+                verdict: RecoveryEvidenceVerdict::DefinitiveNegative,
+                reason_code: "store_missing".into(),
+                evidence_refs: vec!["evidence://native-store".into()],
+                store_state: EvidenceStoreState::Missing,
+            }],
+            decision: LossDecisionSummary {
+                state: LossDecisionState::Lost,
+                reason_code: "all_applicable_recovery_paths_definitively_unavailable".into(),
+                unknown_paths: 0,
+                retained_recoverable_evidence: false,
+            },
+            cleanup_target: CleanupDecisionEvidence {
+                owned_handle_ref: "registry://incarnation-contract".into(),
+                ownership_verified: true,
+                incarnation_id: IncarnationId::parse("incarnation-contract").unwrap(),
+            },
+            analysis: IncidentAnalysis {
+                observed_cause: "provider state missing".into(),
+                missing_invariant: "checkpoint unavailable".into(),
+                hypotheses: vec![],
+                preventive_action: "retain a verified checkpoint".into(),
+                regression_case: "P5-G02".into(),
+            },
+            created_at: "2026-09-08T00:00:00Z".into(),
+        };
+        let encoded = serde_json::to_string(&certificate).unwrap();
+        assert!(!encoded.contains("native-session-secret"));
+        let restored: LostDecisionCertificate = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(restored, certificate);
+
+        let notice = RuntimeNotice {
+            notice_id: NoticeId::parse("notice-contract").unwrap(),
+            kind: NoticeKind::CleanupSucceeded,
+            message: "Found and cleaned up 1 lost agent process.".into(),
+            reference: "CONTRACT".into(),
+            incident_ids: vec![certificate.incident_id],
+            delivery_state: NoticeDeliveryState::Pending,
+            created_at: "2026-09-08T00:00:00Z".into(),
+        };
+        assert_eq!(
+            serde_json::from_value::<RuntimeNotice>(serde_json::to_value(&notice).unwrap())
+                .unwrap(),
+            notice
+        );
     }
 }

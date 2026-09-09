@@ -1379,6 +1379,7 @@ mod tests {
             existence: &probe,
             pane_ledger: &ledger,
             fresh_agent: None,
+            managed: None,
         };
         let pane = |n: u32, sid: &str| ReconcilePane {
             pane_key: format!("pane-{n}"),

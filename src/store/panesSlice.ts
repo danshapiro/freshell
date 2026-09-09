@@ -36,6 +36,7 @@ import { sanitizeCodexDurabilityRef } from '@shared/codex-durability'
 import { migrateLegacyFreshAgentContent, migrateLegacyFreshAgentDurableState, preservedDurableFreshAgentIdentity } from '@shared/fresh-agent'
 import { normalizeFreshAgentStyleOverride } from '@shared/settings'
 import { parsePaneNamingIdentityInput } from '@/lib/tab-name-source'
+import { ManagedRuntimeProjectionFieldsSchema, type ManagedRuntimeProjectionFields } from '@shared/managed-runtime'
 
 
 const log = createLogger('PanesSlice')
@@ -46,6 +47,27 @@ type FreshAgentSessionMaterializedPayload = {
   sessionType: FreshAgentPaneContent['sessionType']
   provider: FreshAgentPaneContent['provider']
   sessionRef?: SessionLocator
+}
+
+function normalizeManagedRuntimeProjection(
+  input: Record<string, unknown>,
+): ManagedRuntimeProjectionFields {
+  const parsed = ManagedRuntimeProjectionFieldsSchema.safeParse({
+    soulId: input.soulId,
+    incarnationId: input.incarnationId,
+    runtimeState: input.runtimeState,
+    viewIntentId: input.viewIntentId,
+    viewIntentRevision: input.viewIntentRevision,
+    soulIntentRevision: input.soulIntentRevision,
+    incidentId: input.incidentId,
+    placementGroup: input.placementGroup,
+    resourceSummary: input.resourceSummary,
+    recoverySummary: input.recoverySummary,
+  })
+  if (!parsed.success) return {}
+  return Object.fromEntries(
+    Object.entries(parsed.data).filter(([, value]) => value !== undefined),
+  ) as ManagedRuntimeProjectionFields
 }
 
 function buildPreservedSessionRef(
@@ -125,6 +147,7 @@ function normalizePaneContent(
       // merges; a wholesale content swap omits them and clears them.
       ...(launchFailure ? { launchFailure } : {}),
       ...(handoffError ? { handoffError } : {}),
+      ...normalizeManagedRuntimeProjection(input as unknown as Record<string, unknown>),
     }
   }
   if (input.kind === 'browser') {
@@ -189,6 +212,7 @@ function normalizePaneContent(
       if (!staleFoldPreservedIdentity) {
         return {
           kind: 'fresh-agent',
+          ...normalizeManagedRuntimeProjection(rawFreshAgent),
           sessionType: input.sessionType,
           provider: input.provider,
           sessionId: input.sessionId,
@@ -273,6 +297,7 @@ function normalizePaneContent(
     }
     return {
       kind: 'fresh-agent',
+      ...normalizeManagedRuntimeProjection(rawFreshAgent),
       sessionType: input.sessionType,
       provider: input.provider,
       sessionId: input.sessionId,

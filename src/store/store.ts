@@ -26,6 +26,7 @@ import machineIdentityReducer from './machineIdentitySlice'
 import extensionsReducer from './extensionsSlice'
 import deckReducer from './deckSlice'
 import sessionNamesReducer from './sessionNamesSlice'
+import managedRuntimeReducer from './managedRuntimeSlice'
 import { perfMiddleware } from './perfMiddleware'
 import { persistMiddleware } from './persistMiddleware'
 import { sessionActivityPersistMiddleware } from './sessionActivityPersistence'
@@ -97,6 +98,9 @@ export const store = configureStore({
     // last-known server projections only, rebuilt from bootstrap/pushes.
     // Never persisted (allowlist rule).
     sessionNames: sessionNamesReducer,
+    // Authoritative managed-runtime projection — reconstructed from the
+    // supervisor on every connection and deliberately never persisted.
+    managedRuntime: managedRuntimeReducer,
   },
   middleware: (getDefault) =>
     getDefault({

@@ -3303,10 +3303,7 @@ pub(crate) struct LaunchPrep {
 /// block (the claude RESTORE_UNAVAILABLE ladder, :1690-1720) is not
 /// extracted, so there is no error path.
 fn managed_runtime_mode(mode: &str) -> bool {
-    matches!(
-        mode,
-        "shell" | "claude" | "codex" | "opencode" | "amplifier"
-    )
+    mode == "shell" || freshell_agent_runtime::managed_provider_enabled(mode)
 }
 
 fn managed_opencode_endpoint(
@@ -3336,9 +3333,217 @@ fn stable_managed_uuid(create_request_id: &str, domain: &[u8]) -> Uuid {
     Uuid::from_bytes(bytes)
 }
 
+async fn adopt_existing_managed_for_compat(
+    registry: &freshell_terminal::TerminalRegistry,
+    mode: &str,
+    create_request_id: &str,
+    negotiated_managed_runtime: bool,
+) -> Result<Option<freshell_terminal::registry::ManagedTerminalDescriptor>, String> {
+    if negotiated_managed_runtime
+        || !registry.has_managed_controller()
+        || !managed_runtime_mode(mode)
+    {
+        return Ok(None);
+    }
+    let terminal_id = stable_managed_uuid(create_request_id, b"terminal")
+        .simple()
+        .to_string();
+    if !registry
+        .adopt_managed_for_reconcile(&terminal_id, Some(create_request_id.to_string()))
+        .await?
+    {
+        return Ok(None);
+    }
+    registry
+        .managed_descriptor(&terminal_id)
+        .map(Some)
+        .ok_or_else(|| "adopted managed terminal has no descriptor".to_string())
+}
+
+/// Reconstruct the web process's ownership evidence before acknowledging a
+/// supervisor-owned terminal to a legacy client. Adoption never starts or
+/// stops the host process, so a stale claim must refuse without killing it.
+#[allow(clippy::too_many_arguments)]
+fn settle_managed_compat_adoption(
+    registry: &freshell_terminal::TerminalRegistry,
+    ownership: &Option<Arc<freshell_ownership::RuntimeOwnershipRegistry>>,
+    create: &TerminalCreate,
+    conn_id: u64,
+    descriptor: &freshell_terminal::registry::ManagedTerminalDescriptor,
+    terminal_ownership: &mut Option<TerminalOwnershipClaim>,
+    session_ref_lease: &mut Option<SessionRefLeaseGuard>,
+    attach_window_operation_id: Option<&str>,
+) -> Result<Option<SessionLocator>, String> {
+    if descriptor.mode != create.mode
+        || descriptor
+            .create_request_id
+            .as_deref()
+            .is_some_and(|id| id != create.request_id)
+        || !registry.is_pty_running(&descriptor.terminal_id)
+    {
+        return Err("managed adoption identity or liveness changed".to_string());
+    }
+    let locator = descriptor
+        .resume_session_id
+        .as_deref()
+        .filter(|id| !id.is_empty() && descriptor.mode != "shell")
+        .map(|id| SessionLocator {
+            provider: descriptor.mode.clone(),
+            session_id: id.to_string(),
+        });
+    if create_session_locator(create)
+        .as_ref()
+        .is_some_and(|wire| Some(wire) != locator.as_ref())
+    {
+        return Err("managed adoption session identity differs from the create".to_string());
+    }
+    if let Some(locator) = locator.as_ref() {
+        if terminal_ownership.is_none() {
+            let operation_id = format!("term-create-compat-{}", create.request_id);
+            let initiator = format!("ws-conn-{conn_id}");
+            let claim = match attach_window_operation_id {
+                Some(window_op) => {
+                    freshell_freshagent::ownership_lane::begin_terminal_lane_claim_under_attach_window(
+                        ownership,
+                        &locator.provider,
+                        &locator.session_id,
+                        &operation_id,
+                        None,
+                        &initiator,
+                        now_ms().max(0) as u64,
+                        window_op,
+                    )
+                }
+                None => freshell_freshagent::ownership_lane::begin_terminal_lane_claim(
+                    ownership,
+                    &locator.provider,
+                    &locator.session_id,
+                    &operation_id,
+                    None,
+                    &initiator,
+                    now_ms().max(0) as u64,
+                ),
+            };
+            match claim {
+                freshell_freshagent::ownership_lane::TerminalLaneClaim::Granted(ticket) => {
+                    *terminal_ownership = Some(TerminalOwnershipClaim {
+                        ticket,
+                        registry: registry.clone(),
+                        locator: locator.clone(),
+                    });
+                }
+                freshell_freshagent::ownership_lane::TerminalLaneClaim::Adopt => {
+                    let same_owner = ownership.as_ref().is_some_and(|coordinator| {
+                        matches!(
+                            coordinator.observe(&locator.provider, &locator.session_id).state,
+                            freshell_ownership::OwnershipState::Live { owner, .. }
+                                if owner.kind == freshell_ownership::RuntimeOwnerKind::Terminal
+                                    && owner.terminal_id.as_deref()
+                                        == Some(descriptor.terminal_id.as_str())
+                        )
+                    });
+                    if !same_owner {
+                        return Err("managed adoption conflicts with another live owner".into());
+                    }
+                }
+                freshell_freshagent::ownership_lane::TerminalLaneClaim::Unwired => {}
+                freshell_freshagent::ownership_lane::TerminalLaneClaim::Refused(outcome) => {
+                    return Err(format!("managed adoption ownership refused: {outcome:?}"));
+                }
+            }
+        }
+        if let Some(claim) = terminal_ownership.take() {
+            if claim.locator != *locator {
+                return Err("managed adoption ownership claim has a different session".into());
+            }
+            claim
+                .commit(&descriptor.terminal_id)
+                .map_err(|outcome| format!("managed adoption ownership moved: {outcome:?}"))?;
+        }
+        if let Some(lease) = session_ref_lease.as_ref() {
+            if lease.locator != *locator {
+                return Err("managed adoption lease has a different session".into());
+            }
+            if !registry.complete_session_ref_claim(
+                locator,
+                &create.request_id,
+                &descriptor.terminal_id,
+            ) {
+                return Err("managed adoption session lease was revoked".into());
+            }
+            let _ = session_ref_lease.take().expect("lease is present").disarm();
+        }
+    }
+    Ok(locator)
+}
+
 #[cfg(test)]
 mod managed_runtime_id_tests {
-    use super::{managed_opencode_endpoint, managed_runtime_mode, stable_managed_uuid};
+    use super::{
+        adopt_existing_managed_for_compat, managed_opencode_endpoint, managed_runtime_mode,
+        stable_managed_uuid, ServerMessage,
+    };
+    use freshell_terminal::registry::{
+        ManagedOutputRead, ManagedTerminalController, ManagedTerminalDescriptor,
+        ManagedTerminalFuture, ManagedTerminalLaunch,
+    };
+    use std::sync::Arc;
+
+    struct LookupOnlyController {
+        descriptor: ManagedTerminalDescriptor,
+    }
+
+    impl ManagedTerminalController for LookupOnlyController {
+        fn lookup_terminal<'a>(
+            &'a self,
+            terminal_id: &'a str,
+            _create_request_id: Option<String>,
+        ) -> ManagedTerminalFuture<'a, Result<Option<ManagedTerminalDescriptor>, String>> {
+            Box::pin(async move {
+                Ok((terminal_id == self.descriptor.terminal_id).then(|| self.descriptor.clone()))
+            })
+        }
+
+        fn launch<'a>(
+            &'a self,
+            _request: ManagedTerminalLaunch,
+        ) -> ManagedTerminalFuture<'a, Result<ManagedTerminalDescriptor, String>> {
+            Box::pin(async { Err("launch must not run during compatibility adoption".into()) })
+        }
+
+        fn input<'a>(
+            &'a self,
+            _terminal: ManagedTerminalDescriptor,
+            _data: String,
+        ) -> ManagedTerminalFuture<'a, Result<(), String>> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn resize<'a>(
+            &'a self,
+            _terminal: ManagedTerminalDescriptor,
+            _cols: u16,
+            _rows: u16,
+        ) -> ManagedTerminalFuture<'a, Result<(), String>> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn stop<'a>(
+            &'a self,
+            _terminal: ManagedTerminalDescriptor,
+        ) -> ManagedTerminalFuture<'a, Result<(), String>> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn read_output<'a>(
+            &'a self,
+            _terminal: ManagedTerminalDescriptor,
+            _after_seq: i64,
+            _max_bytes: u64,
+        ) -> ManagedTerminalFuture<'a, Result<ManagedOutputRead, String>> {
+            Box::pin(async { Err("not needed".into()) })
+        }
+    }
 
     #[test]
     fn managed_ids_are_retry_stable_and_domain_separated() {
@@ -3353,12 +3558,21 @@ mod managed_runtime_id_tests {
     }
 
     #[test]
-    fn phase3_managed_modes_cover_every_enabled_terminal_provider() {
-        for mode in ["shell", "claude", "codex", "opencode", "amplifier"] {
-            assert!(managed_runtime_mode(mode), "missing managed mode {mode}");
+    fn managed_modes_follow_the_release_qualification_manifest() {
+        let manifest: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../docs/development/runtime-provider-capabilities.json"
+        ))
+        .unwrap();
+        assert!(managed_runtime_mode("shell"));
+        for provider in manifest["providers"].as_array().unwrap() {
+            let mode = provider["provider"].as_str().unwrap();
+            let expected = provider["managedEnabled"].as_bool().unwrap();
+            assert_eq!(
+                managed_runtime_mode(mode),
+                expected,
+                "managed routing drifted from release qualification for {mode}"
+            );
         }
-        assert!(!managed_runtime_mode("gemini"));
-        assert!(!managed_runtime_mode("kimi"));
     }
 
     #[test]
@@ -3369,6 +3583,198 @@ mod managed_runtime_id_tests {
         assert_eq!(endpoint.port, 4096);
         assert!(managed_opencode_endpoint("opencode", false).is_none());
         assert!(managed_opencode_endpoint("shell", true).is_none());
+    }
+
+    #[tokio::test]
+    async fn legacy_capability_replay_adopts_existing_managed_terminal_without_launch() {
+        let registry = freshell_terminal::TerminalRegistry::new();
+        let create_request_id = "create-old-client-managed";
+        let terminal_id = stable_managed_uuid(create_request_id, b"terminal")
+            .simple()
+            .to_string();
+        let descriptor = ManagedTerminalDescriptor {
+            soul_id: "soul-old-client".into(),
+            incarnation_id: "incarnation-old-client".into(),
+            terminal_id: terminal_id.clone(),
+            stream_id: "stream-old-client".into(),
+            mode: "opencode".into(),
+            cwd: "/workspace".into(),
+            resume_session_id: Some("ses_old_client".into()),
+            create_request_id: Some(create_request_id.into()),
+        };
+        registry.set_managed_controller(Some(Arc::new(LookupOnlyController {
+            descriptor: descriptor.clone(),
+        })));
+
+        let adopted =
+            adopt_existing_managed_for_compat(&registry, "opencode", create_request_id, false)
+                .await
+                .unwrap()
+                .expect("old-capability replay adopts the managed row");
+        assert_eq!(adopted, descriptor);
+        assert!(registry.is_managed(&terminal_id));
+
+        assert!(
+            adopt_existing_managed_for_compat(&registry, "opencode", create_request_id, true,)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    async fn assert_compat_create_retains_ownership(wire_ref: bool, already_registered: bool) {
+        let ownership = Arc::new(freshell_ownership::RuntimeOwnershipRegistry::new());
+        let mut state = super::pane_reconcile_gate_tests::state();
+        state.registry =
+            freshell_terminal::TerminalRegistry::new().with_ownership(Arc::clone(&ownership));
+        state.ownership = Some(Arc::clone(&ownership));
+        state.cli_commands = Arc::new(vec![freshell_platform::CliCommandSpec {
+            name: "opencode".into(),
+            label: "OpenCode".into(),
+            default_cmd: "opencode".into(),
+            ..Default::default()
+        }]);
+        let create_request_id = format!("compat-{wire_ref}-{already_registered}");
+        let terminal_id = stable_managed_uuid(&create_request_id, b"terminal")
+            .simple()
+            .to_string();
+        let descriptor = ManagedTerminalDescriptor {
+            soul_id: "soul-compat".into(),
+            incarnation_id: "incarnation-compat".into(),
+            terminal_id: terminal_id.clone(),
+            stream_id: "stream-compat".into(),
+            mode: "opencode".into(),
+            cwd: "/workspace".into(),
+            resume_session_id: Some("ses_compat".into()),
+            create_request_id: Some(create_request_id.clone()),
+        };
+        state
+            .registry
+            .set_managed_controller(Some(Arc::new(LookupOnlyController {
+                descriptor: descriptor.clone(),
+            })));
+        if already_registered {
+            state.registry.register_managed(descriptor);
+        }
+
+        let frames = Arc::new(std::sync::Mutex::new(Vec::<ServerMessage>::new()));
+        let collector = Arc::clone(&frames);
+        let sink: freshell_terminal::FrameSink = Arc::new(move |message| {
+            collector.lock().expect("frames lock").push(message);
+        });
+        let mut output = crate::create_gate::CreateOutput::Channel(&sink);
+        let mut body = serde_json::json!({
+            "requestId": create_request_id,
+            "mode": "opencode",
+            "shell": "system",
+            "restore": true,
+        });
+        if wire_ref {
+            body["sessionRef"] = serde_json::json!({
+                "provider": "opencode", "sessionId": "ses_compat"
+            });
+        }
+        let create: freshell_protocol::TerminalCreate =
+            serde_json::from_value(body).expect("terminal create");
+        let mut limiter = crate::create_limit::CreateRateLimiter::new(100, 1000);
+        assert!(
+            super::handle_create(
+                create,
+                None,
+                &mut output,
+                &state,
+                17,
+                true,
+                &mut limiter,
+                &super::ConnectionIdentity::default(),
+                super::now_ms(),
+            )
+            .await
+        );
+        assert!(frames.lock().expect("frames lock").iter().any(|frame| {
+            matches!(frame, ServerMessage::TerminalCreated(created) if created.terminal_id == terminal_id)
+        }));
+        let snapshot = ownership.observe("opencode", "ses_compat");
+        assert!(matches!(
+            snapshot.state,
+            freshell_ownership::OwnershipState::Live { ref owner, .. }
+                if owner.kind == freshell_ownership::RuntimeOwnerKind::Terminal
+                    && owner.terminal_id.as_deref() == Some(terminal_id.as_str())
+        ));
+        assert!(matches!(
+            ownership.begin_start(
+                "opencode",
+                "ses_compat",
+                freshell_ownership::RuntimeOwnerKind::FreshAgent,
+                "fresh-agent-after-compat",
+                None,
+                "test",
+                super::now_ms().max(0) as u64,
+            ),
+            freshell_ownership::BeginOutcome::OwnedByOtherKind { .. }
+        ));
+        if wire_ref {
+            let locator = freshell_protocol::SessionLocator {
+                provider: "opencode".into(),
+                session_id: "ses_compat".into(),
+            };
+            assert_eq!(
+                state.registry.bound_terminal_for_session_ref(&locator),
+                Some(terminal_id),
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn legacy_compat_lookup_commits_wire_claim_and_lease() {
+        assert_compat_create_retains_ownership(true, false).await;
+    }
+
+    #[tokio::test]
+    async fn legacy_compat_lookup_claims_learned_identity() {
+        assert_compat_create_retains_ownership(false, false).await;
+    }
+
+    #[tokio::test]
+    async fn keyed_create_adopt_of_managed_row_retains_ownership() {
+        assert_compat_create_retains_ownership(false, true).await;
+    }
+
+    #[test]
+    fn managed_compat_adoption_rejects_mismatched_identity() {
+        let registry = freshell_terminal::TerminalRegistry::new();
+        let create: freshell_protocol::TerminalCreate = serde_json::from_value(serde_json::json!({
+            "requestId": "create-match",
+            "mode": "opencode",
+            "shell": "system",
+            "sessionRef": { "provider": "opencode", "sessionId": "ses_match" }
+        }))
+        .expect("terminal create");
+        let mut descriptor = ManagedTerminalDescriptor {
+            soul_id: "soul-match".into(),
+            incarnation_id: "incarnation-match".into(),
+            terminal_id: "terminal-match".into(),
+            stream_id: "stream-match".into(),
+            mode: "opencode".into(),
+            cwd: "/workspace".into(),
+            resume_session_id: Some("ses_match".into()),
+            create_request_id: Some("create-match".into()),
+        };
+        registry.register_managed(descriptor.clone());
+        let check = |descriptor: &ManagedTerminalDescriptor| {
+            super::settle_managed_compat_adoption(
+                &registry, &None, &create, 17, descriptor, &mut None, &mut None, None,
+            )
+        };
+        assert!(check(&descriptor).is_ok());
+        descriptor.mode = "claude".into();
+        assert!(check(&descriptor).is_err());
+        descriptor.mode = "opencode".into();
+        descriptor.create_request_id = Some("another-create".into());
+        assert!(check(&descriptor).is_err());
+        descriptor.create_request_id = Some("create-match".into());
+        descriptor.resume_session_id = Some("ses_other".into());
+        assert!(check(&descriptor).is_err());
     }
 }
 
@@ -4042,6 +4448,34 @@ pub(crate) async fn handle_create(
                 .registry
                 .newest_live_by_create_request_id(&create.request_id)
             {
+                let managed_locator =
+                    if let Some(descriptor) = state.registry.managed_descriptor(&existing) {
+                        let mut claim = None;
+                        let mut lease = None;
+                        match settle_managed_compat_adoption(
+                            &state.registry,
+                            &state.ownership,
+                            &create,
+                            conn_id,
+                            &descriptor,
+                            &mut claim,
+                            &mut lease,
+                            None,
+                        ) {
+                            Ok(locator) => locator,
+                            Err(error) => {
+                                return send_create_error(
+                                    out,
+                                    ErrorCode::SessionReserved,
+                                    error,
+                                    &create.request_id,
+                                )
+                                .await;
+                            }
+                        }
+                    } else {
+                        None
+                    };
                 tracing::info!(
                     terminal_id = %existing,
                     create_request_id = %create.request_id,
@@ -4059,7 +4493,10 @@ pub(crate) async fn handle_create(
                     cwd: state.registry.probe(&existing).and_then(|row| row.cwd),
                     notice: None,
                     restore_error: None,
-                    session_ref: state.identity.session_ref_for(&existing),
+                    session_ref: state
+                        .identity
+                        .session_ref_for(&existing)
+                        .or(managed_locator),
                     // Unified agent names (Task 2): the adopted terminal's
                     // retained naming binding (its registry cache carries the
                     // last-known record).
@@ -4690,8 +5127,91 @@ pub(crate) async fn handle_create(
         .await;
     }
 
-    // A legacy prepared Codex restore already reserved its terminal ID before
-    // off-permit planning; the managed lane uses stable IDs for retry parity.
+    // Compatibility fence: a client that predates managedRuntimeV1 may still
+    // replay a pane created by a newer client. It must never spawn a second
+    // legacy provider for the same durable create key. Reconstruct the
+    // supervisor-owned facade by the deterministic terminal id and answer the
+    // ordinary terminal.created shape; attach/input then use the existing
+    // terminal protocol without requiring the old client to understand souls.
+    match adopt_existing_managed_for_compat(
+        &state.registry,
+        &mode,
+        &create.request_id,
+        use_managed_runtime,
+    )
+    .await
+    {
+        Ok(Some(descriptor)) => {
+            let managed_terminal_id = descriptor.terminal_id.clone();
+            let session_ref = match settle_managed_compat_adoption(
+                &state.registry,
+                &state.ownership,
+                &create,
+                conn_id,
+                &descriptor,
+                &mut terminal_ownership,
+                &mut session_ref_lease,
+                _wire_adopt_guard.as_ref().map(|guard| guard.operation_id()),
+            ) {
+                Ok(locator) => locator,
+                Err(error) => {
+                    return send_create_error(
+                        out,
+                        ErrorCode::SessionReserved,
+                        error,
+                        &create.request_id,
+                    )
+                    .await;
+                }
+            };
+            tracing::info!(
+                terminal_id = %managed_terminal_id,
+                create_request_id = %create.request_id,
+                mode = %mode,
+                "terminal.create.compat_adopted_managed"
+            );
+            let dedupe_request_id = create.request_id.clone();
+            let created = ServerMessage::TerminalCreated(TerminalCreated {
+                created_at: now_ms(),
+                request_id: create.request_id,
+                terminal_id: managed_terminal_id.clone(),
+                clear_codex_durability: None,
+                cwd: Some(descriptor.cwd),
+                notice: Some(
+                    "Reattached to the existing managed agent without launching a duplicate."
+                        .to_string(),
+                ),
+                restore_error: None,
+                session_ref,
+                session_name: state.registry.session_name_of(&managed_terminal_id),
+                name_ref: state.identity.name_ref_for(&managed_terminal_id),
+            });
+            let sent = out.send(&created).await;
+            state.create_dedupe.settle(
+                &dedupe_request_id,
+                &managed_terminal_id,
+                &created,
+                create.restore,
+                |terminal_id| state.registry.is_pty_running(terminal_id),
+            );
+            return sent;
+        }
+        Ok(None) => {}
+        Err(error) => {
+            return send_create_error(
+                out,
+                ErrorCode::PtySpawnFailed,
+                format!("managed runtime compatibility lookup failed: {error}"),
+                &create.request_id,
+            )
+            .await;
+        }
+    }
+
+    // Managed create retries must be payload-identical across web-process
+    // replacement. Derive both IDs from the pane's durable createRequestId.
+    // Legacy Codex resumes reuse the ID reserved by their prepared sidecar
+    // setup before the spawn gate; other legacy creates retain random UUIDs.
     let (terminal_id, stream_id) = if use_managed_runtime {
         (
             stable_managed_uuid(&create.request_id, b"terminal")
@@ -5761,6 +6281,8 @@ pub(crate) async fn handle_create(
             provider_model: model.clone(),
             provider_sandbox: sandbox.clone(),
             provider_permission_mode: permission_mode.clone(),
+            view_tab_id: create.tab_id.clone(),
+            view_pane_id: create.pane_id.clone(),
             create_request_id: Some(create.request_id.clone()),
         };
         match state.registry.launch_managed(managed).await {
@@ -7293,6 +7815,12 @@ async fn handle_pane_reconcile(
         )
         .await;
     }
+    // Managed pre-pass. Adoption reconstructs the browser-facing facade for a
+    // supervisor-owned soul BEFORE the legacy ladder consults host-local
+    // provider stores. A lookup that FAILS is recorded rather than ignored: an
+    // unreadable managed truth must withhold the ladder's authority to declare
+    // that soul dead (see `ManagedReconcileFacts`).
+    let mut managed_facts = crate::reconcile::ManagedReconcileFacts::default();
     if managed_runtime_v1 {
         for pane in request
             .panes
@@ -7316,15 +7844,19 @@ async fn handle_pane_reconcile(
                     "pane_reconcile.adopted_managed_terminal"
                 ),
                 Ok(false) => {}
-                Err(error) => tracing::warn!(
-                    terminal_id,
-                    pane_key = %pane.pane_key,
-                    %error,
-                    "pane_reconcile.managed_terminal_lookup_failed"
-                ),
+                Err(error) => {
+                    tracing::warn!(
+                        terminal_id,
+                        pane_key = %pane.pane_key,
+                        %error,
+                        "pane_reconcile.managed_terminal_lookup_failed"
+                    );
+                    managed_facts.mark_indeterminate(pane.pane_key.clone());
+                }
             }
         }
     }
+    let managed_facts = (!managed_facts.is_empty()).then_some(managed_facts);
 
     // Built ONCE per reconcile request and reused for any re-derivation of deps
     // (B1's warming deferral re-derives via rebuild_deps — rebuilding the
@@ -7352,6 +7884,7 @@ async fn handle_pane_reconcile(
             existence: state.session_existence.as_ref(),
             pane_ledger: &state.pane_ledger,
             fresh_agent: fresh_agent_snapshot.as_ref(),
+            managed: managed_facts.as_ref(),
         };
         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             crate::reconcile::derive_verdicts(&deps, &request.panes)

@@ -18,9 +18,10 @@
     "dev:client": "vite --config config/vite/vite.config.ts",
     "predev:server": "pnpm run prepare:rust-runtime",
     "dev:server": "tsx scripts/run-with-default-port.ts cargo run -p freshell-server --locked",
-    "typecheck": "pnpm run typecheck:client && pnpm run typecheck:tools",
+    "typecheck": "pnpm run typecheck:client && pnpm run typecheck:tools && pnpm run typecheck:runtime",
     "typecheck:client": "tsc -p tsconfig.json --noEmit",
     "typecheck:tools": "tsc -p tsconfig.tools.json --noEmit",
+    "typecheck:runtime": "tsc -p tsconfig.runtime.json",
     "prebuild": "tsx scripts/prebuild-guard.ts",
     "postinstall": "node scripts/install-hooks.mjs",
     "build": "pnpm run typecheck:client && pnpm run build:client && pnpm run build:tools && pnpm run build:rust",
@@ -91,12 +92,14 @@
     "visible-first:contract:check": "tsx scripts/assert-visible-first-acceptance.ts",
     "perf:audit:compare": "tsx scripts/compare-visible-first-audit.ts",
     "perf:audit:gate": "tsx scripts/assert-visible-first-audit-gate.ts",
-    "contract:generate": "tsx port/contract/generate-ws-contract.ts",
+    "contract:generate": "tsx port/contract/generate-ws-contract.ts && tsx port/contract/generate-managed-runtime-contract.ts",
     "test:port": "vitest run --config config/vitest/vitest.port.config.ts",
     "test:oracle": "vitest run --config config/vitest/vitest.oracle.config.ts",
     "test:sandbox": "bash scripts/sandbox-test.sh",
     "test:runtime": "tsx scripts/testing/test-coordinator.ts run test:runtime",
-    "test:runtime:raw": "tsx scripts/testing/runtime-gate.ts"
+    "test:runtime:raw": "tsx scripts/testing/runtime-gate.ts",
+    "test:runtime:phase5:soak": "tsx scripts/testing/runtime-phase5-soak.ts",
+    "test:runtime:campaign": "tsx scripts/testing/runtime-landing-campaign.ts"
   },
   "dependencies": {
     "@dnd-kit/core": "^6.3.1",

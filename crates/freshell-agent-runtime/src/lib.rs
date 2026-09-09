@@ -6,9 +6,9 @@
 //! the session host is the only component allowed to execute provider code.
 
 use freshell_runtime_protocol::{
-    AllocationState, DurablePosition, IdentityProvenance, ProviderSessionRef, RecoveryBlockReason,
-    ResumeSpec, RetryHint, RuntimeError, RuntimeErrorCode, TerminalLaunchSpec,
-    RESUME_SPEC_SCHEMA_VERSION,
+    AllocationState, DurablePosition, EvidenceStoreState, IdentityProvenance, ProviderSessionRef,
+    RecoveryBlockReason, RecoveryPath, ResumeSpec, RetryHint, RuntimeError, RuntimeErrorCode,
+    TerminalLaunchSpec, RESUME_SPEC_SCHEMA_VERSION,
 };
 use rusqlite::{Connection, OpenFlags};
 use serde::{Deserialize, Serialize};
@@ -23,15 +23,53 @@ pub const MAX_SUCCESSFUL_RECOVERIES_PER_HOUR: u64 = 5;
 pub const RECOVERY_WINDOW_MS: i64 = 60 * 60 * 1_000;
 pub const AUTOMATIC_RETRY_DELAYS_MS: [u64; 2] = [2_000, 10_000];
 
+/// Whether a provider's durable-soul behavior has actually been proven by a
+/// live, candidate-bound certification campaign.
+///
+/// This is deliberately a separate axis from `managed_enabled`: deterministic
+/// implementation support can exist and be unit-tested long before a real
+/// provider turn has ever been observed. Only `Certified` authorizes a
+/// production durable-soul promise; the landing gate may defer the rest, and
+/// the production gate stays blocked while any remain deferred.
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CertificationState {
+    /// A live provider campaign produced a candidate-bound PASS receipt.
+    Certified,
+    /// The adapter exists and is deterministically tested, but no live receipt
+    /// exists yet. The provider must not be advertised as production-ready.
+    PendingLiveProviderCertification,
+    /// The provider makes no managed durable-soul claim at all.
+    NotApplicable,
+}
+
+impl CertificationState {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Certified => "certified",
+            Self::PendingLiveProviderCertification => "pending_live_provider_certification",
+            Self::NotApplicable => "not_applicable",
+        }
+    }
+}
+
+/// The typed reason a provider is withheld from the production release scope.
+pub const PENDING_LIVE_PROVIDER_CERTIFICATION_REASON: &str = "pending_live_provider_certification";
+
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct ProviderCapability {
     pub provider: &'static str,
+    /// Certification is the outer bound on every other release promise below.
+    pub certification_state: CertificationState,
     pub managed_enabled: bool,
     /// True only when Phase 3 can prove exact durable conversation recovery.
     /// A managed shell remains useful but is intentionally not counted as an
     /// AI-provider durability claim after its live process exits.
     pub durable_recovery_enabled: bool,
+    /// Complete recovery-path inventory consumed by the Phase 5 loss
+    /// certificate. An absent path is explicitly inapplicable.
+    pub recovery_paths: &'static [RecoveryPath],
     pub managed_modes: &'static [&'static str],
     pub execution_boundary: &'static str,
     pub identity_capture: &'static str,
@@ -50,8 +88,10 @@ pub struct ProviderCapability {
 pub const PROVIDER_CAPABILITIES: &[ProviderCapability] = &[
     ProviderCapability {
         provider: "shell",
+        certification_state: CertificationState::Certified,
         managed_enabled: true,
         durable_recovery_enabled: false,
+        recovery_paths: &[RecoveryPath::Reattach, RecoveryPath::PristineSeed],
         managed_modes: &["shell"],
         execution_boundary: "session-host-pty",
         identity_capture: "none-live-process-only",
@@ -65,8 +105,15 @@ pub const PROVIDER_CAPABILITIES: &[ProviderCapability] = &[
     },
     ProviderCapability {
         provider: "claude",
-        managed_enabled: true,
-        durable_recovery_enabled: true,
+        certification_state: CertificationState::PendingLiveProviderCertification,
+        managed_enabled: false,
+        durable_recovery_enabled: false,
+        recovery_paths: &[
+            RecoveryPath::Reattach,
+            RecoveryPath::NativeResume,
+            RecoveryPath::CheckpointRestore,
+            RecoveryPath::PristineSeed,
+        ],
         managed_modes: &["claude"],
         execution_boundary: "session-host-pty",
         identity_capture: "preallocated-session-id-plus-transcript-probe",
@@ -76,12 +123,19 @@ pub const PROVIDER_CAPABILITIES: &[ProviderCapability] = &[
         checkpoint_policy: "provider-transcript-only",
         bootstrap: ".claude/.credentials.json copied before privilege drop",
         live_gate: "haiku-lowest-reasoning",
-        blocked_reason: None,
+        blocked_reason: Some("PENDING_LIVE_QUALIFICATION"),
     },
     ProviderCapability {
         provider: "opencode",
+        certification_state: CertificationState::Certified,
         managed_enabled: true,
         durable_recovery_enabled: true,
+        recovery_paths: &[
+            RecoveryPath::Reattach,
+            RecoveryPath::NativeResume,
+            RecoveryPath::CheckpointRestore,
+            RecoveryPath::PristineSeed,
+        ],
         managed_modes: &["opencode"],
         execution_boundary: "session-host-pty",
         identity_capture: "soul-local-sqlite-exact-row",
@@ -95,8 +149,15 @@ pub const PROVIDER_CAPABILITIES: &[ProviderCapability] = &[
     },
     ProviderCapability {
         provider: "codex",
-        managed_enabled: true,
-        durable_recovery_enabled: true,
+        certification_state: CertificationState::PendingLiveProviderCertification,
+        managed_enabled: false,
+        durable_recovery_enabled: false,
+        recovery_paths: &[
+            RecoveryPath::Reattach,
+            RecoveryPath::NativeResume,
+            RecoveryPath::CheckpointRestore,
+            RecoveryPath::PristineSeed,
+        ],
         managed_modes: &["codex"],
         execution_boundary: "session-host-pty-plus-app-server-proxy",
         identity_capture: "host-proxy-exact-thread-event-plus-rollout-probe",
@@ -106,12 +167,19 @@ pub const PROVIDER_CAPABILITIES: &[ProviderCapability] = &[
         checkpoint_policy: "provider-rollout-only",
         bootstrap: ".codex/auth.json copied before privilege drop",
         live_gate: "gpt-5.6-luna-lowest-reasoning",
-        blocked_reason: None,
+        blocked_reason: Some("PENDING_LIVE_QUALIFICATION"),
     },
     ProviderCapability {
         provider: "amplifier",
-        managed_enabled: true,
-        durable_recovery_enabled: true,
+        certification_state: CertificationState::PendingLiveProviderCertification,
+        managed_enabled: false,
+        durable_recovery_enabled: false,
+        recovery_paths: &[
+            RecoveryPath::Reattach,
+            RecoveryPath::NativeResume,
+            RecoveryPath::CheckpointRestore,
+            RecoveryPath::PristineSeed,
+        ],
         managed_modes: &["amplifier"],
         execution_boundary: "session-host-pty",
         identity_capture: "launcher-stub-plus-exact-materialized-session-directory",
@@ -121,12 +189,14 @@ pub const PROVIDER_CAPABILITIES: &[ProviderCapability] = &[
         checkpoint_policy: "provider-session-directory",
         bootstrap: ".amplifier/settings.yaml copied before privilege drop",
         live_gate: "provider-approved-lowest-cost-model",
-        blocked_reason: None,
+        blocked_reason: Some("PENDING_LIVE_QUALIFICATION"),
     },
     ProviderCapability {
         provider: "gemini",
+        certification_state: CertificationState::NotApplicable,
         managed_enabled: false,
         durable_recovery_enabled: false,
+        recovery_paths: &[],
         managed_modes: &["gemini"],
         execution_boundary: "legacy-extension",
         identity_capture: "none",
@@ -140,8 +210,10 @@ pub const PROVIDER_CAPABILITIES: &[ProviderCapability] = &[
     },
     ProviderCapability {
         provider: "kimi",
+        certification_state: CertificationState::NotApplicable,
         managed_enabled: false,
         durable_recovery_enabled: false,
+        recovery_paths: &[],
         managed_modes: &["kimi"],
         execution_boundary: "legacy-extension",
         identity_capture: "none",
@@ -164,6 +236,7 @@ pub enum ProviderStoreProbe {
     DefinitivelyUnavailable {
         reason: String,
         evidence: Vec<String>,
+        store_state: EvidenceStoreState,
     },
     Blocked {
         reason: RecoveryBlockReason,
@@ -199,8 +272,55 @@ pub fn capability(provider: &str) -> Option<&'static ProviderCapability> {
         .find(|candidate| candidate.provider == provider)
 }
 
+/// Complete recovery-path inventory for production providers and the
+/// deterministic native-session fixture used by destructive gates. Fixtures
+/// are deliberately not included in the checked-in production provider
+/// matrix, but their loss proof remains just as explicit.
+pub fn recovery_paths(provider: &str) -> Option<&'static [RecoveryPath]> {
+    match provider {
+        "phase1-fixture" | "native-session-fixture" => Some(&[
+            RecoveryPath::Reattach,
+            RecoveryPath::NativeResume,
+            RecoveryPath::CheckpointRestore,
+            RecoveryPath::PristineSeed,
+        ]),
+        other => capability(other).map(|capability| capability.recovery_paths),
+    }
+}
+
+pub fn managed_recovery_enabled(provider: &str) -> bool {
+    matches!(provider, "phase1-fixture" | "native-session-fixture")
+        || capability(provider).is_some_and(|capability| capability.managed_enabled)
+}
+
 pub fn managed_provider_enabled(provider: &str) -> bool {
     capability(provider).is_some_and(|candidate| candidate.managed_enabled)
+}
+
+/// True only when the provider may make a production durable-soul promise:
+/// live-certified, managed-enabled, and durable-recovery-enabled together.
+///
+/// Every managed-durability claim in the runtime, API, and gates derives from
+/// this single predicate so a deferred provider cannot be promoted by editing
+/// one flag in isolation.
+pub fn durable_souls_certified(provider: &str) -> bool {
+    capability(provider).is_some_and(|candidate| {
+        candidate.certification_state == CertificationState::Certified
+            && candidate.managed_enabled
+            && candidate.durable_recovery_enabled
+    })
+}
+
+/// Providers whose live certification campaign has not yet run. They stay on
+/// the legacy path and are the only cases the landing gate may defer.
+pub fn providers_pending_live_certification() -> Vec<&'static str> {
+    PROVIDER_CAPABILITIES
+        .iter()
+        .filter(|capability| {
+            capability.certification_state == CertificationState::PendingLiveProviderCertification
+        })
+        .map(|capability| capability.provider)
+        .collect()
 }
 
 #[derive(Debug)]
@@ -486,10 +606,7 @@ fn probe_native_fixture(provider_home: &Path, expected: &str) -> ProviderStorePr
     let bytes = match fs::read(&path) {
         Ok(bytes) => bytes,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return ProviderStoreProbe::DefinitivelyUnavailable {
-                reason: "native fixture state is absent".into(),
-                evidence: vec![path.display().to_string()],
-            }
+            return probe_native_fixture_checkpoint(provider_home, expected, &path)
         }
         Err(error) => {
             return blocked(
@@ -539,12 +656,147 @@ fn probe_native_fixture(provider_home: &Path, expected: &str) -> ProviderStorePr
     }
 }
 
+fn probe_native_fixture_checkpoint(
+    provider_home: &Path,
+    expected: &str,
+    primary_path: &Path,
+) -> ProviderStoreProbe {
+    let directory = provider_home.join(".freshell/checkpoints/native-session");
+    if !directory.exists() {
+        return ProviderStoreProbe::DefinitivelyUnavailable {
+            reason: "native fixture state and checkpoints are absent".into(),
+            evidence: vec![
+                primary_path.display().to_string(),
+                directory.display().to_string(),
+            ],
+            store_state: EvidenceStoreState::Missing,
+        };
+    }
+    let entries = match fs::read_dir(&directory) {
+        Ok(entries) => entries,
+        Err(error) => {
+            return blocked(
+                RecoveryBlockReason::StoreUnreadable,
+                &format!("read native fixture checkpoint directory: {error}"),
+                vec![directory.display().to_string()],
+                Some("repair provider-state checkpoint permissions"),
+            )
+        }
+    };
+    let mut candidates = Vec::new();
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) => {
+                return blocked(
+                    RecoveryBlockReason::StoreUnreadable,
+                    &format!("read native fixture checkpoint entry: {error}"),
+                    vec![directory.display().to_string()],
+                    None,
+                )
+            }
+        };
+        let path = entry.path();
+        let metadata = match fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(error) => {
+                return blocked(
+                    RecoveryBlockReason::StoreUnreadable,
+                    &format!("inspect native fixture checkpoint: {error}"),
+                    vec![path.display().to_string()],
+                    None,
+                )
+            }
+        };
+        if metadata.file_type().is_symlink() {
+            return blocked(
+                RecoveryBlockReason::AmbiguousIdentity,
+                "native fixture checkpoint path is a symlink",
+                vec![path.display().to_string()],
+                Some("replace checkpoint symlinks with private regular files"),
+            );
+        }
+        if !metadata.is_file() || metadata.len() > 1024 * 1024 {
+            continue;
+        }
+        let revision = path
+            .file_stem()
+            .and_then(|value| value.to_str())
+            .and_then(|value| value.parse::<u64>().ok());
+        if let Some(revision) = revision {
+            candidates.push((revision, path));
+        }
+    }
+    candidates.sort_by_key(|(revision, _)| *revision);
+    let Some((revision, path)) = candidates.pop() else {
+        return ProviderStoreProbe::DefinitivelyUnavailable {
+            reason: "native fixture state is absent and no numeric checkpoint exists".into(),
+            evidence: vec![
+                primary_path.display().to_string(),
+                directory.display().to_string(),
+            ],
+            store_state: EvidenceStoreState::Missing,
+        };
+    };
+    let bytes = match fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            return blocked(
+                RecoveryBlockReason::StoreUnreadable,
+                &format!("read native fixture checkpoint: {error}"),
+                vec![path.display().to_string()],
+                Some("repair provider-state checkpoint permissions"),
+            )
+        }
+    };
+    let value: serde_json::Value = match serde_json::from_slice(&bytes) {
+        Ok(value) => value,
+        Err(error) => {
+            return blocked(
+                RecoveryBlockReason::StoreUnreadable,
+                &format!("parse native fixture checkpoint: {error}"),
+                vec![path.display().to_string()],
+                Some("restore a valid checkpoint"),
+            )
+        }
+    };
+    let actual = value.get("sessionId").and_then(serde_json::Value::as_str);
+    let stored_revision = value
+        .get("checkpointRevision")
+        .and_then(serde_json::Value::as_u64);
+    match (actual, stored_revision) {
+        (Some(actual), Some(stored)) if actual == expected && stored == revision => {
+            ProviderStoreProbe::Ready {
+                evidence: vec![
+                    path.display().to_string(),
+                    format!("sessionId={actual}"),
+                    format!("checkpointRevision={revision}"),
+                    "checkpointPrimaryMissing=true".into(),
+                ],
+            }
+        }
+        (Some(actual), _) if actual != expected => blocked(
+            RecoveryBlockReason::WrongNativeIdentity,
+            &format!("fixture checkpoint belongs to {actual}, expected {expected}"),
+            vec![path.display().to_string()],
+            None,
+        ),
+        _ => blocked(
+            RecoveryBlockReason::StoreUnreadable,
+            "fixture checkpoint has no exact matching identity/revision",
+            vec![path.display().to_string()],
+            Some("restore a valid checkpoint"),
+        ),
+    }
+}
+
 fn probe_opencode(provider_home: &Path, expected: &str) -> ProviderStoreProbe {
     let path = provider_home.join(".local/share/opencode/opencode.db");
     if !path.exists() {
         return ProviderStoreProbe::DefinitivelyUnavailable {
             reason: "OpenCode session database is absent".into(),
             evidence: vec![path.display().to_string()],
+            store_state: EvidenceStoreState::Missing,
         };
     }
     let connection = match Connection::open_with_flags(
@@ -575,6 +827,7 @@ fn probe_opencode(provider_home: &Path, expected: &str) -> ProviderStoreProbe {
         Ok(false) => ProviderStoreProbe::DefinitivelyUnavailable {
             reason: format!("OpenCode database has no exact session row {expected}"),
             evidence: vec![path.display().to_string()],
+            store_state: EvidenceStoreState::PresentReadable,
         },
         Err(error) => blocked(
             RecoveryBlockReason::UnsupportedProtocol,
@@ -591,6 +844,7 @@ fn probe_amplifier(provider_home: &Path, expected: &str) -> ProviderStoreProbe {
         return ProviderStoreProbe::DefinitivelyUnavailable {
             reason: "Amplifier project store is absent".into(),
             evidence: vec![root.display().to_string()],
+            store_state: EvidenceStoreState::Missing,
         };
     }
     let mut queue = VecDeque::from([(root.clone(), 0_u8)]);
@@ -656,6 +910,7 @@ fn probe_amplifier(provider_home: &Path, expected: &str) -> ProviderStoreProbe {
         [] => ProviderStoreProbe::DefinitivelyUnavailable {
             reason: format!("Amplifier store has no exact session {expected}"),
             evidence: vec![root.display().to_string()],
+            store_state: EvidenceStoreState::PresentReadable,
         },
         [session_dir] if freshell_sessions::amplifier_stub::stub_is_unused(session_dir) => {
             ProviderStoreProbe::DefinitivelyUnavailable {
@@ -663,6 +918,7 @@ fn probe_amplifier(provider_home: &Path, expected: &str) -> ProviderStoreProbe {
                     "Amplifier session {expected} is a pristine launcher stub, not a durable conversation"
                 ),
                 evidence: vec![session_dir.display().to_string(), "turnCount=0".into()],
+                store_state: EvidenceStoreState::PresentReadable,
             }
         }
         [session_dir] => ProviderStoreProbe::Ready {
@@ -690,6 +946,7 @@ fn probe_bounded_tree(root: &Path, expected: &str, mode: ArtifactMatch) -> Provi
         return ProviderStoreProbe::DefinitivelyUnavailable {
             reason: "provider session root is absent".into(),
             evidence: vec![root.display().to_string()],
+            store_state: EvidenceStoreState::Missing,
         };
     }
     let mut queue = VecDeque::from([(root.to_path_buf(), 0_u8)]);
@@ -772,6 +1029,7 @@ fn probe_bounded_tree(root: &Path, expected: &str, mode: ArtifactMatch) -> Provi
     ProviderStoreProbe::DefinitivelyUnavailable {
         reason: format!("no exact provider artifact for {expected}"),
         evidence: vec![root.display().to_string()],
+        store_state: EvidenceStoreState::PresentReadable,
     }
 }
 
@@ -826,6 +1084,20 @@ pub fn classify_provider_failure(message: &str) -> RecoveryBlockReason {
         RecoveryBlockReason::CredentialsExpired
     } else if normalized.contains("rate limit") || normalized.contains("429") {
         RecoveryBlockReason::RateLimited
+    } else if normalized.contains("retry budget") || normalized.contains("retry exhausted") {
+        RecoveryBlockReason::RetryBudget
+    } else if normalized.contains("store")
+        && (normalized.contains("unreadable")
+            || normalized.contains("permission denied")
+            || normalized.contains("corrupt"))
+    {
+        RecoveryBlockReason::StoreUnreadable
+    } else if normalized.contains("store")
+        && (normalized.contains("missing")
+            || normalized.contains("not found")
+            || normalized.contains("absent"))
+    {
+        RecoveryBlockReason::StoreMissing
     } else if normalized.contains("version") || normalized.contains("schema") {
         RecoveryBlockReason::IncompatibleBinary
     } else if normalized.contains("workspace") || normalized.contains("cwd") {
@@ -979,6 +1251,52 @@ mod tests {
     }
 
     #[test]
+    fn native_fixture_probe_uses_exact_verified_checkpoint_when_primary_is_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let checkpoint = dir
+            .path()
+            .join(".freshell/checkpoints/native-session/3.json");
+        fs::create_dir_all(checkpoint.parent().unwrap()).unwrap();
+        fs::write(
+            &checkpoint,
+            r#"{"sessionId":"fixture-checkpoint","history":["create"],"checkpointRevision":3}"#,
+        )
+        .unwrap();
+        let terminal = terminal("opencode", &[]);
+        let mut spec = build_resume_spec(ResumeSpecInput {
+            provider: "opencode",
+            provider_store_id: "store-one",
+            native_session_id: "fixture-checkpoint",
+            terminal: &terminal,
+            provider_version: None,
+            creation_seed_ref: "seed".into(),
+            checkpoint_revision: 3,
+            evidence_revision: 4,
+            never_dispatched: false,
+        })
+        .unwrap();
+        spec.provider_session.provider = "native-session-fixture".into();
+        let probe = probe_provider_store(dir.path(), &spec);
+        match probe {
+            ProviderStoreProbe::Ready { evidence } => {
+                assert!(evidence.iter().any(|row| row == "checkpointRevision=3"));
+                assert!(evidence
+                    .iter()
+                    .any(|row| row == "checkpointPrimaryMissing=true"));
+            }
+            other => panic!("expected checkpoint readiness, got {other:?}"),
+        }
+        spec.provider_session.native_session_id = "wrong".into();
+        assert!(matches!(
+            probe_provider_store(dir.path(), &spec),
+            ProviderStoreProbe::Blocked {
+                reason: RecoveryBlockReason::WrongNativeIdentity,
+                ..
+            }
+        ));
+    }
+
+    #[test]
     fn opencode_probe_reads_exact_row_without_guessing_latest() {
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join(".local/share/opencode/opencode.db");
@@ -1053,6 +1371,41 @@ mod tests {
     }
 
     #[test]
+    fn release_qualified_opencode_blocker_matrix_is_explicit() {
+        let cases = [
+            (
+                "401 unauthorized credentials",
+                RecoveryBlockReason::CredentialsExpired,
+            ),
+            ("429 rate limit exceeded", RecoveryBlockReason::RateLimited),
+            (
+                "provider service is unavailable",
+                RecoveryBlockReason::ProviderUnavailable,
+            ),
+            (
+                "provider state store is unreadable",
+                RecoveryBlockReason::StoreUnreadable,
+            ),
+            (
+                "provider state store is missing",
+                RecoveryBlockReason::StoreMissing,
+            ),
+            (
+                "provider session schema version changed",
+                RecoveryBlockReason::IncompatibleBinary,
+            ),
+            ("retry budget exhausted", RecoveryBlockReason::RetryBudget),
+        ];
+        for (message, expected) in cases {
+            assert_eq!(classify_provider_failure(message), expected, "{message}");
+        }
+        let capability = capability("opencode").unwrap();
+        assert!(capability.managed_enabled);
+        assert!(capability.durable_recovery_enabled);
+        assert_eq!(capability.blocked_reason, None);
+    }
+
+    #[test]
     fn checked_in_capability_manifest_matches_runtime_inventory() {
         let manifest: serde_json::Value = serde_json::from_str(include_str!(
             "../../../docs/development/runtime-provider-capabilities.json"
@@ -1063,7 +1416,7 @@ mod tests {
         assert_eq!(manifest["releaseScope"]["freshAgentEnabled"], false);
         assert_eq!(
             manifest["releaseScope"]["managedTerminalProviders"],
-            serde_json::json!(["claude", "codex", "opencode", "amplifier"])
+            serde_json::json!(["opencode"])
         );
         let providers = manifest["providers"].as_array().unwrap();
         assert_eq!(providers.len(), PROVIDER_CAPABILITIES.len());
@@ -1085,6 +1438,24 @@ mod tests {
                 entry["durableRecoveryEnabled"],
                 capability.durable_recovery_enabled
             );
+            let recovery_paths: Vec<_> = entry["recoveryPaths"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|value| value.as_str().unwrap())
+                .collect();
+            let expected_paths: Vec<_> = capability
+                .recovery_paths
+                .iter()
+                .map(|path| match path {
+                    RecoveryPath::Reattach => "reattach",
+                    RecoveryPath::NativeResume => "native_resume",
+                    RecoveryPath::CheckpointRestore => "checkpoint_restore",
+                    RecoveryPath::PristineSeed => "pristine_seed",
+                    RecoveryPath::NativeImport => "native_import",
+                })
+                .collect();
+            assert_eq!(recovery_paths, expected_paths);
             let modes: Vec<_> = entry["managedModes"]
                 .as_array()
                 .unwrap()
@@ -1112,7 +1483,17 @@ mod tests {
             .filter(|capability| capability.durable_recovery_enabled)
             .map(|capability| capability.provider)
             .collect();
-        assert_eq!(durable, ["claude", "opencode", "codex", "amplifier"]);
+        assert_eq!(durable, ["opencode"]);
+        assert_eq!(
+            manifest["releaseScope"]["deferredManagedProviders"],
+            serde_json::json!(["claude", "codex", "amplifier"])
+        );
+        for provider in ["claude", "codex", "amplifier"] {
+            let deferred = capability(provider).expect("deferred adapter remains registered");
+            assert!(!deferred.managed_enabled);
+            assert!(!deferred.durable_recovery_enabled);
+            assert_eq!(deferred.blocked_reason, Some("PENDING_LIVE_QUALIFICATION"));
+        }
 
         for doorway in manifest["doorways"].as_array().unwrap() {
             let policy = doorway["policy"].as_str().unwrap();
@@ -1148,6 +1529,125 @@ mod tests {
             true
         );
         assert_eq!(manifest["invariants"]["stopIntentWins"], true);
+    }
+
+    #[test]
+    fn durable_souls_certification_state_is_typed_and_fail_closed() {
+        // A provider may only advertise managed durable-soul ownership when its
+        // live certification campaign has actually passed. The certification
+        // state is the single typed switch; `managedEnabled` /
+        // `durableRecoveryEnabled` are derived promises that must never exceed
+        // it. This is what keeps a documentation-only or convenience
+        // enablement from silently widening the release scope.
+        for capability in PROVIDER_CAPABILITIES {
+            match capability.certification_state {
+                CertificationState::PendingLiveProviderCertification => {
+                    assert!(
+                        !capability.managed_enabled,
+                        "{} is pending live certification and must not be managed-enabled",
+                        capability.provider
+                    );
+                    assert!(
+                        !capability.durable_recovery_enabled,
+                        "{} is pending live certification and must not claim durable recovery",
+                        capability.provider
+                    );
+                    assert_eq!(
+                        capability.blocked_reason,
+                        Some("PENDING_LIVE_QUALIFICATION"),
+                        "{} must carry the typed pending reason",
+                        capability.provider
+                    );
+                    assert!(!durable_souls_certified(capability.provider));
+                }
+                CertificationState::NotApplicable => {
+                    assert!(!capability.durable_recovery_enabled);
+                    assert!(!durable_souls_certified(capability.provider));
+                }
+                CertificationState::Certified => {
+                    assert!(
+                        capability.managed_enabled,
+                        "{} is certified and must be managed-enabled",
+                        capability.provider
+                    );
+                }
+            }
+            if capability.durable_recovery_enabled {
+                assert_eq!(
+                    capability.certification_state,
+                    CertificationState::Certified,
+                    "{} claims durable recovery without a certification",
+                    capability.provider
+                );
+                assert!(durable_souls_certified(capability.provider));
+            }
+        }
+
+        // Unknown providers are never certified.
+        assert!(!durable_souls_certified("not-a-provider"));
+
+        let deferred: Vec<_> = PROVIDER_CAPABILITIES
+            .iter()
+            .filter(|capability| {
+                capability.certification_state
+                    == CertificationState::PendingLiveProviderCertification
+            })
+            .map(|capability| capability.provider)
+            .collect();
+        assert_eq!(deferred, ["claude", "codex", "amplifier"]);
+
+        let certified_durable: Vec<_> = PROVIDER_CAPABILITIES
+            .iter()
+            .filter(|capability| durable_souls_certified(capability.provider))
+            .map(|capability| capability.provider)
+            .collect();
+        assert_eq!(certified_durable, ["opencode"]);
+    }
+
+    #[test]
+    fn checked_in_manifest_publishes_the_same_certification_states() {
+        let manifest: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../docs/development/runtime-provider-capabilities.json"
+        ))
+        .unwrap();
+        for capability in PROVIDER_CAPABILITIES {
+            let entry = manifest["providers"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|entry| entry["provider"] == capability.provider)
+                .unwrap();
+            assert_eq!(
+                entry["certificationState"],
+                capability.certification_state.as_str(),
+                "manifest certification state drifted for {}",
+                capability.provider
+            );
+        }
+
+        let certification = &manifest["certification"];
+        assert_eq!(certification["schemaVersion"], 1);
+        assert_eq!(
+            certification["deferralReason"],
+            "pending_live_provider_certification"
+        );
+        assert_eq!(
+            certification["productionGate"]["status"],
+            "BLOCKED_PENDING_LIVE_PROVIDER_CERTIFICATION"
+        );
+        assert_eq!(
+            certification["deferredProviders"],
+            serde_json::json!(["claude", "codex", "amplifier"])
+        );
+        assert_eq!(
+            certification["certifiedDurableProviders"],
+            serde_json::json!(["opencode"])
+        );
+        assert_eq!(certification["landingGate"]["id"], "durable-souls-landing");
+        assert_eq!(
+            certification["landingGate"]["deferrableProviders"],
+            serde_json::json!(["claude", "codex", "amplifier"])
+        );
     }
 
     fn resume_spec_for_test(provider: &str, session_id: &str, provider_home: &Path) -> ResumeSpec {

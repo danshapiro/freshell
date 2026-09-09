@@ -14,6 +14,7 @@ import { LiveTerminalHandleSchema, SessionRefSchema, type RestoreError } from '.
 import { CodexDurabilityRefSchema, type CodexDurabilityRef } from './codex-durability.js'
 import type { SessionNameRecord, SessionNameRef, SessionNameUpdate } from './session-names.js'
 import { TabNameSourceSchema } from './session-names.js'
+import type { ManagedRuntimeInventoryChangedMessage, ManagedRuntimeViewChangedMessage } from './managed-runtime.js'
 
 // ──────────────────────────────────────────────────────────────
 // Shared enums and helpers
@@ -1969,3 +1970,5 @@ export type ServerMessage =
   | ExtensionServerReadyMessage
   | ExtensionServerErrorMessage
   | ExtensionServerStoppedMessage
+  | ManagedRuntimeInventoryChangedMessage
+  | ManagedRuntimeViewChangedMessage

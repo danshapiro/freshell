@@ -1,0 +1,19 @@
+{
+  "extends": "./tsconfig.tools.json",
+  "compilerOptions": {
+    "noEmit": true,
+    "rootDir": ".",
+    "types": ["node"]
+  },
+  "include": [
+    "scripts/testing/provider-certification.ts",
+    "scripts/testing/runtime-gate.ts",
+    "scripts/testing/runtime-gate-args.ts",
+    "scripts/testing/runtime-sandbox.ts",
+    "scripts/testing/runtime-test-broker.ts",
+    "scripts/testing/runtime-phase5-soak.ts",
+    "scripts/testing/runtime-landing-campaign.ts",
+    "test/runtime/**/*.ts",
+    "shared/**/*.ts"
+  ]
+}

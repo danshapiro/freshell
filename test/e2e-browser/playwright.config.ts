@@ -21,6 +21,22 @@ export const LOCAL_ONLY_SPECS = [{
   spec: 'runtime-provider-resurrection-rust.spec.ts',
   selector: '--project=chromium test/e2e-browser/specs/runtime-provider-resurrection-rust.spec.ts',
   classification: 'local-only-docker-supervisor',
+}, {
+  spec: 'runtime-opencode-provider-qualification-rust.spec.ts',
+  selector: '--project=chromium test/e2e-browser/specs/runtime-opencode-provider-qualification-rust.spec.ts',
+  classification: 'local-only-docker-supervisor',
+}, {
+  spec: 'runtime-tabs-rehydrate-rust.spec.ts',
+  selector: '--project=chromium test/e2e-browser/specs/runtime-tabs-rehydrate-rust.spec.ts',
+  classification: 'local-only-docker-supervisor',
+}, {
+  spec: 'runtime-lost-soul-notice-rust.spec.ts',
+  selector: '--project=chromium test/e2e-browser/specs/runtime-lost-soul-notice-rust.spec.ts',
+  classification: 'local-only-docker-supervisor',
+}, {
+  spec: 'runtime-chaos-rust.spec.ts',
+  selector: '--project=chromium test/e2e-browser/specs/runtime-chaos-rust.spec.ts',
+  classification: 'local-only-docker-supervisor',
 }]
 
 const continuityRequested = process.env.FRESHELL_SMOKE

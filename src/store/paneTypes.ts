@@ -9,6 +9,7 @@ import type { CodexDurabilityRef } from '@shared/codex-durability'
 import type { FreshAgentRuntimeProvider, FreshAgentSessionType } from '@shared/fresh-agent'
 import type { FreshAgentStyle } from '@shared/settings'
 import type { SessionNameRef } from '@shared/session-names'
+import type { ManagedRuntimeProjectionFields } from '@shared/managed-runtime'
 
 export type SessionLocator = SharedSessionLocator
 
@@ -206,7 +207,7 @@ export type TerminalPaneContent = {
   launchFailure?: LaunchFailure
   /** kata b8ke: the reopen handoff's typed failure — the pane was KEPT (VOLATILE — never persisted). */
   handoffError?: HandoffError
-}
+} & ManagedRuntimeProjectionFields
 
 /**
  * Browser pane content for embedded web views.
@@ -345,7 +346,7 @@ export type FreshAgentPaneContent = {
   namingHandle?: string
   /** kata b8ke: the reopen handoff's typed failure — the pane was KEPT (VOLATILE — never persisted). */
   handoffError?: HandoffError
-}
+} & ManagedRuntimeProjectionFields
 
 /**
  * Extension pane content — generic catch-all for extension-system panes.

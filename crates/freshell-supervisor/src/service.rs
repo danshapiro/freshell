@@ -9,15 +9,15 @@ use crate::{
 use freshell_runtime_protocol::{
     host_proof, read_frame, write_frame, AdminCommand, AdminReply, AdminResult, CommandState,
     ControlRole, Envelope, FixtureKind, HostBootId, HostCommand, HostReply, HostResult,
-    IncarnationId, LaunchResult, LaunchState, RequestId, ResumeSpec, RuntimeError,
-    RuntimeErrorCode, RuntimeLimits, RuntimeMetrics, RuntimeOutputBatch, RuntimeView, SoulId,
-    StopOutcome, TerminalLaunchSpec, CONTROL_PROTOCOL_VERSION,
+    IncarnationId, LaunchResult, LaunchState, LimitApplication, RequestId, ResumeSpec,
+    RuntimeError, RuntimeErrorCode, RuntimeLimits, RuntimeMetrics, RuntimeOutputBatch, RuntimeView,
+    SoulId, StopOutcome, TerminalLaunchSpec, UpdateLimitsResult, CONTROL_PROTOCOL_VERSION,
 };
 use sha2::{Digest, Sha256};
 use std::{
     collections::HashMap,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, Mutex as StdMutex, OnceLock},
     time::{SystemTime, UNIX_EPOCH},
 };
 use tokio::{
@@ -83,6 +83,10 @@ impl Supervisor {
         let mut config = config;
         config.runtime_root = canonical_root;
         config.host_binary_path = canonical_binary;
+        lifecycle_secrets()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(config.lifecycle_log.clone(), config.control_secret.clone());
         Ok(Self {
             registry,
             backend,
@@ -140,6 +144,135 @@ impl Supervisor {
             AdminCommand::Inventory => Ok(AdminResult::Inventory(
                 self.registry.inventory().await.map_err(map_registry)?,
             )),
+            AdminCommand::InventorySnapshot => Ok(AdminResult::InventorySnapshot(
+                self.registry
+                    .inventory_snapshot()
+                    .await
+                    .map_err(map_registry)?,
+            )),
+            AdminCommand::PendingViewProjections(request) => {
+                self.registry
+                    .assert_epoch(request.expected_control_epoch)
+                    .map_err(map_registry)?;
+                Ok(AdminResult::PendingViewProjections(
+                    self.registry
+                        .pending_view_projections(request.limit)
+                        .await
+                        .map_err(map_registry)?,
+                ))
+            }
+            AdminCommand::AcknowledgeViewProjection(request) => {
+                self.registry
+                    .assert_epoch(request.expected_control_epoch)
+                    .map_err(map_registry)?;
+                self.registry
+                    .acknowledge_view_projection(request.event_id)
+                    .await
+                    .map_err(map_registry)?;
+                Ok(AdminResult::ViewProjectionAcknowledged)
+            }
+            AdminCommand::UpdateViewVisibility(request) => {
+                self.registry
+                    .assert_epoch(request.expected_control_epoch)
+                    .map_err(map_registry)?;
+                let view = self
+                    .registry
+                    .update_view_visibility(
+                        request.view_id,
+                        request.visibility,
+                        request.expected_revision,
+                        request.expected_soul_intent_revision,
+                    )
+                    .await
+                    .map_err(map_registry)?;
+                Ok(AdminResult::ViewIntent(view))
+            }
+            AdminCommand::UpsertViewIntent(request) => {
+                self.registry
+                    .assert_epoch(request.expected_control_epoch)
+                    .map_err(map_registry)?;
+                let view = self
+                    .registry
+                    .upsert_view_intent(request)
+                    .await
+                    .map_err(map_registry)?;
+                Ok(AdminResult::ViewIntent(view))
+            }
+            AdminCommand::UpdateLimits(request) => {
+                self.registry
+                    .assert_epoch(request.expected_control_epoch)
+                    .map_err(map_registry)?;
+                let configured_limits = request.limits.validate()?;
+                let view = self
+                    .registry
+                    .update_configured_limits(
+                        request.soul_id,
+                        configured_limits,
+                        request.expected_intent_revision,
+                    )
+                    .await
+                    .map_err(map_registry)?;
+                Ok(AdminResult::UpdateLimits(UpdateLimitsResult {
+                    effective_limits: view.effective_limits,
+                    view,
+                    application: LimitApplication::NextIncarnation,
+                    configured_limits,
+                }))
+            }
+            AdminCommand::PendingNotices(request) => {
+                self.registry
+                    .assert_epoch(request.expected_control_epoch)
+                    .map_err(map_registry)?;
+                Ok(AdminResult::PendingNotices(
+                    self.registry
+                        .pending_notices(request.profile_id, request.limit)
+                        .await
+                        .map_err(map_registry)?,
+                ))
+            }
+            AdminCommand::NoticeReceipt(request) => {
+                self.registry
+                    .assert_epoch(request.expected_control_epoch)
+                    .map_err(map_registry)?;
+                self.registry
+                    .record_notice_receipt(request.notice_id, request.profile_id, request.state)
+                    .await
+                    .map_err(map_registry)?;
+                Ok(AdminResult::NoticeReceiptRecorded)
+            }
+            AdminCommand::IncidentSummary(request) => {
+                self.registry
+                    .assert_epoch(request.expected_control_epoch)
+                    .map_err(map_registry)?;
+                Ok(AdminResult::IncidentSummary(
+                    self.registry
+                        .loss_incident_summary(request.incident_id)
+                        .await
+                        .map_err(map_registry)?,
+                ))
+            }
+            AdminCommand::MetricsSnapshot => Ok(AdminResult::MetricsSnapshot(
+                self.registry
+                    .runtime_metrics_snapshot()
+                    .await
+                    .map_err(map_registry)?,
+            )),
+            AdminCommand::MigrationPlan(request) => {
+                let image_verified = self.config.image_ref.starts_with("sha256:")
+                    && self.config.image_ref.len() == "sha256:".len() + 64;
+                Ok(AdminResult::MigrationPlan(
+                    self.registry
+                        .plan_or_apply_migration(request, true, image_verified)
+                        .await
+                        .map_err(map_registry)?,
+                ))
+            }
+            AdminCommand::RepairAudit(request) => Ok(AdminResult::RepairAudit(
+                self.registry
+                    .repair_audit(request)
+                    .await
+                    .map_err(map_registry)?,
+            )),
             AdminCommand::Launch(request) => {
                 self.registry
                     .assert_epoch(request.expected_control_epoch)
@@ -152,7 +285,9 @@ impl Supervisor {
                 self.registry
                     .assert_epoch(request.expected_control_epoch)
                     .map_err(map_registry)?;
-                let (outcome, view) = self.stop(request.soul_id).await?;
+                let (outcome, view) = self
+                    .stop(request.soul_id, request.expected_intent_revision)
+                    .await?;
                 Ok(AdminResult::Stop { outcome, view })
             }
             AdminCommand::TerminalInput(request) => {
@@ -212,6 +347,19 @@ impl Supervisor {
     ) -> Result<LaunchResult, RuntimeError> {
         let limits = request.limits.validate()?;
         request.validate_workload()?;
+        if !release_qualified_workload(
+            &request.provider,
+            request.fixture.is_some(),
+            request.terminal.is_some(),
+        ) {
+            return Err(RuntimeError::new(
+                RuntimeErrorCode::UnsupportedWorkload,
+                format!(
+                    "provider {} is adapter-ready but not release-qualified for managed ownership",
+                    request.provider
+                ),
+            ));
+        }
         crate::limits::verify_profile(request.profile, limits).map_err(|message| {
             RuntimeError::new(RuntimeErrorCode::InvalidRuntimeLimits, message)
         })?;
@@ -231,6 +379,7 @@ impl Supervisor {
                 project_key: request.project_key.clone(),
                 fixture: request.fixture,
                 terminal: request.terminal.clone(),
+                view_intent: request.view_intent.clone(),
                 admission: self.config.admission,
             })
             .await
@@ -613,11 +762,15 @@ impl Supervisor {
         }
     }
 
-    async fn stop(&self, soul_id: SoulId) -> Result<(StopOutcome, RuntimeView), RuntimeError> {
+    async fn stop(
+        &self,
+        soul_id: SoulId,
+        expected_intent_revision: Option<u64>,
+    ) -> Result<(StopOutcome, RuntimeView), RuntimeError> {
         // The durable stop intent is committed before any IPC or Docker signal.
         let handle = self
             .registry
-            .begin_stop(soul_id.clone())
+            .begin_stop_expected(soul_id.clone(), expected_intent_revision)
             .await
             .map_err(map_registry)?;
         append_event(
@@ -754,6 +907,11 @@ impl Supervisor {
         let secret = std::fs::read(runtime_dir.join("secret")).map_err(io_runtime)?;
         let challenge = uuid::Uuid::new_v4().to_string();
         let deadline = Instant::now() + Duration::from_secs(8);
+        // The connect retry tolerates a host that has not bound its socket
+        // yet. Once connected, the reply itself is bounded by the same budget
+        // every other host command uses: a host that accepts and then goes
+        // silent is HostUnreachable, never an unbounded wait.
+        let budget = host_command_budget(std::env::var(HOST_COMMAND_TIMEOUT_ENV).ok().as_deref());
         loop {
             match UnixStream::connect(&socket).await {
                 Ok(mut stream) => {
@@ -765,12 +923,8 @@ impl Supervisor {
                             challenge: challenge.clone(),
                         },
                     );
-                    write_frame(&mut stream, &envelope).await.map_err(|e| {
-                        RuntimeError::new(RuntimeErrorCode::HostUnreachable, e.to_string())
-                    })?;
-                    let reply: HostReply = read_frame(&mut stream).await.map_err(|e| {
-                        RuntimeError::new(RuntimeErrorCode::HostUnreachable, e.to_string())
-                    })?;
+                    let reply =
+                        exchange_host_frame(&mut stream, &envelope, budget, &socket).await?;
                     match reply.result? {
                         HostResult::Hello {
                             host_boot_id,
@@ -928,9 +1082,6 @@ impl Supervisor {
         host: &AuthenticatedHost,
         command: HostCommand,
     ) -> Result<HostResult, RuntimeError> {
-        let mut stream = UnixStream::connect(runtime_dir.join("host.sock"))
-            .await
-            .map_err(|e| RuntimeError::new(RuntimeErrorCode::HostUnreachable, e.to_string()))?;
         let mut envelope = Envelope::new(RequestId::new(), ControlRole::Supervisor, command);
         envelope.auth = Some(host_proof(
             &host.secret,
@@ -938,12 +1089,12 @@ impl Supervisor {
             &host.host_boot_id,
             &incarnation_id,
         ));
-        write_frame(&mut stream, &envelope)
-            .await
-            .map_err(|e| RuntimeError::new(RuntimeErrorCode::HostUnreachable, e.to_string()))?;
-        let reply: HostReply = read_frame(&mut stream)
-            .await
-            .map_err(|e| RuntimeError::new(RuntimeErrorCode::HostUnreachable, e.to_string()))?;
+        let reply = request_host_reply(
+            &runtime_dir.join("host.sock"),
+            &envelope,
+            host_command_budget(std::env::var(HOST_COMMAND_TIMEOUT_ENV).ok().as_deref()),
+        )
+        .await?;
         reply.result
     }
 
@@ -1041,6 +1192,219 @@ pub fn default_backend(socket: impl Into<PathBuf>) -> Arc<dyn RuntimeBackend> {
     Arc::new(DockerEngineBackend::new(socket))
 }
 
+/// Default bound on one supervisor→session-host control round trip.
+///
+/// The supervisor is the sole runtime authority; a session host is an
+/// untrusted workload boundary. An unresponsive (or maliciously silent) host
+/// must never be able to hold an authoritative transaction — above all
+/// `stop` — open forever. Exceeding the budget is a typed, recoverable
+/// `HostUnreachable`, after which the caller proceeds through the
+/// Docker-level path it already owns.
+pub(crate) const DEFAULT_HOST_COMMAND_TIMEOUT_MS: u64 = 10_000;
+
+pub(crate) const HOST_COMMAND_TIMEOUT_ENV: &str = "FRESHELL_RUNTIME_HOST_COMMAND_TIMEOUT_MS";
+
+/// Resolve the round-trip budget. Absent, unparseable, or zero configuration
+/// falls back to the default: the failure direction is always a bounded wait,
+/// never an unbounded one.
+pub(crate) fn host_command_budget(configured: Option<&str>) -> Duration {
+    configured
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .filter(|ms| *ms > 0)
+        .map(Duration::from_millis)
+        .unwrap_or(Duration::from_millis(DEFAULT_HOST_COMMAND_TIMEOUT_MS))
+}
+
+/// One bounded framed request/reply against a session host's control socket.
+/// Connect, write, and read all share the single budget so a host that accepts
+/// the connection and then goes silent cannot extend the wait.
+pub(crate) async fn request_host_reply(
+    socket_path: &Path,
+    envelope: &Envelope<HostCommand>,
+    budget: Duration,
+) -> Result<HostReply, RuntimeError> {
+    let unreachable =
+        |message: String| RuntimeError::new(RuntimeErrorCode::HostUnreachable, message);
+    let socket_display = socket_path.display().to_string();
+    tokio::time::timeout(budget, async {
+        let mut stream = UnixStream::connect(socket_path)
+            .await
+            .map_err(|error| unreachable(error.to_string()))?;
+        write_frame(&mut stream, envelope)
+            .await
+            .map_err(|error| unreachable(error.to_string()))?;
+        let reply: HostReply = read_frame(&mut stream)
+            .await
+            .map_err(|error| unreachable(error.to_string()))?;
+        Ok(reply)
+    })
+    .await
+    .unwrap_or_else(|_| {
+        Err(unreachable(format!(
+            "session host {socket_display} timed out after {}ms",
+            budget.as_millis()
+        )))
+    })
+}
+
+/// Bounded write/read on an already-connected host stream. Connecting is the
+/// caller's business (the hello handshake retries a not-yet-bound socket);
+/// the conversation itself is bounded exactly like every other host command.
+pub(crate) async fn exchange_host_frame(
+    stream: &mut UnixStream,
+    envelope: &Envelope<HostCommand>,
+    budget: Duration,
+    socket_path: &Path,
+) -> Result<HostReply, RuntimeError> {
+    let unreachable =
+        |message: String| RuntimeError::new(RuntimeErrorCode::HostUnreachable, message);
+    let socket_display = socket_path.display().to_string();
+    tokio::time::timeout(budget, async {
+        write_frame(stream, envelope)
+            .await
+            .map_err(|error| unreachable(error.to_string()))?;
+        let reply: HostReply = read_frame(stream)
+            .await
+            .map_err(|error| unreachable(error.to_string()))?;
+        Ok(reply)
+    })
+    .await
+    .unwrap_or_else(|_| {
+        Err(unreachable(format!(
+            "session host {socket_display} timed out after {}ms",
+            budget.as_millis()
+        )))
+    })
+}
+
+fn release_qualified_workload(provider: &str, is_fixture: bool, has_terminal: bool) -> bool {
+    is_fixture || !has_terminal || freshell_agent_runtime::managed_provider_enabled(provider)
+}
+
+#[cfg(test)]
+mod host_ipc_timeout_tests {
+    use super::{host_command_budget, request_host_reply, DEFAULT_HOST_COMMAND_TIMEOUT_MS};
+    use freshell_runtime_protocol::{
+        ControlRole, Envelope, HostCommand, IncarnationId, RequestId, RuntimeErrorCode,
+    };
+    use std::time::{Duration, Instant};
+    use tokio::net::UnixListener;
+
+    /// A session host that accepts the connection and then never answers must
+    /// NOT be able to hold the supervisor's authoritative stop hostage. The
+    /// supervisor owns the runtime; an unresponsive workload is a bounded,
+    /// typed `HostUnreachable`, after which the Docker-level stop still runs.
+    #[tokio::test]
+    async fn an_accepted_but_unanswered_host_command_fails_within_its_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket_path = dir.path().join("host.sock");
+        let listener = UnixListener::bind(&socket_path).unwrap();
+        // Accept and hold the connection open forever without replying.
+        let accepted = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            tokio::time::sleep(Duration::from_secs(3_600)).await;
+            drop(stream);
+        });
+
+        let envelope = Envelope::new(
+            RequestId::new(),
+            ControlRole::Supervisor,
+            HostCommand::Status {
+                incarnation_id: IncarnationId::parse("incarnation-timeout-test").unwrap(),
+            },
+        );
+        let started = Instant::now();
+        let error = request_host_reply(&socket_path, &envelope, Duration::from_millis(300))
+            .await
+            .expect_err("an unanswered host must not block forever");
+        let elapsed = started.elapsed();
+
+        assert_eq!(error.code, RuntimeErrorCode::HostUnreachable);
+        assert!(
+            error.message.contains("timed out"),
+            "the error must say the host timed out, not something generic: {}",
+            error.message
+        );
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "the budget must bound the wait, took {elapsed:?}"
+        );
+        accepted.abort();
+    }
+
+    #[test]
+    fn the_host_command_budget_is_bounded_and_overridable() {
+        // Absent/garbage/zero configuration falls back to the safe default
+        // rather than becoming an unbounded wait.
+        assert_eq!(
+            host_command_budget(None),
+            Duration::from_millis(DEFAULT_HOST_COMMAND_TIMEOUT_MS)
+        );
+        assert_eq!(
+            host_command_budget(Some("not-a-number")),
+            Duration::from_millis(DEFAULT_HOST_COMMAND_TIMEOUT_MS)
+        );
+        assert_eq!(
+            host_command_budget(Some("0")),
+            Duration::from_millis(DEFAULT_HOST_COMMAND_TIMEOUT_MS)
+        );
+        assert_eq!(host_command_budget(Some("250")), Duration::from_millis(250));
+    }
+}
+
+#[cfg(test)]
+mod release_scope_tests {
+    use super::{append_event, lifecycle_secrets, release_qualified_workload};
+
+    #[test]
+    fn direct_terminal_launch_cannot_bypass_live_qualification_scope() {
+        assert!(release_qualified_workload("shell", false, true));
+        assert!(release_qualified_workload("opencode", false, true));
+        for provider in ["claude", "codex", "amplifier", "gemini", "kimi"] {
+            assert!(
+                !release_qualified_workload(provider, false, true),
+                "{provider}"
+            );
+        }
+        assert!(release_qualified_workload(
+            "native-session-fixture",
+            true,
+            false
+        ));
+    }
+
+    #[test]
+    fn lifecycle_redaction_uses_the_secret_registered_for_each_log_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = dir.path().join("first.jsonl");
+        let second = dir.path().join("second.jsonl");
+        lifecycle_secrets()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(first.clone(), "first-secret-value".into());
+        lifecycle_secrets()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(second.clone(), "second-secret-value".into());
+        append_event(
+            &first,
+            "test",
+            serde_json::json!({"value":"first-secret-value"}),
+        );
+        append_event(
+            &second,
+            "test",
+            serde_json::json!({"value":"second-secret-value"}),
+        );
+        let first_log = std::fs::read_to_string(first).unwrap();
+        let second_log = std::fs::read_to_string(second).unwrap();
+        assert!(!first_log.contains("first-secret-value"));
+        assert!(!second_log.contains("second-secret-value"));
+        assert!(first_log.contains("***REDACTED***"));
+        assert!(second_log.contains("***REDACTED***"));
+    }
+}
+
 fn semantic_launch_digest(
     request: &freshell_runtime_protocol::LaunchRequest,
 ) -> Result<String, RuntimeError> {
@@ -1086,6 +1450,14 @@ fn map_registry(error: RegistryError) -> RuntimeError {
             RuntimeErrorCode::RequestIdConflict
         }
         RegistryError::StaleControlEpoch { .. } => RuntimeErrorCode::StaleControlEpoch,
+        RegistryError::StaleIntentRevision { .. } => RuntimeErrorCode::StaleIntentRevision,
+        RegistryError::LossCertificationBlocked(_) => RuntimeErrorCode::LossCertificationBlocked,
+        RegistryError::IncidentPersistenceFailed(_) | RegistryError::IncidentNotFound(_) => {
+            RuntimeErrorCode::IncidentPersistenceFailed
+        }
+        RegistryError::NoticeNotFound(_) => RuntimeErrorCode::NoticeNotFound,
+        RegistryError::MigrationBlocked(_) => RuntimeErrorCode::MigrationBlocked,
+        RegistryError::RepairBlocked(_) => RuntimeErrorCode::RepairBlocked,
         RegistryError::UnknownSoul(_) => RuntimeErrorCode::UnknownSoul,
         RegistryError::UnknownIncarnation(_) => RuntimeErrorCode::UnknownIncarnation,
         RegistryError::BlockedResource { .. } => RuntimeErrorCode::BlockedResource,
@@ -1128,28 +1500,35 @@ fn write_secret_durable(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     Ok(())
 }
 
+static LIFECYCLE_SECRETS: OnceLock<StdMutex<HashMap<PathBuf, String>>> = OnceLock::new();
+
+fn lifecycle_secrets() -> &'static StdMutex<HashMap<PathBuf, String>> {
+    LIFECYCLE_SECRETS.get_or_init(|| StdMutex::new(HashMap::new()))
+}
+
 pub(crate) fn append_event(path: &Path, event: &str, data: serde_json::Value) {
-    let Some(parent) = path.parent() else {
-        return;
-    };
-    if std::fs::create_dir_all(parent).is_err() {
-        return;
-    }
-    let line =
-        match serde_json::to_vec(&serde_json::json!({"at":now_millis(),"event":event,"data":data}))
-        {
-            Ok(line) => line,
-            Err(_) => return,
-        };
-    use std::io::Write;
-    if let Ok(mut file) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
-    {
-        let _ = file.write_all(&line);
-        let _ = file.write_all(b"\n");
-        let _ = file.sync_data();
+    let line = serde_json::json!({
+        "at": now_millis(),
+        "event": event,
+        "data": data,
+    });
+    match freshell_runtime_observability::RotatingJsonlWriter::create(
+        path,
+        10 * 1024 * 1024,
+        4,
+        lifecycle_secrets()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(path)
+            .cloned()
+            .unwrap_or_default(),
+    ) {
+        Ok(writer) => {
+            if let Err(error) = writer.write_json(&line).and_then(|_| writer.sync_all()) {
+                eprintln!("supervisor lifecycle event write failed: {error}");
+            }
+        }
+        Err(error) => eprintln!("supervisor lifecycle log unavailable: {error}"),
     }
 }
 
@@ -1172,7 +1551,7 @@ fn now_millis() -> i64 {
 }
 
 #[cfg(feature = "runtime-test-faults")]
-fn crash_if(point: &'static str) {
+pub(crate) fn crash_if(point: &'static str) {
     if std::env::var("FRESHELL_RUNTIME_CRASH_POINT")
         .ok()
         .as_deref()
@@ -1183,4 +1562,4 @@ fn crash_if(point: &'static str) {
     }
 }
 #[cfg(not(feature = "runtime-test-faults"))]
-fn crash_if(_point: &'static str) {}
+pub(crate) fn crash_if(_point: &'static str) {}

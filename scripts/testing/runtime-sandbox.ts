@@ -69,7 +69,7 @@ export class RuntimeGateBlockedError extends Error {
 
 export class RuntimeHarness {
   readonly repoRoot: string
-  readonly phase: 1 | 2 | 3
+  readonly phase: 1 | 2 | 3 | 4 | 5
   readonly runId: string
   readonly candidateSha: string
   readonly testRoot: string
@@ -94,7 +94,7 @@ export class RuntimeHarness {
   private readonly assertions: AssertionRecord[] = []
   private brokerStarted = false
 
-  constructor(repoRoot: string, runId = randomUUID(), phase: 1 | 2 | 3 = 1) {
+  constructor(repoRoot: string, runId = randomUUID(), phase: 1 | 2 | 3 | 4 | 5 = 1) {
     this.repoRoot = fs.realpathSync(repoRoot)
     this.phase = phase
     this.runId = runId
@@ -124,16 +124,33 @@ export class RuntimeHarness {
       ? { phase: 'phase-1', externalProviders: 'not-applicable', fixtures: ['heartbeat', 'descendant_spawner', 'cpu_burner', 'memory_allocator', 'native_session', 'security_probe'] }
       : this.phase === 2
         ? { phase: 'phase-2', opencode: { status: 'pending-live-gate', version: '1.18.21', model: 'opencode/big-pickle', freeTier: true }, workloadImage: 'pinned' }
-        : {
-            phase: 'phase-3',
-            deterministicFixture: { provider: 'native-session-fixture', status: 'pending-live-gate' },
-            providers: {
-              claude: { status: 'pending-receipt', requiredModel: 'haiku', reasoning: 'lowest' },
-              opencode: { status: 'pending-receipt', version: '1.18.21', model: 'opencode/big-pickle', freeTier: true },
-              codex: { status: 'pending-receipt', version: '0.147.0', requiredModel: 'gpt-5.6-luna', reasoning: 'lowest' },
-              amplifier: { status: 'pending-receipt', version: '0.1.1', commit: '1873aa980535c99a743b17172e4231833f6c8741' },
-            },
-          }
+        : this.phase === 3
+          ? {
+              phase: 'phase-3',
+              deterministicFixture: { provider: 'native-session-fixture', status: 'pending-live-gate' },
+              providers: {
+                claude: { status: 'pending-receipt', requiredModel: 'haiku', reasoning: 'lowest' },
+                opencode: { status: 'pending-receipt', version: '1.18.21', model: 'opencode/big-pickle', freeTier: true },
+                codex: { status: 'pending-receipt', version: '0.147.0', requiredModel: 'gpt-5.6-luna', reasoning: 'lowest' },
+                amplifier: { status: 'pending-receipt', version: '0.1.1', commit: '1873aa980535c99a743b17172e4231833f6c8741' },
+              },
+            }
+          : this.phase === 4
+            ? {
+                phase: 'phase-4',
+                startupReconciliation: 'pending-live-gate',
+                durableViewIntents: 'pending-live-gate',
+                browserRehydration: 'pending-receipt',
+                compatibilityFallback: 'pending-live-gate',
+              }
+            : {
+                phase: 'phase-5',
+                lossCertification: 'pending-live-gate',
+                incidentBeforeCleanup: 'pending-live-gate',
+                durableNotices: 'pending-browser-receipt',
+                chaos: 'pending-live-gate',
+                migrationRollback: 'pending-live-gate',
+              }
     fs.writeFileSync(path.join(this.evidenceDir, 'provider-results.json'), JSON.stringify(providerResults, null, 2))
 
     this.recordLifecycle('gate.prepare.started', { repoRoot: this.repoRoot, candidateSha: this.candidateSha, runId: this.runId })
@@ -232,6 +249,15 @@ export class RuntimeHarness {
   writeBrowserArtifact(name: string, value: unknown): string {
     fs.mkdirSync(this.browserDir, { recursive: true })
     const target = path.join(this.browserDir, `${sanitizeName(name)}.json`)
+    fs.writeFileSync(target, JSON.stringify(value, null, 2))
+    return target
+  }
+
+  /// A named top-level evidence artifact. The gate manifest declares which
+  /// artifacts a run must contain; this is how a case contributes one.
+  writeArtifact(fileName: string, value: unknown): string {
+    const target = path.join(this.evidenceDir, sanitizeName(fileName))
+    fs.mkdirSync(path.dirname(target), { recursive: true })
     fs.writeFileSync(target, JSON.stringify(value, null, 2))
     return target
   }
@@ -446,6 +472,7 @@ export class RuntimeHarness {
     provider?: string
     providerStoreId?: string
     creationSeedRef?: string
+    viewIntent?: Record<string, unknown>
   }): any {
     const terminal = params.terminal
     return {
@@ -460,6 +487,7 @@ export class RuntimeHarness {
         ...(params.projectKey ? { projectKey: params.projectKey } : {}),
         ...(params.nativeSessionId ? { nativeSessionId: params.nativeSessionId } : {}),
         ...(terminal ? { terminal } : { fixture: params.fixture ?? 'heartbeat' }),
+        ...(params.viewIntent ? { viewIntent: params.viewIntent } : {}),
         ...(params.expectedControlEpoch === undefined ? {} : { expectedControlEpoch: params.expectedControlEpoch }),
       },
     }
@@ -485,20 +513,182 @@ export class RuntimeHarness {
     return { method: 'inventory' }
   }
 
+  inventorySnapshotBody(): any {
+    return { method: 'inventory_snapshot' }
+  }
+
+  pendingViewProjectionsBody(limit = 100, expectedControlEpoch?: number): any {
+    return {
+      method: 'pending_view_projections',
+      params: { limit, ...(expectedControlEpoch === undefined ? {} : { expectedControlEpoch }) },
+    }
+  }
+
+  acknowledgeViewProjectionBody(eventId: string, expectedControlEpoch?: number): any {
+    return {
+      method: 'acknowledge_view_projection',
+      params: { eventId, ...(expectedControlEpoch === undefined ? {} : { expectedControlEpoch }) },
+    }
+  }
+
+  updateViewVisibilityBody(params: {
+    viewId: string
+    visibility: 'visible' | 'detached' | 'hidden'
+    expectedRevision: number
+    expectedSoulIntentRevision: number
+    expectedControlEpoch?: number
+  }): any {
+    return {
+      method: 'update_view_visibility',
+      params: {
+        viewId: params.viewId,
+        visibility: params.visibility,
+        expectedRevision: params.expectedRevision,
+        expectedSoulIntentRevision: params.expectedSoulIntentRevision,
+        ...(params.expectedControlEpoch === undefined ? {} : { expectedControlEpoch: params.expectedControlEpoch }),
+      },
+    }
+  }
+
+  upsertViewIntentBody(params: {
+    soulId: string
+    viewId?: string
+    intent: Record<string, unknown>
+    expectedRevision?: number
+    expectedSoulIntentRevision: number
+    expectedControlEpoch?: number
+  }): any {
+    return {
+      method: 'upsert_view_intent',
+      params: {
+        soulId: params.soulId,
+        ...(params.viewId ? { viewId: params.viewId } : {}),
+        intent: params.intent,
+        ...(params.expectedRevision === undefined ? {} : { expectedRevision: params.expectedRevision }),
+        expectedSoulIntentRevision: params.expectedSoulIntentRevision,
+        ...(params.expectedControlEpoch === undefined ? {} : { expectedControlEpoch: params.expectedControlEpoch }),
+      },
+    }
+  }
+
+  updateLimitsBody(params: {
+    soulId: string
+    limits: RuntimeLimits
+    expectedIntentRevision: number
+    expectedControlEpoch?: number
+  }): any {
+    return {
+      method: 'update_limits',
+      params: {
+        soulId: params.soulId,
+        limits: params.limits,
+        expectedIntentRevision: params.expectedIntentRevision,
+        ...(params.expectedControlEpoch === undefined ? {} : { expectedControlEpoch: params.expectedControlEpoch }),
+      },
+    }
+  }
+
   probeRecoveryBody(soulId: string, expectedControlEpoch?: number): any {
     return { method: 'probe_recovery', params: { soulId, ...(expectedControlEpoch === undefined ? {} : { expectedControlEpoch }) } }
+  }
+
+  pendingNoticesBody(profileId: string, limit = 20, expectedControlEpoch?: number): any {
+    return {
+      method: 'pending_notices',
+      params: {
+        profileId,
+        limit,
+        ...(expectedControlEpoch === undefined ? {} : { expectedControlEpoch }),
+      },
+    }
+  }
+
+  noticeReceiptBody(params: {
+    noticeId: string
+    profileId: string
+    state: 'rendered' | 'acknowledged' | 'dismissed'
+    expectedControlEpoch?: number
+  }): any {
+    return {
+      method: 'notice_receipt',
+      params: {
+        noticeId: params.noticeId,
+        profileId: params.profileId,
+        state: params.state,
+        ...(params.expectedControlEpoch === undefined ? {} : { expectedControlEpoch: params.expectedControlEpoch }),
+      },
+    }
+  }
+
+  incidentSummaryBody(incidentId: string, expectedControlEpoch?: number): any {
+    return {
+      method: 'incident_summary',
+      params: {
+        incidentId,
+        ...(expectedControlEpoch === undefined ? {} : { expectedControlEpoch }),
+      },
+    }
+  }
+
+  runtimeMetricsSnapshotBody(): any {
+    return { method: 'metrics_snapshot' }
+  }
+
+  migrationPlanBody(params: {
+    requestedMode: 'legacy' | 'managed-opt-in' | 'managed-default'
+    apply?: boolean
+    backupPath?: string
+    legacyMetadataPath?: string
+    expectedControlEpoch?: number
+  }): any {
+    return {
+      method: 'migration_plan',
+      params: {
+        requestedMode: params.requestedMode,
+        apply: params.apply ?? false,
+        ...(params.backupPath ? { backupPath: params.backupPath } : {}),
+        ...(params.legacyMetadataPath ? { legacyMetadataPath: params.legacyMetadataPath } : {}),
+        ...(params.expectedControlEpoch === undefined ? {} : { expectedControlEpoch: params.expectedControlEpoch }),
+      },
+    }
+  }
+
+  repairAuditBody(apply = false, expectedControlEpoch?: number): any {
+    return {
+      method: 'repair_audit',
+      params: {
+        apply,
+        ...(expectedControlEpoch === undefined ? {} : { expectedControlEpoch }),
+      },
+    }
   }
 
   recoverBody(
     soulId: string,
     trigger: 'provider_exit' | 'host_unreachable' | 'startup_reconcile' | 'manual_retry' | 'retry_exhausted' | 'explicit_request' = 'explicit_request',
     expectedControlEpoch?: number,
+    expectedIntentRevision?: number,
   ): any {
-    return { method: 'recover', params: { soulId, trigger, ...(expectedControlEpoch === undefined ? {} : { expectedControlEpoch }) } }
+    return {
+      method: 'recover',
+      params: {
+        soulId,
+        trigger,
+        ...(expectedIntentRevision === undefined ? {} : { expectedIntentRevision }),
+        ...(expectedControlEpoch === undefined ? {} : { expectedControlEpoch }),
+      },
+    }
   }
 
-  stopBody(soulId: string, expectedControlEpoch?: number): any {
-    return { method: 'stop', params: { soulId, ...(expectedControlEpoch === undefined ? {} : { expectedControlEpoch }) } }
+  stopBody(soulId: string, expectedControlEpoch?: number, expectedIntentRevision?: number): any {
+    return {
+      method: 'stop',
+      params: {
+        soulId,
+        ...(expectedIntentRevision === undefined ? {} : { expectedIntentRevision }),
+        ...(expectedControlEpoch === undefined ? {} : { expectedControlEpoch }),
+      },
+    }
   }
 
   runtimeDir(instance: SupervisorInstance, incarnationId: string): string {
@@ -552,6 +742,22 @@ export class RuntimeHarness {
     if (!this.isContainerRunning(containerId)) return
     const result = spawnSync('docker', ['kill', containerId], { encoding: 'utf8' })
     if (result.status !== 0) throw new Error(result.stderr || `docker kill failed for owned runtime ${containerId}`)
+  }
+
+  killOwnedRuntimePidExact(containerId: string, pid: number, signal: 'TERM' | 'KILL' = 'KILL'): void {
+    if (!this.broker.receiptIds().has(containerId)) {
+      throw new Error(`refusing to signal a pid in non-receipt container ${containerId}`)
+    }
+    if (!Number.isSafeInteger(pid) || pid <= 1) {
+      throw new Error(`refusing to signal unsafe runtime pid ${pid}`)
+    }
+    if (!this.isContainerRunning(containerId)) return
+    const result = spawnSync('docker', ['exec', containerId, 'kill', `-${signal}`, String(pid)], {
+      encoding: 'utf8',
+    })
+    if (result.status !== 0) {
+      throw new Error(result.stderr || `docker exec kill failed for owned runtime ${containerId} pid ${pid}`)
+    }
   }
 
   execOwnedContainerExact(containerId: string, command: string[]): string {
@@ -833,18 +1039,39 @@ function git(cwd: string, args: string[]): string {
   return execFileSync('git', args, { cwd, encoding: 'utf8' })
 }
 
-function unixRoundTrip(socketPath: string, frame: Buffer): Promise<unknown> {
+/// Bound on one gate → supervisor control round trip.
+///
+/// A wedged supervisor must produce a FAIL with evidence, never an
+/// indefinitely hanging gate: a run that never returns cannot be reviewed,
+/// cannot clean up its own containers, and cannot be told apart from a slow
+/// one. Generous by design — this catches deadlock, not slowness.
+export const CONTROL_ROUND_TRIP_TIMEOUT_MS = Number(
+  process.env.FRESHELL_RUNTIME_CONTROL_TIMEOUT_MS ?? 120_000,
+)
+
+function unixRoundTrip(
+  socketPath: string,
+  frame: Buffer,
+  timeoutMs = CONTROL_ROUND_TRIP_TIMEOUT_MS,
+): Promise<unknown> {
   return new Promise((resolve, reject) => {
     const socket = net.createConnection(socketPath)
     const chunks: Buffer[] = []
     let expected: number | undefined
     let done = false
+    let timer: NodeJS.Timeout
     const fail = (error: unknown) => {
       if (done) return
       done = true
+      clearTimeout(timer)
       socket.destroy()
       reject(error)
     }
+    timer = setTimeout(() => {
+      fail(new Error(`control round trip exceeded ${timeoutMs}ms: ${socketPath}`))
+    }, timeoutMs)
+    // A pending timer must never keep the gate process alive on its own.
+    timer.unref?.()
     socket.once('error', fail)
     socket.on('data', (chunk: Buffer) => {
       chunks.push(chunk)
@@ -854,6 +1081,7 @@ function unixRoundTrip(socketPath: string, frame: Buffer): Promise<unknown> {
         try {
           const parsed = JSON.parse(bytes.subarray(4, 4 + expected).toString('utf8'))
           done = true
+          clearTimeout(timer)
           socket.destroy()
           resolve(parsed)
         } catch (error) { fail(error) }

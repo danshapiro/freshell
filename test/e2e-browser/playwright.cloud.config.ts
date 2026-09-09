@@ -77,8 +77,8 @@ export const CLOUD_SKIP_SPECS = [
   // Environment-sensitive: checkpoint/rewind with fake codex sidecar
   // exceeds 120s timeout under cloud resource constraints
   'agent-checkpoint-rewind.spec.ts',
-  // Local-only receipt: cloud must never substitute for this provider-binary
-  // contract. The positive local selector is exported by the base config.
+  // Local-only receipts need provider binaries or a host Docker supervisor
+  // and broker. Their positive selectors are exported by the base config.
   ...LOCAL_ONLY_SPECS.map(({ spec }) => spec),
 ]
 

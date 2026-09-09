@@ -97,17 +97,16 @@
 //! (full-flow schema + correlation + restart) for the outer, black-box,
 //! operator-experience proof of this contract.
 
-use std::fs::{self, File, OpenOptions};
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Mutex, OnceLock};
 
 use axum::extract::Request;
 use axum::http::Uri;
 use axum::middleware::Next;
 use axum::response::Response;
-use regex::Regex;
+#[cfg(test)]
+use freshell_runtime_observability::scrub;
+use freshell_runtime_observability::RotatingJsonlWriter as RotatingWriter;
 use serde_json::{Map, Value};
 use tracing::field::{Field, Visit};
 use tracing::span::{Attributes, Id, Record};
@@ -209,160 +208,11 @@ pub fn init(config: LoggingConfig) -> std::io::Result<()> {
         .map_err(|err| std::io::Error::other(err.to_string()))
 }
 
-// ─────────────────────────── redaction (DIAG-03) ───────────────────────────
-
-fn token_field_re() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| {
-        Regex::new(r#"(?i)"([a-z0-9_-]*token[a-z0-9_-]*)"\s*:\s*"((?:\\.|[^"\\])*)""#)
-            .expect("valid token-field redaction regex")
-    })
-}
-
-fn cookie_field_re() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| {
-        Regex::new(r#"(?i)"(cookie)"\s*:\s*"((?:\\.|[^"\\])*)""#)
-            .expect("valid cookie-field redaction regex")
-    })
-}
-
-fn cookie_header_re() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| {
-        Regex::new(r"(?i)\b(cookie|set-cookie)\s*:\s*[^\r\n\x22]+")
-            .expect("valid cookie-header redaction regex")
-    })
-}
-
-/// Redact `line` BEFORE it reaches disk. This is the from-the-first-byte
-/// guarantee (DIAG-03): [`RotatingWriter::write_line`] calls this on every
-/// single line, so no call site can leak a secret by forgetting to scrub it
-/// locally -- the scrub is a property of the writer, not the caller.
-fn scrub(line: &str, secret: &str) -> String {
-    let mut out = line.to_string();
-    if !secret.is_empty() {
-        out = out.replace(secret, "***REDACTED***");
-    }
-    out = token_field_re()
-        .replace_all(&out, |caps: &regex::Captures| {
-            format!("\"{}\":\"***REDACTED***\"", &caps[1])
-        })
-        .into_owned();
-    out = cookie_field_re()
-        .replace_all(&out, |caps: &regex::Captures| {
-            format!("\"{}\":\"***REDACTED***\"", &caps[1])
-        })
-        .into_owned();
-    out = cookie_header_re()
-        .replace_all(&out, |caps: &regex::Captures| {
-            format!("{}: ***REDACTED***", &caps[1])
-        })
-        .into_owned();
-    out
-}
-
-// ───────────────────────── rotation (DIAG-03) ─────────────────────────
-
-struct RotatingInner {
-    path: PathBuf,
-    max_bytes: u64,
-    max_backups: u32,
-    file: File,
-    size: u64,
-    secret: String,
-}
-
-impl RotatingInner {
-    fn backup_path(&self, n: u32) -> PathBuf {
-        let mut s = self.path.as_os_str().to_os_string();
-        s.push(format!(".{n}"));
-        PathBuf::from(s)
-    }
-
-    /// Shift `path.1 -> path.2 -> ... -> path.max_backups` (dropping the
-    /// oldest overflow), move the active file to `path.1`, then open a fresh
-    /// active file. Every write beyond `max_bytes` on the active file
-    /// triggers exactly one of these, keeping the total file count bounded
-    /// at `1 + max_backups` no matter how long the process runs.
-    fn rotate(&mut self) {
-        if self.max_backups == 0 {
-            let _ = fs::remove_file(&self.path);
-        } else {
-            let oldest = self.backup_path(self.max_backups);
-            let _ = fs::remove_file(&oldest);
-            for n in (1..self.max_backups).rev() {
-                let from = self.backup_path(n);
-                let to = self.backup_path(n + 1);
-                if from.exists() {
-                    let _ = fs::rename(&from, &to);
-                }
-            }
-            let _ = fs::rename(&self.path, self.backup_path(1));
-        }
-        if let Ok(f) = OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(true)
-            .open(&self.path)
-        {
-            self.file = f;
-            self.size = 0;
-        }
-    }
-}
-
-/// A redacting, size-rotating JSONL sink. Every [`write_line`](Self::write_line)
-/// call scrubs the line, rotates first if the write would exceed the
-/// configured cap, then writes + flushes synchronously -- so there is no
-/// buffered-but-unflushed window: the "final flush on shutdown" concern
-/// (DIAG-03's Playwright validation text) does not apply here because there
-/// is never anything left unflushed to begin with.
-pub struct RotatingWriter {
-    inner: Mutex<RotatingInner>,
-}
-
-impl RotatingWriter {
-    pub fn create(
-        path: PathBuf,
-        max_bytes: u64,
-        max_backups: u32,
-        secret: String,
-    ) -> std::io::Result<Self> {
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        let file = OpenOptions::new().create(true).append(true).open(&path)?;
-        let size = file.metadata()?.len();
-        Ok(Self {
-            inner: Mutex::new(RotatingInner {
-                path,
-                max_bytes,
-                max_backups,
-                file,
-                size,
-                secret,
-            }),
-        })
-    }
-
-    fn write_line(&self, line: &str) {
-        let mut inner = match self.inner.lock() {
-            Ok(guard) => guard,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        let scrubbed = scrub(line, &inner.secret);
-        let mut bytes = scrubbed.into_bytes();
-        bytes.push(b'\n');
-        if inner.size > 0 && inner.size + bytes.len() as u64 > inner.max_bytes {
-            inner.rotate();
-        }
-        if inner.file.write_all(&bytes).is_ok() {
-            let _ = inner.file.flush();
-            inner.size += bytes.len() as u64;
-        }
-    }
-}
+// ───────────────────────── redaction + rotation (DIAG-03) ─────────────────────────
+//
+// `scrub` and `RotatingJsonlWriter` live in the lower-level
+// freshell-runtime-observability crate so supervisor incident reports and host
+// diagnostics have the exact same from-first-byte redaction and size bounds.
 
 // ───────────────────────── JSON event formatting (DIAG-01) ─────────────────────────
 
@@ -518,7 +368,7 @@ where
         );
 
         if let Ok(line) = serde_json::to_string(&Value::Object(map)) {
-            self.writer.write_line(&line);
+            let _ = self.writer.write_line(&line);
         }
     }
 }
@@ -696,7 +546,7 @@ mod tests {
         let writer = RotatingWriter::create(path.clone(), 200, 2, String::new()).unwrap();
 
         for i in 0..200 {
-            writer.write_line(&format!(
+            let _ = writer.write_line(&format!(
                 r#"{{"ts":"now","level":"INFO","target":"t","msg":"line {i} padding padding"}}"#
             ));
         }

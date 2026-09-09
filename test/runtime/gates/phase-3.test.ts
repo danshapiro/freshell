@@ -468,13 +468,20 @@ async function gate09IndependentSoulsAndViews(h: RuntimeHarness): Promise<void> 
   const receipt = requiredProviderReceipt(
     caseId,
     h,
-    'The deterministic two-soul isolation check passed. Supply OpenCode/Codex terminal-and-second-view evidence in FRESHELL_RUNTIME_PHASE3_PROVIDER_RECEIPT.',
+    'The deterministic two-soul isolation check passed. Supply terminal-and-second-view evidence for every release-enabled durable provider in FRESHELL_RUNTIME_PHASE3_PROVIDER_RECEIPT.',
   )
   const isolation = receipt.isolation as any
-  h.assert(caseId, isolation?.opencode?.twoSoulsIndependent === true, 'real OpenCode souls have independent processes and budgets', isolation)
-  h.assert(caseId, isolation?.opencode?.oneWriterPerSoul === true, 'OpenCode second view does not create a second writer', isolation)
-  h.assert(caseId, isolation?.codex?.terminalAndSecondView === true, 'Codex terminal and second-view path is exercised', isolation)
-  h.assert(caseId, isolation?.codex?.oneWriterPerThread === true, 'Codex uses one writer per native thread', isolation)
+  const enabled = readCapabilityManifest(h).providers
+    .filter((provider: any) => provider.durableRecoveryEnabled === true)
+    .map((provider: any) => provider.provider)
+  if (enabled.includes('opencode')) {
+    h.assert(caseId, isolation?.opencode?.twoSoulsIndependent === true, 'real OpenCode souls have independent processes and budgets', isolation)
+    h.assert(caseId, isolation?.opencode?.oneWriterPerSoul === true, 'OpenCode second view does not create a second writer', isolation)
+  }
+  if (enabled.includes('codex')) {
+    h.assert(caseId, isolation?.codex?.terminalAndSecondView === true, 'Codex terminal and second-view path is exercised', isolation)
+    h.assert(caseId, isolation?.codex?.oneWriterPerThread === true, 'Codex uses one writer per native thread', isolation)
+  }
 }
 
 async function gate10PermissionPromptBrowserReceipt(h: RuntimeHarness): Promise<void> {
@@ -732,6 +739,7 @@ function requiredProviderReceipt(caseId: string, h: RuntimeHarness, instruction:
   )
   h.assert(caseId, receipt.schemaVersion === 1 && receipt.status === 'PASS', 'provider receipt is an explicit schema-v1 PASS', receipt)
   h.assert(caseId, receipt.candidateSha === h.candidateSha, 'provider receipt belongs to the exact candidate commit', receipt)
+  h.writeBrowserArtifact(`${caseId}-provider-matrix`, receipt)
   return receipt
 }
 

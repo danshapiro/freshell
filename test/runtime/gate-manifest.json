@@ -699,7 +699,7 @@
         "phase-4"
       ],
       "command": "npm run test:runtime -- gate phase-5 --require-live",
-      "command_status": "TO_BE_IMPLEMENTED_IN_PHASE_1",
+      "command_status": "implemented",
       "tasks": [
         {
           "id": "P5.1",
@@ -871,7 +871,78 @@
         "P5-G12"
       ],
       "own_required_case_count": 12,
-      "cumulative_required_case_count": 56
+      "cumulative_required_case_count": 56,
+      "required_artifacts": [
+        "provider-results.json",
+        "ownership-before.json",
+        "ownership-after.json",
+        "cleanup.json",
+        "broker.jsonl",
+        "assertions.jsonl",
+        "build.json",
+        "capabilities.json",
+        "lifecycle.jsonl",
+        "incidents/",
+        "browser/",
+        "summary.json",
+        "runtime-metrics.json",
+        "migration-plan.json",
+        "deferred-providers.json",
+        "repair-audit.json"
+      ]
     }
-  ]
+  ],
+  "certification_gates": {
+    "schema_version": 1,
+    "source_manifest": "docs/development/runtime-provider-capabilities.json",
+    "provider_certification_case_ids": [
+      "PC-SHELL",
+      "PC-CLAUDE",
+      "PC-OPENCODE",
+      "PC-CODEX",
+      "PC-AMPLIFIER"
+    ],
+    "case_statuses": [
+      "PASS",
+      "DEFERRED_LIVE_PROVIDER_CERTIFICATION",
+      "BLOCKED",
+      "FAIL"
+    ],
+    "deferral_reason": "pending_live_provider_certification",
+    "modes": {
+      "landing": {
+        "id": "durable-souls-landing",
+        "command": "npm run test:runtime -- gate landing --require-live",
+        "cumulative_phase": "phase-5",
+        "may_pass_with_deferred_providers": true,
+        "deferrable_providers": [
+          "claude",
+          "codex",
+          "amplifier"
+        ],
+        "every_other_case_must_pass": true,
+        "deferral_is_not_a_pass": true
+      },
+      "production": {
+        "id": "durable-souls-production-gate-5",
+        "command": "npm run test:runtime -- gate phase-5 --require-live",
+        "cumulative_phase": "phase-5",
+        "may_pass_with_deferred_providers": false,
+        "expected_status_until_live_certification": "BLOCKED",
+        "expected_blocked_reason": "pending_live_provider_certification",
+        "blocked_is_never_pass": true,
+        "required_certified_providers": [
+          "shell",
+          "opencode",
+          "claude",
+          "codex",
+          "amplifier"
+        ]
+      }
+    },
+    "required_artifacts": [
+      "summary.json",
+      "deferred-providers.json"
+    ]
+  }
 }

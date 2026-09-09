@@ -5,10 +5,16 @@
 //! supervisor's registry-backed `OwnedRuntimeHandle` boundary.
 
 use freshell_runtime_protocol::{
-    read_frame, write_frame, AdminCommand, AdminReply, AdminResult, ControlRole, Envelope,
-    LaunchRequest, RecoverRequest, RecoveryProbeRequest, RecoveryTrigger, RequestId, RuntimeError,
-    RuntimeErrorCode, RuntimeMetricsRequest, SoulId, StopRequest, TerminalInputRequest,
-    TerminalReadOutputRequest, TerminalResizeRequest, CONTROL_PROTOCOL_VERSION,
+    read_frame, write_frame, AcknowledgeViewProjectionRequest, AdminCommand, AdminReply,
+    AdminResult, ControlRole, Envelope, IncidentId, IncidentSummaryRequest, LaunchRequest,
+    LossIncidentSummary, ManagedRolloutMode, MigrationPlan, MigrationPlanRequest,
+    NoticeDeliveryState, NoticeId, NoticeReceiptRequest, PendingNoticesRequest,
+    PendingViewProjectionsRequest, RecoverRequest, RecoveryProbeRequest, RecoveryTrigger,
+    RepairAudit, RepairRequest, RequestId, RuntimeError, RuntimeErrorCode,
+    RuntimeInventorySnapshot, RuntimeMetricsRequest, RuntimeMetricsSnapshot, RuntimeNotice,
+    RuntimeView, SoulId, StopOutcome, StopRequest, TerminalInputRequest, TerminalReadOutputRequest,
+    TerminalResizeRequest, UpdateLimitsRequest, UpdateLimitsResult, UpdateViewVisibilityRequest,
+    UpsertViewIntentRequest, ViewIntent, ViewProjectionEvent, CONTROL_PROTOCOL_VERSION,
 };
 use std::{path::PathBuf, sync::Arc};
 use tokio::{net::UnixStream, sync::RwLock};
@@ -93,6 +99,416 @@ impl RuntimeClient {
         {
             AdminResult::Inventory(views) => Ok(views),
             _ => Err(ClientError::UnexpectedResult),
+        }
+    }
+
+    pub async fn inventory_snapshot(&self) -> Result<RuntimeInventorySnapshot, ClientError> {
+        match self
+            .request(RequestId::new(), AdminCommand::InventorySnapshot)
+            .await?
+        {
+            AdminResult::InventorySnapshot(snapshot) => Ok(snapshot),
+            _ => Err(ClientError::UnexpectedResult),
+        }
+    }
+
+    pub async fn pending_view_projections(
+        &self,
+        limit: u32,
+    ) -> Result<Vec<ViewProjectionEvent>, ClientError> {
+        let epoch = self.current_epoch().await?;
+        let mut request = PendingViewProjectionsRequest {
+            limit,
+            expected_control_epoch: Some(epoch),
+        };
+        match self
+            .request(
+                RequestId::new(),
+                AdminCommand::PendingViewProjections(request.clone()),
+            )
+            .await
+        {
+            Ok(AdminResult::PendingViewProjections(events)) => Ok(events),
+            Err(error) if error.runtime_code() == Some(RuntimeErrorCode::StaleControlEpoch) => {
+                request.expected_control_epoch = Some(self.health().await?.0);
+                match self
+                    .request(
+                        RequestId::new(),
+                        AdminCommand::PendingViewProjections(request),
+                    )
+                    .await?
+                {
+                    AdminResult::PendingViewProjections(events) => Ok(events),
+                    _ => Err(ClientError::UnexpectedResult),
+                }
+            }
+            Ok(_) => Err(ClientError::UnexpectedResult),
+            Err(error) => Err(error),
+        }
+    }
+
+    pub async fn acknowledge_view_projection(
+        &self,
+        event_id: freshell_runtime_protocol::ProjectionEventId,
+    ) -> Result<(), ClientError> {
+        let epoch = self.current_epoch().await?;
+        let mut request = AcknowledgeViewProjectionRequest {
+            event_id,
+            expected_control_epoch: Some(epoch),
+        };
+        match self
+            .request(
+                RequestId::new(),
+                AdminCommand::AcknowledgeViewProjection(request.clone()),
+            )
+            .await
+        {
+            Ok(AdminResult::ViewProjectionAcknowledged) => Ok(()),
+            Err(error) if error.runtime_code() == Some(RuntimeErrorCode::StaleControlEpoch) => {
+                request.expected_control_epoch = Some(self.health().await?.0);
+                match self
+                    .request(
+                        RequestId::new(),
+                        AdminCommand::AcknowledgeViewProjection(request),
+                    )
+                    .await?
+                {
+                    AdminResult::ViewProjectionAcknowledged => Ok(()),
+                    _ => Err(ClientError::UnexpectedResult),
+                }
+            }
+            Ok(_) => Err(ClientError::UnexpectedResult),
+            Err(error) => Err(error),
+        }
+    }
+
+    pub async fn update_view_visibility(
+        &self,
+        request: UpdateViewVisibilityRequest,
+    ) -> Result<ViewIntent, ClientError> {
+        self.update_view_visibility_with_request_id(RequestId::new(), request)
+            .await
+    }
+
+    pub async fn update_view_visibility_with_request_id(
+        &self,
+        request_id: RequestId,
+        mut request: UpdateViewVisibilityRequest,
+    ) -> Result<ViewIntent, ClientError> {
+        request.expected_control_epoch = Some(self.current_epoch().await?);
+        let original = request.clone();
+        match self
+            .request(
+                request_id.clone(),
+                AdminCommand::UpdateViewVisibility(request),
+            )
+            .await
+        {
+            Ok(AdminResult::ViewIntent(intent)) => Ok(intent),
+            Err(error) if error.runtime_code() == Some(RuntimeErrorCode::StaleControlEpoch) => {
+                let mut retry = original;
+                retry.expected_control_epoch = Some(self.health().await?.0);
+                match self
+                    .request(request_id, AdminCommand::UpdateViewVisibility(retry))
+                    .await?
+                {
+                    AdminResult::ViewIntent(intent) => Ok(intent),
+                    _ => Err(ClientError::UnexpectedResult),
+                }
+            }
+            Ok(_) => Err(ClientError::UnexpectedResult),
+            Err(error) => Err(error),
+        }
+    }
+
+    pub async fn upsert_view_intent(
+        &self,
+        request: UpsertViewIntentRequest,
+    ) -> Result<ViewIntent, ClientError> {
+        self.upsert_view_intent_with_request_id(RequestId::new(), request)
+            .await
+    }
+
+    pub async fn upsert_view_intent_with_request_id(
+        &self,
+        request_id: RequestId,
+        mut request: UpsertViewIntentRequest,
+    ) -> Result<ViewIntent, ClientError> {
+        request.expected_control_epoch = Some(self.current_epoch().await?);
+        let original = request.clone();
+        match self
+            .request(request_id.clone(), AdminCommand::UpsertViewIntent(request))
+            .await
+        {
+            Ok(AdminResult::ViewIntent(intent)) => Ok(intent),
+            Err(error) if error.runtime_code() == Some(RuntimeErrorCode::StaleControlEpoch) => {
+                let mut retry = original;
+                retry.expected_control_epoch = Some(self.health().await?.0);
+                match self
+                    .request(request_id, AdminCommand::UpsertViewIntent(retry))
+                    .await?
+                {
+                    AdminResult::ViewIntent(intent) => Ok(intent),
+                    _ => Err(ClientError::UnexpectedResult),
+                }
+            }
+            Ok(_) => Err(ClientError::UnexpectedResult),
+            Err(error) => Err(error),
+        }
+    }
+
+    pub async fn update_limits(
+        &self,
+        soul_id: SoulId,
+        limits: freshell_runtime_protocol::RuntimeLimits,
+        expected_intent_revision: u64,
+    ) -> Result<UpdateLimitsResult, ClientError> {
+        self.update_limits_with_request_id(
+            RequestId::new(),
+            soul_id,
+            limits,
+            expected_intent_revision,
+        )
+        .await
+    }
+
+    pub async fn update_limits_with_request_id(
+        &self,
+        request_id: RequestId,
+        soul_id: SoulId,
+        limits: freshell_runtime_protocol::RuntimeLimits,
+        expected_intent_revision: u64,
+    ) -> Result<UpdateLimitsResult, ClientError> {
+        let mut request = UpdateLimitsRequest {
+            soul_id,
+            limits,
+            expected_intent_revision,
+            expected_control_epoch: Some(self.current_epoch().await?),
+        };
+        let original = request.clone();
+        match self
+            .request(request_id.clone(), AdminCommand::UpdateLimits(request))
+            .await
+        {
+            Ok(AdminResult::UpdateLimits(result)) => Ok(result),
+            Err(error) if error.runtime_code() == Some(RuntimeErrorCode::StaleControlEpoch) => {
+                request = original;
+                request.expected_control_epoch = Some(self.health().await?.0);
+                match self
+                    .request(request_id, AdminCommand::UpdateLimits(request))
+                    .await?
+                {
+                    AdminResult::UpdateLimits(result) => Ok(result),
+                    _ => Err(ClientError::UnexpectedResult),
+                }
+            }
+            Ok(_) => Err(ClientError::UnexpectedResult),
+            Err(error) => Err(error),
+        }
+    }
+
+    pub async fn pending_notices(
+        &self,
+        profile_id: String,
+        limit: u32,
+    ) -> Result<Vec<RuntimeNotice>, ClientError> {
+        let mut request = PendingNoticesRequest {
+            profile_id,
+            limit,
+            expected_control_epoch: Some(self.current_epoch().await?),
+        };
+        let original = request.clone();
+        match self
+            .request(RequestId::new(), AdminCommand::PendingNotices(request))
+            .await
+        {
+            Ok(AdminResult::PendingNotices(notices)) => Ok(notices),
+            Err(error) if error.runtime_code() == Some(RuntimeErrorCode::StaleControlEpoch) => {
+                request = original;
+                request.expected_control_epoch = Some(self.health().await?.0);
+                match self
+                    .request(RequestId::new(), AdminCommand::PendingNotices(request))
+                    .await?
+                {
+                    AdminResult::PendingNotices(notices) => Ok(notices),
+                    _ => Err(ClientError::UnexpectedResult),
+                }
+            }
+            Ok(_) => Err(ClientError::UnexpectedResult),
+            Err(error) => Err(error),
+        }
+    }
+
+    pub async fn record_notice_receipt(
+        &self,
+        notice_id: NoticeId,
+        profile_id: String,
+        state: NoticeDeliveryState,
+    ) -> Result<(), ClientError> {
+        self.record_notice_receipt_with_request_id(RequestId::new(), notice_id, profile_id, state)
+            .await
+    }
+
+    pub async fn record_notice_receipt_with_request_id(
+        &self,
+        request_id: RequestId,
+        notice_id: NoticeId,
+        profile_id: String,
+        state: NoticeDeliveryState,
+    ) -> Result<(), ClientError> {
+        let mut request = NoticeReceiptRequest {
+            notice_id,
+            profile_id,
+            state,
+            expected_control_epoch: Some(self.current_epoch().await?),
+        };
+        let original = request.clone();
+        match self
+            .request(request_id.clone(), AdminCommand::NoticeReceipt(request))
+            .await
+        {
+            Ok(AdminResult::NoticeReceiptRecorded) => Ok(()),
+            Err(error) if error.runtime_code() == Some(RuntimeErrorCode::StaleControlEpoch) => {
+                request = original;
+                request.expected_control_epoch = Some(self.health().await?.0);
+                match self
+                    .request(request_id, AdminCommand::NoticeReceipt(request))
+                    .await?
+                {
+                    AdminResult::NoticeReceiptRecorded => Ok(()),
+                    _ => Err(ClientError::UnexpectedResult),
+                }
+            }
+            Ok(_) => Err(ClientError::UnexpectedResult),
+            Err(error) => Err(error),
+        }
+    }
+
+    pub async fn incident_summary(
+        &self,
+        incident_id: IncidentId,
+    ) -> Result<LossIncidentSummary, ClientError> {
+        let mut request = IncidentSummaryRequest {
+            incident_id,
+            expected_control_epoch: Some(self.current_epoch().await?),
+        };
+        let original = request.clone();
+        match self
+            .request(RequestId::new(), AdminCommand::IncidentSummary(request))
+            .await
+        {
+            Ok(AdminResult::IncidentSummary(summary)) => Ok(summary),
+            Err(error) if error.runtime_code() == Some(RuntimeErrorCode::StaleControlEpoch) => {
+                request = original;
+                request.expected_control_epoch = Some(self.health().await?.0);
+                match self
+                    .request(RequestId::new(), AdminCommand::IncidentSummary(request))
+                    .await?
+                {
+                    AdminResult::IncidentSummary(summary) => Ok(summary),
+                    _ => Err(ClientError::UnexpectedResult),
+                }
+            }
+            Ok(_) => Err(ClientError::UnexpectedResult),
+            Err(error) => Err(error),
+        }
+    }
+
+    pub async fn runtime_metrics_snapshot(&self) -> Result<RuntimeMetricsSnapshot, ClientError> {
+        match self
+            .request(RequestId::new(), AdminCommand::MetricsSnapshot)
+            .await?
+        {
+            AdminResult::MetricsSnapshot(snapshot) => Ok(snapshot),
+            _ => Err(ClientError::UnexpectedResult),
+        }
+    }
+
+    pub async fn migration_plan(
+        &self,
+        request: MigrationPlanRequest,
+    ) -> Result<MigrationPlan, ClientError> {
+        self.migration_plan_with_request_id(RequestId::new(), request)
+            .await
+    }
+
+    pub async fn migration_plan_with_request_id(
+        &self,
+        request_id: RequestId,
+        mut request: MigrationPlanRequest,
+    ) -> Result<MigrationPlan, ClientError> {
+        request.expected_control_epoch = Some(self.current_epoch().await?);
+        let original = request.clone();
+        match self
+            .request(request_id.clone(), AdminCommand::MigrationPlan(request))
+            .await
+        {
+            Ok(AdminResult::MigrationPlan(plan)) => Ok(plan),
+            Err(error) if error.runtime_code() == Some(RuntimeErrorCode::StaleControlEpoch) => {
+                let mut retry = original;
+                retry.expected_control_epoch = Some(self.health().await?.0);
+                match self
+                    .request(request_id, AdminCommand::MigrationPlan(retry))
+                    .await?
+                {
+                    AdminResult::MigrationPlan(plan) => Ok(plan),
+                    _ => Err(ClientError::UnexpectedResult),
+                }
+            }
+            Ok(_) => Err(ClientError::UnexpectedResult),
+            Err(error) => Err(error),
+        }
+    }
+
+    pub async fn set_rollout_mode(
+        &self,
+        requested_mode: ManagedRolloutMode,
+        backup_path: Option<String>,
+        legacy_metadata_path: Option<String>,
+    ) -> Result<MigrationPlan, ClientError> {
+        self.migration_plan(MigrationPlanRequest {
+            requested_mode,
+            apply: true,
+            backup_path,
+            legacy_metadata_path,
+            expected_control_epoch: None,
+        })
+        .await
+    }
+
+    pub async fn repair_audit(&self, apply: bool) -> Result<RepairAudit, ClientError> {
+        self.repair_audit_with_request_id(RequestId::new(), apply)
+            .await
+    }
+
+    pub async fn repair_audit_with_request_id(
+        &self,
+        request_id: RequestId,
+        apply: bool,
+    ) -> Result<RepairAudit, ClientError> {
+        let mut request = RepairRequest {
+            apply,
+            expected_control_epoch: Some(self.current_epoch().await?),
+        };
+        let original = request.clone();
+        match self
+            .request(request_id.clone(), AdminCommand::RepairAudit(request))
+            .await
+        {
+            Ok(AdminResult::RepairAudit(audit)) => Ok(audit),
+            Err(error) if error.runtime_code() == Some(RuntimeErrorCode::StaleControlEpoch) => {
+                request = original;
+                request.expected_control_epoch = Some(self.health().await?.0);
+                match self
+                    .request(request_id, AdminCommand::RepairAudit(request))
+                    .await?
+                {
+                    AdminResult::RepairAudit(audit) => Ok(audit),
+                    _ => Err(ClientError::UnexpectedResult),
+                }
+            }
+            Ok(_) => Err(ClientError::UnexpectedResult),
+            Err(error) => Err(error),
         }
     }
 
@@ -235,40 +651,104 @@ impl RuntimeClient {
         soul_id: SoulId,
         trigger: RecoveryTrigger,
     ) -> Result<freshell_runtime_protocol::RecoveryResult, ClientError> {
-        let epoch = self.current_epoch().await?;
+        self.recover_expected(soul_id, trigger, None).await
+    }
+
+    pub async fn recover_expected(
+        &self,
+        soul_id: SoulId,
+        trigger: RecoveryTrigger,
+        expected_intent_revision: Option<u64>,
+    ) -> Result<freshell_runtime_protocol::RecoveryResult, ClientError> {
+        self.recover_expected_with_request_id(
+            RequestId::new(),
+            soul_id,
+            trigger,
+            expected_intent_revision,
+        )
+        .await
+    }
+
+    pub async fn recover_expected_with_request_id(
+        &self,
+        request_id: RequestId,
+        soul_id: SoulId,
+        trigger: RecoveryTrigger,
+        expected_intent_revision: Option<u64>,
+    ) -> Result<freshell_runtime_protocol::RecoveryResult, ClientError> {
+        let mut request = RecoverRequest {
+            soul_id,
+            trigger,
+            expected_intent_revision,
+            expected_control_epoch: Some(self.current_epoch().await?),
+        };
+        let original = request.clone();
         match self
-            .request(
-                RequestId::new(),
-                AdminCommand::Recover(RecoverRequest {
-                    soul_id,
-                    trigger,
-                    expected_control_epoch: Some(epoch),
-                }),
-            )
-            .await?
+            .request(request_id.clone(), AdminCommand::Recover(request))
+            .await
         {
-            AdminResult::Recovery(result) => Ok(result),
-            _ => Err(ClientError::UnexpectedResult),
+            Ok(AdminResult::Recovery(result)) => Ok(result),
+            Err(error) if error.runtime_code() == Some(RuntimeErrorCode::StaleControlEpoch) => {
+                request = original;
+                request.expected_control_epoch = Some(self.health().await?.0);
+                match self
+                    .request(request_id, AdminCommand::Recover(request))
+                    .await?
+                {
+                    AdminResult::Recovery(result) => Ok(result),
+                    _ => Err(ClientError::UnexpectedResult),
+                }
+            }
+            Ok(_) => Err(ClientError::UnexpectedResult),
+            Err(error) => Err(error),
         }
     }
 
-    pub async fn stop(
+    pub async fn stop(&self, soul_id: SoulId) -> Result<StopOutcome, ClientError> {
+        self.stop_expected(soul_id, None)
+            .await
+            .map(|(outcome, _)| outcome)
+    }
+
+    pub async fn stop_expected(
         &self,
         soul_id: SoulId,
-    ) -> Result<freshell_runtime_protocol::StopOutcome, ClientError> {
-        let epoch = self.current_epoch().await?;
+        expected_intent_revision: Option<u64>,
+    ) -> Result<(StopOutcome, RuntimeView), ClientError> {
+        self.stop_expected_with_request_id(RequestId::new(), soul_id, expected_intent_revision)
+            .await
+    }
+
+    pub async fn stop_expected_with_request_id(
+        &self,
+        request_id: RequestId,
+        soul_id: SoulId,
+        expected_intent_revision: Option<u64>,
+    ) -> Result<(StopOutcome, RuntimeView), ClientError> {
+        let mut request = StopRequest {
+            soul_id,
+            expected_intent_revision,
+            expected_control_epoch: Some(self.current_epoch().await?),
+        };
+        let original = request.clone();
         match self
-            .request(
-                RequestId::new(),
-                AdminCommand::Stop(StopRequest {
-                    soul_id,
-                    expected_control_epoch: Some(epoch),
-                }),
-            )
-            .await?
+            .request(request_id.clone(), AdminCommand::Stop(request))
+            .await
         {
-            AdminResult::Stop { outcome, .. } => Ok(outcome),
-            _ => Err(ClientError::UnexpectedResult),
+            Ok(AdminResult::Stop { outcome, view }) => Ok((outcome, view)),
+            Err(error) if error.runtime_code() == Some(RuntimeErrorCode::StaleControlEpoch) => {
+                request = original;
+                request.expected_control_epoch = Some(self.health().await?.0);
+                match self
+                    .request(request_id, AdminCommand::Stop(request))
+                    .await?
+                {
+                    AdminResult::Stop { outcome, view } => Ok((outcome, view)),
+                    _ => Err(ClientError::UnexpectedResult),
+                }
+            }
+            Ok(_) => Err(ClientError::UnexpectedResult),
+            Err(error) => Err(error),
         }
     }
 

@@ -8,6 +8,50 @@ server built with `managed-runtime-v1`, booted with the runtime controller, and
 a client that negotiated `managedRuntimeV1` can use it. Other routes remain
 legacy.
 
+## Current release qualification
+
+OpenCode 1.18.21 (`opencode/big-pickle` free tier) is the only
+release-qualified durable coding provider in this landing. Claude, Codex, and
+Amplifier remain adapter-ready but route through their legacy ownership paths
+until their real live campaigns pass. The checked-in capability manifest is
+the source of truth, and managed WebSocket/REST/control admission follows it
+directly. Historical sections below describe adapter construction and earlier
+phase sequencing; they do not override the current release flags.
+
+## Certification state and the two release gates
+
+Implementation support and a production promise are separate claims, so they
+are tracked on separate axes in
+`docs/development/runtime-provider-capabilities.json`:
+
+| Field | Meaning |
+|---|---|
+| `certificationState` | Whether a live, candidate-bound certification campaign has actually passed for this provider. One of `certified`, `pending_live_provider_certification`, `not_applicable`. |
+| `managedEnabled` | Whether managed routing may own this provider at all. |
+| `durableRecoveryEnabled` | Whether a durable-soul recovery promise is made for it. |
+
+`certificationState` is the outer bound: a provider that is not `certified`
+must be `managedEnabled: false`, `durableRecoveryEnabled: false`, routed by no
+`managed` doorway, and absent from `releaseScope.managedTerminalProviders`.
+`freshell_agent_runtime::durable_souls_certified` is the single predicate all
+three conditions collapse into, and
+`crates/freshell-agent-runtime/src/lib.rs` fails its own tests if the checked-in
+manifest and the compiled table ever disagree. Deterministic adapter support
+for a deferred provider may exist and be unit-tested; it grants no capability
+negotiation, API, or UI durability claim.
+
+Two gates consume that state:
+
+| Gate | Command | Meaning |
+|---|---|---|
+| Landing / pre-certification | `npm run test:runtime -- gate landing --require-live` | The cumulative `P1-G*`…`P5-G*` body plus one `PC-<PROVIDER>` case each. It may PASS while exactly the manifest's `certification.landingGate.deferrableProviders` are recorded `DEFERRED_LIVE_PROVIDER_CERTIFICATION`. Every other case must genuinely PASS. |
+| Full production Gate 5 | `npm run test:runtime -- gate phase-5 --require-live` | The same body in production mode. While any required provider is uncertified it exits 2 with status `BLOCKED` and `blockedReason: "pending_live_provider_certification"`. |
+
+`BLOCKED` is never `PASS`. A landing run that defers anything other than the
+manifest's deferrable set fails, and a deferral in production mode fails. Each
+run writes `deferred-providers.json` next to `summary.json` so what is *not*
+proven is explicit rather than inferred.
+
 ## Identity and authority
 
 A **soul** is the durable logical coding-agent identity. An **incarnation** is a
@@ -33,6 +77,55 @@ The initial schema is installed transactionally and contains `installation`,
 covers `prepared`, `created`, `starting`, `running`, and `stopping`; a failed
 stop therefore keeps the ownership claim instead of making a replacement look
 safe. Raw credentials are not stored in these tables.
+
+## Managed truth versus the legacy disk index
+
+A managed soul's provider state lives inside that soul's own runtime volume.
+The web server's host-local session index cannot see it, so it must never
+adjudicate one. Pane reconciliation (`crates/freshell-ws/src/reconcile.rs`)
+resolves this in a fixed order before it consults the index:
+
+1. **A live managed facade that owns the exact identity wins.** If a Running
+   managed row carries this `(provider, sessionId)`, the verdict is `attach` to
+   that terminal — whatever the host disk index believes. Without this, a
+   perfectly healthy supervisor-owned conversation reads
+   "ever observed, now absent" and is declared `dead_session`.
+2. **Unknown managed truth withholds the death claim.** The managed pre-pass
+   adopts each presented terminal from protected supervisor inventory. A lookup
+   that *fails* (controller unreachable, protocol error) is recorded in
+   `ManagedReconcileFacts`, and the ladder answers
+   `error{managed_runtime_unavailable}` instead of a definitive
+   `dead_session`. An unknown answer authorizes no loss.
+3. Only when managed truth is known-absent does the ordinary legacy ladder run
+   unchanged.
+
+The browser folds `managed_runtime_unavailable` and
+`managed_runtime_authoritative` as `managedDeferred` (`src/lib/pane-reconcile.ts`):
+the pane is left exactly as it is, with no `restoreError` painted over it,
+because `src/lib/recovery/managed-runtime-recovery.ts` is the authority and
+will set the real state from the supervisor inventory. Suppression is scoped
+per pane key, so an unrelated pane still gets its ordinary honest verdict.
+
+## Bounded session-host IPC
+
+The supervisor is the sole runtime authority; a session host is an untrusted
+workload boundary. Every supervisor→host control round trip — the hello
+handshake included — is bounded by
+`FRESHELL_RUNTIME_HOST_COMMAND_TIMEOUT_MS` (default 10s). Exceeding it is a
+typed `HostUnreachable`, after which the caller proceeds through the
+Docker-level path it already owns.
+
+This matters most for `stop`: the durable stop intent commits first, then the
+graceful host stop is *attempted*. A host that accepts the control connection
+and then goes silent used to hold the authoritative stop open forever. It is
+now bounded, and `request_stop` → `verify_empty` → `force_stop` still reaches
+`verified_empty`.
+
+The session host itself keeps a worker-thread floor
+(`HOST_MIN_WORKER_THREADS`). Inside a CPU-capped container
+`available_parallelism()` routinely reports 1, and a single-worker runtime
+makes the control plane share one thread with every workload task — a long
+synchronous step then looks indistinguishable from a dead host.
 
 ## Launch transaction
 
@@ -291,3 +384,61 @@ mode is validated by `scripts/sandbox-selftest.sh`.
 
 The runtime suite is excluded from ordinary Vitest discovery so `npm test`
 never performs destructive lifecycle tests accidentally.
+
+## Phase 4 durable views and startup reconciliation
+
+The supervisor, not the web process, performs initial inventory reconciliation.
+It limits concurrent recovery, records readiness and scan duration, and does not
+expose the control socket as ready until the initial scan has converged or
+recorded explicit blockers. A continuous observer checks only registry-issued
+ownership handles.
+
+A durable `view_intent` describes how a soul should appear to an owner and
+workspace. Automatic primary placement is deterministic; explicit additional
+views have independent view IDs but share the same soul and provider writer.
+The supervisor writes revisioned projection events to its outbox. The Rust web
+server applies those events idempotently, updates the pane identity ledger, and
+ACKs only after durable projection. The browser always refreshes managed
+inventory on `ready` and on revision broadcasts, merges missing views into the
+saved layout, and does not replace unrelated tabs or steal focus.
+
+Closing a view commits `detached`; stopping an agent commits a fenced soul stop
+intent and hides automatic recreation. Old clients may adopt an already
+managed deterministic terminal ID without advertising managed ownership, but
+may not launch a second provider process.
+
+## Phase 5 loss certification and operations
+
+Phase 5 introduces a strict boundary between reversible recovery failure and
+irreversible loss. Each enabled provider declares a complete ordered recovery
+path inventory. Path probes return ready, blocked/unknown, or definitive
+negative with typed store evidence. Any unknown, unreadable, incompatible,
+rate-limited, credential, workspace, or backend state remains `blocked`.
+
+When every applicable path is freshly definitive-negative, the supervisor
+atomically persists a loss incident and stops the soul before sending any
+cleanup signal. The certificate stores hashes/references rather than raw native
+IDs or credentials. Cleanup then uses the exact registry ownership handle,
+tries graceful host shutdown, escalates only inside that enclosure, verifies
+backend emptiness, and finalizes the same incident. Named runtime-test
+failpoints prove restart idempotency after incident commit, after cleanup, and
+before export. They are compiled out of release behavior.
+
+Incident export, metrics, and notices use durable outbox/idempotency keys. A
+cleanup-failed notice remains truthful while ownership is unresolved; a later
+verified result supersedes it with one final deliverable notice. Notice ACKs
+are per profile and survive reconnect/restart. The ended pane keeps its soul,
+provider/native identity in authenticated UI state, history, and incident link;
+no blank replacement or ambiguous prompt replay is permitted.
+
+Lifecycle logs use the shared runtime observability crate: sensitive fields and
+exact process secrets are scrubbed before persistence, files are private and
+bounded/rotated, and incident documents are atomic. Open incidents are never
+removed by retention.
+
+Rollout state is registry-owned (`legacy`, `managed-opt-in`, or
+`managed-default`). Managed-default requires a verified consistent backup.
+Rollback changes routing policy only; it preserves managed souls, ownership,
+views, provider volumes, incidents, notices, and metrics. Repair can resume
+idempotent registry-backed work but never infer ownership from labels, process
+names, environment tags, cwd, or partial IDs.
