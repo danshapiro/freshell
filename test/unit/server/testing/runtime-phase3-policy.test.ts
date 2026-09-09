@@ -6,6 +6,7 @@ import { afterEach, describe, expect, it } from 'vitest'
 
 import { RuntimeGateBlockedError } from '../../../../scripts/testing/runtime-sandbox.js'
 import {
+  automaticResumeHistoryPreservesIdentity,
   loadRequiredPhase3Receipt,
   requirePhase3ReceiptCandidate,
   supervisorCrashEvent,
@@ -40,6 +41,28 @@ describe('Phase 3 live receipt prerequisites', () => {
       { status: 'PASS', candidateSha: 'a'.repeat(40) },
       'b'.repeat(40),
     )).toThrow(/exact candidate/)
+  })
+})
+
+describe('Phase 3 automatic-resume history evidence', () => {
+  const sessionId = 'fixture-native-exact-session'
+
+  it('accepts exactly one automatic continuation of the materialized identity', () => {
+    expect(automaticResumeHistoryPreservesIdentity({
+      ok: true,
+      sessionId,
+      history: ['create', 'automatic_resume'],
+    }, sessionId)).toBe(true)
+  })
+
+  it.each([
+    { ok: true, sessionId, history: ['create', 'resume'] },
+    { ok: true, sessionId, history: ['create', 'automatic_resume', 'automatic_resume'] },
+    { ok: true, sessionId, history: ['create', 'create', 'automatic_resume'] },
+    { ok: true, sessionId: 'different-session', history: ['create', 'automatic_resume'] },
+    { ok: false, sessionId, history: ['create', 'automatic_resume'] },
+  ])('rejects manual, duplicate, fresh, foreign, or failed history %#', (history) => {
+    expect(automaticResumeHistoryPreservesIdentity(history, sessionId)).toBe(false)
   })
 })
 
