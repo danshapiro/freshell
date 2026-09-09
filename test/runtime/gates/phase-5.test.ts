@@ -11,6 +11,11 @@ import {
   type SupervisorInstance,
 } from '../../../scripts/testing/runtime-sandbox.js'
 import { receiptArtifactName } from '../../../scripts/testing/runtime-receipts.js'
+import {
+  loadRuntimeSoakReceipt,
+  SOAK_MAX_RUNTIME_LOG_BYTES,
+  SOAK_MAX_TERMINAL_SPOOL_BYTES,
+} from '../../../scripts/testing/runtime-soak-evidence.js'
 import { validateProviderQualificationReceipt } from '../../../scripts/testing/provider-qualification-receipt.js'
 
 export const PHASE5_CASE_IDS = [
@@ -481,12 +486,12 @@ async function gate10SoakReceipt(h: RuntimeHarness): Promise<void> {
     'FRESHELL_RUNTIME_PHASE5_SOAK_RECEIPT',
     'Run scripts/testing/runtime-phase5-soak.ts for at least 30 minutes and provide its candidate-bound receipt.',
   )
-  h.assert(caseId, receipt.durationMs >= 30 * 60 * 1_000, 'soak duration is at least 30 minutes', receipt)
-  h.assert(caseId, receipt.desiredSouls >= 50, 'soak keeps at least 50 desired souls', receipt)
-  h.assert(caseId, receipt.memoryPressure === true && receipt.cpuPressure === true && receipt.pidPressure === true, 'soak exercises CPU, memory, and PID pressure', receipt)
-  h.assert(caseId, receipt.falseLossNotices === 0 && receipt.duplicateWriters === 0, 'soak has no false loss notices or duplicate writers', receipt)
-  h.assert(caseId, receipt.unboundedOutputGrowth !== true && receipt.unboundedLogGrowth !== true, 'soak proves output/log bounds', receipt)
-  h.assert(caseId, receipt.cleanupVerified === true && receipt.unsafeBrokerAttempts === 0, 'soak cleans every owned object with zero unsafe attempts', receipt)
+  const summary = receipt.soakValidation
+  h.assert(caseId, summary.durationMs >= 30 * 60 * 1_000, 'hashed samples span at least 30 measured minutes', summary)
+  h.assert(caseId, summary.desiredSouls >= 50, 'every sample keeps at least 50 persistent desired souls', summary)
+  h.assert(caseId, summary.memoryPressureObserved && summary.cpuThrottlingObserved && summary.pidPressureObserved, 'samples prove actual CPU, memory, and PID pressure', summary)
+  h.assert(caseId, summary.falseLossNotices === 0 && summary.duplicateWriters === 0, 'samples have no false loss notices or duplicate writers', summary)
+  h.assert(caseId, summary.maxTerminalSpoolBytes <= SOAK_MAX_TERMINAL_SPOOL_BYTES && summary.maxRuntimeLogBytes <= SOAK_MAX_RUNTIME_LOG_BYTES, 'samples prove actual host spool/log retained-byte bounds', summary)
 }
 
 async function gate11MigrationBackupAndRollback(h: RuntimeHarness): Promise<void> {
@@ -791,6 +796,7 @@ function requiredReceipt(
     throw new Error(`${envName} is not valid JSON or a readable JSON path: ${String(error)}`)
   }
   let providers = receipt.providers
+  let soakValidation
   if (envName === 'FRESHELL_RUNTIME_PHASE5_PROVIDER_RECEIPT') {
     const validated = validateProviderQualificationReceipt({
       repoRoot: h.repoRoot,
@@ -800,6 +806,18 @@ function requiredReceipt(
       allowLegacyV1ForProviders: ['opencode'],
     })
     providers = validated.providers
+  } else if (envName === 'FRESHELL_RUNTIME_PHASE5_SOAK_RECEIPT') {
+    const validated = loadRuntimeSoakReceipt({
+      repoRoot: h.repoRoot,
+      candidateSha: h.candidateSha,
+      runtimeImage: h.imageRef,
+      receipt,
+    })
+    soakValidation = validated.summary
+    fs.writeFileSync(
+      path.join(h.browserDir, `${receiptArtifactName(envName, caseId)}-samples.jsonl`),
+      validated.sampleEvidenceBytes,
+    )
   } else {
     h.assert(caseId, receipt.schemaVersion === 1, `${envName} uses its expected schema v1`, receipt)
   }
@@ -809,7 +827,7 @@ function requiredReceipt(
   // must remain independently reviewable after temporary receipt paths are
   // removed; the source file is never treated as the evidence artifact.
   h.writeBrowserArtifact(receiptArtifactName(envName, caseId), receipt)
-  return { ...receipt, providers }
+  return { ...receipt, providers, ...(soakValidation ? { soakValidation } : {}) }
 }
 
 function assertProviderMatrix(
