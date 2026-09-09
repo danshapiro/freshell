@@ -14,6 +14,8 @@ import WebSocket from 'ws'
 import { test } from '../helpers/fixtures.js'
 import { ManagedRuntimeBrowserRig } from '../helpers/managed-runtime.js'
 import { TestHarness } from '../helpers/test-harness.js'
+import { runtimeBrowserPost as apiPost, pruneRuntimeBrowserLayout } from '../helpers/runtime-browser-api.js'
+import { LAYOUT_STORAGE_KEY } from '../../../src/store/storage-keys.js'
 import { WS_PROTOCOL_VERSION } from '@shared/ws-version'
 
 async function waitForValue<T>(
@@ -36,40 +38,8 @@ async function waitForValue<T>(
   throw new Error(`timed out waiting for ${description}${suffix}`)
 }
 
-async function apiPost<T>(
-  page: Page,
-  token: string,
-  route: string,
-  body: unknown,
-): Promise<T> {
-  return page.evaluate(async ({ token: authToken, route: apiRoute, body: requestBody }) => {
-    const response = await fetch(apiRoute, {
-      method: 'POST',
-      headers: {
-        authorization: `Bearer ${authToken}`,
-        'content-type': 'application/json',
-      },
-      body: JSON.stringify(requestBody),
-    })
-    const text = await response.text()
-    if (!response.ok) throw new Error(`${response.status} ${text}`)
-    return text ? JSON.parse(text) : null
-  }, { token, route, body }) as Promise<T>
-}
-
 async function browserState(page: Page): Promise<any> {
-  return page.evaluate(() => {
-    const harness = (window as any).__FRESHELL_TEST__
-    if (!harness?.getState) throw new Error('Freshell test harness is unavailable')
-    return harness.getState()
-  })
-}
-
-async function selectTab(page: Page, tabId: string): Promise<void> {
-  await page.evaluate((id) => {
-    const harness = (window as any).__FRESHELL_TEST__
-    harness.dispatch({ type: 'tabs/selectTab', payload: id })
-  }, tabId)
+  return new TestHarness(page).getState()
 }
 
 function visibleManagedTabs(state: any): any[] {
@@ -81,49 +51,18 @@ function latestSoul(snapshot: any, soulId: string): any | undefined {
 }
 
 async function prunePersistedLayoutToTab(page: Page, keepTabId: string): Promise<string> {
-  return page.evaluate((tabId) => {
-    const candidateKeys = Array.from({ length: localStorage.length }, (_, index) => localStorage.key(index))
-      .filter((key): key is string => Boolean(key))
-    for (const key of candidateKeys) {
-      const raw = localStorage.getItem(key)
-      if (!raw) continue
-      let value: any
-      try {
-        value = JSON.parse(raw)
-      } catch {
-        continue
-      }
-      const root = value?.state?.tabs && value?.state?.panes ? value.state : value
-      if (!Array.isArray(root?.tabs?.tabs) || !root?.panes?.layouts) continue
-      if (!root.tabs.tabs.some((tab: any) => tab.id === tabId)) continue
-
-      root.tabs.tabs = root.tabs.tabs.filter((tab: any) => tab.id === tabId)
-      root.tabs.activeTabId = tabId
-      root.tabs.tombstones = []
-      for (const field of [
-        'layouts',
-        'activePane',
-        'paneTitles',
-        'paneTitleSetByUser',
-        'zoomedPane',
-        'closingTabs',
-        'closingPanes',
-        'refreshRequests',
-        'restoreFallbackAttemptsByPane',
-        'reconcilePendingPanes',
-      ]) {
-        const table = root.panes[field]
-        if (table && typeof table === 'object' && !Array.isArray(table)) {
-          root.panes[field] = Object.fromEntries(
-            Object.entries(table).filter(([key]) => key === tabId),
-          )
-        }
-      }
-      localStorage.setItem(key, JSON.stringify(value))
-      return key
-    }
-    throw new Error('could not locate the persisted Freshell layout record')
-  }, keepTabId)
+  const persisted = await waitForValue('canonical persisted browser layout', async () => {
+    const raw = await page.evaluate((key) => localStorage.getItem(key), LAYOUT_STORAGE_KEY)
+    if (!raw) return null
+    const value = JSON.parse(raw)
+    return value?.tabs?.tabs?.some((tab: any) => tab.id === keepTabId) && value?.panes?.layouts?.[keepTabId]
+      ? value : null
+  }, 15_000)
+  const pruned = pruneRuntimeBrowserLayout(persisted, keepTabId)
+  await page.evaluate(({ key, value }) => localStorage.setItem(key, JSON.stringify(value)), {
+    key: LAYOUT_STORAGE_KEY, value: pruned,
+  })
+  return LAYOUT_STORAGE_KEY
 }
 
 class RawWsClient {
@@ -226,7 +165,8 @@ test.describe.serial('Phase 4 managed-runtime tab rehydration', () => {
         browser: 'about:blank',
         name: 'Existing saved layout',
       })
-      expect(browser.success).toBe(true)
+      expect(browser.tabId).toEqual(expect.any(String))
+      expect(browser.paneId).toEqual(expect.any(String))
       const browserTabId: string = browser.tabId
       await expect.poll(() => harness.getTabCount(), { timeout: 30_000 }).toBe(1)
 
@@ -237,7 +177,8 @@ test.describe.serial('Phase 4 managed-runtime tab rehydration', () => {
           name: `Managed shell ${index}`,
           cwd: rig.repoRoot,
         })
-        expect(response.success).toBe(true)
+        expect(response.tabId).toEqual(expect.any(String))
+        expect(response.paneId).toEqual(expect.any(String))
         created.push(response)
       }
       await expect.poll(() => harness.getTabCount(), { timeout: 60_000 }).toBe(4)
@@ -269,10 +210,9 @@ test.describe.serial('Phase 4 managed-runtime tab rehydration', () => {
         .map((view: any) => view.preferredPaneId)
         .sort()
 
-      await selectTab(page, browserTabId)
+      await page.getByRole('button', { name: 'Existing saved layout', exact: true }).click()
       await expect.poll(() => harness.getActiveTabId()).toBe(browserTabId)
       const activePaneBefore = (await browserState(page)).panes.activePane[browserTabId]
-      await page.waitForTimeout(1_000)
       const layoutStorageKey = await prunePersistedLayoutToTab(page, browserTabId)
       expect(layoutStorageKey.length).toBeGreaterThan(0)
 
@@ -336,7 +276,7 @@ test.describe.serial('Phase 4 managed-runtime tab rehydration', () => {
       }
 
       const closeSoulId = initialSoulIds[0]
-      const closeSection = statusPanel.locator('section').filter({ hasText: closeSoulId })
+      const closeSection = statusPanel.getByRole('region').filter({ hasText: closeSoulId })
       await closeSection.getByRole('button', { name: 'Close view' }).click()
       const closeOutcome = await waitForValue('detached view with live soul', async () => {
         const snapshot = await rig.inventorySnapshot()
@@ -352,7 +292,7 @@ test.describe.serial('Phase 4 managed-runtime tab rehydration', () => {
       }).toBe(2)
 
       const stopSoulId = initialSoulIds[1]
-      const stopSection = statusPanel.locator('section').filter({ hasText: stopSoulId })
+      const stopSection = statusPanel.getByRole('region').filter({ hasText: stopSoulId })
       page.once('dialog', (dialog) => void dialog.accept())
       await stopSection.getByRole('button', { name: 'Stop agent' }).click()
       const stopOutcome = await waitForValue('explicitly stopped soul', async () => {
