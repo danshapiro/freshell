@@ -35,13 +35,24 @@ export function parseGateArgs(args: string[]): ParsedGateArgs {
   } else {
     return { error: GATE_USAGE, exitCode: 1 }
   }
-  const modeIndex = args.indexOf('--mode')
-  if (modeIndex !== -1) {
-    const explicit = args[modeIndex + 1]
-    if (explicit !== 'landing' && explicit !== 'production') return { error: GATE_USAGE, exitCode: 1 }
-    mode = explicit
+  let requireLive = false
+  let explicitMode = false
+  for (let index = 2; index < args.length; index += 1) {
+    const option = args[index]
+    if (option === '--require-live' && !requireLive) {
+      requireLive = true
+    } else if (option === '--mode' && !explicitMode) {
+      const value = args[++index]
+      if (value !== 'landing' && value !== 'production') return { error: GATE_USAGE, exitCode: 1 }
+      mode = value
+      explicitMode = true
+    } else {
+      // Unknown or repeated options are errors, not ignored instructions.
+      // In particular, do not accept two contradictory --mode values.
+      return { error: GATE_USAGE, exitCode: 1 }
+    }
   }
-  if (!args.includes('--require-live')) {
+  if (!requireLive) {
     return {
       error: `BLOCKED: ${target} may only pass through the live Docker/IPC gate; add --require-live.`,
       exitCode: 2,

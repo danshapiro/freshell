@@ -154,8 +154,59 @@ export function deferredProviderManifest(manifest: CapabilityManifest): Deferred
  * promise anywhere in the manifest that the runtime and the public contract
  * both consume.
  */
+function duplicates(values: readonly string[]): string[] {
+  const seen = new Set<string>()
+  return [...new Set(values.filter((value) => {
+    if (seen.has(value)) return true
+    seen.add(value)
+    return false
+  }))]
+}
+
 export function capabilityClaimViolations(manifest: CapabilityManifest): string[] {
   const violations: string[] = []
+  const byProvider = new Map(manifest.providers.map((row) => [row.provider, row]))
+  for (const provider of duplicates(manifest.providers.map((row) => row.provider))) {
+    violations.push(`duplicate provider declaration: ${provider}`)
+  }
+
+  // Scope is policy, not documentation. Validate all references, not only the
+  // flags on known rows: an unknown name used to escape the uncertified set.
+  for (const provider of manifest.releaseScope?.managedTerminalProviders ?? []) {
+    const row = byProvider.get(provider)
+    if (!row || row.certificationState !== 'certified' || !row.managedEnabled) {
+      violations.push(`releaseScope.managedTerminalProviders includes unknown or uncertified provider ${provider}`)
+    }
+  }
+  for (const provider of duplicates(manifest.releaseScope?.managedTerminalProviders ?? [])) {
+    violations.push(`releaseScope.managedTerminalProviders has duplicate provider ${provider}`)
+  }
+
+  const required = manifest.certification.productionGate.requiredCertifiedProviders ?? []
+  if (required.length === 0) {
+    violations.push('certification.productionGate.requiredCertifiedProviders must not be empty')
+  }
+  for (const provider of duplicates(required)) {
+    violations.push(`requiredCertifiedProviders has duplicate provider ${provider}`)
+  }
+  for (const provider of required) {
+    if (!byProvider.has(provider)) violations.push(`requiredCertifiedProviders references unknown provider ${provider}`)
+  }
+  for (const row of manifest.providers) {
+    if ((row.managedEnabled || row.certificationState === PENDING_LIVE_PROVIDER_CERTIFICATION)
+      && !required.includes(row.provider)) {
+      violations.push(`requiredCertifiedProviders omits managed or pending provider ${row.provider}`)
+    }
+  }
+  const deferrable = manifest.certification.landingGate.deferrableProviders ?? []
+  for (const provider of duplicates(deferrable)) {
+    violations.push(`deferrableProviders has duplicate provider ${provider}`)
+  }
+  for (const provider of deferrable) {
+    if (byProvider.get(provider)?.certificationState !== PENDING_LIVE_PROVIDER_CERTIFICATION) {
+      violations.push(`deferrableProviders includes non-pending provider ${provider}`)
+    }
+  }
   const uncertified = new Set(
     manifest.providers
       .filter((row) => row.certificationState !== 'certified')
@@ -182,6 +233,9 @@ export function capabilityClaimViolations(manifest: CapabilityManifest): string[
   for (const doorway of manifest.doorways ?? []) {
     if (doorway.policy !== 'managed') continue
     for (const provider of doorway.providers) {
+      if (!byProvider.has(provider)) {
+        violations.push(`doorway ${doorway.id} routes unknown provider ${provider} as managed`)
+      }
       if (uncertified.has(provider)) {
         violations.push(`doorway ${doorway.id} routes uncertified provider ${provider} as managed`)
       }
@@ -290,6 +344,8 @@ export type CaseResult = {
 export type GateOutcomeInput = {
   mode: GateMode
   caseResults: CaseResult[]
+  /** The exact manifest-expanded case set, including evidence audit cases. */
+  expectedCaseIds?: readonly string[]
   cleanupOk: boolean
   unsafeBrokerAttempts: number
   primaryError?: unknown
@@ -323,7 +379,10 @@ export function resolveGateOutcome(input: GateOutcomeInput): GateOutcome {
   if (input.primaryError !== undefined) {
     failures.push(input.primaryError instanceof Error ? input.primaryError.message : String(input.primaryError))
   }
-  if (!input.cleanupOk) failures.push('cleanup did not verify')
+  if (input.cleanupOk !== true) failures.push('cleanup did not verify')
+  if (!Number.isSafeInteger(input.unsafeBrokerAttempts) || input.unsafeBrokerAttempts < 0) {
+    failures.push('unsafe destructive broker attempt count is invalid')
+  }
   if (input.unsafeBrokerAttempts > 0) {
     failures.push(`${input.unsafeBrokerAttempts} unsafe destructive broker attempt(s)`)
   }
@@ -333,8 +392,37 @@ export function resolveGateOutcome(input: GateOutcomeInput): GateOutcome {
     }
   }
 
+  const actualCaseIds = input.caseResults.map((row) => row.caseId)
+  if (actualCaseIds.length === 0) failures.push('no cases executed')
+  for (const caseId of duplicates(actualCaseIds)) failures.push(`duplicate case result: ${caseId}`)
+  if (input.expectedCaseIds !== undefined) {
+    if (input.expectedCaseIds.length === 0) failures.push('required case set is empty')
+    for (const caseId of duplicates(input.expectedCaseIds)) failures.push(`duplicate required case: ${caseId}`)
+    const expected = new Set(input.expectedCaseIds)
+    const actual = new Set(actualCaseIds)
+    for (const caseId of expected) {
+      if (!actual.has(caseId)) failures.push(`missing required case: ${caseId}`)
+    }
+    for (const caseId of actual) {
+      if (!expected.has(caseId)) failures.push(`unexpected case result: ${caseId}`)
+    }
+  }
+  for (const provider of duplicates(deferred)) failures.push(`duplicate deferred provider: ${provider}`)
+  // Every declared deferral needs its own terminal result. A pending list
+  // alone must never turn an all-PASS production summary into certification.
+  for (const provider of deferred) {
+    const row = input.caseResults.find((result) => result.caseId === providerCertificationCaseId(provider))
+    const accounted = input.mode === 'landing'
+      ? row?.status === DEFERRED_CASE_STATUS
+      : row?.status === 'BLOCKED' && row.reason === PENDING_LIVE_PROVIDER_CERTIFICATION
+    if (!accounted) failures.push(`deferred provider ${provider} has no matching ${input.mode} result`)
+  }
+
   const blocked: string[] = []
   for (const result of input.caseResults) {
+    if (typeof result.caseId !== 'string' || result.caseId.trim().length === 0) {
+      failures.push('case result has no valid case ID')
+    }
     if (result.status === 'FAIL') {
       failures.push(`${result.caseId} failed`)
       continue
@@ -346,8 +434,14 @@ export function resolveGateOutcome(input: GateOutcomeInput): GateOutcome {
     if (result.status === DEFERRED_CASE_STATUS) {
       if (input.mode !== 'landing') {
         failures.push(`${result.caseId} may not be deferred in production mode`)
-      } else if (result.provider && !deferrable.has(result.provider)) {
-        failures.push(`${result.caseId} may not be deferred`)
+      }
+      // Only PC-<PROVIDER> is deferrable. A phase/soak/safety case cannot
+      // borrow an allowed provider field or omit it to bypass this boundary.
+      const provider = [...deferrable].find((name) => providerCertificationCaseId(name) === result.caseId)
+      if (!provider || (result.provider !== undefined && result.provider !== provider)) {
+        failures.push(`${result.caseId} is not an authorized provider certification deferral`)
+      } else if (!deferred.includes(provider)) {
+        failures.push(`${result.caseId} is missing from the deferred-provider manifest`)
       }
       continue
     }
