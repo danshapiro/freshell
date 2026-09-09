@@ -130,7 +130,8 @@ impl OutputJournal {
         }
         let retained_from_seq = by_seq.keys().next().copied().unwrap_or(self.next_seq);
         let head_seq = self.next_seq.saturating_sub(1);
-        let reset_required = after_seq.saturating_add(1) < retained_from_seq;
+        let reset_required =
+            after_seq > head_seq || after_seq.saturating_add(1) < retained_from_seq;
         let effective_after = if reset_required {
             retained_from_seq.saturating_sub(1)
         } else {
@@ -311,6 +312,28 @@ mod tests {
         assert!(batch.reset_required);
         assert!(batch.truncated);
         assert!(!batch.frames.is_empty());
+    }
+
+    #[test]
+    fn cursor_from_a_previous_host_cannot_hide_a_new_epochs_output() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut journal = OutputJournal::new(
+            dir.path(),
+            IncarnationId::new(),
+            "same-terminal".into(),
+            "new-host-epoch".into(),
+        )
+        .unwrap();
+        journal.append("restored native conversation").unwrap();
+        let batch = journal.read(206, 64 * 1024).unwrap();
+        assert!(
+            batch.reset_required,
+            "a cursor ahead of this epoch must reset, not wait forever"
+        );
+        assert_eq!(batch.frames.len(), 1);
+        assert_eq!(batch.frames[0].seq_start, 1);
+        assert_eq!(batch.frames[0].data, "restored native conversation");
+        assert!(journal.read(1, 64 * 1024).unwrap().frames.is_empty());
     }
 
     #[test]
