@@ -5,7 +5,7 @@ import os from 'node:os'
 import path from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
-import { OPENCODE_NATIVE_HISTORY_SCRIPT, nativeAssistantProof, openCodeTerminalReady } from '../../../e2e-browser/helpers/opencode-native-history.js'
+import { OPENCODE_NATIVE_HISTORY_SCRIPT, nativeAssistantProof, openCodeTerminalReady, selectNativeAssistantTurn } from '../../../e2e-browser/helpers/opencode-native-history.js'
 
 let root: string
 let filename: string
@@ -39,6 +39,16 @@ describe('live recovery proves new native assistant responses, never TUI echo or
     message('answer', 'ses_owned', 'assistant', 'nonce-in-real-answer')
     expect(read()).toMatchObject({ sessionId: 'ses_owned', available: true, turns: [{ messageId: 'answer', text: 'nonce-in-real-answer', toolPartCount: 0 }] })
     expect(read().turns).toHaveLength(1)
+  })
+
+  it('waits past unrelated completed assistant rows for the correlated no-tool answer', () => {
+    const turns = [
+      { messageId: 'intro', parentMessageId: 'u0', completedAt: 1, text: 'Freshell.', toolPartCount: 0, modelId: 'big-pickle', providerId: 'opencode' },
+      { messageId: 'tool', parentMessageId: 'u1', completedAt: 2, text: 'p-target', toolPartCount: 1, modelId: 'big-pickle', providerId: 'opencode' },
+      { messageId: 'answer', parentMessageId: 'u1', completedAt: 3, text: 'The project is p-target.', toolPartCount: 0, modelId: 'big-pickle', providerId: 'opencode' },
+    ]
+    expect(selectNativeAssistantTurn(turns, new Set(['old']), 'p-target')?.messageId).toBe('answer')
+    expect(selectNativeAssistantTurn(turns, new Set(['answer']), 'p-target')).toBeNull()
   })
 
   it('keeps tool activity visible so a memory-only claim cannot hide a filesystem lookup', () => {
