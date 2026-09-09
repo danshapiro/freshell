@@ -483,8 +483,8 @@ export async function exercisePhase3StartupReplacementCrash(
   const history = await h.nativeFixtureCall(reconciled, liveView.incarnationId, { method: 'history' })
   h.assert(
     caseId,
-    history.ok === true && history.sessionId === crashSoul.sessionId && history.history?.[0] === 'create' && history.history?.includes('resume'),
-    'the replacement reconnects to the original materialized native session',
+    automaticResumeHistoryPreservesIdentity(history, crashSoul.sessionId!),
+    'the replacement reconnects exactly once through automatic resume without a fresh create',
     history,
   )
   const stop = dataOf(
@@ -499,6 +499,20 @@ export async function exercisePhase3StartupReplacementCrash(
     nativeSessionStable,
     stopOutcome: stop.outcome,
   }
+}
+
+export function automaticResumeHistoryPreservesIdentity(
+  history: unknown,
+  expectedSessionId: string,
+): boolean {
+  if (!history || typeof history !== 'object') return false
+  const candidate = history as { ok?: unknown; sessionId?: unknown; history?: unknown }
+  return candidate.ok === true
+    && candidate.sessionId === expectedSessionId
+    && Array.isArray(candidate.history)
+    && candidate.history.length === 2
+    && candidate.history[0] === 'create'
+    && candidate.history[1] === 'automatic_resume'
 }
 
 export function supervisorCrashEvent(
