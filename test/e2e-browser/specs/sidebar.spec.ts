@@ -1,4 +1,37 @@
 import { test, expect } from '../helpers/fixtures.js'
+import type { Page } from '@playwright/test'
+
+async function setSidebarSearchLoading(page: Page, loading: boolean): Promise<void> {
+  await page.evaluate((nextLoading) => {
+    window.__FRESHELL_TEST_HARNESS__?.dispatch({
+      type: 'sessions/setSessionWindowLoading',
+      payload: {
+        surface: 'sidebar',
+        loading: nextLoading,
+        loadingKind: nextLoading ? 'search' : undefined,
+        query: 'test',
+        searchTier: 'title',
+      },
+    })
+  }, loading)
+}
+
+function measureVisibleInputContentWidth(element: HTMLInputElement): number {
+  const row = element.parentElement
+  if (!row) return 0
+  const styles = getComputedStyle(element)
+  const paddingLeft = parseFloat(styles.paddingLeft) || 0
+  const paddingRight = parseFloat(styles.paddingRight) || 0
+  const borderLeft = parseFloat(styles.borderLeftWidth) || 0
+  const borderRight = parseFloat(styles.borderRightWidth) || 0
+  const inputRect = element.getBoundingClientRect()
+  const rowRect = row.getBoundingClientRect()
+  const contentLeft = inputRect.left + paddingLeft + borderLeft
+  const contentRight = inputRect.right - paddingRight - borderRight
+  const visibleLeft = Math.max(contentLeft, rowRect.left)
+  const visibleRight = Math.min(contentRight, rowRect.right)
+  return Math.max(0, visibleRight - visibleLeft)
+}
 
 test.describe('Sidebar', () => {
   test('sidebar is visible by default', async ({ freshellPage, page }) => {
@@ -112,6 +145,188 @@ test.describe('Sidebar', () => {
     await clearButton.click()
     const value = await searchInput.inputValue()
     expect(value).toBe('')
+  })
+
+  test('search input and controls remain visible and contained with pending search at high scale', async ({ freshellPage, page }) => {
+    // terminalFontSize=32 → --ui-scale=2.0 (all rem-based sizes double).
+    // sidebar=200px is the minimum (SIDEBAR_MIN_WIDTH). At scale 2.0 the
+    // old pr-36 (9rem = 288px) exceeded the input width and collapsed the
+    // text area to ~1 char. The flex layout must guarantee usable text space
+    // even with the loading indicator and clear button visible.
+    await page.evaluate(() => {
+      window.__FRESHELL_TEST_HARNESS__?.dispatch({
+        type: 'settings/updateSettingsLocal',
+        payload: {
+          terminal: { fontSize: 32 },
+          sidebar: { width: 200, collapsed: false },
+        },
+      })
+    })
+
+    await page.waitForFunction(() => {
+      const scale = getComputedStyle(document.documentElement).getPropertyValue('--ui-scale')
+      return parseFloat(scale) >= 2.0
+    })
+
+    const searchInput = page.getByPlaceholder('Search...')
+    await expect(searchInput).toBeVisible()
+
+    // Measure the input's visible content width. This catches the original bug
+    // where right padding consumed the text area while the input box stayed wide.
+    const emptyWidth = await searchInput.evaluate(measureVisibleInputContentWidth)
+    const inputFontSize = await searchInput.evaluate((el: HTMLInputElement) => {
+      return parseFloat(getComputedStyle(el).fontSize)
+    })
+    expect(emptyWidth).toBeGreaterThan(inputFontSize)
+
+    await searchInput.fill('test')
+    await setSidebarSearchLoading(page, true)
+
+    // Assert the loading indicator is visible (search is pending).
+    const loadingIndicator = page.getByTestId('search-loading')
+    await expect(loadingIndicator).toBeVisible({ timeout: 3_000 })
+
+    // At 200px sidebar with px-based padding, the row is ~176px, which
+    // activates the container query. Verify the loading text is visually
+    // hidden but remains accessible.
+    const loadingTextStyles = await loadingIndicator.evaluate((el) => {
+      const text = el.querySelector('.sidebar-search-loading-text')
+      if (!text) return null
+      const cs = getComputedStyle(text)
+      return {
+        position: cs.position,
+        width: cs.width,
+        clip: cs.clip,
+      }
+    })
+    expect(loadingTextStyles).not.toBeNull()
+    expect(loadingTextStyles!.position).toBe('absolute')
+    expect(loadingTextStyles!.width).toBe('1px')
+
+    // Scope this assertion because dnd-kit mounts another role="status".
+    await expect(loadingIndicator).toHaveAttribute('role', 'status')
+    const a11ySnapshot = await loadingIndicator.ariaSnapshot()
+    expect(a11ySnapshot).toContain('Searching')
+
+    const pendingWidth = await searchInput.evaluate(measureVisibleInputContentWidth)
+    expect(pendingWidth).toBeGreaterThan(inputFontSize)
+
+    const clearButton = page.getByRole('button', { name: /clear search/i })
+    await expect(clearButton).toBeVisible()
+    const rowBox = await searchInput.evaluate((el: HTMLInputElement) => {
+      const row = el.parentElement
+      if (!row) return null
+      const rect = row.getBoundingClientRect()
+      return { left: rect.left, right: rect.right }
+    })
+    const clearBox = await clearButton.boundingBox()
+    expect(rowBox).not.toBeNull()
+    expect(clearBox).not.toBeNull()
+    expect(clearBox!.x + clearBox!.width).toBeLessThanOrEqual(rowBox!.right + 1)
+
+    await setSidebarSearchLoading(page, false)
+    await expect(loadingIndicator).not.toBeVisible({ timeout: 5_000 })
+    await expect(searchInput).toHaveAttribute('aria-busy', 'false')
+
+    // After loading completes, the input content width should still be usable.
+    const settledWidth = await searchInput.evaluate(measureVisibleInputContentWidth)
+    expect(settledWidth).toBeGreaterThan(inputFontSize)
+  })
+
+  test('search input keeps usable width at high scale with default sidebar (above container query cutoff)', async ({ freshellPage, page }) => {
+    // At scale 2.0 with 288px sidebar, the row is ~264px and has room for the
+    // full loading label while retaining usable input space.
+    await page.evaluate(() => {
+      window.__FRESHELL_TEST_HARNESS__?.dispatch({
+        type: 'settings/updateSettingsLocal',
+        payload: {
+          terminal: { fontSize: 32 },
+          sidebar: { width: 288, collapsed: false },
+        },
+      })
+    })
+
+    await page.waitForFunction(() => {
+      const scale = getComputedStyle(document.documentElement).getPropertyValue('--ui-scale')
+      return parseFloat(scale) >= 2.0
+    })
+
+    const searchInput = page.getByPlaceholder('Search...')
+    const inputFontSize = await searchInput.evaluate((el: HTMLInputElement) => {
+      return parseFloat(getComputedStyle(el).fontSize)
+    })
+
+    await searchInput.fill('test')
+    await setSidebarSearchLoading(page, true)
+
+    const loadingIndicator = page.getByTestId('search-loading')
+    await expect(loadingIndicator).toBeVisible({ timeout: 3_000 })
+
+    const loadingText = loadingIndicator.locator('.sidebar-search-loading-text')
+    await expect(loadingText).toBeVisible()
+    const loadingTextRect = await loadingText.boundingBox()
+    expect(loadingTextRect).not.toBeNull()
+    expect(loadingTextRect!.width).toBeGreaterThan(10)
+
+    const pendingWidth = await searchInput.evaluate(measureVisibleInputContentWidth)
+    expect(pendingWidth).toBeGreaterThan(inputFontSize)
+  })
+
+  test('search row contains the full mobile clear-button touch target', async ({ freshellPage, page }) => {
+    // On mobile, the search row itself must contain the clear button's full
+    // 44px touch target; relying on overflow makes the outer edges untappable.
+    await page.setViewportSize({ width: 400, height: 700 })
+
+    // On mobile, the sidebar auto-collapses; open it first
+    const showButton = page.getByRole('button', { name: /show sidebar/i })
+    await expect(showButton).toBeVisible({ timeout: 5_000 })
+    await showButton.click()
+    await page.waitForTimeout(300)
+
+    const searchInput = page.getByPlaceholder('Search...')
+    await expect(searchInput).toBeVisible({ timeout: 3_000 })
+    await searchInput.fill('test')
+    await page.waitForTimeout(200)
+
+    const clearButton = page.getByRole('button', { name: /clear search/i })
+    await expect(clearButton).toBeVisible()
+
+    // The button's layout height should be at least 44px (min-h-[44px]).
+    const buttonHeight = await clearButton.evaluate((el: HTMLButtonElement) => {
+      return el.getBoundingClientRect().height
+    })
+    expect(buttonHeight).toBeGreaterThanOrEqual(44)
+
+    // The button's layout width should also be at least 44px (min-w-[44px]).
+    const buttonWidth = await clearButton.evaluate((el: HTMLButtonElement) => {
+      return el.getBoundingClientRect().width
+    })
+    expect(buttonWidth).toBeGreaterThanOrEqual(44)
+
+    const rowBox = await searchInput.evaluate((el: HTMLInputElement) => {
+      const row = el.parentElement
+      if (!row) return null
+      const rect = row.getBoundingClientRect()
+      return { top: rect.top, bottom: rect.bottom, height: rect.height }
+    })
+    const buttonBox = await clearButton.boundingBox()
+    expect(rowBox).not.toBeNull()
+    expect(buttonBox).not.toBeNull()
+    expect(rowBox!.height).toBeGreaterThanOrEqual(44)
+    expect(buttonBox!.y).toBeGreaterThanOrEqual(rowBox!.top)
+    expect(buttonBox!.y + buttonBox!.height).toBeLessThanOrEqual(rowBox!.bottom)
+
+    // Click the formerly clipped top edge, not Playwright's default center.
+    await page.mouse.click(buttonBox!.x + buttonBox!.width / 2, buttonBox!.y + 2)
+    await expect(searchInput).toHaveValue('')
+
+    // The input itself should fill the row height on mobile so the entire
+    // row is tappable (not just the input's intrinsic font-size height).
+    await searchInput.fill('test')
+    const inputHeight = await searchInput.evaluate((el: HTMLInputElement) => {
+      return el.getBoundingClientRect().height
+    })
+    expect(inputHeight).toBeGreaterThanOrEqual(40)
   })
 
   test('sidebar empty state with isolated HOME', async ({ freshellPage, page, terminal }) => {

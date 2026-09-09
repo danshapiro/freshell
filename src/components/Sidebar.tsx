@@ -795,41 +795,40 @@ export default function Sidebar({
       </div>
 
       {/* Search */}
-      <div className="px-3 pb-3">
-        <div className="relative">
-          <Search className="absolute left-2.5 top-1/2 -translate-y-1/2 h-3.5 w-3.5 text-muted-foreground" />
+      <div className="px-[12px] pb-3">
+        <div className="sidebar-search-row flex min-h-[44px] items-center gap-[4px] overflow-x-clip rounded-md bg-muted/50 focus-within:ring-1 focus-within:ring-border md:min-h-0 md:h-8">
+          <Search className="ml-[10px] h-[14px] w-[14px] shrink-0 text-muted-foreground" />
           <input
             type="text"
             placeholder="Search..."
             value={filter}
             onChange={(e) => setFilter(e.target.value)}
             aria-busy={showSearchLoading}
-            className="w-full h-8 pl-8 pr-36 text-sm bg-muted/50 border-0 rounded-md placeholder:text-muted-foreground/60 focus:outline-none focus:ring-1 focus:ring-border"
+            className="min-w-0 flex-1 self-stretch border-0 bg-transparent text-sm placeholder:text-muted-foreground/60 focus:outline-none"
           />
-          <div className="absolute right-2 top-1/2 flex w-28 -translate-y-1/2 items-center justify-end gap-1">
-            {showSearchLoading ? (
-              <span
-                role="status"
-                data-testid="search-loading"
-                className="inline-flex items-center gap-1 text-xs text-muted-foreground"
-              >
-                <Loader2 className="h-3.5 w-3.5 animate-spin" aria-hidden="true" />
-                <span>Searching...</span>
-              </span>
-            ) : null}
-            {filter ? (
-              <button
-                aria-label="Clear search"
-                onClick={() => setFilter('')}
-                className="p-0.5 min-h-11 min-w-11 md:min-h-0 md:min-w-0 flex items-center justify-center rounded hover:bg-muted text-muted-foreground hover:text-foreground"
-              >
-                <X className="h-3.5 w-3.5" />
-              </button>
-            ) : null}
-          </div>
+          {showSearchLoading ? (
+            <span
+              role="status"
+              data-testid="search-loading"
+              className="inline-flex min-w-0 max-w-[80px] shrink items-center gap-[4px] overflow-hidden text-xs text-muted-foreground"
+            >
+              <Loader2 className="h-[14px] w-[14px] shrink-0 animate-spin" aria-hidden="true" />
+              <span className="sidebar-search-loading-text min-w-0 truncate">Searching...</span>
+            </span>
+          ) : null}
+          {filter ? (
+            <button
+              type="button"
+              aria-label="Clear search"
+              onClick={() => setFilter('')}
+              className="shrink-0 p-[2px] pr-[4px] min-h-[44px] min-w-[44px] md:min-h-0 md:min-w-0 flex items-center justify-center rounded hover:bg-muted text-muted-foreground hover:text-foreground"
+            >
+              <X className="h-[14px] w-[14px]" />
+            </button>
+          ) : null}
         </div>
         {repoOptions.length > 0 && (
-          <div className="mt-2 flex items-center gap-1">
+          <div className="mt-[12px] flex items-center gap-1">
             <select
               aria-label="Repo filter"
               value={repoFilter}

@@ -3204,7 +3204,6 @@ describe('Sidebar Component - Session-Centric Display', () => {
       const searchLoading = screen.getByTestId('search-loading')
       expect(searchLoading).toBeInTheDocument()
       expect(searchLoading.querySelector('span:not(.sr-only)')).toHaveTextContent('Searching...')
-      expect(searchInput).toHaveClass('pr-36')
     })
 
     it('hides search chrome when clearing to browse while stale search results remain visible', async () => {

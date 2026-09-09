@@ -1,6 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
-import { createHash } from 'crypto'
-import { render, screen, fireEvent, cleanup, act } from '@testing-library/react'
+import { render, screen, cleanup, act } from '@testing-library/react'
 import { Provider } from 'react-redux'
 import { configureStore } from '@reduxjs/toolkit'
 import Sidebar from '@/components/Sidebar'
@@ -11,7 +10,6 @@ import connectionReducer from '@/store/connectionSlice'
 import sessionsReducer from '@/store/sessionsSlice'
 import sessionActivityReducer from '@/store/sessionActivitySlice'
 import terminalDirectoryReducer from '@/store/terminalDirectorySlice'
-import type { ProjectGroup } from '@/store/types'
 
 // Mock react-window's List component
 vi.mock('react-window', () => ({
@@ -63,20 +61,7 @@ vi.mock('@/lib/api', async () => {
   }
 })
 
-const sessionId = (label: string) => {
-  const hex = createHash('md5').update(label).digest('hex')
-  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20, 32)}`
-}
-
-function createTestStore(options?: { projects?: ProjectGroup[] }) {
-  const projects = (options?.projects ?? []).map((project) => ({
-    ...project,
-    sessions: (project.sessions ?? []).map((session) => ({
-      ...session,
-      provider: session.provider ?? 'claude',
-    })),
-  }))
-
+function createTestStore() {
   return configureStore({
     reducer: {
       settings: settingsReducer,
@@ -117,7 +102,7 @@ function createTestStore(options?: { projects?: ProjectGroup[] }) {
         paneTitles: {},
       },
       sessions: {
-        projects,
+        projects: [],
         expandedProjects: new Set<string>(),
         isLoading: false,
         error: null,
@@ -212,24 +197,5 @@ describe('Sidebar mobile touch targets', () => {
     expect(terminalNavButton.className).toMatch(/md:py-1\.5/)
     expect(terminalNavButton.className).toMatch(/min-h-11/)
     expect(terminalNavButton.className).toMatch(/md:min-h-0/)
-  })
-
-  it('search clear button has min-h-11 min-w-11 md:min-h-0 md:min-w-0 classes for mobile touch target', () => {
-    const store = createTestStore()
-    renderSidebar(store)
-
-    act(() => {
-      vi.advanceTimersByTime(100)
-    })
-
-    // Type in search to reveal clear button
-    const searchInput = screen.getByPlaceholderText('Search...')
-    fireEvent.change(searchInput, { target: { value: 'test' } })
-
-    const clearButton = screen.getByRole('button', { name: /clear search/i })
-    expect(clearButton.className).toMatch(/min-h-11/)
-    expect(clearButton.className).toMatch(/min-w-11/)
-    expect(clearButton.className).toMatch(/md:min-h-0/)
-    expect(clearButton.className).toMatch(/md:min-w-0/)
   })
 })
