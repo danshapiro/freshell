@@ -153,6 +153,38 @@ function storeWithState(state = baseState()) {
 }
 
 describe('managed runtime recovery merge', () => {
+  it('adopts a pane whose managed terminal is still being created', () => {
+    // The originating pane knows its createRequestId long before the server
+    // answers with a terminalId. Matching only on terminalId/soulId therefore
+    // misses it for the whole create round trip, and the reconciler
+    // manufactures a SECOND view of the same soul — a duplicate tab over one
+    // writer. The create request id is the stable identity across that window.
+    const state = baseState()
+    state.panes.layouts['user-tab'].content = {
+      kind: 'terminal',
+      createRequestId: 'create-one',
+      status: 'creating',
+      mode: 'opencode',
+    }
+    const plan = buildManagedRuntimeMergePlan(snapshot(), state)
+    expect(plan.creates).toHaveLength(0)
+    expect(plan.updates).toHaveLength(1)
+    expect(plan.updates[0]).toMatchObject({ tabId: 'user-tab', paneId: 'user-pane' })
+  })
+
+  it('does not adopt an unrelated pane that merely lacks a terminal id', () => {
+    const state = baseState()
+    state.panes.layouts['user-tab'].content = {
+      kind: 'terminal',
+      createRequestId: 'some-other-create',
+      status: 'creating',
+      mode: 'shell',
+    }
+    const plan = buildManagedRuntimeMergePlan(snapshot(), state)
+    expect(plan.creates).toHaveLength(1)
+    expect(plan.updates).toHaveLength(0)
+  })
+
   it('adds a missing recovered view without replacing layout or stealing focus', () => {
     const store = storeWithState()
     const plan = buildManagedRuntimeMergePlan(snapshot(), store.getState() as any)

@@ -10,6 +10,7 @@ import {
   RuntimeHarness,
   type SupervisorInstance,
 } from '../../../scripts/testing/runtime-sandbox.js'
+import { receiptArtifactName } from '../../../scripts/testing/runtime-receipts.js'
 
 export const PHASE3_CASE_IDS = [
   'P3-G01', 'P3-G02', 'P3-G03', 'P3-G04', 'P3-G05', 'P3-G06',
@@ -499,7 +500,7 @@ async function gate10PermissionPromptBrowserReceipt(h: RuntimeHarness): Promise<
   h.assert(caseId, browser.samePane === true && browser.visibleRecoveryState === true, 'the same pane shows recovery state across reconnect', browser)
   h.assert(caseId, browser.rejectedInputWhileRecovering === true, 'new input is rejected/fenced while recovery is active', browser)
   h.assert(caseId, browser.toolCompletedExactlyOnce === true && browser.followUpCompleted === true, 'tool and follow-up complete exactly once after reconnect', browser)
-  h.writeBrowserArtifact(caseId, receipt)
+  h.writeBrowserArtifact(receiptArtifactName('FRESHELL_RUNTIME_PHASE3_BROWSER_RECEIPT', caseId), receipt)
 }
 
 async function gate11PersistedRetryAndManualRearm(h: RuntimeHarness): Promise<void> {
@@ -739,7 +740,7 @@ function requiredProviderReceipt(caseId: string, h: RuntimeHarness, instruction:
   )
   h.assert(caseId, receipt.schemaVersion === 1 && receipt.status === 'PASS', 'provider receipt is an explicit schema-v1 PASS', receipt)
   h.assert(caseId, receipt.candidateSha === h.candidateSha, 'provider receipt belongs to the exact candidate commit', receipt)
-  h.writeBrowserArtifact(`${caseId}-provider-matrix`, receipt)
+  h.writeBrowserArtifact(receiptArtifactName('FRESHELL_RUNTIME_PHASE3_PROVIDER_RECEIPT', caseId), receipt)
   return receipt
 }
 

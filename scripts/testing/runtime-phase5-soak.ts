@@ -1,6 +1,7 @@
 import fs from 'node:fs'
 import path from 'node:path'
 
+import { defaultReceiptFileName } from './runtime-receipts.js'
 import { newRequest, newSoul, RuntimeHarness, type SupervisorInstance } from './runtime-sandbox.js'
 
 const MIN_DURATION_MS = 30 * 60 * 1_000
@@ -162,7 +163,7 @@ try {
     errors: [failure ? String(failure) : null, ...cleanup.errors].filter(Boolean),
   }
   const target = process.env.FRESHELL_RUNTIME_PHASE5_SOAK_RECEIPT
-    || path.join(h.evidenceDir, 'phase5-soak-receipt.json')
+    || path.join(h.evidenceDir, defaultReceiptFileName('FRESHELL_RUNTIME_PHASE5_SOAK_RECEIPT'))
   fs.mkdirSync(path.dirname(target), { recursive: true })
   fs.writeFileSync(target, JSON.stringify(receipt, null, 2))
   console.log(`[phase5-soak] receipt: ${target}`)
