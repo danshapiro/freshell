@@ -51,6 +51,18 @@ if (!fs.existsSync(filename)) {
 }
 `
 
+export function selectNativeAssistantTurn(
+  turns: readonly NativeAssistantTurn[],
+  priorMessageIds: ReadonlySet<string>,
+  expectedText: string,
+): NativeAssistantTurn | null {
+  return turns.find((turn) => (
+    !priorMessageIds.has(turn.messageId)
+    && turn.toolPartCount === 0
+    && turn.text.includes(expectedText)
+  )) ?? null
+}
+
 export function nativeAssistantProof(nativeSessionId: string, turn: NativeAssistantTurn) {
   return {
     nativeSessionId,
