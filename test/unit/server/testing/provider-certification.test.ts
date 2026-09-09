@@ -16,6 +16,8 @@ import {
   productionCertificationStatus,
   providerCertificationCaseId,
   providerCertificationCaseIds,
+  certificationCaseIds,
+  RELEASE_SCOPE_CASE_ID,
   resolveGateOutcome,
 } from '../../../../scripts/testing/provider-certification.js'
 import { parseGateArgs } from '../../../../scripts/testing/runtime-gate-args.js'
@@ -78,6 +80,20 @@ describe('checked-in provider certification manifest', () => {
     expect(providerCertificationCaseIds(loadCapabilityManifest(repoRoot))).toEqual([
       'PC-SHELL', 'PC-CLAUDE', 'PC-OPENCODE', 'PC-CODEX', 'PC-AMPLIFIER',
     ])
+  })
+
+  it('puts the release-scope audit first in the full certification case set', () => {
+    expect(certificationCaseIds(loadCapabilityManifest(repoRoot))).toEqual([
+      RELEASE_SCOPE_CASE_ID, 'PC-SHELL', 'PC-CLAUDE', 'PC-OPENCODE', 'PC-CODEX', 'PC-AMPLIFIER',
+    ])
+  })
+
+  it('matches the case ids the gate manifest declares', () => {
+    const gateManifest = JSON.parse(
+      fs.readFileSync(path.join(repoRoot, 'test/runtime/gate-manifest.json'), 'utf8'),
+    )
+    expect(gateManifest.certification_gates.provider_certification_case_ids)
+      .toEqual(certificationCaseIds(loadCapabilityManifest(repoRoot)))
   })
 })
 
