@@ -26,6 +26,10 @@ export const LOCAL_ONLY_SPECS = [{
   selector: '--project=chromium test/e2e-browser/specs/runtime-opencode-provider-qualification-rust.spec.ts',
   classification: 'local-only-docker-supervisor',
 }, {
+  spec: 'runtime-managed-provider-qualification-rust.spec.ts',
+  selector: '--project=chromium test/e2e-browser/specs/runtime-managed-provider-qualification-rust.spec.ts',
+  classification: 'local-only-docker-supervisor',
+}, {
   spec: 'runtime-tabs-rehydrate-rust.spec.ts',
   selector: '--project=chromium test/e2e-browser/specs/runtime-tabs-rehydrate-rust.spec.ts',
   classification: 'local-only-docker-supervisor',

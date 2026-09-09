@@ -5,6 +5,11 @@ import os from 'node:os'
 import path from 'node:path'
 
 import { defaultReceiptFileName } from '../../../scripts/testing/runtime-receipts.js'
+import {
+  buildProviderQualificationReceipt,
+  type ProviderQualificationReceiptV2,
+  type ProviderQualificationRow,
+} from '../../../scripts/testing/provider-qualification-receipt.js'
 import { RuntimeHarness, type SupervisorInstance } from '../../../scripts/testing/runtime-sandbox.js'
 import { RustServer } from './rust-server.js'
 import type { TestServerInfo } from './test-server.js'
@@ -55,6 +60,8 @@ export class ManagedRuntimeBrowserRig {
   private readonly serverEnv: Record<string, string>
   private readonly supervisorEnv: Record<string, string>
   private readonly supervisorBinaryKind: 'test' | 'release'
+  private readonly enabledProviders: string[]
+  private readonly providerSettings: Record<string, Record<string, unknown>>
 
   constructor(
     repoRoot = process.cwd(),
@@ -62,12 +69,18 @@ export class ManagedRuntimeBrowserRig {
     serverEnv: Record<string, string> = {},
     supervisorEnv: Record<string, string> = {},
     supervisorBinaryKind: 'test' | 'release' = 'test',
+    qualificationProviders: {
+      enabledProviders: string[]
+      providerSettings?: Record<string, Record<string, unknown>>
+    } = { enabledProviders: ['opencode'] },
   ) {
     this.repoRoot = fs.realpathSync(repoRoot)
     this.runtime = new RuntimeHarness(this.repoRoot, undefined, phase)
     this.serverEnv = { ...serverEnv }
     this.supervisorEnv = { ...supervisorEnv }
     this.supervisorBinaryKind = supervisorBinaryKind
+    this.enabledProviders = [...qualificationProviders.enabledProviders]
+    this.providerSettings = { ...qualificationProviders.providerSettings }
   }
 
   async start(): Promise<TestServerInfo> {
@@ -94,8 +107,13 @@ export class ManagedRuntimeBrowserRig {
           settings: {
             defaultCwd: this.repoRoot,
             codingCli: {
-              enabledProviders: ['opencode'],
-              providers: { opencode: { model: P2_OPENCODE_FREE_MODEL } },
+              enabledProviders: this.enabledProviders,
+              providers: {
+                ...(this.enabledProviders.includes('opencode')
+                  ? { opencode: { model: P2_OPENCODE_FREE_MODEL } }
+                  : {}),
+                ...this.providerSettings,
+              },
             },
           },
         }, null, 2))
@@ -215,13 +233,16 @@ export class ManagedRuntimeBrowserRig {
     return target
   }
 
-  writeProviderQualificationReceipt(value: unknown): string[] {
+  writeProviderQualificationReceipt(
+    value: unknown,
+    defaultFileName = 'opencode-provider-qualification.json',
+  ): string[] {
     const targets = new Set([
       process.env.FRESHELL_RUNTIME_PHASE3_PROVIDER_RECEIPT,
       process.env.FRESHELL_RUNTIME_PHASE5_PROVIDER_RECEIPT,
     ].filter((value): value is string => Boolean(value?.trim())))
     if (targets.size === 0) {
-      targets.add(path.join(this.runtime.browserDir, 'opencode-provider-qualification.json'))
+      targets.add(path.join(this.runtime.browserDir, defaultFileName))
     }
     const written: string[] = []
     for (const target of targets) {
@@ -230,6 +251,29 @@ export class ManagedRuntimeBrowserRig {
       written.push(target)
     }
     return written
+  }
+
+  finalizeProviderQualificationReceipt(providers: ProviderQualificationRow[]): {
+    receipt: ProviderQualificationReceiptV2
+    paths: string[]
+  } {
+    const receipt = buildProviderQualificationReceipt({
+      repoRoot: this.repoRoot,
+      evidenceDir: this.runtime.evidenceDir,
+      candidateSha: this.runtime.candidateSha,
+      receiptRunId: this.runtime.runId,
+      runtimeImage: this.runtime.imageRef,
+      providers,
+    })
+    return {
+      receipt,
+      paths: this.writeProviderQualificationReceipt(
+        receipt,
+        providers.length > 1
+          ? 'managed-provider-qualification.json'
+          : `${providers[0]?.provider ?? 'provider'}-provider-qualification.json`,
+      ),
+    }
   }
 
   writePhase3BrowserReceipt(value: unknown): string {
