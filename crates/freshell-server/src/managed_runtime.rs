@@ -233,6 +233,7 @@ impl ManagedTerminalController for ServerManagedRuntimeController {
                     provider_bootstrap_files: provider_bootstrap_files(&request.mode)?,
                     provider_secret_references,
                 }),
+                fresh_agent: None,
                 view_intent: Some(ViewIntentRequest {
                     owner_id: String::new(),
                     workspace_id: project_key.clone(),
