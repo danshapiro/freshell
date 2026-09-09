@@ -18,9 +18,10 @@ use freshell_agent_runtime::{classify_provider_failure, recovery_paths, verify_n
 use freshell_runtime_protocol::{
     CommandState, DesiredState, EvidenceStoreState, HostCommand, HostResult, IncidentAnalysis,
     IncidentTimelineEvent, LossBuildEvidence, LossCleanupReport, ManagedRolloutMode,
-    ReattachHandle, RecoverRequest, RecoveryBlockReason, RecoveryEvidenceVerdict, RecoveryOutcome,
-    RecoveryPath, RecoveryPathEvidence, RecoveryProbe, RecoveryResult, RecoveryTrigger, RetryHint,
-    RuntimeError, RuntimeErrorCode, RuntimeView, SoulId, StopOutcome, CONTROL_PROTOCOL_VERSION,
+    ReattachHandle, RecoverRequest, RecoveryAttemptId, RecoveryBlockReason,
+    RecoveryEvidenceVerdict, RecoveryOutcome, RecoveryPath, RecoveryPathEvidence, RecoveryProbe,
+    RecoveryResult, RecoveryTrigger, RetryHint, RuntimeError, RuntimeErrorCode, RuntimeView,
+    SoulId, StopOutcome, TerminalLaunchSpec, CONTROL_PROTOCOL_VERSION,
 };
 use tokio::time::{sleep, Duration, Instant};
 
@@ -556,11 +557,16 @@ impl Supervisor {
             });
         }
 
+        let replacement_terminal = if resume_spec.is_some() {
+            terminal_without_first_boot_state(start.context.terminal.clone())
+        } else {
+            start.context.terminal.clone()
+        };
         let prepared = match self
             .registry
             .prepare_replacement(
                 start.clone(),
-                start.context.terminal.clone(),
+                replacement_terminal,
                 resume_spec.clone(),
                 path,
             )
@@ -604,9 +610,22 @@ impl Supervisor {
         match launch {
             Ok(_) => {}
             Err(error) => {
+                let reason = classify_provider_failure(&error.message);
+                crate::service::append_event(
+                    &self.config.lifecycle_log,
+                    "supervisor.recovery.activation_failed",
+                    recovery_activation_failure_data(
+                        &soul_id,
+                        &prior_incarnation_id,
+                        &prepared.prepared.incarnation_id,
+                        &attempt_id,
+                        path,
+                        reason,
+                        &error,
+                    ),
+                );
                 self.cleanup_failed_replacement(&prepared.prepared.incarnation_id)
                     .await;
-                let reason = classify_provider_failure(&error.message);
                 self.registry
                     .mark_recovery_blocked(
                         soul_id.clone(),
@@ -1795,6 +1814,40 @@ fn blocked(
     }
 }
 
+fn recovery_activation_failure_data(
+    soul_id: &SoulId,
+    prior_incarnation_id: &freshell_runtime_protocol::IncarnationId,
+    replacement_incarnation_id: &freshell_runtime_protocol::IncarnationId,
+    attempt_id: &RecoveryAttemptId,
+    path: RecoveryPath,
+    reason: RecoveryBlockReason,
+    error: &RuntimeError,
+) -> serde_json::Value {
+    serde_json::json!({
+        "soulId": soul_id,
+        "priorIncarnationId": prior_incarnation_id,
+        "replacementIncarnationId": replacement_incarnation_id,
+        "attemptId": attempt_id,
+        "path": path,
+        "blockReason": reason,
+        "errorCode": error.code,
+        "errorMessage": error.message,
+    })
+}
+
+fn terminal_without_first_boot_state(
+    terminal: Option<TerminalLaunchSpec>,
+) -> Option<TerminalLaunchSpec> {
+    terminal.map(|mut terminal| {
+        // Exact recovery consumes the credential/config copies already named
+        // by ResumeSpec::credential_references in the verified provider
+        // volume. Source bind mounts are first-boot inputs, not recovery
+        // dependencies, and may no longer exist by the time a host fails.
+        terminal.provider_bootstrap_files.clear();
+        terminal
+    })
+}
+
 fn map_registry(error: RegistryError) -> RuntimeError {
     let code = match &error {
         RegistryError::Busy => RuntimeErrorCode::RegistryBusy,
@@ -1823,4 +1876,80 @@ fn map_registry(error: RegistryError) -> RuntimeError {
         _ => RuntimeErrorCode::RegistryFailure,
     };
     RuntimeError::new(code, error.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use freshell_runtime_protocol::IncarnationId;
+
+    #[test]
+    fn recovery_activation_diagnostic_links_generic_block_to_exact_failure() {
+        let soul_id = SoulId::new();
+        let prior = IncarnationId::new();
+        let replacement = IncarnationId::new();
+        let attempt = RecoveryAttemptId::new();
+        let error = RuntimeError::new(
+            RuntimeErrorCode::HostUnreachable,
+            "prepare provider bootstrap: operation not permitted",
+        );
+
+        let data = recovery_activation_failure_data(
+            &soul_id,
+            &prior,
+            &replacement,
+            &attempt,
+            RecoveryPath::NativeResume,
+            RecoveryBlockReason::ProviderUnavailable,
+            &error,
+        );
+
+        assert_eq!(data["soulId"], soul_id.as_str());
+        assert_eq!(data["priorIncarnationId"], prior.as_str());
+        assert_eq!(data["replacementIncarnationId"], replacement.as_str());
+        assert_eq!(data["attemptId"], attempt.as_str());
+        assert_eq!(data["path"], "native_resume");
+        assert_eq!(data["blockReason"], "PROVIDER_UNAVAILABLE");
+        assert_eq!(data["errorCode"], "HOST_UNREACHABLE");
+        assert!(data["errorMessage"]
+            .as_str()
+            .unwrap()
+            .contains("operation not permitted"));
+    }
+
+    #[test]
+    fn exact_replacement_drops_first_boot_sources_but_keeps_launch_identity() {
+        let terminal = TerminalLaunchSpec {
+            terminal_id: "terminal-exact".into(),
+            stream_id: "stream-exact".into(),
+            mode: "opencode".into(),
+            program: "opencode".into(),
+            args: vec!["--model".into(), "free".into()],
+            env: std::collections::BTreeMap::new(),
+            cwd: "/workspace".into(),
+            run_as_uid: 65_534,
+            run_as_gid: 0,
+            cols: 80,
+            rows: 24,
+            project_key: "project-exact".into(),
+            workspace_path: "/workspace".into(),
+            git_common_dir: None,
+            create_request_id: Some("create-exact".into()),
+            resume_session_id: None,
+            provider_model: Some("free".into()),
+            provider_sandbox: None,
+            provider_permission_mode: None,
+            provider_bootstrap_files: vec![freshell_runtime_protocol::ProviderBootstrapFile {
+                source_path: "/first-boot/auth.json".into(),
+                provider_relative_path: ".local/share/opencode/auth.json".into(),
+            }],
+        };
+
+        let replacement = terminal_without_first_boot_state(Some(terminal.clone())).unwrap();
+
+        assert!(replacement.provider_bootstrap_files.is_empty());
+        assert_eq!(replacement.terminal_id, terminal.terminal_id);
+        assert_eq!(replacement.program, terminal.program);
+        assert_eq!(replacement.args, terminal.args);
+    }
 }
