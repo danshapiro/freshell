@@ -734,6 +734,9 @@
                     },
                     "type": "array"
                   },
+                  "supportsEffort": {
+                    "type": "boolean"
+                  },
                   "supportsModel": {
                     "type": "boolean"
                   },
@@ -2958,6 +2961,9 @@
                     "additionalProperties": false,
                     "properties": {
                       "cwd": {
+                        "type": "string"
+                      },
+                      "effort": {
                         "type": "string"
                       },
                       "maxTurns": {
