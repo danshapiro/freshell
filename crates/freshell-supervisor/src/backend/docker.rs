@@ -1,4 +1,6 @@
-use freshell_runtime_protocol::{FreshAgentLaunchSpec, ProviderBootstrapFile, TerminalLaunchSpec};
+use freshell_runtime_protocol::{
+    FreshAgentLaunchSpec, ProviderBootstrapFile, ProviderSecretReference, TerminalLaunchSpec,
+};
 use std::path::{Path, PathBuf};
 
 /// Exact extra-mount set for a Phase 2 terminal workload. Every source is
@@ -18,6 +20,7 @@ pub fn terminal_mounts(spec: &TerminalLaunchSpec) -> Result<TerminalMounts, Stri
         &spec.cwd,
         spec.git_common_dir.as_deref(),
         &spec.provider_bootstrap_files,
+        &spec.provider_secret_references,
     )
 }
 
@@ -27,6 +30,7 @@ pub fn fresh_agent_mounts(spec: &FreshAgentLaunchSpec) -> Result<TerminalMounts,
         &spec.cwd,
         spec.git_common_dir.as_deref(),
         &spec.provider_bootstrap_files,
+        &[],
     )
 }
 
@@ -35,6 +39,7 @@ fn workload_mounts(
     cwd_path: &str,
     git_common_path: Option<&str>,
     bootstrap_files: &[ProviderBootstrapFile],
+    secret_references: &[ProviderSecretReference],
 ) -> Result<TerminalMounts, String> {
     let workspace = canonical_dir(Path::new(workspace_path), "workspace")?;
     if workspace != Path::new(workspace_path) {
@@ -70,8 +75,8 @@ fn workload_mounts(
         reject_management_path(&source)?;
         provider_bootstrap_files.push(source);
     }
-    let mut provider_secret_files = Vec::with_capacity(spec.provider_secret_references.len());
-    for secret in &spec.provider_secret_references {
+    let mut provider_secret_files = Vec::with_capacity(secret_references.len());
+    for secret in secret_references {
         let source = std::fs::canonicalize(&secret.source_path)
             .map_err(|error| format!("provider secret reference: {error}"))?;
         if !source.is_file() || source != Path::new(&secret.source_path) {
