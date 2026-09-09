@@ -1,5 +1,6 @@
 import { createSlice, PayloadAction, createAsyncThunk } from '@reduxjs/toolkit'
 import type { Tab, TerminalStatus, TabMode, ShellType, CodingCliProviderName } from './types'
+import type { ManagedRuntimeProjectionFields } from '@shared/managed-runtime'
 import { nanoid } from 'nanoid'
 import { closePane, initLayout, restoreLayout, removeLayout, replacePane, setPaneCloseError, updatePaneContent, updatePaneTitleByTerminalId, updatePaneTitle, markTabClosing, clearTabClosing, markPaneClosing, clearPaneClosing, hasAnyClosePending } from './panesSlice'
 import { clearTabAttention, clearPaneAttention } from './turnCompletionSlice.js'
@@ -290,7 +291,8 @@ type AddTabPayload = {
   forceNew?: boolean
   createRequestId?: string
   titleSetByUser?: boolean
-}
+  activate?: boolean
+} & ManagedRuntimeProjectionFields
 
 export const tabsSlice = createSlice({
   name: 'tabs',
@@ -317,13 +319,28 @@ export const tabsSlice = createSlice({
         serverInstanceId: payload.serverInstanceId,
         resumeSessionId: undefined,
         sessionMetadataByKey: payload.sessionMetadataByKey,
+        soulId: payload.soulId,
+        incarnationId: payload.incarnationId,
+        runtimeState: payload.runtimeState,
+        viewIntentId: payload.viewIntentId,
+        viewIntentRevision: payload.viewIntentRevision,
+        soulIntentRevision: payload.soulIntentRevision,
+        incidentId: payload.incidentId,
+        placementGroup: payload.placementGroup,
+        resourceSummary: payload.resourceSummary,
+        recoverySummary: payload.recoverySummary,
         createdAt: Date.now(),
         updatedAt: Date.now(),
         titleSetByUser: payload.titleSetByUser,
         lastInputAt: undefined,
       }
       state.tabs.push(tab)
-      state.activeTabId = id
+      if (payload.viewIntentId) {
+        state.tombstones = (state.tombstones || []).filter((tombstone) => tombstone.id !== id)
+      }
+      if (payload.activate !== false || state.activeTabId === null) {
+        state.activeTabId = id
+      }
     },
     setActiveTab: (state, action: PayloadAction<string>) => {
       state.activeTabId = action.payload

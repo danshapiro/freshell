@@ -3,7 +3,7 @@
   "description": "Auto-generated from shared/ws-protocol.ts. DO NOT EDIT BY HAND. Regenerate with `npm run contract:generate`. Each entry is a JSON Schema for one server→client message shape, keyed by its `type` discriminant and synthesized from the ServerMessage union via the TypeScript type checker. Opaque values (unknown / index signatures / any) are intentionally permissive — see nondeterministic-fields.md. The wire contract is frozen for the Rust port.",
   "generator": "port/contract/generate-ws-contract.ts",
   "jsonSchemaDialect": "https://json-schema.org/draft/2020-12/schema",
-  "messageCount": 64,
+  "messageCount": 66,
   "messages": {
     "amplifier.activity.list.response": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -2658,6 +2658,167 @@
       "required": [
         "timestamp",
         "type"
+      ],
+      "type": "object"
+    },
+    "runtime.inventory.changed": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "properties": {
+        "readiness": {
+          "additionalProperties": false,
+          "properties": {
+            "blockedSubsystems": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "initialScanDurationMs": {
+              "type": "number"
+            },
+            "initialScanFinishedAt": {
+              "type": "number"
+            },
+            "initialScanStartedAt": {
+              "type": "number"
+            },
+            "initialScanState": {
+              "enum": [
+                "pending",
+                "scanning",
+                "complete",
+                "blocked"
+              ],
+              "type": "string"
+            },
+            "inventoryRevision": {
+              "type": "number"
+            },
+            "startupRecoveryConcurrencyLimit": {
+              "type": "number"
+            },
+            "startupRecoveryPeak": {
+              "type": "number"
+            }
+          },
+          "required": [
+            "blockedSubsystems",
+            "initialScanState",
+            "inventoryRevision",
+            "startupRecoveryConcurrencyLimit",
+            "startupRecoveryPeak"
+          ],
+          "type": "object"
+        },
+        "revision": {
+          "type": "number"
+        },
+        "type": {
+          "const": "runtime.inventory.changed",
+          "type": "string"
+        }
+      },
+      "required": [
+        "readiness",
+        "revision",
+        "type"
+      ],
+      "type": "object"
+    },
+    "runtime.view.changed": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "properties": {
+        "eventId": {
+          "type": "string"
+        },
+        "inventoryRevision": {
+          "type": "number"
+        },
+        "type": {
+          "const": "runtime.view.changed",
+          "type": "string"
+        },
+        "view": {
+          "additionalProperties": false,
+          "properties": {
+            "createdAt": {
+              "type": "number"
+            },
+            "kind": {
+              "enum": [
+                "automatic_primary",
+                "explicit"
+              ],
+              "type": "string"
+            },
+            "ownerId": {
+              "type": "string"
+            },
+            "placementGroup": {
+              "type": "string"
+            },
+            "preferredPaneId": {
+              "type": "string"
+            },
+            "preferredTabId": {
+              "type": "string"
+            },
+            "revision": {
+              "type": "number"
+            },
+            "soulId": {
+              "type": "string"
+            },
+            "soulIntentRevision": {
+              "type": "number"
+            },
+            "title": {
+              "type": "string"
+            },
+            "updatedAt": {
+              "type": "number"
+            },
+            "viewId": {
+              "type": "string"
+            },
+            "visibility": {
+              "enum": [
+                "visible",
+                "detached",
+                "hidden"
+              ],
+              "type": "string"
+            },
+            "workspaceId": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "createdAt",
+            "kind",
+            "ownerId",
+            "placementGroup",
+            "preferredPaneId",
+            "preferredTabId",
+            "revision",
+            "soulId",
+            "soulIntentRevision",
+            "title",
+            "updatedAt",
+            "viewId",
+            "visibility",
+            "workspaceId"
+          ],
+          "type": "object"
+        }
+      },
+      "required": [
+        "eventId",
+        "inventoryRevision",
+        "type",
+        "view"
       ],
       "type": "object"
     },

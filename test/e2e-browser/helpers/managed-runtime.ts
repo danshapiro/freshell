@@ -52,20 +52,30 @@ export class ManagedRuntimeBrowserRig {
   info!: TestServerInfo
   private serverBin = ''
   private readonly serverEnv: Record<string, string>
+  private readonly supervisorEnv: Record<string, string>
+  private readonly supervisorBinaryKind: 'test' | 'release'
 
   constructor(
     repoRoot = process.cwd(),
-    phase: 2 | 3 = 2,
+    phase: 2 | 3 | 4 | 5 = 2,
     serverEnv: Record<string, string> = {},
+    supervisorEnv: Record<string, string> = {},
+    supervisorBinaryKind: 'test' | 'release' = 'test',
   ) {
     this.repoRoot = fs.realpathSync(repoRoot)
     this.runtime = new RuntimeHarness(this.repoRoot, undefined, phase)
     this.serverEnv = { ...serverEnv }
+    this.supervisorEnv = { ...supervisorEnv }
+    this.supervisorBinaryKind = supervisorBinaryKind
   }
 
   async start(): Promise<TestServerInfo> {
     await this.runtime.prepare()
-    this.supervisor = await this.runtime.startSupervisor({ scenarioId: 'browser-managed-runtime' })
+    this.supervisor = await this.runtime.startSupervisor({
+      scenarioId: 'browser-managed-runtime',
+      binaryKind: this.supervisorBinaryKind,
+      env: this.supervisorEnv,
+    })
     this.serverBin = this.buildManagedServer()
     this.web = new RustServer({
       preserveHomeOnStop: true,
@@ -126,6 +136,7 @@ export class ManagedRuntimeBrowserRig {
       volumeName: previous.volumeName,
       binaryKind: previous.binaryKind,
       reuseSecret: true,
+      env: this.supervisorEnv,
     })
     return this.supervisor
   }
@@ -154,6 +165,11 @@ export class ManagedRuntimeBrowserRig {
   async inventory(): Promise<ManagedRuntimeView[]> {
     const result = await this.runtime.adminOk(this.supervisor, { method: 'inventory' })
     return this.dataOf(result, 'inventory') as ManagedRuntimeView[]
+  }
+
+  async inventorySnapshot(): Promise<any> {
+    const result = await this.runtime.adminOk(this.supervisor, { method: 'inventory_snapshot' })
+    return this.dataOf(result, 'inventory_snapshot')
   }
 
   async runningViewForTerminal(terminalId: string): Promise<ManagedRuntimeView | null> {
@@ -198,9 +214,50 @@ export class ManagedRuntimeBrowserRig {
     return target
   }
 
+  writeProviderQualificationReceipt(value: unknown): string[] {
+    const targets = new Set([
+      process.env.FRESHELL_RUNTIME_PHASE3_PROVIDER_RECEIPT,
+      process.env.FRESHELL_RUNTIME_PHASE5_PROVIDER_RECEIPT,
+    ].filter((value): value is string => Boolean(value?.trim())))
+    if (targets.size === 0) {
+      targets.add(path.join(this.runtime.browserDir, 'opencode-provider-qualification.json'))
+    }
+    const written: string[] = []
+    for (const target of targets) {
+      fs.mkdirSync(path.dirname(target), { recursive: true })
+      fs.writeFileSync(target, JSON.stringify(value, null, 2))
+      written.push(target)
+    }
+    return written
+  }
+
   writePhase3BrowserReceipt(value: unknown): string {
     const target = process.env.FRESHELL_RUNTIME_PHASE3_BROWSER_RECEIPT
       || path.join(this.runtime.browserDir, 'p3-g10-provider-resurrection.json')
+    fs.mkdirSync(path.dirname(target), { recursive: true })
+    fs.writeFileSync(target, JSON.stringify(value, null, 2))
+    return target
+  }
+
+  writePhase4BrowserReceipt(value: unknown): string {
+    const target = process.env.FRESHELL_RUNTIME_PHASE4_BROWSER_RECEIPT
+      || path.join(this.runtime.browserDir, 'p4-g08-runtime-tabs-rehydrate.json')
+    fs.mkdirSync(path.dirname(target), { recursive: true })
+    fs.writeFileSync(target, JSON.stringify(value, null, 2))
+    return target
+  }
+
+  writePhase5LossReceipt(value: unknown): string {
+    const target = process.env.FRESHELL_RUNTIME_PHASE5_LOSS_RECEIPT
+      || path.join(this.runtime.browserDir, 'p5-g02-real-opencode-loss.json')
+    fs.mkdirSync(path.dirname(target), { recursive: true })
+    fs.writeFileSync(target, JSON.stringify(value, null, 2))
+    return target
+  }
+
+  writePhase5ChaosReceipt(value: unknown): string {
+    const target = process.env.FRESHELL_RUNTIME_PHASE5_CHAOS_RECEIPT
+      || path.join(this.runtime.browserDir, 'p5-g09-browser-chaos.json')
     fs.mkdirSync(path.dirname(target), { recursive: true })
     fs.writeFileSync(target, JSON.stringify(value, null, 2))
     return target

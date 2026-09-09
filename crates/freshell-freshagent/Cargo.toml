@@ -28,6 +28,7 @@ publish.workspace = true
 # The frozen wire types the broadcasts emit (ui.command / freshAgent.session.materialized
 # / sessions.changed) — contract-locked shapes.
 freshell-protocol = { path = "../freshell-protocol" }
+freshell-agent-runtime = { path = "../freshell-agent-runtime" }
 # The opencode serve client CORE + its real reqwest/process backends (real-transport):
 # spawn+bounded-health cold-start (DEV-0001), create_session, run_turn (idle edge),
 # list_messages (transcript capture), and the ownership-safe reaper.
@@ -60,6 +61,7 @@ freshell-platform = { path = "../freshell-platform" }
 axum = "0.8"
 serde = { workspace = true }
 serde_json = { workspace = true }
+sha2 = "0.10"
 # `<think>`/`<thinking>` balanced-tag segmentation for opencode assistant text
 # (`itemsFromAssistantTextPart`/`normalizeBalancedThinkTags`, normalize.ts:100-189) needs a
 # backreference (`<(thinking|think)...>...</\1>`) to match only same-name open/close pairs --

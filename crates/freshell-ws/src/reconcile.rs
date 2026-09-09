@@ -40,6 +40,44 @@ pub struct ReconcileDeps<'a> {
     /// fresh-agent panes; `None` keeps the frozen client's
     /// `invalid{unsupported_kind}` contract.
     pub fresh_agent: Option<&'a crate::reconcile_freshagent::FreshAgentReconcileSnapshot>,
+    /// Phase 4 managed-runtime facts for THIS request: `Some` only on a
+    /// connection that negotiated `managedRuntimeV1`. See
+    /// [`ManagedReconcileFacts`].
+    pub managed: Option<&'a ManagedReconcileFacts>,
+}
+
+/// What the managed pre-pass learned about this reconcile request.
+///
+/// The supervisor owns managed souls; their provider state lives inside the
+/// soul's own runtime volume, which the web server's host-local session index
+/// cannot see. So when managed truth is available it dominates, and when it
+/// could not be read it *withholds* the legacy ladder's authority to declare a
+/// definitive loss — an unknown answer is BLOCKED, never `dead_session`.
+#[derive(Debug, Default, Clone)]
+pub struct ManagedReconcileFacts {
+    /// Panes whose managed lookup failed (controller unreachable, protocol
+    /// error). Their managed truth is unknown for this request.
+    indeterminate_pane_keys: std::collections::HashSet<String>,
+}
+
+impl ManagedReconcileFacts {
+    pub fn with_indeterminate<I: IntoIterator<Item = String>>(pane_keys: I) -> Self {
+        Self {
+            indeterminate_pane_keys: pane_keys.into_iter().collect(),
+        }
+    }
+
+    pub fn mark_indeterminate(&mut self, pane_key: impl Into<String>) {
+        self.indeterminate_pane_keys.insert(pane_key.into());
+    }
+
+    pub fn is_indeterminate(&self, pane_key: &str) -> bool {
+        self.indeterminate_pane_keys.contains(pane_key)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.indeterminate_pane_keys.is_empty()
+    }
 }
 
 /// Derive one verdict per presented pane, 1:1 by `paneKey`, order preserved
@@ -323,6 +361,34 @@ fn verdict_for_pane(deps: &ReconcileDeps<'_>, pane: &ReconcilePane) -> PaneVerdi
         };
     };
 
+    // Managed runtime dominance (Phase 4). The host-local session index has no
+    // visibility into a supervisor-owned soul's provider store, so it must not
+    // adjudicate one. A managed row that owns this exact identity IS the
+    // answer; managed truth that could not be read withholds the ladder's
+    // authority to claim a definitive loss.
+    if let Some(descriptor) = deps
+        .registry
+        .live_managed_owner_for_session(&sref.provider, &sref.session_id)
+    {
+        let corrected = corrected_flag(pane.session_ref.as_ref(), Some(&sref));
+        return PaneVerdict {
+            terminal_id: Some(descriptor.terminal_id),
+            session_ref: Some(sref),
+            corrected,
+            ..base(pane, ReconcileVerdict::Attach)
+        };
+    }
+    if deps
+        .managed
+        .is_some_and(|facts| facts.is_indeterminate(&pane.pane_key))
+    {
+        return PaneVerdict {
+            session_ref: Some(sref),
+            reason: Some("managed_runtime_unavailable".to_string()),
+            ..base(pane, ReconcileVerdict::Error)
+        };
+    }
+
     match deps.existence.exists(&sref.provider, &sref.session_id) {
         SessionExistence::Present => {
             // §7.5: a respawn ↔ instant-exit loop converges to a terminal,
@@ -542,6 +608,7 @@ mod tests {
                 existence: &self.probe,
                 pane_ledger: &self.ledger,
                 fresh_agent: None,
+                managed: None,
             }
         }
 
@@ -577,6 +644,18 @@ mod tests {
 
         fn one(&self, pane: ReconcilePane) -> PaneVerdict {
             let verdicts = derive_verdicts(&self.deps(), &[pane]);
+            assert_eq!(verdicts.len(), 1);
+            verdicts.into_iter().next().unwrap()
+        }
+
+        fn one_with_managed(
+            &self,
+            pane: ReconcilePane,
+            managed: &ManagedReconcileFacts,
+        ) -> PaneVerdict {
+            let mut deps = self.deps();
+            deps.managed = Some(managed);
+            let verdicts = derive_verdicts(&deps, &[pane]);
             assert_eq!(verdicts.len(), 1);
             verdicts.into_iter().next().unwrap()
         }
@@ -691,6 +770,81 @@ mod tests {
         let v = f.one(p);
         assert_eq!(v.verdict, ReconcileVerdict::Fresh);
         assert_eq!(v.reason.as_deref(), Some("identity_never_observed"));
+    }
+
+    /// Managed supervisor truth dominates the legacy host-local disk index.
+    ///
+    /// A managed soul keeps its provider state INSIDE its own runtime volume,
+    /// which the web server's host-local session index cannot see. Left alone,
+    /// the legacy ladder reads "ever observed, now absent" and declares a
+    /// perfectly healthy supervisor-owned conversation dead. The managed row
+    /// is the authority for its own identity: attach to it.
+    #[test]
+    fn managed_ownership_dominates_a_stale_disk_index_absence_verdict() {
+        let f = Fixture::new();
+        f.registry
+            .register_managed(freshell_terminal::registry::ManagedTerminalDescriptor {
+                soul_id: "soul-managed-1".to_string(),
+                incarnation_id: "incarnation-managed-1".to_string(),
+                terminal_id: "T-managed".to_string(),
+                stream_id: "stream-managed".to_string(),
+                mode: "opencode".to_string(),
+                cwd: "/workspace".to_string(),
+                resume_session_id: Some("ses-managed".to_string()),
+                create_request_id: Some("cr-managed-original".to_string()),
+            });
+        // The host-local index has seen this id before and no longer finds it:
+        // the exact shape that produces `session_not_on_disk`.
+        f.probe.mark_observed("opencode", "ses-managed");
+
+        let mut p = pane("cr-managed-restored");
+        p.mode = Some("opencode".to_string());
+        p.session_ref = Some(sref("opencode", "ses-managed"));
+        let v = f.one(p);
+
+        assert_eq!(
+            v.verdict,
+            ReconcileVerdict::Attach,
+            "a supervisor-owned identity is never adjudicated by the host disk index"
+        );
+        assert_eq!(v.terminal_id.as_deref(), Some("T-managed"));
+        assert_eq!(v.session_ref, Some(sref("opencode", "ses-managed")));
+    }
+
+    /// Proof-gated death: when managed truth could not be read, the legacy
+    /// ladder has no authority to declare a definitive loss. An unavailable
+    /// controller is BLOCKED (a retriable per-pane error), never `dead_session`.
+    #[test]
+    fn indeterminate_managed_truth_blocks_instead_of_declaring_a_dead_session() {
+        let f = Fixture::new();
+        f.probe.mark_observed("opencode", "ses-unknown");
+        let mut p = pane("cr-managed-unknown");
+        p.mode = Some("opencode".to_string());
+        p.session_ref = Some(sref("opencode", "ses-unknown"));
+        let pane_key = p.pane_key.clone();
+
+        let managed = ManagedReconcileFacts::with_indeterminate([pane_key]);
+        let v = f.one_with_managed(p, &managed);
+
+        assert_eq!(v.verdict, ReconcileVerdict::Error);
+        assert_eq!(v.reason.as_deref(), Some("managed_runtime_unavailable"));
+        assert_eq!(v.session_ref, Some(sref("opencode", "ses-unknown")));
+    }
+
+    /// The suppression is scoped to the pane whose managed truth is missing —
+    /// an unrelated pane still gets its ordinary, honest verdict.
+    #[test]
+    fn indeterminate_managed_truth_does_not_suppress_unrelated_panes() {
+        let f = Fixture::new();
+        f.probe.mark_observed("claude", "s-really-gone");
+        let mut p = pane("cr-unrelated");
+        p.session_ref = Some(sref("claude", "s-really-gone"));
+
+        let managed = ManagedReconcileFacts::with_indeterminate(["pk-some-other-pane".to_string()]);
+        let v = f.one_with_managed(p, &managed);
+
+        assert_eq!(v.verdict, ReconcileVerdict::DeadSession);
+        assert_eq!(v.reason.as_deref(), Some("session_not_on_disk"));
     }
 
     /// Row 4/7: Absent but EVER seen on disk → explicit dead_session.

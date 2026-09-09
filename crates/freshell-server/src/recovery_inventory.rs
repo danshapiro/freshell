@@ -1407,6 +1407,12 @@ pub struct RecoveryInventoryState {
     /// here (the wave-B widened D7 liveness join: locator-adopted terminals
     /// hold their session identity here, not on the registry row).
     pub identity: freshell_ws::identity::TerminalIdentityRegistry,
+    /// Phase 4 authoritative managed-runtime inventory. Kept optional so the
+    /// legacy recovery offer remains available when the controller feature is
+    /// disabled; clients follow the linked revision rather than treating the
+    /// browser's saved layout as process truth.
+    #[cfg(feature = "managed-runtime-v1")]
+    pub managed_runtime_client: Option<freshell_runtime_client::RuntimeClient>,
 }
 
 #[derive(serde::Deserialize)]
@@ -1499,14 +1505,57 @@ async fn inventory_handler(
         pane_closes: state.ledger.list_pane_closes(),
         pane_detach_closes: state.ledger.list_pane_detach_closes(),
     };
-    Json(build_inventory(
+    let inventory = build_inventory(
         unions,
         apply_kill_tombstone_dominance(state.ledger.list_bindings(), &dominant_tombstones),
         live,
         &evidence,
         &closes,
-    ))
-    .into_response()
+    );
+    let mut body = match serde_json::to_value(inventory) {
+        Ok(body) => body,
+        Err(error) => {
+            tracing::error!(target: "freshell_server::recovery_inventory",
+                error = %error, "recovery inventory serialization failed");
+            return internal_error();
+        }
+    };
+    #[cfg(feature = "managed-runtime-v1")]
+    {
+        let managed = match state.managed_runtime_client.as_ref() {
+            Some(client) => match client.inventory_snapshot().await {
+                Ok(snapshot) => json!({
+                    "available": true,
+                    "authoritativeEndpoint": "/api/runtime/souls",
+                    "revision": snapshot.revision,
+                    "readiness": snapshot.readiness,
+                }),
+                Err(error) => json!({
+                    "available": true,
+                    "authoritativeEndpoint": "/api/runtime/souls",
+                    "error": error.to_string(),
+                }),
+            },
+            None => json!({
+                "available": false,
+                "authoritativeEndpoint": "/api/runtime/souls",
+            }),
+        };
+        if let Some(object) = body.as_object_mut() {
+            object.insert("managedRuntime".into(), managed);
+        }
+    }
+    #[cfg(not(feature = "managed-runtime-v1"))]
+    if let Some(object) = body.as_object_mut() {
+        object.insert(
+            "managedRuntime".into(),
+            json!({
+                "available": false,
+                "authoritativeEndpoint": "/api/runtime/souls",
+            }),
+        );
+    }
+    Json(body).into_response()
 }
 
 /// Read-only liveness join (D7): `(provider = mode, sessionId)` for every

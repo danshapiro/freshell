@@ -15,6 +15,28 @@ import type { RecoveryInventory } from '@/lib/recovery/types'
 import {
   type FreshAgentModelCapabilitiesResponse,
 } from '@shared/fresh-agent-model-capabilities'
+import {
+  ManagedRuntimeIncidentSummarySchema,
+  ManagedRuntimeInventorySnapshotSchema,
+  ManagedRuntimeMigrationPlanSchema,
+  ManagedRuntimeMetricsSnapshotSchema,
+  ManagedRuntimeNoticesResponseSchema,
+  ManagedRuntimeRepairAuditSchema,
+  ManagedRuntimeSoulDetailSchema,
+  ManagedRuntimeUpdateLimitsResultSchema,
+  type ManagedRuntimeIncidentSummary,
+  type ManagedRuntimeInventorySnapshot,
+  type ManagedRuntimeLimits,
+  type ManagedRuntimeMigrationPlan,
+  type ManagedRuntimeMetricsSnapshot,
+  type ManagedRuntimeNotice,
+  type ManagedRuntimeNoticeDeliveryState,
+  type ManagedRuntimeRepairAudit,
+  type ManagedRuntimeRolloutMode,
+  type ManagedRuntimeSoulDetail,
+  type ManagedRuntimeUpdateLimitsResult,
+  type ManagedRuntimeViewVisibility,
+} from '@shared/managed-runtime'
 import { parseFreshAgentModelCapabilitiesResponse } from '@/lib/fresh-agent-model-capabilities'
 import {
   FreshAgentThreadTurnBodyQuerySchema,
@@ -307,6 +329,185 @@ export async function getBootstrap(options: ApiRequestOptions = {}): Promise<any
 export async function getRecoveryInventory(clientInstanceId: string, bootAgoMs: number): Promise<RecoveryInventory> {
   return api.get<RecoveryInventory>(
     `/api/recovery/inventory${buildQueryString([['clientInstanceId', clientInstanceId], ['bootAgoMs', Math.max(0, Math.round(bootAgoMs))]])}`,
+  )
+}
+
+export function createManagedRuntimeRequestId(): string {
+  const suffix = typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function'
+    ? crypto.randomUUID()
+    : `${Date.now()}-${Math.random().toString(36).slice(2)}`
+  return `request-runtime-ui-${suffix}`
+}
+
+export async function getManagedRuntimeInventory(
+  workspaceId?: string,
+  options: ApiRequestOptions = {},
+): Promise<ManagedRuntimeInventorySnapshot> {
+  const query = buildQueryString([['workspaceId', workspaceId]])
+  return ManagedRuntimeInventorySnapshotSchema.parse(
+    await api.get(`/api/runtime/souls${query}`, options),
+  )
+}
+
+export async function getManagedRuntimeReadiness(
+  options: ApiRequestOptions = {},
+): Promise<Pick<ManagedRuntimeInventorySnapshot, 'revision' | 'readiness' | 'pendingProjectionCount'>> {
+  const response = await api.get('/api/runtime/readiness', options)
+  const parsed = ManagedRuntimeInventorySnapshotSchema.pick({
+    revision: true,
+    readiness: true,
+    pendingProjectionCount: true,
+  }).parse(response)
+  return parsed
+}
+
+export async function getManagedRuntimeSoul(
+  soulId: string,
+  options: ApiRequestOptions = {},
+): Promise<ManagedRuntimeSoulDetail> {
+  return ManagedRuntimeSoulDetailSchema.parse(
+    await api.get(`/api/runtime/souls/${encodeURIComponent(soulId)}`, options),
+  )
+}
+
+export async function retryManagedRuntimeSoul(
+  soulId: string,
+  expectedIntentRevision: number,
+  requestId = createManagedRuntimeRequestId(),
+): Promise<unknown> {
+  return api.post(`/api/runtime/souls/${encodeURIComponent(soulId)}/retry`, {
+    requestId,
+    expectedIntentRevision,
+  })
+}
+
+export async function stopManagedRuntimeSoul(
+  soulId: string,
+  expectedIntentRevision: number,
+  requestId = createManagedRuntimeRequestId(),
+): Promise<unknown> {
+  return api.post(`/api/runtime/souls/${encodeURIComponent(soulId)}/stop`, {
+    requestId,
+    expectedIntentRevision,
+  })
+}
+
+export async function updateManagedRuntimeLimits(
+  soulId: string,
+  expectedIntentRevision: number,
+  limits: ManagedRuntimeLimits,
+  requestId = createManagedRuntimeRequestId(),
+): Promise<ManagedRuntimeUpdateLimitsResult> {
+  return ManagedRuntimeUpdateLimitsResultSchema.parse(
+    await api.patch(`/api/runtime/souls/${encodeURIComponent(soulId)}/limits`, {
+      requestId,
+      expectedIntentRevision,
+      ...limits,
+    }),
+  )
+}
+
+export async function updateManagedRuntimeViewVisibility(
+  viewId: string,
+  visibility: ManagedRuntimeViewVisibility,
+  expectedRevision: number,
+  expectedSoulIntentRevision: number,
+  requestId = createManagedRuntimeRequestId(),
+): Promise<unknown> {
+  return api.patch(`/api/runtime/views/${encodeURIComponent(viewId)}`, {
+    requestId,
+    visibility,
+    expectedRevision,
+    expectedSoulIntentRevision,
+  })
+}
+
+export async function getManagedRuntimeIncidentSummary(
+  incidentId: string,
+  options: ApiRequestOptions = {},
+): Promise<ManagedRuntimeIncidentSummary> {
+  return ManagedRuntimeIncidentSummarySchema.parse(
+    await api.get(`/api/runtime/incidents/${encodeURIComponent(incidentId)}/summary`, options),
+  )
+}
+
+export async function getManagedRuntimeNotices(
+  profileId: string,
+  limit = 20,
+  options: ApiRequestOptions = {},
+): Promise<ManagedRuntimeNotice[]> {
+  const query = buildQueryString([
+    ['profileId', profileId],
+    ['limit', Math.max(1, Math.min(100, Math.round(limit)))],
+  ])
+  return ManagedRuntimeNoticesResponseSchema.parse(
+    await api.get(`/api/runtime/notices${query}`, options),
+  ).notices
+}
+
+export async function recordManagedRuntimeNoticeReceipt(
+  noticeId: string,
+  profileId: string,
+  state: ManagedRuntimeNoticeDeliveryState,
+  requestId = createManagedRuntimeRequestId(),
+): Promise<void> {
+  await api.post(`/api/runtime/notices/${encodeURIComponent(noticeId)}/receipt`, {
+    requestId,
+    profileId,
+    state,
+  })
+}
+
+export async function getManagedRuntimeMetricsSnapshot(
+  options: ApiRequestOptions = {},
+): Promise<ManagedRuntimeMetricsSnapshot> {
+  return ManagedRuntimeMetricsSnapshotSchema.parse(
+    await api.get('/api/runtime/metrics', options),
+  )
+}
+
+export async function planManagedRuntimeMigration(
+  requestedMode: ManagedRuntimeRolloutMode,
+  options: {
+    backupPath?: string
+    legacyMetadataPath?: string
+  } = {},
+): Promise<ManagedRuntimeMigrationPlan> {
+  return ManagedRuntimeMigrationPlanSchema.parse(
+    await api.post('/api/runtime/migration/plan', {
+      requestId: createManagedRuntimeRequestId(),
+      requestedMode,
+      backupPath: options.backupPath,
+      legacyMetadataPath: options.legacyMetadataPath,
+    }),
+  )
+}
+
+export async function applyManagedRuntimeMigration(
+  requestedMode: ManagedRuntimeRolloutMode,
+  options: {
+    backupPath?: string
+    legacyMetadataPath?: string
+  } = {},
+): Promise<ManagedRuntimeMigrationPlan> {
+  return ManagedRuntimeMigrationPlanSchema.parse(
+    await api.post('/api/runtime/migration/apply', {
+      requestId: createManagedRuntimeRequestId(),
+      requestedMode,
+      backupPath: options.backupPath,
+      legacyMetadataPath: options.legacyMetadataPath,
+    }),
+  )
+}
+
+export async function auditManagedRuntimeRepair(
+  apply = false,
+): Promise<ManagedRuntimeRepairAudit> {
+  return ManagedRuntimeRepairAuditSchema.parse(
+    await api.post('/api/runtime/repair', {
+      requestId: createManagedRuntimeRequestId(),
+      apply,
+    }),
   )
 }
 

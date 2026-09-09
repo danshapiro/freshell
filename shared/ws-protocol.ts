@@ -12,6 +12,7 @@ import type { ClientExtensionEntry } from './extension-types.js'
 import type { ServerSettings } from './settings.js'
 import { LiveTerminalHandleSchema, SessionRefSchema, type RestoreError } from './session-contract.js'
 import { CodexDurabilityRefSchema, type CodexDurabilityRef } from './codex-durability.js'
+import type { ManagedRuntimeInventoryChangedMessage, ManagedRuntimeViewChangedMessage } from './managed-runtime.js'
 
 // ──────────────────────────────────────────────────────────────
 // Shared enums and helpers
@@ -1639,3 +1640,5 @@ export type ServerMessage =
   | ExtensionServerReadyMessage
   | ExtensionServerErrorMessage
   | ExtensionServerStoppedMessage
+  | ManagedRuntimeInventoryChangedMessage
+  | ManagedRuntimeViewChangedMessage

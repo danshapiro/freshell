@@ -49,9 +49,38 @@ struct HostState {
     pty: Mutex<Option<HostedPty>>,
 }
 
-#[tokio::main]
-async fn main() {
-    let code = match run().await {
+/// A managed session host runs inside a CPU-capped container, so
+/// `available_parallelism()` routinely reports 1. A single-worker runtime
+/// makes the control plane share one thread with every workload task: any
+/// long synchronous step (a large output batch, a durable journal fsync, a
+/// provider store probe) stalls the supervisor's control connection, and the
+/// supervisor cannot tell that apart from a dead host. Keep a small floor so
+/// a control command — above all `Stop` — always has a worker available, and
+/// a ceiling so a host on a large machine does not spawn a pointless thread
+/// per core inside a half-CPU cgroup.
+pub(crate) const HOST_MIN_WORKER_THREADS: usize = 4;
+pub(crate) const HOST_MAX_WORKER_THREADS: usize = 8;
+
+pub(crate) fn host_worker_threads(available_parallelism: usize) -> usize {
+    available_parallelism.clamp(HOST_MIN_WORKER_THREADS, HOST_MAX_WORKER_THREADS)
+}
+
+fn main() {
+    let available = std::thread::available_parallelism()
+        .map(|value| value.get())
+        .unwrap_or(1);
+    let runtime = match tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(host_worker_threads(available))
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            eprintln!("{{\"event\":\"session_host.fatal\",\"error\":\"runtime: {error}\"}}");
+            std::process::exit(1);
+        }
+    };
+    let code = match runtime.block_on(run()) {
         Ok(()) => 0,
         Err(error) => {
             eprintln!(
@@ -97,8 +126,9 @@ async fn serve(args: &[String]) -> Result<(), String> {
         ..Default::default()
     };
     write_state(&state_dir, &persisted)?;
-    append_event(
+    append_event_with_secret(
         &state_dir,
+        &secret,
         "host.boot",
         serde_json::json!({"hostBootId":host_boot_id,"incarnationId":incarnation_id}),
     )?;
@@ -126,8 +156,9 @@ async fn serve(args: &[String]) -> Result<(), String> {
         let state = state.clone();
         tokio::spawn(async move {
             if let Err(error) = handle_connection(stream, state.clone()).await {
-                let _ = append_event(
+                let _ = append_event_with_secret(
                     &state.state_dir,
+                    &state.secret,
                     "host.connection_error",
                     serde_json::json!({"error":error}),
                 );
@@ -248,7 +279,7 @@ async fn dispatch(
                     if let Some(mut pty) = state.pty.lock().await.take() {
                         pty.stop().await;
                     }
-                    append_event(&state.state_dir, "host.stop_requested", serde_json::json!({"controlEpoch":control_epoch,"executionGeneration":execution_generation})).ok();
+                    append_event_with_secret(&state.state_dir, &state.secret, "host.stop_requested", serde_json::json!({"controlEpoch":control_epoch,"executionGeneration":execution_generation})).ok();
                     Ok(HostResult::Stopped)
                 }
                 HostCommand::SecurityProbe { incarnation_id } => {
@@ -388,6 +419,7 @@ async fn dispatch(
                             path: RecoveryPath::NativeResume,
                             reason: "no durable native identity or checkpoint is recorded".into(),
                             evidence: vec![state.state_dir.display().to_string()],
+                            store_state: freshell_runtime_protocol::EvidenceStoreState::Missing,
                         },
                     };
                     Ok(HostResult::RecoveryProbe(probe))
@@ -579,7 +611,7 @@ async fn grant_execution(
     persisted.worker_pid = Some(pid);
     persisted.fixture_evidence = evidence;
     write_state(&state.state_dir, &persisted).map_err(registry_like_error)?;
-    append_event(&state.state_dir, "host.grant_consumed", serde_json::json!({"grantId":grant_id,"workerPid":pid,"workerLaunchCount":persisted.worker_launch_count,"controlEpoch":control_epoch,"executionGeneration":execution_generation})).ok();
+    append_event_with_secret(&state.state_dir, &state.secret, "host.grant_consumed", serde_json::json!({"grantId":grant_id,"workerPid":pid,"workerLaunchCount":persisted.worker_launch_count,"controlEpoch":control_epoch,"executionGeneration":execution_generation})).ok();
 
     Ok(HostResult::GrantAccepted {
         host_boot_id: state.host_boot_id.clone(),
@@ -1295,21 +1327,36 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), String> {
     Ok(())
 }
 
-fn append_event(state_dir: &Path, event: &str, data: serde_json::Value) -> Result<(), String> {
+pub(crate) fn append_event(
+    state_dir: &Path,
+    event: &str,
+    data: serde_json::Value,
+) -> Result<(), String> {
+    append_event_with_secret(state_dir, b"", event, data)
+}
+
+fn append_event_with_secret(
+    state_dir: &Path,
+    process_secret: &[u8],
+    event: &str,
+    data: serde_json::Value,
+) -> Result<(), String> {
     let path = state_dir.join("host-lifecycle.jsonl");
-    let line =
-        serde_json::to_vec(&serde_json::json!({"at":now_millis(),"event":event,"data":data}))
-            .map_err(|e| e.to_string())?;
-    use std::io::Write;
-    let mut file = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
-        .map_err(|e| e.to_string())?;
-    file.write_all(&line)
-        .and_then(|_| file.write_all(b"\n"))
-        .map_err(|e| e.to_string())?;
-    file.sync_data().map_err(|e| e.to_string())
+    let writer = freshell_runtime_observability::RotatingJsonlWriter::create(
+        path,
+        2 * 1024 * 1024,
+        2,
+        String::from_utf8_lossy(process_secret).into_owned(),
+    )
+    .map_err(|error| error.to_string())?;
+    writer
+        .write_json(&serde_json::json!({
+            "at": now_millis(),
+            "event": event,
+            "data": data,
+        }))
+        .and_then(|_| writer.sync_all())
+        .map_err(|error| error.to_string())
 }
 
 fn optional_arg(args: &[String], key: &str) -> Option<String> {
@@ -1344,6 +1391,23 @@ fn now_millis() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The control plane must keep a worker even inside a half-CPU cgroup
+    /// where `available_parallelism()` reports 1. Without the floor, one
+    /// long synchronous workload step wedges the supervisor's Stop command
+    /// and the host looks dead when it is merely busy.
+    #[test]
+    fn the_session_host_runtime_keeps_a_worker_floor_for_control_commands() {
+        assert_eq!(host_worker_threads(1), HOST_MIN_WORKER_THREADS);
+        assert_eq!(host_worker_threads(2), HOST_MIN_WORKER_THREADS);
+        assert_eq!(
+            host_worker_threads(HOST_MIN_WORKER_THREADS),
+            HOST_MIN_WORKER_THREADS
+        );
+        assert_eq!(host_worker_threads(6), 6);
+        assert_eq!(host_worker_threads(256), HOST_MAX_WORKER_THREADS);
+        assert!(HOST_MIN_WORKER_THREADS >= 2, "one worker is never enough");
+    }
 
     #[test]
     fn effective_limits_fall_back_when_host_is_unbounded() {

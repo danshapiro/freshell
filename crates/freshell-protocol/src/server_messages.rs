@@ -92,6 +92,15 @@ pub enum ServerMessage {
     Pong(Pong),
     #[serde(rename = "ready")]
     Ready(Ready),
+    // Durable-souls managed runtime (Phase 4): the web projection's two
+    // server-authoritative edges. `runtime.inventory.changed` fires once per
+    // reconciled supervisor inventory revision; `runtime.view.changed` fires
+    // once per applied view-projection event. Emitted by
+    // `crates/freshell-server/src/managed_runtime_api.rs`.
+    #[serde(rename = "runtime.inventory.changed")]
+    RuntimeInventoryChanged(RuntimeInventoryChanged),
+    #[serde(rename = "runtime.view.changed")]
+    RuntimeViewChanged(RuntimeViewChanged),
     #[serde(rename = "session.repair.activity")]
     SessionRepairActivity(SessionRepairActivity),
     #[serde(rename = "session.status")]
@@ -174,7 +183,7 @@ pub enum ServerMessage {
 
 /// The exact `type` discriminants of every server→client message, in the frozen
 /// inventory's order. This is the T0 conformance checklist.
-pub const SERVER_MESSAGE_TYPES: [&str; 64] = [
+pub const SERVER_MESSAGE_TYPES: [&str; 66] = [
     "amplifier.activity.list.response",
     "amplifier.activity.updated",
     "claude.activity.list.response",
@@ -211,6 +220,8 @@ pub const SERVER_MESSAGE_TYPES: [&str; 64] = [
     "perf.logging",
     "pong",
     "ready",
+    "runtime.inventory.changed",
+    "runtime.view.changed",
     "session.repair.activity",
     "session.status",
     "sessions.changed",
@@ -240,6 +251,93 @@ pub const SERVER_MESSAGE_TYPES: [&str; 64] = [
     "terminals.changed",
     "ui.command",
 ];
+
+/// Supervisor startup-scan readiness carried by
+/// [`ServerMessage::RuntimeInventoryChanged`]. Mirrors
+/// `ManagedRuntimeInitialScanStateSchema` in `shared/managed-runtime.ts`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ManagedRuntimeInitialScanState {
+    Pending,
+    Scanning,
+    Complete,
+    Blocked,
+}
+
+/// How a view intent came to exist. `automatic_primary` is the one view the
+/// supervisor mints for a soul that has none; `explicit` is operator-created.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ManagedRuntimeViewKind {
+    AutomaticPrimary,
+    Explicit,
+}
+
+/// Whether a view intent is currently rendered, detached, or suppressed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ManagedRuntimeViewVisibility {
+    Visible,
+    Detached,
+    Hidden,
+}
+
+/// Startup-scan readiness for the managed runtime inventory. Mirrors
+/// `ManagedRuntimeReadinessSchema`; the four optional fields are absent (not
+/// null) before the scan reaches the corresponding milestone.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ManagedRuntimeReadiness {
+    pub inventory_revision: u64,
+    pub initial_scan_state: ManagedRuntimeInitialScanState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub initial_scan_started_at: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub initial_scan_finished_at: Option<i64>,
+    pub blocked_subsystems: Vec<String>,
+    pub startup_recovery_concurrency_limit: u64,
+    pub startup_recovery_peak: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub initial_scan_duration_ms: Option<u64>,
+}
+
+/// One durable view intent. Mirrors `ManagedRuntimeViewIntentSchema`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ManagedRuntimeViewIntent {
+    pub view_id: String,
+    pub soul_id: String,
+    pub owner_id: String,
+    pub workspace_id: String,
+    pub kind: ManagedRuntimeViewKind,
+    pub preferred_tab_id: String,
+    pub preferred_pane_id: String,
+    pub title: String,
+    pub placement_group: String,
+    pub visibility: ManagedRuntimeViewVisibility,
+    pub revision: u64,
+    pub soul_intent_revision: u64,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+/// The supervisor inventory advanced to a new reconciled revision.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RuntimeInventoryChanged {
+    pub revision: u64,
+    pub readiness: ManagedRuntimeReadiness,
+}
+
+/// A single view-projection event was applied. `eventId` is the supervisor
+/// outbox id the web projection acknowledges, so the edge stays replay-safe.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RuntimeViewChanged {
+    pub inventory_revision: u64,
+    pub event_id: String,
+    pub view: ManagedRuntimeViewIntent,
+}
 
 /// Extension server→client discriminants declared BEYOND the generated
 /// inventory (`port/contract/ws-message-inventory.json`). Since the

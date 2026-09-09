@@ -9,6 +9,7 @@ publish.workspace = true
 freshell-agent-runtime = { path = "../freshell-agent-runtime" }
 freshell-codex = { path = "../freshell-codex", features = ["real-transport"] }
 freshell-runtime-protocol = { path = "../freshell-runtime-protocol" }
+freshell-runtime-observability = { path = "../freshell-runtime-observability" }
 freshell-terminal = { path = "../freshell-terminal" }
 freshell-platform = { path = "../freshell-platform" }
 freshell-protocol = { path = "../freshell-protocol" }

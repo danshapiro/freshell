@@ -48,12 +48,12 @@ fn server_types_match_inventory_exactly() {
     let inv = inventory();
     assert_eq!(
         inv["serverToClient"]["count"].as_u64(),
-        Some(64),
-        "inventory declares 64 server→client types"
+        Some(66),
+        "inventory declares 66 server→client types"
     );
     let expected = json_type_set(&inv["serverToClient"]["types"]);
     let actual: BTreeSet<String> = SERVER_MESSAGE_TYPES.iter().map(|s| s.to_string()).collect();
-    assert_eq!(actual.len(), 64, "crate declares 64 server types (no dups)");
+    assert_eq!(actual.len(), 66, "crate declares 66 server types (no dups)");
     assert_eq!(
         actual, expected,
         "SERVER_MESSAGE_TYPES must equal the frozen inventory (no missing/extra)"
@@ -61,14 +61,14 @@ fn server_types_match_inventory_exactly() {
 }
 
 #[test]
-fn combined_surface_is_104() {
+fn combined_surface_is_106() {
     let all = all_message_types();
-    assert_eq!(all.len(), 104, "40 client + 64 server = 104 discriminants");
+    assert_eq!(all.len(), 106, "40 client + 66 server = 106 discriminants");
     // sorted + unique
     let unique: BTreeSet<&str> = all.iter().copied().collect();
     assert_eq!(
         unique.len(),
-        104,
+        106,
         "no discriminant collides across directions"
     );
 }
@@ -227,4 +227,60 @@ fn terminal_kill_accepts_and_carries_the_optional_correlation_fields() {
     };
     assert_eq!(k.request_id.as_deref(), Some("r1"));
     assert_eq!(k.create_request_id.as_deref(), Some("cr1"));
+}
+
+/// Durable souls Phase 4: the two managed-runtime web-projection edges are
+/// emitted by `crates/freshell-server/src/managed_runtime_api.rs` as raw
+/// `json!` values, so the typed surface has to represent that exact shape or
+/// the frame is a FIDELITY GAP. These payloads are copied from the emit sites.
+#[test]
+fn runtime_inventory_changed_roundtrips_camel_case() {
+    let json = r#"{"type":"runtime.inventory.changed","revision":7,"readiness":{"inventoryRevision":7,"initialScanState":"complete","initialScanStartedAt":1788923659806,"initialScanFinishedAt":1788923659832,"blockedSubsystems":[],"startupRecoveryConcurrencyLimit":4,"startupRecoveryPeak":0,"initialScanDurationMs":26}}"#;
+    let msg: freshell_protocol::ServerMessage = serde_json::from_str(json).expect("parse");
+    let v: serde_json::Value = serde_json::to_value(&msg).expect("serialize");
+    assert_eq!(v["type"], "runtime.inventory.changed");
+    assert_eq!(v["revision"], 7);
+    assert_eq!(v["readiness"]["initialScanState"], "complete");
+    assert_eq!(v["readiness"]["startupRecoveryConcurrencyLimit"], 4);
+    assert_eq!(v["readiness"]["blockedSubsystems"], serde_json::json!([]));
+
+    // Pre-scan readiness omits the four optional milestones entirely; the
+    // strict Zod schema on the client rejects explicit nulls, so they must
+    // stay absent rather than serialize as null.
+    let pending: freshell_protocol::ServerMessage = serde_json::from_str(
+        r#"{"type":"runtime.inventory.changed","revision":0,"readiness":{"inventoryRevision":0,"initialScanState":"pending","blockedSubsystems":["docker"],"startupRecoveryConcurrencyLimit":4,"startupRecoveryPeak":0}}"#,
+    )
+    .expect("parse pre-scan shape");
+    let v: serde_json::Value = serde_json::to_value(&pending).unwrap();
+    let readiness = v["readiness"].as_object().expect("readiness object");
+    for absent in [
+        "initialScanStartedAt",
+        "initialScanFinishedAt",
+        "initialScanDurationMs",
+    ] {
+        assert!(
+            !readiness.contains_key(absent),
+            "{absent} must be absent, not null, before the scan reaches it"
+        );
+    }
+    assert_eq!(v["readiness"]["blockedSubsystems"][0], "docker");
+}
+
+#[test]
+fn runtime_view_changed_roundtrips_camel_case() {
+    let json = r#"{"type":"runtime.view.changed","inventoryRevision":12,"eventId":"evt-9","view":{"viewId":"view-1","soulId":"soul-1","ownerId":"owner-1","workspaceId":"ws-1","kind":"automatic_primary","preferredTabId":"tab-1","preferredPaneId":"pane-1","title":"opencode","placementGroup":"group-1","visibility":"visible","revision":3,"soulIntentRevision":2,"createdAt":1788923659806,"updatedAt":1788923659832}}"#;
+    let msg: freshell_protocol::ServerMessage = serde_json::from_str(json).expect("parse");
+    let back = serde_json::to_string(&msg).expect("serialize");
+    let v: serde_json::Value = serde_json::from_str(&back).unwrap();
+    assert_eq!(v["type"], "runtime.view.changed");
+    assert_eq!(v["inventoryRevision"], 12);
+    assert_eq!(v["eventId"], "evt-9");
+    assert_eq!(v["view"]["kind"], "automatic_primary");
+    assert_eq!(v["view"]["visibility"], "visible");
+    assert_eq!(v["view"]["preferredPaneId"], "pane-1");
+    // The whole frame must survive a full roundtrip byte-for-byte in value
+    // terms: the projection acknowledges by eventId, so any dropped field
+    // would silently un-ack a durable outbox row.
+    let original: serde_json::Value = serde_json::from_str(json).unwrap();
+    assert_eq!(v, original);
 }

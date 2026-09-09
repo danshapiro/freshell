@@ -1,0 +1,251 @@
+import { configureStore } from '@reduxjs/toolkit'
+import { describe, expect, it } from 'vitest'
+import tabsReducer from '@/store/tabsSlice'
+import panesReducer from '@/store/panesSlice'
+import managedRuntimeReducer from '@/store/managedRuntimeSlice'
+import {
+  applyManagedRuntimeMergePlan,
+  buildManagedRuntimeMergePlan,
+} from '@/lib/recovery/managed-runtime-recovery'
+import type {
+  ManagedRuntimeInventorySnapshot,
+  ManagedRuntimeSoul,
+  ManagedRuntimeViewIntent,
+} from '@shared/managed-runtime'
+
+function soul(overrides: Partial<ManagedRuntimeSoul> = {}): ManagedRuntimeSoul {
+  return {
+    soulId: 'soul-one',
+    incarnationId: 'incarnation-one',
+    launchState: 'running',
+    cleanupState: 'none',
+    intentRevision: 3,
+    executionGeneration: 1,
+    effectiveLimits: { cpuMilli: 500, memoryBytes: 134_217_728, swapBytes: 0, pidsMax: 64 },
+    configuredLimits: { cpuMilli: 500, memoryBytes: 134_217_728, swapBytes: 0, pidsMax: 64 },
+    terminalId: 'terminal-one',
+    terminalStreamId: 'stream-one',
+    terminalMode: 'opencode',
+    terminalCwd: '/workspace',
+    terminalCreateRequestId: 'create-one',
+    terminalResumeSessionId: 'ses_one',
+    projectKey: 'workspace-one',
+    profile: 'default_agent',
+    desiredState: 'running',
+    recoveryState: 'live',
+    durabilityState: 'resume_captured',
+    allocationState: 'verified_durable',
+    provider: 'opencode',
+    nativeSessionId: 'ses_one',
+    evidenceRevision: 2,
+    successfulRecoveriesInWindow: 1,
+    ...overrides,
+  }
+}
+
+function view(overrides: Partial<ManagedRuntimeViewIntent> = {}): ManagedRuntimeViewIntent {
+  return {
+    viewId: 'view-one',
+    soulId: 'soul-one',
+    ownerId: 'installation-one',
+    workspaceId: 'workspace-one',
+    kind: 'automatic_primary',
+    preferredTabId: 'tab-recovered-one',
+    preferredPaneId: 'pane-recovered-one',
+    title: 'Recovered OpenCode agent',
+    placementGroup: 'Recovered agents',
+    visibility: 'visible',
+    revision: 2,
+    soulIntentRevision: 3,
+    createdAt: 1,
+    updatedAt: 2,
+    ...overrides,
+  }
+}
+
+function snapshot(
+  souls: ManagedRuntimeSoul[] = [soul()],
+  viewIntents: ManagedRuntimeViewIntent[] = [view()],
+): ManagedRuntimeInventorySnapshot {
+  return {
+    revision: 9,
+    readiness: {
+      inventoryRevision: 9,
+      initialScanState: 'complete',
+      initialScanStartedAt: 1,
+      initialScanFinishedAt: 4,
+      blockedSubsystems: [],
+      startupRecoveryConcurrencyLimit: 4,
+      startupRecoveryPeak: 2,
+      initialScanDurationMs: 3,
+    },
+    souls,
+    viewIntents,
+    pendingProjectionCount: 0,
+  }
+}
+
+function baseState() {
+  return {
+    tabs: {
+      tabs: [{
+        id: 'user-tab',
+        createRequestId: 'user-tab',
+        title: 'My layout',
+        status: 'running',
+        mode: 'shell',
+        shell: 'system',
+        createdAt: 1,
+        updatedAt: 1,
+      }],
+      activeTabId: 'user-tab',
+      renameRequestTabId: null,
+      tombstones: [],
+    },
+    panes: {
+      layouts: {
+        'user-tab': {
+          type: 'leaf',
+          id: 'user-pane',
+          content: {
+            kind: 'terminal',
+            createRequestId: 'user-pane',
+            status: 'running',
+            mode: 'shell',
+            shell: 'system',
+          },
+        },
+      },
+      activePane: { 'user-tab': 'user-pane' },
+      paneTitles: { 'user-tab': { 'user-pane': 'Shell' } },
+      paneTitleSetByUser: {},
+      renameRequestTabId: null,
+      renameRequestPaneId: null,
+      zoomedPane: {},
+      closingTabs: {},
+      closingPanes: {},
+      refreshRequests: {},
+      restoreFallbackAttemptsByPane: {},
+      deadSessionAdjudication: [],
+      reconcilePendingPanes: {},
+    },
+    managedRuntime: {
+      available: true,
+      status: 'idle',
+      revision: 0,
+      souls: [],
+      viewIntents: [],
+      pendingProjectionCount: 0,
+      reconstructedViewCount: 0,
+    },
+  } as any
+}
+
+function storeWithState(state = baseState()) {
+  return configureStore({
+    reducer: {
+      tabs: tabsReducer,
+      panes: panesReducer,
+      managedRuntime: managedRuntimeReducer,
+    },
+    preloadedState: state,
+  })
+}
+
+describe('managed runtime recovery merge', () => {
+  it('adds a missing recovered view without replacing layout or stealing focus', () => {
+    const store = storeWithState()
+    const plan = buildManagedRuntimeMergePlan(snapshot(), store.getState() as any)
+    expect(plan.creates).toHaveLength(1)
+    expect(plan.updates).toHaveLength(0)
+
+    applyManagedRuntimeMergePlan(store as any, plan)
+    const state = store.getState()
+    expect(state.tabs.activeTabId).toBe('user-tab')
+    expect(state.panes.layouts['user-tab']).toEqual(baseState().panes.layouts['user-tab'])
+    expect(state.tabs.tabs.map((tab) => tab.id)).toEqual(['user-tab', 'tab-recovered-one'])
+    const recovered = state.panes.layouts['tab-recovered-one']
+    expect(recovered.type).toBe('leaf')
+    if (recovered.type !== 'leaf') throw new Error('expected recovered leaf')
+    expect(recovered.id).toBe('pane-recovered-one')
+    expect(recovered.content).toMatchObject({
+      kind: 'terminal',
+      terminalId: 'terminal-one',
+      soulId: 'soul-one',
+      viewIntentId: 'view-one',
+      sessionRef: { provider: 'opencode', sessionId: 'ses_one' },
+    })
+
+    const replay = buildManagedRuntimeMergePlan(snapshot(), state as any)
+    expect(replay.creates).toHaveLength(0)
+    expect(replay.updates).toHaveLength(1)
+  })
+
+  it('adopts a matching saved session pane in place', () => {
+    const state = baseState()
+    state.tabs.tabs[0].mode = 'opencode'
+    state.panes.layouts['user-tab'].content = {
+      kind: 'terminal',
+      createRequestId: 'old-create',
+      status: 'creating',
+      mode: 'opencode',
+      shell: 'system',
+      sessionRef: { provider: 'opencode', sessionId: 'ses_one' },
+    }
+    const plan = buildManagedRuntimeMergePlan(snapshot(), state)
+    expect(plan.creates).toHaveLength(0)
+    expect(plan.updates).toHaveLength(1)
+    expect(plan.updates[0]).toMatchObject({ tabId: 'user-tab', paneId: 'user-pane' })
+    expect(plan.updates[0].content).toMatchObject({
+      terminalId: 'terminal-one',
+      soulId: 'soul-one',
+      status: 'running',
+    })
+  })
+
+  it('keeps two explicit views over one soul as two deterministic panes', () => {
+    const state = baseState()
+    const views = [
+      view({
+        viewId: 'view-explicit-a',
+        kind: 'explicit',
+        preferredTabId: 'tab-explicit-a',
+        preferredPaneId: 'pane-explicit-a',
+      }),
+      view({
+        viewId: 'view-explicit-b',
+        kind: 'explicit',
+        preferredTabId: 'tab-explicit-b',
+        preferredPaneId: 'pane-explicit-b',
+      }),
+    ]
+    const plan = buildManagedRuntimeMergePlan(snapshot([soul()], views), state)
+    expect(plan.creates.map((entry) => entry.tabId)).toEqual([
+      'tab-explicit-a',
+      'tab-explicit-b',
+    ])
+    expect(plan.creates.every((entry) => entry.content.soulId === 'soul-one')).toBe(true)
+    expect(new Set(plan.creates.map((entry) => entry.content.terminalId))).toEqual(
+      new Set(['terminal-one']),
+    )
+  })
+
+  it('projects blocked recovery honestly instead of substituting a fresh session', () => {
+    const blocked = soul({
+      launchState: 'stopped',
+      recoveryState: 'blocked',
+      recoveryReason: 'CREDENTIALS_EXPIRED',
+      containerId: undefined,
+    })
+    const plan = buildManagedRuntimeMergePlan(snapshot([blocked]), baseState())
+    expect(plan.creates[0].content).toMatchObject({
+      status: 'recovering',
+      soulId: 'soul-one',
+      sessionRef: { provider: 'opencode', sessionId: 'ses_one' },
+      recoverySummary: {
+        recoveryState: 'blocked',
+        reason: 'CREDENTIALS_EXPIRED',
+      },
+    })
+  })
+})

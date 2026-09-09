@@ -6,6 +6,7 @@ import App from '@/App'
 import settingsReducer, { defaultSettings } from '@/store/settingsSlice'
 import tabsReducer from '@/store/tabsSlice'
 import connectionReducer, { setLiveTerminalIds } from '@/store/connectionSlice'
+import managedRuntimeReducer from '@/store/managedRuntimeSlice'
 import sessionsReducer from '@/store/sessionsSlice'
 import panesReducer, { applyReconcileAttach, clearDeadTerminals, setDeadSessionAdjudication } from '@/store/panesSlice'
 import { isFreshAgentReconcileActive, setFreshAgentReconcileActive } from '@/lib/pane-reconcile'
@@ -225,6 +226,7 @@ function createStore() {
       settings: settingsReducer,
       tabs: tabsReducer,
       connection: connectionReducer,
+      managedRuntime: managedRuntimeReducer,
       sessions: sessionsReducer,
       panes: panesReducer,
       network: networkReducer,

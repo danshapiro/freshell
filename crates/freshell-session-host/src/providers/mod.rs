@@ -114,13 +114,16 @@ pub async fn probe_resume(
                 resume_spec: Box::new(resume_spec),
             }
         }
-        Ok(ProviderStoreProbe::DefinitivelyUnavailable { reason, evidence }) => {
-            RecoveryProbe::DefinitivelyUnavailable {
-                path: RecoveryPath::NativeResume,
-                reason,
-                evidence,
-            }
-        }
+        Ok(ProviderStoreProbe::DefinitivelyUnavailable {
+            reason,
+            evidence,
+            store_state,
+        }) => RecoveryProbe::DefinitivelyUnavailable {
+            path: RecoveryPath::NativeResume,
+            reason,
+            evidence,
+            store_state,
+        },
         Ok(ProviderStoreProbe::Blocked {
             reason,
             retry_hint,

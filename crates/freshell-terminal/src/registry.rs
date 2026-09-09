@@ -391,6 +391,8 @@ pub struct ManagedTerminalLaunch {
     pub provider_model: Option<String>,
     pub provider_sandbox: Option<String>,
     pub provider_permission_mode: Option<String>,
+    pub view_tab_id: Option<String>,
+    pub view_pane_id: Option<String>,
     pub create_request_id: Option<String>,
 }
 
@@ -2151,6 +2153,36 @@ impl TerminalRegistry {
 
     pub fn is_managed(&self, terminal_id: &str) -> bool {
         self.managed_descriptor(terminal_id).is_some()
+    }
+
+    /// The live managed facade that owns this exact provider identity, if any.
+    ///
+    /// A managed soul's provider state lives inside its own runtime volume,
+    /// so the web server's host-local session index cannot adjudicate it. Pane
+    /// reconciliation consults this first: the supervisor-owned row is the
+    /// authority for its own identity, whatever a stale disk index believes.
+    /// Only Running rows answer — a stopped facade owns nothing.
+    pub fn live_managed_owner_for_session(
+        &self,
+        provider: &str,
+        session_id: &str,
+    ) -> Option<ManagedTerminalDescriptor> {
+        let inner = self.inner.lock().expect("registry lock");
+        inner.terminals.values().find_map(|handle| {
+            let descriptor = handle.managed.as_ref()?;
+            if descriptor.mode != provider {
+                return None;
+            }
+            if descriptor.resume_session_id.as_deref() != Some(session_id) {
+                return None;
+            }
+            let running = handle
+                .shared
+                .lock()
+                .ok()
+                .is_some_and(|shared| shared.status == TerminalRunStatus::Running);
+            running.then(|| descriptor.clone())
+        })
     }
 
     /// Register the browser-facing facade for a supervisor-owned PTY. This row

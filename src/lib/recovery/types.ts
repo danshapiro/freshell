@@ -103,10 +103,30 @@ export interface LedgerOnlyEntry {
   permissionMode?: string
 }
 
+
+export interface ManagedRuntimeRecoveryLink {
+  available: boolean
+  authoritativeEndpoint: string
+  revision?: number
+  readiness?: {
+    inventoryRevision: number
+    initialScanState: 'pending' | 'scanning' | 'complete' | 'blocked'
+    initialScanStartedAt?: number
+    initialScanFinishedAt?: number
+    blockedSubsystems: string[]
+    startupRecoveryConcurrencyLimit: number
+    startupRecoveryPeak: number
+    initialScanDurationMs?: number
+  }
+  error?: string
+}
+
 export interface RecoveryInventory {
   recoverable: boolean
   contentId: string
   device: RecoveryDevice | null
   otherDevices: RecoveryOtherDevice[]
   ledgerOnly: LedgerOnlyEntry[]
+  /** Phase 4 link to the supervisor-authoritative managed runtime inventory. */
+  managedRuntime?: ManagedRuntimeRecoveryLink
 }

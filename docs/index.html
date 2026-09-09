@@ -701,6 +701,16 @@ body { background: hsl(var(--background)); color: hsl(var(--foreground)); transi
           <span class="tab-label">Fresh Agent</span>
           <span class="tab-close"><i data-lucide="x" class="icon-xs"></i></span>
         </div>
+        <!-- Durable Souls: agents the supervisor recovered before any browser
+             connected arrive in a Recovered agents group. They appear without
+             stealing focus; closing a view is not stopping the agent. -->
+        <div class="tab" data-tab="recovered">
+          <span class="tab-icons">
+            <i data-lucide="life-buoy" class="icon-xs"></i>
+          </span>
+          <span class="tab-label">Recovered agents</span>
+          <span class="tab-close"><i data-lucide="x" class="icon-xs"></i></span>
+        </div>
         <!-- Arrow buttons (< >) appear at edges when tabs overflow. Not shown in this mock since tabs fit. -->
         <div class="tab-add" title="New shell tab"><i data-lucide="plus" class="icon"></i></div>
       </div>
@@ -710,6 +720,16 @@ body { background: hsl(var(--background)); color: hsl(var(--foreground)); transi
           <div class="pane" style="flex:.48">
             <div class="pane-header active"><i data-lucide="terminal" class="icon"></i><span class="pane-header-title">Terminal — zsh</span><span class="pane-header-meta">~/code/freshell</span><div class="pane-btns"><span class="pane-btn"><i data-lucide="maximize-2" class="icon-xs"></i></span><span class="pane-btn"><i data-lucide="x" class="icon-xs"></i></span></div></div>
             <div class="terminal-inline-status">Codex reconnecting... typed input is buffered until ready.</div>
+            <!-- Durable Souls: managed agents report an honest recovery state
+                 (Reconnecting / Restarting agent / Recovery blocked / Ready /
+                 Stopped) with Retry and Stop agent as separate actions. A
+                 blocked or recovering agent is never replaced by a blank
+                 fresh session. -->
+            <div class="terminal-inline-status">Restarting agent — resuming the same OpenCode session (2 recovered).</div>
+            <!-- Durable Souls: one brief, truthful notice per profile when a
+                 soul is genuinely unrecoverable. The ended pane keeps its
+                 history and links to the durable incident. -->
+            <div class="terminal-inline-status">Agent ended without a running process. Cleanup verified. View incident · Dismiss</div>
             <div class="terminal" id="term-welcome"></div>
           </div>
           <div class="divider-v"><div class="dots"><span></span><span></span><span></span></div></div>
@@ -774,6 +794,25 @@ body { background: hsl(var(--background)); color: hsl(var(--foreground)); transi
       </div>
 
       <!-- Claude Code -->
+      <!-- Durable Souls: agents the supervisor recovered before any browser
+           connected. Each keeps its exact conversation; a blocked one stays
+           visible and honest instead of becoming a blank fresh session. -->
+      <div class="tab-panel" id="panel-recovered">
+        <div class="split-h">
+          <div class="pane" style="flex:.5">
+            <div class="pane-header active"><i data-lucide="terminal" class="icon"></i><span class="pane-header-title">OpenCode — recovered</span><span class="pane-header-meta">~/code/freshell</span><div class="pane-btns"><span class="pane-btn"><i data-lucide="maximize-2" class="icon-xs"></i></span><span class="pane-btn"><i data-lucide="x" class="icon-xs"></i></span></div></div>
+            <div class="terminal-inline-status">Ready — resumed the same session after a server restart.</div>
+            <div class="terminal" id="term-recovered"></div>
+          </div>
+          <div class="divider-v"><div class="dots"><span></span><span></span><span></span></div></div>
+          <div class="pane" style="flex:.5">
+            <div class="pane-header inactive"><i data-lucide="terminal" class="icon"></i><span class="pane-header-title">OpenCode — blocked</span><span class="pane-header-meta">~/code/other-project</span><div class="pane-btns"><span class="pane-btn"><i data-lucide="maximize-2" class="icon-xs"></i></span><span class="pane-btn"><i data-lucide="x" class="icon-xs"></i></span></div></div>
+            <div class="terminal-inline-status">Recovery blocked: provider credentials expired. Retry · Stop agent</div>
+            <div class="terminal" id="term-recovered-blocked"></div>
+          </div>
+        </div>
+      </div>
+
       <div class="tab-panel" id="panel-claude">
         <div class="pane">
           <div class="pane-header active"><i data-lucide="terminal" class="icon"></i><span class="pane-header-title">Terminal — Claude Code</span><span class="pane-header-meta">~/code/freshell</span><div class="pane-btns"><span class="pane-btn"><i data-lucide="maximize-2" class="icon-xs"></i></span><span class="pane-btn"><i data-lucide="x" class="icon-xs"></i></span></div></div>

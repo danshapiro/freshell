@@ -4,6 +4,7 @@
   "providers": [
     {
       "provider": "shell",
+      "certificationState": "certified",
       "managedEnabled": true,
       "durableRecoveryEnabled": false,
       "managedModes": [
@@ -17,12 +18,18 @@
       "checkpointPolicy": "none",
       "bootstrap": "none",
       "liveGate": "deterministic-shell",
-      "blockedReason": null
+      "blockedReason": null,
+      "recoveryPaths": [
+        "reattach",
+        "pristine_seed"
+      ],
+      "qualificationStatus": "deterministic-qualified-non-durable"
     },
     {
       "provider": "claude",
-      "managedEnabled": true,
-      "durableRecoveryEnabled": true,
+      "certificationState": "pending_live_provider_certification",
+      "managedEnabled": false,
+      "durableRecoveryEnabled": false,
       "managedModes": [
         "claude"
       ],
@@ -34,10 +41,18 @@
       "checkpointPolicy": "provider-transcript-only",
       "bootstrap": ".claude/.credentials.json copied before privilege drop",
       "liveGate": "haiku-lowest-reasoning",
-      "blockedReason": null
+      "blockedReason": "PENDING_LIVE_QUALIFICATION",
+      "recoveryPaths": [
+        "reattach",
+        "native_resume",
+        "checkpoint_restore",
+        "pristine_seed"
+      ],
+      "qualificationStatus": "adapter-ready-live-gate-pending"
     },
     {
       "provider": "opencode",
+      "certificationState": "certified",
       "managedEnabled": true,
       "durableRecoveryEnabled": true,
       "managedModes": [
@@ -51,12 +66,20 @@
       "checkpointPolicy": "provider-sqlite-only-no-live-copy",
       "bootstrap": ".local/share/opencode/auth.json copied before privilege drop",
       "liveGate": "opencode-1.18.21-big-pickle-free-tier",
-      "blockedReason": null
+      "blockedReason": null,
+      "recoveryPaths": [
+        "reattach",
+        "native_resume",
+        "checkpoint_restore",
+        "pristine_seed"
+      ],
+      "qualificationStatus": "live-qualified-release-enabled"
     },
     {
       "provider": "codex",
-      "managedEnabled": true,
-      "durableRecoveryEnabled": true,
+      "certificationState": "pending_live_provider_certification",
+      "managedEnabled": false,
+      "durableRecoveryEnabled": false,
       "managedModes": [
         "codex"
       ],
@@ -68,12 +91,20 @@
       "checkpointPolicy": "provider-rollout-only",
       "bootstrap": ".codex/auth.json copied before privilege drop",
       "liveGate": "gpt-5.6-luna-lowest-reasoning",
-      "blockedReason": null
+      "blockedReason": "PENDING_LIVE_QUALIFICATION",
+      "recoveryPaths": [
+        "reattach",
+        "native_resume",
+        "checkpoint_restore",
+        "pristine_seed"
+      ],
+      "qualificationStatus": "adapter-ready-live-gate-pending"
     },
     {
       "provider": "amplifier",
-      "managedEnabled": true,
-      "durableRecoveryEnabled": true,
+      "certificationState": "pending_live_provider_certification",
+      "managedEnabled": false,
+      "durableRecoveryEnabled": false,
       "managedModes": [
         "amplifier"
       ],
@@ -85,10 +116,18 @@
       "checkpointPolicy": "provider-session-directory",
       "bootstrap": ".amplifier/settings.yaml copied before privilege drop",
       "liveGate": "provider-approved-lowest-cost-model",
-      "blockedReason": null
+      "blockedReason": "PENDING_LIVE_QUALIFICATION",
+      "recoveryPaths": [
+        "reattach",
+        "native_resume",
+        "checkpoint_restore",
+        "pristine_seed"
+      ],
+      "qualificationStatus": "adapter-ready-live-gate-pending"
     },
     {
       "provider": "gemini",
+      "certificationState": "not_applicable",
       "managedEnabled": false,
       "durableRecoveryEnabled": false,
       "managedModes": [
@@ -102,10 +141,13 @@
       "checkpointPolicy": "none",
       "bootstrap": "extension-owned",
       "liveGate": "not-enabled",
-      "blockedReason": "BLOCKED_RECOVERY_IMPLEMENTATION"
+      "blockedReason": "BLOCKED_RECOVERY_IMPLEMENTATION",
+      "recoveryPaths": [],
+      "qualificationStatus": "not-enabled"
     },
     {
       "provider": "kimi",
+      "certificationState": "not_applicable",
       "managedEnabled": false,
       "durableRecoveryEnabled": false,
       "managedModes": [
@@ -119,7 +161,9 @@
       "checkpointPolicy": "none",
       "bootstrap": "extension-owned",
       "liveGate": "not-enabled",
-      "blockedReason": "BLOCKED_RECOVERY_IMPLEMENTATION"
+      "blockedReason": "BLOCKED_RECOVERY_IMPLEMENTATION",
+      "recoveryPaths": [],
+      "qualificationStatus": "not-enabled"
     }
   ],
   "doorways": [
@@ -128,13 +172,21 @@
       "name": "websocket-terminal-create-attach",
       "providers": [
         "shell",
-        "claude",
-        "codex",
-        "opencode",
-        "amplifier"
+        "opencode"
       ],
       "policy": "managed",
       "identityRule": "allocate-or-capture-one-exact-native-id"
+    },
+    {
+      "id": "deferred-managed-provider-create",
+      "name": "deferred-managed-providers",
+      "providers": [
+        "claude",
+        "codex",
+        "amplifier"
+      ],
+      "policy": "legacy",
+      "identityRule": "PENDING_LIVE_QUALIFICATION_NO_MANAGED_OWNERSHIP_CLAIM"
     },
     {
       "id": "rest-freshclaude-create",
@@ -171,10 +223,7 @@
       "name": "startup-reconcile-and-exit-observer",
       "providers": [
         "shell",
-        "claude",
-        "codex",
-        "opencode",
-        "amplifier"
+        "opencode"
       ],
       "policy": "managed",
       "identityRule": "reattach-first-then-exact-resume"
@@ -184,10 +233,7 @@
       "name": "provider-exit-observer",
       "providers": [
         "shell",
-        "claude",
-        "codex",
-        "opencode",
-        "amplifier"
+        "opencode"
       ],
       "policy": "managed",
       "identityRule": "provider-exit-does-not-commit-stop-intent"
@@ -231,10 +277,7 @@
   "releaseScope": {
     "freshAgentEnabled": false,
     "managedTerminalProviders": [
-      "claude",
-      "codex",
-      "opencode",
-      "amplifier"
+      "opencode"
     ],
     "disabledFreshAgentModes": [
       "freshclaude",
@@ -245,6 +288,52 @@
     "disabledExtensionModes": [
       "gemini",
       "kimi"
-    ]
+    ],
+    "deferredManagedProviders": [
+      "claude",
+      "codex",
+      "amplifier"
+    ],
+    "deferredReason": "PENDING_LIVE_QUALIFICATION"
+  },
+  "certification": {
+    "schemaVersion": 1,
+    "deferralReason": "pending_live_provider_certification",
+    "certifiedDurableProviders": [
+      "opencode"
+    ],
+    "deferredProviders": [
+      "claude",
+      "codex",
+      "amplifier"
+    ],
+    "landingGate": {
+      "id": "durable-souls-landing",
+      "description": "Cumulative P1-P5 qualification that may pass while exactly the deferred providers await live certification. Every non-deferred case must still PASS.",
+      "deferrableProviders": [
+        "claude",
+        "codex",
+        "amplifier"
+      ],
+      "deferredCaseStatus": "DEFERRED_LIVE_PROVIDER_CERTIFICATION"
+    },
+    "productionGate": {
+      "id": "durable-souls-production-gate-5",
+      "status": "BLOCKED_PENDING_LIVE_PROVIDER_CERTIFICATION",
+      "reason": "pending_live_provider_certification",
+      "description": "Full production certification. Requires live candidate-bound turn, recovery, and follow-up receipts for every provider that will be advertised production-ready. BLOCKED is never PASS.",
+      "requiredCertifiedProviders": [
+        "shell",
+        "opencode",
+        "claude",
+        "codex",
+        "amplifier"
+      ],
+      "blockingProviders": [
+        "claude",
+        "codex",
+        "amplifier"
+      ]
+    }
   }
 }

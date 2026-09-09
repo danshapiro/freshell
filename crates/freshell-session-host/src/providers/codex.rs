@@ -2,7 +2,10 @@ use super::cli;
 use freshell_agent_runtime::ProviderStoreProbe;
 use freshell_codex::{
     launch_lifecycle::{CodexLaunchSidecar, CodexTerminalLaunchManager, LaunchClass},
-    launch_plan::{codex_remote_args, CodexLaunchPlanInput, CODEX_INITIAL_LAUNCH_ATTEMPTS},
+    launch_plan::{
+        codex_remote_args, CodexLaunchPlanInput, CodexSidecarLaunchContext,
+        CODEX_INITIAL_LAUNCH_ATTEMPTS,
+    },
     remote_proxy::RemoteProxyEvent,
 };
 use freshell_runtime_protocol::{ResumeSpec, TerminalLaunchSpec};
@@ -25,6 +28,10 @@ pub async fn prepare(terminal: &TerminalLaunchSpec) -> Result<PreparedCodexLaunc
         model: terminal.provider_model.as_deref(),
         sandbox: terminal.provider_sandbox.as_deref(),
         approval_policy: terminal.provider_permission_mode.as_deref(),
+        // The managed session host owns the sidecar inside the soul enclosure.
+        // It has no web-owned MCP context to inherit, so use the explicit
+        // empty launch context rather than silently reintroducing web state.
+        sidecar_context: CodexSidecarLaunchContext::default(),
     };
     let launch = CodexTerminalLaunchManager::global()
         .plan_create_with_retry_uncancellable(

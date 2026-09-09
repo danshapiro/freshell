@@ -4297,6 +4297,8 @@ fn test_state(
         )),
         registry: test_registry(),
         identity: freshell_ws::identity::TerminalIdentityRegistry::new(),
+        #[cfg(feature = "managed-runtime-v1")]
+        managed_runtime_client: None,
     }
 }
 
@@ -4730,6 +4732,8 @@ async fn route_offers_a_live_attributed_row_as_a_reattach_candidate() {
         ))),
         registry,
         identity: freshell_ws::identity::TerminalIdentityRegistry::new(),
+        #[cfg(feature = "managed-runtime-v1")]
+        managed_runtime_client: None,
     };
     let router = router(state);
     let (code, body) = get(

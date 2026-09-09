@@ -3,9 +3,9 @@
 use freshell_runtime_client::{ClientError, RuntimeClient};
 use freshell_runtime_protocol::{
     DesiredState, LaunchRequest, LaunchState, ProviderBootstrapFile, RecoveryBlockReason,
-    RecoveryOutcome, RecoveryProbe, RecoveryResult, RecoveryState, RecoveryTrigger, RequestId,
-    RuntimeErrorCode, RuntimeLimits, RuntimeProfile, RuntimeView, SoulId, StopOutcome,
-    TerminalLaunchSpec,
+    RecoveryOutcome, RecoveryProbe, RecoveryResult, RecoveryTrigger, RequestId, RuntimeErrorCode,
+    RuntimeLimits, RuntimeProfile, RuntimeView, SoulId, StopOutcome, TerminalLaunchSpec,
+    ViewIntentKind, ViewIntentRequest, ViewVisibilityIntent,
 };
 use freshell_terminal::registry::{
     ManagedOutputChunk, ManagedOutputRead, ManagedTerminalController, ManagedTerminalDescriptor,
@@ -34,7 +34,7 @@ pub struct ServerManagedRuntimeController {
 }
 
 impl ServerManagedRuntimeController {
-    pub async fn from_env() -> Result<Option<Arc<dyn ManagedTerminalController>>, String> {
+    pub async fn from_env() -> Result<Option<Arc<Self>>, String> {
         if std::env::var("FRESHELL_MANAGED_RUNTIME_V1").ok().as_deref() != Some("1") {
             return Ok(None);
         }
@@ -56,67 +56,11 @@ impl ServerManagedRuntimeController {
             client,
             recovery: Arc::new(ManagedRecoveryState::default()),
         });
-        controller.reconcile_startup().await?;
-        Self::spawn_death_observer(&controller);
         Ok(Some(controller))
     }
 
-    async fn reconcile_startup(&self) -> Result<(), String> {
-        let views = self
-            .client
-            .inventory()
-            .await
-            .map_err(|error| format!("managed runtime startup inventory: {error}"))?;
-        // Registry state cannot prove that a container or its provider process
-        // survived while the server was down. Probe every desired-running
-        // managed terminal; live ones cheaply reattach, dead ones replace.
-        for view in views.into_iter().filter(should_observe) {
-            self.schedule_recovery(view.soul_id, RecoveryTrigger::StartupReconcile)
-                .await;
-        }
-        Ok(())
-    }
-
-    fn spawn_death_observer(controller: &Arc<Self>) {
-        let weak = Arc::downgrade(controller);
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
-            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-            loop {
-                interval.tick().await;
-                let Some(controller) = weak.upgrade() else {
-                    return;
-                };
-                controller.observe_once().await;
-            }
-        });
-    }
-
-    async fn observe_once(&self) {
-        let Ok(views) = self.client.inventory().await else {
-            return;
-        };
-        for view in views.into_iter().filter(should_observe) {
-            let soul = view.soul_id;
-            if view.launch_state != LaunchState::Running
-                || view.recovery_state != RecoveryState::Live
-            {
-                self.schedule_recovery(soul, RecoveryTrigger::StartupReconcile)
-                    .await;
-                continue;
-            }
-            match self.client.read_output(soul.clone(), 0, 1).await {
-                Ok(output) if output.exited => {
-                    self.schedule_recovery(soul, RecoveryTrigger::ProviderExit)
-                        .await;
-                }
-                Err(error) if recoverable_host_error(&error) => {
-                    self.schedule_recovery(soul, RecoveryTrigger::HostUnreachable)
-                        .await;
-                }
-                _ => {}
-            }
-        }
+    pub fn runtime_client(&self) -> RuntimeClient {
+        self.client.clone()
     }
 
     async fn recovery_in_flight(&self, soul_id: &str) -> bool {
@@ -266,7 +210,7 @@ impl ManagedTerminalController for ServerManagedRuntimeController {
                     run_as_gid,
                     cols: request.spec.cols,
                     rows: request.spec.rows,
-                    project_key,
+                    project_key: project_key.clone(),
                     workspace_path: workspace.to_string_lossy().into_owned(),
                     git_common_dir: git_common_dir.map(|p| p.to_string_lossy().into_owned()),
                     create_request_id: request.create_request_id.clone(),
@@ -275,6 +219,16 @@ impl ManagedTerminalController for ServerManagedRuntimeController {
                     provider_sandbox: request.provider_sandbox.clone(),
                     provider_permission_mode: request.provider_permission_mode.clone(),
                     provider_bootstrap_files: provider_bootstrap_files(&request.mode)?,
+                }),
+                view_intent: Some(ViewIntentRequest {
+                    owner_id: String::new(),
+                    workspace_id: project_key.clone(),
+                    kind: ViewIntentKind::AutomaticPrimary,
+                    preferred_tab_id: request.view_tab_id.clone(),
+                    preferred_pane_id: request.view_pane_id.clone(),
+                    title: Some(format!("{} agent", provider_label(&request.mode))),
+                    placement_group: None,
+                    visibility: ViewVisibilityIntent::Visible,
                 }),
                 expected_control_epoch: None,
             };
@@ -470,10 +424,6 @@ impl ManagedTerminalController for ServerManagedRuntimeController {
             })
         })
     }
-}
-
-fn should_observe(view: &RuntimeView) -> bool {
-    view.desired_state == DesiredState::Running && view.terminal_id.is_some()
 }
 
 fn managed_recovery_test_delay() -> Option<std::time::Duration> {
@@ -839,6 +789,17 @@ fn provider_bootstrap_files_from_candidate(
     }])
 }
 
+fn provider_label(provider: &str) -> &str {
+    match provider {
+        "claude" => "Claude",
+        "codex" => "Codex",
+        "opencode" => "OpenCode",
+        "amplifier" => "Amplifier",
+        "shell" => "Shell",
+        other => other,
+    }
+}
+
 fn stable_soul_id(key: &str) -> Result<SoulId, String> {
     SoulId::parse(format!("soul-terminal-{}", stable_hex(key))).map_err(|e| e.to_string())
 }
@@ -953,6 +914,8 @@ mod tests {
             host_boot_id: Some(freshell_runtime_protocol::HostBootId::new()),
             execution_generation: 1,
             effective_limits: None,
+            configured_limits: None,
+            view_intent_revision: None,
             terminal_id: Some("terminal-stable".into()),
             terminal_stream_id: Some("stream-stable".into()),
             terminal_mode: Some("opencode".into()),
@@ -968,12 +931,12 @@ mod tests {
             provider: Some("opencode".into()),
             native_session_id: None,
             recovery_reason: None,
+            incident_id: None,
             prior_incarnation_id: None,
             recovery_attempt_id: None,
             evidence_revision: 0,
             successful_recoveries_in_window: 0,
         };
-        assert!(should_observe(&running));
         let descriptor = managed_descriptor_from_view(&running, Some("reconcile-create".into()))
             .expect("durable managed descriptor");
         assert_eq!(descriptor.terminal_id, "terminal-stable");
@@ -982,13 +945,6 @@ mod tests {
             descriptor.create_request_id.as_deref(),
             Some("reconcile-create")
         );
-        let mut stopped_intent = running.clone();
-        stopped_intent.desired_state = DesiredState::Stopped;
-        assert!(!should_observe(&stopped_intent));
-        let mut non_terminal = running.clone();
-        non_terminal.terminal_id = None;
-        assert!(!should_observe(&non_terminal));
-
         let reused =
             reusable_running_view(std::slice::from_ref(&running), &soul, "terminal-stable")
                 .unwrap()

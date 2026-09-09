@@ -74,6 +74,16 @@ const CLOUD_SKIP_SPECS = [
   'agent-checkpoint-rewind.spec.ts',
   // Requires codex binary (creates mode:'codex' tabs via MCP)
   'mcp-qa-smoke-rust.spec.ts',
+  // Durable Souls destructive runtime lane: these drive a real supervisor,
+  // real Docker workloads, and the restricted Docker broker on the HOST. The
+  // Cloud Run image has no Docker socket to broker, so they cannot run there
+  // at all. Their coverage is the local candidate-bound landing campaign
+  // (`npm run test:runtime:campaign`), not this lane — see
+  // docs/plans/freshell-durable-souls-phase-5-handoff.md.
+  'runtime-opencode-provider-qualification-rust.spec.ts',
+  'runtime-tabs-rehydrate-rust.spec.ts',
+  'runtime-lost-soul-notice-rust.spec.ts',
+  'runtime-chaos-rust.spec.ts',
 ]
 
 // Test titles to exclude via grepInvert (keeps the spec file but skips

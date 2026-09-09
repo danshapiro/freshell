@@ -1328,6 +1328,7 @@ version = "0.1.0"
 dependencies = [
  "axum",
  "fancy-regex",
+ "freshell-agent-runtime",
  "freshell-codex",
  "freshell-opencode",
  "freshell-platform",
@@ -1338,6 +1339,7 @@ dependencies = [
  "libc",
  "serde",
  "serde_json",
+ "sha2",
  "tempfile",
  "tokio",
  "tower",
@@ -1389,6 +1391,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "freshell-runtime-observability"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "regex",
+ "serde",
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
 name = "freshell-runtime-protocol"
 version = "0.1.0"
 dependencies = [
@@ -1416,6 +1429,7 @@ dependencies = [
  "freshell-platform",
  "freshell-protocol",
  "freshell-runtime-client",
+ "freshell-runtime-observability",
  "freshell-runtime-protocol",
  "freshell-sessions",
  "freshell-terminal",
@@ -1449,6 +1463,7 @@ dependencies = [
  "freshell-codex",
  "freshell-platform",
  "freshell-protocol",
+ "freshell-runtime-observability",
  "freshell-runtime-protocol",
  "freshell-sessions",
  "freshell-terminal",
@@ -1484,7 +1499,9 @@ name = "freshell-supervisor"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "chrono",
  "freshell-agent-runtime",
+ "freshell-runtime-observability",
  "freshell-runtime-protocol",
  "libc",
  "rusqlite",
@@ -1539,6 +1556,7 @@ dependencies = [
  "axum",
  "chrono",
  "freshell-activity",
+ "freshell-agent-runtime",
  "freshell-codex",
  "freshell-freshagent",
  "freshell-opencode",

@@ -185,9 +185,16 @@ export const MATRIX_SPECS = [
 // Exported (no behavior change) so test/e2e-browser/playwright.gate01.config.ts
 // (GATE-01) can testIgnore the SAME array instead of drifting a copy.
 export const RUST_ONLY_SPECS = [
-  // Durable Souls Phase 2/3: own a feature-enabled RustServer + runtime supervisor.
+  // Durable Souls Phase 2-5: own a feature-enabled RustServer + runtime
+  // supervisor (and, for the qualification/loss/chaos specs, the restricted
+  // Docker broker). Their e2eServerKind:'rust' guard fails under the
+  // fixture-default 'legacy' seam.
   /runtime-terminal-continuity-rust\.spec\.ts$/,
   /runtime-provider-resurrection-rust\.spec\.ts$/,
+  /runtime-opencode-provider-qualification-rust\.spec\.ts$/,
+  /runtime-tabs-rehydrate-rust\.spec\.ts$/,
+  /runtime-lost-soul-notice-rust\.spec\.ts$/,
+  /runtime-chaos-rust\.spec\.ts$/,
   /continuity-smoke\.spec\.ts$/,
   /deploy-tab-diff-rust\.spec\.ts$/,
   // COMPOUND-RESTART: drives RustServer.restartAbrupt() (SIGKILL + reboot),
@@ -419,6 +426,10 @@ export default defineConfig({
         /harness-01-rust-server\.spec\.ts$/,
         /runtime-terminal-continuity-rust\.spec\.ts$/,
         /runtime-provider-resurrection-rust\.spec\.ts$/,
+        /runtime-opencode-provider-qualification-rust\.spec\.ts$/,
+        /runtime-tabs-rehydrate-rust\.spec\.ts$/,
+        /runtime-lost-soul-notice-rust\.spec\.ts$/,
+        /runtime-chaos-rust\.spec\.ts$/,
         /amplifier-restore-rust\.spec\.ts$/,
         /opencode-terminal-restore-rust\.spec\.ts$/,
         // TERM-15/TERM-16 — terminal-mode CLI activity (blue/busy), the

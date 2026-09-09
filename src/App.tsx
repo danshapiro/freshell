@@ -62,6 +62,8 @@ import { TerminalInterestReporter } from '@/components/TerminalInterestReporter'
 import { ReconcileWarmingBanner } from '@/components/ReconcileWarmingBanner'
 import { SetupWizard } from '@/components/SetupWizard'
 import { RecoveryOfferPanel } from '@/components/RecoveryOfferPanel'
+import { ManagedAgentRecoveryStatus } from '@/components/ManagedAgentRecoveryStatus'
+import { ManagedRuntimeNotices } from '@/components/ManagedRuntimeNotices'
 import VirtualDeckPanel from '@/components/VirtualDeckPanel'
 import { ErrorBoundary } from '@/components/ui/error-boundary'
 import { fetchNetworkStatus } from '@/store/networkSlice'
@@ -89,6 +91,12 @@ import { hasDismissedAutoSetupWizard, markAutoSetupWizardDismissed } from '@/lib
 import type { LocalSettingsPatch, ServerSettings } from '@shared/settings'
 import { z } from 'zod'
 import { withChunkErrorRecovery } from '@/lib/import-retry'
+import { queueManagedRuntimeRefresh } from '@/lib/recovery/managed-runtime-recovery'
+import { setManagedRuntimeAvailable } from '@/store/managedRuntimeSlice'
+import {
+  ManagedRuntimeInventoryChangedMessageSchema,
+  ManagedRuntimeViewChangedMessageSchema,
+} from '@shared/managed-runtime'
 
 const log = createLogger('App')
 
@@ -1106,6 +1114,13 @@ export default function App() {
             paneReconcileActiveRef.current = paneReconcile
             setPaneReconcileActive(paneReconcile)
             setFreshAgentReconcileActive(freshAgentReconcile)
+            const managedRuntime = ready.data.capabilities?.managedRuntimeV1 === true
+            dispatch(setManagedRuntimeAvailable(managedRuntime))
+            if (managedRuntime) {
+              // Always-on and independent of RecoveryOfferPanel/localStorage:
+              // every ready re-reads the supervisor's authoritative inventory.
+              void queueManagedRuntimeRefresh(appStore, 'ready')
+            }
             pendingReconcileRef.current = null
             dispatch(clearAllReconcilePendingPanes())
             if (paneReconcile) {
@@ -1178,6 +1193,18 @@ export default function App() {
           }
           lastSessionsRevision = -1
           void recoverMissingStartupState()
+        }
+        if (msg.type === 'runtime.inventory.changed') {
+          const parsed = ManagedRuntimeInventoryChangedMessageSchema.safeParse(msg)
+          if (parsed.success && parsed.data.revision >= appStore.getState().managedRuntime.revision) {
+            void queueManagedRuntimeRefresh(appStore, 'inventory-changed')
+          }
+        }
+        if (msg.type === 'runtime.view.changed') {
+          const parsed = ManagedRuntimeViewChangedMessageSchema.safeParse(msg)
+          if (parsed.success && parsed.data.inventoryRevision >= appStore.getState().managedRuntime.revision) {
+            void queueManagedRuntimeRefresh(appStore, 'view-changed')
+          }
         }
         if (msg.type === 'pane.reconcile.result') {
           const pending = pendingReconcileRef.current
@@ -2079,6 +2106,8 @@ npm run serve`}</pre>
       )}
       {/* LANE B3 (recover-my-panes): self-gating recovery offer — see docs/plans/2026-07-26-recover-my-panes.md */}
       <RecoveryOfferPanel />
+      <ManagedAgentRecoveryStatus />
+      <ManagedRuntimeNotices />
       {/* In-app Stream Deck emulator — self-hides unless deck.virtualDeckOpen */}
       <VirtualDeckPanel />
       </div>

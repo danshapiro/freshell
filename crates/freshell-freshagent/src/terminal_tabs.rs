@@ -37,6 +37,7 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use freshell_platform::detect::{host_os_live, is_windows, is_wsl_env_live, HostOs};
@@ -52,7 +53,7 @@ use freshell_platform::{
     RealFileProbe, ShellType, SpawnSpec,
 };
 use freshell_protocol::{ServerMessage, SessionLocator, UiCommand};
-use freshell_terminal::registry::SessionRefClaim;
+use freshell_terminal::registry::{ManagedTerminalLaunch, SessionRefClaim};
 
 use crate::{
     authorized, fail_json, fail_json_code, ok_json, text_plain, FreshAgentState, TabRecord,
@@ -71,6 +72,24 @@ use crate::{
 /// updating two lists in lockstep.
 fn mode_is_known(state: &FreshAgentState, mode: &str) -> bool {
     mode == "shell" || state.cli_commands.iter().any(|s| s.name == mode)
+}
+
+fn managed_runtime_mode(mode: &str) -> bool {
+    mode == "shell" || freshell_agent_runtime::managed_provider_enabled(mode)
+}
+
+fn stable_managed_uuid(create_request_id: &str, domain: &[u8]) -> Uuid {
+    let mut hasher = Sha256::new();
+    hasher.update(b"freshell-managed-terminal-v1\0");
+    hasher.update(domain);
+    hasher.update(b"\0");
+    hasher.update(create_request_id.as_bytes());
+    let digest = hasher.finalize();
+    let mut bytes = [0u8; 16];
+    bytes.copy_from_slice(&digest[..16]);
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    Uuid::from_bytes(bytes)
 }
 
 /// `acceptedSessionRefForMode` (`router.ts:230-236`): a `sessionRef` is only
@@ -507,8 +526,11 @@ fn arm_locators_for_fresh_pane(
     mode: &str,
     cwd: Option<&str>,
     resume_session_id: Option<&str>,
-    managed_codex: bool,
+    managed_runtime: bool,
 ) {
+    if managed_runtime {
+        return;
+    }
     if let Some(locator) = &state.opencode_locator {
         locator.arm(terminal_id, mode, true, resume_session_id, cwd, now_ms());
     }
@@ -519,7 +541,7 @@ fn arm_locators_for_fresh_pane(
     // S5.b / D-03: managed panes bind identity from the proxy Candidate stream,
     // so the CODEX locator never ARMS for them (mirrors
     // `freshell_ws::codex_association::should_arm_codex_locator`).
-    if !managed_codex {
+    if !managed_runtime {
         if let Some(locator) = &state.codex_locator {
             locator.arm(terminal_id, mode, true, resume_session_id, cwd);
         }
@@ -1522,8 +1544,17 @@ async fn settle_gated_create(inputs: GatedSettleInputs) -> Result<TerminalSpawnR
         amplifier_stub,
     } = inputs;
 
-    let terminal_id = Uuid::new_v4().to_string();
-    let stream_id = Uuid::new_v4().to_string();
+    let use_managed_runtime = registry.has_managed_controller() && managed_runtime_mode(&mode);
+    let (terminal_id, stream_id) = if use_managed_runtime {
+        (
+            stable_managed_uuid(&create_request_id, b"terminal")
+                .simple()
+                .to_string(),
+            stable_managed_uuid(&create_request_id, b"stream").to_string(),
+        )
+    } else {
+        (Uuid::new_v4().to_string(), Uuid::new_v4().to_string())
+    };
 
     let mut cli: Option<CliLaunch> = None;
     let mut mcp_cwd: Option<String> = None;
@@ -1564,7 +1595,9 @@ async fn settle_gated_create(inputs: GatedSettleInputs) -> Result<TerminalSpawnR
         let target = cli_provider_target(shell_type, host_os, is_wsl, cwd.as_deref(), &RealEnv);
         let managed_flag =
             std::env::var(freshell_codex::launch_plan::FRESHELL_CODEX_MANAGED_LAUNCH_ENV).ok();
-        let codex_setup = if codex_create_uses_managed_launch(&mode, managed_flag.as_deref()) {
+        let codex_setup = if !use_managed_runtime
+            && codex_create_uses_managed_launch(&mode, managed_flag.as_deref())
+        {
             Some(
                 build_codex_managed_launch_setup(
                     terminal_id.clone(),
@@ -1583,7 +1616,12 @@ async fn settle_gated_create(inputs: GatedSettleInputs) -> Result<TerminalSpawnR
 
         // opencode: allocate the loopback control endpoint BEFORE building the
         // launch (mirrors `crates/freshell-ws/src/terminal.rs:802-813`).
-        let opencode_endpoint = if mode == "opencode" {
+        let opencode_endpoint = if mode == "opencode" && use_managed_runtime {
+            Some(freshell_opencode::serve::Endpoint {
+                hostname: "127.0.0.1".to_string(),
+                port: 4096,
+            })
+        } else if mode == "opencode" {
             use freshell_opencode::serve::PortAllocator as _;
             match freshell_opencode::transport::LoopbackPortAllocator.allocate() {
                 Ok(ep) => Some(ep),
@@ -1654,6 +1692,7 @@ async fn settle_gated_create(inputs: GatedSettleInputs) -> Result<TerminalSpawnR
             None
         };
         let managed_codex = codex_launch.is_some();
+        let host_managed_codex = use_managed_runtime && mode == "codex";
         // The resumeSessionId ECHO (`router.ts:177`): the registry record and every
         // downstream identity consumer carry the echoed value.
         if let Some(launch) = &codex_launch {
@@ -1686,15 +1725,21 @@ async fn settle_gated_create(inputs: GatedSettleInputs) -> Result<TerminalSpawnR
             }
             None => {
                 mcp_cwd = resolve_mcp_cwd(cwd.as_deref(), &RealEnv, host_os, is_wsl);
-                let mcp_injection = match generate_mcp_injection(
-                    &RealMcpRuntime,
-                    &mode,
-                    &terminal_id,
-                    mcp_cwd.as_deref(),
-                    target,
-                ) {
-                    Ok(injection) => injection,
-                    Err(error) => return Err(fail_json(StatusCode::BAD_REQUEST, error.message)),
+                let mcp_injection = if use_managed_runtime {
+                    McpInjection::default()
+                } else {
+                    match generate_mcp_injection(
+                        &RealMcpRuntime,
+                        &mode,
+                        &terminal_id,
+                        mcp_cwd.as_deref(),
+                        target,
+                    ) {
+                        Ok(injection) => injection,
+                        Err(error) => {
+                            return Err(fail_json(StatusCode::BAD_REQUEST, error.message))
+                        }
+                    }
                 };
                 let overrides =
                     build_terminal_base_env(&RealEnv, &terminal_id, Some(&tab_id), Some(&pane_id));
@@ -1706,7 +1751,7 @@ async fn settle_gated_create(inputs: GatedSettleInputs) -> Result<TerminalSpawnR
         // HERE at the IO layer; the pure resolver only reads the result from
         // CliLaunchInputs (mcp_injection precedent). Failure must never block
         // the launch.
-        let opencode_rebind_tui_config = if mode == "opencode" {
+        let opencode_rebind_tui_config = if mode == "opencode" && !use_managed_runtime {
             opencode_rebind_precompute()
         } else {
             None
@@ -1744,11 +1789,15 @@ async fn settle_gated_create(inputs: GatedSettleInputs) -> Result<TerminalSpawnR
             // Managed codex (flag ON): model/sandbox/permissionMode route through the
             // PLAN, not argv (legacy's spawn providerSettings for codex carry ONLY
             // `codexAppServer`, `router.ts:178-193`).
-            permission_mode: (!managed_codex)
+            permission_mode: (!(managed_codex || host_managed_codex))
                 .then_some(())
                 .and(permission_mode.as_deref()),
-            model: (!managed_codex).then_some(()).and(model.as_deref()),
-            sandbox: (!managed_codex).then_some(()).and(sandbox.as_deref()),
+            model: (!(managed_codex || host_managed_codex))
+                .then_some(())
+                .and(model.as_deref()),
+            sandbox: (!(managed_codex || host_managed_codex))
+                .then_some(())
+                .and(sandbox.as_deref()),
             // DEV-0006 S4 inc.2: the PROXY's ws URL when the flag-gated managed launch
             // planned one; `None` (today's shipped shape) otherwise.
             codex_remote_ws_url: codex_launch
@@ -1967,34 +2016,66 @@ async fn settle_gated_create(inputs: GatedSettleInputs) -> Result<TerminalSpawnR
     // door (`crates/freshell-ws/src/terminal.rs`). Values consumed by the
     // call and unused afterwards (`child_env`, `stream_id`, `on_exit`)
     // move in without cloning.
-    let spawn_registry = registry.clone();
-    let spawn_spec = spec.clone();
-    let spawn_terminal_id = terminal_id.clone();
-    let spawn_mode = mode.clone();
-    let spawn_resume = resume_session_id.clone();
-    let spawn_request_id = create_request_id.clone();
-    let create_result = match tokio::task::spawn_blocking(move || {
-        spawn_registry.create(
-            &spawn_spec,
-            &child_env,
-            spawn_terminal_id,
-            stream_id,
-            &spawn_mode,
-            spawn_resume.as_deref(),
-            Some(spawn_request_id.as_str()), // create_request_id: REST accept-or-mint key (this task)
-            None,                            // ring_max_bytes: registry default
-            on_exit,
-        )
-    })
-    .await
-    {
-        Ok(result) => result,
-        // JoinError (incl. panic inside the closure) surfaces as a spawn
-        // failure into the unchanged rollback + 400 path below, same as the
-        // WS path.
-        Err(join_err) => Err(std::io::Error::other(format!(
-            "terminal spawn task panicked: {join_err}"
-        ))),
+    let create_result = if use_managed_runtime {
+        let managed = ManagedTerminalLaunch {
+            spec: spec.clone(),
+            env: child_env.clone(),
+            terminal_id: terminal_id.clone(),
+            stream_id: stream_id.clone(),
+            mode: mode.clone(),
+            resume_session_id: resume_session_id.clone(),
+            provider_model: body
+                .get("model")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            provider_sandbox: body
+                .get("sandbox")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            provider_permission_mode: body
+                .get("permissionMode")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            view_tab_id: Some(tab_id.clone()),
+            view_pane_id: Some(pane_id.clone()),
+            create_request_id: Some(create_request_id.clone()),
+        };
+        match registry.launch_managed(managed).await {
+            Ok(descriptor) => {
+                registry.register_managed(descriptor);
+                Ok(())
+            }
+            Err(error) => Err(std::io::Error::other(format!(
+                "managed runtime launch failed: {error}"
+            ))),
+        }
+    } else {
+        let spawn_registry = registry.clone();
+        let spawn_spec = spec.clone();
+        let spawn_terminal_id = terminal_id.clone();
+        let spawn_mode = mode.clone();
+        let spawn_resume = resume_session_id.clone();
+        let spawn_request_id = create_request_id.clone();
+        match tokio::task::spawn_blocking(move || {
+            spawn_registry.create(
+                &spawn_spec,
+                &child_env,
+                spawn_terminal_id,
+                stream_id,
+                &spawn_mode,
+                spawn_resume.as_deref(),
+                Some(spawn_request_id.as_str()),
+                None,
+                on_exit,
+            )
+        })
+        .await
+        {
+            Ok(result) => result,
+            Err(join_err) => Err(std::io::Error::other(format!(
+                "terminal spawn task panicked: {join_err}"
+            ))),
+        }
     };
     if let Err(err) = create_result {
         // PIN 2 compensating delete — SAME gate as the write (eaa25b7d).
@@ -2149,7 +2230,7 @@ async fn settle_gated_create(inputs: GatedSettleInputs) -> Result<TerminalSpawnR
         &mode,
         cwd.as_deref(),
         resume_session_id.as_deref(),
-        managed_codex,
+        use_managed_runtime || managed_codex,
     );
 
     // D8 winner bind (REST rung): record sessionRef->terminalId in the

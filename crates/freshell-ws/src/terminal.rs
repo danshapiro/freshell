@@ -2510,10 +2510,7 @@ pub(crate) struct LaunchPrep {
 /// block (the claude RESTORE_UNAVAILABLE ladder, :1690-1720) is not
 /// extracted, so there is no error path.
 fn managed_runtime_mode(mode: &str) -> bool {
-    matches!(
-        mode,
-        "shell" | "claude" | "codex" | "opencode" | "amplifier"
-    )
+    mode == "shell" || freshell_agent_runtime::managed_provider_enabled(mode)
 }
 
 fn managed_opencode_endpoint(
@@ -2543,9 +2540,100 @@ fn stable_managed_uuid(create_request_id: &str, domain: &[u8]) -> Uuid {
     Uuid::from_bytes(bytes)
 }
 
+async fn adopt_existing_managed_for_compat(
+    registry: &freshell_terminal::TerminalRegistry,
+    mode: &str,
+    create_request_id: &str,
+    negotiated_managed_runtime: bool,
+) -> Result<Option<freshell_terminal::registry::ManagedTerminalDescriptor>, String> {
+    if negotiated_managed_runtime
+        || !registry.has_managed_controller()
+        || !managed_runtime_mode(mode)
+    {
+        return Ok(None);
+    }
+    let terminal_id = stable_managed_uuid(create_request_id, b"terminal")
+        .simple()
+        .to_string();
+    if !registry
+        .adopt_managed_for_reconcile(&terminal_id, Some(create_request_id.to_string()))
+        .await?
+    {
+        return Ok(None);
+    }
+    registry
+        .managed_descriptor(&terminal_id)
+        .map(Some)
+        .ok_or_else(|| "adopted managed terminal has no descriptor".to_string())
+}
+
 #[cfg(test)]
 mod managed_runtime_id_tests {
-    use super::{managed_opencode_endpoint, managed_runtime_mode, stable_managed_uuid};
+    use super::{
+        adopt_existing_managed_for_compat, managed_opencode_endpoint, managed_runtime_mode,
+        stable_managed_uuid,
+    };
+    use freshell_terminal::registry::{
+        ManagedOutputRead, ManagedTerminalController, ManagedTerminalDescriptor,
+        ManagedTerminalFuture, ManagedTerminalLaunch,
+    };
+    use std::sync::Arc;
+
+    struct LookupOnlyController {
+        descriptor: ManagedTerminalDescriptor,
+    }
+
+    impl ManagedTerminalController for LookupOnlyController {
+        fn lookup_terminal<'a>(
+            &'a self,
+            terminal_id: &'a str,
+            _create_request_id: Option<String>,
+        ) -> ManagedTerminalFuture<'a, Result<Option<ManagedTerminalDescriptor>, String>> {
+            Box::pin(async move {
+                Ok((terminal_id == self.descriptor.terminal_id).then(|| self.descriptor.clone()))
+            })
+        }
+
+        fn launch<'a>(
+            &'a self,
+            _request: ManagedTerminalLaunch,
+        ) -> ManagedTerminalFuture<'a, Result<ManagedTerminalDescriptor, String>> {
+            Box::pin(async { Err("launch must not run during compatibility adoption".into()) })
+        }
+
+        fn input<'a>(
+            &'a self,
+            _terminal: ManagedTerminalDescriptor,
+            _data: String,
+        ) -> ManagedTerminalFuture<'a, Result<(), String>> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn resize<'a>(
+            &'a self,
+            _terminal: ManagedTerminalDescriptor,
+            _cols: u16,
+            _rows: u16,
+        ) -> ManagedTerminalFuture<'a, Result<(), String>> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn stop<'a>(
+            &'a self,
+            _terminal: ManagedTerminalDescriptor,
+        ) -> ManagedTerminalFuture<'a, Result<(), String>> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn read_output<'a>(
+            &'a self,
+            _terminal: ManagedTerminalDescriptor,
+            _after_seq: i64,
+            _max_bytes: u64,
+        ) -> ManagedTerminalFuture<'a, Result<ManagedOutputRead, String>> {
+            Box::pin(async { Err("not needed".into()) })
+        }
+    }
 
     #[test]
     fn managed_ids_are_retry_stable_and_domain_separated() {
@@ -2560,12 +2648,21 @@ mod managed_runtime_id_tests {
     }
 
     #[test]
-    fn phase3_managed_modes_cover_every_enabled_terminal_provider() {
-        for mode in ["shell", "claude", "codex", "opencode", "amplifier"] {
-            assert!(managed_runtime_mode(mode), "missing managed mode {mode}");
+    fn managed_modes_follow_the_release_qualification_manifest() {
+        let manifest: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../docs/development/runtime-provider-capabilities.json"
+        ))
+        .unwrap();
+        assert!(managed_runtime_mode("shell"));
+        for provider in manifest["providers"].as_array().unwrap() {
+            let mode = provider["provider"].as_str().unwrap();
+            let expected = provider["managedEnabled"].as_bool().unwrap();
+            assert_eq!(
+                managed_runtime_mode(mode),
+                expected,
+                "managed routing drifted from release qualification for {mode}"
+            );
         }
-        assert!(!managed_runtime_mode("gemini"));
-        assert!(!managed_runtime_mode("kimi"));
     }
 
     #[test]
@@ -2576,6 +2673,43 @@ mod managed_runtime_id_tests {
         assert_eq!(endpoint.port, 4096);
         assert!(managed_opencode_endpoint("opencode", false).is_none());
         assert!(managed_opencode_endpoint("shell", true).is_none());
+    }
+
+    #[tokio::test]
+    async fn legacy_capability_replay_adopts_existing_managed_terminal_without_launch() {
+        let registry = freshell_terminal::TerminalRegistry::new();
+        let create_request_id = "create-old-client-managed";
+        let terminal_id = stable_managed_uuid(create_request_id, b"terminal")
+            .simple()
+            .to_string();
+        let descriptor = ManagedTerminalDescriptor {
+            soul_id: "soul-old-client".into(),
+            incarnation_id: "incarnation-old-client".into(),
+            terminal_id: terminal_id.clone(),
+            stream_id: "stream-old-client".into(),
+            mode: "opencode".into(),
+            cwd: "/workspace".into(),
+            resume_session_id: Some("ses_old_client".into()),
+            create_request_id: Some(create_request_id.into()),
+        };
+        registry.set_managed_controller(Some(Arc::new(LookupOnlyController {
+            descriptor: descriptor.clone(),
+        })));
+
+        let adopted =
+            adopt_existing_managed_for_compat(&registry, "opencode", create_request_id, false)
+                .await
+                .unwrap()
+                .expect("old-capability replay adopts the managed row");
+        assert_eq!(adopted, descriptor);
+        assert!(registry.is_managed(&terminal_id));
+
+        assert!(
+            adopt_existing_managed_for_compat(&registry, "opencode", create_request_id, true,)
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 }
 
@@ -3216,6 +3350,71 @@ pub(crate) async fn handle_create(
             &create.request_id,
         )
         .await;
+    }
+
+    // Compatibility fence: a client that predates managedRuntimeV1 may still
+    // replay a pane created by a newer client. It must never spawn a second
+    // legacy provider for the same durable create key. Reconstruct the
+    // supervisor-owned facade by the deterministic terminal id and answer the
+    // ordinary terminal.created shape; attach/input then use the existing
+    // terminal protocol without requiring the old client to understand souls.
+    match adopt_existing_managed_for_compat(
+        &state.registry,
+        &mode,
+        &create.request_id,
+        use_managed_runtime,
+    )
+    .await
+    {
+        Ok(Some(descriptor)) => {
+            let managed_terminal_id = descriptor.terminal_id.clone();
+            let session_ref = descriptor
+                .resume_session_id
+                .as_ref()
+                .filter(|session_id| !session_id.is_empty() && descriptor.mode != "shell")
+                .map(|session_id| freshell_protocol::SessionLocator {
+                    provider: descriptor.mode.clone(),
+                    session_id: session_id.clone(),
+                });
+            tracing::info!(
+                terminal_id = %managed_terminal_id,
+                create_request_id = %create.request_id,
+                mode = %mode,
+                "terminal.create.compat_adopted_managed"
+            );
+            let dedupe_request_id = create.request_id.clone();
+            let created = ServerMessage::TerminalCreated(TerminalCreated {
+                created_at: now_ms(),
+                request_id: create.request_id,
+                terminal_id: managed_terminal_id.clone(),
+                clear_codex_durability: None,
+                cwd: Some(descriptor.cwd),
+                notice: Some(
+                    "Reattached to the existing managed agent without launching a duplicate."
+                        .to_string(),
+                ),
+                restore_error: None,
+                session_ref,
+            });
+            state.create_dedupe.settle(
+                &dedupe_request_id,
+                &managed_terminal_id,
+                &created,
+                create.restore,
+                |terminal_id| state.registry.is_pty_running(terminal_id),
+            );
+            return out.send(&created).await;
+        }
+        Ok(None) => {}
+        Err(error) => {
+            return send_create_error(
+                out,
+                ErrorCode::PtySpawnFailed,
+                format!("managed runtime compatibility lookup failed: {error}"),
+                &create.request_id,
+            )
+            .await;
+        }
     }
 
     // Managed create retries must be payload-identical across web-process
@@ -3976,6 +4175,8 @@ pub(crate) async fn handle_create(
             provider_model: model.clone(),
             provider_sandbox: sandbox.clone(),
             provider_permission_mode: permission_mode.clone(),
+            view_tab_id: create.tab_id.clone(),
+            view_pane_id: create.pane_id.clone(),
             create_request_id: Some(create.request_id.clone()),
         };
         match state.registry.launch_managed(managed).await {
@@ -5302,6 +5503,12 @@ async fn handle_pane_reconcile(
         )
         .await;
     }
+    // Managed pre-pass. Adoption reconstructs the browser-facing facade for a
+    // supervisor-owned soul BEFORE the legacy ladder consults host-local
+    // provider stores. A lookup that FAILS is recorded rather than ignored: an
+    // unreadable managed truth must withhold the ladder's authority to declare
+    // that soul dead (see `ManagedReconcileFacts`).
+    let mut managed_facts = crate::reconcile::ManagedReconcileFacts::default();
     if managed_runtime_v1 {
         for pane in request
             .panes
@@ -5325,15 +5532,19 @@ async fn handle_pane_reconcile(
                     "pane_reconcile.adopted_managed_terminal"
                 ),
                 Ok(false) => {}
-                Err(error) => tracing::warn!(
-                    terminal_id,
-                    pane_key = %pane.pane_key,
-                    %error,
-                    "pane_reconcile.managed_terminal_lookup_failed"
-                ),
+                Err(error) => {
+                    tracing::warn!(
+                        terminal_id,
+                        pane_key = %pane.pane_key,
+                        %error,
+                        "pane_reconcile.managed_terminal_lookup_failed"
+                    );
+                    managed_facts.mark_indeterminate(pane.pane_key.clone());
+                }
             }
         }
     }
+    let managed_facts = (!managed_facts.is_empty()).then_some(managed_facts);
 
     // Built ONCE per reconcile request and reused for any re-derivation of deps
     // (B1's warming deferral re-derives via rebuild_deps — rebuilding the
@@ -5361,6 +5572,7 @@ async fn handle_pane_reconcile(
             existence: state.session_existence.as_ref(),
             pane_ledger: &state.pane_ledger,
             fresh_agent: fresh_agent_snapshot.as_ref(),
+            managed: managed_facts.as_ref(),
         };
         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             crate::reconcile::derive_verdicts(&deps, &request.panes)

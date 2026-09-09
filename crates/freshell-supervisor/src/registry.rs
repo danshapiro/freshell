@@ -1,10 +1,10 @@
 use crate::admission::{AdmissionPolicy, ReservationTotals};
 use freshell_runtime_protocol::{
     AllocationState, CleanupState, DesiredState, DockerDaemonId, DurabilityState, FixtureKind,
-    GrantId, HostBootId, IncarnationId, InstallationId, LaunchNonce, LaunchState,
-    RecoveryAttemptId, RecoveryBlockReason, RecoveryPath, RecoveryState, RecoveryTrigger,
+    GrantId, HostBootId, IncarnationId, IncidentId, InstallationId, LaunchNonce, LaunchState,
+    NoticeId, RecoveryAttemptId, RecoveryBlockReason, RecoveryPath, RecoveryState, RecoveryTrigger,
     RequestId, ResumeSpec, RuntimeLimits, RuntimeProfile, RuntimeView, SoulId, StopOutcome,
-    TerminalLaunchSpec,
+    TerminalLaunchSpec, ViewIntentRequest,
 };
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use serde::{Deserialize, Serialize};
@@ -17,7 +17,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-const SCHEMA_VERSION: u32 = 4;
+pub const SCHEMA_VERSION: u32 = 6;
 const ACTIVE_STATES: &str = "'prepared','created','starting','running','stopping'";
 
 #[derive(Debug, thiserror::Error)]
@@ -38,6 +38,8 @@ pub enum RegistryError {
     BlockedResource { scope: &'static str },
     #[error("stale control epoch: expected {expected}, current {current}")]
     StaleControlEpoch { expected: u64, current: u64 },
+    #[error("stale soul intent revision: expected {expected}, current {current}")]
+    StaleIntentRevision { expected: u64, current: u64 },
     #[error("unknown incarnation {0}")]
     UnknownIncarnation(IncarnationId),
     #[error("unknown soul {0}")]
@@ -50,6 +52,18 @@ pub enum RegistryError {
     RecoveryBlocked { soul_id: SoulId, reason: String },
     #[error("native session identity conflicts with durable soul identity")]
     NativeIdentityConflict,
+    #[error("loss certification is blocked: {0}")]
+    LossCertificationBlocked(String),
+    #[error("loss incident persistence failed: {0}")]
+    IncidentPersistenceFailed(String),
+    #[error("unknown loss incident {0}")]
+    IncidentNotFound(IncidentId),
+    #[error("unknown runtime notice {0}")]
+    NoticeNotFound(NoticeId),
+    #[error("managed rollout migration is blocked: {0}")]
+    MigrationBlocked(String),
+    #[error("runtime repair is blocked: {0}")]
+    RepairBlocked(String),
     #[error("terminal input request id was reused with different data")]
     InputConflict,
     #[error("fault injected at registry barrier {0}")]
@@ -91,6 +105,7 @@ pub struct LaunchPreparation {
     pub project_key: String,
     pub fixture: Option<FixtureKind>,
     pub terminal: Option<TerminalLaunchSpec>,
+    pub view_intent: Option<ViewIntentRequest>,
     pub admission: AdmissionPolicy,
 }
 
@@ -336,6 +351,7 @@ impl Registry {
                 return Err(RegistryError::InstallationMismatch);
             }
         }
+        crate::view_intents::backfill_automatic_view_intents(&mut conn, &installation_id)?;
 
         let next_epoch = epoch
             .checked_add(1)
@@ -363,6 +379,15 @@ impl Registry {
     }
     pub fn control_epoch(&self) -> u64 {
         self.inner.control_epoch
+    }
+    pub(crate) fn database_path(&self) -> &Path {
+        &self.inner.db_path
+    }
+    pub(crate) fn registry_root(&self) -> &Path {
+        self.inner
+            .db_path
+            .parent()
+            .expect("registry database always has a parent")
     }
 
     pub fn assert_epoch(&self, expected: Option<u64>) -> Result<(), RegistryError> {
@@ -407,14 +432,14 @@ impl Registry {
             let now = now_millis();
             let profile_name = runtime_profile_name(input.profile);
             let provider_volume_name = stable_provider_volume_name(&installation_id, &input.soul_id);
-            let soul_row: Option<(String, String, String, String, Option<String>)> = tx
+            let soul_row: Option<(String, String, String, String, Option<String>, u64)> = tx
                 .query_row(
-                    "SELECT provider,provider_store_id,project_key,resource_profile,native_session_id FROM souls WHERE soul_id=?1",
+                    "SELECT provider,provider_store_id,project_key,resource_profile,native_session_id,intent_revision FROM souls WHERE soul_id=?1",
                     params![input.soul_id.as_str()],
-                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?)),
                 )
                 .optional()?;
-            if let Some((provider, store, project, profile, native)) = soul_row {
+            let soul_intent_revision = if let Some((provider, store, project, profile, native, revision)) = soul_row {
                 if provider != input.provider
                     || store != input.provider_store_id
                     || project != input.project_key
@@ -425,9 +450,10 @@ impl Registry {
                         "existing soul launch identity/profile does not match request".into(),
                     ));
                 }
+                revision
             } else {
                 tx.execute(
-                    "INSERT INTO souls (soul_id,provider,provider_store_id,native_session_id,creation_seed_ref,desired_state,intent_revision,recovery_state,recovery_reason,recovery_attempt_id,durability_state,allocation_state,resume_spec,checkpoint_revision,evidence_revision,recovery_window_started_at,successful_recoveries_in_window,project_key,resource_profile,provider_volume_name,created_at,updated_at) VALUES (?1,?2,?3,?4,?5,'running',1,'live',NULL,NULL,'unknown','allocated',NULL,0,0,NULL,0,?6,?7,?8,?9,?9)",
+                    "INSERT INTO souls (soul_id,provider,provider_store_id,native_session_id,creation_seed_ref,desired_state,intent_revision,recovery_state,recovery_reason,recovery_attempt_id,durability_state,allocation_state,resume_spec,checkpoint_revision,evidence_revision,recovery_window_started_at,successful_recoveries_in_window,project_key,resource_profile,provider_volume_name,configured_limits,created_at,updated_at) VALUES (?1,?2,?3,?4,?5,'running',1,'live',NULL,NULL,'unknown','allocated',NULL,0,0,NULL,0,?6,?7,?8,?9,?10,?10)",
                     params![
                         input.soul_id.as_str(),
                         input.provider,
@@ -437,8 +463,22 @@ impl Registry {
                         input.project_key,
                         profile_name,
                         provider_volume_name,
+                        serde_json::to_string(&input.requested_limits)?,
                         now
                     ],
+                )?;
+                1
+            };
+            if input.terminal.is_some() || input.view_intent.is_some() {
+                crate::view_intents::ensure_automatic_primary_in_tx(
+                    &tx,
+                    &installation_id,
+                    &input.soul_id,
+                    &input.project_key,
+                    &input.provider,
+                    soul_intent_revision,
+                    input.view_intent.as_ref(),
+                    now,
                 )?;
             }
 
@@ -641,6 +681,14 @@ impl Registry {
     }
 
     pub async fn begin_stop(&self, soul_id: SoulId) -> Result<OwnedRuntimeHandle, RegistryError> {
+        self.begin_stop_expected(soul_id, None).await
+    }
+
+    pub async fn begin_stop_expected(
+        &self,
+        soul_id: SoulId,
+        expected_intent_revision: Option<u64>,
+    ) -> Result<OwnedRuntimeHandle, RegistryError> {
         let installation = self.installation_id().clone();
         self.run_blocking(move |mut conn| {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -663,8 +711,16 @@ impl Registry {
                 params![soul_id.as_str()],
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )?;
+            if let Some(expected) = expected_intent_revision {
+                if expected != revision {
+                    return Err(RegistryError::StaleIntentRevision {
+                        expected,
+                        current: revision,
+                    });
+                }
+            }
             let now = now_millis();
-            if desired_state != "stopped" {
+            let committed_revision = if desired_state != "stopped" {
                 let next = revision.checked_add(1).ok_or_else(|| {
                     RegistryError::Integrity("intent revision overflow".into())
                 })?;
@@ -676,7 +732,16 @@ impl Registry {
                     "INSERT OR IGNORE INTO stop_tombstones (soul_id,intent_revision,actor,reason,committed_at) VALUES (?1,?2,'supervisor','managed stop',?3)",
                     params![soul_id.as_str(), next, now],
                 )?;
-            }
+                next
+            } else {
+                revision
+            };
+            crate::view_intents::hide_automatic_primary_in_tx(
+                &tx,
+                &soul_id,
+                committed_revision,
+                now,
+            )?;
             if !matches!(launch_state.as_str(), "stopped" | "failed") {
                 tx.execute(
                     "UPDATE incarnations SET launch_state='stopping',cleanup_state='requested',updated_at=?1 WHERE incarnation_id=?2",
@@ -712,7 +777,7 @@ impl Registry {
                 tx.execute("DELETE FROM admission_reservations WHERE incarnation_id=?1", params![incarnation_id.as_str()])?;
                 tx.execute("UPDATE commands SET state='stopped',updated_at=?1 WHERE incarnation_id=?2", params![now, incarnation_id.as_str()])?;
                 tx.execute(
-                    "UPDATE souls SET recovery_state='stopped',recovery_reason='STOP_INTENT',recovery_attempt_id=NULL,updated_at=?1 WHERE soul_id=(SELECT soul_id FROM incarnations WHERE incarnation_id=?2) AND desired_state='stopped'",
+                    "UPDATE souls SET recovery_state='stopped',recovery_reason='STOP_INTENT',recovery_attempt_id=NULL,updated_at=?1 WHERE soul_id=(SELECT soul_id FROM incarnations WHERE incarnation_id=?2) AND desired_state='stopped' AND recovery_state!='lost'",
                     params![now, incarnation_id.as_str()],
                 )?;
             }
@@ -1414,7 +1479,7 @@ impl Registry {
         })
     }
 
-    async fn run_blocking<T, F>(&self, f: F) -> Result<T, RegistryError>
+    pub(crate) async fn run_blocking<T, F>(&self, f: F) -> Result<T, RegistryError>
     where
         T: Send + 'static,
         F: FnOnce(Connection) -> Result<T, RegistryError> + Send + 'static,
@@ -1429,7 +1494,7 @@ impl Registry {
     }
 }
 
-fn open_connection(path: &Path) -> Result<Connection, RegistryError> {
+pub(crate) fn open_connection(path: &Path) -> Result<Connection, RegistryError> {
     let conn = Connection::open(path)?;
     conn.pragma_update(None, "foreign_keys", "ON")?;
     conn.pragma_update(None, "journal_mode", "WAL")?;
@@ -1444,6 +1509,17 @@ fn table_exists(conn: &Connection, table: &str) -> Result<bool, RegistryError> {
         params![table],
         |row| row.get(0),
     )?)
+}
+
+fn column_exists(conn: &Connection, table: &str, column: &str) -> Result<bool, RegistryError> {
+    let mut statement = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+    let columns = statement.query_map([], |row| row.get::<_, String>(1))?;
+    for candidate in columns {
+        if candidate? == column {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 fn reservation_totals(
@@ -1565,7 +1641,13 @@ fn create_schema(
             singleton INTEGER PRIMARY KEY CHECK(singleton=1),
             installation_id TEXT NOT NULL,
             schema_version INTEGER NOT NULL,
-            control_epoch INTEGER NOT NULL
+            control_epoch INTEGER NOT NULL,
+            inventory_revision INTEGER NOT NULL DEFAULT 0,
+            initial_scan_state TEXT NOT NULL DEFAULT 'pending',
+            initial_scan_error TEXT,
+            initial_scan_started_at INTEGER,
+            initial_scan_finished_at INTEGER,
+            initial_scan_peak_concurrency INTEGER NOT NULL DEFAULT 0
         );
         CREATE TABLE souls (
             soul_id TEXT PRIMARY KEY,
@@ -1588,6 +1670,8 @@ fn create_schema(
             project_key TEXT NOT NULL,
             resource_profile TEXT NOT NULL,
             provider_volume_name TEXT NOT NULL,
+            configured_limits TEXT,
+            loss_incident_id TEXT,
             created_at INTEGER NOT NULL,
             updated_at INTEGER NOT NULL
         );
@@ -1665,12 +1749,100 @@ fn create_schema(
             started_at INTEGER NOT NULL,
             finished_at INTEGER
         );
+        CREATE TABLE view_intents (
+            view_id TEXT PRIMARY KEY,
+            soul_id TEXT NOT NULL REFERENCES souls(soul_id),
+            owner_id TEXT NOT NULL,
+            workspace_id TEXT NOT NULL,
+            kind TEXT NOT NULL,
+            preferred_tab_id TEXT NOT NULL,
+            preferred_pane_id TEXT NOT NULL,
+            title TEXT NOT NULL,
+            placement_group TEXT NOT NULL,
+            visibility TEXT NOT NULL,
+            revision INTEGER NOT NULL,
+            soul_intent_revision INTEGER NOT NULL,
+            created_at INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL
+        );
+        CREATE UNIQUE INDEX one_automatic_primary_view_per_soul ON view_intents(owner_id,workspace_id,soul_id) WHERE kind='automatic_primary';
         CREATE TABLE outbox (
             event_id TEXT PRIMARY KEY,
             event_kind TEXT NOT NULL,
             payload TEXT NOT NULL,
             created_at INTEGER NOT NULL,
             delivered_at INTEGER
+        );
+        CREATE TABLE loss_incidents (
+            incident_id TEXT PRIMARY KEY,
+            correlation_id TEXT NOT NULL,
+            soul_id TEXT NOT NULL REFERENCES souls(soul_id),
+            incarnation_id TEXT NOT NULL REFERENCES incarnations(incarnation_id),
+            provider TEXT NOT NULL,
+            provider_store_id TEXT NOT NULL,
+            native_session_ref_hash TEXT NOT NULL,
+            intent_revision INTEGER NOT NULL,
+            decision_state TEXT NOT NULL,
+            reason_code TEXT NOT NULL,
+            certificate_json TEXT NOT NULL,
+            cleanup_state TEXT NOT NULL,
+            cleanup_json TEXT NOT NULL,
+            observed_cause TEXT NOT NULL,
+            missing_invariant TEXT NOT NULL,
+            hypotheses_json TEXT NOT NULL,
+            preventive_action TEXT NOT NULL,
+            regression_case TEXT NOT NULL,
+            created_at INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL,
+            closed_at INTEGER
+        );
+        CREATE UNIQUE INDEX one_loss_incident_per_soul_revision ON loss_incidents(soul_id,intent_revision);
+        CREATE TABLE runtime_notices (
+            notice_id TEXT PRIMARY KEY,
+            kind TEXT NOT NULL,
+            message TEXT NOT NULL,
+            reference TEXT NOT NULL,
+            incident_ids_json TEXT NOT NULL,
+            superseded_by TEXT,
+            created_at INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL
+        );
+        CREATE TABLE notice_receipts (
+            notice_id TEXT NOT NULL REFERENCES runtime_notices(notice_id),
+            profile_id TEXT NOT NULL,
+            state TEXT NOT NULL,
+            rendered_at INTEGER,
+            acknowledged_at INTEGER,
+            dismissed_at INTEGER,
+            updated_at INTEGER NOT NULL,
+            PRIMARY KEY(notice_id,profile_id)
+        );
+        CREATE TABLE runtime_counters (
+            name TEXT NOT NULL,
+            label TEXT NOT NULL,
+            value INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL,
+            PRIMARY KEY(name,label)
+        );
+        CREATE TABLE rollout_state (
+            singleton INTEGER PRIMARY KEY CHECK(singleton=1),
+            mode TEXT NOT NULL,
+            updated_at INTEGER NOT NULL
+        );
+        CREATE TABLE migration_runs (
+            migration_id TEXT PRIMARY KEY,
+            current_mode TEXT NOT NULL,
+            requested_mode TEXT NOT NULL,
+            dry_run INTEGER NOT NULL,
+            plan_json TEXT NOT NULL,
+            backup_path TEXT,
+            applied_at INTEGER,
+            created_at INTEGER NOT NULL
+        );
+        CREATE TABLE repair_audits (
+            audit_id TEXT PRIMARY KEY,
+            audit_json TEXT NOT NULL,
+            created_at INTEGER NOT NULL
         );
         CREATE TABLE stop_tombstones (
             soul_id TEXT NOT NULL REFERENCES souls(soul_id),
@@ -1688,8 +1860,21 @@ fn create_schema(
             pids_max INTEGER NOT NULL,
             created_at INTEGER NOT NULL
         );
+        CREATE TRIGGER souls_inventory_insert AFTER INSERT ON souls BEGIN UPDATE installation SET inventory_revision=inventory_revision+1 WHERE singleton=1; END;
+        CREATE TRIGGER souls_inventory_update AFTER UPDATE ON souls BEGIN UPDATE installation SET inventory_revision=inventory_revision+1 WHERE singleton=1; END;
+        CREATE TRIGGER souls_inventory_delete AFTER DELETE ON souls BEGIN UPDATE installation SET inventory_revision=inventory_revision+1 WHERE singleton=1; END;
+        CREATE TRIGGER incarnations_inventory_insert AFTER INSERT ON incarnations BEGIN UPDATE installation SET inventory_revision=inventory_revision+1 WHERE singleton=1; END;
+        CREATE TRIGGER incarnations_inventory_update AFTER UPDATE ON incarnations BEGIN UPDATE installation SET inventory_revision=inventory_revision+1 WHERE singleton=1; END;
+        CREATE TRIGGER incarnations_inventory_delete AFTER DELETE ON incarnations BEGIN UPDATE installation SET inventory_revision=inventory_revision+1 WHERE singleton=1; END;
+        CREATE TRIGGER view_intents_inventory_insert AFTER INSERT ON view_intents BEGIN UPDATE installation SET inventory_revision=inventory_revision+1 WHERE singleton=1; END;
+        CREATE TRIGGER view_intents_inventory_update AFTER UPDATE ON view_intents BEGIN UPDATE installation SET inventory_revision=inventory_revision+1 WHERE singleton=1; END;
+        CREATE TRIGGER view_intents_inventory_delete AFTER DELETE ON view_intents BEGIN UPDATE installation SET inventory_revision=inventory_revision+1 WHERE singleton=1; END;
     "#))?;
-    tx.execute("INSERT INTO installation (singleton,installation_id,schema_version,control_epoch) VALUES (1,?1,?2,0)", params![installation_id.as_str(), SCHEMA_VERSION])?;
+    tx.execute("INSERT INTO installation (singleton,installation_id,schema_version,control_epoch,inventory_revision,initial_scan_state) VALUES (1,?1,?2,0,0,'pending')", params![installation_id.as_str(), SCHEMA_VERSION])?;
+    tx.execute(
+        "INSERT INTO rollout_state (singleton,mode,updated_at) VALUES (1,'legacy',?1)",
+        params![now_millis()],
+    )?;
     tx.commit()?;
     durable_sync_parent(conn.path().map(Path::new).and_then(Path::parent))?;
     Ok(())
@@ -1771,6 +1956,167 @@ fn migrate_schema(conn: &mut Connection) -> Result<(), RegistryError> {
         tx.commit()?;
         schema = 4;
     }
+    if schema == 4 {
+        let add_inventory_revision = !column_exists(conn, "installation", "inventory_revision")?;
+        let add_scan_state = !column_exists(conn, "installation", "initial_scan_state")?;
+        let add_scan_error = !column_exists(conn, "installation", "initial_scan_error")?;
+        let add_scan_started = !column_exists(conn, "installation", "initial_scan_started_at")?;
+        let add_scan_finished = !column_exists(conn, "installation", "initial_scan_finished_at")?;
+        let add_scan_peak = !column_exists(conn, "installation", "initial_scan_peak_concurrency")?;
+        let add_configured_limits = !column_exists(conn, "souls", "configured_limits")?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if add_inventory_revision {
+            tx.execute_batch(
+                "ALTER TABLE installation ADD COLUMN inventory_revision INTEGER NOT NULL DEFAULT 0;",
+            )?;
+        }
+        if add_scan_state {
+            tx.execute_batch(
+                "ALTER TABLE installation ADD COLUMN initial_scan_state TEXT NOT NULL DEFAULT 'pending';",
+            )?;
+        }
+        if add_scan_error {
+            tx.execute_batch("ALTER TABLE installation ADD COLUMN initial_scan_error TEXT;")?;
+        }
+        if add_scan_started {
+            tx.execute_batch(
+                "ALTER TABLE installation ADD COLUMN initial_scan_started_at INTEGER;",
+            )?;
+        }
+        if add_scan_finished {
+            tx.execute_batch(
+                "ALTER TABLE installation ADD COLUMN initial_scan_finished_at INTEGER;",
+            )?;
+        }
+        if add_scan_peak {
+            tx.execute_batch(
+                "ALTER TABLE installation ADD COLUMN initial_scan_peak_concurrency INTEGER NOT NULL DEFAULT 0;",
+            )?;
+        }
+        if add_configured_limits {
+            tx.execute_batch("ALTER TABLE souls ADD COLUMN configured_limits TEXT;")?;
+        }
+        tx.execute_batch(
+            r#"
+            CREATE TABLE IF NOT EXISTS view_intents (
+                view_id TEXT PRIMARY KEY,
+                soul_id TEXT NOT NULL REFERENCES souls(soul_id),
+                owner_id TEXT NOT NULL,
+                workspace_id TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                preferred_tab_id TEXT NOT NULL,
+                preferred_pane_id TEXT NOT NULL,
+                title TEXT NOT NULL,
+                placement_group TEXT NOT NULL,
+                visibility TEXT NOT NULL,
+                revision INTEGER NOT NULL,
+                soul_intent_revision INTEGER NOT NULL,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL
+            );
+            CREATE UNIQUE INDEX IF NOT EXISTS one_automatic_primary_view_per_soul ON view_intents(owner_id,workspace_id,soul_id) WHERE kind='automatic_primary';
+            CREATE TRIGGER IF NOT EXISTS souls_inventory_insert AFTER INSERT ON souls BEGIN UPDATE installation SET inventory_revision=inventory_revision+1 WHERE singleton=1; END;
+            CREATE TRIGGER IF NOT EXISTS souls_inventory_update AFTER UPDATE ON souls BEGIN UPDATE installation SET inventory_revision=inventory_revision+1 WHERE singleton=1; END;
+            CREATE TRIGGER IF NOT EXISTS souls_inventory_delete AFTER DELETE ON souls BEGIN UPDATE installation SET inventory_revision=inventory_revision+1 WHERE singleton=1; END;
+            CREATE TRIGGER IF NOT EXISTS incarnations_inventory_insert AFTER INSERT ON incarnations BEGIN UPDATE installation SET inventory_revision=inventory_revision+1 WHERE singleton=1; END;
+            CREATE TRIGGER IF NOT EXISTS incarnations_inventory_update AFTER UPDATE ON incarnations BEGIN UPDATE installation SET inventory_revision=inventory_revision+1 WHERE singleton=1; END;
+            CREATE TRIGGER IF NOT EXISTS incarnations_inventory_delete AFTER DELETE ON incarnations BEGIN UPDATE installation SET inventory_revision=inventory_revision+1 WHERE singleton=1; END;
+            CREATE TRIGGER IF NOT EXISTS view_intents_inventory_insert AFTER INSERT ON view_intents BEGIN UPDATE installation SET inventory_revision=inventory_revision+1 WHERE singleton=1; END;
+            CREATE TRIGGER IF NOT EXISTS view_intents_inventory_update AFTER UPDATE ON view_intents BEGIN UPDATE installation SET inventory_revision=inventory_revision+1 WHERE singleton=1; END;
+            CREATE TRIGGER IF NOT EXISTS view_intents_inventory_delete AFTER DELETE ON view_intents BEGIN UPDATE installation SET inventory_revision=inventory_revision+1 WHERE singleton=1; END;
+            UPDATE souls SET configured_limits=(SELECT requested_limits FROM incarnations i WHERE i.soul_id=souls.soul_id ORDER BY i.created_at DESC LIMIT 1) WHERE configured_limits IS NULL;
+            UPDATE installation SET schema_version=5,inventory_revision=inventory_revision+1 WHERE singleton=1;
+            "#,
+        )?;
+        tx.commit()?;
+        schema = 5;
+    }
+    if schema == 5 {
+        let add_loss_incident_id = !column_exists(conn, "souls", "loss_incident_id")?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if add_loss_incident_id {
+            tx.execute_batch("ALTER TABLE souls ADD COLUMN loss_incident_id TEXT;")?;
+        }
+        tx.execute_batch(
+            r#"
+            CREATE TABLE IF NOT EXISTS loss_incidents (
+                incident_id TEXT PRIMARY KEY,
+                correlation_id TEXT NOT NULL,
+                soul_id TEXT NOT NULL REFERENCES souls(soul_id),
+                incarnation_id TEXT NOT NULL REFERENCES incarnations(incarnation_id),
+                provider TEXT NOT NULL,
+                provider_store_id TEXT NOT NULL,
+                native_session_ref_hash TEXT NOT NULL,
+                intent_revision INTEGER NOT NULL,
+                decision_state TEXT NOT NULL,
+                reason_code TEXT NOT NULL,
+                certificate_json TEXT NOT NULL,
+                cleanup_state TEXT NOT NULL,
+                cleanup_json TEXT NOT NULL,
+                observed_cause TEXT NOT NULL,
+                missing_invariant TEXT NOT NULL,
+                hypotheses_json TEXT NOT NULL,
+                preventive_action TEXT NOT NULL,
+                regression_case TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL,
+                closed_at INTEGER
+            );
+            CREATE UNIQUE INDEX IF NOT EXISTS one_loss_incident_per_soul_revision ON loss_incidents(soul_id,intent_revision);
+            CREATE TABLE IF NOT EXISTS runtime_notices (
+                notice_id TEXT PRIMARY KEY,
+                kind TEXT NOT NULL,
+                message TEXT NOT NULL,
+                reference TEXT NOT NULL,
+                incident_ids_json TEXT NOT NULL,
+                superseded_by TEXT,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS notice_receipts (
+                notice_id TEXT NOT NULL REFERENCES runtime_notices(notice_id),
+                profile_id TEXT NOT NULL,
+                state TEXT NOT NULL,
+                rendered_at INTEGER,
+                acknowledged_at INTEGER,
+                dismissed_at INTEGER,
+                updated_at INTEGER NOT NULL,
+                PRIMARY KEY(notice_id,profile_id)
+            );
+            CREATE TABLE IF NOT EXISTS runtime_counters (
+                name TEXT NOT NULL,
+                label TEXT NOT NULL,
+                value INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL,
+                PRIMARY KEY(name,label)
+            );
+            CREATE TABLE IF NOT EXISTS rollout_state (
+                singleton INTEGER PRIMARY KEY CHECK(singleton=1),
+                mode TEXT NOT NULL,
+                updated_at INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS migration_runs (
+                migration_id TEXT PRIMARY KEY,
+                current_mode TEXT NOT NULL,
+                requested_mode TEXT NOT NULL,
+                dry_run INTEGER NOT NULL,
+                plan_json TEXT NOT NULL,
+                backup_path TEXT,
+                applied_at INTEGER,
+                created_at INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS repair_audits (
+                audit_id TEXT PRIMARY KEY,
+                audit_json TEXT NOT NULL,
+                created_at INTEGER NOT NULL
+            );
+            INSERT OR IGNORE INTO rollout_state (singleton,mode,updated_at) VALUES (1,'legacy',0);
+            UPDATE installation SET schema_version=6,inventory_revision=inventory_revision+1 WHERE singleton=1;
+            "#,
+        )?;
+        tx.commit()?;
+        schema = 6;
+    }
     if schema != SCHEMA_VERSION {
         return Err(RegistryError::Integrity(format!(
             "unsupported older schema {schema}"
@@ -1825,7 +2171,7 @@ fn load_prepared_row(
     })
 }
 
-fn load_owned_handle(
+pub(crate) fn load_owned_handle(
     conn: &Connection,
     installation: InstallationId,
     incarnation_id: &IncarnationId,
@@ -1905,10 +2251,11 @@ fn load_recovery_context(
         String,
         Option<i64>,
         u64,
+        Option<String>,
     );
     let row: SoulRecoveryRow = conn
         .query_row(
-            "SELECT provider,provider_store_id,native_session_id,creation_seed_ref,desired_state,intent_revision,recovery_state,durability_state,allocation_state,checkpoint_revision,evidence_revision,resume_spec,project_key,resource_profile,recovery_window_started_at,successful_recoveries_in_window FROM souls WHERE soul_id=?1",
+            "SELECT provider,provider_store_id,native_session_id,creation_seed_ref,desired_state,intent_revision,recovery_state,durability_state,allocation_state,checkpoint_revision,evidence_revision,resume_spec,project_key,resource_profile,recovery_window_started_at,successful_recoveries_in_window,configured_limits FROM souls WHERE soul_id=?1",
             params![soul_id.as_str()],
             |row| {
                 Ok((
@@ -1928,6 +2275,7 @@ fn load_recovery_context(
                     row.get(13)?,
                     row.get(14)?,
                     row.get(15)?,
+                    row.get(16)?,
                 ))
             },
         )
@@ -1975,7 +2323,11 @@ fn load_recovery_context(
         profile: parse_runtime_profile(&row.13)?,
         fixture: prior_handle.fixture(),
         terminal: prior_handle.terminal().cloned(),
-        requested_limits: prior_handle.requested_limits(),
+        requested_limits: row
+            .16
+            .map(|value| serde_json::from_str(&value))
+            .transpose()?
+            .unwrap_or_else(|| prior_handle.requested_limits()),
         accepted_command_count,
         completed_command_count,
         never_dispatched,
@@ -1985,9 +2337,9 @@ fn load_recovery_context(
     })
 }
 
-fn load_inventory(conn: &Connection) -> Result<Vec<RuntimeView>, RegistryError> {
+pub(crate) fn load_inventory(conn: &Connection) -> Result<Vec<RuntimeView>, RegistryError> {
     let mut stmt = conn.prepare(
-        "SELECT i.soul_id,i.incarnation_id,i.launch_state,i.cleanup_state,s.intent_revision,i.container_id,i.host_boot_id,i.execution_generation,i.effective_limits,i.terminal_id,s.project_key,s.resource_profile,s.desired_state,s.recovery_state,s.durability_state,s.allocation_state,s.provider,s.native_session_id,s.recovery_reason,i.prior_incarnation_id,s.recovery_attempt_id,s.evidence_revision,s.successful_recoveries_in_window,i.terminal_spec FROM incarnations i JOIN souls s ON s.soul_id=i.soul_id ORDER BY i.created_at,i.incarnation_id",
+        "SELECT i.soul_id,i.incarnation_id,i.launch_state,i.cleanup_state,s.intent_revision,i.container_id,i.host_boot_id,i.execution_generation,i.effective_limits,i.terminal_id,s.project_key,s.resource_profile,s.desired_state,s.recovery_state,s.durability_state,s.allocation_state,s.provider,s.native_session_id,s.recovery_reason,i.prior_incarnation_id,s.recovery_attempt_id,s.evidence_revision,s.successful_recoveries_in_window,i.terminal_spec,s.configured_limits,(SELECT MAX(v.revision) FROM view_intents v WHERE v.soul_id=i.soul_id),s.loss_incident_id FROM incarnations i JOIN souls s ON s.soul_id=i.soul_id ORDER BY i.created_at,i.incarnation_id",
     )?;
     let mut rows = stmt.query([])?;
     let mut out = Vec::new();
@@ -2014,6 +2366,11 @@ fn load_inventory(conn: &Connection) -> Result<Vec<RuntimeView>, RegistryError> 
                 .map_err(|_| RegistryError::Integrity("invalid host boot id".into()))?,
             execution_generation: row.get(7)?,
             effective_limits: effective.map(|v| serde_json::from_str(&v)).transpose()?,
+            configured_limits: row
+                .get::<_, Option<String>>(24)?
+                .map(|value| serde_json::from_str(&value))
+                .transpose()?,
+            view_intent_revision: row.get(25)?,
             terminal_id: row.get(9)?,
             terminal_stream_id: terminal_spec.as_ref().map(|spec| spec.stream_id.clone()),
             terminal_mode: terminal_spec.as_ref().map(|spec| spec.mode.clone()),
@@ -2033,6 +2390,11 @@ fn load_inventory(conn: &Connection) -> Result<Vec<RuntimeView>, RegistryError> 
             provider: Some(row.get(16)?),
             native_session_id: row.get(17)?,
             recovery_reason: row.get(18)?,
+            incident_id: row
+                .get::<_, Option<String>>(26)?
+                .map(freshell_runtime_protocol::IncidentId::parse)
+                .transpose()
+                .map_err(|_| RegistryError::Integrity("invalid incident id".into()))?,
             prior_incarnation_id: row
                 .get::<_, Option<String>>(19)?
                 .map(IncarnationId::parse)
@@ -2130,7 +2492,7 @@ fn parse_cleanup_state(value: &str) -> Result<CleanupState, RegistryError> {
     })
 }
 
-fn now_millis() -> i64 {
+pub(crate) fn now_millis() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -2166,7 +2528,7 @@ fn acquire_exclusive_lock(_file: &std::fs::File) -> Result<(), RegistryError> {
 }
 
 #[cfg(feature = "runtime-test-faults")]
-fn failpoint(name: &'static str) -> Result<(), RegistryError> {
+pub(crate) fn failpoint(name: &'static str) -> Result<(), RegistryError> {
     if std::env::var("FRESHELL_RUNTIME_DB_FAILPOINT")
         .ok()
         .as_deref()
@@ -2178,7 +2540,7 @@ fn failpoint(name: &'static str) -> Result<(), RegistryError> {
 }
 
 #[cfg(not(feature = "runtime-test-faults"))]
-fn failpoint(_name: &'static str) -> Result<(), RegistryError> {
+pub(crate) fn failpoint(_name: &'static str) -> Result<(), RegistryError> {
     Ok(())
 }
 
@@ -2209,6 +2571,7 @@ mod tests {
             project_key: "test-project".into(),
             fixture: None,
             terminal: None,
+            view_intent: None,
             admission: AdmissionPolicy::default(),
         }
     }
@@ -2731,6 +3094,186 @@ mod tests {
             .map(Result::unwrap)
             .collect();
         assert!(columns.iter().any(|column| column == "protected_payload"));
+    }
+
+    fn drop_phase_six_schema(conn: &Connection) {
+        conn.execute_batch(
+            r#"
+            PRAGMA foreign_keys=OFF;
+            BEGIN IMMEDIATE;
+            DROP TABLE IF EXISTS notice_receipts;
+            DROP TABLE IF EXISTS runtime_notices;
+            DROP TABLE IF EXISTS runtime_counters;
+            DROP TABLE IF EXISTS migration_runs;
+            DROP TABLE IF EXISTS repair_audits;
+            DROP INDEX IF EXISTS one_loss_incident_per_soul_revision;
+            DROP TABLE IF EXISTS loss_incidents;
+            DROP TABLE IF EXISTS rollout_state;
+            ALTER TABLE souls DROP COLUMN loss_incident_id;
+            COMMIT;
+            PRAGMA foreign_keys=ON;
+            "#,
+        )
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn schema_five_migration_preserves_views_and_adds_loss_operations_tables() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("registry");
+        let installation = InstallationId::new();
+        let registry = Registry::open(&root, Some(installation.clone())).unwrap();
+        let db = registry.inner.db_path.clone();
+        let soul = SoulId::new();
+        registry
+            .prepare_launch(prep(soul.clone(), RequestId::new(), "schema-five"))
+            .await
+            .unwrap();
+        let before_views: u64 = open_connection(&db)
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM view_intents", [], |row| row.get(0))
+            .unwrap();
+        drop(registry);
+
+        let conn = open_connection(&db).unwrap();
+        drop_phase_six_schema(&conn);
+        conn.execute(
+            "UPDATE installation SET schema_version=5 WHERE singleton=1",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+
+        let migrated = Registry::open(&root, Some(installation)).unwrap();
+        let conn = open_connection(&migrated.inner.db_path).unwrap();
+        let schema: u32 = conn
+            .query_row(
+                "SELECT schema_version FROM installation WHERE singleton=1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(schema, SCHEMA_VERSION);
+        let after_views: u64 = conn
+            .query_row("SELECT COUNT(*) FROM view_intents", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(after_views, before_views);
+        for table in [
+            "loss_incidents",
+            "runtime_notices",
+            "notice_receipts",
+            "runtime_counters",
+            "rollout_state",
+            "migration_runs",
+            "repair_audits",
+        ] {
+            assert!(table_exists(&conn, table).unwrap(), "missing {table}");
+        }
+        assert!(column_exists(&conn, "souls", "loss_incident_id").unwrap());
+        let preserved: u64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM souls WHERE soul_id=?1",
+                params![soul.as_str()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(preserved, 1);
+    }
+
+    #[tokio::test]
+    async fn schema_four_migration_preserves_existing_rows_and_backfills_views() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("registry");
+        let installation = InstallationId::new();
+        let registry = Registry::open(&root, Some(installation.clone())).unwrap();
+        let db = registry.inner.db_path.clone();
+        let soul = SoulId::new();
+        let prepared = registry
+            .prepare_launch(prep(soul.clone(), RequestId::new(), "schema-four"))
+            .await
+            .unwrap();
+        let conn = open_connection(&db).unwrap();
+        conn.execute(
+            "UPDATE incarnations SET terminal_spec='{}' WHERE incarnation_id=?1",
+            params![prepared.incarnation_id.as_str()],
+        )
+        .unwrap();
+        drop(conn);
+        drop(registry);
+
+        let conn = open_connection(&db).unwrap();
+        drop_phase_six_schema(&conn);
+        conn.execute_batch(
+            r#"
+            PRAGMA foreign_keys=OFF;
+            BEGIN IMMEDIATE;
+            DROP TRIGGER IF EXISTS souls_inventory_insert;
+            DROP TRIGGER IF EXISTS souls_inventory_update;
+            DROP TRIGGER IF EXISTS souls_inventory_delete;
+            DROP TRIGGER IF EXISTS incarnations_inventory_insert;
+            DROP TRIGGER IF EXISTS incarnations_inventory_update;
+            DROP TRIGGER IF EXISTS incarnations_inventory_delete;
+            DROP TRIGGER IF EXISTS view_intents_inventory_insert;
+            DROP TRIGGER IF EXISTS view_intents_inventory_update;
+            DROP TRIGGER IF EXISTS view_intents_inventory_delete;
+            DROP INDEX IF EXISTS one_automatic_primary_view_per_soul;
+            DROP TABLE IF EXISTS view_intents;
+            ALTER TABLE souls DROP COLUMN configured_limits;
+            ALTER TABLE installation DROP COLUMN inventory_revision;
+            ALTER TABLE installation DROP COLUMN initial_scan_state;
+            ALTER TABLE installation DROP COLUMN initial_scan_error;
+            ALTER TABLE installation DROP COLUMN initial_scan_started_at;
+            ALTER TABLE installation DROP COLUMN initial_scan_finished_at;
+            ALTER TABLE installation DROP COLUMN initial_scan_peak_concurrency;
+            UPDATE installation SET schema_version=4 WHERE singleton=1;
+            COMMIT;
+            PRAGMA foreign_keys=ON;
+            "#,
+        )
+        .unwrap();
+        drop(conn);
+
+        let migrated = Registry::open(&root, Some(installation.clone())).unwrap();
+        assert_eq!(migrated.installation_id(), &installation);
+        let conn = open_connection(&migrated.inner.db_path).unwrap();
+        let schema: u32 = conn
+            .query_row(
+                "SELECT schema_version FROM installation WHERE singleton=1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(schema, SCHEMA_VERSION);
+        let preserved: u64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM souls WHERE soul_id=?1",
+                params![soul.as_str()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(preserved, 1);
+        let views: Vec<(String, String, String)> = {
+            let mut statement = conn
+                .prepare("SELECT soul_id,kind,visibility FROM view_intents WHERE soul_id=?1")
+                .unwrap();
+            statement
+                .query_map(params![soul.as_str()], |row| {
+                    Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+                })
+                .unwrap()
+                .map(Result::unwrap)
+                .collect()
+        };
+        assert_eq!(
+            views,
+            vec![(
+                soul.to_string(),
+                "automatic_primary".into(),
+                "visible".into()
+            )]
+        );
+        assert!(column_exists(&conn, "souls", "configured_limits").unwrap());
+        assert!(column_exists(&conn, "installation", "inventory_revision").unwrap());
     }
 
     #[test]

@@ -84,6 +84,15 @@ async fn run() -> Result<(), String> {
         },
     )
     .map_err(|e| e.message)?;
+    supervisor
+        .reconcile_pending_loss_cleanup()
+        .await
+        .map_err(|error| format!("pending loss cleanup reconciliation: {}", error.message))?;
+    supervisor
+        .reconcile_startup()
+        .await
+        .map_err(|error| format!("startup reconciliation: {}", error.message))?;
+    supervisor.spawn_runtime_observer();
     serve_control(supervisor, &control_socket).await
 }
 

@@ -95,6 +95,12 @@ export class TestHarness {
    * This works with all renderers (WebGL, canvas, DOM) unlike DOM scraping.
    * @param terminalId - specific terminal ID, or omit for first registered terminal
    */
+  async getRegisteredTerminalIds(): Promise<string[]> {
+    return this.page.evaluate(() => (
+      window.__FRESHELL_TEST_HARNESS__?.getRegisteredTerminalIds?.() ?? []
+    ))
+  }
+
   async getTerminalBuffer(terminalId?: string): Promise<string | null> {
     return this.page.evaluate((id) => {
       const harness = window.__FRESHELL_TEST_HARNESS__
