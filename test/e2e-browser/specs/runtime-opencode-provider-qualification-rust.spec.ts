@@ -26,6 +26,7 @@ import {
 import { openPanePicker } from '../helpers/pane-picker.js'
 import { TerminalHelper } from '../helpers/terminal-helpers.js'
 import { TestHarness } from '../helpers/test-harness.js'
+import { OPENCODE_NATIVE_HISTORY_SCRIPT, nativeAssistantProof, type NativeAssistantTurn } from '../helpers/opencode-native-history.js'
 import type { ProviderQualificationRow } from '../../../scripts/testing/provider-qualification-receipt.js'
 
 function leavesByMode(node: any, mode: string): any[] {
@@ -247,24 +248,6 @@ async function waitForReplacementPrompt(
   }, 120_000)
 }
 
-async function terminalBuffer(page: Page, terminalId: string): Promise<string> {
-  return page.evaluate((id) => (
-    window.__FRESHELL_TEST_HARNESS__?.getTerminalBuffer?.(id) ?? ''
-  ), terminalId)
-}
-
-function occurrenceCount(value: string, needle: string): number {
-  if (!needle) return 0
-  let count = 0
-  let offset = 0
-  while (true) {
-    const found = value.indexOf(needle, offset)
-    if (found < 0) return count
-    count += 1
-    offset = found + needle.length
-  }
-}
-
 async function paneSessionId(
   harness: TestHarness,
   tabId: string,
@@ -273,6 +256,33 @@ async function paneSessionId(
   const content = leavesByMode(await harness.getPaneLayout(tabId), 'opencode')
     .find((candidate) => candidate.id === paneId)?.content
   return typeof content?.sessionRef?.sessionId === 'string' ? content.sessionRef.sessionId : null
+}
+
+function nativeAssistantTurns(rig: ManagedRuntimeBrowserRig, view: ManagedRuntimeView, sessionId: string): NativeAssistantTurn[] {
+  if (!view.containerId) throw new Error('native evidence probe has no exact owned container')
+  const raw = rig.ownedProviderExec(view.containerId, [
+    'node', '--no-warnings', '-e', OPENCODE_NATIVE_HISTORY_SCRIPT,
+    '/home/freshell/provider/.local/share/opencode/opencode.db', sessionId,
+  ])
+  const evidence = JSON.parse(raw)
+  expect(evidence.schemaVersion).toBe(1)
+  expect(evidence.sessionId).toBe(sessionId)
+  return evidence.available ? evidence.turns : []
+}
+
+async function nextNativeAssistantTurn(
+  rig: ManagedRuntimeBrowserRig, view: ManagedRuntimeView, sessionId: string,
+  priorMessageIds: ReadonlySet<string>,
+): Promise<NativeAssistantTurn> {
+  return waitForValue('a new completed native assistant message, not a rendered echo', () => (
+    nativeAssistantTurns(rig, view, sessionId).find((turn) => !priorMessageIds.has(turn.messageId)) ?? null
+  ), 180_000)
+}
+
+function verifyMemoryAnswer(turn: NativeAssistantTurn, projectName: string): void {
+  expect(turn.toolPartCount, 'conversation recall must not consult workspace files or tools').toBe(0)
+  expect(`${turn.providerId}/${turn.modelId}`).toBe(P2_OPENCODE_FREE_MODEL)
+  expect(turn.text).toContain(projectName)
 }
 
 function cgroupLimitsVerified(rig: ManagedRuntimeBrowserRig, view: ManagedRuntimeView): boolean {
@@ -366,24 +376,21 @@ test.describe.serial('OpenCode provider qualification', () => {
       const limitsVerified = cgroupLimitsVerified(rig, first.view)
       expect(limitsVerified).toBe(true)
 
-      const nonce = `P3_NATIVE_MEMORY_${randomBytes(16).toString('hex')}`
-      const storedSuffix = Math.random().toString(36).slice(2, 10).toUpperCase()
-      const storedMarker = `P3_STORED_${storedSuffix}`
-      const storedBefore = occurrenceCount(await terminalBuffer(page, first.terminalId), storedMarker)
+      // A plain conversation task avoids synthetic marker-assembly prompts.
+      // Proof comes from NEW provider-native assistant rows, never echoed input
+      // or a redraw of old terminal history. The project name has 128 bits.
+      const nonce = `p-${randomBytes(16).toString('base64url')}`
       await executeInPane(
-        page,
-        first.paneId,
-        `Remember this exact nonce only in our conversation: ${nonce}. Use no tools. Reply by joining P3, STORED, and ${storedSuffix} with underscores and no other text.`,
+        page, first.paneId,
+        `For the project we are discussing, the name is ${nonce}. What is the project name?`,
       )
-      await waitForValue('an unechoed completed-turn marker', async () => (
-        occurrenceCount(await terminalBuffer(page, first.terminalId), storedMarker) > storedBefore
-          ? true
-          : null
-      ), 180_000)
       const nativeSessionId = await waitForValue('first exact OpenCode session id', async () => (
         await paneSessionId(harness, tabId, first.paneId)
       ), 120_000)
       expect(nativeSessionId).toMatch(/^ses_/)
+      const firstAnswer = await nextNativeAssistantTurn(rig, first.view, nativeSessionId, new Set())
+      verifyMemoryAnswer(firstAnswer, nonce)
+      const nativeConversationProofs = [nativeAssistantProof(nativeSessionId, firstAnswer)]
 
       // Session-host/container loss: exact old enclosure must be empty before
       // the new incarnation becomes the sole writer.
@@ -408,19 +415,12 @@ test.describe.serial('OpenCode provider qualification', () => {
         (await paneSessionId(harness, tabId, first.paneId)) === nativeSessionId ? true : null
       ), 120_000)
       await waitForReplacementPrompt(page, harness, rig, tabId, first.paneId, afterHostCrash)
-      const nonceOccurrencesBeforeRecall = occurrenceCount(
-        await terminalBuffer(page, first.terminalId),
-        nonce,
-      )
-      await executeInPane(
-        page,
-        first.paneId,
-        'Without using tools or reading files, reply with exactly the nonce from my first instruction.',
-      )
-      await waitForValue('a new nonce occurrence in the recovered model response', async () => {
-        const count = occurrenceCount(await terminalBuffer(page, first.terminalId), nonce)
-        return count > nonceOccurrencesBeforeRecall ? true : null
-      }, 180_000)
+      const beforeRecall = new Set(nativeAssistantTurns(rig, afterHostCrash, nativeSessionId).map((turn) => turn.messageId))
+      await executeInPane(page, first.paneId, 'What is the name of the project we chose earlier?')
+      const recalledAnswer = await nextNativeAssistantTurn(rig, afterHostCrash, nativeSessionId, beforeRecall)
+      verifyMemoryAnswer(recalledAnswer, nonce)
+      expect(recalledAnswer.messageId).not.toBe(firstAnswer.messageId)
+      nativeConversationProofs.push(nativeAssistantProof(nativeSessionId, recalledAnswer))
       const recalledNonce = true
 
       // Provider-process loss: kill only the exact host-recorded worker PID,
@@ -449,19 +449,12 @@ test.describe.serial('OpenCode provider qualification', () => {
         afterProviderCrash.incarnationId,
       )
       await waitForReplacementPrompt(page, harness, rig, tabId, first.paneId, afterProviderCrash)
-      const providerMarker = `P3_PROVIDER_PROCESS_RECOVERED_${Math.random().toString(36).slice(2, 10).toUpperCase()}`
-      const providerMarkerParts = providerMarker.split('_')
-      const providerMarkerBefore = occurrenceCount(await terminalBuffer(page, first.terminalId), providerMarker)
-      await executeInPane(
-        page,
-        first.paneId,
-        `Use no tools. Reply by joining ${providerMarkerParts.join(', ')} with underscores and no other text.`,
-      )
-      await waitForValue('an unechoed provider-recovery follow-up marker', async () => (
-        occurrenceCount(await terminalBuffer(page, first.terminalId), providerMarker) > providerMarkerBefore
-          ? true
-          : null
-      ), 180_000)
+      const beforeProviderFollowup = new Set(nativeAssistantTurns(rig, afterProviderCrash, nativeSessionId).map((turn) => turn.messageId))
+      await executeInPane(page, first.paneId, 'Please remind me of the project name we selected.')
+      const providerAnswer = await nextNativeAssistantTurn(rig, afterProviderCrash, nativeSessionId, beforeProviderFollowup)
+      verifyMemoryAnswer(providerAnswer, nonce)
+      expect(providerAnswer.messageId).not.toBe(recalledAnswer.messageId)
+      nativeConversationProofs.push(nativeAssistantProof(nativeSessionId, providerAnswer))
       const providerFollowUpCompleted = true
 
       // A second OpenCode soul is independently owned, while an explicit
@@ -469,22 +462,16 @@ test.describe.serial('OpenCode provider qualification', () => {
       const prior = new Set(leavesByMode(await harness.getPaneLayout(tabId), 'opencode').map((leaf) => leaf.id))
       const second = await createOpencodePane(page, harness, terminal, rig, tabId, prior)
       if (!second.view.containerId) throw new Error('second OpenCode view lacks container')
-      const secondMarker = `P3_SECOND_SOUL_READY_${Math.random().toString(36).slice(2, 10).toUpperCase()}`
-      const secondMarkerParts = secondMarker.split('_')
-      const secondMarkerBefore = occurrenceCount(await terminalBuffer(page, second.terminalId), secondMarker)
-      await executeInPane(
-        page,
-        second.paneId,
-        `Use no tools. Reply by joining ${secondMarkerParts.join(', ')} with underscores and no other text.`,
-      )
-      await waitForValue('an unechoed second-soul marker', async () => (
-        occurrenceCount(await terminalBuffer(page, second.terminalId), secondMarker) > secondMarkerBefore
-          ? true
-          : null
-      ), 180_000)
+      const secondNonce = `p-${randomBytes(16).toString('base64url')}`
+      await executeInPane(page, second.paneId,
+        `For the project we are discussing, the name is ${secondNonce}. What is the project name?`)
       const secondSessionId = await waitForValue('second exact OpenCode session id', async () => (
         await paneSessionId(harness, tabId, second.paneId)
       ), 120_000)
+      const secondAnswer = await nextNativeAssistantTurn(rig, second.view, secondSessionId, new Set())
+      verifyMemoryAnswer(secondAnswer, secondNonce)
+      expect(secondAnswer.text).not.toContain(nonce)
+      nativeConversationProofs.push(nativeAssistantProof(secondSessionId, secondAnswer))
       expect(second.view.soulId).not.toBe(first.view.soulId)
       expect(second.view.containerId).not.toBe(afterProviderCrash.containerId)
       expect(secondSessionId).not.toBe(nativeSessionId)
@@ -546,6 +533,7 @@ test.describe.serial('OpenCode provider qualification', () => {
         model: P2_OPENCODE_FREE_MODEL,
         reasoningEffort: 'provider-default',
         completedTurn: true,
+        nativeConversationProofs,
         nativeStateCaptured: true,
         nativeSessionId,
         runtimeOwned: true,
