@@ -1,7 +1,6 @@
 #!/usr/bin/env node
 
 import { spawn, type ChildProcess } from 'node:child_process'
-import { createRequire } from 'node:module'
 import path from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 import {
@@ -9,10 +8,10 @@ import {
   detectProjectManager,
   resolveManagerCommand,
 } from '../lib/package-manager.js'
+import { resolveVitestCommand } from './coordinator-upstream.js'
 
 const SCRIPT_DIR = path.dirname(fileURLToPath(import.meta.url))
 const PROJECT_ROOT = path.resolve(SCRIPT_DIR, '../..')
-const REQUIRE = createRequire(path.join(PROJECT_ROOT, 'package.json'))
 
 function log(severity: 'info' | 'error', event: string, fields: Record<string, unknown> = {}): void {
   const stream = severity === 'error' ? process.stderr : process.stdout
@@ -127,9 +126,9 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
     if (exitCode !== 0) return exitCode
   }
 
-  const vitest = REQUIRE.resolve('vitest/vitest.mjs')
+  const vitest = resolveVitestCommand(PROJECT_ROOT)
   const config = path.join(PROJECT_ROOT, 'config', 'vitest', 'vitest.runtime.config.ts')
-  return runChild(process.execPath, [vitest, 'run', '--config', config, ...argv], process.env)
+  return runChild(vitest.command, [...vitest.args, 'run', '--config', config, ...argv], process.env)
 }
 
 if (process.argv[1] && pathToFileURL(process.argv[1]).href === import.meta.url) {

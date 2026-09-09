@@ -1,6 +1,7 @@
 // @vitest-environment node
 import { EventEmitter } from 'node:events'
 import fs from 'node:fs'
+import { createRequire } from 'node:module'
 import os from 'node:os'
 import path from 'node:path'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
@@ -14,6 +15,11 @@ vi.mock('node:child_process', async (original) => ({
 import { main as runSourceRuntimeTests } from '../../../scripts/testing/run-source-runtime-tests.js'
 import { main as runStandardTests } from '../../../scripts/run-standard-tests.js'
 import { resolveManagerExecFileCommand } from '../../setup/manager-command.js'
+
+const require = createRequire(import.meta.url)
+const vitestPackagePath = require.resolve('vitest/package.json')
+const vitestManifest = JSON.parse(fs.readFileSync(vitestPackagePath, 'utf8')) as { bin: { vitest: string } }
+const expectedVitestEntrypoint = path.resolve(path.dirname(vitestPackagePath), vitestManifest.bin.vitest)
 
 interface LaunchFixture {
   root: string
@@ -106,6 +112,12 @@ describe('runtime test script manager launches', () => {
     expect(specs).toContainEqual({
       command: 'cargo',
       args: ['build', '--release', '-p', 'freshell-server', '--locked'],
+      windowsHide: true,
+      shell: false,
+    })
+    expect(specs.at(-1)).toMatchObject({
+      command: process.execPath,
+      args: [expectedVitestEntrypoint, 'run', '--config', expect.stringContaining('vitest.runtime.config.ts')],
       windowsHide: true,
       shell: false,
     })

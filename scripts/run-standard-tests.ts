@@ -1,7 +1,6 @@
 #!/usr/bin/env tsx
 
 import { execFileSync, spawn, type ChildProcess } from 'node:child_process'
-import { createRequire } from 'node:module'
 import { availableParallelism, constants as osConstants, setPriority } from 'node:os'
 import { dirname, resolve } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
@@ -12,11 +11,11 @@ import {
   resolveManagerCommand,
   type PackageManagerKind,
 } from './lib/package-manager.js'
+import { resolveVitestCommand } from './testing/coordinator-upstream.js'
 
 const SCRIPT_DIR = dirname(fileURLToPath(import.meta.url))
 const PROJECT_ROOT = resolve(SCRIPT_DIR, '..')
-const REQUIRE = createRequire(resolve(PROJECT_ROOT, 'package.json'))
-const VITEST_ENTRYPOINT = REQUIRE.resolve('vitest/vitest.mjs')
+const VITEST_ENTRYPOINT = resolveVitestCommand(PROJECT_ROOT).args[0]
 const DEFAULT_VITEST_CONFIG = 'config/vitest/vitest.config.ts'
 const ELECTRON_VITEST_CONFIG = 'config/vitest/vitest.electron.config.ts'
 const ELECTRON_RUNTIME_VITEST_CONFIG = 'config/vitest/vitest.electron-runtime.config.ts'
