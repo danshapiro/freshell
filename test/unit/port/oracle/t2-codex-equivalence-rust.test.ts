@@ -91,7 +91,7 @@ function mtimeMs(filePath: string): number {
   try { return fs.statSync(filePath).mtimeMs } catch { return -1 }
 }
 
-const describeLive = shouldRun ? describe.sequential : describe.skip
+const describeLive = shouldRun ? describe : describe.skip
 
 describeLive('T2 equivalence — original ≡ rust (freshcodex + cheap-GPT, codex app-server)', () => {
   let run: CodexT2Run | null = null

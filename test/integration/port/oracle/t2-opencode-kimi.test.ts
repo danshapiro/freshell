@@ -81,7 +81,7 @@ function opencodeVersion(): string {
   return r.status === 0 ? r.stdout.trim().split('\n')[0] : 'unknown'
 }
 
-const describeLive = shouldRun ? describe.sequential : describe.skip
+const describeLive = shouldRun ? describe : describe.skip
 
 describeLive('T2 live opencode + Kimi k2.7 behavioral invariants (original server)', () => {
   let run: T2Run | null = null

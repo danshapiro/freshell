@@ -12,10 +12,7 @@ function resolveTsxLoaderPath(): string {
 const { mockConnect, mockRegisterTool, mockMcpServer, mockStdioTransport, mockExecuteAction } = vi.hoisted(() => {
   const mockConnect = vi.fn().mockResolvedValue(undefined)
   const mockRegisterTool = vi.fn()
-  const mockMcpServer = vi.fn().mockReturnValue({
-    tool: mockRegisterTool,
-    connect: mockConnect,
-  })
+  const mockMcpServer = vi.fn()
   const mockStdioTransport = vi.fn()
   const mockExecuteAction = vi.fn().mockResolvedValue({ ok: true })
   return { mockConnect, mockRegisterTool, mockMcpServer, mockStdioTransport, mockExecuteAction }
@@ -46,11 +43,13 @@ describe('MCP server initialization', () => {
     mockStdioTransport.mockClear()
     mockExecuteAction.mockClear()
 
-    // Re-mock after resetModules
-    mockMcpServer.mockReturnValue({
-      tool: mockRegisterTool,
-      connect: mockConnect,
+    // Vitest 5 models constructor mocks as classes. Keep constructor call
+    // recording on the vi.fn while returning the same minimal SDK surface.
+    mockMcpServer.mockImplementation(class {
+      tool = mockRegisterTool
+      connect = mockConnect
     })
+    mockStdioTransport.mockImplementation(class {})
   })
 
   async function importServer() {

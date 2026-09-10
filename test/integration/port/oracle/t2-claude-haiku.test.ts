@@ -87,7 +87,7 @@ function credentialMtimeMs(): number {
   try { return fs.statSync(claudeCredPaths().userCredentials).mtimeMs } catch { return -1 }
 }
 
-const describeLive = shouldRun ? describe.sequential : describe.skip
+const describeLive = shouldRun ? describe : describe.skip
 
 describeLive('T2 live freshclaude + Claude Haiku behavioral invariants (original server)', () => {
   let run: ClaudeT2Run | null = null

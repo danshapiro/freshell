@@ -97,7 +97,7 @@ function mtimeMs(filePath: string): number {
   try { return fs.statSync(filePath).mtimeMs } catch { return -1 }
 }
 
-const describeLive = shouldRun ? describe.sequential : describe.skip
+const describeLive = shouldRun ? describe : describe.skip
 
 describeLive('T2 equivalence — original ≡ rust (freshclaude + Claude Haiku, Node claude-sidecar)', () => {
   let run: ClaudeT2Run | null = null
