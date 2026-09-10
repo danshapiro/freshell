@@ -2052,6 +2052,10 @@
               ],
               "type": "string"
             },
+            "requestId": {
+              "minLength": 1,
+              "type": "string"
+            },
             "sessionId": {
               "minLength": 1,
               "type": "string"
@@ -3328,6 +3332,10 @@
               ],
               "type": "string"
             },
+            "requestId": {
+              "minLength": 1,
+              "type": "string"
+            },
             "sessionId": {
               "minLength": 1,
               "type": "string"
@@ -3706,6 +3714,10 @@
             "codex",
             "opencode"
           ],
+          "type": "string"
+        },
+        "requestId": {
+          "minLength": 1,
           "type": "string"
         },
         "sessionId": {

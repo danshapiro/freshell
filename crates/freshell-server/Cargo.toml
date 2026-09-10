@@ -37,7 +37,6 @@ name = "freshell-server"
 path = "src/main.rs"
 
 [dependencies]
-freshell-agent-runtime = { path = "../freshell-agent-runtime", optional = true }
 freshell-protocol = { path = "../freshell-protocol" }
 freshell-ws = { path = "../freshell-ws" }
 freshell-api = { path = "../freshell-api" }
@@ -59,6 +58,7 @@ freshell-sessions = { path = "../freshell-sessions" }
 # The shared terminal registry constructed into WsState (terminals owned by
 # terminalId across connections — the multi-client / reconnection backbone).
 freshell-terminal = { path = "../freshell-terminal" }
+freshell-agent-runtime = { path = "../freshell-agent-runtime", optional = true }
 freshell-runtime-client = { path = "../freshell-runtime-client", optional = true }
 freshell-runtime-observability = { path = "../freshell-runtime-observability" }
 freshell-runtime-protocol = { path = "../freshell-runtime-protocol", optional = true }

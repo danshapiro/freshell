@@ -1,6 +1,77 @@
 use super::*;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+struct OperationTransport {
+    operations: std::sync::Mutex<Vec<(String, FreshAgentOperation)>>,
+    supported: bool,
+    operation_failure: Option<OperationFailureKind>,
+    operation_native_session_id: Option<String>,
+}
+
+#[async_trait]
+impl FreshAgentTransport for OperationTransport {
+    async fn start(&self, _profile: &FreshAgentProfile) -> Result<TransportStart, String> {
+        Ok(TransportStart {
+            native_session_id: Some("native-ops".into()),
+        })
+    }
+    async fn dispatch(
+        &self,
+        _: &RequestId,
+        _: &str,
+        _: &FreshAgentProfile,
+    ) -> Result<DispatchAck, DispatchFailure> {
+        unreachable!()
+    }
+    async fn resolve_permission(&self, _: &str, _: Value) -> Result<(), DispatchFailure> {
+        unreachable!()
+    }
+    async fn interrupt(&self) -> Result<(), String> {
+        Ok(())
+    }
+    async fn supports_operation(&self, _: &FreshAgentOperation) -> Result<bool, String> {
+        Ok(self.supported)
+    }
+    async fn dispatch_operation(
+        &self,
+        request_id: &RequestId,
+        operation: &FreshAgentOperation,
+    ) -> Result<OperationAck, OperationFailure> {
+        self.operations
+            .lock()
+            .unwrap()
+            .push((request_id.as_str().into(), operation.clone()));
+        if let Some(kind) = self.operation_failure {
+            return Err(OperationFailure {
+                kind,
+                message: "fixture rejection".into(),
+                acceptance_ambiguous: false,
+            });
+        }
+        Ok(OperationAck {
+            provider_ack_id: Some(request_id.as_str().into()),
+            native_session_id: self.operation_native_session_id.clone(),
+        })
+    }
+    async fn capture(&self, max_bytes: usize) -> Result<FreshAgentCapture, String> {
+        let text = "user: hello\nassistant: world";
+        Ok(FreshAgentCapture {
+            provider: FreshProvider::Claude,
+            session_type: "freshclaude".into(),
+            presentation_session_id: "presentation-ops".into(),
+            native_session_id: "native-ops".into(),
+            text: text[..text.len().min(max_bytes)].into(),
+            truncated: max_bytes < text.len(),
+        })
+    }
+    async fn stop(self: Arc<Self>) -> Result<(), String> {
+        Ok(())
+    }
+    fn take_event_stream(&self) -> Option<tokio::sync::mpsc::Receiver<AgentEvent>> {
+        None
+    }
+}
+
 struct FakeTransport {
     native: String,
     starts: AtomicUsize,
@@ -186,6 +257,256 @@ fn profile(provider: FreshProvider, store: &str, native: Option<&str>) -> FreshA
         provider_store_id: store.into(),
         native_session_id: native.map(str::to_string),
     }
+}
+
+#[tokio::test]
+async fn semantic_operations_are_durable_idempotent_and_conflict_on_changed_payload() {
+    let dir = tempfile::tempdir().unwrap();
+    let transport = Arc::new(OperationTransport {
+        operations: std::sync::Mutex::new(Vec::new()),
+        supported: true,
+        operation_failure: None,
+        operation_native_session_id: Some("native-ops".into()),
+    });
+    let actor = FreshAgentHostActor::open(
+        dir.path(),
+        profile(FreshProvider::Claude, "ops", None),
+        transport.clone(),
+    )
+    .await
+    .unwrap();
+    let request_id = RequestId::parse("compact-stable-1").unwrap();
+    let operation = FreshAgentOperation::Compact {
+        instructions: Some("retain decisions".into()),
+        cwd: Some("/workspace".into()),
+    };
+    assert_eq!(
+        actor
+            .semantic_operation(request_id.clone(), operation.clone())
+            .await
+            .unwrap(),
+        CommandState::ProviderAcked
+    );
+    assert_eq!(
+        actor
+            .semantic_operation(request_id.clone(), operation)
+            .await
+            .unwrap(),
+        CommandState::ProviderAcked
+    );
+    assert_eq!(transport.operations.lock().unwrap().len(), 1);
+    let conflict = actor
+        .semantic_operation(
+            request_id,
+            FreshAgentOperation::Compact {
+                instructions: Some("different".into()),
+                cwd: Some("/workspace".into()),
+            },
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(conflict, ActorError::RequestConflict);
+}
+
+#[tokio::test]
+async fn unsupported_semantic_operation_is_rejected_before_journal_or_transport_mutation() {
+    let dir = tempfile::tempdir().unwrap();
+    let transport = Arc::new(OperationTransport {
+        operations: std::sync::Mutex::new(Vec::new()),
+        supported: false,
+        operation_failure: None,
+        operation_native_session_id: Some("native-ops".into()),
+    });
+    let actor = FreshAgentHostActor::open(
+        dir.path(),
+        profile(FreshProvider::Codex, "ops-unsupported", None),
+        transport.clone(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        actor
+            .semantic_operation(
+                RequestId::parse("redo-stable-1").unwrap(),
+                FreshAgentOperation::Rollback {
+                    direction: FreshAgentRollbackDirection::Redo,
+                    mode: FreshAgentRollbackMode::Step,
+                    turn_id: None,
+                    cwd: None,
+                },
+            )
+            .await
+            .unwrap_err(),
+        ActorError::UnsupportedOperation
+    );
+    assert!(transport.operations.lock().unwrap().is_empty());
+    let persisted: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(dir.path().join("fresh-agent-state.json")).unwrap())
+            .unwrap();
+    assert_eq!(persisted["commands"].as_object().unwrap().len(), 0);
+}
+
+#[tokio::test]
+async fn semantic_dispatch_ack_gap_becomes_ambiguous_after_restart_and_is_never_replayed() {
+    let dir = tempfile::tempdir().unwrap();
+    let operation = FreshAgentOperation::Compact {
+        instructions: None,
+        cwd: None,
+    };
+    let request_id = RequestId::parse("compact-gap-1").unwrap();
+    let first_transport = Arc::new(OperationTransport {
+        operations: std::sync::Mutex::new(Vec::new()),
+        supported: true,
+        operation_failure: None,
+        operation_native_session_id: Some("native-ops".into()),
+    });
+    let actor = FreshAgentHostActor::open(
+        dir.path(),
+        profile(FreshProvider::Claude, "gap", None),
+        first_transport,
+    )
+    .await
+    .unwrap();
+    actor
+        .semantic_operation(request_id.clone(), operation.clone())
+        .await
+        .unwrap();
+    drop(actor);
+    let path = dir.path().join("fresh-agent-state.json");
+    let mut persisted: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    persisted["commands"][request_id.as_str()]["state"] = serde_json::json!("dispatching");
+    std::fs::write(&path, serde_json::to_vec(&persisted).unwrap()).unwrap();
+
+    let recovered_transport = Arc::new(OperationTransport {
+        operations: std::sync::Mutex::new(Vec::new()),
+        supported: true,
+        operation_failure: None,
+        operation_native_session_id: Some("native-ops".into()),
+    });
+    let recovered = FreshAgentHostActor::open(
+        dir.path(),
+        profile(FreshProvider::Claude, "gap", Some("native-ops")),
+        recovered_transport.clone(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        recovered
+            .semantic_operation(request_id, operation)
+            .await
+            .unwrap_err(),
+        ActorError::AmbiguousDispatch
+    );
+    assert!(recovered_transport.operations.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn provider_preflight_unsupported_result_is_typed_and_idempotent_after_journaling() {
+    let dir = tempfile::tempdir().unwrap();
+    let transport = Arc::new(OperationTransport {
+        operations: std::sync::Mutex::new(Vec::new()),
+        supported: true,
+        operation_failure: Some(OperationFailureKind::Unsupported),
+        operation_native_session_id: Some("native-ops".into()),
+    });
+    let actor = FreshAgentHostActor::open(
+        dir.path(),
+        profile(FreshProvider::Opencode, "dynamic-unsupported", None),
+        transport.clone(),
+    )
+    .await
+    .unwrap();
+    let request_id = RequestId::parse("undo-dynamic-unsupported").unwrap();
+    let operation = FreshAgentOperation::Rollback {
+        direction: FreshAgentRollbackDirection::Undo,
+        mode: FreshAgentRollbackMode::Step,
+        turn_id: None,
+        cwd: None,
+    };
+    for _ in 0..2 {
+        assert_eq!(
+            actor
+                .semantic_operation(request_id.clone(), operation.clone())
+                .await
+                .unwrap_err(),
+            ActorError::UnsupportedOperation
+        );
+    }
+    assert_eq!(transport.operations.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn capture_is_read_only_bounded_and_keeps_both_session_identities() {
+    let dir = tempfile::tempdir().unwrap();
+    let transport = Arc::new(OperationTransport {
+        operations: std::sync::Mutex::new(Vec::new()),
+        supported: true,
+        operation_failure: None,
+        operation_native_session_id: Some("native-ops".into()),
+    });
+    let actor = FreshAgentHostActor::open(
+        dir.path(),
+        profile(FreshProvider::Claude, "capture", None),
+        transport,
+    )
+    .await
+    .unwrap();
+    let capture = actor.capture(12).await.unwrap();
+    assert_eq!(capture.presentation_session_id, "presentation-ops");
+    assert_eq!(capture.native_session_id, "native-ops");
+    assert!(capture.text.len() <= 12);
+    assert!(capture.truncated);
+}
+
+#[tokio::test]
+async fn semantic_operation_ack_rotates_and_persists_native_identity() {
+    let dir = tempfile::tempdir().unwrap();
+    let transport = Arc::new(OperationTransport {
+        operations: std::sync::Mutex::new(Vec::new()),
+        supported: true,
+        operation_failure: None,
+        operation_native_session_id: Some("native-after-rollback".into()),
+    });
+    let actor = FreshAgentHostActor::open(
+        dir.path(),
+        profile(FreshProvider::Claude, "identity-rotation", None),
+        transport,
+    )
+    .await
+    .unwrap();
+
+    actor
+        .semantic_operation(
+            RequestId::parse("undo-reroots-native-identity").unwrap(),
+            FreshAgentOperation::Rollback {
+                direction: FreshAgentRollbackDirection::Undo,
+                mode: FreshAgentRollbackMode::Step,
+                turn_id: None,
+                cwd: None,
+            },
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        actor.profile().await.native_session_id.as_deref(),
+        Some("native-after-rollback")
+    );
+    let persisted: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(dir.path().join("fresh-agent-state.json")).unwrap())
+            .unwrap();
+    assert_eq!(
+        persisted["profile"]["nativeSessionId"],
+        "native-after-rollback"
+    );
+    assert!(actor.read_events(0, 20).await.events.iter().any(|event| {
+        matches!(
+            &event.event,
+            AgentEvent::Started { native_session_id }
+                if native_session_id == "native-after-rollback"
+        )
+    }));
 }
 
 #[tokio::test]

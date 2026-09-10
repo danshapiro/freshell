@@ -7,7 +7,10 @@ use async_trait::async_trait;
 pub use freshell_runtime_protocol::{
     AgentEvent, AgentEventBatch as EventBatch, AgentJournalEvent as JournalEvent, FreshProvider,
 };
-use freshell_runtime_protocol::{CommandState, FreshAgentTurnSettings, RequestId};
+use freshell_runtime_protocol::{
+    CommandState, FreshAgentCapture, FreshAgentRollbackDirection, FreshAgentRollbackMode,
+    FreshAgentTurnSettings, RequestId,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -77,6 +80,14 @@ pub struct DispatchAck {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OperationAck {
+    pub provider_ack_id: Option<String>,
+    /// Some rollback implementations materialize a new provider-native
+    /// conversation while retaining the Freshell presentation identity.
+    pub native_session_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DispatchFailure {
     pub message: String,
     /// True when the request crossed the transport's acceptance boundary or
@@ -93,6 +104,35 @@ pub struct ForkTransition {
     /// retired inside this same soul. This lets the web avoid translating a
     /// provider-native branch operation into a destructive whole-soul stop.
     pub parent_retired_by_runtime: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OperationFailureKind {
+    Unsupported,
+    Rejected,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OperationFailure {
+    pub kind: OperationFailureKind,
+    pub message: String,
+    pub acceptance_ambiguous: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "operation", rename_all = "snake_case")]
+pub enum FreshAgentOperation {
+    Compact {
+        instructions: Option<String>,
+        cwd: Option<String>,
+    },
+    Rollback {
+        direction: FreshAgentRollbackDirection,
+        mode: FreshAgentRollbackMode,
+        turn_id: Option<String>,
+        cwd: Option<String>,
+    },
 }
 
 #[async_trait]
@@ -123,6 +163,23 @@ pub trait FreshAgentTransport: Send + Sync {
         })
     }
     async fn interrupt(&self) -> Result<(), String>;
+    async fn supports_operation(&self, _operation: &FreshAgentOperation) -> Result<bool, String> {
+        Ok(false)
+    }
+    async fn dispatch_operation(
+        &self,
+        _request_id: &RequestId,
+        _operation: &FreshAgentOperation,
+    ) -> Result<OperationAck, OperationFailure> {
+        Err(OperationFailure {
+            kind: OperationFailureKind::Unsupported,
+            message: "provider does not support this operation".into(),
+            acceptance_ambiguous: false,
+        })
+    }
+    async fn capture(&self, _max_bytes: usize) -> Result<FreshAgentCapture, String> {
+        Err("provider does not expose a hosted snapshot".into())
+    }
     /// Whether this actor still owns a usable provider enclosure. Provider
     /// adapters may self-heal a child internally; they should report false
     /// only when no live owned session remains.
@@ -145,6 +202,8 @@ pub enum ActorError {
     RequestConflict,
     #[error("command dispatch is ambiguous and will not be replayed")]
     AmbiguousDispatch,
+    #[error("provider does not support this operation")]
+    UnsupportedOperation,
     #[error("permission request is unknown")]
     UnknownDecision,
     #[error("permission request is already resolved")]
@@ -161,6 +220,8 @@ struct PersistedCommand {
     payload_digest: String,
     state: CommandState,
     provider_ack_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    operation_failure: Option<OperationFailureKind>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -429,6 +490,7 @@ impl FreshAgentHostActor {
                     payload_digest: digest,
                     state: CommandState::Queued,
                     provider_ack_id: None,
+                    operation_failure: None,
                 },
             );
             write_protected_payload(&self.state_dir, &request_id, text.as_bytes())?;
@@ -535,6 +597,7 @@ impl FreshAgentHostActor {
                     payload_digest,
                     state: CommandState::Dispatching,
                     provider_ack_id: None,
+                    operation_failure: None,
                 },
             );
             // The input contains only provider branch position/settings, not a
@@ -613,6 +676,135 @@ impl FreshAgentHostActor {
                 }
             }
         }
+    }
+
+    pub async fn semantic_operation(
+        &self,
+        request_id: RequestId,
+        operation: FreshAgentOperation,
+    ) -> Result<CommandState, ActorError> {
+        let _dispatch_guard = self.dispatch_lock.lock().await;
+        let material = serde_json::to_vec(&operation).map_err(persist)?;
+        let payload_digest = digest(&material);
+        {
+            let state = self.state.lock().await;
+            if let Some(existing) = state.commands.get(request_id.as_str()) {
+                if existing.payload_digest != payload_digest {
+                    return Err(ActorError::RequestConflict);
+                }
+                return match (existing.state, existing.operation_failure) {
+                    (CommandState::Cancelled, Some(OperationFailureKind::Unsupported)) => {
+                        Err(ActorError::UnsupportedOperation)
+                    }
+                    (CommandState::Cancelled, Some(OperationFailureKind::Rejected)) => Err(
+                        ActorError::Transport("provider previously rejected operation".into()),
+                    ),
+                    (
+                        CommandState::Ambiguous | CommandState::Dispatching | CommandState::Queued,
+                        _,
+                    ) => Err(ActorError::AmbiguousDispatch),
+                    (other, _) => Ok(other),
+                };
+            }
+        }
+        if !self
+            .transport
+            .supports_operation(&operation)
+            .await
+            .map_err(|_| ActorError::Transport("provider capability check failed".into()))?
+        {
+            return Err(ActorError::UnsupportedOperation);
+        }
+        {
+            let mut state = self.state.lock().await;
+            state.commands.insert(
+                request_id.as_str().to_string(),
+                PersistedCommand {
+                    payload_digest,
+                    state: CommandState::Queued,
+                    provider_ack_id: None,
+                    operation_failure: None,
+                },
+            );
+            write_protected_payload(&self.state_dir, &request_id, &material)?;
+            write_state(&self.state_dir, &state)?;
+            state
+                .commands
+                .get_mut(request_id.as_str())
+                .expect("inserted semantic operation")
+                .state = CommandState::Dispatching;
+            write_state(&self.state_dir, &state)?;
+        }
+
+        let result = self
+            .transport
+            .dispatch_operation(&request_id, &operation)
+            .await;
+        let mut state = self.state.lock().await;
+        let (outcome, native_session_id) = {
+            let command = state
+                .commands
+                .get_mut(request_id.as_str())
+                .expect("durable semantic operation");
+            match result {
+                Ok(ack) => {
+                    command.provider_ack_id = ack.provider_ack_id;
+                    command.state = CommandState::ProviderAcked;
+                    (Ok(CommandState::ProviderAcked), ack.native_session_id)
+                }
+                Err(failure) => {
+                    command.state = if failure.acceptance_ambiguous {
+                        CommandState::Ambiguous
+                    } else {
+                        CommandState::Cancelled
+                    };
+                    command.operation_failure = Some(failure.kind);
+                    let error = if failure.acceptance_ambiguous {
+                        ActorError::AmbiguousDispatch
+                    } else if failure.kind == OperationFailureKind::Unsupported {
+                        ActorError::UnsupportedOperation
+                    } else {
+                        ActorError::Transport(failure.message)
+                    };
+                    (Err(error), None)
+                }
+            }
+        };
+        if let Some(native_session_id) = native_session_id {
+            if state.profile.native_session_id.as_deref() != Some(&native_session_id) {
+                state.profile.native_session_id = Some(native_session_id.clone());
+                push_event_bounded(
+                    &mut state,
+                    AgentEvent::Started { native_session_id },
+                    self.event_byte_cap,
+                    self.event_count_cap,
+                )?;
+            }
+        }
+        let command_state = state
+            .commands
+            .get(request_id.as_str())
+            .expect("durable semantic operation")
+            .state;
+        push_event_bounded(
+            &mut state,
+            AgentEvent::CommandOutcome {
+                request_id,
+                state: command_state,
+            },
+            self.event_byte_cap,
+            self.event_count_cap,
+        )?;
+        write_state(&self.state_dir, &state)?;
+        outcome
+    }
+
+    pub async fn capture(&self, max_bytes: usize) -> Result<FreshAgentCapture, ActorError> {
+        let max_bytes = max_bytes.clamp(1, 256 * 1024);
+        self.transport
+            .capture(max_bytes)
+            .await
+            .map_err(ActorError::Transport)
     }
 
     pub async fn record_event(&self, event: AgentEvent) -> Result<u64, ActorError> {

@@ -15,6 +15,13 @@ pub const MAX_CONTROL_FRAME_BYTES: usize = 1024 * 1024;
 
 type HmacSha256 = Hmac<Sha256>;
 
+pub mod fresh_agent_ops;
+pub use fresh_agent_ops::*;
+
+#[cfg(test)]
+#[path = "fresh_agent_ops_tests.rs"]
+mod fresh_agent_ops_tests;
+
 macro_rules! string_id {
     ($name:ident, $prefix:literal) => {
         #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, PartialOrd, Ord)]
@@ -709,6 +716,8 @@ pub enum RuntimeErrorCode {
     CommandAmbiguous,
     OutputCursorExpired,
     UnsupportedWorkload,
+    UnsupportedOperation,
+    OperationImplementationUnavailable,
     FaultInjected,
     RecoveryBlocked,
     RecoveryImplementationUnavailable,
@@ -1631,6 +1640,9 @@ pub enum AdminCommand {
     TerminalReadOutput(TerminalReadOutputRequest),
     FreshAgentSend(FreshAgentSendRequest),
     FreshAgentFork(FreshAgentForkRequest),
+    FreshAgentCompact(FreshAgentCompactRequest),
+    FreshAgentRollback(FreshAgentRollbackRequest),
+    FreshAgentCapture(FreshAgentCaptureRequest),
     FreshAgentResolve(FreshAgentResolveRequest),
     FreshAgentInterrupt(FreshAgentInterruptRequest),
     FreshAgentReadEvents(FreshAgentReadEventsRequest),
@@ -1781,6 +1793,7 @@ pub enum AdminResult {
         state: CommandState,
     },
     FreshAgentFork(FreshAgentForkResult),
+    FreshAgentCapture(FreshAgentCapture),
     FreshAgentInterrupted,
     FreshAgentEvents(AgentEventBatch),
     RuntimeMetrics(RuntimeMetrics),
@@ -1860,6 +1873,28 @@ pub enum HostCommand {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         input: Option<serde_json::Value>,
     },
+    FreshAgentCompact {
+        incarnation_id: IncarnationId,
+        request_id: RequestId,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        instructions: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cwd: Option<String>,
+    },
+    FreshAgentRollback {
+        incarnation_id: IncarnationId,
+        request_id: RequestId,
+        direction: FreshAgentRollbackDirection,
+        mode: FreshAgentRollbackMode,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        turn_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cwd: Option<String>,
+    },
+    FreshAgentCapture {
+        incarnation_id: IncarnationId,
+        max_bytes: u32,
+    },
     FreshAgentResolve {
         incarnation_id: IncarnationId,
         decision_id: String,
@@ -1920,6 +1955,7 @@ pub enum HostResult {
     },
     FreshAgentFork(FreshAgentForkResult),
     FreshAgentInterrupted,
+    FreshAgentCapture(FreshAgentCapture),
     FreshAgentEvents(AgentEventBatch),
     RuntimeMetrics(RuntimeMetrics),
     Status {

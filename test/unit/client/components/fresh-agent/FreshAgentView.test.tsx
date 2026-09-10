@@ -4053,6 +4053,7 @@ describe('FreshAgentView', () => {
 
     expect(wsMock.send).toHaveBeenCalledWith({
       type: 'freshAgent.compact',
+      requestId: expect.any(String),
       sessionId: 'freshopencode-req-compact',
       sessionType: 'freshopencode',
       provider: 'opencode',

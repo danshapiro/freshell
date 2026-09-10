@@ -464,6 +464,84 @@ async fn dispatch(
                         },
                     ))
                 }
+                HostCommand::FreshAgentCompact {
+                    incarnation_id,
+                    request_id,
+                    instructions,
+                    cwd,
+                } => {
+                    ensure_incarnation(&incarnation_id, state)?;
+                    let actor = state
+                        .fresh_agent
+                        .lock()
+                        .await
+                        .clone()
+                        .ok_or_else(unsupported_fresh_agent)?;
+                    let command_state = actor
+                        .semantic_operation(
+                            request_id,
+                            freshell_agent_runtime::host_actor::FreshAgentOperation::Compact {
+                                instructions,
+                                cwd,
+                            },
+                        )
+                        .await
+                        .map_err(map_actor_error)?;
+                    Ok(HostResult::FreshAgentCommand {
+                        state: command_state,
+                        native_session_id: actor.profile().await.native_session_id,
+                    })
+                }
+                HostCommand::FreshAgentRollback {
+                    incarnation_id,
+                    request_id,
+                    direction,
+                    mode,
+                    turn_id,
+                    cwd,
+                } => {
+                    ensure_incarnation(&incarnation_id, state)?;
+                    let actor = state
+                        .fresh_agent
+                        .lock()
+                        .await
+                        .clone()
+                        .ok_or_else(unsupported_fresh_agent)?;
+                    let command_state = actor
+                        .semantic_operation(
+                            request_id,
+                            freshell_agent_runtime::host_actor::FreshAgentOperation::Rollback {
+                                direction,
+                                mode,
+                                turn_id,
+                                cwd,
+                            },
+                        )
+                        .await
+                        .map_err(map_actor_error)?;
+                    Ok(HostResult::FreshAgentCommand {
+                        state: command_state,
+                        native_session_id: actor.profile().await.native_session_id,
+                    })
+                }
+                HostCommand::FreshAgentCapture {
+                    incarnation_id,
+                    max_bytes,
+                } => {
+                    ensure_incarnation(&incarnation_id, state)?;
+                    let actor = state
+                        .fresh_agent
+                        .lock()
+                        .await
+                        .clone()
+                        .ok_or_else(unsupported_fresh_agent)?;
+                    Ok(HostResult::FreshAgentCapture(
+                        actor
+                            .capture(max_bytes as usize)
+                            .await
+                            .map_err(map_actor_error)?,
+                    ))
+                }
                 HostCommand::FreshAgentResolve {
                     incarnation_id,
                     decision_id,
@@ -568,6 +646,7 @@ fn map_actor_error(error: freshell_agent_runtime::host_actor::ActorError) -> Run
             RuntimeErrorCode::InvalidRequest
         }
         ActorError::WriterBusy => RuntimeErrorCode::OwnershipMismatch,
+        ActorError::UnsupportedOperation => RuntimeErrorCode::UnsupportedOperation,
         ActorError::InvalidProfile => RuntimeErrorCode::InvalidRequest,
         ActorError::Transport(_) | ActorError::Persistence(_) => RuntimeErrorCode::HostUnreachable,
     };
@@ -1640,14 +1719,20 @@ mod tests {
     use super::*;
     use async_trait::async_trait;
     use freshell_agent_runtime::host_actor::{
-        DispatchAck, DispatchFailure, FreshAgentProfile, FreshAgentTransport, TransportStart,
+        DispatchAck, DispatchFailure, FreshAgentOperation, FreshAgentProfile, FreshAgentTransport,
+        OperationAck, OperationFailure, TransportStart,
     };
-    use freshell_runtime_protocol::{AgentEvent, FreshProvider, RequestId};
+    use freshell_runtime_protocol::{
+        AgentEvent, FreshAgentCapture, FreshAgentRollbackDirection, FreshAgentRollbackMode,
+        FreshProvider, RequestId,
+    };
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     struct RpcFixtureTransport {
         dispatches: AtomicUsize,
         decisions: AtomicUsize,
+        operations: AtomicUsize,
+        captures: AtomicUsize,
         stops: AtomicUsize,
     }
 
@@ -1682,6 +1767,37 @@ mod tests {
 
         async fn interrupt(&self) -> Result<(), String> {
             Ok(())
+        }
+
+        async fn supports_operation(
+            &self,
+            _operation: &FreshAgentOperation,
+        ) -> Result<bool, String> {
+            Ok(true)
+        }
+
+        async fn dispatch_operation(
+            &self,
+            request_id: &RequestId,
+            _operation: &FreshAgentOperation,
+        ) -> Result<OperationAck, OperationFailure> {
+            self.operations.fetch_add(1, Ordering::SeqCst);
+            Ok(OperationAck {
+                provider_ack_id: Some(request_id.to_string()),
+                native_session_id: Some("fixture-native-thread".into()),
+            })
+        }
+
+        async fn capture(&self, max_bytes: usize) -> Result<FreshAgentCapture, String> {
+            self.captures.fetch_add(1, Ordering::SeqCst);
+            Ok(FreshAgentCapture {
+                provider: FreshProvider::Claude,
+                session_type: "freshclaude".into(),
+                presentation_session_id: "fixture-public-thread".into(),
+                native_session_id: "fixture-native-thread".into(),
+                text: "user: fixture"[..max_bytes.min(13)].into(),
+                truncated: max_bytes < 13,
+            })
         }
 
         async fn stop(self: Arc<Self>) -> Result<(), String> {
@@ -1731,6 +1847,8 @@ mod tests {
         let transport = Arc::new(RpcFixtureTransport {
             dispatches: AtomicUsize::new(0),
             decisions: AtomicUsize::new(0),
+            operations: AtomicUsize::new(0),
+            captures: AtomicUsize::new(0),
             stops: AtomicUsize::new(0),
         });
         let actor = freshell_agent_runtime::host_actor::FreshAgentHostActor::open(
@@ -1796,6 +1914,66 @@ mod tests {
         .await
         .unwrap();
         assert!(matches!(batch, HostResult::FreshAgentEvents(_)));
+        let compact_id = RequestId::parse("rpc-compact-one").unwrap();
+        for _ in 0..2 {
+            let compact = dispatch(
+                authenticated_host_envelope(
+                    &state,
+                    HostCommand::FreshAgentCompact {
+                        incarnation_id: state.incarnation_id.clone(),
+                        request_id: compact_id.clone(),
+                        instructions: Some("retain decisions".into()),
+                        cwd: Some("/workspace".into()),
+                    },
+                ),
+                &state,
+            )
+            .await
+            .unwrap();
+            assert!(matches!(
+                compact,
+                HostResult::FreshAgentCommand {
+                    state: freshell_runtime_protocol::CommandState::ProviderAcked,
+                    ..
+                }
+            ));
+        }
+        let rollback = dispatch(
+            authenticated_host_envelope(
+                &state,
+                HostCommand::FreshAgentRollback {
+                    incarnation_id: state.incarnation_id.clone(),
+                    request_id: RequestId::parse("rpc-undo-one").unwrap(),
+                    direction: FreshAgentRollbackDirection::Undo,
+                    mode: FreshAgentRollbackMode::Step,
+                    turn_id: None,
+                    cwd: None,
+                },
+            ),
+            &state,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(rollback, HostResult::FreshAgentCommand { .. }));
+        let capture = dispatch(
+            authenticated_host_envelope(
+                &state,
+                HostCommand::FreshAgentCapture {
+                    incarnation_id: state.incarnation_id.clone(),
+                    max_bytes: 1024,
+                },
+            ),
+            &state,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            capture,
+            HostResult::FreshAgentCapture(FreshAgentCapture {
+                native_session_id,
+                ..
+            }) if native_session_id == "fixture-native-thread"
+        ));
         for _ in 0..2 {
             dispatch(
                 authenticated_host_envelope(
@@ -1813,6 +1991,8 @@ mod tests {
         }
         assert_eq!(transport.dispatches.load(Ordering::SeqCst), 1);
         assert_eq!(transport.decisions.load(Ordering::SeqCst), 1);
+        assert_eq!(transport.operations.load(Ordering::SeqCst), 2);
+        assert_eq!(transport.captures.load(Ordering::SeqCst), 1);
         assert_eq!(transport.stops.load(Ordering::SeqCst), 0);
 
         dispatch(

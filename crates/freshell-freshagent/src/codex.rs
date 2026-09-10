@@ -8406,6 +8406,7 @@ pub(crate) mod tests {
 
     fn compact_msg(session_id: &str) -> FreshAgentCompact {
         FreshAgentCompact {
+            request_id: None,
             provider: freshell_protocol::AgentProvider::Codex,
             session_id: session_id.to_string(),
             session_type: freshell_protocol::SessionType::Freshcodex,

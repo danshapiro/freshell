@@ -2689,11 +2689,33 @@ async fn capture(
             return fail_json(StatusCode::NOT_FOUND, "pane not found".to_string());
         }
     };
-    if state.hosted_rest_gateway().is_some() {
-        return fail_json(
-            StatusCode::NOT_IMPLEMENTED,
-            "capture for a durable fresh-agent host is not available".to_string(),
-        );
+    if let Some(gateway) = state.hosted_rest_gateway() {
+        let session_id = pane
+            .durable_id
+            .clone()
+            .unwrap_or_else(|| pane.placeholder_id.clone());
+        let max_bytes = params
+            .get("maxBytes")
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(256 * 1024)
+            .clamp(1, 256 * 1024);
+        return match gateway
+            .capture(hosted_rest::HostedRestCapture {
+                session_id,
+                max_bytes,
+            })
+            .await
+        {
+            Ok(capture) => text_plain(capture.text),
+            Err(hosted_rest::HostedRestCaptureError::Unsupported) => fail_json(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "hosted fresh-agent provider does not support transcript capture".to_string(),
+            ),
+            Err(hosted_rest::HostedRestCaptureError::Unavailable) => fail_json(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "hosted fresh-agent transcript is temporarily unavailable".to_string(),
+            ),
+        };
     }
     let Some(durable_id) = pane.durable_id else {
         // No turn yet → empty transcript (text/plain), matching a fresh pane.

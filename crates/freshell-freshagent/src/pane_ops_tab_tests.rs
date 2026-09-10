@@ -6,10 +6,12 @@
 use super::tests::{app, create_shell_tab, delete, get, patch, post, state_with_registry};
 use super::*;
 use crate::hosted_rest;
+use tower::util::ServiceExt;
 
 struct HostedRestFake {
     creates: std::sync::atomic::AtomicUsize,
     sends: std::sync::atomic::AtomicUsize,
+    captures: std::sync::atomic::AtomicUsize,
 }
 
 #[async_trait::async_trait]
@@ -36,6 +38,20 @@ impl hosted_rest::HostedFreshAgentRestGateway for HostedRestFake {
         Ok(hosted_rest::HostedRestSendResult {
             session_id: request.session_id,
             completed: true,
+        })
+    }
+
+    async fn capture(
+        &self,
+        request: hosted_rest::HostedRestCapture,
+    ) -> Result<hosted_rest::HostedRestCaptureResult, hosted_rest::HostedRestCaptureError> {
+        self.captures
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(hosted_rest::HostedRestCaptureResult {
+            session_id: request.session_id,
+            native_session_id: "native-rest-session".into(),
+            text: "user: continue\nassistant: done\n".into(),
+            truncated: false,
         })
     }
 }
@@ -703,6 +719,7 @@ async fn hosted_rest_create_and_send_never_start_the_web_owned_opencode_transpor
     let gateway = Arc::new(HostedRestFake {
         creates: std::sync::atomic::AtomicUsize::new(0),
         sends: std::sync::atomic::AtomicUsize::new(0),
+        captures: std::sync::atomic::AtomicUsize::new(0),
     });
     state.set_hosted_rest_gateway(gateway.clone()).unwrap();
     let router = app(state.clone());
@@ -716,7 +733,7 @@ async fn hosted_rest_create_and_send_never_start_the_web_owned_opencode_transpor
     assert_eq!(status, StatusCode::OK, "{created}");
     let pane_id = created["data"]["paneId"].as_str().unwrap();
     let (status, sent) = post(
-        router,
+        router.clone(),
         &format!("/api/panes/{pane_id}/send-keys"),
         json!({"text":"continue","timeout":1}),
         true,
@@ -726,6 +743,25 @@ async fn hosted_rest_create_and_send_never_start_the_web_owned_opencode_transpor
     assert_eq!(sent["data"]["status"], "idle");
     assert_eq!(gateway.creates.load(std::sync::atomic::Ordering::SeqCst), 1);
     assert_eq!(gateway.sends.load(std::sync::atomic::Ordering::SeqCst), 1);
+    let response = router
+        .oneshot(
+            axum::http::Request::builder()
+                .uri(format!("/api/panes/{pane_id}/capture"))
+                .header("x-auth-token", "tok")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert_eq!(body.as_ref(), b"user: continue\nassistant: done\n");
+    assert_eq!(
+        gateway.captures.load(std::sync::atomic::Ordering::SeqCst),
+        1
+    );
     assert!(state.opencode.lock().await.is_none());
 }
 
