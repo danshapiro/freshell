@@ -894,7 +894,15 @@ pub struct ProviderBootstrapFile {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ProviderSecretProfile {
-    AmplifierOnecliAnthropicHaikuLow,
+    /// The approved OneCLI deployment: Amplifier's VLLM module talks to the
+    /// LunaRoute-compatible upstream through the credentialed HTTPS proxy
+    /// referenced by the user's private keys.env.
+    AmplifierOnecliLunarouteGlm53,
+    /// Deserialization-only compatibility for pre-correction candidate state.
+    /// Validation and secret resolution reject it rather than silently running
+    /// an old Anthropic/Haiku launch as the new LunaRoute profile.
+    #[serde(rename = "amplifier_onecli_anthropic_haiku_low")]
+    LegacyAmplifierOnecliAnthropicHaikuLow,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -904,8 +912,6 @@ pub struct ProviderSecretReference {
     /// session host reads its read-only mount immediately before child spawn.
     pub source_path: String,
     pub profile: ProviderSecretProfile,
-    /// Approved non-secret endpoint. Secret resolution must match it exactly.
-    pub approved_endpoint: String,
 }
 
 /// Fresh-agent provider hosted inside one managed soul enclosure. Kilroy is
@@ -1187,9 +1193,11 @@ impl TerminalLaunchSpec {
             let source = std::path::Path::new(&secret.source_path);
             if self.mode != "amplifier"
                 || !source.is_absolute()
-                || secret.approved_endpoint.len() > 2048
-                || !secret.approved_endpoint.starts_with("https://")
-                || secret.approved_endpoint.chars().any(char::is_control)
+                || secret.source_path.chars().any(char::is_control)
+                || !matches!(
+                    secret.profile,
+                    ProviderSecretProfile::AmplifierOnecliLunarouteGlm53
+                )
             {
                 return Err(RuntimeError::new(
                     RuntimeErrorCode::InvalidRequest,
@@ -2155,6 +2163,21 @@ mod tests {
             serde_json::from_value::<RecoveryProbe>(encoded).unwrap(),
             RecoveryProbe::Blocked { .. }
         ));
+    }
+
+    #[test]
+    fn legacy_amplifier_secret_profile_deserializes_but_is_not_reinterpreted() {
+        let reference: ProviderSecretReference = serde_json::from_value(serde_json::json!({
+            "sourcePath": "/private/keys.env",
+            "profile": "amplifier_onecli_anthropic_haiku_low",
+            "approvedEndpoint": "https://obsolete.example.invalid/v1"
+        }))
+        .unwrap();
+        assert_eq!(
+            reference.profile,
+            ProviderSecretProfile::LegacyAmplifierOnecliAnthropicHaikuLow
+        );
+        assert_eq!(reference.source_path, "/private/keys.env");
     }
 
     #[test]

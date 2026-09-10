@@ -241,7 +241,7 @@ describe('Amplifier native history proof', () => {
     const root = tempRoot('amplifier-native')
     const sessionDir = path.join(root, '-workspace', 'sessions', sessionId)
     writeJsonl(path.join(sessionDir, 'events.jsonl'), [
-      { ts: '2026-09-01T00:00:00.000Z', schema: { name: 'amplifier.log', ver: '1.0.0' }, event: 'session:config', session_id: sessionId, data: { raw: { providers: [{ id: 'freshell-onecli-anthropic', config: { default_model: 'claude-haiku-4-5-20251001', reasoning_effort: 'low' } }] } } },
+      { ts: '2026-09-01T00:00:00.000Z', schema: { name: 'amplifier.log', ver: '1.0.0' }, event: 'session:config', session_id: sessionId, data: { raw: { providers: [{ id: 'lunaroute', config: { default_model: 'glm-5.3' } }] } } },
       { ts: '2026-09-01T00:00:01.000Z', schema: { name: 'amplifier.log', ver: '1.0.0' }, event: 'prompt:complete', session_id: sessionId, request_id: 'turn-1', status: 'ok', data: {} },
       { ts: '2026-09-01T00:00:01.100Z', schema: { name: 'amplifier.log', ver: '1.0.0' }, event: 'cleanup:store_end', session_id: sessionId, request_id: 'turn-1', status: 'ok', data: {} },
     ])
@@ -257,8 +257,8 @@ describe('Amplifier native history proof', () => {
         completionEventOrdinal: 1,
       }),
       completedAt: '2026-09-01T00:00:01.100Z', toolCalls: [],
-      resolvedProvider: 'freshell-onecli-anthropic', resolvedModel: 'claude-haiku-4-5-20251001',
-      resolvedReasoningEffort: 'low', providerProvenance: 'amplifier-session:config.provider',
+      resolvedProvider: 'lunaroute', resolvedModel: 'glm-5.3',
+      resolvedReasoningEffort: 'provider-default', providerProvenance: 'amplifier-session:config.provider',
     })])
   })
 
@@ -266,7 +266,7 @@ describe('Amplifier native history proof', () => {
     const root = tempRoot('amplifier-tool-event')
     const sessionDir = path.join(root, 'project', 'sessions', sessionId)
     writeJsonl(path.join(sessionDir, 'events.jsonl'), [
-      { ts: '2026-09-01T00:00:00.000Z', schema: { name: 'amplifier.log', ver: '1.0.0' }, event: 'session:config', session_id: sessionId, data: { raw: { providers: [{ id: 'freshell-onecli-anthropic', config: { default_model: 'claude-haiku-4-5-20251001', reasoning_effort: 'low' } }] } } },
+      { ts: '2026-09-01T00:00:00.000Z', schema: { name: 'amplifier.log', ver: '1.0.0' }, event: 'session:config', session_id: sessionId, data: { raw: { providers: [{ id: 'lunaroute', config: { default_model: 'glm-5.3' } }] } } },
       { ts: '2026-09-01T00:00:00.500Z', schema: { name: 'amplifier.log', ver: '1.0.0' }, event: 'tool:pre', session_id: sessionId, data: { tool_name: 'read_file' } },
       { ts: '2026-09-01T00:00:01.000Z', schema: { name: 'amplifier.log', ver: '1.0.0' }, event: 'prompt:complete', session_id: sessionId, request_id: 'turn-1', data: {} },
       { ts: '2026-09-01T00:00:01.100Z', schema: { name: 'amplifier.log', ver: '1.0.0' }, event: 'cleanup:store_end', session_id: sessionId, request_id: 'turn-1', data: {} },
@@ -298,7 +298,7 @@ describe('Amplifier native history proof', () => {
     const pinnedRoot = tempRoot('amplifier-pinned-shape')
     const pinnedDir = path.join(pinnedRoot, 'project', 'sessions', sessionId)
     writeJsonl(path.join(pinnedDir, 'events.jsonl'), [
-      { ts: '2026-09-01T00:00:00.000Z', schema: { name: 'amplifier.log', ver: '1.0.0' }, event: 'session:config', session_id: sessionId, data: { raw: { providers: [{ id: 'freshell-onecli-anthropic', config: { default_model: 'claude-haiku-4-5-20251001', reasoning_effort: 'low' } }] } } },
+      { ts: '2026-09-01T00:00:00.000Z', schema: { name: 'amplifier.log', ver: '1.0.0' }, event: 'session:config', session_id: sessionId, data: { raw: { providers: [{ id: 'lunaroute', config: { default_model: 'glm-5.3' } }] } } },
       { ts: '2026-09-01T00:00:01.000Z', schema: { name: 'amplifier.log', ver: '1.0.0' }, event: 'prompt:complete', session_id: sessionId, data: {} },
       { ts: '2026-09-01T00:00:01.100Z', schema: { name: 'amplifier.log', ver: '1.0.0' }, event: 'cleanup:store_end', session_id: sessionId, data: {} },
       { ts: '2026-09-01T00:00:02.000Z', schema: { name: 'amplifier.log', ver: '1.0.0' }, event: 'prompt:complete', session_id: sessionId, data: {} },

@@ -69,14 +69,15 @@ describe('checked-in provider certification manifest', () => {
     expect(capabilityClaimViolations(loadCapabilityManifest(repoRoot))).toEqual([])
   })
 
-  it('pins managed Amplifier to the image-owned Haiku/low profile without changing legacy launch', () => {
+  it('pins managed Amplifier to the actual OneCLI/LunaRoute profile without changing legacy launch', () => {
     const settings = fs.readFileSync(
-      path.join(repoRoot, 'docker/runtime/amplifier-onecli-haiku-low.yaml'),
+      path.join(repoRoot, 'docker/runtime/amplifier-onecli-lunaroute-glm53.yaml'),
       'utf8',
     )
-    expect(settings).toContain('default_model: claude-haiku-4-5-20251001')
-    expect(settings).toContain('reasoning_effort: low')
-    expect(settings).not.toMatch(/fable|gpt-5\.6-sol|max/i)
+    expect(settings).toContain('id: lunaroute')
+    expect(settings).toContain('module: provider-vllm')
+    expect(settings).toContain('default_model: glm-5.3')
+    expect(settings).not.toMatch(/anthropic|haiku|fable|gpt-5\.6-sol|max/i)
     execFileSync('sh', ['-n', path.join(repoRoot, 'docker/runtime/amplifier-onecli')])
     const manifest = JSON.parse(
       fs.readFileSync(path.join(repoRoot, 'extensions/amplifier/freshell.json'), 'utf8'),
@@ -249,7 +250,7 @@ describe('provider qualification receipt v2', () => {
       : provider === 'opencode'
         ? { providerVersion: '1.18.21', model: 'opencode/big-pickle', reasoningEffort: 'provider-default', nativeProvider: 'opencode' }
         : provider === 'amplifier'
-          ? { providerVersion: '0.1.1', model: 'claude-haiku-4-5-20251001', reasoningEffort: 'low', nativeProvider: 'freshell-onecli-anthropic' }
+          ? { providerVersion: '0.1.1', model: 'glm-5.3', reasoningEffort: 'provider-default', nativeProvider: 'lunaroute' }
           : { providerVersion: '2.1.263', model: 'haiku', reasoningEffort: 'low', nativeProvider: 'anthropic' }
     const stages = ['initial', 'after_session_host_crash', 'after_provider_process_crash'] as const
     return {

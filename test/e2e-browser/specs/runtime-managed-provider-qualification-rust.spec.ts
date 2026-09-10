@@ -32,8 +32,8 @@ import type { NativeAssistantTurn, NativeHistory } from '../helpers/provider-nat
 import { TestHarness } from '../helpers/test-harness.js'
 
 const LIVE_ENV = 'FRESHELL_RUNTIME_MANAGED_PROVIDER_QUALIFICATION_LIVE'
-const AMPLIFIER_MODEL = 'claude-haiku-4-5-20251001'
-const AMPLIFIER_EFFORT = 'low'
+const AMPLIFIER_MODEL = 'glm-5.3'
+const AMPLIFIER_EFFORT = 'provider-default'
 
 type ProviderDefinition = {
   provider: 'claude' | 'codex' | 'opencode' | 'amplifier'
@@ -49,33 +49,16 @@ type ProviderDefinition = {
   nativeIdPattern: RegExp
 }
 
-function requiredAmplifierSetting(name: 'MODEL' | 'REASONING_EFFORT'): string {
-  const key = `FRESHELL_RUNTIME_AMPLIFIER_${name}`
-  const value = process.env[key]?.trim()
-  if (!value) throw new Error(`${key} must name the exact non-secret live Amplifier identity`)
-  const expected = name === 'MODEL' ? AMPLIFIER_MODEL : AMPLIFIER_EFFORT
-  if (value !== expected) {
-    throw new Error(`${key} must be ${expected}; qualification refuses an unapproved or more expensive profile`)
-  }
-  return value
-}
-
 function requireAmplifierOnecliBootstrap(): void {
-  const endpoint = process.env.FRESHELL_MANAGED_AMPLIFIER_ONECLI_ENDPOINT?.trim()
-  if (!endpoint?.startsWith('https://')
-    || endpoint.includes('@')
-    || endpoint.includes('#')
-    || endpoint.includes('?')) {
-    throw new Error('FRESHELL_MANAGED_AMPLIFIER_ONECLI_ENDPOINT must be an explicit credential-free https URL')
-  }
   const keys = process.env.FRESHELL_MANAGED_AMPLIFIER_ONECLI_KEYS_FILE?.trim()
     || path.join(process.env.HOME ?? '', '.amplifier', 'keys.env')
   let regular = false
   try {
-    regular = fs.statSync(keys).isFile()
+    const stat = fs.lstatSync(keys)
+    regular = stat.isFile() && !stat.isSymbolicLink() && (stat.mode & 0o077) === 0
   } catch {}
   if (!path.isAbsolute(keys) || !regular) {
-    throw new Error(`Amplifier OneCLI keys reference is missing or not an absolute regular file: ${keys}`)
+    throw new Error(`Amplifier OneCLI keys reference is missing, linked, or not private: ${keys}`)
   }
 }
 
@@ -130,15 +113,13 @@ function providerDefinitions(): ProviderDefinition[] {
   ]
   if (selected.includes('amplifier')) {
     requireAmplifierOnecliBootstrap()
-    const model = requiredAmplifierSetting('MODEL')
-    const effort = requiredAmplifierSetting('REASONING_EFFORT')
     definitions.push({
       provider: 'amplifier',
       pickerName: /^Amplifier$/i,
       directoryName: /Starting directory for Amplifier/i,
       providerVersion: '0.1.1',
-      model,
-      reasoningEffort: effort,
+      model: AMPLIFIER_MODEL,
+      reasoningEffort: AMPLIFIER_EFFORT,
       versionCommand: [
         '/opt/amplifier-src/.venv/bin/python',
         '-c',
@@ -501,7 +482,7 @@ async function qualifyProvider(
       proof.resolvedReasoningEffort === definition.reasoningEffort
       && (definition.provider !== 'codex' || proof.resolvedModel === definition.model)
       && (definition.provider !== 'amplifier' || (
-        proof.resolvedProvider === 'freshell-onecli-anthropic'
+        proof.resolvedProvider === 'lunaroute'
         && proof.resolvedModel === definition.model
       ))
       && (definition.provider !== 'claude' || proof.resolvedModel.toLowerCase().includes('haiku'))

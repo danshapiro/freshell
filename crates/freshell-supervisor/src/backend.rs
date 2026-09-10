@@ -1235,7 +1235,7 @@ mod tests {
         let workspace = tempfile::tempdir().unwrap();
         let keys = root.path().join("keys.env");
         let secret = "amplifier-onecli-secret-sentinel";
-        std::fs::write(&keys, format!("ANTHROPIC_API_KEY={secret}\n")).unwrap();
+        std::fs::write(&keys, format!("LUNAROUTE_API_KEY={secret}\n")).unwrap();
         let keys = std::fs::canonicalize(keys).unwrap();
         let workspace = std::fs::canonicalize(workspace.path()).unwrap();
         let terminal = TerminalLaunchSpec {
@@ -1262,8 +1262,7 @@ mod tests {
             provider_bootstrap_files: Vec::new(),
             provider_secret_references: vec![ProviderSecretReference {
                 source_path: keys.to_string_lossy().into_owned(),
-                profile: ProviderSecretProfile::AmplifierOnecliAnthropicHaikuLow,
-                approved_endpoint: "https://onecli.example.invalid/v1".into(),
+                profile: ProviderSecretProfile::AmplifierOnecliLunarouteGlm53,
             }],
         };
         let mounts = docker::terminal_mounts(&terminal).unwrap();
@@ -1307,9 +1306,10 @@ mod tests {
         );
         let durable_json = serde_json::to_string(&body).unwrap();
         assert!(durable_json.contains(&keys.to_string_lossy().to_string()));
-        // Docker needs only the exact read-only mount. The approved endpoint is
-        // durable in the authenticated launch spec and must not be copied into
-        // the daemon's create request or labels.
+        // Docker needs only the exact read-only mount. The profile selector is
+        // delivered later over the authenticated host grant, while resolved
+        // upstream/proxy credentials stay out of Docker JSON and labels.
+        assert!(!durable_json.contains("amplifier_onecli_lunaroute_glm53"));
         assert!(!durable_json.contains("onecli.example.invalid"));
         assert!(!durable_json.contains(secret));
     }

@@ -69,27 +69,31 @@ evidence contains those exact values. Codex must show
 `-c model_reasoning_effort="minimal"`, not a synthesized flag or provider
 default.
 
-Amplifier qualification uses the approved
-`/home/sentinelx/sentinelx-tools/amplifier-onecli` credential source model,
-but never executes that wrapper or sources shell text. The web process stores
-only a canonical reference to the private `~/.amplifier/keys.env`; the session
-host's bounded parser resolves its allowlisted names immediately before spawn
-and adds them only to the unprivileged Amplifier child. The runtime image owns
-the exact `claude-haiku-4-5-20251001` / `low` settings and wrapper. Supply the
-non-secret approved endpoint explicitly:
+Amplifier qualification uses the same approved OneCLI credential-source
+semantics as `/home/sentinelx/sentinelx-tools/amplifier-onecli`, but never
+executes that wrapper or sources shell text. The web process stores only a
+canonical reference to the private `~/.amplifier/keys.env`; the session host's
+bounded parser resolves its allowlisted LunaRoute/proxy fields immediately
+before spawn and translates only the provider-vllm and proxy transport values
+into the unprivileged child environment. Host-local `ONECLI_URL` is deliberately
+not forwarded into the container. The runtime image pins the actual provider-vllm
+source and the `glm-5.3` default used by the approved OneCLI profile; reasoning
+is provider-default unless the native provider itself records otherwise.
 
 ```bash
+# Optional only when the canonical default is not being used; it must resolve
+# to that same approved private file.
 export FRESHELL_MANAGED_AMPLIFIER_ONECLI_KEYS_FILE="$HOME/.amplifier/keys.env"
-export FRESHELL_MANAGED_AMPLIFIER_ONECLI_ENDPOINT='https://approved-onecli-endpoint.example/v1'
-export FRESHELL_RUNTIME_AMPLIFIER_MODEL='claude-haiku-4-5-20251001'
-export FRESHELL_RUNTIME_AMPLIFIER_REASONING_EFFORT='low'
 ```
 
-The keys-file variable may be omitted only when the canonical approved default
-exists with mode `0600` or stricter. A different keys file, a placeholder,
-unknown key, malformed assignment, endpoint mismatch, expensive model/effort,
-or any raw OAuth file fails closed with an actionable error. Secret bytes are
-absent from launch specs, the registry, Docker environment, logs, and receipts.
+The keys-file variable may be omitted when the canonical approved default
+exists with mode `0600` or stricter. A different/public/symlinked keys file,
+unknown key, malformed shell syntax, credentialed/non-HTTPS upstream URL,
+container-loopback proxy, mismatched model, or raw OAuth reference fails closed.
+OneCLI-managed placeholder provider keys remain valid because authentication can
+be supplied by the approved proxy itself. Secret bytes are absent from launch
+specs, the registry, Docker JSON environment, logs, and receipts; they exist
+only in the provider child environment.
 Model and effort evidence comes from Amplifier's native redacted
 `session:config` event, never imagined resume flags. These instructions prepare
 a campaign only; all three providers remain deferred and release-disabled until
