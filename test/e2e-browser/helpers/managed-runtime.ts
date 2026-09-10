@@ -14,6 +14,11 @@ import { RuntimeHarness, type SupervisorInstance } from '../../../scripts/testin
 import { RustServer } from './rust-server.js'
 import type { TestServerInfo } from './test-server.js'
 import type { QualifiableTerminalProvider } from '../../../scripts/testing/provider-qualification-selection.js'
+import {
+  buildFreshAgentQualificationReceipt,
+  type FreshAgentQualificationReceiptV1,
+  type FreshAgentQualificationRow,
+} from '../../../scripts/testing/fresh-agent-qualification-receipt.js'
 
 export const P2_OPENCODE_VERSION = '1.18.21'
 export const P2_OPENCODE_FREE_MODEL = 'opencode/big-pickle'
@@ -34,6 +39,9 @@ export type ManagedRuntimeView = {
   terminalCwd?: string
   terminalCreateRequestId?: string
   terminalResumeSessionId?: string
+  freshAgentSessionId?: string
+  freshAgentSessionType?: string
+  freshAgentRuntimeVariant?: string
   projectKey?: string
   profile?: string
   provider?: string
@@ -63,6 +71,8 @@ export class ManagedRuntimeBrowserRig {
   private readonly supervisorBinaryKind: 'test' | 'release'
   private readonly enabledProviders: string[]
   private readonly providerSettings: Record<string, Record<string, unknown>>
+  private readonly freshAgentModes: string[]
+  private readonly fixtureFreshAgentModes: string[]
   private qualificationSupervisorBin: string | undefined
 
   constructor(
@@ -74,6 +84,8 @@ export class ManagedRuntimeBrowserRig {
     qualificationProviders: {
       enabledProviders: string[]
       providerSettings?: Record<string, Record<string, unknown>>
+      freshAgentModes?: string[]
+      fixtureFreshAgentModes?: string[]
     } = { enabledProviders: ['opencode'] },
   ) {
     this.repoRoot = fs.realpathSync(repoRoot)
@@ -83,6 +95,11 @@ export class ManagedRuntimeBrowserRig {
     this.supervisorBinaryKind = supervisorBinaryKind
     this.enabledProviders = [...qualificationProviders.enabledProviders]
     this.providerSettings = { ...qualificationProviders.providerSettings }
+    this.freshAgentModes = [...(qualificationProviders.freshAgentModes ?? [])]
+    this.fixtureFreshAgentModes = [...(qualificationProviders.fixtureFreshAgentModes ?? [])]
+    if (this.fixtureFreshAgentModes.length > 0 && supervisorBinaryKind !== 'test') {
+      throw new Error('deterministic fresh-agent fixtures require the test session-host build')
+    }
   }
 
   async start(): Promise<TestServerInfo> {
@@ -101,6 +118,26 @@ export class ManagedRuntimeBrowserRig {
           ? this.runtime.testSupervisorBinary
           : this.runtime.releaseSupervisorBinary),
     })
+    if (this.freshAgentModes.length > 0) {
+      const supervisorBinary = this.qualificationSupervisorBin
+        ?? (this.supervisorBinaryKind === 'test'
+          ? this.runtime.testSupervisorBinary
+          : this.runtime.releaseSupervisorBinary)
+      this.runtime.recordFreshAgentQualificationBuild({
+        kind: this.fixtureFreshAgentModes.length > 0 ? 'deterministic_fixture' : 'production',
+        serverFeatures: [this.fixtureFreshAgentModes.length > 0
+          ? 'managed-fresh-agent-fixtures'
+          : 'managed-runtime-v1'],
+        sessionHostFeatures: this.fixtureFreshAgentModes.length > 0 ? ['fresh-agent-fixtures'] : [],
+        selectedModes: this.freshAgentModes,
+        fixtureModes: this.fixtureFreshAgentModes,
+        serverBinary: this.serverBin,
+        supervisorBinary,
+        sessionHostBinary: this.supervisorBinaryKind === 'test'
+          ? this.runtime.testHostBinary
+          : this.runtime.releaseHostBinary,
+      })
+    }
     this.supervisor = await this.runtime.startSupervisor({
       scenarioId: 'browser-managed-runtime',
       binaryKind: this.supervisorBinaryKind,
@@ -111,6 +148,12 @@ export class ManagedRuntimeBrowserRig {
       preserveHomeOnStop: true,
       env: {
         FRESHELL_MANAGED_RUNTIME_V1: '1',
+        ...(this.freshAgentModes.length > 0
+          ? { FRESHELL_MANAGED_FRESH_AGENT_V1: '1' }
+          : {}),
+        ...(this.fixtureFreshAgentModes.length > 0
+          ? { FRESHELL_MANAGED_FRESH_AGENT_FIXTURE_MODES: this.fixtureFreshAgentModes.join(',') }
+          : {}),
         FRESHELL_RUNTIME_CONTROL_SOCKET: this.supervisor.controlSocket,
         FRESHELL_RUNTIME_CONTROL_SECRET_FILE: this.supervisor.controlSecretFile,
         ...this.serverEnv,
@@ -132,6 +175,14 @@ export class ManagedRuntimeBrowserRig {
                 ...this.providerSettings,
               },
             },
+            ...(this.freshAgentModes.length > 0
+              ? {
+                  freshAgent: {
+                    enabled: true,
+                    providers: this.providerSettings,
+                  },
+                }
+              : {}),
           },
         }, null, 2))
       },
@@ -226,6 +277,12 @@ export class ManagedRuntimeBrowserRig {
     return (await this.inventory()).find((row) => row.terminalId === terminalId && row.launchState === 'running') ?? null
   }
 
+  async runningViewForFreshSession(sessionId: string): Promise<ManagedRuntimeView | null> {
+    return (await this.inventory()).find((row: any) => (
+      row.freshAgentSessionId === sessionId && row.launchState === 'running'
+    )) ?? null
+  }
+
   ownedContainerExec(containerId: string, args: string[]): string {
     return this.runtime.execOwnedContainerExact(containerId, args)
   }
@@ -307,6 +364,33 @@ export class ManagedRuntimeBrowserRig {
     }
   }
 
+  finalizeFreshAgentQualificationReceipt(rows: FreshAgentQualificationRow[]): {
+    receipt: FreshAgentQualificationReceiptV1
+    paths: string[]
+  } {
+    const receipt = buildFreshAgentQualificationReceipt({
+      repoRoot: this.repoRoot,
+      evidenceDir: this.runtime.evidenceDir,
+      candidateSha: this.runtime.candidateSha,
+      receiptRunId: this.runtime.runId,
+      runtimeImage: this.runtime.imageRef,
+      selectedModes: rows.map(({ mode }) => mode),
+      rows,
+    })
+    const targets = new Set([
+      process.env.FRESHELL_RUNTIME_PHASE3_FRESH_AGENT_RECEIPT,
+      process.env.FRESHELL_RUNTIME_PHASE5_FRESH_AGENT_RECEIPT,
+    ].filter((value): value is string => Boolean(value?.trim())))
+    if (targets.size === 0) {
+      targets.add(path.join(this.runtime.browserDir, 'fresh-agent-qualification.json'))
+    }
+    for (const target of targets) {
+      fs.mkdirSync(path.dirname(target), { recursive: true })
+      fs.writeFileSync(target, JSON.stringify(receipt, null, 2))
+    }
+    return { receipt, paths: [...targets] }
+  }
+
   writePhase3BrowserReceipt(value: unknown): string {
     const target = process.env.FRESHELL_RUNTIME_PHASE3_BROWSER_RECEIPT
       || path.join(this.runtime.browserDir, defaultReceiptFileName('FRESHELL_RUNTIME_PHASE3_BROWSER_RECEIPT'))
@@ -344,7 +428,9 @@ export class ManagedRuntimeBrowserRig {
     const qualification = this.pendingQualificationProviders()
     execFileSync(mise, [
       'exec', 'rust@1.96', '--', 'cargo', 'build', '--release', '-p', 'freshell-server',
-      '--features', qualification.length ? 'managed-provider-qualification' : 'managed-runtime-v1',
+      '--features', this.fixtureFreshAgentModes.length > 0
+        ? 'managed-fresh-agent-fixtures'
+        : qualification.length ? 'managed-provider-qualification' : 'managed-runtime-v1',
     ], { cwd: this.repoRoot, stdio: 'inherit' })
     const source = path.join(this.repoRoot, 'target', 'release', 'freshell-server')
     const target = path.join(this.runtime.buildDir, 'freshell-server-managed')

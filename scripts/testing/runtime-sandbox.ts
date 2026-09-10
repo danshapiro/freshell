@@ -56,6 +56,17 @@ export type ProviderQualificationBuildRecord = {
   supervisorBinary: string
 }
 
+export type FreshAgentQualificationBuildRecord = {
+  kind: 'production' | 'deterministic_fixture'
+  serverFeatures: string[]
+  sessionHostFeatures: string[]
+  selectedModes: string[]
+  fixtureModes: string[]
+  serverBinary: string
+  supervisorBinary: string
+  sessionHostBinary: string
+}
+
 export class RuntimeGateAssertionError extends Error {
   constructor(
     readonly caseId: string,
@@ -252,6 +263,28 @@ export class RuntimeHarness {
       },
     }
     fs.writeFileSync(buildPath, JSON.stringify({ ...build, qualificationBuild }, null, 2))
+  }
+
+  recordFreshAgentQualificationBuild(record: FreshAgentQualificationBuildRecord): void {
+    const buildPath = path.join(this.evidenceDir, 'build.json')
+    const build = JSON.parse(fs.readFileSync(buildPath, 'utf8'))
+    const freshAgentQualificationBuild = {
+      kind: record.kind,
+      serverFeatures: [...record.serverFeatures].sort(),
+      sessionHostFeatures: [...record.sessionHostFeatures].sort(),
+      selectedModes: [...record.selectedModes],
+      fixtureModes: [...record.fixtureModes],
+      binaries: {
+        server: fileBuild(this.validateRunBuildBinary(record.serverBinary, 'fresh-agent qualification server')),
+        supervisor: fileBuild(this.validateRunBuildBinary(record.supervisorBinary, 'fresh-agent qualification supervisor')),
+        sessionHost: fileBuild(this.validateRunBuildBinary(record.sessionHostBinary, 'fresh-agent qualification session host')),
+      },
+    }
+    fs.writeFileSync(buildPath, JSON.stringify({
+      ...build,
+      freshAgentQualificationBuild,
+      binaries: { ...build.binaries, ...freshAgentQualificationBuild.binaries },
+    }, null, 2))
   }
 
   assert(caseId: string, condition: unknown, message: string, evidence?: unknown): asserts condition {
@@ -542,6 +575,23 @@ export class RuntimeHarness {
 
   terminalReadOutputBody(soulId: string, afterSeq = 0, maxBytes = 64 * 1024, expectedControlEpoch?: number): any {
     return { method: 'terminal_read_output', params: { soulId, afterSeq, maxBytes, ...(expectedControlEpoch === undefined ? {} : { expectedControlEpoch }) } }
+  }
+
+  freshAgentResolveBody(
+    soulId: string,
+    decisionId: string,
+    decision: Record<string, unknown>,
+    expectedControlEpoch?: number,
+  ): any {
+    return {
+      method: 'fresh_agent_resolve',
+      params: {
+        soulId,
+        decisionId,
+        decision,
+        ...(expectedControlEpoch === undefined ? {} : { expectedControlEpoch }),
+      },
+    }
   }
 
   runtimeMetricsBody(soulId: string, expectedControlEpoch?: number): any {
@@ -976,7 +1026,7 @@ export class RuntimeHarness {
   private buildBinaries(): void {
     fs.mkdirSync(this.buildDir, { recursive: true })
     const mise = path.join(os.homedir(), '.local', 'bin', 'mise')
-    execFileSync(mise, ['exec', 'rust@1.96', '--', 'cargo', 'build', '-p', 'freshell-supervisor', '-p', 'freshell-session-host', '--features', 'freshell-supervisor/runtime-test-faults'], { cwd: this.repoRoot, stdio: 'inherit' })
+    execFileSync(mise, ['exec', 'rust@1.96', '--', 'cargo', 'build', '-p', 'freshell-supervisor', '-p', 'freshell-session-host', '--features', 'freshell-supervisor/runtime-test-faults,freshell-session-host/fresh-agent-fixtures'], { cwd: this.repoRoot, stdio: 'inherit' })
     this.testSupervisorBinary = path.join(this.buildDir, 'freshell-supervisor-test')
     this.testHostBinary = path.join(this.buildDir, 'freshell-session-host-test')
     fs.copyFileSync(path.join(this.repoRoot, 'target/debug/freshell-supervisor'), this.testSupervisorBinary)

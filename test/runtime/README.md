@@ -139,6 +139,39 @@ npm run test:runtime:provider-qualification -- --provider amplifier
 The campaign refuses to treat a missing live flag or a Playwright skip as a
 qualification pass.
 
+### Fresh-agent live qualification
+
+Hosted FreshClaude, Kilroy, FreshCodex, and FreshOpenCode use a separate
+`fresh_agent_live` schema-v1 receipt. A producer must select exact mode names;
+empty selections, aliases such as `claude`, `all`, whitespace, unknown names,
+and duplicates fail before the runtime harness creates any workload:
+
+```bash
+FRESHELL_RUNTIME_FRESH_AGENT_QUALIFICATION_LIVE=1 \
+npm run test:runtime:fresh-agent-qualification -- --mode freshcodex
+```
+
+The producer pins the low-cost profiles from `gate-manifest.json` (Claude
+Haiku/low, Codex `gpt-5.6-luna`/low, and OpenCode
+`opencode/big-pickle`/provider-default), provider/runtime versions, exact
+native IDs, two provider-native completed assistant turns, no-tool recall,
+web/session-host/provider-process failure evidence, one-writer evidence,
+independent provider volumes/enclosures, and cgroup limits with swap disabled.
+Claude and Kilroy additionally require a real pending approval to survive web
+and host recovery and resolve exactly once.
+
+`managed-fresh-agent-fixtures` and the session-host `fresh-agent-fixtures`
+feature form a separate deterministic regression lane. Fixture selection is a
+typed launch field and the provider child runs inside the managed soul; an
+ordinary session-host explicitly rejects it. A fixture build can never satisfy
+the live receipt validator. Run its local, provider-free supervisor/recovery
+proof explicitly with `npm run test:runtime:fresh-agent-fixtures`; it exercises
+all four modes, web/session-host/provider-child failure, pending-decision
+recovery, enclosure/store isolation, and startup reconciliation without
+writing a qualification receipt. The checked-in capability manifest keeps all
+four fresh modes disabled until an authentic receipt is reviewed and the
+release flags are changed deliberately.
+
 The gate includes crash failpoints around incident commit, cleanup, export, and
 notice projection. Failpoints are available only in the test supervisor built
 with `runtime-test-faults`. The release-binary case passes the same environment

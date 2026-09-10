@@ -13,9 +13,9 @@ use freshell_protocol::{
 };
 use freshell_runtime_client::RuntimeClient;
 use freshell_runtime_protocol::{
-    AgentEvent, DesiredState, FreshAgentLaunchSpec, FreshProvider, LaunchRequest,
-    ProviderBootstrapFile, RequestId, RuntimeLimits, RuntimeProfile, SoulId, StopOutcome,
-    ViewIntentKind, ViewIntentRequest, ViewVisibilityIntent,
+    AgentEvent, DesiredState, FreshAgentFixtureTransport, FreshAgentLaunchSpec, FreshProvider,
+    LaunchRequest, ProviderBootstrapFile, RequestId, RuntimeLimits, RuntimeProfile, SoulId,
+    StopOutcome, ViewIntentKind, ViewIntentRequest, ViewVisibilityIntent,
 };
 use freshell_ws::hosted_fresh_agent::{HostedFreshAgentCommand, HostedFreshAgentGateway};
 use sha2::{Digest, Sha256};
@@ -30,6 +30,7 @@ use std::{
 use tokio::sync::{broadcast, Mutex};
 
 const OPT_IN_ENV: &str = "FRESHELL_MANAGED_FRESH_AGENT_V1";
+const FIXTURE_MODES_ENV: &str = "FRESHELL_MANAGED_FRESH_AGENT_FIXTURE_MODES";
 const PROVIDER_UID: u32 = 65_534;
 const PROVIDER_GID: u32 = 0;
 
@@ -38,6 +39,7 @@ pub(crate) struct HostedFreshAgentProxy {
     broadcast: Arc<broadcast::Sender<String>>,
     aliases: Mutex<HashMap<(String, String), SoulId>>,
     pollers: Mutex<HashSet<SoulId>>,
+    fixture_modes: HashSet<String>,
 }
 
 impl HostedFreshAgentProxy {
@@ -51,11 +53,13 @@ impl HostedFreshAgentProxy {
         let client = client.ok_or_else(|| {
             format!("{OPT_IN_ENV}=1 requires an available managed runtime controller")
         })?;
+        let fixture_modes = configured_fixture_modes()?;
         Ok(Some(Arc::new(Self {
             client,
             broadcast,
             aliases: Mutex::new(HashMap::new()),
             pollers: Mutex::new(HashSet::new()),
+            fixture_modes,
         })))
     }
 
@@ -76,7 +80,7 @@ impl HostedFreshAgentProxy {
             }
             HostedFreshAgentCommand::Attach(message) => {
                 if let Some(soul) = self
-                    .resolve_soul(&message.provider, &message.session_id)
+                    .resolve_soul(&message.provider, message.session_type, &message.session_id)
                     .await
                 {
                     let provider_name = provider_wire(&message.provider);
@@ -111,7 +115,10 @@ impl HostedFreshAgentProxy {
                     .as_deref()
                     .and_then(|value| RequestId::parse(value.to_string()).ok())
                     .unwrap_or_else(RequestId::new);
-                let result = match self.resolve_soul(&provider, &session_id).await {
+                let result = match self
+                    .resolve_soul(&provider, session_type, &session_id)
+                    .await
+                {
                     Some(soul) => {
                         let settings = turn_settings(message.settings, message.cwd);
                         self.client
@@ -132,7 +139,7 @@ impl HostedFreshAgentProxy {
             }
             HostedFreshAgentCommand::Interrupt(message) => {
                 let result = match self
-                    .resolve_soul(&message.provider, &message.session_id)
+                    .resolve_soul(&message.provider, message.session_type, &message.session_id)
                     .await
                 {
                     Some(soul) => self.client.fresh_agent_interrupt(soul).await,
@@ -149,7 +156,7 @@ impl HostedFreshAgentProxy {
             }
             HostedFreshAgentCommand::Kill(message) => {
                 let success = if let Some(soul) = self
-                    .resolve_soul(&message.provider, &message.session_id)
+                    .resolve_soul(&message.provider, message.session_type, &message.session_id)
                     .await
                 {
                     matches!(self.client.stop(soul).await, Ok(StopOutcome::VerifiedEmpty))
@@ -215,8 +222,9 @@ impl HostedFreshAgentProxy {
         message: freshell_protocol::FreshAgentCreate,
     ) -> Result<(), ()> {
         let provider = fresh_provider(&message.provider, message.session_type).ok_or(())?;
+        let public_provider = fresh_provider_wire(&provider);
         if let Some(session_ref) = message.session_ref.as_ref() {
-            if session_ref.provider != provider.as_str() {
+            if session_ref.provider != public_provider {
                 return Err(());
             }
             let inventory = self.client.inventory().await.map_err(|_| ())?;
@@ -227,7 +235,7 @@ impl HostedFreshAgentProxy {
                 .ok_or(())?;
             let public_session_id = session_ref.session_id.clone();
             let soul = view.soul_id;
-            let provider_name = provider.as_str().to_string();
+            let provider_name = public_provider.to_string();
             let canonical_session_id = view.fresh_agent_session_id;
             {
                 let mut aliases = self.aliases.lock().await;
@@ -242,7 +250,7 @@ impl HostedFreshAgentProxy {
             self.send(ServerMessage::FreshAgentCreated(FreshAgentCreated {
                 provider: provider_name.clone(),
                 request_id: message.request_id,
-                runtime_provider: provider_name.clone(),
+                runtime_provider: provider.as_str().into(),
                 session_id: public_session_id.clone(),
                 session_type: session_type_wire(message.session_type),
                 session_ref: Some(SessionLocator {
@@ -261,7 +269,7 @@ impl HostedFreshAgentProxy {
             if !started {
                 self.replay_once(
                     soul,
-                    provider.as_str(),
+                    public_provider,
                     &public_session_id,
                     &session_type_wire(message.session_type),
                 )
@@ -308,6 +316,10 @@ impl HostedFreshAgentProxy {
                 .and_then(|value| serde_json::to_value(value).ok())
                 .and_then(|value| value.as_str().map(str::to_string)),
             native_session_id: native_session_id.clone(),
+            fixture_transport: self
+                .fixture_modes
+                .contains(&session_type)
+                .then_some(FreshAgentFixtureTransport::Deterministic),
             provider_bootstrap_files: provider_bootstrap_files(&provider).map_err(|_| ())?,
         };
         let project_key = format!("project-{}", stable_hex(&workspace.to_string_lossy()));
@@ -348,12 +360,12 @@ impl HostedFreshAgentProxy {
             .await
             .map_err(|_| ())?;
         self.aliases.lock().await.insert(
-            (provider.as_str().into(), public_session_id.clone()),
+            (public_provider.into(), public_session_id.clone()),
             soul.clone(),
         );
         self.start_poller(
             soul,
-            provider.as_str().into(),
+            public_provider.into(),
             public_session_id,
             session_type,
         )
@@ -369,7 +381,10 @@ impl HostedFreshAgentProxy {
         decision_id: String,
         decision: serde_json::Value,
     ) {
-        let result = match self.resolve_soul(&provider, &session_id).await {
+        let result = match self
+            .resolve_soul(&provider, session_type, &session_id)
+            .await
+        {
             Some(soul) => self
                 .client
                 .fresh_agent_resolve(soul, decision_id, decision)
@@ -387,13 +402,19 @@ impl HostedFreshAgentProxy {
         }
     }
 
-    async fn resolve_soul(&self, provider: &AgentProvider, session_id: &str) -> Option<SoulId> {
-        let provider = provider_wire(provider);
+    async fn resolve_soul(
+        &self,
+        provider: &AgentProvider,
+        session_type: SessionType,
+        session_id: &str,
+    ) -> Option<SoulId> {
+        let public_provider = provider_wire(provider);
+        let runtime_provider = fresh_provider(&Some(provider.clone()), session_type)?;
         if let Some(soul) = self
             .aliases
             .lock()
             .await
-            .get(&(provider.clone(), session_id.to_string()))
+            .get(&(public_provider.clone(), session_id.to_string()))
             .cloned()
         {
             return Some(soul);
@@ -401,14 +422,14 @@ impl HostedFreshAgentProxy {
         let inventory = self.client.inventory().await.ok()?;
         let view = inventory.into_iter().rev().find(|view| {
             view.desired_state == DesiredState::Running
-                && view.provider.as_deref() == Some(provider.as_str())
+                && view.provider.as_deref() == Some(runtime_provider.as_str())
                 && (view.fresh_agent_session_id.as_deref() == Some(session_id)
                     || view.native_session_id.as_deref() == Some(session_id))
         })?;
-        self.aliases
-            .lock()
-            .await
-            .insert((provider, session_id.to_string()), view.soul_id.clone());
+        self.aliases.lock().await.insert(
+            (public_provider, session_id.to_string()),
+            view.soul_id.clone(),
+        );
         Some(view.soul_id)
     }
 
@@ -543,13 +564,15 @@ impl HostedFreshAgentProxy {
 
 #[async_trait::async_trait]
 impl HostedFreshAgentRestGateway for HostedFreshAgentProxy {
-    async fn create_opencode(
+    async fn create_agent(
         self: Arc<Self>,
         request: HostedRestCreate,
     ) -> Result<HostedRestCreated, ()> {
+        let (provider, session_type) =
+            rest_agent_identity(&request.provider, &request.session_type)?;
         let message = freshell_protocol::FreshAgentCreate {
             request_id: request.request_id,
-            session_type: SessionType::Freshopencode,
+            session_type,
             cwd: request.cwd,
             effort: request.effort,
             legacy_restore_context: None,
@@ -557,12 +580,12 @@ impl HostedFreshAgentRestGateway for HostedFreshAgentProxy {
             model_selection: None,
             permission_mode: None,
             plugins: None,
-            provider: Some(AgentProvider::Opencode),
+            provider: Some(provider.clone()),
             resume_session_id: None,
             sandbox: None,
             session_ref: request.native_session_id.map(|session_id| {
                 freshell_protocol::SessionLocator {
-                    provider: "opencode".into(),
+                    provider: provider_wire(&provider),
                     session_id,
                 }
             }),
@@ -572,14 +595,22 @@ impl HostedFreshAgentRestGateway for HostedFreshAgentProxy {
             .session_ref
             .as_ref()
             .map(|value| value.session_id.clone())
-            .unwrap_or_else(|| format!("managed-opencode-{}", stable_hex(&message.request_id)));
+            .unwrap_or_else(|| {
+                format!(
+                    "managed-{}-{}",
+                    request.provider,
+                    stable_hex(&message.request_id)
+                )
+            });
         self.create(message).await?;
         Ok(HostedRestCreated { session_id })
     }
 
-    async fn send_opencode(&self, request: HostedRestSend) -> Result<HostedRestSendResult, ()> {
+    async fn send_agent(&self, request: HostedRestSend) -> Result<HostedRestSendResult, ()> {
+        let (provider, session_type) =
+            rest_agent_identity(&request.provider, &request.session_type)?;
         let soul = self
-            .resolve_soul(&AgentProvider::Opencode, &request.session_id)
+            .resolve_soul(&provider, session_type, &request.session_id)
             .await
             .ok_or(())?;
         let before = self
@@ -696,6 +727,19 @@ fn fresh_provider(
     }
 }
 
+fn rest_agent_identity(
+    provider: &str,
+    session_type: &str,
+) -> Result<(AgentProvider, SessionType), ()> {
+    match (provider, session_type) {
+        ("claude", "freshclaude") => Ok((AgentProvider::Claude, SessionType::Freshclaude)),
+        ("claude", "kilroy") => Ok((AgentProvider::Claude, SessionType::Kilroy)),
+        ("codex", "freshcodex") => Ok((AgentProvider::Codex, SessionType::Freshcodex)),
+        ("opencode", "freshopencode") => Ok((AgentProvider::Opencode, SessionType::Freshopencode)),
+        _ => Err(()),
+    }
+}
+
 fn turn_settings(
     settings: Option<freshell_protocol::FreshAgentSendSettings>,
     cwd: Option<String>,
@@ -734,6 +778,53 @@ fn runtime_variant(provider: &FreshProvider) -> &'static str {
         FreshProvider::Codex => "codex-app-server",
         FreshProvider::Opencode => "opencode-per-soul-http",
     }
+}
+
+fn fresh_provider_wire(provider: &FreshProvider) -> &'static str {
+    match provider {
+        FreshProvider::Kilroy => "claude",
+        other => other.as_str(),
+    }
+}
+
+fn parse_fixture_modes(raw: &str) -> Result<HashSet<String>, String> {
+    const MODES: [&str; 4] = ["freshclaude", "kilroy", "freshcodex", "freshopencode"];
+    if raw.is_empty() {
+        return Err(format!("{FIXTURE_MODES_ENV} must not be empty"));
+    }
+    let mut selected = HashSet::new();
+    for mode in raw.split(',') {
+        if mode.trim() != mode || !MODES.contains(&mode) {
+            return Err(format!(
+                "{FIXTURE_MODES_ENV} contains non-exact fresh-agent mode {mode:?}"
+            ));
+        }
+        if !selected.insert(mode.to_string()) {
+            return Err(format!(
+                "{FIXTURE_MODES_ENV} contains duplicate mode {mode:?}"
+            ));
+        }
+    }
+    Ok(selected)
+}
+
+#[cfg(feature = "managed-fresh-agent-fixtures")]
+fn configured_fixture_modes() -> Result<HashSet<String>, String> {
+    std::env::var(FIXTURE_MODES_ENV)
+        .ok()
+        .map(|raw| parse_fixture_modes(&raw))
+        .transpose()
+        .map(|value| value.unwrap_or_default())
+}
+
+#[cfg(not(feature = "managed-fresh-agent-fixtures"))]
+fn configured_fixture_modes() -> Result<HashSet<String>, String> {
+    if std::env::var_os(FIXTURE_MODES_ENV).is_some() {
+        return Err(format!(
+            "{FIXTURE_MODES_ENV} requires a server built with managed-fresh-agent-fixtures"
+        ));
+    }
+    Ok(HashSet::new())
 }
 
 fn provider_wire(provider: &AgentProvider) -> String {

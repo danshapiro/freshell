@@ -81,6 +81,8 @@ const CLOUD_SKIP_SPECS = [
   // (`npm run test:runtime:campaign`), not this lane — see
   // docs/plans/freshell-durable-souls-phase-5-handoff.md.
   'runtime-opencode-provider-qualification-rust.spec.ts',
+  'runtime-fresh-agent-fixture-rust.spec.ts',
+  'runtime-fresh-agent-qualification-rust.spec.ts',
   'runtime-tabs-rehydrate-rust.spec.ts',
   'runtime-lost-soul-notice-rust.spec.ts',
   'runtime-chaos-rust.spec.ts',

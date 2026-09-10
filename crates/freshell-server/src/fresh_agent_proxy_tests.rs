@@ -30,6 +30,24 @@ fn stable_ids_are_provider_scoped_and_do_not_contain_input() {
 }
 
 #[test]
+fn kilroy_keeps_claude_public_routing_distinct_from_its_runtime_identity() {
+    assert_eq!(fresh_provider_wire(&FreshProvider::Kilroy), "claude");
+    assert_eq!(FreshProvider::Kilroy.as_str(), "kilroy");
+    assert_eq!(
+        rest_agent_identity("claude", "kilroy"),
+        Ok((AgentProvider::Claude, SessionType::Kilroy))
+    );
+    assert!(resume_identity_matches(
+        DesiredState::Running,
+        Some("kilroy"),
+        Some("kilroy-native"),
+        Some("managed-kilroy-public"),
+        "kilroy",
+        "managed-kilroy-public",
+    ));
+}
+
+#[test]
 fn resume_reuses_only_the_exact_running_soul_identity() {
     assert!(resume_identity_matches(
         DesiredState::Running,
@@ -85,4 +103,27 @@ fn only_provider_terminal_edges_complete_a_rest_turn() {
             "event":{"type":"freshAgent.status","status":"busy"}
         }),
     }));
+}
+
+#[test]
+fn fixture_mode_selection_is_exact_and_rejects_duplicates() {
+    assert_eq!(
+        parse_fixture_modes("freshclaude,kilroy,freshcodex,freshopencode")
+            .unwrap()
+            .len(),
+        4
+    );
+    for invalid in [
+        "",
+        "all",
+        "claude",
+        "freshclaude, freshcodex",
+        "freshcodex,freshcodex",
+        "freshopencode,",
+    ] {
+        assert!(
+            parse_fixture_modes(invalid).is_err(),
+            "accepted {invalid:?}"
+        );
+    }
 }

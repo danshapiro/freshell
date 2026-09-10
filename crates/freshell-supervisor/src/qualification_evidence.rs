@@ -91,6 +91,7 @@ mod tests {
                 project_key: "project".into(),
                 fixture: None,
                 terminal: None,
+                fresh_agent: None,
                 view_intent: None,
                 admission: AdmissionPolicy::default(),
             })

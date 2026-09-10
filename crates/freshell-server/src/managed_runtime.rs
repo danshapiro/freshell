@@ -203,6 +203,7 @@ impl ManagedTerminalController for ServerManagedRuntimeController {
                 project_key: project_key.clone(),
                 native_session_id: request.resume_session_id.clone(),
                 fixture: None,
+                fresh_agent: None,
                 terminal: Some(TerminalLaunchSpec {
                     terminal_id: request.terminal_id.clone(),
                     stream_id: request.stream_id.clone(),

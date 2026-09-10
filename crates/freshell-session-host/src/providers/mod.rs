@@ -7,9 +7,13 @@
 mod claude;
 mod cli;
 mod codex;
+#[cfg(feature = "fresh-agent-fixtures")]
+mod deterministic_fresh_agent;
 mod fresh_agent;
 mod opencode;
 
+#[cfg(feature = "fresh-agent-fixtures")]
+pub(crate) use deterministic_fresh_agent::run_worker as run_fresh_agent_fixture_worker;
 pub(crate) use fresh_agent::open_hosted_fresh_agent;
 
 pub(crate) use codex::PreparedCodexLaunch;
@@ -76,16 +80,21 @@ pub async fn probe_resume(
     run_as_gid: u32,
 ) -> RecoveryProbe {
     let provider = resume_spec.provider_session.provider.clone();
-    let result = match provider.as_str() {
-        "claude" | "kilroy" => claude::probe(&resume_spec, run_as_uid, run_as_gid).await,
-        "codex" => codex::probe(&resume_spec, run_as_uid, run_as_gid).await,
-        "opencode" => opencode::probe(&resume_spec, run_as_uid, run_as_gid).await,
-        "amplifier" | "phase1-fixture" | "native-session-fixture" => {
-            cli::probe_as_provider(&resume_spec, run_as_uid, run_as_gid).await
+    let result = match resume_spec.fixture_transport {
+        Some(freshell_runtime_protocol::FreshAgentFixtureTransport::Deterministic) => {
+            deterministic_resume_probe(&resume_spec)
         }
-        other => Err(format!(
-            "managed recovery probe is not implemented for provider {other}"
-        )),
+        None => match provider.as_str() {
+            "claude" | "kilroy" => claude::probe(&resume_spec, run_as_uid, run_as_gid).await,
+            "codex" => codex::probe(&resume_spec, run_as_uid, run_as_gid).await,
+            "opencode" => opencode::probe(&resume_spec, run_as_uid, run_as_gid).await,
+            "amplifier" | "phase1-fixture" | "native-session-fixture" => {
+                cli::probe_as_provider(&resume_spec, run_as_uid, run_as_gid).await
+            }
+            other => Err(format!(
+                "managed recovery probe is not implemented for provider {other}"
+            )),
+        },
     };
     match result {
         Ok(ProviderStoreProbe::Ready { evidence }) => {
@@ -148,6 +157,21 @@ pub async fn probe_resume(
             evidence: vec![message],
         },
     }
+}
+
+#[cfg(feature = "fresh-agent-fixtures")]
+fn deterministic_resume_probe(spec: &ResumeSpec) -> Result<ProviderStoreProbe, String> {
+    deterministic_fresh_agent::probe_resume(
+        spec,
+        std::path::Path::new(&spec.provider_home)
+            .join(".freshell-fixture")
+            .as_path(),
+    )
+}
+
+#[cfg(not(feature = "fresh-agent-fixtures"))]
+fn deterministic_resume_probe(_spec: &ResumeSpec) -> Result<ProviderStoreProbe, String> {
+    Err("deterministic fresh-agent recovery is absent from this session-host build".into())
 }
 
 pub fn run_probe_worker(args: &[String]) -> Result<(), String> {

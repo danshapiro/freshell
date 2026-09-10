@@ -62,6 +62,7 @@ pub fn exact_resume_candidate(
             },
             mode: agent.session_type.clone(),
             runtime_variant: agent.runtime_variant.clone(),
+            fixture_transport: agent.fixture_transport,
             program: "freshell-session-host fresh-agent".into(),
             resume_argv: Vec::new(),
             provider_home: PROVIDER_HOME.into(),
@@ -139,6 +140,7 @@ pub fn exact_resume_candidate(
             },
             mode: "native_session_fixture".into(),
             runtime_variant: "native_session_fixture".into(),
+            fixture_transport: None,
             program: "freshell-session-host fixture native_session".into(),
             resume_argv: Vec::new(),
             provider_home: PROVIDER_HOME.into(),
@@ -336,6 +338,7 @@ mod tests {
             permission_mode: Some("ask".into()),
             sandbox: Some("workspace-write".into()),
             native_session_id: Some("thread-native-42".into()),
+            fixture_transport: None,
             provider_bootstrap_files: Vec::new(),
         });
 
@@ -351,6 +354,43 @@ mod tests {
         assert_eq!(resume.model.as_deref(), Some("gpt-test"));
         assert_eq!(resume.reasoning_effort.as_deref(), Some("high"));
         assert_eq!(resume.permission_mode.as_deref(), Some("ask"));
+        assert_eq!(resume.fixture_transport, None);
+    }
+
+    #[test]
+    fn hosted_fixture_resume_preserves_typed_transport_selection() {
+        let mut context = fixture_context(Some("thread-fixture-42"));
+        context.provider = "codex".into();
+        context.provider_store_id = "fixture-store-42".into();
+        context.fresh_agent = Some(FreshAgentLaunchSpec {
+            session_id: "presentation-fixture-42".into(),
+            provider: FreshProvider::Codex,
+            session_type: "freshcodex".into(),
+            runtime_variant: "codex-app-server-v1".into(),
+            provider_store_id: "fixture-store-42".into(),
+            cwd: "/workspace/project".into(),
+            workspace_path: "/workspace/project".into(),
+            git_common_dir: None,
+            run_as_uid: 65_534,
+            run_as_gid: 0,
+            model: Some("gpt-test".into()),
+            effort: Some("low".into()),
+            permission_mode: None,
+            sandbox: Some("workspace-write".into()),
+            native_session_id: Some("thread-fixture-42".into()),
+            fixture_transport: Some(
+                freshell_runtime_protocol::FreshAgentFixtureTransport::Deterministic,
+            ),
+            provider_bootstrap_files: Vec::new(),
+        });
+
+        let resume = exact_resume_candidate(&context, Some("thread-fixture-42"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            resume.fixture_transport,
+            Some(freshell_runtime_protocol::FreshAgentFixtureTransport::Deterministic)
+        );
     }
 
     #[test]

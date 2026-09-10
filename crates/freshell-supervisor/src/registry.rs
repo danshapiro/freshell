@@ -2777,6 +2777,7 @@ mod tests {
             permission_mode: Some("ask".into()),
             sandbox: Some("workspace-write".into()),
             native_session_id: None,
+            fixture_transport: None,
             provider_bootstrap_files: Vec::new(),
         });
         let prepared = registry.prepare_launch(launch).await.unwrap();
