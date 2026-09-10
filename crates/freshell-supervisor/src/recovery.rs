@@ -9,7 +9,9 @@
 use crate::{
     backend::{BackendError, BackendRuntimeState},
     checkpoints,
-    loss_report::{IncidentExporter, LossDecisionInput, LostDecision},
+    loss_report::{
+        hash_loss_certificate, path_name, IncidentExporter, LossDecisionInput, LostDecision,
+    },
     registry::{OwnedRuntimeHandle, RecoveryContext, RegistryError},
     resume_catalog,
     service::Supervisor,
@@ -23,6 +25,7 @@ use freshell_runtime_protocol::{
     RecoveryResult, RecoveryTrigger, RetryHint, RuntimeError, RuntimeErrorCode, RuntimeView,
     SoulId, StopOutcome, TerminalLaunchSpec, CONTROL_PROTOCOL_VERSION,
 };
+use sha2::{Digest, Sha256};
 use tokio::time::{sleep, Duration, Instant};
 
 impl Supervisor {
@@ -794,13 +797,14 @@ impl Supervisor {
         soul_id: SoulId,
         probe: RecoveryProbe,
     ) -> Result<RecoveryResult, RuntimeError> {
-        let (path, message, evidence) = match &probe {
+        let (path, store_state, message, evidence) = match &probe {
             RecoveryProbe::DefinitivelyUnavailable {
                 path,
                 reason,
                 evidence,
+                store_state,
                 ..
-            } => (*path, reason.clone(), evidence.clone()),
+            } => (*path, *store_state, reason.clone(), evidence.clone()),
             _ => {
                 return Err(RuntimeError::new(
                     RuntimeErrorCode::InvalidRequest,
@@ -808,9 +812,13 @@ impl Supervisor {
                 ))
             }
         };
-        let mut preserved_evidence = evidence;
+        let (_, mut preserved_evidence) =
+            normalized_negative_evidence(path, store_state, &evidence);
         preserved_evidence.push("rolloutMode=legacy".into());
-        preserved_evidence.push(format!("definitiveNegative={message}"));
+        preserved_evidence.push(format!(
+            "definitiveNegativeReasonDigest={}",
+            digest_forensic_strings(std::slice::from_ref(&message))
+        ));
         self.registry
             .mark_recovery_blocked(
                 soul_id.clone(),
@@ -855,13 +863,24 @@ impl Supervisor {
         trigger: RecoveryTrigger,
         definitive_probe: RecoveryProbe,
     ) -> Result<RecoveryResult, RuntimeError> {
+        // Native stores and authenticated hosts can become visible while the
+        // complete path inventory is being evaluated. Re-run the full probe
+        // and rebuild every path row from the refreshed intent immediately
+        // before constructing the certificate. Any late positive, unreadable
+        // state, or stop/new-intent fence cancels loss.
+        let final_probe = self.probe_recovery_inner(soul_id.clone()).await?;
+        if !final_probe_still_allows_loss(&final_probe) {
+            return self
+                .preserve_nonloss_probe(soul_id, trigger, final_probe)
+                .await;
+        }
         let context = self
             .registry
             .recovery_context(soul_id.clone())
             .await
             .map_err(map_registry)?;
         let path_evidence = match self
-            .collect_loss_path_evidence(&context, &definitive_probe)
+            .collect_loss_path_evidence(&context, &final_probe)
             .await
         {
             Ok(evidence) => evidence,
@@ -879,12 +898,8 @@ impl Supervisor {
                 provider => format!("unreported-{provider}"),
             });
         let now = freshell_runtime_observability::now_rfc3339_millis();
-        let observed_cause = match &definitive_probe {
-            RecoveryProbe::DefinitivelyUnavailable { reason, .. } => reason.clone(),
-            _ => "all recovery paths were exhausted".into(),
-        };
         let analysis = IncidentAnalysis {
-            observed_cause: observed_cause.clone(),
+            observed_cause: "all_applicable_recovery_paths_definitively_unavailable".into(),
             missing_invariant: "no live enclosure, readable native store, verified checkpoint, or pristine never-dispatched seed remained".into(),
             hypotheses: vec![
                 "provider state was removed or became irreversibly inconsistent".into(),
@@ -994,12 +1009,13 @@ impl Supervisor {
             serde_json::json!({
                 "soulId": soul_id,
                 "incidentId": prepared.certificate.incident_id,
+                "certificateSha256": hash_loss_certificate(&prepared.certificate),
                 "cleanupTarget": prepared.certificate.cleanup_target.owned_handle_ref,
                 "foreignObjectsTouched": 0,
             }),
         );
         crate::service::crash_if("after_loss_incident_commit");
-        self.export_pending_incidents().await;
+        self.export_pending_incidents().await?;
 
         let preexisting_empty = self
             .backend
@@ -1035,13 +1051,14 @@ impl Supervisor {
             .await
             .map_err(map_registry)?;
         crate::service::crash_if("after_loss_finalize_before_export");
-        self.export_pending_incidents().await;
+        self.export_pending_incidents().await?;
         crate::service::append_event(
             &self.config.lifecycle_log,
             "supervisor.loss.finalized",
             serde_json::json!({
                 "soulId": soul_id,
                 "incidentId": incident_id,
+                "certificateSha256": hash_loss_certificate(&prepared.certificate),
                 "cleanupOutcome": outcome,
                 "foreignObjectsTouched": 0,
             }),
@@ -1220,6 +1237,11 @@ impl Supervisor {
                     ));
                 }
             };
+            let mut row = row;
+            let (reason_code, evidence_refs) =
+                normalized_negative_evidence(row.path, row.store_state, &row.evidence_refs);
+            row.reason_code = reason_code;
+            row.evidence_refs = evidence_refs;
             evidence.push(row);
         }
         Ok(evidence)
@@ -1329,7 +1351,7 @@ impl Supervisor {
     /// crash. The incident row and exact cleanup capability were committed
     /// together, so this never discovers authority from Docker-wide state.
     pub async fn reconcile_pending_loss_cleanup(&self) -> Result<(), RuntimeError> {
-        self.export_pending_incidents().await;
+        self.export_pending_incidents().await?;
         let incidents = self
             .registry
             .unresolved_loss_incident_ids()
@@ -1385,11 +1407,11 @@ impl Supervisor {
                 }),
             );
         }
-        self.export_pending_incidents().await;
+        self.export_pending_incidents().await?;
         Ok(())
     }
 
-    pub(crate) async fn export_pending_incidents(&self) {
+    pub(crate) async fn export_pending_incidents(&self) -> Result<(), RuntimeError> {
         let exports = match self.registry.pending_incident_exports(100).await {
             Ok(exports) => exports,
             Err(error) => {
@@ -1398,7 +1420,10 @@ impl Supervisor {
                     "supervisor.loss.export_queue_read_failed",
                     serde_json::json!({"error": error.to_string()}),
                 );
-                return;
+                return Err(RuntimeError::new(
+                    RuntimeErrorCode::IncidentPersistenceFailed,
+                    "durable incident export queue is unavailable",
+                ));
             }
         };
         let exporter = IncidentExporter::new(
@@ -1451,9 +1476,10 @@ impl Supervisor {
                     }
                 }
                 Err(error) => {
-                    // The SQLite incident/export intent is already durable, so
-                    // exact cleanup may proceed. Leave this outbox row pending
-                    // and surface an emergency operator-visible event.
+                    // The SQLite incident/export intent is already durable,
+                    // but destructive cleanup remains blocked until the
+                    // private atomic incident artifact also reaches disk.
+                    // Leave the outbox row pending for startup reconciliation.
                     eprintln!(
                         "Freshell loss incident export pending for {}: {}",
                         event.incident_id, error
@@ -1467,9 +1493,14 @@ impl Supervisor {
                             "retryPending": true,
                         }),
                     );
+                    return Err(RuntimeError::new(
+                        RuntimeErrorCode::IncidentPersistenceFailed,
+                        "durable incident artifact could not be persisted before cleanup",
+                    ));
                 }
             }
         }
+        Ok(())
     }
 
     async fn replay_queued_inputs(
@@ -1867,8 +1898,42 @@ fn recovery_activation_failure_data(
         "path": path,
         "blockReason": reason,
         "errorCode": error.code,
-        "errorMessage": error.message,
+        "errorClass": "provider_activation_failed",
     })
+}
+
+fn normalized_negative_evidence(
+    path: RecoveryPath,
+    store_state: EvidenceStoreState,
+    transient_evidence: &[String],
+) -> (String, Vec<String>) {
+    let store = match store_state {
+        EvidenceStoreState::Missing => "missing",
+        EvidenceStoreState::PresentReadable => "present_readable",
+        EvidenceStoreState::PresentUnreadable => "present_unreadable",
+        EvidenceStoreState::Unknown => "unknown",
+        EvidenceStoreState::NotApplicable => "not_applicable",
+    };
+    (
+        format!("{}_definitive_negative_{store}", path_name(path)),
+        vec![
+            format!("recoveryPath={}", path_name(path)),
+            format!("storeState={store}"),
+            format!(
+                "transientEvidenceDigest={}",
+                digest_forensic_strings(transient_evidence)
+            ),
+        ],
+    )
+}
+
+fn final_probe_still_allows_loss(probe: &RecoveryProbe) -> bool {
+    matches!(probe, RecoveryProbe::DefinitivelyUnavailable { .. })
+}
+
+fn digest_forensic_strings(values: &[String]) -> String {
+    let encoded = serde_json::to_vec(values).expect("forensic strings are serializable");
+    format!("sha256:{:x}", Sha256::digest(encoded))
 }
 
 fn terminal_without_first_boot_state(
@@ -1976,10 +2041,47 @@ mod tests {
         assert_eq!(data["path"], "native_resume");
         assert_eq!(data["blockReason"], "PROVIDER_UNAVAILABLE");
         assert_eq!(data["errorCode"], "HOST_UNREACHABLE");
-        assert!(data["errorMessage"]
-            .as_str()
-            .unwrap()
-            .contains("operation not permitted"));
+        assert_eq!(data["errorClass"], "provider_activation_failed");
+        assert!(!data.to_string().contains("operation not permitted"));
+    }
+
+    #[test]
+    fn loss_evidence_persists_only_structured_codes_and_transient_digests() {
+        let synthetic = vec![
+            "synthetic native transcript text".to_string(),
+            "Bearer abcdefghijklmnop".to_string(),
+        ];
+        let (reason, refs) = normalized_negative_evidence(
+            RecoveryPath::NativeResume,
+            EvidenceStoreState::Missing,
+            &synthetic,
+        );
+        let encoded = serde_json::to_string(&(reason, refs)).unwrap();
+        assert!(encoded.contains("native_resume_definitive_negative_missing"));
+        assert!(encoded.contains("transientEvidenceDigest=sha256:"));
+        assert!(!encoded.contains("synthetic native transcript text"));
+        assert!(!encoded.contains("abcdefghijklmnop"));
+    }
+
+    #[test]
+    fn late_liveness_probe_cancels_loss_certification() {
+        let late_live = RecoveryProbe::ReattachReady {
+            handle: ReattachHandle {
+                incarnation_id: IncarnationId::new(),
+                host_boot_id: freshell_runtime_protocol::HostBootId::new(),
+                container_id: "a".repeat(64),
+            },
+            protocol_version: CONTROL_PROTOCOL_VERSION,
+        };
+        assert!(!final_probe_still_allows_loss(&late_live));
+        assert!(final_probe_still_allows_loss(
+            &RecoveryProbe::DefinitivelyUnavailable {
+                path: RecoveryPath::NativeResume,
+                reason: "structured-negative".into(),
+                evidence: vec!["digest-only".into()],
+                store_state: EvidenceStoreState::Missing,
+            }
+        ));
     }
 
     #[test]

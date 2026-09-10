@@ -22,6 +22,15 @@ export type ManagedRuntimeView = {
   soulId: string
   incarnationId: string
   launchState: string
+  cleanupState?: string
+  intentRevision: number
+  executionGeneration?: number
+  effectiveLimits?: {
+    cpuMilli: number
+    memoryBytes: number
+    swapBytes: number
+    pidsMax: number
+  }
   desiredState?: string
   recoveryState?: string
   durabilityState?: string
@@ -164,8 +173,17 @@ export class ManagedRuntimeBrowserRig {
   }
 
   async restartSupervisor(): Promise<SupervisorInstance> {
+    return this.replaceSupervisor('graceful')
+  }
+
+  async restartSupervisorAbrupt(): Promise<SupervisorInstance> {
+    return this.replaceSupervisor('abrupt')
+  }
+
+  private async replaceSupervisor(mode: 'graceful' | 'abrupt'): Promise<SupervisorInstance> {
     const previous = this.supervisor
-    this.runtime.stopSupervisorExact(previous)
+    if (mode === 'abrupt') this.runtime.killTrackedContainerExact(previous.containerId)
+    else this.runtime.stopSupervisorExact(previous)
     this.runtime.removeContainerExact(previous.containerId)
     this.supervisor = await this.runtime.startSupervisor({
       scenarioId: previous.scenarioId,
@@ -251,16 +269,16 @@ export class ManagedRuntimeBrowserRig {
   writeBrowserReceipt(value: unknown): string {
     const target = process.env.FRESHELL_RUNTIME_BROWSER_RECEIPT
       || path.join(this.runtime.browserDir, defaultReceiptFileName('FRESHELL_RUNTIME_BROWSER_RECEIPT'))
-    fs.mkdirSync(path.dirname(target), { recursive: true })
-    fs.writeFileSync(target, JSON.stringify(value, null, 2))
+    fs.mkdirSync(path.dirname(target), { recursive: true, mode: 0o700 })
+    fs.writeFileSync(target, JSON.stringify(value, null, 2), { mode: 0o600 })
     return target
   }
 
   writeOpencodeReceipt(value: unknown): string {
     const target = process.env.FRESHELL_RUNTIME_OPENCODE_RECEIPT
       || path.join(this.runtime.browserDir, defaultReceiptFileName('FRESHELL_RUNTIME_OPENCODE_RECEIPT'))
-    fs.mkdirSync(path.dirname(target), { recursive: true })
-    fs.writeFileSync(target, JSON.stringify(value, null, 2))
+    fs.mkdirSync(path.dirname(target), { recursive: true, mode: 0o700 })
+    fs.writeFileSync(target, JSON.stringify(value, null, 2), { mode: 0o600 })
     return target
   }
 
@@ -277,8 +295,8 @@ export class ManagedRuntimeBrowserRig {
     }
     const written: string[] = []
     for (const target of targets) {
-      fs.mkdirSync(path.dirname(target), { recursive: true })
-      fs.writeFileSync(target, JSON.stringify(value, null, 2))
+      fs.mkdirSync(path.dirname(target), { recursive: true, mode: 0o700 })
+      fs.writeFileSync(target, JSON.stringify(value, null, 2), { mode: 0o600 })
       written.push(target)
     }
     return written
@@ -310,33 +328,42 @@ export class ManagedRuntimeBrowserRig {
   writePhase3BrowserReceipt(value: unknown): string {
     const target = process.env.FRESHELL_RUNTIME_PHASE3_BROWSER_RECEIPT
       || path.join(this.runtime.browserDir, defaultReceiptFileName('FRESHELL_RUNTIME_PHASE3_BROWSER_RECEIPT'))
-    fs.mkdirSync(path.dirname(target), { recursive: true })
-    fs.writeFileSync(target, JSON.stringify(value, null, 2))
+    fs.mkdirSync(path.dirname(target), { recursive: true, mode: 0o700 })
+    fs.writeFileSync(target, JSON.stringify(value, null, 2), { mode: 0o600 })
     return target
   }
 
   writePhase4BrowserReceipt(value: unknown): string {
     const target = process.env.FRESHELL_RUNTIME_PHASE4_BROWSER_RECEIPT
       || path.join(this.runtime.browserDir, defaultReceiptFileName('FRESHELL_RUNTIME_PHASE4_BROWSER_RECEIPT'))
-    fs.mkdirSync(path.dirname(target), { recursive: true })
-    fs.writeFileSync(target, JSON.stringify(value, null, 2))
+    fs.mkdirSync(path.dirname(target), { recursive: true, mode: 0o700 })
+    fs.writeFileSync(target, JSON.stringify(value, null, 2), { mode: 0o600 })
     return target
   }
 
   writePhase5LossReceipt(value: unknown): string {
-    const target = process.env.FRESHELL_RUNTIME_PHASE5_LOSS_RECEIPT
-      || path.join(this.runtime.browserDir, defaultReceiptFileName('FRESHELL_RUNTIME_PHASE5_LOSS_RECEIPT'))
-    fs.mkdirSync(path.dirname(target), { recursive: true })
-    fs.writeFileSync(target, JSON.stringify(value, null, 2))
+    const target = this.canonicalPhase5ReceiptTarget('FRESHELL_RUNTIME_PHASE5_LOSS_RECEIPT')
+    fs.mkdirSync(path.dirname(target), { recursive: true, mode: 0o700 })
+    fs.writeFileSync(target, JSON.stringify(value, null, 2), { mode: 0o600 })
     return target
   }
 
   writePhase5ChaosReceipt(value: unknown): string {
-    const target = process.env.FRESHELL_RUNTIME_PHASE5_CHAOS_RECEIPT
-      || path.join(this.runtime.browserDir, defaultReceiptFileName('FRESHELL_RUNTIME_PHASE5_CHAOS_RECEIPT'))
-    fs.mkdirSync(path.dirname(target), { recursive: true })
-    fs.writeFileSync(target, JSON.stringify(value, null, 2))
+    const target = this.canonicalPhase5ReceiptTarget('FRESHELL_RUNTIME_PHASE5_CHAOS_RECEIPT')
+    fs.mkdirSync(path.dirname(target), { recursive: true, mode: 0o700 })
+    fs.writeFileSync(target, JSON.stringify(value, null, 2), { mode: 0o600 })
     return target
+  }
+
+  private canonicalPhase5ReceiptTarget(
+    envName: 'FRESHELL_RUNTIME_PHASE5_LOSS_RECEIPT' | 'FRESHELL_RUNTIME_PHASE5_CHAOS_RECEIPT',
+  ): string {
+    const canonical = path.join(this.runtime.browserDir, defaultReceiptFileName(envName))
+    const requested = process.env[envName]?.trim()
+    if (requested && path.resolve(this.repoRoot, requested) !== canonical) {
+      throw new Error(`${envName} must name the canonical candidate/run browser receipt path`)
+    }
+    return canonical
   }
 
   private buildManagedServer(): string {

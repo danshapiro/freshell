@@ -7,6 +7,7 @@
 
 use regex::Regex;
 use serde::Serialize;
+use serde_json::Value;
 use std::{
     fs::{self, File, OpenOptions},
     io::Write,
@@ -67,6 +68,14 @@ fn secret_query_re() -> &'static Regex {
     })
 }
 
+fn provider_content_field_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(r#"(?i)"([a-z0-9_-]*(?:transcript|provider[_-]?response|response[_-]?content|raw[_-]?output)[a-z0-9_-]*)"\s*:\s*"((?:\\.|[^"\\])*)""#)
+            .expect("valid provider-content redaction regex")
+    })
+}
+
 /// Scrub one already-rendered record before it reaches any persistent sink.
 ///
 /// The exact process secret is replaced everywhere, then common and future
@@ -98,9 +107,69 @@ pub fn scrub(line: &str, process_secret: &str) -> String {
     out = common_secret_re()
         .replace_all(&out, "***REDACTED***")
         .into_owned();
+    out = provider_content_field_re()
+        .replace_all(&out, |caps: &regex::Captures| {
+            format!("\"{}\":\"***REDACTED***\"", &caps[1])
+        })
+        .into_owned();
     secret_query_re()
         .replace_all(&out, "$1***REDACTED***")
         .into_owned()
+}
+
+fn redact_sensitive_json(value: &mut Value) {
+    match value {
+        Value::Object(fields) => {
+            for (key, child) in fields {
+                if sensitive_json_key(key) {
+                    *child = Value::String("***REDACTED***".into());
+                } else {
+                    redact_sensitive_json(child);
+                }
+            }
+        }
+        Value::Array(items) => items.iter_mut().for_each(redact_sensitive_json),
+        _ => {}
+    }
+}
+
+fn sensitive_json_key(key: &str) -> bool {
+    let normalized = key
+        .chars()
+        .filter(|character| character.is_ascii_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect::<String>();
+    [
+        "token",
+        "secret",
+        "password",
+        "credential",
+        "apikey",
+        "authorization",
+        "cookie",
+        "transcript",
+        "providerresponse",
+        "responsecontent",
+        "rawoutput",
+    ]
+    .iter()
+    .any(|fragment| normalized.contains(fragment))
+}
+
+fn redacted_json<T: Serialize>(
+    value: &T,
+    pretty: bool,
+    process_secret: &str,
+) -> std::io::Result<String> {
+    let mut value = serde_json::to_value(value).map_err(std::io::Error::other)?;
+    redact_sensitive_json(&mut value);
+    let encoded = if pretty {
+        serde_json::to_string_pretty(&value)
+    } else {
+        serde_json::to_string(&value)
+    }
+    .map_err(std::io::Error::other)?;
+    Ok(scrub(&encoded, process_secret))
 }
 
 struct RotatingInner {
@@ -193,7 +262,13 @@ impl RotatingJsonlWriter {
     }
 
     pub fn write_json<T: Serialize>(&self, value: &T) -> std::io::Result<()> {
-        let line = serde_json::to_string(value).map_err(std::io::Error::other)?;
+        let process_secret = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .process_secret
+            .clone();
+        let line = redacted_json(value, false, &process_secret)?;
         self.write_line(&line)
     }
 
@@ -219,8 +294,7 @@ pub fn atomic_write_redacted_json<T: Serialize>(
         .ok_or_else(|| std::io::Error::other("document path has no parent"))?;
     fs::create_dir_all(parent)?;
     fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))?;
-    let encoded = serde_json::to_string_pretty(value).map_err(std::io::Error::other)?;
-    let redacted = scrub(&encoded, process_secret);
+    let redacted = redacted_json(value, true, process_secret)?;
     static TEMP_NONCE: AtomicU64 = AtomicU64::new(1);
     let nonce = TEMP_NONCE.fetch_add(1, Ordering::Relaxed);
     let tmp = path.with_extension(format!("tmp-{}-{nonce}", std::process::id()));
@@ -275,6 +349,29 @@ mod tests {
         );
         assert!(!unstructured.contains("abcdefghijklmnop"));
         assert!(!unstructured.contains("secret-value"));
+
+        let provider_content = scrub(
+            r#"{"nativeTranscript":"synthetic native transcript text","providerResponse":"provider-private-content","safe":"retained"}"#,
+            "",
+        );
+        assert!(!provider_content.contains("synthetic native transcript text"));
+        assert!(!provider_content.contains("provider-private-content"));
+        assert!(provider_content.contains("retained"));
+
+        let dir = tempfile::tempdir().unwrap();
+        let nested_path = dir.path().join("nested.jsonl");
+        let writer = RotatingJsonlWriter::create(&nested_path, 4096, 1, "").unwrap();
+        writer
+            .write_json(&serde_json::json!({
+                "providerResponse": { "content": "nested provider-private-content" },
+                "nativeTranscript": ["synthetic native transcript text"],
+                "safe": "retained",
+            }))
+            .unwrap();
+        let nested = fs::read_to_string(nested_path).unwrap();
+        assert!(!nested.contains("nested provider-private-content"));
+        assert!(!nested.contains("synthetic native transcript text"));
+        assert!(nested.contains("retained"));
     }
 
     #[test]

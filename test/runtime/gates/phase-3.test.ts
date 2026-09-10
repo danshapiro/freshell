@@ -846,6 +846,7 @@ function requiredProviderReceipt(caseId: string, h: RuntimeHarness, instruction:
     candidateSha: h.candidateSha,
     expectedRuntimeImage: h.imageRef,
     receipt,
+    legacyMigration: { gateMode: 'landing', providers: ['opencode'] },
   })
   h.assert(caseId, receipt.status === 'PASS', 'provider receipt is an explicit PASS', receipt)
   h.assert(caseId, receipt.candidateSha === h.candidateSha, 'provider receipt belongs to the exact candidate commit', receipt)
