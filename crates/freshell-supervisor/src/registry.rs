@@ -1126,6 +1126,100 @@ impl Registry {
         .await
     }
 
+    pub async fn transition_native_session(
+        &self,
+        soul_id: SoulId,
+        incarnation_id: IncarnationId,
+        expected_parent: &str,
+        child_session_id: &str,
+    ) -> Result<(), RegistryError> {
+        let expected_parent = expected_parent.to_string();
+        let child_session_id = child_session_id.to_string();
+        if expected_parent.is_empty()
+            || child_session_id.is_empty()
+            || expected_parent == child_session_id
+            || expected_parent.chars().any(char::is_control)
+            || child_session_id.chars().any(char::is_control)
+        {
+            return Err(RegistryError::NativeIdentityConflict);
+        }
+        self.run_blocking(move |mut conn| {
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let (provider, store, existing, intent): (String, String, Option<String>, u64) = tx
+                .query_row(
+                    "SELECT provider,provider_store_id,native_session_id,intent_revision FROM souls WHERE soul_id=?1",
+                    params![soul_id.as_str()],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                )
+                .optional()?
+                .ok_or_else(|| RegistryError::UnknownSoul(soul_id.clone()))?;
+            let owner: String = tx.query_row(
+                "SELECT soul_id FROM incarnations WHERE incarnation_id=?1",
+                params![incarnation_id.as_str()], |row| row.get(0),
+            ).optional()?.ok_or_else(|| RegistryError::UnknownIncarnation(incarnation_id.clone()))?;
+            if owner != soul_id.as_str() {
+                return Err(RegistryError::NativeIdentityConflict);
+            }
+            // The response to a successful provider fork can be lost. Retrying
+            // the same transition after durable commit is idempotent.
+            if existing.as_deref() == Some(child_session_id.as_str()) {
+                let claim: Option<String> = tx.query_row(
+                    "SELECT incarnation_id FROM writer_claims WHERE provider=?1 AND provider_store_id=?2 AND native_session_id=?3",
+                    params![provider, store, child_session_id], |row| row.get(0),
+                ).optional()?;
+                if claim.as_deref() != Some(incarnation_id.as_str()) {
+                    return Err(RegistryError::NativeIdentityConflict);
+                }
+                tx.commit()?;
+                return Ok(());
+            }
+            if existing.as_deref() != Some(expected_parent.as_str()) {
+                return Err(RegistryError::NativeIdentityConflict);
+            }
+            let encoded: String = tx.query_row(
+                "SELECT fresh_agent_spec FROM incarnations WHERE incarnation_id=?1",
+                params![incarnation_id.as_str()], |row| row.get(0),
+            )?;
+            let mut spec: FreshAgentLaunchSpec = serde_json::from_str(&encoded)
+                .map_err(|_| RegistryError::Integrity("invalid fresh-agent launch spec".into()))?;
+            if spec.native_session_id.as_deref() != Some(expected_parent.as_str()) {
+                return Err(RegistryError::NativeIdentityConflict);
+            }
+            let conflicting: Option<String> = tx.query_row(
+                "SELECT incarnation_id FROM writer_claims WHERE provider=?1 AND provider_store_id=?2 AND native_session_id=?3",
+                params![provider, store, child_session_id], |row| row.get(0),
+            ).optional()?;
+            if conflicting.is_some() {
+                return Err(RegistryError::NativeIdentityConflict);
+            }
+            let removed = tx.execute(
+                "DELETE FROM writer_claims WHERE provider=?1 AND provider_store_id=?2 AND native_session_id=?3 AND soul_id=?4 AND incarnation_id=?5",
+                params![provider, store, expected_parent, soul_id.as_str(), incarnation_id.as_str()],
+            )?;
+            if removed != 1 {
+                return Err(RegistryError::NativeIdentityConflict);
+            }
+            tx.execute(
+                "INSERT INTO writer_claims (provider,provider_store_id,native_session_id,soul_id,incarnation_id,intent_revision) VALUES (?1,?2,?3,?4,?5,?6)",
+                params![provider, store, child_session_id, soul_id.as_str(), incarnation_id.as_str(), intent],
+            )?;
+            spec.native_session_id = Some(child_session_id.clone());
+            let now = now_millis();
+            tx.execute(
+                "UPDATE incarnations SET fresh_agent_spec=?1,updated_at=?2 WHERE incarnation_id=?3",
+                params![serde_json::to_string(&spec)?, now, incarnation_id.as_str()],
+            )?;
+            // Any prior resume proof names the old branch. It must be
+            // re-materialized from the child before a later replacement.
+            tx.execute(
+                "UPDATE souls SET native_session_id=?1,resume_spec=NULL,allocation_state='materializing',durability_state='live_only',checkpoint_revision=0,updated_at=?2 WHERE soul_id=?3",
+                params![child_session_id, now, soul_id.as_str()],
+            )?;
+            tx.commit()?;
+            Ok(())
+        }).await
+    }
+
     pub async fn store_verified_resume_spec(
         &self,
         soul_id: SoulId,
@@ -3103,6 +3197,104 @@ mod tests {
                 .await,
             Err(RegistryError::InputConflict)
         ));
+    }
+
+    #[tokio::test]
+    async fn native_fork_transitions_identity_in_place_and_replaces_the_writer_claim() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let registry = Registry::open(dir.path(), None).unwrap();
+        let soul = SoulId::new();
+        let prepared = materialize_fresh_runtime(&registry, soul.clone(), workspace.path()).await;
+        registry
+            .record_native_session(
+                soul.clone(),
+                prepared.incarnation_id.clone(),
+                "native-parent".into(),
+            )
+            .await
+            .unwrap();
+        // Model an already-qualified parent branch. A provider-native fork
+        // invalidates this exact resume/checkpoint evidence even though the
+        // soul and enclosure stay live.
+        {
+            let conn = open_connection(&registry.inner.db_path).unwrap();
+            conn.execute(
+                "UPDATE souls SET durability_state='checkpoint_captured', allocation_state='verified_durable', checkpoint_revision=9, resume_spec='{}' WHERE soul_id=?1",
+                params![soul.as_str()],
+            )
+            .unwrap();
+        }
+
+        registry
+            .transition_native_session(
+                soul.clone(),
+                prepared.incarnation_id.clone(),
+                "native-parent",
+                "native-child",
+            )
+            .await
+            .unwrap();
+        // A retry after the transition is idempotent, but an unrelated expected parent is not.
+        registry
+            .transition_native_session(
+                soul.clone(),
+                prepared.incarnation_id.clone(),
+                "native-parent",
+                "native-child",
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            registry
+                .transition_native_session(
+                    soul.clone(),
+                    prepared.incarnation_id.clone(),
+                    "foreign-parent",
+                    "another-child",
+                )
+                .await,
+            Err(RegistryError::NativeIdentityConflict)
+        ));
+
+        let context = registry.recovery_context(soul.clone()).await.unwrap();
+        assert_eq!(context.native_session_id.as_deref(), Some("native-child"));
+        assert_eq!(context.resume_spec, None);
+        assert_eq!(context.allocation_state, AllocationState::Materializing);
+        assert_eq!(context.durability_state, DurabilityState::LiveOnly);
+        assert_eq!(context.checkpoint_revision, 0);
+        let child_candidate =
+            crate::resume_catalog::exact_resume_candidate(&context, Some("native-child"))
+                .unwrap()
+                .expect(
+                    "the live child identity can immediately construct its own resume candidate",
+                );
+        assert_eq!(
+            child_candidate.provider_session.native_session_id,
+            "native-child"
+        );
+        assert_eq!(child_candidate.checkpoint_revision, 0);
+        assert_eq!(
+            context
+                .fresh_agent
+                .as_ref()
+                .and_then(|spec| spec.native_session_id.as_deref()),
+            Some("native-child")
+        );
+        assert_eq!(
+            context.prior_handle.incarnation_id(),
+            &prepared.incarnation_id
+        );
+        let conn = open_connection(&registry.inner.db_path).unwrap();
+        let parent_claims: u64 = conn.query_row(
+            "SELECT COUNT(*) FROM writer_claims WHERE soul_id=?1 AND native_session_id='native-parent'",
+            params![soul.as_str()], |row| row.get(0),
+        ).unwrap();
+        let child_claims: u64 = conn.query_row(
+            "SELECT COUNT(*) FROM writer_claims WHERE soul_id=?1 AND native_session_id='native-child' AND incarnation_id=?2",
+            params![soul.as_str(), prepared.incarnation_id.as_str()], |row| row.get(0),
+        ).unwrap();
+        assert_eq!((parent_claims, child_claims), (0, 1));
     }
 
     #[tokio::test]

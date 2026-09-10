@@ -1295,6 +1295,25 @@ pub struct FreshAgentSendRequest {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct FreshAgentForkRequest {
+    pub soul_id: SoulId,
+    pub parent_session_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expected_control_epoch: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FreshAgentForkResult {
+    pub parent_session_id: String,
+    pub child_session_id: String,
+    pub parent_retired_by_runtime: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct FreshAgentResolveRequest {
     pub soul_id: SoulId,
     pub decision_id: String,
@@ -1603,6 +1622,7 @@ pub enum AdminCommand {
     TerminalResize(TerminalResizeRequest),
     TerminalReadOutput(TerminalReadOutputRequest),
     FreshAgentSend(FreshAgentSendRequest),
+    FreshAgentFork(FreshAgentForkRequest),
     FreshAgentResolve(FreshAgentResolveRequest),
     FreshAgentInterrupt(FreshAgentInterruptRequest),
     FreshAgentReadEvents(FreshAgentReadEventsRequest),
@@ -1752,6 +1772,7 @@ pub enum AdminResult {
     FreshAgentCommand {
         state: CommandState,
     },
+    FreshAgentFork(FreshAgentForkResult),
     FreshAgentInterrupted,
     FreshAgentEvents(AgentEventBatch),
     RuntimeMetrics(RuntimeMetrics),
@@ -1824,6 +1845,13 @@ pub enum HostCommand {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         settings: Option<FreshAgentTurnSettings>,
     },
+    FreshAgentFork {
+        incarnation_id: IncarnationId,
+        request_id: RequestId,
+        parent_session_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        input: Option<serde_json::Value>,
+    },
     FreshAgentResolve {
         incarnation_id: IncarnationId,
         decision_id: String,
@@ -1882,6 +1910,7 @@ pub enum HostResult {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         native_session_id: Option<String>,
     },
+    FreshAgentFork(FreshAgentForkResult),
     FreshAgentInterrupted,
     FreshAgentEvents(AgentEventBatch),
     RuntimeMetrics(RuntimeMetrics),
@@ -2235,6 +2264,30 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn fresh_agent_fork_is_a_same_runtime_session_transition_on_the_wire() {
+        let request = FreshAgentForkRequest {
+            soul_id: SoulId::parse("soul-fork-wire").unwrap(),
+            parent_session_id: "native-parent".into(),
+            input: Some(serde_json::json!({"atTurnId":"turn-4"})),
+            expected_control_epoch: Some(8),
+        };
+        let encoded = serde_json::to_value(AdminCommand::FreshAgentFork(request.clone())).unwrap();
+        assert_eq!(encoded["method"], "fresh_agent_fork");
+        let decoded: AdminCommand = serde_json::from_value(encoded).unwrap();
+        assert!(matches!(decoded, AdminCommand::FreshAgentFork(value) if value == request));
+
+        let transition = FreshAgentForkResult {
+            parent_session_id: "native-parent".into(),
+            child_session_id: "native-child".into(),
+            parent_retired_by_runtime: true,
+        };
+        let host = HostResult::FreshAgentFork(transition.clone());
+        let decoded: HostResult =
+            serde_json::from_value(serde_json::to_value(host).unwrap()).unwrap();
+        assert!(matches!(decoded, HostResult::FreshAgentFork(value) if value == transition));
     }
 
     #[test]

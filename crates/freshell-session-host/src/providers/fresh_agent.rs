@@ -6,25 +6,31 @@
 
 use async_trait::async_trait;
 use freshell_agent_runtime::host_actor::{
-    DispatchAck, DispatchFailure, FreshAgentHostActor, FreshAgentProfile, FreshAgentTransport,
-    TransportStart,
+    DispatchAck, DispatchFailure, ForkTransition, FreshAgentHostActor, FreshAgentProfile,
+    FreshAgentTransport, TransportStart,
 };
 use freshell_freshagent::{FreshAgentState, FreshClaudeState, FreshCodexState, FreshOpencodeState};
 use freshell_protocol::{
-    AgentProvider, FreshAgentApprovalRespond, FreshAgentCreate, FreshAgentInterrupt,
-    FreshAgentQuestionRespond, FreshAgentSend, FreshAgentSendSettings, SessionLocator, SessionType,
-    StringOrNumber,
+    AgentProvider, FreshAgentApprovalRespond, FreshAgentCreate, FreshAgentFork,
+    FreshAgentInterrupt, FreshAgentKill, FreshAgentQuestionRespond, FreshAgentSend,
+    FreshAgentSendSettings, ServerMessage, SessionLocator, SessionType, StringOrNumber,
 };
 use freshell_runtime_protocol::{AgentEvent, FreshAgentLaunchSpec, FreshProvider, RequestId};
 use serde_json::{json, Value};
-use std::{collections::BTreeMap, sync::Arc, time::Duration};
-use tokio::sync::{broadcast, mpsc, watch, Mutex};
+use std::{
+    collections::{BTreeMap, HashSet},
+    sync::Arc,
+    time::Duration,
+};
+use tokio::sync::{broadcast, mpsc, oneshot, watch, Mutex};
 
 const CREATE_TIMEOUT: Duration = Duration::from_secs(50);
 // OpenCode's bounded cold start can consume 20s of health probing plus a 30s
 // request budget before the correlated acceptance edge exists. Stay below the
 // supervisor's 60s hosted-agent command envelope while covering that bound.
 const SEND_ACK_TIMEOUT: Duration = Duration::from_secs(55);
+const FORK_TIMEOUT: Duration = Duration::from_secs(55);
+const RETIRE_TIMEOUT: Duration = Duration::from_secs(20);
 const EVENT_CHANNEL_CAPACITY: usize = 256;
 
 enum ProviderState {
@@ -44,6 +50,8 @@ struct HostedTransport {
     created_rx: Mutex<watch::Receiver<Option<Result<String, ()>>>>,
     native_rx: Mutex<watch::Receiver<Option<String>>>,
     send_outcomes: broadcast::Sender<(String, bool)>,
+    kill_outcomes: broadcast::Sender<(String, bool)>,
+    suppressed_kills: Arc<std::sync::Mutex<HashSet<String>>>,
     event_rx: std::sync::Mutex<Option<mpsc::Receiver<AgentEvent>>>,
 }
 
@@ -96,6 +104,8 @@ impl HostedTransport {
         let (native_tx, native_rx) = watch::channel(None);
         let (event_tx, event_rx) = mpsc::channel(EVENT_CHANNEL_CAPACITY);
         let (send_outcomes, _) = broadcast::channel(64);
+        let (kill_outcomes, _) = broadcast::channel(64);
+        let suppressed_kills = Arc::new(std::sync::Mutex::new(HashSet::new()));
         spawn_broadcast_bridge(
             provider.clone(),
             broadcast_rx,
@@ -103,6 +113,8 @@ impl HostedTransport {
             native_tx,
             event_tx,
             send_outcomes.clone(),
+            kill_outcomes.clone(),
+            Arc::clone(&suppressed_kills),
         );
         Arc::new(Self {
             provider,
@@ -112,6 +124,8 @@ impl HostedTransport {
             created_rx: Mutex::new(created_rx),
             native_rx: Mutex::new(native_rx),
             send_outcomes,
+            kill_outcomes,
+            suppressed_kills,
             event_rx: std::sync::Mutex::new(Some(event_rx)),
         })
     }
@@ -169,6 +183,70 @@ impl HostedTransport {
         })
         .await
         .map_err(|_| "provider did not verify resumed native identity".to_string())?
+    }
+
+    async fn provider_session_is_live(&self, session_id: &str) -> bool {
+        match &self.state {
+            ProviderState::Claude(state) => state.has_live_session(session_id).await,
+            ProviderState::Codex(state) => state.has_live_session(session_id).await,
+            ProviderState::Opencode { runtime, .. } => runtime.has_live_session(session_id).await,
+        }
+    }
+
+    async fn retire_provider_session(&self, session_id: &str) -> Result<(), DispatchFailure> {
+        let mut outcomes = self.kill_outcomes.subscribe();
+        self.suppressed_kills
+            .lock()
+            .expect("suppressed kill lock")
+            .insert(session_id.to_string());
+        let message = FreshAgentKill {
+            provider: self.provider_wire(),
+            session_id: session_id.to_string(),
+            session_type: self.session_type(),
+            cwd: self
+                .profile
+                .lock()
+                .expect("profile lock")
+                .as_ref()
+                .map(|profile| profile.cwd.clone()),
+        };
+        match &self.state {
+            ProviderState::Claude(state) => state.handle_kill(message).await,
+            ProviderState::Codex(state) => state.handle_kill(message).await,
+            ProviderState::Opencode { runtime, .. } => runtime.handle_kill(message).await,
+        }
+        let observed = tokio::time::timeout(RETIRE_TIMEOUT, async {
+            loop {
+                match outcomes.recv().await {
+                    Ok((id, success)) if id == session_id => return Some(success),
+                    Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(broadcast::error::RecvError::Closed) => return None,
+                }
+            }
+        })
+        .await
+        .ok()
+        .flatten();
+        let live = self.provider_session_is_live(session_id).await;
+        if !live {
+            self.suppressed_kills
+                .lock()
+                .expect("suppressed kill lock")
+                .remove(session_id);
+            return Ok(());
+        }
+        self.suppressed_kills
+            .lock()
+            .expect("suppressed kill lock")
+            .remove(session_id);
+        Err(DispatchFailure {
+            message: match observed {
+                Some(false) => "provider-native session retirement was refused",
+                _ => "provider-native session retirement could not be verified",
+            }
+            .into(),
+            acceptance_ambiguous: observed.is_none(),
+        })
     }
 }
 
@@ -309,6 +387,121 @@ impl FreshAgentTransport for HostedTransport {
         }
     }
 
+    async fn fork(
+        &self,
+        request_id: &RequestId,
+        parent_session_id: &str,
+        input: Option<Value>,
+    ) -> Result<ForkTransition, DispatchFailure> {
+        let current = self
+            .session_id
+            .lock()
+            .await
+            .clone()
+            .ok_or_else(|| DispatchFailure {
+                message: "fresh-agent session is not started".into(),
+                acceptance_ambiguous: false,
+            })?;
+        if current != parent_session_id {
+            return Err(DispatchFailure {
+                message: "provider-native fork parent no longer matches the owned session".into(),
+                acceptance_ambiguous: false,
+            });
+        }
+        if matches!(self.provider, FreshProvider::Claude | FreshProvider::Kilroy) {
+            return Err(DispatchFailure {
+                message: "provider-native conversation fork is unsupported".into(),
+                acceptance_ambiguous: false,
+            });
+        }
+        let message = FreshAgentFork {
+            provider: self.provider_wire(),
+            session_id: current.clone(),
+            session_type: self.session_type(),
+            input,
+            request_id: Some(request_id.as_str().to_string()),
+            cwd: self
+                .profile
+                .lock()
+                .expect("profile lock")
+                .as_ref()
+                .map(|profile| profile.cwd.clone()),
+            tab_id: None,
+        };
+        let (sender, receiver) = oneshot::channel::<ServerMessage>();
+        let slot = Arc::new(std::sync::Mutex::new(Some(sender)));
+        let sink_slot = Arc::clone(&slot);
+        let sink: freshell_terminal::FrameSink = Arc::new(move |frame| {
+            if let Some(sender) = sink_slot.lock().expect("fork reply lock").take() {
+                let _ = sender.send(frame);
+            }
+        });
+        match &self.state {
+            ProviderState::Codex(state) => state.handle_fork(message, None, sink).await,
+            ProviderState::Opencode { runtime, .. } => {
+                runtime.handle_fork(message, None, sink).await
+            }
+            ProviderState::Claude(_) => unreachable!("unsupported providers returned above"),
+        }
+        let forked = match tokio::time::timeout(FORK_TIMEOUT, receiver).await {
+            Ok(Ok(ServerMessage::FreshAgentForked(forked))) => forked,
+            Ok(Ok(_)) => {
+                return Err(DispatchFailure {
+                    message: "provider-native fork did not return a fork transition".into(),
+                    acceptance_ambiguous: true,
+                })
+            }
+            Ok(Err(_)) | Err(_) => {
+                return Err(DispatchFailure {
+                    message: "provider-native fork acknowledgement was not observed".into(),
+                    acceptance_ambiguous: true,
+                })
+            }
+        };
+        if forked.parent_session_id != current
+            || forked.session_id.is_empty()
+            || forked.session_id == current
+            || forked.provider
+                != match self.provider {
+                    FreshProvider::Claude | FreshProvider::Kilroy => "claude",
+                    FreshProvider::Codex => "codex",
+                    FreshProvider::Opencode => "opencode",
+                }
+            || forked.session_type
+                != match self.provider {
+                    FreshProvider::Claude => "freshclaude",
+                    FreshProvider::Kilroy => "kilroy",
+                    FreshProvider::Codex => "freshcodex",
+                    FreshProvider::Opencode => "freshopencode",
+                }
+        {
+            return Err(DispatchFailure {
+                message: "provider-native fork returned mismatched ownership identity".into(),
+                acceptance_ambiguous: true,
+            });
+        }
+        let child = forked.session_id;
+        if let Err(parent_error) = self.retire_provider_session(&current).await {
+            // Best-effort transactional rollback: if the child can be retired and
+            // the parent is still live, the provider-native branch did not become
+            // the current product state and a safe explicit retry is possible.
+            let child_rollback = self.retire_provider_session(&child).await;
+            let parent_still_live = self.provider_session_is_live(&current).await;
+            return Err(DispatchFailure {
+                message: "provider-native fork could not retire its previous branch".into(),
+                acceptance_ambiguous: parent_error.acceptance_ambiguous
+                    || child_rollback.is_err()
+                    || !parent_still_live,
+            });
+        }
+        *self.session_id.lock().await = Some(child.clone());
+        Ok(ForkTransition {
+            parent_session_id: current,
+            child_session_id: child,
+            parent_retired_by_runtime: true,
+        })
+    }
+
     async fn resolve_permission(
         &self,
         decision_id: &str,
@@ -423,6 +616,8 @@ fn spawn_broadcast_bridge(
     native: watch::Sender<Option<String>>,
     events: mpsc::Sender<AgentEvent>,
     send_outcomes: broadcast::Sender<(String, bool)>,
+    kill_outcomes: broadcast::Sender<(String, bool)>,
+    suppressed_kills: Arc<std::sync::Mutex<HashSet<String>>>,
 ) {
     tokio::spawn(async move {
         let mut dropped = 0u64;
@@ -440,6 +635,21 @@ fn spawn_broadcast_bridge(
             };
             if let Some(outcome) = parse_send_outcome(&value) {
                 let _ = send_outcomes.send(outcome);
+            }
+            if value.get("type").and_then(Value::as_str) == Some("freshAgent.killed") {
+                if let (Some(session_id), Some(success)) = (
+                    value.get("sessionId").and_then(Value::as_str),
+                    value.get("success").and_then(Value::as_bool),
+                ) {
+                    let _ = kill_outcomes.send((session_id.to_string(), success));
+                    if suppressed_kills
+                        .lock()
+                        .expect("suppressed kill lock")
+                        .remove(session_id)
+                    {
+                        continue;
+                    }
+                }
             }
             if value.get("type").and_then(Value::as_str) == Some("freshAgent.create.failed") {
                 let _ = created.send(Some(Err(())));

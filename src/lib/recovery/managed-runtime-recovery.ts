@@ -160,7 +160,11 @@ function updateExistingContent(
     const sessionRef = sessionRefFor(soul)
     return {
       ...existing,
-      ...(sessionRef ? { sessionRef } : {}),
+      ...(sessionRef ? {
+        sessionId: sessionRef.sessionId,
+        resumeSessionId: sessionRef.sessionId,
+        sessionRef,
+      } : {}),
       ...definedOnly(fields),
     }
   }

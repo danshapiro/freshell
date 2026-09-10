@@ -342,6 +342,20 @@ impl Supervisor {
                     .await?;
                 Ok(AdminResult::FreshAgentCommand { state })
             }
+            AdminCommand::FreshAgentFork(request) => {
+                self.registry
+                    .assert_epoch(request.expected_control_epoch)
+                    .map_err(map_registry)?;
+                let result = self
+                    .fresh_agent_fork(
+                        envelope.request_id,
+                        request.soul_id,
+                        request.parent_session_id,
+                        request.input,
+                    )
+                    .await?;
+                Ok(AdminResult::FreshAgentFork(result))
+            }
             AdminCommand::FreshAgentResolve(request) => {
                 self.registry
                     .assert_epoch(request.expected_control_epoch)
@@ -961,6 +975,80 @@ impl Supervisor {
                 Err(error)
             }
         }
+    }
+
+    async fn fresh_agent_fork(
+        &self,
+        request_id: RequestId,
+        soul_id: SoulId,
+        presentation_parent_session_id: String,
+        input: Option<serde_json::Value>,
+    ) -> Result<freshell_runtime_protocol::FreshAgentForkResult, RuntimeError> {
+        let lifecycle_lock = self.lifecycle_lock(&soul_id).await;
+        let _lifecycle_guard = lifecycle_lock.lock().await;
+        let context = self
+            .registry
+            .recovery_context(soul_id.clone())
+            .await
+            .map_err(map_registry)?;
+        let parent_native = context.native_session_id.clone().ok_or_else(|| {
+            RuntimeError::new(
+                RuntimeErrorCode::InvalidRequest,
+                "fresh-agent native identity is not materialized",
+            )
+        })?;
+        let handle = context.prior_handle;
+        if handle.fresh_agent().is_none() {
+            return Err(RuntimeError::new(
+                RuntimeErrorCode::UnsupportedWorkload,
+                "soul is not a hosted fresh-agent",
+            ));
+        }
+        let host = self
+            .authenticate_host(handle.incarnation_id(), handle.runtime_dir())
+            .await?;
+        let transition = match self
+            .send_authenticated_host_command(
+                handle.incarnation_id().clone(),
+                handle.runtime_dir(),
+                &host,
+                HostCommand::FreshAgentFork {
+                    incarnation_id: handle.incarnation_id().clone(),
+                    request_id,
+                    parent_session_id: parent_native.clone(),
+                    input,
+                },
+            )
+            .await?
+        {
+            HostResult::FreshAgentFork(result) => result,
+            _ => {
+                return Err(RuntimeError::new(
+                    RuntimeErrorCode::HostAuthenticationFailed,
+                    "unexpected fresh-agent fork reply",
+                ))
+            }
+        };
+        let already_applied = classify_fresh_agent_fork_transition(&parent_native, &transition)?;
+        if !already_applied {
+            self.registry
+                .transition_native_session(
+                    soul_id.clone(),
+                    handle.incarnation_id().clone(),
+                    &parent_native,
+                    &transition.child_session_id,
+                )
+                .await
+                .map_err(map_registry)?;
+        }
+        // Re-materialize exact resume evidence for the child immediately. A
+        // successful fork never leaves the soul recoverable only as its parent.
+        let _ = self.probe_recovery(soul_id).await;
+        Ok(freshell_runtime_protocol::FreshAgentForkResult {
+            parent_session_id: presentation_parent_session_id,
+            child_session_id: transition.child_session_id,
+            parent_retired_by_runtime: true,
+        })
     }
 
     async fn fresh_agent_resolve(
@@ -1719,6 +1807,32 @@ pub(crate) async fn exchange_host_frame(
     })
 }
 
+fn classify_fresh_agent_fork_transition(
+    current_native: &str,
+    transition: &freshell_runtime_protocol::FreshAgentForkResult,
+) -> Result<bool, RuntimeError> {
+    if transition.parent_session_id.is_empty()
+        || transition.child_session_id.is_empty()
+        || transition.parent_session_id == transition.child_session_id
+        || !transition.parent_retired_by_runtime
+    {
+        return Err(RuntimeError::new(
+            RuntimeErrorCode::OwnershipMismatch,
+            "fresh-agent fork did not prove a valid in-soul parent-to-child transition",
+        ));
+    }
+    if current_native == transition.parent_session_id {
+        return Ok(false);
+    }
+    if current_native == transition.child_session_id {
+        return Ok(true);
+    }
+    Err(RuntimeError::new(
+        RuntimeErrorCode::OwnershipMismatch,
+        "fresh-agent fork transition does not match the current native session",
+    ))
+}
+
 fn release_qualified_workload(
     provider: &str,
     is_fixture: bool,
@@ -1815,12 +1929,39 @@ mod host_ipc_timeout_tests {
 #[cfg(test)]
 mod release_scope_tests {
     use super::{
-        activation_failure_data, append_event, lifecycle_secrets, release_qualified_workload,
+        activation_failure_data, append_event, classify_fresh_agent_fork_transition,
+        lifecycle_secrets, release_qualified_workload,
     };
     use crate::registry::PreparedLaunch;
     use freshell_runtime_protocol::{
-        IncarnationId, LaunchNonce, LaunchState, RuntimeError, RuntimeErrorCode, SoulId,
+        FreshAgentForkResult, IncarnationId, LaunchNonce, LaunchState, RuntimeError,
+        RuntimeErrorCode, SoulId,
     };
+
+    #[test]
+    fn fork_transition_accepts_first_apply_and_exact_idempotent_replay_only() {
+        let transition = FreshAgentForkResult {
+            parent_session_id: "native-parent".into(),
+            child_session_id: "native-child".into(),
+            parent_retired_by_runtime: true,
+        };
+        assert_eq!(
+            classify_fresh_agent_fork_transition("native-parent", &transition).unwrap(),
+            false,
+            "parent current means registry transition still needs applying",
+        );
+        assert_eq!(
+            classify_fresh_agent_fork_transition("native-child", &transition).unwrap(),
+            true,
+            "child current means this request already committed and may replay",
+        );
+        assert!(classify_fresh_agent_fork_transition("foreign", &transition).is_err());
+        let unsafe_transition = FreshAgentForkResult {
+            parent_retired_by_runtime: false,
+            ..transition
+        };
+        assert!(classify_fresh_agent_fork_transition("native-parent", &unsafe_transition).is_err());
+    }
 
     #[test]
     fn direct_terminal_launch_cannot_bypass_live_qualification_scope() {

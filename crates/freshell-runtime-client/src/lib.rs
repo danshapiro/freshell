@@ -6,12 +6,12 @@
 
 use freshell_runtime_protocol::{
     read_frame, write_frame, AcknowledgeViewProjectionRequest, AdminCommand, AdminReply,
-    AdminResult, ControlRole, Envelope, FreshAgentInterruptRequest, FreshAgentReadEventsRequest,
-    FreshAgentResolveRequest, FreshAgentSendRequest, IncidentId, IncidentSummaryRequest,
-    LaunchRequest, LossIncidentSummary, ManagedRolloutMode, MigrationPlan, MigrationPlanRequest,
-    NoticeDeliveryState, NoticeId, NoticeReceiptRequest, PendingNoticesRequest,
-    PendingViewProjectionsRequest, RecoverRequest, RecoveryProbeRequest, RecoveryTrigger,
-    RepairAudit, RepairRequest, RequestId, RuntimeError, RuntimeErrorCode,
+    AdminResult, ControlRole, Envelope, FreshAgentForkRequest, FreshAgentInterruptRequest,
+    FreshAgentReadEventsRequest, FreshAgentResolveRequest, FreshAgentSendRequest, IncidentId,
+    IncidentSummaryRequest, LaunchRequest, LossIncidentSummary, ManagedRolloutMode, MigrationPlan,
+    MigrationPlanRequest, NoticeDeliveryState, NoticeId, NoticeReceiptRequest,
+    PendingNoticesRequest, PendingViewProjectionsRequest, RecoverRequest, RecoveryProbeRequest,
+    RecoveryTrigger, RepairAudit, RepairRequest, RequestId, RuntimeError, RuntimeErrorCode,
     RuntimeInventorySnapshot, RuntimeMetricsRequest, RuntimeMetricsSnapshot, RuntimeNotice,
     RuntimeView, SoulId, StopOutcome, StopRequest, TerminalInputRequest, TerminalReadOutputRequest,
     TerminalResizeRequest, UpdateLimitsRequest, UpdateLimitsResult, UpdateViewVisibilityRequest,
@@ -640,6 +640,31 @@ impl RuntimeClient {
             .await?
         {
             AdminResult::FreshAgentCommand { state } => Ok(state),
+            _ => Err(ClientError::UnexpectedResult),
+        }
+    }
+
+    pub async fn fresh_agent_fork(
+        &self,
+        request_id: RequestId,
+        soul_id: SoulId,
+        parent_session_id: String,
+        input: Option<serde_json::Value>,
+    ) -> Result<freshell_runtime_protocol::FreshAgentForkResult, ClientError> {
+        let epoch = self.current_epoch().await?;
+        match self
+            .request(
+                request_id,
+                AdminCommand::FreshAgentFork(FreshAgentForkRequest {
+                    soul_id,
+                    parent_session_id,
+                    input,
+                    expected_control_epoch: Some(epoch),
+                }),
+            )
+            .await?
+        {
+            AdminResult::FreshAgentFork(result) => Ok(result),
             _ => Err(ClientError::UnexpectedResult),
         }
     }
