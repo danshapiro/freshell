@@ -439,6 +439,31 @@ async fn dispatch(
                         native_session_id,
                     })
                 }
+                HostCommand::FreshAgentFork {
+                    incarnation_id,
+                    request_id,
+                    parent_session_id,
+                    input,
+                } => {
+                    ensure_incarnation(&incarnation_id, state)?;
+                    let actor = state
+                        .fresh_agent
+                        .lock()
+                        .await
+                        .clone()
+                        .ok_or_else(|| unsupported_fresh_agent())?;
+                    let transition = actor
+                        .fork(request_id, parent_session_id, input)
+                        .await
+                        .map_err(map_actor_error)?;
+                    Ok(HostResult::FreshAgentFork(
+                        freshell_runtime_protocol::FreshAgentForkResult {
+                            parent_session_id: transition.parent_session_id,
+                            child_session_id: transition.child_session_id,
+                            parent_retired_by_runtime: transition.parent_retired_by_runtime,
+                        },
+                    ))
+                }
                 HostCommand::FreshAgentResolve {
                     incarnation_id,
                     decision_id,
