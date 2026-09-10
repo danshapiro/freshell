@@ -44,6 +44,7 @@ type ProducerStep = CampaignStepDescriptor & {
   kind: 'producer'
   title: string
   qualificationProviders?: readonly string[]
+  qualificationModes?: readonly string[]
   explicitLiveOnly?: boolean
   requiredLiveEnv?: string
   runner: ProducerRunner
@@ -122,6 +123,20 @@ const STEPS: Step[] = [
     produces: ['FRESHELL_RUNTIME_BROWSER_RECEIPT', 'FRESHELL_RUNTIME_OPENCODE_RECEIPT'],
     runner: 'playwright',
     run: playwright('test/e2e-browser/specs/runtime-terminal-continuity-rust.spec.ts', {}),
+  }),
+  defineCampaignProducerStep({
+    id: 'fresh-agent-qualification',
+    kind: 'producer',
+    title: 'Authentic hosted FreshClaude/Kilroy/FreshCodex/FreshOpenCode qualification',
+    produces: [
+      'FRESHELL_RUNTIME_PHASE3_FRESH_AGENT_RECEIPT',
+      'FRESHELL_RUNTIME_PHASE5_FRESH_AGENT_RECEIPT',
+    ],
+    qualificationModes: ['freshclaude', 'kilroy', 'freshcodex', 'freshopencode'],
+    explicitLiveOnly: true,
+    requiredLiveEnv: 'FRESHELL_RUNTIME_FRESH_AGENT_QUALIFICATION_LIVE',
+    runner: 'playwright',
+    run: playwright('test/e2e-browser/specs/runtime-fresh-agent-qualification-rust.spec.ts', {}),
   }),
   defineCampaignProducerStep({
     id: 'resurrection',

@@ -34,6 +34,11 @@ import {
   validatePhase5LossReceipt,
 } from '../../../scripts/testing/runtime-phase5-loss-evidence.js'
 import { validateProviderQualificationReceipt } from '../../../scripts/testing/provider-qualification-receipt.js'
+import {
+  PHASE5_FRESH_AGENT_RECEIPT_ENV,
+  releasedFreshAgentReceiptRows,
+} from '../../../scripts/testing/fresh-agent-release-gate.js'
+import { validateFreshAgentIngressInventory } from '../../../scripts/testing/fresh-agent-ingress-inventory.js'
 
 export const PHASE5_CASE_IDS = [
   'P5-G01', 'P5-G02', 'P5-G03', 'P5-G04', 'P5-G05', 'P5-G06',
@@ -58,6 +63,7 @@ export async function runPhase5Gate(
   h: RuntimeHarness,
   onCasePassed: (caseId: string) => void = () => {},
 ): Promise<Phase5RunResult> {
+  validateFreshAgentIngressInventory(h.repoRoot)
   const executed: string[] = []
   const blocked: Blocked[] = []
   const cases = [
@@ -153,6 +159,26 @@ async function gate01RecoverableProvidersAreNotLoss(h: RuntimeHarness): Promise<
     h.assert(caseId, row.oldEnclosureVerifiedEmpty === true, `${row.provider} verifies old cleanup before replacement`, row)
     h.assert(caseId, row.followUpCompleted === true, `${row.provider} completes a real follow-up`, row)
   })
+  const manifest = JSON.parse(fs.readFileSync(
+    path.join(h.repoRoot, 'docs/development/runtime-provider-capabilities.json'),
+    'utf8',
+  ))
+  const freshRows = releasedFreshAgentReceiptRows({
+    manifest,
+    repoRoot: h.repoRoot,
+    candidateSha: h.candidateSha,
+    runtimeImage: h.imageRef,
+    raw: process.env[PHASE5_FRESH_AGENT_RECEIPT_ENV],
+    envName: PHASE5_FRESH_AGENT_RECEIPT_ENV,
+  })
+  if (freshRows.length) {
+    h.writeBrowserArtifact(receiptArtifactName(PHASE5_FRESH_AGENT_RECEIPT_ENV, caseId), {
+      modes: freshRows.map((row) => row.mode),
+      receipt: JSON.parse(process.env[PHASE5_FRESH_AGENT_RECEIPT_ENV]!.trim().startsWith('{')
+        ? process.env[PHASE5_FRESH_AGENT_RECEIPT_ENV]!
+        : fs.readFileSync(process.env[PHASE5_FRESH_AGENT_RECEIPT_ENV]!, 'utf8')),
+    })
+  }
 }
 
 async function gate02GenuineLossCertificateAndCleanup(h: RuntimeHarness): Promise<void> {

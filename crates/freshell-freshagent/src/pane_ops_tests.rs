@@ -5,10 +5,36 @@
 //! module's `pub(super)` helpers).
 
 use super::*;
+use crate::hosted_rest;
 use axum::body::Body;
 use axum::http::Request;
 use std::sync::Arc;
 use tower::util::ServiceExt;
+
+struct SplitHostedGateway;
+
+#[async_trait::async_trait]
+impl hosted_rest::HostedFreshAgentRestGateway for SplitHostedGateway {
+    async fn create_agent(
+        self: Arc<Self>,
+        request: hosted_rest::HostedRestCreate,
+    ) -> Result<hosted_rest::HostedRestCreated, ()> {
+        assert_eq!(
+            (request.provider.as_str(), request.session_type.as_str()),
+            ("claude", "freshclaude")
+        );
+        Ok(hosted_rest::HostedRestCreated {
+            session_id: "managed-split-claude".into(),
+        })
+    }
+
+    async fn send_agent(
+        &self,
+        _request: hosted_rest::HostedRestSend,
+    ) -> Result<hosted_rest::HostedRestSendResult, ()> {
+        unreachable!("split creation does not send a prompt")
+    }
+}
 
 pub(super) fn state_with_registry() -> FreshAgentState {
     let (tx, _rx) = tokio::sync::broadcast::channel::<String>(64);
@@ -160,7 +186,7 @@ async fn split_unknown_pane_on_empty_store_is_404_no_layout_snapshot() {
 }
 
 #[tokio::test]
-async fn split_agent_pane_is_honest_400() {
+async fn split_agent_without_durable_gateway_is_503_and_rolls_back_layout() {
     let state = state_with_registry();
     let router = app(state.clone());
     let (_tab_id, pane_id, _terminal_id) = create_shell_tab(router.clone()).await;
@@ -172,9 +198,32 @@ async fn split_agent_pane_is_honest_400() {
         true,
     )
     .await;
-    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
     let msg = body["message"].as_str().unwrap();
-    assert!(msg.contains("fresh-agent"), "{msg}");
+    assert!(msg.contains("gateway"), "{msg}");
+    assert_eq!(state.layout.list_panes(None).unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn split_agent_routes_to_durable_gateway_and_attaches_fresh_content() {
+    let state = state_with_registry();
+    state
+        .set_hosted_rest_gateway(Arc::new(SplitHostedGateway))
+        .unwrap();
+    let router = app(state.clone());
+    let (tab_id, pane_id, _terminal_id) = create_shell_tab(router.clone()).await;
+    let (status, body) = post(
+        router,
+        &format!("/api/panes/{pane_id}/split"),
+        json!({ "agent": "claude", "cwd": "/workspace" }),
+        true,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let new_pane_id = body["data"]["paneId"].as_str().unwrap();
+    let rows = state.layout.list_panes(Some(&tab_id)).unwrap();
+    let created = rows.iter().find(|row| row.id == new_pane_id).unwrap();
+    assert_eq!(created.kind.as_deref(), Some("fresh-agent"));
 }
 
 #[tokio::test]

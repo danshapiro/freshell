@@ -31,6 +31,7 @@ managed-provider-qualification = [
   "freshell-ws/provider-qualification",
   "freshell-freshagent/provider-qualification",
 ]
+managed-fresh-agent-fixtures = ["managed-runtime-v1"]
 
 [[bin]]
 name = "freshell-server"

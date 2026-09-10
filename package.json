@@ -94,7 +94,9 @@
     "test:runtime:raw": "tsx scripts/testing/runtime-gate.ts",
     "test:runtime:phase5:soak": "tsx scripts/testing/runtime-phase5-soak.ts",
     "test:runtime:campaign": "tsx scripts/testing/runtime-landing-campaign.ts",
-    "test:runtime:provider-qualification": "tsx scripts/testing/runtime-provider-qualification.ts"
+    "test:runtime:provider-qualification": "tsx scripts/testing/runtime-provider-qualification.ts",
+    "test:runtime:fresh-agent-qualification": "tsx scripts/testing/runtime-fresh-agent-qualification.ts",
+    "test:runtime:fresh-agent-fixtures": "FRESHELL_RUNTIME_FRESH_AGENT_FIXTURE_TEST=1 FRESHELL_E2E_BACKEND=local playwright test --config test/e2e-browser/playwright.config.ts --project=rust-chromium test/e2e-browser/specs/runtime-fresh-agent-fixture-rust.spec.ts"
   },
   "dependencies": {
     "@ai-sdk/google": "^3.0.29",

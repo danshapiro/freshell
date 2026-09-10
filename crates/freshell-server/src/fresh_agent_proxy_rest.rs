@@ -4,13 +4,15 @@ use super::*;
 
 #[async_trait::async_trait]
 impl HostedFreshAgentRestGateway for HostedFreshAgentProxy {
-    async fn create_opencode(
+    async fn create_agent(
         self: Arc<Self>,
         request: HostedRestCreate,
     ) -> Result<HostedRestCreated, ()> {
+        let (provider, session_type) =
+            rest_agent_identity(&request.provider, &request.session_type)?;
         let message = freshell_protocol::FreshAgentCreate {
             request_id: request.request_id,
-            session_type: SessionType::Freshopencode,
+            session_type,
             cwd: request.cwd,
             effort: request.effort,
             legacy_restore_context: None,
@@ -18,11 +20,11 @@ impl HostedFreshAgentRestGateway for HostedFreshAgentProxy {
             model_selection: None,
             permission_mode: None,
             plugins: None,
-            provider: Some(AgentProvider::Opencode),
+            provider: Some(provider.clone()),
             resume_session_id: None,
             sandbox: None,
             session_ref: request.native_session_id.map(|session_id| SessionLocator {
-                provider: "opencode".into(),
+                provider: provider_wire(&provider),
                 session_id,
             }),
             tab_id: None,
@@ -31,14 +33,22 @@ impl HostedFreshAgentRestGateway for HostedFreshAgentProxy {
             .session_ref
             .as_ref()
             .map(|value| value.session_id.clone())
-            .unwrap_or_else(|| format!("managed-opencode-{}", stable_hex(&message.request_id)));
+            .unwrap_or_else(|| {
+                format!(
+                    "managed-{}-{}",
+                    request.provider,
+                    stable_hex(&message.request_id)
+                )
+            });
         self.create(message).await?;
         Ok(HostedRestCreated { session_id })
     }
 
-    async fn send_opencode(&self, request: HostedRestSend) -> Result<HostedRestSendResult, ()> {
+    async fn send_agent(&self, request: HostedRestSend) -> Result<HostedRestSendResult, ()> {
+        let (provider, session_type) =
+            rest_agent_identity(&request.provider, &request.session_type)?;
         let soul = self
-            .resolve_soul(&AgentProvider::Opencode, &request.session_id)
+            .resolve_soul(&provider, session_type, &request.session_id)
             .await
             .ok_or(())?;
         let before = self
@@ -68,8 +78,11 @@ impl HostedFreshAgentRestGateway for HostedFreshAgentProxy {
         &self,
         request: HostedRestCapture,
     ) -> Result<HostedRestCaptureResult, HostedRestCaptureError> {
+        let (provider, session_type) =
+            rest_agent_identity(&request.provider, &request.session_type)
+                .map_err(|_| HostedRestCaptureError::Unavailable)?;
         let soul = self
-            .resolve_soul(&AgentProvider::Opencode, &request.session_id)
+            .resolve_soul(&provider, session_type, &request.session_id)
             .await
             .ok_or(HostedRestCaptureError::Unavailable)?;
         let capture = self

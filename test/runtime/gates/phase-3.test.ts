@@ -12,6 +12,11 @@ import {
 } from '../../../scripts/testing/runtime-sandbox.js'
 import { receiptArtifactName } from '../../../scripts/testing/runtime-receipts.js'
 import { validateProviderQualificationReceipt } from '../../../scripts/testing/provider-qualification-receipt.js'
+import {
+  PHASE3_FRESH_AGENT_RECEIPT_ENV,
+  releasedFreshAgentReceiptRows,
+} from '../../../scripts/testing/fresh-agent-release-gate.js'
+import { validateFreshAgentIngressInventory } from '../../../scripts/testing/fresh-agent-ingress-inventory.js'
 
 export const PHASE3_CASE_IDS = [
   'P3-G01', 'P3-G02', 'P3-G03', 'P3-G04', 'P3-G05', 'P3-G06',
@@ -55,6 +60,7 @@ export async function runPhase3Gate(
   harness: RuntimeHarness,
   onCasePassed: (caseId: string) => void = () => {},
 ): Promise<Phase3RunResult> {
+  validateFreshAgentIngressInventory(harness.repoRoot)
   const executed: string[] = []
   const blocked: Phase3BlockedCase[] = []
   const cases = [
@@ -141,6 +147,22 @@ async function gate01EnabledProviderMatrixReceipt(h: RuntimeHarness): Promise<vo
     for (const mode of capability.managedModes) {
       h.assert(caseId, receiptModes.has(mode), `${capability.provider} receipt covers enabled mode ${mode}`, row)
     }
+  }
+  const freshRows = releasedFreshAgentReceiptRows({
+    manifest,
+    repoRoot: h.repoRoot,
+    candidateSha: h.candidateSha,
+    runtimeImage: h.imageRef,
+    raw: process.env[PHASE3_FRESH_AGENT_RECEIPT_ENV],
+    envName: PHASE3_FRESH_AGENT_RECEIPT_ENV,
+  })
+  if (freshRows.length) {
+    h.writeBrowserArtifact(receiptArtifactName(PHASE3_FRESH_AGENT_RECEIPT_ENV, caseId), {
+      modes: freshRows.map((row) => row.mode),
+      receipt: JSON.parse(process.env[PHASE3_FRESH_AGENT_RECEIPT_ENV]!.trim().startsWith('{')
+        ? process.env[PHASE3_FRESH_AGENT_RECEIPT_ENV]!
+        : fs.readFileSync(process.env[PHASE3_FRESH_AGENT_RECEIPT_ENV]!, 'utf8')),
+    })
   }
 }
 

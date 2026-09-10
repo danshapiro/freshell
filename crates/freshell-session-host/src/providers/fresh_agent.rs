@@ -18,8 +18,8 @@ use freshell_protocol::{
     FreshAgentSendSettings, ServerMessage, SessionLocator, SessionType, StringOrNumber,
 };
 use freshell_runtime_protocol::{
-    AgentEvent, FreshAgentCapture, FreshAgentLaunchSpec, FreshAgentRollbackDirection,
-    FreshAgentRollbackMode, FreshProvider, RequestId,
+    AgentEvent, FreshAgentCapture, FreshAgentFixtureTransport, FreshAgentLaunchSpec,
+    FreshAgentRollbackDirection, FreshAgentRollbackMode, FreshProvider, RequestId,
 };
 use serde_json::{json, Value};
 use std::{
@@ -62,7 +62,7 @@ struct HostedTransport {
 }
 
 pub(crate) async fn open_hosted_fresh_agent(
-    state_dir: &std::path::Path,
+    _incarnation_state_dir: &std::path::Path,
     launch: FreshAgentLaunchSpec,
 ) -> Result<Arc<FreshAgentHostActor>, String> {
     let profile = FreshAgentProfile {
@@ -76,10 +76,49 @@ pub(crate) async fn open_hosted_fresh_agent(
         provider_store_id: launch.provider_store_id,
         native_session_id: launch.native_session_id,
     };
-    let transport = HostedTransport::new(launch.provider).await;
-    FreshAgentHostActor::open(state_dir.join("fresh-agent"), profile, transport)
-        .await
-        .map_err(|error| error.to_string())
+    let transport: Arc<dyn FreshAgentTransport> = match launch.fixture_transport {
+        None => HostedTransport::new(launch.provider).await,
+        Some(FreshAgentFixtureTransport::Deterministic) => {
+            deterministic_transport(&profile, launch.run_as_uid, launch.run_as_gid).await?
+        }
+    };
+    // This path is on the soul's provider volume, not the incarnation runtime
+    // directory. It therefore preserves the one-writer command and decision
+    // journal across a session-host replacement without sharing state between
+    // souls.
+    FreshAgentHostActor::open(
+        "/home/freshell/provider/.freshell-host-actor",
+        profile,
+        transport,
+    )
+    .await
+    .map_err(|error| error.to_string())
+}
+
+#[cfg(feature = "fresh-agent-fixtures")]
+async fn deterministic_transport(
+    profile: &FreshAgentProfile,
+    run_as_uid: u32,
+    run_as_gid: u32,
+) -> Result<Arc<dyn FreshAgentTransport>, String> {
+    Ok(
+        super::deterministic_fresh_agent::DeterministicFreshAgentTransport::open(
+            "/home/freshell/provider/.freshell-fixture",
+            profile,
+            run_as_uid,
+            run_as_gid,
+        )
+        .await?,
+    )
+}
+
+#[cfg(not(feature = "fresh-agent-fixtures"))]
+async fn deterministic_transport(
+    _profile: &FreshAgentProfile,
+    _run_as_uid: u32,
+    _run_as_gid: u32,
+) -> Result<Arc<dyn FreshAgentTransport>, String> {
+    Err("deterministic fresh-agent transport is absent from this session-host build".into())
 }
 
 impl HostedTransport {

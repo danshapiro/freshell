@@ -2002,6 +2002,7 @@ mod tests {
             permission_mode: Some("ask".into()),
             sandbox: Some("workspace-write".into()),
             native_session_id: Some("thread-exact".into()),
+            fixture_transport: None,
             provider_bootstrap_files: Vec::new(),
         };
 
