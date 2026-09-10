@@ -1,7 +1,8 @@
-import { randomUUID } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
+import { DatabaseSync } from 'node:sqlite'
 
 import {
   newRequest,
@@ -10,13 +11,28 @@ import {
   RuntimeHarness,
   type SupervisorInstance,
 } from '../../../scripts/testing/runtime-sandbox.js'
-import { receiptArtifactName } from '../../../scripts/testing/runtime-receipts.js'
+import {
+  ReceiptRunRegistry,
+  readCandidateReceiptSource,
+} from '../../../scripts/testing/runtime-receipt-source.js'
+import {
+  defaultReceiptFileName,
+  receiptArtifactName,
+} from '../../../scripts/testing/runtime-receipts.js'
 import {
   loadRuntimeSoakReceipt,
   runtimeSoakRetainedBundle,
   SOAK_MAX_RUNTIME_LOG_BYTES,
   SOAK_MAX_TERMINAL_SPOOL_BYTES,
 } from '../../../scripts/testing/runtime-soak-evidence.js'
+import {
+  phase5ChaosRetainedBundle,
+  validatePhase5ChaosReceipt,
+} from '../../../scripts/testing/runtime-phase5-chaos-evidence.js'
+import {
+  phase5LossRetainedBundle,
+  validatePhase5LossReceipt,
+} from '../../../scripts/testing/runtime-phase5-loss-evidence.js'
 import { validateProviderQualificationReceipt } from '../../../scripts/testing/provider-qualification-receipt.js'
 
 export const PHASE5_CASE_IDS = [
@@ -26,6 +42,8 @@ export const PHASE5_CASE_IDS = [
 
 type Blocked = { caseId: string; message: string; evidence?: unknown }
 export type Phase5RunResult = { executed: string[]; blocked: Blocked[] }
+
+const receiptRuns = new WeakMap<RuntimeHarness, ReceiptRunRegistry>()
 
 type NativeSoul = {
   soulId: string
@@ -184,12 +202,10 @@ async function gate02GenuineLossCertificateAndCleanup(h: RuntimeHarness): Promis
     'FRESHELL_RUNTIME_PHASE5_LOSS_RECEIPT',
     'Run runtime-lost-soul-notice-rust.spec.ts against isolated real OpenCode state and provide its candidate-bound receipt.',
   )
-  const real = receipt.browser ?? receipt
-  h.assert(caseId, real.browserInteraction === true && real.provider === 'opencode', 'real isolated provider loss ran through the browser', real)
-  h.assert(caseId, real.allRegisteredStateRemoved === true && real.diagnosticOnlyRetained === true, 'real loss removed every resumable copy but retained diagnostic evidence only', real)
-  h.assert(caseId, real.incidentPersistedBeforeCleanup === true && real.exactCleanupVerified === true, 'real provider incident precedes exact cleanup', real)
-  h.assert(caseId, real.briefNoticeDisplayed === true && real.endedPaneRetained === true, 'browser displayed one notice and retained the ended pane', real)
-  h.assert(caseId, real.foreignObjectsTouched === 0 && real.credentialsTouched !== true, 'real-provider loss remained isolated', real)
+  const real = receipt.lossValidation
+  h.assert(caseId, real.provider === 'opencode', 'real isolated OpenCode loss ran through the browser evidence builder', real)
+  h.assert(caseId, real.exactCleanupVerified === true && real.foreignObjectsTouched === 0, 'hashed incident and broker evidence prove exact isolated cleanup', real)
+  h.assert(caseId, real.displayedNoticeCount === 1, 'hashed browser evidence proves exactly one truthful notice', real)
 }
 
 async function gate03EveryRecoverableAlternativeWins(h: RuntimeHarness): Promise<void> {
@@ -311,21 +327,40 @@ async function gate06CleanupAndExportFailuresStayHonest(h: RuntimeHarness): Prom
   const soul = await launchNativeSoul(h, supervisor, caseId, 'cleanup-failure', true)
   await captureResume(h, supervisor, soul, caseId)
   removeEveryFixtureRecoveryCopy(h, soul)
-  const first = dataOf(await h.adminOk(
+  const firstReply = await h.adminRaw(
     supervisor,
     h.recoverBody(soul.soulId, 'provider_exit', await epoch(h, supervisor)),
     { requestId: newRequest() },
-  ), 'recovery')
-  h.assert(caseId, first.outcome === 'lost', 'loss classification is durable even when cleanup remains unresolved', first)
-  h.assert(caseId, first.view.cleanupState === 'termination_unconfirmed', 'cleanup failure is explicit and retains ownership evidence', first.view)
-  h.assert(caseId, h.isContainerRunning(soul.containerId), 'injected cleanup failure never claims a running enclosure was removed')
-  const failedIncident = await incidentSummary(h, supervisor, first.incidentId)
+  )
+  h.assert(caseId, firstReply.result?.Err?.code === 'INCIDENT_PERSISTENCE_FAILED', 'incident artifact failure blocks before destructive cleanup', firstReply)
+  const pendingView = latestSoul((await inventorySnapshot(h, supervisor)).souls, soul.soulId)
+  const incidentId = pendingView?.incidentId
+  h.assert(caseId, typeof incidentId === 'string' && incidentId.startsWith('incident-'), 'durable registry exposes the exact pending incident identity after export failure', pendingView)
+  h.assert(caseId, pendingView.cleanupState === 'requested', 'export failure leaves exact cleanup pending rather than claiming an attempt', pendingView)
+  h.assert(caseId, h.isContainerRunning(soul.containerId), 'incident export failure sends no destructive signal to the owned enclosure')
+  const pendingIncident = await incidentSummary(h, supervisor, incidentId)
+  h.assert(caseId, pendingIncident.state === 'cleanup_pending' && !pendingIncident.cleanup.verifiedEmpty, 'open incident and outbox survive while cleanup is fail-closed', pendingIncident)
+  h.assert(caseId, (await pendingNotices(h, supervisor)).length === 0, 'no cleanup notice is fabricated before any cleanup attempt')
+  const pendingExportBefore = listIncidentFiles(h, supervisor, incidentId)
+  h.assert(caseId, pendingExportBefore.length === 0, 'injected export failure leaves filesystem artifact pending rather than fabricating one', pendingExportBefore)
+
+  h.stopSupervisorExact(supervisor)
+  h.removeContainerExact(supervisor.containerId)
+  supervisor = await h.startSupervisor({
+    scenarioId,
+    volumeName: supervisor.volumeName,
+    reuseSecret: true,
+    env: { FRESHELL_RUNTIME_LOSS_CLEANUP_FAILPOINT: 'termination_unconfirmed' },
+  })
+  const failedIncident = await waitFor(async () => {
+    const summary = await incidentSummary(h, supervisor, incidentId)
+    return summary.state === 'cleanup_failed' ? summary : null
+  }, 30_000)
   h.assert(caseId, failedIncident.state === 'cleanup_failed' && !failedIncident.cleanup.verifiedEmpty, 'incident truthfully records cleanup failure', failedIncident)
   const firstNotices = await pendingNotices(h, supervisor)
   h.assert(caseId, firstNotices.length === 1 && firstNotices[0].kind === 'cleanup_failed', 'only a cleanup-failed notice is deliverable before verification', firstNotices)
   h.assert(caseId, !firstNotices[0].message.includes('cleaned up'), 'failure notice never says cleanup succeeded', firstNotices[0])
-  const pendingExportBefore = listIncidentFiles(h, supervisor, first.incidentId)
-  h.assert(caseId, pendingExportBefore.length === 0, 'injected export failure leaves filesystem artifact pending rather than fabricating one', pendingExportBefore)
+  h.assert(caseId, h.isContainerRunning(soul.containerId), 'injected cleanup failure never claims a running enclosure was removed')
 
   h.stopSupervisorExact(supervisor)
   h.removeContainerExact(supervisor.containerId)
@@ -335,14 +370,14 @@ async function gate06CleanupAndExportFailuresStayHonest(h: RuntimeHarness): Prom
     reuseSecret: true,
   })
   const finalIncident = await waitFor(async () => {
-    const summary = await incidentSummary(h, supervisor, first.incidentId)
+    const summary = await incidentSummary(h, supervisor, incidentId)
     return summary.state === 'closed' ? summary : null
   }, 30_000)
   h.assert(caseId, finalIncident.cleanup.verifiedEmpty === true, 'startup resumes exact pending cleanup and positively verifies emptiness', finalIncident)
   h.assert(caseId, !h.isContainerRunning(soul.containerId), 'eventual cleanup removes only the exact prior enclosure')
   const notices = await pendingNotices(h, supervisor)
   h.assert(caseId, notices.length === 1 && notices[0].kind === 'cleanup_succeeded', 'verified retry supersedes the temporary failure notice with one final success', notices)
-  const exported = listIncidentFiles(h, supervisor, first.incidentId)
+  const exported = listIncidentFiles(h, supervisor, incidentId)
   h.assert(caseId, exported.some((file) => file.endsWith('.closed.json')), 'pending incident export is retried successfully after restart', exported)
   h.assert(caseId, h.broker.unsafeAttempts().length === 0, 'cleanup/export failures never broaden kill authority')
 }
@@ -419,9 +454,11 @@ async function gate08RedactionRotationAndForensics(h: RuntimeHarness): Promise<v
   const files = listIncidentFiles(h, supervisor, result.incidentId)
   h.assert(caseId, files.length >= 1, 'loss leaves a reconstructable redacted artifact after cleanup', files)
   const incidentRoot = path.join('/var/lib/freshell-supervisor', 'incidents')
+  const artifactName = files.includes(`${result.incidentId}.closed.json`)
+    ? `${result.incidentId}.closed.json`
+    : `${result.incidentId}.open.json`
   const artifact = h.runCommand('docker', [
-    'exec', supervisor.containerId, 'sh', '-lc',
-    `cat ${incidentRoot}/${result.incidentId}.closed.json 2>/dev/null || cat ${incidentRoot}/${result.incidentId}.open.json`,
+    'exec', supervisor.containerId, 'cat', path.join(incidentRoot, artifactName),
   ])
   for (const field of ['observedCause', 'missingInvariant', 'hypotheses', 'preventiveAction', 'regressionCase', 'cleanup']) {
     h.assert(caseId, artifact.includes(`"${field}"`), `incident artifact contains ${field}`, artifact)
@@ -473,10 +510,10 @@ async function gate09RestartAndFailureStorm(h: RuntimeHarness): Promise<void> {
     'FRESHELL_RUNTIME_PHASE5_CHAOS_RECEIPT',
     'Run runtime-chaos-rust.spec.ts for 100 web cycles and provide its candidate-bound receipt.',
   )
-  const chaos = browserReceipt.browser ?? browserReceipt
-  h.assert(caseId, chaos.webRestartCycles >= 100 && chaos.supervisorRestartCycles >= 20, 'browser chaos covers the required restart counts', chaos)
-  h.assert(caseId, chaos.longToolExactlyOnce === true && chaos.pendingApprovalSurvived === true, 'long tool and pending approval preserve exact-once semantics', chaos)
-  h.assert(caseId, chaos.falseLossNotices === 0 && chaos.duplicateWriters === 0, 'chaos run has no false loss or duplicate writers', chaos)
+  const chaos = browserReceipt.chaosValidation
+  h.assert(caseId, chaos.webReplacementCycles === 100 && chaos.supervisorReplacementCycles === 20, 'hashed cycle evidence covers the exact replacement counts', chaos)
+  h.assert(caseId, chaos.providerToolRequestCount === 2 && chaos.providerToolResultCount === 2 && chaos.replayCount === 0, 'provider-native evidence proves both tools exactly once without replay', chaos)
+  h.assert(caseId, chaos.approvalDecisionCount === 1 && chaos.falseLossNoticeCount === 0 && chaos.unsafeBrokerAttempts === 0, 'chaos evidence proves one approval decision with no false loss or unsafe broker action', chaos)
 }
 
 async function gate10SoakReceipt(h: RuntimeHarness): Promise<void> {
@@ -531,6 +568,7 @@ async function gate11MigrationBackupAndRollback(h: RuntimeHarness): Promise<void
   h.assert(caseId, optIn.currentMode === 'managed-opt-in' && optIn.blockers.length === 0, 'managed opt-in applies without disturbing legacy metadata', optIn)
   const soul = await launchNativeSoul(h, supervisor, caseId, 'rollout-soul', true)
   await captureResume(h, supervisor, soul, caseId)
+  const beforeManagedDefault = await inventorySnapshot(h, supervisor)
   const managedDefault = dataOf(await h.adminOk(
     supervisor,
     h.migrationPlanBody({
@@ -544,6 +582,18 @@ async function gate11MigrationBackupAndRollback(h: RuntimeHarness): Promise<void
   ), 'migration_plan')
   h.assert(caseId, managedDefault.currentMode === 'managed-default' && managedDefault.registryBackupVerified === true, 'managed-default requires and verifies a consistent registry backup', managedDefault)
   h.assert(caseId, fs.existsSync(managedDefault.registryBackupPath), 'verified registry backup exists at the explicit path', managedDefault)
+  const backupStat = fs.lstatSync(managedDefault.registryBackupPath)
+  const backupSha256 = createHash('sha256').update(fs.readFileSync(managedDefault.registryBackupPath)).digest('hex')
+  const backupDb = new DatabaseSync(managedDefault.registryBackupPath, { readOnly: true })
+  const backupSchema = (backupDb.prepare('SELECT schema_version AS version FROM installation WHERE singleton=1').get() as { version: number }).version
+  const backupIntegrity = (backupDb.prepare('PRAGMA integrity_check').get() as { integrity_check: string }).integrity_check
+  backupDb.close()
+  h.assert(caseId, backupStat.isFile() && !backupStat.isSymbolicLink() && (backupStat.mode & 0o077) === 0, 'registry backup is a private regular file', { mode: backupStat.mode & 0o777 })
+  h.assert(caseId, managedDefault.registryBackupSha256 === backupSha256, 'migration receipt binds the exact verified backup digest', { expected: managedDefault.registryBackupSha256, actual: backupSha256 })
+  h.assert(caseId, backupIntegrity === 'ok' && managedDefault.registryBackupSchemaVersion === backupSchema, 'migration verifies the exact supported registry schema before apply', { backupIntegrity, backupSchema, planSchema: managedDefault.registryBackupSchemaVersion })
+  const afterManagedDefault = await inventorySnapshot(h, supervisor)
+  h.assert(caseId, JSON.stringify(afterManagedDefault.souls) === JSON.stringify(beforeManagedDefault.souls), 'managed-default apply preserves exact soul/intent data', { before: beforeManagedDefault.souls, after: afterManagedDefault.souls })
+  h.assert(caseId, JSON.stringify(afterManagedDefault.viewIntents) === JSON.stringify(beforeManagedDefault.viewIntents), 'managed-default apply preserves exact view data', { before: beforeManagedDefault.viewIntents, after: afterManagedDefault.viewIntents })
   h.assert(caseId, Buffer.compare(beforeLegacy, fs.readFileSync(legacyFile)) === 0, 'apply remains read-only toward legacy metadata')
 
   const foreign = h.createForeignSentinel({ scenarioId })
@@ -560,7 +610,10 @@ async function gate11MigrationBackupAndRollback(h: RuntimeHarness): Promise<void
   h.assert(caseId, h.isContainerRunning(soul.containerId), 'rollback does not mass-stop an existing managed soul')
   h.assert(caseId, h.isContainerRunning(foreign), 'rollback leaves unrelated runtime sentinel untouched')
   const snapshot = await inventorySnapshot(h, supervisor)
+  h.assert(caseId, JSON.stringify(snapshot.souls) === JSON.stringify(beforeManagedDefault.souls), 'rollback restores exact soul/intent data', { before: beforeManagedDefault.souls, after: snapshot.souls })
+  h.assert(caseId, JSON.stringify(snapshot.viewIntents) === JSON.stringify(beforeManagedDefault.viewIntents), 'rollback restores exact view data', { before: beforeManagedDefault.viewIntents, after: snapshot.viewIntents })
   h.assert(caseId, latestSoul(snapshot.souls, soul.soulId)?.nativeSessionId === soul.sessionId, 'rollback preserves registry and native identity', snapshot)
+  const beforeRepair = JSON.stringify(snapshot)
   const repair = dataOf(await h.adminOk(
     supervisor,
     h.repairAuditBody(false, await epoch(h, supervisor)),
@@ -568,6 +621,7 @@ async function gate11MigrationBackupAndRollback(h: RuntimeHarness): Promise<void
   ), 'repair_audit')
   h.assert(caseId, repair.registryIntegrity === 'ok' && repair.mutationPerformed === false, 'read-only repair reports integrity without guessed mutations', repair)
   h.assert(caseId, repair.unknownOwnershipCount === 0, 'repair finds no unknown ownership authority', repair)
+  h.assert(caseId, JSON.stringify(await inventorySnapshot(h, supervisor)) === beforeRepair, 'read-only repair leaves registry-visible soul/intent/view data byte-equivalent', repair)
   h.assert(caseId, h.broker.unsafeAttempts().length === 0, 'migration and rollback issue no unsafe destructive requests')
 
   // The manifest requires migration and repair evidence in the run itself, not
@@ -613,11 +667,7 @@ async function gate12ReleaseAndFullMatrix(h: RuntimeHarness): Promise<void> {
   )
   assertProviderMatrix(h, caseId, receipt, (row) => {
     h.assert(caseId, row.releaseBinary === true, `${row.provider} was tested on non-fault release binaries`, row)
-    if (receipt.schemaVersion === 1) {
-      h.assert(caseId, row.cleanupVerified === true && row.unsafeAttempts === 0, `${row.provider} cleanup proof is safe`, row)
-    } else {
-      h.assert(caseId, receipt.schemaVersion === 2, `${row.provider} cleanup proof uses evidence-bound schema v2`, receipt)
-    }
+    h.assert(caseId, receipt.schemaVersion === 2, `${row.provider} cleanup proof uses evidence-bound schema v2`, receipt)
   })
   h.assert(caseId, h.broker.unsafeAttempts().length === 0, 'final matrix has zero unsafe broker attempts')
 }
@@ -692,8 +742,22 @@ async function captureResume(
 function removeEveryFixtureRecoveryCopy(h: RuntimeHarness, soul: NativeSoul): void {
   h.killOwnedRuntimePidExact(soul.containerId, soul.workerPid)
   h.execOwnedContainerExact(soul.containerId, [
-    'sh', '-lc',
-    'find /home/freshell/provider -type f -name "native-session-state.json" -delete; find /home/freshell/provider/.freshell/checkpoints/native-session -type f -delete 2>/dev/null || true',
+    'node', '-e', String.raw`
+const fs = require('node:fs');
+const path = require('node:path');
+const state = '/home/freshell/provider/native-session-state.json';
+try { fs.unlinkSync(state); } catch (error) { if (error.code !== 'ENOENT') throw error; }
+const checkpointDir = '/home/freshell/provider/.freshell/checkpoints/native-session';
+let entries = [];
+try { entries = fs.readdirSync(checkpointDir, { withFileTypes: true }); }
+catch (error) { if (error.code !== 'ENOENT') throw error; }
+for (const entry of entries) {
+  if (!entry.isFile() || !/^\d+\.json$/.test(entry.name)) {
+    throw new Error('unknown checkpoint object blocks exact loss fixture cleanup');
+  }
+  fs.unlinkSync(path.join(checkpointDir, entry.name));
+}
+`,
   ])
 }
 
@@ -755,11 +819,17 @@ function counter(snapshot: any, name: string, label: string): number {
 }
 
 function listIncidentFiles(h: RuntimeHarness, supervisor: SupervisorInstance, incidentId: string): string[] {
-  const output = h.runCommand('docker', [
-    'exec', supervisor.containerId, 'sh', '-lc',
-    `find /var/lib/freshell-supervisor/incidents -maxdepth 1 -type f -name '${incidentId}.*.json' -printf '%f\\n' 2>/dev/null | sort`,
-  ])
-  return output.split(/\r?\n/).filter(Boolean)
+  if (!/^incident-[A-Za-z0-9-]+$/.test(incidentId)) throw new Error('unsafe incident id')
+  const root = '/var/lib/freshell-supervisor/incidents'
+  const names = [`${incidentId}.open.json`, `${incidentId}.closed.json`]
+  return names.filter((name) => {
+    try {
+      h.runCommand('docker', ['exec', supervisor.containerId, 'test', '-f', path.join(root, name)])
+      return true
+    } catch {
+      return false
+    }
+  })
 }
 
 function collectTextFiles(root: string): string {
@@ -791,14 +861,24 @@ function requiredReceipt(
   if (!raw?.trim()) {
     throw new RuntimeGateBlockedError(caseId, instruction, { requiredEnvironmentVariable: envName })
   }
-  let receipt: any
-  try {
-    receipt = JSON.parse(raw.trim().startsWith('{') ? raw : fs.readFileSync(raw, 'utf8'))
-  } catch (error) {
-    throw new Error(`${envName} is not valid JSON or a readable JSON path: ${String(error)}`)
+  let registry = receiptRuns.get(h)
+  if (!registry) {
+    registry = new ReceiptRunRegistry()
+    receiptRuns.set(h, registry)
   }
+  const loaded = readCandidateReceiptSource({
+    repoRoot: h.repoRoot,
+    candidateSha: h.candidateSha,
+    source: raw,
+    expectedFileName: defaultReceiptFileName(envName),
+    kind: envName,
+    registry,
+  })
+  const receipt = loaded.receipt
   let providers = receipt.providers
   let soakValidation
+  let lossValidation
+  let chaosValidation
   if (envName === 'FRESHELL_RUNTIME_PHASE5_PROVIDER_RECEIPT') {
     const validated = validateProviderQualificationReceipt({
       repoRoot: h.repoRoot,
@@ -816,14 +896,37 @@ function requiredReceipt(
     })
     soakValidation = validated.summary
     const retained = runtimeSoakRetainedBundle(validated)
+    const retainedIndex = { ...retained.index, sourceReceiptSha256: loaded.sourceSha256 }
     const bundleDir = path.join(h.browserDir, `${receiptArtifactName(envName, caseId)}-bundle`)
     fs.mkdirSync(bundleDir, { recursive: true, mode: 0o700 })
     for (const [fileName, bytes] of Object.entries(retained.files)) {
       fs.writeFileSync(path.join(bundleDir, fileName), bytes, { mode: 0o600 })
     }
-    fs.writeFileSync(path.join(bundleDir, 'index.json'), JSON.stringify(retained.index, null, 2), { mode: 0o600 })
+    fs.writeFileSync(path.join(bundleDir, 'index.json'), JSON.stringify(retainedIndex, null, 2), { mode: 0o600 })
+  } else if (envName === 'FRESHELL_RUNTIME_PHASE5_LOSS_RECEIPT') {
+    const validated = validatePhase5LossReceipt({
+      repoRoot: h.repoRoot,
+      candidateSha: h.candidateSha,
+      runtimeImage: h.imageRef,
+      receipt,
+    })
+    lossValidation = validated.summary
+    const retained = phase5LossRetainedBundle(validated)
+    retained.index.sourceReceiptSha256 = loaded.sourceSha256
+    writeRetainedBundle(h, envName, caseId, retained)
+  } else if (envName === 'FRESHELL_RUNTIME_PHASE5_CHAOS_RECEIPT') {
+    const validated = validatePhase5ChaosReceipt({
+      repoRoot: h.repoRoot,
+      candidateSha: h.candidateSha,
+      runtimeImage: h.imageRef,
+      receipt,
+    })
+    chaosValidation = validated.summary
+    const retained = phase5ChaosRetainedBundle(validated)
+    retained.index = { ...retained.index, sourceReceiptSha256: loaded.sourceSha256 }
+    writeRetainedBundle(h, envName, caseId, retained)
   } else {
-    h.assert(caseId, receipt.schemaVersion === 1, `${envName} uses its expected schema v1`, receipt)
+    h.assert(caseId, receipt.schemaVersion === 2, `${envName} uses evidence-bound schema v2`, receipt)
   }
   h.assert(caseId, receipt.status === 'PASS', `${envName} is an explicit PASS`, receipt)
   h.assert(caseId, receipt.candidateSha === h.candidateSha, `${envName} belongs to the exact candidate commit`, receipt)
@@ -831,7 +934,27 @@ function requiredReceipt(
   // must remain independently reviewable after temporary receipt paths are
   // removed; the source file is never treated as the evidence artifact.
   h.writeBrowserArtifact(receiptArtifactName(envName, caseId), receipt)
-  return { ...receipt, providers, ...(soakValidation ? { soakValidation } : {}) }
+  return {
+    ...receipt,
+    providers,
+    ...(soakValidation ? { soakValidation } : {}),
+    ...(lossValidation ? { lossValidation } : {}),
+    ...(chaosValidation ? { chaosValidation } : {}),
+  }
+}
+
+function writeRetainedBundle(
+  h: RuntimeHarness,
+  envName: string,
+  caseId: string,
+  retained: { files: Record<string, Buffer>; index: unknown },
+): void {
+  const bundleDir = path.join(h.browserDir, `${receiptArtifactName(envName, caseId)}-bundle`)
+  fs.mkdirSync(bundleDir, { recursive: true, mode: 0o700 })
+  for (const [fileName, bytes] of Object.entries(retained.files)) {
+    fs.writeFileSync(path.join(bundleDir, fileName), bytes, { mode: 0o600 })
+  }
+  fs.writeFileSync(path.join(bundleDir, 'index.json'), JSON.stringify(retained.index, null, 2), { mode: 0o600 })
 }
 
 function assertProviderMatrix(

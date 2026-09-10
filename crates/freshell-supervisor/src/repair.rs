@@ -125,10 +125,12 @@ impl Registry {
             hasher.update(b"freshell-repair-audit-v1\0");
             hasher.update(encoded.as_bytes());
             let audit_id = format!("repair-{:x}", hasher.finalize());
-            conn.execute(
-                "INSERT OR IGNORE INTO repair_audits (audit_id,audit_json,created_at) VALUES (?1,?2,?3)",
-                params![audit_id, encoded, now],
-            )?;
+            if request.apply {
+                conn.execute(
+                    "INSERT OR IGNORE INTO repair_audits (audit_id,audit_json,created_at) VALUES (?1,?2,?3)",
+                    params![audit_id, encoded, now],
+                )?;
+            }
             Ok(audit)
         })
         .await
@@ -158,11 +160,117 @@ impl Registry {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{admission::AdmissionPolicy, registry::LaunchPreparation};
+    use freshell_runtime_protocol::{RequestId, RuntimeLimits, RuntimeProfile, SoulId};
+    use rusqlite::Connection;
+
+    fn limits() -> RuntimeLimits {
+        RuntimeLimits {
+            cpu_milli: 500,
+            memory_bytes: 64 * 1024 * 1024,
+            swap_bytes: 0,
+            pids_max: 32,
+        }
+    }
 
     #[test]
     fn audit_type_defaults_to_no_mutation() {
         let audit = RepairAudit::default();
         assert!(!audit.mutation_performed);
         assert_eq!(audit.unknown_ownership_count, 0);
+    }
+
+    #[tokio::test]
+    async fn read_only_repair_does_not_persist_an_audit_or_change_db_version() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry = Registry::open(dir.path(), None).unwrap();
+        let observer = Connection::open(dir.path().join("runtime.sqlite3")).unwrap();
+        let before_version: u64 = observer
+            .query_row("PRAGMA data_version", [], |row| row.get(0))
+            .unwrap();
+        let before_audits: u64 = observer
+            .query_row("SELECT COUNT(*) FROM repair_audits", [], |row| row.get(0))
+            .unwrap();
+        let audit = registry
+            .repair_audit(RepairRequest {
+                apply: false,
+                expected_control_epoch: Some(registry.control_epoch()),
+            })
+            .await
+            .unwrap();
+        let after_version: u64 = observer
+            .query_row("PRAGMA data_version", [], |row| row.get(0))
+            .unwrap();
+        let after_audits: u64 = observer
+            .query_row("SELECT COUNT(*) FROM repair_audits", [], |row| row.get(0))
+            .unwrap();
+        assert!(!audit.mutation_performed);
+        assert_eq!(before_audits, after_audits);
+        assert_eq!(before_version, after_version);
+    }
+
+    #[tokio::test]
+    async fn apply_quarantines_unknown_partial_ownership_without_mutation() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry = Registry::open(dir.path(), None).unwrap();
+        let prepared = registry
+            .prepare_launch(LaunchPreparation {
+                soul_id: SoulId::new(),
+                provider: "opencode".into(),
+                provider_store_id: "repair-unknown-store".into(),
+                native_session_id: Some("ses_repair_unknown".into()),
+                creation_seed_ref: "repair-unknown-seed".into(),
+                request_id: RequestId::new(),
+                payload_digest: "repair-unknown-payload".into(),
+                requested_limits: limits(),
+                profile: RuntimeProfile::Custom,
+                project_key: "repair-unknown-project".into(),
+                fixture: None,
+                terminal: None,
+                fresh_agent: None,
+                view_intent: None,
+                admission: AdmissionPolicy::default(),
+            })
+            .await
+            .unwrap();
+        let db = dir.path().join("runtime.sqlite3");
+        let observer = Connection::open(&db).unwrap();
+        observer
+            .execute(
+                "UPDATE incarnations SET container_id='partial-ambiguous-id' WHERE incarnation_id=?1",
+                params![prepared.incarnation_id.as_str()],
+            )
+            .unwrap();
+        let before: (String, Option<String>) = observer
+            .query_row(
+                "SELECT launch_state,container_id FROM incarnations WHERE incarnation_id=?1",
+                params![prepared.incarnation_id.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+
+        let audit = registry
+            .repair_audit(RepairRequest {
+                apply: true,
+                expected_control_epoch: Some(registry.control_epoch()),
+            })
+            .await
+            .unwrap();
+
+        let after: (String, Option<String>) = observer
+            .query_row(
+                "SELECT launch_state,container_id FROM incarnations WHERE incarnation_id=?1",
+                params![prepared.incarnation_id.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(audit.unknown_ownership_count, 1);
+        assert!(!audit.mutation_performed);
+        assert_eq!(before, after);
+        assert_eq!(audit.blocked_objects.len(), 1);
+        assert!(audit.blocked_objects[0].starts_with(&format!(
+            "registry://soul/{}/incarnation/{}?",
+            prepared.soul_id, prepared.incarnation_id
+        )));
     }
 }

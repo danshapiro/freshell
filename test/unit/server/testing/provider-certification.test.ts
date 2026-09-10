@@ -419,7 +419,7 @@ describe('provider qualification receipt v2', () => {
       candidateSha,
       expectedRuntimeImage: runtimeImage,
       receipt: fixture.receipt,
-      allowLegacyV1ForProviders: ['opencode'],
+      legacyMigration: { gateMode: 'landing', providers: ['opencode'] },
     }).providers).toEqual([providerRow()])
   })
 
@@ -491,7 +491,7 @@ describe('provider qualification receipt v2', () => {
       candidateSha,
       expectedRuntimeImage: runtimeImage,
       receipt: fixture.receipt,
-      allowLegacyV1ForProviders: ['opencode'],
+      legacyMigration: { gateMode: 'landing', providers: ['opencode'] },
     })).toThrow(/digest|sha-256/i)
   })
 
@@ -502,7 +502,7 @@ describe('provider qualification receipt v2', () => {
       candidateSha,
       expectedRuntimeImage: runtimeImage,
       receipt,
-      allowLegacyV1ForProviders: ['opencode'],
+      legacyMigration: { gateMode: 'landing', providers: ['opencode'] },
     })
     expect(() => validate({ ...fixture.receipt, candidateSha: 'c'.repeat(40) })).toThrow(/candidate/i)
     expect(() => validate({ ...fixture.receipt, receiptRunId: 'another-run' })).toThrow(/evidence run|run id/i)
@@ -527,7 +527,7 @@ describe('provider qualification receipt v2', () => {
       candidateSha,
       expectedRuntimeImage: runtimeImage,
       receipt: fixture.receipt,
-      allowLegacyV1ForProviders: ['opencode'],
+      legacyMigration: { gateMode: 'landing', providers: ['opencode'] },
     })).toThrow(/manifest run id|candidate-bound/i)
   })
 
@@ -707,7 +707,7 @@ describe('provider qualification receipt v2', () => {
       candidateSha,
       expectedRuntimeImage: runtimeImage,
       receipt: fixture.receipt,
-      allowLegacyV1ForProviders: ['opencode'],
+      legacyMigration: { gateMode: 'landing', providers: ['opencode'] },
     })).toThrow(/pinned.*version|providerVersion/i)
   })
 
@@ -722,11 +722,11 @@ describe('provider qualification receipt v2', () => {
       candidateSha,
       expectedRuntimeImage: runtimeImage,
       receipt: forged,
-      allowLegacyV1ForProviders: ['opencode'],
+      legacyMigration: { gateMode: 'landing', providers: ['opencode'] },
     })).toThrow(/provider.*artifact|summary/i)
   })
 
-  it('never lets a legacy terminal-only schema v1 receipt certify production', () => {
+  it('allows legacy schema v1 only through the typed OpenCode landing migration, never production', () => {
     const legacyBase = {
       schemaVersion: 1,
       status: 'PASS',
@@ -738,15 +738,35 @@ describe('provider qualification receipt v2', () => {
       candidateSha,
       expectedRuntimeImage: runtimeImage,
       receipt: { ...legacyBase, providers: [{ provider: 'opencode' }] },
-      allowLegacyV1ForProviders: ['opencode'],
-    })).toThrow(/schema v2|legacy/i)
+      legacyMigration: { gateMode: 'landing', providers: ['opencode'] },
+    }).legacyV1).toBe(true)
+    expect(() => validateProviderQualificationReceipt({
+      repoRoot,
+      candidateSha,
+      expectedRuntimeImage: runtimeImage,
+      receipt: { ...legacyBase, providers: [{ provider: 'opencode' }] },
+    })).toThrow(/landing-only|production acceptance/i)
     expect(() => validateProviderQualificationReceipt({
       repoRoot,
       candidateSha,
       expectedRuntimeImage: runtimeImage,
       receipt: { ...legacyBase, providers: [{ provider: 'claude' }] },
-      allowLegacyV1ForProviders: ['opencode'],
+      legacyMigration: { gateMode: 'landing', providers: ['opencode'] },
     })).toThrow(/schema v2|legacy/i)
+    const secretLikeProvider = 'sk-abcdefghijklmnopqrstuvwx'
+    let failure = ''
+    try {
+      validateProviderQualificationReceipt({
+        repoRoot,
+        candidateSha,
+        expectedRuntimeImage: runtimeImage,
+        receipt: { ...legacyBase, providers: [{ provider: secretLikeProvider }] },
+        legacyMigration: { gateMode: 'landing', providers: ['opencode'] },
+      })
+    } catch (error) {
+      failure = String(error)
+    }
+    expect(failure).not.toContain(secretLikeProvider)
   })
 })
 

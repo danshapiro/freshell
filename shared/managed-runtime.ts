@@ -281,6 +281,8 @@ export const ManagedRuntimeMigrationPlanSchema = z.object({
   registryBackupRequired: z.boolean(),
   registryBackupVerified: z.boolean(),
   registryBackupPath: z.string().optional(),
+  registryBackupSha256: z.string().regex(/^[0-9a-f]{64}$/).optional(),
+  registryBackupSchemaVersion: NonNegativeIntSchema.optional(),
   managedSoulCount: NonNegativeIntSchema,
   legacyMetadataCount: NonNegativeIntSchema,
   projectedCpuMilli: NonNegativeIntSchema,

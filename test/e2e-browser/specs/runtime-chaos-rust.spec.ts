@@ -9,6 +9,12 @@ import fs from 'node:fs'
 import path from 'node:path'
 import { expect, type Page } from '@playwright/test'
 
+import { captureRuntimeReceiptCandidate, sha256 } from '../../../scripts/testing/runtime-phase5-evidence-common.js'
+import {
+  buildPhase5ChaosReceipt,
+  PHASE5_CHAOS_ASSERTIONS_FILE,
+  PHASE5_CHAOS_PROVIDER_EVENTS_FILE,
+} from '../../../scripts/testing/runtime-phase5-chaos-evidence.js'
 import { test } from '../helpers/fixtures.js'
 import {
   ManagedRuntimeBrowserRig,
@@ -17,6 +23,16 @@ import {
   type ManagedRuntimeView,
 } from '../helpers/managed-runtime.js'
 import { openPanePicker } from '../helpers/pane-picker.js'
+import {
+  captureChaosRuntimeObservation,
+  nativeFollowUpMessageIds,
+  nativeToolEvidence,
+  structuredChaosLog,
+  writePrivateJson,
+  writePrivateJsonl,
+  type ChaosRuntimeObservation,
+  type StructuredChaosLog,
+} from '../helpers/runtime-chaos-evidence.js'
 import { TerminalHelper } from '../helpers/terminal-helpers.js'
 import { TestHarness } from '../helpers/test-harness.js'
 
@@ -137,12 +153,43 @@ function markerCount(rig: ManagedRuntimeBrowserRig, containerId: string, name: s
   return /^\d+$/.test(raw) ? Number(raw) : -1
 }
 
+function monotonicMs(): number {
+  return Math.floor(performance.now())
+}
+
+async function exactFalseLossNoticeIds(
+  page: Page,
+  rig: ManagedRuntimeBrowserRig,
+  token: string,
+  soulId: string,
+): Promise<string[]> {
+  const notices = await page.evaluate(async ({ authToken }) => {
+    const response = await fetch('/api/runtime/notices?profileId=profile%3Aphase5-chaos&limit=100', {
+      headers: { authorization: `Bearer ${authToken}` },
+    })
+    if (!response.ok) throw new Error(`notice query failed with HTTP ${response.status}`)
+    return (await response.json()).notices
+  }, { authToken: token })
+  const matching: string[] = []
+  for (const notice of notices) {
+    for (const incidentId of notice.incidentIds ?? notice.incident_ids ?? []) {
+      const incident = dataOf(await rig.runtime.adminOk(
+        rig.supervisor,
+        rig.runtime.incidentSummaryBody(incidentId, await rig.controlEpoch()),
+      ), 'incident_summary')
+      if (incident.soulId === soulId || incident.soul_id === soulId) matching.push(notice.noticeId ?? notice.notice_id)
+    }
+  }
+  return [...new Set(matching)]
+}
+
 test.describe.serial('Phase 5 runtime chaos', () => {
   test('P5-G09: pending approval and long tool survive 100 web and 20 supervisor replacements', async ({ page, e2eServerKind }) => {
     test.skip(process.env.FRESHELL_RUNTIME_PHASE5_CHAOS_LIVE !== '1', 'set FRESHELL_RUNTIME_PHASE5_CHAOS_LIVE=1 for the chaos receipt')
     expect(e2eServerKind).toBe('rust')
     test.setTimeout(2_400_000)
 
+    const candidateBefore = captureRuntimeReceiptCandidate(process.cwd())
     const rig = new ManagedRuntimeBrowserRig(
       process.cwd(),
       5,
@@ -153,6 +200,11 @@ test.describe.serial('Phase 5 runtime chaos', () => {
         FRESHELL_RUNTIME_OBSERVER_INTERVAL_MS: '1000',
       },
     )
+    const webCycles: Record<string, unknown>[] = []
+    const supervisorCycles: Record<string, unknown>[] = []
+    const browserLogs: StructuredChaosLog[] = []
+    const serverLogs: StructuredChaosLog[] = []
+    let receiptReady = false
     try {
       const info = await rig.start()
       const migration = dataOf(await rig.runtime.adminOk(
@@ -209,6 +261,8 @@ test.describe.serial('Phase 5 runtime chaos', () => {
           .find((candidate) => candidate.id === paneId)?.content
         return typeof content?.sessionRef?.sessionId === 'string' ? content.sessionRef.sessionId : null
       }, 120_000)
+      const expectedRuntimeIdentity = { ...initial, nativeSessionId: providerSessionId }
+      const initialRuntime = await captureChaosRuntimeObservation(rig, expectedRuntimeIdentity)
 
       // Permission remains provider-native and pending across web replacement.
       rig.ownedProviderExec(initial.containerId, ['rm', '-f', '/home/freshell/provider/p5-chaos-approval-count'])
@@ -223,6 +277,15 @@ test.describe.serial('Phase 5 runtime chaos', () => {
         return text.includes('Permission required') && text.includes('Allow once') ? true : null
       }, 180_000)
       expect(markerCount(rig, initial.containerId, 'p5-chaos-approval-count')).toBe(0)
+      const approvalBefore = await waitForValue('one pending provider-native approval tool request', () => {
+        const evidence = nativeToolEvidence(rig, initial.containerId!, providerSessionId, 'p5-chaos-approval-count')
+        return evidence.requestIds.length === 1 && evidence.resultIds.length === 0 && evidence.replayCount === 0
+          ? evidence
+          : null
+      }, 60_000)
+      const webBefore = rig.web.processEvidence()
+      const webBootBefore = await harness.getBootId()
+      const webStarted = monotonicMs()
       const readyAt = await harness.getLastReadyAt()
       await rig.crashAndRestartWeb()
       await harness.waitForConnectionAfter(readyAt, 90_000)
@@ -231,11 +294,40 @@ test.describe.serial('Phase 5 runtime chaos', () => {
         const text = await terminal.getVisibleText(currentId ?? terminalId)
         return text.includes('Permission required') && text.includes('Allow once') ? true : null
       }, 90_000)
+      const webAfter = rig.web.processEvidence()
+      const webBootAfter = await harness.getBootId()
+      const webEnded = monotonicMs()
+      const firstRuntime = await captureChaosRuntimeObservation(rig, expectedRuntimeIdentity)
+      webCycles.push({
+        cycle: 1,
+        mode: 'abrupt',
+        attemptCount: webAfter.bootAttemptCount,
+        startedMonotonicMs: webStarted,
+        endedMonotonicMs: webEnded,
+        beforePid: webBefore.pid,
+        afterPid: webAfter.pid,
+        beforeBootId: webBootBefore,
+        afterBootId: webBootAfter,
+        runtime: firstRuntime,
+      })
+      browserLogs.push(structuredChaosLog(
+        'browser', 1, webEnded, 'info', 'web.replaced',
+        JSON.stringify({
+          cycle: 1, mode: 'abrupt', beforePid: webBefore.pid, afterPid: webAfter.pid,
+          beforeBootId: webBootBefore, afterBootId: webBootAfter,
+        }),
+      ))
       await pressInPane(page, paneId, 'Enter')
       await waitForValue('approval tool exactly once', () => (
         markerCount(rig, initial.containerId!, 'p5-chaos-approval-count') === 1 ? true : null
       ), 180_000)
-      const pendingApprovalSurvived = true
+      const approvalAfter = await waitForValue('one completed provider-native approval tool result', () => {
+        const evidence = nativeToolEvidence(rig, initial.containerId!, providerSessionId, 'p5-chaos-approval-count')
+        return evidence.requestIds.length === 1 && evidence.resultIds.length === 1 && evidence.replayCount === 0
+          ? evidence
+          : null
+      }, 60_000)
+      expect(approvalAfter.requestIds).toEqual(approvalBefore.requestIds)
 
       // Start a long-running side effect and replace the web process repeatedly.
       rig.ownedProviderExec(initial.containerId, ['rm', '-f', '/home/freshell/provider/p5-chaos-long-tool-count'])
@@ -249,11 +341,13 @@ test.describe.serial('Phase 5 runtime chaos', () => {
         return table.includes('sleep 180') ? true : null
       }, 60_000)
 
-      let webRestartCycles = 1
-      let duplicateWriters = 0
-      for (; webRestartCycles < 100; webRestartCycles += 1) {
+      for (let cycle = 2; cycle <= 100; cycle += 1) {
+        const beforeProcess = rig.web.processEvidence()
+        const beforeBootId = await harness.getBootId()
+        const startedMonotonicMs = monotonicMs()
         const previousReady = await harness.getLastReadyAt()
-        if (webRestartCycles % 2 === 0) await rig.restartWebGracefully()
+        const mode = cycle % 2 === 1 ? 'abrupt' : 'graceful'
+        if (mode === 'graceful') await rig.restartWebGracefully()
         else await rig.crashAndRestartWeb()
         await harness.waitForConnectionAfter(previousReady, 90_000)
         const currentLeaf = await waitForModeLeaf(
@@ -265,22 +359,67 @@ test.describe.serial('Phase 5 runtime chaos', () => {
         )
         expect(currentLeaf.content.terminalId).toBe(terminalId)
         expect(currentLeaf.content.sessionRef?.sessionId).toBe(providerSessionId)
-        const snapshot = await rig.inventorySnapshot()
-        const running = snapshot.souls.filter((row: any) => row.soulId === initial.soulId && row.launchState === 'running')
-        duplicateWriters += Math.max(0, running.length - 1)
+        const afterProcess = rig.web.processEvidence()
+        const afterBootId = await harness.getBootId()
+        const endedMonotonicMs = monotonicMs()
+        const runtime = await captureChaosRuntimeObservation(rig, expectedRuntimeIdentity)
+        webCycles.push({
+          cycle,
+          mode,
+          attemptCount: afterProcess.bootAttemptCount,
+          startedMonotonicMs,
+          endedMonotonicMs,
+          beforePid: beforeProcess.pid,
+          afterPid: afterProcess.pid,
+          beforeBootId,
+          afterBootId,
+          runtime,
+        })
+        browserLogs.push(structuredChaosLog(
+          'browser', cycle, endedMonotonicMs, 'info', 'web.replaced',
+          JSON.stringify({
+            cycle, mode, beforePid: beforeProcess.pid, afterPid: afterProcess.pid,
+            beforeBootId, afterBootId,
+          }),
+        ))
       }
 
-      let supervisorRestartCycles = 0
-      for (; supervisorRestartCycles < 20; supervisorRestartCycles += 1) {
-        await rig.restartSupervisor()
-        await waitForValue(`supervisor restart ${supervisorRestartCycles + 1}`, async () => {
+      for (let cycle = 1; cycle <= 20; cycle += 1) {
+        const beforeContainerId = rig.supervisor.containerId
+        const beforePid = rig.runtime.ownedContainerHostPidExact(beforeContainerId)
+        const beforeControlEpoch = await rig.controlEpoch()
+        const mode = cycle % 2 === 1 ? 'abrupt' : 'graceful'
+        const startedMonotonicMs = monotonicMs()
+        if (mode === 'abrupt') await rig.restartSupervisorAbrupt()
+        else await rig.restartSupervisor()
+        await waitForValue(`supervisor restart ${cycle}`, async () => {
           const snapshot = await rig.inventorySnapshot()
           const row = snapshot.souls.filter((candidate: any) => candidate.soulId === initial.soulId).at(-1)
           return row?.launchState === 'running' ? row : null
         }, 60_000)
-        const snapshot = await rig.inventorySnapshot()
-        const running = snapshot.souls.filter((row: any) => row.soulId === initial.soulId && row.launchState === 'running')
-        duplicateWriters += Math.max(0, running.length - 1)
+        const afterContainerId = rig.supervisor.containerId
+        const afterPid = rig.runtime.ownedContainerHostPidExact(afterContainerId)
+        const afterControlEpoch = await rig.controlEpoch()
+        const endedMonotonicMs = monotonicMs()
+        const runtime = await captureChaosRuntimeObservation(rig, expectedRuntimeIdentity)
+        supervisorCycles.push({
+          cycle,
+          mode,
+          attemptCount: 1,
+          startedMonotonicMs,
+          endedMonotonicMs,
+          beforeContainerId,
+          afterContainerId,
+          beforePid,
+          afterPid,
+          beforeControlEpoch,
+          afterControlEpoch,
+          runtime,
+        })
+        serverLogs.push(structuredChaosLog(
+          'server', cycle, endedMonotonicMs, 'info', 'supervisor.replaced',
+          JSON.stringify({ cycle, mode, beforeContainerId, afterContainerId, beforePid, afterPid }),
+        ))
       }
 
       await waitForValue('long tool one side effect', () => (
@@ -289,6 +428,16 @@ test.describe.serial('Phase 5 runtime chaos', () => {
       expect(markerCount(rig, initial.containerId, 'p5-chaos-long-tool-count')).toBe(1)
       await executeInPane(page, paneId, 'Reply with exactly P5_CHAOS_FOLLOWUP and use no tools.')
       await waitForPaneOutput(page, harness, tabId, paneId, 'P5_CHAOS_FOLLOWUP', 180_000)
+      const longToolEvidence = await waitForValue('one completed native long-tool request/result', () => {
+        const evidence = nativeToolEvidence(rig, initial.containerId!, providerSessionId, 'p5-chaos-long-tool-count')
+        return evidence.requestIds.length === 1 && evidence.resultIds.length === 1 && evidence.replayCount === 0
+          ? evidence
+          : null
+      }, 60_000)
+      const followUpMessageIds = await waitForValue('one provider-native follow-up message', () => {
+        const ids = nativeFollowUpMessageIds(rig, initial.containerId!, providerSessionId, 'P5_CHAOS_FOLLOWUP')
+        return ids.length === 1 ? ids : null
+      }, 60_000)
 
       const finalSnapshot = await rig.inventorySnapshot()
       const finalView = finalSnapshot.souls.filter((row: any) => row.soulId === initial.soulId).at(-1)
@@ -296,47 +445,92 @@ test.describe.serial('Phase 5 runtime chaos', () => {
       expect(finalView.containerId).toBe(initial.containerId)
       expect(finalView.hostBootId).toBe(initial.hostBootId)
       expect(finalView.nativeSessionId).toBe(providerSessionId)
-      const notices = await page.evaluate(async ({ token }) => {
-        const response = await fetch('/api/runtime/notices?profileId=profile%3Aphase5-chaos&limit=100', {
-          headers: { authorization: `Bearer ${token}` },
-        })
-        if (!response.ok) throw new Error(await response.text())
-        return (await response.json()).notices
-      }, { token: info.token })
-      const falseLossNotices = notices.length
+      expect(finalView.evidenceRevision).toBeGreaterThan(0)
+      const matchingNoticeIds = await exactFalseLossNoticeIds(page, rig, info.token, initial.soulId)
+      expect(matchingNoticeIds).toEqual([])
+      const finalRuntime: ChaosRuntimeObservation = await captureChaosRuntimeObservation(rig, expectedRuntimeIdentity)
+      expect(finalRuntime).toEqual(initialRuntime)
 
-      const runtimeDir = rig.runtime.runtimeDir(rig.supervisor, initial.incarnationId)
-      const hostState = JSON.parse(fs.readFileSync(path.join(runtimeDir, 'host-state.json'), 'utf8'))
-      const receipt = {
+      const capturedServer = rig.web.capturedOutput()
+      const capturedServerBytes = `${capturedServer.stdout}${capturedServer.stderr}`
+      expect(capturedServerBytes).not.toContain('P5_CHAOS_FOLLOWUP')
+      expect(capturedServerBytes).not.toContain(info.token)
+      serverLogs.push(structuredChaosLog(
+        'server', serverLogs.length + 1, monotonicMs(), 'info', 'server.output.captured', capturedServerBytes,
+      ))
+      writePrivateJsonl(path.join(rig.runtime.evidenceDir, 'phase5-chaos-server-log.jsonl'), serverLogs)
+      writePrivateJsonl(path.join(rig.runtime.evidenceDir, 'phase5-chaos-browser-log.jsonl'), browserLogs)
+      writePrivateJson(path.join(rig.runtime.evidenceDir, PHASE5_CHAOS_PROVIDER_EVENTS_FILE), {
         schemaVersion: 1,
-        status: 'PASS',
+        provider: 'opencode',
+        nativeSessionId: providerSessionId,
+        approval: {
+          requestIds: approvalAfter.requestIds,
+          resultIds: approvalAfter.resultIds,
+          providerDecisionCount: approvalAfter.resultIds.length - approvalBefore.resultIds.length,
+          replayCount: approvalAfter.replayCount,
+        },
+        longTool: longToolEvidence,
+        followUp: { messageIds: followUpMessageIds, completedCount: followUpMessageIds.length },
+      })
+      writePrivateJson(path.join(rig.runtime.evidenceDir, PHASE5_CHAOS_ASSERTIONS_FILE), {
+        schemaVersion: 1,
         candidateSha: rig.runtime.candidateSha,
-        browser: {
-          browserInteraction: true,
+        receiptRunId: rig.runtime.runId,
+        caseId: 'P5-G09',
+        test: { total: 1, passed: 1, failed: 0, skipped: 0 },
+        identity: {
           provider: 'opencode',
           providerVersion: P2_OPENCODE_VERSION,
           model: P2_OPENCODE_FREE_MODEL,
-          webRestartCycles,
-          supervisorRestartCycles,
-          pendingApprovalSurvived,
-          longToolExactlyOnce: markerCount(rig, initial.containerId, 'p5-chaos-long-tool-count') === 1,
-          falseLossNotices,
-          duplicateWriters,
-          sameSoulId: finalView.soulId === initial.soulId,
-          sameIncarnation: finalView.incarnationId === initial.incarnationId,
-          sameNativeSession: finalView.nativeSessionId === providerSessionId,
-          providerLaunchCount: hostState.workerLaunchCount,
-          followUpCompleted: true,
           paneId,
           terminalId,
+          ...initialRuntime,
         },
-      }
-      const receiptPath = rig.writePhase5ChaosReceipt(receipt)
-      // eslint-disable-next-line no-console
-      console.log(`[P5-G09] chaos receipt: ${receiptPath}`)
+        webCycles,
+        supervisorCycles,
+        approval: {
+          toolRequestId: approvalAfter.requestIds[0],
+          decisionsBeforeClick: approvalBefore.resultIds.length,
+          decisionsAfterClick: approvalAfter.resultIds.length,
+          markerCount: markerCount(rig, initial.containerId, 'p5-chaos-approval-count'),
+        },
+        longTool: {
+          toolRequestId: longToolEvidence.requestIds[0],
+          markerCount: markerCount(rig, initial.containerId, 'p5-chaos-long-tool-count'),
+          sleepSeconds: 180,
+        },
+        falseLossQuery: {
+          profileId: 'profile:phase5-chaos',
+          soulId: initial.soulId,
+          evidenceRevision: finalView.evidenceRevision,
+          matchingNoticeIds,
+        },
+        followUp: { nativeMessageId: followUpMessageIds[0], completed: true },
+      })
+      receiptReady = true
     } finally {
       const cleanup = await rig.stop()
       expect(cleanup.ok, cleanup.errors.join('\n')).toBe(true)
     }
+    expect(receiptReady).toBe(true)
+    fs.copyFileSync(
+      path.join(rig.repoRoot, 'docs/development/runtime-provider-capabilities.json'),
+      path.join(rig.runtime.evidenceDir, 'phase5-capability-inventory.json'),
+    )
+    fs.chmodSync(path.join(rig.runtime.evidenceDir, 'phase5-capability-inventory.json'), 0o600)
+    const receipt = buildPhase5ChaosReceipt({
+      repoRoot: rig.repoRoot,
+      evidenceDir: rig.runtime.evidenceDir,
+      candidateSha: rig.runtime.candidateSha,
+      runtimeImage: rig.runtime.imageRef,
+      receiptRunId: rig.runtime.runId,
+      candidateBefore,
+      candidateAfter: captureRuntimeReceiptCandidate(rig.repoRoot),
+    })
+    const receiptPath = rig.writePhase5ChaosReceipt(receipt)
+    expect(sha256(fs.readFileSync(receiptPath))).toMatch(/^[0-9a-f]{64}$/)
+    // eslint-disable-next-line no-console
+    console.log(`[P5-G09] evidence-derived chaos receipt: ${receiptPath}`)
   })
 })

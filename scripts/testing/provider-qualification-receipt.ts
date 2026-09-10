@@ -142,15 +142,18 @@ export type ValidateProviderQualificationReceiptInput = {
   candidateSha: string
   expectedRuntimeImage: string
   receipt: unknown
-  /** @deprecated Legacy terminal-only receipts never certify production. */
-  allowLegacyV1ForProviders?: readonly string[]
+  /** Landing-only compatibility reader. Production consumers must omit it. */
+  legacyMigration?: {
+    gateMode: 'landing'
+    providers: readonly string[]
+  }
   /** Preliminary evidence consumers must opt in explicitly; final gates omit this. */
   acceptedBuildKinds?: readonly ProviderQualificationBuildEvidence['kind'][]
 }
 
 export type ValidatedProviderQualificationReceipt = {
-  schemaVersion: 2
-  legacyV1: false
+  schemaVersion: 1 | 2
+  legacyV1: boolean
   providers: any[]
   receipt: any
 }
@@ -189,7 +192,8 @@ export function buildProviderQualificationReceipt(
     runtimeImage: input.runtimeImage,
     qualificationBuild,
     providers: input.providers,
-  }, null, 2))
+  }, null, 2), { mode: 0o600 })
+  fs.chmodSync(assertionsPath, 0o600)
 
   const artifact = (fileName: string): QualificationArtifactReference => ({
     path: `${evidenceRun}/${fileName}`,
@@ -308,10 +312,29 @@ export function validateProviderQualificationReceipt(
 }
 
 function validateLegacyV1(
-  _input: ValidateProviderQualificationReceiptInput,
-  _receipt: Record<string, any>,
+  input: ValidateProviderQualificationReceiptInput,
+  receipt: Record<string, any>,
 ): ValidatedProviderQualificationReceipt {
-  throw new Error('legacy schema v1 cannot certify production; cryptographic native-turn proof requires schema v2')
+  if (receipt.status !== 'PASS') throw new Error('legacy provider qualification receipt is not PASS')
+  stringEqual(receipt.candidateSha, input.candidateSha, 'legacy receipt candidate SHA')
+  stringEqual(receipt.runtimeImage, input.expectedRuntimeImage, 'legacy receipt runtime image')
+  const providers = Array.isArray(receipt.providers) ? receipt.providers : []
+  if (providers.length === 0) throw new Error('legacy provider qualification receipt has no provider rows')
+  if (input.legacyMigration?.gateMode !== 'landing') {
+    throw new Error(
+      'legacy schema v1 is landing-only and cannot satisfy production acceptance; cryptographic native-turn proof requires schema v2',
+    )
+  }
+  const allowed = new Set(input.legacyMigration.providers)
+  const forbidden = providers
+    .map((row) => row?.provider)
+    .filter((provider) => typeof provider !== 'string' || !allowed.has(provider))
+  if (forbidden.length) {
+    throw new Error(
+      'legacy schema v1 contains a provider outside the typed landing allowlist; production promotion requires schema v2',
+    )
+  }
+  return { schemaVersion: 1, legacyV1: true, providers, receipt }
 }
 
 function validateProviderRows(value: unknown): asserts value is ProviderQualificationRow[] {
@@ -323,10 +346,10 @@ function validateProviderRows(value: unknown): asserts value is ProviderQualific
     const row = object(candidate, 'qualification provider row')
     assertEvidenceRedacted(row, 'qualification provider row')
     const provider = nonEmptyString(row.provider, 'provider')
-    if (seen.has(provider)) throw new Error(`qualification provider row ${provider} is duplicated`)
+    if (seen.has(provider)) throw new Error('qualification provider row is duplicated')
     seen.add(provider)
     if (!Array.isArray(row.modes) || row.modes.length === 0 || row.modes.some((mode: unknown) => typeof mode !== 'string' || !mode)) {
-      throw new Error(`${provider}.modes must contain exact provider modes`)
+      throw new Error('qualification provider modes must contain exact non-empty values')
     }
     for (const field of ['providerVersion', 'model', 'reasoningEffort', 'nativeSessionId'] as const) {
       boundedEvidenceString(row[field], `${provider}.${field}`)
@@ -352,14 +375,14 @@ function validateProviderRows(value: unknown): asserts value is ProviderQualific
       'onlyOneWriter',
       'oldEnclosureVerifiedEmpty',
     ] as const) {
-      if (row[field] !== true) throw new Error(`${provider}.${field} must be true in qualification evidence`)
+      if (row[field] !== true) throw new Error(`qualification provider field ${field} must be true in evidence`)
     }
     const limits = object(row.limitEvidence, `${provider}.limitEvidence`)
     for (const field of ['cpuMax', 'memoryMax', 'swapMax', 'pidsMax'] as const) {
       nonEmptyString(limits[field], `${provider}.limitEvidence.${field}`)
     }
     if (limits.swapMax !== '0') {
-      throw new Error(`${provider}.limitEvidence.swapMax must prove swap is disabled`)
+      throw new Error('qualification provider limitEvidence.swapMax must prove swap is disabled')
     }
     const claim = object(row.writerClaim, `${provider}.writerClaim`)
     stringEqual(claim.provider, provider, `${provider}.writerClaim.provider`)
@@ -368,21 +391,21 @@ function validateProviderRows(value: unknown): asserts value is ProviderQualific
       nonEmptyString(claim[field], `${provider}.writerClaim.${field}`)
     }
     if (claim.activeClaimCount !== 1 || claim.globalConflictingClaimCount !== 0) {
-      throw new Error(`${provider}.writerClaim must prove exactly one global tuple owner`)
+      throw new Error('qualification provider writerClaim must prove exactly one global tuple owner')
     }
     const ordering = object(row.verifiedEmptyOrdering, `${provider}.verifiedEmptyOrdering`)
     if (ordering.stopOutcome !== 'verified_empty'
       || ordering.activeClaimCountAfterStop !== 0
       || ordering.globalConflictingClaimCountAfterStop !== 0
       || ordering.oldContainerRunningAfterStop !== false) {
-      throw new Error(`${provider}.verifiedEmptyOrdering must prove claim release and enclosure emptiness after stop`)
+      throw new Error('qualification provider verifiedEmptyOrdering must prove claim release and enclosure emptiness after stop')
     }
     if (row.lostNoticeCount !== 0) {
-      throw new Error(`${provider}.lostNoticeCount must be zero in qualification evidence`)
+      throw new Error('qualification provider lostNoticeCount must be zero in evidence')
     }
     const crashKinds = new Set(Array.isArray(row.crashKinds) ? row.crashKinds : [])
     for (const required of ['session_host', 'provider_process']) {
-      if (!crashKinds.has(required)) throw new Error(`${provider}.crashKinds must include ${required}`)
+      if (!crashKinds.has(required)) throw new Error(`qualification crashKinds must include ${required}`)
     }
   }
 }
@@ -668,8 +691,8 @@ function assertBrokerSafeBytes(bytes: Buffer): void {
     let event: any
     try {
       event = JSON.parse(line)
-    } catch (error) {
-      throw new Error(`broker artifact line ${index + 1} is not JSON: ${String(error)}`)
+    } catch {
+      throw new Error(`broker artifact line ${index + 1} is not valid JSON`)
     }
     if (event?.unsafeAttempt === true) unsafe += 1
   }

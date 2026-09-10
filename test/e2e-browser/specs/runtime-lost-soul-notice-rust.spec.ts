@@ -21,6 +21,16 @@ import {
 import { openPanePicker } from '../helpers/pane-picker.js'
 import { TerminalHelper } from '../helpers/terminal-helpers.js'
 import { TestHarness } from '../helpers/test-harness.js'
+import {
+  captureRuntimeReceiptCandidate,
+  sha256,
+} from '../../../scripts/testing/runtime-phase5-evidence-common.js'
+import {
+  buildPhase5LossReceipt,
+  PHASE5_CAPABILITY_INVENTORY_FILE,
+  PHASE5_LOSS_ASSERTIONS_FILE,
+  PHASE5_LOSS_INCIDENT_FILE,
+} from '../../../scripts/testing/runtime-phase5-loss-evidence.js'
 
 function leavesByMode(node: any, mode: string): any[] {
   if (!node) return []
@@ -127,18 +137,59 @@ function dataOf(result: any, kind: string): any {
   return result.data
 }
 
+function providerFileEvidence(rig: ManagedRuntimeBrowserRig, containerId: string, filePath: string): {
+  path: string
+  exists: boolean
+  sha256: string
+} {
+  const script = String.raw`
+const crypto = require('node:crypto');
+const fs = require('node:fs');
+const target = process.argv[1];
+let exists = false;
+let digest = crypto.createHash('sha256').update('absent').digest('hex');
+try {
+  const stat = fs.lstatSync(target);
+  exists = stat.isFile();
+  if (exists) digest = crypto.createHash('sha256').update(fs.readFileSync(target)).digest('hex');
+} catch (error) {
+  if (error.code !== 'ENOENT') throw error;
+}
+process.stdout.write(JSON.stringify({ path: target, exists, sha256: digest }));
+`
+  return JSON.parse(rig.ownedProviderExec(containerId, ['node', '-e', script, filePath]))
+}
+
+function exactAbsenceCheck(rig: ManagedRuntimeBrowserRig, containerId: string, target: string) {
+  const script = String.raw`
+const fs = require('node:fs');
+const target = process.argv[1];
+let state = 'absent';
+try { fs.lstatSync(target); state = 'present'; } catch (error) { if (error.code !== 'ENOENT') state = 'unknown'; }
+process.stdout.write(JSON.stringify({ path: target, state, probe: 'lstat' }));
+`
+  return JSON.parse(rig.ownedProviderExec(containerId, ['node', '-e', script, target]))
+}
+
+function writePrivateJson(filePath: string, value: unknown): void {
+  fs.writeFileSync(filePath, JSON.stringify(value, null, 2), { mode: 0o600 })
+  fs.chmodSync(filePath, 0o600)
+}
+
 test.describe.serial('Phase 5 certified provider loss', () => {
   test('P5-G02: real OpenCode loss persists incident before exact cleanup and shows one brief notice', async ({ page, e2eServerKind }) => {
     test.skip(process.env.FRESHELL_RUNTIME_PHASE5_LIVE !== '1', 'set FRESHELL_RUNTIME_PHASE5_LIVE=1 for the live loss receipt')
     expect(e2eServerKind).toBe('rust')
     test.setTimeout(1_200_000)
 
+    const candidateBefore = captureRuntimeReceiptCandidate(process.cwd())
     const rig = new ManagedRuntimeBrowserRig(
       process.cwd(),
       5,
       {},
       { FRESHELL_RUNTIME_OBSERVER_INTERVAL_MS: '60000' },
     )
+    let receiptReady = false
     try {
       const info = await rig.start()
       const controlEpoch = await rig.controlEpoch()
@@ -212,17 +263,41 @@ test.describe.serial('Phase 5 certified provider loss', () => {
       const workerPid = Number(hostState.workerPid)
       expect(workerPid).toBeGreaterThan(1)
 
+      const credentialPath = '/home/freshell/provider/.local/share/opencode/auth.json'
+      const credentialBefore = providerFileEvidence(rig, before.containerId, credentialPath)
+
       // Retain only a diagnostic marker; remove OpenCode session DB/artifacts
       // and all Freshell checkpoint copies without reading or mutating host
       // credentials. Then terminate exactly the recorded provider PID.
       rig.runtime.killOwnedRuntimePidExact(before.containerId, workerPid)
       rig.ownedContainerExec(before.containerId, [
-        'sh', '-lc',
-        'rm -rf /home/freshell/provider/.local/share/opencode /home/freshell/provider/.cache/opencode /home/freshell/provider/.freshell/checkpoints; test -f /home/freshell/provider/p5-diagnostic-only',
+        'node', '-e', String.raw`
+const fs = require('node:fs');
+for (const target of [
+  '/home/freshell/provider/.local/share/opencode/opencode.db',
+  '/home/freshell/provider/.local/share/opencode/opencode.db-wal',
+  '/home/freshell/provider/.local/share/opencode/opencode.db-shm',
+]) {
+  try { fs.unlinkSync(target); } catch (error) { if (error.code !== 'ENOENT') throw error; }
+}
+const checkpoints = '/home/freshell/provider/.freshell/checkpoints';
+try { fs.rmSync(checkpoints, { recursive: true }); } catch (error) { if (error.code !== 'ENOENT') throw error; }
+if (!fs.statSync('/home/freshell/provider/p5-diagnostic-only').isFile()) process.exit(2);
+`,
       ])
       const diagnosticOnlyRetained = rig.ownedProviderExec(before.containerId, [
         'sh', '-lc', 'cat "$HOME/p5-diagnostic-only"',
       ]).trim() === diagnostic
+      expect(diagnosticOnlyRetained).toBe(true)
+      const credentialAfter = providerFileEvidence(rig, before.containerId, credentialPath)
+      expect(credentialAfter).toEqual(credentialBefore)
+      const exactAbsenceChecks = [
+        '/home/freshell/provider/.local/share/opencode/opencode.db',
+        '/home/freshell/provider/.local/share/opencode/opencode.db-wal',
+        '/home/freshell/provider/.local/share/opencode/opencode.db-shm',
+        '/home/freshell/provider/.freshell/checkpoints',
+      ].map((target) => exactAbsenceCheck(rig, before.containerId!, target))
+      expect(exactAbsenceChecks.every((row) => row.state === 'absent')).toBe(true)
 
       const result = dataOf(await rig.runtime.adminOk(
         rig.supervisor,
@@ -261,61 +336,86 @@ test.describe.serial('Phase 5 certified provider loss', () => {
       const incidentPersisted = rig.runtime.runCommand('docker', [
         'exec', rig.supervisor.containerId, 'test', '-s', incidentPath,
       ]) === ''
-      const lifecycle = fs.readFileSync(
-        path.join(rig.runtime.evidenceDir, 'lifecycle.jsonl'),
-        'utf8',
-      )
-        .split(/\r?\n/)
-        .filter(Boolean)
-        .map((line) => JSON.parse(line))
-      const committedIndex = lifecycle.findIndex((row) => (
-        row.event === 'supervisor.loss.incident_committed'
-          && row.data?.incidentId === result.incidentId
-      ))
-      const finalizedIndex = lifecycle.findIndex((row) => (
-        row.event === 'supervisor.loss.finalized'
-          && row.data?.incidentId === result.incidentId
-      ))
-      const incidentPersistedBeforeCleanup = committedIndex >= 0
-        && finalizedIndex > committedIndex
+      expect(incidentPersisted).toBe(true)
       const artifact = rig.runtime.runCommand('docker', [
         'exec', rig.supervisor.containerId, 'cat', incidentPath,
       ])
       expect(artifact).not.toContain(providerSessionId)
       expect(artifact).not.toContain(rig.supervisor.controlSecret)
 
-      const receipt = {
+      const incidentArtifact = JSON.parse(artifact)
+      expect(incidentArtifact.certificateSha256).toMatch(/^[0-9a-f]{64}$/)
+      expect(incidentArtifact.certificate.intentRevision).toBe(before.intentRevision)
+      expect(result.view.intentRevision).toBe(before.intentRevision + 1)
+      writePrivateJson(path.join(rig.runtime.evidenceDir, PHASE5_LOSS_INCIDENT_FILE), incidentArtifact)
+      writePrivateJson(path.join(rig.runtime.evidenceDir, PHASE5_LOSS_ASSERTIONS_FILE), {
         schemaVersion: 1,
-        status: 'PASS',
         candidateSha: rig.runtime.candidateSha,
-        browser: {
-          browserInteraction: true,
+        receiptRunId: rig.runtime.runId,
+        caseId: 'P5-G02',
+        test: { total: 1, passed: 1, failed: 0, skipped: 0 },
+        identity: {
           provider: 'opencode',
           providerVersion: P2_OPENCODE_VERSION,
           model: P2_OPENCODE_FREE_MODEL,
-          allRegisteredStateRemoved: true,
-          diagnosticOnlyRetained,
-          incidentPersistedBeforeCleanup: incidentPersisted
-            && incident.state === 'closed'
-            && incidentPersistedBeforeCleanup,
-          exactCleanupVerified: incident.cleanup.verifiedEmpty === true,
-          briefNoticeDisplayed: true,
-          endedPaneRetained: ended.content.recoverySummary.recoveryState === 'lost',
-          foreignObjectsTouched: incident.cleanup.foreignObjectsTouched,
-          credentialsTouched: false,
           soulId: before.soulId,
-          nativeSessionIdHashOnly: !artifact.includes(providerSessionId),
+          incarnationId: before.incarnationId,
+          containerId: before.containerId,
+          hostBootId: before.hostBootId,
+          nativeSessionIdHash: incidentArtifact.certificate.nativeSessionRefHash,
           incidentId: result.incidentId,
           paneId,
           terminalId,
         },
-      }
-      const receiptPath = rig.writePhase5LossReceipt(receipt)
-      // eslint-disable-next-line no-console
-      console.log(`[P5-G02] real OpenCode loss receipt: ${receiptPath}`)
+        intent: {
+          checkedRevision: before.intentRevision,
+          lossRevision: incidentArtifact.certificate.intentRevision,
+          endedRevision: result.view.intentRevision,
+        },
+        providerState: {
+          exactAbsenceChecks,
+          credentialIntegrity: [{
+            path: credentialPath,
+            beforeExists: credentialBefore.exists,
+            afterExists: credentialAfter.exists,
+            beforeSha256: credentialBefore.sha256,
+            afterSha256: credentialAfter.sha256,
+          }],
+        },
+        browser: {
+          displayedNoticeIds: [incidentArtifact.noticeId],
+          endedPane: {
+            soulId: ended.content.soulId,
+            incarnationId: before.incarnationId,
+            incidentId: ended.content.incidentId,
+            nativeSessionIdHash: incidentArtifact.certificate.nativeSessionRefHash,
+            recoveryState: ended.content.recoverySummary.recoveryState,
+          },
+        },
+      })
+      receiptReady = true
     } finally {
       const cleanup = await rig.stop()
       expect(cleanup.ok, cleanup.errors.join('\n')).toBe(true)
     }
+    expect(receiptReady).toBe(true)
+    fs.copyFileSync(
+      path.join(rig.repoRoot, 'docs/development/runtime-provider-capabilities.json'),
+      path.join(rig.runtime.evidenceDir, PHASE5_CAPABILITY_INVENTORY_FILE),
+    )
+    fs.chmodSync(path.join(rig.runtime.evidenceDir, PHASE5_CAPABILITY_INVENTORY_FILE), 0o600)
+    const receipt = buildPhase5LossReceipt({
+      repoRoot: rig.repoRoot,
+      evidenceDir: rig.runtime.evidenceDir,
+      candidateSha: rig.runtime.candidateSha,
+      runtimeImage: rig.runtime.imageRef,
+      receiptRunId: rig.runtime.runId,
+      candidateBefore,
+      candidateAfter: captureRuntimeReceiptCandidate(rig.repoRoot),
+    })
+    const receiptPath = rig.writePhase5LossReceipt(receipt)
+    expect(sha256(fs.readFileSync(receiptPath))).toMatch(/^[0-9a-f]{64}$/)
+    // eslint-disable-next-line no-console
+    console.log(`[P5-G02] real OpenCode loss receipt: ${receiptPath}`)
   })
 })

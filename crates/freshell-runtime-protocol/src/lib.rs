@@ -616,6 +616,10 @@ pub struct MigrationPlan {
     pub registry_backup_verified: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub registry_backup_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub registry_backup_sha256: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub registry_backup_schema_version: Option<u32>,
     pub managed_soul_count: u64,
     pub legacy_metadata_count: u64,
     pub projected_cpu_milli: u64,

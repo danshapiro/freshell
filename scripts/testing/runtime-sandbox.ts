@@ -120,15 +120,15 @@ export class RuntimeHarness {
   async prepare(): Promise<void> {
     fs.rmSync(this.testRoot, { recursive: true, force: true })
     fs.mkdirSync(this.testRoot, { recursive: true, mode: 0o700 })
-    fs.mkdirSync(this.evidenceDir, { recursive: true })
-    fs.mkdirSync(this.incidentsDir, { recursive: true })
-    fs.mkdirSync(this.browserDir, { recursive: true })
+    ensurePrivateDirectory(this.evidenceDir)
+    ensurePrivateDirectory(this.incidentsDir)
+    ensurePrivateDirectory(this.browserDir)
     if (this.phase === 1) {
-      fs.writeFileSync(path.join(this.browserDir, 'not-applicable.json'), JSON.stringify({ reason: 'Phase 1 has no browser surface; the live gate exercises the supervisor/runtime IPC directly.' }, null, 2))
+      writePrivateJson(path.join(this.browserDir, 'not-applicable.json'), { reason: 'Phase 1 has no browser surface; the live gate exercises the supervisor/runtime IPC directly.' })
     }
 
     const sourceManifest = JSON.parse(fs.readFileSync(path.join(this.repoRoot, 'test/runtime/gate-manifest.json'), 'utf8'))
-    fs.writeFileSync(path.join(this.evidenceDir, 'manifest.json'), JSON.stringify({ ...sourceManifest, execution: { candidateSha: this.candidateSha, runId: this.runId, startedAt: new Date().toISOString() } }, null, 2))
+    writePrivateJson(path.join(this.evidenceDir, 'manifest.json'), { ...sourceManifest, execution: { candidateSha: this.candidateSha, runId: this.runId, startedAt: new Date().toISOString() } })
     const providerResults = this.phase === 1
       ? { phase: 'phase-1', externalProviders: 'not-applicable', fixtures: ['heartbeat', 'descendant_spawner', 'cpu_burner', 'memory_allocator', 'native_session', 'security_probe'] }
       : this.phase === 2
@@ -160,7 +160,7 @@ export class RuntimeHarness {
                 chaos: 'pending-live-gate',
                 migrationRollback: 'pending-live-gate',
               }
-    fs.writeFileSync(path.join(this.evidenceDir, 'provider-results.json'), JSON.stringify(providerResults, null, 2))
+    writePrivateJson(path.join(this.evidenceDir, 'provider-results.json'), providerResults)
 
     this.recordLifecycle('gate.prepare.started', { repoRoot: this.repoRoot, candidateSha: this.candidateSha, runId: this.runId })
     this.ensureRuntimeImage()
@@ -183,9 +183,9 @@ export class RuntimeHarness {
     await this.broker.start()
     this.brokerStarted = true
 
-    fs.writeFileSync(path.join(this.evidenceDir, 'ownership-before.json'), JSON.stringify({ brokerReceipts: [], trackedContainers: [] }, null, 2))
-    fs.writeFileSync(path.join(this.evidenceDir, 'capabilities.json'), JSON.stringify(this.collectCapabilities(), null, 2))
-    fs.writeFileSync(path.join(this.evidenceDir, 'build.json'), JSON.stringify(this.collectBuildInfo(), null, 2))
+    writePrivateJson(path.join(this.evidenceDir, 'ownership-before.json'), { brokerReceipts: [], trackedContainers: [] })
+    writePrivateJson(path.join(this.evidenceDir, 'capabilities.json'), this.collectCapabilities())
+    writePrivateJson(path.join(this.evidenceDir, 'build.json'), this.collectBuildInfo())
     this.recordLifecycle('gate.prepare.completed', { imageRef: this.imageRef, brokerSocket: proxySocketPath })
   }
 
@@ -231,9 +231,9 @@ export class RuntimeHarness {
       unsafeBrokerAttempts: this.broker?.unsafeAttempts?.() ?? [],
       completedAt: new Date().toISOString(),
     }
-    fs.mkdirSync(this.evidenceDir, { recursive: true })
-    fs.writeFileSync(path.join(this.evidenceDir, 'cleanup.json'), JSON.stringify(cleanup, null, 2))
-    fs.writeFileSync(path.join(this.evidenceDir, 'ownership-after.json'), JSON.stringify({ brokerReceipts: this.broker?.receipts?.() ?? [], brokerEvents: this.broker?.eventsSnapshot?.() ?? [] }, null, 2))
+    ensurePrivateDirectory(this.evidenceDir)
+    writePrivateJson(path.join(this.evidenceDir, 'cleanup.json'), cleanup)
+    writePrivateJson(path.join(this.evidenceDir, 'ownership-after.json'), { brokerReceipts: this.broker?.receipts?.() ?? [], brokerEvents: this.broker?.eventsSnapshot?.() ?? [] })
     this.collectScenarioLifecycleLogs()
     return { ok: cleanup.ok, errors }
   }
@@ -251,30 +251,30 @@ export class RuntimeHarness {
         supervisor: fileBuild(this.validateRunBuildBinary(record.supervisorBinary, 'qualification supervisor')),
       },
     }
-    fs.writeFileSync(buildPath, JSON.stringify({ ...build, qualificationBuild }, null, 2))
+    writePrivateJson(buildPath, { ...build, qualificationBuild })
   }
 
   assert(caseId: string, condition: unknown, message: string, evidence?: unknown): asserts condition {
     const record: AssertionRecord = { at: new Date().toISOString(), caseId, pass: Boolean(condition), message, ...(evidence === undefined ? {} : { evidence }) }
     this.assertions.push(record)
-    fs.appendFileSync(this.assertionsPath, `${JSON.stringify(record)}\n`)
+    appendPrivateLine(this.assertionsPath, record)
     if (!condition) throw new RuntimeGateAssertionError(caseId, message, evidence)
   }
 
   recordLifecycle(event: string, data: unknown = {}): void {
-    fs.mkdirSync(path.dirname(this.lifecyclePath), { recursive: true })
-    fs.appendFileSync(this.lifecyclePath, `${JSON.stringify({ at: new Date().toISOString(), event, data })}\n`)
+    ensurePrivateDirectory(path.dirname(this.lifecyclePath))
+    appendPrivateLine(this.lifecyclePath, { at: new Date().toISOString(), event, data })
   }
 
   writeIncident(name: string, value: unknown): void {
-    fs.mkdirSync(this.incidentsDir, { recursive: true })
-    fs.writeFileSync(path.join(this.incidentsDir, `${sanitizeName(name)}.json`), JSON.stringify(value, null, 2))
+    ensurePrivateDirectory(this.incidentsDir)
+    writePrivateJson(path.join(this.incidentsDir, `${sanitizeName(name)}.json`), value)
   }
 
   writeBrowserArtifact(name: string, value: unknown): string {
-    fs.mkdirSync(this.browserDir, { recursive: true })
+    ensurePrivateDirectory(this.browserDir)
     const target = path.join(this.browserDir, `${sanitizeName(name)}.json`)
-    fs.writeFileSync(target, JSON.stringify(value, null, 2))
+    writePrivateJson(target, value)
     return target
   }
 
@@ -282,17 +282,17 @@ export class RuntimeHarness {
   /// artifacts a run must contain; this is how a case contributes one.
   writeArtifact(fileName: string, value: unknown): string {
     const target = path.join(this.evidenceDir, sanitizeName(fileName))
-    fs.mkdirSync(path.dirname(target), { recursive: true })
-    fs.writeFileSync(target, JSON.stringify(value, null, 2))
+    ensurePrivateDirectory(path.dirname(target))
+    writePrivateJson(target, value)
     return target
   }
 
   writeProviderResults(value: unknown): void {
-    fs.writeFileSync(path.join(this.evidenceDir, 'provider-results.json'), JSON.stringify(value, null, 2))
+    writePrivateJson(path.join(this.evidenceDir, 'provider-results.json'), value)
   }
 
   writeSummary(summary: unknown): void {
-    fs.writeFileSync(path.join(this.evidenceDir, 'summary.json'), JSON.stringify(summary, null, 2))
+    writePrivateJson(path.join(this.evidenceDir, 'summary.json'), summary)
   }
 
   scenarioPath(scenarioId: string): string {
@@ -763,6 +763,23 @@ export class RuntimeHarness {
     if (result.status !== 0) throw new Error(result.stderr || `docker stop failed for tracked container ${containerId}`)
   }
 
+  killTrackedContainerExact(containerId: string): void {
+    if (!this.trackedContainers.has(containerId)) throw new Error(`refusing to kill untracked container ${containerId}`)
+    if (!this.isContainerRunning(containerId)) return
+    const result = spawnSync('docker', ['kill', containerId], { encoding: 'utf8' })
+    if (result.status !== 0) throw new Error(result.stderr || `docker kill failed for tracked container ${containerId}`)
+  }
+
+  ownedContainerHostPidExact(containerId: string): number {
+    if (!this.trackedContainers.has(containerId) && !this.broker.receiptIds().has(containerId)) {
+      throw new Error(`refusing to inspect host PID for unowned container ${containerId}`)
+    }
+    const raw = docker(['inspect', '--format', '{{.State.Pid}}', containerId]).trim()
+    const pid = Number(raw)
+    if (!Number.isSafeInteger(pid) || pid <= 1) throw new Error(`owned container ${containerId} has invalid host PID ${raw}`)
+    return pid
+  }
+
   restartOwnedRuntimeExact(containerId: string): void {
     if (!this.broker.receiptIds().has(containerId)) throw new Error(`refusing to restart non-receipt container ${containerId}`)
     const result = spawnSync('docker', ['restart', '-t', '1', containerId], { encoding: 'utf8' })
@@ -1037,7 +1054,7 @@ export class RuntimeHarness {
       const log = path.join(runtimeNamespace, scenario, 'evidence', 'lifecycle.jsonl')
       if (!fs.existsSync(log)) continue
       for (const line of fs.readFileSync(log, 'utf8').split('\n').filter(Boolean)) {
-        fs.appendFileSync(this.lifecyclePath, `${JSON.stringify({ at: new Date().toISOString(), event: 'supervisor.lifecycle', data: { scenario, raw: JSON.parse(line) } })}\n`)
+        appendPrivateLine(this.lifecyclePath, { at: new Date().toISOString(), event: 'supervisor.lifecycle', data: { scenario, raw: JSON.parse(line) } })
       }
     }
   }
@@ -1146,6 +1163,23 @@ function fileBuild(filePath: string): unknown {
 
 function sanitizeName(value: string): string {
   return value.replace(/[^a-zA-Z0-9_.-]/g, '-').slice(0, 120)
+}
+
+function ensurePrivateDirectory(dir: string): void {
+  fs.mkdirSync(dir, { recursive: true, mode: 0o700 })
+  fs.chmodSync(dir, 0o700)
+}
+
+function writePrivateJson(filePath: string, value: unknown): void {
+  ensurePrivateDirectory(path.dirname(filePath))
+  fs.writeFileSync(filePath, JSON.stringify(value, null, 2), { mode: 0o600 })
+  fs.chmodSync(filePath, 0o600)
+}
+
+function appendPrivateLine(filePath: string, value: unknown): void {
+  ensurePrivateDirectory(path.dirname(filePath))
+  fs.appendFileSync(filePath, `${JSON.stringify(value)}\n`, { mode: 0o600 })
+  fs.chmodSync(filePath, 0o600)
 }
 
 function sleep(ms: number): Promise<void> {

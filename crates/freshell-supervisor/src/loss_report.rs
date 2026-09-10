@@ -268,6 +268,11 @@ pub fn hash_native_session_reference(
     format!("sha256:{:x}", hasher.finalize())
 }
 
+pub fn hash_loss_certificate(certificate: &LostDecisionCertificate) -> String {
+    let encoded = serde_json::to_vec(certificate).expect("loss certificate is serializable");
+    format!("{:x}", Sha256::digest(encoded))
+}
+
 #[derive(Clone)]
 pub struct IncidentExporter {
     root: PathBuf,
@@ -315,7 +320,11 @@ impl IncidentExporter {
         atomic_write_redacted_json(&target, value, &self.process_secret)?;
         if closed {
             let open = self.root.join(format!("{incident_id}.open.json"));
-            let _ = fs::remove_file(open);
+            match fs::remove_file(open) {
+                Ok(()) => std::fs::File::open(&self.root)?.sync_all()?,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error),
+            }
         }
         self.enforce_retention()?;
         Ok(target)
@@ -390,10 +399,13 @@ impl Registry {
         let certificate = decision.into_certificate();
         self.run_blocking(move |mut conn| {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            if let Some((existing_json, incarnation_raw, committed_revision)) = tx
+            if let Some((existing_json, incarnation_raw, committed_revision, desired, recovery, current_incident)) = tx
                 .query_row(
                     "SELECT certificate_json,incarnation_id, \
-                     (SELECT intent_revision FROM souls WHERE soul_id=loss_incidents.soul_id) \
+                     (SELECT intent_revision FROM souls WHERE soul_id=loss_incidents.soul_id), \
+                     (SELECT desired_state FROM souls WHERE soul_id=loss_incidents.soul_id), \
+                     (SELECT recovery_state FROM souls WHERE soul_id=loss_incidents.soul_id), \
+                     (SELECT loss_incident_id FROM souls WHERE soul_id=loss_incidents.soul_id) \
                      FROM loss_incidents WHERE soul_id=?1 AND intent_revision=?2",
                     params![certificate.soul_id.as_str(), certificate.intent_revision],
                     |row| {
@@ -401,6 +413,9 @@ impl Registry {
                             row.get::<_, String>(0)?,
                             row.get::<_, String>(1)?,
                             row.get::<_, u64>(2)?,
+                            row.get::<_, String>(3)?,
+                            row.get::<_, String>(4)?,
+                            row.get::<_, Option<String>>(5)?,
                         ))
                     },
                 )
@@ -409,6 +424,20 @@ impl Registry {
                 let existing: LostDecisionCertificate = serde_json::from_str(&existing_json)?;
                 if existing != certificate {
                     return Err(RegistryError::RequestConflict);
+                }
+                let expected_committed_revision = certificate
+                    .intent_revision
+                    .checked_add(1)
+                    .ok_or_else(|| RegistryError::Integrity("intent revision overflow".into()))?;
+                if committed_revision != expected_committed_revision
+                    || desired != "stopped"
+                    || recovery != "lost"
+                    || current_incident.as_deref() != Some(certificate.incident_id.as_str())
+                {
+                    return Err(RegistryError::StaleIntentRevision {
+                        expected: expected_committed_revision,
+                        current: committed_revision,
+                    });
                 }
                 let incarnation_id = freshell_runtime_protocol::IncarnationId::parse(incarnation_raw)
                     .map_err(|_| RegistryError::Integrity("invalid loss incarnation id".into()))?;
@@ -603,23 +632,26 @@ impl Registry {
     ) -> Result<RuntimeNotice, RegistryError> {
         self.run_blocking(move |mut conn| {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            let (soul_id, incarnation_id, current_state, certificate_json): (
+            let (soul_id, incarnation_id, current_state, certificate_json, persisted_cleanup_json): (
+                String,
                 String,
                 String,
                 String,
                 String,
             ) = tx
                 .query_row(
-                    "SELECT soul_id,incarnation_id,cleanup_state,certificate_json FROM loss_incidents WHERE incident_id=?1",
+                    "SELECT soul_id,incarnation_id,cleanup_state,certificate_json,cleanup_json FROM loss_incidents WHERE incident_id=?1",
                     params![incident_id.as_str()],
-                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
                 )
                 .optional()?
                 .ok_or_else(|| {
                     RegistryError::IncidentNotFound(incident_id.clone())
                 })?;
+            let certificate: LostDecisionCertificate = serde_json::from_str(&certificate_json)?;
             if current_state == "closed" {
-                let kind = if cleanup.graceful_attempt == "not_required" {
+                let persisted_cleanup: LossCleanupReport = serde_json::from_str(&persisted_cleanup_json)?;
+                let kind = if persisted_cleanup.graceful_attempt == "not_required" {
                     NoticeKind::EndedWithoutProcess
                 } else {
                     NoticeKind::CleanupSucceeded
@@ -628,14 +660,50 @@ impl Registry {
                     &tx,
                     kind,
                     std::slice::from_ref(&incident_id),
-                    cleanup.foreign_objects_touched,
+                    persisted_cleanup.foreign_objects_touched,
                     crate::registry::now_millis(),
                 )?;
                 tx.commit()?;
                 return Ok(notice);
             }
+            if cleanup.owned_handle_ref != certificate.cleanup_target.owned_handle_ref
+                || cleanup.foreign_objects_touched != 0
+            {
+                return Err(RegistryError::InvalidState(
+                    "loss cleanup result does not match the exact certified ownership handle".into(),
+                ));
+            }
+            let expected_revision = certificate
+                .intent_revision
+                .checked_add(1)
+                .ok_or_else(|| RegistryError::Integrity("intent revision overflow".into()))?;
+            let (desired_state, current_revision, recovery_state, current_incident): (
+                String,
+                u64,
+                String,
+                Option<String>,
+            ) = tx.query_row(
+                "SELECT desired_state,intent_revision,recovery_state,loss_incident_id FROM souls WHERE soul_id=?1",
+                params![soul_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )?;
+            if desired_state != "stopped"
+                || current_revision != expected_revision
+                || recovery_state != "lost"
+                || current_incident.as_deref() != Some(incident_id.as_str())
+            {
+                return Err(RegistryError::StaleIntentRevision {
+                    expected: expected_revision,
+                    current: current_revision,
+                });
+            }
             let now = crate::registry::now_millis();
             let verified = outcome == StopOutcome::VerifiedEmpty && cleanup.verified_empty;
+            if verified && !cleanup.ownership_verified {
+                return Err(RegistryError::InvalidState(
+                    "verified-empty cleanup lacks exact ownership verification".into(),
+                ));
+            }
             let (incident_state, launch_state, cleanup_state, notice_kind) = if verified {
                 (
                     "closed",
@@ -658,21 +726,31 @@ impl Registry {
                     NoticeKind::CleanupFailed,
                 )
             };
-            tx.execute(
+            let incident_changed = tx.execute(
                 "UPDATE loss_incidents SET cleanup_state=?1,cleanup_json=?2,updated_at=?3,closed_at=?4 \
-                 WHERE incident_id=?5",
+                 WHERE incident_id=?5 AND cleanup_state=?6",
                 params![
                     incident_state,
                     serde_json::to_string(&cleanup)?,
                     now,
                     verified.then_some(now),
-                    incident_id.as_str()
+                    incident_id.as_str(),
+                    current_state,
                 ],
             )?;
-            tx.execute(
-                "UPDATE incarnations SET launch_state=?1,cleanup_state=?2,updated_at=?3 WHERE incarnation_id=?4",
-                params![launch_state, cleanup_state, now, incarnation_id],
+            if incident_changed != 1 {
+                return Err(RegistryError::RequestConflict);
+            }
+            let incarnation_changed = tx.execute(
+                "UPDATE incarnations SET launch_state=?1,cleanup_state=?2,updated_at=?3 \
+                 WHERE incarnation_id=?4 AND soul_id=?5",
+                params![launch_state, cleanup_state, now, incarnation_id, soul_id],
             )?;
+            if incarnation_changed != 1 {
+                return Err(RegistryError::InvalidState(
+                    "loss cleanup incarnation no longer belongs to the certified soul".into(),
+                ));
+            }
             if verified {
                 tx.execute(
                     "DELETE FROM writer_claims WHERE incarnation_id=?1",
@@ -692,16 +770,24 @@ impl Registry {
                     params![now, incarnation_id],
                 )?;
             }
-            tx.execute(
+            let soul_changed = tx.execute(
                 "UPDATE souls SET recovery_state='lost',recovery_reason=?1,recovery_attempt_id=NULL, \
-                 loss_incident_id=?2,updated_at=?3 WHERE soul_id=?4",
+                 loss_incident_id=?2,updated_at=?3 WHERE soul_id=?4 AND intent_revision=?5 \
+                 AND desired_state='stopped' AND recovery_state='lost' AND loss_incident_id=?2",
                 params![
                     format!("LOSS_CERTIFIED:{incident_id}"),
                     incident_id.as_str(),
                     now,
-                    soul_id
+                    soul_id,
+                    expected_revision,
                 ],
             )?;
+            if soul_changed != 1 {
+                return Err(RegistryError::StaleIntentRevision {
+                    expected: expected_revision,
+                    current: current_revision,
+                });
+            }
             let notice = enqueue_notice_in_tx(
                 &tx,
                 notice_kind,
@@ -732,11 +818,12 @@ impl Registry {
                     }
                 }
             }
-            let certificate: LostDecisionCertificate = serde_json::from_str(&certificate_json)?;
+            let certificate_sha256 = hash_loss_certificate(&certificate);
             let summary = serde_json::json!({
                 "incidentId": incident_id,
                 "event": "soul.loss.finalized",
                 "certificate": certificate,
+                "certificateSha256": certificate_sha256,
                 "cleanupState": incident_state,
                 "cleanup": cleanup,
                 "noticeId": notice.notice_id,
@@ -850,154 +937,5 @@ fn loss_decision_state_name(state: LossDecisionState) -> &'static str {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::{
-        admission::AdmissionPolicy,
-        registry::LaunchPreparation,
-        service::{Supervisor, SupervisorConfig},
-    };
-    use freshell_runtime_protocol::{
-        AllocationState, DockerDaemonId, DurabilityState, FixtureKind, IncarnationId, LaunchNonce,
-        RecoveryBlockReason, RuntimeLimits, RuntimeProfile, SoulId,
-    };
-
-    fn evidence() -> Vec<RecoveryPathEvidence> {
-        vec![
-            RecoveryPathEvidence {
-                path: RecoveryPath::Reattach,
-                verdict: RecoveryEvidenceVerdict::DefinitiveNegative,
-                reason_code: "runtime_absent".into(),
-                evidence_refs: vec!["backend://missing".into()],
-                store_state: EvidenceStoreState::NotApplicable,
-            },
-            RecoveryPathEvidence {
-                path: RecoveryPath::NativeResume,
-                verdict: RecoveryEvidenceVerdict::DefinitiveNegative,
-                reason_code: "provider_store_missing".into(),
-                evidence_refs: vec!["provider://missing".into()],
-                store_state: EvidenceStoreState::Missing,
-            },
-            RecoveryPathEvidence {
-                path: RecoveryPath::CheckpointRestore,
-                verdict: RecoveryEvidenceVerdict::DefinitiveNegative,
-                reason_code: "checkpoint_missing".into(),
-                evidence_refs: vec!["checkpointRevision=0".into()],
-                store_state: EvidenceStoreState::Missing,
-            },
-            RecoveryPathEvidence {
-                path: RecoveryPath::PristineSeed,
-                verdict: RecoveryEvidenceVerdict::DefinitiveNegative,
-                reason_code: "input_was_dispatched".into(),
-                evidence_refs: vec!["commandJournal.dispatched>0".into()],
-                store_state: EvidenceStoreState::NotApplicable,
-            },
-        ]
-    }
-
-    #[test]
-    fn unknown_or_unreadable_path_can_never_construct_loss() {
-        let mut rows = evidence();
-        rows[1].store_state = EvidenceStoreState::PresentUnreadable;
-        assert!(matches!(
-            validate_path_inventory(
-                &[
-                    RecoveryPath::Reattach,
-                    RecoveryPath::NativeResume,
-                    RecoveryPath::CheckpointRestore,
-                    RecoveryPath::PristineSeed,
-                ],
-                &rows,
-            ),
-            Err(LossDecisionError::UnknownPathEvidence("native_resume"))
-        ));
-        rows[1].store_state = EvidenceStoreState::Unknown;
-        assert!(validate_path_inventory(
-            &[
-                RecoveryPath::Reattach,
-                RecoveryPath::NativeResume,
-                RecoveryPath::CheckpointRestore,
-                RecoveryPath::PristineSeed,
-            ],
-            &rows,
-        )
-        .is_err());
-    }
-
-    #[test]
-    fn missing_or_duplicate_manifest_path_can_never_construct_loss() {
-        let mut rows = evidence();
-        rows.pop();
-        assert_eq!(
-            validate_path_inventory(
-                &[
-                    RecoveryPath::Reattach,
-                    RecoveryPath::NativeResume,
-                    RecoveryPath::CheckpointRestore,
-                    RecoveryPath::PristineSeed,
-                ],
-                &rows,
-            ),
-            Err(LossDecisionError::IncompletePathInventory)
-        );
-        rows.push(rows[0].clone());
-        assert_eq!(
-            validate_path_inventory(
-                &[
-                    RecoveryPath::Reattach,
-                    RecoveryPath::NativeResume,
-                    RecoveryPath::CheckpointRestore,
-                    RecoveryPath::PristineSeed,
-                ],
-                &rows,
-            ),
-            Err(LossDecisionError::IncompletePathInventory)
-        );
-    }
-
-    #[test]
-    fn incident_export_redacts_and_never_evicts_open_reports() {
-        let dir = tempfile::tempdir().unwrap();
-        let exporter = IncidentExporter::new(dir.path(), "top-secret-native-id");
-        let open = dir.path().join("incident-open.open.json");
-        fs::write(&open, b"open").unwrap();
-        let old = dir.path().join("incident-old.closed.json");
-        fs::write(&old, vec![b'x'; 8]).unwrap();
-        exporter
-            .export_summary(
-                &IncidentId::parse("incident-new").unwrap(),
-                true,
-                &serde_json::json!({
-                    "token": "top-secret-native-id",
-                    "safe": "retained"
-                }),
-            )
-            .unwrap();
-        assert!(open.exists());
-        let content = fs::read_to_string(dir.path().join("incident-new.closed.json")).unwrap();
-        assert!(!content.contains("top-secret-native-id"));
-        assert!(content.contains("retained"));
-    }
-
-    // Keep these imports exercised so the test module fails if the registry
-    // ownership capability ceases to remain private/non-forgeable.
-    #[test]
-    fn ownership_capability_types_remain_in_supervisor_crate() {
-        let _ = std::any::TypeId::of::<OwnedRuntimeHandle>();
-        let _ = std::any::TypeId::of::<RecoveryContext>();
-        let _ = std::any::TypeId::of::<LaunchPreparation>();
-        let _ = std::any::TypeId::of::<Supervisor>();
-        let _ = std::any::TypeId::of::<SupervisorConfig>();
-        let _ = std::any::TypeId::of::<AdmissionPolicy>();
-        let _ = std::any::TypeId::of::<RuntimeLimits>();
-        let _ = std::any::TypeId::of::<RuntimeProfile>();
-        let _ = std::any::TypeId::of::<FixtureKind>();
-        let _ = std::any::TypeId::of::<SoulId>();
-        let _ = std::any::TypeId::of::<IncarnationId>();
-        let _ = std::any::TypeId::of::<LaunchNonce>();
-        let _ = std::any::TypeId::of::<DockerDaemonId>();
-        let _ = std::any::TypeId::of::<AllocationState>();
-        let _ = std::any::TypeId::of::<DurabilityState>();
-        let _ = std::any::TypeId::of::<RecoveryBlockReason>();
-    }
-}
+#[path = "loss_report_tests.rs"]
+mod tests;
