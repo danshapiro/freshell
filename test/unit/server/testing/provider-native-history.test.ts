@@ -1,3 +1,4 @@
+import { execFileSync } from 'node:child_process'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
@@ -10,6 +11,7 @@ import { readClaudeNativeHistory } from '../../../e2e-browser/helpers/provider-n
 import { readCodexNativeHistory } from '../../../e2e-browser/helpers/provider-native-history/codex.js'
 import { readOpenCodeNativeHistory } from '../../../e2e-browser/helpers/provider-native-history/opencode.js'
 import { nativeTurnProof } from '../../../e2e-browser/helpers/provider-native-history/proof.js'
+import { OPENCODE_NATIVE_HISTORY_SCRIPT } from '../../../e2e-browser/helpers/opencode-native-history.js'
 
 const roots: string[] = []
 
@@ -212,6 +214,22 @@ describe('OpenCode native history proof', () => {
       toolCalls: [], resolvedProvider: 'opencode', resolvedModel: 'big-pickle',
       resolvedReasoningEffort: 'provider-default',
     })])
+    const inEnclosure = JSON.parse(execFileSync(
+      process.execPath,
+      ['--no-warnings', '-e', OPENCODE_NATIVE_HISTORY_SCRIPT, dbPath, 'ses_exact'],
+      { encoding: 'utf8' },
+    ))
+    expect(inEnclosure).toMatchObject({
+      schemaVersion: 1,
+      provider: 'opencode',
+      nativeSessionId: 'ses_exact',
+      turns: [expect.objectContaining({
+        messageId: 'msg-1',
+        text: '00112233445566778899aabbccddeeff',
+        resolvedProvider: 'opencode',
+        resolvedModel: 'big-pickle',
+      })],
+    })
   })
 
   it('fails closed for a symlinked database and an absent exact session row', () => {

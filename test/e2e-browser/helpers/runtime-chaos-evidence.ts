@@ -3,7 +3,7 @@ import fs from 'node:fs'
 import path from 'node:path'
 
 import type { ManagedRuntimeBrowserRig, ManagedRuntimeView } from './managed-runtime.js'
-import { OPENCODE_NATIVE_HISTORY_SCRIPT, type NativeAssistantTurn } from './opencode-native-history.js'
+import { OPENCODE_NATIVE_HISTORY_SCRIPT, type NativeHistory } from './opencode-native-history.js'
 
 const OPENCODE_TOOL_EVIDENCE_SCRIPT = String.raw`
 const fs = require('node:fs');
@@ -130,10 +130,14 @@ export function nativeFollowUpMessageIds(
   const result = JSON.parse(rig.ownedProviderExec(containerId, [
     'node', '--no-warnings', '-e', OPENCODE_NATIVE_HISTORY_SCRIPT,
     '/home/freshell/provider/.local/share/opencode/opencode.db', nativeSessionId,
-  ])) as { available: boolean; turns: NativeAssistantTurn[] }
-  return result.available
-    ? result.turns.filter((turn) => turn.text.includes(marker)).map((turn) => turn.messageId)
-    : []
+  ])) as NativeHistory
+  if (result.provider !== 'opencode' || result.nativeSessionId !== nativeSessionId) {
+    throw new Error('native follow-up probe returned a conflicting OpenCode identity')
+  }
+  return result.turns
+    .filter((turn) => turn.text.includes(marker))
+    .map((turn) => turn.messageId)
+    .filter((messageId): messageId is string => typeof messageId === 'string' && messageId.length > 0)
 }
 
 export function structuredChaosLog(
