@@ -101,9 +101,11 @@ async fn run() -> Result<(), String> {
         Some("serve") => serve(&args[2..]).await,
         Some("worker") => worker(&args[2..]).await,
         Some("fixture-child") => fixture_child(&args[2..]).await,
+        #[cfg(feature = "fresh-agent-fixtures")]
+        Some("fresh-agent-fixture-worker") => providers::run_fresh_agent_fixture_worker(&args[2..]).await,
         Some("opencode-identity-worker") => pty::run_opencode_identity_worker(&args[2..]),
         Some("provider-probe-worker") => providers::run_probe_worker(&args[2..]),
-        _ => Err("usage: freshell-session-host <serve|worker|fixture-child|opencode-identity-worker|provider-probe-worker> ...".into()),
+        _ => Err("usage: freshell-session-host <serve|worker|fixture-child|fresh-agent-fixture-worker|opencode-identity-worker|provider-probe-worker> ...".into()),
     }
 }
 
@@ -2192,6 +2194,7 @@ mod tests {
             },
             mode: "opencode".into(),
             runtime_variant: "managed_terminal_pty".into(),
+            fixture_transport: None,
             program: launcher.to_string_lossy().into_owned(),
             resume_argv: vec!["--continue".into(), "--model".into(), "free-model".into()],
             provider_home: "/home/freshell/provider".into(),
