@@ -878,6 +878,10 @@ pub struct FreshAgentForked {
     pub session_type: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub request_id: Option<String>,
+    /// Managed runtimes set this only after the same soul has retired the old
+    /// provider session. Legacy servers omit it, preserving legacy cleanup.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_retired_by_runtime: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub session_ref: Option<SessionLocator>,
 }

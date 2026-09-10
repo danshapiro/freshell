@@ -2013,13 +2013,13 @@ export function FreshAgentView({
       }
       if (
         message.type === 'freshAgent.forked'
-        && message.requestId === paneContent.createRequestId
+        && (message.parentRetiredByRuntime === true || message.requestId === paneContent.createRequestId)
         && message.parentSessionId === paneContent.sessionId
         && message.sessionType === paneContent.sessionType
         && message.provider === paneContent.provider
         && typeof message.sessionId === 'string'
       ) {
-        if (message.sessionId !== paneContent.sessionId) {
+        if (message.sessionId !== paneContent.sessionId && message.parentRetiredByRuntime !== true) {
           const cwd = getFreshOpenCodeRouteCwd(paneContent, { sessionCwd: agentSession?.cwd })
           sendFreshAgentMessage({
             type: 'freshAgent.kill',

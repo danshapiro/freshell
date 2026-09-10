@@ -245,6 +245,49 @@ describe('managed runtime recovery merge', () => {
     expect(content.initialCwd).toBe('/workspace/real')
   })
 
+  it('rekeys an offline fresh-agent view to the supervisor current native branch after provider fork', () => {
+    const state = baseState()
+    state.tabs.tabs[0].mode = 'freshcodex'
+    state.panes.layouts['user-tab'].content = {
+      kind: 'fresh-agent',
+      createRequestId: 'view-create-parent',
+      status: 'connected',
+      sessionType: 'freshcodex',
+      provider: 'codex',
+      sessionId: 'native-parent',
+      resumeSessionId: 'native-parent',
+      sessionRef: { provider: 'codex', sessionId: 'native-parent' },
+      soulId: 'soul-one',
+      viewIntentId: 'view-one',
+      incarnationId: 'incarnation-one',
+    }
+    const forked = soul({
+      provider: 'codex',
+      nativeSessionId: 'native-child',
+      terminalId: undefined,
+      terminalStreamId: undefined,
+      terminalMode: undefined,
+      terminalCwd: undefined,
+      terminalCreateRequestId: undefined,
+      terminalResumeSessionId: undefined,
+      freshAgentSessionId: 'native-child',
+      freshAgentSessionType: 'freshcodex',
+      freshAgentRuntimeVariant: 'codex-app-server',
+    })
+    const plan = buildManagedRuntimeMergePlan(snapshot([forked]), state)
+    expect(plan.creates).toHaveLength(0)
+    expect(plan.updates).toHaveLength(1)
+    expect(plan.updates[0].content).toMatchObject({
+      kind: 'fresh-agent',
+      createRequestId: 'view-create-parent',
+      sessionId: 'native-child',
+      resumeSessionId: 'native-child',
+      sessionRef: { provider: 'codex', sessionId: 'native-child' },
+      soulId: 'soul-one',
+      viewIntentId: 'view-one',
+    })
+  })
+
   it('does not adopt an unrelated pane that merely lacks a terminal id', () => {
     const state = baseState()
     state.panes.layouts['user-tab'].content = {

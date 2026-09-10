@@ -533,3 +533,201 @@ async fn every_fresh_provider_materializes_native_identity_through_the_host_even
         .unwrap();
     }
 }
+
+struct ForkingTransport {
+    forks: AtomicUsize,
+}
+
+#[async_trait]
+impl FreshAgentTransport for ForkingTransport {
+    async fn start(&self, profile: &FreshAgentProfile) -> Result<TransportStart, String> {
+        Ok(TransportStart {
+            native_session_id: profile.native_session_id.clone(),
+        })
+    }
+    async fn dispatch(
+        &self,
+        _: &RequestId,
+        _: &str,
+        _: &FreshAgentProfile,
+    ) -> Result<DispatchAck, DispatchFailure> {
+        unreachable!("fork fixture does not dispatch text")
+    }
+    async fn fork(
+        &self,
+        _request_id: &RequestId,
+        parent_session_id: &str,
+        input: Option<Value>,
+    ) -> Result<ForkTransition, DispatchFailure> {
+        self.forks.fetch_add(1, Ordering::SeqCst);
+        assert_eq!(parent_session_id, "native-parent");
+        assert_eq!(input, Some(serde_json::json!({"atTurnId":"turn-7"})));
+        Ok(ForkTransition {
+            parent_session_id: parent_session_id.into(),
+            child_session_id: "native-child".into(),
+            parent_retired_by_runtime: true,
+        })
+    }
+    async fn resolve_permission(&self, _: &str, _: Value) -> Result<(), DispatchFailure> {
+        Ok(())
+    }
+    async fn interrupt(&self) -> Result<(), String> {
+        Ok(())
+    }
+    async fn stop(self: Arc<Self>) -> Result<(), String> {
+        Ok(())
+    }
+    fn take_event_stream(&self) -> Option<tokio::sync::mpsc::Receiver<AgentEvent>> {
+        None
+    }
+}
+
+#[tokio::test]
+async fn provider_native_fork_transitions_the_same_actor_without_a_second_writer() {
+    let dir = tempfile::tempdir().unwrap();
+    let transport = Arc::new(ForkingTransport {
+        forks: AtomicUsize::new(0),
+    });
+    let actor = FreshAgentHostActor::open(
+        dir.path(),
+        profile(FreshProvider::Codex, "same-store", Some("native-parent")),
+        transport.clone(),
+    )
+    .await
+    .unwrap();
+    let request = RequestId::parse("fork-same-soul-1").unwrap();
+    let input = Some(serde_json::json!({"atTurnId":"turn-7"}));
+    let transition = actor
+        .fork(request.clone(), "native-parent".into(), input.clone())
+        .await
+        .unwrap();
+    assert_eq!(transition.child_session_id, "native-child");
+    assert!(transition.parent_retired_by_runtime);
+    assert_eq!(
+        actor.profile().await.native_session_id.as_deref(),
+        Some("native-child")
+    );
+    assert_eq!(transport.forks.load(Ordering::SeqCst), 1);
+
+    // Lost reply/reconnect reuses durable completion and never calls provider fork twice.
+    assert_eq!(
+        actor
+            .fork(request.clone(), "native-child".into(), input.clone())
+            .await
+            .unwrap(),
+        transition,
+        "same request must replay the original parent-to-child transition after registry state has advanced",
+    );
+    assert_eq!(transport.forks.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        actor
+            .fork(
+                request,
+                "native-child".into(),
+                Some(serde_json::json!({"atTurnId":"different"}))
+            )
+            .await,
+        Err(ActorError::RequestConflict),
+    );
+}
+
+struct HangingForkTransport {
+    forks: AtomicUsize,
+    entered: tokio::sync::Notify,
+}
+
+#[async_trait]
+impl FreshAgentTransport for HangingForkTransport {
+    async fn start(&self, profile: &FreshAgentProfile) -> Result<TransportStart, String> {
+        Ok(TransportStart {
+            native_session_id: profile.native_session_id.clone(),
+        })
+    }
+    async fn dispatch(
+        &self,
+        _: &RequestId,
+        _: &str,
+        _: &FreshAgentProfile,
+    ) -> Result<DispatchAck, DispatchFailure> {
+        unreachable!("fork crash fixture does not dispatch text")
+    }
+    async fn fork(
+        &self,
+        _: &RequestId,
+        _: &str,
+        _: Option<Value>,
+    ) -> Result<ForkTransition, DispatchFailure> {
+        self.forks.fetch_add(1, Ordering::SeqCst);
+        self.entered.notify_one();
+        std::future::pending::<Result<ForkTransition, DispatchFailure>>().await
+    }
+    async fn resolve_permission(&self, _: &str, _: Value) -> Result<(), DispatchFailure> {
+        Ok(())
+    }
+    async fn interrupt(&self) -> Result<(), String> {
+        Ok(())
+    }
+    async fn stop(self: Arc<Self>) -> Result<(), String> {
+        Ok(())
+    }
+    fn take_event_stream(&self) -> Option<tokio::sync::mpsc::Receiver<AgentEvent>> {
+        None
+    }
+}
+
+#[tokio::test]
+async fn interrupted_provider_fork_is_ambiguous_after_reopen_and_is_never_replayed() {
+    let dir = tempfile::tempdir().unwrap();
+    let first_transport = Arc::new(HangingForkTransport {
+        forks: AtomicUsize::new(0),
+        entered: tokio::sync::Notify::new(),
+    });
+    let actor = FreshAgentHostActor::open(
+        dir.path(),
+        profile(FreshProvider::Codex, "same-store", Some("native-parent")),
+        first_transport.clone(),
+    )
+    .await
+    .unwrap();
+    let request = RequestId::parse("fork-crash-window-1").unwrap();
+    let spawned = {
+        let actor = actor.clone();
+        let request = request.clone();
+        tokio::spawn(async move { actor.fork(request, "native-parent".into(), None).await })
+    };
+    tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        first_transport.entered.notified(),
+    )
+    .await
+    .expect("fork reached provider acceptance window");
+    spawned.abort();
+    let _ = spawned.await;
+    assert_eq!(first_transport.forks.load(Ordering::SeqCst), 1);
+    drop(actor);
+    drop(first_transport);
+
+    let retry_transport = Arc::new(ForkingTransport {
+        forks: AtomicUsize::new(0),
+    });
+    let reopened = FreshAgentHostActor::open(
+        dir.path(),
+        profile(FreshProvider::Codex, "same-store", Some("native-parent")),
+        retry_transport.clone(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        reopened.fork(request, "native-parent".into(), None).await,
+        Err(ActorError::AmbiguousDispatch),
+    );
+    assert_eq!(
+        retry_transport.forks.load(Ordering::SeqCst),
+        0,
+        "an uncertain provider-native fork is never auto-replayed after host loss",
+    );
+    assert_eq!(
+        reopened.profile().await.native_session_id.as_deref(),
+        Some("native-parent")
+    );
+}

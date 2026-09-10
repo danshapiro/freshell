@@ -8,8 +8,8 @@ use freshell_freshagent::hosted_rest::{
     HostedRestSendResult,
 };
 use freshell_protocol::{
-    AgentProvider, FreshAgentCreateFailed, FreshAgentCreated, FreshAgentEvent, FreshAgentKilled,
-    ServerMessage, SessionLocator, SessionType, StringOrNumber,
+    AgentProvider, FreshAgentCreateFailed, FreshAgentCreated, FreshAgentEvent, FreshAgentForked,
+    FreshAgentKilled, ServerMessage, SessionLocator, SessionType, StringOrNumber,
 };
 use freshell_runtime_client::RuntimeClient;
 use freshell_runtime_protocol::{
@@ -37,6 +37,7 @@ pub(crate) struct HostedFreshAgentProxy {
     client: RuntimeClient,
     broadcast: Arc<broadcast::Sender<String>>,
     aliases: Mutex<HashMap<(String, String), SoulId>>,
+    presentation_ids: Mutex<HashMap<SoulId, String>>,
     pollers: Mutex<HashSet<SoulId>>,
 }
 
@@ -55,6 +56,7 @@ impl HostedFreshAgentProxy {
             client,
             broadcast,
             aliases: Mutex::new(HashMap::new()),
+            presentation_ids: Mutex::new(HashMap::new()),
             pollers: Mutex::new(HashSet::new()),
         })))
     }
@@ -189,12 +191,67 @@ impl HostedFreshAgentProxy {
                 message.session_type,
                 "managed fresh-agent compact is not available",
             ),
-            HostedFreshAgentCommand::Fork(message) => self.error_event(
-                &message.provider,
-                &message.session_id,
-                message.session_type,
-                "managed fresh-agent fork is not available",
-            ),
+            HostedFreshAgentCommand::Fork(message) => {
+                let provider = message.provider.clone();
+                let session_id = message.session_id.clone();
+                let session_type = message.session_type;
+                let request_id = message
+                    .request_id
+                    .as_deref()
+                    .and_then(|value| RequestId::parse(value.to_string()).ok())
+                    .unwrap_or_else(RequestId::new);
+                let result = match self.resolve_soul(&provider, &session_id).await {
+                    Some(soul) => self
+                        .client
+                        .fresh_agent_fork(
+                            request_id,
+                            soul.clone(),
+                            session_id.clone(),
+                            message.input,
+                        )
+                        .await
+                        .map(|transition| (soul, transition)),
+                    None => Err(freshell_runtime_client::ClientError::UnexpectedResult),
+                };
+                match result {
+                    Ok((soul, transition)) => {
+                        let provider_name = provider_wire(&provider);
+                        {
+                            let mut aliases = self.aliases.lock().await;
+                            aliases.retain(|(mapped_provider, _), mapped_soul| {
+                                mapped_provider != &provider_name || mapped_soul != &soul
+                            });
+                            aliases.insert(
+                                (provider_name.clone(), transition.child_session_id.clone()),
+                                soul.clone(),
+                            );
+                        }
+                        self.presentation_ids
+                            .lock()
+                            .await
+                            .insert(soul, transition.child_session_id.clone());
+                        self.send(ServerMessage::FreshAgentForked(FreshAgentForked {
+                            request_id: message.request_id,
+                            parent_session_id: transition.parent_session_id,
+                            session_id: transition.child_session_id.clone(),
+                            session_type: session_type_wire(session_type),
+                            provider: provider_wire(&provider),
+                            runtime_provider: provider_wire(&provider),
+                            parent_retired_by_runtime: Some(transition.parent_retired_by_runtime),
+                            session_ref: Some(SessionLocator {
+                                provider: provider_wire(&provider),
+                                session_id: transition.child_session_id,
+                            }),
+                        }));
+                    }
+                    Err(_) => self.error_event(
+                        &provider,
+                        &session_id,
+                        session_type,
+                        "managed provider-native fork failed without creating another soul",
+                    ),
+                }
+            }
             HostedFreshAgentCommand::Undo(message) => self.error_event(
                 &message.provider,
                 &message.session_id,
@@ -419,6 +476,11 @@ impl HostedFreshAgentProxy {
         presentation_session_id: String,
         session_type: String,
     ) -> bool {
+        self.presentation_ids
+            .lock()
+            .await
+            .entry(soul.clone())
+            .or_insert_with(|| presentation_session_id.clone());
         if !self.pollers.lock().await.insert(soul.clone()) {
             return false;
         }
@@ -445,10 +507,21 @@ impl HostedFreshAgentProxy {
                         }
                         for event in batch.events {
                             cursor = cursor.max(event.sequence);
+                            // Provider-native identity is nested provider state. The public
+                            // routing alias changes only through an explicit same-soul fork
+                            // transition or durable inventory reconciliation, never merely
+                            // because initial startup observed a native ID.
+                            let current_presentation = proxy
+                                .presentation_ids
+                                .lock()
+                                .await
+                                .get(&soul)
+                                .cloned()
+                                .unwrap_or_else(|| presentation_session_id.clone());
                             proxy.forward_host_event(
                                 event.event,
                                 &provider,
-                                &presentation_session_id,
+                                &current_presentation,
                                 &session_type,
                             );
                         }
@@ -470,6 +543,7 @@ impl HostedFreshAgentProxy {
                 tokio::time::sleep(Duration::from_millis(50)).await;
             }
             proxy.pollers.lock().await.remove(&soul);
+            proxy.presentation_ids.lock().await.remove(&soul);
         });
         true
     }

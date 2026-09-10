@@ -84,6 +84,17 @@ pub struct DispatchFailure {
     pub acceptance_ambiguous: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ForkTransition {
+    pub parent_session_id: String,
+    pub child_session_id: String,
+    /// True only after the provider-owned parent writer/session has been
+    /// retired inside this same soul. This lets the web avoid translating a
+    /// provider-native branch operation into a destructive whole-soul stop.
+    pub parent_retired_by_runtime: bool,
+}
+
 #[async_trait]
 pub trait FreshAgentTransport: Send + Sync {
     async fn start(&self, profile: &FreshAgentProfile) -> Result<TransportStart, String>;
@@ -98,6 +109,19 @@ pub trait FreshAgentTransport: Send + Sync {
         decision_id: &str,
         decision: Value,
     ) -> Result<(), DispatchFailure>;
+    /// Branch the provider-native conversation inside this owned soul. Providers
+    /// without a native fork surface return a deterministic unsupported error.
+    async fn fork(
+        &self,
+        _request_id: &RequestId,
+        _parent_session_id: &str,
+        _input: Option<Value>,
+    ) -> Result<ForkTransition, DispatchFailure> {
+        Err(DispatchFailure {
+            message: "provider-native conversation fork is unsupported".into(),
+            acceptance_ambiguous: false,
+        })
+    }
     async fn interrupt(&self) -> Result<(), String>;
     /// Whether this actor still owns a usable provider enclosure. Provider
     /// adapters may self-heal a child internally; they should report false
@@ -162,6 +186,8 @@ struct PersistedActorState {
     schema_version: u32,
     profile: FreshAgentProfile,
     commands: BTreeMap<String, PersistedCommand>,
+    #[serde(default)]
+    completed_forks: BTreeMap<String, ForkTransition>,
     decisions: BTreeMap<String, PersistedDecision>,
     events: VecDeque<JournalEvent>,
     event_bytes: usize,
@@ -175,6 +201,7 @@ impl PersistedActorState {
             schema_version: 1,
             profile,
             commands: BTreeMap::new(),
+            completed_forks: BTreeMap::new(),
             decisions: BTreeMap::new(),
             events: VecDeque::new(),
             event_bytes: 0,
@@ -455,6 +482,129 @@ impl FreshAgentHostActor {
                     self.event_byte_cap,
                     self.event_count_cap,
                 )?;
+                write_state(&self.state_dir, &state)?;
+                if failure.acceptance_ambiguous {
+                    Err(ActorError::AmbiguousDispatch)
+                } else {
+                    Err(ActorError::Transport(failure.message))
+                }
+            }
+        }
+    }
+
+    pub async fn fork(
+        &self,
+        request_id: RequestId,
+        parent_session_id: String,
+        input: Option<Value>,
+    ) -> Result<ForkTransition, ActorError> {
+        let _dispatch_guard = self.dispatch_lock.lock().await;
+        let command_material =
+            serde_json::to_vec(&("provider_native_fork", &input)).map_err(persist)?;
+        let payload_digest = digest(&command_material);
+        {
+            let mut state = self.state.lock().await;
+            if let Some(existing) = state.commands.get(request_id.as_str()) {
+                if existing.payload_digest != payload_digest {
+                    return Err(ActorError::RequestConflict);
+                }
+                return match existing.state {
+                    CommandState::Completed | CommandState::ProviderAcked => state
+                        .completed_forks
+                        .get(request_id.as_str())
+                        .cloned()
+                        .ok_or_else(|| {
+                            ActorError::Persistence(
+                                "completed fork is missing its durable transition".into(),
+                            )
+                        }),
+                    CommandState::Ambiguous | CommandState::Dispatching | CommandState::Queued => {
+                        Err(ActorError::AmbiguousDispatch)
+                    }
+                    _ => Err(ActorError::Transport(
+                        "provider-native fork was previously rejected".into(),
+                    )),
+                };
+            }
+            if state.profile.native_session_id.as_deref() != Some(parent_session_id.as_str()) {
+                return Err(ActorError::NativeIdentityMismatch);
+            }
+            state.commands.insert(
+                request_id.as_str().to_string(),
+                PersistedCommand {
+                    payload_digest,
+                    state: CommandState::Dispatching,
+                    provider_ack_id: None,
+                },
+            );
+            // The input contains only provider branch position/settings, not a
+            // prompt. It is still persisted under the protected command lane so
+            // a lost acknowledgement cannot issue a second native fork.
+            write_protected_payload(
+                &self.state_dir,
+                &request_id,
+                serde_json::to_vec(&(parent_session_id.as_str(), &input))
+                    .map_err(persist)?
+                    .as_slice(),
+            )?;
+            write_state(&self.state_dir, &state)?;
+        }
+
+        let result = self
+            .transport
+            .fork(&request_id, &parent_session_id, input)
+            .await;
+        let mut state = self.state.lock().await;
+        match result {
+            Ok(transition) => {
+                if transition.parent_session_id != parent_session_id
+                    || transition.child_session_id.is_empty()
+                    || transition.child_session_id == parent_session_id
+                    || transition.child_session_id.chars().any(char::is_control)
+                    || !transition.parent_retired_by_runtime
+                {
+                    if let Some(command) = state.commands.get_mut(request_id.as_str()) {
+                        command.state = CommandState::Ambiguous;
+                    }
+                    write_state(&self.state_dir, &state)?;
+                    return Err(ActorError::AmbiguousDispatch);
+                }
+                state.profile.native_session_id = Some(transition.child_session_id.clone());
+                if let Some(command) = state.commands.get_mut(request_id.as_str()) {
+                    command.provider_ack_id = Some(transition.child_session_id.clone());
+                    command.state = CommandState::Completed;
+                }
+                state
+                    .completed_forks
+                    .insert(request_id.as_str().to_string(), transition.clone());
+                push_event_bounded(
+                    &mut state,
+                    AgentEvent::Started {
+                        native_session_id: transition.child_session_id.clone(),
+                    },
+                    self.event_byte_cap,
+                    self.event_count_cap,
+                )?;
+                push_event_bounded(
+                    &mut state,
+                    AgentEvent::CommandOutcome {
+                        request_id,
+                        state: CommandState::Completed,
+                    },
+                    self.event_byte_cap,
+                    self.event_count_cap,
+                )?;
+                write_state(&self.state_dir, &state)?;
+                Ok(transition)
+            }
+            Err(failure) => {
+                if let Some(command) = state.commands.get_mut(request_id.as_str()) {
+                    command.state = if failure.acceptance_ambiguous {
+                        CommandState::Ambiguous
+                    } else {
+                        CommandState::Cancelled
+                    };
+                }
                 write_state(&self.state_dir, &state)?;
                 if failure.acceptance_ambiguous {
                     Err(ActorError::AmbiguousDispatch)

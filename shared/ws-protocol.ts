@@ -1526,7 +1526,7 @@ export type FreshAgentServerMessage =
   | { type: 'freshAgent.send.accepted'; requestId: string; sessionId: string; sessionType: string; provider: string; submittedTurnId?: string; cwd?: string }
   | { type: 'freshAgent.event'; sessionId: string; sessionType: string; provider: string; event: unknown }
   | { type: 'freshAgent.session.materialized'; previousSessionId: string; sessionId: string; sessionType: string; provider: string; sessionRef?: { provider: string; sessionId: string } }
-  | { type: 'freshAgent.forked'; requestId?: string; parentSessionId: string; sessionId: string; sessionType: string; provider: string; runtimeProvider: string; sessionRef?: { provider: string; sessionId: string } }
+  | { type: 'freshAgent.forked'; requestId?: string; parentSessionId: string; sessionId: string; sessionType: string; provider: string; runtimeProvider: string; parentRetiredByRuntime?: boolean; sessionRef?: { provider: string; sessionId: string } }
   | { type: 'freshAgent.killed'; sessionId: string; sessionType: string; provider: string; success: boolean }
 
 // -- Extensions --

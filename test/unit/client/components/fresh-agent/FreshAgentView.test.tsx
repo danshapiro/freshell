@@ -5652,6 +5652,60 @@ describe('FreshAgentView', () => {
     })
   })
 
+  it('does not stop the containing soul when the managed runtime already retired the fork parent', async () => {
+    const store = createStore()
+    let onMessage: ((message: Record<string, unknown>) => void) | undefined
+    wsMock.onMessage.mockImplementation((handler) => { onMessage = handler; return () => {} })
+    store.dispatch(initLayout({
+      tabId: 'tab-1', paneId: 'pane-1', content: {
+        kind: 'fresh-agent', sessionType: 'freshcodex', provider: 'codex',
+        createRequestId: 'managed-fork-request', sessionId: 'thread-parent', status: 'idle',
+      },
+    }))
+    render(<Provider store={store}><StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" /></Provider>)
+    await waitFor(() => expect(onMessage).toBeTypeOf('function'))
+    wsMock.send.mockClear()
+    act(() => onMessage?.({
+      type: 'freshAgent.forked', requestId: 'managed-fork-request',
+      parentSessionId: 'thread-parent', sessionId: 'thread-child',
+      sessionType: 'freshcodex', provider: 'codex', runtimeProvider: 'codex',
+      parentRetiredByRuntime: true,
+    }))
+    await waitFor(() => {
+      const layout = store.getState().panes.layouts['tab-1']
+      if (layout?.type !== 'leaf' || layout.content.kind !== 'fresh-agent') throw new Error('expected fresh-agent pane')
+      expect(layout.content.sessionId).toBe('thread-child')
+    })
+    expect(wsMock.send).not.toHaveBeenCalledWith(expect.objectContaining({ type: 'freshAgent.kill' }))
+  })
+
+  it('follows a managed same-soul fork even when another view issued the request', async () => {
+    const store = createStore()
+    let onMessage: ((message: Record<string, unknown>) => void) | undefined
+    wsMock.onMessage.mockImplementation((handler) => { onMessage = handler; return () => {} })
+    store.dispatch(initLayout({
+      tabId: 'tab-1', paneId: 'pane-1', content: {
+        kind: 'fresh-agent', sessionType: 'freshcodex', provider: 'codex',
+        createRequestId: 'this-view-request', sessionId: 'thread-parent', status: 'idle',
+      },
+    }))
+    render(<Provider store={store}><StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" /></Provider>)
+    await waitFor(() => expect(onMessage).toBeTypeOf('function'))
+    wsMock.send.mockClear()
+    act(() => onMessage?.({
+      type: 'freshAgent.forked', requestId: 'other-view-request',
+      parentSessionId: 'thread-parent', sessionId: 'thread-child',
+      sessionType: 'freshcodex', provider: 'codex', runtimeProvider: 'codex',
+      parentRetiredByRuntime: true,
+    }))
+    await waitFor(() => {
+      const layout = store.getState().panes.layouts['tab-1']
+      if (layout?.type !== 'leaf' || layout.content.kind !== 'fresh-agent') throw new Error('expected fresh-agent pane')
+      expect(layout.content.sessionId).toBe('thread-child')
+    })
+    expect(wsMock.send).not.toHaveBeenCalledWith(expect.objectContaining({ type: 'freshAgent.kill' }))
+  })
+
   it('ignores Freshcodex fork responses for a different pane request', async () => {
     const store = createStore()
     let onMessage: ((message: Record<string, unknown>) => void) | undefined
