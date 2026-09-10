@@ -106,12 +106,15 @@ policy rather than relying on a provider default:
 
 For Amplifier, optionally point
 `FRESHELL_MANAGED_AMPLIFIER_ONECLI_KEYS_FILE` at the approved private
-`~/.amplifier/keys.env` (that canonical file is the default), and set the
-credential-free `FRESHELL_MANAGED_AMPLIFIER_ONECLI_ENDPOINT` explicitly. The
-runtime image pins `claude-haiku-4-5-20251001` with `low` reasoning; the native
-`session:config` event must prove both. The keys file is parsed, never sourced,
-and its resolved values exist only in the provider child environment. A raw
-OAuth file, a different reference, or an unapproved profile fails closed.
+`~/.amplifier/keys.env` (that canonical file is the default). No second endpoint
+variable is required: the approved file is the source of truth for the
+LunaRoute upstream and OneCLI proxy transport. The runtime image pins the same
+provider-vllm source used by that setup and `glm-5.3`; the native
+`session:config` event is the provider-effective authority for model/reasoning.
+The keys file is parsed, never sourced; host-local OneCLI control URLs are not
+forwarded into the container, while provider/proxy secret values exist only in
+the child environment. A raw OAuth file, a different reference, malformed
+transport URL, or an unapproved model fails closed.
 
 These values and bootstrap paths make a live campaign reproducible. They do
 not certify or enable Claude, Codex, or Amplifier; the capability manifest
