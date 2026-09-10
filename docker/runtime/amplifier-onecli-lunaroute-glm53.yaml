@@ -1,0 +1,12 @@
+config:
+  providers:
+    - id: lunaroute
+      module: provider-vllm
+      source: file:///opt/amplifier-provider-vllm
+      config:
+        api_key: ${VLLM_API_KEY}
+        base_url: ${VLLM_BASE_URL}
+        default_model: glm-5.3
+        context_window: 131072
+        timeout: 3600
+        priority: 1

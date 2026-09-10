@@ -2981,7 +2981,7 @@ mod tests {
         let workspace = tempfile::tempdir().unwrap();
         let keys = workspace.path().join("keys.env");
         let secret = "amplifier-onecli-secret-never-persist";
-        std::fs::write(&keys, format!("ANTHROPIC_API_KEY={secret}\n")).unwrap();
+        std::fs::write(&keys, format!("LUNAROUTE_API_KEY={secret}\n")).unwrap();
         let keys = std::fs::canonicalize(keys).unwrap();
         let workspace_path = std::fs::canonicalize(workspace.path()).unwrap();
 
@@ -3010,13 +3010,11 @@ mod tests {
             provider_sandbox: None,
             provider_permission_mode: None,
             provider_bootstrap_files: Vec::new(),
-            provider_secret_references: vec![
-                freshell_runtime_protocol::ProviderSecretReference {
-                    source_path: keys.to_string_lossy().into_owned(),
-                    profile: freshell_runtime_protocol::ProviderSecretProfile::AmplifierOnecliAnthropicHaikuLow,
-                    approved_endpoint: "https://onecli.example.invalid/v1".into(),
-                },
-            ],
+            provider_secret_references: vec![freshell_runtime_protocol::ProviderSecretReference {
+                source_path: keys.to_string_lossy().into_owned(),
+                profile:
+                    freshell_runtime_protocol::ProviderSecretProfile::AmplifierOnecliLunarouteGlm53,
+            }],
         });
         registry.prepare_launch(launch).await.unwrap();
 
@@ -3029,7 +3027,8 @@ mod tests {
             )
             .unwrap();
         assert!(terminal_json.contains(&keys.to_string_lossy().to_string()));
-        assert!(terminal_json.contains("onecli.example.invalid"));
+        assert!(terminal_json.contains("amplifier_onecli_lunaroute_glm53"));
+        assert!(!terminal_json.contains("onecli.example.invalid"));
         assert!(!terminal_json.contains(secret));
         drop(conn);
 

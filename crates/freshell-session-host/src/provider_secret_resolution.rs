@@ -12,6 +12,8 @@ const ALLOWED_NAMES: &[&str] = &[
     "GLM_RUNPOD_API_KEY",
     "GLM_RUNPOD_BASE_URL",
     "HTTPS_PROXY",
+    "LUNAROUTE_API_KEY",
+    "LUNAROUTE_BASE_URL",
     "NODE_EXTRA_CA_CERTS",
     "NO_PROXY",
     "ONECLI_GATEWAY",
@@ -23,19 +25,11 @@ const ALLOWED_NAMES: &[&str] = &[
     "https_proxy",
     "no_proxy",
 ];
-const ANTHROPIC_CHILD_NAMES: &[&str] = &[
-    "ANTHROPIC_API_KEY",
-    "ANTHROPIC_BASE_URL",
+const CERTIFICATE_CHILD_NAMES: &[&str] = &[
     "CURL_CA_BUNDLE",
-    "HTTPS_PROXY",
     "NODE_EXTRA_CA_CERTS",
-    "NO_PROXY",
-    "ONECLI_GATEWAY",
-    "ONECLI_URL",
     "REQUESTS_CA_BUNDLE",
     "SSL_CERT_FILE",
-    "https_proxy",
-    "no_proxy",
 ];
 
 pub fn resolve_child_environment(
@@ -58,50 +52,95 @@ pub fn resolve_child_environment(
     }
     let raw = fs::read_to_string(mount)
         .map_err(|error| format!("read Amplifier OneCLI keys reference: {error}"))?;
-    resolve_profile(reference.profile, &reference.approved_endpoint, &raw)
+    resolve_profile(reference.profile, &raw)
 }
 
 fn resolve_profile(
     profile: ProviderSecretProfile,
-    approved_endpoint: &str,
     raw: &str,
 ) -> Result<BTreeMap<String, String>, String> {
     let parsed = parse_keys_env(raw)?;
     match profile {
-        ProviderSecretProfile::AmplifierOnecliAnthropicHaikuLow => {
-            let api_key = required(&parsed, "ANTHROPIC_API_KEY")?;
-            reject_placeholder("ANTHROPIC_API_KEY", api_key)?;
-            required(&parsed, "ONECLI_GATEWAY")?;
-            let endpoint = parsed
-                .get("ONECLI_URL")
-                .or_else(|| parsed.get("ANTHROPIC_BASE_URL"))
-                .map(String::as_str)
-                .ok_or_else(|| {
-                    "Amplifier OneCLI profile requires ONECLI_URL or ANTHROPIC_BASE_URL in keys.env"
-                        .to_string()
-                })?;
-            if endpoint != approved_endpoint {
-                return Err("OneCLI URL does not match the explicitly approved endpoint".into());
-            }
-            if parsed
-                .get("ANTHROPIC_BASE_URL")
-                .is_some_and(|value| value != approved_endpoint)
-            {
+        ProviderSecretProfile::AmplifierOnecliLunarouteGlm53 => {
+            // The approved proxy may replace a provider placeholder key, so
+            // only non-emptiness is required here. The credentialed gateway
+            // URL itself must never retain its operator placeholder.
+            let api_key = required(&parsed, "LUNAROUTE_API_KEY")?;
+            let upstream = required(&parsed, "LUNAROUTE_BASE_URL")?;
+            validate_https_upstream(upstream)?;
+            let gateway = required(&parsed, "ONECLI_GATEWAY")?;
+            if gateway != "1" && !gateway.eq_ignore_ascii_case("enabled") {
                 return Err(
-                    "ANTHROPIC_BASE_URL conflicts with the explicitly approved OneCLI endpoint"
-                        .into(),
+                    "Amplifier OneCLI profile requires ONECLI_GATEWAY to be enabled".into(),
                 );
             }
+            let upper_proxy = parsed.get("HTTPS_PROXY").map(String::as_str);
+            let lower_proxy = parsed.get("https_proxy").map(String::as_str);
+            if matches!((upper_proxy, lower_proxy), (Some(upper), Some(lower)) if upper != lower) {
+                return Err("Amplifier OneCLI HTTPS_PROXY and https_proxy values conflict".into());
+            }
+            let proxy = upper_proxy.or(lower_proxy).ok_or_else(|| {
+                "Amplifier OneCLI profile requires a container-reachable HTTPS proxy".to_string()
+            })?;
+            reject_proxy_placeholder(proxy)?;
+            validate_container_proxy(proxy)?;
+
+            // ONECLI_URL is a host-local control endpoint in the approved
+            // setup. Do not forward it into the container: 127.0.0.1 there is
+            // the soul, not the host gateway. NO_PROXY is also deliberately
+            // omitted so the approved upstream cannot bypass the gateway.
+            // Provider-vllm needs only its upstream/API-key pair plus the
+            // canonical proxy and certificate transport.
             let mut child = BTreeMap::new();
-            for name in ANTHROPIC_CHILD_NAMES {
+            child.insert("VLLM_API_KEY".into(), api_key.to_string());
+            child.insert("VLLM_BASE_URL".into(), upstream.to_string());
+            child.insert("HTTPS_PROXY".into(), proxy.to_string());
+            child.insert("https_proxy".into(), proxy.to_string());
+            for name in CERTIFICATE_CHILD_NAMES {
                 if let Some(value) = parsed.get(*name) {
                     child.insert((*name).to_string(), value.clone());
                 }
             }
-            child.insert("ANTHROPIC_BASE_URL".into(), approved_endpoint.into());
             Ok(child)
         }
+        ProviderSecretProfile::LegacyAmplifierOnecliAnthropicHaikuLow => Err(
+            "legacy Amplifier Anthropic/Haiku secret profile is no longer supported; recreate the managed runtime with the approved OneCLI/LunaRoute profile".into(),
+        ),
     }
+}
+
+fn validate_https_upstream(value: &str) -> Result<(), String> {
+    let url = url::Url::parse(value)
+        .map_err(|_| "LUNAROUTE_BASE_URL must be a valid credential-free HTTPS URL".to_string())?;
+    if url.scheme() != "https"
+        || url.host_str().is_none()
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        return Err("LUNAROUTE_BASE_URL must be a credential-free HTTPS URL".into());
+    }
+    Ok(())
+}
+
+fn validate_container_proxy(value: &str) -> Result<(), String> {
+    let url = url::Url::parse(value)
+        .map_err(|_| "HTTPS_PROXY must be a valid HTTP(S) URL".to_string())?;
+    if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
+        return Err("HTTPS_PROXY must be a valid HTTP(S) URL".into());
+    }
+    let host = url.host_str().unwrap_or_default().to_ascii_lowercase();
+    if host == "localhost" || host == "::1" || host.starts_with("127.") {
+        return Err(
+            "HTTPS_PROXY cannot use container loopback; use the approved OneCLI proxy address reachable from the managed bridge"
+                .into(),
+        );
+    }
+    if url.query().is_some() || url.fragment().is_some() {
+        return Err("HTTPS_PROXY cannot contain query or fragment data".into());
+    }
+    Ok(())
 }
 
 fn parse_keys_env(raw: &str) -> Result<BTreeMap<String, String>, String> {
@@ -134,7 +173,6 @@ fn parse_keys_env(raw: &str) -> Result<BTreeMap<String, String>, String> {
                 "Amplifier keys.env line {line_number} has an empty or oversized value"
             ));
         }
-        reject_placeholder(name, &value)?;
         values.insert(name.to_string(), value);
     }
     Ok(values)
@@ -222,6 +260,17 @@ fn expand_references(
     Ok(out)
 }
 
+fn reject_proxy_placeholder(value: &str) -> Result<(), String> {
+    let lower = value.to_ascii_lowercase();
+    if lower.contains("<agent_token>")
+        || lower.contains("placeholder")
+        || lower.contains("changeme")
+    {
+        return Err("Amplifier OneCLI HTTPS proxy still contains an operator placeholder".into());
+    }
+    Ok(())
+}
+
 fn required<'a>(values: &'a BTreeMap<String, String>, name: &str) -> Result<&'a str, String> {
     values
         .get(name)
@@ -229,51 +278,48 @@ fn required<'a>(values: &'a BTreeMap<String, String>, name: &str) -> Result<&'a 
         .ok_or_else(|| format!("Amplifier OneCLI profile requires {name} in keys.env"))
 }
 
-fn reject_placeholder(name: &str, value: &str) -> Result<(), String> {
-    let lower = value.to_ascii_lowercase();
-    if (value.starts_with('<') && value.ends_with('>'))
-        || lower.contains("placeholder")
-        || lower.contains("changeme")
-    {
-        return Err(format!(
-            "Amplifier OneCLI value {name} is still a placeholder"
-        ));
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn resolves_only_the_selected_profile_environment() {
-        let raw = "ONECLI_GATEWAY=enabled\nONECLI_URL=https://onecli.example/v1\nANTHROPIC_API_KEY='test-secret-not-real'\nOPENAI_API_KEY=must-not-leak\nSSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt\nREQUESTS_CA_BUNDLE=$SSL_CERT_FILE\n";
-        let child = resolve_profile(
-            ProviderSecretProfile::AmplifierOnecliAnthropicHaikuLow,
-            "https://onecli.example/v1",
-            raw,
-        )
-        .unwrap();
+    fn resolves_actual_onecli_lunaroute_profile_to_vllm_child_environment() {
+        let raw = "ONECLI_GATEWAY=1\nONECLI_URL=http://127.0.0.1:10254\nLUNAROUTE_API_KEY='proxy-managed-placeholder'\nLUNAROUTE_BASE_URL=https://lunaroute.example/v1\nHTTPS_PROXY=http://user:credential@192.0.2.10:10255\nNO_PROXY=localhost,127.0.0.1\nSSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt\nREQUESTS_CA_BUNDLE=$SSL_CERT_FILE\n";
+        let child =
+            resolve_profile(ProviderSecretProfile::AmplifierOnecliLunarouteGlm53, raw).unwrap();
         assert_eq!(
-            child.get("ANTHROPIC_API_KEY").unwrap(),
-            "test-secret-not-real"
+            child.get("VLLM_API_KEY").unwrap(),
+            "proxy-managed-placeholder"
+        );
+        assert_eq!(
+            child.get("VLLM_BASE_URL").unwrap(),
+            "https://lunaroute.example/v1"
+        );
+        assert_eq!(
+            child.get("HTTPS_PROXY").unwrap(),
+            "http://user:credential@192.0.2.10:10255"
         );
         assert_eq!(child.get("REQUESTS_CA_BUNDLE"), child.get("SSL_CERT_FILE"));
-        assert!(!child.contains_key("OPENAI_API_KEY"));
+        assert_eq!(child.get("HTTPS_PROXY"), child.get("https_proxy"));
+        assert!(!child.contains_key("LUNAROUTE_API_KEY"));
+        assert!(!child.contains_key("ONECLI_URL"));
+        assert!(!child.contains_key("NO_PROXY"));
+        assert!(!child.contains_key("no_proxy"));
+        assert!(!child.contains_key("ANTHROPIC_API_KEY"));
     }
 
     #[test]
-    fn rejects_shell_syntax_unknown_names_duplicates_and_placeholders() {
+    fn onecli_profile_rejects_shell_syntax_unknown_names_duplicates_and_unreachable_proxy() {
         for raw in [
-            "ONECLI_GATEWAY=enabled\nONECLI_URL=https://onecli.example/v1\nANTHROPIC_API_KEY=$(cat /secret)\n",
-            "ONECLI_GATEWAY=enabled\nONECLI_URL=https://onecli.example/v1\nEVIL=value\nANTHROPIC_API_KEY=key\n",
-            "ONECLI_GATEWAY=enabled\nONECLI_URL=https://onecli.example/v1\nANTHROPIC_API_KEY=one\nANTHROPIC_API_KEY=two\n",
-            "ONECLI_GATEWAY=enabled\nONECLI_URL=https://onecli.example/v1\nANTHROPIC_API_KEY=<AGENT_TOKEN>\n",
+            "ONECLI_GATEWAY=1\nLUNAROUTE_API_KEY=$(cat /secret)\nLUNAROUTE_BASE_URL=https://lunaroute.example/v1\nHTTPS_PROXY=http://user:credential@192.0.2.10:10255\n",
+            "ONECLI_GATEWAY=1\nEVIL=value\nLUNAROUTE_API_KEY=key\nLUNAROUTE_BASE_URL=https://lunaroute.example/v1\nHTTPS_PROXY=http://user:credential@192.0.2.10:10255\n",
+            "ONECLI_GATEWAY=1\nLUNAROUTE_API_KEY=one\nLUNAROUTE_API_KEY=two\nLUNAROUTE_BASE_URL=https://lunaroute.example/v1\nHTTPS_PROXY=http://user:credential@192.0.2.10:10255\n",
+            "ONECLI_GATEWAY=1\nLUNAROUTE_API_KEY=key\nLUNAROUTE_BASE_URL=https://lunaroute.example/v1\nHTTPS_PROXY=http://user:credential@127.0.0.1:10255\n",
+            "ONECLI_GATEWAY=1\nLUNAROUTE_API_KEY=proxy-managed-placeholder\nLUNAROUTE_BASE_URL=https://lunaroute.example/v1\nHTTPS_PROXY=http://<AGENT_TOKEN>@192.0.2.10:10255\n",
+            "ONECLI_GATEWAY=1\nLUNAROUTE_API_KEY=key\nLUNAROUTE_BASE_URL=https://lunaroute.example/v1\nHTTPS_PROXY=http://user:one@192.0.2.10:10255\nhttps_proxy=http://user:two@192.0.2.10:10255\n",
         ] {
             assert!(resolve_profile(
-                ProviderSecretProfile::AmplifierOnecliAnthropicHaikuLow,
-                "https://onecli.example/v1",
+                ProviderSecretProfile::AmplifierOnecliLunarouteGlm53,
                 raw,
             )
             .is_err());
@@ -281,29 +327,35 @@ mod tests {
     }
 
     #[test]
-    fn endpoint_mismatch_and_missing_required_values_are_actionable() {
-        let mismatch = resolve_profile(
-            ProviderSecretProfile::AmplifierOnecliAnthropicHaikuLow,
-            "https://approved.example/v1",
-            "ONECLI_GATEWAY=enabled\nONECLI_URL=https://different.example/v1\nANTHROPIC_API_KEY=key\n",
+    fn onecli_profile_rejects_credentialed_or_non_https_upstream_and_missing_proxy() {
+        for raw in [
+            "ONECLI_GATEWAY=1\nLUNAROUTE_API_KEY=key\nLUNAROUTE_BASE_URL=https://user:secret@lunaroute.example/v1\nHTTPS_PROXY=http://user:credential@192.0.2.10:10255\n",
+            "ONECLI_GATEWAY=1\nLUNAROUTE_API_KEY=key\nLUNAROUTE_BASE_URL=http://lunaroute.example/v1\nHTTPS_PROXY=http://user:credential@192.0.2.10:10255\n",
+            "ONECLI_GATEWAY=1\nLUNAROUTE_API_KEY=key\nLUNAROUTE_BASE_URL=https://lunaroute.example/v1\n",
+        ] {
+            assert!(resolve_profile(
+                ProviderSecretProfile::AmplifierOnecliLunarouteGlm53,
+                raw,
+            )
+            .is_err());
+        }
+    }
+
+    #[test]
+    fn legacy_anthropic_profile_is_readable_but_fails_closed() {
+        let error = resolve_profile(
+            ProviderSecretProfile::LegacyAmplifierOnecliAnthropicHaikuLow,
+            "ANTHROPIC_API_KEY=obsolete\n",
         )
         .unwrap_err();
-        assert!(mismatch.contains("does not match"));
-        let missing = resolve_profile(
-            ProviderSecretProfile::AmplifierOnecliAnthropicHaikuLow,
-            "https://approved.example/v1",
-            "ONECLI_GATEWAY=enabled\nONECLI_URL=https://approved.example/v1\n",
-        )
-        .unwrap_err();
-        assert!(missing.contains("ANTHROPIC_API_KEY"));
+        assert!(error.contains("no longer supported"));
     }
 
     #[test]
     fn serialised_launch_contains_references_but_never_resolved_secret_bytes() {
         let reference = freshell_runtime_protocol::ProviderSecretReference {
             source_path: "/private/keys.env".into(),
-            profile: ProviderSecretProfile::AmplifierOnecliAnthropicHaikuLow,
-            approved_endpoint: "https://onecli.example/v1".into(),
+            profile: ProviderSecretProfile::AmplifierOnecliLunarouteGlm53,
         };
         let json = serde_json::to_string(&reference).unwrap();
         assert!(json.contains("/private/keys.env"));

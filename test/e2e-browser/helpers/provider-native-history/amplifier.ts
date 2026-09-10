@@ -28,14 +28,14 @@ function profileFromEvents(events: Record<string, any>[]): AmplifierProfile {
     if (!Array.isArray(raw.providers)) throw new Error('Amplifier session:config lacks providers schema')
     const matches = raw.providers
       .map((value: unknown) => object(value, 'Amplifier provider config'))
-      .filter((provider: Record<string, any>) => (provider.id ?? provider.instance_id) === 'freshell-onecli-anthropic')
+      .filter((provider: Record<string, any>) => (provider.id ?? provider.instance_id) === 'lunaroute')
     if (matches.length !== 1) throw new Error('Amplifier session:config must contain exactly one approved OneCLI provider')
     const provider = matches[0]
     const config = object(provider.config, 'Amplifier OneCLI provider config')
     profiles.push({
       provider: requiredString(provider.id ?? provider.instance_id, 'Amplifier OneCLI provider id'),
       model: requiredString(config.default_model, 'Amplifier native default model'),
-      effort: requiredString(config.reasoning_effort, 'Amplifier native reasoning effort'),
+      effort: optionalString(config.reasoning ?? config.reasoning_effort) ?? 'provider-default',
     })
   }
   if (profiles.length === 0) throw new Error('Amplifier native events lack session:config profile evidence')

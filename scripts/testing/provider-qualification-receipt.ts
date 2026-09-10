@@ -511,7 +511,7 @@ function validateNativeProfile(provider: string, row: Record<string, any>, proof
     return
   }
   if (provider === 'amplifier') {
-    if (proof.resolvedProvider !== 'freshell-onecli-anthropic' || proof.resolvedModel !== row.model) {
+    if (proof.resolvedProvider !== 'lunaroute' || proof.resolvedModel !== row.model) {
       throw new Error(`${label} does not prove the approved native Amplifier OneCLI profile`)
     }
     return

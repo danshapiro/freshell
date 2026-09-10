@@ -9,8 +9,9 @@ ARG CODEX_VERSION=0.147.0
 ARG OPENCODE_VERSION=1.18.21
 ARG AMPLIFIER_APP_CLI_COMMIT=1873aa980535c99a743b17172e4231833f6c8741
 ARG AMPLIFIER_UV_VERSION=0.8.22
-ARG AMPLIFIER_PROVIDER_ANTHROPIC_COMMIT=4cf78c792dd214233d16b373e824135de5687957
-ARG AMPLIFIER_ANTHROPIC_SDK_VERSION=1.0.0
+ARG AMPLIFIER_PROVIDER_VLLM_COMMIT=e1846e907b0ce90b3e8748346244e548fa0d3241
+ARG AMPLIFIER_OPENAI_SDK_VERSION=2.8.1
+ARG AMPLIFIER_OPENAI_HARMONY_VERSION=0.0.8
 ENV DEBIAN_FRONTEND=noninteractive
 COPY --from=node-source /usr/local/ /usr/local/
 RUN apt-get update \
@@ -26,24 +27,25 @@ RUN apt-get update \
  && git clone --filter=blob:none https://github.com/microsoft/amplifier-app-cli /opt/amplifier-src \
  && git -C /opt/amplifier-src checkout --detach "${AMPLIFIER_APP_CLI_COMMIT}" \
  && /opt/uv/bin/uv sync --locked --no-dev --project /opt/amplifier-src \
- && git clone --filter=blob:none https://github.com/microsoft/amplifier-module-provider-anthropic /opt/amplifier-provider-anthropic \
- && git -C /opt/amplifier-provider-anthropic checkout --detach "${AMPLIFIER_PROVIDER_ANTHROPIC_COMMIT}" \
- && git -C /opt/amplifier-provider-anthropic rev-parse HEAD | grep -Fx "${AMPLIFIER_PROVIDER_ANTHROPIC_COMMIT}" \
- && /opt/uv/bin/uv pip install --python /opt/amplifier-src/.venv/bin/python "anthropic==${AMPLIFIER_ANTHROPIC_SDK_VERSION}" \
- && /opt/uv/bin/uv pip install --python /opt/amplifier-src/.venv/bin/python --no-deps /opt/amplifier-provider-anthropic \
+ && git clone --filter=blob:none https://github.com/microsoft/amplifier-module-provider-vllm /opt/amplifier-provider-vllm \
+ && git -C /opt/amplifier-provider-vllm checkout --detach "${AMPLIFIER_PROVIDER_VLLM_COMMIT}" \
+ && git -C /opt/amplifier-provider-vllm rev-parse HEAD | grep -Fx "${AMPLIFIER_PROVIDER_VLLM_COMMIT}" \
+ && /opt/uv/bin/uv pip install --python /opt/amplifier-src/.venv/bin/python \
+      "openai==${AMPLIFIER_OPENAI_SDK_VERSION}" "openai-harmony==${AMPLIFIER_OPENAI_HARMONY_VERSION}" \
+ && /opt/uv/bin/uv pip install --python /opt/amplifier-src/.venv/bin/python --no-deps /opt/amplifier-provider-vllm \
  && rm -rf /opt/amplifier-src/.git \
- && rm -rf /opt/amplifier-provider-anthropic/.git \
+ && rm -rf /opt/amplifier-provider-vllm/.git \
  && ln -s /opt/amplifier-src/.venv/bin/amplifier /usr/local/bin/amplifier \
  && node --version | grep -Fx 'v22.23.2' \
  && claude --version | grep -F "${CLAUDE_CODE_VERSION}" \
  && codex --version | grep -F "${CODEX_VERSION}" \
  && opencode --version | grep -Fx "${OPENCODE_VERSION}" \
  && /opt/amplifier-src/.venv/bin/python -c 'import importlib.metadata as m; assert m.version("amplifier-app-cli") == "0.1.1"' \
- && /opt/amplifier-src/.venv/bin/python -c 'import importlib.metadata as m; assert m.version("anthropic") == "1.0.0"; assert m.version("amplifier-module-provider-anthropic") == "1.0.0"' \
+ && /opt/amplifier-src/.venv/bin/python -c 'import importlib.metadata as m; assert m.version("openai") == "2.8.1"; assert m.version("openai-harmony") == "0.0.8"; assert m.version("amplifier-module-provider-vllm") == "1.0.0"' \
  && /lib/x86_64-linux-gnu/libc.so.6 | grep -F '2.39'
 
 COPY --chmod=0755 docker/runtime/amplifier-onecli /usr/local/bin/freshell-amplifier-onecli
-COPY --chmod=0644 docker/runtime/amplifier-onecli-haiku-low.yaml /etc/freshell/amplifier-onecli-haiku-low.yaml
+COPY --chmod=0644 docker/runtime/amplifier-onecli-lunaroute-glm53.yaml /etc/freshell/amplifier-onecli-lunaroute-glm53.yaml
 
 # FreshClaude/Kilroy run inside the soul host, so their JS SDK bridge and its
 # pinned dependency must be part of the workload image rather than resolved

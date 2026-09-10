@@ -1,14 +1,14 @@
 #!/bin/sh
 set -eu
 
-profile=/etc/freshell/amplifier-onecli-haiku-low.yaml
+profile=/etc/freshell/amplifier-onecli-lunaroute-glm53.yaml
 home=${AMPLIFIER_HOME:-${HOME}/.amplifier}
 settings=${home}/settings.yaml
 umask 077
 mkdir -p "$home"
 if [ -e "$settings" ]; then
   if ! cmp -s "$profile" "$settings"; then
-    echo "freshell-amplifier-onecli: existing settings do not match the approved Haiku/low profile" >&2
+    echo "freshell-amplifier-onecli: existing settings do not match the approved OneCLI/LunaRoute profile" >&2
     exit 78
   fi
 else
@@ -19,7 +19,6 @@ if [ "${1:-}" = session ] && [ "${2:-}" = resume ]; then
   exec /usr/local/bin/amplifier "$@"
 fi
 exec /usr/local/bin/amplifier run \
-  --provider freshell-onecli-anthropic \
-  --model claude-haiku-4-5-20251001 \
+  --provider lunaroute \
   --mode chat \
   "$@"

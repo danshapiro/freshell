@@ -379,9 +379,6 @@ export class ManagedRuntimeBrowserRig {
     if (selected.length === 0) return {}
     return {
       FRESHELL_MANAGED_PROVIDER_QUALIFICATION: selected.join(','),
-      ...(selected.includes('amplifier')
-        ? { FRESHELL_MANAGED_AMPLIFIER_PROFILE: 'onecli-anthropic-haiku-low' }
-        : {}),
     }
   }
 

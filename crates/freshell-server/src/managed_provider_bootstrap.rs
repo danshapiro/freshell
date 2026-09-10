@@ -2,9 +2,10 @@ use freshell_runtime_protocol::{ProviderSecretProfile, ProviderSecretReference};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
-pub const AMPLIFIER_PROFILE: &str = "onecli-anthropic-haiku-low";
-pub const AMPLIFIER_MODEL: &str = "claude-haiku-4-5-20251001";
-pub const AMPLIFIER_REASONING_EFFORT: &str = "low";
+/// This is the provider-effective model configured by the approved OneCLI
+/// deployment, not a synthetic model selected purely for qualification.
+pub const AMPLIFIER_MODEL: &str = "glm-5.3";
+pub const AMPLIFIER_REASONING_EFFORT: &str = "provider-default";
 pub const AMPLIFIER_PROGRAM: &str = "/usr/local/bin/freshell-amplifier-onecli";
 
 pub fn amplifier_secret_references(
@@ -20,10 +21,6 @@ pub fn amplifier_secret_references(
         .filter(|value| !value.trim().is_empty())
         .map(PathBuf::from)
         .unwrap_or_else(|| approved_keys.clone());
-    let profile = std::env::var("FRESHELL_MANAGED_AMPLIFIER_PROFILE")
-        .map_err(|_| format!("Amplifier qualification requires FRESHELL_MANAGED_AMPLIFIER_PROFILE={AMPLIFIER_PROFILE}"))?;
-    let endpoint = std::env::var("FRESHELL_MANAGED_AMPLIFIER_ONECLI_ENDPOINT")
-        .map_err(|_| "Amplifier qualification requires an explicit non-secret FRESHELL_MANAGED_AMPLIFIER_ONECLI_ENDPOINT".to_string())?;
     let raw_oauth = std::env::var("FRESHELL_MANAGED_AMPLIFIER_OAUTH_FILE")
         .ok()
         .filter(|value| !value.trim().is_empty())
@@ -33,10 +30,8 @@ pub fn amplifier_secret_references(
             fallback.is_file().then_some(fallback)
         });
     validate_amplifier_bootstrap(
-        &profile,
         model,
         effort,
-        &endpoint,
         &configured_keys,
         &approved_keys,
         raw_oauth.as_deref(),
@@ -44,53 +39,52 @@ pub fn amplifier_secret_references(
 }
 
 fn validate_amplifier_bootstrap(
-    profile: &str,
     model: Option<&str>,
     effort: Option<&str>,
-    endpoint: &str,
     configured_keys: &Path,
     approved_keys: &Path,
     raw_oauth: Option<&Path>,
 ) -> Result<Vec<ProviderSecretReference>, String> {
-    if profile != AMPLIFIER_PROFILE {
-        return Err(format!(
-            "unsupported Amplifier profile {profile:?}; qualification allows only {AMPLIFIER_PROFILE}"
-        ));
-    }
     if model != Some(AMPLIFIER_MODEL) || effort != Some(AMPLIFIER_REASONING_EFFORT) {
         return Err(format!(
-            "Amplifier qualification requires model {AMPLIFIER_MODEL} with reasoning effort {AMPLIFIER_REASONING_EFFORT}"
+            "Amplifier OneCLI requires model {AMPLIFIER_MODEL} with native provider-default reasoning"
         ));
-    }
-    let endpoint_tail = endpoint.strip_prefix("https://").unwrap_or_default();
-    let authority = endpoint_tail.split('/').next().unwrap_or_default();
-    if authority.is_empty()
-        || authority.starts_with('.')
-        || authority.ends_with('.')
-        || !authority
-            .chars()
-            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '-' | ':'))
-        || endpoint.chars().any(|ch| matches!(ch, '@' | '#' | '?'))
-        || endpoint
-            .chars()
-            .any(|ch| !ch.is_ascii() || ch.is_whitespace() || ch.is_control())
-    {
-        return Err(
-            "Amplifier OneCLI endpoint must be an explicit credential-free https URL".into(),
-        );
     }
     if raw_oauth.is_some() {
         return Err("Amplifier OneCLI keys.env conflicts with raw OAuth bootstrap; remove the OAuth reference for qualification".into());
     }
-    let approved = std::fs::canonicalize(approved_keys).map_err(|error| {
+    let approved_metadata = std::fs::symlink_metadata(approved_keys).map_err(|error| {
         format!(
             "approved Amplifier OneCLI keys file {} is missing: {error}",
             approved_keys.display()
         )
     })?;
-    let configured = std::fs::canonicalize(configured_keys).map_err(|error| {
+    if !approved_metadata.is_file()
+        || approved_metadata.file_type().is_symlink()
+        || approved_metadata.permissions().mode() & 0o077 != 0
+    {
+        return Err(
+            "approved Amplifier OneCLI keys file must be a private regular file (mode 0600 or stricter), not a symlink".into(),
+        );
+    }
+    let approved = std::fs::canonicalize(approved_keys).map_err(|error| {
+        format!(
+            "approved Amplifier OneCLI keys file {} is unavailable: {error}",
+            approved_keys.display()
+        )
+    })?;
+    let configured_metadata = std::fs::symlink_metadata(configured_keys).map_err(|error| {
         format!(
             "Amplifier OneCLI keys reference {} is missing: {error}",
+            configured_keys.display()
+        )
+    })?;
+    if !configured_metadata.is_file() || configured_metadata.file_type().is_symlink() {
+        return Err("Amplifier OneCLI keys reference must be a regular file, not a symlink".into());
+    }
+    let configured = std::fs::canonicalize(configured_keys).map_err(|error| {
+        format!(
+            "Amplifier OneCLI keys reference {} is unavailable: {error}",
             configured_keys.display()
         )
     })?;
@@ -100,15 +94,14 @@ fn validate_amplifier_bootstrap(
             approved.display()
         ));
     }
-    let metadata = std::fs::metadata(&configured)
-        .map_err(|error| format!("inspect Amplifier OneCLI keys reference: {error}"))?;
-    if !metadata.is_file() || metadata.permissions().mode() & 0o077 != 0 {
-        return Err("Amplifier OneCLI keys reference must be a private regular file (mode 0600 or stricter)".into());
+    if configured_metadata.permissions().mode() & 0o077 != 0 {
+        return Err(
+            "Amplifier OneCLI keys reference must be private (mode 0600 or stricter)".into(),
+        );
     }
     Ok(vec![ProviderSecretReference {
         source_path: configured.to_string_lossy().into_owned(),
-        profile: ProviderSecretProfile::AmplifierOnecliAnthropicHaikuLow,
-        approved_endpoint: endpoint.to_string(),
+        profile: ProviderSecretProfile::AmplifierOnecliLunarouteGlm53,
     }])
 }
 
@@ -119,20 +112,18 @@ mod tests {
 
     fn private_file(root: &Path) -> PathBuf {
         let path = root.join("keys.env");
-        fs::write(&path, "ANTHROPIC_API_KEY=placeholder-for-parser-test\n").unwrap();
+        fs::write(&path, "LUNAROUTE_API_KEY=onecli-managed-by-proxy\n").unwrap();
         fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
         path
     }
 
     #[test]
-    fn accepts_only_the_approved_reference_and_low_cost_profile() {
+    fn accepts_only_the_approved_reference_and_actual_onecli_profile() {
         let root = tempfile::tempdir().unwrap();
         let keys = private_file(root.path());
         let refs = validate_amplifier_bootstrap(
-            AMPLIFIER_PROFILE,
             Some(AMPLIFIER_MODEL),
             Some(AMPLIFIER_REASONING_EFFORT),
-            "https://onecli.example.invalid/v1",
             &keys,
             &keys,
             None,
@@ -140,54 +131,28 @@ mod tests {
         .unwrap();
         assert_eq!(refs.len(), 1);
         assert_eq!(refs[0].source_path, keys.to_string_lossy());
+        assert_eq!(
+            refs[0].profile,
+            ProviderSecretProfile::AmplifierOnecliLunarouteGlm53
+        );
     }
 
     #[test]
-    fn fails_closed_for_expensive_defaults_endpoint_credentials_or_raw_oauth() {
+    fn fails_closed_for_a_different_model_or_raw_oauth_without_inventing_endpoint_configuration() {
         let root = tempfile::tempdir().unwrap();
         let keys = private_file(root.path());
         for result in [
             validate_amplifier_bootstrap(
-                AMPLIFIER_PROFILE,
-                Some("claude-fable-5"),
-                Some("high"),
-                "https://onecli.example/v1",
+                Some("different-model"),
+                Some(AMPLIFIER_REASONING_EFFORT),
                 &keys,
                 &keys,
                 None,
             ),
+            validate_amplifier_bootstrap(Some(AMPLIFIER_MODEL), Some("high"), &keys, &keys, None),
             validate_amplifier_bootstrap(
-                AMPLIFIER_PROFILE,
-                Some(AMPLIFIER_MODEL),
-                Some("max"),
-                "https://onecli.example/v1",
-                &keys,
-                &keys,
-                None,
-            ),
-            validate_amplifier_bootstrap(
-                AMPLIFIER_PROFILE,
                 Some(AMPLIFIER_MODEL),
                 Some(AMPLIFIER_REASONING_EFFORT),
-                "https://token@onecli.example/v1",
-                &keys,
-                &keys,
-                None,
-            ),
-            validate_amplifier_bootstrap(
-                AMPLIFIER_PROFILE,
-                Some(AMPLIFIER_MODEL),
-                Some(AMPLIFIER_REASONING_EFFORT),
-                "https://onecli.example/v1?token=secret",
-                &keys,
-                &keys,
-                None,
-            ),
-            validate_amplifier_bootstrap(
-                AMPLIFIER_PROFILE,
-                Some(AMPLIFIER_MODEL),
-                Some(AMPLIFIER_REASONING_EFFORT),
-                "https://onecli.example/v1",
                 &keys,
                 &keys,
                 Some(Path::new("oauth.json")),
@@ -197,18 +162,36 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn rejects_a_symlink_even_when_it_resolves_to_the_approved_file() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().unwrap();
+        let approved = private_file(root.path());
+        let linked = root.path().join("linked.env");
+        symlink(&approved, &linked).unwrap();
+        let error = validate_amplifier_bootstrap(
+            Some(AMPLIFIER_MODEL),
+            Some(AMPLIFIER_REASONING_EFFORT),
+            &linked,
+            &approved,
+            None,
+        )
+        .unwrap_err();
+        assert!(error.contains("symlink"));
+    }
+
     #[test]
     fn rejects_a_different_or_public_keys_file() {
         let root = tempfile::tempdir().unwrap();
         let approved = private_file(root.path());
         let other = root.path().join("other.env");
-        fs::write(&other, "ANTHROPIC_API_KEY=nope\n").unwrap();
+        fs::write(&other, "LUNAROUTE_API_KEY=other\n").unwrap();
         fs::set_permissions(&other, fs::Permissions::from_mode(0o644)).unwrap();
         let different = validate_amplifier_bootstrap(
-            AMPLIFIER_PROFILE,
             Some(AMPLIFIER_MODEL),
             Some(AMPLIFIER_REASONING_EFFORT),
-            "https://onecli.example/v1",
             &other,
             &approved,
             None,
