@@ -733,7 +733,7 @@ describe('provider qualification receipt v2', () => {
       candidateSha,
       runtimeImage,
     }
-    expect(() => validateProviderQualificationReceipt({
+    expect(validateProviderQualificationReceipt({
       repoRoot,
       candidateSha,
       expectedRuntimeImage: runtimeImage,
