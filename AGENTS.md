@@ -42,6 +42,9 @@ Freshell is a self-hosted, browser-accessible terminal multiplexer and session o
 ## Amplifier Skills Deployment (machine note)
 - Never symlink a git repo (or anything containing `.git`) into `~/.amplifier/skills/`. Amplifier's skill discovery walks that tree, refuses symlinks that resolve outside it, and spams "Skipping symlink that escapes repository boundary" warnings at every launch. Deploy a skill as a plain copy of its `SKILL.md` into `~/.amplifier/skills/<name>/`; keep the canonical skill in its own repo (e.g. `~/code/skill-parallel-development`) and re-copy on update.
 
+## SentinelX Agent (garageserver)
+- The agent maintenance layout, checks, upgrade procedure, and rollback steps are documented in [docs/development/sentinelx-agent.md](docs/development/sentinelx-agent.md).
+
 ## Kata
 - `.kata.toml` is committed project configuration. Always commit it after modifying it.
 
