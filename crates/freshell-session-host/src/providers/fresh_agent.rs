@@ -62,7 +62,7 @@ struct HostedTransport {
 }
 
 pub(crate) async fn open_hosted_fresh_agent(
-    _incarnation_state_dir: &std::path::Path,
+    incarnation_state_dir: &std::path::Path,
     launch: FreshAgentLaunchSpec,
 ) -> Result<Arc<FreshAgentHostActor>, String> {
     let profile = FreshAgentProfile {
@@ -82,17 +82,22 @@ pub(crate) async fn open_hosted_fresh_agent(
             deterministic_transport(&profile, launch.run_as_uid, launch.run_as_gid).await?
         }
     };
-    // This path is on the soul's provider volume, not the incarnation runtime
-    // directory. It therefore preserves the one-writer command and decision
-    // journal across a session-host replacement without sharing state between
-    // souls.
+    // Actor command/decision state is trusted control-plane state. Never put
+    // it under provider-owned HOME: provider code must not be able to mutate
+    // idempotency or permission decisions. The incarnation runtime directory
+    // survives a host-process restart; cross-incarnation recovery is fenced by
+    // the supervisor journal plus exact provider-native state.
     FreshAgentHostActor::open(
-        "/home/freshell/provider/.freshell-host-actor",
+        hosted_actor_state_dir(incarnation_state_dir),
         profile,
         transport,
     )
     .await
     .map_err(|error| error.to_string())
+}
+
+fn hosted_actor_state_dir(incarnation_state_dir: &std::path::Path) -> std::path::PathBuf {
+    incarnation_state_dir.join("fresh-agent")
 }
 
 #[cfg(feature = "fresh-agent-fixtures")]
@@ -1103,6 +1108,14 @@ fn parse_send_outcome(value: &Value) -> Option<(String, bool)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn trusted_actor_state_is_incarnation_scoped_and_outside_provider_home() {
+        let runtime = std::path::Path::new("/run/freshell/incarnation-owned");
+        let actor = hosted_actor_state_dir(runtime);
+        assert_eq!(actor, runtime.join("fresh-agent"));
+        assert!(!actor.starts_with("/home/freshell/provider"));
+    }
 
     #[test]
     fn send_acceptance_parser_is_correlated_and_fail_closed() {

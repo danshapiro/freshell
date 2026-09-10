@@ -857,7 +857,7 @@ async fn grant_execution(
                 launch.permission_mode = resume.permission_mode.clone();
                 launch.cwd = resume.cwd.clone();
             }
-            if !exact_resume {
+            if should_prepare_fresh_agent_provider_home(exact_resume, launch.fixture_transport) {
                 prepare_provider_bootstrap_files(
                     &launch.provider_bootstrap_files,
                     launch.run_as_uid,
@@ -911,6 +911,13 @@ async fn grant_execution(
         fixture_evidence: persisted.fixture_evidence.clone(),
         native_session_id,
     })
+}
+
+fn should_prepare_fresh_agent_provider_home(
+    exact_resume: bool,
+    fixture_transport: Option<freshell_runtime_protocol::FreshAgentFixtureTransport>,
+) -> bool {
+    !exact_resume && fixture_transport.is_none()
 }
 
 fn prepare_provider_state_for_fresh_launch(
@@ -2257,6 +2264,21 @@ mod tests {
         if let Some(mut pty) = launched_pty.take() {
             pty.stop().await;
         }
+    }
+
+    #[test]
+    fn deterministic_fresh_agent_fixture_never_chowns_provider_home() {
+        use freshell_runtime_protocol::FreshAgentFixtureTransport;
+        assert!(!should_prepare_fresh_agent_provider_home(
+            false,
+            Some(FreshAgentFixtureTransport::Deterministic),
+        ));
+        assert!(!should_prepare_fresh_agent_provider_home(
+            true,
+            Some(FreshAgentFixtureTransport::Deterministic),
+        ));
+        assert!(!should_prepare_fresh_agent_provider_home(true, None));
+        assert!(should_prepare_fresh_agent_provider_home(false, None));
     }
 
     #[test]
