@@ -27166,6 +27166,7 @@ pub(crate) mod tests {
         // THE STALE COMPACT: observed generation is the PRE-advance value —
         // typed refusal (SESSION_RESERVED), never a recreation.
         st.handle_compact(FreshAgentCompact {
+            request_id: None,
             provider: freshell_protocol::AgentProvider::Codex,
             session_id: thread_id.clone(),
             session_type: freshell_protocol::SessionType::Freshcodex,
@@ -27370,6 +27371,7 @@ pub(crate) mod tests {
 
         // THE FENCE-LESS COMPACT against the mid-Handoff key: typed refusal.
         st.handle_compact(FreshAgentCompact {
+            request_id: None,
             provider: freshell_protocol::AgentProvider::Codex,
             session_id: thread_id.clone(),
             session_type: freshell_protocol::SessionType::Freshcodex,
@@ -27475,6 +27477,7 @@ pub(crate) mod tests {
         // THE STALE COMPACT: the pre-advance observed pair — typed refusal,
         // never a recreation.
         st.handle_compact(FreshAgentCompact {
+            request_id: None,
             provider: freshell_protocol::AgentProvider::Codex,
             session_id: thread_id.clone(),
             session_type: freshell_protocol::SessionType::Freshcodex,

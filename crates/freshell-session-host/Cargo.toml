@@ -5,6 +5,10 @@ edition.workspace = true
 rust-version.workspace = true
 publish.workspace = true
 
+[features]
+default = []
+fresh-agent-fixtures = []
+
 [dependencies]
 freshell-agent-runtime = { path = "../freshell-agent-runtime" }
 freshell-freshagent = { path = "../freshell-freshagent" }

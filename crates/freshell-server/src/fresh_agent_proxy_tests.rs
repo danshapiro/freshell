@@ -36,6 +36,47 @@ fn stable_ids_are_provider_scoped_and_do_not_contain_input() {
 }
 
 #[test]
+fn kilroy_keeps_claude_public_routing_distinct_from_its_runtime_identity() {
+    assert_eq!(fresh_provider_wire(&FreshProvider::Kilroy), "claude");
+    assert_eq!(FreshProvider::Kilroy.as_str(), "kilroy");
+    assert_eq!(
+        rest_agent_identity("claude", "kilroy"),
+        Ok((AgentProvider::Claude, SessionType::Kilroy))
+    );
+    assert!(resume_identity_matches(
+        DesiredState::Running,
+        Some("kilroy"),
+        Some("kilroy-native"),
+        Some("managed-kilroy-public"),
+        "kilroy",
+        "managed-kilroy-public",
+    ));
+}
+
+#[test]
+fn fixture_mode_selection_is_exact_and_rejects_duplicates() {
+    assert_eq!(
+        parse_fixture_modes("freshclaude,kilroy,freshcodex,freshopencode")
+            .unwrap()
+            .len(),
+        4
+    );
+    for invalid in [
+        "",
+        "all",
+        "claude",
+        "freshclaude, freshcodex",
+        "freshcodex,freshcodex",
+        "freshopencode,",
+    ] {
+        assert!(
+            parse_fixture_modes(invalid).is_err(),
+            "accepted {invalid:?}"
+        );
+    }
+}
+
+#[test]
 fn resume_reuses_only_the_exact_running_soul_identity() {
     assert!(resume_identity_matches(
         DesiredState::Running,
@@ -190,6 +231,7 @@ async fn managed_provider_fork_rekeys_the_same_soul_without_launch_or_stop() {
         )])),
         presentation_ids: Mutex::new(HashMap::from([(soul.clone(), "public-parent".into())])),
         pollers: Mutex::new(HashSet::new()),
+        fixture_modes: HashSet::new(),
     });
     Arc::clone(&proxy)
         .handle(HostedFreshAgentCommand::Fork(FreshAgentFork {
@@ -216,7 +258,11 @@ async fn managed_provider_fork_rekeys_the_same_soul_without_launch_or_stop() {
     assert_eq!(forked.parent_retired_by_runtime, Some(true));
     assert_eq!(
         proxy
-            .resolve_soul(&AgentProvider::Codex, "native-child")
+            .resolve_soul(
+                &AgentProvider::Codex,
+                SessionType::Freshcodex,
+                "native-child"
+            )
             .await,
         Some(soul.clone())
     );

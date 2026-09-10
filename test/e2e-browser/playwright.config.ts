@@ -6,8 +6,9 @@ export const CONTINUITY_SMOKE_SPEC = /continuity-smoke\.spec\.ts$/
 export const MATCH_ALL_TEST_IGNORE = [CONTINUITY_SMOKE_SPEC]
 
 /**
- * These specs require locally installed provider binaries. Cloud selection must
- * never stand in for their receipt; `selector` is the positive local command.
+ * These specs require local provider binaries or a host Docker supervisor.
+ * Cloud selection must never stand in for their receipt; `selector` is the
+ * positive local command.
  */
 export const LOCAL_ONLY_SPECS = [{
   spec: 'mcp-qa-smoke-rust.spec.ts',
@@ -28,6 +29,14 @@ export const LOCAL_ONLY_SPECS = [{
 }, {
   spec: 'runtime-managed-provider-qualification-rust.spec.ts',
   selector: '--project=chromium test/e2e-browser/specs/runtime-managed-provider-qualification-rust.spec.ts',
+  classification: 'local-only-docker-supervisor',
+}, {
+  spec: 'runtime-fresh-agent-fixture-rust.spec.ts',
+  selector: '--project=chromium test/e2e-browser/specs/runtime-fresh-agent-fixture-rust.spec.ts',
+  classification: 'local-only-docker-supervisor',
+}, {
+  spec: 'runtime-fresh-agent-qualification-rust.spec.ts',
+  selector: '--project=chromium test/e2e-browser/specs/runtime-fresh-agent-qualification-rust.spec.ts',
   classification: 'local-only-docker-supervisor',
 }, {
   spec: 'runtime-tabs-rehydrate-rust.spec.ts',

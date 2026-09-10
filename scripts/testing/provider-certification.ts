@@ -51,13 +51,32 @@ export type ProviderRow = {
   qualificationStatus?: string
 }
 
+export type FreshAgentModeRow = {
+  mode: string
+  provider: string
+  runtimeVariant: string
+  hostOwnedImplementation: boolean
+  enabledInReleaseScope: boolean
+  liveQualificationStatus: 'pending_authentic_receipt' | 'certified'
+  certified: boolean
+  pendingApprovalSupported: boolean
+}
+
 export type CapabilityManifest = {
   schemaVersion: number
   providers: ProviderRow[]
-  doorways: Array<{ id: string; providers: string[]; policy: string; identityRule: string }>
+  freshAgentModes: FreshAgentModeRow[]
+  doorways: Array<{
+    id: string
+    providers: string[]
+    policy: string
+    identityRule: string
+    enabledInReleaseScope?: boolean
+  }>
   releaseScope?: {
     managedTerminalProviders?: string[]
     deferredManagedProviders?: string[]
+    disabledFreshAgentModes?: string[]
     [key: string]: unknown
   }
   certification: {
@@ -81,6 +100,67 @@ export type CapabilityManifest = {
     }
   }
   [key: string]: unknown
+}
+
+export function releasedFreshAgentModes(manifest: CapabilityManifest): FreshAgentModeRow[] {
+  return (manifest.freshAgentModes ?? []).filter((row) => row.enabledInReleaseScope)
+}
+
+/**
+ * Fresh-agent implementation and release certification are independent axes.
+ * `passedModes` is the set a release gate is about to record as PASS; feeding
+ * a disabled row is itself a structural failure rather than harmless extra
+ * evidence.
+ */
+export function freshAgentReleaseScopeViolations(
+  manifest: CapabilityManifest,
+  passedModes: readonly string[],
+): string[] {
+  const violations: string[] = []
+  const rows = manifest.freshAgentModes ?? []
+  const expectedModes = ['freshclaude', 'kilroy', 'freshcodex', 'freshopencode']
+  const declaredModes = rows.map((row) => row.mode)
+  if (JSON.stringify(declaredModes) !== JSON.stringify(expectedModes)) {
+    violations.push(`freshAgentModes must declare exactly ${JSON.stringify(expectedModes)}`)
+  }
+  for (const mode of duplicates(declaredModes)) violations.push(`duplicate fresh-agent mode declaration: ${mode}`)
+  const byMode = new Map(rows.map((row) => [row.mode, row]))
+  const anyEnabled = rows.some((row) => row.enabledInReleaseScope)
+  if (manifest.releaseScope?.freshAgentEnabled !== anyEnabled) {
+    violations.push('releaseScope.freshAgentEnabled must exactly match the per-mode release scope')
+  }
+  for (const row of rows) {
+    if (!row.hostOwnedImplementation && row.enabledInReleaseScope) {
+      violations.push(`${row.mode} is released without a host-owned implementation`)
+    }
+    if (row.enabledInReleaseScope
+      && (row.certified !== true || row.liveQualificationStatus !== 'certified')) {
+      violations.push(`${row.mode} is released without a live candidate-bound receipt certification`)
+    }
+    if (!row.enabledInReleaseScope && row.certified === true) {
+      violations.push(`${row.mode} is disabled but carries a certification PASS flag`)
+    }
+    const doorway = manifest.doorways.find((candidate) => candidate.id === `rest-${row.mode}-create`)
+    const expectedPolicy = row.enabledInReleaseScope ? 'managed' : 'blocked'
+    if (!doorway
+      || doorway.providers.length !== 1
+      || doorway.providers[0] !== row.provider
+      || doorway.policy !== expectedPolicy
+      || doorway.enabledInReleaseScope !== row.enabledInReleaseScope) {
+      violations.push(`${row.mode} REST doorway does not exactly match its release scope`)
+    }
+  }
+  for (const mode of duplicates(passedModes)) violations.push(`duplicate fresh-agent PASS row: ${mode}`)
+  for (const mode of passedModes) {
+    const row = byMode.get(mode)
+    if (!row) violations.push(`unknown fresh-agent mode ${mode} was counted as PASS`)
+    else if (!row.enabledInReleaseScope) violations.push(`${mode} is disabled but was accidentally included as PASS`)
+  }
+  const disabled = rows.filter((row) => !row.enabledInReleaseScope).map((row) => row.mode)
+  if (JSON.stringify(manifest.releaseScope?.disabledFreshAgentModes ?? []) !== JSON.stringify(disabled)) {
+    violations.push('releaseScope.disabledFreshAgentModes does not exactly match freshAgentModes status rows')
+  }
+  return violations
 }
 
 export function loadCapabilityManifest(repoRoot: string): CapabilityManifest {
@@ -164,7 +244,7 @@ function duplicates(values: readonly string[]): string[] {
 }
 
 export function capabilityClaimViolations(manifest: CapabilityManifest): string[] {
-  const violations: string[] = []
+  const violations: string[] = [...freshAgentReleaseScopeViolations(manifest, [])]
   const byProvider = new Map(manifest.providers.map((row) => [row.provider, row]))
   for (const provider of duplicates(manifest.providers.map((row) => row.provider))) {
     violations.push(`duplicate provider declaration: ${provider}`)

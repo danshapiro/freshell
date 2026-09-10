@@ -361,6 +361,7 @@ fn sleeper_cli_spec(name: &str) -> freshell_platform::CliCommandSpec {
             "{{sessionId}}".to_string(),
         ]),
         model_args: None,
+        effort_args: None,
         sandbox_args: None,
         permission_mode_args: None,
     }
@@ -7778,6 +7779,7 @@ async fn opencode_handoff_during_compaction_aborts_the_daemon_side_summarize() {
     let before = rig.ownership.observe("opencode", &sid);
     rig.fresh_opencode
         .handle_compact(FreshAgentCompact {
+            request_id: None,
             provider: AgentProvider::Opencode,
             session_id: sid.clone(),
             session_type: SessionType::Freshopencode,
@@ -7855,6 +7857,8 @@ async fn opencode_handoff_stop_aborts_an_in_flight_rest_driven_turn_before_reapi
         "pane-r31".to_string(),
         crate::PaneEntry {
             placeholder_id: "freshopencode-r31".to_string(),
+            provider: "opencode".to_string(),
+            session_type: "freshopencode".to_string(),
             cwd: Some("/tmp".to_string()),
             model: None,
             effort: None,
@@ -7980,6 +7984,8 @@ async fn opencode_handoff_stop_waits_for_a_mid_dispatch_rest_drive_under_the_gat
         "pane-r42".to_string(),
         crate::PaneEntry {
             placeholder_id: "freshopencode-r42".to_string(),
+            provider: "opencode".to_string(),
+            session_type: "freshopencode".to_string(),
             cwd: Some("/tmp".to_string()),
             model: None,
             effort: None,
@@ -8126,6 +8132,8 @@ async fn a_second_rest_drive_settles_the_retained_witness_before_replacing_it() 
         "pane-r43".to_string(),
         crate::PaneEntry {
             placeholder_id: "freshopencode-r43".to_string(),
+            provider: "opencode".to_string(),
+            session_type: "freshopencode".to_string(),
             cwd: Some("/tmp".to_string()),
             model: None,
             effort: None,
@@ -8235,6 +8243,8 @@ async fn an_unconfirmable_retained_witness_refuses_the_replacement_typed() {
         "pane-r43b".to_string(),
         crate::PaneEntry {
             placeholder_id: "freshopencode-r43b".to_string(),
+            provider: "opencode".to_string(),
+            session_type: "freshopencode".to_string(),
             cwd: Some("/tmp".to_string()),
             model: None,
             effort: None,
