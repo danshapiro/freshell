@@ -86,8 +86,9 @@ export class RestrictedDockerBroker {
   }
 
   async start(): Promise<void> {
-    fs.mkdirSync(path.dirname(this.policy.proxySocketPath), { recursive: true })
-    fs.mkdirSync(path.dirname(this.policy.logPath), { recursive: true })
+    fs.mkdirSync(path.dirname(this.policy.proxySocketPath), { recursive: true, mode: 0o700 })
+    fs.mkdirSync(path.dirname(this.policy.logPath), { recursive: true, mode: 0o700 })
+    fs.chmodSync(path.dirname(this.policy.logPath), 0o700)
     fs.rmSync(this.policy.proxySocketPath, { force: true })
     this.server = http.createServer((request, response) => {
       void this.handle(request, response)
@@ -324,7 +325,8 @@ export class RestrictedDockerBroker {
   private record(event: Omit<BrokerEvent, 'at'>): void {
     const full: BrokerEvent = { at: new Date().toISOString(), ...event }
     this.events.push(full)
-    fs.appendFileSync(this.policy.logPath, `${JSON.stringify(full)}\n`)
+    fs.appendFileSync(this.policy.logPath, `${JSON.stringify(full)}\n`, { mode: 0o600 })
+    fs.chmodSync(this.policy.logPath, 0o600)
   }
 }
 

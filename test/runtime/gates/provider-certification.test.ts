@@ -29,6 +29,8 @@ import {
   providerCertificationCaseIds,
 } from '../../../scripts/testing/provider-certification.js'
 import { validateProviderQualificationReceipt } from '../../../scripts/testing/provider-qualification-receipt.js'
+import { readCandidateReceiptSource } from '../../../scripts/testing/runtime-receipt-source.js'
+import { defaultReceiptFileName } from '../../../scripts/testing/runtime-receipts.js'
 import type { RuntimeHarness } from '../../../scripts/testing/runtime-sandbox.js'
 
 export function providerCertificationCaseIdsFor(repoRoot: string): string[] {
@@ -49,7 +51,13 @@ export type ProviderCertificationRunResult = {
 function readProviderReceipt(h: RuntimeHarness, caseId: string): any | null {
   const raw = process.env.FRESHELL_RUNTIME_PHASE5_PROVIDER_RECEIPT
   if (!raw?.trim()) return null
-  const receipt = JSON.parse(raw.trim().startsWith('{') ? raw : fs.readFileSync(raw, 'utf8'))
+  const receipt = readCandidateReceiptSource({
+    repoRoot: h.repoRoot,
+    candidateSha: h.candidateSha,
+    source: raw,
+    expectedFileName: defaultReceiptFileName('FRESHELL_RUNTIME_PHASE5_PROVIDER_RECEIPT'),
+    kind: 'FRESHELL_RUNTIME_PHASE5_PROVIDER_RECEIPT',
+  }).receipt
   h.writeBrowserArtifact(`${caseId}-provider-receipt`, receipt)
   return receipt
 }

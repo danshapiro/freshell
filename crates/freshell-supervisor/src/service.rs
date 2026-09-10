@@ -17,7 +17,10 @@ use sha2::{Digest, Sha256};
 use std::{
     collections::HashMap,
     path::{Path, PathBuf},
-    sync::{Arc, Mutex as StdMutex, OnceLock},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, Mutex as StdMutex, OnceLock,
+    },
     time::{SystemTime, UNIX_EPOCH},
 };
 use tokio::{
@@ -2325,10 +2328,9 @@ mod release_scope_tests {
         assert_eq!(event["data"]["stage"], "deliver_execution_grant");
         assert_eq!(event["data"]["launchState"], "starting");
         assert_eq!(event["data"]["errorCode"], "HOST_UNREACHABLE");
-        assert!(event["data"]["errorMessage"]
-            .as_str()
-            .unwrap()
-            .contains("***REDACTED***"));
+        assert_eq!(event["data"]["errorClass"], "runtime_activation_failed");
+        assert!(event["data"].get("errorMessage").is_none());
+        assert!(!contents.contains("prepare provider bootstrap failed"));
     }
 }
 
@@ -2428,14 +2430,33 @@ fn write_secret_durable(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
 }
 
 static LIFECYCLE_SECRETS: OnceLock<StdMutex<HashMap<PathBuf, String>>> = OnceLock::new();
+static LIFECYCLE_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+static LIFECYCLE_MONOTONIC_NANOS: AtomicU64 = AtomicU64::new(0);
+static LIFECYCLE_STARTED: OnceLock<Instant> = OnceLock::new();
+static LIFECYCLE_WRITE_LOCK: StdMutex<()> = StdMutex::new(());
 
 fn lifecycle_secrets() -> &'static StdMutex<HashMap<PathBuf, String>> {
     LIFECYCLE_SECRETS.get_or_init(|| StdMutex::new(HashMap::new()))
 }
 
 pub(crate) fn append_event(path: &Path, event: &str, data: serde_json::Value) {
+    let _write_guard = LIFECYCLE_WRITE_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let sequence = LIFECYCLE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let sampled_nanos = LIFECYCLE_STARTED
+        .get_or_init(Instant::now)
+        .elapsed()
+        .as_nanos()
+        .min(u128::from(u64::MAX)) as u64;
+    let prior_nanos = LIFECYCLE_MONOTONIC_NANOS.load(Ordering::Relaxed);
+    let monotonic_nanos = sampled_nanos.max(prior_nanos.saturating_add(1));
+    LIFECYCLE_MONOTONIC_NANOS.store(monotonic_nanos, Ordering::Relaxed);
     let line = serde_json::json!({
         "at": now_millis(),
+        "sequence": sequence,
+        "monotonicNanos": monotonic_nanos,
+        "processId": std::process::id(),
         "event": event,
         "data": data,
     });
@@ -2472,7 +2493,7 @@ fn activation_failure_data(
         "launchState": state,
         "stage": stage,
         "errorCode": error.code,
-        "errorMessage": error.message,
+        "errorClass": "runtime_activation_failed",
     })
 }
 

@@ -323,6 +323,7 @@ export class RustServer implements E2eServerHandle {
   private ownsHomeDir = false
   private stdoutBuffer = ''
   private stderrBuffer = ''
+  private _lastBootAttemptCount = 0
   private readonly options: RustServerOptions
 
   constructor(options: RustServerOptions = {}) {
@@ -392,6 +393,7 @@ export class RustServer implements E2eServerHandle {
             `bind race: foreign server answered health on port ${port} (server-info ${identity.status})`,
           )
         }
+        this._lastBootAttemptCount = attempt
         return info
       } catch (error) {
         lastError = error
@@ -436,6 +438,7 @@ export class RustServer implements E2eServerHandle {
     if (!homeDir || !priorInfo) throw new Error('RustServer not started; cannot restart()')
 
     await this.killCurrentProcess() // process only -- the isolated HOME is never touched
+    this._lastBootAttemptCount = 1
     return this.boot(homeDir, priorInfo.port, priorInfo.token)
   }
 
@@ -485,7 +488,18 @@ export class RustServer implements E2eServerHandle {
       await this.reapSurvivingChildren(childPidsBeforeKill)
     }
 
+    this._lastBootAttemptCount = 1
     return this.boot(homeDir, priorInfo.port, priorInfo.token)
+  }
+
+  processEvidence(): { pid: number; bootAttemptCount: number } {
+    const pid = this.process?.pid
+    if (!pid || !isPidAlive(pid)) throw new Error('RustServer has no live owned process evidence')
+    return { pid, bootAttemptCount: this._lastBootAttemptCount }
+  }
+
+  capturedOutput(): { stdout: string; stderr: string } {
+    return { stdout: this.stdoutBuffer, stderr: this.stderrBuffer }
   }
 
   async stop(): Promise<void> {

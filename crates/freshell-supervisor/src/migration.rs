@@ -13,6 +13,7 @@ use freshell_runtime_protocol::{
     ManagedRolloutMode, MigrationId, MigrationPlan, MigrationPlanRequest, RuntimeLimits,
 };
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
+use sha2::{Digest, Sha256};
 use std::{
     fs,
     os::unix::fs::PermissionsExt,
@@ -67,13 +68,17 @@ impl Registry {
 
             let mut backup_path = None;
             let mut backup_verified = false;
+            let mut backup_sha256 = None;
+            let mut backup_schema_version = None;
             if apply && blockers.is_empty() && registry_backup_required {
                 let requested = backup_request
                     .as_deref()
                     .expect("backup requirement checked above");
                 let resolved = resolve_backup_path(requested, &migration_id)?;
-                create_verified_backup(&mut conn, &db_path, &resolved)?;
+                let evidence = create_verified_backup(&mut conn, &db_path, &resolved)?;
                 backup_verified = true;
+                backup_sha256 = Some(evidence.sha256);
+                backup_schema_version = Some(evidence.schema_version);
                 backup_path = Some(resolved.to_string_lossy().into_owned());
             } else if let Some(requested) = backup_request.as_deref().filter(|value| !value.is_empty()) {
                 backup_path = Some(
@@ -93,6 +98,8 @@ impl Registry {
                 registry_backup_required,
                 registry_backup_verified: backup_verified,
                 registry_backup_path: backup_path.clone(),
+                registry_backup_sha256: backup_sha256,
+                registry_backup_schema_version: backup_schema_version,
                 managed_soul_count,
                 legacy_metadata_count,
                 projected_cpu_milli,
@@ -230,11 +237,16 @@ fn resolve_backup_path(
     Ok(resolved)
 }
 
+struct BackupEvidence {
+    sha256: String,
+    schema_version: u32,
+}
+
 fn create_verified_backup(
     conn: &mut Connection,
     source: &Path,
     target: &Path,
-) -> Result<(), RegistryError> {
+) -> Result<BackupEvidence, RegistryError> {
     if source == target {
         return Err(RegistryError::InvalidState(
             "registry backup cannot overwrite the active database".into(),
@@ -266,7 +278,11 @@ fn create_verified_backup(
     if let Some(parent) = target.parent() {
         std::fs::File::open(parent)?.sync_all()?;
     }
-    Ok(())
+    let bytes = fs::read(target)?;
+    Ok(BackupEvidence {
+        sha256: format!("{:x}", Sha256::digest(bytes)),
+        schema_version: schema,
+    })
 }
 
 fn count_legacy_metadata(path: &Path) -> Result<u64, String> {
@@ -414,5 +430,97 @@ mod tests {
             registry.rollout_mode().await.unwrap(),
             ManagedRolloutMode::Legacy
         );
+    }
+
+    #[tokio::test]
+    async fn managed_default_returns_independently_verifiable_backup_digest_and_schema() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry_root = dir.path().join("registry");
+        let registry = Registry::open(&registry_root, None).unwrap();
+        let backup = dir.path().join("backup.sqlite3");
+        let plan = registry
+            .plan_or_apply_migration(
+                MigrationPlanRequest {
+                    requested_mode: ManagedRolloutMode::ManagedDefault,
+                    apply: true,
+                    backup_path: Some(backup.to_string_lossy().into_owned()),
+                    legacy_metadata_path: None,
+                    expected_control_epoch: Some(registry.control_epoch()),
+                },
+                true,
+                true,
+            )
+            .await
+            .unwrap();
+        assert!(plan.registry_backup_verified);
+        let expected_sha256 = format!("{:x}", Sha256::digest(fs::read(&backup).unwrap()));
+        assert_eq!(
+            plan.registry_backup_sha256.as_deref(),
+            Some(expected_sha256.as_str())
+        );
+        assert_eq!(
+            plan.registry_backup_schema_version,
+            Some(crate::registry::SCHEMA_VERSION)
+        );
+        let read_only =
+            Connection::open_with_flags(&backup, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+        let integrity: String = read_only
+            .query_row("PRAGMA integrity_check", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(integrity, "ok");
+    }
+
+    #[tokio::test]
+    async fn interrupted_apply_leaves_mode_and_migration_journal_uncommitted() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry_root = dir.path().join("registry");
+        let registry = Registry::open(&registry_root, None).unwrap();
+        let backup = dir.path().join("interrupted-backup.sqlite3");
+        let observer = Connection::open(registry.database_path()).unwrap();
+        observer
+            .execute_batch(
+                "CREATE TRIGGER phase5_interrupt_migration BEFORE UPDATE ON rollout_state \
+                 BEGIN SELECT RAISE(ABORT, 'simulated migration interruption'); END;",
+            )
+            .unwrap();
+        drop(observer);
+
+        let result = registry
+            .plan_or_apply_migration(
+                MigrationPlanRequest {
+                    requested_mode: ManagedRolloutMode::ManagedDefault,
+                    apply: true,
+                    backup_path: Some(backup.to_string_lossy().into_owned()),
+                    legacy_metadata_path: None,
+                    expected_control_epoch: Some(registry.control_epoch()),
+                },
+                true,
+                true,
+            )
+            .await;
+        assert!(result.is_err());
+        assert_eq!(
+            registry.rollout_mode().await.unwrap(),
+            ManagedRolloutMode::Legacy
+        );
+        let observer = Connection::open(registry.database_path()).unwrap();
+        let journal_rows: u64 = observer
+            .query_row("SELECT COUNT(*) FROM migration_runs", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(journal_rows, 0);
+        assert!(
+            backup.is_file(),
+            "verified pre-apply backup remains available"
+        );
+        let backup_db =
+            Connection::open_with_flags(&backup, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+        let backup_mode: String = backup_db
+            .query_row(
+                "SELECT mode FROM rollout_state WHERE singleton=1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(backup_mode, "legacy");
     }
 }

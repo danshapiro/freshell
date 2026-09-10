@@ -508,9 +508,10 @@ mod tests {
         assert_eq!(reference.len(), 8);
     }
     #[tokio::test]
-    async fn duplicate_notice_receipt_is_a_noop_including_metrics() {
+    async fn duplicate_notice_receipt_is_a_noop_across_restart_including_metrics() {
         let dir = tempfile::tempdir().unwrap();
         let registry = Registry::open(dir.path(), None).unwrap();
+        let installation_id = registry.installation_id().clone();
         let incident = IncidentId::parse("incident-idempotent").unwrap();
         let notice_id = stable_notice_id(NoticeKind::CleanupSucceeded, &[incident.clone()]);
         let mut conn = crate::registry::open_connection(registry.database_path()).unwrap();
@@ -528,16 +529,24 @@ mod tests {
         tx.commit().unwrap();
         drop(conn);
 
-        for _ in 0..2 {
-            registry
-                .record_notice_receipt(
-                    notice_id.clone(),
-                    "profile-idempotent".into(),
-                    NoticeDeliveryState::Acknowledged,
-                )
-                .await
-                .unwrap();
-        }
+        registry
+            .record_notice_receipt(
+                notice_id.clone(),
+                "profile-idempotent".into(),
+                NoticeDeliveryState::Acknowledged,
+            )
+            .await
+            .unwrap();
+        drop(registry);
+        let registry = Registry::open(dir.path(), Some(installation_id)).unwrap();
+        registry
+            .record_notice_receipt(
+                notice_id.clone(),
+                "profile-idempotent".into(),
+                NoticeDeliveryState::Acknowledged,
+            )
+            .await
+            .unwrap();
         let metrics = registry.runtime_metrics_snapshot().await.unwrap();
         let count = metrics
             .counters
