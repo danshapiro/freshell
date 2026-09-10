@@ -1,5 +1,5 @@
 {
-  "schemaVersion": 1,
+  "schemaVersion": 2,
   "managedRuntimeVersion": 1,
   "providers": [
     {
@@ -166,6 +166,48 @@
       "qualificationStatus": "not-enabled"
     }
   ],
+  "freshAgentModes": [
+    {
+      "mode": "freshclaude",
+      "provider": "claude",
+      "runtimeVariant": "claude-agent-sdk",
+      "hostOwnedImplementation": true,
+      "enabledInReleaseScope": false,
+      "liveQualificationStatus": "pending_authentic_receipt",
+      "certified": false,
+      "pendingApprovalSupported": true
+    },
+    {
+      "mode": "kilroy",
+      "provider": "claude",
+      "runtimeVariant": "kilroy-claude-agent-sdk",
+      "hostOwnedImplementation": true,
+      "enabledInReleaseScope": false,
+      "liveQualificationStatus": "pending_authentic_receipt",
+      "certified": false,
+      "pendingApprovalSupported": true
+    },
+    {
+      "mode": "freshcodex",
+      "provider": "codex",
+      "runtimeVariant": "codex-app-server",
+      "hostOwnedImplementation": true,
+      "enabledInReleaseScope": false,
+      "liveQualificationStatus": "pending_authentic_receipt",
+      "certified": false,
+      "pendingApprovalSupported": false
+    },
+    {
+      "mode": "freshopencode",
+      "provider": "opencode",
+      "runtimeVariant": "opencode-per-soul-http",
+      "hostOwnedImplementation": true,
+      "enabledInReleaseScope": false,
+      "liveQualificationStatus": "pending_authentic_receipt",
+      "certified": false,
+      "pendingApprovalSupported": false
+    }
+  ],
   "doorways": [
     {
       "id": "websocket-terminal-create",
@@ -191,6 +233,16 @@
     {
       "id": "rest-freshclaude-create",
       "name": "rest-freshclaude",
+      "providers": [
+        "claude"
+      ],
+      "policy": "blocked",
+      "identityRule": "FRESH_AGENT_GLOBALLY_DISABLED_IN_RELEASE_SCOPE",
+      "enabledInReleaseScope": false
+    },
+    {
+      "id": "rest-kilroy-create",
+      "name": "rest-kilroy",
       "providers": [
         "claude"
       ],

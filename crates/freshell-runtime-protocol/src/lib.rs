@@ -258,6 +258,10 @@ pub struct ResumeSpec {
     pub mode: String,
     #[serde(default)]
     pub runtime_variant: String,
+    /// Test-only transport identity must survive supervisor-led recovery so
+    /// the resumed host never silently crosses into a paid provider adapter.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fixture_transport: Option<FreshAgentFixtureTransport>,
     pub program: String,
     #[serde(default)]
     pub resume_argv: Vec<String>,
@@ -939,6 +943,15 @@ pub enum FreshProvider {
     Opencode,
 }
 
+/// Test-only provider transport selected through the typed managed launch.
+/// The protocol knows the request so ordinary hosts can reject it explicitly;
+/// only a session-host compiled with its fixture feature may execute it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FreshAgentFixtureTransport {
+    Deterministic,
+}
+
 impl FreshProvider {
     pub fn as_str(&self) -> &'static str {
         match self {
@@ -977,6 +990,8 @@ pub struct FreshAgentLaunchSpec {
     pub sandbox: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub native_session_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fixture_transport: Option<FreshAgentFixtureTransport>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub provider_bootstrap_files: Vec<ProviderBootstrapFile>,
 }
@@ -2117,6 +2132,7 @@ mod tests {
         let spec: ResumeSpec = serde_json::from_value(legacy).unwrap();
         assert_eq!(spec.schema_version, RESUME_SPEC_SCHEMA_VERSION);
         assert_eq!(spec.runtime_variant, "");
+        assert_eq!(spec.fixture_transport, None);
         assert_eq!(spec.provider_volume, None);
         assert_eq!(spec.identity_provenance, IdentityProvenance::Unknown);
         assert_eq!(spec.durable_position, DurablePosition::default());
@@ -2135,6 +2151,7 @@ mod tests {
             },
             mode: "claude".into(),
             runtime_variant: "managed_terminal_pty".into(),
+            fixture_transport: None,
             program: "claude".into(),
             resume_argv: vec!["--resume".into(), "session-one".into()],
             provider_home: "/home/freshell/provider".into(),
@@ -2276,6 +2293,7 @@ mod tests {
             permission_mode: Some("ask".into()),
             sandbox: Some("workspace-write".into()),
             native_session_id: Some("native-one".into()),
+            fixture_transport: None,
             provider_bootstrap_files: vec![ProviderBootstrapFile {
                 source_path: "/credential-reference-only".into(),
                 provider_relative_path: ".provider/config.json".into(),
