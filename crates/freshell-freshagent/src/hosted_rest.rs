@@ -34,6 +34,26 @@ pub struct HostedRestSendResult {
     pub completed: bool,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HostedRestCapture {
+    pub session_id: String,
+    pub max_bytes: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HostedRestCaptureResult {
+    pub session_id: String,
+    pub native_session_id: String,
+    pub text: String,
+    pub truncated: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HostedRestCaptureError {
+    Unsupported,
+    Unavailable,
+}
+
 #[async_trait]
 pub trait HostedFreshAgentRestGateway: Send + Sync {
     async fn create_opencode(
@@ -42,6 +62,11 @@ pub trait HostedFreshAgentRestGateway: Send + Sync {
     ) -> Result<HostedRestCreated, ()>;
 
     async fn send_opencode(&self, request: HostedRestSend) -> Result<HostedRestSendResult, ()>;
+
+    async fn capture(
+        &self,
+        request: HostedRestCapture,
+    ) -> Result<HostedRestCaptureResult, HostedRestCaptureError>;
 }
 
 pub type SharedHostedFreshAgentRestGateway = std::sync::Arc<dyn HostedFreshAgentRestGateway>;

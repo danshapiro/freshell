@@ -6,8 +6,10 @@
 
 use freshell_runtime_protocol::{
     read_frame, write_frame, AcknowledgeViewProjectionRequest, AdminCommand, AdminReply,
-    AdminResult, ControlRole, Envelope, FreshAgentForkRequest, FreshAgentInterruptRequest,
-    FreshAgentReadEventsRequest, FreshAgentResolveRequest, FreshAgentSendRequest, IncidentId,
+    AdminResult, ControlRole, Envelope, FreshAgentCapture, FreshAgentCaptureRequest,
+    FreshAgentCompactRequest, FreshAgentForkRequest, FreshAgentInterruptRequest,
+    FreshAgentReadEventsRequest, FreshAgentResolveRequest, FreshAgentRollbackDirection,
+    FreshAgentRollbackMode, FreshAgentRollbackRequest, FreshAgentSendRequest, IncidentId,
     IncidentSummaryRequest, LaunchRequest, LossIncidentSummary, ManagedRolloutMode, MigrationPlan,
     MigrationPlanRequest, NoticeDeliveryState, NoticeId, NoticeReceiptRequest,
     PendingNoticesRequest, PendingViewProjectionsRequest, RecoverRequest, RecoveryProbeRequest,
@@ -665,6 +667,82 @@ impl RuntimeClient {
             .await?
         {
             AdminResult::FreshAgentFork(result) => Ok(result),
+            _ => Err(ClientError::UnexpectedResult),
+        }
+    }
+
+    pub async fn fresh_agent_compact(
+        &self,
+        request_id: RequestId,
+        soul_id: SoulId,
+        instructions: Option<String>,
+        cwd: Option<String>,
+    ) -> Result<freshell_runtime_protocol::CommandState, ClientError> {
+        let epoch = self.current_epoch().await?;
+        match self
+            .request(
+                request_id,
+                AdminCommand::FreshAgentCompact(FreshAgentCompactRequest {
+                    soul_id,
+                    instructions,
+                    cwd,
+                    expected_control_epoch: Some(epoch),
+                }),
+            )
+            .await?
+        {
+            AdminResult::FreshAgentCommand { state } => Ok(state),
+            _ => Err(ClientError::UnexpectedResult),
+        }
+    }
+
+    pub async fn fresh_agent_rollback(
+        &self,
+        request_id: RequestId,
+        soul_id: SoulId,
+        direction: FreshAgentRollbackDirection,
+        mode: FreshAgentRollbackMode,
+        turn_id: Option<String>,
+        cwd: Option<String>,
+    ) -> Result<freshell_runtime_protocol::CommandState, ClientError> {
+        let epoch = self.current_epoch().await?;
+        match self
+            .request(
+                request_id,
+                AdminCommand::FreshAgentRollback(FreshAgentRollbackRequest {
+                    soul_id,
+                    direction,
+                    mode,
+                    turn_id,
+                    cwd,
+                    expected_control_epoch: Some(epoch),
+                }),
+            )
+            .await?
+        {
+            AdminResult::FreshAgentCommand { state } => Ok(state),
+            _ => Err(ClientError::UnexpectedResult),
+        }
+    }
+
+    pub async fn fresh_agent_capture(
+        &self,
+        soul_id: SoulId,
+        max_bytes: u32,
+    ) -> Result<FreshAgentCapture, ClientError> {
+        let epoch = self.current_epoch().await?;
+        match self
+            .request(
+                RequestId::new(),
+                AdminCommand::FreshAgentCapture(FreshAgentCaptureRequest {
+                    soul_id,
+                    max_bytes,
+                    expected_control_epoch: Some(epoch),
+                }),
+            )
+            .await?
+        {
+            AdminResult::FreshAgentCapture(capture) => Ok(capture),
             _ => Err(ClientError::UnexpectedResult),
         }
     }

@@ -356,6 +356,38 @@ impl Supervisor {
                     .await?;
                 Ok(AdminResult::FreshAgentFork(result))
             }
+            AdminCommand::FreshAgentCompact(request) => {
+                self.registry
+                    .assert_epoch(request.expected_control_epoch)
+                    .map_err(map_registry)?;
+                let state = self
+                    .fresh_agent_compact(
+                        envelope.request_id,
+                        request.soul_id,
+                        request.instructions,
+                        request.cwd,
+                    )
+                    .await?;
+                Ok(AdminResult::FreshAgentCommand { state })
+            }
+            AdminCommand::FreshAgentRollback(request) => {
+                self.registry
+                    .assert_epoch(request.expected_control_epoch)
+                    .map_err(map_registry)?;
+                let state = self
+                    .fresh_agent_rollback(envelope.request_id, request)
+                    .await?;
+                Ok(AdminResult::FreshAgentCommand { state })
+            }
+            AdminCommand::FreshAgentCapture(request) => {
+                self.registry
+                    .assert_epoch(request.expected_control_epoch)
+                    .map_err(map_registry)?;
+                Ok(AdminResult::FreshAgentCapture(
+                    self.fresh_agent_capture(request.soul_id, request.max_bytes)
+                        .await?,
+                ))
+            }
             AdminCommand::FreshAgentResolve(request) => {
                 self.registry
                     .assert_epoch(request.expected_control_epoch)
@@ -1051,6 +1083,186 @@ impl Supervisor {
         })
     }
 
+    async fn fresh_agent_compact(
+        &self,
+        request_id: RequestId,
+        soul_id: SoulId,
+        instructions: Option<String>,
+        cwd: Option<String>,
+    ) -> Result<CommandState, RuntimeError> {
+        let lifecycle_lock = self.lifecycle_lock(&soul_id).await;
+        let _lifecycle_guard = lifecycle_lock.lock().await;
+        let handle = self
+            .registry
+            .active_handle_for_soul(soul_id)
+            .await
+            .map_err(map_registry)?;
+        if handle.fresh_agent().is_none() {
+            return Err(RuntimeError::new(
+                RuntimeErrorCode::UnsupportedWorkload,
+                "soul is not a hosted fresh-agent",
+            ));
+        }
+        let host = self
+            .authenticate_host(handle.incarnation_id(), handle.runtime_dir())
+            .await?;
+        match self
+            .send_authenticated_host_command(
+                handle.incarnation_id().clone(),
+                handle.runtime_dir(),
+                &host,
+                HostCommand::FreshAgentCompact {
+                    incarnation_id: handle.incarnation_id().clone(),
+                    request_id,
+                    instructions,
+                    cwd,
+                },
+            )
+            .await?
+        {
+            HostResult::FreshAgentCommand { state, .. } => Ok(state),
+            _ => Err(RuntimeError::new(
+                RuntimeErrorCode::HostAuthenticationFailed,
+                "unexpected fresh-agent compact reply",
+            )),
+        }
+    }
+
+    async fn fresh_agent_rollback(
+        &self,
+        request_id: RequestId,
+        request: freshell_runtime_protocol::FreshAgentRollbackRequest,
+    ) -> Result<CommandState, RuntimeError> {
+        let soul_id = request.soul_id;
+        let lifecycle_lock = self.lifecycle_lock(&soul_id).await;
+        let _lifecycle_guard = lifecycle_lock.lock().await;
+        let context = self
+            .registry
+            .recovery_context(soul_id.clone())
+            .await
+            .map_err(map_registry)?;
+        let prior_native = context.native_session_id.clone();
+        let handle = context.prior_handle;
+        if handle.fresh_agent().is_none() {
+            return Err(RuntimeError::new(
+                RuntimeErrorCode::UnsupportedWorkload,
+                "soul is not a hosted fresh-agent",
+            ));
+        }
+        let host = self
+            .authenticate_host(handle.incarnation_id(), handle.runtime_dir())
+            .await?;
+        match self
+            .send_authenticated_host_command(
+                handle.incarnation_id().clone(),
+                handle.runtime_dir(),
+                &host,
+                HostCommand::FreshAgentRollback {
+                    incarnation_id: handle.incarnation_id().clone(),
+                    request_id,
+                    direction: request.direction,
+                    mode: request.mode,
+                    turn_id: request.turn_id,
+                    cwd: request.cwd,
+                },
+            )
+            .await?
+        {
+            HostResult::FreshAgentCommand {
+                state,
+                native_session_id,
+            } => {
+                let identity_update = classify_fresh_agent_operation_identity(
+                    prior_native.as_deref(),
+                    native_session_id.as_deref(),
+                )?;
+                match identity_update {
+                    FreshAgentNativeIdentityUpdate::Unchanged => {}
+                    FreshAgentNativeIdentityUpdate::Record => {
+                        self.registry
+                            .record_native_session(
+                                soul_id.clone(),
+                                handle.incarnation_id().clone(),
+                                native_session_id
+                                    .clone()
+                                    .expect("record classification requires identity"),
+                            )
+                            .await
+                            .map_err(map_registry)?;
+                    }
+                    FreshAgentNativeIdentityUpdate::Transition => {
+                        self.registry
+                            .transition_native_session(
+                                soul_id.clone(),
+                                handle.incarnation_id().clone(),
+                                prior_native
+                                    .as_deref()
+                                    .expect("transition classification requires parent"),
+                                native_session_id
+                                    .as_deref()
+                                    .expect("transition classification requires child"),
+                            )
+                            .await
+                            .map_err(map_registry)?;
+                    }
+                }
+                if identity_update != FreshAgentNativeIdentityUpdate::Unchanged {
+                    // The old resume/checkpoint proof names the pre-operation
+                    // branch. Re-materialize exact evidence before replacement.
+                    let _ = self.probe_recovery(soul_id).await;
+                }
+                Ok(state)
+            }
+            _ => Err(RuntimeError::new(
+                RuntimeErrorCode::HostAuthenticationFailed,
+                "unexpected fresh-agent rollback reply",
+            )),
+        }
+    }
+
+    async fn fresh_agent_capture(
+        &self,
+        soul_id: SoulId,
+        max_bytes: u32,
+    ) -> Result<freshell_runtime_protocol::FreshAgentCapture, RuntimeError> {
+        let handle = self
+            .registry
+            .active_handle_for_soul(soul_id)
+            .await
+            .map_err(map_registry)?;
+        let Some(fresh_agent) = handle.fresh_agent() else {
+            return Err(RuntimeError::new(
+                RuntimeErrorCode::UnsupportedWorkload,
+                "soul is not a hosted fresh-agent",
+            ));
+        };
+        let presentation_session_id = fresh_agent.session_id.clone();
+        let host = self
+            .authenticate_host(handle.incarnation_id(), handle.runtime_dir())
+            .await?;
+        match self
+            .send_authenticated_host_command(
+                handle.incarnation_id().clone(),
+                handle.runtime_dir(),
+                &host,
+                HostCommand::FreshAgentCapture {
+                    incarnation_id: handle.incarnation_id().clone(),
+                    max_bytes: max_bytes.clamp(1, 256 * 1024),
+                },
+            )
+            .await?
+        {
+            HostResult::FreshAgentCapture(mut capture) => {
+                capture.presentation_session_id = presentation_session_id;
+                Ok(capture)
+            }
+            _ => Err(RuntimeError::new(
+                RuntimeErrorCode::HostAuthenticationFailed,
+                "unexpected fresh-agent capture reply",
+            )),
+        }
+    }
+
     async fn fresh_agent_resolve(
         &self,
         soul_id: SoulId,
@@ -1583,6 +1795,8 @@ impl Supervisor {
         let is_slow_fresh_agent_command = matches!(
             &command,
             HostCommand::FreshAgentSend { .. }
+                | HostCommand::FreshAgentCompact { .. }
+                | HostCommand::FreshAgentRollback { .. }
                 | HostCommand::GrantExecution {
                     fresh_agent: Some(_),
                     ..
@@ -1807,6 +2021,35 @@ pub(crate) async fn exchange_host_frame(
     })
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FreshAgentNativeIdentityUpdate {
+    Unchanged,
+    Record,
+    Transition,
+}
+
+fn classify_fresh_agent_operation_identity(
+    current_native: Option<&str>,
+    observed_native: Option<&str>,
+) -> Result<FreshAgentNativeIdentityUpdate, RuntimeError> {
+    let Some(observed_native) = observed_native else {
+        return Ok(FreshAgentNativeIdentityUpdate::Unchanged);
+    };
+    if observed_native.is_empty() || observed_native.chars().any(char::is_control) {
+        return Err(RuntimeError::new(
+            RuntimeErrorCode::OwnershipMismatch,
+            "fresh-agent operation returned an invalid native session identity",
+        ));
+    }
+    match current_native {
+        None => Ok(FreshAgentNativeIdentityUpdate::Record),
+        Some(current) if current == observed_native => {
+            Ok(FreshAgentNativeIdentityUpdate::Unchanged)
+        }
+        Some(_) => Ok(FreshAgentNativeIdentityUpdate::Transition),
+    }
+}
+
 fn classify_fresh_agent_fork_transition(
     current_native: &str,
     transition: &freshell_runtime_protocol::FreshAgentForkResult,
@@ -1930,13 +2173,42 @@ mod host_ipc_timeout_tests {
 mod release_scope_tests {
     use super::{
         activation_failure_data, append_event, classify_fresh_agent_fork_transition,
-        lifecycle_secrets, release_qualified_workload,
+        classify_fresh_agent_operation_identity, lifecycle_secrets, release_qualified_workload,
+        FreshAgentNativeIdentityUpdate,
     };
     use crate::registry::PreparedLaunch;
     use freshell_runtime_protocol::{
         FreshAgentForkResult, IncarnationId, LaunchNonce, LaunchState, RuntimeError,
         RuntimeErrorCode, SoulId,
     };
+
+    #[test]
+    fn semantic_operation_identity_classifies_record_transition_and_replay() {
+        assert_eq!(
+            classify_fresh_agent_operation_identity(None, None).unwrap(),
+            FreshAgentNativeIdentityUpdate::Unchanged
+        );
+        assert_eq!(
+            classify_fresh_agent_operation_identity(None, Some("native-one")).unwrap(),
+            FreshAgentNativeIdentityUpdate::Record
+        );
+        assert_eq!(
+            classify_fresh_agent_operation_identity(Some("native-parent"), Some("native-child"))
+                .unwrap(),
+            FreshAgentNativeIdentityUpdate::Transition
+        );
+        assert_eq!(
+            classify_fresh_agent_operation_identity(Some("native-child"), Some("native-child"))
+                .unwrap(),
+            FreshAgentNativeIdentityUpdate::Unchanged,
+            "an exact retry after registry commit must be idempotent",
+        );
+        assert!(classify_fresh_agent_operation_identity(
+            Some("native-parent"),
+            Some("bad\nidentity")
+        )
+        .is_err());
+    }
 
     #[test]
     fn fork_transition_accepts_first_apply_and_exact_idempotent_replay_only() {

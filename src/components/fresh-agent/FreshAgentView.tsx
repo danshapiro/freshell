@@ -1346,6 +1346,7 @@ export function FreshAgentView({
       const cwd = getFreshOpenCodeRouteCwd(current, { sessionCwd: freshOpenCodeRouteCwdRef.current })
       sendFreshAgentMessage({
         type: 'freshAgent.compact',
+        requestId: nanoid(),
         sessionId: current.sessionId,
         sessionType: current.sessionType,
         provider: current.provider,

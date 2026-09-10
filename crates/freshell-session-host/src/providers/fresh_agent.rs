@@ -6,16 +6,21 @@
 
 use async_trait::async_trait;
 use freshell_agent_runtime::host_actor::{
-    DispatchAck, DispatchFailure, ForkTransition, FreshAgentHostActor, FreshAgentProfile,
-    FreshAgentTransport, TransportStart,
+    DispatchAck, DispatchFailure, ForkTransition, FreshAgentHostActor, FreshAgentOperation,
+    FreshAgentProfile, FreshAgentTransport, OperationAck, OperationFailure, OperationFailureKind,
+    TransportStart,
 };
+use freshell_freshagent::rollback_record::{RollbackDirection, RollbackModeReq, RollbackRequest};
 use freshell_freshagent::{FreshAgentState, FreshClaudeState, FreshCodexState, FreshOpencodeState};
 use freshell_protocol::{
-    AgentProvider, FreshAgentApprovalRespond, FreshAgentCreate, FreshAgentFork,
+    AgentProvider, FreshAgentApprovalRespond, FreshAgentCompact, FreshAgentCreate, FreshAgentFork,
     FreshAgentInterrupt, FreshAgentKill, FreshAgentQuestionRespond, FreshAgentSend,
     FreshAgentSendSettings, ServerMessage, SessionLocator, SessionType, StringOrNumber,
 };
-use freshell_runtime_protocol::{AgentEvent, FreshAgentLaunchSpec, FreshProvider, RequestId};
+use freshell_runtime_protocol::{
+    AgentEvent, FreshAgentCapture, FreshAgentLaunchSpec, FreshAgentRollbackDirection,
+    FreshAgentRollbackMode, FreshProvider, RequestId,
+};
 use serde_json::{json, Value};
 use std::{
     collections::{BTreeMap, HashSet},
@@ -52,6 +57,7 @@ struct HostedTransport {
     send_outcomes: broadcast::Sender<(String, bool)>,
     kill_outcomes: broadcast::Sender<(String, bool)>,
     suppressed_kills: Arc<std::sync::Mutex<HashSet<String>>>,
+    event_tx: mpsc::Sender<AgentEvent>,
     event_rx: std::sync::Mutex<Option<mpsc::Receiver<AgentEvent>>>,
 }
 
@@ -111,7 +117,7 @@ impl HostedTransport {
             broadcast_rx,
             created_tx,
             native_tx,
-            event_tx,
+            event_tx.clone(),
             send_outcomes.clone(),
             kill_outcomes.clone(),
             Arc::clone(&suppressed_kills),
@@ -126,6 +132,7 @@ impl HostedTransport {
             send_outcomes,
             kill_outcomes,
             suppressed_kills,
+            event_tx,
             event_rx: std::sync::Mutex::new(Some(event_rx)),
         })
     }
@@ -247,6 +254,50 @@ impl HostedTransport {
             .into(),
             acceptance_ambiguous: observed.is_none(),
         })
+    }
+
+    async fn current_native_id(&self) -> Result<String, String> {
+        if let Some(native) = self.native_rx.lock().await.borrow().clone() {
+            return Ok(native);
+        }
+        let profile_native = self
+            .profile
+            .lock()
+            .expect("profile lock")
+            .as_ref()
+            .and_then(|profile| profile.native_session_id.clone());
+        match profile_native {
+            Some(native) => Ok(native),
+            None => self
+                .session_id
+                .lock()
+                .await
+                .clone()
+                .ok_or_else(|| "fresh-agent session is not started".to_string()),
+        }
+    }
+
+    async fn snapshot_value(&self) -> Result<Value, String> {
+        let native_id = self.current_native_id().await?;
+        let cwd = self
+            .profile
+            .lock()
+            .expect("profile lock")
+            .as_ref()
+            .map(|profile| profile.cwd.clone());
+        match &self.state {
+            ProviderState::Claude(state) => {
+                state.get_snapshot(self.session_type(), &native_id).await
+            }
+            ProviderState::Codex(state) => state
+                .get_snapshot(&native_id, cwd.as_deref())
+                .await
+                .map_err(|_| "codex snapshot unavailable".to_string()),
+            ProviderState::Opencode { owner, .. } => owner
+                .get_opencode_snapshot(&native_id, cwd.as_deref())
+                .await
+                .map_err(|_| "opencode snapshot unavailable".to_string()),
+        }
     }
 }
 
@@ -584,6 +635,139 @@ impl FreshAgentTransport for HostedTransport {
         Ok(())
     }
 
+    async fn supports_operation(&self, operation: &FreshAgentOperation) -> Result<bool, String> {
+        match operation {
+            FreshAgentOperation::Compact { .. } => Ok(true),
+            FreshAgentOperation::Rollback {
+                direction: FreshAgentRollbackDirection::Redo,
+                ..
+            } if matches!(self.provider, FreshProvider::Codex) => Ok(false),
+            FreshAgentOperation::Rollback { .. } => {
+                let snapshot = self.snapshot_value().await?;
+                Ok(operation_supported_by_snapshot(operation, &snapshot))
+            }
+        }
+    }
+
+    async fn dispatch_operation(
+        &self,
+        request_id: &RequestId,
+        operation: &FreshAgentOperation,
+    ) -> Result<OperationAck, OperationFailure> {
+        let session_id = self
+            .session_id
+            .lock()
+            .await
+            .clone()
+            .ok_or_else(|| OperationFailure {
+                kind: OperationFailureKind::Rejected,
+                message: "fresh-agent session is not started".into(),
+                acceptance_ambiguous: false,
+            })?;
+        let mut observed_native = None;
+        match operation {
+            FreshAgentOperation::Compact { instructions, cwd } => {
+                let message = FreshAgentCompact {
+                    request_id: Some(request_id.as_str().to_string()),
+                    provider: self.provider_wire(),
+                    session_id,
+                    session_type: self.session_type(),
+                    cwd: cwd.clone(),
+                    instructions: instructions.clone(),
+                };
+                match &self.state {
+                    ProviderState::Claude(state) => state.handle_compact(message).await,
+                    ProviderState::Codex(state) => state.handle_compact(message).await,
+                    ProviderState::Opencode { runtime, .. } => {
+                        runtime.handle_compact(message).await
+                    }
+                }
+            }
+            FreshAgentOperation::Rollback {
+                direction,
+                mode,
+                turn_id,
+                cwd,
+            } => {
+                let operation = RollbackRequest {
+                    direction: match direction {
+                        FreshAgentRollbackDirection::Undo => RollbackDirection::Undo,
+                        FreshAgentRollbackDirection::Redo => RollbackDirection::Redo,
+                    },
+                    mode: match mode {
+                        FreshAgentRollbackMode::Step => RollbackModeReq::Step,
+                        FreshAgentRollbackMode::ToTurn => RollbackModeReq::ToTurn,
+                    },
+                    turn_id: turn_id.clone(),
+                    session_id,
+                    session_type: self.session_type(),
+                    provider: self.provider_wire(),
+                    request_id: request_id.as_str().to_string(),
+                    cwd: cwd.clone(),
+                };
+                let captured = Arc::new(std::sync::Mutex::new(Vec::<Value>::new()));
+                let captured_sink = Arc::clone(&captured);
+                let sink: freshell_terminal::FrameSink = Arc::new(move |frame| {
+                    if let Ok(value) = serde_json::to_value(frame) {
+                        captured_sink.lock().expect("rollback frames").push(value);
+                    }
+                });
+                match &self.state {
+                    ProviderState::Claude(state) => state.handle_rollback(operation, sink).await,
+                    ProviderState::Codex(state) => state.handle_rollback(operation, sink).await,
+                    ProviderState::Opencode { runtime, .. } => {
+                        runtime.handle_rollback(operation, sink).await
+                    }
+                }
+                let frames = captured.lock().expect("rollback frames").clone();
+                for payload in &frames {
+                    let _ = self
+                        .event_tx
+                        .send(AgentEvent::Provider {
+                            payload: payload.clone(),
+                        })
+                        .await;
+                }
+                if let Some(code) = frames.iter().find_map(find_operation_error_code) {
+                    return Err(OperationFailure {
+                        kind: if code == "UNSUPPORTED_CAPABILITY" {
+                            OperationFailureKind::Unsupported
+                        } else {
+                            OperationFailureKind::Rejected
+                        },
+                        message: "provider rejected hosted rollback".into(),
+                        acceptance_ambiguous: false,
+                    });
+                }
+                observed_native = frames.iter().find_map(find_operation_session_id);
+            }
+        }
+        Ok(OperationAck {
+            provider_ack_id: Some(request_id.as_str().to_string()),
+            native_session_id: observed_native,
+        })
+    }
+
+    async fn capture(&self, max_bytes: usize) -> Result<FreshAgentCapture, String> {
+        let snapshot = self.snapshot_value().await?;
+        let native_session_id = self.current_native_id().await?;
+        let presentation_session_id = snapshot
+            .get("sessionId")
+            .or_else(|| snapshot.get("threadId"))
+            .and_then(Value::as_str)
+            .unwrap_or(&native_session_id)
+            .to_string();
+        let (text, truncated) = render_snapshot_text(&snapshot, max_bytes);
+        Ok(FreshAgentCapture {
+            provider: self.provider.clone(),
+            session_type: session_type_wire(self.session_type()).into(),
+            presentation_session_id,
+            native_session_id,
+            text,
+            truncated,
+        })
+    }
+
     async fn is_live(&self) -> bool {
         let Some(session_id) = self.session_id.lock().await.clone() else {
             return false;
@@ -762,6 +946,107 @@ fn parse_sandbox(value: &str) -> Option<freshell_protocol::Sandbox> {
     }
 }
 
+fn session_type_wire(session_type: SessionType) -> &'static str {
+    match session_type {
+        SessionType::Freshclaude => "freshclaude",
+        SessionType::Freshcodex => "freshcodex",
+        SessionType::Kilroy => "kilroy",
+        SessionType::Freshopencode => "freshopencode",
+    }
+}
+
+fn operation_supported_by_snapshot(operation: &FreshAgentOperation, snapshot: &Value) -> bool {
+    let capability = match operation {
+        FreshAgentOperation::Compact { .. } => return true,
+        FreshAgentOperation::Rollback {
+            direction: FreshAgentRollbackDirection::Undo,
+            ..
+        } => "undo",
+        FreshAgentOperation::Rollback {
+            direction: FreshAgentRollbackDirection::Redo,
+            ..
+        } => "redo",
+    };
+    snapshot
+        .get("capabilities")
+        .and_then(|value| value.get(capability))
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+}
+
+fn find_operation_error_code(value: &Value) -> Option<&str> {
+    if value.get("type").and_then(Value::as_str) == Some("freshAgent.error") {
+        return value.get("code").and_then(Value::as_str);
+    }
+    match value {
+        Value::Object(object) => object.values().find_map(find_operation_error_code),
+        Value::Array(values) => values.iter().find_map(find_operation_error_code),
+        _ => None,
+    }
+}
+
+fn find_operation_session_id(value: &Value) -> Option<String> {
+    if matches!(
+        value.get("type").and_then(Value::as_str),
+        Some("freshAgent.rolledBack") | Some("freshAgent.redone")
+    ) {
+        return value
+            .get("newSessionId")
+            .or_else(|| value.get("sessionId"))
+            .and_then(Value::as_str)
+            .map(str::to_string);
+    }
+    match value {
+        Value::Object(object) => object.values().find_map(find_operation_session_id),
+        Value::Array(values) => values.iter().find_map(find_operation_session_id),
+        _ => None,
+    }
+}
+
+fn render_snapshot_text(snapshot: &Value, max_bytes: usize) -> (String, bool) {
+    let mut output = String::new();
+    if let Some(turns) = snapshot.get("turns").and_then(Value::as_array) {
+        for turn in turns {
+            let role = turn
+                .get("role")
+                .and_then(Value::as_str)
+                .unwrap_or("assistant");
+            let mut body = Vec::new();
+            if let Some(items) = turn.get("items").and_then(Value::as_array) {
+                for item in items {
+                    if let Some(text) = item.get("text").and_then(Value::as_str) {
+                        body.push(text);
+                    } else if let Some(command) = item.get("command").and_then(Value::as_str) {
+                        body.push(command);
+                    } else if let Some(result) = item.get("output").and_then(Value::as_str) {
+                        body.push(result);
+                    }
+                }
+            }
+            if body.is_empty() {
+                if let Some(summary) = turn.get("summary").and_then(Value::as_str) {
+                    body.push(summary);
+                }
+            }
+            if !body.is_empty() {
+                output.push_str(role);
+                output.push_str(": ");
+                output.push_str(&body.join("\n"));
+                output.push('\n');
+            }
+        }
+    }
+    if output.len() <= max_bytes {
+        return (output, false);
+    }
+    let mut boundary = max_bytes;
+    while boundary > 0 && !output.is_char_boundary(boundary) {
+        boundary -= 1;
+    }
+    output.truncate(boundary);
+    (output, true)
+}
+
 fn parse_send_outcome(value: &Value) -> Option<(String, bool)> {
     let event_type = value.get("type")?.as_str()?;
     let request_id = value.get("requestId").and_then(|value| match value {
@@ -814,5 +1099,91 @@ mod tests {
             Some(freshell_protocol::Sandbox::DangerFullAccess)
         );
         assert_eq!(parse_sandbox("unknown"), None);
+    }
+
+    #[tokio::test]
+    async fn operation_support_matrix_matches_each_hosted_provider() {
+        let compact = FreshAgentOperation::Compact {
+            instructions: None,
+            cwd: None,
+        };
+        let undo = FreshAgentOperation::Rollback {
+            direction: FreshAgentRollbackDirection::Undo,
+            mode: FreshAgentRollbackMode::Step,
+            turn_id: None,
+            cwd: None,
+        };
+        let redo = FreshAgentOperation::Rollback {
+            direction: FreshAgentRollbackDirection::Redo,
+            mode: FreshAgentRollbackMode::Step,
+            turn_id: None,
+            cwd: None,
+        };
+        for provider in [
+            FreshProvider::Claude,
+            FreshProvider::Kilroy,
+            FreshProvider::Codex,
+            FreshProvider::Opencode,
+        ] {
+            let transport = HostedTransport::new(provider.clone()).await;
+            assert_eq!(
+                transport.supports_operation(&compact).await,
+                Ok(true),
+                "{provider:?} compact"
+            );
+            if provider == FreshProvider::Codex {
+                assert_eq!(transport.supports_operation(&redo).await, Ok(false));
+            }
+            assert!(operation_supported_by_snapshot(
+                &undo,
+                &json!({"capabilities":{"undo":true,"redo":provider != FreshProvider::Codex}})
+            ));
+            assert_eq!(
+                operation_supported_by_snapshot(
+                    &redo,
+                    &json!({"capabilities":{"undo":true,"redo":provider != FreshProvider::Codex}})
+                ),
+                provider != FreshProvider::Codex
+            );
+        }
+    }
+
+    #[test]
+    fn rollback_reply_error_parser_handles_nested_event_envelopes() {
+        let payload = json!({
+            "type":"freshAgent.event",
+            "event":{"type":"freshAgent.error","code":"UNSUPPORTED_CAPABILITY"}
+        });
+        assert_eq!(
+            find_operation_error_code(&payload),
+            Some("UNSUPPORTED_CAPABILITY")
+        );
+        assert_eq!(find_operation_error_code(&json!({"type":"ok"})), None);
+        assert_eq!(
+            find_operation_session_id(&json!({
+                "type":"freshAgent.event",
+                "event":{
+                    "type":"freshAgent.rolledBack",
+                    "sessionId":"old-native",
+                    "newSessionId":"new-native"
+                }
+            })),
+            Some("new-native".into())
+        );
+    }
+
+    #[test]
+    fn snapshot_text_renderer_is_plain_and_utf8_bounded() {
+        let snapshot = json!({"turns":[
+            {"role":"user","summary":"ignored","items":[{"kind":"text","text":"héllo"}]},
+            {"role":"assistant","summary":"world","items":[]}
+        ]});
+        let (full, truncated) = render_snapshot_text(&snapshot, 100);
+        assert_eq!(full, "user: héllo\nassistant: world\n");
+        assert!(!truncated);
+        let (short, truncated) = render_snapshot_text(&snapshot, 8);
+        assert!(short.len() <= 8);
+        assert!(short.is_char_boundary(short.len()));
+        assert!(truncated);
     }
 }

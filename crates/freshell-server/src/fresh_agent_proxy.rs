@@ -4,7 +4,8 @@
 //! supervisor/session-host actor. This module owns no provider process.
 
 use freshell_freshagent::hosted_rest::{
-    HostedFreshAgentRestGateway, HostedRestCreate, HostedRestCreated, HostedRestSend,
+    HostedFreshAgentRestGateway, HostedRestCapture, HostedRestCaptureError,
+    HostedRestCaptureResult, HostedRestCreate, HostedRestCreated, HostedRestSend,
     HostedRestSendResult,
 };
 use freshell_protocol::{
@@ -13,9 +14,10 @@ use freshell_protocol::{
 };
 use freshell_runtime_client::RuntimeClient;
 use freshell_runtime_protocol::{
-    AgentEvent, DesiredState, FreshAgentLaunchSpec, FreshProvider, LaunchRequest,
-    ProviderBootstrapFile, RequestId, RuntimeLimits, RuntimeProfile, SoulId, StopOutcome,
-    ViewIntentKind, ViewIntentRequest, ViewVisibilityIntent,
+    AgentEvent, DesiredState, FreshAgentLaunchSpec, FreshAgentRollbackDirection,
+    FreshAgentRollbackMode, FreshProvider, LaunchRequest, ProviderBootstrapFile, RequestId,
+    RuntimeErrorCode, RuntimeLimits, RuntimeProfile, SoulId, StopOutcome, ViewIntentKind,
+    ViewIntentRequest, ViewVisibilityIntent,
 };
 use freshell_ws::hosted_fresh_agent::{HostedFreshAgentCommand, HostedFreshAgentGateway};
 use sha2::{Digest, Sha256};
@@ -185,12 +187,38 @@ impl HostedFreshAgentProxy {
                 )
                 .await;
             }
-            HostedFreshAgentCommand::Compact(message) => self.error_event(
-                &message.provider,
-                &message.session_id,
-                message.session_type,
-                "managed fresh-agent compact is not available",
-            ),
+            HostedFreshAgentCommand::Compact(message) => {
+                let request_id = message
+                    .request_id
+                    .as_deref()
+                    .and_then(|value| RequestId::parse(value.to_string()).ok())
+                    .unwrap_or_else(RequestId::new);
+                let result = match self
+                    .resolve_soul(&message.provider, &message.session_id)
+                    .await
+                {
+                    Some(soul) => self
+                        .client
+                        .fresh_agent_compact(
+                            request_id,
+                            soul,
+                            message.instructions.clone(),
+                            message.cwd.clone(),
+                        )
+                        .await
+                        .map(|_| ()),
+                    None => Err(freshell_runtime_client::ClientError::UnexpectedResult),
+                };
+                if let Err(error) = result {
+                    self.operation_error_event(
+                        &message.provider,
+                        &message.session_id,
+                        message.session_type,
+                        &error,
+                        "managed fresh-agent compact was not accepted",
+                    );
+                }
+            }
             HostedFreshAgentCommand::Fork(message) => {
                 let provider = message.provider.clone();
                 let session_id = message.session_id.clone();
@@ -252,18 +280,32 @@ impl HostedFreshAgentProxy {
                     ),
                 }
             }
-            HostedFreshAgentCommand::Undo(message) => self.error_event(
-                &message.provider,
-                &message.session_id,
-                message.session_type,
-                "managed fresh-agent undo is not available",
-            ),
-            HostedFreshAgentCommand::Redo(message) => self.error_event(
-                &message.provider,
-                &message.session_id,
-                message.session_type,
-                "managed fresh-agent redo is not available",
-            ),
+            HostedFreshAgentCommand::Undo(message) => {
+                self.rollback(
+                    message.provider,
+                    message.session_id,
+                    message.session_type,
+                    message.request_id,
+                    FreshAgentRollbackDirection::Undo,
+                    message.mode,
+                    message.turn_id,
+                    message.cwd,
+                )
+                .await;
+            }
+            HostedFreshAgentCommand::Redo(message) => {
+                self.rollback(
+                    message.provider,
+                    message.session_id,
+                    message.session_type,
+                    message.request_id,
+                    FreshAgentRollbackDirection::Redo,
+                    message.mode,
+                    message.turn_id,
+                    message.cwd,
+                )
+                .await;
+            }
         }
     }
 
@@ -444,6 +486,54 @@ impl HostedFreshAgentProxy {
         }
     }
 
+    async fn rollback(
+        &self,
+        provider: AgentProvider,
+        session_id: String,
+        session_type: SessionType,
+        request_id: String,
+        direction: FreshAgentRollbackDirection,
+        mode: Option<freshell_protocol::RollbackMode>,
+        turn_id: Option<String>,
+        cwd: Option<String>,
+    ) {
+        let parsed_request_id = RequestId::parse(request_id);
+        let result = match (
+            parsed_request_id,
+            self.resolve_soul(&provider, &session_id).await,
+        ) {
+            (Ok(request_id), Some(soul)) => self
+                .client
+                .fresh_agent_rollback(
+                    request_id,
+                    soul,
+                    direction,
+                    match mode {
+                        Some(freshell_protocol::RollbackMode::ToTurn) => {
+                            FreshAgentRollbackMode::ToTurn
+                        }
+                        Some(freshell_protocol::RollbackMode::Step) | None => {
+                            FreshAgentRollbackMode::Step
+                        }
+                    },
+                    turn_id,
+                    cwd,
+                )
+                .await
+                .map(|_| ()),
+            _ => Err(freshell_runtime_client::ClientError::UnexpectedResult),
+        };
+        if let Err(error) = result {
+            self.operation_error_event(
+                &provider,
+                &session_id,
+                session_type,
+                &error,
+                "managed fresh-agent rollback was not accepted",
+            );
+        }
+    }
+
     async fn resolve_soul(&self, provider: &AgentProvider, session_id: &str) -> Option<SoulId> {
         let provider = provider_wire(provider);
         if let Some(soul) = self
@@ -573,6 +663,11 @@ impl HostedFreshAgentProxy {
         match event {
             AgentEvent::Provider { mut payload } => {
                 rewrite_presentation_id(&mut payload, presentation_session_id);
+                freshell_agent_runtime::snapshot_projection::project_hosted_snapshot(
+                    &mut payload,
+                    provider,
+                    session_type,
+                );
                 if let Ok(frame) = serde_json::to_string(&payload) {
                     let _ = self.broadcast.send(frame);
                 }
@@ -596,12 +691,37 @@ impl HostedFreshAgentProxy {
         session_type: SessionType,
         message: &str,
     ) {
+        self.error_event_code(
+            provider,
+            session_id,
+            session_type,
+            "MANAGED_FRESH_AGENT_ERROR",
+            message,
+        );
+    }
+
+    fn operation_error_event(
+        &self,
+        provider: &AgentProvider,
+        session_id: &str,
+        session_type: SessionType,
+        error: &freshell_runtime_client::ClientError,
+        fallback: &str,
+    ) {
+        let code = operation_error_code(error);
+        self.error_event_code(provider, session_id, session_type, code, fallback);
+    }
+
+    fn error_event_code(
+        &self,
+        provider: &AgentProvider,
+        session_id: &str,
+        session_type: SessionType,
+        code: &str,
+        message: &str,
+    ) {
         self.send(ServerMessage::FreshAgentEvent(FreshAgentEvent {
-            event: serde_json::json!({
-                "type":"freshAgent.error",
-                "code":"MANAGED_FRESH_AGENT_ERROR",
-                "message":message,
-            }),
+            event: fresh_agent_error_payload(code, message),
             provider: provider_wire(provider),
             session_id: session_id.into(),
             session_type: session_type_wire(session_type),
@@ -615,71 +735,6 @@ impl HostedFreshAgentProxy {
     }
 }
 
-#[async_trait::async_trait]
-impl HostedFreshAgentRestGateway for HostedFreshAgentProxy {
-    async fn create_opencode(
-        self: Arc<Self>,
-        request: HostedRestCreate,
-    ) -> Result<HostedRestCreated, ()> {
-        let message = freshell_protocol::FreshAgentCreate {
-            request_id: request.request_id,
-            session_type: SessionType::Freshopencode,
-            cwd: request.cwd,
-            effort: request.effort,
-            legacy_restore_context: None,
-            model: request.model,
-            model_selection: None,
-            permission_mode: None,
-            plugins: None,
-            provider: Some(AgentProvider::Opencode),
-            resume_session_id: None,
-            sandbox: None,
-            session_ref: request.native_session_id.map(|session_id| {
-                freshell_protocol::SessionLocator {
-                    provider: "opencode".into(),
-                    session_id,
-                }
-            }),
-            tab_id: None,
-        };
-        let session_id = message
-            .session_ref
-            .as_ref()
-            .map(|value| value.session_id.clone())
-            .unwrap_or_else(|| format!("managed-opencode-{}", stable_hex(&message.request_id)));
-        self.create(message).await?;
-        Ok(HostedRestCreated { session_id })
-    }
-
-    async fn send_opencode(&self, request: HostedRestSend) -> Result<HostedRestSendResult, ()> {
-        let soul = self
-            .resolve_soul(&AgentProvider::Opencode, &request.session_id)
-            .await
-            .ok_or(())?;
-        let before = self
-            .client
-            .fresh_agent_events(soul.clone(), 0, 1)
-            .await
-            .map_err(|_| ())?;
-        let request_id = RequestId::parse(request.request_id).map_err(|_| ())?;
-        self.client
-            .fresh_agent_send(request_id, soul.clone(), request.text, None)
-            .await
-            .map_err(|_| ())?;
-        let completed = wait_for_completion(
-            &self.client,
-            soul,
-            before.head,
-            Duration::from_millis(request.timeout_ms),
-        )
-        .await;
-        Ok(HostedRestSendResult {
-            session_id: request.session_id,
-            completed,
-        })
-    }
-}
-
 impl HostedFreshAgentGateway for HostedFreshAgentProxy {
     fn dispatch(
         self: Arc<Self>,
@@ -689,44 +744,10 @@ impl HostedFreshAgentGateway for HostedFreshAgentProxy {
     }
 }
 
-async fn wait_for_completion(
-    client: &RuntimeClient,
-    soul: SoulId,
-    mut cursor: u64,
-    budget: Duration,
-) -> bool {
-    let deadline = tokio::time::Instant::now() + budget;
-    loop {
-        let Ok(batch) = client.fresh_agent_events(soul.clone(), cursor, 128).await else {
-            return false;
-        };
-        for entry in batch.events {
-            cursor = cursor.max(entry.sequence);
-            if provider_event_completes_turn(&entry.event) {
-                return true;
-            }
-        }
-        let now = tokio::time::Instant::now();
-        if now >= deadline {
-            return false;
-        }
-        tokio::time::sleep((deadline - now).min(Duration::from_millis(50))).await;
-    }
-}
-
-fn provider_event_completes_turn(event: &AgentEvent) -> bool {
-    let AgentEvent::Provider { payload } = event else {
-        return false;
-    };
-    let event = payload.get("event").unwrap_or(payload);
-    let event_type = event
-        .get("type")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or_default();
-    event_type == "freshAgent.turn.complete"
-        || (event_type == "freshAgent.status"
-            && event.get("status").and_then(serde_json::Value::as_str) == Some("idle"))
-}
+#[path = "fresh_agent_proxy_rest.rs"]
+mod rest;
+#[cfg(test)]
+use rest::provider_event_completes_turn;
 
 fn resume_view_matches(
     view: &freshell_runtime_protocol::RuntimeView,
@@ -837,6 +858,24 @@ fn decision_id(value: StringOrNumber) -> String {
     }
 }
 
+fn operation_error_code(error: &freshell_runtime_client::ClientError) -> &'static str {
+    match error.runtime_code() {
+        Some(RuntimeErrorCode::UnsupportedOperation) => "UNSUPPORTED_CAPABILITY",
+        Some(RuntimeErrorCode::OperationImplementationUnavailable) => "IMPLEMENTATION_UNAVAILABLE",
+        Some(RuntimeErrorCode::CommandAmbiguous) => "COMMAND_AMBIGUOUS",
+        Some(RuntimeErrorCode::RequestIdConflict) => "REQUEST_ID_CONFLICT",
+        _ => "MANAGED_FRESH_AGENT_ERROR",
+    }
+}
+
+fn fresh_agent_error_payload(code: &str, message: &str) -> serde_json::Value {
+    serde_json::json!({
+        "type":"freshAgent.error",
+        "code":code,
+        "message":message,
+    })
+}
+
 fn rewrite_presentation_id(payload: &mut serde_json::Value, presentation_id: &str) {
     let Some(object) = payload.as_object_mut() else {
         return;
@@ -861,6 +900,13 @@ fn rewrite_presentation_id(payload: &mut serde_json::Value, presentation_id: &st
             }
         }
         _ => {}
+    }
+    // Provider broadcasts can be either a raw freshAgent.* frame or a
+    // ServerMessage::FreshAgentEvent envelope. Rewrite the nested event too;
+    // materialization still preserves the newly observed native identity by
+    // changing only previousSessionId in its own arm above.
+    for child in object.values_mut() {
+        rewrite_presentation_id(child, presentation_id);
     }
 }
 

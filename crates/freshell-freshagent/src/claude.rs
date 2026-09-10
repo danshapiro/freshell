@@ -2487,6 +2487,35 @@ impl FreshClaudeState {
         (approvals, questions)
     }
 
+    /// Read the provider-owned transcript and apply this live runtime's pending
+    /// request, settings, status, and rollback overlays. Session hosts use this
+    /// read-only path for capture; it never consults web-owned pane state.
+    pub async fn get_snapshot(
+        &self,
+        session_type: SessionType,
+        thread_id: &str,
+    ) -> Result<Value, String> {
+        let rollback = self.load_rollback_record(thread_id).await;
+        let mut snapshot = crate::claude_snapshot::get_claude_snapshot(
+            session_type_str(session_type),
+            thread_id,
+            rollback.as_ref(),
+        )
+        .await
+        .map_err(|error| match error {
+            crate::claude_snapshot::ClaudeSnapshotError::NotFound => {
+                "claude session not found".to_string()
+            }
+            crate::claude_snapshot::ClaudeSnapshotError::Io(_) => {
+                "claude snapshot unavailable".to_string()
+            }
+        })?;
+        let (approvals, questions) = self.snapshot_pending_overlay(thread_id).await;
+        crate::claude_snapshot::apply_pending_overlay(&mut snapshot, approvals, questions);
+        self.apply_snapshot_metadata(thread_id, &mut snapshot).await;
+        Ok(snapshot)
+    }
+
     pub(crate) async fn apply_snapshot_metadata(&self, any_id: &str, snapshot: &mut Value) {
         let Some(key) = self.resolve_session_key(any_id).await else {
             return;
@@ -10265,6 +10294,7 @@ rl.on('line', (line) => {
 
     fn compact_msg(session_id: &str, instructions: Option<&str>) -> FreshAgentCompact {
         FreshAgentCompact {
+            request_id: None,
             provider: freshell_protocol::AgentProvider::Claude,
             session_id: session_id.to_string(),
             session_type: SessionType::Freshclaude,

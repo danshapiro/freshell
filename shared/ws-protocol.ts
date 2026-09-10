@@ -817,6 +817,7 @@ export const FreshAgentInterruptSchema = z.object({
 
 export const FreshAgentCompactSchema = z.object({
   type: z.literal('freshAgent.compact'),
+  requestId: z.string().min(1).optional(),
   sessionId: z.string().min(1),
   sessionType: z.enum(['freshclaude', 'freshcodex', 'kilroy', 'freshopencode']),
   provider: z.enum(['claude', 'codex', 'opencode']),
