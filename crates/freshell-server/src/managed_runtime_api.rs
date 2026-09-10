@@ -306,6 +306,8 @@ impl ManagedRuntimeApiState {
                 create_request_id: create_request_id.as_deref(),
                 origin_create_request_id: create_request_id.as_deref(),
                 provenance: ProvenancePolicy::Inherit,
+                observed_epoch: None,
+                observed_generation: None,
                 now_ms: now,
             })
         })

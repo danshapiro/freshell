@@ -1203,6 +1203,11 @@ impl Registry {
                 "INSERT INTO writer_claims (provider,provider_store_id,native_session_id,soul_id,incarnation_id,intent_revision) VALUES (?1,?2,?3,?4,?5,?6)",
                 params![provider, store, child_session_id, soul_id.as_str(), incarnation_id.as_str(), intent],
             )?;
+            // An in-soul reroot changes both the provider-native writer key
+            // and the externally resumable presentation key. Persist them
+            // together so a web-server restart cannot rediscover the retired
+            // parent through inventory fallback.
+            spec.session_id = child_session_id.clone();
             spec.native_session_id = Some(child_session_id.clone());
             let now = now_millis();
             tx.execute(
@@ -3279,6 +3284,24 @@ mod tests {
                 .as_ref()
                 .and_then(|spec| spec.native_session_id.as_deref()),
             Some("native-child")
+        );
+        assert_eq!(
+            context
+                .fresh_agent
+                .as_ref()
+                .map(|spec| spec.session_id.as_str()),
+            Some("native-child"),
+            "inventory fallback must not resurrect the retired presentation alias",
+        );
+        let inventory = registry.inventory().await.unwrap();
+        let view = inventory
+            .iter()
+            .find(|view| view.soul_id == soul)
+            .expect("forked soul remains inventoried");
+        assert_eq!(view.fresh_agent_session_id.as_deref(), Some("native-child"));
+        assert_ne!(
+            view.fresh_agent_session_id.as_deref(),
+            Some("fresh-session")
         );
         assert_eq!(
             context.prior_handle.incarnation_id(),

@@ -4394,6 +4394,7 @@ describe('FreshAgentView', () => {
 
     expect(wsMock.send).toHaveBeenCalledWith({
       type: 'freshAgent.compact',
+      requestId: expect.any(String),
       sessionId: 'freshopencode-req-compact',
       sessionType: 'freshopencode',
       provider: 'opencode',
@@ -10368,15 +10369,16 @@ describe('b8ke ext r21 F2: the compact/undo/fork senders carry the observed fenc
     // The queued frame carries the observed pair — the server's stale-pair
     // rejection can refuse a reconnect-replayed stale compact, never an
     // unfenced recreation.
-    expect(wsMock.send).toHaveBeenCalledWith({
+    expect(wsMock.send).toHaveBeenCalledWith(expect.objectContaining({
       type: 'freshAgent.compact',
+      requestId: expect.any(String),
       sessionId: 'ses-r21-compact',
       sessionType: 'freshopencode',
       provider: 'opencode',
       cwd: '/repo/r21',
       observedEpoch: 12,
       observedGeneration: 34,
-    })
+    }))
   })
 
   it('/compact with NO owner record sends no pair (the legacy-unfenced shape)', async () => {

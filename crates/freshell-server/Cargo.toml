@@ -35,7 +35,6 @@ name = "freshell-server"
 path = "src/main.rs"
 
 [dependencies]
-freshell-agent-runtime = { path = "../freshell-agent-runtime", optional = true }
 freshell-protocol = { path = "../freshell-protocol" }
 freshell-ws = { path = "../freshell-ws" }
 freshell-api = { path = "../freshell-api" }
@@ -61,6 +60,7 @@ freshell-terminal = { path = "../freshell-terminal" }
 # kata b8ke Task 3: the ONE runtime-ownership coordinator minted in main and
 # injected into every fresh-agent lane (plus the Starting-state watchdog).
 freshell-ownership = { path = "../freshell-ownership" }
+freshell-agent-runtime = { path = "../freshell-agent-runtime", optional = true }
 freshell-runtime-client = { path = "../freshell-runtime-client", optional = true }
 freshell-runtime-observability = { path = "../freshell-runtime-observability" }
 freshell-runtime-protocol = { path = "../freshell-runtime-protocol", optional = true }

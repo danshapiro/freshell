@@ -26,6 +26,11 @@ pub use qualification_policy::{
     qualification_policy_from_value, QualificationPolicy, QUALIFICATION_PROVIDER_ENV,
 };
 pub mod host_actor;
+pub mod snapshot_projection;
+
+#[cfg(test)]
+#[path = "snapshot_projection_tests.rs"]
+mod snapshot_projection_tests;
 
 pub const PROVIDER_HOME: &str = "/home/freshell/provider";
 pub const MAX_SUCCESSFUL_RECOVERIES_PER_HOUR: u64 = 5;

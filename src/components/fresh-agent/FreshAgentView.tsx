@@ -1734,6 +1734,7 @@ export function FreshAgentView({
       const fence = selectPaneOwnerFence(appStore.getState(), current)
       sendFreshAgentMessage({
         type: 'freshAgent.compact',
+        requestId: nanoid(),
         sessionId: current.sessionId,
         sessionType: current.sessionType,
         provider: current.provider,
