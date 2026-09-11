@@ -409,8 +409,8 @@ behavioral matrix, including actual-provider and stress scenarios. Use
 for focused work. `npm run test:runtime -- gate phase-5 --require-live` runs
 only the deterministic Docker subset. Neither imports an earlier certificate.
 
-The configured browser backend must support Docker; unsupported execution is
-reported as blocked, never silently replaced. Ordinary logs/results retain
+Stage 5a browser verification explicitly uses the approved local Docker lane
+through `test:e2e:local`, independent of the ambient cloud default. Ordinary logs/results retain
 build and provider identity without a clean-SHA or evidence-catalog prerequisite.
 See test/runtime/README.md for coverage mapping and credential policy.
 

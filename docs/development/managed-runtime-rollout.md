@@ -184,7 +184,7 @@ npm run test:runtime:verify -- --suite all
 ```
 
 The runtime command includes actual providers and long stress work; it needs
-credentials and a Docker-capable configured browser runner. See
+credentials and the approved local Docker browser runner. See
 `test/runtime/README.md` for focused commands. Failed, skipped, and unrun
 scenarios remain unresolved; no report import or clean-SHA certificate is needed.
 

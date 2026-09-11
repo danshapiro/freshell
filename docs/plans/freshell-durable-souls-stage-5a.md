@@ -52,11 +52,11 @@ durable view intent, durable incidents, and idempotent notices.
    `node:sqlite` client-environment suite loads and one remaining arrow-constructor
    xterm mock. Unit and server subsets had passed. Repair test ownership and the
    mock, not product behavior; retain the tests in their proper runner.
-7. **Environment:** E2E is configured `cloud`; Vitest is unset (local default).
-   Do not silently switch browser execution to local. Docker-backed tests must
-   use a suitable explicit runner; report the unsupported configured lane rather
-   than counting excluded specs as coverage. No production restart or PR is
-   authorized by this stage.
+7. **Environment amendment (September 11):** Dan explicitly selected the local
+   Docker-backed browser lane for Stage 5a. `runtime-verify` therefore invokes
+   `test:e2e:local` and pins `FRESHELL_E2E_BACKEND=local` for browser steps,
+   regardless of the ambient shell's cloud default. This is the approved lane,
+   not a silent fallback. No production restart or PR is authorized by this stage.
 
 ## Implementation sequence
 
@@ -181,7 +181,7 @@ Logs below are relative to `.runtime-evidence/stage-5a/` in this worktree.
 | Actual Docker P5-G06: export and cleanup failures | PASS; cleanup successful; zero unsafe attempts. | `docker-p5-g06.log` |
 | Actual Docker P5-G07: crashes at loss/cleanup/notice boundaries | PASS; cleanup successful; zero unsafe attempts. | `docker-p5-g07-final.log` |
 | Actual Docker P5-G08: private durable observations without invented postmortem | PASS; cleanup successful; zero unsafe attempts. | `docker-p5-g08-final.log` |
-| Configured cloud browser attempt (`--only rehydrate`) | BLOCKED, exit 2: this Cloud Run backend cannot host the Docker runtime. No local fallback or skipped coverage counted as a pass. | `browser-backend.log` |
+| Original cloud browser attempt (`--only rehydrate`) | Historical BLOCKED result before the local-lane amendment; superseded by the final local runs below. | `browser-backend.log` |
 
 The initial failures and their fixes remain in the adjacent `*-red.log` and
 first-run logs. The combined regression first exposed the inherited Electron
@@ -193,8 +193,9 @@ marker issue. Both were fixed and rerun successfully, rather than omitted.
 Stage 5a is implemented. It does not claim a new full all-provider live campaign,
 a new 30-minute stress run, or execution of all 50 Docker scenarios in this task.
 The relevant actual Docker loss scenarios and the ordinary regression suite
-passed. Actual-provider/fresh-mode browser verification still needs an approved
-Docker-capable runner; conservative defaults were not silently promoted.
+passed. Actual-provider/fresh-mode browser verification now runs through the explicitly
+approved local Docker lane. Conservative defaults remain unchanged until the
+complete local matrix passes and the release-scope update is reviewed.
 Gemini/Kimi/plugin implementation gaps remain gaps in the original product,
 not exclusions introduced by simplification. Complete the original provider
 and operation coverage before calling the full feature deployed.

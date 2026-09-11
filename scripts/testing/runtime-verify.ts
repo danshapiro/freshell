@@ -12,7 +12,7 @@ export type VerificationStep = {
 }
 const spec = (name: string) => `test/e2e-browser/specs/${name}-rust.spec.ts`
 const browser = (id: string, lane: Exclude<Suite, 'all'>, name: string, env: Record<string, string> = {}): VerificationStep => ({
-  id, lane, browser: true, args: ['run', 'test:e2e', '--', '--project=rust-chromium', '--reporter=json', spec(name)], env,
+  id, lane, browser: true, args: ['run', 'test:e2e:local', '--', '--project=rust-chromium', '--reporter=json', spec(name)], env: { ...env, FRESHELL_E2E_BACKEND: 'local' },
 })
 const STEPS: VerificationStep[] = [
   { id: 'runtime', lane: 'deterministic', browser: false, args: ['run', 'test:runtime', '--', 'gate', 'phase-5', '--require-live'], env: {} },
@@ -71,11 +71,6 @@ export function verificationOutcome(results: Array<'PASS' | 'FAIL' | 'BLOCKED'>)
   return results.includes('BLOCKED') ? { status: 'BLOCKED', exitCode: 2 } : { status: 'PASS', exitCode: 0 }
 }
 
-export function browserBackendBlock(env: NodeJS.ProcessEnv): string | null {
-  if (env.FRESHELL_E2E_BACKEND === 'cloud') return 'Configured Cloud Run browser backend has no Docker runtime support; use an approved Docker-capable runner. No local fallback or skipped coverage was used.'
-  if (env.FRESHELL_E2E_BACKEND !== 'local') return 'Choose an explicit supported browser backend before running Docker-backed browser tests.'
-  return null
-}
 
 async function execute(args: string[], env: NodeJS.ProcessEnv, log: string): Promise<number> {
   const fd = fs.openSync(log, 'wx', 0o600)
@@ -101,14 +96,7 @@ export async function runVerification(selection: VerificationSelection, override
   for (const step of steps) {
     const log = path.join(root, `${step.id}.log`)
     const reportFile = path.join(root, `${step.id}.playwright.json`)
-    const env = { ...process.env, ...step.env, ...overrides, PLAYWRIGHT_JSON_OUTPUT_NAME: reportFile }
-    const block = step.browser ? browserBackendBlock(env) : null
-    if (block) {
-      fs.writeFileSync(log, block, { mode: 0o600 })
-      results.push({ id: step.id, status: 'BLOCKED', exitCode: 2, error: block, log })
-      console.log(`BLOCKED ${step.id}: ${block}`)
-      continue
-    }
+    const env = { ...process.env, ...overrides, ...step.env, PLAYWRIGHT_JSON_OUTPUT_NAME: reportFile }
     console.log(`RUN ${step.id}: ${log}`)
     let exitCode = 1, error: string|null = null
     try {

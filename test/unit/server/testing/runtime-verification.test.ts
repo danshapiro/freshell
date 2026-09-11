@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { parseVerificationArgs, verificationSteps, playwrightFailure, verificationOutcome, browserBackendBlock } from '../../../../scripts/testing/runtime-verify.js'
+import { parseVerificationArgs, verificationSteps, playwrightFailure, verificationOutcome } from '../../../../scripts/testing/runtime-verify.js'
 
 describe('direct runtime verification', () => {
   it('keeps every implemented terminal provider and fresh mode in the live matrix', () => {
@@ -37,10 +37,13 @@ describe('direct runtime verification', () => {
 })
 
 
-describe('configured Docker browser execution', () => {
-  it('does not silently substitute local execution for cloud or an unset backend', () => {
-    expect(browserBackendBlock({ FRESHELL_E2E_BACKEND: 'cloud' })).toMatch(/no Docker runtime support/)
-    expect(browserBackendBlock({})).toMatch(/explicit supported/)
-    expect(browserBackendBlock({ FRESHELL_E2E_BACKEND: 'local' })).toBeNull()
+describe('Stage 5a local Docker browser execution', () => {
+  it('uses the explicit local browser entrypoint regardless of ambient cloud configuration', () => {
+    const browserSteps = verificationSteps({ suite: 'all' }).filter(step => step.browser)
+    expect(browserSteps.length).toBeGreaterThan(0)
+    for (const step of browserSteps) {
+      expect(step.args.slice(0, 2)).toEqual(['run', 'test:e2e:local'])
+      expect(step.env.FRESHELL_E2E_BACKEND).toBe('local')
+    }
   })
 })

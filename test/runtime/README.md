@@ -41,11 +41,10 @@ not a whole-product or actual-provider result. `--case` is narrower still.
 
 ## Runner and sandbox
 
-Browser tests use the configured E2E backend. The current Cloud Run browser
-backend does not support the Docker runtime; the direct runner reports BLOCKED
-rather than silently substituting local execution or accepting skipped specs.
-Use an approved Docker-capable runner for those scenarios. Nonbrowser Docker
-cases are a separate sandbox workload, not a browser fallback.
+Stage 5a browser tests explicitly use the local Docker-backed entrypoint
+`test:e2e:local` and pin `FRESHELL_E2E_BACKEND=local`. Dan selected this lane
+for final qualification; it is not an ambient fallback from cloud. Nonbrowser
+Docker cases remain a separate sandbox workload.
 
 All destructive scenarios stay within RuntimeHarness and the restricted Docker
 broker. Exact container/volume ownership records and cleanup are retained.
