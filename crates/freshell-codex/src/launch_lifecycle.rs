@@ -1296,25 +1296,38 @@ impl CodexLaunchRuntime for SpawnedCodexAppServerRuntime {
                             state: SidecarRecordState::Active,
                             lane: None,
                         };
-                        // Write failures are logged LOUDLY, never abort the
-                        // launch (the pane-ledger write-failure policy).
-                        if let Err(error) = self.store.write(&row) {
+                        // A detached sidecar without a durable row is an
+                        // unrecoverable ownership gap. Fail closed: terminate
+                        // the exact Child handle this invocation still owns
+                        // and refuse to acknowledge the launch. Do NOT widen
+                        // this failure path into a process-name/env scan.
+                        if let Err(error) =
+                            persist_record_or_terminate_exact_child(&self.store, &row, &mut child)
+                                .await
+                        {
                             tracing::error!(
                                 target: "freshell_codex::launch",
                                 ownership_id = %row.ownership_id,
                                 pid = row.pid,
                                 error = %error,
-                                "sidecar_record_write_failed: spawn proceeds UNTRACKED \
-                                 (detached; boot reconcile cannot see this sidecar)"
+                                "sidecar_record_write_failed: exact spawned child terminated; \
+                                 retained launch refused"
                             );
+                            return Err(error);
                         }
                         record = Some(row);
                     }
-                    None => tracing::error!(
-                        target: "freshell_codex::launch",
-                        ownership_id = %ownership_id,
-                        "sidecar_record_skipped: child pid unavailable after probe success"
-                    ),
+                    None => {
+                        let _ = child.start_kill();
+                        let _ = tokio::time::timeout(Duration::from_secs(5), child.wait()).await;
+                        tracing::error!(
+                            target: "freshell_codex::launch",
+                            ownership_id = %ownership_id,
+                            "sidecar_record_skipped: child pid unavailable after probe success; \
+                             exact spawned child terminated and launch refused"
+                        );
+                        return Err("codex app-server launch refused: child pid unavailable for durable ownership record".to_string());
+                    }
                 }
             }
 
@@ -1440,9 +1453,72 @@ impl CodexLaunchRuntime for SpawnedCodexAppServerRuntime {
     }
 }
 
+/// Persist the ownership row before a detached launch can be acknowledged.
+/// On write failure the only process signalled here is the exact `Child`
+/// handle returned by this invocation's spawn; no legacy process scan is
+/// authorized by a persistence failure.
+async fn persist_record_or_terminate_exact_child(
+    store: &CodexSidecarStore,
+    row: &CodexSidecarRecord,
+    child: &mut tokio::process::Child,
+) -> Result<(), String> {
+    if let Err(error) = store.write(row) {
+        let pid = child.id();
+        let kill_error = child.start_kill().err().map(|e| e.to_string());
+        let wait_result = tokio::time::timeout(Duration::from_secs(5), child.wait()).await;
+        let cleanup = match wait_result {
+            Ok(Ok(status)) => format!("exact child {pid:?} exited with {status}"),
+            Ok(Err(wait_error)) => format!("exact child {pid:?} wait failed: {wait_error}"),
+            Err(_) => format!("exact child {pid:?} did not confirm exit within cleanup budget"),
+        };
+        return Err(format!(
+            "codex app-server ownership record write failed: {error}; {cleanup}{}",
+            kill_error
+                .map(|e| format!("; start_kill failed: {e}"))
+                .unwrap_or_default()
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn durable_record_failure_terminates_exact_detached_child_and_refuses_success() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let bad_root = dir.path().join("not-a-directory");
+        std::fs::write(&bad_root, b"file").expect("seed non-directory store root");
+        let store = CodexSidecarStore::new(bad_root);
+        let mut command = tokio::process::Command::new("sleep");
+        command.arg("60").kill_on_drop(false);
+        let mut child = command.spawn().expect("spawn owned child");
+        let pid = child.id().expect("child pid");
+        let row = CodexSidecarRecord {
+            record_version: SIDECAR_RECORD_VERSION,
+            ownership_id: "codex-sidecar-phase1-write-failure".to_string(),
+            pid,
+            starttime: proc_starttime(pid as i32).unwrap_or(0),
+            cmdline: proc_cmdline(pid as i32).unwrap_or_else(|| vec!["sleep".into(), "60".into()]),
+            ws_url: "ws://127.0.0.1:1".into(),
+            session_id: None,
+            terminal_id: None,
+            server_instance_id: default_server_instance_id(),
+            created_at: unix_millis(),
+            updated_at: unix_millis(),
+            state: SidecarRecordState::Active,
+            lane: None,
+        };
+        let error = persist_record_or_terminate_exact_child(&store, &row, &mut child)
+            .await
+            .expect_err("unwritable durability store must refuse retained launch");
+        assert!(error.contains("ownership record write failed"));
+        assert!(
+            child.try_wait().expect("try_wait exact child").is_some(),
+            "the exact child must be confirmed stopped before returning failure"
+        );
+    }
 
     #[tokio::test]
     async fn drain_forwards_tagged_events_to_the_sink() {

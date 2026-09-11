@@ -1,0 +1,954 @@
+{
+  "schema_version": 1,
+  "kind": "freshell_managed_runtime_gate_specification",
+  "status": "SPECIFICATION_NOT_EXECUTED",
+  "prepared_on": "2026-09-06",
+  "inspected_commit": "78b8d9d7ae6c02f81646fe22f11bd7e286f0054c",
+  "source_document": "freshell-durable-souls-five-phase-execution-plan.md",
+  "source_document_sha256": "d48f853e24e9d15cf3153c6ac4520d91912de65c2203c96e393cc8d52e27456c",
+  "intended_repository_path": "test/runtime/gate-manifest.json",
+  "required_scenario_count": 56,
+  "implementation_task_count": 31,
+  "execution_contract": {
+    "entrypoint_exists_at_inspected_commit": false,
+    "implementation_phase": 1,
+    "cumulative": true,
+    "required_status_for_every_expanded_case": "PASS",
+    "exit_codes": {
+      "0": "PASS",
+      "1": "FAIL",
+      "2": "BLOCKED"
+    },
+    "skip_is_pass": false,
+    "missing_tests_is_pass": false,
+    "fixture_is_real_provider_substitute": false,
+    "unexplained_retry_is_pass": false,
+    "cleanup_failure_is_pass": false,
+    "foreign_target_request_even_if_proxy_rejects_is_pass": false,
+    "required_artifacts": [
+      "manifest.json",
+      "summary.json",
+      "build.json",
+      "capabilities.json",
+      "ownership-before.json",
+      "ownership-after.json",
+      "lifecycle.jsonl",
+      "assertions.jsonl",
+      "provider-results.json",
+      "browser/",
+      "incidents/",
+      "cleanup.json"
+    ],
+    "evidence_root": ".runtime-evidence/<candidate-sha>/<run-id>/",
+    "notes": "Phase 1 browser/provider entries may explicitly record not applicable. From Phase 2, required native-provider and browser cases must execute. An explicit NOT_APPLICABLE artifact is not permission to skip a required test.",
+    "provider_test_cost_policy": {
+      "opencode": {
+        "default_lane": "free_tier",
+        "rule": "Use the real OpenCode free-tier path first/default whenever it supports the behavior under test; record the resolved provider/model."
+      },
+      "claude": {
+        "model": "Haiku",
+        "thinking_or_reasoning": "lowest_available",
+        "rule": "Do not silently upgrade to Sonnet/Opus or a higher thinking/reasoning setting."
+      },
+      "codex": {
+        "model": "GPT-5.6 Luna",
+        "thinking_or_reasoning": "lowest_available",
+        "rule": "Do not silently upgrade to a higher-cost model or higher thinking/reasoning setting."
+      },
+      "unavailable_required_configuration": "BLOCKED",
+      "override_rule": "Only a test explicitly about another model may override; the scenario and evidence must name the resolved model and reasoning/thinking setting."
+    }
+  },
+  "parameter_expansion": {
+    "required": true,
+    "freeze_enabled_configuration_before_run": true,
+    "configuration_removal_to_pass_forbidden": true,
+    "expanded_id_format": "<scenario-id>/<provider>/<mode>/<ingress>/<variant-as-needed>",
+    "expected_modes_at_inspected_base": [
+      "claude-cli",
+      "freshclaude",
+      "kilroy",
+      "codex-terminal",
+      "freshcodex",
+      "opencode-terminal",
+      "freshopencode",
+      "amplifier-terminal"
+    ],
+    "additional_modes": "All enabled Gemini, Kimi, extension/plugin, or newly registered coding modes; enumerate current registrations.",
+    "ingress_inventory": [
+      "browser-picker",
+      "browser-split",
+      "history-resume",
+      "ws-create",
+      "ws-attach",
+      "rest-tab",
+      "rest-split",
+      "mcp-new-tab",
+      "mcp-split",
+      "startup-restore",
+      "auto-resume",
+      "managed-child-agent"
+    ],
+    "applicability_rule": "Expand actual supported modes and ingresses from the capability manifest. Explicit capability-negative behavior is tested, not marked as an executed positive resume test.",
+    "phase_1": "Real compiled supervisor/host, Docker, OS fixture processes, ownership and fault injection. No external coding-provider substitution is claimed.",
+    "phase_2": "Includes OpenCode 1.18.21 with anonymous free-tier model opencode/big-pickle and a real browser; auto-update is disabled and fixture loads establish measured resource boundaries. Claude and Codex are subsequent provider lanes governed by the provider test-cost policy.",
+    "phase_3": "Every enabled mode executes real create and native resume; each supported ingress must traverse the production launch path. Error/rare-race variants may use actual fixture processes as specified.",
+    "phase_4": "Real browser, server, supervisor and host with enabled real-provider smoke set, plus deterministic multi-soul stress fixtures.",
+    "phase_5": "Every enabled family proves automatic native recovery is not loss; actual isolated provider state used for the genuine-loss test, complete live mode/ingress campaign and fixture chaos.",
+    "expected_actual_sets_must_match": true
+  },
+  "phases": [
+    {
+      "number": 1,
+      "id": "phase-1",
+      "title": "durable ownership, safe launch/stop, and the live test harness",
+      "depends_on": [],
+      "command": "npm run test:runtime -- gate phase-1 --require-live",
+      "command_status": "TO_BE_IMPLEMENTED_IN_PHASE_1",
+      "tasks": [
+        {
+          "id": "P1.1",
+          "title": "freeze types and threat boundary"
+        },
+        {
+          "id": "P1.2",
+          "title": "build the protected registry"
+        },
+        {
+          "id": "P1.3",
+          "title": "implement the Docker backend with no process-creation gap"
+        },
+        {
+          "id": "P1.4",
+          "title": "implement authoritative stop"
+        },
+        {
+          "id": "P1.5",
+          "title": "harden legacy hazards without broadening legacy authority"
+        },
+        {
+          "id": "P1.6",
+          "title": "construct physically isolated live tests"
+        },
+        {
+          "id": "P1.7",
+          "title": "protocol and evidence scaffolding"
+        }
+      ],
+      "cases": [
+        {
+          "id": "P1-G01",
+          "required": true,
+          "procedure": "Run the sandbox selftest, then start the compiled supervisor/host and real heartbeat worker through actual IPC/Docker.",
+          "pass_assertion": "Correct binary/image hashes, usable worker, committed owned ID, effective limits, no production mounts/ports.",
+          "status": "NOT_RUN"
+        },
+        {
+          "id": "P1-G02",
+          "required": true,
+          "procedure": "Crash the supervisor at each launch barrier: after intent, after Docker create, after ID commit, after host start, before/after grant commit and delivery. Restart with the same volume.",
+          "pass_assertion": "No provider before ownership/grant; at most one authorized launch; unregistered created objects are stopped; no acknowledged untracked worker.",
+          "status": "NOT_RUN"
+        },
+        {
+          "id": "P1-G03",
+          "required": true,
+          "procedure": "Make registry writes fail before launch, at ID commit, and at grant commit.",
+          "pass_assertion": "API errors; no provider execution and no success acknowledgment; recoverable evidence remains.",
+          "status": "NOT_RUN"
+        },
+        {
+          "id": "P1-G04",
+          "required": true,
+          "procedure": "Start unrelated sentinel processes and containers with matching executable names, cwd strings, labels, and copied environment tags; submit stale/wrong handles.",
+          "pass_assertion": "Sentinels keep heartbeating; SUT emits no destructive request for them. Test owner cleans them later by its separate receipts.",
+          "status": "NOT_RUN"
+        },
+        {
+          "id": "P1-G05",
+          "required": true,
+          "procedure": "Let an owned worker fork/double-fork, change session/group, and spawn during stop.",
+          "pass_assertion": "Exact enclosure becomes empty; all owned descendants stop; unrelated sentinel stays alive.",
+          "status": "NOT_RUN"
+        },
+        {
+          "id": "P1-G06",
+          "required": true,
+          "procedure": "Inject Docker timeout/stop failure and then restore Docker control.",
+          "pass_assertion": "First outcome is unconfirmed, record/claim retained; later stop verifies empty; no premature `Reaped` or notice.",
+          "status": "NOT_RUN"
+        },
+        {
+          "id": "P1-G07",
+          "required": true,
+          "procedure": "Start two supervisors against the same registry; replay stale epoch commands and reused request IDs with a changed payload.",
+          "pass_assertion": "One controller; stale control rejected; conflicting request rejected; no duplicate worker.",
+          "status": "NOT_RUN"
+        },
+        {
+          "id": "P1-G08",
+          "required": true,
+          "procedure": "Exercise legacy registration-write failure and legacy sweep kill refusal in the destructive sandbox.",
+          "pass_assertion": "No successful retained untracked launch; no unconditional `Reaped`; no foreign signal.",
+          "status": "NOT_RUN"
+        },
+        {
+          "id": "P1-G09",
+          "required": true,
+          "procedure": "Attempt runtime access to Docker/admin IPC, another incarnation's socket, registry files, and host PID namespace.",
+          "pass_assertion": "Access denied; own allowed IPC still functions.",
+          "status": "NOT_RUN"
+        },
+        {
+          "id": "P1-G10",
+          "required": true,
+          "procedure": "Run a normal release image with test fault settings, then intentionally leave a required test unmatched/skipped in a harness selftest.",
+          "pass_assertion": "Release fault hooks absent; the gate checker fails the deliberately incomplete run.",
+          "status": "NOT_RUN"
+        }
+      ],
+      "cumulative_required_case_ids": [
+        "P1-G01",
+        "P1-G02",
+        "P1-G03",
+        "P1-G04",
+        "P1-G05",
+        "P1-G06",
+        "P1-G07",
+        "P1-G08",
+        "P1-G09",
+        "P1-G10"
+      ],
+      "own_required_case_count": 10,
+      "cumulative_required_case_count": 10
+    },
+    {
+      "number": 2,
+      "id": "phase-2",
+      "title": "independent PTY/session hosts and enforced per-agent budgets",
+      "depends_on": [
+        "phase-1"
+      ],
+      "command": "npm run test:runtime -- gate phase-2 --require-live",
+      "command_status": "IMPLEMENTED_LIVE_GATE",
+      "tasks": [
+        {
+          "id": "P2.1",
+          "title": "define the workload image and persistent mounts"
+        },
+        {
+          "id": "P2.2",
+          "title": "limits and admission"
+        },
+        {
+          "id": "P2.3",
+          "title": "move PTY ownership out of the web server"
+        },
+        {
+          "id": "P2.4",
+          "title": "bounded output and durable commands"
+        },
+        {
+          "id": "P2.5",
+          "title": "first real coding CLI/server adapter: OpenCode free-tier"
+        },
+        {
+          "id": "P2.6",
+          "title": "OOM, exit, and test fixtures"
+        }
+      ],
+      "cases": [
+        {
+          "id": "P2-G01",
+          "required": true,
+          "procedure": "Through the real browser, open a managed shell running a heartbeat and a long child command. Gracefully restart web, then SIGKILL web, ten cycles total.",
+          "pass_assertion": "Same soul, incarnation, container, host boot, and child process identity; output advances; input remains usable; one tab/view association.",
+          "status": "NOT_RUN"
+        },
+        {
+          "id": "P2-G02",
+          "required": true,
+          "procedure": "Close all browsers and stop web for 60 seconds while output is produced; reconnect with old and expired cursors.",
+          "pass_assertion": "Worker continues; output replay is ordered/deduped; explicit reset on expired cursor; queues/spool stay within configured bounds.",
+          "status": "NOT_RUN"
+        },
+        {
+          "id": "P2-G03",
+          "required": true,
+          "procedure": "Restart and crash the supervisor while web and the worker run.",
+          "pass_assertion": "Same provider incarnation keeps running; new supervisor adopts it; stale epoch control is rejected.",
+          "status": "NOT_RUN"
+        },
+        {
+          "id": "P2-G04",
+          "required": true,
+          "procedure": "Start OpenCode 1.18.21 with opencode/big-pickle on the anonymous free-tier path, complete a first Bash-tool turn, begin a controlled long Bash tool, SIGKILL/restart web while the tool is running, then run a provider-side tool in a follow-up.",
+          "pass_assertion": "Same native ses_* session, soul, OS incarnation, container and host boot; tool effects occur exactly once; provider launch count stays one; no paid-model fallback or CLI auto-update.",
+          "status": "NOT_RUN"
+        },
+        {
+          "id": "P2-G05",
+          "required": true,
+          "procedure": "Run CPU burners with four descendants under a 500-milliCPU fixture profile while an independent sentinel runs. Measure 30 seconds after warmup.",
+          "pass_assertion": "Effective `cpu.max` matches; aggregate CPU time stays at or below 0.60 CPU-seconds/second over the window; throttling counters increase when schedulable; sentinel remains responsive. If host starvation prevents proving throttling, mark infrastructure blocked, not pass.",
+          "status": "NOT_RUN"
+        },
+        {
+          "id": "P2-G06",
+          "required": true,
+          "procedure": "Grow touched memory beyond the 256 MiB fixture cap, including a child-only allocation case.",
+          "pass_assertion": "Effective memory/swap bounds match; cgroup OOM/exit observed; web and unrelated sentinel survive; no unbounded allocation; no false lost verdict.",
+          "status": "NOT_RUN"
+        },
+        {
+          "id": "P2-G07",
+          "required": true,
+          "procedure": "Spawn bounded descendants until the PID/thread ceiling rejects more; also test a double-fork/setsid descendant.",
+          "pass_assertion": "Effective process ceiling enforced; every descendant remains in the same quota boundary; complete owned cleanup.",
+          "status": "NOT_RUN"
+        },
+        {
+          "id": "P2-G08",
+          "required": true,
+          "procedure": "Submit concurrent launches that exceed the configured aggregate budget and attach a second view to one soul.",
+          "pass_assertion": "Admitted reservations never exceed budget; excess launches blocked; second view creates neither worker nor reservation.",
+          "status": "NOT_RUN"
+        },
+        {
+          "id": "P2-G09",
+          "required": true,
+          "procedure": "Use a real Git worktree, file edit/build command, provider home, and saved cwd; recreate only the web container.",
+          "pass_assertion": "Git/common-dir paths and edits work; files and provider state persist; registry/control secrets inaccessible from workload.",
+          "status": "NOT_RUN"
+        },
+        {
+          "id": "P2-G10",
+          "required": true,
+          "procedure": "Lose command acknowledgment, retry the same request, then stop while a create/input acknowledgment is delayed.",
+          "pass_assertion": "No duplicate dispatch; conflicting reuse rejected; user stop wins; no replacement spawned by a web exit callback.",
+          "status": "NOT_RUN"
+        },
+        {
+          "id": "P2-G11",
+          "required": true,
+          "procedure": "Restart only named web/supervisor services using deployment commands, then intentionally recreate the host process.",
+          "pass_assertion": "Web/supervisor restarts preserve host; host restart changes boot ID and cannot execute an old grant or create an unregistered second provider.",
+          "status": "NOT_RUN"
+        }
+      ],
+      "cumulative_required_case_ids": [
+        "P1-G01",
+        "P1-G02",
+        "P1-G03",
+        "P1-G04",
+        "P1-G05",
+        "P1-G06",
+        "P1-G07",
+        "P1-G08",
+        "P1-G09",
+        "P1-G10",
+        "P2-G01",
+        "P2-G02",
+        "P2-G03",
+        "P2-G04",
+        "P2-G05",
+        "P2-G06",
+        "P2-G07",
+        "P2-G08",
+        "P2-G09",
+        "P2-G10",
+        "P2-G11"
+      ],
+      "own_required_case_count": 11,
+      "cumulative_required_case_count": 21
+    },
+    {
+      "number": 3,
+      "id": "phase-3",
+      "title": "all provider adapters and automatic soul resurrection",
+      "depends_on": [
+        "phase-1",
+        "phase-2"
+      ],
+      "command": "npm run test:runtime -- gate phase-3 --require-live",
+      "command_status": "TO_BE_IMPLEMENTED_IN_PHASE_1",
+      "tasks": [
+        {
+          "id": "P3.1",
+          "title": "inventory every provider/mode and launch doorway"
+        },
+        {
+          "id": "P3.2",
+          "title": "move the complete provider conversation machinery"
+        },
+        {
+          "id": "P3.3",
+          "title": "capture recoverability, not just an ID"
+        },
+        {
+          "id": "P3.4",
+          "title": "implement typed recovery probes and the full ladder"
+        },
+        {
+          "id": "P3.5",
+          "title": "automatic replacement, no competing restart loops"
+        },
+        {
+          "id": "P3.6",
+          "title": "remove fresh-session substitution from automatic recovery"
+        }
+      ],
+      "cases": [
+        {
+          "id": "P3-G01",
+          "required": true,
+          "procedure": "For every enabled provider/mode in the manifest, create through its actual Freshell UI/API path, complete a turn, and verify native durability.",
+          "pass_assertion": "Actual provider binary/SDK used; version recorded; exact native ID and scoped state captured; no skipped enabled mode.",
+          "status": "NOT_RUN"
+        },
+        {
+          "id": "P3-G02",
+          "required": true,
+          "procedure": "Store a random 128-bit nonce in a completed conversation, then stop the web client, make its owned host unreconnectable, restart web, and let recovery run. Ask for the prior nonce without including it in the new prompt or workspace files.",
+          "pass_assertion": "Old enclosure verified empty before replacement; new incarnation, same soul/native conversation; live follow-up returns nonce; provider trace shows no tool read used to recover nonce from test files.",
+          "status": "NOT_RUN"
+        },
+        {
+          "id": "P3-G03",
+          "required": true,
+          "procedure": "Kill the provider process while host survives; separately kill the host while native state persists. Run for every enabled provider family.",
+          "pass_assertion": "Automatically resumed native session; correct resource profile; only one writer; no user action needed to begin resurrection.",
+          "status": "NOT_RUN"
+        },
+        {
+          "id": "P3-G04",
+          "required": true,
+          "procedure": "Delete the primary state only in an isolated synthetic test soul with a verified provider-compatible backup/checkpoint.",
+          "pass_assertion": "Backup recovery tried before loss; source evidence retained; correct history/native lineage; no unrelated fresh conversation.",
+          "status": "NOT_RUN"
+        },
+        {
+          "id": "P3-G05",
+          "required": true,
+          "procedure": "Force expired credentials, rate limit, provider outage, unreadable/missing mount, incompatible binary, and retry exhaustion; then repair the dependency.",
+          "pass_assertion": "Remains `BLOCKED`, never lost; state preserved; repair leads to the same soul's native resume without needing a blank replacement.",
+          "status": "NOT_RUN"
+        },
+        {
+          "id": "P3-G06",
+          "required": true,
+          "procedure": "Return the wrong native ID from a fixture resume and exercise each managed caller through the former `SpawnFresh` policy.",
+          "pass_assertion": "Wrong ID rejected, failed attempt safely removed, original identity retained; no fresh-session fallback or silent success.",
+          "status": "NOT_RUN"
+        },
+        {
+          "id": "P3-G07",
+          "required": true,
+          "procedure": "Restart before zero-turn materialization, after input journaling but before dispatch, and in the dispatch/ack gap.",
+          "pass_assertion": "Proven pristine seed/queued input can recover; dispatched-ambiguous input is not replayed; no allocated ID is misreported as durable.",
+          "status": "NOT_RUN"
+        },
+        {
+          "id": "P3-G08",
+          "required": true,
+          "procedure": "Deliver concurrent restore/create requests, race user Stop with resume, and restart supervisor during replacement.",
+          "pass_assertion": "At most one writer; stop intent wins; no activation before old runtime verified empty; stale events cannot resurrect old bindings.",
+          "status": "NOT_RUN"
+        },
+        {
+          "id": "P3-G09",
+          "required": true,
+          "procedure": "Open two managed OpenCode souls and stress/kill one; repeat with Codex terminal plus a second view.",
+          "pass_assertion": "OpenCode processes/budgets are independent; second soul unaffected; second view does not launch a second provider writer.",
+          "status": "NOT_RUN"
+        },
+        {
+          "id": "P3-G10",
+          "required": true,
+          "procedure": "Leave a real provider permission prompt/tool in progress, restart web and supervisor, and resolve the prompt on reconnect.",
+          "pass_assertion": "Pending decision survives same-host restart; no accidental approval; tool completes once; no provider dependence on dead web-owned stdin.",
+          "status": "NOT_RUN"
+        },
+        {
+          "id": "P3-G11",
+          "required": true,
+          "procedure": "Cause repeated resumable crashes and restart controllers between attempts.",
+          "pass_assertion": "Persisted retry/flap bounds hold; paused but resumable soul is blocked, not lost; repaired/manual retry reuses the same conversation.",
+          "status": "NOT_RUN"
+        },
+        {
+          "id": "P3-G12",
+          "required": true,
+          "procedure": "Exercise every supported ingress in the generated doorway matrix, including MCP and API creates without a connected browser.",
+          "pass_assertion": "Exactly one supervised/limited runtime per requested soul; zero managed calls to legacy spawn/kill/auto-resume sites.",
+          "status": "NOT_RUN"
+        }
+      ],
+      "cumulative_required_case_ids": [
+        "P1-G01",
+        "P1-G02",
+        "P1-G03",
+        "P1-G04",
+        "P1-G05",
+        "P1-G06",
+        "P1-G07",
+        "P1-G08",
+        "P1-G09",
+        "P1-G10",
+        "P2-G01",
+        "P2-G02",
+        "P2-G03",
+        "P2-G04",
+        "P2-G05",
+        "P2-G06",
+        "P2-G07",
+        "P2-G08",
+        "P2-G09",
+        "P2-G10",
+        "P2-G11",
+        "P3-G01",
+        "P3-G02",
+        "P3-G03",
+        "P3-G04",
+        "P3-G05",
+        "P3-G06",
+        "P3-G07",
+        "P3-G08",
+        "P3-G09",
+        "P3-G10",
+        "P3-G11",
+        "P3-G12"
+      ],
+      "own_required_case_count": 12,
+      "cumulative_required_case_count": 33
+    },
+    {
+      "number": 4,
+      "id": "phase-4",
+      "title": "startup reconciliation and automatic tab reconstruction",
+      "depends_on": [
+        "phase-1",
+        "phase-2",
+        "phase-3"
+      ],
+      "command": "npm run test:runtime -- gate phase-4 --require-live",
+      "command_status": "TO_BE_IMPLEMENTED_IN_PHASE_1",
+      "tasks": [
+        {
+          "id": "P4.1",
+          "title": "implement controller-first startup reconciliation"
+        },
+        {
+          "id": "P4.2",
+          "title": "persist view intent and bridge the existing ledger"
+        },
+        {
+          "id": "P4.3",
+          "title": "extend the public contract compatibly"
+        },
+        {
+          "id": "P4.4",
+          "title": "always reconcile the managed set on the client"
+        },
+        {
+          "id": "P4.5",
+          "title": "close, detach, stop, and cross-device behavior"
+        },
+        {
+          "id": "P4.6",
+          "title": "resource settings and recovery actions"
+        }
+      ],
+      "cases": [
+        {
+          "id": "P4-G01",
+          "required": true,
+          "procedure": "Create multiple real managed agents through REST/MCP with no browser, restart web, then open a fresh browser.",
+          "pass_assertion": "Recovery occurs before browser arrival; every desired-running soul appears in tabs with the correct identity/state.",
+          "status": "NOT_RUN"
+        },
+        {
+          "id": "P4-G02",
+          "required": true,
+          "procedure": "Keep a nonempty saved localStorage layout, remove one soul's UI association in isolated test state, and restart.",
+          "pass_assertion": "Missing soul receives one recovered view; existing tabs/layout survive; no recovery-offer acceptance required.",
+          "status": "NOT_RUN"
+        },
+        {
+          "id": "P4-G03",
+          "required": true,
+          "procedure": "Clear browser storage completely, then refresh repeatedly and connect two independent browser contexts simultaneously.",
+          "pass_assertion": "Same souls and native IDs; deterministic recovered views; zero duplicate runtimes/reservations.",
+          "status": "NOT_RUN"
+        },
+        {
+          "id": "P4-G04",
+          "required": true,
+          "procedure": "Mix live, resumable-dead, resource-blocked, credential-blocked, explicitly stopped, and historical-only sessions.",
+          "pass_assertion": "Live adopted, dead resumable resurrected, blocked visible, stopped/history not auto-started.",
+          "status": "NOT_RUN"
+        },
+        {
+          "id": "P4-G05",
+          "required": true,
+          "procedure": "Race Stop Agent with startup, resume completion, old ledger outbox replay, and a stale whole-layout snapshot.",
+          "pass_assertion": "Stop revision wins; no active replacement and no resurrected running tab.",
+          "status": "NOT_RUN"
+        },
+        {
+          "id": "P4-G06",
+          "required": true,
+          "procedure": "Detach a view without stopping, restart, and separately create two intentional views of one soul.",
+          "pass_assertion": "Running detached soul becomes visible again under policy; intentional extra views survive; one runtime total.",
+          "status": "NOT_RUN"
+        },
+        {
+          "id": "P4-G07",
+          "required": true,
+          "procedure": "Crash during view-intent commit, ledger projection, and projection acknowledgment; restart both controllers.",
+          "pass_assertion": "Idempotent recovery placement; no lost associations, duplicate tabs, or stopped-soul resurrection.",
+          "status": "NOT_RUN"
+        },
+        {
+          "id": "P4-G08",
+          "required": true,
+          "procedure": "Use real provider conversation history before/after resume; exercise pending approval, busy state, and completion notifications.",
+          "pass_assertion": "History remains visible; correct lifecycle status; no fabricated completion/chime; follow-up actually works.",
+          "status": "NOT_RUN"
+        },
+        {
+          "id": "P4-G09",
+          "required": true,
+          "procedure": "Simulate supervisor scan failure/unknown schema and recover it while browser remains open.",
+          "pass_assertion": "Explicit degraded/blocked state, not empty success; no automatic destructive cleanup; inventory eventually converges.",
+          "status": "NOT_RUN"
+        },
+        {
+          "id": "P4-G10",
+          "required": true,
+          "procedure": "Use an old-capability client/legacy Node backend against relevant shared schemas; change limits through the real UI.",
+          "pass_assertion": "No unsafe unmanaged restore fallback; backward contract tests pass; effective limit changes match server policy and survive restart.",
+          "status": "NOT_RUN"
+        },
+        {
+          "id": "P4-G11",
+          "required": true,
+          "procedure": "Rehydrate at least 50 fixture souls with mixed states and a concurrency cap of four provider starts, plus the enabled real-provider smoke set.",
+          "pass_assertion": "No request-rate restore storm, bounded startup queue, all intended tabs represented, interactive UI; measured timings recorded without dropping slow souls.",
+          "status": "NOT_RUN"
+        }
+      ],
+      "cumulative_required_case_ids": [
+        "P1-G01",
+        "P1-G02",
+        "P1-G03",
+        "P1-G04",
+        "P1-G05",
+        "P1-G06",
+        "P1-G07",
+        "P1-G08",
+        "P1-G09",
+        "P1-G10",
+        "P2-G01",
+        "P2-G02",
+        "P2-G03",
+        "P2-G04",
+        "P2-G05",
+        "P2-G06",
+        "P2-G07",
+        "P2-G08",
+        "P2-G09",
+        "P2-G10",
+        "P2-G11",
+        "P3-G01",
+        "P3-G02",
+        "P3-G03",
+        "P3-G04",
+        "P3-G05",
+        "P3-G06",
+        "P3-G07",
+        "P3-G08",
+        "P3-G09",
+        "P3-G10",
+        "P3-G11",
+        "P3-G12",
+        "P4-G01",
+        "P4-G02",
+        "P4-G03",
+        "P4-G04",
+        "P4-G05",
+        "P4-G06",
+        "P4-G07",
+        "P4-G08",
+        "P4-G09",
+        "P4-G10",
+        "P4-G11"
+      ],
+      "own_required_case_count": 11,
+      "cumulative_required_case_count": 44
+    },
+    {
+      "number": 5,
+      "id": "phase-5",
+      "title": "genuine lost-soul reaping, forensic observability, and controlled rollout",
+      "depends_on": [
+        "phase-1",
+        "phase-2",
+        "phase-3",
+        "phase-4"
+      ],
+      "command": "npm run test:runtime -- gate phase-5 --require-live",
+      "command_status": "implemented",
+      "tasks": [
+        {
+          "id": "P5.1",
+          "title": "implement a loss decision certificate"
+        },
+        {
+          "id": "P5.2",
+          "title": "make incident persistence part of cleanup"
+        },
+        {
+          "id": "P5.3",
+          "title": "structured logs that support an actual explanation"
+        },
+        {
+          "id": "P5.4",
+          "title": "brief notices, durable delivery"
+        },
+        {
+          "id": "P5.5",
+          "title": "metrics and regression feedback"
+        },
+        {
+          "id": "P5.6",
+          "title": "migration and rollback"
+        }
+      ],
+      "cases": [
+        {
+          "id": "P5-G01",
+          "required": true,
+          "procedure": "For each enabled real provider family, preserve its native state while making the old runtime unusable, then restart web/supervisor.",
+          "pass_assertion": "Native recovery succeeds; zero lost notices; old owned workload cleaned before replacement; real follow-up works.",
+          "status": "NOT_RUN"
+        },
+        {
+          "id": "P5-G02",
+          "required": true,
+          "procedure": "In an isolated real-provider test soul, remove its primary resumable state **and every registered checkpoint**; retain only non-resumable diagnostic metadata/hashes, not an undisclosed usable transcript backup. Leave an owned non-reconnectable worker.",
+          "pass_assertion": "Only after all applicable definitive negatives: loss committed, exact owned enclosure reaped, non-resumable diagnostic evidence/incident retained, brief notice displayed. No credentials/real user state touched.",
+          "status": "NOT_RUN"
+        },
+        {
+          "id": "P5-G03",
+          "required": true,
+          "procedure": "Provide each recoverable alternative: healthy host despite missing disk state, native resume, valid older checkpoint, uniquely attributable recovered identity, pristine seed.",
+          "pass_assertion": "None classified lost; correct path wins; live last-copy host is not destroyed just for missing checkpoint.",
+          "status": "NOT_RUN"
+        },
+        {
+          "id": "P5-G04",
+          "required": true,
+          "procedure": "Make provider stores unreadable, registry corrupt, credentials absent, protocol too new, workspace missing, or a recovery adapter temporarily unavailable.",
+          "pass_assertion": "All blocked, never lost; no unsafe cleanup; repairing prerequisites restores the same souls.",
+          "status": "NOT_RUN"
+        },
+        {
+          "id": "P5-G05",
+          "required": true,
+          "procedure": "Create foreign sentinels with copied names/argv/env/tags/labels and a container replacing a deleted one's old name; inject stale records and daemon-ID mismatch.",
+          "pass_assertion": "Zero foreign-target destructive API attempts and zero foreign signals; all sentinels alive until the test owner's separate teardown.",
+          "status": "NOT_RUN"
+        },
+        {
+          "id": "P5-G06",
+          "required": true,
+          "procedure": "Fail graceful/forced stop, pause the runtime, disconnect Docker during verification, and fail incident export.",
+          "pass_assertion": "No false cleaned-up notice; record/claim retained; outbox survives; eventual verified cleanup produces one correct notice.",
+          "status": "NOT_RUN"
+        },
+        {
+          "id": "P5-G07",
+          "required": true,
+          "procedure": "Crash after loss intent, after stop, after verified-empty, after notice enqueue, and after browser render but before ack.",
+          "pass_assertion": "Idempotent cleanup; stable incident/notice IDs; no duplicate notice in a profile retaining its receipt, and no new incarnation; pending notice reaches the next browser. A separately tested cleared-receipt/undelivered-ack case may redeliver the same incident, never repeat cleanup.",
+          "status": "NOT_RUN"
+        },
+        {
+          "id": "P5-G08",
+          "required": true,
+          "procedure": "Inject synthetic tokens/cookies/secrets into provider errors; rotate logs and restart all web/supervisor services.",
+          "pass_assertion": "No secret in any output artifact; durable incident still reconstructs the full decision/cleanup timeline; cause vs hypothesis clearly separated.",
+          "status": "NOT_RUN"
+        },
+        {
+          "id": "P5-G09",
+          "required": true,
+          "procedure": "Run 100 fixture-backed web restart/failure cycles, 20 supervisor cycles, and controlled host/provider crashes across mixed souls. Include one active long tool and one pending approval in the real-provider smoke subset.",
+          "pass_assertion": "No duplicate writers, hidden desired-running souls, unbounded retry loops, false loss, growing orphan counts, or unrelated interruption. Record all resource/queue measurements.",
+          "status": "NOT_RUN"
+        },
+        {
+          "id": "P5-G10",
+          "required": true,
+          "procedure": "Run a 30-minute mixed fixture soak with CPU/memory/PID pressure confined to one runtime, repeated client disconnects, 50 desired souls, and bounded output.",
+          "pass_assertion": "Control-plane remains responsive under the configured admission budget; resource/spool bounds hold; cleanup returns to baseline. Durations are test specifications, not delivery promises.",
+          "status": "NOT_RUN"
+        },
+        {
+          "id": "P5-G11",
+          "required": true,
+          "procedure": "Dry-run migrate legacy metadata, perform an approved test-only migration, then roll the web binary back to the previous compatible version.",
+          "pass_assertion": "Legacy foreign processes untouched; managed runtime remains controlled/visible or explicitly upgrade-blocked; no DB downgrade/reset and no mass stop.",
+          "status": "NOT_RUN"
+        },
+        {
+          "id": "P5-G12",
+          "required": true,
+          "procedure": "Run final non-fault release images, the full enabled-provider/ingress matrix, all earlier gates, and affected existing regression suites.",
+          "pass_assertion": "Every required case actually ran and passed; no enabled provider skipped; no fault hooks; zero unexplained loss events; independent ownership-after audit shows only intended surviving test sentinels before their explicit teardown.",
+          "status": "NOT_RUN"
+        }
+      ],
+      "cumulative_required_case_ids": [
+        "P1-G01",
+        "P1-G02",
+        "P1-G03",
+        "P1-G04",
+        "P1-G05",
+        "P1-G06",
+        "P1-G07",
+        "P1-G08",
+        "P1-G09",
+        "P1-G10",
+        "P2-G01",
+        "P2-G02",
+        "P2-G03",
+        "P2-G04",
+        "P2-G05",
+        "P2-G06",
+        "P2-G07",
+        "P2-G08",
+        "P2-G09",
+        "P2-G10",
+        "P2-G11",
+        "P3-G01",
+        "P3-G02",
+        "P3-G03",
+        "P3-G04",
+        "P3-G05",
+        "P3-G06",
+        "P3-G07",
+        "P3-G08",
+        "P3-G09",
+        "P3-G10",
+        "P3-G11",
+        "P3-G12",
+        "P4-G01",
+        "P4-G02",
+        "P4-G03",
+        "P4-G04",
+        "P4-G05",
+        "P4-G06",
+        "P4-G07",
+        "P4-G08",
+        "P4-G09",
+        "P4-G10",
+        "P4-G11",
+        "P5-G01",
+        "P5-G02",
+        "P5-G03",
+        "P5-G04",
+        "P5-G05",
+        "P5-G06",
+        "P5-G07",
+        "P5-G08",
+        "P5-G09",
+        "P5-G10",
+        "P5-G11",
+        "P5-G12"
+      ],
+      "own_required_case_count": 12,
+      "cumulative_required_case_count": 56,
+      "required_artifacts": [
+        "provider-results.json",
+        "ownership-before.json",
+        "ownership-after.json",
+        "cleanup.json",
+        "broker.jsonl",
+        "assertions.jsonl",
+        "build.json",
+        "capabilities.json",
+        "lifecycle.jsonl",
+        "incidents/",
+        "browser/",
+        "summary.json",
+        "runtime-metrics.json",
+        "migration-plan.json",
+        "deferred-providers.json",
+        "repair-audit.json"
+      ]
+    }
+  ],
+  "certification_gates": {
+    "schema_version": 1,
+    "source_manifest": "docs/development/runtime-provider-capabilities.json",
+    "provider_certification_case_ids": [
+      "PC-SCOPE",
+      "PC-SHELL",
+      "PC-CLAUDE",
+      "PC-OPENCODE",
+      "PC-CODEX",
+      "PC-AMPLIFIER"
+    ],
+    "case_statuses": [
+      "PASS",
+      "DEFERRED_LIVE_PROVIDER_CERTIFICATION",
+      "BLOCKED",
+      "FAIL"
+    ],
+    "deferral_reason": "pending_live_provider_certification",
+    "modes": {
+      "landing": {
+        "id": "durable-souls-landing",
+        "command": "npm run test:runtime -- gate landing --require-live",
+        "cumulative_phase": "phase-5",
+        "may_pass_with_deferred_providers": true,
+        "deferrable_providers": [
+          "claude",
+          "codex",
+          "amplifier"
+        ],
+        "every_other_case_must_pass": true,
+        "deferral_is_not_a_pass": true
+      },
+      "production": {
+        "id": "durable-souls-production-gate-5",
+        "command": "npm run test:runtime -- gate phase-5 --require-live",
+        "cumulative_phase": "phase-5",
+        "may_pass_with_deferred_providers": false,
+        "expected_status_until_live_certification": "BLOCKED",
+        "expected_blocked_reason": "pending_live_provider_certification",
+        "blocked_is_never_pass": true,
+        "required_certified_providers": [
+          "shell",
+          "opencode",
+          "claude",
+          "codex",
+          "amplifier"
+        ]
+      }
+    },
+    "required_artifacts": [
+      "summary.json",
+      "deferred-providers.json"
+    ],
+    "scope_case": {
+      "id": "PC-SCOPE",
+      "procedure": "Audit the checked-in capability manifest before classifying any provider: no uncertified provider may be managed-enabled, claim durable recovery, be routed by a managed doorway, or appear in the managed release scope.",
+      "pass_assertion": "Zero release-scope violations; the declared certified/deferred sets equal the provider rows; the certification case set is exact."
+    }
+  }
+}

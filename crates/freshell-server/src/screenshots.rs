@@ -114,7 +114,9 @@ async fn create_screenshot(
     // unwinding — the dropped pending record simply ignores stray results.
     let request_id = uuid::Uuid::new_v4().to_string();
     let rx = state.broker.register(request_id.clone());
-    state.broker.send_capture(&request_id, scope, tab_id, pane_id);
+    state
+        .broker
+        .send_capture(&request_id, scope, tab_id, pane_id);
 
     let result = match tokio::time::timeout(SCREENSHOT_TIMEOUT, rx).await {
         Ok(Ok(result)) => result,

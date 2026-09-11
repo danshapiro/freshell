@@ -19,10 +19,15 @@ edition.workspace = true
 rust-version.workspace = true
 publish.workspace = true
 
+[features]
+default = []
+provider-qualification = ["freshell-agent-runtime/provider-qualification"]
+
 [dependencies]
 # The frozen wire types this crate emits (ready/settings.updated/etc.) + the
 # client-message types it parses (terminal.create/attach/input/kill/…).
 freshell-protocol = { path = "../freshell-protocol" }
+freshell-agent-runtime = { path = "../freshell-agent-runtime" }
 # The PTY core (real pseudo-terminal spawn + seq'd output framing) the terminal
 # handlers drive, and the SpawnSpec builder that resolves the shell.
 freshell-terminal = { path = "../freshell-terminal" }

@@ -44,6 +44,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use axum::extract::ws::{Message, WebSocket};
 use futures_util::stream::SplitSink;
 use futures_util::{SinkExt, StreamExt};
+use sha2::{Digest, Sha256};
 use tokio::sync::mpsc;
 use tracing::Instrument;
 use uuid::Uuid;
@@ -67,6 +68,7 @@ use freshell_protocol::{
     TerminalDetach, TerminalIdOnly, TerminalInputBlocked, TerminalInputBlockedReason, TerminalKill,
     TerminalResize, LEGACY_RESUME_IDENTITY_REFUSAL,
 };
+use freshell_terminal::registry::ManagedTerminalLaunch;
 use freshell_terminal::{build_child_env_from_process, FrameSink};
 
 use crate::WsState;
@@ -264,12 +266,16 @@ pub async fn run(
     origin_kind: &'static str,
     conn_identity: ConnectionIdentity,
     terminal_interest_v1: bool,
+    managed_runtime_v1: bool,
 ) {
     let (ws_tx, ws_rx) = socket.split();
 
     // Identify this connection so the registry can key its terminal subscriptions
     // (and sweep them on close).
     let conn_id = state.registry.new_connection_id();
+    state
+        .registry
+        .set_managed_runtime_connection(conn_id, managed_runtime_v1);
 
     // DIAG-01: this connection is now fully authenticated (the handshake was
     // already written by the caller) -- lifecycle event with process/
@@ -417,6 +423,14 @@ async fn run_loop(
     ping_ticker.tick().await;
     let mut keepalive = connection_writer::Keepalive::default();
 
+    // Managed-runtime output is drained continuously by the session host. While
+    // this web connection is attached, sample the bounded host spool into the
+    // ordinary registry replay/fan-out buffer. Web absence stops only this
+    // projection loop; it never stops the host's PTY reader.
+    let mut managed_output_ticker = tokio::time::interval(std::time::Duration::from_millis(250));
+    managed_output_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    managed_output_ticker.tick().await;
+
     // DIAG-01: the reason (and, when the peer supplied one, the WS close
     // code) this connection's loop broke -- captured at each `break` site,
     // then logged ONCE at teardown (`ws.connection.closed`) rather than
@@ -472,6 +486,20 @@ async fn run_loop(
                         close_reason = exit.reason();
                         close_code = exit.close_code();
                         break;
+                    }
+                }
+            }
+            _ = managed_output_ticker.tick(), if state.registry.managed_runtime_connection(conn_id) => {
+                for terminal_id in state.registry.managed_attached_to(conn_id) {
+                    match tokio::time::timeout(
+                        std::time::Duration::from_millis(500),
+                        refresh_managed_output_and_associate(state, &terminal_id, 64 * 1024),
+                    ).await {
+                        Ok(Ok(_)) => {}
+                        Ok(Err(error)) => tracing::warn!(terminal_id = %terminal_id, error = %error,
+                            "managed_runtime.output_refresh_failed"),
+                        Err(_) => tracing::warn!(terminal_id = %terminal_id,
+                            "managed_runtime.output_refresh_timeout"),
                     }
                 }
             }
@@ -894,6 +922,12 @@ async fn handle_client_text(
     if let Some(reply) = fresh_agent_control_refusal(&message) {
         return send(ws_tx, &reply).await;
     }
+    // Explicit managed fresh-agent rollout: every fresh-agent operation is
+    // consumed by the external gateway when installed. It is never allowed
+    // to fall through and mint a competing web-owned provider writer.
+    if crate::hosted_fresh_agent::dispatch_if_installed(&message) {
+        return true;
+    }
     match message {
         ClientMessage::TerminalInterest(interest) => match ws_tx.set_terminal_interest(&interest) {
             Ok(()) => true,
@@ -1064,7 +1098,9 @@ async fn handle_client_text(
                 // session lost before its first snapshot.
                 let asserted_at = now_ms();
                 maybe_restamp_on_attach(&attach, state, conn_identity, asserted_at).await;
-                match handle_attach(attach, state, conn_id, conn_sink, terminal_output_batch_v1) {
+                match handle_attach(attach, state, conn_id, conn_sink, terminal_output_batch_v1)
+                    .await
+                {
                     Some(err) => send(ws_tx, &err).await,
                     None => true,
                 }
@@ -1110,15 +1146,39 @@ async fn handle_client_text(
             // Enter of an armed codex pane scans (7-9 ms warm — A6).
             crate::codex_association::note_possible_submit(state, &input.terminal_id, &input.data)
                 .await;
-            let outcome = state
-                .registry
-                .input(&input.terminal_id, input.data.as_bytes());
-            if !outcome.found {
-                // Silent-loss fix (kata dtfn): an unknown terminalId used to
-                // produce TOTAL SILENCE — no error, no ack — so keystrokes
-                // racing a server restart vanished. Answer with the
-                // input-blocked frame the client renders as a visible notice.
-                return send(ws_tx, &unknown_terminal_input_blocked(&input.terminal_id)).await;
+            if state.registry.is_managed(&input.terminal_id) {
+                if let Err(error) = state
+                    .registry
+                    .managed_input(&input.terminal_id, input.data.clone())
+                    .await
+                {
+                    if let Some(reason) = managed_input_blocked_reason(&error) {
+                        return send(
+                            ws_tx,
+                            &managed_runtime_input_blocked(&input.terminal_id, reason),
+                        )
+                        .await;
+                    }
+                    return send(
+                        ws_tx,
+                        &managed_runtime_error(
+                            &input.terminal_id,
+                            &format!("input failed: {error}"),
+                        ),
+                    )
+                    .await;
+                }
+            } else {
+                let outcome = state
+                    .registry
+                    .input(&input.terminal_id, input.data.as_bytes());
+                if !outcome.found {
+                    // Silent-loss fix (kata dtfn): an unknown terminalId used to
+                    // produce TOTAL SILENCE — no error, no ack — so keystrokes
+                    // racing a server restart vanished. Answer with the
+                    // input-blocked frame the client renders as a visible notice.
+                    return send(ws_tx, &unknown_terminal_input_blocked(&input.terminal_id)).await;
+                }
             }
             // Restore-across-restart fix (opencode): seam for an armed
             // opencode terminal's first Enter/submit. No-ops for every
@@ -1132,8 +1192,11 @@ async fn handle_client_text(
         }
         ClientMessage::TerminalResize(resize) => {
             if terminal_dims_in_range(resize.cols, resize.rows) {
-                handle_resize(resize, state);
-                true
+                let terminal_id = resize.terminal_id.clone();
+                match handle_resize(resize, state).await {
+                    Ok(()) => true,
+                    Err(error) => send(ws_tx, &managed_runtime_error(&terminal_id, &error)).await,
+                }
             } else {
                 send(ws_tx, &invalid_dims_error(resize.cols, resize.rows)).await
             }
@@ -1713,8 +1776,14 @@ async fn handle_client_text(
             // refusal can never reach pre-reconcile ("frozen") clients — they
             // never send the request at all (§3).
             if pane_reconcile_v1 {
-                return handle_pane_reconcile(request, ws_tx, state, pane_reconcile_fresh_agent_v1)
-                    .await;
+                return handle_pane_reconcile(
+                    request,
+                    ws_tx,
+                    state,
+                    pane_reconcile_fresh_agent_v1,
+                    state.registry.managed_runtime_connection(conn_id),
+                )
+                .await;
             }
             // Capability not negotiated on THIS connection: answer explicitly.
             send(
@@ -1965,22 +2034,53 @@ fn opencode_rebind_precompute() -> Option<String> {
 }
 
 /// Provider settings `codingCli.providers[mode]` (`ws:2317-2319`) as
-/// `(permission_mode, model, sandbox)`, with the codex strip (`ws:2464-2465`
-/// — model/sandbox/permissionMode route to the app-server plan instead).
+/// `(permission_mode, model, effort, sandbox)`, with the codex split: model,
+/// sandbox, and permission mode route to the app-server plan while the exact
+/// reasoning config remains provider CLI argv.
 /// Boot-snapshot settings. Extracted from `handle_create` so the auto-resume
 /// respawn seam (Task 4) derives launch params identically.
+fn configured_provider_settings(
+    state: &WsState,
+    mode: &str,
+) -> (
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+) {
+    let Some(provider) = state.settings.coding_cli.providers.get(mode) else {
+        return (None, None, None, None);
+    };
+    (
+        provider.permission_mode.clone(),
+        provider.model.clone(),
+        provider.effort.clone(),
+        provider.sandbox.clone(),
+    )
+}
+
 fn cli_provider_settings(
     state: &WsState,
     mode: &str,
-) -> (Option<String>, Option<String>, Option<String>) {
-    if mode == "shell" || mode == "codex" {
-        return (None, None, None);
+) -> (
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+) {
+    if mode == "shell" {
+        return (None, None, None, None);
     }
-    let Some(p) = state.settings.coding_cli.providers.get(mode) else {
-        return (None, None, None);
-    };
-    let pick = |key: &str| p.get(key).and_then(|v| v.as_str()).map(str::to_string);
-    (pick("permissionMode"), pick("model"), pick("sandbox"))
+    if mode == "codex" {
+        let effort = state
+            .settings
+            .coding_cli
+            .providers
+            .get(mode)
+            .and_then(|provider| provider.effort.clone());
+        return (None, None, effort, None);
+    }
+    configured_provider_settings(state, mode)
 }
 
 /// One value-safe rendering of the managed Codex launch shared by its TUI
@@ -2076,16 +2176,10 @@ async fn plan_codex_managed_launch(
     cancel: Option<&mut tokio::sync::watch::Receiver<bool>>,
 ) -> Result<freshell_codex::launch_lifecycle::CodexTerminalLaunch, PlanLaunchError> {
     let codex_provider = state.settings.coding_cli.providers.get("codex");
-    let provider_str = |key: &str| {
-        codex_provider
-            .and_then(|p| p.get(key))
-            .and_then(|v| v.as_str())
-            .map(str::to_string)
-    };
-    let plan_model = provider_str("model");
-    let plan_sandbox = provider_str("sandbox");
+    let plan_model = codex_provider.and_then(|provider| provider.model.clone());
+    let plan_sandbox = codex_provider.and_then(|provider| provider.sandbox.clone());
     // `approvalPolicy: providerSettings?.permissionMode` (`ws:942`).
-    let plan_approval = provider_str("permissionMode");
+    let plan_approval = codex_provider.and_then(|provider| provider.permission_mode.clone());
     let input = freshell_codex::launch_plan::CodexLaunchPlanInput {
         cwd: setup.runtime_cwd.as_deref(),
         resume_session_id,
@@ -2434,6 +2528,210 @@ pub(crate) struct LaunchPrep {
 /// (terminal.rs:1621-1689). Infallible: the only loud reject in the old
 /// block (the claude RESTORE_UNAVAILABLE ladder, :1690-1720) is not
 /// extracted, so there is no error path.
+fn managed_runtime_mode(mode: &str) -> bool {
+    mode == "shell" || freshell_agent_runtime::managed_provider_enabled(mode)
+}
+
+fn managed_opencode_endpoint(
+    mode: &str,
+    use_managed_runtime: bool,
+) -> Option<freshell_opencode::serve::Endpoint> {
+    (use_managed_runtime && mode == "opencode").then(|| freshell_opencode::serve::Endpoint {
+        hostname: "127.0.0.1".to_string(),
+        // Each managed soul has a private network namespace, so this endpoint
+        // is stable across web retries and cannot collide with another soul.
+        port: 4096,
+    })
+}
+
+fn stable_managed_uuid(create_request_id: &str, domain: &[u8]) -> Uuid {
+    let mut hasher = Sha256::new();
+    hasher.update(b"freshell-managed-terminal-v1\0");
+    hasher.update(domain);
+    hasher.update(b"\0");
+    hasher.update(create_request_id.as_bytes());
+    let digest = hasher.finalize();
+    let mut bytes = [0u8; 16];
+    bytes.copy_from_slice(&digest[..16]);
+    // Present a standards-shaped v4 UUID while retaining deterministic bits.
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    Uuid::from_bytes(bytes)
+}
+
+async fn adopt_existing_managed_for_compat(
+    registry: &freshell_terminal::TerminalRegistry,
+    mode: &str,
+    create_request_id: &str,
+    negotiated_managed_runtime: bool,
+) -> Result<Option<freshell_terminal::registry::ManagedTerminalDescriptor>, String> {
+    if negotiated_managed_runtime
+        || !registry.has_managed_controller()
+        || !managed_runtime_mode(mode)
+    {
+        return Ok(None);
+    }
+    let terminal_id = stable_managed_uuid(create_request_id, b"terminal")
+        .simple()
+        .to_string();
+    if !registry
+        .adopt_managed_for_reconcile(&terminal_id, Some(create_request_id.to_string()))
+        .await?
+    {
+        return Ok(None);
+    }
+    registry
+        .managed_descriptor(&terminal_id)
+        .map(Some)
+        .ok_or_else(|| "adopted managed terminal has no descriptor".to_string())
+}
+
+#[cfg(test)]
+mod managed_runtime_id_tests {
+    use super::{
+        adopt_existing_managed_for_compat, managed_opencode_endpoint, managed_runtime_mode,
+        stable_managed_uuid,
+    };
+    use freshell_terminal::registry::{
+        ManagedOutputRead, ManagedTerminalController, ManagedTerminalDescriptor,
+        ManagedTerminalFuture, ManagedTerminalLaunch,
+    };
+    use std::sync::Arc;
+
+    struct LookupOnlyController {
+        descriptor: ManagedTerminalDescriptor,
+    }
+
+    impl ManagedTerminalController for LookupOnlyController {
+        fn lookup_terminal<'a>(
+            &'a self,
+            terminal_id: &'a str,
+            _create_request_id: Option<String>,
+        ) -> ManagedTerminalFuture<'a, Result<Option<ManagedTerminalDescriptor>, String>> {
+            Box::pin(async move {
+                Ok((terminal_id == self.descriptor.terminal_id).then(|| self.descriptor.clone()))
+            })
+        }
+
+        fn launch<'a>(
+            &'a self,
+            _request: ManagedTerminalLaunch,
+        ) -> ManagedTerminalFuture<'a, Result<ManagedTerminalDescriptor, String>> {
+            Box::pin(async { Err("launch must not run during compatibility adoption".into()) })
+        }
+
+        fn input<'a>(
+            &'a self,
+            _terminal: ManagedTerminalDescriptor,
+            _data: String,
+        ) -> ManagedTerminalFuture<'a, Result<(), String>> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn resize<'a>(
+            &'a self,
+            _terminal: ManagedTerminalDescriptor,
+            _cols: u16,
+            _rows: u16,
+        ) -> ManagedTerminalFuture<'a, Result<(), String>> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn stop<'a>(
+            &'a self,
+            _terminal: ManagedTerminalDescriptor,
+        ) -> ManagedTerminalFuture<'a, Result<(), String>> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn read_output<'a>(
+            &'a self,
+            _terminal: ManagedTerminalDescriptor,
+            _after_seq: i64,
+            _max_bytes: u64,
+        ) -> ManagedTerminalFuture<'a, Result<ManagedOutputRead, String>> {
+            Box::pin(async { Err("not needed".into()) })
+        }
+    }
+
+    #[test]
+    fn managed_ids_are_retry_stable_and_domain_separated() {
+        let a = stable_managed_uuid("create-pane-1", b"terminal");
+        let b = stable_managed_uuid("create-pane-1", b"terminal");
+        let stream = stable_managed_uuid("create-pane-1", b"stream");
+        let other = stable_managed_uuid("create-pane-2", b"terminal");
+        assert_eq!(a, b);
+        assert_ne!(a, stream);
+        assert_ne!(a, other);
+        assert_eq!(a.get_version_num(), 4);
+    }
+
+    #[test]
+    fn managed_modes_follow_the_release_qualification_manifest() {
+        let manifest: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../docs/development/runtime-provider-capabilities.json"
+        ))
+        .unwrap();
+        assert!(managed_runtime_mode("shell"));
+        for provider in manifest["providers"].as_array().unwrap() {
+            let mode = provider["provider"].as_str().unwrap();
+            let expected = provider["managedEnabled"].as_bool().unwrap();
+            assert_eq!(
+                managed_runtime_mode(mode),
+                expected,
+                "managed routing drifted from release qualification for {mode}"
+            );
+        }
+    }
+
+    #[test]
+    fn managed_opencode_uses_private_namespace_fixed_endpoint() {
+        let endpoint = managed_opencode_endpoint("opencode", true)
+            .expect("managed opencode has an in-container endpoint");
+        assert_eq!(endpoint.hostname, "127.0.0.1");
+        assert_eq!(endpoint.port, 4096);
+        assert!(managed_opencode_endpoint("opencode", false).is_none());
+        assert!(managed_opencode_endpoint("shell", true).is_none());
+    }
+
+    #[tokio::test]
+    async fn legacy_capability_replay_adopts_existing_managed_terminal_without_launch() {
+        let registry = freshell_terminal::TerminalRegistry::new();
+        let create_request_id = "create-old-client-managed";
+        let terminal_id = stable_managed_uuid(create_request_id, b"terminal")
+            .simple()
+            .to_string();
+        let descriptor = ManagedTerminalDescriptor {
+            soul_id: "soul-old-client".into(),
+            incarnation_id: "incarnation-old-client".into(),
+            terminal_id: terminal_id.clone(),
+            stream_id: "stream-old-client".into(),
+            mode: "opencode".into(),
+            cwd: "/workspace".into(),
+            resume_session_id: Some("ses_old_client".into()),
+            create_request_id: Some(create_request_id.into()),
+        };
+        registry.set_managed_controller(Some(Arc::new(LookupOnlyController {
+            descriptor: descriptor.clone(),
+        })));
+
+        let adopted =
+            adopt_existing_managed_for_compat(&registry, "opencode", create_request_id, false)
+                .await
+                .unwrap()
+                .expect("old-capability replay adopts the managed row");
+        assert_eq!(adopted, descriptor);
+        assert!(registry.is_managed(&terminal_id));
+
+        assert!(
+            adopt_existing_managed_for_compat(&registry, "opencode", create_request_id, true,)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+}
+
 pub(crate) fn derive_launch_prep(create: &TerminalCreate, mode: &str) -> LaunchPrep {
     // Spawn-time resume id + launch intent (`ws-handler.ts:2040-2067`; U7: only
     // the spawn-time id is modeled here — the sessionRef binding/repair pipeline
@@ -2608,6 +2906,7 @@ async fn gate_wire_resume(
     resume_session_id: &mut Option<String>,
     launch_intent: &mut LaunchIntent,
     claude_fresh_prealloc: &mut bool,
+    intent: freshell_platform::resume_gate::ResumeIntent,
 ) -> ResumeGateCarry {
     // In-gate liveness precondition: legacy resumeSessionId-only
     // carriers bypass D7 in every ordering — a LIVE session must never
@@ -2649,14 +2948,24 @@ async fn gate_wire_resume(
         let probe = state.session_existence.clone();
         let mode_for_gate = mode.to_string();
         let rid = resume_session_id.take();
-        let intent = *launch_intent;
-        spawn_blocking_in_span(move || {
-            crate::resume_validation::validate_wire_resume(
-                &mode_for_gate,
-                rid,
-                intent,
-                probe.as_ref(),
-            )
+        let launch_intent_value = *launch_intent;
+        spawn_blocking_in_span(move || match intent {
+            freshell_platform::resume_gate::ResumeIntent::ManagedRecovery => {
+                crate::resume_validation::validate_managed_wire_resume(
+                    &mode_for_gate,
+                    rid,
+                    launch_intent_value,
+                    probe.as_ref(),
+                )
+            }
+            freshell_platform::resume_gate::ResumeIntent::UserCreate => {
+                crate::resume_validation::validate_wire_resume(
+                    &mode_for_gate,
+                    rid,
+                    launch_intent_value,
+                    probe.as_ref(),
+                )
+            }
         })
         .await
         .expect("resume validation task panicked")
@@ -2706,6 +3015,7 @@ pub(crate) async fn prepare_launch(
     create: &TerminalCreate,
     state: &WsState,
     cancel: &mut tokio::sync::watch::Receiver<bool>,
+    managed_runtime_v1: bool,
 ) -> Result<PreparedLaunch, PrepareError> {
     // Same mode derivation handle_create uses (copy the exact expression
     // from handle_create's `mode` binding so the two sites can never
@@ -2728,6 +3038,11 @@ pub(crate) async fn prepare_launch(
                 &mut prep.resume_session_id,
                 &mut prep.launch_intent,
                 &mut prep.claude_fresh_prealloc,
+                if managed_runtime_v1 && managed_runtime_mode(&mode) {
+                    freshell_platform::resume_gate::ResumeIntent::ManagedRecovery
+                } else {
+                    freshell_platform::resume_gate::ResumeIntent::UserCreate
+                },
             )
             .await,
         )
@@ -2746,12 +3061,13 @@ pub(crate) async fn prepare_launch(
     // byte-identical to today.
     let managed_flag =
         std::env::var(freshell_codex::launch_plan::FRESHELL_CODEX_MANAGED_LAUNCH_ENV).ok();
-    let codex_launch = if prep.resume_session_id.is_some()
+    let codex_launch = if !managed_runtime_v1
+        && prep.resume_session_id.is_some()
         && codex_create_uses_managed_launch(&mode, managed_flag.as_deref())
     {
-        // Reserve exactly one ID only for a managed resume that will plan.
-        // The structured guard carries it through the spawn-gate wait so the
-        // eventual PTY and already-spawned sidecar cannot diverge.
+        // A supervisor-managed Codex soul creates its sidecar inside the
+        // session host; only the legacy web-owned lane reserves a local
+        // sidecar before the spawn-gate wait.
         let host_os = host_os_live();
         let setup = build_codex_managed_launch_setup(
             Uuid::new_v4().simple().to_string(),
@@ -3026,10 +3342,13 @@ pub(crate) async fn handle_create(
         .await;
     }
 
+    let mode = create.mode.clone();
+    let use_managed_runtime =
+        state.registry.managed_runtime_connection(conn_id) && managed_runtime_mode(&mode);
+
     let host_os = host_os_live();
     let is_wsl = is_wsl_env_live();
     let shell = map_shell(create.shell);
-    let mode = create.mode.clone();
 
     // Reject modes that are neither 'shell' nor a registered coding CLI — the
     // reference throws `UnknownTerminalModeError` (`terminal-registry.ts:1073-1074`,
@@ -3052,16 +3371,92 @@ pub(crate) async fn handle_create(
         .await;
     }
 
-    // `terminalId` via UUID (nanoid-alphabet-compatible for the oracle
-    // validator); `streamId` via UUIDv4. A prepared managed restore already
-    // reserved the terminal id before off-permit planning, so reuse that one
-    // instead of minting/rerendering a second context.
-    let terminal_id = prepared_codex
-        .as_ref()
-        .and_then(PreparedCodexLaunch::terminal_id)
-        .map(str::to_string)
-        .unwrap_or_else(|| Uuid::new_v4().simple().to_string());
-    let stream_id = Uuid::new_v4().to_string();
+    // Compatibility fence: a client that predates managedRuntimeV1 may still
+    // replay a pane created by a newer client. It must never spawn a second
+    // legacy provider for the same durable create key. Reconstruct the
+    // supervisor-owned facade by the deterministic terminal id and answer the
+    // ordinary terminal.created shape; attach/input then use the existing
+    // terminal protocol without requiring the old client to understand souls.
+    match adopt_existing_managed_for_compat(
+        &state.registry,
+        &mode,
+        &create.request_id,
+        use_managed_runtime,
+    )
+    .await
+    {
+        Ok(Some(descriptor)) => {
+            let managed_terminal_id = descriptor.terminal_id.clone();
+            let session_ref = descriptor
+                .resume_session_id
+                .as_ref()
+                .filter(|session_id| !session_id.is_empty() && descriptor.mode != "shell")
+                .map(|session_id| freshell_protocol::SessionLocator {
+                    provider: descriptor.mode.clone(),
+                    session_id: session_id.clone(),
+                });
+            tracing::info!(
+                terminal_id = %managed_terminal_id,
+                create_request_id = %create.request_id,
+                mode = %mode,
+                "terminal.create.compat_adopted_managed"
+            );
+            let dedupe_request_id = create.request_id.clone();
+            let created = ServerMessage::TerminalCreated(TerminalCreated {
+                created_at: now_ms(),
+                request_id: create.request_id,
+                terminal_id: managed_terminal_id.clone(),
+                clear_codex_durability: None,
+                cwd: Some(descriptor.cwd),
+                notice: Some(
+                    "Reattached to the existing managed agent without launching a duplicate."
+                        .to_string(),
+                ),
+                restore_error: None,
+                session_ref,
+            });
+            state.create_dedupe.settle(
+                &dedupe_request_id,
+                &managed_terminal_id,
+                &created,
+                create.restore,
+                |terminal_id| state.registry.is_pty_running(terminal_id),
+            );
+            return out.send(&created).await;
+        }
+        Ok(None) => {}
+        Err(error) => {
+            return send_create_error(
+                out,
+                ErrorCode::PtySpawnFailed,
+                format!("managed runtime compatibility lookup failed: {error}"),
+                &create.request_id,
+            )
+            .await;
+        }
+    }
+
+    // Managed create retries must be payload-identical across web-process
+    // replacement. Derive both IDs from the pane's durable createRequestId.
+    // Legacy Codex resumes instead reuse the ID reserved by their prepared
+    // sidecar setup; all other legacy creates retain random UUIDs.
+    let (terminal_id, stream_id) = if use_managed_runtime {
+        (
+            stable_managed_uuid(&create.request_id, b"terminal")
+                .simple()
+                .to_string(),
+            stable_managed_uuid(&create.request_id, b"stream").to_string(),
+        )
+    } else {
+        (
+            prepared_codex
+                .as_ref()
+                .and_then(PreparedCodexLaunch::terminal_id)
+                .map(str::to_string)
+                .unwrap_or_else(|| Uuid::new_v4().simple().to_string()),
+            Uuid::new_v4().to_string(),
+        )
+    };
 
     // Resolve the effective cwd BEFORE any branch/mcp computation (`tr:1565` via
     // `resolve_create_cwd`): explicit `create.cwd`, else `settings.defaultCwd`,
@@ -3239,6 +3634,11 @@ pub(crate) async fn handle_create(
                 &mut resume_session_id,
                 &mut launch_intent,
                 &mut claude_fresh_prealloc,
+                if use_managed_runtime {
+                    freshell_platform::resume_gate::ResumeIntent::ManagedRecovery
+                } else {
+                    freshell_platform::resume_gate::ResumeIntent::UserCreate
+                },
             )
             .await,
         ),
@@ -3284,7 +3684,7 @@ pub(crate) async fn handle_create(
     // below uses it (re-resolution is idempotent: an absolute unix path
     // passes through resolve_unix_shell_cwd unchanged).
     let mut amplifier_stub: Option<freshell_sessions::amplifier_stub::EnsuredSession> = None;
-    if mode == "amplifier" {
+    if mode == "amplifier" && !use_managed_runtime {
         // Amplifier identity hardening (kata qmpk) — sequential, complementary
         // to the cross-mode D7 liveness guard above (PR #540): D7 rejects
         // cross-terminal session theft generically; these two are
@@ -3446,38 +3846,51 @@ pub(crate) async fn handle_create(
         }
     }
     // Provider settings `codingCli.providers[mode]` (`ws:2317-2319`), with the
-    // codex strip (`ws:2464-2465` — model/sandbox/permissionMode route to the
-    // app-server plan instead). Boot-snapshot settings (same documented caveat
+    // codex split: model/sandbox/permissionMode route to the app-server plan,
+    // while effort remains the exact CLI config argv. Boot-snapshot settings (same documented caveat
     // as `defaultCwd` above). Shared with the auto-resume respawn seam
     // (Task 4) via `cli_provider_settings`.
-    let (permission_mode, model, sandbox) = cli_provider_settings(state, &mode);
+    let (permission_mode, model, effort, sandbox) = if use_managed_runtime {
+        configured_provider_settings(state, &mode)
+    } else {
+        cli_provider_settings(state, &mode)
+    };
 
     // opencode: allocate the loopback control endpoint BEFORE building the launch
     // (`ws:2471-2473`; `local-port.ts:13-41`), via the freshell-opencode
     // `LoopbackPortAllocator` seam (spec §3.3 rev 2.1 — transport.rs:323). The
     // port rides into argv (`--hostname/--port`), which is also its record.
-    let opencode_endpoint = if mode == "opencode" {
-        use freshell_opencode::serve::PortAllocator as _;
-        match freshell_opencode::transport::LoopbackPortAllocator.allocate() {
-            Ok(ep) => Some(ep),
-            Err(e) => {
-                return send_create_error(out, ErrorCode::PtySpawnFailed, e, &create.request_id)
-                    .await
+    let opencode_endpoint =
+        if let Some(endpoint) = managed_opencode_endpoint(&mode, use_managed_runtime) {
+            Some(endpoint)
+        } else if mode == "opencode" {
+            use freshell_opencode::serve::PortAllocator as _;
+            match freshell_opencode::transport::LoopbackPortAllocator.allocate() {
+                Ok(ep) => Some(ep),
+                Err(e) => {
+                    return send_create_error(out, ErrorCode::PtySpawnFailed, e, &create.request_id)
+                        .await
+                }
             }
-        }
-    } else {
-        None
-    };
+        } else {
+            None
+        };
 
-    // Build one managed setup for each newly spawned pair. A prepared resume
-    // hands us its original setup/launch; a fresh or A4-inline plan builds it
-    // only after every validation/duplicate gate above has passed.
-    let prepared_pair = prepared_codex.as_mut().and_then(PreparedCodexLaunch::take);
+    // A supervisor-managed Codex soul owns its app-server and proxy inside
+    // the session host. The web-owned legacy lane retains mainline's paired
+    // TUI/sidecar MCP rendering and prepared-launch guard.
     let managed_flag =
         std::env::var(freshell_codex::launch_plan::FRESHELL_CODEX_MANAGED_LAUNCH_ENV).ok();
+    let prepared_pair = if use_managed_runtime {
+        None
+    } else {
+        prepared_codex.as_mut().and_then(PreparedCodexLaunch::take)
+    };
     let (codex_setup, codex_launch) = match prepared_pair {
         Some((setup, launch)) => (Some(setup), Some(launch)),
-        None if codex_create_uses_managed_launch(&mode, managed_flag.as_deref()) => {
+        None if !use_managed_runtime
+            && codex_create_uses_managed_launch(&mode, managed_flag.as_deref()) =>
+        {
             let setup = match build_codex_managed_launch_setup(
                 terminal_id.clone(),
                 shell,
@@ -3522,12 +3935,10 @@ pub(crate) async fn handle_create(
         }
         None => (None, None),
     };
-    let codex_remote_ws_url: Option<String> =
-        codex_launch.as_ref().map(|l| l.remote_ws_url.clone());
+    let codex_remote_ws_url: Option<String> = codex_launch
+        .as_ref()
+        .map(|launch| launch.remote_ws_url.clone());
 
-    // The TUI target still drives CLI resolution. Managed Codex uses the
-    // setup's one-shot TUI rendering/environment; all other paths retain the
-    // existing generic MCP computation unchanged.
     let target = cli_provider_target(shell, host_os, is_wsl, resolved_cwd.as_deref(), &RealEnv);
     let (mcp_cwd, mcp_injection, overrides) = match codex_setup {
         Some(setup) => (
@@ -3541,28 +3952,32 @@ pub(crate) async fn handle_create(
             } else {
                 resolve_mcp_cwd(resolved_cwd.as_deref(), &RealEnv, host_os, is_wsl)
             };
-            let mcp_injection = if mode == "shell" {
-                McpInjection::default()
-            } else {
-                match generate_mcp_injection(
-                    &RealMcpRuntime,
-                    &mode,
-                    &terminal_id,
-                    mcp_cwd.as_deref(),
-                    target,
-                ) {
-                    Ok(injection) => injection,
-                    Err(error) => {
-                        return send_create_error(
-                            out,
-                            ErrorCode::PtySpawnFailed,
-                            error.message,
-                            &create.request_id,
-                        )
-                        .await
+            let mcp_injection =
+                if mode == "shell" || (use_managed_runtime && managed_runtime_mode(&mode)) {
+                    // Managed providers cannot depend on web-owned MCP files or
+                    // web-process credentials. Host-local durable integrations
+                    // are prepared inside their owned enclosure.
+                    McpInjection::default()
+                } else {
+                    match generate_mcp_injection(
+                        &RealMcpRuntime,
+                        &mode,
+                        &terminal_id,
+                        mcp_cwd.as_deref(),
+                        target,
+                    ) {
+                        Ok(injection) => injection,
+                        Err(error) => {
+                            return send_create_error(
+                                out,
+                                ErrorCode::PtySpawnFailed,
+                                error.message,
+                                &create.request_id,
+                            )
+                            .await
+                        }
                     }
-                }
-            };
+                };
             let overrides = build_terminal_base_env(
                 &RealEnv,
                 &terminal_id,
@@ -3577,7 +3992,7 @@ pub(crate) async fn handle_create(
     // the IO layer; the pure resolver only reads the result from
     // CliLaunchInputs (mcp_injection precedent). Failure must never block the
     // launch.
-    let opencode_rebind_tui_config = if mode == "opencode" {
+    let opencode_rebind_tui_config = if mode == "opencode" && !use_managed_runtime {
         opencode_rebind_precompute()
     } else {
         None
@@ -3592,6 +4007,7 @@ pub(crate) async fn handle_create(
         launch_intent,
         permission_mode: permission_mode.as_deref(),
         model: model.as_deref(),
+        effort: effort.as_deref(),
         sandbox: sandbox.as_deref(),
         codex_remote_ws_url: codex_remote_ws_url.as_deref(),
         opencode_server: opencode_endpoint
@@ -3762,40 +4178,72 @@ pub(crate) async fn handle_create(
         }
     }
 
-    // The PTY spawn is synchronous; run it on the blocking pool so hung/slow
-    // spawns occupy a blocking thread (plus, on the gated restore path, the
-    // caller-held permit), never an async worker (on small hosts, N inline
-    // blocking spawns would wedge the whole runtime including the timer
-    // driver).
-    let registry = state.registry.clone();
-    let spawn_spec = spec.clone();
-    let spawn_terminal_id = terminal_id.clone();
-    let spawn_mode = mode.clone();
-    let spawn_resume_session_id = resume_session_id.clone();
-    let spawn_create_request_id = create.request_id.clone();
-    // PIN2_PTY_SPAWN_ANCHOR: the spawn makes preallocated identity observable.
-    let create_result = match spawn_blocking_in_span(move || {
-        registry.create(
-            &spawn_spec,
-            &child_env,
-            spawn_terminal_id,
-            stream_id,
-            &spawn_mode,
-            spawn_resume_session_id.as_deref(),
-            // The pane's stable creation key, stamped atomically with the registry
-            // insert (reconciliation design §5.1) — capability-independent and
-            // inert on its own; only the §5.4 dedupe branch is gated.
-            Some(&spawn_create_request_id),
-            None,
-            on_exit,
-        )
-    })
-    .await
-    {
-        Ok(res) => res,
-        Err(join_err) => Err(std::io::Error::other(format!(
-            "terminal spawn task panicked: {join_err}"
-        ))),
+    // Phase 2 managed-runtime door: ONLY a connection that negotiated the
+    // capability, against a server boot with an installed controller, may move
+    // shell/Claude/OpenCode PTY ownership out of the web process. Other providers and
+    // every non-negotiating connection retain the legacy local spawn path.
+    // PIN2_PTY_SPAWN_ANCHOR: either the local PTY spawn OR the supervisor's
+    // host-owned PTY makes the preallocated identity observable.
+    let create_result: std::io::Result<()> = if use_managed_runtime {
+        let managed = ManagedTerminalLaunch {
+            spec: spec.clone(),
+            env: child_env.clone(),
+            terminal_id: terminal_id.clone(),
+            stream_id: stream_id.clone(),
+            mode: mode.clone(),
+            resume_session_id: resume_session_id.clone(),
+            provider_model: model.clone(),
+            provider_reasoning_effort: effort.clone(),
+            provider_sandbox: sandbox.clone(),
+            provider_permission_mode: permission_mode.clone(),
+            view_tab_id: create.tab_id.clone(),
+            view_pane_id: create.pane_id.clone(),
+            create_request_id: Some(create.request_id.clone()),
+        };
+        match state.registry.launch_managed(managed).await {
+            Ok(descriptor) => {
+                state.registry.register_managed(descriptor);
+                tracing::info!(
+                    terminal_id = %terminal_id,
+                    mode = %mode,
+                    "terminal.created_managed: PTY/process ownership lives in session host"
+                );
+                Ok(())
+            }
+            Err(error) => Err(std::io::Error::other(format!(
+                "managed runtime launch failed: {error}"
+            ))),
+        }
+    } else {
+        // The legacy PTY spawn is synchronous; run it on the blocking pool so
+        // hung/slow spawns never occupy an async worker.
+        let registry = state.registry.clone();
+        let spawn_spec = spec.clone();
+        let spawn_terminal_id = terminal_id.clone();
+        let spawn_stream_id = stream_id.clone();
+        let spawn_mode = mode.clone();
+        let spawn_resume_session_id = resume_session_id.clone();
+        let spawn_create_request_id = create.request_id.clone();
+        match spawn_blocking_in_span(move || {
+            registry.create(
+                &spawn_spec,
+                &child_env,
+                spawn_terminal_id,
+                spawn_stream_id,
+                &spawn_mode,
+                spawn_resume_session_id.as_deref(),
+                Some(&spawn_create_request_id),
+                None,
+                on_exit,
+            )
+        })
+        .await
+        {
+            Ok(res) => res,
+            Err(join_err) => Err(std::io::Error::other(format!(
+                "terminal spawn task panicked: {join_err}"
+            ))),
+        }
     };
     if let Err(err) = create_result {
         // PIN 2 (Step 4b): the spawn FAILED, so the pre-spawn claude binding
@@ -3933,20 +4381,24 @@ pub(crate) async fn handle_create(
     // The endpoint was allocated pre-launch and rode into argv; the hub's
     // OpencodeAttach arm re-checks the tracked mode, so this only arms for
     // opencode panes. Channel-deferred — safe off the dispatch path.
-    if let (Some(hub), Some(ep)) = (&state.activity, opencode_endpoint.as_ref()) {
-        hub.attach_opencode_serve(&terminal_id, &ep.hostname, ep.port);
+    if !use_managed_runtime {
+        if let (Some(hub), Some(ep)) = (&state.activity, opencode_endpoint.as_ref()) {
+            hub.attach_opencode_serve(&terminal_id, &ep.hostname, ep.port);
+        }
     }
 
     // Restore-across-restart fix (opencode): arm the opencode locator for a
     // FRESH (non-resuming) opencode pane. No-ops for every other mode/resume
     // case.
-    crate::opencode_association::maybe_arm(
-        state,
-        &terminal_id,
-        &mode,
-        resolved_cwd.as_deref(),
-        resume_session_id.as_deref(),
-    );
+    if !use_managed_runtime {
+        crate::opencode_association::maybe_arm(
+            state,
+            &terminal_id,
+            &mode,
+            resolved_cwd.as_deref(),
+            resume_session_id.as_deref(),
+        );
+    }
 
     // Lane B2: arm the codex rollout locator for a FRESH (non-resuming)
     // codex pane. Restore-created panes WITHOUT identity arm too — arm()
@@ -4415,7 +4867,7 @@ pub async fn respawn_agent_terminal(
     // Launch params from state.settings EXACTLY as handle_create derives them
     // (BindingRow launch fields are hardcoded None for terminal panes —
     // pane_ledger.rs:405-408).
-    let (permission_mode, model, sandbox) = cli_provider_settings(state, &mode);
+    let (permission_mode, model, effort, sandbox) = cli_provider_settings(state, &mode);
 
     // opencode: allocate the loopback control endpoint BEFORE building the
     // launch, same seam as `handle_create`.
@@ -4509,6 +4961,7 @@ pub async fn respawn_agent_terminal(
         launch_intent,
         permission_mode: permission_mode.as_deref(),
         model: model.as_deref(),
+        effort: effort.as_deref(),
         sandbox: sandbox.as_deref(),
         codex_remote_ws_url: codex_remote_ws_url.as_deref(),
         opencode_server: opencode_endpoint
@@ -5056,6 +5509,7 @@ async fn handle_pane_reconcile(
     ws_tx: &mut WsSink,
     state: &WsState,
     pane_reconcile_fresh_agent_v1: bool,
+    managed_runtime_v1: bool,
 ) -> bool {
     if request.panes.len() > crate::reconcile::MAX_RECONCILE_PANES {
         let mut out = crate::create_gate::CreateOutput::Socket(ws_tx);
@@ -5071,6 +5525,49 @@ async fn handle_pane_reconcile(
         )
         .await;
     }
+    // Managed pre-pass. Adoption reconstructs the browser-facing facade for a
+    // supervisor-owned soul BEFORE the legacy ladder consults host-local
+    // provider stores. A lookup that FAILS is recorded rather than ignored: an
+    // unreadable managed truth must withhold the ladder's authority to declare
+    // that soul dead (see `ManagedReconcileFacts`).
+    let mut managed_facts = crate::reconcile::ManagedReconcileFacts::default();
+    if managed_runtime_v1 {
+        for pane in request
+            .panes
+            .iter()
+            .filter(|pane| pane.kind.as_deref() == Some("terminal"))
+        {
+            let Some(terminal_id) = pane.terminal_id.as_deref() else {
+                continue;
+            };
+            if state.registry.exists(terminal_id) {
+                continue;
+            }
+            match state
+                .registry
+                .adopt_managed_for_reconcile(terminal_id, pane.create_request_id.clone())
+                .await
+            {
+                Ok(true) => tracing::info!(
+                    terminal_id,
+                    pane_key = %pane.pane_key,
+                    "pane_reconcile.adopted_managed_terminal"
+                ),
+                Ok(false) => {}
+                Err(error) => {
+                    tracing::warn!(
+                        terminal_id,
+                        pane_key = %pane.pane_key,
+                        %error,
+                        "pane_reconcile.managed_terminal_lookup_failed"
+                    );
+                    managed_facts.mark_indeterminate(pane.pane_key.clone());
+                }
+            }
+        }
+    }
+    let managed_facts = (!managed_facts.is_empty()).then_some(managed_facts);
+
     // Built ONCE per reconcile request and reused for any re-derivation of deps
     // (B1's warming deferral re-derives via rebuild_deps — rebuilding the
     // snapshot would double-burn the respawn counter; V9 §3.6).
@@ -5097,6 +5594,7 @@ async fn handle_pane_reconcile(
             existence: state.session_existence.as_ref(),
             pane_ledger: &state.pane_ledger,
             fresh_agent: fresh_agent_snapshot.as_ref(),
+            managed: managed_facts.as_ref(),
         };
         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             crate::reconcile::derive_verdicts(&deps, &request.panes)
@@ -5420,6 +5918,22 @@ async fn maybe_restamp_on_attach(
     crate::pane_ledger::surface_write_failure(state, &attach.terminal_id, result.map(|_| ()))
 }
 
+async fn refresh_managed_output_and_associate(
+    state: &WsState,
+    terminal_id: &str,
+    max_bytes: u64,
+) -> Result<freshell_terminal::registry::ManagedOutputRead, String> {
+    let read = state
+        .registry
+        .refresh_managed_output(terminal_id, max_bytes)
+        .await?;
+    if let Some(session_id) = read.native_session_id.as_deref() {
+        crate::opencode_association::associate_managed_session(state, terminal_id, session_id)
+            .await;
+    }
+    Ok(read)
+}
+
 /// `terminal.attach` — resolve the terminal in the shared registry and attach THIS
 /// connection to it: the registry enqueues `terminal.attach.ready`, replays the
 /// scrollback (seq-ordered, stamped with this attach's id + `source:'replay'`), and
@@ -5428,13 +5942,24 @@ async fn maybe_restamp_on_attach(
 /// the reference's `error{INVALID_TERMINAL_ID, "Terminal not running"}` frame for
 /// the caller to send (`ws-handler.ts:2730-2735`; restored by kata dtfn — the SPA's
 /// recovery ladder recreates the pane). `None` = attached.
-fn handle_attach(
+async fn handle_attach(
     attach: TerminalAttach,
     state: &WsState,
     conn_id: u64,
     conn_sink: &FrameSink,
     terminal_output_batch_v1: bool,
 ) -> Option<ServerMessage> {
+    if state.registry.is_managed(&attach.terminal_id) {
+        if let Err(error) =
+            refresh_managed_output_and_associate(state, &attach.terminal_id, 256 * 1024).await
+        {
+            return Some(managed_runtime_error(
+                &attach.terminal_id,
+                &format!("output replay failed: {error}"),
+            ));
+        }
+    }
+
     // STATE-SYNC FIX 1 increment 2a: stamp the canonical identity onto
     // `attach.ready` from the shared identity registry (create-time
     // resume ids AND locator-associated ids both live there); the
@@ -5454,9 +5979,31 @@ fn handle_attach(
     ) {
         let cols = attach.cols.clamp(0, u16::MAX as i64) as u16;
         let rows = attach.rows.clamp(0, u16::MAX as i64) as u16;
-        state
-            .registry
-            .resize_for_attach(&attach.terminal_id, conn_id, attach.intent, cols, rows);
+        let resize_status = state.registry.resize_for_attach(
+            &attach.terminal_id,
+            conn_id,
+            attach.intent,
+            cols,
+            rows,
+        );
+        if state.registry.is_managed(&attach.terminal_id)
+            && matches!(
+                resize_status,
+                freshell_terminal::registry::AttachResizeStatus::Resized
+                    | freshell_terminal::registry::AttachResizeStatus::Unchanged
+            )
+        {
+            if let Err(error) = state
+                .registry
+                .managed_resize(&attach.terminal_id, cols, rows)
+                .await
+            {
+                return Some(managed_runtime_error(
+                    &attach.terminal_id,
+                    &format!("attach resize failed: {error}"),
+                ));
+            }
+        }
     }
 
     let outcome = state.registry.attach(
@@ -5619,6 +6166,47 @@ fn unknown_terminal_input_blocked(terminal_id: &str) -> ServerMessage {
     })
 }
 
+fn managed_input_blocked_reason(detail: &str) -> Option<TerminalInputBlockedReason> {
+    let normalized = detail.to_ascii_lowercase();
+    if normalized.contains("recovery is in progress")
+        || normalized.contains("input was not dispatched")
+    {
+        Some(TerminalInputBlockedReason::ManagedRecoveryPending)
+    } else if normalized.contains("recovery ended in blocked")
+        || normalized.contains("recovery is blocked")
+        || normalized.contains("blocked_retry_budget")
+    {
+        Some(TerminalInputBlockedReason::ManagedRecoveryBlocked)
+    } else {
+        None
+    }
+}
+
+fn managed_runtime_input_blocked(
+    terminal_id: &str,
+    reason: TerminalInputBlockedReason,
+) -> ServerMessage {
+    ServerMessage::TerminalInputBlocked(TerminalInputBlocked {
+        reason,
+        terminal_id: terminal_id.to_string(),
+    })
+}
+
+fn managed_runtime_error(terminal_id: &str, detail: &str) -> ServerMessage {
+    ServerMessage::Error(ErrorMsg {
+        code: ErrorCode::InternalError,
+        message: format!("Managed runtime unavailable: {detail}"),
+        timestamp: crate::now_iso(),
+        actual_session_ref: None,
+        expected_session_ref: None,
+        request_id: None,
+        retry_after_ms: None,
+        terminal_exit_code: None,
+        terminal_id: Some(terminal_id.to_string()),
+        live_terminal_id: None,
+    })
+}
+
 /// `AgentProvider` -> its wire string (the enum serializes lowercase).
 fn agent_provider_wire(provider: AgentProvider) -> &'static str {
     match provider {
@@ -5746,10 +6334,17 @@ fn rollback_refusal_frame(
 
 /// `terminal.resize` — resize the shared PTY (`registry.resize`); no dedicated wire
 /// reply. `unchanged` when the geometry already matches.
-fn handle_resize(resize: TerminalResize, state: &WsState) {
+async fn handle_resize(resize: TerminalResize, state: &WsState) -> Result<(), String> {
     let cols = resize.cols.clamp(0, u16::MAX as i64) as u16;
     let rows = resize.rows.clamp(0, u16::MAX as i64) as u16;
     state.registry.resize(&resize.terminal_id, cols, rows);
+    if state.registry.is_managed(&resize.terminal_id) {
+        state
+            .registry
+            .managed_resize(&resize.terminal_id, cols, rows)
+            .await?;
+    }
+    Ok(())
 }
 
 /// `terminal.detach` — drop THIS connection's subscription (the terminal keeps
@@ -6267,8 +6862,55 @@ async fn handle_kill(kill: TerminalKill, ws_tx: &mut WsSink, state: &WsState) ->
     const PERSISTED_CLOSE_COPY: &str =
         "the terminal close is recorded durably, but the ledger reported an error; \
          the terminal was closed to keep state consistent";
+    let managed_removed = if state.registry.is_managed(&kill.terminal_id) {
+        match state.registry.managed_stop(&kill.terminal_id).await {
+            Ok(()) => Some(remove_managed_after_stop_and_broadcast(
+                state,
+                &kill.terminal_id,
+            )),
+            Err(error) => {
+                tracing::error!(terminal_id = %kill.terminal_id, error = %error,
+                    "managed_runtime.stop_failed_after_durable_close");
+                let copy = format!(
+                    "the terminal close is recorded durably, but the managed runtime could not be verified stopped: {error}"
+                );
+                if let Some(request_id) = &kill.request_id {
+                    return send(
+                        ws_tx,
+                        &ServerMessage::TerminalKilled(freshell_protocol::TerminalKilled {
+                            request_id: request_id.clone(),
+                            terminal_id: kill.terminal_id,
+                            success: false,
+                            error: Some(copy),
+                        }),
+                    )
+                    .await;
+                }
+                return send(
+                    ws_tx,
+                    &ServerMessage::Error(ErrorMsg {
+                        code: ErrorCode::InternalError,
+                        message: copy,
+                        timestamp: crate::now_iso(),
+                        actual_session_ref: None,
+                        expected_session_ref: None,
+                        request_id: None,
+                        retry_after_ms: None,
+                        terminal_id: Some(kill.terminal_id),
+                        terminal_exit_code: None,
+                        live_terminal_id: None,
+                    }),
+                )
+                .await;
+            }
+        }
+    } else {
+        None
+    };
     if let Some(request_id) = &kill.request_id {
-        kill_and_broadcast(state, &kill.terminal_id);
+        if managed_removed.is_none() {
+            kill_and_broadcast(state, &kill.terminal_id);
+        }
         let msg = ServerMessage::TerminalKilled(freshell_protocol::TerminalKilled {
             request_id: request_id.clone(),
             terminal_id: kill.terminal_id,
@@ -6277,7 +6919,8 @@ async fn handle_kill(kill: TerminalKill, ws_tx: &mut WsSink, state: &WsState) ->
         });
         return send(ws_tx, &msg).await;
     }
-    if kill_and_broadcast(state, &kill.terminal_id) {
+    let removed = managed_removed.unwrap_or_else(|| kill_and_broadcast(state, &kill.terminal_id));
+    if removed {
         if persisted_despite_error {
             let msg = ServerMessage::Error(ErrorMsg {
                 code: ErrorCode::InternalError,
@@ -6313,38 +6956,50 @@ fn close_outcome_is_clean_failure(
 /// `INVALID_TERMINAL_ID` error).
 fn kill_and_broadcast(state: &WsState, terminal_id: &str) -> bool {
     if state.registry.kill(terminal_id) {
-        // Fix Spec: Session Naming Cluster -- retire (not remove) on the KILL exit
-        // path too (the natural-exit `on_exit` hook handles the other path); a
-        // kill that never established an identity is a harmless no-op `retire()`.
-        state.identity.retire(terminal_id);
-        // Cancel-set hygiene: a kill removes the registry row, so NO
-        // CrashEvent (and therefore no hub settle tail) will ever consume a
-        // pending auto-resume cancel for this id — drop it here or a Stop
-        // click followed by a pane close leaks the entry for the process
-        // lifetime.
-        state
-            .auto_resume_cancels
-            .lock()
-            .expect("auto_resume_cancels lock")
-            .remove(terminal_id);
-        // DEV-0008 closure (Task 18): retire the META record + broadcast the
-        // removal BEFORE `terminals.changed` -- Node's kill emits
-        // `terminal.exit` synchronously (retire + remove broadcast,
-        // `server/index.ts:657-665`) and only then reaches
-        // `broadcastTerminalsChanged()` (`ws-handler.ts:2988`). The PTY exit
-        // hook fires for kills too; `retire`'s already-retired no-op keeps
-        // the frame single per terminal lifetime.
-        if state.terminal_meta.retire(terminal_id, now_ms()) {
-            crate::terminal_meta::broadcast_terminal_meta_updated(
-                &state.broadcast_tx,
-                vec![],
-                vec![terminal_id.to_string()],
-            );
-        }
-        broadcast_terminals_changed(state);
+        after_terminal_removed(state, terminal_id);
         return true;
     }
     false
+}
+
+fn remove_managed_after_stop_and_broadcast(state: &WsState, terminal_id: &str) -> bool {
+    if state.registry.remove_managed_after_stop(terminal_id) {
+        after_terminal_removed(state, terminal_id);
+        return true;
+    }
+    false
+}
+
+fn after_terminal_removed(state: &WsState, terminal_id: &str) {
+    // Fix Spec: Session Naming Cluster -- retire (not remove) on the KILL exit
+    // path too (the natural-exit `on_exit` hook handles the other path); a
+    // kill that never established an identity is a harmless no-op `retire()`.
+    state.identity.retire(terminal_id);
+    // Cancel-set hygiene: a kill removes the registry row, so NO
+    // CrashEvent (and therefore no hub settle tail) will ever consume a
+    // pending auto-resume cancel for this id — drop it here or a Stop
+    // click followed by a pane close leaks the entry for the process
+    // lifetime.
+    state
+        .auto_resume_cancels
+        .lock()
+        .expect("auto_resume_cancels lock")
+        .remove(terminal_id);
+    // DEV-0008 closure (Task 18): retire the META record + broadcast the
+    // removal BEFORE `terminals.changed` -- Node's kill emits
+    // `terminal.exit` synchronously (retire + remove broadcast,
+    // `server/index.ts:657-665`) and only then reaches
+    // `broadcastTerminalsChanged()` (`ws-handler.ts:2988`). The PTY exit
+    // hook fires for kills too; `retire`'s already-retired no-op keeps
+    // the frame single per terminal lifetime.
+    if state.terminal_meta.retire(terminal_id, now_ms()) {
+        crate::terminal_meta::broadcast_terminal_meta_updated(
+            &state.broadcast_tx,
+            vec![],
+            vec![terminal_id.to_string()],
+        );
+    }
+    broadcast_terminals_changed(state);
 }
 
 /// Whether a `freshAgent.interrupt`/`freshAgent.kill` frame should route to the codex
@@ -7725,7 +8380,11 @@ mod input_identity_tests {
 
 #[cfg(test)]
 mod terminal_dims_range_tests {
-    use super::{invalid_dims_error, terminal_dims_in_range, unknown_terminal_input_blocked};
+    use super::{
+        invalid_dims_error, managed_input_blocked_reason, managed_runtime_input_blocked,
+        terminal_dims_in_range, unknown_terminal_input_blocked,
+    };
+    use freshell_protocol::TerminalInputBlockedReason;
 
     #[test]
     fn rejects_zero_and_one_below_node_floor() {
@@ -7776,6 +8435,31 @@ mod terminal_dims_range_tests {
                 "type": "terminal.input.blocked",
                 "reason": "unknown_terminal",
                 "terminalId": "t-gone",
+            })
+        );
+    }
+
+    #[test]
+    fn managed_recovery_input_is_visibly_fenced() {
+        let pending = managed_input_blocked_reason(
+            "managed soul recovery is in progress; input was not dispatched",
+        )
+        .expect("pending recovery reason");
+        let blocked = managed_input_blocked_reason(
+            "managed soul recovery ended in Blocked: BLOCKED_RETRY_BUDGET",
+        )
+        .expect("blocked recovery reason");
+        assert_eq!(pending, TerminalInputBlockedReason::ManagedRecoveryPending);
+        assert_eq!(blocked, TerminalInputBlockedReason::ManagedRecoveryBlocked);
+
+        let json = serde_json::to_value(managed_runtime_input_blocked("managed-1", pending))
+            .expect("serialize managed input fence");
+        assert_eq!(
+            json,
+            serde_json::json!({
+                "type": "terminal.input.blocked",
+                "reason": "managed_recovery_pending",
+                "terminalId": "managed-1",
             })
         );
     }

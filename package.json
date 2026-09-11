@@ -15,9 +15,10 @@
     "dev": "tsx scripts/run-with-default-port.ts concurrently -n client,server -c blue,green \"vite --config config/vite/vite.config.ts\" \"tsx watch server/index.ts\"",
     "dev:client": "vite --config config/vite/vite.config.ts",
     "dev:server": "tsx scripts/run-with-default-port.ts tsx watch server/index.ts",
-    "typecheck": "npm run typecheck:client && npm run typecheck:server",
+    "typecheck": "npm run typecheck:client && npm run typecheck:server && npm run typecheck:runtime",
     "typecheck:client": "tsc -p tsconfig.json --noEmit",
     "typecheck:server": "tsc -p tsconfig.server.json --noEmit",
+    "typecheck:runtime": "tsc -p tsconfig.runtime.json",
     "prebuild": "tsx scripts/prebuild-guard.ts",
     "build": "npm run typecheck:client && npm run build:client && npm run build:server",
     "build:client": "vite build --config config/vite/vite.config.ts",
@@ -84,11 +85,18 @@
     "visible-first:contract:check": "tsx scripts/assert-visible-first-acceptance.ts",
     "perf:audit:compare": "tsx scripts/compare-visible-first-audit.ts",
     "perf:audit:gate": "tsx scripts/assert-visible-first-audit-gate.ts",
-    "contract:generate": "tsx port/contract/generate-ws-contract.ts",
+    "contract:generate": "tsx port/contract/generate-ws-contract.ts && tsx port/contract/generate-managed-runtime-contract.ts",
     "test:port": "vitest run --config config/vitest/vitest.port.config.ts",
     "test:oracle": "vitest run --config config/vitest/vitest.oracle.config.ts",
     "test:oracle:t2": "vitest run --config config/vitest/vitest.oracle-t2.config.ts",
-    "test:sandbox": "bash scripts/sandbox-test.sh"
+    "test:sandbox": "bash scripts/sandbox-test.sh",
+    "test:runtime": "tsx scripts/testing/test-coordinator.ts run test:runtime",
+    "test:runtime:raw": "tsx scripts/testing/runtime-gate.ts",
+    "test:runtime:phase5:soak": "tsx scripts/testing/runtime-phase5-soak.ts",
+    "test:runtime:campaign": "tsx scripts/testing/runtime-landing-campaign.ts",
+    "test:runtime:provider-qualification": "tsx scripts/testing/runtime-provider-qualification.ts",
+    "test:runtime:fresh-agent-qualification": "tsx scripts/testing/runtime-fresh-agent-qualification.ts",
+    "test:runtime:fresh-agent-fixtures": "FRESHELL_RUNTIME_FRESH_AGENT_FIXTURE_TEST=1 FRESHELL_E2E_BACKEND=local playwright test --config test/e2e-browser/playwright.config.ts --project=rust-chromium test/e2e-browser/specs/runtime-fresh-agent-fixture-rust.spec.ts"
   },
   "dependencies": {
     "@ai-sdk/google": "^3.0.29",
@@ -151,20 +159,20 @@
     "@types/supertest": "^6.0.2",
     "@types/w3c-web-hid": "^1.0.7",
     "@types/ws": "^8.5.12",
+    "@types/yauzl": "^2.10.3",
     "@typescript-eslint/eslint-plugin": "^8.54.0",
     "@typescript-eslint/parser": "^8.54.0",
     "@vitejs/plugin-react": "^4.7.0",
     "autoprefixer": "^10.4.20",
     "concurrently": "^9.1.2",
     "cross-env": "^7.0.3",
-    "electron": "^33.0.0",
-    "electron-builder": "^25.1.0",
+    "electron": "^44.3.0",
+    "electron-builder": "^26.15.3",
     "electron-updater": "^6.3.0",
     "eslint": "^9.39.2",
     "eslint-plugin-jsx-a11y": "^6.10.2",
     "eslint-plugin-react": "^7.37.5",
     "eslint-plugin-react-hooks": "^5.1.0",
-    "extract-zip": "^2.0.1",
     "globals": "^17.3.0",
     "jsdom": "^25.0.1",
     "pino-pretty": "^11.3.0",
@@ -172,11 +180,18 @@
     "supertest": "^7.0.0",
     "superwstest": "^1.1.0",
     "tailwindcss": "^3.4.17",
-    "tar": "^6.2.1",
+    "tar": "^7.5.22",
     "tsx": "^4.19.2",
     "typescript": "^5.7.2",
     "vite": "^6.4.1",
-    "vitest": "^3.2.4",
-    "yaml": "^2.9.0"
+    "vitest": "^5.0.0",
+    "yaml": "^2.9.0",
+    "yauzl": "^3.4.0"
+  },
+  "overrides": {
+    "qs": "6.16.0",
+    "tsx": {
+      "esbuild": "0.28.2"
+    }
   }
 }

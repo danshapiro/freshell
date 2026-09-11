@@ -177,6 +177,10 @@ pub struct HelloCapabilities {
     /// advertises the capability back (§4.2). Absent for the frozen client.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pane_reconcile_v1: Option<bool>,
+    /// Phase 2 durable runtime opt-in. A server acknowledges this only when a
+    /// managed-runtime controller is actually installed for the current boot.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub managed_runtime_v1: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -784,6 +788,8 @@ pub struct FreshAgentInterrupt {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FreshAgentCompact {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<String>,
     pub provider: AgentProvider,
     pub session_id: String,
     pub session_type: SessionType,

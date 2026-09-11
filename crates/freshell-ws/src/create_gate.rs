@@ -90,50 +90,56 @@ pub(crate) fn spawn_gated_restore_create(
             // and codex planning can no longer starve other modes' restores.
             // The restore-class plan wait is cancel-aware with no wall-clock
             // death (LaunchClass::Restore; overflow -> RATE_LIMITED).
-            let prepared =
-                match crate::terminal::prepare_launch(&create, &state, &mut cancel_rx).await {
-                    Ok(prepared) => prepared,
-                    Err(crate::terminal::PrepareError::Cancelled) => {
-                        tracing::info!(
-                            target: "freshell_ws::spawn_gate",
-                            request_id = %create.request_id,
-                            "restore_create_cancelled"
-                        );
-                        // Non-settled exit: drop the dedupe sentinel (and fail any
-                        // cross-connection waiters loud) so a resend proceeds fresh.
-                        state.create_dedupe.clear_if_in_flight(&create.request_id);
-                        return;
-                    }
-                    Err(crate::terminal::PrepareError::PlanQueueFull) => {
-                        let mut out = CreateOutput::Channel(&sink);
-                        let _ = crate::terminal::send_create_error(
-                            &mut out,
-                            ErrorCode::RateLimited,
-                            "Too many concurrent codex launches".to_string(),
-                            &create.request_id,
-                        )
-                        .await;
-                        state.create_dedupe.clear_if_in_flight(&create.request_id);
-                        return;
-                    }
-                    // (No Reject arm: post-A12, prepare_launch cannot reject — the
-                    // claude RESTORE_UNAVAILABLE ladder runs inside handle_create,
-                    // after the adopt/D8 arms, exactly as today.)
-                    Err(crate::terminal::PrepareError::PlanFailed(message)) => {
-                        // Same frame this failure produced when it happened inside
-                        // handle_create (`error{code:PTY_SPAWN_FAILED}`).
-                        let mut out = CreateOutput::Channel(&sink);
-                        let _ = crate::terminal::send_create_error(
-                            &mut out,
-                            ErrorCode::PtySpawnFailed,
-                            message,
-                            &create.request_id,
-                        )
-                        .await;
-                        state.create_dedupe.clear_if_in_flight(&create.request_id);
-                        return;
-                    }
-                };
+            let prepared = match crate::terminal::prepare_launch(
+                &create,
+                &state,
+                &mut cancel_rx,
+                state.registry.managed_runtime_connection(conn_id),
+            )
+            .await
+            {
+                Ok(prepared) => prepared,
+                Err(crate::terminal::PrepareError::Cancelled) => {
+                    tracing::info!(
+                        target: "freshell_ws::spawn_gate",
+                        request_id = %create.request_id,
+                        "restore_create_cancelled"
+                    );
+                    // Non-settled exit: drop the dedupe sentinel (and fail any
+                    // cross-connection waiters loud) so a resend proceeds fresh.
+                    state.create_dedupe.clear_if_in_flight(&create.request_id);
+                    return;
+                }
+                Err(crate::terminal::PrepareError::PlanQueueFull) => {
+                    let mut out = CreateOutput::Channel(&sink);
+                    let _ = crate::terminal::send_create_error(
+                        &mut out,
+                        ErrorCode::RateLimited,
+                        "Too many concurrent codex launches".to_string(),
+                        &create.request_id,
+                    )
+                    .await;
+                    state.create_dedupe.clear_if_in_flight(&create.request_id);
+                    return;
+                }
+                // (No Reject arm: post-A12, prepare_launch cannot reject — the
+                // claude RESTORE_UNAVAILABLE ladder runs inside handle_create,
+                // after the adopt/D8 arms, exactly as today.)
+                Err(crate::terminal::PrepareError::PlanFailed(message)) => {
+                    // Same frame this failure produced when it happened inside
+                    // handle_create (`error{code:PTY_SPAWN_FAILED}`).
+                    let mut out = CreateOutput::Channel(&sink);
+                    let _ = crate::terminal::send_create_error(
+                        &mut out,
+                        ErrorCode::PtySpawnFailed,
+                        message,
+                        &create.request_id,
+                    )
+                    .await;
+                    state.create_dedupe.clear_if_in_flight(&create.request_id);
+                    return;
+                }
+            };
             // Restore-class gate wait: cancel-aware, NO timeout (D-GATE-SOFT
             // generalized: contention may not kill a restore). QueueFull still
             // fails loud (-> RATE_LIMITED via spawn_gate_error_parts); Timeout

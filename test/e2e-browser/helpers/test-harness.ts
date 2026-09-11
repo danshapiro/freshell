@@ -29,6 +29,41 @@ export class TestHarness {
     )
   }
 
+  /** Last Redux timestamp from a completed ready handshake. */
+  async getLastReadyAt(): Promise<number | null> {
+    return this.page.evaluate(() => {
+      const value = window.__FRESHELL_TEST_HARNESS__?.getState()?.connection?.lastReadyAt
+      return typeof value === 'number' ? value : null
+    })
+  }
+
+  /** Per-process Rust server boot identity from the completed ready handshake. */
+  async getBootId(): Promise<string> {
+    return this.page.evaluate(() => {
+      const value = window.__FRESHELL_TEST_HARNESS__?.getState()?.connection?.bootId
+      if (typeof value !== 'string' || value.length === 0) throw new Error('ready handshake lacks a boot identity')
+      return value
+    })
+  }
+
+  /** Wait for a new ready handshake, not a stale ready state from before restart. */
+  async waitForConnectionAfter(previousLastReadyAt: number | null, timeoutMs = 60_000): Promise<void> {
+    await this.page.waitForFunction(
+      (previous) => {
+        const harness = window.__FRESHELL_TEST_HARNESS__
+        if (!harness) return false
+        const state = harness.getState()
+        const next = state?.connection?.lastReadyAt
+        return harness.getWsReadyState() === 'ready'
+          && state?.connection?.status === 'ready'
+          && typeof next === 'number'
+          && next !== previous
+      },
+      previousLastReadyAt,
+      { timeout: timeoutMs },
+    )
+  }
+
   /**
    * Force-close the underlying WebSocket to trigger auto-reconnect.
    * Unlike the WsClient's disconnect() method, this does NOT set intentionalClose,
@@ -69,6 +104,12 @@ export class TestHarness {
    * This works with all renderers (WebGL, canvas, DOM) unlike DOM scraping.
    * @param terminalId - specific terminal ID, or omit for first registered terminal
    */
+  async getRegisteredTerminalIds(): Promise<string[]> {
+    return this.page.evaluate(() => (
+      window.__FRESHELL_TEST_HARNESS__?.getRegisteredTerminalIds?.() ?? []
+    ))
+  }
+
   async getTerminalBuffer(terminalId?: string): Promise<string | null> {
     return this.page.evaluate((id) => {
       const harness = window.__FRESHELL_TEST_HARNESS__

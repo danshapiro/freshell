@@ -19,7 +19,7 @@ import {
 
 const opencode = await resolveProviderBinary('opencode')
 const KIMI = 'provider/model'
-const describeReal = opencode.resolvedPath ? describe.sequential : describe.skip
+const describeReal = opencode.resolvedPath ? describe : describe.skip
 
 describeReal(
   `opencode serve real provider${opencode.resolvedPath ? '' : ' (opencode not on PATH)'}`,
@@ -113,7 +113,7 @@ if (opencode.resolvedPath) {
   }
 }
 
-const describeRealKimi = kimiAvailable ? describe.sequential : describe.skip
+const describeRealKimi = kimiAvailable ? describe : describe.skip
 
 describeRealKimi('orchestration system smoke (Kimi k2.7)', () => {
   let cwdRoot: string | undefined

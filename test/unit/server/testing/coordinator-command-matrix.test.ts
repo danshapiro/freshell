@@ -773,3 +773,14 @@ describe('classifyCommand()', () => {
     expect(scripts['test:electron']).toBe('vitest run --config config/vitest/vitest.electron.config.ts')
   })
 })
+
+
+describe('runtime gate coordination', () => {
+  it('coordinates the destructive runtime gate as one dedicated suite', () => {
+    expect(classifyCommand({ commandKey: 'test:runtime', forwardedArgs: ['gate', 'phase-1', '--require-live'] })).toEqual({
+      kind: 'coordinated',
+      suiteKey: 'runtime:gate',
+      phases: [{ runner: 'npm', script: 'test:runtime:raw', args: ['gate', 'phase-1', '--require-live'] }],
+    })
+  })
+})

@@ -39,12 +39,15 @@ use axum::response::Response;
 use axum::{Json, Router};
 use serde_json::{json, Value};
 
-use freshell_protocol::{ServerMessage, UiCommand, LEGACY_RESUME_IDENTITY_REFUSAL};
+use freshell_protocol::{ServerMessage, SessionLocator, UiCommand, LEGACY_RESUME_IDENTITY_REFUSAL};
 
 use crate::layout_store::RenameOutcome;
 use crate::target_resolver::{resolve_target, ResolvedTarget};
 use crate::terminal_tabs::{spawn_terminal_pane, TerminalSpawnResult};
-use crate::{approx_json, authorized, fail_json, ok_json, parse_required_name, FreshAgentState};
+use crate::{
+    approx_json, authorized, fail_json, hosted_rest, ok_json, parse_required_name, rest_agent_mode,
+    FreshAgentState, PaneEntry,
+};
 
 /// Mount the pane + tab lifecycle routes onto an existing router. Split out of
 /// [`crate::router`] so `lib.rs`'s route table stays a single glance-able list;
@@ -136,11 +139,11 @@ pub(crate) fn resolve_pane_target(state: &FreshAgentState, raw: &str) -> PaneTar
 /// pipeline runs unchanged and the spawned content lands back in the store
 /// via `attachPaneContent` (`router.ts:1374`). A store miss (unknown pane)
 /// responds Node's `approx('pane split requested; not applied')`
-/// (`router.ts:1312-1314`). `agent`-based fresh-agent splits
-/// (`router.ts:1258-1285`) remain an explicit, documented deferral (honest
-/// 400) -- out of this slice's bounded scope; browser/editor/terminal splits
-/// are fully implemented. Response + broadcast shapes are unchanged from
-/// Slice 3b-1.
+/// (`router.ts:1312-1314`). `agent`-based fresh-agent splits route through the
+/// same typed hosted gateway used by tab creation, roll the tentative layout
+/// mutation back on launch failure, and attach the returned provider-native
+/// session to the store-minted pane. Response + broadcast shapes remain
+/// compatible with Slice 3b-1.
 pub(crate) async fn split_pane(
     State(state): State<FreshAgentState>,
     Path(raw_pane_id): Path<String>,
@@ -165,15 +168,6 @@ pub(crate) async fn split_pane(
         PaneTarget::Reject(resp) => return resp,
     };
 
-    if body.get("agent").and_then(Value::as_str).is_some() {
-        return fail_json(
-            StatusCode::BAD_REQUEST,
-            "splitting a fresh-agent pane (\"agent\") is not yet implemented on this server; \
-             create a new tab with {\"agent\":...} instead"
-                .to_string(),
-        );
-    }
-
     let direction = body
         .get("direction")
         .and_then(Value::as_str)
@@ -188,7 +182,98 @@ pub(crate) async fn split_pane(
         Err(_) => return approx_json(Value::Null, "pane split requested; not applied"),
     };
 
-    let new_content = if body
+    let new_content = if let Some(agent) = body.get("agent").and_then(Value::as_str) {
+        let Some((provider, session_type)) = rest_agent_mode(agent) else {
+            let _ = state.layout.close_pane(&new_pane_id);
+            return fail_json(
+                StatusCode::BAD_REQUEST,
+                format!("unknown agent \"{agent}\""),
+            );
+        };
+        let Some(gateway) = state.hosted_rest_gateway() else {
+            let _ = state.layout.close_pane(&new_pane_id);
+            return fail_json(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "durable fresh-agent gateway is not installed".to_string(),
+            );
+        };
+        let native_session_id = match body.get("sessionRef") {
+            None => None,
+            Some(value) => match serde_json::from_value::<SessionLocator>(value.clone()) {
+                Ok(locator) if locator.provider == provider && !locator.session_id.is_empty() => {
+                    Some(locator.session_id)
+                }
+                _ => {
+                    let _ = state.layout.close_pane(&new_pane_id);
+                    return fail_json(
+                        StatusCode::BAD_REQUEST,
+                        format!("sessionRef must identify a {provider} session"),
+                    );
+                }
+            },
+        };
+        let request_id = uuid::Uuid::new_v4().simple().to_string();
+        let cwd = body.get("cwd").and_then(Value::as_str).map(str::to_string);
+        let model = body
+            .get("model")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        let effort = body
+            .get("effort")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        let created = match gateway
+            .create_agent(hosted_rest::HostedRestCreate {
+                request_id: request_id.clone(),
+                provider: provider.into(),
+                session_type: session_type.into(),
+                cwd: cwd.clone(),
+                model: model.clone(),
+                effort: effort.clone(),
+                native_session_id,
+            })
+            .await
+        {
+            Ok(created) => created,
+            Err(()) => {
+                let _ = state.layout.close_pane(&new_pane_id);
+                return fail_json(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "durable fresh-agent host could not be created".to_string(),
+                );
+            }
+        };
+        let mut content = json!({
+            "kind":"fresh-agent",
+            "sessionType":session_type,
+            "provider":provider,
+            "sessionId":created.session_id,
+            "createRequestId":request_id,
+            "status":"connected",
+        });
+        if let Some(value) = &cwd {
+            content["initialCwd"] = json!(value);
+        }
+        if let Some(value) = &model {
+            content["model"] = json!(value);
+        }
+        if let Some(value) = &effort {
+            content["effort"] = json!(value);
+        }
+        state.panes.lock().expect("panes mutex").insert(
+            new_pane_id.clone(),
+            PaneEntry {
+                placeholder_id: created.session_id.clone(),
+                provider: provider.into(),
+                session_type: session_type.into(),
+                cwd,
+                model,
+                effort,
+                durable_id: Some(created.session_id),
+            },
+        );
+        content
+    } else if body
         .get("hostStats")
         .and_then(Value::as_bool)
         .unwrap_or(false)

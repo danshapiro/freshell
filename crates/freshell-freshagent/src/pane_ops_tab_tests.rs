@@ -5,6 +5,69 @@
 
 use super::tests::{app, create_shell_tab, delete, get, patch, post, state_with_registry};
 use super::*;
+use crate::hosted_rest;
+use tower::util::ServiceExt;
+
+struct HostedRestFake {
+    creates: std::sync::atomic::AtomicUsize,
+    sends: std::sync::atomic::AtomicUsize,
+    captures: std::sync::atomic::AtomicUsize,
+    identities: std::sync::Mutex<Vec<(String, String)>>,
+}
+
+#[async_trait::async_trait]
+impl hosted_rest::HostedFreshAgentRestGateway for HostedRestFake {
+    async fn create_agent(
+        self: Arc<Self>,
+        request: hosted_rest::HostedRestCreate,
+    ) -> Result<hosted_rest::HostedRestCreated, ()> {
+        assert_eq!(request.cwd.as_deref(), Some("/workspace"));
+        self.identities
+            .lock()
+            .unwrap()
+            .push((request.provider, request.session_type));
+        self.creates
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(hosted_rest::HostedRestCreated {
+            session_id: "managed-rest-session".into(),
+        })
+    }
+
+    async fn send_agent(
+        &self,
+        request: hosted_rest::HostedRestSend,
+    ) -> Result<hosted_rest::HostedRestSendResult, ()> {
+        assert_eq!(request.session_id, "managed-rest-session");
+        assert_eq!(
+            (request.provider.as_str(), request.session_type.as_str()),
+            ("opencode", "freshopencode")
+        );
+        assert_eq!(request.text, "continue");
+        self.sends.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(hosted_rest::HostedRestSendResult {
+            session_id: request.session_id,
+            completed: true,
+        })
+    }
+
+    async fn capture(
+        &self,
+        request: hosted_rest::HostedRestCapture,
+    ) -> Result<hosted_rest::HostedRestCaptureResult, hosted_rest::HostedRestCaptureError> {
+        assert_eq!(
+            (request.provider.as_str(), request.session_type.as_str()),
+            ("opencode", "freshopencode")
+        );
+        self.captures
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(hosted_rest::HostedRestCaptureResult {
+            session_id: request.session_id,
+            native_session_id: "native-rest-session".into(),
+            text: "user: continue\nassistant: done\n".into(),
+            truncated: false,
+        })
+    }
+}
 
 /// Seed the shared layout store the way Task 13's WS ingestion does: a
 /// `ui.layout.sync` payload folded via `update_from_ui` (pattern from the
@@ -661,6 +724,99 @@ async fn fresh_agent_rest_create_registers_tab_and_pane_in_the_layout_store() {
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["data"]["activeTabId"], json!(tab_id));
     assert_eq!(body["data"]["tabs"][0]["id"], json!(tab_id));
+}
+
+#[tokio::test]
+async fn hosted_rest_create_and_send_never_start_the_web_owned_opencode_transport() {
+    let state = state_with_registry();
+    let gateway = Arc::new(HostedRestFake {
+        creates: std::sync::atomic::AtomicUsize::new(0),
+        sends: std::sync::atomic::AtomicUsize::new(0),
+        captures: std::sync::atomic::AtomicUsize::new(0),
+        identities: std::sync::Mutex::new(Vec::new()),
+    });
+    state.set_hosted_rest_gateway(gateway.clone()).unwrap();
+    let router = app(state.clone());
+    let (status, created) = post(
+        router.clone(),
+        "/api/tabs",
+        json!({"agent":"opencode","cwd":"/workspace"}),
+        true,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{created}");
+    let pane_id = created["data"]["paneId"].as_str().unwrap();
+    let (status, sent) = post(
+        router.clone(),
+        &format!("/api/panes/{pane_id}/send-keys"),
+        json!({"text":"continue","timeout":1}),
+        true,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{sent}");
+    assert_eq!(sent["data"]["status"], "idle");
+    assert_eq!(gateway.creates.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert_eq!(gateway.sends.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert_eq!(
+        gateway.identities.lock().unwrap().as_slice(),
+        &[("opencode".into(), "freshopencode".into())]
+    );
+    let response = router
+        .oneshot(
+            axum::http::Request::builder()
+                .uri(format!("/api/panes/{pane_id}/capture"))
+                .header("x-auth-token", "tok")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert_eq!(body.as_ref(), b"user: continue\nassistant: done\n");
+    assert_eq!(
+        gateway.captures.load(std::sync::atomic::Ordering::SeqCst),
+        1
+    );
+    assert_eq!(
+        gateway.identities.lock().unwrap().as_slice(),
+        &[("opencode".into(), "freshopencode".into())]
+    );
+    assert!(state.opencode.lock().await.is_none());
+}
+
+#[tokio::test]
+async fn hosted_rest_tab_routes_every_fresh_agent_mode_to_the_typed_gateway() {
+    let state = state_with_registry();
+    let gateway = Arc::new(HostedRestFake {
+        creates: std::sync::atomic::AtomicUsize::new(0),
+        sends: std::sync::atomic::AtomicUsize::new(0),
+        captures: std::sync::atomic::AtomicUsize::new(0),
+        identities: std::sync::Mutex::new(Vec::new()),
+    });
+    state.set_hosted_rest_gateway(gateway.clone()).unwrap();
+    let router = app(state);
+    for agent in ["claude", "kilroy", "codex", "opencode"] {
+        let (status, body) = post(
+            router.clone(),
+            "/api/tabs",
+            json!({"agent":agent,"cwd":"/workspace"}),
+            true,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{agent}: {body}");
+    }
+    assert_eq!(
+        gateway.identities.lock().unwrap().as_slice(),
+        &[
+            ("claude".into(), "freshclaude".into()),
+            ("claude".into(), "kilroy".into()),
+            ("codex".into(), "freshcodex".into()),
+            ("opencode".into(), "freshopencode".into()),
+        ]
+    );
 }
 
 #[tokio::test]

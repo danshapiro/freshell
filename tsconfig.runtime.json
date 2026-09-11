@@ -1,0 +1,28 @@
+{
+  "extends": "./tsconfig.server.json",
+  "compilerOptions": {
+    "noEmit": true,
+    "types": ["node"]
+  },
+  "include": [
+    "scripts/testing/provider-certification.ts",
+    "scripts/testing/provider-qualification-receipt.ts",
+    "scripts/testing/provider-qualification-selection.ts",
+    "scripts/testing/fresh-agent-qualification-receipt.ts",
+    "scripts/testing/fresh-agent-qualification-selection.ts",
+    "scripts/testing/fresh-agent-release-gate.ts",
+    "scripts/testing/fresh-agent-ingress-inventory.ts",
+    "scripts/testing/runtime-provider-qualification.ts",
+    "scripts/testing/runtime-fresh-agent-qualification.ts",
+    "scripts/testing/runtime-gate.ts",
+    "scripts/testing/runtime-gate-args.ts",
+    "scripts/testing/runtime-sandbox.ts",
+    "scripts/testing/runtime-test-broker.ts",
+    "scripts/testing/runtime-phase5-soak.ts",
+    "scripts/testing/runtime-soak-evidence.ts",
+    "scripts/testing/runtime-landing-campaign.ts",
+    "test/unit/server/testing/runtime-soak-evidence.test.ts",
+    "test/runtime/**/*.ts",
+    "shared/**/*.ts"
+  ]
+}

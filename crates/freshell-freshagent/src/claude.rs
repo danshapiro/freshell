@@ -2487,6 +2487,35 @@ impl FreshClaudeState {
         (approvals, questions)
     }
 
+    /// Read the provider-owned transcript and apply this live runtime's pending
+    /// request, settings, status, and rollback overlays. Session hosts use this
+    /// read-only path for capture; it never consults web-owned pane state.
+    pub async fn get_snapshot(
+        &self,
+        session_type: SessionType,
+        thread_id: &str,
+    ) -> Result<Value, String> {
+        let rollback = self.load_rollback_record(thread_id).await;
+        let mut snapshot = crate::claude_snapshot::get_claude_snapshot(
+            session_type_str(session_type),
+            thread_id,
+            rollback.as_ref(),
+        )
+        .await
+        .map_err(|error| match error {
+            crate::claude_snapshot::ClaudeSnapshotError::NotFound => {
+                "claude session not found".to_string()
+            }
+            crate::claude_snapshot::ClaudeSnapshotError::Io(_) => {
+                "claude snapshot unavailable".to_string()
+            }
+        })?;
+        let (approvals, questions) = self.snapshot_pending_overlay(thread_id).await;
+        crate::claude_snapshot::apply_pending_overlay(&mut snapshot, approvals, questions);
+        self.apply_snapshot_metadata(thread_id, &mut snapshot).await;
+        Ok(snapshot)
+    }
+
     pub(crate) async fn apply_snapshot_metadata(&self, any_id: &str, snapshot: &mut Value) {
         let Some(key) = self.resolve_session_key(any_id).await else {
             return;
@@ -5489,8 +5518,32 @@ async fn spawn_sidecar() -> Result<(Child, ChildStdin, ChildStdout, String), Str
     let node = std::env::var("FRESHELL_CLAUDE_NODE").unwrap_or_else(|_| "node".to_string());
     let ownership_id = mint_ownership_id();
 
-    let mut cmd = tokio::process::Command::new(&node);
-    cmd.arg(&entry);
+    let run_as = std::env::var("FRESHELL_PROVIDER_RUN_AS_UID")
+        .ok()
+        .and_then(|uid| {
+            std::env::var("FRESHELL_PROVIDER_RUN_AS_GID")
+                .ok()
+                .map(|gid| (uid, gid))
+        });
+    let mut cmd = if let Some((uid, gid)) = run_as {
+        let mut command = tokio::process::Command::new("/usr/bin/setpriv");
+        command.args([
+            "--reuid",
+            &uid,
+            "--regid",
+            &gid,
+            "--clear-groups",
+            "--no-new-privs",
+            "--",
+            &node,
+        ]);
+        command.arg(&entry);
+        command
+    } else {
+        let mut command = tokio::process::Command::new(&node);
+        command.arg(&entry);
+        command
+    };
     // Inherit the parent env (HOME=<isolated>, CLAUDE_HOME=<isolated>/.claude) and layer the
     // ownership tag so the /proc reaper can find our sidecar AND the claude CLI grandchild
     // (the SDK's clean-env passes FRESHELL_CLAUDE_SIDECAR_ID through — it strips only
@@ -10241,6 +10294,7 @@ rl.on('line', (line) => {
 
     fn compact_msg(session_id: &str, instructions: Option<&str>) -> FreshAgentCompact {
         FreshAgentCompact {
+            request_id: None,
             provider: freshell_protocol::AgentProvider::Claude,
             session_id: session_id.to_string(),
             session_type: SessionType::Freshclaude,

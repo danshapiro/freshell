@@ -47,6 +47,7 @@ fn exiting_cli_spec(name: &str, code: i32) -> freshell_platform::CliCommandSpec 
             "{{sessionId}}".to_string(),
         ]),
         model_args: None,
+        effort_args: None,
         sandbox_args: None,
         permission_mode_args: None,
     }

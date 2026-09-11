@@ -91,9 +91,6 @@ pub(crate) async fn drain_and_associate(state: &WsState) {
     let located = match tokio::task::spawn_blocking(move || locator.tick(now)).await {
         Ok(located) => located,
         Err(join_error) => {
-            // The blocking closure only calls `OpencodeLocator::tick`, which
-            // does not itself panic in normal operation; a panic here would
-            // be a genuine bug, not a routine condition to silently swallow.
             tracing::warn!(
                 error = %join_error,
                 "opencode_locator_tick_panicked: sweep tick task panicked, skipping this cycle"
@@ -102,86 +99,83 @@ pub(crate) async fn drain_and_associate(state: &WsState) {
         }
     };
     for located in located {
-        let Some(entry) = state
-            .registry
-            .directory()
-            .into_iter()
-            .find(|e| e.terminal_id == located.terminal_id)
-        else {
-            tracing::warn!(
-                terminal_id = %located.terminal_id,
-                session_id = %located.session_id,
-                "opencode_association_rejected: terminal_missing"
-            );
-            continue;
-        };
-        if entry.mode != "opencode" || entry.status != TerminalRunStatus::Running {
-            tracing::warn!(
-                terminal_id = %located.terminal_id,
-                mode = %entry.mode,
-                "opencode_association_rejected: terminal_not_opencode_or_not_running"
-            );
-            continue;
-        }
-        if entry.resume_session_id.is_some() {
-            tracing::warn!(
-                terminal_id = %located.terminal_id,
-                "opencode_association_rejected: terminal_already_bound"
-            );
-            continue;
-        }
-        // Claim guards on the id being adopted (parity with the codex
-        // adoption tail's `codex_identity::codex_claim_refused` and the
-        // opencode SIGNAL lane's `target_session_guards_pass` — this
-        // locator lane previously had neither, so a sole cwd-matching
-        // candidate could silently rebind another pane's (or a fresh
-        // agent's) session onto this terminal).
-        if opencode_claim_refused(state, &located.terminal_id, &located.session_id).await {
-            continue;
-        }
-
-        state.identity.upsert(
-            &located.terminal_id,
-            Some("opencode"),
-            Some(&located.session_id),
-            entry.cwd.as_deref(),
-            now_ms(),
-        );
-        state.registry.set_meta(
-            &located.terminal_id,
-            None,
-            None,
-            Some("opencode".to_string()),
-            Some(located.session_id.clone()),
-        );
-        // P1.8 (trigger c) + P1.10: locator resolution is an identity event —
-        // durable binding row first, then the spawn-time pending marker is
-        // deleted. Registry-truth cwd, same as the in-memory binds above.
-        // Awaited (drain_and_associate is async; the helper spawn_blockings
-        // the fsync off this sweep task — V1.md).
-        crate::pane_ledger::ledger_resolve_identity(
-            state,
-            &located.terminal_id,
-            "opencode",
-            &located.session_id,
-            entry.cwd.as_deref(),
-        )
-        .await;
-        broadcast_terminal_session_associated(
-            state,
-            &located.terminal_id,
-            &located.session_id,
-            entry.cwd.clone(),
-        )
-        .await;
-        // Task 10: feed the identity proof into the activity hub — the
-        // opencode tracker's deferred (awaitingAssociation) completions
-        // release on this bind (channel-deferred, safe off the sweep task;
-        // codex_identity.rs:221 precedent).
-        if let Some(hub) = &state.activity {
-            hub.bind_opencode_session(&located.terminal_id, &located.session_id);
-        }
+        associate_session_identity(state, &located.terminal_id, &located.session_id).await;
     }
+}
+
+/// Managed OpenCode learns its native id inside the soul's session host, where
+/// the provider SQLite store actually lives. Fold that trusted id through the
+/// same claim guards, identity registry, pane ledger and broadcasts as the
+/// legacy host-side locator. Repeated observations of the same id are a no-op.
+pub(crate) async fn associate_managed_session(
+    state: &WsState,
+    terminal_id: &str,
+    session_id: &str,
+) {
+    associate_session_identity(state, terminal_id, session_id).await;
+}
+
+async fn associate_session_identity(state: &WsState, terminal_id: &str, session_id: &str) -> bool {
+    let Some(entry) = state
+        .registry
+        .directory()
+        .into_iter()
+        .find(|entry| entry.terminal_id == terminal_id)
+    else {
+        tracing::warn!(
+            terminal_id,
+            session_id,
+            "opencode_association_rejected: terminal_missing"
+        );
+        return false;
+    };
+    if entry.mode != "opencode" || entry.status != TerminalRunStatus::Running {
+        tracing::warn!(terminal_id, mode = %entry.mode,
+            "opencode_association_rejected: terminal_not_opencode_or_not_running");
+        return false;
+    }
+    if entry.resume_session_id.as_deref() == Some(session_id) {
+        return true;
+    }
+    if entry.resume_session_id.is_some() {
+        tracing::warn!(
+            terminal_id,
+            session_id,
+            "opencode_association_rejected: terminal_already_bound_to_different_session"
+        );
+        return false;
+    }
+    if opencode_claim_refused(state, terminal_id, session_id).await {
+        return false;
+    }
+
+    state.identity.upsert(
+        terminal_id,
+        Some("opencode"),
+        Some(session_id),
+        entry.cwd.as_deref(),
+        now_ms(),
+    );
+    state.registry.set_meta(
+        terminal_id,
+        None,
+        None,
+        Some("opencode".to_string()),
+        Some(session_id.to_string()),
+    );
+    crate::pane_ledger::ledger_resolve_identity(
+        state,
+        terminal_id,
+        "opencode",
+        session_id,
+        entry.cwd.as_deref(),
+    )
+    .await;
+    broadcast_terminal_session_associated(state, terminal_id, session_id, entry.cwd.clone()).await;
+    if let Some(hub) = &state.activity {
+        hub.bind_opencode_session(terminal_id, session_id);
+    }
+    true
 }
 
 /// Bug-1 (sidebar rail): classify a resume target at the moment a `ses_` id

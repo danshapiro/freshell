@@ -98,6 +98,7 @@ export type CodingCliCommandSpec = {
   resumeArgs?: (sessionId: string) => string[]
   createSessionArgs?: (sessionId: string) => string[]
   modelArgs?: (model: string) => string[]
+  effortArgs?: (effort: string) => string[]
   sandboxArgs?: (sandbox: string) => string[]
   permissionModeArgs?: (permissionMode: string) => string[]
   permissionModeEnvVar?: string
@@ -111,6 +112,8 @@ const FALLBACK_CODING_CLI_COMMAND_SPECS: Array<[string, CodingCliCommandSpec]> =
     defaultCommand: 'claude',
     resumeArgs: (sessionId: string) => ['--resume', sessionId],
     createSessionArgs: (sessionId: string) => ['--session-id', sessionId],
+    modelArgs: (model: string) => ['--model', model],
+    effortArgs: (effort: string) => ['--effort', effort],
     permissionModeArgs: (permissionMode: string) => ['--permission-mode', permissionMode],
   }],
   ['codex', {
@@ -119,6 +122,7 @@ const FALLBACK_CODING_CLI_COMMAND_SPECS: Array<[string, CodingCliCommandSpec]> =
     defaultCommand: 'codex',
     resumeArgs: (sessionId: string) => ['resume', sessionId],
     modelArgs: (model: string) => ['--model', model],
+    effortArgs: (effort: string) => ['-c', `model_reasoning_effort="${effort}"`],
     sandboxArgs: (sandbox: string) => ['--sandbox', sandbox],
   }],
   ['opencode', {
@@ -258,6 +262,7 @@ function providerNotificationArgs(
 export type ProviderSettings = {
   permissionMode?: string
   model?: string
+  effort?: string
   sandbox?: string
   codexAppServer?: {
     wsUrl: string
@@ -360,6 +365,9 @@ function resolveCodingCliCommand(
     : providerSettings?.model
   if (effectiveModel && spec.modelArgs) {
     settingsArgs.push(...spec.modelArgs(effectiveModel))
+  }
+  if (providerSettings?.effort && spec.effortArgs) {
+    settingsArgs.push(...spec.effortArgs(providerSettings.effort))
   }
   if (providerSettings?.sandbox && spec.sandboxArgs) {
     settingsArgs.push(...spec.sandboxArgs(providerSettings.sandbox))

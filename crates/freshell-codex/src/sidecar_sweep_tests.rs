@@ -657,6 +657,55 @@ async fn unverifiable_verdict_decides_retain_and_commit_records_reason() {
 }
 
 #[tokio::test]
+async fn sweep_preserves_record_and_reports_unconfirmed_when_kill_cannot_prove_empty() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let store = store_in(&dir);
+    let ownership_id = "codex-sidecar-a9000022-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+    // On TERM the root re-execs with a different argv. The sweep has already
+    // sent a signal, but the identity no longer authorizes escalation. This is
+    // the exact shape that used to be mislabeled Reaped and have its record
+    // deleted even though the root still existed.
+    let script = r#"trap 'exec sleep 301' TERM; sleep 300 & wait"#;
+    let root = spawn_own_shell_child("bash", &["-c", script], &["bash", "-c", script]);
+    let root_pid = root.0.id() as i32;
+    let children = wait_for_sleep_children(root_pid, 1);
+    let _orphan_guard = OrphanSnapshotGuard(children);
+    let record = record_for_child(ownership_id, root.0.id(), Some(SESSION));
+    store.write(&record).expect("write record");
+    let (reconciler, report) = SidecarReconciler::boot_reconcile(Arc::clone(&store));
+    assert_eq!(report.held, 1);
+
+    let outcome = reconciler
+        .commit_sweep_decision(&record, SweepDecision::Kill)
+        .await;
+    assert_eq!(outcome, SweepOutcome::TerminationUnconfirmed);
+    assert_eq!(
+        proc_starttime(root_pid),
+        Some(record.starttime),
+        "the exact root incarnation still exists, so Reaped would be false"
+    );
+    let rows = store.load_all();
+    assert_eq!(
+        rows.len(),
+        1,
+        "ownership evidence must survive an unconfirmed kill"
+    );
+    assert_eq!(rows[0].ownership_id, ownership_id);
+    assert_eq!(
+        rows[0].state,
+        SidecarRecordState::Retained {
+            reason: "termination-unconfirmed".to_string()
+        }
+    );
+    assert_eq!(
+        reconciler.unclaimed_len(),
+        1,
+        "the unconfirmed row remains held for later reconciliation"
+    );
+    // ChildGuard owns and reaps only this test's re-exec'd root on drop.
+}
+
+#[tokio::test]
 async fn kill_tree_reports_sigterm_sent_when_escalation_is_refused() {
     // The Task 6 carry-forward: after SIGTERM is sent and the drain budget
     // expires, a pre-SIGKILL re-verify that no longer matches must report

@@ -99,7 +99,7 @@ function createFakeSidecar(options: {
   }
 }
 
-describe.sequential('TerminalRegistry Codex durable recovery', () => {
+describe('TerminalRegistry Codex durable recovery', () => {
   let registry: TerminalRegistry
 
   beforeEach(async () => {

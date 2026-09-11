@@ -22,6 +22,7 @@ import type {
 import type { CodingCliProviderName, TokenSummary, SessionLocator } from '@shared/ws-protocol'
 import type { CodexDurabilityRef } from '@shared/codex-durability'
 import type { TitleSource } from '../../shared/title-source'
+import type { ManagedRuntimeProjectionFields } from '@shared/managed-runtime'
 export type { CodingCliProviderName }
 
 // TabMode includes 'shell' for regular terminals, plus all coding CLI providers
@@ -46,7 +47,7 @@ export interface SessionListMetadata {
   isNonInteractive?: boolean
 }
 
-export interface Tab {
+export interface Tab extends ManagedRuntimeProjectionFields {
   id: string
   createRequestId: string
   title: string

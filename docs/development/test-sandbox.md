@@ -27,11 +27,26 @@ scripts/sandbox-test.sh --corpus "cargo test -p freshell-sessions -- --ignored p
 This mounts `~/.codex/sessions` and `~/.claude/projects` read-only at their natural paths inside
 the container. Without `--corpus`, no real user data is mounted at all.
 
+## The `--runtime-suite` flag
+
+Managed-runtime lifecycle and reaping tests use the stricter mode:
+
+```bash
+scripts/sandbox-test.sh --runtime-suite "cargo test -p freshell-codex <destructive-test-name>"
+```
+
+`--runtime-suite` is intentionally incompatible with `--corpus`. It uses `--network none`, a
+read-only container root with only explicit tmpfs/bind/volume write locations and enables
+`no-new-privileges`. The root entrypoint may initialize cache-volume ownership, but it always drops
+to the unprivileged `sandbox` UID before test code and the self-test verifies that test code has zero
+effective capabilities. The mode never mounts Docker/admin sockets or real provider homes. The runtime gate's separate trusted broker is the only component allowed to hold the real
+Docker socket; this wrapper never grants it to tests.
+
 ## Safety guarantees
 
 | What | Guarantee |
 |---|---|
-| Network | Dedicated bridge network (`freshell-sandbox`), never `--network=host`. Binding port 3001/3002/etc. inside the container binds in its own namespace — the host's real dev servers on those ports are untouched. |
+| Network | Ordinary mode uses the dedicated `freshell-sandbox` bridge, never `--network=host`; `--runtime-suite` uses `--network none`. Binding a port inside either container namespace cannot collide with a host listener. |
 | Host processes | Container has its own PID namespace. Killing/crashing anything inside (including something literally named `freshell-server`) cannot reach a host process. |
 | `~/.freshell`, `~/.claude`, `~/.codex`, `~/.local/share/opencode` | Not mounted by default. `--corpus` mounts only `~/.codex/sessions` and `~/.claude/projects`, and only **read-only**. |
 | Repo | Bind-mounted read-write at `/workspace` so test output/artifacts are inspectable from the host. |
@@ -95,4 +110,4 @@ scripts/sandbox-selftest.sh
 
 It proves PID isolation, port isolation, filesystem isolation (read-only corpus mounts really are
 read-only, host `~/.freshell` isn't visible unmounted), and that a real crate's tests run green
-inside the sandbox — while checking host `:3001`/`:3002` health before and after the entire run.
+inside the sandbox. It uses exact host-side PID and HTTP sentinels that the self-test itself creates, so concurrent worktree servers may legitimately change without producing a false isolation failure; host `:3001`/`:3002` and Freshell PIDs are recorded as diagnostics only.

@@ -263,6 +263,28 @@ describe('foldVerdicts', () => {
     expect(dispatched.types).toContain(setReconcileWarming.type)
   })
 
+  it('leaves a pane alone when managed truth is unavailable, instead of failing it', () => {
+    // The supervisor owns managed souls. When the server could not read
+    // managed truth it says so explicitly; the browser must NOT paint a
+    // provider failure over a soul that is very likely alive — the managed
+    // inventory reconciler is the authority and will set the real state.
+    const { req, dispatch, dispatched } = foldHarness([
+      ['error', { reason: 'managed_runtime_unavailable' }],
+    ])
+    const outcome = foldVerdicts(dispatch, req, resultFor(req, dispatched.verdicts))
+    expect(outcome).toMatchObject({ managedDeferred: 1, warming: 0 })
+    expect(dispatched.types).not.toContain(setPaneRestoreError.type)
+  })
+
+  it('still fails a pane for an ordinary terminal error reason', () => {
+    const { req, dispatch, dispatched } = foldHarness([
+      ['error', { reason: 'provider_unavailable' }],
+    ])
+    const outcome = foldVerdicts(dispatch, req, resultFor(req, dispatched.verdicts))
+    expect(outcome).toMatchObject({ managedDeferred: 0 })
+    expect(dispatched.types).toContain(setPaneRestoreError.type)
+  })
+
   it('attach fold carries the result serverInstanceId and the pane ref parsed from the request', () => {
     const { req, dispatch, dispatched } = foldHarness([['attach', { terminalId: 'T1', corrected: true }]])
     foldVerdicts(dispatch, req, resultFor(req, dispatched.verdicts))

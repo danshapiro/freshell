@@ -1,0 +1,27 @@
+[package]
+name = "freshell-agent-runtime"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[features]
+default = []
+provider-qualification = []
+
+[dependencies]
+freshell-runtime-protocol = { path = "../freshell-runtime-protocol" }
+freshell-sessions = { path = "../freshell-sessions" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+rusqlite = { version = "0.31", features = ["bundled"] }
+thiserror = "2"
+async-trait = "0.1"
+sha2 = "0.10"
+tokio = { version = "1", features = ["rt", "sync"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+tempfile = "3"

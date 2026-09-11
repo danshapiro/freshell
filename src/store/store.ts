@@ -24,6 +24,7 @@ import { networkReducer } from './networkSlice'
 import tabRegistryReducer from './tabRegistrySlice'
 import extensionsReducer from './extensionsSlice'
 import deckReducer from './deckSlice'
+import managedRuntimeReducer from './managedRuntimeSlice'
 import { perfMiddleware } from './perfMiddleware'
 import { persistMiddleware } from './persistMiddleware'
 import { sessionActivityPersistMiddleware } from './sessionActivityPersistence'
@@ -77,6 +78,9 @@ export const store = configureStore({
     extensions: extensionsReducer,
     // Ephemeral device state — never persisted (allowlist rule)
     deck: deckReducer,
+    // Authoritative managed-runtime projection — reconstructed from the
+    // supervisor on every connection and deliberately never persisted.
+    managedRuntime: managedRuntimeReducer,
   },
   middleware: (getDefault) =>
     getDefault({

@@ -3942,6 +3942,10 @@ describe('TerminalView lifecycle updates', () => {
       fireData(term, 'doomed keystrokes')
       act(() => {
         vi.advanceTimersByTime(30_001)
+        // writeLocalXtermNotice goes through TerminalWriteQueue, which submits
+        // on the next animation frame. Vitest 5 no longer drains an rAF that
+        // was scheduled by the last timer inside the same advance call.
+        vi.advanceTimersByTime(20)
       })
       expectTerminalWriteContaining(term, 'the terminal did not reconnect in time')
     } finally {
@@ -4046,7 +4050,8 @@ describe('TerminalView lifecycle updates', () => {
     try {
       fireData(term, 'doomed')
       act(() => {
-        vi.advanceTimersByTime(30_001) // timeout -> immediate notice write
+        vi.advanceTimersByTime(30_001) // timeout -> notice enqueue
+        vi.advanceTimersByTime(20) // TerminalWriteQueue -> next animation frame
       })
       const writesBeforeAnchor = term.write.mock.calls.length
 
@@ -4057,6 +4062,8 @@ describe('TerminalView lifecycle updates', () => {
           requestId: createMsg.requestId,
           terminalId: 'term-new',
         })
+        // The post-anchor notice is also serialized through TerminalWriteQueue.
+        vi.advanceTimersByTime(20)
       })
       // The notice is written AGAIN after the anchor (post-clear), so it
       // survives the hydrate wipe.
@@ -5359,6 +5366,73 @@ describe('TerminalView lifecycle updates', () => {
         streamId: null,
         serverInstanceId: 'server-attach-stream',
       })).toBeNull()
+    })
+
+    it.each([1, 206])('restarts a recovered managed output epoch at sequence one after old cursor %s', async (oldHead) => {
+      const { terminalId, term } = await renderTerminalHarness({
+        status: 'running', terminalId: `term-managed-epoch-${oldHead}`,
+        serverInstanceId: 'server-managed-epoch', ackInitialAttach: false, clearSends: false,
+      })
+      const attach = sentMessages().find((msg) => msg?.type === 'terminal.attach' && msg?.terminalId === terminalId)!
+      act(() => {
+        messageHandler!({ type: 'terminal.attach.ready', terminalId, streamId: 'old-host-epoch',
+          headSeq: oldHead, replayFromSeq: oldHead, replayToSeq: oldHead, attachRequestId: attach.attachRequestId })
+        messageHandler!({ type: 'terminal.output', terminalId, streamId: 'old-host-epoch',
+          seqStart: oldHead, seqEnd: oldHead, data: 'OLD HOST HISTORY', attachRequestId: attach.attachRequestId })
+        messageHandler!({ type: 'terminal.stream.changed', terminalId, streamId: 'new-host-epoch',
+          reason: 'new_pty_session', attachRequestId: attach.attachRequestId })
+      })
+      // Reuse the existing safe hydration handshake to retire queued writes
+      // and parser callbacks from the old source before accepting lower seqs.
+      const replacementAttach = sentMessages().filter((msg) => msg?.type === 'terminal.attach' && msg?.terminalId === terminalId).at(-1)!
+      expect(replacementAttach.attachRequestId).not.toBe(attach.attachRequestId)
+      expect(replacementAttach.sinceSeq).toBe(0)
+      expect(sentMessages().filter((msg) => msg?.type === 'terminal.create')).toHaveLength(0)
+      act(() => {
+        messageHandler!({ type: 'terminal.attach.ready', terminalId, streamId: 'new-host-epoch',
+          headSeq: 2, replayFromSeq: 1, replayToSeq: 2, attachRequestId: replacementAttach.attachRequestId })
+        messageHandler!({ type: 'terminal.output', terminalId, streamId: 'new-host-epoch',
+          seqStart: 1, seqEnd: 1, data: 'RECOVERED PROVIDER PROMPT', attachRequestId: replacementAttach.attachRequestId })
+        messageHandler!({ type: 'terminal.output', terminalId, streamId: 'old-host-epoch',
+          seqStart: oldHead + 1, seqEnd: oldHead + 1, data: 'STALE OLD HOST', attachRequestId: attach.attachRequestId })
+        messageHandler!({ type: 'terminal.output', terminalId, streamId: 'new-host-epoch',
+          seqStart: 2, seqEnd: 2, data: 'NEW NATIVE RESPONSE', attachRequestId: replacementAttach.attachRequestId })
+      })
+      const writes = terminalWriteStrings(term).join('')
+      expect(writes).toContain('RECOVERED PROVIDER PROMPT')
+      expect(writes).toContain('NEW NATIVE RESPONSE')
+      expect(writes).not.toContain('STALE OLD HOST')
+      expect(loadTerminalSurfaceCheckpoint(terminalId, {
+        streamId: 'new-host-epoch', serverInstanceId: 'server-managed-epoch',
+      })?.parserAppliedSeq).toBe(2)
+    })
+
+    it('does not rewind a managed epoch on a duplicate stream-change notification', async () => {
+      const { terminalId, term } = await renderTerminalHarness({
+        status: 'running', terminalId: 'term-managed-epoch-idempotent',
+        ackInitialAttach: false, clearSends: false,
+      })
+      const attach = sentMessages().find((msg) => msg?.type === 'terminal.attach' && msg?.terminalId === terminalId)!
+      act(() => {
+        messageHandler!({ type: 'terminal.attach.ready', terminalId, streamId: 'old-managed-epoch',
+          headSeq: 0, replayFromSeq: 1, replayToSeq: 0, attachRequestId: attach.attachRequestId })
+        messageHandler!({ type: 'terminal.stream.changed', terminalId, streamId: 'new-managed-epoch',
+          reason: 'new_pty_session', attachRequestId: attach.attachRequestId })
+      })
+      const replacementAttach = sentMessages().filter((msg) => msg?.type === 'terminal.attach' && msg?.terminalId === terminalId).at(-1)!
+      expect(replacementAttach.attachRequestId).not.toBe(attach.attachRequestId)
+      const frame = { type: 'terminal.output', terminalId, streamId: 'new-managed-epoch',
+        seqStart: 1, seqEnd: 1, data: 'EXACTLY_ONCE_NEW_EPOCH', attachRequestId: replacementAttach.attachRequestId }
+      act(() => {
+        messageHandler!({ type: 'terminal.attach.ready', terminalId, streamId: 'new-managed-epoch',
+          headSeq: 1, replayFromSeq: 1, replayToSeq: 1, attachRequestId: replacementAttach.attachRequestId })
+        messageHandler!(frame)
+        messageHandler!({ type: 'terminal.stream.changed', terminalId, streamId: 'new-managed-epoch',
+          reason: 'new_pty_session', attachRequestId: replacementAttach.attachRequestId })
+        messageHandler!(frame)
+      })
+      expect(terminalWriteStrings(term).join('').split('EXACTLY_ONCE_NEW_EPOCH')).toHaveLength(2)
+      expect(sentMessages().filter((msg) => msg?.type === 'terminal.attach' && msg?.terminalId === terminalId)).toHaveLength(2)
     })
 
     it('accepts live output after a terminal.stream.changed control message without trusting the old stream', async () => {

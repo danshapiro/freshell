@@ -860,6 +860,7 @@ checksum = "9ed9a281f7bc9b7576e61468ba615a66a5c8cfdff42420a70aa82701a3b1e292"
 dependencies = [
  "block-buffer",
  "crypto-common",
+ "subtle",
 ]
 
 [[package]]
@@ -1277,6 +1278,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "freshell-agent-runtime"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "freshell-runtime-protocol",
+ "freshell-sessions",
+ "libc",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+]
+
+[[package]]
 name = "freshell-api"
 version = "0.1.0"
 dependencies = [
@@ -1312,8 +1330,10 @@ dependencies = [
 name = "freshell-freshagent"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "axum",
  "fancy-regex",
+ "freshell-agent-runtime",
  "freshell-codex",
  "freshell-opencode",
  "freshell-platform",
@@ -1324,6 +1344,7 @@ dependencies = [
  "libc",
  "serde",
  "serde_json",
+ "sha2",
  "tempfile",
  "tokio",
  "tower",
@@ -1365,19 +1386,59 @@ dependencies = [
 ]
 
 [[package]]
+name = "freshell-runtime-client"
+version = "0.1.0"
+dependencies = [
+ "freshell-runtime-protocol",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+]
+
+[[package]]
+name = "freshell-runtime-observability"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "regex",
+ "serde",
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
+name = "freshell-runtime-protocol"
+version = "0.1.0"
+dependencies = [
+ "hmac",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror 2.0.18",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
 name = "freshell-server"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "axum",
  "base64 0.22.1",
  "chrono",
  "dotenvy",
+ "freshell-agent-runtime",
  "freshell-api",
  "freshell-codex",
  "freshell-extensions",
  "freshell-freshagent",
  "freshell-platform",
  "freshell-protocol",
+ "freshell-runtime-client",
+ "freshell-runtime-observability",
+ "freshell-runtime-protocol",
  "freshell-sessions",
  "freshell-terminal",
  "freshell-ws",
@@ -1403,6 +1464,31 @@ dependencies = [
 ]
 
 [[package]]
+name = "freshell-session-host"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "freshell-agent-runtime",
+ "freshell-codex",
+ "freshell-freshagent",
+ "freshell-platform",
+ "freshell-protocol",
+ "freshell-runtime-observability",
+ "freshell-runtime-protocol",
+ "freshell-sessions",
+ "freshell-terminal",
+ "libc",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "url",
+ "uuid",
+]
+
+[[package]]
 name = "freshell-sessions"
 version = "0.1.0"
 dependencies = [
@@ -1417,6 +1503,27 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "uuid",
+]
+
+[[package]]
+name = "freshell-supervisor"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "chrono",
+ "freshell-agent-runtime",
+ "freshell-runtime-observability",
+ "freshell-runtime-protocol",
+ "libc",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
  "uuid",
 ]
 
@@ -1461,6 +1568,7 @@ dependencies = [
  "axum",
  "chrono",
  "freshell-activity",
+ "freshell-agent-runtime",
  "freshell-codex",
  "freshell-freshagent",
  "freshell-opencode",
@@ -2022,6 +2130,15 @@ name = "hex"
 version = "0.4.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7f24254aa9a54b5c858eaee2f5bccdb46aaf0e486a595ed5fd8f86ba55232a70"
+
+[[package]]
+name = "hmac"
+version = "0.12.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6c49c37c09c17a53d937dfbb742eb3a961d65a994e6bcdcf37e7399d0cc8ab5e"
+dependencies = [
+ "digest",
+]
 
 [[package]]
 name = "html5ever"

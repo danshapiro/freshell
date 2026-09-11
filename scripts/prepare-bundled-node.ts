@@ -30,10 +30,10 @@ import https from 'https'
 import { createRequire } from 'module'
 import path from 'path'
 import { pipeline } from 'node:stream/promises'
+import yauzl, { type Entry } from 'yauzl'
 import { fileURLToPath } from 'url'
 import tar from 'tar'
 
-const extractZip = (await import('extract-zip')).default
 const require = createRequire(import.meta.url)
 
 const __filename = fileURLToPath(import.meta.url)
@@ -250,6 +250,65 @@ async function downloadFile(url: string, destination: string): Promise<void> {
   })
 }
 
+export function validateZipEntryName(name: string): void {
+  if (!name || name.includes('\0') || name.includes('\\') || name.startsWith('/')
+    || /^[A-Za-z]:/.test(name) || name.split('/').some((part) => part === '..')) {
+    throw new Error('ZIP entry has an unsafe path')
+  }
+}
+
+function entryIsSymlink(entry: Entry): boolean {
+  return ((entry.externalFileAttributes >>> 16) & 0o170000) === 0o120000
+}
+
+/** Extract exactly one expected regular member; all archive paths remain data. */
+export async function extractZipMember(
+  archivePath: string,
+  expectedMember: string,
+  outputPath: string,
+): Promise<void> {
+  validateZipEntryName(expectedMember)
+  const maxEntries = 100_000
+  const maxMemberBytes = 256 * 1024 * 1024
+  try {
+    await new Promise<void>((resolve, reject) => {
+      yauzl.open(archivePath, {
+      lazyEntries: true,
+      autoClose: true,
+      decodeStrings: true,
+      validateEntrySizes: true,
+      strictFileNames: true,
+    }, (openError, zip) => {
+      if (openError || !zip) return reject(new Error('Could not open ZIP archive'))
+      let entries = 0
+      let found = false
+      const fail = (message: string) => { zip.close(); reject(new Error(message)) }
+      zip.on('error', () => reject(new Error('ZIP archive read failed')))
+      zip.on('end', () => found ? resolve() : reject(new Error('Expected ZIP member is missing')))
+      zip.on('entry', (entry) => {
+        try { validateZipEntryName(entry.fileName) } catch { return fail('ZIP contains an unsafe path') }
+        if (++entries > maxEntries) return fail('ZIP contains too many entries')
+        if (entry.fileName !== expectedMember) return zip.readEntry()
+        if (found) return fail('ZIP contains duplicate expected members')
+        found = true
+        if (entry.fileName.endsWith('/') || entryIsSymlink(entry)) return fail('Expected ZIP member is not a regular file')
+        if (entry.uncompressedSize <= 0 || entry.uncompressedSize > maxMemberBytes) return fail('Expected ZIP member has an unsafe size')
+        mkdirSync(path.dirname(outputPath), { recursive: true })
+        zip.openReadStream(entry, (streamError, stream) => {
+          if (streamError || !stream) return fail('Could not read expected ZIP member')
+          pipeline(stream, createWriteStream(outputPath, { flags: 'wx', mode: 0o755 }))
+            .then(() => zip.readEntry(), () => fail('Could not extract expected ZIP member'))
+        })
+      })
+        zip.readEntry()
+      })
+    })
+  } catch (error) {
+    removePath(outputPath)
+    throw error
+  }
+}
+
 async function extractNodeBinary(
   version: string,
   platform: string,
@@ -264,9 +323,9 @@ async function extractNodeBinary(
 
   try {
     if (platform === 'win32') {
-      await extractZip(archivePath, { dir: tmpDir })
-      cpSync(
-        path.join(tmpDir, `node-v${version}-win-${arch}`, 'node.exe'),
+      await extractZipMember(
+        archivePath,
+        `node-v${version}-win-${arch}/node.exe`,
         binaryPath,
       )
       return

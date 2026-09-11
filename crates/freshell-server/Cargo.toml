@@ -14,6 +14,25 @@ edition.workspace = true
 rust-version.workspace = true
 publish.workspace = true
 
+[features]
+# Phase 1 handoff marker only. This flag is disabled by default and intentionally
+# has no dependency or routing wiring yet; enabling it MUST NOT cause a legacy
+# process launch to be described as managed. Phase 2/3 will attach the runtime
+# client only after their live continuity/provider gates pass.
+default = []
+managed-runtime-v1 = [
+  "dep:freshell-agent-runtime",
+  "dep:freshell-runtime-client",
+  "dep:freshell-runtime-protocol",
+]
+managed-provider-qualification = [
+  "managed-runtime-v1",
+  "freshell-agent-runtime/provider-qualification",
+  "freshell-ws/provider-qualification",
+  "freshell-freshagent/provider-qualification",
+]
+managed-fresh-agent-fixtures = ["managed-runtime-v1"]
+
 [[bin]]
 name = "freshell-server"
 path = "src/main.rs"
@@ -40,10 +59,15 @@ freshell-sessions = { path = "../freshell-sessions" }
 # The shared terminal registry constructed into WsState (terminals owned by
 # terminalId across connections — the multi-client / reconnection backbone).
 freshell-terminal = { path = "../freshell-terminal" }
+freshell-agent-runtime = { path = "../freshell-agent-runtime", optional = true }
+freshell-runtime-client = { path = "../freshell-runtime-client", optional = true }
+freshell-runtime-observability = { path = "../freshell-runtime-observability" }
+freshell-runtime-protocol = { path = "../freshell-runtime-protocol", optional = true }
 # `sync` = the shared broadcast bus; `signal` = graceful SIGTERM shutdown (serve
 # reaping); `time` = the bounded wait for the `ui.screenshot.result` round-trip.
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal", "sync", "time"] }
 axum = "0.8"
+async-trait = "0.1"
 serde_json = { workspace = true }
 # Boot-scoped identifiers: `srv-<uuidv4>` / `boot-<uuidv4>`.
 uuid = { version = "1", features = ["v4"] }

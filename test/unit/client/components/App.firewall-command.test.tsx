@@ -20,6 +20,7 @@ import App from '@/App'
 import settingsReducer, { defaultSettings } from '@/store/settingsSlice'
 import tabsReducer from '@/store/tabsSlice'
 import connectionReducer, { setStatus } from '@/store/connectionSlice'
+import managedRuntimeReducer from '@/store/managedRuntimeSlice'
 import sessionsReducer from '@/store/sessionsSlice'
 import panesReducer from '@/store/panesSlice'
 import tabRegistryReducer from '@/store/tabRegistrySlice'
@@ -185,6 +186,7 @@ function createTestStore(connectionStatus: 'connecting' | 'ready') {
       settings: settingsReducer,
       tabs: tabsReducer,
       connection: connectionReducer,
+      managedRuntime: managedRuntimeReducer,
       sessions: sessionsReducer,
       panes: panesReducer,
       tabRegistry: tabRegistryReducer,

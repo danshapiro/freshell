@@ -1,0 +1,15 @@
+[package]
+name = "freshell-runtime-client"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+freshell-runtime-protocol = { path = "../freshell-runtime-protocol" }
+tokio = { version = "1", features = ["net", "sync", "fs", "io-util", "macros", "rt"] }
+thiserror = "2"
+serde_json = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"

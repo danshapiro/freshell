@@ -2,7 +2,7 @@
   "name": "amplifier",
   "version": "1.0.0",
   "label": "Amplifier",
-  "description": "Microsoft's Amplifier CLI agent",
+  "description": "Microsoft's Amplifier CLI agent (managed qualification uses the pinned OneCLI/LunaRoute glm-5.3 profile)",
   "category": "cli",
   "cli": {
     "command": "amplifier",

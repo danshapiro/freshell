@@ -1,0 +1,3020 @@
+{
+  "description": "Generated from shared/managed-runtime.ts. Do not edit by hand.",
+  "generator": "port/contract/generate-managed-runtime-contract.ts",
+  "schemaCount": 38,
+  "schemas": {
+    "ManagedRuntimeAllocationStateSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "enum": [
+        "allocated",
+        "materializing",
+        "verified_durable",
+        "degraded"
+      ],
+      "type": "string"
+    },
+    "ManagedRuntimeCleanupStateSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "enum": [
+        "none",
+        "requested",
+        "termination_unconfirmed",
+        "verified_empty",
+        "blocked_ownership"
+      ],
+      "type": "string"
+    },
+    "ManagedRuntimeCounterSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "properties": {
+        "label": {
+          "type": "string"
+        },
+        "name": {
+          "type": "string"
+        },
+        "value": {
+          "maximum": 9007199254740991,
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "name",
+        "label",
+        "value"
+      ],
+      "type": "object"
+    },
+    "ManagedRuntimeDesiredStateSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "enum": [
+        "running",
+        "stopped"
+      ],
+      "type": "string"
+    },
+    "ManagedRuntimeDurabilityStateSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "enum": [
+        "unknown",
+        "live_only",
+        "resume_captured",
+        "checkpoint_captured",
+        "intrinsically_non_resumable"
+      ],
+      "type": "string"
+    },
+    "ManagedRuntimeIncidentSummarySchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "properties": {
+        "cleanup": {
+          "additionalProperties": false,
+          "properties": {
+            "forcedAttempt": {
+              "type": "string"
+            },
+            "foreignObjectsTouched": {
+              "maximum": 9007199254740991,
+              "minimum": 0,
+              "type": "integer"
+            },
+            "gracefulAttempt": {
+              "type": "string"
+            },
+            "ownedHandleRef": {
+              "type": "string"
+            },
+            "ownershipVerified": {
+              "type": "boolean"
+            },
+            "verifiedAt": {
+              "type": "string"
+            },
+            "verifiedEmpty": {
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "ownedHandleRef",
+            "ownershipVerified",
+            "gracefulAttempt",
+            "forcedAttempt",
+            "verifiedEmpty",
+            "foreignObjectsTouched"
+          ],
+          "type": "object"
+        },
+        "correlationId": {
+          "maxLength": 160,
+          "minLength": 1,
+          "type": "string"
+        },
+        "createdAt": {
+          "type": "string"
+        },
+        "incidentId": {
+          "maxLength": 160,
+          "minLength": 1,
+          "type": "string"
+        },
+        "observedCause": {
+          "type": "string"
+        },
+        "provider": {
+          "type": "string"
+        },
+        "reasonCode": {
+          "type": "string"
+        },
+        "soulId": {
+          "maxLength": 160,
+          "minLength": 1,
+          "type": "string"
+        },
+        "state": {
+          "enum": [
+            "cleanup_pending",
+            "cleanup_failed",
+            "closed"
+          ],
+          "type": "string"
+        },
+        "updatedAt": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "incidentId",
+        "correlationId",
+        "soulId",
+        "provider",
+        "state",
+        "reasonCode",
+        "observedCause",
+        "cleanup",
+        "createdAt",
+        "updatedAt"
+      ],
+      "type": "object"
+    },
+    "ManagedRuntimeInitialScanStateSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "enum": [
+        "pending",
+        "scanning",
+        "complete",
+        "blocked"
+      ],
+      "type": "string"
+    },
+    "ManagedRuntimeInventoryChangedMessageSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "properties": {
+        "readiness": {
+          "additionalProperties": false,
+          "properties": {
+            "blockedSubsystems": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "initialScanDurationMs": {
+              "maximum": 9007199254740991,
+              "minimum": 0,
+              "type": "integer"
+            },
+            "initialScanFinishedAt": {
+              "maximum": 9007199254740991,
+              "minimum": -9007199254740991,
+              "type": "integer"
+            },
+            "initialScanStartedAt": {
+              "maximum": 9007199254740991,
+              "minimum": -9007199254740991,
+              "type": "integer"
+            },
+            "initialScanState": {
+              "enum": [
+                "pending",
+                "scanning",
+                "complete",
+                "blocked"
+              ],
+              "type": "string"
+            },
+            "inventoryRevision": {
+              "maximum": 9007199254740991,
+              "minimum": 0,
+              "type": "integer"
+            },
+            "startupRecoveryConcurrencyLimit": {
+              "maximum": 9007199254740991,
+              "minimum": 0,
+              "type": "integer"
+            },
+            "startupRecoveryPeak": {
+              "maximum": 9007199254740991,
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "inventoryRevision",
+            "initialScanState",
+            "blockedSubsystems",
+            "startupRecoveryConcurrencyLimit",
+            "startupRecoveryPeak"
+          ],
+          "type": "object"
+        },
+        "revision": {
+          "maximum": 9007199254740991,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "type": {
+          "const": "runtime.inventory.changed",
+          "type": "string"
+        }
+      },
+      "required": [
+        "type",
+        "revision",
+        "readiness"
+      ],
+      "type": "object"
+    },
+    "ManagedRuntimeInventorySnapshotSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "properties": {
+        "pendingProjectionCount": {
+          "maximum": 9007199254740991,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "readiness": {
+          "additionalProperties": false,
+          "properties": {
+            "blockedSubsystems": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "initialScanDurationMs": {
+              "maximum": 9007199254740991,
+              "minimum": 0,
+              "type": "integer"
+            },
+            "initialScanFinishedAt": {
+              "maximum": 9007199254740991,
+              "minimum": -9007199254740991,
+              "type": "integer"
+            },
+            "initialScanStartedAt": {
+              "maximum": 9007199254740991,
+              "minimum": -9007199254740991,
+              "type": "integer"
+            },
+            "initialScanState": {
+              "enum": [
+                "pending",
+                "scanning",
+                "complete",
+                "blocked"
+              ],
+              "type": "string"
+            },
+            "inventoryRevision": {
+              "maximum": 9007199254740991,
+              "minimum": 0,
+              "type": "integer"
+            },
+            "startupRecoveryConcurrencyLimit": {
+              "maximum": 9007199254740991,
+              "minimum": 0,
+              "type": "integer"
+            },
+            "startupRecoveryPeak": {
+              "maximum": 9007199254740991,
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "inventoryRevision",
+            "initialScanState",
+            "blockedSubsystems",
+            "startupRecoveryConcurrencyLimit",
+            "startupRecoveryPeak"
+          ],
+          "type": "object"
+        },
+        "revision": {
+          "maximum": 9007199254740991,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "souls": {
+          "items": {
+            "additionalProperties": false,
+            "properties": {
+              "allocationState": {
+                "enum": [
+                  "allocated",
+                  "materializing",
+                  "verified_durable",
+                  "degraded"
+                ],
+                "type": "string"
+              },
+              "cleanupState": {
+                "enum": [
+                  "none",
+                  "requested",
+                  "termination_unconfirmed",
+                  "verified_empty",
+                  "blocked_ownership"
+                ],
+                "type": "string"
+              },
+              "configuredLimits": {
+                "additionalProperties": false,
+                "properties": {
+                  "cpuMilli": {
+                    "maximum": 9007199254740991,
+                    "minimum": 0,
+                    "type": "integer"
+                  },
+                  "memoryBytes": {
+                    "maximum": 9007199254740991,
+                    "minimum": 0,
+                    "type": "integer"
+                  },
+                  "pidsMax": {
+                    "maximum": 9007199254740991,
+                    "minimum": 0,
+                    "type": "integer"
+                  },
+                  "swapBytes": {
+                    "maximum": 9007199254740991,
+                    "minimum": 0,
+                    "type": "integer"
+                  }
+                },
+                "required": [
+                  "cpuMilli",
+                  "memoryBytes",
+                  "swapBytes",
+                  "pidsMax"
+                ],
+                "type": "object"
+              },
+              "containerId": {
+                "type": "string"
+              },
+              "desiredState": {
+                "enum": [
+                  "running",
+                  "stopped"
+                ],
+                "type": "string"
+              },
+              "durabilityState": {
+                "enum": [
+                  "unknown",
+                  "live_only",
+                  "resume_captured",
+                  "checkpoint_captured",
+                  "intrinsically_non_resumable"
+                ],
+                "type": "string"
+              },
+              "effectiveLimits": {
+                "additionalProperties": false,
+                "properties": {
+                  "cpuMilli": {
+                    "maximum": 9007199254740991,
+                    "minimum": 0,
+                    "type": "integer"
+                  },
+                  "memoryBytes": {
+                    "maximum": 9007199254740991,
+                    "minimum": 0,
+                    "type": "integer"
+                  },
+                  "pidsMax": {
+                    "maximum": 9007199254740991,
+                    "minimum": 0,
+                    "type": "integer"
+                  },
+                  "swapBytes": {
+                    "maximum": 9007199254740991,
+                    "minimum": 0,
+                    "type": "integer"
+                  }
+                },
+                "required": [
+                  "cpuMilli",
+                  "memoryBytes",
+                  "swapBytes",
+                  "pidsMax"
+                ],
+                "type": "object"
+              },
+              "evidenceRevision": {
+                "maximum": 9007199254740991,
+                "minimum": 0,
+                "type": "integer"
+              },
+              "executionGeneration": {
+                "maximum": 9007199254740991,
+                "minimum": 0,
+                "type": "integer"
+              },
+              "hostBootId": {
+                "type": "string"
+              },
+              "incarnationId": {
+                "maxLength": 160,
+                "minLength": 1,
+                "type": "string"
+              },
+              "incidentId": {
+                "maxLength": 160,
+                "minLength": 1,
+                "type": "string"
+              },
+              "intentRevision": {
+                "maximum": 9007199254740991,
+                "minimum": 0,
+                "type": "integer"
+              },
+              "launchState": {
+                "enum": [
+                  "prepared",
+                  "created",
+                  "starting",
+                  "running",
+                  "stopping",
+                  "stopped",
+                  "failed"
+                ],
+                "type": "string"
+              },
+              "nativeSessionId": {
+                "type": "string"
+              },
+              "priorIncarnationId": {
+                "type": "string"
+              },
+              "profile": {
+                "enum": [
+                  "default_agent",
+                  "test_fixture",
+                  "custom"
+                ],
+                "type": "string"
+              },
+              "projectKey": {
+                "type": "string"
+              },
+              "provider": {
+                "type": "string"
+              },
+              "recoveryAttemptId": {
+                "type": "string"
+              },
+              "recoveryReason": {
+                "type": "string"
+              },
+              "recoveryState": {
+                "enum": [
+                  "live",
+                  "recovering",
+                  "blocked",
+                  "lost",
+                  "stopped"
+                ],
+                "type": "string"
+              },
+              "soulId": {
+                "maxLength": 160,
+                "minLength": 1,
+                "type": "string"
+              },
+              "successfulRecoveriesInWindow": {
+                "maximum": 9007199254740991,
+                "minimum": 0,
+                "type": "integer"
+              },
+              "terminalCreateRequestId": {
+                "type": "string"
+              },
+              "terminalCwd": {
+                "type": "string"
+              },
+              "terminalId": {
+                "type": "string"
+              },
+              "terminalMode": {
+                "type": "string"
+              },
+              "terminalResumeSessionId": {
+                "type": "string"
+              },
+              "terminalStreamId": {
+                "type": "string"
+              },
+              "viewIntentRevision": {
+                "maximum": 9007199254740991,
+                "minimum": 0,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "soulId",
+              "incarnationId",
+              "launchState",
+              "cleanupState",
+              "intentRevision",
+              "executionGeneration",
+              "desiredState",
+              "recoveryState",
+              "durabilityState",
+              "allocationState",
+              "evidenceRevision",
+              "successfulRecoveriesInWindow"
+            ],
+            "type": "object"
+          },
+          "type": "array"
+        },
+        "viewIntents": {
+          "items": {
+            "additionalProperties": false,
+            "properties": {
+              "createdAt": {
+                "maximum": 9007199254740991,
+                "minimum": -9007199254740991,
+                "type": "integer"
+              },
+              "kind": {
+                "enum": [
+                  "automatic_primary",
+                  "explicit"
+                ],
+                "type": "string"
+              },
+              "ownerId": {
+                "type": "string"
+              },
+              "placementGroup": {
+                "type": "string"
+              },
+              "preferredPaneId": {
+                "maxLength": 160,
+                "minLength": 1,
+                "type": "string"
+              },
+              "preferredTabId": {
+                "maxLength": 160,
+                "minLength": 1,
+                "type": "string"
+              },
+              "revision": {
+                "maximum": 9007199254740991,
+                "minimum": 0,
+                "type": "integer"
+              },
+              "soulId": {
+                "maxLength": 160,
+                "minLength": 1,
+                "type": "string"
+              },
+              "soulIntentRevision": {
+                "maximum": 9007199254740991,
+                "minimum": 0,
+                "type": "integer"
+              },
+              "title": {
+                "type": "string"
+              },
+              "updatedAt": {
+                "maximum": 9007199254740991,
+                "minimum": -9007199254740991,
+                "type": "integer"
+              },
+              "viewId": {
+                "maxLength": 160,
+                "minLength": 1,
+                "type": "string"
+              },
+              "visibility": {
+                "enum": [
+                  "visible",
+                  "detached",
+                  "hidden"
+                ],
+                "type": "string"
+              },
+              "workspaceId": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "viewId",
+              "soulId",
+              "ownerId",
+              "workspaceId",
+              "kind",
+              "preferredTabId",
+              "preferredPaneId",
+              "title",
+              "placementGroup",
+              "visibility",
+              "revision",
+              "soulIntentRevision",
+              "createdAt",
+              "updatedAt"
+            ],
+            "type": "object"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "revision",
+        "readiness",
+        "souls",
+        "viewIntents",
+        "pendingProjectionCount"
+      ],
+      "type": "object"
+    },
+    "ManagedRuntimeLaunchStateSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "enum": [
+        "prepared",
+        "created",
+        "starting",
+        "running",
+        "stopping",
+        "stopped",
+        "failed"
+      ],
+      "type": "string"
+    },
+    "ManagedRuntimeLimitApplicationSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "enum": [
+        "applied_now",
+        "next_incarnation"
+      ],
+      "type": "string"
+    },
+    "ManagedRuntimeLimitsMutationSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "properties": {
+        "cpuMilli": {
+          "maximum": 9007199254740991,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "expectedIntentRevision": {
+          "maximum": 9007199254740991,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "memoryBytes": {
+          "maximum": 9007199254740991,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "pidsMax": {
+          "maximum": 9007199254740991,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "requestId": {
+          "maxLength": 160,
+          "minLength": 1,
+          "type": "string"
+        },
+        "swapBytes": {
+          "maximum": 9007199254740991,
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "requestId",
+        "expectedIntentRevision",
+        "cpuMilli",
+        "memoryBytes",
+        "swapBytes",
+        "pidsMax"
+      ],
+      "type": "object"
+    },
+    "ManagedRuntimeLimitsSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "properties": {
+        "cpuMilli": {
+          "maximum": 9007199254740991,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "memoryBytes": {
+          "maximum": 9007199254740991,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "pidsMax": {
+          "maximum": 9007199254740991,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "swapBytes": {
+          "maximum": 9007199254740991,
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "cpuMilli",
+        "memoryBytes",
+        "swapBytes",
+        "pidsMax"
+      ],
+      "type": "object"
+    },
+    "ManagedRuntimeLossCleanupReportSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "properties": {
+        "forcedAttempt": {
+          "type": "string"
+        },
+        "foreignObjectsTouched": {
+          "maximum": 9007199254740991,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "gracefulAttempt": {
+          "type": "string"
+        },
+        "ownedHandleRef": {
+          "type": "string"
+        },
+        "ownershipVerified": {
+          "type": "boolean"
+        },
+        "verifiedAt": {
+          "type": "string"
+        },
+        "verifiedEmpty": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "ownedHandleRef",
+        "ownershipVerified",
+        "gracefulAttempt",
+        "forcedAttempt",
+        "verifiedEmpty",
+        "foreignObjectsTouched"
+      ],
+      "type": "object"
+    },
+    "ManagedRuntimeLossIncidentStateSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "enum": [
+        "cleanup_pending",
+        "cleanup_failed",
+        "closed"
+      ],
+      "type": "string"
+    },
+    "ManagedRuntimeMetricsSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "properties": {
+        "cpuNrThrottled": {
+          "maximum": 9007199254740991,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "cpuThrottledUsec": {
+          "maximum": 9007199254740991,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "cpuUsageUsec": {
+          "maximum": 9007199254740991,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "memoryCurrentBytes": {
+          "maximum": 9007199254740991,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "memoryOom": {
+          "maximum": 9007199254740991,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "memoryOomKill": {
+          "maximum": 9007199254740991,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "memoryPeakBytes": {
+          "maximum": 9007199254740991,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "pidsCurrent": {
+          "maximum": 9007199254740991,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "pidsMax": {
+          "maximum": 9007199254740991,
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "cpuUsageUsec",
+        "cpuThrottledUsec",
+        "cpuNrThrottled",
+        "memoryCurrentBytes",
+        "memoryPeakBytes",
+        "memoryOom",
+        "memoryOomKill",
+        "pidsCurrent",
+        "pidsMax"
+      ],
+      "type": "object"
+    },
+    "ManagedRuntimeMetricsSnapshotSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "properties": {
+        "counters": {
+          "items": {
+            "additionalProperties": false,
+            "properties": {
+              "label": {
+                "type": "string"
+              },
+              "name": {
+                "type": "string"
+              },
+              "value": {
+                "maximum": 9007199254740991,
+                "minimum": 0,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "name",
+              "label",
+              "value"
+            ],
+            "type": "object"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "counters"
+      ],
+      "type": "object"
+    },
+    "ManagedRuntimeMigrationPlanSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "properties": {
+        "blockers": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "controllerReady": {
+          "type": "boolean"
+        },
+        "currentMode": {
+          "enum": [
+            "legacy",
+            "managed-opt-in",
+            "managed-default"
+          ],
+          "type": "string"
+        },
+        "dryRun": {
+          "type": "boolean"
+        },
+        "imageVerified": {
+          "type": "boolean"
+        },
+        "legacyMetadataCount": {
+          "maximum": 9007199254740991,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "managedSoulCount": {
+          "maximum": 9007199254740991,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "migrationId": {
+          "maxLength": 160,
+          "minLength": 1,
+          "type": "string"
+        },
+        "projectedCpuMilli": {
+          "maximum": 9007199254740991,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "projectedMemoryBytes": {
+          "maximum": 9007199254740991,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "projectedPids": {
+          "maximum": 9007199254740991,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "registryBackupPath": {
+          "type": "string"
+        },
+        "registryBackupRequired": {
+          "type": "boolean"
+        },
+        "registryBackupSchemaVersion": {
+          "maximum": 9007199254740991,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "registryBackupSha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "type": "string"
+        },
+        "registryBackupVerified": {
+          "type": "boolean"
+        },
+        "requestedMode": {
+          "enum": [
+            "legacy",
+            "managed-opt-in",
+            "managed-default"
+          ],
+          "type": "string"
+        }
+      },
+      "required": [
+        "migrationId",
+        "currentMode",
+        "requestedMode",
+        "dryRun",
+        "controllerReady",
+        "imageVerified",
+        "registryBackupRequired",
+        "registryBackupVerified",
+        "managedSoulCount",
+        "legacyMetadataCount",
+        "projectedCpuMilli",
+        "projectedMemoryBytes",
+        "projectedPids",
+        "blockers"
+      ],
+      "type": "object"
+    },
+    "ManagedRuntimeNoticeDeliveryStateSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "enum": [
+        "pending",
+        "rendered",
+        "acknowledged",
+        "dismissed"
+      ],
+      "type": "string"
+    },
+    "ManagedRuntimeNoticeKindSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "enum": [
+        "cleanup_succeeded",
+        "cleanup_failed",
+        "ended_without_process"
+      ],
+      "type": "string"
+    },
+    "ManagedRuntimeNoticeSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "properties": {
+        "createdAt": {
+          "type": "string"
+        },
+        "deliveryState": {
+          "enum": [
+            "pending",
+            "rendered",
+            "acknowledged",
+            "dismissed"
+          ],
+          "type": "string"
+        },
+        "incidentIds": {
+          "items": {
+            "maxLength": 160,
+            "minLength": 1,
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "kind": {
+          "enum": [
+            "cleanup_succeeded",
+            "cleanup_failed",
+            "ended_without_process"
+          ],
+          "type": "string"
+        },
+        "message": {
+          "type": "string"
+        },
+        "noticeId": {
+          "maxLength": 160,
+          "minLength": 1,
+          "type": "string"
+        },
+        "reference": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "noticeId",
+        "kind",
+        "message",
+        "reference",
+        "incidentIds",
+        "deliveryState",
+        "createdAt"
+      ],
+      "type": "object"
+    },
+    "ManagedRuntimeNoticesResponseSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "properties": {
+        "notices": {
+          "items": {
+            "additionalProperties": false,
+            "properties": {
+              "createdAt": {
+                "type": "string"
+              },
+              "deliveryState": {
+                "enum": [
+                  "pending",
+                  "rendered",
+                  "acknowledged",
+                  "dismissed"
+                ],
+                "type": "string"
+              },
+              "incidentIds": {
+                "items": {
+                  "maxLength": 160,
+                  "minLength": 1,
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              "kind": {
+                "enum": [
+                  "cleanup_succeeded",
+                  "cleanup_failed",
+                  "ended_without_process"
+                ],
+                "type": "string"
+              },
+              "message": {
+                "type": "string"
+              },
+              "noticeId": {
+                "maxLength": 160,
+                "minLength": 1,
+                "type": "string"
+              },
+              "reference": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "noticeId",
+              "kind",
+              "message",
+              "reference",
+              "incidentIds",
+              "deliveryState",
+              "createdAt"
+            ],
+            "type": "object"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "notices"
+      ],
+      "type": "object"
+    },
+    "ManagedRuntimeProjectionFieldsSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "properties": {
+        "incarnationId": {
+          "maxLength": 160,
+          "minLength": 1,
+          "type": "string"
+        },
+        "incidentId": {
+          "maxLength": 160,
+          "minLength": 1,
+          "type": "string"
+        },
+        "placementGroup": {
+          "type": "string"
+        },
+        "recoverySummary": {
+          "additionalProperties": false,
+          "properties": {
+            "allocationState": {
+              "enum": [
+                "allocated",
+                "materializing",
+                "verified_durable",
+                "degraded"
+              ],
+              "type": "string"
+            },
+            "attemptId": {
+              "type": "string"
+            },
+            "desiredState": {
+              "enum": [
+                "running",
+                "stopped"
+              ],
+              "type": "string"
+            },
+            "durabilityState": {
+              "enum": [
+                "unknown",
+                "live_only",
+                "resume_captured",
+                "checkpoint_captured",
+                "intrinsically_non_resumable"
+              ],
+              "type": "string"
+            },
+            "incidentId": {
+              "maxLength": 160,
+              "minLength": 1,
+              "type": "string"
+            },
+            "reason": {
+              "type": "string"
+            },
+            "recoveryState": {
+              "enum": [
+                "live",
+                "recovering",
+                "blocked",
+                "lost",
+                "stopped"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "desiredState",
+            "recoveryState",
+            "durabilityState",
+            "allocationState"
+          ],
+          "type": "object"
+        },
+        "resourceSummary": {
+          "additionalProperties": false,
+          "properties": {
+            "actual": {
+              "additionalProperties": false,
+              "properties": {
+                "cpuNrThrottled": {
+                  "maximum": 9007199254740991,
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "cpuThrottledUsec": {
+                  "maximum": 9007199254740991,
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "cpuUsageUsec": {
+                  "maximum": 9007199254740991,
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "memoryCurrentBytes": {
+                  "maximum": 9007199254740991,
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "memoryOom": {
+                  "maximum": 9007199254740991,
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "memoryOomKill": {
+                  "maximum": 9007199254740991,
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "memoryPeakBytes": {
+                  "maximum": 9007199254740991,
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "pidsCurrent": {
+                  "maximum": 9007199254740991,
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "pidsMax": {
+                  "maximum": 9007199254740991,
+                  "minimum": 0,
+                  "type": "integer"
+                }
+              },
+              "required": [
+                "cpuUsageUsec",
+                "cpuThrottledUsec",
+                "cpuNrThrottled",
+                "memoryCurrentBytes",
+                "memoryPeakBytes",
+                "memoryOom",
+                "memoryOomKill",
+                "pidsCurrent",
+                "pidsMax"
+              ],
+              "type": "object"
+            },
+            "application": {
+              "enum": [
+                "applied_now",
+                "next_incarnation"
+              ],
+              "type": "string"
+            },
+            "configured": {
+              "additionalProperties": false,
+              "properties": {
+                "cpuMilli": {
+                  "maximum": 9007199254740991,
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "memoryBytes": {
+                  "maximum": 9007199254740991,
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "pidsMax": {
+                  "maximum": 9007199254740991,
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "swapBytes": {
+                  "maximum": 9007199254740991,
+                  "minimum": 0,
+                  "type": "integer"
+                }
+              },
+              "required": [
+                "cpuMilli",
+                "memoryBytes",
+                "swapBytes",
+                "pidsMax"
+              ],
+              "type": "object"
+            },
+            "effective": {
+              "additionalProperties": false,
+              "properties": {
+                "cpuMilli": {
+                  "maximum": 9007199254740991,
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "memoryBytes": {
+                  "maximum": 9007199254740991,
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "pidsMax": {
+                  "maximum": 9007199254740991,
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "swapBytes": {
+                  "maximum": 9007199254740991,
+                  "minimum": 0,
+                  "type": "integer"
+                }
+              },
+              "required": [
+                "cpuMilli",
+                "memoryBytes",
+                "swapBytes",
+                "pidsMax"
+              ],
+              "type": "object"
+            }
+          },
+          "type": "object"
+        },
+        "runtimeState": {
+          "enum": [
+            "prepared",
+            "created",
+            "starting",
+            "running",
+            "stopping",
+            "stopped",
+            "failed"
+          ],
+          "type": "string"
+        },
+        "soulId": {
+          "maxLength": 160,
+          "minLength": 1,
+          "type": "string"
+        },
+        "soulIntentRevision": {
+          "maximum": 9007199254740991,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "viewIntentId": {
+          "maxLength": 160,
+          "minLength": 1,
+          "type": "string"
+        },
+        "viewIntentRevision": {
+          "maximum": 9007199254740991,
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "type": "object"
+    },
+    "ManagedRuntimeReadinessSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "properties": {
+        "blockedSubsystems": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "initialScanDurationMs": {
+          "maximum": 9007199254740991,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "initialScanFinishedAt": {
+          "maximum": 9007199254740991,
+          "minimum": -9007199254740991,
+          "type": "integer"
+        },
+        "initialScanStartedAt": {
+          "maximum": 9007199254740991,
+          "minimum": -9007199254740991,
+          "type": "integer"
+        },
+        "initialScanState": {
+          "enum": [
+            "pending",
+            "scanning",
+            "complete",
+            "blocked"
+          ],
+          "type": "string"
+        },
+        "inventoryRevision": {
+          "maximum": 9007199254740991,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "startupRecoveryConcurrencyLimit": {
+          "maximum": 9007199254740991,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "startupRecoveryPeak": {
+          "maximum": 9007199254740991,
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "inventoryRevision",
+        "initialScanState",
+        "blockedSubsystems",
+        "startupRecoveryConcurrencyLimit",
+        "startupRecoveryPeak"
+      ],
+      "type": "object"
+    },
+    "ManagedRuntimeRecoveryStateSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "enum": [
+        "live",
+        "recovering",
+        "blocked",
+        "lost",
+        "stopped"
+      ],
+      "type": "string"
+    },
+    "ManagedRuntimeRecoverySummarySchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "properties": {
+        "allocationState": {
+          "enum": [
+            "allocated",
+            "materializing",
+            "verified_durable",
+            "degraded"
+          ],
+          "type": "string"
+        },
+        "attemptId": {
+          "type": "string"
+        },
+        "desiredState": {
+          "enum": [
+            "running",
+            "stopped"
+          ],
+          "type": "string"
+        },
+        "durabilityState": {
+          "enum": [
+            "unknown",
+            "live_only",
+            "resume_captured",
+            "checkpoint_captured",
+            "intrinsically_non_resumable"
+          ],
+          "type": "string"
+        },
+        "incidentId": {
+          "maxLength": 160,
+          "minLength": 1,
+          "type": "string"
+        },
+        "reason": {
+          "type": "string"
+        },
+        "recoveryState": {
+          "enum": [
+            "live",
+            "recovering",
+            "blocked",
+            "lost",
+            "stopped"
+          ],
+          "type": "string"
+        }
+      },
+      "required": [
+        "desiredState",
+        "recoveryState",
+        "durabilityState",
+        "allocationState"
+      ],
+      "type": "object"
+    },
+    "ManagedRuntimeRepairAuditSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "properties": {
+        "blockedObjects": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "mutationPerformed": {
+          "type": "boolean"
+        },
+        "protectedReceiptCount": {
+          "maximum": 9007199254740991,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "registryIntegrity": {
+          "type": "string"
+        },
+        "unknownOwnershipCount": {
+          "maximum": 9007199254740991,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "unresolvedObjectCount": {
+          "maximum": 9007199254740991,
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "registryIntegrity",
+        "protectedReceiptCount",
+        "unresolvedObjectCount",
+        "unknownOwnershipCount",
+        "blockedObjects",
+        "mutationPerformed"
+      ],
+      "type": "object"
+    },
+    "ManagedRuntimeResourceSummarySchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "properties": {
+        "actual": {
+          "additionalProperties": false,
+          "properties": {
+            "cpuNrThrottled": {
+              "maximum": 9007199254740991,
+              "minimum": 0,
+              "type": "integer"
+            },
+            "cpuThrottledUsec": {
+              "maximum": 9007199254740991,
+              "minimum": 0,
+              "type": "integer"
+            },
+            "cpuUsageUsec": {
+              "maximum": 9007199254740991,
+              "minimum": 0,
+              "type": "integer"
+            },
+            "memoryCurrentBytes": {
+              "maximum": 9007199254740991,
+              "minimum": 0,
+              "type": "integer"
+            },
+            "memoryOom": {
+              "maximum": 9007199254740991,
+              "minimum": 0,
+              "type": "integer"
+            },
+            "memoryOomKill": {
+              "maximum": 9007199254740991,
+              "minimum": 0,
+              "type": "integer"
+            },
+            "memoryPeakBytes": {
+              "maximum": 9007199254740991,
+              "minimum": 0,
+              "type": "integer"
+            },
+            "pidsCurrent": {
+              "maximum": 9007199254740991,
+              "minimum": 0,
+              "type": "integer"
+            },
+            "pidsMax": {
+              "maximum": 9007199254740991,
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "cpuUsageUsec",
+            "cpuThrottledUsec",
+            "cpuNrThrottled",
+            "memoryCurrentBytes",
+            "memoryPeakBytes",
+            "memoryOom",
+            "memoryOomKill",
+            "pidsCurrent",
+            "pidsMax"
+          ],
+          "type": "object"
+        },
+        "application": {
+          "enum": [
+            "applied_now",
+            "next_incarnation"
+          ],
+          "type": "string"
+        },
+        "configured": {
+          "additionalProperties": false,
+          "properties": {
+            "cpuMilli": {
+              "maximum": 9007199254740991,
+              "minimum": 0,
+              "type": "integer"
+            },
+            "memoryBytes": {
+              "maximum": 9007199254740991,
+              "minimum": 0,
+              "type": "integer"
+            },
+            "pidsMax": {
+              "maximum": 9007199254740991,
+              "minimum": 0,
+              "type": "integer"
+            },
+            "swapBytes": {
+              "maximum": 9007199254740991,
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "cpuMilli",
+            "memoryBytes",
+            "swapBytes",
+            "pidsMax"
+          ],
+          "type": "object"
+        },
+        "effective": {
+          "additionalProperties": false,
+          "properties": {
+            "cpuMilli": {
+              "maximum": 9007199254740991,
+              "minimum": 0,
+              "type": "integer"
+            },
+            "memoryBytes": {
+              "maximum": 9007199254740991,
+              "minimum": 0,
+              "type": "integer"
+            },
+            "pidsMax": {
+              "maximum": 9007199254740991,
+              "minimum": 0,
+              "type": "integer"
+            },
+            "swapBytes": {
+              "maximum": 9007199254740991,
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "cpuMilli",
+            "memoryBytes",
+            "swapBytes",
+            "pidsMax"
+          ],
+          "type": "object"
+        }
+      },
+      "type": "object"
+    },
+    "ManagedRuntimeRevisionMutationSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "properties": {
+        "expectedIntentRevision": {
+          "maximum": 9007199254740991,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "requestId": {
+          "maxLength": 160,
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "required": [
+        "requestId",
+        "expectedIntentRevision"
+      ],
+      "type": "object"
+    },
+    "ManagedRuntimeRolloutModeSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "enum": [
+        "legacy",
+        "managed-opt-in",
+        "managed-default"
+      ],
+      "type": "string"
+    },
+    "ManagedRuntimeSoulDetailSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "properties": {
+        "actualUsage": {
+          "anyOf": [
+            {
+              "additionalProperties": false,
+              "properties": {
+                "cpuNrThrottled": {
+                  "maximum": 9007199254740991,
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "cpuThrottledUsec": {
+                  "maximum": 9007199254740991,
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "cpuUsageUsec": {
+                  "maximum": 9007199254740991,
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "memoryCurrentBytes": {
+                  "maximum": 9007199254740991,
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "memoryOom": {
+                  "maximum": 9007199254740991,
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "memoryOomKill": {
+                  "maximum": 9007199254740991,
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "memoryPeakBytes": {
+                  "maximum": 9007199254740991,
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "pidsCurrent": {
+                  "maximum": 9007199254740991,
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "pidsMax": {
+                  "maximum": 9007199254740991,
+                  "minimum": 0,
+                  "type": "integer"
+                }
+              },
+              "required": [
+                "cpuUsageUsec",
+                "cpuThrottledUsec",
+                "cpuNrThrottled",
+                "memoryCurrentBytes",
+                "memoryPeakBytes",
+                "memoryOom",
+                "memoryOomKill",
+                "pidsCurrent",
+                "pidsMax"
+              ],
+              "type": "object"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "readiness": {
+          "additionalProperties": false,
+          "properties": {
+            "blockedSubsystems": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "initialScanDurationMs": {
+              "maximum": 9007199254740991,
+              "minimum": 0,
+              "type": "integer"
+            },
+            "initialScanFinishedAt": {
+              "maximum": 9007199254740991,
+              "minimum": -9007199254740991,
+              "type": "integer"
+            },
+            "initialScanStartedAt": {
+              "maximum": 9007199254740991,
+              "minimum": -9007199254740991,
+              "type": "integer"
+            },
+            "initialScanState": {
+              "enum": [
+                "pending",
+                "scanning",
+                "complete",
+                "blocked"
+              ],
+              "type": "string"
+            },
+            "inventoryRevision": {
+              "maximum": 9007199254740991,
+              "minimum": 0,
+              "type": "integer"
+            },
+            "startupRecoveryConcurrencyLimit": {
+              "maximum": 9007199254740991,
+              "minimum": 0,
+              "type": "integer"
+            },
+            "startupRecoveryPeak": {
+              "maximum": 9007199254740991,
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "inventoryRevision",
+            "initialScanState",
+            "blockedSubsystems",
+            "startupRecoveryConcurrencyLimit",
+            "startupRecoveryPeak"
+          ],
+          "type": "object"
+        },
+        "revision": {
+          "maximum": 9007199254740991,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "soul": {
+          "additionalProperties": false,
+          "properties": {
+            "allocationState": {
+              "enum": [
+                "allocated",
+                "materializing",
+                "verified_durable",
+                "degraded"
+              ],
+              "type": "string"
+            },
+            "cleanupState": {
+              "enum": [
+                "none",
+                "requested",
+                "termination_unconfirmed",
+                "verified_empty",
+                "blocked_ownership"
+              ],
+              "type": "string"
+            },
+            "configuredLimits": {
+              "additionalProperties": false,
+              "properties": {
+                "cpuMilli": {
+                  "maximum": 9007199254740991,
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "memoryBytes": {
+                  "maximum": 9007199254740991,
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "pidsMax": {
+                  "maximum": 9007199254740991,
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "swapBytes": {
+                  "maximum": 9007199254740991,
+                  "minimum": 0,
+                  "type": "integer"
+                }
+              },
+              "required": [
+                "cpuMilli",
+                "memoryBytes",
+                "swapBytes",
+                "pidsMax"
+              ],
+              "type": "object"
+            },
+            "containerId": {
+              "type": "string"
+            },
+            "desiredState": {
+              "enum": [
+                "running",
+                "stopped"
+              ],
+              "type": "string"
+            },
+            "durabilityState": {
+              "enum": [
+                "unknown",
+                "live_only",
+                "resume_captured",
+                "checkpoint_captured",
+                "intrinsically_non_resumable"
+              ],
+              "type": "string"
+            },
+            "effectiveLimits": {
+              "additionalProperties": false,
+              "properties": {
+                "cpuMilli": {
+                  "maximum": 9007199254740991,
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "memoryBytes": {
+                  "maximum": 9007199254740991,
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "pidsMax": {
+                  "maximum": 9007199254740991,
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "swapBytes": {
+                  "maximum": 9007199254740991,
+                  "minimum": 0,
+                  "type": "integer"
+                }
+              },
+              "required": [
+                "cpuMilli",
+                "memoryBytes",
+                "swapBytes",
+                "pidsMax"
+              ],
+              "type": "object"
+            },
+            "evidenceRevision": {
+              "maximum": 9007199254740991,
+              "minimum": 0,
+              "type": "integer"
+            },
+            "executionGeneration": {
+              "maximum": 9007199254740991,
+              "minimum": 0,
+              "type": "integer"
+            },
+            "hostBootId": {
+              "type": "string"
+            },
+            "incarnationId": {
+              "maxLength": 160,
+              "minLength": 1,
+              "type": "string"
+            },
+            "incidentId": {
+              "maxLength": 160,
+              "minLength": 1,
+              "type": "string"
+            },
+            "intentRevision": {
+              "maximum": 9007199254740991,
+              "minimum": 0,
+              "type": "integer"
+            },
+            "launchState": {
+              "enum": [
+                "prepared",
+                "created",
+                "starting",
+                "running",
+                "stopping",
+                "stopped",
+                "failed"
+              ],
+              "type": "string"
+            },
+            "nativeSessionId": {
+              "type": "string"
+            },
+            "priorIncarnationId": {
+              "type": "string"
+            },
+            "profile": {
+              "enum": [
+                "default_agent",
+                "test_fixture",
+                "custom"
+              ],
+              "type": "string"
+            },
+            "projectKey": {
+              "type": "string"
+            },
+            "provider": {
+              "type": "string"
+            },
+            "recoveryAttemptId": {
+              "type": "string"
+            },
+            "recoveryReason": {
+              "type": "string"
+            },
+            "recoveryState": {
+              "enum": [
+                "live",
+                "recovering",
+                "blocked",
+                "lost",
+                "stopped"
+              ],
+              "type": "string"
+            },
+            "soulId": {
+              "maxLength": 160,
+              "minLength": 1,
+              "type": "string"
+            },
+            "successfulRecoveriesInWindow": {
+              "maximum": 9007199254740991,
+              "minimum": 0,
+              "type": "integer"
+            },
+            "terminalCreateRequestId": {
+              "type": "string"
+            },
+            "terminalCwd": {
+              "type": "string"
+            },
+            "terminalId": {
+              "type": "string"
+            },
+            "terminalMode": {
+              "type": "string"
+            },
+            "terminalResumeSessionId": {
+              "type": "string"
+            },
+            "terminalStreamId": {
+              "type": "string"
+            },
+            "viewIntentRevision": {
+              "maximum": 9007199254740991,
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "soulId",
+            "incarnationId",
+            "launchState",
+            "cleanupState",
+            "intentRevision",
+            "executionGeneration",
+            "desiredState",
+            "recoveryState",
+            "durabilityState",
+            "allocationState",
+            "evidenceRevision",
+            "successfulRecoveriesInWindow"
+          ],
+          "type": "object"
+        },
+        "viewIntents": {
+          "items": {
+            "additionalProperties": false,
+            "properties": {
+              "createdAt": {
+                "maximum": 9007199254740991,
+                "minimum": -9007199254740991,
+                "type": "integer"
+              },
+              "kind": {
+                "enum": [
+                  "automatic_primary",
+                  "explicit"
+                ],
+                "type": "string"
+              },
+              "ownerId": {
+                "type": "string"
+              },
+              "placementGroup": {
+                "type": "string"
+              },
+              "preferredPaneId": {
+                "maxLength": 160,
+                "minLength": 1,
+                "type": "string"
+              },
+              "preferredTabId": {
+                "maxLength": 160,
+                "minLength": 1,
+                "type": "string"
+              },
+              "revision": {
+                "maximum": 9007199254740991,
+                "minimum": 0,
+                "type": "integer"
+              },
+              "soulId": {
+                "maxLength": 160,
+                "minLength": 1,
+                "type": "string"
+              },
+              "soulIntentRevision": {
+                "maximum": 9007199254740991,
+                "minimum": 0,
+                "type": "integer"
+              },
+              "title": {
+                "type": "string"
+              },
+              "updatedAt": {
+                "maximum": 9007199254740991,
+                "minimum": -9007199254740991,
+                "type": "integer"
+              },
+              "viewId": {
+                "maxLength": 160,
+                "minLength": 1,
+                "type": "string"
+              },
+              "visibility": {
+                "enum": [
+                  "visible",
+                  "detached",
+                  "hidden"
+                ],
+                "type": "string"
+              },
+              "workspaceId": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "viewId",
+              "soulId",
+              "ownerId",
+              "workspaceId",
+              "kind",
+              "preferredTabId",
+              "preferredPaneId",
+              "title",
+              "placementGroup",
+              "visibility",
+              "revision",
+              "soulIntentRevision",
+              "createdAt",
+              "updatedAt"
+            ],
+            "type": "object"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "revision",
+        "readiness",
+        "soul",
+        "viewIntents",
+        "actualUsage"
+      ],
+      "type": "object"
+    },
+    "ManagedRuntimeSoulSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "properties": {
+        "allocationState": {
+          "enum": [
+            "allocated",
+            "materializing",
+            "verified_durable",
+            "degraded"
+          ],
+          "type": "string"
+        },
+        "cleanupState": {
+          "enum": [
+            "none",
+            "requested",
+            "termination_unconfirmed",
+            "verified_empty",
+            "blocked_ownership"
+          ],
+          "type": "string"
+        },
+        "configuredLimits": {
+          "additionalProperties": false,
+          "properties": {
+            "cpuMilli": {
+              "maximum": 9007199254740991,
+              "minimum": 0,
+              "type": "integer"
+            },
+            "memoryBytes": {
+              "maximum": 9007199254740991,
+              "minimum": 0,
+              "type": "integer"
+            },
+            "pidsMax": {
+              "maximum": 9007199254740991,
+              "minimum": 0,
+              "type": "integer"
+            },
+            "swapBytes": {
+              "maximum": 9007199254740991,
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "cpuMilli",
+            "memoryBytes",
+            "swapBytes",
+            "pidsMax"
+          ],
+          "type": "object"
+        },
+        "containerId": {
+          "type": "string"
+        },
+        "desiredState": {
+          "enum": [
+            "running",
+            "stopped"
+          ],
+          "type": "string"
+        },
+        "durabilityState": {
+          "enum": [
+            "unknown",
+            "live_only",
+            "resume_captured",
+            "checkpoint_captured",
+            "intrinsically_non_resumable"
+          ],
+          "type": "string"
+        },
+        "effectiveLimits": {
+          "additionalProperties": false,
+          "properties": {
+            "cpuMilli": {
+              "maximum": 9007199254740991,
+              "minimum": 0,
+              "type": "integer"
+            },
+            "memoryBytes": {
+              "maximum": 9007199254740991,
+              "minimum": 0,
+              "type": "integer"
+            },
+            "pidsMax": {
+              "maximum": 9007199254740991,
+              "minimum": 0,
+              "type": "integer"
+            },
+            "swapBytes": {
+              "maximum": 9007199254740991,
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "cpuMilli",
+            "memoryBytes",
+            "swapBytes",
+            "pidsMax"
+          ],
+          "type": "object"
+        },
+        "evidenceRevision": {
+          "maximum": 9007199254740991,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "executionGeneration": {
+          "maximum": 9007199254740991,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "hostBootId": {
+          "type": "string"
+        },
+        "incarnationId": {
+          "maxLength": 160,
+          "minLength": 1,
+          "type": "string"
+        },
+        "incidentId": {
+          "maxLength": 160,
+          "minLength": 1,
+          "type": "string"
+        },
+        "intentRevision": {
+          "maximum": 9007199254740991,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "launchState": {
+          "enum": [
+            "prepared",
+            "created",
+            "starting",
+            "running",
+            "stopping",
+            "stopped",
+            "failed"
+          ],
+          "type": "string"
+        },
+        "nativeSessionId": {
+          "type": "string"
+        },
+        "priorIncarnationId": {
+          "type": "string"
+        },
+        "profile": {
+          "enum": [
+            "default_agent",
+            "test_fixture",
+            "custom"
+          ],
+          "type": "string"
+        },
+        "projectKey": {
+          "type": "string"
+        },
+        "provider": {
+          "type": "string"
+        },
+        "recoveryAttemptId": {
+          "type": "string"
+        },
+        "recoveryReason": {
+          "type": "string"
+        },
+        "recoveryState": {
+          "enum": [
+            "live",
+            "recovering",
+            "blocked",
+            "lost",
+            "stopped"
+          ],
+          "type": "string"
+        },
+        "soulId": {
+          "maxLength": 160,
+          "minLength": 1,
+          "type": "string"
+        },
+        "successfulRecoveriesInWindow": {
+          "maximum": 9007199254740991,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "terminalCreateRequestId": {
+          "type": "string"
+        },
+        "terminalCwd": {
+          "type": "string"
+        },
+        "terminalId": {
+          "type": "string"
+        },
+        "terminalMode": {
+          "type": "string"
+        },
+        "terminalResumeSessionId": {
+          "type": "string"
+        },
+        "terminalStreamId": {
+          "type": "string"
+        },
+        "viewIntentRevision": {
+          "maximum": 9007199254740991,
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "soulId",
+        "incarnationId",
+        "launchState",
+        "cleanupState",
+        "intentRevision",
+        "executionGeneration",
+        "desiredState",
+        "recoveryState",
+        "durabilityState",
+        "allocationState",
+        "evidenceRevision",
+        "successfulRecoveriesInWindow"
+      ],
+      "type": "object"
+    },
+    "ManagedRuntimeUpdateLimitsResultSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "properties": {
+        "application": {
+          "enum": [
+            "applied_now",
+            "next_incarnation"
+          ],
+          "type": "string"
+        },
+        "configuredLimits": {
+          "additionalProperties": false,
+          "properties": {
+            "cpuMilli": {
+              "maximum": 9007199254740991,
+              "minimum": 0,
+              "type": "integer"
+            },
+            "memoryBytes": {
+              "maximum": 9007199254740991,
+              "minimum": 0,
+              "type": "integer"
+            },
+            "pidsMax": {
+              "maximum": 9007199254740991,
+              "minimum": 0,
+              "type": "integer"
+            },
+            "swapBytes": {
+              "maximum": 9007199254740991,
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "cpuMilli",
+            "memoryBytes",
+            "swapBytes",
+            "pidsMax"
+          ],
+          "type": "object"
+        },
+        "effectiveLimits": {
+          "additionalProperties": false,
+          "properties": {
+            "cpuMilli": {
+              "maximum": 9007199254740991,
+              "minimum": 0,
+              "type": "integer"
+            },
+            "memoryBytes": {
+              "maximum": 9007199254740991,
+              "minimum": 0,
+              "type": "integer"
+            },
+            "pidsMax": {
+              "maximum": 9007199254740991,
+              "minimum": 0,
+              "type": "integer"
+            },
+            "swapBytes": {
+              "maximum": 9007199254740991,
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "cpuMilli",
+            "memoryBytes",
+            "swapBytes",
+            "pidsMax"
+          ],
+          "type": "object"
+        },
+        "view": {
+          "additionalProperties": false,
+          "properties": {
+            "allocationState": {
+              "enum": [
+                "allocated",
+                "materializing",
+                "verified_durable",
+                "degraded"
+              ],
+              "type": "string"
+            },
+            "cleanupState": {
+              "enum": [
+                "none",
+                "requested",
+                "termination_unconfirmed",
+                "verified_empty",
+                "blocked_ownership"
+              ],
+              "type": "string"
+            },
+            "configuredLimits": {
+              "additionalProperties": false,
+              "properties": {
+                "cpuMilli": {
+                  "maximum": 9007199254740991,
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "memoryBytes": {
+                  "maximum": 9007199254740991,
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "pidsMax": {
+                  "maximum": 9007199254740991,
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "swapBytes": {
+                  "maximum": 9007199254740991,
+                  "minimum": 0,
+                  "type": "integer"
+                }
+              },
+              "required": [
+                "cpuMilli",
+                "memoryBytes",
+                "swapBytes",
+                "pidsMax"
+              ],
+              "type": "object"
+            },
+            "containerId": {
+              "type": "string"
+            },
+            "desiredState": {
+              "enum": [
+                "running",
+                "stopped"
+              ],
+              "type": "string"
+            },
+            "durabilityState": {
+              "enum": [
+                "unknown",
+                "live_only",
+                "resume_captured",
+                "checkpoint_captured",
+                "intrinsically_non_resumable"
+              ],
+              "type": "string"
+            },
+            "effectiveLimits": {
+              "additionalProperties": false,
+              "properties": {
+                "cpuMilli": {
+                  "maximum": 9007199254740991,
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "memoryBytes": {
+                  "maximum": 9007199254740991,
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "pidsMax": {
+                  "maximum": 9007199254740991,
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "swapBytes": {
+                  "maximum": 9007199254740991,
+                  "minimum": 0,
+                  "type": "integer"
+                }
+              },
+              "required": [
+                "cpuMilli",
+                "memoryBytes",
+                "swapBytes",
+                "pidsMax"
+              ],
+              "type": "object"
+            },
+            "evidenceRevision": {
+              "maximum": 9007199254740991,
+              "minimum": 0,
+              "type": "integer"
+            },
+            "executionGeneration": {
+              "maximum": 9007199254740991,
+              "minimum": 0,
+              "type": "integer"
+            },
+            "hostBootId": {
+              "type": "string"
+            },
+            "incarnationId": {
+              "maxLength": 160,
+              "minLength": 1,
+              "type": "string"
+            },
+            "incidentId": {
+              "maxLength": 160,
+              "minLength": 1,
+              "type": "string"
+            },
+            "intentRevision": {
+              "maximum": 9007199254740991,
+              "minimum": 0,
+              "type": "integer"
+            },
+            "launchState": {
+              "enum": [
+                "prepared",
+                "created",
+                "starting",
+                "running",
+                "stopping",
+                "stopped",
+                "failed"
+              ],
+              "type": "string"
+            },
+            "nativeSessionId": {
+              "type": "string"
+            },
+            "priorIncarnationId": {
+              "type": "string"
+            },
+            "profile": {
+              "enum": [
+                "default_agent",
+                "test_fixture",
+                "custom"
+              ],
+              "type": "string"
+            },
+            "projectKey": {
+              "type": "string"
+            },
+            "provider": {
+              "type": "string"
+            },
+            "recoveryAttemptId": {
+              "type": "string"
+            },
+            "recoveryReason": {
+              "type": "string"
+            },
+            "recoveryState": {
+              "enum": [
+                "live",
+                "recovering",
+                "blocked",
+                "lost",
+                "stopped"
+              ],
+              "type": "string"
+            },
+            "soulId": {
+              "maxLength": 160,
+              "minLength": 1,
+              "type": "string"
+            },
+            "successfulRecoveriesInWindow": {
+              "maximum": 9007199254740991,
+              "minimum": 0,
+              "type": "integer"
+            },
+            "terminalCreateRequestId": {
+              "type": "string"
+            },
+            "terminalCwd": {
+              "type": "string"
+            },
+            "terminalId": {
+              "type": "string"
+            },
+            "terminalMode": {
+              "type": "string"
+            },
+            "terminalResumeSessionId": {
+              "type": "string"
+            },
+            "terminalStreamId": {
+              "type": "string"
+            },
+            "viewIntentRevision": {
+              "maximum": 9007199254740991,
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "soulId",
+            "incarnationId",
+            "launchState",
+            "cleanupState",
+            "intentRevision",
+            "executionGeneration",
+            "desiredState",
+            "recoveryState",
+            "durabilityState",
+            "allocationState",
+            "evidenceRevision",
+            "successfulRecoveriesInWindow"
+          ],
+          "type": "object"
+        }
+      },
+      "required": [
+        "view",
+        "application",
+        "configuredLimits"
+      ],
+      "type": "object"
+    },
+    "ManagedRuntimeViewChangedMessageSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "properties": {
+        "eventId": {
+          "maxLength": 160,
+          "minLength": 1,
+          "type": "string"
+        },
+        "inventoryRevision": {
+          "maximum": 9007199254740991,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "type": {
+          "const": "runtime.view.changed",
+          "type": "string"
+        },
+        "view": {
+          "additionalProperties": false,
+          "properties": {
+            "createdAt": {
+              "maximum": 9007199254740991,
+              "minimum": -9007199254740991,
+              "type": "integer"
+            },
+            "kind": {
+              "enum": [
+                "automatic_primary",
+                "explicit"
+              ],
+              "type": "string"
+            },
+            "ownerId": {
+              "type": "string"
+            },
+            "placementGroup": {
+              "type": "string"
+            },
+            "preferredPaneId": {
+              "maxLength": 160,
+              "minLength": 1,
+              "type": "string"
+            },
+            "preferredTabId": {
+              "maxLength": 160,
+              "minLength": 1,
+              "type": "string"
+            },
+            "revision": {
+              "maximum": 9007199254740991,
+              "minimum": 0,
+              "type": "integer"
+            },
+            "soulId": {
+              "maxLength": 160,
+              "minLength": 1,
+              "type": "string"
+            },
+            "soulIntentRevision": {
+              "maximum": 9007199254740991,
+              "minimum": 0,
+              "type": "integer"
+            },
+            "title": {
+              "type": "string"
+            },
+            "updatedAt": {
+              "maximum": 9007199254740991,
+              "minimum": -9007199254740991,
+              "type": "integer"
+            },
+            "viewId": {
+              "maxLength": 160,
+              "minLength": 1,
+              "type": "string"
+            },
+            "visibility": {
+              "enum": [
+                "visible",
+                "detached",
+                "hidden"
+              ],
+              "type": "string"
+            },
+            "workspaceId": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "viewId",
+            "soulId",
+            "ownerId",
+            "workspaceId",
+            "kind",
+            "preferredTabId",
+            "preferredPaneId",
+            "title",
+            "placementGroup",
+            "visibility",
+            "revision",
+            "soulIntentRevision",
+            "createdAt",
+            "updatedAt"
+          ],
+          "type": "object"
+        }
+      },
+      "required": [
+        "type",
+        "inventoryRevision",
+        "eventId",
+        "view"
+      ],
+      "type": "object"
+    },
+    "ManagedRuntimeViewIntentSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "properties": {
+        "createdAt": {
+          "maximum": 9007199254740991,
+          "minimum": -9007199254740991,
+          "type": "integer"
+        },
+        "kind": {
+          "enum": [
+            "automatic_primary",
+            "explicit"
+          ],
+          "type": "string"
+        },
+        "ownerId": {
+          "type": "string"
+        },
+        "placementGroup": {
+          "type": "string"
+        },
+        "preferredPaneId": {
+          "maxLength": 160,
+          "minLength": 1,
+          "type": "string"
+        },
+        "preferredTabId": {
+          "maxLength": 160,
+          "minLength": 1,
+          "type": "string"
+        },
+        "revision": {
+          "maximum": 9007199254740991,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "soulId": {
+          "maxLength": 160,
+          "minLength": 1,
+          "type": "string"
+        },
+        "soulIntentRevision": {
+          "maximum": 9007199254740991,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "title": {
+          "type": "string"
+        },
+        "updatedAt": {
+          "maximum": 9007199254740991,
+          "minimum": -9007199254740991,
+          "type": "integer"
+        },
+        "viewId": {
+          "maxLength": 160,
+          "minLength": 1,
+          "type": "string"
+        },
+        "visibility": {
+          "enum": [
+            "visible",
+            "detached",
+            "hidden"
+          ],
+          "type": "string"
+        },
+        "workspaceId": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "viewId",
+        "soulId",
+        "ownerId",
+        "workspaceId",
+        "kind",
+        "preferredTabId",
+        "preferredPaneId",
+        "title",
+        "placementGroup",
+        "visibility",
+        "revision",
+        "soulIntentRevision",
+        "createdAt",
+        "updatedAt"
+      ],
+      "type": "object"
+    },
+    "ManagedRuntimeViewKindSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "enum": [
+        "automatic_primary",
+        "explicit"
+      ],
+      "type": "string"
+    },
+    "ManagedRuntimeViewMutationSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "properties": {
+        "expectedRevision": {
+          "maximum": 9007199254740991,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "expectedSoulIntentRevision": {
+          "maximum": 9007199254740991,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "requestId": {
+          "maxLength": 160,
+          "minLength": 1,
+          "type": "string"
+        },
+        "visibility": {
+          "enum": [
+            "visible",
+            "detached",
+            "hidden"
+          ],
+          "type": "string"
+        }
+      },
+      "required": [
+        "requestId",
+        "visibility",
+        "expectedRevision",
+        "expectedSoulIntentRevision"
+      ],
+      "type": "object"
+    },
+    "ManagedRuntimeViewVisibilitySchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "enum": [
+        "visible",
+        "detached",
+        "hidden"
+      ],
+      "type": "string"
+    }
+  },
+  "source": "shared/managed-runtime.ts",
+  "title": "Freshell managed runtime Phase 4 contract"
+}

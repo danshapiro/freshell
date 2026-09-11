@@ -37,6 +37,7 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use freshell_platform::detect::{host_os_live, is_windows, is_wsl_env_live, HostOs};
@@ -52,7 +53,7 @@ use freshell_platform::{
     RealFileProbe, ShellType, SpawnSpec,
 };
 use freshell_protocol::{ServerMessage, SessionLocator, UiCommand};
-use freshell_terminal::registry::SessionRefClaim;
+use freshell_terminal::registry::{ManagedTerminalLaunch, SessionRefClaim};
 
 use crate::{
     authorized, fail_json, fail_json_code, ok_json, text_plain, FreshAgentState, TabRecord,
@@ -71,6 +72,24 @@ use crate::{
 /// updating two lists in lockstep.
 fn mode_is_known(state: &FreshAgentState, mode: &str) -> bool {
     mode == "shell" || state.cli_commands.iter().any(|s| s.name == mode)
+}
+
+fn managed_runtime_mode(mode: &str) -> bool {
+    mode == "shell" || freshell_agent_runtime::managed_provider_enabled(mode)
+}
+
+fn stable_managed_uuid(create_request_id: &str, domain: &[u8]) -> Uuid {
+    let mut hasher = Sha256::new();
+    hasher.update(b"freshell-managed-terminal-v1\0");
+    hasher.update(domain);
+    hasher.update(b"\0");
+    hasher.update(create_request_id.as_bytes());
+    let digest = hasher.finalize();
+    let mut bytes = [0u8; 16];
+    bytes.copy_from_slice(&digest[..16]);
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    Uuid::from_bytes(bytes)
 }
 
 /// `acceptedSessionRefForMode` (`router.ts:230-236`): a `sessionRef` is only
@@ -507,8 +526,11 @@ fn arm_locators_for_fresh_pane(
     mode: &str,
     cwd: Option<&str>,
     resume_session_id: Option<&str>,
-    managed_codex: bool,
+    managed_runtime: bool,
 ) {
+    if managed_runtime {
+        return;
+    }
     if let Some(locator) = &state.opencode_locator {
         locator.arm(terminal_id, mode, true, resume_session_id, cwd, now_ms());
     }
@@ -519,7 +541,7 @@ fn arm_locators_for_fresh_pane(
     // S5.b / D-03: managed panes bind identity from the proxy Candidate stream,
     // so the CODEX locator never ARMS for them (mirrors
     // `freshell_ws::codex_association::should_arm_codex_locator`).
-    if !managed_codex {
+    if !managed_runtime {
         if let Some(locator) = &state.codex_locator {
             locator.arm(terminal_id, mode, true, resume_session_id, cwd);
         }
@@ -626,9 +648,11 @@ fn validate_rest_resume(
     resume_session_id: Option<String>,
     launch_intent: LaunchIntent,
     probe: Option<&freshell_platform::resume_gate::ResumeProbeFn>,
+    intent: freshell_platform::resume_gate::ResumeIntent,
 ) -> RestResumeOutcome {
     use freshell_platform::resume_gate::{
-        evaluate_resume_gate, provider_validated, stale_resume_notice, ResumeGateDecision,
+        evaluate_resume_gate_for_intent, provider_validated, stale_resume_notice,
+        ResumeGateDecision,
     };
     let Some(probe) = probe else {
         return rest_resume_passthrough(resume_session_id, launch_intent);
@@ -640,8 +664,15 @@ fn validate_rest_resume(
         return rest_resume_passthrough(resume_session_id, launch_intent);
     }
     let answer = probe(mode, &sid);
-    match evaluate_resume_gate(mode, answer.existence, answer.ever_observed_on_disk) {
-        ResumeGateDecision::Proceed => rest_resume_passthrough(resume_session_id, launch_intent),
+    match evaluate_resume_gate_for_intent(
+        mode,
+        answer.existence,
+        answer.ever_observed_on_disk,
+        intent,
+    ) {
+        ResumeGateDecision::Proceed | ResumeGateDecision::BlockedRecovery => {
+            rest_resume_passthrough(resume_session_id, launch_intent)
+        }
         ResumeGateDecision::SpawnFresh => {
             let notice = stale_resume_notice(mode, &sid);
             let (fresh_id, intent, claude_fresh_prealloc) = match mode {
@@ -1006,6 +1037,8 @@ pub(crate) async fn spawn_terminal_pane(
     // the gate entirely (passthrough — same shape validate_rest_resume
     // returns for Proceed), so the unchanged create flows into the D7-REST
     // guard and D8 lease exactly as today.
+    let managed_recovery = registry.has_managed_controller()
+        && matches!(mode.as_str(), "shell" | "claude" | "opencode");
     let rest_outcome = if candidate_is_live {
         rest_resume_passthrough(resume_session_id.take(), launch_intent)
     } else {
@@ -1014,7 +1047,17 @@ pub(crate) async fn spawn_terminal_pane(
         let rid = resume_session_id.take();
         let intent = launch_intent;
         tokio::task::spawn_blocking(move || {
-            validate_rest_resume(&mode_for_gate, rid, intent, probe.as_ref())
+            validate_rest_resume(
+                &mode_for_gate,
+                rid,
+                intent,
+                probe.as_ref(),
+                if managed_recovery {
+                    freshell_platform::resume_gate::ResumeIntent::ManagedRecovery
+                } else {
+                    freshell_platform::resume_gate::ResumeIntent::UserCreate
+                },
+            )
         })
         .await
         .expect("resume validation task panicked")
@@ -1501,8 +1544,17 @@ async fn settle_gated_create(inputs: GatedSettleInputs) -> Result<TerminalSpawnR
         amplifier_stub,
     } = inputs;
 
-    let terminal_id = Uuid::new_v4().to_string();
-    let stream_id = Uuid::new_v4().to_string();
+    let use_managed_runtime = registry.has_managed_controller() && managed_runtime_mode(&mode);
+    let (terminal_id, stream_id) = if use_managed_runtime {
+        (
+            stable_managed_uuid(&create_request_id, b"terminal")
+                .simple()
+                .to_string(),
+            stable_managed_uuid(&create_request_id, b"stream").to_string(),
+        )
+    } else {
+        (Uuid::new_v4().to_string(), Uuid::new_v4().to_string())
+    };
 
     let mut cli: Option<CliLaunch> = None;
     let mut mcp_cwd: Option<String> = None;
@@ -1512,6 +1564,25 @@ async fn settle_gated_create(inputs: GatedSettleInputs) -> Result<TerminalSpawnR
     let mut codex_launch: Option<freshell_codex::launch_lifecycle::CodexTerminalLaunch> = None;
     let spec: SpawnSpec;
     let child_env: BTreeMap<String, String>;
+    // Explicit REST overrides are also copied into ManagedTerminalLaunch so
+    // the durable resume spec can preserve provider policy independently of
+    // the rendered argv.
+    let permission_mode = body
+        .get("permissionMode")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let model = body
+        .get("model")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let effort = body
+        .get("effort")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let sandbox = body
+        .get("sandbox")
+        .and_then(Value::as_str)
+        .map(str::to_string);
 
     if mode == "shell" {
         // `host_os`/`is_wsl` arrive from `spawn_terminal_pane` (hoisted, Task
@@ -1543,7 +1614,9 @@ async fn settle_gated_create(inputs: GatedSettleInputs) -> Result<TerminalSpawnR
         let target = cli_provider_target(shell_type, host_os, is_wsl, cwd.as_deref(), &RealEnv);
         let managed_flag =
             std::env::var(freshell_codex::launch_plan::FRESHELL_CODEX_MANAGED_LAUNCH_ENV).ok();
-        let codex_setup = if codex_create_uses_managed_launch(&mode, managed_flag.as_deref()) {
+        let codex_setup = if !use_managed_runtime
+            && codex_create_uses_managed_launch(&mode, managed_flag.as_deref())
+        {
             Some(
                 build_codex_managed_launch_setup(
                     terminal_id.clone(),
@@ -1562,7 +1635,12 @@ async fn settle_gated_create(inputs: GatedSettleInputs) -> Result<TerminalSpawnR
 
         // opencode: allocate the loopback control endpoint BEFORE building the
         // launch (mirrors `crates/freshell-ws/src/terminal.rs:802-813`).
-        let opencode_endpoint = if mode == "opencode" {
+        let opencode_endpoint = if mode == "opencode" && use_managed_runtime {
+            Some(freshell_opencode::serve::Endpoint {
+                hostname: "127.0.0.1".to_string(),
+                port: 4096,
+            })
+        } else if mode == "opencode" {
             use freshell_opencode::serve::PortAllocator as _;
             match freshell_opencode::transport::LoopbackPortAllocator.allocate() {
                 Ok(ep) => Some(ep),
@@ -1578,19 +1656,6 @@ async fn settle_gated_create(inputs: GatedSettleInputs) -> Result<TerminalSpawnR
         // so there is no settings-derived fallback layer here; a client that
         // wants non-default provider settings must pass them explicitly on
         // the create call).
-        let permission_mode = body
-            .get("permissionMode")
-            .and_then(Value::as_str)
-            .map(str::to_string);
-        let model = body
-            .get("model")
-            .and_then(Value::as_str)
-            .map(str::to_string);
-        let sandbox = body
-            .get("sandbox")
-            .and_then(Value::as_str)
-            .map(str::to_string);
-
         // D-C-REVISIT(FRESHELL_CODEX_MANAGED_LAUNCH) — RESOLVED 2026-07-30
         // (DEV-0006 S5.e precondition): this plan no longer runs under the
         // held spawn permit (acquire moved below the plan, WS-auto-resume
@@ -1665,15 +1730,21 @@ async fn settle_gated_create(inputs: GatedSettleInputs) -> Result<TerminalSpawnR
             }
             None => {
                 mcp_cwd = resolve_mcp_cwd(cwd.as_deref(), &RealEnv, host_os, is_wsl);
-                let mcp_injection = match generate_mcp_injection(
-                    &RealMcpRuntime,
-                    &mode,
-                    &terminal_id,
-                    mcp_cwd.as_deref(),
-                    target,
-                ) {
-                    Ok(injection) => injection,
-                    Err(error) => return Err(fail_json(StatusCode::BAD_REQUEST, error.message)),
+                let mcp_injection = if use_managed_runtime {
+                    McpInjection::default()
+                } else {
+                    match generate_mcp_injection(
+                        &RealMcpRuntime,
+                        &mode,
+                        &terminal_id,
+                        mcp_cwd.as_deref(),
+                        target,
+                    ) {
+                        Ok(injection) => injection,
+                        Err(error) => {
+                            return Err(fail_json(StatusCode::BAD_REQUEST, error.message))
+                        }
+                    }
                 };
                 let overrides =
                     build_terminal_base_env(&RealEnv, &terminal_id, Some(&tab_id), Some(&pane_id));
@@ -1685,7 +1756,7 @@ async fn settle_gated_create(inputs: GatedSettleInputs) -> Result<TerminalSpawnR
         // HERE at the IO layer; the pure resolver only reads the result from
         // CliLaunchInputs (mcp_injection precedent). Failure must never block
         // the launch.
-        let opencode_rebind_tui_config = if mode == "opencode" {
+        let opencode_rebind_tui_config = if mode == "opencode" && !use_managed_runtime {
             opencode_rebind_precompute()
         } else {
             None
@@ -1720,13 +1791,15 @@ async fn settle_gated_create(inputs: GatedSettleInputs) -> Result<TerminalSpawnR
             } else {
                 launch_intent
             },
-            // Managed codex (flag ON): model/sandbox/permissionMode route through the
-            // PLAN, not argv (legacy's spawn providerSettings for codex carry ONLY
-            // `codexAppServer`, `router.ts:178-193`).
+            // The legacy web-owned Codex sidecar consumes these through its
+            // launch plan. Reasoning effort remains the exact CLI config argv.
+            // A Durable Soul's host-owned sidecar also receives the typed
+            // fields, so model and reasoning policy survive recovery.
             permission_mode: (!managed_codex)
                 .then_some(())
                 .and(permission_mode.as_deref()),
             model: (!managed_codex).then_some(()).and(model.as_deref()),
+            effort: effort.as_deref(),
             sandbox: (!managed_codex).then_some(()).and(sandbox.as_deref()),
             // DEV-0006 S4 inc.2: the PROXY's ws URL when the flag-gated managed launch
             // planned one; `None` (today's shipped shape) otherwise.
@@ -1946,34 +2019,58 @@ async fn settle_gated_create(inputs: GatedSettleInputs) -> Result<TerminalSpawnR
     // door (`crates/freshell-ws/src/terminal.rs`). Values consumed by the
     // call and unused afterwards (`child_env`, `stream_id`, `on_exit`)
     // move in without cloning.
-    let spawn_registry = registry.clone();
-    let spawn_spec = spec.clone();
-    let spawn_terminal_id = terminal_id.clone();
-    let spawn_mode = mode.clone();
-    let spawn_resume = resume_session_id.clone();
-    let spawn_request_id = create_request_id.clone();
-    let create_result = match tokio::task::spawn_blocking(move || {
-        spawn_registry.create(
-            &spawn_spec,
-            &child_env,
-            spawn_terminal_id,
-            stream_id,
-            &spawn_mode,
-            spawn_resume.as_deref(),
-            Some(spawn_request_id.as_str()), // create_request_id: REST accept-or-mint key (this task)
-            None,                            // ring_max_bytes: registry default
-            on_exit,
-        )
-    })
-    .await
-    {
-        Ok(result) => result,
-        // JoinError (incl. panic inside the closure) surfaces as a spawn
-        // failure into the unchanged rollback + 400 path below, same as the
-        // WS path.
-        Err(join_err) => Err(std::io::Error::other(format!(
-            "terminal spawn task panicked: {join_err}"
-        ))),
+    let create_result = if use_managed_runtime {
+        let managed = ManagedTerminalLaunch {
+            spec: spec.clone(),
+            env: child_env.clone(),
+            terminal_id: terminal_id.clone(),
+            stream_id: stream_id.clone(),
+            mode: mode.clone(),
+            resume_session_id: resume_session_id.clone(),
+            provider_model: model.clone(),
+            provider_reasoning_effort: effort.clone(),
+            provider_sandbox: sandbox.clone(),
+            provider_permission_mode: permission_mode.clone(),
+            view_tab_id: Some(tab_id.clone()),
+            view_pane_id: Some(pane_id.clone()),
+            create_request_id: Some(create_request_id.clone()),
+        };
+        match registry.launch_managed(managed).await {
+            Ok(descriptor) => {
+                registry.register_managed(descriptor);
+                Ok(())
+            }
+            Err(error) => Err(std::io::Error::other(format!(
+                "managed runtime launch failed: {error}"
+            ))),
+        }
+    } else {
+        let spawn_registry = registry.clone();
+        let spawn_spec = spec.clone();
+        let spawn_terminal_id = terminal_id.clone();
+        let spawn_mode = mode.clone();
+        let spawn_resume = resume_session_id.clone();
+        let spawn_request_id = create_request_id.clone();
+        match tokio::task::spawn_blocking(move || {
+            spawn_registry.create(
+                &spawn_spec,
+                &child_env,
+                spawn_terminal_id,
+                stream_id,
+                &spawn_mode,
+                spawn_resume.as_deref(),
+                Some(spawn_request_id.as_str()),
+                None,
+                on_exit,
+            )
+        })
+        .await
+        {
+            Ok(result) => result,
+            Err(join_err) => Err(std::io::Error::other(format!(
+                "terminal spawn task panicked: {join_err}"
+            ))),
+        }
     };
     if let Err(err) = create_result {
         // PIN 2 compensating delete — SAME gate as the write (eaa25b7d).
@@ -2128,7 +2225,7 @@ async fn settle_gated_create(inputs: GatedSettleInputs) -> Result<TerminalSpawnR
         &mode,
         cwd.as_deref(),
         resume_session_id.as_deref(),
-        managed_codex,
+        use_managed_runtime || managed_codex,
     );
 
     // D8 winner bind (REST rung): record sessionRef->terminalId in the
@@ -3600,6 +3697,7 @@ mod tests {
             resume_args: Some(vec!["--resume".to_string(), "{{sessionId}}".to_string()]),
             create_session_args: None,
             model_args: None,
+            effort_args: None,
             sandbox_args: None,
             permission_mode_args: None,
         }
@@ -3697,6 +3795,7 @@ mod tests {
             default_cmd: "codex".to_string(),
             resume_args: Some(vec!["resume".to_string(), "{{sessionId}}".to_string()]),
             model_args: Some(vec!["--model".to_string(), "{{model}}".to_string()]),
+            effort_args: None,
             sandbox_args: Some(vec!["--sandbox".to_string(), "{{sandbox}}".to_string()]),
             ..Default::default()
         }
@@ -4823,6 +4922,42 @@ if (args.includes('app-server')) {{
         let _ = std::fs::remove_file(&argv_file);
     }
 
+    #[tokio::test]
+    async fn rest_codex_effort_uses_exact_reasoning_config_argv() {
+        let _codex_environment = crate::codex::tests::ENV_LOCK.lock().await;
+        let _environment = TestEnvRestore::capture(&["FRESHELL_CODEX_MANAGED_LAUNCH"]);
+        std::env::set_var("FRESHELL_CODEX_MANAGED_LAUNCH", "0");
+        let argv_file = unique_argv_file("codex-effort");
+        let mut cli = recording_cli_spec("codex", &argv_file);
+        cli.effort_args = Some(vec![
+            "-c".to_string(),
+            "model_reasoning_effort=\"{{effort}}\"".to_string(),
+        ]);
+        let state = state_with_registry().with_cli_commands(Arc::new(vec![cli]));
+        let registry = state.terminal_registry.clone().unwrap();
+        let (status, body) = post(
+            app(state),
+            "/api/tabs",
+            json!({
+                "mode": "codex",
+                "cwd": std::env::temp_dir().to_string_lossy(),
+                "effort": "minimal"
+            }),
+            true,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let terminal_id = body["data"]["terminalId"].as_str().unwrap();
+        let argv = read_argv_file_eventually(&argv_file).await;
+        assert!(
+            argv.lines()
+                .any(|arg| arg == "model_reasoning_effort=\"minimal\""),
+            "codex argv did not preserve exact effort config: {argv}"
+        );
+        registry.kill(terminal_id);
+        let _ = std::fs::remove_file(&argv_file);
+    }
+
     /// kata ejh6: the legacy `resumeSessionId` wire field is REFUSED at the
     /// `POST /api/tabs` door on EVERY registered mode (uniform any-carry
     /// ruling) — 400 with the frozen text, before any mode branch. The cli
@@ -5516,6 +5651,7 @@ if (args.includes('app-server')) {{
             Some("stale-amp".into()),
             LaunchIntent::Resume,
             Some(&probe),
+            freshell_platform::resume_gate::ResumeIntent::UserCreate,
         );
         assert_ne!(out.resume_session_id.as_deref(), Some("stale-amp"));
         assert!(out.resume_session_id.is_some());
@@ -5530,6 +5666,7 @@ if (args.includes('app-server')) {{
             Some("anything".into()),
             LaunchIntent::Resume,
             None,
+            freshell_platform::resume_gate::ResumeIntent::UserCreate,
         );
         assert_eq!(out.resume_session_id.as_deref(), Some("anything"));
         assert!(out.stale_session_id.is_none());
@@ -5546,6 +5683,7 @@ if (args.includes('app-server')) {{
                 Some("ses_x".into()),
                 LaunchIntent::Resume,
                 Some(&probe),
+                freshell_platform::resume_gate::ResumeIntent::UserCreate,
             );
             assert_eq!(out.resume_session_id.as_deref(), Some("ses_x"));
             assert!(out.notice.is_none());
@@ -5561,6 +5699,7 @@ if (args.includes('app-server')) {{
             Some("stale-cx".into()),
             LaunchIntent::Resume,
             Some(&probe),
+            freshell_platform::resume_gate::ResumeIntent::UserCreate,
         );
         assert!(out.resume_session_id.is_none());
         assert_eq!(out.stale_session_id.as_deref(), Some("stale-cx"));
@@ -5579,6 +5718,7 @@ if (args.includes('app-server')) {{
             Some("stale-cl".into()),
             LaunchIntent::Resume,
             Some(&probe),
+            freshell_platform::resume_gate::ResumeIntent::UserCreate,
         );
         assert_eq!(out.launch_intent, LaunchIntent::Start);
         let minted = out.resume_session_id.expect("fresh claude id minted");

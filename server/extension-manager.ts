@@ -179,6 +179,7 @@ export class ExtensionManager extends EventEmitter {
         clientEntry.cli = {
           supportsPermissionMode: manifest.cli.supportsPermissionMode,
           supportsModel: manifest.cli.supportsModel,
+          supportsEffort: manifest.cli.supportsEffort,
           supportsSandbox: manifest.cli.supportsSandbox,
           supportsResume: !!manifest.cli.resumeArgs,
           resumeCommandTemplate,

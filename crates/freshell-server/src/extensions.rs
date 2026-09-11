@@ -215,6 +215,7 @@ impl ExtensionRegistry {
                 resume_args: cli.resume_args.clone(),
                 create_session_args: cli.create_session_args.clone(),
                 model_args: cli.model_args.clone(),
+                effort_args: cli.effort_args.clone(),
                 sandbox_args: cli.sandbox_args.clone(),
                 permission_mode_args: cli.permission_mode_args.clone(),
             })
@@ -286,6 +287,9 @@ fn client_entry(m: &ExtensionManifest) -> Value {
             if let Some(v) = cli.supports_model {
                 c.insert("supportsModel".into(), json!(v));
             }
+            if let Some(v) = cli.supports_effort {
+                c.insert("supportsEffort".into(), json!(v));
+            }
             if let Some(v) = cli.supports_sandbox {
                 c.insert("supportsSandbox".into(), json!(v));
             }
@@ -350,6 +354,19 @@ pub fn detect_available_clis(
 pub fn detect_available_clis_live(specs: &[CliDetectionSpec]) -> Value {
     let runner = StdCommandRunner::default();
     detect_available_clis(specs, &|k| std::env::var(k).ok(), host_os_live(), &runner)
+}
+
+/// Promote an extension-backed CLI when its executable is supplied by the
+/// managed workload image rather than the web host. Never invent a provider:
+/// only an existing detection-map key may be changed from false to true.
+pub fn promote_managed_runtime_cli(available: &mut Value, name: &str) {
+    let Some(map) = available.as_object_mut() else {
+        return;
+    };
+    let Some(slot) = map.get_mut(name) else {
+        return;
+    };
+    *slot = Value::Bool(true);
 }
 
 // ── Live directory resolution ───────────────────────────────────────────────
@@ -833,6 +850,17 @@ mod tests {
         let out = detect_available_clis(&specs, &get, HostOs::Linux, &runner);
         assert_eq!(out["claude"], json!(true));
         assert_eq!(out["codex"], json!(false));
+    }
+
+    #[test]
+    fn managed_runtime_availability_only_promotes_already_registered_provider() {
+        let mut value = serde_json::json!({"claude": false, "opencode": false});
+        promote_managed_runtime_cli(&mut value, "opencode");
+        promote_managed_runtime_cli(&mut value, "not-registered");
+        assert_eq!(
+            value,
+            serde_json::json!({"claude": false, "opencode": true})
+        );
     }
 
     #[test]

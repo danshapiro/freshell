@@ -93,7 +93,7 @@ function statOrNull(p: string): { mtimeMs: number; size: number } | null {
   }
 }
 
-const describeLive = shouldRun ? describe.sequential : describe.skip
+const describeLive = shouldRun ? describe : describe.skip
 
 describeLive('T2 equivalence — original ≡ rust (opencode + Kimi k2.7, cold-start)', () => {
   let run: T2Run | null = null

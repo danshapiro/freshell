@@ -28,12 +28,20 @@ mod existence;
 mod existence_by_id;
 mod extensions;
 mod files;
+#[cfg(feature = "managed-runtime-v1")]
+mod fresh_agent_proxy;
 mod host_stats;
 mod identity_sink;
 mod instance_id;
 mod legacy_local_seed;
 mod logging;
 mod managed_ports;
+#[cfg(feature = "managed-runtime-v1")]
+mod managed_provider_bootstrap;
+#[cfg(feature = "managed-runtime-v1")]
+mod managed_runtime;
+#[cfg(feature = "managed-runtime-v1")]
+mod managed_runtime_api;
 mod migrations;
 mod net_bind;
 mod network;
@@ -357,6 +365,49 @@ async fn main() -> ExitCode {
     // Cloned (cheap Arc) into the files REST surface too, whose `candidate-dirs`
     // sources the running terminals' cwds for the DirectoryPicker.
     let registry = freshell_terminal::TerminalRegistry::new();
+    #[cfg(feature = "managed-runtime-v1")]
+    let (managed_runtime_available, managed_runtime_client) = {
+        let controller = managed_runtime::ServerManagedRuntimeController::from_env()
+            .await
+            .map_err(|error| {
+                tracing::error!(error = %error, "managed_runtime.init_failed");
+                error
+            })
+            .unwrap_or_else(|error| {
+                eprintln!("managed runtime initialization failed: {error}");
+                std::process::exit(1);
+            });
+        let available = controller.is_some();
+        let client = controller
+            .as_ref()
+            .map(|controller| controller.runtime_client());
+        registry.set_managed_controller(controller.map(|controller| {
+            controller as Arc<dyn freshell_terminal::registry::ManagedTerminalController>
+        }));
+        (available, client)
+    };
+    #[cfg(not(feature = "managed-runtime-v1"))]
+    let managed_runtime_available = false;
+    #[cfg(feature = "managed-runtime-v1")]
+    if let Some(gateway) = fresh_agent_proxy::HostedFreshAgentProxy::from_opt_in(
+        managed_runtime_client.clone(),
+        Arc::clone(&broadcast_tx),
+    )
+    .unwrap_or_else(|error| {
+        eprintln!("managed fresh-agent gateway initialization failed: {error}");
+        std::process::exit(1);
+    }) {
+        fresh_agent_state
+            .set_hosted_rest_gateway(gateway.clone())
+            .unwrap_or_else(|error| {
+                eprintln!("managed fresh-agent gateway initialization failed: {error}");
+                std::process::exit(1);
+            });
+        freshell_ws::hosted_fresh_agent::install_gateway(gateway).unwrap_or_else(|error| {
+            eprintln!("managed fresh-agent gateway initialization failed: {error}");
+            std::process::exit(1);
+        });
+    }
     // HOST-PRESSURE PANE (Task 9, docs/plans/2026-08-25-host-pressure-pane.md):
     // the Rust host-stats collector — freshell-platform readers over
     // freshell-ws's trait bridge. Constructed here (not at the ~1311
@@ -1222,8 +1273,14 @@ async fn main() -> ExitCode {
     // Detect which coding-CLI agents are on PATH (so the PanePicker surfaces the real
     // claude/codex/opencode agents, was `{}`) and serialize the client registry for
     // `GET /api/extensions`, reusing the `extension_registry` scanned above.
-    let available_clis =
+    let mut available_clis =
         extensions::detect_available_clis_live(&extension_registry.cli_detection_specs());
+    if managed_runtime_available {
+        // OpenCode lives in the pinned managed workload image; a healthy
+        // managed controller means the web host does not need its own copy.
+        // The helper only promotes an already-registered extension key.
+        extensions::promote_managed_runtime_cli(&mut available_clis, "opencode");
+    }
     let extensions_registry = Arc::new(extension_registry.to_client_registry());
 
     // The boot REST surface the RETAINED React SPA fetches on first paint
@@ -1597,7 +1654,29 @@ async fn main() -> ExitCode {
         broadcast_tx: Arc::clone(&broadcast_tx),
     };
 
+    #[cfg(feature = "managed-runtime-v1")]
+    let managed_runtime_router = {
+        let state = managed_runtime_api::ManagedRuntimeApiState::new(
+            Arc::clone(&auth_token),
+            managed_runtime_client.clone(),
+            home.as_ref()
+                .map(|home| home.join(".freshell").join("managed-runtime-views.json")),
+            Arc::clone(&pane_ledger),
+            Arc::clone(&broadcast_tx),
+        )
+        .await
+        .unwrap_or_else(|error| {
+            eprintln!("managed runtime API initialization failed: {error}");
+            std::process::exit(1);
+        });
+        state.spawn_projector();
+        managed_runtime_api::router(state)
+    };
+    #[cfg(not(feature = "managed-runtime-v1"))]
+    let managed_runtime_router = axum::Router::new();
+
     let app = freshell_api::router(api_state)
+        .merge(managed_runtime_router)
         .merge(diag::router(diag_state))
         .merge(freshell_ws::router(ws_state))
         .merge(freshell_freshagent::router(fresh_agent_state.clone()))
@@ -1646,6 +1725,8 @@ async fn main() -> ExitCode {
                 ledger: std::sync::Arc::clone(&pane_ledger),
                 registry: registry.clone(),
                 identity: terminal_identity.clone(),
+                #[cfg(feature = "managed-runtime-v1")]
+                managed_runtime_client: managed_runtime_client.clone(),
             },
         ))
         .merge(network::router(network_state))

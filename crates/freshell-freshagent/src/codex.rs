@@ -2800,6 +2800,7 @@ impl FreshCodexState {
             session_type: SESSION_TYPE.to_string(),
             provider: PROVIDER.to_string(),
             runtime_provider: PROVIDER.to_string(),
+            parent_retired_by_runtime: None,
             session_ref: Some(SessionLocator {
                 provider: PROVIDER.to_string(),
                 session_id: child_id,
@@ -8405,6 +8406,7 @@ pub(crate) mod tests {
 
     fn compact_msg(session_id: &str) -> FreshAgentCompact {
         FreshAgentCompact {
+            request_id: None,
             provider: freshell_protocol::AgentProvider::Codex,
             session_id: session_id.to_string(),
             session_type: freshell_protocol::SessionType::Freshcodex,

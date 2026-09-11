@@ -38,6 +38,7 @@ export default defineConfig({
       'test/integration/extension-system.test.ts',
     ],
     exclude: [
+      'test/runtime/**',
       'docs/plans/**',
       'test/integration/server/codex-real-provider-smoke.test.ts',
       'test/integration/server/opencode-serve-real-provider-smoke.test.ts',
@@ -47,12 +48,7 @@ export default defineConfig({
     hookTimeout: 30000,
     // Maximum parallelization settings
     pool: 'threads',
-    poolOptions: {
-      threads: {
-        singleThread: false,
-        isolate: true,
-      },
-    },
+    isolate: true,
     fileParallelism: true,
     maxConcurrency: 10,
     sequence: {

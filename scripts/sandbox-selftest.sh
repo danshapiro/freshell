@@ -37,16 +37,11 @@ if ! docker network inspect "${NETWORK_NAME}" >/dev/null 2>&1; then
   docker network create --driver bridge "${NETWORK_NAME}" >/dev/null
 fi
 
-# ---- host baseline, captured before any proof runs ----
-# This worktree is shared by multiple concurrently-active agents (see
-# AGENTS.md "Many agents may be working in the worktree at the same time"),
-# whose tsx-watch/nodemon dev servers can legitimately restart for reasons
-# that have nothing to do with this sandbox (a file edit elsewhere in the
-# repo). A single curl at the wrong instant can catch that ordinary blip.
-# Retry a few times before declaring a code: a status that genuinely
-# regressed BECAUSE of something this self-test did (the only thing we're
-# actually trying to prove didn't happen) will not spontaneously recover in
-# 3 seconds; an unrelated dev-server restart will.
+# ---- host baseline and self-owned host sentinels ----
+# Real Freshell processes are useful diagnostics but are NOT stable test
+# fixtures: other agents legitimately start/stop worktree servers while this
+# test runs. Create exact host-side sentinels that this self-test alone owns,
+# then prove container operations cannot affect those sentinels.
 _curl_code() { curl -s -o /dev/null -w '%{http_code}' --max-time 3 "$1" 2>/dev/null || echo "ERR"; }
 _host_check_with_retry() {
   local url="$1" attempt code
@@ -64,10 +59,68 @@ host_3001() { _host_check_with_retry "http://localhost:3001/"; }
 host_3002() { _host_check_with_retry "http://localhost:3002/"; }
 host_freshell_pids() { pgrep -f freshell-server 2>/dev/null | sort | tr '\n' ',' || true; }
 
+HOST_PID_SENTINEL_PID=""
+HOST_PORT_SENTINEL_PID=""
+HOST_PORT_FILE="$(mktemp)"
+cleanup_selftest_decoys() {
+  if [ -n "${HOST_PID_SENTINEL_PID}" ]; then
+    kill "${HOST_PID_SENTINEL_PID}" 2>/dev/null || true
+    wait "${HOST_PID_SENTINEL_PID}" 2>/dev/null || true
+  fi
+  if [ -n "${HOST_PORT_SENTINEL_PID}" ]; then
+    kill "${HOST_PORT_SENTINEL_PID}" 2>/dev/null || true
+    wait "${HOST_PORT_SENTINEL_PID}" 2>/dev/null || true
+  fi
+  rm -f "${HOST_PORT_FILE}"
+}
+trap cleanup_selftest_decoys EXIT
+
+bash -c 'exec -a freshell-server-sandbox-host-sentinel sleep 300' &
+HOST_PID_SENTINEL_PID=$!
+
+python3 - "${HOST_PORT_FILE}" <<'PYHOST' &
+import http.server
+import socketserver
+import sys
+
+class Handler(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        body = b"host-sandbox-sentinel"
+        self.send_response(200)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+    def log_message(self, *_args):
+        pass
+
+with socketserver.TCPServer(("127.0.0.1", 0), Handler) as server:
+    with open(sys.argv[1], "w", encoding="utf-8") as handle:
+        handle.write(str(server.server_address[1]))
+        handle.flush()
+    server.serve_forever()
+PYHOST
+HOST_PORT_SENTINEL_PID=$!
+for _attempt in $(seq 1 100); do
+  [ -s "${HOST_PORT_FILE}" ] && break
+  sleep 0.02
+done
+if [ ! -s "${HOST_PORT_FILE}" ]; then
+  echo "FAIL: host port sentinel failed to publish its port"
+  exit 1
+fi
+HOST_SENTINEL_PORT="$(cat "${HOST_PORT_FILE}")"
+host_port_sentinel() { curl -fsS --max-time 2 "http://127.0.0.1:${HOST_SENTINEL_PORT}/" 2>/dev/null || true; }
+host_pid_sentinel_alive() {
+  kill -0 "${HOST_PID_SENTINEL_PID}" 2>/dev/null \
+    && ps -p "${HOST_PID_SENTINEL_PID}" -o args= 2>/dev/null | grep -q 'freshell-server-sandbox-host-sentinel'
+}
+
 BEFORE_3001="$(host_3001)"
 BEFORE_3002="$(host_3002)"
 BEFORE_PIDS="$(host_freshell_pids)"
-echo "[baseline] host :3001=${BEFORE_3001} :3002=${BEFORE_3002} freshell-server pids=[${BEFORE_PIDS}]"
+BEFORE_SENTINEL_HTTP="$(host_port_sentinel)"
+echo "[diagnostic baseline] host :3001=${BEFORE_3001} :3002=${BEFORE_3002} freshell-server pids=[${BEFORE_PIDS}]"
+echo "[owned sentinels] pid=${HOST_PID_SENTINEL_PID} http=127.0.0.1:${HOST_SENTINEL_PORT} response=${BEFORE_SENTINEL_HTTP}"
 echo
 
 # ---- Proof 1: PID isolation ----
@@ -93,38 +146,38 @@ echo "decoy-alive-after-kill=${decoy_after}"
 EOF
 )" || P1_STATUS=$?
 echo "${P1_OUT}"
-AFTER_3002_P1="$(host_3002)"
 AFTER_PIDS_P1="$(host_freshell_pids)"
 PS_COUNT="$(echo "${P1_OUT}" | grep -oP 'container-ps-count=\K[0-9]+' || true)"
 DECOY_BEFORE="$(echo "${P1_OUT}" | grep -oP 'decoy-alive-before-kill=\K[0-9]+' || true)"
 DECOY_AFTER="$(echo "${P1_OUT}" | grep -oP 'decoy-alive-after-kill=\K[0-9]+' || true)"
 if [ "${P1_STATUS}" -eq 0 ] && [ -n "${PS_COUNT}" ] && [ -n "${DECOY_BEFORE}" ] && [ -n "${DECOY_AFTER}" ] \
   && [ "${PS_COUNT}" -le 10 ] && [ "${DECOY_BEFORE}" -ge 1 ] && [ "${DECOY_AFTER}" -eq 0 ] \
-  && [ "${AFTER_PIDS_P1}" = "${BEFORE_PIDS}" ] && [ "${AFTER_3002_P1}" = "${BEFORE_3002}" ]; then
-  pass "container has its own tiny PID namespace (ps count=${PS_COUNT}); killed its own decoy \"freshell-server\" (${DECOY_BEFORE}->${DECOY_AFTER}); host freshell-server pids unchanged [${AFTER_PIDS_P1}] and :3002 still ${AFTER_3002_P1}"
+  && host_pid_sentinel_alive; then
+  pass "container killed its own freshell-server decoy (${DECOY_BEFORE}->${DECOY_AFTER}) while exact host sentinel pid ${HOST_PID_SENTINEL_PID} survived; observed real Freshell pids are diagnostic only"
 else
-  fail "PID isolation: container_exit=${P1_STATUS} ps_count=${PS_COUNT} decoy_before=${DECOY_BEFORE} decoy_after=${DECOY_AFTER} host_pids_before=[${BEFORE_PIDS}] host_pids_after=[${AFTER_PIDS_P1}] host_3002_before=${BEFORE_3002} host_3002_after=${AFTER_3002_P1}"
+  fail "PID isolation: container_exit=${P1_STATUS} ps_count=${PS_COUNT} decoy_before=${DECOY_BEFORE} decoy_after=${DECOY_AFTER} owned_host_sentinel_pid=${HOST_PID_SENTINEL_PID} host_pids_before=[${BEFORE_PIDS}] host_pids_after=[${AFTER_PIDS_P1}]"
 fi
 echo
 
 # ---- Proof 2: port isolation ----
 echo "--- Proof 2: port isolation ---"
 P2_STATUS=0
-P2_OUT="$(docker run --rm --network "${NETWORK_NAME}" "${IMAGE_TAG}" bash -c '
+P2_OUT="$(docker run --rm --network "${NETWORK_NAME}" -e TEST_PORT="${HOST_SENTINEL_PORT}" "${IMAGE_TAG}" bash -c '
   set -e
-  node -e "require(\"http\").createServer((_,res)=>res.end(\"container-3001-ok\")).listen(3001,\"0.0.0.0\")" &
+  node -e "require(\"http\").createServer((_,res)=>res.end(\"container-port-ok\")).listen(Number(process.env.TEST_PORT),\"0.0.0.0\")" &
   SERVER_PID=$!
   sleep 0.5
-  curl -s --max-time 3 http://127.0.0.1:3001/
+  curl -s --max-time 3 "http://127.0.0.1:${TEST_PORT}/"
   echo
   kill "${SERVER_PID}" 2>/dev/null || true
 ')" || P2_STATUS=$?
 echo "container bind result: ${P2_OUT}"
-AFTER_3001_P2="$(host_3001)"
-if [ "${P2_STATUS}" -eq 0 ] && echo "${P2_OUT}" | grep -q "container-3001-ok" && [ "${AFTER_3001_P2}" = "${BEFORE_3001}" ]; then
-  pass "container bound its own :3001 in its own network namespace; host :3001 unaffected throughout (still ${AFTER_3001_P2})"
+AFTER_SENTINEL_HTTP_P2="$(host_port_sentinel)"
+if [ "${P2_STATUS}" -eq 0 ] && echo "${P2_OUT}" | grep -q "container-port-ok" \
+  && [ "${AFTER_SENTINEL_HTTP_P2}" = "host-sandbox-sentinel" ]; then
+  pass "container bound its own :${HOST_SENTINEL_PORT} while the self-owned host listener on the same port stayed reachable"
 else
-  fail "port isolation: container_exit=${P2_STATUS} container_bind_output=[${P2_OUT}] host_3001_before=${BEFORE_3001} host_3001_after=${AFTER_3001_P2}"
+  fail "port isolation: container_exit=${P2_STATUS} container_bind_output=[${P2_OUT}] host_sentinel_response=[${AFTER_SENTINEL_HTTP_P2}]"
 fi
 echo
 
@@ -135,7 +188,13 @@ echo "--- Proof 3: filesystem isolation ---"
 # This is a synthetic mount (a scratch tempdir), not one of the wrapper's
 # named paths, so there's no "production path" to route it through here.
 RO_SRC="$(mktemp -d)"
+# mktemp creates mode 0700; the sandbox runs as the matching numeric UID but
+# user-namespace/remap setups can still make that directory unreadable. The
+# corpus fixture is intentionally public-read, while the mount itself remains
+# read-only and is what this proof is testing.
+chmod 0755 "${RO_SRC}"
 echo "readonly-marker" >"${RO_SRC}/marker.txt"
+chmod 0644 "${RO_SRC}/marker.txt"
 P3A_STATUS=0
 P3A_OUT="$(docker run --rm --network "${NETWORK_NAME}" \
   -v "${RO_SRC}:/home/sandbox/ro-corpus:ro" \
@@ -171,31 +230,66 @@ P3B_OUT="$("${REPO_ROOT}/scripts/sandbox-test.sh" '
 ' 2>&1)" || P3B_STATUS=$?
 echo "${P3B_OUT}"
 
-if [ "${P3A_STATUS}" -eq 0 ] && [ "${P3B_STATUS}" -eq 0 ] \
+# 3c: managed-runtime lifecycle mode is stricter than the ordinary sandbox:
+# no default route, no Docker socket, no real provider homes, read-only root.
+P3C_STATUS=0
+P3C_OUT="$("${REPO_ROOT}/scripts/sandbox-test.sh" --runtime-suite '
+  set -e
+  [ "${FRESHELL_SANDBOX_MODE:-}" = "runtime-suite" ]
+  for sock in /var/run/docker.sock /run/docker.sock; do
+    [ ! -S "$sock" ] || { echo "docker-socket-visible:$sock"; exit 1; }
+  done
+  for p in "$HOME/.freshell" "$HOME/.claude" "$HOME/.codex" "$HOME/.local/share/opencode"; do
+    [ ! -e "$p" ] || { echo "provider-home-visible:$p"; exit 1; }
+  done
+  if grep -qE "^[^[:space:]]+[[:space:]]+00000000[[:space:]]" /proc/net/route; then
+    echo "default-route-visible"
+    exit 1
+  fi
+  if touch /runtime-suite-root-write-probe 2>/dev/null; then
+    echo "root-writable"
+    exit 1
+  fi
+  cap_eff=$(awk "/^CapEff:/ {print \$2}" /proc/self/status)
+  [ "$cap_eff" = "0000000000000000" ] || { echo "effective-capabilities:$cap_eff"; exit 1; }
+  echo "runtime-suite-isolated"
+' 2>&1)" || P3C_STATUS=$?
+echo "${P3C_OUT}"
+
+if [ "${P3A_STATUS}" -eq 0 ] && [ "${P3B_STATUS}" -eq 0 ] && [ "${P3C_STATUS}" -eq 0 ] \
   && echo "${P3A_OUT}" | grep -q "read-ok:readonly-marker" \
   && echo "${P3A_OUT}" | grep -qi "Read-only file system" \
-  && ! echo "${P3B_OUT}" | grep -q "host-path-visible:"; then
-  pass "read-only corpus mount is readable but not writable (EROFS); production wrapper (scripts/sandbox-test.sh) does not expose \$HOME/.freshell, .claude, .codex, or .local/share/opencode without --corpus"
+  && ! echo "${P3B_OUT}" | grep -q "host-path-visible:" \
+  && echo "${P3C_OUT}" | grep -q "runtime-suite-isolated"; then
+  pass "read-only mount enforcement works; ordinary sandbox hides provider homes; --runtime-suite also removes network/admin authority and makes the container root read-only"
 else
-  fail "filesystem isolation: ro_mount_exit=${P3A_STATUS} ro_mount_output=[${P3A_OUT}] wrapper_exit=${P3B_STATUS} wrapper_output=[${P3B_OUT}]"
+  fail "filesystem isolation: ro_mount_exit=${P3A_STATUS} ordinary_exit=${P3B_STATUS} runtime_suite_exit=${P3C_STATUS} ro=[${P3A_OUT}] ordinary=[${P3B_OUT}] runtime_suite=[${P3C_OUT}]"
 fi
 echo
 
-# ---- Proof 4: utility — real crate tests run green, timed vs host ----
-echo "--- Proof 4: cargo test -p freshell-ws (sandbox vs host, warm caches both) ---"
-# warm the sandbox cargo caches first so the timed run reflects steady-state,
-# matching the honesty requirement for the host comparison (also warm).
-"${REPO_ROOT}/scripts/sandbox-test.sh" "cargo test -p freshell-ws --quiet" >/tmp/sandbox-selftest-warm.log 2>&1 || true
+# ---- Proof 4: utility — a real crate test runs green in both environments ----
+# Keep this proof deliberately small and deterministic. The sandbox self-test
+# proves isolation; broad freshell-ws behavior belongs to the coordinated test
+# suite and can include unrelated watcher concurrency that obscures this proof.
+TEST_CRATE="freshell-runtime-protocol"
+echo "--- Proof 4: cargo test -p ${TEST_CRATE} (sandbox vs host, warm caches both) ---"
+"${REPO_ROOT}/scripts/sandbox-test.sh" "cargo test -p ${TEST_CRATE} --quiet" >/tmp/sandbox-selftest-warm.log 2>&1 || true
 
 SANDBOX_STATUS=0
 SANDBOX_START=$(date +%s.%N)
-SANDBOX_OUT="$("${REPO_ROOT}/scripts/sandbox-test.sh" "cargo test -p freshell-ws" 2>&1)" || SANDBOX_STATUS=$?
+SANDBOX_OUT="$("${REPO_ROOT}/scripts/sandbox-test.sh" "cargo test -p ${TEST_CRATE}" 2>&1)" || SANDBOX_STATUS=$?
 SANDBOX_END=$(date +%s.%N)
 SANDBOX_SECS=$(echo "${SANDBOX_END} - ${SANDBOX_START}" | bc)
 
+# The repo requires Rust 1.96 and this host intentionally leaves an older
+# system cargo on PATH. Follow AGENTS.md and use mise for the host comparison.
+HOST_CARGO=(cargo)
+if command -v mise >/dev/null 2>&1; then
+  HOST_CARGO=(mise exec rust@1.96 -- cargo)
+fi
 HOST_STATUS=0
 HOST_START=$(date +%s.%N)
-HOST_OUT="$(cd "${REPO_ROOT}" && cargo test -p freshell-ws 2>&1)" || HOST_STATUS=$?
+HOST_OUT="$(cd "${REPO_ROOT}" && "${HOST_CARGO[@]}" test -p "${TEST_CRATE}" 2>&1)" || HOST_STATUS=$?
 HOST_END=$(date +%s.%N)
 HOST_SECS=$(echo "${HOST_END} - ${HOST_START}" | bc)
 
@@ -204,9 +298,9 @@ echo "host:    exit=${HOST_STATUS} wall=${HOST_SECS}s"
 if [ "${SANDBOX_STATUS}" -eq 0 ] && [ "${HOST_STATUS}" -eq 0 ] \
   && echo "${SANDBOX_OUT}" | grep -q "test result: ok" \
   && echo "${HOST_OUT}" | grep -q "test result: ok"; then
-  pass "cargo test -p freshell-ws green in sandbox (${SANDBOX_SECS}s) and on host (${HOST_SECS}s)"
+  pass "cargo test -p ${TEST_CRATE} green in sandbox (${SANDBOX_SECS}s) and on host (${HOST_SECS}s)"
 else
-  fail "cargo test -p freshell-ws: sandbox_exit=${SANDBOX_STATUS} host_exit=${HOST_STATUS}"
+  fail "cargo test -p ${TEST_CRATE}: sandbox_exit=${SANDBOX_STATUS} host_exit=${HOST_STATUS}"
   echo "--- sandbox output tail ---"
   echo "${SANDBOX_OUT}" | tail -20
   echo "--- host output tail ---"
@@ -232,16 +326,18 @@ else
 fi
 echo
 
-# ---- final host health check ----
+# ---- final host isolation check ----
 FINAL_3001="$(host_3001)"
 FINAL_3002="$(host_3002)"
 FINAL_PIDS="$(host_freshell_pids)"
-echo "=== final host health ==="
-echo "host :3001=${FINAL_3001} (was ${BEFORE_3001}) :3002=${FINAL_3002} (was ${BEFORE_3002}) freshell-server pids=[${FINAL_PIDS}] (was [${BEFORE_PIDS}])"
-if [ "${FINAL_3001}" != "${BEFORE_3001}" ] || [ "${FINAL_3002}" != "${BEFORE_3002}" ] || [ "${FINAL_PIDS}" != "${BEFORE_PIDS}" ]; then
-  fail "host health changed across the self-test run"
+FINAL_SENTINEL_HTTP="$(host_port_sentinel)"
+echo "=== final host isolation ==="
+echo "[diagnostic] host :3001=${FINAL_3001} (was ${BEFORE_3001}) :3002=${FINAL_3002} (was ${BEFORE_3002})"
+echo "[diagnostic] observed Freshell pids now=[${FINAL_PIDS}] baseline=[${BEFORE_PIDS}] (concurrent activity allowed)"
+if host_pid_sentinel_alive && [ "${FINAL_SENTINEL_HTTP}" = "host-sandbox-sentinel" ]; then
+  pass "both exact host sentinels created by this self-test survived every container operation"
 else
-  pass "host health unchanged across the entire self-test run"
+  fail "self-owned host sentinel changed: pid=${HOST_PID_SENTINEL_PID} http=[${FINAL_SENTINEL_HTTP}]"
 fi
 
 echo

@@ -1,0 +1,37 @@
+{
+  "schemaVersion": 1,
+  "runtimeBaseImage": {
+    "repository": "ubuntu",
+    "tag": "24.04",
+    "digest": "sha256:33ceb71981b602c1a7443a53469e4dba065f7503eab3078a2d7a57a2ab987517"
+  },
+  "nodeSourceImage": {
+    "repository": "node",
+    "tag": "22.23.2-bookworm-slim",
+    "digest": "sha256:83f487e0a63425e5b4d146fb5e5be574bcbe1b7b843d3ebafdd95eaf7767a7e5"
+  },
+  "node": "22.23.2",
+  "providers": {
+    "claude": {
+      "package": "@anthropic-ai/claude-code",
+      "version": "2.1.263"
+    },
+    "codex": {
+      "package": "@openai/codex",
+      "version": "0.147.0"
+    },
+    "opencode": {
+      "package": "opencode-ai",
+      "version": "1.18.21"
+    },
+    "amplifier": {
+      "repository": "microsoft/amplifier-app-cli",
+      "commit": "1873aa980535c99a743b17172e4231833f6c8741",
+      "version": "0.1.1",
+      "foundationCommit": "0d5c5204befc33febfc2bdb8cd8d72ff0a3e6c84",
+      "anthropicProviderCommit": "4cf78c792dd214233d16b373e824135de5687957",
+      "anthropicSdkVersion": "1.0.0",
+      "uvVersion": "0.8.22"
+    }
+  }
+}

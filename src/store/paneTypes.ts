@@ -8,6 +8,7 @@ import type { RestoreError, CrashTrace } from '@shared/session-contract'
 import type { CodexDurabilityRef } from '@shared/codex-durability'
 import type { FreshAgentRuntimeProvider, FreshAgentSessionType } from '@shared/fresh-agent'
 import type { FreshAgentStyle } from '@shared/settings'
+import type { ManagedRuntimeProjectionFields } from '@shared/managed-runtime'
 
 export type SessionLocator = SharedSessionLocator
 
@@ -124,7 +125,7 @@ export type TerminalPaneContent = {
   /** znhn item 1: persisted deliberately — do NOT add to
    * stripTransientSessionFields. Absent on old layouts = no trace. */
   crashTrace?: CrashTrace
-}
+} & ManagedRuntimeProjectionFields
 
 /**
  * Browser pane content for embedded web views.
@@ -251,7 +252,7 @@ export type FreshAgentPaneContent = {
   pendingReconcile?: 'respawn' | 'fresh'
   /** VOLATILE fold counter — re-fires FreshAgentView's create effect on same-createRequestId folds. */
   reconcileEpoch?: number
-}
+} & ManagedRuntimeProjectionFields
 
 /**
  * Extension pane content — generic catch-all for extension-system panes.

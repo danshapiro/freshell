@@ -12,6 +12,7 @@ import type { ClientExtensionEntry } from './extension-types.js'
 import type { ServerSettings } from './settings.js'
 import { LiveTerminalHandleSchema, SessionRefSchema, type RestoreError } from './session-contract.js'
 import { CodexDurabilityRefSchema, type CodexDurabilityRef } from './codex-durability.js'
+import type { ManagedRuntimeInventoryChangedMessage, ManagedRuntimeViewChangedMessage } from './managed-runtime.js'
 
 // ──────────────────────────────────────────────────────────────
 // Shared enums and helpers
@@ -418,6 +419,7 @@ export const HelloSchema = z.object({
     // STRIP unknown keys, so without this the capability would silently no-op.
     paneReconcileV1: z.literal(true).optional(),
     paneReconcileFreshAgentV1: z.literal(true).optional(),
+    managedRuntimeV1: z.literal(true).optional(),
   }).optional(),
   client: z.object({
     mobile: z.boolean().optional(),
@@ -815,6 +817,7 @@ export const FreshAgentInterruptSchema = z.object({
 
 export const FreshAgentCompactSchema = z.object({
   type: z.literal('freshAgent.compact'),
+  requestId: z.string().min(1).optional(),
   sessionId: z.string().min(1),
   sessionType: z.enum(['freshclaude', 'freshcodex', 'kilroy', 'freshopencode']),
   provider: z.enum(['claude', 'codex', 'opencode']),
@@ -977,6 +980,7 @@ export const ReadyCapabilitiesSchema = z
     terminalInterestV1: z.literal(true).optional(),
     paneReconcileV1: z.literal(true).optional(),
     paneReconcileFreshAgentV1: z.literal(true).optional(),
+    managedRuntimeV1: z.literal(true).optional(),
   })
   .optional()
 
@@ -1523,7 +1527,7 @@ export type FreshAgentServerMessage =
   | { type: 'freshAgent.send.accepted'; requestId: string; sessionId: string; sessionType: string; provider: string; submittedTurnId?: string; cwd?: string }
   | { type: 'freshAgent.event'; sessionId: string; sessionType: string; provider: string; event: unknown }
   | { type: 'freshAgent.session.materialized'; previousSessionId: string; sessionId: string; sessionType: string; provider: string; sessionRef?: { provider: string; sessionId: string } }
-  | { type: 'freshAgent.forked'; requestId?: string; parentSessionId: string; sessionId: string; sessionType: string; provider: string; runtimeProvider: string; sessionRef?: { provider: string; sessionId: string } }
+  | { type: 'freshAgent.forked'; requestId?: string; parentSessionId: string; sessionId: string; sessionType: string; provider: string; runtimeProvider: string; parentRetiredByRuntime?: boolean; sessionRef?: { provider: string; sessionId: string } }
   | { type: 'freshAgent.killed'; sessionId: string; sessionType: string; provider: string; success: boolean }
 
 // -- Extensions --
@@ -1637,3 +1641,5 @@ export type ServerMessage =
   | ExtensionServerReadyMessage
   | ExtensionServerErrorMessage
   | ExtensionServerStoppedMessage
+  | ManagedRuntimeInventoryChangedMessage
+  | ManagedRuntimeViewChangedMessage

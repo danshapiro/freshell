@@ -6,6 +6,7 @@ import App from '@/App'
 import settingsReducer, { defaultSettings } from '@/store/settingsSlice'
 import tabsReducer from '@/store/tabsSlice'
 import connectionReducer from '@/store/connectionSlice'
+import managedRuntimeReducer from '@/store/managedRuntimeSlice'
 import sessionsReducer from '@/store/sessionsSlice'
 import panesReducer from '@/store/panesSlice'
 import tabRegistryReducer from '@/store/tabRegistrySlice'
@@ -207,6 +208,7 @@ function createStore(options?: {
       settings: settingsReducer,
       tabs: tabsReducer,
       connection: connectionReducer,
+      managedRuntime: managedRuntimeReducer,
       sessions: sessionsReducer,
       panes: panesReducer,
       network: networkReducer,

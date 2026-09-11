@@ -30,6 +30,7 @@ export interface FreshellTestHarness {
   setTerminalNetworkEffectsSuppressed: (paneId: string, suppressed: boolean) => void
   isTerminalNetworkEffectsSuppressed: (paneId: string) => boolean
   getTerminalBuffer: (terminalId?: string) => string | null
+  getRegisteredTerminalIds: () => string[]
   /**
    * Additive xterm-mode snapshot for replay-sync e2e coverage: returns the
    * xterm IModes-derived fields the renderer gates mouse forwarding on, plus
@@ -141,6 +142,7 @@ export function installTestHarness(
       ;(window as { __FRESHELL_SUPPRESS_ALL_FRESH_AGENT_NETWORK_EFFECTS__?: boolean }).__FRESHELL_SUPPRESS_ALL_FRESH_AGENT_NETWORK_EFFECTS__ = suppressed
     },
     isAllFreshAgentNetworkEffectsSuppressed: () => suppressAllFreshAgentNetworkEffects,
+    getRegisteredTerminalIds: () => [...terminalBuffers.keys()],
     getTerminalBuffer: (terminalId?: string) => {
       if (terminalId) {
         const accessor = terminalBuffers.get(terminalId)

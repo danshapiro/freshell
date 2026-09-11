@@ -174,7 +174,13 @@ impl ScreenshotBroker {
     /// capable SPA client renders + replies. Frame shape is byte-compatible with
     /// `ws-handler.ts` (`{type, command, payload:{requestId, scope, tabId?,
     /// paneId?}}`), matching `ui-commands.ts#handleScreenshotCapture`.
-    pub fn send_capture(&self, request_id: &str, scope: &str, tab_id: Option<&str>, pane_id: Option<&str>) {
+    pub fn send_capture(
+        &self,
+        request_id: &str,
+        scope: &str,
+        tab_id: Option<&str>,
+        pane_id: Option<&str>,
+    ) {
         let mut payload = json!({
             "requestId": request_id,
             "scope": scope,

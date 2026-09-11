@@ -9,6 +9,7 @@ import {
   ClaudeActivityListSchema,
   ClientMessageSchema,
   ErrorCode,
+  FreshAgentCompactSchema,
   FreshAgentSendSchema,
   HelloSchema,
   TerminalAttachSchema,
@@ -73,6 +74,16 @@ describe('websocket protocol schemas', () => {
       provider: 'codex',
       text: 'Continue',
     }).requestId).toBe('send-request-1')
+  })
+
+  it('preserves a stable freshAgent.compact requestId', () => {
+    expect(FreshAgentCompactSchema.parse({
+      type: 'freshAgent.compact',
+      requestId: 'compact-request-1',
+      sessionId: 'thread-1',
+      sessionType: 'freshcodex',
+      provider: 'codex',
+    }).requestId).toBe('compact-request-1')
   })
 
   it('accepts SESSION_IDENTITY_MISMATCH as an error code', () => {
@@ -660,6 +671,7 @@ describe('ws protocol', () => {
           providers: {
             codex: {
               model: 'gpt-5-codex',
+              effort: 'minimal',
               sandbox: 'workspace-write',
             },
           },
@@ -691,6 +703,7 @@ describe('ws protocol', () => {
     }])
     expect(registry.createCalls[0]?.resumeSessionId).toBeUndefined()
     expect(registry.createCalls[0]?.providerSettings).toEqual({
+      effort: 'minimal',
       codexAppServer: expect.objectContaining({
         wsUrl: DEFAULT_CODEX_REMOTE_WS_URL,
       }),

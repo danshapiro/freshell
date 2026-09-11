@@ -30,6 +30,7 @@ export default defineConfig({
     environment: 'jsdom',
     setupFiles: ['./test/setup/dom.ts'],
     exclude: [
+      'test/runtime/**',
       '**/node_modules/**',
       '**/server-node-modules/**',
       '**/bundled-node/**',
@@ -63,12 +64,7 @@ export default defineConfig({
     },
     // Maximum parallelization settings
     pool: 'threads',
-    poolOptions: {
-      threads: {
-        singleThread: false,
-        isolate: true,
-      },
-    },
+    isolate: true,
     fileParallelism: true,
     maxConcurrency: 10,
     sequence: {

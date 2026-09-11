@@ -2102,6 +2102,7 @@ impl FreshOpencodeState {
             session_type: SESSION_TYPE.to_string(),
             provider: PROVIDER.to_string(),
             runtime_provider: PROVIDER.to_string(),
+            parent_retired_by_runtime: None,
             session_ref: Some(SessionLocator {
                 provider: PROVIDER.to_string(),
                 session_id: child.id.clone(),
@@ -7935,6 +7936,7 @@ mod tests {
 
     fn compact_msg(session_id: &str) -> FreshAgentCompact {
         FreshAgentCompact {
+            request_id: None,
             provider: AgentProvider::Opencode,
             session_id: session_id.to_string(),
             session_type: SessionType::Freshopencode,
@@ -9808,6 +9810,7 @@ mod tests {
                 session_type: "freshopencode".to_string(),
                 provider: "opencode".to_string(),
                 runtime_provider: "opencode".to_string(),
+                parent_retired_by_runtime: None,
                 session_ref: Some(SessionLocator {
                     provider: "opencode".to_string(),
                     session_id: "ses_child".to_string(),

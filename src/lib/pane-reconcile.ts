@@ -248,6 +248,13 @@ export interface FoldOutcome {
   fresh: number
   dead: number
   warming: number
+  /**
+   * Panes the server explicitly deferred to managed-runtime truth. They are
+   * neither attached nor failed here: the managed inventory reconciler owns
+   * their state, and painting a provider failure over a live supervisor-owned
+   * soul would be a lie.
+   */
+  managedDeferred: number
   invalid: number
   cardinalityViolation: boolean
 }
@@ -394,6 +401,17 @@ function foldFreshAgentVerdict(
 }
 
 /**
+ * `error` reasons that mean "managed runtime owns this answer", not "this pane
+ * failed". The server emits them instead of a definitive `dead_session` when a
+ * supervisor-owned soul's truth could not be read from the host-local index —
+ * an unknown managed answer authorizes no loss claim.
+ */
+const MANAGED_DEFERRED_REASONS = new Set([
+  'managed_runtime_unavailable',
+  'managed_runtime_authoritative',
+])
+
+/**
  * Fold a pane.reconcile.result into the store, one dispatch per pane
  * verdict — EXCEPT dead_session adjudication and index_warming, which
  * are each batched into a single dispatch.
@@ -420,6 +438,7 @@ export function foldVerdicts(
     fresh: 0,
     dead: 0,
     warming: 0,
+    managedDeferred: 0,
     invalid: 0,
     cardinalityViolation: false,
   }
@@ -534,6 +553,12 @@ export function foldVerdicts(
         if (verdict.reason === 'index_warming') {
           warmingRefs.push({ tabId, paneId })
           outcome.warming++
+        } else if (MANAGED_DEFERRED_REASONS.has(verdict.reason ?? '')) {
+          // The server withheld a legacy adjudication because managed runtime
+          // owns this answer and it was unavailable for this request. Leave
+          // the pane exactly as it is; `managed-runtime-recovery` reconciles
+          // it from the supervisor inventory.
+          outcome.managedDeferred++
         } else {
           // provider_unavailable and any other terminal error reason:
           // per-pane restoreError via the provider-failure rendering path.

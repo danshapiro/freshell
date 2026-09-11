@@ -37,6 +37,9 @@ function normalizeCodingCliProviderPatchForApi(
   if (Object.prototype.hasOwnProperty.call(providerPatch, 'model') && providerPatch.model === undefined) {
     normalizedProviderPatch.model = null
   }
+  if (Object.prototype.hasOwnProperty.call(providerPatch, 'effort') && providerPatch.effort === undefined) {
+    normalizedProviderPatch.effort = null
+  }
   if (Object.prototype.hasOwnProperty.call(providerPatch, 'sandbox') && providerPatch.sandbox === undefined) {
     normalizedProviderPatch.sandbox = null
   }

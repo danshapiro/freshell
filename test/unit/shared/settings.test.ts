@@ -29,6 +29,20 @@ describe('shared settings contract', () => {
     })
   })
 
+  it('accepts an explicit coding CLI effort setting', () => {
+    const parsed = buildServerSettingsPatchSchema(['claude', 'codex']).parse({
+      codingCli: {
+        providers: {
+          claude: { model: 'haiku', effort: 'low' },
+          codex: { model: 'gpt-5.6-luna', effort: 'minimal' },
+        },
+      },
+    })
+
+    expect(parsed.codingCli?.providers?.claude).toEqual({ model: 'haiku', effort: 'low' })
+    expect(parsed.codingCli?.providers?.codex).toEqual({ model: 'gpt-5.6-luna', effort: 'minimal' })
+  })
+
   it('accepts tracked and exact fresh-agent model selections with dynamic effort strings', () => {
     const parsed = buildServerSettingsPatchSchema().parse({
       freshAgent: {

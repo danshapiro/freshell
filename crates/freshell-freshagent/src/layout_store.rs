@@ -498,7 +498,11 @@ impl LayoutStore {
             snapshot.pane_titles.remove(tab_id);
             snapshot.pane_title_set_by_user.remove(tab_id);
             if was_active {
-                let next_index = if removed_index > 0 { removed_index - 1 } else { 0 };
+                let next_index = if removed_index > 0 {
+                    removed_index - 1
+                } else {
+                    0
+                };
                 snapshot.active_tab_id = snapshot
                     .tabs
                     .get(next_index)

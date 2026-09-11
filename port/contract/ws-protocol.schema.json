@@ -522,6 +522,10 @@
             "capabilities": {
               "additionalProperties": false,
               "properties": {
+                "managedRuntimeV1": {
+                  "const": true,
+                  "type": "boolean"
+                },
                 "paneReconcileFreshAgentV1": {
                   "const": true,
                   "type": "boolean"
@@ -2048,6 +2052,10 @@
               ],
               "type": "string"
             },
+            "requestId": {
+              "minLength": 1,
+              "type": "string"
+            },
             "sessionId": {
               "minLength": 1,
               "type": "string"
@@ -3324,6 +3332,10 @@
               ],
               "type": "string"
             },
+            "requestId": {
+              "minLength": 1,
+              "type": "string"
+            },
             "sessionId": {
               "minLength": 1,
               "type": "string"
@@ -3702,6 +3714,10 @@
             "codex",
             "opencode"
           ],
+          "type": "string"
+        },
+        "requestId": {
+          "minLength": 1,
           "type": "string"
         },
         "sessionId": {
@@ -4283,6 +4299,10 @@
         "capabilities": {
           "additionalProperties": false,
           "properties": {
+            "managedRuntimeV1": {
+              "const": true,
+              "type": "boolean"
+            },
             "paneReconcileFreshAgentV1": {
               "const": true,
               "type": "boolean"
@@ -7264,6 +7284,10 @@
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "additionalProperties": false,
       "properties": {
+        "managedRuntimeV1": {
+          "const": true,
+          "type": "boolean"
+        },
         "paneReconcileFreshAgentV1": {
           "const": true,
           "type": "boolean"

@@ -68,3 +68,7 @@ port/vm-bridge/outbound/
 
 # GATE-01 per-slice Playwright JSON reports (working state; committed artifact is gate01-baseline.json)
 test/e2e-browser/gate01-reports/
+
+# Live managed-runtime gate build/evidence (reproducible, never committed).
+/.runtime-build/
+/.runtime-evidence/
