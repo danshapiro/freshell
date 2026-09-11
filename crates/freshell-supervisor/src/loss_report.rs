@@ -64,8 +64,6 @@ pub enum LossDecisionError {
     MissingEvidenceReference(&'static str),
     #[error("cleanup authority is not the exact registry-owned prior incarnation")]
     UnsafeCleanupAuthority,
-    #[error("incident analysis field {0} is empty")]
-    MissingAnalysis(&'static str),
 }
 
 #[derive(Debug, Clone)]
@@ -122,7 +120,6 @@ impl LostDecision {
             ));
         }
         validate_path_inventory(applicable_paths, &input.path_evidence)?;
-        validate_analysis(&input.analysis)?;
 
         let state = if context.provider == "shell" {
             LossDecisionState::NonResumableTerminalEnded
@@ -216,20 +213,6 @@ fn validate_path_inventory(
             return Err(LossDecisionError::MissingEvidenceReference(path_name(
                 *path,
             )));
-        }
-    }
-    Ok(())
-}
-
-fn validate_analysis(analysis: &IncidentAnalysis) -> Result<(), LossDecisionError> {
-    for (name, value) in [
-        ("observed_cause", analysis.observed_cause.as_str()),
-        ("missing_invariant", analysis.missing_invariant.as_str()),
-        ("preventive_action", analysis.preventive_action.as_str()),
-        ("regression_case", analysis.regression_case.as_str()),
-    ] {
-        if value.trim().is_empty() {
-            return Err(LossDecisionError::MissingAnalysis(name));
         }
     }
     Ok(())

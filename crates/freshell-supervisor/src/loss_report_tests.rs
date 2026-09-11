@@ -54,13 +54,18 @@ fn limits() -> RuntimeLimits {
 
 async fn prepared_loss(root: &std::path::Path) -> (Registry, PreparedLoss) {
     let registry = Registry::open(root, None).unwrap();
+    let prepared = prepare_loss_in(&registry, root).await;
+    (registry, prepared)
+}
+
+async fn prepare_loss_in(registry: &Registry, root: &std::path::Path) -> PreparedLoss {
     let soul_id = SoulId::new();
     let prepared = registry
         .prepare_launch(LaunchPreparation {
             soul_id: soul_id.clone(),
             provider: "opencode".into(),
             provider_store_id: "store-test".into(),
-            native_session_id: Some("ses_test_exact".into()),
+            native_session_id: Some(format!("ses_{}", soul_id.as_str())),
             creation_seed_ref: "seed-test".into(),
             request_id: freshell_runtime_protocol::RequestId::new(),
             payload_digest: "payload-test".into(),
@@ -80,7 +85,7 @@ async fn prepared_loss(root: &std::path::Path) -> (Registry, PreparedLoss) {
             prepared.incarnation_id.clone(),
             BackendCreatedRecord {
                 daemon_id: DockerDaemonId::new(),
-                container_id: "a".repeat(64),
+                container_id: format!("{:x}", Sha256::digest(soul_id.as_str().as_bytes())),
                 image_ref: format!("sha256:{}", "b".repeat(64)),
                 runtime_dir: root.join("runtime"),
                 host_binary_path: root.join("runtime/host"),
@@ -121,16 +126,15 @@ async fn prepared_loss(root: &std::path::Path) -> (Registry, PreparedLoss) {
         }],
         analysis: IncidentAnalysis {
             observed_cause: "all_paths_absent".into(),
-            missing_invariant: "durable_provider_state".into(),
-            hypotheses: vec!["state_deleted".into()],
-            preventive_action: "retain_state".into(),
-            regression_case: "loss_stale_finalize".into(),
+            missing_invariant: String::new(),
+            hypotheses: Vec::new(),
+            preventive_action: String::new(),
+            regression_case: String::new(),
         },
         created_at: Some("2026-09-09T00:00:00.000Z".into()),
     })
     .unwrap();
-    let prepared_loss = registry.prepare_loss(decision).await.unwrap();
-    (registry, prepared_loss)
+    registry.prepare_loss(decision).await.unwrap()
 }
 
 fn cleanup(prepared: &PreparedLoss) -> LossCleanupReport {
@@ -344,4 +348,234 @@ fn ownership_capability_types_remain_in_supervisor_crate() {
     let _ = std::any::TypeId::of::<AllocationState>();
     let _ = std::any::TypeId::of::<DurabilityState>();
     let _ = std::any::TypeId::of::<RecoveryBlockReason>();
+}
+
+// Stage 5a: fake backend, real SQLite. These tests never contact Docker or
+// signal a host process; every mutation still receives a registry-owned handle.
+#[derive(Default)]
+struct CleanupBackend {
+    stopped: std::sync::Mutex<std::collections::BTreeSet<String>>,
+}
+
+#[async_trait::async_trait]
+impl crate::backend::RuntimeBackend for CleanupBackend {
+    async fn create_stopped(
+        &self,
+        _: &crate::backend::CreateRuntimeSpec,
+    ) -> Result<crate::backend::BackendCreated, crate::backend::BackendError> {
+        panic!("cleanup must not launch")
+    }
+    async fn start_host(&self, _: &OwnedRuntimeHandle) -> Result<(), crate::backend::BackendError> {
+        panic!("cleanup must not launch")
+    }
+    async fn inspect(
+        &self,
+        _: &OwnedRuntimeHandle,
+    ) -> Result<crate::backend::BackendInspection, crate::backend::BackendError> {
+        panic!("unexpected inspection")
+    }
+    async fn request_stop(
+        &self,
+        h: &OwnedRuntimeHandle,
+        _: u64,
+    ) -> Result<(), crate::backend::BackendError> {
+        self.stopped
+            .lock()
+            .unwrap()
+            .insert(h.incarnation_id().to_string());
+        Ok(())
+    }
+    async fn force_stop(&self, _: &OwnedRuntimeHandle) -> Result<(), crate::backend::BackendError> {
+        panic!("graceful fake stop succeeds")
+    }
+    async fn verify_empty(
+        &self,
+        h: &OwnedRuntimeHandle,
+    ) -> Result<bool, crate::backend::BackendError> {
+        Ok(self
+            .stopped
+            .lock()
+            .unwrap()
+            .contains(h.incarnation_id().as_str()))
+    }
+    async fn list_known(
+        &self,
+        _: &[OwnedRuntimeHandle],
+    ) -> Result<Vec<(IncarnationId, crate::backend::BackendInspection)>, crate::backend::BackendError>
+    {
+        panic!("cleanup must not sweep")
+    }
+    async fn read_limits(
+        &self,
+        _: &OwnedRuntimeHandle,
+    ) -> Result<RuntimeLimits, crate::backend::BackendError> {
+        panic!("unexpected limits read")
+    }
+    async fn enable_long_lived(
+        &self,
+        _: &OwnedRuntimeHandle,
+    ) -> Result<(), crate::backend::BackendError> {
+        panic!("cleanup must not launch")
+    }
+}
+
+fn cleanup_supervisor(
+    registry: Registry,
+    root: &std::path::Path,
+    backend: std::sync::Arc<CleanupBackend>,
+) -> Supervisor {
+    let binary = root.join("test-host");
+    fs::write(&binary, "not executable; fake backend only").unwrap();
+    Supervisor::new(
+        registry,
+        backend,
+        SupervisorConfig {
+            runtime_root: root.join("runtime"),
+            host_binary_path: binary,
+            image_ref: format!("sha256:{}", "b".repeat(64)),
+            test_run_id: "stage-5a".into(),
+            control_secret: "test-secret".into(),
+            lifecycle_log: root.join("lifecycle.jsonl"),
+            admission: AdmissionPolicy::default(),
+        },
+    )
+    .unwrap()
+}
+
+#[tokio::test]
+async fn secondary_export_failure_does_not_block_cleanup_and_retries_after_repair() {
+    let dir = tempfile::tempdir().unwrap();
+    let (registry, prepared) = prepared_loss(dir.path()).await;
+    let backend = std::sync::Arc::new(CleanupBackend::default());
+    let supervisor = cleanup_supervisor(registry, dir.path(), backend.clone());
+    // An ordinary file where the exporter expects a directory: deterministic
+    // filesystem failure even when tests happen to run as container root.
+    fs::write(dir.path().join("incidents"), "export unavailable").unwrap();
+    supervisor.reconcile_pending_loss_cleanup().await.unwrap();
+    assert_eq!(backend.stopped.lock().unwrap().len(), 1);
+    let summary = supervisor
+        .registry()
+        .loss_incident_summary(prepared.certificate.incident_id.clone())
+        .await
+        .unwrap();
+    assert!(summary.cleanup.verified_empty);
+    assert!(!supervisor
+        .registry()
+        .pending_incident_exports(100)
+        .await
+        .unwrap()
+        .is_empty());
+    assert_eq!(
+        supervisor
+            .registry()
+            .pending_notices("stage5a-profile".into(), 100)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    fs::remove_file(dir.path().join("incidents")).unwrap();
+    supervisor.reconcile_pending_loss_cleanup().await.unwrap();
+    assert!(supervisor
+        .registry()
+        .pending_incident_exports(100)
+        .await
+        .unwrap()
+        .is_empty());
+    assert_eq!(
+        backend.stopped.lock().unwrap().len(),
+        1,
+        "export retry must not repeat cleanup"
+    );
+    assert!(dir
+        .path()
+        .join("incidents")
+        .join(format!("{}.closed.json", prepared.certificate.incident_id))
+        .exists());
+}
+
+#[tokio::test]
+async fn authoritative_cleanup_read_failure_still_prevents_backend_mutation() {
+    let dir = tempfile::tempdir().unwrap();
+    let (registry, _) = prepared_loss(dir.path()).await;
+    let backend = std::sync::Arc::new(CleanupBackend::default());
+    let supervisor = cleanup_supervisor(registry, dir.path(), backend.clone());
+    Connection::open(dir.path().join("runtime.sqlite3"))
+        .unwrap()
+        .execute("DROP TABLE loss_incidents", [])
+        .unwrap();
+    assert!(supervisor.reconcile_pending_loss_cleanup().await.is_err());
+    assert!(backend.stopped.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn incident_commentary_is_optional_but_does_not_change_loss_safety() {
+    let dir = tempfile::tempdir().unwrap();
+    let (registry, _) = prepared_loss(dir.path()).await;
+    let prepared = prepare_loss_in(&registry, dir.path()).await;
+    // Wire compatibility: old records with enrichment still round-trip, while
+    // new incidents can contain only their observed cause.
+    let analysis: IncidentAnalysis =
+        serde_json::from_value(serde_json::json!({"observedCause": "provider_state_missing"}))
+            .unwrap();
+    assert!(analysis.hypotheses.is_empty());
+    assert!(analysis.regression_case.is_empty());
+    let mut certificate = prepared.certificate;
+    certificate.analysis = analysis;
+    let encoded = serde_json::to_value(&certificate).unwrap();
+    assert_eq!(
+        encoded["analysis"]["observedCause"],
+        "provider_state_missing"
+    );
+    assert!(encoded["analysis"].get("regressionCase").is_none());
+}
+
+#[tokio::test]
+async fn one_failed_export_does_not_starve_other_incidents() {
+    let dir = tempfile::tempdir().unwrap();
+    let (registry, first) = prepared_loss(dir.path()).await;
+    let second = prepare_loss_in(&registry, dir.path()).await;
+    let backend = std::sync::Arc::new(CleanupBackend::default());
+    let supervisor = cleanup_supervisor(registry, dir.path(), backend.clone());
+    let obstructed = dir
+        .path()
+        .join("incidents")
+        .join(format!("{}.open.json", first.certificate.incident_id));
+    fs::create_dir_all(&obstructed).unwrap();
+    supervisor.reconcile_pending_loss_cleanup().await.unwrap();
+    assert_eq!(backend.stopped.lock().unwrap().len(), 2);
+    let pending = supervisor
+        .registry()
+        .pending_incident_exports(100)
+        .await
+        .unwrap();
+    assert!(!pending.is_empty());
+    assert!(pending
+        .iter()
+        .all(|e| e.incident_id == first.certificate.incident_id));
+    assert!(dir
+        .path()
+        .join("incidents")
+        .join(format!("{}.closed.json", second.certificate.incident_id))
+        .exists());
+    fs::remove_dir(obstructed).unwrap();
+    supervisor.reconcile_pending_loss_cleanup().await.unwrap();
+    assert!(supervisor
+        .registry()
+        .pending_incident_exports(100)
+        .await
+        .unwrap()
+        .is_empty());
+    assert_eq!(backend.stopped.lock().unwrap().len(), 2);
+}
+
+#[test]
+fn old_enriched_incident_analysis_still_round_trips() {
+    let old = serde_json::json!({
+        "observedCause": "missing", "missingInvariant": "history",
+        "hypotheses": ["disk corruption"], "preventiveAction": "backup",
+        "regressionCase": "known-regression"
+    });
+    let parsed: IncidentAnalysis = serde_json::from_value(old.clone()).unwrap();
+    assert_eq!(serde_json::to_value(parsed).unwrap(), old);
 }

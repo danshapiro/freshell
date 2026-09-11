@@ -358,15 +358,15 @@ async function gate06CleanupAndExportFailuresStayHonest(h: RuntimeHarness): Prom
     h.recoverBody(soul.soulId, 'provider_exit', await epoch(h, supervisor)),
     { requestId: newRequest() },
   )
-  h.assert(caseId, firstReply.result?.Err?.code === 'INCIDENT_PERSISTENCE_FAILED', 'incident artifact failure blocks before destructive cleanup', firstReply)
+  h.assert(caseId, firstReply.result?.Ok?.kind === 'recovery', 'secondary export failure does not veto the durable cleanup attempt', firstReply)
   const pendingView = latestSoul((await inventorySnapshot(h, supervisor)).souls, soul.soulId)
   const incidentId = pendingView?.incidentId
   h.assert(caseId, typeof incidentId === 'string' && incidentId.startsWith('incident-'), 'durable registry exposes the exact pending incident identity after export failure', pendingView)
-  h.assert(caseId, pendingView.cleanupState === 'requested', 'export failure leaves exact cleanup pending rather than claiming an attempt', pendingView)
-  h.assert(caseId, h.isContainerRunning(soul.containerId), 'incident export failure sends no destructive signal to the owned enclosure')
+  h.assert(caseId, pendingView.cleanupState === 'termination_unconfirmed', 'cleanup failure remains independently visible despite export failure', pendingView)
+  h.assert(caseId, h.isContainerRunning(soul.containerId), 'injected backend failure leaves the owned enclosure running')
   const pendingIncident = await incidentSummary(h, supervisor, incidentId)
-  h.assert(caseId, pendingIncident.state === 'cleanup_pending' && !pendingIncident.cleanup.verifiedEmpty, 'open incident and outbox survive while cleanup is fail-closed', pendingIncident)
-  h.assert(caseId, (await pendingNotices(h, supervisor)).length === 0, 'no cleanup notice is fabricated before any cleanup attempt')
+  h.assert(caseId, pendingIncident.state === 'cleanup_failed' && !pendingIncident.cleanup.verifiedEmpty, 'database retains truthful cleanup failure while secondary export is pending', pendingIncident)
+  h.assert(caseId, (await pendingNotices(h, supervisor)).every((notice: any) => notice.kind === 'cleanup_failed'), 'export failure never suppresses a truthful failure notice or fabricates success')
   const pendingExportBefore = listIncidentFiles(h, supervisor, incidentId)
   h.assert(caseId, pendingExportBefore.length === 0, 'injected export failure leaves filesystem artifact pending rather than fabricating one', pendingExportBefore)
 

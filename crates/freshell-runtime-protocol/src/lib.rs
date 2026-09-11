@@ -453,10 +453,13 @@ pub struct LossCleanupReport {
 #[serde(rename_all = "camelCase")]
 pub struct IncidentAnalysis {
     pub observed_cause: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub missing_invariant: String,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub hypotheses: Vec<String>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub preventive_action: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub regression_case: String,
 }
 

@@ -898,15 +898,14 @@ impl Supervisor {
                 provider => format!("unreported-{provider}"),
             });
         let now = freshell_runtime_observability::now_rfc3339_millis();
+        // Record observations, not a generated postmortem. Root cause and
+        // prevention can be added later; neither authorizes destructive work.
         let analysis = IncidentAnalysis {
             observed_cause: "all_applicable_recovery_paths_definitively_unavailable".into(),
-            missing_invariant: "no live enclosure, readable native store, verified checkpoint, or pristine never-dispatched seed remained".into(),
-            hypotheses: vec![
-                "provider state was removed or became irreversibly inconsistent".into(),
-                "the runtime exited after its last durable recovery artifact disappeared".into(),
-            ],
-            preventive_action: "retain and continuously verify at least one independent native-store or checkpoint recovery artifact".into(),
-            regression_case: "P5-G02".into(),
+            missing_invariant: String::new(),
+            hypotheses: Vec::new(),
+            preventive_action: String::new(),
+            regression_case: String::new(),
         };
         let decision = match LostDecision::try_new(LossDecisionInput {
             installation_id: self.registry.installation_id(),
@@ -1015,8 +1014,6 @@ impl Supervisor {
             }),
         );
         crate::service::crash_if("after_loss_incident_commit");
-        self.export_pending_incidents().await?;
-
         let preexisting_empty = self
             .backend
             .verify_empty(&prepared.handle)
@@ -1051,7 +1048,7 @@ impl Supervisor {
             .await
             .map_err(map_registry)?;
         crate::service::crash_if("after_loss_finalize_before_export");
-        self.export_pending_incidents().await?;
+        self.export_pending_incidents().await;
         crate::service::append_event(
             &self.config.lifecycle_log,
             "supervisor.loss.finalized",
@@ -1351,7 +1348,6 @@ impl Supervisor {
     /// crash. The incident row and exact cleanup capability were committed
     /// together, so this never discovers authority from Docker-wide state.
     pub async fn reconcile_pending_loss_cleanup(&self) -> Result<(), RuntimeError> {
-        self.export_pending_incidents().await?;
         let incidents = self
             .registry
             .unresolved_loss_incident_ids()
@@ -1407,11 +1403,14 @@ impl Supervisor {
                 }),
             );
         }
-        self.export_pending_incidents().await?;
+        self.export_pending_incidents().await;
         Ok(())
     }
 
-    pub(crate) async fn export_pending_incidents(&self) -> Result<(), RuntimeError> {
+    /// The registry/outbox is already authoritative and durable. Secondary
+    /// file exports are bounded retries, never authority to stop (or veto a
+    /// stop). Keep failed rows pending and preserve ordering within an incident.
+    pub(crate) async fn export_pending_incidents(&self) {
         let exports = match self.registry.pending_incident_exports(100).await {
             Ok(exports) => exports,
             Err(error) => {
@@ -1420,17 +1419,18 @@ impl Supervisor {
                     "supervisor.loss.export_queue_read_failed",
                     serde_json::json!({"error": error.to_string()}),
                 );
-                return Err(RuntimeError::new(
-                    RuntimeErrorCode::IncidentPersistenceFailed,
-                    "durable incident export queue is unavailable",
-                ));
+                return;
             }
         };
         let exporter = IncidentExporter::new(
             self.registry.registry_root().join("incidents"),
             self.config.control_secret.clone(),
         );
+        let mut failed_incidents = std::collections::HashSet::new();
         for event in exports {
+            if failed_incidents.contains(&event.incident_id) {
+                continue;
+            }
             #[cfg(feature = "runtime-test-faults")]
             let injected_export_failure = std::env::var("FRESHELL_RUNTIME_INCIDENT_EXPORT_FAIL")
                 .ok()
@@ -1464,6 +1464,7 @@ impl Supervisor {
                         .acknowledge_incident_export(event.event_id.clone())
                         .await
                     {
+                        failed_incidents.insert(event.incident_id.clone());
                         crate::service::append_event(
                             &self.config.lifecycle_log,
                             "supervisor.loss.export_ack_failed",
@@ -1476,10 +1477,9 @@ impl Supervisor {
                     }
                 }
                 Err(error) => {
-                    // The SQLite incident/export intent is already durable,
-                    // but destructive cleanup remains blocked until the
-                    // private atomic incident artifact also reaches disk.
-                    // Leave the outbox row pending for startup reconciliation.
+                    // SQLite retains the incident and export intent. Keep this
+                    // row pending; unrelated incidents may still be exported.
+                    failed_incidents.insert(event.incident_id.clone());
                     eprintln!(
                         "Freshell loss incident export pending for {}: {}",
                         event.incident_id, error
@@ -1493,14 +1493,9 @@ impl Supervisor {
                             "retryPending": true,
                         }),
                     );
-                    return Err(RuntimeError::new(
-                        RuntimeErrorCode::IncidentPersistenceFailed,
-                        "durable incident artifact could not be persisted before cleanup",
-                    ));
                 }
             }
         }
-        Ok(())
     }
 
     async fn replay_queued_inputs(
