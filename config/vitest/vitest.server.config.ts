@@ -32,6 +32,8 @@ export default defineConfig({
       'test/unit/server/**/*.test.ts',
       'test/unit/visible-first/**/*.test.ts',
       'test/integration/server/**/*.test.ts',
+      'test/e2e/agent-cli-flow.test.ts',
+      'test/e2e/agent-cli-screenshot-smoke.test.ts',
       'test/integration/real/**/*.test.ts',
       'test/integration/session-repair.test.ts',
       'test/integration/session-search-e2e.test.ts',

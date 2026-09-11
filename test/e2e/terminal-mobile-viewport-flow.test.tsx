@@ -23,7 +23,7 @@ vi.mock('@/components/terminal/terminal-runtime', () => ({
 }))
 
 vi.mock('@xterm/xterm', () => ({
-  Terminal: vi.fn().mockImplementation(() => ({
+  Terminal: vi.fn().mockImplementation(function () { return {
     open: vi.fn(),
     onData: vi.fn(() => ({ dispose: vi.fn() })),
     onTitleChange: vi.fn(() => ({ dispose: vi.fn() })),
@@ -37,7 +37,7 @@ vi.mock('@xterm/xterm', () => ({
     cols: 80,
     rows: 24,
     options: {},
-  })),
+  } }),
 }))
 
 vi.mock('@/lib/ws-client', () => ({

@@ -171,6 +171,18 @@ describe('vitest config', () => {
     expect(excluded).toContain('test/integration/real/**')
   })
 
+  it('keeps Node-only CLI flows and live oracle suites out of the browser transform', async () => {
+    const client = (await import('../../config/vitest/vitest.config.ts')).default
+    const server = (await import('../../config/vitest/vitest.server.config.ts')).default
+    for (const file of ['test/e2e/agent-cli-flow.test.ts', 'test/e2e/agent-cli-screenshot-smoke.test.ts']) {
+      expect(client.test?.exclude).toContain(file)
+      expect(server.test?.include).toContain(file)
+    }
+    expect(client.test?.exclude).toContain('test/integration/port/**')
+    const oracle = (await import('../../config/vitest/vitest.oracle-t2.config.ts')).default
+    expect(oracle.test?.include).toContain('test/integration/port/oracle/**/*.test.ts')
+  })
+
   it('runs real-provider integration contracts in the node server suite', async () => {
     const configModule = await import('../../config/vitest/vitest.server.config.ts')
     const config = configModule.default
