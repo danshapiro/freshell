@@ -8,6 +8,14 @@
 
 **Production readiness (September 9): BLOCKED.** Code and gate harnesses for all five phases are present, and the latest ordinary regression check passes with 11,896 tests passed and 27 optional tests skipped. Exact-resume bootstrap and release-gate integrity fixes are committed. This does **not** establish a production runtime PASS: Claude, Codex, and Amplifier live certification remains pending; the required Docker-backed browser qualification lane needs resolution under the configured cloud-backend policy; and the final clean-candidate cumulative chaos/soak campaign has not been qualified. See [the production-readiness record](freshell-durable-souls-production-readiness.md) for commits, evidence, and remaining ship gates. The acceptance contract below is unchanged.
 
+### Stage 5a amendment (September 11, 2026)
+
+[Stage 5a — feature-preserving runtime simplification](freshell-durable-souls-stage-5a.md)
+supersedes the certification/report-attestation requirements and the requirement
+that secondary incident export succeed before cleanup. Product scope and
+behavioral safeguards remain unchanged; all coding agents remain in scope.
+Authoritative durable cleanup intent is still required before destruction.
+
 ### Outcome
 
 Every Freshell-managed coding agent has a stable logical identity, its own enforced local CPU/memory/process budget, and a runtime independent of the web server. Restarting the web server restores its connection and tabs. When a runtime cannot be reattached, Freshell terminates that exact owned runtime and automatically uses the coding agent's valid recovery path. Only an agent with neither a usable live runtime nor any viable continuity-preserving resurrection path is a **lost soul**. Lost owned processes are reaped, the user receives a brief notice, and durable diagnostic evidence explains the loss and cleanup.
