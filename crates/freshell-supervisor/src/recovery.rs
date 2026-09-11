@@ -9,6 +9,7 @@
 use crate::{
     backend::{BackendError, BackendRuntimeState},
     checkpoints,
+    fresh_agent_control_state::copy_protected_fresh_agent_state,
     loss_report::{
         hash_loss_certificate, path_name, IncidentExporter, LossDecisionInput, LostDecision,
     },
@@ -26,6 +27,7 @@ use freshell_runtime_protocol::{
     RuntimeView, SoulId, StopOutcome, TerminalLaunchSpec, CONTROL_PROTOCOL_VERSION,
 };
 use sha2::{Digest, Sha256};
+use std::fs;
 use tokio::time::{sleep, Duration, Instant};
 
 fn retry_budget_requires_manual_rearm(
@@ -653,6 +655,83 @@ impl Supervisor {
             Err(error) => return Err(map_registry(error)),
         };
 
+        if prepared.fresh_agent.is_some() {
+            let replacement_runtime_dir = match self.ensure_incarnation_dir(&prepared.prepared) {
+                Ok(runtime_dir) => runtime_dir,
+                Err(error) => {
+                    self.registry
+                        .retire_unowned_prepared_replacement(soul_id.clone())
+                        .await
+                        .map_err(map_registry)?;
+                    return self
+                        .blocked_control_state_transfer(
+                            soul_id,
+                            prior_incarnation_id,
+                            prepared.prepared.incarnation_id,
+                            attempt_id,
+                            path,
+                            resume_spec,
+                            error,
+                        )
+                        .await;
+                }
+            };
+            match copy_protected_fresh_agent_state(
+                start.context.prior_handle.runtime_dir(),
+                &replacement_runtime_dir,
+            ) {
+                Ok(true) => crate::service::append_event(
+                    &self.config.lifecycle_log,
+                    "supervisor.recovery.fresh_agent_control_state_transferred",
+                    serde_json::json!({
+                        "soulId": soul_id,
+                        "priorIncarnationId": prior_incarnation_id,
+                        "replacementIncarnationId": prepared.prepared.incarnation_id,
+                    }),
+                ),
+                Ok(false) => {
+                    let error = RuntimeError::new(
+                        RuntimeErrorCode::RegistryFailure,
+                        "prior fresh-agent control state is absent",
+                    );
+                    let _ = fs::remove_dir_all(&replacement_runtime_dir);
+                    self.registry
+                        .retire_unowned_prepared_replacement(soul_id.clone())
+                        .await
+                        .map_err(map_registry)?;
+                    return self
+                        .blocked_control_state_transfer(
+                            soul_id,
+                            prior_incarnation_id,
+                            prepared.prepared.incarnation_id,
+                            attempt_id,
+                            path,
+                            resume_spec,
+                            error,
+                        )
+                        .await;
+                }
+                Err(error) => {
+                    let _ = fs::remove_dir_all(&replacement_runtime_dir);
+                    self.registry
+                        .retire_unowned_prepared_replacement(soul_id.clone())
+                        .await
+                        .map_err(map_registry)?;
+                    return self
+                        .blocked_control_state_transfer(
+                            soul_id,
+                            prior_incarnation_id,
+                            prepared.prepared.incarnation_id,
+                            attempt_id,
+                            path,
+                            resume_spec,
+                            error,
+                        )
+                        .await;
+                }
+            }
+        }
+
         let launch = self
             .activate_prepared(
                 prepared.prepared.clone(),
@@ -834,6 +913,57 @@ impl Supervisor {
             attempt_id: Some(attempt_id),
             expected_native_session_id,
             observed_native_session_id,
+            incident_id: None,
+        })
+    }
+
+    async fn blocked_control_state_transfer(
+        &self,
+        soul_id: SoulId,
+        prior_incarnation_id: freshell_runtime_protocol::IncarnationId,
+        replacement_incarnation_id: freshell_runtime_protocol::IncarnationId,
+        attempt_id: RecoveryAttemptId,
+        path: RecoveryPath,
+        resume_spec: Option<freshell_runtime_protocol::ResumeSpec>,
+        error: RuntimeError,
+    ) -> Result<RecoveryResult, RuntimeError> {
+        let message = "the protected fresh-agent command/approval journal could not be transferred";
+        crate::service::append_event(
+            &self.config.lifecycle_log,
+            "supervisor.recovery.fresh_agent_control_state_transfer_failed",
+            serde_json::json!({
+                "soulId": soul_id,
+                "priorIncarnationId": prior_incarnation_id,
+                "replacementIncarnationId": replacement_incarnation_id,
+                "errorCode": error.code,
+            }),
+        );
+        self.registry
+            .mark_recovery_blocked(
+                soul_id,
+                None,
+                RecoveryBlockReason::StoreUnreadable,
+                vec![message.into()],
+            )
+            .await
+            .map_err(map_registry)?;
+        Ok(RecoveryResult {
+            outcome: RecoveryOutcome::Blocked,
+            view: self
+                .view_for_or_prior(&replacement_incarnation_id, &prior_incarnation_id)
+                .await?,
+            probe: Some(blocked(
+                path,
+                RecoveryBlockReason::StoreUnreadable,
+                message,
+                None,
+            )),
+            prior_incarnation_id: Some(prior_incarnation_id),
+            attempt_id: Some(attempt_id),
+            expected_native_session_id: resume_spec
+                .as_ref()
+                .map(|spec| spec.provider_session.native_session_id.clone()),
+            observed_native_session_id: None,
             incident_id: None,
         })
     }

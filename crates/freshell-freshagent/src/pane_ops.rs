@@ -231,6 +231,8 @@ pub(crate) async fn split_pane(
                 model: model.clone(),
                 effort: effort.clone(),
                 native_session_id,
+                preferred_tab_id: tab_id.clone(),
+                preferred_pane_id: new_pane_id.clone(),
             })
             .await
         {

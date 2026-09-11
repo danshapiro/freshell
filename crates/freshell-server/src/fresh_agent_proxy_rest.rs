@@ -10,6 +10,9 @@ impl HostedFreshAgentRestGateway for HostedFreshAgentProxy {
     ) -> Result<HostedRestCreated, ()> {
         let (provider, session_type) =
             rest_agent_identity(&request.provider, &request.session_type)?;
+        let runtime_provider = fresh_provider(&Some(provider.clone()), session_type).ok_or(())?;
+        let preferred_tab_id = request.preferred_tab_id;
+        let preferred_pane_id = request.preferred_pane_id;
         let message = freshell_protocol::FreshAgentCreate {
             request_id: request.request_id,
             session_type,
@@ -27,21 +30,21 @@ impl HostedFreshAgentRestGateway for HostedFreshAgentProxy {
                 provider: provider_wire(&provider),
                 session_id,
             }),
-            tab_id: None,
+            tab_id: Some(preferred_tab_id.clone()),
         };
         let session_id = message
             .session_ref
             .as_ref()
             .map(|value| value.session_id.clone())
-            .unwrap_or_else(|| {
-                format!(
-                    "managed-{}-{}",
-                    request.provider,
-                    stable_hex(&message.request_id)
-                )
-            });
-        self.create(message).await?;
+            .unwrap_or_else(|| managed_public_session_id(&runtime_provider, &message.request_id));
+        self.create_with_view(message, Some(preferred_tab_id), Some(preferred_pane_id))
+            .await?;
         Ok(HostedRestCreated { session_id })
+    }
+
+    async fn resolve_pane(&self, pane_id: &str) -> Result<Option<HostedRestPane>, ()> {
+        let snapshot = self.client.inventory_snapshot().await.map_err(|_| ())?;
+        Ok(hosted_rest_pane_from_snapshot(&snapshot, pane_id))
     }
 
     async fn send_agent(&self, request: HostedRestSend) -> Result<HostedRestSendResult, ()> {
@@ -55,12 +58,18 @@ impl HostedFreshAgentRestGateway for HostedFreshAgentProxy {
             .client
             .fresh_agent_events(soul.clone(), 0, 1)
             .await
-            .map_err(|_| ())?;
-        let request_id = RequestId::parse(request.request_id).map_err(|_| ())?;
+            .map_err(|error| {
+                tracing::warn!(%error, %soul, "managed fresh-agent REST pre-send event read failed");
+            })?;
+        let request_id = RequestId::parse(request.request_id).map_err(|error| {
+            tracing::warn!(%error, %soul, "managed fresh-agent REST request id was invalid");
+        })?;
         self.client
-            .fresh_agent_send(request_id, soul.clone(), request.text, None)
+            .fresh_agent_send(request_id.clone(), soul.clone(), request.text, None)
             .await
-            .map_err(|_| ())?;
+            .map_err(|error| {
+                tracing::warn!(%error, %soul, %request_id, "managed fresh-agent REST send failed");
+            })?;
         let completed = wait_for_completion(
             &self.client,
             soul,

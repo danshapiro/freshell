@@ -386,7 +386,7 @@ async function qualifyProvider(
   if (!afterHostLoss.containerId) throw new Error('host-loss replacement has no owned container')
   const pid = workerPid(rig, afterHostLoss)
   expect(pid).toBeGreaterThan(1)
-  rig.runtime.killOwnedRuntimePidExact(afterHostLoss.containerId, pid)
+  rig.runtime.killOwnedRuntimePidExact(afterHostLoss.containerId, pid, [definition.processBinary])
   const afterProviderLoss = await waitForReplacement(rig, created.terminalId, afterHostLoss.incarnationId)
   expect(afterProviderLoss.soulId).toBe(created.view.soulId)
   expect(afterProviderLoss.nativeSessionId).toBe(nativeSessionId)

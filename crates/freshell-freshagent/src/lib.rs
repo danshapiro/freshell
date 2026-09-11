@@ -1962,6 +1962,7 @@ async fn create_hosted_agent_tab(
     native_session_id: Option<String>,
 ) -> Response {
     let request_id = Uuid::new_v4().simple().to_string();
+    let (tab_id, pane_id) = state.layout.create_tab(name.as_deref());
     let created = match gateway
         .create_agent(hosted_rest::HostedRestCreate {
             request_id: request_id.clone(),
@@ -1971,18 +1972,20 @@ async fn create_hosted_agent_tab(
             model: model.clone(),
             effort: effort.clone(),
             native_session_id,
+            preferred_tab_id: tab_id.clone(),
+            preferred_pane_id: pane_id.clone(),
         })
         .await
     {
         Ok(created) => created,
         Err(()) => {
+            let _ = state.layout.close_tab(&tab_id);
             return fail_json(
                 StatusCode::SERVICE_UNAVAILABLE,
                 "durable fresh-agent host could not be created".to_string(),
-            )
+            );
         }
     };
-    let (tab_id, pane_id) = state.layout.create_tab(name.as_deref());
     let mut pane_content = json!({
         "kind": "fresh-agent",
         "sessionType": session_type,
@@ -2021,6 +2024,71 @@ async fn create_hosted_agent_tab(
         json!({"tabId":tab_id,"paneId":pane_id,"sessionId":created.session_id}),
         "fresh-agent pane created",
     )
+}
+
+impl FreshAgentState {
+    /// Rebuild the REST/MCP pane reverse indexes from a supervisor-owned view.
+    /// This is idempotent and performs no provider launch.
+    pub fn restore_hosted_rest_pane(
+        &self,
+        pane: hosted_rest::HostedRestPane,
+    ) -> Result<(), &'static str> {
+        let pane_content = json!({
+            "kind":"fresh-agent",
+            "sessionType":pane.session_type,
+            "provider":pane.provider,
+            "sessionId":pane.session_id,
+            "createRequestId":format!("managed-restored-{}", pane.pane_id),
+            "status":"connected",
+        });
+        self.layout.ensure_managed_tab_pane(
+            &pane.tab_id,
+            &pane.pane_id,
+            pane.title.as_deref(),
+            pane_content.clone(),
+        )?;
+        register_fresh_agent_tab(
+            self,
+            &pane.tab_id,
+            &pane.pane_id,
+            pane.title.as_deref(),
+            &pane_content,
+            PaneEntry {
+                placeholder_id: pane.session_id.clone(),
+                provider: pane.provider,
+                session_type: pane.session_type,
+                cwd: None,
+                model: None,
+                effort: None,
+                durable_id: Some(pane.session_id),
+            },
+        );
+        Ok(())
+    }
+}
+
+async fn resolve_or_restore_hosted_pane(
+    state: &FreshAgentState,
+    pane_id: &str,
+) -> Option<PaneEntry> {
+    if let Some(pane) = state
+        .panes
+        .lock()
+        .expect("panes mutex")
+        .get(pane_id)
+        .cloned()
+    {
+        return Some(pane);
+    }
+    let gateway = state.hosted_rest_gateway()?;
+    let pane = gateway.resolve_pane(pane_id).await.ok().flatten()?;
+    state.restore_hosted_rest_pane(pane).ok()?;
+    state
+        .panes
+        .lock()
+        .expect("panes mutex")
+        .get(pane_id)
+        .cloned()
 }
 
 /// The registration every fresh-agent pane-minting path needs: attach the pane
@@ -2415,13 +2483,7 @@ async fn send_keys(
         return fail_json(StatusCode::BAD_REQUEST, "text is required".to_string());
     }
 
-    let pane = match state
-        .panes
-        .lock()
-        .expect("panes mutex")
-        .get(&pane_id)
-        .cloned()
-    {
+    let pane = match resolve_or_restore_hosted_pane(&state, &pane_id).await {
         Some(pane) => pane,
         None => return fail_json(StatusCode::NOT_FOUND, "pane not found".to_string()),
     };
@@ -2692,13 +2754,7 @@ async fn capture(
         return resp;
     }
 
-    let pane = match state
-        .panes
-        .lock()
-        .expect("panes mutex")
-        .get(&pane_id)
-        .cloned()
-    {
+    let pane = match resolve_or_restore_hosted_pane(&state, &pane_id).await {
         Some(pane) => pane,
         None => {
             // Layout-only panes (e.g. a legacy `agent-chat` pane normalized to

@@ -1,6 +1,7 @@
 pub mod admission;
 pub mod backend;
 pub mod checkpoints;
+mod fresh_agent_control_state;
 pub mod inventory;
 pub mod limits;
 pub mod loss_report;

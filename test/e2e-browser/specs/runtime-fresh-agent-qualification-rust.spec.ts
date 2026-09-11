@@ -32,14 +32,15 @@ type Definition = {
   effort: string
   versionCommand: string[]
   processPattern: RegExp
+  processIdentityFragments: string[]
   pendingApproval: boolean
 }
 
 const DEFINITIONS: Record<QualifiableFreshAgentMode, Definition> = {
-  freshclaude: { mode: 'freshclaude', agent: 'claude', provider: 'claude', version: '2.1.263', model: 'haiku', effort: 'low', versionCommand: ['claude', '--version'], processPattern: /(?:^|\s)claude(?:$|\s)/m, pendingApproval: true },
-  kilroy: { mode: 'kilroy', agent: 'kilroy', provider: 'claude', version: '2.1.263', model: 'haiku', effort: 'low', versionCommand: ['claude', '--version'], processPattern: /(?:^|\s)claude(?:$|\s)/m, pendingApproval: true },
-  freshcodex: { mode: 'freshcodex', agent: 'codex', provider: 'codex', version: '0.147.0', model: 'gpt-5.6-luna', effort: 'low', versionCommand: ['codex', '--version'], processPattern: /codex.*app-server|app-server.*codex/m, pendingApproval: false },
-  freshopencode: { mode: 'freshopencode', agent: 'opencode', provider: 'opencode', version: '1.18.21', model: 'opencode/big-pickle', effort: 'provider-default', versionCommand: ['opencode', '--version'], processPattern: /opencode.*serve/m, pendingApproval: false },
+  freshclaude: { mode: 'freshclaude', agent: 'claude', provider: 'claude', version: '2.1.263', model: 'haiku', effort: 'low', versionCommand: ['claude', '--version'], processPattern: /(?:^|\s)claude(?:$|\s)/m, processIdentityFragments: ['claude'], pendingApproval: true },
+  kilroy: { mode: 'kilroy', agent: 'kilroy', provider: 'claude', version: '2.1.263', model: 'haiku', effort: 'low', versionCommand: ['claude', '--version'], processPattern: /(?:^|\s)claude(?:$|\s)/m, processIdentityFragments: ['claude'], pendingApproval: true },
+  freshcodex: { mode: 'freshcodex', agent: 'codex', provider: 'codex', version: '0.147.0', model: 'gpt-5.6-luna', effort: 'low', versionCommand: ['codex', '--version'], processPattern: /codex.*app-server|app-server.*codex/m, processIdentityFragments: ['codex', 'app-server'], pendingApproval: false },
+  freshopencode: { mode: 'freshopencode', agent: 'opencode', provider: 'opencode', version: '1.18.21', model: 'opencode/big-pickle', effort: 'provider-default', versionCommand: ['opencode', '--version'], processPattern: /opencode.*serve/m, processIdentityFragments: ['opencode', 'serve'], pendingApproval: false },
 }
 
 function selectedDefinitions(): Definition[] {
@@ -178,7 +179,7 @@ async function qualify(
   expect(rig.runtime.isContainerRunning(initial.containerId)).toBe(false)
 
   const childPid = providerPid(rig.ownedContainerProcessTable(afterHost.containerId), definition.processPattern)
-  rig.runtime.killOwnedRuntimePidExact(afterHost.containerId, childPid)
+  rig.runtime.killOwnedRuntimePidExact(afterHost.containerId, childPid, definition.processIdentityFragments)
   const afterProvider = await replacement(rig, sessionId, afterHost.incarnationId)
   expect(afterProvider.nativeSessionId).toBe(nativeSessionId)
   const claim = await rig.qualificationWriterClaim({

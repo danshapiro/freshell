@@ -1179,3 +1179,71 @@ fn update_from_ui_migrates_legacy_agent_chat_and_fresh_agent_content() {
     assert!(p.get("sessionRef").is_none());
     assert!(p.get("resumeSessionId").is_none());
 }
+
+#[test]
+fn restores_an_exact_managed_tab_and_pane_after_web_replacement() {
+    let store = LayoutStore::default();
+    let content = json!({
+        "kind":"fresh-agent", "provider":"claude", "sessionType":"freshclaude",
+        "sessionId":"managed-claude-session", "status":"connected"
+    });
+    store
+        .ensure_managed_tab_pane(
+            "tab-managed",
+            "pane-managed",
+            Some("Claude agent"),
+            content.clone(),
+        )
+        .unwrap();
+    let pane = store.get_pane_snapshot("pane-managed").unwrap();
+    assert_eq!(pane.tab_id, "tab-managed");
+    assert_eq!(pane.pane_content, Some(content.clone()));
+
+    // Idempotent startup/lazy repair updates the same pane, never duplicates it.
+    let updated = json!({
+        "kind":"fresh-agent", "provider":"claude", "sessionType":"freshclaude",
+        "sessionId":"managed-claude-session", "status":"recovering"
+    });
+    store
+        .ensure_managed_tab_pane(
+            "tab-managed",
+            "pane-managed",
+            Some("Claude agent"),
+            updated.clone(),
+        )
+        .unwrap();
+    assert_eq!(store.list_panes(Some("tab-managed")).unwrap().len(), 1);
+    assert_eq!(
+        store
+            .get_pane_snapshot("pane-managed")
+            .unwrap()
+            .pane_content,
+        Some(updated)
+    );
+}
+
+#[test]
+fn exact_managed_pane_restore_refuses_id_collisions() {
+    let store = LayoutStore::default();
+    store
+        .ensure_managed_tab_pane(
+            "tab-one",
+            "pane-shared",
+            None,
+            json!({"kind":"fresh-agent"}),
+        )
+        .unwrap();
+    assert_eq!(
+        store.ensure_managed_tab_pane(
+            "tab-two",
+            "pane-shared",
+            None,
+            json!({"kind":"fresh-agent"})
+        ),
+        Err("managed pane id is already attached to another tab")
+    );
+    assert_eq!(
+        store.ensure_managed_tab_pane("tab-one", "pane-other", None, json!({"kind":"fresh-agent"})),
+        Err("managed tab id already has different pane content")
+    );
+}

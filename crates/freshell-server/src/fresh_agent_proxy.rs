@@ -5,7 +5,7 @@
 
 use freshell_freshagent::hosted_rest::{
     HostedFreshAgentRestGateway, HostedRestCapture, HostedRestCaptureError,
-    HostedRestCaptureResult, HostedRestCreate, HostedRestCreated, HostedRestSend,
+    HostedRestCaptureResult, HostedRestCreate, HostedRestCreated, HostedRestPane, HostedRestSend,
     HostedRestSendResult,
 };
 use freshell_protocol::{
@@ -16,8 +16,8 @@ use freshell_runtime_client::RuntimeClient;
 use freshell_runtime_protocol::{
     AgentEvent, DesiredState, FreshAgentFixtureTransport, FreshAgentLaunchSpec,
     FreshAgentRollbackDirection, FreshAgentRollbackMode, FreshProvider, LaunchRequest,
-    ProviderBootstrapFile, RequestId, RuntimeErrorCode, RuntimeLimits, RuntimeProfile, SoulId,
-    StopOutcome, ViewIntentKind, ViewIntentRequest, ViewVisibilityIntent,
+    ProviderBootstrapFile, RequestId, RuntimeErrorCode, RuntimeInventorySnapshot, RuntimeLimits,
+    RuntimeProfile, SoulId, StopOutcome, ViewIntentKind, ViewIntentRequest, ViewVisibilityIntent,
 };
 use freshell_ws::hosted_fresh_agent::{HostedFreshAgentCommand, HostedFreshAgentGateway};
 use sha2::{Digest, Sha256};
@@ -323,6 +323,16 @@ impl HostedFreshAgentProxy {
         self: &Arc<Self>,
         message: freshell_protocol::FreshAgentCreate,
     ) -> Result<(), ()> {
+        let preferred_tab_id = message.tab_id.clone();
+        self.create_with_view(message, preferred_tab_id, None).await
+    }
+
+    async fn create_with_view(
+        self: &Arc<Self>,
+        message: freshell_protocol::FreshAgentCreate,
+        preferred_tab_id: Option<String>,
+        preferred_pane_id: Option<String>,
+    ) -> Result<(), ()> {
         let provider = fresh_provider(&message.provider, message.session_type).ok_or(())?;
         let public_provider = fresh_provider_wire(&provider);
         if let Some(session_ref) = message.session_ref.as_ref() {
@@ -386,13 +396,7 @@ impl HostedFreshAgentProxy {
             .session_ref
             .as_ref()
             .map(|value| value.session_id.clone())
-            .unwrap_or_else(|| {
-                format!(
-                    "managed-{}-{}",
-                    provider.as_str(),
-                    stable_hex(&message.request_id)
-                )
-            });
+            .unwrap_or_else(|| managed_public_session_id(&provider, &message.request_id));
         let native_session_id = message
             .session_ref
             .as_ref()
@@ -446,8 +450,8 @@ impl HostedFreshAgentProxy {
                 owner_id: String::new(),
                 workspace_id: project_key,
                 kind: ViewIntentKind::AutomaticPrimary,
-                preferred_tab_id: message.tab_id.clone(),
-                preferred_pane_id: None,
+                preferred_tab_id,
+                preferred_pane_id,
                 title: Some(format!("{} agent", provider.as_str())),
                 placement_group: None,
                 visibility: ViewVisibilityIntent::Visible,
@@ -472,6 +476,35 @@ impl HostedFreshAgentProxy {
             session_type,
         )
         .await;
+        Ok(())
+    }
+
+    pub(crate) async fn restore_rest_state(
+        self: &Arc<Self>,
+        state: &freshell_freshagent::FreshAgentState,
+    ) -> Result<(), String> {
+        let snapshot = self.client.inventory_snapshot().await.map_err(|error| {
+            format!("managed fresh-agent inventory restoration failed: {error}")
+        })?;
+        for restored in hosted_rest_panes_from_snapshot(&snapshot) {
+            state
+                .restore_hosted_rest_pane(restored.pane.clone())
+                .map_err(|error| format!("managed fresh-agent pane restoration failed: {error}"))?;
+            self.aliases.lock().await.insert(
+                (
+                    restored.pane.provider.clone(),
+                    restored.pane.session_id.clone(),
+                ),
+                restored.soul_id.clone(),
+            );
+            self.start_poller(
+                restored.soul_id,
+                restored.pane.provider,
+                restored.pane.session_id,
+                restored.pane.session_type,
+            )
+            .await;
+        }
         Ok(())
     }
 
@@ -997,6 +1030,71 @@ fn rewrite_presentation_id(payload: &mut serde_json::Value, presentation_id: &st
 
 fn stable_hex(value: &str) -> String {
     format!("{:x}", Sha256::digest(value.as_bytes()))[..32].to_string()
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ResolvedHostedRestPane {
+    soul_id: SoulId,
+    pane: HostedRestPane,
+}
+
+fn hosted_rest_panes_from_snapshot(
+    snapshot: &RuntimeInventorySnapshot,
+) -> Vec<ResolvedHostedRestPane> {
+    snapshot
+        .view_intents
+        .iter()
+        .filter(|intent| intent.visibility == ViewVisibilityIntent::Visible)
+        .filter_map(|intent| hosted_rest_pane_for_intent(snapshot, intent))
+        .collect()
+}
+
+fn hosted_rest_pane_from_snapshot(
+    snapshot: &RuntimeInventorySnapshot,
+    pane_id: &str,
+) -> Option<HostedRestPane> {
+    snapshot
+        .view_intents
+        .iter()
+        .filter(|intent| intent.visibility == ViewVisibilityIntent::Visible)
+        .filter(|intent| intent.preferred_pane_id == pane_id)
+        .filter_map(|intent| hosted_rest_pane_for_intent(snapshot, intent))
+        .next()
+        .map(|restored| restored.pane)
+}
+
+fn hosted_rest_pane_for_intent(
+    snapshot: &RuntimeInventorySnapshot,
+    intent: &freshell_runtime_protocol::ViewIntent,
+) -> Option<ResolvedHostedRestPane> {
+    let view = snapshot.souls.iter().rev().find(|view| {
+        view.soul_id == intent.soul_id
+            && view.desired_state == DesiredState::Running
+            && view.fresh_agent_session_id.is_some()
+            && view.fresh_agent_session_type.is_some()
+    })?;
+    let runtime_provider = match view.provider.as_deref()? {
+        "claude" => FreshProvider::Claude,
+        "kilroy" => FreshProvider::Kilroy,
+        "codex" => FreshProvider::Codex,
+        "opencode" => FreshProvider::Opencode,
+        _ => return None,
+    };
+    Some(ResolvedHostedRestPane {
+        soul_id: view.soul_id.clone(),
+        pane: HostedRestPane {
+            tab_id: intent.preferred_tab_id.clone(),
+            pane_id: intent.preferred_pane_id.clone(),
+            session_id: view.fresh_agent_session_id.clone()?,
+            provider: fresh_provider_wire(&runtime_provider).into(),
+            session_type: view.fresh_agent_session_type.clone()?,
+            title: Some(intent.title.clone()),
+        },
+    })
+}
+
+fn managed_public_session_id(provider: &FreshProvider, request_id: &str) -> String {
+    format!("managed-{}-{}", provider.as_str(), stable_hex(request_id))
 }
 
 fn stable_soul_id(provider: &str, request_id: &str) -> Result<SoulId, String> {

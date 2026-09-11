@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { parseVerificationArgs, verificationSteps, playwrightFailure, verificationOutcome, playwrightReportEnvironment } from '../../../../scripts/testing/runtime-verify.js'
+import { parseVerificationArgs, verificationSteps, playwrightFailure, verificationOutcome, playwrightReportEnvironment, verificationStepEnvironment } from '../../../../scripts/testing/runtime-verify.js'
 
 describe('direct runtime verification', () => {
   it('keeps every implemented terminal provider and fresh mode in the live matrix', () => {
@@ -22,6 +22,18 @@ describe('direct runtime verification', () => {
       expect(() => parseVerificationArgs(args)).toThrow()
     }
   })
+
+  it('lets focused provider and fresh-mode selection override the full-matrix default without changing the local lane', () => {
+    const provider = verificationSteps({ only: ['managed-provider-qualification'] })[0]
+    const env = verificationStepEnvironment(provider, {
+      FRESHELL_RUNTIME_MANAGED_PROVIDER_QUALIFICATION_PROVIDERS: 'claude',
+    }, '/tmp/provider.json')
+    expect(env.FRESHELL_RUNTIME_MANAGED_PROVIDER_QUALIFICATION_PROVIDERS).toBe('claude')
+    expect(env.FRESHELL_E2E_BACKEND).toBe('local')
+    expect(() => verificationStepEnvironment(provider, { FRESHELL_E2E_BACKEND: 'cloud' }, '/tmp/bad.json'))
+      .toThrow(/unsupported verification override/i)
+  })
+
   it('never mistakes an empty, skipped, flaky, or failed Playwright selection for coverage', () => {
     expect(playwrightFailure({ stats: { expected: 2, unexpected: 0, skipped: 0, flaky: 0 } })).toBeNull()
     for (const report of [undefined, {}, { stats: { expected: 0, unexpected: 0, skipped: 0, flaky: 0 } }, { stats: { expected: 2, unexpected: 0, skipped: 1, flaky: 0 } }, { stats: { expected: 2, unexpected: 0, skipped: 0, flaky: 1 } }, { stats: { expected: 2, unexpected: 1, skipped: 0, flaky: 0 } }]) {

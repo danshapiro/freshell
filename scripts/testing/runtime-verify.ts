@@ -63,6 +63,29 @@ export function playwrightReportEnvironment(reportFile: string): { PLAYWRIGHT_JS
   return { PLAYWRIGHT_JSON_OUTPUT_FILE: reportFile }
 }
 
+const VERIFICATION_OVERRIDE_KEYS = new Set([
+  'FRESHELL_RUNTIME_MANAGED_PROVIDER_QUALIFICATION_PROVIDERS',
+  'FRESHELL_RUNTIME_FRESH_AGENT_QUALIFICATION_MODES',
+])
+
+export function verificationStepEnvironment(
+  step: VerificationStep,
+  overrides: Record<string, string>,
+  reportFile: string,
+): NodeJS.ProcessEnv {
+  for (const key of Object.keys(overrides)) {
+    if (!VERIFICATION_OVERRIDE_KEYS.has(key)) {
+      throw new Error(`unsupported verification override: ${key}`)
+    }
+  }
+  return {
+    ...process.env,
+    ...step.env,
+    ...overrides,
+    ...playwrightReportEnvironment(reportFile),
+  }
+}
+
 export function playwrightFailure(report: unknown): string | null {
   const stats = (report as { stats?: Record<string, number> } | null)?.stats
   if (!stats || !Number.isSafeInteger(stats.expected) || stats.expected <= 0) return 'Playwright ran no passing tests'
@@ -100,7 +123,7 @@ export async function runVerification(selection: VerificationSelection, override
   for (const step of steps) {
     const log = path.join(root, `${step.id}.log`)
     const reportFile = path.join(root, `${step.id}.playwright.json`)
-    const env = { ...process.env, ...overrides, ...step.env, ...playwrightReportEnvironment(reportFile) }
+    const env = verificationStepEnvironment(step, overrides, reportFile)
     console.log(`RUN ${step.id}: ${log}`)
     let exitCode = 1, error: string|null = null
     try {

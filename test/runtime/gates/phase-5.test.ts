@@ -222,7 +222,7 @@ async function gate04UnknownAndTransientEvidenceBlocks(h: RuntimeHarness): Promi
   const soul = await launchNativeSoul(h, supervisor, caseId, 'unreadable', true)
   await captureResume(h, supervisor, soul, caseId)
   h.execOwnedContainerExact(soul.containerId, ['chmod', '000', '/home/freshell/provider/native-session-state.json'])
-  h.killOwnedRuntimePidExact(soul.containerId, soul.workerPid)
+  h.killOwnedRuntimePidExact(soul.containerId, soul.workerPid, ['worker', '--fixture', 'native_session'])
   const blocked = dataOf(await h.adminOk(
     supervisor,
     h.recoverBody(soul.soulId, 'provider_exit', await epoch(h, supervisor)),
@@ -667,7 +667,7 @@ async function captureResume(
 }
 
 function removeEveryFixtureRecoveryCopy(h: RuntimeHarness, soul: NativeSoul): void {
-  h.killOwnedRuntimePidExact(soul.containerId, soul.workerPid)
+  h.killOwnedRuntimePidExact(soul.containerId, soul.workerPid, ['worker', '--fixture', 'native_session'])
   h.execOwnedContainerExact(soul.containerId, [
     'node', '-e', String.raw`
 const fs = require('node:fs');

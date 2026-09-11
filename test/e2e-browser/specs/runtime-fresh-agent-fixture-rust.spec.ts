@@ -170,7 +170,7 @@ test.describe.serial('managed fresh-agent deterministic fixture', () => {
         rig.ownedContainerProcessTable(codex.view.containerId!),
         'codex',
       )
-      rig.runtime.killOwnedRuntimePidExact(codex.view.containerId!, workerPid)
+      rig.runtime.killOwnedRuntimePidExact(codex.view.containerId!, workerPid, ['fresh-agent-fixture-worker', '--provider', 'codex'])
       const recoveredCodex = await replacement(rig, codex.sessionId, codex.view.incarnationId)
       expect(recoveredCodex.nativeSessionId).toBe(codex.view.nativeSessionId)
       expect(fixtureState(rig, recoveredCodex.containerId!).dispatchCount).toBe(1)
@@ -183,6 +183,25 @@ test.describe.serial('managed fresh-agent deterministic fixture', () => {
         ))
         expect(current.nativeSessionId).toBe(item.view.nativeSessionId)
       }
+    } catch (error) {
+      const inventory = await rig.inventory().catch((inventoryError) => ([{
+        inventoryError: inventoryError instanceof Error ? inventoryError.message : String(inventoryError),
+      }] as any[]))
+      const diagnostics = inventory.map((row: any) => {
+        const containerId = typeof row.containerId === 'string' ? row.containerId : undefined
+        return {
+          view: row,
+          container: containerId ? {
+            running: rig.runtime.isContainerRunning(containerId),
+            logs: rig.runtime.containerLogs(containerId),
+            processes: rig.runtime.isContainerRunning(containerId)
+              ? rig.ownedContainerProcessTable(containerId)
+              : undefined,
+          } : undefined,
+        }
+      })
+      console.error('[fresh-agent-fixture diagnostics]', JSON.stringify(diagnostics, null, 2))
+      throw error
     } finally {
       const cleanup = await rig.stop()
       expect(cleanup.ok, cleanup.errors.join('\n')).toBe(true)

@@ -447,7 +447,7 @@ test.describe.serial('OpenCode provider qualification', () => {
       )
       const workerPid = Number(JSON.parse(fs.readFileSync(hostStatePath, 'utf8')).workerPid)
       expect(workerPid).toBeGreaterThan(1)
-      rig.runtime.killOwnedRuntimePidExact(afterHostCrash.containerId, workerPid)
+      rig.runtime.killOwnedRuntimePidExact(afterHostCrash.containerId, workerPid, ['opencode'])
       const afterProviderCrash = await waitForRunningView(
         rig,
         first.terminalId,

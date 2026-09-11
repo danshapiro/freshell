@@ -541,9 +541,19 @@ async function gate12DoorwayAndSpawnSiteInventory(h: RuntimeHarness): Promise<vo
   }
 
   const managedRuntime = fs.readFileSync(path.join(h.repoRoot, 'crates/freshell-server/src/managed_runtime.rs'), 'utf8')
+  const supervisorInventory = fs.readFileSync(path.join(h.repoRoot, 'crates/freshell-supervisor/src/inventory.rs'), 'utf8')
+  const supervisorRecovery = fs.readFileSync(path.join(h.repoRoot, 'crates/freshell-supervisor/src/recovery.rs'), 'utf8')
   const wsResume = fs.readFileSync(path.join(h.repoRoot, 'crates/freshell-ws/src/resume_validation.rs'), 'utf8')
   const restResume = fs.readFileSync(path.join(h.repoRoot, 'crates/freshell-freshagent/src/terminal_tabs.rs'), 'utf8')
-  h.assert(caseId, managedRuntime.includes('RecoveryTrigger::StartupReconcile') && managedRuntime.includes('RecoveryTrigger::ProviderExit'), 'one managed controller owns startup and exit recovery')
+  h.assert(
+    caseId,
+    supervisorInventory.includes('RecoveryTrigger::StartupReconcile')
+      && supervisorInventory.includes('RecoveryTrigger::ProviderExit')
+      && /pub(?:\(crate\))?\s+async\s+fn\s+recover\s*\(/.test(supervisorRecovery)
+      && /client\s*\.\s*recover\s*\(/.test(managedRuntime)
+      && !managedRuntime.includes('prepare_replacement('),
+    'startup, observer, and web-detected failures converge on the supervisor-owned recovery state machine',
+  )
   h.assert(caseId, wsResume.includes('ResumeIntent::ManagedRecovery') && restResume.includes('ResumeIntent::ManagedRecovery'), 'WS and REST resume callers delegate managed recovery to the shared policy')
   h.assert(caseId, manifest.invariants.managedRecoveryMaySpawnFresh === false, 'manifest forbids fresh-session substitution')
   h.assert(caseId, manifest.invariants.automaticPromptReplay === false, 'manifest forbids ambiguous automatic prompt replay')

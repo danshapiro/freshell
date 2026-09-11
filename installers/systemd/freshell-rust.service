@@ -35,7 +35,12 @@ Type=simple
 # EDIT: absolute path to your freshell checkout (the server loads .env and
 # serves dist/client relative to its cwd).
 WorkingDirectory=%h/code/freshell
-ExecStart=%h/code/freshell/target/release/freshell-server
+# Prepare the immutable managed release before enabling/upgrading this unit:
+#   scripts/launch-rust.sh --prepare-only
+ExecStart=%h/code/freshell/scripts/run-rust-managed.sh --port 3002
+# The supervisor is a deliberately independent process. Stop/restart this unit
+# replaces only the web main process; the wrapper reconnects to the controller.
+KillMode=process
 Environment=PORT=3002
 # AUTH_TOKEN: the server reads it from WorkingDirectory/.env itself
 # (main.rs:76-87). Alternatively make it explicit to systemd:

@@ -267,7 +267,7 @@ test.describe.serial('Phase 5 certified provider loss', () => {
       // Retain only a diagnostic marker; remove OpenCode session DB/artifacts
       // and all Freshell checkpoint copies without reading or mutating host
       // credentials. Then terminate exactly the recorded provider PID.
-      rig.runtime.killOwnedRuntimePidExact(before.containerId, workerPid)
+      rig.runtime.killOwnedRuntimePidExact(before.containerId, workerPid, ['opencode'])
       rig.ownedContainerExec(before.containerId, [
         'node', '-e', String.raw`
 const fs = require('node:fs');

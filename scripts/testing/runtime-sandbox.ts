@@ -40,6 +40,109 @@ export type AdminReply = {
   result: { Ok?: any; Err?: AdminError }
 }
 
+export type ExactProcessSignalOutcome = 'signalled' | 'already_exited'
+
+export function normalizeExpectedProcessFragments(fragments: readonly string[]): string[] {
+  if (fragments.length === 0 || new Set(fragments).size !== fragments.length) {
+    throw new Error('exact runtime process identity requires unique command fragments')
+  }
+  for (const fragment of fragments) {
+    if (fragment.length === 0 || fragment.length > 256 || fragment.trim() !== fragment
+        || [...fragment].some((character) => character < ' ' || character === '\u007f')) {
+      throw new Error('exact runtime process identity fragment is invalid')
+    }
+  }
+  return [...fragments]
+}
+
+const EXACT_PROCESS_SIGNAL_SCRIPT = String.raw`
+const fs = require('node:fs')
+const pid = Number(process.argv[1])
+const signal = process.argv[2]
+const expected = JSON.parse(process.argv[3])
+const expectedUid = Number(process.argv[4])
+const expectedGid = Number(process.argv[5])
+function identity() {
+  try {
+    const stat = fs.readFileSync('/proc/' + pid + '/stat', 'utf8')
+    const close = stat.lastIndexOf(')')
+    if (close < 0) throw new Error('unparseable process stat')
+    const fields = stat.slice(close + 2).trim().split(/\s+/)
+    if (fields.length < 20) throw new Error('short process stat')
+    const args = fs.readFileSync('/proc/' + pid + '/cmdline').toString('utf8').split('\0').filter(Boolean)
+    const status = fs.readFileSync('/proc/' + pid + '/status', 'utf8')
+    const uid = Number(/^Uid:\s+(\d+)/m.exec(status)?.[1])
+    const gid = Number(/^Gid:\s+(\d+)/m.exec(status)?.[1])
+    return { startTimeTicks: fields[19], args, uid, gid }
+  } catch (error) {
+    if (error && (error.code === 'ENOENT' || error.code === 'ESRCH')) return null
+    throw error
+  }
+}
+const before = identity()
+if (!before) {
+  process.stdout.write(JSON.stringify({ outcome: 'already_exited' }))
+  process.exit(0)
+}
+if (before.uid !== expectedUid || before.gid !== expectedGid
+    || !expected.every(fragment => before.args.some(argument => argument.includes(fragment)))) {
+  process.stderr.write('exact runtime process identity mismatch')
+  process.exit(45)
+}
+try {
+  process.kill(pid, 'SIG' + signal)
+  process.stdout.write(JSON.stringify({ outcome: 'signalled' }))
+} catch (error) {
+  if (error && error.code === 'ESRCH') {
+    process.stdout.write(JSON.stringify({ outcome: 'already_exited' }))
+  } else {
+    throw error
+  }
+}
+`
+
+export function exactProcessSignalDockerArgs(
+  containerId: string,
+  pid: number,
+  expected: readonly string[],
+  signal: 'TERM' | 'KILL',
+  runAsUid = 65_534,
+  runAsGid = 0,
+): string[] {
+  if (!/^[0-9a-f]{64}$/.test(containerId)) throw new Error('exact runtime process signal requires a full container id')
+  if (!Number.isSafeInteger(pid) || pid <= 1) throw new Error('exact runtime process signal requires a safe pid')
+  if (!Number.isSafeInteger(runAsUid) || runAsUid <= 0 || runAsUid > 0xffff_ffff
+      || !Number.isSafeInteger(runAsGid) || runAsGid < 0 || runAsGid > 0xffff_ffff) {
+    throw new Error('exact runtime process signal requires a safe provider uid/gid')
+  }
+  return ['exec', '--user', `${runAsUid}:${runAsGid}`, containerId, 'node', '-e', EXACT_PROCESS_SIGNAL_SCRIPT,
+    String(pid), signal, JSON.stringify(normalizeExpectedProcessFragments(expected)),
+    String(runAsUid), String(runAsGid)]
+}
+
+export function classifyExactProcessSignalResult(result: {
+  status: number | null
+  stdout: string
+  stderr: string
+}): ExactProcessSignalOutcome {
+  if (result.status === 45) {
+    throw new Error(result.stderr || 'exact runtime process identity mismatch')
+  }
+  if (result.status !== 0) {
+    throw new Error(result.stderr || `exact runtime process signal exited ${result.status ?? 'without status'}`)
+  }
+  let parsed: { outcome?: unknown }
+  try {
+    parsed = JSON.parse(result.stdout)
+  } catch {
+    throw new Error('exact runtime process signal returned malformed JSON')
+  }
+  if (parsed.outcome !== 'signalled' && parsed.outcome !== 'already_exited') {
+    throw new Error('exact runtime process signal returned a malformed outcome')
+  }
+  return parsed.outcome
+}
+
 export type AssertionRecord = {
   at: string
   caseId: string
@@ -822,22 +925,31 @@ export class RuntimeHarness {
     if (result.status !== 0) throw new Error(result.stderr || `docker kill failed for owned runtime ${containerId}`)
   }
 
-  killOwnedRuntimePidExact(containerId: string, pid: number, signal: 'TERM' | 'KILL' = 'KILL'): void {
+  killOwnedRuntimePidExact(
+    containerId: string,
+    pid: number,
+    expectedCommandFragments: readonly string[],
+    signal: 'TERM' | 'KILL' = 'KILL',
+    runAsUid = 65_534,
+    runAsGid = 0,
+  ): ExactProcessSignalOutcome {
     if (!this.broker.receiptIds().has(containerId)) {
       throw new Error(`refusing to signal a pid in non-receipt container ${containerId}`)
     }
     if (!Number.isSafeInteger(pid) || pid <= 1) {
       throw new Error(`refusing to signal unsafe runtime pid ${pid}`)
     }
-    if (!this.isContainerRunning(containerId)) return
-    const result = spawnSync('docker', ['exec', containerId, 'kill', `-${signal}`, String(pid)], {
-      encoding: 'utf8',
+    const expected = normalizeExpectedProcessFragments(expectedCommandFragments)
+    if (!this.isContainerRunning(containerId)) return 'already_exited'
+    const result = spawnSync('docker', exactProcessSignalDockerArgs(
+      containerId, pid, expected, signal, runAsUid, runAsGid,
+    ), { encoding: 'utf8' })
+    return classifyExactProcessSignalResult({
+      status: result.status,
+      stdout: result.stdout ?? '',
+      stderr: result.stderr ?? '',
     })
-    if (result.status !== 0) {
-      throw new Error(result.stderr || `docker exec kill failed for owned runtime ${containerId} pid ${pid}`)
-    }
   }
-
   execOwnedContainerExact(containerId: string, command: string[]): string {
     if (!this.broker.receiptIds().has(containerId) && !this.trackedContainers.has(containerId)) {
       throw new Error(`refusing to exec non-owned container ${containerId}`)

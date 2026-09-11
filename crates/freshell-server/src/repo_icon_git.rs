@@ -103,9 +103,13 @@ mod tests {
 
     #[test]
     fn no_git_falls_back_to_start() {
-        let tmp = tempfile::tempdir().unwrap();
+        // The configured TMPDIR can itself be a Git worktree on developer
+        // machines. Use the system temporary root for this no-ancestor-repo
+        // case so the fixture's premise is explicit rather than ambient.
+        let tmp = tempfile::tempdir_in("/tmp").unwrap();
         let dir = tmp.path().join("plain");
         fs::create_dir_all(&dir).unwrap();
+        assert!(dir.ancestors().all(|path| !path.join(".git").exists()));
         let info = resolve_repo(&dir);
         assert_eq!(info.repo_root, dir);
         assert_eq!(info.checkout_root, dir);

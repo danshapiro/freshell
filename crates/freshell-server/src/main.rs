@@ -397,6 +397,13 @@ async fn main() -> ExitCode {
         eprintln!("managed fresh-agent gateway initialization failed: {error}");
         std::process::exit(1);
     }) {
+        gateway
+            .restore_rest_state(&fresh_agent_state)
+            .await
+            .unwrap_or_else(|error| {
+                eprintln!("managed fresh-agent view restoration failed: {error}");
+                std::process::exit(1);
+            });
         fresh_agent_state
             .set_hosted_rest_gateway(gateway.clone())
             .unwrap_or_else(|error| {

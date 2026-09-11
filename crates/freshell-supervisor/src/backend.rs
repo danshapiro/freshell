@@ -731,8 +731,42 @@ struct ExpectedConfig {
     runtime_dir: String,
     limits: RuntimeLimits,
     terminal: Option<TerminalLaunchSpec>,
-    fresh_agent: Option<FreshAgentLaunchSpec>,
+    fresh_agent: Option<ImmutableFreshAgentConfig>,
     provider_volume_name: String,
+}
+
+/// Only enclosure-affecting fields belong in the Docker ownership digest.
+/// Conversation identity and per-turn settings are durable mutable state and
+/// may change while this exact container continues to own the soul.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ImmutableFreshAgentConfig {
+    provider: freshell_runtime_protocol::FreshProvider,
+    session_type: String,
+    runtime_variant: String,
+    provider_store_id: String,
+    workspace_path: String,
+    git_common_dir: Option<String>,
+    run_as_uid: u32,
+    run_as_gid: u32,
+    fixture_transport: Option<freshell_runtime_protocol::FreshAgentFixtureTransport>,
+    provider_bootstrap_files: Vec<freshell_runtime_protocol::ProviderBootstrapFile>,
+}
+
+impl From<&FreshAgentLaunchSpec> for ImmutableFreshAgentConfig {
+    fn from(spec: &FreshAgentLaunchSpec) -> Self {
+        Self {
+            provider: spec.provider.clone(),
+            session_type: spec.session_type.clone(),
+            runtime_variant: spec.runtime_variant.clone(),
+            provider_store_id: spec.provider_store_id.clone(),
+            workspace_path: spec.workspace_path.clone(),
+            git_common_dir: spec.git_common_dir.clone(),
+            run_as_uid: spec.run_as_uid,
+            run_as_gid: spec.run_as_gid,
+            fixture_transport: spec.fixture_transport,
+            provider_bootstrap_files: spec.provider_bootstrap_files.clone(),
+        }
+    }
 }
 
 impl ExpectedConfig {
@@ -746,7 +780,10 @@ impl ExpectedConfig {
             runtime_dir: runtime_dir.to_string_lossy().into_owned(),
             limits: spec.limits,
             terminal: spec.terminal.clone(),
-            fresh_agent: spec.fresh_agent.clone(),
+            fresh_agent: spec
+                .fresh_agent
+                .as_ref()
+                .map(ImmutableFreshAgentConfig::from),
             provider_volume_name: spec.provider_volume_name.clone(),
         }
     }
@@ -762,7 +799,7 @@ fn immutable_digest_from_handle(handle: &OwnedRuntimeHandle) -> Result<String, B
         runtime_dir: handle.runtime_dir().to_string_lossy().into_owned(),
         limits: handle.requested_limits(),
         terminal: handle.terminal().cloned(),
-        fresh_agent: handle.fresh_agent().cloned(),
+        fresh_agent: handle.fresh_agent().map(ImmutableFreshAgentConfig::from),
         provider_volume_name: handle.provider_volume_name().to_owned(),
     })
 }
@@ -1312,6 +1349,85 @@ mod tests {
         assert!(!durable_json.contains("amplifier_onecli_lunaroute_glm53"));
         assert!(!durable_json.contains("onecli.example.invalid"));
         assert!(!durable_json.contains(secret));
+    }
+
+    #[test]
+    fn fresh_agent_ownership_digest_ignores_mutable_conversation_state() {
+        let root = tempfile::tempdir().unwrap();
+        let mut agent = FreshAgentLaunchSpec {
+            session_id: "presentation-parent".into(),
+            provider: freshell_runtime_protocol::FreshProvider::Claude,
+            session_type: "freshclaude".into(),
+            runtime_variant: "claude-agent-sdk".into(),
+            provider_store_id: "store-one".into(),
+            cwd: "/workspace/project".into(),
+            workspace_path: "/workspace".into(),
+            git_common_dir: None,
+            run_as_uid: 65_534,
+            run_as_gid: 0,
+            model: Some("haiku".into()),
+            effort: Some("low".into()),
+            permission_mode: Some("ask".into()),
+            sandbox: Some("workspace-write".into()),
+            native_session_id: None,
+            fixture_transport: None,
+            provider_bootstrap_files: Vec::new(),
+        };
+        let make = |agent: FreshAgentLaunchSpec| CreateRuntimeSpec {
+            installation_id: InstallationId::parse("installation-digest").unwrap(),
+            soul_id: SoulId::parse("soul-digest").unwrap(),
+            incarnation_id: IncarnationId::parse("incarnation-digest").unwrap(),
+            image_ref: "sha256:image".into(),
+            host_binary_path: root.path().join("host"),
+            runtime_dir: root.path().join("runtime"),
+            limits: RuntimeLimits {
+                cpu_milli: 1000,
+                memory_bytes: 1024,
+                swap_bytes: 0,
+                pids_max: 64,
+            },
+            test_run_id: "digest".into(),
+            terminal: None,
+            fresh_agent: Some(agent),
+            provider_volume_name: "freshell-provider-digest".into(),
+        };
+        let initial = make(agent.clone());
+        let initial_digest = digest_expected(&ExpectedConfig::new(
+            &initial,
+            &initial.host_binary_path,
+            &initial.runtime_dir,
+        ))
+        .unwrap();
+
+        // These values legitimately change while the same container remains
+        // alive: native identity materializes, a fork changes presentation,
+        // and per-turn settings are updated inside the host actor.
+        agent.session_id = "presentation-child".into();
+        agent.native_session_id = Some("native-child".into());
+        agent.cwd = "/workspace/project/subdir".into();
+        agent.model = Some("sonnet".into());
+        agent.effort = Some("high".into());
+        agent.permission_mode = Some("plan".into());
+        agent.sandbox = Some("read-only".into());
+        let changed = make(agent.clone());
+        let changed_digest = digest_expected(&ExpectedConfig::new(
+            &changed,
+            &changed.host_binary_path,
+            &changed.runtime_dir,
+        ))
+        .unwrap();
+        assert_eq!(initial_digest, changed_digest);
+
+        // Enclosure-affecting identity/topology still changes ownership truth.
+        agent.workspace_path = "/different-workspace".into();
+        let escaped = make(agent);
+        let escaped_digest = digest_expected(&ExpectedConfig::new(
+            &escaped,
+            &escaped.host_binary_path,
+            &escaped.runtime_dir,
+        ))
+        .unwrap();
+        assert_ne!(initial_digest, escaped_digest);
     }
 
     #[test]

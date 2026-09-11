@@ -1,8 +1,10 @@
 use super::*;
 use freshell_protocol::FreshAgentFork;
 use freshell_runtime_protocol::{
-    read_frame, write_frame, AdminCommand, AdminReply, AdminResult, ControlRole, Envelope,
-    FreshAgentForkResult, InstallationId, RuntimeErrorCode,
+    read_frame, write_frame, AdminCommand, AdminReply, AdminResult, AllocationState, CleanupState,
+    ControlRole, DurabilityState, Envelope, FreshAgentForkResult, IncarnationId, InstallationId,
+    LaunchState, RecoveryState, RuntimeErrorCode, RuntimeInventorySnapshot, RuntimeProfile,
+    RuntimeReadiness, RuntimeView, ViewIntent, ViewIntentId, ViewVisibilityIntent,
 };
 use tokio::net::UnixListener;
 
@@ -475,4 +477,111 @@ fn hosted_snapshot_unknown_capability_payloads_fail_closed_without_falsifying_kn
         assert_eq!(projected["rollback"]["canRedo"], false);
         assert!(projected["rollback"].get("redoableTurnIds").is_none());
     }
+}
+
+#[test]
+fn managed_public_session_id_uses_runtime_provider_for_kilroy() {
+    let request = "request-kilroy";
+    assert_eq!(
+        managed_public_session_id(&FreshProvider::Kilroy, request),
+        format!("managed-kilroy-{}", stable_hex(request))
+    );
+    assert_ne!(
+        managed_public_session_id(&FreshProvider::Kilroy, request),
+        format!("managed-claude-{}", stable_hex(request))
+    );
+}
+
+#[test]
+fn resolves_a_managed_rest_pane_from_supervisor_view_intent_after_web_restart() {
+    let soul = SoulId::parse("soul-rest-recovery").unwrap();
+    let snapshot = RuntimeInventorySnapshot {
+        revision: 9,
+        readiness: RuntimeReadiness {
+            inventory_revision: 9,
+            initial_scan_state: freshell_runtime_protocol::InitialScanState::Complete,
+            initial_scan_started_at: Some(1),
+            initial_scan_finished_at: Some(2),
+            blocked_subsystems: Vec::new(),
+            startup_recovery_concurrency_limit: 4,
+            startup_recovery_peak: 1,
+            initial_scan_duration_ms: Some(1),
+        },
+        souls: vec![RuntimeView {
+            soul_id: soul.clone(),
+            incarnation_id: IncarnationId::parse("incarnation-rest-recovery").unwrap(),
+            launch_state: LaunchState::Running,
+            cleanup_state: CleanupState::None,
+            intent_revision: 3,
+            container_id: Some("a".repeat(64)),
+            host_boot_id: None,
+            execution_generation: 1,
+            effective_limits: None,
+            configured_limits: None,
+            view_intent_revision: Some(2),
+            terminal_id: None,
+            terminal_stream_id: None,
+            terminal_mode: None,
+            terminal_cwd: None,
+            terminal_create_request_id: None,
+            terminal_resume_session_id: None,
+            fresh_agent_session_id: Some("managed-kilroy-session".into()),
+            fresh_agent_session_type: Some("kilroy".into()),
+            fresh_agent_runtime_variant: Some("kilroy-claude-agent-sdk".into()),
+            project_key: Some("project-one".into()),
+            profile: Some(RuntimeProfile::DefaultAgent),
+            desired_state: DesiredState::Running,
+            recovery_state: RecoveryState::Live,
+            durability_state: DurabilityState::ResumeCaptured,
+            allocation_state: AllocationState::VerifiedDurable,
+            provider: Some("kilroy".into()),
+            native_session_id: Some("native-kilroy".into()),
+            recovery_reason: None,
+            incident_id: None,
+            prior_incarnation_id: None,
+            recovery_attempt_id: None,
+            evidence_revision: 1,
+            successful_recoveries_in_window: 0,
+        }],
+        view_intents: vec![ViewIntent {
+            view_id: ViewIntentId::parse("view-rest-recovery").unwrap(),
+            soul_id: soul,
+            owner_id: "installation".into(),
+            workspace_id: "project-one".into(),
+            kind: ViewIntentKind::AutomaticPrimary,
+            preferred_tab_id: "tab-restored".into(),
+            preferred_pane_id: "pane-restored".into(),
+            title: "Kilroy agent".into(),
+            placement_group: "Recovered agents".into(),
+            visibility: ViewVisibilityIntent::Visible,
+            revision: 2,
+            soul_intent_revision: 3,
+            created_at: 1,
+            updated_at: 2,
+        }],
+        pending_projection_count: 0,
+    };
+    assert_eq!(
+        hosted_rest_pane_from_snapshot(&snapshot, "pane-restored"),
+        Some(HostedRestPane {
+            tab_id: "tab-restored".into(),
+            pane_id: "pane-restored".into(),
+            session_id: "managed-kilroy-session".into(),
+            provider: "claude".into(),
+            session_type: "kilroy".into(),
+            title: Some("Kilroy agent".into()),
+        })
+    );
+    assert_eq!(
+        hosted_rest_pane_from_snapshot(&snapshot, "not-this-pane"),
+        None
+    );
+
+    let mut detached = snapshot.clone();
+    detached.view_intents[0].visibility = ViewVisibilityIntent::Detached;
+    assert_eq!(
+        hosted_rest_pane_from_snapshot(&detached, "pane-restored"),
+        None,
+        "a stale REST pane id must not recreate a deliberately detached view"
+    );
 }

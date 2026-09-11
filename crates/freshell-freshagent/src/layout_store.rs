@@ -474,6 +474,61 @@ impl LayoutStore {
         (tab_id, pane_id)
     }
 
+    /// Restore one supervisor-owned view with its durable tab/pane IDs after
+    /// web replacement. Existing exact rows are refreshed idempotently; ID
+    /// collisions are refused rather than overwriting a user's layout.
+    pub fn ensure_managed_tab_pane(
+        &self,
+        tab_id: &str,
+        pane_id: &str,
+        title: Option<&str>,
+        content: Value,
+    ) -> Result<(), &'static str> {
+        let mut inner = self.lock();
+        let mut found_exact = false;
+        for snapshot in inner.snapshots_mut() {
+            if let Some(existing_tab) = find_pane_tab(snapshot, pane_id) {
+                if existing_tab != tab_id {
+                    return Err("managed pane id is already attached to another tab");
+                }
+                if let Some(root) = snapshot.layouts.get_mut(tab_id) {
+                    root.replace_leaf_content(pane_id, content.clone());
+                    seed_pane_title(snapshot, tab_id, pane_id, &content);
+                    found_exact = true;
+                }
+            }
+        }
+        if found_exact {
+            return Ok(());
+        }
+
+        let snapshot = inner.ensure_primary();
+        if snapshot.tabs.iter().any(|tab| tab.id == tab_id) || snapshot.layouts.contains_key(tab_id)
+        {
+            return Err("managed tab id already has different pane content");
+        }
+        snapshot.tabs.push(TabRow {
+            id: tab_id.to_string(),
+            title: title.map(str::to_string),
+            fallback_session_ref: None,
+        });
+        snapshot.layouts.insert(
+            tab_id.to_string(),
+            PaneNode::Leaf {
+                id: pane_id.to_string(),
+                content: content.clone(),
+            },
+        );
+        if snapshot.active_tab_id.is_none() {
+            snapshot.active_tab_id = Some(tab_id.to_string());
+        }
+        snapshot
+            .active_pane
+            .insert(tab_id.to_string(), pane_id.to_string());
+        seed_pane_title(snapshot, tab_id, pane_id, &content);
+        Ok(())
+    }
+
     /// Purges layouts/activePane/title maps (`closeTab`, `layout-store.ts:577-587`,
     /// plus `removeTabMetadata`, `:87-91`) in EVERY client snapshot containing
     /// the tab.

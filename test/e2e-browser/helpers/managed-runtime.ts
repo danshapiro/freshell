@@ -145,6 +145,7 @@ export class ManagedRuntimeBrowserRig {
     })
     this.web = new RustServer({
       preserveHomeOnStop: true,
+      verbose: process.env.FRESHELL_RUNTIME_BROWSER_VERBOSE === '1',
       env: {
         FRESHELL_MANAGED_RUNTIME_V1: '1',
         ...(this.freshAgentModes.length > 0
@@ -309,7 +310,10 @@ export class ManagedRuntimeBrowserRig {
   }
 
   ownedContainerProcessTable(containerId: string): string {
-    return this.runtime.topOwnedContainerExact(containerId, ['-eo', 'pid,args'])
+    // docker top reports host-namespace PIDs, which cannot be safely passed to
+    // an in-container signal operation. Read ps inside the exact owned
+    // enclosure so every PID and /proc identity share one namespace.
+    return this.ownedContainerExec(containerId, ['ps', '-eo', 'pid,args'])
   }
 
   writeBrowserResult(value: unknown): string { return this.writeResult('browser-continuity.json', value) }

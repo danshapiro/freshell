@@ -13,6 +13,18 @@ pub struct HostedRestCreate {
     pub model: Option<String>,
     pub effort: Option<String>,
     pub native_session_id: Option<String>,
+    pub preferred_tab_id: String,
+    pub preferred_pane_id: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HostedRestPane {
+    pub tab_id: String,
+    pub pane_id: String,
+    pub session_id: String,
+    pub provider: String,
+    pub session_type: String,
+    pub title: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -68,6 +80,10 @@ pub trait HostedFreshAgentRestGateway: Send + Sync {
     ) -> Result<HostedRestCreated, ()>;
 
     async fn send_agent(&self, request: HostedRestSend) -> Result<HostedRestSendResult, ()>;
+
+    async fn resolve_pane(&self, _pane_id: &str) -> Result<Option<HostedRestPane>, ()> {
+        Ok(None)
+    }
 
     async fn capture(
         &self,
