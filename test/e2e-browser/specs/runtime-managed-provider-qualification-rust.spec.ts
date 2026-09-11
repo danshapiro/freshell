@@ -47,6 +47,7 @@ type ProviderDefinition = {
   processBinary: string
   processIdentityNeedles: string[]
   nativeIdPattern: RegExp
+  terminalReadyText?: string
 }
 
 function requireAmplifierOnecliBootstrap(): void {
@@ -109,6 +110,7 @@ function providerDefinitions(): ProviderDefinition[] {
       processBinary: 'opencode',
       processIdentityNeedles: [P2_OPENCODE_FREE_MODEL],
       nativeIdPattern: /^ses_/,
+      terminalReadyText: 'Ask anything',
     },
   ]
   if (selected.includes('amplifier')) {
@@ -187,6 +189,18 @@ function expectExactProcessIdentity(processTable: string, identity: string): voi
 
 function expectActualProviderProcess(processTable: string, binary: string): void {
   expect(processTable).toMatch(new RegExp(`(?:^|\\s)(?:/[^\\s]*/)?${regexEscape(binary)}(?:$|\\s)`, 'm'))
+}
+
+async function waitForProviderTerminalReady(
+  page: Page,
+  terminalId: string,
+  definition: ProviderDefinition,
+): Promise<void> {
+  const readyText = definition.terminalReadyText
+  if (!readyText) return
+  await waitForValue(`${definition.provider} terminal readiness`, async () => (
+    (await terminalBuffer(page, terminalId)).includes(readyText) ? true : null
+  ), 180_000)
 }
 
 async function executeAndAwaitNonceOutput(
@@ -352,6 +366,7 @@ async function qualifyProvider(
   }
   const exactLimits = limitEvidence(rig, created.view)
   expect(exactLimits.swapMax).toBe('0')
+  await waitForProviderTerminalReady(page, created.terminalId, definition)
 
   const nonce = `codename-${randomBytes(16).toString('hex')}`
   await executeAndAwaitNonceOutput(
