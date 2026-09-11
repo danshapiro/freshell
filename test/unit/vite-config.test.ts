@@ -11,12 +11,16 @@ vi.mock('dotenv', () => ({
   default: { config: vi.fn() },
   config: vi.fn(),
 }))
-// Mock platform module — WSL detection is now centralized in platform.ts
-vi.mock('../../server/platform.js', () => ({
+// Mock platform module — WSL detection is now centralized in platform.ts.
+// Keep one hoisted mock identity across vi.resetModules(); Vitest 5 restores
+// factory-created vi.fn implementations differently from Vitest 3, which made
+// the first dynamic get-network-host import observe the real WSL result.
+const platformMocks = vi.hoisted(() => ({
   isWSL: vi.fn(() => false),
 }))
-
-import { isWSL } from '../../server/platform.js'
+vi.mock('../../server/platform.js', () => ({
+  isWSL: platformMocks.isWSL,
+}))
 
 const TEST_TIMEOUT_MS = 20_000
 
@@ -25,7 +29,10 @@ describe('getNetworkHost', () => {
   const originalBindHost = process.env.FRESHELL_BIND_HOST
 
   beforeEach(() => {
-    vi.restoreAllMocks()
+    vi.clearAllMocks()
+    vi.mocked(readFileSync).mockReset()
+    platformMocks.isWSL.mockReset()
+    platformMocks.isWSL.mockReturnValue(false)
     vi.resetModules()
     delete process.env.HOST
     // FRESHELL_BIND_HOST is an explicit override honored by getNetworkHost;
@@ -86,7 +93,7 @@ describe('getNetworkHost', () => {
   })
 
   it('always returns 0.0.0.0 on WSL regardless of config', async () => {
-    vi.mocked(isWSL).mockReturnValue(true)
+    platformMocks.isWSL.mockReturnValue(true)
     const { getNetworkHost } = await import('../../server/get-network-host.js')
     expect(getNetworkHost()).toBe('0.0.0.0')
   })
