@@ -131,14 +131,15 @@ describe('useTabBarScroll', () => {
     mockDisconnect = vi.fn()
     resizeCallback = null
     originalResizeObserver = globalThis.ResizeObserver
-    globalThis.ResizeObserver = vi.fn((cb) => {
-      resizeCallback = cb
-      return {
-        observe: mockObserve,
-        unobserve: vi.fn(),
-        disconnect: mockDisconnect,
+    globalThis.ResizeObserver = vi.fn().mockImplementation(class MockResizeObserver {
+      observe = mockObserve
+      unobserve = vi.fn()
+      disconnect = mockDisconnect
+
+      constructor(cb: ResizeObserverCallback) {
+        resizeCallback = cb as unknown as (entries: any[]) => void
       }
-    }) as any
+    }) as unknown as typeof ResizeObserver
   })
 
   afterEach(() => {

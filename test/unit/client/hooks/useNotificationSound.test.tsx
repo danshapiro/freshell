@@ -42,7 +42,14 @@ describe('useNotificationSound', () => {
       currentTime: 0,
       src: '',
     }
-    AudioSpy = vi.fn(() => mockAudioInstance)
+    AudioSpy = vi.fn().mockImplementation(class MockAudio {
+      preload = ''
+      volume = 1
+      pause = mockAudioInstance.pause
+      play = mockAudioInstance.play
+      currentTime = 0
+      src = ''
+    })
     vi.stubGlobal('Audio', AudioSpy)
   })
 

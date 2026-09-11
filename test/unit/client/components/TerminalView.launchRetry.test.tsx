@@ -448,8 +448,14 @@ describe('launch-time INVALID_TERMINAL_ID bounded retry', () => {
     }
 
     // Budget exhausted (5 schedules consumed) -> the 6th failure fell through
-    // to failLaunch inside the loop's final iteration.
+    // to failLaunch inside the loop's final iteration. The visible failure is
+    // serialized through TerminalWriteQueue; let the queued frame/microtask
+    // settle before asserting on the xterm mock.
     expect(paneStatus(store)).toBe('error')
+    await act(async () => {
+      vi.advanceTimersByTime(20)
+      await Promise.resolve()
+    })
     const wroteFailure = terminalInstances.some((t: any) =>
       t.write.mock.calls.some(([data]: [string]) => String(data).includes('[Restore failed]')))
     expect(wroteFailure).toBe(true)

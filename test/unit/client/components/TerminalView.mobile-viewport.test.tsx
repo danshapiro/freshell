@@ -47,25 +47,25 @@ vi.mock('@/components/terminal/terminal-runtime', () => ({
 }))
 
 vi.mock('@xterm/xterm', () => ({
-  Terminal: vi.fn().mockImplementation(() => {
-    const term = {
-      open: vi.fn(),
-      onData: vi.fn(() => ({ dispose: vi.fn() })),
-      onTitleChange: vi.fn(() => ({ dispose: vi.fn() })),
-      attachCustomKeyEventHandler: vi.fn(),
-      attachCustomWheelEventHandler: vi.fn(),
-      registerLinkProvider: vi.fn(() => ({ dispose: vi.fn() })),
-      write: vi.fn(),
-      clear: vi.fn(),
-      dispose: vi.fn(),
-      getSelection: vi.fn(() => ''),
-      focus: vi.fn(),
-      cols: 80,
-      rows: 24,
-      options: {},
+  Terminal: vi.fn().mockImplementation(class MockTerminal {
+    open = vi.fn()
+    onData = vi.fn(() => ({ dispose: vi.fn() }))
+    onTitleChange = vi.fn(() => ({ dispose: vi.fn() }))
+    attachCustomKeyEventHandler = vi.fn()
+    attachCustomWheelEventHandler = vi.fn()
+    registerLinkProvider = vi.fn(() => ({ dispose: vi.fn() }))
+    write = vi.fn()
+    clear = vi.fn()
+    dispose = vi.fn()
+    getSelection = vi.fn(() => '')
+    focus = vi.fn()
+    cols = 80
+    rows = 24
+    options = {}
+
+    constructor() {
+      terminalMocks.instances.push(this)
     }
-    terminalMocks.instances.push(term)
-    return term
   }),
 }))
 

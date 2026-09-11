@@ -25,30 +25,30 @@ const renderCounters = vi.hoisted(() => ({
   mobileHookCalls: 0,
 }))
 
-global.ResizeObserver = vi.fn().mockImplementation(() => ({
-  observe: vi.fn(),
-  unobserve: vi.fn(),
-  disconnect: vi.fn(),
-}))
+global.ResizeObserver = vi.fn().mockImplementation(class MockResizeObserver {
+  observe = vi.fn()
+  unobserve = vi.fn()
+  disconnect = vi.fn()
+}) as unknown as typeof ResizeObserver
 
 vi.mock('@xterm/xterm', () => ({
-  Terminal: vi.fn().mockImplementation(() => ({
-    loadAddon: vi.fn(),
-    open: vi.fn(),
-    registerLinkProvider: vi.fn(() => ({ dispose: vi.fn() })),
-    onData: vi.fn(() => ({ dispose: vi.fn() })),
-    onTitleChange: vi.fn(() => ({ dispose: vi.fn() })),
-    attachCustomKeyEventHandler: vi.fn(),
-    attachCustomWheelEventHandler: vi.fn(),
-    dispose: vi.fn(),
-    write: vi.fn(),
-    clear: vi.fn(),
-    getSelection: vi.fn(),
-    focus: vi.fn(),
-    cols: 80,
-    rows: 24,
-    options: {},
-  })),
+  Terminal: vi.fn().mockImplementation(class MockTerminal {
+    loadAddon = vi.fn()
+    open = vi.fn()
+    registerLinkProvider = vi.fn(() => ({ dispose: vi.fn() }))
+    onData = vi.fn(() => ({ dispose: vi.fn() }))
+    onTitleChange = vi.fn(() => ({ dispose: vi.fn() }))
+    attachCustomKeyEventHandler = vi.fn()
+    attachCustomWheelEventHandler = vi.fn()
+    dispose = vi.fn()
+    write = vi.fn()
+    clear = vi.fn()
+    getSelection = vi.fn()
+    focus = vi.fn()
+    cols = 80
+    rows = 24
+    options = {}
+  }),
 }))
 
 vi.mock('@/lib/ws-client', () => ({
