@@ -128,6 +128,46 @@ const DISK_T1 = new Map([
 const NET_T0 = { rxBytes: 1_000_000, txBytes: 500_000, rxErr: 3, txErr: 1, rxDrop: 2, txDrop: 4 }
 const NET_T1 = { rxBytes: 1_500_000, txBytes: 600_000, rxErr: 5, txErr: 3, rxDrop: 3, txDrop: 5 }
 
+const CPU_T2 = {
+  total: 6000,
+  busy: 600,
+  steal: 60,
+  perCore: [
+    { total: 1500, busy: 150 },
+    { total: 1500, busy: 150 },
+    { total: 1500, busy: 150 },
+    { total: 1500, busy: 150 },
+  ],
+}
+const CPU_T3 = {
+  total: 8000,
+  busy: 1200,
+  steal: 100,
+  perCore: [
+    { total: 2000, busy: 300 },
+    { total: 2000, busy: 300 },
+    { total: 2000, busy: 300 },
+    { total: 2000, busy: 300 },
+  ],
+}
+// T2->T3 over one 2s fast tick: dBusy 600/dTotal 2000 = 30%; dSteal 40/2000 = 2%;
+// per-core 150/500 = 30%; swap in 24*4/2 = 48 KB/s; out 12*4/2 = 24 KB/s;
+// majfaults 40/2 = 20/s; oom 9->11.
+const VMSTAT_T2 = { pswpin: 200, pswpout: 80, pgmajfault: 100, oomKill: 9 }
+const VMSTAT_T3 = { pswpin: 224, pswpout: 92, pgmajfault: 140, oomKill: 11 }
+// Slow tier growth for the restart cycle (re-based T2->T3 values over 5s equal
+// the familiar disk/net delta math): read 51200*512/5 = 5,242,880 B/s; write
+// 102400*512/5 = 10,485,760 B/s; util 1000/5000 = 20%; await (2000+2000)/(100+400) = 8ms;
+// rx (2.5M-2M)/5 = 100,000 B/s; tx (1.1M-1M)/5 = 20,000 B/s; err/drop deltas 2/3/1/2.
+const DISK_T2 = new Map([
+  ['sda', { readsCompleted: 2000, readMs: 8000, writesCompleted: 4000, writeMs: 16000, readSectors: 200_000, writtenSectors: 800_000, timeDoingIosMs: 1000 }],
+])
+const DISK_T3 = new Map([
+  ['sda', { readsCompleted: 2100, readMs: 10000, writesCompleted: 4400, writeMs: 18000, readSectors: 251_200, writtenSectors: 902_400, timeDoingIosMs: 2000 }],
+])
+const NET_T2 = { rxBytes: 2_000_000, txBytes: 1_000_000, rxErr: 7, txErr: 2, rxDrop: 5, txDrop: 6 }
+const NET_T3 = { rxBytes: 2_500_000, txBytes: 1_100_000, rxErr: 9, txErr: 5, rxDrop: 6, txDrop: 8 }
+
 const TABLE = {
   top: [{ pid: 5, name: 'node', cpuPct: 12.3, rssBytes: 1e6, state: 'S' }],
   zombies: 1,
@@ -334,6 +374,77 @@ describe('start/stop (contract points 1, 5)', () => {
     vi.advanceTimersByTime(2000)
     expect(readerFn('readCpuTimes')).toHaveBeenCalledTimes(2)
   })
+
+  it('restart after stop re-bases every delta family and resets the live cache (fresh-start restart)', () => {
+    // Cycle 1: run the default T0 fixtures long enough for every prev-* store
+    // AND the slow-owned liveCache keys to populate (fast ticks at 2/4/6s, the
+    // first slow tick at 5s).
+    const service = makeService()
+    service.start()
+    vi.advanceTimersByTime(6000)
+    expect(service.getSnapshot().live.diskIo.available).toBe(true) // slow cache populated pre-stop
+
+    service.stop()
+    // A stopped service publishes the documented fresh-subscriber shape again:
+    // no stale slow sections survive a stop.
+    const stopped = service.getSnapshot().live
+    expect(stopped.diskIo.available).toBe(false)
+    expect(stopped.network.available).toBe(false)
+    expect(stopped.limits.available).toBe(false)
+
+    // The cumulative counters GROW while the service is unwatched — the
+    // long-window bug case (all values below are grown from the T0 cycle).
+    // Fake timers advance Date.now(), the dt basis.
+    vi.advanceTimersByTime(20000)
+    vi.mocked(readersMock.readCpuTimes).mockReturnValue(CPU_T2)
+    vi.mocked(readersMock.readVmstat).mockReturnValue(VMSTAT_T2)
+    vi.mocked(readersMock.readDiskStats).mockReturnValue(DISK_T2)
+    vi.mocked(readersMock.readNetDev).mockReturnValue(NET_T2)
+
+    service.start()
+    // The restart's immediate tick is the documented null-safe first sample:
+    // zero rates/deltas, totals carried from the CURRENT (T2) sample, and the
+    // slow sections stay unavailable until their first new slow tick.
+    const restarted = service.getSnapshot().live
+    expect(restarted.cpu).toEqual({ available: true, usagePct: 0, stealPct: 0, perCorePct: [0, 0, 0, 0], freqMHz: null })
+    expect(restarted.paging).toEqual({ available: true, swapInKbps: 0, swapOutKbps: 0, majFaultsPerSec: 0, oomKillsDelta: 0, oomKillsTotal: 9 })
+    expect(restarted.diskIo.available).toBe(false)
+    expect(restarted.network.available).toBe(false)
+    expect(restarted.limits.available).toBe(false)
+
+    // The next fast tick deltas against the RESTART sample (T2), never against
+    // the pre-stop sample (T0): every value below derives from T2->T3, dt=2s.
+    vi.mocked(readersMock.readCpuTimes).mockReturnValue(CPU_T3)
+    vi.mocked(readersMock.readVmstat).mockReturnValue(VMSTAT_T3)
+    vi.advanceTimersByTime(2000)
+    const live = service.getSnapshot().live
+    expect(live.cpu).toEqual({ available: true, usagePct: 30, stealPct: 2, perCorePct: [30, 30, 30, 30], freqMHz: null })
+    expect(live.paging).toEqual({ available: true, swapInKbps: 48, swapOutKbps: 24, majFaultsPerSec: 20, oomKillsDelta: 2, oomKillsTotal: 11 })
+
+    // First post-restart slow tick (t=+5000): the null-safe first slow sample
+    // — zero rates/deltas, carried totals from the GROWN samples.
+    vi.advanceTimersByTime(3000)
+    const firstSlow = service.getSnapshot().live
+    expect(firstSlow.diskIo).toEqual({ available: true, readBps: 0, writeBps: 0, utilPct: null, weightedAwaitMs: null })
+    expect(firstSlow.network).toEqual({
+      available: true, rxBps: 0, txBps: 0,
+      rxErrorsTotal: 7, txErrorsTotal: 2, rxDroppedTotal: 5, txDroppedTotal: 6,
+      rxErrorsDelta: 0, txErrorsDelta: 0, rxDroppedDelta: 0, txDroppedDelta: 0,
+    })
+
+    // Second post-restart slow tick (t=+10000): disk/net re-based on the FIRST
+    // post-restart slow sample (T2), never the pre-stop sample (T0).
+    vi.mocked(readersMock.readDiskStats).mockReturnValue(DISK_T3)
+    vi.mocked(readersMock.readNetDev).mockReturnValue(NET_T3)
+    vi.advanceTimersByTime(5000)
+    const rebased = service.getSnapshot().live
+    expect(rebased.diskIo).toEqual({ available: true, readBps: 5_242_880, writeBps: 10_485_760, utilPct: 20, weightedAwaitMs: 8 })
+    expect(rebased.network).toEqual({
+      available: true, rxBps: 100_000, txBps: 20_000,
+      rxErrorsTotal: 9, txErrorsTotal: 5, rxDroppedTotal: 6, txDroppedTotal: 8,
+      rxErrorsDelta: 2, txErrorsDelta: 3, rxDroppedDelta: 1, txDroppedDelta: 2,
+    })
+  })
 })
 
 describe('event-loop lag histogram lifecycle (contract point 3)', () => {
@@ -362,7 +473,7 @@ describe('event-loop lag histogram lifecycle (contract point 3)', () => {
     expect(fakeHistogram.disable).toHaveBeenCalledTimes(1)
   })
 
-  it('collects no lag samples while stopped (cache retains last tick), then resumes per-tick on restart', () => {
+  it('collects no lag samples while stopped, then resumes per-tick on restart', () => {
     const service = makeService()
     service.start()
     service.stop()
