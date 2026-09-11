@@ -22,11 +22,47 @@ use freshell_runtime_protocol::{
     IncidentTimelineEvent, LossBuildEvidence, LossCleanupReport, ManagedRolloutMode,
     ReattachHandle, RecoverRequest, RecoveryAttemptId, RecoveryBlockReason,
     RecoveryEvidenceVerdict, RecoveryOutcome, RecoveryPath, RecoveryPathEvidence, RecoveryProbe,
-    RecoveryResult, RecoveryTrigger, RetryHint, RuntimeError, RuntimeErrorCode, RuntimeView,
-    SoulId, StopOutcome, TerminalLaunchSpec, CONTROL_PROTOCOL_VERSION,
+    RecoveryResult, RecoveryState, RecoveryTrigger, RetryHint, RuntimeError, RuntimeErrorCode,
+    RuntimeView, SoulId, StopOutcome, TerminalLaunchSpec, CONTROL_PROTOCOL_VERSION,
 };
 use sha2::{Digest, Sha256};
 use tokio::time::{sleep, Duration, Instant};
+
+fn retry_budget_requires_manual_rearm(
+    trigger: RecoveryTrigger,
+    state: RecoveryState,
+    reason: Option<&str>,
+) -> bool {
+    trigger != RecoveryTrigger::ManualRetry
+        && state == RecoveryState::Blocked
+        && matches!(reason, Some("RETRY_BUDGET" | "BLOCKED_RETRY_BUDGET"))
+}
+
+fn retry_budget_probe() -> RecoveryProbe {
+    RecoveryProbe::Blocked {
+        path: RecoveryPath::NativeResume,
+        reason: RecoveryBlockReason::RetryBudget,
+        retry_hint: RetryHint {
+            automatic_after_ms: None,
+            manual_retry: true,
+            repair: Some("repair the dependency, then explicitly retry this soul".into()),
+        },
+        evidence: vec!["bounded automatic retry schedule exhausted (initial, 2s, 10s)".into()],
+    }
+}
+
+fn retry_budget_blocked_result(view: RuntimeView) -> RecoveryResult {
+    RecoveryResult {
+        outcome: RecoveryOutcome::Blocked,
+        expected_native_session_id: view.native_session_id.clone(),
+        prior_incarnation_id: view.prior_incarnation_id.clone(),
+        view,
+        probe: Some(retry_budget_probe()),
+        attempt_id: None,
+        observed_native_session_id: None,
+        incident_id: None,
+    }
+}
 
 impl Supervisor {
     pub(crate) async fn probe_recovery(
@@ -246,7 +282,7 @@ impl Supervisor {
             .rev()
             .find(|view| view.soul_id == request.soul_id)
         {
-            if view.recovery_state == freshell_runtime_protocol::RecoveryState::Lost {
+            if view.recovery_state == RecoveryState::Lost {
                 return Ok(RecoveryResult {
                     outcome: RecoveryOutcome::Lost,
                     incident_id: view.incident_id.clone(),
@@ -258,6 +294,23 @@ impl Supervisor {
                     view,
                 });
             }
+            // Retry exhaustion is a durable operator-visible pause. A healthy
+            // surviving host may be reattachable, but startup/observer probes
+            // are not authorization to erase the persisted flap ceiling. Only
+            // the explicit ManualRetry trigger rearms it.
+            if retry_budget_requires_manual_rearm(
+                request.trigger,
+                view.recovery_state,
+                view.recovery_reason.as_deref(),
+            ) {
+                return Ok(retry_budget_blocked_result(view));
+            }
+        }
+        if request.trigger == RecoveryTrigger::ManualRetry {
+            self.registry
+                .rearm_recovery_budget(request.soul_id.clone())
+                .await
+                .map_err(map_registry)?;
         }
         if self
             .registry
@@ -272,17 +325,10 @@ impl Supervisor {
             );
         }
         if request.trigger == RecoveryTrigger::RetryExhausted {
-            let evidence =
-                vec!["bounded automatic retry schedule exhausted (initial, 2s, 10s)".into()];
-            let probe = RecoveryProbe::Blocked {
-                path: RecoveryPath::NativeResume,
-                reason: RecoveryBlockReason::RetryBudget,
-                retry_hint: freshell_runtime_protocol::RetryHint {
-                    automatic_after_ms: None,
-                    manual_retry: true,
-                    repair: Some("repair the dependency, then explicitly retry this soul".into()),
-                },
-                evidence: evidence.clone(),
+            let probe = retry_budget_probe();
+            let evidence = match &probe {
+                RecoveryProbe::Blocked { evidence, .. } => evidence.clone(),
+                _ => unreachable!("retry budget helper always returns a blocked probe"),
             };
             self.registry
                 .mark_recovery_blocked(
@@ -1977,6 +2023,33 @@ fn map_registry(error: RegistryError) -> RuntimeError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn persisted_retry_budget_block_requires_explicit_manual_rearm() {
+        for trigger in [
+            RecoveryTrigger::ProviderExit,
+            RecoveryTrigger::HostUnreachable,
+            RecoveryTrigger::StartupReconcile,
+            RecoveryTrigger::RetryExhausted,
+            RecoveryTrigger::ExplicitRequest,
+        ] {
+            assert!(retry_budget_requires_manual_rearm(
+                trigger,
+                RecoveryState::Blocked,
+                Some("RETRY_BUDGET"),
+            ));
+        }
+        assert!(!retry_budget_requires_manual_rearm(
+            RecoveryTrigger::ManualRetry,
+            RecoveryState::Blocked,
+            Some("RETRY_BUDGET"),
+        ));
+        assert!(!retry_budget_requires_manual_rearm(
+            RecoveryTrigger::StartupReconcile,
+            RecoveryState::Blocked,
+            Some("PROVIDER_UNAVAILABLE"),
+        ));
+    }
     use freshell_runtime_protocol::{FreshAgentLaunchSpec, FreshProvider, IncarnationId};
 
     #[test]

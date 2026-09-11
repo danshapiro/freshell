@@ -1539,6 +1539,28 @@ impl Registry {
         .await
     }
 
+    /// Explicit user retry rearms the persisted flap window without changing
+    /// identity, desired state, or the current blocked verdict. The following
+    /// probe/reattach or replacement transition owns the state change.
+    pub async fn rearm_recovery_budget(&self, soul_id: SoulId) -> Result<(), RegistryError> {
+        self.run_blocking(move |mut conn| {
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let changed = tx.execute(
+                "UPDATE souls SET recovery_window_started_at=NULL,successful_recoveries_in_window=0,updated_at=?1 WHERE soul_id=?2 AND desired_state='running'",
+                params![now_millis(), soul_id.as_str()],
+            )?;
+            if changed != 1 {
+                return Err(RegistryError::RecoveryBlocked {
+                    soul_id,
+                    reason: "STOP_INTENT_OR_UNKNOWN_SOUL".into(),
+                });
+            }
+            tx.commit()?;
+            Ok(())
+        })
+        .await
+    }
+
     pub async fn mark_recovery_live(
         &self,
         soul_id: SoulId,
@@ -3418,6 +3440,41 @@ mod tests {
             )
             .unwrap();
         assert_eq!(state, "recovering");
+        assert_eq!(count, 0);
+        assert_eq!(native, None);
+
+        // The supervisor's reattach path does not call begin_recovery. Its
+        // explicit rearm operation must preserve the same identity while
+        // clearing only the persisted flap window.
+        txless_rearm_fixture(&registry, &soul).await;
+    }
+
+    async fn txless_rearm_fixture(registry: &Registry, soul: &SoulId) {
+        let conn = open_connection(&registry.inner.db_path).unwrap();
+        conn.execute(
+            "UPDATE souls SET recovery_state='blocked',recovery_reason='RETRY_BUDGET',recovery_window_started_at=?1,successful_recoveries_in_window=4 WHERE soul_id=?2",
+            params![now_millis(), soul.as_str()],
+        )
+        .unwrap();
+        drop(conn);
+        registry.rearm_recovery_budget(soul.clone()).await.unwrap();
+        let conn = open_connection(&registry.inner.db_path).unwrap();
+        let (state, reason, window, count, native): (
+            String,
+            Option<String>,
+            Option<i64>,
+            u64,
+            Option<String>,
+        ) = conn
+            .query_row(
+                "SELECT recovery_state,recovery_reason,recovery_window_started_at,successful_recoveries_in_window,native_session_id FROM souls WHERE soul_id=?1",
+                params![soul.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+            )
+            .unwrap();
+        assert_eq!(state, "blocked");
+        assert_eq!(reason.as_deref(), Some("RETRY_BUDGET"));
+        assert_eq!(window, None);
         assert_eq!(count, 0);
         assert_eq!(native, None);
     }
