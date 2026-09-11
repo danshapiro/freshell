@@ -122,12 +122,24 @@ async function gate02NonceSurvivesHostAndControllerLoss(h: RuntimeHarness): Prom
   h.killOwnedRuntimeExact(native.containerId)
 
   const restarted = await h.startSupervisor({ scenarioId, volumeName: first.volumeName })
+  // Supervisor readiness follows its startup scan. The desired-running soul is
+  // therefore already recovered before a web/controller caller can redrive it.
+  const startupView = latestSoulView(await inventory(h, restarted), native.soulId)
+  assertExactReplacementView(h, caseId, native, startupView)
+
   const recovery = dataOf(
     await h.adminOk(restarted, h.recoverBody(native.soulId, 'host_unreachable')),
     'recovery',
   )
-  assertExactReplacement(h, caseId, native, recovery)
-  const recalled = await h.nativeFixtureCall(restarted, recovery.view.incarnationId, {
+  h.assert(
+    caseId,
+    recovery.outcome === 'reattached'
+      && recovery.view.incarnationId === startupView.incarnationId
+      && recovery.view.nativeSessionId === native.sessionId,
+    'a delayed web recovery request idempotently reattaches the startup replacement',
+    recovery,
+  )
+  const recalled = await h.nativeFixtureCall(restarted, startupView.incarnationId, {
     method: 'recall',
     key: 'gate_nonce',
   })
@@ -636,17 +648,42 @@ function assertExactReplacement(
   expectedPriorIncarnationId = before.incarnationId,
 ): void {
   h.assert(caseId, recovery.outcome === 'replaced', 'failed incarnation is replaced through the recovery transaction', recovery)
-  h.assert(caseId, recovery.view.soulId === before.soulId, 'replacement keeps the same soul', recovery)
-  h.assert(caseId, recovery.view.incarnationId !== before.incarnationId, 'replacement receives a new incarnation', recovery)
+  assertExactReplacementView(
+    h,
+    caseId,
+    before,
+    recovery.view,
+    expectedSessionId,
+    expectedPriorIncarnationId,
+  )
   h.assert(
     caseId,
     recovery.priorIncarnationId === expectedPriorIncarnationId,
-    'replacement records its immediate old/new incarnation lineage',
+    'recovery response records its immediate old/new incarnation lineage',
     recovery,
   )
   h.assert(caseId, recovery.expectedNativeSessionId === expectedSessionId, 'replacement resumes the recorded native identity', recovery)
   h.assert(caseId, recovery.observedNativeSessionId === expectedSessionId, 'replacement verifies the provider-returned native identity', recovery)
-  h.assert(caseId, recovery.view.nativeSessionId === expectedSessionId, 'committed binding remains the exact native conversation', recovery)
+}
+
+function assertExactReplacementView(
+  h: RuntimeHarness,
+  caseId: string,
+  before: NativeSoul,
+  view: any,
+  expectedSessionId = before.sessionId,
+  expectedPriorIncarnationId = before.incarnationId,
+): void {
+  h.assert(caseId, view?.soulId === before.soulId, 'replacement keeps the same soul', view)
+  h.assert(caseId, view?.incarnationId !== before.incarnationId, 'replacement receives a new incarnation', view)
+  h.assert(caseId, view?.launchState === 'running' && view?.recoveryState === 'live', 'replacement is live and running', view)
+  h.assert(
+    caseId,
+    view?.priorIncarnationId === expectedPriorIncarnationId,
+    'replacement view records its immediate old/new incarnation lineage',
+    view,
+  )
+  h.assert(caseId, view?.nativeSessionId === expectedSessionId, 'committed binding remains the exact native conversation', view)
 }
 
 async function controlEpoch(h: RuntimeHarness, supervisor: SupervisorInstance): Promise<number> {
