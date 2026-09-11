@@ -1,0 +1,15 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "types": [
+      "node",
+      "vite/client",
+      "w3c-web-hid"
+    ],
+    "tsBuildInfoFile": "./node_modules/.cache/tsconfig.runtime-browser.tsbuildinfo"
+  },
+  "include": [
+    "test/e2e-browser/specs/runtime-*.spec.ts",
+    "src/**/*.d.ts"
+  ]
+}

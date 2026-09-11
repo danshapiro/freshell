@@ -121,5 +121,51 @@ and missing external execution are reported honestly, not hidden by new flags.
 
 ## Execution results
 
-Pending implementation. No Stage 5a test pass or all-provider release approval is
-claimed by this planning document.
+Implementation is present. The following additional assumptions were checked
+while implementing, rather than treating the plan as infallible:
+
+- The canonical provider manifest becomes a production Rust build input after
+  consolidation. Both upload ignore policies excluded it and the cloud Rust
+  build stage did not copy it. A narrow exception and explicit COPY fix this;
+  regression tests still exclude private runtime material and unrelated docs.
+- Some old runtime scenarios start focused unit subtests. Their inherited
+  coordinator-active marker prevented the nested invocation, even though the
+  outer scenario already held the lease. A shared, single-file-only helper now
+  uses the repo-owned focused runner with a child-local marker reset. The parent
+  lease remains held and its environment is unchanged; broad selectors fail.
+- The new browser typecheck found a prior resurrection-test bug: its output wait
+  returns void, so calling .includes on that value failed after the scenario.
+  The positive output wait remains the assertion; its successful result is no
+  longer treated as a string. Native message IDs are narrowed before selection.
+- The combined suite reached its Electron stage for the first time on this
+  candidate and exposed two additional Vitest 5 constructor mocks. Only test
+  doubles changed; the 14 affected tests now pass with unchanged assertions.
+
+Delivered behavior: secondary export no longer blocks authoritative cleanup;
+incident enrichment is optional and old records still deserialize; runtime
+capabilities come from one declaration; explicit provider selection uses normal
+production binaries; fixture/fault-injection separation remains; direct test
+execution replaces certificate catalogs/importers and separate release modes.
+
+The original 56 scenario descriptions remain. Fifty deterministic cases remain
+in the raw Docker runner. Six report-only cases now execute their actual
+browser/provider/soak scenario directly. Mixed cases retain their deterministic
+checks and their live checks in the corresponding specs. Native-history,
+resource, approval, isolation, and cleanup assertions were moved rather than
+removed. Current provider/fresh-mode defaults are unchanged; the full product
+still requires all original agents and all applicable recovery/operation paths.
+
+Validation so far: 129 Rust tests pass (runtime protocol 19, provider/runtime 38,
+supervisor 72); lint has zero errors and 11 existing warnings; contract generation
+has no drift; TypeScript runtime/browser checks and the managed Rust server build
+pass. Direct result-check tests pass, as do the build-context and runner tests.
+The exact-owned Docker P5-G06 export/cleanup scenario passes with successful
+cleanup and no unsafe attempts. The first full check passed client, server, and
+port suites, then failed only on the subsequently fixed Electron mocks.
+
+Final combined regression and P5-G07/P5-G08 reruns are recorded below when they
+complete. The configured cloud browser backend reports BLOCKED because it
+cannot host this Docker runtime. No browser fallback, actual-provider PASS,
+30-minute stress PASS, full-product readiness, PR, or deployment is claimed by
+these Stage 5a changes. Live provider/fresh-mode coverage remains necessary for
+the full original product before changing its conservative defaults.

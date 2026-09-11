@@ -20,10 +20,10 @@ use std::{
 
 mod provider_inventory;
 pub use provider_inventory::pinned_provider_version;
-mod qualification_policy;
-pub use qualification_policy::{
-    process_qualification_policy, qualification_managed_provider_enabled,
-    qualification_policy_from_value, QualificationPolicy, QUALIFICATION_PROVIDER_ENV,
+mod managed_policy;
+pub use managed_policy::{
+    managed_provider_policy_from_value, process_managed_provider_policy, ManagedProviderPolicy,
+    MANAGED_PROVIDERS_ENV,
 };
 pub mod host_actor;
 pub mod snapshot_projection;
@@ -37,209 +37,38 @@ pub const MAX_SUCCESSFUL_RECOVERIES_PER_HOUR: u64 = 5;
 pub const RECOVERY_WINDOW_MS: i64 = 60 * 60 * 1_000;
 pub const AUTOMATIC_RETRY_DELAYS_MS: [u64; 2] = [2_000, 10_000];
 
-/// Whether a provider's durable-soul behavior has actually been proven by a
-/// live, candidate-bound certification campaign.
-///
-/// This is deliberately a separate axis from `managed_enabled`: deterministic
-/// implementation support can exist and be unit-tested long before a real
-/// provider turn has ever been observed. Only `Certified` authorizes a
-/// production durable-soul promise; the landing gate may defer the rest, and
-/// the production gate stays blocked while any remain deferred.
-#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum CertificationState {
-    /// A live provider campaign produced a candidate-bound PASS receipt.
-    Certified,
-    /// The adapter exists and is deterministically tested, but no live receipt
-    /// exists yet. The provider must not be advertised as production-ready.
-    PendingLiveProviderCertification,
-    /// The provider makes no managed durable-soul claim at all.
-    NotApplicable,
-}
-
-impl CertificationState {
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Certified => "certified",
-            Self::PendingLiveProviderCertification => "pending_live_provider_certification",
-            Self::NotApplicable => "not_applicable",
-        }
-    }
-}
-
-/// The typed reason a provider is withheld from the production release scope.
-pub const PENDING_LIVE_PROVIDER_CERTIFICATION_REASON: &str = "pending_live_provider_certification";
-
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+/// Adapter facts and conservative installation defaults. Test results are not
+/// runtime state. The checked-in manifest is the single provider declaration.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct ProviderCapability {
-    pub provider: &'static str,
-    /// Certification is the outer bound on every other release promise below.
-    pub certification_state: CertificationState,
+    pub provider: String,
     pub managed_enabled: bool,
-    /// True only when Phase 3 can prove exact durable conversation recovery.
-    /// A managed shell remains useful but is intentionally not counted as an
-    /// AI-provider durability claim after its live process exits.
     pub durable_recovery_enabled: bool,
-    /// Complete recovery-path inventory consumed by the Phase 5 loss
-    /// certificate. An absent path is explicitly inapplicable.
-    pub recovery_paths: &'static [RecoveryPath],
-    pub managed_modes: &'static [&'static str],
-    pub execution_boundary: &'static str,
-    pub identity_capture: &'static str,
-    pub state_store: &'static str,
-    pub resume_command: Option<&'static str>,
-    pub zero_turn_policy: &'static str,
-    pub checkpoint_policy: &'static str,
-    pub bootstrap: &'static str,
-    pub live_gate: &'static str,
-    pub blocked_reason: Option<&'static str>,
+    pub recovery_paths: Vec<RecoveryPath>,
+    pub managed_modes: Vec<String>,
+    pub execution_boundary: String,
+    pub identity_capture: String,
+    pub state_store: String,
+    pub resume_command: Option<String>,
+    pub zero_turn_policy: String,
+    pub checkpoint_policy: String,
+    pub bootstrap: String,
+    pub blocked_reason: Option<String>,
 }
 
-/// The runtime-side provider inventory.  The checked-in JSON capability
-/// manifest expands this with UI/API ingress coverage; both are compared by
-/// tests so an enabled provider cannot silently lack an adapter.
-pub const PROVIDER_CAPABILITIES: &[ProviderCapability] = &[
-    ProviderCapability {
-        provider: "shell",
-        certification_state: CertificationState::Certified,
-        managed_enabled: true,
-        durable_recovery_enabled: false,
-        recovery_paths: &[RecoveryPath::Reattach, RecoveryPath::PristineSeed],
-        managed_modes: &["shell"],
-        execution_boundary: "session-host-pty",
-        identity_capture: "none-live-process-only",
-        state_store: "soul-volume-plus-terminal-spool",
-        resume_command: None,
-        zero_turn_policy: "pristine-seed-only-with-never-dispatched-proof",
-        checkpoint_policy: "none",
-        bootstrap: "none",
-        live_gate: "deterministic-shell",
-        blocked_reason: None,
-    },
-    ProviderCapability {
-        provider: "claude",
-        certification_state: CertificationState::PendingLiveProviderCertification,
-        managed_enabled: false,
-        durable_recovery_enabled: false,
-        recovery_paths: &[
-            RecoveryPath::Reattach,
-            RecoveryPath::NativeResume,
-            RecoveryPath::CheckpointRestore,
-            RecoveryPath::PristineSeed,
-        ],
-        managed_modes: &["claude"],
-        execution_boundary: "session-host-pty",
-        identity_capture: "preallocated-session-id-plus-transcript-probe",
-        state_store: "$CLAUDE_CONFIG_DIR/projects/**/*.jsonl",
-        resume_command: Some("claude --resume <exact-session-id>"),
-        zero_turn_policy: "preallocated-id-is-not-durable-before-transcript",
-        checkpoint_policy: "provider-transcript-only",
-        bootstrap: ".claude/.credentials.json copied before privilege drop",
-        live_gate: "haiku-lowest-reasoning",
-        blocked_reason: Some("PENDING_LIVE_QUALIFICATION"),
-    },
-    ProviderCapability {
-        provider: "opencode",
-        certification_state: CertificationState::Certified,
-        managed_enabled: true,
-        durable_recovery_enabled: true,
-        recovery_paths: &[
-            RecoveryPath::Reattach,
-            RecoveryPath::NativeResume,
-            RecoveryPath::CheckpointRestore,
-            RecoveryPath::PristineSeed,
-        ],
-        managed_modes: &["opencode"],
-        execution_boundary: "session-host-pty",
-        identity_capture: "soul-local-sqlite-exact-row",
-        state_store: "$XDG_DATA_HOME/opencode/opencode.db",
-        resume_command: Some("opencode --session <exact-ses-id>"),
-        zero_turn_policy: "session-row-must-materialize",
-        checkpoint_policy: "provider-sqlite-only-no-live-copy",
-        bootstrap: ".local/share/opencode/auth.json copied before privilege drop",
-        live_gate: "opencode-1.18.21-big-pickle-free-tier",
-        blocked_reason: None,
-    },
-    ProviderCapability {
-        provider: "codex",
-        certification_state: CertificationState::PendingLiveProviderCertification,
-        managed_enabled: false,
-        durable_recovery_enabled: false,
-        recovery_paths: &[
-            RecoveryPath::Reattach,
-            RecoveryPath::NativeResume,
-            RecoveryPath::CheckpointRestore,
-            RecoveryPath::PristineSeed,
-        ],
-        managed_modes: &["codex"],
-        execution_boundary: "session-host-pty-plus-app-server-proxy",
-        identity_capture: "host-proxy-exact-thread-event-plus-rollout-probe",
-        state_store: "$CODEX_HOME/sessions/**/*.jsonl",
-        resume_command: Some("codex resume <exact-thread-id>"),
-        zero_turn_policy: "no-durable-thread-until-provider-materializes",
-        checkpoint_policy: "provider-rollout-only",
-        bootstrap: ".codex/auth.json copied before privilege drop",
-        live_gate: "gpt-5.6-luna-lowest-reasoning",
-        blocked_reason: Some("PENDING_LIVE_QUALIFICATION"),
-    },
-    ProviderCapability {
-        provider: "amplifier",
-        certification_state: CertificationState::PendingLiveProviderCertification,
-        managed_enabled: false,
-        durable_recovery_enabled: false,
-        recovery_paths: &[
-            RecoveryPath::Reattach,
-            RecoveryPath::NativeResume,
-            RecoveryPath::CheckpointRestore,
-            RecoveryPath::PristineSeed,
-        ],
-        managed_modes: &["amplifier"],
-        execution_boundary: "session-host-pty",
-        identity_capture: "launcher-stub-plus-exact-materialized-session-directory",
-        state_store: "$HOME/.amplifier/projects/**/sessions/<id>",
-        resume_command: Some("amplifier session resume --full-history <exact-id>"),
-        zero_turn_policy: "stub-is-not-durable-conversation-proof",
-        checkpoint_policy: "provider-session-directory",
-        bootstrap: "approved private keys.env reference resolved into child-only env plus image-pinned OneCLI Haiku/low profile; raw OAuth forbidden",
-        live_gate: "provider-approved-lowest-cost-model",
-        blocked_reason: Some("PENDING_LIVE_QUALIFICATION"),
-    },
-    ProviderCapability {
-        provider: "gemini",
-        certification_state: CertificationState::NotApplicable,
-        managed_enabled: false,
-        durable_recovery_enabled: false,
-        recovery_paths: &[],
-        managed_modes: &["gemini"],
-        execution_boundary: "legacy-extension",
-        identity_capture: "none",
-        state_store: "unimplemented",
-        resume_command: None,
-        zero_turn_policy: "no-continuity-claim",
-        checkpoint_policy: "none",
-        bootstrap: "extension-owned",
-        live_gate: "not-enabled",
-        blocked_reason: Some("BLOCKED_RECOVERY_IMPLEMENTATION"),
-    },
-    ProviderCapability {
-        provider: "kimi",
-        certification_state: CertificationState::NotApplicable,
-        managed_enabled: false,
-        durable_recovery_enabled: false,
-        recovery_paths: &[],
-        managed_modes: &["kimi"],
-        execution_boundary: "legacy-extension",
-        identity_capture: "none",
-        state_store: "unimplemented",
-        resume_command: None,
-        zero_turn_policy: "no-continuity-claim",
-        checkpoint_policy: "none",
-        bootstrap: "extension-owned",
-        live_gate: "not-enabled",
-        blocked_reason: Some("BLOCKED_RECOVERY_IMPLEMENTATION"),
-    },
-];
+pub static PROVIDER_CAPABILITIES: std::sync::LazyLock<Vec<ProviderCapability>> =
+    std::sync::LazyLock::new(|| {
+        #[derive(Deserialize)]
+        struct Manifest {
+            providers: Vec<ProviderCapability>,
+        }
+        serde_json::from_str::<Manifest>(include_str!(
+            "../../../docs/development/runtime-provider-capabilities.json"
+        ))
+        .expect("checked-in provider manifest must be valid")
+        .providers
+    });
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "data", rename_all = "snake_case")]
@@ -298,44 +127,17 @@ pub fn recovery_paths(provider: &str) -> Option<&'static [RecoveryPath]> {
             RecoveryPath::CheckpointRestore,
             RecoveryPath::PristineSeed,
         ]),
-        other => capability(other).map(|capability| capability.recovery_paths),
+        other => capability(other).map(|capability| capability.recovery_paths.as_slice()),
     }
 }
 
 pub fn managed_recovery_enabled(provider: &str) -> bool {
     matches!(provider, "phase1-fixture" | "native-session-fixture")
-        || capability(provider).is_some_and(|capability| capability.managed_enabled)
+        || managed_provider_enabled(provider)
 }
 
 pub fn managed_provider_enabled(provider: &str) -> bool {
-    capability(provider).is_some_and(|candidate| candidate.managed_enabled)
-        || qualification_managed_provider_enabled(provider)
-}
-
-/// True only when the provider may make a production durable-soul promise:
-/// live-certified, managed-enabled, and durable-recovery-enabled together.
-///
-/// Every managed-durability claim in the runtime, API, and gates derives from
-/// this single predicate so a deferred provider cannot be promoted by editing
-/// one flag in isolation.
-pub fn durable_souls_certified(provider: &str) -> bool {
-    capability(provider).is_some_and(|candidate| {
-        candidate.certification_state == CertificationState::Certified
-            && candidate.managed_enabled
-            && candidate.durable_recovery_enabled
-    })
-}
-
-/// Providers whose live certification campaign has not yet run. They stay on
-/// the legacy path and are the only cases the landing gate may defer.
-pub fn providers_pending_live_certification() -> Vec<&'static str> {
-    PROVIDER_CAPABILITIES
-        .iter()
-        .filter(|capability| {
-            capability.certification_state == CertificationState::PendingLiveProviderCertification
-        })
-        .map(|capability| capability.provider)
-        .collect()
+    process_managed_provider_policy().is_ok_and(|policy| policy.permits(provider))
 }
 
 #[derive(Debug)]
@@ -1460,247 +1262,54 @@ mod tests {
 
     #[test]
     fn checked_in_capability_manifest_matches_runtime_inventory() {
+        let names: Vec<_> = PROVIDER_CAPABILITIES
+            .iter()
+            .map(|row| row.provider.as_str())
+            .collect();
+        assert_eq!(
+            names,
+            [
+                "shell",
+                "claude",
+                "opencode",
+                "codex",
+                "amplifier",
+                "gemini",
+                "kimi"
+            ]
+        );
+        for row in PROVIDER_CAPABILITIES.iter() {
+            assert_eq!(
+                names.iter().filter(|name| **name == row.provider).count(),
+                1
+            );
+            if row.managed_enabled {
+                assert!(!row.recovery_paths.is_empty());
+            }
+            if row.durable_recovery_enabled {
+                assert!(row.resume_command.is_some());
+            }
+        }
+        let defaults = managed_provider_policy_from_value(None).unwrap();
+        assert!(defaults.permits("shell"));
+        assert!(defaults.permits("opencode"));
+        for provider in ["claude", "codex", "amplifier", "gemini", "kimi"] {
+            assert!(
+                !defaults.permits(provider),
+                "Stage 5a does not silently widen defaults"
+            );
+        }
         let manifest: serde_json::Value = serde_json::from_str(include_str!(
             "../../../docs/development/runtime-provider-capabilities.json"
         ))
         .unwrap();
-        assert_eq!(manifest["schemaVersion"], 1);
-        assert_eq!(manifest["managedRuntimeVersion"], 1);
-        assert_eq!(manifest["releaseScope"]["freshAgentEnabled"], false);
-        assert_eq!(
-            manifest["releaseScope"]["managedTerminalProviders"],
-            serde_json::json!(["opencode"])
-        );
-        let providers = manifest["providers"].as_array().unwrap();
-        assert_eq!(providers.len(), PROVIDER_CAPABILITIES.len());
-
-        for capability in PROVIDER_CAPABILITIES {
-            let matches: Vec<_> = providers
-                .iter()
-                .filter(|entry| entry["provider"] == capability.provider)
-                .collect();
-            assert_eq!(
-                matches.len(),
-                1,
-                "provider {} must occur once",
-                capability.provider
-            );
-            let entry = matches[0];
-            assert_eq!(entry["managedEnabled"], capability.managed_enabled);
-            assert_eq!(
-                entry["durableRecoveryEnabled"],
-                capability.durable_recovery_enabled
-            );
-            let recovery_paths: Vec<_> = entry["recoveryPaths"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .map(|value| value.as_str().unwrap())
-                .collect();
-            let expected_paths: Vec<_> = capability
-                .recovery_paths
-                .iter()
-                .map(|path| match path {
-                    RecoveryPath::Reattach => "reattach",
-                    RecoveryPath::NativeResume => "native_resume",
-                    RecoveryPath::CheckpointRestore => "checkpoint_restore",
-                    RecoveryPath::PristineSeed => "pristine_seed",
-                    RecoveryPath::NativeImport => "native_import",
-                })
-                .collect();
-            assert_eq!(recovery_paths, expected_paths);
-            let modes: Vec<_> = entry["managedModes"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .map(|value| value.as_str().unwrap())
-                .collect();
-            assert_eq!(modes, capability.managed_modes);
-            assert_eq!(entry["executionBoundary"], capability.execution_boundary);
-            assert_eq!(entry["identityCapture"], capability.identity_capture);
-            assert_eq!(entry["stateStore"], capability.state_store);
-            assert_eq!(entry["zeroTurnPolicy"], capability.zero_turn_policy);
-            assert_eq!(entry["checkpointPolicy"], capability.checkpoint_policy);
-            assert_eq!(entry["bootstrap"], capability.bootstrap);
-            assert_eq!(entry["liveGate"], capability.live_gate);
-            assert_eq!(entry["resumeCommand"].as_str(), capability.resume_command);
-            assert_eq!(entry["blockedReason"].as_str(), capability.blocked_reason);
-            if capability.durable_recovery_enabled {
-                assert!(capability.managed_enabled);
-                assert!(capability.resume_command.is_some());
-            }
-        }
-
-        let durable: Vec<_> = PROVIDER_CAPABILITIES
-            .iter()
-            .filter(|capability| capability.durable_recovery_enabled)
-            .map(|capability| capability.provider)
-            .collect();
-        assert_eq!(durable, ["opencode"]);
-        assert_eq!(
-            manifest["releaseScope"]["deferredManagedProviders"],
-            serde_json::json!(["claude", "codex", "amplifier"])
-        );
-        for provider in ["claude", "codex", "amplifier"] {
-            let deferred = capability(provider).expect("deferred adapter remains registered");
-            assert!(!deferred.managed_enabled);
-            assert!(!deferred.durable_recovery_enabled);
-            assert_eq!(deferred.blocked_reason, Some("PENDING_LIVE_QUALIFICATION"));
-        }
-
-        for doorway in manifest["doorways"].as_array().unwrap() {
-            let policy = doorway["policy"].as_str().unwrap();
-            assert!(matches!(policy, "managed" | "blocked" | "legacy"));
-            for provider in doorway["providers"].as_array().unwrap() {
-                let provider = provider.as_str().unwrap();
-                let capability = capability(provider)
-                    .unwrap_or_else(|| panic!("doorway names unknown provider {provider}"));
-                if policy == "managed" {
-                    assert!(
-                        capability.managed_enabled,
-                        "managed doorway cannot route disabled provider {provider}"
-                    );
-                }
-            }
-        }
-
+        assert_eq!(manifest["invariants"]["automaticPromptReplay"], false);
+        assert_eq!(manifest["invariants"]["stopIntentWins"], true);
         assert_eq!(
             manifest["invariants"]["retryDelaysMs"],
             serde_json::json!(AUTOMATIC_RETRY_DELAYS_MS)
         );
-        assert_eq!(
-            manifest["invariants"]["maxSuccessfulRecoveriesPerHour"],
-            MAX_SUCCESSFUL_RECOVERIES_PER_HOUR
-        );
-        assert_eq!(
-            manifest["invariants"]["managedRecoveryMaySpawnFresh"],
-            false
-        );
-        assert_eq!(manifest["invariants"]["automaticPromptReplay"], false);
-        assert_eq!(
-            manifest["invariants"]["lostRequiresAllPathsDefinitivelyUnavailable"],
-            true
-        );
-        assert_eq!(manifest["invariants"]["stopIntentWins"], true);
-    }
-
-    #[test]
-    fn durable_souls_certification_state_is_typed_and_fail_closed() {
-        // A provider may only advertise managed durable-soul ownership when its
-        // live certification campaign has actually passed. The certification
-        // state is the single typed switch; `managedEnabled` /
-        // `durableRecoveryEnabled` are derived promises that must never exceed
-        // it. This is what keeps a documentation-only or convenience
-        // enablement from silently widening the release scope.
-        for capability in PROVIDER_CAPABILITIES {
-            match capability.certification_state {
-                CertificationState::PendingLiveProviderCertification => {
-                    assert!(
-                        !capability.managed_enabled,
-                        "{} is pending live certification and must not be managed-enabled",
-                        capability.provider
-                    );
-                    assert!(
-                        !capability.durable_recovery_enabled,
-                        "{} is pending live certification and must not claim durable recovery",
-                        capability.provider
-                    );
-                    assert_eq!(
-                        capability.blocked_reason,
-                        Some("PENDING_LIVE_QUALIFICATION"),
-                        "{} must carry the typed pending reason",
-                        capability.provider
-                    );
-                    assert!(!durable_souls_certified(capability.provider));
-                }
-                CertificationState::NotApplicable => {
-                    assert!(!capability.durable_recovery_enabled);
-                    assert!(!durable_souls_certified(capability.provider));
-                }
-                CertificationState::Certified => {
-                    assert!(
-                        capability.managed_enabled,
-                        "{} is certified and must be managed-enabled",
-                        capability.provider
-                    );
-                }
-            }
-            if capability.durable_recovery_enabled {
-                assert_eq!(
-                    capability.certification_state,
-                    CertificationState::Certified,
-                    "{} claims durable recovery without a certification",
-                    capability.provider
-                );
-                assert!(durable_souls_certified(capability.provider));
-            }
-        }
-
-        // Unknown providers are never certified.
-        assert!(!durable_souls_certified("not-a-provider"));
-
-        let deferred: Vec<_> = PROVIDER_CAPABILITIES
-            .iter()
-            .filter(|capability| {
-                capability.certification_state
-                    == CertificationState::PendingLiveProviderCertification
-            })
-            .map(|capability| capability.provider)
-            .collect();
-        assert_eq!(deferred, ["claude", "codex", "amplifier"]);
-
-        let certified_durable: Vec<_> = PROVIDER_CAPABILITIES
-            .iter()
-            .filter(|capability| durable_souls_certified(capability.provider))
-            .map(|capability| capability.provider)
-            .collect();
-        assert_eq!(certified_durable, ["opencode"]);
-    }
-
-    #[test]
-    fn checked_in_manifest_publishes_the_same_certification_states() {
-        let manifest: serde_json::Value = serde_json::from_str(include_str!(
-            "../../../docs/development/runtime-provider-capabilities.json"
-        ))
-        .unwrap();
-        for capability in PROVIDER_CAPABILITIES {
-            let entry = manifest["providers"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .find(|entry| entry["provider"] == capability.provider)
-                .unwrap();
-            assert_eq!(
-                entry["certificationState"],
-                capability.certification_state.as_str(),
-                "manifest certification state drifted for {}",
-                capability.provider
-            );
-        }
-
-        let certification = &manifest["certification"];
-        assert_eq!(certification["schemaVersion"], 1);
-        assert_eq!(
-            certification["deferralReason"],
-            "pending_live_provider_certification"
-        );
-        assert_eq!(
-            certification["productionGate"]["status"],
-            "BLOCKED_PENDING_LIVE_PROVIDER_CERTIFICATION"
-        );
-        assert_eq!(
-            certification["deferredProviders"],
-            serde_json::json!(["claude", "codex", "amplifier"])
-        );
-        assert_eq!(
-            certification["certifiedDurableProviders"],
-            serde_json::json!(["opencode"])
-        );
-        assert_eq!(certification["landingGate"]["id"], "durable-souls-landing");
-        assert_eq!(
-            certification["landingGate"]["deferrableProviders"],
-            serde_json::json!(["claude", "codex", "amplifier"])
-        );
+        assert_eq!(manifest["freshAgentModes"].as_array().unwrap().len(), 4);
     }
 
     fn resume_spec_for_test(provider: &str, session_id: &str, provider_home: &Path) -> ResumeSpec {

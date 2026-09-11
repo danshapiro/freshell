@@ -18,7 +18,7 @@
     "typecheck": "npm run typecheck:client && npm run typecheck:server && npm run typecheck:runtime",
     "typecheck:client": "tsc -p tsconfig.json --noEmit",
     "typecheck:server": "tsc -p tsconfig.server.json --noEmit",
-    "typecheck:runtime": "tsc -p tsconfig.runtime.json",
+    "typecheck:runtime": "tsc -p tsconfig.runtime.json && tsc -p tsconfig.runtime-browser.json",
     "prebuild": "tsx scripts/prebuild-guard.ts",
     "build": "npm run typecheck:client && npm run build:client && npm run build:server",
     "build:client": "vite build --config config/vite/vite.config.ts",
@@ -93,10 +93,11 @@
     "test:runtime": "tsx scripts/testing/test-coordinator.ts run test:runtime",
     "test:runtime:raw": "tsx scripts/testing/runtime-gate.ts",
     "test:runtime:phase5:soak": "tsx scripts/testing/runtime-phase5-soak.ts",
-    "test:runtime:campaign": "tsx scripts/testing/runtime-landing-campaign.ts",
+    "test:runtime:campaign": "tsx scripts/testing/runtime-verify.ts",
     "test:runtime:provider-qualification": "tsx scripts/testing/runtime-provider-qualification.ts",
     "test:runtime:fresh-agent-qualification": "tsx scripts/testing/runtime-fresh-agent-qualification.ts",
-    "test:runtime:fresh-agent-fixtures": "FRESHELL_RUNTIME_FRESH_AGENT_FIXTURE_TEST=1 FRESHELL_E2E_BACKEND=local playwright test --config test/e2e-browser/playwright.config.ts --project=rust-chromium test/e2e-browser/specs/runtime-fresh-agent-fixture-rust.spec.ts"
+    "test:runtime:fresh-agent-fixtures": "tsx scripts/testing/runtime-verify.ts --only fresh-agent-fixtures",
+    "test:runtime:verify": "tsx scripts/testing/runtime-verify.ts"
   },
   "dependencies": {
     "@ai-sdk/google": "^3.0.29",

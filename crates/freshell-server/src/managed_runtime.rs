@@ -40,7 +40,7 @@ impl ServerManagedRuntimeController {
         if std::env::var("FRESHELL_MANAGED_RUNTIME_V1").ok().as_deref() != Some("1") {
             return Ok(None);
         }
-        freshell_agent_runtime::process_qualification_policy()?;
+        freshell_agent_runtime::process_managed_provider_policy()?;
         let socket = std::env::var("FRESHELL_RUNTIME_CONTROL_SOCKET").map_err(|_| {
             "FRESHELL_MANAGED_RUNTIME_V1=1 requires FRESHELL_RUNTIME_CONTROL_SOCKET".to_string()
         })?;

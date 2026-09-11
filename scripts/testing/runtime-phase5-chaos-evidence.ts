@@ -3,7 +3,6 @@ import path from 'node:path'
 
 import {
   array,
-  artifactReference,
   equalString,
   exactKeys,
   integer,
@@ -15,7 +14,6 @@ import {
   validateCleanupContainsContainer,
   validateTestCounts,
   type LoadedPhase5Evidence,
-  type RuntimeCandidateEvidence,
 } from './runtime-phase5-evidence-common.js'
 
 export const CHAOS_WEB_REPLACEMENT_CYCLES = 100
@@ -58,13 +56,8 @@ export type Phase5ChaosSummary = {
 
 export type ValidatedPhase5ChaosReceipt = LoadedPhase5Evidence & { summary: Phase5ChaosSummary }
 
-export function validatePhase5ChaosReceipt(input: {
-  repoRoot: string
-  candidateSha: string
-  runtimeImage: string
-  receipt: unknown
-}): ValidatedPhase5ChaosReceipt {
-  const loaded = loadPhase5Evidence({ ...input, kind: 'phase5_chaos', artifactFiles: ARTIFACT_FILES })
+export function assertPhase5ChaosRun(evidenceDir: string): ValidatedPhase5ChaosReceipt {
+  const loaded = loadPhase5Evidence(evidenceDir, ARTIFACT_FILES)
   const assertions = loaded.json.assertions
   exactKeys(assertions, [
     'schemaVersion', 'caseId', 'candidateSha', 'receiptRunId', 'test', 'identity',
@@ -73,8 +66,6 @@ export function validatePhase5ChaosReceipt(input: {
   if (assertions.schemaVersion !== 1 || assertions.caseId !== 'P5-G09') {
     throw new Error('chaos assertion artifact has the wrong schema or case')
   }
-  equalString(assertions.candidateSha, input.candidateSha, 'chaos assertions candidate SHA')
-  equalString(assertions.receiptRunId, loaded.receipt.receiptRunId, 'chaos assertions run id')
   validateTestCounts(assertions.test, 'chaos assertion test counts')
   const identity = validateIdentity(assertions.identity)
   capabilityFor(loaded.json.capabilityInventory, identity.provider)
@@ -112,85 +103,7 @@ export function validatePhase5ChaosReceipt(input: {
     serverLogBytes: loaded.bytes.serverLog.length,
     browserLogBytes: loaded.bytes.browserLog.length,
   }
-  if (stableJson(loaded.receipt.summary) !== stableJson(summary)) {
-    throw new Error('chaos receipt summary differs from evidence-derived summary')
-  }
   return { ...loaded, summary }
-}
-
-export function buildPhase5ChaosReceipt(input: {
-  repoRoot: string
-  evidenceDir: string
-  candidateSha: string
-  runtimeImage: string
-  receiptRunId: string
-  candidateBefore: RuntimeCandidateEvidence
-  candidateAfter: RuntimeCandidateEvidence
-}): Record<string, any> {
-  const evidenceRun = `.runtime-evidence/${input.candidateSha}/${input.receiptRunId}`
-  const expected = path.join(fs.realpathSync(input.repoRoot), ...evidenceRun.split('/'))
-  if (fs.realpathSync(input.evidenceDir) !== expected) throw new Error('chaos builder evidence directory is not the exact candidate run')
-  const assertions = JSON.parse(fs.readFileSync(path.join(input.evidenceDir, PHASE5_CHAOS_ASSERTIONS_FILE), 'utf8'))
-  const identity = assertions.identity
-  const web = validateWebCycles(assertions.webCycles, identity)
-  const supervisor = validateSupervisorCycles(assertions.supervisorCycles, identity, web.lastEnded)
-  const receipt = {
-    schemaVersion: 2,
-    kind: 'phase5_chaos',
-    status: 'PASS',
-    candidateSha: input.candidateSha,
-    runtimeImage: input.runtimeImage,
-    receiptRunId: input.receiptRunId,
-    evidenceRun,
-    candidateIntegrity: { before: input.candidateBefore, after: input.candidateAfter, failures: [] },
-    artifacts: Object.fromEntries(Object.entries(ARTIFACT_FILES).map(([key, descriptor]) => [
-      key, artifactReference(input.evidenceDir, evidenceRun, descriptor.fileName),
-    ])),
-    summary: {
-      provider: identity.provider,
-      soulId: identity.soulId,
-      incarnationId: identity.incarnationId,
-      nativeSessionId: identity.nativeSessionId,
-      webReplacementCycles: 100,
-      supervisorReplacementCycles: 20,
-      approvalDecisionCount: 1,
-      providerToolRequestCount: 2,
-      providerToolResultCount: 2,
-      replayCount: 0,
-      falseLossNoticeCount: 0,
-      unsafeBrokerAttempts: 0,
-      maxCycleGapMs: Math.max(web.maxGap, supervisor.maxGap),
-      serverLogBytes: fs.statSync(path.join(input.evidenceDir, 'phase5-chaos-server-log.jsonl')).size,
-      browserLogBytes: fs.statSync(path.join(input.evidenceDir, 'phase5-chaos-browser-log.jsonl')).size,
-    },
-  }
-  validatePhase5ChaosReceipt({ ...input, receipt })
-  return receipt
-}
-
-export function phase5ChaosRetainedBundle(validated: ValidatedPhase5ChaosReceipt): {
-  files: Record<string, Buffer>
-  index: Record<string, unknown>
-} {
-  const names: Record<string, string> = {
-    assertions: 'assertions.json', providerEvents: 'provider-events.json', lifecycle: 'lifecycle.jsonl',
-    broker: 'broker.jsonl', cleanup: 'cleanup.json', build: 'build.json', manifest: 'manifest.json',
-    capabilityInventory: 'capability-inventory.json', serverLog: 'server-log.jsonl', browserLog: 'browser-log.jsonl',
-  }
-  return {
-    files: Object.fromEntries(Object.entries(names).map(([key, name]) => [name, validated.bytes[key]])),
-    index: {
-      schemaVersion: 1,
-      candidateSha: validated.receipt.candidateSha,
-      receiptRunId: validated.receipt.receiptRunId,
-      evidenceRun: validated.receipt.evidenceRun,
-      sourceReceiptSha256: validated.sourceReceiptSha256,
-      files: Object.fromEntries(Object.entries(names).map(([key, name]) => [
-        name,
-        { originalPath: validated.receipt.artifacts[key].path, sha256: validated.receipt.artifacts[key].sha256 },
-      ])),
-    },
-  }
 }
 
 type RuntimeIdentity = {

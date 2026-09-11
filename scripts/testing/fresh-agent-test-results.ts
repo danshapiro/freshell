@@ -1,24 +1,18 @@
-import { createHash } from 'node:crypto'
 import fs from 'node:fs'
+
 import path from 'node:path'
 
 import {
   QUALIFIABLE_FRESH_AGENT_MODES,
   type QualifiableFreshAgentMode,
 } from './fresh-agent-qualification-selection.js'
+
 import {
   FRESH_AGENT_INGRESS_INVENTORY,
   type FreshAgentIngressId,
 } from './fresh-agent-ingress-inventory.js'
 
-export const FRESH_AGENT_QUALIFICATION_ASSERTIONS_FILE = 'fresh-agent-qualification-assertions.json'
-export const FRESH_AGENT_QUALIFICATION_BROKER_FILE = 'broker.jsonl'
-export const FRESH_AGENT_QUALIFICATION_CLEANUP_FILE = 'cleanup.json'
-export const FRESH_AGENT_QUALIFICATION_CANDIDATE_FILE = 'build.json'
-
 const SHA256 = /^[a-f0-9]{64}$/
-const CANDIDATE_SHA = /^[a-f0-9]{40}$/
-const SAFE_RUN_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/
 
 const MODE_CONTRACT = {
   freshclaude: {
@@ -114,156 +108,6 @@ export type FreshAgentQualificationRow = {
     writerClaimReleasedBeforeResume: boolean
   }
   [key: string]: unknown
-}
-
-export type FreshQualificationArtifactReference = {
-  path: string
-  sha256: string
-}
-
-export type FreshAgentQualificationReceiptV1 = {
-  schemaVersion: 1
-  lane: 'fresh_agent_live'
-  status: 'PASS'
-  candidateSha: string
-  receiptRunId: string
-  evidenceRun: string
-  runtimeImage: string
-  selectedModes: QualifiableFreshAgentMode[]
-  rows: FreshAgentQualificationRow[]
-  artifacts: {
-    candidate: FreshQualificationArtifactReference
-    assertions: FreshQualificationArtifactReference
-    broker: FreshQualificationArtifactReference
-    cleanup: FreshQualificationArtifactReference
-  }
-}
-
-export type BuildFreshAgentQualificationReceiptInput = {
-  repoRoot: string
-  evidenceDir: string
-  candidateSha: string
-  receiptRunId: string
-  runtimeImage: string
-  selectedModes: QualifiableFreshAgentMode[]
-  rows: FreshAgentQualificationRow[]
-}
-
-export type ValidateFreshAgentQualificationReceiptInput = {
-  repoRoot: string
-  candidateSha: string
-  expectedRuntimeImage: string
-  receipt: unknown
-}
-
-export function buildFreshAgentQualificationReceipt(
-  input: BuildFreshAgentQualificationReceiptInput,
-): FreshAgentQualificationReceiptV1 {
-  validateCandidate(input.candidateSha, input.runtimeImage, input.receiptRunId)
-  const repoRoot = fs.realpathSync(input.repoRoot)
-  const evidenceRun = expectedEvidenceRun(input.candidateSha, input.receiptRunId)
-  const expectedDir = path.join(repoRoot, ...evidenceRun.split('/'))
-  if (fs.realpathSync(input.evidenceDir) !== expectedDir) {
-    throw new Error(`fresh-agent evidence directory must be the candidate-bound run ${evidenceRun}`)
-  }
-  validateRunArtifacts(expectedDir, input.candidateSha, input.receiptRunId, input.runtimeImage, input.selectedModes)
-  validateRows(repoRoot, input.selectedModes, input.rows)
-  rejectSensitiveFields(input.rows)
-  assertBrokerSafe(readRegularFile(path.join(expectedDir, FRESH_AGENT_QUALIFICATION_BROKER_FILE), 'broker artifact'))
-  assertCleanupSafe(readRegularFile(path.join(expectedDir, FRESH_AGENT_QUALIFICATION_CLEANUP_FILE), 'cleanup artifact'))
-
-  const assertionPath = path.join(expectedDir, FRESH_AGENT_QUALIFICATION_ASSERTIONS_FILE)
-  fs.writeFileSync(assertionPath, JSON.stringify({
-    schemaVersion: 1,
-    lane: 'fresh_agent_live',
-    candidateSha: input.candidateSha,
-    receiptRunId: input.receiptRunId,
-    runtimeImage: input.runtimeImage,
-    selectedModes: input.selectedModes,
-    rows: input.rows,
-  }, null, 2), { mode: 0o600 })
-
-  const artifact = (fileName: string): FreshQualificationArtifactReference => ({
-    path: `${evidenceRun}/${fileName}`,
-    sha256: sha256File(path.join(expectedDir, fileName)),
-  })
-  const receipt: FreshAgentQualificationReceiptV1 = {
-    schemaVersion: 1,
-    lane: 'fresh_agent_live',
-    status: 'PASS',
-    candidateSha: input.candidateSha,
-    receiptRunId: input.receiptRunId,
-    evidenceRun,
-    runtimeImage: input.runtimeImage,
-    selectedModes: [...input.selectedModes],
-    rows: input.rows,
-    artifacts: {
-      candidate: artifact(FRESH_AGENT_QUALIFICATION_CANDIDATE_FILE),
-      assertions: artifact(FRESH_AGENT_QUALIFICATION_ASSERTIONS_FILE),
-      broker: artifact(FRESH_AGENT_QUALIFICATION_BROKER_FILE),
-      cleanup: artifact(FRESH_AGENT_QUALIFICATION_CLEANUP_FILE),
-    },
-  }
-  validateFreshAgentQualificationReceipt({
-    repoRoot,
-    candidateSha: input.candidateSha,
-    expectedRuntimeImage: input.runtimeImage,
-    receipt,
-  })
-  return receipt
-}
-
-export function validateFreshAgentQualificationReceipt(
-  input: ValidateFreshAgentQualificationReceiptInput,
-): { receipt: FreshAgentQualificationReceiptV1, rows: FreshAgentQualificationRow[] } {
-  const receipt = object(input.receipt, 'fresh-agent qualification receipt')
-  if (receipt.schemaVersion !== 1) throw new Error('fresh-agent qualification receipt must use schema v1; legacy evidence is rejected')
-  if (receipt.lane !== 'fresh_agent_live') throw new Error('fresh-agent qualification receipt has the wrong lane')
-  if (receipt.status !== 'PASS') throw new Error('fresh-agent qualification receipt is not PASS')
-  validateCandidate(input.candidateSha, input.expectedRuntimeImage, receipt.receiptRunId)
-  stringEqual(receipt.candidateSha, input.candidateSha, 'receipt candidate SHA')
-  stringEqual(receipt.runtimeImage, input.expectedRuntimeImage, 'receipt runtime image')
-  const evidenceRun = expectedEvidenceRun(input.candidateSha, receipt.receiptRunId)
-  stringEqual(receipt.evidenceRun, evidenceRun, 'receipt evidence run')
-
-  const repoRoot = fs.realpathSync(input.repoRoot)
-  const evidenceDir = path.join(repoRoot, ...evidenceRun.split('/'))
-  if (!fs.existsSync(evidenceDir)) throw new Error(`fresh-agent evidence run is missing: ${evidenceRun}`)
-  if (fs.realpathSync(evidenceDir) !== evidenceDir) throw new Error('fresh-agent evidence run must not traverse a symlink')
-  validateRows(repoRoot, receipt.selectedModes, receipt.rows)
-  rejectSensitiveFields(receipt.rows)
-
-  const artifacts = object(receipt.artifacts, 'fresh-agent receipt artifacts')
-  const candidateBytes = validateArtifact(evidenceDir, evidenceRun, FRESH_AGENT_QUALIFICATION_CANDIDATE_FILE, artifacts.candidate)
-  const assertionBytes = validateArtifact(evidenceDir, evidenceRun, FRESH_AGENT_QUALIFICATION_ASSERTIONS_FILE, artifacts.assertions)
-  const brokerBytes = validateArtifact(evidenceDir, evidenceRun, FRESH_AGENT_QUALIFICATION_BROKER_FILE, artifacts.broker)
-  const cleanupBytes = validateArtifact(evidenceDir, evidenceRun, FRESH_AGENT_QUALIFICATION_CLEANUP_FILE, artifacts.cleanup)
-  // Candidate bytes are hashed independently above; parse again so a valid
-  // digest over a stale build can never satisfy this validator.
-  const candidate = parseJsonObject(candidateBytes, 'candidate build artifact')
-  stringEqual(candidate.candidateSha, input.candidateSha, 'candidate build SHA')
-  stringEqual(candidate.runtimeImage, input.expectedRuntimeImage, 'candidate runtime image')
-  validateRunArtifacts(evidenceDir, input.candidateSha, receipt.receiptRunId, input.expectedRuntimeImage, receipt.selectedModes)
-
-  const assertion = parseJsonObject(assertionBytes, 'fresh-agent assertion artifact')
-  if (assertion.schemaVersion !== 1 || assertion.lane !== 'fresh_agent_live') {
-    throw new Error('fresh-agent assertion artifact has an unsupported schema or lane')
-  }
-  stringEqual(assertion.candidateSha, input.candidateSha, 'assertion candidate SHA')
-  stringEqual(assertion.receiptRunId, receipt.receiptRunId, 'assertion run id')
-  stringEqual(assertion.runtimeImage, input.expectedRuntimeImage, 'assertion runtime image')
-  if (stableJson(assertion.selectedModes) !== stableJson(receipt.selectedModes)
-    || stableJson(assertion.rows) !== stableJson(receipt.rows)) {
-    throw new Error('fresh-agent receipt summary differs from its hashed assertion artifact')
-  }
-  validateRows(repoRoot, assertion.selectedModes, assertion.rows)
-  rejectSensitiveFields(assertion.rows)
-  assertBrokerSafe(brokerBytes)
-  assertCleanupSafe(cleanupBytes)
-  return {
-    receipt: receipt as FreshAgentQualificationReceiptV1,
-    rows: assertion.rows,
-  }
 }
 
 function validateRows(
@@ -395,70 +239,6 @@ function validateLimits(mode: string, value: unknown): void {
   if (limits.swapMax !== '0') throw new Error(`${mode}.limits.swapMax must prove swap is disabled`)
 }
 
-function validateRunArtifacts(
-  evidenceDir: string,
-  candidateSha: string,
-  runId: string,
-  runtimeImage: string,
-  selectedModes: unknown,
-): void {
-  const manifest = parseJsonObject(readRegularFile(path.join(evidenceDir, 'manifest.json'), 'run manifest'), 'run manifest')
-  const execution = object(manifest.execution, 'run manifest execution')
-  stringEqual(execution.candidateSha, candidateSha, 'run manifest candidate SHA')
-  stringEqual(execution.runId, runId, 'run manifest run id')
-  const build = parseJsonObject(readRegularFile(path.join(evidenceDir, 'build.json'), 'candidate build artifact'), 'candidate build artifact')
-  stringEqual(build.candidateSha, candidateSha, 'candidate build SHA')
-  stringEqual(build.runtimeImage, runtimeImage, 'candidate runtime image')
-  const qualification = object(build.freshAgentQualificationBuild, 'fresh-agent qualification build')
-  if (qualification.kind !== 'production') {
-    throw new Error('deterministic fresh-agent fixtures cannot satisfy a live qualification receipt')
-  }
-  if (stableJson(qualification.serverFeatures) !== stableJson(['managed-runtime-v1'])
-    || stableJson(qualification.sessionHostFeatures) !== stableJson([])
-    || stableJson(qualification.fixtureModes) !== stableJson([])) {
-    throw new Error('live fresh-agent qualification must use production server and session-host features')
-  }
-  if (stableJson(qualification.selectedModes) !== stableJson(selectedModes)) {
-    throw new Error('fresh-agent qualification build selected modes differ from the receipt')
-  }
-  const binaries = object(build.binaries, 'candidate binaries')
-  for (const key of ['server', 'supervisor', 'sessionHost']) {
-    requireSha256(object(binaries[key], `${key} binary`).sha256, `${key} binary SHA-256`)
-  }
-}
-
-function validateArtifact(
-  evidenceDir: string,
-  evidenceRun: string,
-  fileName: string,
-  candidate: unknown,
-): Buffer {
-  const artifact = object(candidate, `${fileName} artifact reference`)
-  stringEqual(artifact.path, `${evidenceRun}/${fileName}`, `${fileName} artifact path`)
-  requireSha256(artifact.sha256, `${fileName} artifact SHA-256`)
-  const bytes = readRegularFile(path.join(evidenceDir, fileName), `${fileName} artifact`)
-  const actual = sha256(bytes)
-  if (actual !== artifact.sha256) throw new Error(`${fileName} artifact SHA-256 digest mismatch`)
-  return bytes
-}
-
-function assertBrokerSafe(bytes: Buffer): void {
-  const lines = bytes.toString('utf8').split(/\r?\n/).filter((line) => line.trim())
-  if (lines.length === 0) throw new Error('broker artifact contains no broker events')
-  for (const [index, line] of lines.entries()) {
-    const event = parseJsonObject(Buffer.from(line), `broker artifact line ${index + 1}`)
-    if (event.unsafeAttempt === true) throw new Error('broker artifact contains an unsafe attempt')
-  }
-}
-
-function assertCleanupSafe(bytes: Buffer): void {
-  const cleanup = parseJsonObject(bytes, 'cleanup artifact')
-  if (cleanup.ok !== true || !Array.isArray(cleanup.errors) || cleanup.errors.length !== 0
-    || !Array.isArray(cleanup.unsafeBrokerAttempts) || cleanup.unsafeBrokerAttempts.length !== 0) {
-    throw new Error('cleanup artifact does not prove exact safe cleanup')
-  }
-}
-
 const FORBIDDEN_KEY = /^(?:responseText|prompt|credentialValue|rawProviderEvents|workspaceData)$/i
 
 function rejectSensitiveFields(value: unknown, location = 'rows'): void {
@@ -471,17 +251,6 @@ function rejectSensitiveFields(value: unknown, location = 'rows'): void {
     if (FORBIDDEN_KEY.test(key)) throw new Error(`forbidden sensitive receipt field at ${location}.${key}`)
     rejectSensitiveFields(child, `${location}.${key}`)
   }
-}
-
-function validateCandidate(candidateSha: unknown, runtimeImage: unknown, runId: unknown): void {
-  if (typeof candidateSha !== 'string' || !CANDIDATE_SHA.test(candidateSha)) throw new Error('candidate SHA must be an exact 40-character lowercase git SHA')
-  if (typeof runtimeImage !== 'string' || !/^sha256:[a-f0-9]{64}$/.test(runtimeImage)) throw new Error('runtime image must be an exact sha256 digest')
-  if (typeof runId !== 'string' || !SAFE_RUN_ID.test(runId)) throw new Error('receipt run ID is invalid')
-}
-
-function expectedEvidenceRun(candidateSha: string, runId: string): string {
-  validateCandidate(candidateSha, `sha256:${'0'.repeat(64)}`, runId)
-  return `.runtime-evidence/${candidateSha}/${runId}`
 }
 
 function object(value: unknown, label: string): Record<string, any> {
@@ -531,14 +300,11 @@ function parseJsonObject(bytes: Buffer, label: string): Record<string, any> {
   return object(value, label)
 }
 
-function sha256(bytes: Buffer): string {
-  return createHash('sha256').update(bytes).digest('hex')
-}
-
-function sha256File(file: string): string {
-  return sha256(readRegularFile(file, path.basename(file)))
-}
-
 function stableJson(value: unknown): string {
   return JSON.stringify(value)
+}
+/** Direct checks shared by live mode tests. Fixture observations cannot pass. */
+export function assertFreshAgentResults(repoRoot: string, selectedModes: unknown, rows: unknown): asserts rows is FreshAgentQualificationRow[] {
+  rejectSensitiveFields(rows)
+  validateRows(repoRoot, selectedModes, rows)
 }

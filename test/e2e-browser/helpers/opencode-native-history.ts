@@ -123,7 +123,8 @@ export function selectNativeAssistantTurn(
   expectedText: string,
 ): NativeAssistantTurn | null {
   return turns.find((turn) => (
-    !priorMessageIds.has(turn.messageId)
+    typeof turn.messageId === 'string'
+    && !priorMessageIds.has(turn.messageId)
     && turn.toolCalls.length === 0
     && turn.text.includes(expectedText)
   )) ?? null

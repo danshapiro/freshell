@@ -892,63 +892,18 @@
       ]
     }
   ],
-  "certification_gates": {
-    "schema_version": 1,
-    "source_manifest": "docs/development/runtime-provider-capabilities.json",
-    "provider_certification_case_ids": [
-      "PC-SCOPE",
-      "PC-SHELL",
-      "PC-CLAUDE",
-      "PC-OPENCODE",
-      "PC-CODEX",
-      "PC-AMPLIFIER"
-    ],
-    "case_statuses": [
-      "PASS",
-      "DEFERRED_LIVE_PROVIDER_CERTIFICATION",
-      "BLOCKED",
-      "FAIL"
-    ],
-    "deferral_reason": "pending_live_provider_certification",
-    "modes": {
-      "landing": {
-        "id": "durable-souls-landing",
-        "command": "npm run test:runtime -- gate landing --require-live",
-        "cumulative_phase": "phase-5",
-        "may_pass_with_deferred_providers": true,
-        "deferrable_providers": [
-          "claude",
-          "codex",
-          "amplifier"
-        ],
-        "every_other_case_must_pass": true,
-        "deferral_is_not_a_pass": true
-      },
-      "production": {
-        "id": "durable-souls-production-gate-5",
-        "command": "npm run test:runtime -- gate phase-5 --require-live",
-        "cumulative_phase": "phase-5",
-        "may_pass_with_deferred_providers": false,
-        "expected_status_until_live_certification": "BLOCKED",
-        "expected_blocked_reason": "pending_live_provider_certification",
-        "blocked_is_never_pass": true,
-        "required_certified_providers": [
-          "shell",
-          "opencode",
-          "claude",
-          "codex",
-          "amplifier"
-        ]
-      }
+  "stage_5a": {
+    "scope": "Original behavioral scenarios remain; report-only consumers are replaced by direct tests.",
+    "direct_browser_scenarios": {
+      "P2-G01": "runtime-terminal-continuity-rust.spec.ts",
+      "P2-G04": "runtime-terminal-continuity-rust.spec.ts",
+      "P3-G01": "runtime-managed-provider-qualification-rust.spec.ts and runtime-fresh-agent-qualification-rust.spec.ts",
+      "P3-G10": "runtime-provider-resurrection-rust.spec.ts",
+      "P4-G08": "runtime-tabs-rehydrate-rust.spec.ts"
     },
-    "required_artifacts": [
-      "summary.json",
-      "deferred-providers.json"
-    ],
-    "scope_case": {
-      "id": "PC-SCOPE",
-      "procedure": "Audit the checked-in capability manifest before classifying any provider: no uncertified provider may be managed-enabled, claim durable recovery, be routed by a managed doorway, or appear in the managed release scope.",
-      "pass_assertion": "Zero release-scope violations; the declared certified/deferred sets equal the provider rows; the certification case set is exact."
-    }
+    "direct_stress_scenarios": {
+      "P5-G10": "scripts/testing/runtime-phase5-soak.ts"
+    },
+    "remaining_cases": "50 deterministic runtime cases plus their separately executed live/browser assertions. A deterministic result is never the whole product result."
   }
 }

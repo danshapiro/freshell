@@ -1,4 +1,4 @@
-import { execFileSync } from 'node:child_process'
+import { runVerification } from './runtime-verify.js'
 import { pathToFileURL } from 'node:url'
 import {
   FRESH_AGENT_QUALIFICATION_MODES_ENV,
@@ -7,7 +7,6 @@ import {
 
 export const FRESH_AGENT_QUALIFICATION_LIVE_ENV =
   'FRESHELL_RUNTIME_FRESH_AGENT_QUALIFICATION_LIVE'
-const SPEC = 'test/e2e-browser/specs/runtime-fresh-agent-qualification-rust.spec.ts'
 
 export function selectedFreshAgentModeFromArgs(args: readonly string[]): string {
   const values = args[0] === '--mode' ? args.slice(1) : args
@@ -21,24 +20,14 @@ export function selectedFreshAgentModeFromArgs(args: readonly string[]): string 
   return selected[0]
 }
 
-export function runSelectedFreshAgentQualification(args = process.argv.slice(2)): void {
-  const mode = selectedFreshAgentModeFromArgs(args)
-  execFileSync('npm', [
-    'run', 'test:e2e:local', '--', '--project=rust-chromium', SPEC,
-  ], {
-    cwd: process.cwd(),
-    env: {
-      ...process.env,
-      [FRESH_AGENT_QUALIFICATION_LIVE_ENV]: '1',
-      [FRESH_AGENT_QUALIFICATION_MODES_ENV]: mode,
-    },
-    stdio: 'inherit',
-  })
+export async function runSelectedFreshAgentQualification(args = process.argv.slice(2)): Promise<number> {
+  const selected = selectedFreshAgentModeFromArgs(args)
+  return runVerification({ only: ['fresh-agent-qualification'] }, { [FRESH_AGENT_QUALIFICATION_MODES_ENV]: selected })
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
   try {
-    runSelectedFreshAgentQualification()
+    process.exitCode = await runSelectedFreshAgentQualification()
   } catch (error) {
     process.stderr.write(`${error instanceof Error ? error.message : String(error)}\n`)
     process.exitCode = 1

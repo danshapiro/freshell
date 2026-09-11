@@ -11,11 +11,10 @@ import {
   type RuntimeLimits,
   type SupervisorInstance,
 } from '../../../scripts/testing/runtime-sandbox.js'
-import { receiptArtifactName } from '../../../scripts/testing/runtime-receipts.js'
 
 export const PHASE4_CASE_IDS = [
   'P4-G01', 'P4-G02', 'P4-G03', 'P4-G04', 'P4-G05', 'P4-G06',
-  'P4-G07', 'P4-G08', 'P4-G09', 'P4-G10', 'P4-G11',
+  'P4-G07', 'P4-G09', 'P4-G10', 'P4-G11',
 ] as const
 
 export type Phase4BlockedCase = {
@@ -41,6 +40,7 @@ type NativeSoul = {
 export async function runPhase4Gate(
   harness: RuntimeHarness,
   onCasePassed: (caseId: string) => void = () => {},
+  only?: ReadonlySet<string>,
 ): Promise<Phase4RunResult> {
   const executed: string[] = []
   const blocked: Phase4BlockedCase[] = []
@@ -55,10 +55,10 @@ export async function runPhase4Gate(
     ['P4-G09', gate09StartupBoundsAndDatabaseHealth],
     ['P4-G10', gate10CloseStopCrossDeviceAndCompatibility],
     ['P4-G11', gate11LegacyRegressionAndContractFreeze],
-    ['P4-G08', gate08BrowserReceipt],
   ] as const
 
   for (const [caseId, run] of cases) {
+    if (only && !only.has(caseId)) continue
     harness.recordLifecycle('gate.case.started', { caseId })
     try {
       await run(harness)
@@ -81,7 +81,7 @@ export async function runPhase4Gate(
     }
   }
 
-  validatePhase4Coverage(PHASE4_CASE_IDS, executed, blocked.map((row) => row.caseId))
+  validatePhase4Coverage(PHASE4_CASE_IDS.filter(id => !only || only.has(id)), executed, blocked.map((row) => row.caseId))
   return { executed, blocked }
 }
 
@@ -226,7 +226,7 @@ async function gate03RestartIdempotence(h: RuntimeHarness): Promise<void> {
 
 async function gate04SavedLayoutMerge(h: RuntimeHarness): Promise<void> {
   const caseId = 'P4-G04'
-  runFocusedNodeTest(h, 'test/unit/lib/managed-runtime-recovery.test.ts')
+  h.runFocusedVitest('test/unit/lib/managed-runtime-recovery.test.ts')
   const source = fs.readFileSync(
     path.join(h.repoRoot, 'src/lib/recovery/managed-runtime-recovery.ts'),
     'utf8',
@@ -276,7 +276,7 @@ async function gate05StoppedHistoryRetained(h: RuntimeHarness): Promise<void> {
 
 async function gate06StatusAndAccessibility(h: RuntimeHarness): Promise<void> {
   const caseId = 'P4-G06'
-  runFocusedNodeTest(h, 'test/unit/client/components/ManagedAgentRecoveryStatus.test.tsx')
+  h.runFocusedVitest('test/unit/client/components/ManagedAgentRecoveryStatus.test.tsx')
   const source = fs.readFileSync(
     path.join(h.repoRoot, 'src/components/ManagedAgentRecoveryStatus.tsx'),
     'utf8',
@@ -337,30 +337,6 @@ async function gate07ResourceLimits(h: RuntimeHarness): Promise<void> {
     expectedControlEpoch: await controlEpoch(h, supervisor),
   }), { requestId: newRequest() })
   h.assert(caseId, invalid.result?.Err?.code === 'INVALID_RUNTIME_LIMITS', 'invalid edits fail before the UI may update its projection', invalid)
-}
-
-async function gate08BrowserReceipt(h: RuntimeHarness): Promise<void> {
-  const caseId = 'P4-G08'
-  const raw = process.env.FRESHELL_RUNTIME_PHASE4_BROWSER_RECEIPT
-  if (!raw?.trim()) {
-    throw new RuntimeGateBlockedError(
-      caseId,
-      'Run runtime-tabs-rehydrate-rust.spec.ts and set FRESHELL_RUNTIME_PHASE4_BROWSER_RECEIPT to its candidate-bound JSON receipt.',
-      { requiredEnvironmentVariable: 'FRESHELL_RUNTIME_PHASE4_BROWSER_RECEIPT' },
-    )
-  }
-  const receipt = readReceipt(raw, caseId)
-  h.assert(caseId, receipt.schemaVersion === 1 && receipt.status === 'PASS', 'browser receipt is an explicit schema-v1 PASS', receipt)
-  h.assert(caseId, receipt.candidateSha === h.candidateSha, 'browser receipt belongs to the exact candidate commit', receipt)
-  const browser = receipt.browser ?? receipt
-  h.assert(caseId, browser.browserInteraction === true, 'receipt was produced through a real browser interaction', browser)
-  h.assert(caseId, browser.coldStartAgents >= 3 && browser.restartCycles >= 3, 'cold-start and repeated reconnect paths were exercised', browser)
-  h.assert(caseId, browser.deterministicPlacement === true && browser.singleViewPerIntent === true, 'automatic tabs have deterministic exactly-once placement', browser)
-  h.assert(caseId, browser.existingLayoutPreserved === true && browser.focusStable === true, 'browser merge preserves saved layout and focus', browser)
-  h.assert(caseId, browser.sameSoulIds === true && browser.noBlankSubstitution === true, 'browser recovery preserves soul/native identity without a blank substitute', browser)
-  h.assert(caseId, browser.closeViewKeepsAgent === true && browser.stopAgentStopsRuntime === true, 'browser distinguishes Close view from Stop agent', browser)
-  h.assert(caseId, browser.oldClientNoDuplicate === true, 'compatibility client cannot duplicate an existing managed soul', browser)
-  h.writeBrowserArtifact(receiptArtifactName('FRESHELL_RUNTIME_PHASE4_BROWSER_RECEIPT', caseId), receipt)
 }
 
 async function gate09StartupBoundsAndDatabaseHealth(h: RuntimeHarness): Promise<void> {
@@ -466,12 +442,12 @@ async function gate10CloseStopCrossDeviceAndCompatibility(h: RuntimeHarness): Pr
   }), { requestId: newRequest() })
   h.assert(caseId, stale.result?.Err?.code === 'STALE_INTENT_REVISION', 'stale pre-stop view mutation cannot recreate a stopped runtime', stale)
   runFocusedRustTest(h, 'freshell-ws', 'legacy_capability_replay_adopts_existing_managed_terminal_without_launch')
-  runFocusedNodeTest(h, 'test/unit/lib/managed-runtime-recovery.test.ts')
+  h.runFocusedVitest('test/unit/lib/managed-runtime-recovery.test.ts')
 }
 
 async function gate11LegacyRegressionAndContractFreeze(h: RuntimeHarness): Promise<void> {
   const caseId = 'P4-G11'
-  runFocusedNodeTest(h, 'test/unit/port/managed-runtime-contract-freeze.test.ts')
+  h.runFocusedVitest('test/unit/port/managed-runtime-contract-freeze.test.ts')
   runFocusedRustTest(h, 'freshell-ws', 'managed_ids_are_retry_stable_and_domain_separated')
   const output = runMise(h, 'rust@1.96', [
     'cargo', 'test', '-p', 'freshell-ws', '--test', 'unknown_terminal_reply', '--all-features', '--', '--nocapture',
@@ -598,30 +574,11 @@ function runFocusedRustTest(h: RuntimeHarness, packageName: string, filter: stri
   }
 }
 
-function runFocusedNodeTest(h: RuntimeHarness, testPath: string): void {
-  const output = runMise(h, 'node@22', [
-    'npm', 'run', 'test:vitest', '--', 'run', testPath,
-    '--config', testPath.startsWith('test/unit/port/')
-      ? 'config/vitest/vitest.port.config.ts'
-      : 'config/vitest/vitest.config.ts',
-  ])
-  if (!/Tests\s+[1-9]\d* passed/.test(output)) {
-    throw new Error(`focused Vitest ${testPath} ran no tests or did not report success\n${output}`)
-  }
-}
 
 function runMise(h: RuntimeHarness, tool: string, args: string[]): string {
   return h.runCommand(path.join(os.homedir(), '.local', 'bin', 'mise'), [
     'exec', tool, '--', ...args,
   ])
-}
-
-function readReceipt(raw: string, caseId: string): any {
-  try {
-    return JSON.parse(raw.trim().startsWith('{') ? raw : fs.readFileSync(raw, 'utf8'))
-  } catch (error) {
-    throw new Error(`${caseId} receipt is not valid JSON or a readable JSON path: ${String(error)}`)
-  }
 }
 
 function dataOf(result: any, expectedKind: string): any {

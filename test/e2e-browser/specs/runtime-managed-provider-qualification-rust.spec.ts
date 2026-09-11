@@ -14,7 +14,7 @@ import path from 'node:path'
 
 import { expect, type Page } from '@playwright/test'
 
-import type { ProviderQualificationRow } from '../../../scripts/testing/provider-qualification-receipt.js'
+import type { ProviderQualificationRow } from '../../../scripts/testing/provider-test-results.js'
 import {
   QUALIFICATION_PROVIDER_SELECTION_ENV,
   parseQualificationProviderSelection,
@@ -563,9 +563,9 @@ test.describe.serial('selectable managed-provider qualification', () => {
       const cleanup = await rig.stop()
       expect(cleanup.ok, cleanup.errors.join('\n')).toBe(true)
     }
-    const finalized = rig.finalizeProviderQualificationReceipt(providers)
-    expect(finalized.receipt.schemaVersion).toBe(2)
-    expect(finalized.receipt.providers).toHaveLength(definitions.length)
+    const finalized = rig.writeProviderResults(providers)
+    expect(finalized.report.schemaVersion).toBe(2)
+    expect(finalized.report.providers).toHaveLength(definitions.length)
     // eslint-disable-next-line no-console
     console.log(`[provider-qualification] selected-provider receipts: ${finalized.paths.join(', ')}`)
   })

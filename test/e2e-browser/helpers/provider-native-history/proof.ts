@@ -3,7 +3,7 @@ import { createHash } from 'node:crypto'
 import type {
   NativeProofStage,
   ProviderNativeTurnProof,
-} from '../../../../scripts/testing/provider-qualification-receipt.js'
+} from '../../../../scripts/testing/provider-test-results.js'
 import type { NativeAssistantTurn } from './types.js'
 
 export function nativeTurnProof(

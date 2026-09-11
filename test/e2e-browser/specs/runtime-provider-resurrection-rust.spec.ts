@@ -262,7 +262,7 @@ test.describe.serial('Phase 3 provider resurrection', () => {
       expect(toolEffectCount).toBe(1)
 
       await terminal.executeCommandInserted('Reply with exactly P3_FOLLOWUP_OK and use no tools.', 1)
-      const followUpText = await terminal.waitForOutput('P3_FOLLOWUP_OK', {
+      await terminal.waitForOutput('P3_FOLLOWUP_OK', {
         terminalId,
         timeout: 180_000,
       })
@@ -293,11 +293,11 @@ test.describe.serial('Phase 3 provider resurrection', () => {
           accidentalApproval,
           toolCompletedExactlyOnce: toolEffectCount === 1,
           providerHostSurvivedWebRestart,
-          followUpCompleted: followUpText.includes('P3_FOLLOWUP_OK'),
+          followUpCompleted: true, // terminal.waitForOutput above rejects unless the marker appears
           followUpResponse: 'P3_FOLLOWUP_OK',
         },
       }
-      const receiptPath = rig.writePhase3BrowserReceipt(receipt)
+      const receiptPath = rig.writeResurrectionResult(receipt)
       // eslint-disable-next-line no-console
       console.log(`[P3-G10] provider resurrection receipt: ${receiptPath}`)
     } finally {

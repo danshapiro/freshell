@@ -7,7 +7,6 @@ publish.workspace = true
 
 [features]
 default = []
-provider-qualification = []
 
 [dependencies]
 freshell-runtime-protocol = { path = "../freshell-runtime-protocol" }

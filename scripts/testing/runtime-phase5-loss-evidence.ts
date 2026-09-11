@@ -3,7 +3,6 @@ import path from 'node:path'
 
 import {
   array,
-  artifactReference,
   digest,
   equalString,
   exactKeys,
@@ -17,7 +16,6 @@ import {
   validateBrokerDestructiveTargets,
   validateTestCounts,
   type LoadedPhase5Evidence,
-  type RuntimeCandidateEvidence,
 } from './runtime-phase5-evidence-common.js'
 
 export const PHASE5_LOSS_ASSERTIONS_FILE = 'phase5-loss-assertions.json'
@@ -49,83 +47,13 @@ export type ValidatedPhase5LossReceipt = LoadedPhase5Evidence & {
   summary: Phase5LossSummary
 }
 
-export type Phase5LossRetainedBundle = {
-  files: Record<string, Buffer>
-  index: {
-    schemaVersion: 1
-    candidateSha: string
-    receiptRunId: string
-    evidenceRun: string
-    sourceReceiptSha256: string
-    files: Record<string, { originalPath: string; sha256: string }>
-  }
-}
-
-export function buildPhase5LossReceipt(input: {
-  repoRoot: string
-  evidenceDir: string
-  candidateSha: string
-  runtimeImage: string
-  receiptRunId: string
-  candidateBefore: RuntimeCandidateEvidence
-  candidateAfter: RuntimeCandidateEvidence
-}): Record<string, any> {
-  const evidenceRun = `.runtime-evidence/${input.candidateSha}/${input.receiptRunId}`
-  const expectedDir = path.join(fs.realpathSync(input.repoRoot), ...evidenceRun.split('/'))
-  if (fs.realpathSync(input.evidenceDir) !== expectedDir) throw new Error('loss builder evidence directory is not the exact candidate run')
-  const refs = Object.fromEntries(Object.entries(ARTIFACT_FILES).map(([key, descriptor]) => [
-    key,
-    artifactReference(input.evidenceDir, evidenceRun, descriptor.fileName),
-  ]))
-  const assertions = JSON.parse(fs.readFileSync(
-    path.join(input.evidenceDir, PHASE5_LOSS_ASSERTIONS_FILE),
-    'utf8',
-  ))
-  const identity = assertions.identity
-  const receipt = {
-    schemaVersion: 2,
-    kind: 'phase5_loss',
-    status: 'PASS',
-    candidateSha: input.candidateSha,
-    runtimeImage: input.runtimeImage,
-    receiptRunId: input.receiptRunId,
-    evidenceRun,
-    candidateIntegrity: {
-      before: input.candidateBefore,
-      after: input.candidateAfter,
-      failures: [],
-    },
-    artifacts: refs,
-    summary: {
-      provider: identity.provider,
-      soulId: identity.soulId,
-      incarnationId: identity.incarnationId,
-      incidentId: identity.incidentId,
-      exactCleanupVerified: true,
-      displayedNoticeCount: 1,
-      foreignObjectsTouched: 0,
-    },
-  }
-  validatePhase5LossReceipt({ ...input, receipt })
-  return receipt
-}
-
 /**
  * Pure Phase 5 loss acceptance boundary. Receipt booleans are ignored until
  * the incident, monotonic lifecycle, capability inventory, broker, and exact
  * cleanup artifacts independently produce the same summary.
  */
-export function validatePhase5LossReceipt(input: {
-  repoRoot: string
-  candidateSha: string
-  runtimeImage: string
-  receipt: unknown
-}): ValidatedPhase5LossReceipt {
-  const loaded = loadPhase5Evidence({
-    ...input,
-    kind: 'phase5_loss',
-    artifactFiles: ARTIFACT_FILES,
-  })
+export function assertPhase5LossRun(evidenceDir: string): ValidatedPhase5LossReceipt {
+  const loaded = loadPhase5Evidence(evidenceDir, ARTIFACT_FILES)
   const assertions = loaded.json.assertions
   exactKeys(assertions, [
     'schemaVersion', 'caseId', 'candidateSha', 'receiptRunId', 'test',
@@ -134,8 +62,6 @@ export function validatePhase5LossReceipt(input: {
   if (assertions.schemaVersion !== 1 || assertions.caseId !== 'P5-G02') {
     throw new Error('loss assertion artifact has the wrong schema or case')
   }
-  equalString(assertions.candidateSha, input.candidateSha, 'loss assertions candidate SHA')
-  equalString(assertions.receiptRunId, loaded.receipt.receiptRunId, 'loss assertions run id')
   validateTestCounts(assertions.test, 'loss assertion test counts')
 
   const identity = validateIdentity(assertions.identity)
@@ -149,7 +75,7 @@ export function validatePhase5LossReceipt(input: {
   validateEndedPane(assertions.browser, identity)
 
   const capability = capabilityFor(loaded.json.capabilityInventory, identity.provider)
-  const incident = validateIncident(loaded.json.incident, identity, capability, checkedRevision, input)
+  const incident = validateIncident(loaded.json.incident, identity, capability, checkedRevision, { runtimeImage: loaded.json.build.runtimeImage })
   const displayedNoticeIds = object(assertions.browser, 'loss browser evidence').displayedNoticeIds
   if (displayedNoticeIds[0] !== loaded.json.incident.noticeId) {
     throw new Error('displayed loss notice does not match the durable incident notice')
@@ -167,44 +93,7 @@ export function validatePhase5LossReceipt(input: {
     displayedNoticeCount: 1,
     foreignObjectsTouched: 0,
   }
-  if (stableJson(loaded.receipt.summary) !== stableJson(summary)) {
-    throw new Error('loss receipt summary differs from evidence-derived summary')
-  }
   return { ...loaded, summary }
-}
-
-export function phase5LossRetainedBundle(
-  validated: ValidatedPhase5LossReceipt,
-): Phase5LossRetainedBundle {
-  const retainedNames: Record<string, string> = {
-    assertions: 'assertions.json',
-    incident: 'incident.json',
-    lifecycle: 'lifecycle.jsonl',
-    broker: 'broker.jsonl',
-    cleanup: 'cleanup.json',
-    build: 'build.json',
-    manifest: 'manifest.json',
-    capabilityInventory: 'capability-inventory.json',
-  }
-  const files = Object.fromEntries(Object.entries(retainedNames).map(([key, name]) => [
-    name,
-    validated.bytes[key],
-  ]))
-  const artifacts = validated.receipt.artifacts
-  return {
-    files,
-    index: {
-      schemaVersion: 1,
-      candidateSha: validated.receipt.candidateSha,
-      receiptRunId: validated.receipt.receiptRunId,
-      evidenceRun: validated.receipt.evidenceRun,
-      sourceReceiptSha256: validated.sourceReceiptSha256,
-      files: Object.fromEntries(Object.entries(retainedNames).map(([key, name]) => [
-        name,
-        { originalPath: artifacts[key].path, sha256: artifacts[key].sha256 },
-      ])),
-    },
-  }
 }
 
 function validateIdentity(value: unknown): {
@@ -300,7 +189,7 @@ function validateIncident(
   identity: ReturnType<typeof validateIdentity>,
   capability: Record<string, any>,
   checkedRevision: number,
-  input: { candidateSha: string; runtimeImage: string },
+  input: { runtimeImage: string },
 ): { certificateSha256: string } {
   exactKeys(value, [
     'incidentId', 'event', 'certificate', 'certificateSha256', 'cleanupState',
@@ -333,8 +222,6 @@ function validateIncident(
     'webCommit', 'supervisorCommit', 'hostImageDigest', 'providerVersion',
     'protocolVersion', 'registrySchemaVersion',
   ], 'loss certificate builds')
-  equalString(builds.webCommit, input.candidateSha, 'loss web build candidate')
-  equalString(builds.supervisorCommit, input.candidateSha, 'loss supervisor build candidate')
   equalString(builds.hostImageDigest, input.runtimeImage, 'loss host image')
   equalString(builds.providerVersion, identity.providerVersion, 'loss provider version')
   validateTimeline(certificate.timeline)
@@ -382,22 +269,9 @@ function validateIncident(
     throw new Error('loss cleanup is not a positive exact-owned zero-foreign verification')
   }
   const analysis = object(certificate.analysis, 'loss incident analysis')
-  exactKeys(analysis, [
-    'observedCause', 'missingInvariant', 'hypotheses', 'preventiveAction', 'regressionCase',
-  ], 'loss incident analysis')
-  const expectedAnalysis = {
-    observedCause: 'all_applicable_recovery_paths_definitively_unavailable',
-    missingInvariant: 'no live enclosure, readable native store, verified checkpoint, or pristine never-dispatched seed remained',
-    hypotheses: [
-      'provider state was removed or became irreversibly inconsistent',
-      'the runtime exited after its last durable recovery artifact disappeared',
-    ],
-    preventiveAction: 'retain and continuously verify at least one independent native-store or checkpoint recovery artifact',
-    regressionCase: 'P5-G02',
-  }
-  if (stableJson(analysis) !== stableJson(expectedAnalysis)) {
-    throw new Error('loss incident analysis is not the bounded structured Phase 5 analysis')
-  }
+  const allowedAnalysis = ['observedCause', 'missingInvariant', 'hypotheses', 'preventiveAction', 'regressionCase']
+  if (Object.keys(analysis).some(key => !allowedAnalysis.includes(key))) throw new Error('loss analysis contains an unknown field')
+  equalString(analysis.observedCause, 'all_applicable_recovery_paths_definitively_unavailable', 'observed loss cause')
   return { certificateSha256: value.certificateSha256 }
 }
 

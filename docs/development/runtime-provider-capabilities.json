@@ -4,7 +4,6 @@
   "providers": [
     {
       "provider": "shell",
-      "certificationState": "certified",
       "managedEnabled": true,
       "durableRecoveryEnabled": false,
       "managedModes": [
@@ -17,17 +16,14 @@
       "zeroTurnPolicy": "pristine-seed-only-with-never-dispatched-proof",
       "checkpointPolicy": "none",
       "bootstrap": "none",
-      "liveGate": "deterministic-shell",
       "blockedReason": null,
       "recoveryPaths": [
         "reattach",
         "pristine_seed"
-      ],
-      "qualificationStatus": "deterministic-qualified-non-durable"
+      ]
     },
     {
       "provider": "claude",
-      "certificationState": "pending_live_provider_certification",
       "managedEnabled": false,
       "durableRecoveryEnabled": false,
       "managedModes": [
@@ -40,19 +36,16 @@
       "zeroTurnPolicy": "preallocated-id-is-not-durable-before-transcript",
       "checkpointPolicy": "provider-transcript-only",
       "bootstrap": ".claude/.credentials.json copied before privilege drop",
-      "liveGate": "haiku-lowest-reasoning",
-      "blockedReason": "PENDING_LIVE_QUALIFICATION",
+      "blockedReason": "MANAGED_PROVIDER_DISABLED",
       "recoveryPaths": [
         "reattach",
         "native_resume",
         "checkpoint_restore",
         "pristine_seed"
-      ],
-      "qualificationStatus": "adapter-ready-live-gate-pending"
+      ]
     },
     {
       "provider": "opencode",
-      "certificationState": "certified",
       "managedEnabled": true,
       "durableRecoveryEnabled": true,
       "managedModes": [
@@ -65,19 +58,16 @@
       "zeroTurnPolicy": "session-row-must-materialize",
       "checkpointPolicy": "provider-sqlite-only-no-live-copy",
       "bootstrap": ".local/share/opencode/auth.json copied before privilege drop",
-      "liveGate": "opencode-1.18.21-big-pickle-free-tier",
       "blockedReason": null,
       "recoveryPaths": [
         "reattach",
         "native_resume",
         "checkpoint_restore",
         "pristine_seed"
-      ],
-      "qualificationStatus": "live-qualified-release-enabled"
+      ]
     },
     {
       "provider": "codex",
-      "certificationState": "pending_live_provider_certification",
       "managedEnabled": false,
       "durableRecoveryEnabled": false,
       "managedModes": [
@@ -90,19 +80,16 @@
       "zeroTurnPolicy": "no-durable-thread-until-provider-materializes",
       "checkpointPolicy": "provider-rollout-only",
       "bootstrap": ".codex/auth.json copied before privilege drop",
-      "liveGate": "gpt-5.6-luna-lowest-reasoning",
-      "blockedReason": "PENDING_LIVE_QUALIFICATION",
+      "blockedReason": "MANAGED_PROVIDER_DISABLED",
       "recoveryPaths": [
         "reattach",
         "native_resume",
         "checkpoint_restore",
         "pristine_seed"
-      ],
-      "qualificationStatus": "adapter-ready-live-gate-pending"
+      ]
     },
     {
       "provider": "amplifier",
-      "certificationState": "pending_live_provider_certification",
       "managedEnabled": false,
       "durableRecoveryEnabled": false,
       "managedModes": [
@@ -115,19 +102,16 @@
       "zeroTurnPolicy": "stub-is-not-durable-conversation-proof",
       "checkpointPolicy": "provider-session-directory",
       "bootstrap": "approved private keys.env reference resolved into child-only env plus image-pinned OneCLI Haiku/low profile; raw OAuth forbidden",
-      "liveGate": "provider-approved-lowest-cost-model",
-      "blockedReason": "PENDING_LIVE_QUALIFICATION",
+      "blockedReason": "MANAGED_PROVIDER_DISABLED",
       "recoveryPaths": [
         "reattach",
         "native_resume",
         "checkpoint_restore",
         "pristine_seed"
-      ],
-      "qualificationStatus": "adapter-ready-live-gate-pending"
+      ]
     },
     {
       "provider": "gemini",
-      "certificationState": "not_applicable",
       "managedEnabled": false,
       "durableRecoveryEnabled": false,
       "managedModes": [
@@ -140,14 +124,11 @@
       "zeroTurnPolicy": "no-continuity-claim",
       "checkpointPolicy": "none",
       "bootstrap": "extension-owned",
-      "liveGate": "not-enabled",
       "blockedReason": "BLOCKED_RECOVERY_IMPLEMENTATION",
-      "recoveryPaths": [],
-      "qualificationStatus": "not-enabled"
+      "recoveryPaths": []
     },
     {
       "provider": "kimi",
-      "certificationState": "not_applicable",
       "managedEnabled": false,
       "durableRecoveryEnabled": false,
       "managedModes": [
@@ -160,10 +141,8 @@
       "zeroTurnPolicy": "no-continuity-claim",
       "checkpointPolicy": "none",
       "bootstrap": "extension-owned",
-      "liveGate": "not-enabled",
       "blockedReason": "BLOCKED_RECOVERY_IMPLEMENTATION",
-      "recoveryPaths": [],
-      "qualificationStatus": "not-enabled"
+      "recoveryPaths": []
     }
   ],
   "freshAgentModes": [
@@ -173,8 +152,6 @@
       "runtimeVariant": "claude-agent-sdk",
       "hostOwnedImplementation": true,
       "enabledInReleaseScope": false,
-      "liveQualificationStatus": "pending_authentic_receipt",
-      "certified": false,
       "pendingApprovalSupported": true
     },
     {
@@ -183,8 +160,6 @@
       "runtimeVariant": "kilroy-claude-agent-sdk",
       "hostOwnedImplementation": true,
       "enabledInReleaseScope": false,
-      "liveQualificationStatus": "pending_authentic_receipt",
-      "certified": false,
       "pendingApprovalSupported": true
     },
     {
@@ -193,8 +168,6 @@
       "runtimeVariant": "codex-app-server",
       "hostOwnedImplementation": true,
       "enabledInReleaseScope": false,
-      "liveQualificationStatus": "pending_authentic_receipt",
-      "certified": false,
       "pendingApprovalSupported": false
     },
     {
@@ -203,8 +176,6 @@
       "runtimeVariant": "opencode-per-soul-http",
       "hostOwnedImplementation": true,
       "enabledInReleaseScope": false,
-      "liveQualificationStatus": "pending_authentic_receipt",
-      "certified": false,
       "pendingApprovalSupported": false
     }
   ],
@@ -228,7 +199,7 @@
         "amplifier"
       ],
       "policy": "legacy",
-      "identityRule": "PENDING_LIVE_QUALIFICATION_NO_MANAGED_OWNERSHIP_CLAIM"
+      "identityRule": "EXPLICIT_MANAGED_PROVIDER_ENABLEMENT_REQUIRED"
     },
     {
       "id": "rest-freshclaude-create",
@@ -346,46 +317,6 @@
       "codex",
       "amplifier"
     ],
-    "deferredReason": "PENDING_LIVE_QUALIFICATION"
-  },
-  "certification": {
-    "schemaVersion": 1,
-    "deferralReason": "pending_live_provider_certification",
-    "certifiedDurableProviders": [
-      "opencode"
-    ],
-    "deferredProviders": [
-      "claude",
-      "codex",
-      "amplifier"
-    ],
-    "landingGate": {
-      "id": "durable-souls-landing",
-      "description": "Cumulative P1-P5 qualification that may pass while exactly the deferred providers await live certification. Every non-deferred case must still PASS.",
-      "deferrableProviders": [
-        "claude",
-        "codex",
-        "amplifier"
-      ],
-      "deferredCaseStatus": "DEFERRED_LIVE_PROVIDER_CERTIFICATION"
-    },
-    "productionGate": {
-      "id": "durable-souls-production-gate-5",
-      "status": "BLOCKED_PENDING_LIVE_PROVIDER_CERTIFICATION",
-      "reason": "pending_live_provider_certification",
-      "description": "Full production certification. Requires live candidate-bound turn, recovery, and follow-up receipts for every provider that will be advertised production-ready. BLOCKED is never PASS.",
-      "requiredCertifiedProviders": [
-        "shell",
-        "opencode",
-        "claude",
-        "codex",
-        "amplifier"
-      ],
-      "blockingProviders": [
-        "claude",
-        "codex",
-        "amplifier"
-      ]
-    }
+    "deferredReason": "MANAGED_PROVIDER_DISABLED"
   }
 }

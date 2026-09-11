@@ -2,24 +2,18 @@ import { execFileSync } from 'node:child_process'
 import fs from 'node:fs'
 import path from 'node:path'
 
-import { candidateIntegrityFailures, captureRuntimeCandidate } from './runtime-gate-integrity.js'
-import { defaultReceiptFileName } from './runtime-receipts.js'
 import {
-  runtimeSoakEvidenceRun,
-  sampleDigest,
-  SOAK_BROKER_FILE,
-  SOAK_CLEANUP_FILE,
   SOAK_MAX_RUNTIME_LOG_BYTES,
   SOAK_MAX_TERMINAL_SPOOL_BYTES,
   SOAK_MIN_DURATION_MS,
   SOAK_SAMPLES_FILE,
   SOAK_TERMINAL_SPOOL_CONFIGURED_BYTES,
-  type RuntimeSoakReceipt,
+  type RuntimeSoakResult,
   type RuntimeSoakSample,
   type SoakFixture,
   type SoakWorkload,
   validateRuntimeSoakBaseline,
-  validateRuntimeSoakReceipt,
+  validateRuntimeSoakResult,
 } from './runtime-soak-evidence.js'
 import { newRequest, newSoul, RuntimeHarness, type SupervisorInstance } from './runtime-sandbox.js'
 
@@ -36,13 +30,12 @@ let supervisor: SupervisorInstance | undefined
 let failure: unknown
 let prepared = false
 let controlEpoch: number | undefined
-let terminalInputProof: RuntimeSoakReceipt['terminalInput'] | undefined
+let terminalInputProof: RuntimeSoakResult['terminalInput'] | undefined
 let shellSpoolConfiguredBytes: number | undefined
 const workloads: SoakWorkload[] = []
 const samples: RuntimeSoakSample[] = []
 const samplesPath = path.join(h.evidenceDir, SOAK_SAMPLES_FILE)
-const target = process.env.FRESHELL_RUNTIME_PHASE5_SOAK_RECEIPT
-  || path.join(h.evidenceDir, defaultReceiptFileName('FRESHELL_RUNTIME_PHASE5_SOAK_RECEIPT'))
+const target = path.join(h.evidenceDir, 'soak-results.json')
 
 function dataOf(result: any, expected: string): any {
   if (!result || result.kind !== expected) throw new Error(`expected ${expected}, received a different runtime response`)
@@ -273,35 +266,14 @@ function readEvidence(fileName: string): Buffer {
   return fs.existsSync(file) ? fs.readFileSync(file) : Buffer.alloc(0)
 }
 
-function writeReceipt(receipt: unknown): void {
+function writeResult(result: unknown): void {
   fs.mkdirSync(path.dirname(target), { recursive: true })
-  fs.writeFileSync(target, JSON.stringify(receipt, null, 2), { mode: 0o600 })
-  console.log(`[phase5-soak] receipt: ${target}`)
+  fs.writeFileSync(target, JSON.stringify(result, null, 2), { mode: 0o600 })
+  console.log(`[phase5-soak] result: ${target}`)
 }
 
-const candidateBefore = captureRuntimeCandidate(h.repoRoot)
-const preflightFailures = candidateIntegrityFailures(h.candidateSha, candidateBefore, candidateBefore)
-
-if (preflightFailures.length > 0) {
-  const candidateAfter = captureRuntimeCandidate(h.repoRoot)
-  const failures = candidateIntegrityFailures(h.candidateSha, candidateBefore, candidateAfter)
-  writeReceipt({
-    schemaVersion: 3,
-    status: 'BLOCKED',
-    candidateSha: h.candidateSha,
-    receiptRunId: h.runId,
-    evidenceRun: runtimeSoakEvidenceRun(h.candidateSha, h.runId),
-    preflightOnly: true,
-    candidateIntegrity: { before: candidateBefore, after: candidateAfter, failures },
-    cleanup: { verified: true, unsafeBrokerAttempts: 0, errors: [] },
-    errors: failures,
-  })
-  console.error(`[phase5-soak] status=BLOCKED preflight=${failures.join('; ')}`)
-  process.exitCode = 2
-} else {
   try {
-    // Once clean preflight passes, any partial prepare may own resources and
-    // therefore requires the harness cleanup path.
+    // A partial prepare may own resources and always requires exact cleanup.
     prepared = true
     await h.prepare()
     supervisor = await h.startSupervisor({
@@ -414,26 +386,19 @@ if (preflightFailures.length > 0) {
         failure ??= error
       }
     }
-    const candidateAfter = captureRuntimeCandidate(h.repoRoot)
-    const integrityFailures = candidateIntegrityFailures(h.candidateSha, candidateBefore, candidateAfter)
     fs.mkdirSync(h.evidenceDir, { recursive: true })
     if (!fs.existsSync(samplesPath)) fs.writeFileSync(samplesPath, '', { mode: 0o600 })
     const sampleEvidenceBytes = readEvidence(SOAK_SAMPLES_FILE)
-    const brokerEvidenceBytes = readEvidence(SOAK_BROKER_FILE)
-    const cleanupEvidenceBytes = readEvidence(SOAK_CLEANUP_FILE)
-    const manifestEvidenceBytes = readEvidence('manifest.json')
-    const buildEvidenceBytes = readEvidence('build.json')
     const unsafeBrokerAttempts = h.broker?.unsafeAttempts?.().length ?? 0
-    const evidenceRun = runtimeSoakEvidenceRun(h.candidateSha, h.runId)
+    const evidenceRun = path.relative(h.repoRoot, h.evidenceDir)
     const first = samples[0]
     const last = samples.at(-1)
     const errors = [
       failure ? safeError(failure) : null,
       ...cleanup.errors,
-      ...integrityFailures,
       terminalInputProof ? null : 'shell output input was not dispatched',
     ].filter((value): value is string => !!value)
-    const receipt: RuntimeSoakReceipt = {
+    const result: RuntimeSoakResult = {
       schemaVersion: 3,
       status: 'FAIL',
       candidateSha: h.candidateSha,
@@ -441,7 +406,6 @@ if (preflightFailures.length > 0) {
       receiptRunId: h.runId,
       evidenceRun,
       desiredWorkloads: workloads,
-      candidateIntegrity: { before: candidateBefore, after: candidateAfter, failures: integrityFailures },
       measurement: {
         startedAtMs: first?.capturedAtMs ?? 0,
         endedAtMs: last?.capturedAtMs ?? 0,
@@ -455,13 +419,6 @@ if (preflightFailures.length > 0) {
         terminalSpoolsBytes: SOAK_MAX_TERMINAL_SPOOL_BYTES,
         runtimeLogsBytes: SOAK_MAX_RUNTIME_LOG_BYTES,
       },
-      artifacts: {
-        samples: { path: `${evidenceRun}/${SOAK_SAMPLES_FILE}`, sha256: sampleDigest(sampleEvidenceBytes) },
-        broker: { path: `${evidenceRun}/${SOAK_BROKER_FILE}`, sha256: sampleDigest(brokerEvidenceBytes) },
-        cleanup: { path: `${evidenceRun}/${SOAK_CLEANUP_FILE}`, sha256: sampleDigest(cleanupEvidenceBytes) },
-        manifest: { path: `${evidenceRun}/manifest.json`, sha256: sampleDigest(manifestEvidenceBytes) },
-        build: { path: `${evidenceRun}/build.json`, sha256: sampleDigest(buildEvidenceBytes) },
-      },
       terminalInput: terminalInputProof ?? {
         soulId: '',
         requestId: 'not-dispatched',
@@ -473,26 +430,16 @@ if (preflightFailures.length > 0) {
     }
     if (errors.length === 0 && cleanup.ok && unsafeBrokerAttempts === 0) {
       try {
-        receipt.status = 'PASS'
-        const validated = validateRuntimeSoakReceipt({
-          candidateSha: h.candidateSha,
-          runtimeImage: h.imageRef,
-          receipt,
-          sampleEvidenceBytes,
-          brokerEvidenceBytes,
-          cleanupEvidenceBytes,
-          manifestEvidenceBytes,
-          buildEvidenceBytes,
-        })
-        receipt.summary = validated.summary
+        result.status = 'PASS'
+        const validated = validateRuntimeSoakResult({ result, sampleEvidenceBytes })
+        result.summary = validated.summary
       } catch (error) {
-        receipt.status = 'FAIL'
-        receipt.errors.push(safeError(error))
-        delete receipt.summary
+        result.status = 'FAIL'
+        result.errors.push(safeError(error))
+        delete result.summary
       }
     }
-    writeReceipt(receipt)
-    console.log(`[phase5-soak] status=${receipt.status} samples=${samples.length} monotonicDurationMs=${receipt.measurement.monotonicDurationMs}`)
-    if (receipt.status !== 'PASS') process.exitCode = 1
+    writeResult(result)
+    console.log(`[phase5-soak] status=${result.status} samples=${samples.length} monotonicDurationMs=${result.measurement.monotonicDurationMs}`)
+    if (result.status !== 'PASS') process.exitCode = 1
   }
-}

@@ -10,17 +10,11 @@ import {
   RuntimeHarness,
   type SupervisorInstance,
 } from '../../../scripts/testing/runtime-sandbox.js'
-import { receiptArtifactName } from '../../../scripts/testing/runtime-receipts.js'
-import { validateProviderQualificationReceipt } from '../../../scripts/testing/provider-qualification-receipt.js'
-import {
-  PHASE3_FRESH_AGENT_RECEIPT_ENV,
-  releasedFreshAgentReceiptRows,
-} from '../../../scripts/testing/fresh-agent-release-gate.js'
 import { validateFreshAgentIngressInventory } from '../../../scripts/testing/fresh-agent-ingress-inventory.js'
 
 export const PHASE3_CASE_IDS = [
-  'P3-G01', 'P3-G02', 'P3-G03', 'P3-G04', 'P3-G05', 'P3-G06',
-  'P3-G07', 'P3-G08', 'P3-G09', 'P3-G10', 'P3-G11', 'P3-G12',
+  'P3-G02', 'P3-G03', 'P3-G04', 'P3-G05', 'P3-G06',
+  'P3-G07', 'P3-G08', 'P3-G09', 'P3-G11', 'P3-G12',
 ] as const
 
 export type Phase3BlockedCase = {
@@ -43,22 +37,11 @@ type NativeSoul = {
   view: any
 }
 
-type ProviderReceipt = {
-  schemaVersion?: number
-  candidateSha?: string
-  status?: string
-  providers?: any[]
-  browser?: any
-  [key: string]: unknown
-}
-
-/**
- * Deterministic recovery faults run before credential/browser-dependent proof.
- * A missing receipt is a release BLOCKED result, never an implicit skip/pass.
- */
+/** Deterministic runtime recovery; live-provider checks run directly in Playwright. */
 export async function runPhase3Gate(
   harness: RuntimeHarness,
   onCasePassed: (caseId: string) => void = () => {},
+  only?: ReadonlySet<string>,
 ): Promise<Phase3RunResult> {
   validateFreshAgentIngressInventory(harness.repoRoot)
   const executed: string[] = []
@@ -70,17 +53,14 @@ export async function runPhase3Gate(
     ['P3-G08', gate08OneWriterStopAndControllerCrashRaces],
     ['P3-G11', gate11PersistedRetryAndManualRearm],
     ['P3-G12', gate12DoorwayAndSpawnSiteInventory],
-    // These cases include deterministic fixture coverage first, then demand
-    // candidate-bound real-provider/browser receipts before they may pass.
     ['P3-G02', gate02NonceSurvivesHostAndControllerLoss],
     ['P3-G03', gate03ProviderAndHostCrashFamilies],
     ['P3-G05', gate05TypedBlockersAndRepair],
     ['P3-G09', gate09IndependentSoulsAndViews],
-    ['P3-G01', gate01EnabledProviderMatrixReceipt],
-    ['P3-G10', gate10PermissionPromptBrowserReceipt],
   ] as const
 
   for (const [caseId, run] of cases) {
+    if (only && !only.has(caseId)) continue
     harness.recordLifecycle('gate.case.started', { caseId })
     try {
       await run(harness)
@@ -103,7 +83,7 @@ export async function runPhase3Gate(
     }
   }
 
-  validatePhase3Coverage(PHASE3_CASE_IDS, executed, blocked.map((row) => row.caseId))
+  validatePhase3Coverage(PHASE3_CASE_IDS.filter(id => !only || only.has(id)), executed, blocked.map((row) => row.caseId))
   return { executed, blocked }
 }
 
@@ -120,49 +100,6 @@ export function validatePhase3Coverage(
     throw new Error(
       `phase3 gate accounting incomplete: missing=[${missing}] duplicates=[${duplicates}] extra=[${extra}]`,
     )
-  }
-}
-
-async function gate01EnabledProviderMatrixReceipt(h: RuntimeHarness): Promise<void> {
-  const caseId = 'P3-G01'
-  const manifest = readCapabilityManifest(h)
-  const enabled = manifest.providers.filter((provider: any) => provider.durableRecoveryEnabled === true)
-  h.assert(caseId, enabled.length > 0, 'capability manifest names at least one durable managed provider', enabled)
-  const receipt = requiredProviderReceipt(
-    caseId,
-    h,
-    'Run every durable-enabled provider/mode through its actual Freshell UI/API create path and set FRESHELL_RUNTIME_PHASE3_PROVIDER_RECEIPT to the resulting JSON receipt.',
-  )
-  const rows = Array.isArray(receipt.providers) ? receipt.providers : []
-  for (const capability of enabled) {
-    const row = rows.find((candidate: any) => candidate.provider === capability.provider)
-    h.assert(caseId, row !== undefined, `receipt covers durable provider ${capability.provider}`, { capability, rows })
-    h.assert(caseId, row.actualProviderBinary === true, `${capability.provider} used its actual provider binary/SDK`, row)
-    h.assert(caseId, typeof (row.providerVersion ?? row.version) === 'string' && (row.providerVersion ?? row.version).length > 0, `${capability.provider} records a provider version`, row)
-    h.assert(caseId, row.completedTurn === true, `${capability.provider} completed a real turn`, row)
-    h.assert(caseId, row.nativeStateCaptured === true, `${capability.provider} captured scoped durable state`, row)
-    h.assert(caseId, typeof row.nativeSessionId === 'string' && row.nativeSessionId.length > 0, `${capability.provider} captured an exact native identity`, row)
-    h.assert(caseId, row.runtimeOwned === true && row.limitsVerified === true, `${capability.provider} ran in one owned limited runtime`, row)
-    const receiptModes = new Set(Array.isArray(row.modes) ? row.modes : [])
-    for (const mode of capability.managedModes) {
-      h.assert(caseId, receiptModes.has(mode), `${capability.provider} receipt covers enabled mode ${mode}`, row)
-    }
-  }
-  const freshRows = releasedFreshAgentReceiptRows({
-    manifest,
-    repoRoot: h.repoRoot,
-    candidateSha: h.candidateSha,
-    runtimeImage: h.imageRef,
-    raw: process.env[PHASE3_FRESH_AGENT_RECEIPT_ENV],
-    envName: PHASE3_FRESH_AGENT_RECEIPT_ENV,
-  })
-  if (freshRows.length) {
-    h.writeBrowserArtifact(receiptArtifactName(PHASE3_FRESH_AGENT_RECEIPT_ENV, caseId), {
-      modes: freshRows.map((row) => row.mode),
-      receipt: JSON.parse(process.env[PHASE3_FRESH_AGENT_RECEIPT_ENV]!.trim().startsWith('{')
-        ? process.env[PHASE3_FRESH_AGENT_RECEIPT_ENV]!
-        : fs.readFileSync(process.env[PHASE3_FRESH_AGENT_RECEIPT_ENV]!, 'utf8')),
-    })
   }
 }
 
@@ -197,28 +134,6 @@ async function gate02NonceSurvivesHostAndControllerLoss(h: RuntimeHarness): Prom
   h.assert(caseId, recalled.ok === true && recalled.value === nonce, 'replacement recalls the prior nonce without receiving it in the follow-up', recalled)
   h.assert(caseId, !h.isContainerRunning(native.containerId), 'the prior enclosure is empty before the replacement remains active')
 
-  const receipt = requiredProviderReceipt(
-    caseId,
-    h,
-    'The deterministic fixture passed. Supply real-provider nonce-recovery evidence in FRESHELL_RUNTIME_PHASE3_PROVIDER_RECEIPT.',
-  )
-  for (const row of durableProviderRows(h, receipt)) {
-    const proof = row.nonceRecovery
-    h.assert(caseId, proof?.sameSoul === true, `${row.provider} preserves the soul during nonce recovery`, proof)
-    h.assert(caseId, proof?.sameNativeSession === true, `${row.provider} preserves the exact native conversation`, proof)
-    h.assert(caseId, proof?.newIncarnation === true && proof?.oldEnclosureVerifiedEmpty === true, `${row.provider} replaces only after proving the old enclosure empty`, proof)
-    h.assert(caseId, proof?.recalledNonce === true && proof?.followUpCompleted === true, `${row.provider} recalls the hidden nonce and accepts a follow-up`, proof)
-    const nativeProofs = Array.isArray(row.nativeTurnProofs) ? row.nativeTurnProofs : []
-    const recallProofs = nativeProofs.filter((native: any) => (
-      native.stage === 'after_session_host_crash' || native.stage === 'after_provider_process_crash'
-    ))
-    h.assert(caseId, recallProofs.length === 2
-      && recallProofs.every((native: any) => native.responseContainsNonce === true
-        && native.toolCallCount === 0
-        && Array.isArray(native.toolCallTypes)
-        && native.toolCallTypes.length === 0),
-    `${row.provider} native recall turns prove nonce recovery with zero tools`, recallProofs)
-  }
 }
 
 async function gate03ProviderAndHostCrashFamilies(h: RuntimeHarness): Promise<void> {
@@ -264,17 +179,6 @@ async function gate03ProviderAndHostCrashFamilies(h: RuntimeHarness): Promise<vo
   h.assert(caseId, recalled.value === 'survives-both', 'state survives provider-process and host-enclosure crashes', recalled)
   assertSingleRunningWriter(h, caseId, await inventory(h, supervisor), native.soulId)
 
-  const receipt = requiredProviderReceipt(
-    caseId,
-    h,
-    'The deterministic provider/host crash fixture passed. Supply per-provider crash-family evidence in FRESHELL_RUNTIME_PHASE3_PROVIDER_RECEIPT.',
-  )
-  for (const row of durableProviderRows(h, receipt)) {
-    const kinds = new Set(Array.isArray(row.crashKinds) ? row.crashKinds : [])
-    h.assert(caseId, kinds.has('provider_process') && kinds.has('session_host'), `${row.provider} covers both crash boundaries`, row)
-    h.assert(caseId, row.automaticResume === true && row.onlyOneWriter === true, `${row.provider} automatically resumes with one writer`, row)
-    h.assert(caseId, row.profileVerified === true && row.sameNativeSession === true, `${row.provider} keeps its profile and native identity`, row)
-  }
 }
 
 async function gate04ProviderCompatibleCheckpointRestore(h: RuntimeHarness): Promise<void> {
@@ -350,20 +254,6 @@ async function gate05TypedBlockersAndRepair(h: RuntimeHarness): Promise<void> {
   h.assert(caseId, rearmed.outcome === 'reattached', 'manual repair/retry rearms the same live conversation', rearmed)
   h.assert(caseId, rearmed.view.nativeSessionId === native.sessionId, 'manual rearm preserves the native identity', rearmed)
 
-  const providerReceipt = requiredProviderReceipt(
-    caseId,
-    h,
-    'The deterministic store corruption/retry repair passed. Supply real-provider blocker classification evidence in FRESHELL_RUNTIME_PHASE3_PROVIDER_RECEIPT.',
-  )
-  const required = new Set(['credentials_expired', 'rate_limited', 'provider_unavailable', 'store_unreadable', 'store_missing', 'incompatible_binary', 'retry_budget'])
-  for (const row of durableProviderRows(h, providerReceipt)) {
-    const blockers = Array.isArray(row.blockers) ? row.blockers : []
-    for (const reason of required) {
-      const proof = blockers.find((candidate: any) => candidate.reason === reason)
-      h.assert(caseId, proof?.outcome === 'blocked' && proof?.lost !== true, `${row.provider} classifies ${reason} as blocked, not lost`, proof)
-    }
-    h.assert(caseId, row.repairedSameSoul === true && row.repairedSameNativeSession === true, `${row.provider} repairs into the same conversation`, row)
-  }
 }
 
 async function gate06WrongIdentityAndNoFreshFallback(h: RuntimeHarness): Promise<void> {
@@ -589,42 +479,6 @@ async function gate09IndependentSoulsAndViews(h: RuntimeHarness): Promise<void> 
   assertSingleRunningWriter(h, caseId, views, first.soulId)
   assertSingleRunningWriter(h, caseId, views, second.soulId)
 
-  const receipt = requiredProviderReceipt(
-    caseId,
-    h,
-    'The deterministic two-soul isolation check passed. Supply terminal-and-second-view evidence for every release-enabled durable provider in FRESHELL_RUNTIME_PHASE3_PROVIDER_RECEIPT.',
-  )
-  const isolation = receipt.isolation as any
-  const enabled = readCapabilityManifest(h).providers
-    .filter((provider: any) => provider.durableRecoveryEnabled === true)
-    .map((provider: any) => provider.provider)
-  if (enabled.includes('opencode')) {
-    h.assert(caseId, isolation?.opencode?.twoSoulsIndependent === true, 'real OpenCode souls have independent processes and budgets', isolation)
-    h.assert(caseId, isolation?.opencode?.oneWriterPerSoul === true, 'OpenCode second view does not create a second writer', isolation)
-  }
-  if (enabled.includes('codex')) {
-    h.assert(caseId, isolation?.codex?.terminalAndSecondView === true, 'Codex terminal and second-view path is exercised', isolation)
-    h.assert(caseId, isolation?.codex?.oneWriterPerThread === true, 'Codex uses one writer per native thread', isolation)
-  }
-}
-
-async function gate10PermissionPromptBrowserReceipt(h: RuntimeHarness): Promise<void> {
-  const caseId = 'P3-G10'
-  const receipt = loadRequiredPhase3Receipt(
-    caseId,
-    process.env.FRESHELL_RUNTIME_PHASE3_BROWSER_RECEIPT,
-    'Run runtime-provider-resurrection-rust.spec.ts with a real provider permission/tool prompt, then set FRESHELL_RUNTIME_PHASE3_BROWSER_RECEIPT to its JSON receipt.',
-  )
-  requirePhase3ReceiptCandidate(caseId, receipt, h.candidateSha)
-  h.assert(caseId, receipt.schemaVersion === 1 && receipt.status === 'PASS', 'browser receipt is an explicit schema-v1 PASS', receipt)
-  h.assert(caseId, receipt.candidateSha === h.candidateSha, 'browser receipt belongs to the exact candidate commit', receipt)
-  const browser = receipt.browser ?? receipt
-  h.assert(caseId, browser.browserInteraction === true, 'receipt was produced through a browser interaction', browser)
-  h.assert(caseId, browser.permissionPromptHandled === true && browser.accidentalApproval !== true, 'pending permission survives without accidental approval', browser)
-  h.assert(caseId, browser.samePane === true && browser.visibleRecoveryState === true, 'the same pane shows recovery state across reconnect', browser)
-  h.assert(caseId, browser.rejectedInputWhileRecovering === true, 'new input is rejected/fenced while recovery is active', browser)
-  h.assert(caseId, browser.toolCompletedExactlyOnce === true && browser.followUpCompleted === true, 'tool and follow-up complete exactly once after reconnect', browser)
-  h.writeBrowserArtifact(receiptArtifactName('FRESHELL_RUNTIME_PHASE3_BROWSER_RECEIPT', caseId), receipt)
 }
 
 async function gate11PersistedRetryAndManualRearm(h: RuntimeHarness): Promise<void> {
@@ -841,63 +695,6 @@ function readCapabilityManifest(h: RuntimeHarness): any {
     path.join(h.repoRoot, 'docs/development/runtime-provider-capabilities.json'),
     'utf8',
   ))
-}
-
-function durableProviderRows(h: RuntimeHarness, receipt: ProviderReceipt): any[] {
-  const manifest = readCapabilityManifest(h)
-  const required = manifest.providers
-    .filter((provider: any) => provider.durableRecoveryEnabled === true)
-    .map((provider: any) => provider.provider)
-  const rows = Array.isArray(receipt.providers) ? receipt.providers : []
-  return required.map((provider: string) => {
-    const row = rows.find((candidate: any) => candidate.provider === provider)
-    if (!row) throw new Error(`phase3 provider receipt is missing durable provider ${provider}`)
-    return row
-  })
-}
-
-function requiredProviderReceipt(caseId: string, h: RuntimeHarness, instruction: string): ProviderReceipt {
-  const receipt = loadRequiredPhase3Receipt(
-    caseId,
-    process.env.FRESHELL_RUNTIME_PHASE3_PROVIDER_RECEIPT,
-    instruction,
-  )
-  requirePhase3ReceiptCandidate(caseId, receipt, h.candidateSha)
-  const validated = validateProviderQualificationReceipt({
-    repoRoot: h.repoRoot,
-    candidateSha: h.candidateSha,
-    expectedRuntimeImage: h.imageRef,
-    receipt,
-    legacyMigration: { gateMode: 'landing', providers: ['opencode'] },
-  })
-  h.assert(caseId, receipt.status === 'PASS', 'provider receipt is an explicit PASS', receipt)
-  h.assert(caseId, receipt.candidateSha === h.candidateSha, 'provider receipt belongs to the exact candidate commit', receipt)
-  h.writeBrowserArtifact(receiptArtifactName('FRESHELL_RUNTIME_PHASE3_PROVIDER_RECEIPT', caseId), receipt)
-  return { ...receipt, providers: validated.providers }
-}
-
-export function loadRequiredPhase3Receipt(caseId: string, raw: string | undefined, instruction: string): ProviderReceipt {
-  if (!raw?.trim()) {
-    throw new RuntimeGateBlockedError(caseId, instruction, { requiredEnvironmentVariable: caseId === 'P3-G10' ? 'FRESHELL_RUNTIME_PHASE3_BROWSER_RECEIPT' : 'FRESHELL_RUNTIME_PHASE3_PROVIDER_RECEIPT' })
-  }
-  let receipt: ProviderReceipt
-  try {
-    const content = raw.trim().startsWith('{') ? raw : fs.readFileSync(raw, 'utf8')
-    receipt = JSON.parse(content)
-  } catch (error) {
-    throw new Error(`${caseId} receipt is not valid JSON or a readable JSON path: ${String(error)}`)
-  }
-  return receipt
-}
-
-export function requirePhase3ReceiptCandidate(
-  caseId: string,
-  receipt: ProviderReceipt,
-  candidateSha: string,
-): void {
-  if (receipt.candidateSha !== candidateSha) {
-    throw new Error(`${caseId} receipt does not belong to the exact candidate commit`)
-  }
 }
 
 function dataOf(result: any, expectedKind: string): any {

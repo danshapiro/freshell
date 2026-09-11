@@ -26,7 +26,7 @@ import { openPanePicker } from '../helpers/pane-picker.js'
 import { TerminalHelper } from '../helpers/terminal-helpers.js'
 import { TestHarness } from '../helpers/test-harness.js'
 import { nativeTurnProof, openCodeTerminalReady, selectNativeAssistantTurn, type NativeAssistantTurn } from '../helpers/opencode-native-history.js'
-import type { ProviderQualificationRow } from '../../../scripts/testing/provider-qualification-receipt.js'
+import type { ProviderQualificationRow } from '../../../scripts/testing/provider-test-results.js'
 
 function leavesByMode(node: any, mode: string): any[] {
   if (!node) return []
@@ -431,7 +431,7 @@ test.describe.serial('OpenCode provider qualification', () => {
         (await paneSessionId(harness, tabId, first.paneId)) === nativeSessionId ? true : null
       ), 120_000)
       await waitForReplacementPrompt(page, harness, rig, tabId, first.paneId, afterHostCrash)
-      const beforeRecall = new Set(nativeAssistantTurns(rig, afterHostCrash, nativeSessionId).map((turn) => turn.messageId))
+      const beforeRecall = new Set(nativeAssistantTurns(rig, afterHostCrash, nativeSessionId).flatMap((turn) => typeof turn.messageId === 'string' ? [turn.messageId] : []))
       await executeInPane(page, first.paneId, 'What is the name of the project we chose earlier?')
       const recalledAnswer = await nextNativeAssistantTurn(rig, afterHostCrash, nativeSessionId, beforeRecall, nonce)
       verifyMemoryAnswer(recalledAnswer, nonce)
@@ -465,7 +465,7 @@ test.describe.serial('OpenCode provider qualification', () => {
         afterProviderCrash.incarnationId,
       )
       await waitForReplacementPrompt(page, harness, rig, tabId, first.paneId, afterProviderCrash)
-      const beforeProviderFollowup = new Set(nativeAssistantTurns(rig, afterProviderCrash, nativeSessionId).map((turn) => turn.messageId))
+      const beforeProviderFollowup = new Set(nativeAssistantTurns(rig, afterProviderCrash, nativeSessionId).flatMap((turn) => typeof turn.messageId === 'string' ? [turn.messageId] : []))
       await executeInPane(page, first.paneId, 'Please remind me of the project name we selected.')
       const providerAnswer = await nextNativeAssistantTurn(rig, afterProviderCrash, nativeSessionId, beforeProviderFollowup, nonce)
       verifyMemoryAnswer(providerAnswer, nonce)
@@ -629,8 +629,8 @@ test.describe.serial('OpenCode provider qualification', () => {
       expect(cleanup.ok, cleanup.errors.join('\n')).toBe(true)
     }
     if (!providerRow) throw new Error('OpenCode qualification produced no provider evidence')
-    const finalized = rig.finalizeProviderQualificationReceipt([providerRow])
-    expect(finalized.receipt.schemaVersion).toBe(2)
+    const finalized = rig.writeProviderResults([providerRow])
+    expect(finalized.report.schemaVersion).toBe(2)
     // eslint-disable-next-line no-console
     console.log(`[provider-qualification] OpenCode receipts: ${finalized.paths.join(', ')}`)
   })

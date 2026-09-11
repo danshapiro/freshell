@@ -25,7 +25,8 @@ coverage/
 # by test/integration/server/test-coordinator.test.ts. Instead, exclude only
 # the docs subdirectories we don't need.
 docs/plans/
-docs/development/
+docs/development/*
+!docs/development/runtime-provider-capabilities.json
 installers/
 electron/
 examples/

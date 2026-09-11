@@ -4,21 +4,17 @@ import fsp from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 
-import { defaultReceiptFileName } from '../../../scripts/testing/runtime-receipts.js'
 import {
-  buildProviderQualificationReceipt,
-  type ProviderQualificationReceiptV2,
+  assertProviderResults,
   type ProviderQualificationRow,
-} from '../../../scripts/testing/provider-qualification-receipt.js'
+} from '../../../scripts/testing/provider-test-results.js'
 import { RuntimeHarness, type SupervisorInstance } from '../../../scripts/testing/runtime-sandbox.js'
 import { RustServer } from './rust-server.js'
 import type { TestServerInfo } from './test-server.js'
-import type { QualifiableTerminalProvider } from '../../../scripts/testing/provider-qualification-selection.js'
 import {
-  buildFreshAgentQualificationReceipt,
-  type FreshAgentQualificationReceiptV1,
+  assertFreshAgentResults,
   type FreshAgentQualificationRow,
-} from '../../../scripts/testing/fresh-agent-qualification-receipt.js'
+} from '../../../scripts/testing/fresh-agent-test-results.js'
 
 export const P2_OPENCODE_VERSION = '1.18.21'
 export const P2_OPENCODE_FREE_MODEL = 'opencode/big-pickle'
@@ -82,7 +78,6 @@ export class ManagedRuntimeBrowserRig {
   private readonly providerSettings: Record<string, Record<string, unknown>>
   private readonly freshAgentModes: string[]
   private readonly fixtureFreshAgentModes: string[]
-  private qualificationSupervisorBin: string | undefined
 
   constructor(
     repoRoot = process.cwd(),
@@ -113,31 +108,27 @@ export class ManagedRuntimeBrowserRig {
 
   async start(): Promise<TestServerInfo> {
     await this.runtime.prepare()
-    this.qualificationSupervisorBin = this.buildQualificationSupervisor()
     this.serverBin = this.buildManagedServer()
-    const selected = this.pendingQualificationProviders()
-    this.runtime.recordProviderQualificationBuild({
-      kind: selected.length ? 'qualification_fixture' : 'production',
-      serverFeatures: [selected.length ? 'managed-provider-qualification' : 'managed-runtime-v1'],
-      supervisorFeatures: selected.length ? ['provider-qualification'] : [],
-      qualificationProviders: selected,
+    this.runtime.recordBrowserBuild({
+      kind: this.fixtureFreshAgentModes.length ? 'deterministic_fixture'
+        : this.supervisorBinaryKind === 'test' ? 'test_faults' : 'production',
+      serverFeatures: [this.fixtureFreshAgentModes.length ? 'managed-fresh-agent-fixtures' : 'managed-runtime-v1'],
+      supervisorFeatures: this.supervisorBinaryKind === 'test' ? ['runtime-test-faults'] : [],
       serverBinary: this.serverBin,
-      supervisorBinary: this.qualificationSupervisorBin
-        ?? (this.supervisorBinaryKind === 'test'
+      supervisorBinary: (this.supervisorBinaryKind === 'test'
           ? this.runtime.testSupervisorBinary
           : this.runtime.releaseSupervisorBinary),
     })
     if (this.freshAgentModes.length > 0) {
-      const supervisorBinary = this.qualificationSupervisorBin
-        ?? (this.supervisorBinaryKind === 'test'
+      const supervisorBinary = (this.supervisorBinaryKind === 'test'
           ? this.runtime.testSupervisorBinary
           : this.runtime.releaseSupervisorBinary)
-      this.runtime.recordFreshAgentQualificationBuild({
+      this.runtime.recordFreshAgentBuild({
         kind: this.fixtureFreshAgentModes.length > 0 ? 'deterministic_fixture' : 'production',
         serverFeatures: [this.fixtureFreshAgentModes.length > 0
           ? 'managed-fresh-agent-fixtures'
           : 'managed-runtime-v1'],
-        sessionHostFeatures: this.fixtureFreshAgentModes.length > 0 ? ['fresh-agent-fixtures'] : [],
+        sessionHostFeatures: this.supervisorBinaryKind === 'test' ? ['fresh-agent-fixtures'] : [],
         selectedModes: this.freshAgentModes,
         fixtureModes: this.fixtureFreshAgentModes,
         serverBinary: this.serverBin,
@@ -150,8 +141,7 @@ export class ManagedRuntimeBrowserRig {
     this.supervisor = await this.runtime.startSupervisor({
       scenarioId: 'browser-managed-runtime',
       binaryKind: this.supervisorBinaryKind,
-      env: { ...this.supervisorEnv, ...this.qualificationEnvironment() },
-      binaryPath: this.qualificationSupervisorBin,
+      env: { ...this.supervisorEnv, ...this.managedEnvironment() },
     })
     this.web = new RustServer({
       preserveHomeOnStop: true,
@@ -166,7 +156,7 @@ export class ManagedRuntimeBrowserRig {
         FRESHELL_RUNTIME_CONTROL_SOCKET: this.supervisor.controlSocket,
         FRESHELL_RUNTIME_CONTROL_SECRET_FILE: this.supervisor.controlSecretFile,
         ...this.serverEnv,
-        ...this.qualificationEnvironment(),
+        ...this.managedEnvironment(),
       },
       setupHome: async (homeDir) => {
         const freshell = path.join(homeDir, '.freshell')
@@ -241,8 +231,7 @@ export class ManagedRuntimeBrowserRig {
       volumeName: previous.volumeName,
       binaryKind: previous.binaryKind,
       reuseSecret: true,
-      env: { ...this.supervisorEnv, ...this.qualificationEnvironment() },
-      binaryPath: this.qualificationSupervisorBin,
+      env: { ...this.supervisorEnv, ...this.managedEnvironment() },
     })
     return this.supervisor
   }
@@ -323,141 +312,42 @@ export class ManagedRuntimeBrowserRig {
     return this.runtime.topOwnedContainerExact(containerId, ['-eo', 'pid,args'])
   }
 
-  writeBrowserReceipt(value: unknown): string {
-    const target = process.env.FRESHELL_RUNTIME_BROWSER_RECEIPT
-      || path.join(this.runtime.browserDir, defaultReceiptFileName('FRESHELL_RUNTIME_BROWSER_RECEIPT'))
+  writeBrowserResult(value: unknown): string { return this.writeResult('browser-continuity.json', value) }
+  writeOpenCodeResult(value: unknown): string { return this.writeResult('opencode-continuity.json', value) }
+  writeResurrectionResult(value: unknown): string { return this.writeResult('provider-resurrection.json', value) }
+  writeRehydrateResult(value: unknown): string { return this.writeResult('tabs-rehydrate.json', value) }
+  writeLossResult(value: unknown): string { return this.writeResult('loss-results.json', value) }
+  writeChaosResult(value: unknown): string { return this.writeResult('chaos-results.json', value) }
+
+  writeProviderResults(providers: ProviderQualificationRow[]) {
+    assertProviderResults(this.repoRoot, providers)
+    const report = { schemaVersion: 2, status: 'PASS', providers,
+      buildCommit: this.runtime.candidateSha, runtimeImage: this.runtime.imageRef }
+    return { report, paths: [this.writeResult('provider-results.json', report)] }
+  }
+
+  writeFreshAgentResults(rows: FreshAgentQualificationRow[]) {
+    const selectedModes = rows.map(({ mode }) => mode)
+    assertFreshAgentResults(this.repoRoot, selectedModes, rows)
+    const report = { schemaVersion: 1, status: 'PASS', selectedModes, rows,
+      buildCommit: this.runtime.candidateSha, runtimeImage: this.runtime.imageRef }
+    return { report, paths: [this.writeResult('fresh-agent-results.json', report)] }
+  }
+
+  private writeResult(fileName: string, value: unknown): string {
+    const target = path.join(this.runtime.browserDir, fileName)
     fs.mkdirSync(path.dirname(target), { recursive: true, mode: 0o700 })
     fs.writeFileSync(target, JSON.stringify(value, null, 2), { mode: 0o600 })
     return target
-  }
-
-  writeOpencodeReceipt(value: unknown): string {
-    const target = process.env.FRESHELL_RUNTIME_OPENCODE_RECEIPT
-      || path.join(this.runtime.browserDir, defaultReceiptFileName('FRESHELL_RUNTIME_OPENCODE_RECEIPT'))
-    fs.mkdirSync(path.dirname(target), { recursive: true, mode: 0o700 })
-    fs.writeFileSync(target, JSON.stringify(value, null, 2), { mode: 0o600 })
-    return target
-  }
-
-  writeProviderQualificationReceipt(
-    value: unknown,
-    defaultFileName = 'opencode-provider-qualification.json',
-  ): string[] {
-    const targets = new Set([
-      process.env.FRESHELL_RUNTIME_PHASE3_PROVIDER_RECEIPT,
-      process.env.FRESHELL_RUNTIME_PHASE5_PROVIDER_RECEIPT,
-    ].filter((value): value is string => Boolean(value?.trim())))
-    if (targets.size === 0) {
-      targets.add(path.join(this.runtime.browserDir, defaultFileName))
-    }
-    const written: string[] = []
-    for (const target of targets) {
-      fs.mkdirSync(path.dirname(target), { recursive: true, mode: 0o700 })
-      fs.writeFileSync(target, JSON.stringify(value, null, 2), { mode: 0o600 })
-      written.push(target)
-    }
-    return written
-  }
-
-  finalizeProviderQualificationReceipt(providers: ProviderQualificationRow[]): {
-    receipt: ProviderQualificationReceiptV2
-    paths: string[]
-  } {
-    const receipt = buildProviderQualificationReceipt({
-      repoRoot: this.repoRoot,
-      evidenceDir: this.runtime.evidenceDir,
-      candidateSha: this.runtime.candidateSha,
-      receiptRunId: this.runtime.runId,
-      runtimeImage: this.runtime.imageRef,
-      providers,
-    })
-    return {
-      receipt,
-      paths: this.writeProviderQualificationReceipt(
-        receipt,
-        providers.length > 1
-          ? 'managed-provider-qualification.json'
-          : `${providers[0]?.provider ?? 'provider'}-provider-qualification.json`,
-      ),
-    }
-  }
-
-  finalizeFreshAgentQualificationReceipt(rows: FreshAgentQualificationRow[]): {
-    receipt: FreshAgentQualificationReceiptV1
-    paths: string[]
-  } {
-    const receipt = buildFreshAgentQualificationReceipt({
-      repoRoot: this.repoRoot,
-      evidenceDir: this.runtime.evidenceDir,
-      candidateSha: this.runtime.candidateSha,
-      receiptRunId: this.runtime.runId,
-      runtimeImage: this.runtime.imageRef,
-      selectedModes: rows.map(({ mode }) => mode),
-      rows,
-    })
-    const targets = new Set([
-      process.env.FRESHELL_RUNTIME_PHASE3_FRESH_AGENT_RECEIPT,
-      process.env.FRESHELL_RUNTIME_PHASE5_FRESH_AGENT_RECEIPT,
-    ].filter((value): value is string => Boolean(value?.trim())))
-    if (targets.size === 0) {
-      targets.add(path.join(this.runtime.browserDir, 'fresh-agent-qualification.json'))
-    }
-    for (const target of targets) {
-      fs.mkdirSync(path.dirname(target), { recursive: true })
-      fs.writeFileSync(target, JSON.stringify(receipt, null, 2))
-    }
-    return { receipt, paths: [...targets] }
-  }
-
-  writePhase3BrowserReceipt(value: unknown): string {
-    const target = process.env.FRESHELL_RUNTIME_PHASE3_BROWSER_RECEIPT
-      || path.join(this.runtime.browserDir, defaultReceiptFileName('FRESHELL_RUNTIME_PHASE3_BROWSER_RECEIPT'))
-    fs.mkdirSync(path.dirname(target), { recursive: true, mode: 0o700 })
-    fs.writeFileSync(target, JSON.stringify(value, null, 2), { mode: 0o600 })
-    return target
-  }
-
-  writePhase4BrowserReceipt(value: unknown): string {
-    const target = process.env.FRESHELL_RUNTIME_PHASE4_BROWSER_RECEIPT
-      || path.join(this.runtime.browserDir, defaultReceiptFileName('FRESHELL_RUNTIME_PHASE4_BROWSER_RECEIPT'))
-    fs.mkdirSync(path.dirname(target), { recursive: true, mode: 0o700 })
-    fs.writeFileSync(target, JSON.stringify(value, null, 2), { mode: 0o600 })
-    return target
-  }
-
-  writePhase5LossReceipt(value: unknown): string {
-    const target = this.canonicalPhase5ReceiptTarget('FRESHELL_RUNTIME_PHASE5_LOSS_RECEIPT')
-    fs.mkdirSync(path.dirname(target), { recursive: true, mode: 0o700 })
-    fs.writeFileSync(target, JSON.stringify(value, null, 2), { mode: 0o600 })
-    return target
-  }
-
-  writePhase5ChaosReceipt(value: unknown): string {
-    const target = this.canonicalPhase5ReceiptTarget('FRESHELL_RUNTIME_PHASE5_CHAOS_RECEIPT')
-    fs.mkdirSync(path.dirname(target), { recursive: true, mode: 0o700 })
-    fs.writeFileSync(target, JSON.stringify(value, null, 2), { mode: 0o600 })
-    return target
-  }
-
-  private canonicalPhase5ReceiptTarget(
-    envName: 'FRESHELL_RUNTIME_PHASE5_LOSS_RECEIPT' | 'FRESHELL_RUNTIME_PHASE5_CHAOS_RECEIPT',
-  ): string {
-    const canonical = path.join(this.runtime.browserDir, defaultReceiptFileName(envName))
-    const requested = process.env[envName]?.trim()
-    if (requested && path.resolve(this.repoRoot, requested) !== canonical) {
-      throw new Error(`${envName} must name the canonical candidate/run browser receipt path`)
-    }
-    return canonical
   }
 
   private buildManagedServer(): string {
     const mise = path.join(os.homedir(), '.local', 'bin', 'mise')
-    const qualification = this.pendingQualificationProviders()
     execFileSync(mise, [
       'exec', 'rust@1.96', '--', 'cargo', 'build', '--release', '-p', 'freshell-server',
       '--features', this.fixtureFreshAgentModes.length > 0
         ? 'managed-fresh-agent-fixtures'
-        : qualification.length ? 'managed-provider-qualification' : 'managed-runtime-v1',
+        : 'managed-runtime-v1',
     ], { cwd: this.repoRoot, stdio: 'inherit' })
     const source = path.join(this.repoRoot, 'target', 'release', 'freshell-server')
     const target = path.join(this.runtime.buildDir, 'freshell-server-managed')
@@ -466,33 +356,13 @@ export class ManagedRuntimeBrowserRig {
     return target
   }
 
-  private buildQualificationSupervisor(): string | undefined {
-    if (this.pendingQualificationProviders().length === 0) return undefined
-    const mise = path.join(os.homedir(), '.local', 'bin', 'mise')
-    execFileSync(mise, [
-      'exec', 'rust@1.96', '--', 'cargo', 'build', '--release', '-p', 'freshell-supervisor',
-      '--features', 'provider-qualification',
-    ], { cwd: this.repoRoot, stdio: 'inherit' })
-    const target = path.join(this.runtime.buildDir, 'freshell-supervisor-qualification')
-    fs.copyFileSync(path.join(this.repoRoot, 'target', 'release', 'freshell-supervisor'), target)
-    fs.chmodSync(target, 0o755)
-    return target
-  }
-
-  private pendingQualificationProviders(): QualifiableTerminalProvider[] {
-    return this.enabledProviders.filter(
-      (provider): provider is QualifiableTerminalProvider => (
-        provider === 'claude' || provider === 'codex' || provider === 'amplifier'
-      ),
-    )
-  }
-
-  private qualificationEnvironment(): Record<string, string> {
-    const selected = this.pendingQualificationProviders()
-    if (selected.length === 0) return {}
-    return {
-      FRESHELL_MANAGED_PROVIDER_QUALIFICATION: selected.join(','),
+  private managedEnvironment(): Record<string, string> {
+    const providers = new Set(['shell', ...this.enabledProviders])
+    for (const mode of this.freshAgentModes) {
+      providers.add(mode === 'kilroy' || mode === 'freshclaude' ? 'claude'
+        : mode === 'freshcodex' ? 'codex' : 'opencode')
     }
+    return { FRESHELL_MANAGED_PROVIDERS: [...providers].join(',') }
   }
 
   private async withManagedBin<T>(operation: () => Promise<T>): Promise<T> {

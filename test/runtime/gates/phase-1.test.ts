@@ -16,6 +16,7 @@ export const PHASE1_CASE_IDS = [
 export async function runPhase1Gate(
   harness: RuntimeHarness,
   onCasePassed: (caseId: string) => void = () => {},
+  only?: ReadonlySet<string>,
 ): Promise<string[]> {
   const executed: string[] = []
   for (const [caseId, run] of [
@@ -30,6 +31,7 @@ export async function runPhase1Gate(
     ['P1-G09', gate09RuntimeIsolation],
     ['P1-G10', gate10ReleaseFaultHooksAndCompleteness],
   ] as const) {
+    if (only && !only.has(caseId)) continue
     harness.recordLifecycle('gate.case.started', { caseId })
     try {
       await run(harness)

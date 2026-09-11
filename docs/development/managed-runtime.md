@@ -8,49 +8,28 @@ server built with `managed-runtime-v1`, booted with the runtime controller, and
 a client that negotiated `managedRuntimeV1` can use it. Other routes remain
 legacy.
 
-## Current release qualification
+## Scope, capabilities, and explicit enablement
 
-OpenCode 1.18.21 (`opencode/big-pickle` free tier) is the only
-release-qualified durable coding provider in this landing. Claude, Codex, and
-Amplifier remain adapter-ready but route through their legacy ownership paths
-until their real live campaigns pass. The checked-in capability manifest is
-the source of truth, and managed WebSocket/REST/control admission follows it
-directly. Historical sections below describe adapter construction and earlier
-phase sequencing; they do not override the current release flags.
+The target remains every coding-agent mode in the original five-phase plan.
+Stage 5a does not remove providers, operations, recovery paths, budgets, views,
+incidents, or notices. Existing conservative defaults remain: shell/OpenCode
+managed routing is on; other terminal adapters and fresh-agent modes still need
+actual integration validation and deliberate enablement before deployment.
 
-## Certification state and the two release gates
+`docs/development/runtime-provider-capabilities.json` is the single declaration
+of provider facts and defaults; Rust embeds it when building. There is no
+runtime CertificationState or separate pending-provider qualification build.
+FRESHELL_MANAGED_PROVIDERS selects an exact comma-separated list of implemented
+terminal adapters on both supervisor and web. Unset uses checked-in defaults;
+unknown/unimplemented names and malformed lists are rejected. Fresh-mode
+configuration and the managed-runtime-v1 feature remain separate. Enablement
+does not grant credentials or implement missing capabilities. Operational
+authentication and isolation are unchanged.
 
-Implementation support and a production promise are separate claims, so they
-are tracked on separate axes in
-`docs/development/runtime-provider-capabilities.json`:
-
-| Field | Meaning |
-|---|---|
-| `certificationState` | Whether a live, candidate-bound certification campaign has actually passed for this provider. One of `certified`, `pending_live_provider_certification`, `not_applicable`. |
-| `managedEnabled` | Whether managed routing may own this provider at all. |
-| `durableRecoveryEnabled` | Whether a durable-soul recovery promise is made for it. |
-
-`certificationState` is the outer bound: a provider that is not `certified`
-must be `managedEnabled: false`, `durableRecoveryEnabled: false`, routed by no
-`managed` doorway, and absent from `releaseScope.managedTerminalProviders`.
-`freshell_agent_runtime::durable_souls_certified` is the single predicate all
-three conditions collapse into, and
-`crates/freshell-agent-runtime/src/lib.rs` fails its own tests if the checked-in
-manifest and the compiled table ever disagree. Deterministic adapter support
-for a deferred provider may exist and be unit-tested; it grants no capability
-negotiation, API, or UI durability claim.
-
-Two gates consume that state:
-
-| Gate | Command | Meaning |
-|---|---|---|
-| Landing / pre-certification | `npm run test:runtime -- gate landing --require-live` | The cumulative `P1-G*`…`P5-G*` body plus one `PC-<PROVIDER>` case each. It may PASS while exactly the manifest's `certification.landingGate.deferrableProviders` are recorded `DEFERRED_LIVE_PROVIDER_CERTIFICATION`. Every other case must genuinely PASS. |
-| Full production Gate 5 | `npm run test:runtime -- gate phase-5 --require-live` | The same body in production mode. While any required provider is uncertified it exits 2 with status `BLOCKED` and `blockedReason: "pending_live_provider_certification"`. |
-
-`BLOCKED` is never `PASS`. A landing run that defers anything other than the
-manifest's deferrable set fails, and a deferral in production mode fails. Each
-run writes `deferred-providers.json` next to `summary.json` so what is *not*
-proven is explicit rather than inferred.
+Run the direct runtime tests described in test/runtime/README.md. Deterministic,
+actual-provider/browser, and long stress scenarios have normal scoped results.
+The former landing/production certificate workflow is retired. A green subset
+is not an all-provider readiness claim.
 
 ## Identity and authority
 
@@ -417,30 +396,23 @@ is not complete until it has zero calls into these legacy ownership paths.
 - Transactional resource admission, named profiles, bounded host replay/spool,
   durable input request dedupe, provider-home/worktree mounts, and safe
   credential-file bootstrap are Phase 2 contracts.
-- Browser continuity remains P2-G01. Under the revised execution order, P2-G04 is the real-OpenCode continuity receipt; Claude and Codex become subsequent provider lanes using the test-cost policy above.
+- Browser continuity remains P2-G01. Under the revised execution order, P2-G04 is the real-OpenCode continuity test; Claude and Codex become subsequent provider lanes using the test-cost policy above.
 - Gate evidence is intentionally untracked under `.runtime-evidence/<candidate-sha>/<run-id>/`
   so each tested commit carries its own reproducible evidence rather than a
   stale checked-in success claim.
 
-## Live gate
+## Direct runtime verification
 
-Run:
+`npm run test:runtime:verify -- --suite all` selects the complete implemented
+behavioral matrix, including actual-provider and stress scenarios. Use
+`--suite deterministic`, `--suite live`, `--suite stress`, or `--only <step>`
+for focused work. `npm run test:runtime -- gate phase-5 --require-live` runs
+only the deterministic Docker subset. Neither imports an earlier certificate.
 
-```bash
-npm run test:runtime -- gate phase-2 --require-live
-```
-
-The gate executes cumulative `P1-G01` through `P1-G10` and `P2-G01` through
-`P2-G11`, imports commit- and image-bound browser/OpenCode receipts, and writes
-reproducible evidence to `.runtime-evidence/<candidate-sha>/<run-id>/`, including
-normalized browser artifacts and the actual provider version/model/native-session
-result. Missing/skipped cases, stale or wrong-image receipts, cleanup failure, or
-any unsafe destructive request fail the gate. Legacy process-kill regressions run
-through `scripts/sandbox-test.sh --runtime-suite`, whose no-network/read-only-root
-mode is validated by `scripts/sandbox-selftest.sh`.
-
-The runtime suite is excluded from ordinary Vitest discovery so `npm test`
-never performs destructive lifecycle tests accidentally.
+The configured browser backend must support Docker; unsupported execution is
+reported as blocked, never silently replaced. Ordinary logs/results retain
+build and provider identity without a clean-SHA or evidence-catalog prerequisite.
+See test/runtime/README.md for coverage mapping and credential policy.
 
 ## Phase 4 durable views and startup reconciliation
 
@@ -464,7 +436,7 @@ intent and hides automatic recreation. Old clients may adopt an already
 managed deterministic terminal ID without advertising managed ownership, but
 may not launch a second provider process.
 
-## Phase 5 loss certification and operations
+## Phase 5 loss handling and operations
 
 Phase 5 introduces a strict boundary between reversible recovery failure and
 irreversible loss. Each enabled provider declares a complete ordered recovery
@@ -474,7 +446,7 @@ rate-limited, credential, workspace, or backend state remains `blocked`.
 
 When every applicable path is freshly definitive-negative, the supervisor
 atomically persists a loss incident and stops the soul before sending any
-cleanup signal. The certificate stores hashes/references rather than raw native
+cleanup signal. The durable loss record stores hashes/references rather than raw native
 IDs or credentials. Cleanup then uses the exact registry ownership handle,
 tries graceful host shutdown, escalates only inside that enclosure, verifies
 backend emptiness, and finalizes the same incident. Named runtime-test
@@ -499,3 +471,12 @@ Rollback changes routing policy only; it preserves managed souls, ownership,
 views, provider volumes, incidents, notices, and metrics. Repair can resume
 idempotent registry-backed work but never infer ownership from labels, process
 names, environment tags, cwd, or partial IDs.
+
+### Stage 5a: secondary reporting does not veto committed cleanup
+
+After SQLite commits the loss and exact cleanup intent, secondary incident-file
+export is best effort. Failed exports stay queued while cleanup and notices
+progress; reconciliation retries them. Authoritative database persistence and
+cleanup-read failures remain blocking. The incident may omit unknown root-cause
+commentary, hypotheses, preventive actions, and regression references. No
+synthetic postmortem is required to perform a safe state transition.

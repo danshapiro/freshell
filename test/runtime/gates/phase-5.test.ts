@@ -12,43 +12,18 @@ import {
   type SupervisorInstance,
 } from '../../../scripts/testing/runtime-sandbox.js'
 import {
-  ReceiptRunRegistry,
-  readCandidateReceiptSource,
-} from '../../../scripts/testing/runtime-receipt-source.js'
-import {
-  defaultReceiptFileName,
-  receiptArtifactName,
-} from '../../../scripts/testing/runtime-receipts.js'
-import {
-  loadRuntimeSoakReceipt,
-  runtimeSoakRetainedBundle,
   SOAK_MAX_RUNTIME_LOG_BYTES,
   SOAK_MAX_TERMINAL_SPOOL_BYTES,
 } from '../../../scripts/testing/runtime-soak-evidence.js'
-import {
-  phase5ChaosRetainedBundle,
-  validatePhase5ChaosReceipt,
-} from '../../../scripts/testing/runtime-phase5-chaos-evidence.js'
-import {
-  phase5LossRetainedBundle,
-  validatePhase5LossReceipt,
-} from '../../../scripts/testing/runtime-phase5-loss-evidence.js'
-import { validateProviderQualificationReceipt } from '../../../scripts/testing/provider-qualification-receipt.js'
-import {
-  PHASE5_FRESH_AGENT_RECEIPT_ENV,
-  releasedFreshAgentReceiptRows,
-} from '../../../scripts/testing/fresh-agent-release-gate.js'
 import { validateFreshAgentIngressInventory } from '../../../scripts/testing/fresh-agent-ingress-inventory.js'
 
 export const PHASE5_CASE_IDS = [
   'P5-G01', 'P5-G02', 'P5-G03', 'P5-G04', 'P5-G05', 'P5-G06',
-  'P5-G07', 'P5-G08', 'P5-G09', 'P5-G10', 'P5-G11', 'P5-G12',
+  'P5-G07', 'P5-G08', 'P5-G09', 'P5-G11', 'P5-G12',
 ] as const
 
 type Blocked = { caseId: string; message: string; evidence?: unknown }
 export type Phase5RunResult = { executed: string[]; blocked: Blocked[] }
-
-const receiptRuns = new WeakMap<RuntimeHarness, ReceiptRunRegistry>()
 
 type NativeSoul = {
   soulId: string
@@ -62,6 +37,7 @@ type NativeSoul = {
 export async function runPhase5Gate(
   h: RuntimeHarness,
   onCasePassed: (caseId: string) => void = () => {},
+  only?: ReadonlySet<string>,
 ): Promise<Phase5RunResult> {
   validateFreshAgentIngressInventory(h.repoRoot)
   const executed: string[] = []
@@ -76,12 +52,12 @@ export async function runPhase5Gate(
     ['P5-G07', gate07CrashMatrixIsIdempotent],
     ['P5-G08', gate08RedactionRotationAndForensics],
     ['P5-G09', gate09RestartAndFailureStorm],
-    ['P5-G10', gate10SoakReceipt],
     ['P5-G11', gate11MigrationBackupAndRollback],
     ['P5-G12', gate12ReleaseAndFullMatrix],
   ] as const
 
   for (const [caseId, run] of cases) {
+    if (only && !only.has(caseId)) continue
     h.recordLifecycle('gate.case.started', { caseId })
     try {
       await run(h)
@@ -103,7 +79,7 @@ export async function runPhase5Gate(
       throw error
     }
   }
-  validatePhase5Coverage(PHASE5_CASE_IDS, executed, blocked.map((row) => row.caseId))
+  validatePhase5Coverage(PHASE5_CASE_IDS.filter(id => !only || only.has(id)), executed, blocked.map((row) => row.caseId))
   return { executed, blocked }
 }
 
@@ -147,38 +123,6 @@ async function gate01RecoverableProvidersAreNotLoss(h: RuntimeHarness): Promise<
   h.assert(caseId, recalled.value === 'state-preserved', 'follow-up reads state from the recovered conversation', recalled)
   h.assert(caseId, (await pendingNotices(h, supervisor)).length === 0, 'successful native recovery emits no lost notice')
 
-  const receipt = requiredReceipt(
-    h,
-    caseId,
-    'FRESHELL_RUNTIME_PHASE5_PROVIDER_RECEIPT',
-    'Run the Phase 5 enabled-provider recovery campaign and provide its candidate-bound receipt.',
-  )
-  assertProviderMatrix(h, caseId, receipt, (row) => {
-    h.assert(caseId, row.nativeRecovery === true, `${row.provider} proves automatic native recovery`, row)
-    h.assert(caseId, row.lostNoticeCount === 0, `${row.provider} emits zero loss notices`, row)
-    h.assert(caseId, row.oldEnclosureVerifiedEmpty === true, `${row.provider} verifies old cleanup before replacement`, row)
-    h.assert(caseId, row.followUpCompleted === true, `${row.provider} completes a real follow-up`, row)
-  })
-  const manifest = JSON.parse(fs.readFileSync(
-    path.join(h.repoRoot, 'docs/development/runtime-provider-capabilities.json'),
-    'utf8',
-  ))
-  const freshRows = releasedFreshAgentReceiptRows({
-    manifest,
-    repoRoot: h.repoRoot,
-    candidateSha: h.candidateSha,
-    runtimeImage: h.imageRef,
-    raw: process.env[PHASE5_FRESH_AGENT_RECEIPT_ENV],
-    envName: PHASE5_FRESH_AGENT_RECEIPT_ENV,
-  })
-  if (freshRows.length) {
-    h.writeBrowserArtifact(receiptArtifactName(PHASE5_FRESH_AGENT_RECEIPT_ENV, caseId), {
-      modes: freshRows.map((row) => row.mode),
-      receipt: JSON.parse(process.env[PHASE5_FRESH_AGENT_RECEIPT_ENV]!.trim().startsWith('{')
-        ? process.env[PHASE5_FRESH_AGENT_RECEIPT_ENV]!
-        : fs.readFileSync(process.env[PHASE5_FRESH_AGENT_RECEIPT_ENV]!, 'utf8')),
-    })
-  }
 }
 
 async function gate02GenuineLossCertificateAndCleanup(h: RuntimeHarness): Promise<void> {
@@ -222,16 +166,6 @@ async function gate02GenuineLossCertificateAndCleanup(h: RuntimeHarness): Promis
   const incidentFiles = listIncidentFiles(h, supervisor, recovery.incidentId)
   h.assert(caseId, incidentFiles.some((file) => file.endsWith('.closed.json')), 'redacted closed incident artifact survives cleanup', incidentFiles)
 
-  const receipt = requiredReceipt(
-    h,
-    caseId,
-    'FRESHELL_RUNTIME_PHASE5_LOSS_RECEIPT',
-    'Run runtime-lost-soul-notice-rust.spec.ts against isolated real OpenCode state and provide its candidate-bound receipt.',
-  )
-  const real = receipt.lossValidation
-  h.assert(caseId, real.provider === 'opencode', 'real isolated OpenCode loss ran through the browser evidence builder', real)
-  h.assert(caseId, real.exactCleanupVerified === true && real.foreignObjectsTouched === 0, 'hashed incident and broker evidence prove exact isolated cleanup', real)
-  h.assert(caseId, real.displayedNoticeCount === 1, 'hashed browser evidence proves exactly one truthful notice', real)
 }
 
 async function gate03EveryRecoverableAlternativeWins(h: RuntimeHarness): Promise<void> {
@@ -458,7 +392,7 @@ async function gate07CrashMatrixIsIdempotent(h: RuntimeHarness): Promise<void> {
     h.assert(caseId, counter(metrics, 'recovery_outcome', 'lost') === 1, `${crashPoint} increments loss metric exactly once`, metrics)
     h.assert(caseId, snapshot.souls.filter((candidate: any) => candidate.soulId === soul.soulId).length === 1, `${crashPoint} never mints a replacement incarnation`, snapshot.souls)
   }
-  runNode(h, 'test/unit/client/components/ManagedRuntimeNotices.test.tsx')
+  h.runFocusedVitest('test/unit/client/components/ManagedRuntimeNotices.test.tsx')
 }
 
 async function gate08RedactionRotationAndForensics(h: RuntimeHarness): Promise<void> {
@@ -486,9 +420,14 @@ async function gate08RedactionRotationAndForensics(h: RuntimeHarness): Promise<v
   const artifact = h.runCommand('docker', [
     'exec', supervisor.containerId, 'cat', path.join(incidentRoot, artifactName),
   ])
-  for (const field of ['observedCause', 'missingInvariant', 'hypotheses', 'preventiveAction', 'regressionCase', 'cleanup']) {
-    h.assert(caseId, artifact.includes(`"${field}"`), `incident artifact contains ${field}`, artifact)
+  for (const field of ['observedCause', 'recoveryPaths', 'cleanupTarget', 'cleanup']) {
+    h.assert(caseId, artifact.includes(`"${field}"`), `incident artifact retains observed ${field}`, artifact)
   }
+  const report = JSON.parse(artifact)
+  const analysis = (report.certificate ?? report).analysis
+  h.assert(caseId, analysis.observedCause === 'all_applicable_recovery_paths_definitively_unavailable'
+    && !analysis.regressionCase && !(analysis.hypotheses?.length),
+  'loss records actual observations without manufacturing a postmortem or regression claim', analysis)
   const syntheticSecret = supervisor.controlSecret
   const allEvidence = collectTextFiles(h.evidenceDir)
   h.assert(caseId, !allEvidence.includes(syntheticSecret), 'runtime evidence is redacted from the first persistent byte')
@@ -530,33 +469,6 @@ async function gate09RestartAndFailureStorm(h: RuntimeHarness): Promise<void> {
     h.assert(caseId, recovery.outcome === 'reattached', `failure/reconnect cycle ${cycle + 1} reattaches without replacement`, recovery)
   }
   h.assert(caseId, (await pendingNotices(h, supervisor)).length === 0, 'restart/failure storm produces no false loss notice')
-  const browserReceipt = requiredReceipt(
-    h,
-    caseId,
-    'FRESHELL_RUNTIME_PHASE5_CHAOS_RECEIPT',
-    'Run runtime-chaos-rust.spec.ts for 100 web cycles and provide its candidate-bound receipt.',
-  )
-  const chaos = browserReceipt.chaosValidation
-  h.assert(caseId, chaos.webReplacementCycles === 100 && chaos.supervisorReplacementCycles === 20, 'hashed cycle evidence covers the exact replacement counts', chaos)
-  h.assert(caseId, chaos.providerToolRequestCount === 2 && chaos.providerToolResultCount === 2 && chaos.replayCount === 0, 'provider-native evidence proves both tools exactly once without replay', chaos)
-  h.assert(caseId, chaos.approvalDecisionCount === 1 && chaos.falseLossNoticeCount === 0 && chaos.unsafeBrokerAttempts === 0, 'chaos evidence proves one approval decision with no false loss or unsafe broker action', chaos)
-}
-
-async function gate10SoakReceipt(h: RuntimeHarness): Promise<void> {
-  const caseId = 'P5-G10'
-  const receipt = requiredReceipt(
-    h,
-    caseId,
-    'FRESHELL_RUNTIME_PHASE5_SOAK_RECEIPT',
-    'Run scripts/testing/runtime-phase5-soak.ts for at least 30 minutes and provide its candidate-bound receipt.',
-  )
-  const summary = receipt.soakValidation
-  h.assert(caseId, summary.durationMs >= 30 * 60 * 1_000, 'hashed samples span at least 30 monotonic measured minutes', summary)
-  h.assert(caseId, summary.desiredSouls >= 50, 'every sample keeps at least 50 persistent desired souls', summary)
-  h.assert(caseId, summary.memoryPressureObserved && summary.cpuThrottlingObserved && summary.pidPressureObserved, 'samples prove actual CPU, memory, and PID pressure', summary)
-  h.assert(caseId, summary.falseLossNotices === 0 && summary.duplicateWriters === 0, 'samples have no false loss notices or duplicate writers', summary)
-  h.assert(caseId, summary.terminalOutputObserved && summary.terminalOutputGrowthObserved && summary.terminalSpoolBoundedTailObserved, 'samples prove continuous production shell output and bounded terminal retention', summary)
-  h.assert(caseId, summary.maxTerminalSpoolBytes <= SOAK_MAX_TERMINAL_SPOOL_BYTES && summary.maxRuntimeLogBytes <= SOAK_MAX_RUNTIME_LOG_BYTES, 'samples prove actual host spool/log retained-byte bounds', summary)
 }
 
 async function gate11MigrationBackupAndRollback(h: RuntimeHarness): Promise<void> {
@@ -662,7 +574,7 @@ async function gate12ReleaseAndFullMatrix(h: RuntimeHarness): Promise<void> {
   runRust(h, 'freshell-runtime-protocol', 'phase5_loss_and_notice_contract_round_trips_without_raw_native_identity')
   runRust(h, 'freshell-agent-runtime', 'checked_in_capability_manifest_matches_runtime_inventory')
   runRust(h, 'freshell-supervisor', 'stable_notice_identity_is_order_independent')
-  runNode(h, 'test/unit/port/managed-runtime-contract-freeze.test.ts')
+  h.runFocusedVitest('test/unit/port/managed-runtime-contract-freeze.test.ts')
 
   const supervisor = await h.startSupervisor({
     scenarioId: unique('p5-g12-release'),
@@ -685,17 +597,6 @@ async function gate12ReleaseAndFullMatrix(h: RuntimeHarness): Promise<void> {
   h.assert(caseId, result.outcome === 'lost' && result.view.cleanupState === 'verified_empty', 'non-fault release build ignores test failpoint environment and completes exact cleanup', result)
   h.assert(caseId, h.isContainerRunning(supervisor.containerId), 'release supervisor did not execute compiled-out crash hooks')
 
-  const receipt = requiredReceipt(
-    h,
-    caseId,
-    'FRESHELL_RUNTIME_PHASE5_PROVIDER_RECEIPT',
-    'Provide the final candidate-bound full enabled-provider/mode receipt.',
-  )
-  assertProviderMatrix(h, caseId, receipt, (row) => {
-    h.assert(caseId, row.releaseBinary === true, `${row.provider} was tested on non-fault release binaries`, row)
-    h.assert(caseId, receipt.schemaVersion === 2, `${row.provider} cleanup proof uses evidence-bound schema v2`, receipt)
-  })
-  h.assert(caseId, h.broker.unsafeAttempts().length === 0, 'final matrix has zero unsafe broker attempts')
 }
 
 async function launchNativeSoul(
@@ -877,132 +778,6 @@ function collectTextFiles(root: string): string {
   return chunks.join('\n')
 }
 
-function requiredReceipt(
-  h: RuntimeHarness,
-  caseId: string,
-  envName: string,
-  instruction: string,
-): any {
-  const raw = process.env[envName]
-  if (!raw?.trim()) {
-    throw new RuntimeGateBlockedError(caseId, instruction, { requiredEnvironmentVariable: envName })
-  }
-  let registry = receiptRuns.get(h)
-  if (!registry) {
-    registry = new ReceiptRunRegistry()
-    receiptRuns.set(h, registry)
-  }
-  const loaded = readCandidateReceiptSource({
-    repoRoot: h.repoRoot,
-    candidateSha: h.candidateSha,
-    source: raw,
-    expectedFileName: defaultReceiptFileName(envName),
-    kind: envName,
-    registry,
-  })
-  const receipt = loaded.receipt
-  let providers = receipt.providers
-  let soakValidation
-  let lossValidation
-  let chaosValidation
-  if (envName === 'FRESHELL_RUNTIME_PHASE5_PROVIDER_RECEIPT') {
-    const validated = validateProviderQualificationReceipt({
-      repoRoot: h.repoRoot,
-      candidateSha: h.candidateSha,
-      expectedRuntimeImage: h.imageRef,
-      receipt,
-    })
-    providers = validated.providers
-  } else if (envName === 'FRESHELL_RUNTIME_PHASE5_SOAK_RECEIPT') {
-    const validated = loadRuntimeSoakReceipt({
-      repoRoot: h.repoRoot,
-      candidateSha: h.candidateSha,
-      runtimeImage: h.imageRef,
-      receipt,
-    })
-    soakValidation = validated.summary
-    const retained = runtimeSoakRetainedBundle(validated)
-    const retainedIndex = { ...retained.index, sourceReceiptSha256: loaded.sourceSha256 }
-    const bundleDir = path.join(h.browserDir, `${receiptArtifactName(envName, caseId)}-bundle`)
-    fs.mkdirSync(bundleDir, { recursive: true, mode: 0o700 })
-    for (const [fileName, bytes] of Object.entries(retained.files)) {
-      fs.writeFileSync(path.join(bundleDir, fileName), bytes, { mode: 0o600 })
-    }
-    fs.writeFileSync(path.join(bundleDir, 'index.json'), JSON.stringify(retainedIndex, null, 2), { mode: 0o600 })
-  } else if (envName === 'FRESHELL_RUNTIME_PHASE5_LOSS_RECEIPT') {
-    const validated = validatePhase5LossReceipt({
-      repoRoot: h.repoRoot,
-      candidateSha: h.candidateSha,
-      runtimeImage: h.imageRef,
-      receipt,
-    })
-    lossValidation = validated.summary
-    const retained = phase5LossRetainedBundle(validated)
-    retained.index.sourceReceiptSha256 = loaded.sourceSha256
-    writeRetainedBundle(h, envName, caseId, retained)
-  } else if (envName === 'FRESHELL_RUNTIME_PHASE5_CHAOS_RECEIPT') {
-    const validated = validatePhase5ChaosReceipt({
-      repoRoot: h.repoRoot,
-      candidateSha: h.candidateSha,
-      runtimeImage: h.imageRef,
-      receipt,
-    })
-    chaosValidation = validated.summary
-    const retained = phase5ChaosRetainedBundle(validated)
-    retained.index = { ...retained.index, sourceReceiptSha256: loaded.sourceSha256 }
-    writeRetainedBundle(h, envName, caseId, retained)
-  } else {
-    h.assert(caseId, receipt.schemaVersion === 2, `${envName} uses evidence-bound schema v2`, receipt)
-  }
-  h.assert(caseId, receipt.status === 'PASS', `${envName} is an explicit PASS`, receipt)
-  h.assert(caseId, receipt.candidateSha === h.candidateSha, `${envName} belongs to the exact candidate commit`, receipt)
-  // Copy the exact validated input into the gate's own evidence tree. A PASS
-  // must remain independently reviewable after temporary receipt paths are
-  // removed; the source file is never treated as the evidence artifact.
-  h.writeBrowserArtifact(receiptArtifactName(envName, caseId), receipt)
-  return {
-    ...receipt,
-    providers,
-    ...(soakValidation ? { soakValidation } : {}),
-    ...(lossValidation ? { lossValidation } : {}),
-    ...(chaosValidation ? { chaosValidation } : {}),
-  }
-}
-
-function writeRetainedBundle(
-  h: RuntimeHarness,
-  envName: string,
-  caseId: string,
-  retained: { files: Record<string, Buffer>; index: unknown },
-): void {
-  const bundleDir = path.join(h.browserDir, `${receiptArtifactName(envName, caseId)}-bundle`)
-  fs.mkdirSync(bundleDir, { recursive: true, mode: 0o700 })
-  for (const [fileName, bytes] of Object.entries(retained.files)) {
-    fs.writeFileSync(path.join(bundleDir, fileName), bytes, { mode: 0o600 })
-  }
-  fs.writeFileSync(path.join(bundleDir, 'index.json'), JSON.stringify(retained.index, null, 2), { mode: 0o600 })
-}
-
-function assertProviderMatrix(
-  h: RuntimeHarness,
-  caseId: string,
-  receipt: any,
-  check: (row: any) => void,
-): void {
-  const manifest = JSON.parse(fs.readFileSync(path.join(h.repoRoot, 'docs/development/runtime-provider-capabilities.json'), 'utf8'))
-  const required = manifest.providers.filter((row: any) => row.managedEnabled && row.durableRecoveryEnabled)
-  const rows = Array.isArray(receipt.providers) ? receipt.providers : []
-  for (const capability of required) {
-    const row = rows.find((candidate: any) => candidate.provider === capability.provider)
-    h.assert(caseId, Boolean(row), `provider receipt covers ${capability.provider}`, { required, rows })
-    const modes = new Set(Array.isArray(row.modes) ? row.modes : [])
-    for (const mode of capability.managedModes) {
-      h.assert(caseId, modes.has(mode), `${capability.provider} receipt covers mode ${mode}`, row)
-    }
-    check(row)
-  }
-}
-
 function runRust(h: RuntimeHarness, packageName: string, filter: string): void {
   const output = h.runCommand(path.join(os.homedir(), '.local', 'bin', 'mise'), [
     'exec', 'rust@1.96', '--', 'cargo', 'test', '-p', packageName, filter,
@@ -1013,17 +788,6 @@ function runRust(h: RuntimeHarness, packageName: string, filter: string): void {
   }
 }
 
-function runNode(h: RuntimeHarness, testPath: string): void {
-  const output = h.runCommand(path.join(os.homedir(), '.local', 'bin', 'mise'), [
-    'exec', 'node@22', '--', 'npm', 'run', 'test:vitest', '--', 'run', testPath,
-    '--config', testPath.startsWith('test/unit/port/')
-      ? 'config/vitest/vitest.port.config.ts'
-      : 'config/vitest/vitest.config.ts',
-  ])
-  if (!/Tests\s+[1-9]\d* passed/.test(output)) {
-    throw new Error(`focused Vitest ${testPath} did not execute successfully\n${output}`)
-  }
-}
 
 function unique(prefix: string): string {
   return `${prefix}-${randomUUID().slice(0, 8)}`

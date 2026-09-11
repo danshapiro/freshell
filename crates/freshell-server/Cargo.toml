@@ -25,12 +25,6 @@ managed-runtime-v1 = [
   "dep:freshell-runtime-client",
   "dep:freshell-runtime-protocol",
 ]
-managed-provider-qualification = [
-  "managed-runtime-v1",
-  "freshell-agent-runtime/provider-qualification",
-  "freshell-ws/provider-qualification",
-  "freshell-freshagent/provider-qualification",
-]
 managed-fresh-agent-fixtures = ["managed-runtime-v1"]
 
 [[bin]]

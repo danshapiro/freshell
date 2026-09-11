@@ -11,10 +11,9 @@ import {
   type RuntimeLimits,
   type SupervisorInstance,
 } from '../../../scripts/testing/runtime-sandbox.js'
-import { receiptArtifactName } from '../../../scripts/testing/runtime-receipts.js'
 
 export const PHASE2_CASE_IDS = [
-  'P2-G01', 'P2-G02', 'P2-G03', 'P2-G04', 'P2-G05', 'P2-G06',
+  'P2-G02', 'P2-G03', 'P2-G05', 'P2-G06',
   'P2-G07', 'P2-G08', 'P2-G09', 'P2-G10', 'P2-G11',
 ] as const
 
@@ -36,14 +35,11 @@ export type Phase2RunResult = {
   blocked: Phase2BlockedCase[]
 }
 
-/**
- * Gate 2 deliberately runs every deterministic infrastructure case before the
- * environment-dependent browser/provider receipts. A blocked browser or
- * credential prerequisite must not hide an unrelated runtime failure.
- */
+/** Deterministic runtime behavior; real browser/provider tests run separately. */
 export async function runPhase2Gate(
   harness: RuntimeHarness,
   onCasePassed: (caseId: string) => void = () => {},
+  only?: ReadonlySet<string>,
 ): Promise<Phase2RunResult> {
   const executed: string[] = []
   const blocked: Phase2BlockedCase[] = []
@@ -57,13 +53,10 @@ export async function runPhase2Gate(
     ['P2-G09', gate09GitWorktreeProviderPersistence],
     ['P2-G10', gate10DroppedAckDedupeAndStopWins],
     ['P2-G11', gate11NamedControllerRestartAndHostRecreation],
-    // Environment-dependent required cases run last so they cannot mask a
-    // deterministic runtime failure.
-    ['P2-G01', gate01BrowserContinuityReceipt],
-    ['P2-G04', gate04RealOpencodeContinuityReceipt],
   ] as const
 
   for (const [caseId, run] of cases) {
+    if (only && !only.has(caseId)) continue
     harness.recordLifecycle('gate.case.started', { caseId })
     try {
       await run(harness)
@@ -85,7 +78,7 @@ export async function runPhase2Gate(
       throw error
     }
   }
-  validatePhase2Coverage(PHASE2_CASE_IDS, executed, blocked.map((row) => row.caseId))
+  validatePhase2Coverage(PHASE2_CASE_IDS.filter(id => !only || only.has(id)), executed, blocked.map((row) => row.caseId))
   return { executed, blocked }
 }
 
@@ -103,25 +96,6 @@ export function validatePhase2Coverage(
       `phase2 gate accounting incomplete: missing=[${missing}] duplicates=[${duplicates}] extra=[${extra}]`,
     )
   }
-}
-
-async function gate01BrowserContinuityReceipt(h: RuntimeHarness): Promise<void> {
-  const caseId = 'P2-G01'
-  const receipt = requiredExternalReceipt(
-    caseId,
-    process.env.FRESHELL_RUNTIME_BROWSER_RECEIPT,
-    'Run runtime-terminal-continuity-rust.spec.ts against the selected E2E backend and set FRESHELL_RUNTIME_BROWSER_RECEIPT to its JSON receipt.',
-  )
-  h.assert(caseId, receipt.caseId === caseId && receipt.status === 'PASS', 'browser receipt is an explicit P2-G01 PASS', receipt)
-  h.assert(caseId, receipt.candidateSha === h.candidateSha, 'browser receipt belongs to the exact candidate commit', receipt)
-  h.assert(caseId, receipt.runtimeImage === h.imageRef, 'browser receipt used the exact reproducible workload image', receipt)
-  h.assert(caseId, receipt.restartCycles === 10, 'browser continuity performed exactly ten web restart/crash cycles', receipt)
-  for (const key of ['soulId', 'incarnationId', 'containerId', 'hostBootId', 'childPid']) {
-    h.assert(caseId, typeof receipt[key] === 'string' || typeof receipt[key] === 'number', `browser receipt carries ${key}`, receipt)
-  }
-  h.assert(caseId, receipt.outputAdvanced === true && receipt.inputUsable === true, 'browser output/input survived web replacement', receipt)
-  h.assert(caseId, receipt.viewAssociations === 1, 'browser retained one tab/view association', receipt)
-  h.writeBrowserArtifact(receiptArtifactName('FRESHELL_RUNTIME_BROWSER_RECEIPT', caseId), receipt)
 }
 
 async function gate02BoundedReplayWhileWebAbsent(h: RuntimeHarness): Promise<void> {
@@ -265,42 +239,6 @@ async function gate03SupervisorRestartAdoptsHost(h: RuntimeHarness): Promise<voi
   h.assert(caseId, !output.includes('SHOULD_NOT_RUN'), 'stale control produced no terminal side effect across either restart', output)
   const stop = dataOf(await h.adminOk(third, h.stopBody(soulId, epoch3)), 'stop')
   h.assert(caseId, stop.outcome === 'verified_empty', 'twice-adopted runtime remains authoritatively stoppable')
-}
-
-async function gate04RealOpencodeContinuityReceipt(h: RuntimeHarness): Promise<void> {
-  const caseId = 'P2-G04'
-  const receipt = requiredExternalReceipt(
-    caseId,
-    process.env.FRESHELL_RUNTIME_OPENCODE_RECEIPT,
-    'Run the real free-tier OpenCode leg of runtime-terminal-continuity-rust.spec.ts and set FRESHELL_RUNTIME_OPENCODE_RECEIPT.',
-  )
-  h.assert(caseId, receipt.caseId === caseId && receipt.status === 'PASS', 'real-OpenCode receipt is an explicit P2-G04 PASS', receipt)
-  h.assert(caseId, receipt.candidateSha === h.candidateSha, 'OpenCode receipt belongs to the exact candidate commit', receipt)
-  h.assert(caseId, receipt.runtimeImage === h.imageRef, 'OpenCode receipt used the exact reproducible workload image', receipt)
-  h.assert(caseId, receipt.provider === 'opencode', 'gate used the OpenCode provider', receipt)
-  h.assert(caseId, receipt.opencodeVersion === '1.18.21', 'gate used the pinned OpenCode version', receipt)
-  h.assert(caseId, receipt.model === 'opencode/big-pickle' && receipt.freeTier === true, 'gate used the pinned free-tier OpenCode model', receipt)
-  h.assert(caseId, typeof receipt.nativeSessionId === 'string' && receipt.nativeSessionId.startsWith('ses_'), 'gate captured a native OpenCode session id', receipt)
-  h.assert(caseId, receipt.sameNativeSession === true && receipt.sameIncarnation === true, 'native OpenCode identity and OS incarnation survive web restart', receipt)
-  h.assert(caseId, receipt.toolCompletionCount === 1 && receipt.followupSucceeded === true, 'long tool completed once and follow-up succeeded', receipt)
-  h.assert(caseId, receipt.providerLaunchCount === 1, 'restoration hid no replacement OpenCode launch', receipt)
-  h.writeBrowserArtifact(receiptArtifactName('FRESHELL_RUNTIME_OPENCODE_RECEIPT', caseId), receipt)
-  h.writeProviderResults({
-    phase: 'phase-2',
-    workloadImage: h.imageRef,
-    opencode: {
-      status: 'PASS',
-      version: receipt.opencodeVersion,
-      model: receipt.model,
-      freeTier: receipt.freeTier,
-      nativeSessionId: receipt.nativeSessionId,
-      sameNativeSession: receipt.sameNativeSession,
-      sameIncarnation: receipt.sameIncarnation,
-      toolCompletionCount: receipt.toolCompletionCount,
-      followupSucceeded: receipt.followupSucceeded,
-      providerLaunchCount: receipt.providerLaunchCount,
-    },
-  })
 }
 
 async function gate05CpuQuota(h: RuntimeHarness): Promise<void> {
@@ -734,20 +672,6 @@ async function waitForHostBootChange(file: string, previous: string, timeoutMs: 
     await sleep(100)
   }
   throw new Error(`host boot id did not change within ${timeoutMs}ms; last=${JSON.stringify(last)}`)
-}
-
-function requiredExternalReceipt(caseId: string, receiptPath: string | undefined, instruction: string): Record<string, any> {
-  if (!receiptPath) throw new RuntimeGateBlockedError(caseId, instruction, { receiptPath: null })
-  let value: unknown
-  try {
-    value = JSON.parse(fs.readFileSync(receiptPath, 'utf8'))
-  } catch (error) {
-    throw new RuntimeGateBlockedError(caseId, `required live receipt is unreadable: ${String(error)}`, { receiptPath })
-  }
-  if (!value || typeof value !== 'object' || Array.isArray(value)) {
-    throw new RuntimeGateBlockedError(caseId, 'required live receipt is not a JSON object', { receiptPath, value })
-  }
-  return value as Record<string, any>
 }
 
 function dataOf(result: any, expectedKind: string): any {

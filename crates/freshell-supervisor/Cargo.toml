@@ -8,7 +8,6 @@ publish.workspace = true
 [features]
 default = []
 runtime-test-faults = []
-provider-qualification = ["freshell-agent-runtime/provider-qualification"]
 
 [dependencies]
 freshell-agent-runtime = { path = "../freshell-agent-runtime" }

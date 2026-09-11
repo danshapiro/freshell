@@ -7,17 +7,16 @@ expired credential, or a failed cleanup is **not** by itself proof of loss.
 
 ## Providers in scope
 
-Loss certification and cleanup only ever apply to providers the capability
-manifest marks `certificationState: "certified"` with managed and durable
-recovery enabled. Today that is OpenCode; managed shell is certified for
-isolation but is intrinsically non-resumable and never produces a durable-soul
-loss certificate.
+Loss handling applies to exact supervisor-owned managed souls whose provider
+has an implemented recovery-path inventory. All original coding-agent modes
+remain in the product scope. Explicitly enabled Claude/Codex/Amplifier instances
+can legitimately produce managed incidents through the same production path as
+OpenCode. Legacy sessions are never adopted merely because a transcript exists.
+A managed shell with an ended PTY is a non-resumable terminal, not a failed
+coding-agent conversation resume.
 
-Claude, Codex, and Amplifier are `pending_live_provider_certification`. They
-run on their legacy paths, are never adopted as managed souls, and therefore
-never appear in an incident, a loss notice, or a cleanup authority. If you see
-one of them named in a managed incident, that is a defect — capture the
-incident and stop, do not clean up.
+There is no runtime certification-state requirement. Inspect actual saved
+ownership, provider enablement, and recovery state, never a test report.
 
 ## Meaning of `lost`
 
@@ -29,11 +28,13 @@ recovery path declared for the provider and every applicable path returned a
 - the provider and runtime variant;
 - a hash of the provider-native identity, never the raw identity;
 - each recovery path and its evidence state;
-- the missing invariant and observed cause;
+- observed failure facts and any known explanatory context;
 - the exact cleanup target issued from the registry ownership record;
 - a stable incident ID and correlation ID.
 
-The incident is persisted before any cleanup signal is sent. The pane/view is
+The incident and cleanup intent are committed to SQLite before cleanup. A
+secondary incident-file export can fail without blocking cleanup; its outbox
+entry is retained for retry. Unknown postmortem commentary is optional. The pane/view is
 retained as ended history and continues to carry the soul ID, provider-native
 session reference in the authenticated UI, and incident link. Freshell does not
 replace it with a blank conversation.

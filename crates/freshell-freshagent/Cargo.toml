@@ -26,7 +26,6 @@ publish.workspace = true
 
 [features]
 default = []
-provider-qualification = ["freshell-agent-runtime/provider-qualification"]
 
 [dependencies]
 # The frozen wire types the broadcasts emit (ui.command / freshAgent.session.materialized

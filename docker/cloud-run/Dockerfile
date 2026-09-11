@@ -37,6 +37,8 @@ WORKDIR /build
 COPY Cargo.toml Cargo.lock ./
 COPY crates/ ./crates/
 COPY extensions/ ./extensions/
+# Shared provider facts are embedded by freshell-agent-runtime.
+COPY docs/development/runtime-provider-capabilities.json ./docs/development/runtime-provider-capabilities.json
 
 # Build only the server binary (release profile).
 RUN cargo build --release -p freshell-server

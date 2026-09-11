@@ -4,25 +4,19 @@ Durable Souls ships behind an explicit supervisor rollout mode. The rollout is
 stateful, auditable, and reversible at the routing layer; it does not delete
 managed state.
 
-## Current staged release scope
+## Full product scope and conservative defaults
 
-The current release-qualified durable provider is **OpenCode 1.18.21** with the
-free-tier `opencode/big-pickle` model. Claude, Codex, and Amplifier are
-adapter-ready but remain explicitly release-disabled as
-`PENDING_LIVE_QUALIFICATION`. Their ordinary legacy routes continue to work;
-they are not eligible for managed ownership, managed-default routing, loss
-certification, or a durable-provider support claim yet.
+All original coding agents and modes remain in scope. Current defaults still
+enable managed shell/OpenCode; other adapters and fresh modes need actual
+behavioral validation before their defaults change. Stage 5a replaces report
+certification with ordinary tests, not an OpenCode-only release promise.
 
-The capability manifest is executable policy. Rust WebSocket/REST routing and
-direct supervisor launch admission all consume the same release flags. A
-disabled provider cannot bypass the staged rollout through a lower-level API.
-
-Each provider row carries an explicit `certificationState`. Claude, Codex, and
-Amplifier are `pending_live_provider_certification`; OpenCode and the managed
-shell are `certified`; the legacy extension providers are `not_applicable`. The
-manifest's `certification` block names the deferred set, the landing gate that
-may defer it, and the production gate that stays
-`BLOCKED_PENDING_LIVE_PROVIDER_CERTIFICATION` until it is empty.
+Provider facts and defaults live in one manifest embedded by Rust. Explicit
+FRESHELL_MANAGED_PROVIDERS on web and supervisor selects implemented terminal
+adapters using normal production routing. This is installation configuration,
+not a qualification-only binary feature. Missing credentials, unsupported
+providers, and missing adapters remain blockers. Neither a setting nor code
+presence establishes readiness. Fresh-mode configuration is still separate.
 
 ## Modes
 
@@ -116,9 +110,8 @@ forwarded into the container, while provider/proxy secret values exist only in
 the child environment. A raw OAuth file, a different reference, malformed
 transport URL, or an unapproved model fails closed.
 
-These values and bootstrap paths make a live campaign reproducible. They do
-not certify or enable Claude, Codex, or Amplifier; the capability manifest
-remains authoritative until a later, receipt-bearing promotion change.
+These bootstrap paths configure the actual provider; they do not replace
+behavioral testing or change installation enablement by themselves.
 
 ## Enabling managed default
 
@@ -128,9 +121,8 @@ Managed-default additionally requires:
 - recorded path, size/hash, and successful verification;
 - clean registry integrity and ownership audit;
 - no unknown pending cleanup;
-- cumulative Gate 5 PASS on the exact candidate;
-- final provider, browser chaos, and 30-minute soak receipts bound to that
-  candidate.
+- passing relevant deterministic, actual-provider/browser, and stress tests
+  for the code being deployed, including the complete intended provider matrix.
 
 Apply only after the backup and all blockers are recorded as successful. The
 change affects subsequent routing; it does not recreate already running souls.
@@ -184,60 +176,21 @@ before persistence. Alert on:
 - unsafe broker attempts;
 - unbounded log/output growth.
 
-## Qualification commands
-
-Focused checks:
+## Verification before deployment
 
 ```bash
-~/.local/bin/mise exec rust@1.96 -- cargo test \
-  -p freshell-runtime-protocol \
-  -p freshell-runtime-observability \
-  -p freshell-agent-runtime \
-  -p freshell-supervisor \
-  -p freshell-runtime-client \
-  -p freshell-session-host \
-  -p freshell-server --all-features
-~/.local/bin/mise exec node@22 -- npm run typecheck
-~/.local/bin/mise exec node@22 -- npm run contract:generate
+npm run check
+npm run test:runtime:verify -- --suite all
 ```
 
-Candidate-bound live qualification. Generate the enabled-provider,
-browser-loss, browser-chaos, Phase 2-4, and >=30-minute soak receipts with the
-checked-in receipt producers first, then run the gate for the release state you
-are actually claiming:
+The runtime command includes actual providers and long stress work; it needs
+credentials and a Docker-capable configured browser runner. See
+`test/runtime/README.md` for focused commands. Failed, skipped, and unrun
+scenarios remain unresolved; no report import or clean-SHA certificate is needed.
 
-```bash
-# Landing / pre-certification gate. Passes only when every non-deferred case
-# passes and the ONLY deferrals are the manifest's deferrable providers
-# (currently Claude, Codex, Amplifier).
-npm run test:runtime -- gate landing --require-live
-
-# Full production Gate 5. Stays BLOCKED (exit 2) with
-# blockedReason "pending_live_provider_certification" until every required
-# provider is live-certified. BLOCKED is never PASS.
-npm run test:runtime -- gate phase-5 --require-live
-```
-
-Gate evidence is untracked beneath
-`.runtime-evidence/<candidate-sha>/<run-id>/`. A receipt from another commit,
-image, skipped test, failed cleanup, or unsafe broker attempt is not valid.
-Every run also writes `deferred-providers.json`: the explicit manifest of what
-the run did **not** prove.
-
-## Promoting a deferred provider
-
-Claude, Codex, and Amplifier are promoted one at a time, after live access is
-available. Use the cost policy recorded in the capability manifest—Claude
-Haiku/lowest reasoning, Codex GPT-5.6 Luna/lowest reasoning, and Amplifier's
-approved lowest-cost model. The promotion candidate must directly observe a
-real turn, exact native identity, native resume after both provider-process and
-session-host loss, blocker classification, second-view one-writer behavior,
-browser approval/tool continuity, safe cleanup, and a follow-up in the same
-conversation. Then, in one candidate, flip that provider's `certificationState` to
-`certified` together with `managedEnabled` and `durableRecoveryEnabled` (the
-Rust capability table and its manifest test enforce that they move together),
-rerun all SHA-bound browser and provider receipts, the pressure soak, the
-landing gate, and cumulative production Gate 5. The production gate stops
-reporting `BLOCKED_PENDING_LIVE_PROVIDER_CERTIFICATION` only when the last
-deferred provider is certified. Never enable a
-provider based only on adapter unit tests or CLI availability.
+Exercise each mode being enabled: exact native identity and follow-up
+continuity, web/host/provider failure, blockers and repair, one writer across
+views, approval/tool continuity, resource limits, and cleanup. Set ordinary
+installation enablement or deliberately change defaults only after it works.
+Keep a consistent registry backup, resource preflight, and safe rollback path.
+All existing PR and production deployment approvals still apply.

@@ -8,8 +8,7 @@ import { afterEach, describe, expect, it } from 'vitest'
 import {
   PHASE5_LOSS_ASSERTIONS_FILE,
   PHASE5_LOSS_INCIDENT_FILE,
-  phase5LossRetainedBundle,
-  validatePhase5LossReceipt,
+  assertPhase5LossRun,
 } from '../../../../scripts/testing/runtime-phase5-loss-evidence.js'
 
 const sha = 'a'.repeat(40)
@@ -28,9 +27,7 @@ function digest(bytes: Buffer | string): string {
 function createFixture(): {
   repoRoot: string
   evidenceDir: string
-  receipt: any
   rewrite(name: string, mutate: (value: any) => void): void
-  rehash(name: string): void
 } {
   const repoRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'phase5-loss-receipt-'))
   roots.push(repoRoot)
@@ -241,76 +238,28 @@ function createFixture(): {
       { mode: 0o600 },
     )
   }
-  const artifact = (name: string) => ({
-    path: `.runtime-evidence/${sha}/${runId}/${name}`,
-    sha256: digest(fs.readFileSync(path.join(evidenceDir, name))),
-  })
-  const integrity = { sha, dirty: false, diffHash: digest(''), statusHash: digest('') }
-  const receipt = {
-    schemaVersion: 2,
-    kind: 'phase5_loss',
-    status: 'PASS',
-    candidateSha: sha,
-    runtimeImage,
-    receiptRunId: runId,
-    evidenceRun: `.runtime-evidence/${sha}/${runId}`,
-    candidateIntegrity: { before: integrity, after: integrity, failures: [] },
-    artifacts: {
-      assertions: artifact(PHASE5_LOSS_ASSERTIONS_FILE),
-      incident: artifact(PHASE5_LOSS_INCIDENT_FILE),
-      lifecycle: artifact('lifecycle.jsonl'),
-      broker: artifact('broker.jsonl'),
-      cleanup: artifact('cleanup.json'),
-      build: artifact('build.json'),
-      manifest: artifact('manifest.json'),
-      capabilityInventory: artifact('phase5-capability-inventory.json'),
-    },
-    summary: {
-      provider: 'opencode', soulId, incarnationId, incidentId,
-      exactCleanupVerified: true, displayedNoticeCount: 1, foreignObjectsTouched: 0,
-    },
-  }
-  return {
-    repoRoot,
-    evidenceDir,
-    receipt,
+  return { repoRoot, evidenceDir,
     rewrite(name, mutate) {
       const target = path.join(evidenceDir, name)
-      const value = JSON.parse(fs.readFileSync(target, 'utf8'))
-      mutate(value)
+      const value = JSON.parse(fs.readFileSync(target, 'utf8')); mutate(value)
+      if (name === PHASE5_LOSS_INCIDENT_FILE) {
+        value.certificateSha256 = digest(JSON.stringify(value.certificate))
+        const log = path.join(evidenceDir, 'lifecycle.jsonl')
+        const rows = fs.readFileSync(log, 'utf8').trim().split('\n').map(line => JSON.parse(line))
+        for (const row of rows) row.data.raw.data.certificateSha256 = value.certificateSha256
+        fs.writeFileSync(log, rows.map(row => JSON.stringify(row)).join('\n')+'\n')
+      }
       fs.writeFileSync(target, JSON.stringify(value))
-    },
-    rehash(name) {
-      const entry = Object.values(receipt.artifacts).find((row: any) => row.path.endsWith(`/${name}`)) as any
-      entry.sha256 = digest(fs.readFileSync(path.join(evidenceDir, name)))
     },
   }
 }
-
-afterEach(() => {
-  for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true })
-})
-
-describe('Phase 5 loss receipt validation', () => {
-  it('derives a PASS only from candidate-bound incident, lifecycle, cleanup, broker, and capability evidence', () => {
+afterEach(() => { for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true }) })
+describe('direct loss observations', () => {
+  it('checks persisted loss, lifecycle ordering, cleanup, and browser identity directly', () => {
     const fx = createFixture()
-    const validated = validatePhase5LossReceipt({
-      repoRoot: fx.repoRoot, candidateSha: sha, runtimeImage, receipt: fx.receipt,
-    })
-    expect(validated.summary).toEqual(fx.receipt.summary)
-    const retained = phase5LossRetainedBundle(validated)
-    expect(Object.keys(retained.files).sort()).toEqual([
-      'assertions.json', 'broker.jsonl', 'build.json', 'capability-inventory.json',
-      'cleanup.json', 'incident.json', 'lifecycle.jsonl', 'manifest.json',
-    ])
-    expect(retained.index.sourceReceiptSha256).toMatch(/^[0-9a-f]{64}$/)
+    expect(assertPhase5LossRun(fx.evidenceDir).summary).toMatchObject({ exactCleanupVerified: true, displayedNoticeCount: 1, foreignObjectsTouched: 0 })
   })
 
-  it('rejects schema v1 and unknown receipt fields', () => {
-    const fx = createFixture()
-    expect(() => validatePhase5LossReceipt({ ...fx, candidateSha: sha, runtimeImage, receipt: { ...fx.receipt, schemaVersion: 1 } })).toThrow(/schema v2/i)
-    expect(() => validatePhase5LossReceipt({ ...fx, candidateSha: sha, runtimeImage, receipt: { ...fx.receipt, credentialsTouched: false } })).toThrow(/unknown field/i)
-  })
 
   it.each([
     ['missing cleanup', 'cleanup.json'],
@@ -319,74 +268,9 @@ describe('Phase 5 loss receipt validation', () => {
   ])('rejects %s evidence', (_label, name) => {
     const fx = createFixture()
     fs.unlinkSync(path.join(fx.evidenceDir, name))
-    expect(() => validatePhase5LossReceipt({ repoRoot: fx.repoRoot, candidateSha: sha, runtimeImage, receipt: fx.receipt })).toThrow(/missing|read/i)
+    expect(() => assertPhase5LossRun(fx.evidenceDir)).toThrow(/missing|read/i)
   })
 
-  it('rejects hash, candidate, image, cleanup, and broker mismatches', () => {
-    for (const mutate of [
-      (fx: ReturnType<typeof createFixture>) => { fx.receipt.artifacts.incident.sha256 = '0'.repeat(64) },
-      (fx: ReturnType<typeof createFixture>) => { fx.receipt.candidateIntegrity.after.sha = '1'.repeat(40) },
-      (fx: ReturnType<typeof createFixture>) => { fx.receipt.candidateIntegrity.before.diffHash = '1'.repeat(64); fx.receipt.candidateIntegrity.after.diffHash = '1'.repeat(64) },
-      (fx: ReturnType<typeof createFixture>) => { fx.receipt.runtimeImage = `sha256:${'1'.repeat(64)}` },
-      (fx: ReturnType<typeof createFixture>) => { fx.rewrite('cleanup.json', (row) => { row.ok = false; row.errors = ['cleanup failed'] }); fx.rehash('cleanup.json') },
-      (fx: ReturnType<typeof createFixture>) => { fs.appendFileSync(path.join(fx.evidenceDir, 'broker.jsonl'), `${JSON.stringify({ unsafeAttempt: true })}\n`); fx.rehash('broker.jsonl') },
-      (fx: ReturnType<typeof createFixture>) => {
-        fs.appendFileSync(path.join(fx.evidenceDir, 'broker.jsonl'), `${JSON.stringify({
-          at: '2026-09-09T20:00:00.004Z', method: 'POST', url: `/v1.47/containers/${'9'.repeat(64)}/stop`,
-          decision: 'forward', unsafeAttempt: false, destructive: true, containerId: '9'.repeat(64),
-        })}\n`)
-        fx.rehash('broker.jsonl')
-      },
-    ]) {
-      const fx = createFixture()
-      mutate(fx)
-      expect(() => validatePhase5LossReceipt({ repoRoot: fx.repoRoot, candidateSha: sha, runtimeImage, receipt: fx.receipt })).toThrow()
-    }
-  })
-
-  it('rejects skipped/zero tests and self-declared summaries that differ from evidence', () => {
-    for (const mutation of [
-      (row: any) => { row.test.total = 0; row.test.passed = 0 },
-      (row: any) => { row.test.skipped = 1 },
-      (row: any) => { row.browser.displayedNoticeIds = [] },
-    ]) {
-      const fx = createFixture()
-      fx.rewrite(PHASE5_LOSS_ASSERTIONS_FILE, mutation)
-      fx.rehash(PHASE5_LOSS_ASSERTIONS_FILE)
-      expect(() => validatePhase5LossReceipt({ repoRoot: fx.repoRoot, candidateSha: sha, runtimeImage, receipt: fx.receipt })).toThrow()
-    }
-    const fx = createFixture()
-    fx.receipt.summary.exactCleanupVerified = false
-    expect(() => validatePhase5LossReceipt({ repoRoot: fx.repoRoot, candidateSha: sha, runtimeImage, receipt: fx.receipt })).toThrow(/summary/i)
-  })
-
-  it('rejects ambiguous manifest, build, cleanup, and broker artifact schemas', () => {
-    for (const [file, mutation] of [
-      ['manifest.json', (row: any) => { row.unchecked = true }],
-      ['build.json', (row: any) => { row.binaries.releaseHost.bytes = 0 }],
-      ['cleanup.json', (row: any) => { row.credentialsTouched = false }],
-      ['broker.jsonl', (row: any) => { delete row.method }],
-    ] as const) {
-      const fx = createFixture()
-      fx.rewrite(file, mutation)
-      fx.rehash(file)
-      expect(() => validatePhase5LossReceipt({ repoRoot: fx.repoRoot, candidateSha: sha, runtimeImage, receipt: fx.receipt })).toThrow()
-    }
-  })
-
-  it('rejects stale or hard-linked evidence files from another run', () => {
-    const stale = createFixture()
-    const stalePath = path.join(stale.evidenceDir, PHASE5_LOSS_ASSERTIONS_FILE)
-    fs.utimesSync(stalePath, new Date('2020-01-01T00:00:00.000Z'), new Date('2020-01-01T00:00:00.000Z'))
-    stale.rehash(PHASE5_LOSS_ASSERTIONS_FILE)
-    expect(() => validatePhase5LossReceipt({ repoRoot: stale.repoRoot, candidateSha: sha, runtimeImage, receipt: stale.receipt })).toThrow(/fresh.*provenance/i)
-
-    const linked = createFixture()
-    const original = path.join(linked.evidenceDir, 'linked-source.json')
-    fs.renameSync(path.join(linked.evidenceDir, PHASE5_LOSS_ASSERTIONS_FILE), original)
-    fs.linkSync(original, path.join(linked.evidenceDir, PHASE5_LOSS_ASSERTIONS_FILE))
-    expect(() => validatePhase5LossReceipt({ repoRoot: linked.repoRoot, candidateSha: sha, runtimeImage, receipt: linked.receipt })).toThrow(/hard-linked/i)
-  })
 
   it('requires exact current intent, definitive inventory-complete negatives, and positive absence checks', () => {
     for (const [file, mutation] of [
@@ -397,10 +281,10 @@ describe('Phase 5 loss receipt validation', () => {
     ] as const) {
       const fx = createFixture()
       fx.rewrite(file, mutation)
-      fx.rehash(file)
-      expect(() => validatePhase5LossReceipt({ repoRoot: fx.repoRoot, candidateSha: sha, runtimeImage, receipt: fx.receipt })).toThrow()
+      expect(() => assertPhase5LossRun(fx.evidenceDir)).toThrow()
     }
   })
+
 
   it('requires monotonic lifecycle ordering bound to the durable certificate hash', () => {
     for (const mutation of [
@@ -413,10 +297,10 @@ describe('Phase 5 loss receipt validation', () => {
       const rows = fs.readFileSync(target, 'utf8').trim().split('\n').map((line) => JSON.parse(line))
       mutation(rows)
       fs.writeFileSync(target, rows.map((row) => JSON.stringify(row)).join('\n') + '\n')
-      fx.rehash('lifecycle.jsonl')
-      expect(() => validatePhase5LossReceipt({ repoRoot: fx.repoRoot, candidateSha: sha, runtimeImage, receipt: fx.receipt })).toThrow(/lifecycle|certificate hash|ordering/i)
+      expect(() => assertPhase5LossRun(fx.evidenceDir)).toThrow(/lifecycle|certificate hash|ordering/i)
     }
   })
+
 
   it('requires exact ownership, zero foreign touches, immutable credentials, and exact ended-pane identity', () => {
     for (const [file, mutation] of [
@@ -427,10 +311,10 @@ describe('Phase 5 loss receipt validation', () => {
     ] as const) {
       const fx = createFixture()
       fx.rewrite(file, mutation)
-      fx.rehash(file)
-      expect(() => validatePhase5LossReceipt({ repoRoot: fx.repoRoot, candidateSha: sha, runtimeImage, receipt: fx.receipt })).toThrow()
+      expect(() => assertPhase5LossRun(fx.evidenceDir)).toThrow()
     }
   })
+
 
   it('rejects secret-looking values and provider transcript/response fields from receipt paths', () => {
     for (const [file, mutation] of [
@@ -444,8 +328,22 @@ describe('Phase 5 loss receipt validation', () => {
     ] as const) {
       const fx = createFixture()
       fx.rewrite(file, mutation)
-      fx.rehash(file)
-      expect(() => validatePhase5LossReceipt({ repoRoot: fx.repoRoot, candidateSha: sha, runtimeImage, receipt: fx.receipt })).toThrow(/secret|unknown field|redact|structured|analysis/i)
+      expect(() => assertPhase5LossRun(fx.evidenceDir)).toThrow(/secret|unknown field|redact|structured|analysis|observed loss cause/i)
+    }
+  })
+  it('accepts absent postmortem enrichment without weakening loss checks', () => {
+    const fx = createFixture()
+    fx.rewrite(PHASE5_LOSS_INCIDENT_FILE, row => { row.certificate.analysis = { observedCause: 'all_applicable_recovery_paths_definitively_unavailable' } })
+    expect(() => assertPhase5LossRun(fx.evidenceDir)).not.toThrow()
+  })
+  it('rejects unsuccessful cleanup, skipped tests, and foreign destructive targets', () => {
+    for (const [name, mutate] of [
+      ['cleanup.json', (row: any) => { row.ok = false }],
+      [PHASE5_LOSS_ASSERTIONS_FILE, (row: any) => { row.test.skipped = 1 }],
+      ['broker.jsonl', (row: any) => { row.containerId = '9'.repeat(64) }],
+    ] as const) {
+      const fx = createFixture(); fx.rewrite(name, mutate)
+      expect(() => assertPhase5LossRun(fx.evidenceDir)).toThrow()
     }
   })
 })

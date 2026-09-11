@@ -21,7 +21,6 @@ publish.workspace = true
 
 [features]
 default = []
-provider-qualification = ["freshell-agent-runtime/provider-qualification"]
 
 [dependencies]
 # The frozen wire types this crate emits (ready/settings.updated/etc.) + the

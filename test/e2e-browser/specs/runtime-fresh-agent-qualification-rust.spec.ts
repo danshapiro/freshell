@@ -11,7 +11,7 @@ import {
   FRESH_AGENT_INGRESS_INVENTORY,
   validateFreshAgentIngressInventory,
 } from '../../../scripts/testing/fresh-agent-ingress-inventory.js'
-import type { FreshAgentQualificationRow } from '../../../scripts/testing/fresh-agent-qualification-receipt.js'
+import type { FreshAgentQualificationRow } from '../../../scripts/testing/fresh-agent-test-results.js'
 import {
   FRESH_AGENT_QUALIFICATION_MODES_ENV,
   parseFreshAgentQualificationModes,
@@ -263,8 +263,8 @@ test.describe.serial('authentic fresh-agent qualification', () => {
       const cleanup = await rig.stop()
       expect(cleanup.ok, cleanup.errors.join('\n')).toBe(true)
     }
-    const finalized = rig.finalizeFreshAgentQualificationReceipt(rows)
-    expect(finalized.receipt.rows).toHaveLength(definitions.length)
+    const finalized = rig.writeFreshAgentResults(rows)
+    expect(finalized.report.rows).toHaveLength(definitions.length)
     console.log(`[fresh-agent-qualification] receipts: ${finalized.paths.join(', ')}`)
   })
 })

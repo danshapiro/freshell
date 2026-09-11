@@ -385,7 +385,7 @@ test.describe.serial('Phase 4 managed-runtime tab rehydration', () => {
           createdTabIds: created.map((response) => response.tabId),
         },
       }
-      const receiptPath = rig.writePhase4BrowserReceipt(receipt)
+      const receiptPath = rig.writeRehydrateResult(receipt)
       // eslint-disable-next-line no-console
       console.log(`[P4-G08] runtime tab rehydration receipt: ${receiptPath}`)
     } finally {

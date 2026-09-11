@@ -1,22 +1,29 @@
-import { createHash } from 'node:crypto'
-import fs from 'node:fs'
-import path from 'node:path'
-
 export const SOAK_MIN_DURATION_MS = 30 * 60 * 1_000
+
 export const SOAK_MIN_DESIRED_SOULS = 50
+
 export const SOAK_MAX_SAMPLE_GAP_MS = 15_000
+
 export const SOAK_MAX_COLLECTION_WINDOW_MS = 10_000
+
 export const SOAK_TERMINAL_SPOOL_CONFIGURED_BYTES = 1024 * 1024
+
 export const SOAK_MAX_TERMINAL_SPOOL_BYTES = SOAK_TERMINAL_SPOOL_CONFIGURED_BYTES + 2 * 64 * 1024
+
 export const SOAK_MAX_RUNTIME_LOG_BYTES = 64 * 1024 * 1024
+
 export const SOAK_SAMPLES_FILE = 'phase5-soak-samples.jsonl'
+
 export const SOAK_BROKER_FILE = 'broker.jsonl'
+
 export const SOAK_CLEANUP_FILE = 'cleanup.json'
 
 const MAX_ARTIFACT_BYTES = 16 * 1024 * 1024
-const EMPTY_SHA256 = createHash('sha256').update(Buffer.alloc(0)).digest('hex')
+
 const MIN_MEMORY_UTILIZATION = 0.8
+
 const MIN_PID_OCCUPANCY = 0.8
+
 const FIXTURES = ['heartbeat', 'shell_output', 'cpu_burner', 'memory_allocator', 'descendant_spawner'] as const
 
 export type SoakFixture = typeof FIXTURES[number]
@@ -90,191 +97,6 @@ export type RuntimeSoakSummary = {
   terminalSpoolBoundedTailObserved: boolean
 }
 
-export type RuntimeSoakCandidate = {
-  sha: string
-  dirty: boolean
-  diffHash: string
-  statusHash: string
-}
-
-export type RuntimeSoakReceipt = {
-  schemaVersion: 3
-  status: 'PASS' | 'FAIL' | 'BLOCKED'
-  candidateSha: string
-  runtimeImage: string
-  receiptRunId: string
-  evidenceRun: string
-  desiredWorkloads: SoakWorkload[]
-  candidateIntegrity: {
-    before: RuntimeSoakCandidate
-    after: RuntimeSoakCandidate
-    failures: string[]
-  }
-  measurement: {
-    startedAtMs: number
-    endedAtMs: number
-    monotonicStartedMs: number
-    monotonicEndedMs: number
-    monotonicDurationMs: number
-    sampleIntervalMs: number
-  }
-  retentionBounds: {
-    terminalSpoolConfiguredBytes: number
-    terminalSpoolsBytes: number
-    runtimeLogsBytes: number
-  }
-  artifacts: {
-    samples: { path: string; sha256: string }
-    broker: { path: string; sha256: string }
-    cleanup: { path: string; sha256: string }
-    manifest: { path: string; sha256: string }
-    build: { path: string; sha256: string }
-  }
-  terminalInput: {
-    soulId: string
-    requestId: string
-    dispatchCount: 1
-    spoolConfiguredBytesObserved: number
-  }
-  cleanup: {
-    verified: boolean
-    unsafeBrokerAttempts: number
-    errors: string[]
-  }
-  summary?: RuntimeSoakSummary
-  errors: string[]
-}
-
-export type ValidateRuntimeSoakReceiptInput = {
-  candidateSha: string
-  runtimeImage: string
-  receipt: unknown
-  sampleEvidenceBytes: Buffer
-  brokerEvidenceBytes: Buffer
-  cleanupEvidenceBytes: Buffer
-  manifestEvidenceBytes: Buffer
-  buildEvidenceBytes: Buffer
-}
-
-export type ValidatedRuntimeSoakReceipt = {
-  receipt: RuntimeSoakReceipt
-  samples: RuntimeSoakSample[]
-  summary: RuntimeSoakSummary
-  sampleEvidenceBytes: Buffer
-  brokerEvidenceBytes: Buffer
-  cleanupEvidenceBytes: Buffer
-  manifestEvidenceBytes: Buffer
-  buildEvidenceBytes: Buffer
-}
-
-export type RuntimeSoakRetainedBundle = {
-  files: Record<'samples.jsonl' | 'broker.jsonl' | 'cleanup.json' | 'manifest.json' | 'build.json', Buffer>
-  index: {
-    schemaVersion: 1
-    candidateSha: string
-    receiptRunId: string
-    evidenceRun: string
-    files: Record<string, { originalPath: string; sha256: string }>
-  }
-}
-
-export type LoadRuntimeSoakReceiptInput = {
-  repoRoot: string
-  candidateSha: string
-  runtimeImage: string
-  receipt: unknown
-}
-
-/**
- * Pure validation boundary for Phase 5 soak certification. Every acceptance
- * verdict is recomputed from the hashed samples; receipt summary booleans and
- * counts are never treated as authority.
- */
-export function validateRuntimeSoakReceipt(
-  input: ValidateRuntimeSoakReceiptInput,
-): ValidatedRuntimeSoakReceipt {
-  const receipt = object(input.receipt, 'runtime soak receipt')
-  if (receipt.schemaVersion !== 3) throw new Error('runtime soak receipt must use schema v3')
-  if (receipt.status !== 'PASS') throw new Error('runtime soak receipt status is not PASS')
-  fullSha(input.candidateSha, 'expected candidate SHA')
-  stringEqual(receipt.candidateSha, input.candidateSha, 'runtime soak receipt candidate SHA')
-  stringEqual(receipt.runtimeImage, input.runtimeImage, 'runtime soak receipt runtime image')
-  runtimeImage(input.runtimeImage)
-  const receiptRunId = safeRunId(receipt.receiptRunId)
-  const evidenceRun = expectedEvidenceRun(input.candidateSha, receiptRunId)
-  stringEqual(receipt.evidenceRun, evidenceRun, 'runtime soak receipt evidence run')
-  validateCandidateIntegrity(receipt.candidateIntegrity, input.candidateSha)
-
-  const artifacts = object(receipt.artifacts, 'runtime soak receipt artifacts')
-  validateArtifact(artifacts.samples, evidenceRun, SOAK_SAMPLES_FILE, input.sampleEvidenceBytes)
-  validateArtifact(artifacts.broker, evidenceRun, SOAK_BROKER_FILE, input.brokerEvidenceBytes)
-  validateArtifact(artifacts.cleanup, evidenceRun, SOAK_CLEANUP_FILE, input.cleanupEvidenceBytes)
-  validateArtifact(artifacts.manifest, evidenceRun, 'manifest.json', input.manifestEvidenceBytes)
-  validateArtifact(artifacts.build, evidenceRun, 'build.json', input.buildEvidenceBytes)
-  validateManifestEvidence(input.manifestEvidenceBytes, input.candidateSha, receiptRunId)
-  validateBuildEvidence(input.buildEvidenceBytes, input.candidateSha, input.runtimeImage)
-
-  const workloads = validateWorkloads(receipt.desiredWorkloads)
-  validateTerminalInput(receipt.terminalInput, workloads)
-  const samples = parseSamples(input.sampleEvidenceBytes)
-  const summary = validateSamples(samples, workloads)
-  validateMeasurement(receipt.measurement, samples, summary)
-  validateRetentionBounds(receipt.retentionBounds)
-  validateCleanup(receipt.cleanup)
-  validateBrokerEvidence(input.brokerEvidenceBytes)
-  validateCleanupEvidence(input.cleanupEvidenceBytes)
-  if (!Array.isArray(receipt.errors) || receipt.errors.length !== 0) {
-    throw new Error('runtime soak PASS receipt must contain no errors')
-  }
-  if (receipt.summary !== undefined && stableJson(receipt.summary) !== stableJson(summary)) {
-    throw new Error('runtime soak receipt summary differs from the sample-derived summary')
-  }
-
-  return {
-    receipt: receipt as RuntimeSoakReceipt,
-    samples,
-    summary,
-    sampleEvidenceBytes: input.sampleEvidenceBytes,
-    brokerEvidenceBytes: input.brokerEvidenceBytes,
-    cleanupEvidenceBytes: input.cleanupEvidenceBytes,
-    manifestEvidenceBytes: input.manifestEvidenceBytes,
-    buildEvidenceBytes: input.buildEvidenceBytes,
-  }
-}
-
-/** Resolve and verify candidate-bound files, then cross the pure boundary. */
-export function loadRuntimeSoakReceipt(
-  input: LoadRuntimeSoakReceiptInput,
-): ValidatedRuntimeSoakReceipt {
-  const receipt = object(input.receipt, 'runtime soak receipt')
-  fullSha(input.candidateSha, 'expected candidate SHA')
-  const receiptRunId = safeRunId(receipt.receiptRunId)
-  const evidenceRun = expectedEvidenceRun(input.candidateSha, receiptRunId)
-  const repoRoot = fs.realpathSync(input.repoRoot)
-  const evidenceDir = path.join(repoRoot, ...evidenceRun.split('/'))
-  const stat = fs.lstatSync(evidenceDir)
-  if (!stat.isDirectory() || stat.isSymbolicLink() || fs.realpathSync(evidenceDir) !== evidenceDir) {
-    throw new Error('runtime soak evidence run must be a real candidate-bound directory')
-  }
-  const manifestPath = path.join(evidenceDir, 'manifest.json')
-  const buildPath = path.join(evidenceDir, 'build.json')
-  readJsonObject(manifestPath, 'runtime soak run manifest')
-  readJsonObject(buildPath, 'runtime soak build artifact')
-  const manifestEvidenceBytes = readRegularFile(manifestPath, 'runtime soak run manifest')
-  const buildEvidenceBytes = readRegularFile(buildPath, 'runtime soak build artifact')
-  const sampleEvidenceBytes = readRegularFile(path.join(evidenceDir, SOAK_SAMPLES_FILE), 'runtime soak samples')
-  const brokerEvidenceBytes = readRegularFile(path.join(evidenceDir, SOAK_BROKER_FILE), 'runtime soak broker evidence')
-  const cleanupEvidenceBytes = readRegularFile(path.join(evidenceDir, SOAK_CLEANUP_FILE), 'runtime soak cleanup evidence')
-  return validateRuntimeSoakReceipt({
-    ...input,
-    sampleEvidenceBytes,
-    brokerEvidenceBytes,
-    cleanupEvidenceBytes,
-    manifestEvidenceBytes,
-    buildEvidenceBytes,
-  })
-}
-
 /** The first complete observation is checked before the 30-minute clock starts. */
 export function validateRuntimeSoakBaseline(sample: RuntimeSoakSample, workloadsValue: unknown): void {
   const workloads = validateWorkloads(workloadsValue)
@@ -285,45 +107,6 @@ export function validateRuntimeSoakBaseline(sample: RuntimeSoakSample, workloads
   if (!observation.pidPressureObserved) {
     throw new Error('runtime soak baseline did not demonstrate calibrated PID pressure')
   }
-}
-
-/** Fixed-name copy plan; source paths from a receipt are never used as targets. */
-export function runtimeSoakRetainedBundle(validated: ValidatedRuntimeSoakReceipt): RuntimeSoakRetainedBundle {
-  const files = {
-    'samples.jsonl': validated.sampleEvidenceBytes,
-    'broker.jsonl': validated.brokerEvidenceBytes,
-    'cleanup.json': validated.cleanupEvidenceBytes,
-    'manifest.json': validated.manifestEvidenceBytes,
-    'build.json': validated.buildEvidenceBytes,
-  }
-  const sources = {
-    'samples.jsonl': validated.receipt.artifacts.samples,
-    'broker.jsonl': validated.receipt.artifacts.broker,
-    'cleanup.json': validated.receipt.artifacts.cleanup,
-    'manifest.json': validated.receipt.artifacts.manifest,
-    'build.json': validated.receipt.artifacts.build,
-  }
-  return {
-    files,
-    index: {
-      schemaVersion: 1,
-      candidateSha: validated.receipt.candidateSha,
-      receiptRunId: validated.receipt.receiptRunId,
-      evidenceRun: validated.receipt.evidenceRun,
-      files: Object.fromEntries(Object.entries(sources).map(([retainedName, artifact]) => [
-        retainedName,
-        { originalPath: artifact.path, sha256: artifact.sha256 },
-      ])),
-    },
-  }
-}
-
-export function sampleDigest(bytes: Buffer): string {
-  return createHash('sha256').update(bytes).digest('hex')
-}
-
-export function runtimeSoakEvidenceRun(candidateSha: string, receiptRunId: string): string {
-  return expectedEvidenceRun(candidateSha, receiptRunId)
 }
 
 function validateSamples(
@@ -618,102 +401,11 @@ function validateTerminalInput(value: unknown, workloads: SoakWorkload[]): void 
   }
 }
 
-function validateCandidateIntegrity(value: unknown, candidateSha: string): void {
-  const integrity = object(value, 'runtime soak candidate integrity')
-  const before = validateCandidate(integrity.before, 'before')
-  const after = validateCandidate(integrity.after, 'after')
-  if (before.sha !== candidateSha || after.sha !== candidateSha) {
-    throw new Error('runtime soak candidate commit changed during qualification')
-  }
-  if (before.dirty || after.dirty) throw new Error('runtime soak candidate must be clean before and after qualification')
-  if (before.diffHash !== EMPTY_SHA256 || before.statusHash !== EMPTY_SHA256
-    || after.diffHash !== EMPTY_SHA256 || after.statusHash !== EMPTY_SHA256) {
-    throw new Error('runtime soak clean candidate hashes must identify empty source changes')
-  }
-  if (before.diffHash !== after.diffHash || before.statusHash !== after.statusHash) {
-    throw new Error('runtime soak candidate inputs changed during qualification')
-  }
-  if (!Array.isArray(integrity.failures) || integrity.failures.length !== 0) {
-    throw new Error('runtime soak candidate integrity reports failures')
-  }
-}
-
-function validateCandidate(value: unknown, label: string): RuntimeSoakCandidate {
-  const candidate = object(value, `runtime soak ${label} candidate`)
-  const sha = fullSha(candidate.sha, `runtime soak ${label} candidate SHA`)
-  if (typeof candidate.dirty !== 'boolean') throw new Error(`runtime soak ${label} candidate dirty flag must be boolean`)
-  const diffHash = sha256(candidate.diffHash, `runtime soak ${label} candidate diff hash`)
-  const statusHash = sha256(candidate.statusHash, `runtime soak ${label} candidate status hash`)
-  return { sha, dirty: candidate.dirty, diffHash, statusHash }
-}
-
 function validateCleanup(value: unknown): void {
   const cleanup = object(value, 'runtime soak cleanup')
   if (cleanup.verified !== true || cleanup.unsafeBrokerAttempts !== 0
     || !Array.isArray(cleanup.errors) || cleanup.errors.length !== 0) {
     throw new Error('runtime soak cleanup did not verify every owned object with zero unsafe attempts')
-  }
-}
-
-function validateArtifact(
-  value: unknown,
-  evidenceRun: string,
-  fileName: string,
-  bytes: Buffer,
-): void {
-  const artifact = object(value, `runtime soak ${fileName} artifact`)
-  if (bytes.length > MAX_ARTIFACT_BYTES) throw new Error(`runtime soak ${fileName} artifact exceeds the evidence size bound`)
-  stringEqual(artifact.path, `${evidenceRun}/${fileName}`, `runtime soak ${fileName} artifact path`)
-  const digest = sha256(artifact.sha256, `runtime soak ${fileName} artifact SHA-256`)
-  if (sampleDigest(bytes) !== digest) throw new Error(`runtime soak ${fileName} artifact digest mismatch`)
-}
-
-function validateManifestEvidence(bytes: Buffer, candidateSha: string, receiptRunId: string): void {
-  const manifest = parseJsonObject(bytes, 'runtime soak run manifest')
-  const execution = object(manifest.execution, 'runtime soak run manifest execution')
-  stringEqual(execution.candidateSha, candidateSha, 'runtime soak run manifest candidate SHA')
-  stringEqual(execution.runId, receiptRunId, 'runtime soak run manifest run ID')
-}
-
-function validateBuildEvidence(bytes: Buffer, candidateSha: string, expectedRuntimeImage: string): void {
-  const build = parseJsonObject(bytes, 'runtime soak build artifact')
-  stringEqual(build.candidateSha, candidateSha, 'runtime soak build candidate SHA')
-  stringEqual(build.runtimeImage, expectedRuntimeImage, 'runtime soak build runtime image')
-  const binaries = object(build.binaries, 'runtime soak build binaries')
-  for (const name of ['testSupervisor', 'testHost', 'releaseSupervisor', 'releaseHost']) {
-    const proof = object(binaries[name], `runtime soak build ${name}`)
-    nonEmptyString(proof.path, `runtime soak build ${name} path`)
-    sha256(proof.sha256, `runtime soak build ${name} SHA-256`)
-    integer(proof.bytes, `runtime soak build ${name} bytes`)
-  }
-}
-
-function validateBrokerEvidence(bytes: Buffer): void {
-  const lines = bytes.toString('utf8').split(/\r?\n/).filter((line) => line.trim())
-  if (lines.length === 0) throw new Error('runtime soak broker evidence contains no events')
-  for (const [index, line] of lines.entries()) {
-    let event: Record<string, any>
-    try {
-      event = object(JSON.parse(line), `runtime soak broker event ${index}`)
-    } catch (error) {
-      if (error instanceof SyntaxError) throw new Error(`runtime soak broker event ${index} is not valid JSON`)
-      throw error
-    }
-    if (event.unsafeAttempt === true) throw new Error('runtime soak broker evidence records an unsafe attempt')
-  }
-}
-
-function validateCleanupEvidence(bytes: Buffer): void {
-  let cleanup: Record<string, any>
-  try {
-    cleanup = object(JSON.parse(bytes.toString('utf8')), 'runtime soak cleanup evidence')
-  } catch (error) {
-    if (error instanceof SyntaxError) throw new Error('runtime soak cleanup evidence is not valid JSON')
-    throw error
-  }
-  if (cleanup.ok !== true || !Array.isArray(cleanup.errors) || cleanup.errors.length !== 0
-    || !Array.isArray(cleanup.unsafeBrokerAttempts) || cleanup.unsafeBrokerAttempts.length !== 0) {
-    throw new Error('runtime soak hashed cleanup evidence did not verify exact safe cleanup')
   }
 }
 
@@ -730,57 +422,6 @@ function parseSamples(bytes: Buffer): RuntimeSoakSample[] {
       throw error
     }
   })
-}
-
-function expectedEvidenceRun(candidateSha: string, receiptRunId: string): string {
-  fullSha(candidateSha, 'candidate SHA')
-  safeRunId(receiptRunId)
-  return `.runtime-evidence/${candidateSha}/${receiptRunId}`
-}
-
-function fullSha(value: unknown, label: string): string {
-  if (typeof value !== 'string' || !/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/.test(value)) throw new Error(`${label} is not a full hexadecimal commit ID`)
-  return value
-}
-
-function sha256(value: unknown, label: string): string {
-  if (typeof value !== 'string' || !/^[a-f0-9]{64}$/.test(value)) throw new Error(`${label} is not a full SHA-256 digest`)
-  return value
-}
-
-function runtimeImage(value: unknown): string {
-  if (typeof value !== 'string' || !/^sha256:[a-f0-9]{64}$/.test(value)) {
-    throw new Error('runtime soak runtime image must be a pinned SHA-256 image ID')
-  }
-  return value
-}
-
-function safeRunId(value: unknown): string {
-  if (typeof value !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(value)) {
-    throw new Error('runtime soak receipt run ID is not a safe evidence directory name')
-  }
-  return value
-}
-
-function readRegularFile(filePath: string, label: string): Buffer {
-  const stat = fs.lstatSync(filePath)
-  if (!stat.isFile() || stat.isSymbolicLink()) throw new Error(`${label} must be a regular file`)
-  if (stat.size > MAX_ARTIFACT_BYTES) throw new Error(`${label} exceeds the evidence size bound`)
-  return fs.readFileSync(filePath)
-}
-
-function readJsonObject(filePath: string, label: string): Record<string, any> {
-  return parseJsonObject(readRegularFile(filePath, label), label)
-}
-
-function parseJsonObject(bytes: Buffer, label: string): Record<string, any> {
-  if (bytes.length > MAX_ARTIFACT_BYTES) throw new Error(`${label} exceeds the evidence size bound`)
-  try {
-    return object(JSON.parse(bytes.toString('utf8')), label)
-  } catch (error) {
-    if (error instanceof SyntaxError) throw new Error(`${label} is not valid JSON`)
-    throw error
-  }
 }
 
 function object(value: unknown, label: string): Record<string, any> {
@@ -813,4 +454,62 @@ function stableJson(value: unknown): string {
       .join(',')}}`
   }
   return JSON.stringify(value)
+}
+export type RuntimeSoakResult = {
+  schemaVersion: 3
+  status: 'PASS' | 'FAIL' | 'BLOCKED'
+  candidateSha: string
+  runtimeImage: string
+  receiptRunId: string
+  evidenceRun: string
+  desiredWorkloads: SoakWorkload[]
+  measurement: {
+    startedAtMs: number
+    endedAtMs: number
+    monotonicStartedMs: number
+    monotonicEndedMs: number
+    monotonicDurationMs: number
+    sampleIntervalMs: number
+  }
+  retentionBounds: {
+    terminalSpoolConfiguredBytes: number
+    terminalSpoolsBytes: number
+    runtimeLogsBytes: number
+  }
+  terminalInput: {
+    soulId: string
+    requestId: string
+    dispatchCount: 1
+    spoolConfiguredBytesObserved: number
+  }
+  cleanup: {
+    verified: boolean
+    unsafeBrokerAttempts: number
+    errors: string[]
+  }
+  summary?: RuntimeSoakSummary
+  errors: string[]
+}
+
+/** Check measured behavior in the soak process; no imported receipt chain. */
+export function validateRuntimeSoakResult(input: { result: unknown; sampleEvidenceBytes: Buffer }): { summary: RuntimeSoakSummary; samples: RuntimeSoakSample[] } {
+  const result = object(input.result, 'runtime soak result')
+  if (result.schemaVersion !== 3) throw new Error('runtime soak result must use schema v3')
+  if (result.status !== 'PASS') throw new Error('runtime soak result status is not PASS')
+  const workloads = validateWorkloads(result.desiredWorkloads)
+  validateTerminalInput(result.terminalInput, workloads)
+  const samples = parseSamples(input.sampleEvidenceBytes)
+  const summary = validateSamples(samples, workloads)
+  validateMeasurement(result.measurement, samples, summary)
+  validateRetentionBounds(result.retentionBounds)
+  validateCleanup(result.cleanup)
+  if (!Array.isArray(result.errors) || result.errors.length) throw new Error('runtime soak result contains errors')
+  return { summary, samples }
+}
+
+function safeRunId(value: unknown): string {
+  if (typeof value !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(value)) {
+    throw new Error('runtime soak receipt run ID is not a safe evidence directory name')
+  }
+  return value
 }

@@ -129,7 +129,9 @@ export function classifyCommand(input: CoordinatorInput): CommandDisposition {
   const normalizedArgs = stripLeadingArgSeparator(input.forwardedArgs)
 
   if (input.commandKey === 'test:runtime') {
-    return coordinated('runtime:gate', [npmPhase('test:runtime:raw', normalizedArgs)])
+    const phases = [npmPhase('test:runtime:raw', normalizedArgs)]
+    if (normalizedArgs.includes('--list')) return passthrough(phases)
+    return coordinated(normalizedArgs.includes('--case') ? undefined : 'runtime:gate', phases)
   }
 
   if (input.commandKey === 'test:vitest') {

@@ -9,14 +9,12 @@ import {
 function createMockBrowserWindow() {
   const instances: any[] = []
 
-  const MockBrowserWindow = vi.fn().mockImplementation((options: Record<string, any>) => {
-    const win = {
-      options,
-      loadURL: vi.fn().mockResolvedValue(undefined),
-      loadFile: vi.fn().mockResolvedValue(undefined),
+  const MockBrowserWindow = vi.fn().mockImplementation(class {
+    loadURL = vi.fn().mockResolvedValue(undefined)
+    loadFile = vi.fn().mockResolvedValue(undefined)
+    constructor(readonly options: Record<string, any>) {
+      instances.push(this)
     }
-    instances.push(win)
-    return win
   }) as unknown as BrowserWindowConstructor
 
   return { MockBrowserWindow, instances }

@@ -9,8 +9,7 @@ import {
   CHAOS_MAX_CYCLE_GAP_MS,
   PHASE5_CHAOS_ASSERTIONS_FILE,
   PHASE5_CHAOS_PROVIDER_EVENTS_FILE,
-  phase5ChaosRetainedBundle,
-  validatePhase5ChaosReceipt,
+  assertPhase5ChaosRun,
 } from '../../../../scripts/testing/runtime-phase5-chaos-evidence.js'
 
 const sha = 'a'.repeat(40)
@@ -177,81 +176,20 @@ function fixture() {
   for (const [name, value] of Object.entries(files)) {
     fs.writeFileSync(path.join(evidenceDir, name), typeof value === 'string' ? value : JSON.stringify(value), { mode: 0o600 })
   }
-  const artifact = (name: string) => ({ path: `.runtime-evidence/${sha}/${runId}/${name}`, sha256: hash(fs.readFileSync(path.join(evidenceDir, name))) })
-  const integrity = { sha, dirty: false, diffHash: hash(''), statusHash: hash('') }
-  const receipt = {
-    schemaVersion: 2,
-    kind: 'phase5_chaos',
-    status: 'PASS',
-    candidateSha: sha,
-    runtimeImage: image,
-    receiptRunId: runId,
-    evidenceRun: `.runtime-evidence/${sha}/${runId}`,
-    candidateIntegrity: { before: integrity, after: integrity, failures: [] },
-    artifacts: {
-      assertions: artifact(PHASE5_CHAOS_ASSERTIONS_FILE),
-      providerEvents: artifact(PHASE5_CHAOS_PROVIDER_EVENTS_FILE),
-      lifecycle: artifact('lifecycle.jsonl'),
-      broker: artifact('broker.jsonl'),
-      cleanup: artifact('cleanup.json'),
-      build: artifact('build.json'),
-      manifest: artifact('manifest.json'),
-      capabilityInventory: artifact('phase5-capability-inventory.json'),
-      serverLog: artifact('phase5-chaos-server-log.jsonl'),
-      browserLog: artifact('phase5-chaos-browser-log.jsonl'),
-    },
-    summary: {
-      provider: 'opencode', soulId, incarnationId, nativeSessionId,
-      webReplacementCycles: 100, supervisorReplacementCycles: 20,
-      approvalDecisionCount: 1, providerToolRequestCount: 2, providerToolResultCount: 2,
-      replayCount: 0, falseLossNoticeCount: 0, unsafeBrokerAttempts: 0,
-      maxCycleGapMs: 5, serverLogBytes: Buffer.byteLength(files['phase5-chaos-server-log.jsonl'] as string),
-      browserLogBytes: Buffer.byteLength(files['phase5-chaos-browser-log.jsonl'] as string),
-    },
-  }
   const rewrite = (name: string, mutate: (value: any) => void) => {
     const target = path.join(evidenceDir, name)
-    const value = JSON.parse(fs.readFileSync(target, 'utf8'))
-    mutate(value)
+    const value = JSON.parse(fs.readFileSync(target, 'utf8')); mutate(value)
     fs.writeFileSync(target, JSON.stringify(value), { mode: 0o600 })
   }
-  const rehash = (name: string) => {
-    const ref = Object.values(receipt.artifacts).find((row: any) => row.path.endsWith(`/${name}`)) as any
-    ref.sha256 = hash(fs.readFileSync(path.join(evidenceDir, name)))
-  }
-  return { repoRoot, evidenceDir, receipt, rewrite, rehash }
+  return { repoRoot, evidenceDir, rewrite }
 }
-
-afterEach(() => {
-  for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true })
-})
-
-function validate(fx: ReturnType<typeof fixture>) {
-  return validatePhase5ChaosReceipt({ repoRoot: fx.repoRoot, candidateSha: sha, runtimeImage: image, receipt: fx.receipt })
-}
-
-describe('Phase 5 chaos receipt validation', () => {
-  it('derives PASS from all 100/20 exact cycle rows and hashed provider/native evidence', () => {
-    const fx = fixture()
-    const validated = validate(fx)
-    expect(validated.summary).toEqual(fx.receipt.summary)
-    expect(Object.keys(phase5ChaosRetainedBundle(validated).files)).toHaveLength(10)
+afterEach(() => { for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true }) })
+function validate(fx: ReturnType<typeof fixture>) { return assertPhase5ChaosRun(fx.evidenceDir) }
+describe('direct chaos observations', () => {
+  it('checks the actual 100/20 cycles, provider events, and logs without an attestation', () => {
+    expect(validate(fixture()).summary).toMatchObject({ webReplacementCycles: 100, supervisorReplacementCycles: 20, replayCount: 0, falseLossNoticeCount: 0 })
   })
 
-  it('rejects schema v1, unknown fields, skipped tests, and summary self-assertions', () => {
-    for (const mutate of [
-      (fx: ReturnType<typeof fixture>) => { fx.receipt.schemaVersion = 1 },
-      (fx: ReturnType<typeof fixture>) => { fx.receipt.duplicateWriters = 0 },
-      (fx: ReturnType<typeof fixture>) => {
-        fx.receipt.candidateIntegrity.before.statusHash = '1'.repeat(64)
-        fx.receipt.candidateIntegrity.after.statusHash = '1'.repeat(64)
-      },
-      (fx: ReturnType<typeof fixture>) => { fx.rewrite(PHASE5_CHAOS_ASSERTIONS_FILE, (row) => { row.test.skipped = 1 }); fx.rehash(PHASE5_CHAOS_ASSERTIONS_FILE) },
-      (fx: ReturnType<typeof fixture>) => { fx.receipt.summary.replayCount = 1 },
-    ]) {
-      const fx = fixture(); mutate(fx); expect(() => validate(fx)).toThrow()
-    }
-  })
 
   it('requires every exact cycle with declared alternation and no retry masking', () => {
     for (const mutation of [
@@ -260,10 +198,11 @@ describe('Phase 5 chaos receipt validation', () => {
       (row: any) => { row.webCycles[2].mode = 'graceful' },
       (row: any) => { row.supervisorCycles[1].attemptCount = 2 },
     ]) {
-      const fx = fixture(); fx.rewrite(PHASE5_CHAOS_ASSERTIONS_FILE, mutation); fx.rehash(PHASE5_CHAOS_ASSERTIONS_FILE)
+      const fx = fixture(); fx.rewrite(PHASE5_CHAOS_ASSERTIONS_FILE, mutation)
       expect(() => validate(fx)).toThrow(/cycle|alternat|attempt/i)
     }
   })
+
 
   it('requires unique replacement process/container identities and continuous chains', () => {
     for (const mutation of [
@@ -274,10 +213,11 @@ describe('Phase 5 chaos receipt validation', () => {
       (row: any) => { row.supervisorCycles[3].afterContainerId = row.supervisorCycles[2].afterContainerId },
       (row: any) => { row.supervisorCycles[4].beforeControlEpoch -= 1 },
     ]) {
-      const fx = fixture(); fx.rewrite(PHASE5_CHAOS_ASSERTIONS_FILE, mutation); fx.rehash(PHASE5_CHAOS_ASSERTIONS_FILE)
+      const fx = fixture(); fx.rewrite(PHASE5_CHAOS_ASSERTIONS_FILE, mutation)
       expect(() => validate(fx)).toThrow(/identity|chain|epoch|unique/i)
     }
   })
+
 
   it('requires monotonic bounded cycles', () => {
     for (const mutation of [
@@ -285,10 +225,11 @@ describe('Phase 5 chaos receipt validation', () => {
       (row: any) => { row.webCycles[1].endedMonotonicMs = row.webCycles[1].startedMonotonicMs - 1 },
       (row: any) => { row.supervisorCycles[0].startedMonotonicMs += CHAOS_MAX_CYCLE_GAP_MS + 1 },
     ]) {
-      const fx = fixture(); fx.rewrite(PHASE5_CHAOS_ASSERTIONS_FILE, mutation); fx.rehash(PHASE5_CHAOS_ASSERTIONS_FILE)
+      const fx = fixture(); fx.rewrite(PHASE5_CHAOS_ASSERTIONS_FILE, mutation)
       expect(() => validate(fx)).toThrow(/monotonic|gap|window/i)
     }
   })
+
 
   it('requires the same soul/native/incarnation/host/writer and effective limits throughout', () => {
     for (const mutation of [
@@ -297,10 +238,11 @@ describe('Phase 5 chaos receipt validation', () => {
       (row: any) => { row.webCycles[4].runtime.unsafeBrokerAttempts = 1 },
       (row: any) => { row.supervisorCycles[3].runtime.limits.swapMax = 'max' },
     ]) {
-      const fx = fixture(); fx.rewrite(PHASE5_CHAOS_ASSERTIONS_FILE, mutation); fx.rehash(PHASE5_CHAOS_ASSERTIONS_FILE)
+      const fx = fixture(); fx.rewrite(PHASE5_CHAOS_ASSERTIONS_FILE, mutation)
       expect(() => validate(fx)).toThrow(/runtime|writer|unsafe|limit|swap/i)
     }
   })
+
 
   it('requires zero decisions before click and exactly one provider-side decision after click', () => {
     for (const mutation of [
@@ -308,10 +250,11 @@ describe('Phase 5 chaos receipt validation', () => {
       (row: any) => { row.approval.decisionsAfterClick = 2 },
       (row: any) => { row.approval.markerCount = 2 },
     ]) {
-      const fx = fixture(); fx.rewrite(PHASE5_CHAOS_ASSERTIONS_FILE, mutation); fx.rehash(PHASE5_CHAOS_ASSERTIONS_FILE)
+      const fx = fixture(); fx.rewrite(PHASE5_CHAOS_ASSERTIONS_FILE, mutation)
       expect(() => validate(fx)).toThrow(/approval|decision|marker/i)
     }
   })
+
 
   it('requires one native request/result per tool, no replay, and exact follow-up evidence', () => {
     for (const mutation of [
@@ -320,10 +263,11 @@ describe('Phase 5 chaos receipt validation', () => {
       (row: any) => { row.longTool.replayCount = 1 },
       (row: any) => { row.followUp.completedCount = 0 },
     ]) {
-      const fx = fixture(); fx.rewrite(PHASE5_CHAOS_PROVIDER_EVENTS_FILE, mutation); fx.rehash(PHASE5_CHAOS_PROVIDER_EVENTS_FILE)
+      const fx = fixture(); fx.rewrite(PHASE5_CHAOS_PROVIDER_EVENTS_FILE, mutation)
       expect(() => validate(fx)).toThrow(/provider|tool|replay|follow-up/i)
     }
   })
+
 
   it('binds false-loss notice evidence to the exact profile, soul, and durable revision', () => {
     for (const mutation of [
@@ -332,10 +276,11 @@ describe('Phase 5 chaos receipt validation', () => {
       (row: any) => { row.falseLossQuery.evidenceRevision = 0 },
       (row: any) => { row.falseLossQuery.matchingNoticeIds = ['notice-loss'] },
     ]) {
-      const fx = fixture(); fx.rewrite(PHASE5_CHAOS_ASSERTIONS_FILE, mutation); fx.rehash(PHASE5_CHAOS_ASSERTIONS_FILE)
+      const fx = fixture(); fx.rewrite(PHASE5_CHAOS_ASSERTIONS_FILE, mutation)
       expect(() => validate(fx)).toThrow(/profile|soul|revision|notice/i)
     }
   })
+
 
   it('retains bounded server/browser logs and rejects secrets or response content', () => {
     const missing = fixture(); fs.unlinkSync(path.join(missing.evidenceDir, 'phase5-chaos-browser-log.jsonl'))
@@ -343,12 +288,10 @@ describe('Phase 5 chaos receipt validation', () => {
 
     const secret = fixture()
     fs.appendFileSync(path.join(secret.evidenceDir, 'phase5-chaos-server-log.jsonl'), `${JSON.stringify({ error: 'Bearer abcdefghijklmnop' })}\n`)
-    secret.rehash('phase5-chaos-server-log.jsonl')
     expect(() => validate(secret)).toThrow(/secret|redact/i)
 
     const response = fixture()
     response.rewrite(PHASE5_CHAOS_PROVIDER_EVENTS_FILE, (row) => { row.providerResponse = 'synthetic native transcript text' })
-    response.rehash(PHASE5_CHAOS_PROVIDER_EVENTS_FILE)
     expect(() => validate(response)).toThrow(/unknown field/i)
 
     for (const mutate of [
@@ -361,8 +304,11 @@ describe('Phase 5 chaos receipt validation', () => {
       const row = JSON.parse(fs.readFileSync(target, 'utf8'))
       mutate(row)
       fs.writeFileSync(target, `${JSON.stringify(row)}\n`, { mode: 0o600 })
-      malformed.rehash('phase5-chaos-server-log.jsonl')
       expect(() => validate(malformed)).toThrow(/log|redact|sequence|digest/i)
     }
+  })
+  it('does not count an empty or skipped run as coverage', () => {
+    const fx = fixture(); fx.rewrite(PHASE5_CHAOS_ASSERTIONS_FILE, row => { row.test.skipped = 1 })
+    expect(() => validate(fx)).toThrow(/skipped/i)
   })
 })

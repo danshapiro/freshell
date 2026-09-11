@@ -1,3 +1,4 @@
+import { stripVTControlCharacters } from 'node:util'
 import { createHash, randomUUID } from 'node:crypto'
 import { execFileSync, spawnSync } from 'node:child_process'
 import fs from 'node:fs'
@@ -47,16 +48,15 @@ export type AssertionRecord = {
   evidence?: unknown
 }
 
-export type ProviderQualificationBuildRecord = {
-  kind: 'production' | 'qualification_fixture'
+export type RuntimeBrowserBuildRecord = {
+  kind: 'production' | 'test_faults' | 'deterministic_fixture'
   serverFeatures: string[]
   supervisorFeatures: string[]
-  qualificationProviders: string[]
   serverBinary: string
   supervisorBinary: string
 }
 
-export type FreshAgentQualificationBuildRecord = {
+export type FreshAgentBuildRecord = {
   kind: 'production' | 'deterministic_fixture'
   serverFeatures: string[]
   sessionHostFeatures: string[]
@@ -140,38 +140,11 @@ export class RuntimeHarness {
 
     const sourceManifest = JSON.parse(fs.readFileSync(path.join(this.repoRoot, 'test/runtime/gate-manifest.json'), 'utf8'))
     writePrivateJson(path.join(this.evidenceDir, 'manifest.json'), { ...sourceManifest, execution: { candidateSha: this.candidateSha, runId: this.runId, startedAt: new Date().toISOString() } })
-    const providerResults = this.phase === 1
-      ? { phase: 'phase-1', externalProviders: 'not-applicable', fixtures: ['heartbeat', 'descendant_spawner', 'cpu_burner', 'memory_allocator', 'native_session', 'security_probe'] }
-      : this.phase === 2
-        ? { phase: 'phase-2', opencode: { status: 'pending-live-gate', version: '1.18.21', model: 'opencode/big-pickle', freeTier: true }, workloadImage: 'pinned' }
-        : this.phase === 3
-          ? {
-              phase: 'phase-3',
-              deterministicFixture: { provider: 'native-session-fixture', status: 'pending-live-gate' },
-              providers: {
-                claude: { status: 'pending-receipt', requiredModel: 'haiku', reasoning: 'lowest' },
-                opencode: { status: 'pending-receipt', version: '1.18.21', model: 'opencode/big-pickle', freeTier: true },
-                codex: { status: 'pending-receipt', version: '0.147.0', requiredModel: 'gpt-5.6-luna', reasoning: 'lowest' },
-                amplifier: { status: 'pending-receipt', version: '0.1.1', commit: '1873aa980535c99a743b17172e4231833f6c8741' },
-              },
-            }
-          : this.phase === 4
-            ? {
-                phase: 'phase-4',
-                startupReconciliation: 'pending-live-gate',
-                durableViewIntents: 'pending-live-gate',
-                browserRehydration: 'pending-receipt',
-                compatibilityFallback: 'pending-live-gate',
-              }
-            : {
-                phase: 'phase-5',
-                lossCertification: 'pending-live-gate',
-                incidentBeforeCleanup: 'pending-live-gate',
-                durableNotices: 'pending-browser-receipt',
-                chaos: 'pending-live-gate',
-                migrationRollback: 'pending-live-gate',
-              }
-    writePrivateJson(path.join(this.evidenceDir, 'provider-results.json'), providerResults)
+    // Setup reports infrastructure only. Real providers are exercised by the
+    // separately selected live tests, not inferred from this manifest.
+    writePrivateJson(path.join(this.evidenceDir, 'provider-results.json'), {
+      scope: 'runtime-sandbox', externalProviders: 'not-tested-by-setup',
+    })
 
     this.recordLifecycle('gate.prepare.started', { repoRoot: this.repoRoot, candidateSha: this.candidateSha, runId: this.runId })
     this.ensureRuntimeImage()
@@ -249,26 +222,25 @@ export class RuntimeHarness {
     return { ok: cleanup.ok, errors }
   }
 
-  recordProviderQualificationBuild(record: ProviderQualificationBuildRecord): void {
+  recordBrowserBuild(record: RuntimeBrowserBuildRecord): void {
     const buildPath = path.join(this.evidenceDir, 'build.json')
     const build = JSON.parse(fs.readFileSync(buildPath, 'utf8'))
-    const qualificationBuild = {
+    const browserBuild = {
       kind: record.kind,
       serverFeatures: [...record.serverFeatures].sort(),
       supervisorFeatures: [...record.supervisorFeatures].sort(),
-      qualificationProviders: [...record.qualificationProviders].sort(),
       binaries: {
         server: fileBuild(this.validateRunBuildBinary(record.serverBinary, 'qualification server')),
         supervisor: fileBuild(this.validateRunBuildBinary(record.supervisorBinary, 'qualification supervisor')),
       },
     }
-    writePrivateJson(buildPath, { ...build, qualificationBuild })
+    writePrivateJson(buildPath, { ...build, browserBuild })
   }
 
-  recordFreshAgentQualificationBuild(record: FreshAgentQualificationBuildRecord): void {
+  recordFreshAgentBuild(record: FreshAgentBuildRecord): void {
     const buildPath = path.join(this.evidenceDir, 'build.json')
     const build = JSON.parse(fs.readFileSync(buildPath, 'utf8'))
-    const freshAgentQualificationBuild = {
+    const freshAgentBuild = {
       kind: record.kind,
       serverFeatures: [...record.serverFeatures].sort(),
       sessionHostFeatures: [...record.sessionHostFeatures].sort(),
@@ -282,8 +254,8 @@ export class RuntimeHarness {
     }
     fs.writeFileSync(buildPath, JSON.stringify({
       ...build,
-      freshAgentQualificationBuild,
-      binaries: { ...build.binaries, ...freshAgentQualificationBuild.binaries },
+      freshAgentBuild,
+      binaries: { ...build.binaries, ...freshAgentBuild.binaries },
     }, null, 2))
   }
 
@@ -970,6 +942,25 @@ export class RuntimeHarness {
 
   runSandboxed(command: string): string {
     return execFileSync('bash', ['scripts/sandbox-test.sh', '--runtime-suite', command], { cwd: this.repoRoot, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 32 * 1024 * 1024 })
+  }
+
+  runFocusedVitest(testPath: string): void {
+    if (!/^test\/[A-Za-z0-9_./-]+\.test\.tsx?$/.test(testPath)
+      || testPath.split('/').includes('..')
+      || !fs.statSync(path.join(this.repoRoot, testPath), { throwIfNoEntry: false })?.isFile()) {
+      throw new Error('runtime subtest must select one existing test file')
+    }
+    // The outer runtime invocation keeps the broad coordinator lease. This is
+    // a single-file passthrough, not recursive acquisition of that same lease.
+    // Change only the child's marker, never the parent holder or environment.
+    const output = this.runCommand(path.join(os.homedir(), '.local', 'bin', 'mise'), [
+      'exec', 'node@22', '--', 'npm', 'run', 'test:vitest', '--', 'run', testPath,
+      '--config', testPath.startsWith('test/unit/port/')
+        ? 'config/vitest/vitest.port.config.ts' : 'config/vitest/vitest.config.ts',
+    ], { env: { FRESHELL_TEST_COORDINATOR_ACTIVE: undefined } })
+    if (!/Tests\s+[1-9]\d* passed/.test(stripVTControlCharacters(output))) {
+      throw new Error(`focused Vitest ${testPath} ran no passing tests`)
+    }
   }
 
   runCommand(command: string, args: string[], options: { cwd?: string; env?: NodeJS.ProcessEnv } = {}): string {

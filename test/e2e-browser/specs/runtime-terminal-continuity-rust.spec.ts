@@ -258,7 +258,7 @@ test.describe.serial('Phase 2 managed runtime continuity', () => {
         candidateSha: rig.runtime.candidateSha,
         runtimeImage: rig.runtime.imageRef,
       }
-      const receiptPath = rig.writeBrowserReceipt(receipt)
+      const receiptPath = rig.writeBrowserResult(receipt)
       // eslint-disable-next-line no-console
       console.log(`[P2-G01] browser continuity receipt: ${receiptPath}`)
     } finally {
@@ -390,7 +390,7 @@ test.describe.serial('Phase 2 managed runtime continuity', () => {
         candidateSha: rig.runtime.candidateSha,
         runtimeImage: rig.runtime.imageRef,
       }
-      const receiptPath = rig.writeOpencodeReceipt(receipt)
+      const receiptPath = rig.writeOpenCodeResult(receipt)
       // eslint-disable-next-line no-console
       console.log(`[P2-G04] real OpenCode continuity receipt: ${receiptPath}`)
     } finally {

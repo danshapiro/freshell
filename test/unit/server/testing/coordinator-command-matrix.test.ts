@@ -784,3 +784,15 @@ describe('runtime gate coordination', () => {
     })
   })
 })
+
+
+describe('runtime inspection is not test coverage', () => {
+  it('lists scenarios without recording a reusable runtime-suite success', () => {
+    expect(classifyCommand({ commandKey: 'test:runtime', forwardedArgs: ['gate', 'phase-5', '--list'] }).kind).toBe('passthrough')
+  })
+  it('coordinates a focused destructive case without calling it the entire runtime suite', () => {
+    const plan = classifyCommand({ commandKey: 'test:runtime', forwardedArgs: ['gate', 'phase-5', '--require-live', '--case', 'P5-G06'] })
+    expect(plan.kind).toBe('coordinated')
+    expect('suiteKey' in plan ? plan.suiteKey : undefined).toBeUndefined()
+  })
+})
