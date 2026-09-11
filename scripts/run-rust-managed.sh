@@ -25,11 +25,11 @@ MISE="$(command -v mise || true)"
 MANAGER=("$MISE" exec node@22 -- "$REPO_ROOT/node_modules/.bin/tsx" "$REPO_ROOT/scripts/managed-runtime-release.ts")
 managed() { "${MANAGER[@]}" "$@" --repo-root "$REPO_ROOT" --freshell-home "$FRESHELL_HOME"; }
 
-# Reading current re-verifies immutable metadata and binary digests. Do not
+# Reading current re-verifies immutable metadata and binary digests. Registry
+# backup is a release-activation concern, not a per-web-restart side effect. Do not
 # require every optional provider credential merely to restore the web UI;
 # provider launch attempts report their own dependency failures.
 BINARY="$(managed current --field serverBinary)"
-managed backup-registry >/dev/null
 managed ensure-supervisor >/dev/null
 ENV_FILE="$(managed web-env-file)"
 [[ -x "$BINARY" ]] || { echo "Missing immutable Freshell server: $BINARY" >&2; exit 1; }

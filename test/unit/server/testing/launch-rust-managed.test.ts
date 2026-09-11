@@ -86,7 +86,7 @@ describe('canonical Rust launcher managed-runtime release wiring', () => {
     expect(source).not.toContain('managed preflight')
     expect(source).toContain('managed current --field serverBinary')
     expect(source).toContain('managed web-env-file')
-    expect(source).toContain('managed backup-registry')
+    expect(source).not.toContain('managed backup-registry')
     expect(source).toContain('exec "$BINARY"')
     expect(source).not.toContain('setsid')
   })
