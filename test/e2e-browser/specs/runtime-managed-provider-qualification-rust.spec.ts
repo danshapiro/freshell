@@ -27,6 +27,7 @@ import {
   type ManagedRuntimeView,
 } from '../helpers/managed-runtime.js'
 import { openPanePicker } from '../helpers/pane-picker.js'
+import { openCodeTerminalReady } from '../helpers/opencode-native-history.js'
 import { nativeTurnProof } from '../helpers/provider-native-history/proof.js'
 import type { NativeAssistantTurn, NativeHistory } from '../helpers/provider-native-history/types.js'
 import { TestHarness } from '../helpers/test-harness.js'
@@ -47,7 +48,6 @@ type ProviderDefinition = {
   processBinary: string
   processIdentityNeedles: string[]
   nativeIdPattern: RegExp
-  terminalReadyText?: string
 }
 
 function requireAmplifierOnecliBootstrap(): void {
@@ -110,7 +110,6 @@ function providerDefinitions(): ProviderDefinition[] {
       processBinary: 'opencode',
       processIdentityNeedles: [P2_OPENCODE_FREE_MODEL],
       nativeIdPattern: /^ses_/,
-      terminalReadyText: 'Ask anything',
     },
   ]
   if (selected.includes('amplifier')) {
@@ -191,16 +190,76 @@ function expectActualProviderProcess(processTable: string, binary: string): void
   expect(processTable).toMatch(new RegExp(`(?:^|\\s)(?:/[^\\s]*/)?${regexEscape(binary)}(?:$|\\s)`, 'm'))
 }
 
+function dataOf(result: any, expectedKind: string): any {
+  if (!result || result.kind !== expectedKind) {
+    throw new Error(`expected ${expectedKind}, got ${JSON.stringify(result)}`)
+  }
+  return result.data
+}
+
 async function waitForProviderTerminalReady(
   page: Page,
-  terminalId: string,
+  harness: TestHarness,
+  rig: ManagedRuntimeBrowserRig,
+  tabId: string,
+  paneId: string,
+  view: ManagedRuntimeView,
   definition: ProviderDefinition,
 ): Promise<void> {
-  const readyText = definition.terminalReadyText
-  if (!readyText) return
-  await waitForValue(`${definition.provider} terminal readiness`, async () => (
-    (await terminalBuffer(page, terminalId)).includes(readyText) ? true : null
-  ), 180_000)
+  // Other provider rows currently expose no stable source-level prompt marker;
+  // their first real turn remains the acceptance check. OpenCode's TUI does,
+  // and it is unsafe to type before bracketed-paste/raw input mode is active.
+  if (definition.provider !== 'opencode') return
+  const terminalId = view.terminalId
+  if (!terminalId) throw new Error('OpenCode runtime has no terminal identity')
+  let sourceEpoch = ''
+  let sourceText = ''
+  let cursor = 0
+  await waitForValue('OpenCode source-epoch and browser input readiness', async () => {
+    const output = dataOf(await rig.runtime.adminOk(
+      rig.supervisor,
+      rig.runtime.terminalReadOutputBody(
+        view.soulId,
+        cursor,
+        256 * 1024,
+        await rig.controlEpoch(),
+      ),
+    ), 'terminal_output')
+    if (output.incarnationId !== view.incarnationId
+        || output.terminalId !== terminalId
+        || !output.streamEpoch
+        || output.exited) return null
+    if (output.streamEpoch !== sourceEpoch || output.resetRequired) {
+      sourceEpoch = output.streamEpoch
+      sourceText = ''
+      cursor = 0
+    }
+    for (const frame of output.frames ?? []) {
+      if (frame.streamEpoch !== sourceEpoch || frame.terminalId !== terminalId) {
+        throw new Error('OpenCode readiness frame has mismatched ownership')
+      }
+      sourceText = (sourceText + frame.data).slice(-512 * 1024)
+      cursor = Math.max(cursor, frame.seqEnd)
+    }
+    if (!openCodeTerminalReady(sourceText)) return null
+
+    const leaf = leavesByMode(await harness.getPaneLayout(tabId), 'opencode')
+      .find((candidate) => candidate.id === paneId)
+    if (leaf?.content?.incarnationId !== view.incarnationId
+        || leaf?.content?.streamId !== sourceEpoch) return null
+    const rendered = await page.evaluate((id) => {
+      const h = window.__FRESHELL_TEST_HARNESS__
+      return {
+        text: h?.getTerminalBuffer(id) ?? '',
+        modes: h?.getTerminalModes?.(id),
+      }
+    }, terminalId)
+    return rendered.text.includes('Build')
+      && rendered.text.includes('Big Pickle')
+      && rendered.modes?.bracketedPasteMode
+      ? true
+      : null
+  }, 180_000)
 }
 
 async function executeAndAwaitNonceOutput(
@@ -366,7 +425,9 @@ async function qualifyProvider(
   }
   const exactLimits = limitEvidence(rig, created.view)
   expect(exactLimits.swapMax).toBe('0')
-  await waitForProviderTerminalReady(page, created.terminalId, definition)
+  await waitForProviderTerminalReady(
+    page, harness, rig, tabId, created.paneId, created.view, definition,
+  )
 
   const nonce = `codename-${randomBytes(16).toString('hex')}`
   await executeAndAwaitNonceOutput(
@@ -389,6 +450,9 @@ async function qualifyProvider(
   expect(afterHostLoss.soulId).toBe(created.view.soulId)
   expect(afterHostLoss.nativeSessionId).toBe(nativeSessionId)
   expect(rig.runtime.isContainerRunning(created.view.containerId)).toBe(false)
+  await waitForProviderTerminalReady(
+    page, harness, rig, tabId, created.paneId, afterHostLoss, definition,
+  )
 
   await executeAndAwaitNonceOutput(
     page,
@@ -407,6 +471,9 @@ async function qualifyProvider(
   expect(afterProviderLoss.nativeSessionId).toBe(nativeSessionId)
   expect(afterProviderLoss.profile).toBe(created.view.profile)
   expect(rig.runtime.isContainerRunning(afterHostLoss.containerId)).toBe(false)
+  await waitForProviderTerminalReady(
+    page, harness, rig, tabId, created.paneId, afterProviderLoss, definition,
+  )
 
   await executeAndAwaitNonceOutput(
     page,
