@@ -296,7 +296,15 @@ export class ManagedRuntimeBrowserRig {
   }
 
   ownedProviderExec(containerId: string, args: string[]): string {
-    return this.runtime.execOwnedContainerAsExact(containerId, '65534:0', args)
+    const home = '/home/freshell/provider'
+    return this.runtime.execOwnedContainerAsExact(containerId, '65534:0', args, {
+      HOME: home,
+      CLAUDE_CONFIG_DIR: `${home}/.claude`,
+      CODEX_HOME: `${home}/.codex`,
+      XDG_CONFIG_HOME: `${home}/.config`,
+      XDG_DATA_HOME: `${home}/.local/share`,
+      TMPDIR: '/tmp',
+    })
   }
 
   ownedContainerHasPid(containerId: string, pid: number): boolean {

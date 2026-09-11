@@ -1,11 +1,30 @@
 import { describe, expect, it } from 'vitest'
 import {
   classifyExactProcessSignalResult,
+  exactOwnedExecDockerArgs,
   exactProcessSignalDockerArgs,
   normalizeExpectedProcessFragments,
 } from '../../../../scripts/testing/runtime-sandbox.js'
 
 describe('exact owned runtime process signaling', () => {
+
+
+  it('passes a bounded explicit provider environment to an exact owned exec', () => {
+    const args = exactOwnedExecDockerArgs('b'.repeat(64), '65534:0', {
+      HOME: '/home/freshell/provider',
+      XDG_DATA_HOME: '/home/freshell/provider/.local/share',
+    }, ['opencode', '--version'])
+    expect(args).toEqual([
+      'exec', '--user', '65534:0',
+      '--env', 'HOME=/home/freshell/provider',
+      '--env', 'XDG_DATA_HOME=/home/freshell/provider/.local/share',
+      'b'.repeat(64), 'opencode', '--version',
+    ])
+    expect(() => exactOwnedExecDockerArgs('b'.repeat(64), '65534:0', { 'BAD-NAME': 'x' }, ['true']))
+      .toThrow(/environment/i)
+    expect(() => exactOwnedExecDockerArgs('b'.repeat(64), '65534:0', { HOME: 'bad\nvalue' }, ['true']))
+      .toThrow(/environment/i)
+  })
 
   it('uses container-root only inside the exact receipt-owned enclosure for the verified signal', () => {
     const args = exactProcessSignalDockerArgs('a'.repeat(64), 11, ['codex', 'app-server'], 'KILL')

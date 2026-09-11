@@ -101,6 +101,28 @@ try {
 }
 `
 
+export function exactOwnedExecDockerArgs(
+  containerId: string,
+  user: string,
+  environment: Readonly<Record<string, string>>,
+  command: readonly string[],
+): string[] {
+  if (!/^[0-9a-f]{64}$/.test(containerId)) throw new Error('exact owned exec requires a full container id')
+  if (!/^\d+:\d+$/.test(user)) throw new Error(`invalid numeric docker exec user ${user}`)
+  if (command.length === 0 || command.some((value) => value.length === 0 || value.includes('\0'))) {
+    throw new Error('exact owned exec requires a non-empty NUL-free command')
+  }
+  const args = ['exec', '--user', user]
+  for (const [key, value] of Object.entries(environment).sort(([left], [right]) => left.localeCompare(right))) {
+    if (!/^[A-Z][A-Z0-9_]*$/.test(key) || value.includes('\0') || value.includes('\n') || value.includes('\r')) {
+      throw new Error(`invalid exact owned exec environment entry ${key}`)
+    }
+    args.push('--env', `${key}=${value}`)
+  }
+  args.push(containerId, ...command)
+  return args
+}
+
 export function exactProcessSignalDockerArgs(
   containerId: string,
   pid: number,
@@ -957,12 +979,19 @@ export class RuntimeHarness {
     return execFileSync('docker', ['exec', containerId, ...command], { encoding: 'utf8', maxBuffer: 32 * 1024 * 1024 })
   }
 
-  execOwnedContainerAsExact(containerId: string, user: string, command: string[]): string {
+  execOwnedContainerAsExact(
+    containerId: string,
+    user: string,
+    command: string[],
+    environment: Readonly<Record<string, string>> = {},
+  ): string {
     if (!this.broker.receiptIds().has(containerId) && !this.trackedContainers.has(containerId)) {
       throw new Error(`refusing to exec non-owned container ${containerId}`)
     }
-    if (!/^\d+:\d+$/.test(user)) throw new Error(`invalid numeric docker exec user ${user}`)
-    return execFileSync('docker', ['exec', '--user', user, containerId, ...command], { encoding: 'utf8', maxBuffer: 32 * 1024 * 1024 })
+    return execFileSync('docker', exactOwnedExecDockerArgs(containerId, user, environment, command), {
+      encoding: 'utf8',
+      maxBuffer: 32 * 1024 * 1024,
+    })
   }
 
   topOwnedContainerExact(containerId: string, psArgs: string[] = ['-eo', 'pid,ppid,sid,comm']): string {
