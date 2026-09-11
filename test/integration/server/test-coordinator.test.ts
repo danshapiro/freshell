@@ -447,8 +447,12 @@ describe('test coordinator CLI', () => {
     expect(queuedOutput).toContain('npm test')
     expect(queuedOutput).toContain('Previous clean baseline')
 
-    expect((await waitForExit(first)).code).toBe(0)
-    expect((await waitForExit(second)).code).toBe(0)
+    const firstExit = await waitForExit(first)
+    expect(firstExit.code, `first coordinator output:
+${firstExit.output}`).toBe(0)
+    const secondExit = await waitForExit(second)
+    expect(secondExit.code, `queued coordinator output:
+${secondExit.output}`).toBe(0)
 
     const commandRuns = await readCommandRuns(fixture.storeDir)
     expect(commandRuns.byKey['test:all']).toMatchObject({
