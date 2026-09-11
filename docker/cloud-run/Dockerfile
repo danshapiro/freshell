@@ -39,6 +39,7 @@ COPY crates/ ./crates/
 COPY extensions/ ./extensions/
 # Shared provider facts are embedded by freshell-agent-runtime.
 COPY docs/development/runtime-provider-capabilities.json ./docs/development/runtime-provider-capabilities.json
+COPY docker/runtime/provider-versions.json ./docker/runtime/provider-versions.json
 
 # Build only the server binary (release profile).
 RUN cargo build --release -p freshell-server

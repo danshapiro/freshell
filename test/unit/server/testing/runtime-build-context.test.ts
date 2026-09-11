@@ -27,6 +27,7 @@ describe.each(['.dockerignore', '.gcloudignore'])('%s keeps private runtime mate
     'scripts/testing/runtime-gate.ts',
     'crates/freshell-session-host/src/main.rs',
     'docs/development/runtime-provider-capabilities.json',
+    'docker/runtime/provider-versions.json',
     'test/unit/server/testing/runtime-build-context.test.ts',
   ])('retains required source %s', (source) => {
     expect(policy().ignores(source)).toBe(false)
@@ -34,10 +35,10 @@ describe.each(['.dockerignore', '.gcloudignore'])('%s keeps private runtime mate
 })
 
 
-it('copies the embedded provider declaration into the Rust cloud build stage', () => {
+it.each(['docs/development/runtime-provider-capabilities.json', 'docker/runtime/provider-versions.json'])('copies embedded %s into the Rust cloud build stage', (source) => {
   const dockerfile = fs.readFileSync(path.join(root, 'docker/cloud-run/Dockerfile'), 'utf8')
   const compile = dockerfile.indexOf('RUN cargo build --release -p freshell-server')
-  const manifest = dockerfile.indexOf('COPY docs/development/runtime-provider-capabilities.json')
+  const manifest = dockerfile.indexOf(`COPY ${source}`)
   expect(manifest).toBeGreaterThanOrEqual(0)
   expect(manifest).toBeLessThan(compile)
 })
