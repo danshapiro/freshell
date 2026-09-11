@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { parseVerificationArgs, verificationSteps, playwrightFailure, verificationOutcome } from '../../../../scripts/testing/runtime-verify.js'
+import { parseVerificationArgs, verificationSteps, playwrightFailure, verificationOutcome, playwrightReportEnvironment } from '../../../../scripts/testing/runtime-verify.js'
 
 describe('direct runtime verification', () => {
   it('keeps every implemented terminal provider and fresh mode in the live matrix', () => {
@@ -38,9 +38,10 @@ describe('direct runtime verification', () => {
 
 
 describe('Stage 5a local Docker browser execution', () => {
-  it('uses the explicit local browser entrypoint regardless of ambient cloud configuration', () => {
+  it('uses the explicit local browser entrypoint and an exact JSON result path regardless of ambient cloud configuration', () => {
     const browserSteps = verificationSteps({ suite: 'all' }).filter(step => step.browser)
     expect(browserSteps.length).toBeGreaterThan(0)
+    expect(playwrightReportEnvironment('/tmp/result.json')).toEqual({ PLAYWRIGHT_JSON_OUTPUT_FILE: '/tmp/result.json' })
     for (const step of browserSteps) {
       expect(step.args.slice(0, 2)).toEqual(['run', 'test:e2e:local'])
       expect(step.env.FRESHELL_E2E_BACKEND).toBe('local')

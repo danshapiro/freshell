@@ -59,6 +59,10 @@ export function parseVerificationArgs(args: string[]): VerificationSelection {
   throw new Error('usage: npm run test:runtime:verify -- [--suite deterministic|live|stress|all | --only <step> ... | --list]')
 }
 
+export function playwrightReportEnvironment(reportFile: string): { PLAYWRIGHT_JSON_OUTPUT_FILE: string } {
+  return { PLAYWRIGHT_JSON_OUTPUT_FILE: reportFile }
+}
+
 export function playwrightFailure(report: unknown): string | null {
   const stats = (report as { stats?: Record<string, number> } | null)?.stats
   if (!stats || !Number.isSafeInteger(stats.expected) || stats.expected <= 0) return 'Playwright ran no passing tests'
@@ -96,7 +100,7 @@ export async function runVerification(selection: VerificationSelection, override
   for (const step of steps) {
     const log = path.join(root, `${step.id}.log`)
     const reportFile = path.join(root, `${step.id}.playwright.json`)
-    const env = { ...process.env, ...overrides, ...step.env, PLAYWRIGHT_JSON_OUTPUT_NAME: reportFile }
+    const env = { ...process.env, ...overrides, ...step.env, ...playwrightReportEnvironment(reportFile) }
     console.log(`RUN ${step.id}: ${log}`)
     let exitCode = 1, error: string|null = null
     try {
