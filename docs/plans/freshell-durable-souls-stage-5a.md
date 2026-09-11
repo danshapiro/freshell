@@ -128,6 +128,9 @@ while implementing, rather than treating the plan as infallible:
   consolidation. Both upload ignore policies excluded it and the cloud Rust
   build stage did not copy it. A narrow exception and explicit COPY fix this;
   regression tests still exclude private runtime material and unrelated docs.
+  The existing provider-version inventory was also missing from that build
+  stage; both embedded JSON inputs are now copied. An offline cargo check of
+  an isolated snapshot containing only the cloud Rust stage inputs passes.
 - Some old runtime scenarios start focused unit subtests. Their inherited
   coordinator-active marker prevented the nested invocation, even though the
   outer scenario already held the lease. A shared, single-file-only helper now
@@ -155,17 +158,48 @@ resource, approval, isolation, and cleanup assertions were moved rather than
 removed. Current provider/fresh-mode defaults are unchanged; the full product
 still requires all original agents and all applicable recovery/operation paths.
 
-Validation so far: 129 Rust tests pass (runtime protocol 19, provider/runtime 38,
-supervisor 72); lint has zero errors and 11 existing warnings; contract generation
-has no drift; TypeScript runtime/browser checks and the managed Rust server build
-pass. Direct result-check tests pass, as do the build-context and runner tests.
-The exact-owned Docker P5-G06 export/cleanup scenario passes with successful
-cleanup and no unsafe attempts. The first full check passed client, server, and
-port suites, then failed only on the subsequently fixed Electron mocks.
+## Final validation results
 
-Final combined regression and P5-G07/P5-G08 reruns are recorded below when they
-complete. The configured cloud browser backend reports BLOCKED because it
-cannot host this Docker runtime. No browser fallback, actual-provider PASS,
-30-minute stress PASS, full-product readiness, PR, or deployment is claimed by
-these Stage 5a changes. Live provider/fresh-mode coverage remains necessary for
-the full original product before changing its conservative defaults.
+Implementation is committed on `feat/durable-souls-release-candidate`.
+The main implementation commit is `00508bbc916dbc9302b85753abc690d7edd98275`;
+the cloud-input follow-up changes build inputs and their regression tests only.
+Logs below are relative to `.runtime-evidence/stage-5a/` in this worktree.
+
+| Check | Actual result | Log |
+|---|---|---|
+| Combined `npm run check` | PASS: 12,204 passed; 30 opt-in tests skipped. Client 6,072; server 5,645; port 45; Electron 442. | `full-check-final.log` |
+| Protocol, agent-runtime, supervisor Rust tests | PASS: 129 tests (19 + 38 + 72). | `rust-final.log` |
+| Managed server check, including all features | PASS. | `rust-check.log`, `rust-all-features.log` |
+| Client production build | PASS; existing large-chunk warning remains. | `client-build.log` |
+| Runtime and affected browser TypeScript checks | PASS. | `runtime-typecheck.log` |
+| ESLint | PASS: zero errors; 11 existing warnings. | `lint.log` |
+| Contract generation | PASS; no generated-contract drift. | `contracts.log` |
+| Direct provider/fresh-agent result and policy checks | PASS: 66 tests at the first combined focused run; later runner additions are also covered by the full check. | `direct-results-green.log` |
+| Loss/chaos/soak observation checks | PASS: 35 tests. | `stress-results-green.log` |
+| Build-context regression checks after final input fix | PASS: 36 tests. | `inventory-context-green.log` |
+| Isolated cloud-stage Rust input snapshot, offline cargo check | PASS; this checks source-input completeness, not a full cloud image deployment. | `cloud-inputs-check.log` |
+| Actual Docker P5-G06: export and cleanup failures | PASS; cleanup successful; zero unsafe attempts. | `docker-p5-g06.log` |
+| Actual Docker P5-G07: crashes at loss/cleanup/notice boundaries | PASS; cleanup successful; zero unsafe attempts. | `docker-p5-g07-final.log` |
+| Actual Docker P5-G08: private durable observations without invented postmortem | PASS; cleanup successful; zero unsafe attempts. | `docker-p5-g08-final.log` |
+| Configured cloud browser attempt (`--only rehydrate`) | BLOCKED, exit 2: this Cloud Run backend cannot host the Docker runtime. No local fallback or skipped coverage counted as a pass. | `browser-backend.log` |
+
+The initial failures and their fixes remain in the adjacent `*-red.log` and
+first-run logs. The combined regression first exposed the inherited Electron
+constructor mocks; the Docker crash matrix exposed the nested focused-runner
+marker issue. Both were fixed and rerun successfully, rather than omitted.
+
+## Remaining full-product work, not deleted scope
+
+Stage 5a is implemented. It does not claim a new full all-provider live campaign,
+a new 30-minute stress run, or execution of all 50 Docker scenarios in this task.
+The relevant actual Docker loss scenarios and the ordinary regression suite
+passed. Actual-provider/fresh-mode browser verification still needs an approved
+Docker-capable runner; conservative defaults were not silently promoted.
+Gemini/Kimi/plugin implementation gaps remain gaps in the original product,
+not exclusions introduced by simplification. Complete the original provider
+and operation coverage before calling the full feature deployed.
+
+No PR or deployment was performed. The live self-hosted server was not restarted.
+Other worktrees were not modified. Public lifecycle states, resource management,
+view intent, credentials/authentication, durable notices, and provider operations
+were deliberately left intact. There was no sweeping schema or Redux rewrite.
