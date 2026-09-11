@@ -161,11 +161,13 @@ async function gate03ProviderAndHostCrashFamilies(h: RuntimeHarness): Promise<vo
 
   h.execOwnedContainerExact(native.containerId, ['kill', '-9', String(native.workerPid)])
   await waitUntil(() => !nativeFixtureWorkerAlive(h, native.containerId, native.workerPid), 8_000)
-  const providerRecovery = dataOf(
-    await h.adminOk(supervisor, h.recoverBody(native.soulId, 'provider_exit')),
-    'recovery',
+  const providerRecovery = await recoverExactOnce(
+    h,
+    supervisor,
+    caseId,
+    native,
+    'provider_exit',
   )
-  assertExactReplacement(h, caseId, native, providerRecovery)
 
   const afterProvider: NativeSoul = {
     ...native,
@@ -179,11 +181,14 @@ async function gate03ProviderAndHostCrashFamilies(h: RuntimeHarness): Promise<vo
   h.assert(caseId, providerView?.profile === native.view.profile, 'provider-process recovery keeps the resource profile', { before: native.view, after: providerView })
 
   h.killOwnedRuntimeExact(providerRecovery.view.containerId)
-  const hostRecovery = dataOf(
-    await h.adminOk(supervisor, h.recoverBody(native.soulId, 'host_unreachable')),
-    'recovery',
+  const hostRecovery = await recoverExactOnce(
+    h,
+    supervisor,
+    caseId,
+    afterProvider,
+    'host_unreachable',
+    native.sessionId,
   )
-  assertExactReplacement(h, caseId, afterProvider, hostRecovery, native.sessionId)
   const recalled = await h.nativeFixtureCall(supervisor, hostRecovery.view.incarnationId, {
     method: 'recall',
     key: 'crash_marker',
@@ -637,6 +642,57 @@ async function captureResumeSpec(
   h.assert(caseId, view?.nativeSessionId === native.sessionId, 'registry persists the provider-observed native identity before recovery', view)
   h.assert(caseId, ['resume_captured', 'checkpoint_captured'].includes(view?.durabilityState), 'registry records verified durable recovery evidence', view)
   h.assert(caseId, view?.allocationState === 'verified_durable', 'materialization is separate from allocation and reaches VERIFIED_DURABLE', view)
+}
+
+async function recoverExactOnce(
+  h: RuntimeHarness,
+  supervisor: SupervisorInstance,
+  caseId: string,
+  before: NativeSoul,
+  trigger: 'provider_exit' | 'host_unreachable',
+  expectedSessionId = before.sessionId,
+): Promise<any> {
+  const recovery = dataOf(
+    await h.adminOk(supervisor, h.recoverBody(before.soulId, trigger)),
+    'recovery',
+  )
+  h.assert(
+    caseId,
+    recovery.outcome === 'replaced' || recovery.outcome === 'reattached',
+    `${trigger} converges to an exact live replacement`,
+    recovery,
+  )
+  assertExactReplacementView(
+    h,
+    caseId,
+    before,
+    recovery.view,
+    expectedSessionId,
+    before.incarnationId,
+  )
+  if (recovery.outcome === 'replaced') {
+    h.assert(
+      caseId,
+      recovery.priorIncarnationId === before.incarnationId,
+      'caller-driven recovery records its immediate old/new incarnation lineage',
+      recovery,
+    )
+    h.assert(
+      caseId,
+      recovery.expectedNativeSessionId === expectedSessionId
+        && recovery.observedNativeSessionId === expectedSessionId,
+      'caller-driven recovery verifies the exact provider-native identity',
+      recovery,
+    )
+  } else {
+    h.assert(
+      caseId,
+      recovery.view.priorIncarnationId === before.incarnationId,
+      'observer recovery ran exactly once before the delayed caller reattached',
+      recovery,
+    )
+  }
+  return recovery
 }
 
 function assertExactReplacement(
