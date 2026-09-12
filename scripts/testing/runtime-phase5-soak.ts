@@ -1,3 +1,4 @@
+import { sampleRuntimeRetention } from './runtime-retention-sample.js'
 import { execFileSync } from 'node:child_process'
 import fs from 'node:fs'
 import path from 'node:path'
@@ -95,42 +96,8 @@ function currentSoul(rows: any[], soulId: string): any | undefined {
     .at(-1)
 }
 
-function regularFileBytes(filePath: string): number {
-  if (!fs.existsSync(filePath)) return 0
-  const stat = fs.lstatSync(filePath)
-  return stat.isFile() && !stat.isSymbolicLink() ? stat.size : 0
-}
-
-function retainedBytes(
-  instance: SupervisorInstance,
-  terminalIncarnationId: string,
-): RuntimeSoakSample['retainedBytes'] & { terminalOutput: RuntimeSoakSample['terminalOutput'] } {
-  let terminalSpools = 0
-  let runtimeLogs = 0
-  const stack = [path.dirname(instance.runtimeRoot)]
-  while (stack.length) {
-    const current = stack.pop()!
-    if (!fs.existsSync(current)) continue
-    const stat = fs.lstatSync(current)
-    if (stat.isSymbolicLink()) continue
-    if (stat.isDirectory()) {
-      for (const name of fs.readdirSync(current)) stack.push(path.join(current, name))
-      continue
-    }
-    const base = path.basename(current)
-    if (/^terminal-spool-(?:current|previous)\.jsonl$/.test(base)) {
-      terminalSpools += stat.size
-    } else if (base.endsWith('.log') || base.endsWith('.jsonl')) {
-      runtimeLogs += stat.size
-    }
-  }
-  const runtimeDir = h.runtimeDir(instance, terminalIncarnationId)
-  const currentBytes = regularFileBytes(path.join(runtimeDir, 'terminal-spool-current.jsonl'))
-  const previousBytes = regularFileBytes(path.join(runtimeDir, 'terminal-spool-previous.jsonl'))
-  if (currentBytes + previousBytes !== terminalSpools) {
-    throw new Error('terminal spool inventory contains bytes outside the single owned shell workload')
-  }
-  return { terminalSpools, runtimeLogs, terminalOutput: { currentBytes, previousBytes } }
+function retainedBytes(instance: SupervisorInstance, terminalIncarnationId: string) {
+  return sampleRuntimeRetention(path.dirname(instance.runtimeRoot), h.runtimeDir(instance, terminalIncarnationId))
 }
 
 async function mapConcurrent<T, R>(values: T[], concurrency: number, map: (value: T) => Promise<R>): Promise<R[]> {
