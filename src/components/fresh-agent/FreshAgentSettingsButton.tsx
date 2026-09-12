@@ -5,6 +5,7 @@ import type { FreshAgentPaneContent } from '@/store/paneTypes'
 import { useAppDispatch, useAppSelector } from '@/store/hooks'
 import { mergePaneContent } from '@/store/panesSlice'
 import { saveServerSettingsPatch } from '@/store/settingsThunks'
+import { sendFreshAgentConfigure } from '@/lib/fresh-agent-configure'
 import {
   FRESH_AGENT_MODEL_OPTIONS_BY_SESSION_TYPE,
   getEffectiveFreshAgentEffort,
@@ -368,20 +369,20 @@ export function FreshAgentSettingsButton({
                                 nextModel,
                                 paneContent.effort,
                               )
-                            dispatch(mergePaneContent({
-                              tabId,
-                              paneId,
-                              updates: {
-                                model: nextModel,
-                                // Stamp the picked row's display label for the
-                                // status-strip chip (id-paired; a later model
-                                // change without a stamp can never mislabel).
-                                // A label echoing the raw id is not a display
-                                // name (e.g. opencode's no-name fallback): skip.
-                                ...(nextRow && nextRow.label !== nextModel
-                                  ? { modelLabel: { modelId: nextModel, label: nextRow.label } }
-                                  : {}),
-                                effort: nextEffort,
+                          dispatch(mergePaneContent({
+                            tabId,
+                            paneId,
+                            updates: {
+                              model: nextModel,
+                              // Stamp the picked row's display label for the
+                              // status-strip chip (id-paired; a later model
+                              // change without a stamp can never mislabel).
+                              // A label echoing the raw id is not a display
+                              // name (e.g. opencode's no-name fallback): skip.
+                              ...(nextRow && nextRow.label !== nextModel
+                                ? { modelLabel: { modelId: nextModel, label: nextRow.label } }
+                                : {}),
+                              effort: nextEffort,
                               // Stamp the switched-to row's known levels
                               // (static or probed) so effort normalization
                               // clamps against THEM — never re-derived from
@@ -393,6 +394,14 @@ export function FreshAgentSettingsButton({
                                 : undefined,
                             },
                           }))
+                          // Apply to the LIVE session (fire-and-forget): the
+                          // server's freshAgent.session.metadata broadcast
+                          // converges every device's model surfaces now, not
+                          // at the next message.
+                          sendFreshAgentConfigure(paneId, paneContent, {
+                            model: nextModel,
+                            ...(nextEffort ? { effort: nextEffort } : {}),
+                          })
                           persistProviderDefaults({
                             modelSelection: { kind: 'exact', modelId: nextModel },
                             ...(nextEffort ? { effort: nextEffort } : {}),
@@ -424,6 +433,10 @@ export function FreshAgentSettingsButton({
                       paneId,
                       updates: { effort: nextEffort },
                     }))
+                    // Apply to the LIVE session (fire-and-forget): the
+                    // metadata broadcast converges the chip's effort tooltip
+                    // on every device now.
+                    sendFreshAgentConfigure(paneId, paneContent, { effort: nextEffort })
                     persistProviderDefaults({ effort: nextEffort })
                   }}
                 >
@@ -475,6 +488,12 @@ export function FreshAgentSettingsButton({
                       paneId,
                       updates: { permissionMode: nextPermissionMode },
                     }))
+                    // Apply to the LIVE session (fire-and-forget): claude
+                    // takes it for real through the configure lane; codex
+                    // records it for the next turn.
+                    sendFreshAgentConfigure(paneId, paneContent, {
+                      permissionMode: nextPermissionMode,
+                    })
                     persistProviderDefaults({ defaultPermissionMode: nextPermissionMode })
                   }}
                 >

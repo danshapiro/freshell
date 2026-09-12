@@ -66,4 +66,85 @@ describe('fresh-agent websocket public contract', () => {
     expect(session.lastErrorCode).toBe('KILL_FAILED')
     expect(session.lastError).toContain('still be running')
   })
+  // ── freshAgent.session.metadata: the live-settings convergence fold ─────────
+
+  function seedLiveSession(store: ReturnType<typeof configureStore<{ freshAgent: typeof freshAgentReducer }>>) {
+    handleFreshAgentMessage(store.dispatch, {
+      type: 'freshAgent.event',
+      sessionId: 'thread-1',
+      sessionType: 'freshcodex',
+      provider: 'codex',
+      event: {
+        type: 'freshAgent.session.init',
+        sessionId: 'thread-1',
+        cliSessionId: 'thread-1',
+        model: 'gpt-5.6-luna',
+        effort: 'high',
+        cwd: '/repo',
+      },
+    })
+  }
+
+  it('folds a session.metadata frame into the live model + effort', () => {
+    const store = configureStore({
+      reducer: { freshAgent: freshAgentReducer },
+    })
+    seedLiveSession(store)
+
+    expect(handleFreshAgentMessage(store.dispatch, {
+      type: 'freshAgent.event',
+      sessionId: 'thread-1',
+      sessionType: 'freshcodex',
+      provider: 'codex',
+      event: {
+        type: 'freshAgent.session.metadata',
+        sessionId: 'thread-1',
+        model: 'gpt-5.6-sol',
+        effort: 'low',
+      },
+    })).toBe(true)
+    const session = store.getState().freshAgent.sessions['freshcodex:codex:thread-1']
+    expect(session.model).toBe('gpt-5.6-sol')
+    expect(session.effort).toBe('low')
+  })
+
+  it('folds an explicit-null metadata as a CLEAR, and absent keys as no-statement', () => {
+    const store = configureStore({
+      reducer: { freshAgent: freshAgentReducer },
+    })
+    seedLiveSession(store)
+
+    // Null states "explicitly no value" (e.g. opencode's Default thinking row):
+    // the clear must REPLACE, not fall through to the stale prior.
+    expect(handleFreshAgentMessage(store.dispatch, {
+      type: 'freshAgent.event',
+      sessionId: 'thread-1',
+      sessionType: 'freshcodex',
+      provider: 'codex',
+      event: {
+        type: 'freshAgent.session.metadata',
+        sessionId: 'thread-1',
+        model: 'gpt-5.6-sol',
+        effort: null,
+      },
+    })).toBe(true)
+    let session = store.getState().freshAgent.sessions['freshcodex:codex:thread-1']
+    expect(session.model).toBe('gpt-5.6-sol')
+    expect(session.effort).toBeNull()
+
+    // Absent keys are "no statement": nothing changes.
+    expect(handleFreshAgentMessage(store.dispatch, {
+      type: 'freshAgent.event',
+      sessionId: 'thread-1',
+      sessionType: 'freshcodex',
+      provider: 'codex',
+      event: {
+        type: 'freshAgent.session.metadata',
+        sessionId: 'thread-1',
+      },
+    })).toBe(true)
+    session = store.getState().freshAgent.sessions['freshcodex:codex:thread-1']
+    expect(session.model).toBe('gpt-5.6-sol')
+    expect(session.effort).toBeNull()
+  })
 })

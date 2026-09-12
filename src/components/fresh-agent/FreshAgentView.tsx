@@ -14,6 +14,7 @@ import type { PaneReconcileRequest } from '@shared/ws-protocol'
 import { useAppDispatch, useAppSelector, useAppStore } from '@/store/hooks'
 import { usePaneFocusAdoption } from '@/hooks/usePaneFocusAdoption'
 import { getWsClient, RECONCILE_VERDICT_WAIT_MS } from '@/lib/ws-client'
+import { sendSuppressedAwareFreshAgentFrame } from '@/lib/fresh-agent-configure'
 import { KILL_ACK_TIMEOUT_MESSAGE, KILL_FAILED_MESSAGE, sendFreshAgentKillAndAwait } from '@/lib/kill-ack'
 import { createLogger } from '@/lib/client-logger'
 import { api, getFreshAgentModelCapabilities, getFreshAgentThreadSnapshot, setSessionMetadata } from '@/lib/api'
@@ -790,13 +791,18 @@ export function FreshAgentView({
   // ≤520px collapse favors the short form: drop a trailing "(1M context)"-style
   // parenthetical (raw ids carry none and pass through unchanged).
   const stripModelLabelShort = stripModelLabel?.replace(/\s*\([^)]*\)\s*$/, '') || stripModelLabel
-  // Tooltip carries the live session's effort when the runtime reports one
-  // (opencode snapshot.settings.effort), else the effort the pane was
-  // created/resumed with — the tooltip words the SESSION's effort; the model
-  // id it labels is the live one.
+  // Tooltip carries the live session's effort when the runtime reports one:
+  // the session-metadata event's fold first (fresher than any REST snapshot by
+  // construction — it lands the instant a configure/turn changes the live
+  // pair, with null meaning an explicit clear), else the REST snapshot's
+  // settings.effort, else the effort the pane was created/resumed with — the
+  // tooltip words the SESSION's effort; the model id it labels is the live one.
+  const stripEffort = agentSession?.effort !== undefined
+    ? agentSession.effort
+    : snapshot?.settings?.effort ?? getEffectiveFreshAgentEffort(paneContent, providerDefaults)
   const stripModelTooltip = !stripModelId
     ? 'model not set'
-    : `${stripModelId} · effort ${snapshot?.settings?.effort ?? getEffectiveFreshAgentEffort(paneContent, providerDefaults) ?? 'Default'}`
+    : `${stripModelId} · effort ${stripEffort ?? 'Default'}`
   const contextSessionId = freshAgentContextSessionId(paneContent, agentSession)
   const [usageTick, forceUsageTick] = useReducer((tick: number) => tick + 1, 0)
   const usageRefreshDispatchedRef = useRef(false)
@@ -1002,17 +1008,11 @@ export function FreshAgentView({
   currentAutoTitleIdentityRef.current = autoTitleIdentity
 
   const sendFreshAgentMessage = useCallback((message: Record<string, unknown>) => {
-    const suppressed = typeof window !== 'undefined'
-      && (
-        window.__FRESHELL_TEST_HARNESS__?.isAllFreshAgentNetworkEffectsSuppressed?.() === true
-        || window.__FRESHELL_TEST_HARNESS__?.isFreshAgentNetworkEffectsSuppressed?.(paneId) === true
-      )
-    if (suppressed) {
-      window.__FRESHELL_TEST_HARNESS__?.recordSentWsMessage?.(message)
-      return
-    }
-    ws.send(message as never)
-  }, [paneId, ws])
+    // The shared suppression-aware send seam (fresh-agent-configure.ts): a
+    // suppressed frame goes to the e2e harness's sent-message spy, never the
+    // wire — identical to every other freshAgent.* frame this view sends.
+    sendSuppressedAwareFreshAgentFrame(paneId, message)
+  }, [paneId])
 
   const releasePendingRebind = useCallback(() => {
     const release = pendingRebindReleaseRef.current

@@ -232,7 +232,8 @@ const freshAgentSlice = createSlice({
 
     sessionInit(state, action: PayloadAction<SessionMutationPayload & {
       cliSessionId?: string
-      model?: string
+      model?: string | null
+      effort?: string | null
       cwd?: string
       tools?: Array<{ name: string }>
     }>) {
@@ -240,6 +241,7 @@ const freshAgentSlice = createSlice({
       if (!session) return
       session.cliSessionId = action.payload.cliSessionId
       session.model = action.payload.model
+      session.effort = action.payload.effort
       session.cwd = action.payload.cwd
       session.tools = action.payload.tools
       session.awaitingDurableHistory = action.payload.cliSessionId ? false : session.awaitingDurableHistory
@@ -250,7 +252,8 @@ const freshAgentSlice = createSlice({
 
     sessionMetadataReceived(state, action: PayloadAction<SessionMutationPayload & {
       cliSessionId?: string
-      model?: string
+      model?: string | null
+      effort?: string | null
       cwd?: string
       tools?: Array<{ name: string }>
     }>) {
@@ -267,7 +270,13 @@ const freshAgentSlice = createSlice({
         session.cliSessionId = metadataCliSessionId
         session.historySessionId = metadataCliSessionId
       }
-      session.model = action.payload.model ?? session.model
+      // Live-settings convergence (`freshAgent.session.metadata`): a stated
+      // model/effort (string OR explicit null — a clear) REPLACES the session
+      // record; an ABSENT key is "no statement" and keeps whatever is there.
+      // The server always states both keys on a metadata frame, so the chip
+      // and the effort tooltip track the live session exactly.
+      if (action.payload.model !== undefined) session.model = action.payload.model
+      if (action.payload.effort !== undefined) session.effort = action.payload.effort
       session.cwd = action.payload.cwd ?? session.cwd
       session.tools = action.payload.tools ?? session.tools
       if (metadataCliSessionId && !wouldDowngradeSnapshotIdentity) {

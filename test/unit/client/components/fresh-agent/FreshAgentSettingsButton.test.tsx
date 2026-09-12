@@ -16,6 +16,11 @@ const saveServerSettingsPatchSpy = vi.hoisted(() => vi.fn((patch: unknown) => ({
 const getFreshAgentModelCapabilitiesSpy = vi.hoisted(() => vi.fn())
 
 const getFreshAgentThreadSnapshotSpy = vi.hoisted(() => vi.fn())
+const wsSendSpy = vi.hoisted(() => vi.fn())
+
+vi.mock('@/lib/ws-client', () => ({
+  getWsClient: () => ({ send: wsSendSpy }),
+}))
 
 vi.mock('@/store/settingsThunks', () => ({
   saveServerSettingsPatch: (patch: unknown) => saveServerSettingsPatchSpy(patch),
@@ -195,6 +200,7 @@ function renderButton(store: ReturnType<typeof createStore>) {
 
 beforeEach(() => {
   saveServerSettingsPatchSpy.mockClear()
+  wsSendSpy.mockClear()
   getFreshAgentModelCapabilitiesSpy.mockReset()
   getFreshAgentModelCapabilitiesSpy.mockResolvedValue(CATALOG_RESPONSE)
   getFreshAgentThreadSnapshotSpy.mockReset()
@@ -499,8 +505,17 @@ describe('FreshAgentSettingsButton', () => {
     // the picked row's display label goes to the status-strip chip via the
     // id-paired stamp (catalog-only ids would otherwise flash their raw id)
     expect(content.modelLabel).toEqual({ modelId: 'sonnet', label: 'Sonnet' })
-  })
 
+    // The radio commit ALSO applies the pick to the LIVE session: the
+    // freshAgent.configure frame converges every device's model surfaces
+    // immediately (claude applies it for real through its configure lane).
+    expect(wsSendSpy).toHaveBeenCalledTimes(1)
+    const configure = wsSendSpy.mock.calls[0][0]
+    expect(configure.type).toBe('freshAgent.configure')
+    expect(configure.sessionId).toBe('thread-settings')
+    expect(configure.provider).toBe('claude')
+    expect(configure.settings).toEqual({ model: 'sonnet', effort: 'alpha' })
+  })
   it('stamps no modelLabel when the switched-to probed row\'s label echoes its raw id', async () => {
     getFreshAgentModelCapabilitiesSpy.mockResolvedValue({
       ok: true as const,

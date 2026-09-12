@@ -5,7 +5,7 @@ import { configureStore } from '@reduxjs/toolkit'
 import panesReducer from '@/store/panesSlice'
 import settingsReducer, { previewServerSettingsPatch, updateSettingsLocal } from '@/store/settingsSlice'
 import sessionsReducer, { applySessionsPatch, applyContextUsageExtras } from '@/store/sessionsSlice'
-import freshAgentReducer, { sessionInit, setSessionStatus, markSessionLost } from '@/store/freshAgentSlice'
+import freshAgentReducer, { sessionInit, sessionMetadataReceived, setSessionStatus, markSessionLost } from '@/store/freshAgentSlice'
 import tabsReducer from '@/store/tabsSlice'
 import connectionReducer from '@/store/connectionSlice'
 import { FreshAgentView, IDLE_INCOMPLETE_MAX_RETRIES } from '@/components/fresh-agent/FreshAgentView'
@@ -7872,6 +7872,147 @@ describe('FreshAgentView session status strip', () => {
     // The tooltip carries the LIVE model id and its session effort — the pane
     // was created with 'high', and no live snapshot effort overrides it.
     expect(chip).toHaveAttribute('title', 'claude-live-99 · effort high')
+  })
+
+  it('the chip follows the model a fresh session.metadata frame states, over a stale REST snapshot', async () => {
+    apiMock.getFreshAgentModelCapabilities.mockResolvedValue({
+      ok: true,
+      sessionType: 'freshclaude',
+      runtimeProvider: 'claude',
+      status: 'fresh',
+      fetchedAt: 1_000,
+      models: [{
+        id: 'claude-live-99',
+        displayName: 'Live Ninety Nine',
+        provider: 'claude',
+        supportsEffort: true,
+        supportedEffortLevels: ['low', 'high'],
+        supportsAdaptiveThinking: true,
+      }],
+    })
+    // The REST snapshot still reports the PRE-change model: the chip must not
+    // be trapped on it once the server has stated the live pair via metadata.
+    apiMock.getFreshAgentThreadSnapshot.mockResolvedValue({
+      status: 'idle',
+      summary: 'summary',
+      capabilities: { send: true, interrupt: true, fork: true },
+      turns: [],
+      settings: { model: 'claude-live-99', effort: 'low' },
+    } as never)
+    const store = createStore()
+    store.dispatch(sessionInit({
+      sessionId: CLAUDE_THREAD_ID,
+      sessionType: 'freshclaude',
+      provider: 'claude',
+      model: 'claude-live-99',
+    }))
+    render(
+      <Provider store={store}>
+        <FreshAgentView
+          tabId="tab-1"
+          paneId="pane-1"
+          paneContent={{
+            kind: 'fresh-agent',
+            sessionType: 'freshclaude',
+            provider: 'claude',
+            createRequestId: 'req-strip-metadata-model',
+            sessionId: CLAUDE_THREAD_ID,
+            status: 'connected',
+            model: 'opus[1m]',
+            effort: 'high',
+          }}
+        />
+      </Provider>,
+    )
+
+    // The chip starts on the live (init) model.
+    await waitFor(() => {
+      expect(screen.getByRole('button', { name: 'Model: Live Ninety Nine — change model' })).toBeInTheDocument()
+    })
+
+    // The live pair changed server-side (a configure or a settings-carrying
+    // send applied it) and the metadata broadcast states the new truth: the
+    // chip flips IMMEDIATELY — the stale snapshot term never masks it.
+    store.dispatch(sessionMetadataReceived({
+      sessionId: CLAUDE_THREAD_ID,
+      sessionType: 'freshclaude',
+      provider: 'claude',
+      model: 'opus[1m]',
+      effort: 'high',
+    }))
+    await waitFor(() => {
+      expect(screen.getByRole('button', { name: 'Model: Claude Opus 5 (1M context) — change model' })).toBeInTheDocument()
+    })
+    expect(screen.queryByRole('button', { name: 'Model: Live Ninety Nine — change model' })).toBeNull()
+    // The tooltip effort follows the metadata fold (not the snapshot's stale
+    // 'low').
+    expect(screen.getByRole('button', { name: 'Model: Claude Opus 5 (1M context) — change model' }))
+      .toHaveAttribute('title', 'opus[1m] · effort high')
+  })
+
+  it('an explicit-null metadata effort clears the chip tooltip back to Default', async () => {
+    apiMock.getFreshAgentModelCapabilities.mockResolvedValue({
+      ok: true,
+      sessionType: 'freshopencode',
+      runtimeProvider: 'opencode',
+      status: 'fresh',
+      fetchedAt: 1_000,
+      models: [{
+        id: 'opencode-go/glm-5.2',
+        displayName: 'GLM 5.2',
+        provider: 'opencode',
+        source: { id: 'opencode-go', displayName: 'OpenCode Go' },
+        supportsEffort: true,
+        supportedEffortLevels: ['low', 'high'],
+        supportsAdaptiveThinking: true,
+      }],
+    })
+    const store = createStore()
+    store.dispatch(sessionInit({
+      sessionId: 'ses_metadata_null',
+      sessionType: 'freshopencode',
+      provider: 'opencode',
+      model: 'opencode-go/glm-5.2',
+      effort: 'high',
+    }))
+    render(
+      <Provider store={store}>
+        <FreshAgentView
+          tabId="tab-1"
+          paneId="pane-1"
+          paneContent={{
+            kind: 'fresh-agent',
+            sessionType: 'freshopencode',
+            provider: 'opencode',
+            createRequestId: 'req-strip-metadata-null',
+            sessionId: 'ses_metadata_null',
+            status: 'connected',
+            model: 'opencode-go/glm-5.2',
+            effort: 'high',
+          }}
+        />
+      </Provider>,
+    )
+
+    await waitFor(() => {
+      expect(screen.getByRole('button', { name: 'Model: GLM 5.2 — change model' })).toBeInTheDocument()
+    })
+    expect(screen.getByRole('button', { name: 'Model: GLM 5.2 — change model' }))
+      .toHaveAttribute('title', 'opencode-go/glm-5.2 · effort high')
+
+    // The Default-row commit clears the variant: metadata states effort null
+    // and the tooltip words the SESSION's cleared effort, not a stale 'high'.
+    store.dispatch(sessionMetadataReceived({
+      sessionId: 'ses_metadata_null',
+      sessionType: 'freshopencode',
+      provider: 'opencode',
+      model: 'opencode-go/glm-5.2',
+      effort: null,
+    }))
+    await waitFor(() => {
+      expect(screen.getByRole('button', { name: 'Model: GLM 5.2 — change model' }))
+        .toHaveAttribute('title', 'opencode-go/glm-5.2 · effort Default')
+    })
   })
 
   it('uses the REST snapshot\'s settings.model when no session-init model exists (restored/MCP panes)', async () => {

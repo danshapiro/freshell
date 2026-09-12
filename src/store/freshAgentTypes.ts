@@ -60,7 +60,13 @@ export type FreshAgentSessionState = FreshAgentSessionLocator & {
   historyRevision?: number
   cliSessionId?: string
   cwd?: string
-  model?: string
+  model?: string | null
+  /** The LIVE session's thinking level, folded from
+   * `freshAgent.session.metadata` (string), JSON null (an explicit clear —
+   * e.g. opencode's Default row), or absent while no metadata ever stated
+   * it. The status-strip tooltip prefers it over the REST snapshot's
+   * settings.effort: the event is fresher by construction. */
+  effort?: string | null
   tools?: Array<{ name: string }>
   turns: FreshAgentTurn[]
   historyItems: FreshAgentTurn[]

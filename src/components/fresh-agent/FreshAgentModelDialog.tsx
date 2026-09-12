@@ -5,6 +5,7 @@ import type { FreshAgentPaneContent } from '@/store/paneTypes'
 import { useAppDispatch, useAppSelector } from '@/store/hooks'
 import { mergePaneContent } from '@/store/panesSlice'
 import { saveServerSettingsPatch } from '@/store/settingsThunks'
+import { sendFreshAgentConfigure } from '@/lib/fresh-agent-configure'
 import { getFreshAgentModelCapabilities } from '@/lib/api'
 import {
   capFreshAgentModelSourceRows,
@@ -369,6 +370,17 @@ export function FreshAgentModelDialog({
           : {}),
       },
     }))
+    // Apply the change to the LIVE session too (fire-and-forget): the server
+    // answers with the freshAgent.session.metadata broadcast that converges
+    // the lower-left chip — and every other device's surfaces — immediately,
+    // instead of the next message's send-time settings carrying it. Pre-create
+    // panes (no sessionId) stage only, exactly as before. An ABSENT effort key
+    // is the explicit Default row (opencode clears the variant; the per-send
+    // providers keep the session's current effort).
+    sendFreshAgentConfigure(paneId, paneContent, {
+      model: model.id,
+      ...(level ? { effort: level } : {}),
+    })
     void dispatch(saveServerSettingsPatch({
       freshAgent: {
         providers: {
@@ -384,7 +396,7 @@ export function FreshAgentModelDialog({
       if (level) recordFreshAgentModelLevelUse(mruProvider, { modelId: model.id, level, cwdKey })
     }
     onClose()
-  }, [capabilities, highlightedModel, highlightedLevelRow, mruProvider, dispatch, tabId, paneId, sessionType, cwdKey, paneContent.provider, onClose])
+  }, [capabilities, highlightedModel, highlightedLevelRow, mruProvider, dispatch, tabId, paneId, sessionType, cwdKey, paneContent, onClose])
 
   const canCommit = Boolean(capabilities && highlightedModel && highlightedLevelRow)
 

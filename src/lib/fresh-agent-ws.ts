@@ -257,7 +257,8 @@ export function handleFreshAgentTransportEvent(dispatch: AppDispatch, msg: Fresh
       dispatch(sessionInit({
         ...locator,
         cliSessionId: event.cliSessionId as string | undefined,
-        model: event.model as string | undefined,
+        model: event.model as string | null | undefined,
+        effort: event.effort as string | null | undefined,
         cwd: event.cwd as string | undefined,
         tools: event.tools as Array<{ name: string }> | undefined,
       }))
@@ -266,7 +267,8 @@ export function handleFreshAgentTransportEvent(dispatch: AppDispatch, msg: Fresh
       dispatch(sessionMetadataReceived({
         ...locator,
         cliSessionId: event.cliSessionId as string | undefined,
-        model: event.model as string | undefined,
+        model: event.model as string | null | undefined,
+        effort: event.effort as string | null | undefined,
         cwd: event.cwd as string | undefined,
         tools: event.tools as Array<{ name: string }> | undefined,
       }))

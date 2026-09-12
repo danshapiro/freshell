@@ -16,6 +16,11 @@ const saveServerSettingsPatchSpy = vi.hoisted(() => vi.fn((patch: unknown) => ({
 })))
 
 const getFreshAgentModelCapabilitiesSpy = vi.hoisted(() => vi.fn())
+const wsSendSpy = vi.hoisted(() => vi.fn())
+
+vi.mock('@/lib/ws-client', () => ({
+  getWsClient: () => ({ send: wsSendSpy }),
+}))
 
 vi.mock('@/store/settingsThunks', () => ({
   saveServerSettingsPatch: (patch: unknown) => saveServerSettingsPatchSpy(patch),
@@ -227,6 +232,7 @@ function seedLevelMru(entries: Array<{ modelId: string; level: string; cwdKey: s
 
 beforeEach(() => {
   saveServerSettingsPatchSpy.mockClear()
+  wsSendSpy.mockClear()
   getFreshAgentModelCapabilitiesSpy.mockReset()
   getFreshAgentModelCapabilitiesSpy.mockResolvedValue(catalogResponse)
   window.localStorage.removeItem('freshopencode.modelMru.v2')
@@ -437,6 +443,18 @@ describe('FreshAgentModelDialog (freshopencode)', () => {
     expect(modelMru[0]).toMatchObject({ id: 'kimi-for-coding/kimi-k3' })
     const levelMru = JSON.parse(window.localStorage.getItem('freshopencode.modelLevelMru.v1') ?? '[]')
     expect(levelMru).toEqual([expect.objectContaining({ modelId: 'kimi-for-coding/kimi-k3', level: 'max', cwdKey: '/repo/project-a' })])
+
+    // The commit ALSO applies the pick to the LIVE session: the
+    // freshAgent.configure frame carries the picked model + level so the
+    // server's metadata broadcast converges the chip (and every other
+    // device's surfaces) immediately.
+    expect(wsSendSpy).toHaveBeenCalledTimes(1)
+    const configure = wsSendSpy.mock.calls[0][0]
+    expect(configure.type).toBe('freshAgent.configure')
+    expect(configure.sessionId).toBe('thread-dialog')
+    expect(configure.sessionType).toBe('freshopencode')
+    expect(configure.provider).toBe('opencode')
+    expect(configure.settings).toEqual({ model: 'kimi-for-coding/kimi-k3', effort: 'max' })
   })
 
   it('commits the Default row as no effort: clears pane effort and provider default effort, and records no level', async () => {
@@ -466,6 +484,29 @@ describe('FreshAgentModelDialog (freshopencode)', () => {
     expect(window.localStorage.getItem('freshopencode.modelLevelMru.v1')).toBeNull()
     const modelMru = JSON.parse(window.localStorage.getItem('freshopencode.modelMru.v2') ?? '[]')
     expect(modelMru[0]).toMatchObject({ id: 'deepseek/deepseek-chat' })
+
+    // The Default commit's configure carries NO effort key — the explicit
+    // "no variant" statement opencode resolves as a clear.
+    expect(wsSendSpy).toHaveBeenCalledTimes(1)
+    const configure = wsSendSpy.mock.calls[0][0]
+    expect(configure.type).toBe('freshAgent.configure')
+    expect(configure.settings).toEqual({ model: 'deepseek/deepseek-chat' })
+  })
+
+
+  it('sends no freshAgent.configure for a pre-create pane (no live session yet)', async () => {
+    const store = createStore()
+    seedFreshopencodePane(store, { sessionId: undefined, status: 'creating' })
+
+    renderDialog(store, { open: true, onClose: () => {} })
+
+    fireEvent.click(await screen.findByRole('option', { name: /Kimi K3/ }))
+    fireEvent.click(screen.getByRole('button', { name: 'Use Kimi K3 · max' }))
+
+    // Staging + the next send's settings still carry the pick; the live-apply
+    // lane has nothing to apply to and stays silent.
+    expect(paneContent(store).model).toBe('kimi-for-coding/kimi-k3')
+    expect(wsSendSpy).not.toHaveBeenCalled()
   })
 
   it('drives highlight with keyboard: arrows move in-column, ←→ switch columns, Enter commits, Escape cancels', async () => {
