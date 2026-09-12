@@ -344,12 +344,43 @@ describe('storage-migration fresh-agent', () => {
     storage.removeItem(VERSION_KEY)
     storage.seed(LAYOUT_KEY, makeLargeLegacyLayoutRaw())
 
+    // This migration is synchronous and the test storage is in memory. Charge
+    // its own worker's CPU work, not time descheduled behind parallel tests.
+    // Node <22.19 lacks threadCpuUsage; retain the original wall-clock budget
+    // there rather than counting other Vitest workers with process.cpuUsage.
+    const startedCpu = typeof process.threadCpuUsage === 'function' ? process.threadCpuUsage() : undefined
     const startedAt = performance.now()
     module.runStorageMigration()
     const elapsedMs = performance.now() - startedAt
+    const cpu = startedCpu ? process.threadCpuUsage(startedCpu) : undefined
+    const workMs = cpu ? (cpu.user + cpu.system) / 1_000 : elapsedMs
 
-    expect(elapsedMs).toBeLessThan(500)
-    expect(localStorage.getItem(LAYOUT_KEY)).not.toContain('"agent-chat"')
-    expect(localStorage.getItem(LAYOUT_KEY)).toContain('"fresh-agent"')
+    expect(workMs, `migration work: ${workMs} ms; elapsed: ${elapsedMs} ms`).toBeLessThan(500)
+    const migrated = JSON.parse(localStorage.getItem(LAYOUT_KEY)!)
+    expect(migrated.tabs.tabs).toHaveLength(100)
+    const leavesOf = (node: any): any[] => node.type === 'leaf'
+      ? [node]
+      : node.children.flatMap(leavesOf)
+    const leaves = Object.values(migrated.panes.layouts).flatMap(leavesOf)
+    expect(leaves).toHaveLength(1_000)
+    for (let tabIndex = 0; tabIndex < 100; tabIndex++) {
+      const tabLeaves = leavesOf(migrated.panes.layouts[`tab-${tabIndex}`])
+      expect(tabLeaves).toHaveLength(10)
+      for (let leafIndex = 0; leafIndex < 10; leafIndex++) {
+        expect(tabLeaves[leafIndex]).toMatchObject({
+          id: `pane-${tabIndex}-${leafIndex}`,
+          content: {
+            kind: 'fresh-agent',
+            provider: 'claude',
+            sessionType: leafIndex % 2 === 0 ? 'freshclaude' : 'kilroy',
+            createRequestId: `req-${tabIndex}-${leafIndex}`,
+            sessionRef: {
+              provider: 'claude',
+              sessionId: `00000000-0000-4000-8000-${String(tabIndex * 10 + leafIndex).padStart(12, '0')}`,
+            },
+          },
+        })
+      }
+    }
   })
 })

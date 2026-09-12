@@ -1,6 +1,6 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest'
 import { EventEmitter } from 'events'
-import { initMainProcess, acquireInstanceLock, type ElectronApp, type MainProcessDeps } from '../../../electron/main.js'
+import { initMainProcess, type ElectronApp, type MainProcessDeps } from '../../../electron/main.js'
 
 function createMockApp(): ElectronApp & EventEmitter {
   const emitter = new EventEmitter() as ElectronApp & EventEmitter
@@ -40,33 +40,11 @@ describe('initMainProcess', () => {
     expect(deps.createMainWindow).toHaveBeenCalled()
   })
 
-  describe('acquireInstanceLock', () => {
-    it('returns true without quitting when the lock is acquired', () => {
-      const app = createMockApp()
-      expect(acquireInstanceLock(app)).toBe(true)
-      expect(app.quit).not.toHaveBeenCalled()
-    })
-
-    it('quits and returns false when another instance holds the lock', () => {
-      const app = createMockApp()
-      ;(app.requestSingleInstanceLock as ReturnType<typeof vi.fn>).mockReturnValue(false)
-      expect(acquireInstanceLock(app)).toBe(false)
-      expect(app.quit).toHaveBeenCalled()
-    })
-
-    it('invokes onDenied BEFORE quitting (so entry.ts can lift the wizard-phase will-quit veto)', () => {
-      const app = createMockApp()
-      ;(app.requestSingleInstanceLock as ReturnType<typeof vi.fn>).mockReturnValue(false)
-      const onDenied = vi.fn()
-      expect(acquireInstanceLock(app, onDenied)).toBe(false)
-      expect(onDenied.mock.invocationCallOrder[0])
-        .toBeLessThan((app.quit as ReturnType<typeof vi.fn>).mock.invocationCallOrder[0])
-    })
-  })
-
-  it('does not register a second-instance handler (entry.ts installs the canonical one in main())', async () => {
+  it('quits when single instance lock fails', async () => {
+    ;(app.requestSingleInstanceLock as ReturnType<typeof vi.fn>).mockReturnValue(false)
     await initMainProcess(deps)
-    expect(app.listenerCount('second-instance')).toBe(0)
+    expect(app.quit).toHaveBeenCalled()
+    expect(deps.createMainWindow).not.toHaveBeenCalled()
   })
 
   it('close-to-tray hides window instead of quitting', async () => {
@@ -111,6 +89,115 @@ describe('initMainProcess', () => {
     // Give async a tick
     await new Promise((r) => setTimeout(r, 10))
     expect(deps.stopServer).toHaveBeenCalled()
+  })
+
+  it('prevents the initial quit until a slow stop settles, then resumes once', async () => {
+    let finishStop!: () => void
+    ;(deps.stopServer as ReturnType<typeof vi.fn>).mockImplementation(() => new Promise<void>((resolve) => {
+      finishStop = resolve
+    }))
+    await initMainProcess(deps)
+
+    const beforeQuit = app.listeners('before-quit')[0] as (event: { preventDefault: () => void }) => void
+    const firstQuit = { preventDefault: vi.fn() }
+    beforeQuit(firstQuit)
+
+    expect(firstQuit.preventDefault).toHaveBeenCalledTimes(1)
+    expect(deps.stopServer).toHaveBeenCalledTimes(1)
+    expect(app.quit).not.toHaveBeenCalled()
+
+    // A second quit request while cleanup is pending is still blocked, but it
+    // must not start another stop operation.
+    const duplicateQuit = { preventDefault: vi.fn() }
+    beforeQuit(duplicateQuit)
+    expect(duplicateQuit.preventDefault).toHaveBeenCalledTimes(1)
+    expect(deps.stopServer).toHaveBeenCalledTimes(1)
+    expect(app.quit).not.toHaveBeenCalled()
+
+    finishStop()
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    expect(app.quit).toHaveBeenCalledTimes(1)
+
+    // The resumed quit is allowed through and does not stop the server again.
+    const resumedQuit = { preventDefault: vi.fn() }
+    beforeQuit(resumedQuit)
+    expect(resumedQuit.preventDefault).not.toHaveBeenCalled()
+    expect(deps.stopServer).toHaveBeenCalledTimes(1)
+  })
+
+  it('resumes quitting when server cleanup rejects', async () => {
+    ;(deps.stopServer as ReturnType<typeof vi.fn>).mockRejectedValue(new Error('stop failed'))
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
+    try {
+      await initMainProcess(deps)
+      const beforeQuit = app.listeners('before-quit')[0] as (event: { preventDefault: () => void }) => void
+      const firstQuit = { preventDefault: vi.fn() }
+
+      beforeQuit(firstQuit)
+      await new Promise((resolve) => setTimeout(resolve, 0))
+
+      expect(firstQuit.preventDefault).toHaveBeenCalledTimes(1)
+      expect(deps.stopServer).toHaveBeenCalledTimes(1)
+      expect(app.quit).toHaveBeenCalledTimes(1)
+
+      const resumedQuit = { preventDefault: vi.fn() }
+      beforeQuit(resumedQuit)
+      expect(resumedQuit.preventDefault).not.toHaveBeenCalled()
+    } finally {
+      errorSpy.mockRestore()
+    }
+  })
+
+  it('resumes quitting when server cleanup throws synchronously', async () => {
+    const stopServer = vi.fn(() => {
+      throw new Error('stop failed synchronously')
+    })
+    deps.stopServer = stopServer as unknown as MainProcessDeps['stopServer']
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
+    try {
+      await initMainProcess(deps)
+      const beforeQuit = app.listeners('before-quit')[0] as (event: { preventDefault: () => void }) => void
+      const firstQuit = { preventDefault: vi.fn() }
+
+      beforeQuit(firstQuit)
+
+      expect(firstQuit.preventDefault).toHaveBeenCalledTimes(1)
+      expect(stopServer).toHaveBeenCalledTimes(1)
+      expect(app.quit).toHaveBeenCalledTimes(1)
+
+      const resumedQuit = { preventDefault: vi.fn() }
+      beforeQuit(resumedQuit)
+      expect(resumedQuit.preventDefault).not.toHaveBeenCalled()
+      expect(stopServer).toHaveBeenCalledTimes(1)
+    } finally {
+      errorSpy.mockRestore()
+    }
+  })
+
+  it('does not re-enter quit when synchronous cleanup failure re-emits before-quit', async () => {
+    const stopServer = vi.fn(() => {
+      throw new Error('stop failed synchronously')
+    })
+    deps.stopServer = stopServer as unknown as MainProcessDeps['stopServer']
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
+    try {
+      await initMainProcess(deps)
+      const beforeQuit = app.listeners('before-quit')[0] as (event: { preventDefault: () => void }) => void
+      const firstQuit = { preventDefault: vi.fn() }
+      ;(app.quit as ReturnType<typeof vi.fn>).mockImplementation(() => {
+        // Electron emits before-quit again when the resumed quit is requested.
+        // A synchronous stop failure must not start another cleanup/quit cycle.
+        app.emit('before-quit', { preventDefault: vi.fn() })
+      })
+
+      beforeQuit(firstQuit)
+
+      expect(firstQuit.preventDefault).toHaveBeenCalledTimes(1)
+      expect(stopServer).toHaveBeenCalledTimes(1)
+      expect(app.quit).toHaveBeenCalledTimes(1)
+    } finally {
+      errorSpy.mockRestore()
+    }
   })
 
   it('activate shows window on macOS', async () => {

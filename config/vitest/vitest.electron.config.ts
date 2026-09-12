@@ -20,6 +20,9 @@ export default defineConfig({
   },
   test: {
     environment: 'node',
+    // Keep Electron workers in-process. The canonical sandbox caps PIDs, and
+    // the default fork pool can exhaust that limit before it reports results.
+    pool: 'threads',
     include: [
       'test/unit/electron/**/*.test.ts',
       'test/unit/electron/**/*.test.tsx',

@@ -2,7 +2,7 @@
 
 Destructive and ops-style test suites (process kills, config corruption, restart storms) and
 agent verification runs execute inside a disposable Docker container so accidents physically
-cannot touch the host's live servers, real data (`~/.freshell`, `~/.claude`, `~/.codex`,
+cannot touch the host's live Rust server, real data (`~/.freshell`, `~/.claude`, `~/.codex`,
 `~/.local/share/opencode`), or unrelated processes.
 
 ## The one command
@@ -48,8 +48,8 @@ of each is slower — see below):
 - `freshell-sandbox-cargo-target` — **sandbox-owned**, not the host's `target/`. Sharing the host
   target directory would cause lock contention with concurrent host builds.
 - `freshell-sandbox-node-modules` — **sandbox-owned**, populated via `npm ci` inside the
-  container on first use. The host's `node_modules` has host-built native modules (e.g.
-  `node-pty`) that won't run inside the container's different environment.
+  container on first use. The host's `node_modules` contains host-specific tooling and
+  should not be shared with the container's environment.
 - `freshell-sandbox-playwright-cache` — downloaded browser binaries.
 
 Reset everything (forces a clean re-warm on next run):

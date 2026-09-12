@@ -9,10 +9,8 @@ import { TestHarness } from '../helpers/test-harness.js'
 
 /**
  * SIDEBAR OPENCODE RAIL -- the user-level proof for the two sidebar bugs
- * fixed in `fix/sidebar-opencode-rail-fixes`. Runs against BOTH real
- * servers (default `chromium` project = Node, `rust-chromium` = Rust);
- * Node parity is part of the fix, so this spec is registered in the
- * rust-chromium `testMatch` rather than `RUST_ONLY_SPECS`.
+ * fixed in `fix/sidebar-opencode-rail-fixes`. It runs against an owned Rust
+ * server with an isolated home.
  *
  *   - Bug 2: OpenCode's catch-all "global" project stores `worktree = '/'`.
  *     Treating that placeholder as a real checkout put every global-project
@@ -32,15 +30,10 @@ import { TestHarness } from '../helpers/test-harness.js'
  * This spec NEVER touches a live/self-hosted server: `createE2eServerHandle`
  * boots an isolated instance on an ephemeral port with its own HOME.
  *
- * STATUS (2026-08-07): GREEN on BOTH projects. The `chromium` (Node) leg
- * was RED at authoring on a real product gap: the Node server's
- * `buildLiveTerminalSessionItem` (`server/session-directory/service.ts`)
- * fabricated a session item for every running terminal without ever
- * setting `isSubagent`, so the default-visibility filter could not drop
- * it. Fixed by mirroring the Rust projection (`session_directory.rs`
- * `build_live_terminal_session_item`, commit 238f16bd): the registry's
- * `resumeTargetIsSubagent` now flows through `TerminalMeta` into the
- * fabricated item's `isSubagent`.
+ * The Rust projection (`session_directory.rs`
+ * `build_live_terminal_session_item`) carries `resumeTargetIsSubagent`
+ * through `TerminalMeta` into the fabricated item's `isSubagent` so the
+ * default-visibility filter can exclude subagent rows.
  */
 
 const __filename = fileURLToPath(import.meta.url)
@@ -76,11 +69,9 @@ const CHILD2_TITLE = 'Rail e2e subagent child session two'
 const CHILD_PANE_DIR_LEAF = 'railsubagentpane'
 /**
  * The cwd BOTH child-target terminals are spawned in. It is the leaf a rail
- * row for such a terminal is grouped/badged by, whichever pathway builds it
- * -- the server-fabricated live-terminal session item
- * (`buildLiveTerminalSessionItem` on Node / `build_live_terminal_session_item`
- * on Rust both derive `projectPath` from the terminal's cwd) or the client's
- * own manufactured row. Pinning the cwd makes "no rail row for a
+ * row for such a terminal is grouped/badged by either active Rust/client
+ * pathway. Both derive `projectPath` from the terminal's cwd. Pinning the cwd
+ * makes "no rail row for a
  * subagent-target terminal" expressible as one deterministic, role-scoped
  * absence instead of a guess about titles.
  */
@@ -149,14 +140,13 @@ async function seedOpencodeDb(homeDir: string, workDir: string): Promise<void> {
 test.describe('sidebar opencode rail', () => {
   test.setTimeout(240_000)
 
-  test('global-project sessions show their real directory; subagent-target terminals stay off the rail', async ({ page, e2eServerKind }) => {
+  test('global-project sessions show their real directory; subagent-target terminals stay off the rail', async ({ page }) => {
     const sharedRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'freshell-oc-rail-'))
     try {
       const fakeOpencodePath = await installFakeOpencodeTerminal(path.join(sharedRoot, 'bin'))
       let childPaneDir = ''
       let childTerminalCwd = ''
       const server = await createE2eServerHandle(process.env, {
-        kind: e2eServerKind,
         construct: {
           env: { OPENCODE_CMD: fakeOpencodePath },
           setupHome: async (homeDir: string) => {
@@ -213,10 +203,8 @@ test.describe('sidebar opencode rail', () => {
               requestId: `e2e-rail-subagent-${Date.now()}`,
               mode: 'opencode',
               cwd,
-              // `shell` is REQUIRED on the wire: the Node server's Zod schema
-              // defaults it to 'system', but the Rust server's serde struct
-              // (`freshell-protocol::client_messages::TerminalCreate`) has no
-              // default, so omitting it makes the Rust server drop the frame.
+              // `shell` is required by the Rust protocol's
+              // `freshell-protocol::client_messages::TerminalCreate` message.
               shell: 'system',
               sessionRef: { provider: 'opencode', sessionId },
             })
@@ -240,8 +228,8 @@ test.describe('sidebar opencode rail', () => {
         // from these terminals is their cwd's leaf -- pinned to
         // CHILD_TERMINAL_CWD_LEAF above. The only session that may appear is
         // the root, badged `timeline`. So a button naming this leaf can only
-        // be a rail row for a subagent-target terminal, on EITHER pathway
-        // (server-fabricated live session item, or client-manufactured row).
+        // be a rail row for a subagent-target terminal, from either the Rust
+        // server's fabricated session item or the client's manufactured row.
         await page.waitForTimeout(2_000) // let a terminals.changed refetch land
         expect(await page.getByText(new RegExp(CHILD_ID)).count()).toBe(0)
         expect(await page.getByText(/opencode --session/).count()).toBe(0)
@@ -268,10 +256,8 @@ test.describe('sidebar opencode rail', () => {
               requestId: `e2e-rail-subagent-paned-${Date.now()}`,
               mode: 'opencode',
               cwd,
-              // `shell` is REQUIRED on the wire: the Node server's Zod schema
-              // defaults it to 'system', but the Rust server's serde struct
-              // (`freshell-protocol::client_messages::TerminalCreate`) has no
-              // default, so omitting it makes the Rust server drop the frame.
+              // `shell` is required by the Rust protocol's
+              // `freshell-protocol::client_messages::TerminalCreate` message.
               shell: 'system',
               sessionRef: { provider: 'opencode', sessionId },
             })

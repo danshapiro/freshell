@@ -14,12 +14,10 @@ import { TestHarness } from '../helpers/test-harness.js'
  * This is the user's exact 2026-07-19 incident chain
  * (`docs/plans/2026-07-19-state-sync-cartography.md` Part 1), replayed
  * (kata ejh6: with the canonical `sessionRef {provider, sessionId}` carrier —
- * the legacy bare `resumeSessionId` wire field is now rejected at the REST
  * door, see the rejection case at the end of this describe) and expected
  * GREEN because the rust server stamps the canonical
  * `sessionRef {provider: mode, sessionId}` onto the `ui.command{tab.create}`
  * payload (`crates/freshell-freshagent/src/terminal_tabs.rs`,
- * `spawn_terminal_pane`) instead of the legacy bare
  * `resumeSessionId` the frozen client's matchers are blind to for every
  * mode but `claude` (`src/lib/session-utils.ts:135-139`):
  *
@@ -40,10 +38,8 @@ import { TestHarness } from '../helpers/test-harness.js'
  *
  * KNOWN DIVERGENCE (rust-only, by design -- same note as
  * `amplifier-restore-rust.spec.ts` / `rest-tab-persistence.spec.ts` /
- * `session-directory-matrix.spec.ts`): this branch's FROZEN legacy `server/`
  * tree predates upstream #514 (`05c6b1fa`) and has no amplifier provider
  * registered at all, so this scenario cannot run there. Registered ONLY
- * under the `rust-chromium` project in `playwright.config.ts`.
  */
 
 const __filename = fileURLToPath(import.meta.url)
@@ -107,12 +103,7 @@ function containsSessionRef(node: unknown, provider: string, sessionId: string):
 test.describe('Remote tab linkage (Rust only)', () => {
   test.setTimeout(150_000)
 
-  test('a REST-created amplifier resume tab shows OPEN in the sidebar, dedupes on sidebar click, and survives a server restart via the persisted sessionRef', async ({ page, e2eServerKind }) => {
-    // Registered ONLY under `rust-chromium` (`playwright.config.ts`) --
-    // assert the precondition explicitly so an accidental matrix inclusion
-    // fails loudly instead of silently no-op'ing on legacy.
-    expect(e2eServerKind).toBe('rust')
-
+  test('a REST-created amplifier resume tab shows OPEN in the sidebar, dedupes on sidebar click, and survives a server restart via the persisted sessionRef', async ({ page }) => {
     const SEEDED_SESSION_ID = 'amp-remote-linkage-0001'
     const SESSION_TITLE = 'remote-tab-linkage seeded session'
     const TAB_NAME = 'remote-linkage-tab'
@@ -126,7 +117,6 @@ test.describe('Remote tab linkage (Rust only)', () => {
       const fakeAmplifierPath = await installFakeAmplifierCli(path.join(sharedRoot, 'bin'))
 
       const server = await createE2eServerHandle(process.env, {
-        kind: e2eServerKind,
         construct: {
           env: {
             AMPLIFIER_CMD: fakeAmplifierPath,
@@ -145,7 +135,6 @@ test.describe('Remote tab linkage (Rust only)', () => {
 
             // Seed the amplifier session the REST create will resume --
             // same fixture shape as `sidebar-click-resume.spec.ts` /
-            // `session-directory-matrix.spec.ts` (`metadata.json` + sibling
             // `transcript.jsonl` under
             // `<amplifier_home>/projects/<slug>/sessions/<id>/`;
             // `working_dir` is mandatory -- the indexer's R10b cwd gate,
@@ -195,7 +184,6 @@ test.describe('Remote tab linkage (Rust only)', () => {
 
         // ------------------------------------------------------------------
         // Step 2: the incident's trigger, re-carriered -- REST create with the
-        // canonical `sessionRef {provider, sessionId}` (kata ejh6: the legacy
         // bare `resumeSessionId` wire field is now REJECTED at the door; see
         // the rejection case at the end of this describe block). Every
         // downstream assertion below (resume argv, live broadcast, sidebar
@@ -300,7 +288,7 @@ test.describe('Remote tab linkage (Rust only)', () => {
         // count).
         // ------------------------------------------------------------------
         if (!server.restart) {
-          throw new Error(`${e2eServerKind} E2eServerHandle does not implement restart()`)
+          throw new Error('Owned Rust E2eServerHandle does not implement restart()')
         }
         await server.restart()
 
@@ -340,16 +328,13 @@ test.describe('Remote tab linkage (Rust only)', () => {
     }
   })
 
-  // kata ejh6: the legacy `resumeSessionId` wire field is REJECTED at the
   // `POST /api/tabs` door — 400 with the exact frozen text, and no visible
   // creation (`/api/tabs` before/after equality proves no spawn, no tab).
   // This case boots its OWN minimal rust server (no amplifier fixtures
   // needed — the rejection fires at the door before any mode work), unlike
   // the big linkage test above whose locals are out of scope here.
-  test('rejects a bare legacy resumeSessionId on REST create with 400 + frozen text (kata ejh6)', async ({ e2eServerKind }) => {
-    expect(e2eServerKind).toBe('rust')
+  test('rejects a bare legacy resumeSessionId on REST create with 400 + frozen text (kata ejh6)', async () => {
     const server = await createE2eServerHandle(process.env, {
-      kind: e2eServerKind,
       construct: {}, // no fixtures: door-top reject needs no provider state
     })
     const info = await server.start()

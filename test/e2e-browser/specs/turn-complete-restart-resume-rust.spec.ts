@@ -95,8 +95,7 @@ async function typePromptIntoLastPane(page: import('@playwright/test').Page, tex
 test.describe('Turn-complete alert across abrupt restart (Rust only)', () => {
   test.setTimeout(180_000)
 
-  test('a recovered CLI pane rings exactly once for its first post-restart turn', async ({ page, e2eServerKind }) => {
-    expect(e2eServerKind).toBe('rust')
+  test('a recovered CLI pane rings exactly once for its first post-restart turn', async ({ page }) => {
     const sharedRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'freshell-lane-c-chime-'))
     // Dual-role: the Rust codex terminal lane boots a `codex app-server`
     // sidecar first from the same CODEX_CMD; a terminal-only fake exits 0 on

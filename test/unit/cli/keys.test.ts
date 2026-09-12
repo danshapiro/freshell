@@ -1,5 +1,5 @@
 import { it, expect } from 'vitest'
-import { translateKeys } from '../../../server/cli/keys'
+import { translateKeys } from '../../../tools/node-client-runtime/keys'
 
 it('translates C-c and Enter', () => {
   expect(translateKeys(['C-c', 'Enter'])).toBe('\x03\r')

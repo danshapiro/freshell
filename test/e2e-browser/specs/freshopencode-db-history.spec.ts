@@ -6,7 +6,7 @@ import { fileURLToPath } from 'node:url'
 import { DatabaseSync } from 'node:sqlite'
 import { openPanePicker } from '../helpers/pane-picker.js'
 import { TestHarness } from '../helpers/test-harness.js'
-import { TestServer } from '../helpers/test-server.js'
+import { RustServer } from '../helpers/rust-server.js'
 
 const __filename = fileURLToPath(import.meta.url)
 const __dirname = path.dirname(__filename)
@@ -254,7 +254,7 @@ test.describe('Freshopencode DB history restore', () => {
     await fsp.mkdir(cwd, { recursive: true })
     await installFakeOpencode(binDir)
 
-    const server = new TestServer(createServerOptions({
+    const server = new RustServer(createServerOptions({
       binDir,
       auditLogPath,
       logsDir,
@@ -332,7 +332,7 @@ test.describe('Freshopencode DB history restore', () => {
     await fsp.mkdir(cwd, { recursive: true })
     await installFakeOpencode(binDir)
 
-    const server = new TestServer(createServerOptions({
+    const server = new RustServer(createServerOptions({
       binDir,
       auditLogPath,
       logsDir,
@@ -400,7 +400,7 @@ test.describe('Freshopencode DB history restore', () => {
       createdAt: tabCreatedAt + 60_000,
     })
 
-    const server = new TestServer(createServerOptions({
+    const server = new RustServer(createServerOptions({
       binDir,
       auditLogPath,
       logsDir,

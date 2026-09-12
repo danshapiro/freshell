@@ -4181,15 +4181,23 @@ mod tests {
         assert_eq!(probe.probe("127.0.0.1".to_string(), port).await, Some(true));
         accept_task.abort();
 
-        // Closed: pick a high port nothing is listening on and expect Some(false).
-        // (Bind-then-drop to get a genuinely free ephemeral port number, then
-        // probe it after the listener is gone — connection refused.)
-        let temp_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let free_port = temp_listener.local_addr().unwrap().port();
-        drop(temp_listener);
-        assert_eq!(
-            probe.probe("127.0.0.1".to_string(), free_port).await,
-            Some(false)
+        // Closed: bind-then-drop an ephemeral listener and probe the released
+        // port. Another parallel test can reclaim that port in the tiny gap
+        // between drop and connect, so retry a bounded number of candidates
+        // instead of treating that scheduling race as a probe failure.
+        let mut found_closed_port = false;
+        for _ in 0..8 {
+            let temp_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let free_port = temp_listener.local_addr().unwrap().port();
+            drop(temp_listener);
+            if probe.probe("127.0.0.1".to_string(), free_port).await == Some(false) {
+                found_closed_port = true;
+                break;
+            }
+        }
+        assert!(
+            found_closed_port,
+            "could not obtain a closed loopback port after bounded retries"
         );
     }
 

@@ -2,18 +2,16 @@
  * T2 behavioral-invariant contract for the equivalence oracle.
  *
  * The T2 rung drives a REAL coding-CLI task with a LIVE (cheap) model call
- * THROUGH the freshell server and asserts BEHAVIORAL INVARIANTS — shape,
+ * THROUGH the Rust freshell server and asserts BEHAVIORAL INVARIANTS — shape,
  * presence, persistence, parseability, and wire behavior — NEVER LLM-text
  * equality (model output is nondeterministic, so byte/text equality is not a
  * valid oracle here). The pinned reply is only checked for *containing* a
  * sentinel token, tolerating provider preamble.
  *
  * This module is deliberately PROVIDER-AGNOSTIC: it reads a structured
- * `T2Observation` produced by a provider-specific harness (opencode today;
- * claude/codex slot in next by registering their id-shapes below). The exact
- * same invariants will later be evaluated against the Rust port's observation,
- * so the ORIGINAL-side observation captured today is the T2 baseline the port
- * is diffed against.
+ * `T2Observation` produced by a provider-specific harness (opencode, claude,
+ * or codex). These checks are supplemental provider contracts, not text-
+ * equality baselines.
  *
  * No server / network / node-pty imports here — pure logic, cheap to unit-test.
  */
@@ -36,10 +34,10 @@ export interface T2SessionRow {
 /**
  * Structured, serializable observation of ONE live T2 run. Everything the
  * invariants need must live here (no live handles) so the same assertions run
- * against the original and the future Rust port.
+ * against independent Rust provider runs.
  */
 export interface T2Observation {
-  // ── provenance / baseline context ───────────────────────────────────────
+  // ── provider-run context ────────────────────────────────────────────────
   /** Runtime provider under test: 'opencode' | 'claude' | 'codex'. */
   provider: string
   /** Full model id driven, e.g. 'umans-ai-coding-plan/umans-kimi-k2.7'. */
@@ -385,13 +383,12 @@ export function assertT2Invariants(obs: T2Observation): T2InvariantReport {
   }
 }
 
-// ── baseline projection (LLM-text-free) ─────────────────────────────────────────
+// ── stable projection (LLM-text-free) ───────────────────────────────────────────
 
 /**
- * The ORIGINAL-side T2 baseline the Rust port is diffed against. Deliberately
- * LLM-text-FREE and free of per-run nondeterminism (no captureText, no concrete
- * random ids, no temp paths, no timings): only the structural SHAPES + the
- * invariant PASS/FAIL matrix — the facts a correct port must reproduce.
+ * A stable provider-run projection. Deliberately LLM-text-FREE and free of
+ * per-run nondeterminism (no captureText, no concrete random ids, no temp
+ * paths, no timings): only structural SHAPES and the invariant matrix.
  */
 export interface T2Baseline {
   tier: 'T2'
@@ -402,7 +399,7 @@ export interface T2Baseline {
   assertedInvariants: string[]
   /** Non-fatal invariant names — recorded/observed but do not gate green. */
   informationalInvariants: string[]
-  /** Overall grade of the captured original run (must be true to be a valid baseline). */
+  /** Overall grade of the captured provider run. */
   ok: boolean
   passed: number
   failed: number
@@ -440,9 +437,9 @@ export interface T2Baseline {
 }
 
 /**
- * Project a live observation + its graded report into the stable, LLM-text-free
- * T2 baseline. Provenance (opencode version, capture timestamp) is added by the
- * caller that persists the file.
+ * Project a live observation + its graded report into a stable, LLM-text-free
+ * provider-run shape. Provenance (provider version, capture timestamp) can be
+ * added by a caller that persists a report.
  */
 export function summarizeT2ForBaseline(obs: T2Observation, report: T2InvariantReport): T2Baseline {
   const shape = shapeFor(obs.provider)

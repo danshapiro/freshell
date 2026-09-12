@@ -12,7 +12,6 @@
  * Recency is `max(metadata timestamps, mtime(transcript.jsonl), mtime(events.jsonl))`
  * (`getActivityMtimeMs`), so every file is utimes-pinned to the seeded
  * `descriptionUpdatedAt` — otherwise build-time "now" silently dominates the
- * seeded past (the exact time-bomb class the matrix spec hit on 2026-07-19).
  */
 
 import path from 'path'

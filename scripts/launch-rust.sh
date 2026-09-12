@@ -124,8 +124,14 @@ if [[ "$SKIP_BUILD" != 1 ]]; then
     exit 0
   fi
   echo "Building Rust server (cargo build --release -p freshell-server)..."
-  cargo build --release -p freshell-server
+  cargo build --release -p freshell-server --locked
 fi
+
+# The Claude SDK is a sanctioned Node sidecar, not the Freshell server.  Keep
+# its locked dependency tree available for every launcher startup, including
+# --skip-build runs from a clean checkout.
+echo "Preparing Rust runtime prerequisites..."
+npm run --silent prepare:rust-runtime
 
 [[ -x "$BINARY" ]] || { echo "Missing binary: $BINARY (build first)" >&2; exit 1; }
 

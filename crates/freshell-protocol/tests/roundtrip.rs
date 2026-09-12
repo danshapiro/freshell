@@ -335,24 +335,6 @@ fn rich_client_messages() {
         other => panic!("expected TerminalAttach, got {other:?}"),
     }
 
-    // codingcli.create — sessionRef (canonical carrier, ejh6 Task 11) + resumeSessionId (retained for reject).
-    let wire = r#"{"type":"codingcli.create","prompt":"hi","provider":"claude","requestId":"r1","cwd":"/x","maxTurns":3,"model":"sonnet","permissionMode":"acceptEdits","sandbox":"workspace-write","resumeSessionId":"prev","sessionRef":{"provider":"claude","sessionId":"sess-canonical"}}"#;
-    match client_roundtrip(wire, "codingcli.create") {
-        ClientMessage::CodingCliCreate(c) => {
-            assert_eq!(c.permission_mode, Some(PermissionMode::AcceptEdits));
-            assert_eq!(c.sandbox, Some(Sandbox::WorkspaceWrite));
-            assert_eq!(c.resume_session_id, Some("prev".to_string()));
-            assert_eq!(
-                c.session_ref,
-                Some(SessionLocator {
-                    provider: "claude".to_string(),
-                    session_id: "sess-canonical".to_string()
-                })
-            );
-        }
-        other => panic!("expected CodingCliCreate, got {other:?}"),
-    }
-
     // ping — unit variant.
     match client_roundtrip(r#"{"type":"ping"}"#, "ping") {
         ClientMessage::Ping => {}

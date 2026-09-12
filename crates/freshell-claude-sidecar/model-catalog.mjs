@@ -1,4 +1,5 @@
-import { pathToFileURL } from 'node:url'
+import { realpathSync } from 'node:fs'
+import { fileURLToPath, pathToFileURL } from 'node:url'
 
 const log = (message, details = {}) => process.stderr.write(`${JSON.stringify({ severity: 'warn', component: 'claude-model-catalog', message, ...details })}\n`)
 
@@ -33,7 +34,21 @@ export async function probeModelCatalog(query, { env = process.env, timeoutMs = 
   }
 }
 
-if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+function isMainModule() {
+  if (!process.argv[1]) return false
+  try {
+    // macOS commonly exposes the same temporary/app path through aliases such
+    // as /var and /private/var. Canonicalize both sides before comparing so a
+    // direct launch still runs the probe when the argv path is symlinked.
+    return realpathSync(fileURLToPath(import.meta.url)) === realpathSync(process.argv[1])
+  } catch {
+    // Preserve the normal URL comparison as a best-effort fallback if a path
+    // disappears during startup or the platform cannot resolve it.
+    return import.meta.url === pathToFileURL(process.argv[1]).href
+  }
+}
+
+if (isMainModule()) {
   try {
     const { query } = await import(process.env.FRESHELL_CLAUDE_SDK_QUERY_MODULE || '@anthropic-ai/claude-agent-sdk')
     const models = await probeModelCatalog(query)

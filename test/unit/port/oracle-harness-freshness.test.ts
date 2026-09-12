@@ -1,64 +1,103 @@
-import * as fs from 'node:fs'
-import * as os from 'node:os'
-import * as path from 'node:path'
-import { afterAll, beforeEach, describe, expect, it } from 'vitest'
-import { nodeBuildStampIsCurrent } from '../../../port/oracle/harness/external-server.js'
+import { spawnSync } from 'node:child_process'
+import fs from 'node:fs'
+import os from 'node:os'
+import path from 'node:path'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
-// Pure-logic coverage for the oracle node dist's stamp-freshness guard: the
-// predicate decides whether `ensureServerBuilt` reuses or rebuilds the
-// compiled node artifact before the oracle boots it.
-//
-// The predicate's cwd (git probe) is injectable: tests pass an explicit
-// `head` (or force the git-less path via `gitAvailable: false`) so no test
-// depends on this scratch root actually being a git worktree.
-describe('nodeBuildStampIsCurrent', () => {
-  const dirs: string[] = []
+vi.mock('node:child_process', async (original) => ({
+  ...await original<typeof import('node:child_process')>(),
+  spawnSync: vi.fn(),
+}))
 
-  function scratchDist(buildId: unknown): string {
-    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'stamp-freshness-'))
-    dirs.push(root)
-    fs.mkdirSync(path.join(root, 'dist', 'server'), { recursive: true })
-    if (buildId !== undefined) {
-      const content = typeof buildId === 'string' ? JSON.stringify({ buildId }) : buildId
-      fs.writeFileSync(path.join(root, 'dist', 'server', 'build-id.json'), content)
-    }
-    fs.writeFileSync(path.join(root, 'dist', 'server', 'index.js'), '// entry')
-    return root
-  }
+const roots: string[] = []
 
-  beforeEach(() => {
-    /* fresh dirs per test */
+function scratchRoot(): string {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'rust-oracle-build-'))
+  roots.push(root)
+  return root
+}
+
+function writeBinary(root: string): string {
+  const bin = path.join(root, 'target', 'release', process.platform === 'win32' ? 'freshell-server.exe' : 'freshell-server')
+  fs.mkdirSync(path.dirname(bin), { recursive: true })
+  fs.writeFileSync(bin, 'fixture binary')
+  return bin
+}
+
+beforeEach(() => {
+  vi.resetModules()
+  vi.mocked(spawnSync).mockReset()
+  vi.mocked(spawnSync).mockImplementation((_file, _args, options) => {
+    writeBinary(String(options?.cwd))
+    return { status: 0 } as ReturnType<typeof spawnSync>
   })
-  afterAll(() => {
-    for (const d of dirs) fs.rmSync(d, { recursive: true, force: true })
-  })
+})
 
-  it('is current when the stamp exactly equals the checkout HEAD', () => {
-    const root = scratchDist('a'.repeat(40))
-    expect(nodeBuildStampIsCurrent(root, { head: 'a'.repeat(40) })).toBe(true)
-  })
+afterEach(() => {
+  for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true })
+})
 
-  it('rebuilds when the stamp is a different sha', () => {
-    const root = scratchDist('f'.repeat(40))
-    expect(nodeBuildStampIsCurrent(root, { head: 'a'.repeat(40) })).toBe(false)
-  })
-
-  it('rebuilds when the bake file is missing', () => {
-    const root = scratchDist(undefined)
-    expect(nodeBuildStampIsCurrent(root, { head: 'a'.repeat(40) })).toBe(false)
-  })
-
-  it('rebuilds when the stamp is "unknown" or malformed but HEAD is available', () => {
-    const unknownRoot = scratchDist('unknown')
-    expect(nodeBuildStampIsCurrent(unknownRoot, { head: 'a'.repeat(40) })).toBe(false)
-    const malformedRoot = scratchDist('not json {')
-    expect(nodeBuildStampIsCurrent(malformedRoot, { head: 'a'.repeat(40) })).toBe(false)
+describe('Rust oracle artifact freshness', () => {
+  it('asks Cargo to validate an existing artifact against the locked checkout', async () => {
+    const { ensureRustServerBuilt } = await import('../../../port/oracle/harness/external-server.js')
+    const root = scratchRoot()
+    const bin = writeBinary(root)
+    expect(ensureRustServerBuilt(root)).toBe(bin)
+    const [command, args, options] = vi.mocked(spawnSync).mock.calls[0]
+    expect(command).toBe('cargo')
+    expect(args).toEqual(['build', '--release', '-p', 'freshell-server', '--locked'])
+    expect(options?.cwd).toBe(root)
   })
 
-  it('keeps legacy reuse when HEAD is unavailable (no stamp semantics to violate)', () => {
-    const unknownRoot = scratchDist('unknown')
-    expect(nodeBuildStampIsCurrent(unknownRoot, { gitAvailable: false })).toBe(true)
-    const staleRoot = scratchDist('f'.repeat(40))
-    expect(nodeBuildStampIsCurrent(staleRoot, { gitAvailable: false })).toBe(true)
+  it('reuses a verified artifact within one test process', async () => {
+    const { ensureRustServerBuilt } = await import('../../../port/oracle/harness/external-server.js')
+    const root = scratchRoot()
+    const bin = ensureRustServerBuilt(root)
+    expect(ensureRustServerBuilt(root)).toBe(bin)
+    expect(spawnSync).toHaveBeenCalledTimes(1)
+  })
+
+  it('builds again if the verified artifact has been removed', async () => {
+    const { ensureRustServerBuilt } = await import('../../../port/oracle/harness/external-server.js')
+    const root = scratchRoot()
+    const bin = ensureRustServerBuilt(root)
+    fs.unlinkSync(bin)
+    expect(ensureRustServerBuilt(root)).toBe(bin)
+    expect(fs.existsSync(bin)).toBe(true)
+    expect(spawnSync).toHaveBeenCalledTimes(2)
+  })
+
+  it('does not reuse one worktree verification for another worktree', async () => {
+    const { ensureRustServerBuilt } = await import('../../../port/oracle/harness/external-server.js')
+    const first = scratchRoot()
+    const second = scratchRoot()
+    writeBinary(second)
+    ensureRustServerBuilt(first)
+    ensureRustServerBuilt(second)
+    expect(spawnSync).toHaveBeenCalledTimes(2)
+    expect(vi.mocked(spawnSync).mock.calls[1][2]?.cwd).toBe(second)
+  })
+
+  it('rejects a failed build even if an old artifact exists and permits retry', async () => {
+    const { ensureRustServerBuilt } = await import('../../../port/oracle/harness/external-server.js')
+    const root = scratchRoot()
+    const bin = writeBinary(root)
+    vi.mocked(spawnSync).mockReturnValueOnce({ status: 101 } as ReturnType<typeof spawnSync>)
+    expect(() => ensureRustServerBuilt(root)).toThrow(/exit 101/)
+    expect(ensureRustServerBuilt(root)).toBe(bin)
+    expect(spawnSync).toHaveBeenCalledTimes(2)
+  })
+
+  it('rejects a successful build that produced no executable', async () => {
+    const { ensureRustServerBuilt } = await import('../../../port/oracle/harness/external-server.js')
+    vi.mocked(spawnSync).mockReturnValueOnce({ status: 0 } as ReturnType<typeof spawnSync>)
+    expect(() => ensureRustServerBuilt(scratchRoot())).toThrow(/still missing/)
+  })
+
+  it('resolves the native Windows executable name', async () => {
+    const { rustServerBinPath } = await import('../../../port/oracle/harness/external-server.js')
+    const root = scratchRoot()
+    expect(rustServerBinPath(root, 'win32')).toBe(path.join(root, 'target', 'release', 'freshell-server.exe'))
+    expect(rustServerBinPath(root, 'linux')).toBe(path.join(root, 'target', 'release', 'freshell-server'))
   })
 })

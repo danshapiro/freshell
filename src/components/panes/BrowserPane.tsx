@@ -1,15 +1,15 @@
 import { useState, useRef, useCallback, useEffect } from 'react'
-import { ArrowLeft, ArrowRight, RotateCcw, X, Wrench, Loader2 } from 'lucide-react'
+import { ArrowLeft, ArrowRight, RotateCcw, X, Wrench } from 'lucide-react'
 import { useAppDispatch, useAppSelector } from '@/store/hooks'
 import { consumePaneRefreshRequest, updatePaneContent } from '@/store/panesSlice'
 import { clearPaneRuntimeActivity, setPaneRuntimeActivity } from '@/store/paneRuntimeActivitySlice'
 import { cn } from '@/lib/utils'
 import { copyText } from '@/lib/clipboard'
 import { isLoopbackHostname } from '@/lib/url-rewrite'
-import { api } from '@/lib/api'
 import { registerBrowserActions } from '@/lib/pane-action-registry'
 import { ContextIds } from '@/components/context-menu/context-menu-constants'
 import { paneRefreshTargetMatchesContent } from '@/lib/pane-utils'
+import { RUST_BASELINE_UNAVAILABLE } from '@/lib/rust-baseline-unavailable'
 import { usePaneFocusAdoption } from '@/hooks/usePaneFocusAdoption'
 import { useIframeFocusLock } from '@/hooks/useIframeFocusLock'
 
@@ -20,8 +20,6 @@ interface BrowserPaneProps {
   url: string
   devToolsOpen: boolean
   focusEligible?: boolean
-  /** Focus-nudge epoch: an explicit same-target select bumps this so the
-   *  owns-focus effect re-runs even without an eligibility transition. */
   focusEpoch?: number
 }
 
@@ -109,11 +107,10 @@ function toIframeSrc(url: string): string {
  * Works for both local and remote browsers since `/api/proxy/http/:port/`
  * is always same-origin with the Freshell page.
  *
- * https: localhost URLs are NOT proxied — the HTTP proxy can't do TLS
- * passthrough, so those fall through to TCP port forwarding for remote
- * browsers or direct access for local browsers.
+ * HTTPS loopback remains unavailable to remote browsers because Rust exposes
+ * no TLS forwarding endpoint.
  */
-function buildHttpProxyUrl(url: string): string | null {
+export function buildHttpProxyUrl(url: string): string | null {
   try {
     const parsed = new URL(url)
     if (parsed.protocol === 'http:' && isLoopbackHostname(parsed.hostname)) {
@@ -135,13 +132,10 @@ function buildHttpProxyUrl(url: string): string | null {
 }
 
 /**
- * Determine whether a URL needs TCP port forwarding (remote browser + localhost).
- * This is the fallback for URLs that buildHttpProxyUrl cannot handle:
- * - https: localhost URLs (HTTP proxy can't do TLS passthrough)
- * - http: localhost URLs on the same port as Freshell (proxy skips those)
+ * Remote loopback URLs outside the supported HTTP proxy are unavailable.
  */
-function needsPortForward(url: string): { parsed: URL; targetPort: number } | null {
-  if (isLoopbackHostname(window.location.hostname)) return null
+function isUnsupportedRemoteLoopback(url: string): boolean {
+  if (isLoopbackHostname(window.location.hostname)) return false
 
   try {
     const parsed = new URL(url)
@@ -149,34 +143,24 @@ function needsPortForward(url: string): { parsed: URL; targetPort: number } | nu
       (parsed.protocol === 'http:' || parsed.protocol === 'https:') &&
       isLoopbackHostname(parsed.hostname)
     ) {
-      const targetPort = parsed.port
-        ? parseInt(parsed.port, 10)
-        : parsed.protocol === 'https:'
-          ? 443
-          : 80
-      return { parsed, targetPort }
+      return true
     }
   } catch {
     // Not a valid URL
   }
-  return null
+  return false
 }
 
-/**
- * Build the forwarded iframe URL: replace hostname and port with the host's
- * address and the forwarded port, preserving the original protocol/path/query/hash.
- * The TCP proxy is a raw pipe — it passes bytes verbatim, so the original
- * protocol must be preserved: https: URLs need the browser to perform TLS
- * with the local service through the proxy, http: URLs stay plaintext.
- */
-function buildForwardedUrl(
-  parsed: URL,
-  forwardedPort: number,
-): string {
-  const forwarded = new URL(parsed.href)
-  forwarded.hostname = window.location.hostname
-  forwarded.port = String(forwardedPort)
-  return forwarded.toString()
+export type BrowserSourceResolution = {
+  src: string | null
+  baselineUnavailable: boolean
+}
+
+export function resolveBrowserSource(url: string): BrowserSourceResolution {
+  const proxyUrl = buildHttpProxyUrl(url)
+  if (proxyUrl) return { src: proxyUrl, baselineUnavailable: false }
+  if (isUnsupportedRemoteLoopback(url)) return { src: null, baselineUnavailable: true }
+  return { src: toIframeSrc(url), baselineUnavailable: false }
 }
 
 export default function BrowserPane({
@@ -193,13 +177,10 @@ export default function BrowserPane({
   const iframeRef = useRef<HTMLIFrameElement>(null)
   const inputRef = useRef<HTMLInputElement>(null)
   const rootRef = useRef<HTMLDivElement | null>(null)
-  // Callback-ref STATE mirror: the iframe-focus-lock effect keys on the
-  // element, so it re-runs exactly when the node (re)mounts — unlike a ref
-  // read, element identity participates in effect deps.
   const [rootEl, setRootEl] = useState<HTMLDivElement | null>(null)
-  const setRootNode = useCallback((el: HTMLDivElement | null) => {
-    rootRef.current = el
-    setRootEl(el)
+  const setRootNode = useCallback((element: HTMLDivElement | null) => {
+    rootRef.current = element
+    setRootEl(element)
   }, [])
   const [inputUrl, setInputUrl] = useState(url)
   const [isLoading, setIsLoading] = useState(false)
@@ -212,11 +193,8 @@ export default function BrowserPane({
   const history = navigation.history
   const historyIndex = navigation.index
 
-  // Port forwarding state
   const [resolvedSrc, setResolvedSrc] = useState<string | null>(null)
-  const [isForwarding, setIsForwarding] = useState(false)
-  const [forwardError, setForwardError] = useState<string | null>(null)
-  const [forwardRetryKey, setForwardRetryKey] = useState(0)
+  const [baselineUnavailable, setBaselineUnavailable] = useState(false)
 
   const currentUrl = history[historyIndex] || ''
 
@@ -226,15 +204,11 @@ export default function BrowserPane({
       return
     }
 
-    if (forwardError || loadError) {
+    if (baselineUnavailable || loadError) {
       dispatch(setPaneRuntimeActivity({ paneId, source: 'browser', phase: 'error' }))
       return
     }
 
-    if (isForwarding) {
-      dispatch(setPaneRuntimeActivity({ paneId, source: 'browser', phase: 'forwarding' }))
-      return
-    }
 
     if (isLoading) {
       dispatch(setPaneRuntimeActivity({ paneId, source: 'browser', phase: 'loading' }))
@@ -242,7 +216,7 @@ export default function BrowserPane({
     }
 
     dispatch(setPaneRuntimeActivity({ paneId, source: 'browser', phase: 'idle' }))
-  }, [currentUrl, dispatch, forwardError, isForwarding, isLoading, loadError, paneId])
+  }, [baselineUnavailable, currentUrl, dispatch, isLoading, loadError, paneId])
 
   useEffect(() => () => {
     dispatch(clearPaneRuntimeActivity({ paneId }))
@@ -274,64 +248,15 @@ export default function BrowserPane({
   useEffect(() => {
     if (!currentUrl) {
       setResolvedSrc(null)
-      setForwardError(null)
-      setIsForwarding(false)
+      setBaselineUnavailable(false)
       return
     }
 
-    // For localhost URLs, route through Freshell's HTTP proxy.
-    // This handles WSL2/Docker where the browser can't reach localhost
-    // ports directly, and also simplifies remote access.
-    const proxyUrl = buildHttpProxyUrl(currentUrl)
-    if (proxyUrl) {
-      setResolvedSrc(proxyUrl)
-      setForwardError(null)
-      setIsForwarding(false)
-      return
-    }
-
-    const forward = needsPortForward(currentUrl)
-    if (!forward) {
-      // No forwarding needed - use the URL directly (with file:// conversion)
-      setResolvedSrc(toIframeSrc(currentUrl))
-      setForwardError(null)
-      setIsForwarding(false)
-      return
-    }
-
-    // Request a port forward from the server
-    let cancelled = false
-    let forwardedTargetPort: number | null = null
-    setIsForwarding(true)
-    setForwardError(null)
-    setResolvedSrc(null)
-    setIsLoading(false)
-
-    api
-      .post<{ forwardedPort: number }>('/api/proxy/forward', {
-        port: forward.targetPort,
-      })
-      .then((result) => {
-        if (cancelled) return
-        forwardedTargetPort = forward.targetPort
-        setResolvedSrc(buildForwardedUrl(forward.parsed, result.forwardedPort))
-      })
-      .catch((err) => {
-        if (cancelled) return
-        const msg = err instanceof Error ? err.message : String(err)
-        setForwardError(`Failed to connect to localhost:${forward.targetPort} — ${msg}`)
-      })
-      .finally(() => {
-        if (!cancelled) setIsForwarding(false)
-      })
-
-    return () => {
-      cancelled = true
-      if (forwardedTargetPort !== null) {
-        api.delete(`/api/proxy/forward/${forwardedTargetPort}`).catch(() => {})
-      }
-    }
-  }, [currentUrl, forwardRetryKey])
+    const resolution = resolveBrowserSource(currentUrl)
+    setResolvedSrc(resolution.src)
+    setBaselineUnavailable(resolution.baselineUnavailable)
+    if (resolution.baselineUnavailable) setIsLoading(false)
+  }, [currentUrl])
 
   const navigate = useCallback((newUrl: string) => {
     if (!newUrl.trim()) return
@@ -388,17 +313,11 @@ export default function BrowserPane({
   const recoverCurrentPage = useCallback(() => {
     if (!currentUrl) return
 
+    const resolution = resolveBrowserSource(currentUrl)
     setLoadError(null)
-    setForwardError(null)
-    setIsLoading(true)
-
-    if (needsPortForward(currentUrl)) {
-      setResolvedSrc(null)
-      setForwardRetryKey((key) => key + 1)
-      return
-    }
-
-    setResolvedSrc(toIframeSrc(currentUrl))
+    setResolvedSrc(resolution.src)
+    setBaselineUnavailable(resolution.baselineUnavailable)
+    setIsLoading(!resolution.baselineUnavailable)
   }, [currentUrl])
 
   const refresh = useCallback(() => {
@@ -414,7 +333,6 @@ export default function BrowserPane({
     try {
       iframe.contentWindow?.location.reload()
       setLoadError(null)
-      setForwardError(null)
       setIsLoading(true)
       return
     } catch {
@@ -424,7 +342,6 @@ export default function BrowserPane({
     const src = iframe.src || resolvedSrc || toIframeSrc(currentUrl)
     iframe.src = src
     setLoadError(null)
-    setForwardError(null)
     setIsLoading(true)
   }, [currentUrl, recoverCurrentPage, resolvedSrc])
 
@@ -449,35 +366,15 @@ export default function BrowserPane({
     }
   }
 
-  // Track the current url in a ref so flip-time focus sees the latest page
-  // WITHOUT making this effect navigation-reactive (navigation must never yank
-  // focus — existing UX).
   const urlRef = useRef(url)
   urlRef.current = url
-
-  // Owns-focus ⇒ DOM focus belongs to this pane: an empty pane goes to the URL
-  // input (user just created it), a loaded pane goes to the pane root so
-  // keystrokes belong here (explicit select of a loaded browser pane, remount
-  // after a leaf→split, mount while eligible). Background/ineligible panes
-  // never focus anything. Eligible MOUNTS are additionally gated by focus
-  // ownership: an agent-driven leaf→split remount must not yank focus back
-  // from application chrome; eligibility flips (explicit select) bypass.
   const mayFocusNow = usePaneFocusAdoption(paneId, focusEligible, focusEpoch)
+  const iframeFocusLocked = useIframeFocusLock(rootEl, focusEligible, mayFocusNow)
   useEffect(() => {
-    if (!focusEligible) return
-    if (!mayFocusNow()) return
+    if (!focusEligible || !mayFocusNow()) return
     if (urlRef.current) rootRef.current?.focus()
     else inputRef.current?.focus()
   }, [focusEligible, mayFocusNow])
-  // The nested-document lock follows actual focus-permission, not just Redux
-  // eligibility: an ownership-denied REMOUNT of an active pane (MCP split of
-  // a browser pane while the user works in app chrome) renders an UNLOCKED
-  // iframe whose page scripts/autofocus could hoist it to activeElement, and
-  // the app-wide guard only rebuffs LOCKED frames. The adoption read must NOT
-  // happen during render (render precedes the outgoing subtree's cleanup that
-  // records ownership); the hook computes the lock post-commit and lifts it
-  // on a pointerdown inside the pane (user wake intent).
-  const iframeFocusLocked = useIframeFocusLock(rootEl, focusEligible, mayFocusNow)
 
   useEffect(() => {
     if (!refreshRequest) return
@@ -580,20 +477,9 @@ export default function BrowserPane({
       <div className="flex-1 flex min-h-0">
         {/* iframe */}
         <div className={cn('flex-1 min-w-0', devToolsOpen && 'border-r border-border')}>
-          {forwardError ? (
-            <div className="flex flex-col items-center justify-center h-full text-muted-foreground gap-3 p-4">
-              <div className="text-destructive font-medium">Failed to connect</div>
-              <div className="text-sm text-center max-w-md">{forwardError}</div>
-              <button
-                onClick={() => {
-                  setForwardError(null)
-                  setResolvedSrc(null)
-                  setForwardRetryKey((k) => k + 1)
-                }}
-                className="mt-2 px-4 py-2 rounded bg-muted hover:bg-muted/80 text-sm"
-              >
-                Try Again
-              </button>
+          {baselineUnavailable ? (
+            <div className="flex items-center justify-center h-full p-4 text-center text-muted-foreground" role="status">
+              {RUST_BASELINE_UNAVAILABLE.remoteLoopback}
             </div>
           ) : loadError ? (
             <div className="flex flex-col items-center justify-center h-full text-muted-foreground gap-3 p-4">
@@ -609,29 +495,15 @@ export default function BrowserPane({
                 Try Again
               </button>
             </div>
-          ) : isForwarding ? (
-            <div className="flex flex-col items-center justify-center h-full text-muted-foreground gap-3 p-4">
-              <Loader2 className="h-6 w-6 animate-spin" />
-              <div className="text-sm">Connecting to {currentUrl}...</div>
-            </div>
           ) : resolvedSrc ? (
             <iframe
               ref={iframeRef}
               src={resolvedSrc}
               className="w-full h-full border-0 bg-white"
               sandbox="allow-scripts allow-same-origin allow-forms allow-popups allow-modals"
-              // Focus neutrality: while this pane does NOT own focus, the
-              // nested document is inert — a same-origin page loading in the
-              // background cannot be focused from the outside. inert does NOT
-              // stop a script INSIDE the nested document from hoisting the
-              // iframe into document.activeElement (verified empirically in
-              // Chromium), so the pane also carries data-focus-locked, which
-              // the app-wide focus-steal guard rebuffs. Removing inert on
-              // eligibility flip does not reload the iframe (attribute only,
-              // src untouched).
               {...(iframeFocusLocked ? ({ inert: '', 'data-focus-locked': 'true' } as Record<string, string>) : {})}
               onLoad={() => setIsLoading(false)}
-              onError={() => {
+              onErrorCapture={() => {
                 setIsLoading(false)
                 setLoadError(`Unable to load "${currentUrl}". The page may not exist, or the server may be blocking embedded access.`)
               }}

@@ -10,10 +10,10 @@
 //! This test spawns the REAL `index.mjs` source with `node` and drives its stdin
 //! directly. The `@anthropic-ai/claude-agent-sdk` dependency is vendored via
 //! `npm install` into the sidecar package's own node_modules and is NOT present
-//! in a plain checkout/CI, so the test copies the real sidecar modules (`index.mjs`
-//! and its Task 1 sibling `permission-channel.mjs`) VERBATIM into a temp dir with a
+//! in a plain checkout/CI, so the test copies the real sidecar entrypoint and its
+//! local helper modules VERBATIM into a temp dir with a
 //! stub `node_modules/@anthropic-ai/claude-agent-sdk` that satisfies only the
-//! top-level `import { query }` (the interrupt-dispatch path under test never calls
+//! top-level SDK import (the interrupt-dispatch path under test never calls
 //! `query()`; the stub throws if it is called). Only module RESOLUTION is redirected
 //! — every dispatched line of JS is the real source, read at test time.
 //!
@@ -30,7 +30,7 @@ use std::process::{Command, Stdio};
 use std::sync::mpsc;
 use std::time::Duration;
 
-/// Stub SDK entry: satisfies `import { query } from '@anthropic-ai/claude-agent-sdk'`
+/// Stub SDK entry: supplies `query` for the sidecar's SDK import
 /// without the vendored dependency. The interrupt-dispatch path never calls it.
 const STUB_SDK_INDEX: &str = "export function query() {\n  throw new Error('test stub: query() must not be called by the interrupt-dispatch test')\n}\n";
 
@@ -42,9 +42,8 @@ const STUB_SDK_PACKAGE_JSON: &str = r#"{
 }
 "#;
 
-/// Read one real sidecar module verbatim (`index.mjs` or its Task 1 sibling
-/// `permission-channel.mjs`, which `index.mjs` imports by relative path — both must
-/// be present in the staged dir for ESM resolution to succeed).
+/// Read one real sidecar module verbatim. The entrypoint and every local helper
+/// it imports must be present in the staged dir for ESM resolution to succeed.
 fn real_sidecar_source(module: &str) -> String {
     let path = format!(
         "{}/../freshell-claude-sidecar/{module}",
@@ -57,21 +56,14 @@ fn real_sidecar_source(module: &str) -> String {
 #[test]
 fn real_sidecar_dispatches_interrupt_frames_to_handle_interrupt() {
     let dir = tempfile::tempdir().expect("create temp dir");
-    std::fs::write(
-        dir.path().join("index.mjs"),
-        real_sidecar_source("index.mjs"),
-    )
-    .expect("copy real index.mjs verbatim");
-    std::fs::write(
-        dir.path().join("permission-channel.mjs"),
-        real_sidecar_source("permission-channel.mjs"),
-    )
-    .expect("copy real permission-channel.mjs verbatim");
-    std::fs::write(
-        dir.path().join("session-settings.mjs"),
-        real_sidecar_source("session-settings.mjs"),
-    )
-    .expect("copy real session-settings.mjs verbatim");
+    for module in [
+        "index.mjs",
+        "permission-channel.mjs",
+        "session-settings.mjs",
+    ] {
+        std::fs::write(dir.path().join(module), real_sidecar_source(module))
+            .unwrap_or_else(|e| panic!("copy real {module} verbatim: {e}"));
+    }
     let sdk_dir = dir
         .path()
         .join("node_modules/@anthropic-ai/claude-agent-sdk");

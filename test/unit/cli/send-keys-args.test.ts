@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest'
-import { partitionSendKeysArgs } from '../../../server/cli/send-keys-args'
+import { partitionSendKeysArgs } from '../../../tools/freshell-cli/send-keys-args'
 
 describe('partitionSendKeysArgs', () => {
   it('keeps all key args when target is provided via -t/--target', () => {

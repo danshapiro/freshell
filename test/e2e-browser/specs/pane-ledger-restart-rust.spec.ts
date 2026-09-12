@@ -117,8 +117,7 @@ test.use({ recoveryOfferHandling: 'manual' })
 test.describe('pane-identity ledger restart durability', () => {
   test.setTimeout(180_000)
 
-  test('identity rows are durable within seconds of pane creation and survive SIGKILL', async ({ page, e2eServerKind }) => {
-    expect(e2eServerKind).toBe('rust')
+  test('identity rows are durable within seconds of pane creation and survive SIGKILL', async ({ page }) => {
     const sharedRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'pane-ledger-e2e-'))
     let capturedHome = ''
     try {
@@ -201,8 +200,7 @@ test.describe('pane-identity ledger restart durability', () => {
     }
   })
 
-  test('SIGKILL inside the opencode locator window leaves a durable fresh-by-race marker', async ({ page, e2eServerKind }) => {
-    expect(e2eServerKind).toBe('rust')
+  test('SIGKILL inside the opencode locator window leaves a durable fresh-by-race marker', async ({ page }) => {
     const sharedRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'pane-ledger-locator-'))
     let capturedHome = ''
     try {
@@ -264,8 +262,7 @@ test.describe('pane-identity ledger restart durability', () => {
     }
   })
 
-  test('SIGKILL between spawn and identity resolution leaves a durable fresh-by-race marker', async ({ page, e2eServerKind }) => {
-    expect(e2eServerKind).toBe('rust')
+  test('SIGKILL between spawn and identity resolution leaves a durable fresh-by-race marker', async ({ page }) => {
     const sharedRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'pane-ledger-locator-'))
     let capturedHome = ''
     try {

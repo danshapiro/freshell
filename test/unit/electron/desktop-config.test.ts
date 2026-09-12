@@ -70,7 +70,7 @@ describe('DesktopConfig', () => {
       const freshellDir = path.join(tempDir, '.freshell')
       await fsp.mkdir(freshellDir, { recursive: true })
       const configData: DesktopConfig = {
-        serverMode: 'daemon',
+        serverMode: 'app-bound',
         globalHotkey: 'CommandOrControl+`',
         startOnLogin: true,
         minimizeToTray: true,
@@ -83,7 +83,7 @@ describe('DesktopConfig', () => {
 
       const config = await readDesktopConfig()
       expect(config).not.toBeNull()
-      expect(config!.serverMode).toBe('daemon')
+      expect(config!.serverMode).toBe('app-bound')
       expect(config!.startOnLogin).toBe(true)
       expect(config!.setupCompleted).toBe(true)
     })
@@ -110,6 +110,58 @@ describe('DesktopConfig', () => {
 
       const config = await readDesktopConfig()
       expect(config).toBeNull()
+    })
+
+    it('migrates persisted daemon mode atomically and emits one redacted notice', async () => {
+      const freshellDir = path.join(tempDir, '.freshell')
+      await fsp.mkdir(freshellDir, { recursive: true })
+      const persisted = {
+        serverMode: 'daemon',
+        port: 4321,
+        remoteUrl: 'https://remote.example.test:4321',
+        remoteToken: 'do-not-log-this-token',
+        knownServers: [{ url: 'http://localhost:4321', label: 'saved' }],
+        alwaysAskOnLaunch: true,
+        globalHotkey: 'CommandOrControl+Space',
+        startOnLogin: true,
+        minimizeToTray: false,
+        setupCompleted: true,
+        windowState: { x: 1, y: 2, width: 3, height: 4, maximized: true },
+      }
+      const desktopJson = path.join(freshellDir, 'desktop.json')
+      await fsp.writeFile(desktopJson, JSON.stringify(persisted))
+      const notice = vi.spyOn(console, 'info').mockImplementation(() => {})
+
+      const migrated = await readDesktopConfig()
+      expect(migrated?.serverMode).toBe('app-bound')
+      expect(migrated).toMatchObject({
+        port: 4321,
+        remoteUrl: persisted.remoteUrl,
+        remoteToken: persisted.remoteToken,
+        knownServers: persisted.knownServers,
+        alwaysAskOnLaunch: true,
+        globalHotkey: persisted.globalHotkey,
+        startOnLogin: true,
+        minimizeToTray: false,
+        setupCompleted: true,
+        windowState: persisted.windowState,
+      })
+
+      const saved = JSON.parse(await fsp.readFile(desktopJson, 'utf8'))
+      expect(saved).toMatchObject({ ...persisted, serverMode: 'app-bound' })
+      expect(notice).toHaveBeenCalledTimes(1)
+      const payload = JSON.parse(String(notice.mock.calls[0]?.[0])) as Record<string, unknown>
+      expect(payload).toMatchObject({
+        severity: 'info',
+        event: 'desktop_config_migrated',
+        from: 'daemon',
+        to: 'app-bound',
+      })
+      expect(String(notice.mock.calls[0]?.[0])).not.toContain(persisted.remoteToken)
+
+      await readDesktopConfig()
+      expect(notice).toHaveBeenCalledTimes(1)
+      notice.mockRestore()
     })
   })
 
@@ -150,8 +202,8 @@ describe('DesktopConfig', () => {
       const config = getDefaultDesktopConfig()
       await writeDesktopConfig(config)
 
-      const patched = await patchDesktopConfig({ serverMode: 'daemon' })
-      expect(patched.serverMode).toBe('daemon')
+      const patched = await patchDesktopConfig({ serverMode: 'app-bound' })
+      expect(patched.serverMode).toBe('app-bound')
       expect(patched.minimizeToTray).toBe(true) // preserved from default
     })
 
@@ -174,7 +226,7 @@ describe('DesktopConfig', () => {
 
       // Fire 5 concurrent patches, each setting a different field
       await Promise.all([
-        patchDesktopConfig({ serverMode: 'daemon' }),
+        patchDesktopConfig({ serverMode: 'app-bound' }),
         patchDesktopConfig({ startOnLogin: true }),
         patchDesktopConfig({ minimizeToTray: false }),
         patchDesktopConfig({ globalHotkey: 'CommandOrControl+Space' }),
@@ -183,7 +235,7 @@ describe('DesktopConfig', () => {
 
       const final = await readDesktopConfig()
       expect(final).not.toBeNull()
-      expect(final!.serverMode).toBe('daemon')
+      expect(final!.serverMode).toBe('app-bound')
       expect(final!.startOnLogin).toBe(true)
       expect(final!.minimizeToTray).toBe(false)
       expect(final!.globalHotkey).toBe('CommandOrControl+Space')
@@ -210,7 +262,7 @@ describe('DesktopConfig', () => {
       await fsp.writeFile(
         path.join(freshellDir, 'desktop.json'),
         JSON.stringify({
-          serverMode: 'daemon',
+          serverMode: 'app-bound',
           port: 8080,
           globalHotkey: 'CommandOrControl+`',
           startOnLogin: false,
@@ -318,7 +370,7 @@ describe('DesktopConfig', () => {
 
     it('rejects invalid remoteUrl', () => {
       const result = DesktopConfigSchema.safeParse({
-        serverMode: 'daemon',
+        serverMode: 'app-bound',
         remoteUrl: 'not-a-url',
       })
       expect(result.success).toBe(false)

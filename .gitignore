@@ -27,9 +27,7 @@ test-results/
 playwright-report/
 blob-report/
 # Electron build artifacts
-bundled-node/
-server-node-modules/
-server-node-modules-staging/
+electron-runtime/
 release/
 dist/wizard/
 artifacts/perf/
@@ -68,3 +66,9 @@ port/vm-bridge/outbound/
 
 # GATE-01 per-slice Playwright JSON reports (working state; committed artifact is gate01-baseline.json)
 test/e2e-browser/gate01-reports/
+
+# Distribution fixtures intentionally contain nested dist/node_modules trees.
+# Keep their tracked files visible to Git and repository tooling.
+!test/fixtures/distribution/
+!test/fixtures/distribution/**/
+!test/fixtures/distribution/**/*

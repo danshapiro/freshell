@@ -8,7 +8,6 @@ import { TestHarness } from '../helpers/test-harness.js'
 import { openPanePicker } from '../helpers/pane-picker.js'
 
 /**
- * RESTORE-MATRIX -- bulletproof-restore acceptance suite (HARNESS-02 matrix).
  *
  * Restore is the user's declared core feature. This spec covers the four
  * restore surfaces called out by the FreshCodex live-update/reload
@@ -24,9 +23,6 @@ import { openPanePicker } from '../helpers/pane-picker.js'
  *   4. EXIT SURFACING        -- a terminal that exits before/at reload never
  *                               renders silently blank (also b9e0c1a3).
  *
- * Every scenario runs against BOTH the legacy Node server and the owned Rust
- * server via the `e2eServerKind` project option (see playwright.config.ts's
- * MATRIX_SPECS), using ONLY the generic E2eServerHandle/testServer seam --
  * no server-kind-specific assertions.
  */
 
@@ -50,9 +46,8 @@ const FAKE_CODEX_APP_SERVER_SOURCE = path.resolve(
  * `ERR_MODULE_NOT_FOUND`. Re-execing node against the ORIGINAL path (still
  * inside the real project tree) avoids both problems.
  *
- * `CODEX_CMD` pointed at this wrapper's path works identically for BOTH
- * server kinds:
- *   - the legacy Node runtime (`server/coding-cli/codex-app-server/runtime.ts`)
+ * `CODEX_CMD` pointed at this wrapper's path works with the owned Rust
+ * server:
  *     spawns `CODEX_CMD` directly as the executable (no shell, no splitting) --
  *     the wrapper's own `#!/usr/bin/env node` shebang (and its +x bit) handles
  *     the rest;
@@ -159,8 +154,8 @@ test.describe('Restore Matrix', () => {
   // -------------------------------------------------------------------
   // SCENARIO 1 -- TERMINAL RESTORE (reload, then server restart)
   // -------------------------------------------------------------------
-  test('terminal survives page reload and then a full server restart', async ({ page, terminal, e2eServerKind }) => {
-    const server = await createE2eServerHandle(process.env, { kind: e2eServerKind })
+  test('terminal survives page reload and then a full server restart', async ({ page, terminal }) => {
+    const server = await createE2eServerHandle(process.env, undefined)
     const info = await server.start()
 
     try {
@@ -198,7 +193,7 @@ test.describe('Restore Matrix', () => {
       // (new terminalId), matching server-restart-recovery.spec.ts's
       // acceptance shape: no error status, a fresh terminalId is assigned. ---
       if (!server.restart) {
-        throw new Error(`${e2eServerKind} E2eServerHandle does not implement restart()`)
+        throw new Error('Owned Rust E2eServerHandle does not implement restart()')
       }
       await server.restart()
 
@@ -222,8 +217,6 @@ test.describe('Restore Matrix', () => {
   // -------------------------------------------------------------------
   // SCENARIO 2 -- FRESH-AGENT RESTORE (reload never abandons the session)
   // -------------------------------------------------------------------
-  // ROOT-CAUSE FINDING (control run against the FROZEN legacy client,
-  // `--project=legacy-chromium`): FreshCodex's real reload-restore contract
   // is NOT "attach only, never create" -- it is CREATE-WITH-RESUME. The
   // frozen client's persisted pane state deliberately does not carry a live
   // `sessionId` across a full page reload (only `sessionRef`/
@@ -233,7 +226,6 @@ test.describe('Restore Matrix', () => {
   // the ORIGINAL durable session. Only once the resulting `freshAgent.created`
   // response repopulates `sessionId` does the attach-effect fire a
   // `freshAgent.attach` for the same id. Captured wire sequence on
-  // `legacy-chromium` (debug capture, since removed): `hello` ->
   // `freshAgent.create` (`resumeSessionId`/`sessionRef` == original session)
   // -> `freshAgent.attach` (`sessionId` == original session) -- and the UI
   // evidence (`error-context.md` screenshot from the earlier failing run)
@@ -241,7 +233,6 @@ test.describe('Restore Matrix', () => {
   // is a genuinely-working restore path, just not an attach-only one -- so
   // the original "no freshAgent.create at all after reload" assertion tested
   // an implementation detail that doesn't match the frozen client's real
-  // contract, not a regression. Confirmed byte-identical on `rust-chromium`
   // (same 3-message sequence, same resume-target correctness). The scenario
   // now asserts the CONTRACT that actually matters -- any `freshAgent.create`
   // sent after reload must target the ORIGINAL session (never mint an
@@ -252,13 +243,12 @@ test.describe('Restore Matrix', () => {
   // lives inside a SPLIT once created via the picker, so `layout.content`
   // alone is the wrong read -- and the missing `persist/flushNow` before
   // reload).
-  test('FreshCodex reload rehydrates the same session instead of creating a new one', async ({ page, e2eServerKind }) => {
+  test('FreshCodex reload rehydrates the same session instead of creating a new one', async ({ page }) => {
     const sharedRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'freshell-restore-matrix-codex-'))
     try {
       const fakeCodexPath = await installFakeCodexAppServer(path.join(sharedRoot, 'bin'))
 
       const server = await createE2eServerHandle(process.env, {
-        kind: e2eServerKind,
         construct: {
           env: { CODEX_CMD: fakeCodexPath },
           // Fresh-agent creation is gated SERVER-side (ws-handler.ts checks
@@ -432,7 +422,6 @@ test.describe('Restore Matrix', () => {
   // SCENARIO 3 -- HISTORICAL SESSION OPEN (sidebar -> tab, real pane title)
   // -------------------------------------------------------------------
   // ROOT-CAUSE FINDING (spec bug, not a product defect -- confirmed via the
-  // FROZEN server's own filtering logic, identical on both server kinds):
   // `server/coding-cli/providers/claude.ts`'s `parseClaudeSession` marks a
   // session `isNonInteractive: true` whenever `userMessageCount <= 1`
   // (single request/reply pair = "headless dispatch or abandoned session",
@@ -445,13 +434,12 @@ test.describe('Restore Matrix', () => {
   // turn, so the seeded session was silently excluded from the sidebar's
   // result set -- zero items renders the "No sessions yet" empty state
   // (no `sidebar-session-list` testid), which is exactly the observed
-  // symptom ("element(s) not found" after 30s). `session-directory-matrix.spec.ts`
   // seeds TWO user/assistant turns per session via its `buildSessionJsonl`
   // helper, which is why its otherwise-identical JSONL shape is discovered
   // and rendered. Fix: seed two turns here too (matching that helper's
   // shape) so the session is genuinely interactive and passes the server's
   // own (correct, intentional) filter -- no server/client code changed.
-  test('opening a seeded historical session from the sidebar gets a real pane title and non-blank content', async ({ page, e2eServerKind }) => {
+  test('opening a seeded historical session from the sidebar gets a real pane title and non-blank content', async ({ page }) => {
     const SESSION_ID = '00000000-0000-4000-8000-0000000c3333'
     const SESSION_TITLE = 'restore-matrix historical session'
 
@@ -459,7 +447,6 @@ test.describe('Restore Matrix', () => {
     const fakeClaudePath = await installFakeClaudeCli(path.join(sharedRoot, 'bin'))
 
     const server = await createE2eServerHandle(process.env, {
-      kind: e2eServerKind,
       construct: {
         // Resuming this seeded session spawns the terminal-mode `claude`
         // provider (`server/terminal-registry.ts`'s `CLAUDE_CMD` override),
@@ -631,7 +618,7 @@ test.describe('Restore Matrix', () => {
   // the EXISTING tab is focused (becomes active) and the tab count does
   // NOT increase (no duplicate tab created).  This is the `findTabIdForSession`
   // dedup path in `src/store/tabsSlice.ts`'s `openSessionTab` action.
-  test('SESSION-10: re-clicking a running session from the sidebar focuses the existing tab instead of creating a duplicate', async ({ page, e2eServerKind }) => {
+  test('SESSION-10: re-clicking a running session from the sidebar focuses the existing tab instead of creating a duplicate', async ({ page }) => {
     const SESSION_ID = '00000000-0000-4000-8000-0000000d4444'
     const SESSION_TITLE = 'SESSION-10 dedup reuse historical session'
 
@@ -639,7 +626,6 @@ test.describe('Restore Matrix', () => {
     const fakeClaudePath = await installFakeClaudeCli(path.join(sharedRoot, 'bin'))
 
     const server = await createE2eServerHandle(process.env, {
-      kind: e2eServerKind,
       construct: {
         env: { CLAUDE_CMD: fakeClaudePath },
         setupHome: async (homeDir) => {
@@ -825,8 +811,8 @@ test.describe('Restore Matrix', () => {
   // -------------------------------------------------------------------
   // SCENARIO 4 -- EXIT SURFACING (never silently blank after mid-life exit)
   // -------------------------------------------------------------------
-  test('a terminal that exits before reload surfaces its exited state instead of rendering blank', async ({ page, terminal, e2eServerKind }) => {
-    const server = await createE2eServerHandle(process.env, { kind: e2eServerKind })
+  test('a terminal that exits before reload surfaces its exited state instead of rendering blank', async ({ page, terminal }) => {
+    const server = await createE2eServerHandle(process.env, undefined)
     const info = await server.start()
 
     try {
@@ -913,15 +899,13 @@ test.describe('Restore Matrix', () => {
   // `Compacting` variant). That bit could lag the app-server's actual
   // freshly-read thread status, permanently wedging the composer read-only
   // after the first live turn completed. Fixed to compute `is_running`
-  // PURELY from the freshly-read thread status, matching the legacy
   // adapter's `normalizeCodexThreadSnapshot` exactly (see
   // `get_snapshot_is_sendable_once_thread_status_is_idle_even_if_active_turn_is_stale`
   // in `codex.rs` for the regression test).
-  test('FreshCodex targets the same durable thread with no duplicate conversation after a full server restart', async ({ page, e2eServerKind }) => {
+  test('FreshCodex targets the same durable thread with no duplicate conversation after a full server restart', async ({ page }) => {
     const sharedRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'freshell-restore-matrix-codex-restart-'))
     try {
       const fakeCodexPath = await installFakeCodexAppServer(path.join(sharedRoot, 'bin'))
-      // TERM-02 "disable unsupported app behavior": both server kinds splice
       // the SAME managed-remote-connection config flag into every codex
       // app-server launch (`server/coding-cli/codex-managed-config.ts`'s
       // `CODEX_MANAGED_REMOTE_CONFIG_ARGS`, mirrored 1:1 by
@@ -933,7 +917,6 @@ test.describe('Restore Matrix', () => {
       const argLogPath = path.join(sharedRoot, 'codex-arg-log.json')
 
       const server = await createE2eServerHandle(process.env, {
-        kind: e2eServerKind,
         construct: {
           env: {
             CODEX_CMD: fakeCodexPath,
@@ -1010,7 +993,6 @@ test.describe('Restore Matrix', () => {
         // remote connection's config flag was genuinely present in the argv
         // the spawned codex process received (recorded by the fixture via
         // `FAKE_CODEX_APP_SERVER_ARG_LOG` above), not merely present in the
-        // server's source code. Both server kinds pass the SAME flag pair
         // immediately, so this is server-kind-agnostic.
         const recordedArgv: string[] = await expect.poll(async () => {
           const raw = await fs.readFile(argLogPath, 'utf8').catch(() => null)
@@ -1066,7 +1048,7 @@ test.describe('Restore Matrix', () => {
         // --- FULL SERVER RESTART (not a client reload): the fake app-server
         // child is a descendant of the server process and dies with it. ---
         if (!server.restart) {
-          throw new Error(`${e2eServerKind} E2eServerHandle does not implement restart()`)
+          throw new Error('Owned Rust E2eServerHandle does not implement restart()')
         }
         await server.restart()
 
@@ -1138,13 +1120,12 @@ test.describe('Restore Matrix', () => {
   // -- i.e., exactly mid-turn, while the pane is still busy waiting for a
   // completion it will now never receive from that process. This is
   // configuration (an env var this spec sets), not a fixture code change.
-  test('a crashed Codex provider process is recovered mid-turn with no chime, and the same durable session continues', async ({ page, e2eServerKind }) => {
+  test('a crashed Codex provider process is recovered mid-turn with no chime, and the same durable session continues', async ({ page }) => {
     const sharedRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'freshell-restore-matrix-codex-crash-'))
     try {
       const fakeCodexPath = await installFakeCodexAppServer(path.join(sharedRoot, 'bin'))
 
       const server = await createE2eServerHandle(process.env, {
-        kind: e2eServerKind,
         construct: {
           env: {
             CODEX_CMD: fakeCodexPath,
@@ -1387,13 +1368,12 @@ test.describe('Restore Matrix', () => {
   // SCENARIO 5's own already-established, proven-reliable per-turn-visible-
   // at-send-time pattern exactly, just repeated a third time and backed by
   // an explicit wire-level count assertion.
-  test('three sequential live Codex turns are each independently sent, visible at send time, and settle to idle', async ({ page, e2eServerKind }) => {
+  test('three sequential live Codex turns are each independently sent, visible at send time, and settle to idle', async ({ page }) => {
     const sharedRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'freshell-restore-matrix-codex-3turns-'))
     try {
       const fakeCodexPath = await installFakeCodexAppServer(path.join(sharedRoot, 'bin'))
 
       const server = await createE2eServerHandle(process.env, {
-        kind: e2eServerKind,
         construct: {
           env: { CODEX_CMD: fakeCodexPath },
           setupHome: async (homeDir) => {
@@ -1506,13 +1486,12 @@ test.describe('Restore Matrix', () => {
   // and the sidecar still pushes the eventual completion once it arrives.
   // That is exactly the "resumed streaming" contract this leg needs to
   // prove, distinct from SCENARIO 5's "restart AFTER completion" leg.
-  test('reloading the page mid-turn recovers the same durable session and the interrupted turn completes after reconnect', async ({ page, e2eServerKind }) => {
+  test('reloading the page mid-turn recovers the same durable session and the interrupted turn completes after reconnect', async ({ page }) => {
     const sharedRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'freshell-restore-matrix-codex-midturn-reload-'))
     try {
       const fakeCodexPath = await installFakeCodexAppServer(path.join(sharedRoot, 'bin'))
 
       const server = await createE2eServerHandle(process.env, {
-        kind: e2eServerKind,
         construct: {
           env: {
             CODEX_CMD: fakeCodexPath,
@@ -1701,7 +1680,6 @@ test.describe('Restore Matrix', () => {
   // against `undefined` and could never pass anywhere. With the capture
   // fixed (see below), the pane-level contract — the durable identity stays
   // 'thread-A', thread-B is never rendered or adopted — empirically holds on
-  // BOTH server kinds, so the pin is removed.
   //
   // What each side actually guarantees underneath:
   //   - RUST (`crates/freshell-freshagent/src/codex.rs`): a wrong-thread
@@ -1710,20 +1688,18 @@ test.describe('Restore Matrix', () => {
   //     sidecar is torn down, an explicit error frame is emitted, and the
   //     wrong id is never adopted. Unit pins: the `*_wrong_thread_id_*`
   //     tests in that file.
-  //   - LEGACY (frozen `server/codex/adapter.ts` ~L843-868): no internal
   //     guard — the adapter silently keeps talking to whatever thread the
   //     app-server returned. That defect is NOT observable at this UI level
   //     (the pane still displays 'thread-A'), and `server/` is frozen, so it
   //     is documented here rather than fixed.
   // -------------------------------------------------------------------
-  test('TERM-25: wrong-thread Codex recovery is rejected, not silently adopted', async ({ page, e2eServerKind }) => {
+  test('TERM-25: wrong-thread Codex recovery is rejected, not silently adopted', async ({ page }) => {
 
     const sharedRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'freshell-restore-matrix-term25-'))
     try {
       const fakeCodexPath = await installFakeCodexAppServer(path.join(sharedRoot, 'bin'))
 
       const server = await createE2eServerHandle(process.env, {
-        kind: e2eServerKind,
         construct: {
           env: {
             CODEX_CMD: fakeCodexPath,
@@ -1813,7 +1789,6 @@ test.describe('Restore Matrix', () => {
         // RUST: passes — the server rejects the wrong-thread answer loudly
         // (sidecar torn down, error frame emitted, wrong id never adopted),
         // so the pane's durable identity stays 'thread-A'.
-        // LEGACY: fails (expected-fail pinned above) — the frozen adapter
         // adopts the returned thread id without validation.
         await expect.poll(async () => {
           const layout = await harness.getPaneLayout(tabId!)

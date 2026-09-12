@@ -18,7 +18,7 @@ const CLAUDE_SETTINGS_WIN: &str = r#"{"hooks":{"SessionStart":[{"hooks":[{"type"
 const MCP_UNIX: &[&str] = &[
     "--import",
     "/repo/node_modules/tsx/dist/loader.mjs",
-    "/repo/server/mcp/server.ts",
+    "/repo/tools/freshell-mcp/server.ts",
 ];
 
 struct MapEnv(BTreeMap<String, String>);
@@ -283,7 +283,7 @@ fn g_x1_codex_live_fresh() {
             "-c".to_string(),
             r#"mcp_servers.freshell.command="node""#.to_string(),
             "-c".to_string(),
-            r#"mcp_servers.freshell.args=["--import", "/repo/node_modules/tsx/dist/loader.mjs", "/repo/server/mcp/server.ts"]"#.to_string(),
+            r#"mcp_servers.freshell.args=["--import", "/repo/node_modules/tsx/dist/loader.mjs", "/repo/tools/freshell-mcp/server.ts"]"#.to_string(),
         ]
     );
     assert!(launch.env.is_empty()); // folded from retired G-X0 (S5.e)
@@ -330,7 +330,7 @@ fn g_x3_codex_no_app_server_model_sandbox() {
             "-c".to_string(),
             r#"mcp_servers.freshell.command="node""#.to_string(),
             "-c".to_string(),
-            r#"mcp_servers.freshell.args=["--import", "/repo/node_modules/tsx/dist/loader.mjs", "/repo/server/mcp/server.ts"]"#.to_string(),
+            r#"mcp_servers.freshell.args=["--import", "/repo/node_modules/tsx/dist/loader.mjs", "/repo/tools/freshell-mcp/server.ts"]"#.to_string(),
             "--model".to_string(),
             "gpt-5.1-codex".to_string(),
             "--sandbox".to_string(),

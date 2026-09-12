@@ -1,25 +1,21 @@
 //! **Batch-framing fidelity test** — the acceptance gate for the deferred 3.3b work
 //! (`terminal.output.batch`).
 //!
-//! The live-wire batch SEGMENT structure is chunk-nondeterministic (node-pty read
-//! boundaries + flush timing vary the frame set boot-to-boot — proven empirically), so
-//! the byte-exact original-vs-rust proof cannot be a live capture. Instead it is done
-//! HERE, over FIXED frame sequences, against goldens generated from the ORIGINAL's own
-//! source-of-truth logic (`port/oracle/baselines/batch/generate-batch-goldens.ts`
-//! imports `createTerminalOutputBarrierScanner` + `buildTerminalOutputBatches` +
-//! `measureTerminalOutputPayloadBytes`).
+//! The live-wire batch segment structure is chunk-nondeterministic (PTY read
+//! boundaries + flush timing vary the frame set boot-to-boot), so the byte-exact
+//! proof is done HERE, over fixed frame sequences, against frozen migration goldens.
 //!
 //! For every committed scenario this test:
 //!   1. verifies the golden file's own sha256 (committed-golden integrity);
 //!   2. reconstructs the scenario's fragments, classifies them with the Rust
-//!      [`BarrierScanner`], builds batches + the wire projection with the SAME ids and
-//!      budgets the generator used;
+//!      [`BarrierScanner`], builds batches + the wire projection with the same ids and
+//!      budgets captured in the frozen fixture;
 //!   3. asserts the Rust wire payloads are **byte-identical** (canonical sorted-key
 //!      JSON) to the golden payloads — every `endOffset` (UTF-16 code units),
 //!      `rawFrameCount`, `barrier` reason, `data`, and `serializedBytes`.
 //!
-//! A mismatch is a REAL fidelity failure (prints the first differing payload); it never
-//! rewrites the golden. This is the deterministic ORIGINAL≡RUST batch-framing proof.
+//! A mismatch is a real fidelity failure (prints the first differing payload); it never
+//! rewrites the golden. This is the deterministic Rust batch-framing proof.
 
 use std::path::PathBuf;
 
@@ -45,8 +41,8 @@ fn sha256_hex(bytes: &[u8]) -> String {
     h.finalize().iter().map(|b| format!("{b:02x}")).collect()
 }
 
-/// Recursively sort object keys → a stable canonical string form (matches the
-/// generator's `sortKeys` + `JSON.stringify`), so the comparison is byte-exact and
+/// Recursively sort object keys → a stable canonical string form matching the
+/// fixture's canonical JSON, so the comparison is byte-exact and
 /// order-independent regardless of serde_json's `preserve_order`.
 fn canonical(value: &Value) -> String {
     fn sort(v: &Value) -> Value {
@@ -67,8 +63,8 @@ fn canonical(value: &Value) -> String {
     serde_json::to_string(&sort(value)).expect("serialize canonical json")
 }
 
-/// The generator's `classifyFrames` (`replay-ring.ts:62-79`): run each fragment through
-/// one persistent scanner, seqs 1..N, one frame per fragment.
+/// Reconstruct each frozen fixture's fragments through one persistent scanner,
+/// with seqs 1..N and one frame per fragment.
 fn classify(fragments: &[String], stream_id: &str) -> Vec<BatchInputFrame> {
     let mut scanner = BarrierScanner::new();
     fragments
@@ -128,7 +124,7 @@ fn reproduce(golden: &Value) -> Vec<Value> {
     out
 }
 
-/// Every committed batch golden (kept in lockstep with the generator's SCENARIOS).
+/// Every committed batch golden retained as frozen migration provenance.
 const SCENARIOS: &[&str] = &[
     "single-ground",
     "multi-merge",
@@ -179,7 +175,7 @@ fn rust_batch_framing_reproduces_every_committed_golden_byte_for_byte() {
             let ce = canonical(e);
             assert_eq!(
                 ca, ce,
-                "[{name}] payload[{i}] diverged from the ORIGINAL-derived golden.\n  rust  : {ca}\n  golden: {ce}"
+                "[{name}] payload[{i}] diverged from the frozen golden.\n  rust  : {ca}\n  golden: {ce}"
             );
         }
         checked += 1;

@@ -1,5 +1,5 @@
 {
-  "//": "CFG-01 item-scoped typecheck gate. The repo-owned typecheck configs (tsconfig.json / tsconfig.server.json) deliberately exclude test/, so this config gives the lossless-writes spec an EXECUTABLE, file-attributed gate: `npx tsc -p test/e2e-browser/tsconfig.cfg01-check.json`, then require zero error lines attributed to the CFG-01 spec file. Errors in pre-existing dependency files (e.g. helpers/fixtures.ts's worker-scope tuple typing) reproduce identically on the base commit and are out of scope. Mirrors the TERM-04/HARNESS-05 convention (tsconfig.term04-check.json / tsconfig.raw-clients-check.json). See docs/plans/df1-evidence/CFG-01.md.",
+  "//": "CFG-01 item-scoped typecheck gate. The repo-owned typecheck configs (tsconfig.json) deliberately exclude test/, so this config gives the lossless-writes spec an EXECUTABLE, file-attributed gate: `npx tsc -p test/e2e-browser/tsconfig.cfg01-check.json`, then require zero error lines attributed to the CFG-01 spec file. Errors in pre-existing dependency files (e.g. helpers/fixtures.ts's worker-scope tuple typing) reproduce identically on the base commit and are out of scope. Mirrors the TERM-04/HARNESS-05 convention (tsconfig.term04-check.json / tsconfig.raw-clients-check.json). See docs/plans/df1-evidence/CFG-01.md.",
   "extends": "../../tsconfig.json",
   "compilerOptions": {
     "noEmit": true,

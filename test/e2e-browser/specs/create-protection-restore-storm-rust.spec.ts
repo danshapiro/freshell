@@ -24,7 +24,8 @@
 import fs from 'node:fs/promises'
 import path from 'node:path'
 import { test, expect } from '../helpers/fixtures.js'
-import { RustServer, type TestServerInfo } from '../helpers/rust-server.js'
+import { RustServer } from '../helpers/rust-server.js'
+import type { E2eServerInfo } from '../helpers/server-fixture-support.js'
 import { TestHarness } from '../helpers/test-harness.js'
 import type { Page } from '@playwright/test'
 
@@ -83,8 +84,7 @@ async function allLeafTerminalIds(harness: TestHarness): Promise<(string | null)
 test.describe('Create protection: restore storm (Rust only)', () => {
   test.setTimeout(300_000)
 
-  test('15-pane reload storm survives abrupt restart: limiter fires, ladder recovers all panes', async ({ page, e2eServerKind }) => {
-    expect(e2eServerKind).toBe('rust')
+  test('15-pane reload storm survives abrupt restart: limiter fires, ladder recovers all panes', async ({ page }) => {
     const server = new RustServer({
       // An inherited RUST_LOG=error would suppress the WARN events this spec
       // greps for (the fixture spreads process.env) — pin it.
@@ -104,7 +104,7 @@ test.describe('Create protection: restore storm (Rust only)', () => {
         }, null, 2))
       },
     })
-    const info: TestServerInfo = await server.start()
+    const info: E2eServerInfo = await server.start()
     try {
       // Belt-and-suspenders: the seed actually took (converts a silent
       // settings-tree fallback into a crisp failure here).

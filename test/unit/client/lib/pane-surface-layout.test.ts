@@ -53,4 +53,3 @@ describe('pane surface layout',()=>{
     expect(next.__proto__.measurable).toBe(true)
   })
 })
-

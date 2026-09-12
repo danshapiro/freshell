@@ -4,7 +4,8 @@
  * which requires a single React instance (problematic in git worktrees).
  */
 
-export type ServerMode = 'daemon' | 'app-bound' | 'remote'
+export const SERVER_MODES = ['app-bound', 'remote'] as const
+export type ServerMode = typeof SERVER_MODES[number]
 
 export interface WizardConfig {
   serverMode: ServerMode
@@ -60,7 +61,7 @@ export function canAdvance(
     if (serverMode === 'remote') {
       return validateUrl(remoteUrl)
     }
-    if (serverMode === 'daemon' || serverMode === 'app-bound') {
+    if (serverMode === 'app-bound') {
       return validatePort(port)
     }
   }

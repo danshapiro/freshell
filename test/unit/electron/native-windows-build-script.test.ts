@@ -10,10 +10,10 @@ describe('native Windows Electron build guard', () => {
     expect(checkNativeWindowsBuildPlatform('win32')).toEqual({ ok: true })
   })
 
-  it('blocks non-Windows builds because node-pty must be compiled natively', () => {
+  it('blocks non-Windows builds because the Rust server must be built natively', () => {
     expect(checkNativeWindowsBuildPlatform('linux')).toEqual({
       ok: false,
-      message: 'electron:build:win must run on native Windows so node-pty is compiled for win32.',
+      message: 'electron:build:win must run on native Windows so the Rust server is built for win32.',
     })
   })
 

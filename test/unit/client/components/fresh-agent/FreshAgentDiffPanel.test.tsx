@@ -1,13 +1,17 @@
-import { describe, expect, it } from 'vitest'
-import { render, screen } from '@testing-library/react'
+import { afterEach, describe, expect, it } from 'vitest'
+import { cleanup, render, screen } from '@testing-library/react'
 import { FreshAgentDiffPanel } from '@/components/fresh-agent/FreshAgentDiffPanel'
 import DiffView from '@/components/fresh-agent/shared/DiffView'
 
 describe('FreshAgentDiffPanel', () => {
+  afterEach(() => cleanup())
+
   it('renders diff entries', () => {
     render(<FreshAgentDiffPanel diffs={[{ id: 'diff-1', title: 'src/app.tsx' }]} />)
     expect(screen.getByText('Diffs')).toBeInTheDocument()
-    expect(screen.getByRole('button', { name: 'Diff: src/app.tsx' })).toBeInTheDocument()
+    expect(screen.getByText('src/app.tsx')).toBeInTheDocument()
+    expect(screen.getByText('Full diff loading is unavailable.')).toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: /Diff:/ })).toBeNull()
   })
 
   it('renders the shared diff view with data-file-path copy target metadata', () => {

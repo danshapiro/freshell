@@ -28,20 +28,14 @@ export interface MenuItemTemplate {
   click?: () => void
 }
 
-export interface TrayAppearance {
-  /** Tooltip override; defaults to 'Freshell'. */
-  tooltip?: string
-}
-
 export function createTray(
   TrayConstructor: TrayApi,
   Menu: MenuApi,
   iconPath: string,
   options: TrayOptions,
-  appearance: TrayAppearance = {},
 ): TrayInstance {
   const tray = new TrayConstructor(iconPath)
-  tray.setToolTip(appearance.tooltip ?? 'Freshell')
+  tray.setToolTip('Freshell')
 
   const buildMenu = async () => {
     const status = await options.getServerStatus()

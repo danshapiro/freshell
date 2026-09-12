@@ -13,7 +13,7 @@ import { fileURLToPath } from 'node:url'
  * over stdin/stdout, no `Content-Length` framing (unlike LSP). Deliberately
  * NOT built on the SDK's own `Client`/`StdioClientTransport` -- this hand-rolls
  * the raw wire contract so a regression in the SERVER's framing (e.g. an
- * accidental `console.log` corrupting the stdio channel, which `server/mcp/server.ts`'s
+ * accidental `console.log` corrupting the stdio channel, which the MCP entrypoint's
  * own doc comment calls out as the one hard rule) is caught even if the SDK's
  * client-side transport were ever to compensate for malformed output.
  */
@@ -33,27 +33,23 @@ function findRepoRootFrom(startDir: string): string {
 /** Absolute path to this worktree's repo root (ported pattern from `rust-server.ts`). */
 export const REPO_ROOT = findRepoRootFrom(__dirname)
 
-/** Absolute path of the built (frozen-source) MCP stdio binary. */
+/** Absolute path of the built standalone MCP stdio binary. */
 export function mcpServerBinPath(root: string = REPO_ROOT): string {
-  return path.join(root, 'dist', 'server', 'mcp', 'server.js')
+  return path.join(root, 'dist', 'tools', 'freshell-mcp', 'server.js')
 }
 
 /**
- * Ensure `dist/server/mcp/server.js` (built from the FROZEN `server/mcp/`
- * source -- consumed here, never edited) exists and is current, by running
- * `npm run build:server` (`tsc -p tsconfig.server.json`). That project has
- * `incremental: true` with a committed `tsBuildInfo` cache
- * (`node_modules/.cache/tsconfig.server.tsbuildinfo`), so it is safe and fast
- * to run UNCONDITIONALLY on every call rather than hand-rolling mtime-staleness
- * detection across the whole frozen `server/` + `shared/` tree: an unchanged
- * tree is a near-instant no-op, and a changed one gets a real (still
- * incremental) rebuild. Returns the elapsed build time in ms so callers can
- * log it.
+ * Ensure `dist/tools/freshell-mcp/server.js` exists and is current by running
+ * `npm run build:tools` (`tsc -p tsconfig.tools.json`). Running the build
+ * unconditionally keeps the generated client current when source files or
+ * dependencies changed, without relying on hand-rolled mtime checks across
+ * the tooling and shared trees. Returns the elapsed build time in ms so
+ * callers can log it.
  */
 export function ensureMcpServerBuilt(root: string = REPO_ROOT): { path: string; buildMs: number } {
   const bin = mcpServerBinPath(root)
   const start = Date.now()
-  const result = spawnSync('npm', ['run', 'build:server'], {
+  const result = spawnSync('npm', ['run', 'build:tools'], {
     cwd: root,
     stdio: 'pipe',
     encoding: 'utf8',
@@ -61,13 +57,13 @@ export function ensureMcpServerBuilt(root: string = REPO_ROOT): { path: string; 
   const buildMs = Date.now() - start
   if (result.status !== 0) {
     throw new Error(
-      `npm run build:server failed (exit ${result.status ?? 'signal ' + result.signal}); ` +
-      `cannot boot the MCP bridge fixture without a current dist/server/mcp/server.js.\n` +
+      `npm run build:tools failed (exit ${result.status ?? 'signal ' + result.signal}); ` +
+      `cannot boot the MCP bridge fixture without a current dist/tools/freshell-mcp/server.js.\n` +
       `stdout:\n${result.stdout}\nstderr:\n${result.stderr}`,
     )
   }
   if (!fs.existsSync(bin)) {
-    throw new Error(`npm run build:server completed but ${bin} is still missing.`)
+    throw new Error(`npm run build:tools completed but ${bin} is still missing.`)
   }
   return { path: bin, buildMs }
 }
@@ -156,7 +152,7 @@ export class McpStdioClient {
       message = JSON.parse(line)
     } catch (error) {
       // A non-JSON line on stdout is itself a protocol violation -- the
-      // "no console.log" rule in `server/mcp/server.ts` exists precisely to
+      // The MCP entrypoint's "no console.log" rule exists precisely to
       // prevent this. Surface it loudly instead of silently dropping it.
       throw new Error(
         `MCP server wrote a non-JSON line to stdout (stdio channel corruption): ${JSON.stringify(line)}\n` +
@@ -217,7 +213,7 @@ export class McpStdioClient {
 
   /**
    * Call the single `freshell` tool with `{action, params}` and unwrap the
-   * `content[0].text` payload. `server/mcp/server.ts`'s tool handler always
+   * `content[0].text` payload. The MCP tool handler always
    * `JSON.stringify()`s the raw action result -- even when that result is
    * itself a plain string (e.g. `capture-pane`'s scrollback text) -- so
    * `JSON.parse`ing it back here recovers the original value in both cases.

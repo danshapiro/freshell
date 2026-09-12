@@ -12,7 +12,7 @@ type ParsedArgs = {
   outputPath: string
 }
 
-const PRODUCTION_ROOTS = ['shared', 'server', 'src'] as const
+const PRODUCTION_ROOTS = ['shared', 'src'] as const
 const SOURCE_EXTENSIONS = new Set(['.ts', '.tsx', '.js', '.jsx', '.mjs', '.cjs'])
 
 function requireValue(flag: string, value: string | undefined): string {

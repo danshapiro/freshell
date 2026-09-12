@@ -6,14 +6,10 @@ import { createE2eServerHandle } from '../helpers/external-target.js'
 const BROWSER_PREFERENCES_STORAGE_KEY = 'freshell.browser-preferences.v1'
 
 // Routed through the generalized E2eServerHandle seam (HARNESS-02) so this
-// SAME spec exercises the legacy Node server or the owned Rust server
-// depending on the active project's `e2eServerKind` option. `setupHome` is
-// part of the construction-options surface shared by both `TestServer` and
-// `RustServer`.
+// part of the owned Rust fixture's construction-options surface.
 const test = base.extend({
-  testServer: [async ({ e2eServerKind }, use) => {
+  testServer: [async ({}, use) => {
     const server = await createE2eServerHandle(process.env, {
-      kind: e2eServerKind,
       construct: {
         setupHome: async (homeDir) => {
           const freshellDir = path.join(homeDir, '.freshell')
@@ -72,31 +68,25 @@ async function getBrowserPreferences(page: any) {
 
 test.describe('Settings Persistence Split', () => {
   // HARNESS-02 Finding 2 -- the seed half of this scenario depends on
-  // `legacyLocalSettingsSeed` (seeded into `.freshell/config.json` by this
   // file's `testServer` override above and asserted back out of the
   // persisted config at the end of each test) round-tripping through the
   // server's settings-load path.
-  // HISTORY: the Rust server originally lacked `legacyLocalSettingsSeed`
   // entirely, AND did not surface a PATCHed server-shared `defaultCwd`
   // through its WS/bootstrap settings resolution -- this spec's rust leg
   // carried a committed describe-wide `test.fail` citing CFG-04/SESSION-13
   // for both gaps together. CFG-04 (df1, merge b6aa86d79) ported the seed
   // extraction/merge/persist/bootstrap-return into the Rust server
-  // (`crates/freshell-server/src/legacy_local_seed.rs` + `settings_store.rs`
   // + `boot.rs`) and flipped the whole leg to expected-pass, which exposed
   // the still-open second gap. This spec therefore splits its expectations
   // per-test (Playwright's `test.fail` granularity is per `test(...)`):
-  //   - seed/browser-local test below: expected-PASS on BOTH projects (the
   //     deeper one-shot-consumption acceptance lives in
-  //     `cfg04-legacy-browser-seed.spec.ts`; triage entry point for a seed
   //     regression is docs/plans/df1-evidence/CFG-04.md);
   //   - defaultCwd replication test at the bottom: expected-PASS on BOTH
-  //     projects. This was pinned `test.fail` on `rust-chromium` with owner
   //     CFG-12; CFG-12 (df1) then made the rust `/ws` connect handshake
   //     resolve the LIVE settings store per connection
   //     (`crates/freshell-ws/src/lib.rs` `WsState::handshake_settings` +
-  //     `SettingsStore::shared_settings_lock()`, mirroring the original's
-  //     per-connection `handshakeSnapshotProvider`, `server/index.ts:415-427`)
+  //     `SettingsStore::shared_settings_lock()`, preserving the
+  //     per-connection live-settings handshake contract.
   //     and the pin was deleted; triage entry point for a replication
   //     regression is docs/plans/df1-evidence/CFG-12.md.
   test('browser-local settings stay local across isolated profiles and reloads', async ({ browser, serverInfo }) => {

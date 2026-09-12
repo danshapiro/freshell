@@ -1,10 +1,11 @@
 import type { Page } from '@playwright/test'
 import { test, expect } from '../helpers/fixtures.js'
+import { FRESHCODEX_DEFAULT_MODEL } from '@shared/fresh-agent-models.js'
 
 async function installPane(page: Page, provider: 'claude' | 'codex') {
   const sessionType = provider === 'claude' ? 'freshclaude' : 'freshcodex'
   const sessionId = 'd4430000-0000-4444-8444-000000000001'
-  const model = provider === 'claude' ? 'opus[1m]' : 'gpt-6-astra'
+  const model = provider === 'claude' ? 'opus[1m]' : FRESHCODEX_DEFAULT_MODEL
   await page.route('**/api/fresh-agent/threads/**', (route) => route.fulfill({
     json: {
       sessionType, provider, sessionId, threadId: sessionId,

@@ -11,7 +11,7 @@ import {
   resolveGitCommonDir,
   resolveGitRepoRoot,
   resolveInvocationCwd,
-} from '../../server/coding-cli/utils.js'
+} from './repo-context.js'
 import {
   classifyCommand,
   COMMAND_KEYS,

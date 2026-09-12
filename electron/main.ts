@@ -5,7 +5,6 @@
 export interface ElectronApp {
   whenReady(): Promise<void>
   on(event: string, callback: (...args: any[]) => void): void
-  listenerCount(event: string): number
   quit(): void
   requestSingleInstanceLock(): boolean
 }
@@ -18,32 +17,20 @@ export interface MainProcessDeps {
   platform: NodeJS.Platform
 }
 
-/**
- * Acquire the single-instance lock for this process's userData dir. When
- * entry.ts has namespaced userData per profile, each profile holds its own
- * lock. Call BEFORE any boot side effects (provisioning, server spawn).
- * Returns true when the lock is held; on failure the app quits and this
- * returns false. `onDenied` (optional) runs immediately BEFORE app.quit() —
- * entry.ts uses it to lift the wizard-phase `will-quit` veto for the denied
- * duplicate, which never enters the wizard.
- */
-export function acquireInstanceLock(app: ElectronApp, onDenied?: () => void): boolean {
+export async function initMainProcess(deps: MainProcessDeps): Promise<void> {
+  const { app, minimizeToTray } = deps
+
+  // Single-instance lock
   const gotLock = app.requestSingleInstanceLock()
   if (!gotLock) {
-    onDenied?.()
     app.quit()
-    return false
+    return
   }
-  return true
-}
 
-export async function initMainProcess(deps: MainProcessDeps): Promise<void> {
-  // The caller must hold the instance lock already (see acquireInstanceLock)
-  // and install the canonical `second-instance` surfacing handler (entry.ts
-  // registers it right after the lock gate, covering every boot phase).
-  const { app, minimizeToTray } = deps
   let mainWindow: any = null
   let isQuitting = false
+  let quitContinuationStarted = false
+  let serverStopInProgress: Promise<void> | undefined
 
   await app.whenReady()
 
@@ -61,16 +48,67 @@ export async function initMainProcess(deps: MainProcessDeps): Promise<void> {
     })
   }
 
+  // Calling app.quit() from a before-quit listener synchronously emits
+  // before-quit again in Electron. Mark the continuation before calling it so
+  // both rejected and synchronously-throwing stopServer implementations are
+  // safe from re-entering this listener.
+  const continueQuit = () => {
+    if (quitContinuationStarted) return
+    quitContinuationStarted = true
+    app.quit()
+  }
+
+  const resumeQuitAfterServerStopFailure = (error: unknown) => {
+    serverStopInProgress = undefined
+    // Cleanup failure must not strand Electron in a half-quit state. We have
+    // already attempted the exact child; resume the quit while the
+    // structured error below preserves the failure for diagnosis.
+    console.error(JSON.stringify({
+      severity: 'error',
+      component: 'electron-main',
+      event: 'server_stop_before_quit_failed',
+      error: error instanceof Error ? error.message : String(error),
+    }))
+    continueQuit()
+  }
+
   // Cleanup on quit
-  app.on('before-quit', async () => {
+  app.on('before-quit', (event?: { preventDefault: () => void }) => {
+    // Electron does not await async event listeners. Prevent the first quit
+    // request, then explicitly resume it after the exact server child has
+    // stopped. The resumed app.quit() fires before-quit again; the guard lets
+    // that one through without stopping the server twice.
+    if (quitContinuationStarted) return
+
+    event?.preventDefault()
     isQuitting = true
-    await deps.stopServer()
+    if (serverStopInProgress) return
+
+    try {
+      serverStopInProgress = deps.stopServer()
+        .then(() => {
+          continueQuit()
+        })
+        .catch(resumeQuitAfterServerStopFailure)
+    } catch (error) {
+      resumeQuitAfterServerStopFailure(error)
+    }
   })
 
   // macOS: re-show window on activate
   app.on('activate', () => {
     if (mainWindow) {
       mainWindow.show()
+    }
+  })
+
+  // Second instance: focus existing window
+  app.on('second-instance', () => {
+    if (mainWindow) {
+      if (mainWindow.isMinimized?.()) {
+        mainWindow.restore?.()
+      }
+      mainWindow.focus?.()
     }
   })
 

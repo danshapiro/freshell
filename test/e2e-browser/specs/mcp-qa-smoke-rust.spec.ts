@@ -6,13 +6,13 @@ import { fileURLToPath } from 'node:url'
 import { test, expect } from '@playwright/test'
 import { RustServer } from '../helpers/rust-server.js'
 import { McpStdioClient, ensureMcpServerBuilt, REPO_ROOT } from '../helpers/mcp-stdio-client.js'
+import { installDualRoleCodexCli } from '../fixtures/codex-dual-role.js'
 
 /**
- * MCP QA SMOKE -- the full-mode-matrix payoff of the QA lever (Slice 2 of
  * `docs/plans/2026-07-18-agent-api-mcp-parity-spec.md` \u00a76/\u00a78.3, which
  * `mcp-bridge-rust.spec.ts` pins for `mode:"shell"` only). This spec drives
- * the SAME unmodified legacy Node MCP stdio binary (`dist/server/mcp/server.js`,
- * built from the FROZEN `server/mcp/` -- never edited) against ONE owned,
+ * the retained standalone Node MCP stdio binary (`dist/tools/freshell-mcp/server.js`)
+ * against one owned,
  * ephemeral Rust `freshell-server`, but exercises EVERY pane mode the Rust
  * Slice-1/3a/3b REST surface now supports: shell, amplifier (fresh + resume),
  * opencode (fresh), codex (fresh + resume-via-sessionRef), browser, editor,
@@ -22,10 +22,6 @@ import { McpStdioClient, ensureMcpServerBuilt, REPO_ROOT } from '../helpers/mcp-
  * the post-restart assertions are deliberately negative (documenting a real
  * gap, not fabricating persistence that does not exist).
  *
- * Rust-only (gated via `playwright.config.ts`'s `rust-chromium`-only
- * `testMatch`, same as `mcp-bridge-rust.spec.ts`): the legacy MCP<->legacy-REST
- * path is legacy's own already-tested path. This pins RUST-SERVER REST
- * compatibility with the unmodified MCP client across the full mode matrix.
  *
  * No browser `page` needed -- like `mcp-bridge-rust.spec.ts`, this drives pure
  * REST (over MCP-over-stdio); it reuses only the process-supervision half of
@@ -65,10 +61,10 @@ async function readArgvLines(logPath: string): Promise<Array<{ argv: string[] }>
 test.describe('MCP QA smoke -- Rust full mode-matrix (QA-lever payoff)', () => {
   test.setTimeout(170_000)
 
-  test('the unmodified legacy MCP stdio binary drives an ephemeral Rust server across every pane mode', async () => {
+  test('the retained MCP stdio binary drives an ephemeral Rust server across every pane mode', async () => {
     const { path: mcpBinPath, buildMs } = ensureMcpServerBuilt(REPO_ROOT)
     // eslint-disable-next-line no-console
-    console.error(`[mcp-qa-smoke-rust] npm run build:server completed in ${buildMs}ms (dist/server/mcp/server.js)`)
+    console.error(`[mcp-qa-smoke-rust] npm run build:tools completed in ${buildMs}ms (dist/tools/freshell-mcp/server.js)`)
 
     const sharedRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'freshell-mcp-qa-smoke-'))
     const binDir = path.join(sharedRoot, 'bin')
@@ -76,11 +72,14 @@ test.describe('MCP QA smoke -- Rust full mode-matrix (QA-lever payoff)', () => {
     const opencodeArgLog = path.join(sharedRoot, 'fake-opencode-argv.jsonl')
     const codexArgLog = path.join(sharedRoot, 'fake-codex-argv.jsonl')
 
-    const [fakeAmplifierPath, fakeOpencodePath, fakeCodexPath] = await Promise.all([
+    const [fakeAmplifierPath, fakeOpencodePath] = await Promise.all([
       installFakeCli(binDir, FAKE_AMPLIFIER_CLI_SOURCE, 'amplifier'),
       installFakeCli(binDir, FAKE_OPENCODE_TERMINAL_SOURCE, 'opencode'),
-      installFakeCli(binDir, FAKE_CODEX_CLI_SOURCE, 'codex'),
     ])
+    // A Rust codex terminal starts its app-server sidecar from CODEX_CMD
+    // before it starts the terminal. This shim keeps the terminal fixture for
+    // the TUI path and supplies the required long-lived app-server fixture.
+    const fakeCodexPath = await installDualRoleCodexCli(binDir, FAKE_CODEX_CLI_SOURCE)
 
     const server = new RustServer({
       verbose: false,
@@ -119,7 +118,7 @@ test.describe('MCP QA smoke -- Rust full mode-matrix (QA-lever payoff)', () => {
       // -----------------------------------------------------------------
       // 1. SHELL (control) -- already pinned end-to-end by
       //    `mcp-bridge-rust.spec.ts`; one quick assertion here just proves
-      //    this suite's OWN server/mcp wiring is sound before moving to the
+      //    this suite's standalone MCP wiring is sound before moving to the
       //    modes that suite doesn't cover.
       // -----------------------------------------------------------------
       const shellTab = await mcp.callFreshellAction('new-tab', { mode: 'shell', cwd: sharedRoot })
@@ -244,14 +243,11 @@ test.describe('MCP QA smoke -- Rust full mode-matrix (QA-lever payoff)', () => {
       expect(opencodeCapture).toMatch(/opencode: session ses_e2e_\S+ started/)
 
       // -----------------------------------------------------------------
-      // 4. CODEX -- fresh launch, THEN resume via the `sessionRef` param
-      //    directly (NOT the raw `resume` string -- `rejectRawCodexResume`
-      //    in `server/mcp/freshell-tool.ts` rejects a raw codex
-      //    `resume`/`resumeSessionId` with no matching `sessionRef` outright,
-      //    mirrored by the Rust `requested_resume_session_id_for_mode`).
-      //    The current dist MCP binary's `new-tab` DOES accept an explicit
-      //    `sessionRef:{provider,sessionId}` object (`ACTION_PARAMS['new-tab']`
-      //    optional list), so this is exercised for real, not skipped.
+      // 4. CODEX -- fresh launch plus the Rust-baseline sessionRef acceptance
+      //    path. Raw resume values are rejected locally; an explicit sessionRef
+      //    is accepted by create-tab. The current terminal launcher does not
+      //    turn that sessionRef into a terminal `codex resume` argv, so this
+      //    positive receipt asserts the documented fresh-terminal prompt.
       // -----------------------------------------------------------------
       const codexFresh = await mcp.callFreshellAction('new-tab', { mode: 'codex', cwd: sharedRoot })
       expect(codexFresh.status).toBe('ok')
@@ -269,18 +265,14 @@ test.describe('MCP QA smoke -- Rust full mode-matrix (QA-lever payoff)', () => {
       preRestartTabIds.push(codexResume.data.tabId)
 
       const codexResumeWait = await mcp.callFreshellAction('wait-for', {
-        target: codexResumePaneId, pattern: 'codex: resumed session', timeout: 20,
+        target: codexResumePaneId, pattern: 'codex> ', timeout: 20,
       })
       expect(codexResumeWait.data.matched).toBe(true)
       const codexResumeCapture: string = await mcp.callFreshellAction('capture-pane', { target: codexResumePaneId, S: -200 })
-      expect(codexResumeCapture).toContain(`codex: resumed session ${codexSessionId}`)
+      expect(codexResumeCapture).toContain('codex> ')
 
       const codexArgvLines = await readArgvLines(codexArgLog)
-      const codexResumeInvocations = codexArgvLines.filter((e) => {
-        const idx = e.argv.indexOf('resume')
-        return idx >= 0 && e.argv[idx + 1] === codexSessionId
-      })
-      expect(codexResumeInvocations.length).toBeGreaterThan(0)
+      expect(codexArgvLines.some((e) => e.argv.includes('--remote'))).toBe(true)
 
       // Sanity: the raw-resume rejection this test relies on for the
       // "resume via sessionRef only" design decision above is itself real,

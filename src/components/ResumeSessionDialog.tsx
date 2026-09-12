@@ -15,11 +15,10 @@ import {
 } from '@shared/resume-resolve-contract'
 
 const WARMING_RETRY_MS = 2000
-// Readiness can stick false FOREVER: startupState.markReady('codingCliIndexer')
-// is only called in the success .then() of the indexer start chain
-// (server/index.ts:1057) and the .catch (:1077-1079) only logs. Bound the
-// auto-retry so a failed indexer degrades to a manual-retry state instead of
-// an infinite spinner.
+// Readiness can stick false FOREVER: the indexer marks itself ready only after
+// its startup chain succeeds, while failures are logged. Bound the auto-retry
+// so a failed indexer degrades to a manual-retry state instead of an infinite
+// spinner.
 const WARMING_RETRY_LIMIT = 15 // ~30s of auto-retries
 const RESUMED_CLOSE_MS = 1500
 

@@ -6,9 +6,47 @@ import fs from 'node:fs'
 import net from 'node:net'
 import http from 'node:http'
 import { RustServer, GEMINI_STRIP_ENV_PREFIXES } from './rust-server.js'
-import { findFreePort } from './test-server.js'
+import { findFreePort } from './server-fixture-support.js'
 
 describe('RustServer.start bind-race retry', () => {
+  it('rejects a healthy non-Rust server occupying an explicitly selected port', async () => {
+    const blocker = http.createServer((req, res) => {
+      if (req.url === '/api/health') {
+        res.writeHead(200, { 'content-type': 'application/json' })
+        res.end(JSON.stringify({ ok: true }))
+        return
+      }
+      if (req.url === '/api/server-info') {
+        res.writeHead(200, { 'content-type': 'application/json' })
+        res.end(JSON.stringify({ runtime: 'node', commit: 'foreign-process' }))
+        return
+      }
+      res.writeHead(404).end()
+    })
+    const blockerSockets = new Set<import('node:net').Socket>()
+    blocker.on('connection', (socket) => {
+      blockerSockets.add(socket)
+      socket.on('close', () => blockerSockets.delete(socket))
+    })
+    await new Promise<void>((resolve, reject) => {
+      blocker.once('error', reject)
+      blocker.listen(0, '127.0.0.1', () => resolve())
+    })
+    const addr = blocker.address()
+    if (!addr || typeof addr === 'string') throw new Error('no blocker port')
+
+    // `port` forces every startup attempt through the occupied-port path;
+    // start() must reject the foreign provenance instead of accepting its
+    // otherwise healthy endpoint. This never contacts a live Freshell port.
+    const server = new RustServer({ port: addr.port })
+    try {
+      await expect(server.start()).rejects.toThrow(/runtime must be "rust"/)
+    } finally {
+      for (const socket of blockerSockets) socket.destroy()
+      await new Promise<void>((resolve) => blocker.close(() => resolve()))
+    }
+  }, 600_000)
+
   it('boots on a fresh port when the first picked port is occupied', async () => {
     // Occupy a port and hold it for the duration of the test. Track accepted
     // sockets: the health poll that hits the blocker gets aborted client-side,

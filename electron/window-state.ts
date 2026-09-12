@@ -22,10 +22,10 @@ const DEFAULTS: WindowState = {
   maximized: false,
 }
 
-export function createWindowStatePersistence(configDir?: string): WindowStatePersistence {
+export function createWindowStatePersistence(): WindowStatePersistence {
   return {
     async load(): Promise<WindowState> {
-      const config = await readDesktopConfig(configDir)
+      const config = await readDesktopConfig()
       if (!config?.windowState) {
         return { ...DEFAULTS }
       }
@@ -39,7 +39,7 @@ export function createWindowStatePersistence(configDir?: string): WindowStatePer
     },
 
     async save(state: { x: number; y: number; width: number; height: number; maximized: boolean }): Promise<void> {
-      await patchDesktopConfig({ windowState: state }, configDir)
+      await patchDesktopConfig({ windowState: state })
     },
   }
 }

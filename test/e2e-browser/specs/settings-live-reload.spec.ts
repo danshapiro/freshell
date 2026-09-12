@@ -2,18 +2,13 @@ import { test, expect } from '../helpers/fixtures.js'
 
 // NARROW live settings reload (this fix): exactly two knobs -
 // `settings.safety.autoKillIdleMinutes` and `settings.terminal.scrollback` -
-// take effect via `PATCH /api/settings` WITHOUT a server restart. Legacy
 // applies both live via `registry.setSettings(updated)`
 // (`server/settings-router.ts:138` -> `terminal-registry.ts:1316-1322`); the
 // Rust port wires the SAME shared `TerminalRegistry` into the
 // `PATCH /api/settings` handler (`crates/freshell-server/src/settings_store.rs`).
 //
-// This spec is the CONTROL for both servers (`legacy-chromium` AND
-// `rust-chromium` -- no `test.fail` gate): the scrollback knob is
 // deterministic and fast to prove end-to-end, unlike the idle-kill knob
-// (which requires waiting out a 30s sweep interval on both servers). If
-// legacy ever regressed to boot-only for this knob too, this spec would
-// catch it on `legacy-chromium` as well, which is the intended parity bar.
+// (which requires waiting out a 30s sweep interval on the Rust server). If
 test.describe('Settings Live Reload (narrow: scrollback)', () => {
   async function selectShell(page: any): Promise<void> {
     const alreadyVisible = await page.locator('.xterm').first().isVisible().catch(() => false)
@@ -52,8 +47,8 @@ test.describe('Settings Live Reload (narrow: scrollback)', () => {
 
   // computeScrollbackMaxChars(lines) = clamp(lines * 300, 64*1024, 4*1024*1024)
   // (terminal-registry.ts:1328-1333 / freshell-terminal's
-  // compute_scrollback_max_bytes, registry.rs:106-110 -- same formula/constants
-  // on both servers). scrollback:250 -> a 75,000-char cap: comfortably above
+  // compute_scrollback_max_bytes, registry.rs:106-110). scrollback:250 -> a
+  // 75,000-char cap: comfortably above
   // the clamp floor (65,536) so this proves the PATCHED value took effect,
   // not just a floor clamp, and comfortably below the ~3,000,000-char DEFAULT
   // cap (scrollback:10000) so a flood sized between the two can only survive

@@ -5571,7 +5571,7 @@ async fn read_created(
 /// Resolve the sidecar entry (`index.mjs`). `FRESHELL_CLAUDE_SIDECAR` overrides; otherwise
 /// the vendored package sits beside this crate at `crates/freshell-claude-sidecar/index.mjs`
 /// (baked from `CARGO_MANIFEST_DIR` so it is cwd-independent).
-fn sidecar_entry_path() -> PathBuf {
+pub(crate) fn sidecar_entry_path() -> PathBuf {
     if let Ok(path) = std::env::var("FRESHELL_CLAUDE_SIDECAR") {
         if !path.is_empty() {
             return PathBuf::from(path);
@@ -14139,20 +14139,16 @@ rl.on('line', (line) => {
         mark_compact_candidate(&in_turn, &turn_tracker);
         confirm_compact_candidate(&in_turn, &turn_tracker, true);
 
-        // Let the fixture `tee` fully drain the pipe before freezing — a
-        // partially-consumed pipe would park the fill loop short of the
-        // helper's full-buffer assertion (its 64KiB threshold assumes an empty
-        // pipe: armrace/armfail freeze before any handler write).
-        tokio::time::sleep(Duration::from_millis(300)).await;
         // Park C2's write mid-window.
         let pid = freeze_fixture_stdin(&st, "rb-armfail-gar").await;
-        let driver = {
-            let st = st.clone();
-            tokio::spawn(async move {
-                st.handle_compact(compact_msg("rb-armfail-gar", None)).await;
-            })
-        };
-        tokio::time::sleep(Duration::from_millis(300)).await;
+        let driver = st.handle_compact(compact_msg("rb-armfail-gar", None));
+        tokio::pin!(driver);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(300), &mut driver)
+                .await
+                .is_err(),
+            "C2's compact write is pending while the reader is stopped"
+        );
 
         // C1's terminal edge folds mid-window: retires the promoted C1 — the
         // gate stays closed with C2's armed entry + S1 still owed.
@@ -14169,10 +14165,9 @@ rl.on('line', (line) => {
             0,
             "SIGKILL the fixture child — the parked write fails"
         );
-        tokio::time::timeout(Duration::from_secs(15), driver)
+        tokio::time::timeout(Duration::from_secs(15), &mut driver)
             .await
-            .expect("the failed write resolves the handler")
-            .expect("the compact task joins");
+            .expect("the failed write resolves the handler");
         assert!(
             in_turn.load(std::sync::atomic::Ordering::SeqCst),
             "ep2-r2 F3: the failed arm's undo never releases the gate while S1 is owed"
@@ -14247,7 +14242,7 @@ rl.on('line', (line) => {
         arm_turn_op(&s.in_turn, &s.turn_tracker, TrackedOp::Turn);
     }
 
-    /// ep1-r3 F3 rig: SIGSTOP the fixture's `tee` and FILL its stdin pipe, so
+    /// ep1-r3 F3 rig: SIGSTOP the fixture's reader and FILL its stdin pipe, so
     /// the next `write_line` parks INSIDE the write await (a deterministic,
     /// harness-pausable "mid-write" window) until the child resumes. Returns
     /// the child's pid for the later SIGCONT/SIGKILL.
@@ -14261,29 +14256,109 @@ rl.on('line', (line) => {
             0,
             "SIGSTOP the fixture child"
         );
-        // A stopped reader never drains: fill the kernel pipe buffer until a
-        // write parks (the elbow timeout elapses) — the NEXT write_line parks
-        // INSIDE the write await. (ChildStdin has no userspace buffer, so a
-        // parked write means the KERNEL pipe is full; the per-iteration
-        // timeout IS the full-pipe signal — deterministic, no guessing.)
+        // A stopped reader never drains. Fill in chunks first, then exhaust
+        // any residual space one byte at a time: a blocked chunk alone does
+        // not prove that the smaller compact request cannot fit. ChildStdin
+        // has no userspace buffer, and a timed-out single-byte write proves
+        // backpressure without assuming the pipe's capacity or initial fill.
+        // `write` is cancellation-safe and reports partial writes; a cancelled
+        // `write_all` could instead hide bytes accepted before the timeout.
         use tokio::io::AsyncWriteExt as _;
         let junk = [b'x'; 4096];
-        let mut filled = 0usize;
-        loop {
-            match tokio::time::timeout(Duration::from_millis(100), session.stdin.write_all(&junk))
-                .await
-            {
-                Ok(Ok(())) => filled += junk.len(),
-                Ok(Err(e)) => panic!("the stdin fill failed: {e}"),
-                Err(_elapsed) => break,
+        for chunk in [&junk[..], &junk[..1]] {
+            loop {
+                match tokio::time::timeout(Duration::from_millis(100), session.stdin.write(chunk))
+                    .await
+                {
+                    Ok(Ok(n)) if n > 0 => {}
+                    result => {
+                        assert!(
+                            result.is_err(),
+                            "the {}-byte fill must stop on backpressure: {result:?}",
+                            chunk.len()
+                        );
+                        break;
+                    }
+                }
             }
         }
-        assert!(
-            filled >= 65536,
-            "the classic 64KiB pipe accepted a full buffer before refusing ({filled})"
-        );
         drop(guard);
         pid
+    }
+
+    /// A one-page pipe must provide the same parked compact-write window as
+    /// a larger pipe. Exercise the real fixture and handler, then verify that
+    /// the request reaches the reader only after it resumes.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_small_fixture_pipe_blocks_compact_until_the_reader_resumes() {
+        use std::os::fd::AsRawFd as _;
+
+        let (st, _rx) = state_with_bus();
+        let stdin_log =
+            insert_rollback_fixture_session_no_probe(&st, "rb-small-pipe", "dur-small-pipe").await;
+        {
+            let guard = st.sessions.lock().await;
+            let session = guard.get("rb-small-pipe").expect("tracked session");
+            // Only this test's empty, owned pipe changes. Linux rounds the
+            // request up to one page, including on hosts with larger pages.
+            let capacity = unsafe { libc::fcntl(session.stdin.as_raw_fd(), libc::F_SETPIPE_SZ, 1) };
+            assert!(
+                capacity > 0,
+                "shrink the owned pipe: {}",
+                std::io::Error::last_os_error()
+            );
+            assert_eq!(capacity as libc::c_long, unsafe {
+                libc::sysconf(libc::_SC_PAGESIZE)
+            });
+        }
+        let pid = freeze_fixture_stdin(&st, "rb-small-pipe").await;
+        let (in_turn, turn_tracker) = busy_tracker_arcs(&st, "rb-small-pipe").await;
+        {
+            // Keep polling the SAME future after the timeout: cancellation
+            // must not restart the compact or submit a duplicate request.
+            let compact = st.handle_compact(compact_msg("rb-small-pipe", None));
+            tokio::pin!(compact);
+            assert!(
+                tokio::time::timeout(Duration::from_millis(100), &mut compact)
+                    .await
+                    .is_err(),
+                "the real compact write stays pending while the reader is stopped"
+            );
+            assert!(in_turn.load(std::sync::atomic::Ordering::SeqCst));
+            assert_eq!(
+                turn_tracker.lock().expect("turn tracker lock").running,
+                Some(TrackedOp::Compact),
+                "the compact reached its write await after arming the tracker"
+            );
+            assert!(
+                st.sessions.try_lock().is_err(),
+                "the pending write holds the session lock"
+            );
+            assert_eq!(std::fs::read(&stdin_log).unwrap_or_default(), b"");
+            assert_eq!(unsafe { libc::kill(pid as libc::pid_t, libc::SIGCONT) }, 0);
+            tokio::time::timeout(Duration::from_secs(15), &mut compact)
+                .await
+                .expect("the compact write completes once the owned reader resumes");
+        }
+
+        // Close the writer and reap this fixture before reading its complete
+        // byte log. kill_on_drop also owns cleanup if an earlier assert fails.
+        let mut session = st.sessions.lock().await.remove("rb-small-pipe").unwrap();
+        drop(session.stdin);
+        assert!(
+            tokio::time::timeout(Duration::from_secs(15), session.child.wait())
+                .await
+                .unwrap()
+                .unwrap()
+                .success()
+        );
+        let received = std::fs::read_to_string(stdin_log).unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(received.trim_start_matches('x')).unwrap(),
+            json!({ "type": "send", "sessionId": "rb-small-pipe", "text": "/compact" }),
+            "the reader receives exactly one complete compact request after the fill bytes"
+        );
     }
 
     /// ep1-r3 F3 CORE — the arm/await race: the stdout consumer folds terminal
@@ -14311,13 +14386,14 @@ rl.on('line', (line) => {
 
         // The compact queues behind the running prior turn — and parks INSIDE
         // the write await (the stopped child never drains a full pipe).
-        let driver = {
-            let st = st.clone();
-            tokio::spawn(async move {
-                st.handle_compact(compact_msg("rb-armrace", None)).await;
-            })
-        };
-        tokio::time::sleep(Duration::from_millis(300)).await;
+        let driver = st.handle_compact(compact_msg("rb-armrace", None));
+        tokio::pin!(driver);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(300), &mut driver)
+                .await
+                .is_err(),
+            "the compact write is pending while the reader is stopped"
+        );
         fold_terminal_edge(&in_turn, &turn_tracker);
         {
             let tracker = turn_tracker.lock().expect("turn tracker lock");
@@ -14343,10 +14419,9 @@ rl.on('line', (line) => {
             0,
             "SIGCONT the fixture child"
         );
-        tokio::time::timeout(Duration::from_secs(15), driver)
+        tokio::time::timeout(Duration::from_secs(15), &mut driver)
             .await
-            .expect("the parked compact write completes once the child resumes")
-            .expect("the compact task joins");
+            .expect("the parked compact write completes once the child resumes");
         assert!(in_turn.load(std::sync::atomic::Ordering::SeqCst));
         assert_eq!(
             turn_tracker.lock().expect("turn tracker lock").queued.len(),
@@ -14402,13 +14477,14 @@ rl.on('line', (line) => {
         // mid-window would deadlock the rig.
         let (in_turn, turn_tracker) = busy_tracker_arcs(&st, "rb-armfail").await;
 
-        let driver = {
-            let st = st.clone();
-            tokio::spawn(async move {
-                st.handle_compact(compact_msg("rb-armfail", None)).await;
-            })
-        };
-        tokio::time::sleep(Duration::from_millis(300)).await;
+        let driver = st.handle_compact(compact_msg("rb-armfail", None));
+        tokio::pin!(driver);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(300), &mut driver)
+                .await
+                .is_err(),
+            "the compact write is pending while the reader is stopped"
+        );
         // The prior turn's terminal edge folds mid-window: retires the running
         // turn; the armed compact's queued entry survives (busy holds).
         fold_terminal_edge(&in_turn, &turn_tracker);
@@ -14420,10 +14496,9 @@ rl.on('line', (line) => {
             0,
             "SIGKILL the fixture child — the parked write fails"
         );
-        tokio::time::timeout(Duration::from_secs(15), driver)
+        tokio::time::timeout(Duration::from_secs(15), &mut driver)
             .await
-            .expect("the failed write resolves the handler")
-            .expect("the compact task joins");
+            .expect("the failed write resolves the handler");
 
         // The frame is LOUD (the compact failure surfaces as INTERNAL_ERROR).
         let frame = await_frame_of_inner_type(&mut rx, "freshAgent.error").await;

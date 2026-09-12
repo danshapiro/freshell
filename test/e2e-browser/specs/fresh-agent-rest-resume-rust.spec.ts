@@ -47,7 +47,6 @@
 //     `tabs.sync.query` harness is modeled on
 //     tabs-registry-persistence-rust.spec.ts.
 //
-// Rust-only: registered in RUST_ONLY_SPECS + rust-chromium testMatch
 // (restartAbrupt exists only on RustServer).
 import fs from 'node:fs'
 import fsp from 'node:fs/promises'
@@ -57,7 +56,7 @@ import { fileURLToPath } from 'node:url'
 import WebSocket from 'ws'
 import { test, expect } from '../helpers/fixtures.js'
 import { RustServer } from '../helpers/rust-server.js'
-import type { TestServerInfo } from '../helpers/test-server.js'
+import type { E2eServerInfo } from '../helpers/server-fixture-support.js'
 import { WS_PROTOCOL_VERSION } from '../../../shared/ws-protocol.js'
 
 const __filename = fileURLToPath(import.meta.url)
@@ -66,7 +65,6 @@ const __dirname = path.dirname(__filename)
 const OPENCODE_FIXTURE = path.resolve(__dirname, '../fixtures/fake-opencode.cjs')
 
 // ---------------------------------------------------------------------------
-// Copied helpers (donor: freshagent-settings-resume-rust.spec.ts / agent-continuity-matrix.spec.ts)
 // ---------------------------------------------------------------------------
 
 /** Parse a JSONL file, tolerating absence (returns []). */
@@ -109,7 +107,6 @@ function seedWallConfig(input: {
  * Successful REST responses on this surface are enveloped as
  * `{status:'ok', data:{…}, message}` (Rust `ok_json`). Unwrap `data` —
  * falling back to the bare body for resilience.
- * (donor: agent-continuity-matrix.spec.ts :46-48)
  */
 function unwrapData(body: any): any {
   return body && typeof body === 'object' && 'data' in body ? body.data : body
@@ -123,7 +120,7 @@ function unwrapData(body: any): any {
  */
 async function bootOpencodeServer(): Promise<{
   server: RustServer
-  info: TestServerInfo
+  info: E2eServerInfo
   sharedRoot: string
   projectDir: string
   auditLogPath: string
@@ -155,12 +152,12 @@ async function bootOpencodeServer(): Promise<{
   }
 }
 
-function authed(info: TestServerInfo): Record<string, string> {
+function authed(info: E2eServerInfo): Record<string, string> {
   return { 'content-type': 'application/json', 'x-auth-token': info.token }
 }
 
 /** POST /api/tabs (fresh-agent agent:opencode lane) with an arbitrary body. */
-async function postCreateTab(info: TestServerInfo, body: Record<string, unknown>) {
+async function postCreateTab(info: E2eServerInfo, body: Record<string, unknown>) {
   const res = await fetch(`${info.baseUrl}/api/tabs`, {
     method: 'POST',
     headers: authed(info),
@@ -184,7 +181,7 @@ async function postCreateTab(info: TestServerInfo, body: Record<string, unknown>
  * Returns the durable `ses_…` id recorded by the audit log.
  */
 async function sendOpencodeTurnRest(
-  info: TestServerInfo,
+  info: E2eServerInfo,
   paneId: string,
   text: string,
   auditLogPath: string,
@@ -210,7 +207,7 @@ async function sendOpencodeTurnRest(
 }
 
 /** GET /api/panes/:id/capture → the rendered text/plain transcript. */
-async function capturePane(info: TestServerInfo, paneId: string): Promise<{ status: number; text: string }> {
+async function capturePane(info: E2eServerInfo, paneId: string): Promise<{ status: number; text: string }> {
   const res = await fetch(`${info.baseUrl}/api/panes/${encodeURIComponent(paneId)}/capture`, {
     headers: authed(info),
   })
@@ -389,8 +386,7 @@ function freshAgentTabRecord(
 test.describe('REST fresh-agent resume + registry placeholder clamp (Task 6, rust)', () => {
   test.setTimeout(240_000)
 
-  test('(a) durable-id resume: POST /api/tabs with a durable sessionRef restores the pane after restartAbrupt', async ({ e2eServerKind }) => {
-    expect(e2eServerKind).toBe('rust')
+  test('(a) durable-id resume: POST /api/tabs with a durable sessionRef restores the pane after restartAbrupt', async () => {
     const lane = await bootOpencodeServer()
     try {
       const { info, auditLogPath, projectDir } = lane
@@ -441,8 +437,7 @@ test.describe('REST fresh-agent resume + registry placeholder clamp (Task 6, rus
     }
   })
 
-  test('(b) placeholder-resolution resume: a placeholder-keyed sessionRef resolves to the materialized durable id after restartAbrupt', async ({ e2eServerKind }) => {
-    expect(e2eServerKind).toBe('rust')
+  test('(b) placeholder-resolution resume: a placeholder-keyed sessionRef resolves to the materialized durable id after restartAbrupt', async () => {
     const lane = await bootOpencodeServer()
     try {
       const { info, auditLogPath } = lane
@@ -523,8 +518,7 @@ test.describe('REST fresh-agent resume + registry placeholder clamp (Task 6, rus
   ]
 
   for (const leg of loudFailures) {
-    test(`resume failure is loud: ${leg.name}`, async ({ e2eServerKind }) => {
-      expect(e2eServerKind).toBe('rust')
+    test(`resume failure is loud: ${leg.name}`, async () => {
       const lane = await bootOpencodeServer()
       try {
         const res = await postCreateTab(lane.info, leg.body)
@@ -539,8 +533,7 @@ test.describe('REST fresh-agent resume + registry placeholder clamp (Task 6, rus
     })
   }
 
-  test('(c) registry placeholder clamp: a placeholder push cannot regress a pane whose live registry record holds a durable sessionRef', async ({ e2eServerKind }) => {
-    expect(e2eServerKind).toBe('rust')
+  test('(c) registry placeholder clamp: a placeholder push cannot regress a pane whose live registry record holds a durable sessionRef', async () => {
     const server = new RustServer()
     let wsA: WebSocket | undefined
     let wsB: WebSocket | undefined

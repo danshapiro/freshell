@@ -37,8 +37,8 @@
  *     (another client's truth) reads identically; a page reload re-attaches
  *     to the same post-rollback state (the durable record survives refresh).
  *
- * Every test hard-gates expect(e2eServerKind).toBe('rust') and owns its
- * RustServer. Per-test wall budget: 120s (the cloud e2e budget — this spec is
+ * Every test owns its RustServer; there is no alternate backend fixture.
+ * Per-test wall budget: 120s (the cloud e2e budget — this spec is
  * cloud-runnable by design: every provider is an in-repo hermetic fake, so it
  * appears in NEITHER CLOUD_SKIP_SPECS nor CLOUD_SKIP_TITLES).
  *
@@ -61,8 +61,8 @@ import { test, expect } from '../helpers/fixtures.js'
 import {
   RustServer,
   GEMINI_STRIP_ENV_PREFIXES,
-  type TestServerInfo,
 } from '../helpers/rust-server.js'
+import type { E2eServerInfo as TestServerInfo } from '../helpers/server-fixture-support.js'
 import { TestHarness } from '../helpers/test-harness.js'
 import { openPanePicker } from '../helpers/pane-picker.js'
 import { WsCapture } from '../helpers/ws-capture.js'
@@ -512,9 +512,10 @@ async function sendOpencodeTurn(
   return (await paneLeaf(harness, tabId))?.content?.sessionId as string
 }
 
-/** Send one freshcodex turn and wait until its snapshot rows render. */
+/** Send one freshcodex turn and wait for the provider's durable idle snapshot. */
 async function sendCodexTurnAndWaitRows(
   page: Page,
+  info: TestServerInfo,
   expectedRowCount: number,
   text: string,
 ): Promise<void> {
@@ -524,6 +525,24 @@ async function sendCodexTurnAndWaitRows(
     paneRoot.locator('article[data-turn-index]'),
     `${expectedRowCount} snapshot rows after "${text}"`,
   ).toHaveCount(expectedRowCount, { timeout: 30_000 })
+  // Pane content starts idle and can paint rows before the provider has
+  // completed its turn. Require the durable Rust snapshot to report both the
+  // expected rows and idle before the next send or rollback gesture.
+  await expect
+    .poll(
+      async () => {
+        const snapshot = await fetchSnapshot(info, 'freshcodex', 'codex', 'thread-new-1')
+        return {
+          rows: snapshot?.turns?.length ?? 0,
+          status: snapshot?.status ?? null,
+        }
+      },
+      {
+        timeout: 30_000,
+        message: `timed out waiting for the durable Codex snapshot to settle after "${text}"`,
+      },
+    )
+    .toEqual({ rows: expectedRowCount, status: 'idle' })
 }
 
 // ── Rollback-spec helpers (no donor) ────────────────────────────────────────
@@ -601,8 +620,7 @@ test.describe('fresh-agent /undo + /redo conversation rollback (rust, kata 1wxv)
   // cloud-runnable by design; the forced-local receipt is a stand-in proof).
   test.setTimeout(120_000)
 
-  test('opencode: /undo step refills composer, /redo restores, a new submission destroys redo — and undoing a patch-carrying turn never touches files (decisions 1, 4, 5)', async ({ page, e2eServerKind }) => {
-    expect(e2eServerKind).toBe('rust')
+  test('opencode: /undo step refills composer, /redo restores, a new submission destroys redo — and undoing a patch-carrying turn never touches files (decisions 1, 4, 5)', async ({ page }) => {
     // Turn 2 is PATCH-CARRYING: the fake writes <cwd>/patch-target.txt while
     // simulating it, so the undo below provably crosses a file-mutating turn.
     const lane = await bootOpencodeLane(page, { FAKE_OPENCODE_PATCH_TURN: '2' })
@@ -695,8 +713,7 @@ test.describe('fresh-agent /undo + /redo conversation rollback (rust, kata 1wxv)
     }
   })
 
-  test('opencode: multi-epoch markers — frozen prior-epoch rows lose "Redo to here" while the current epoch keeps it (delta-r1 F6)', async ({ page, e2eServerKind }) => {
-    expect(e2eServerKind).toBe('rust')
+  test('opencode: multi-epoch markers — frozen prior-epoch rows lose "Redo to here" while the current epoch keeps it (delta-r1 F6)', async ({ page }) => {
     const lane = await bootOpencodeLane(page)
     try {
       await waitForPaneStatus(lane.harness, lane.tabId, 'idle')
@@ -750,8 +767,7 @@ test.describe('fresh-agent /undo + /redo conversation rollback (rust, kata 1wxv)
     }
   })
 
-  test('opencode: undo-to-here via the per-turn icon is ONE revert (decision 3)', async ({ page, e2eServerKind }) => {
-    expect(e2eServerKind).toBe('rust')
+  test('opencode: undo-to-here via the per-turn icon is ONE revert (decision 3)', async ({ page }) => {
     const lane = await bootOpencodeLane(page)
     try {
       await waitForPaneStatus(lane.harness, lane.tabId, 'idle')
@@ -783,13 +799,12 @@ test.describe('fresh-agent /undo + /redo conversation rollback (rust, kata 1wxv)
     }
   })
 
-  test('codex: undo-to-here reverts in place; /redo is refused with the codex copy', async ({ page, e2eServerKind }) => {
-    expect(e2eServerKind).toBe('rust')
+  test('codex: undo-to-here reverts in place; /redo is refused with the codex copy', async ({ page }) => {
     const lane = await bootCodexLane(page)
     try {
       await waitForPaneStatus(lane.harness, lane.tabId, 'idle')
-      await sendCodexTurnAndWaitRows(page, 2, 'codex turn one')
-      await sendCodexTurnAndWaitRows(page, 4, 'codex turn two')
+      await sendCodexTurnAndWaitRows(page, lane.info, 2, 'codex turn one')
+      await sendCodexTurnAndWaitRows(page, lane.info, 4, 'codex turn two')
       const snap = (): Promise<any | null> => fetchSnapshot(lane.info, 'freshcodex', 'codex', 'thread-new-1')
       expect(userRows(await snap())).toBe(2)
 
@@ -852,8 +867,7 @@ test.describe('fresh-agent /undo + /redo conversation rollback (rust, kata 1wxv)
     }
   })
 
-  test('claude: /undo fork-at-point re-keys the pane and refills — and never touches checkpoints (decision 1)', async ({ page, e2eServerKind }) => {
-    expect(e2eServerKind).toBe('rust')
+  test('claude: /undo fork-at-point re-keys the pane and refills — and never touches checkpoints (decision 1)', async ({ page }) => {
     const lane = await bootClaudeLane(page, 'freshclaude')
     try {
       await waitForPaneStatus(lane.harness, lane.tabId, 'idle')
@@ -940,8 +954,7 @@ test.describe('fresh-agent /undo + /redo conversation rollback (rust, kata 1wxv)
     }
   })
 
-  test('kilroy: typed /undo drives the claude lane — fork-at-point fork, pane re-key, refill, marker (r2 provider coverage)', async ({ page, e2eServerKind }) => {
-    expect(e2eServerKind).toBe('rust')
+  test('kilroy: typed /undo drives the claude lane — fork-at-point fork, pane re-key, refill, marker (r2 provider coverage)', async ({ page }) => {
     const lane = await bootClaudeLane(page, 'kilroy', { KILROY_ENABLED: '1' })
     try {
       await waitForPaneStatus(lane.harness, lane.tabId, 'idle')
@@ -985,8 +998,7 @@ test.describe('fresh-agent /undo + /redo conversation rollback (rust, kata 1wxv)
     }
   })
 
-  test('multi-client convergence: sibling raw-WS client + REST see the same post-rollback truth (decision 10)', async ({ page, e2eServerKind }) => {
-    expect(e2eServerKind).toBe('rust')
+  test('multi-client convergence: sibling raw-WS client + REST see the same post-rollback truth (decision 10)', async ({ page }) => {
     const lane = await bootOpencodeLane(page)
     try {
       await waitForPaneStatus(lane.harness, lane.tabId, 'idle')
@@ -1047,8 +1059,7 @@ test.describe('fresh-agent /undo + /redo conversation rollback (rust, kata 1wxv)
     }
   })
 
-  test('mid-turn lockout: /undo is rejected while a turn runs; cards survive (decisions 6, 7)', async ({ page, e2eServerKind }) => {
-    expect(e2eServerKind).toBe('rust')
+  test('mid-turn lockout: /undo is rejected while a turn runs; cards survive (decisions 6, 7)', async ({ page }) => {
     const lane = await bootClaudeLane(page, 'freshclaude')
     try {
       await waitForPaneStatus(lane.harness, lane.tabId, 'idle')

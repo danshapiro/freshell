@@ -1,14 +1,13 @@
 /**
  * T2 LIVE behavioral-invariant harness — freshcodex + cheap-GPT (codex-spark) slice.
  * ---------------------------------------------------------------------------
- * Boots the ORIGINAL freshell server as an isolated external process, seeds the
+ * Boots the Rust freshell server as an isolated external process, seeds the
  * user's Codex credential + config (READ-ONLY copies) into that isolated HOME's
  * CODEX_HOME, drives ONE real (cheap) GPT turn THROUGH the server's real fresh-agent
  * WS surface (`freshAgent.create` → `freshAgent.send`), and distils the result into
  * the SAME structured `T2Observation` that `assertT2Invariants` (invariants.ts) grades
  * on SHAPE / PRESENCE / PERSISTENCE / PARSEABILITY / WIRE behavior — never LLM-text
- * equality. This is the ORIGINAL-side codex T2 baseline; the Rust port will later be
- * driven through the identical surface and diffed against it.
+ * equality. This is a supplemental Rust-only provider contract.
  *
  * ── Why this MIRRORS the claude/Haiku slice but differs in four concrete ways ──
  *   1. DRIVE PATH — codex is app-server-driven (freshell spawns the real `codex
@@ -54,12 +53,12 @@
  *   CFG  src: ~/.codex/config.toml      (user, READ-ONLY)
  *   AUTH dst: <isoHOME>/.codex/auth.json     (isolated copy)
  *   CFG  dst: <isoHOME>/.codex/config.toml   (isolated copy)
- *   HOME    : TestServer(runtimeRootMode:'isolated') sets HOME=<isoHOME>. codex resolves
- *             CODEX_HOME as `process.env.CODEX_HOME || $HOME/.codex`
- *             (server/coding-cli/providers/codex.ts:26) and neither the server nor the
- *             app-server child sets CODEX_HOME (verified: parent env has it unset), so
- *             the codex app-server authenticates from and writes ALL rollout/session
- *             data under the isolated `<isoHOME>/.codex` — NEVER the user's real ~/.codex.
+ *   HOME    : `startExternalServer` creates <isoHOME> and applies HOME plus
+ *             CODEX_HOME=<isoHOME>/.codex to the owned Rust server process.
+ *             Its setupHome callback copies the credential and config before
+ *             startup, so the codex app-server authenticates from and writes ALL
+ *             rollout/session data under the isolated `<isoHOME>/.codex` — NEVER
+ *             the user's real ~/.codex.
  *   SANDBOX : permissionMode='never' (→ approvalPolicy 'never') + sandbox='read-only',
  *             so a pure-text turn can never hang on an interactive approval prompt nor
  *             write to the workspace while unattended.
@@ -76,7 +75,7 @@ import fsp from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 
-import { startExternalServer, type ExternalServerHandle, type OracleTarget } from './external-server.js'
+import { startExternalServer, type ExternalServerHandle } from './external-server.js'
 import { WsCaptureClient, type CapturedMessage } from './ws-capture-client.js'
 import { collectSentinelOwnedPids, reapSentinelOwned } from './t2-live.js'
 import { enableFreshClients } from './t2-live-claude.js'
@@ -267,7 +266,7 @@ export async function seedCodexCredsIntoHome(homeDir: string): Promise<{
   await fsp.mkdir(path.dirname(authTarget), { recursive: true })
   await fsp.copyFile(userAuth, authTarget) // READ user, WRITE temp only
   await fsp.copyFile(userConfig, configTarget) // READ user, WRITE temp only
-  // Lock the isolated copies down like the originals (0600) — defensive hygiene.
+  // Lock the isolated copies down (0600) — defensive hygiene.
   await fsp.chmod(authTarget, 0o600).catch(() => {})
   await fsp.chmod(configTarget, 0o600).catch(() => {})
 
@@ -485,14 +484,6 @@ export interface RunCodexT2Options {
   turnTimeoutMs?: number
   /** Pipe the spawned server's stdout/stderr. */
   verbose?: boolean
-  /**
-   * Which server to drive: the node original (`'node'`, default) or the Rust port
-   * (`'rust'`). The SAME driver produces the T2Observation for both, so the oracle's
-   * original-vs-rust comparison is a true same-driver / different-SUT differential
-   * (mirrors the opencode T2-rust equivalence path). Both spawn the REAL `codex app-server`
-   * under the isolated CODEX_HOME and drive the identical WS `freshAgent.*` surface.
-   */
-  target?: OracleTarget
 }
 
 export interface T2TeardownFacts {
@@ -503,8 +494,6 @@ export interface T2TeardownFacts {
 
 export interface CodexT2Run {
   handle: ExternalServerHandle
-  /** Which server was driven ('node' original or 'rust' port). */
-  target: OracleTarget
   /** Isolated project cwd created for this run (removed on teardown). */
   cwd: string
   /** Absolute isolated sessions dir observed for rollout transcripts. */
@@ -526,8 +515,6 @@ export async function runCodexGptMiniT2(options: RunCodexT2Options = {}): Promis
   const turnTimeoutMs = options.turnTimeoutMs ?? 180_000
   const traceOn = options.verbose === true || !!process.env.FRESHELL_T2_TRACE
   const startedAt = Date.now()
-  const target: OracleTarget = options.target ?? 'node'
-
   if (resolveCodexBinary() === null) {
     throw new Error('codex binary not resolvable on PATH (required for the codex T2 harness)')
   }
@@ -544,7 +531,6 @@ export async function runCodexGptMiniT2(options: RunCodexT2Options = {}): Promis
   let handle: ExternalServerHandle
   try {
     handle = await startExternalServer({
-      target,
       provider: 'oracle-t2-codex',
       startTimeoutMs: 90_000,
       verbose: options.verbose ?? false,
@@ -810,7 +796,7 @@ export async function runCodexGptMiniT2(options: RunCodexT2Options = {}): Promis
     return facts
   }
 
-  return { handle, target, cwd, sessionsDir, observation, teardown }
+  return { handle, cwd, sessionsDir, observation, teardown }
 }
 
 /** Re-exported so tests can assert ownership without importing t2-live directly. */

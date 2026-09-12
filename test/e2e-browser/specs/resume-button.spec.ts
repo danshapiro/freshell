@@ -22,18 +22,15 @@ import { TestHarness } from '../helpers/test-harness.js'
  * Boot/seed scaffolding is lifted from `sidebar-click-resume.spec.ts` (the
  * direct prior art) with ONE deliberate difference: `CODEX_CMD` points at a
  * DUAL-MODE wrapper, not `fixtures/fake-codex-cli.mjs`. Root cause (see the
- * task brief and the prior art's legacy `test.fixme`): legacy codex
- * terminal-create runs `planCodexLaunch` -> `runtime.ensureReady`, which
- * spawns the SAME `CODEX_CMD` binary FIRST as a JSON-RPC sidecar
- * (`... app-server --listen <ws>`, `server/coding-cli/codex-app-server/
- * runtime.ts:1828-1834`) whose `initialize` handshake gates the PTY spawn.
+ * task brief): the Rust Codex terminal path first starts the SAME `CODEX_CMD`
+ * binary as a JSON-RPC sidecar (`... app-server --listen <ws>`), whose
+ * `initialize` handshake gates the PTY spawn.
  * `fake-codex-cli.mjs` never listens on the `--listen` URL, so that create
  * settles into `status: 'error'` -- a fixture/architecture mismatch, not a
  * server bug. The protocol-faithful sidecar fixture
  * (`test/fixtures/coding-cli/codex-app-server/fake-app-server.mjs`, proven by
  * the passing `test/integration/server/codex-session-flow.test.ts`) handles
- * the sidecar mode; the wrapper below handles both modes, so THIS spec goes
- * green on legacy without inheriting the fixme.
+ * the sidecar mode; the wrapper below handles both modes for the Rust baseline.
  */
 
 const __filename = fileURLToPath(import.meta.url)
@@ -51,11 +48,11 @@ const FILLER_COUNT = 44
 const fillerId = (i: number) => `aaaaaaaa-1111-4111-8111-${String(i).padStart(12, '0')}`
 
 /**
- * Legacy codex terminal-create spawns CODEX_CMD TWICE: first as the JSON-RPC
- * sidecar (`… app-server --listen <ws>`, runtime.ts:1828-1834) whose
+ * The Rust Codex terminal path spawns CODEX_CMD TWICE: first as the JSON-RPC
+ * sidecar (`… app-server --listen <ws>`) whose
  * `initialize` handshake gates the PTY spawn, then as the PTY TUI with the
  * resume argv. fixtures/fake-codex-cli.mjs handles only the second mode —
- * exactly why the prior art is test.fixme on legacy. This wrapper handles both.
+ * exactly why this Rust-baseline fixture must handle both modes.
  */
 async function writeDualModeCodexCli(binDir: string): Promise<string> {
   await fs.mkdir(binDir, { recursive: true })
@@ -138,12 +135,12 @@ interface ResumeScenario {
 }
 
 /**
- * Boot a legacy server whose isolated HOME carries 40+ codex sessions (so the
+ * Boot an owned Rust server whose isolated HOME carries 40+ codex sessions (so the
  * sidebar list scrolls) with RESUME_ID among them — same seeding shape as
  * `sidebar-click-resume.spec.ts`'s codex seed (a `session_meta` record with
  * `payload.id`/`cwd` plus `response_item`/`message` records for a real title).
  */
-async function bootResumeScenario(e2eServerKind: 'legacy' | 'rust'): Promise<ResumeScenario> {
+async function bootResumeScenario(): Promise<ResumeScenario> {
   const sharedRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'freshell-resume-button-'))
   const argvLogPath = path.join(sharedRoot, 'fake-codex-argv.jsonl')
   const projectDir = path.join(sharedRoot, 'project')
@@ -180,7 +177,6 @@ async function bootResumeScenario(e2eServerKind: 'legacy' | 'rust'): Promise<Res
   }
 
   const server = await createE2eServerHandle(process.env, {
-    kind: e2eServerKind,
     construct: {
       env: { CODEX_CMD: fakeCodexPath, FAKE_CODEX_ARGV_LOG: argvLogPath },
       setupHome: async (homeDir) => {
@@ -224,8 +220,8 @@ async function bootResumeScenario(e2eServerKind: 'legacy' | 'rust'): Promise<Res
 
 test.setTimeout(90_000)
 
-test('resume button stays visible at top/middle/bottom scroll', async ({ page, e2eServerKind }) => {
-  const scenario = await bootResumeScenario(e2eServerKind)
+test('resume button stays visible at top/middle/bottom scroll', async ({ page }) => {
+  const scenario = await bootResumeScenario()
   try {
     await bootAndConnect(page, scenario.info)
 
@@ -253,8 +249,8 @@ test('resume button stays visible at top/middle/bottom scroll', async ({ page, e
   }
 })
 
-test('resume button is visible in fullWidth mobile mode', async ({ page, e2eServerKind }) => {
-  const scenario = await bootResumeScenario(e2eServerKind)
+test('resume button is visible in fullWidth mobile mode', async ({ page }) => {
+  const scenario = await bootResumeScenario()
   try {
     await page.setViewportSize({ width: 390, height: 844 })
     await bootAndConnect(page, scenario.info)
@@ -271,8 +267,8 @@ test('resume button is visible in fullWidth mobile mode', async ({ page, e2eServ
   }
 })
 
-test('paste-then-Enter resumes the session with the right agent', async ({ page, e2eServerKind }) => {
-  const scenario = await bootResumeScenario(e2eServerKind)
+test('paste-then-Enter resumes the session with the right agent', async ({ page }) => {
+  const scenario = await bootResumeScenario()
   try {
     const harness = await bootAndConnect(page, scenario.info)
     const tabCountBefore = await harness.getTabCount()

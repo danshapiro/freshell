@@ -33,7 +33,7 @@
 // turn-making test. Opt-in run:
 //   FRESHELL_RUN_REAL_PROVIDER_CONTRACTS=1 npm run test:vitest -- \
 //     run test/integration/real/amplifier-stub-adoption-contract.test.ts \
-//     --config config/vitest/vitest.server.config.ts
+//     --config config/vitest/vitest.config.ts
 //
 
 import { execFile, spawn } from 'node:child_process'

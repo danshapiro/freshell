@@ -2,11 +2,10 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { render, screen, cleanup, fireEvent, waitFor, act } from '@testing-library/react'
 import { Provider } from 'react-redux'
 import { configureStore } from '@reduxjs/toolkit'
-import panesReducer, { requestPaneRefresh, setActivePane } from '@/store/panesSlice'
+import panesReducer, { requestPaneRefresh } from '@/store/panesSlice'
 import settingsReducer from '@/store/settingsSlice'
 import paneRuntimeActivityReducer from '@/store/paneRuntimeActivitySlice'
-import BrowserPane from '@/components/panes/BrowserPane'
-import { resetPaneFocusOwnershipForTests, wirePaneFocusOwnershipInvalidation, isPaneFocusRestorePendingForTests, paneSelectionMiddleware } from '@/lib/pane-focus-ownership'
+import BrowserPane, { resolveBrowserSource } from '@/components/panes/BrowserPane'
 
 // Mock clipboard
 vi.mock('@/lib/clipboard', () => ({
@@ -35,7 +34,6 @@ const createMockStore = () =>
       settings: settingsReducer,
       paneRuntimeActivity: paneRuntimeActivityReducer,
     },
-    middleware: (getDefault) => getDefault().concat(paneSelectionMiddleware as never),
     preloadedState: {
       panes: {
         layouts: {},
@@ -90,7 +88,6 @@ describe('BrowserPane', () => {
       configurable: true,
     })
     cleanup()
-    resetPaneFocusOwnershipForTests()
   })
 
   function setWindowHostname(hostname: string) {
@@ -297,36 +294,6 @@ describe('BrowserPane', () => {
       expect(store.getState().panes.refreshRequestsByPane['tab-1']).toBeUndefined()
     })
 
-    it('retries a failed forwarded page when a matching refresh request arrives without an iframe', async () => {
-      const store = createBrowserStore()
-      setWindowHostname('192.168.1.100')
-      vi.mocked(api.post)
-        .mockRejectedValueOnce(new Error('Connection refused'))
-        .mockResolvedValueOnce({ forwardedPort: 45678 })
-
-      await act(async () => {
-        // Use https: URL — http: uses same-origin proxy, not TCP forwarding
-        renderBrowserPane({ url: 'https://localhost:3000' }, store)
-      })
-
-      await waitFor(() => {
-        expect(screen.getByText('Failed to connect')).toBeInTheDocument()
-      })
-
-      act(() => {
-        store.dispatch(requestPaneRefresh({ tabId: 'tab-1', paneId: 'pane-1' }))
-      })
-
-      await waitFor(() => {
-        expect(api.post).toHaveBeenCalledTimes(2)
-      })
-      await waitFor(() => {
-        expect(screen.queryByText('Failed to connect')).not.toBeInTheDocument()
-      })
-      // Protocol preserved — TCP forward passes bytes verbatim
-      expect(document.querySelector('iframe')?.getAttribute('src')).toBe('https://192.168.1.100:45678/')
-      expect(store.getState().panes.refreshRequestsByPane['tab-1']).toBeUndefined()
-    })
   })
 
   describe('runtime activity', () => {
@@ -342,38 +309,6 @@ describe('BrowserPane', () => {
       })
     })
 
-    it('marks the pane as error when port forwarding fails for https: URL', async () => {
-      setWindowHostname('remote-host')
-      vi.mocked(api.post).mockRejectedValueOnce(new Error('forward failed'))
-      // Use https: — http: uses same-origin proxy, not TCP forwarding
-      const { store } = renderBrowserPane({ url: 'https://127.0.0.1:3000' })
-
-      await waitFor(() => {
-        expect(store.getState().paneRuntimeActivity.byPaneId['pane-1']).toMatchObject({
-          source: 'browser',
-          phase: 'error',
-        })
-      })
-    })
-
-    it('marks remote localhost forwarding as busy while the proxy request is pending', async () => {
-      setWindowHostname('remote-host')
-      let resolveForward: ((value: { forwardedPort: number }) => void) | null = null
-      vi.mocked(api.post).mockReturnValueOnce(new Promise((resolve) => {
-        resolveForward = resolve
-      }))
-      // Use https: — http: uses same-origin proxy, not TCP forwarding
-      const { store } = renderBrowserPane({ url: 'https://127.0.0.1:3000' })
-
-      expect(store.getState().paneRuntimeActivity.byPaneId['pane-1']).toMatchObject({
-        source: 'browser',
-        phase: 'forwarding',
-      })
-
-      await act(async () => {
-        resolveForward?.({ forwardedPort: 45678 })
-      })
-    })
   })
 
   describe('file:// URL handling', () => {
@@ -408,7 +343,7 @@ describe('BrowserPane', () => {
     })
   })
 
-  describe('port forwarding for remote access', () => {
+  describe('localhost HTTP proxying', () => {
     it('proxies http: localhost URLs through HTTP proxy when accessing remotely', async () => {
       setWindowHostname('192.168.1.100')
 
@@ -424,6 +359,26 @@ describe('BrowserPane', () => {
         const iframe = document.querySelector('iframe')
         expect(iframe).toBeTruthy()
         expect(iframe!.getAttribute('src')).toBe('/api/proxy/http/4000/')
+      })
+    })
+
+    it('keeps the HTTP proxy when recovering a failed remote localhost page', async () => {
+      setWindowHostname('192.168.1.100')
+      renderBrowserPane({ url: 'http://localhost:4000/path' })
+
+      const iframe = await screen.findByTitle('Browser content')
+      expect(iframe).toHaveAttribute('src', '/api/proxy/http/4000/path')
+
+      await act(async () => {
+        fireEvent.error(iframe, { bubbles: true })
+      })
+      fireEvent.click(await screen.findByRole('button', { name: 'Try Again' }))
+
+      await waitFor(() => {
+        expect(screen.getByTitle('Browser content')).toHaveAttribute(
+          'src',
+          '/api/proxy/http/4000/path',
+        )
       })
     })
 
@@ -460,23 +415,6 @@ describe('BrowserPane', () => {
       })
     })
 
-    it('preserves https: protocol for forwarded https: localhost URLs', async () => {
-      setWindowHostname('192.168.1.100')
-      vi.mocked(api.post).mockResolvedValue({ forwardedPort: 45678 })
-
-      await act(async () => {
-        renderBrowserPane({ url: 'https://localhost:3000/app' })
-      })
-
-      expect(api.post).toHaveBeenCalledWith('/api/proxy/forward', { port: 3000 })
-
-      await waitFor(() => {
-        const iframe = document.querySelector('iframe')
-        expect(iframe).toBeTruthy()
-        // Protocol preserved — TCP proxy passes bytes verbatim (including TLS handshake)
-        expect(iframe!.getAttribute('src')).toBe('https://192.168.1.100:45678/app')
-      })
-    })
 
     it('proxies localhost URLs through HTTP proxy when accessing locally', async () => {
       setWindowHostname('localhost')
@@ -520,439 +458,23 @@ describe('BrowserPane', () => {
       )
     })
 
-    it('shows connecting state while port forward is pending for https: URL', async () => {
-      setWindowHostname('192.168.1.100')
-      let resolveForward!: (value: { forwardedPort: number }) => void
-      vi.mocked(api.post).mockReturnValue(
-        new Promise((resolve) => {
-          resolveForward = resolve
-        }),
-      )
-
-      renderBrowserPane({ url: 'https://localhost:3000' })
-
-      // Should show connecting state (no iframe yet)
-      expect(screen.getByText(/Connecting/i)).toBeInTheDocument()
-      expect(document.querySelector('iframe')).toBeNull()
-
-      // Resolve the forward
-      await act(async () => {
-        resolveForward({ forwardedPort: 45678 })
-      })
-
-      // Now the iframe should appear
-      await waitFor(() => {
-        const iframe = document.querySelector('iframe')
-        expect(iframe).toBeTruthy()
-        expect(iframe!.getAttribute('src')).toBe('https://192.168.1.100:45678/')
-      })
-    })
-
-    it('clears forwarding state when navigating to a non-forward URL', async () => {
-      setWindowHostname('192.168.1.100')
-      vi.mocked(api.post).mockReturnValue(new Promise(() => {}))
-
-      renderBrowserPane({ url: 'https://localhost:3000' })
-
-      expect(screen.getByText(/Connecting/i)).toBeInTheDocument()
-
-      const input = screen.getByPlaceholderText('Enter URL...')
-      fireEvent.change(input, { target: { value: 'https://example.com' } })
-      fireEvent.keyDown(input, { key: 'Enter' })
-
-      await waitFor(() => {
-        expect(screen.queryByText(/Connecting/i)).not.toBeInTheDocument()
-        const iframe = document.querySelector('iframe')
-        expect(iframe).toBeTruthy()
-        expect(iframe!.getAttribute('src')).toBe('https://example.com')
-      })
-    })
-
-    it('releases port forward when navigating away from a forwarded URL', async () => {
-      setWindowHostname('192.168.1.100')
-      vi.mocked(api.post).mockResolvedValue({ forwardedPort: 45678 })
-
-      await act(async () => {
-        renderBrowserPane({ url: 'https://localhost:3000' })
-      })
-
-      await waitFor(() => {
-        const iframe = document.querySelector('iframe')
-        expect(iframe).toBeTruthy()
-      })
-
-      // Navigate away
-      const input = screen.getByPlaceholderText('Enter URL...')
-      fireEvent.change(input, { target: { value: 'https://example.com' } })
-      fireEvent.keyDown(input, { key: 'Enter' })
-
-      await waitFor(() => {
-        expect(api.delete).toHaveBeenCalledWith('/api/proxy/forward/3000')
-      })
-    })
-
-    it('shows error when port forwarding fails for https: URL', async () => {
-      setWindowHostname('192.168.1.100')
-      vi.mocked(api.post).mockRejectedValue(
-        new Error('Failed to create port forward'),
-      )
-
-      await act(async () => {
-        renderBrowserPane({ url: 'https://localhost:3000' })
-      })
-
-      await waitFor(() => {
-        // Use exact string to avoid matching the description which also contains "Failed to connect"
-        expect(screen.getByText('Failed to connect')).toBeInTheDocument()
-      })
-    })
-
-    it('clears loading state when port forwarding fails for https: URL', async () => {
-      setWindowHostname('192.168.1.100')
-      vi.mocked(api.post).mockRejectedValue(new Error('Connection refused'))
-
-      await act(async () => {
-        renderBrowserPane({ url: 'https://localhost:3000' })
-      })
-
-      await waitFor(() => {
-        expect(screen.getByText('Failed to connect')).toBeInTheDocument()
-      })
-
-      // Toolbar should show Refresh (not Stop), meaning isLoading is false
-      expect(screen.getByTitle('Refresh')).toBeInTheDocument()
-      expect(screen.queryByTitle('Stop')).not.toBeInTheDocument()
-    })
-
-    it('retries port forwarding when Try Again is clicked after failure', async () => {
-      setWindowHostname('192.168.1.100')
-      vi.mocked(api.post)
-        .mockRejectedValueOnce(new Error('Connection refused'))
-        .mockResolvedValueOnce({ forwardedPort: 45678 })
-
-      await act(async () => {
-        renderBrowserPane({ url: 'https://localhost:3000' })
-      })
-
-      await waitFor(() => {
-        expect(screen.getByText('Failed to connect')).toBeInTheDocument()
-      })
-
-      expect(api.post).toHaveBeenCalledTimes(1)
-
-      // Click Try Again
-      await act(async () => {
-        fireEvent.click(screen.getByText('Try Again'))
-      })
-
-      // Should have made a second API call
-      await waitFor(() => {
-        expect(api.post).toHaveBeenCalledTimes(2)
-      })
-
-      // Should now show the iframe (https: protocol preserved through TCP forward)
-      await waitFor(() => {
-        const iframe = document.querySelector('iframe')
-        expect(iframe).toBeTruthy()
-        expect(iframe!.getAttribute('src')).toBe('https://192.168.1.100:45678/')
-      })
-    })
   })
 
-  describe('focus gating', () => {
-    it('focuses the URL input for an empty-url pane that owns focus (default)', () => {
-      renderBrowserPane({ url: '' })
-      expect(screen.getByPlaceholderText('Enter URL...')).toHaveFocus()
-    })
+  it('uses the HTTP proxy for localhost and clearly disables remote HTTPS loopback', async () => {
+    setWindowHostname('remote.example')
+    const { rerender } = renderBrowserPane({ url: 'http://localhost:4040/path' })
+    expect(await screen.findByTitle('Browser content')).toHaveAttribute('src', '/api/proxy/http/4040/path')
+    rerender(<Provider store={createMockStore()}><BrowserPane paneId="pane-1" tabId="tab-1" browserInstanceId="browser-1" url="https://localhost:4040" devToolsOpen={false} /></Provider>)
+    expect(await screen.findByRole('status')).toHaveTextContent('Remote loopback forwarding is unavailable; use a localhost HTTP URL or open the URL on the server host.')
+    expect(api.post).not.toHaveBeenCalledWith('/api/proxy/forward', expect.anything())
+  })
 
-    it('does not focus the URL input when focusEligible is false', () => {
-      renderBrowserPane({ url: '', focusEligible: false })
-      expect(screen.getByPlaceholderText('Enter URL...')).not.toHaveFocus()
-    })
+  it('keeps remote HTTPS loopback unavailable when resolving a recovery source', () => {
+    setWindowHostname('remote.example')
 
-    it('marks the iframe inert when NOT focus-eligible (page content cannot programmatically steal focus)', () => {
-      renderBrowserPane({ url: 'https://example.com', focusEligible: false })
-      const iframe = document.querySelector('iframe')
-      expect(iframe).toBeTruthy()
-      expect(iframe!.hasAttribute('inert')).toBe(true)
-    })
-
-    it('does NOT set inert when the pane owns focus (default) — content stays interactive', () => {
-      renderBrowserPane({ url: 'https://example.com' })
-      const iframe = document.querySelector('iframe')
-      expect(iframe).toBeTruthy()
-      expect(iframe!.hasAttribute('inert')).toBe(false)
-    })
-
-    it('removes inert on a false→true eligibility flip (explicit select) without reloading the iframe', () => {
-      const { rerender, store } = renderBrowserPane({ url: 'https://example.com', focusEligible: false })
-      const iframe = document.querySelector('iframe')
-      expect(iframe!.hasAttribute('inert')).toBe(true)
-      const srcBefore = iframe!.getAttribute('src')
-      rerender(
-        <Provider store={store}>
-          <BrowserPane paneId="pane-1" tabId="tab-1" browserInstanceId="browser-1" url="https://example.com" devToolsOpen={false} focusEligible />
-        </Provider>,
-      )
-      const iframeAfter = document.querySelector('iframe')
-      expect(iframeAfter === iframe).toBe(true) // same element — no reload
-      expect(iframeAfter!.hasAttribute('inert')).toBe(false)
-      expect(iframeAfter!.getAttribute('src')).toBe(srcBefore)
-    })
-
-    it('REAL split-swap commit order (new subtree renders before old cleanup): chrome keeps focus, iframe stays locked', () => {
-      const first = renderBrowserPane({ url: 'https://example.com' })
-      // Mount autofocus claims the pane root; the user then moves to app chrome.
-      const chrome = document.createElement('input')
-      document.body.appendChild(chrome)
-      chrome.focus()
-      // Single commit: wrapping div added → pane-1 subtree deleted + recreated —
-      // React renders the new tree BEFORE the old subtree's layout cleanups
-      // write the ownership record. A render-time adoption read would latch
-      // "unknown → allowed" and steal chrome's focus; post-commit reads deny it.
-      first.rerender(
-        <Provider store={first.store}>
-          <div>
-            <div data-pane-id="pane-2"><input aria-label="sibling" /></div>
-            <BrowserPane paneId="pane-1" tabId="tab-1" browserInstanceId="browser-1" url="https://example.com" devToolsOpen={false} />
-          </div>
-        </Provider>,
-      )
-      const iframe = document.querySelector('iframe')!
-      expect(iframe.hasAttribute('inert')).toBe(true)
-      expect(iframe.getAttribute('data-focus-locked')).toBe('true')
-      expect(chrome).toHaveFocus()
-    })
-
-    it('locks the iframe on an ownership-DENIED eligible remount (active pane, user in app chrome)', () => {
-      const first = renderBrowserPane({ url: 'https://example.com' })
-      // Mount autofocus claims the pane root (own-focus); the user then moves
-      // to app chrome, so the teardown record is owned:false.
-      const chrome = document.createElement('input')
-      document.body.appendChild(chrome)
-      chrome.focus()
-      first.unmount()
-      const second = renderBrowserPane({ url: 'https://example.com' })
-      const iframe = document.querySelector('iframe')
-      expect(iframe!.hasAttribute('inert')).toBe(true)
-      expect(iframe!.getAttribute('data-focus-locked')).toBe('true')
-      // …and chrome keeps focus (no yank-back from the denied remount).
-      expect(chrome).toHaveFocus()
-      second.unmount()
-    })
-
-    it('pointerdown on a denied-remount pane UNLOCKS the iframe (click-to-wake recovery) without stealing focus', () => {
-      const first = renderBrowserPane({ url: 'https://example.com' })
-      const chrome = document.createElement('input')
-      document.body.appendChild(chrome)
-      chrome.focus()
-      first.unmount()
-      renderBrowserPane({ url: 'https://example.com' }) // denied remount → locked
-      const iframe = document.querySelector('iframe')!
-      expect(iframe.hasAttribute('inert')).toBe(true)
-      const root = iframe.closest('[data-pane-id="pane-1"]') as HTMLElement
-      fireEvent.pointerDown(root)
-      expect(iframe.hasAttribute('inert')).toBe(false)
-      expect(iframe.getAttribute('data-focus-locked')).toBeNull()
-      // Unlock does not yank focus — the browser default for the click does.
-      expect(chrome).toHaveFocus()
-    })
-
-    it('keyboard activation (Enter/Space on the pane shell) UNLOCKS a denied-remount iframe (keyboard access parity with pointer wake)', () => {
-      const first = renderBrowserPane({ url: 'https://example.com' })
-      const chrome = document.createElement('input')
-      document.body.appendChild(chrome)
-      chrome.focus()
-      first.unmount()
-      renderBrowserPane({ url: 'https://example.com' }) // denied remount → locked
-      const iframe = document.querySelector('iframe')!
-      expect(iframe.hasAttribute('inert')).toBe(true)
-      const root = iframe.closest('[data-pane-id="pane-1"]') as HTMLElement
-      fireEvent.keyDown(root, { key: 'Enter' })
-      expect(iframe.hasAttribute('inert')).toBe(false)
-      expect(iframe.getAttribute('data-focus-locked')).toBeNull()
-      expect(chrome).toHaveFocus() // unlock is not a focus steal
-    })
-
-    it('focuses the pane root on mount for a loaded pane that owns focus', () => {
-      renderBrowserPane({ url: 'https://example.com' })
-      const root = document.querySelector('[data-pane-id="pane-1"]')
-      expect(root).toHaveFocus()
-    })
-
-    it('does not focus a loaded pane while ineligible, but on the later false→true flip (explicit select)', () => {
-      const { rerender, store } = renderBrowserPane({ url: 'https://example.com', focusEligible: false })
-      const iframe = document.querySelector('iframe')
-      const root = document.querySelector('[data-pane-id="pane-1"]')
-      expect(iframe).not.toBeNull()
-      expect(root).not.toHaveFocus()
-      rerender(
-        <Provider store={store}>
-          <BrowserPane paneId="pane-1" tabId="tab-1" browserInstanceId="browser-1" url="https://example.com" devToolsOpen={false} focusEligible />
-        </Provider>,
-      )
-      expect(root).toHaveFocus()
-    })
-
-    it('remount WITHOUT prior focus ownership keeps focus where the user left it (agent split while user is in app chrome)', () => {
-      const first = renderBrowserPane({ url: 'https://example.com' })
-      expect(document.querySelector('[data-pane-id="pane-1"]')).toHaveFocus()
-      // User moved into application chrome without changing activePane.
-      const chrome = document.createElement('input')
-      document.body.appendChild(chrome)
-      chrome.focus()
-      expect(chrome).toHaveFocus()
-      // Leaf→split remount destroys and recreates the pane's React subtree.
-      first.unmount()
-      renderBrowserPane({ url: 'https://example.com' })
-      expect(chrome).toHaveFocus()
-      expect(document.querySelector('[data-pane-id="pane-1"]')).not.toHaveFocus()
-    })
-
-    it('remount WITH prior focus ownership restores the pane focus (matches user-split UX and the e2e split contract)', () => {
-      const first = renderBrowserPane({ url: 'https://example.com' })
-      const root = document.querySelector('[data-pane-id="pane-1"]')
-      expect(root).toHaveFocus()
-      first.unmount()
-      renderBrowserPane({ url: 'https://example.com' })
-      expect(document.querySelector('[data-pane-id="pane-1"]')).toHaveFocus()
-    })
-
-    it('pin: navigation never yanks focus (url change is not a focus event)', () => {
-      const { rerender, store } = renderBrowserPane({ url: 'https://example.com' })
-      const chrome = document.createElement('input')
-      document.body.appendChild(chrome)
-      chrome.focus()
-      expect(chrome).toHaveFocus()
-      rerender(
-        <Provider store={store}>
-          <BrowserPane paneId="pane-1" tabId="tab-1" browserInstanceId="browser-1" url="https://other.example.com" devToolsOpen={false} focusEligible />
-        </Provider>,
-      )
-      expect(chrome).toHaveFocus()
-    })
-
-    it('a denied remount still focuses on a later explicit eligibility flip (switch away and back)', () => {
-      const first = renderBrowserPane({ url: 'https://example.com' })
-      expect(document.querySelector('[data-pane-id="pane-1"]')).toHaveFocus()
-      const chrome = document.createElement('input')
-      document.body.appendChild(chrome)
-      chrome.focus()
-      first.unmount()
-      const { rerender, store } = renderBrowserPane({ url: 'https://example.com' })
-      expect(chrome).toHaveFocus() // denied adoption: agent split while user is in app chrome
-      rerender(
-        <Provider store={store}>
-          <BrowserPane paneId="pane-1" tabId="tab-1" browserInstanceId="browser-1" url="https://example.com" devToolsOpen={false} focusEligible={false} />
-        </Provider>,
-      )
-      rerender(
-        <Provider store={store}>
-          <BrowserPane paneId="pane-1" tabId="tab-1" browserInstanceId="browser-1" url="https://example.com" devToolsOpen={false} focusEligible />
-        </Provider>,
-      )
-      // Explicit-select flips ALWAYS bypass the ownership gate — a denied
-      // remount must not strand the pane unfocused forever.
-      expect(document.querySelector('[data-pane-id="pane-1"]')).toHaveFocus()
-    })
-
-    it('a remount restores focus to the EXACT element that held it (URL input), not the default target', async () => {
-      const first = renderBrowserPane({ url: 'https://example.com' })
-      expect(document.querySelector('[data-pane-id="pane-1"]')).toHaveFocus()
-      // User clicked into the URL field of the loaded pane…
-      const urlInput = screen.getByPlaceholderText('Enter URL...')
-      urlInput.focus()
-      expect(urlInput).toHaveFocus()
-      // …then an agent split remounts the subtree.
-      first.unmount()
-      renderBrowserPane({ url: 'https://example.com' })
-      // Default mount focus lands on the pane root; the recorded descriptor
-      // then re-resolves and refocuses the URL input (rAF + macrotask — poll,
-      // do not sleep: jsdom rAF lands late under pool load).
-      await waitFor(() => expect(screen.getByPlaceholderText('Enter URL...')).toHaveFocus(), { timeout: 2000 })
-    })
-
-    it('a remount restores focus to the EMBEDDED iframe when the user was inside the page (descriptor: sole iframe)', async () => {
-      const first = renderBrowserPane({ url: 'https://example.com' })
-      const iframe = document.querySelector('iframe') as HTMLIFrameElement
-      iframe.focus()
-      expect(iframe).toHaveFocus()
-      first.unmount()
-      renderBrowserPane({ url: 'https://example.com' })
-      // Default mount focus lands on the pane root; the descriptor restore
-      // then refocuses the iframe (rAF + macrotask — poll, do not sleep).
-      await waitFor(() => expect(document.querySelector('iframe')).toHaveFocus(), { timeout: 2000 })
-    })
-
-    it('restores focus for a Redux-INACTIVE pane that held DOM focus via keyboard (split must not drop it to body)', async () => {
-      // Pane shells are keyboard-focusable without changing activePane; focus
-      // via Tab never dispatches setActivePane.
-      const first = renderBrowserPane({ url: 'https://example.com', focusEligible: false })
-      const shell = document.querySelector('[data-pane-id="pane-1"]') as HTMLElement
-      shell.focus()
-      expect(shell).toHaveFocus()
-      first.unmount()
-      renderBrowserPane({ url: 'https://example.com', focusEligible: false })
-      // The content focus effect early-returns (ineligible); the record-driven
-      // restore must still hand focus back to the replacement shell.
-      await waitFor(
-        () => expect(document.querySelector('[data-pane-id="pane-1"]')).toHaveFocus(),
-        { timeout: 2000 },
-      )
-    })
-
-    it('burst splits preserve the pre-split focus target (descriptor survives intermediate remounts)', async () => {
-      const first = renderBrowserPane({ url: 'https://example.com' })
-      const urlInput = screen.getByPlaceholderText('Enter URL...')
-      urlInput.focus()
-      first.unmount() // records the URL input
-      const second = renderBrowserPane({ url: 'https://example.com' }) // default root focus; restore pending
-      // Second split lands BEFORE the restore fires.
-      second.unmount() // must NOT overwrite the URL descriptor with the artifact focus
-      renderBrowserPane({ url: 'https://example.com' })
-      await waitFor(() => expect(screen.getByPlaceholderText('Enter URL...')).toHaveFocus(), { timeout: 2000 })
-    })
-
-    it('a restore in flight YIELDS to a newer explicit selection (split, then immediately select elsewhere)', async () => {
-      const first = renderBrowserPane({ url: 'https://example.com' })
-      const urlInput = screen.getByPlaceholderText('Enter URL...')
-      urlInput.focus()
-      first.unmount() // records the URL input
-      const { store } = renderBrowserPane({ url: 'https://example.com' }) // adoption allowed; restore scheduled
-      const unwire = wirePaneFocusOwnershipInvalidation(store)
-      try {
-        // The agent immediately selects elsewhere before the restore fires —
-        // the selection must win; the restore must not drag focus back.
-        // (focusNudge: mirrors the pane.select fold's epoch path.)
-        act(() => {
-          store.dispatch(setActivePane({ tabId: 'tab-1', paneId: 'pane-2', focusNudge: true }))
-        })
-        // The window fired (pending spent)…
-        await waitFor(() => expect(isPaneFocusRestorePendingForTests('pane-1')).toBe(false))
-        // …but it yielded to the newer selection: URL input never grabbed focus.
-        expect(screen.getByPlaceholderText('Enter URL...')).not.toHaveFocus()
-      } finally {
-        unwire()
-      }
-    })
-
-    it('an explicit re-select of the ALREADY-active pane (focus epoch bump) focuses a denied remount', () => {
-      const first = renderBrowserPane({ url: 'https://example.com' })
-      expect(document.querySelector('[data-pane-id="pane-1"]')).toHaveFocus()
-      const chrome = document.createElement('input')
-      document.body.appendChild(chrome)
-      chrome.focus()
-      first.unmount() // records NOT owned (chrome holds focus)
-      const { rerender, store } = renderBrowserPane({ url: 'https://example.com' })
-      expect(chrome).toHaveFocus() // denied adoption (recorded not-owned)
-      // Same-target select produces no eligibility transition; PaneContainer
-      // forwards the bumped epoch — simulate that hand-off via the prop.
-      rerender(
-        <Provider store={store}>
-          <BrowserPane paneId="pane-1" tabId="tab-1" browserInstanceId="browser-1" url="https://example.com" devToolsOpen={false} focusEligible focusEpoch={1} />
-        </Provider>,
-      )
-      expect(document.querySelector('[data-pane-id="pane-1"]')).toHaveFocus()
+    expect(resolveBrowserSource('https://localhost:4040/path')).toEqual({
+      src: null,
+      baselineUnavailable: true,
     })
   })
 })

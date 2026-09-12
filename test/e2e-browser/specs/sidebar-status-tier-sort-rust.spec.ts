@@ -61,7 +61,8 @@ import * as path from 'node:path'
 import * as os from 'node:os'
 import { fileURLToPath } from 'node:url'
 import WebSocket from 'ws'
-import { RustServer, ensureRustServerBuilt, type TestServerInfo } from '../helpers/rust-server.js'
+import { RustServer, ensureRustServerBuilt } from '../helpers/rust-server.js'
+import type { E2eServerInfo } from '../helpers/server-fixture-support.js'
 import { TestHarness } from '../helpers/test-harness.js'
 import { WS_PROTOCOL_VERSION } from '../../../shared/ws-protocol.js'
 
@@ -476,7 +477,7 @@ async function getSessionTabId(
 test.describe.serial('sidebar status-tier sort (rust)', () => {
   test.setTimeout(300_000)
   let server: RustServer
-  let info: TestServerInfo
+  let info: E2eServerInfo
   let sharedRoot = ''
   let projectDir = ''
   let deviceB: Awaited<ReturnType<typeof connectRawDevice>>

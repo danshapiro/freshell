@@ -1,17 +1,10 @@
-import type { TestServerInfo } from './test-server.js'
+import type { E2eServerInfo } from './server-fixture-support.js'
 
 /**
  * External-target seam for the T3 oracle.
  *
  * When `FRESHELL_E2E_TARGET_URL` is set, the e2e-browser suite connects to an
- * EXTERNALLY-provided, already-running server (e.g. the Rust `freshell-server`
- * port) instead of spawning a fresh Node `TestServer`. This lets the identical
- * Playwright specs grade the port for full-flow + visual parity against the
- * ORIGINAL's committed baselines.
- *
- * This module changes NOTHING about the default behavior: when
- * `FRESHELL_E2E_TARGET_URL` is unset, `createE2eServerHandle()` returns a normal
- * `TestServer` and the suite behaves exactly as before.
+ * externally provided Rust server. Otherwise it starts an owned Rust server.
  *
  * Env vars (all optional except the URL):
  * - FRESHELL_E2E_TARGET_URL     http(s) base URL of the running server to grade.
@@ -23,39 +16,23 @@ import type { TestServerInfo } from './test-server.js'
  */
 
 /**
- * The minimal server surface the fixtures rely on. `TestServer`, `RustServer`,
- * and `ExternalServer` all satisfy this structurally.
+ * The minimal server surface the fixtures rely on. Owned Rust and external
+ * targets satisfy this structurally.
  */
 export interface E2eServerHandle {
-  start(): Promise<TestServerInfo>
+  start(): Promise<E2eServerInfo>
   stop(): Promise<void>
-  readonly info: TestServerInfo
+  readonly info: E2eServerInfo
   /**
    * Optional: stop the CURRENT owned process (keeping its isolated home) and
    * boot a fresh process bound to the SAME home/port/token. Implemented by
-   * the owned fixtures (`TestServer`, `RustServer`) for restart/recovery
+   * the owned Rust fixture for restart/recovery
    * specs (HARNESS-02). `ExternalServer` does not implement this -- it never
    * owns the target process, so it has nothing to restart.
    */
-  restart?(): Promise<TestServerInfo>
+  restart?(): Promise<E2eServerInfo>
 }
 
-/**
- * HARNESS-02 -- which real server implementation a worker's fixtures should
- * boot: the legacy Node server (`TestServer`) or the owned Rust binary
- * (`RustServer`). Selected per Playwright PROJECT via the `e2eServerKind`
- * fixture option (see `helpers/fixtures.ts` and `playwright.config.ts`), NOT
- * by this module -- this module only knows how to construct the handle once
- * a kind has been chosen.
- */
-export type E2eServerKind = 'legacy' | 'rust'
-
-/**
- * Construction options common to BOTH owned server kinds (a structural
- * subset of `TestServerOptions` and `RustServerOptions`). Kept here, rather
- * than importing either concrete options type, so this module does not
- * prefer one implementation's option surface over the other's.
- */
 export interface E2eServerConstructOptions {
   /** Extra environment variables merged into (and able to override) the spawned server's environment. */
   env?: Record<string, string>
@@ -72,9 +49,7 @@ export interface E2eServerConstructOptions {
 }
 
 export interface CreateE2eServerHandleOptions {
-  /** Which owned implementation to boot when no external target is configured (default: 'legacy'). */
-  kind?: E2eServerKind
-  /** Construction options forwarded to the chosen owned implementation's constructor. */
+  /** Construction options forwarded to the owned Rust server. */
   construct?: E2eServerConstructOptions
 }
 
@@ -125,19 +100,19 @@ export function resolveExternalTarget(env: NodeJS.ProcessEnv = process.env): Ext
  * it (this is what keeps the seam safe against, e.g., the user's live server).
  */
 export class ExternalServer implements E2eServerHandle {
-  private _info: TestServerInfo | null = null
+  private _info: E2eServerInfo | null = null
   private readonly startTimeoutMs: number
 
   constructor(private readonly env: NodeJS.ProcessEnv = process.env) {
     this.startTimeoutMs = Number(env.FRESHELL_E2E_TARGET_TIMEOUT_MS ?? 30_000)
   }
 
-  get info(): TestServerInfo {
+  get info(): E2eServerInfo {
     if (!this._info) throw new Error('ExternalServer not started')
     return this._info
   }
 
-  async start(): Promise<TestServerInfo> {
+  async start(): Promise<E2eServerInfo> {
     const target = resolveExternalTarget(this.env)
     await this.waitForHealth(target.baseUrl, this.startTimeoutMs)
     this._info = {
@@ -192,17 +167,9 @@ export class ExternalServer implements E2eServerHandle {
 
 /**
  * Returns the server handle the e2e fixtures should use for a worker:
- * - `ExternalServer` when `FRESHELL_E2E_TARGET_URL` is set (grade the port);
- *   this ALWAYS takes priority, regardless of `options.kind` -- it is the T3
- *   oracle seam and predates the HARNESS-02 matrix.
- * - otherwise, an owned `RustServer` when `options.kind === 'rust'`
- *   (HARNESS-02 matrix);
- * - otherwise a fresh local `TestServer` -- the original, default behavior,
- *   unchanged for every existing caller that does not pass `kind`.
- *
- * Both `TestServer` and `RustServer` are imported lazily so that a run only
- * ever loads the local-spawn machinery for the implementation it actually
- * needs (an external-target run loads neither).
+ * - `ExternalServer` when `FRESHELL_E2E_TARGET_URL` is set. It is always
+ *   non-owned and is never stopped.
+ * - otherwise an owned `RustServer`.
  */
 export async function createE2eServerHandle(
   env: NodeJS.ProcessEnv = process.env,
@@ -212,14 +179,7 @@ export async function createE2eServerHandle(
     return new ExternalServer(env)
   }
 
-  const kind = options.kind ?? 'legacy'
   const construct = options.construct ?? {}
-
-  if (kind === 'rust') {
-    const { RustServer } = await import('./rust-server.js')
-    return new RustServer(construct)
-  }
-
-  const { TestServer } = await import('./test-server.js')
-  return new TestServer(construct)
+  const { RustServer } = await import('./rust-server.js')
+  return new RustServer(construct)
 }

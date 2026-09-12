@@ -4,7 +4,7 @@
 // [--hostname H]`.
 //
 // Wire surface mirrors the consumer contract in
-// server/fresh-agent/adapters/opencode/serve-events.ts (flat SSE frames
+// the Rust OpenCode event adapter (flat SSE frames
 // `data: {"type":…,"properties":…}\n\n`; `server.connected` on connect;
 // `session.status {status:{type:'busy'|'idle'}}` + `session.idle`) and the
 // durable-resume probe in freshell-freshagent/src/opencode_ws.rs

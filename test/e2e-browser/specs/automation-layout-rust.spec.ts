@@ -2,7 +2,7 @@ import type { Page } from '@playwright/test'
 import { test, expect } from '../helpers/fixtures.js'
 import { createE2eServerHandle, type E2eServerHandle } from '../helpers/external-target.js'
 import { TestHarness } from '../helpers/test-harness.js'
-import type { TestServerInfo } from '../helpers/test-server.js'
+import type { E2eServerInfo } from '../helpers/server-fixture-support.js'
 
 /**
  * AUTOMATION LAYOUT PARITY (Task 23, rust-only) -- e2e proof of the Rust
@@ -28,27 +28,26 @@ import type { TestServerInfo } from '../helpers/test-server.js'
  *
  * PER-TEST OWNED SERVERS (auto-title-rust.spec.ts / Task 21 precedent): each
  * test boots its own `RustServer` (isolated HOME, ephemeral port) via
- * `createE2eServerHandle({kind:'rust'})`. Test 1 needs a deterministic
+ * `createE2eServerHandle()`. Test 1 needs a deterministic
  * 3-tab layout, Test 2 a deterministic 2-pane split, and Test 3 a server NO
  * browser page has EVER synced a layout into -- none of which can share a
  * worker-scoped server under `fullyParallel`. Registered rust-only in
  * `playwright.config.ts` (the LayoutStore-backed automation routes are this
- * sweep's Rust work; the frozen legacy `server/` tree is not under test).
  */
 
 interface BootedServer {
   server: E2eServerHandle
-  info: TestServerInfo
+  info: E2eServerInfo
 }
 
 async function bootRustServer(): Promise<BootedServer> {
-  const server = await createE2eServerHandle(process.env, { kind: 'rust' })
+  const server = await createE2eServerHandle(process.env)
   const info = await server.start()
   return { server, info }
 }
 
 /** Navigate + wait for the harness's WS connection to reach `ready`. */
-async function connect(page: Page, info: TestServerInfo): Promise<TestHarness> {
+async function connect(page: Page, info: E2eServerInfo): Promise<TestHarness> {
   await page.goto(`${info.baseUrl}/?token=${info.token}&e2e=1`)
   const harness = new TestHarness(page)
   await harness.waitForHarness()
@@ -104,7 +103,7 @@ async function splitAndSelectShell(page: Page, direction: 'horizontal' | 'vertic
 }
 
 /** `page.request` REST helpers (the brief pins page.request as the client). */
-function api(page: Page, info: TestServerInfo) {
+function api(page: Page, info: E2eServerInfo) {
   const headers = { 'content-type': 'application/json', 'x-auth-token': info.token }
   return {
     async get(pathname: string): Promise<any> {

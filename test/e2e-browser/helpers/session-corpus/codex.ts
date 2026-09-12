@@ -9,7 +9,6 @@
  * assistant). First user text → title; first assistant text → summary.
  *
  * Codex's own archive is a MOVE to `$CODEX_HOME/archived_sessions/…`; the
- * legacy glob covers only `sessions/` (recursively), so archived rollouts
  * are written there with expectation `absent` — that IS the expected semantics.
  */
 

@@ -15,10 +15,10 @@ export const FRESH_AGENT_CONTRACT_TRACEABILITY: readonly FreshAgentContractTrace
   FRESH_AGENT_CONTRACT_SCHEMA_NAMES.map((schema) => ({
     schema,
     producers: [
-      'server/fresh-agent/adapters/claude/normalize.ts',
-      'server/fresh-agent/adapters/codex/normalize.ts',
+      'crates/freshell-freshagent/src/claude.rs',
+      'crates/freshell-freshagent/src/codex.rs',
     ],
-    serverParser: 'server/fresh-agent/runtime-manager.ts',
+    serverParser: 'crates/freshell-server/src/main.rs',
     clientParser: 'src/lib/api.ts',
     stateOwner: 'src/store/freshAgentSlice.ts',
     uiConsumer: 'src/components/fresh-agent/FreshAgentView.tsx',

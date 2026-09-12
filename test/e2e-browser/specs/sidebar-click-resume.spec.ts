@@ -20,35 +20,23 @@ import { TestHarness } from '../helpers/test-harness.js'
  * historical session in the sidebar, and assert the newly-opened pane's
  * spawned CLI process actually receives `resume <sessionId>` in its argv
  * (not just that a pane opens with a plausible title, which
- * `restore-matrix.spec.ts`'s "opening a seeded historical session..."
  * scenario already covers for Claude without an argv-level check).
  *
  * Two provider legs:
  *
- *   - Amplifier (`amplifier resume <id>`): Rust-only, GREEN. KNOWN
- *     DIVERGENCE (same as `amplifier-restore-rust.spec.ts` and
- *     `session-directory-matrix.spec.ts`'s identical note): this checked-out
- *     branch's `server/` tree (legacy Node implementation, FROZEN for this
- *     task) predates upstream `origin/main` commit `05c6b1fa`
- *     ("feat(amplifier): durable session tracking via events.jsonl", #514)
- *     -- legacy has NO amplifier provider registered at all, so this leg is
- *     skipped (not silently omitted -- see the explicit `test.skip` call
- *     with its reason) on `legacy-chromium`. This test PASSES on
- *     `rust-chromium`: the click dispatches a resume, the pane gets a real
- *     `terminalId`, the spawned fake `amplifier` process's argv contains
+ *   - Amplifier (`amplifier resume <id>`): the Rust baseline dispatches a
+ *     resume, the pane gets a real `terminalId`, the spawned fake
+ *     `amplifier` process's argv contains
  *     `["resume", "<sessionId>"]`, and its stdout carries the matching
  *     "resumed session" marker -- the FULL clause the SESSION-01 checklist
  *     note left open ("resuming a session through the UI" via a deliberate
  *     click, not a restart-driven re-launch) is proven for this provider.
  *   - Codex (`codex resume <id>`, per `extensions/codex-cli/freshell.json`'s
- *     `resumeArgs` and `server/terminal-registry.ts:105`/
  *     `crates/freshell-platform/src/cli_launch_goldens.rs`'s G-X2):
- *     DIAGNOSTIC ONLY (`test.fixme`), NOT a green assertion, on EITHER
- *     server kind -- see the DISCOVERED comment on the test itself for the
- *     two independent findings (legacy: terminal-create settles into
- *     `status: 'error'`; rust: the actual resume happens through the
- *     FreshCodex JSON-RPC app-server sidecar, not a plain `codex resume
- *     <id>` CLI argv, so this fixture's premise doesn't match reality).
+ *     DIAGNOSTIC ONLY (`test.fixme`), NOT a green assertion. The Rust
+ *     baseline resumes through the FreshCodex JSON-RPC app-server sidecar,
+ *     not a plain `codex resume <id>` CLI argv, so this fixture's premise
+ *     does not match the current runtime.
  */
 
 const __filename = fileURLToPath(import.meta.url)
@@ -111,40 +99,14 @@ test.describe('Sidebar Click Resume', () => {
   test.setTimeout(90_000)
 
   // -------------------------------------------------------------------
-  // CODEX -- both server kinds (legacy is a genuine control; see file
-  // doc comment above).
+  // CODEX — Rust baseline.
   // -------------------------------------------------------------------
-  test('clicking a seeded Codex session in the sidebar spawns it via `codex resume <id>`', async ({ page, e2eServerKind }) => {
-    // DISCOVERED (2026-07-19) / RE-DIAGNOSED (2026-07-22 incident, "codex
-    // tabs lose their sessions on every server restart"):
-    //
-    //   - `legacy-chromium` (still `test.fixme`): clicking this seeded Codex
-    //     session's sidebar row correctly dispatches a resume (the pane's
-    //     persisted content shows the correct `sessionRef: { provider:
-    //     'codex', sessionId }` and `initialCwd`), but the server-side
-    //     terminal-create request settles into `content.status === 'error'`
-    //     with NO `terminalId` ever assigned -- confirmed with `CODEX_CMD`
-    //     pointed at a real, executable fake CLI (proven to work for the
-    //     identical claude-CLI shape in `restore-matrix.spec.ts`) and with
-    //     `codingCli.enabledProviders` explicitly including `codex` (ruling
-    //     out the `ws-handler.ts` enabled-provider gate). `server/` is
-    //     FROZEN, so this cannot be root-caused/fixed here.
-    //   - `rust-chromium` (now GREEN): the 2026-07-19 finding here -- a real
-    //     `terminalId` + running process whose argv was ONLY the `-c
-    //     key=value` overrides, no `["resume", id]` -- was MISDIAGNOSED as
-    //     "the resume routes through the FreshCodex JSON-RPC sidecar". It
-    //     was actually THE incident bug: the Rust WS create path's
-    //     codex-special resume derivation
-    //     (`crates/freshell-ws/src/terminal.rs`) read ONLY
-    //     `create.resumeSessionId` and ignored `create.sessionRef` -- the
-    //     only place the frozen client carries identity -- so the spawn was
-    //     plain `codex` with no resume args. Legacy derives the codex resume
-    //     id from the sessionRef (`server/ws-handler.ts:2040-2047`, the
-    //     `durable_session_ref_resume` plan); the fix aligns the Rust port
-    //     with that anchor, and this leg now passes as a real regression
-    //     guard (see also `codex-terminal-bounce-rust.spec.ts` for the
-    //     restart leg, and `crates/freshell-ws/tests/codex_session_ref_resume.rs`).
-    test.fixme(e2eServerKind === 'legacy', 'Legacy leg only -- see the legacy-chromium DISCOVERED finding above (frozen server/ tree settles this create into status:error).')
+  test('clicking a seeded Codex session in the sidebar spawns it via `codex resume <id>`', async ({ page }) => {
+    // The Rust terminal create path derives the Codex resume id from the
+    // pane's `sessionRef`; otherwise the launch would be plain `codex` with
+    // no `resume <id>` argv pair. This assertion remains an explicit
+    // TERM-22 diagnostic while `codex-terminal-bounce-rust.spec.ts` covers
+    // the corresponding restart path.
 
     // GATE-01 (2026-08-09): rust leg regressed on the df1/integration tip —
     // the sidebar click-resume settles with `content.terminalId` null (20 s
@@ -153,7 +115,7 @@ test.describe('Sidebar Click Resume', () => {
     // slice-7 AND isolated rerun reproof-s7-sideclick. Owner: TERM-22.
     // Pin masks assertions after :244 (B001: un-pin must re-verify all).
     test.fail(
-      e2eServerKind === 'rust',
+      true,
       'TERM-22: sidebar codex click-resume never assigns terminalId (GATE-01 2026-08-09; same family as codex-terminal-bounce)',
     )
 
@@ -169,7 +131,6 @@ test.describe('Sidebar Click Resume', () => {
       const fakeCodexPath = await installFakeCli(FAKE_CODEX_CLI_SOURCE, 'codex', path.join(sharedRoot, 'bin'))
 
       const server = await createE2eServerHandle(process.env, {
-        kind: e2eServerKind,
         construct: {
           env: { CODEX_CMD: fakeCodexPath, FAKE_CODEX_ARGV_LOG: argLogPath },
           setupHome: async (homeDir) => {
@@ -182,7 +143,6 @@ test.describe('Sidebar Click Resume', () => {
               },
             }, null, 2))
 
-            // Same real-reader shape as `session-directory-matrix.spec.ts`'s
             // codex seed: a `session_meta` record carrying `payload.id`/`cwd`
             // plus a `response_item`/`message` record so a real title is
             // extracted.
@@ -293,15 +253,9 @@ test.describe('Sidebar Click Resume', () => {
   })
 
   // -------------------------------------------------------------------
-  // AMPLIFIER -- Rust only. KNOWN DIVERGENCE: see file doc comment above.
+  // AMPLIFIER — Rust baseline.
   // -------------------------------------------------------------------
-  test('clicking a seeded Amplifier session in the sidebar spawns it via `amplifier resume <id>` (Rust only)', async ({ page, e2eServerKind }) => {
-    test.skip(
-      e2eServerKind !== 'rust',
-      'KNOWN DIVERGENCE: this branch\'s FROZEN legacy server/ tree predates upstream #514 (05c6b1fa) -- ' +
-      'no amplifier provider registered at all on legacy (see session-directory-matrix.spec.ts and ' +
-      'amplifier-restore-rust.spec.ts\'s identical note). Not a parity gap to gate per-assertion.',
-    )
+  test('clicking a seeded Amplifier session in the sidebar spawns it via `amplifier resume <id>`', async ({ page }) => {
 
     const AMPLIFIER_SESSION_ID = 'amp-click-resume-0001'
     const SESSION_TITLE = 'sidebar-click-resume amplifier session'
@@ -315,7 +269,6 @@ test.describe('Sidebar Click Resume', () => {
       const fakeAmplifierPath = await installFakeCli(FAKE_AMPLIFIER_CLI_SOURCE, 'amplifier', path.join(sharedRoot, 'bin'))
 
       const server = await createE2eServerHandle(process.env, {
-        kind: e2eServerKind,
         construct: {
           env: {
             AMPLIFIER_CMD: fakeAmplifierPath,
@@ -335,7 +288,6 @@ test.describe('Sidebar Click Resume', () => {
               },
             }, null, 2))
 
-            // Same shape as `session-directory-matrix.spec.ts`'s amplifier
             // seed: `metadata.json` + sibling `transcript.jsonl` under
             // `<amplifier_home>/projects/<slug>/sessions/<id>/`.
             const amplifierSessionDir = path.join(

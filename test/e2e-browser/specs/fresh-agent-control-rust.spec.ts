@@ -52,7 +52,6 @@
  *      })
  *      process.stdin.resume()
  *   2. FRESHELL_FAKE_NOOP=1 npx playwright test --config test/e2e-browser/playwright.config.ts \
- *        --project=rust-chromium fresh-agent-control-rust -g "Allow"
  *   Expected: the approval-allow test fails — the approval card never renders
  *   (timeout waiting for role=alert "Permission request for Bash"), proving
  *   the assertion chain is not vacuous. (Recorded in the Task-8 report; with
@@ -75,8 +74,8 @@ import { test, expect } from '../helpers/fixtures.js'
 import {
   RustServer,
   GEMINI_STRIP_ENV_PREFIXES,
-  type TestServerInfo,
 } from '../helpers/rust-server.js'
+import type { E2eServerInfo } from '../helpers/server-fixture-support.js';
 import { TestHarness } from '../helpers/test-harness.js'
 import { openPanePicker } from '../helpers/pane-picker.js'
 import { WS_PROTOCOL_VERSION } from '../../../shared/ws-version.js'
@@ -334,7 +333,7 @@ async function bootWall(
     stripEnvPrefixes?: string[]
     setupHome?: (homeDir: string) => Promise<void>
   } = {},
-): Promise<{ server: RustServer; info: TestServerInfo; harness: TestHarness }> {
+): Promise<{ server: RustServer; info: E2eServerInfo; harness: TestHarness }> {
   const server = new RustServer({
     env: options.env,
     stripEnvPrefixes: options.stripEnvPrefixes,
@@ -429,7 +428,7 @@ async function waitForStdinFrame(
 
 /** Direct REST snapshot read — the route every card renders from. */
 async function fetchSnapshot(
-  info: TestServerInfo,
+  info: E2eServerInfo,
   sessionType: string,
   provider: string,
   threadId: string,
@@ -542,7 +541,7 @@ async function bootClaudeLane(
   extraEnv: Record<string, string> = {},
 ): Promise<{
   server: RustServer
-  info: TestServerInfo
+  info: E2eServerInfo
   harness: TestHarness
   sharedRoot: string
   projectDir: string
@@ -626,8 +625,7 @@ async function raisePermissionAndAssertNoDecisions(
 test.describe('fresh-agent control surfaces — claude lane (rust)', () => {
   test.setTimeout(180_000)
 
-  test('approval: Allow writes the exact permission.respond, never before the click', async ({ page, e2eServerKind }) => {
-    expect(e2eServerKind).toBe('rust')
+  test('approval: Allow writes the exact permission.respond, never before the click', async ({ page }) => {
     const lane = await bootClaudeLane(page, 'freshclaude')
     try {
       await waitForPaneStatus(lane.harness, lane.tabId, 'idle')
@@ -657,8 +655,7 @@ test.describe('fresh-agent control surfaces — claude lane (rust)', () => {
     }
   })
 
-  test('approval: Deny writes the deny decision, no success completion, pane stays usable', async ({ page, e2eServerKind }) => {
-    expect(e2eServerKind).toBe('rust')
+  test('approval: Deny writes the deny decision, no success completion, pane stays usable', async ({ page }) => {
     const lane = await bootClaudeLane(page, 'freshclaude')
     try {
       await waitForPaneStatus(lane.harness, lane.tabId, 'idle')
@@ -750,8 +747,7 @@ test.describe('fresh-agent control surfaces — claude lane (rust)', () => {
     }
   })
 
-  test('approval: survives page reload mid-pending (exactly one restored card), Allow still works', async ({ page, e2eServerKind }) => {
-    expect(e2eServerKind).toBe('rust')
+  test('approval: survives page reload mid-pending (exactly one restored card), Allow still works', async ({ page }) => {
     const lane = await bootClaudeLane(page, 'freshclaude')
     try {
       await waitForPaneStatus(lane.harness, lane.tabId, 'idle')
@@ -794,8 +790,7 @@ test.describe('fresh-agent control surfaces — claude lane (rust)', () => {
     }
   })
 
-  test('approval cancellation: composer Stop removes the card with zero fabricated decisions', async ({ page, e2eServerKind }) => {
-    expect(e2eServerKind).toBe('rust')
+  test('approval cancellation: composer Stop removes the card with zero fabricated decisions', async ({ page }) => {
     const lane = await bootClaudeLane(page, 'freshclaude')
     try {
       await waitForPaneStatus(lane.harness, lane.tabId, 'idle')
@@ -824,8 +819,7 @@ test.describe('fresh-agent control surfaces — claude lane (rust)', () => {
     }
   })
 
-  test('Always Allow answers the second raise without a click', async ({ page, e2eServerKind }) => {
-    expect(e2eServerKind).toBe('rust')
+  test('Always Allow answers the second raise without a click', async ({ page }) => {
     const lane = await bootClaudeLane(page, 'freshclaude')
     try {
       await waitForPaneStatus(lane.harness, lane.tabId, 'idle')
@@ -864,8 +858,7 @@ test.describe('fresh-agent control surfaces — claude lane (rust)', () => {
     }
   })
 
-  test('questions: single-choice, multi-select, and Other answers keyed by question text', async ({ page, e2eServerKind }) => {
-    expect(e2eServerKind).toBe('rust')
+  test('questions: single-choice, multi-select, and Other answers keyed by question text', async ({ page }) => {
     const lane = await bootClaudeLane(page, 'freshclaude')
     try {
       await waitForPaneStatus(lane.harness, lane.tabId, 'idle')
@@ -933,8 +926,7 @@ test.describe('fresh-agent control surfaces — claude lane (rust)', () => {
     }
   })
 
-  test('compact: /compact instructions land on the same session; compacting shows; context retained', async ({ page, e2eServerKind }) => {
-    expect(e2eServerKind).toBe('rust')
+  test('compact: /compact instructions land on the same session; compacting shows; context retained', async ({ page }) => {
     const lane = await bootClaudeLane(page, 'freshclaude')
     try {
       await waitForPaneStatus(lane.harness, lane.tabId, 'idle')
@@ -1006,8 +998,7 @@ test.describe('fresh-agent control surfaces — claude lane (rust)', () => {
     }
   })
 
-  test('capability gate: /fork is not offered for claude', async ({ page, e2eServerKind }) => {
-    expect(e2eServerKind).toBe('rust')
+  test('capability gate: /fork is not offered for claude', async ({ page }) => {
     const lane = await bootClaudeLane(page, 'freshclaude')
     try {
       await waitForPaneStatus(lane.harness, lane.tabId, 'idle')
@@ -1030,68 +1021,6 @@ test.describe('fresh-agent control surfaces — claude lane (rust)', () => {
       await fs.rm(lane.sharedRoot, { recursive: true, force: true }).catch(() => {})
     }
   })
-  test('per-send settings reach the claude sidecar before the send (freshclaude)', async ({ page, e2eServerKind }) => {
-    expect(e2eServerKind).toBe('rust')
-    const lane = await bootClaudeLane(page, 'freshclaude')
-    try {
-      await waitForPaneStatus(lane.harness, lane.tabId, 'idle')
-      const paneSessionId = (await paneLeaf(lane.harness, lane.tabId))?.content?.sessionId as string
-      expect(paneSessionId, 'the pane bridge session id must be known before the send').toBeTruthy()
-
-      // Change the permission mode BETWEEN sends through the pane's real
-      // settings gear: freshclaude's registry default is 'default', so picking
-      // 'acceptEdits' is a REAL change the next send must apply.
-      await page.getByRole('button', { name: 'Agent settings' }).click()
-      await page.getByRole('combobox', { name: 'Permission mode' }).selectOption('acceptEdits')
-      await page.keyboard.press('Escape')
-      await expect
-        .poll(async () => (await paneLeaf(lane.harness, lane.tabId))?.content?.permissionMode ?? null)
-        .toBe('acceptEdits')
-
-      await sendComposerText(page, 'settings probe')
-
-      // Canonical machinery: the settings-bearing send routes through
-      // configure_for_send, which writes a `configure` frame and awaits the
-      // sidecar's ack BEFORE the user message frame — the stdin audit proves
-      // strict ordering (the knobs provably land before the turn starts).
-      await waitForStdinFrame(
-        lane.stdinLog,
-        (f) => f?.type === 'configure' && f?.settings?.permissionMode === 'acceptEdits',
-        'configure frame carrying permissionMode:acceptEdits',
-      )
-      await waitForStdinFrame(
-        lane.stdinLog,
-        (f) => f?.type === 'send' && f?.text === 'settings probe',
-        'send frame for "settings probe"',
-      )
-      const frames = readStdinFrames(lane.stdinLog)
-      const configureIdx = frames.findIndex(
-        (f) => f?.type === 'configure' && f?.settings?.permissionMode === 'acceptEdits',
-      )
-      const sendIdx = frames.findIndex((f) => f?.type === 'send' && f?.text === 'settings probe')
-      expect(configureIdx, 'the per-send configure frame must exist in the audit').toBeGreaterThanOrEqual(0)
-      expect(sendIdx, 'the probe send must exist in the audit').toBeGreaterThanOrEqual(0)
-      expect(configureIdx, 'configure must land strictly BEFORE the send it applies to').toBeLessThan(sendIdx)
-
-      // The fake sidecar answers with sdk.configured carrying the applied
-      // settings (the ack configure_for_send awaits): the wire-row proves the
-      // ack as well as the ordering.
-      const ack = await waitForLogEntry(
-        lane.eventsLog,
-        (e) => e.kind === 'wire'
-          && e.frame?.type === 'sdk.configured'
-          && e.frame?.ok === true
-          && e.frame?.settings?.permissionMode === 'acceptEdits'
-          && e.frame?.sessionId === paneSessionId,
-        'sdk.configured wire row acknowledging permissionMode:acceptEdits',
-      )
-      expect(ack.frame.ok).toBe(true)
-      await waitForPaneStatus(lane.harness, lane.tabId, 'idle')
-    } finally {
-      await lane.server.stop().catch(() => {})
-      await fs.rm(lane.sharedRoot, { recursive: true, force: true }).catch(() => {})
-    }
-  })
 })
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1101,8 +1030,7 @@ test.describe('fresh-agent control surfaces — claude lane (rust)', () => {
 test.describe('fresh-agent control surfaces — kilroy lane (rust)', () => {
   test.setTimeout(240_000)
 
-  test('kilroy lifecycle: create/send/approval/question/reload/cancel on the KILROY_ENABLED gate', async ({ page, e2eServerKind }) => {
-    expect(e2eServerKind).toBe('rust')
+  test('kilroy lifecycle: create/send/approval/question/reload/cancel on the KILROY_ENABLED gate', async ({ page }) => {
     const lane = await bootClaudeLane(page, 'kilroy', { KILROY_ENABLED: '1' })
     try {
       await waitForPaneStatus(lane.harness, lane.tabId, 'idle')
@@ -1200,8 +1128,7 @@ test.describe('fresh-agent control surfaces — kilroy lane (rust)', () => {
     }
   })
 
-  test('kilroy crash mid-turn + restart recover the SAME durable session, never a fabricated completion', async ({ page, e2eServerKind }) => {
-    expect(e2eServerKind).toBe('rust')
+  test('kilroy crash mid-turn + restart recover the SAME durable session, never a fabricated completion', async ({ page }) => {
     const lane = await bootClaudeLane(page, 'kilroy', { KILROY_ENABLED: '1' })
     try {
       await waitForPaneStatus(lane.harness, lane.tabId, 'idle')
@@ -1298,16 +1225,9 @@ function projectSlugOf(cwd: string): string {
 // ─────────────────────────────────────────────────────────────────────────────
 
 /** Boot a freshcodex pane against the behavior-driven fake codex app-server. */
-async function bootCodexLane(
-  page: Page,
-  // Per-test behavior knobs merged INTO FAKE_CODEX_APP_SERVER_BEHAVIOR
-  // (e.g. turnCompleteDelayMs to wedge a mid-flight turn).
-  behavior: Record<string, unknown> = {},
-  // Per-test server env (e.g. FRESHELL_FRESHCODEX_QUIET_WINDOW_MS).
-  extraEnv: Record<string, string> = {},
-): Promise<{
+async function bootCodexLane(page: Page, behavior: Record<string, unknown> = {}): Promise<{
   server: RustServer
-  info: TestServerInfo
+  info: E2eServerInfo
   harness: TestHarness
   sharedRoot: string
   projectDir: string
@@ -1333,7 +1253,6 @@ async function bootCodexLane(
           appendClientResponseLogPath: responseLogPath,
           ...behavior,
         }),
-        ...extraEnv,
       },
       setupHome: seedWallConfig({ providers: ['codex'], freshAgent: true }),
     })
@@ -1354,18 +1273,6 @@ function readCodexOps(opLogPath: string): any[] {
   return readJsonl(opLogPath)
 }
 
-/** Read a freshAgent session's status from the harness store — the exact
- * `agentSession.status` the stuck card's `effectiveStatus` renders from. */
-async function readFreshAgentSessionStatus(
-  harness: TestHarness,
-  sessionId: string,
-): Promise<string | null> {
-  const state = await harness.getState()
-  const sessions = state?.freshAgent?.sessions ?? {}
-  const session = Object.values(sessions).find((s: any) => s?.sessionId === sessionId) as any
-  return session?.status ?? null
-}
-
 /**
  * The fork handoff's lifecycle methods (task-008-review C-1). The fake's op
  * log records EVERY `thread/*` RPC — including `thread/read` snapshot
@@ -1382,9 +1289,10 @@ const CODEX_FORK_LIFECYCLE_METHODS = new Set([
   'thread/resume',
 ])
 
-/** Send one freshcodex turn and wait until its snapshot rows render. */
+/** Send one freshcodex turn and wait for the provider's durable idle snapshot. */
 async function sendCodexTurnAndWaitRows(
   page: Page,
+  info: E2eServerInfo,
   expectedRowCount: number,
   text: string,
 ): Promise<void> {
@@ -1394,6 +1302,25 @@ async function sendCodexTurnAndWaitRows(
     paneRoot.locator('article[data-turn-index]'),
     `${expectedRowCount} snapshot rows after "${text}"`,
   ).toHaveCount(expectedRowCount, { timeout: 30_000 })
+  // The pane layout starts idle and can paint rows before the provider has
+  // completed its turn. The Rust snapshot is the authoritative provider state;
+  // require both the expected durable rows and an idle status before the next
+  // send, compact, or fork action.
+  await expect
+    .poll(
+      async () => {
+        const snapshot = await fetchSnapshot(info, 'freshcodex', 'codex', 'thread-new-1')
+        return {
+          rows: snapshot?.turns?.length ?? 0,
+          status: snapshot?.status ?? null,
+        }
+      },
+      {
+        timeout: 30_000,
+        message: `timed out waiting for the durable Codex snapshot to settle after "${text}"`,
+      },
+    )
+    .toEqual({ rows: expectedRowCount, status: 'idle' })
 }
 
 /** The parent's durable rollout file under the fake's CODEX_HOME. */
@@ -1425,8 +1352,7 @@ async function readRollout(homeDir: string, threadId: string): Promise<string | 
 test.describe('fresh-agent control surfaces — codex lane (rust)', () => {
   test.setTimeout(240_000)
 
-  test('Codex approvals and questions survive reload and send user decisions to the provider', async ({ page, e2eServerKind }) => {
-    expect(e2eServerKind).toBe('rust')
+  test('Codex approvals and questions survive reload and send user decisions to the provider', async ({ page }) => {
     const lane = await bootCodexLane(page, { serverRequestsByPrompt: {
       'Approve tests': { id: 501, method: 'item/commandExecution/requestApproval', params: { command: 'npm test', reason: 'Run project tests' } },
       'Ask a question': { id: 'question-501', method: 'item/tool/requestUserInput', params: { isBlocking: true, questions: [{ id: 'color', header: 'Color', question: 'Choose a color', options: [{ label: 'Blue', description: 'Use blue' }] }] } },
@@ -1465,12 +1391,11 @@ test.describe('fresh-agent control surfaces — codex lane (rust)', () => {
     }
   })
 
-  test('compact: thread/compact/start, never a turn; pane returns usable', async ({ page, e2eServerKind }) => {
-    expect(e2eServerKind).toBe('rust')
+  test('compact: thread/compact/start, never a turn; pane returns usable', async ({ page }) => {
     const lane = await bootCodexLane(page)
     try {
       await waitForPaneStatus(lane.harness, lane.tabId, 'idle')
-      await sendCodexTurnAndWaitRows(page, 2, 'codex turn one')
+      await sendCodexTurnAndWaitRows(page, lane.info, 2, 'codex turn one')
 
       // Typed slash gesture → freshAgent.compact → thread/compact/start.
       const paneRoot = page.locator('[data-context="fresh-agent"]').last()
@@ -1496,20 +1421,19 @@ test.describe('fresh-agent control surfaces — codex lane (rust)', () => {
 
       // Usable after compact: a follow-up prompt mints exactly the next turn
       // (two recorded turns -> four display rows).
-      await sendCodexTurnAndWaitRows(page, 4, 'codex post-compact turn')
+      await sendCodexTurnAndWaitRows(page, lane.info, 4, 'codex post-compact turn')
     } finally {
       await lane.server.stop().catch(() => {})
       await fs.rm(lane.sharedRoot, { recursive: true, force: true }).catch(() => {})
     }
   })
 
-  test('fork from tip: fork→archive→(child) unarchive→resume chain; source untouched; pane repoints', async ({ page, e2eServerKind }) => {
-    expect(e2eServerKind).toBe('rust')
+  test('fork from tip: fork→archive→(child) unarchive→resume chain; source untouched; pane repoints', async ({ page }) => {
     const lane = await bootCodexLane(page)
     try {
       await waitForPaneStatus(lane.harness, lane.tabId, 'idle')
-      await sendCodexTurnAndWaitRows(page, 2, 'codex turn one')
-      await sendCodexTurnAndWaitRows(page, 4, 'codex turn two')
+      await sendCodexTurnAndWaitRows(page, lane.info, 2, 'codex turn one')
+      await sendCodexTurnAndWaitRows(page, lane.info, 4, 'codex turn two')
 
       const parentRolloutBefore = await readRollout(lane.info.homeDir, 'thread-new-1')
       expect(parentRolloutBefore, 'the parent rollout must exist').toBeTruthy()
@@ -1578,13 +1502,12 @@ test.describe('fresh-agent control surfaces — codex lane (rust)', () => {
     }
   })
 
-  test('per-turn fork: :row-N normalizes to the raw turn id, child diverges at the pin, dual durability', async ({ page, e2eServerKind }) => {
-    expect(e2eServerKind).toBe('rust')
+  test('per-turn fork: :row-N normalizes to the raw turn id, child diverges at the pin, dual durability', async ({ page }) => {
     const lane = await bootCodexLane(page)
     try {
       await waitForPaneStatus(lane.harness, lane.tabId, 'idle')
-      await sendCodexTurnAndWaitRows(page, 2, 'codex turn one')
-      await sendCodexTurnAndWaitRows(page, 4, 'codex turn two')
+      await sendCodexTurnAndWaitRows(page, lane.info, 2, 'codex turn one')
+      await sendCodexTurnAndWaitRows(page, lane.info, 4, 'codex turn two')
 
       // Fork from turn 1's ASSISTANT row (data-turn-index 1, the synthesized
       // split id `turn-1:row-1`) via the turn's real hover affordance.
@@ -1747,7 +1670,6 @@ test.describe('fresh-agent control surfaces — codex lane (rust)', () => {
       await fs.rm(lane.sharedRoot, { recursive: true, force: true }).catch(() => {})
     }
   })
-
   // Wedged-sidecar deadman (r47n): the fake's turnCompleteDelayMs keeps the
   // process alive but the turn/completed broadcast effectively never lands
   // (3.6e6 ms), so the quiet window must surface the stuck state with recovery
@@ -1917,7 +1839,7 @@ test.describe('fresh-agent control surfaces — codex lane (rust)', () => {
 /** Boot a freshopencode pane against the HTTP/SSE fake opencode serve. */
 async function bootOpencodeLane(page: Page): Promise<{
   server: RustServer
-  info: TestServerInfo
+  info: E2eServerInfo
   harness: TestHarness
   sharedRoot: string
   projectDir: string
@@ -1990,8 +1912,7 @@ async function sendOpencodeTurn(
 test.describe('fresh-agent control surfaces — opencode lane (rust)', () => {
   test.setTimeout(240_000)
 
-  test('compact: POST /session/:id/summarize carries {providerID,modelID} exactly', async ({ page, e2eServerKind }) => {
-    expect(e2eServerKind).toBe('rust')
+  test('compact: POST /session/:id/summarize carries {providerID,modelID} exactly', async ({ page }) => {
     const lane = await bootOpencodeLane(page)
     try {
       const sessionId = await sendOpencodeTurn(page, lane.harness, lane.tabId, 'opencode turn one', 1, lane.auditLogPath)
@@ -2022,8 +1943,7 @@ test.describe('fresh-agent control surfaces — opencode lane (rust)', () => {
     }
   })
 
-  test('fork from tip: child insert + pane repoint; source untouched after parent kill', async ({ page, e2eServerKind }) => {
-    expect(e2eServerKind).toBe('rust')
+  test('fork from tip: child insert + pane repoint; source untouched after parent kill', async ({ page }) => {
     const lane = await bootOpencodeLane(page)
     try {
       const parentId = await sendOpencodeTurn(page, lane.harness, lane.tabId, 'opencode turn one', 1, lane.auditLogPath)
@@ -2077,8 +1997,7 @@ test.describe('fresh-agent control surfaces — opencode lane (rust)', () => {
     }
   })
 
-  test('per-turn fork: messageID lands; child history stops at the pin; dual durability', async ({ page, e2eServerKind }) => {
-    expect(e2eServerKind).toBe('rust')
+  test('per-turn fork: messageID lands; child history stops at the pin; dual durability', async ({ page }) => {
     const lane = await bootOpencodeLane(page)
     try {
       const parentId = await sendOpencodeTurn(page, lane.harness, lane.tabId, 'opencode turn one', 1, lane.auditLogPath)

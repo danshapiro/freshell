@@ -35,8 +35,7 @@ function collectLeaves(node: any): any[] {
 test.describe('Rapid double abrupt restart (Rust only)', () => {
   test.setTimeout(180_000)
 
-  test('a shell pane converges across two rapid abrupt restarts', async ({ page, e2eServerKind }) => {
-    expect(e2eServerKind).toBe('rust')
+  test('a shell pane converges across two rapid abrupt restarts', async ({ page }) => {
     const server = new RustServer({})
     const info = await server.start()
     try {

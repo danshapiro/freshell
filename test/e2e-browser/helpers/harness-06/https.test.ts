@@ -12,7 +12,6 @@ import type { TargetServer } from './target-server.js'
 /**
  * HARNESS-06 trusted-HTTPS coverage: the committed test CA + leaf assets
  * (fixtures/tls/, marked DO NOT TRUST), an https target boot helper, and the
- * trust matrix TAURI-14/BROWSER-03 parameterize: trusted-with-CA succeeds,
  * no-CA rejects, and the unrelated self-signed "untrusted" cert rejects even
  * with the CA pinned.
  */
