@@ -4399,6 +4399,104 @@ async fn route_excludes_requesting_clients_own_generations() {
 }
 
 #[tokio::test]
+async fn route_scopes_recovery_to_requested_machine_instead_of_selecting_first_survivor() {
+    let tmp = tempfile::tempdir().unwrap();
+    write_snapshot(
+        tmp.path(),
+        "machinea",
+        "client-a",
+        1_000,
+        1,
+        json!([
+            {"tabKey":"machinea:tab-a","tabId":"tab-a","tabName":"wrong machine","status":"open","revision":1,"updatedAt":1000,
+             "paneCount":1,"panes":[{"paneId":"pane-a","kind":"terminal","payload":{"mode":"shell"}}]}
+        ]),
+    );
+    write_snapshot(
+        tmp.path(),
+        "machineb",
+        "client-b",
+        2_000,
+        1,
+        json!([
+            {"tabKey":"machineb:tab-b","tabId":"tab-b","tabName":"selected machine","status":"open","revision":1,"updatedAt":2000,
+             "paneCount":1,"panes":[{"paneId":"pane-b","kind":"terminal","payload":{"mode":"shell"}}]}
+        ]),
+    );
+
+    let (code, body) = get(
+        router(test_state(Some(tmp.path().to_path_buf()), None)),
+        "/api/recovery/inventory?clientInstanceId=me&bootAgoMs=1000000000000&machineId=machineb",
+        Some("tok"),
+    )
+    .await;
+
+    assert_eq!(code, StatusCode::OK);
+    assert_eq!(body["device"]["deviceId"], "machineb", "{body}");
+    assert_eq!(body["device"]["tabs"][0]["tabName"], "selected machine");
+    assert!(
+        body["otherDevices"].as_array().unwrap().is_empty(),
+        "a scoped recovery must never offer another machine: {body}"
+    );
+}
+
+#[test]
+fn requested_machine_scope_accepts_the_legacy_device_id_alias_and_rejects_conflicts() {
+    let legacy_alias = InventoryQuery {
+        client_instance_id: None,
+        boot_ago_ms: None,
+        machine_id: None,
+        device_id: Some("selected-machine".to_string()),
+    };
+    assert_eq!(
+        requested_machine_scope(&legacy_alias).unwrap(),
+        Some("selected-machine".to_string())
+    );
+
+    let conflict = InventoryQuery {
+        client_instance_id: None,
+        boot_ago_ms: None,
+        machine_id: Some("machine-a".to_string()),
+        device_id: Some("machine-b".to_string()),
+    };
+    assert_eq!(
+        requested_machine_scope(&conflict).unwrap_err(),
+        "machineId and deviceId must name the same machine"
+    );
+}
+
+#[tokio::test]
+async fn route_never_falls_back_to_another_machine_when_the_requested_scope_has_no_snapshot() {
+    let tmp = tempfile::tempdir().unwrap();
+    write_snapshot(
+        tmp.path(),
+        "machinewithsnapshot",
+        "client-a",
+        1_000,
+        1,
+        json!([
+            {"tabKey":"machinewithsnapshot:tab-a","tabId":"tab-a","tabName":"must not leak","status":"open","revision":1,"updatedAt":1000,
+             "paneCount":1,"panes":[{"paneId":"pane-a","kind":"terminal","payload":{"mode":"shell"}}]}
+        ]),
+    );
+
+    let (code, body) = get(
+        router(test_state(Some(tmp.path().to_path_buf()), None)),
+        "/api/recovery/inventory?clientInstanceId=me&bootAgoMs=1000000000000&machineId=machinewithoutsnapshot",
+        Some("tok"),
+    )
+    .await;
+
+    assert_eq!(code, StatusCode::OK);
+    assert_eq!(body["recoverable"], false, "{body}");
+    assert!(body["device"].is_null(), "{body}");
+    assert!(
+        body["otherDevices"].as_array().unwrap().is_empty(),
+        "{body}"
+    );
+}
+
+#[tokio::test]
 async fn route_never_offers_ledger_only_rows_without_parent_evidence() {
     // D8 route-level contract (deliberate rewrite of the old blanket-contract
     // test `route_serves_ledger_only_recovery_without_snapshots`): with NO

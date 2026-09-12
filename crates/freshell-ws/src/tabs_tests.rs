@@ -9,6 +9,8 @@ use crate::tabs_store_model::{
     DEFAULT_DEVICE_DISPLAY_TTL_DAYS, MINUTE_MS,
 };
 use serde_json::{json, Value};
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 
 fn open_record(tab_key: &str, tab_name: &str, updated_at: i64) -> Value {
     json!({
@@ -215,6 +217,98 @@ fn record_ownership_mismatch_is_rejected() {
         err,
         "Tabs registry record device metadata must match the snapshot device metadata"
     );
+}
+
+#[derive(Clone)]
+struct FixtureMachineDirectory {
+    labels: Arc<Mutex<HashMap<String, String>>>,
+}
+
+impl FixtureMachineDirectory {
+    fn with_machine(id: &str, label: &str) -> Self {
+        Self {
+            labels: Arc::new(Mutex::new(HashMap::from([(
+                id.to_string(),
+                label.to_string(),
+            )]))),
+        }
+    }
+}
+
+impl MachineIdentityStore for FixtureMachineDirectory {
+    fn resolve_for_tab_sync(&self, machine_id: &str) -> Result<Option<String>, String> {
+        Ok(self.labels.lock().unwrap().get(machine_id).cloned())
+    }
+
+    fn machine_exists(&self, machine_id: &str) -> bool {
+        self.labels.lock().unwrap().contains_key(machine_id)
+    }
+}
+
+#[test]
+fn server_owned_machine_directory_rejects_unknown_ids_and_canonicalizes_labels() {
+    let reg = TabsRegistry::new();
+    reg.install_machine_identity(Arc::new(FixtureMachineDirectory::with_machine(
+        "machine-1",
+        "Canonical desktop",
+    )));
+
+    let error = reg
+        .replace_client_snapshot(
+            "srv",
+            "unknown-machine",
+            "Client supplied label",
+            "client-1",
+            1,
+            vec![open_record("unknown:tab", "wrong", 1)],
+        )
+        .unwrap_err();
+    assert!(error.contains("Unknown machine ID"), "{error}");
+
+    reg.replace_client_snapshot(
+        "srv",
+        "machine-1",
+        "Stale client label",
+        "client-1",
+        1,
+        vec![open_record("machine-1:tab", "work", 2)],
+    )
+    .unwrap();
+    let data = reg.query("machine-1", "client-1", 30, now_ms()).unwrap();
+    assert_eq!(
+        data["localOpen"][0]["deviceLabel"], "Canonical desktop",
+        "the server canonical label, not the stale client label, is persisted"
+    );
+    assert_eq!(
+        data["localOpen"][0]["tabKey"], "machine-1:tab",
+        "canonicalizing a label never rekeys existing tab provenance"
+    );
+    assert!(reg
+        .query("unknown-machine", "client-1", 30, now_ms())
+        .is_err());
+    assert!(
+        !reg.retire_client_snapshot("unknown-machine", "client-1", 2),
+        "unknown IDs are rejected on every tab-sync mutation path"
+    );
+}
+
+#[test]
+fn legacy_metadata_keeps_a_real_label_when_a_watermark_has_no_label() {
+    let reg = TabsRegistry::new();
+    reg.replace_client_snapshot(
+        "srv",
+        "legacy-device",
+        "Original desktop",
+        "client-1",
+        1,
+        vec![open_record("legacy-device:tab", "work", 2)],
+    )
+    .unwrap();
+
+    let metadata = reg.legacy_device_metadata();
+    assert_eq!(metadata.len(), 1);
+    assert_eq!(metadata[0].device_id, "legacy-device");
+    assert_eq!(metadata[0].device_label, "Original desktop");
 }
 
 #[test]

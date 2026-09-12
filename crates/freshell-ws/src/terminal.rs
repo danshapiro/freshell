@@ -752,25 +752,7 @@ async fn handle_client_text(
     if let Some(msg_type) = value.get("type").and_then(|v| v.as_str()) {
         match msg_type {
             "tabs.sync.push" => {
-                // D8: refresh the connection identity from each push (same
-                // non-empty-string filter `validate_tabs_push` applies), so a
-                // mid-lifetime clientInstanceId rotation self-heals at the
-                // next push instead of waiting out a reconnect.
-                if let Some(device_id) = value
-                    .get("deviceId")
-                    .and_then(|v| v.as_str())
-                    .filter(|s| !s.is_empty())
-                {
-                    conn_identity.device_id = Some(device_id.to_string());
-                }
-                if let Some(client_instance_id) = value
-                    .get("clientInstanceId")
-                    .and_then(|v| v.as_str())
-                    .filter(|s| !s.is_empty())
-                {
-                    conn_identity.client_instance_id = Some(client_instance_id.to_string());
-                }
-                return handle_tabs_push(&value, ws_tx, state).await;
+                return handle_tabs_push(&value, ws_tx, state, conn_identity).await;
             }
             "tabs.sync.query" => return handle_tabs_query(&value, ws_tx, state).await,
             "tabs.sync.client.retire" => {
@@ -6366,7 +6348,12 @@ fn is_opencode_provider(provider: freshell_protocol::AgentProvider) -> bool {
 /// registry, then reply `tabs.sync.ack`. On a stale/invalid revision the registry
 /// returns `Err`, which we surface as an `error{code:INVALID_MESSAGE}` frame (the
 /// original's `catch` arm; the SPA maps a `/tabs/i` error to its sync-error state).
-async fn handle_tabs_push(value: &serde_json::Value, ws_tx: &mut WsSink, state: &WsState) -> bool {
+async fn handle_tabs_push(
+    value: &serde_json::Value,
+    ws_tx: &mut WsSink,
+    state: &WsState,
+    conn_identity: &mut ConnectionIdentity,
+) -> bool {
     match tabs_push_response(
         value,
         state.tabs.clone(),
@@ -6374,7 +6361,27 @@ async fn handle_tabs_push(value: &serde_json::Value, ws_tx: &mut WsSink, state: 
     )
     .await
     {
-        TabsPushResponse::Ack(message) => send(ws_tx, &message).await,
+        TabsPushResponse::Ack(message) => {
+            // Refresh provenance only AFTER the machine directory accepted
+            // this exact push. An unknown `deviceId` must never become a
+            // connection identity merely because it appeared in a rejected
+            // envelope.
+            if let Some(device_id) = value
+                .get("deviceId")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+            {
+                conn_identity.device_id = Some(device_id.to_string());
+            }
+            if let Some(client_instance_id) = value
+                .get("clientInstanceId")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+            {
+                conn_identity.client_instance_id = Some(client_instance_id.to_string());
+            }
+            send(ws_tx, &message).await
+        }
         TabsPushResponse::Error(frame) => send_raw(ws_tx, &frame).await,
     }
 }
@@ -8019,6 +8026,18 @@ mod connection_span_filter_tests {
 mod pane_reconcile_gate_tests {
     use super::*;
 
+    struct OnlyKnownMachine;
+
+    impl crate::tabs::MachineIdentityStore for OnlyKnownMachine {
+        fn resolve_for_tab_sync(&self, machine_id: &str) -> Result<Option<String>, String> {
+            Ok((machine_id == "known-machine").then(|| "Canonical machine".to_string()))
+        }
+
+        fn machine_exists(&self, machine_id: &str) -> bool {
+            machine_id == "known-machine"
+        }
+    }
+
     /// A REAL loopback websocket pair: a scratch axum app upgrades the client
     /// connection and hands its write half (the production `WsSink` type) to
     /// the test, so `handle_client_text` runs its real serialization + send
@@ -8141,6 +8160,43 @@ mod pane_reconcile_gate_tests {
             reconcile_deferral_budget_ms: crate::reconcile::RECONCILE_DEFERRAL_BUDGET_MS_DEFAULT,
             fresh_agent_respawn_counts: Default::default(),
         }
+    }
+
+    #[tokio::test]
+    async fn rejected_unknown_tabs_push_does_not_replace_connection_identity() {
+        let (mut ws_tx, mut client) = loopback_sink_and_client().await;
+        let state = state();
+        state
+            .tabs
+            .install_machine_identity(std::sync::Arc::new(OnlyKnownMachine));
+        let mut conn_identity = ConnectionIdentity {
+            device_id: Some("known-machine".to_string()),
+            client_instance_id: Some("known-client".to_string()),
+        };
+        let rejected_push = serde_json::json!({
+            "type": "tabs.sync.push",
+            "deviceId": "unknown-machine",
+            "deviceLabel": "Unknown machine",
+            "clientInstanceId": "unknown-client",
+            "snapshotRevision": 1,
+            "records": [],
+        });
+
+        assert!(
+            handle_tabs_push(&rejected_push, &mut ws_tx, &state, &mut conn_identity).await,
+            "a rejected tabs push must answer without disconnecting the client"
+        );
+        let frame = next_text_frame(&mut client).await;
+        assert_eq!(frame["type"], "error");
+        assert_eq!(frame["code"], "INVALID_MESSAGE");
+        assert!(frame["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("Unknown machine ID")));
+        assert_eq!(conn_identity.device_id.as_deref(), Some("known-machine"));
+        assert_eq!(
+            conn_identity.client_instance_id.as_deref(),
+            Some("known-client")
+        );
     }
 
     #[tokio::test]

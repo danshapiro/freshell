@@ -32,6 +32,7 @@
 //! caller sees the IO error and the registry keeps serving the last
 //! durably-committed state (Node throws out of the mutation, store.ts:1189).
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
@@ -54,6 +55,31 @@ use crate::tabs_store_model::{
 /// string-identical rejection both revision guards throw.
 const STALE_REVISION_ERROR: &str =
     "Stale snapshot revision rejected for tabs registry client snapshot";
+
+/// Server-owned machine-directory seam. The WebSocket protocol deliberately
+/// continues calling this a `deviceId`, but a configured directory is the
+/// authority that decides which IDs may write or query tab-sync data and what
+/// label is canonical for that ID.
+pub trait MachineIdentityStore: Send + Sync {
+    /// `Ok(None)` means the ID is unknown and must be rejected. An accepted
+    /// resolution records activity before returning the canonical label.
+    fn resolve_for_tab_sync(&self, machine_id: &str) -> Result<Option<String>, String>;
+
+    /// A read-only known-ID check for query paths. Queries run on the async
+    /// WebSocket loop, so this must not turn a routine read into a filesystem
+    /// write; accepted pushes perform the durable activity touch above.
+    fn machine_exists(&self, machine_id: &str) -> bool;
+}
+
+/// Historical device metadata extracted from the compact tabs registry during
+/// server boot. `freshell-server` imports these exact IDs into its separate
+/// machine directory without touching a tab key or snapshot path.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LegacyDeviceMetadata {
+    pub device_id: String,
+    pub device_label: String,
+    pub last_seen_at: i64,
+}
 
 /// The result of a `tabs.sync.push` (`tabs.sync.ack` payload).
 #[derive(Debug)]
@@ -89,6 +115,10 @@ pub struct TabsRegistry {
     /// Push/state caps — the store's own caps in durable mode, `DEFAULT_CAPS`
     /// otherwise.
     caps: Arc<TabsStoreCaps>,
+    /// Optional server-owned machine directory. It is installed after the
+    /// server imports every historical ID at boot; `None` preserves the
+    /// memory-only unit-test/no-home mode.
+    machine_identity: Arc<Mutex<Option<Arc<dyn MachineIdentityStore>>>>,
 }
 
 impl Default for TabsRegistry {
@@ -101,6 +131,7 @@ impl Default for TabsRegistry {
             persist_dir: None,
             store: None,
             caps: Arc::new(default_caps()),
+            machine_identity: Arc::new(Mutex::new(None)),
         }
     }
 }
@@ -130,7 +161,86 @@ impl TabsRegistry {
             persist_dir: persist_dir.map(Arc::new),
             store: Some(Arc::new(Mutex::new(store))),
             caps: Arc::new(caps),
+            machine_identity: Arc::new(Mutex::new(None)),
         }
+    }
+
+    /// Install the authoritative machine directory only after the server has
+    /// imported legacy IDs from this compact state and from snapshots. The
+    /// shared interior slot lets all cloned REST/WS registry handles observe
+    /// the same policy without adding a new field to every `WsState` literal.
+    pub fn install_machine_identity(&self, machine_identity: Arc<dyn MachineIdentityStore>) {
+        *self
+            .machine_identity
+            .lock()
+            .expect("machine identity registry lock") = Some(machine_identity);
+    }
+
+    /// Extract every exact device ID still represented by the compact durable
+    /// registry. This deliberately reads all durable components, not merely
+    /// `devices_by_id`, whose display TTL means it is not a canonical history.
+    pub fn legacy_device_metadata(&self) -> Vec<LegacyDeviceMetadata> {
+        let state = self.inner.lock().expect("tabs registry lock");
+        let mut candidates: HashMap<String, LegacyDeviceMetadata> = HashMap::new();
+        let mut consider = |device_id: &str, device_label: Option<&str>, last_seen_at: i64| {
+            if device_id.is_empty() {
+                return;
+            }
+            let label = device_label.filter(|label| !label.trim().is_empty());
+            match candidates.get_mut(device_id) {
+                Some(existing) if existing.last_seen_at > last_seen_at => {}
+                Some(existing) => {
+                    // Revision watermarks name an ID but carry no label. They
+                    // must never erase an otherwise useful historical label
+                    // just because their timestamp ties a richer component.
+                    if let Some(label) = label {
+                        existing.device_label = label.to_string();
+                    }
+                    existing.last_seen_at = last_seen_at;
+                }
+                None => {
+                    candidates.insert(
+                        device_id.to_string(),
+                        LegacyDeviceMetadata {
+                            device_id: device_id.to_string(),
+                            device_label: label.unwrap_or("Recovered device").to_string(),
+                            last_seen_at,
+                        },
+                    );
+                }
+            }
+        };
+
+        for device in state.devices_by_id.values() {
+            consider(
+                &device.device_id,
+                Some(&device.device_label),
+                device.last_seen_at,
+            );
+        }
+        for snapshot in state.open_snapshots_by_client.values() {
+            consider(
+                &snapshot.device_id,
+                Some(&snapshot.device_label),
+                snapshot.snapshot_received_at,
+            );
+        }
+        for watermark in state.client_revisions_by_client.values() {
+            consider(&watermark.device_id, None, watermark.last_seen_at);
+        }
+        for record in state.closed_by_tab_key.values() {
+            let device_id = record_str(record, "deviceId").unwrap_or_default();
+            let device_label = record_str(record, "deviceLabel");
+            consider(
+                &device_id,
+                device_label.as_deref(),
+                closed_at_or_updated(record),
+            );
+        }
+
+        let mut out: Vec<LegacyDeviceMetadata> = candidates.into_values().collect();
+        out.sort_by(|left, right| left.device_id.cmp(&right.device_id));
+        out
     }
 
     /// `replaceClientSnapshot` (store.ts:1091-1192): validate + canonicalize
@@ -150,8 +260,16 @@ impl TabsRegistry {
         device_label: &str,
         client_instance_id: &str,
         snapshot_revision: i64,
-        records: Vec<Value>,
+        mut records: Vec<Value>,
     ) -> Result<PushAck, String> {
+        let canonical_device_label = self.canonical_machine_label(device_id, device_label)?;
+        canonicalize_envelope_machine_metadata(
+            &mut records,
+            device_id,
+            device_label,
+            &canonical_device_label,
+        )?;
+        let device_label = canonical_device_label.as_str();
         let now = now_ms();
         // Pre-checks run OUTSIDE every lock (store.ts:1091-1107 run before
         // the mutation is enqueued).
@@ -278,6 +396,11 @@ impl TabsRegistry {
         client_instance_id: &str,
         snapshot_revision: i64,
     ) -> bool {
+        if let Err(error) = self.require_known_machine(device_id) {
+            tracing::warn!(target: "freshell_ws::tabs", device_id = %device_id, error = %error,
+                "tabs_sync_retire_rejected_unknown_machine");
+            return false;
+        }
         let now = now_ms();
         let Ok(key) = client_snapshot_key(device_id, client_instance_id) else {
             return false;
@@ -351,6 +474,7 @@ impl TabsRegistry {
         closed_tab_retention_days: i64,
         now_ms: i64,
     ) -> Result<Value, String> {
+        self.require_known_machine(device_id)?;
         if !(1..=30).contains(&closed_tab_retention_days) {
             return Err("Closed tab retention must be an integer from 1 to 30 days".to_string());
         }
@@ -487,6 +611,34 @@ impl TabsRegistry {
 
         (record_count, device_count)
     }
+
+    fn canonical_machine_label(
+        &self,
+        device_id: &str,
+        supplied_label: &str,
+    ) -> Result<String, String> {
+        match self.machine_identity() {
+            Some(directory) => directory
+                .resolve_for_tab_sync(device_id)?
+                .ok_or_else(|| format!("Unknown machine ID for tabs sync: {device_id}")),
+            None => Ok(supplied_label.to_string()),
+        }
+    }
+
+    fn require_known_machine(&self, device_id: &str) -> Result<(), String> {
+        match self.machine_identity() {
+            Some(directory) if directory.machine_exists(device_id) => Ok(()),
+            Some(_) => Err(format!("Unknown machine ID for tabs sync: {device_id}")),
+            None => Ok(()),
+        }
+    }
+
+    fn machine_identity(&self) -> Option<Arc<dyn MachineIdentityStore>> {
+        self.machine_identity
+            .lock()
+            .expect("machine identity registry lock")
+            .clone()
+    }
 }
 
 // ── Push pre-checks (store.ts:1091-1107 + ws-handler.ts:3122-3132) ──────────
@@ -499,6 +651,40 @@ struct PreparedPush {
     closed_records: Vec<Value>,
     push_hash: String,
     open_snapshot_hash: String,
+}
+
+/// Verify a record's client-supplied ownership against the legacy envelope,
+/// then rewrite its label to the server-owned canonical value before the
+/// normal tabs registry validator receives it. This preserves the existing
+/// anti-cross-machine ownership check while allowing an upgraded server to
+/// correct a stale client label without rejecting its workspace.
+fn canonicalize_envelope_machine_metadata(
+    records: &mut [Value],
+    device_id: &str,
+    supplied_label: &str,
+    canonical_label: &str,
+) -> Result<(), String> {
+    for record in records {
+        let Some(map) = record.as_object_mut() else {
+            continue;
+        };
+        for (field, expected) in [("deviceId", device_id), ("deviceLabel", supplied_label)] {
+            if map
+                .get(field)
+                .and_then(Value::as_str)
+                .is_some_and(|value| value != expected)
+            {
+                return Err(
+                    "Tabs registry record device metadata must match the snapshot device \
+                     metadata"
+                        .to_string(),
+                );
+            }
+        }
+        map.insert("deviceId".to_string(), json!(device_id));
+        map.insert("deviceLabel".to_string(), json!(canonical_label));
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]

@@ -1414,6 +1414,11 @@ pub struct RecoveryInventoryState {
 struct InventoryQuery {
     client_instance_id: Option<String>,
     boot_ago_ms: Option<u64>,
+    /// The server-owned machine selected by the client. `deviceId` remains
+    /// accepted below as a wire-compatible alias while the retained client
+    /// still speaks in device terms.
+    machine_id: Option<String>,
+    device_id: Option<String>,
 }
 
 pub fn router(state: RecoveryInventoryState) -> Router {
@@ -1450,6 +1455,12 @@ async fn inventory_handler(
     if !is_authed(&headers, &state.auth_token) {
         return unauthorized();
     }
+    let machine_scope = match requested_machine_scope(&q) {
+        Ok(scope) => scope,
+        Err(message) => {
+            return (StatusCode::BAD_REQUEST, Json(json!({ "error": message }))).into_response();
+        }
+    };
     let exclude = q.client_instance_id.unwrap_or_default();
     // D2/A16: anchor the concurrent-client filter to the requester's boot.
     // Missing param => 0 => boot_cutoff = now, so nothing that predates the
@@ -1459,7 +1470,7 @@ async fn inventory_handler(
         None => (vec![], vec![]),
         Some(dir) => {
             let job = tokio::task::spawn_blocking(move || {
-                read_foreign_unions(&dir, &exclude, boot_cutoff)
+                read_foreign_unions(&dir, &exclude, boot_cutoff, machine_scope.as_deref())
             });
             match job.await {
                 Ok(Ok(u)) => u,
@@ -1507,6 +1518,23 @@ async fn inventory_handler(
         &closes,
     ))
     .into_response()
+}
+
+/// Resolve the additive machine-scoping query without changing the existing
+/// device-shaped recovery wire contract. A selected scope is exact: it is
+/// never a hint that permits falling back to an unrelated surviving device.
+fn requested_machine_scope(query: &InventoryQuery) -> Result<Option<String>, &'static str> {
+    let machine_id = query.machine_id.as_deref();
+    let device_id = query.device_id.as_deref();
+    match (machine_id, device_id) {
+        (Some(machine), Some(device)) if machine != device => {
+            Err("machineId and deviceId must name the same machine")
+        }
+        (Some(""), _) | (_, Some("")) => Err("machineId must be a non-empty string"),
+        (Some(machine), _) => Ok(Some(machine.to_string())),
+        (_, Some(device)) => Ok(Some(device.to_string())),
+        (None, None) => Ok(None),
+    }
 }
 
 /// Read-only liveness join (D7): `(provider = mode, sessionId)` for every
@@ -1614,6 +1642,7 @@ fn read_foreign_unions(
     dir: &std::path::Path,
     exclude_client: &str,
     boot_cutoff: u64,
+    machine_scope: Option<&str>,
 ) -> std::io::Result<(Vec<DeviceUnion>, DeviceEvidence)> {
     use freshell_ws::tabs_persist::{
         list_snapshot_devices, read_device_overview, read_generations_union_by_ids, ComponentsUnion,
@@ -1624,6 +1653,9 @@ fn read_foreign_unions(
         return Ok((out, evidence));
     }
     'devices: for device in list_snapshot_devices(dir)? {
+        if machine_scope.is_some_and(|scope| scope != device) {
+            continue;
+        }
         let mut last_missing: Vec<String> = Vec::new();
         for _attempt in 0..UNION_READ_ATTEMPTS {
             let Some((_, generations)) = read_device_overview(dir, &device)? else {

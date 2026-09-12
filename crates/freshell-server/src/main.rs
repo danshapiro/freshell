@@ -33,6 +33,7 @@ mod identity_sink;
 mod instance_id;
 mod legacy_local_seed;
 mod logging;
+mod machines;
 mod managed_ports;
 mod migrations;
 mod net_bind;
@@ -553,6 +554,9 @@ async fn main() -> ExitCode {
     // `<home>/.freshell/tabs-snapshots/<deviceId>/` (last 5 per device) so a
     // device's tabs can be rebuilt after client-state loss (continuity trio,
     // docs/plans/2026-07-22-continuity-safety-trio.md).
+    let snapshots_dir = home
+        .as_ref()
+        .map(|home| home.join(".freshell").join("tabs-snapshots"));
     let tabs = match &home {
         Some(home) => {
             let store_root = home.join(".freshell").join("tabs-registry");
@@ -574,13 +578,39 @@ async fn main() -> ExitCode {
                     std::process::exit(1);
                 }
             };
-            freshell_ws::tabs::TabsRegistry::with_durable_store(
-                store,
-                Some(home.join(".freshell").join("tabs-snapshots")),
-            )
+            freshell_ws::tabs::TabsRegistry::with_durable_store(store, snapshots_dir.clone())
         }
         None => freshell_ws::tabs::TabsRegistry::new(),
     };
+    // Machine identities are server-owned and imported BEFORE any route or
+    // WebSocket handler receives traffic. The import preserves every legacy
+    // `deviceId` exactly, including IDs that now survive only in immutable
+    // snapshot directories; no tab key, ledger provenance, or snapshot path
+    // is rewritten during this migration.
+    let legacy_machine_candidates =
+        match machines::legacy_machine_candidates(&tabs, snapshots_dir.as_deref()) {
+            Ok(candidates) => candidates,
+            Err(error) => {
+                tracing::error!(target: "freshell_server::machines", error = %error,
+                    "machine_directory_legacy_discovery_failed");
+                eprintln!("Failed to discover legacy machine identities: {error}");
+                std::process::exit(1);
+            }
+        };
+    let machine_store = match machines::MachineStore::open(
+        home.as_ref()
+            .map(|home| home.join(".freshell").join("machines")),
+        legacy_machine_candidates,
+    ) {
+        Ok(store) => store,
+        Err(error) => {
+            tracing::error!(target: "freshell_server::machines", error = %error,
+                "machine_directory_open_failed");
+            eprintln!("Failed to open machine directory: {error}");
+            std::process::exit(1);
+        }
+    };
+    tabs.install_machine_identity(Arc::new(machine_store.clone()));
 
     // Follow-up 3.19: discover the CLI extensions (bundled `extensions/` + user/local
     // dirs) once. Feeds THREE consumers: the WS terminal spawner's coding-CLI command
@@ -1624,14 +1654,16 @@ async fn main() -> ExitCode {
             },
         ))
         .merge(boot::router(boot_state))
+        .merge(machines::router(machines::MachinesState {
+            auth_token: Arc::clone(&auth_token),
+            store: machine_store.clone(),
+        }))
         // Continuity trio Task 2: the tabs-sync snapshot read surface. The
         // `snapshots_dir` MUST match the `tabs-snapshots` dir wired into the
         // `TabsRegistry` above so the reads serve exactly what pushes persist.
         .merge(tabs_snapshots::router(tabs_snapshots::TabsSnapshotsState {
             auth_token: Arc::clone(&auth_token),
-            snapshots_dir: home
-                .as_ref()
-                .map(|h| h.join(".freshell").join("tabs-snapshots")),
+            snapshots_dir: snapshots_dir.clone(),
         }))
         // B3/P1.9 Task 2: the recovery-inventory read surface. Joins the SAME
         // tabs-snapshots store as `tabs_snapshots` above (read-only), the
@@ -1640,9 +1672,7 @@ async fn main() -> ExitCode {
         .merge(recovery_inventory::router(
             recovery_inventory::RecoveryInventoryState {
                 auth_token: auth_token.as_ref().clone(),
-                snapshots_dir: home
-                    .as_ref()
-                    .map(|h| h.join(".freshell").join("tabs-snapshots")),
+                snapshots_dir: snapshots_dir.clone(),
                 ledger: std::sync::Arc::clone(&pane_ledger),
                 registry: registry.clone(),
                 identity: terminal_identity.clone(),
