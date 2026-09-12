@@ -696,6 +696,7 @@ async function main(): Promise<void> {
   ipcMain.removeHandler('complete-setup')
   ipcMain.removeHandler('get-server-mode')
   ipcMain.removeHandler('get-server-status')
+  ipcMain.removeHandler('get-hostname')
   ipcMain.removeHandler('set-global-hotkey')
   ipcMain.removeHandler('install-update')
   ipcMain.removeHandler('get-launch-options')
@@ -723,29 +724,27 @@ async function main(): Promise<void> {
     }
   }
 
+  function isMainRenderer(event: unknown): boolean {
+    const typed = event as {
+      sender?: { id?: number }
+      senderFrame?: { url?: string }
+    }
+    if (mainWebContentsId === undefined || typed.sender?.id !== mainWebContentsId) return false
+    const expectedOrigin = getExpectedOrigin()
+    const frameUrl = typed.senderFrame?.url
+    if (!expectedOrigin || !frameUrl) return false
+    try {
+      return new URL(frameUrl).origin === expectedOrigin
+    } catch {
+      return false
+    }
+  }
+
   // Register system-browser link handler.
   registerOpenExternalHandler({
     ipcMain,
     shell,
-    isAllowedSender: (event) => {
-      const typed = event as {
-        sender?: { id?: number }
-        senderFrame?: { url?: string }
-      }
-      const senderId = typed.sender?.id
-      if (mainWebContentsId === undefined || senderId !== mainWebContentsId) {
-        return false
-      }
-      const expectedOrigin = getExpectedOrigin()
-      if (!expectedOrigin) return false
-      const frameUrl = typed.senderFrame?.url
-      if (!frameUrl) return false
-      try {
-        return new URL(frameUrl).origin === expectedOrigin
-      } catch {
-        return false
-      }
-    },
+    isAllowedSender: isMainRenderer,
   })
 
   // Register the complete-setup handler before runStartup so it is available
@@ -857,6 +856,11 @@ async function main(): Promise<void> {
     running: serverSpawner.isRunning() || attachedToOwnResidentServer,
     mode: desktopConfig.serverMode,
   }))
+
+  // Deliberately narrow renderer surface: the selected Freshell renderer can
+  // ask only for this desktop process's hostname. It accepts no arguments and
+  // is origin- and webContents-bound like open-external-url.
+  ipcMain.handle('get-hostname', (event) => (isMainRenderer(event) ? os.hostname() : ''))
 
   ipcMain.handle('set-global-hotkey', (_event, accelerator: string) => {
     return hotkeyManager.update(accelerator, () => {

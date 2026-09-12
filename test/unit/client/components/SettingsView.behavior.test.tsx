@@ -1,11 +1,8 @@
 import { describe, it, expect, vi } from 'vitest'
 import { act, fireEvent, screen, within } from '@testing-library/react'
-import { DEVICE_DISMISSED_STORAGE_KEY } from '@/store/storage-keys'
 import {
   createSettingsViewStore,
-  createTabRegistryState,
   installSettingsViewHooks,
-  makeRegistryRecord,
   renderSettingsView,
   switchSettingsTab,
 } from './settings-view-test-utils'
@@ -578,45 +575,16 @@ describe('SettingsView behavior sections', () => {
     })
   })
 
-  describe('Devices section', () => {
-    it('deletes a remote device row and persists dismissed device ids', async () => {
-      const store = createSettingsViewStore({
-        extraPreloadedState: {
-          tabRegistry: createTabRegistryState({
-            remoteOpen: [
-              makeRegistryRecord({ deviceId: 'remote-a', deviceLabel: 'studio-mac', tabKey: 'remote-a:tab-1' }),
-            ],
-            devices: [
-              { deviceId: 'remote-a', deviceLabel: 'studio-mac', lastSeenAt: 10 },
-              { deviceId: 'remote-b', deviceLabel: 'studio-mac', lastSeenAt: 5 },
-            ],
-            closed: [
-              makeRegistryRecord({
-                deviceId: 'remote-b',
-                deviceLabel: 'studio-mac',
-                tabKey: 'remote-b:tab-2',
-                tabId: 'tab-2',
-                status: 'closed',
-                closedAt: 5,
-                updatedAt: 5,
-              }),
-            ],
-          }),
-        },
-      })
+  describe('Machine section', () => {
+    it('shows the selected server-owned machine controls in Advanced settings', () => {
+      const store = createSettingsViewStore()
       renderSettingsView(store)
       switchSettingsTab('Advanced')
 
-      expect(screen.getAllByLabelText('Device name for studio-mac')).toHaveLength(2)
-
-      fireEvent.click(screen.getAllByRole('button', { name: 'Delete device studio-mac' })[0])
-
-      await act(async () => {
-        await Promise.resolve()
-      })
-
-      expect(screen.getAllByLabelText('Device name for studio-mac')).toHaveLength(1)
-      expect(JSON.parse(localStorage.getItem(DEVICE_DISMISSED_STORAGE_KEY) || '[]')).toEqual(['remote-a'])
+      expect(screen.getByRole('heading', { name: 'Machine' })).toBeInTheDocument()
+      expect(screen.getByRole('textbox', { name: 'Machine name' })).toHaveValue('Settings test machine')
+      expect(screen.getByRole('button', { name: 'Rename machine' })).toBeInTheDocument()
+      expect(screen.getByRole('button', { name: 'Switch machine' })).toBeInTheDocument()
     })
   })
 })

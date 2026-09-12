@@ -1,137 +1,112 @@
-import { useCallback, useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useState } from 'react'
 import { useAppDispatch, useAppSelector } from '@/store/hooks'
-import {
-  dismissDeviceIds,
-  persistDeviceAliasesForDevices,
-  persistOwnDeviceLabel,
-  setTabRegistryDeviceAliases,
-  setTabRegistryDismissedDeviceIds,
-  setTabRegistryDeviceLabel,
-} from '@/store/tabRegistrySlice'
-import { buildKnownDevices, type KnownDevice } from '@/lib/known-devices'
+import { renameMachine } from '@/lib/api'
+import { clearSelectedMachineId } from '@/lib/machine-identity'
+import { updateSelectedMachine, type MachineIdentityState } from '@/store/machineIdentitySlice'
+import { setTabRegistryDeviceMeta } from '@/store/tabRegistrySlice'
 import type { SettingsSectionProps } from './settings-types'
 import {
   SettingsSection,
   SettingsRow,
 } from './settings-controls'
 
+/**
+ * The wire protocol still calls this a device, but it is now the selected
+ * server-owned machine. There is intentionally no local alias or delete
+ * surface here: the server owns the canonical label and durable workspace.
+ */
 export default function DevicesSettings(_props: SettingsSectionProps) {
   const dispatch = useAppDispatch()
-  const tabRegistryState = useAppSelector((s) => (s as any).tabRegistry)
-  const fallbackTabRegistry = useMemo(() => ({
-    deviceId: 'local-device',
-    deviceLabel: 'local-device',
-    deviceAliases: {} as Record<string, string>,
-    dismissedDeviceIds: [] as string[],
-    localOpen: [],
-    sameDeviceOpen: [],
-    remoteOpen: [],
-    closed: [],
-    devices: [],
-  }), [])
-  const tabRegistry = tabRegistryState ?? fallbackTabRegistry
-  const [deviceNameInputs, setDeviceNameInputs] = useState<Record<string, string>>({})
-
-  const knownDevices = useMemo(() => {
-    return buildKnownDevices({
-      ownDeviceId: tabRegistry.deviceId,
-      ownDeviceLabel: tabRegistry.deviceLabel,
-      deviceAliases: tabRegistry.deviceAliases,
-      dismissedDeviceIds: tabRegistry.dismissedDeviceIds,
-      localOpen: tabRegistry.localOpen,
-      sameDeviceOpen: tabRegistry.sameDeviceOpen,
-      remoteOpen: tabRegistry.remoteOpen,
-      closed: tabRegistry.closed,
-      devices: tabRegistry.devices,
-    })
-  }, [tabRegistry])
+  const machineIdentity = useAppSelector(
+    (state) => (state as unknown as { machineIdentity?: MachineIdentityState }).machineIdentity,
+  )
+  const machine = machineIdentity?.selectedMachine
+  const [label, setLabel] = useState(machine?.label ?? '')
+  const [saving, setSaving] = useState(false)
+  const [error, setError] = useState<string | undefined>()
 
   useEffect(() => {
-    setDeviceNameInputs((current) => {
-      const next: Record<string, string> = {}
-      for (const device of knownDevices) {
-        next[device.key] = current[device.key] ?? device.effectiveLabel
-      }
-      const changed =
-        Object.keys(current).length !== Object.keys(next).length ||
-        Object.entries(next).some(([key, value]) => current[key] !== value)
-      return changed ? next : current
-    })
-  }, [knownDevices])
+    setLabel(machine?.label ?? '')
+  }, [machine?.id, machine?.label])
 
-  const saveDeviceName = useCallback((device: KnownDevice) => {
-    const nextValue = (deviceNameInputs[device.key] || '').trim()
-    if (device.isOwn) {
-      const persisted = persistOwnDeviceLabel(nextValue || tabRegistry.deviceLabel)
-      dispatch(setTabRegistryDeviceLabel(persisted))
-      setDeviceNameInputs((current) => ({ ...current, [device.key]: persisted }))
+  const renameSelectedMachine = useCallback(async () => {
+    const nextLabel = label.trim()
+    if (!machine) {
+      setError('No machine has been selected yet.')
       return
     }
-    const aliases = persistDeviceAliasesForDevices(device.deviceIds, nextValue || undefined)
-    dispatch(setTabRegistryDeviceAliases(aliases))
-    setDeviceNameInputs((current) => ({
-      ...current,
-      [device.key]: device.deviceIds.map((deviceId) => aliases[deviceId]).find(Boolean) || device.baseLabel,
-    }))
-  }, [deviceNameInputs, dispatch, tabRegistry.deviceLabel])
+    if (!nextLabel) {
+      setError('Enter a machine name.')
+      return
+    }
 
-  const deleteDevice = useCallback((device: KnownDevice) => {
-    if (device.isOwn) return
+    setSaving(true)
+    setError(undefined)
+    try {
+      const renamed = await renameMachine(machine.id, nextLabel)
+      dispatch(updateSelectedMachine(renamed))
+      // Keep the established wire fields canonical until the next hello/sync.
+      dispatch(setTabRegistryDeviceMeta({
+        deviceId: renamed.id,
+        deviceLabel: renamed.label,
+      }))
+      setLabel(renamed.label)
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : 'Could not rename this machine.')
+    } finally {
+      setSaving(false)
+    }
+  }, [dispatch, label, machine])
 
-    const aliases = persistDeviceAliasesForDevices(device.deviceIds, undefined)
-    const dismissedIds = dismissDeviceIds(device.deviceIds)
-    dispatch(setTabRegistryDeviceAliases(aliases))
-    dispatch(setTabRegistryDismissedDeviceIds(dismissedIds))
-    setDeviceNameInputs((current) => {
-      const next = { ...current }
-      delete next[device.key]
-      return next
-    })
-  }, [dispatch])
+  const switchMachine = useCallback(() => {
+    // The reload is a transport boundary. It stops the current tab-sync lane
+    // before the chooser begins the next machine's scoped restoration.
+    clearSelectedMachineId()
+    window.location.reload()
+  }, [])
 
   return (
     <SettingsSection
-      title="Devices"
-      description="Rename devices for the Tabs workspace. Remote device aliases apply only on this machine."
+      title="Machine"
+      description="This machine determines which saved workspace this Freshell client opens on this server."
     >
-      {knownDevices.map((device) => (
-        <SettingsRow
-          key={device.key}
-          label={device.isOwn ? 'This machine' : device.baseLabel}
-          description={device.isOwn ? 'Renaming this updates what other machines see.' : 'Alias stored locally on this machine only.'}
+      <SettingsRow
+        label="Current machine"
+        description={machine ? 'Rename the machine shown to other Freshell clients.' : 'A machine is selected while Freshell starts.'}
+      >
+        <div className="flex w-full flex-col gap-2 md:w-auto md:flex-row md:items-center">
+          <input
+            type="text"
+            value={label}
+            disabled={!machine || saving}
+            onChange={(event) => setLabel(event.target.value)}
+            className="h-10 w-full min-w-[14rem] rounded-md border border-border bg-muted px-3 text-sm focus:outline-none focus:ring-1 focus:ring-border md:h-8 md:w-[20rem]"
+            aria-label="Machine name"
+            placeholder="Machine name"
+          />
+          <button
+            type="button"
+            onClick={() => void renameSelectedMachine()}
+            disabled={!machine || saving}
+            className="h-10 shrink-0 rounded-md border border-border px-3 text-sm hover:bg-muted disabled:cursor-not-allowed disabled:opacity-50 md:h-8"
+          >
+            Rename machine
+          </button>
+        </div>
+      </SettingsRow>
+      <SettingsRow
+        label="Choose another machine"
+        description="Open the chooser to use a different saved workspace or add this computer."
+      >
+        <button
+          type="button"
+          onClick={switchMachine}
+          className="h-10 rounded-md border border-border px-3 text-sm hover:bg-muted md:h-8"
         >
-          <div className="flex w-full items-center gap-2 md:w-auto">
-            <input
-              type="text"
-              value={deviceNameInputs[device.key] ?? device.effectiveLabel}
-              onChange={(event) => setDeviceNameInputs((current) => ({
-                ...current,
-                [device.key]: event.target.value,
-              }))}
-              className="h-10 w-full min-w-[14rem] px-3 text-sm bg-muted border-0 rounded-md focus:outline-none focus:ring-1 focus:ring-border md:h-8 md:w-[20rem]"
-              aria-label={`Device name for ${device.effectiveLabel}`}
-              placeholder={device.baseLabel}
-            />
-            <button
-              type="button"
-              onClick={() => saveDeviceName(device)}
-              className="h-10 px-3 text-sm rounded-md border border-border hover:bg-muted md:h-8"
-            >
-              Save
-            </button>
-            {!device.isOwn ? (
-              <button
-                type="button"
-                onClick={() => deleteDevice(device)}
-                className="h-10 px-3 text-sm rounded-md border border-border hover:bg-muted md:h-8"
-                aria-label={`Delete device ${device.effectiveLabel}`}
-              >
-                Delete
-              </button>
-            ) : null}
-          </div>
-        </SettingsRow>
-      ))}
+          Switch machine
+        </button>
+      </SettingsRow>
+      {error ? <p role="alert" className="text-sm text-destructive">{error}</p> : null}
     </SettingsSection>
   )
 }

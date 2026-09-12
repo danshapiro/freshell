@@ -15,6 +15,7 @@ import sessionsReducer from '@/store/sessionsSlice'
 import extensionsReducer from '@/store/extensionsSlice'
 import { networkReducer, type NetworkState, type NetworkStatusResponse } from '@/store/networkSlice'
 import tabRegistryReducer, { type TabRegistryState } from '@/store/tabRegistrySlice'
+import machineIdentityReducer from '@/store/machineIdentitySlice'
 import type { RegistryTabRecord } from '@/store/tabRegistryTypes'
 import { serverSettingsSaveStateMiddleware } from '@/store/settingsThunks'
 import type { AppSettings } from '@/store/types'
@@ -185,6 +186,7 @@ export function createSettingsViewStore(options: CreateSettingsViewStoreOptions 
       extensions: extensionsReducer,
       network: networkReducer,
       tabRegistry: tabRegistryReducer,
+      machineIdentity: machineIdentityReducer,
     },
     middleware: (getDefault) =>
       getDefault({
@@ -198,6 +200,17 @@ export function createSettingsViewStore(options: CreateSettingsViewStoreOptions 
         entries: defaultCliExtensions,
       },
       tabRegistry: createTabRegistryState(),
+      machineIdentity: {
+        status: 'ready' as const,
+        mode: 'server-managed' as const,
+        selectedMachine: {
+          id: 'machine-settings-test',
+          label: 'Settings test machine',
+          createdAt: 1_789_171_200_000,
+          lastSeenAt: 1_789_171_200_000,
+        },
+        machines: [],
+      },
       ...extraPreloadedState,
     },
   })

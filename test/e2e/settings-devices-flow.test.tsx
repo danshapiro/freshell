@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { act, cleanup, fireEvent, render, screen } from '@testing-library/react'
+import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { Provider } from 'react-redux'
 import { configureStore } from '@reduxjs/toolkit'
 import SettingsView from '@/components/SettingsView'
@@ -8,16 +8,18 @@ import tabsReducer from '@/store/tabsSlice'
 import connectionReducer from '@/store/connectionSlice'
 import sessionsReducer from '@/store/sessionsSlice'
 import { networkReducer } from '@/store/networkSlice'
-import tabRegistryReducer, { type TabRegistryState } from '@/store/tabRegistrySlice'
-import { DEVICE_DISMISSED_STORAGE_KEY } from '@/store/storage-keys'
-import type { RegistryTabRecord } from '@/store/tabRegistryTypes'
+import tabRegistryReducer from '@/store/tabRegistrySlice'
+import machineIdentityReducer, { setMachineReady } from '@/store/machineIdentitySlice'
 import {
   composeResolvedSettings,
   createDefaultServerSettings,
   resolveLocalSettings,
 } from '@shared/settings'
 
+const renameMachine = vi.hoisted(() => vi.fn())
+
 vi.mock('@/lib/api', () => ({
+  renameMachine: (...args: unknown[]) => renameMachine(...args),
   api: {
     patch: vi.fn().mockResolvedValue({}),
     get: vi.fn().mockResolvedValue({}),
@@ -27,50 +29,19 @@ vi.mock('@/lib/api', () => ({
   },
 }))
 
-function makeRecord(overrides: Partial<RegistryTabRecord>): RegistryTabRecord {
-  return {
-    tabKey: 'remote-a:tab-1',
-    tabId: 'tab-1',
-    serverInstanceId: 'srv-test',
-    deviceId: 'remote-a',
-    deviceLabel: 'studio-mac',
-    tabName: 'work item',
-    status: 'open',
-    revision: 1,
-    createdAt: 1,
-    updatedAt: 2,
-    paneCount: 1,
-    titleSetByUser: false,
-    panes: [],
-    ...overrides,
-  }
+const MACHINE = {
+  id: 'machine-desktop',
+  label: 'DANDESKTOP',
+  createdAt: 1_789_171_200_000,
+  lastSeenAt: 1_789_171_200_000,
 }
 
-function createTabRegistryState(overrides: Partial<TabRegistryState> = {}): TabRegistryState {
-  return {
-    ...(tabRegistryReducer(undefined, { type: '@@INIT' }) as TabRegistryState),
-    deviceId: 'local-device',
-    deviceLabel: 'local-device',
-    localOpen: [],
-    sameDeviceOpen: [],
-    remoteOpen: [],
-    devices: [],
-    closed: [],
-    localClosed: {},
-    closedTabRetentionDays: 30,
-    loading: false,
-    searchRangeDays: 30,
-    ...overrides,
-  }
-}
-
-function createStore(tabRegistryState: Partial<TabRegistryState> = {}) {
+function createStore() {
   const serverSettings = createDefaultServerSettings({
     loggingDebug: defaultSettings.logging.debug,
   })
   const localSettings = resolveLocalSettings()
-
-  return configureStore({
+  const store = configureStore({
     reducer: {
       settings: settingsReducer,
       tabs: tabsReducer,
@@ -78,13 +49,11 @@ function createStore(tabRegistryState: Partial<TabRegistryState> = {}) {
       sessions: sessionsReducer,
       network: networkReducer,
       tabRegistry: tabRegistryReducer,
+      machineIdentity: machineIdentityReducer,
     },
-    middleware: (getDefault) =>
-      getDefault({
-        serializableCheck: {
-          ignoredPaths: ['sessions.expandedProjects'],
-        },
-      }),
+    middleware: (getDefault) => getDefault({
+      serializableCheck: { ignoredPaths: ['sessions.expandedProjects'] },
+    }),
     preloadedState: {
       settings: {
         serverSettings,
@@ -93,43 +62,26 @@ function createStore(tabRegistryState: Partial<TabRegistryState> = {}) {
         loaded: true,
         lastSavedAt: undefined,
       },
-      tabRegistry: createTabRegistryState(tabRegistryState),
     },
   })
+  store.dispatch(setMachineReady({ machine: MACHINE, mode: 'server-managed' }))
+  return store
 }
 
-describe('settings devices management flow (e2e)', () => {
+describe('settings machine management flow (e2e)', () => {
   beforeEach(() => {
     localStorage.clear()
-    vi.useFakeTimers()
+    renameMachine.mockReset()
   })
 
   afterEach(() => {
     cleanup()
-    vi.useRealTimers()
+    localStorage.clear()
   })
 
-  it('renders server-backed device rows, deletes one remote device, and renders Devices last', async () => {
-    const store = createStore({
-      remoteOpen: [
-        makeRecord({ deviceId: 'remote-a', deviceLabel: 'studio-mac', tabKey: 'remote-a:tab-1' }),
-      ],
-      devices: [
-        { deviceId: 'remote-a', deviceLabel: 'studio-mac', lastSeenAt: 10 },
-        { deviceId: 'remote-b', deviceLabel: 'studio-mac', lastSeenAt: 5 },
-      ],
-      closed: [
-        makeRecord({
-          deviceId: 'remote-b',
-          deviceLabel: 'studio-mac',
-          tabKey: 'remote-b:tab-2',
-          tabId: 'tab-2',
-          status: 'closed',
-          closedAt: 5,
-          updatedAt: 5,
-        }),
-      ],
-    })
+  it('renames the selected machine and exposes the switch control through Settings', async () => {
+    renameMachine.mockResolvedValue({ ...MACHINE, label: 'Dan desktop' })
+    const store = createStore()
 
     render(
       <Provider store={store}>
@@ -137,21 +89,18 @@ describe('settings devices management flow (e2e)', () => {
       </Provider>,
     )
 
-    fireEvent.click(screen.getByRole('tab', { name: /^network$/i }))
-    expect(screen.getByRole('heading', { name: /^network$/i })).toBeInTheDocument()
-    expect(screen.getByRole('switch', { name: /remote access/i })).toBeInTheDocument()
-
     fireEvent.click(screen.getByRole('tab', { name: /^advanced$/i }))
-    expect(screen.getAllByLabelText('Device name for studio-mac')).toHaveLength(2)
-    expect(screen.getByRole('heading', { name: 'Devices' })).toBeInTheDocument()
+    expect(screen.getByRole('heading', { name: 'Machine' })).toBeInTheDocument()
 
-    fireEvent.click(screen.getAllByRole('button', { name: 'Delete device studio-mac' })[0])
-
-    await act(async () => {
-      await Promise.resolve()
+    fireEvent.change(screen.getByRole('textbox', { name: 'Machine name' }), {
+      target: { value: 'Dan desktop' },
     })
+    fireEvent.click(screen.getByRole('button', { name: 'Rename machine' }))
 
-    expect(screen.getAllByLabelText('Device name for studio-mac')).toHaveLength(1)
-    expect(JSON.parse(localStorage.getItem(DEVICE_DISMISSED_STORAGE_KEY) || '[]')).toEqual(['remote-a'])
+    await waitFor(() => {
+      expect(renameMachine).toHaveBeenCalledWith(MACHINE.id, 'Dan desktop')
+    })
+    expect(store.getState().machineIdentity.selectedMachine?.label).toBe('Dan desktop')
+    expect(screen.getByRole('button', { name: 'Switch machine' })).toBeInTheDocument()
   })
 })

@@ -1287,6 +1287,28 @@ export const panesSlice = createSlice({
       delete state.restoreFallbackAttemptsByPane?.[tabId]
     },
 
+    /** See tabs/clearTabsForMachine. This runs before selected-machine
+     * recovery while no terminal components are mounted, so it deliberately
+     * bypasses the ordinary close workflow rather than producing false close
+     * records for another machine's panes. */
+    clearPanesForMachine: (state) => {
+      state.layouts = {}
+      state.activePane = {}
+      state.paneTitles = {}
+      state.paneTitleSetByUser = {}
+      state.renameRequestTabId = null
+      state.renameRequestPaneId = null
+      state.zoomedPane = {}
+      state.refreshRequestsByPane = {}
+      state.focusEpochByPaneId = {}
+      state.restoreFallbackAttemptsByPane = {}
+      state.deadSessionAdjudication = []
+      state.reconcileWarming = null
+      state.reconcilePendingPanes = {}
+      state.closingTabs = {}
+      state.closingPanes = {}
+    },
+
     splitPane: (
       state,
       action: PayloadAction<{
@@ -2737,6 +2759,7 @@ export const {
   initLayout,
   restoreLayout,
   resetLayout,
+  clearPanesForMachine,
   splitPane,
   addPane,
   closePane,

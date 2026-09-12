@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import reducer, {
+  resolveAndPersistDeviceMeta,
   setTabRegistryLoading,
   setTabRegistrySnapshot,
   setTabRegistrySyncError,
@@ -61,6 +62,22 @@ describe('tabRegistrySlice', () => {
     expect(DEVICE_LABEL_CUSTOM_STORAGE_KEY).toBe('freshell.device-label-custom.v2')
     expect(DEVICE_FINGERPRINT_STORAGE_KEY).toBe('freshell.device-fingerprint.v2')
     expect(DEVICE_ALIASES_STORAGE_KEY).toBe('freshell.device-aliases.v2')
+  })
+
+  it('keeps a legacy device id and label stable when browser metadata changes', () => {
+    localStorage.setItem(DEVICE_ID_STORAGE_KEY, 'legacy-machine')
+    localStorage.setItem(DEVICE_LABEL_STORAGE_KEY, 'legacy-label')
+    localStorage.setItem(DEVICE_LABEL_CUSTOM_STORAGE_KEY, '0')
+    // Older builds wrote this value. A change in it must no longer mint a
+    // second machine, and the server hostname must never rename the client.
+    localStorage.setItem('freshell.device-fingerprint.v2', 'obsolete-browser-fingerprint')
+
+    const meta = resolveAndPersistDeviceMeta({
+      platform: 'linux',
+      hostName: 'the-server-hostname',
+    })
+
+    expect(meta).toEqual({ deviceId: 'legacy-machine', deviceLabel: 'legacy-label' })
   })
 
   it('stores snapshot groups and clears loading/error', () => {

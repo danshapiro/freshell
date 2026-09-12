@@ -532,6 +532,12 @@ body { background: hsl(var(--background)); color: hsl(var(--foreground)); transi
 }
 .settings-select { padding-right: 32px; }
 .settings-textarea { min-height: 76px; padding: 9px 10px; resize: vertical; font-family: inherit; }
+.settings-actions { display: flex; align-items: center; gap: 8px; }
+.settings-action {
+  min-height: 32px; padding: 0 10px; border: 1px solid hsl(var(--border)); border-radius: 6px;
+  background: transparent; color: hsl(var(--foreground)); font: inherit; font-size: 12px; cursor: pointer;
+}
+.settings-action:hover { background: hsl(var(--muted)); }
 .settings-segmented {
   display: flex; width: 100%; gap: 2px; padding: 2px; border-radius: 7px; background: hsl(var(--muted));
 }
@@ -1259,12 +1265,16 @@ body { background: hsl(var(--background)); color: hsl(var(--foreground)); transi
             </div>
 
             <div class="settings-section">
-              <h2>Devices</h2>
-              <p class="settings-section-desc">Device names and local aliases</p>
+              <h2>Machine</h2>
+              <p class="settings-section-desc">Choose the saved workspace this client opens on this server.</p>
               <div class="settings-list">
                 <div class="settings-row">
-                  <div class="settings-label"><div class="settings-label-title">This machine</div><div class="settings-label-desc">Renaming this updates what other machines see.</div></div>
-                  <div class="settings-control"><input class="settings-input" type="text" aria-label="Device name for this machine" value="local-device"></div>
+                  <div class="settings-label"><div class="settings-label-title">Current machine</div><div class="settings-label-desc">Rename the machine shown to other Freshell clients.</div></div>
+                  <div class="settings-control"><div class="settings-actions"><input class="settings-input" type="text" aria-label="Machine name" value="DANDESKTOP"><button class="settings-action" type="button">Rename machine</button></div></div>
+                </div>
+                <div class="settings-row">
+                  <div class="settings-label"><div class="settings-label-title">Choose another machine</div><div class="settings-label-desc">Open the chooser to use a saved workspace or add this computer.</div></div>
+                  <div class="settings-control"><button class="settings-action" type="button">Switch machine</button></div>
                 </div>
               </div>
             </div>

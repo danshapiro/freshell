@@ -12,6 +12,7 @@ import { getAuthToken } from '@/lib/auth'
 import { sanitizeSessionLocators } from '@/lib/session-utils'
 import type { SessionLocator } from '@/store/paneTypes'
 import type { RecoveryInventory } from '@/lib/recovery/types'
+import type { Machine } from '@/lib/machine-identity'
 import {
   type FreshAgentModelCapabilitiesResponse,
 } from '@shared/fresh-agent-model-capabilities'
@@ -304,9 +305,56 @@ export async function getBootstrap(options: ApiRequestOptions = {}): Promise<any
   return api.get('/api/bootstrap', options)
 }
 
-export async function getRecoveryInventory(clientInstanceId: string, bootAgoMs: number): Promise<RecoveryInventory> {
+function parseMachine(value: unknown): Machine {
+  if (!value || typeof value !== 'object') throw new Error('Invalid machine response')
+  const machine = value as Record<string, unknown>
+  if (typeof machine.id !== 'string' || !machine.id.trim()) throw new Error('Invalid machine id')
+  if (typeof machine.label !== 'string' || !machine.label.trim()) throw new Error('Invalid machine label')
+  const createdAt = machine.createdAt
+  const lastSeenAt = machine.lastSeenAt
+  if (
+    typeof createdAt !== 'number'
+    || !Number.isFinite(createdAt)
+    || typeof lastSeenAt !== 'number'
+    || !Number.isFinite(lastSeenAt)
+  ) {
+    throw new Error('Invalid machine timestamps')
+  }
+  return {
+    id: machine.id,
+    label: machine.label,
+    createdAt,
+    lastSeenAt,
+  }
+}
+
+export async function getMachines(): Promise<Machine[]> {
+  const response = await api.get<{ machines?: unknown }>('/api/machines')
+  if (!Array.isArray(response.machines)) throw new Error('Invalid machines response')
+  return response.machines.map(parseMachine)
+}
+
+export async function createMachine(label: string): Promise<Machine> {
+  const response = await api.post<{ machine?: unknown }>('/api/machines', { label })
+  return parseMachine(response.machine)
+}
+
+export async function renameMachine(machineId: string, label: string): Promise<Machine> {
+  const response = await api.patch<{ machine?: unknown }>(`/api/machines/${encodeURIComponent(machineId)}`, { label })
+  return parseMachine(response.machine)
+}
+
+export async function getRecoveryInventory(
+  clientInstanceId: string,
+  bootAgoMs: number,
+  options: { machineId?: string } = {},
+): Promise<RecoveryInventory> {
   return api.get<RecoveryInventory>(
-    `/api/recovery/inventory${buildQueryString([['clientInstanceId', clientInstanceId], ['bootAgoMs', Math.max(0, Math.round(bootAgoMs))]])}`,
+    `/api/recovery/inventory${buildQueryString([
+      ['clientInstanceId', clientInstanceId],
+      ['bootAgoMs', Math.max(0, Math.round(bootAgoMs))],
+      ['machineId', options.machineId?.trim() || undefined],
+    ])}`,
   )
 }
 

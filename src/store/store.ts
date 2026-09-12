@@ -22,6 +22,7 @@ import paneRuntimeActivityReducer from './paneRuntimeActivitySlice'
 import hostStatsReducer from './hostStatsSlice'
 import { networkReducer } from './networkSlice'
 import tabRegistryReducer from './tabRegistrySlice'
+import machineIdentityReducer from './machineIdentitySlice'
 import extensionsReducer from './extensionsSlice'
 import deckReducer from './deckSlice'
 import { perfMiddleware } from './perfMiddleware'
@@ -74,6 +75,9 @@ export const store = configureStore({
     hostStats: hostStatsReducer,
     network: networkReducer,
     tabRegistry: tabRegistryReducer,
+    // Server-owned workspace selection. This state gates renderer mounts and
+    // all tab-registry transport until a machine has been resolved.
+    machineIdentity: machineIdentityReducer,
     extensions: extensionsReducer,
     // Ephemeral device state — never persisted (allowlist rule)
     deck: deckReducer,

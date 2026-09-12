@@ -727,6 +727,12 @@ export const persistMiddleware: Middleware<{}, PersistState> = (store) => {
       if (a.type === 'tabs/removeTab') {
         userClosedTabsIntent = true
       }
+      // A selected-machine restore is an explicit, server-confirmed cache
+      // replacement. If that machine is empty, persist the empty workspace
+      // rather than retaining the previous machine's local layout forever.
+      if (a.type === 'tabs/clearTabsForMachine') {
+        userClosedTabsIntent = true
+      }
       if (a.type.startsWith('panes/') && panesChanged) {
         panesDirty = true
         scheduleFlush()

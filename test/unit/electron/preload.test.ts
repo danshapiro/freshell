@@ -37,6 +37,7 @@ describe('Preload API', () => {
       'chooseLaunchOption',
       'chooseProfile',
       'completeSetup',
+      'getHostname',
       'getLaunchOptions',
       'getProfiles',
       'getServerMode',
@@ -65,6 +66,7 @@ describe('Preload API', () => {
     expect(typeof exposedApi.completeSetup).toBe('function')
     expect(typeof exposedApi.getLaunchOptions).toBe('function')
     expect(typeof exposedApi.chooseLaunchOption).toBe('function')
+    expect(typeof exposedApi.getHostname).toBe('function')
     expect(typeof exposedApi.openExternal).toBe('function')
   })
 
@@ -99,6 +101,11 @@ describe('Preload API', () => {
   it('getLaunchOptions invokes correct IPC channel', () => {
     exposedApi.getLaunchOptions()
     expect(mockIpcRenderer.invoke).toHaveBeenCalledWith('get-launch-options')
+  })
+
+  it('getHostname invokes the narrow local-hostname IPC channel', () => {
+    exposedApi.getHostname()
+    expect(mockIpcRenderer.invoke).toHaveBeenCalledWith('get-hostname')
   })
 
   it('chooseLaunchOption invokes correct IPC channel with choice', () => {

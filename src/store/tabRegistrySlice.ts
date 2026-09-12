@@ -7,7 +7,6 @@ import { getClosedTabRetentionDaysPreference } from '@/lib/browser-preferences'
 import {
   DEVICE_ALIASES_STORAGE_KEY,
   DEVICE_DISMISSED_STORAGE_KEY,
-  DEVICE_FINGERPRINT_STORAGE_KEY,
   DEVICE_ID_STORAGE_KEY,
   DEVICE_LABEL_CUSTOM_STORAGE_KEY,
   DEVICE_LABEL_STORAGE_KEY,
@@ -48,19 +47,9 @@ function normalizeDeviceLabel(input: string): string {
 }
 
 function buildDefaultDeviceLabel(hints: DeviceMetaHints = {}): string {
-  const hostName = hints.hostName?.trim()
-  if (hostName) return normalizeDeviceLabel(hostName)
   const platform = hints.platform
     || (typeof navigator !== 'undefined' ? (navigator.platform || 'device') : 'device')
   return normalizeDeviceLabel(platform.toLowerCase())
-}
-
-function buildDeviceFingerprint(hints: DeviceMetaHints = {}): string {
-  const ua = typeof navigator !== 'undefined' ? navigator.userAgent : 'unknown'
-  const platform = typeof navigator !== 'undefined'
-    ? (navigator.platform || 'device')
-    : (hints.platform || 'device')
-  return `${platform}|${ua}`
 }
 
 function loadDeviceAliases(storage: Storage | null): Record<string, string> {
@@ -122,21 +111,9 @@ function loadDeviceMeta(hints: DeviceMetaHints = {}): { deviceId: string; device
   }
 
   let deviceId = storage.getItem(DEVICE_ID_STORAGE_KEY) || ''
-  const fingerprint = buildDeviceFingerprint(hints)
-  const storedFingerprint = storage.getItem(DEVICE_FINGERPRINT_STORAGE_KEY) || ''
-  const shouldRotateDeviceId =
-    !deviceId ||
-    deviceId === 'device-unknown' ||
-    (storedFingerprint && storedFingerprint !== fingerprint)
-  if (!deviceId) {
-    deviceId = randomId()
-  }
-  if (shouldRotateDeviceId) {
+  if (!deviceId || deviceId === 'device-unknown') {
     deviceId = randomId()
     storage.setItem(DEVICE_ID_STORAGE_KEY, deviceId)
-    storage.setItem(DEVICE_FINGERPRINT_STORAGE_KEY, fingerprint)
-  } else if (!storedFingerprint) {
-    storage.setItem(DEVICE_FINGERPRINT_STORAGE_KEY, fingerprint)
   }
 
   let deviceLabel = storage.getItem(DEVICE_LABEL_STORAGE_KEY) || ''
@@ -147,13 +124,11 @@ function loadDeviceMeta(hints: DeviceMetaHints = {}): { deviceId: string; device
     storage.setItem(DEVICE_LABEL_STORAGE_KEY, deviceLabel)
     storage.setItem(DEVICE_LABEL_CUSTOM_STORAGE_KEY, '0')
   } else if (!isCustomLabel) {
-    const normalizedCurrent = normalizeDeviceLabel(deviceLabel)
-    if (normalizedCurrent !== defaultLabel) {
-      deviceLabel = defaultLabel
-      storage.setItem(DEVICE_LABEL_STORAGE_KEY, deviceLabel)
-    } else {
-      deviceLabel = normalizedCurrent
-    }
+    // Device labels and IDs once rotated when the browser fingerprint or the
+    // *server's* hostname changed. A server-owned machine selection now owns
+    // that decision. Preserve a legacy value exactly enough for the server to
+    // recognize and migrate it; never use hostName as a client identity hint.
+    deviceLabel = normalizeDeviceLabel(deviceLabel)
   } else {
     deviceLabel = normalizeDeviceLabel(deviceLabel)
   }
@@ -282,7 +257,7 @@ export const tabRegistrySlice = createSlice({
       state.deviceLabel = action.payload.deviceLabel
     },
     setTabRegistryDeviceLabel: (state, action: PayloadAction<string>) => {
-      state.deviceLabel = normalizeDeviceLabel(action.payload)
+      state.deviceLabel = action.payload.trim() || 'device'
     },
     setTabRegistryDeviceAliases: (state, action: PayloadAction<Record<string, string>>) => {
       state.deviceAliases = action.payload

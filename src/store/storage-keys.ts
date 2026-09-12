@@ -14,6 +14,9 @@ export const STORAGE_KEYS = {
   deviceFingerprint: 'freshell.device-fingerprint.v2',
   deviceAliases: 'freshell.device-aliases.v2',
   deviceDismissed: 'freshell.device-dismissed.v1',
+  machineId: 'freshell.machine-id.v1',
+  machineSelections: 'freshell.machine-selections.v1',
+  machineSelectionReset: 'freshell.machine-selection-reset.v1',
   tabRegistryClientInstanceId: 'freshell.tabs.client-instance-id.v1',
   tabRegistrySnapshotRevision: 'freshell.tabs.snapshot-revision.v1',
   inputHistory: 'freshell.input-history.v1',
@@ -34,5 +37,8 @@ export const DEVICE_LABEL_CUSTOM_STORAGE_KEY = STORAGE_KEYS.deviceLabelCustom
 export const DEVICE_FINGERPRINT_STORAGE_KEY = STORAGE_KEYS.deviceFingerprint
 export const DEVICE_ALIASES_STORAGE_KEY = STORAGE_KEYS.deviceAliases
 export const DEVICE_DISMISSED_STORAGE_KEY = STORAGE_KEYS.deviceDismissed
+export const MACHINE_ID_STORAGE_KEY = STORAGE_KEYS.machineId
+export const MACHINE_SELECTIONS_STORAGE_KEY = STORAGE_KEYS.machineSelections
+export const MACHINE_SELECTION_RESET_STORAGE_KEY = STORAGE_KEYS.machineSelectionReset
 export const TAB_REGISTRY_CLIENT_INSTANCE_ID_STORAGE_KEY = STORAGE_KEYS.tabRegistryClientInstanceId
 export const TAB_REGISTRY_SNAPSHOT_REVISION_STORAGE_KEY = STORAGE_KEYS.tabRegistrySnapshotRevision

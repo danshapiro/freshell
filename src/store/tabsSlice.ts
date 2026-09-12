@@ -370,6 +370,18 @@ export const tabsSlice = createSlice({
         state.activeTabId = state.tabs[nextIndex]?.id ?? state.tabs[0].id
       }
     },
+    /**
+     * A server-confirmed machine switch replaces the local cache before tab
+     * registry sync begins. This is deliberately not a user close: it must
+     * not emit pane-close evidence for tabs owned by the previously selected
+     * machine.
+     */
+    clearTabsForMachine: (state) => {
+      state.tabs = []
+      state.activeTabId = null
+      state.renameRequestTabId = null
+      state.tombstones = []
+    },
     hydrateTabs: (state, action: PayloadAction<TabsState>) => {
       const meta = (action as PayloadAction<TabsState, string, HydrateTabsMeta | undefined>).meta
       const remoteTabs = (action.payload.tabs || []).map(migrateTabFields)
@@ -455,6 +467,7 @@ export const {
   clearTabRenameRequest,
   updateTab,
   removeTab,
+  clearTabsForMachine,
   hydrateTabs,
   reorderTabs,
   switchToNextTab,

@@ -132,7 +132,7 @@ describe('SettingsView core sections', () => {
       expect(screen.getByRole('heading', { name: 'Advanced' })).toBeInTheDocument()
       expect(screen.getByText('Terminal internals and debugging')).toBeInTheDocument()
       expect(screen.getByText('Runtime')).toBeInTheDocument()
-      expect(screen.getByText('Devices')).toBeInTheDocument()
+      expect(screen.getByRole('heading', { name: 'Machine' })).toBeInTheDocument()
       expect(screen.getByRole('heading', { name: 'Extensions' })).toBeInTheDocument()
       expect(screen.getByText('Developer extension controls')).toBeInTheDocument()
       expect(screen.getByText('No extensions installed')).toBeInTheDocument()

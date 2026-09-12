@@ -33,6 +33,7 @@ export interface FreshellDesktopApi {
   isElectron: boolean
   getServerMode: () => Promise<string>
   getServerStatus: () => Promise<{ running: boolean; mode: string }>
+  getHostname: () => Promise<string>
   setGlobalHotkey: (accelerator: string) => Promise<boolean>
   onUpdateAvailable: (callback: () => void) => void
   onUpdateDownloaded: (callback: () => void) => void
@@ -63,6 +64,7 @@ export function registerPreloadApi(
     isElectron: true,
     getServerMode: () => ipcRenderer.invoke('get-server-mode'),
     getServerStatus: () => ipcRenderer.invoke('get-server-status'),
+    getHostname: () => ipcRenderer.invoke('get-hostname'),
     setGlobalHotkey: (accelerator: string) => ipcRenderer.invoke('set-global-hotkey', accelerator),
     onUpdateAvailable: (callback: () => void) => ipcRenderer.on('update-available', callback),
     onUpdateDownloaded: (callback: () => void) => ipcRenderer.on('update-downloaded', callback),

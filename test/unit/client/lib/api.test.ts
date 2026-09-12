@@ -10,6 +10,10 @@ import {
   getFreshAgentTurnPage,
   fetchSidebarSessionsSnapshot,
   getBootstrap,
+  getMachines,
+  createMachine,
+  renameMachine,
+  getRecoveryInventory,
   getSessionDirectoryPage,
   getTerminalDirectoryPage,
   searchSessions,
@@ -104,6 +108,50 @@ describe('visible-first read-model helpers', () => {
       expect.objectContaining({
         headers: expect.any(Headers),
       }),
+    )
+  })
+
+  it('accepts numeric machine timestamps from server-owned routes and scopes recovery to the selected machine', async () => {
+    const machine = {
+      id: 'machine-desktop',
+      label: 'DANDESKTOP',
+      createdAt: 1_789_171_200_000,
+      lastSeenAt: 1_789_171_200_000,
+    }
+    mockFetch
+      .mockResolvedValueOnce(mockJson({ machines: [machine] }))
+      .mockResolvedValueOnce(mockJson({ machine }))
+      .mockResolvedValueOnce(mockJson({ machine: { ...machine, label: 'Dan desktop' } }))
+      .mockResolvedValueOnce(mockJson({
+        recoverable: false,
+        contentId: 'machine-desktop:empty',
+        device: null,
+        otherDevices: [],
+        ledgerOnly: [],
+      }))
+
+    await expect(getMachines()).resolves.toEqual([machine])
+    await expect(createMachine('DANDESKTOP')).resolves.toEqual(machine)
+    await expect(renameMachine(machine.id, 'Dan desktop')).resolves.toEqual({ ...machine, label: 'Dan desktop' })
+    await getRecoveryInventory('client-window-1', 123.6, { machineId: machine.id })
+
+    expect(mockFetch).toHaveBeenNthCalledWith(1, '/api/machines', expect.objectContaining({
+      headers: expect.any(Headers),
+    }))
+    expect(mockFetch).toHaveBeenNthCalledWith(2, '/api/machines', expect.objectContaining({
+      method: 'POST',
+      body: JSON.stringify({ label: 'DANDESKTOP' }),
+      headers: expect.any(Headers),
+    }))
+    expect(mockFetch).toHaveBeenNthCalledWith(3, '/api/machines/machine-desktop', expect.objectContaining({
+      method: 'PATCH',
+      body: JSON.stringify({ label: 'Dan desktop' }),
+      headers: expect.any(Headers),
+    }))
+    expect(mockFetch).toHaveBeenNthCalledWith(
+      4,
+      '/api/recovery/inventory?clientInstanceId=client-window-1&bootAgoMs=124&machineId=machine-desktop',
+      expect.objectContaining({ headers: expect.any(Headers) }),
     )
   })
 

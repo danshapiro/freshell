@@ -9,7 +9,15 @@ import {
   resetWsSnapshotReceived,
 } from '@/store/sessionsSlice'
 import { addTab, closeTab, reopenClosedTab, switchToNextTab, switchToPrevTab } from '@/store/tabsSlice'
-import { api, isApiUnauthorizedError, isTransientRequestFailure, type VersionInfo } from '@/lib/api'
+import {
+  ApiError,
+  api,
+  createMachine,
+  getMachines,
+  isApiUnauthorizedError,
+  isTransientRequestFailure,
+  type VersionInfo,
+} from '@/lib/api'
 import {
   fetchSessionWindow,
   loadInitialSessionsWindow,
@@ -50,6 +58,20 @@ import { installCrossTabSync } from '@/store/crossTabSync'
 import { startTabRegistrySync, getCurrentTabRegistryClientInstanceId } from '@/store/tabRegistrySync'
 import { startSessionGreyTouchWatcher } from '@/store/sessionGreyTouch'
 import { resolveAndPersistDeviceMeta, setTabRegistryDeviceMeta } from '@/store/tabRegistrySlice'
+import {
+  setMachineChooser,
+  setMachineReady,
+  setMachineResolutionError,
+  setMachineRestoring,
+  type MachineIdentityState,
+} from '@/store/machineIdentitySlice'
+import type { Machine } from '@/lib/machine-identity'
+import {
+  getSuggestedMachineLabel,
+  persistSelectedMachineId,
+  resolveMachineIdentity,
+} from '@/lib/machine-identity'
+import { restoreMachineWorkspace } from '@/lib/machine-workspace'
 import { buildLocalSettingsPatch } from '@/store/browserPreferencesPersistence'
 import Sidebar, { AppView } from '@/components/Sidebar'
 import TabBar from '@/components/TabBar'
@@ -63,6 +85,7 @@ import { TerminalInterestReporter } from '@/components/TerminalInterestReporter'
 import { ReconcileWarmingBanner } from '@/components/ReconcileWarmingBanner'
 import { SetupWizard } from '@/components/SetupWizard'
 import { RecoveryOfferPanel } from '@/components/RecoveryOfferPanel'
+import { MachineChooser } from '@/components/MachineChooser'
 import VirtualDeckPanel from '@/components/VirtualDeckPanel'
 import { ErrorBoundary } from '@/components/ui/error-boundary'
 import { fetchNetworkStatus } from '@/store/networkSlice'
@@ -199,6 +222,12 @@ export default function App() {
   // the effect below re-runs when the status flips back to 'ready'.
   const connectionStatus = useAppSelector((s) => s.connection.status)
   const networkStatus = useAppSelector((s) => s.network.status)
+  // A number of focused App tests intentionally provide a partial store. The
+  // real store always has this slice; treating its absence as legacy behavior
+  // keeps those narrow tests independent of machine bootstrap concerns.
+  const machineIdentity = useAppSelector(
+    (s) => (s as unknown as { machineIdentity?: MachineIdentityState }).machineIdentity,
+  )
   const perfAuditEnabled = typeof window !== 'undefined'
     && new URLSearchParams(window.location.search).has('perfAudit')
   const perfAuditBridgeRef = useRef<ReturnType<typeof createPerfAuditBridge> | null>(null)
@@ -331,8 +360,12 @@ export default function App() {
 
   // Keep this tab's Redux state in sync with persisted writes from other browser tabs.
   useEffect(() => {
+    // A persisted layout is scoped only after the selected server machine has
+    // replaced the local cache. Until then, an older browser tab must not
+    // hydrate a foreign workspace into this boot.
+    if (machineIdentity?.status && machineIdentity.status !== 'ready') return
     return installCrossTabSync(appStore)
-  }, [appStore])
+  }, [appStore, machineIdentity?.status])
 
   useEffect(() => {
     return () => {
@@ -514,6 +547,24 @@ export default function App() {
     }
   }, [updateAvailable])
 
+  const restartAfterMachineSelection = useCallback(() => {
+    // A reload is an intentional bootstrap boundary: it drops any old
+    // websocket/client-instance lane before the newly selected workspace is
+    // hydrated, so it cannot write the previous layout under a new machine.
+    window.location.reload()
+  }, [])
+
+  const selectMachineFromChooser = useCallback(async (machine: Machine) => {
+    persistSelectedMachineId(machine.id)
+    restartAfterMachineSelection()
+  }, [restartAfterMachineSelection])
+
+  const addMachineFromChooser = useCallback(async (label: string) => {
+    const machine = await createMachine(label)
+    persistSelectedMachineId(machine.id)
+    restartAfterMachineSelection()
+  }, [restartAfterMachineSelection])
+
   // Bootstrap: load settings, sessions, and connect websocket.
   useEffect(() => {
     let cancelled = false
@@ -532,6 +583,10 @@ export default function App() {
     let lastReadyServerInstanceId: string | undefined
     let lastSessionsRevision = -1
     const versionInfoLoadedRef = { current: false }
+    const machineIdentityEnabled = !!(
+      appStore.getState() as unknown as { machineIdentity?: MachineIdentityState }
+    ).machineIdentity
+    let machineTransportReady = !machineIdentityEnabled
 
     // Bounded wait for the current boot's pane.reconcile.result: the result
     // is unicast to THIS socket, so a result lost with a dying socket would
@@ -641,10 +696,6 @@ export default function App() {
               if (hasLoadedPlatformCapabilities(bootstrapData.platform)) {
                 platformCapabilitiesLoaded = true
               }
-              dispatch(setTabRegistryDeviceMeta(resolveAndPersistDeviceMeta({
-                platform: bootstrapData.platform.platform,
-                hostName: bootstrapData.platform.hostName ?? bootstrapData.platform.host,
-              })))
             }
             if (bootstrapData.configFallback) {
               setConfigFallback({
@@ -680,10 +731,6 @@ export default function App() {
             dispatch(setAvailableClis(platformData.availableClis ?? {}))
             dispatch(setFeatureFlags(platformData.featureFlags ?? {}))
             platformCapabilitiesLoaded = true
-            dispatch(setTabRegistryDeviceMeta(resolveAndPersistDeviceMeta({
-              platform: platformData.platform,
-              hostName: platformData.hostName ?? platformData.host,
-            })))
           }
           return true
         } catch (err: any) {
@@ -725,34 +772,103 @@ export default function App() {
         dispatch(setError('Authentication failed'))
       }
 
-      // ── WebSocket setup (synchronous) ─────────────────────────────
-      // Register the message handler BEFORE any async work.  App.tsx is the
-      // sole owner of the WebSocket connection. The socket may become ready
-      // while we await HTTP fetches below; registering early avoids losing
-      // early messages.
+      // ── WebSocket setup (transport remains gated) ──────────────────
+      // Register message handlers now, but do not configure hello or start
+      // tabs.sync until a selected machine has restored its scoped workspace.
       const ws = getWsClient()
-      stopTabRegistrySync = startTabRegistrySync(appStore, ws)
       // Grey-transition touch: sessions leaving non-grey status (any of the
       // four tiers) get an activity ratchet, so the default sort floats them
       // to the top of the grey agents. Store-only; no WS dependency.
       stopSessionGreyTouch = startSessionGreyTouchWatcher(appStore)
 
-      // Set up hello extension to include session IDs for prioritized repair
-      ws.setHelloExtensionProvider(() => ({
-        sessions: getSessionsForHello(appStore.getState()),
-        sidebarOpenSessions: collectSessionLocatorsFromTabs(
-          appStore.getState().tabs.tabs,
-          appStore.getState().panes,
-        ),
-        client: { mobile: isMobileRef.current },
-        // D8 (restore-open-sessions-only): the connection's provenance identity
-        // — the same deviceId/clientInstanceId `tabs.sync.push` frames carry —
-        // so the server can stamp connection-scoped ledger bind rows. The
-        // provider is re-invoked per (re)connect, so a lease-collision rotation
-        // re-stamps on the next hello.
-        deviceId: appStore.getState().tabRegistry.deviceId,
-        clientInstanceId: getCurrentTabRegistryClientInstanceId(),
-      }))
+      let machineTransportConfigured = false
+      const configureMachineBoundTransport = () => {
+        if (machineTransportConfigured) return
+        machineTransportConfigured = true
+        stopTabRegistrySync = startTabRegistrySync(appStore, ws)
+        // Set up hello extension only after the selected machine has been
+        // resolved. `deviceId`/`deviceLabel` remain wire-compatible names,
+        // now carrying the server-owned machine id and canonical label.
+        ws.setHelloExtensionProvider(() => ({
+          sessions: getSessionsForHello(appStore.getState()),
+          sidebarOpenSessions: collectSessionLocatorsFromTabs(
+            appStore.getState().tabs.tabs,
+            appStore.getState().panes,
+          ),
+          client: { mobile: isMobileRef.current },
+          deviceId: appStore.getState().tabRegistry.deviceId,
+          clientInstanceId: getCurrentTabRegistryClientInstanceId(),
+        }))
+        machineTransportReady = true
+      }
+
+      const resolveMachineBeforeTransport = async (): Promise<boolean> => {
+        if (!machineIdentityEnabled) return true
+        try {
+          const machines = await getMachines()
+          if (cancelled) return false
+          const suggestedLabel = await getSuggestedMachineLabel()
+          if (cancelled) return false
+          const resolution = await resolveMachineIdentity({
+            machines,
+            createMachine,
+            suggestedLabel,
+          })
+          if (cancelled) return false
+          if (resolution.kind === 'chooser') {
+            dispatch(setMachineChooser({
+              machines: resolution.machines,
+              suggestedLabel: resolution.suggestedLabel,
+            }))
+            return false
+          }
+
+          dispatch(setMachineRestoring(resolution.machine))
+          dispatch(setTabRegistryDeviceMeta({
+            deviceId: resolution.machine.id,
+            deviceLabel: resolution.machine.label,
+          }))
+          await restoreMachineWorkspace(appStore, resolution.machine.id)
+          if (cancelled) return false
+          dispatch(setMachineReady({ machine: resolution.machine, mode: 'server-managed' }))
+          return true
+        } catch (err) {
+          if (handleBootstrapAuthFailure(err)) return false
+          // A frozen client can still connect to a server that predates the
+          // machine API. Keep that compatibility lane stable (no fingerprint
+          // rotation) while all server-owned deployments use the branch above.
+          if (err instanceof ApiError && err.status === 404) {
+            const legacy = resolveAndPersistDeviceMeta()
+            if (cancelled) return false
+            dispatch(setTabRegistryDeviceMeta(legacy))
+            dispatch(setMachineReady({
+              machine: {
+                id: legacy.deviceId,
+                label: legacy.deviceLabel,
+                createdAt: 0,
+                lastSeenAt: 0,
+              },
+              mode: 'legacy',
+            }))
+            return true
+          }
+          log.warn('Failed to resolve the selected machine', err)
+          if (!cancelled) {
+            dispatch(setMachineResolutionError(
+              err instanceof Error ? err.message : 'Could not resolve a machine',
+            ))
+          }
+          return false
+        }
+      }
+
+      // Focused App tests and old embedded renderers can supply a deliberately
+      // partial Redux store without the new machine slice. They retain the
+      // pre-machine bootstrap path; production stores always include the
+      // slice and therefore take the gated branch above.
+      if (!machineIdentityEnabled) {
+        configureMachineBoundTransport()
+      }
 
       const requestCodexActivityList = () => {
         const requestId = `codex-activity-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
@@ -1066,6 +1182,12 @@ export default function App() {
             log.error('ready frame failed schema validation; skipping restart detection', ready.error.issues)
           } else {
             dispatch(setServerInstanceId(nextServerInstanceId))
+            const selectedMachine = (
+              appStore.getState() as unknown as { machineIdentity?: MachineIdentityState }
+            ).machineIdentity?.selectedMachine
+            if (selectedMachine) {
+              persistSelectedMachineId(selectedMachine.id, nextServerInstanceId)
+            }
             const newBootId = ready.data.bootId
             if (!newBootId) {
               log.warn('ready frame carried no bootId; falling back to serverInstanceId for restart detection')
@@ -1551,6 +1673,13 @@ export default function App() {
       // ── HTTP bootstrap (async) ────────────────────────────────────
       if (!(await loadBootstrapData())) return
 
+      // Select and hydrate one server-owned machine before the websocket can
+      // send hello or tab sync. This makes a storage reset a deliberate choice
+      // instead of an arbitrary restore followed by a blank-layout overwrite.
+      if (!(await resolveMachineBeforeTransport())) return
+      if (cancelled) return
+      configureMachineBoundTransport()
+
       if (!(await ensureSidebarSessionsWindow())) return
 
       if (!(await loadVersionInfo())) return
@@ -1580,6 +1709,12 @@ export default function App() {
         dispatch(setError(undefined))
         dispatch(setStatus('ready'))
         dispatch(setServerInstanceId(ws.serverInstanceId))
+        const selectedMachine = (
+          appStore.getState() as unknown as { machineIdentity?: MachineIdentityState }
+        ).machineIdentity?.selectedMachine
+        if (selectedMachine) {
+          persistSelectedMachineId(selectedMachine.id, ws.serverInstanceId)
+        }
         dispatch(resetWsSnapshotReceived())
 
         promoteRecentHttpSessionsBaseline()
@@ -1621,8 +1756,12 @@ export default function App() {
     // page comes back to the front (visibilitychange/online/pageshow — the
     // iOS bfcache restore only fires pageshow).
     const ws = getWsClient()
-    const pokeWs = () => ws.poke()
-    const pokeWsWhenVisible = () => { if (document.visibilityState === 'visible') ws.poke() }
+    const pokeWs = () => {
+      if (machineTransportReady) ws.poke()
+    }
+    const pokeWsWhenVisible = () => {
+      if (machineTransportReady && document.visibilityState === 'visible') ws.poke()
+    }
     window.addEventListener('online', pokeWs)
     window.addEventListener('pageshow', pokeWs)
     document.addEventListener('visibilitychange', pokeWsWhenVisible)
@@ -1633,6 +1772,7 @@ export default function App() {
       document.removeEventListener('visibilitychange', pokeWsWhenVisible)
       cancelled = true
       cleanedUp = true
+      machineTransportReady = false
       clearReconcileResultWait()
       cleanup?.()
       stopTabRegistrySync?.()
@@ -1730,10 +1870,10 @@ export default function App() {
 
   // Ensure at least one tab exists for first-time users.
   useEffect(() => {
-    if (tabs.length === 0) {
+    if ((!machineIdentity || machineIdentity.status === 'ready') && tabs.length === 0) {
       dispatch(addTab({ mode: 'shell' }))
     }
-  }, [tabs.length, dispatch])
+  }, [tabs.length, dispatch, machineIdentity])
 
   const handleTerminalChromeRevealTouchStart = useCallback((event: ReactTouchEvent<HTMLDivElement>) => {
     if (!isMobile || view !== 'terminal') return
@@ -1765,6 +1905,46 @@ export default function App() {
       void exitFullscreen()
     }
   }, [exitFullscreen, isFullscreen, isLandscapeTerminalView, isMobile, view])
+
+  if (machineIdentity && machineIdentity.status !== 'ready') {
+    if (machineIdentity.status === 'choosing') {
+      return (
+        <MachineChooser
+          machines={machineIdentity.machines}
+          suggestedLabel={machineIdentity.suggestedLabel ?? 'Browser device 1'}
+          onSelectMachine={selectMachineFromChooser}
+          onAddMachine={addMachineFromChooser}
+        />
+      )
+    }
+
+    return (
+      <main
+        className="min-h-screen bg-background text-foreground flex items-center justify-center p-4"
+        aria-busy={machineIdentity.status === 'resolving' || machineIdentity.status === 'restoring'}
+      >
+        <section className="w-full max-w-lg rounded-lg border border-border bg-background p-6 shadow-lg">
+          <h1 className="text-xl font-semibold">
+            {machineIdentity.status === 'error' ? 'Could not choose a machine' : 'Preparing this machine'}
+          </h1>
+          <p className="mt-2 text-sm text-muted-foreground" role={machineIdentity.status === 'error' ? 'alert' : 'status'}>
+            {machineIdentity.status === 'error'
+              ? machineIdentity.error ?? 'Reload Freshell and try again.'
+              : 'Loading the saved workspace for this machine.'}
+          </p>
+          {machineIdentity.status === 'error' ? (
+            <button
+              type="button"
+              className="mt-5 h-10 rounded-md bg-primary px-4 text-sm text-primary-foreground hover:bg-primary/90"
+              onClick={() => window.location.reload()}
+            >
+              Reload
+            </button>
+          ) : null}
+        </section>
+      </main>
+    )
+  }
 
   const content = (() => {
     if (view === 'sessions') {
@@ -2079,8 +2259,9 @@ npm run serve`}</pre>
           }}
         />
       )}
-      {/* LANE B3 (recover-my-panes): self-gating recovery offer — see docs/plans/2026-07-26-recover-my-panes.md */}
-      <RecoveryOfferPanel />
+      {/* A server-owned machine hydrates its scoped durable workspace during
+          bootstrap. Legacy servers retain the older opt-in recovery panel. */}
+      {machineIdentity?.mode !== 'server-managed' ? <RecoveryOfferPanel /> : null}
       {/* In-app Stream Deck emulator — self-hides unless deck.virtualDeckOpen */}
       <VirtualDeckPanel />
       </div>
