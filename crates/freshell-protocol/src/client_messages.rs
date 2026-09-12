@@ -1,4 +1,4 @@
-//! Client → server messages (`ClientMessage`, 39 discriminants).
+//! Client → server messages (`ClientMessage`, 40 discriminants).
 //!
 //! These are the Zod-validated inbound surface. Deserialization is
 //! accept-and-strip (no `deny_unknown_fields`), mirroring the runtime.
@@ -86,6 +86,15 @@ pub enum ClientMessage {
     FreshAgentSend(FreshAgentSend),
     #[serde(rename = "freshAgent.interrupt")]
     FreshAgentInterrupt(FreshAgentInterrupt),
+    /// `freshAgent.configure` — apply settings (model / effort / permission
+    /// mode / sandbox) to a LIVE session without sending a message, so every
+    /// device's model surfaces converge immediately. The server broadcasts
+    /// `freshAgent.session.metadata` with the new effective settings; a
+    /// refused configure surfaces as the session-scoped `freshAgent.error`
+    /// (e.g. changing model mid-turn on claude). Additive: older servers
+    /// accept-and-strip the frame (degrading to staged-at-next-send).
+    #[serde(rename = "freshAgent.configure")]
+    FreshAgentConfigure(FreshAgentConfigure),
     #[serde(rename = "freshAgent.compact")]
     FreshAgentCompact(FreshAgentCompact),
     #[serde(rename = "freshAgent.approval.respond")]
@@ -112,7 +121,7 @@ pub enum ClientMessage {
 
 /// The exact `type` discriminants of every client→server message, in the frozen
 /// inventory's order. This is the T0 conformance checklist.
-pub const CLIENT_MESSAGE_TYPES: [&str; 40] = [
+pub const CLIENT_MESSAGE_TYPES: [&str; 41] = [
     "amplifier.activity.list",
     "claude.activity.list",
     "client.diagnostic",
@@ -123,6 +132,7 @@ pub const CLIENT_MESSAGE_TYPES: [&str; 40] = [
     "freshAgent.approval.respond",
     "freshAgent.attach",
     "freshAgent.compact",
+    "freshAgent.configure",
     "freshAgent.create",
     "freshAgent.fork",
     "freshAgent.interrupt",
@@ -779,6 +789,22 @@ pub struct FreshAgentInterrupt {
     pub session_type: SessionType,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cwd: Option<String>,
+}
+
+/// `freshAgent.configure` payload — the settings mirror [`FreshAgentSendSettings`]
+/// (model / effort / permission mode / sandbox / cwd), applied to the LIVE
+/// session instead of riding the next send.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FreshAgentConfigure {
+    pub provider: AgentProvider,
+    pub session_id: String,
+    pub session_type: SessionType,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<String>,
+    pub settings: FreshAgentSendSettings,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

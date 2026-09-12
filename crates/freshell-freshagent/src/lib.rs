@@ -49,6 +49,7 @@ pub mod pane_ops;
 mod pane_resize;
 pub mod rollback_record;
 pub mod session_lease;
+pub mod session_metadata;
 pub mod snapshot;
 pub mod spawn_gate;
 pub(crate) mod summary;

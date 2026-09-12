@@ -813,6 +813,33 @@ export const FreshAgentInterruptSchema = z.object({
   cwd: z.string().optional(),
 })
 
+/** `freshAgent.configure` — apply session settings (model / effort /
+ * permissionMode / sandbox) to a LIVE session without sending a message, so
+ * every device's model surfaces converge immediately. Claude/kilroy apply
+ * for real through the sidecar's configure lane (setModel et al.); codex and
+ * opencode record the choice as the next turn's per-send settings (their
+ * advertised `per-send` scope). Every provider broadcasts
+ * `freshAgent.session.metadata` with the new effective settings; a refused
+ * or failed configure surfaces as the session-scoped `freshAgent.error`
+ * banner (e.g. changing model mid-turn on claude). Additive: an older server
+ * ignores the frame (accept-and-strip), degrading to the staged-at-next-send
+ * behavior. */
+export const FreshAgentConfigureSchema = z.object({
+  type: z.literal('freshAgent.configure'),
+  requestId: z.string().min(1).optional(),
+  sessionId: z.string().min(1),
+  sessionType: z.enum(['freshclaude', 'freshcodex', 'kilroy', 'freshopencode']),
+  provider: z.enum(['claude', 'codex', 'opencode']),
+  cwd: z.string().optional(),
+  settings: z.object({
+    cwd: z.string().min(1).optional(),
+    model: z.string().min(1).optional(),
+    permissionMode: z.string().min(1).optional(),
+    sandbox: z.enum(['read-only', 'workspace-write', 'danger-full-access']).optional(),
+    effort: z.string().trim().min(1).optional(),
+  }),
+})
+
 export const FreshAgentCompactSchema = z.object({
   type: z.literal('freshAgent.compact'),
   sessionId: z.string().min(1),
@@ -890,6 +917,7 @@ export const FreshAgentClientMessageSchema = z.discriminatedUnion('type', [
   FreshAgentAttachSchema,
   FreshAgentSendSchema,
   FreshAgentInterruptSchema,
+  FreshAgentConfigureSchema,
   FreshAgentCompactSchema,
   FreshAgentApprovalRespondSchema,
   FreshAgentQuestionRespondSchema,
@@ -1027,6 +1055,7 @@ export const ClientMessageSchema = z.discriminatedUnion('type', [
   FreshAgentAttachSchema,
   FreshAgentSendSchema,
   FreshAgentInterruptSchema,
+  FreshAgentConfigureSchema,
   FreshAgentCompactSchema,
   FreshAgentApprovalRespondSchema,
   FreshAgentQuestionRespondSchema,

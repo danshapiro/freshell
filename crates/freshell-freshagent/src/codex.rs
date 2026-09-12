@@ -68,10 +68,10 @@ use freshell_codex::{
     CODEX_SIDECAR_OWNERSHIP_ENV,
 };
 use freshell_protocol::{
-    ErrorCode, ErrorMsg, FreshAgentAttach, FreshAgentCompact, FreshAgentCreate,
-    FreshAgentCreateFailed, FreshAgentCreated, FreshAgentEvent, FreshAgentFork, FreshAgentForked,
-    FreshAgentInterrupt, FreshAgentKill, FreshAgentKilled, FreshAgentSend,
-    FreshAgentSessionMaterialized, ServerMessage, SessionLocator,
+    ErrorCode, ErrorMsg, FreshAgentAttach, FreshAgentCompact, FreshAgentConfigure,
+    FreshAgentCreate, FreshAgentCreateFailed, FreshAgentCreated, FreshAgentEvent,
+    FreshAgentFork, FreshAgentForked, FreshAgentInterrupt, FreshAgentKill, FreshAgentKilled,
+    FreshAgentSend, FreshAgentSessionMaterialized, ServerMessage, SessionLocator,
 };
 use freshell_terminal::FrameSink;
 
@@ -1761,7 +1761,9 @@ impl FreshCodexState {
 
         // Only persist choices once the provider has accepted them. Failed sends
         // keep the previous working settings for resume and retry.
+        let mut settings_changed = false;
         if let Some(session) = self.sessions.lock().await.get_mut(&session_id) {
+            settings_changed = session.model != model || session.effort != effort;
             session.model = model.clone();
             session.effort = effort.clone();
             session.cwd = turn_cwd.clone();
@@ -1782,6 +1784,20 @@ impl FreshCodexState {
             None,
         )
         .await;
+
+        // A send whose settings CHANGED the session record converges every
+        // device's model surfaces (the same frame `handle_configure` emits —
+        // a device that missed the configure still lands here). Keyed at the
+        // client-addressed id, the same stamp the accepted frame below uses.
+        if settings_changed {
+            self.broadcast(&crate::session_metadata::session_metadata_frame(
+                PROVIDER,
+                SESSION_TYPE,
+                &session_id,
+                Some(model.as_str()),
+                effort.as_deref(),
+            ));
+        }
 
         // DIAG-01: the turn was accepted by the sidecar -- session_id + turn
         // id only, never the submitted text/prompt.
@@ -1818,6 +1834,111 @@ impl FreshCodexState {
             terminal_id: None,
             live_terminal_id: None,
         }));
+    }
+
+    // ── freshAgent.configure (WS) ────────────────────────────────────────────
+
+    /// Handle a `freshAgent.configure`: record the carried settings as the
+    /// session's NEXT-turn settings (codex's advertised `per-send` scope —
+    /// each `turn/start` carries model/effort/sandbox/approvalPolicy itself),
+    /// re-snapshot the durable binding row, and broadcast
+    /// `freshAgent.session.metadata` so every device's model surfaces converge
+    /// immediately. Explicit choices win over the stored values, exactly like
+    /// `handle_send`'s settings merge; the effort is wire-validated up front
+    /// so the record never holds a value the next turn could not send.
+    ///
+    /// No busy refusal: recording mid-turn is safe — the in-flight turn keeps
+    /// the parameters it already started with, and the next turn picks up the
+    /// recorded pair (the `per-send` contract). `INVALID_SESSION_ID` for an
+    /// unknown session surfaces on the pane's error banner.
+    pub async fn handle_configure(&self, msg: FreshAgentConfigure) {
+        let session_id = msg.session_id.clone();
+        let stored = {
+            let sessions = self.sessions.lock().await;
+            sessions.get(&session_id).map(|s| {
+                (
+                    s.model.clone(),
+                    s.effort.clone(),
+                    s.sandbox.clone(),
+                    s.permission_mode.clone(),
+                    s.cwd.clone(),
+                )
+            })
+        };
+        let Some((stored_model, stored_effort, stored_sandbox, stored_permission, stored_cwd)) =
+            stored
+        else {
+            self.emit_fresh_agent_error(
+                &session_id,
+                "INVALID_SESSION_ID",
+                "codex session not found",
+            );
+            return;
+        };
+
+        let settings = &msg.settings;
+        let mut model = settings
+            .model
+            .clone()
+            .unwrap_or_else(|| stored_model.clone());
+        let effort = settings.effort.clone().or_else(|| stored_effort.clone());
+        let mut sandbox = settings
+            .sandbox
+            .map(sandbox_wire_value)
+            .or_else(|| stored_sandbox.clone());
+        let mut permission_mode = settings
+            .permission_mode
+            .clone()
+            .or_else(|| stored_permission.clone());
+        if let Err(error) = normalize_codex_permission(&mut permission_mode, &mut sandbox) {
+            self.emit_fresh_agent_error(&session_id, "INVALID_PERMISSION_MODE", &error);
+            return;
+        }
+        // Re-normalize on configure (the same idempotent pass send applies).
+        model = normalize_freshcodex_model(Some(&model));
+        let effort = normalize_freshcodex_effort(Some(&model), effort.as_deref());
+        if let Err(err) = to_codex_reasoning_effort(effort.as_deref()) {
+            self.emit_fresh_agent_error(&session_id, "INVALID_EFFORT", &err.to_string());
+            return;
+        }
+
+        let settings_changed =
+            stored_model != model || stored_effort != effort || stored_sandbox != sandbox
+                || stored_permission != permission_mode;
+        if !settings_changed {
+            // Idempotent configure: nothing to converge.
+            return;
+        }
+        if let Some(session) = self.sessions.lock().await.get_mut(&session_id) {
+            session.model = model.clone();
+            session.effort = effort.clone();
+            session.sandbox = sandbox.clone();
+            session.permission_mode = permission_mode.clone();
+        }
+        self.record_codex_binding(
+            &session_id,
+            None,
+            &model,
+            sandbox.as_deref(),
+            permission_mode.as_deref(),
+            effort.as_deref(),
+            stored_cwd.as_deref(),
+            None,
+            // A settings record is not a new browser assertion — conn-less
+            // (the ledger merge keeps the row's prior stamps).
+            None,
+        )
+        .await;
+
+        // Broadcast keyed at the CLIENT-ADDRESSED id: the client's fold
+        // resolves the sessions-map entry by it.
+        self.broadcast(&crate::session_metadata::session_metadata_frame(
+            PROVIDER,
+            SESSION_TYPE,
+            &session_id,
+            Some(model.as_str()),
+            effort.as_deref(),
+        ));
     }
 
     // ── freshAgent.interrupt (WS) ────────────────────────────────────────────
@@ -17413,5 +17534,238 @@ pub(crate) mod tests {
             json!(100),
             "a stale provider basis never beats the record floor (the client monotonic watermark holds)"
         );
+    }
+
+    // ── freshAgent.configure: live model convergence ─────────────────────────
+
+    fn configure_msg(session_id: &str, model: Option<&str>, effort: Option<&str>) -> FreshAgentConfigure {
+        FreshAgentConfigure {
+            provider: freshell_protocol::AgentProvider::Codex,
+            session_id: session_id.to_string(),
+            session_type: freshell_protocol::SessionType::Freshcodex,
+            cwd: None,
+            request_id: Some("req-configure".to_string()),
+            settings: freshell_protocol::FreshAgentSendSettings {
+                cwd: None,
+                model: model.map(|m| m.to_string()),
+                permission_mode: None,
+                sandbox: None,
+                effort: effort.map(|e| e.to_string()),
+            },
+        }
+    }
+
+    /// Insert the lightest possible live session record (no sidecar, no
+    /// consumer): a channel-transport client + the sleep-child watcher
+    /// `insert_session_for_test` drives.
+    async fn inserted_session(
+        st: &FreshCodexState,
+        thread_id: &str,
+    ) -> std::sync::Arc<CodexAppServerClient> {
+        let (transport, _peer) = freshell_codex::new_channel_transport();
+        let (client, _notifs) = CodexAppServerClient::connect(transport);
+        let client = Arc::new(client);
+        st.insert_session_for_test(thread_id, client.clone(), None).await;
+        client
+    }
+
+    async fn drain(rx: &mut tokio::sync::broadcast::Receiver<String>) -> Vec<Value> {
+        let mut out = Vec::new();
+        while let Ok(frame) = rx.try_recv() {
+            out.push(serde_json::from_str(&frame).expect("frames are JSON"));
+        }
+        out
+    }
+
+    /// A configure records the normalized pair on the session record (the next
+    /// turn's per-send settings — codex's advertised scope) and broadcasts
+    /// `freshAgent.session.metadata` so every device's model surfaces converge.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn configure_records_the_pair_and_broadcasts_session_metadata() {
+        let (st, rx) = state_with_bus();
+        let mut rx = rx;
+        inserted_session(&st, "thread-cfg").await;
+
+        st.handle_configure(configure_msg("thread-cfg", Some("gpt-5.6-luna"), Some("high")))
+            .await;
+
+        let (model, effort) = {
+            let sessions = st.sessions.lock().await;
+            let session = sessions.get("thread-cfg").expect("session tracked");
+            (session.model.clone(), session.effort.clone())
+        };
+        assert_eq!(model, "gpt-5.6-luna");
+        assert_eq!(effort.as_deref(), Some("high"));
+
+        let frames = drain(&mut rx).await;
+        let metadata = frames
+            .iter()
+            .find(|f| f["type"] == "freshAgent.event"
+                && f["event"]["type"] == "freshAgent.session.metadata")
+            .expect("a metadata frame is broadcast");
+        assert_eq!(metadata["provider"], json!("codex"));
+        assert_eq!(metadata["sessionType"], json!("freshcodex"));
+        assert_eq!(metadata["sessionId"], json!("thread-cfg"));
+        assert_eq!(metadata["event"]["model"], json!("gpt-5.6-luna"));
+        assert_eq!(metadata["event"]["effort"], json!("high"));
+    }
+
+    /// An unknown-menu effort clamps to the model's menu default (the same
+    /// two-stage normalization `handle_send` applies), and the broadcast
+    /// carries the CLAMPED value — the record never holds a raw pick.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn configure_normalizes_the_effort_before_recording_it() {
+        let (st, rx) = state_with_bus();
+        let mut rx = rx;
+        inserted_session(&st, "thread-cfg-clamp").await;
+
+        st.handle_configure(configure_msg("thread-cfg-clamp", None, Some("bogus")))
+            .await;
+
+        let effort = {
+            let sessions = st.sessions.lock().await;
+            sessions
+                .get("thread-cfg-clamp")
+                .expect("session tracked")
+                .effort
+                .clone()
+        };
+        assert_eq!(
+            effort.as_deref(),
+            Some("max"),
+            "an unknown-menu effort clamps to gpt-5.3-codex-spark's default"
+        );
+        let frames = drain(&mut rx).await;
+        let metadata = frames
+            .iter()
+            .find(|f| f["type"] == "freshAgent.event"
+                && f["event"]["type"] == "freshAgent.session.metadata")
+            .expect("a metadata frame is broadcast");
+        assert_eq!(metadata["event"]["effort"], json!("max"));
+    }
+
+    /// An idempotent configure (same effective pair) stays silent on the bus.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_idempotent_configure_broadcasts_no_metadata() {
+        let (st, rx) = state_with_bus();
+        let mut rx = rx;
+        inserted_session(&st, "thread-cfg-idem").await;
+
+        st.handle_configure(configure_msg("thread-cfg-idem", Some("gpt-5.6-luna"), Some("high")))
+            .await;
+        let first = drain(&mut rx).await;
+        assert_eq!(
+            first
+                .iter()
+                .filter(|f| f["type"] == "freshAgent.event"
+                    && f["event"]["type"] == "freshAgent.session.metadata")
+                .count(),
+            1
+        );
+
+        st.handle_configure(configure_msg("thread-cfg-idem", Some("gpt-5.6-luna"), Some("high")))
+            .await;
+        let second = drain(&mut rx).await;
+        assert!(
+            !second.iter().any(|f| f["type"] == "freshAgent.event"
+                && f["event"]["type"] == "freshAgent.session.metadata"),
+            "an idempotent configure converges nothing"
+        );
+    }
+
+    /// An unknown session answers the pane-banner `freshAgent.error`
+    /// (INVALID_SESSION_ID), never a metadata frame.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn configure_for_an_unknown_session_answers_invalid_session_id() {
+        let (st, rx) = state_with_bus();
+        let mut rx = rx;
+
+        st.handle_configure(configure_msg("thread-nope", Some("gpt-5.6-luna"), None))
+            .await;
+
+        let frames = drain(&mut rx).await;
+        let error = frames
+            .iter()
+            .find(|f| f["type"] == "freshAgent.event"
+                && f["event"]["type"] == "freshAgent.error")
+            .expect("the unknown session surfaces a freshAgent.error frame");
+        assert_eq!(error["event"]["code"], json!("INVALID_SESSION_ID"));
+        assert!(
+            !frames.iter().any(|f| f["type"] == "freshAgent.event"
+                && f["event"]["type"] == "freshAgent.session.metadata"),
+            "no metadata converges for an unknown session"
+        );
+    }
+
+    /// A send whose settings CHANGE the session record broadcasts the metadata
+    /// convergence frame at the turn-accept apply site (the same frame
+    /// `handle_configure` emits — a device that missed the configure still
+    /// lands here); a send with UNCHANGED settings stays silent.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_send_with_changed_settings_broadcasts_session_metadata() {
+        let _guard = ENV_LOCK.lock().await;
+        configure_fake_codex_cmd("{}");
+        let (st, mut rx) = state_with_bus();
+
+        let thread_id = create_real_fake_session(&st, &mut rx).await;
+
+        let send_with_settings = |text: &str, model: &str, effort: &str| FreshAgentSend {
+            provider: freshell_protocol::AgentProvider::Codex,
+            session_id: thread_id.clone(),
+            session_type: freshell_protocol::SessionType::Freshcodex,
+            text: text.to_string(),
+            cwd: None,
+            images: None,
+            request_id: None,
+            settings: Some(freshell_protocol::FreshAgentSendSettings {
+                cwd: None,
+                model: Some(model.to_string()),
+                permission_mode: None,
+                sandbox: None,
+                effort: Some(effort.to_string()),
+            }),
+        };
+
+        // First send carries the initial pair.
+        st.handle_send(send_with_settings("one", "gpt-5.6-luna", "high"))
+            .await;
+        let first = collect_frames_until(
+            &mut rx,
+            std::time::Duration::from_secs(5),
+            |f| f["type"] == "freshAgent.send.accepted",
+        )
+        .await;
+        assert!(first.matched, "the fake app-server accepts the turn");
+
+        // Second send CHANGES the pair: the apply site must converge.
+        st.handle_send(send_with_settings("two", "gpt-5.6-sol", "low"))
+            .await;
+        let second = collect_frames_until(
+            &mut rx,
+            std::time::Duration::from_secs(5),
+            |f| {
+                f["type"] == "freshAgent.event"
+                    && f["event"]["type"] == "freshAgent.session.metadata"
+            },
+        )
+        .await;
+        assert!(
+            second.matched,
+            "a settings-changing send broadcasts metadata: {:?}",
+            second.frames
+        );
+        let metadata = second
+            .frames
+            .iter()
+            .rev()
+            .find(|f| f["type"] == "freshAgent.event"
+                && f["event"]["type"] == "freshAgent.session.metadata")
+            .expect("the metadata frame");
+        assert_eq!(metadata["sessionId"], json!(thread_id));
+        assert_eq!(metadata["event"]["model"], json!("gpt-5.6-sol"));
+        assert_eq!(metadata["event"]["effort"], json!("low"));
+
+        std::env::remove_var("CODEX_CMD");
+        std::env::remove_var("FAKE_CODEX_APP_SERVER_BEHAVIOR");
     }
 }

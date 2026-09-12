@@ -69,10 +69,11 @@ use freshell_opencode::{
     SdkProviderEvent, ServeError, SessionSignal, SnapshotStatus,
 };
 use freshell_protocol::{
-    ErrorCode, ErrorMsg, FreshAgentAttach, FreshAgentCompact, FreshAgentCreate,
-    FreshAgentCreateFailed, FreshAgentCreated, FreshAgentEvent, FreshAgentFork, FreshAgentForked,
-    FreshAgentInterrupt, FreshAgentKill, FreshAgentKilled, FreshAgentSend, FreshAgentSendAccepted,
-    FreshAgentSessionMaterialized, ServerMessage, SessionLocator,
+    ErrorCode, ErrorMsg, FreshAgentAttach, FreshAgentCompact, FreshAgentConfigure,
+    FreshAgentCreate, FreshAgentCreateFailed, FreshAgentCreated, FreshAgentEvent,
+    FreshAgentFork, FreshAgentForked, FreshAgentInterrupt, FreshAgentKill, FreshAgentKilled,
+    FreshAgentSend, FreshAgentSendAccepted, FreshAgentSessionMaterialized, ServerMessage,
+    SessionLocator,
 };
 use freshell_terminal::FrameSink;
 
@@ -1102,6 +1103,8 @@ impl FreshOpencodeState {
             durable_id
         };
 
+        let previous_model = session.model.clone();
+        let previous_effort = session.effort.clone();
         session.model = model.clone();
         session.effort = effort.clone();
 
@@ -1127,8 +1130,21 @@ impl FreshOpencodeState {
                     effort: session.effort.clone(),
                     cwd: session.cwd.clone(),
                 },
-            })
-            .await;
+             })
+             .await;
+         }
+
+        // A send whose settings CHANGED the session record converges every
+        // device's model surfaces (the same frame `handle_configure` emits —
+        // a device that missed the configure still lands here).
+        if previous_model != model || previous_effort != effort {
+            self.broadcast(&crate::session_metadata::session_metadata_frame(
+                PROVIDER,
+                SESSION_TYPE,
+                &busy_session_id,
+                model.as_deref(),
+                effort.as_deref(),
+            ));
         }
 
         let real_id = acked_session_id.clone();
@@ -1183,6 +1199,110 @@ impl FreshOpencodeState {
             handle: turn_task,
             compact_settled_rx: None,
         });
+    }
+
+    // ── freshAgent.configure (WS) ────────────────────────────────────────────
+
+    /// Handle a `freshAgent.configure`: apply the carried settings to the LIVE
+    /// session record NOW (they ride the next turn's prompt body — opencode's
+    /// advertised `per-send` setting scope), refresh the durable binding row's
+    /// settings when the session has materialized, and broadcast
+    /// `freshAgent.session.metadata` so every device's model surfaces converge
+    /// immediately. Model/effort are normalized PURELY from the carried
+    /// settings — the same rule `handle_send` applies (`normalizeOpencodeInput`:
+    /// a settings object that omits model CLEARS it) — so a configure is
+    /// exactly "what the next send would have carried", minus the turn.
+    ///
+    /// sandbox/permissionMode have NO opencode wire concept: logged
+    /// observably, never silently dropped (kata z7j7, same as the send path).
+    /// No busy refusal: recording mid-turn is safe — the in-flight turn keeps
+    /// the model it already prompted with, and the next turn picks up the new
+    /// pair (the `per-send` contract).
+    pub async fn handle_configure(&self, msg: FreshAgentConfigure) {
+        let session_id = msg.session_id.clone();
+        let session_arc = {
+            let guard = self.sessions.lock().await;
+            guard.get(&session_id).cloned()
+        };
+        let Some(session_arc) = session_arc else {
+            self.emit_fresh_agent_error(
+                &session_id,
+                "INVALID_SESSION_ID",
+                "opencode session not found",
+            );
+            return;
+        };
+
+        let mut session = session_arc.lock().await;
+        // The killed/close-pending gates (the same refusals `handle_send`
+        // applies): a configure for a pane that is going away must never
+        // re-assert a ledger row the kill is retiring.
+        if session.killed.load(Ordering::SeqCst) || session.close_pending > 0 {
+            drop(session);
+            self.emit_fresh_agent_error(
+                &session_id,
+                "INVALID_SESSION_ID",
+                "opencode session not found",
+            );
+            return;
+        }
+
+        if msg.settings.sandbox.is_some() || msg.settings.permission_mode.is_some() {
+            tracing::info!(
+                session_id = %session_id,
+                has_sandbox = msg.settings.sandbox.is_some(),
+                has_permission_mode = msg.settings.permission_mode.is_some(),
+                "freshagent.opencode.configure-unsupported-settings-ignored"
+            );
+        }
+
+        let model = normalize_opencode_model(msg.settings.model.as_deref());
+        let effort = normalize_opencode_effort(model.as_deref(), msg.settings.effort.as_deref());
+        let changed = session.model != model || session.effort != effort;
+        if !changed {
+            // Idempotent configure: nothing to converge.
+            return;
+        }
+        session.model = model.clone();
+        session.effort = effort.clone();
+
+        // Materialized sessions re-snapshot the binding row's settings (the
+        // same per-send refresh `handle_send` performs — durable before the
+        // broadcast). A configure for a placeholder has no row yet; the
+        // materialization write will carry the staged pair.
+        let durable_id = session.real_session_id.clone();
+        let provenance = session.provenance.clone();
+        let cwd = session.cwd.clone();
+        drop(session);
+        if let Some(durable_id) = durable_id {
+            self.record_binding_row(crate::identity_sink::FreshAgentBindingUpsert {
+                provider: PROVIDER.into(),
+                session_id: durable_id,
+                mode: SESSION_TYPE.into(),
+                create_request_id: None,
+                resolves_pending: None,
+                supersedes: None,
+                provenance: provenance.into(),
+                settings: crate::identity_sink::FreshAgentSettings {
+                    model: model.clone(),
+                    sandbox: None,
+                    permission_mode: None,
+                    effort: effort.clone(),
+                    cwd,
+                },
+            })
+            .await;
+        }
+
+        // Broadcast keyed at the CLIENT-ADDRESSED id (the id the configure
+        // named): the client's fold resolves the sessions-map entry by it.
+        self.broadcast(&crate::session_metadata::session_metadata_frame(
+            PROVIDER,
+            SESSION_TYPE,
+            &session_id,
+            model.as_deref(),
+            effort.as_deref(),
+        ));
     }
 
     /// Reconcile liveness probe (campaign §4.3, Task 13): is this id tracked
@@ -11588,5 +11708,282 @@ mod tests {
             !record.can_redo(),
             "the new chain is fully restored; the frozen rows stay ledger-only"
         );
+    }
+
+    // ── freshAgent.configure: live model convergence ─────────────────────────
+
+    fn configure_msg(session_id: &str, model: Option<&str>, effort: Option<&str>) -> FreshAgentConfigure {
+        FreshAgentConfigure {
+            provider: AgentProvider::Opencode,
+            session_id: session_id.to_string(),
+            session_type: SessionType::Freshopencode,
+            cwd: None,
+            request_id: Some("req-configure".to_string()),
+            settings: freshell_protocol::FreshAgentSendSettings {
+                cwd: None,
+                model: model.map(|m| m.to_string()),
+                permission_mode: None,
+                sandbox: None,
+                effort: effort.map(|e| e.to_string()),
+            },
+        }
+    }
+
+    fn send_msg_with_settings(
+        session_id: &str,
+        text: &str,
+        model: Option<&str>,
+        effort: Option<&str>,
+    ) -> FreshAgentSend {
+        FreshAgentSend {
+            provider: AgentProvider::Opencode,
+            session_id: session_id.to_string(),
+            session_type: SessionType::Freshopencode,
+            text: text.to_string(),
+            cwd: None,
+            images: None,
+            request_id: Some(format!("req-{text}")),
+            settings: Some(freshell_protocol::FreshAgentSendSettings {
+                cwd: None,
+                model: model.map(|m| m.to_string()),
+                permission_mode: None,
+                sandbox: None,
+                effort: effort.map(|e| e.to_string()),
+            }),
+        }
+    }
+
+    /// Drain every frame currently buffered on the bus.
+    async fn drain(rx: &mut tokio::sync::broadcast::Receiver<String>) -> Vec<serde_json::Value> {
+        let mut out = Vec::new();
+        while let Ok(frame) = rx.try_recv() {
+            out.push(serde_json::from_str(&frame).expect("frames are JSON"));
+        }
+        out
+    }
+
+    #[tokio::test]
+    async fn configure_records_the_pair_and_broadcasts_session_metadata() {
+        let (tx, rx) = tokio::sync::broadcast::channel::<String>(64);
+        let fresh_agent = FreshAgentState::new(Arc::new("tok".to_string()), Arc::new(tx));
+        let (manager, _killed) = started_manager().await;
+        fresh_agent.set_manager_for_test(manager).await;
+        let st = FreshOpencodeState::new(fresh_agent);
+
+        st.handle_create(create_msg("req-cfg-live"), None).await;
+        let placeholder = "freshopencode-req-cfg-live";
+        let mut rx = rx;
+
+        st.handle_configure(configure_msg(placeholder, Some("prov/mdl-b"), Some("low")))
+            .await;
+
+        // The session record holds the staged pair…
+        let sessions = st.sessions.lock().await;
+        let session = sessions.get(placeholder).expect("session tracked").lock().await;
+        assert_eq!(session.model.as_deref(), Some("prov/mdl-b"));
+        assert_eq!(session.effort.as_deref(), Some("low"));
+        drop(session);
+        drop(sessions);
+
+        // …and the metadata broadcast converges every device's surfaces,
+        // keyed at the CLIENT-ADDRESSED id (the placeholder here).
+        let frames = drain(&mut rx).await;
+        let metadata = frames
+            .iter()
+            .find(|f| f["type"] == "freshAgent.event"
+                && f["event"]["type"] == "freshAgent.session.metadata")
+            .expect("a metadata frame is broadcast");
+        assert_eq!(metadata["provider"], json!("opencode"));
+        assert_eq!(metadata["sessionType"], json!("freshopencode"));
+        assert_eq!(metadata["sessionId"], json!(placeholder));
+        assert_eq!(metadata["event"]["sessionId"], json!(placeholder));
+        assert_eq!(metadata["event"]["model"], json!("prov/mdl-b"));
+        assert_eq!(metadata["event"]["effort"], json!("low"));
+    }
+
+    #[tokio::test]
+    async fn an_idempotent_configure_broadcasts_no_metadata() {
+        let (tx, rx) = tokio::sync::broadcast::channel::<String>(64);
+        let fresh_agent = FreshAgentState::new(Arc::new("tok".to_string()), Arc::new(tx));
+        let (manager, _killed) = started_manager().await;
+        fresh_agent.set_manager_for_test(manager).await;
+        let st = FreshOpencodeState::new(fresh_agent);
+        let mut rx = rx;
+
+        st.handle_create(create_msg("req-cfg-idem"), None).await;
+        let placeholder = "freshopencode-req-cfg-idem";
+        st.handle_configure(configure_msg(placeholder, Some("prov/mdl-b"), None))
+            .await;
+        let first = drain(&mut rx).await;
+        assert_eq!(
+            first
+                .iter()
+                .filter(|f| f["type"] == "freshAgent.event"
+                    && f["event"]["type"] == "freshAgent.session.metadata")
+                .count(),
+            1,
+            "the first (changing) configure broadcasts exactly one metadata frame"
+        );
+
+        // Same values again: nothing changed, nothing converges, no frame.
+        st.handle_configure(configure_msg(placeholder, Some("prov/mdl-b"), None))
+            .await;
+        let second = drain(&mut rx).await;
+        assert!(
+            !second.iter().any(|f| f["type"] == "freshAgent.event"
+                && f["event"]["type"] == "freshAgent.session.metadata"),
+            "an idempotent configure stays silent on the bus"
+        );
+    }
+
+    #[tokio::test]
+    async fn configure_for_an_unknown_session_answers_invalid_session_id() {
+        let (tx, rx) = tokio::sync::broadcast::channel::<String>(64);
+        let fresh_agent = FreshAgentState::new(Arc::new("tok".to_string()), Arc::new(tx));
+        let st = FreshOpencodeState::new(fresh_agent);
+        let mut rx = rx;
+
+        st.handle_configure(configure_msg("freshopencode-nope", Some("prov/mdl-b"), None))
+            .await;
+
+        let frames = drain(&mut rx).await;
+        let error = frames
+            .iter()
+            .find(|f| f["type"] == "freshAgent.event"
+                && f["event"]["type"] == "freshAgent.error")
+            .expect("the unknown session surfaces a freshAgent.error frame");
+        assert_eq!(error["event"]["code"], json!("INVALID_SESSION_ID"));
+        assert_eq!(error["sessionId"], json!("freshopencode-nope"));
+    }
+
+    #[tokio::test]
+    async fn configure_on_a_killed_session_is_refused_before_any_side_effect() {
+        let (tx, rx) = tokio::sync::broadcast::channel::<String>(64);
+        let fresh_agent = FreshAgentState::new(Arc::new("tok".to_string()), Arc::new(tx));
+        let (manager, _killed) = started_manager().await;
+        fresh_agent.set_manager_for_test(manager).await;
+        let st = FreshOpencodeState::new(fresh_agent);
+        let fake = std::sync::Arc::new(crate::identity_sink::FakeIdentitySink::default());
+        st.set_identity_sink(fake.clone());
+
+        st.handle_create(create_msg("req-cfg-killed"), None).await;
+        let placeholder = "freshopencode-req-cfg-killed";
+        let session_arc = {
+            let sessions = st.sessions.lock().await;
+            sessions.get(placeholder).expect("session tracked").clone()
+        };
+        session_arc.lock().await.killed.store(true, Ordering::SeqCst);
+        let mut rx = rx;
+
+        st.handle_configure(configure_msg(placeholder, Some("prov/mdl-b"), None))
+            .await;
+
+        let frames = drain(&mut rx).await;
+        let error = frames
+            .iter()
+            .find(|f| f["type"] == "freshAgent.event"
+                && f["event"]["type"] == "freshAgent.error")
+            .expect("the killed session refuses with an error frame");
+        assert_eq!(error["event"]["code"], json!("INVALID_SESSION_ID"));
+        // The record is untouched: no metadata, no binding write.
+        assert!(
+            !frames.iter().any(|f| f["type"] == "freshAgent.event"
+                && f["event"]["type"] == "freshAgent.session.metadata"),
+            "a refused configure never converges a dying session"
+        );
+        assert!(fake.bindings.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_send_with_changed_settings_broadcasts_session_metadata() {
+        let (tx, rx) = tokio::sync::broadcast::channel::<String>(64);
+        let fresh_agent = FreshAgentState::new(Arc::new("tok".to_string()), Arc::new(tx));
+        let (manager, _killed) = started_manager().await;
+        fresh_agent.set_manager_for_test(manager).await;
+        let st = FreshOpencodeState::new(fresh_agent);
+        let fake = std::sync::Arc::new(crate::identity_sink::FakeIdentitySink::default());
+        st.set_identity_sink(fake.clone());
+        let mut rx = rx;
+
+        st.handle_create(create_msg("req-cfg-send"), None).await;
+        let placeholder = "freshopencode-req-cfg-send";
+
+        // First send carries the initial pair (materializes + records)…
+        st.handle_send(send_msg_with_settings(placeholder, "one", Some("prov/mdl-a"), Some("high")))
+            .await;
+        let _ = drain(&mut rx).await;
+
+        // …the second send CHANGES the pair: the accepted-turn apply path must
+        // converge the metadata broadcast, keyed at the durable id the pane now
+        // holds (the same stamp the accepted frame uses).
+        st.handle_send(send_msg_with_settings(placeholder, "two", Some("prov/mdl-b"), Some("low")))
+            .await;
+        let frames = drain(&mut rx).await;
+        let metadata = frames
+            .iter()
+            .find(|f| f["type"] == "freshAgent.event"
+                && f["event"]["type"] == "freshAgent.session.metadata")
+            .expect("a settings-changing send broadcasts metadata");
+        assert_eq!(metadata["event"]["model"], json!("prov/mdl-b"));
+        assert_eq!(metadata["event"]["effort"], json!("low"));
+        assert!(
+            metadata["sessionId"].as_str().unwrap().starts_with("ses_"),
+            "post-materialization broadcasts key at the durable id"
+        );
+
+        // A send with UNCHANGED settings adds no second metadata frame.
+        st.handle_send(send_msg_with_settings(placeholder, "three", Some("prov/mdl-b"), Some("low")))
+            .await;
+        let frames = drain(&mut rx).await;
+        assert!(
+            !frames.iter().any(|f| f["type"] == "freshAgent.event"
+                && f["event"]["type"] == "freshAgent.session.metadata"),
+            "an unchanged-settings send stays silent"
+        );
+    }
+
+    #[tokio::test]
+    async fn configure_on_a_materialized_session_re_snapshots_the_binding_row() {
+        let (tx, rx) = tokio::sync::broadcast::channel::<String>(64);
+        let fresh_agent = FreshAgentState::new(Arc::new("tok".to_string()), Arc::new(tx));
+        let (manager, _killed) = started_manager().await;
+        fresh_agent.set_manager_for_test(manager).await;
+        let st = FreshOpencodeState::new(fresh_agent);
+        let fake = std::sync::Arc::new(crate::identity_sink::FakeIdentitySink::default());
+        st.set_identity_sink(fake.clone());
+        let mut rx = rx;
+
+        st.handle_create(create_msg("req-cfg-row"), None).await;
+        let placeholder = "freshopencode-req-cfg-row";
+        st.handle_send(send_msg_with_settings(placeholder, "one", Some("prov/mdl-a"), Some("high")))
+            .await;
+        let _ = drain(&mut rx).await;
+        let durable = {
+            let sessions = st.sessions.lock().await;
+            let session_arc = sessions.get(placeholder).expect("tracked").clone();
+            drop(sessions);
+            let session = session_arc.lock().await;
+            session.real_session_id.clone().expect("materialized")
+        };
+
+        st.handle_configure(configure_msg(&durable, Some("prov/mdl-b"), Some("low")))
+            .await;
+        let frames = drain(&mut rx).await;
+        assert!(
+            frames
+                .iter()
+                .any(|f| f["type"] == "freshAgent.event"
+                    && f["event"]["type"] == "freshAgent.session.metadata"
+                    && f["event"]["model"] == json!("prov/mdl-b")),
+            "the durable-id configure converges too"
+        );
+        let bindings = fake.bindings.lock().unwrap();
+        let last = bindings
+            .iter()
+            .rev()
+            .find(|b| b.session_id == durable)
+            .expect("a binding row re-snapshot");
+        assert_eq!(last.settings.model.as_deref(), Some("prov/mdl-b"));
+        assert_eq!(last.settings.effort.as_deref(), Some("low"));
     }
 }

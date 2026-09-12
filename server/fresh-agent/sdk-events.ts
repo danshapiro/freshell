@@ -23,8 +23,8 @@ export type FreshAgentProviderEvent =
     sessionId: string
     sessionRef?: { provider: string; sessionId: string }
   }
-  | { type: 'freshAgent.session.init'; sessionId: string; cliSessionId?: string; model?: string; cwd?: string; tools?: Array<{ name: string }> }
-  | { type: 'freshAgent.session.metadata'; sessionId: string; cliSessionId?: string; model?: string; cwd?: string; tools?: Array<{ name: string }> }
+  | { type: 'freshAgent.session.init'; sessionId: string; cliSessionId?: string; model?: string; effort?: string; cwd?: string; tools?: Array<{ name: string }> }
+  | { type: 'freshAgent.session.metadata'; sessionId: string; cliSessionId?: string; model?: string; effort?: string; cwd?: string; tools?: Array<{ name: string }> }
   | { type: 'freshAgent.assistant'; sessionId: string; content: ContentBlock[]; model?: string; usage?: Usage }
   | { type: 'freshAgent.stream'; sessionId: string; event: unknown; parentToolUseId?: string | null }
   | { type: 'freshAgent.result'; sessionId: string; result?: string; durationMs?: number; costUsd?: number; usage?: Usage }

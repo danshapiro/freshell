@@ -1296,6 +1296,35 @@ async fn handle_client_text(
             }
             true
         }
+        // `freshAgent.configure`: apply settings (model / effort / permission
+        // mode / sandbox) to a LIVE session without a turn, converging every
+        // device's model surfaces via the `freshAgent.session.metadata`
+        // broadcast. Same provider routing as send/interrupt/kill — detached
+        // tasks, never blocking the connection's select loop (a claude
+        // configure awaits the sidecar's configure RPC). `amplifier` has no
+        // fresh-agent runtime: dropped, same as its send arm.
+        ClientMessage::FreshAgentConfigure(configure) => {
+            if is_codex_provider(configure.provider) {
+                let fresh_codex = state.fresh_codex.clone();
+                tokio::spawn(
+                    async move { fresh_codex.handle_configure(configure).await }
+                        .instrument(tracing::Span::current()),
+                );
+            } else if configure.provider == freshell_protocol::AgentProvider::Claude {
+                let fresh_claude = state.fresh_claude.clone();
+                tokio::spawn(
+                    async move { fresh_claude.handle_configure(configure).await }
+                        .instrument(tracing::Span::current()),
+                );
+            } else if configure.provider == freshell_protocol::AgentProvider::Opencode {
+                let fresh_opencode = state.fresh_opencode.clone();
+                tokio::spawn(
+                    async move { fresh_opencode.handle_configure(configure).await }
+                        .instrument(tracing::Span::current()),
+                );
+            }
+            true
+        }
         ClientMessage::FreshAgentKill(kill) => {
             if is_codex_provider(kill.provider) {
                 let fresh_codex = state.fresh_codex.clone();

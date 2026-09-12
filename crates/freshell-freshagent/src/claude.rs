@@ -56,10 +56,10 @@ use tokio::sync::Mutex as TokioMutex;
 
 use freshell_protocol::{
     ErrorCode, ErrorMsg, FreshAgentApprovalRespond, FreshAgentAttach, FreshAgentCompact,
-    FreshAgentCreate, FreshAgentCreateFailed, FreshAgentCreated, FreshAgentEvent,
-    FreshAgentInterrupt, FreshAgentKill, FreshAgentKilled, FreshAgentQuestionRespond,
-    FreshAgentSend, FreshAgentSendAccepted, FreshAgentSessionMaterialized, ServerMessage,
-    SessionType,
+    FreshAgentConfigure, FreshAgentCreate, FreshAgentCreateFailed, FreshAgentCreated,
+    FreshAgentEvent, FreshAgentInterrupt, FreshAgentKill, FreshAgentKilled,
+    FreshAgentQuestionRespond, FreshAgentSend, FreshAgentSendAccepted,
+    FreshAgentSessionMaterialized, ServerMessage, SessionType,
 };
 
 use crate::{FreshAgentCreateDedup, FreshAgentCreateOutcome, SharedPaneIdentitySink};
@@ -1989,12 +1989,37 @@ impl FreshClaudeState {
                     "freshagent.claude.unsupported-settings-ignored"
                 );
             }
+            let settings_before = {
+                let guard = self.sessions.lock().await;
+                guard.get(&map_key).map(|s| {
+                    (s.configuration.settings.model.clone(), s.configuration.settings.effort.clone())
+                })
+            };
             if let Err(err) = self
                 .configure_for_send(&map_key, settings, session_type)
                 .await
             {
                 self.send_error(&request_id, "CLAUDE_SETTINGS_FAILED", &err);
                 return;
+            }
+            // A send whose settings CHANGED the live session converges every
+            // device's model surfaces (the same frame `handle_configure`
+            // emits — a device that missed the configure still lands here).
+            let settings_after = {
+                let guard = self.sessions.lock().await;
+                guard.get(&map_key).map(|s| {
+                    (s.configuration.settings.model.clone(), s.configuration.settings.effort.clone())
+                })
+            };
+            if settings_before != settings_after {
+                let (model, effort) = settings_after.unwrap_or((None, None));
+                self.broadcast(&crate::session_metadata::session_metadata_frame(
+                    PROVIDER,
+                    session_type,
+                    &session_id,
+                    model.as_deref(),
+                    effort.as_deref(),
+                ));
             }
         }
         // Task 4 review (C1b): the destroy target comes from POST-lock session
@@ -2185,6 +2210,97 @@ impl FreshClaudeState {
             .await;
         }
         applied
+    }
+
+    // ── freshAgent.configure (WS) ─────────────────────────────────────────────
+
+    /// Handle a `freshAgent.configure`: apply the carried settings to the
+    /// LIVE sidecar session NOW — model and effort through the sidecar's
+    /// configure lane (`setModel` / `applyFlagSettings`), which is a REAL
+    /// mid-conversation change (claude's settings are live, not per-send) —
+    /// then broadcast `freshAgent.session.metadata` so every device's model
+    /// surfaces converge immediately.
+    ///
+    /// Same serialization discipline as `handle_send`: the session turn lock
+    /// is held across the busy gate and the sidecar write, and
+    /// [`Self::configure_for_send`] refuses while a turn is in flight ("Wait
+    /// for the current turn to finish before changing agent settings.") —
+    /// surfaced on the pane's error banner, with the pane's staged choice
+    /// still riding the next send's configure-for-send leg.
+    pub async fn handle_configure(&self, msg: FreshAgentConfigure) {
+        let session_id = msg.session_id.clone();
+        let session_type = session_type_str(msg.session_type);
+        let request_id = msg.request_id.clone();
+
+        let (map_key, turn_lock) = loop {
+            let handles = match self.resolve_session_key(&session_id).await {
+                Some(key) => {
+                    let guard = self.sessions.lock().await;
+                    guard.get(&key).map(|s| (key, s.turn_lock.clone()))
+                }
+                None => None,
+            };
+            if let Some(handles) = handles {
+                break handles;
+            }
+            if !self.rollback_in_flight.contains(&session_id) {
+                self.send_error(&request_id, "SESSION_NOT_FOUND", "claude session not found");
+                return;
+            }
+            tokio::time::sleep(MID_ROLLBACK_PARK_TICK).await;
+        };
+        let _turn = turn_lock.lock().await;
+
+        // kata z7j7: sandbox has NO claude-side concept — log observably
+        // (id + boolean flag only), mirroring the send path's arm.
+        if msg.settings.sandbox.is_some() {
+            tracing::info!(
+                session_id = %session_id,
+                has_sandbox = true,
+                "freshagent.claude.configure-unsupported-settings-ignored"
+            );
+        }
+
+        let before = {
+            let guard = self.sessions.lock().await;
+            guard
+                .get(&map_key)
+                .map(|s| (s.configuration.settings.model.clone(), s.configuration.settings.effort.clone()))
+        };
+        if let Err(err) = self
+            .configure_for_send(&map_key, &msg.settings, session_type)
+            .await
+        {
+            // The refusal/failure is user-facing session state (busy turn,
+            // sidecar death): the pane banner is the surface, on every device.
+            self.emit_fresh_agent_error(
+                &session_id,
+                session_type,
+                "CLAUDE_SETTINGS_FAILED",
+                &err,
+            );
+            return;
+        }
+        let after = {
+            let guard = self.sessions.lock().await;
+            guard
+                .get(&map_key)
+                .map(|s| (s.configuration.settings.model.clone(), s.configuration.settings.effort.clone()))
+        };
+        if before == after {
+            // Idempotent configure: nothing to converge.
+            return;
+        }
+        let (model, effort) = after.unwrap_or((None, None));
+        // Broadcast keyed at the CLIENT-ADDRESSED id (the id the configure
+        // named): the client's fold resolves the sessions-map entry by it.
+        self.broadcast(&crate::session_metadata::session_metadata_frame(
+            PROVIDER,
+            session_type,
+            &session_id,
+            model.as_deref(),
+            effort.as_deref(),
+        ));
     }
 
     // ── freshAgent.approval.respond / question.respond / compact (WS, Task 2) ─────────
@@ -5903,16 +6019,20 @@ pub(crate) mod tests {
     }
 
     /// Bounded drain of the broadcast receiver until a `freshAgent.event` envelope with
-    /// the given INNER type arrives (mirrors [`await_claude_created`]'s 15s shape).
+    /// the given INNER type arrives (mirroring [`await_claude_created`]'s shape, with a
+    /// 45s dead-man budget: the awaited frames are near-instant under normal load, and
+    /// only full-crate 96-way-parallel starvation delays them — 15s was observed to
+    /// starve intermittently on the shared dev box (pre-existing flake, pinned on an
+    /// unmodified checkout); 45s keeps the dead-man switch while riding out contention).
     async fn await_frame_of_inner_type(
         rx: &mut tokio::sync::broadcast::Receiver<String>,
         inner_type: &str,
     ) -> Value {
-        tokio::time::timeout(std::time::Duration::from_secs(15), async {
+        tokio::time::timeout(std::time::Duration::from_secs(45), async {
             loop {
                 let frame: Value = match rx.recv().await {
                     // Under host load the bounded drain can fall behind the
-                    // 64-frame bus: re-sync and keep waiting (the 15s budget
+                    // 64-frame bus: re-sync and keep waiting (the 45s budget
                     // stays the dead-man switch); `Closed` surfaces through
                     // the same deadline as a lost sender.
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
@@ -15074,5 +15194,202 @@ rl.on('line', (line) => {
             "the ledger holds NO row at all afterward — not even an empty record"
         );
         drop(env);
+    }
+
+    // ── freshAgent.configure: live model convergence ─────────────────────────
+
+    fn configure_msg(session_id: &str, model: Option<&str>, effort: Option<&str>) -> FreshAgentConfigure {
+        FreshAgentConfigure {
+            provider: freshell_protocol::AgentProvider::Claude,
+            session_id: session_id.to_string(),
+            session_type: SessionType::Freshclaude,
+            cwd: None,
+            request_id: Some("req-configure".to_string()),
+            settings: freshell_protocol::FreshAgentSendSettings {
+                cwd: None,
+                model: model.map(|m| m.to_string()),
+                permission_mode: None,
+                sandbox: None,
+                effort: effort.map(|e| e.to_string()),
+            },
+        }
+    }
+
+    async fn drain(rx: &mut tokio::sync::broadcast::Receiver<String>) -> Vec<Value> {
+        let mut out = Vec::new();
+        while let Ok(frame) = rx.try_recv() {
+            out.push(serde_json::from_str(&frame).expect("frames are JSON"));
+        }
+        out
+    }
+
+    /// A configure applies the settings to the LIVE sidecar session (the fake
+    /// mirrors the real configure lane: setModel + the sdk.configured receipt)
+    /// and broadcasts `freshAgent.session.metadata` so every device's model
+    /// surfaces converge. The ledger row's settings re-snapshot through the
+    /// existing adopt_session_init leg configure_for_send performs.
+    #[tokio::test]
+    async fn configure_applies_settings_and_broadcasts_session_metadata() {
+        let _env_guard = CLAUDE_ENV_LOCK.lock().await;
+        let env = FakeClaudeSidecarEnv::install();
+        let (state, rx) = state_with_bus();
+        let mut rx = rx;
+        state
+            .handle_create(dedup_create_msg("configure-live"), None)
+            .await;
+        let created = await_claude_created(&mut rx, "configure-live").await;
+        let session_id = created["sessionId"].as_str().unwrap().to_string();
+
+        state
+            .handle_configure(configure_msg(&session_id, Some("opus[1m]"), Some("high")))
+            .await;
+
+        // The configure lane reached the sidecar…
+        let frames = env.respond_log_frames(1).await;
+        assert_eq!(frames[0]["type"], json!("configure"));
+        assert_eq!(frames[0]["settings"]["model"], json!("opus[1m]"));
+
+        // …the session record holds the applied pair…
+        let (record_model, record_effort) = {
+            let guard = state.sessions.lock().await;
+            let session = guard.values().find(|s| s.sidecar_session_id == session_id).expect("session");
+            (
+                session.configuration.settings.model.clone(),
+                session.configuration.settings.effort.clone(),
+            )
+        };
+        assert_eq!(record_model.as_deref(), Some("opus[1m]"));
+        assert_eq!(record_effort.as_deref(), Some("high"));
+
+        // …and the metadata broadcast converges every device's surfaces, keyed
+        // at the CLIENT-ADDRESSED id.
+        let frames = drain(&mut rx).await;
+        let metadata = frames
+            .iter()
+            .find(|f| f["type"] == "freshAgent.event"
+                && f["event"]["type"] == "freshAgent.session.metadata")
+            .expect("a metadata frame is broadcast");
+        assert_eq!(metadata["provider"], json!("claude"));
+        assert_eq!(metadata["sessionType"], json!("freshclaude"));
+        assert_eq!(metadata["sessionId"], json!(session_id));
+        assert_eq!(metadata["event"]["model"], json!("opus[1m]"));
+        assert_eq!(metadata["event"]["effort"], json!("high"));
+    }
+
+    /// The fake sidecar's scripted refusal (model 'unavailable') surfaces on
+    /// the pane-banner error channel with the session's flavour, and NO
+    /// metadata converges a value the live session never took.
+    #[tokio::test]
+    async fn a_refused_configure_surfaces_the_banner_error_and_converges_nothing() {
+        let _env_guard = CLAUDE_ENV_LOCK.lock().await;
+        let env = FakeClaudeSidecarEnv::install();
+        let (state, rx) = state_with_bus();
+        let mut rx = rx;
+        state
+            .handle_create(dedup_create_msg("configure-refused"), None)
+            .await;
+        let created = await_claude_created(&mut rx, "configure-refused").await;
+        let session_id = created["sessionId"].as_str().unwrap().to_string();
+
+        state
+            .handle_configure(configure_msg(&session_id, Some("unavailable"), None))
+            .await;
+        let _ = env.respond_log_frames(1).await;
+
+        let frames = drain(&mut rx).await;
+        let error = frames
+            .iter()
+            .find(|f| f["type"] == "freshAgent.event"
+                && f["event"]["type"] == "freshAgent.error")
+            .expect("the refusal surfaces a freshAgent.error frame");
+        assert_eq!(error["event"]["code"], json!("CLAUDE_SETTINGS_FAILED"));
+        assert_eq!(error["sessionType"], json!("freshclaude"));
+        assert_eq!(error["sessionId"], json!(session_id));
+        assert!(
+            !frames.iter().any(|f| f["type"] == "freshAgent.event"
+                && f["event"]["type"] == "freshAgent.session.metadata"),
+            "a refused configure never converges"
+        );
+    }
+
+    /// An idempotent configure (the sidecar applied the same pair already in
+    /// the record) stays silent on the bus.
+    #[tokio::test]
+    async fn an_idempotent_configure_broadcasts_no_metadata() {
+        let _env_guard = CLAUDE_ENV_LOCK.lock().await;
+        let env = FakeClaudeSidecarEnv::install();
+        let (state, rx) = state_with_bus();
+        let mut rx = rx;
+        state
+            .handle_create(dedup_create_msg("configure-idem"), None)
+            .await;
+        let created = await_claude_created(&mut rx, "configure-idem").await;
+        let session_id = created["sessionId"].as_str().unwrap().to_string();
+
+        state
+            .handle_configure(configure_msg(&session_id, Some("opus[1m]"), None))
+            .await;
+        let first = env.respond_log_frames(1).await;
+        assert_eq!(first[0]["settings"]["model"], json!("opus[1m]"));
+        let frames = drain(&mut rx).await;
+        assert_eq!(
+            frames
+                .iter()
+                .filter(|f| f["type"] == "freshAgent.event"
+                    && f["event"]["type"] == "freshAgent.session.metadata")
+                .count(),
+            1,
+            "the first (changing) configure broadcasts exactly one metadata frame"
+        );
+
+        state
+            .handle_configure(configure_msg(&session_id, Some("opus[1m]"), None))
+            .await;
+        // The second configure is a pure no-op: configure_for_send
+        // short-circuits before any sidecar write (the respond log stays at
+        // one frame), and no metadata converges.
+        let frames = drain(&mut rx).await;
+        assert!(
+            !frames.iter().any(|f| f["type"] == "freshAgent.event"
+                && f["event"]["type"] == "freshAgent.session.metadata"),
+            "an idempotent configure converges nothing"
+        );
+    }
+
+    /// A settings-bearing send that CHANGES the live session converges the
+    /// metadata broadcast too (the send-time configure_for_send leg): a
+    /// device that missed the configure still lands here.
+    #[tokio::test]
+    async fn a_settings_changing_send_broadcasts_session_metadata() {
+        let _env_guard = CLAUDE_ENV_LOCK.lock().await;
+        let env = FakeClaudeSidecarEnv::install();
+        let (state, rx) = state_with_bus();
+        let mut rx = rx;
+        state
+            .handle_create(dedup_create_msg("configure-send"), None)
+            .await;
+        let created = await_claude_created(&mut rx, "configure-send").await;
+        let session_id = created["sessionId"].as_str().unwrap().to_string();
+
+        let mut send = send_msg(&session_id, "carries a new model");
+        send.settings = Some(freshell_protocol::FreshAgentSendSettings {
+            cwd: None,
+            model: Some("opus[1m]".to_string()),
+            effort: Some("high".to_string()),
+            permission_mode: None,
+            sandbox: None,
+        });
+        state.handle_send(send).await;
+        let _ = env.respond_log_frames(1).await;
+
+        let frames = drain(&mut rx).await;
+        let metadata = frames
+            .iter()
+            .find(|f| f["type"] == "freshAgent.event"
+                && f["event"]["type"] == "freshAgent.session.metadata")
+            .expect("a settings-changing send broadcasts metadata");
+        assert_eq!(metadata["sessionId"], json!(session_id));
+        assert_eq!(metadata["event"]["model"], json!("opus[1m]"));
+        assert_eq!(metadata["event"]["effort"], json!("high"));
     }
 }
