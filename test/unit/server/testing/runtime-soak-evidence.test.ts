@@ -325,6 +325,20 @@ describe('direct soak measurements', () => {
   })
 
 
+  it('keeps the 80% floor when calibrating the measured September 11 memory workload', () => {
+    const baseline = validSamples()[0]
+    const memory = baseline.metrics.find((metric) => metric.fixture === 'memory_allocator')!
+    memory.memoryCurrentBytes = 39_424_000
+    memory.memoryPeakBytes = 39_682_048
+    memory.memoryLimitBytes = 48 * 1024 * 1024
+    expect(() => validateRuntimeSoakBaseline(baseline, desiredWorkloads())).toThrow(/baseline.*memory pressure/i)
+    // A tighter test-only cgroup, not weaker acceptance or synthesized pressure.
+    memory.memoryLimitBytes = 44 * 1024 * 1024
+    expect(() => validateRuntimeSoakBaseline(baseline, desiredWorkloads())).not.toThrow()
+    memory.memoryCurrentBytes = Math.floor(memory.memoryLimitBytes * 0.799)
+    expect(() => validateRuntimeSoakBaseline(baseline, desiredWorkloads())).toThrow(/baseline.*memory pressure/i)
+  })
+
   it('requires continuous nonzero terminal output growth from the one shell workload', () => {
     const zero = validSamples()
     for (const sample of zero) {

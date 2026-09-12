@@ -69,9 +69,12 @@ function limitsFor(fixture: SoakFixture) {
     return { cpuMilli: 500, memoryBytes: 96 * 1024 * 1024, swapBytes: 0, pidsMax: 32 }
   }
   if (fixture === 'memory_allocator') {
-    // The worker touches 32 MiB. The authentic baseline must still prove that
-    // host overhead brings current occupancy to the >=80% acceptance floor.
-    return { cpuMilli: 100, memoryBytes: 48 * 1024 * 1024, swapBytes: 0, pidsMax: 12 }
+    // The worker touches 32 MiB. The Sept 11 baseline measured 39,424,000 B
+    // total occupancy: only 78.3% of the original 48 MiB cap, correctly rejected.
+    // Tighten (never loosen) that test-only cap to 44 MiB: the measured working
+    // set is 85.4%, with headroom. The live baseline must still independently
+    // satisfy the UNCHANGED >=80% floor before the measurement clock starts.
+    return { cpuMilli: 100, memoryBytes: 44 * 1024 * 1024, swapBytes: 0, pidsMax: 12 }
   }
   if (fixture === 'descendant_spawner') {
     // host, worker, child, and grandchild at five tasks each occupy at least

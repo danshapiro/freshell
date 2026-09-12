@@ -109,9 +109,6 @@ test.describe.serial('Phase 3 provider resurrection', () => {
 
     const rig = new ManagedRuntimeBrowserRig(process.cwd(), 3, {
       FRESHELL_MANAGED_OPENCODE_BASH_PERMISSION: 'ask',
-      // Debug-only, bounded delay makes the input fence observable without
-      // changing release timing or recovery semantics.
-      FRESHELL_MANAGED_RECOVERY_TEST_DELAY_MS: '7000',
     })
 
     try {
@@ -217,17 +214,28 @@ test.describe.serial('Phase 3 provider resurrection', () => {
       expect(approvalSurvivedWebRestart).toBe(true)
       expect(markerLineCount(rig, before.containerId)).toBe(0)
 
-      rig.runtime.killOwnedRuntimeExact(before.containerId)
-      await new Promise((resolve) => setTimeout(resolve, 1_500))
-
-      const fenceNotice = await waitForValue('visible managed recovery input fence', async () => {
-        await terminal.typeInTerminal(`P3_RECOVERY_FENCE_${Date.now()}\n`, 1)
-        await new Promise((resolve) => setTimeout(resolve, 250))
-        const text = await terminal.getVisibleText(terminalId)
-        return text.includes('Input not sent: this managed session is recovering') ? text : null
-      }, 4_500)
-      const rejectedInputWhileRecovering = fenceNotice.includes('Input not sent: this managed session is recovering')
-      expect(rejectedInputWhileRecovering).toBe(true)
+      // Hold the exact soul's replacement create after broker-policy validation.
+      // The old debug-only web delay is absent in release builds and cannot
+      // constrain the independent supervisor observer. A real barrier makes the
+      // transient input fence testable without slowing production recovery.
+      const barrier = rig.runtime.broker.holdNextCreateForOwnedSoul(before.soulId)
+      let rejectedInputWhileRecovering = false
+      try {
+        rig.runtime.killOwnedRuntimeExact(before.containerId)
+        expect(await barrier.entered, 'replacement must reach the bounded owned create barrier').toBe(true)
+        const fenceNotice = await waitForValue('visible managed recovery input fence', async () => {
+          // No Enter: a late probe must never accidentally approve a native tool.
+          await terminal.typeInTerminal(`P3_RECOVERY_FENCE_${Date.now()}`, 1)
+          await new Promise((resolve) => setTimeout(resolve, 250))
+          const text = await terminal.getVisibleText(terminalId)
+          return text.includes('Input not sent: this managed session is recovering') ? text : null
+        }, 4_500)
+        rejectedInputWhileRecovering = fenceNotice.includes('Input not sent: this managed session is recovering')
+        expect(barrier.expired()).toBe(false)
+        expect(rejectedInputWhileRecovering).toBe(true)
+      } finally {
+        barrier.release()
+      }
 
       const after = await waitForRunningView(
         rig,

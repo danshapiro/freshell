@@ -2,6 +2,7 @@ import { createHash } from 'node:crypto'
 import fs from 'node:fs'
 import http, { type IncomingMessage, type ServerResponse } from 'node:http'
 import path from 'node:path'
+import { OwnedCreateBarriers, type OwnedCreateBarrier } from './runtime-create-barrier.js'
 
 const DOCKER_API_PREFIX = '/v1.47'
 const MAX_REQUEST_BYTES = 2 * 1024 * 1024
@@ -54,6 +55,9 @@ export class RestrictedDockerBroker {
   private readonly events: BrokerEvent[] = []
   private server?: http.Server
   private stopFailuresRemaining = 0
+  private readonly createBarriers = new OwnedCreateBarriers((soulId) => (
+    this.receipts().some((receipt) => receipt.soulId === soulId)
+  ))
 
   constructor(private readonly policy: RestrictedDockerBrokerPolicy) {}
 
@@ -85,6 +89,10 @@ export class RestrictedDockerBroker {
     this.stopFailuresRemaining = Math.max(0, count)
   }
 
+  holdNextCreateForOwnedSoul(soulId: string): OwnedCreateBarrier {
+    return this.createBarriers.arm(soulId)
+  }
+
   async start(): Promise<void> {
     fs.mkdirSync(path.dirname(this.policy.proxySocketPath), { recursive: true, mode: 0o700 })
     fs.mkdirSync(path.dirname(this.policy.logPath), { recursive: true, mode: 0o700 })
@@ -101,6 +109,7 @@ export class RestrictedDockerBroker {
   }
 
   async close(): Promise<void> {
+    this.createBarriers.releaseAll()
     if (!this.server) return
     await new Promise<void>((resolve) => this.server!.close(() => resolve()))
     this.server = undefined
@@ -134,6 +143,15 @@ export class RestrictedDockerBroker {
       const validation = this.validateCreate(body)
       if (!validation.ok) {
         this.block(response, method, url, 403, validation.reason, true, undefined)
+        return
+      }
+      // A bounded one-shot test barrier can hold only a fully validated create
+      // for an already receipt-owned soul. Expiry fails explicitly, and close()
+      // releases pending waits so a failed test cannot strand broker teardown.
+      if (await this.createBarriers.enter(validation.soulId) === 'expired') {
+        this.record({ method, url, decision: 'inject_failure', reason: 'owned create barrier expired', destructive: false, unsafeAttempt: false })
+        response.writeHead(503, { 'content-type': 'application/json' })
+        response.end(JSON.stringify({ message: 'runtime test create barrier expired' }))
         return
       }
       const forwarded = await this.forward(request, body)

@@ -119,16 +119,29 @@ async function qualify(
     model: definition.model,
     effort: definition.effort === 'provider-default' ? undefined : definition.effort,
   }))
-  if (!created?.paneId || !created?.sessionId) throw new Error('MCP new-tab did not create a fresh-agent pane')
+  if (!created?.tabId || !created?.paneId || !created?.sessionId) throw new Error('MCP new-tab did not create a fresh-agent pane')
   const paneId = created.paneId as string
   const sessionId = created.sessionId as string
+  // MCP creation is intentionally focus-neutral. Select the returned tab/pane
+  // before exercising its browser composer; do not change production focus policy.
+  // Creation broadcasts an asynchronous layout update. Wait for the new tab
+  // to enter the normal REST tab inventory before asking MCP to select it.
+  await waitFor('MCP-created tab becomes selectable', async () => {
+    const selected = dataOf(await executeAction('select-tab', { target: created.tabId }))
+    return selected?.error ? null : selected
+  }, 30_000)
+  await expect.poll(() => new TestHarness(page).getActiveTabId(), { timeout: 30_000 }).toBe(created.tabId)
+  const selectedPane = dataOf(await executeAction('select-pane', { target: paneId }))
+  expect(selectedPane?.error).toBeUndefined()
   const initial = await waitFor('managed fresh-agent view', () => rig.runningViewForFreshSession(sessionId))
   if (!initial.containerId) throw new Error('managed fresh-agent view has no enclosure')
   expect(rig.ownedProviderExec(initial.containerId, definition.versionCommand)).toContain(definition.version)
+  const first = await sendNoToolTurn(page, paneId, sessionId, 'Remember the next ordinary word in this conversation: cedar. Use no tools. Reply only acknowledged.')
+  // FreshOpenCode materializes its native session and starts its serve process
+  // lazily on the FIRST send. Before then only the supervised host must exist.
+  // Still require the actual pinned provider, now at its documented lifecycle.
   const initialProcesses = rig.ownedContainerProcessTable(initial.containerId)
   expect(initialProcesses).toMatch(definition.processPattern)
-
-  const first = await sendNoToolTurn(page, paneId, sessionId, 'Remember the next ordinary word in this conversation: cedar. Use no tools. Reply only acknowledged.')
   const second = await sendNoToolTurn(page, paneId, sessionId, 'Use no tools or files. Reply with the ordinary word I asked you to remember.')
   const nativeSessionId = await waitFor('provider native identity', async () => (
     (await rig.runningViewForFreshSession(sessionId))?.nativeSessionId ?? null
