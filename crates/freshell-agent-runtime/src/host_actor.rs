@@ -177,6 +177,9 @@ pub trait FreshAgentTransport: Send + Sync {
             acceptance_ambiguous: false,
         })
     }
+    async fn snapshot(&self) -> Result<Value, String> {
+        Err("provider does not expose a hosted snapshot".into())
+    }
     async fn capture(&self, _max_bytes: usize) -> Result<FreshAgentCapture, String> {
         Err("provider does not expose a hosted snapshot".into())
     }
@@ -797,6 +800,25 @@ impl FreshAgentHostActor {
         )?;
         write_state(&self.state_dir, &state)?;
         outcome
+    }
+
+    /// Snapshot reads do not dispatch input or mutate command-idempotency state.
+    pub async fn snapshot(&self) -> Result<Value, ActorError> {
+        let snapshot = self
+            .transport
+            .snapshot()
+            .await
+            .map_err(ActorError::Transport)?;
+        let bytes = serde_json::to_vec(&snapshot)
+            .map_err(|error| ActorError::Transport(error.to_string()))?;
+        // Leave room for the authenticated envelope. Never silently truncate
+        // structured transcript data into a different valid conversation.
+        if bytes.len() > freshell_runtime_protocol::MAX_CONTROL_FRAME_BYTES - 16 * 1024 {
+            return Err(ActorError::Transport(
+                "hosted snapshot exceeds control-frame limit".into(),
+            ));
+        }
+        Ok(snapshot)
     }
 
     pub async fn capture(&self, max_bytes: usize) -> Result<FreshAgentCapture, ActorError> {

@@ -62,3 +62,12 @@ pub struct FreshAgentCapture {
     pub text: String,
     pub truncated: bool,
 }
+
+/// Structured provider-native snapshot, read only through the current owner.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FreshAgentSnapshotRequest {
+    pub soul_id: SoulId,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expected_control_epoch: Option<u64>,
+}

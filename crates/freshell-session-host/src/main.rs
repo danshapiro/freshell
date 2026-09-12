@@ -526,6 +526,18 @@ async fn dispatch(
                         native_session_id: actor.profile().await.native_session_id,
                     })
                 }
+                HostCommand::FreshAgentSnapshot { incarnation_id } => {
+                    ensure_incarnation(&incarnation_id, state)?;
+                    let actor = state
+                        .fresh_agent
+                        .lock()
+                        .await
+                        .clone()
+                        .ok_or_else(unsupported_fresh_agent)?;
+                    Ok(HostResult::FreshAgentSnapshot(
+                        actor.snapshot().await.map_err(map_actor_error)?,
+                    ))
+                }
                 HostCommand::FreshAgentCapture {
                     incarnation_id,
                     max_bytes,

@@ -107,6 +107,35 @@ async fn get_snapshot(
     }
     let cwd = query.get("cwd").cloned();
 
+    let known_pair = matches!(
+        (session_type.as_str(), provider.as_str()),
+        ("freshclaude" | "kilroy", "claude")
+            | ("freshcodex", "codex")
+            | ("freshopencode", "opencode")
+    );
+    if known_pair {
+        if let Some(gateway) = state.opencode.hosted_rest_gateway() {
+            match gateway
+                .snapshot(crate::hosted_rest::HostedRestSnapshot {
+                    session_id: thread_id.clone(),
+                    provider: provider.clone(),
+                    session_type: session_type.clone(),
+                })
+                .await
+            {
+                Ok(Some(snapshot)) => return Json(snapshot).into_response(),
+                Ok(None) => {} // Positively unmanaged: retain the legacy path.
+                Err(()) => {
+                    return fail_with_code(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "managed fresh-agent snapshot is temporarily unavailable".into(),
+                        "MANAGED_FRESH_AGENT_UNAVAILABLE",
+                    )
+                }
+            }
+        }
+    }
+
     match (session_type.as_str(), provider.as_str()) {
         ("freshcodex", "codex") => match state.codex.get_snapshot(&thread_id, cwd.as_deref()).await
         {
@@ -978,5 +1007,188 @@ mod tests {
         assert_eq!(value["provider"], json!("opencode"));
         assert_eq!(value["threadId"], json!("ses_1"));
         assert_eq!(value["turns"][0]["items"][0]["text"], json!("hi"));
+    }
+}
+
+#[cfg(test)]
+mod hosted_snapshot_tests {
+    use super::*;
+    use crate::hosted_rest::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct Gateway {
+        calls: AtomicUsize,
+        unavailable: bool,
+        unmanaged: bool,
+    }
+    #[async_trait::async_trait]
+    impl HostedFreshAgentRestGateway for Gateway {
+        async fn create_agent(
+            self: Arc<Self>,
+            _: HostedRestCreate,
+        ) -> Result<HostedRestCreated, ()> {
+            panic!("snapshot must not create")
+        }
+        async fn send_agent(&self, _: HostedRestSend) -> Result<HostedRestSendResult, ()> {
+            panic!("snapshot must not send")
+        }
+        async fn snapshot(
+            &self,
+            request: HostedRestSnapshot,
+        ) -> Result<Option<serde_json::Value>, ()> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            if self.unavailable {
+                return Err(());
+            }
+            if self.unmanaged {
+                return Ok(None);
+            }
+            assert_eq!(request.session_id, "owned-public-alias");
+            Ok(Some(
+                json!({"sessionType": request.session_type, "provider": request.provider,
+                "threadId": request.session_id, "sessionId": request.session_id,
+                "status":"idle", "revision":1, "tokenUsage":{}, "turns":[],
+                "capabilities":{"send":true,"interrupt":true,"approvals":false,"questions":false,"fork":false}}),
+            ))
+        }
+    }
+    fn state(gateway: Arc<Gateway>) -> SnapshotState {
+        let tx = Arc::new(tokio::sync::broadcast::channel::<String>(64).0);
+        let token = Arc::new("test-token".to_string());
+        let opencode = FreshAgentState::new(token.clone(), tx.clone());
+        opencode.set_hosted_rest_gateway(gateway).unwrap();
+        SnapshotState::new(
+            token.clone(),
+            FreshCodexState::new(token, tx.clone(), json!({})),
+            opencode,
+            FreshClaudeState::new(tx),
+        )
+    }
+    async fn request(
+        gateway: Arc<Gateway>,
+        session_type: &str,
+        provider: &str,
+        id: &str,
+        auth: bool,
+    ) -> (StatusCode, serde_json::Value) {
+        let mut headers = HeaderMap::new();
+        if auth {
+            headers.insert("x-auth-token", "test-token".parse().unwrap());
+        }
+        let reply = get_snapshot(
+            State(state(gateway)),
+            Path((session_type.into(), provider.into(), id.into())),
+            Query(HashMap::new()),
+            headers,
+        )
+        .await;
+        let status = reply.status();
+        let bytes = axum::body::to_bytes(reply.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        (status, serde_json::from_slice(&bytes).unwrap())
+    }
+    #[tokio::test]
+    async fn every_hosted_mode_reads_its_owner_not_web_local_state() {
+        for (mode, provider) in [
+            ("freshclaude", "claude"),
+            ("kilroy", "claude"),
+            ("freshcodex", "codex"),
+            ("freshopencode", "opencode"),
+        ] {
+            let gateway = Arc::new(Gateway {
+                calls: AtomicUsize::new(0),
+                unavailable: false,
+                unmanaged: false,
+            });
+            let (status, body) =
+                request(gateway.clone(), mode, provider, "owned-public-alias", true).await;
+            assert_eq!(status, StatusCode::OK, "{mode}: {body}");
+            assert_eq!(body["capabilities"]["send"], true);
+            assert_eq!(body["sessionId"], "owned-public-alias");
+            assert_eq!(gateway.calls.load(Ordering::SeqCst), 1);
+        }
+    }
+    #[tokio::test]
+    async fn owner_failure_is_unavailable_not_an_empty_legacy_placeholder() {
+        let gateway = Arc::new(Gateway {
+            calls: AtomicUsize::new(0),
+            unavailable: true,
+            unmanaged: false,
+        });
+        let (status, body) = request(
+            gateway.clone(),
+            "freshopencode",
+            "opencode",
+            "freshopencode-placeholder",
+            true,
+        )
+        .await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+        assert_eq!(gateway.calls.load(Ordering::SeqCst), 1);
+    }
+    #[tokio::test]
+    async fn only_positive_unmanaged_result_uses_legacy_snapshot_path() {
+        let gateway = Arc::new(Gateway {
+            calls: AtomicUsize::new(0),
+            unavailable: false,
+            unmanaged: true,
+        });
+        let (status, body) = request(
+            gateway.clone(),
+            "freshopencode",
+            "opencode",
+            "freshopencode-placeholder",
+            true,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["threadId"], "freshopencode-placeholder");
+        assert_eq!(gateway.calls.load(Ordering::SeqCst), 1);
+    }
+    #[tokio::test]
+    async fn unauthorized_or_mismatched_locators_never_reach_the_owner() {
+        let gateway = Arc::new(Gateway {
+            calls: AtomicUsize::new(0),
+            unavailable: false,
+            unmanaged: false,
+        });
+        assert_eq!(
+            request(
+                gateway.clone(),
+                "freshopencode",
+                "opencode",
+                "owned-public-alias",
+                false
+            )
+            .await
+            .0,
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            request(
+                gateway.clone(),
+                "bogus",
+                "opencode",
+                "owned-public-alias",
+                true
+            )
+            .await
+            .0,
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            request(
+                gateway.clone(),
+                "freshopencode",
+                "codex",
+                "owned-public-alias",
+                true
+            )
+            .await
+            .0,
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert_eq!(gateway.calls.load(Ordering::SeqCst), 0);
     }
 }

@@ -1394,6 +1394,8 @@ pub struct TerminalResizeRequest {
 pub struct TerminalReadOutputRequest {
     pub soul_id: SoulId,
     pub after_seq: u64,
+    /// Batch budget. At least one complete sequence frame may be returned to
+    /// make progress; individual frames never exceed the 64-KiB transport limit.
     pub max_bytes: u64,
     /// Source epoch the caller has already rendered. Older clients omit it;
     /// the host then preserves cursor-only behavior for wire compatibility.
@@ -1665,6 +1667,7 @@ pub enum AdminCommand {
     FreshAgentCompact(FreshAgentCompactRequest),
     FreshAgentRollback(FreshAgentRollbackRequest),
     FreshAgentCapture(FreshAgentCaptureRequest),
+    FreshAgentSnapshot(FreshAgentSnapshotRequest),
     FreshAgentResolve(FreshAgentResolveRequest),
     FreshAgentInterrupt(FreshAgentInterruptRequest),
     FreshAgentReadEvents(FreshAgentReadEventsRequest),
@@ -1816,6 +1819,7 @@ pub enum AdminResult {
     },
     FreshAgentFork(FreshAgentForkResult),
     FreshAgentCapture(FreshAgentCapture),
+    FreshAgentSnapshot(serde_json::Value),
     FreshAgentInterrupted,
     FreshAgentEvents(AgentEventBatch),
     RuntimeMetrics(RuntimeMetrics),
@@ -1913,6 +1917,9 @@ pub enum HostCommand {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         cwd: Option<String>,
     },
+    FreshAgentSnapshot {
+        incarnation_id: IncarnationId,
+    },
     FreshAgentCapture {
         incarnation_id: IncarnationId,
         max_bytes: u32,
@@ -1978,6 +1985,7 @@ pub enum HostResult {
     FreshAgentFork(FreshAgentForkResult),
     FreshAgentInterrupted,
     FreshAgentCapture(FreshAgentCapture),
+    FreshAgentSnapshot(serde_json::Value),
     FreshAgentEvents(AgentEventBatch),
     RuntimeMetrics(RuntimeMetrics),
     Status {

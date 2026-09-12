@@ -33,6 +33,21 @@ pub fn project_hosted_snapshot(payload: &mut Value, provider: &str, session_type
     visit(payload, provider, session_type, known_pair);
 }
 
+/// Apply the same provider/gateway intersection to the canonical REST body.
+pub fn project_hosted_snapshot_body(payload: &mut Value, provider: &str, session_type: &str) {
+    let known_pair = matches!(
+        (provider, session_type),
+        ("claude", "freshclaude" | "kilroy")
+            | ("codex", "freshcodex")
+            | ("opencode", "freshopencode")
+    );
+    if let Some(object) = payload.as_object_mut() {
+        let identity_matches = object.get("provider").and_then(Value::as_str) == Some(provider)
+            && object.get("sessionType").and_then(Value::as_str) == Some(session_type);
+        project_capabilities(object, provider, known_pair && identity_matches);
+    }
+}
+
 fn visit(value: &mut Value, provider: &str, session_type: &str, known_pair: bool) {
     let Value::Object(object) = value else {
         return;

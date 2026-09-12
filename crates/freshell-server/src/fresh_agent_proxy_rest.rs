@@ -83,6 +83,58 @@ impl HostedFreshAgentRestGateway for HostedFreshAgentProxy {
         })
     }
 
+    async fn snapshot(
+        &self,
+        request: freshell_freshagent::hosted_rest::HostedRestSnapshot,
+    ) -> Result<Option<serde_json::Value>, ()> {
+        let (provider, session_type) =
+            rest_agent_identity(&request.provider, &request.session_type)?;
+        let runtime_provider = fresh_provider(&Some(provider), session_type).ok_or(())?;
+        // An inventory failure cannot be interpreted as "not managed". That
+        // would consult the wrong home or launch a second provider in web.
+        let inventory = self.client.inventory().await.map_err(|_| ())?;
+        let Some(view) = inventory.iter().rev().find(|view| {
+            view.provider.as_deref() == Some(runtime_provider.as_str())
+                && view.fresh_agent_session_type.as_deref() == Some(request.session_type.as_str())
+                && (view.fresh_agent_session_id.as_deref() == Some(request.session_id.as_str())
+                    || view.native_session_id.as_deref() == Some(request.session_id.as_str()))
+        }) else {
+            return if request.session_id.starts_with("managed-") {
+                Err(())
+            } else {
+                Ok(None)
+            };
+        };
+        if view.desired_state != DesiredState::Running {
+            return Err(());
+        }
+        let mut snapshot = self
+            .client
+            .fresh_agent_snapshot(view.soul_id.clone())
+            .await
+            .map_err(|_| ())?;
+        let object = snapshot.as_object_mut().ok_or(())?;
+        if object.get("provider").and_then(serde_json::Value::as_str)
+            != Some(request.provider.as_str())
+            || object
+                .get("sessionType")
+                .and_then(serde_json::Value::as_str)
+                != Some(request.session_type.as_str())
+        {
+            return Err(());
+        }
+        // Public locator stays stable while provider-native identity remains in
+        // the owning host/registry. Do not rewrite native turn/message records.
+        object.insert("sessionId".into(), request.session_id.clone().into());
+        object.insert("threadId".into(), request.session_id.into());
+        freshell_agent_runtime::snapshot_projection::project_hosted_snapshot_body(
+            &mut snapshot,
+            &request.provider,
+            &request.session_type,
+        );
+        Ok(Some(snapshot))
+    }
+
     async fn capture(
         &self,
         request: HostedRestCapture,

@@ -72,6 +72,14 @@ pub enum HostedRestCaptureError {
     Unavailable,
 }
 
+/// A read of the exact host-owned conversation; no provider launch or input.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HostedRestSnapshot {
+    pub session_id: String,
+    pub provider: String,
+    pub session_type: String,
+}
+
 #[async_trait]
 pub trait HostedFreshAgentRestGateway: Send + Sync {
     async fn create_agent(
@@ -80,6 +88,15 @@ pub trait HostedFreshAgentRestGateway: Send + Sync {
     ) -> Result<HostedRestCreated, ()>;
 
     async fn send_agent(&self, request: HostedRestSend) -> Result<HostedRestSendResult, ()>;
+
+    /// None is a positively unmanaged locator; errors must never fall through
+    /// to a web-owned provider or return an invented empty conversation.
+    async fn snapshot(
+        &self,
+        _request: HostedRestSnapshot,
+    ) -> Result<Option<serde_json::Value>, ()> {
+        Ok(None)
+    }
 
     async fn resolve_pane(&self, _pane_id: &str) -> Result<Option<HostedRestPane>, ()> {
         Ok(None)

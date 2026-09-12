@@ -382,6 +382,14 @@ impl Supervisor {
                     .await?;
                 Ok(AdminResult::FreshAgentCommand { state })
             }
+            AdminCommand::FreshAgentSnapshot(request) => {
+                self.registry
+                    .assert_epoch(request.expected_control_epoch)
+                    .map_err(map_registry)?;
+                Ok(AdminResult::FreshAgentSnapshot(
+                    self.fresh_agent_snapshot(request.soul_id).await?,
+                ))
+            }
             AdminCommand::FreshAgentCapture(request) => {
                 self.registry
                     .assert_epoch(request.expected_control_epoch)
@@ -1219,6 +1227,43 @@ impl Supervisor {
             _ => Err(RuntimeError::new(
                 RuntimeErrorCode::HostAuthenticationFailed,
                 "unexpected fresh-agent rollback reply",
+            )),
+        }
+    }
+
+    async fn fresh_agent_snapshot(
+        &self,
+        soul_id: SoulId,
+    ) -> Result<serde_json::Value, RuntimeError> {
+        let handle = self
+            .registry
+            .active_handle_for_soul(soul_id)
+            .await
+            .map_err(map_registry)?;
+        if handle.fresh_agent().is_none() {
+            return Err(RuntimeError::new(
+                RuntimeErrorCode::UnsupportedWorkload,
+                "soul is not a hosted fresh-agent",
+            ));
+        }
+        let host = self
+            .authenticate_host(handle.incarnation_id(), handle.runtime_dir())
+            .await?;
+        match self
+            .send_authenticated_host_command(
+                handle.incarnation_id().clone(),
+                handle.runtime_dir(),
+                &host,
+                HostCommand::FreshAgentSnapshot {
+                    incarnation_id: handle.incarnation_id().clone(),
+                },
+            )
+            .await?
+        {
+            HostResult::FreshAgentSnapshot(snapshot) => Ok(snapshot),
+            _ => Err(RuntimeError::new(
+                RuntimeErrorCode::HostAuthenticationFailed,
+                "unexpected fresh-agent snapshot reply",
             )),
         }
     }

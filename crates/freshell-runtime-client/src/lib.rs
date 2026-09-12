@@ -725,6 +725,28 @@ impl RuntimeClient {
         }
     }
 
+    pub async fn fresh_agent_snapshot(
+        &self,
+        soul_id: SoulId,
+    ) -> Result<serde_json::Value, ClientError> {
+        let epoch = self.current_epoch().await?;
+        match self
+            .request(
+                RequestId::new(),
+                AdminCommand::FreshAgentSnapshot(
+                    freshell_runtime_protocol::FreshAgentSnapshotRequest {
+                        soul_id,
+                        expected_control_epoch: Some(epoch),
+                    },
+                ),
+            )
+            .await?
+        {
+            AdminResult::FreshAgentSnapshot(snapshot) => Ok(snapshot),
+            _ => Err(ClientError::UnexpectedResult),
+        }
+    }
+
     pub async fn fresh_agent_capture(
         &self,
         soul_id: SoulId,

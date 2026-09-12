@@ -792,6 +792,10 @@ impl FreshAgentTransport for HostedTransport {
         })
     }
 
+    async fn snapshot(&self) -> Result<Value, String> {
+        self.snapshot_value().await
+    }
+
     async fn capture(&self, max_bytes: usize) -> Result<FreshAgentCapture, String> {
         let snapshot = self.snapshot_value().await?;
         let native_session_id = self.current_native_id().await?;
@@ -1151,6 +1155,38 @@ mod tests {
             Some(freshell_protocol::Sandbox::DangerFullAccess)
         );
         assert_eq!(parse_sandbox("unknown"), None);
+    }
+
+    #[tokio::test]
+    async fn lazy_opencode_snapshot_is_writable_before_any_provider_send() {
+        let transport = HostedTransport::new(FreshProvider::Opencode).await;
+        let profile = FreshAgentProfile {
+            provider: FreshProvider::Opencode,
+            runtime_variant: "opencode-per-soul-http".into(),
+            cwd: std::env::current_dir()
+                .unwrap()
+                .to_string_lossy()
+                .into_owned(),
+            model: Some("opencode/big-pickle".into()),
+            effort: None,
+            permission_mode: None,
+            sandbox: None,
+            provider_store_id: "isolated-test".into(),
+            native_session_id: None,
+        };
+        // Create only allocates an in-memory placeholder; no paid provider or
+        // process is started. The snapshot must unlock the real first-send UI.
+        let started = transport.start(&profile).await.unwrap();
+        assert!(started.native_session_id.is_none());
+        let snapshot = transport.snapshot().await.unwrap();
+        assert_eq!(snapshot["capabilities"]["send"], true);
+        assert_eq!(snapshot["provider"], "opencode");
+        assert_eq!(snapshot["sessionType"], "freshopencode");
+        assert!(snapshot["threadId"]
+            .as_str()
+            .unwrap()
+            .starts_with("freshopencode-"));
+        assert!(snapshot["turns"].as_array().unwrap().is_empty());
     }
 
     #[tokio::test]

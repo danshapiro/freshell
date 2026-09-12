@@ -84,3 +84,33 @@ fn admin_and_host_envelopes_keep_the_same_semantic_request_id() {
         } if restored_id == request_id
     ));
 }
+
+#[test]
+fn structured_snapshot_read_round_trips_with_exact_owner_and_epoch() {
+    let soul = crate::SoulId::new();
+    let command = crate::AdminCommand::FreshAgentSnapshot(crate::FreshAgentSnapshotRequest {
+        soul_id: soul.clone(),
+        expected_control_epoch: Some(17),
+    });
+    let bytes = serde_json::to_vec(&command).unwrap();
+    let decoded: crate::AdminCommand = serde_json::from_slice(&bytes).unwrap();
+    assert!(
+        matches!(decoded, crate::AdminCommand::FreshAgentSnapshot(request)
+        if request.soul_id == soul && request.expected_control_epoch == Some(17))
+    );
+    let incarnation = crate::IncarnationId::new();
+    let host = crate::HostCommand::FreshAgentSnapshot {
+        incarnation_id: incarnation.clone(),
+    };
+    let decoded: crate::HostCommand =
+        serde_json::from_slice(&serde_json::to_vec(&host).unwrap()).unwrap();
+    assert!(
+        matches!(decoded, crate::HostCommand::FreshAgentSnapshot { incarnation_id } if incarnation_id == incarnation)
+    );
+    let snapshot =
+        serde_json::json!({"turns":[{"id":"native-id","items":[{"text":"retained history"}]}]});
+    let reply = crate::HostResult::FreshAgentSnapshot(snapshot.clone());
+    let decoded: crate::HostResult =
+        serde_json::from_slice(&serde_json::to_vec(&reply).unwrap()).unwrap();
+    assert!(matches!(decoded, crate::HostResult::FreshAgentSnapshot(value) if value == snapshot));
+}

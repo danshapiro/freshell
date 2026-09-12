@@ -190,3 +190,26 @@ fn malformed_or_mismatched_snapshot_capabilities_fail_closed() {
         assert!(projected["rollback"].get("redoableTurnIds").is_none());
     }
 }
+
+#[test]
+fn canonical_rest_snapshot_gets_the_same_capabilities_without_an_event_type() {
+    for (provider, mode) in [
+        ("claude", "freshclaude"),
+        ("claude", "kilroy"),
+        ("codex", "freshcodex"),
+        ("opencode", "freshopencode"),
+    ] {
+        let mut body = json!({"provider":provider,"sessionType":mode,"sessionId":"public-alias",
+            "threadId":"public-alias","capabilities":advertised_capabilities(),
+            "turns":[{"id":"native-turn"}],"rollback":{"canRedo":true,"redoableTurnIds":["native-turn"]}});
+        let mut event = body.clone();
+        event["type"] = "freshAgent.session.snapshot".into();
+        project_hosted_snapshot(&mut event, provider, mode);
+        crate::snapshot_projection::project_hosted_snapshot_body(&mut body, provider, mode);
+        event.as_object_mut().unwrap().remove("type");
+        assert_eq!(body, event);
+        assert_eq!(body["turns"][0]["id"], "native-turn");
+        crate::snapshot_projection::project_hosted_snapshot_body(&mut body, provider, "wrong-mode");
+        assert_eq!(body["capabilities"]["send"], false);
+    }
+}
