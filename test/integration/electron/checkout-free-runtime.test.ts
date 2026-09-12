@@ -321,6 +321,9 @@ describe('checkout-free Electron runtime acceptance', () => {
       },
       stdio: ['ignore', 'pipe', 'pipe'],
     })
+    const serverDiagnostics: string[] = []
+    server.stdout?.on('data', (chunk: Buffer) => serverDiagnostics.push(`[stdout] ${chunk.toString()}`))
+    server.stderr?.on('data', (chunk: Buffer) => serverDiagnostics.push(`[stderr] ${chunk.toString()}`))
     let ws: WebSocket | undefined
     let terminalId: string | undefined
     let mcp: ChildProcess | undefined
@@ -333,11 +336,42 @@ describe('checkout-free Electron runtime acceptance', () => {
       expect(info.runtime).toBe('rust')
       expect(info.commit).toEqual(expect.any(String))
 
+      const bundledNodeVersion = execFileSync(nodeBinary, ['--version'], {
+        cwd: emptyCwd,
+        env: { ...process.env, NODE_PATH: '' },
+        encoding: 'utf8',
+      }).trim()
+      expect(bundledNodeVersion).toMatch(/^v\d+\.\d+\.\d+$/)
+      const directCatalog = execFileSync(
+        nodeBinary,
+        [path.join(runtime, 'claude-sidecar', 'model-catalog.mjs')],
+        {
+          cwd: emptyCwd,
+          env: {
+            ...process.env,
+            FRESHELL_CLAUDE_SDK_QUERY_MODULE: fakeSdk.relativeSpecifier,
+            NODE_PATH: '',
+          },
+          encoding: 'utf8',
+          timeout: 20_000,
+        },
+      )
+      expect(JSON.parse(directCatalog)).toEqual([{
+        value: 'checkout-free-relocated-model',
+        displayName: 'Checkout-Free Relocated Model',
+        supportedEffortLevels: ['medium'],
+        supportsAdaptiveThinking: true,
+      }])
+
       const modelCapabilities = await requestJson(`${baseUrl}/api/fresh-agent/model-capabilities/freshclaude`, {
         headers: { 'x-auth-token': AUTHENTICATION_TOKEN },
       })
-      expect(modelCapabilities.status).toBe(200)
-      const catalog = await modelCapabilities.json() as Record<string, unknown>
+      const modelCapabilitiesBody = await modelCapabilities.text()
+      expect(
+        modelCapabilities.status,
+        `model-capabilities response: ${modelCapabilitiesBody}\nserver diagnostics:\n${serverDiagnostics.join('').slice(-12_000)}`,
+      ).toBe(200)
+      const catalog = JSON.parse(modelCapabilitiesBody) as Record<string, unknown>
       expect(catalog).toMatchObject({
         ok: true,
         sessionType: 'freshclaude',
