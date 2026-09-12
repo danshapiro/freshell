@@ -146,18 +146,10 @@ impl OutputJournal {
                 more = true;
                 break;
             }
-            if cost > budget && frames.is_empty() {
-                // append() already chunks at <=64KiB, but a smaller caller budget
-                // should still make forward progress without emitting an oversized frame.
-                let Some(first) = split_utf8(&frame.data, budget).first().copied() else {
-                    continue;
-                };
-                let mut partial = frame.clone();
-                partial.data = first.to_string();
-                frames.push(partial);
-                more = true;
-                break;
-            }
+            // A sequence is an indivisible frame. Sending a prefix with the
+            // original seqEnd would make the caller acknowledge unseen bytes.
+            // Treat max_bytes as a batch budget, allowing the first complete
+            // frame to make progress; append() still enforces the 64-KiB bound.
             used = used.saturating_add(cost);
             frames.push(frame.clone());
         }
@@ -334,6 +326,33 @@ mod tests {
         assert_eq!(batch.frames[0].seq_start, 1);
         assert_eq!(batch.frames[0].data, "restored native conversation");
         assert!(journal.read(1, 64 * 1024).unwrap().frames.is_empty());
+    }
+
+    #[test]
+    fn a_small_read_budget_never_acknowledges_only_part_of_a_sequence() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut journal =
+            OutputJournal::new(dir.path(), IncarnationId::new(), "t".into(), "epoch".into())
+                .unwrap();
+        let first = "🦀".repeat(16_384);
+        journal.append(&first).unwrap();
+        journal.append("next frame").unwrap();
+        // A cursor names complete frames, not byte offsets. Returning one
+        // byte (or one Unicode scalar) with seqEnd=1 loses the rest forever.
+        let batch = journal.read(0, 1).unwrap();
+        assert_eq!(batch.frames.len(), 1);
+        assert_eq!(batch.frames[0].seq_end, 1);
+        assert_eq!(batch.frames[0].data, first);
+        assert!(batch.truncated);
+        let next = journal.read(batch.frames[0].seq_end, 1).unwrap();
+        assert_eq!(next.frames[0].data, "next frame");
+        assert!(!next.truncated);
+        assert!(next.frames[0].data.len() <= MAX_TRANSPORT_CHUNK_BYTES);
+        assert!(journal
+            .read(next.frames[0].seq_end, 1)
+            .unwrap()
+            .frames
+            .is_empty());
     }
 
     #[test]
