@@ -307,7 +307,8 @@ export class FreshAgentRuntimeManager {
   }
 
   /** Apply session settings to the LIVE session without a turn. The adapter's
-   * own `sdk.session.metadata` emission converges every subscribed device's
+   * own session-metadata emission (the normalized
+   * `freshAgent.session.metadata` frame) converges every subscribed device's
    * model surfaces; a refusal (e.g. changing model mid-turn on claude) throws
    * and surfaces through the handler's session-scoped error path. */
   async configure(locator: FreshAgentSessionLocator, input: { settings?: FreshAgentCreateRequest }) {

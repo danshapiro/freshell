@@ -6919,32 +6919,45 @@ describe('snapshot scheduler integration (zrrj)', () => {
   })
 
   it('coalesces a burst of freshopencode session.changed events across sibling panes into one snapshot GET', async () => {
-    const store = createStore()
-    const broadcast = captureWsBroadcast()
-    apiMock.getFreshAgentThreadSnapshot.mockResolvedValue(freshopencodeSnapshot('done', 10))
+    // Wall-clock debounce plus waitFor's 1s deadline races CPU contention
+    // under parallel suites (the 429 sibling's note): advance the actual
+    // scheduler/React timers deterministically.
+    vi.useFakeTimers()
+    try {
+      const store = createStore()
+      const broadcast = captureWsBroadcast()
+      apiMock.getFreshAgentThreadSnapshot.mockResolvedValue(freshopencodeSnapshot('done', 10))
 
-    store.dispatch(initLayout({ tabId: 'tab-1', paneId: 'pane-1', content: schedulerPaneContent('req-sched-a') }))
-    store.dispatch(initLayout({ tabId: 'tab-2', paneId: 'pane-2', content: schedulerPaneContent('req-sched-b') }))
-    render(
-      <Provider store={store}>
-        <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
-        <StoreBackedFreshAgentView tabId="tab-2" paneId="pane-2" />
-      </Provider>,
-    )
-    // Let the identity fetches (immediate + trailing coalesce for the sibling)
-    // fully settle before measuring the burst.
-    await waitFor(() => expect(screen.getAllByText('done').length).toBeGreaterThan(0))
-    await flushMs(400)
-    apiMock.getFreshAgentThreadSnapshot.mockClear()
+      store.dispatch(initLayout({ tabId: 'tab-1', paneId: 'pane-1', content: schedulerPaneContent('req-sched-a') }))
+      store.dispatch(initLayout({ tabId: 'tab-2', paneId: 'pane-2', content: schedulerPaneContent('req-sched-b') }))
+      render(
+        <Provider store={store}>
+          <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
+          <StoreBackedFreshAgentView tabId="tab-2" paneId="pane-2" />
+        </Provider>,
+      )
+      // Let the identity fetches (immediate + trailing coalesce for the
+      // sibling) fully settle before measuring the burst.
+      await act(async () => { await vi.advanceTimersByTimeAsync(0) })
+      await act(async () => { await vi.advanceTimersByTimeAsync(SNAPSHOT_DEBOUNCE_MS) })
+      await act(async () => { await vi.advanceTimersByTimeAsync(0) })
+      expect(screen.getAllByText('done').length).toBeGreaterThan(0)
+      apiMock.getFreshAgentThreadSnapshot.mockClear()
 
-    for (let i = 0; i < 10; i += 1) {
-      broadcast(sessionChanged())
+      for (let i = 0; i < 10; i += 1) {
+        broadcast(sessionChanged())
+      }
+
+      // Exactly one trailing GET shared by both panes, not one per event/pane.
+      await act(async () => { await vi.advanceTimersByTimeAsync(SNAPSHOT_DEBOUNCE_MS) })
+      expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledTimes(1)
+      // A further full window stays silent: the burst coalesced into that one
+      // trailing GET.
+      await act(async () => { await vi.advanceTimersByTimeAsync(SNAPSHOT_DEBOUNCE_MS) })
+      expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledTimes(1)
+    } finally {
+      vi.useRealTimers()
     }
-
-    // Exactly one trailing GET shared by both panes, not one per event/pane.
-    await waitFor(() => expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledTimes(1))
-    await flushMs(400)
-    expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledTimes(1)
   })
 
   it('keeps the last good snapshot visible and stops fetching during 429 backoff', async () => {

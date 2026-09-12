@@ -348,7 +348,13 @@ describe('storage-migration fresh-agent', () => {
     module.runStorageMigration()
     const elapsedMs = performance.now() - startedAt
 
-    expect(elapsedMs).toBeLessThan(500)
+    // Contention-tolerant budget: the migration measures ~10-50ms unloaded,
+    // but this suite runs 96-way-parallel on a box many agents share — a
+    // wall-clock budget tight enough to catch the O(n)→O(n²) class (~100x,
+    // seconds-to-minutes at 1000 leaves) without failing on CPU starvation
+    // (observed at ~2-3s while sibling agents' vitest runs hold the cores;
+    // also observed failing on an unmodified checkout under the same load).
+    expect(elapsedMs).toBeLessThan(5_000)
     expect(localStorage.getItem(LAYOUT_KEY)).not.toContain('"agent-chat"')
     expect(localStorage.getItem(LAYOUT_KEY)).toContain('"fresh-agent"')
   })
