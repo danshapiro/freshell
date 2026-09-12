@@ -260,6 +260,9 @@ export const RUST_ONLY_SPECS = [
   // P1.13 (Lane B4 Task 14): per-provider settings survive restart + codex
   // crash memory-loss banner. Imports RustServer directly for restartAbrupt().
   /freshagent-settings-resume-rust\.spec\.ts$/,
+  // Fresh-agent live model convergence (raw-WS configure + session.metadata
+  // broadcasts per provider fixture). Rust-only (see RUST_ONLY_SPECS entry).
+  /freshagent-live-model-convergence-rust\.spec\.ts$/,
   // Task 6 (the-usual/freshagent-sessionref-regression): REST fresh-agent
   // `sessionRef` resume (durable + placeholder→durable via the pane ledger,
   // loud 4xx failures) + the tabs.sync registry placeholder clamp. Imports
@@ -556,6 +559,12 @@ export default defineConfig({
         // codex crash memory-loss banner. Imports RustServer directly for
         // restartAbrupt().
         /freshagent-settings-resume-rust\.spec\.ts$/,
+        // Fresh-agent live model convergence: owns per-test RustServers
+        // (fake opencode serve + fake claude sidecar) proving
+        // freshAgent.configure broadcasts freshAgent.session.metadata and the
+        // next turn carries the configured pair. Rust-only (raw-WS against
+        // the owned server; see the RUST_ONLY_SPECS entry).
+        /freshagent-live-model-convergence-rust\.spec\.ts$/,
         // Task 6 (see the RUST_ONLY_SPECS entry): REST fresh-agent resume +
         // registry placeholder clamp. Imports RustServer for restartAbrupt().
         /fresh-agent-rest-resume-rust\.spec\.ts$/,

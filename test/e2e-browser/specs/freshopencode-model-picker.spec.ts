@@ -342,6 +342,81 @@ test.describe('Freshopencode model + thinking selector', () => {
     expect(levelMru).toContain('"low"')
   })
 
+  test('a commit sends freshAgent.configure and the metadata broadcast flips the chip over the stale snapshot', async ({
+    freshellPage,
+    page,
+    harness,
+    terminal,
+  }) => {
+    await terminal.waitForTerminal()
+    const cwd = await fsp.mkdtemp(path.join(os.tmpdir(), 'freshell-model-selector-converge-'))
+
+    await routeCatalog(page, CATALOG)
+    await routeThreads(page)
+    await routeFileApis(page, cwd)
+    await enableFreshClientsAndOpencode(page)
+    await createFreshopencodePane(page, cwd)
+
+    const chip = (label: string) => page.getByRole('button', { name: `Model: ${label} — change model` })
+
+    // The stubbed snapshot reports the PRE-change model in settings.model —
+    // the stale live-session term the chip prefers over the staged pick (the
+    // exact mask the live servers used to trap the chip on).
+    await expect(chip('GLM 5.2')).toBeVisible({ timeout: 15_000 })
+
+    // Commit DeepSeek V4 Pro · low through the shared dialog.
+    const settings = await openFreshAgentSettings(page)
+    await settings.getByRole('button', { name: /Change/ }).click()
+    const dialog = page.getByRole('dialog', { name: 'Model and thinking level' })
+    await expect(dialog).toBeVisible({ timeout: 10_000 })
+    await dialog.getByRole('searchbox', { name: 'Filter models' }).fill('deepseek')
+    await dialog.getByRole('option', { name: /DeepSeek V4 Pro/ }).click()
+    // Keyboard to the low row (the same in-column flow the first test uses):
+    // preselect lands on the model's highest level ('high'), ArrowUp → 'low'.
+    await page.keyboard.press('ArrowRight')
+    await page.keyboard.press('ArrowUp')
+    await expect(dialog.getByRole('button', { name: 'Use DeepSeek V4 Pro · low' })).toBeVisible()
+    await page.keyboard.press('Enter')
+    await expect(dialog).toHaveCount(0)
+
+    // The commit ALSO applies the pick to the LIVE session: the
+    // freshAgent.configure frame went out on the wire (the pane's network
+    // effects are suppressed to the spy, so read it there).
+    const sent = (await harness.getSentWsMessages()) as Array<Record<string, unknown>>
+    const configure = sent.find((m) => m?.type === 'freshAgent.configure')
+    expect(configure, 'the commit must send freshAgent.configure').toBeTruthy()
+    expect(configure).toMatchObject({
+      sessionType: 'freshopencode',
+      provider: 'opencode',
+      settings: { model: 'deepseek/deepseek-v4-pro', effort: 'low' },
+    })
+
+    // Before the server answers, the chip still shows the stale snapshot's
+    // live model — the staged pick is masked by the (stale) session truth.
+    await expect(chip('GLM 5.2')).toBeVisible({ timeout: 5_000 })
+
+    // The server's freshAgent.session.metadata broadcast states the applied
+    // pair: the chip flips IMMEDIATELY, over the stale snapshot term.
+    await harness.receiveWsMessage({
+      type: 'freshAgent.event',
+      sessionType: 'freshopencode',
+      provider: 'opencode',
+      sessionId: 'ses_e2e',
+      event: {
+        type: 'freshAgent.session.metadata',
+        sessionId: 'ses_e2e',
+        model: 'deepseek/deepseek-v4-pro',
+        effort: 'low',
+      },
+    })
+    await expect(chip('DeepSeek V4 Pro')).toBeVisible({ timeout: 10_000 })
+    await expect(chip('DeepSeek V4 Pro')).toHaveAttribute(
+      'title',
+      'deepseek/deepseek-v4-pro · effort low',
+    )
+    await expect(chip('GLM 5.2')).toHaveCount(0)
+  })
+
   test('/model in the composer opens the same dialog', async ({
     freshellPage,
     page,
