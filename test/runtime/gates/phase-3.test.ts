@@ -254,11 +254,13 @@ async function gate05TypedBlockersAndRepair(h: RuntimeHarness): Promise<void> {
   h.assert(caseId, blocked.expectedNativeSessionId === native.sessionId, 'blocked state retains the original native identity', blocked)
 
   restoreProviderVolume(h, receipt!.providerVolumeName!, originalState)
-  const repaired = dataOf(
-    await h.adminOk(supervisor, h.recoverBody(native.soulId, 'manual_retry')),
-    'recovery',
-  )
-  assertExactReplacement(h, caseId, native, repaired, native.sessionId, blocked.view.incarnationId)
+  // Repair can become visible to the independent observer before the manual
+  // caller runs. Either caller ordering must converge to exactly one successor
+  // of the blocked incarnation, never another conversation or duplicate writer.
+  await recoverExactOnce(h, supervisor, caseId, {
+    ...native, incarnationId: blocked.view.incarnationId,
+  }, 'manual_retry')
+  assertSingleRunningWriter(h, caseId, await inventory(h, supervisor), native.soulId)
   const exhausted = dataOf(
     await h.adminOk(supervisor, h.recoverBody(native.soulId, 'retry_exhausted')),
     'recovery',
@@ -649,7 +651,7 @@ async function recoverExactOnce(
   supervisor: SupervisorInstance,
   caseId: string,
   before: NativeSoul,
-  trigger: 'provider_exit' | 'host_unreachable',
+  trigger: 'provider_exit' | 'host_unreachable' | 'manual_retry',
   expectedSessionId = before.sessionId,
 ): Promise<any> {
   const recovery = dataOf(
