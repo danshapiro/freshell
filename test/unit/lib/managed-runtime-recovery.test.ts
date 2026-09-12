@@ -2,7 +2,7 @@ import { configureStore } from '@reduxjs/toolkit'
 import { describe, expect, it } from 'vitest'
 import tabsReducer, { addTab, setActiveTab, updateTab } from '@/store/tabsSlice'
 import { handleUiCommand } from '@/lib/ui-commands'
-import panesReducer from '@/store/panesSlice'
+import panesReducer, { updatePaneContent } from '@/store/panesSlice'
 import managedRuntimeReducer from '@/store/managedRuntimeSlice'
 import {
   applyManagedRuntimeMergePlan,
@@ -243,6 +243,58 @@ describe('managed runtime recovery merge', () => {
     expect(content.streamId).toBe('stream-real')
     expect(content.sessionRef).toEqual({ provider: 'opencode', sessionId: 'ses_real' })
     expect(content.initialCwd).toBe('/workspace/real')
+  })
+
+  it.each(['inventory-first', 'attach-first'] as const)(
+    'never substitutes the launch stream seed for the attached source epoch when %s wins', (order) => {
+      const state = baseState()
+      state.panes.layouts['user-tab'].content = {
+        kind: 'terminal', createRequestId: 'create-one', terminalId: 'terminal-one',
+        status: 'running', mode: 'opencode', shell: 'system',
+      }
+      const store = storeWithState(state)
+      const refresh = () => applyManagedRuntimeMergePlan(
+        store as any, buildManagedRuntimeMergePlan(snapshot(), store.getState() as any),
+      )
+      const attach = () => store.dispatch(updatePaneContent({
+        tabId: 'user-tab', paneId: 'user-pane',
+        content: { ...(store.getState().panes.layouts['user-tab'] as any).content,
+          streamId: 'stream-one-hostboot-actual' },
+      }))
+      if (order === 'inventory-first') { refresh(); attach() }
+      else { attach(); refresh() }
+      // The inventory stream id is a launch seed; only the source attachment
+      // knows the host-generated epoch. Further inventory refreshes cannot
+      // turn a correctly attached pane back into a different sequence domain.
+      refresh()
+      const content: any = (store.getState().panes.layouts['user-tab'] as any).content
+      expect(content.streamId).toBe('stream-one-hostboot-actual')
+      expect(content.incarnationId).toBe('incarnation-one')
+      expect(content.status).toBe('running')
+    },
+  )
+
+  it('leaves a reconstructed pane stream unset until the source attach handshake', () => {
+    const plan = buildManagedRuntimeMergePlan(snapshot(), baseState())
+    expect(plan.creates).toHaveLength(1)
+    expect(plan.creates[0].content.terminalId).toBe('terminal-one')
+    expect(plan.creates[0].content.streamId).toBeUndefined()
+  })
+
+  it('does not pre-advance an existing surface epoch when a replacement is projected', () => {
+    const state = baseState()
+    state.panes.layouts['user-tab'].content = {
+      kind: 'terminal', createRequestId: 'create-one', terminalId: 'terminal-one',
+      soulId: 'soul-one', incarnationId: 'incarnation-one',
+      streamId: 'stream-one-hostboot-old', status: 'running', mode: 'opencode',
+    }
+    const replacement = soul({ incarnationId: 'incarnation-two', terminalStreamId: 'replacement-seed' })
+    const plan = buildManagedRuntimeMergePlan(snapshot([replacement]), state)
+    // terminal.stream.changed must still see the old surface epoch so it can
+    // retire old writes and request full hydration of the replacement stream.
+    expect(plan.updates[0].content).toMatchObject({
+      incarnationId: 'incarnation-two', streamId: 'stream-one-hostboot-old',
+    })
   })
 
   it('rekeys an offline fresh-agent view to the supervisor current native branch after provider fork', () => {

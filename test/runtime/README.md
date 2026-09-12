@@ -1,8 +1,9 @@
 # Durable Souls runtime tests — Stage 5a
 
-The full coding-agent feature set remains the goal. Stage 5a replaces layered
-report certification with direct test execution, without dropping behavioral
-checks, providers, resource controls, recovery paths, or operational safeguards.
+The eight in-scope coding-agent modes remain required. Stage 5a replaces layered
+report certification with direct test execution, without dropping their behavioral
+checks, resource controls, recovery paths, or operational safeguards. Gemini, Kimi,
+and extension/plugin support are explicitly deferred by the scope amendment below.
 
 ## Direct commands
 
@@ -29,9 +30,10 @@ provider usage and long stress work.
 
 Use the single-provider/mode commands for narrower work. The live suite names
 its complete implemented matrix explicitly; ambient selection variables do not
-narrow it. Enabled Gemini/Kimi/plugin hosting and native recovery remain part of
-the original product scope. Unimplemented capabilities remain outstanding work,
-not an exemption or a passing test result.
+narrow it. Dan explicitly deferred Gemini, Kimi, and extension/plugin support
+from Stage 5a on September 11, 2026. They are excluded from this stage's
+implementation and acceptance, not reported as passing coverage. All eight
+named modes and their safety and recovery assertions remain required.
 
 `test:runtime:campaign` is a compatibility alias for the new direct runner.
 Old `gate landing` and certification-mode arguments are retired. Existing

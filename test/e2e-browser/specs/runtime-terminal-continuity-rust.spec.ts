@@ -159,6 +159,41 @@ function waitForSessionId(content: () => Promise<any>, timeoutMs: number): Promi
   }, timeoutMs)
 }
 
+/** Force a real revisioned inventory refresh AFTER attachment has established its epoch. */
+async function assertInventoryPreservesAttachedEpoch(
+  harness: TestHarness,
+  rig: ManagedRuntimeBrowserRig,
+  pane: TerminalIdentity,
+  view: ManagedRuntimeView,
+): Promise<void> {
+  const result = await rig.runtime.adminOk(rig.supervisor, rig.runtime.terminalReadOutputBody(
+    view.soulId, 0, 64 * 1024, await rig.controlEpoch(),
+  ))
+  expect(result.kind).toBe('terminal_output')
+  const source = result.data
+  expect(source.incarnationId).toBe(view.incarnationId)
+  expect(source.terminalId).toBe(pane.terminalId)
+  expect(source.streamEpoch).not.toBe(view.terminalStreamId)
+  const content = async () => findTerminalLeaves(await harness.getPaneLayout(pane.tabId))
+    .find((leaf) => leaf.content.terminalId === pane.terminalId)?.content
+  await expect.poll(async () => (await content())?.streamId, { timeout: 30_000 }).toBe(source.streamEpoch)
+
+  const inventory = await rig.inventorySnapshot()
+  const intent = inventory.viewIntents.find((row: any) => row.soulId === view.soulId)
+  if (!intent) throw new Error('attached managed shell lacks a durable view intent')
+  // Reasserting visible with a new request advances the real view revision;
+  // the normal WS invalidation / HTTP inventory path must fold that revision.
+  const updated = await rig.runtime.adminOk(rig.supervisor, rig.runtime.updateViewVisibilityBody({
+    viewId: intent.viewId, visibility: 'visible', expectedRevision: intent.revision,
+    expectedSoulIntentRevision: view.intentRevision, expectedControlEpoch: await rig.controlEpoch(),
+  }))
+  expect(updated.data.revision).toBeGreaterThan(intent.revision)
+  await expect.poll(async () => (await content())?.viewIntentRevision, { timeout: 30_000 })
+    .toBe(updated.data.revision)
+  expect((await content())?.streamId).toBe(source.streamEpoch)
+  expect((await content())?.incarnationId).toBe(view.incarnationId)
+}
+
 test.describe.serial('Phase 2 managed runtime continuity', () => {
   test('P2-G01: real browser shell survives ten graceful/abrupt web replacements', async ({ page, e2eServerKind }) => {
     expect(e2eServerKind).toBe('rust')
@@ -178,6 +213,8 @@ test.describe.serial('Phase 2 managed runtime continuity', () => {
       const initialPane = await waitForTerminalIdentity(harness, 90_000)
       const initialView = await waitForRunningView(rig, initialPane.terminalId, 90_000)
       if (!initialView?.containerId || !initialView.hostBootId) throw new Error('managed runtime view missing container/host identity')
+
+      await assertInventoryPreservesAttachedEpoch(harness, rig, initialPane, initialView)
 
       // Two long-lived descendants: one heartbeat producer proves output is
       // continuously drained while web disappears; one plain sleep gives a
@@ -232,6 +269,8 @@ test.describe.serial('Phase 2 managed runtime continuity', () => {
         }, 60_000)
         outputAdvanced = true
         lastHeartbeat = heartbeat
+
+        await assertInventoryPreservesAttachedEpoch(harness, rig, pane, view)
 
         const marker = `P2_WEB_CYCLE_${cycle}_${Date.now()}`
         const markerPath = `/home/freshell/provider/p2-web-cycle-${cycle}`

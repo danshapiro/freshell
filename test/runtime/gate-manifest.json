@@ -75,7 +75,7 @@
       "freshopencode",
       "amplifier-terminal"
     ],
-    "additional_modes": "All enabled Gemini, Kimi, extension/plugin, or newly registered coding modes; enumerate current registrations.",
+    "additional_modes": "Stage 5a user-approved scope amendment (2026-09-11): Gemini, Kimi, and extension/plugin support are deferred and excluded from this stage, not passed. All eight expected modes remain required.",
     "ingress_inventory": [
       "browser-picker",
       "browser-split",

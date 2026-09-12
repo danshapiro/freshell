@@ -29,6 +29,7 @@ import {
 import { openPanePicker } from '../helpers/pane-picker.js'
 import { openCodeTerminalReady } from '../helpers/opencode-native-history.js'
 import { nativeTurnProof } from '../helpers/provider-native-history/proof.js'
+import { selectNextNativeNonceTurn } from '../helpers/provider-native-history/sequence.js'
 import type { NativeAssistantTurn, NativeHistory } from '../helpers/provider-native-history/types.js'
 import { TestHarness } from '../helpers/test-harness.js'
 
@@ -154,6 +155,7 @@ async function waitForValue<T>(
   description: string,
   probe: () => T | null | undefined | Promise<T | null | undefined>,
   timeoutMs: number,
+  intervalMs = 200,
 ): Promise<T> {
   const deadline = Date.now() + timeoutMs
   let lastError: unknown
@@ -164,18 +166,10 @@ async function waitForValue<T>(
     } catch (error) {
       lastError = error
     }
-    await new Promise((resolve) => setTimeout(resolve, 200))
+    await new Promise((resolve) => setTimeout(resolve, intervalMs))
   }
   const suffix = lastError instanceof Error ? `; last error: ${lastError.message}` : ''
   throw new Error(`timed out waiting for ${description}${suffix}`)
-}
-
-async function terminalBuffer(page: Page, terminalId: string): Promise<string> {
-  return page.evaluate((id) => window.__FRESHELL_TEST_HARNESS__?.getTerminalBuffer?.(id) ?? '', terminalId)
-}
-
-function occurrences(value: string, needle: string): number {
-  return value.split(needle).length - 1
 }
 
 function regexEscape(value: string): string {
@@ -215,73 +209,113 @@ async function waitForProviderTerminalReady(
   let sourceEpoch = ''
   let sourceText = ''
   let cursor = 0
-  await waitForValue('OpenCode source-epoch and browser input readiness', async () => {
-    const output = dataOf(await rig.runtime.adminOk(
-      rig.supervisor,
-      rig.runtime.terminalReadOutputBody(
-        view.soulId,
-        cursor,
-        256 * 1024,
-        await rig.controlEpoch(),
-      ),
-    ), 'terminal_output')
-    if (output.incarnationId !== view.incarnationId
-        || output.terminalId !== terminalId
-        || !output.streamEpoch
-        || output.exited) return null
-    if (output.streamEpoch !== sourceEpoch || output.resetRequired) {
-      sourceEpoch = output.streamEpoch
-      sourceText = ''
-      cursor = 0
-    }
-    for (const frame of output.frames ?? []) {
-      if (frame.streamEpoch !== sourceEpoch || frame.terminalId !== terminalId) {
-        throw new Error('OpenCode readiness frame has mismatched ownership')
+  let diagnostic: Record<string, unknown> = { soulId: view.soulId, incarnationId: view.incarnationId, terminalId }
+  try {
+    await waitForValue('OpenCode source-epoch and browser input readiness', async () => {
+      const output = dataOf(await rig.runtime.adminOk(
+        rig.supervisor,
+        rig.runtime.terminalReadOutputBody(
+          view.soulId,
+          cursor,
+          256 * 1024,
+          await rig.controlEpoch(),
+        ),
+      ), 'terminal_output')
+      if (output.incarnationId !== view.incarnationId
+          || output.terminalId !== terminalId
+          || !output.streamEpoch
+          || output.exited) return null
+      if (output.streamEpoch !== sourceEpoch || output.resetRequired) {
+        sourceEpoch = output.streamEpoch
+        sourceText = ''
+        cursor = 0
       }
-      sourceText = (sourceText + frame.data).slice(-512 * 1024)
-      cursor = Math.max(cursor, frame.seqEnd)
-    }
-    if (!openCodeTerminalReady(sourceText)) return null
-
-    const leaf = leavesByMode(await harness.getPaneLayout(tabId), 'opencode')
-      .find((candidate) => candidate.id === paneId)
-    if (leaf?.content?.incarnationId !== view.incarnationId
-        || leaf?.content?.streamId !== sourceEpoch) return null
-    const rendered = await page.evaluate((id) => {
-      const h = window.__FRESHELL_TEST_HARNESS__
-      return {
-        text: h?.getTerminalBuffer(id) ?? '',
-        modes: h?.getTerminalModes?.(id),
+      for (const frame of output.frames ?? []) {
+        if (frame.streamEpoch !== sourceEpoch || frame.terminalId !== terminalId) {
+          throw new Error('OpenCode readiness frame has mismatched ownership')
+        }
+        sourceText = (sourceText + frame.data).slice(-512 * 1024)
+        cursor = Math.max(cursor, frame.seqEnd)
       }
-    }, terminalId)
-    return rendered.text.includes('Build')
-      && rendered.text.includes('Big Pickle')
-      && rendered.modes?.bracketedPasteMode
-      ? true
-      : null
-  }, 180_000)
+      const sourceReady = openCodeTerminalReady(sourceText)
+      const leaf = leavesByMode(await harness.getPaneLayout(tabId), 'opencode')
+        .find((candidate) => candidate.id === paneId)
+      const rendered = await page.evaluate((id) => {
+        const h = window.__FRESHELL_TEST_HARNESS__
+        return {
+          text: h?.getTerminalBuffer(id) ?? '',
+          modes: h?.getTerminalModes?.(id),
+          connectionStatus: h?.getState()?.connection?.status,
+        }
+      }, terminalId)
+      diagnostic = {
+        ...diagnostic, sourceReady, sourceEpoch, cursor,
+        paneIncarnationId: leaf?.content?.incarnationId, paneStreamId: leaf?.content?.streamId,
+        paneStatus: leaf?.content?.status, paneRecovery: leaf?.content?.recoverySummary,
+        browserInputReady: rendered.modes?.bracketedPasteMode,
+        browserBuildBanner: rendered.text.includes('Build'),
+        browserModelBanner: rendered.text.includes('Big Pickle'),
+        connectionStatus: rendered.connectionStatus,
+      }
+      if (!sourceReady || leaf?.content?.incarnationId !== view.incarnationId
+          || leaf?.content?.streamId !== sourceEpoch) return null
+      return rendered.connectionStatus === 'ready'
+        && rendered.text.includes('Build')
+        && rendered.text.includes('Big Pickle')
+        && rendered.modes?.bracketedPasteMode
+        ? true
+        : null
+    }, 180_000)
+  } catch (error) {
+    rig.runtime.writeBrowserArtifact('managed-provider-input-readiness', diagnostic)
+    throw error
+  }
 }
 
-async function executeAndAwaitNonceOutput(
-  page: Page,
-  paneId: string,
-  terminalId: string,
+type ProviderTurnContext = {
+  page: Page
+  harness: TestHarness
+  rig: ManagedRuntimeBrowserRig
+  tabId: string
+  paneId: string
+  view: ManagedRuntimeView
+  definition: ProviderDefinition
+}
+
+async function executeAndAwaitNativeTurn(
+  context: ProviderTurnContext,
   command: string,
   nonce: string,
-  timeoutMs = 240_000,
-): Promise<void> {
-  const before = occurrences(await terminalBuffer(page, terminalId), nonce)
-  const expectedIncrease = command.includes(nonce) ? 2 : 1
+  previous: readonly NativeAssistantTurn[] = [],
+): Promise<{ nativeSessionId: string; turn: NativeAssistantTurn }> {
+  const { page, harness, rig, tabId, paneId, view, definition } = context
+  if (!view.containerId) throw new Error('native turn probe has no exact owned container')
   const terminal = page.locator(`[data-pane-id="${paneId}"] .xterm:visible`).last()
   await terminal.waitFor({ state: 'visible', timeout: 90_000 })
   await terminal.click()
   await page.keyboard.insertText(command)
   await page.keyboard.press('Enter')
-  // This is only a sequencing signal. The stopped provider-native transcript,
-  // not terminal output or occurrence count, is the qualification authority.
-  await waitForValue('provider response sequencing signal', async () => (
-    occurrences(await terminalBuffer(page, terminalId), nonce) >= before + expectedIncrease ? true : null
-  ), timeoutMs)
+  const nativeSessionId = await waitForValue('exact native session id', () => (
+    paneNativeId(harness, tabId, paneId, definition.provider)
+  ), 180_000)
+  expect(nativeSessionId).toMatch(definition.nativeIdPattern)
+  const probe = path.join(rig.repoRoot, 'test/e2e-browser/helpers/provider-native-history/probe-cli.ts')
+  const loader = path.join(rig.repoRoot, 'node_modules/tsx/dist/loader.mjs')
+  const turn = await waitForValue('new completed provider-native assistant response', () => {
+    const raw = rig.ownedProviderExec(view.containerId!, [
+      'node', '--no-warnings', '--import', loader, probe,
+      definition.provider, nativeHistorySource(definition.provider), nativeSessionId,
+    ])
+    const history = JSON.parse(raw) as NativeHistory
+    expect(history.schemaVersion).toBe(1)
+    expect(history.provider).toBe(definition.provider)
+    return selectNextNativeNonceTurn(history, nativeSessionId, nonce, previous)
+  }, 240_000, 1_000)
+  rig.runtime.recordLifecycle('provider.native_turn.completed', {
+    provider: definition.provider, nativeSessionId, incarnationId: view.incarnationId,
+    ordinal: previous.length + 1, nativeEvidence: turn.nativeEvidence,
+  })
+  return { nativeSessionId, turn }
 }
 
 function nativeHistorySource(provider: ProviderDefinition['provider']): string {
@@ -430,17 +464,15 @@ async function qualifyProvider(
   )
 
   const nonce = `codename-${randomBytes(16).toString('hex')}`
-  await executeAndAwaitNonceOutput(
-    page,
-    created.paneId,
-    created.terminalId,
+  const turnContext: ProviderTurnContext = {
+    page, harness, rig, tabId, paneId: created.paneId, view: created.view, definition,
+  }
+  const initial = await executeAndAwaitNativeTurn(
+    turnContext,
     `The private project codename for this conversation is ${nonce}. Without using tools or files, what codename did I just give you?`,
     nonce,
   )
-  const nativeSessionId = await waitForValue('exact native session id', async () => (
-    await paneNativeId(harness, tabId, created.paneId, definition.provider)
-  ), 180_000)
-  expect(nativeSessionId).toMatch(definition.nativeIdPattern)
+  const nativeSessionId = initial.nativeSessionId
   const inventoryNativeId = await waitForValue('inventory native session id', async () => (
     (await rig.runningViewForTerminal(created.terminalId))?.nativeSessionId
   ), 120_000)
@@ -454,13 +486,12 @@ async function qualifyProvider(
     page, harness, rig, tabId, created.paneId, afterHostLoss, definition,
   )
 
-  await executeAndAwaitNonceOutput(
-    page,
-    created.paneId,
-    created.terminalId,
+  const hostRecall = await executeAndAwaitNativeTurn(
+    { ...turnContext, view: afterHostLoss },
     'Without using tools or files, what private project codename did I give you earlier?',
-    nonce,
+    nonce, [initial.turn],
   )
+  expect(hostRecall.nativeSessionId).toBe(nativeSessionId)
 
   if (!afterHostLoss.containerId) throw new Error('host-loss replacement has no owned container')
   const pid = workerPid(rig, afterHostLoss)
@@ -475,13 +506,12 @@ async function qualifyProvider(
     page, harness, rig, tabId, created.paneId, afterProviderLoss, definition,
   )
 
-  await executeAndAwaitNonceOutput(
-    page,
-    created.paneId,
-    created.terminalId,
+  const providerRecall = await executeAndAwaitNativeTurn(
+    { ...turnContext, view: afterProviderLoss },
     'Please remind me of the private project codename from the start of this same conversation. Do not use tools or files.',
-    nonce,
+    nonce, [initial.turn, hostRecall.turn],
   )
+  expect(providerRecall.nativeSessionId).toBe(nativeSessionId)
 
   const snapshot = await rig.inventorySnapshot()
   const runningWriters = snapshot.souls.filter((row: any) => (
@@ -526,6 +556,9 @@ async function qualifyProvider(
     nativeSessionId,
   )
   const [initialTurn, hostCrashTurn, providerCrashTurn] = nonceTurns(nativeHistory, nonce)
+  expect([initialTurn, hostCrashTurn, providerCrashTurn]).toEqual([
+    initial.turn, hostRecall.turn, providerRecall.turn,
+  ])
   const nativeTurnProofs = [
     nativeTurnProof('initial', nativeSessionId, initialTurn, nonce),
     nativeTurnProof('after_session_host_crash', nativeSessionId, hostCrashTurn, nonce),

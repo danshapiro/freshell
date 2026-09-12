@@ -9,13 +9,17 @@ runtime architecture. Baseline: `7d5dff9dff7c060ec6138550402cb20a713336bd`, in t
 existing `durable-souls-release-candidate` worktree. `origin/main` remains
 `2e05dd9e2f8a4dce393689d228e21ad123c474a5` at planning time.
 
-All coding agents remain required: Claude terminal, FreshClaude, Kilroy, Codex
-terminal, FreshCodex, OpenCode terminal, FreshOpenCode, Amplifier, and managed
-hosting/capability treatment for enabled Gemini/Kimi/plugin modes. No adapter,
-provider operation, creation doorway, resource control, recovery path, view
-behavior, or ordinary legacy behavior is removed. Existing disabled defaults
-are not silently promoted; missing integration work/testing remains outstanding
-for the full product, never reclassified as out of scope.
+Required agents: Claude terminal, FreshClaude, Kilroy, Codex terminal,
+FreshCodex, OpenCode terminal, FreshOpenCode, and Amplifier. At Dan's explicit
+request on September 11, 2026, Gemini, Kimi, and extension/plugin support are
+excluded from Stage 5a implementation and acceptance. Their unexecuted work is
+recorded as deferred, never as a passing test. Existing legacy behavior is not
+removed, and unsupported managed capabilities continue to fail closed.
+
+For the eight required modes, no provider operation, creation doorway, resource
+control, recovery path, or view behavior is removed. Existing disabled defaults
+are not silently promoted; missing required-mode integration and testing remain
+outstanding.
 
 Keep exact ownership, isolation/authentication, controller fencing, one writer,
 stop-wins revisions, independent session hosts, protected command/permission
@@ -156,7 +160,7 @@ browser/provider/soak scenario directly. Mixed cases retain their deterministic
 checks and their live checks in the corresponding specs. Native-history,
 resource, approval, isolation, and cleanup assertions were moved rather than
 removed. Current provider/fresh-mode defaults are unchanged; the full product
-still requires all original agents and all applicable recovery/operation paths.
+still requires all eight in-scope modes and their applicable recovery/operation paths.
 
 ## Final validation results
 
@@ -188,7 +192,7 @@ first-run logs. The combined regression first exposed the inherited Electron
 constructor mocks; the Docker crash matrix exposed the nested focused-runner
 marker issue. Both were fixed and rerun successfully, rather than omitted.
 
-## Remaining full-product work, not deleted scope
+## Remaining in-scope product work
 
 Stage 5a is implemented. It does not claim a new full all-provider live campaign,
 a new 30-minute stress run, or execution of all 50 Docker scenarios in this task.
@@ -196,11 +200,44 @@ The relevant actual Docker loss scenarios and the ordinary regression suite
 passed. Actual-provider/fresh-mode browser verification now runs through the explicitly
 approved local Docker lane. Conservative defaults remain unchanged until the
 complete local matrix passes and the release-scope update is reviewed.
-Gemini/Kimi/plugin implementation gaps remain gaps in the original product,
-not exclusions introduced by simplification. Complete the original provider
-and operation coverage before calling the full feature deployed.
+Gemini, Kimi, and extension/plugin work is explicitly deferred by the September
+11 scope amendment above. Complete the eight required modes and their operation
+coverage before calling Stage 5a ready; deferred support is not tested support.
 
 No PR or deployment was performed. The live self-hosted server was not restarted.
 Other worktrees were not modified. Public lifecycle states, resource management,
 view intent, credentials/authentication, durable notices, and provider operations
 were deliberately left intact. There was no sweeping schema or Redux rewrite.
+
+
+## September 11 continuation — source epoch and native turn fixes
+
+The prior OpenCode failure was root-caused, not worked around with a longer
+wait. Pre-teardown diagnostics showed a ready WebSocket, ready native TUI, correct
+incarnation, and enabled bracketed paste. The browser's stream ID alone was wrong:
+a supervisor inventory refresh had overwritten the attached host epoch with its
+launch seed. The projection now leaves stream ownership to the source attachment
+handshake. Four new unit cases cover ordering, new panes, and replacement.
+
+After that fix, OpenCode accepted and durably answered the prompt, exposing a
+second test bug: a rendered-echo occurrence count was not a reliable completion
+signal. Each prompt now waits for one new completed native assistant record;
+earlier records must remain unchanged and the stopped history must match all
+three observed turns. No prompt retry or weaker recovery assertion was added.
+See `docs/rca/2026-09-11-managed-terminal-source-epoch.md` for code paths and red
+reproductions, including why post-cleanup screenshots falsely suggested offline.
+
+New working-tree validation (not a clean final-candidate release claim):
+
+| Check | Actual result | Evidence |
+|---|---|---|
+| Projection + recovery UI | PASS, 20 tests; four new cases fail before the fix. | `stage-5a/stream-projection-{red,green}.log` |
+| Terminal lifecycle and launch retry | PASS, 171 tests. | `stage-5a/terminal-lifecycle-regression.log` |
+| Native readers and turn sequencing | PASS, 31 tests, including 10 new sequencing cases. | `stage-5a/native-sequence-green.log` |
+| Real Chromium P2-G01 | PASS, 10 web restarts plus forced revision refresh after each attach; usable input/output, exact runtime, clean cleanup, zero unsafe attempts. | `stage-5a/shell-stream-regression.log` |
+| Real managed OpenCode | PASS, initial + host-crash recall + provider-crash recall in one exact native session; three completed no-tools native answers, one writer, verified empty old enclosures, zero loss notices, clean cleanup. | `verification/d87f033a-1504-4bd8-9984-1ddb22ea5a28/results.json` |
+| Runtime/browser TypeScript and lint | PASS; lint retains 11 existing warnings, zero errors. | `stage-5a/stream-fix-lint.log` |
+
+Evidence paths above are relative to `.runtime-evidence/`. Other provider modes,
+the complete live matrix, final deterministic gate, and long stress runs remain
+separate required checks. The passing OpenCode test is not credited to them.

@@ -93,6 +93,8 @@ export const ManagedRuntimeSoulSchema = z.object({
   configuredLimits: ManagedRuntimeLimitsSchema.optional(),
   viewIntentRevision: NonNegativeIntSchema.optional(),
   terminalId: z.string().optional(),
+  // Launch seed retained in the registry, NOT the host-generated source epoch.
+  // Browser streamId is established by terminal attachment/output control frames.
   terminalStreamId: z.string().optional(),
   terminalMode: z.string().optional(),
   terminalCwd: z.string().optional(),

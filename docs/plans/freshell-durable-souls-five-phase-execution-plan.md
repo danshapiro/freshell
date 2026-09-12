@@ -13,7 +13,11 @@
 [Stage 5a — feature-preserving runtime simplification](freshell-durable-souls-stage-5a.md)
 supersedes the certification/report-attestation requirements and the requirement
 that secondary incident export succeed before cleanup. Product scope and
-behavioral safeguards remain unchanged; all coding agents remain in scope.
+behavioral safeguards remain unchanged for the eight required modes: Claude
+terminal, FreshClaude, Kilroy, Codex terminal, FreshCodex, OpenCode terminal,
+FreshOpenCode, and Amplifier. Dan explicitly deferred Gemini, Kimi, and
+extension/plugin support on September 11. That scope amendment overrides the
+original additional-mode requirements below; deferred work is not a test pass.
 Authoritative durable cleanup intent is still required before destruction.
 
 ### Outcome

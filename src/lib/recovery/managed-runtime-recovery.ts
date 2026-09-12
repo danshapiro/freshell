@@ -114,7 +114,11 @@ function managedTerminalContent(
   return {
     kind: 'terminal',
     terminalId: soul.terminalId,
-    streamId: soul.terminalStreamId,
+    // Inventory retains the launch seed, not HostedPty's boot-specific source
+    // epoch. Only terminal.attach.ready / terminal.stream.changed may advance
+    // the rendered surface's streamId. Projecting the seed here overwrites a
+    // valid attachment and can poison checkpoint/replay sequencing. New panes
+    // attach without an epoch; existing panes retain theirs until the handshake.
     createRequestId: soul.terminalCreateRequestId || `managed-${view.viewId}`,
     status: terminalStatus(soul),
     mode,
