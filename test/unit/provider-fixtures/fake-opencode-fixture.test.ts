@@ -9,6 +9,7 @@
 // and asserts the copied turns SURVIVE and the new turn APPENDS.
 import { describe, it, expect, beforeAll, afterAll } from 'vitest'
 import { spawn, spawnSync, type ChildProcess } from 'node:child_process'
+import { once } from 'node:events'
 import * as fs from 'node:fs'
 import * as net from 'node:net'
 import * as os from 'node:os'
@@ -81,10 +82,18 @@ beforeAll(async () => {
   await waitForServer(port)
 }, 30_000)
 
-afterAll(() => {
-  server?.kill('SIGTERM')
+afterAll(async () => {
+  const child = server
   server = undefined
-  fs.rmSync(scratch, { recursive: true, force: true })
+  if (child && child.exitCode === null && child.signalCode === null) {
+    const exited = once(child, 'exit')
+    child.kill('SIGTERM')
+    await Promise.race([
+      exited,
+      new Promise((resolve) => setTimeout(resolve, 2_000)),
+    ])
+  }
+  fs.rmSync(scratch, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 })
 })
 
 describe('fake-opencode fixture fork sequence parity (ep3-r1 F3)', () => {

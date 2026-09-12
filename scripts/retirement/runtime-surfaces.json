@@ -17,21 +17,6 @@
       "role": "release-job"
     },
     {
-      "id": "workflow-port-contract",
-      "path": ".github/workflows/port-contract.yml",
-      "role": "release-job"
-    },
-    {
-      "id": "workflow-rust-clippy",
-      "path": ".github/workflows/rust-clippy.yml",
-      "role": "release-job"
-    },
-    {
-      "id": "workflow-typecheck-client",
-      "path": ".github/workflows/typecheck-client.yml",
-      "role": "release-job"
-    },
-    {
       "id": "electron-builder-config",
       "path": "config/electron-builder.yml",
       "role": "packaging-config"

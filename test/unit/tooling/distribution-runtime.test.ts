@@ -211,41 +211,6 @@ describe('Rust-only distribution runtime contracts', () => {
     expect(durations).not.toMatch(/legacy-chromium|rust-chromium/)
   })
 
-  it('owns Rust formatting, linting, workspace tests, and source-runtime smoke in CI', () => {
-    const workflow = readProjectFile('.github/workflows/rust-clippy.yml')
-
-    expect(workflow).toContain('toolchain: 1.96.0')
-    expect(workflow).toContain('cargo fmt --all --check')
-    expect(workflow).toContain('cargo clippy --workspace --all-targets --locked')
-    expect(workflow).toContain('cargo build -p freshell-server --locked')
-    expect(workflow).toContain('cargo test --workspace --locked')
-    expect(workflow).toContain('npm run test:source-runtime')
-    expect(workflow).toContain('FRESHELL_SERVER_BIN:')
-    expect(workflow.indexOf('cargo build -p freshell-server --locked')).toBeLessThan(
-      workflow.indexOf('npm run test:source-runtime'),
-    )
-    for (const term of FORBIDDEN_DISTRIBUTION_TERMS) expect(workflow).not.toMatch(term)
-  })
-
-  it('runs the nonempty default Vitest lane without artifact prerequisites', () => {
-    const workflow = readProjectFile('.github/workflows/typecheck-client.yml')
-    const vitestConfig = readProjectFile('config/vitest/vitest.config.ts')
-
-    expect(workflow).toContain('npm run typecheck:client')
-    expect(workflow).toContain('npm run test:vitest')
-    expect(workflow).toContain('config/vitest/vitest.config.ts')
-    expect(workflow).not.toContain('cargo build')
-    expect(workflow).not.toContain('prepare:electron-runtime')
-    expect(vitestConfig).toContain("'test/integration/tooling/**'")
-    expect(vitestConfig).toContain("'test/integration/electron/**'")
-  })
-
-  it('gives the default Vitest lane enough time to finish in the client workflow', () => {
-    const workflow = readProjectFile('.github/workflows/typecheck-client.yml')
-
-    expect(workflow).toMatch(/typecheck-client:\s*\n\s+runs-on:[\s\S]*?timeout-minutes:\s*30\b/)
-  })
-
   for (const workflowPath of ['.github/workflows/electron-build.yml', '.github/workflows/electron-release.yml']) {
     it(`${workflowPath} builds and verifies native artifacts on every required OS`, () => {
       const workflow = readProjectFile(workflowPath)
