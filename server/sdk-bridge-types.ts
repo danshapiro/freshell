@@ -68,9 +68,9 @@ export type SdkServerMessage =
     streamingActive?: boolean
     streamingText?: string
   }
-  | { type: 'sdk.session.init'; sessionId: string; cliSessionId?: string; model?: string; cwd?: string; tools?: Array<{ name: string }> }
+  | { type: 'sdk.session.init'; sessionId: string; cliSessionId?: string; model?: string; effort?: string; cwd?: string; tools?: Array<{ name: string }> }
   | { type: 'sdk.session.changed'; sessionId: string; reason?: string }
-  | { type: 'sdk.session.metadata'; sessionId: string; cliSessionId?: string; model?: string; cwd?: string; tools?: Array<{ name: string }> }
+  | { type: 'sdk.session.metadata'; sessionId: string; cliSessionId?: string; model?: string; effort?: string; cwd?: string; tools?: Array<{ name: string }> }
   | { type: 'sdk.assistant'; sessionId: string; content: ContentBlock[]; model?: string; usage?: Usage }
   | { type: 'sdk.stream'; sessionId: string; event: unknown; parentToolUseId?: string | null }
   | { type: 'sdk.result'; sessionId: string; result?: string; durationMs?: number; costUsd?: number; usage?: Usage }

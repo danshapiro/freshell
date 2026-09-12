@@ -65,6 +65,12 @@ export interface FreshAgentRuntimeAdapter {
    * emitter) and rebind subscriptions. Undefined when the session is unknown. */
   sessionStateGeneration?(sessionId: string): number | undefined
   send?(sessionId: string, input: { requestId?: string; text: string; images?: FreshAgentInputImage[]; settings?: FreshAgentCreateRequest }): Promise<FreshAgentSendResult> | FreshAgentSendResult
+  /** Apply settings (model / effort / permissionMode / sandbox) to the LIVE
+   * session without sending a message, converging every subscribed device's
+   * model surfaces via the adapter-emitted `sdk.session.metadata` event.
+   * Adapters without a live-settings lane surface the standard unsupported
+   * capability error. */
+  configure?(sessionId: string, input: { settings?: FreshAgentCreateRequest }): Promise<void> | void
   interrupt?(sessionId: string): Promise<void> | void
   compact?(sessionId: string, input?: { instructions?: string }): Promise<void> | void
   kill?(sessionId: string): Promise<boolean> | boolean

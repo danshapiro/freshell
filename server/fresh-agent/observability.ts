@@ -63,6 +63,17 @@ export type FreshAgentObservabilityEvent =
     errorCode?: string
   }
   | {
+    kind: 'fresh_agent_configure'
+    sessionType: string
+    provider: string
+    sessionIdHash: string
+    cwdHash?: string
+    requestId?: string
+    outcome: 'ok' | 'failed'
+    errorCode?: string
+    durationMs?: number
+  }
+  | {
     kind: 'fresh_agent_attach'
     sessionType: string
     provider: string

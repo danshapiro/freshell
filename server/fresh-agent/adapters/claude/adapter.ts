@@ -172,6 +172,23 @@ export function createClaudeFreshAgentAdapter(deps: ClaudeFreshAgentAdapterDeps)
       return send
     },
 
+    async configure(sessionId, input) {
+      // Serialize with in-flight sends (the same pendingSends chain `send`
+      // rides): configureSession's own busy gate refuses mid-turn changes, and
+      // the chain closes the check-then-set window against a concurrent send's
+      // own configure leg. The bridge's applied-change metadata broadcast
+      // converges every subscribed device.
+      const prior = pendingSends.get(sessionId) ?? Promise.resolve()
+      const configure = prior.then(async () => {
+        await deps.sdkBridge.configureSession(sessionId, input.settings ?? {})
+      })
+      const settled = configure.catch(() => {}).finally(() => {
+        if (pendingSends.get(sessionId) === settled) pendingSends.delete(sessionId)
+      })
+      pendingSends.set(sessionId, settled)
+      return await configure
+    },
+
     interrupt(sessionId) {
       mapMissingResult(
         deps.sdkBridge.interrupt(sessionId),

@@ -25,6 +25,45 @@ describe('Claude fresh-agent adapter', () => {
     expect(order).toEqual(['configure:opus', 'first', 'configure:sonnet', 'second'])
   })
 
+  it('applies a configure through the bridge, serialized behind an in-flight send', async () => {
+    let release!: () => void
+    const firstSend = new Promise<void>((resolve) => { release = resolve })
+    const order: string[] = []
+    const sdkBridge = {
+      configureSession: vi.fn(async (_id: string, settings: { model?: string }) => {
+        order.push(`configure:${settings.model}`)
+        if (settings.model === 'opus') await firstSend
+      }),
+      sendUserMessage: vi.fn((_id: string, text: string) => { order.push(text); return true }),
+    }
+    const adapter = createClaudeFreshAgentAdapter({ sdkBridge: sdkBridge as any })
+    const send = adapter.send?.('session', { text: 'first', settings: { requestId: 'a', sessionType: 'freshclaude', model: 'opus' } })
+    const configure = adapter.configure?.('session', { settings: { model: 'sonnet' } as any })
+    await Promise.resolve()
+    // The configure parks behind the in-flight send's own configure leg —
+    // the bridge's busy gate never sees an interleaved settings change.
+    expect(order).toEqual(['configure:opus'])
+    release()
+    await Promise.all([send, configure])
+    expect(order).toEqual(['configure:opus', 'first', 'configure:sonnet'])
+    expect(sdkBridge.configureSession).toHaveBeenCalledWith('session', { model: 'sonnet' })
+  })
+
+  it('a failed configure rejects and leaves the chain usable for the next send', async () => {
+    const sdkBridge = {
+      configureSession: vi.fn()
+        .mockRejectedValueOnce(new Error('Wait for the current turn to finish before changing agent settings.'))
+        .mockResolvedValueOnce(undefined),
+      sendUserMessage: vi.fn().mockReturnValue(true),
+    }
+    const adapter = createClaudeFreshAgentAdapter({ sdkBridge: sdkBridge as any })
+    await expect(adapter.configure?.('session', { settings: { model: 'sonnet' } as any }))
+      .rejects.toThrow(/current turn/i)
+    // The failure must not wedge the pendingSends chain: the next send runs.
+    await adapter.send?.('session', { text: 'still works' })
+    expect(sdkBridge.sendUserMessage).toHaveBeenCalledWith('session', 'still works', undefined)
+  })
+
   it('applies settings before sending and leaves the message unsent if configuration fails', async () => {
     const order: string[] = []
     const sdkBridge = {

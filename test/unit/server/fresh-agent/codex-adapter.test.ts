@@ -1985,4 +1985,78 @@ describe('wedged-sidecar deadman (quiet window)', () => {
       vi.useRealTimers()
     }
   })
+  // ── freshAgent.configure: live model convergence ─────────────────────────
+  describe('configure (live settings)', () => {
+    function makeConfigureStubRuntime() {
+      const runtime = {
+        startThread: vi.fn(),
+        resumeThread: vi.fn(),
+        startTurn: vi.fn().mockResolvedValue({ turnId: 'turn-1' }),
+        interruptTurn: vi.fn(),
+        onThreadLifecycle: vi.fn(() => vi.fn()),
+        onTurnStarted: vi.fn(() => vi.fn()),
+        onTurnCompleted: vi.fn(() => vi.fn()),
+        onExit: vi.fn(() => vi.fn()),
+        readThread: vi.fn().mockResolvedValue({ thread: { ...makeCodexThread('thread-1'), status: { type: 'idle' } }, turns: [] }),
+        listThreadTurns: vi.fn().mockResolvedValue({ turns: [], nextCursor: null, revision: 7 }),
+        readThreadTurn: vi.fn().mockResolvedValue(null),
+        shutdown: vi.fn().mockResolvedValue(undefined),
+      }
+      return runtime
+    }
+
+    it('records the normalized pair and emits sdk.session.metadata to subscribed listeners', async () => {
+      const runtime = makeConfigureStubRuntime()
+      const adapter = createCodexFreshAgentAdapter({ runtime: runtime as any })
+      const listener = vi.fn()
+      await adapter.subscribe?.('thread-1', listener)
+
+      // 'xhigh' is the menu alias for the wire 'max' level: the recorded pair
+      // (and the emitted event) states the MENU value, exactly like send.
+      await adapter.configure?.('thread-1', {
+        settings: { sessionType: 'freshcodex', model: 'gpt-5.6-luna', effort: 'xhigh' } as any,
+      })
+
+      expect(listener).toHaveBeenCalledWith({
+        type: 'sdk.session.metadata',
+        sessionId: 'thread-1',
+        model: 'gpt-5.6-luna',
+        effort: 'max',
+      })
+
+      // The NEXT send carries the recorded pair on its turn/start.
+      await adapter.send?.('thread-1', { requestId: 'req-next', text: 'hello' } as any)
+      expect(runtime.startTurn).toHaveBeenCalledWith(expect.objectContaining({
+        model: 'gpt-5.6-luna',
+        effort: 'xhigh',
+      }))
+    })
+
+    it('keeps the stored pair when a configure states no model or effort', async () => {
+      const runtime = makeConfigureStubRuntime()
+      runtime.startThread = vi.fn().mockResolvedValue({ threadId: 'thread-new-1' })
+      const adapter = createCodexFreshAgentAdapter({ runtime: runtime as any })
+      await adapter.create?.({ requestId: 'c', sessionType: 'freshcodex', model: 'gpt-5.6-sol', effort: 'low' } as any)
+      const listener = vi.fn()
+      await adapter.subscribe?.('thread-new-1', listener)
+
+      // A permission-mode-only configure records the permission and keeps the
+      // model/effort; the emitted metadata states the FULL effective pair so
+      // every subscribed device converges on one truth.
+      await adapter.configure?.('thread-new-1', {
+        settings: { permissionMode: 'never' } as any,
+      })
+      expect(listener).toHaveBeenCalledWith({
+        type: 'sdk.session.metadata',
+        sessionId: 'thread-new-1',
+        model: 'gpt-5.6-sol',
+        effort: 'low',
+      })
+      await adapter.send?.('thread-new-1', { requestId: 'req-next', text: 'hello' } as any)
+      expect(runtime.startTurn).toHaveBeenCalledWith(expect.objectContaining({
+        model: 'gpt-5.6-sol',
+        approvalPolicy: 'never',
+      }))
+    })
+  })
 })

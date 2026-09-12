@@ -1092,6 +1092,32 @@ export function createOpencodeFreshAgentAdapter(options: CreateOpencodeFreshAgen
       return await sendForState(state, { text: input.text, settings: input.settings })
     },
 
+    /** Apply settings to the LIVE session record without a turn (opencode's
+     * per-send scope: the NEXT prompt_async body carries the recorded pair).
+     * Mirrors `materializeOrSend`'s settings-merge semantics (present settings
+     * normalize over the record; an absent key keeps the stored value), then
+     * emits the `sdk.session.metadata` convergence event so every subscribed
+     * device's model surfaces update immediately. No busy refusal: recording
+     * mid-turn is safe — the in-flight turn keeps the pair it prompted with. */
+    async configure(sessionId, input) {
+      const state = requireState(sessionId)
+      const settings = (input.settings ?? {}) as Partial<FreshAgentCreateRequest>
+      const normalized = input.settings
+        ? normalizeOpencodeInput({ requestId: state.placeholderId, sessionType: 'freshopencode', provider: 'opencode', ...settings } as FreshAgentCreateRequest)
+        : undefined
+      const model = normalized?.model ?? state.model
+      const effort = normalized?.effort ?? state.effort
+      if (state.model === model && state.effort === effort) return
+      state.model = model
+      state.effort = effort
+      state.events.emit('event', {
+        type: 'sdk.session.metadata',
+        sessionId,
+        model: state.model,
+        effort: state.effort,
+      })
+    },
+
     async interrupt(sessionId) {
       const state = requireState(sessionId)
       // Mark before aborting so the in-flight send (parked on onceIdle) sees the abort and

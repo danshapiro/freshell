@@ -1128,6 +1128,37 @@ export function createCodexFreshAgentAdapter(deps: {
       return { requestId, submittedTurnId }
     },
 
+    /** Apply settings to the LIVE thread record without a turn (codex's
+     * per-send scope: the NEXT turn/start carries the recorded pair). Merges
+     * + normalizes exactly like `send`'s settings leg, then emits the
+     * `sdk.session.metadata` convergence event to every subscribed listener.
+     * No busy refusal: the in-flight turn keeps the parameters it started
+     * with, and the next turn picks up the recorded pair. */
+    async configure(sessionId, input) {
+      const settings: Partial<FreshAgentCreateRequest> = {
+        ...settingsByThread.get(sessionId),
+        ...input.settings,
+      }
+      const model = normalizeFreshAgentModel(settings.sessionType ?? 'freshcodex', 'codex', settings.model)
+      settings.model = model
+      settings.effort = normalizeFreshAgentEffort(settings.sessionType ?? 'freshcodex', 'codex', model, settings.effort)
+      // Wire-validate up front so the record never holds an unsendable value.
+      toCodexReasoningEffort(settings.effort)
+      if (Object.keys(settings).length > 0) {
+        settingsByThread.set(sessionId, settings)
+      }
+      const listeners = deadmanListenersByThread.get(sessionId)
+      if (!listeners) return
+      for (const listener of listeners) {
+        listener({
+          type: 'sdk.session.metadata',
+          sessionId,
+          model: settings.model,
+          effort: settings.effort,
+        })
+      }
+    },
+
     async interrupt(sessionId) {
       const runtime = await ensureRuntime(sessionId, settingsByThread.get(sessionId))
       if (!runtime.interruptTurn) {

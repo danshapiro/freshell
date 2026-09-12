@@ -90,11 +90,12 @@ import {
   TerminalKillSchema,
   CodingCliInputSchema,
   CodingCliKillSchema,
-  FreshAgentCreateSchema,
-  FreshAgentAttachSchema,
-  FreshAgentSendSchema,
-  FreshAgentInterruptSchema,
-  FreshAgentCompactSchema,
+      FreshAgentCreateSchema,
+      FreshAgentAttachSchema,
+      FreshAgentSendSchema,
+      FreshAgentInterruptSchema,
+      FreshAgentConfigureSchema,
+      FreshAgentCompactSchema,
   FreshAgentApprovalRespondSchema,
   FreshAgentQuestionRespondSchema,
   FreshAgentKillSchema,
@@ -156,6 +157,7 @@ type FreshAgentRuntimeManagerLike = {
    * generation means the state's emitter was recreated and subscriptions must rebind. */
   sessionStateGeneration?: (locator: any) => number | undefined
   send?: (locator: any, input: any) => Promise<FreshAgentSendResult> | FreshAgentSendResult
+  configure?: (locator: any, input: { settings?: any }) => Promise<void> | void
   interrupt?: (locator: any) => Promise<void> | void
   compact?: (locator: any, input?: { instructions?: string }) => Promise<void> | void
   resolveApproval?: (locator: any, requestId: string | number, decision: Record<string, unknown>) => Promise<void> | void
@@ -870,6 +872,7 @@ export class WsHandler {
       FreshAgentAttachSchema,
       FreshAgentSendSchema,
       FreshAgentInterruptSchema,
+      FreshAgentConfigureSchema,
       FreshAgentCompactSchema,
       FreshAgentApprovalRespondSchema,
       FreshAgentQuestionRespondSchema,
@@ -3867,6 +3870,46 @@ export class WsHandler {
             errorCode: this.freshAgentErrorCode(error),
           })
           this.sendError(ws, { code: 'INTERNAL_ERROR', message: errorMessage(error) })
+        }
+        return
+      }
+
+      case 'freshAgent.configure': {
+        // Apply settings (model / effort / permissionMode / sandbox) to the
+        // LIVE session without a turn. Success converges every subscribed
+        // device through the adapter's `freshAgent.session.metadata` event;
+        // a refusal (e.g. changing model mid-turn on claude) surfaces on the
+        // pane's session-scoped error banner — parity with the Rust slice.
+        const manager = this.freshAgentRuntimeManager
+        const locator = this.freshAgentLocatorFromMessage(m)
+        if (!manager?.configure) {
+          this.sendError(ws, { code: 'INTERNAL_ERROR', message: this.freshAgentUnavailableMessage() })
+          return
+        }
+        if (!await this.waitForFreshAgentAuthorization(ws, state, locator, m.requestId)) return
+        const startedAt = Date.now()
+        try {
+          await manager.configure(locator, { settings: m.settings })
+          recordFreshAgentObservabilityEvent({
+            kind: 'fresh_agent_configure',
+            ...this.freshAgentIdentityFields(locator),
+            ...(m.requestId ? { requestId: m.requestId } : {}),
+            outcome: 'ok',
+            durationMs: Date.now() - startedAt,
+          })
+        } catch (error) {
+          recordFreshAgentObservabilityEvent({
+            kind: 'fresh_agent_configure',
+            ...this.freshAgentIdentityFields(locator),
+            ...(m.requestId ? { requestId: m.requestId } : {}),
+            outcome: 'failed',
+            errorCode: this.freshAgentErrorCode(error),
+            durationMs: Date.now() - startedAt,
+          })
+          this.safeSend(ws, this.freshAgentEventMessage(locator, makeFreshAgentProviderErrorEvent(locator.sessionId, {
+            code: this.freshAgentErrorCode(error),
+            message: errorMessage(error),
+          })))
         }
         return
       }

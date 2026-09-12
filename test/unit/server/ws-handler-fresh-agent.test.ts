@@ -372,6 +372,88 @@ describe('WsHandler fresh-agent routing', () => {
     }
   })
 
+  it('routes freshAgent.configure through the runtime manager and surfaces a refusal as the session-scoped error banner', async () => {
+    const runtimeManager = {
+      create: vi.fn().mockResolvedValue({
+        sessionId: 'codex-session-2',
+        sessionType: 'freshcodex',
+        runtimeProvider: 'codex',
+      }),
+      subscribe: vi.fn().mockResolvedValue(() => undefined),
+      configure: vi.fn()
+        .mockResolvedValueOnce(undefined)
+        .mockRejectedValueOnce(new Error('Wait for the current turn to finish before changing agent settings.')),
+    }
+    const { server } = await createServer({ freshAgentRuntimeManager: runtimeManager })
+
+    try {
+      const ws = await connectAndAuth(server)
+      const seenMessages: any[] = []
+      ws.on('message', (data) => {
+        seenMessages.push(JSON.parse(data.toString()))
+      })
+
+      ws.send(JSON.stringify({
+        type: 'freshAgent.create',
+        requestId: 'req-2',
+        sessionType: 'freshcodex',
+        provider: 'codex',
+      }))
+      await vi.waitFor(() => {
+        expect(seenMessages.some((message) => message.type === 'freshAgent.created')).toBe(true)
+      })
+
+      // A successful configure answers with nothing on this socket (the
+      // adapter-emitted freshAgent.session.metadata event is the convergence
+      // frame, delivered through the session subscription).
+      ws.send(JSON.stringify({
+        type: 'freshAgent.configure',
+        requestId: 'cfg-ok',
+        sessionId: 'codex-session-2',
+        sessionType: 'freshcodex',
+        provider: 'codex',
+        settings: { model: 'gpt-5.6-luna', effort: 'low' },
+      }))
+      const locator = { sessionId: 'codex-session-2', sessionType: 'freshcodex', provider: 'codex' }
+      await vi.waitFor(() => {
+        expect(runtimeManager.configure).toHaveBeenCalledWith(locator, {
+          settings: { model: 'gpt-5.6-luna', effort: 'low' },
+        })
+      })
+
+      // A refused configure surfaces as the pane's session-scoped error
+      // banner (freshAgent.error), never silence.
+      ws.send(JSON.stringify({
+        type: 'freshAgent.configure',
+        requestId: 'cfg-busy',
+        sessionId: 'codex-session-2',
+        sessionType: 'freshcodex',
+        provider: 'codex',
+        settings: { model: 'gpt-5.6-sol' },
+      }))
+      await vi.waitFor(() => {
+        expect(runtimeManager.configure).toHaveBeenCalledTimes(2)
+      })
+      await vi.waitFor(() => {
+        const banner = seenMessages.find((message) => (
+          message.type === 'freshAgent.event'
+          && message.event?.type === 'freshAgent.error'
+          && message.event?.message?.includes('current turn')
+        ))
+        expect(banner).toBeTruthy()
+        expect(banner.sessionId).toBe('codex-session-2')
+      })
+
+      ws.close()
+      await new Promise<void>((resolve) => server.close(() => resolve()))
+    } finally {
+      // ensure the server is closed even on assertion failures mid-test
+      if (server.listening) {
+        await new Promise<void>((resolve) => server.close(() => resolve()))
+      }
+    }
+  })
+
   it('routes freshAgent.send, freshAgent.interrupt, freshAgent approvals/questions, freshAgent.kill, and freshAgent.fork through the runtime manager after create ownership is established', async () => {
     const runtimeManager = {
       create: vi.fn().mockResolvedValue({

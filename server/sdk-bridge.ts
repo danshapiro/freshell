@@ -959,6 +959,19 @@ export class SdkBridge extends EventEmitter {
         await sp.query.setPermissionMode(requested.permissionMode as Parameters<SdkQuery['setPermissionMode']>[0])
         state.permissionMode = requested.permissionMode
       }
+      // Live-settings convergence: every applied change broadcasts the
+      // session's effective model/effort (normalized downstream to
+      // `freshAgent.session.metadata`), so every subscribed device's model
+      // surfaces update immediately — a configure AND a settings-carrying
+      // send both land here.
+      if (modelChanged || effortChanged) {
+        this.broadcastToSession(sessionId, {
+          type: 'sdk.session.metadata',
+          sessionId,
+          model: state.model,
+          effort: state.effort,
+        })
+      }
     } catch (err) {
       log.warn({ sessionId, err }, 'Claude session settings update failed; message not sent')
       throw err

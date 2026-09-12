@@ -306,6 +306,18 @@ export class FreshAgentRuntimeManager {
     await record.adapter.interrupt(locator.sessionId)
   }
 
+  /** Apply session settings to the LIVE session without a turn. The adapter's
+   * own `sdk.session.metadata` emission converges every subscribed device's
+   * model surfaces; a refusal (e.g. changing model mid-turn on claude) throws
+   * and surfaces through the handler's session-scoped error path. */
+  async configure(locator: FreshAgentSessionLocator, input: { settings?: FreshAgentCreateRequest }) {
+    const record = await this.requireOrRecoverSession(locator)
+    if (!record.adapter.configure) {
+      throw new FreshAgentUnsupportedCapabilityError(`Configure is not supported for ${record.sessionType}`)
+    }
+    await record.adapter.configure(locator.sessionId, input)
+  }
+
   async compact(locator: FreshAgentSessionLocator, input?: { instructions?: string }) {
     const record = await this.requireOrRecoverSession(locator)
     if (!record.adapter.compact) {

@@ -124,6 +124,48 @@ function makeAdapter(manager: FakeManager, overrides: Partial<Parameters<typeof 
 }
 
 describe('OpenCode serve adapter: create + send', () => {
+
+  // ── configure (live settings): the /model convergence lane ───────────────
+  it('configure records the pair and emits sdk.session.metadata; an idempotent configure stays silent', async () => {
+    const manager = makeFakeManager()
+    const adapter = makeAdapter(manager)
+    const created = await adapter.create({
+      requestId: 'req-cfg',
+      sessionType: 'freshopencode',
+      provider: 'opencode',
+      model: 'opencode-go/glm-5.2',
+      effort: 'high',
+    })
+    const events: Array<Record<string, unknown>> = []
+    await adapter.subscribe?.(created.sessionId, (event) => events.push(event as Record<string, unknown>))
+
+    await adapter.configure?.(created.sessionId, {
+      settings: { sessionType: 'freshopencode', model: 'kimi-for-coding/kimi-k3', effort: 'low' },
+    })
+
+    const metadata = events.find((event) => event.type === 'sdk.session.metadata')
+    expect(metadata).toMatchObject({
+      type: 'sdk.session.metadata',
+      sessionId: created.sessionId,
+      model: 'kimi-for-coding/kimi-k3',
+      effort: 'low',
+    })
+
+    // Idempotent: nothing changes, nothing converges.
+    const before = events.length
+    await adapter.configure?.(created.sessionId, {
+      settings: { sessionType: 'freshopencode', model: 'kimi-for-coding/kimi-k3', effort: 'low' },
+    })
+    expect(events.slice(before).filter((event) => event.type === 'sdk.session.metadata')).toHaveLength(0)
+  })
+
+  it('configure for an unknown session surfaces the lost-session error', async () => {
+    const manager = makeFakeManager()
+    const adapter = makeAdapter(manager)
+    await expect(adapter.configure?.('freshopencode-unknown', { settings: { model: 'x' } }))
+      .rejects.toThrow(/not available/i)
+  })
+
   it('creates a placeholder, materializes on first send via POST /session, and awaits idle', async () => {
     const manager = makeFakeManager()
     const adapter = makeAdapter(manager)

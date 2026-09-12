@@ -1405,6 +1405,27 @@ describe('SdkBridge', () => {
       await expect(bridge.configureSession(session.sessionId, { model: 'sonnet' })).rejects.toThrow(/current turn/i)
     })
 
+    it('broadcasts sdk.session.metadata with the effective pair on an applied change (and stays silent when nothing changed)', async () => {
+      mockKeepStreamOpen = true
+      const session = await bridge.createSession({ model: 'opus', effort: 'high' })
+      const received: any[] = []
+      bridge.subscribe(session.sessionId, (msg: any) => received.push(msg))
+
+      await bridge.configureSession(session.sessionId, { model: 'sonnet' })
+      expect(bridge.getSession(session.sessionId)?.model).toBe('sonnet')
+      const metadata = received.find((msg) => msg?.type === 'sdk.session.metadata')
+      expect(metadata).toMatchObject({ type: 'sdk.session.metadata', model: 'sonnet' })
+      // A same-model configure keeps the effort (the bridge's same-model rule),
+      // and the metadata states the effective pair the session now runs with.
+      expect(bridge.getSession(session.sessionId)?.effort).toBeUndefined()
+      expect(metadata.effort).toBeUndefined()
+
+      // Idempotent configure: nothing changes, nothing converges.
+      const before = received.length
+      await bridge.configureSession(session.sessionId, { model: 'sonnet' })
+      expect(received.slice(before).filter((msg: any) => msg?.type === 'sdk.session.metadata')).toHaveLength(0)
+    })
+
     it('does not record a rejected model change and rejects changing the conversation directory', async () => {
       mockKeepStreamOpen = true
       const session = await bridge.createSession({ cwd: '/repo', model: 'opus', effort: 'high' })
