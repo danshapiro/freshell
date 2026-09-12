@@ -2,6 +2,9 @@
 
 import { describe, expect, it, vi } from 'vitest'
 import { execFile } from 'node:child_process'
+import { mkdtemp, rm, symlink } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import path from 'node:path'
 import { promisify } from 'node:util'
 import { fileURLToPath } from 'node:url'
 // @ts-expect-error The standalone sidecar helper is a plain Node ESM module.
@@ -47,5 +50,23 @@ describe('Claude model catalog helper', () => {
     })
     expect(JSON.parse(stdout)).toEqual([{ value: 'sonnet', displayName: 'Claude Sonnet', supportedEffortLevels: ['low', 'high'] }])
     expect(stderr).toBe('')
+  })
+
+  it.runIf(process.platform !== 'win32')('runs through a symlinked entry path', async () => {
+    const entry = fileURLToPath(new URL('../../../crates/freshell-claude-sidecar/model-catalog.mjs', import.meta.url))
+    const fixture = fileURLToPath(new URL('./fixtures/model-catalog-query.mjs', import.meta.url))
+    const root = await mkdtemp(path.join(tmpdir(), 'freshell-model-catalog-'))
+    const alias = path.join(root, 'model-catalog.mjs')
+    try {
+      await symlink(entry, alias)
+      const { stdout, stderr } = await promisify(execFile)(process.execPath, [alias], {
+        env: { ...process.env, FRESHELL_CLAUDE_SDK_QUERY_MODULE: fixture },
+        timeout: 5_000,
+      })
+      expect(JSON.parse(stdout)).toEqual([{ value: 'sonnet', displayName: 'Claude Sonnet', supportedEffortLevels: ['low', 'high'] }])
+      expect(stderr).toBe('')
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
   })
 })
