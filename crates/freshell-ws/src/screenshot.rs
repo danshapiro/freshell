@@ -1,18 +1,21 @@
 //! UI-screenshot request/response broker (Phase 3.18).
 //!
 //! Ports the `wsHandler.requestUiScreenshot` round-trip of `server/ws-handler.ts`
-//! (line 1045) that `POST /api/screenshots` (`server/agent-api/router.ts:1070`)
-//! drives:
+//! that `POST /api/screenshots` (`server/agent-api/router.ts`) drives:
 //!
 //! 1. the REST handler [`register`]s a `requestId` and gets a [`oneshot`] receiver;
 //! 2. it [`send_capture`]s a `{type:"ui.command", command:"screenshot.capture",
 //!    payload:{requestId, scope, tabId?, paneId?}}` frame onto the shared broadcast
-//!    bus (the exact shape `src/lib/ui-commands.ts:73` dispatches);
+//!    bus (the exact shape `src/lib/ui-commands.ts` dispatches);
 //! 3. the screenshot-capable SPA client renders the DOM (`captureUiScreenshot` /
 //!    html2canvas) and replies `{type:"ui.screenshot.result", requestId, ...}`
-//!    (`src/lib/ui-commands.ts:51`);
+//!    (`src/lib/ui-commands.ts`);
 //! 4. the `/ws` inbound loop routes that reply through [`resolve_from`], waking the
 //!    awaiting REST handler with the base64 PNG.
+//!
+//! The client renders through an html2canvas CLONE of the document (revealing
+//! background tabs inside the clone only), so a capture never moves the user's
+//! selection or focus and needs no server-side cancel unwinding.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -127,47 +130,55 @@ impl ScreenshotBroker {
 
     /// Route an inbound `ui.screenshot.result` to its waiting REST handler. Unknown
     /// / already-resolved `requestId`s are ignored (a late duplicate from a second
-    /// capable client).
+    /// capable client — that client's capture rendered off-DOM and mutated
+    /// nothing, so a stray duplicate is harmless).
     pub fn resolve_from(&self, connection_id: u64, request_id: &str, result: ScreenshotResult) {
-        let mut pending = self.inner.pending.lock().unwrap();
-        let matches = pending.get(request_id).is_some_and(|request| {
-            request
-                .expected_client_id
-                .is_none_or(|id| id == connection_id)
-        });
-        if matches {
-            if let Some(request) = pending.remove(request_id) {
-                let _ = request.sender.send(result);
+        let sender = {
+            let mut pending = self.inner.pending.lock().unwrap();
+            let matches = pending.get(request_id).is_some_and(|request| {
+                request
+                    .expected_client_id
+                    .is_none_or(|id| id == connection_id)
+            });
+            if matches {
+                pending.remove(request_id).map(|request| request.sender)
+            } else {
+                None
             }
+        };
+        if let Some(sender) = sender {
+            let _ = sender.send(result);
         }
     }
 
     /// Test/compatibility helper for request producers with no target binding.
     /// Target-bound restore requests cannot be resolved through this path.
     pub fn resolve(&self, request_id: &str, result: ScreenshotResult) {
-        let mut pending = self.inner.pending.lock().unwrap();
-        let is_unbound = pending
-            .get(request_id)
-            .is_some_and(|request| request.expected_client_id.is_none());
-        if is_unbound {
-            if let Some(request) = pending.remove(request_id) {
-                let _ = request.sender.send(result);
+        let sender = {
+            let mut pending = self.inner.pending.lock().unwrap();
+            let is_unbound = pending
+                .get(request_id)
+                .is_some_and(|request| request.expected_client_id.is_none());
+            if is_unbound {
+                pending.remove(request_id).map(|request| request.sender)
+            } else {
+                None
             }
+        };
+        if let Some(sender) = sender {
+            let _ = sender.send(result);
         }
     }
 
     /// Broadcast the `screenshot.capture` `ui.command` to every connection; the
     /// capable SPA client renders + replies. Frame shape is byte-compatible with
-    /// `ws-handler.ts:1072` (`{type, command, payload:{requestId, scope, tabId?,
+    /// `ws-handler.ts` (`{type, command, payload:{requestId, scope, tabId?,
     /// paneId?}}`), matching `ui-commands.ts#handleScreenshotCapture`.
-    pub fn send_capture(
-        &self,
-        request_id: &str,
-        scope: &str,
-        tab_id: Option<&str>,
-        pane_id: Option<&str>,
-    ) {
-        let mut payload = json!({ "requestId": request_id, "scope": scope });
+    pub fn send_capture(&self, request_id: &str, scope: &str, tab_id: Option<&str>, pane_id: Option<&str>) {
+        let mut payload = json!({
+            "requestId": request_id,
+            "scope": scope,
+        });
         if let Some(tab_id) = tab_id {
             payload["tabId"] = json!(tab_id);
         }
@@ -268,6 +279,7 @@ mod tests {
         assert_eq!(v["payload"]["requestId"], "req-9");
         assert_eq!(v["payload"]["scope"], "view");
         assert!(v["payload"].get("tabId").is_none());
+        assert!(v["payload"].get("paneId").is_none());
 
         // Pane scope carries tabId + paneId.
         b.send_capture("req-10", "pane", Some("tab-1"), Some("pane-1"));

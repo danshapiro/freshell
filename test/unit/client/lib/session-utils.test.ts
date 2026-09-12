@@ -8,6 +8,7 @@ import {
   findTabIdForSession,
   getActiveSessionRefForTab,
   getSessionsForHello,
+  liveTerminalRowIdentity,
 } from '@/lib/session-utils'
 import type {
   FreshAgentPaneContent,
@@ -17,6 +18,7 @@ import type {
   TerminalPaneContent,
 } from '@/store/paneTypes'
 import type { RootState } from '@/store/store'
+import type { BackgroundTerminal } from '@/store/types'
 
 const VALID_SESSION_ID = '550e8400-e29b-41d4-a716-446655440000'
 const OTHER_SESSION_ID = '6f1c2b3a-4d5e-4f70-8a9b-0c1d2e3f4a5b'
@@ -393,5 +395,121 @@ describe('extractSessionLocators', () => {
     expect(extractSessionLocators(terminalContent('claude', { resumeSessionId: VALID_SESSION_ID }))).toEqual([
       { provider: 'claude', sessionId: VALID_SESSION_ID },
     ])
+  })
+})
+
+describe('liveTerminalRowIdentity', () => {
+  function registryTerminal(overrides: Partial<BackgroundTerminal> = {}): BackgroundTerminal {
+    return {
+      terminalId: 'term-1',
+      title: 'Agent pane',
+      createdAt: 1,
+      lastActivityAt: 1,
+      status: 'running',
+      hasClients: true,
+      mode: 'opencode',
+      ...overrides,
+    }
+  }
+
+  function agentContent(
+    mode: TerminalPaneContent['mode'] = 'opencode',
+    options: Parameters<typeof terminalContent>[1] = {},
+  ): TerminalPaneContent {
+    return terminalContent(mode, { terminalId: 'term-1', ...options })
+  }
+
+  it('keys a running identity-less agent terminal as <mode>:terminal:<terminalId>', () => {
+    expect(liveTerminalRowIdentity(agentContent(), registryTerminal())).toEqual({
+      provider: 'opencode',
+      key: 'opencode:terminal:term-1',
+    })
+  })
+
+  it('falls back to the content-mode terminal key when the registry entry is missing', () => {
+    expect(liveTerminalRowIdentity(agentContent(), undefined)).toEqual({
+      provider: 'opencode',
+      key: 'opencode:terminal:term-1',
+    })
+    // Registry miss never keys shell content (shell terminals produce no row)
+    expect(liveTerminalRowIdentity(agentContent('shell'), undefined)).toBeUndefined()
+  })
+
+  it('returns undefined when the terminal is not running and carries no canonical identity', () => {
+    expect(liveTerminalRowIdentity(agentContent(), registryTerminal({ status: 'exited' }))).toBeUndefined()
+  })
+
+  it('returns undefined for shell-mode registry terminals', () => {
+    expect(liveTerminalRowIdentity(agentContent('shell'), registryTerminal({ mode: 'shell' }))).toBeUndefined()
+    expect(liveTerminalRowIdentity(agentContent('shell'), registryTerminal({ mode: undefined }))).toBeUndefined()
+  })
+
+  it('returns the canonical key when the registry terminal carries a sessionRef', () => {
+    expect(liveTerminalRowIdentity(agentContent(), registryTerminal({
+      sessionRef: { provider: 'opencode', sessionId: 'session-1' },
+    }))).toEqual({
+      provider: 'opencode',
+      key: 'opencode:session-1',
+    })
+    // Canonical rows do not depend on terminal liveness
+    expect(liveTerminalRowIdentity(agentContent(), registryTerminal({
+      status: 'exited',
+      sessionRef: { provider: 'opencode', sessionId: 'session-1' },
+    }))).toEqual({
+      provider: 'opencode',
+      key: 'opencode:session-1',
+    })
+  })
+
+  it('returns the codex canonical key for codex terminals with registry durability identity', () => {
+    const durable = {
+      schemaVersion: 1,
+      state: 'durable',
+      durableThreadId: 'durable-1',
+    } as const
+    expect(liveTerminalRowIdentity(agentContent('codex'), registryTerminal({
+      mode: 'codex',
+      codexDurability: durable,
+    }))).toEqual({ provider: 'codex', key: 'codex:durable-1' })
+    const candidateOnly = {
+      schemaVersion: 1,
+      state: 'identity_pending',
+      candidate: {
+        provider: 'codex',
+        candidateThreadId: 'cand-1',
+        rolloutPath: '/tmp/rollout.jsonl',
+        source: 'thread_start_response',
+        capturedAt: 1,
+      },
+    } as const
+    expect(liveTerminalRowIdentity(agentContent('codex'), registryTerminal({
+      mode: 'codex',
+      codexDurability: candidateOnly,
+    }))).toEqual({ provider: 'codex', key: 'codex:cand-1' })
+    // codex WITHOUT any durability identity still gets a terminal key
+    expect(liveTerminalRowIdentity(agentContent('codex'), registryTerminal({ mode: 'codex' }))).toEqual({
+      provider: 'codex',
+      key: 'codex:terminal:term-1',
+    })
+  })
+
+  it('returns nothing when the content already carries canonical identity (canonical loop covers it)', () => {
+    const withRef = agentContent('claude', {
+      sessionRef: { provider: 'claude', sessionId: VALID_SESSION_ID },
+    })
+    expect(liveTerminalRowIdentity(withRef, registryTerminal())).toBeUndefined()
+    expect(liveTerminalRowIdentity(withRef, undefined)).toBeUndefined()
+    const withDurability = {
+      ...agentContent('codex'),
+      codexDurability: { schemaVersion: 1, state: 'durable', durableThreadId: 'durable-own' } as const,
+    }
+    expect(liveTerminalRowIdentity(withDurability, undefined)).toBeUndefined()
+  })
+
+  it('returns undefined for non-terminal contents and terminals without a terminalId', () => {
+    expect(liveTerminalRowIdentity(freshAgentContent(), registryTerminal())).toBeUndefined()
+    expect(liveTerminalRowIdentity(freshAgentContent(), undefined)).toBeUndefined()
+    expect(liveTerminalRowIdentity(terminalContent('opencode'), registryTerminal())).toBeUndefined()
+    expect(liveTerminalRowIdentity(terminalContent('opencode'), undefined)).toBeUndefined()
   })
 })

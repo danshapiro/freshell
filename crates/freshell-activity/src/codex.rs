@@ -386,7 +386,21 @@ impl CodexActivityTracker {
                 .unwrap_or(true);
             state.last_seen_task_started_at =
                 max_ts(state.last_seen_task_started_at, Some(started_at));
-            let effective_clear = max_ts(observed_clear, state.last_cleared_at);
+            // pkvz: for a LIVE (Pending) turn whose start belongs to the
+            // pending submit (started_at >= pending_submit_at, matching
+            // codex-activity-tracker.ts:446), the same-batch clear must NOT
+            // shadow the start promotion. Historical (Idle / start before the
+            // pending submit) rollouts keep the same-batch clear.
+            let effective_clear = if state.phase == CodexPhase::Pending
+                && events
+                    .latest_task_started_at
+                    .zip(state.pending_submit_at)
+                    .is_some_and(|(started, pending)| started >= pending)
+            {
+                state.last_cleared_at
+            } else {
+                max_ts(observed_clear, state.last_cleared_at)
+            };
             if is_new
                 && state
                     .accepted_start_at
@@ -1611,6 +1625,98 @@ mod tests {
         tracker.reconcile_rollout("t1", &started(40), 45);
         let done = tracker.reconcile_rollout("t1", &completed(60), 65);
         assert_eq!(completions(&done), vec![1], "turn 2 completes exactly once");
+    }
+
+    #[test]
+    fn reconcile_one_batch_start_and_clear_on_a_pending_turn_with_newer_start_completes() {
+        // pkvz: under whole-workspace load the hub drains the just-attached
+        // rollout in ONE batch (session_meta + task_started + task_complete). The
+        // promotion guard's effective_clear included the same-batch task_complete,
+        // shadowing the task_started, so accepted_start_at stayed None; the
+        // Pending clear branch then re-armed (has_queued_submit's unwrap_or(true))
+        // instead of recording the completion -- terminal.turn.complete never
+        // fired. The separate-batch path was green because the promotion landed
+        // before the clear. This pins the one-batch path: a LIVE (Pending) turn
+        // whose start is at/after the pending submit completes in one batch.
+        let mut tracker = CodexActivityTracker::new();
+        tracker.track_terminal("t1", Some("thread-1"), 0);
+        tracker.note_input("t1", "\r", 10); // turn 1 pending
+        tracker.note_input("t1", "\r", 20); // queued submit (turn 2)
+        let events = CodexTaskEvents {
+            latest_task_started_at: Some(40), // at/after the pending submit (10)
+            latest_task_completed_at: Some(60),
+            ..Default::default()
+        };
+        let effects = tracker.reconcile_rollout("t1", &events, 70);
+        assert_eq!(
+            completions(&effects),
+            vec![1],
+            "one-batch live turn (start >= pending submit) completes exactly once"
+        );
+        assert_eq!(
+            phases(&effects),
+            vec![CodexPhase::Idle],
+            "the turn lands Idle, not re-armed Pending"
+        );
+    }
+
+    #[test]
+    fn reconcile_one_batch_start_and_clear_on_a_pending_turn_with_older_start_rearms() {
+        // Mirror of the separate-batch re-arm in
+        // reconcile_clear_with_queued_submit_swallows_the_late_bel_echo: when the
+        // queued submit (20) postdates the completed turn's start (12), the clear
+        // re-arms turn 2 and records nothing -- the one-batch path must match the
+        // separate-batch path here too (no over-ring).
+        let mut tracker = CodexActivityTracker::new();
+        tracker.track_terminal("t1", Some("thread-1"), 0);
+        tracker.note_input("t1", "\r", 10);
+        tracker.note_input("t1", "\r", 20); // queued submit newer than the turn start
+        let events = CodexTaskEvents {
+            latest_task_started_at: Some(12),
+            latest_task_completed_at: Some(25),
+            ..Default::default()
+        };
+        let clear = tracker.reconcile_rollout("t1", &events, 30);
+        assert!(
+            completions(&clear).is_empty(),
+            "re-arm to the queued turn is not a turn end (one-batch parity with separate-batch)"
+        );
+        // Pending->Pending is not a public change: changed() suppresses the Changed
+        // effect, so phases(&clear) is []. Inspect the tracker state directly.
+        assert_eq!(
+            tracker.list()[0].phase,
+            CodexPhase::Pending,
+            "re-armed to Pending, not Idle"
+        );
+    }
+
+    #[test]
+    fn reconcile_one_batch_historical_start_before_pending_submit_records_nothing() {
+        // pkvz regression guard (plan review round 1, finding 1): a historical
+        // rollout whose start (5) and clear (7) both predate the pending submit
+        // (10) must NOT promote or record a completion. The temporal restriction
+        // (started_at >= pending_submit_at) keeps the same-batch clear in the
+        // guard for this case, so the suppression is preserved. Without the
+        // restriction, the Pending bypass would promote on start=5 and ring a
+        // false completion for a turn that ended before the user submitted.
+        let mut tracker = CodexActivityTracker::new();
+        tracker.track_terminal("t1", Some("thread-1"), 0);
+        tracker.note_input("t1", "\r", 10); // pending submit at 10
+        let events = CodexTaskEvents {
+            latest_task_started_at: Some(5),   // BEFORE the pending submit
+            latest_task_completed_at: Some(7), // BEFORE the pending submit
+            ..Default::default()
+        };
+        let effects = tracker.reconcile_rollout("t1", &events, 20);
+        assert!(
+            completions(&effects).is_empty(),
+            "historical rollout predating the pending submit must not ring"
+        );
+        assert_eq!(
+            tracker.list()[0].phase,
+            CodexPhase::Pending,
+            "the live pending turn is not consumed by a historical rollout"
+        );
     }
 
     #[test]

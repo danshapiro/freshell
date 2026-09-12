@@ -1670,6 +1670,166 @@ test.describe('fresh-agent control surfaces — codex lane (rust)', () => {
       await fs.rm(lane.sharedRoot, { recursive: true, force: true }).catch(() => {})
     }
   })
+  // Wedged-sidecar deadman (r47n): the fake's turnCompleteDelayMs keeps the
+  // process alive but the turn/completed broadcast effectively never lands
+  // (3.6e6 ms), so the quiet window must surface the stuck state with recovery
+  // instead of an eternal spinner.
+  test('wedged sidecar: quiet window surfaces the stuck state with recovery, not an eternal spinner', async ({ page, e2eServerKind }) => {
+    expect(e2eServerKind).toBe('rust')
+    const lane = await bootCodexLane(
+      page,
+      { turnCompleteDelayMs: 3_600_000 },
+      { FRESHELL_FRESHCODEX_QUIET_WINDOW_MS: '4000' },
+    )
+    try {
+      await waitForPaneStatus(lane.harness, lane.tabId, 'idle')
+      const paneRoot = page.locator('[data-context="fresh-agent"]').last()
+      const stuckAlert = paneRoot.getByRole('alert').filter({ hasText: /appears stuck/i })
+      const threadId = ((await paneLeaf(lane.harness, lane.tabId))?.content?.sessionId ?? '') as string
+      expect(threadId, 'freshcodex thread id materialized before the send').toBeTruthy()
+
+      await sendComposerText(page, 'run a turn that will wedge')
+
+      // Within the bound (2s < 4s window, measured from the send — the
+      // deadman arms when the send's turn/start RPC lands): no stuck state.
+      await page.waitForTimeout(2000)
+      await expect(stuckAlert).toHaveCount(0)
+
+      // Past the bound: the stuck notice surfaces (role=alert), and the pane
+      // stops asserting "working" — the session status the card reads is now
+      // 'stuck', never a fabricated idle/turn-complete.
+      await expect(stuckAlert, 'stuck notice after the quiet window').toBeVisible({ timeout: 25_000 })
+      await expect
+        .poll(
+          () => readFreshAgentSessionStatus(lane.harness, threadId),
+          { timeout: 15_000, message: 'session status stops asserting busy (stuck)' },
+        )
+        .toBe('stuck')
+
+      // The wedge is a live, in-flight turn: exactly one recorded turn
+      // renders (user + assistant rows) and nothing ever completes it.
+      await expect(
+        paneRoot.locator('article[data-turn-index]'),
+        'exactly one wedged turn renders (user+assistant rows), alive but silent',
+      ).toHaveCount(2, { timeout: 30_000 })
+
+      // Recovery: restart the sidecar and resume the durable thread. Truthful
+      // terminal state = idle with transcript intact, or idle with the explicit
+      // memory-loss alert (both are acceptance-valid).
+      await stuckAlert.getByRole('button', { name: /restart sidecar/i }).click()
+      await waitForPaneStatus(lane.harness, lane.tabId, 'idle')
+      await expect(stuckAlert).toHaveCount(0)
+      const opsAfter = readCodexOps(lane.opLogPath).map((op: any) => op.method)
+      const resumed = opsAfter.includes('thread/resume')
+      const respawnedFresh = opsAfter.filter((m: string) => m === 'thread/start').length >= 2
+      expect(resumed || respawnedFresh).toBe(true)
+      if (respawnedFresh && !resumed) {
+        // Respawn-as-new surfaces through the existing restore-error alert
+        // machinery (getRestoreErrorMessage, FreshAgentView.tsx).
+        await expect(paneRoot.getByRole('alert').filter({ hasText: /cannot be resumed|no longer has memory/i })).toBeVisible()
+      }
+    } finally {
+      await lane.server.stop().catch(() => {})
+      await fs.rm(lane.sharedRoot, { recursive: true, force: true }).catch(() => {})
+    }
+  })
+
+  test('long turn within the quiet window completes normally and never shows the stuck state', async ({ page, e2eServerKind }) => {
+    expect(e2eServerKind).toBe('rust')
+    const lane = await bootCodexLane(
+      page,
+      { turnCompleteDelayMs: 3_000 },
+      { FRESHELL_FRESHCODEX_QUIET_WINDOW_MS: '8000' },
+    )
+    try {
+      await waitForPaneStatus(lane.harness, lane.tabId, 'idle')
+      const paneRoot = page.locator('[data-context="fresh-agent"]').last()
+      const stuckAlert = paneRoot.getByRole('alert').filter({ hasText: /appears stuck/i })
+
+      await sendComposerText(page, 'a slow but healthy turn')
+      const sentAt = Date.now()
+
+      // The turn runs and renders (user + assistant rows = exactly one
+      // recorded turn) and completes within the 8s window: the pane returns
+      // to a truthful idle (turn/completed at ~3s disarms the deadman).
+      await expect(
+        paneRoot.locator('article[data-turn-index]'),
+        'the slow turn renders and is tracked',
+      ).toHaveCount(2, { timeout: 30_000 })
+      await waitForPaneStatus(lane.harness, lane.tabId, 'idle')
+
+      // ... and stays stuck-free PAST the bound (measured from the send): a
+      // completed turn must never fire the deadman — an alert here would be
+      // exactly the false positive the bound exists to prevent.
+      await page.waitForTimeout(Math.max(0, 11_000 - (Date.now() - sentAt)))
+      await expect(stuckAlert).toHaveCount(0)
+    } finally {
+      await lane.server.stop().catch(() => {})
+      await fs.rm(lane.sharedRoot, { recursive: true, force: true }).catch(() => {})
+    }
+  })
+
+  test('per-send settings alter the turn payload against the Rust server (freshcodex)', async ({ page, e2eServerKind }) => {
+    expect(e2eServerKind).toBe('rust')
+    const lane = await bootCodexLane(page)
+    try {
+      await waitForPaneStatus(lane.harness, lane.tabId, 'idle')
+      // Turn 1 rides the pane's untouched defaults.
+      await sendCodexTurnAndWaitRows(page, 2, 'codex turn one')
+      const threadId = (await paneLeaf(lane.harness, lane.tabId))?.content?.sessionId as string
+      expect(threadId, 'the durable codex thread id must be known before turn two').toBeTruthy()
+
+      // Change model + effort BETWEEN sends through the real settings UI:
+      // gear popover → Model row ("Change…") → the two-column model dialog →
+      // pick GPT-5.6 Sol, stage its `low` thinking level, commit.
+      await page.getByRole('button', { name: 'Agent settings' }).click()
+      const popover = page.getByRole('dialog', { name: 'Agent settings' })
+      await expect(popover).toBeVisible({ timeout: 10_000 })
+      await popover.getByRole('button', { name: /Change/ }).click()
+      const dialog = page.getByRole('dialog', { name: 'Model and thinking level' })
+      await expect(dialog).toBeVisible({ timeout: 10_000 })
+      await dialog.getByRole('option', { name: 'GPT-5.6 Sol' }).click()
+      const levelsList = dialog.getByRole('listbox', { name: 'Thinking levels for GPT-5.6 Sol' })
+      await expect(levelsList).toBeVisible()
+      await levelsList.getByRole('option', { name: 'low', exact: true }).click()
+      await dialog.getByRole('button', { name: 'Use GPT-5.6 Sol · low' }).click()
+      await expect(dialog).toHaveCount(0)
+      // The commit leaves the settings popover open behind the dialog; close it.
+      await page.keyboard.press('Escape')
+      await expect(popover).toHaveCount(0, { timeout: 10_000 })
+      await expect
+        .poll(async () => {
+          const content = (await paneLeaf(lane.harness, lane.tabId))?.content
+          return content ? `${content.model ?? ''}|${content.effort ?? ''}` : ''
+        })
+        .toBe('gpt-5.6-sol|low')
+
+      // Turn 2 must now carry the changed knobs (canonical's codex.rs merges
+      // msg.settings over the session baseline before turn/start).
+      await sendCodexTurnAndWaitRows(page, 4, 'codex turn two')
+
+      // Ground truth: the fake's recorded-turns file under the lane's isolated
+      // CODEX_HOME (<home>/.codex/fake-turns/<threadId>.json). Each recorded
+      // turn carries its captured turn/start params additively under `start` —
+      // turn 2 carries the per-send selection while turn 1 kept the defaults
+      // (gpt-6-astra / the default 'max' effort, wire-mapped 'xhigh' by
+      // to_codex_reasoning_effort).
+      const turnsPath = path.join(lane.info.homeDir, '.codex', 'fake-turns', `${threadId}.json`)
+      await expect(async () => {
+        const turns = JSON.parse(await fs.readFile(turnsPath, 'utf8')) as any[]
+        expect(turns, 'exactly the two recorded turns').toHaveLength(2)
+        expect(turns[1]?.start?.model).toBe('gpt-5.6-sol')
+        expect(turns[1]?.start?.effort).toBe('low')
+        expect(turns[0]?.start?.model).toBe('gpt-6-astra')
+        expect(turns[0]?.start?.effort).toBe('xhigh')
+        expect(turns[0]?.start?.model).not.toBe(turns[1]?.start?.model)
+        expect(turns[0]?.start?.effort).not.toBe(turns[1]?.start?.effort)
+      }).toPass({ timeout: 15_000 })
+    } finally {
+      await lane.server.stop().catch(() => {})
+      await fs.rm(lane.sharedRoot, { recursive: true, force: true }).catch(() => {})
+    }
+  })
 })
 
 // ─────────────────────────────────────────────────────────────────────────────

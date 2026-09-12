@@ -3,8 +3,9 @@ import type { Tab, TerminalStatus, TabMode, ShellType, CodingCliProviderName } f
 import { nanoid } from 'nanoid'
 import { closePane, initLayout, restoreLayout, removeLayout, replacePane, setPaneCloseError, updatePaneContent, updatePaneTitleByTerminalId, updatePaneTitle, markTabClosing, clearTabClosing, markPaneClosing, clearPaneClosing, hasAnyClosePending } from './panesSlice'
 import { clearTabAttention, clearPaneAttention } from './turnCompletionSlice.js'
+import { updateSessionActivity } from './sessionActivitySlice'
 import type { PaneContent, PaneNode } from './paneTypes'
-import { findTabIdForSession } from '@/lib/session-utils'
+import { findTabIdForSession, collectSessionRefsFromTabs, liveTerminalRowIdentity } from '@/lib/session-utils'
 import { getProviderLabel } from '@/lib/coding-cli-utils'
 import { basenameSegment } from '@shared/path-basename'
 import { buildResumeContent } from '@/lib/session-type-utils'
@@ -19,7 +20,7 @@ import {
 } from '@/lib/tab-registry-snapshot'
 import { UNKNOWN_SERVER_INSTANCE_ID } from './tabRegistryConstants'
 import { KILL_ACK_TIMEOUT_MS, PANE_CLOSE_ACK_TIMEOUT_MESSAGE, PANE_CLOSE_FAILED_MESSAGE, PANE_CLOSE_REMOVAL_REFUSED_MESSAGE, sendPaneClosedAndAwait, sendPaneOpened, sendPanesClosedAndAwait } from '@/lib/kill-ack'
-import { collectSessionPaneIdentities, findPaneContent } from '@/lib/pane-utils'
+import { collectSessionPaneIdentities, collectPaneContents, findPaneContent } from '@/lib/pane-utils'
 import { markPaneCloseEvidenceConfirmed } from '@/lib/pane-close-evidence-marks'
 import type { RootState } from './store'
 import { selectTabIdByTerminalId } from './selectors/paneTerminalSelectors'
@@ -290,6 +291,13 @@ type AddTabPayload = {
   forceNew?: boolean
   createRequestId?: string
   titleSetByUser?: boolean
+  /**
+   * Server-driven creates (ui.command tab.create) pass activate:false so an
+   * agent/MCP action never steals the user's focus. Local creates omit the
+   * flag and keep the historical auto-activation. Bootstrap exception: the
+   * very first tab always becomes active — nothing else promotes it.
+   */
+  activate?: boolean
 }
 
 export const tabsSlice = createSlice({
@@ -323,7 +331,9 @@ export const tabsSlice = createSlice({
         lastInputAt: undefined,
       }
       state.tabs.push(tab)
-      state.activeTabId = id
+      if (payload.activate !== false || state.tabs.length === 1) {
+        state.activeTabId = id
+      }
     },
     setActiveTab: (state, action: PayloadAction<string>) => {
       state.activeTabId = action.payload
@@ -788,6 +798,65 @@ export const closeTab = createAsyncThunk(
           paneTitleSetByUser: frozenPaneTitleSetByUser || {},
           closedAt: Date.now(),
         }))
+      }
+
+      // Closing a tab counts as a user touch on its sessions: ratchet each
+      // one's locally-stored activity timestamp at close-commit time so the
+      // just-closed session floats to the top of the grey section under the
+      // default 'activity' sort (the grey tier consumes the ratchet with
+      // presence-priority — compareByStatusTiers in
+      // selectors/sidebarSelectors.ts). Two loops over the frozen pre-close
+      // snapshot, both ratchet-only (updateSessionActivity never lowers a
+      // stored value):
+      //
+      // 1. Canonical session refs — collectSessionRefsFromTabs covers both
+      //    layout leaves and layout-less tabs (buildTabFallbackLocator).
+      // 2. Leaf contents whose own locators are empty but still correspond
+      //    to sidebar rows: registry-only canonical identity (sessionRef /
+      //    codex durability known only to the terminal directory),
+      //    identity-less live-terminal fallback rows keyed
+      //    `<mode>:terminal:<terminalId>`, and terminals whose directory
+      //    entry hasn't loaded yet — liveTerminalRowIdentity resolves the
+      //    right key (or none) per content.
+      //
+      // Unconditional by design: REST/MCP/server-broadcast closes flow
+      // through this same thunk on every connected client (ui-commands.ts
+      // tab.close → closeTab), so a mirrored close ratchets too —
+      // harmless-to-useful under ratchet-only semantics. The app-level
+      // grey-transition touch watcher (store/sessionGreyTouch.ts) also
+      // touches tier-visible keys at close; the overlap is equally harmless.
+      if (frozenTab) {
+        const touchedAt = Date.now()
+        for (const ref of collectSessionRefsFromTabs([frozenTab], stateAtClose.panes)) {
+          dispatch(updateSessionActivity({
+            sessionId: ref.sessionId,
+            provider: ref.provider,
+            lastInputAt: touchedAt,
+          }))
+        }
+        if (frozenLayout) {
+          const directoryItems = (stateAtClose as {
+            terminalDirectory?: RootState['terminalDirectory']
+          }).terminalDirectory?.windows?.sidebar?.items
+          for (const content of collectPaneContents(frozenLayout)) {
+            const identity = liveTerminalRowIdentity(
+              content,
+              content.kind === 'terminal' && content.terminalId
+                ? directoryItems?.find((item) => item.terminalId === content.terminalId)
+                : undefined,
+            )
+            if (!identity) continue
+            // identity.key is pre-composed and contains colons, so
+            // makeSessionKey passes it through unchanged (provider is kept
+            // for dispatch parity with the canonical loop above, not for
+            // key construction).
+            dispatch(updateSessionActivity({
+              sessionId: identity.key,
+              provider: identity.provider,
+              lastInputAt: touchedAt,
+            }))
+          }
+        }
       }
 
       // The frozen set is authoritative (F3): remove the tab and the layout

@@ -11,10 +11,12 @@ import tabsReducer, {
   openSessionTab,
   TabsState,
 } from '../../../../src/store/tabsSlice'
-import panesReducer, { initLayout } from '../../../../src/store/panesSlice'
+import panesReducer, { initLayout, splitPane } from '../../../../src/store/panesSlice'
 import connectionReducer from '../../../../src/store/connectionSlice'
 import extensionsReducer from '../../../../src/store/extensionsSlice'
-import type { Tab } from '../../../../src/store/types'
+import sessionActivityReducer from '../../../../src/store/sessionActivitySlice'
+import terminalDirectoryReducer from '../../../../src/store/terminalDirectorySlice'
+import type { BackgroundTerminal, Tab } from '../../../../src/store/types'
 
 const VALID_CLAUDE_SESSION_ID = '550e8400-e29b-41d4-a716-446655440000'
 
@@ -38,8 +40,9 @@ function createOpenSessionStore(serverInstanceId?: string) {
 }
 
 
-const { paneCloseAckHandlers } = vi.hoisted(() => ({
+const { paneCloseAckHandlers, paneCloseAckMode } = vi.hoisted(() => ({
   paneCloseAckHandlers: new Set<(msg: unknown) => void>(),
+  paneCloseAckMode: { fail: false },
 }))
 
 // Delta-r7-r3 (focused-episode-7 round 2, Finding F2): the close gate awaits
@@ -57,10 +60,11 @@ vi.mock('@/lib/ws-client', () => ({
       }
       // Focused-episode-7 round 3 (Finding F1): the whole-tab close is ONE
       // batch envelope — answer the correlated `panes.closed.result` (the
-      // healthy-server shape), same as the per-pane lane above.
+      // healthy-server shape), same as the per-pane lane above. The fail
+      // switch lets a test pin the failed-evidence path (the tab stays).
       if (m?.type === 'panes.closed' && m.requestId) {
         for (const handler of [...paneCloseAckHandlers]) {
-          handler({ type: 'panes.closed.result', requestId: m.requestId, success: true })
+          handler({ type: 'panes.closed.result', requestId: m.requestId, success: !paneCloseAckMode.fail })
         }
       }
     },
@@ -88,6 +92,7 @@ describe('tabsSlice', () => {
       activeTabId: null,
     }
     vi.clearAllMocks()
+    paneCloseAckMode.fail = false
   })
 
   describe('addTab', () => {
@@ -189,6 +194,21 @@ describe('tabsSlice', () => {
       state = tabsReducer(state, addTab())
       const secondTabId = state.tabs[1].id
       expect(state.activeTabId).toBe(secondTabId)
+    })
+
+    it('activate: false does not change the active tab', () => {
+      let state = tabsReducer(initialState, addTab({ title: 'One' }))
+      const firstActiveId = state.activeTabId
+      state = tabsReducer(state, addTab({ title: 'Two', activate: false }))
+
+      expect(state.tabs).toHaveLength(2)
+      expect(state.activeTabId).toBe(firstActiveId)
+    })
+
+    it('activate: false still activates when this is the first tab (bootstrap edge)', () => {
+      const state = tabsReducer(initialState, addTab({ title: 'Only', activate: false }))
+      expect(state.tabs).toHaveLength(1)
+      expect(state.activeTabId).toBe(state.tabs[0].id)
     })
   })
 
@@ -611,6 +631,281 @@ describe('tabsSlice', () => {
 
       // Layout should be removed
       expect(store.getState().panes.layouts[tabId]).toBeUndefined()
+    })
+  })
+
+  describe('closeTab session activity ratchet', () => {
+    const SECOND_CLAUDE_ID = '550e8400-e29b-41d4-a716-446655440001'
+
+    function createRatchetStore(
+      sessions: Record<string, number> = {},
+      terminals: BackgroundTerminal[] = [],
+    ) {
+      return configureStore({
+        reducer: {
+          tabs: tabsReducer,
+          panes: panesReducer,
+          sessionActivity: sessionActivityReducer,
+          terminalDirectory: terminalDirectoryReducer,
+        },
+        preloadedState: {
+          sessionActivity: { sessions },
+          terminalDirectory: {
+            windows: { sidebar: { items: terminals, nextCursor: null } },
+            searches: {},
+          },
+        },
+      })
+    }
+
+    function claudeRefContent(sessionId: string) {
+      return {
+        kind: 'terminal' as const,
+        mode: 'claude' as const,
+        resumeSessionId: sessionId,
+        sessionRef: { provider: 'claude', sessionId },
+      }
+    }
+
+    it('ratchets activity for every session ref of the closing tab', async () => {
+      const store = createRatchetStore()
+      store.dispatch(addTab({ mode: 'claude' }))
+      const tabId = store.getState().tabs.tabs[0].id
+      store.dispatch(initLayout({ tabId, content: claudeRefContent(VALID_CLAUDE_SESSION_ID) }))
+      const leafId = (store.getState().panes.layouts[tabId] as any).id
+      store.dispatch(splitPane({
+        tabId,
+        paneId: leafId,
+        direction: 'horizontal',
+        newContent: claudeRefContent(SECOND_CLAUDE_ID),
+      }))
+
+      const beforeClose = Date.now()
+      await store.dispatch(closeTab(tabId))
+
+      const sessions = store.getState().sessionActivity.sessions
+      expect(sessions[`claude:${VALID_CLAUDE_SESSION_ID}`]).toBeGreaterThanOrEqual(beforeClose)
+      expect(sessions[`claude:${SECOND_CLAUDE_ID}`]).toBeGreaterThanOrEqual(beforeClose)
+    })
+
+    it('records no activity when closing a sessionless shell tab', async () => {
+      const store = createRatchetStore()
+      store.dispatch(addTab({ mode: 'shell' }))
+      const tabId = store.getState().tabs.tabs[0].id
+      store.dispatch(initLayout({ tabId, content: { kind: 'terminal', mode: 'shell' } }))
+
+      await store.dispatch(closeTab(tabId))
+
+      expect(store.getState().sessionActivity.sessions).toEqual({})
+    })
+
+    it('never downgrades a newer existing ratchet value', async () => {
+      const future = Date.now() + 60_000
+      const store = createRatchetStore({ [`claude:${VALID_CLAUDE_SESSION_ID}`]: future })
+      store.dispatch(addTab({ mode: 'claude' }))
+      const tabId = store.getState().tabs.tabs[0].id
+      store.dispatch(initLayout({
+        tabId,
+        content: {
+          kind: 'terminal',
+          mode: 'claude',
+          resumeSessionId: VALID_CLAUDE_SESSION_ID,
+        },
+      }))
+
+      await store.dispatch(closeTab(tabId))
+
+      expect(store.getState().sessionActivity.sessions[`claude:${VALID_CLAUDE_SESSION_ID}`]).toBe(future)
+    })
+
+    it('ratchets layout-less tabs via tab-level fallback identity', async () => {
+      const store = createRatchetStore()
+      store.dispatch(hydrateTabs({
+        tabs: [{
+          id: 'layout-less',
+          createRequestId: 'layout-less',
+          title: 'Layout-less',
+          status: 'running',
+          mode: 'claude',
+          resumeSessionId: VALID_CLAUDE_SESSION_ID,
+          createdAt: 1,
+        } as any],
+        activeTabId: 'layout-less',
+      }))
+
+      const beforeClose = Date.now()
+      await store.dispatch(closeTab('layout-less'))
+
+      expect(store.getState().sessionActivity.sessions[`claude:${VALID_CLAUDE_SESSION_ID}`])
+        .toBeGreaterThanOrEqual(beforeClose)
+    })
+
+    it('ratchets the fallback row key of every running identity-less registry terminal in the layout', async () => {
+      // Running agent terminals without sessionRef surface in the sidebar as
+      // fallback rows keyed `<mode>:terminal:<terminalId>`; the row persists
+      // after tab close because the terminal keeps running.
+      const store = createRatchetStore({}, [
+        {
+          terminalId: 'term-op-1',
+          title: 'OpenCode one',
+          createdAt: 1,
+          lastActivityAt: 1,
+          status: 'running',
+          hasClients: true,
+          mode: 'opencode',
+        },
+        {
+          terminalId: 'term-op-2',
+          title: 'OpenCode two',
+          createdAt: 1,
+          lastActivityAt: 1,
+          status: 'running',
+          hasClients: true,
+          mode: 'opencode',
+        },
+      ])
+      store.dispatch(addTab({ mode: 'opencode' }))
+      const tabId = store.getState().tabs.tabs[0].id
+      store.dispatch(initLayout({
+        tabId,
+        content: { kind: 'terminal', mode: 'opencode', terminalId: 'term-op-1' },
+      }))
+      const leafId = (store.getState().panes.layouts[tabId] as any).id
+      store.dispatch(splitPane({
+        tabId,
+        paneId: leafId,
+        direction: 'horizontal',
+        newContent: { kind: 'terminal', mode: 'opencode', terminalId: 'term-op-2' },
+      }))
+
+      const beforeClose = Date.now()
+      await store.dispatch(closeTab(tabId))
+
+      const sessions = store.getState().sessionActivity.sessions
+      expect(sessions['opencode:terminal:term-op-1']).toBeGreaterThanOrEqual(beforeClose)
+      expect(sessions['opencode:terminal:term-op-2']).toBeGreaterThanOrEqual(beforeClose)
+    })
+
+    it('skips the terminal key when a codex registry terminal has durability identity', async () => {
+      // That row is keyed codex:<durabilitySessionId> and is already ratcheted
+      // by the canonical refs loop (pane-content codex durability locator).
+      const codexDurability = { schemaVersion: 1, state: 'durable', durableThreadId: 'durable-cx-1' } as const
+      const store = createRatchetStore({}, [{
+        terminalId: 'term-cx-1',
+        title: 'Codex pane',
+        createdAt: 1,
+        lastActivityAt: 1,
+        status: 'running',
+        hasClients: true,
+        mode: 'codex',
+        codexDurability,
+      }])
+      store.dispatch(addTab({ mode: 'codex' }))
+      const tabId = store.getState().tabs.tabs[0].id
+      store.dispatch(initLayout({
+        tabId,
+        content: { kind: 'terminal', mode: 'codex', terminalId: 'term-cx-1', codexDurability },
+      }))
+
+      const beforeClose = Date.now()
+      await store.dispatch(closeTab(tabId))
+
+      const sessions = store.getState().sessionActivity.sessions
+      expect(sessions['codex:durable-cx-1']).toBeGreaterThanOrEqual(beforeClose)
+      expect(sessions['codex:terminal:term-cx-1']).toBeUndefined()
+    })
+
+    it('ratchets the registry canonical key when the sessionRef exists only in the registry', async () => {
+      // Canonical identity lives in the registry, not the pane content: the
+      // content yields no locator, so the canonical loop ratchets nothing.
+      // The sidebar rows this terminal under claude:<sessionId>; the ratchet
+      // must target that canonical key, not a terminal alias (which would be
+      // junk — no row ever reads it).
+      const store = createRatchetStore({}, [{
+        terminalId: 'term-ref-1',
+        title: 'Claude pane',
+        createdAt: 1,
+        lastActivityAt: 1,
+        status: 'running',
+        hasClients: true,
+        mode: 'claude',
+        sessionRef: { provider: 'claude', sessionId: VALID_CLAUDE_SESSION_ID },
+      }])
+      store.dispatch(addTab({ mode: 'claude' }))
+      const tabId = store.getState().tabs.tabs[0].id
+      store.dispatch(initLayout({
+        tabId,
+        content: { kind: 'terminal', mode: 'claude', terminalId: 'term-ref-1' },
+      }))
+
+      const beforeClose = Date.now()
+      await store.dispatch(closeTab(tabId))
+
+      const sessions = store.getState().sessionActivity.sessions
+      expect(sessions[`claude:${VALID_CLAUDE_SESSION_ID}`]).toBeGreaterThanOrEqual(beforeClose)
+      expect(sessions['claude:terminal:term-ref-1']).toBeUndefined()
+    })
+
+    it('ratchets the registry codex canonical key when durability identity exists only in the registry', async () => {
+      // Same registry-only-identity gap as the sessionRef case: the content
+      // carries no codexDurability, so the canonical loop yields nothing, but
+      // the sidebar rows the terminal under codex:<durabilitySessionId>.
+      const store = createRatchetStore({}, [{
+        terminalId: 'term-cx-2',
+        title: 'Codex pane',
+        createdAt: 1,
+        lastActivityAt: 1,
+        status: 'running',
+        hasClients: true,
+        mode: 'codex',
+        codexDurability: { schemaVersion: 1, state: 'durable', durableThreadId: 'durable-cx-2' } as const,
+      }])
+      store.dispatch(addTab({ mode: 'codex' }))
+      const tabId = store.getState().tabs.tabs[0].id
+      store.dispatch(initLayout({
+        tabId,
+        content: { kind: 'terminal', mode: 'codex', terminalId: 'term-cx-2' },
+      }))
+
+      const beforeClose = Date.now()
+      await store.dispatch(closeTab(tabId))
+
+      const sessions = store.getState().sessionActivity.sessions
+      expect(sessions['codex:durable-cx-2']).toBeGreaterThanOrEqual(beforeClose)
+      expect(sessions['codex:terminal:term-cx-2']).toBeUndefined()
+    })
+
+    it('falls back to the pane-mode terminal key when the registry entry is missing', async () => {
+      // terminalDirectory.windows.sidebar.items loads asynchronously, can
+      // fail or be stale, and is capped: closing before the entry arrives
+      // must still ratchet the key the still-running terminal's fallback row
+      // will read once it registers.
+      const store = createRatchetStore()
+      store.dispatch(addTab({ mode: 'opencode' }))
+      const tabId = store.getState().tabs.tabs[0].id
+      store.dispatch(initLayout({
+        tabId,
+        content: { kind: 'terminal', mode: 'opencode', terminalId: 'term-miss-1' },
+      }))
+
+      const beforeClose = Date.now()
+      await store.dispatch(closeTab(tabId))
+
+      expect(store.getState().sessionActivity.sessions['opencode:terminal:term-miss-1'])
+        .toBeGreaterThanOrEqual(beforeClose)
+    })
+
+    it('ratchets nothing when the close evidence fails (the tab stays)', async () => {
+      paneCloseAckMode.fail = true
+      const store = createRatchetStore()
+      store.dispatch(addTab({ mode: 'claude' }))
+      const tabId = store.getState().tabs.tabs[0].id
+      store.dispatch(initLayout({ tabId, content: claudeRefContent(VALID_CLAUDE_SESSION_ID) }))
+
+      await store.dispatch(closeTab(tabId))
+
+      expect(store.getState().tabs.tabs).toHaveLength(1)
+      expect(store.getState().sessionActivity.sessions).toEqual({})
     })
   })
 

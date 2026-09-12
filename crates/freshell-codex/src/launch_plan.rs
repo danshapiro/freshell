@@ -24,6 +24,7 @@
 //! - `if (!sandbox) return undefined` — `Some("")` normalizes to `None`, not an error.
 
 use crate::durability::CODEX_SIDECAR_OWNERSHIP_ENV;
+use std::collections::BTreeMap;
 use std::fmt;
 
 // ─── constants ──────────────────────────────────────────────────────────────────────────
@@ -175,6 +176,9 @@ pub struct CodexLaunchPlanInput<'a> {
     pub model: Option<&'a str>,
     pub sandbox: Option<&'a str>,
     pub approval_policy: Option<&'a str>,
+    /// Spawn-only configuration/context for a newly created app-server. A
+    /// claimed survivor deliberately does not consume this new context.
+    pub sidecar_context: CodexSidecarLaunchContext,
 }
 
 /// The pure launch PLAN: every decision `planCreate` (`launch-planner.ts:125-163`)
@@ -203,6 +207,9 @@ pub struct CodexLaunchPlan {
     pub model: Option<String>,
     pub sandbox: Option<CodexSandboxMode>,
     pub approval_policy: Option<String>,
+    /// The immutable context a newly spawned runtime carries across retries.
+    /// Environment values are never persisted into sidecar records.
+    pub sidecar_context: CodexSidecarLaunchContext,
 }
 
 /// The `planCodexLaunch` decision tree (`ws-handler.ts:928-950` →
@@ -231,6 +238,7 @@ pub fn plan_codex_launch(
         model: input.model.map(str::to_string),
         sandbox,
         approval_policy: input.approval_policy.map(str::to_string),
+        sidecar_context: input.sidecar_context.clone(),
     })
 }
 
@@ -311,34 +319,71 @@ pub fn codex_remote_args(proxy_ws_url: &str) -> Result<[String; 4], CodexRemoteA
 
 // ─── app-server sidecar spawn spec (codex.rs::spawn_sidecar ⇐ runtime.ts:1246-1261) ─────
 
+/// The value-safe, immutable configuration a newly spawned managed app-server receives.
+/// The `config_args` are static configuration pairs; environment values remain only in the
+/// child process environment and are intentionally redacted from [`fmt::Debug`].
+#[derive(Clone, PartialEq, Eq, Default)]
+pub struct CodexSidecarLaunchContext {
+    pub config_args: Vec<String>,
+    pub env: BTreeMap<String, String>,
+}
+
+impl fmt::Debug for CodexSidecarLaunchContext {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CodexSidecarLaunchContext")
+            .field("config_args", &self.config_args)
+            .field("env_keys", &self.env.keys().collect::<Vec<_>>())
+            .finish()
+    }
+}
+
 /// The argv (after the `codex` program token) + env a managed app-server sidecar spawn
-/// carries. Pure description only — S4 owns the actual spawn.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// carries. Pure description only — S4 owns the actual spawn. Environment values are
+/// deliberately redacted from [`fmt::Debug`].
+#[derive(Clone, PartialEq, Eq)]
 pub struct CodexSidecarSpawnSpec {
     pub args: Vec<String>,
     pub env: Vec<(String, String)>,
 }
 
-/// `codex -c features.apps=false app-server --listen <ws_url>` with the ownership tag
-/// env (`FRESHELL_CODEX_SIDECAR_ID=<ownership_id>`) the `/proc` reaper keys on —
-/// exactly the shape `freshell-freshagent/src/codex.rs::spawn_sidecar` (⇐
-/// `runtime.ts:1246-1261`) builds today.
-pub fn codex_sidecar_spawn_spec(listen_ws_url: &str, ownership_id: &str) -> CodexSidecarSpawnSpec {
+impl fmt::Debug for CodexSidecarSpawnSpec {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut env_keys = self.env.iter().map(|(key, _)| key).collect::<Vec<_>>();
+        env_keys.sort_unstable();
+        f.debug_struct("CodexSidecarSpawnSpec")
+            .field("args", &self.args)
+            .field("env_keys", &env_keys)
+            .finish()
+    }
+}
+
+/// `codex -c features.apps=false <context config> app-server --listen <ws_url>` with the
+/// ownership tag the `/proc` reaper keys on. Context environment values stay in the spawned
+/// process environment; the ownership tag is inserted after context merge so it wins on a
+/// collision. This is the shared shape terminal runtimes and fresh-agent use.
+pub fn codex_sidecar_spawn_spec(
+    listen_ws_url: &str,
+    ownership_id: &str,
+    context: &CodexSidecarLaunchContext,
+) -> CodexSidecarSpawnSpec {
     let mut args: Vec<String> = CODEX_MANAGED_REMOTE_CONFIG_ARGS
         .iter()
         .map(|s| s.to_string())
         .collect();
+    args.extend(context.config_args.iter().cloned());
     args.extend([
         "app-server".to_string(),
         "--listen".to_string(),
         listen_ws_url.to_string(),
     ]);
+    let mut env = context.env.clone();
+    env.insert(
+        CODEX_SIDECAR_OWNERSHIP_ENV.to_string(),
+        ownership_id.to_string(),
+    );
     CodexSidecarSpawnSpec {
         args,
-        env: vec![(
-            CODEX_SIDECAR_OWNERSHIP_ENV.to_string(),
-            ownership_id.to_string(),
-        )],
+        env: env.into_iter().collect(),
     }
 }
 
@@ -489,6 +534,7 @@ mod tests {
                 model: None,
                 sandbox: None,
                 approval_policy: None,
+                sidecar_context: CodexSidecarLaunchContext::default(),
             })
         );
     }
@@ -512,6 +558,7 @@ mod tests {
                 model: None,
                 sandbox: None,
                 approval_policy: None,
+                sidecar_context: CodexSidecarLaunchContext::default(),
             })
         );
     }
@@ -526,6 +573,7 @@ mod tests {
                 model: Some("gpt-5.2-codex"),
                 sandbox: Some("workspace-write"),
                 approval_policy: Some("on-request"),
+                sidecar_context: CodexSidecarLaunchContext::default(),
             }),
             Ok(CodexLaunchPlan {
                 session_id: Some("thread-s".to_string()),
@@ -536,6 +584,7 @@ mod tests {
                 model: Some("gpt-5.2-codex".to_string()),
                 sandbox: Some(CodexSandboxMode::WorkspaceWrite),
                 approval_policy: Some("on-request".to_string()),
+                sidecar_context: CodexSidecarLaunchContext::default(),
             })
         );
     }
@@ -675,7 +724,11 @@ mod tests {
     #[test]
     fn sidecar_spawn_spec_golden() {
         assert_eq!(
-            codex_sidecar_spawn_spec("ws://127.0.0.1:41234", "codex-sidecar-abc"),
+            codex_sidecar_spawn_spec(
+                "ws://127.0.0.1:41234",
+                "codex-sidecar-abc",
+                &CodexSidecarLaunchContext::default(),
+            ),
             CodexSidecarSpawnSpec {
                 args: vec![
                     "-c".to_string(),
@@ -690,6 +743,77 @@ mod tests {
                 )],
             }
         );
+    }
+
+    #[test]
+    fn sidecar_spawn_spec_places_context_before_app_server_and_redacts_values() {
+        let context = CodexSidecarLaunchContext {
+            config_args: vec![
+                "-c".to_string(),
+                "mcp_servers.freshell.command=\"node\"".to_string(),
+                "-c".to_string(),
+                "mcp_servers.freshell.env_vars=[\"FRESHELL_TOKEN\"]".to_string(),
+            ],
+            env: std::collections::BTreeMap::from([
+                (
+                    CODEX_SIDECAR_OWNERSHIP_ENV.to_string(),
+                    "context-must-not-win".to_string(),
+                ),
+                (
+                    "FRESHELL_PANE_ID".to_string(),
+                    "pane-context-test".to_string(),
+                ),
+                ("FRESHELL_TOKEN".to_string(), "not-visible".to_string()),
+            ]),
+        };
+
+        let spec =
+            codex_sidecar_spawn_spec("ws://127.0.0.1:41234", "sidecar-ownership-wins", &context);
+
+        assert_eq!(
+            spec.args,
+            vec![
+                "-c",
+                "features.apps=false",
+                "-c",
+                "mcp_servers.freshell.command=\"node\"",
+                "-c",
+                "mcp_servers.freshell.env_vars=[\"FRESHELL_TOKEN\"]",
+                "app-server",
+                "--listen",
+                "ws://127.0.0.1:41234",
+            ]
+        );
+        assert_eq!(
+            spec.env,
+            vec![
+                (
+                    CODEX_SIDECAR_OWNERSHIP_ENV.to_string(),
+                    "sidecar-ownership-wins".to_string(),
+                ),
+                ("FRESHELL_PANE_ID".to_string(), "pane-context-test".to_string()),
+                ("FRESHELL_TOKEN".to_string(), "not-visible".to_string()),
+            ],
+            "a BTreeMap makes process environment ordering deterministic and the ownership tag wins"
+        );
+
+        let context_debug = format!("{context:?}");
+        let spec_debug = format!("{spec:?}");
+        for rendered in [&context_debug, &spec_debug] {
+            assert!(rendered.contains("FRESHELL_TOKEN"));
+            assert!(rendered.contains(CODEX_SIDECAR_OWNERSHIP_ENV));
+            for value in [
+                "not-visible",
+                "context-must-not-win",
+                "sidecar-ownership-wins",
+                "pane-context-test",
+            ] {
+                assert!(
+                    !rendered.contains(value),
+                    "Debug output must expose environment names, never values"
+                );
+            }
+        }
     }
 
     // ── plan_codex_launch_retry — vectors ported from

@@ -7,6 +7,7 @@ import panesReducer, {
   addPane,
   closePane,
   setActivePane,
+  nudgePaneFocus,
   resizePanes,
   resizeMultipleSplits,
   updatePaneContent,
@@ -912,6 +913,40 @@ describe('panesSlice', () => {
         expect(newPane.content.devToolsOpen).toBe(true)
       }
     })
+
+    it('activate: false keeps the current active pane', () => {
+      let state = panesReducer(
+        initialState,
+        initLayout({ tabId: 'tab-1', content: { kind: 'terminal', mode: 'shell' } })
+      )
+      const originalPaneId = (state.layouts['tab-1'] as Extract<PaneNode, { type: 'leaf' }>).id
+
+      // Pre-zoom the original pane so the split's zoom-clear invariant is pinned
+      // for the activate:false path too (it must be unconditional — it is a
+      // layout invariant, not a focus move).
+      state = panesReducer(state, toggleZoom({ tabId: 'tab-1', paneId: originalPaneId }))
+      expect(state.zoomedPane['tab-1']).toBe(originalPaneId)
+
+      state = panesReducer(
+        state,
+        splitPane({
+          tabId: 'tab-1',
+          paneId: originalPaneId,
+          direction: 'horizontal',
+          newPaneId: 'pane-new',
+          newContent: { kind: 'terminal', mode: 'claude' },
+          activate: false,
+        })
+      )
+
+      const split = state.layouts['tab-1'] as Extract<PaneNode, { type: 'split' }>
+      expect(split.type).toBe('split')
+      expect((split.children[1] as Extract<PaneNode, { type: 'leaf' }>).id).toBe('pane-new')
+      expect(state.activePane['tab-1']).toBe(originalPaneId)
+      // Zoom clear + title bookkeeping stay unconditional (layout invariants, not focus):
+      expect(state.zoomedPane['tab-1']).toBeUndefined()
+      expect(state.paneTitles['tab-1']['pane-new']).toBeDefined()
+    })
   })
 
   describe('swapPanes', () => {
@@ -1350,6 +1385,76 @@ describe('panesSlice', () => {
       )
 
       expect(state.activePane['tab-1']).toBe('some-pane')
+    })
+
+    it('bumps the pane focus epoch ONLY for explicit select folds (focusNudge), including same-target selects', () => {
+      // Pointer-driven activations must not bump: Pane mousedown bubbles from
+      // in-pane inputs (rename, search), and a bump would re-run focus effects
+      // and steal focus back from the element just clicked.
+      let state = panesReducer(initialState, setActivePane({ tabId: 'tab-1', paneId: 'p1' }))
+      expect(state.focusEpochByPaneId?.['p1'] ?? 0).toBe(0)
+      state = panesReducer(state, setActivePane({ tabId: 'tab-1', paneId: 'p1', focusNudge: true }))
+      expect(state.focusEpochByPaneId?.['p1']).toBe(1)
+      // Same-target re-select still bumps: it is the only DOM-focus signal
+      // when no eligibility transition exists (focus-neutral split aftermath).
+      state = panesReducer(state, setActivePane({ tabId: 'tab-1', paneId: 'p1', focusNudge: true }))
+      expect(state.focusEpochByPaneId?.['p1']).toBe(2)
+      state = panesReducer(state, setActivePane({ tabId: 'tab-1', paneId: 'p2' }))
+      expect(state.focusEpochByPaneId?.['p2'] ?? 0).toBe(0)
+      expect(state.focusEpochByPaneId?.['p1']).toBe(2) // p1 untouched
+    })
+
+    it('closePane drops the closed pane\'s focus-epoch entry', () => {
+      let state = panesReducer(
+        initialState,
+        initLayout({ tabId: 'tab-close', paneId: 'p1', content: { kind: 'terminal', mode: 'shell' } })
+      )
+      state = panesReducer(state, splitPane({
+        tabId: 'tab-close',
+        paneId: 'p1',
+        direction: 'horizontal',
+        newContent: { kind: 'terminal', mode: 'shell' },
+      }))
+      const split = state.layouts['tab-close'] as Extract<PaneNode, { type: 'split' }>
+      const newPaneId = (split.children[1] as Extract<PaneNode, { type: 'leaf' }>).id
+      state = panesReducer(state, setActivePane({ tabId: 'tab-close', paneId: newPaneId, focusNudge: true }))
+      expect(state.focusEpochByPaneId?.[newPaneId]).toBe(1)
+      state = panesReducer(state, closePane({ tabId: 'tab-close', paneId: newPaneId }))
+      expect(state.focusEpochByPaneId?.[newPaneId]).toBeUndefined()
+    })
+
+    it('removeLayout drops focus-epoch entries for every removed leaf', () => {
+      let state = panesReducer(
+        initialState,
+        initLayout({ tabId: 'tab-gone', paneId: 'pa', content: { kind: 'terminal', mode: 'shell' } })
+      )
+      state = panesReducer(state, splitPane({
+        tabId: 'tab-gone',
+        paneId: 'pa',
+        direction: 'horizontal',
+        newContent: { kind: 'terminal', mode: 'shell' },
+      }))
+      const split = state.layouts['tab-gone'] as Extract<PaneNode, { type: 'split' }>
+      const pb = (split.children[1] as Extract<PaneNode, { type: 'leaf' }>).id
+      state = panesReducer(state, setActivePane({ tabId: 'tab-gone', paneId: 'pa', focusNudge: true }))
+      state = panesReducer(state, setActivePane({ tabId: 'tab-gone', paneId: pb, focusNudge: true }))
+      expect(state.focusEpochByPaneId?.['pa']).toBeDefined()
+      expect(state.focusEpochByPaneId?.[pb]).toBeDefined()
+      state = panesReducer(state, removeLayout({ tabId: 'tab-gone' }))
+      expect(state.focusEpochByPaneId?.['pa']).toBeUndefined()
+      expect(state.focusEpochByPaneId?.[pb]).toBeUndefined()
+    })
+  })
+
+  describe('nudgePaneFocus', () => {
+    it("bumps the tab's ACTIVE pane epoch (tab.select fold) and no-ops without an active pane", () => {
+      let state = panesReducer(initialState, setActivePane({ tabId: 'tab-1', paneId: 'p1' }))
+      expect(state.focusEpochByPaneId?.['p1'] ?? 0).toBe(0)
+      state = panesReducer(state, nudgePaneFocus({ tabId: 'tab-1' }))
+      expect(state.focusEpochByPaneId?.['p1']).toBe(1)
+      const before = state.focusEpochByPaneId
+      state = panesReducer(state, nudgePaneFocus({ tabId: 'tab-without-active-pane' }))
+      expect(state.focusEpochByPaneId).toBe(before) // untouched map instance
     })
   })
 
@@ -2026,6 +2131,33 @@ describe('panesSlice', () => {
   })
 
   describe('hydratePanes', () => {
+    it('prunes focus-epoch entries for panes dropped by the merged layouts', () => {
+      let state = panesReducer(
+        initialState,
+        initLayout({ tabId: 'tab-x', paneId: 'keep', content: { kind: 'terminal', mode: 'shell' } })
+      )
+      state = panesReducer(state, setActivePane({ tabId: 'tab-x', paneId: 'keep', focusNudge: true }))
+      state = panesReducer(state, setActivePane({ tabId: 'tab-x', paneId: 'remote-gone', focusNudge: true }))
+      expect(state.focusEpochByPaneId?.['keep']).toBe(1)
+      expect(state.focusEpochByPaneId?.['remote-gone']).toBe(1)
+
+      const incoming: PanesState = {
+        layouts: {
+          // Cross-device sync dropped 'remote-gone'; only 'keep' survives.
+          'tab-x': { type: 'leaf', id: 'keep', content: { kind: 'terminal', mode: 'shell' } },
+        },
+        activePane: { 'tab-x': 'keep' },
+        paneTitles: {},
+        paneTitleSetByUser: {},
+        renameRequestTabId: null,
+        renameRequestPaneId: null,
+        zoomedPane: {},
+      }
+      state = panesReducer(state, hydratePanes(incoming))
+      expect(state.focusEpochByPaneId?.['keep']).toBe(1)
+      expect(state.focusEpochByPaneId?.['remote-gone']).toBeUndefined()
+    })
+
     it('restores persisted state', () => {
       const savedState: PanesState = {
         layouts: {

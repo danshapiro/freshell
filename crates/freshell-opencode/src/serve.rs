@@ -327,6 +327,27 @@ impl std::fmt::Display for ServeHttpError {
 
 impl std::error::Error for ServeHttpError {}
 
+/// Render `err` plus every `source()` in its chain, `"; caused by: "`-joined.
+///
+/// A bare `to_string()` drops the diagnostics that pin a failure class:
+/// reqwest's top-level Display is only `"error sending request for url (...)"`
+/// while the TCP-level cause (`"connection reset by peer (os error 104)"`,
+/// `"connection closed before message completed"`) lives in the `source()`
+/// chain. [`ServeHttpError`] strings carry this rendering so WARN logs and
+/// client-visible messages preserve the full cause trail (the 2026-09-11
+/// compact incident's exact gap: the failure trigger was unrecoverable from
+/// the top-level string alone).
+pub fn display_error_chain(err: &(dyn std::error::Error + 'static)) -> String {
+    let mut rendered = err.to_string();
+    let mut source = err.source();
+    while let Some(cause) = source {
+        rendered.push_str("; caused by: ");
+        rendered.push_str(&cause.to_string());
+        source = cause.source();
+    }
+    rendered
+}
+
 /// The HTTP transport seam (`fetchFn`). One request/response round-trip. The
 /// `Err` side is a [`ServeHttpError`]: `Undelivered` ONLY for a provable
 /// connect-phase refusal (never a byte sent), `Ambiguous` for everything else
@@ -1422,6 +1443,76 @@ fn encode_path_segment(segment: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── display_error_chain (transport diagnostics preservation) ─────────────
+
+    /// A two-deep `source()` chain: top → mid → leaf.
+    #[derive(Debug)]
+    struct LeafError;
+
+    impl std::fmt::Display for LeafError {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "leaf cause")
+        }
+    }
+    impl std::error::Error for LeafError {}
+
+    #[derive(Debug)]
+    struct MidError;
+
+    impl std::fmt::Display for MidError {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "mid cause")
+        }
+    }
+    impl std::error::Error for MidError {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+            Some(&LeafError)
+        }
+    }
+
+    #[derive(Debug)]
+    struct TopError;
+
+    impl std::fmt::Display for TopError {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "top message")
+        }
+    }
+    impl std::error::Error for TopError {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+            Some(&MidError)
+        }
+    }
+
+    /// A source-less error renders alone (no trailing separators).
+    #[derive(Debug)]
+    struct BareError;
+
+    impl std::fmt::Display for BareError {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "bare message")
+        }
+    }
+    impl std::error::Error for BareError {}
+
+    #[test]
+    fn display_error_chain_appends_every_source_in_order() {
+        assert_eq!(
+            display_error_chain(&TopError),
+            "top message; caused by: mid cause; caused by: leaf cause",
+            "the whole source chain rides along, innermost last"
+        );
+    }
+
+    #[test]
+    fn display_error_chain_bare_error_renders_top_only() {
+        assert_eq!(
+            display_error_chain(&BareError),
+            "bare message",
+            "a source-less error renders exactly its own Display"
+        );
+    }
 
     #[test]
     fn healthy_response_predicate_matches_reference() {

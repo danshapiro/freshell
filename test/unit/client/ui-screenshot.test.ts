@@ -17,6 +17,7 @@ import settingsReducer, { defaultSettings } from '@/store/settingsSlice'
 import { ContextMenuProvider } from '@/components/context-menu/ContextMenuProvider'
 import { ContextIds } from '@/components/context-menu/context-menu-constants'
 import { captureUiScreenshot } from '../../../src/lib/ui-screenshot'
+import { suspendTerminalRenderersForScreenshot } from '../../../src/lib/screenshot-capture-env'
 
 vi.mock('html2canvas', () => ({
   default: vi.fn(),
@@ -94,13 +95,42 @@ function setRect(node: Element, width: number, height: number) {
   })
 }
 
-function createRuntime() {
+/** The inline `visibility: hidden` chain state (target → body) inside a
+ *  html2canvas clone document, as the real cloner would produce: '' means no
+ *  inline override at all, 'visible' an explicit reveal, 'hidden' untouched
+ *  hidden styling. */
+function cloneChainVisibilities(cloneRoot: HTMLElement): string[] {
+  const doc = cloneRoot.ownerDocument
+  const states: string[] = []
+  for (let el = cloneRoot as HTMLElement | null; el && el !== doc.documentElement; el = el.parentElement) {
+    states.push(el.style.visibility)
+  }
+  return states
+}
+
+/** Standard html2canvas mock: clones the live target into a fresh document,
+ *  hands BOTH to onclone (the real cloner passes the cloned reference element
+ *  as the second argument), and records the clone for assertions. */
+function mockCloneRender(resultBase64 = 'ROOTPNG') {
+  let clonedTarget: HTMLElement | null = null
+  vi.mocked(html2canvas).mockImplementation(async (el: any, opts: any = {}) => {
+    if (typeof opts.onclone !== 'function') {
+      throw new Error('expected the main render to carry onclone')
+    }
+    const cloneDoc = document.implementation.createHTMLDocument('clone')
+    clonedTarget = (el as HTMLElement).cloneNode(true) as HTMLElement
+    cloneDoc.body.appendChild(clonedTarget)
+    opts.onclone(cloneDoc, clonedTarget)
+    return {
+      width: 800,
+      height: 500,
+      toDataURL: () => `data:image/png;base64,${resultBase64}`,
+    } as any
+  })
   return {
-    dispatch: vi.fn(),
-    getState: () => ({
-      tabs: { activeTabId: 'tab-1' },
-      panes: { activePane: {}, layouts: {} },
-    }) as any,
+    get clonedTarget() {
+      return clonedTarget!
+    },
   }
 }
 
@@ -170,13 +200,6 @@ function createMenuStore() {
   })
 }
 
-function createMenuRuntime(store: ReturnType<typeof createMenuStore>) {
-  return {
-    dispatch: store.dispatch,
-    getState: store.getState,
-  }
-}
-
 describe('captureUiScreenshot iframe handling', () => {
   beforeEach(async () => {
     vi.clearAllMocks()
@@ -214,7 +237,7 @@ describe('captureUiScreenshot iframe handling', () => {
         const cloneDoc = document.implementation.createHTMLDocument('clone')
         const cloneTarget = target.cloneNode(true) as HTMLElement
         cloneDoc.body.appendChild(cloneTarget)
-        opts.onclone(cloneDoc)
+        opts.onclone(cloneDoc, cloneTarget)
         clonedHtml = cloneTarget.innerHTML
         return {
           width: 800,
@@ -230,14 +253,13 @@ describe('captureUiScreenshot iframe handling', () => {
       } as any
     })
 
-    const result = await captureUiScreenshot({ scope: 'view' }, createRuntime() as any)
+    const result = await captureUiScreenshot({ scope: 'view' })
 
     expect(result.ok).toBe(true)
     expect(result.imageBase64).toBe('ROOTPNG')
     expect(vi.mocked(html2canvas)).toHaveBeenCalledTimes(2)
     expect(clonedHtml).toContain('data-screenshot-iframe-image="true"')
     expect(clonedHtml).not.toContain('<iframe')
-    expect(iframe.hasAttribute('data-screenshot-iframe-marker')).toBe(false)
   })
 
   it('captures proxy-URL iframe as image content when document is accessible', async () => {
@@ -263,7 +285,7 @@ describe('captureUiScreenshot iframe handling', () => {
         const cloneDoc = document.implementation.createHTMLDocument('clone')
         const cloneTarget = target.cloneNode(true) as HTMLElement
         cloneDoc.body.appendChild(cloneTarget)
-        opts.onclone(cloneDoc)
+        opts.onclone(cloneDoc, cloneTarget)
         clonedHtml = cloneTarget.innerHTML
         return {
           width: 800,
@@ -279,7 +301,7 @@ describe('captureUiScreenshot iframe handling', () => {
       } as any
     })
 
-    const result = await captureUiScreenshot({ scope: 'view' }, createRuntime() as any)
+    const result = await captureUiScreenshot({ scope: 'view' })
 
     expect(result.ok).toBe(true)
     expect(result.imageBase64).toBe('PROXYPNG')
@@ -313,7 +335,7 @@ describe('captureUiScreenshot iframe handling', () => {
       const cloneDoc = document.implementation.createHTMLDocument('clone')
       const cloneTarget = target.cloneNode(true) as HTMLElement
       cloneDoc.body.appendChild(cloneTarget)
-      opts.onclone(cloneDoc)
+      opts.onclone(cloneDoc, cloneTarget)
       clonedHtml = cloneTarget.innerHTML
       return {
         width: 800,
@@ -322,13 +344,12 @@ describe('captureUiScreenshot iframe handling', () => {
       } as any
     })
 
-    const result = await captureUiScreenshot({ scope: 'view' }, createRuntime() as any)
+    const result = await captureUiScreenshot({ scope: 'view' })
 
     expect(result.ok).toBe(true)
     expect(result.imageBase64).toBe('ROOTPNG')
     expect(clonedHtml).toContain('data-screenshot-iframe-placeholder="true"')
     expect(clonedHtml).toContain('blocked.example.com')
-    expect(iframe.hasAttribute('data-screenshot-iframe-marker')).toBe(false)
   })
 
   it('writes a portable PNG artifact for the terminal context menu capture and verifies the captured DOM', async () => {
@@ -373,7 +394,7 @@ describe('captureUiScreenshot iframe handling', () => {
         const doc = document.implementation.createHTMLDocument('clone')
         const cloneRoot = (el as HTMLElement).cloneNode(true) as HTMLElement
         doc.body.appendChild(cloneRoot)
-        opts.onclone(doc)
+        opts.onclone(doc, cloneRoot)
         cloneDoc = doc
       }
 
@@ -394,7 +415,7 @@ describe('captureUiScreenshot iframe handling', () => {
       } as any
     })
 
-    const result = await captureUiScreenshot({ scope: 'view' }, createMenuRuntime(store) as any)
+    const result = await captureUiScreenshot({ scope: 'view' })
     expect(result.ok).toBe(true)
     await fs.writeFile(contextMenuProofPath, Buffer.from(result.imageBase64!, 'base64'))
 
@@ -417,5 +438,380 @@ describe('captureUiScreenshot iframe handling', () => {
     const artifact = await fs.readFile(contextMenuProofPath)
     expect(artifact.length).toBeGreaterThan(8)
     expect(Array.from(artifact.subarray(0, 8))).toEqual([...PNG_SIGNATURE_BYTES])
+  })
+})
+
+describe('captureUiScreenshot off-DOM capture of background tabs', () => {
+  beforeEach(() => {
+    vi.clearAllMocks()
+    document.body.innerHTML = ''
+  })
+
+  it('renders a visibility-hidden background tab through the clone reveal without touching the live DOM', async () => {
+    // .tab-hidden keeps background tabs fully LAID OUT (visibility, not
+    // display) so xterm can measure — which is exactly what lets the capture
+    // render them from a clone without activating the tab. The inline style
+    // stands in for the class rule (same computed visibility).
+    document.body.innerHTML = `
+      <div>
+        <div data-tab-content-id="tab-1" class="tab-visible h-full w-full">Foreground</div>
+        <div data-tab-content-id="tab-2" class="tab-hidden" style="visibility: hidden">
+          <div data-pane-shell="true" data-pane-id="pane-2">Background content</div>
+        </div>
+      </div>
+    `
+    const wrapper = document.querySelector('[data-tab-content-id="tab-2"]') as HTMLElement
+    setRect(wrapper, 800, 500)
+    const liveHtmlBefore = wrapper.outerHTML
+
+    const render = mockCloneRender('BGPNG')
+
+    const result = await captureUiScreenshot({ scope: 'tab', tabId: 'tab-2' })
+
+    expect(result.ok).toBe(true)
+    expect(result.imageBase64).toBe('BGPNG')
+    // Protocol envelope fields stay present (REST /api/screenshots echoes
+    // them) and are honestly false: nothing moved.
+    expect(result.changedFocus).toBe(false)
+    expect(result.restoredFocus).toBe(false)
+    // The render targeted the LIVE hidden wrapper...
+    expect(vi.mocked(html2canvas).mock.calls[0]?.[0]).toBe(wrapper)
+    // ...and revealed the CLONE chain only: every clone ancestor up to body
+    // carries the explicit visibility override.
+    expect(cloneChainVisibilities(render.clonedTarget)).toEqual(['visible', 'visible'])
+    // The live DOM is byte-identical: no selection, focus, style, or
+    // attribute mutation anywhere.
+    expect(wrapper.outerHTML).toBe(liveHtmlBefore)
+  })
+
+  it('reveals every hidden ancestor for a pane in a background tab (pane scope)', async () => {
+    document.body.innerHTML = `
+      <div>
+        <div data-tab-content-id="tab-3" style="visibility: hidden">
+          <div class="terminal-root" style="visibility: hidden">
+            <div data-pane-shell="true" data-pane-id="pane-3">Background pane</div>
+          </div>
+        </div>
+      </div>
+    `
+    const wrapper = document.querySelector('[data-tab-content-id="tab-3"]') as HTMLElement
+    const pane = document.querySelector('[data-pane-id="pane-3"]') as HTMLElement
+    setRect(wrapper, 800, 500)
+    setRect(pane, 800, 500)
+    const liveHtmlBefore = wrapper.outerHTML
+
+    // html2canvas clones the WHOLE document and hands onclone the cloned
+    // reference element with its ancestors intact — mirror that by cloning
+    // the wrapper and locating the cloned pane inside it.
+    let clonedPane: HTMLElement | null = null
+    vi.mocked(html2canvas).mockImplementation(async (el: any, opts: any = {}) => {
+      if (typeof opts.onclone !== 'function') {
+        throw new Error('expected the main render to carry onclone')
+      }
+      const cloneDoc = document.implementation.createHTMLDocument('clone')
+      const cloneWrapper = wrapper.cloneNode(true) as HTMLElement
+      cloneDoc.body.appendChild(cloneWrapper)
+      clonedPane = cloneWrapper.querySelector('[data-pane-id="pane-3"]') as HTMLElement
+      opts.onclone(cloneDoc, clonedPane)
+      return {
+        width: 800,
+        height: 500,
+        toDataURL: () => 'data:image/png;base64,PANE3PNG',
+      } as any
+    })
+
+    const result = await captureUiScreenshot({ scope: 'pane', paneId: 'pane-3' })
+
+    expect(result.ok).toBe(true)
+    expect(result.imageBase64).toBe('PANE3PNG')
+    // Pane shell → terminal root → tab wrapper (→ body): the whole chain that
+    // hides the pane gets the clone-side reveal.
+    expect(cloneChainVisibilities(clonedPane!)).toEqual(['visible', 'visible', 'visible', 'visible'])
+    expect(wrapper.outerHTML).toBe(liveHtmlBefore)
+  })
+
+  it('adds no reveal to an already-visible target (the walk is armed only for hidden chains)', async () => {
+    document.body.innerHTML = `
+      <div>
+        <div data-pane-shell="true" data-pane-id="pane-1">Foreground pane</div>
+      </div>
+    `
+    const pane = document.querySelector('[data-pane-id="pane-1"]') as HTMLElement
+    setRect(pane, 800, 500)
+
+    const render = mockCloneRender('FGPNG')
+
+    const result = await captureUiScreenshot({ scope: 'pane', paneId: 'pane-1' })
+
+    expect(result.ok).toBe(true)
+    // No inline visibility anywhere on the clone chain: a visible target's
+    // onclone is a no-op beyond iframe replacement.
+    expect(cloneChainVisibilities(render.clonedTarget).every((state) => state === '')).toBe(true)
+  })
+
+  it('prepares iframe replacements for panes inside hidden tabs (layout gates, not paint)', async () => {
+    document.body.innerHTML = `
+      <div>
+        <div data-tab-content-id="tab-4" style="visibility: hidden">
+          <div data-pane-shell="true" data-pane-id="pane-4">
+            <iframe id="hidden-frame" src="/api/proxy/http/3000/"></iframe>
+          </div>
+        </div>
+      </div>
+    `
+    const pane = document.querySelector('[data-pane-id="pane-4"]') as HTMLElement
+    const iframe = document.getElementById('hidden-frame') as HTMLIFrameElement
+    setRect(pane, 800, 500)
+    setRect(iframe, 500, 300)
+
+    const iframeDoc = iframe.contentDocument
+    expect(iframeDoc).toBeTruthy()
+    iframeDoc?.open()
+    iframeDoc?.write('<!doctype html><html><body><p>Hidden-tab proxied content</p></body></html>')
+    iframeDoc?.close()
+
+    // Order pin: the suspension must bracket ONLY the main render — terminal
+    // renderers stay active through target resolution and iframe pre-render.
+    const order: string[] = []
+    vi.mocked(suspendTerminalRenderersForScreenshot).mockImplementation(async () => {
+      order.push('suspend')
+      return async () => {
+        order.push('resume')
+      }
+    })
+    let clonedHtml = ''
+    vi.mocked(html2canvas).mockImplementation(async (el: any, opts: any = {}) => {
+      if (typeof opts.onclone === 'function') {
+        order.push('main-render')
+        const cloneDoc = document.implementation.createHTMLDocument('clone')
+        const cloneTarget = (el as HTMLElement).cloneNode(true) as HTMLElement
+        cloneDoc.body.appendChild(cloneTarget)
+        opts.onclone(cloneDoc, cloneTarget)
+        clonedHtml = cloneTarget.innerHTML
+        return {
+          width: 800,
+          height: 500,
+          toDataURL: () => 'data:image/png;base64,HIDDENPNG',
+        } as any
+      }
+      order.push('iframe-render')
+      return {
+        width: 500,
+        height: 300,
+        toDataURL: () => 'data:image/png;base64,IFRAMEHIDDENPNG',
+      } as any
+    })
+
+    const result = await captureUiScreenshot({ scope: 'pane', paneId: 'pane-4' })
+
+    expect(result.ok).toBe(true)
+    // The visibility-hidden iframe still got its content pre-rendered (the
+    // iframe render ran) and swapped in on the clone.
+    expect(vi.mocked(html2canvas)).toHaveBeenCalledTimes(2)
+    expect(clonedHtml).toContain('data-screenshot-iframe-image="true"')
+    expect(clonedHtml).not.toContain('<iframe')
+    // Renderers stay active through pre-render; frozen only for the main render.
+    expect(order).toEqual(['iframe-render', 'suspend', 'main-render', 'resume'])
+  })
+
+  it('applies no iframe replacements when the pane tree changed between preparation and clone', async () => {
+    document.body.innerHTML = `
+      <div data-context="global">
+        <iframe id="stable-frame" src="/api/proxy/http/3000/"></iframe>
+      </div>
+    `
+    const target = document.querySelector('[data-context="global"]') as HTMLElement
+    const iframe = document.getElementById('stable-frame') as HTMLIFrameElement
+    setRect(target, 800, 500)
+    setRect(iframe, 500, 300)
+
+    const iframeDoc = iframe.contentDocument
+    expect(iframeDoc).toBeTruthy()
+    iframeDoc?.open()
+    iframeDoc?.write('<!doctype html><html><body><p>Content</p></body></html>')
+    iframeDoc?.close()
+
+    let clonedHtml = ''
+    vi.mocked(html2canvas).mockImplementation(async (el: any, opts: any = {}) => {
+      if (typeof opts.onclone === 'function') {
+        const cloneDoc = document.implementation.createHTMLDocument('clone')
+        const cloneTarget = (el as HTMLElement).cloneNode(true) as HTMLElement
+        // A concurrent split landed between preparation and clone: the tree
+        // now hosts a second iframe, so index correlation is untrustworthy.
+        cloneTarget.appendChild(cloneTarget.ownerDocument.createElement('iframe'))
+        cloneDoc.body.appendChild(cloneTarget)
+        opts.onclone(cloneDoc, cloneTarget)
+        clonedHtml = cloneTarget.innerHTML
+        return {
+          width: 800,
+          height: 500,
+          toDataURL: () => 'data:image/png;base64,ROOTPNG',
+        } as any
+      }
+      return {
+        width: 500,
+        height: 300,
+        toDataURL: () => 'data:image/png;base64,IFRAMEPNG',
+      } as any
+    })
+
+    const result = await captureUiScreenshot({ scope: 'view' })
+
+    expect(result.ok).toBe(true)
+    // Replacement skipped entirely: the clone keeps its iframes rather than
+    // risking an image landing on the wrong one.
+    expect(clonedHtml).toContain('<iframe')
+    expect(clonedHtml).not.toContain('data-screenshot-iframe-image')
+  })
+
+  it('applies no iframe replacements when the iframe srcs no longer match the prepared list', async () => {
+    document.body.innerHTML = `
+      <div data-context="global">
+        <iframe id="orig-frame" src="/api/proxy/http/3000/"></iframe>
+      </div>
+    `
+    const target = document.querySelector('[data-context="global"]') as HTMLElement
+    const iframe = document.getElementById('orig-frame') as HTMLIFrameElement
+    setRect(target, 800, 500)
+    setRect(iframe, 500, 300)
+
+    const iframeDoc = iframe.contentDocument
+    expect(iframeDoc).toBeTruthy()
+    iframeDoc?.open()
+    iframeDoc?.write('<!doctype html><html><body><p>Content</p></body></html>')
+    iframeDoc?.close()
+
+    let clonedHtml = ''
+    vi.mocked(html2canvas).mockImplementation(async (el: any, opts: any = {}) => {
+      if (typeof opts.onclone === 'function') {
+        const cloneDoc = document.implementation.createHTMLDocument('clone')
+        const cloneTarget = (el as HTMLElement).cloneNode(true) as HTMLElement
+        // Same iframe count, different page: the prepared replacement belongs
+        // to a different element now.
+        cloneTarget.querySelector('iframe')?.setAttribute('src', '/api/proxy/http/9999/')
+        cloneDoc.body.appendChild(cloneTarget)
+        opts.onclone(cloneDoc, cloneTarget)
+        clonedHtml = cloneTarget.innerHTML
+        return {
+          width: 800,
+          height: 500,
+          toDataURL: () => 'data:image/png;base64,ROOTPNG',
+        } as any
+      }
+      return {
+        width: 500,
+        height: 300,
+        toDataURL: () => 'data:image/png;base64,IFRAMEPNG',
+      } as any
+    })
+
+    const result = await captureUiScreenshot({ scope: 'view' })
+
+    expect(result.ok).toBe(true)
+    expect(clonedHtml).toContain('<iframe')
+    expect(clonedHtml).not.toContain('data-screenshot-iframe-image')
+  })
+
+  it('applies no iframe replacements when a same-src iframe now lives in a different pane (pane-id fingerprint)', async () => {
+    document.body.innerHTML = `
+      <div data-context="global">
+        <div data-pane-id="pane-x">
+          <iframe id="same-src-frame" src="/api/proxy/http/3000/"></iframe>
+        </div>
+      </div>
+    `
+    const target = document.querySelector('[data-context="global"]') as HTMLElement
+    const iframe = document.getElementById('same-src-frame') as HTMLIFrameElement
+    setRect(target, 800, 500)
+    setRect(iframe, 500, 300)
+
+    const iframeDoc = iframe.contentDocument
+    expect(iframeDoc).toBeTruthy()
+    iframeDoc?.open()
+    iframeDoc?.write('<!doctype html><html><body><p>Content</p></body></html>')
+    iframeDoc?.close()
+
+    let clonedHtml = ''
+    vi.mocked(html2canvas).mockImplementation(async (el: any, opts: any = {}) => {
+      if (typeof opts.onclone === 'function') {
+        const cloneDoc = document.implementation.createHTMLDocument('clone')
+        const cloneTarget = (el as HTMLElement).cloneNode(true) as HTMLElement
+        // Same count, same src — but the tree changed between preparation and
+        // clone and the iframe now belongs to a different pane: index+src
+        // alone could not tell, the owning-pane fingerprint can.
+        cloneTarget
+          .querySelector('[data-pane-id]')
+          ?.setAttribute('data-pane-id', 'pane-swapped-in')
+        cloneDoc.body.appendChild(cloneTarget)
+        opts.onclone(cloneDoc, cloneTarget)
+        clonedHtml = cloneTarget.innerHTML
+        return {
+          width: 800,
+          height: 500,
+          toDataURL: () => 'data:image/png;base64,ROOTPNG',
+        } as any
+      }
+      return {
+        width: 500,
+        height: 300,
+        toDataURL: () => 'data:image/png;base64,IFRAMEPNG',
+      } as any
+    })
+
+    const result = await captureUiScreenshot({ scope: 'view' })
+
+    expect(result.ok).toBe(true)
+    expect(clonedHtml).toContain('<iframe')
+    expect(clonedHtml).not.toContain('data-screenshot-iframe-image')
+  })
+
+  it('fails honestly when the capture target never appears', async () => {
+    vi.useFakeTimers({ toFake: ['Date', 'setTimeout'] })
+    try {
+      const suspends: number[] = []
+      const resumes: number[] = []
+      vi.mocked(suspendTerminalRenderersForScreenshot).mockImplementation(async () => {
+        suspends.push(Date.now())
+        return async () => {
+          resumes.push(Date.now())
+        }
+      })
+
+      const pending = captureUiScreenshot({ scope: 'tab', tabId: 'tab-missing' })
+      await vi.advanceTimersByTimeAsync(1700)
+      const result = await pending
+
+      expect(result.ok).toBe(false)
+      expect(result.error).toBe('capture target not found')
+      expect(result.changedFocus).toBe(false)
+      // A never-found target suspends nothing at all — the renderer
+      // suspension starts only around the main render, after resolution.
+      expect(suspends).toHaveLength(0)
+      expect(resumes).toHaveLength(0)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('resumes terminal renderers when the render fails', async () => {
+    document.body.innerHTML = `
+      <div data-pane-shell="true" data-pane-id="pane-err">Err</div>
+    `
+    const pane = document.querySelector('[data-pane-id="pane-err"]') as HTMLElement
+    setRect(pane, 800, 500)
+
+    const resumes: number[] = []
+    vi.mocked(suspendTerminalRenderersForScreenshot).mockImplementation(async () => async () => {
+      resumes.push(Date.now())
+    })
+    vi.mocked(html2canvas).mockImplementation(async () => {
+      throw new Error('renderer exploded')
+    })
+
+    const result = await captureUiScreenshot({ scope: 'pane', paneId: 'pane-err' })
+
+    expect(result.ok).toBe(false)
+    expect(result.error).toBe('renderer exploded')
+    expect(resumes).toHaveLength(1)
   })
 })

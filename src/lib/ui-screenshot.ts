@@ -1,13 +1,8 @@
 import html2canvas from 'html2canvas'
-import { setActivePane } from '@/store/panesSlice'
-import { setActiveTab } from '@/store/tabsSlice'
 import { suspendTerminalRenderersForScreenshot } from '@/lib/screenshot-capture-env'
-import type { PaneNode } from '@/store/paneTypes'
-import type { AppDispatch, RootState } from '@/store/store'
 
-const VISIBLE_WAIT_TIMEOUT_MS = 1500
-const VISIBLE_WAIT_INTERVAL_MS = 50
-const IFRAME_MARKER_ATTR = 'data-screenshot-iframe-marker'
+const ELEMENT_WAIT_TIMEOUT_MS = 1500
+const ELEMENT_WAIT_INTERVAL_MS = 50
 const IFRAME_IMAGE_ATTR = 'data-screenshot-iframe-image'
 const IFRAME_PLACEHOLDER_ATTR = 'data-screenshot-iframe-placeholder'
 
@@ -25,19 +20,12 @@ export type ScreenshotResult = {
   imageBase64?: string
   width?: number
   height?: number
+  /** Always false: captures render through an off-DOM clone and never move
+   *  the user's selection or focus. The fields stay for wire/REST envelope
+   *  compatibility (POST /api/screenshots echoes both). */
   changedFocus: boolean
   restoredFocus: boolean
   error?: string
-}
-
-type RuntimeContext = {
-  dispatch: AppDispatch
-  getState: () => RootState
-}
-
-type FocusSnapshot = {
-  activeTabId: string | null
-  activePaneByTab: Record<string, string>
 }
 
 type IframeReplacement =
@@ -45,43 +33,11 @@ type IframeReplacement =
   | { kind: 'placeholder'; message: string; src: string }
 
 type PreparedIframeCapture = {
-  onclone: (doc: Document) => void
-  cleanup: () => void
+  onclone: (doc: Document, clonedTarget: HTMLElement) => void
 }
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms))
-}
-
-function afterPaint(): Promise<void> {
-  return new Promise((resolve) => {
-    requestAnimationFrame(() => requestAnimationFrame(() => resolve()))
-  })
-}
-
-function snapshotFocus(state: RootState): FocusSnapshot {
-  return {
-    activeTabId: state.tabs.activeTabId,
-    activePaneByTab: { ...state.panes.activePane },
-  }
-}
-
-function isElementVisible(element: HTMLElement): boolean {
-  if (!element.isConnected) return false
-  const style = window.getComputedStyle(element)
-  if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') return false
-  const rect = element.getBoundingClientRect()
-  return rect.width >= 2 && rect.height >= 2
-}
-
-async function waitForVisibleElement(getElement: () => HTMLElement | null, timeoutMs = VISIBLE_WAIT_TIMEOUT_MS): Promise<HTMLElement | null> {
-  const startedAt = Date.now()
-  while (Date.now() - startedAt < timeoutMs) {
-    const candidate = getElement()
-    if (candidate && isElementVisible(candidate)) return candidate
-    await sleep(VISIBLE_WAIT_INTERVAL_MS)
-  }
-  return null
 }
 
 function escapeSelectorValue(value: string): string {
@@ -212,57 +168,6 @@ function buildIframeReplacementElement(
   return container
 }
 
-async function prepareIframeCapture(target: HTMLElement, scale: number): Promise<PreparedIframeCapture> {
-  const iframes = Array.from(target.querySelectorAll('iframe'))
-  if (iframes.length === 0) {
-    return {
-      onclone: () => {},
-      cleanup: () => {},
-    }
-  }
-
-  const markedIframes = new Map<string, HTMLIFrameElement>()
-  const previousMarkers = new Map<HTMLIFrameElement, string | null>()
-  const replacements = new Map<string, IframeReplacement>()
-  const markerPrefix = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`
-
-  for (let i = 0; i < iframes.length; i += 1) {
-    const iframe = iframes[i]
-    const marker = `shot-iframe-${markerPrefix}-${i}`
-    previousMarkers.set(iframe, iframe.getAttribute(IFRAME_MARKER_ATTR))
-    iframe.setAttribute(IFRAME_MARKER_ATTR, marker)
-    markedIframes.set(marker, iframe)
-  }
-
-  for (const [marker, iframe] of markedIframes) {
-    if (!isElementVisible(iframe)) continue
-    replacements.set(marker, await captureIframeReplacement(iframe, scale))
-  }
-
-  return {
-    onclone: (doc: Document) => {
-      const cloneIframes = Array.from(doc.querySelectorAll(`iframe[${IFRAME_MARKER_ATTR}]`))
-      for (const candidate of cloneIframes) {
-        const cloneIframe = candidate as HTMLIFrameElement
-        const marker = cloneIframe.getAttribute(IFRAME_MARKER_ATTR)
-        if (!marker) continue
-        const replacement = replacements.get(marker)
-        if (!replacement) continue
-        cloneIframe.replaceWith(buildIframeReplacementElement(doc, cloneIframe, replacement))
-      }
-    },
-    cleanup: () => {
-      for (const [iframe, previous] of previousMarkers) {
-        if (previous === null) {
-          iframe.removeAttribute(IFRAME_MARKER_ATTR)
-        } else {
-          iframe.setAttribute(IFRAME_MARKER_ATTR, previous)
-        }
-      }
-    },
-  }
-}
-
 function findPaneElement(paneId: string): HTMLElement | null {
   const escaped = escapeSelectorValue(paneId)
   return document.querySelector(`[data-pane-shell="true"][data-pane-id="${escaped}"]`) as HTMLElement | null
@@ -277,139 +182,179 @@ function findViewElement(): HTMLElement | null {
   return (document.querySelector('[data-context="global"]') as HTMLElement | null) || document.body
 }
 
-function nodeContainsPane(node: PaneNode | undefined, paneId: string): boolean {
-  if (!node) return false
-  if (node.type === 'leaf') return node.id === paneId
-  return nodeContainsPane(node.children[0], paneId) || nodeContainsPane(node.children[1], paneId)
+/** Background tabs stay fully LAID OUT while hidden — `.tab-hidden` is
+ *  `visibility: hidden` (not `display: none`) precisely so xterm can keep
+ *  measuring — which is what lets a capture render them without activating
+ *  the tab: html2canvas parses the target's bounds and paints from its CLONE
+ *  of the document, and skips visibility-hidden subtrees while painting. */
+function hasLayout(element: HTMLElement): boolean {
+  if (!element.isConnected) return false
+  const rect = element.getBoundingClientRect()
+  return rect.width >= 1 && rect.height >= 1
 }
 
-function findTabIdForPane(state: RootState, paneId: string): string | undefined {
-  for (const [tabId, root] of Object.entries(state.panes.layouts)) {
-    if (nodeContainsPane(root, paneId)) return tabId
+async function waitForLaidOutElement(
+  getElement: () => HTMLElement | null,
+  timeoutMs = ELEMENT_WAIT_TIMEOUT_MS,
+): Promise<HTMLElement | null> {
+  const startedAt = Date.now()
+  while (Date.now() - startedAt < timeoutMs) {
+    const candidate = getElement()
+    if (candidate && hasLayout(candidate)) return candidate
+    await sleep(ELEMENT_WAIT_INTERVAL_MS)
   }
-  return undefined
+  return null
 }
 
-async function restoreFocus(ctx: RuntimeContext, before: FocusSnapshot, paneTabsToRestore: Set<string>): Promise<boolean> {
-  try {
-    for (const tabId of paneTabsToRestore) {
-      const originalPaneId = before.activePaneByTab[tabId]
-      if (!originalPaneId) continue
-      if (ctx.getState().panes.activePane[tabId] !== originalPaneId) {
-        ctx.dispatch(setActivePane({ tabId, paneId: originalPaneId }))
+function isHiddenFromPaint(el: HTMLElement): boolean {
+  const view = el.ownerDocument.defaultView
+  if (!view) return false
+  const visibility = view.getComputedStyle(el).visibility
+  return visibility === 'hidden' || visibility === 'collapse'
+}
+
+/** Whether any ancestor of the LIVE target (target included, up to body) is
+ *  hidden from paint — i.e. the target sits in a background tab and the clone
+ *  reveal must be armed for it. Computed on the live DOM where the window's
+ *  real stylesheet resolution is available. */
+function chainHiddenFromPaint(target: HTMLElement): boolean {
+  for (let el = target as HTMLElement | null; el && el !== el.ownerDocument.documentElement; el = el.parentElement) {
+    if (isHiddenFromPaint(el)) return true
+  }
+  return false
+}
+
+/** Clone-side reveal: an inline `visibility: visible` on every ancestor of
+ *  the cloned target (up to body) beats the `.tab-hidden` class rule, making
+ *  the background tab paintable inside html2canvas's clone. Only the clone
+ *  changes — the live DOM, the user's selection, and DOM focus never move,
+ *  which is the whole point: a screenshot must never steal the user's tab. */
+function revealClonedTargetChain(clonedTarget: HTMLElement): void {
+  for (
+    let el = clonedTarget as HTMLElement | null;
+    el && el !== el.ownerDocument.documentElement;
+    el = el.parentElement
+  ) {
+    el.style.visibility = 'visible'
+  }
+}
+
+/** html2canvas cannot paint (or reliably clone) iframe content inside the
+ *  main render, so each iframe's document is pre-rendered separately and the
+ *  clone swaps the iframe for the resulting image (or an explicit
+ *  placeholder when the document is inaccessible, e.g. cross-origin).
+ *
+ *  Clone-side correlation: the replacement list is built from the LIVE
+ *  target's iframes in document order, and applied to the CLONED target's
+ *  iframes in document order. The two lists are verified to still describe
+ *  the same tree at clone time — same count AND same per-index fingerprint
+ *  (owning pane id + src) — because the pane tree can change between
+ *  preparation and clone (a concurrent split), and a mismatch applies NO
+ *  replacements rather than risk an image landing on the wrong iframe. The
+ *  pane id disambiguates same-URL iframes (each browser/extension pane hosts
+ *  exactly one). No marker attributes are stamped on the live DOM at all. */
+async function prepareIframeCapture(target: HTMLElement, scale: number): Promise<PreparedIframeCapture> {
+  const iframes = Array.from(target.querySelectorAll('iframe'))
+  if (iframes.length === 0) {
+    return { onclone: () => {} }
+  }
+
+  const originalFingerprints = iframes.map((iframe) => iframeFingerprint(iframe))
+  const replacements: (IframeReplacement | null)[] = []
+  for (const iframe of iframes) {
+    // Layout-gated, not paint-gated: a background tab's iframe is
+    // visibility-hidden yet fully laid out, and its same-origin document is
+    // readable regardless of CSS visibility.
+    replacements.push(hasLayout(iframe) ? await captureIframeReplacement(iframe, scale) : null)
+  }
+
+  return {
+    onclone: (doc, clonedTarget) => {
+      const cloneIframes = Array.from(clonedTarget.querySelectorAll('iframe'))
+      if (cloneIframes.length !== iframes.length) return
+      for (let i = 0; i < cloneIframes.length; i += 1) {
+        if (iframeFingerprint(cloneIframes[i]) !== originalFingerprints[i]) return
       }
-    }
-
-    if (before.activeTabId && ctx.getState().tabs.activeTabId !== before.activeTabId) {
-      ctx.dispatch(setActiveTab(before.activeTabId))
-    }
-
-    await afterPaint()
-
-    const after = ctx.getState()
-    if (before.activeTabId && after.tabs.activeTabId !== before.activeTabId) return false
-    for (const tabId of paneTabsToRestore) {
-      const originalPaneId = before.activePaneByTab[tabId]
-      if (!originalPaneId) continue
-      if (after.panes.activePane[tabId] !== originalPaneId) return false
-    }
-    return true
-  } catch {
-    return false
-  }
-}
-
-export async function captureUiScreenshot(request: ScreenshotRequest, ctx: RuntimeContext): Promise<ScreenshotResult> {
-  const focusBefore = snapshotFocus(ctx.getState())
-  const paneTabsToRestore = new Set<string>()
-  let changedFocus = false
-  let restoredFocus = false
-
-  const setActiveTabIfNeeded = async (tabId: string) => {
-    if (ctx.getState().tabs.activeTabId === tabId) return
-    ctx.dispatch(setActiveTab(tabId))
-    changedFocus = true
-    await afterPaint()
-  }
-
-  const setActivePaneIfNeeded = async (tabId: string, paneId: string) => {
-    if (ctx.getState().panes.activePane[tabId] === paneId) return
-    ctx.dispatch(setActivePane({ tabId, paneId }))
-    paneTabsToRestore.add(tabId)
-    changedFocus = true
-    await afterPaint()
-  }
-
-  let result: Omit<ScreenshotResult, 'changedFocus' | 'restoredFocus'>
-  const restoreRenderers = await suspendTerminalRenderersForScreenshot()
-  try {
-    let target: HTMLElement | null = null
-
-    if (request.scope === 'view') {
-      target = findViewElement()
-    } else if (request.scope === 'tab') {
-      const tabId = request.tabId
-      if (!tabId) throw new Error('tabId required for tab scope')
-
-      target = findTabElement(tabId)
-      if (!target || !isElementVisible(target)) {
-        await setActiveTabIfNeeded(tabId)
-        target = await waitForVisibleElement(() => findTabElement(tabId))
-      }
-    } else {
-      const paneId = request.paneId
-      if (!paneId) throw new Error('paneId required for pane scope')
-
-      target = findPaneElement(paneId)
-      if (!target || !isElementVisible(target)) {
-        const targetTabId = request.tabId || findTabIdForPane(ctx.getState(), paneId)
-        if (!targetTabId) throw new Error('pane tab not found')
-
-        await setActiveTabIfNeeded(targetTabId)
-        target = findPaneElement(paneId)
-
-        if (!target || !isElementVisible(target)) {
-          await setActivePaneIfNeeded(targetTabId, paneId)
-          target = await waitForVisibleElement(() => findPaneElement(paneId))
+      for (let i = 0; i < cloneIframes.length; i += 1) {
+        const replacement = replacements[i]
+        if (replacement) {
+          cloneIframes[i].replaceWith(buildIframeReplacementElement(doc, cloneIframes[i], replacement))
         }
       }
-    }
+    },
+  }
+}
 
+/** Stable iframe identity across the live DOM and its html2canvas clone: the
+ *  owning pane's id (unique; empty when the iframe sits outside pane shells,
+ *  e.g. app-level chrome in view scope) plus the raw src attribute. */
+function iframeFingerprint(iframe: HTMLIFrameElement): string {
+  const paneId = iframe.closest('[data-pane-id]')?.getAttribute('data-pane-id') ?? ''
+  return `${paneId}\u0000${iframe.getAttribute('src') ?? ''}`
+}
+
+async function resolveCaptureTarget(request: ScreenshotRequest): Promise<HTMLElement> {
+  if (request.scope === 'view') {
+    const target = findViewElement()
     if (!target) throw new Error('capture target not found')
-    if (!isElementVisible(target)) {
-      const visibleTarget = await waitForVisibleElement(() => target)
-      if (!visibleTarget) throw new Error('capture target is not visible')
-      target = visibleTarget
-    }
+    return target
+  }
+  if (request.scope === 'tab') {
+    if (!request.tabId) throw new Error('tabId required for tab scope')
+    const target = await waitForLaidOutElement(() => findTabElement(request.tabId!))
+    if (!target) throw new Error('capture target not found')
+    return target
+  }
+  if (!request.paneId) throw new Error('paneId required for pane scope')
+  const target = await waitForLaidOutElement(() => findPaneElement(request.paneId!))
+  if (!target) throw new Error('capture target not found')
+  return target
+}
 
+export async function captureUiScreenshot(request: ScreenshotRequest): Promise<ScreenshotResult> {
+  let result: Omit<ScreenshotResult, 'changedFocus' | 'restoredFocus'>
+  try {
+    const target = await resolveCaptureTarget(request)
     const scale = Math.max(1, window.devicePixelRatio || 1)
+    // Armed live-side: only a target with a hidden ancestor chain (a
+    // background tab) needs the clone reveal; visible targets skip it.
+    const needsReveal = chainHiddenFromPaint(target)
+    // Iframe pre-render needs no frozen renderers (it renders nested documents,
+    // not terminal canvases), so the suspension starts as late as possible —
+    // exactly around the main render, the only step that reads the WebGL
+    // canvases — and a never-found target suspends nothing at all.
     const preparedIframes = await prepareIframeCapture(target, scale)
-    let canvas: HTMLCanvasElement
+    // Web canvases (xterm's WebGL renderer) are only reliably readable around
+    // a fresh synchronous render — the refcounted suspension forces one and
+    // freezes the renderers while html2canvas copies each canvas into its
+    // clone. Balanced in `finally`, including every failure path.
+    const restoreRenderers = await suspendTerminalRenderersForScreenshot()
     try {
-      canvas = await html2canvas(target, {
+      const canvas = await html2canvas(target, {
         backgroundColor: null,
         allowTaint: true,
         useCORS: true,
         logging: false,
         scale,
-        onclone: (doc) => {
-          preparedIframes.onclone(doc)
+        onclone: (doc, clonedTarget) => {
+          if (needsReveal) revealClonedTargetChain(clonedTarget)
+          preparedIframes.onclone(doc, clonedTarget)
         },
       })
+
+      const dataUrl = canvas.toDataURL('image/png')
+      const prefix = 'data:image/png;base64,'
+      if (!dataUrl.startsWith(prefix)) throw new Error('failed to encode png screenshot')
+
+      result = {
+        ok: true,
+        mimeType: 'image/png',
+        imageBase64: dataUrl.slice(prefix.length),
+        width: canvas.width,
+        height: canvas.height,
+      }
     } finally {
-      preparedIframes.cleanup()
-    }
-
-    const dataUrl = canvas.toDataURL('image/png')
-    const prefix = 'data:image/png;base64,'
-    if (!dataUrl.startsWith(prefix)) throw new Error('failed to encode png screenshot')
-
-    result = {
-      ok: true,
-      mimeType: 'image/png',
-      imageBase64: dataUrl.slice(prefix.length),
-      width: canvas.width,
-      height: canvas.height,
+      await restoreRenderers()
     }
   } catch (err: any) {
     result = {
@@ -418,15 +363,9 @@ export async function captureUiScreenshot(request: ScreenshotRequest, ctx: Runti
     }
   }
 
-  await restoreRenderers()
-
-  if (changedFocus) {
-    restoredFocus = await restoreFocus(ctx, focusBefore, paneTabsToRestore)
-  }
-
   return {
     ...result,
-    changedFocus,
-    restoredFocus,
+    changedFocus: false,
+    restoredFocus: false,
   }
 }

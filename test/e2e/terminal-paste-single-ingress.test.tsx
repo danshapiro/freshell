@@ -268,7 +268,7 @@ describe('terminal paste single-ingress (e2e)', () => {
     })
   })
 
-  it('sends plain Escape once as terminal input', async () => {
+  it('sends plain Escape once as terminal input via onData', async () => {
     const store = createStore()
     const paneContent: TerminalPaneContent = {
       kind: 'terminal',
@@ -289,10 +289,13 @@ describe('terminal paste single-ingress (e2e)', () => {
     await waitFor(() => {
       expect(keyHandler).not.toBeNull()
     })
+    await waitFor(() => {
+      expect(onDataCb).not.toBeNull()
+    })
 
     wsMocks.send.mockClear()
     const preventDefault = vi.fn()
-    const blocked = keyHandler!({
+    const passed = keyHandler!({
       key: 'Escape',
       code: 'Escape',
       ctrlKey: false,
@@ -304,8 +307,12 @@ describe('terminal paste single-ingress (e2e)', () => {
       preventDefault,
     } as unknown as KeyboardEvent)
 
-    expect(blocked).toBe(false)
-    expect(preventDefault).toHaveBeenCalled()
+    expect(passed).toBe(true)
+    expect(preventDefault).not.toHaveBeenCalled()
+    expect(wsMocks.send).not.toHaveBeenCalled()
+
+    onDataCb!('\x1b')
+
     expect(wsMocks.send).toHaveBeenCalledTimes(1)
     expect(wsMocks.send).toHaveBeenCalledWith({
       type: 'terminal.input',

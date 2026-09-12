@@ -43,6 +43,7 @@ import { useOrientation } from '@/hooks/useOrientation'
 import { useFullscreen } from '@/hooks/useFullscreen'
 import { useElectronExternalLinks } from '@/hooks/useElectronExternalLinks'
 import { useTurnCompletionNotifications } from '@/hooks/useTurnCompletionNotifications'
+import { useFocusStealGuard } from '@/hooks/useFocusStealGuard'
 import { useStreamDeck } from '@/hooks/useStreamDeck'
 import { useDrag } from '@use-gesture/react'
 import { installCrossTabSync } from '@/store/crossTabSync'
@@ -184,6 +185,7 @@ export default function App() {
   useThemeEffect()
   useTurnCompletionNotifications()
   useElectronExternalLinks()
+  useFocusStealGuard()
   useStreamDeck()
 
   const dispatch = useAppDispatch()

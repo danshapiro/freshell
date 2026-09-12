@@ -18,7 +18,7 @@ Object.defineProperty(globalThis, 'localStorage', { value: localStorageMock, wri
 
 // Now import slices - they'll see our mocked localStorage
 import tabsReducer, { hydrateTabs, addTab } from '../../../../src/store/tabsSlice'
-import panesReducer, { hydratePanes, initLayout, requestPaneRefresh, splitPane } from '../../../../src/store/panesSlice'
+import panesReducer, { hydratePanes, initLayout, requestPaneRefresh, splitPane, setActivePane } from '../../../../src/store/panesSlice'
 import {
   loadPersistedPanes,
   loadPersistedTabs,
@@ -329,6 +329,27 @@ describe('Panes Persistence Integration', () => {
     expect(loaded!.activePane['tab-1']).toBeUndefined()
     expect(loaded!.paneTitles['tab-1']).toBeUndefined()
     expect(loaded!.paneTitleSetByUser['tab-1']).toBeUndefined()
+  })
+
+  it('does not persist focusEpochByPaneId (ephemeral select-session signal)', () => {
+    const store = configureStore({
+      reducer: {
+        tabs: tabsReducer,
+        panes: panesReducer,
+      },
+      middleware: (getDefault) => getDefault().concat(persistMiddleware as any),
+    })
+
+    store.dispatch(addTab({ mode: 'shell' }))
+    const tabId = store.getState().tabs.tabs[0].id
+    const paneId = store.getState().panes.activePane[tabId]
+    store.dispatch(setActivePane({ tabId, paneId, focusNudge: true }))
+    expect(store.getState().panes.focusEpochByPaneId?.[paneId]).toBe(1)
+
+    vi.runAllTimers()
+
+    const saved = JSON.parse(localStorage.getItem('freshell.layout.v3')!)
+    expect(saved.panes.focusEpochByPaneId).toBeUndefined()
   })
 
   it('does not persist refreshRequestsByPane', () => {

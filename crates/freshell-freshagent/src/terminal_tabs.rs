@@ -40,10 +40,12 @@ use serde_json::{json, Value};
 use uuid::Uuid;
 
 use freshell_platform::detect::{host_os_live, is_windows, is_wsl_env_live, HostOs};
-use freshell_platform::mcp_inject::{cleanup_mcp_config, generate_mcp_injection, RealMcpRuntime};
+use freshell_platform::mcp_inject::{
+    build_managed_codex_mcp_renderings, cleanup_mcp_config, generate_mcp_injection, RealMcpRuntime,
+};
 use freshell_platform::spawn::{
     cli_provider_target, resolve_coding_cli_command, resolve_mcp_cwd, resolve_shell,
-    resolve_unix_shell_cwd, CliLaunchInputs, LaunchIntent,
+    resolve_unix_shell_cwd, CliLaunchInputs, LaunchIntent, McpInjection,
 };
 use freshell_platform::{
     build_cli_spawn_spec, build_spawn_spec, build_windows_cli_spawn_spec, CliLaunch, Env, RealEnv,
@@ -382,6 +384,53 @@ fn build_terminal_base_env(
         out.insert("FRESHELL_PANE_ID".to_string(), p.to_string());
     }
     out
+}
+
+/// One value-safe managed Codex rendering for this terminal tab's TUI and a
+/// newly spawned app-server. It intentionally does not implement `Debug` so
+/// terminal context values cannot reach log or error surfaces.
+struct CodexManagedLaunchSetup {
+    terminal_id: String,
+    runtime_cwd: Option<String>,
+    tui_mcp_injection: McpInjection,
+    terminal_env: BTreeMap<String, String>,
+    sidecar_context: freshell_codex::launch_plan::CodexSidecarLaunchContext,
+}
+
+/// Construct the managed pair once. The app-server receives the host-native
+/// rendering plus the terminal's canonical environment; the TUI receives its
+/// selected target rendering. A claimed survivor is selected below without
+/// consuming or rewriting this spawn-only setup.
+fn build_codex_managed_launch_setup(
+    terminal_id: String,
+    shell: ShellType,
+    host_os: HostOs,
+    is_wsl: bool,
+    resolved_cwd: Option<&str>,
+    tab_id: Option<&str>,
+    pane_id: Option<&str>,
+) -> Result<CodexManagedLaunchSetup, String> {
+    let runtime_cwd = resolve_mcp_cwd(resolved_cwd, &RealEnv, host_os, is_wsl);
+    let tui_target = cli_provider_target(shell, host_os, is_wsl, resolved_cwd, &RealEnv);
+    let renderings =
+        build_managed_codex_mcp_renderings(&RealMcpRuntime, &RealEnv, host_os, is_wsl, tui_target)
+            .map_err(|error| error.message)?;
+    let freshell_platform::mcp_inject::ManagedCodexMcpRenderings { tui, sidecar } = renderings;
+    let terminal_env = build_terminal_base_env(&RealEnv, &terminal_id, tab_id, pane_id);
+    let mut sidecar_env = sidecar.env;
+    // Canonical terminal values own any overlap with a future renderer.
+    sidecar_env.extend(terminal_env.clone());
+
+    Ok(CodexManagedLaunchSetup {
+        terminal_id,
+        runtime_cwd,
+        tui_mcp_injection: tui,
+        terminal_env,
+        sidecar_context: freshell_codex::launch_plan::CodexSidecarLaunchContext {
+            config_args: sidecar.args,
+            env: sidecar_env,
+        },
+    })
 }
 
 /// JS `String(Number(s))` for the `PORT` template slot (mirrored from
@@ -1492,17 +1541,23 @@ async fn settle_gated_create(inputs: GatedSettleInputs) -> Result<TerminalSpawnR
             .unwrap_or(ShellType::System);
 
         let target = cli_provider_target(shell_type, host_os, is_wsl, cwd.as_deref(), &RealEnv);
-        mcp_cwd = resolve_mcp_cwd(cwd.as_deref(), &RealEnv, host_os, is_wsl);
-
-        let mcp_injection = match generate_mcp_injection(
-            &RealMcpRuntime,
-            &mode,
-            &terminal_id,
-            mcp_cwd.as_deref(),
-            target,
-        ) {
-            Ok(i) => i,
-            Err(e) => return Err(fail_json(StatusCode::BAD_REQUEST, e.message)),
+        let managed_flag =
+            std::env::var(freshell_codex::launch_plan::FRESHELL_CODEX_MANAGED_LAUNCH_ENV).ok();
+        let codex_setup = if codex_create_uses_managed_launch(&mode, managed_flag.as_deref()) {
+            Some(
+                build_codex_managed_launch_setup(
+                    terminal_id.clone(),
+                    shell_type,
+                    host_os,
+                    is_wsl,
+                    cwd.as_deref(),
+                    Some(&tab_id),
+                    Some(&pane_id),
+                )
+                .map_err(|message| fail_json(StatusCode::BAD_REQUEST, message))?,
+            )
+        } else {
+            None
         };
 
         // opencode: allocate the loopback control endpoint BEFORE building the
@@ -1554,15 +1609,14 @@ async fn settle_gated_create(inputs: GatedSettleInputs) -> Result<TerminalSpawnR
         // `{codexAppServer}` providerSettings). Flag OFF: today's plain-CLI behavior,
         // byte-identical. The raw-resume rejection already ran in
         // `derive_resume_identity` — planning happens strictly after it.
-        let managed_flag =
-            std::env::var(freshell_codex::launch_plan::FRESHELL_CODEX_MANAGED_LAUNCH_ENV).ok();
-        codex_launch = if codex_create_uses_managed_launch(&mode, managed_flag.as_deref()) {
+        codex_launch = if let Some(setup) = codex_setup.as_ref() {
             let input = freshell_codex::launch_plan::CodexLaunchPlanInput {
-                cwd: cwd.as_deref(),
+                cwd: setup.runtime_cwd.as_deref(),
                 resume_session_id: resume_session_id.as_deref(),
                 model: model.as_deref(),
                 sandbox: sandbox.as_deref(),
                 approval_policy: permission_mode.as_deref(),
+                sidecar_context: setup.sidecar_context.clone(),
             };
             match freshell_codex::launch_lifecycle::CodexTerminalLaunchManager::global()
                 .plan_create_with_retry_uncancellable(
@@ -1587,6 +1641,45 @@ async fn settle_gated_create(inputs: GatedSettleInputs) -> Result<TerminalSpawnR
                 launch.session_id.as_deref(),
             );
         }
+
+        // The managed setup already rendered the TUI injection and built the
+        // terminal environment for this exact id/tab/pane. Non-managed paths
+        // retain the existing generic MCP/environment work.
+        let (mcp_injection, overrides) = match codex_setup {
+            Some(setup) => {
+                if setup.terminal_id.as_str() != terminal_id.as_str() {
+                    return Err(fail_json(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "managed Codex terminal setup did not match its spawn id".to_string(),
+                    ));
+                }
+                let CodexManagedLaunchSetup {
+                    terminal_id: _,
+                    runtime_cwd,
+                    tui_mcp_injection,
+                    terminal_env,
+                    sidecar_context: _,
+                } = setup;
+                mcp_cwd = runtime_cwd;
+                (tui_mcp_injection, terminal_env)
+            }
+            None => {
+                mcp_cwd = resolve_mcp_cwd(cwd.as_deref(), &RealEnv, host_os, is_wsl);
+                let mcp_injection = match generate_mcp_injection(
+                    &RealMcpRuntime,
+                    &mode,
+                    &terminal_id,
+                    mcp_cwd.as_deref(),
+                    target,
+                ) {
+                    Ok(injection) => injection,
+                    Err(error) => return Err(fail_json(StatusCode::BAD_REQUEST, error.message)),
+                };
+                let overrides =
+                    build_terminal_base_env(&RealEnv, &terminal_id, Some(&tab_id), Some(&pane_id));
+                (mcp_injection, overrides)
+            }
+        };
 
         // Freshell opencode TUI rebind plugin: the install (fs I/O) happens
         // HERE at the IO layer; the pure resolver only reads the result from
@@ -1653,8 +1746,6 @@ async fn settle_gated_create(inputs: GatedSettleInputs) -> Result<TerminalSpawnR
 
         let effective_shell = resolve_shell(shell_type, host_os, is_wsl);
         let windows_like = is_windows(host_os) || (is_wsl && effective_shell != ShellType::System);
-        let overrides =
-            build_terminal_base_env(&RealEnv, &terminal_id, Some(&tab_id), Some(&pane_id));
 
         spec = match &launch {
             Some(l) if windows_like => build_windows_cli_spawn_spec(
@@ -3566,6 +3657,269 @@ mod tests {
         std::fs::read_to_string(path).unwrap_or_default()
     }
 
+    const SYNTHETIC_FRESHELL_TOKEN: &str = "synthetic-rest-managed-codex-token";
+    const FRESHELL_CONTEXT_ENV_KEYS: [&str; 6] = [
+        "FRESHELL",
+        "FRESHELL_URL",
+        "FRESHELL_TOKEN",
+        "FRESHELL_TERMINAL_ID",
+        "FRESHELL_TAB_ID",
+        "FRESHELL_PANE_ID",
+    ];
+
+    /// The real dispatcher and committed fake app-server capture only these
+    /// allowlisted fields. Never derive Debug for this fixture: assertion
+    /// messages must not surface context values.
+    #[derive(serde::Deserialize)]
+    struct CapturedCodexProcess {
+        argv: Vec<String>,
+        env: BTreeMap<String, String>,
+    }
+
+    /// Snapshot values so the synthetic real-process fixture cannot leak a
+    /// test environment into another test. The values themselves are never
+    /// formatted or logged.
+    struct TestEnvRestore {
+        values: Vec<(&'static str, Option<std::ffi::OsString>)>,
+    }
+
+    impl TestEnvRestore {
+        fn capture(keys: &[&'static str]) -> Self {
+            Self {
+                values: keys
+                    .iter()
+                    .map(|key| (*key, std::env::var_os(key)))
+                    .collect(),
+            }
+        }
+    }
+
+    impl Drop for TestEnvRestore {
+        fn drop(&mut self) {
+            for (key, value) in self.values.drain(..) {
+                match value {
+                    Some(value) => std::env::set_var(key, value),
+                    None => std::env::remove_var(key),
+                }
+            }
+        }
+    }
+
+    fn managed_codex_cli_spec() -> freshell_platform::CliCommandSpec {
+        freshell_platform::CliCommandSpec {
+            name: "codex".to_string(),
+            label: "Codex CLI".to_string(),
+            env_var: Some("CODEX_CMD".to_string()),
+            default_cmd: "codex".to_string(),
+            resume_args: Some(vec!["resume".to_string(), "{{sessionId}}".to_string()]),
+            model_args: Some(vec!["--model".to_string(), "{{model}}".to_string()]),
+            sandbox_args: Some(vec!["--sandbox".to_string(), "{{sandbox}}".to_string()]),
+            ..Default::default()
+        }
+    }
+
+    fn managed_codex_dispatcher() -> std::path::PathBuf {
+        let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../test/fixtures/coding-cli/codex-app-server/fake-app-server.mjs")
+            .canonicalize()
+            .expect("fake app-server fixture exists");
+        let dispatcher = std::env::temp_dir().join(format!(
+            "freshell-rest-managed-codex-dispatcher-{}-{}.mjs",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        let script = format!(
+            r#"#!/usr/bin/env node
+import fs from 'node:fs'
+const args = process.argv.slice(2)
+if (args.includes('app-server')) {{
+  await import('file://{fixture}')
+}} else {{
+  fs.writeFileSync(process.env.CODEX_ARGV_CAPTURE_PATH, JSON.stringify({{
+    argv: args,
+    env: {{
+      FRESHELL: process.env.FRESHELL,
+      FRESHELL_URL: process.env.FRESHELL_URL,
+      FRESHELL_TOKEN: process.env.FRESHELL_TOKEN,
+      FRESHELL_TERMINAL_ID: process.env.FRESHELL_TERMINAL_ID,
+      FRESHELL_TAB_ID: process.env.FRESHELL_TAB_ID,
+      FRESHELL_PANE_ID: process.env.FRESHELL_PANE_ID,
+    }},
+  }}))
+  setInterval(() => undefined, 1000)
+}}
+"#,
+            fixture = fixture.display()
+        );
+        std::fs::write(&dispatcher, script).expect("write dispatcher");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut permissions = std::fs::metadata(&dispatcher).unwrap().permissions();
+            permissions.set_mode(0o755);
+            std::fs::set_permissions(&dispatcher, permissions).unwrap();
+        }
+        dispatcher
+    }
+
+    async fn wait_for_captured_codex_process(path: &std::path::Path) -> CapturedCodexProcess {
+        for _ in 0..200 {
+            if let Ok(content) = std::fs::read_to_string(path) {
+                if !content.is_empty() {
+                    return serde_json::from_str(&content).expect("captured process is JSON");
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        panic!("spawned codex child did not write its allowlisted capture")
+    }
+
+    fn freshell_mcp_pairs(argv: &[String]) -> Vec<(String, String)> {
+        argv.windows(2)
+            .filter(|pair| pair[0] == "-c" && pair[1].starts_with("mcp_servers.freshell."))
+            .map(|pair| (pair[0].clone(), pair[1].clone()))
+            .collect()
+    }
+
+    fn managed_env_vars_config() -> String {
+        let names = freshell_platform::mcp_inject::FRESHELL_MCP_CONTEXT_ENV_VARS
+            .iter()
+            .map(|name| format!("{name:?}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!("mcp_servers.freshell.env_vars=[{names}]")
+    }
+
+    fn mcp_recipe_pairs(pairs: &[(String, String)]) -> Vec<(String, String)> {
+        pairs
+            .iter()
+            .filter(|(_, value)| {
+                value.starts_with("mcp_servers.freshell.command=")
+                    || value.starts_with("mcp_servers.freshell.args=")
+            })
+            .cloned()
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn managed_codex_terminal_tab_supplies_sidecar_context() {
+        // This is a real TUI + app-server pair, serialized with the crate's
+        // other Codex process fixtures. The local guard additionally restores
+        // the terminal-context inputs that its synthetic environment owns.
+        let _codex_environment = crate::codex::tests::ENV_LOCK.lock().await;
+        let _environment = TestEnvRestore::capture(&[
+            "AUTH_TOKEN",
+            "CODEX_ARGV_CAPTURE_PATH",
+            "CODEX_CMD",
+            "FAKE_CODEX_APP_SERVER_ARG_LOG",
+            "FRESHELL_CODEX_MANAGED_LAUNCH",
+            "FRESHELL_URL",
+            "PORT",
+        ]);
+        let dispatcher = managed_codex_dispatcher();
+        let tui_capture = unique_argv_file("managed-codex-tui");
+        let sidecar_capture = unique_argv_file("managed-codex-sidecar");
+        std::env::set_var("CODEX_CMD", &dispatcher);
+        std::env::set_var("CODEX_ARGV_CAPTURE_PATH", &tui_capture);
+        std::env::set_var("FAKE_CODEX_APP_SERVER_ARG_LOG", &sidecar_capture);
+        std::env::set_var("FRESHELL_CODEX_MANAGED_LAUNCH", "1");
+        std::env::set_var("PORT", "23126");
+        std::env::set_var("FRESHELL_URL", "http://127.0.0.1:23126");
+        std::env::set_var("AUTH_TOKEN", SYNTHETIC_FRESHELL_TOKEN);
+
+        let state =
+            state_with_registry().with_cli_commands(Arc::new(vec![managed_codex_cli_spec()]));
+        let registry = state.terminal_registry.clone().expect("registry wired");
+        let cwd = std::env::temp_dir();
+        let (status, body) = post(
+            app(state),
+            "/api/tabs",
+            json!({ "mode": "codex", "cwd": cwd.to_string_lossy() }),
+            true,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "managed terminal tab must create");
+        let terminal_id = body["data"]["terminalId"]
+            .as_str()
+            .expect("terminal id")
+            .to_string();
+        let tab_id = body["data"]["tabId"].as_str().expect("tab id").to_string();
+        let pane_id = body["data"]["paneId"]
+            .as_str()
+            .expect("pane id")
+            .to_string();
+        let tui = wait_for_captured_codex_process(&tui_capture).await;
+        let sidecar = wait_for_captured_codex_process(&sidecar_capture).await;
+
+        // Collect evidence before cleanup; a failed assertion must never
+        // strand the real test fixture's PTY or its sidecar.
+        let tui_pairs = freshell_mcp_pairs(&tui.argv);
+        let sidecar_pairs = freshell_mcp_pairs(&sidecar.argv);
+        let expected_env_vars = managed_env_vars_config();
+        let tui_recipe = mcp_recipe_pairs(&tui_pairs);
+        let sidecar_recipe = mcp_recipe_pairs(&sidecar_pairs);
+        let sidecar_app_server_index = sidecar.argv.iter().position(|arg| arg == "app-server");
+        let sidecar_config_before_app_server = sidecar_app_server_index.is_some_and(|index| {
+            sidecar
+                .argv
+                .windows(2)
+                .enumerate()
+                .filter(|(_, pair)| pair[0] == "-c")
+                .all(|(pair_index, _)| pair_index < index)
+        });
+        let equal_context = tui.env == sidecar.env
+            && tui.env.len() == FRESHELL_CONTEXT_ENV_KEYS.len()
+            && FRESHELL_CONTEXT_ENV_KEYS
+                .iter()
+                .all(|key| tui.env.contains_key(*key))
+            && tui
+                .env
+                .get("FRESHELL_TERMINAL_ID")
+                .is_some_and(|value| value == &terminal_id)
+            && tui
+                .env
+                .get("FRESHELL_TAB_ID")
+                .is_some_and(|value| value == &tab_id)
+            && tui
+                .env
+                .get("FRESHELL_PANE_ID")
+                .is_some_and(|value| value == &pane_id);
+        let no_token_in_argv = [&tui.argv, &sidecar.argv].into_iter().all(|argv| {
+            !argv
+                .iter()
+                .any(|arg| arg.contains(SYNTHETIC_FRESHELL_TOKEN))
+        });
+        registry.kill(&terminal_id);
+        let _ = std::fs::remove_file(&tui_capture);
+        let _ = std::fs::remove_file(&sidecar_capture);
+        let _ = std::fs::remove_file(&dispatcher);
+
+        for pairs in [&tui_pairs, &sidecar_pairs] {
+            assert!(
+                pairs
+                    .iter()
+                    .any(|(flag, value)| flag == "-c" && value == &expected_env_vars),
+                "managed TUI and sidecar each need the exact static Freshell env_vars declaration"
+            );
+        }
+        assert!(
+            !tui_recipe.is_empty() && tui_recipe == sidecar_recipe,
+            "managed terminal-tab pair must receive the same Freshell MCP command recipe"
+        );
+        assert!(
+            sidecar_config_before_app_server,
+            "all sidecar configuration pairs must precede app-server"
+        );
+        assert!(
+            equal_context,
+            "managed terminal-tab TUI and sidecar must receive one equal six-key Freshell context"
+        );
+        assert!(
+            no_token_in_argv,
+            "synthetic Freshell token must never be serialized into argv"
+        );
+    }
+
     fn state_with_opencode_locator(home: std::path::PathBuf) -> FreshAgentState {
         state_with_registry().with_opencode_locator(Some(std::sync::Arc::new(
             freshell_sessions::opencode_locator::OpencodeLocator::new(home),
@@ -4633,6 +4987,8 @@ mod tests {
     async fn create_codex_tab_accepts_session_ref_and_derives_resume_args() {
         // DEV-0006 S5.e: the managed-launch default is ON; this suite exercises the
         // plain-CLI codex path (recording CLI spec, no app-server), so pin OFF.
+        let _codex_environment = crate::codex::tests::ENV_LOCK.lock().await;
+        let _environment = TestEnvRestore::capture(&["FRESHELL_CODEX_MANAGED_LAUNCH"]);
         std::env::set_var("FRESHELL_CODEX_MANAGED_LAUNCH", "0");
         let argv_file = unique_argv_file("codex-accept");
         let state =
@@ -5498,6 +5854,8 @@ mod tests {
     async fn rest_gate_skips_sidecar_live_candidate_create_proceeds_unchanged() {
         // DEV-0006 S5.e: the managed-launch default is ON; this suite exercises the
         // plain-CLI codex path (recording CLI spec, no app-server), so pin OFF.
+        let _codex_environment = crate::codex::tests::ENV_LOCK.lock().await;
+        let _environment = TestEnvRestore::capture(&["FRESHELL_CODEX_MANAGED_LAUNCH"]);
         std::env::set_var("FRESHELL_CODEX_MANAGED_LAUNCH", "0");
         const SIDECAR_LIVE: &str = "stale-cx";
         let argv_file = unique_argv_file("door3-sidecar-skip");
@@ -6375,6 +6733,8 @@ mod tests {
     async fn send_keys_enter_feeds_codex_locator() {
         // DEV-0006 S5.e: the managed-launch default is ON; this suite exercises the
         // plain-CLI codex path (sh-script fake codex, no app-server), so pin OFF.
+        let _codex_environment = crate::codex::tests::ENV_LOCK.lock().await;
+        let _environment = TestEnvRestore::capture(&["FRESHELL_CODEX_MANAGED_LAUNCH"]);
         std::env::set_var("FRESHELL_CODEX_MANAGED_LAUNCH", "0");
         let root = unique_temp_home("codex-submit");
         let argv_file = unique_argv_file("codex-submit");

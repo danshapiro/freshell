@@ -211,10 +211,14 @@ describe('tab focus behavior (e2e)', () => {
     await waitFor(() => {
       expect(terminalInstances).toHaveLength(2)
     })
-    await waitFor(() => {
-      expect(terminalInstances[0].focus).toHaveBeenCalled()
-      expect(terminalInstances[1].focus).toHaveBeenCalled()
-    })
+
+    // Focus-neutrality: both terminals mount HIDDEN (tab-1 is active), so
+    // neither may focus at mount — TerminalView's scheduled mount-focus flush
+    // is gated on shouldFocusActiveTerminal (Task 2 of mcp-focus-neutrality).
+    // This phase previously pinned that steal directly.
+    await new Promise((r) => setTimeout(r, 150))
+    expect(terminalInstances[0].focus).not.toHaveBeenCalled()
+    expect(terminalInstances[1].focus).not.toHaveBeenCalled()
 
     terminalInstances[0].focus.mockClear()
     terminalInstances[1].focus.mockClear()

@@ -1857,6 +1857,21 @@ impl FreshOpencodeState {
                 &last_turn_complete_at,
             );
             if let Err(err) = result {
+                // Server-side observability (the 2026-09-11 compact incident's
+                // gap): before this WARN existed, a failed compact drive was
+                // visible ONLY as the client's "Agent error" banner — the
+                // structured log carried no trace, leaving the failure's
+                // timing and cause unrecoverable. The `never_dispatched`
+                // verdict records the delivery truth the compensation above
+                // used; `error` carries the serve error verbatim (including
+                // the transport `source()` chain, via `display_error_chain`).
+                tracing::warn!(
+                    provider = PROVIDER,
+                    session = %compact_id,
+                    never_dispatched = err.never_dispatched(),
+                    error = %err,
+                    "freshagent.opencode.compact_failed"
+                );
                 fresh_agent.broadcast(&event_frame(
                     &compact_id,
                     json!({
@@ -7961,6 +7976,13 @@ mod tests {
         /// error-after-send outcome: OpenCode ≥1.18.21's summarize runs
         /// `revertSvc.cleanup` FIRST, so this is a POSSIBLY-destroyed tail.
         Answered500,
+        /// The POST is recorded, then the connection breaks WITHOUT an answer
+        /// — the AMBIGUOUS mid-flight transport leg (the production
+        /// `ServeError::Transport` class; the 2026-09-11 compact incident's
+        /// failure shape: "error sending request for url (...)"). Delivery is
+        /// unknowable, so the tail is possibly-gone exactly like
+        /// `Answered500`.
+        MidflightTransport,
         /// The POST never exists server-side: the refusal is answered WITHOUT
         /// recording the request — modeling a connect-phase refusal before a
         /// byte left (the provably-undelivered leg).
@@ -8122,6 +8144,18 @@ mod tests {
                     Some("running"),
                     "the busy `running` snapshot must precede the summarize POST"
                 );
+                if self.summarize_outcome == SummarizeOutcome::MidflightTransport {
+                    // The request WAS recorded above (delivery is ambiguous),
+                    // then the connection broke before an answer — the exact
+                    // reqwest send()-phase failure the real transport maps to
+                    // `ServeHttpError::Ambiguous` → `ServeError::Transport`.
+                    return Box::pin(async {
+                        Err(ServeHttpError::Ambiguous(
+                            "error sending request for url (http://127.0.0.1:42579/session/ses_1/summarize?directory=%2Ftmp)"
+                                .to_string(),
+                        ))
+                    });
+                }
                 if self.summarize_outcome == SummarizeOutcome::Answered500 {
                     return Box::pin(async {
                         Ok(ServeHttpResponse::new(500, b"summarize exploded".to_vec()))
@@ -8495,6 +8529,7 @@ mod tests {
     /// bundle below.)
     #[tokio::test]
     async fn compact_summarize_answered_500_after_receipt_destroys_redo_forever() {
+        let (events, _guard) = info_capture::capture();
         let (st, http, mut rx) =
             compact_state(r#"{"model":null}"#, SummarizeOutcome::Answered500).await;
         insert_compact_session(&st, "ses_1", Some("prov-a/mdl-x")).await;
@@ -8508,6 +8543,24 @@ mod tests {
             .find(|f| is_event(f, "freshAgent.error", None))
             .expect("the failure is LOUD");
         assert_eq!(error_frame["event"]["code"], "OPENCODE_COMPACT_FAILED");
+        // The failure is observable server-side too, with the delivery verdict
+        // the compensation used (an answered 5xx is NOT provably undelivered).
+        {
+            let events = events.lock().expect("capture lock");
+            let warn = events
+                .iter()
+                .find(|e| e.message.contains("freshagent.opencode.compact_failed"))
+                .expect("an answered-5xx compact failure must be visible in server logs");
+            assert_eq!(
+                warn.fields.get("session").map(String::as_str),
+                Some("ses_1")
+            );
+            assert_eq!(
+                warn.fields.get("never_dispatched").map(String::as_str),
+                Some("false"),
+                "an answered non-2xx is an error-after-send, never provably undelivered"
+            );
+        }
         assert_eq!(
             http.summarize_requests().len(),
             1,
@@ -8540,6 +8593,90 @@ mod tests {
         );
     }
 
+    /// The AMBIGUOUS mid-flight transport leg (the 2026-09-11 production
+    /// incident class: a compact failing with "opencode serve transport
+    /// error: error sending request for url (...)"). Delivery is unknowable,
+    /// so three contracts must hold:
+    /// (a) the pane hears a LOUD `OPENCODE_COMPACT_FAILED` whose message
+    ///     carries the serve error verbatim,
+    /// (b) the failure is observable SERVER-SIDE as a structured
+    ///     `freshagent.opencode.compact_failed` WARN (session + provider +
+    ///     `never_dispatched=false` + the error) — the observability gap the
+    ///     incident exposed: before this leg existed, the only trace was the
+    ///     client banner, leaving the failure's timing and cause unrecoverable
+    ///     from `rust-server.jsonl`, and
+    /// (c) the pre-drive destroy STANDS (error-after-send ≠ tail survived —
+    ///     the same finality as `Answered500`).
+    #[tokio::test]
+    async fn compact_summarize_midflight_transport_failure_logs_and_keeps_destroy() {
+        let (events, _guard) = info_capture::capture();
+        let (st, http, mut rx) =
+            compact_state(r#"{"model":null}"#, SummarizeOutcome::MidflightTransport).await;
+        insert_compact_session(&st, "ses_1", Some("prov-a/mdl-x")).await;
+        let sink = seed_redoable_record(&st, "ses_1").await;
+
+        st.handle_compact(compact_msg("ses_1")).await;
+
+        let frames = frames_until(&mut rx, |f| is_event(f, "freshAgent.error", None)).await;
+        let error_frame = frames
+            .iter()
+            .find(|f| is_event(f, "freshAgent.error", None))
+            .expect("the failure is LOUD");
+        assert_eq!(error_frame["event"]["code"], "OPENCODE_COMPACT_FAILED");
+        assert!(
+            error_frame["event"]["message"]
+                .as_str()
+                .unwrap_or("")
+                .contains("opencode serve transport error"),
+            "the raw serve transport diagnostic crosses the wire: {error_frame}"
+        );
+        assert_eq!(
+            http.summarize_requests().len(),
+            1,
+            "the POST was recorded BEFORE the connection broke — delivery is ambiguous, not provably-refused"
+        );
+        // (b) the server-side WARN — the observability this incident motivated.
+        let events = events.lock().expect("capture lock");
+        let warn = events
+            .iter()
+            .find(|e| e.message.contains("freshagent.opencode.compact_failed"))
+            .expect(
+                "compact failures must be visible in server logs, not just the client banner",
+            );
+        assert_eq!(
+            warn.fields.get("session").map(String::as_str),
+            Some("ses_1"),
+            "the WARN names the compacted session"
+        );
+        assert_eq!(
+            warn.fields.get("provider").map(String::as_str),
+            Some("opencode"),
+            "the WARN names the provider"
+        );
+        assert_eq!(
+            warn.fields.get("never_dispatched").map(String::as_str),
+            Some("false"),
+            "a mid-flight transport break is NOT provably undelivered"
+        );
+        assert!(
+            warn.fields
+                .get("error")
+                .map(|s| s.contains("transport error"))
+                .unwrap_or(false),
+            "the WARN carries the serve error (transport chain included): {:?}",
+            warn.fields
+        );
+        drop(events);
+        // (c) compensation semantics: ambiguous delivery ⇒ the destroy stands.
+        let record = sink
+            .load_rollback(PROVIDER, "ses_1")
+            .expect("the record survives");
+        assert!(
+            record.redo_destroyed && !record.can_redo(),
+            "mid-flight transport ⇒ redo destroyed FOREVER (delivery is ambiguous, the tail is possibly gone): {record:?}"
+        );
+    }
+
     /// ep1-r3 F2's OTHER leg — the provably-UNDELIVERED dispatch: the
     /// summarize POST's connect phase refused BEFORE a byte left the client
     /// (the fake reject models "no POST was ever received"), so the serve
@@ -8547,6 +8684,7 @@ mod tests {
     /// destroy is compensated back, and redo stays valid.
     #[tokio::test]
     async fn compact_summarize_undelivered_dispatch_preserves_redo() {
+        let (events, _guard) = info_capture::capture();
         let (st, http, mut rx) =
             compact_state(r#"{"model":null}"#, SummarizeOutcome::Undelivered).await;
         insert_compact_session(&st, "ses_1", Some("prov-a/mdl-x")).await;
@@ -8567,6 +8705,24 @@ mod tests {
                 .contains("connect refused"),
             "the undelivered diagnostic crosses the wire: {error_frame}"
         );
+        // The failure is observable server-side too, with the delivery verdict
+        // the compensation used (a connect-phase refusal IS provably undelivered).
+        {
+            let events = events.lock().expect("capture lock");
+            let warn = events
+                .iter()
+                .find(|e| e.message.contains("freshagent.opencode.compact_failed"))
+                .expect("an undelivered compact failure must be visible in server logs");
+            assert_eq!(
+                warn.fields.get("session").map(String::as_str),
+                Some("ses_1")
+            );
+            assert_eq!(
+                warn.fields.get("never_dispatched").map(String::as_str),
+                Some("true"),
+                "a connect-phase refusal is provably undelivered"
+            );
+        }
         assert!(
             http.summarize_requests().is_empty(),
             "the dispatch provably never reached the serve (no POST was ever received)"

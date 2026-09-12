@@ -225,9 +225,13 @@ test.describe('hidden-pane rebind (F8 / P1.11)', () => {
       await page.keyboard.type('sleep 500')
       await page.keyboard.press('Enter')
 
-      // Hide it: a second tab becomes active.
-      await createTabViaRest(info, { mode: 'shell', cwd: os.tmpdir() })
+      // Hide it: a second tab becomes active. REST creates are focus-neutral
+      // (agent-driven creates must not steal user focus), so hiding requires an
+      // explicit user-equivalent reveal (tab-strip click) — that replaces the
+      // activation the create used to perform implicitly.
+      const shellTabId = await createTabViaRest(info, { mode: 'shell', cwd: os.tmpdir() })
       await harness.waitForTabCount(2)
+      await revealTab(page, harness, shellTabId)
       await expect.poll(async () => harness.getActiveTabId(), { timeout: 15_000 }).not.toBe(hiddenTabId)
 
       // SIGKILL + revive. Do NOT touch the hidden tab.
@@ -324,9 +328,11 @@ test.describe('hidden-pane rebind (F8 / P1.11)', () => {
       // createRequestId; that discriminator is obsolete in the merged tree.)
       const createRequestIdBefore = contentBefore.createRequestId as string
 
-      // Hide it behind a new shell tab.
-      await createTabViaRest(info, { mode: 'shell', cwd: os.tmpdir() })
+      // Hide it behind a new shell tab (explicit reveal — REST creates are
+      // focus-neutral now; see site 1 above).
+      const shellTabId = await createTabViaRest(info, { mode: 'shell', cwd: os.tmpdir() })
       await harness.waitForTabCount(2)
+      await revealTab(page, harness, shellTabId)
       await expect.poll(async () => harness.getActiveTabId(), { timeout: 15_000 }).not.toBe(freshTabId)
 
       await server.restartAbrupt()

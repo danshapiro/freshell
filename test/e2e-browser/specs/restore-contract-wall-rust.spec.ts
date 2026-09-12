@@ -571,6 +571,11 @@ test.describe('Restore Contract Wall (P0.1)', () => {
         expect(await harness.getTabCount()).toBe(tabCountBefore + 1)
       }).toPass({ timeout: 15_000 })
 
+      // REST creates are focus-neutral; reveal the new tab explicitly
+      // (user-equivalent tab-strip click) before driving its terminal.
+      await page.locator(`[data-context="tab"][data-tab-id="${tabId}"]`).click()
+      await expect.poll(async () => harness.getActiveTabId(), { timeout: 10_000 }).toBe(tabId)
+
       const terminalIdBefore: string = await expect
         .poll(async () => (await harness.getPaneLayout(tabId))?.content?.terminalId ?? null, {
           timeout: 20_000,
@@ -2398,9 +2403,12 @@ test.describe('Restore Contract Wall (P0.1)', () => {
         .not.toBeNull()
         .then(async () => (await harness.getPaneLayout(hiddenTabId))?.content?.terminalId)
 
-      // Second tab becomes active; the first is now hidden.
-      await createTabViaRest(info, { mode: 'shell', cwd: os.tmpdir() })
+      // Second tab becomes active; the first is now hidden. REST creates are
+      // focus-neutral (agent-driven creates must not steal user focus), so the
+      // switch requires an explicit reveal — a user-equivalent tab-strip click.
+      const secondTabId = await createTabViaRest(info, { mode: 'shell', cwd: os.tmpdir() })
       await harness.waitForTabCount(2)
+      await page.locator(`[data-context="tab"][data-tab-id="${secondTabId}"]`).click()
       await expect
         .poll(async () => harness.getActiveTabId(), { timeout: 15_000 })
         .not.toBe(hiddenTabId)

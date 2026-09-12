@@ -10,6 +10,8 @@ import { registerBrowserActions } from '@/lib/pane-action-registry'
 import { ContextIds } from '@/components/context-menu/context-menu-constants'
 import { paneRefreshTargetMatchesContent } from '@/lib/pane-utils'
 import { RUST_BASELINE_UNAVAILABLE } from '@/lib/rust-baseline-unavailable'
+import { usePaneFocusAdoption } from '@/hooks/usePaneFocusAdoption'
+import { useIframeFocusLock } from '@/hooks/useIframeFocusLock'
 
 interface BrowserPaneProps {
   paneId: string
@@ -17,6 +19,8 @@ interface BrowserPaneProps {
   browserInstanceId: string
   url: string
   devToolsOpen: boolean
+  focusEligible?: boolean
+  focusEpoch?: number
 }
 
 const MAX_HISTORY_SIZE = 50
@@ -165,11 +169,19 @@ export default function BrowserPane({
   browserInstanceId,
   url,
   devToolsOpen,
+  focusEligible = true,
+  focusEpoch = 0,
 }: BrowserPaneProps) {
   const dispatch = useAppDispatch()
   const refreshRequest = useAppSelector((state) => state.panes.refreshRequestsByPane?.[tabId]?.[paneId] ?? null)
   const iframeRef = useRef<HTMLIFrameElement>(null)
   const inputRef = useRef<HTMLInputElement>(null)
+  const rootRef = useRef<HTMLDivElement | null>(null)
+  const [rootEl, setRootEl] = useState<HTMLDivElement | null>(null)
+  const setRootNode = useCallback((element: HTMLDivElement | null) => {
+    rootRef.current = element
+    setRootEl(element)
+  }, [])
   const [inputUrl, setInputUrl] = useState(url)
   const [isLoading, setIsLoading] = useState(false)
   const [loadError, setLoadError] = useState<string | null>(null)
@@ -354,13 +366,15 @@ export default function BrowserPane({
     }
   }
 
+  const urlRef = useRef(url)
+  urlRef.current = url
+  const mayFocusNow = usePaneFocusAdoption(paneId, focusEligible, focusEpoch)
+  const iframeFocusLocked = useIframeFocusLock(rootEl, focusEligible, mayFocusNow)
   useEffect(() => {
-    // Focus the URL input only when there's no initial URL (user just created a new browser pane)
-    // This is more accessible than autoFocus and allows users to manually control focus
-    if (!url && inputRef.current) {
-      inputRef.current.focus()
-    }
-  }, [url])
+    if (!focusEligible || !mayFocusNow()) return
+    if (urlRef.current) rootRef.current?.focus()
+    else inputRef.current?.focus()
+  }, [focusEligible, mayFocusNow])
 
   useEffect(() => {
     if (!refreshRequest) return
@@ -402,6 +416,8 @@ export default function BrowserPane({
 
   return (
     <div
+      ref={setRootNode}
+      tabIndex={-1}
       className="flex flex-col h-full w-full bg-background"
       data-context={ContextIds.Browser}
       data-pane-id={paneId}
@@ -485,6 +501,7 @@ export default function BrowserPane({
               src={resolvedSrc}
               className="w-full h-full border-0 bg-white"
               sandbox="allow-scripts allow-same-origin allow-forms allow-popups allow-modals"
+              {...(iframeFocusLocked ? ({ inert: '', 'data-focus-locked': 'true' } as Record<string, string>) : {})}
               onLoad={() => setIsLoading(false)}
               onErrorCapture={() => {
                 setIsLoading(false)

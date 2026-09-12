@@ -1295,9 +1295,11 @@ export const panesSlice = createSlice({
         direction: 'horizontal' | 'vertical'
         newContent: PaneContentInput
         newPaneId?: string
+        /** ui.command pane.split passes false — agent-driven splits never steal focus-in-tab. */
+        activate?: boolean
       }>
     ) => {
-      const { tabId, paneId, direction, newContent, newPaneId: providedPaneId } = action.payload
+      const { tabId, paneId, direction, newContent, newPaneId: providedPaneId, activate } = action.payload
       const root = state.layouts[tabId]
       if (!root) return
       if (refuseMutationWhileClosing(state, tabId, 'splitPane')) return
@@ -1324,7 +1326,9 @@ export const panesSlice = createSlice({
       const newRoot = findAndReplace(root, paneId, splitNode)
       if (newRoot) {
         state.layouts[tabId] = newRoot
-        state.activePane[tabId] = newPaneId
+        if (activate !== false) {
+          state.activePane[tabId] = newPaneId
+        }
 
         // Clear zoom so the new pane is visible
         if (state.zoomedPane?.[tabId]) {
@@ -1463,16 +1467,45 @@ export const panesSlice = createSlice({
           delete state.zoomedPane[tabId]
         }
 
+        // Drop the closed pane's ephemeral focus-epoch entry.
+        if (state.focusEpochByPaneId) {
+          delete state.focusEpochByPaneId[paneId]
+        }
+
         reconcileRefreshRequestsForTab(state, tabId)
       }
     },
 
     setActivePane: (
       state,
-      action: PayloadAction<{ tabId: string; paneId: string }>
+      action: PayloadAction<{ tabId: string; paneId: string; focusNudge?: boolean }>
     ) => {
-      const { tabId, paneId } = action.payload
+      const { tabId, paneId, focusNudge } = action.payload
       state.activePane[tabId] = paneId
+      // The epoch bump is ONLY for explicit select folds (ui-commands), where
+      // "select moves DOM focus" is the contract even without an eligibility
+      // transition. Plain pointer activations (Pane mousedown bubbles from
+      // in-pane inputs like rename/search) must NOT bump — that would re-run
+      // focus effects and steal focus back from the element just clicked.
+      if (focusNudge) {
+        state.focusEpochByPaneId ??= {}
+        state.focusEpochByPaneId[paneId] = (state.focusEpochByPaneId[paneId] ?? 0) + 1
+      }
+    },
+
+    /**
+     * tab.select fold: the tab's ACTIVE pane gets the focus nudge, so an
+     * explicit tab select re-focuses content even when the tab was already
+     * Redux-active (no eligibility transition).
+     */
+    nudgePaneFocus: (
+      state,
+      action: PayloadAction<{ tabId: string }>
+    ) => {
+      const paneId = state.activePane[action.payload.tabId]
+      if (!paneId) return
+      state.focusEpochByPaneId ??= {}
+      state.focusEpochByPaneId[paneId] = (state.focusEpochByPaneId[paneId] ?? 0) + 1
     },
 
     resizePanes: (
@@ -1994,7 +2027,14 @@ export const panesSlice = createSlice({
       action: PayloadAction<{ tabId: string }>
     ) => {
       const { tabId } = action.payload
+      const removedRoot = state.layouts[tabId]
       delete state.layouts[tabId]
+      // Any restored tab gets fresh selection bookkeeping for its panes.
+      if (removedRoot && state.focusEpochByPaneId) {
+        for (const leaf of collectLeaves(removedRoot)) {
+          delete state.focusEpochByPaneId[leaf.id]
+        }
+      }
       delete state.activePane[tabId]
       delete state.paneTitles[tabId]
       // The tab is gone — any in-flight close guard for it is spent.
@@ -2076,6 +2116,20 @@ export const panesSlice = createSlice({
       state.zoomedPane = {}
       state.refreshRequestsByPane = {}
       state.restoreFallbackAttemptsByPane = {}
+      // Focus epochs are ephemeral select bookkeeping: prune entries of panes
+      // no longer present after the merge — unlike closePane/removeLayout,
+      // hydration can drop leaves wholesale (cross-device removals), otherwise
+      // one stale entry per remotely-removed explicitly-selected pane persists
+      // for the page lifetime and inflates every epoch-map update.
+      if (state.focusEpochByPaneId) {
+        const live = new Set<string>()
+        for (const root of Object.values(mergedLayouts)) {
+          for (const leaf of collectLeaves(root)) live.add(leaf.id)
+        }
+        for (const id of Object.keys(state.focusEpochByPaneId)) {
+          if (!live.has(id)) delete state.focusEpochByPaneId[id]
+        }
+      }
       state.deadSessionAdjudication = []
       state.reconcileWarming = null
       state.reconcilePendingPanes = {}
@@ -2687,6 +2741,7 @@ export const {
   addPane,
   closePane,
   setActivePane,
+  nudgePaneFocus,
   resizePanes,
   resizeMultipleSplits,
   resetSplit,
@@ -2740,3 +2795,12 @@ export const {
 
 export default panesSlice.reducer
 export type { PanesState }
+
+/**
+ * Per-pane focus-nudge epoch (see PanesState.focusEpochByPaneId). Tolerant by
+ * design: bare component test stores may omit the panes slice or preload a
+ * partial panes state without the optional epoch map.
+ */
+export function selectPaneFocusEpoch(state: { panes?: PanesState }, paneId: string): number {
+  return state.panes?.focusEpochByPaneId?.[paneId] ?? 0
+}

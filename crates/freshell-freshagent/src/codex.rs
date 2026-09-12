@@ -58,7 +58,7 @@ use tokio::sync::{oneshot, Mutex as TokioMutex};
 use freshell_codex::launch_lifecycle::{
     allocate_loopback_port, drain_child_io, SIDECAR_START_BUDGET,
 };
-use freshell_codex::launch_plan::codex_sidecar_spawn_spec;
+use freshell_codex::launch_plan::{codex_sidecar_spawn_spec, CodexSidecarLaunchContext};
 use freshell_codex::transport::{reap_owned_codex_sidecars, TungsteniteTransport};
 use freshell_codex::{
     mint_ownership_id, normalize_codex_thread_status, normalize_freshcodex_effort,
@@ -3716,7 +3716,11 @@ impl FreshCodexState {
         let ownership_id = mint_ownership_id();
         // The canonical argv + env: `-c features.apps=false app-server --listen <ws_url>`
         // plus the ownership tag the /proc reaper keys on (S5.d.1 unification).
-        let spec = codex_sidecar_spawn_spec(&ws_url, &ownership_id);
+        let spec = codex_sidecar_spawn_spec(
+            &ws_url,
+            &ownership_id,
+            &CodexSidecarLaunchContext::default(),
+        );
         let codex_cmd = std::env::var("CODEX_CMD").unwrap_or_else(|_| "codex".to_string());
         // Whitespace-split so a test fixture can point `CODEX_CMD` at an interpreter plus
         // script (e.g. `CODEX_CMD="node /path/fake-app-server.mjs"`) without needing the

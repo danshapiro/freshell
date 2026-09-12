@@ -888,10 +888,13 @@ describe('TerminalView lifecycle updates', () => {
     await waitFor(() => {
       expect(terminalInstances).toHaveLength(2)
     })
-    await waitFor(() => {
-      expect(terminalInstances[0].focus).toHaveBeenCalled()
-      expect(terminalInstances[1].focus).toHaveBeenCalled()
-    })
+    // Hidden-tab mounts are focus-neutral now: the mount flush must not focus
+    // either terminal while the tab is hidden. (This phase previously pinned
+    // the ungated mount focus — the exact background-mount steal removed in
+    // this task.)
+    await act(async () => { await new Promise((r) => setTimeout(r, 150)) })
+    expect(terminalInstances[0].focus).not.toHaveBeenCalled()
+    expect(terminalInstances[1].focus).not.toHaveBeenCalled()
 
     terminalInstances[0].focus.mockClear()
     terminalInstances[1].focus.mockClear()

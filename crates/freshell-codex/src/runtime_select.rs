@@ -36,5 +36,7 @@ pub async fn select_codex_runtime(
             ));
         }
     }
-    Arc::new(SpawnedCodexAppServerRuntime::new())
+    Arc::new(SpawnedCodexAppServerRuntime::with_context(
+        plan.sidecar_context.clone(),
+    ))
 }

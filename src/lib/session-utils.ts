@@ -6,7 +6,7 @@ import { isNonShellMode } from '@/lib/coding-cli-utils'
 import { resolveFreshAgentType } from '@/lib/fresh-agent-registry'
 import type { PaneContent, PaneNode } from '@/store/paneTypes'
 import type { RootState } from '@/store/store'
-import type { CodingCliProviderName } from '@/store/types'
+import type { BackgroundTerminal, CodingCliProviderName } from '@/store/types'
 import { isValidClaudeSessionId } from '@/lib/claude-session-id'
 
 type SessionMatchLocator = {
@@ -302,6 +302,68 @@ export function collectSessionRefsFromTabs(
     })),
     sessionKey,
   )
+}
+
+export interface LiveTerminalRowIdentity {
+  provider: CodingCliProviderName
+  /** activity/sessionActivity bucket key the sidebar row reads */
+  key: string
+}
+
+/**
+ * Activity key of the sidebar row a closing tab's leaf content corresponds
+ * to, for contents whose own canonical identity (extractSessionLocators) is
+ * empty — those contents are already ratcheted by the canonical refs loop in
+ * closeTab, so this returns undefined for them (never a second key).
+ *
+ * For the rest, the registry terminal (resolved by the caller via the
+ * content's terminalId) decides, in priority order:
+ *
+ * 1. registry sessionRef → the canonical `<provider>:<sessionId>` row key
+ *    (the identity-less alias would be junk: no row ever reads it);
+ * 2. registry codex durability → the canonical `codex:<durabilitySessionId>`
+ *    row key (mirrors getCodexDurabilitySessionId in sidebarSelectors.ts);
+ * 3. running, identity-less, non-shell registry terminal → the live-terminal
+ *    fallback row key `<mode>:terminal:<terminalId>` (the `for (const
+ *    terminal of terminals)` loop in store/selectors/sidebarSelectors.ts —
+ *    the predicate MUST stay in sync with that loop's guard and with
+ *    resolveTerminalFallbackRowKey in lib/pane-activity.ts);
+ * 4. NO registry entry at all (directory not yet loaded, failed, stale, or
+ *    paged out) → the content's own `<mode>:terminal:<terminalId>` key, so
+ *    the still-running terminal's fallback row sorts fresh once it appears.
+ *
+ * Returns undefined when no sidebar row can result: non-terminal content,
+ * no terminalId, or a registry terminal that exists but is not running and
+ * carries no canonical identity (its live row is gone).
+ */
+export function liveTerminalRowIdentity(
+  content: PaneContent,
+  terminal: Pick<BackgroundTerminal, 'terminalId' | 'status' | 'mode' | 'sessionRef' | 'codexDurability'> | undefined,
+): LiveTerminalRowIdentity | undefined {
+  if (content.kind !== 'terminal' || !content.terminalId) return undefined
+  if (extractSessionLocators(content).length > 0) return undefined
+
+  if (terminal) {
+    const sessionRef = sanitizeSessionLocator(terminal.sessionRef)
+    if (sessionRef) {
+      return { provider: sessionRef.provider, key: `${sessionRef.provider}:${sessionRef.sessionId}` }
+    }
+    const durabilitySessionId = terminal.mode === 'codex'
+      ? terminal.codexDurability?.durableThreadId
+        ?? terminal.codexDurability?.candidate?.candidateThreadId
+      : undefined
+    if (durabilitySessionId) {
+      return { provider: 'codex', key: `codex:${durabilitySessionId}` }
+    }
+    if (terminal.status !== 'running') return undefined
+    if (!isNonShellMode(terminal.mode)) return undefined
+    const provider = terminal.mode as CodingCliProviderName
+    return { provider, key: `${provider}:terminal:${terminal.terminalId}` }
+  }
+
+  if (!isNonShellMode(content.mode)) return undefined
+  const provider = content.mode as CodingCliProviderName
+  return { provider, key: `${provider}:terminal:${content.terminalId}` }
 }
 
 export function getActiveSessionRefForTab(state: RootState, tabId: string): SessionRef | undefined {

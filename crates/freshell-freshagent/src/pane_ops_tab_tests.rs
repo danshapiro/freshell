@@ -129,8 +129,8 @@ async fn get_tabs_lists_rest_created_tabs_in_creation_order() {
     );
     assert_eq!(
         body["data"]["activeTabId"],
-        json!(browser_tab),
-        "create sets the active tab"
+        json!(shell_tab),
+        "agent creates are focus-neutral: the server cursor stays on the first tab"
     );
 
     state

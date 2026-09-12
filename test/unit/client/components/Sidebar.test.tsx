@@ -5,7 +5,7 @@ import { Provider } from 'react-redux'
 import { configureStore } from '@reduxjs/toolkit'
 import Sidebar from '@/components/Sidebar'
 import settingsReducer, { defaultSettings } from '@/store/settingsSlice'
-import tabsReducer from '@/store/tabsSlice'
+import tabsReducer, { closeTab } from '@/store/tabsSlice'
 import panesReducer from '@/store/panesSlice'
 import connectionReducer from '@/store/connectionSlice'
 import sessionsReducer, {
@@ -20,6 +20,7 @@ import opencodeActivityReducer, { type OpencodeActivityState } from '@/store/ope
 import terminalDirectoryReducer, { setTerminalDirectoryWindowData } from '@/store/terminalDirectorySlice'
 import tabRegistryReducer, { type TabRegistryState } from '@/store/tabRegistrySlice'
 import freshAgentReducer from '@/store/freshAgentSlice'
+import turnCompletionReducer from '@/store/turnCompletionSlice'
 import type { ProjectGroup, BackgroundTerminal, TabMode, Tab } from '@/store/types'
 import type { PaneNode } from '@/store/paneTypes'
 import type { ClientExtensionEntry } from '@shared/extension-types'
@@ -42,14 +43,36 @@ const defaultCliExtensions: ClientExtensionEntry[] = [
 
 // Mock the WebSocket client
 const mockSend = vi.fn()
-const mockOnMessage = vi.fn(() => () => {})
+const wsMessageHandlers = new Set<(msg: unknown) => void>()
+const mockOnMessage = vi.fn((handler: (msg: unknown) => void) => {
+  wsMessageHandlers.add(handler)
+  return () => {
+    wsMessageHandlers.delete(handler)
+  }
+})
 const mockConnect = vi.fn().mockResolvedValue(undefined)
 const mockFetchSidebarSessionsSnapshot = vi.fn()
 const mockGetTerminalDirectoryPage = vi.fn()
 
 vi.mock('@/lib/ws-client', () => ({
   getWsClient: () => ({
-    send: mockSend,
+    // Answer the evidence-gated close thunks' acknowledgements inline (the
+    // healthy-server shape, mirroring tabsSlice.test.ts) so component tests
+    // can dispatch the REAL closeTab and watch the close complete.
+    send: (msg: unknown) => {
+      mockSend(msg)
+      const m = msg as { type?: string; requestId?: string; createRequestId?: string }
+      if (m?.type === 'panes.closed' && m.requestId) {
+        for (const handler of [...wsMessageHandlers]) {
+          handler({ type: 'panes.closed.result', requestId: m.requestId, success: true })
+        }
+      }
+      if (m?.type === 'pane.closed' && m.createRequestId) {
+        for (const handler of [...wsMessageHandlers]) {
+          handler({ type: 'pane.closed.result', createRequestId: m.createRequestId, success: true })
+        }
+      }
+    },
     onMessage: mockOnMessage,
     connect: mockConnect,
   }),
@@ -151,6 +174,7 @@ function createTestStore(options?: {
   freshAgentSessions?: Record<string, FreshAgentSessionState>
   repoIcons?: Record<string, any>
   panesSettings?: Partial<(typeof defaultSettings)['panes']>
+  attentionByTab?: Record<string, boolean>
 }) {
   const projects = (options?.projects ?? []).map((project) => ({
     ...project,
@@ -198,6 +222,7 @@ function createTestStore(options?: {
       tabRegistry: tabRegistryReducer,
       freshAgent: freshAgentReducer,
       repoIcons: repoIconsReducer,
+      turnCompletion: turnCompletionReducer,
     },
     middleware: (getDefault) =>
       getDefault({
@@ -288,6 +313,10 @@ function createTestStore(options?: {
       },
       repoIcons: {
         byCwd: options?.repoIcons ?? {},
+      },
+      turnCompletion: {
+        ...turnCompletionReducer(undefined, { type: '@@test/init' }),
+        attentionByTab: options?.attentionByTab ?? {},
       },
     },
   })
@@ -917,7 +946,7 @@ describe('Sidebar Component - Session-Centric Display', () => {
           .querySelectorAll<HTMLButtonElement>(`button[data-session-id="${activeSessionId}"]`),
       )
       expect(rows).toHaveLength(1)
-      expect(rows.filter((row) => row.classList.contains('bg-emerald-100'))).toHaveLength(1)
+      expect(rows.filter((row) => row.classList.contains('bg-muted'))).toHaveLength(1)
     })
 
     it('treats pane resumeSessionId as open and active even when tab has none', async () => {
@@ -974,7 +1003,7 @@ describe('Sidebar Component - Session-Centric Display', () => {
       const button = screen.getByText('Pane-owned session').closest('button')
       expect(button).not.toBeNull()
       expect(button).toHaveAttribute('data-has-tab', 'true')
-      expect(button).toHaveClass('bg-emerald-100')
+      expect(button).toHaveClass('bg-muted')
     })
 
     it('does not treat non-UUID Claude pane resumeSessionId as canonical tab identity', async () => {
@@ -1239,6 +1268,83 @@ describe('Sidebar Component - Session-Centric Display', () => {
 
       expect(buttons[0]).toHaveTextContent('Was active session')
       expect(buttons[1]).toHaveTextContent('Never active session')
+    })
+
+    it('floats a just-closed session to the top of the grey section', async () => {
+      const now = Date.now()
+      const closerSid = sessionId('closing-float')
+      const greyNewerSid = sessionId('grey-newer')
+      const greyOlderSid = sessionId('grey-older')
+      const projects: ProjectGroup[] = [
+        {
+          projectPath: '/home/user/project',
+          sessions: [
+            {
+              sessionId: closerSid,
+              projectPath: '/home/user/project',
+              lastActivityAt: now - 7200000,
+              title: 'Closing session',
+              cwd: '/home/user/project',
+            },
+            {
+              sessionId: greyNewerSid,
+              projectPath: '/home/user/project',
+              lastActivityAt: now - 1000,
+              title: 'Grey newer session',
+              cwd: '/home/user/project',
+            },
+            {
+              sessionId: greyOlderSid,
+              projectPath: '/home/user/project',
+              lastActivityAt: now - 5000,
+              title: 'Grey older session',
+              cwd: '/home/user/project',
+            },
+          ],
+        },
+      ]
+
+      const tabs = [{
+        id: 'tab-closing',
+        resumeSessionId: closerSid,
+        sessionRef: { provider: 'claude', sessionId: closerSid },
+        mode: 'claude',
+      }]
+      const store = createTestStore({ projects, tabs, sortMode: 'activity' })
+      renderSidebar(store, [])
+
+      await act(async () => {
+        vi.advanceTimersByTime(100)
+      })
+
+      const buttons = () => screen.getAllByRole('button').filter(
+        // endsWith would never match: every session row button's textContent
+        // ends with the appended relative-timestamp span (Sidebar.tsx), so
+        // match with `includes`, exactly like the neighboring ratchet tests.
+        (btn) => btn.textContent?.includes('session')
+      )
+
+      // Pinned (local-open tier) first while its tab is open, then grey newest-first.
+      expect(buttons()[0]).toHaveTextContent('Closing session')
+      expect(buttons()[1]).toHaveTextContent('Grey newer session')
+      expect(buttons()[2]).toHaveTextContent('Grey older session')
+
+      const beforeClose = Date.now()
+      await act(async () => {
+        await store.dispatch(closeTab('tab-closing') as any)
+        vi.advanceTimersByTime(100)
+      })
+
+      // The close ratcheted the session's activity timestamp...
+      expect(store.getState().sessionActivity.sessions[`claude:${closerSid}`])
+        .toBeGreaterThanOrEqual(beforeClose)
+      // ...so the stale session — grey order [newer, older, closer] without it —
+      // lands on top of the grey section instead of sinking below both.
+      expect(buttons()).toHaveLength(3)
+      expect(buttons()[0]).toHaveTextContent('Closing session')
+      expect(buttons()[0]).toHaveAttribute('data-has-tab', 'false')
+      expect(buttons()[1]).toHaveTextContent('Grey newer session')
+      expect(buttons()[2]).toHaveTextContent('Grey older session')
     })
 
     it('shows green indicator for sessions with tabs, muted for others', async () => {
@@ -3197,7 +3303,6 @@ describe('Sidebar Component - Session-Centric Display', () => {
       const searchLoading = screen.getByTestId('search-loading')
       expect(searchLoading).toBeInTheDocument()
       expect(searchLoading.querySelector('span:not(.sr-only)')).toHaveTextContent('Searching...')
-      expect(searchInput).toHaveClass('pr-36')
     })
 
     it('hides search chrome when clearing to browse while stale search results remain visible', async () => {
@@ -5446,7 +5551,7 @@ describe('Sidebar Component - Session-Centric Display', () => {
   })
 
   describe('Sidebar row green/blue treatments', () => {
-    it('applies green fill and left border for an active open session', async () => {
+    it('applies green fill and left border for an active session that needs attention', async () => {
       const projects: ProjectGroup[] = [
         {
           projectPath: '/home/user/project',
@@ -5462,7 +5567,7 @@ describe('Sidebar Component - Session-Centric Display', () => {
         },
       ]
       const tabs = [{ id: 'tab-1', resumeSessionId: sessionId('active-open'), mode: 'claude' }]
-      const store = createTestStore({ projects, tabs, activeTabId: 'tab-1' })
+      const store = createTestStore({ projects, tabs, activeTabId: 'tab-1', attentionByTab: { 'tab-1': true } })
       renderSidebar(store, [])
 
       await act(async () => { vi.advanceTimersByTime(100) })
@@ -5510,10 +5615,10 @@ describe('Sidebar Component - Session-Centric Display', () => {
       await act(async () => { vi.advanceTimersByTime(100) })
 
       const button = screen.getByRole('button', { name: /active busy session/i })
-      expect(button).toHaveClass('bg-blue-100')
-      expect(button).toHaveClass('border-l-2')
-      expect(button).toHaveClass('border-l-blue-500')
-      expect(button).toHaveClass('dark:bg-blue-900/40')
+      expect(button).toHaveClass('bg-muted')
+      expect(button).toHaveClass('border-l-transparent')
+      expect(button).not.toHaveClass('bg-blue-100')
+      expect(button).not.toHaveClass('border-l-blue-500')
     })
 
     it('applies transparent border and no color treatment for an inactive closed session', async () => {
@@ -5543,7 +5648,7 @@ describe('Sidebar Component - Session-Centric Display', () => {
       expect(button).toHaveClass('border-l-transparent')
     })
 
-    it('applies light green fill for an inactive open session', async () => {
+    it('applies light green fill for an inactive session that needs attention', async () => {
       const projects: ProjectGroup[] = [
         {
           projectPath: '/home/user/project',
@@ -5559,7 +5664,7 @@ describe('Sidebar Component - Session-Centric Display', () => {
         },
       ]
       const tabs = [{ id: 'tab-1', resumeSessionId: sessionId('inactive-open'), mode: 'claude' }]
-      const store = createTestStore({ projects, tabs })
+      const store = createTestStore({ projects, tabs, attentionByTab: { 'tab-1': true } })
       renderSidebar(store, [])
 
       await act(async () => { vi.advanceTimersByTime(100) })
@@ -5616,10 +5721,9 @@ describe('Sidebar Component - Session-Centric Display', () => {
       await act(async () => { vi.advanceTimersByTime(100) })
 
       const button = screen.getByRole('button', { name: /inactive busy session/i })
-      expect(button).toHaveClass('bg-blue-50')
-      expect(button).toHaveClass('border-l-2')
-      expect(button).toHaveClass('border-l-blue-500/70')
-      expect(button).toHaveClass('dark:bg-blue-900/20')
+      expect(button).not.toHaveClass('bg-blue-50')
+      expect(button).not.toHaveClass('border-l-blue-500')
+      expect(button).toHaveClass('border-l-transparent')
     })
   })
 })

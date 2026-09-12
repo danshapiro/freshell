@@ -253,6 +253,43 @@ fn mutations_without_snapshot_report_no_layout_snapshot_but_create_tab_bootstrap
 }
 
 #[test]
+fn close_tab_preserves_cursor_for_background_closes_and_advances_on_active_close() {
+    // Cursor parity with the client's removeTab reducer: a failed agent
+    // create rolls the layout back to exactly the USER's tab (never the
+    // first), and only closing the cursor's own tab selects a survivor.
+    let store = LayoutStore::default();
+    let sync = sync_from(json!({
+        "tabs": [{ "id": "t1" }, { "id": "t2" }, { "id": "t3" }],
+        "activeTabId": "t3",
+        "layouts": {
+            "t1": leaf("p1", json!({ "kind": "terminal", "terminalId": "term-1" })),
+            "t2": leaf("p2", json!({ "kind": "terminal", "terminalId": "term-2" })),
+            "t3": leaf("p3", json!({ "kind": "terminal", "terminalId": "term-3" })),
+        },
+        "activePane": { "t1": "p1", "t2": "p2", "t3": "p3" },
+        "timestamp": 1,
+    }));
+    store.update_from_ui(&sync, "c");
+
+    // Background close (a failed agent create's rollback): cursor unmoved.
+    let (bg, _) = store.create_tab(None);
+    assert_eq!(store.close_tab(&bg).tab_id.as_deref(), Some(bg.as_str()));
+    assert_eq!(
+        store.get_normalized_snapshot(None)["activeTabId"],
+        json!("t3"),
+        "background closeTab must not move the cursor"
+    );
+
+    // Active close: the PREVIOUS neighbor inherits, not the first tab.
+    assert_eq!(store.close_tab("t3").tab_id.as_deref(), Some("t3"));
+    assert_eq!(
+        store.get_normalized_snapshot(None)["activeTabId"],
+        json!("t2"),
+        "active closeTab advances to the previous neighbor (client parity)"
+    );
+}
+
+#[test]
 fn swap_pane_exchanges_content_and_title_maps() {
     let store = LayoutStore::default();
     let sync = sync_from(json!({
@@ -599,7 +636,9 @@ fn split_pane_select_pane_and_attach_content_reseed_derived_titles() {
         json!("vertical")
     );
     assert_eq!(snap["layouts"][tab_id.as_str()]["sizes"], json!([50, 50]));
-    assert_eq!(snap["activePane"][tab_id.as_str()], json!(new_pane.clone()));
+    // Agent splits are focus-neutral: the server cursor stays on the
+    // pre-split pane (the client's splitPane carries activate:false).
+    assert_eq!(snap["activePane"][tab_id.as_str()], json!(pane_id.clone()));
     assert_eq!(
         snap["paneTitles"][tab_id.as_str()][new_pane.as_str()],
         json!("Shell")
@@ -648,6 +687,42 @@ fn split_pane_select_pane_and_attach_content_reseed_derived_titles() {
             .message,
         Some("tab not found")
     );
+}
+
+#[test]
+fn create_tab_and_split_pane_never_move_the_server_cursor() {
+    // Focus neutrality is a server contract too: REST/MCP cursor-relative
+    // operations (select-next/prev tab, omitted targets) must keep addressing
+    // the USER's selection while an agent's background create/split lands.
+    let store = LayoutStore::default();
+    let (t1, p1) = store.create_tab(Some("User"));
+    assert_eq!(
+        store.get_normalized_snapshot(None)["activeTabId"],
+        json!(t1),
+        "the FIRST tab still activates (nothing exists to steal)"
+    );
+
+    let (t2, p2) = store.create_tab(Some("Agent"));
+    let snap = store.get_normalized_snapshot(None);
+    assert_eq!(
+        snap["activeTabId"],
+        json!(t1),
+        "agent create must not move the server cursor"
+    );
+    assert_eq!(
+        snap["activePane"][t2.as_str()],
+        json!(p2),
+        "the new tab's own pane coordinate is populated"
+    );
+
+    let (_tab, new_pane) = store.split_pane(&p1, "vertical").expect("split works");
+    let snap = store.get_normalized_snapshot(None);
+    assert_eq!(
+        snap["activePane"][t1.as_str()],
+        json!(p1),
+        "agent split must not move the pane cursor"
+    );
+    assert_ne!(new_pane, p1); // sanity: a genuinely new pane id
 }
 
 // ── multi-client snapshots (the pane-rename cross-client fix) ──────────────

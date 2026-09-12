@@ -3,6 +3,7 @@ import type { ApiError } from '@/lib/api'
 import { api } from '@/lib/api'
 import { fuzzyMatch } from '@/lib/fuzzy-match'
 import { rankCandidateDirectories } from '@/lib/tab-directory-preference'
+import { usePaneFocusAdoption } from '@/hooks/usePaneFocusAdoption'
 import { cn } from '@/lib/utils'
 
 type DirectoryPickerProps = {
@@ -13,6 +14,11 @@ type DirectoryPickerProps = {
   globalDefault?: string
   onConfirm: (cwd: string) => void
   onBack: () => void
+  paneId?: string
+  focusEligible?: boolean
+  /** Focus-nudge epoch: explicit same-target selects bump this so the focus
+   *  effect re-runs even without an eligibility transition. */
+  focusEpoch?: number
 }
 
 type CompletionSuggestion = {
@@ -53,6 +59,9 @@ export default function DirectoryPicker({
   globalDefault,
   onConfirm,
   onBack,
+  paneId,
+  focusEligible = true,
+  focusEpoch = 0,
 }: DirectoryPickerProps) {
   const inputId = useId()
   const listboxId = useId()
@@ -74,10 +83,15 @@ export default function DirectoryPicker({
     setInputValue(defaultCwd ?? '')
   }, [defaultCwd])
 
+  // Eligible mounts are ownership-gated (agent-driven remounts must not yank
+  // focus from app chrome); eligibility flips bypass the gate.
+  const mayFocusNow = usePaneFocusAdoption(paneId, focusEligible, focusEpoch)
   useEffect(() => {
+    if (!focusEligible) return
+    if (!mayFocusNow()) return
     inputRef.current?.focus()
     inputRef.current?.select()
-  }, [])
+  }, [focusEligible, mayFocusNow])
 
   useEffect(() => {
     let cancelled = false

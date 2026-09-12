@@ -98,6 +98,34 @@ describe('Rust capability rejection wall', () => {
   })
 })
 
+describe('focus neutrality (MCP wrapper)', () => {
+  it('creation flows never issue a /select request — focus moves only via explicit select verbs', async () => {
+    // The browser-side contract (focus-neutral create/split) is enforced in the
+    // client fold; this pins the MCP wrapper: an accidental extra select POST
+    // in a creation flow would regress MCP-driven focus behavior end to end.
+    mockClient.get.mockImplementation((url: string) => {
+      if (url === '/api/tabs') {
+        return Promise.resolve({ data: { tabs: [{ id: 'tab-a', name: 'A', activePaneId: 'pmain' }], activeTabId: 'tab-a' } })
+      }
+      if (url.startsWith('/api/panes')) {
+        return Promise.resolve({ data: { panes: [{ id: 'pmain', tabId: 'tab-a', index: 0 }] } })
+      }
+      return Promise.resolve({ data: {} })
+    })
+    mockClient.post.mockResolvedValue({ data: { id: 'new-id' } })
+
+    await executeAction('new-tab', { name: 'Work', mode: 'claude' })
+    await executeAction('new-tab', { name: 'B', browser: 'https://example.com' })
+    await executeAction('new-tab', { name: 'E', editor: '/tmp/x.ts' })
+    await executeAction('split-pane', { target: 'pmain', direction: 'vertical', mode: 'shell' })
+    await executeAction('rename-tab', { name: 'Renamed', target: 'tab-a' })
+
+    const postedUrls = mockClient.post.mock.calls.map(([u]) => String(u))
+    expect(postedUrls.length).toBeGreaterThanOrEqual(3)
+    expect(postedUrls.every((url) => !url.endsWith('/select'))).toBe(true)
+  })
+})
+
 describe('executeAction -- tab actions', () => {
   it('new-tab calls POST /api/tabs with name and mode', async () => {
     mockClient.post.mockResolvedValue({ id: 't1' })

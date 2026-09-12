@@ -122,18 +122,38 @@ function createStore(overrides?: {
 
 function renderPicker(
   overrides?: Parameters<typeof createStore>[0],
-  props?: { onSelect?: ReturnType<typeof vi.fn>; onCancel?: ReturnType<typeof vi.fn>; isOnlyPane?: boolean }
+  props?: { onSelect?: ReturnType<typeof vi.fn>; onCancel?: ReturnType<typeof vi.fn>; isOnlyPane?: boolean; focusEligible?: boolean; paneId?: string; focusEpoch?: number }
 ) {
   const store = createStore(overrides)
   const onSelect = props?.onSelect ?? vi.fn()
   const onCancel = props?.onCancel ?? vi.fn()
   const isOnlyPane = props?.isOnlyPane ?? false
-  render(
+  const focusEligible = props?.focusEligible ?? true
+  const utils = render(
     <Provider store={store}>
-      <PanePicker onSelect={onSelect} onCancel={onCancel} isOnlyPane={isOnlyPane} />
+      <PanePicker
+        onSelect={onSelect}
+        onCancel={onCancel}
+        isOnlyPane={isOnlyPane}
+        focusEligible={focusEligible}
+        paneId={props?.paneId}
+        focusEpoch={props?.focusEpoch}
+      />
     </Provider>
   )
-  return { onSelect, onCancel, store }
+  const rerenderPicker = (next: { focusEligible?: boolean; focusEpoch?: number }) => utils.rerender(
+    <Provider store={store}>
+      <PanePicker
+        onSelect={onSelect}
+        onCancel={onCancel}
+        isOnlyPane={isOnlyPane}
+        focusEligible={next.focusEligible ?? focusEligible}
+        paneId={props?.paneId}
+        focusEpoch={next.focusEpoch ?? props?.focusEpoch}
+      />
+    </Provider>
+  )
+  return { onSelect, onCancel, store, rerenderPicker, ...utils }
 }
 
 // Helper to get the picker container
@@ -199,6 +219,19 @@ describe('PanePicker', () => {
       expect(screen.getByText('Editor')).toBeInTheDocument()
       expect(screen.getByText('Browser')).toBeInTheDocument()
       expect(screen.getByText('Shell')).toBeInTheDocument()
+    })
+
+    it('re-focuses the container on a focus epoch bump after a denied remount (same-target select)', () => {
+      const first = renderPicker(undefined, { paneId: 'pane-k' })
+      expect(getContainer()).toHaveFocus()
+      const chrome = document.createElement('input')
+      document.body.appendChild(chrome)
+      chrome.focus()
+      first.unmount() // records NOT owned
+      const second = renderPicker(undefined, { paneId: 'pane-k' })
+      expect(chrome).toHaveFocus() // denied adoption: agent split while user is in app chrome
+      second.rerenderPicker({ focusEpoch: 1 })
+      expect(getContainer()).toHaveFocus()
     })
 
     it('renders icons for each option', () => {
@@ -721,6 +754,11 @@ describe('PanePicker', () => {
       renderPicker()
       const container = getContainer()
       expect(container).toHaveFocus()
+    })
+
+    it('does not focus the picker container when focusEligible is false', () => {
+      renderPicker(undefined, { focusEligible: false })
+      expect(getContainer()).not.toHaveFocus()
     })
   })
 

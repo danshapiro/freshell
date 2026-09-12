@@ -875,7 +875,7 @@ describe('TerminalView keyboard handling', () => {
   })
 
   describe('other keys', () => {
-    it('sends plain Escape directly as terminal input', async () => {
+    it('passes plain Escape through to xterm and sends once via onData', async () => {
       const { store, tabId, paneId, paneContent } = createTestStore('term-1')
 
       render(
@@ -886,14 +886,19 @@ describe('TerminalView keyboard handling', () => {
 
       await waitFor(() => {
         expect(capturedKeyHandler).not.toBeNull()
+        expect(capturedOnData).not.toBeNull()
       })
 
       const wsSendCountBefore = wsMocks.send.mock.calls.length
       const event = createKeyboardEvent('Escape')
       const result = capturedKeyHandler!(event)
 
-      expect(result).toBe(false)
-      expect(event.preventDefault).toHaveBeenCalled()
+      expect(result).toBe(true)
+      expect(event.preventDefault).not.toHaveBeenCalled()
+      expect(wsMocks.send).toHaveBeenCalledTimes(wsSendCountBefore)
+
+      capturedOnData!('\x1b')
+
       expect(wsMocks.send).toHaveBeenCalledTimes(wsSendCountBefore + 1)
       expect(wsMocks.send).toHaveBeenLastCalledWith({
         type: 'terminal.input',

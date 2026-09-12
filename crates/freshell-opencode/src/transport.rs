@@ -78,11 +78,16 @@ impl ServeHttp for ReqwestServeHttp {
             // proves the serve never saw the request; every other `send()`
             // failure is possibly post-send, and a `bytes()` failure is PROVABLY
             // post-send (the response headers already arrived).
+            // `display_error_chain` keeps the reqwest `source()` chain (the
+            // TCP-level cause — "connection reset by peer", "connection closed
+            // before message completed") in the string the WARN/error frames
+            // carry, so the failure class stays diagnosable post-hoc.
             let resp = builder.send().await.map_err(|e| {
+                let rendered = crate::display_error_chain(&e);
                 if e.is_connect() {
-                    crate::ServeHttpError::Undelivered(e.to_string())
+                    crate::ServeHttpError::Undelivered(rendered)
                 } else {
-                    crate::ServeHttpError::Ambiguous(e.to_string())
+                    crate::ServeHttpError::Ambiguous(rendered)
                 }
             })?;
             let status = resp.status().as_u16();
@@ -95,7 +100,7 @@ impl ServeHttp for ReqwestServeHttp {
             let bytes = resp
                 .bytes()
                 .await
-                .map_err(|e| crate::ServeHttpError::Ambiguous(e.to_string()))?;
+                .map_err(|e| crate::ServeHttpError::Ambiguous(crate::display_error_chain(&e)))?;
             Ok(ServeHttpResponse {
                 status,
                 body: bytes.to_vec(),

@@ -24,10 +24,12 @@
 //!
 //! Loopback ephemeral ports only — never 3001/3002.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
+use serde::Deserialize;
 use serde_json::json;
 use tokio::net::TcpListener;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
@@ -36,6 +38,53 @@ use freshell_ws::WsState;
 
 const AUTH_TOKEN: &str = "e2e-codex-managed-launch-token";
 const RECV_TIMEOUT: Duration = Duration::from_secs(20);
+const SYNTHETIC_FRESHELL_TOKEN: &str = "synthetic-managed-codex-context-token";
+const FRESHELL_CONTEXT_ENV_KEYS: [&str; 6] = [
+    "FRESHELL",
+    "FRESHELL_URL",
+    "FRESHELL_TOKEN",
+    "FRESHELL_TERMINAL_ID",
+    "FRESHELL_TAB_ID",
+    "FRESHELL_PANE_ID",
+];
+
+/// The dispatcher and fake app-server intentionally capture only this
+/// allowlisted process surface. Context values are synthetic test data and
+/// assertions below never print either captured environment map.
+#[derive(Deserialize)]
+struct CapturedCodexProcess {
+    argv: Vec<String>,
+    env: BTreeMap<String, String>,
+}
+
+/// Restore the process-global test seam without ever formatting its values.
+/// The fixture owns only synthetic context, but this keeps an ambient server
+/// environment intact even when an assertion aborts the test early.
+struct TestEnvRestore {
+    values: Vec<(&'static str, Option<std::ffi::OsString>)>,
+}
+
+impl TestEnvRestore {
+    fn capture(keys: &[&'static str]) -> Self {
+        Self {
+            values: keys
+                .iter()
+                .map(|key| (*key, std::env::var_os(key)))
+                .collect(),
+        }
+    }
+}
+
+impl Drop for TestEnvRestore {
+    fn drop(&mut self) {
+        for (key, value) in self.values.drain(..) {
+            match value {
+                Some(value) => std::env::set_var(key, value),
+                None => std::env::remove_var(key),
+            }
+        }
+    }
+}
 
 fn test_settings_value() -> serde_json::Value {
     serde_json::json!({
@@ -79,8 +128,9 @@ fn codex_cli_spec() -> freshell_platform::CliCommandSpec {
 /// Write the node dispatcher that plays BOTH codex roles:
 /// - argv contains `app-server` → run the committed fake app-server fixture
 ///   (`test/fixtures/coding-cli/codex-app-server/fake-app-server.mjs`) — the sidecar.
-/// - otherwise (the TUI launch) → dump argv JSON to `$CODEX_ARGV_CAPTURE_PATH` and stay
-///   alive so the pane keeps running until the test kills it.
+/// - otherwise (the TUI launch) → dump complete argv plus only the six allowed
+///   Freshell environment fields to `$CODEX_ARGV_CAPTURE_PATH`, then stay alive
+///   so the pane keeps running until the test kills it.
 fn write_codex_dispatcher() -> std::path::PathBuf {
     let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../test/fixtures/coding-cli/codex-app-server/fake-app-server.mjs")
@@ -97,7 +147,17 @@ fn write_codex_dispatcher() -> std::path::PathBuf {
          if (args.includes('app-server')) {{\n\
            await import('file://{fixture}')\n\
          }} else {{\n\
-           fs.writeFileSync(process.env.CODEX_ARGV_CAPTURE_PATH, JSON.stringify(args))\n\
+           fs.writeFileSync(process.env.CODEX_ARGV_CAPTURE_PATH, JSON.stringify({{\n\
+             argv: args,\n\
+             env: {{\n\
+               FRESHELL: process.env.FRESHELL,\n\
+               FRESHELL_URL: process.env.FRESHELL_URL,\n\
+               FRESHELL_TOKEN: process.env.FRESHELL_TOKEN,\n\
+               FRESHELL_TERMINAL_ID: process.env.FRESHELL_TERMINAL_ID,\n\
+               FRESHELL_TAB_ID: process.env.FRESHELL_TAB_ID,\n\
+               FRESHELL_PANE_ID: process.env.FRESHELL_PANE_ID,\n\
+             }},\n\
+           }}))\n\
            setInterval(() => undefined, 1000)\n\
          }}\n",
         fixture = fixture.display()
@@ -113,7 +173,11 @@ fn write_codex_dispatcher() -> std::path::PathBuf {
     dispatcher
 }
 
-async fn spawn_server() -> (String, freshell_terminal::TerminalRegistry) {
+async fn spawn_server() -> (
+    String,
+    freshell_terminal::TerminalRegistry,
+    freshell_ws::WsState,
+) {
     let auth_token = Arc::new(AUTH_TOKEN.to_string());
     let broadcast_tx = Arc::new(tokio::sync::broadcast::channel::<String>(64).0);
     let settings =
@@ -174,7 +238,7 @@ async fn spawn_server() -> (String, freshell_terminal::TerminalRegistry) {
         fresh_agent_respawn_counts: Default::default(),
     };
 
-    let router = freshell_ws::router(state);
+    let router = freshell_ws::router(state.clone());
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind ephemeral loopback port");
@@ -183,7 +247,7 @@ async fn spawn_server() -> (String, freshell_terminal::TerminalRegistry) {
         let _ = axum::serve(listener, router).await;
     });
 
-    (format!("ws://{addr}/ws"), registry)
+    (format!("ws://{addr}/ws"), registry, state)
 }
 
 type TestWs =
@@ -217,19 +281,29 @@ async fn connect_and_handshake(url: &str) -> TestWs {
 
 /// Create a codex terminal and return the `terminal.created` frame (or the `error`
 /// frame, panicking with it for diagnosis).
-async fn create_codex_terminal(ws: &mut TestWs, request_id: &str, cwd: &str) -> serde_json::Value {
-    ws.send(WsMessage::Text(
-        json!({
-            "type": "terminal.create",
-            "requestId": request_id,
-            "mode": "codex",
-            "shell": "system",
-            "cwd": cwd,
-        })
-        .to_string(),
-    ))
-    .await
-    .expect("send terminal.create");
+async fn create_codex_terminal(
+    ws: &mut TestWs,
+    request_id: &str,
+    cwd: &str,
+    tab_id: Option<&str>,
+    pane_id: Option<&str>,
+) -> serde_json::Value {
+    let mut create = json!({
+        "type": "terminal.create",
+        "requestId": request_id,
+        "mode": "codex",
+        "shell": "system",
+        "cwd": cwd,
+    });
+    if let Some(tab_id) = tab_id {
+        create["tabId"] = json!(tab_id);
+    }
+    if let Some(pane_id) = pane_id {
+        create["paneId"] = json!(pane_id);
+    }
+    ws.send(WsMessage::Text(create.to_string()))
+        .await
+        .expect("send terminal.create");
     loop {
         let msg = tokio::time::timeout(RECV_TIMEOUT, ws.next())
             .await
@@ -266,6 +340,7 @@ async fn create_codex_terminal_resume(
             "mode": "codex",
             "shell": "system",
             "cwd": cwd,
+            "restore": true,
             "sessionRef": { "provider": "codex", "sessionId": resume_session_id },
         })
         .to_string(),
@@ -291,13 +366,13 @@ async fn create_codex_terminal_resume(
     }
 }
 
-/// Poll the capture file the dispatcher writes until it appears, then parse the argv.
-fn wait_for_captured_argv(path: &std::path::Path) -> Vec<String> {
+/// Poll a dispatcher or fake-app-server capture until it appears.
+fn wait_for_captured_process(path: &std::path::Path) -> CapturedCodexProcess {
     let deadline = std::time::Instant::now() + RECV_TIMEOUT;
     loop {
         if let Ok(raw) = std::fs::read_to_string(path) {
             if !raw.is_empty() {
-                return serde_json::from_str(&raw).expect("captured argv is a JSON array");
+                return serde_json::from_str(&raw).expect("captured process is JSON");
             }
         }
         assert!(
@@ -309,24 +384,172 @@ fn wait_for_captured_argv(path: &std::path::Path) -> Vec<String> {
     }
 }
 
+fn wait_for_captured_argv(path: &std::path::Path) -> Vec<String> {
+    wait_for_captured_process(path).argv
+}
+
 fn resume_pair_position(argv: &[String], session_id: &str) -> Option<usize> {
     argv.windows(2)
         .position(|w| w[0] == "resume" && w[1] == session_id)
 }
 
+/// Extract each complete Codex `-c` pair that configures the Freshell MCP
+/// server. Keeping the flag with its value protects ordering checks below.
+fn freshell_mcp_pairs(argv: &[String]) -> Vec<(String, String)> {
+    argv.windows(2)
+        .filter(|pair| pair[0] == "-c" && pair[1].starts_with("mcp_servers.freshell."))
+        .map(|pair| (pair[0].clone(), pair[1].clone()))
+        .collect()
+}
+
+fn managed_env_vars_config() -> String {
+    let names = freshell_platform::mcp_inject::FRESHELL_MCP_CONTEXT_ENV_VARS
+        .iter()
+        .map(|name| format!("{name:?}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("mcp_servers.freshell.env_vars=[{names}]")
+}
+
+fn mcp_recipe_pairs(pairs: &[(String, String)]) -> Vec<(String, String)> {
+    pairs
+        .iter()
+        .filter(|(_, value)| {
+            value.starts_with("mcp_servers.freshell.command=")
+                || value.starts_with("mcp_servers.freshell.args=")
+        })
+        .cloned()
+        .collect()
+}
+
+fn assert_spawned_pair_parity(
+    tui: &CapturedCodexProcess,
+    sidecar: &CapturedCodexProcess,
+    expected_terminal_id: &str,
+    expected_tab_id: Option<&str>,
+    expected_pane_id: Option<&str>,
+) {
+    let tui_pairs = freshell_mcp_pairs(&tui.argv);
+    let sidecar_pairs = freshell_mcp_pairs(&sidecar.argv);
+    let expected_env_vars = managed_env_vars_config();
+
+    for pairs in [&tui_pairs, &sidecar_pairs] {
+        assert!(
+            pairs
+                .iter()
+                .any(|(flag, value)| flag == "-c" && value == &expected_env_vars),
+            "managed Freshell MCP config must include the exact static env_vars pair"
+        );
+    }
+
+    let tui_recipe = mcp_recipe_pairs(&tui_pairs);
+    let sidecar_recipe = mcp_recipe_pairs(&sidecar_pairs);
+    assert!(
+        !tui_recipe.is_empty() && tui_recipe == sidecar_recipe,
+        "the TUI and newly spawned app-server must receive the same Freshell MCP command recipe"
+    );
+
+    let app_server_index = sidecar
+        .argv
+        .iter()
+        .position(|arg| arg == "app-server")
+        .expect("sidecar argv includes app-server");
+    assert!(
+        sidecar
+            .argv
+            .windows(2)
+            .enumerate()
+            .filter(|(_, pair)| pair[0] == "-c")
+            .all(|(index, _)| index < app_server_index),
+        "all sidecar configuration pairs must precede app-server"
+    );
+
+    let expected_keys = FRESHELL_CONTEXT_ENV_KEYS
+        .iter()
+        .copied()
+        .filter(|key| match *key {
+            "FRESHELL_TAB_ID" => expected_tab_id.is_some(),
+            "FRESHELL_PANE_ID" => expected_pane_id.is_some(),
+            _ => true,
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        tui.env == sidecar.env
+            && tui.env.len() == expected_keys.len()
+            && expected_keys.iter().all(|key| tui.env.contains_key(*key)),
+        "the TUI and newly spawned app-server must have equal allowlisted Freshell environments"
+    );
+    for capture in [tui, sidecar] {
+        assert!(
+            capture
+                .env
+                .get("FRESHELL_TERMINAL_ID")
+                .is_some_and(|id| id == expected_terminal_id),
+            "the spawned pair must receive the created terminal id"
+        );
+        match expected_tab_id {
+            Some(tab_id) => assert!(
+                capture
+                    .env
+                    .get("FRESHELL_TAB_ID")
+                    .is_some_and(|id| id == tab_id),
+                "the spawned pair must receive the requested tab id"
+            ),
+            None => assert!(
+                !capture.env.contains_key("FRESHELL_TAB_ID"),
+                "headless replacement launches intentionally omit tab id"
+            ),
+        }
+        match expected_pane_id {
+            Some(pane_id) => assert!(
+                capture
+                    .env
+                    .get("FRESHELL_PANE_ID")
+                    .is_some_and(|id| id == pane_id),
+                "the spawned pair must receive the requested pane id"
+            ),
+            None => assert!(
+                !capture.env.contains_key("FRESHELL_PANE_ID"),
+                "headless replacement launches intentionally omit pane id"
+            ),
+        }
+    }
+
+    for argv in [&tui.argv, &sidecar.argv] {
+        assert!(
+            !argv
+                .iter()
+                .any(|arg| arg.contains(SYNTHETIC_FRESHELL_TOKEN)),
+            "synthetic Freshell token must never be serialized into argv"
+        );
+    }
+}
+
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "host-gated e2e (needs node + repo node_modules); mutates process env — run alone with --ignored --test-threads=1"]
 async fn codex_terminal_create_argv_default_managed_and_flag_zero_optout() {
+    let _environment = TestEnvRestore::capture(&[
+        "AUTH_TOKEN",
+        "CODEX_ARGV_CAPTURE_PATH",
+        "CODEX_CMD",
+        "FAKE_CODEX_APP_SERVER_ARG_LOG",
+        "FRESHELL_CODEX_MANAGED_LAUNCH",
+        "FRESHELL_URL",
+        "PORT",
+    ]);
     let dispatcher = write_codex_dispatcher();
     let tmp_cwd = std::env::temp_dir().join(format!("freshell-codex-e2e-{}", std::process::id()));
     std::fs::create_dir_all(&tmp_cwd).unwrap();
     std::env::set_var("CODEX_CMD", &dispatcher);
+    std::env::set_var("PORT", "23123");
+    std::env::set_var("FRESHELL_URL", "http://127.0.0.1:23123");
+    std::env::set_var("AUTH_TOKEN", SYNTHETIC_FRESHELL_TOKEN);
     // DEV-0006 S5.e: the managed-launch default is ON, so "unset" IS the managed
     // leg. (Phase 1 is the default; Phase 2 opts out with "0"; Phase 3 resumes
     // under the default.)
     std::env::remove_var("FRESHELL_CODEX_MANAGED_LAUNCH");
 
-    let (ws_url, registry) = spawn_server().await;
+    let (ws_url, registry, state) = spawn_server().await;
     let mut ws = connect_and_handshake(&ws_url).await;
 
     // ── Phase 1: default (unset) must plan the managed launch (--remote 4-tuple
@@ -336,11 +559,34 @@ async fn codex_terminal_create_argv_default_managed_and_flag_zero_optout() {
         std::process::id()
     ));
     let _ = std::fs::remove_file(&default_capture);
+    let default_sidecar_capture = std::env::temp_dir().join(format!(
+        "freshell-codex-e2e-sidecar-default-{}.json",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&default_sidecar_capture);
     std::env::set_var("CODEX_ARGV_CAPTURE_PATH", &default_capture);
+    std::env::set_var("FAKE_CODEX_APP_SERVER_ARG_LOG", &default_sidecar_capture);
 
-    let created = create_codex_terminal(&mut ws, "req-default", tmp_cwd.to_str().unwrap()).await;
+    let created = create_codex_terminal(
+        &mut ws,
+        "req-default",
+        tmp_cwd.to_str().unwrap(),
+        Some("tab-e2e-fresh"),
+        Some("pane-e2e-fresh"),
+    )
+    .await;
     let default_terminal_id = created["terminalId"].as_str().unwrap().to_string();
-    let default_argv = wait_for_captured_argv(&default_capture);
+    let default_tui = wait_for_captured_process(&default_capture);
+    let default_sidecar = wait_for_captured_process(&default_sidecar_capture);
+    let default_argv = &default_tui.argv;
+
+    assert_spawned_pair_parity(
+        &default_tui,
+        &default_sidecar,
+        &default_terminal_id,
+        Some("tab-e2e-fresh"),
+        Some("pane-e2e-fresh"),
+    );
 
     // The first four tokens (terminal-registry.ts:295-307; DEV-0006 live capture).
     assert_eq!(default_argv[0], "--remote", "argv: {default_argv:?}");
@@ -399,7 +645,8 @@ async fn codex_terminal_create_argv_default_managed_and_flag_zero_optout() {
     std::env::set_var("CODEX_ARGV_CAPTURE_PATH", &off_capture);
     std::env::set_var("FRESHELL_CODEX_MANAGED_LAUNCH", "0");
 
-    let created = create_codex_terminal(&mut ws, "req-off", tmp_cwd.to_str().unwrap()).await;
+    let created =
+        create_codex_terminal(&mut ws, "req-off", tmp_cwd.to_str().unwrap(), None, None).await;
     let off_terminal_id = created["terminalId"].as_str().unwrap().to_string();
     let off_argv = wait_for_captured_argv(&off_capture);
 
@@ -412,6 +659,12 @@ async fn codex_terminal_create_argv_default_managed_and_flag_zero_optout() {
         &["-c".to_string(), "tui.notification_method=bel".to_string()],
         "explicit \"0\" argv must keep the plain-CLI shape (retired G-X0): {off_argv:?}"
     );
+    assert!(
+        !freshell_mcp_pairs(&off_argv)
+            .iter()
+            .any(|(_, value)| value == &managed_env_vars_config()),
+        "explicit opt-out must not add the managed-sidecar-only env_vars configuration"
+    );
     registry.kill(&off_terminal_id);
 
     // ── Phase 3: managed resume — default (unset) + resumeSessionId; the resume
@@ -422,7 +675,13 @@ async fn codex_terminal_create_argv_default_managed_and_flag_zero_optout() {
         std::process::id()
     ));
     let _ = std::fs::remove_file(&resume_capture);
+    let resume_sidecar_capture = std::env::temp_dir().join(format!(
+        "freshell-codex-e2e-sidecar-resume-{}.json",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&resume_sidecar_capture);
     std::env::set_var("CODEX_ARGV_CAPTURE_PATH", &resume_capture);
+    std::env::set_var("FAKE_CODEX_APP_SERVER_ARG_LOG", &resume_sidecar_capture);
 
     let created = create_codex_terminal_resume(
         &mut ws,
@@ -432,7 +691,16 @@ async fn codex_terminal_create_argv_default_managed_and_flag_zero_optout() {
     )
     .await;
     let resume_terminal_id = created["terminalId"].as_str().unwrap().to_string();
-    let resume_argv = wait_for_captured_argv(&resume_capture);
+    let resume_tui = wait_for_captured_process(&resume_capture);
+    let resume_sidecar = wait_for_captured_process(&resume_sidecar_capture);
+    let resume_argv = &resume_tui.argv;
+    assert_spawned_pair_parity(
+        &resume_tui,
+        &resume_sidecar,
+        &resume_terminal_id,
+        None,
+        None,
+    );
     assert_eq!(
         resume_argv[0], "--remote",
         "managed resume argv: {resume_argv:?}"
@@ -451,8 +719,52 @@ async fn codex_terminal_create_argv_default_managed_and_flag_zero_optout() {
     );
     registry.kill(&resume_terminal_id);
 
+    // ── Phase 4: headless auto-resume gets a newly spawned managed pair, but
+    // ── intentionally has no layout ids ─────────────────────────────────────────
+    let auto_resume_capture = std::env::temp_dir().join(format!(
+        "freshell-codex-e2e-argv-auto-resume-{}.json",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&auto_resume_capture);
+    let auto_resume_sidecar_capture = std::env::temp_dir().join(format!(
+        "freshell-codex-e2e-sidecar-auto-resume-{}.json",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&auto_resume_sidecar_capture);
+    std::env::set_var("CODEX_ARGV_CAPTURE_PATH", &auto_resume_capture);
+    std::env::set_var(
+        "FAKE_CODEX_APP_SERVER_ARG_LOG",
+        &auto_resume_sidecar_capture,
+    );
+
+    let auto_resume_terminal_id = freshell_ws::terminal::respawn_agent_terminal(
+        &state,
+        &freshell_ws::terminal::AgentRespawnRequest {
+            mode: "codex".into(),
+            provider: "codex".into(),
+            session_id: "thread-e2e-auto-resume".into(),
+            create_request_id: "req-auto-resume".into(),
+            cwd: Some(tmp_cwd.to_string_lossy().into_owned()),
+        },
+    )
+    .await
+    .expect("managed Codex auto-resume spawn");
+    let auto_resume_tui = wait_for_captured_process(&auto_resume_capture);
+    let auto_resume_sidecar = wait_for_captured_process(&auto_resume_sidecar_capture);
+    let auto_resume_argv = &auto_resume_tui.argv;
+    assert_spawned_pair_parity(
+        &auto_resume_tui,
+        &auto_resume_sidecar,
+        &auto_resume_terminal_id,
+        None,
+        None,
+    );
+    assert!(
+        resume_pair_position(auto_resume_argv, "thread-e2e-auto-resume").is_some(),
+        "auto-resume argv must retain the Codex resume pair: {auto_resume_argv:?}"
+    );
+    registry.kill(&auto_resume_terminal_id);
+
     // ── Cleanup ───────────────────────────────────────────────────────────────────
-    std::env::remove_var("FRESHELL_CODEX_MANAGED_LAUNCH");
-    std::env::remove_var("CODEX_ARGV_CAPTURE_PATH");
-    std::env::remove_var("CODEX_CMD");
+    // `_environment` restores all process-global test seams on scope exit.
 }

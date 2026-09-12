@@ -33,7 +33,9 @@ use std::collections::BTreeMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
+use crate::path::convert_windows_path_to_wsl_path;
 use crate::spawn::{McpInjection, ProviderTarget};
+use crate::{Env, HostOs};
 
 /// An MCP injection failure. `message` carries the reference-exact `Error.message`
 /// where one exists (`cw` throw sites); IO failures carry the OS error text.
@@ -66,6 +68,25 @@ impl std::error::Error for McpInjectError {}
 pub enum McpServerArg {
     Literal(String),
     Path(String),
+}
+
+/// Freshell context names that Codex forwards from the parent process to its
+/// stdio MCP child. Values intentionally remain in the parent environment.
+pub const FRESHELL_MCP_CONTEXT_ENV_VARS: [&str; 6] = [
+    "FRESHELL",
+    "FRESHELL_URL",
+    "FRESHELL_TOKEN",
+    "FRESHELL_TERMINAL_ID",
+    "FRESHELL_TAB_ID",
+    "FRESHELL_PANE_ID",
+];
+
+/// Target-specific inline MCP renderings for a managed Codex TUI and its
+/// host-native app-server sidecar.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ManagedCodexMcpRenderings {
+    pub tui: McpInjection,
+    pub sidecar: McpInjection,
 }
 
 /// An MCP command is a complete executable plus its arguments. Keeping the
@@ -462,6 +483,19 @@ pub fn build_mcp_server_command(
     ))
 }
 
+fn render_mcp_server_command_recipe(
+    recipe: &[McpServerArg],
+    mut render_path: impl FnMut(&str) -> Result<String, McpInjectError>,
+) -> Result<Vec<String>, McpInjectError> {
+    recipe
+        .iter()
+        .map(|arg| match arg {
+            McpServerArg::Literal(value) => Ok(value.clone()),
+            McpServerArg::Path(path) => render_path(path),
+        })
+        .collect()
+}
+
 /// `tomlEscape` (`cw:142-144`): wrap in `"` with `\` → `\\` and `"` → `\"`.
 pub fn toml_escape(value: &str) -> String {
     format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
@@ -491,6 +525,124 @@ pub fn codex_inline_toml_command_args(server_command: &str, server_args: &[Strin
         "-c".to_string(),
         format!("mcp_servers.freshell.args=[{toml_args}]"),
     ]
+}
+
+fn managed_codex_inline_toml_args(
+    server_command: &str,
+    server_args: &[String],
+) -> Vec<String> {
+    let mut args = codex_inline_toml_command_args(server_command, server_args);
+    let env_vars = FRESHELL_MCP_CONTEXT_ENV_VARS
+        .iter()
+        .map(|name| toml_escape(name))
+        .collect::<Vec<_>>()
+        .join(", ");
+    args.extend([
+        "-c".to_string(),
+        format!("mcp_servers.freshell.env_vars=[{env_vars}]"),
+    ]);
+    args
+}
+
+/// Render one tagged MCP recipe for the managed Codex TUI and separately for
+/// the host-native app-server sidecar. The static `env_vars` declaration tells
+/// Codex which parent-process Freshell context names to retain for its stdio
+/// MCP child without placing any values in inline TOML.
+pub fn build_managed_codex_mcp_renderings(
+    runtime: &dyn McpRuntime,
+    env: &dyn Env,
+    host_os: HostOs,
+    is_wsl_env: bool,
+    tui_target: ProviderTarget,
+) -> Result<ManagedCodexMcpRenderings, McpInjectError> {
+    // Resolve the tagged command once so the TUI and sidecar receive the same
+    // immutable recipe and a runtime cannot return mismatched paths per call.
+    let command = runtime.server_command()?;
+    let sidecar_target = if host_os == HostOs::Windows {
+        ProviderTarget::Windows
+    } else {
+        ProviderTarget::Unix
+    };
+
+    Ok(ManagedCodexMcpRenderings {
+        tui: managed_codex_mcp_injection(
+            &command,
+            runtime,
+            env,
+            host_os,
+            is_wsl_env,
+            tui_target,
+        )?,
+        sidecar: managed_codex_mcp_injection(
+            &command,
+            runtime,
+            env,
+            host_os,
+            is_wsl_env,
+            sidecar_target,
+        )?,
+    })
+}
+
+fn managed_codex_mcp_injection(
+    command: &McpServerCommand,
+    runtime: &dyn McpRuntime,
+    env: &dyn Env,
+    host_os: HostOs,
+    is_wsl_env: bool,
+    target: ProviderTarget,
+) -> Result<McpInjection, McpInjectError> {
+    // A packaged Windows Node remains a Windows process even when a Unix TUI
+    // launches it through WSL. Translate only the executable and carry the
+    // Windows arguments unchanged across that process boundary.
+    if target == ProviderTarget::Unix && host_os == HostOs::Windows {
+        if let McpServerArg::Path(executable) = &command.command {
+            if executable.as_bytes().get(1) == Some(&b':') || executable.starts_with("\\\\") {
+                let mut rendered = vec![
+                    format!("WSLENV={}", mcp_wsl_env(runtime.wsl_env())),
+                    runtime.convert_to_unix_path(executable)?,
+                ];
+                rendered.extend(command.args.iter().map(|arg| match arg {
+                    McpServerArg::Literal(value) | McpServerArg::Path(value) => value.clone(),
+                }));
+                return Ok(McpInjection {
+                    args: managed_codex_inline_toml_args("env", &rendered),
+                    env: BTreeMap::new(),
+                });
+            }
+        }
+    }
+
+    let server_command = match &command.command {
+        McpServerArg::Literal(value) => value.clone(),
+        McpServerArg::Path(path) => {
+            if host_os == HostOs::Windows && target == ProviderTarget::Unix {
+                convert_windows_path_to_wsl_path(path, env, is_wsl_env).ok_or_else(|| {
+                    McpInjectError::new(
+                        "Cannot render managed Codex path for a Unix TUI: failed to convert the Windows path to a WSL path.",
+                    )
+                })?
+            } else {
+                provider_path(runtime, target, path)?
+            }
+        }
+    };
+    let server_args = render_mcp_server_command_recipe(&command.args, |path| {
+        if host_os == HostOs::Windows && target == ProviderTarget::Unix {
+            convert_windows_path_to_wsl_path(path, env, is_wsl_env).ok_or_else(|| {
+                McpInjectError::new(
+                    "Cannot render managed Codex MCP path for a Unix TUI: failed to convert the Windows path to a WSL path.",
+                )
+            })
+        } else {
+            provider_path(runtime, target, path)
+        }
+    })?;
+
+    Ok(McpInjection {
+        args: managed_codex_inline_toml_args(&server_command, &server_args),
+        env: BTreeMap::new(),
+    })
 }
 
 fn tmp_file_path(rt: &dyn McpRuntime, terminal_id: &str) -> PathBuf {

@@ -48,8 +48,10 @@ use tokio::sync::mpsc;
 use tracing::Instrument;
 use uuid::Uuid;
 
-use freshell_platform::detect::{host_os_live, is_windows, is_wsl_env_live};
-use freshell_platform::mcp_inject::{cleanup_mcp_config, generate_mcp_injection, RealMcpRuntime};
+use freshell_platform::detect::{host_os_live, is_windows, is_wsl_env_live, HostOs};
+use freshell_platform::mcp_inject::{
+    build_managed_codex_mcp_renderings, cleanup_mcp_config, generate_mcp_injection, RealMcpRuntime,
+};
 use freshell_platform::spawn::{
     cli_provider_target, resolve_coding_cli_command, resolve_mcp_cwd, resolve_shell,
     resolve_unix_shell_cwd, CliLaunchInputs, LaunchIntent, McpInjection,
@@ -1979,6 +1981,55 @@ fn cli_provider_settings(
     (pick("permissionMode"), pick("model"), pick("sandbox"))
 }
 
+/// One value-safe rendering of the managed Codex launch shared by its TUI
+/// and a newly spawned app-server. It deliberately has no `Debug` impl: the
+/// parent environment carries terminal context values and must never be
+/// formatted into logs or error surfaces.
+struct CodexManagedLaunchSetup {
+    terminal_id: String,
+    runtime_cwd: Option<String>,
+    tui_mcp_injection: McpInjection,
+    terminal_env: BTreeMap<String, String>,
+    sidecar_context: freshell_codex::launch_plan::CodexSidecarLaunchContext,
+}
+
+/// Build the terminal-scoped managed Codex setup exactly once. The sidecar
+/// gets the host-native rendering and the same canonical terminal environment
+/// as the TUI; the TUI gets its selected target rendering. A claimed survivor
+/// never consumes this value (runtime selection preserves it unchanged).
+fn build_codex_managed_launch_setup(
+    terminal_id: String,
+    shell: ShellType,
+    host_os: HostOs,
+    is_wsl: bool,
+    resolved_cwd: Option<&str>,
+    tab_id: Option<&str>,
+    pane_id: Option<&str>,
+) -> Result<CodexManagedLaunchSetup, String> {
+    let runtime_cwd = resolve_mcp_cwd(resolved_cwd, &RealEnv, host_os, is_wsl);
+    let tui_target = cli_provider_target(shell, host_os, is_wsl, resolved_cwd, &RealEnv);
+    let renderings =
+        build_managed_codex_mcp_renderings(&RealMcpRuntime, &RealEnv, host_os, is_wsl, tui_target)
+            .map_err(|error| error.message)?;
+    let freshell_platform::mcp_inject::ManagedCodexMcpRenderings { tui, sidecar } = renderings;
+    let terminal_env = build_terminal_base_env(&RealEnv, &terminal_id, tab_id, pane_id);
+    let mut sidecar_env = sidecar.env;
+    // Canonical terminal values are the authority if a renderer ever grows an
+    // overlapping environment key.
+    sidecar_env.extend(terminal_env.clone());
+
+    Ok(CodexManagedLaunchSetup {
+        terminal_id,
+        runtime_cwd,
+        tui_mcp_injection: tui,
+        terminal_env,
+        sidecar_context: freshell_codex::launch_plan::CodexSidecarLaunchContext {
+            config_args: sidecar.args,
+            env: sidecar_env,
+        },
+    })
+}
+
 /// WS-side projection of [`CodexLaunchError`] keeping exactly the
 /// distinctions the create doors need (graceful restore/resume S1).
 pub(crate) enum PlanLaunchError {
@@ -2006,9 +2057,8 @@ impl PlanLaunchError {
 /// default ON since S5.e): plan the managed app-server launch
 /// (`planCodexLaunch`, ws:2442-2449: sidecar spawn + remote proxy, 5-attempt
 /// initial budget); the codex provider settings route through the PLAN, not
-/// argv (the `ws:2464-2465` strip). Flag `"0"` opts out to the plain-CLI shape
-/// (`Ok(None)` — the retired G-X0 shape; G-X1/G-X2 pin the live path since the
-/// S5.e flip).
+/// argv (the `ws:2464-2465` strip). Callers apply the explicit `"0"` opt-out
+/// before reaching this helper, retaining the plain-CLI shape.
 ///
 /// Extracted from `handle_create` so the auto-resume respawn seam (Task 4)
 /// plans identically. `Err` carries the thrown planCodexLaunch message —
@@ -2018,17 +2068,11 @@ impl PlanLaunchError {
 /// doors pass `None` (never-fired watch minted in the manager).
 async fn plan_codex_managed_launch(
     state: &WsState,
-    mode: &str,
-    raw_cwd: Option<&str>,
+    setup: &CodexManagedLaunchSetup,
     resume_session_id: Option<&str>,
     class: freshell_codex::launch_lifecycle::LaunchClass,
     cancel: Option<&mut tokio::sync::watch::Receiver<bool>>,
-) -> Result<Option<freshell_codex::launch_lifecycle::CodexTerminalLaunch>, PlanLaunchError> {
-    let managed_flag =
-        std::env::var(freshell_codex::launch_plan::FRESHELL_CODEX_MANAGED_LAUNCH_ENV).ok();
-    if !codex_create_uses_managed_launch(mode, managed_flag.as_deref()) {
-        return Ok(None);
-    }
+) -> Result<freshell_codex::launch_lifecycle::CodexTerminalLaunch, PlanLaunchError> {
     let codex_provider = state.settings.coding_cli.providers.get("codex");
     let provider_str = |key: &str| {
         codex_provider
@@ -2041,11 +2085,12 @@ async fn plan_codex_managed_launch(
     // `approvalPolicy: providerSettings?.permissionMode` (`ws:942`).
     let plan_approval = provider_str("permissionMode");
     let input = freshell_codex::launch_plan::CodexLaunchPlanInput {
-        cwd: raw_cwd,
+        cwd: setup.runtime_cwd.as_deref(),
         resume_session_id,
         model: plan_model.as_deref(),
         sandbox: plan_sandbox.as_deref(),
         approval_policy: plan_approval.as_deref(),
+        sidecar_context: setup.sidecar_context.clone(),
     };
     let manager = freshell_codex::launch_lifecycle::CodexTerminalLaunchManager::global();
     let result = match cancel {
@@ -2069,7 +2114,7 @@ async fn plan_codex_managed_launch(
                 .await
         }
     };
-    result.map(Some).map_err(|error| match error {
+    result.map_err(|error| match error {
         freshell_codex::launch_lifecycle::CodexLaunchError::QueueFull => PlanLaunchError::QueueFull,
         freshell_codex::launch_lifecycle::CodexLaunchError::Cancelled => PlanLaunchError::Cancelled,
         other => PlanLaunchError::Failed(other.to_string()),
@@ -2484,24 +2529,40 @@ pub(crate) fn derive_launch_prep(create: &TerminalCreate, mode: &str) -> LaunchP
 /// (which is `Handle::try_current()`-guarded — Task 2 — so this Drop can
 /// NEVER panic, even outside runtime context).
 pub(crate) struct PreparedCodexLaunch(
-    Option<freshell_codex::launch_lifecycle::CodexTerminalLaunch>,
+    Option<(
+        CodexManagedLaunchSetup,
+        freshell_codex::launch_lifecycle::CodexTerminalLaunch,
+    )>,
 );
 
 impl PreparedCodexLaunch {
-    pub(crate) fn new(
-        launch: Option<freshell_codex::launch_lifecycle::CodexTerminalLaunch>,
+    fn new(
+        setup: CodexManagedLaunchSetup,
+        launch: freshell_codex::launch_lifecycle::CodexTerminalLaunch,
     ) -> Self {
-        Self(launch)
+        Self(Some((setup, launch)))
     }
+
+    /// The ID was reserved before off-permit planning. Reuse it in
+    /// `handle_create`; do not mint or render a second terminal context.
+    fn terminal_id(&self) -> Option<&str> {
+        self.0.as_ref().map(|(setup, _)| setup.terminal_id.as_str())
+    }
+
     /// Hand the launch to the adoption path; the guard becomes inert.
-    pub(crate) fn take(&mut self) -> Option<freshell_codex::launch_lifecycle::CodexTerminalLaunch> {
+    fn take(
+        &mut self,
+    ) -> Option<(
+        CodexManagedLaunchSetup,
+        freshell_codex::launch_lifecycle::CodexTerminalLaunch,
+    )> {
         self.0.take()
     }
 }
 
 impl Drop for PreparedCodexLaunch {
     fn drop(&mut self) {
-        if let Some(launch) = self.0.take() {
+        if let Some((_, launch)) = self.0.take() {
             tracing::info!(
                 target: "freshell_ws::create",
                 "prepared_codex_launch_discarded"
@@ -2681,18 +2742,40 @@ pub(crate) async fn prepare_launch(
     // sessionRef/resumeSessionId keeps today's EXACT on-permit inline
     // planning path (LaunchClass::Interactive inside handle_create),
     // byte-identical to today.
-    let codex_launch = if prep.resume_session_id.is_some() {
+    let managed_flag =
+        std::env::var(freshell_codex::launch_plan::FRESHELL_CODEX_MANAGED_LAUNCH_ENV).ok();
+    let codex_launch = if prep.resume_session_id.is_some()
+        && codex_create_uses_managed_launch(&mode, managed_flag.as_deref())
+    {
+        // Reserve exactly one ID only for a managed resume that will plan.
+        // The structured guard carries it through the spawn-gate wait so the
+        // eventual PTY and already-spawned sidecar cannot diverge.
+        let host_os = host_os_live();
+        let setup = build_codex_managed_launch_setup(
+            Uuid::new_v4().simple().to_string(),
+            map_shell(create.shell),
+            host_os,
+            is_wsl_env_live(),
+            resolve_create_cwd(
+                create.cwd.as_deref(),
+                state.settings.default_cwd.as_deref(),
+                host_os,
+            )
+            .as_deref(),
+            create.tab_id.as_deref(),
+            create.pane_id.as_deref(),
+        )
+        .map_err(PrepareError::PlanFailed)?;
         match plan_codex_managed_launch(
             state,
-            &mode,
-            create.cwd.as_deref(),
+            &setup,
             prep.resume_session_id.as_deref(),
             freshell_codex::launch_lifecycle::LaunchClass::Restore,
             Some(cancel),
         )
         .await
         {
-            Ok(launch) => Some(PreparedCodexLaunch::new(launch)),
+            Ok(launch) => Some(PreparedCodexLaunch::new(setup, launch)),
             Err(PlanLaunchError::QueueFull) => return Err(PrepareError::PlanQueueFull),
             Err(PlanLaunchError::Cancelled) => return Err(PrepareError::Cancelled),
             Err(PlanLaunchError::Failed(message)) => return Err(PrepareError::PlanFailed(message)),
@@ -2941,11 +3024,6 @@ pub(crate) async fn handle_create(
         .await;
     }
 
-    // `terminalId` via UUID (nanoid-alphabet-compatible for the oracle validator);
-    // `streamId` via UUIDv4 (the reference's randomUUID()).
-    let terminal_id = Uuid::new_v4().simple().to_string();
-    let stream_id = Uuid::new_v4().to_string();
-
     let host_os = host_os_live();
     let is_wsl = is_wsl_env_live();
     let shell = map_shell(create.shell);
@@ -2971,6 +3049,17 @@ pub(crate) async fn handle_create(
         )
         .await;
     }
+
+    // `terminalId` via UUID (nanoid-alphabet-compatible for the oracle
+    // validator); `streamId` via UUIDv4. A prepared managed restore already
+    // reserved the terminal id before off-permit planning, so reuse that one
+    // instead of minting/rerendering a second context.
+    let terminal_id = prepared_codex
+        .as_ref()
+        .and_then(PreparedCodexLaunch::terminal_id)
+        .map(str::to_string)
+        .unwrap_or_else(|| Uuid::new_v4().simple().to_string());
+    let stream_id = Uuid::new_v4().to_string();
 
     // Resolve the effective cwd BEFORE any branch/mcp computation (`tr:1565` via
     // `resolve_create_cwd`): explicit `create.cwd`, else `settings.defaultCwd`,
@@ -3378,84 +3467,107 @@ pub(crate) async fn handle_create(
         None
     };
 
-    // codex `--remote <wsUrl>` (DEV-0006, `FRESHELL_CODEX_MANAGED_LAUNCH` default
-    // ON since S5.e): plan the managed app-server launch (`planCodexLaunch`,
-    // ws:2442-2449: sidecar spawn + remote proxy, 5-attempt initial budget) and
-    // point the TUI at the PROXY's ws URL; the codex provider settings route
-    // through the PLAN, not argv (the `ws:2464-2465` strip above). Flag `"0"`
-    // opts out to the plain-CLI shape (the retired G-X0 shape; G-X1/G-X2 pin the
-    // live path since the S5.e flip).
-    // Extracted to `plan_codex_managed_launch` (shared with the auto-resume
-    // respawn seam, Task 4). Legacy plans with the RAW create cwd (`ws:2444`
-    // passes `m.cwd`).
-    let codex_launch = match prepared_codex.as_mut() {
-        // Restore path with a derived resume id: planned pre-gate (P1).
-        // take() disarms the guard — from here the existing failed-spawn
-        // arm and adopt path own the launch exactly as today. The None arm
-        // below serves interactive creates AND the A4 fresh-plan exclusion
-        // (restore:true codex with no derived resume session id): both plan
-        // on-permit inline, byte-identical to today.
-        Some(guard) => guard.take(),
-        None => match plan_codex_managed_launch(
-            state,
-            &mode,
-            create.cwd.as_deref(),
-            resume_session_id.as_deref(),
-            freshell_codex::launch_lifecycle::LaunchClass::Interactive,
-            None,
-        )
-        .await
-        {
-            Ok(launch) => launch,
-            Err(error) => {
-                // A thrown planCodexLaunch surfaces through the generic create catch
-                // (`ws:2606-2614`) as an `error{code:PTY_SPAWN_FAILED}` frame.
-                // QueueFull/Cancelled are unreachable for Interactive-class
-                // `None`-cancel calls; `message()` keeps the frame text
-                // identical for `Failed`.
-                return send_create_error(
-                    out,
-                    ErrorCode::PtySpawnFailed,
-                    error.message(),
-                    &create.request_id,
-                )
-                .await;
-            }
-        },
+    // Build one managed setup for each newly spawned pair. A prepared resume
+    // hands us its original setup/launch; a fresh or A4-inline plan builds it
+    // only after every validation/duplicate gate above has passed.
+    let prepared_pair = prepared_codex.as_mut().and_then(PreparedCodexLaunch::take);
+    let managed_flag =
+        std::env::var(freshell_codex::launch_plan::FRESHELL_CODEX_MANAGED_LAUNCH_ENV).ok();
+    let (codex_setup, codex_launch) = match prepared_pair {
+        Some((setup, launch)) => (Some(setup), Some(launch)),
+        None if codex_create_uses_managed_launch(&mode, managed_flag.as_deref()) => {
+            let setup = match build_codex_managed_launch_setup(
+                terminal_id.clone(),
+                shell,
+                host_os,
+                is_wsl,
+                resolved_cwd.as_deref(),
+                create.tab_id.as_deref(),
+                create.pane_id.as_deref(),
+            ) {
+                Ok(setup) => setup,
+                Err(message) => {
+                    return send_create_error(
+                        out,
+                        ErrorCode::PtySpawnFailed,
+                        message,
+                        &create.request_id,
+                    )
+                    .await
+                }
+            };
+            let launch = match plan_codex_managed_launch(
+                state,
+                &setup,
+                resume_session_id.as_deref(),
+                freshell_codex::launch_lifecycle::LaunchClass::Interactive,
+                None,
+            )
+            .await
+            {
+                Ok(launch) => launch,
+                Err(error) => {
+                    return send_create_error(
+                        out,
+                        ErrorCode::PtySpawnFailed,
+                        error.message(),
+                        &create.request_id,
+                    )
+                    .await
+                }
+            };
+            (Some(setup), Some(launch))
+        }
+        None => (None, None),
     };
     let codex_remote_ws_url: Option<String> =
         codex_launch.as_ref().map(|l| l.remote_ws_url.clone());
 
-    // ProviderTarget + host-native mcp cwd (`tr:911-914,1153,1203,1236,1262`).
+    // The TUI target still drives CLI resolution. Managed Codex uses the
+    // setup's one-shot TUI rendering/environment; all other paths retain the
+    // existing generic MCP computation unchanged.
     let target = cli_provider_target(shell, host_os, is_wsl, resolved_cwd.as_deref(), &RealEnv);
-    let mcp_cwd = if mode == "shell" {
-        None
-    } else {
-        resolve_mcp_cwd(resolved_cwd.as_deref(), &RealEnv, host_os, is_wsl)
-    };
-
-    // MCP injection (§3.2 IO layer). Reference parity: a throw here propagates out
-    // of buildSpawnSpec BEFORE the pty.spawn try — no cleanup call on this path.
-    let mcp_injection = if mode == "shell" {
-        McpInjection::default()
-    } else {
-        match generate_mcp_injection(
-            &RealMcpRuntime,
-            &mode,
-            &terminal_id,
-            mcp_cwd.as_deref(),
-            target,
-        ) {
-            Ok(i) => i,
-            Err(e) => {
-                return send_create_error(
-                    out,
-                    ErrorCode::PtySpawnFailed,
-                    e.message,
-                    &create.request_id,
-                )
-                .await
-            }
+    let (mcp_cwd, mcp_injection, overrides) = match codex_setup {
+        Some(setup) => (
+            setup.runtime_cwd,
+            setup.tui_mcp_injection,
+            setup.terminal_env,
+        ),
+        None => {
+            let mcp_cwd = if mode == "shell" {
+                None
+            } else {
+                resolve_mcp_cwd(resolved_cwd.as_deref(), &RealEnv, host_os, is_wsl)
+            };
+            let mcp_injection = if mode == "shell" {
+                McpInjection::default()
+            } else {
+                match generate_mcp_injection(
+                    &RealMcpRuntime,
+                    &mode,
+                    &terminal_id,
+                    mcp_cwd.as_deref(),
+                    target,
+                ) {
+                    Ok(injection) => injection,
+                    Err(error) => {
+                        return send_create_error(
+                            out,
+                            ErrorCode::PtySpawnFailed,
+                            error.message,
+                            &create.request_id,
+                        )
+                        .await
+                    }
+                }
+            };
+            let overrides = build_terminal_base_env(
+                &RealEnv,
+                &terminal_id,
+                create.tab_id.as_deref(),
+                create.pane_id.as_deref(),
+            );
+            (mcp_cwd, mcp_injection, overrides)
         }
     };
 
@@ -3498,17 +3610,6 @@ pub(crate) async fn handle_create(
             .await
         }
     };
-
-    // `buildTerminalBaseEnv` (`tr:1529-1542`): FRESHELL/FRESHELL_URL/FRESHELL_TOKEN/
-    // FRESHELL_TERMINAL_ID/+TAB/PANE. U6 resolution: the Rust server's canonical
-    // port/token plumbing IS `PORT`/`AUTH_TOKEN` (main.rs), so the reference's
-    // env-derived computation carries over verbatim.
-    let overrides = build_terminal_base_env(
-        &RealEnv,
-        &terminal_id,
-        create.tab_id.as_deref(),
-        create.pane_id.as_deref(),
-    );
 
     // (`effective_shell`/`windows_like` are hoisted above the amplifier
     // pre-create block so its windows-arm reject evaluates the same predicate
@@ -4326,39 +4427,66 @@ pub async fn respawn_agent_terminal(
         None
     };
 
-    // codex `--remote <wsUrl>` (DEV-0006 S4, FLAG-GATED default OFF) — the
-    // same shared planner `handle_create` uses.
-    let codex_launch = match plan_codex_managed_launch(
-        state,
-        &mode,
-        req.cwd.as_deref(),
-        resume_session_id.as_deref(),
-        freshell_codex::launch_lifecycle::LaunchClass::Interactive,
-        None,
-    )
-    .await
-    {
-        Ok(launch) => launch,
-        Err(error) => return Err(RespawnError::LaunchUnresolvable(error.message())),
+    // A replacement Codex sidecar is a new process, so it receives a fresh
+    // setup from the replacement terminal id. Headless recovery intentionally
+    // has no tab/pane identities.
+    let managed_flag =
+        std::env::var(freshell_codex::launch_plan::FRESHELL_CODEX_MANAGED_LAUNCH_ENV).ok();
+    let codex_setup = if codex_create_uses_managed_launch(&mode, managed_flag.as_deref()) {
+        Some(
+            build_codex_managed_launch_setup(
+                terminal_id.clone(),
+                shell,
+                host_os,
+                is_wsl,
+                resolved_cwd.as_deref(),
+                None,
+                None,
+            )
+            .map_err(RespawnError::LaunchUnresolvable)?,
+        )
+    } else {
+        None
+    };
+    let codex_launch = match codex_setup.as_ref() {
+        Some(setup) => Some(
+            plan_codex_managed_launch(
+                state,
+                setup,
+                resume_session_id.as_deref(),
+                freshell_codex::launch_lifecycle::LaunchClass::Interactive,
+                None,
+            )
+            .await
+            .map_err(|error| RespawnError::LaunchUnresolvable(error.message()))?,
+        ),
+        None => None,
     };
     let codex_remote_ws_url: Option<String> =
         codex_launch.as_ref().map(|l| l.remote_ws_url.clone());
 
-    // ProviderTarget + host-native mcp cwd, then the MCP injection — same
-    // order and same IO layer as `handle_create` (a throw here propagates
-    // before the pty spawn; no cleanup call on this path, matching
-    // `handle_create`'s error arm).
+    // Managed Codex reuses its setup's TUI rendering/environment. Other
+    // replacement modes retain the existing generic computation.
     let target = cli_provider_target(shell, host_os, is_wsl, resolved_cwd.as_deref(), &RealEnv);
-    let mcp_cwd = resolve_mcp_cwd(resolved_cwd.as_deref(), &RealEnv, host_os, is_wsl);
-    let mcp_injection = match generate_mcp_injection(
-        &RealMcpRuntime,
-        &mode,
-        &terminal_id,
-        mcp_cwd.as_deref(),
-        target,
-    ) {
-        Ok(i) => i,
-        Err(e) => return Err(RespawnError::LaunchUnresolvable(e.message)),
+    let (mcp_cwd, mcp_injection, overrides) = match codex_setup {
+        Some(setup) => (
+            setup.runtime_cwd,
+            setup.tui_mcp_injection,
+            setup.terminal_env,
+        ),
+        None => {
+            let mcp_cwd = resolve_mcp_cwd(resolved_cwd.as_deref(), &RealEnv, host_os, is_wsl);
+            let mcp_injection = generate_mcp_injection(
+                &RealMcpRuntime,
+                &mode,
+                &terminal_id,
+                mcp_cwd.as_deref(),
+                target,
+            )
+            .map_err(|error| RespawnError::LaunchUnresolvable(error.message))?;
+            let overrides = build_terminal_base_env(&RealEnv, &terminal_id, None, None);
+            (mcp_cwd, mcp_injection, overrides)
+        }
     };
 
     // Freshell opencode TUI rebind plugin — same IO-layer precompute as
@@ -4398,10 +4526,6 @@ pub async fn respawn_agent_terminal(
             "mode '{mode}' resolved no CLI launch"
         )));
     };
-
-    // `buildTerminalBaseEnv` — FRESHELL_TAB_ID/FRESHELL_PANE_ID deliberately
-    // omitted (see the fn doc comment: not derivable server-side).
-    let overrides = build_terminal_base_env(&RealEnv, &terminal_id, None, None);
 
     // Branch selection mirrors `handle_create`/`buildSpawnSpec`.
     let effective_shell = resolve_shell(shell, host_os, is_wsl);

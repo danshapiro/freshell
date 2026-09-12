@@ -6594,6 +6594,207 @@ describe('FreshAgentView transcript font size', () => {
       await waitFor(() => expect(document.activeElement).toBe(root))
       expect(focusSpy).not.toHaveBeenCalled()
     })
+
+    it('does NOT re-focus the composer after a remount that lacked focus ownership (agent split while user is in app chrome)', async () => {
+      const store = createStore()
+      const content = {
+        kind: 'fresh-agent' as const,
+        sessionType: 'freshcodex' as const,
+        provider: 'codex' as const,
+        createRequestId: 'req-remount-gate',
+        sessionId: 'thread-remount-gate',
+        status: 'idle' as const,
+      }
+      const first = render(
+        <Provider store={store}>
+          <FreshAgentView tabId="tab-1" paneId="pane-1" paneContent={content} />
+        </Provider>,
+      )
+      const textbox = await screen.findByRole('textbox', { name: 'Chat message input' }) as HTMLTextAreaElement
+      await waitFor(() => expect(textbox).not.toBeDisabled())
+      act(() => {
+        store.dispatch(setActivePane({ tabId: 'tab-1', paneId: 'pane-1' }))
+      })
+      await waitFor(() => expect(document.activeElement).toBe(textbox))
+      // User moved into application chrome without changing activePane…
+      const chrome = document.createElement('input')
+      document.body.appendChild(chrome)
+      chrome.focus()
+      // …then a leaf→split remount destroys and recreates this subtree.
+      first.unmount()
+      render(
+        <Provider store={store}>
+          <FreshAgentView tabId="tab-1" paneId="pane-1" paneContent={content} />
+        </Provider>,
+      )
+      const textbox2 = await screen.findByRole('textbox', { name: 'Chat message input' }) as HTMLTextAreaElement
+      await waitFor(() => expect(textbox2).not.toBeDisabled())
+      await flushFrames()
+      expect(document.activeElement).toBe(chrome)
+    })
+
+    it('re-focuses the composer when the ALREADY-active pane is explicitly re-selected (same-target select / focus epoch bump)', async () => {
+      const store = createStore()
+      const content = {
+        kind: 'fresh-agent' as const,
+        sessionType: 'freshcodex' as const,
+        provider: 'codex' as const,
+        createRequestId: 'req-epoch-reselect',
+        sessionId: 'thread-epoch-reselect',
+        status: 'idle' as const,
+      }
+      const first = render(
+        <Provider store={store}>
+          <FreshAgentView tabId="tab-1" paneId="pane-1" paneContent={content} />
+        </Provider>,
+      )
+      const textbox = await screen.findByRole('textbox', { name: 'Chat message input' }) as HTMLTextAreaElement
+      await waitFor(() => expect(textbox).not.toBeDisabled())
+      act(() => {
+        store.dispatch(setActivePane({ tabId: 'tab-1', paneId: 'pane-1' }))
+      })
+      await waitFor(() => expect(document.activeElement).toBe(textbox))
+      const chrome = document.createElement('input')
+      document.body.appendChild(chrome)
+      chrome.focus()
+      first.unmount()
+      const second = render(
+        <Provider store={store}>
+          <FreshAgentView tabId="tab-1" paneId="pane-1" paneContent={content} />
+        </Provider>,
+      )
+      const textbox2 = await screen.findByRole('textbox', { name: 'Chat message input' }) as HTMLTextAreaElement
+      await waitFor(() => expect(textbox2).not.toBeDisabled())
+      await flushFrames()
+      expect(document.activeElement).toBe(chrome) // denied adoption
+      // Same-target select: no eligibility transition exists, so the focus
+      // epoch bump is the only signal that can legitimately move DOM focus.
+      // PaneContainer forwards the bumped epoch — simulate that hand-off via
+      // the prop (the fold→epoch-bump wiring is covered in ui-commands and
+      // panesSlice tests; e2e §6b covers the full path).
+      second.rerender(
+        <Provider store={store}>
+          <FreshAgentView tabId="tab-1" paneId="pane-1" paneContent={content} focusEpoch={1} />
+        </Provider>,
+      )
+      await flushFrames()
+      await waitFor(() => expect(document.activeElement).toBe(textbox2))
+    })
+  })
+
+  describe('click-to-defocus transcript focus (c1fa)', () => {
+    async function setupActivePane() {
+      const store = createStore()
+      apiMock.getFreshAgentThreadSnapshot.mockResolvedValueOnce({
+        status: 'idle',
+        capabilities: { send: true, interrupt: true, fork: false },
+        turns: [
+          { id: 'turn-c1fa-0', role: 'user', items: [{ id: 'item-c1fa-0', kind: 'text', text: 'User message c1fa' }] },
+          { id: 'turn-c1fa-1', role: 'assistant', items: [{ id: 'item-c1fa-1', kind: 'text', text: 'Assistant reply c1fa' }] },
+        ],
+      })
+      render(
+        <Provider store={store}>
+          <FreshAgentView
+            tabId="tab-1"
+            paneId="pane-1"
+            paneContent={{
+              kind: 'fresh-agent',
+              sessionType: 'freshcodex',
+              provider: 'codex',
+              createRequestId: 'req-c1fa',
+              sessionId: 'thread-c1fa',
+              status: 'idle',
+            }}
+          />
+        </Provider>,
+      )
+      await waitFor(() => expect(screen.getByText('Assistant reply c1fa')).toBeInTheDocument())
+      const root = document.querySelector('[data-context="fresh-agent"]') as HTMLElement
+      const scroller = document.querySelector('[data-context="fresh-agent-transcript"]') as HTMLDivElement
+      const textbox = screen.getByRole('textbox', { name: 'Chat message input' }) as HTMLTextAreaElement
+      // Activate the pane so the activation effect has fired and focused the composer.
+      await act(async () => {
+        store.dispatch(setActivePane({ tabId: 'tab-1', paneId: 'pane-1' }))
+        await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()))
+      })
+      await waitFor(() => expect(document.activeElement).toBe(textbox))
+      Object.defineProperty(scroller, 'clientHeight', { configurable: true, get: () => 200 })
+      Object.defineProperty(scroller, 'scrollHeight', { configurable: true, get: () => 1000 })
+      scroller.scrollTop = 500
+      fireEvent.scroll(scroller)
+      return { store, root, scroller, textbox }
+    }
+
+    it('makes the transcript scroll container click-focusable (tabindex="-1")', async () => {
+      const { scroller } = await setupActivePane()
+      expect(scroller.getAttribute('tabindex')).toBe('-1')
+      scroller.focus()
+      expect(document.activeElement).toBe(scroller)
+    })
+
+    it('does not force-focus the composer on pointer-up in the transcript region', async () => {
+      const { root, textbox } = await setupActivePane()
+      // Move focus to the pane root (already tabIndex={-1}) to simulate the user
+      // having clicked a non-composer region.
+      root.focus()
+      expect(document.activeElement).toBe(root)
+      const focusSpy = vi.spyOn(textbox, 'focus')
+      fireEvent.pointerUp(root)
+      // The removed handler deferred composerRef.focus() in a requestAnimationFrame;
+      // flush the frame so a red run (handler still present) actually calls the
+      // spy and fails, instead of passing vacuously before the rAF fires.
+      await act(async () => {
+        await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()))
+      })
+      expect(focusSpy).not.toHaveBeenCalled()
+      expect(document.activeElement).toBe(root)
+    })
+
+    it('lets nav keys scroll the transcript once the transcript holds focus', async () => {
+      const { scroller } = await setupActivePane()
+      scroller.focus()
+      expect(document.activeElement).toBe(scroller)
+      const event = createEvent.keyDown(scroller, { key: 'PageDown' })
+      fireEvent(scroller, event)
+      expect(event.defaultPrevented).toBe(true)
+      expect(scroller.scrollTop).toBe(660)
+    })
+
+    it('still funnels plain-text keys to the composer and re-focuses it', async () => {
+      const { scroller, textbox } = await setupActivePane()
+      scroller.focus()
+      expect(document.activeElement).toBe(scroller)
+      fireEvent(scroller, createEvent.keyDown(scroller, { key: 'h' }))
+      expect(textbox.value).toBe('h')
+      // appendText schedules textareaRef.focus() on the next animation frame;
+      // flush it and assert focus returns to the composer (the load-bearing
+      // refocus, assumption L3), so a regression that broke refocus would fail.
+      await act(async () => {
+        await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()))
+      })
+      expect(document.activeElement).toBe(textbox)
+    })
+
+    it('still focuses the composer when the pane is (re)activated after a transcript click', async () => {
+      const { store, scroller, textbox } = await setupActivePane()
+      // Simulate the user clicking the transcript (focus moves off the composer).
+      scroller.focus()
+      expect(document.activeElement).toBe(scroller)
+      const focusSpy = vi.spyOn(textbox, 'focus')
+      // Switch away and back — pane (re)activation must refocus the composer.
+      act(() => {
+        store.dispatch(setActivePane({ tabId: 'tab-1', paneId: 'pane-other' }))
+      })
+      act(() => {
+        store.dispatch(setActivePane({ tabId: 'tab-1', paneId: 'pane-1' }))
+      })
+      await act(async () => {
+        await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()))
+      })
+      expect(focusSpy).toHaveBeenCalled()
+      expect(document.activeElement).toBe(textbox)
+    })
   })
 })
 

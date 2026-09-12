@@ -5,7 +5,10 @@
 //!
 //! Harness copied from the (retired) codex_candidate_activity.rs: real
 //! server, real socket, real PTY running a fake codex binary, CODEX_HOME
-//! pointed at a tempdir.
+//! pointed at a tempdir. Both tests mutate process-wide env (`CODEX_HOME`,
+//! `CODEX_ARGV_CAPTURE_PATH`) and share a PID-only fake-script path, so they
+//! are serialized via `ENV_LOCK` (the repo's convention, e.g.
+//! `codex_fork_rebind.rs`).
 
 #[cfg(unix)]
 mod common;
@@ -18,6 +21,11 @@ use serde_json::json;
 use std::time::Duration;
 #[cfg(unix)]
 use tokio_tungstenite::tungstenite::Message as WsMessage;
+
+/// Serializes tests that mutate process-wide env (`CODEX_HOME`,
+/// `CODEX_ARGV_CAPTURE_PATH`) and share the PID-only fake-script path.
+#[cfg(unix)]
+static ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 /// Fake codex: records argv to $CODEX_ARGV_CAPTURE_PATH (atomic tmp+mv) then
 /// sleeps. Copied from the (retired) tests/codex_candidate_persisted.rs.
@@ -82,22 +90,22 @@ async fn send_create(ws: &mut common::TestWs, mode: &str) -> String {
         .to_string()
 }
 
-/// Scan WS text frames until `pred` matches or the 30s budget elapses.
+/// Scan WS text frames until `pred` matches or the 120s budget elapses.
 /// Non-matching frames are simply skipped (no drop-on-mismatch semantics).
 ///
-/// DEFLAKE (f3wp refresh): was 10s. Under workspace-level load (full
-/// cargo-test parallelism alongside a parallel playwright e2e run) the
-/// inotify-driven rollout read plus frame delivery was observed to exceed
-/// 10s once (`/tmp/f3wp-refresh/cargo-runverify1.log`, "expected
-/// terminal.turn.complete ... stamped by the locator adoption",
-/// 15.43s total test time). The assertions are unchanged -- only the wait
-/// budget grew; a genuinely missing frame still fails, 20s later.
+/// DEFLAKE (f3wp refresh → pkvz): was 10s → 30s. Under workspace-level load
+/// (full cargo-test parallelism on a 4-core CI runner) the inotify-driven
+/// rollout read plus the locator adoption sweep latency was observed to
+/// exceed 30s (kata pkvz, 3+ CI occurrences). Bumped to 120s to cover the
+/// observed sweep latency under contention with margin. The assertions are
+/// unchanged — only the wait budget grew; a genuinely missing frame still
+/// fails, 120s later.
 #[cfg(unix)]
 async fn wait_for_frame(
     ws: &mut common::TestWs,
     pred: impl Fn(&serde_json::Value) -> bool,
 ) -> bool {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
     while tokio::time::Instant::now() < deadline {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         match tokio::time::timeout(remaining.max(Duration::from_millis(1)), ws.next()).await {
@@ -136,7 +144,11 @@ fn codex_event_line(payload_type: &str, at_ms: i64) -> String {
 async fn fresh_pane_locator_identity_reaches_activity_and_turn_complete() {
     const THREAD: &str = "11111111-2222-3333-4444-555555555555";
 
-    // ---- env setup (single sequential test: this binary owns process env) ----
+    // Serialize env mutation with the one-batch test (both mutate CODEX_HOME
+    // and share the PID-only fake-script path).
+    let _env = ENV_LOCK.lock().await;
+
+    // ---- env setup (serialized via ENV_LOCK: this binary owns process env) ----
     // CODEX_HOME tempdir; the sessions day tree exists but holds NO rollout
     // yet — the locator's FIRST-submit re-snapshot must see zero files.
     let codex_home = tempfile::tempdir().expect("codex home");
@@ -251,6 +263,126 @@ async fn fresh_pane_locator_identity_reaches_activity_and_turn_complete() {
     assert!(
         completed,
         "expected terminal.turn.complete with provider=codex and sessionId stamped by the locator adoption"
+    );
+
+    registry.kill(&terminal_id);
+    std::env::remove_var("CODEX_HOME");
+    std::env::remove_var("CODEX_ARGV_CAPTURE_PATH");
+}
+
+/// pkvz end-to-end non-regression guard: proves the one-batch drain path
+/// (session_meta + task_started + task_complete in one `reconcile_rollout`
+/// call) produces a `terminal.turn.complete` end-to-end through the real
+/// server, socket, PTY, inotify watcher, and activity hub. The deterministic
+/// RED/GREEN evidence for the one-batch SUPPRESSION is in the three unit tests
+/// in `freshell-activity/src/codex.rs` (which deterministically set the
+/// `queued_submit_at` state the suppression requires). This integration test
+/// does NOT reproduce the suppression (the queued-submit race is not
+/// deterministically controllable from the WS client); it proves the
+/// one-batch drain path works end-to-end after the fix.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn fresh_pane_locator_one_batch_drain_records_turn_complete() {
+    const THREAD: &str = "22222222-3333-4444-5555-666666666666";
+
+    // Serialize env mutation with the identity-reaches test (both mutate
+    // CODEX_HOME and share the PID-only fake-script path).
+    let _env = ENV_LOCK.lock().await;
+
+    let codex_home = tempfile::tempdir().expect("codex home");
+    let sessions_day = codex_home
+        .path()
+        .join("sessions")
+        .join("2026")
+        .join("07")
+        .join("24");
+    std::fs::create_dir_all(&sessions_day).expect("sessions tree");
+    std::env::set_var("CODEX_HOME", codex_home.path());
+    std::env::set_var("FRESHELL_CODEX_MANAGED_LAUNCH", "0");
+    let capture = std::env::temp_dir().join(format!(
+        "codex-locator-one-batch-argv-{}.txt",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&capture);
+    std::env::set_var("CODEX_ARGV_CAPTURE_PATH", &capture);
+
+    let (url, registry) = common::spawn_server_with_specs_activity_and_codex_locator(
+        vec![codex_capture_spec()],
+        &codex_home.path().join("sessions"),
+    )
+    .await;
+    let (mut ws, _inventory) = common::connect_and_capture_inventory(&url).await;
+
+    let terminal_id = send_create(&mut ws, "codex").await;
+
+    // First Enter: opens the 2s window, re-snapshots known_files (no rollout).
+    // Wait for the server's `codex.activity.updated` with `phase: "pending"`
+    // (proves note_possible_submit completed the re-snapshot AND note_input set
+    // Pending) — the re-snapshot MUST finish before the rollout is written, or
+    // it would be permanently excluded.
+    common::send_input(&mut ws, &terminal_id, "\r").await;
+    let pending = wait_for_frame(&mut ws, |v| {
+        v["type"] == "codex.activity.updated"
+            && v["upsert"]
+                .as_array()
+                .map(|u| {
+                    u.iter()
+                        .any(|r| r["terminalId"] == terminal_id.as_str() && r["phase"] == "pending")
+                })
+                .unwrap_or(false)
+    })
+    .await;
+    assert!(
+        pending,
+        "expected codex.activity.updated with phase=pending after the first Enter"
+    );
+
+    // Write the rollout WITHIN the 2s window (the pending frame above proves
+    // the re-snapshot completed, so this file is a new candidate). The 150ms
+    // locator sweep will find it and bind it; CodexAttach's initial drain reads
+    // all three lines in ONE reconcile_rollout call — the one-batch path.
+    let cwd = std::env::temp_dir().to_string_lossy().to_string();
+    let rollout = sessions_day.join(format!("rollout-2026-07-24T12-00-00-{THREAD}.jsonl"));
+    let ts = 9_999_999_999_999;
+    std::fs::write(
+        &rollout,
+        format!(
+            "{{\"timestamp\":\"2026-07-24T12:00:00.000Z\",\"type\":\"session_meta\",\"payload\":{{\"id\":\"{THREAD}\",\"cwd\":\"{cwd}\"}}}}\n{}\n{}\n",
+            codex_event_line("task_started", ts),
+            codex_event_line("task_complete", ts + 100),
+        ),
+    )
+    .unwrap();
+
+    // The sweep (150ms) finds the rollout within the 2s window and binds it.
+    let bound = wait_for_frame(&mut ws, |v| {
+        v["type"] == "codex.activity.updated"
+            && v["upsert"]
+                .as_array()
+                .map(|u| {
+                    u.iter().any(|r| {
+                        r["terminalId"] == terminal_id.as_str() && r["sessionId"] == THREAD
+                    })
+                })
+                .unwrap_or(false)
+    })
+    .await;
+    assert!(
+        bound,
+        "expected codex.activity.updated carrying the locator-resolved sessionId"
+    );
+
+    // The one-batch initial drain records a `terminal.turn.complete`.
+    let completed = wait_for_frame(&mut ws, |v| {
+        v["type"] == "terminal.turn.complete"
+            && v["terminalId"] == terminal_id.as_str()
+            && v["provider"] == "codex"
+            && v["sessionId"] == THREAD
+    })
+    .await;
+    assert!(
+        completed,
+        "expected terminal.turn.complete from the one-batch initial drain"
     );
 
     registry.kill(&terminal_id);

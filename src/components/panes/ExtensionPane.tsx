@@ -12,6 +12,8 @@ interface ExtensionPaneProps {
   tabId: string
   paneId: string
   content: ExtensionPaneContent
+  focusEligible?: boolean
+  focusEpoch?: number
 }
 
 export default function ExtensionPane({ content }: ExtensionPaneProps) {

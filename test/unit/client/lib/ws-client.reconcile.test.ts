@@ -116,9 +116,11 @@ describe('WsClient pane-reconcile capability', () => {
     c.send({ type: 'terminal.create', requestId: 'cr-1', mode: 'shell' } as any)
 
     await connectAndReady(c, { /* no capabilities */ })
+    vi.advanceTimersByTime(0)
     MockWebSocket.instances[0]._close(1006, 'drop-after-create')
 
     const reconnectInstance = await connectAndReady(c, { /* no capabilities */ })
+    vi.advanceTimersByTime(0)
     const creates = framesOf(reconnectInstance).filter((f) => f.type === 'terminal.create')
     expect(creates).toHaveLength(1)
   })
@@ -133,6 +135,7 @@ describe('WsClient pane-reconcile capability', () => {
 
     // Downgraded server: reconnect ready has no capabilities. Legacy replay must fire.
     const reconnectInstance = await connectAndReady(c, { /* no capabilities */ })
+    vi.advanceTimersByTime(0)
     const creates = framesOf(reconnectInstance).filter((f) => f.type === 'terminal.create')
     expect(creates).toHaveLength(1)
   })
@@ -148,6 +151,7 @@ describe('WsClient pane-reconcile capability', () => {
     expect(framesOf(instance).filter((f) => f.type === 'terminal.create')).toHaveLength(0)
 
     vi.advanceTimersByTime(RECONCILE_VERDICT_WAIT_MS + 50)
+    vi.advanceTimersByTime(0)
     const creates = framesOf(instance).filter((f) => f.type === 'terminal.create')
     expect(creates).toEqual([
       expect.objectContaining({ type: 'terminal.create', requestId: 'cr-new' }),
@@ -176,6 +180,7 @@ describe('WsClient pane-reconcile capability', () => {
 
       const instance = await connectAndReady(c, { capabilities: { paneReconcileV1: true } })
       c.setReconcilePendingCreates(['req-a'])
+      vi.advanceTimersByTime(0)
 
       const creates = framesOf(instance).filter((f) => f.type === 'terminal.create')
       expect(creates).toEqual([
@@ -190,6 +195,7 @@ describe('WsClient pane-reconcile capability', () => {
 
       c.send({ type: 'terminal.create', requestId: 'req-pending' } as any)
       c.send({ type: 'terminal.create', requestId: 'req-other' } as any)
+      vi.advanceTimersByTime(0)
 
       const creates = framesOf(instance).filter((f) => f.type === 'terminal.create')
       expect(creates).toEqual([
@@ -205,6 +211,7 @@ describe('WsClient pane-reconcile capability', () => {
       const instance = await connectAndReady(c, { capabilities: { paneReconcileV1: true } })
       c.cancelCreate('req-a')
       c.clearReconcileCreateHold()
+      vi.advanceTimersByTime(0)
 
       const creates = framesOf(instance).filter((f) => f.type === 'terminal.create')
       expect(creates.filter((f) => f.requestId === 'req-a')).toHaveLength(0)
@@ -223,6 +230,7 @@ describe('WsClient pane-reconcile capability', () => {
       expect(framesOf(instance).filter((f) => f.type === 'terminal.create')).toHaveLength(0)
 
       vi.advanceTimersByTime(RECONCILE_VERDICT_WAIT_MS + 50)
+      vi.advanceTimersByTime(0)
       const creates = framesOf(instance).filter((f) => f.type === 'terminal.create')
       expect(creates).toEqual([
         expect.objectContaining({ type: 'terminal.create', requestId: 'req-a' }),
@@ -234,6 +242,7 @@ describe('WsClient pane-reconcile capability', () => {
       c.send({ type: 'terminal.create', requestId: 'req-a' } as any)
 
       const instance = await connectAndReady(c, { /* no capabilities */ })
+      vi.advanceTimersByTime(0)
       const creates = framesOf(instance).filter((f) => f.type === 'terminal.create')
       expect(creates).toEqual([
         expect.objectContaining({ type: 'terminal.create', requestId: 'req-a' }),
@@ -251,6 +260,7 @@ describe('WsClient pane-reconcile capability', () => {
       // Downgraded server: no capability, the create flushes via the normal
       // preReadyCreateQueue path — exactly once, never a duplicate.
       const reconnectInstance = await connectAndReady(c, { /* no capabilities */ })
+      vi.advanceTimersByTime(0)
       const creates = framesOf(reconnectInstance).filter((f) => f.type === 'terminal.create')
       expect(creates).toEqual([
         expect.objectContaining({ type: 'terminal.create', requestId: 'req-a' }),

@@ -18,7 +18,7 @@ vi.mock('@/lib/api', () => ({
 function renderDirectoryPicker(overrides: Partial<ComponentProps<typeof DirectoryPicker>> = {}) {
   const onConfirm = vi.fn()
   const onBack = vi.fn()
-  render(
+  const utils = render(
     <DirectoryPicker
       providerType="claude"
       providerLabel="Claude"
@@ -28,7 +28,18 @@ function renderDirectoryPicker(overrides: Partial<ComponentProps<typeof Director
       {...overrides}
     />
   )
-  return { onConfirm, onBack }
+  const rerenderPicker = (overrides2: Partial<ComponentProps<typeof DirectoryPicker>> = {}) => utils.rerender(
+    <DirectoryPicker
+      providerType="claude"
+      providerLabel="Claude"
+      defaultCwd="/home/user/project"
+      onConfirm={onConfirm}
+      onBack={onBack}
+      {...overrides}
+      {...overrides2}
+    />
+  )
+  return { onConfirm, onBack, rerenderPicker, ...utils }
 }
 
 describe('DirectoryPicker', () => {
@@ -42,6 +53,48 @@ describe('DirectoryPicker', () => {
   afterEach(() => {
     cleanup()
     vi.useRealTimers()
+  })
+
+  it('re-focuses the input on a focus epoch bump after a denied remount (same-target select)', () => {
+    // Bare renders carry no data-pane-id root (the Pane wrapper carries it in
+    // production), so wrap one — recordPaneFocusBeforeUnmount needs the root
+    // to answer the contains() question.
+    const renderWrapped = (focusEpoch = 0) => render(
+      <div data-pane-id="pane-d">
+        <DirectoryPicker
+          providerType="claude"
+          providerLabel="Claude"
+          defaultCwd="/home/user/project"
+          onConfirm={vi.fn()}
+          onBack={vi.fn()}
+          paneId="pane-d"
+          focusEpoch={focusEpoch}
+        />
+      </div>,
+    )
+    const first = renderWrapped()
+    const input = screen.getByLabelText('Starting directory for Claude') as HTMLInputElement
+    expect(input).toHaveFocus()
+    const chrome = document.createElement('input')
+    document.body.appendChild(chrome)
+    chrome.focus()
+    first.unmount() // records NOT owned (focus is in chrome)
+    const second = renderWrapped()
+    expect(chrome).toHaveFocus() // denied adoption: agent split while user is in app chrome
+    second.rerender(
+      <div data-pane-id="pane-d">
+        <DirectoryPicker
+          providerType="claude"
+          providerLabel="Claude"
+          defaultCwd="/home/user/project"
+          onConfirm={vi.fn()}
+          onBack={vi.fn()}
+          paneId="pane-d"
+          focusEpoch={1}
+        />
+      </div>,
+    )
+    expect(screen.getByLabelText('Starting directory for Claude')).toHaveFocus()
   })
 
   it('renders with defaultCwd and selects input text on mount', async () => {
@@ -408,6 +461,22 @@ describe('DirectoryPicker', () => {
         expect(mockApiPost).toHaveBeenCalledWith('/api/files/mkdir', { path: '/tmp/shift-enter' })
       })
       expect(onConfirm).toHaveBeenCalledWith('/tmp/shift-enter')
+    })
+  })
+
+  describe('focus gating', () => {
+    it('focuses and selects the input by default (focusEligible omitted)', async () => {
+      renderDirectoryPicker({ defaultCwd: '/tmp/work' })
+      const input = screen.getByLabelText('Starting directory for Claude') as HTMLInputElement
+      await waitFor(() => expect(input).toHaveFocus())
+      await waitFor(() => expect(input.selectionEnd).toBe('/tmp/work'.length))
+    })
+
+    it('does not focus the input when focusEligible is false', async () => {
+      renderDirectoryPicker({ defaultCwd: '/tmp/work', focusEligible: false })
+      const input = screen.getByLabelText('Starting directory for Claude') as HTMLInputElement
+      await waitFor(() => expect(input.value).toBe('/tmp/work'))
+      expect(input).not.toHaveFocus()
     })
   })
 })

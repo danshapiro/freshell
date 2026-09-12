@@ -249,3 +249,51 @@ fn malformed_line_never_panics_across_all_committed_fixtures() {
         assert!(meta.message_count >= 0, "{name} produced a meta");
     }
 }
+
+#[test]
+fn fifth_gen_claude_models_map_to_1m_window() {
+    // kata 9c92: 5th-gen claude sessions run the 1M "context-1m" window.
+    // prompt = 50000 + 45000 + 5000 = 100000 ≤ 1M → no elevation.
+    let meta = parse_str(concat!(
+        "{\"type\":\"assistant\",\"uuid\":\"uuid-opus5-1m\",\"message\":",
+        "{\"role\":\"assistant\",\"model\":\"claude-opus-5\",\"usage\":",
+        "{\"input_tokens\":50000,\"output_tokens\":4000,",
+        "\"cache_read_input_tokens\":45000,\"cache_creation_input_tokens\":5000}}}\n",
+    ));
+    let usage = meta.token_usage.expect("token_usage");
+    assert_eq!(usage.model_context_window, Some(1_000_000));
+    assert_eq!(usage.compact_threshold_tokens, Some(950_000));
+    // context = 50000 + 4000 + 45000 + 5000 = 104000; round(104000/950000*100) = 11
+    assert_eq!(usage.compact_percent, Some(11));
+}
+
+#[test]
+fn elevation_lifts_window_when_prompt_exceeds_mapped_window() {
+    // kata 9c92: a 200K-mapped model with a served prompt of 388178 — only possible
+    // on a larger real window (a true 200K session compacts at 190K). Elevation → 1M.
+    let meta = parse_str(concat!(
+        "{\"type\":\"assistant\",\"uuid\":\"uuid-elevated\",\"message\":",
+        "{\"role\":\"assistant\",\"model\":\"claude-sonnet-4-20250514\",\"usage\":",
+        "{\"input_tokens\":2,\"output_tokens\":8,",
+        "\"cache_read_input_tokens\":384514,\"cache_creation_input_tokens\":3662}}}\n",
+    ));
+    let usage = meta.token_usage.expect("token_usage");
+    assert_eq!(usage.model_context_window, Some(1_000_000));
+    assert_eq!(usage.compact_threshold_tokens, Some(950_000));
+    // context = 2 + 8 + 384514 + 3662 = 388186; round(388186/950000*100) = 41
+    assert_eq!(usage.compact_percent, Some(41));
+}
+
+#[test]
+fn no_elevation_when_prompt_within_mapped_window() {
+    // kata 9c92: 200K model, prompt 190K (at the 95% cliff) — no elevation.
+    let meta = parse_str(concat!(
+        "{\"type\":\"assistant\",\"uuid\":\"uuid-cliff\",\"message\":",
+        "{\"role\":\"assistant\",\"model\":\"claude-sonnet-4-20250514\",\"usage\":",
+        "{\"input_tokens\":190000,\"output_tokens\":5,",
+        "\"cache_read_input_tokens\":0,\"cache_creation_input_tokens\":0}}}\n",
+    ));
+    let usage = meta.token_usage.expect("token_usage");
+    assert_eq!(usage.model_context_window, Some(200_000));
+    assert_eq!(usage.compact_threshold_tokens, Some(190_000));
+}

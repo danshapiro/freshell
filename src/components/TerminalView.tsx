@@ -108,6 +108,7 @@ import {
   type OutputBatchAcceptedSegment,
 } from '@/lib/terminal-attach-seq-state'
 import { useMobile } from '@/hooks/useMobile'
+import { usePaneFocusAdoption } from '@/hooks/usePaneFocusAdoption'
 import { useKeyboardInset } from '@/hooks/useKeyboardInset'
 import { useEnsureExtensionsRegistry } from '@/hooks/useEnsureExtensionsRegistry'
 import { findLocalFilePaths, isImageFilePath } from '@/lib/path-utils'
@@ -441,6 +442,9 @@ interface TerminalViewProps {
   paneId: string
   paneContent: PaneContent
   hidden?: boolean
+  /** Focus-nudge epoch: explicit same-target selects bump this so the focus
+   *  effects re-run even without an eligibility transition. */
+  focusEpoch?: number
 }
 
 type AttachIntent = 'viewport_hydrate' | 'keepalive_delta' | 'transport_reconnect'
@@ -572,7 +576,7 @@ export function isEngagementInput(data: string): boolean {
   /* eslint-enable no-control-regex */
 }
 
-function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps) {
+function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: TerminalViewProps) {
   const dispatch = useAppDispatch()
   const appStore = useAppStore()
   const isMobile = useMobile()
@@ -1269,6 +1273,8 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
     pendingOsc52EventRef.current = pendingOsc52Event
   }, [pendingOsc52Event])
 
+  const shouldFocusActiveTerminalRef = useRef(false)
+
   // Sync during render (not in useEffect) so refs always have latest values
   paneLastInputAtRef.current = paneLastInputAt
   settingsRef.current = settings
@@ -1281,6 +1287,15 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
   }, [serverInstanceId])
 
   const shouldFocusActiveTerminal = !hidden && activeTabId === tabId && activePaneId === paneId
+  shouldFocusActiveTerminalRef.current = shouldFocusActiveTerminal
+
+  // Mount-time focus adoption gate (agent focus neutrality): eligible MOUNTS
+  // only pull DOM focus if this pane owned it before teardown — an agent-driven
+  // leaf→split remount must not yank focus back from app chrome. False→true
+  // eligibility flips (explicit select / tab switch) bypass the gate. The
+  // decision is consumed lazily, so the mount-time `focus:true` layout consum-
+  // ption (which fires once the terminal actually attaches) evaluates it too.
+  const mayFocusNow = usePaneFocusAdoption(paneId, shouldFocusActiveTerminal, focusEpoch)
 
   // Keep the active pane's terminal focused when tabs/panes switch so typing works immediately.
   useEffect(() => {
@@ -1288,6 +1303,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
     if (!shouldFocusActiveTerminal) return
     const term = termRef.current
     if (!term) return
+    if (!mayFocusNow()) return
 
     requestAnimationFrame(() => {
       if (termRef.current !== term) return
@@ -1302,7 +1318,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
     })
     // paneId/tabId are mount-stable props; listed only so the debug-log
     // payload above satisfies exhaustive-deps without new warnings.
-  }, [isTerminal, shouldFocusActiveTerminal, paneId, tabId])
+  }, [isTerminal, shouldFocusActiveTerminal, mayFocusNow, paneId, tabId])
 
   useEffect(() => {
     lastSessionActivityAtRef.current = 0
@@ -1742,7 +1758,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
     if (shouldScrollToBottom) {
       try { term.scrollToBottom() } catch { /* disposed */ }
     }
-    if (shouldFocus) {
+    if (shouldFocus && shouldFocusActiveTerminalRef.current && mayFocusNow()) {
       // kata r49m: same yield policy for the coalesced layout flush.
       if (shouldYieldProgrammaticTerminalFocus()) {
         log.debug('programmatic terminal focus yielded to inline editor', { paneId: paneIdRef.current, tabId, source: 'layout-flush' })
@@ -1752,7 +1768,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
     }
     // tabId is a mount-stable prop; listed only so the debug-log payload
     // above satisfies exhaustive-deps without new warnings.
-  }, [suppressNetworkEffects, syncGeometryEpochForViewport, ws, tabId])
+  }, [mayFocusNow, suppressNetworkEffects, syncGeometryEpochForViewport, ws, tabId])
 
   const enqueueTerminalWrite = useCallback((data: string, onWritten?: () => void, options?: TerminalWriteQueueOptions): boolean => {
     if (!data) return false
@@ -2423,19 +2439,6 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
       if (isTerminalPasteShortcut(event)) {
         // Policy-only: block xterm key translation (for example Ctrl+V -> ^V)
         // and allow native/browser paste path to feed xterm.
-        return false
-      }
-
-      if (
-        event.key === 'Escape' &&
-        event.type === 'keydown' &&
-        !event.ctrlKey &&
-        !event.shiftKey &&
-        !event.altKey &&
-        !event.metaKey
-      ) {
-        event.preventDefault()
-        sendInput('\u001b')
         return false
       }
 

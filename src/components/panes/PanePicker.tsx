@@ -9,6 +9,7 @@ import { getVisibleFreshAgentConfigs, type FreshAgentProviderName } from '@/lib/
 import { FRESH_AGENT_REGISTRY } from '@/lib/fresh-agent-registry'
 import { ProviderIcon } from '@/components/icons/provider-icons'
 import { useEnsureExtensionsRegistry } from '@/hooks/useEnsureExtensionsRegistry'
+import { usePaneFocusAdoption } from '@/hooks/usePaneFocusAdoption'
 import { computePanePickerLayout } from '@/lib/pane-picker-layout'
 import type { CodingCliProviderName } from '@/lib/coding-cli-types'
 import type { ClientExtensionEntry } from '@shared/extension-types'
@@ -73,9 +74,13 @@ interface PanePickerProps {
   isOnlyPane: boolean
   tabId?: string
   paneId?: string
+  focusEligible?: boolean
+  /** Focus-nudge epoch: explicit same-target selects bump this so the focus
+   *  effect re-runs even without an eligibility transition. */
+  focusEpoch?: number
 }
 
-export default function PanePicker({ onSelect, onCancel, isOnlyPane, tabId, paneId }: PanePickerProps) {
+export default function PanePicker({ onSelect, onCancel, isOnlyPane, tabId, paneId, focusEligible = true, focusEpoch = 0 }: PanePickerProps) {
   useEnsureExtensionsRegistry()
 
   const platform = useAppSelector((s) => s.connection?.platform ?? null)
@@ -220,10 +225,14 @@ export default function PanePicker({ onSelect, onCancel, isOnlyPane, tabId, pane
     }
   }, [handleSelect, options])
 
-  // Auto-focus the container on mount so keyboard shortcuts work immediately
+  // Auto-focus the container when the picker owns focus, so keyboard shortcuts
+  // work immediately; background-mounted pickers must not steal DOM focus.
+  // Eligible mounts are ownership-gated (agent-driven remounts must not yank
+  // focus from app chrome); eligibility flips bypass the gate.
+  const mayFocusNow = usePaneFocusAdoption(paneId, focusEligible, focusEpoch)
   useEffect(() => {
-    containerRef.current?.focus()
-  }, [])
+    if (focusEligible && mayFocusNow()) containerRef.current?.focus()
+  }, [focusEligible, mayFocusNow])
 
   // Measure the container once and track its size with a ResizeObserver so the
   // adaptive grid re-layouts as the pane resizes.

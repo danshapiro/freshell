@@ -1,7 +1,7 @@
 import { addTab, setActiveTab, closeTab, closePaneWithCleanup } from '@/store/tabsSlice'
-import { initLayout, splitPane, setActivePane, updatePaneContent, resizePanes, swapPanes } from '@/store/panesSlice'
+import { initLayout, splitPane, setActivePane, nudgePaneFocus, updatePaneContent, resizePanes, swapPanes } from '@/store/panesSlice'
 import { captureUiScreenshot } from '@/lib/ui-screenshot'
-import type { AppDispatch, RootState } from '@/store/store'
+import type { RootState } from '@/store/store'
 import { applyPaneRename, applyTabRename } from '@/store/titleSync'
 
 type DispatchFn = (action: any) => any
@@ -25,7 +25,7 @@ async function handleScreenshotCapture(msg: any, runtime: UiCommandRuntime): Pro
     : {}
 
   const requestId = typeof payload.requestId === 'string' ? payload.requestId : ''
-  if (!requestId || !runtime.send || !runtime.getState) return
+  if (!requestId || !runtime.send) return
 
   const scope = payload.scope
   if (scope !== 'pane' && scope !== 'tab' && scope !== 'view') {
@@ -44,10 +44,9 @@ async function handleScreenshotCapture(msg: any, runtime: UiCommandRuntime): Pro
   const tabId = typeof payload.tabId === 'string' ? payload.tabId : undefined
 
   try {
-    const capture = await captureUiScreenshot({ scope, paneId, tabId }, {
-      dispatch: runtime.dispatch as AppDispatch,
-      getState: runtime.getState,
-    })
+    // Renders through an off-DOM clone: the user's selection, focus, and
+    // screen never move, background tabs included.
+    const capture = await captureUiScreenshot({ scope, paneId, tabId })
     runtime.send({
       type: 'ui.screenshot.result',
       requestId,
@@ -86,6 +85,7 @@ export function handleUiCommand(msg: any, runtimeOrDispatch: UiCommandRuntime | 
         sessionRef: msg.payload.sessionRef,
         resumeSessionId: msg.payload.resumeSessionId,
         status: msg.payload.status,
+        activate: false,
       }))
       if (msg.payload.paneId && msg.payload.paneContent) {
         return dispatch(initLayout({ tabId: msg.payload.id, paneId: msg.payload.paneId, content: msg.payload.paneContent }))
@@ -107,7 +107,11 @@ export function handleUiCommand(msg: any, runtimeOrDispatch: UiCommandRuntime | 
       }
       return
     case 'tab.select':
-      return dispatch(setActiveTab(msg.payload.id))
+      dispatch(setActiveTab(msg.payload.id))
+      // Focus contract: explicit selects move DOM focus. When the tab (or its
+      // active pane) was already Redux-active there is no eligibility
+      // transition, so nudge the pane focus epoch as the DOM-focus signal.
+      return dispatch(nudgePaneFocus({ tabId: msg.payload.id }))
     case 'tab.rename':
       return dispatch(applyTabRename({ tabId: msg.payload.id, title: msg.payload.title }))
     case 'tab.close':
@@ -119,12 +123,16 @@ export function handleUiCommand(msg: any, runtimeOrDispatch: UiCommandRuntime | 
         direction: msg.payload.direction,
         newContent: msg.payload.newContent,
         newPaneId: msg.payload.newPaneId,
+        activate: false,
       }))
     case 'pane.close':
       return dispatch(closePaneWithCleanup({ tabId: msg.payload.tabId, paneId: msg.payload.paneId }))
     case 'pane.select':
       dispatch(setActiveTab(msg.payload.tabId))
-      return dispatch(setActivePane({ tabId: msg.payload.tabId, paneId: msg.payload.paneId }))
+      // focusNudge: an explicit select moves DOM focus even when the pane is
+      // already Redux-active (no eligibility transition exists to re-run
+      // focus effects) — the epoch bump is that signal.
+      return dispatch(setActivePane({ tabId: msg.payload.tabId, paneId: msg.payload.paneId, focusNudge: true }))
     case 'pane.rename':
       return dispatch(applyPaneRename({
         tabId: msg.payload.tabId,

@@ -52,6 +52,10 @@ Use absolute paths for `--cwd` and `--editor`.
 - **Default targeting (MCP only):** When no target is specified, the MCP tool resolves to your own pane/tab (set by `FRESHELL_TAB_ID`/`FRESHELL_PANE_ID`), not the user's active viewport. `split-pane` without a target splits your own pane.
 - **Default direction:** `split-pane` defaults to vertical (top/bottom). Use `-h` for horizontal (left/right).
 
+## Focus neutrality
+
+All creation commands (new-tab, split-pane, MCP/REST creates) are focus-neutral: they never move the user's active tab or active pane, and background-created panes never steal DOM focus. Focus moves ONLY via explicit select-tab / select-pane (REST: POST /api/tabs/:id/select, POST /api/panes/:id/select). When scripting multi-pane work, select explicitly before measuring focus-dependent behavior.
+
 ## Command reference
 
 Output behavior:

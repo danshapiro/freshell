@@ -330,6 +330,11 @@ test.describe.serial('P1.14 sidebar registry sync (rust)', () => {
       return typeof buffer === 'string' && buffer.includes('codex> ')
     }, { timeout: 15_000 }).toBe(true)
 
+    // REST creates are focus-neutral; reveal the codex tab explicitly (user-
+    // equivalent tab-strip click) before driving its terminal.
+    await page.locator(`[data-context="tab"][data-tab-id="${restTabId}"]`).click()
+    await expect.poll(async () => harness.getActiveTabId(), { timeout: 10_000 }).toBe(restTabId)
+
     // The driven client shows the pane; type Enter so the fake codex
     // terminal materializes its rollout (Enter-gated, fixture contract).
     // NOTE: multiple .xterm elements stay mounted (every tab's TabContent is

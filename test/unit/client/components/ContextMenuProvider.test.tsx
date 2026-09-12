@@ -15,6 +15,7 @@ import freshAgentReducer, { sessionInit } from '@/store/freshAgentSlice'
 import tabRegistryReducer, { setTabRegistrySnapshot } from '@/store/tabRegistrySlice'
 import { terminalDetachMiddleware } from '@/store/terminalDetachMiddleware'
 import { ContextMenuProvider } from '@/components/context-menu/ContextMenuProvider'
+import { registerFreshAgentTurnItems } from '@/lib/pane-action-registry'
 import type { ClientExtensionEntry } from '@shared/extension-types'
 
 const defaultCliExtensions: ClientExtensionEntry[] = [
@@ -2744,7 +2745,7 @@ describe('fresh-agent turn carve-out', () => {
     )
   }
 
-  it('opens no provider menu for contextmenu inside article[data-turn-role]', () => {
+  it('opens the provider menu for a fine-pointer right-click on plain turn text', () => {
     renderFreshAgentFixture()
 
     const target = screen.getByText('Turn body text')
@@ -2753,13 +2754,16 @@ describe('fresh-agent turn carve-out', () => {
       target.dispatchEvent(event)
     })
 
-    expect(screen.queryByRole('menu')).toBeNull()
-    // The provider's capture-phase carve-out cancels the event: for a real
-    // article-targeted event the transcript's bubble-phase handler cancels it
-    // too (harmless double cancel), and a late Android contextmenu retargeted
-    // onto the transcript's sheet has no transcript handler at all — the
-    // provider must preventDefault or the browser's native menu opens.
+    // Exactly one menu, and it is the PROVIDER's fresh-agent menu — the
+    // transcript no longer renders a turn menu of its own (one menu system).
+    // The touch/sheet carve-out stays gesture-scoped: fine-pointer turn
+    // right-clicks are ordinary fresh-agent targets now.
     expect(event.defaultPrevented).toBe(true)
+    expect(screen.getAllByRole('menu')).toHaveLength(1)
+    expect(screen.getByRole('menuitem', { name: 'Select all' })).toBeInTheDocument()
+    expect(screen.getByRole('menuitem', { name: 'Copy session ID' })).toBeInTheDocument()
+    // Without a pane-registered turn-items builder there are no turn rows.
+    expect(screen.queryByRole('menuitem', { name: 'Fork conversation from here' })).toBeNull()
   })
 
   it('still opens the pane menu for contextmenu in the pane container outside any turn article', () => {
@@ -2846,13 +2850,107 @@ describe('fresh-agent turn carve-out', () => {
       expect(screen.getByRole('menuitem', { name: 'Copy new version' })).toBeInTheDocument()
     })
 
-    it('keeps the whole-turn carve-out for plain turn text inside the specialized fixture (control)', () => {
+    it('opens the provider menu for plain turn text inside the specialized fixture (no more whole-turn carve-out)', () => {
       renderSpecializedFixture()
 
       const event = rightClick(screen.getByText('Plain turn text'))
 
       expect(event.defaultPrevented).toBe(true)
-      expect(screen.queryByRole('menu')).toBeNull()
+      expect(screen.getAllByRole('menu')).toHaveLength(1)
+      // Plain turn text hits no specialized sub-region, so the region items
+      // stay off; the base fresh-agent rows remain.
+      expect(screen.queryByRole('menuitem', { name: 'Copy code block' })).toBeNull()
+      expect(screen.getByRole('menuitem', { name: 'Select all' })).toBeInTheDocument()
+    })
+  })
+
+  describe('turn action items from the pane registry', () => {
+    function registerPaneTurnItems(onFork: (turnId: string) => void) {
+      return registerFreshAgentTurnItems('pane-1', (articleIndex) =>
+        articleIndex === 0
+          ? [
+              { label: 'Copy turn text', run: vi.fn() },
+              { label: 'Fork conversation from here', run: () => onFork('turn-1') },
+              { label: 'Undo to here', disabled: true, run: vi.fn() },
+              { label: 'Rewind code to here', destructive: true, run: vi.fn() },
+            ]
+          : null,
+      )
+    }
+
+    it('prepends the pane-registered turn actions for plain-text regions of a turn article', () => {
+      const onFork = vi.fn()
+      const unregister = registerPaneTurnItems(onFork)
+      try {
+        renderFreshAgentFixture({ 'data-turn-index': '0' })
+
+        const event = new MouseEvent('contextmenu', { bubbles: true, cancelable: true, clientX: 100, clientY: 100 })
+        act(() => {
+          screen.getByText('Turn body text').dispatchEvent(event)
+        })
+
+        // One menu system renders — the turn-specific rows come first, then a
+        // separator, then the base fresh-agent items.
+        expect(screen.getAllByRole('menu')).toHaveLength(1)
+        const labels = screen.getAllByRole('menuitem').map((el) => el.textContent)
+        expect(labels.slice(0, 4)).toEqual([
+          'Copy turn text',
+          'Fork conversation from here',
+          'Undo to here',
+          'Rewind code to here',
+        ])
+        expect(labels).toContain('Select all')
+        expect(labels).toContain('Copy session ID')
+
+        // Builder gates map onto MenuItem semantics: disabled rows stay
+        // inert, destructive rows render with danger styling.
+        expect(screen.getByRole('menuitem', { name: 'Undo to here' })).toBeDisabled()
+        expect(screen.getByRole('menuitem', { name: 'Rewind code to here' }).className).toContain('text-destructive')
+
+        // Item activation runs the builder's callback.
+        fireEvent.click(screen.getByRole('menuitem', { name: 'Fork conversation from here' }))
+        expect(onFork).toHaveBeenCalledWith('turn-1')
+      } finally {
+        unregister()
+      }
+    })
+
+    it('keeps turn actions off specialized sub-regions of the same turn (the region selects items, not menus)', () => {
+      const onFork = vi.fn()
+      const unregister = registerPaneTurnItems(onFork)
+      try {
+        const { container } = renderWithProvider(
+          <div
+            data-context={ContextIds.FreshAgent}
+            data-tab-id="tab-1"
+            data-pane-id="pane-1"
+            data-session-id="sess-1"
+            data-provider="claude"
+            data-session-type="freshclaude"
+          >
+            <article data-turn-role="assistant" data-turn-index="0">
+              <div className="prose prose-sm" data-markdown-body="">
+                <pre><code>const answer = 42</code></pre>
+              </div>
+            </article>
+          </div>,
+        )
+
+        const codeEl = container.querySelector('.prose pre code') as HTMLElement
+        const event = new MouseEvent('contextmenu', { bubbles: true, cancelable: true, clientX: 100, clientY: 100 })
+        act(() => {
+          codeEl.dispatchEvent(event)
+        })
+
+        // The PR-#735 partition survives as ITEM selection within the one
+        // menu: code blocks keep their context rows and gain no turn rows.
+        expect(event.defaultPrevented).toBe(true)
+        expect(screen.getAllByRole('menu')).toHaveLength(1)
+        expect(screen.getByRole('menuitem', { name: 'Copy code block' })).toBeInTheDocument()
+        expect(screen.queryByRole('menuitem', { name: 'Fork conversation from here' })).toBeNull()
+      } finally {
+        unregister()
+      }
     })
   })
 

@@ -188,6 +188,9 @@ test.describe('Git branch/dirty badges (Rust only)', () => {
       // The tab materializes (this part works)...
       const tabStrip = page.locator('[data-testid="tab-strip"]')
       await expect(tabStrip.getByText('badge-rest-tab', { exact: true })).toBeVisible({ timeout: 15_000 })
+      // REST creates are focus-neutral; reveal the tab explicitly (user-
+      // equivalent tab-strip click) before asserting its pane is visible.
+      await page.locator(`[data-context="tab"][data-tab-id="${tabId}"]`).click()
       const paneShell = page.locator(`[data-context="pane"][data-tab-id="${tabId}"]`)
       await expect(paneShell.locator('.xterm').first()).toBeVisible({ timeout: 30_000 })
 

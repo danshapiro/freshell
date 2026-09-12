@@ -12,6 +12,7 @@
 //! proves the fake-TUI → proxy → app-server relay end to end.
 #![cfg(feature = "real-transport")]
 
+use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -28,14 +29,85 @@ use freshell_codex::launch_lifecycle::{
     CodexTerminalLaunchManager, LaunchClass, SpawnedCodexAppServerRuntime,
     CODEX_LAUNCH_PLANNER_SHUTDOWN_MESSAGE, CODEX_SIDECAR_NOT_ADOPTABLE_MESSAGE,
 };
-use freshell_codex::launch_plan::{codex_remote_args, CodexLaunchPlanInput};
+use freshell_codex::launch_plan::{
+    codex_remote_args, plan_codex_launch, CodexLaunchPlanInput, CodexSidecarLaunchContext,
+};
 use freshell_codex::{
-    proc_cmdline, proc_starttime, verify_sidecar_identity, BoxFuture, CodexSidecarRecord,
-    CodexSidecarStore, IdentityVerdict, ReattachedCodexAppServerRuntime, SidecarReconciler,
-    SidecarRecordState, CODEX_SIDECAR_OWNERSHIP_ENV, SIDECAR_RECORD_VERSION,
+    proc_cmdline, proc_starttime, select_codex_runtime, verify_sidecar_identity, BoxFuture,
+    CodexSidecarRecord, CodexSidecarStore, IdentityVerdict, ReattachedCodexAppServerRuntime,
+    SidecarReconciler, SidecarRecordState, CODEX_SIDECAR_OWNERSHIP_ENV, SIDECAR_RECORD_VERSION,
 };
 
 const RECV_TIMEOUT: Duration = Duration::from_secs(10);
+const SYNTHETIC_CONTEXT_TOKEN: &str = "not-visible";
+
+/// Restores a process-global command override even when a test assertion panics. The
+/// production runtime intentionally resolves `CODEX_CMD` at spawn time, so this is the
+/// smallest way to exercise the public runtime-selection seam with the committed fixture.
+struct EnvVarGuard {
+    key: &'static str,
+    previous: Option<std::ffi::OsString>,
+}
+
+impl EnvVarGuard {
+    fn set(key: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
+        let previous = std::env::var_os(key);
+        std::env::set_var(key, value);
+        Self { key, previous }
+    }
+}
+
+impl Drop for EnvVarGuard {
+    fn drop(&mut self) {
+        if let Some(value) = self.previous.take() {
+            std::env::set_var(self.key, value);
+        } else {
+            std::env::remove_var(self.key);
+        }
+    }
+}
+
+fn context_config_args() -> Vec<String> {
+    vec![
+        "-c".to_string(),
+        "mcp_servers.freshell.command=\"node\"".to_string(),
+        "-c".to_string(),
+        "mcp_servers.freshell.env_vars=[\"FRESHELL_TOKEN\"]".to_string(),
+    ]
+}
+
+fn sidecar_context(arg_log: &std::path::Path) -> CodexSidecarLaunchContext {
+    CodexSidecarLaunchContext {
+        config_args: context_config_args(),
+        env: BTreeMap::from([
+            (
+                "FAKE_CODEX_APP_SERVER_ARG_LOG".to_string(),
+                arg_log.display().to_string(),
+            ),
+            ("FRESHELL".to_string(), "1".to_string()),
+            (
+                "FRESHELL_URL".to_string(),
+                "http://freshell.test".to_string(),
+            ),
+            (
+                "FRESHELL_TOKEN".to_string(),
+                SYNTHETIC_CONTEXT_TOKEN.to_string(),
+            ),
+            (
+                "FRESHELL_TERMINAL_ID".to_string(),
+                "terminal-context-test".to_string(),
+            ),
+            (
+                "FRESHELL_TAB_ID".to_string(),
+                "tab-context-test".to_string(),
+            ),
+            (
+                "FRESHELL_PANE_ID".to_string(),
+                "pane-context-test".to_string(),
+            ),
+        ]),
+    }
+}
 
 // ── fake runtime: a loopback WS echo listener standing in for the app-server ──────
 
@@ -43,6 +115,7 @@ struct FakeRuntime {
     ws_url: String,
     ensure_ready_calls: Mutex<Vec<Option<String>>>,
     fail_ensure_ready: AtomicBool,
+    fail_ownership_update: AtomicBool,
     fail_prepare_retention: AtomicBool,
     shutdown_calls: AtomicU32,
     ownership_updates: Mutex<Vec<(String, u64)>>,
@@ -80,6 +153,7 @@ impl FakeRuntime {
             ws_url,
             ensure_ready_calls: Mutex::new(Vec::new()),
             fail_ensure_ready: AtomicBool::new(false),
+            fail_ownership_update: AtomicBool::new(false),
             fail_prepare_retention: AtomicBool::new(false),
             shutdown_calls: AtomicU32::new(0),
             ownership_updates: Mutex::new(Vec::new()),
@@ -110,6 +184,9 @@ impl CodexLaunchRuntime for FakeRuntime {
         generation: u64,
     ) -> BoxFuture<'_, Result<(), String>> {
         Box::pin(async move {
+            if self.fail_ownership_update.load(Ordering::SeqCst) {
+                return Err("fake runtime: ownership update failed".to_string());
+            }
             self.ownership_updates
                 .lock()
                 .unwrap()
@@ -452,6 +529,57 @@ async fn manager_adopts_by_terminal_id_and_tears_down_on_exit() {
         );
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
+}
+
+/// A failed terminal-side adoption still owns the prepared launch until its
+/// proxy and child have been discarded. Otherwise the moved launch would be
+/// stranded in the planner's active map until a later process shutdown.
+#[tokio::test]
+async fn failed_adoption_discards_the_still_owned_launch() {
+    let runtime = FakeRuntime::start().await;
+    let factory_runtime = runtime.clone();
+    let manager = CodexTerminalLaunchManager::new(Box::new(move |_plan| {
+        let rt = factory_runtime.clone() as Arc<dyn CodexLaunchRuntime>;
+        Box::pin(async move { rt })
+    }));
+    let launch = manager
+        .plan_create_with_retry_uncancellable(
+            &CodexLaunchPlanInput::default(),
+            1,
+            LaunchClass::Interactive,
+        )
+        .await
+        .expect("prepared launch");
+    let remote_ws_url = launch.remote_ws_url.clone();
+
+    runtime.fail_ownership_update.store(true, Ordering::SeqCst);
+    let error = manager
+        .adopt("term-adoption-failure", launch, 0)
+        .await
+        .expect_err("the injected ownership failure must reach the caller");
+    assert_eq!(error, "fake runtime: ownership update failed");
+    assert_eq!(
+        runtime.shutdown_calls.load(Ordering::SeqCst),
+        1,
+        "the still-owned sidecar must be discarded immediately"
+    );
+    assert!(
+        !matches!(
+            timeout(Duration::from_secs(1), connect_async(&remote_ws_url)).await,
+            Ok(Ok(_))
+        ),
+        "the failed adoption must close the planned proxy immediately"
+    );
+
+    // A later manager shutdown must find no active planned launch. This also
+    // proves the failure did not leave a proxy/child retained for the planner
+    // to clean up at process shutdown.
+    manager.shutdown().await;
+    assert_eq!(
+        runtime.shutdown_calls.load(Ordering::SeqCst),
+        1,
+        "failed adoption must not leave an active planned sidecar"
+    );
 }
 
 #[tokio::test]
@@ -948,6 +1076,133 @@ fn fake_app_server_command() -> String {
     let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../test/fixtures/coding-cli/codex-app-server/fake-app-server.mjs");
     format!("node {}", fixture.display())
+}
+
+async fn wait_for_arg_log(path: &std::path::Path) -> serde_json::Value {
+    let deadline = tokio::time::Instant::now() + RECV_TIMEOUT;
+    loop {
+        if let Ok(contents) = std::fs::read_to_string(path) {
+            return serde_json::from_str(&contents).expect("fixture arg log is valid JSON");
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "fake app-server did not write its argument observation"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+fn assert_captured_spawn_context(captured: &serde_json::Value) {
+    let argv = captured["argv"]
+        .as_array()
+        .expect("fixture records argv as an array")
+        .iter()
+        .map(|value| value.as_str().expect("fixture argv values are strings"))
+        .collect::<Vec<_>>();
+    let app_server_index = argv
+        .iter()
+        .position(|value| *value == "app-server")
+        .expect("sidecar must execute app-server");
+    assert_eq!(
+        &argv[..app_server_index],
+        [
+            "-c",
+            "features.apps=false",
+            "-c",
+            "mcp_servers.freshell.command=\"node\"",
+            "-c",
+            "mcp_servers.freshell.env_vars=[\"FRESHELL_TOKEN\"]",
+        ],
+        "all context config pairs must precede app-server"
+    );
+    assert_eq!(argv.get(app_server_index + 1).copied(), Some("--listen"));
+    assert!(
+        !argv.iter().any(|value| *value == SYNTHETIC_CONTEXT_TOKEN),
+        "context values must stay out of the child argv"
+    );
+    assert_eq!(
+        captured["env"]["FRESHELL_TOKEN"].as_str(),
+        Some(SYNTHETIC_CONTEXT_TOKEN),
+        "the child receives the context value through its environment"
+    );
+    assert_eq!(
+        captured["env"]["FRESHELL_TERMINAL_ID"].as_str(),
+        Some("terminal-context-test"),
+        "the child receives the terminal context through its environment"
+    );
+}
+
+#[tokio::test]
+async fn spawned_runtime_receives_context_but_reattached_runtime_does_not() {
+    let _codex_cmd = EnvVarGuard::set("CODEX_CMD", fake_app_server_command());
+    let dir = tempfile::tempdir().expect("temporary fixture observations");
+
+    // No reattach candidate: the production selector must construct a spawned
+    // runtime from the plan's context. The fixture sees its real child argv/env.
+    let spawned_log = dir.path().join("spawned.json");
+    let spawned_context = sidecar_context(&spawned_log);
+    let spawned_plan = plan_codex_launch(&CodexLaunchPlanInput {
+        sidecar_context: spawned_context,
+        ..Default::default()
+    })
+    .expect("valid spawned plan");
+    let spawned = select_codex_runtime(None, None, &spawned_plan).await;
+    spawned
+        .ensure_ready(None)
+        .await
+        .expect("spawned runtime becomes ready");
+    assert_captured_spawn_context(&wait_for_arg_log(&spawned_log).await);
+    spawned.shutdown().await.expect("tear down spawned child");
+
+    // A verified survivor keeps its original process unchanged. Give a NEW
+    // plan an observation path that only a wrongly-created replacement child
+    // could write, then prove selection reattaches instead.
+    let (_store_dir, store) = temp_sidecar_store();
+    let survivor = SpawnedCodexAppServerRuntime::with_command_and_store(
+        fake_app_server_command(),
+        store.clone(),
+    );
+    let survivor_ready = survivor
+        .ensure_ready(None)
+        .await
+        .expect("spawn survivor fixture");
+    survivor
+        .note_session_id("survivor-session".to_string())
+        .await
+        .expect("persist survivor session id");
+    let survivor_pid = survivor.child_pid().await.expect("survivor pid");
+    drop(survivor);
+
+    let (reconciler, report) = SidecarReconciler::boot_reconcile(store.clone());
+    assert_eq!(report.held, 1, "the live sidecar is held for reattachment");
+    let reconciler = Arc::new(reconciler);
+    let unexpected_spawn_log = dir.path().join("unexpected-replacement.json");
+    let survivor_plan = plan_codex_launch(&CodexLaunchPlanInput {
+        resume_session_id: Some("survivor-session"),
+        sidecar_context: sidecar_context(&unexpected_spawn_log),
+        ..Default::default()
+    })
+    .expect("valid resume plan");
+    let reattached = select_codex_runtime(Some(&reconciler), Some(&store), &survivor_plan).await;
+    let reattached_ready = reattached
+        .ensure_ready(None)
+        .await
+        .expect("reattach existing survivor");
+    assert_eq!(reattached_ready.ws_url, survivor_ready.ws_url);
+    assert!(
+        !unexpected_spawn_log.exists(),
+        "a reattached survivor must not start a replacement child with the new context"
+    );
+    assert!(
+        proc_starttime(survivor_pid as i32).is_some(),
+        "the verified survivor remains the live process"
+    );
+
+    reattached
+        .shutdown()
+        .await
+        .expect("tear down the test survivor");
+    wait_pid_gone(survivor_pid).await;
 }
 
 #[tokio::test]

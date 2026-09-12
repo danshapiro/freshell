@@ -38,6 +38,10 @@ import {
   pruneTabRecencyToCurrentLayout,
   tabRecencyPruneMiddleware,
 } from './tabRecencyPruneMiddleware'
+import {
+  wirePaneFocusOwnershipInvalidation,
+  paneSelectionMiddleware,
+} from '@/lib/pane-focus-ownership'
 
 enableMapSet()
 
@@ -80,6 +84,7 @@ export const store = configureStore({
         ignoredPaths: ['sessions.expandedProjects'],
       },
     }).concat(
+      paneSelectionMiddleware,
       perfMiddleware,
       tabFallbackIdentityMiddleware,
       tabRecencyPruneMiddleware,
@@ -94,6 +99,14 @@ export const store = configureStore({
 })
 
 pruneTabRecencyToCurrentLayout(store)
+
+// Pane focus-ownership memory: explicit selections (activePane value changes
+// and epoch nudges) advance the restore-guard serial; ownership records are
+// forgotten the moment their pane id RE-APPEARS in any layout (a reopened
+// tab's preserved leaf ids), so reopening a closed tab never reads a stale
+// close-time record. Removal-time records intentionally linger (LRU-bounded)
+// because React's teardown re-record lands after the store update.
+wirePaneFocusOwnershipInvalidation(store)
 
 // Note: Tabs and Panes are now loaded from localStorage directly in their slice
 // initial states (see tabsSlice.ts and panesSlice.ts). This ensures the state

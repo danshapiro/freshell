@@ -14,6 +14,8 @@ import { copyText } from '@/lib/clipboard'
 import { registerEditorActions } from '@/lib/pane-action-registry'
 import { ContextIds } from '@/components/context-menu/context-menu-constants'
 import { createLogger } from '@/lib/client-logger'
+import { usePaneFocusAdoption } from '@/hooks/usePaneFocusAdoption'
+import { shouldRecordSuppressAutofocus } from '@/lib/pane-focus-ownership'
 
 
 const log = createLogger('EditorPane')
@@ -135,6 +137,10 @@ interface EditorPaneProps {
   content: string
   viewMode?: 'source' | 'preview'
   wordWrap?: boolean
+  focusEligible?: boolean
+  /** Focus-nudge epoch: explicit same-target selects bump this so focus moves
+   *  even without an eligibility transition. */
+  focusEpoch?: number
 }
 
 export default function EditorPane({
@@ -146,6 +152,8 @@ export default function EditorPane({
   content,
   viewMode = 'source',
   wordWrap = true,
+  focusEligible = true,
+  focusEpoch = 0,
 }: EditorPaneProps) {
   const dispatch = useAppDispatch()
   const monacoTheme = useMonacoTheme()
@@ -174,6 +182,7 @@ export default function EditorPane({
   const editorFontSize = useAppSelector((s) => s.settings.settings.terminal?.fontSize) ?? 16
   const mountedRef = useRef(true)
   const editorRef = useRef<Monaco.editor.IStandaloneCodeEditor | null>(null)
+  const rootRef = useRef<HTMLDivElement | null>(null)
   const fileInputRef = useRef<HTMLInputElement>(null)
   const pathInputRef = useRef<HTMLInputElement>(null)
   const fileHandleRef = useRef<FileSystemFileHandle | null>(null)
@@ -209,6 +218,14 @@ export default function EditorPane({
   const defaultBrowseRoot = firstTerminalCwd || defaultCwd || null
   const isHtmlPreview = isHtml(filePath, currentLanguage)
   const showEmptyState = !filePath && !editorValue
+  // The <Editor> branch renders only in source mode with content; preview and
+  // empty states render no Monaco. @monaco-editor/react disposes the editor
+  // on unmount but never tells us — clear the ref, or flip/epoch focus paths
+  // would focus() a disposed editor instead of falling back to the pane root.
+  const editorRendered = !showEmptyState && !(currentViewMode === 'preview' && showPreviewToggle)
+  useEffect(() => {
+    if (!editorRendered) editorRef.current = null
+  }, [editorRendered])
 
   const resolvePath = useCallback((pathValue: string | null): string | null => {
     if (!pathValue) return null
@@ -292,10 +309,55 @@ export default function EditorPane({
     return () => clearTimeout(timer)
   }, [filePickerMessage])
 
+  // Render-synced (same pattern as connectionStatusRef above): onMount fires
+  // asynchronously with a closure captured at editor-creation time, so it must
+  // read eligibility through a ref — an explicit select that lands BEFORE the
+  // async Monaco mount otherwise leaves the selected editor unfocused forever.
+  const focusEligibleRef = useRef(focusEligible)
+  focusEligibleRef.current = focusEligible
+
+  // Eligible-mount focus is gated by recorded focus ownership (agent-driven
+  // leaf→split remounts must not yank focus from app chrome); flips bypass.
+  const mayFocusNow = usePaneFocusAdoption(paneId, focusEligible, focusEpoch)
+
   function handleEditorMount(editor: Monaco.editor.IStandaloneCodeEditor) {
     editorRef.current = editor
-    editor.focus()
+    // onMount is async — eligible-at-mount focus can only happen HERE.
+    // EXCEPT when a recorded focus descriptor still speaks for this window
+    // (resolves AND no newer explicit selection landed): a remount's restore
+    // pass is about to refocus that exact element (e.g. the toolbar path
+    // field the user was typing in), and a late async Monaco focus would
+    // stomp it. A newer selection owns the outcome instead — its in-effect
+    // focus may have hit only the pane root because editorRef was not yet
+    // set, so THIS mount focus is the select contract completing.
+    if (focusEligibleRef.current && mayFocusNow() && !shouldRecordSuppressAutofocus(paneId)) editor.focus()
   }
+
+  // Focus target for explicit selects/flips when Monaco is NOT rendered
+  // (preview mode, empty/path-less state): the pane root is tabbable to
+  // program focus, so an explicit select NEVER leaves DOM focus stranded in
+  // the previously-focused pane or app chrome.
+  const focusEditorOrRoot = useCallback(() => {
+    ;(editorRef.current ?? rootRef.current)?.focus()
+  }, [])
+
+  // Later false→true eligibility flips (explicit select bringing a
+  // background-mounted editor forward) — handleEditorMount never refires.
+  // Same-target selects arrive as focus-epoch bumps: mayFocusNow's identity
+  // changes, re-running this effect while `was` stays true — the else branch
+  // covers that (and a previously ownership-DENIED mount recovering on a
+  // later explicit select).
+  const prevFocusEligibleRef = useRef(focusEligible)
+  useEffect(() => {
+    const was = prevFocusEligibleRef.current
+    prevFocusEligibleRef.current = focusEligible
+    if (!focusEligible) return
+    if (!was) {
+      focusEditorOrRoot()
+      return
+    }
+    if (mayFocusNow()) focusEditorOrRoot()
+  }, [focusEligible, mayFocusNow, focusEditorOrRoot])
 
   const debouncedPathChange = useMemo(
     () =>
@@ -909,6 +971,10 @@ export default function EditorPane({
 
   return (
     <div
+      ref={rootRef}
+      // Program-focus fallback for preview/empty-state selects (no Monaco in
+      // the tree); -1 keeps it out of sequential tab order.
+      tabIndex={-1}
       className="h-full w-full flex flex-col"
       data-testid="editor-pane"
       data-context={ContextIds.Editor}
