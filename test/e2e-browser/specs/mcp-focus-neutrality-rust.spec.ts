@@ -106,8 +106,7 @@ function leafIds(node: LayoutNodeShape | undefined): string[] {
 test.describe('MCP/REST focus neutrality', () => {
   test.setTimeout(120_000)
 
-  test('REST create/split never steal focus; explicit select routes do', async ({ page, e2eServerKind }) => {
-    expect(e2eServerKind).toBe('rust')
+  test('REST create/split never steal focus; explicit select routes do', async ({ page }) => {
     const { server, harness, info } = await bootWall(page)
     try {
       await selectShellIfPickerShowing(page)
@@ -331,8 +330,7 @@ test.describe('MCP/REST focus neutrality', () => {
     }
   })
 
-  test('REST screenshot of a background tab renders it without stealing selection or focus', async ({ page, e2eServerKind }) => {
-    expect(e2eServerKind).toBe('rust')
+  test('REST screenshot of a background tab renders it without stealing selection or focus', async ({ page }) => {
     const { server, harness, info } = await bootWall(page)
     try {
       await selectShellIfPickerShowing(page)
