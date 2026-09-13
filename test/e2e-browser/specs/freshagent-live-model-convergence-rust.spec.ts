@@ -142,9 +142,8 @@ function seedWallConfig(input: {
 }
 
 test.describe('fresh-agent live model convergence (rust)', () => {
-  test('opencode: configure broadcasts session metadata and the next turn carries the pair', async ({ e2eServerKind }) => {
+  test('opencode: configure broadcasts session metadata and the next turn carries the pair', async () => {
     test.setTimeout(180_000)
-    expect(e2eServerKind).toBe('rust')
     const sharedRoot = await fsp.mkdtemp(path.join(os.tmpdir(), 'fa-conv-opencode-'))
     const binDir = path.join(sharedRoot, 'bin')
     const auditLogPath = path.join(sharedRoot, 'opencode-audit.jsonl')
@@ -271,9 +270,8 @@ test.describe('fresh-agent live model convergence (rust)', () => {
     }
   })
 
-  test('claude: configure applies through the sidecar lane and broadcasts session metadata', async ({ e2eServerKind }) => {
+  test('claude: configure applies through the sidecar lane and broadcasts session metadata', async () => {
     test.setTimeout(180_000)
-    expect(e2eServerKind).toBe('rust')
     const sharedRoot = await fsp.mkdtemp(path.join(os.tmpdir(), 'fa-conv-claude-'))
     const sidecarLogPath = path.join(sharedRoot, 'sidecar-requests.jsonl')
     const projectDir = path.join(sharedRoot, 'proj')
