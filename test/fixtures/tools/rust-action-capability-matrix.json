@@ -1,0 +1,6 @@
+{
+  "canonicalActions": 33,
+  "aliases": 14,
+  "unsupported": ["run", "fresh-send", "attach"],
+  "acceptedNoOpCaptureParams": ["J", "e"]
+}

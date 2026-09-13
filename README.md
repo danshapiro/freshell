@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="https://img.shields.io/badge/node-%3E%3D18-brightgreen" alt="Node.js Version">
+  <img src="https://img.shields.io/badge/node-%3E%3D22-brightgreen" alt="Node.js tools version">
   <img src="https://img.shields.io/badge/platform-windows%20%7C%20macos%20%7C%20linux-blue" alt="Platform Support">
   <img src="https://img.shields.io/badge/license-MIT-green" alt="License">
 </p>
@@ -25,7 +25,7 @@
 - **Speak with the dead** — Resume any Claude, Codex, or OpenCode session from any device (even if you weren't using freshell to run it)
 - **Fancy tabs** — Auto-name from terminal content, drag-and-drop reorder, and per-pane type icons so you know what's in each tab
 - **Freshclaude** — An interactive alternative to Claude CLI that works with your Anthropic subscription. Rich chat UI with collapsible tool strips, token budget display, and full session persistence.
-- **Extension system** — Add new pane types, CLI integrations, and server-side services via manifest-based extensions. Enable and disable from the Extensions management page.
+- **Extension system** — Add CLI integrations via manifest-based extensions. Client and server-hosted extension panes are not supported by the Rust server.
 - **Self-configuring workspace** — Just ask Claude or Codex to open a browser in a pane, or create a tab with four subagents. Built-in tmux-like API and skill makes it simple.
 - **Live pane headers** — See your active directory, git branch, and context usage in every pane title bar, updating live as you work. Fresh-agent panes carry their context meter in their status strip instead of the header.
 - **Host pressure dashboard pane** — CPU, memory, pressure, and I/O at a glance with near-zero overhead (metrics stream only while you're watching). Linux, WSL, and macOS only — not shown on Windows.
@@ -45,124 +45,46 @@ cd freshell
 # Install dependencies
 npm install
 
-# Build and run
+# Build the client, tools, and Rust server, then run it
 npm run serve
 ```
 
-On first run, freshell auto-generates a `.env` file with a secure random `AUTH_TOKEN`. The token is printed to the console at startup — open the URL shown to connect.
+On first run, `npm run serve`, `npm run dev`, `npm run dev:server`, and the
+Rust launcher create a private `.env` file with a secure random `AUTH_TOKEN` if
+one is not already supplied. Existing environment variables and `.env` values
+are preserved. The Rust server prints the URL at startup — open it to connect.
+
+For a development checkout, use `npm run dev` for Vite plus the Rust server,
+or `PORT=3499 npm run dev:server` for the Rust server without Vite. For a
+previously built checkout, `scripts/launch-rust.sh --port 3499` builds and
+starts an isolated Rust instance; use a port other than the live self-hosted
+port when testing a worktree.
 
 ## Prerequisites
 
-Node.js 18+ (20+ recommended) and platform build tools for native modules (`windows-build-tools` on Windows, Xcode CLI Tools on macOS, `build-essential python3` on Linux).
+Node.js 22.5+ and Rust stable are required. Node is used for the client,
+standalone CLI/MCP tools, and Electron build; the Rust toolchain builds the
+`freshell-server` binary and owns PTY support. Platform-specific build tools
+are documented in [Building the Windows Electron App](docs/development/windows-electron-build.md).
 
 > **Note:** On native Windows, terminals default to WSL. Set `WINDOWS_SHELL=cmd` or `WINDOWS_SHELL=powershell` to use a native Windows shell instead.
-
-## Desktop profiles (multiple instances)
-
-The desktop app normally runs one instance with one configuration. **Profiles**
-let you run multiple independent desktop clients on the same machine at the
-same time — for example one connected to your work server and one to a
-personal server.
-
-Each named profile gets its own:
-
-- settings, window state, and logs (`~/.freshell-<id>/`; the default profile
-  keeps using `~/.freshell/`)
-- Electron storage dir (`…/Freshell-<id>` in packaged builds,
-  `freshell-<id>` in dev/unpackaged runs), so cookies and localStorage never
-  mix
-- single-instance lock: launching the same profile twice focuses the running
-  window; different profiles run side by side
-
-### Defining profiles
-
-Create `~/.freshell/profiles.json`:
-
-```json
-{
-  "profiles": [
-    { "id": "work", "label": "Work" },
-    { "id": "home" }
-  ]
-}
-```
-
-Rules: `id` is lowercase letters/digits/dashes starting with a letter or digit
-(max 32 chars); `default` and `profile-picker` are reserved (the first means
-the original un-namespaced environment; the second is the picker launcher's
-own storage dir); `label` is optional display text.
-
-When at least one named profile is defined, launching the app without a
-profile shows a picker (the default profile is always listed first; the built-
-in default counts, so one named profile in the file already means "more than
-one configured"). The picker is a small launcher: whichever profile you pick,
-the app relaunches itself pinned to it — you'll see a quick restart, then the
-app continues in the chosen profile. Pin a launch to a profile with
-`--profile=<id>` or `FRESHELL_PROFILE=<id>`; named ids do not have to be
-listed in `profiles.json` — an unlisted id simply starts with a fresh
-configuration.
-
-### Notes and limitations
-
-- Global hotkey: the first instance to register an accelerator keeps it;
-  later instances log a warning (`global_hotkey_registration_failed`) and have
-  no hotkey. Give each profile a distinct hotkey in its own settings.
-- App-bound servers: each profile spawns its own server pinned to that
-  profile's config dir (`FRESHELL_CONFIG_DIR`) and port — a named profile
-  never adopts another profile's already-running local server; choose a
-  distinct port per profile. Once named profiles exist (listed in
-  `profiles.json`, used from the command line, or previously run — including
-  a stray `~/.freshell-<id>` backup dir, which shape-checks by name), the same
-  applies to the **Default** profile: it no longer auto-attaches to a
-  discovered local server, and if its configured port is held by a neighbor,
-  Freshell bumps to the next free port and saves that port into the profile's
-  settings (visible in the setup summary). An app-bound profile that finds
-  its OWN config dir's server already resident attaches to it instead of
-  double-spawning.
-- Daemon services (`freshell.service`, `com.freshell.server`,
-  "Freshell Server" task) are machine-global single instances — daemon mode is
-  available only on the **Default** profile; named profiles fall back to the
-  chooser instead.
-- Silent-install provisioning (`desktop.provision`) applies to the default
-  profile only.
-- Auto-update relaunches the app without `--profile`: after an update, the
-  picker shows again (pick your profile back).
-- Installing/upgrading on Windows terminates all running Freshell instances.
-- Relaunching while a profile is running: on Linux/Windows, a launch without a
-  flag shows the picker again and choosing the running profile focuses its
-  window; launching with the same `--profile` as a running instance focuses
-  that window (the new process quits). On macOS, relaunching from Finder or
-  the Dock while ANY Freshell instance is running just activates the running
-  instance (the OS enforces this) and never shows the picker — use
-  `--profile=` flags or `FRESHELL_PROFILE` from a terminal, or Quit before
-  relaunching to get the picker. Two simultaneous flag-less launches race for
-  the picker's launcher slot: the first shows the picker; the second quietly
-  exits and brings the existing picker forward.
-- Daemon-service caveat for the Node server: the shipped daemon templates have
-  always contained an (until now inert) `FRESHELL_CONFIG_DIR` environment
-  line; starting with this release the Node server honors it. If you
-  hand-generated a daemon unit from those templates with a non-default config
-  directory, the value now takes effect at next start (state relocates to that
-  directory): remove the line from your unit, or move your existing
-  `~/.freshell` contents into the directory it names. Units using the default
-  `~/.freshell` path are unaffected — and if your service's working directory
-  is not the config dir (systemd user units default to `$HOME`), the server
-  copies an existing `.env` from the old location into the config dir rather
-  than rotating your token. Rust-server installs never read this
-  variable.
 
 ## Usage
 
 ```bash
-npm run dev     # Development with hot reload
-npm run serve   # Production build and run
+npm run dev     # Vite + Rust server with hot reload
+npm run serve   # Build and run the Rust server
 ```
 
 `npm run serve` is intended for `main`. If you run it from another branch, Freshell asks for confirmation in an interactive terminal and refuses in non-interactive shells unless `FRESHELL_ALLOW_NON_MAIN_SERVE=1` is set.
 
+For unattended operation, build `freshell-server` and install the optional
+user service in [`installers/systemd/freshell-rust.service`](installers/systemd/freshell-rust.service).
+The service is standalone and independent of Electron.
+
 ### Fresh agents
 
-Freshclaude, Freshcodex, and Freshopencode share a chat interface with attachments, tool output, questions, and approval controls. Use `/model` or click the model name to choose a model and thinking level. Changes apply to your next message; the picker remembers recent choices for each project.
+Freshclaude, Freshcodex, and Freshopencode share a chat interface with tool output, questions, and approval controls. Use `/model` or click the model name to choose a model and thinking level. Changes apply to your next message; the picker remembers recent choices for each project.
 
 You can queue follow-up messages while an agent works. They run one at a time, and the queue stays available if the session disconnects or ends. Expand the queue to read or cancel individual messages. Codex permission settings control when it asks for approval; “Never ask” does not change the session’s file or network access limits.
 
@@ -222,9 +144,12 @@ Then unplug and replug the deck. Without the rule, the connection status shows "
 | Variable | Required | Description |
 |----------|----------|-------------|
 | `AUTH_TOKEN` | Auto | Authentication token (auto-generated on first run, min 16 chars) |
-| `PORT` | No | Server port (default: 3001) |
+| `PORT` | No | Rust server port (default: 3001) |
+| `FRESHELL_BIND_HOST` | No | Explicit Rust server bind host, such as `127.0.0.1` or `0.0.0.0` |
+| `FRESHELL_HOME` | No | Freshell state/config home (default: the user's home directory) |
 | `ALLOWED_ORIGINS` | No | Auto-managed CORS origins for the active server bind host and LAN IPs |
 | `EXTRA_ALLOWED_ORIGINS` | No | Comma-separated custom CORS origins preserved across runtime origin rebuilds |
+| `RUST_LOG` | No | Rust structured-log filter (default: `info`) |
 | `CLAUDE_HOME` | No | Path to Claude config directory (default: `~/.claude`) |
 | `CODEX_HOME` | No | Path to Codex config directory (default: `~/.codex`) |
 | `WINDOWS_SHELL` | No | Windows shell: `wsl` (default), `cmd`, or `powershell` |
@@ -235,8 +160,11 @@ Then unplug and replug the deck. Without the rule, the connection status shows "
 | `GEMINI_CMD` | No | Gemini CLI command override |
 | `KIMI_CMD` | No | Kimi CLI command override |
 | `AMPLIFIER_CMD` | No | Amplifier CLI command override |
-| `FRESHELL_AUTO_RESUME_IDENTITY_GRACE_MS` | No | Comma-separated identity-grace recheck delays before a crashed agent pane settles (default: `2500,2500` — 5s total); set to empty to disable |
 | `GOOGLE_GENERATIVE_AI_API_KEY` | No | Gemini API key for AI-powered terminal summaries |
+| `FRESHELL_CLAUDE_NODE` | No | Node executable for the isolated Claude SDK sidecar (normally set by Electron) |
+| `FRESHELL_CLAUDE_SIDECAR` | No | Claude sidecar entrypoint override for Rust development/service runs |
+| `FRESHELL_MCP_NODE` | No | Node executable for the standalone MCP client |
+| `FRESHELL_MCP_ENTRY` | No | Standalone MCP client entrypoint override |
 
 ### Coding CLI Providers
 
@@ -258,23 +186,62 @@ OpenCode permissions are controlled by the OpenCode configuration for the OS use
 
 Amplifier loads the freshell MCP only if its bundle mounts `tool-mcp` (the default `anchors` bundle does not). Add `tool-mcp` to your Amplifier bundle to enable orchestration.
 
+### Standalone CLI and MCP client
+
+The Rust server is the only Freshell HTTP/WebSocket backend. The Node programs
+under `tools/` are clients: they connect to an already-running Rust server and
+do not start one.
+
+```bash
+npm run build:tools
+FRESHELL_URL=http://localhost:3001 FRESHELL_TOKEN=<token> \
+  node dist/tools/freshell-cli/index.js list-tabs
+FRESHELL_URL=http://localhost:3001 FRESHELL_TOKEN=<token> \
+  node dist/tools/freshell-mcp/server.js
+```
+
+When Freshell starts a terminal, it supplies the MCP client endpoint through
+`FRESHELL_URL` and `FRESHELL_TOKEN`. In the packaged desktop app, the native
+Rust server is under `resources/bin/`; the packaged Node runtime and MCP client
+are separate resources. Claude fresh-agent panes use the isolated
+`crates/freshell-claude-sidecar` package, which wraps the Claude SDK over
+newline-delimited JSON on stdin/stdout. The sidecar is not a network service.
+
+### Rust server scope
+
+The Rust server supports the browser UI, terminal and session workflows, the
+supported agent pane flows, and the retained CLI/MCP actions. A small set of
+legacy Node-only operations is intentionally unavailable: server-managed
+extension processes/assets, external-editor reveal, the old command-running and
+direct fresh-agent-send APIs, legacy coding-client WebSocket messages, paged
+fresh-agent transcript/viewport APIs, and remote browser forwarding. Use a
+terminal pane or the supported Rust REST/WS/MCP operations instead. The session
+repair/backfill and remaining parity work are tracked in the project parity
+checklist and existing issues; they are not silently presented as supported.
+
 ## Tech Stack
 
 - **Frontend**: React 18, Redux Toolkit, Tailwind CSS, xterm.js, Monaco Editor, Zod, lucide-react
-- **Backend**: Express, WebSocket (ws), node-pty, Pino, Chokidar, Zod
+- **Backend**: Rust `freshell-server`, Axum, Tokio, portable-pty, SQLite, and structured JSONL logging
+- **Client tooling**: Node.js standalone CLI and stdio MCP client
+- **Claude integration**: isolated Node Claude SDK sidecar, launched by the Rust fresh-agent runtime
 - **Build**: Vite, TypeScript
-- **Testing**: Vitest, Testing Library, supertest, superwstest
-- **AI**: Vercel AI SDK with Google Gemini
+- **Testing**: Vitest, Testing Library, Playwright, and Cargo tests
+- **AI**: Google Gemini integration in the Rust server
 
 ## Extensions
 
-Freshell supports custom pane types via extensions. Three categories are available:
+Freshell discovers extension manifests and supports CLI extensions in terminal
+panes. The Rust server does not render extension iframe panes:
 
-- **Client** — Static HTML/JS served by freshell (no server needed)
-- **Server** — Your own HTTP server, managed by freshell with automatic port allocation
 - **CLI** — Any terminal tool wrapped as a pane
+- **Client** — Not available as a Freshell pane
+- **Server-hosted** — Not available as a Freshell pane; run the service
+  separately and open it as a supported browser pane when appropriate
 
-Drop a directory with a `freshell.json` manifest into `~/.freshell/extensions/` and restart freshell. See [`examples/extensions/`](examples/extensions/) for working examples of each type.
+Drop a directory with a `freshell.json` manifest into `~/.freshell/extensions/`
+and restart Freshell. See [`examples/extensions/`](examples/extensions/) for
+CLI examples and historical client/server manifests.
 
 ## Contributing
 

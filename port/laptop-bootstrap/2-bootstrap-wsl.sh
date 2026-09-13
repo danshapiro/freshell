@@ -11,7 +11,7 @@ echo "== [1/7] apt toolchain (build, cross-compile, GUI/Tauri, screenshots/OCR) 
 sudo apt-get update -y
 sudo apt-get install -y build-essential curl git pkg-config libssl-dev unzip \
   mingw-w64 imagemagick tesseract-ocr xdotool \
-  libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev
+  libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev libdbus-1-dev librsvg2-dev
 
 echo "== [2/7] rust (stable + the Windows cross target) =="
 if ! command -v cargo >/dev/null 2>&1; then
@@ -38,11 +38,10 @@ npm ci
 (cd crates/freshell-claude-sidecar && npm install)
 npx playwright install --with-deps chromium
 
-echo "== [6/7] builds: original (reference) + rust linux + rust windows exe =="
+echo "== [6/7] builds: client/tools + Rust linux + Rust windows exe =="
 npm run build
-cargo build --release -p freshell-server
-cargo build --release -p freshell-server --target x86_64-pc-windows-gnu
-cargo build -p freshell-tauri || echo "WARN: tauri build failed — check GUI deps (HANDOFF §3); not fatal for server work"
+cargo build --release -p freshell-server --target x86_64-pc-windows-gnu --locked
+cargo build -p freshell-tauri --locked || echo "WARN: tauri build failed — check GUI deps (HANDOFF §3); not fatal for server work"
 
 echo "== [7/7] coding CLIs (binaries only — AUTH is a separate human step) =="
 npm i -g @anthropic-ai/claude-code @openai/codex opencode-ai || echo "WARN: a global CLI install failed; install individually"

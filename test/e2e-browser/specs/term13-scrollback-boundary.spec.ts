@@ -39,7 +39,7 @@ import { test, expect } from '../helpers/fixtures.js'
  * slice mid-codepoint:
  *   - `registry.rs::ingest()` evicts WHOLE `RetainedFrame`s only (FIFO,
  *     `s.replay.pop_front()`), counted in UTF-16 code units
- *     (`utf16_len`) matching legacy `ChunkRingBuffer` accounting -- never a
+ *     (`utf16_len`) -- never a
  *     partial slice of a frame's `data: String` (which, being a real Rust
  *     `String`, cannot hold a lone surrogate or a partial UTF-8 sequence in
  *     the first place).
@@ -47,36 +47,14 @@ import { test, expect } from '../helpers/fixtures.js'
  *     over-cap chunk) walks `s.chars().rev()` -- whole scalar values only.
  *   - `replay_ring.rs`'s `normalize_frame_data` (used only for a single
  *     over-cap chunk) walks the fatal UTF-8 decoder from a byte offset
- *     forward to the first valid boundary -- the same technique legacy's
- *     `normalizeFrameData` uses.
+ *     forward to the first valid boundary.
  * This is NOT a product bug -- no `test.fail`/expected-fail pin is applied.
  * The assertions below are a genuine, currently-passing proof of the
  * item's Unicode-integrity clause, not a documented gap.
  *
- * DISCOVERY 2 (2026-07-19, this task) -- KNOWN DIVERGENCE, legacy search is
- * NOT scoped to the retained window: `server/terminal-view/mirror.ts`'s
- * `TerminalViewMirror` holds TWO independent stores per terminal -- a
- * byte-capped `ReplayRing` (backs reattach-replay, genuinely bounded by the
- * scrollback setting) and a SEPARATE, entirely UNBOUNDED `this.lines` array
- * (`appendLines`, only ever grows) that legacy's OWN `search()` reads from.
- * Legacy's search endpoint therefore never reflects the scrollback cap at
- * all, regardless of setting -- confirmed empirically (a needle flooded far
- * outside a 75,000-char cap is still found by legacy's search, at the
- * un-evicted absolute line position). The Rust port's `terminals.rs`
- * deliberately unifies this: `entry.snapshot` (search's data source) is
- * built from the SAME bounded `s.replay` the reattach path uses, so Rust's
- * search genuinely IS scoped to the retained window -- a real improvement
- * over legacy, not a parity gap. The search-boundary assertions below are
- * therefore gated to `e2eServerKind === 'rust'`, with an explicit,
- * evidence-backed assertion of legacy's documented (not merely skipped)
- * divergence in the `else` branch of each test.
- *
- * Routed through the generic `serverInfo`/`harness`/`terminal` fixtures
- * (same seam as `settings-live-reload.spec.ts`) for every OTHER assertion
- * (reattach-replay survives, Unicode integrity) -- those are a true parity
- * control, unaffected by DISCOVERY 2 -- so this spec runs against both the
- * legacy Node server and the owned Rust server per `playwright.config.ts`'s
- * `MATRIX_SPECS`.
+ * The Rust server deliberately unifies its bounded replay and search data:
+ * `entry.snapshot` is built from the same bounded replay used for reattach.
+ * These assertions therefore exercise the Rust-baseline contract directly.
  */
 test.describe('TERM-13 -- scrollback honors the configured cap at the Unicode/search boundary', () => {
   async function selectShell(page: any): Promise<void> {
@@ -137,8 +115,8 @@ test.describe('TERM-13 -- scrollback honors the configured cap at the Unicode/se
   // computeScrollbackMaxChars(lines) = clamp(lines * 300, 64*1024, 4*1024*1024)
   // (terminal-registry.ts:1328-1333 / freshell-terminal's
   // compute_scrollback_max_bytes, registry.rs:106-110 -- same formula/constants
-  // on both servers, and the exact formula `settings-live-reload.spec.ts`
-  // documents). 250 lines -> a 75,000-char cap; 10,000 lines -> a
+  // and the exact formula `settings-live-reload.spec.ts` documents). 250
+  // lines -> a 75,000-char cap; 10,000 lines -> a
   // 3,000,000-char cap. The flood below (~180,000 UTF-16 units) sits
   // strictly between the two, so the needle line survives ONLY under the
   // large cap.
@@ -232,7 +210,6 @@ test.describe('TERM-13 -- scrollback honors the configured cap at the Unicode/se
     harness,
     terminal,
     serverInfo,
-    e2eServerKind,
   }) => {
     const { terminalId, visibleText, needle, doneMarker } = await runScrollbackScenario(
       page,
@@ -243,14 +220,12 @@ test.describe('TERM-13 -- scrollback honors the configured cap at the Unicode/se
     )
 
     // The LATEST marker survived reattach (proves the reattach/replay path
-    // itself still works, independent of the cap). TRUE PARITY on both
-    // server kinds.
+    // itself still works, independent of the cap).
     expect(visibleText).toContain(doneMarker)
 
     // UNICODE INTEGRITY: whatever is currently rendered never contains the
     // replacement character -- the universal symptom of a mid-codepoint
-    // slice (byte- or UTF-16-unit-unaware trimming). TRUE PARITY on both
-    // server kinds.
+    // slice (byte- or UTF-16-unit-unaware trimming).
     expect(visibleText).not.toContain(REPLACEMENT_CHAR)
 
     // BOUNDARY + SEARCH: the server-side search endpoint reads the SAME
@@ -262,19 +237,9 @@ test.describe('TERM-13 -- scrollback honors the configured cap at the Unicode/se
     // control -- so an initial `getVisibleText()` window reflects
     // client-side pagination state, not the server's retained boundary).
     //
-    // KNOWN DIVERGENCE (see DISCOVERY 2 above): legacy's search is backed
-    // by `TerminalViewMirror`'s unbounded `this.lines`, never scoped to the
-    // scrollback cap. On Rust, the needle is genuinely evicted and
-    // unsearchable; on legacy, it remains findable regardless of setting --
-    // asserted explicitly (not silently skipped) as evidence for the
-    // divergence claim.
     const search = await searchTerminal(page, serverInfo, terminalId, needle)
     expect(search.status).toBe(200)
-    if (e2eServerKind === 'rust') {
-      expect(search.body?.matches).toEqual([])
-    } else {
-      expect(search.body?.matches?.length).toBeGreaterThan(0)
-    }
+    expect(search.body?.matches).toEqual([])
   })
 
   test('a LARGE scrollback cap retains the earliest needle/search match, byte-perfect and Unicode-clean', async ({
@@ -282,7 +247,6 @@ test.describe('TERM-13 -- scrollback honors the configured cap at the Unicode/se
     harness,
     terminal,
     serverInfo,
-    e2eServerKind,
   }) => {
     const { terminalId, visibleText, needle, doneMarker } = await runScrollbackScenario(
       page,
@@ -293,23 +257,17 @@ test.describe('TERM-13 -- scrollback honors the configured cap at the Unicode/se
     )
 
     // The LATEST marker survived reattach (proves the reattach/replay path
-    // itself still works). TRUE PARITY on both server kinds.
+    // itself still works).
     expect(visibleText).toContain(doneMarker)
 
     // UNICODE INTEGRITY: no replacement character anywhere in the currently
-    // rendered buffer. TRUE PARITY on both server kinds.
+    // rendered buffer.
     expect(visibleText).not.toContain(REPLACEMENT_CHAR)
 
     // BOUNDARY + SEARCH: on Rust, the needle IS a real match, with the
     // returned `text` field byte-for-byte intact (proves the mirror's own
     // line-splitting/CSI-stripping normalization doesn't mangle it either).
     //
-    // KNOWN DIVERGENCE (see DISCOVERY 2 above): legacy's search always
-    // finds the needle regardless of the configured cap (its unbounded
-    // `TerminalViewMirror.lines`), so this is not a meaningful "boundary"
-    // proof on legacy the way it is on Rust -- still asserted (not
-    // skipped) as evidence, and the byte-perfect/Unicode-clean shape of
-    // whatever IS returned is checked on BOTH kinds.
     const search = await searchTerminal(page, serverInfo, terminalId, needle)
     expect(search.status).toBe(200)
     expect(Array.isArray(search.body?.matches)).toBe(true)
@@ -318,6 +276,5 @@ test.describe('TERM-13 -- scrollback honors the configured cap at the Unicode/se
     expect(matchedLine).toBeTruthy()
     expect(matchedLine.text).toContain(EMOJI)
     expect(matchedLine.text).not.toContain(REPLACEMENT_CHAR)
-    void e2eServerKind // documented above; no branch needed for this test's shape
   })
 })

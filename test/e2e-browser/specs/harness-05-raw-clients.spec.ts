@@ -1,9 +1,6 @@
 /**
  * HARNESS-05 — probe spec for the raw HTTP/WebSocket Playwright clients
- * (`test/e2e-browser/helpers/raw-clients.ts`). Matrix spec: runs under BOTH
- * `legacy-chromium` and `rust-chromium` because Group B legs drive REAL
  * per-server code paths (hello handling, protocol-error enforcement,
- * ping/pong, orchestration REST). Registered in MATRIX_SPECS.
  *
  * Full item text: "Add raw HTTP and WebSocket clients to the Playwright
  * runner. Tests need to send malformed frames, delay reads/hello, create
@@ -16,11 +13,10 @@
  * and a second normal socket stays usable. Rust protocol semantics are
  * tested later." — Group A maps one-to-one onto this sentence via the
  * deterministic `EchoWsFixture` (`echo-ws-fixture.ts`); Group B then proves
- * the same capabilities against whichever real server the running project
- * boots, asserting only cross-server INVARIANTS (termination, exact
- * documented pong shape, HTTP statuses) and RECORDING per-leg observations
- * (close codes, terminal-event kinds, reject statuses) for the evidence
- * file. Deeper per-server protocol semantics belong to SAFE-01/03/05,
+ * the same capabilities against the owned Rust server, asserting its
+ * documented termination, pong shape, and HTTP statuses while recording
+ * observations (close codes, terminal-event kinds, reject statuses) for the
+ * evidence file. Deeper protocol semantics belong to SAFE-01/03/05,
  * TERM-19, AUTO-12, etc., which consume this helper.
  *
  * The spec never requests the `page` fixture: no browser is launched.
@@ -179,8 +175,7 @@ test.describe.serial('Group B: raw-client capability legs against the real serve
 
   test('B1: delayed hello — 1200ms of silence, then hello still reaches ready', async ({ serverInfo }, testInfo) => {
     const client = await connect(serverInfo.wsUrl)
-    // Both servers send nothing and never close before the ~5s hello
-    // deadline (legacy ws-handler.ts: hello timer 5000ms default; rust
+    // The Rust server sends nothing and never closes before the ~5s hello
     // freshell-server hello_timeout_ms default 5000) — a 1200ms delay must
     // be a healthy, silent, still-connected window.
     const silentFrames = await client.collectFramesDuring(1200)
@@ -284,8 +279,8 @@ test.describe.serial('Group B: raw-client capability legs against the real serve
     } finally {
       // R5 (review round 1): the testServer fixture is worker-scoped and a
       // browser tab persists in its layout store until deleted; a retry of
-      // this test must not inherit the previous attempt's tab. Both servers
-      // expose DELETE /api/tabs/:id. Cleanup is best-effort so it never
+      // this test must not inherit the previous attempt's tab. The Rust server
+      // exposes DELETE /api/tabs/:id. Cleanup is best-effort so it never
       // masks an assertion failure in the try block.
       if (tabId) {
         const deleted = await rawHttpRequest(serverInfo.baseUrl, {

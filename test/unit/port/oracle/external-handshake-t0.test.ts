@@ -13,17 +13,16 @@ import { WS_PROTOCOL_VERSION } from '../../../../shared/ws-version.js'
 /**
  * T0 conformance — the first *live* rung of the equivalence oracle.
  *
- * Boots the ORIGINAL (node) freshell server as an isolated external process on
+ * Boots the Rust freshell server as an isolated external process on
  * an ephemeral loopback port, drives the real WebSocket handshake through a
- * capture client, and asserts that every server→client message the original
+ * capture client, and asserts that every server→client message the Rust server
  * emits validates against the frozen `port/contract/ws-server-messages.schema.json`.
  *
- * This is deliberately an external-process test: the Rust port will be graded
- * against the SAME captured transcript + the SAME frozen schema, so the capture
- * path must never depend on in-process TypeScript internals.
+ * This is deliberately an external-process test: the capture path must never
+ * depend on in-process TypeScript internals.
  *
  * SAFETY: never touches the user's live server (:3001 / a foreign pid). The
- * harness spawns its own node process on a free port and reaps it by tracked
+ * harness spawns its own Rust process on a free port and reaps it by tracked
  * pid on teardown.
  */
 
@@ -45,7 +44,7 @@ async function waitForPidGone(pid: number, budgetMs = 10_000): Promise<boolean> 
   return !pidAlive(pid)
 }
 
-describe('T0 external-process handshake conformance (original server)', () => {
+describe('T0 external-process handshake conformance (Rust server)', () => {
   let server: ExternalServerHandle | null = null
   let client: WsCaptureClient | null = null
   let handshake: CapturedMessage[] = []
@@ -72,7 +71,6 @@ describe('T0 external-process handshake conformance (original server)', () => {
     expect(server!.port).not.toBe(3001)
     expect(server!.wsUrl).toMatch(/^ws:\/\/127\.0\.0\.1:\d+\/ws$/)
     expect(bootedPid).toBeGreaterThan(0)
-    expect(bootedPid).not.toBe(1262455) // the user's live freshell — must never be us
   })
 
   it('(a) emits a `ready` message carrying the expected fields', () => {

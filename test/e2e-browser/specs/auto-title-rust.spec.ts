@@ -6,7 +6,7 @@ import type { AddressInfo } from 'node:net'
 import { test, expect } from '../helpers/fixtures.js'
 import { createE2eServerHandle, type E2eServerHandle } from '../helpers/external-target.js'
 import { TestHarness } from '../helpers/test-harness.js'
-import type { TestServerInfo } from '../helpers/test-server.js'
+import type { E2eServerInfo } from '../helpers/server-fixture-support.js'
 
 /**
  * AUTO-TITLE PIPELINE (Task 21, rust-only) -- e2e proof of the Rust server's
@@ -100,7 +100,6 @@ async function startFakeGemini(replyText: string): Promise<FakeGemini> {
  * `provider-generated` (`parse/claude.rs:521-526`), which blocks both the
  * sweep's AI branch and the generate-title route by design -- so none is
  * written. The FIRST user record is what `first_user_message` extracts.
- * Trimmed from `session-directory-matrix.spec.ts`'s `buildSessionJsonl`.
  */
 function buildClaudeSessionJsonl(input: {
   sessionId: string
@@ -161,7 +160,6 @@ function buildClaudeSessionJsonl(input: {
 }
 
 /**
- * Deterministic fake `claude` CLI (restore-matrix.spec.ts's
  * `installFakeClaudeCli` pattern): prints text then stays alive like the real
  * interactive TUI, so the resumed pane's terminal stays `running` for the
  * sweep's live-terminal match. Installed via the `CLAUDE_CMD` env override.
@@ -187,7 +185,7 @@ interface SeededSession {
 
 interface BootedServer {
   server: E2eServerHandle
-  info: TestServerInfo
+  info: E2eServerInfo
   root: string
 }
 
@@ -204,7 +202,6 @@ async function bootAutoTitleServer(opts: {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'freshell-auto-title-'))
   const fakeClaudePath = await installFakeClaudeCli(path.join(root, 'bin'))
   const server = await createE2eServerHandle(process.env, {
-    kind: 'rust',
     construct: {
       env: {
         CLAUDE_CMD: fakeClaudePath,
@@ -463,7 +460,6 @@ test.describe('Auto-title pipeline (rust)', () => {
       ).toBe(FIRST_MESSAGE)
 
       // User rename through the real PATCH route (titleSource:'user', the
-      // top ladder rung -- user=5 > ai=4 > first-message=3 > legacy=2 > dir=1).
       const res = await page.request.patch(
         `${booted.info.baseUrl}/api/sessions/${encodeURIComponent(`claude:${SESSION_ID}`)}`,
         {

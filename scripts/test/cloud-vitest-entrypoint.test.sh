@@ -39,11 +39,16 @@ check "entrypoint.sh contains 'vitest'" grep -q 'vitest' "$ENTRYPOINT"
 # Check 3: entrypoint.sh contains '--shard' reference
 check "entrypoint.sh contains '--shard'" grep -q -- '--shard' "$ENTRYPOINT"
 
-# Check 4: entrypoint.sh contains '--passWithNoTests'
-check "entrypoint.sh contains '--passWithNoTests'" grep -q -- '--passWithNoTests' "$ENTRYPOINT"
+# Check 4: entrypoint.sh does not force empty selections to pass
+NO_TESTS_OVERRIDE="--passWithNoTests"
+check "entrypoint.sh rejects vacuous test selection" bash -c "! grep -q -- '$NO_TESTS_OVERRIDE' '$ENTRYPOINT'"
 
 # Check 5: entrypoint.sh references VITEST_CONFIGS
 check "entrypoint.sh references 'VITEST_CONFIGS'" grep -q 'VITEST_CONFIGS' "$ENTRYPOINT"
+
+# Check 5b: entrypoint.sh cannot be pointed at a retired server config
+RETIRED_SERVER_CONFIG="config/vitest/vitest.server.config.ts"
+check "entrypoint.sh rejects a retired server config" bash -c "! grep -q '$RETIRED_SERVER_CONFIG' '$ENTRYPOINT'"
 
 # Check 6: entrypoint.sh references VITEST_ARGS_JSON (not VITEST_ARGS)
 check "entrypoint.sh references 'VITEST_ARGS_JSON'" grep -q 'VITEST_ARGS_JSON' "$ENTRYPOINT"

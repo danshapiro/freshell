@@ -22,7 +22,7 @@ const BASELINE_DIR = path.resolve(
 /**
  * T1 determinism — the byte-stream rung of the equivalence oracle.
  *
- * Boots the ORIGINAL (node) freshell server as an isolated external process,
+ * Boots the Rust freshell server as an isolated external process,
  * drives each fixed shell scenario through a REAL pty over the live WebSocket
  * wire, and captures the exact terminal output bytes between sentinels. It then
  * boots a SECOND fully independent server and captures again. For every scenario
@@ -31,12 +31,9 @@ const BASELINE_DIR = path.resolve(
  *
  * A mismatch is a real finding (residual nondeterminism), printed as a hex diff.
  *
- * SAFETY: only spawns its own node servers on ephemeral loopback ports and reaps
- * them by tracked pid. It never binds :3001 and never touches the user's live
- * freshell (pid 1262455).
- */
-
-const LIVE_SERVER_PID = 1262455
+ * SAFETY: only spawns its own Rust servers on ephemeral loopback ports and reaps
+ * them by tracked pid. It never binds :3001.
+*/
 
 function pidAlive(pid: number): boolean {
   try {
@@ -88,13 +85,11 @@ async function captureAllOnFreshBoot(tag: string): Promise<BootCapture> {
   }
 }
 
-describe('T1 PTY byte-stream golden determinism (original server)', () => {
-  let liveAliveAtStart = false
+describe('T1 PTY byte-stream golden determinism (Rust server)', () => {
   let bootA: BootCapture | null = null
   let bootB: BootCapture | null = null
 
   beforeAll(async () => {
-    liveAliveAtStart = pidAlive(LIVE_SERVER_PID)
     bootA = await captureAllOnFreshBoot('a')
     bootB = await captureAllOnFreshBoot('b')
   }, 120_000)
@@ -113,14 +108,13 @@ describe('T1 PTY byte-stream golden determinism (original server)', () => {
     }
   })
 
-  it('booted two distinct isolated servers — never :3001 / the live pid', () => {
+  it('booted two distinct owned Rust servers — never :3001', () => {
     expect(bootA, 'boot A must have produced captures').toBeTruthy()
     expect(bootB, 'boot B must have produced captures').toBeTruthy()
     expect(bootA!.pid).toBeGreaterThan(0)
     expect(bootB!.pid).toBeGreaterThan(0)
     expect(bootA!.pid).not.toBe(bootB!.pid)
     for (const boot of [bootA!, bootB!]) {
-      expect(boot.pid).not.toBe(LIVE_SERVER_PID)
       expect(boot.port).not.toBe(3001)
     }
   })
@@ -160,18 +154,10 @@ describe('T1 PTY byte-stream golden determinism (original server)', () => {
     })
   }
 
-  it('reaped both spawned server pids and left the live :3001 server untouched', async () => {
+  it('reaped both spawned Rust server pids', async () => {
     for (const boot of [bootA!, bootB!]) {
       const gone = await waitForPidGone(boot.pid)
       expect(gone, `spawned server pid ${boot.pid} should be reaped`).toBe(true)
-    }
-    // Never adopted the live pid; if it was up when we started, it is still up.
-    expect([bootA!.pid, bootB!.pid]).not.toContain(LIVE_SERVER_PID)
-    if (liveAliveAtStart) {
-      expect(
-        pidAlive(LIVE_SERVER_PID),
-        'the user live freshell (pid 1262455) must remain alive — we must not have touched it',
-      ).toBe(true)
     }
   })
 })
@@ -182,8 +168,8 @@ describe('T1 PTY byte-stream golden determinism (original server)', () => {
  * This is exactly how the Rust port will be graded: boot the server, capture the
  * scenario's terminal bytes, and require them to match `port/oracle/baselines/
  * pty/<scenario>.golden` byte-for-byte (with the `.meta.json` sha256 as an
- * integrity cross-check). Regenerate the goldens only via
- * `port/oracle/baselines/pty/generate-pty-goldens.ts` when a change is intended.
+ * integrity cross-check). These files are frozen Rust-baseline provenance;
+ * update them only as an explicitly reviewed migration.
  */
 describe('T1 PTY golden baseline (fresh capture equals committed golden)', () => {
   let server: ExternalServerHandle | null = null

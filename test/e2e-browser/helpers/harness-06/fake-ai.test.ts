@@ -4,10 +4,8 @@ import { startFakeGemini, type FakeGemini } from './fake-ai.js'
 /**
  * HARNESS-06 summary-AI coverage: a fake Gemini `generateContent` endpoint
  * that returns caller-configured FIXED output. Two validation layers:
- *  1. raw HTTP (the exact URL/header/JSON shapes the SDK uses), and
- *  2. the REAL `@ai-sdk/google` client (the pinned prod dependency) driven at
- *     the fake's baseURL -- if the fake's response shape drifts from what the
- *     Zod schema in the SDK validates, this leg throws.
+ * The fixture is exercised through raw HTTP so this retained test does not
+ * pull the retired Node AI SDK into the root dependency graph.
  */
 
 const fakes: FakeGemini[] = []
@@ -108,28 +106,5 @@ describe('harness-06 fake-ai: raw HTTP shape', () => {
   it('404s unknown model routes without hanging', async () => {
     const f = await make()
     expect((await fetch(`${f.baseUrl}/v1beta/other`, { method: 'POST', body: '{}' })).status).toBe(404)
-  })
-})
-
-describe('harness-06 fake-ai: real @ai-sdk/google client compatibility', () => {
-  it('generateText round-trips the fixed output through the pinned SDK', async () => {
-    const f = await make()
-    const { createGoogleGenerativeAI } = await import('@ai-sdk/google')
-    const { generateText } = await import('ai')
-    const google = createGoogleGenerativeAI({ baseURL: f.geminiBaseUrl, apiKey: 'fixture-key' })
-    const result = await generateText({ model: google(MODEL), prompt: 'summarize this' })
-    expect(result.text).toBe(FIXED)
-    expect(f.ledger().some((e) => e.action === 'generateContent' && e.promptText.includes('summarize this'))).toBe(true)
-  })
-
-  it('streamText round-trips the fixed output through the pinned SDK', async () => {
-    const f = await make()
-    const { createGoogleGenerativeAI } = await import('@ai-sdk/google')
-    const { streamText } = await import('ai')
-    const google = createGoogleGenerativeAI({ baseURL: f.geminiBaseUrl, apiKey: 'fixture-key' })
-    const { textStream } = streamText({ model: google(MODEL), prompt: 'stream' })
-    let acc = ''
-    for await (const chunk of textStream) acc += chunk
-    expect(acc).toBe(FIXED)
   })
 })

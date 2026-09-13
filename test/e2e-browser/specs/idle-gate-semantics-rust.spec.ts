@@ -107,8 +107,7 @@ const turnCompleteFor = (terminalId: string) => (f: WsFrame) =>
 test.describe('idle-gate semantics (rust)', () => {
   test.setTimeout(300_000)
 
-  test('claude: queued submit BEFORE the BEL never fires idle mid-turn; drain emits one queue-empty idle', async ({ page, e2eServerKind }) => {
-    expect(e2eServerKind).toBe('rust')
+  test('claude: queued submit BEFORE the BEL never fires idle mid-turn; drain emits one queue-empty idle', async ({ page }) => {
     const sharedRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'freshell-idlegate-claude-'))
     try {
       const fakeClaude = await installFakeCli(path.join(sharedRoot, 'bin'), 'claude', FAKE_BEL_CLI)
@@ -162,8 +161,7 @@ test.describe('idle-gate semantics (rust)', () => {
     }
   })
 
-  test('codex: queued submit never fires idle mid-turn; drain emits one grace idle after the full grace window', async ({ page, e2eServerKind }) => {
-    expect(e2eServerKind).toBe('rust')
+  test('codex: queued submit never fires idle mid-turn; drain emits one grace idle after the full grace window', async ({ page }) => {
     const sharedRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'freshell-idlegate-codex-'))
     try {
       // Dual-role: the Rust codex terminal lane boots a 'codex app-server'
@@ -216,8 +214,7 @@ test.describe('idle-gate semantics (rust)', () => {
     }
   })
 
-  test('amplifier: overlapping prompts emit exactly one grace idle, never inside the grace window', async ({ page, e2eServerKind }) => {
-    expect(e2eServerKind).toBe('rust')
+  test('amplifier: overlapping prompts emit exactly one grace idle, never inside the grace window', async ({ page }) => {
     const sharedRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'freshell-idlegate-amp-'))
     try {
       const fakeAmp = await installFakeCli(path.join(sharedRoot, 'bin'), 'amplifier', FAKE_AMPLIFIER_CLI)
@@ -260,8 +257,7 @@ test.describe('idle-gate semantics (rust)', () => {
     }
   })
 
-  test('restart mid-busy: no spurious idle or chime edge after an abrupt SIGKILL + reboot', async ({ page, e2eServerKind }) => {
-    expect(e2eServerKind).toBe('rust')
+  test('restart mid-busy: no spurious idle or chime edge after an abrupt SIGKILL + reboot', async ({ page }) => {
     const sharedRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'freshell-idlegate-restart-'))
     try {
       const fakeClaude = await installFakeCli(path.join(sharedRoot, 'bin'), 'claude', FAKE_BEL_CLI)
@@ -313,8 +309,7 @@ test.describe('idle-gate semantics (rust)', () => {
     }
   })
 
-  test('two concurrent servers keep independent idle/status streams', async ({ page, e2eServerKind }) => {
-    expect(e2eServerKind).toBe('rust')
+  test('two concurrent servers keep independent idle/status streams', async ({ page }) => {
     const sharedRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'freshell-idlegate-twoserver-'))
     try {
       const fakeClaude = await installFakeCli(path.join(sharedRoot, 'bin'), 'claude', FAKE_BEL_CLI)

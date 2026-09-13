@@ -31,6 +31,13 @@
 # Playwright. Pass as a container arg or in PLAYWRIGHT_ARGS.
 set -euo pipefail
 
+log_json() {
+  local severity="$1"
+  local event="$2"
+  local message="$3"
+  printf '{"severity":"%s","event":"%s","message":"%s"}\n' "$severity" "$event" "$message"
+}
+
 # Cloud Run sets CLOUD_RUN_TASK_INDEX (0-based) and CLOUD_RUN_TASK_COUNT
 # when the job is configured with --tasks > 1.
 TASK_INDEX="${CLOUD_RUN_TASK_INDEX:-0}"
@@ -40,7 +47,11 @@ TASK_COUNT="${CLOUD_RUN_TASK_COUNT:-1}"
 if [ "${TEST_MODE:-}" = "vitest" ]; then
   SHARD_INDEX=$((TASK_INDEX + 1))
   SHARD_COUNT="$TASK_COUNT"
-  CONFIGS="${VITEST_CONFIGS:-config/vitest/vitest.config.ts config/vitest/vitest.server.config.ts}"
+  CONFIGS="${VITEST_CONFIGS:-config/vitest/vitest.config.ts}"
+  if [ "$CONFIGS" != "config/vitest/vitest.config.ts" ]; then
+    log_json error vitest_config_rejected "Only the retained default Vitest config is supported in this image."
+    exit 2
+  fi
 
   # Parse VITEST_ARGS_JSON (JSON array) into a bash array using jq.
   # This preserves argument boundaries (spaces, metacharacters, etc.)
@@ -60,7 +71,7 @@ if [ "${TEST_MODE:-}" = "vitest" ]; then
   EXIT_CODE=0
   for config in $CONFIGS; do
     echo "[vitest-entrypoint] Running vitest: $config ${SHARD_ARG[*]-} ${EXTRA_ARGS[*]-}"
-    npx vitest run --passWithNoTests --config "$config" "${SHARD_ARG[@]}" "${EXTRA_ARGS[@]}" || EXIT_CODE=$?
+    npx vitest run --config "$config" "${SHARD_ARG[@]}" "${EXTRA_ARGS[@]}" || EXIT_CODE=$?
   done
   exit "$EXIT_CODE"
 fi
@@ -123,28 +134,30 @@ SHARD=$((TASK_INDEX + 1))
 echo "[e2e-entrypoint] Duration-aware shard ${SHARD}/${TASK_COUNT}"
 
 # 1. Discover spec files that will actually run (respects --project, grep,
-#    and positional spec-path filters). Falls back to globbing if --list fails.
+#    and positional spec-path filters). Discovery errors are fatal: silently
+#    broadening a selection would make a green job meaningless.
 echo "[e2e-entrypoint] Discovering spec files via --list..."
-LIST_OUTPUT=$(npx playwright test --config "$CONFIG" --list \
-  "${FLAGS[@]}" "${SPEC_FILTERS[@]}" 2>/dev/null || true)
-
-if [ -n "$LIST_OUTPUT" ]; then
-  # Extract unique spec basenames from lines like:
-  #   "  [chromium] › auth.spec.ts:4:3 › ..."
-  mapfile -t SPEC_NAMES < <(
-    echo "$LIST_OUTPUT" | sed -n 's/.*› \([^:]*\.spec\.ts\):.*/\1/p' | sort -u
-  )
+if LIST_OUTPUT=$(npx playwright test --config "$CONFIG" --list \
+  "${FLAGS[@]}" "${SPEC_FILTERS[@]}" 2>&1); then
+  LIST_STATUS=0
 else
-  echo "[e2e-entrypoint] --list produced no output, falling back to glob"
-  mapfile -t SPEC_NAMES < <(
-    ls "$SPECS_DIR"/*.spec.ts 2>/dev/null | xargs -n1 basename 2>/dev/null | sort
-  )
+  LIST_STATUS=$?
 fi
+if [ "$LIST_STATUS" -ne 0 ]; then
+  log_json error e2e_discovery_failed "Playwright test discovery failed."
+  exit "$LIST_STATUS"
+fi
+
+# Extract unique spec basenames from lines like:
+#   "  [chromium] › auth.spec.ts:4:3 › ..."
+mapfile -t SPEC_NAMES < <(
+  echo "$LIST_OUTPUT" | sed -n 's/.*› \([^:]*\.spec\.ts\):.*/\1/p' | sort -u
+)
 
 SPEC_COUNT="${#SPEC_NAMES[@]}"
 if [ "$SPEC_COUNT" -eq 0 ]; then
-  echo "[e2e-entrypoint] No spec files found. Running all tests."
-  exec npx playwright test --config "$CONFIG" "${FLAGS[@]}" "${SPEC_FILTERS[@]}"
+  log_json error e2e_no_specs "No spec files discovered."
+  exit 1
 fi
 echo "[e2e-entrypoint] Found ${SPEC_COUNT} spec files"
 
@@ -182,8 +195,8 @@ SORTED_PAIRS=$(printf '%s' "$PAIRS" | sort -rn)
 declare -a shard_totals=()
 declare -a shard_specs=()
 for ((i = 0; i < TASK_COUNT; i++)); do
-  shard_totals[$i]=0
-  shard_specs[$i]=""
+  shard_totals[i]=0
+  shard_specs[i]=""
 done
 
 while read -r dur spec; do
@@ -197,11 +210,11 @@ while read -r dur spec; do
       min_total=${shard_totals[$i]}
     fi
   done
-  shard_totals[$min_shard]=$(( min_total + dur ))
-  if [ -z "${shard_specs[$min_shard]}" ]; then
-    shard_specs[$min_shard]="$spec"
+  shard_totals[min_shard]=$(( min_total + dur ))
+  if [ -z "${shard_specs[min_shard]}" ]; then
+    shard_specs[min_shard]="$spec"
   else
-    shard_specs[$min_shard]="${shard_specs[$min_shard]} $spec"
+    shard_specs[min_shard]="${shard_specs[min_shard]} $spec"
   fi
 done <<< "$SORTED_PAIRS"
 
@@ -237,7 +250,7 @@ fi
 #    substring filter ambiguity between similarly-named specs).
 read -ra MY_SPEC_PATHS <<< "$MY_SPECS"
 for i in "${!MY_SPEC_PATHS[@]}"; do
-  MY_SPEC_PATHS[$i]="${SPECS_DIR}/${MY_SPEC_PATHS[$i]}"
+  MY_SPEC_PATHS[i]="${SPECS_DIR}/${MY_SPEC_PATHS[i]}"
 done
 
 echo "[e2e-entrypoint] Playwright flags: ${FLAGS[*]-}"

@@ -93,4 +93,26 @@ describe('sanitize-test-env prelude (behavioral, via spawned node children)', ()
     expect(innerStderr).toBe('')
     for (const key of AMBIENT_ENV_POISONS) expect(envReport[key]).toBeUndefined()
   })
+
+  it.each([
+    'vitest.runtime.config.ts',
+    'vitest.electron-runtime.config.ts',
+  ])('%s sanitizes the environment inherited by child processes', async (configName) => {
+    const env = { ...process.env, ...POISONED_ENV }
+    delete env.FRESHELL_RUN_REAL_PROVIDER_CONTRACTS
+    const configPath = path.resolve(process.cwd(), 'config/vitest', configName)
+    const { stdout } = await execFileAsync(
+      process.execPath,
+      [tsxCli, fixture, 'config', configPath],
+      { env, maxBuffer: 1024 * 1024 },
+    )
+    const result = JSON.parse(stdout) as {
+      innerStderr: string
+      envReport: Record<string, string | undefined>
+    }
+    expect(result.innerStderr).toBe('')
+    for (const key of AMBIENT_ENV_POISONS) {
+      expect(result.envReport[key]).toBeUndefined()
+    }
+  })
 })

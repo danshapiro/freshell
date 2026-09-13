@@ -5,7 +5,7 @@ import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { openPanePicker } from '../helpers/pane-picker.js'
 import { TestHarness } from '../helpers/test-harness.js'
-import { TestServer } from '../helpers/test-server.js'
+import { RustServer } from '../helpers/rust-server.js'
 
 const __filename = fileURLToPath(import.meta.url)
 const __dirname = path.dirname(__filename)
@@ -357,7 +357,7 @@ async function assertConflictingCreateDirectoryIsRejected(input: {
 test.describe('Freshopencode restart recovery', () => {
   test.setTimeout(180_000)
 
-  test('resumes a route-bound serve session after TestServer restart', async ({ page }) => {
+  test('resumes a route-bound serve session after RustServer restart', async ({ page }) => {
     const sharedRoot = await fsp.mkdtemp(path.join(os.tmpdir(), 'freshell-freshopencode-restart-'))
     const binDir = path.join(sharedRoot, 'bin')
     const logsDir = path.join(sharedRoot, 'logs')
@@ -371,13 +371,13 @@ test.describe('Freshopencode restart recovery', () => {
     await fsp.mkdir(badCwd, { recursive: true })
     await installFakeOpencode(binDir)
 
-    const server1 = new TestServer(createServerOptions({
+    const server1 = new RustServer(createServerOptions({
       binDir,
       auditLogPath,
       logsDir,
       sharedOpencodeDataDir,
     }))
-    let server2: TestServer | undefined
+    let server2: RustServer | undefined
 
     try {
       const info1 = await server1.start()
@@ -408,7 +408,7 @@ test.describe('Freshopencode restart recovery', () => {
       const eventCountBeforeRestart = (await readAuditEvents(auditLogPath)).length
 
       await server1.stop()
-      server2 = new TestServer(createServerOptions({
+      server2 = new RustServer(createServerOptions({
         binDir,
         auditLogPath,
         logsDir,

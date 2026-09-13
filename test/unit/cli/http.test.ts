@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { createHttpClient } from '../../../server/cli/http'
+import { createHttpClient } from '../../../tools/freshell-cli/http'
 
 describe('createHttpClient', () => {
   afterEach(() => {

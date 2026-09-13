@@ -22,6 +22,7 @@ import {
   prevStep,
   buildConfig,
   STEPS,
+  SERVER_MODES,
   DEFAULT_PORT,
   DEFAULT_HOTKEY,
   PORT_MIN,
@@ -44,6 +45,10 @@ describe('Wizard module', () => {
 })
 
 describe('Wizard logic', () => {
+  it('advertises only app-bound and remote server modes', () => {
+    expect(SERVER_MODES).toEqual(['app-bound', 'remote'])
+  })
+
   describe('STEPS', () => {
     it('has 5 steps in correct order', () => {
       expect(STEPS).toEqual(['welcome', 'server-mode', 'configuration', 'hotkey', 'complete'])
@@ -110,16 +115,11 @@ describe('Wizard logic', () => {
     })
 
     it('always allows advancing from server-mode step', () => {
-      expect(canAdvance('server-mode', 'daemon', 3001, '')).toBe('')
+      expect(canAdvance('server-mode', 'app-bound', 3001, '')).toBe('')
     })
 
     it('always allows advancing from hotkey step', () => {
       expect(canAdvance('hotkey', 'app-bound', 3001, '')).toBe('')
-    })
-
-    it('validates port for daemon mode on configuration step', () => {
-      expect(canAdvance('configuration', 'daemon', 3001, '')).toBe('')
-      expect(canAdvance('configuration', 'daemon', 80, '')).toContain('between')
     })
 
     it('validates port for app-bound mode on configuration step', () => {
@@ -159,12 +159,12 @@ describe('Wizard logic', () => {
 
   describe('buildConfig', () => {
     it('builds a complete WizardConfig object', () => {
-      const config = buildConfig('daemon', 3001, 'http://server', 'mytoken', 'Ctrl+`')
+      const config = buildConfig('app-bound', 3001, '', '', 'Ctrl+`')
       expect(config).toEqual({
-        serverMode: 'daemon',
+        serverMode: 'app-bound',
         port: 3001,
-        remoteUrl: 'http://server',
-        remoteToken: 'mytoken',
+        remoteUrl: '',
+        remoteToken: '',
         globalHotkey: 'Ctrl+`',
       })
     })

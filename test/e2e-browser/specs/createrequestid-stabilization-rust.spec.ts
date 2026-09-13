@@ -48,8 +48,7 @@ function collectTerminalCreateRequestIds(node: any, out: string[] = []): string[
 }
 
 test.describe('createRequestId stabilization (rust REST ingress + reload)', () => {
-  test('REST-created terminal pane carries a server-minted createRequestId', async ({ page, e2eServerKind, serverInfo }) => {
-    expect(e2eServerKind).toBe('rust')
+  test('REST-created terminal pane carries a server-minted createRequestId', async ({ page, serverInfo }) => {
     const { baseUrl, token } = serverInfo
 
     // Connect the browser FIRST: the server broadcasts ui.command{tab.create}
@@ -78,8 +77,7 @@ test.describe('createRequestId stabilization (rust REST ingress + reload)', () =
     expect(key).toMatch(/^[0-9a-f]{32}$/)
   })
 
-  test('page reload hydrates the same createRequestId for the pane', async ({ page, e2eServerKind, serverInfo }) => {
-    expect(e2eServerKind).toBe('rust')
+  test('page reload hydrates the same createRequestId for the pane', async ({ page, serverInfo }) => {
     const { baseUrl, token } = serverInfo
 
     await page.goto(`${baseUrl}/?token=${token}&e2e=1`)

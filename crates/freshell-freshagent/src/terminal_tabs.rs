@@ -3288,13 +3288,29 @@ mod tests {
     #[tokio::test]
     async fn create_host_stats_tab_attaches_host_stats_pane_content_and_no_terminal() {
         let state = state_with_registry();
+        let registry = state.terminal_registry.clone().unwrap();
+        assert!(registry.inventory().is_empty());
         let mut rx = state.broadcast_tx.subscribe();
-        let (status, body) =
-            post(app(state), "/api/tabs", json!({ "hostStats": true }), true).await;
+
+        let (status, body) = post(
+            app(state.clone()),
+            "/api/tabs",
+            json!({ "hostStats": true }),
+            true,
+        )
+        .await;
         assert_eq!(status, StatusCode::OK);
         assert!(body["data"]["tabId"].as_str().is_some());
-        assert!(body["data"]["paneId"].as_str().is_some());
+        let pane_id = body["data"]["paneId"].as_str().expect("created pane id");
         assert!(body["data"].get("terminalId").is_none());
+        assert!(registry.inventory().is_empty());
+
+        let pane = state
+            .layout
+            .get_pane_snapshot(pane_id)
+            .expect("stored pane");
+        assert_eq!(pane.kind.as_deref(), Some("host-stats"));
+        assert!(pane.terminal_id.is_none());
 
         let frame = rx.recv().await.expect("ui.command frame broadcast");
         let msg: Value = serde_json::from_str(&frame).unwrap();
