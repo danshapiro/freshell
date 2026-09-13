@@ -265,10 +265,9 @@ export default function Sidebar({
   // updates — no DOM flicker despite the frequent ticks.
   const [timestampTick, setTimestampTick] = useState(0)
   const [resumeDialogOpen, setResumeDialogOpen] = useState(false)
-  // Server-declared capability gate: only the Node server declares
-  // `sessionResolve` (Task 3, server/platform-router.ts). The Rust server
-  // serves the same bundle WITHOUT the flag or the resolve endpoint, so the
-  // footer must not render there.
+  // Server-declared capability gate. The Rust server exposes
+  // `sessionResolve` only when the matching resolve endpoint is available,
+  // so the footer follows the runtime contract rather than assuming support.
   const resumeEnabled = useAppSelector((s) => s.connection?.featureFlags?.sessionResolve === true)
   useEffect(() => {
     const id = window.setInterval(() => setTimestampTick((t) => t + 1), 15_000)
