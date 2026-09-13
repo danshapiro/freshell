@@ -25,7 +25,7 @@ describe('resolvePaneRepoCwd', () => {
     expect(resolvePaneRepoCwd(terminalContent({ initialCwd: '/home/u/proj' }), undefined, NO_META)).toBe('/home/u/proj')
   })
 
-  it('prefers terminalMeta repoRoot over initialCwd (Node server enrichment)', () => {
+  it('prefers terminalMeta repoRoot over initialCwd (server enrichment)', () => {
     const meta: Record<string, TerminalMetaRecord> = {
       't1': { terminalId: 't1', updatedAt: 1, cwd: '/home/u/proj/sub', repoRoot: '/home/u/proj' },
     }

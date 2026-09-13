@@ -5,8 +5,8 @@ import type { TerminalMetaRecord } from '@/store/terminalMetaSlice'
 
 /**
  * The cwd hint used to identify a pane's repo, for coding-agent panes only.
- * Terminal panes: terminalMeta (repoRoot > checkoutRoot > cwd — populated by
- * the Node server; identity-only on Rust) then the pane/tab initialCwd.
+ * Terminal panes: terminalMeta (repoRoot > checkoutRoot > cwd, populated by
+ * the Rust server's metadata sweep) then the pane/tab initialCwd.
  * Fresh-agent panes: their initialCwd. Plain shells and non-terminal panes
  * are out of scope (return undefined).
  */

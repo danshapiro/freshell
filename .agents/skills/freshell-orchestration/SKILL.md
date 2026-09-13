@@ -26,7 +26,7 @@ The MCP tool accepts the same commands as the CLI below but with structured JSON
 If the MCP tool is not available (e.g., running outside Freshell or in a context without MCP support), use the CLI:
 
 ```bash
-FSH="npx tsx server/cli/index.ts"
+FSH="npx tsx tools/freshell-cli/index.ts"
 $FSH health
 ```
 
@@ -167,7 +167,7 @@ $FSH split-pane --editor "$FILE"
 ## Playbook: create, split, and rename without UI interaction
 
 ```bash
-FSH="npx tsx server/cli/index.ts"
+FSH="npx tsx tools/freshell-cli/index.ts"
 CWD="/absolute/path/to/repo"
 FILE="/absolute/path/to/repo/README.md"
 
@@ -185,7 +185,7 @@ $FSH rename-pane "Editor"
 ## Playbook: parallel Claude panes
 
 ```bash
-FSH="npx tsx server/cli/index.ts"
+FSH="npx tsx tools/freshell-cli/index.ts"
 CWD="/absolute/path/to/repo"
 PROMPT="Implement <task>. Run tests. Summarize tradeoffs."
 

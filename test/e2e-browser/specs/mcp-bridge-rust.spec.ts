@@ -11,14 +11,14 @@ import { McpStdioClient, ensureMcpServerBuilt, REPO_ROOT } from '../helpers/mcp-
  * (`docs/plans/2026-07-18-agent-api-mcp-parity-spec.md` \u00a76 "QA-Lever Design",
  * \u00a78.3 "One MCP smoke").
  *
- * Proves the legacy Node MCP stdio binary (`server/mcp/` -- FROZEN, consumed
- * here ONLY as the already-BUILT `dist/server/mcp/server.js`, never edited)
+ * Proves the standalone Node MCP stdio client (`tools/freshell-mcp/`, consumed
+ * here as the freshly built `dist/tools/freshell-mcp/server.js`)
  * drives an OWNED, ephemeral Rust `freshell-server` end-to-end over its REAL
  * stdio JSON-RPC wire protocol, with ZERO Rust-side MCP code. This is the
  * "zero-Rust-MCP" QA lever the spec's \u00a76.2 describes: the moment the Rust
  * server serves the REST Agent-API with the same shapes + `x-auth-token`
  * auth (Slice 1, `crates/freshell-freshagent/src/terminal_tabs.rs`), the
- * unmodified Node MCP binary can drive it unchanged.
+ * standalone Node MCP client can drive it unchanged.
  *
  * Deliberately gated to the RUST target only (see `playwright.config.ts`'s
  * `rust-chromium` project `testMatch`), not run against legacy: the legacy
@@ -45,10 +45,10 @@ import { McpStdioClient, ensureMcpServerBuilt, REPO_ROOT } from '../helpers/mcp-
 test.describe('MCP bridge -- Rust QA lever pin (Slice 2)', () => {
   test.setTimeout(120_000)
 
-  test('unmodified legacy MCP stdio binary drives an ephemeral Rust server end-to-end', async () => {
+  test('standalone MCP stdio client drives an ephemeral Rust server end-to-end', async () => {
     const { path: mcpBinPath, buildMs } = ensureMcpServerBuilt(REPO_ROOT)
     // eslint-disable-next-line no-console
-    console.error(`[mcp-bridge-rust] npm run build:server completed in ${buildMs}ms (dist/server/mcp/server.js)`)
+    console.error(`[mcp-bridge-rust] npm run build:tools completed in ${buildMs}ms (dist/tools/freshell-mcp/server.js)`)
 
     const server = new RustServer({ verbose: false })
     const info = await server.start()
@@ -126,8 +126,8 @@ test.describe('MCP bridge -- Rust QA lever pin (Slice 2)', () => {
       // WITHOUT a per-row `tabId` (the df1->main sync merge adopted main's
       // evolved Node-exact listPanes row contract; see
       // docs/plans/df1-evidence/MAIN-SYNC-MERGE.md "Gate record"). The frozen
-      // MCP binary types the same five fields (`PaneSummary`,
-      // server/mcp/freshell-tool.ts) and never reads `tabId`. Tab membership
+      // MCP client types the same five fields (`PaneSummary`,
+      // tools/freshell-mcp/freshell-tool.ts) and never reads `tabId`. Tab membership
       // is cross-referenced the way this surface actually offers it: the
       // `?tabId=` filter, exercised via the MCP tool's `target` param below.
       const listPanes = await mcp.callFreshellAction('list-panes')

@@ -1,359 +1,147 @@
 ---
 name: extension-installer
-description: "Use when installing, creating, or setting up Freshell extensions — from GitHub repos, local directories, or from scratch as custom panes."
+description: "Install, create, or troubleshoot supported Freshell CLI extensions from GitHub repositories, local directories, or scratch. Use browser panes for independently run web applications; Freshell does not support client or server extension panes."
 ---
 
-# Installing Freshell Extensions
+# Installing Freshell CLI Extensions
 
-## When to Use
+Freshell's Rust server supports CLI extensions that launch terminal tools. It
+still validates historical `client` and `server` manifests for compatibility,
+but it does not start their processes, proxy their traffic, or render extension
+iframes. Do not create or present those categories as supported.
 
-Use this skill when a user wants to:
-- Add a new pane type to Freshell (from GitHub, a local project, or from scratch)
-- Create a custom extension (server, client, or CLI)
-- Debug why an installed extension isn't showing up
+If the requested extension is a web application, run it independently and open
+its reachable URL in a normal Freshell browser pane. If it is a static page,
+serve it with an independent static-file server first.
 
-Do NOT use for modifying built-in pane types (terminal, browser, picker, etc.).
+## Before installing
 
-## Critical Facts
+- Inspect the project and its existing `freshell.json` before changing it.
+- Build or install the CLI yourself. Freshell does not run package installation
+  or build steps for extensions.
+- Confirm the CLI command works on the host and determine whether it needs a
+  fixed working directory or environment variables.
+- Use an absolute symlink target. Freshell scans symlinked directories.
+- Never restart the live Freshell server without the user's explicit approval.
+  Installing files is safe; activating a new extension waits for the next
+  approved restart.
 
-> **Read this box before doing anything.** These are the non-obvious rules that cause silent failures.
+## Supported manifest
 
-1. **Extensions must be pre-built.** Freshell does NOT run `npm install`, `npm run build`, or any build step. The extension directory must contain ready-to-run artifacts before symlinking.
+Create `freshell.json` in the extension directory. The manifest schema is
+strict: unknown keys or a category/config mismatch cause the extension to be
+skipped with a server warning.
 
-2. **Scan only on startup.** Extensions are discovered once when the server starts. After installing or changing an extension, Freshell must be restarted.
+Required top-level fields:
 
-3. **`z.strictObject` rejects unknown keys.** The manifest schema uses strict validation. Any key not in the schema (typos, extra fields) causes the entire manifest to silently fail validation and the extension is skipped. Check server logs for warnings.
+| Field | Value |
+|---|---|
+| `name` | Non-empty unique identifier |
+| `version` | Non-empty version string |
+| `label` | Human-readable picker label |
+| `description` | Short picker description |
+| `category` | Must be `"cli"` |
+| `cli` | Must be the only category config block |
 
-4. **Exactly one category config block.** The manifest must have exactly one of `client`, `server`, or `cli` — and it must match the `category` field. Having zero, two, or a mismatched block fails validation.
+Useful optional top-level fields:
 
-5. **Symlinks are the recommended dev pattern.** The scanner follows symlinks. Point `~/.freshell/extensions/<name>` at your project directory for development.
+| Field | Purpose |
+|---|---|
+| `icon` | Path relative to the extension directory |
+| `picker.shortcut` | Picker shortcut letter |
+| `picker.group` | Picker group, commonly `"agents"` or `"tools"` |
 
-6. **Template interpolation in `server.env`.** Values support `{{port}}` (allocated port) and `{{varName}}` (contentSchema field defaults). Unresolved templates are left as-is.
+The `cli` block accepts:
 
-7. **`~/` expands to homedir.** After template interpolation, env values starting with `~/` are expanded to the user's home directory.
+| Field | Purpose |
+|---|---|
+| `command` | Required executable name or absolute path |
+| `args` | Base argument array; defaults to `[]` |
+| `env` | String-to-string environment additions |
+| `envVar` | Environment variable that overrides `command` |
+| `resumeArgs` | Resume argument template using `{{sessionId}}` |
+| `createSessionArgs` | New-session argument template using `{{sessionId}}` |
+| `modelArgs` | Model argument template using `{{model}}` |
+| `sandboxArgs` | Sandbox argument template using `{{sandbox}}` |
+| `permissionModeArgs` | Permission argument template using `{{permissionMode}}` |
+| `permissionModeEnvVar` | Environment variable used for permission mode |
+| `permissionModeValues` | Maps Freshell permission modes to environment values |
+| `supportsPermissionMode` | Whether the picker exposes permission controls |
+| `supportsModel` | Whether the picker exposes model controls |
+| `supportsSandbox` | Whether the picker exposes sandbox controls |
+| `terminalBehavior` | Optional renderer and scroll behavior overrides |
 
-8. **Two scan directories.** Freshell scans `~/.freshell/extensions/` (user-installed) and `.freshell/extensions/` (local dev, relative to cwd). First match wins for duplicate names.
+`terminalBehavior.preferredRenderer` currently accepts `"canvas"`.
+`terminalBehavior.scrollInputPolicy` accepts `"native"` or
+`"fallbackToCursorKeysWhenAltScreenMouseCapture"`.
 
-## Category Decision Tree
+Use the advanced capability fields only when the CLI actually implements the
+corresponding arguments. The built-in manifests under `extensions/` are the
+best current examples for coding agents.
 
-| Extension needs... | Category | Required config block |
-|---|---|---|
-| Its own HTTP server process (Express, Flask, etc.) | `server` | `server: { command, ... }` |
-| Just static HTML/JS/CSS served by Freshell | `client` | `client: { entry }` |
-| A TUI/CLI tool running in a terminal | `cli` | `cli: { command, ... }` |
+## Minimal example
 
-## Manifest Reference
-
-All fields below are derived from the Zod schema in `server/extension-manifest.ts`. Use **only** these keys — any others cause silent rejection.
-
-### Top-level fields
-
-| Field | Type | Required | Notes |
-|---|---|---|---|
-| `name` | string | yes | Unique identifier, min 1 char |
-| `version` | string | yes | Semver recommended, min 1 char |
-| `label` | string | yes | Human-readable display name |
-| `description` | string | yes | Short description for picker |
-| `category` | `"client"` \| `"server"` \| `"cli"` | yes | Must match the config block |
-| `icon` | string | no | Path to icon file (relative to extension dir) |
-| `url` | string | no | URL path template for iframe src (server and client extensions). Supports `{{fieldName}}` interpolation from contentSchema. Defaults to `"/"` |
-| `contentSchema` | object | no | Defines dynamic fields for pane props (see below) |
-| `picker` | object | no | Picker UI config (see below) |
-| `client` | object | conditional | Required when `category: "client"` |
-| `server` | object | conditional | Required when `category: "server"` |
-| `cli` | object | conditional | Required when `category: "cli"` |
-
-### `contentSchema` fields
-
-Each key in `contentSchema` maps to a field descriptor:
-
-| Field | Type | Required | Notes |
-|---|---|---|---|
-| `type` | `"string"` \| `"number"` \| `"boolean"` | yes | |
-| `label` | string | yes | Display label |
-| `required` | boolean | no | |
-| `default` | string \| number \| boolean | no | **Must match the declared `type`** (e.g., `type: "string"` requires a string default) |
-
-### `picker` fields
-
-| Field | Type | Required | Notes |
-|---|---|---|---|
-| `shortcut` | string | no | Keyboard shortcut letter in picker |
-| `group` | string | no | Picker group name |
-
-### `client` config
-
-| Field | Type | Required | Notes |
-|---|---|---|---|
-| `entry` | string | yes | Path to HTML file (relative to extension dir), min 1 char |
-
-### `server` config
-
-| Field | Type | Required | Default | Notes |
-|---|---|---|---|---|
-| `command` | string | yes | — | Executable to run (e.g., `"node"`) |
-| `args` | string[] | no | `[]` | Arguments to command |
-| `env` | Record<string, string> | no | — | Environment variables; supports `{{port}}` and `{{varName}}` interpolation |
-| `readyPattern` | string | no | — | Regex matched against stdout/stderr; server is "ready" when matched |
-| `readyTimeout` | number (positive int) | no | `10000` | Milliseconds to wait for readyPattern before killing |
-| `healthCheck` | string | no | — | Reserved for future use. Accepted by schema but not used at runtime yet. |
-| `singleton` | boolean | no | `true` | Reserved for future use. Accepted by schema but not used at runtime yet (currently always one process per extension). |
-
-### `cli` config
-
-| Field | Type | Required | Default | Notes |
-|---|---|---|---|---|
-| `command` | string | yes | — | Executable to run |
-| `args` | string[] | no | `[]` | Arguments to command |
-| `env` | Record<string, string> | no | — | Environment variables |
-
-### Copy-paste templates
-
-**Server extension:**
-
-```json
-{
-  "name": "my-server-ext",
-  "version": "0.1.0",
-  "label": "My Server Extension",
-  "description": "Does a thing with a server",
-  "category": "server",
-  "server": {
-    "command": "node",
-    "args": ["dist/index.js"],
-    "env": {
-      "PORT": "{{port}}"
-    },
-    "readyPattern": "listening on"
-  }
-}
-```
-
-**Client extension:**
-
-```json
-{
-  "name": "my-client-ext",
-  "version": "0.1.0",
-  "label": "My Client Extension",
-  "description": "A static HTML pane",
-  "category": "client",
-  "client": {
-    "entry": "index.html"
-  }
-}
-```
-
-**CLI extension:**
-
-```json
-{
-  "name": "my-cli-ext",
-  "version": "0.1.0",
-  "label": "My CLI Extension",
-  "description": "Wraps a TUI tool",
-  "category": "cli",
-  "cli": {
-    "command": "htop"
-  }
-}
-```
-
-## Workflow: Install from GitHub/URL
-
-1. **Clone the repo** to a local directory (e.g., `~/code/<name>`).
-2. **Install dependencies** — `npm install` (or equivalent for the project's stack).
-3. **Build** — `npm run build` (or equivalent). Verify build artifacts exist (e.g., `dist/`).
-4. **Check for `freshell.json`** in the project root.
-   - If missing, create one. Examine the project to determine:
-     - **Category:** Does it start a server? → `server`. Static HTML? → `client`. CLI tool? → `cli`.
-     - **Command:** What starts the server or CLI? (e.g., `node dist/index.js`)
-     - **readyPattern:** What does the server print to stdout when ready? (e.g., `"listening on"`)
-5. **Validate the manifest** mentally against the schema above — no extra keys, category block matches `category` field, required fields present.
-6. **Symlink into extensions directory:**
-   ```bash
-   mkdir -p ~/.freshell/extensions
-   ln -sf /absolute/path/to/extension ~/.freshell/extensions/<name>
-   ```
-   Use absolute paths — relative symlinks break when the working directory changes.
-7. **Restart Freshell** for the extension to be discovered.
-8. **Verify** — open the pane picker, confirm the extension appears, open it, confirm it works.
-
-## Workflow: Install from Local Directory
-
-1. **Check for `freshell.json`** — if missing, create one (see manifest reference above).
-2. **Build if needed** — check if the project requires a build step and run it.
-3. **Symlink:**
-   ```bash
-   mkdir -p ~/.freshell/extensions
-   ln -sf /absolute/path/to/project ~/.freshell/extensions/<name>
-   ```
-4. **Restart Freshell.**
-5. **Verify** in the pane picker.
-
-## Workflow: Create from Scratch
-
-### Minimal server extension
-
-Create a directory with two files:
-
-**`index.js`:**
-```javascript
-const http = require('http');
-const port = process.env.PORT || 3000;
-const server = http.createServer((req, res) => {
-  res.writeHead(200, { 'Content-Type': 'text/html' });
-  res.end('<h1>Hello from my extension</h1>');
-});
-server.listen(port, () => console.log(`Listening on port ${port}`));
-```
-
-**`freshell.json`:**
-```json
-{
-  "name": "hello-server",
-  "version": "0.1.0",
-  "label": "Hello Server",
-  "description": "Minimal server extension example",
-  "category": "server",
-  "server": {
-    "command": "node",
-    "args": ["index.js"],
-    "env": { "PORT": "{{port}}" },
-    "readyPattern": "Listening on"
-  }
-}
-```
-
-No build step needed. Symlink and restart.
-
-### Single-file client extension
-
-Create a directory with two files:
-
-**`index.html`:**
-```html
-<!DOCTYPE html>
-<html>
-<head><title>My Pane</title></head>
-<body>
-  <h1>Hello from a client extension</h1>
-  <script>
-    // Your pane logic here
-  </script>
-</body>
-</html>
-```
-
-**`freshell.json`:**
-```json
-{
-  "name": "hello-client",
-  "version": "0.1.0",
-  "label": "Hello Client",
-  "description": "Minimal client extension example",
-  "category": "client",
-  "client": {
-    "entry": "index.html"
-  }
-}
-```
-
-No build step, no dependencies. Symlink and restart.
-
-### CLI wrapper
-
-Just a manifest pointing at an existing binary. Single file:
-
-**`freshell.json`:**
 ```json
 {
   "name": "htop-pane",
   "version": "0.1.0",
   "label": "htop",
-  "description": "System monitor in a pane",
+  "description": "System monitor in a terminal pane",
   "category": "cli",
   "cli": {
     "command": "htop"
-  }
-}
-```
-
-Create a directory with just this file, symlink, and restart.
-
-## Validation Checklist
-
-Run through this before declaring an extension installed:
-
-- [ ] `freshell.json` is valid JSON
-- [ ] All 5 required top-level fields present (`name`, `version`, `label`, `description`, `category`)
-- [ ] No unknown keys at any level (check typos — `readypattern` vs `readyPattern`)
-- [ ] Exactly one category config block, matching `category` field
-- [ ] `contentSchema` defaults match their declared `type` (string default for `type: "string"`, etc.)
-- [ ] **Server:** build artifacts exist (e.g., `dist/`), command is executable, `readyPattern` matches actual stdout
-- [ ] **Client:** `entry` file exists at the specified path
-- [ ] **CLI:** command is on PATH or specified as absolute path
-- [ ] Symlink resolves correctly (`ls -la ~/.freshell/extensions/<name>`)
-- [ ] Freshell restarted after install
-- [ ] Extension appears in pane picker
-- [ ] Extension opens and functions correctly
-
-## Common Mistakes
-
-| Mistake | Symptom | Fix |
-|---|---|---|
-| Unknown key in manifest (typo or extra field) | Extension silently not loaded. Warning in server logs. | Remove the key. Only use keys listed in the manifest reference. |
-| Multiple category config blocks | Validation fails, extension skipped | Remove extra blocks — only one of `client`/`server`/`cli` allowed |
-| Category block doesn't match `category` field | Validation fails | e.g., `"category": "server"` requires a `"server": {...}` block, not `"client"` |
-| Build artifacts missing | Server extension fails to start (command can't find entry file) | Run the project's build step before symlinking |
-| Relative symlink path | Symlink breaks when Freshell's cwd differs | Always use `ln -sf /absolute/path` |
-| Missing PORT in server env | Server binds to wrong port; Freshell can't reach it | Add `"PORT": "{{port}}"` to `server.env` |
-| `readyTimeout` too low | Extension killed before it finishes starting | Increase `readyTimeout` (default is 10000ms) |
-| `contentSchema` default type mismatch | Validation fails (e.g., number default for `type: "string"`) | Ensure `typeof default === type` |
-| Expecting hot-reload after changes | Changes not picked up | Restart Freshell — extensions are scanned once at startup |
-| Duplicate extension name | Second extension silently skipped (first wins) | Use unique names across all extension directories |
-
-## Real-World Example: kilroy-run-pane
-
-For reference, here's the manifest from the kilroy-run-pane extension (a server extension with contentSchema, url interpolation, and picker config):
-
-```json
-{
-  "name": "kilroy-run-pane",
-  "version": "0.1.0",
-  "label": "Kilroy Run Viewer",
-  "description": "View Kilroy pipeline runs with DAG visualization and stage execution details",
-  "category": "server",
-  "server": {
-    "command": "node",
-    "args": ["dist-server/index.js"],
-    "env": {
-      "PORT": "{{port}}",
-      "KILROY_RUNS_DIR": "{{runsDir}}"
-    },
-    "readyPattern": "Listening on",
-    "readyTimeout": 10000,
-    "healthCheck": "/api/health",
-    "singleton": true
-  },
-  "url": "/run/{{runId}}",
-  "contentSchema": {
-    "runId": {
-      "type": "string",
-      "label": "Run ID",
-      "required": false
-    },
-    "runsDir": {
-      "type": "string",
-      "label": "Runs directory",
-      "default": "~/.local/state/kilroy/attractor/runs"
-    }
   },
   "picker": {
-    "shortcut": "R",
+    "shortcut": "H",
     "group": "tools"
   }
 }
 ```
 
-Note how `{{runsDir}}` in `server.env` is interpolated from the `runsDir` contentSchema default, and the `~/` prefix in that default is expanded to the user's home directory at runtime.
+## Install from a repository or local directory
+
+1. Clone or locate the project in a stable absolute path.
+2. Install dependencies and build its executable artifacts when required.
+3. Create or correct `freshell.json` using the supported CLI schema above.
+4. Verify the configured command runs successfully from a normal terminal.
+5. Link the extension directory:
+
+   ```bash
+   mkdir -p ~/.freshell/extensions
+   ln -sfn /absolute/path/to/extension ~/.freshell/extensions/<name>
+   ```
+
+6. Confirm the link resolves with `readlink -f`.
+7. Report that activation requires a Freshell restart. Restart only when the
+   user has explicitly approved restarting the live server.
+8. After an approved restart, inspect server logs, `GET /api/extensions`, and
+   the New Tab picker. Launch the extension and verify its real terminal
+   behavior.
+
+Freshell scans `~/.freshell/extensions/`, then `.freshell/extensions/` relative
+to the server working directory, then the built-in `extensions/` directory.
+The first manifest with a duplicate name wins.
+
+## Troubleshooting
+
+- Missing from the picker: inspect startup warnings, confirm the symlink and
+  command, and check that the provider is enabled in Settings → Coding CLI.
+- Manifest rejected: remove unknown keys, require all five top-level identity
+  fields, set `category` to `"cli"`, and keep exactly one `cli` block.
+- Command unavailable: install/build it or set the configured `envVar` to its
+  absolute executable path.
+- Changed files have no effect: extensions are scanned only at server startup;
+  wait for an approved restart.
+- Existing `client` or `server` manifest: explain that it is historical and
+  unavailable in the Rust runtime. For a web service, run it independently and
+  open its URL in a browser pane.
+
+## Completion checklist
+
+- `freshell.json` is valid JSON and contains no unknown keys.
+- `category` is `"cli"`, with one `cli` block and no `client` or `server` block.
+- The executable and any referenced artifacts exist and run on this host.
+- The symlink resolves to the intended stable directory.
+- No live restart occurred without explicit user approval.
+- After activation, logs are clean, the picker entry appears, and launching it
+  exercises the configured CLI.

@@ -9,8 +9,7 @@
 // mismatched sides with PROTOCOL_MISMATCH ("Please reload the page."), so a
 // close is either confirmed by a server that knows the answer or the
 // connection never pretends it can be — no silent exactness loss. (The
-// hello check is symmetric: both the Node server's ws-handler and
-// freshell-ws enforce it.)
+// hello check is symmetric: both peers enforce it in freshell-ws.)
 //
 // Focused-episode-7 round 5 (Finding F3) — NO bump for `pane.opened.result`:
 // the re-assertion gained a correlated answer, but the client never GATES on
