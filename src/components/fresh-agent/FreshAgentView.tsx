@@ -486,6 +486,12 @@ function readCodexFork(value: unknown): { parentThreadId?: string } | undefined 
   }
 }
 
+function composeOutgoingText(text: string, attachmentPaths: string[]): string {
+  if (attachmentPaths.length === 0) return text
+  const list = attachmentPaths.map((path) => `- ${path}`).join('\n')
+  return `${text ? `${text}\n\n` : ''}Attached files (read them from disk):\n${list}`
+}
+
 function isEditableTarget(target: EventTarget | null): boolean {
   if (!(target instanceof HTMLElement)) return false
   return Boolean(target.closest('input, textarea, select, [contenteditable=""], [contenteditable="true"]'))
@@ -2955,6 +2961,7 @@ export function FreshAgentView({
               }
               storageKey={`fresh-agent-draft:${paneContent.sessionType}:${paneContent.sessionId ?? paneContent.createRequestId}`}
               historyKey={`fresh-agent-prompt-history:${paneContent.sessionType}`}
+              provider={paneContent.provider}
               thinking={isBusy}
               queuedMessages={queuedMessages}
               onCancelQueued={(index) => {
@@ -2974,12 +2981,13 @@ export function FreshAgentView({
                   ? REDO_CODEX_UNSUPPORTED_NOTICE
                   : rollbackUnsupportedNotice(descriptor?.label ?? paneContent.provider),
               )}
-              onSend={(text) => {
+              onSend={(text, attachmentPaths) => {
                 dispatch(dismissTabGreen(tabId))
                 if (!paneContent.sessionId || sessionEnded) return
                 if (!canSend && !isBusy) return
-                if (!text) return
-                setQueuedMessages((queue) => [...queue, text])
+                const outgoing = composeOutgoingText(text, attachmentPaths)
+                if (!outgoing) return
+                setQueuedMessages((queue) => [...queue, outgoing])
               }}
             />
             <FreshAgentModelDialog
