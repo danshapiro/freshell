@@ -2617,3 +2617,7 @@ mod tests {
         assert_eq!(snap.manual, Some(recovered.manual));
     }
 }
+
+#[cfg(test)]
+#[path = "host_stats_collection_tests.rs"]
+mod collection_tests;

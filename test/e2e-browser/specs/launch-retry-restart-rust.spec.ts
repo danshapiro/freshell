@@ -42,8 +42,7 @@ function collectLeaves(node: any): any[] {
 test.describe('Launch retry across abrupt restart (Rust only)', () => {
   test.setTimeout(180_000)
 
-  test('a create in flight when the server dies abruptly retries and lands instead of a permanent error', async ({ page, e2eServerKind }) => {
-    expect(e2eServerKind).toBe('rust')
+  test('a create in flight when the server dies abruptly retries and lands instead of a permanent error', async ({ page }) => {
     const server = new RustServer({})
     const info = await server.start()
     try {

@@ -6,8 +6,8 @@ import type { CapturedMessage } from './ws-capture-client.js'
 
 /**
  * Validates captured server→client messages against the FROZEN wire contract in
- * `port/contract/` — the shared source of truth for the TS original, the future
- * Rust `freshell-protocol` crate, and this oracle.
+ * `port/contract/` — the shared source of truth for the Rust server and this
+ * oracle.
  *
  * ajv v6 caveat: the committed schemas declare `$schema: draft/2020-12` but only
  * use draft-07 keywords (they were synthesized permissively from the TS types).

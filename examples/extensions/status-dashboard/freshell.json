@@ -2,7 +2,7 @@
   "name": "status-dashboard",
   "version": "0.1.0",
   "label": "Status Dashboard",
-  "description": "Live system resource monitor with auto-refreshing stats",
+  "description": "Historical server-extension example; not supported by the Rust Freshell server",
   "category": "server",
   "server": {
     "command": "node",

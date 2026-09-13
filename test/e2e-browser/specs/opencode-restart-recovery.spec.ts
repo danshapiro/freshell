@@ -6,7 +6,7 @@ import { fileURLToPath } from 'node:url'
 import WebSocket from 'ws'
 import { WS_PROTOCOL_VERSION } from '../../../shared/ws-protocol.js'
 import { TestHarness } from '../helpers/test-harness.js'
-import { TestServer } from '../helpers/test-server.js'
+import { RustServer } from '../helpers/rust-server.js'
 
 const __filename = fileURLToPath(import.meta.url)
 const __dirname = path.dirname(__filename)
@@ -460,14 +460,14 @@ async function runRestartScenario(input: {
   await installFakeOpencode(binDir)
   await fsp.mkdir(sharedCwd, { recursive: true })
 
-  const server1 = new TestServer(createServerOptions({
+  const server1 = new RustServer(createServerOptions({
     binDir,
     auditLogPath,
     logsDir,
     sharedOpencodeDataDir,
   }))
 
-  let server2: TestServer | undefined
+  let server2: RustServer | undefined
   try {
     const info1 = await server1.start()
     await input.page.goto(`${info1.baseUrl}/?token=${info1.token}&e2e=1`)
@@ -524,7 +524,7 @@ async function runRestartScenario(input: {
       await server1.kill('SIGKILL')
     }
 
-    server2 = new TestServer(createServerOptions({
+    server2 = new RustServer(createServerOptions({
       binDir,
       auditLogPath,
       logsDir,
@@ -633,7 +633,7 @@ test.describe('OpenCode restart recovery', () => {
     const sharedOpencodeDataDir = path.join(sharedRoot, 'opencode-data')
     await installFakeOpencode(binDir)
 
-    const server = new TestServer(createServerOptions({
+    const server = new RustServer(createServerOptions({
       binDir,
       auditLogPath,
       logsDir,
@@ -719,7 +719,7 @@ test.describe('OpenCode restart recovery', () => {
     const sessionEventGatePath = path.join(sharedRoot, 'release-opencode-session-events')
     await installFakeOpencode(binDir)
 
-    const server = new TestServer(createServerOptions({
+    const server = new RustServer(createServerOptions({
       binDir,
       auditLogPath,
       logsDir,
@@ -906,7 +906,7 @@ test.describe('OpenCode restart recovery', () => {
     const sharedOpencodeDataDir = path.join(sharedRoot, 'opencode-data')
     await installFakeOpencode(binDir)
 
-    const server = new TestServer(createServerOptions({
+    const server = new RustServer(createServerOptions({
       binDir,
       auditLogPath,
       logsDir,

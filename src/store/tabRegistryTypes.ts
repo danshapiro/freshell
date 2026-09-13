@@ -4,11 +4,11 @@ export {
   RegistryPaneSnapshotSchema,
   TabRegistryRecordSchema,
   normalizeRegistryTabRecord,
-} from '../../server/tabs-registry/types'
+} from '../../shared/tab-registry-types.js'
 
 export type {
   RegistryTabStatus,
   RegistryPaneKind,
   RegistryPaneSnapshot,
   RegistryTabRecord,
-} from '../../server/tabs-registry/types'
+} from '../../shared/tab-registry-types.js'

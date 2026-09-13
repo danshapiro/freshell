@@ -13,18 +13,13 @@ import { claudeProjectSlug, writeClaudeSession } from './claude.js'
 import { codexDatePath, writeCodexSession } from './codex.js'
 import { writeOpencodeCorpus, type OpencodeSessionSpec } from './opencode.js'
 import { writeAmplifierSession } from './amplifier.js'
-import { parseAmplifierMetadata } from '../../../../server/coding-cli/providers/amplifier.js'
 import { createNestedGitRepos, createWorktreePair } from './git-layout.js'
 import { buildSessionCorpus } from './index.js'
 import {
   clearRepoRootCache,
   resolveGitCheckoutRoot,
   resolveGitRepoRoot,
-} from '../../../../server/coding-cli/utils.js'
-import {
-  runOpencodeListingQuery,
-  THREE_VIEWS_MARKER_SQL_PATTERN,
-} from '../../../../server/coding-cli/providers/opencode-listing-query.js'
+} from '../../../../scripts/testing/repo-context.js'
 import type { CorpusContext } from './types.js'
 
 /**
@@ -365,7 +360,6 @@ describe('session-corpus codex writer', () => {
       lastActivityAt: Date.parse('2026-08-02T10:00:00.002Z'),
       archivedByProvider: true,
     })
-    // NOT under sessions/** — the legacy glob never sees it, on purpose.
     expect(ctx.files[0].path.startsWith('.codex/archived_sessions/2026/08/02/')).toBe(true)
     expect(exp.visibility).toBe('absent')
     expect(exp.title).toBeUndefined() // never indexed: no wire semantics
@@ -387,7 +381,7 @@ describe('session-corpus opencode writer', () => {
     }
   }
 
-  it('creates the DB under XDG data home; production listing query sees only root non-archived rows', async () => {
+  it('creates the DB under XDG data home and records visibility expectations', async () => {
     const home = await mkHome()
     const ctx = mkCtx(home)
     const specs = [
@@ -402,21 +396,9 @@ describe('session-corpus opencode writer', () => {
     expect(ctx.files).toHaveLength(1)
     expect(ctx.files[0].path).toBe('.local/share/opencode/opencode.db')
 
-    // THE production listing query (opencode-listing-query.ts) is the reader
-    // under test here: archived and child rows must not come back.
-    const dbPath = path.join(home, '.local', 'share', 'opencode', 'opencode.db')
-    const { rows } = await runOpencodeListingQuery(dbPath, THREE_VIEWS_MARKER_SQL_PATTERN)
-    const ids = rows.map((r) => r.sessionId).sort()
-    expect(ids).toEqual(['h04corpus-oc-delta', 'h04corpus-oc-echo'])
-
-    const delta = rows.find((r) => r.sessionId === 'h04corpus-oc-delta')!
-    expect(delta).toMatchObject({
-      cwd: specs[0].directory,
-      title: 'h04corpus-testtoken delta',
-      createdAt: specs[0].timeCreated,
-      lastActivityAt: specs[0].timeUpdated,
-      projectPath: specs[0].projectWorktree,
-    })
+    // The writer contract records the exact DB location and provider rows;
+    // Rust owns production ingestion, so this helper test does not import the
+    // deleted Node OpenCode reader.
 
     // expectations
     const byRole = (role: string) => exps.find((e) => e.role === role)!
@@ -461,16 +443,16 @@ describe('session-corpus amplifier writer', () => {
       '.amplifier/projects/epsilon-project/sessions/h04corpus-testtoken-amp-epsilon/transcript.jsonl',
     ])
 
-    // the production parser is the reader under test
-    const parsed = parseAmplifierMetadata(metaRaw)
-    expect(parsed).toMatchObject({
-      sessionId: 'h04corpus-testtoken-amp-epsilon',
-      cwd,
-      createdAt: Math.floor(created), // fractional floored
-      lastActivityAt: updated,
-      title: 'h04corpus-testtoken epsilon',
-      titleSource: 'provider-generated',
-      summary: 'h04corpus-testtoken epsilon summary text',
+    // Rust owns production ingestion; this helper test checks the writer's
+    // metadata bytes without importing the deleted Node provider reader.
+    const metadata = JSON.parse(metaRaw) as Record<string, unknown>
+    expect(metadata).toMatchObject({
+      session_id: 'h04corpus-testtoken-amp-epsilon',
+      working_dir: cwd,
+      created,
+      description_updated_at: new Date(updated).toISOString(),
+      name: 'h04corpus-testtoken epsilon',
+      description: 'h04corpus-testtoken epsilon summary text',
     })
 
     // mtimes pinned to the seeded activity instant (recency fold must not

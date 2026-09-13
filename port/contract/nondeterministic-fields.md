@@ -30,9 +30,9 @@ layer can be built field-by-field.
 | Field | Kind | Appears in (`type`) |
 |-------|------|---------------------|
 | `terminalId` | nanoid | terminal.create, terminal.attach, terminal.detach, terminal.input, terminal.resize, terminal.kill, terminal.codex.candidate.persisted, terminal.created, terminal.attach.ready, terminal.stream.changed, terminal.detached, terminal.exit, terminal.status, terminal.output, terminal.output.batch, terminal.output.gap, terminal.title.updated, terminal.session.associated, terminal.codex.durability.updated, terminal.input.blocked, terminal.meta.updated, terminal.turn.complete, terminal.idle, terminal.inventory, terminals.changed (`recoverableTerminalIds[]`), pane.reconcile.result (`verdicts[].terminalId`, `verdicts[].duplicate`), {codex,opencode,claude,amplifier}.activity.updated / .list.response |
-| `requestId` | correlation id | terminal.create, {codex,opencode,claude,amplifier}.activity.list(+.response), ui.screenshot.result, codingcli.create/.created, freshAgent.create/.send/.fork(+.created/.create.failed/.send.accepted/.forked), tabs.sync.snapshot, error |
-| `sessionId` | provider session id (`ses_…`, Claude UUID, opencode id) | codingcli.input/.kill/.created/.event/.exit/.stderr/.killed, freshAgent.* (attach/send/interrupt/compact/approval.respond/question.respond/kill/fork + created/.event/.materialized/.forked/.killed/.send.accepted), session.status, session.repair.activity, terminal.turn.complete, terminal metadata, pane.reconcile.result (`verdicts[].sessionRef.sessionId`), {codex,opencode,claude,amplifier} activity records |
-| `resumeSessionId` | references a prior session id | codingcli.create, freshAgent.create/.attach |
+| `requestId` | correlation id | terminal.create, {codex,opencode,claude,amplifier}.activity.list(+.response), ui.screenshot.result, freshAgent.create/.send/.fork(+.created/.create.failed/.send.accepted/.forked), tabs.sync.snapshot, error |
+| `sessionId` | provider session id (`ses_…`, Claude UUID, opencode id) | freshAgent.* (attach/send/interrupt/compact/approval.respond/question.respond/kill/fork + created/.event/.materialized/.forked/.killed/.send.accepted), session.status, session.repair.activity, terminal.turn.complete, terminal metadata, pane.reconcile.result (`verdicts[].sessionRef.sessionId`), {codex,opencode,claude,amplifier} activity records |
+| `resumeSessionId` | references a prior session id | freshAgent.create/.attach |
 | `streamId` | pty stream id | terminal.attach.ready, terminal.stream.changed, terminal.output, terminal.output.batch, terminal.output.gap |
 | `attachRequestId` | attach correlation id | terminal.attach, terminal.attach.ready, terminal.stream.changed, terminal.output, terminal.output.batch, terminal.output.gap |
 | `tabId`, `paneId` | client layout ids | client.diagnostic, terminal.create |
@@ -85,7 +85,7 @@ layer can be built field-by-field.
 
 | Field | Appears in |
 |-------|------------|
-| `cwd` | terminal.create, codingcli.create, freshAgent.* , terminal.created, terminal metadata, terminal.inventory |
+| `cwd` | terminal.create, freshAgent.* , terminal.created, terminal metadata, terminal.inventory |
 | `rolloutPath` | terminal.codex.candidate.persisted, terminal.codex.durability.updated (`durability.candidate.rolloutPath`) |
 | `checkoutRoot`, `repoRoot`, `displaySubdir` | terminal.meta.updated (`upsert[]`) |
 | `defaultCwd`, `allowedFilePaths[]` | settings.updated (`settings`) |
@@ -95,13 +95,12 @@ layer can be built field-by-field.
 | Field | Appears in | Note |
 |-------|------------|------|
 | `data` | terminal.output, terminal.output.batch (+ `segments[].data`) | PTY bytes — deterministic only for fixed shell commands (T1); LLM-driven output is nondeterministic |
-| `event` (`unknown`) | codingcli.event, freshAgent.event | provider-specific payload; parse + shape-check only |
-| `text` | codingcli.stderr | provider stderr |
+| `event` (`unknown`) | freshAgent.event | provider-specific payload; parse + shape-check only |
 | `imageBase64` | ui.screenshot.result | PNG bytes; compare via perceptual/size invariants, not equality |
 | `title` | terminal.title.updated, terminal.inventory (`terminals[].title`), ui.layout.sync tab titles | may be LLM-generated |
 | `branch`, `isDirty` | terminal.meta.updated (`upsert[]`) | live git state |
 | `cliVersion` | terminal.codex.durability.updated (`durability.candidate.cliVersion`) | environment-specific |
-| `model` | codingcli.create, freshAgent.send (`settings.model`) | usually pinned; provider may echo a resolved id |
+| `model` | freshAgent.send (`settings.model`) | usually pinned; provider may echo a resolved id |
 
 ## Deterministic (do NOT normalize — must match exactly)
 

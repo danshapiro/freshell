@@ -139,7 +139,7 @@ pub enum SessionType {
     Freshopencode,
 }
 
-/// Sandbox policy shared by codingcli/freshAgent create/send.
+/// Sandbox policy shared by terminal and fresh-agent launch requests.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Sandbox {
@@ -148,7 +148,7 @@ pub enum Sandbox {
     DangerFullAccess,
 }
 
-/// Permission mode enum (used by `codingcli.create`; freshAgent uses a free
+/// Permission mode enum (used by terminal and fresh-agent launch requests; freshAgent uses a free
 /// string here, so it is *not* this type there).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]

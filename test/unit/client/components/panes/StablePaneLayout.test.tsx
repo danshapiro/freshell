@@ -30,7 +30,6 @@ vi.mock('@/components/panes/PaneContainer', async () => {
     </div>
   } }
 })
-
 const leaf = (id: string): Extract<PaneNode, { type: 'leaf' }> => ({
   type: 'leaf', id, content: { kind: 'terminal', mode: 'claude', status: 'running', createRequestId: `create-${id}`, terminalId: `terminal-${id}` },
 })
@@ -267,4 +266,3 @@ describe('stable divider resizing', () => {
     }
   })
 })
-

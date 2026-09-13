@@ -12,15 +12,10 @@ import { openPanePicker } from '../helpers/pane-picker.js'
  * the Rust port, on the LAUNCHER-ASSIGNED identity mechanism.
  *
  * KNOWN DIVERGENCE (rust-only, by design -- see `playwright.config.ts`'s
- * `rust-chromium`-only `testMatch` entry for this file, and
- * `session-directory-matrix.spec.ts`'s identical divergence note): this
- * checked-out branch's `server/` tree (legacy Node implementation, FROZEN
  * for this task) predates upstream `origin/main` commit `05c6b1fa`
  * ("feat(amplifier): durable session tracking via events.jsonl", #514) --
- * legacy has NO amplifier provider registered at all, so this scenario
  * cannot run there. This is not a parity gap to gate per-assertion; it is an
  * absent feature on this branch, and this spec is scoped to the Rust
- * project only rather than pretending legacy participates.
  *
  * The mechanism under test: the Rust broker mints a UUID at amplifier
  * terminal create, pre-creates the session stub dir under
@@ -112,7 +107,6 @@ async function openAmplifierPane(page: import('@playwright/test').Page): Promise
  * SPLITS the currently-visible terminal rather than opening a new tab (it
  * only falls back to "Add pane" when no `.xterm` is visible yet), so both
  * amplifier panes in this scenario end up as sibling leaves under ONE tab's
- * split tree, not two separate tabs -- mirrors `restore-matrix.spec.ts`'s
  * `findFreshAgentLeaf` helper, generalized to return every matching leaf.
  */
 function collectLeaves(node: any): any[] {
@@ -155,13 +149,8 @@ async function openAmplifierPaneAndGetLeaf(
 test.describe('Amplifier Restore (Rust only)', () => {
   test.setTimeout(120_000)
 
-  test('amplifier panes restore across a server restart via `amplifier resume <id>` -- identity assigned at create, never-used panes included', async ({ page, e2eServerKind }) => {
-    // This spec is registered ONLY under the `rust-chromium` project
+  test('amplifier panes restore across a server restart via `amplifier resume <id>` -- identity assigned at create, never-used panes included', async ({ page }) => {
     // (`playwright.config.ts`), but assert the precondition explicitly so a
-    // future accidental `MATRIX_SPECS` inclusion fails loudly instead of
-    // silently no-op'ing on legacy.
-    expect(e2eServerKind).toBe('rust')
-
     // GATE-01 (2026-08-09): deterministic rust-side regression found by the
     // unchanged-suite gate — after the restart, `amplifier resume <id>` falls
     // back to "session could not be found on disk — started a fresh session"
@@ -171,7 +160,7 @@ test.describe('Amplifier Restore (Rust only)', () => {
     // content check; un-pin must re-verify the whole test per B001). Red in
     // the isolated rerun reproof-s3-amplifier-rust too — not load/flake.
     test.fail(
-      e2eServerKind === 'rust',
+      true,
       'TERM-27: amplifier resume across restart loses the on-disk session (GATE-01 2026-08-09)',
     )
 
@@ -181,7 +170,6 @@ test.describe('Amplifier Restore (Rust only)', () => {
       const fakeAmplifierPath = await installFakeAmplifierCli(path.join(sharedRoot, 'bin'))
 
       const server = await createE2eServerHandle(process.env, {
-        kind: e2eServerKind,
         construct: {
           env: {
             AMPLIFIER_CMD: fakeAmplifierPath,
@@ -201,7 +189,6 @@ test.describe('Amplifier Restore (Rust only)', () => {
           // filter): `availableClis[name]`, `enabledProviders.includes(name)`,
           // and NOT `disabledExtensions.includes(name)`. `enabledProviders`
           // has no amplifier-friendly default, so it must be seeded here --
-          // same real settings surface the FreshCodex restore-matrix
           // scenarios seed for `codingCli.enabledProviders` (there for
           // `codex`), just naming `amplifier` instead.
           setupHome: async (homeDir) => {
@@ -338,7 +325,7 @@ test.describe('Amplifier Restore (Rust only)', () => {
         // BOTH panes must respawn with `resume <their-id>`.
         // -------------------------------------------------------------
         if (!server.restart) {
-          throw new Error(`${e2eServerKind} E2eServerHandle does not implement restart()`)
+          throw new Error('Owned Rust E2eServerHandle does not implement restart()')
         }
         await server.restart()
 

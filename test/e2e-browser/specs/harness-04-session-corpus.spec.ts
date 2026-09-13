@@ -14,7 +14,7 @@
  *     REAL provider homes were untouched (marker tripwires + absent-dir
  *     strictness, the attributable layers from harness-01's live-host idiom).
  *
- *   Leg B (legacy-open semantics): boot the LEGACY server against a corpus
+ *   Leg B (owned Rust server): seed the corpus into the fixture's isolated
  *     home and drive the real `/api/session-directory` read model through
  *     `page.request` — >1 page via nextCursor, exact identity/title/summary/
  *     projectPath/checkoutPath/archived/fractional-order matching vs the
@@ -25,8 +25,7 @@
  *     delta/epsilon titles — the corpus is genuinely browsable.
  *
  * Per the checklist validation text this does NOT exercise Rust
- * multi-provider indexing — the server leg pins `kind: 'legacy'` under BOTH
- * matrix projects; Rust-side indexing of this corpus belongs to the later
+ * multi-provider indexing — the server leg uses the Rust baseline under
  * SESSION-* items.
  */
 
@@ -142,11 +141,9 @@ const test = base.extend<Record<string, never>, {
   corpusWorker: SessionCorpus
   testServer: E2eServerHandle
 }>({
-  // Worker-scoped corpus built ONCE inside the legacy server's isolated home.
   testServer: [async ({}, use) => {
     corpusHolder.value = undefined
     const server = await createE2eServerHandle(process.env, {
-      kind: 'legacy',
       construct: {
         setupHome: async (homeDir) => {
           corpusHolder.value = await buildSessionCorpus(homeDir)
@@ -245,10 +242,10 @@ test.describe('HARNESS-04: session corpus builder', () => {
   })
 
   /* ---------------------------------------------------------------- */
-  /* Leg B — legacy-open expected semantics                             */
+  /* Leg B — owned Rust server manifest semantics                       */
   /* ---------------------------------------------------------------- */
 
-  test('leg B: legacy server pages the corpus with exact manifest semantics', async ({ page, corpusWorker, serverInfo }) => {
+  test('leg B: owned Rust server pages the corpus with exact manifest semantics', async ({ page, corpusWorker, serverInfo }) => {
     const manifest = corpusWorker.manifest
     const listed = listedSessions(manifest)
     const pageLimit = manifest.pagination.pageLimit

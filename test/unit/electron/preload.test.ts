@@ -35,10 +35,8 @@ describe('Preload API', () => {
     const keys = Object.keys(exposedApi).sort()
     expect(keys).toEqual([
       'chooseLaunchOption',
-      'chooseProfile',
       'completeSetup',
       'getLaunchOptions',
-      'getProfiles',
       'getServerMode',
       'getServerStatus',
       'installUpdate',
@@ -86,7 +84,7 @@ describe('Preload API', () => {
 
   it('completeSetup invokes correct IPC channel with config', () => {
     const config = {
-      serverMode: 'daemon' as const,
+      serverMode: 'app-bound' as const,
       port: 3001,
       remoteUrl: '',
       remoteToken: '',

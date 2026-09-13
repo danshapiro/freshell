@@ -23,8 +23,6 @@
  * Rust-only: the auto-resume orchestrator lives in the Rust server
  * (crates/freshell-ws/src/auto_resume.rs); owns one RustServer per test rig
  * (ephemeral loopback port — NEVER 3001/3002). Registered ONLY under
- * `rust-chromium` and testIgnore'd on every match-all project (see
- * playwright.config.ts's RUST_ONLY_SPECS).
  */
 import { test, expect } from '../helpers/fixtures.js'
 import * as fs from 'node:fs/promises'
@@ -33,7 +31,7 @@ import * as os from 'node:os'
 import { fileURLToPath } from 'node:url'
 import type { Page } from '@playwright/test'
 import { RustServer, ensureRustServerBuilt } from '../helpers/rust-server.js'
-import type { TestServerInfo } from '../helpers/test-server.js'
+import type { E2eServerInfo } from '../helpers/server-fixture-support.js'
 import { TestHarness } from '../helpers/test-harness.js'
 import { openPanePicker } from '../helpers/pane-picker.js'
 
@@ -138,7 +136,7 @@ interface Rig {
   root: string
   argvLog: string
   server: RustServer
-  info: TestServerInfo
+  info: E2eServerInfo
 }
 
 async function bootRig(prefix: string, behaviorEnv: Record<string, string>): Promise<Rig> {
@@ -166,7 +164,7 @@ async function teardownRig(rig: Rig | undefined): Promise<void> {
 }
 
 /** Connect, ensure a live shell terminal, then create a claude pane via the UI. */
-async function createClaudePane(page: Page, info: TestServerInfo): Promise<TestHarness> {
+async function createClaudePane(page: Page, info: E2eServerInfo): Promise<TestHarness> {
   const harness = await connect(page, info)
   await selectShellIfPickerShowing(page)
   await expect(page.locator('.xterm').first()).toBeVisible({ timeout: 30_000 })
@@ -193,8 +191,7 @@ test.describe('agent crash auto-resume (rust only)', () => {
     ensureRustServerBuilt()
   })
 
-  test('crash → bounded auto-resume with --resume <same id> and a visible notice', async ({ page, e2eServerKind }) => {
-    expect(e2eServerKind).toBe('rust')
+  test('crash → bounded auto-resume with --resume <same id> and a visible notice', async ({ page }) => {
     test.setTimeout(240_000)
     let rig: Rig | undefined
     try {
@@ -249,8 +246,7 @@ test.describe('agent crash auto-resume (rust only)', () => {
     }
   })
 
-  test('instantly re-crashing CLI exhausts retries and settles with a loud banner', async ({ page, e2eServerKind }) => {
-    expect(e2eServerKind).toBe('rust')
+  test('instantly re-crashing CLI exhausts retries and settles with a loud banner', async ({ page }) => {
     test.setTimeout(240_000)
     let rig: Rig | undefined
     try {
@@ -276,8 +272,7 @@ test.describe('agent crash auto-resume (rust only)', () => {
     }
   })
 
-  test('clean exit (code 0) neither resumes nor alarms', async ({ page, e2eServerKind }) => {
-    expect(e2eServerKind).toBe('rust')
+  test('clean exit (code 0) neither resumes nor alarms', async ({ page }) => {
     test.setTimeout(240_000)
     let rig: Rig | undefined
     try {
@@ -301,8 +296,7 @@ test.describe('agent crash auto-resume (rust only)', () => {
     }
   })
 
-  test('Relaunch button drives a resume with the same session id', async ({ page, e2eServerKind }) => {
-    expect(e2eServerKind).toBe('rust')
+  test('Relaunch button drives a resume with the same session id', async ({ page }) => {
     test.setTimeout(240_000)
     let rig: Rig | undefined
     try {
@@ -362,8 +356,7 @@ test.describe('agent crash auto-resume (rust only)', () => {
     }
   })
 
-  test('a persistent crash trace survives reload and is dismissible', async ({ page, e2eServerKind }) => {
-    expect(e2eServerKind).toBe('rust')
+  test('a persistent crash trace survives reload and is dismissible', async ({ page }) => {
     test.setTimeout(240_000)
     let rig: Rig | undefined
     try {
@@ -392,8 +385,7 @@ test.describe('agent crash auto-resume (rust only)', () => {
     }
   })
 
-  test('a flap loop trips the circuit breaker: settles with the crashed-N-times banner', async ({ page, e2eServerKind }) => {
-    expect(e2eServerKind).toBe('rust')
+  test('a flap loop trips the circuit breaker: settles with the crashed-N-times banner', async ({ page }) => {
     test.setTimeout(240_000)
     let rig: Rig | undefined
     try {
@@ -425,8 +417,7 @@ test.describe('agent crash auto-resume (rust only)', () => {
     }
   })
 
-  test('cancel clears the recovering notice immediately and no respawn happens', async ({ page, e2eServerKind }) => {
-    expect(e2eServerKind).toBe('rust')
+  test('cancel clears the recovering notice immediately and no respawn happens', async ({ page }) => {
     test.setTimeout(240_000)
     let rig: Rig | undefined
     try {

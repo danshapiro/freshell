@@ -185,7 +185,6 @@ describe('refresh context menu flow (e2e)', () => {
   })
 
   it('Refresh tab exits zoom and refreshes all browser panes in the stored layout', async () => {
-    vi.mocked(api.post).mockImplementation(() => new Promise(() => {}))
     let reloadCount = 0
     const contentWindowSpy = vi.spyOn(window.HTMLIFrameElement.prototype, 'contentWindow', 'get').mockImplementation(() => {
       return {
@@ -212,14 +211,12 @@ describe('refresh context menu flow (e2e)', () => {
       const user = userEvent.setup()
       const { container } = renderFlow(store)
 
-      // Only pane-1 (port 3000) uses TCP forwarding — it matches Freshell's
-      // own port so the HTTP proxy skips it; pane-2 uses the same-origin
-      // /api/proxy path and never posts. The forward promise never resolves,
-      // so pane-1 has no iframe and one in-flight forward.
       await waitFor(() => {
-        expect(vi.mocked(api.post)).toHaveBeenCalledTimes(1)
+        expect(screen.getByRole('status')).toHaveTextContent(
+          'Remote loopback forwarding is unavailable; use a localhost HTTP URL or open the URL on the server host.',
+        )
       })
-      vi.mocked(api.post).mockClear()
+      expect(vi.mocked(api.post).mock.calls.filter(([path]) => path === '/api/proxy/forward')).toHaveLength(0)
 
       await user.pointer({ target: screen.getByText('Tab One'), keys: '[MouseRight]' })
       await user.click(screen.getByRole('menuitem', { name: 'Refresh tab' }))
@@ -230,13 +227,13 @@ describe('refresh context menu flow (e2e)', () => {
       await waitFor(() => {
         expect(container.querySelectorAll('[data-context="pane"]')).toHaveLength(2)
       })
-      // Zoom exit keeps BOTH panes mounted (the stable surface layer — the old
-      // recursive tree remounted the zoomed sibling). pane-1's refresh takes
-      // the recover path: still no iframe (forward never resolved), so it
-      // retries the forward exactly once. pane-2 reloads its iframe in place.
-      await waitFor(() => {
-        expect(vi.mocked(api.post)).toHaveBeenCalledTimes(1)
-      })
+      // Rust does not expose the retired raw TCP-forwarding endpoint. The
+      // remote loopback pane stays explicitly unavailable while the other
+      // browser pane uses Rust's supported HTTP proxy path.
+      expect(screen.getByText(
+        'Remote loopback forwarding is unavailable; use a localhost HTTP URL or open the URL on the server host.',
+      )).toBeInTheDocument()
+      expect(vi.mocked(api.post).mock.calls.filter(([path]) => path === '/api/proxy/forward')).toHaveLength(0)
       expect(reloadCount).toBe(1)
       await waitFor(() => {
         expect(store.getState().panes.refreshRequestsByPane['tab-1']).toBeUndefined()

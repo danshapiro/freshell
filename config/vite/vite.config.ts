@@ -3,32 +3,13 @@ import type { HttpProxy } from 'vite'
 import react from '@vitejs/plugin-react'
 import path from 'path'
 import { fileURLToPath } from 'url'
-import { execFileSync } from 'node:child_process'
-import { getNetworkHost } from '../../server/get-network-host.js'
+import { getFreshellConfigDir } from '../../shared/freshell-home.js'
+import { getNetworkHost, isWSL } from './get-network-host.js'
+import { computeClientBuildId } from './build-id.js'
 
 const __filename = fileURLToPath(import.meta.url)
 const __dirname = path.dirname(__filename)
 const projectRoot = path.resolve(__dirname, '../..')
-
-/**
- * The client's build identity: the git commit the bundle was built from,
- * matching the server-side stamps (`crates/freshell-ws/build.rs` /
- * `server/build-id.ts` + `scripts/bake-server-build-id.mjs`). `"unknown"`
- * fallback — the client's compare rule ignores `"unknown"` on both sides.
- */
-function computeClientBuildId(): string {
-  try {
-    const sha = execFileSync('git', ['rev-parse', 'HEAD'], {
-      cwd: projectRoot,
-      stdio: ['ignore', 'pipe', 'ignore'],
-    })
-      .toString()
-      .trim()
-    return /^[0-9a-f]{40}$/.test(sha) ? sha : 'unknown'
-  } catch {
-    return 'unknown'
-  }
-}
 
 /**
  * Transport-level proxy failures that mean "the backend is down or restarting":
@@ -64,7 +45,8 @@ function silenceStartupErrors(proxy: HttpProxy.Server) {
 }
 
 export default defineConfig(({ mode }) => {
-  const env = loadEnv(mode, projectRoot, '')
+  // Vite reads .env into `env`; process.env remains the explicit override.
+  const env = { ...loadEnv(mode, projectRoot, ''), ...process.env }
   const backendPort = process.env.PORT || env.PORT || '3001'
   const backendHost = process.env.VITE_BACKEND_HOST || process.env.BACKEND_HOST || env.VITE_BACKEND_HOST || env.BACKEND_HOST || '127.0.0.1'
   const backendUrl = `http://${backendHost}:${backendPort}`
@@ -78,7 +60,7 @@ export default defineConfig(({ mode }) => {
     plugins: [react()],
     define: {
       __PERF_LOGGING__: JSON.stringify(env.PERF_LOGGING || ''),
-      __FRESHELL_BUILD_ID__: JSON.stringify(computeClientBuildId()),
+      __FRESHELL_BUILD_ID__: JSON.stringify(computeClientBuildId(projectRoot)),
     },
     resolve: {
       alias: {
@@ -93,7 +75,11 @@ export default defineConfig(({ mode }) => {
       chunkSizeWarningLimit: 1400,
     },
     server: {
-      host: getNetworkHost(),
+      host: getNetworkHost({
+        env,
+        configDir: getFreshellConfigDir(env),
+        isWsl: isWSL(),
+      }),
       allowedHosts,
       port: vitePort,
       watch: {

@@ -256,7 +256,7 @@ function readFdInfo(procRoot: string, pid: number): { fdCount: number | null; so
 
 /**
  * Snapshot the process trees rooted at `rootPids` (typically one owned server
- * PID from a TestServer/RustServer fixture's `info.pid`). Roots that are no
+ * PID from an owned Rust fixture's `info.pid`). Roots that are no
  * longer alive yield an empty snapshot rather than an error — callers compare
  * `processCount` against their own baseline.
  */
@@ -355,7 +355,6 @@ export interface StableBaselineOptions {
  *
  * Why not merely wait for zombies == 0 (gate B003, 2026-08-09): a baseline
  * captured the instant no zombie exists can still freeze a still-RUNNING
- * transient child into `before` — measured live on WSL2: the legacy server's
  * startup spawns `ipconfig.exe` (bootstrap.ts LAN-IP detection, awaited
  * pre-listen) and `netsh.exe` (firewall.ts detectFirewall via the
  * fire-and-forget startup getStatus() banner) in S-state around the

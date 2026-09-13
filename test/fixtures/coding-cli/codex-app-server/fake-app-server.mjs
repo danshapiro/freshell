@@ -819,13 +819,19 @@ wss.on('connection', (socket) => {
       }
       if (method === 'turn/start' && behavior.recordTurns && result?.turn?.id) {
         // recordTurns opt-in: a recorded turn closes with the real turn
-        // lifecycle notifications (turn/started → turn/completed{completed})
+        // lifecycle notifications (thread/status active → turn/started →
+        // thread/status idle → turn/completed{completed})
         // so the consumer's active-turn tracking clears and the idle snapshot
         // edge (which re-fetches the recorded transcript) actually fires. The
         // gap MATTERS (never drop it): the server's send task records
         // active_turn when the RPC result lands; a same-tick turn/completed
         // could clear it BEFORE that record, leaving the session wedged busy —
         // a real provider never completes a turn within the result's tick.
+        behavior.threadStatuses = { ...(behavior.threadStatuses ?? {}), [message.params?.threadId]: 'active' }
+        broadcastNotification('thread/status/changed', {
+          threadId: message.params?.threadId,
+          status: { type: 'active' },
+        })
         broadcastNotification('turn/started', {
           threadId: message.params?.threadId,
           turn: { id: result.turn.id, status: 'inProgress' },
@@ -845,6 +851,11 @@ wss.on('connection', (socket) => {
           interrupted = response.cancelled === true
         }
         await new Promise((resolve) => setTimeout(resolve, Number(behavior.turnCompleteDelayMs ?? 150)))
+        behavior.threadStatuses[message.params?.threadId] = 'idle'
+        broadcastNotification('thread/status/changed', {
+          threadId: message.params?.threadId,
+          status: { type: 'idle' },
+        })
         broadcastNotification('turn/completed', {
           threadId: message.params?.threadId,
           turn: { id: result.turn.id, status: interrupted ? 'interrupted' : 'completed' },
