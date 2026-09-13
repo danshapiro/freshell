@@ -30,7 +30,7 @@
  * entirely production code.
  *
  * Rust-only: runs in the application Chromium project (owns a
- * RustServer directly, the e2eServerKind seam not used). CLOUD-SKIPPED with
+ * RustServer directly rather than the shared server fixture). CLOUD-SKIPPED with
  * justification (see playwright.cloud.config.ts): the Cloud Run image
  * builds WITHOUT git metadata, so both the Rust bake and the Vite define
  * are "unknown" there and the compare is inert BY DESIGN — this spec can

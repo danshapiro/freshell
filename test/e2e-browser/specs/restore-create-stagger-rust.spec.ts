@@ -76,8 +76,7 @@ async function allLeafTerminalIds(harness: TestHarness): Promise<(string | null)
 test.describe('restore create stagger', () => {
   test.setTimeout(300_000)
 
-  test('multiple persisted terminal panes space terminal.create sends >=400ms on reload', async ({ page, e2eServerKind }) => {
-    expect(e2eServerKind).toBe('rust')
+  test('multiple persisted terminal panes space terminal.create sends >=400ms on reload', async ({ page }) => {
     const server = new RustServer({
       env: { RUST_LOG: 'info' },
       // Tab-add must mount shell terminals directly; the default

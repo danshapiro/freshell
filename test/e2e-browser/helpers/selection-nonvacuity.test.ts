@@ -56,11 +56,14 @@ loadConfigFromFile(process.argv[2]).then((config) => {
   return JSON.parse(output) as ResolvedProject[]
 }
 
-function listedProjects(env: NodeJS.ProcessEnv): { output: string; labels: string[]; tests: number; files: number } {
+function listedProjects(
+  env: NodeJS.ProcessEnv,
+  configPath = playwrightConfig,
+): { output: string; labels: string[]; tests: number; files: number } {
   const output = execFileSync(process.execPath, [
     playwrightCli,
     'test',
-    '--config', playwrightConfig,
+    '--config', configPath,
     '--list',
   ], {
     cwd: projectRoot,
@@ -132,6 +135,12 @@ describe('browser selection non-vacuity', () => {
     ])
     expect(new Set(CLOUD_SKIP_SPECS).size).toBe(CLOUD_SKIP_SPECS.length)
     for (const localOnly of LOCAL_ONLY_SPECS) expect(CLOUD_SKIP_SPECS).toContain(localOnly.spec)
+
+    const cloud = listedProjects(cleanEnvironment(), cloudConfig)
+    expect(cloud.labels).toEqual(['chromium'])
+    expect(cloud.output).toContain('[chromium]')
+    expect(cloud.tests).toBeGreaterThan(0)
+    expect(cloud.files).toBeGreaterThan(0)
   })
 
   it('rejects a healthy response that does not identify Rust provenance', () => {

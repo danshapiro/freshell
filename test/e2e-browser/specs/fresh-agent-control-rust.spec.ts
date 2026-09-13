@@ -1674,8 +1674,7 @@ test.describe('fresh-agent control surfaces — codex lane (rust)', () => {
   // process alive but the turn/completed broadcast effectively never lands
   // (3.6e6 ms), so the quiet window must surface the stuck state with recovery
   // instead of an eternal spinner.
-  test('wedged sidecar: quiet window surfaces the stuck state with recovery, not an eternal spinner', async ({ page, e2eServerKind }) => {
-    expect(e2eServerKind).toBe('rust')
+  test('wedged sidecar: quiet window surfaces the stuck state with recovery, not an eternal spinner', async ({ page }) => {
     const lane = await bootCodexLane(
       page,
       { turnCompleteDelayMs: 3_600_000 },
@@ -1734,8 +1733,7 @@ test.describe('fresh-agent control surfaces — codex lane (rust)', () => {
     }
   })
 
-  test('long turn within the quiet window completes normally and never shows the stuck state', async ({ page, e2eServerKind }) => {
-    expect(e2eServerKind).toBe('rust')
+  test('long turn within the quiet window completes normally and never shows the stuck state', async ({ page }) => {
     const lane = await bootCodexLane(
       page,
       { turnCompleteDelayMs: 3_000 },
@@ -1769,8 +1767,7 @@ test.describe('fresh-agent control surfaces — codex lane (rust)', () => {
     }
   })
 
-  test('per-send settings alter the turn payload against the Rust server (freshcodex)', async ({ page, e2eServerKind }) => {
-    expect(e2eServerKind).toBe('rust')
+  test('per-send settings alter the turn payload against the Rust server (freshcodex)', async ({ page }) => {
     const lane = await bootCodexLane(page)
     try {
       await waitForPaneStatus(lane.harness, lane.tabId, 'idle')
