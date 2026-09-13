@@ -1021,6 +1021,68 @@ test.describe('fresh-agent control surfaces — claude lane (rust)', () => {
       await fs.rm(lane.sharedRoot, { recursive: true, force: true }).catch(() => {})
     }
   })
+
+  test('per-send settings reach the claude sidecar before the send (freshclaude)', async ({ page }) => {
+    const lane = await bootClaudeLane(page, 'freshclaude')
+    try {
+      await waitForPaneStatus(lane.harness, lane.tabId, 'idle')
+      const paneSessionId = (await paneLeaf(lane.harness, lane.tabId))?.content?.sessionId as string
+      expect(paneSessionId, 'the pane bridge session id must be known before the send').toBeTruthy()
+
+      // Change the permission mode BETWEEN sends through the pane's real
+      // settings gear: freshclaude's registry default is 'default', so picking
+      // 'acceptEdits' is a REAL change the next send must apply.
+      await page.getByRole('button', { name: 'Agent settings' }).click()
+      await page.getByRole('combobox', { name: 'Permission mode' }).selectOption('acceptEdits')
+      await page.keyboard.press('Escape')
+      await expect
+        .poll(async () => (await paneLeaf(lane.harness, lane.tabId))?.content?.permissionMode ?? null)
+        .toBe('acceptEdits')
+
+      await sendComposerText(page, 'settings probe')
+      // Canonical machinery: the settings-bearing send routes through
+      // configure_for_send, which writes a `configure` frame and awaits the
+      // sidecar's ack BEFORE the user message frame — the stdin audit proves
+      // strict ordering (the knobs provably land before the turn starts).
+      await waitForStdinFrame(
+        lane.stdinLog,
+        (f) => f?.type === 'configure' && f?.settings?.permissionMode === 'acceptEdits',
+        'configure frame carrying permissionMode:acceptEdits',
+      )
+      await waitForStdinFrame(
+        lane.stdinLog,
+        (f) => f?.type === 'send' && f?.text === 'settings probe',
+        'send frame for "settings probe"',
+      )
+
+      const frames = readStdinFrames(lane.stdinLog)
+      const configureIdx = frames.findIndex(
+        (f) => f?.type === 'configure' && f?.settings?.permissionMode === 'acceptEdits',
+      )
+      const sendIdx = frames.findIndex((f) => f?.type === 'send' && f?.text === 'settings probe')
+      expect(configureIdx, 'the per-send configure frame must exist in the audit').toBeGreaterThanOrEqual(0)
+      expect(sendIdx, 'the probe send must exist in the audit').toBeGreaterThanOrEqual(0)
+      expect(configureIdx, 'configure must land strictly BEFORE the send it applies to').toBeLessThan(sendIdx)
+
+      // The fake sidecar answers with sdk.configured carrying the applied
+      // settings (the ack configure_for_send awaits): the wire-row proves the
+      // ack as well as the ordering.
+      const ack = await waitForLogEntry(
+        lane.eventsLog,
+        (e) => e.kind === 'wire'
+          && e.frame?.type === 'sdk.configured'
+          && e.frame?.ok === true
+          && e.frame?.settings?.permissionMode === 'acceptEdits'
+          && e.frame?.sessionId === paneSessionId,
+        'sdk.configured wire row acknowledging permissionMode:acceptEdits',
+      )
+      expect(ack.frame.ok).toBe(true)
+      await waitForPaneStatus(lane.harness, lane.tabId, 'idle')
+    } finally {
+      await lane.server.stop().catch(() => {})
+      await fs.rm(lane.sharedRoot, { recursive: true, force: true }).catch(() => {})
+    }
+  })
 })
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1225,7 +1287,11 @@ function projectSlugOf(cwd: string): string {
 // ─────────────────────────────────────────────────────────────────────────────
 
 /** Boot a freshcodex pane against the behavior-driven fake codex app-server. */
-async function bootCodexLane(page: Page, behavior: Record<string, unknown> = {}): Promise<{
+async function bootCodexLane(
+  page: Page,
+  behavior: Record<string, unknown> = {},
+  extraEnv: Record<string, string> = {},
+): Promise<{
   server: RustServer
   info: E2eServerInfo
   harness: TestHarness
@@ -1253,6 +1319,7 @@ async function bootCodexLane(page: Page, behavior: Record<string, unknown> = {})
           appendClientResponseLogPath: responseLogPath,
           ...behavior,
         }),
+        ...extraEnv,
       },
       setupHome: seedWallConfig({ providers: ['codex'], freshAgent: true }),
     })
@@ -1271,6 +1338,18 @@ async function bootCodexLane(page: Page, behavior: Record<string, unknown> = {})
 
 function readCodexOps(opLogPath: string): any[] {
   return readJsonl(opLogPath)
+}
+
+/** Read a freshAgent session's status from the harness store — the exact
+ * `agentSession.status` the stuck card's `effectiveStatus` renders from. */
+async function readFreshAgentSessionStatus(
+  harness: TestHarness,
+  sessionId: string,
+): Promise<string | null> {
+  const state = await harness.getState()
+  const sessions = state?.freshAgent?.sessions ?? {}
+  const session = Object.values(sessions).find((s: any) => s?.sessionId === sessionId) as any
+  return session?.status ?? null
 }
 
 /**
@@ -1772,7 +1851,7 @@ test.describe('fresh-agent control surfaces — codex lane (rust)', () => {
     try {
       await waitForPaneStatus(lane.harness, lane.tabId, 'idle')
       // Turn 1 rides the pane's untouched defaults.
-      await sendCodexTurnAndWaitRows(page, 2, 'codex turn one')
+      await sendCodexTurnAndWaitRows(page, lane.info, 2, 'codex turn one')
       const threadId = (await paneLeaf(lane.harness, lane.tabId))?.content?.sessionId as string
       expect(threadId, 'the durable codex thread id must be known before turn two').toBeTruthy()
 
@@ -1803,7 +1882,7 @@ test.describe('fresh-agent control surfaces — codex lane (rust)', () => {
 
       // Turn 2 must now carry the changed knobs (canonical's codex.rs merges
       // msg.settings over the session baseline before turn/start).
-      await sendCodexTurnAndWaitRows(page, 4, 'codex turn two')
+      await sendCodexTurnAndWaitRows(page, lane.info, 4, 'codex turn two')
 
       // Ground truth: the fake's recorded-turns file under the lane's isolated
       // CODEX_HOME (<home>/.codex/fake-turns/<threadId>.json). Each recorded
