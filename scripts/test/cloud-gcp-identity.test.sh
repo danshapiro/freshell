@@ -252,6 +252,12 @@ if [[ "$*" == *"auth print-access-token"* ]]; then echo stub-token; exit 0; fi
 # discipline.)
 if [[ "$*" == *"executions list"* ]]; then echo "green-exec-1"; exit 0; fi
 if [[ "$*" == *"logs read"* ]]; then echo "  1 passed (1.0s)"; exit 0; fi
+# The e2e lane also requires one structured completion receipt per task from
+# Cloud Logging (jsonPayload); the e2e checks here all run --shards=1.
+if [[ "$*" == "logging read"* ]]; then
+  echo '[{"jsonPayload":{"event":"e2e_playwright_task_complete","execution":"green-exec-1","taskIndex":0,"taskCount":1,"recoveredRetryCount":0}}]'
+  exit 0
+fi
 if [[ "$*" == *"executions describe"* ]]; then
   if [[ "$*" == *"succeededCount"* ]]; then
     N=$(grep -oP -- '--tasks=\K[0-9]+' "${GREEN_LOG}" | tail -1)

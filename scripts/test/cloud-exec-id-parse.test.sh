@@ -66,6 +66,16 @@ if [[ "$*" == *"executions describe"* ]]; then
 fi
 if [[ "$*" == *"executions list"* ]]; then echo "test-exec-123"; exit 0; fi
 if [[ "$*" == *"logs read"* ]]; then echo "Test Files  1 passed (1)"; exit 0; fi
+# The e2e wrapper also requires one structured completion receipt per task
+# from Cloud Logging (jsonPayload), scoped to the parsed execution id.
+if [[ "$*" == *"logging read"* ]]; then
+  if [[ "$*" == *'"test-exec-123"'* ]]; then
+    echo '[{"jsonPayload":{"event":"e2e_playwright_task_complete","execution":"test-exec-123","taskIndex":0,"taskCount":1,"recoveredRetryCount":0}}]'
+  else
+    echo '[]'
+  fi
+  exit 0
+fi
 # Image lane: a small upload listing and an already-published image (by
 # digest), so these runs reuse it and go straight to the job lifecycle.
 if [[ "$*" == *"meta list-files-for-upload"* ]]; then printf '%s\n' package.json docker/cloud-run/cloudbuild.yaml; exit 0; fi
