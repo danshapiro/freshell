@@ -23,15 +23,22 @@ describe('process tree signalling', () => {
     const grandchildPid = Number.parseInt(firstChunk.toString().trim(), 10)
     const parentExit = once(parent, 'exit')
 
-    const signalled = signalProcessTree(parent.pid!, 'SIGTERM')
+    try {
+      const signalled = signalProcessTree(parent.pid!, 'SIGTERM')
 
-    expect(signalled).toEqual(expect.arrayContaining([parent.pid, grandchildPid]))
-    await parentExit
-    const deadline = Date.now() + 10_000
-    while (Date.now() < deadline && isProcessRunning(grandchildPid)) {
-      await new Promise((resolve) => setTimeout(resolve, 25))
+      expect(signalled).toEqual(expect.arrayContaining([parent.pid, grandchildPid]))
+      await parentExit
+      const deadline = Date.now() + 10_000
+      while (Date.now() < deadline && isProcessRunning(grandchildPid)) {
+        await new Promise((resolve) => setTimeout(resolve, 25))
+      }
+      expect(isProcessRunning(grandchildPid)).toBe(false)
+    } finally {
+      // Never leak the fixture processes when an assertion above fails.
+      for (const pid of [parent.pid, grandchildPid]) {
+        if (pid && isProcessRunning(pid)) process.kill(pid, 'SIGKILL')
+      }
     }
-    expect(isProcessRunning(grandchildPid)).toBe(false)
   })
 
   itUnix('reports an exited process as not running', async () => {
