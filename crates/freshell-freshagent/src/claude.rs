@@ -7345,6 +7345,68 @@ rl.on('line', (line) => {
         .unwrap_or_else(|_| panic!("freshAgent.created for {request_id} resolves within budget"))
     }
 
+    /// Drain `rx` until BOTH the `freshAgent.created` frame for `request_id` AND that
+    /// session's `freshAgent.session.init` event have arrived, in EITHER order; returns
+    /// the created frame.
+    ///
+    /// Not [`await_claude_created`] followed by a second drain for the init event:
+    /// `handle_create` starts the stdout consumer BEFORE it registers the session and
+    /// broadcasts `freshAgent.created`, and the fake sidecar prints `sdk.session.init`
+    /// in the same burst as its `created` answer. On a multi-thread runtime another
+    /// worker can run the consumer while the handler is still between those two points,
+    /// so the init event can reach the bus FIRST — a created-only drain would discard it
+    /// and the follow-up drain would wait out its budget for a frame already consumed.
+    async fn await_claude_created_and_session_init(
+        rx: &mut tokio::sync::broadcast::Receiver<String>,
+        request_id: &str,
+    ) -> Value {
+        tokio::time::timeout(std::time::Duration::from_secs(15), async {
+            let mut created: Option<Value> = None;
+            let mut init_session_ids: Vec<String> = Vec::new();
+            loop {
+                let frame: Value = match rx.recv().await {
+                    // Under host load the bounded drain can fall behind the
+                    // 64-frame bus: re-sync and keep waiting (the 15s budget
+                    // stays the dead-man switch); `Closed` surfaces through
+                    // the same deadline as a lost sender.
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(err) => panic!("broadcast recv failed: {err}"),
+                    Ok(raw) => serde_json::from_str(&raw).unwrap(),
+                };
+                if frame["requestId"] == request_id {
+                    assert_ne!(
+                        frame["type"], "freshAgent.create.failed",
+                        "create for {request_id} failed: {frame}"
+                    );
+                    if frame["type"] == "freshAgent.created" {
+                        created = Some(frame);
+                    }
+                } else if frame["type"] == "freshAgent.event"
+                    && frame["event"]["type"] == "freshAgent.session.init"
+                {
+                    if let Some(sid) = frame["sessionId"].as_str() {
+                        init_session_ids.push(sid.to_string());
+                    }
+                }
+                if let Some(created) = &created {
+                    if init_session_ids
+                        .iter()
+                        .any(|sid| created["sessionId"] == sid.as_str())
+                    {
+                        return created.clone();
+                    }
+                }
+            }
+        })
+        .await
+        .unwrap_or_else(|_| {
+            panic!(
+                "freshAgent.created and freshAgent.session.init for {request_id} \
+                 arrive within budget"
+            )
+        })
+    }
+
     /// Node parity (`runtime-manager.ts:106-108`): a `freshAgent.create` whose
     /// ONLY identity is a provider-matched `sessionRef` must resume exactly
     /// like the legacy `resumeSessionId` carrier — the canonical field cannot
@@ -11108,29 +11170,10 @@ rl.on('line', (line) => {
         msg.effort = Some("high".to_string());
         msg.cwd = Some(env.dir.to_string_lossy().to_string());
         state.handle_create(msg, None).await;
-        await_claude_created(&mut rx, "req-binding-init").await;
-
         // Wait for sdk.session.init to be consumed: the binding write is AWAITED
         // before the init frame broadcasts, so seeing the freshAgent.session.init
         // envelope proves the row already landed.
-        tokio::time::timeout(std::time::Duration::from_secs(15), async {
-            loop {
-                let frame: Value = match rx.recv().await {
-                    // Under host load the bounded drain can fall behind the
-                    // 64-frame bus: re-sync and keep waiting (the 15s budget
-                    // stays the dead-man switch); `Closed` surfaces through
-                    // the same deadline as a lost sender.
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
-                    Err(err) => panic!("broadcast recv failed: {err}"),
-                    Ok(raw) => serde_json::from_str(&raw).unwrap(),
-                };
-                if frame["event"]["type"] == "freshAgent.session.init" {
-                    break;
-                }
-            }
-        })
-        .await
-        .expect("freshAgent.session.init consumed within budget");
+        await_claude_created_and_session_init(&mut rx, "req-binding-init").await;
 
         let bindings = fake.bindings.lock().unwrap();
         let b = bindings.last().expect("binding at sdk.session.init");
@@ -11166,27 +11209,9 @@ rl.on('line', (line) => {
         state
             .handle_create(dedup_create_msg("req-binding-blank"), None)
             .await;
-        await_claude_created(&mut rx, "req-binding-blank").await;
-
-        // The init frame still broadcasts (the skip affects ONLY the ledger write).
-        tokio::time::timeout(std::time::Duration::from_secs(15), async {
-            loop {
-                let frame: Value = match rx.recv().await {
-                    // Under host load the bounded drain can fall behind the
-                    // 64-frame bus: re-sync and keep waiting (the 15s budget
-                    // stays the dead-man switch); `Closed` surfaces through
-                    // the same deadline as a lost sender.
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
-                    Err(err) => panic!("broadcast recv failed: {err}"),
-                    Ok(raw) => serde_json::from_str(&raw).unwrap(),
-                };
-                if frame["event"]["type"] == "freshAgent.session.init" {
-                    break;
-                }
-            }
-        })
-        .await
-        .expect("freshAgent.session.init consumed within budget");
+        // The init frame still broadcasts (the skip affects ONLY the ledger write),
+        // and only after the adoption's recordable check has run.
+        await_claude_created_and_session_init(&mut rx, "req-binding-blank").await;
 
         assert!(
             fake.bindings.lock().unwrap().is_empty(),
@@ -11221,28 +11246,9 @@ rl.on('line', (line) => {
             7_777,
         );
         state.handle_create(msg, Some(provenance)).await;
-        await_claude_created(&mut rx, "req-binding-prov").await;
-
         // The binding write is AWAITED before the init frame broadcasts (same
         // witness idiom as `session_init_records_binding_with_create_settings`).
-        tokio::time::timeout(std::time::Duration::from_secs(15), async {
-            loop {
-                let frame: Value = match rx.recv().await {
-                    // Under host load the bounded drain can fall behind the
-                    // 64-frame bus: re-sync and keep waiting (the 15s budget
-                    // stays the dead-man switch); `Closed` surfaces through
-                    // the same deadline as a lost sender.
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
-                    Err(err) => panic!("broadcast recv failed: {err}"),
-                    Ok(raw) => serde_json::from_str(&raw).unwrap(),
-                };
-                if frame["event"]["type"] == "freshAgent.session.init" {
-                    break;
-                }
-            }
-        })
-        .await
-        .expect("freshAgent.session.init consumed within budget");
+        await_claude_created_and_session_init(&mut rx, "req-binding-prov").await;
 
         let bindings = fake.bindings.lock().unwrap();
         let b = bindings.last().expect("binding at sdk.session.init");
