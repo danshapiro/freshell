@@ -66,6 +66,32 @@ export const reusableSuccessRecordSchema = latestRunRecordSchema.extend({
   reusableKey: z.string(),
 })
 
+export const ungatedPhaseStatusSchema = z.object({
+  label: z.string(),
+  selector: z.string(),
+  startedAt: z.string(),
+  finishedAt: z.string().optional(),
+  state: z.enum(['running', 'passed', 'failed', 'stopped']),
+  exitCode: z.number().int().optional(),
+})
+
+/** A coordinated run's phases that run outside the gate, published while the run is live. */
+export const ungatedRunRecordSchema = z.object({
+  schemaVersion: z.literal(1),
+  runId: z.string(),
+  summary: z.string(),
+  summarySource: summarySourceSchema,
+  pid: z.number().int(),
+  hostname: z.string().optional(),
+  queuedAt: z.string(),
+  gate: z.enum(['waiting', 'holding', 'released']),
+  phases: z.array(ungatedPhaseStatusSchema),
+  entrypoint: entrypointSchema,
+  command: commandSchema,
+  repo: repoSchema,
+  agent: agentSchema,
+})
+
 export const latestRunsFileSchema = z.object({
   schemaVersion: z.literal(1),
   byKey: z.record(z.string(), latestRunRecordSchema),
@@ -81,6 +107,8 @@ export type LatestRunRecord = z.infer<typeof latestRunRecordSchema>
 export type LatestRunsFile = z.infer<typeof latestRunsFileSchema>
 export type ReusableSuccessRecord = z.infer<typeof reusableSuccessRecordSchema>
 export type ReusableSuccessFile = z.infer<typeof reusableSuccessFileSchema>
+export type UngatedPhaseStatus = z.infer<typeof ungatedPhaseStatusSchema>
+export type UngatedRunRecord = z.infer<typeof ungatedRunRecordSchema>
 
 export function emptyLatestRunsFile(): LatestRunsFile {
   return {

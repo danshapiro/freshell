@@ -1,3 +1,6 @@
+import { parseStandardTestCliArgs } from '../run-standard-tests.js'
+import { isCloudVitestBackend, type EnvironmentLike } from './cloud-vitest-lane.js'
+
 export type SuiteKey =
   | 'full-suite'
   | 'default:coverage'
@@ -38,6 +41,8 @@ export const COMMAND_KEYS = [
 export type CoordinatorInput = {
   commandKey: CommandKey
   forwardedArgs: string[]
+  /** Consulted for FRESHELL_VITEST_BACKEND only; omitted means the local backend. */
+  env?: EnvironmentLike
 }
 
 export type UpstreamPhase =
@@ -55,9 +60,20 @@ export type UpstreamPhase =
     runner: 'cargo'
     args: string[]
   }
+  | {
+    runner: 'cloud-vitest'
+    args: string[]
+  }
 
 export type CommandDisposition =
-  | { kind: 'coordinated'; suiteKey?: SuiteKey; phases: UpstreamPhase[] }
+  | {
+    kind: 'coordinated'
+    suiteKey?: SuiteKey
+    /** Local phases, run in order while holding the gate. */
+    phases: UpstreamPhase[]
+    /** Phases with no local CPU/RAM footprint, run outside the gate for the whole run. */
+    ungatedPhases?: UpstreamPhase[]
+  }
   | { kind: 'delegated'; phases: UpstreamPhase[] }
   | { kind: 'passthrough'; phases: UpstreamPhase[] }
   | { kind: 'rejected'; reason: string }
@@ -96,7 +112,7 @@ export function classifyCommand(input: CoordinatorInput): CommandDisposition {
   }
 
   if (hasHelpOrVersion(args)) return classifyHelpOrVersion(input.commandKey, args)
-  if (isCompositeCommand(input.commandKey)) return classifyCompositeCommand(input.commandKey, args)
+  if (isCompositeCommand(input.commandKey)) return classifyCompositeCommand(input.commandKey, args, input.env ?? {})
   return classifySinglePhaseCommand(input.commandKey, args)
 }
 
@@ -118,7 +134,7 @@ function classifyHelpOrVersion(commandKey: CommandKey, args: string[]): CommandD
   return passthrough([vitestPhase('default', ['--config', DEFAULT_VITEST_CONFIG, ...args])])
 }
 
-function classifyCompositeCommand(commandKey: CommandKey, args: string[]): CommandDisposition {
+function classifyCompositeCommand(commandKey: CommandKey, args: string[], env: EnvironmentLike): CommandDisposition {
   if (hasReporter(args)) {
     return {
       kind: 'rejected',
@@ -147,6 +163,16 @@ function classifyCompositeCommand(commandKey: CommandKey, args: string[]): Comma
   }
 
   if (isBroadCompositeWorkload(filtered)) {
+    if (isCloudVitestBackend(env)) {
+      // The cloud client lane uses no local CPU/RAM, so it starts at once and
+      // runs outside the gate; the gated runner then skips it.
+      return {
+        kind: 'coordinated',
+        suiteKey: 'full-suite',
+        phases: [npmPhase('test:balanced', ['--skip-suite=client', ...filtered])],
+        ungatedPhases: [{ runner: 'cloud-vitest', args: parseStandardTestCliArgs(filtered).forwardedArgs }],
+      }
+    }
     return coordinated('full-suite', [npmPhase('test:balanced', filtered)])
   }
   return delegated([vitestPhase('default', ['run', '--config', DEFAULT_VITEST_CONFIG, ...filtered])])

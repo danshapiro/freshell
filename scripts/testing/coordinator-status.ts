@@ -3,6 +3,7 @@ import {
   type HolderRecord,
   type LatestRunRecord,
   type ReusableSuccessRecord,
+  type UngatedRunRecord,
 } from './coordinator-schema.js'
 import {
   buildCoordinatorEndpoint,
@@ -13,6 +14,7 @@ import {
   readCommandRuns,
   readReusableSuccesses,
   readSuiteRuns,
+  readUngatedRunRecords,
 } from './coordinator-store.js'
 
 export type StatusRequest = {
@@ -38,6 +40,8 @@ export type StatusView = {
   fullSuiteReusableSuccess?: ReusableSuccessRecord
   latestCommandsByKey: Record<string, LatestRunRecord>
   latestSuitesByKey: Record<string, LatestRunRecord>
+  /** Live runs' phases that execute outside the gate; they never make the gate busy. */
+  ungatedRuns: UngatedRunRecord[]
 }
 
 export async function buildStatusView(request: StatusRequest): Promise<StatusView> {
@@ -46,11 +50,12 @@ export async function buildStatusView(request: StatusRequest): Promise<StatusVie
     request.endpointPlatform ?? process.platform,
     request.endpointBaseDirs,
   )
-  const [activeHolder, commandRuns, suiteRuns, reusableSuccesses] = await Promise.all([
+  const [activeHolder, commandRuns, suiteRuns, reusableSuccesses, ungatedRuns] = await Promise.all([
     readActiveHolder(endpoint),
     readCommandRuns(endpoint.storeDir),
     readSuiteRuns(endpoint.storeDir),
     readReusableSuccesses(endpoint.storeDir),
+    readUngatedRunRecords(endpoint.storeDir),
   ])
 
   const state = activeHolder === 'running-undescribed'
@@ -103,6 +108,7 @@ export async function buildStatusView(request: StatusRequest): Promise<StatusVie
       : fullSuiteReusableSuccess,
     latestCommandsByKey: commandRuns.byKey,
     latestSuitesByKey: suiteRuns.byKey,
+    ungatedRuns,
   }
 }
 
@@ -124,6 +130,14 @@ export function renderStatusView(view: StatusView): string {
     if (view.holder.agent.kind) lines.push(`agent: ${view.holder.agent.kind}`)
     if (view.holder.agent.sessionId) lines.push(`session: ${view.holder.agent.sessionId}`)
     if (view.holder.agent.threadId) lines.push(`thread: ${view.holder.agent.threadId}`)
+  }
+
+  for (const run of view.ungatedRuns) {
+    lines.push(`ungated-run: ${run.summary} (command: ${run.command.display}, gate: ${run.gate}, pid: ${run.pid}, worktree: ${run.repo.worktreePath})`)
+    for (const phase of run.phases) {
+      const detail = phase.state === 'running' ? formatElapsed(phase.startedAt) : `exit=${phase.exitCode ?? 'unknown'}`
+      lines.push(`ungated-phase: ${phase.label} ${phase.state} ${detail}`)
+    }
   }
 
   if (view.latestCommand) {

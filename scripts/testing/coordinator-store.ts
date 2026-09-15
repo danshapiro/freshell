@@ -12,17 +12,20 @@ import {
   latestRunsFileSchema,
   reusableSuccessFileSchema,
   reusableSuccessRecordSchema,
+  ungatedRunRecordSchema,
   type HolderRecord,
   type LatestRunRecord,
   type LatestRunsFile,
   type ReusableSuccessFile,
   type ReusableSuccessRecord,
+  type UngatedRunRecord,
 } from './coordinator-schema.js'
 
 const HOLDER_FILE = 'holder.json'
 const COMMAND_RUNS_FILE = 'command-runs.json'
 const SUITE_RUNS_FILE = 'suite-runs.json'
 const REUSABLE_SUCCESS_FILE = 'reusable-success.json'
+const UNGATED_RUNS_DIR = 'ungated-runs'
 const LOCK_RETRY_MS = 25
 const LOCK_TIMEOUT_MS = 5_000
 const LOCK_STALE_MS = 30_000
@@ -111,6 +114,69 @@ export async function recordReusableSuccess(storeDir: string, result: ReusableSu
   await mutateReusableSuccessFile(storeDir, (reusableSuccesses) => {
     reusableSuccesses.byReusableKey[record.reusableKey] = record
   })
+}
+
+export async function writeUngatedRunRecord(storeDir: string, record: UngatedRunRecord): Promise<void> {
+  await writeJsonFile(path.join(storeDir, UNGATED_RUNS_DIR), ungatedRunFileName(record.runId), ungatedRunRecordSchema.parse(record))
+}
+
+/** Remove this run's record, plus any left behind by coordinators on this host that died without cleaning up. */
+export async function clearUngatedRunRecord(storeDir: string, runId: string): Promise<void> {
+  const dir = path.join(storeDir, UNGATED_RUNS_DIR)
+  await unlinkIfPresent(path.join(dir, ungatedRunFileName(runId)))
+  for (const entry of await readUngatedRunEntries(dir)) {
+    if (entry.record && isFromDeadLocalProcess(entry.record)) {
+      await unlinkIfPresent(entry.filePath)
+    }
+  }
+}
+
+/** Live ungated runs, oldest first; records from dead coordinators on this host are ignored. */
+export async function readUngatedRunRecords(storeDir: string): Promise<UngatedRunRecord[]> {
+  const entries = await readUngatedRunEntries(path.join(storeDir, UNGATED_RUNS_DIR))
+  return entries
+    .flatMap((entry) => entry.record && !isFromDeadLocalProcess(entry.record) ? [entry.record] : [])
+    .sort((left, right) => left.queuedAt.localeCompare(right.queuedAt))
+}
+
+async function readUngatedRunEntries(dir: string): Promise<Array<{ filePath: string; record?: UngatedRunRecord }>> {
+  let names: string[]
+  try {
+    names = await fsp.readdir(dir)
+  } catch {
+    return []
+  }
+
+  return Promise.all(names
+    .filter((name) => name.endsWith('.json'))
+    .map(async (name) => {
+      const filePath = path.join(dir, name)
+      try {
+        const parsed = ungatedRunRecordSchema.safeParse(JSON.parse(await fsp.readFile(filePath, 'utf8')))
+        return { filePath, record: parsed.success ? parsed.data : undefined }
+      } catch {
+        return { filePath }
+      }
+    }))
+}
+
+function ungatedRunFileName(runId: string): string {
+  return `${runId.replace(/[^A-Za-z0-9_-]/g, '_')}.json`
+}
+
+function isFromDeadLocalProcess(record: UngatedRunRecord): boolean {
+  if (record.hostname && record.hostname !== hostname()) return false
+  return !isProcessAlive(record.pid)
+}
+
+async function unlinkIfPresent(filePath: string): Promise<void> {
+  try {
+    await fsp.unlink(filePath)
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
+      throw error
+    }
+  }
 }
 
 async function readLatestRunsFile(storeDir: string, fileName: string): Promise<LatestRunsFile> {

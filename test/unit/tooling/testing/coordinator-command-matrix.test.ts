@@ -24,6 +24,45 @@ describe('coordinator command matrix', () => {
     }
   })
 
+  it('starts the cloud client lane outside the gate and keeps only local phases gated when the Vitest backend is cloud', () => {
+    for (const commandKey of ['test', 'test:all', 'check', 'verify'] as const) {
+      expect(classifyCommand({ commandKey, forwardedArgs: [], env: { FRESHELL_VITEST_BACKEND: 'cloud' } })).toEqual({
+        kind: 'coordinated',
+        suiteKey: 'full-suite',
+        ungatedPhases: [{ runner: 'cloud-vitest', args: [] }],
+        phases: [{ runner: 'npm', script: 'test:balanced', args: ['--skip-suite=client'] }],
+      })
+    }
+  })
+
+  it('forwards runner-only flags to the gated runner but not to the cloud Vitest lane', () => {
+    expect(classifyCommand({
+      commandKey: 'test',
+      forwardedArgs: ['--mode=aggressive', '-t', 'prebuild'],
+      env: { FRESHELL_VITEST_BACKEND: 'cloud' },
+    })).toEqual({
+      kind: 'coordinated',
+      suiteKey: 'full-suite',
+      ungatedPhases: [{ runner: 'cloud-vitest', args: ['-t', 'prebuild'] }],
+      phases: [{ runner: 'npm', script: 'test:balanced', args: ['--skip-suite=client', '--mode=aggressive', '-t', 'prebuild'] }],
+    })
+  })
+
+  it.each([{}, { FRESHELL_VITEST_BACKEND: 'local' }])('keeps every full-suite phase gated when the Vitest backend is not cloud (%j)', (env) => {
+    expect(classifyCommand({ commandKey: 'test', forwardedArgs: [], env })).toEqual({
+      kind: 'coordinated',
+      suiteKey: 'full-suite',
+      phases: [{ runner: 'npm', script: 'test:balanced', args: [] }],
+    })
+  })
+
+  it('keeps git-dependent composite selectors local and ungated even with the cloud backend', () => {
+    expect(classifyCommand({ commandKey: 'test', forwardedArgs: ['--changed'], env: { FRESHELL_VITEST_BACKEND: 'cloud' } })).toEqual({
+      kind: 'delegated',
+      phases: [{ runner: 'vitest', config: 'default', args: ['run', '--config', 'config/vitest/vitest.config.ts', '--changed'] }],
+    })
+  })
+
   it('uses explicit Rust cargo phases for server and integration commands', () => {
     expect(classifyCommand({ commandKey: 'test:server', forwardedArgs: [] })).toEqual({
       kind: 'coordinated',

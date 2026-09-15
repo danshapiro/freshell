@@ -1,3 +1,5 @@
+import { spawn } from 'node:child_process'
+import { once } from 'node:events'
 import fsp from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
@@ -9,6 +11,7 @@ import {
   type HolderRecord,
   type LatestRunRecord,
   type ReusableSuccessRecord,
+  type UngatedRunRecord,
 } from '../../../../scripts/testing/coordinator-schema.js'
 import { buildCoordinatorEndpoint, tryListen } from '../../../../scripts/testing/coordinator-endpoint.js'
 import { buildStatusView, renderStatusView } from '../../../../scripts/testing/coordinator-status.js'
@@ -16,8 +19,11 @@ import {
   getCoordinatorStoreDir,
   recordCommandResult,
   recordReusableSuccess,
+  clearUngatedRunRecord,
+  readUngatedRunRecords,
   recordSuiteResult,
   writeHolder,
+  writeUngatedRunRecord,
 } from '../../../../scripts/testing/coordinator-store.js'
 
 let tempDir: string
@@ -107,6 +113,37 @@ function createReusableSuccessRecord(overrides: Partial<ReusableSuccessRecord> =
     }),
     ...overrides,
   } as ReusableSuccessRecord
+}
+
+function createUngatedRunRecord(overrides: Partial<UngatedRunRecord> = {}): UngatedRunRecord {
+  const holder = createHolderRecord()
+  return {
+    schemaVersion: 1,
+    runId: 'ungated-run-1',
+    summary: 'Cloud client in flight',
+    summarySource: 'env',
+    pid: process.pid,
+    hostname: os.hostname(),
+    queuedAt: new Date(Date.now() - 65_000).toISOString(),
+    gate: 'waiting',
+    phases: [{
+      label: 'cloud client',
+      selector: 'cloud-vitest:default',
+      startedAt: new Date(Date.now() - 65_000).toISOString(),
+      state: 'running',
+    }],
+    entrypoint: holder.entrypoint,
+    command: holder.command,
+    repo: holder.repo,
+    agent: holder.agent,
+    ...overrides,
+  }
+}
+
+async function exitedPid(): Promise<number> {
+  const child = spawn(process.execPath, ['-e', ''], { stdio: 'ignore' })
+  await once(child, 'exit')
+  return child.pid!
 }
 
 describe('buildStatusView()', () => {
@@ -287,5 +324,30 @@ describe('buildStatusView()', () => {
     const rendered = renderStatusView(view)
     expect(rendered).toContain('latest-suite: default:test/unit success exit=0')
     expect(rendered).toContain('reusable-summary: Unit-only baseline')
+  })
+
+  it('lists live ungated phases separately from the gate holder and ignores records left by dead coordinators', async () => {
+    const commonDir = path.join(tempDir, 'repo', '.git')
+    const storeDir = getCoordinatorStoreDir(commonDir)
+    const endpoint = buildCoordinatorEndpoint(commonDir, 'linux', [tempDir])
+    await writeUngatedRunRecord(storeDir, createUngatedRunRecord())
+    await writeUngatedRunRecord(storeDir, createUngatedRunRecord({
+      runId: 'ungated-run-dead',
+      summary: 'Coordinator that was SIGKILLed',
+      pid: await exitedPid(),
+    }))
+
+    const view = await buildStatusView({ commonDir, endpoint })
+
+    expect(view.state).toBe('idle')
+    expect(view.ungatedRuns.map((record) => record.runId)).toEqual(['ungated-run-1'])
+    const rendered = renderStatusView(view)
+    expect(rendered).toContain('state: idle')
+    expect(rendered).toContain('ungated-run: Cloud client in flight (command: npm test, gate: waiting')
+    expect(rendered).toMatch(/ungated-phase: cloud client running 1m \d+s/)
+    expect(rendered).not.toContain('SIGKILLed')
+
+    await clearUngatedRunRecord(storeDir, 'ungated-run-1')
+    expect(await readUngatedRunRecords(storeDir)).toEqual([])
   })
 })

@@ -1,6 +1,6 @@
 import { execFile } from 'node:child_process'
 import { randomUUID } from 'node:crypto'
-import { hostname, userInfo } from 'node:os'
+import { constants as osConstants, hostname, userInfo } from 'node:os'
 import path from 'node:path'
 import { promisify } from 'node:util'
 import { pathToFileURL } from 'node:url'
@@ -21,6 +21,7 @@ import {
   type UpstreamPhase,
 } from './coordinator-command-matrix.js'
 import { buildCoordinatorEndpoint, tryListen, type ListeningServer } from './coordinator-endpoint.js'
+import { logCoordinatorEvent } from './coordinator-log.js'
 import {
   buildReusableSuccessKey,
   type HolderRecord,
@@ -36,11 +37,22 @@ import {
   writeHolder,
 } from './coordinator-store.js'
 import { buildStatusView, renderStatusView } from './coordinator-status.js'
-import { assertNoCoordinatorRecursion, runUpstreamPhase } from './coordinator-upstream.js'
+import { RunControl, UngatedPhaseSet, type UngatedRunIdentity } from './coordinator-ungated-phases.js'
+import {
+  assertNoCoordinatorRecursion,
+  describeUpstreamPhase,
+  runUpstreamPhase,
+  startUpstreamPhase,
+  type RunningPhase,
+} from './coordinator-upstream.js'
 
 const execFileAsync = promisify(execFile)
 const DEFAULT_POLL_MS = 60_000
 const DEFAULT_MAX_WAIT_MS = 24 * 60 * 60 * 1000
+const DEFAULT_STOP_GRACE_MS = 20_000
+const STOP_SIGNALS: NodeJS.Signals[] = process.platform === 'win32'
+  ? ['SIGINT', 'SIGTERM']
+  : ['SIGINT', 'SIGTERM', 'SIGHUP']
 
 type ParsedRunArgs = {
   commandKey: CommandKey
@@ -102,6 +114,7 @@ async function runCommand(parsed: ParsedRunArgs): Promise<number> {
   const disposition = classifyCommand({
     commandKey: parsed.commandKey,
     forwardedArgs: parsed.forwardedArgs,
+    env: process.env,
   })
 
   if (disposition.kind === 'rejected') {
@@ -270,20 +283,77 @@ async function runPrePhasesIfNeeded(
   return undefined
 }
 
+/**
+ * Run a coordinated command. Ungated phases (the cloud client Vitest lane)
+ * start immediately and run outside the gate for the whole run; the gate is
+ * held only while local phases run and is released as soon as they finish.
+ * The first failure, interrupt, or gate timeout on either side stops the
+ * other, and the run succeeds only if every phase passed.
+ */
 async function runCoordinatedCommand(context: CoordinatedRunContext): Promise<number> {
   const endpoint = buildCoordinatorEndpoint(context.repo.commonDir)
+  const storeDir = endpoint.storeDir
   const pollMs = parseNumberEnv('FRESHELL_TEST_COORDINATOR_POLL_MS', DEFAULT_POLL_MS)
   const maxWaitMs = parseNumberEnv('FRESHELL_TEST_COORDINATOR_MAX_WAIT_MS', DEFAULT_MAX_WAIT_MS)
+  const stopGraceMs = parseNumberEnv('FRESHELL_TEST_COORDINATOR_STOP_GRACE_MS', DEFAULT_STOP_GRACE_MS)
   const queuedAt = new Date().toISOString()
-  let startedAt = queuedAt
   const waitStarted = Date.now()
 
+  const control = new RunControl()
+  const removeSignalHandlers = onStopSignals((signal) => {
+    if (control.stop({ kind: 'signal', signal, exitCode: signalExitCode(signal) })) {
+      logCoordinatorEvent('warn', 'run_interrupted', { signal })
+    }
+  })
+  const ungated = new UngatedPhaseSet(storeDir, buildUngatedRunIdentity(context, queuedAt), control)
+
   let listener: ListeningServer | undefined
-  let suiteStarted = false
+  let gateAcquiredAtMs: number | undefined
   let activeRepo = context.repo
+  let suiteStarted = false
+  let localPhase: RunningPhase | undefined
+
+  const releaseGate = async (): Promise<void> => {
+    if (!listener) return
+    await clearHolderIfRunIdMatches(storeDir, context.runId)
+    await listener.close()
+    listener = undefined
+    await ungated.setGate('released')
+    logCoordinatorEvent('info', 'gate_released', { heldMs: Date.now() - (gateAcquiredAtMs ?? Date.now()) })
+  }
+
+  const recordOutcome = async (exitCode: number, recordSuite: boolean): Promise<void> => {
+    const repo = await refreshRepoContext(activeRepo).catch(() => activeRepo)
+    const startedAt = ungated.isEmpty && gateAcquiredAtMs !== undefined
+      ? new Date(gateAcquiredAtMs).toISOString()
+      : queuedAt
+    const latest = buildLatestRunRecord({
+      runId: context.runId,
+      commandKey: context.commandKey,
+      suiteKey: context.disposition.suiteKey,
+      summary: context.summary,
+      commandDisplay: context.commandDisplay,
+      forwardedArgs: context.forwardedArgs,
+      repo,
+      runtime: context.runtime,
+      startedAt,
+      finishedAt: new Date().toISOString(),
+      exitCode,
+    })
+
+    await recordCommandResult(storeDir, latest)
+    if (recordSuite) {
+      await recordSuiteResult(storeDir, latest)
+    }
+    if (exitCode === 0 && repo.commit && repo.isDirty === false && latest.entrypoint.suiteKey) {
+      await recordReusableSuccess(storeDir, buildReusableSuccessRecord(latest))
+    }
+  }
 
   try {
-    while (!listener) {
+    await ungated.start(context.disposition.ungatedPhases ?? [], process.env)
+
+    while (!control.isStopped()) {
       const attempt = await tryListen(endpoint)
       if (attempt.kind === 'listening') {
         listener = attempt
@@ -292,105 +362,75 @@ async function runCoordinatedCommand(context: CoordinatedRunContext): Promise<nu
 
       await printQueuedStatus(context)
       if (Date.now() - waitStarted >= maxWaitMs) {
-        const finishedAt = new Date().toISOString()
-        const repo = await refreshRepoContext(context.repo).catch(() => context.repo)
-        await recordCommandResult(getCoordinatorStoreDir(repo.commonDir), buildLatestRunRecord({
-          runId: context.runId,
-          commandKey: context.commandKey,
-          suiteKey: context.disposition.suiteKey,
-          summary: context.summary,
-          commandDisplay: context.commandDisplay,
-          forwardedArgs: context.forwardedArgs,
-          repo,
-          runtime: context.runtime,
-          startedAt: queuedAt,
-          finishedAt,
-          exitCode: 124,
-        }))
         console.error(`${new Date().toISOString()} queued intentionally but timed out waiting for the coordinated run gate.`)
-        return 124
+        control.stop({ kind: 'gate-timeout', exitCode: 124 })
+        break
       }
-      await delay(pollMs)
+      await waitForStopOrDelay(control, pollMs)
     }
 
-    activeRepo = await refreshRepoContext(context.repo).catch(() => context.repo)
-    startedAt = new Date().toISOString()
-    const holder = buildHolderRecord(context, activeRepo, startedAt)
-    await writeHolder(endpoint.storeDir, holder)
+    if (listener && !control.isStopped()) {
+      gateAcquiredAtMs = Date.now()
+      activeRepo = await refreshRepoContext(context.repo).catch(() => context.repo)
+      await writeHolder(storeDir, buildHolderRecord(context, activeRepo, new Date(gateAcquiredAtMs).toISOString()))
+      await ungated.setGate('holding')
+      logCoordinatorEvent('info', 'gate_acquired', { waitedMs: gateAcquiredAtMs - waitStarted })
 
-    if (process.env.FRESHELL_TEST_COORDINATOR_THROW_AFTER_HOLDER === '1') {
-      throw new Error('Injected failure after holder write.')
+      if (process.env.FRESHELL_TEST_COORDINATOR_THROW_AFTER_HOLDER === '1') {
+        throw new Error('Injected failure after holder write.')
+      }
+
+      const gatedPhases = [
+        ...prePhasesForCommand(context.commandKey).map((phase) => ({ phase, suite: false })),
+        ...context.disposition.phases.map((phase) => ({ phase, suite: true })),
+      ]
+      for (const { phase, suite } of gatedPhases) {
+        if (control.isStopped()) break
+        suiteStarted ||= suite
+        const selector = describeUpstreamPhase(phase)
+        logCoordinatorEvent('info', 'gated_phase_started', { phase: selector })
+        localPhase = startUpstreamPhase(phase, process.env)
+        const exitCode = await waitForPhaseOrStop(localPhase, control)
+        if (exitCode === undefined) {
+          await localPhase.stop(control.stopSignal, stopGraceMs)
+          logCoordinatorEvent('warn', 'gated_phase_stopped', { phase: selector, reason: control.cause?.kind })
+          break
+        }
+        logCoordinatorEvent(exitCode === 0 ? 'info' : 'error', 'gated_phase_finished', { phase: selector, exitCode })
+        if (exitCode !== 0) {
+          control.stop({ kind: 'phase-failed', phase: selector, ungated: false, exitCode })
+        }
+      }
+      localPhase = undefined
     }
 
-    const prePhaseResult = await runPrePhasesIfNeeded({
-      commandKey: context.commandKey,
-      forwardedArgs: context.forwardedArgs,
-      commandDisplay: context.commandDisplay,
-      disposition: context.disposition,
-      repo: activeRepo,
-      runtime: context.runtime,
-      summary: context.summary,
-      startedAt,
-    })
-    if (prePhaseResult !== undefined) {
-      return prePhaseResult
-    }
+    await releaseGate()
+    await ungated.settle(stopGraceMs)
 
-    suiteStarted = true
-    const exitCode = await runPhases(context.disposition.phases)
-    const finishedAt = new Date().toISOString()
-    const repo = await refreshRepoContext(activeRepo)
-    const latest = buildLatestRunRecord({
-      runId: context.runId,
-      commandKey: context.commandKey,
-      suiteKey: context.disposition.suiteKey,
-      summary: context.summary,
-      commandDisplay: context.commandDisplay,
-      forwardedArgs: context.forwardedArgs,
-      repo,
-      runtime: context.runtime,
-      startedAt,
-      finishedAt,
-      exitCode,
-    })
-    const storeDir = getCoordinatorStoreDir(repo.commonDir)
-
-    await recordCommandResult(storeDir, latest)
-    await recordSuiteResult(storeDir, latest)
-
-    if (exitCode === 0 && repo.commit && repo.isDirty === false && latest.entrypoint.suiteKey) {
-      await recordReusableSuccess(storeDir, buildReusableSuccessRecord(latest))
-    }
-
+    const cause = control.cause
+    const exitCode = cause?.exitCode ?? 0
+    // Suite results are verdicts on the suite, so skip them when the run
+    // stopped before any suite phase ran or failed: a failing pre-phase, a
+    // gate timeout, or an interrupt while queued.
+    const suiteVerdict = !cause || suiteStarted || (cause.kind === 'phase-failed' && cause.ungated)
+    await recordOutcome(exitCode, suiteVerdict)
+    logCoordinatorEvent(exitCode === 0 ? 'info' : 'error', 'run_finished', { exitCode, cause })
     return exitCode
   } catch (error) {
-    const finishedAt = new Date().toISOString()
-    const repo = await refreshRepoContext(activeRepo).catch(() => activeRepo)
-    const latest = buildLatestRunRecord({
-      runId: context.runId,
-      commandKey: context.commandKey,
-      suiteKey: context.disposition.suiteKey,
-      summary: context.summary,
-      commandDisplay: context.commandDisplay,
-      forwardedArgs: context.forwardedArgs,
-      repo,
-      runtime: context.runtime,
-      startedAt,
-      finishedAt,
-      exitCode: 1,
-    })
-    const storeDir = getCoordinatorStoreDir(repo.commonDir)
-    await recordCommandResult(storeDir, latest)
-    if (suiteStarted) {
-      await recordSuiteResult(storeDir, latest)
-    }
-    console.error((error as Error).message)
+    const message = (error as Error).message
+    control.stop({ kind: 'error', message, exitCode: 1 })
+    await localPhase?.stop('SIGTERM', stopGraceMs)
+    await ungated.stopAll(stopGraceMs)
+    await recordOutcome(1, suiteStarted)
+    console.error(message)
     return 1
   } finally {
-    await clearHolderIfRunIdMatches(endpoint.storeDir, context.runId)
+    removeSignalHandlers()
+    await clearHolderIfRunIdMatches(storeDir, context.runId)
     if (listener) {
       await listener.close()
     }
+    await ungated.clear()
   }
 }
 
@@ -402,6 +442,39 @@ async function runPhases(phases: UpstreamPhase[]): Promise<number> {
     }
   }
   return 0
+}
+
+/** Resolves with the phase's exit code, or undefined if the run was stopped first. */
+async function waitForPhaseOrStop(phase: RunningPhase, control: RunControl): Promise<number | undefined> {
+  const outcome = await Promise.race([
+    phase.exitCode.then((exitCode) => ({ exitCode }), (error: unknown) => ({ error })),
+    control.stopped.then(() => undefined),
+  ])
+  if (outcome && 'error' in outcome) throw outcome.error
+  return outcome?.exitCode
+}
+
+async function waitForStopOrDelay(control: RunControl, ms: number): Promise<void> {
+  let timer: NodeJS.Timeout | undefined
+  await Promise.race([
+    control.stopped,
+    new Promise<void>((resolve) => {
+      timer = setTimeout(resolve, ms)
+    }),
+  ])
+  clearTimeout(timer)
+}
+
+function onStopSignals(handler: (signal: NodeJS.Signals) => void): () => void {
+  const listener = (signal: NodeJS.Signals): void => handler(signal)
+  for (const signal of STOP_SIGNALS) process.on(signal, listener)
+  return () => {
+    for (const signal of STOP_SIGNALS) process.off(signal, listener)
+  }
+}
+
+function signalExitCode(signal: NodeJS.Signals): number {
+  return 128 + (osConstants.signals[signal as keyof typeof osConstants.signals] ?? 1)
 }
 
 async function printQueuedStatus(context: CoordinatedRunContext): Promise<void> {
@@ -418,6 +491,28 @@ async function printQueuedStatus(context: CoordinatedRunContext): Promise<void> 
   })
   console.log(`${new Date().toISOString()} queued intentionally; waiting for the coordinated run gate.`)
   console.log(renderStatusView(statusView))
+}
+
+function buildUngatedRunIdentity(context: CoordinatedRunContext, queuedAt: string): UngatedRunIdentity {
+  return {
+    schemaVersion: 1,
+    runId: context.runId,
+    summary: context.summary.summary,
+    summarySource: context.summary.summarySource,
+    pid: process.pid,
+    hostname: hostname(),
+    queuedAt,
+    entrypoint: {
+      commandKey: context.commandKey,
+      suiteKey: context.disposition.suiteKey,
+    },
+    command: {
+      display: context.commandDisplay,
+      argv: [context.commandKey, ...context.forwardedArgs],
+    },
+    repo: repoRecord(context.repo),
+    agent: readAgentMetadata(),
+  }
 }
 
 function buildHolderRecord(context: CoordinatedRunContext, repo: RepoContext, startedAt: string): HolderRecord {
@@ -438,16 +533,7 @@ function buildHolderRecord(context: CoordinatedRunContext, repo: RepoContext, st
       display: context.commandDisplay,
       argv: [context.commandKey, ...context.forwardedArgs],
     },
-    repo: {
-      invocationCwd: repo.invocationCwd,
-      checkoutRoot: repo.checkoutRoot,
-      repoRoot: repo.repoRoot,
-      commonDir: repo.commonDir,
-      worktreePath: repo.worktreePath,
-      branch: repo.branch,
-      commit: repo.commit,
-      isDirty: repo.isDirty,
-    },
+    repo: repoRecord(repo),
     runtime: context.runtime,
     agent: readAgentMetadata(),
   }
@@ -483,18 +569,22 @@ function buildLatestRunRecord(input: {
       display: input.commandDisplay,
       argv: [input.commandKey, ...input.forwardedArgs],
     },
-    repo: {
-      invocationCwd: input.repo.invocationCwd,
-      checkoutRoot: input.repo.checkoutRoot,
-      repoRoot: input.repo.repoRoot,
-      commonDir: input.repo.commonDir,
-      worktreePath: input.repo.worktreePath,
-      branch: input.repo.branch,
-      commit: input.repo.commit,
-      isDirty: input.repo.isDirty,
-    },
+    repo: repoRecord(input.repo),
     runtime: input.runtime,
     agent: readAgentMetadata(),
+  }
+}
+
+function repoRecord(repo: RepoContext): HolderRecord['repo'] {
+  return {
+    invocationCwd: repo.invocationCwd,
+    checkoutRoot: repo.checkoutRoot,
+    repoRoot: repo.repoRoot,
+    commonDir: repo.commonDir,
+    worktreePath: repo.worktreePath,
+    branch: repo.branch,
+    commit: repo.commit,
+    isDirty: repo.isDirty,
   }
 }
 
