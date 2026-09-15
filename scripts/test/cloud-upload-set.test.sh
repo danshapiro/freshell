@@ -65,6 +65,12 @@ for path in "${LITTER[@]}"; do
   check "fixture: '$path' is git-ignored" git -C "$ROOT" check-ignore -q --no-index -- "$path"
 done
 
+# A linked worktree's `.git` is a FILE ("gitdir: <path>"), not a directory.
+# It is never part of git's view and must not be uploaded: it would leak a
+# local path into the image and make identical content hash differently in
+# every worktree.
+printf 'gitdir: /home/someone/repo/.git/worktrees/fixture\n' > "$TREE/.git"
+
 list_upload() {
   gcloud meta list-files-for-upload "$TREE" 2>/dev/null | LC_ALL=C sort -u
 }
@@ -76,6 +82,7 @@ check "gcloud listed a non-trivial upload set" test "$(wc -l < "$WORK/upload.txt
 for path in "${LITTER[@]}"; do
   check "gitignored '$path' is not uploaded" bash -c '! grep -Fxq -- "$1" "$2"' _ "$path" "$WORK/upload.txt"
 done
+check "a linked worktree's .git file is not uploaded" bash -c '! grep -Fxq .git "$1"' _ "$WORK/upload.txt"
 
 LC_ALL=C comm -23 "$WORK/upload.txt" "$WORK/gitview.txt" > "$WORK/uploaded-outside-gitview.txt"
 check "every uploaded file is in git's view (nothing git ignores ships)" \

@@ -20,8 +20,10 @@ coverage/
 /test/unit/server/
 /test/integration/server/
 
-# Version control and CI
-.git/
+# Version control and CI. `.git` has no trailing slash on purpose: in a linked
+# worktree it is a FILE pointing at the main repository, and uploading it
+# would leak a local path and make identical trees hash differently.
+.git
 .github/
 
 # Agent/tool configuration directories (not needed in the image)

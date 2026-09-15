@@ -15,7 +15,8 @@ coverage/
 /test/integration/server/
 
 # Version control and CI
-.git/
+# `.git` without a trailing slash: in a linked worktree it is a file.
+.git
 .github/
 
 # Agent/tool configuration directories (not needed in the image)
