@@ -212,10 +212,12 @@ mkdir -p "$GTDIR"
 export GREEN_LOG="$TDIR/green-gcloud.log"
 
 # Green-run fake gcloud. images describe reports the image MISSING (exit 1)
-# so every run also crosses the build lane (builds submit stubbed); the job
-# lifecycle succeeds for any --shards value. Records every argv in $GREEN_LOG
-# and every --account token (one per line) in $GREEN_LOG.accounts — an ABSENT
-# accounts file is the proof that every call omitted --account.
+# so every run also crosses the build lane: the upload listing, an async
+# Cloud Build whose first status poll reports SUCCESS with a recorded digest,
+# then the job lifecycle, which succeeds for any --shards value. Records every
+# argv in $GREEN_LOG and every --account token (one per line) in
+# $GREEN_LOG.accounts — an ABSENT accounts file is the proof that every call
+# omitted --account.
 cat > "$GTDIR/gcloud" <<'GREEN_FAKE'
 #!/usr/bin/env bash
 echo "GCLOUD_ARGS: $*" >> "${GREEN_LOG:?set GREEN_LOG}"
@@ -225,11 +227,24 @@ echo "GCLOUD_ARGS: $*" >> "${GREEN_LOG:?set GREEN_LOG}"
 # non-empty: an ABSENT accounts file therefore proves omission.
 ACCT_TOKENS="$(grep -oP -- '--account=\S+' <<< "$*" 2>/dev/null || true)"
 if [ -n "$ACCT_TOKENS" ]; then printf '%s\n' "$ACCT_TOKENS" >> "${GREEN_LOG}.accounts"; fi
+# Build-lane calls match on their leading subcommand, BEFORE the substring
+# checks below: their arguments carry temp paths that must never be mistaken
+# for another subcommand.
+if [[ "$*" == "meta list-files-for-upload"* ]]; then printf '%s\n' package.json docker/cloud-run/cloudbuild.yaml; exit 0; fi
+if [[ "$*" == "builds submit"* ]]; then echo green-build-1; exit 0; fi
+if [[ "$*" == "builds list"* ]]; then exit 0; fi
+if [[ "$*" == "builds describe"* ]]; then
+  if [[ "$*" == *"buildStepOutputs"* ]]; then
+    printf '{"results":{"buildStepOutputs":["","%s"]}}\n' "$(printf 'sha256:%064d' 7 | base64 -w0)"
+  else
+    echo SUCCESS
+  fi
+  exit 0
+fi
 if [[ "$*" == *"info"* ]]; then echo "/nonexistent-sdk-root"; exit 0; fi
 if [[ "$*" == *"artifacts docker images describe"* ]]; then exit 1; fi
 if [[ "$*" == *"artifacts repositories describe"* ]]; then exit 0; fi
 if [[ "$*" == *"artifacts repositories create"* ]]; then exit 0; fi
-if [[ "$*" == *"builds submit"* ]]; then exit 0; fi
 if [[ "$*" == *"auth print-access-token"* ]]; then echo stub-token; exit 0; fi
 # Substring-match order matters: "run jobs executions list|logs read" CONTAINS
 # "run jobs execute" as a substring, so the specific execution subcommands are
@@ -252,10 +267,18 @@ exit 0
 GREEN_FAKE
 cat > "$GTDIR/docker" <<'GREEN_DOCKER'
 #!/usr/bin/env bash
-if [ ! -t 0 ]; then cat >/dev/null 2>&1 || true; fi
+# login drains the token pipe; the standalone push lane finds a local image
+# for the current tree and pushes it, reporting a digest.
+case "${1:-}" in
+  login) cat >/dev/null 2>&1 || true ;;
+  image) printf 'sha256:%064d\n' 8 ;;
+  push) printf '%s: digest: sha256:%064d size: 1\n' "${2##*:}" 9 ;;
+esac
 exit 0
 GREEN_DOCKER
 chmod +x "$GTDIR/gcloud" "$GTDIR/docker"
+# Keep the wrappers' same-machine image lock inside this suite's sandbox.
+export FRESHELL_CLOUD_IMAGE_LOCK_DIR="$TDIR/locks"
 
 # Distinctive values per rung and pin source so the accounts log proves
 # WHICH token won, never just that some token appeared.

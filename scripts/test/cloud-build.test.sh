@@ -97,18 +97,42 @@ check "vitest-cloud.sh help mentions --local-build" \
 
 # Check 16: e2e-cloud.sh build (default) with fake gcloud dispatches to Cloud Build
 FAKE_DIR=$(mktemp -d)
+# Fake Cloud Build: an async submit whose first status poll reports SUCCESS
+# and whose step output carries the pushed digest (sha256:0…01).
 cat > "$FAKE_DIR/gcloud" << 'FAKE'
 #!/usr/bin/env bash
 echo "FAKE_GCLOUD: $@" >> "${FAKE_GCLOUD_LOG:-/dev/null}"
-if [[ "$*" == *"artifacts docker images describe"* ]]; then exit 0; fi
+if [[ "$*" == "meta list-files-for-upload"* ]]; then printf '%s\n' package.json docker/cloud-run/Dockerfile docker/cloud-run/cloudbuild.yaml; exit 0; fi
+if [[ "$*" == "builds submit"* ]]; then echo "fake-build-1"; exit 0; fi
+if [[ "$*" == "builds list"* ]]; then exit 0; fi
+if [[ "$*" == "builds describe"* ]]; then
+  if [[ "$*" == *"buildStepOutputs"* ]]; then
+    printf '{"results":{"buildStepOutputs":["","%s"]}}\n' "$(printf 'sha256:%064d' 1 | base64 -w0)"
+  else
+    echo SUCCESS
+  fi
+  exit 0
+fi
+if [[ "$*" == *"artifacts docker images describe"* ]]; then exit 1; fi
 if [[ "$*" == *"artifacts repositories describe"* ]]; then exit 0; fi
 if [[ "$*" == *"auth print-access-token"* ]]; then echo "fake-token"; exit 0; fi
 if [[ "$*" == *"info"* ]]; then echo "/usr/lib/google-cloud-sdk"; exit 0; fi
 exit 0
 FAKE
+# Fake docker: build records an image id, push reports digest sha256:0…03.
 cat > "$FAKE_DIR/docker" << 'FAKE'
 #!/usr/bin/env bash
 echo "FAKE_DOCKER: $@" >> "${FAKE_DOCKER_LOG:-/dev/null}"
+case "${1:-}" in
+  login) cat >/dev/null ;;
+  build)
+    prev=""
+    for a in "$@"; do
+      if [ "$prev" = "--iidfile" ]; then printf 'sha256:%064d' 2 > "$a"; fi
+      prev="$a"
+    done ;;
+  push) printf '%s: digest: sha256:%064d size: 1\n' "${2##*:}" 3 ;;
+esac
 exit 0
 FAKE
 chmod +x "$FAKE_DIR/gcloud" "$FAKE_DIR/docker"
@@ -117,17 +141,25 @@ export FAKE_GCLOUD_LOG="$FAKE_DIR/gcloud.log"
 export FAKE_DOCKER_LOG="$FAKE_DIR/docker.log"
 touch "$FAKE_GCLOUD_LOG" "$FAKE_DOCKER_LOG"
 export PATH="$FAKE_DIR:$PATH"
+# Keep the wrappers' same-machine image lock inside this suite's sandbox.
+export FRESHELL_CLOUD_IMAGE_LOCK_DIR="$FAKE_DIR/locks"
+CLOUD_DIGEST_RE='@sha256:0\{63\}1'
+LOCAL_DIGEST_RE='@sha256:0\{63\}3'
 
 # Default build should use Cloud Build (gcloud builds submit)
-bash scripts/e2e-cloud.sh build 2>&1 > /dev/null || true
+E2E_BUILD_OUT=$(bash scripts/e2e-cloud.sh build 2>&1) || true
 check "e2e-cloud.sh build (default) calls gcloud builds submit" \
   grep -q 'builds submit' "$FAKE_GCLOUD_LOG"
+check "e2e-cloud.sh build (default) reports the digest the Cloud Build recorded" \
+  grep -q "Cloud Build complete: .*${CLOUD_DIGEST_RE}" <<< "$E2E_BUILD_OUT"
 
 # Check 17: vitest-cloud.sh build (default) with fake gcloud dispatches to Cloud Build
 rm -f "$FAKE_GCLOUD_LOG"; touch "$FAKE_GCLOUD_LOG"
-bash scripts/vitest-cloud.sh build 2>&1 > /dev/null || true
+VITEST_BUILD_OUT=$(bash scripts/vitest-cloud.sh build 2>&1) || true
 check "vitest-cloud.sh build (default) calls gcloud builds submit" \
   grep -q 'builds submit' "$FAKE_GCLOUD_LOG"
+check "vitest-cloud.sh build (default) reports the digest the Cloud Build recorded" \
+  grep -q "Cloud Build complete: .*${CLOUD_DIGEST_RE}" <<< "$VITEST_BUILD_OUT"
 
 # Check 17b: the Cloud Build submission receives the immutable source commit
 # that the Docker build stamps into the Rust and client artifacts. This is a

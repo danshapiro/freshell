@@ -55,8 +55,9 @@ GCP_REPO="${FRESHELL_GCP_REPO:-freshell-e2e}"
 GCP_JOB="${FRESHELL_GCP_JOB:-freshell-e2e}"
 
 IMAGE_NAME="freshell-e2e"
-IMAGE_LOCAL="${IMAGE_NAME}:latest"
-IMAGE_REMOTE="${GCP_REGION}-docker.pkg.dev/${GCP_PROJECT}/${GCP_REPO}/${IMAGE_NAME}:latest"
+# The digest reference (<repo>@sha256:...) of the image a cloud run tests;
+# set by cmd_run. Never a tag: see scripts/lib/cloud-image.sh.
+IMAGE_REMOTE=""
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
@@ -67,24 +68,15 @@ ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 # shellcheck source=scripts/lib/gcp-identity.sh
 . "$SCRIPT_DIR/lib/gcp-identity.sh"
 
-# Commit-addressed image tag (wrap-review r3): a cloud run must execute the
-# code at the CURRENT HEAD — with only a mutable :latest tag, `run` would
-# happily execute whatever source was last pushed and the "cloud e2e gate"
-# could pass against STALE code. `:latest` is still built/pushed (human
-# convenience pointer + layer-cache anchor) but the run path never uses it.
-# A dirty tree gets a non-addressable `-dirty` SENTINEL tag so a build of
-# uncommitted code can never masquerade as the clean commit (untracked files
-# count as dirty — the image bakes the working tree); `-dirty` tags are not
-# content-addressable, so the run path ALWAYS rebuilds on a dirty tree
-# instead of reusing a stale `-dirty` image (wrap-review r4).
-image_tag_for_head() {
-  local sha
-  sha="$(git -C "$ROOT" rev-parse --short=12 HEAD 2>/dev/null || echo unknown)"
-  if [ -n "$(git -C "$ROOT" status --porcelain 2>/dev/null)" ]; then
-    sha="${sha}-dirty"
-  fi
-  echo "$sha"
-}
+# Shared test-image identity: which exact tree an image holds, its tag,
+# build dedupe across concurrent runs, and digest pinning. The contract is
+# documented at the top of the helper. Sourcing only defines functions.
+# shellcheck source=scripts/lib/cloud-image.sh
+. "$SCRIPT_DIR/lib/cloud-image.sh"
+CLOUD_IMAGE_LOG_PREFIX="[e2e-cloud]"
+# Image progress joins this wrapper's other progress on stdout; the stdout of
+# cloud_image_ensure itself carries only its result line.
+exec {CLOUD_IMAGE_LOG_FD}>&1
 
 # Ensure gcloud's bin dir is on PATH (for docker-credential-gcloud used by
 # Docker when pushing to Artifact Registry). Guarded: local runs, `help`,
@@ -118,21 +110,13 @@ gcloud_flags() {
 # swap the image/config of an in-flight run, and forces "find my execution"
 # to fall back to "the latest execution of the shared job" — which may be
 # another run's results. Every run therefore creates its own job
-# (<prefix>-<imagetag>-<random6>), executes it, and deletes it on every exit
-# path (success, failure, SIGINT/SIGTERM). FRESHELL_GCP_JOB is the prefix.
+# (<prefix>-<commit>[-dirty]-<random6>, from the image tag in $1), executes
+# it, and deletes it on every exit path (success, failure, SIGINT/SIGTERM).
+# FRESHELL_GCP_JOB is the prefix.
 unique_job_name() {
   local rand
   rand=$(LC_ALL=C tr -dc 'a-z0-9' </dev/urandom | head -c 6)
-  printf '%s-%s-%s' "$GCP_JOB" "$(image_tag_for_head)" "$rand"
-}
-
-# gcloud artifacts commands use --location, not --region
-gcloud_artifacts_flags() {
-  if [ -n "${GCP_ACCOUNT:-}" ]; then
-    echo "--account=${GCP_ACCOUNT} --project=${GCP_PROJECT} --location=${GCP_REGION}"
-  else
-    echo "--project=${GCP_PROJECT} --location=${GCP_REGION}"
-  fi
+  printf '%s-%s-%s' "$GCP_JOB" "$(cloud_image_job_label "$1")" "$rand"
 }
 
 # Prints a pinned --account flag, or NOTHING (not even an empty word) when no
@@ -180,6 +164,12 @@ Identity (cloud lanes only — details: docs/development/gcloud-robot.md):
   (needs GCLOUD_ROBOT_HOME, the installed gcloud-robot skill directory)
   > ambient gcloud (one quiet stderr note). GCLOUD_ROBOT_REQUIRE=1 fails
   closed with guidance instead of the ambient fallback.
+
+Test image (details: docs/development/cloud-test-images.md): a cloud run
+tests an image of exactly the tree it was started from, and its job pins that
+image by digest. A clean tree uses the commit tag (<commit>), reused while it
+exists; uncommitted changes get <commit>-dirty-<content hash>. Runs that need
+the same image share one build instead of building it again.
 
 Cloud job lifecycle: each cloud run creates its OWN unique job
 (<prefix>-<commit>[-dirty]-<random>), executes it, and deletes it
@@ -233,34 +223,21 @@ cmd_build() {
   # zero GCP tooling. Probe = the lane's gating permission.
   freshell_resolve_cloud_identity "cloudbuild.builds.create"
 
-  # Content-addressed tag (see image_tag_for_head): the only tag `run` pins.
-  local tag remote_base build_commit
-  tag="$(image_tag_for_head)"
-  remote_base="${GCP_REGION}-docker.pkg.dev/${GCP_PROJECT}/${GCP_REPO}/${IMAGE_NAME}"
-  build_commit="$(git -C "$ROOT" rev-parse HEAD)"
-  if ! [[ "$build_commit" =~ ^[0-9a-f]{40}$ ]]; then
-    echo "[e2e-cloud] ERROR: HEAD is not a lowercase 40-hex commit: $build_commit" >&2
+  # `build` always publishes a fresh image of the current tree (--force); a
+  # build of the same tag that is already in flight is still reused.
+  local -a ensure_args=(--force)
+  if $local_build; then
+    ensure_args+=(--local-build)
+  fi
+  local image_line
+  if ! image_line="$(cloud_image_ensure "${ensure_args[@]}")"; then
+    echo "[e2e-cloud] ERROR: image build failed." >&2
     exit 1
   fi
-
   if $local_build; then
-    echo "[e2e-cloud] Building Docker image locally (tag: $tag)..."
-    docker build -f "$ROOT/docker/cloud-run/Dockerfile" \
-      --build-arg "FRESHELL_BUILD_COMMIT=${build_commit}" \
-      -t "$IMAGE_LOCAL" \
-      -t "${IMAGE_NAME}:${tag}" \
-      "$ROOT"
-    echo "[e2e-cloud] Image built: $IMAGE_LOCAL (${IMAGE_NAME}:${tag})"
-    cmd_push
+    echo "[e2e-cloud] Image published: ${image_line#* } (tag ${image_line%% *})"
   else
-    echo "[e2e-cloud] Building Docker image via Cloud Build (tag: $tag)..."
-    gcloud builds submit \
-      --config "$ROOT/docker/cloud-run/cloudbuild.yaml" \
-      $(account_flag) \
-      --project="$GCP_PROJECT" \
-      --substitutions=_IMAGE="${remote_base}:${tag}",_FRESHELL_BUILD_COMMIT="$build_commit" \
-      "$ROOT"
-    echo "[e2e-cloud] Cloud Build complete: ${remote_base}:${tag}"
+    echo "[e2e-cloud] Cloud Build complete: ${image_line#* } (tag ${image_line%% *})"
   fi
 }
 
@@ -293,35 +270,17 @@ cmd_push() {
   done
 
   # A standalone `push` reaches gcloud without passing through cmd_build;
-  # resolve idempotently (free when cmd_build already did).
+  # resolve idempotently.
   freshell_resolve_cloud_identity "cloudbuild.builds.create"
 
-  # Ensure the Artifact Registry repo exists
-  if ! gcloud artifacts repositories describe $(gcloud_artifacts_flags) "$GCP_REPO" &>/dev/null; then
-    echo "[e2e-cloud] Creating Artifact Registry repository: $GCP_REPO"
-    gcloud artifacts repositories create $(gcloud_artifacts_flags) "$GCP_REPO" \
-      --repository-format=docker || true
+  # Pushes the local image `build --local-build` made for the CURRENT tree
+  # (tagged freshell-e2e:<tag>) — never a shared local tag.
+  local image_line
+  if ! image_line="$(cloud_image_push_local_build)"; then
+    echo "[e2e-cloud] ERROR: push failed." >&2
+    exit 1
   fi
-
-  # Authenticate Docker to Artifact Registry using an access token.
-  # We can't rely on the docker-credential-gcloud helper being on PATH.
-  gcloud auth print-access-token $(account_flag) | \
-    docker login -u oauth2accesstoken --password-stdin \
-      "https://${GCP_REGION}-docker.pkg.dev"
-
-  # Push BOTH refs explicitly: the commit-addressed tag (what `run`
-  # resolves) and :latest (human convenience pointer + cache anchor; `run`
-  # never consumes it). Never read the mutable $IMAGE_REMOTE global here —
-  # the standalone `push` subcommand path still has it at :latest while the
-  # run path has repointed it at the HEAD tag.
-  local tag remote_base
-  tag="$(image_tag_for_head)"
-  remote_base="${GCP_REGION}-docker.pkg.dev/${GCP_PROJECT}/${GCP_REPO}/${IMAGE_NAME}"
-  docker tag "$IMAGE_LOCAL" "${remote_base}:latest"
-  docker tag "$IMAGE_LOCAL" "${remote_base}:${tag}"
-  docker push "${remote_base}:${tag}"
-  docker push "${remote_base}:latest"
-  echo "[e2e-cloud] Pushed: ${remote_base}:${tag} (+ ${remote_base}:latest)"
+  echo "[e2e-cloud] Pushed: ${image_line#* } (tag ${image_line%% *})"
 }
 
 # ---------------------------------------------------------------------------
@@ -454,51 +413,33 @@ cmd_run() {
       "${pw_args[@]}"
   fi
 
-  # Identity ladder (run lane): resolve before the image describe / build /
+  # Identity ladder (run lane): resolve before the image lookup / build /
   # job calls below. `run --local` never reaches here (it exec'd above),
   # so the local lane stays free of GCP tooling and of the ladder's
   # stderr note.
   freshell_resolve_cloud_identity "run.jobs.run"
 
-  # Recompute the remote ref with potentially overridden GCP settings —
-  # COMMIT-ADDRESSED, never mutable :latest (see image_tag_for_head): the
-  # job must run THIS HEAD's code or fail loudly, never pass on a stale
-  # image.
-  local image_tag
-  image_tag="$(image_tag_for_head)"
-  IMAGE_REMOTE="${GCP_REGION}-docker.pkg.dev/${GCP_PROJECT}/${GCP_REPO}/${IMAGE_NAME}:${image_tag}"
-
-  # Cloud mode
+  # The image of exactly this tree (scripts/lib/cloud-image.sh): reused when
+  # already published or already being built, otherwise built once. The job
+  # below pins its DIGEST, so no concurrent run can swap what this run tests.
+  local image_line image_tag
+  local -a ensure_args=()
   if $force_build; then
-    if $local_build_flag; then
-      cmd_build --local-build
-    else
-      cmd_build
-    fi
-  elif [[ "$image_tag" == *-dirty ]]; then
-    # A dirty tree has NO addressable content: a stored `<sha>-dirty` tag can
-    # only ever name whatever the FIRST dirty build contained, so reusing it
-    # would silently run stale source (wrap-review r4). Always rebuild+push;
-    # docker's layer cache keeps an unchanged tree cheap.
-    echo "[e2e-cloud] Dirty worktree — rebuilding the image (uncommitted tree has no addressable tag)..."
-    if $local_build_flag; then
-      cmd_build --local-build
-    else
-      cmd_build
-    fi
-  elif ! gcloud artifacts docker images describe "$IMAGE_REMOTE" \
-      $(account_flag) --project="$GCP_PROJECT" &>/dev/null 2>&1; then
-    # Clean tree: the HEAD tag genuinely addresses this image's content.
-    echo "[e2e-cloud] No remote image for HEAD ($image_tag), building and pushing..."
-    if $local_build_flag; then
-      cmd_build --local-build
-    else
-      cmd_build
-    fi
+    ensure_args+=(--force)
   fi
+  if $local_build_flag; then
+    ensure_args+=(--local-build)
+  fi
+  if ! image_line="$(cloud_image_ensure "${ensure_args[@]+"${ensure_args[@]}"}")"; then
+    echo "[e2e-cloud] ERROR: could not build or resolve the test image for this tree." >&2
+    exit 1
+  fi
+  image_tag="${image_line%% *}"
+  IMAGE_REMOTE="${image_line#* }"
 
   echo "[e2e-cloud] Running on Cloud Run Jobs..."
   echo "[e2e-cloud]   Image:   $IMAGE_REMOTE"
+  echo "[e2e-cloud]   Tag:     $image_tag"
   echo "[e2e-cloud]   Shards:  $shards"
   echo "[e2e-cloud]   Timeout: $timeout"
   echo "[e2e-cloud]   Args:    ${pw_args[*]}"
@@ -528,7 +469,7 @@ cmd_run() {
   # per-run state (image, tasks, timeout, arg env file) — safe to store on
   # the job precisely because no other run ever touches it. Delete the job
   # (and temp env file) on EVERY exit path: success, failure, Ctrl-C/TERM.
-  RUN_JOB_NAME="$(unique_job_name)"
+  RUN_JOB_NAME="$(unique_job_name "$image_tag")"
   if ! [[ "$RUN_JOB_NAME" =~ ^[a-z][a-z0-9-]{0,48}$ ]]; then
     echo "[e2e-cloud] ERROR: invalid job name '$RUN_JOB_NAME' (check FRESHELL_GCP_JOB prefix)" >&2
     rm -f "$RUN_ENV_FILE"

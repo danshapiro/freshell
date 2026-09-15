@@ -9,6 +9,8 @@ SCRIPT="$ROOT/scripts/e2e-cloud.sh"
 WORK="$(mktemp -d /tmp/freshell-cloud-logging-receipt.XXXXXX)"
 trap 'rm -rf "$WORK"' EXIT
 mkdir -p "$WORK/bin" "$WORK/capture"
+# Keep the wrapper's same-machine image lock inside this suite's sandbox.
+export FRESHELL_CLOUD_IMAGE_LOCK_DIR="$WORK/locks"
 
 cat > "$WORK/bin/gcloud" <<'GCLOUD'
 #!/usr/bin/env bash
@@ -16,7 +18,9 @@ set -euo pipefail
 printf '%s\n' "$*" >> "$STUB_CAPTURE/gcloud.args"
 case "$*" in
   "info "*) echo /nonexistent-sdk-root ;;
-  *"artifacts docker images describe"*) exit 0 ;;
+  # Image lane: a small upload listing and an already-published image.
+  *"meta list-files-for-upload"*) printf '%s\n' package.json docker/cloud-run/cloudbuild.yaml ;;
+  *"artifacts docker images describe"*) printf 'sha256:%064d\n' 1 ;;
   *"builds submit"*) exit 0 ;;
   *"run jobs create"*)
     for arg in "$@"; do

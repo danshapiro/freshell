@@ -150,13 +150,16 @@ if ! echo "$LOCAL_ENV_OUTPUT" | grep -q "Running locally"; then
 fi
 echo "PASS: FRESHELL_E2E_BACKEND=local runs locally"
 
-# Check 11: --cloud overrides FRESHELL_E2E_BACKEND=local, and the cloud run
-# targets the COMMIT-ADDRESSED image for the current HEAD — never mutable
-# :latest (wrap-review r3: a stale :latest let the cloud e2e gate pass
-# against old source). Fully STUBBED gcloud/docker: this check previously
-# invoked the real toolchain, which on an authenticated machine could
-# really build, push, and execute a cloud job from a test.
-echo "Testing: --cloud targets the HEAD-addressed image (stubbed gcloud/docker)"
+# Check 11: --cloud overrides FRESHELL_E2E_BACKEND=local, and the cloud job is
+# pinned to the DIGEST of the image built from this exact tree — never a tag
+# (Cloud Run resolves a tag only when the execution starts, so a concurrent
+# run could swap it) and never mutable :latest (wrap-review r3: a stale
+# :latest let the cloud e2e gate pass against old source). The build must
+# publish this tree's tag: the commit for a clean tree, the commit plus a
+# content hash otherwise. Fully STUBBED gcloud/docker: this check previously
+# invoked the real toolchain, which on an authenticated machine could really
+# build, push, and execute a cloud job from a test.
+echo "Testing: --cloud pins the digest of this tree's image (stubbed gcloud/docker)"
 STUB_DIR="$(mktemp -d /tmp/e2e-cloud-stubs.XXXXXX)"
 export STUB_CAPTURE="$STUB_DIR/capture"
 mkdir -p "$STUB_CAPTURE"
@@ -165,13 +168,21 @@ cat > "$STUB_DIR/gcloud" <<'STUB'
 args="$*"
 case "$args" in
   "info "*) echo "/nonexistent-sdk-root"; exit 0 ;;
+  "meta list-files-for-upload"*) printf '%s\n' package.json docker/cloud-run/cloudbuild.yaml; exit 0 ;;
+  "builds submit"*) echo "$args" >> "$STUB_CAPTURE/builds.args"; echo stub-build-1; exit 0 ;;
+  "builds list"*) exit 0 ;;
+  "builds describe"*)
+    case "$args" in
+      *buildStepOutputs*) printf '{"results":{"buildStepOutputs":["","%s"]}}\n' "$(printf 'sha256:%064d' 42 | base64 -w0)" ;;
+      *) echo SUCCESS ;;
+    esac
+    exit 0 ;;
   "auth print-access-token"*) echo stub-token; exit 0 ;;
   *"artifacts repositories describe"*) exit 1 ;;
   *"artifacts repositories create"*) exit 0 ;;
   *"artifacts docker images describe"*) echo "$args" >> "$STUB_CAPTURE/describe.args"; exit 1 ;;
   *"run jobs create"*) echo "$args" >> "$STUB_CAPTURE/create.args"; exit 0 ;;
   *"run jobs update"*) echo "$args" >> "$STUB_CAPTURE/update.args"; exit 0 ;;
-  *"builds submit"*) echo "$args" >> "$STUB_CAPTURE/builds.args"; exit 0 ;;
   *"run jobs execute"*) exit 0 ;;
   *"executions list"*) echo "exec-stub"; exit 0 ;;
   *"executions describe"*)
@@ -199,11 +210,11 @@ echo "$*" >> "$STUB_CAPTURE/docker.args"
 exit 0
 STUB
 chmod +x "$STUB_DIR/gcloud" "$STUB_DIR/docker"
-EXPECTED_TAG="$(git rev-parse --short=12 HEAD)"
-if [ -n "$(git status --porcelain)" ]; then
-  EXPECTED_TAG="${EXPECTED_TAG}-dirty"
-fi
-CLOUD_STUB_OUTPUT=$(env PATH="$STUB_DIR:$PATH" FRESHELL_E2E_BACKEND=local "$SCRIPT" run --cloud --project=chromium test/e2e-browser/specs/auth.spec.ts 2>&1) || {
+SHA12="$(git rev-parse --short=12 HEAD)"
+STUB_DIGEST="sha256:$(printf '%064d' 42)"
+CLOUD_STUB_OUTPUT=$(env PATH="$STUB_DIR:$PATH" FRESHELL_E2E_BACKEND=local \
+  FRESHELL_CLOUD_IMAGE_LOCK_DIR="$STUB_DIR/locks" \
+  "$SCRIPT" run --cloud --project=chromium test/e2e-browser/specs/auth.spec.ts 2>&1) || {
   echo "FAIL: stubbed cloud run failed"
   echo "$CLOUD_STUB_OUTPUT" | tail -20
   rm -rf "$STUB_DIR"
@@ -215,46 +226,32 @@ if echo "$CLOUD_STUB_OUTPUT" | grep -q "Running locally"; then
   rm -rf "$STUB_DIR"
   exit 1
 fi
-if ! grep -qE -- "--image=[^ ]+freshell-e2e:${EXPECTED_TAG} " "$STUB_CAPTURE/create.args" 2>/dev/null; then
-  echo "FAIL: cloud job did not target the HEAD-addressed image tag ($EXPECTED_TAG)"
+IMAGE_ARG="$(grep -oE -- '--image=[^ ]+' "$STUB_CAPTURE/create.args" 2>/dev/null | head -1 || true)"
+IMAGE_RE="^--image=[^ ]+/freshell-e2e@${STUB_DIGEST}$"
+if ! [[ "$IMAGE_ARG" =~ $IMAGE_RE ]]; then
+  echo "FAIL: cloud job was not pinned to the digest the build recorded ($STUB_DIGEST)"
   echo "create args: $(cat "$STUB_CAPTURE/create.args" 2>/dev/null || echo '<none>')"
   rm -rf "$STUB_DIR"
   exit 1
 fi
-if grep -q -- "--image=[^ ]*freshell-e2e:latest" "$STUB_CAPTURE/create.args" 2>/dev/null; then
-  echo "FAIL: cloud job targeted mutable :latest (stale-image hazard)"
-  rm -rf "$STUB_DIR"
-  exit 1
+# The build must PUBLISH this tree's tag: the commit for a clean tree, the
+# commit plus the content hash of its snapshot otherwise.
+PUBLISHED_REF="$(grep -oE '_IMAGE=[^ ,]+' "$STUB_CAPTURE/builds.args" 2>/dev/null | head -1 || true)"
+PUBLISHED_TAG="${PUBLISHED_REF##*:}"
+if [ -n "$(git status --porcelain)" ]; then
+  TAG_RE="^${SHA12}-dirty-[0-9a-f]{16}$"
+else
+  TAG_RE="^${SHA12}$"
 fi
-# The HEAD-addressed tag must be PUBLISHED by the build path taken:
-# local-docker (`docker push …:TAG` — `--local-build` leg) or Cloud Build
-# (`gcloud builds submit --substitutions=_IMAGE=…:TAG` — the default).
-if ! { grep -q "push [^ ]*freshell-e2e:${EXPECTED_TAG}" "$STUB_CAPTURE/docker.args" 2>/dev/null \
-     || grep -q "_IMAGE=[^ ]*freshell-e2e:${EXPECTED_TAG}" "$STUB_CAPTURE/builds.args" 2>/dev/null; }; then
-  echo "FAIL: the HEAD-addressed image was never published by the build path"
-  echo "docker args: $(cat "$STUB_CAPTURE/docker.args" 2>/dev/null || echo '<none>')"
+if ! [[ "$PUBLISHED_REF" == _IMAGE=*freshell-e2e:* && "$PUBLISHED_TAG" =~ $TAG_RE ]]; then
+  echo "FAIL: the build did not publish this tree's tag (got '$PUBLISHED_REF', want tag $TAG_RE)"
   echo "builds args: $(cat "$STUB_CAPTURE/builds.args" 2>/dev/null || echo '<none>')"
   rm -rf "$STUB_DIR"
   exit 1
 fi
-# Dirty-tree rule (wrap-review r4): a -dirty tag is not content-addressable,
-# so a dirty run must ALWAYS rebuild — clean-tree runs may skip the build
-# when the HEAD tag already exists remotely, so only the dirty leg can be
-# asserted here. (This suite commonly runs on a dirty tree, making this a
-# live pin in practice.)
-if [ -n "$(git status --porcelain)" ]; then
-  if ! { grep -qE "^build " "$STUB_CAPTURE/docker.args" 2>/dev/null \
-       || grep -qE "^builds submit" "$STUB_CAPTURE/builds.args" 2>/dev/null; }; then
-    echo "FAIL: dirty tree but the cloud path did NOT rebuild the image"
-    echo "docker args: $(cat "$STUB_CAPTURE/docker.args" 2>/dev/null || echo '<none>')"
-    echo "builds args: $(cat "$STUB_CAPTURE/builds.args" 2>/dev/null || echo '<none>')"
-    rm -rf "$STUB_DIR"
-    exit 1
-  fi
-fi
 rm -rf "$STUB_DIR"
 unset STUB_CAPTURE
-echo "PASS: --cloud targets and pushes the HEAD-addressed image tag"
+echo "PASS: --cloud publishes this tree's tag and pins the job to the built digest"
 
 # Check 12: the wrapper works on machines WITHOUT gcloud for non-cloud
 # subcommands. The top-level gcloud-sdk PATH setup must not kill the script
@@ -366,14 +363,18 @@ echo "PASS: split-form value flags are normalized before dispatch"
 STUB2_DIR="$(mktemp -d /tmp/e2e-cloud-stub2.XXXXXX)"
 export STUB2_CAPTURE="$STUB2_DIR/capture"
 mkdir -p "$STUB2_CAPTURE"
+# Keep the wrapper's same-machine image lock inside this check's sandbox.
+export FRESHELL_CLOUD_IMAGE_LOCK_DIR="$STUB2_DIR/locks"
 cat > "$STUB2_DIR/gcloud" <<'STUB2'
 #!/usr/bin/env bash
 echo "$*" >> "$STUB2_CAPTURE/gcloud.args"
 case "$*" in
   "info "*) echo "/nonexistent-sdk-root"; exit 0 ;;
+  # Image lane: a small upload listing and an already-published image.
+  "meta list-files-for-upload"*) printf '%s\n' package.json docker/cloud-run/cloudbuild.yaml; exit 0 ;;
   *"artifacts repositories describe"*) exit 0 ;;
   *"artifacts repositories create"*) exit 0 ;;
-  *"artifacts docker images describe"*) exit 0 ;;
+  *"artifacts docker images describe"*) printf 'sha256:%064d\n' 1; exit 0 ;;
   *"auth print-access-token"*) echo stub-token; exit 0 ;;
   *"builds submit"*) exit 0 ;;
   *"run jobs create"*)

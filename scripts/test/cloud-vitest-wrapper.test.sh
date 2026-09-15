@@ -65,7 +65,14 @@ for i in "$@"; do
   fi
 done
 # More specific patterns first; catch-all run jobs last
+# Image lane: a small upload listing and an already-published image (by
+# digest), so runs reuse it and go straight to the job lifecycle.
+if [[ "$*" == *"meta list-files-for-upload"* ]]; then
+  printf '%s\n' package.json docker/cloud-run/cloudbuild.yaml
+  exit 0
+fi
 if [[ "$*" == *"artifacts docker images describe"* ]]; then
+  printf 'sha256:%064d\n' 1
   exit 0
 fi
 if [[ "$*" == *"artifacts repositories describe"* ]]; then
@@ -105,6 +112,8 @@ chmod +x "$FAKE_GCLOUD_DIR/gcloud"
 export FAKE_GCLOUD_LOG="$FAKE_GCLOUD_DIR/gcloud.log"
 touch "$FAKE_GCLOUD_LOG"
 export PATH="$FAKE_GCLOUD_DIR:$PATH"
+# Keep the wrapper's same-machine image lock inside this suite's sandbox.
+export FRESHELL_CLOUD_IMAGE_LOCK_DIR="$FAKE_GCLOUD_DIR/locks"
 
 CLOUD_OUTPUT=$(bash "$SCRIPT" run --cloud --config=default --shards=2 2>&1 || true)
 check "--cloud calls gcloud (fake)" grep -q 'FAKE_GCLOUD' "$FAKE_GCLOUD_LOG"
@@ -162,7 +171,9 @@ fi
 cat > "$FAKE_GCLOUD_DIR/gcloud" << 'FAKE2'
 #!/usr/bin/env bash
 echo "FAKE_GCLOUD: $@" >> "${FAKE_GCLOUD_LOG:-/dev/null}"
-if [[ "$*" == *"artifacts docker images describe"* ]] || [[ "$*" == *"artifacts repositories describe"* ]] || [[ "$*" == *"builds submit"* ]]; then exit 0; fi
+if [[ "$*" == *"meta list-files-for-upload"* ]]; then printf '%s\n' package.json docker/cloud-run/cloudbuild.yaml; exit 0; fi
+if [[ "$*" == *"artifacts docker images describe"* ]]; then printf 'sha256:%064d\n' 1; exit 0; fi
+if [[ "$*" == *"artifacts repositories describe"* ]] || [[ "$*" == *"builds submit"* ]]; then exit 0; fi
 if [[ "$*" == *"auth print-access-token"* ]]; then echo "fake-token"; exit 0; fi
 if [[ "$*" == *"info"* ]]; then echo "/usr/lib/google-cloud-sdk"; exit 0; fi
 if [[ "$*" == *"logs read"* ]]; then echo "Test Files  1 passed (1)"; exit 0; fi
@@ -199,7 +210,9 @@ check "describe was retried (>=3 describe calls logged)" bash -c "[ \$(grep -c '
 cat > "$FAKE_GCLOUD_DIR/gcloud" << 'FAKE3'
 #!/usr/bin/env bash
 echo "FAKE_GCLOUD: $@" >> "${FAKE_GCLOUD_LOG:-/dev/null}"
-if [[ "$*" == *"artifacts docker images describe"* ]] || [[ "$*" == *"artifacts repositories describe"* ]] || [[ "$*" == *"builds submit"* ]]; then exit 0; fi
+if [[ "$*" == *"meta list-files-for-upload"* ]]; then printf '%s\n' package.json docker/cloud-run/cloudbuild.yaml; exit 0; fi
+if [[ "$*" == *"artifacts docker images describe"* ]]; then printf 'sha256:%064d\n' 1; exit 0; fi
+if [[ "$*" == *"artifacts repositories describe"* ]] || [[ "$*" == *"builds submit"* ]]; then exit 0; fi
 if [[ "$*" == *"auth print-access-token"* ]]; then echo "fake-token"; exit 0; fi
 if [[ "$*" == *"info"* ]]; then echo "/usr/lib/google-cloud-sdk"; exit 0; fi
 if [[ "$*" == *"logs read"* ]]; then echo "Test Files  1 passed (1)"; exit 0; fi
@@ -249,7 +262,9 @@ fi
 cat > "$FAKE_GCLOUD_DIR/gcloud" << 'FAKE4'
 #!/usr/bin/env bash
 echo "FAKE_GCLOUD: $@" >> "${FAKE_GCLOUD_LOG:-/dev/null}"
-if [[ "$*" == *"artifacts docker images describe"* ]] || [[ "$*" == *"artifacts repositories describe"* ]] || [[ "$*" == *"builds submit"* ]]; then exit 0; fi
+if [[ "$*" == *"meta list-files-for-upload"* ]]; then printf '%s\n' package.json docker/cloud-run/cloudbuild.yaml; exit 0; fi
+if [[ "$*" == *"artifacts docker images describe"* ]]; then printf 'sha256:%064d\n' 1; exit 0; fi
+if [[ "$*" == *"artifacts repositories describe"* ]] || [[ "$*" == *"builds submit"* ]]; then exit 0; fi
 if [[ "$*" == *"auth print-access-token"* ]]; then echo "fake-token"; exit 0; fi
 if [[ "$*" == *"info"* ]]; then echo "/usr/lib/google-cloud-sdk"; exit 0; fi
 if [[ "$*" == *"logs read"* ]]; then exit 0; fi
@@ -279,7 +294,9 @@ check "failed run still deletes its own job" bash -c \
 cat > "$FAKE_GCLOUD_DIR/gcloud" << 'FAKE5'
 #!/usr/bin/env bash
 echo "FAKE_GCLOUD: $@" >> "${FAKE_GCLOUD_LOG:-/dev/null}"
-if [[ "$*" == *"artifacts docker images describe"* ]] || [[ "$*" == *"artifacts repositories describe"* ]] || [[ "$*" == *"builds submit"* ]]; then exit 0; fi
+if [[ "$*" == *"meta list-files-for-upload"* ]]; then printf '%s\n' package.json docker/cloud-run/cloudbuild.yaml; exit 0; fi
+if [[ "$*" == *"artifacts docker images describe"* ]]; then printf 'sha256:%064d\n' 1; exit 0; fi
+if [[ "$*" == *"artifacts repositories describe"* ]] || [[ "$*" == *"builds submit"* ]]; then exit 0; fi
 if [[ "$*" == *"auth print-access-token"* ]]; then echo "fake-token"; exit 0; fi
 if [[ "$*" == *"info"* ]]; then echo "/usr/lib/google-cloud-sdk"; exit 0; fi
 if [[ "$*" == *"logs read"* ]]; then echo "Test Files  1 passed (1)"; exit 0; fi
@@ -309,7 +326,9 @@ fi
 cat > "$FAKE_GCLOUD_DIR/gcloud" << 'FAKE6'
 #!/usr/bin/env bash
 echo "FAKE_GCLOUD: $@" >> "${FAKE_GCLOUD_LOG:-/dev/null}"
-if [[ "$*" == *"artifacts docker images describe"* ]] || [[ "$*" == *"artifacts repositories describe"* ]] || [[ "$*" == *"builds submit"* ]]; then exit 0; fi
+if [[ "$*" == *"meta list-files-for-upload"* ]]; then printf '%s\n' package.json docker/cloud-run/cloudbuild.yaml; exit 0; fi
+if [[ "$*" == *"artifacts docker images describe"* ]]; then printf 'sha256:%064d\n' 1; exit 0; fi
+if [[ "$*" == *"artifacts repositories describe"* ]] || [[ "$*" == *"builds submit"* ]]; then exit 0; fi
 if [[ "$*" == *"auth print-access-token"* ]]; then echo "fake-token"; exit 0; fi
 if [[ "$*" == *"info"* ]]; then echo "/usr/lib/google-cloud-sdk"; exit 0; fi
 if [[ "$*" == *"logs read"* ]]; then echo "Test Files  1 passed (1)"; exit 0; fi
@@ -339,7 +358,9 @@ check "id-parse fallback lists executions of THIS run's job only" bash -c \
 cat > "$FAKE_GCLOUD_DIR/gcloud" << 'FAKE7'
 #!/usr/bin/env bash
 echo "FAKE_GCLOUD: $@" >> "${FAKE_GCLOUD_LOG:-/dev/null}"
-if [[ "$*" == *"artifacts docker images describe"* ]] || [[ "$*" == *"artifacts repositories describe"* ]] || [[ "$*" == *"builds submit"* ]]; then exit 0; fi
+if [[ "$*" == *"meta list-files-for-upload"* ]]; then printf '%s\n' package.json docker/cloud-run/cloudbuild.yaml; exit 0; fi
+if [[ "$*" == *"artifacts docker images describe"* ]]; then printf 'sha256:%064d\n' 1; exit 0; fi
+if [[ "$*" == *"artifacts repositories describe"* ]] || [[ "$*" == *"builds submit"* ]]; then exit 0; fi
 if [[ "$*" == *"auth print-access-token"* ]]; then echo "fake-token"; exit 0; fi
 if [[ "$*" == *"info"* ]]; then echo "/usr/lib/google-cloud-sdk"; exit 0; fi
 if [[ "$*" == *"logs read"* ]]; then exit 0; fi

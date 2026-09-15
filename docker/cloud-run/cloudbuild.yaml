@@ -1,3 +1,11 @@
+# Submitted by scripts/lib/cloud-image.sh (scripts/vitest-cloud.sh and
+# scripts/e2e-cloud.sh) with the build-context snapshot as its source.
+# Substitutions:
+#   _IMAGE                  image ref to publish (<repo>:<tag>)
+#   _CACHE_IMAGE            BuildKit registry cache ref
+#   _FRESHELL_BUILD_COMMIT  full commit sha stamped into the artifacts
+# The last step records the pushed image digest as build step output, so the
+# runner pins its Cloud Run job to exactly the image this build produced.
 steps:
   # Create a buildx builder that supports registry cache export.
   # The default docker driver does not support --cache-to type=registry.
@@ -7,7 +15,7 @@ steps:
   # Pull existing cache image for layer caching (exit 0 if not found yet).
   - name: 'gcr.io/cloud-builders/docker'
     entrypoint: 'bash'
-    args: ['-c', 'docker pull ${_IMAGE}-cache || exit 0']
+    args: ['-c', 'docker pull ${_CACHE_IMAGE} || exit 0']
     env:
       - 'DOCKER_BUILDKIT=1'
   # Build with BuildKit + mode=max registry cache to preserve intermediate
@@ -23,13 +31,26 @@ steps:
       - '--build-arg'
       - 'FRESHELL_BUILD_COMMIT=${_FRESHELL_BUILD_COMMIT}'
       - '--cache-from'
-      - 'type=registry,ref=${_IMAGE}-cache'
+      - 'type=registry,ref=${_CACHE_IMAGE}'
       - '--cache-to'
-      - 'type=registry,ref=${_IMAGE}-cache,mode=max'
+      - 'type=registry,ref=${_CACHE_IMAGE},mode=max'
+      - '--metadata-file'
+      - '/workspace/image-metadata.json'
       - '--push'
       - '.'
     env:
       - 'DOCKER_BUILDKIT=1'
+  # Publish the digest buildx pushed (never re-resolved from the mutable tag).
+  - name: 'gcr.io/cloud-builders/docker'
+    entrypoint: 'bash'
+    args:
+      - '-c'
+      - |
+        set -euo pipefail
+        digest="$$(grep -o '"containerimage.digest": *"sha256:[0-9a-f]\{64\}"' /workspace/image-metadata.json | grep -o 'sha256:[0-9a-f]\{64\}')"
+        test -n "$$digest"
+        echo "Pushed ${_IMAGE} as $$digest"
+        printf '%s' "$$digest" > "$$BUILDER_OUTPUT/output"
 options:
   machineType: 'E2_HIGHCPU_32'
   diskSizeGb: 200

@@ -66,7 +66,11 @@ if [[ "$*" == *"executions describe"* ]]; then
 fi
 if [[ "$*" == *"executions list"* ]]; then echo "test-exec-123"; exit 0; fi
 if [[ "$*" == *"logs read"* ]]; then echo "Test Files  1 passed (1)"; exit 0; fi
-if [[ "$*" == *"artifacts docker images describe"* ]] || [[ "$*" == *"artifacts repositories describe"* ]] || [[ "$*" == *"builds submit"* ]]; then exit 0; fi
+# Image lane: a small upload listing and an already-published image (by
+# digest), so these runs reuse it and go straight to the job lifecycle.
+if [[ "$*" == *"meta list-files-for-upload"* ]]; then printf '%s\n' package.json docker/cloud-run/cloudbuild.yaml; exit 0; fi
+if [[ "$*" == *"artifacts docker images describe"* ]]; then printf 'sha256:%064d\n' 1; exit 0; fi
+if [[ "$*" == *"artifacts repositories describe"* ]] || [[ "$*" == *"builds submit"* ]]; then exit 0; fi
 if [[ "$*" == *"auth print-access-token"* ]]; then echo "fake-token"; exit 0; fi
 if [[ "$*" == *"info"* ]]; then echo "/usr/lib/google-cloud-sdk"; exit 0; fi
 if [[ "$*" == *"run jobs"* ]]; then exit 0; fi  # create/update
@@ -74,6 +78,8 @@ exit 0
 FAKE
 chmod +x "$FAKE_DIR/gcloud"
 export PATH="$FAKE_DIR:$PATH"
+# Keep the wrappers' same-machine image lock inside this suite's sandbox.
+export FRESHELL_CLOUD_IMAGE_LOCK_DIR="$FAKE_DIR/locks"
 
 # --- vitest wrapper ---
 rm -f "$FAKE_LOG"; touch "$FAKE_LOG"
