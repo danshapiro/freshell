@@ -28,9 +28,12 @@ Freshell is a self-hosted, browser-accessible terminal multiplexer and session o
 
 ## Test Coordination
 - Broad repo-supported test runs wait for the shared coordinator gate; if another agent holds it, wait rather than kill a foreign holder.
+- The gate protects local CPU/RAM only. With `FRESHELL_VITEST_BACKEND=cloud`, `npm test`, `test:all`, `check`, and `verify` (including `scripts/base-gate.sh`) start the cloud client Vitest phase immediately and run it outside the gate, with its output prefixed `[cloud client]`. They hold the gate only for local work (typecheck/build, source-runtime, Rust, Electron) and release it as soon as that finishes. The client Vitest phase stays gated whenever it runs locally (local backend or `--changed`).
+- A run passes, and records success in `.git/freshell-test-coordinator/`, only if every phase passed, cloud included. The first failure on either side stops the other side's processes; a gate-wait timeout (exit 124) or Ctrl-C/SIGTERM (exit 128+signal) stops the cloud phase too.
+- Local phases share the worktree with the cloud phase, which checks it for uncommitted changes and uploads it to Cloud Build while they run. Local phases must write only paths that are both gitignored and excluded from that upload (`dist/`, `target/`, `node_modules/`, `test-results/`).
 - Pre-worktree green-base checks (and any broad gate intended to validate `origin/main` itself, as opposed to a branch under test) go through `scripts/base-gate.sh` (e.g. `scripts/base-gate.sh test`), which runs the command from a clean scratch worktree at `origin/main`. The main checkout accumulates untracked litter; the cloud runners treat that as a non-addressable `-dirty` image and pay a ~13 min cold rebuild every time, whereas a clean worktree uses the content-addressed commit tag — built at most once per commit and shared by every later run.
 - Set `FRESHELL_TEST_SUMMARY` when you want holder/status output to show a human-meaningful reason for a broad run.
-- Use `npm run test:status` to inspect the current holder, recent results, and any advisory reusable baseline.
+- Use `npm run test:status` to inspect the current holder, in-flight ungated cloud phases (`ungated-run:` lines), recent results, and any advisory reusable baseline.
 - Use `npm run test:vitest -- ...` for a repo-owned direct Vitest path. Raw `npx vitest` is not a coordinated workflow.
 - `test:unit` is the exact default-config `test/unit` workload, `test:integration` runs Rust workspace integration tests, and `test:server` is the Cargo-backed Rust `freshell-server` lane. Zero-argument and explicit broad `--run` server/integration invocations are coordinated; narrowed Cargo selectors are delegated.
 - Ambient proxy vars (`HTTP(S)_PROXY`, either case) and `FRESHELL_BIND_HOST` are stripped by `config/vitest/sanitize-test-env.ts` at Vitest config load, including source-runtime and packaged-runtime lanes. The exact `FRESHELL_RUN_REAL_PROVIDER_CONTRACTS=1` escape hatch preserves proxy egress but still removes `FRESHELL_BIND_HOST`.
@@ -148,7 +151,7 @@ npm test                    # Coordinated client, Rust, and Electron suite
 npm run check               # Typecheck, then coordinated full suite
 npm run verify              # Build, then coordinated full suite
 npm run test:coverage       # Coordinated default-config coverage run
-npm run test:status         # Show active holder, latest results, and advisory baseline info
+npm run test:status         # Show active holder, ungated cloud phases, latest results, and advisory baseline info
 npm run test:vitest -- ...  # Repo-owned direct Vitest path for focused passthrough work
 ```
 

@@ -16,12 +16,15 @@
 | `npm run test:integration` | Exact Rust workspace integration-test workload |
 | `npm run test:server` | Cargo-backed Rust `freshell-server` tests; only coordinates explicit broad `--run` |
 | `npm run test:coverage` | Exact default-config `vitest run --coverage` workload |
-| `npm run test:status` | Show the current holder, latest results, and any matching advisory baseline |
+| `npm run test:status` | Show the current holder, in-flight ungated cloud phases, latest results, and any matching advisory baseline |
 | `npm run test:vitest -- ...` | Repo-owned direct Vitest path for focused passthrough work |
 
 ## Coordination Rules
 
 - Broad repo-supported runs wait instead of failing fast when another coordinated run is active.
+- The gate covers local work only. With `FRESHELL_VITEST_BACKEND=cloud`, the full-suite commands (`npm test`, `test:all`, `check`, `verify`) start the cloud client Vitest phase right away, outside the gate, and take the gate only for typecheck/build, source-runtime, Rust, and Electron. Cloud output is prefixed `[cloud client]`, and `test:status` lists it as an `ungated-run`.
+- The run passes only if every phase passes. The first failure on either side stops the other; a gate-wait timeout exits 124, and Ctrl-C/SIGTERM exits 128+signal after stopping every phase's processes.
+- Because the cloud phase uploads the worktree while local phases build, local phases may write only paths that git ignores and Cloud Build does not upload (`dist/`, `target/`, `node_modules/`, `test-results/`).
 - `test:unit` is the exact default-config `test/unit` workload.
 - `test:integration` runs the Rust workspace integration tests.
 - `test:server` runs the Cargo-backed Rust `freshell-server` crate. Zero-argument and explicit broad `--run` invocations are coordinated; narrowed Cargo selectors are delegated.
