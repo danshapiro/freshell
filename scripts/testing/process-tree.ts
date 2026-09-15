@@ -1,4 +1,5 @@
 import { spawnSync } from 'node:child_process'
+import fs from 'node:fs'
 
 export interface ProcessRecord {
   pid: number
@@ -159,4 +160,51 @@ export function readProcessSnapshot(
     throw new Error(`could not read POSIX process table: ${result.error?.message ?? result.stderr ?? `exit ${result.status}`}`)
   }
   return parsePosixSnapshot(result.stdout ?? '')
+}
+
+/** True while `pid` names a live process that has not exited (zombies count as exited). */
+export function isProcessRunning(pid: number): boolean {
+  try {
+    process.kill(pid, 0)
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === 'EPERM'
+  }
+
+  // An exited child still answers signal 0 until it is reaped; a container
+  // whose pid 1 never reaps would otherwise report stopped phases as alive.
+  try {
+    const stat = fs.readFileSync(`/proc/${pid}/stat`, 'utf8')
+    const state = stat.slice(stat.lastIndexOf(')') + 2).charAt(0)
+    return state !== 'Z' && state !== 'X'
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code !== 'ENOENT'
+  }
+}
+
+/**
+ * Send `signal` to a process and every descendant visible right now, the way
+ * a terminal interrupt reaches a whole foreground job. Returns the signalled
+ * pids (root first) so callers can confirm that none of them survive.
+ */
+export function signalProcessTree(
+  rootPid: number,
+  signal: NodeJS.Signals,
+  platform: NodeJS.Platform = process.platform,
+  snapshot: (platform: NodeJS.Platform) => ProcessRecord[] = readProcessSnapshot,
+): number[] {
+  let pids = [rootPid]
+  try {
+    pids = [rootPid, ...descendantPids(rootPid, snapshot(platform))]
+  } catch {
+    // Without a readable process table, still signal the root.
+  }
+
+  for (const pid of pids) {
+    try {
+      process.kill(pid, signal)
+    } catch {
+      // Already exited.
+    }
+  }
+  return pids
 }
