@@ -113,6 +113,10 @@ regex = "1"
 libc = "0.2"
 
 [dev-dependencies]
+# `test-util` unlocks `#[tokio::test(start_paused = true)]`, so the settings
+# freshness-reload throttle test (`settings_store.rs`) runs on a paused clock
+# instead of racing real time under a loaded parallel test run.
+tokio = { version = "1", features = ["test-util"] }
 # `ServiceExt::oneshot` for in-process axum router handler tests (`sessions.rs`).
 tower = { version = "0.5", features = ["util"] }
 # Isolated temp dirs for `session_metadata.rs`'s store round-trip tests.
