@@ -826,39 +826,88 @@ where
     }
 }
 
-/// Thread-local capture. `#[tokio::test]` is a current-thread runtime, so the
-/// in-process server's reconcile task (tokio::spawn'd by the accept loop) is
-/// polled on THIS thread and observes the guard — the
-/// `diag01_lifecycle_events.rs` convention.
-fn log_capture() -> (
-    Arc<Mutex<Vec<CapturedEvent>>>,
-    tracing::subscriber::DefaultGuard,
-) {
-    let events = Arc::new(Mutex::new(Vec::new()));
-    let layer = LogCapture {
-        events: Arc::clone(&events),
-    };
-    let subscriber = tracing_subscriber::registry().with(layer);
-    let guard = tracing::subscriber::set_default(subscriber);
-    (events, guard)
+/// Process-wide capture, installed once for this whole test binary.
+///
+/// Do not replace this with a thread-local `set_default` capture: that is
+/// order-dependent. tracing-core caches each callsite's `Interest` for the
+/// whole process the first time the callsite is hit, and while only one
+/// dispatcher exists it asks only the REGISTERING thread's default
+/// dispatcher (tracing-core `callsite.rs`, `Rebuilder::JustOne`). When a
+/// sibling dead-verdict test with no subscriber reaches the WARN first, the
+/// callsite is cached as `Interest::never` and the event is skipped on every
+/// thread, so the capture receives nothing. A global default is what every
+/// thread sees, so the cached interest is right whoever registers first.
+///
+/// Every event in the binary lands in the shared vec: reads MUST filter by a
+/// per-test-unique field, never by message alone.
+fn log_capture() -> Arc<Mutex<Vec<CapturedEvent>>> {
+    static EVENTS: std::sync::OnceLock<Arc<Mutex<Vec<CapturedEvent>>>> = std::sync::OnceLock::new();
+    Arc::clone(EVENTS.get_or_init(|| {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let layer = LogCapture {
+            events: Arc::clone(&events),
+        };
+        let subscriber = tracing_subscriber::registry().with(layer);
+        // This binary installs no other global subscriber; a second
+        // installer panics here instead of silently capturing nothing.
+        tracing::subscriber::set_global_default(subscriber)
+            .expect("this test binary installs exactly one global subscriber");
+        events
+    }))
 }
 
-#[tokio::test]
-async fn dead_session_verdict_is_warn_logged_with_claimed_identity() {
-    let (events, _guard) = log_capture();
-    let probe = std::sync::Arc::new(StubProbe::default());
-    // GoneObserved: ledger-observed before, Absent now.
-    probe
-        .answers
-        .lock()
-        .unwrap()
-        .insert(("codex".into(), "gone-1".into()), SessionExistence::Absent);
+/// A probe answering GoneObserved (ledger-observed before, Absent now) for
+/// `codex`/`session_id` -- the `dead_session` / `session_not_on_disk` path.
+fn gone_observed_probe(session_id: &str) -> Arc<StubProbe> {
+    let probe = Arc::new(StubProbe::default());
+    probe.answers.lock().unwrap().insert(
+        ("codex".into(), session_id.into()),
+        SessionExistence::Absent,
+    );
     probe
         .observed
         .lock()
         .unwrap()
-        .insert(("codex".into(), "gone-1".into()));
-    let server = spawn_server_with_probe(probe).await;
+        .insert(("codex".into(), session_id.into()));
+    probe
+}
+
+/// Drive a `dead_session` verdict to completion on a SEPARATE OS thread that
+/// has no subscriber of its own -- exactly what a sibling dead-verdict test
+/// in this binary does when libtest runs it in parallel. That thread is the
+/// first to reach the `pane_reconcile.dead_session` WARN callsite, so it is
+/// the one that registers it.
+fn register_dead_session_callsite_from_uncaptured_thread() {
+    std::thread::spawn(|| {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("uncaptured-thread runtime")
+            .block_on(async {
+                let server = spawn_server_with_probe(gone_observed_probe("gone-uncaptured")).await;
+                let (mut ws, _ready) = connect(&server.url, true, true).await;
+                let verdicts = reconcile_request(
+                    &mut ws,
+                    serde_json::json!([
+                        { "paneKey": "uncaptured-pane", "kind": "fresh-agent",
+                          "sessionRef": {"provider": "codex", "sessionId": "gone-uncaptured"} }
+                    ]),
+                )
+                .await;
+                assert_eq!(verdicts[0]["verdict"], "dead_session");
+            });
+    })
+    .join()
+    .expect("uncaptured-thread dead_session reconcile");
+}
+
+#[tokio::test]
+async fn dead_session_verdict_is_warn_logged_with_claimed_identity() {
+    let events = log_capture();
+    // Worst-case scheduling, forced: the WARN callsite is registered by a
+    // thread outside this test before this test emits through it.
+    register_dead_session_callsite_from_uncaptured_thread();
+    let server = spawn_server_with_probe(gone_observed_probe("gone-1")).await;
     let (mut ws, _ready) = connect(&server.url, true, true).await;
     let verdicts = reconcile_request(
         &mut ws,
@@ -871,29 +920,23 @@ async fn dead_session_verdict_is_warn_logged_with_claimed_identity() {
     assert_eq!(verdicts[0]["verdict"], "dead_session");
     assert_eq!(verdicts[0]["reason"], "session_not_on_disk");
 
-    // The WARN is emitted before the response frame is sent, but under CI
-    // contention the tracing layer's push can lag the client's read by a
-    // scheduling quantum. Bounded-poll the capture instead of asserting
-    // immediately so the test is resilient to that lag without masking a
-    // genuinely missing log (a 5s budget on a current-thread runtime).
-    let hits = tokio::time::timeout(std::time::Duration::from_secs(5), async {
-        loop {
-            let hits: Vec<CapturedEvent> = {
-                let events = events.lock().expect("capture lock");
-                events
-                    .iter()
-                    .filter(|e| e.message.contains("pane_reconcile.dead_session"))
-                    .cloned()
-                    .collect()
-            };
-            if hits.len() == 1 {
-                return hits;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        }
-    })
-    .await
-    .expect("dead_session WARN was not captured within 5s");
+    // No wait needed: the server emits the WARN synchronously, in the same
+    // handler, BEFORE it sends the result frame, and the global capture layer
+    // records it inside that emit. By the time the client holds the frame the
+    // event is already in the vec. (Missing WARNs previously blamed on "lag"
+    // were the cached-`Interest::never` race documented on `log_capture`.)
+    // Filter by this test's unique pane key: sibling tests' dead-verdict WARNs
+    // land in the same global vec.
+    let hits: Vec<CapturedEvent> = events
+        .lock()
+        .expect("capture lock")
+        .iter()
+        .filter(|e| {
+            e.message.contains("pane_reconcile.dead_session")
+                && e.fields.get("pane_key").map(String::as_str) == Some("deadpane")
+        })
+        .cloned()
+        .collect();
     assert_eq!(
         hits.len(),
         1,
