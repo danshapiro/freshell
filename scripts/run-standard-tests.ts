@@ -5,6 +5,12 @@ import { createRequire } from 'node:module'
 import { availableParallelism, constants as osConstants, setPriority } from 'node:os'
 import { dirname, resolve } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
+import {
+  hasGitDependentSelectors,
+  isCloudVitestBackend,
+  resolveCloudVitestCommand,
+  type EnvironmentLike,
+} from './testing/cloud-vitest-lane.js'
 import { resolveNpmCommand } from './testing/coordinator-upstream.js'
 
 const SCRIPT_DIR = dirname(fileURLToPath(import.meta.url))
@@ -16,7 +22,8 @@ const ELECTRON_VITEST_CONFIG = 'config/vitest/vitest.electron.config.ts'
 const ELECTRON_RUNTIME_VITEST_CONFIG = 'config/vitest/vitest.electron-runtime.config.ts'
 
 export type StandardTestMode = 'desktop' | 'aggressive'
-export type SuiteName = 'client' | 'source-runtime' | 'rust' | 'electron' | 'electron-runtime'
+export const SUITE_NAMES = ['client', 'source-runtime', 'rust', 'electron', 'electron-runtime'] as const
+export type SuiteName = typeof SUITE_NAMES[number]
 export type RunPriority = 'normal' | 'background'
 
 export interface StandardTestRun {
@@ -38,6 +45,24 @@ interface CreatePlanInput {
   ci: boolean
   mode?: StandardTestMode
   forwardedArgs: string[]
+  /** Suites another runner owns (the coordinator runs the cloud client lane itself). */
+  skipSuites?: readonly SuiteName[]
+}
+
+export interface StandardTestCliArgs {
+  mode?: StandardTestMode
+  skipSuites: SuiteName[]
+  forwardedArgs: string[]
+}
+
+export interface StandardTestExecution {
+  plan: StandardTestPlan
+  forwardedArgs: string[]
+  /** Set when the client lane runs on Cloud Run Jobs instead of locally. */
+  cloudClient?: { command: string; args: string[] }
+  localStages: StandardTestRun[][]
+  /** The cloud backend was requested but git-dependent selectors forced every lane local. */
+  gitDependentCloudFallback: boolean
 }
 
 interface DesktopWorkerPlan {
@@ -132,8 +157,7 @@ function detectRequestedSuites(forwardedArgs: string[]): SuiteName[] | null {
     if (suite) suites.add(suite)
   }
   if (suites.size === 0) return null
-  return ['client', 'source-runtime', 'rust', 'electron', 'electron-runtime']
-    .filter((suite): suite is SuiteName => suites.has(suite))
+  return SUITE_NAMES.filter((suite) => suites.has(suite))
 }
 
 function buildRuns(
@@ -185,21 +209,24 @@ export function createStandardTestPlan({
   ci,
   mode,
   forwardedArgs,
+  skipSuites = [],
 }: CreatePlanInput): StandardTestPlan {
   const resolvedMode = mode ?? (ci ? 'aggressive' : 'desktop')
   const requestedSuites = detectRequestedSuites(forwardedArgs)
   const workers = resolveDesktopWorkerPlan(cpuCount)
   const runs = buildRuns(resolvedMode, workers, requestedSuites?.includes('electron-runtime') ?? false)
-  const selectedRuns = requestedSuites
+  const selectedRuns = (requestedSuites
     ? runs.filter((run) => requestedSuites.includes(run.name))
-    : runs
+    : runs)
+    .filter((run) => !skipSuites.includes(run.name))
 
   // Each phase owns its prerequisites and artifacts. The source-runtime
   // wrapper begins with npm run prebuild, so the broad check/verify path keeps
   // the same live-server build guard as a direct source-runtime invocation.
   // Keeping the phases in order also prevents a source-runtime build and Cargo
-  // from racing over the same target/dist directories while retaining one
-  // coordinator gate for the full suite.
+  // from racing over the same target/dist directories while one coordinator
+  // gate covers every local phase. (With the cloud backend, the coordinator
+  // runs the client lane outside the gate and passes --skip-suite=client.)
   return {
     mode: resolvedMode,
     stages: selectedRuns.map((run) => [run]),
@@ -300,72 +327,83 @@ async function runStage(stage: StandardTestRun[], forwardedArgs: string[]): Prom
   })
 }
 
-function selectedSuites(forwardedArgs: string[]): Set<SuiteName> | null {
-  const requested = detectRequestedSuites(forwardedArgs)
-  return requested ? new Set(requested) : null
+export function resolveStandardTestExecution(input: {
+  argv: readonly string[]
+  env: EnvironmentLike
+  availableParallelism: number
+  ci: boolean
+}): StandardTestExecution {
+  const { mode, skipSuites, forwardedArgs } = parseStandardTestCliArgs(input.argv)
+  const plan = createStandardTestPlan({
+    availableParallelism: input.availableParallelism,
+    ci: input.ci,
+    mode,
+    forwardedArgs,
+    skipSuites,
+  })
+  const local = (gitDependentCloudFallback: boolean): StandardTestExecution => ({
+    plan,
+    forwardedArgs,
+    localStages: plan.stages,
+    gitDependentCloudFallback,
+  })
+
+  const runsClientLane = plan.stages.some((stage) => stage.some((run) => run.name === 'client'))
+  if (!runsClientLane || !isCloudVitestBackend(input.env)) return local(false)
+  if (hasGitDependentSelectors(forwardedArgs)) return local(true)
+
+  return {
+    plan,
+    forwardedArgs,
+    cloudClient: resolveCloudVitestCommand(forwardedArgs, input.env),
+    localStages: plan.stages.filter((stage) => !stage.some((run) => run.name === 'client')),
+    gitDependentCloudFallback: false,
+  }
 }
 
 export async function main(argv: string[] = process.argv.slice(2)): Promise<number> {
-  const { mode, forwardedArgs } = parseCliArgs(argv)
-  const requested = selectedSuites(forwardedArgs)
+  const cpuCount = availableParallelism()
+  const execution = resolveStandardTestExecution({
+    argv,
+    env: process.env,
+    availableParallelism: cpuCount,
+    ci: process.env.CI === 'true' || process.env.CI === '1',
+  })
+  const { plan, forwardedArgs, cloudClient, localStages } = execution
 
-  // Cloud Vitest owns only the retained default client/tooling lane. The
-  // source-runtime and Cargo phases still run locally because they need the
-  // built Rust artifact and a real process filesystem.
-  if (process.env.FRESHELL_VITEST_BACKEND === 'cloud' && (!requested || requested.has('client'))) {
-    const hasGitDependentArgs = forwardedArgs.some((arg) => arg === '--changed' || arg.startsWith('--changed='))
-    if (hasGitDependentArgs) {
-      log('warn', 'Git-dependent selectors detected; running all phases locally', { forwardedArgs })
-    } else {
-      const cloudScript = process.env.FRESHELL_VITEST_CLOUD_SCRIPT || resolve(PROJECT_ROOT, 'scripts/vitest-cloud.sh')
-      log('info', 'Dispatching default Vitest phase to cloud', { cloudScript, forwardedArgs })
-      try {
-        execFileSync(cloudScript, ['run', '--cloud', '--config=default', ...forwardedArgs], {
-          stdio: 'inherit',
-          cwd: PROJECT_ROOT,
-          env: process.env,
-        })
-      } catch {
-        return 1
-      }
-
-      const plan = createStandardTestPlan({
-        availableParallelism: availableParallelism(),
-        ci: process.env.CI === 'true' || process.env.CI === '1',
-        mode,
-        forwardedArgs,
-      })
-      const localStages = plan.stages.filter((entry) => entry[0]?.name !== 'client')
-      log('info', 'Cloud default phase complete; running local phases', {
-        phases: localStages.map((stage) => stage[0]?.name).filter((name): name is SuiteName => Boolean(name)),
-      })
-      try {
-        for (const stage of localStages) {
-          await runStage(stage, forwardedArgs)
-        }
-        return 0
-      } catch (error) {
-        log('error', 'Standard test run failed', { error: error instanceof Error ? error.message : String(error) })
-        return 1
-      }
-    }
+  if (plan.stages.length === 0) {
+    log('error', 'No test phases selected; refusing a vacuous run', { argv })
+    return 2
+  }
+  if (execution.gitDependentCloudFallback) {
+    log('warn', 'Git-dependent selectors detected; running all phases locally', { forwardedArgs })
   }
 
-  const plan = createStandardTestPlan({
-    availableParallelism: availableParallelism(),
-    ci: process.env.CI === 'true' || process.env.CI === '1',
-    mode,
-    forwardedArgs,
-  })
-  log('info', 'Resolved standard test plan', {
-    mode: plan.mode,
-    availableParallelism: availableParallelism(),
-    stages: plan.stages,
-    forwardedArgs,
-  })
+  if (cloudClient) {
+    log('info', 'Dispatching default Vitest phase to cloud', { cloudScript: cloudClient.command, forwardedArgs })
+    try {
+      execFileSync(cloudClient.command, cloudClient.args, {
+        stdio: 'inherit',
+        cwd: PROJECT_ROOT,
+        env: process.env,
+      })
+    } catch {
+      return 1
+    }
+    log('info', 'Cloud default phase complete; running local phases', {
+      phases: localStages.map((stage) => stage[0]?.name).filter((name): name is SuiteName => Boolean(name)),
+    })
+  } else {
+    log('info', 'Resolved standard test plan', {
+      mode: plan.mode,
+      availableParallelism: cpuCount,
+      stages: localStages,
+      forwardedArgs,
+    })
+  }
 
   try {
-    for (const stage of plan.stages) await runStage(stage, forwardedArgs)
+    for (const stage of localStages) await runStage(stage, forwardedArgs)
     return 0
   } catch (error) {
     log('error', 'Standard test run failed', {
@@ -375,8 +413,9 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
   }
 }
 
-function parseCliArgs(argv: string[]): { mode?: StandardTestMode; forwardedArgs: string[] } {
+export function parseStandardTestCliArgs(argv: readonly string[]): StandardTestCliArgs {
   const forwardedArgs: string[] = []
+  const skipSuites: SuiteName[] = []
   let mode: StandardTestMode | undefined
   for (let index = 0; index < argv.length; index += 1) {
     const arg = argv[index]
@@ -395,13 +434,30 @@ function parseCliArgs(argv: string[]): { mode?: StandardTestMode; forwardedArgs:
         continue
       }
     }
+    if (arg === '--skip-suite' || arg.startsWith('--skip-suite=')) {
+      const value = arg === '--skip-suite' ? argv[++index] : arg.slice('--skip-suite='.length)
+      if (!isSuiteName(value)) {
+        throw new Error(`Unknown --skip-suite value "${value ?? ''}". Valid suites: ${SUITE_NAMES.join(', ')}`)
+      }
+      skipSuites.push(value)
+      continue
+    }
     forwardedArgs.push(arg)
   }
-  return { mode, forwardedArgs }
+  return { mode, skipSuites, forwardedArgs }
+}
+
+function isSuiteName(value: string | undefined): value is SuiteName {
+  return (SUITE_NAMES as readonly string[]).includes(value ?? '')
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
   main().then((code) => {
     process.exitCode = code
+  }).catch((error: unknown) => {
+    log('error', 'Standard test runner failed to start', {
+      error: error instanceof Error ? error.message : String(error),
+    })
+    process.exitCode = 1
   })
 }

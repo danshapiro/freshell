@@ -3,8 +3,10 @@ import { describe, expect, it } from 'vitest'
 import {
   buildVitestArgs,
   createStandardTestPlan,
+  parseStandardTestCliArgs,
   resolveDesktopWorkerPlan,
   resolvePriorityValue,
+  resolveStandardTestExecution,
 } from '../../../scripts/run-standard-tests.js'
 import { buildSourceRuntimePhases } from '../../../scripts/testing/run-source-runtime-tests.js'
 
@@ -135,6 +137,66 @@ describe('run-standard-tests', () => {
         ci: false,
         forwardedArgs: ['/home/user/code/freshell/test/server/ws-protocol.test.ts'],
       }).stages.flat().map((run) => run.name)).toEqual(['rust'])
+    })
+  })
+
+  describe('parseStandardTestCliArgs', () => {
+    it('strips runner-only mode and skip-suite flags from the forwarded arguments', () => {
+      expect(parseStandardTestCliArgs(['--mode', 'aggressive', '--skip-suite=client', '-t', 'prebuild', '--skip-suite', 'electron'])).toEqual({
+        mode: 'aggressive',
+        skipSuites: ['client', 'electron'],
+        forwardedArgs: ['-t', 'prebuild'],
+      })
+    })
+
+    it('rejects an unknown suite name instead of silently running it', () => {
+      expect(() => parseStandardTestCliArgs(['--skip-suite=clients'])).toThrow(/clients/)
+    })
+  })
+
+  describe('resolveStandardTestExecution', () => {
+    const stageNames = (stages: Array<Array<{ name: string }>>) => stages.map((stage) => stage[0]?.name)
+    const base = { availableParallelism: 32, ci: false }
+
+    it('dispatches the client lane to the cloud script and keeps the other lanes local', () => {
+      const execution = resolveStandardTestExecution({ ...base, argv: [], env: { FRESHELL_VITEST_BACKEND: 'cloud' } })
+      expect(execution.cloudClient).toEqual({
+        command: expect.stringMatching(/scripts[\\/]vitest-cloud\.sh$/),
+        args: ['run', '--cloud', '--config=default'],
+      })
+      expect(stageNames(execution.localStages)).toEqual(['source-runtime', 'rust', 'electron'])
+    })
+
+    it('honors an injected cloud script and forwards Vitest arguments without runner-only flags', () => {
+      const execution = resolveStandardTestExecution({
+        ...base,
+        argv: ['--mode=aggressive', '-t', 'prebuild'],
+        env: { FRESHELL_VITEST_BACKEND: 'cloud', FRESHELL_VITEST_CLOUD_SCRIPT: '/fake/cloud.sh' },
+      })
+      expect(execution.cloudClient).toEqual({
+        command: '/fake/cloud.sh',
+        args: ['run', '--cloud', '--config=default', '-t', 'prebuild'],
+      })
+    })
+
+    it('neither dispatches nor runs the client lane when the coordinator owns it', () => {
+      const execution = resolveStandardTestExecution({ ...base, argv: ['--skip-suite=client'], env: { FRESHELL_VITEST_BACKEND: 'cloud' } })
+      expect(execution.cloudClient).toBeUndefined()
+      expect(stageNames(execution.localStages)).toEqual(['source-runtime', 'rust', 'electron'])
+    })
+
+    it('runs every lane locally for git-dependent selectors and reports the fallback', () => {
+      const execution = resolveStandardTestExecution({ ...base, argv: ['--changed'], env: { FRESHELL_VITEST_BACKEND: 'cloud' } })
+      expect(execution.cloudClient).toBeUndefined()
+      expect(execution.gitDependentCloudFallback).toBe(true)
+      expect(stageNames(execution.localStages)).toEqual(['client', 'source-runtime', 'rust', 'electron'])
+    })
+
+    it('runs every lane locally with the local backend', () => {
+      const execution = resolveStandardTestExecution({ ...base, argv: [], env: {} })
+      expect(execution.cloudClient).toBeUndefined()
+      expect(execution.gitDependentCloudFallback).toBe(false)
+      expect(stageNames(execution.localStages)).toEqual(['client', 'source-runtime', 'rust', 'electron'])
     })
   })
 
