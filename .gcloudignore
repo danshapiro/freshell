@@ -1,3 +1,10 @@
+# Never upload anything git ignores: gitignored build outputs and local litter
+# (release/, .verify-vantages.env, agent scratch) must not reach Cloud Build,
+# and the cloud runners' commit-tagged images must contain exactly what a
+# clean checkout of that commit contains. Included FIRST so every `!`
+# re-include below still wins (last matching pattern decides).
+#!include:.gitignore
+
 # Build artifacts (rebuilt in Docker — never copy from host)
 node_modules/
 dist/
