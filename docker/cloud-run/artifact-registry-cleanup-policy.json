@@ -1,0 +1,19 @@
+[
+  {
+    "name": "delete-test-images-older-than-1d",
+    "action": {"type": "Delete"},
+    "condition": {
+      "tagState": "any",
+      "packageNamePrefixes": ["freshell-e2e"],
+      "olderThan": "1d"
+    }
+  },
+  {
+    "name": "keep-12-most-recent-test-image-versions",
+    "action": {"type": "Keep"},
+    "mostRecentVersions": {
+      "packageNamePrefixes": ["freshell-e2e"],
+      "keepCount": 12
+    }
+  }
+]

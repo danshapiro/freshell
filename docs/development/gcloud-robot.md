@@ -187,7 +187,7 @@ account (export it). All skill scripts are invoked via
    GCLOUD_ROBOT_KEY_FILE=<key path printed by bootstrap> \
    bash "$GCLOUD_ROBOT_HOME/scripts/verify-as-robot.sh" \
      --probe "gcloud artifacts repositories describe freshell-e2e --location=us-west1 --project=misc-puttering-project" \
-     --probe "gcloud artifacts docker images describe us-west1-docker.pkg.dev/misc-puttering-project/freshell-e2e/freshell-e2e:latest --project=misc-puttering-project" \
+     --probe "gcloud artifacts docker images list us-west1-docker.pkg.dev/misc-puttering-project/freshell-e2e/freshell-e2e --include-tags --sort-by=~UPDATE_TIME --limit=1 --project=misc-puttering-project" \
      --probe "gcloud run jobs list --region=us-west1 --project=misc-puttering-project --limit=1" \
      --probe "gcloud builds list --project=misc-puttering-project --limit=1"
    ```
