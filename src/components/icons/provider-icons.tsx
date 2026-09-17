@@ -99,23 +99,29 @@ export function AmplifierIcon(props: IconProps) {
 }
 
 // Fresh* agent icons — the seedling badge family. Every fresh agent keeps its
-// source CLI mark at full strength and gains the same seedling planted in a
-// soil mound at the mark's lower-right corner, rendered at half strength (the
-// icon set's existing grey, same tone as the opencode mark's inner square) so
-// the badge stays monochrome yet visibly its own layer. A knockout mask cuts
-// a thin gap in the mark around the seedling, so the grey reads in front of
-// the mark instead of merging into it — on any background, since the gap is
-// true transparency rather than a background-colored stroke.
+// source CLI mark at EXACTLY the same rendered size as the plain provider
+// icon (the mark group fills the 24-unit box the way the native viewBox
+// does), and gains the same seedling planted in a soil mound anchored in the
+// icon's lower-right corner. The seedling draws at full strength — the
+// half-strength grey variant was too faint in dark mode — and a knockout
+// mask cuts a gap in the mark around the seedling's leaves and upper stem so
+// the badge reads as its own layer in front of the mark on any background.
+// Below the root line (y=16.05) the mask turns white: the seedling's lower
+// stem and mound UNION with the mark instead of cutting it, so the knockout
+// can never sever floating fragments out of legs, bands, or lattice ends.
 
 // Seedling geometry in a local 24-unit box, stem base at (12, 9.3):
 // two leaves (y 4.2–6.4), a tapering stem (y 5.4–9.3), and a soil mound
-// ellipse (cy 9.85). The mask uses only stem+leaves — the mound unions with
-// the mark so the seedling stays planted at the corner.
+// ellipse (cy 9.85). The mask uses only stem+leaves — the mound always
+// unions with the mark so the seedling stays planted at the corner.
 const SPROUT_CUT_PATHS = [
   'M11.5 9.3C11.55 7.3 11.65 6.5 12 5.4C12.35 6.5 12.45 7.3 12.5 9.3Z',
   'M12 6.4C10.7 6.5 9.6 5.6 9.4 4.2C10.7 4.1 11.9 5 12 6.4Z',
   'M12 6.4C13.3 6.5 14.4 5.6 14.6 4.2C13.3 4.1 12.1 5 12 6.4Z',
 ] as const
+
+/** Below this y the knockout stops: the mark stays visible and the seedling roots into it. */
+const SPROUT_ROOT_LINE = 16.05
 
 const CLAUDE_MARK_PATH = 'M616.9,649.5h-209.7c0,0,0,104.7,0,104.7h-56.6c0,0,.2-104.5.2-104.5h-48.6s.2,104.5.2,104.5h-56.7c0,0,.2-104.4.2-104.4l-48.6-.7v-96.4c.1,0-104.8,0-104.8,0v-104.9s104.9,0,104.9,0v-201.6c0,0,628.9,0,628.9,0v201.6c0,0,104.9,0,104.9,0v104.9s-104.9,0-104.9,0v96.6c.1,0-56.5.4-56.5.4l.2,104.5h-48.6s.2-104.6.2-104.6h-56.6s.2,104.6.2,104.6h-48.6s.2-104.6.2-104.6ZM351.1,447.5l-.5-96.4h-48.4c0,0,0,96.6,0,96.6l48.8-.2ZM722,447.7l-.4-96.7h-56.5c0,0,0,96.8,0,96.8h56.9Z'
 
@@ -127,8 +133,8 @@ const OPENCODE_MARK_PATHS = [
 ] as const
 
 /**
- * Shared two-tone fresh* icon body: `mark` is the untouched source mark, and
- * the seedling is stamped at `sproutTransform` (local 24-unit coordinates).
+ * Shared fresh* icon body: `mark` is the untouched source mark, and the
+ * seedling is stamped at `sproutTransform` (local 24-unit coordinates).
  * The mask id is instance-unique (useId) so simultaneous renders — tab bar,
  * picker, headers, the deck serializer — never cross-reference each other's
  * masks.
@@ -144,12 +150,15 @@ function FreshAgentMarkIcon({ mark, sproutTransform, ...props }: IconProps & { m
     >
       <mask id={maskId} maskUnits="userSpaceOnUse" x="-2" y="-2" width="28" height="28">
         <rect x="-2" y="-2" width="28" height="28" fill="white" />
-        <g transform={sproutTransform} fill="black" stroke="black" strokeWidth="1.2" strokeLinejoin="round">
+        <g transform={sproutTransform} fill="black" stroke="black" strokeWidth="1.5" strokeLinejoin="round">
           {SPROUT_CUT_PATHS.map((d) => <path key={d} d={d} />)}
         </g>
+        {/* Root line: below it the mark stays visible, so the seedling roots
+            into the mark instead of cutting fragments out of it. */}
+        <rect x="-2" y={SPROUT_ROOT_LINE} width="28" height="12" fill="white" />
       </mask>
       <g mask={`url(#${maskId})`}>{mark}</g>
-      <g transform={sproutTransform} fill="currentColor" fillOpacity="0.5">
+      <g transform={sproutTransform} fill="currentColor">
         {SPROUT_CUT_PATHS.map((d) => <path key={d} d={d} />)}
         <ellipse cx="12" cy="9.85" rx="2" ry="1.05" />
       </g>
@@ -161,11 +170,11 @@ export function FreshclaudeIcon(props: IconProps) {
   return (
     <FreshAgentMarkIcon
       mark={
-        <g transform="translate(-0.323 1.957) scale(0.024076)">
+        <g transform="translate(-2.0838 -1.7637) scale(0.027515)">
           <path fill="currentColor" d={CLAUDE_MARK_PATH} />
         </g>
       }
-      sproutTransform="translate(5 8.875) scale(1.25)"
+      sproutTransform="translate(3.9 8.7125) scale(1.375)"
       {...props}
     />
   )
@@ -175,11 +184,11 @@ export function FreshcodexIcon(props: IconProps) {
   return (
     <FreshAgentMarkIcon
       mark={
-        <g transform="translate(2.52 4.07) scale(1.1843)">
+        <g transform="translate(0.3915 0.3335) scale(1.44985)">
           <path fill="currentColor" d={CODEX_MARK_PATH} />
         </g>
       }
-      sproutTransform="translate(4.3 8.91) scale(1.3)"
+      sproutTransform="translate(2.822 8.113) scale(1.43)"
       {...props}
     />
   )
@@ -189,12 +198,12 @@ export function FreshopencodeIcon(props: IconProps) {
   return (
     <FreshAgentMarkIcon
       mark={
-        <g transform="translate(-22.6 -6.04) scale(0.05769)">
+        <g transform="translate(-34.15 -13.38) scale(0.076923)">
           <path fill="currentColor" d={OPENCODE_MARK_PATHS[0]} />
           <path fill="currentColor" fillOpacity="0.5" d={OPENCODE_MARK_PATHS[1]} />
         </g>
       }
-      sproutTransform="translate(0.6 7.045) scale(1.35)"
+      sproutTransform="translate(2.029 7.5135) scale(1.485)"
       {...props}
     />
   )
