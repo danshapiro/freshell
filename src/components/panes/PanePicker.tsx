@@ -25,7 +25,8 @@ interface PickerOption {
   icon: IconComponent | null
   providerName?: CodingCliProviderName
   shortcut: string
-  afterCli?: boolean
+  /** Underlying coding CLI of a fresh-agent option, used for agent-family grouping */
+  runtimeProvider?: CodingCliProviderName
 }
 
 const shellOption: PickerOption = { type: 'shell', label: 'Shell', icon: Terminal, shortcut: 'S' }
@@ -44,6 +45,11 @@ const nonShellOptions: PickerOption[] = [
 // Host pressure dashboard (plan-pane-types §3c): the server-derived flag
 // already encodes platform support; the platform clause is belt-and-braces.
 const hostStatsOption: PickerOption = { type: 'host-stats', label: 'System Status', icon: Gauge, shortcut: 'H' }
+
+// Agent-family order for the picker: each family is its fresh variants then
+// its CLI. Amplifier then gets a dedicated slot ahead of the remaining CLIs.
+const FRESH_FAMILY_PROVIDER_ORDER: readonly CodingCliProviderName[] = ['claude', 'codex', 'opencode']
+const AMPLIFIER_CLI_PROVIDER: CodingCliProviderName = 'amplifier'
 
 const EMPTY_AVAILABLE_CLIS: Record<string, boolean> = {}
 const EMPTY_FEATURE_FLAGS: Record<string, boolean> = {}
@@ -113,7 +119,7 @@ export default function PanePicker({ onSelect, onCancel, isOnlyPane, tabId, pane
         label: config.label,
         icon: config.icon,
         shortcut: config.pickerShortcut,
-        afterCli: config.pickerAfterCli,
+        runtimeProvider: config.codingCliProvider,
       }))
     const otherFreshAgentOptions: PickerOption[] = freshClientsEnabled
       ? FRESH_AGENT_REGISTRY
@@ -127,13 +133,50 @@ export default function PanePicker({ onSelect, onCancel, isOnlyPane, tabId, pane
             label: entry.label,
             icon: entry.icon,
             shortcut: entry.pickerShortcut,
-            afterCli: entry.pickerAfterCli,
+            runtimeProvider: entry.runtimeProvider,
           }))
       : []
 
     const allFreshAgentOptions = [...freshAgentProviderOptions, ...otherFreshAgentOptions]
-    const freshAgentOptionsBeforeCli = allFreshAgentOptions.filter((o) => !o.afterCli)
-    const freshAgentOptionsAfterCli = allFreshAgentOptions.filter((o) => o.afterCli)
+
+    // Agent-family grouping: every fresh variant renders directly before its
+    // underlying CLI, families in FRESH_FAMILY_PROVIDER_ORDER — so the picker
+    // reads claudes, codexes, opencodes — then amplifier gets a dedicated
+    // slot, then any remaining CLIs keep registry order.
+    const cliOptionsByProvider = new Map(cliOptions.map((option) => [option.type as string, option]))
+    const consumedCliTypes = new Set<string>()
+    const freshOptionsByProvider = new Map<string, PickerOption[]>()
+    for (const option of allFreshAgentOptions) {
+      const provider = option.runtimeProvider
+      if (!provider) continue
+      const familyOptions = freshOptionsByProvider.get(provider) ?? []
+      familyOptions.push(option)
+      freshOptionsByProvider.set(provider, familyOptions)
+    }
+    const agentFamilyOptions: PickerOption[] = []
+    const emitAgentFamily = (provider: string) => {
+      agentFamilyOptions.push(...(freshOptionsByProvider.get(provider) ?? []))
+      freshOptionsByProvider.delete(provider)
+      const cli = cliOptionsByProvider.get(provider)
+      if (cli && !consumedCliTypes.has(cli.type)) {
+        agentFamilyOptions.push(cli)
+        consumedCliTypes.add(cli.type)
+      }
+    }
+    FRESH_FAMILY_PROVIDER_ORDER.forEach(emitAgentFamily)
+    // Amplifier leads the non-family CLIs.
+    emitAgentFamily(AMPLIFIER_CLI_PROVIDER)
+    // Remaining CLIs (gemini, kimi, …) keep registry order.
+    for (const cli of cliOptions) {
+      if (!consumedCliTypes.has(cli.type)) {
+        agentFamilyOptions.push(cli)
+        consumedCliTypes.add(cli.type)
+      }
+    }
+    // Defensive: fresh options for providers outside the family order (none today).
+    for (const familyOptions of freshOptionsByProvider.values()) {
+      agentFamilyOptions.push(...familyOptions)
+    }
 
     // Extension options from the registry (exclude CLI extensions and disabled extensions)
     const extensionOptions: PickerOption[] = extensionEntries
@@ -153,8 +196,9 @@ export default function PanePicker({ onSelect, onCancel, isOnlyPane, tabId, pane
       ? [hostStatsOption]
       : []
 
-    // Order: fresh-agent clients (before), CLIs, fresh-agent clients (after), Host Stats, Editor, Browser, Shell(s), Extensions
-    return [...freshAgentOptionsBeforeCli, ...cliOptions, ...freshAgentOptionsAfterCli, ...hostStatsOptions, ...nonShellOptions, ...shellOptions, ...extensionOptions]
+    // Order: agent families (fresh variant + CLI per provider), amplifier,
+    // remaining CLIs, Host Stats, Editor, Browser, Shell(s), Extensions
+    return [...agentFamilyOptions, ...hostStatsOptions, ...nonShellOptions, ...shellOptions, ...extensionOptions]
   }, [platform, availableClis, featureFlags, enabledProviders, disabledExtensions, freshClientsEnabled, extensionEntries])
 
   const [focusedIndex, setFocusedIndex] = useState<number | null>(null)

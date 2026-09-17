@@ -812,10 +812,11 @@ describe('Sidebar Component - Session-Centric Display', () => {
       // Should NOT show "Claude CLI" label
       expect(screen.queryByText('Claude CLI: Freshclaude session')).not.toBeInTheDocument()
 
-      // The icon SVG should be the FreshclaudeIcon (viewBox 0 0 1024 1024), not ClaudeIcon
+      // The icon SVG should be the FreshclaudeIcon (24-unit sprout-badge
+      // viewBox), not ClaudeIcon (75.73 64.08 872.25 872.25)
       const svg = rowButton!.querySelector('svg')
       expect(svg).toBeTruthy()
-      expect(svg!.getAttribute('viewBox')).toBe('0 0 1024 1024')
+      expect(svg!.getAttribute('viewBox')).toBe('0 0 24 24')
     })
   })
 

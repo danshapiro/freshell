@@ -32,6 +32,19 @@ const mockOpencodeExt: ClientExtensionEntry = {
   name: 'opencode', version: '1.0.0', label: 'OpenCode', description: '', category: 'cli',
   cli: { supportsModel: true, supportsPermissionMode: true, supportsResume: true, resumeCommandTemplate: ['opencode', '--session', '{{sessionId}}'] },
 }
+const mockAmplifierExt: ClientExtensionEntry = {
+  name: 'amplifier', version: '1.0.0', label: 'Amplifier', description: '', category: 'cli',
+  picker: { shortcut: 'A' },
+  cli: { supportsResume: true, resumeCommandTemplate: ['amplifier', 'session', 'resume', '--full-history', '{{sessionId}}'] },
+}
+const mockGeminiExt: ClientExtensionEntry = {
+  name: 'gemini', version: '1.0.0', label: 'Gemini', description: '', category: 'cli',
+  cli: {},
+}
+const mockKimiExt: ClientExtensionEntry = {
+  name: 'kimi', version: '1.0.0', label: 'Kimi', description: '', category: 'cli',
+  cli: {},
+}
 const defaultCliExtensions: ClientExtensionEntry[] = [mockClaudeExt, mockCodexExt]
 
 // Mock lucide-react icons
@@ -297,7 +310,7 @@ describe('PanePicker', () => {
       expect(codexButton.querySelector('img')).not.toBeInTheDocument()
     })
 
-    it('renders options in correct order: Freshclaude, CLIs, Freshcodex, Editor, Browser, Shell (Kilroy hidden by default)', () => {
+    it('renders options grouped by agent family: claudes, codexes, then everything else (Kilroy hidden by default)', () => {
       renderPicker({
         availableClis: { claude: true, codex: true },
         enabledProviders: ['claude', 'codex'],
@@ -306,17 +319,17 @@ describe('PanePicker', () => {
       })
       const buttons = screen.getAllByRole('button')
       const labels = buttons.map(b => b.getAttribute('aria-label'))
-      expect(labels[0]).toBe('Freshclaude')
-      expect(labels[1]).toBe('Claude CLI')
-      expect(labels[2]).toBe('Codex CLI')
-      expect(labels[3]).toBe('Freshcodex')
-      expect(labels[4]).toBe('Editor')
-      expect(labels[5]).toBe('Browser')
-      expect(labels[6]).toBe('Shell')
+      // Family grouping: each agent's fresh variants render directly before
+      // its CLI, families in registry order, non-family options unchanged.
+      expect(labels).toEqual([
+        'Freshclaude', 'Claude CLI',
+        'Freshcodex', 'Codex CLI',
+        'Editor', 'Browser', 'Shell',
+      ])
       expect(labels).not.toContain('Kilroy')
     })
 
-    it('shows Kilroy when kilroy feature flag is enabled', () => {
+    it('groups Kilroy into the claude family when the kilroy feature flag is enabled', () => {
       renderPicker({
         availableClis: { claude: true, codex: true },
         enabledProviders: ['claude', 'codex'],
@@ -326,16 +339,30 @@ describe('PanePicker', () => {
       })
       const buttons = screen.getAllByRole('button')
       const labels = buttons.map(b => b.getAttribute('aria-label'))
-      expect(labels).toContain('Kilroy')
-      // Kilroy should appear after CLIs (it has pickerAfterCli: true)
-      expect(labels[0]).toBe('Freshclaude')
-      expect(labels[1]).toBe('Claude CLI')
-      expect(labels[2]).toBe('Codex CLI')
-      expect(labels[3]).toBe('Kilroy')
-      expect(labels[4]).toBe('Freshcodex')
-      expect(labels[5]).toBe('Editor')
-      expect(labels[6]).toBe('Browser')
-      expect(labels[7]).toBe('Shell')
+      expect(labels).toEqual([
+        'Freshclaude', 'Kilroy', 'Claude CLI',
+        'Freshcodex', 'Codex CLI',
+        'Editor', 'Browser', 'Shell',
+      ])
+    })
+
+    it('renders the full family order: claudes, codexes, opencodes, amplifier, then remaining CLIs', () => {
+      renderPicker({
+        availableClis: { claude: true, codex: true, opencode: true, amplifier: true, gemini: true, kimi: true },
+        enabledProviders: ['claude', 'codex', 'opencode', 'amplifier', 'gemini', 'kimi'],
+        extensions: [mockClaudeExt, mockCodexExt, mockOpencodeExt, mockAmplifierExt, mockGeminiExt, mockKimiExt],
+        freshClientsEnabled: true,
+      })
+      const buttons = screen.getAllByRole('button')
+      const labels = buttons.map(b => b.getAttribute('aria-label'))
+      expect(labels).toEqual([
+        'Freshclaude', 'Claude CLI',
+        'Freshcodex', 'Codex CLI',
+        'Freshopencode', 'OpenCode',
+        'Amplifier',
+        'Gemini', 'Kimi',
+        'Editor', 'Browser', 'Shell',
+      ])
     })
 
     it('hides all fresh clients by default even when their CLIs are available and enabled', () => {

@@ -42,7 +42,6 @@ export const FRESH_AGENT_PROVIDER_CONFIGS: FreshAgentProviderConfig[] = [
         defaultPermissionMode: entry.defaultPermissionMode,
         settingsVisibility: entry.settingsVisibility,
         pickerShortcut: entry.pickerShortcut,
-        pickerAfterCli: entry.pickerAfterCli,
         hidden: entry.hidden,
         featureFlag: entry.featureFlag,
       }

@@ -4,10 +4,10 @@ import {
   type FreshAgentSessionType,
 } from '@shared/fresh-agent'
 import {
-  CodexIcon,
   FreshclaudeIcon,
+  FreshcodexIcon,
+  FreshopencodeIcon,
   KilroyIcon,
-  OpencodeIcon,
 } from '@/components/icons/provider-icons'
 import {
   FRESHCODEX_DEFAULT_EFFORT,
@@ -55,7 +55,6 @@ export type FreshAgentRegistryEntry = {
     timecodes: boolean
   }
   pickerShortcut: string
-  pickerAfterCli?: boolean
   hidden?: boolean
   disabled?: boolean
   featureFlag?: string
@@ -84,7 +83,7 @@ export const FRESH_AGENT_REGISTRY: readonly FreshAgentRegistryEntry[] = [
     sessionType: 'freshcodex',
     runtimeProvider: 'codex',
     label: 'Freshcodex',
-    icon: CodexIcon,
+    icon: FreshcodexIcon,
     defaultModel: FRESHCODEX_DEFAULT_MODEL,
     defaultPermissionMode: 'on-request',
     defaultEffort: FRESHCODEX_DEFAULT_EFFORT,
@@ -97,7 +96,6 @@ export const FRESH_AGENT_REGISTRY: readonly FreshAgentRegistryEntry[] = [
       timecodes: true,
     },
     pickerShortcut: 'X',
-    pickerAfterCli: true,
   },
   {
     sessionType: 'kilroy',
@@ -116,7 +114,6 @@ export const FRESH_AGENT_REGISTRY: readonly FreshAgentRegistryEntry[] = [
       timecodes: true,
     },
     pickerShortcut: 'K',
-    pickerAfterCli: true,
     hidden: true,
     featureFlag: 'kilroy',
   },
@@ -124,7 +121,7 @@ export const FRESH_AGENT_REGISTRY: readonly FreshAgentRegistryEntry[] = [
     sessionType: 'freshopencode',
     runtimeProvider: 'opencode',
     label: 'Freshopencode',
-    icon: OpencodeIcon,
+    icon: FreshopencodeIcon,
     defaultModel: undefined,
     defaultPermissionMode: 'default',
     defaultEffort: FRESHOPENCODE_DEFAULT_EFFORT,
@@ -137,7 +134,6 @@ export const FRESH_AGENT_REGISTRY: readonly FreshAgentRegistryEntry[] = [
       timecodes: true,
     },
     pickerShortcut: 'O',
-    pickerAfterCli: true,
   },
 ] as const
 
