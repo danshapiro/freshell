@@ -35,6 +35,7 @@ import {
   resolveFreshAgentType,
 } from '@/lib/fresh-agent-registry'
 import { cn } from '@/lib/utils'
+import { Loader2 } from 'lucide-react'
 import { collectPaneEntries, paneRefreshTargetMatchesContent } from '@/lib/pane-utils'
 import { getCanonicalDurableSessionId, getPreferredResumeSessionId } from '@/store/persistControl'
 import { isValidClaudeSessionId } from '@/lib/claude-session-id'
@@ -142,6 +143,24 @@ export const SNAPSHOT_INVALIDATING_FRESH_AGENT_EVENTS = new Set([
   'freshAgent.rolledBack', // the requesting pane's ack also refetches
   'freshAgent.redone',
 ])
+// These events mean the durable transcript may have changed. Status, approval,
+// and question events are deliberately excluded: they update the surrounding
+// pane UI, but do not make an already-rendered transcript stale. That keeps a
+// hidden pane immediately usable when its last transcript snapshot is still
+// current.
+export const TRANSCRIPT_INVALIDATING_FRESH_AGENT_EVENTS = new Set([
+  'freshAgent.session.changed',
+  'freshAgent.result',
+  'freshAgent.turn.complete',
+  'freshAgent.error',
+  'freshAgent.assistant',
+  'freshAgent.stream',
+  'freshAgent.session.rolledBack',
+  'freshAgent.session.redone',
+  'freshAgent.rolledBack',
+  'freshAgent.redone',
+])
+const REVEAL_REFRESH_MAX_WAIT_MS = 15_000
 const log = createLogger('FreshAgentView')
 // Context usage validity window for the strip meter: at 60s the strip triggers
 // a background refresh (never a blank-out of an accurate idle reading); if no
@@ -475,6 +494,16 @@ function isSnapshotInvalidatingFreshAgentEvent(message: Record<string, unknown>)
   return Boolean(eventType && SNAPSHOT_INVALIDATING_FRESH_AGENT_EVENTS.has(eventType))
 }
 
+function isTranscriptInvalidatingFreshAgentEvent(message: Record<string, unknown>): boolean {
+  if (message.type !== 'freshAgent.event') return false
+  const eventType = readMessageEventType(message)
+  if (eventType === 'freshAgent.session.snapshot') {
+    const event = isRecord(message.event) ? message.event : undefined
+    return typeof event?.status === 'string' && BUSY_STATES.has(event.status)
+  }
+  return Boolean(eventType && TRANSCRIPT_INVALIDATING_FRESH_AGENT_EVENTS.has(eventType))
+}
+
 /**
  * b8ke ext F1: exported for the alias-convergence unit tests (the pure
  * pane-locator predicate).
@@ -760,6 +789,19 @@ export function FreshAgentView({
   const [loadError, setLoadError] = useState<string | null>(null)
   const [snapshotRefreshNonce, setSnapshotRefreshNonce] = useState(0)
   const snapshotRefreshTriggerRef = useRef<SnapshotTrigger>('identity')
+  // A hidden pane keeps its last good transcript until a transcript-changing
+  // event says that it is no longer current. On reveal, the old DOM remains
+  // mounted but is concealed behind a refresh state so the user never reads a
+  // stale conversation as if it were current.
+  const [snapshotDirty, setSnapshotDirty] = useState(false)
+  const snapshotDirtyRef = useRef(false)
+  const snapshotDirtyVersionRef = useRef(0)
+  const snapshotDirtyBaseRevisionRef = useRef<number | null>(null)
+  const revealRefreshVersionRef = useRef<number | null>(null)
+  const revealRefreshStartedAtRef = useRef<number | null>(null)
+  const revealRefreshRetryTimerRef = useRef<number | null>(null)
+  const snapshotRefreshSerialRef = useRef(0)
+  const [snapshotRevealError, setSnapshotRevealError] = useState<string | null>(null)
   // Non-null while the snapshot key is rate-limited (429/backoff): the last
   // good snapshot stays visible and a single retry is armed at expiry.
   // Task 17 also consumes this for the snapshot `trigger` query param.
@@ -1057,6 +1099,23 @@ export function FreshAgentView({
   const snapshotThreadId = getFreshAgentSnapshotThreadId(paneContent, claudeSession)
   const snapshotThreadIdRef = useRef(snapshotThreadId)
   snapshotThreadIdRef.current = snapshotThreadId
+  const snapshotHydrationIdentity = `${paneContent.createRequestId}:${paneContent.sessionType}:${paneContent.provider}:${snapshotThreadId ?? ''}`
+  const previousSnapshotHydrationIdentityRef = useRef(snapshotHydrationIdentity)
+  useEffect(() => {
+    if (previousSnapshotHydrationIdentityRef.current === snapshotHydrationIdentity) return
+    previousSnapshotHydrationIdentityRef.current = snapshotHydrationIdentity
+    snapshotDirtyRef.current = false
+    snapshotDirtyVersionRef.current += 1
+    snapshotDirtyBaseRevisionRef.current = null
+    revealRefreshVersionRef.current = null
+    revealRefreshStartedAtRef.current = null
+    if (revealRefreshRetryTimerRef.current !== null) {
+      clearTimeout(revealRefreshRetryTimerRef.current)
+      revealRefreshRetryTimerRef.current = null
+    }
+    setSnapshotDirty(false)
+    setSnapshotRevealError(null)
+  }, [snapshotHydrationIdentity])
   const hasRestoreFailure = Boolean(
     paneContent.provider === 'claude'
       && paneContent.sessionId
@@ -1141,6 +1200,10 @@ export function FreshAgentView({
         clearTimeout(verdictWaitTimerRef.current)
         verdictWaitTimerRef.current = null
       }
+      if (revealRefreshRetryTimerRef.current !== null) {
+        clearTimeout(revealRefreshRetryTimerRef.current)
+        revealRefreshRetryTimerRef.current = null
+      }
     }
   }, [releasePendingRebind])
 
@@ -1149,8 +1212,30 @@ export function FreshAgentView({
   // scheduler (debounce/coalesce now live there, not in this component).
   const requestSnapshotRefresh = useCallback((trigger: SnapshotTrigger) => {
     snapshotRefreshTriggerRef.current = trigger
+    snapshotRefreshSerialRef.current += 1
     setSnapshotRefreshNonce((value) => value + 1)
   }, [])
+
+  const markSnapshotDirty = useCallback(() => {
+    if (!snapshotDirtyRef.current) {
+      const revision = snapshotRef.current?.revision
+      snapshotDirtyBaseRevisionRef.current = typeof revision === 'number' ? revision : null
+    }
+    snapshotDirtyVersionRef.current += 1
+    snapshotDirtyRef.current = true
+    setSnapshotDirty(true)
+    setSnapshotRevealError(null)
+  }, [])
+
+  const requestRevealRefresh = useCallback((force = false) => {
+    if (hiddenRef.current || !snapshotDirtyRef.current) return
+    const version = snapshotDirtyVersionRef.current
+    if (!force && revealRefreshVersionRef.current === version) return
+    revealRefreshVersionRef.current = version
+    if (revealRefreshStartedAtRef.current === null) revealRefreshStartedAtRef.current = Date.now()
+    setSnapshotRevealError(null)
+    requestSnapshotRefresh('reveal')
+  }, [requestSnapshotRefresh])
 
   // kata b8ke (round-3 F6): the ONE fenced attach sender — every
   // freshAgent.attach producer (mount rebind, reconnect re-attach,
@@ -2082,6 +2167,7 @@ export function FreshAgentView({
           // Surface hydration (HTTP transcript snapshot fetch) is EXPENSIVE --
           // defer it until reveal instead of fetching for every hidden pane.
           pendingRevealRefreshRef.current = true
+          markSnapshotDirty()
         } else {
           sendAttach()
           requestSnapshotRefresh('reconnect')
@@ -2094,18 +2180,20 @@ export function FreshAgentView({
     paneId,
     paneContent.sessionId,
     paneContent.reconcileEpoch,
+    markSnapshotDirty,
     requestSnapshotRefresh,
     sendFencedFreshAgentAttach,
     ws,
   ])
 
-  // F8: consume the deferred snapshot refresh on reveal.
+  // F8: consume the deferred snapshot refresh on reveal. The dirty marker is
+  // also used by transcript-changing websocket events, so the same path
+  // handles reconnects and provider activity without duplicate fetches.
   useEffect(() => {
     if (hidden) return
-    if (!pendingRevealRefreshRef.current) return
-    pendingRevealRefreshRef.current = false
-    requestSnapshotRefresh('reveal')
-  }, [hidden, requestSnapshotRefresh])
+    if (pendingRevealRefreshRef.current) pendingRevealRefreshRef.current = false
+    requestRevealRefresh()
+  }, [hidden, requestRevealRefresh, snapshotDirty])
 
   // reconcileNotice is a one-shot: visible for 5s, then consumed from the
   // pane content (a chat pane has no xterm write-notice channel; a timed
@@ -2262,7 +2350,8 @@ export function FreshAgentView({
         } else {
           recordPendingSendMetadata(message.requestId, { legacyAccepted: true })
         }
-        requestSnapshotRefresh('send-accepted')
+        if (hiddenRef.current) markSnapshotDirty()
+        else requestSnapshotRefresh('send-accepted')
       }
       if (message.type === 'error') {
         // Task 10: owned send failures. `requestId` is the only correlation
@@ -2338,11 +2427,24 @@ export function FreshAgentView({
         // one render. The status version below still observes that final idle.
         if (isBusyEvent) outgoingTurnRef.current.sawBusy = true
       }
-      if (
-        isSnapshotInvalidatingFreshAgentEvent(message)
+      const messageBelongsToPane = message.type === 'freshAgent.event'
         && locatorMatchesPane(message, paneContentRef.current, freshOpenCodeRouteCwdRef.current, runtimeOwnersForLocator())
-      ) {
-        requestSnapshotRefresh('event')
+      const eventType = readMessageEventType(message)
+      const event = message.type === 'freshAgent.event' && isRecord(message.event) ? message.event : undefined
+      const eventStatus = typeof event?.status === 'string' ? event.status : undefined
+      const previousStatus = agentSessionStatusRef.current ?? paneContentRef.current.status
+      const busySnapshotSettled = eventType === 'freshAgent.session.snapshot'
+        && eventStatus !== undefined
+        && !BUSY_STATES.has(eventStatus)
+        && BUSY_STATES.has(previousStatus)
+      const transcriptChanged = isTranscriptInvalidatingFreshAgentEvent(message) || busySnapshotSettled
+      if (messageBelongsToPane && transcriptChanged && (hiddenRef.current || snapshotDirtyRef.current)) {
+        markSnapshotDirty()
+      }
+      if (messageBelongsToPane && !hiddenRef.current && transcriptChanged && snapshotDirtyRef.current) {
+        requestRevealRefresh(true)
+      } else if (messageBelongsToPane && isSnapshotInvalidatingFreshAgentEvent(message)) {
+        if (!hiddenRef.current) requestSnapshotRefresh('event')
       }
       // kata 1wxv: the requesting-sink ack drives the composer refill; rollback
       // refusals render their server-pinned message verbatim. Both match on the
@@ -2421,7 +2523,7 @@ export function FreshAgentView({
       }
     })
     return unsubscribe
-  }, [agentSession?.cwd, appStore, captureFreshAgentAttachmentAttempt, clearReserveRedrive, commitSnapshot, descriptor?.label, dispatch, migratePendingAutoTitle, paneContent, paneContent.createRequestId, paneId, recordPendingSendMetadata, redriveAfterSessionReserved, releasePendingRebind, requestSnapshotRefresh, resendPendingMessage, sendFencedFreshAgentAttach, sendFreshAgentMessage, setLocalEcho, tabId, ws])
+  }, [agentSession?.cwd, appStore, captureFreshAgentAttachmentAttempt, clearReserveRedrive, commitSnapshot, descriptor?.label, dispatch, markSnapshotDirty, migratePendingAutoTitle, paneContent, paneContent.createRequestId, paneId, recordPendingSendMetadata, redriveAfterSessionReserved, releasePendingRebind, requestRevealRefresh, requestSnapshotRefresh, resendPendingMessage, sendFencedFreshAgentAttach, sendFreshAgentMessage, setLocalEcho, tabId, ws])
 
   useEffect(() => {
     if (!snapshotThreadId) return
@@ -2459,6 +2561,8 @@ export function FreshAgentView({
     const requestCwd = freshOpenCodeRouteCwdRef.current ?? paneContentRef.current.initialCwd
     const requestAgentSessionStatusVersion = agentSessionStatusVersionRef.current
     const requestOutgoingTurnId = outgoingTurnRef.current?.requestId
+    const trigger = snapshotRefreshTriggerRef.current
+    const refreshSerial = snapshotRefreshSerialRef.current
     const applySnapshot = (next: FreshAgentSnapshot) => {
       const snapshotIdentity = currentAutoTitleIdentityRef.current
       const resolved = next as FreshAgentSnapshot
@@ -2494,6 +2598,41 @@ export function FreshAgentView({
       }
       commitSnapshot(displaySnapshot)
       setSnapshotAutoTitleIdentity(snapshotIdentity)
+      const revealRefreshIsCurrent = (
+        trigger === 'reveal'
+        && snapshotDirtyRef.current
+        && revealRefreshVersionRef.current === snapshotDirtyVersionRef.current
+        && refreshSerial === snapshotRefreshSerialRef.current
+      )
+      const revealRevisionIsFresh = snapshotDirtyBaseRevisionRef.current === null
+        || typeof resolved.revision !== 'number'
+        || resolved.revision > snapshotDirtyBaseRevisionRef.current
+      if (revealRefreshIsCurrent && revealRevisionIsFresh) {
+        if (revealRefreshRetryTimerRef.current !== null) {
+          clearTimeout(revealRefreshRetryTimerRef.current)
+          revealRefreshRetryTimerRef.current = null
+        }
+        snapshotDirtyRef.current = false
+        snapshotDirtyBaseRevisionRef.current = null
+        revealRefreshVersionRef.current = null
+        revealRefreshStartedAtRef.current = null
+        setSnapshotDirty(false)
+        setSnapshotRevealError(null)
+      } else if (revealRefreshIsCurrent && !revealRevisionIsFresh
+        && revealRefreshRetryTimerRef.current === null) {
+        const startedAt = revealRefreshStartedAtRef.current ?? Date.now()
+        const remaining = startedAt + REVEAL_REFRESH_MAX_WAIT_MS - Date.now()
+        if (remaining <= 0) {
+          revealRefreshStartedAtRef.current = null
+          setSnapshotRevealError('The conversation did not finish refreshing. Try again.')
+        } else {
+          revealRefreshRetryTimerRef.current = window.setTimeout(() => {
+            revealRefreshRetryTimerRef.current = null
+            if (!isMountedRef.current || hiddenRef.current || !snapshotDirtyRef.current) return
+            requestRevealRefresh(true)
+          }, Math.min(250, remaining))
+        }
+      }
       const echo = localEchoRef.current
       const echoPendingMetadata = echo ? pendingSendMetadataRef.current.get(echo.requestId) : undefined
       const landedEcho = echo
@@ -2679,10 +2818,14 @@ export function FreshAgentView({
         }))
         return
       }
+      if (trigger === 'reveal' && snapshotDirtyRef.current) {
+        revealRefreshStartedAtRef.current = null
+        setSnapshotRevealError(error instanceof Error ? error.message : 'Failed to refresh conversation')
+        return
+      }
       setLoadError(error instanceof Error ? error.message : 'Failed to load session')
     }
     const key = makeSnapshotKey({ sessionType: requestSessionType, provider, threadId: sessionId, cwd: requestCwd })
-    const trigger = snapshotRefreshTriggerRef.current
     void getSnapshotScheduler().schedule(key, trigger, () =>
       // NO signal: the run may execute on behalf of other panes sharing the
       // key, or after this effect cleaned up (A2). Staleness is handled by
@@ -2704,10 +2847,23 @@ export function FreshAgentView({
         setRateLimitedUntil(outcome.retryAtMs)
         if (rateLimitRetryTimerRef.current === null) {
           const delay = Math.max(0, outcome.retryAtMs - Date.now())
+          if (
+            trigger === 'reveal'
+            && revealRefreshStartedAtRef.current !== null
+            && Date.now() + delay > revealRefreshStartedAtRef.current + REVEAL_REFRESH_MAX_WAIT_MS
+          ) {
+            revealRefreshStartedAtRef.current = null
+            setSnapshotRevealError('The conversation did not finish refreshing. Try again.')
+            return
+          }
           rateLimitRetryTimerRef.current = window.setTimeout(() => {
             rateLimitRetryTimerRef.current = null
             setRateLimitedUntil(null)
-            requestSnapshotRefresh('manual')
+            if (snapshotDirtyRef.current && !hiddenRef.current) {
+              requestRevealRefresh(true)
+            } else {
+              requestSnapshotRefresh('manual')
+            }
           }, delay + 50)
         }
         return
@@ -2733,6 +2889,7 @@ export function FreshAgentView({
     paneId,
     commitSnapshot,
     migratePendingAutoTitle,
+    requestRevealRefresh,
     requestSnapshotRefresh,
     setLocalEcho,
     snapshotThreadId,
@@ -3200,6 +3357,10 @@ export function FreshAgentView({
       ? null
       : (paneContent.restoreError ? getRestoreErrorMessage(paneContent.restoreError.reason) : null)
     const visibleLoadError = visibleRestoreFailure || visiblePaneRestoreFailure || isRestoring ? null : loadError
+    const revealRefreshBlocking = !hidden && snapshotDirty
+    const revealRefreshStatus = snapshotRevealError
+      ? 'The conversation could not be refreshed.'
+      : 'Refreshing conversation'
     const WatermarkIcon = descriptor?.icon
     const handlePaneKeyDown = (event: ReactKeyboardEvent<HTMLElement>) => {
       if (event.defaultPrevented) return
@@ -3508,64 +3669,102 @@ export function FreshAgentView({
               />
             </div>
             <FreshAgentOpenSessionContext.Provider value={openDelegationSession}>
-              <FreshAgentTranscript
-                ref={transcriptRef}
-                paneId={paneId}
-                turns={localEcho
-                  ? [...turns, {
-                      id: `__local-echo:${localEcho.requestId}`,
-                      turnId: localEcho.submittedTurnId ?? `__local-echo:${localEcho.requestId}`,
-                      requestId: localEcho.requestId,
-                      role: 'user',
-                      summary: localEcho.text,
-                      items: [{ id: `__local-echo-item:${localEcho.requestId}`, kind: 'text', text: localEcho.text }],
-                    } as FreshAgentTurn]
-                  : turns}
-                canFork={canFork}
-                canRollback={canRollback}
-                rollbackBusy={isBusy}
-                rolledBackTurns={snapshot?.rolledBackTurns ?? []}
-                canRedo={canRedoNow}
-                redoableTurnIds={snapshot?.rollback?.redoableTurnIds}
-                // Conversation identity for the disclosure's conversation scoping.
-                // Codex snapshots carry NO sessionId (codex.rs stamps threadId
-                // only) — fall back to threadId so a codex pane re-collapses the
-                // history line across conversation switches too.
-                sessionId={snapshot?.sessionId ?? snapshot?.threadId}
-                agentLabel={descriptor?.label}
-                expandThinking={globalExpandThinking}
-                expandTools={globalExpandTools}
-                showTimecodes={effectiveShowTimecodes}
-                showTranscriptMinimap={showTranscriptMinimap}
-                isStreaming={isBusy}
-                onForkFromTurn={(turnId) => sendFork(turnId)}
-                onRollbackToTurn={(turnId) => {
-                  // The busy pre-flight gate picks copy by DIRECTION (decision 7)…
-                  if (isBusy) {
-                    setNotice(ROLLBACK_BUSY_UNDO_NOTICE)
-                    return
-                  }
-                  // …and a capability-false provider gets an explicit refusal (decision 8:
-                  // no confirmations, explicit rejections, tooltips name the step).
-                  if (canRollback) {
-                    sendRollback('undo', 'toTurn', turnId)
-                    return
-                  }
-                  setNotice(rollbackUnsupportedNotice(descriptor?.label ?? paneContent.provider))
-                }}
-                onRedoToTurn={(turnId) => {
-                  if (isBusy) {
-                    setNotice(ROLLBACK_BUSY_REDO_NOTICE)
-                    return
-                  }
-                  if (canRedoNow) {
-                    sendRollback('redo', 'toTurn', turnId)
-                    return
-                  }
-                  setNotice(REDO_DESTROYED_NOTICE)
-                }}
-                onRewindToTurn={paneContent.initialCwd ? rewindToTurn : undefined}
-              />
+              <div
+                className="relative min-h-0 flex-1"
+                aria-busy={revealRefreshBlocking}
+              >
+                <div
+                  className={cn('h-full min-h-0', revealRefreshBlocking && 'invisible')}
+                  {...(revealRefreshBlocking
+                    ? { 'aria-hidden': true, 'data-testid': 'fresh-agent-stale-transcript' }
+                    : {})}
+                >
+                  <FreshAgentTranscript
+                    ref={transcriptRef}
+                    presentationPaused={revealRefreshBlocking}
+                    paneId={paneId}
+                    turns={localEcho
+                      ? [...turns, {
+                          id: `__local-echo:${localEcho.requestId}`,
+                          turnId: localEcho.submittedTurnId ?? `__local-echo:${localEcho.requestId}`,
+                          requestId: localEcho.requestId,
+                          role: 'user',
+                          summary: localEcho.text,
+                          items: [{ id: `__local-echo-item:${localEcho.requestId}`, kind: 'text', text: localEcho.text }],
+                        } as FreshAgentTurn]
+                      : turns}
+                    canFork={canFork}
+                    canRollback={canRollback}
+                    rollbackBusy={isBusy}
+                    rolledBackTurns={snapshot?.rolledBackTurns ?? []}
+                    canRedo={canRedoNow}
+                    redoableTurnIds={snapshot?.rollback?.redoableTurnIds}
+                    // Conversation identity for the disclosure's conversation scoping.
+                    // Codex snapshots carry NO sessionId (codex.rs stamps threadId
+                    // only) — fall back to threadId so a codex pane re-collapses the
+                    // history line across conversation switches too.
+                    sessionId={snapshot?.sessionId ?? snapshot?.threadId}
+                    agentLabel={descriptor?.label}
+                    expandThinking={globalExpandThinking}
+                    expandTools={globalExpandTools}
+                    showTimecodes={effectiveShowTimecodes}
+                    showTranscriptMinimap={showTranscriptMinimap}
+                    isStreaming={isBusy}
+                    onForkFromTurn={(turnId) => sendFork(turnId)}
+                    onRollbackToTurn={(turnId) => {
+                      // The busy pre-flight gate picks copy by DIRECTION (decision 7)…
+                      if (isBusy) {
+                        setNotice(ROLLBACK_BUSY_UNDO_NOTICE)
+                        return
+                      }
+                      // …and a capability-false provider gets an explicit refusal (decision 8:
+                      // no confirmations, explicit rejections, tooltips name the step).
+                      if (canRollback) {
+                        sendRollback('undo', 'toTurn', turnId)
+                        return
+                      }
+                      setNotice(rollbackUnsupportedNotice(descriptor?.label ?? paneContent.provider))
+                    }}
+                    onRedoToTurn={(turnId) => {
+                      if (isBusy) {
+                        setNotice(ROLLBACK_BUSY_REDO_NOTICE)
+                        return
+                      }
+                      if (canRedoNow) {
+                        sendRollback('redo', 'toTurn', turnId)
+                        return
+                      }
+                      setNotice(REDO_DESTROYED_NOTICE)
+                    }}
+                    onRewindToTurn={paneContent.initialCwd ? rewindToTurn : undefined}
+                  />
+                </div>
+                {revealRefreshBlocking ? (
+                  <div
+                    className="absolute inset-0 z-20 flex items-center justify-center bg-background/80 px-4 backdrop-blur-[1px]"
+                    role={snapshotRevealError ? 'alert' : 'status'}
+                    aria-label={revealRefreshStatus}
+                  >
+                    {snapshotRevealError ? (
+                      <div className="flex max-w-sm items-center gap-3 rounded-md border border-amber-500/50 bg-background px-3 py-2 text-sm shadow-sm">
+                        <span>{snapshotRevealError}</span>
+                        <button
+                          type="button"
+                          className="shrink-0 rounded border border-border/70 px-2 py-1 text-xs"
+                          onClick={() => requestRevealRefresh(true)}
+                        >
+                          Retry
+                        </button>
+                      </div>
+                    ) : (
+                      <div className="flex items-center gap-2 rounded-md border border-border/70 bg-background px-3 py-2 text-sm shadow-sm">
+                        <Loader2 className="h-4 w-4 animate-spin" aria-hidden="true" />
+                        <span>Refreshing conversation…</span>
+                      </div>
+                    )}
+                  </div>
+                ) : null}
+              </div>
             </FreshAgentOpenSessionContext.Provider>
             {/* Every fresh-agent pane gets the strip (unknown state included):
                 the model chip opens the shared model dialog and the strip owns
@@ -3676,6 +3875,8 @@ export function FreshAgentView({
     paneContent,
     pendingCreateFailure,
     queuedMessages,
+    hidden,
+    requestRevealRefresh,
     restartStuckSidecar,
     rewindToTurn,
     openDelegationSession,
@@ -3687,6 +3888,8 @@ export function FreshAgentView({
     sendFork,
     sendRollback,
     snapshot,
+    snapshotRevealError,
+    snapshotDirty,
     slashCommands,
     dispatch,
     appStore,

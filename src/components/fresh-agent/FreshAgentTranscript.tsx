@@ -1041,6 +1041,9 @@ export type FreshAgentTranscriptProps = {
    * restore) re-collapses the disclosure — the toggle never leaks across
    * conversations. Omitted in isolation/tests (the state keys on null). */
   sessionId?: string
+  /** Keep the transcript mounted while a reveal refresh is pending, but pause
+   * measurement and scroll bookkeeping until the new snapshot is committed. */
+  presentationPaused?: boolean
 }
 
 export const FreshAgentTranscript = forwardRef<FreshAgentTranscriptHandle, FreshAgentTranscriptProps>(function FreshAgentTranscript({
@@ -1064,6 +1067,7 @@ export const FreshAgentTranscript = forwardRef<FreshAgentTranscriptHandle, Fresh
   onRedoToTurn,
   redoableTurnIds,
   sessionId,
+  presentationPaused = false,
 }, ref) {
   const scrollerRef = useRef<HTMLDivElement | null>(null)
   const [atBottom, setAtBottom] = useState(true)
@@ -1223,6 +1227,7 @@ export const FreshAgentTranscript = forwardRef<FreshAgentTranscriptHandle, Fresh
   }), [])
 
   useLayoutEffect(() => {
+    if (presentationPaused) return
     const node = scrollerRef.current
     if (!node) return
     if (atBottom) {
@@ -1231,11 +1236,12 @@ export const FreshAgentTranscript = forwardRef<FreshAgentTranscriptHandle, Fresh
     } else {
       setNewMessages((count) => count + 1)
     }
-  }, [atBottom, transcriptSignature])
+  }, [atBottom, presentationPaused, transcriptSignature])
 
   useEffect(() => {
+    if (presentationPaused) return
     sweepTranscript()
-  }, [sweepTranscript, transcriptSignature])
+  }, [presentationPaused, sweepTranscript, transcriptSignature])
 
   // Shared row markup for BOTH rolled-back presentations (the e2e locates rows
   // via div.flex.items-start). The redo button branch is gated on the row's
@@ -1269,6 +1275,7 @@ export const FreshAgentTranscript = forwardRef<FreshAgentTranscriptHandle, Fresh
         className="fresh-agent-transcript-scroll flex h-full flex-col gap-0 overflow-x-hidden overflow-y-auto overscroll-contain px-3 py-3"
         data-context="fresh-agent-transcript"
         onScroll={(event) => {
+          if (presentationPaused) return
           const node = event.currentTarget
           setAtBottom(computeAtBottom(node))
           sweepTranscript()
@@ -1381,7 +1388,7 @@ export const FreshAgentTranscript = forwardRef<FreshAgentTranscriptHandle, Fresh
           {newMessages > 0 ? `${newMessages} new` : 'Bottom'}
         </button>
       ) : null}
-      {showTranscriptMinimap ? (
+      {showTranscriptMinimap && !presentationPaused ? (
         <FreshAgentTranscriptMinimap
           scrollerRef={scrollerRef}
           measurement={transcriptMeasurement}
