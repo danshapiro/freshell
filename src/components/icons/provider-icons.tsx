@@ -1,4 +1,4 @@
-import { useId, type ReactNode } from 'react'
+import type { ReactNode } from 'react'
 import type { SVGProps } from 'react'
 import type { CodingCliProviderName } from '@/lib/coding-cli-types'
 
@@ -98,34 +98,24 @@ export function AmplifierIcon(props: IconProps) {
   )
 }
 
-// Fresh* agent icons — the seedling badge family. Every fresh agent keeps its
-// source CLI mark at EXACTLY the same rendered size as the plain provider
-// icon (the mark group fills the 24-unit box the way the native viewBox
-// does), and gains the same seedling planted in a soil mound anchored in the
-// icon's lower-right corner. The seedling draws at full strength — the
-// half-strength grey variant was too faint in dark mode — and a knockout
-// mask cuts a gap in the mark around the seedling's leaves and upper stem so
-// the badge reads as its own layer in front of the mark on any background.
-// Below the root line (y=16.05) the mask turns white: the seedling's lower
-// stem and mound UNION with the mark instead of cutting it, so the knockout
-// can never sever floating fragments out of legs, bands, or lattice ends.
+// Fresh* agent icons — the beaded ring family. Every fresh agent keeps its
+// source CLI mark, shrunk to fit, framed by the same ring of fourteen beads
+// in the same 24-unit box the plain CLI icons fill (the bead ring's outer
+// extent, 11.8, matches the marks' native reach, so fresh and CLI icons read
+// as one size). The ring is the fresh marker: monochrome (currentColor), no
+// knockout machinery, legible at every rendered size. Each mark shrinks
+// about the box center with ~1 unit of clearance to the beads' inner
+// extent (10.6 - 1.2 = 9.4) — the transforms below compose the shrink with
+// each mark's native fit-the-box transform.
 
-// Seedling geometry in a local 24-unit box, stem base at (12, 9.3):
-// two leaves (y 4.2–6.4), a tapering stem (y 5.4–9.3), and a soil mound
-// ellipse (cy 9.85). The mask uses only stem+leaves — the mound always
-// unions with the mark so the seedling stays planted at the corner.
-const SPROUT_CUT_PATHS = [
-  'M11.5 9.3C11.55 7.3 11.65 6.5 12 5.4C12.35 6.5 12.45 7.3 12.5 9.3Z',
-  'M12 6.4C10.7 6.5 9.6 5.6 9.4 4.2C10.7 4.1 11.9 5 12 6.4Z',
-  'M12 6.4C13.3 6.5 14.4 5.6 14.6 4.2C13.3 4.1 12.1 5 12 6.4Z',
-] as const
-
-/** Below this y the knockout stops: the mark stays visible and the seedling roots into it. */
-const SPROUT_ROOT_LINE = 16.05
+// Bead ring geometry: 14 dots on radius 10.6, each of radius 1.2.
+const BEAD_COUNT = 14
+const BEAD_RING_RADIUS = 10.6
+const BEAD_RADIUS = 1.2
 
 const CLAUDE_MARK_PATH = 'M616.9,649.5h-209.7c0,0,0,104.7,0,104.7h-56.6c0,0,.2-104.5.2-104.5h-48.6s.2,104.5.2,104.5h-56.7c0,0,.2-104.4.2-104.4l-48.6-.7v-96.4c.1,0-104.8,0-104.8,0v-104.9s104.9,0,104.9,0v-201.6c0,0,628.9,0,628.9,0v201.6c0,0,104.9,0,104.9,0v104.9s-104.9,0-104.9,0v96.6c.1,0-56.5.4-56.5.4l.2,104.5h-48.6s.2-104.6.2-104.6h-56.6s.2,104.6.2,104.6h-48.6s.2-104.6.2-104.6ZM351.1,447.5l-.5-96.4h-48.4c0,0,0,96.6,0,96.6l48.8-.2ZM722,447.7l-.4-96.7h-56.5c0,0,0,96.8,0,96.8h56.9Z'
 
-const CODEX_MARK_PATH = 'M14.949 6.547a3.94 3.94 0 0 0-.348-3.273 4.11 4.11 0 0 0-4.4-1.934A4.1 4.1 0 0 0 8.423.2 4.15 4.15 0 0 0 6.305.086a4.1 4.1 0 0 0-1.891.948 4.04 4.04 0 0 0-1.158 1.753 4.1 4.1 0 0 0-1.563.679A4 4 0 0 0 .554 4.72a3.99 3.99 0 0 0 .502 4.731 3.94 3.94 0 0 0 .346 3.274 4.11 4.11 0 0 0 4.402 1.933c.382.425.852.764 1.377.995.526.231 1.095.35 1.67.346 1.78.002 3.358-1.132 3.901-2.804a4.1 4.1 0 0 0 1.563-.68 4 4 0 0 0 1.14-1.253 3.99 3.99 0 0 1-.506-4.716m-6.097 8.406a3.05 3.05 0 0 1-1.945-.694l.096-.054 3.23-1.838a.53.53 0 0 0 .265-.455v-4.49l1.366.778q.02.011.025.035v3.722c-.003 1.653-1.361 2.992-3.037 2.996m-6.53-2.75a2.95 2.95 0 0 1-.36-2.01l.095.057L5.29 12.09a.53.53 0 0 0 .527 0l3.949-2.246v1.555a.05.05 0 0 1-.022.041L6.473 13.3c-1.454.826-3.311.335-4.15-1.098m-.85-6.94A3.02 3.02 0 0 1 3.07 3.949v3.785a.51.51 0 0 0 .262.451l3.93 2.237-1.366.779a.05.05 0 0 1-.048 0L2.585 9.342a2.98 2.98 0 0 1-1.113-4.094zm11.216 2.571L8.747 5.576l1.362-.776a.05.05 0 0 1 .048 0l3.265 1.86a3 3 0 0 1 1.173 1.207 2.96 2.96 0 0 1-.27 3.2 3.05 3.05 0 0 1-1.36.997V8.279a.52.52 0 0 0-.276-.445m1.36-2.015-.097-.057-3.226-1.855a.53.53 0 0 0-.53 0L6.249 6.153V4.598a.04.04 0 0 1 .019-.04L9.533 2.7a3.07 3.07 0 0 1 3.257.139c.474.325.843.778 1.066 1.303.223.526.289 1.103.191 1.664zM5.503 8.575 4.139 7.8a.05.05 0 0 1-.026-.037V4.049c0-.57.166-1.127.476-1.607s.752-.864 1.275-1.105a3.08 3.08 0 0 1 3.234.41l-.096.054-3.23 1.838a.53.53 0 0 0-.265.455zm.742-1.577 1.758-1 1.762 1v2l-1.755 1-1.762-1z'
+const CODEX_MARK_PATH = 'M14.949 6.547a3.94 3.94 0 0 0-.348-3.273 4.11 4.11 0 0 0-4.4-1.934A4.1 4.1 0 0 0 8.423.2 4.15 4.15 0 0 0 6.305.086a4.1 4.1 0 0 0-1.891.948 4.04 4.04 0 0 0-1.158 1.753 4.1 4.1 0 0 0-1.563.679A4 4 0 0 0 .554 4.72a3.99 3.99 0 0 0 .502 4.731 3.94 3.94 0 0 0 .346 3.274 4.11 4.11 0 0 0 4.402 1.933c.382.425.852.764 1.377.995.526.231 1.095.35 1.67.346 1.78.002 3.358-1.132 3.901-2.804a4.1 4.1 0 0 0 1.563-.68 4 4 0 0 0 1.14-1.253 3.99 3.99 0 0 0-.506-4.716m-6.097 8.406a3.05 3.05 0 0 1-1.945-.694l.096-.054 3.23-1.838a.53.53 0 0 0 .265-.455v-4.49l1.366.778q.02.011.025.035v3.722c-.003 1.653-1.361 2.992-3.037 2.996m-6.53-2.75a2.95 2.95 0 0 1-.36-2.01l.095.057L5.29 12.09a.53.53 0 0 0 .527 0l3.949-2.246v1.555a.05.05 0 0 1-.022.041L6.473 13.3c-1.454.826-3.311.335-4.15-1.098m-.85-6.94A3.02 3.02 0 0 1 3.07 3.949v3.785a.51.51 0 0 0 .262.451l3.93 2.237-1.366.779a.05.05 0 0 1-.048 0L2.585 9.342a2.98 2.98 0 0 1-1.113-4.094zm11.216 2.571L8.747 5.576l1.362-.776a.05.05 0 0 1 .048 0l3.265 1.86a3 3 0 0 1 1.173 1.207 2.96 2.96 0 0 1-.27 3.2 3.05 3.05 0 0 1-1.36.997V8.279a.52.52 0 0 0-.276-.445m1.36-2.015-.097-.057-3.226-1.855a.53.53 0 0 0-.53 0L6.249 6.153V4.598a.04.04 0 0 1 .019-.04L9.533 2.7a3.07 3.07 0 0 1 3.257.139c.474.325.843.778 1.066 1.303.223.526.289 1.103.191 1.664zM5.503 8.575 4.139 7.8a.05.05 0 0 1-.026-.037V4.049c0-.57.166-1.127.476-1.607s.752-.864 1.275-1.105a3.08 3.08 0 0 1 3.234.41l-.096.054-3.23 1.838a.53.53 0 0 0-.265.455zm.742-1.577 1.758-1 1.762 1v2l-1.755 1-1.762-1z'
 
 const OPENCODE_MARK_PATHS = [
   'M520,180h200v300h-240V180h40ZM540,300v120h120v-180h-120v60Z',
@@ -133,14 +123,13 @@ const OPENCODE_MARK_PATHS = [
 ] as const
 
 /**
- * Shared fresh* icon body: `mark` is the untouched source mark, and the
- * seedling is stamped at `sproutTransform` (local 24-unit coordinates).
- * The mask id is instance-unique (useId) so simultaneous renders — tab bar,
- * picker, headers, the deck serializer — never cross-reference each other's
- * masks.
+ * Shared fresh* icon body: `mark` is the untouched source mark, stamped at
+ * `markTransform` (the shrink-about-center composition that fits it inside
+ * the bead ring). The beads are plain circles — no masks, no useId-scoped
+ * ids — so simultaneous renders (tab bar, picker, headers, the deck
+ * serializer) all serialize and paint identically.
  */
-function FreshAgentMarkIcon({ mark, sproutTransform, ...props }: IconProps & { mark: ReactNode; sproutTransform: string }) {
-  const maskId = `fresh-seedling-cut-${useId().replace(/[^a-zA-Z0-9]/g, '')}`
+function FreshAgentMarkIcon({ mark, markTransform, ...props }: IconProps & { mark: ReactNode; markTransform: string }) {
   return (
     <svg
       xmlns="http://www.w3.org/2000/svg"
@@ -148,20 +137,19 @@ function FreshAgentMarkIcon({ mark, sproutTransform, ...props }: IconProps & { m
       fill="none"
       {...props}
     >
-      <mask id={maskId} maskUnits="userSpaceOnUse" x="-2" y="-2" width="28" height="28">
-        <rect x="-2" y="-2" width="28" height="28" fill="white" />
-        <g transform={sproutTransform} fill="black" stroke="black" strokeWidth="1.5" strokeLinejoin="round">
-          {SPROUT_CUT_PATHS.map((d) => <path key={d} d={d} />)}
-        </g>
-        {/* Root line: below it the mark stays visible, so the seedling roots
-            into the mark instead of cutting fragments out of it. */}
-        <rect x="-2" y={SPROUT_ROOT_LINE} width="28" height="12" fill="white" />
-      </mask>
-      <g mask={`url(#${maskId})`}>{mark}</g>
-      <g transform={sproutTransform} fill="currentColor">
-        {SPROUT_CUT_PATHS.map((d) => <path key={d} d={d} />)}
-        <ellipse cx="12" cy="9.85" rx="2" ry="1.05" />
-      </g>
+      {Array.from({ length: BEAD_COUNT }, (_, i) => {
+        const angle = (((i * 360) / BEAD_COUNT) - 90) * (Math.PI / 180)
+        return (
+          <circle
+            key={i}
+            cx={+(12 + BEAD_RING_RADIUS * Math.cos(angle)).toFixed(3)}
+            cy={+(12 + BEAD_RING_RADIUS * Math.sin(angle)).toFixed(3)}
+            r={BEAD_RADIUS}
+            fill="currentColor"
+          />
+        )
+      })}
+      <g transform={markTransform}>{mark}</g>
     </svg>
   )
 }
@@ -169,12 +157,8 @@ function FreshAgentMarkIcon({ mark, sproutTransform, ...props }: IconProps & { m
 export function FreshclaudeIcon(props: IconProps) {
   return (
     <FreshAgentMarkIcon
-      mark={
-        <g transform="translate(-2.0838 -1.7637) scale(0.027515)">
-          <path fill="currentColor" d={CLAUDE_MARK_PATH} />
-        </g>
-      }
-      sproutTransform="translate(3.9 8.7125) scale(1.375)"
+      mark={<path fill="currentColor" d={CLAUDE_MARK_PATH} />}
+      markTransform="translate(2.42302 2.64068) scale(0.0187102)"
       {...props}
     />
   )
@@ -183,12 +167,8 @@ export function FreshclaudeIcon(props: IconProps) {
 export function FreshcodexIcon(props: IconProps) {
   return (
     <FreshAgentMarkIcon
-      mark={
-        <g transform="translate(0.3915 0.3335) scale(1.44985)">
-          <path fill="currentColor" d={CODEX_MARK_PATH} />
-        </g>
-      }
-      sproutTransform="translate(2.822 8.113) scale(1.43)"
+      mark={<path fill="currentColor" d={CODEX_MARK_PATH} />}
+      markTransform="translate(4.33839 4.30011) scale(0.956901)"
       {...props}
     />
   )
@@ -198,12 +178,12 @@ export function FreshopencodeIcon(props: IconProps) {
   return (
     <FreshAgentMarkIcon
       mark={
-        <g transform="translate(-34.15 -13.38) scale(0.076923)">
+        <>
           <path fill="currentColor" d={OPENCODE_MARK_PATHS[0]} />
           <path fill="currentColor" fillOpacity="0.5" d={OPENCODE_MARK_PATHS[1]} />
-        </g>
+        </>
       }
-      sproutTransform="translate(2.029 7.5135) scale(1.485)"
+      markTransform="translate(-12.4595 -1.4514) scale(0.0407692)"
       {...props}
     />
   )
