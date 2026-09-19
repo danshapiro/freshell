@@ -3674,7 +3674,7 @@ export function FreshAgentView({
                 aria-busy={revealRefreshBlocking}
               >
                 <div
-                  className={cn('h-full min-h-0', revealRefreshBlocking && 'invisible')}
+                  className={cn('flex h-full min-h-0 flex-col', revealRefreshBlocking && 'invisible')}
                   {...(revealRefreshBlocking
                     ? { 'aria-hidden': true, 'data-testid': 'fresh-agent-stale-transcript' }
                     : {})}
