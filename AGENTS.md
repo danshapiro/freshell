@@ -72,6 +72,8 @@ Freshell is a self-hosted, browser-accessible terminal multiplexer and session o
 
 The production self-hosted Freshell is the Rust server (`target/release/freshell-server`, workspace crate `freshell-server`), running on **port 3001** from the main checkout (`.env` sets `PORT=3001`; the launcher script's built-in default is 3002, so always confirm the live port via `ls ~/.freshell/rust-server-*.pid` or `ss -tlnp`).
 
+For the concise, host-agnostic startup flow for the server and native Windows client, see [Self-hosted launch runbook](docs/development/self-hosted-launch-runbook.md).
+
 **Canonical launcher: `scripts/launch-rust.sh`** — use this instead of hand-rolled build/launch commands:
 
 ```bash
