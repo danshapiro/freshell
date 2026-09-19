@@ -98,20 +98,22 @@ export function AmplifierIcon(props: IconProps) {
   )
 }
 
-// Fresh* agent icons — the beaded ring family. Every fresh agent keeps its
-// source CLI mark, shrunk to fit, framed by the same ring of fourteen beads
-// in the same 24-unit box the plain CLI icons fill (the bead ring's outer
-// extent, 11.8, matches the marks' native reach, so fresh and CLI icons read
-// as one size). The ring is the fresh marker: monochrome (currentColor), no
-// knockout machinery, legible at every rendered size. Each mark shrinks
-// about the box center with ~1 unit of clearance to the beads' inner
-// extent (10.6 - 1.2 = 9.4) — the transforms below compose the shrink with
-// each mark's native fit-the-box transform.
+// Fresh* agent icons — the 14-lobe star ring family. Every fresh agent keeps
+// its source CLI mark, shrunk to fit, framed by the same ring in the same
+// 24-unit box the plain CLI icons fill (the ring's outer disc, radius 11.8,
+// matches the marks' native reach, so fresh and CLI icons read as one
+// size). The ring is a solid disc with a 14-lobe star-shaped window cut out
+// of it (one evenodd path): smooth outer contour, scalloped inner contour —
+// the "double outline" look. Monochrome (currentColor), no knockout
+// machinery, legible at every rendered size. Each mark shrinks about the
+// box center with ≥ 1 unit of clearance to the window's valley extent
+// (radius 9.0) — the transforms below compose the shrink with each mark's
+// native fit-the-box transform.
 
-// Bead ring geometry: 14 dots on radius 10.6, each of radius 1.2.
-const BEAD_COUNT = 14
-const BEAD_RING_RADIUS = 10.6
-const BEAD_RADIUS = 1.2
+// Ring geometry: disc radius 11.8; star window with 14 lobes, valleys on
+// radius 9.0, lobe apexes on radius ~10.2 (quadratic controls on ~11.63).
+const FRESH_RING_PATH =
+  'M12 0.2A11.8 11.8 0 1 1 11.99 0.2Z M12.000 3.000Q14.587 0.666 15.905 3.891Q19.249 2.911 19.036 6.389Q22.474 6.956 20.774 9.997Q23.626 12.000 20.774 14.003Q22.474 17.044 19.036 17.611Q19.249 21.089 15.905 20.109Q14.587 23.334 12.000 21.000Q9.413 23.334 8.095 20.109Q4.751 21.089 4.964 17.611Q1.526 17.044 3.226 14.003Q0.374 12.000 3.226 9.997Q1.526 6.956 4.964 6.389Q4.751 2.911 8.095 3.891Q9.413 0.666 12.000 3.000Z'
 
 const CLAUDE_MARK_PATH = 'M616.9,649.5h-209.7c0,0,0,104.7,0,104.7h-56.6c0,0,.2-104.5.2-104.5h-48.6s.2,104.5.2,104.5h-56.7c0,0,.2-104.4.2-104.4l-48.6-.7v-96.4c.1,0-104.8,0-104.8,0v-104.9s104.9,0,104.9,0v-201.6c0,0,628.9,0,628.9,0v201.6c0,0,104.9,0,104.9,0v104.9s-104.9,0-104.9,0v96.6c.1,0-56.5.4-56.5.4l.2,104.5h-48.6s.2-104.6.2-104.6h-56.6s.2,104.6.2,104.6h-48.6s.2-104.6.2-104.6ZM351.1,447.5l-.5-96.4h-48.4c0,0,0,96.6,0,96.6l48.8-.2ZM722,447.7l-.4-96.7h-56.5c0,0,0,96.8,0,96.8h56.9Z'
 
@@ -125,9 +127,9 @@ const OPENCODE_MARK_PATHS = [
 /**
  * Shared fresh* icon body: `mark` is the untouched source mark, stamped at
  * `markTransform` (the shrink-about-center composition that fits it inside
- * the bead ring). The beads are plain circles — no masks, no useId-scoped
- * ids — so simultaneous renders (tab bar, picker, headers, the deck
- * serializer) all serialize and paint identically.
+ * the star ring's window). The ring is a single evenodd path — no masks, no
+ * useId-scoped ids — so simultaneous renders (tab bar, picker, headers, the
+ * deck serializer) all serialize and paint identically.
  */
 function FreshAgentMarkIcon({ mark, markTransform, ...props }: IconProps & { mark: ReactNode; markTransform: string }) {
   return (
@@ -137,18 +139,7 @@ function FreshAgentMarkIcon({ mark, markTransform, ...props }: IconProps & { mar
       fill="none"
       {...props}
     >
-      {Array.from({ length: BEAD_COUNT }, (_, i) => {
-        const angle = (((i * 360) / BEAD_COUNT) - 90) * (Math.PI / 180)
-        return (
-          <circle
-            key={i}
-            cx={+(12 + BEAD_RING_RADIUS * Math.cos(angle)).toFixed(3)}
-            cy={+(12 + BEAD_RING_RADIUS * Math.sin(angle)).toFixed(3)}
-            r={BEAD_RADIUS}
-            fill="currentColor"
-          />
-        )
-      })}
+      <path fill="currentColor" fillRule="evenodd" d={FRESH_RING_PATH} />
       <g transform={markTransform}>{mark}</g>
     </svg>
   )
