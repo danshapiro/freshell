@@ -15,7 +15,8 @@ import { test } from '../helpers/fixtures.js'
 import { ManagedRuntimeBrowserRig } from '../helpers/managed-runtime.js'
 import { TestHarness } from '../helpers/test-harness.js'
 import { runtimeBrowserPost as apiPost, pruneRuntimeBrowserLayout } from '../helpers/runtime-browser-api.js'
-import { LAYOUT_STORAGE_KEY } from '../../../src/store/storage-keys.js'
+import { LAYOUT_WINDOW_ID_STORAGE_KEY } from '../../../src/store/storage-keys.js'
+import { derivedLayoutKey } from '../../../src/store/window-layout-keys.js'
 import { WS_PROTOCOL_VERSION } from '@shared/ws-version'
 
 async function waitForValue<T>(
@@ -51,8 +52,14 @@ function latestSoul(snapshot: any, soulId: string): any | undefined {
 }
 
 async function prunePersistedLayoutToTab(page: Page, keepTabId: string): Promise<string> {
+  const layoutWindowId = await page.evaluate(
+    (key) => sessionStorage.getItem(key),
+    LAYOUT_WINDOW_ID_STORAGE_KEY,
+  )
+  if (!layoutWindowId) throw new Error('browser has no layout-window id')
+  const layoutStorageKey = derivedLayoutKey(layoutWindowId)
   const persisted = await waitForValue('canonical persisted browser layout', async () => {
-    const raw = await page.evaluate((key) => localStorage.getItem(key), LAYOUT_STORAGE_KEY)
+    const raw = await page.evaluate((key) => localStorage.getItem(key), layoutStorageKey)
     if (!raw) return null
     const value = JSON.parse(raw)
     return value?.tabs?.tabs?.some((tab: any) => tab.id === keepTabId) && value?.panes?.layouts?.[keepTabId]
@@ -67,8 +74,8 @@ async function prunePersistedLayoutToTab(page: Page, keepTabId: string): Promise
     if (window.top !== window || sessionStorage.getItem(marker) === 'installed') return
     localStorage.setItem(key, raw)
     sessionStorage.setItem(marker, 'installed')
-  }, { key: LAYOUT_STORAGE_KEY, raw: JSON.stringify(pruned), marker })
-  return LAYOUT_STORAGE_KEY
+  }, { key: layoutStorageKey, raw: JSON.stringify(pruned), marker })
+  return layoutStorageKey
 }
 
 class RawWsClient {
