@@ -19,12 +19,16 @@ use freshell_runtime_protocol::{
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
+#[cfg(not(test))]
+use std::process::Stdio;
 use std::{
     fs,
     path::{Path, PathBuf},
     sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
+#[cfg(not(test))]
+use tokio::io::AsyncWriteExt;
 use tokio::{
     process::{Child, Command},
     sync::{mpsc, Mutex},
@@ -64,22 +68,18 @@ impl DeterministicFreshAgentTransport {
         run_as_gid: u32,
     ) -> Result<Arc<Self>, String> {
         let state_dir = state_dir.into();
-        fs::create_dir_all(&state_dir).map_err(|error| error.to_string())?;
-        let path = state_dir.join(STATE_FILE);
-        let state = if path.exists() {
-            serde_json::from_slice::<FixtureState>(
-                &fs::read(&path).map_err(|error| error.to_string())?,
-            )
-            .map_err(|error| format!("read deterministic provider state: {error}"))?
-        } else {
-            FixtureState {
-                schema_version: 1,
-                native_session_id: fixture_native_id(profile),
-                dispatch_count: 0,
-                completion_count: 0,
-                pending_decision_id: None,
-            }
-        };
+        let state =
+            if let Some(state) = read_provider_state(&state_dir, run_as_uid, run_as_gid).await? {
+                state
+            } else {
+                FixtureState {
+                    schema_version: 1,
+                    native_session_id: fixture_native_id(profile),
+                    dispatch_count: 0,
+                    completion_count: 0,
+                    pending_decision_id: None,
+                }
+            };
         if profile
             .native_session_id
             .as_deref()
@@ -87,7 +87,7 @@ impl DeterministicFreshAgentTransport {
         {
             return Err("deterministic provider native identity mismatch".into());
         }
-        write_state(&state_dir, &state)?;
+        write_provider_state(&state_dir, &state, run_as_uid, run_as_gid).await?;
         let (event_tx, event_rx) = mpsc::channel(EVENT_CAPACITY);
         Ok(Arc::new(Self {
             state_dir,
@@ -148,7 +148,9 @@ impl DeterministicFreshAgentTransport {
             let turn_id = format!("turn-{}-{ordinal}", short_hash(request_id.as_str()));
             let message_id = format!("assistant-{}-{ordinal}", short_hash(&turn_id));
             let native = state.native_session_id.clone();
-            write_state(&self.state_dir, &state).map_err(non_ambiguous)?;
+            write_provider_state(&self.state_dir, &state, self.run_as_uid, self.run_as_gid)
+                .await
+                .map_err(non_ambiguous)?;
             (native, turn_id, message_id)
         };
         self.event_tx
@@ -212,7 +214,9 @@ impl FreshAgentTransport for DeterministicFreshAgentTransport {
                 }
                 let decision_id = format!("decision-{}", short_hash(request_id.as_str()));
                 state.pending_decision_id = Some(decision_id.clone());
-                write_state(&self.state_dir, &state).map_err(non_ambiguous)?;
+                write_provider_state(&self.state_dir, &state, self.run_as_uid, self.run_as_gid)
+                    .await
+                    .map_err(non_ambiguous)?;
                 drop(state);
                 self.event_tx
                     .send(AgentEvent::PermissionRequested {
@@ -230,7 +234,9 @@ impl FreshAgentTransport for DeterministicFreshAgentTransport {
                     provider_ack_id: Some(request_id.as_str().into()),
                 });
             }
-            write_state(&self.state_dir, &state).map_err(non_ambiguous)?;
+            write_provider_state(&self.state_dir, &state, self.run_as_uid, self.run_as_gid)
+                .await
+                .map_err(non_ambiguous)?;
         }
         if text != HANG_AFTER_ACCEPT_CONTROL {
             self.emit_completion(request_id).await?;
@@ -251,7 +257,9 @@ impl FreshAgentTransport for DeterministicFreshAgentTransport {
                 return Err(non_ambiguous("deterministic decision identity mismatch"));
             }
             state.pending_decision_id = None;
-            write_state(&self.state_dir, &state).map_err(non_ambiguous)?;
+            write_provider_state(&self.state_dir, &state, self.run_as_uid, self.run_as_gid)
+                .await
+                .map_err(non_ambiguous)?;
             RequestId::parse(format!("resolved-{decision_id}"))
                 .map_err(|error| non_ambiguous(error.to_string()))?
         };
@@ -299,22 +307,19 @@ pub(crate) async fn run_worker(args: &[String]) -> Result<(), String> {
 /// Read-only recovery qualification for the deterministic provider state. The
 /// caller supplies the soul-scoped directory so tests can prove identity
 /// semantics without touching a real provider home.
-pub(crate) fn probe_resume(
+pub(crate) async fn probe_resume(
     resume_spec: &ResumeSpec,
     state_dir: &Path,
+    run_as_uid: u32,
+    run_as_gid: u32,
 ) -> Result<ProviderStoreProbe, String> {
-    let path = state_dir.join(STATE_FILE);
-    if !path.exists() {
+    let Some(state) = read_provider_state(state_dir, run_as_uid, run_as_gid).await? else {
         return Ok(ProviderStoreProbe::DefinitivelyUnavailable {
             reason: "deterministic provider state is absent".into(),
             evidence: vec!["fixtureState=missing".into()],
             store_state: EvidenceStoreState::Missing,
         });
-    }
-    let state = serde_json::from_slice::<FixtureState>(
-        &fs::read(&path).map_err(|error| format!("read deterministic provider state: {error}"))?,
-    )
-    .map_err(|error| format!("decode deterministic provider state: {error}"))?;
+    };
     if state.schema_version != 1 {
         return Ok(ProviderStoreProbe::Blocked {
             reason: RecoveryBlockReason::IncompatibleBinary,
@@ -360,11 +365,143 @@ fn short_hash(value: &str) -> String {
 }
 
 fn write_state(state_dir: &Path, state: &FixtureState) -> Result<(), String> {
+    fs::create_dir_all(state_dir).map_err(|error| error.to_string())?;
     let bytes = serde_json::to_vec_pretty(state).map_err(|error| error.to_string())?;
     let path = state_dir.join(STATE_FILE);
     let temporary = state_dir.join(format!(".{STATE_FILE}.{}.tmp", std::process::id()));
     fs::write(&temporary, bytes).map_err(|error| error.to_string())?;
     fs::rename(temporary, path).map_err(|error| error.to_string())
+}
+
+fn read_state(state_dir: &Path) -> Result<Option<FixtureState>, String> {
+    let path = state_dir.join(STATE_FILE);
+    if !path.exists() {
+        return Ok(None);
+    }
+    serde_json::from_slice(&fs::read(&path).map_err(|error| error.to_string())?)
+        .map(Some)
+        .map_err(|error| format!("decode deterministic provider state: {error}"))
+}
+
+#[cfg(test)]
+async fn read_provider_state(
+    state_dir: &Path,
+    _run_as_uid: u32,
+    _run_as_gid: u32,
+) -> Result<Option<FixtureState>, String> {
+    read_state(state_dir)
+}
+
+#[cfg(test)]
+async fn write_provider_state(
+    state_dir: &Path,
+    state: &FixtureState,
+    _run_as_uid: u32,
+    _run_as_gid: u32,
+) -> Result<(), String> {
+    write_state(state_dir, state)
+}
+
+#[cfg(not(test))]
+async fn read_provider_state(
+    state_dir: &Path,
+    run_as_uid: u32,
+    run_as_gid: u32,
+) -> Result<Option<FixtureState>, String> {
+    let output = provider_state_worker(state_dir, run_as_uid, run_as_gid, "read", None).await?;
+    serde_json::from_slice(&output)
+        .map_err(|error| format!("decode provider-state worker reply: {error}"))
+}
+
+#[cfg(not(test))]
+async fn write_provider_state(
+    state_dir: &Path,
+    state: &FixtureState,
+    run_as_uid: u32,
+    run_as_gid: u32,
+) -> Result<(), String> {
+    let input = serde_json::to_vec(state).map_err(|error| error.to_string())?;
+    provider_state_worker(state_dir, run_as_uid, run_as_gid, "write", Some(&input))
+        .await
+        .map(|_| ())
+}
+
+#[cfg(not(test))]
+async fn provider_state_worker(
+    state_dir: &Path,
+    run_as_uid: u32,
+    run_as_gid: u32,
+    operation: &str,
+    input: Option<&[u8]>,
+) -> Result<Vec<u8>, String> {
+    if state_dir != Path::new("/home/freshell/provider/.freshell-fixture") {
+        return Err("deterministic provider state path is not the mounted provider home".into());
+    }
+    let executable = std::env::current_exe().map_err(|error| error.to_string())?;
+    let current_uid = unsafe { libc::geteuid() };
+    let current_gid = unsafe { libc::getegid() };
+    let mut command = if run_as_uid == current_uid && run_as_gid == current_gid {
+        Command::new(&executable)
+    } else {
+        let mut command = Command::new("/usr/bin/setpriv");
+        command
+            .arg("--reuid")
+            .arg(run_as_uid.to_string())
+            .arg("--regid")
+            .arg(run_as_gid.to_string())
+            .arg("--clear-groups")
+            .arg("--no-new-privs")
+            .arg("--")
+            .arg(executable);
+        command
+    };
+    command
+        .arg("fresh-agent-fixture-state-worker")
+        .arg(operation)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = command
+        .spawn()
+        .map_err(|error| format!("spawn provider-state worker: {error}"))?;
+    if let Some(input) = input {
+        child
+            .stdin
+            .take()
+            .ok_or_else(|| "provider-state worker has no stdin".to_string())?
+            .write_all(input)
+            .await
+            .map_err(|error| format!("write provider-state worker: {error}"))?;
+    }
+    drop(child.stdin.take());
+    let output = child
+        .wait_with_output()
+        .await
+        .map_err(|error| format!("wait for provider-state worker: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "provider-state worker exited {:?}: {}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stderr).trim(),
+        ));
+    }
+    Ok(output.stdout)
+}
+
+pub(crate) fn run_state_worker(args: &[String]) -> Result<(), String> {
+    let state_dir = Path::new("/home/freshell/provider/.freshell-fixture");
+    match args {
+        [operation] if operation == "read" => {
+            serde_json::to_writer(std::io::stdout(), &read_state(state_dir)?)
+                .map_err(|error| error.to_string())
+        }
+        [operation] if operation == "write" => {
+            let state: FixtureState = serde_json::from_reader(std::io::stdin())
+                .map_err(|error| format!("decode provider-state write: {error}"))?;
+            write_state(state_dir, &state)
+        }
+        _ => Err("fixture state worker requires read or write".into()),
+    }
 }
 
 fn non_ambiguous(message: impl ToString) -> DispatchFailure {
@@ -474,8 +611,8 @@ mod tests {
         transport.stop().await.unwrap();
     }
 
-    #[test]
-    fn recovery_probe_requires_the_exact_persisted_native_identity() {
+    #[tokio::test]
+    async fn recovery_probe_requires_the_exact_persisted_native_identity() {
         let root = tempfile::tempdir().unwrap();
         let state = FixtureState {
             schema_version: 1,
@@ -487,14 +624,18 @@ mod tests {
         write_state(root.path(), &state).unwrap();
         let mut spec = fixture_resume_spec("fixture-native-codex-exact");
         assert!(matches!(
-            probe_resume(&spec, root.path()).unwrap(),
+            probe_resume(&spec, root.path(), unsafe { libc::getuid() }, unsafe { libc::getgid() }).await.unwrap(),
             ProviderStoreProbe::Ready { evidence }
                 if evidence.iter().any(|item| item == "fixtureIdentity=exact")
         ));
 
         spec.provider_session.native_session_id = "fixture-native-codex-wrong".into();
         assert!(matches!(
-            probe_resume(&spec, root.path()).unwrap(),
+            probe_resume(&spec, root.path(), unsafe { libc::getuid() }, unsafe {
+                libc::getgid()
+            })
+            .await
+            .unwrap(),
             ProviderStoreProbe::DefinitivelyUnavailable {
                 store_state: EvidenceStoreState::PresentReadable,
                 ..

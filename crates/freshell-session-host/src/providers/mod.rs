@@ -13,6 +13,8 @@ mod fresh_agent;
 mod opencode;
 
 #[cfg(feature = "fresh-agent-fixtures")]
+pub(crate) use deterministic_fresh_agent::run_state_worker as run_fresh_agent_fixture_state_worker;
+#[cfg(feature = "fresh-agent-fixtures")]
 pub(crate) use deterministic_fresh_agent::run_worker as run_fresh_agent_fixture_worker;
 pub(crate) use fresh_agent::open_hosted_fresh_agent;
 
@@ -82,7 +84,7 @@ pub async fn probe_resume(
     let provider = resume_spec.provider_session.provider.clone();
     let result = match resume_spec.fixture_transport {
         Some(freshell_runtime_protocol::FreshAgentFixtureTransport::Deterministic) => {
-            deterministic_resume_probe(&resume_spec)
+            deterministic_resume_probe(&resume_spec, run_as_uid, run_as_gid).await
         }
         None => match provider.as_str() {
             "claude" | "kilroy" => claude::probe(&resume_spec, run_as_uid, run_as_gid).await,
@@ -160,17 +162,28 @@ pub async fn probe_resume(
 }
 
 #[cfg(feature = "fresh-agent-fixtures")]
-fn deterministic_resume_probe(spec: &ResumeSpec) -> Result<ProviderStoreProbe, String> {
+async fn deterministic_resume_probe(
+    spec: &ResumeSpec,
+    run_as_uid: u32,
+    run_as_gid: u32,
+) -> Result<ProviderStoreProbe, String> {
     deterministic_fresh_agent::probe_resume(
         spec,
         std::path::Path::new(&spec.provider_home)
             .join(".freshell-fixture")
             .as_path(),
+        run_as_uid,
+        run_as_gid,
     )
+    .await
 }
 
 #[cfg(not(feature = "fresh-agent-fixtures"))]
-fn deterministic_resume_probe(_spec: &ResumeSpec) -> Result<ProviderStoreProbe, String> {
+async fn deterministic_resume_probe(
+    _spec: &ResumeSpec,
+    _run_as_uid: u32,
+    _run_as_gid: u32,
+) -> Result<ProviderStoreProbe, String> {
     Err("deterministic fresh-agent recovery is absent from this session-host build".into())
 }
 

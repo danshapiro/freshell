@@ -103,6 +103,8 @@ async fn run() -> Result<(), String> {
         Some("fixture-child") => fixture_child(&args[2..]).await,
         #[cfg(feature = "fresh-agent-fixtures")]
         Some("fresh-agent-fixture-worker") => providers::run_fresh_agent_fixture_worker(&args[2..]).await,
+        #[cfg(feature = "fresh-agent-fixtures")]
+        Some("fresh-agent-fixture-state-worker") => providers::run_fresh_agent_fixture_state_worker(&args[2..]),
         Some("opencode-identity-worker") => pty::run_opencode_identity_worker(&args[2..]),
         Some("provider-probe-worker") => providers::run_probe_worker(&args[2..]),
         _ => Err("usage: freshell-session-host <serve|worker|fixture-child|fresh-agent-fixture-worker|opencode-identity-worker|provider-probe-worker> ...".into()),
@@ -177,6 +179,14 @@ async fn handle_connection(mut stream: UnixStream, state: Arc<HostState>) -> Res
         read_frame(&mut stream).await.map_err(|e| e.to_string())?;
     let request_id = envelope.request_id.clone();
     let result = dispatch(envelope, &state).await;
+    if let Err(error) = &result {
+        let _ = append_event_with_secret(
+            &state.state_dir,
+            &state.secret,
+            "host.command_failed",
+            serde_json::json!({"errorCode":error.code,"message":error.message}),
+        );
+    }
     write_frame(&mut stream, &HostReply { request_id, result })
         .await
         .map_err(|e| e.to_string())
@@ -863,19 +873,19 @@ async fn grant_execution(
                     launch.run_as_uid,
                     launch.run_as_gid,
                 )
-                .map_err(|_| {
+                .map_err(|error| {
                     RuntimeError::new(
                         RuntimeErrorCode::HostUnreachable,
-                        "prepare hosted fresh-agent provider state failed",
+                        format!("prepare hosted fresh-agent provider state failed: {error}"),
                     )
                 })?;
             }
             let actor = providers::open_hosted_fresh_agent(&state.state_dir, launch.clone())
                 .await
-                .map_err(|_| {
+                .map_err(|error| {
                     RuntimeError::new(
                         RuntimeErrorCode::HostUnreachable,
-                        "hosted fresh-agent provider failed to start",
+                        format!("hosted fresh-agent provider failed to start: {error}"),
                     )
                 })?;
             let profile = actor.profile().await;
