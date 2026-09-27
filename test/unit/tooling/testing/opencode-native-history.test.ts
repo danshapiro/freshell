@@ -1,3 +1,4 @@
+// @vitest-environment node
 import { createHash } from 'node:crypto'
 import fs from 'node:fs'
 import os from 'node:os'

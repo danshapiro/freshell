@@ -13,9 +13,8 @@ function resolveTsxLoaderPath(): string {
 const { mockConnect, mockRegisterTool, mockMcpServer, mockStdioTransport, mockExecuteAction } = vi.hoisted(() => {
   const mockConnect = vi.fn().mockResolvedValue(undefined)
   const mockRegisterTool = vi.fn()
-  const mockMcpServer = vi.fn().mockReturnValue({
-    tool: mockRegisterTool,
-    connect: mockConnect,
+  const mockMcpServer = vi.fn().mockImplementation(function () {
+    return { tool: mockRegisterTool, connect: mockConnect }
   })
   const mockStdioTransport = vi.fn()
   const mockExecuteAction = vi.fn().mockResolvedValue({ ok: true })
@@ -48,9 +47,8 @@ describe('MCP server initialization', () => {
     mockExecuteAction.mockClear()
 
     // Re-mock after resetModules
-    mockMcpServer.mockReturnValue({
-      tool: mockRegisterTool,
-      connect: mockConnect,
+    mockMcpServer.mockImplementation(function () {
+      return { tool: mockRegisterTool, connect: mockConnect }
     })
   })
 
