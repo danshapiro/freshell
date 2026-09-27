@@ -4969,6 +4969,54 @@ fn register_fresh_agent_tab(
         .insert(pane_id.to_string(), tab_id.to_string());
 }
 
+/// A web restart drops the REST pane map while the shared layout and hosted
+/// runtime survive. Resolve hosted panes from the persisted layout on a miss;
+/// the gateway still checks the session against the supervisor inventory.
+fn pane_entry_for_request(state: &FreshAgentState, pane_id: &str) -> Option<PaneEntry> {
+    if let Some(pane) = state.panes.lock().expect("panes mutex").get(pane_id) {
+        return Some(pane.clone());
+    }
+    state.hosted_rest_gateway()?;
+    let snapshot = state.layout.get_pane_snapshot(pane_id)?;
+    let content = snapshot.pane_content?;
+    if content.get("kind")?.as_str()? != "fresh-agent" {
+        return None;
+    }
+    let provider = content.get("provider")?.as_str()?;
+    let session_type = content.get("sessionType")?.as_str()?;
+    if !matches!(
+        (provider, session_type),
+        ("claude", "freshclaude")
+            | ("claude", "kilroy")
+            | ("codex", "freshcodex")
+            | ("opencode", "freshopencode")
+    ) {
+        return None;
+    }
+    let session_id = content.get("sessionId")?.as_str()?.to_string();
+    if session_id.is_empty() {
+        return None;
+    }
+    Some(PaneEntry {
+        placeholder_id: session_id.clone(),
+        provider: provider.to_string(),
+        session_type: session_type.to_string(),
+        cwd: content
+            .get("initialCwd")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        model: content
+            .get("model")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        effort: content
+            .get("effort")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        durable_id: Some(session_id),
+    })
+}
+
 /// Broadcast `ui.command{tab.create}` — AFTER registration (Node's order is
 /// createTab -> runtime create -> attachPaneContent -> broadcast -> respond,
 /// router.ts:546-589, and `create_content_tab` likewise inserts before
@@ -6132,13 +6180,7 @@ async fn send_keys(
         return fail_json(StatusCode::BAD_REQUEST, "text is required".to_string());
     }
 
-    let pane = match state
-        .panes
-        .lock()
-        .expect("panes mutex")
-        .get(&pane_id)
-        .cloned()
-    {
+    let pane = match pane_entry_for_request(&state, &pane_id) {
         Some(pane) => pane,
         None => return fail_json(StatusCode::NOT_FOUND, "pane not found".to_string()),
     };
@@ -6822,13 +6864,7 @@ async fn capture(
         return resp;
     }
 
-    let pane = match state
-        .panes
-        .lock()
-        .expect("panes mutex")
-        .get(&pane_id)
-        .cloned()
-    {
+    let pane = match pane_entry_for_request(&state, &pane_id) {
         Some(pane) => pane,
         None => {
             // Layout-only panes (e.g. a legacy `agent-chat` pane normalized to
@@ -8944,6 +8980,106 @@ mod tests {
     }
 
     // -- P1.13 Task 7: REST send-keys materialization writes a binding row --
+
+    #[derive(Default)]
+    struct RecordingHostedRestGateway {
+        sends: Mutex<Vec<hosted_rest::HostedRestSend>>,
+        captures: Mutex<Vec<hosted_rest::HostedRestCapture>>,
+    }
+
+    #[async_trait::async_trait]
+    impl hosted_rest::HostedFreshAgentRestGateway for RecordingHostedRestGateway {
+        async fn create_agent(
+            self: Arc<Self>,
+            _request: hosted_rest::HostedRestCreate,
+        ) -> Result<hosted_rest::HostedRestCreated, ()> {
+            Ok(hosted_rest::HostedRestCreated {
+                session_id: "managed-kilroy-recovered".into(),
+            })
+        }
+
+        async fn send_agent(
+            &self,
+            request: hosted_rest::HostedRestSend,
+        ) -> Result<hosted_rest::HostedRestSendResult, ()> {
+            self.sends.lock().expect("sends mutex").push(request);
+            Ok(hosted_rest::HostedRestSendResult {
+                session_id: "managed-kilroy-recovered".into(),
+                completed: true,
+            })
+        }
+
+        async fn capture(
+            &self,
+            request: hosted_rest::HostedRestCapture,
+        ) -> Result<hosted_rest::HostedRestCaptureResult, hosted_rest::HostedRestCaptureError>
+        {
+            self.captures.lock().expect("captures mutex").push(request);
+            Ok(hosted_rest::HostedRestCaptureResult {
+                session_id: "managed-kilroy-recovered".into(),
+                native_session_id: "kilroy-native".into(),
+                text: "recovered transcript".into(),
+                truncated: false,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn hosted_rest_send_and_capture_recover_pane_from_persisted_layout_after_web_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("layout.json");
+        let gateway = Arc::new(RecordingHostedRestGateway::default());
+        let first = state().with_layout(layout_store::LayoutStore::with_persistence(path.clone()));
+        first.set_hosted_rest_gateway(gateway.clone()).unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert("x-auth-token", "tok".parse().unwrap());
+        let created = create_tab(
+            State(first),
+            headers.clone(),
+            Json(json!({ "agent": "kilroy", "cwd": "/tmp" })),
+        )
+        .await;
+        assert_eq!(created.status(), StatusCode::OK);
+        let created_body: Value = serde_json::from_slice(
+            &axum::body::to_bytes(created.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        let pane_id = created_body["data"]["paneId"].as_str().unwrap().to_string();
+
+        let restarted = state().with_layout(layout_store::LayoutStore::with_persistence(path));
+        restarted.set_hosted_rest_gateway(gateway.clone()).unwrap();
+        let sent = send_keys(
+            State(restarted.clone()),
+            Path(pane_id.clone()),
+            headers.clone(),
+            Json(json!({ "data": "after restart" })),
+        )
+        .await;
+        assert_eq!(sent.status(), StatusCode::OK);
+        let sends = gateway.sends.lock().expect("sends mutex");
+        assert_eq!(sends.len(), 1);
+        assert_eq!(sends[0].session_id, "managed-kilroy-recovered");
+        assert_eq!(sends[0].text, "after restart");
+        drop(sends);
+
+        let captured = capture(
+            State(restarted),
+            Path(pane_id),
+            headers,
+            Query(std::collections::HashMap::new()),
+        )
+        .await;
+        assert_eq!(captured.status(), StatusCode::OK);
+        let text = axum::body::to_bytes(captured.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(&text[..], b"recovered transcript");
+        let captures = gateway.captures.lock().expect("captures mutex");
+        assert_eq!(captures.len(), 1);
+        assert_eq!(captures[0].session_id, "managed-kilroy-recovered");
+    }
 
     /// Like `opencode_ws::tests::FakeHttp`: `POST /session` mints `ses_1`; everything
     /// else (health, prompt, status) answers a benign `{}`.
