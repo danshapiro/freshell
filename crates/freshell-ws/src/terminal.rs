@@ -12249,6 +12249,8 @@ mod managed_output_order_tests {
         ) -> ManagedTerminalFuture<'a, Result<ManagedOutputRead, String>> {
             Box::pin(async {
                 Ok(ManagedOutputRead {
+                    stream_epoch: Some("S-managed-short-lived".into()),
+                    incarnation_id: Some("incarnation-short-lived".into()),
                     reset_required: false,
                     truncated: false,
                     retained_from_seq: 1,
