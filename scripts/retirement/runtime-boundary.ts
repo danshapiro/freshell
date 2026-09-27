@@ -47,6 +47,8 @@ const ignoredDirectoryNames = new Set([
 // checkout root; a similarly named directory under scripts/ or test/ must
 // still be inspected as ordinary repository content.
 const ignoredGeneratedRootDirectoryNames = new Set([
+  '.runtime-build',
+  '.runtime-evidence',
   'bundled-node',
   'server-node-modules',
 ])
@@ -66,6 +68,9 @@ const sourceExtensions = new Set(['.cjs', '.js', '.jsx', '.mjs', '.ts', '.tsx'])
  */
 export const NON_BACKEND_LISTENER_PATHS = [
   'scripts/testing/coordinator-endpoint.ts',
+  // The qualification harness brokers Docker API calls through a local Unix
+  // socket. It has no Freshell PTYs or application state.
+  'scripts/testing/runtime-test-broker.ts',
   // The native session-names contract runner: its pickFreePort binds
   // loopback :0 transiently (probe-and-close) to hand a free port to the
   // CHILD freshell-server / provider CLI processes it launches inside the

@@ -17,6 +17,7 @@ type RuntimeSurface = {
 
 const ALLOWED_LISTENER_PATHS = [
   'scripts/testing/coordinator-endpoint.ts',
+  'scripts/testing/runtime-test-broker.ts',
   'test/e2e-browser/helpers/echo-ws-fixture.ts',
   'test/e2e-browser/helpers/harness-06/target-server.ts',
   'test/e2e-browser/helpers/harness-06/update-feed.ts',
@@ -181,6 +182,18 @@ describe('runtime boundary analyzer', () => {
 
     expect(result.manifestDrift).toEqual(['unlisted owner: scripts/bundled-node/new-owner.ts'])
     expect(result.unexpectedNodeBackend).toEqual(['scripts/bundled-node/new-owner.ts'])
+  })
+
+  it('ignores runtime qualification artifacts at checkout top level but scans nested paths', async () => {
+    const root = await createSyntheticRoot([], {
+      '.runtime-build/run/unlisted-helper': '#!/bin/sh\nexit 0\n',
+      '.runtime-evidence/run/unlisted-helper': '#!/bin/sh\nexit 0\n',
+      'scripts/.runtime-build/unlisted-helper': '#!/bin/sh\nexit 0\n',
+    })
+
+    const result = await analyzeRuntimeBoundary(root)
+
+    expect(result.manifestDrift).toEqual(['unlisted owner: scripts/.runtime-build/unlisted-helper'])
   })
 
   it.each(BUILD_COMPOSITIONS)(

@@ -450,6 +450,7 @@ describe('launch-time INVALID_TERMINAL_ID bounded retry', () => {
     // Budget exhausted (5 schedules consumed) -> the 6th failure fell through
     // to failLaunch inside the loop's final iteration.
     expect(paneStatus(store)).toBe('error')
+    await act(async () => { vi.advanceTimersByTime(17) })
     const wroteFailure = terminalInstances.some((t: any) =>
       t.write.mock.calls.some(([data]: [string]) => String(data).includes('[Restore failed]')))
     expect(wroteFailure).toBe(true)

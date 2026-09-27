@@ -131,7 +131,7 @@ describe('useTabBarScroll', () => {
     mockDisconnect = vi.fn()
     resizeCallback = null
     originalResizeObserver = globalThis.ResizeObserver
-    globalThis.ResizeObserver = vi.fn((cb) => {
+    globalThis.ResizeObserver = vi.fn(function (cb) {
       resizeCallback = cb
       return {
         observe: mockObserve,

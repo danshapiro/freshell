@@ -47,7 +47,7 @@ describe('useNotificationSound', () => {
   beforeEach(() => {
     audioInstances = []
     playImpl = () => Promise.resolve()
-    AudioSpy = vi.fn(() => {
+    AudioSpy = vi.fn(function () {
       const listeners = new Map<string, Array<() => void>>()
       const instance: FakeAudio = {
         preload: '',

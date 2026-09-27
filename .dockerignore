@@ -167,6 +167,9 @@ Thumbs.db
 !AGENTS.md
 !docs/skills/testing.md
 !docs/lab-notes/2026-04-20-coding-cli-session-contract.md
+!docs/development/
+docs/development/*
+!docs/development/runtime-provider-capabilities.json
 
 # Explicitly keep package manifests (harmless; guards against future globs)
 !package.json

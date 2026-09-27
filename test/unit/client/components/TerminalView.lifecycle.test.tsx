@@ -4649,6 +4649,7 @@ describe('TerminalView lifecycle updates', () => {
       fireData(term, 'doomed keystrokes')
       act(() => {
         vi.advanceTimersByTime(30_001)
+        vi.advanceTimersByTime(17) // Vitest 5 schedules the queued xterm write on the next frame.
       })
       expectTerminalWriteContaining(term, 'the terminal did not reconnect in time')
     } finally {
@@ -4754,6 +4755,7 @@ describe('TerminalView lifecycle updates', () => {
       fireData(term, 'doomed')
       act(() => {
         vi.advanceTimersByTime(30_001) // timeout -> immediate notice write
+        vi.advanceTimersByTime(17) // Flush the queued notice before anchoring.
       })
       const writesBeforeAnchor = term.write.mock.calls.length
 
@@ -4764,6 +4766,7 @@ describe('TerminalView lifecycle updates', () => {
           requestId: createMsg.requestId,
           terminalId: 'term-new',
         })
+        vi.advanceTimersByTime(17) // Flush the post-anchor notice write.
       })
       // The notice is written AGAIN after the anchor (post-clear), so it
       // survives the hydrate wipe.

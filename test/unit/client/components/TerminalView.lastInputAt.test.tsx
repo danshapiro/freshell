@@ -14,33 +14,37 @@ import type { TerminalPaneContent } from '@/store/paneTypes'
 let onDataCallback: ((data: string) => void) | null = null
 
 vi.mock('@xterm/xterm', () => ({
-  Terminal: vi.fn().mockImplementation(() => ({
-    loadAddon: vi.fn(),
-    open: vi.fn(),
-    registerLinkProvider: vi.fn(() => ({ dispose: vi.fn() })),
-    onData: vi.fn((cb: (data: string) => void) => {
-      onDataCallback = cb
-      return { dispose: vi.fn() }
-    }),
-    onTitleChange: vi.fn(() => ({ dispose: vi.fn() })),
-    attachCustomKeyEventHandler: vi.fn(),
-    attachCustomWheelEventHandler: vi.fn(),
-    dispose: vi.fn(),
-    write: vi.fn(),
-    writeln: vi.fn(),
-    clear: vi.fn(),
-    cols: 80,
-    rows: 24,
-    options: {},
-    getSelection: vi.fn(() => ''),
-    focus: vi.fn(),
-  })),
+  Terminal: vi.fn().mockImplementation(function () {
+    return {
+      loadAddon: vi.fn(),
+      open: vi.fn(),
+      registerLinkProvider: vi.fn(() => ({ dispose: vi.fn() })),
+      onData: vi.fn((cb: (data: string) => void) => {
+        onDataCallback = cb
+        return { dispose: vi.fn() }
+      }),
+      onTitleChange: vi.fn(() => ({ dispose: vi.fn() })),
+      attachCustomKeyEventHandler: vi.fn(),
+      attachCustomWheelEventHandler: vi.fn(),
+      dispose: vi.fn(),
+      write: vi.fn(),
+      writeln: vi.fn(),
+      clear: vi.fn(),
+      cols: 80,
+      rows: 24,
+      options: {},
+      getSelection: vi.fn(() => ''),
+      focus: vi.fn(),
+    }
+  }),
 }))
 
 vi.mock('@xterm/addon-fit', () => ({
-  FitAddon: vi.fn().mockImplementation(() => ({
-    fit: vi.fn(),
-  })),
+  FitAddon: vi.fn().mockImplementation(function () {
+    return {
+      fit: vi.fn(),
+    }
+  }),
 }))
 
 const mockSend = vi.fn()
@@ -53,10 +57,12 @@ vi.mock('@/lib/ws-client', () => ({
   }),
 }))
 
-vi.stubGlobal('ResizeObserver', vi.fn().mockImplementation(() => ({
-  observe: vi.fn(),
-  disconnect: vi.fn(),
-})))
+vi.stubGlobal('ResizeObserver', vi.fn().mockImplementation(function () {
+  return {
+    observe: vi.fn(),
+    disconnect: vi.fn(),
+  }
+}))
 
 describe('TerminalView - lastInputAt updates', () => {
   beforeEach(() => {
