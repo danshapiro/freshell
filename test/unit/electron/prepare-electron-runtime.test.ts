@@ -14,6 +14,7 @@ vi.mock('node:fs', async (importOriginal) => {
 import {
   RUNTIME_LAYOUT,
   buildDeployArgs,
+  extractNodeArchive,
   findUnapprovedRuntimePaths,
   getRuntimeAllowlist,
   getNodeBinaryName,
@@ -35,6 +36,54 @@ function nativeArch(): 'x64' | 'arm64' {
 
 function temporaryRoot(): string {
   return mkdtempSync(path.join(tmpdir(), 'freshell-electron-runtime-'))
+}
+
+function crc32(bytes: Buffer): number {
+  let crc = 0xffffffff
+  for (const byte of bytes) {
+    crc ^= byte
+    for (let bit = 0; bit < 8; bit++) {
+      crc = (crc >>> 1) ^ (crc & 1 ? 0xedb88320 : 0)
+    }
+  }
+  return (crc ^ 0xffffffff) >>> 0
+}
+
+function storedZip(members: Array<{ name: string; bytes: Buffer }>): Buffer {
+  const localRecords: Buffer[] = []
+  const directoryRecords: Buffer[] = []
+  let offset = 0
+  for (const { name, bytes } of members) {
+    const fileName = Buffer.from(name)
+    const local = Buffer.alloc(30)
+    local.writeUInt32LE(0x04034b50, 0)
+    local.writeUInt16LE(20, 4)
+    local.writeUInt32LE(crc32(bytes), 14)
+    local.writeUInt32LE(bytes.length, 18)
+    local.writeUInt32LE(bytes.length, 22)
+    local.writeUInt16LE(fileName.length, 26)
+    localRecords.push(local, fileName, bytes)
+
+    const directory = Buffer.alloc(46)
+    directory.writeUInt32LE(0x02014b50, 0)
+    directory.writeUInt16LE(20, 4)
+    directory.writeUInt16LE(20, 6)
+    directory.writeUInt32LE(crc32(bytes), 16)
+    directory.writeUInt32LE(bytes.length, 20)
+    directory.writeUInt32LE(bytes.length, 24)
+    directory.writeUInt16LE(fileName.length, 28)
+    directory.writeUInt32LE(offset, 42)
+    directoryRecords.push(directory, fileName)
+    offset += local.length + fileName.length + bytes.length
+  }
+  const directorySize = directoryRecords.reduce((total, record) => total + record.length, 0)
+  const end = Buffer.alloc(22)
+  end.writeUInt32LE(0x06054b50, 0)
+  end.writeUInt16LE(members.length, 8)
+  end.writeUInt16LE(members.length, 10)
+  end.writeUInt32LE(directorySize, 12)
+  end.writeUInt32LE(offset, 16)
+  return Buffer.concat([...localRecords, ...directoryRecords, end])
 }
 
 function writeExecutable(filePath: string, contents = '#!/bin/sh\nexit 0\n'): void {
@@ -210,7 +259,7 @@ function collectLinks(root: string): string[] {
       else if (stats.isDirectory()) walk(absolute)
     }
   }
-  walk(root, '')
+  walk(root)
   return links.sort()
 }
 
@@ -230,6 +279,27 @@ function stageFixture(root: string, runtimeDir: string, extra: { deployRuntime?:
 }
 
 describe('prepare-electron-runtime staging', () => {
+  it('extracts only the expected Windows Node executable from a ZIP archive', async () => {
+    const root = temporaryRoot()
+    try {
+      const archive = path.join(root, 'node.zip')
+      const destination = path.join(root, 'staged', 'node.exe')
+      const nodeBytes = Buffer.from('synthetic Windows Node executable')
+      writeFileSync(archive, storedZip([
+        { name: 'node-v22.12.0-win-x64/README.md', bytes: Buffer.from('not an executable') },
+        { name: 'node-v22.12.0-win-x64/node.exe', bytes: nodeBytes },
+      ]))
+
+      await extractNodeArchive('22.12.0', 'win32', 'x64', archive, destination)
+
+      expect(readFileSync(destination)).toEqual(nodeBytes)
+      expect(readdirSync(path.dirname(destination))).toEqual(['node.exe'])
+      expect(readdirSync(root)).toEqual(['node.zip', 'staged'])
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
+
   it('plans the Rust app resources and keeps Node paths limited to sanctioned clients', () => {
     const runtimeRoot = path.resolve('/tmp/electron-runtime')
     expect(getRuntimeBinaryName('linux')).toBe('freshell-server')

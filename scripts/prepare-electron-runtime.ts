@@ -35,6 +35,7 @@ import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { pipeline } from 'node:stream/promises'
+import yauzl from 'yauzl'
 
 import {
   detectProjectManager,
@@ -707,41 +708,71 @@ async function downloadNodeArchive(
   }
 }
 
-async function extractNodeArchive(
+async function extractZipMember(archivePath: string, member: string, destination: string): Promise<void> {
+  const zip = await new Promise<yauzl.ZipFile>((resolve, reject) => {
+    yauzl.open(archivePath, { lazyEntries: true, autoClose: false }, (error, file) => {
+      if (error) reject(error)
+      else resolve(file)
+    })
+  })
+  try {
+    await new Promise<void>((resolve, reject) => {
+      zip.on('error', reject)
+      zip.on('end', () => reject(new Error(`Node archive is missing ${member}`)))
+      zip.on('entry', (entry: yauzl.Entry) => {
+        if (entry.fileName !== member) {
+          zip.readEntry()
+          return
+        }
+        zip.openReadStream(entry, (error, input) => {
+          if (error) {
+            reject(error)
+            return
+          }
+          if (!input) {
+            reject(new Error(`Cannot read ${member} from Node archive`))
+            return
+          }
+          void pipeline(input, createWriteStream(destination)).then(resolve, reject)
+        })
+      })
+      zip.readEntry()
+    })
+  } catch (error) {
+    removePath(destination)
+    throw error
+  } finally {
+    zip.close()
+  }
+}
+
+export async function extractNodeArchive(
   version: string,
   platform: ElectronRuntimePlatform,
   arch: ElectronRuntimeArch,
   archivePath: string,
   binaryPath: string,
 ): Promise<void> {
+  mkdirSync(path.dirname(binaryPath), { recursive: true })
+  if (platform === 'win32') {
+    await extractZipMember(archivePath, `node-v${version}-win-${arch}/node.exe`, binaryPath)
+    return
+  }
   const extractionDir = path.join(path.dirname(archivePath), `extract-${platform}-${arch}`)
   removePath(extractionDir)
   mkdirSync(extractionDir, { recursive: true })
-  mkdirSync(path.dirname(binaryPath), { recursive: true })
   try {
-    if (platform === 'win32') {
-      const extractZip = (await import('extract-zip')).default
-      await extractZip(archivePath, { dir: extractionDir })
-      copyRequiredFile(
-        path.join(extractionDir, `node-v${version}-win-${arch}`, 'node.exe'),
-        binaryPath,
-      )
-    } else {
-      // tar does not ship declarations; keep this dynamic import isolated to
-      // the archive-extraction branch so staging retains the existing runtime
-      // dependency without adding a type-only package.
-      // @ts-expect-error tar has no bundled TypeScript declarations.
-      const tar = await import('tar')
-      const member = `node-v${version}-${platform}-${arch}/bin/node`
-      await tar.x({
-        file: archivePath,
-        cwd: extractionDir,
-        strip: 2,
-        filter: (entryPath: string) => entryPath === member,
-      })
-      copyRequiredFile(path.join(extractionDir, 'node'), binaryPath)
-    }
-    if (platform !== 'win32') ensureExecutable(binaryPath)
+    // Keep tar isolated to the Unix archive-extraction branch.
+    const tar = await import('tar')
+    const member = `node-v${version}-${platform}-${arch}/bin/node`
+    await tar.x({
+      file: archivePath,
+      cwd: extractionDir,
+      strip: 2,
+      filter: (entryPath: string) => entryPath === member,
+    })
+    copyRequiredFile(path.join(extractionDir, 'node'), binaryPath)
+    ensureExecutable(binaryPath)
   } finally {
     removePath(extractionDir)
   }
