@@ -12444,6 +12444,38 @@ rl.on('line', (line) => {
         );
     }
 
+    // Creation may publish the CLI index and durable binding while its
+    // ownership attach guard still holds the key. Match the production
+    // handoff caller's bounded retry of that transient Blocked outcome.
+    async fn begin_test_terminal_handoff(
+        registry: &freshell_ownership::RuntimeOwnershipRegistry,
+        operation_id: &str,
+    ) -> u64 {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
+        loop {
+            match registry.begin_handoff(
+                "claude",
+                FRESH_CREATE_DURABLE_ID,
+                freshell_ownership::RuntimeOwnerKind::Terminal,
+                operation_id,
+                None,
+                "test",
+                0,
+            ) {
+                freshell_ownership::BeginOutcome::Granted { generation } => return generation,
+                freshell_ownership::BeginOutcome::Blocked { retry_after_ms, .. } => {
+                    assert!(
+                        tokio::time::Instant::now() < deadline,
+                        "the Handoff begin never cleared its transient Blocked window"
+                    );
+                    tokio::time::sleep(std::time::Duration::from_millis(retry_after_ms.min(50)))
+                        .await;
+                }
+                other => panic!("expected the Handoff begin to be granted, got {other:?}"),
+            }
+        }
+    }
+
     /// b8ke delta round-3 F1: a coordinator-REFUSED kill mutates NOTHING
     /// durable — the pane-ledger row stays BOUND, the session stays live,
     /// and the refusal broadcast is TYPED (code + message, never
@@ -12477,39 +12509,9 @@ rl.on('line', (line) => {
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
 
-        // THE REFUSAL WINDOW: a handoff owns the key's transition. The
-        // begin honors the registry's own transient contract: the
-        // create's adoption can still hold its attach guard
-        // (`in_flight_attaches > 0` on a Vacant record — the b8ke ext
-        // r32 F1 exit-during-guard window) after the identity binding is
-        // recorded, so a single-shot begin can answer
-        // `Blocked { retry_after_ms }` under heavy parallel load. The
-        // production handoff caller RETRIES Blocked; the test applies the
-        // same bounded retry instead of assuming an always-instant
-        // grant (the kata-hsrh flake discipline).
-        let begin_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
-        let _handoff_generation = loop {
-            match registry.begin_handoff(
-                "claude",
-                FRESH_CREATE_DURABLE_ID,
-                freshell_ownership::RuntimeOwnerKind::Terminal,
-                "handoff-blocking-d3-f1",
-                None,
-                "test",
-                0,
-            ) {
-                freshell_ownership::BeginOutcome::Granted { generation } => break generation,
-                freshell_ownership::BeginOutcome::Blocked { retry_after_ms, .. } => {
-                    assert!(
-                        tokio::time::Instant::now() < begin_deadline,
-                        "the Handoff begin never cleared its transient Blocked window"
-                    );
-                    tokio::time::sleep(std::time::Duration::from_millis(retry_after_ms.min(50)))
-                        .await;
-                }
-                other => panic!("expected the Handoff begin to be granted, got {other:?}"),
-            }
-        };
+        // THE REFUSAL WINDOW: the handoff owns the key's transition.
+        let _handoff_generation =
+            begin_test_terminal_handoff(&registry, "handoff-blocking-d3-f1").await;
 
         st.handle_kill(kill_msg(&placeholder)).await;
 
@@ -12594,17 +12596,7 @@ rl.on('line', (line) => {
         // stamp is consumed and a TERMINAL owner is committed under the
         // durable id.
         crate::ownership_lane::take_retained_stamp(&st.ownership_stamps, FRESH_CREATE_DURABLE_ID);
-        let freshell_ownership::BeginOutcome::Granted { generation } = registry.begin_handoff(
-            "claude",
-            FRESH_CREATE_DURABLE_ID,
-            freshell_ownership::RuntimeOwnerKind::Terminal,
-            "handoff-completed-e3r1",
-            None,
-            "test",
-            0,
-        ) else {
-            panic!("expected the Handoff begin to be granted")
-        };
+        let generation = begin_test_terminal_handoff(&registry, "handoff-completed-e3r1").await;
         let terminal_owner = freshell_ownership::OwnerIdentity {
             kind: freshell_ownership::RuntimeOwnerKind::Terminal,
             terminal_id: Some("t-replacement".into()),
@@ -12990,17 +12982,7 @@ rl.on('line', (line) => {
         // THE MID-HANDOFF WINDOW: kill_for_handoff consumed the stamp
         // while the coordinator record stays Handoff.
         crate::ownership_lane::take_retained_stamp(&st.ownership_stamps, FRESH_CREATE_DURABLE_ID);
-        let freshell_ownership::BeginOutcome::Granted { generation } = registry.begin_handoff(
-            "claude",
-            FRESH_CREATE_DURABLE_ID,
-            freshell_ownership::RuntimeOwnerKind::Terminal,
-            "handoff-in-flight-e3r2",
-            None,
-            "test",
-            0,
-        ) else {
-            panic!("expected the Handoff begin to be granted")
-        };
+        let generation = begin_test_terminal_handoff(&registry, "handoff-in-flight-e3r2").await;
 
         // THE CONCURRENT KILL: typed refusal, NOTHING durable.
         st.handle_kill(kill_msg(&placeholder)).await;
@@ -13342,17 +13324,7 @@ rl.on('line', (line) => {
 
         // The Handoff window: the map entry still exists (the runtime has
         // not stopped yet) — the pre-d3 fast paths adopted/no-op'd here.
-        let freshell_ownership::BeginOutcome::Granted { generation: _ } = registry.begin_handoff(
-            "claude",
-            FRESH_CREATE_DURABLE_ID,
-            freshell_ownership::RuntimeOwnerKind::Terminal,
-            "handoff-blocking-d3-f2",
-            None,
-            "test",
-            0,
-        ) else {
-            panic!("expected the Handoff begin to be granted")
-        };
+        begin_test_terminal_handoff(&registry, "handoff-blocking-d3-f2").await;
 
         // A delayed CREATE (resume through the live session): the claim
         // sees the Handoff state and answers the typed refusal — never
