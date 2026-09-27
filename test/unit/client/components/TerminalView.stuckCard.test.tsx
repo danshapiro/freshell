@@ -576,15 +576,13 @@ describe('TerminalView stuck card (wedge-backstop LB-7 matrix)', () => {
     expect(paneState(store).terminalId).toBe(TID)
   })
 
-  // ── E: advisory guard ──
-  it('restart (arm E): bails with no kill when an opencode durable replacement is already in flight', async () => {
+  // ── E: retention loss does not take ownership of the stuck-card action ──
+  it('restart (arm E): a retention gap leaves restart available for an explicit stuck-recovery kill', async () => {
     const { store, paneContent } = makeStore({ stuck: { at: 123, terminalId: TID } })
     await renderPane(store, paneContent)
 
-    // Put the pane into the opencode replay-window replacement flow: the
-    // mount attach is a viewport_hydrate (sinceSeq 0), so an unrecoverable
-    // output gap arms pendingDurableReplacementRef and fires the
-    // replacement's OWN (reason-less) kill.
+    // The mount attach is a viewport_hydrate (sinceSeq 0). A retention gap
+    // reports lost history without automatically killing the running agent.
     const attach = sentFrames().find((m) => m.type === 'terminal.attach' && m.terminalId === TID)
     expect(attach).toMatchObject({ intent: 'viewport_hydrate', sinceSeq: 0 })
     await act(async () => {
@@ -597,17 +595,15 @@ describe('TerminalView stuck card (wedge-backstop LB-7 matrix)', () => {
         toSeq: 5,
       })
     })
-    const replacementKills = sentKills()
-    expect(replacementKills).toHaveLength(1)
-    expect(replacementKills[0]).not.toHaveProperty('reason')
+    expect(sentKills()).toHaveLength(0)
+    expect(paneState(store).status).toBe('running')
 
-    // The stuck card's restart must NOT add a second, reason-carrying kill:
-    // the replacement flow already owns this pane's recovery.
+    // The user can still restart a stuck agent after losing replay history.
     await clickRestart()
     expect(sentKills()).toHaveLength(1)
-    expect(sentKills().filter((m) => m.reason === 'stuck-recovery')).toHaveLength(0)
+    expect(sentKills()[0]).toMatchObject({ terminalId: TID, reason: 'stuck-recovery' })
 
-    // The pane is untouched by the bail — the replacement flow drives it.
+    // The pane stays in place until the correlated kill is acknowledged.
     const content = paneState(store)
     expect(content.status).toBe('running')
     expect(content.pendingReconcile).toBeUndefined()
