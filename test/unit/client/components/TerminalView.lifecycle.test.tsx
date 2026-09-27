@@ -9,6 +9,7 @@ import panesReducer, {
   setPaneCloseError,
   applyReconcileAttach,
   setReconcilePendingPanes,
+  clearAllReconcilePendingPanes,
 } from '@/store/panesSlice'
 import settingsReducer, { defaultSettings, updateSettingsLocal } from '@/store/settingsSlice'
 import connectionReducer, { setStatus as setConnectionStatus } from '@/store/connectionSlice'
@@ -13003,6 +13004,56 @@ describe('TerminalView lifecycle updates', () => {
         expect(terminalWrites(term)).toBe('SEED TAIL')
         expect(term.clear).not.toHaveBeenCalled()
       })
+
+      it.each(['deferred', 'confirmed'] as const)(
+        'retries a rejected attach when the reconcile window closes with a %s verdict',
+        async (verdict) => {
+          const { store, terminalId, term } = await renderReconcileFlapPane('rejected')
+          await applyCheckpointBaseline(terminalId, term)
+          act(() => {
+            store.dispatch(setReconcilePendingPanes({
+              paneKeys: ['tab-v2-stream:pane-v2-stream'],
+              startedAt: Date.now(),
+            }))
+          })
+          wsMocks.send.mockClear()
+
+          act(() => { reconnectHandler?.() })
+          const rejectedAttach = attachMessagesFor(terminalId).at(-1)
+          expect(rejectedAttach).toMatchObject({ type: 'terminal.attach', terminalId })
+
+          act(() => {
+            messageHandler!({
+              type: 'error',
+              code: 'INVALID_TERMINAL_ID',
+              message: 'Terminal not running',
+              terminalId,
+              requestId: rejectedAttach!.attachRequestId,
+            })
+          })
+          expect(sentMessages().filter((msg) => msg?.type === 'terminal.create')).toHaveLength(0)
+
+          // A managed runtime can defer its verdict or confirm the same
+          // persisted identity. Either result must re-drive the attach that
+          // the server rejected, preserving the terminal ID.
+          act(() => {
+            if (verdict === 'confirmed') {
+              store.dispatch(applyReconcileAttach({
+                tabId: 'tab-v2-stream',
+                paneId: 'pane-v2-stream',
+                terminalId,
+                serverInstanceId: 'srv-9b',
+                sessionRef: { provider: 'claude', sessionId: 's-9b-rejected' },
+              }))
+            } else {
+              store.dispatch(clearAllReconcilePendingPanes())
+            }
+          })
+          const attaches = attachMessagesFor(terminalId)
+          expect(attaches).toHaveLength(2)
+          expect(attaches[1].attachRequestId).not.toBe(rejectedAttach!.attachRequestId)
+        },
+      )
 
       it('a corrective duplicate verdict re-drives as a checkpoint delta, never a full refetch', async () => {
         const { store, terminalId } = await renderReconcileFlapPane('dup')

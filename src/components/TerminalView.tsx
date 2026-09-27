@@ -6295,6 +6295,23 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
               reconcilePendingSinceRef.current !== undefined
               && Date.now() - reconcilePendingSinceRef.current < RECONCILE_VERDICT_WAIT_MS
             ) {
+              if (currentAttachInvalidTerminalError) {
+                // The server rejected this attach generation while its
+                // managed terminal registry was still recovering. The
+                // reconcile result may confirm the same persisted identity,
+                // so the pending-window close must retry the attach instead
+                // of treating this rejected generation as still in flight.
+                clearQuarantineRepair()
+                currentAttachRef.current = null
+                pacedReplayRef.current = null
+                deferredAttachStateRef.current = {
+                  mode: 'none',
+                  pendingIntent: null,
+                  pendingSinceSeq: 0,
+                  pendingReason: 'initial_hydrate',
+                }
+                setIsAttaching(false)
+              }
               return
             }
             const restoreMode = current?.mode || (paneContent.kind === 'terminal' ? paneContent.mode : 'shell')
