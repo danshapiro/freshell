@@ -235,6 +235,8 @@ async fn managed_provider_fork_rekeys_the_same_soul_without_launch_or_stop() {
     });
     Arc::clone(&proxy)
         .handle(HostedFreshAgentCommand::Fork(FreshAgentFork {
+            observed_epoch: None,
+            observed_generation: None,
             provider: AgentProvider::Codex,
             session_id: "public-parent".into(),
             session_type: SessionType::Freshcodex,
