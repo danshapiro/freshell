@@ -861,7 +861,11 @@ export class RuntimeHarness {
       throw new Error(`refusing to signal unsafe runtime pid ${pid}`)
     }
     if (!this.isContainerRunning(containerId)) return
-    const result = spawnSync('docker', ['exec', containerId, 'kill', `-${signal}`, String(pid)], {
+    // Runtime workers run as the provider UID. The rootless container host
+    // has no CAP_KILL for that UID, so signal from the same user namespace.
+    const result = spawnSync('docker', [
+      'exec', '--user', '65534:0', containerId, 'kill', `-${signal}`, String(pid),
+    ], {
       encoding: 'utf8',
     })
     if (result.status !== 0) {
