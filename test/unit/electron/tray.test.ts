@@ -14,7 +14,11 @@ describe('Tray', () => {
       setContextMenu: vi.fn(),
       on: vi.fn(),
     }
-    MockTray = vi.fn().mockReturnValue(mockTrayInstance) as any
+    MockTray = vi.fn().mockImplementation(class {
+      setToolTip = mockTrayInstance.setToolTip
+      setContextMenu = mockTrayInstance.setContextMenu
+      on = mockTrayInstance.on
+    }) as any
     capturedTemplate = []
     mockMenu = {
       buildFromTemplate: vi.fn((template: MenuItemTemplate[]) => {
