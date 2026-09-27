@@ -8423,27 +8423,28 @@ async fn handle_attach(
     // The registry decides geometry and installs the subscriber under one
     // terminal lock. Mirror only an accepted geometry to the external host;
     // a secondary viewer or keepalive attach must not resize that PTY.
-    if outcome.found && state.registry.is_managed(&attach.terminal_id) {
-        if matches!(
+    if outcome.found
+        && state.registry.is_managed(&attach.terminal_id)
+        && matches!(
             outcome.geometry,
             Some(
                 freshell_terminal::registry::AttachResizeStatus::Resized
                     | freshell_terminal::registry::AttachResizeStatus::Unchanged
             )
-        ) {
-            let cols = (attach.cols.clamp(0, u16::MAX as i64) as u16).max(2);
-            let rows = (attach.rows.clamp(0, u16::MAX as i64) as u16).max(2);
-            if let Err(error) = state
-                .registry
-                .managed_resize(&attach.terminal_id, cols, rows)
-                .await
-            {
-                state.registry.detach(&attach.terminal_id, conn_id);
-                return AttachReply::Error(Box::new(managed_runtime_error(
-                    &attach.terminal_id,
-                    &format!("attach resize failed: {error}"),
-                )));
-            }
+        )
+    {
+        let cols = (attach.cols.clamp(0, u16::MAX as i64) as u16).max(2);
+        let rows = (attach.rows.clamp(0, u16::MAX as i64) as u16).max(2);
+        if let Err(error) = state
+            .registry
+            .managed_resize(&attach.terminal_id, cols, rows)
+            .await
+        {
+            state.registry.detach(&attach.terminal_id, conn_id);
+            return AttachReply::Error(Box::new(managed_runtime_error(
+                &attach.terminal_id,
+                &format!("attach resize failed: {error}"),
+            )));
         }
     }
     if outcome.found {

@@ -42,6 +42,14 @@ pub struct SupervisorConfig {
     pub admission: AdmissionPolicy,
 }
 
+pub(crate) struct LaunchWorkload {
+    pub(crate) soul_id: SoulId,
+    pub(crate) fixture: Option<FixtureKind>,
+    pub(crate) terminal: Option<TerminalLaunchSpec>,
+    pub(crate) fresh_agent: Option<FreshAgentLaunchSpec>,
+    pub(crate) resume_spec: Option<ResumeSpec>,
+}
+
 #[derive(Clone)]
 pub struct Supervisor {
     pub(crate) registry: Registry,
@@ -501,11 +509,13 @@ impl Supervisor {
 
         self.activate_prepared(
             prepared,
-            request.soul_id,
-            request.fixture,
-            request.terminal,
-            request.fresh_agent,
-            None,
+            LaunchWorkload {
+                soul_id: request.soul_id,
+                fixture: request.fixture,
+                terminal: request.terminal,
+                fresh_agent: request.fresh_agent,
+                resume_spec: None,
+            },
             limits,
         )
         .await
@@ -514,11 +524,7 @@ impl Supervisor {
     pub(crate) async fn activate_prepared(
         &self,
         prepared: PreparedLaunch,
-        soul_id: SoulId,
-        fixture: Option<FixtureKind>,
-        terminal: Option<TerminalLaunchSpec>,
-        fresh_agent: Option<FreshAgentLaunchSpec>,
-        resume_spec: Option<ResumeSpec>,
+        workload: LaunchWorkload,
         limits: RuntimeLimits,
     ) -> Result<LaunchResult, RuntimeError> {
         let mut state = prepared.state;
@@ -526,7 +532,7 @@ impl Supervisor {
             let runtime_dir = self.ensure_incarnation_dir(&prepared).map_err(|error| {
                 self.activation_failure(&prepared, state, "ensure_runtime_directory", error)
             })?;
-            if fresh_agent.is_some() {
+            if workload.fresh_agent.is_some() {
                 ensure_host_actor_state_dir(
                     &self.config.runtime_root,
                     self.registry.installation_id(),
@@ -547,8 +553,8 @@ impl Supervisor {
                     runtime_dir: runtime_dir.clone(),
                     limits,
                     test_run_id: self.config.test_run_id.clone(),
-                    terminal: terminal.clone(),
-                    fresh_agent: fresh_agent.clone(),
+                    terminal: workload.terminal.clone(),
+                    fresh_agent: workload.fresh_agent.clone(),
                     provider_volume_name: stable_provider_volume_name(
                         self.registry.installation_id(),
                         &prepared.soul_id,
@@ -615,7 +621,7 @@ impl Supervisor {
             return self
                 .launch_result_from_status(
                     prepared.incarnation_id.clone(),
-                    soul_id,
+                    workload.soul_id.clone(),
                     authenticated,
                     status,
                 )
@@ -685,16 +691,7 @@ impl Supervisor {
                 self.activation_failure(&prepared, state, "enable_long_lived_runtime", error)
             })?;
         let accepted = self
-            .send_grant(
-                &handle,
-                soul_id.clone(),
-                fixture,
-                terminal,
-                fresh_agent,
-                resume_spec,
-                &authenticated,
-                &grant,
-            )
+            .send_grant(&handle, &workload, &authenticated, &grant)
             .await
             .map_err(|error| {
                 self.activation_failure(&prepared, state, "deliver_execution_grant", error)
@@ -710,7 +707,7 @@ impl Supervisor {
         if let Some(native_session_id) = accepted.native_session_id.as_ref() {
             self.registry
                 .record_native_session(
-                    soul_id.clone(),
+                    workload.soul_id.clone(),
                     handle.incarnation_id().clone(),
                     native_session_id.clone(),
                 )
@@ -723,7 +720,7 @@ impl Supervisor {
         append_event(
             &self.config.lifecycle_log,
             "supervisor.launch_running",
-            serde_json::json!({"soulId":soul_id,"incarnationId":handle.incarnation_id(),"containerId":handle.container_id(),"workerPid":accepted.worker_pid,"workerLaunchCount":accepted.worker_launch_count}),
+            serde_json::json!({"soulId":workload.soul_id,"incarnationId":handle.incarnation_id(),"containerId":handle.container_id(),"workerPid":accepted.worker_pid,"workerLaunchCount":accepted.worker_launch_count}),
         );
         let view = find_view(&self.registry, handle.incarnation_id())
             .await
@@ -1689,26 +1686,22 @@ impl Supervisor {
     async fn send_grant(
         &self,
         handle: &crate::registry::OwnedRuntimeHandle,
-        soul_id: SoulId,
-        fixture: Option<FixtureKind>,
-        terminal: Option<TerminalLaunchSpec>,
-        fresh_agent: Option<FreshAgentLaunchSpec>,
-        resume_spec: Option<ResumeSpec>,
+        workload: &LaunchWorkload,
         host: &AuthenticatedHost,
         grant: &ExecutionGrantRecord,
     ) -> Result<AcceptedGrant, RuntimeError> {
         let incarnation_id = handle.incarnation_id().clone();
         let command = HostCommand::GrantExecution {
             incarnation_id: incarnation_id.clone(),
-            soul_id,
+            soul_id: workload.soul_id.clone(),
             host_boot_id: grant.host_boot_id.clone(),
             control_epoch: grant.control_epoch,
             execution_generation: grant.execution_generation,
             grant_id: grant.grant_id.clone(),
-            fixture,
-            terminal: terminal.map(Box::new),
-            fresh_agent: fresh_agent.map(Box::new),
-            resume_spec: resume_spec.map(Box::new),
+            fixture: workload.fixture,
+            terminal: workload.terminal.clone().map(Box::new),
+            fresh_agent: workload.fresh_agent.clone().map(Box::new),
+            resume_spec: workload.resume_spec.clone().map(Box::new),
         };
         match self
             .send_authenticated_host_command(incarnation_id, handle.runtime_dir(), host, command)
@@ -2338,14 +2331,12 @@ mod release_scope_tests {
             child_session_id: "native-child".into(),
             parent_retired_by_runtime: true,
         };
-        assert_eq!(
-            classify_fresh_agent_fork_transition("native-parent", &transition).unwrap(),
-            false,
+        assert!(
+            !classify_fresh_agent_fork_transition("native-parent", &transition).unwrap(),
             "parent current means registry transition still needs applying",
         );
-        assert_eq!(
+        assert!(
             classify_fresh_agent_fork_transition("native-child", &transition).unwrap(),
-            true,
             "child current means this request already committed and may replay",
         );
         assert!(classify_fresh_agent_fork_transition("foreign", &transition).is_err());

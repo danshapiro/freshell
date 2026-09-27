@@ -502,7 +502,10 @@ mod tests {
     #[test]
     fn bounded_notice_copy_never_contains_native_identity() {
         let incident = IncidentId::parse("incident-copy").unwrap();
-        let id = stable_notice_id(NoticeKind::CleanupSucceeded, &[incident.clone()]);
+        let id = stable_notice_id(
+            NoticeKind::CleanupSucceeded,
+            std::slice::from_ref(&incident),
+        );
         let reference = notice_reference(NoticeKind::CleanupSucceeded, &[incident]);
         assert!(id.as_str().starts_with("notice-"));
         assert_eq!(reference.len(), 8);
@@ -513,7 +516,10 @@ mod tests {
         let registry = Registry::open(dir.path(), None).unwrap();
         let installation_id = registry.installation_id().clone();
         let incident = IncidentId::parse("incident-idempotent").unwrap();
-        let notice_id = stable_notice_id(NoticeKind::CleanupSucceeded, &[incident.clone()]);
+        let notice_id = stable_notice_id(
+            NoticeKind::CleanupSucceeded,
+            std::slice::from_ref(&incident),
+        );
         let mut conn = crate::registry::open_connection(registry.database_path()).unwrap();
         let tx = conn
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)

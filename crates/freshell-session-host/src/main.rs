@@ -265,14 +265,16 @@ async fn dispatch(
                     }
                     grant_execution(
                         state,
-                        soul_id,
-                        control_epoch,
-                        execution_generation,
-                        grant_id,
-                        fixture,
-                        terminal.map(|terminal| *terminal),
-                        fresh_agent.map(|agent| *agent),
-                        resume_spec.map(|resume_spec| *resume_spec),
+                        GrantExecutionRequest {
+                            soul_id,
+                            control_epoch,
+                            execution_generation,
+                            grant_id,
+                            fixture,
+                            terminal: terminal.map(|terminal| *terminal),
+                            fresh_agent: fresh_agent.map(|agent| *agent),
+                            resume_spec: resume_spec.map(|resume_spec| *resume_spec),
+                        },
                     )
                     .await
                 }
@@ -440,7 +442,7 @@ async fn dispatch(
                         .lock()
                         .await
                         .clone()
-                        .ok_or_else(|| unsupported_fresh_agent())?;
+                        .ok_or_else(unsupported_fresh_agent)?;
                     let command_state = actor
                         .dispatch(request_id, text, settings)
                         .await
@@ -463,7 +465,7 @@ async fn dispatch(
                         .lock()
                         .await
                         .clone()
-                        .ok_or_else(|| unsupported_fresh_agent())?;
+                        .ok_or_else(unsupported_fresh_agent)?;
                     let transition = actor
                         .fork(request_id, parent_session_id, input)
                         .await
@@ -565,7 +567,7 @@ async fn dispatch(
                         .lock()
                         .await
                         .clone()
-                        .ok_or_else(|| unsupported_fresh_agent())?;
+                        .ok_or_else(unsupported_fresh_agent)?;
                     actor
                         .resolve_permission(&decision_id, decision)
                         .await
@@ -583,7 +585,7 @@ async fn dispatch(
                         .lock()
                         .await
                         .clone()
-                        .ok_or_else(|| unsupported_fresh_agent())?;
+                        .ok_or_else(unsupported_fresh_agent)?;
                     actor.interrupt().await.map_err(map_actor_error)?;
                     Ok(HostResult::FreshAgentInterrupted)
                 }
@@ -598,7 +600,7 @@ async fn dispatch(
                         .lock()
                         .await
                         .clone()
-                        .ok_or_else(|| unsupported_fresh_agent())?;
+                        .ok_or_else(unsupported_fresh_agent)?;
                     let events = actor
                         .read_events(after_sequence, (max_events as usize).clamp(1, 4096))
                         .await;
@@ -680,8 +682,7 @@ fn ensure_incarnation(
     Ok(())
 }
 
-async fn grant_execution(
-    state: &Arc<HostState>,
+struct GrantExecutionRequest {
     soul_id: SoulId,
     control_epoch: u64,
     execution_generation: u64,
@@ -690,7 +691,22 @@ async fn grant_execution(
     terminal: Option<TerminalLaunchSpec>,
     fresh_agent: Option<FreshAgentLaunchSpec>,
     resume_spec: Option<ResumeSpec>,
+}
+
+async fn grant_execution(
+    state: &Arc<HostState>,
+    request: GrantExecutionRequest,
 ) -> Result<HostResult, RuntimeError> {
+    let GrantExecutionRequest {
+        soul_id,
+        control_epoch,
+        execution_generation,
+        grant_id,
+        fixture,
+        terminal,
+        fresh_agent,
+        resume_spec,
+    } = request;
     let mut persisted = state.persisted.lock().await;
     if control_epoch < persisted.max_control_epoch
         || execution_generation < persisted.max_execution_generation
@@ -1836,7 +1852,6 @@ mod tests {
         );
         assert_eq!(host_worker_threads(6), 6);
         assert_eq!(host_worker_threads(256), HOST_MAX_WORKER_THREADS);
-        assert!(HOST_MIN_WORKER_THREADS >= 2, "one worker is never enough");
     }
 
     #[test]

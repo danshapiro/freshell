@@ -9504,11 +9504,7 @@ async fn spawn_sidecar() -> Result<(Child, ChildStdin, ChildStdout, String), Str
 
     let run_as = std::env::var("FRESHELL_PROVIDER_RUN_AS_UID")
         .ok()
-        .and_then(|uid| {
-            std::env::var("FRESHELL_PROVIDER_RUN_AS_GID")
-                .ok()
-                .map(|gid| (uid, gid))
-        });
+        .zip(std::env::var("FRESHELL_PROVIDER_RUN_AS_GID").ok());
     let mut cmd = if let Some((uid, gid)) = run_as {
         let mut command = tokio::process::Command::new("/usr/bin/setpriv");
         command.args([

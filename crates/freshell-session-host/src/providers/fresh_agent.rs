@@ -43,8 +43,8 @@ enum ProviderState {
     Claude(FreshClaudeState),
     Codex(FreshCodexState),
     Opencode {
-        runtime: FreshOpencodeState,
-        owner: FreshAgentState,
+        runtime: Box<FreshOpencodeState>,
+        owner: Box<FreshAgentState>,
     },
 }
 
@@ -136,8 +136,8 @@ impl HostedTransport {
                     Arc::clone(&broadcast_tx),
                 );
                 ProviderState::Opencode {
-                    runtime: FreshOpencodeState::new(owner.clone()),
-                    owner,
+                    runtime: Box::new(FreshOpencodeState::new(owner.clone())),
+                    owner: Box::new(owner),
                 }
             }
         };
@@ -150,12 +150,14 @@ impl HostedTransport {
         spawn_broadcast_bridge(
             provider.clone(),
             broadcast_rx,
-            created_tx,
-            native_tx,
-            event_tx.clone(),
-            send_outcomes.clone(),
-            kill_outcomes.clone(),
-            Arc::clone(&suppressed_kills),
+            BroadcastBridgeOutputs {
+                created: created_tx,
+                native: native_tx,
+                events: event_tx.clone(),
+                send_outcomes: send_outcomes.clone(),
+                kill_outcomes: kill_outcomes.clone(),
+                suppressed_kills: Arc::clone(&suppressed_kills),
+            },
         );
         Arc::new(Self {
             provider,
@@ -841,16 +843,28 @@ impl FreshAgentTransport for HostedTransport {
     }
 }
 
-fn spawn_broadcast_bridge(
-    provider: FreshProvider,
-    mut receiver: broadcast::Receiver<String>,
+struct BroadcastBridgeOutputs {
     created: watch::Sender<Option<Result<String, ()>>>,
     native: watch::Sender<Option<String>>,
     events: mpsc::Sender<AgentEvent>,
     send_outcomes: broadcast::Sender<(String, bool)>,
     kill_outcomes: broadcast::Sender<(String, bool)>,
     suppressed_kills: Arc<std::sync::Mutex<HashSet<String>>>,
+}
+
+fn spawn_broadcast_bridge(
+    provider: FreshProvider,
+    mut receiver: broadcast::Receiver<String>,
+    outputs: BroadcastBridgeOutputs,
 ) {
+    let BroadcastBridgeOutputs {
+        created,
+        native,
+        events,
+        send_outcomes,
+        kill_outcomes,
+        suppressed_kills,
+    } = outputs;
     tokio::spawn(async move {
         let mut dropped = 0u64;
         loop {
@@ -958,15 +972,14 @@ fn spawn_broadcast_bridge(
                     }
                 }
             }
-            if dropped > 0 {
-                if events
+            if dropped > 0
+                && events
                     .try_send(AgentEvent::Provider {
                         payload: json!({"type":"freshAgent.host.backpressure","dropped":dropped}),
                     })
                     .is_ok()
-                {
-                    dropped = 0;
-                }
+            {
+                dropped = 0;
             }
             if captured_decision {
                 continue;

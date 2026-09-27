@@ -282,6 +282,7 @@ impl WriterLock {
             .create(true)
             .read(true)
             .write(true)
+            .truncate(false)
             .open(path)
             .map_err(persist)?;
         #[cfg(unix)]
@@ -1041,9 +1042,8 @@ fn pending_decision_ids(state: &PersistedActorState) -> BTreeSet<String> {
     state
         .decisions
         .iter()
-        .filter_map(|(decision_id, decision)| {
-            matches!(decision.state, DecisionState::Pending).then(|| decision_id.clone())
-        })
+        .filter(|(_, decision)| matches!(decision.state, DecisionState::Pending))
+        .map(|(decision_id, _)| decision_id.clone())
         .collect()
 }
 

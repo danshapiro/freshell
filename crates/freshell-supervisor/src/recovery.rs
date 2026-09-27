@@ -14,7 +14,7 @@ use crate::{
     },
     registry::{OwnedRuntimeHandle, RecoveryContext, RegistryError},
     resume_catalog,
-    service::Supervisor,
+    service::{LaunchWorkload, Supervisor},
 };
 use freshell_agent_runtime::{classify_provider_failure, recovery_paths, verify_native_identity};
 use freshell_runtime_protocol::{
@@ -610,11 +610,13 @@ impl Supervisor {
         let launch = self
             .activate_prepared(
                 prepared.prepared.clone(),
-                soul_id.clone(),
-                prepared.fixture,
-                prepared.terminal.clone(),
-                prepared.fresh_agent.clone(),
-                prepared.resume_spec.clone(),
+                LaunchWorkload {
+                    soul_id: soul_id.clone(),
+                    fixture: prepared.fixture,
+                    terminal: prepared.terminal.clone(),
+                    fresh_agent: prepared.fresh_agent.clone(),
+                    resume_spec: prepared.resume_spec.clone(),
+                },
                 start.context.requested_limits,
             )
             .await;

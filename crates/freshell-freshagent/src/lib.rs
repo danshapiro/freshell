@@ -4701,13 +4701,16 @@ async fn create_tab(
         return create_hosted_agent_tab(
             &state,
             gateway,
-            provider,
-            session_type,
-            cwd,
-            model,
-            effort,
+            hosted_rest::HostedRestCreate {
+                request_id: Uuid::new_v4().simple().to_string(),
+                provider: provider.into(),
+                session_type: session_type.into(),
+                cwd,
+                model,
+                effort,
+                native_session_id,
+            },
             name,
-            native_session_id,
         )
         .await;
     }
@@ -4865,27 +4868,10 @@ async fn create_tab(
 async fn create_hosted_agent_tab(
     state: &FreshAgentState,
     gateway: hosted_rest::SharedHostedFreshAgentRestGateway,
-    provider: &str,
-    session_type: &str,
-    cwd: Option<String>,
-    model: Option<String>,
-    effort: Option<String>,
+    request: hosted_rest::HostedRestCreate,
     name: Option<String>,
-    native_session_id: Option<String>,
 ) -> Response {
-    let request_id = Uuid::new_v4().simple().to_string();
-    let created = match gateway
-        .create_agent(hosted_rest::HostedRestCreate {
-            request_id: request_id.clone(),
-            provider: provider.into(),
-            session_type: session_type.into(),
-            cwd: cwd.clone(),
-            model: model.clone(),
-            effort: effort.clone(),
-            native_session_id,
-        })
-        .await
-    {
+    let created = match gateway.create_agent(request.clone()).await {
         Ok(created) => created,
         Err(()) => {
             return fail_json(
@@ -4894,6 +4880,15 @@ async fn create_hosted_agent_tab(
             )
         }
     };
+    let hosted_rest::HostedRestCreate {
+        request_id,
+        provider,
+        session_type,
+        cwd,
+        model,
+        effort,
+        ..
+    } = request;
     let (tab_id, pane_id) = state.layout.create_tab(name.as_deref());
     let mut pane_content = json!({
         "kind": "fresh-agent",
@@ -4920,8 +4915,8 @@ async fn create_hosted_agent_tab(
         &pane_content,
         PaneEntry {
             placeholder_id: created.session_id.clone(),
-            provider: provider.into(),
-            session_type: session_type.into(),
+            provider,
+            session_type,
             cwd,
             model,
             effort,
@@ -9058,11 +9053,12 @@ mod tests {
         )
         .await;
         assert_eq!(sent.status(), StatusCode::OK);
-        let sends = gateway.sends.lock().expect("sends mutex");
-        assert_eq!(sends.len(), 1);
-        assert_eq!(sends[0].session_id, "managed-kilroy-recovered");
-        assert_eq!(sends[0].text, "after restart");
-        drop(sends);
+        {
+            let sends = gateway.sends.lock().expect("sends mutex");
+            assert_eq!(sends.len(), 1);
+            assert_eq!(sends[0].session_id, "managed-kilroy-recovered");
+            assert_eq!(sends[0].text, "after restart");
+        }
 
         let captured = capture(
             State(restarted),

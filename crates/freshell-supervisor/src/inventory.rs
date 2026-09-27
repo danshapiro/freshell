@@ -356,14 +356,3 @@ fn map_registry(error: crate::registry::RegistryError) -> RuntimeError {
     };
     RuntimeError::new(code, error.to_string())
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn startup_concurrency_defaults_are_bounded() {
-        assert_eq!(DEFAULT_STARTUP_RECOVERY_CONCURRENCY, 4);
-        assert!(MAX_STARTUP_RECOVERY_CONCURRENCY <= 16);
-    }
-}

@@ -1,15 +1,10 @@
 //! Headless regression tests: source epochs must survive the complete replay seam.
 use super::*;
 use std::sync::atomic::{AtomicBool, AtomicUsize};
-use std::task::{Context, Poll, Wake, Waker};
+use std::task::{Context, Poll, Waker};
 
-struct Noop;
-impl Wake for Noop {
-    fn wake(self: Arc<Self>) {}
-}
 fn poll_once<F: Future>(future: Pin<&mut F>) -> Poll<F::Output> {
-    let waker: Waker = Arc::new(Noop).into();
-    future.poll(&mut Context::from_waker(&waker))
+    future.poll(&mut Context::from_waker(Waker::noop()))
 }
 fn immediate<F: Future>(future: F) -> F::Output {
     let mut future = Box::pin(future);
