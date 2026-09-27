@@ -119,7 +119,10 @@ export class RuntimeHarness {
     this.phase = phase
     this.runId = runId
     this.candidateSha = git(this.repoRoot, ['rev-parse', 'HEAD']).trim()
-    this.testRoot = path.join('/tmp/frt', runId.slice(0, 12))
+    // A shared /tmp/frt can belong to another account on multi-user hosts.
+    // Keep the short socket path while isolating each account's test runs.
+    const userId = process.getuid?.() ?? process.pid
+    this.testRoot = path.join(os.tmpdir(), `frt-${userId}`, runId.slice(0, 12))
     this.evidenceDir = path.join(this.repoRoot, '.runtime-evidence', this.candidateSha, runId)
     this.buildDir = path.join(this.repoRoot, '.runtime-build', this.runId)
     this.assertionsPath = path.join(this.evidenceDir, 'assertions.jsonl')
