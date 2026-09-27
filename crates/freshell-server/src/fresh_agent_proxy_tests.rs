@@ -54,6 +54,22 @@ fn kilroy_keeps_claude_public_routing_distinct_from_its_runtime_identity() {
 }
 
 #[test]
+fn rest_and_hosted_create_use_the_same_kilroy_presentation_identity() {
+    let (public_provider, session_type) = rest_agent_identity("claude", "kilroy").unwrap();
+    let runtime_provider = fresh_provider(&Some(public_provider), session_type).unwrap();
+    let request_id = "kilroy-rest-request";
+    let expected = format!("managed-kilroy-{}", stable_hex(request_id));
+    assert_eq!(
+        presentation_id_for_create(&runtime_provider, request_id, None),
+        expected
+    );
+    assert_eq!(
+        presentation_id_for_create(&runtime_provider, request_id, Some("native-42")),
+        "native-42"
+    );
+}
+
+#[test]
 fn fixture_mode_selection_is_exact_and_rejects_duplicates() {
     assert_eq!(
         parse_fixture_modes("freshclaude,kilroy,freshcodex,freshopencode")

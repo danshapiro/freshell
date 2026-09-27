@@ -389,17 +389,14 @@ impl HostedFreshAgentProxy {
         let cwd = canonical_cwd(message.cwd.as_deref()).map_err(|_| ())?;
         let workspace = workspace_root(&cwd);
         let soul = stable_soul_id(provider.as_str(), &message.request_id).map_err(|_| ())?;
-        let public_session_id = message
-            .session_ref
-            .as_ref()
-            .map(|value| value.session_id.clone())
-            .unwrap_or_else(|| {
-                format!(
-                    "managed-{}-{}",
-                    provider.as_str(),
-                    stable_hex(&message.request_id)
-                )
-            });
+        let public_session_id = presentation_id_for_create(
+            &provider,
+            &message.request_id,
+            message
+                .session_ref
+                .as_ref()
+                .map(|value| value.session_id.as_str()),
+        );
         let native_session_id = message
             .session_ref
             .as_ref()
@@ -1004,6 +1001,16 @@ fn rewrite_presentation_id(payload: &mut serde_json::Value, presentation_id: &st
 
 fn stable_hex(value: &str) -> String {
     format!("{:x}", Sha256::digest(value.as_bytes()))[..32].to_string()
+}
+
+fn presentation_id_for_create(
+    provider: &FreshProvider,
+    request_id: &str,
+    native_session_id: Option<&str>,
+) -> String {
+    native_session_id
+        .map(str::to_owned)
+        .unwrap_or_else(|| format!("managed-{}-{}", provider.as_str(), stable_hex(request_id)))
 }
 
 fn stable_soul_id(provider: &str, request_id: &str) -> Result<SoulId, String> {

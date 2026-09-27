@@ -10,6 +10,7 @@ impl HostedFreshAgentRestGateway for HostedFreshAgentProxy {
     ) -> Result<HostedRestCreated, ()> {
         let (provider, session_type) =
             rest_agent_identity(&request.provider, &request.session_type)?;
+        let runtime_provider = fresh_provider(&Some(provider.clone()), session_type).ok_or(())?;
         let message = freshell_protocol::FreshAgentCreate {
             request_id: request.request_id,
             session_type,
@@ -32,17 +33,14 @@ impl HostedFreshAgentRestGateway for HostedFreshAgentProxy {
             tab_id: None,
             naming_handle: None,
         };
-        let session_id = message
-            .session_ref
-            .as_ref()
-            .map(|value| value.session_id.clone())
-            .unwrap_or_else(|| {
-                format!(
-                    "managed-{}-{}",
-                    request.provider,
-                    stable_hex(&message.request_id)
-                )
-            });
+        let session_id = presentation_id_for_create(
+            &runtime_provider,
+            &message.request_id,
+            message
+                .session_ref
+                .as_ref()
+                .map(|value| value.session_id.as_str()),
+        );
         self.create(message).await?;
         Ok(HostedRestCreated { session_id })
     }
