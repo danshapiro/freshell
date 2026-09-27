@@ -3,6 +3,18 @@
 # runtime ABI used to build freshell-session-host. Both inputs are digest-pinned.
 FROM node@sha256:83f487e0a63425e5b4d146fb5e5be574bcbe1b7b843d3ebafdd95eaf7767a7e5 AS node-source
 
+# Export the Claude sidecar from the same frozen pnpm workspace lock used by
+# the rest of Freshell. A hoisted production deploy carries its dependencies
+# as a self-contained tree, without links back to this build workspace.
+FROM node-source AS claude-sidecar
+WORKDIR /sidecar-workspace
+COPY package.json pnpm-lock.yaml pnpm-workspace.yaml ./
+COPY crates/freshell-claude-sidecar/package.json crates/freshell-claude-sidecar/
+COPY packages/freshell-mcp-runtime/package.json packages/freshell-mcp-runtime/
+COPY crates/freshell-claude-sidecar/*.mjs crates/freshell-claude-sidecar/
+RUN npm install --global pnpm@10.34.5 \
+ && pnpm --filter freshell-claude-sidecar --prod --frozen-lockfile --config.node-linker=hoisted deploy /opt/freshell-claude-sidecar
+
 FROM ubuntu@sha256:33ceb71981b602c1a7443a53469e4dba065f7503eab3078a2d7a57a2ab987517
 ARG CLAUDE_CODE_VERSION=2.1.263
 ARG CODEX_VERSION=0.147.0
@@ -50,9 +62,7 @@ COPY --chmod=0644 docker/runtime/amplifier-onecli-lunaroute-glm53.yaml /etc/fres
 # FreshClaude/Kilroy run inside the soul host, so their JS SDK bridge and its
 # pinned dependency must be part of the workload image rather than resolved
 # through a web-server worktree path.
-COPY crates/freshell-claude-sidecar/package.json crates/freshell-claude-sidecar/package-lock.json /opt/freshell-claude-sidecar/
-RUN cd /opt/freshell-claude-sidecar && npm ci --omit=dev --ignore-scripts
-COPY crates/freshell-claude-sidecar/*.mjs /opt/freshell-claude-sidecar/
+COPY --from=claude-sidecar /opt/freshell-claude-sidecar/ /opt/freshell-claude-sidecar/
 
 WORKDIR /workspace
 CMD ["/bin/bash"]
