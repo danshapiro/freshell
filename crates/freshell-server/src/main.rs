@@ -762,6 +762,15 @@ async fn probe_stale_start_fences(
     }
 }
 
+fn runtime_ownership_for_ledger(
+    ledger: &freshell_ws::pane_ledger::PaneLedger,
+) -> std::io::Result<Arc<freshell_ownership::RuntimeOwnershipRegistry>> {
+    Ok(Arc::new(match ledger.reserve_boot_epoch()? {
+        Some(epoch) => freshell_ownership::RuntimeOwnershipRegistry::with_epoch(epoch),
+        None => freshell_ownership::RuntimeOwnershipRegistry::new(),
+    }))
+}
+
 #[tokio::main]
 async fn main() -> ExitCode {
     // Legacy parity: `import 'dotenv/config'` (`server/index.ts:2-3`) loads
@@ -976,12 +985,26 @@ async fn main() -> ExitCode {
     fresh_codex_state.set_session_leases(Arc::clone(&fresh_agent_leases));
     fresh_claude_state.set_session_leases(Arc::clone(&fresh_agent_leases));
 
-    // kata b8ke: the ONE server-wide runtime-ownership coordinator shared
-    // by the terminal lane and every fresh-agent provider (Task 3 wires the
-    // fresh-agent lanes; Task 4 adds the WsState field for the terminal
-    // lane). The per-boot epoch is minted at construction (see
-    // `freshell_ownership`'s crate doc).
-    let ownership = Arc::new(freshell_ownership::RuntimeOwnershipRegistry::new());
+    // The ledger's single-writer lock also owns the durable boot-epoch
+    // counter. Reserve an epoch before any identity lane can write: the
+    // ledger orders (epoch, generation) pairs numerically, so a fresh random
+    // epoch could otherwise sort below a row from the previous server boot.
+    let pane_ledger = std::sync::Arc::new(freshell_ws::pane_ledger::PaneLedger::new_locked(
+        home.as_ref()
+            .map(|h| h.join(".freshell").join("pane-ledger")),
+    ));
+    let ownership = match runtime_ownership_for_ledger(&pane_ledger) {
+        Ok(registry) => registry,
+        Err(err) => {
+            tracing::error!(error = %err, "ownership.boot_epoch_reservation_failed");
+            return ExitCode::FAILURE;
+        }
+    };
+    tracing::info!(
+        boot_epoch = ownership.boot_epoch(),
+        ledger_enabled = pane_ledger.is_enabled(),
+        "ownership.boot_epoch_ready"
+    );
     fresh_codex_state.set_ownership(Arc::clone(&ownership));
     fresh_claude_state.set_ownership(Arc::clone(&ownership));
 
@@ -1129,19 +1152,8 @@ async fn main() -> ExitCode {
     // live-session guard can consume it through the `SessionIdentityLookup`
     // seam (cheap-clone handle; `WsState` keeps using this same binding).
     let terminal_identity = freshell_ws::identity::TerminalIdentityRegistry::new();
-    // P1.8: the pane-identity ledger (spec §4.2). Root resolved ONCE here;
-    // the module itself never reads env vars. No home => disabled no-op,
-    // same policy as tabs-snapshots. `new_locked` = the single-writer
-    // guard (V2.md): exclusive flock on <root>/lock, ConfigLock pattern —
-    // a second server on the same home comes up with a DISABLED ledger and
-    // a loud ERROR instead of two writers corrupting one store. Hoisted
-    // above the fresh-agent builder chain (kata hbsa Task 5, ledger A8):
-    // it depends only on `home`, and the REST spawn pipeline's
-    // `PaneIdentityBinder` below must share THIS instance with `ws_state`.
-    let pane_ledger = std::sync::Arc::new(freshell_ws::pane_ledger::PaneLedger::new_locked(
-        home.as_ref()
-            .map(|h| h.join(".freshell").join("pane-ledger")),
-    ));
+    // Every REST and WS identity lane shares the locked ledger constructed
+    // above, including its durable boot epoch.
     // Codex sidecar record store (katas ynfn/da92, Task 10 wiring): the
     // flock'd single-writer store of the `codex app-server` sidecars that
     // terminal panes spawn, so a restarted server can reattach to (or
@@ -4644,6 +4656,24 @@ mod sessions_sweep_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn boot_epoch_is_reserved_before_constructing_runtime_ownership() {
+        let root = tempfile::tempdir().expect("pane-ledger root");
+        let first_epoch = {
+            let ledger = freshell_ws::pane_ledger::PaneLedger::new_locked(Some(root.path().into()));
+            runtime_ownership_for_ledger(&ledger)
+                .expect("first registry")
+                .boot_epoch()
+        };
+        let second_epoch = {
+            let ledger = freshell_ws::pane_ledger::PaneLedger::new_locked(Some(root.path().into()));
+            runtime_ownership_for_ledger(&ledger)
+                .expect("restarted registry")
+                .boot_epoch()
+        };
+        assert_eq!(second_epoch, first_epoch + 1);
+    }
 
     /// Save-and-restore guard for one env var (tests below mutate real
     /// process env; the shared `HOME_ENV_TEST_LOCK` serializes them

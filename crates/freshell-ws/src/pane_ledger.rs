@@ -1438,6 +1438,15 @@ pub struct PaneLedger {
     close_pause: Mutex<Option<std::sync::Arc<ClosePauseGate>>>,
 }
 
+const MAX_JSON_SAFE_BOOT_EPOCH: u64 = (1u64 << 53) - 1;
+
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct BootEpochRecord {
+    version: u32,
+    epoch: u64,
+}
+
 /// b8ke d4 F3: the test-only close-park gate — `paused=true` blocks every
 /// `close_pane` at entry; `paused=false` + notify releases them all.
 pub struct ClosePauseGate {
@@ -1446,6 +1455,80 @@ pub struct ClosePauseGate {
 }
 
 impl PaneLedger {
+    /// Reserve the next server-wide ownership epoch while this ledger's
+    /// single-writer lock is held. The counter is durable before the server
+    /// accepts any identity work. Existing random-epoch rows and scoped close
+    /// records seed the first reservation when upgrading an older store.
+    /// A disabled ledger has no durable rows to compare and returns `None`.
+    pub fn reserve_boot_epoch(&self) -> std::io::Result<Option<u64>> {
+        let Some(root) = &self.root else {
+            return Ok(None);
+        };
+        let index = self.guard();
+        let path = root.join("boot-epoch.json");
+        let stored_epoch = match std::fs::read(&path) {
+            Ok(bytes) => {
+                let record: BootEpochRecord = serde_json::from_slice(&bytes)
+                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+                if record.version != 1 {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!(
+                            "unsupported pane-ledger boot epoch version {}",
+                            record.version
+                        ),
+                    ));
+                }
+                record.epoch
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => 0,
+            Err(e) => return Err(e),
+        };
+        let row_epoch = index
+            .bindings
+            .values()
+            .filter_map(|row| row.owner_epoch)
+            .max()
+            .unwrap_or(0);
+        let close_epoch = index
+            .close_envelopes
+            .values()
+            .flat_map(|record| {
+                record
+                    .kills
+                    .iter()
+                    .filter_map(|kill| kill.scope.map(|s| s.0))
+            })
+            .max()
+            .unwrap_or(0);
+        let fence_epoch = index
+            .kill_tombstones
+            .values()
+            .filter_map(|entry| entry.scope.map(|scope| scope.0))
+            .max()
+            .unwrap_or(0);
+        let next = stored_epoch
+            .max(row_epoch)
+            .max(close_epoch)
+            .max(fence_epoch)
+            .checked_add(1)
+            .filter(|epoch| *epoch <= MAX_JSON_SAFE_BOOT_EPOCH)
+            .ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "pane-ledger boot epoch exceeds the JSON-safe integer range",
+                )
+            })?;
+        write_row_atomic(
+            &path,
+            &BootEpochRecord {
+                version: 1,
+                epoch: next,
+            },
+        )?;
+        Ok(Some(next))
+    }
+
     /// b8ke d4 F3: arm the test-only close-park (doc-hidden; production
     /// never calls). Returns the gate so the test can release it.
     #[doc(hidden)]

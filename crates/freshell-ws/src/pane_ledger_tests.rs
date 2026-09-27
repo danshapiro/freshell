@@ -20,6 +20,139 @@ fn temp_root(label: &str) -> PathBuf {
     dir
 }
 
+#[test]
+fn boot_epoch_outlives_the_process_and_advances_past_legacy_random_row_epochs() {
+    let root = temp_root("boot-epoch-migration");
+    const LEGACY_EPOCH: u64 = 8_000_000_000_000_000;
+    {
+        let ledger = PaneLedger::new_locked(Some(root.clone()));
+        ledger
+            .record_fresh_agent_binding(&fa_write_fenced(
+                "codex",
+                "existing-thread",
+                1_000,
+                LEGACY_EPOCH,
+                9,
+            ))
+            .expect("legacy random-epoch row is durable");
+    }
+
+    let resumed_epoch = {
+        let ledger = PaneLedger::new_locked(Some(root.clone()));
+        let epoch = ledger
+            .reserve_boot_epoch()
+            .expect("reserve epoch")
+            .expect("enabled ledger");
+        assert_eq!(epoch, LEGACY_EPOCH + 1);
+        ledger
+            .record_fresh_agent_binding(&fa_write_fenced(
+                "codex",
+                "existing-thread",
+                2_000,
+                epoch,
+                1,
+            ))
+            .expect("a legitimate post-restart resume may replace the old row");
+        assert_eq!(
+            ledger
+                .load_binding("codex", "existing-thread")
+                .unwrap()
+                .owner_epoch,
+            Some(epoch),
+        );
+        epoch
+    };
+
+    {
+        let ledger = PaneLedger::new_locked(Some(root.clone()));
+        assert_eq!(
+            ledger.reserve_boot_epoch().expect("reserve second epoch"),
+            Some(resumed_epoch + 1),
+            "the counter advances even when the prior boot wrote no additional rows",
+        );
+    }
+    std::fs::remove_dir_all(root).expect("cleanup temp root");
+}
+
+#[test]
+fn boot_epoch_reservation_advances_without_any_binding_rows() {
+    let root = temp_root("boot-epoch-no-rows");
+    let first = PaneLedger::new_locked(Some(root.clone()))
+        .reserve_boot_epoch()
+        .expect("reserve first epoch");
+    let second = PaneLedger::new_locked(Some(root.clone()))
+        .reserve_boot_epoch()
+        .expect("reserve second epoch");
+    assert_eq!(second, first.map(|epoch| epoch + 1));
+    std::fs::remove_dir_all(root).expect("cleanup temp root");
+}
+
+#[test]
+fn boot_epoch_migration_advances_past_scoped_close_records() {
+    let root = temp_root("boot-epoch-close-scope");
+    const OLD_EPOCH: u64 = 8_500_000_000_000_000;
+    write_row_atomic(
+        &PaneLedger::close_envelope_path(&root, "codex:closed-thread"),
+        &CloseEnvelopeRecord {
+            ledger_version: LEDGER_VERSION,
+            terminal_id: None,
+            create_request_id: None,
+            closed_at: 1_000,
+            kills: vec![PaneCloseKill {
+                provider: "codex".to_string(),
+                session_id: "closed-thread".to_string(),
+                at_ms: 1_000,
+                scope: Some((OLD_EPOCH, 3)),
+            }],
+            panes: vec![],
+        },
+    )
+    .expect("seed scoped close record");
+
+    let ledger = PaneLedger::new_locked(Some(root.clone()));
+    assert_eq!(
+        ledger.reserve_boot_epoch().expect("reserve epoch"),
+        Some(OLD_EPOCH + 1),
+    );
+    drop(ledger);
+    std::fs::remove_dir_all(root).expect("cleanup temp root");
+}
+
+#[test]
+fn boot_epoch_reservation_fails_closed_when_counter_is_corrupt_or_exhausted() {
+    let root = temp_root("boot-epoch-corrupt");
+    let path = root.join("boot-epoch.json");
+    std::fs::write(&path, b"{invalid").expect("seed corrupt counter");
+    let ledger = PaneLedger::new_locked(Some(root.clone()));
+    assert_eq!(
+        ledger
+            .reserve_boot_epoch()
+            .expect_err("corrupt counter must fail")
+            .kind(),
+        std::io::ErrorKind::InvalidData,
+    );
+    drop(ledger);
+
+    write_row_atomic(
+        &path,
+        &BootEpochRecord {
+            version: 1,
+            epoch: MAX_JSON_SAFE_BOOT_EPOCH,
+        },
+    )
+    .expect("seed exhausted counter");
+    let ledger = PaneLedger::new_locked(Some(root.clone()));
+    assert_eq!(
+        ledger
+            .reserve_boot_epoch()
+            .expect_err("exhausted counter must fail")
+            .kind(),
+        std::io::ErrorKind::InvalidData,
+    );
+    drop(ledger);
+    std::fs::remove_dir_all(root).expect("cleanup temp root");
+}
+
 /// H1 diagnostic: on a lock-acquisition failure, `/proc/locks` names the
 /// live holder pid(s) for this lock file (self vs foreign is the only
 /// discrimination it can make: the pid column is the LOCKING tgid, so an
