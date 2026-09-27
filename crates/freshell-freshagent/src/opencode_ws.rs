@@ -8074,17 +8074,26 @@ mod tests {
     struct SlowAbortSessionFakeHttp {
         abort_started: AtomicBool,
         abort_delay_ms: u64,
+        abort_release: Option<Arc<tokio::sync::Notify>>,
         daemon_busy: AtomicBool,
         status_polls: AtomicUsize,
+        prompt_calls: AtomicUsize,
     }
     impl SlowAbortSessionFakeHttp {
         fn new(abort_delay_ms: u64) -> Self {
             Self {
                 abort_started: AtomicBool::new(false),
                 abort_delay_ms,
+                abort_release: None,
                 daemon_busy: AtomicBool::new(true),
                 status_polls: AtomicUsize::new(0),
+                prompt_calls: AtomicUsize::new(0),
             }
+        }
+
+        fn with_abort_release(mut self, release: Arc<tokio::sync::Notify>) -> Self {
+            self.abort_release = Some(release);
+            self
         }
     }
     impl ServeHttp for SlowAbortSessionFakeHttp {
@@ -8101,11 +8110,17 @@ mod tests {
             let is_abort = req.url.contains("/abort")
                 && matches!(req.method, freshell_opencode::serve::HttpMethod::Post);
             let is_status = req.url.contains("/session/status");
+            if req.url.contains("/prompt_async") {
+                self.prompt_calls.fetch_add(1, Ordering::SeqCst);
+            }
             if is_abort {
                 self.abort_started.store(true, Ordering::SeqCst);
                 let delay_ms = self.abort_delay_ms;
+                let release = self.abort_release.clone();
                 return Box::pin(async move {
-                    if delay_ms > 0 {
+                    if let Some(release) = release {
+                        release.notified().await;
+                    } else if delay_ms > 0 {
                         tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
                     }
                     Ok(ServeHttpResponse::new(500, b"abort exploded".to_vec()))
@@ -14861,7 +14876,10 @@ mod tests {
     async fn interrupt_abort_failure_rings_both_real_turn_ends_and_the_err_arm_adds_nothing() {
         let (tx, mut rx) = tokio::sync::broadcast::channel::<String>(64);
         let fresh_agent = FreshAgentState::new(Arc::new("tok".to_string()), Arc::new(tx));
-        let http = Arc::new(SlowAbortSessionFakeHttp::new(400));
+        let abort_release = Arc::new(tokio::sync::Notify::new());
+        let http = Arc::new(
+            SlowAbortSessionFakeHttp::new(0).with_abort_release(Arc::clone(&abort_release)),
+        );
         let deps = ServeDeps {
             spawner: Arc::new(TrackedSpawner {
                 killed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -14879,7 +14897,7 @@ mod tests {
             .ensure_started()
             .await
             .expect("healthy fake serve starts");
-        fresh_agent.set_manager_for_test(manager).await;
+        fresh_agent.set_manager_for_test(manager.clone()).await;
         let st = FreshOpencodeState::new(fresh_agent);
 
         st.handle_create(create_msg("req-int-fr23"), None).await;
@@ -14932,21 +14950,28 @@ mod tests {
         // earlier drive's settle tail below.
         st.handle_send(send_msg(placeholder, "second")).await;
 
-        // Deterministic busy→idle: wait for the later send's first status
-        // poll (observed daemon activity, while daemon_busy still holds),
-        // then clear daemon_busy — the next polls read idle and BOTH drives
-        // settle legitimately, each ringing its own natural edge and
-        // advancing the session clock DURING the abort RPC's pending
-        // window.
-        let poll_baseline = http.status_polls.load(Ordering::SeqCst);
+        // The second prompt proves both drives subscribed to the session's
+        // status stream. Broadcast busy to both before releasing daemon_busy:
+        // a global poll count cannot prove the later drive saw activity,
+        // which await_idle requires before it can count idle polls.
         let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
-        while http.status_polls.load(Ordering::SeqCst) <= poll_baseline {
+        while http.prompt_calls.load(Ordering::SeqCst) < 2 {
             assert!(
                 tokio::time::Instant::now() < deadline,
-                "the later send never polled the daemon status"
+                "the later send never dispatched its prompt"
             );
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
+        manager.dispatch_event(freshell_opencode::ParsedServeEvent {
+            kind: "session.status".to_string(),
+            session_id: Some("ses_1".to_string()),
+            properties: {
+                let mut properties = serde_json::Map::new();
+                properties.insert("status".to_string(), json!({ "type": "busy" }));
+                properties
+            },
+            raw: serde_json::Map::new(),
+        });
         http.daemon_busy.store(false, Ordering::SeqCst);
 
         // BOTH natural rings land inside the pending window (bounded wait):
@@ -14982,12 +15007,17 @@ mod tests {
             ats[1] > ats[0],
             "the two edges share the session's strictly-monotonic clock: {ats:?}"
         );
+        assert!(
+            !interrupt.is_finished(),
+            "both natural turn ends must ring before the abort RPC answers"
+        );
 
-        // The abort RPC fails after its delay; the Err arm runs and adds
+        // Release the failing abort RPC; the Err arm runs and adds
         // NOTHING: its recovery mint sees the clock ADVANCED (both natural
         // rings stamped it inside the window) and stays silent, and the
         // occupied restore slot (the later send's task) is the documented
         // corner.
+        abort_release.notify_one();
         interrupt.await.expect("interrupt task");
 
         let mut extra_edges = 0;
