@@ -246,13 +246,34 @@ impl Supervisor {
                             {
                                 Ok(status) if status.exited => Some(RecoveryTrigger::ProviderExit),
                                 Ok(_) => None,
-                                Err(_) => Some(RecoveryTrigger::HostUnreachable),
+                                Err(error) => {
+                                    append_event(
+                                        &supervisor.config.lifecycle_log,
+                                        "supervisor.runtime_observer.host_status_failed",
+                                        serde_json::json!({"soulId":view.soul_id,"errorCode":error.code,"message":error.message}),
+                                    );
+                                    Some(RecoveryTrigger::HostUnreachable)
+                                }
                             },
-                            Err(_) => Some(RecoveryTrigger::HostUnreachable),
+                            Err(error) => {
+                                append_event(
+                                    &supervisor.config.lifecycle_log,
+                                    "supervisor.runtime_observer.authenticate_failed",
+                                    serde_json::json!({"soulId":view.soul_id,"errorCode":error.code,"message":error.message}),
+                                );
+                                Some(RecoveryTrigger::HostUnreachable)
+                            }
                         }
                     }
                     Ok(_) => None,
-                    Err(_) => Some(RecoveryTrigger::HostUnreachable),
+                    Err(error) => {
+                        append_event(
+                            &supervisor.config.lifecycle_log,
+                            "supervisor.runtime_observer.inspect_failed",
+                            serde_json::json!({"soulId":view.soul_id,"message":error.to_string()}),
+                        );
+                        Some(RecoveryTrigger::HostUnreachable)
+                    }
                 };
                 if let Some(trigger) = trigger {
                     append_event(
