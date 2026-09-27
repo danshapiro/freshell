@@ -244,14 +244,7 @@ test.describe.serial('Phase 2 managed runtime continuity', () => {
         expect(rig.runtime.broker.receipts()).toHaveLength(receiptCount)
         expect(rig.ownedContainerHasPid(originalIdentity.containerId, childPid)).toBe(true)
 
-        let heartbeat: number
-        try {
-          heartbeat = await waitForValue(`heartbeat advance after web cycle ${cycle}`, async () => {
-            const text = await terminal.getVisibleText(pane.terminalId)
-            const value = Number(text.match(/P2_HEARTBEAT:(\d+)/g)?.at(-1)?.split(':')[1] ?? -1)
-            return value > lastHeartbeat ? value : null
-          }, 60_000)
-        } catch (error) {
+        const failWithDiagnostics = async (error: unknown): Promise<never> => {
           const connection = await page.evaluate(() => ({
             ws: window.__FRESHELL_TEST_HARNESS__?.getWsReadyState(),
             redux: window.__FRESHELL_TEST_HARNESS__?.getState()?.connection,
@@ -261,23 +254,28 @@ test.describe.serial('Phase 2 managed runtime continuity', () => {
             try { return rig.web.processEvidence() } catch { return null }
           })()
           const output = rig.web.capturedOutput()
-          const text = await terminal.getVisibleText(pane.terminalId).catch(() => '')
-          const paneContent = findTerminalLeaves(await harness.getPaneLayout(pane.tabId))[0]?.content
-          const ownedProcesses = rig.ownedContainerExec(
-            originalIdentity.containerId,
-            ['ps', '-eo', 'pid,stat,args'],
-          )
-          const hostLogs = rig.runtime.containerLogs(originalIdentity.containerId)
+          const terminalText = await terminal.getVisibleText(pane.terminalId).catch(() => '')
           throw new Error(`${error instanceof Error ? error.message : String(error)}; diagnostics=${JSON.stringify({
             cycle, lastHeartbeat, connection, webProcess,
-            paneContent,
-            wsEvents: wsEvents.slice(-80),
-            terminalTail: text.slice(-500),
-            ownedProcesses: ownedProcesses.slice(-1200),
-            hostLogsTail: hostLogs.slice(-1200),
+            paneContent: findTerminalLeaves(await harness.getPaneLayout(pane.tabId))[0]?.content,
+            wsEvents: wsEvents.slice(-100),
+            terminalTail: terminalText.slice(-800),
+            ownedProcesses: rig.ownedContainerProcessTable(originalIdentity.containerId).slice(-1200),
+            hostLogsTail: rig.runtime.containerLogs(originalIdentity.containerId).slice(-1200),
             webStdoutTail: output.stdout.slice(-1500),
             webStderrTail: output.stderr.slice(-1500),
           })}`)
+        }
+
+        let heartbeat: number
+        try {
+          heartbeat = await waitForValue(`heartbeat advance after web cycle ${cycle}`, async () => {
+            const text = await terminal.getVisibleText(pane.terminalId)
+            const value = Number(text.match(/P2_HEARTBEAT:(\d+)/g)?.at(-1)?.split(':')[1] ?? -1)
+            return value > lastHeartbeat ? value : null
+          }, 60_000)
+        } catch (error) {
+          await failWithDiagnostics(error)
         }
         outputAdvanced = true
         lastHeartbeat = heartbeat
@@ -290,21 +288,7 @@ test.describe.serial('Phase 2 managed runtime continuity', () => {
         try {
           await waitForOwnedFileValue(rig, originalIdentity.containerId, markerPath, marker, 30_000)
         } catch (error) {
-          const connection = await page.evaluate(() => ({
-            ws: window.__FRESHELL_TEST_HARNESS__?.getWsReadyState(),
-            redux: window.__FRESHELL_TEST_HARNESS__?.getState()?.connection,
-          })).catch(() => null)
-          const output = rig.web.capturedOutput()
-          const text = await terminal.getVisibleText(pane.terminalId).catch(() => '')
-          throw new Error(`${error instanceof Error ? error.message : String(error)}; diagnostics=${JSON.stringify({
-            cycle, connection, wsEvents: wsEvents.slice(-100),
-            terminalTail: text.slice(-800),
-            paneContent: findTerminalLeaves(await harness.getPaneLayout(pane.tabId))[0]?.content,
-            ownedProcesses: rig.ownedContainerProcessTable(originalIdentity.containerId).slice(-1200),
-            hostLogsTail: rig.runtime.containerLogs(originalIdentity.containerId).slice(-1200),
-            webStdoutTail: output.stdout.slice(-1500),
-            webStderrTail: output.stderr.slice(-1500),
-          })}`)
+          await failWithDiagnostics(error)
         }
 
         expect(await harness.getTabCount()).toBe(1)
