@@ -14,9 +14,13 @@ OpenCode 1.18.21 (`opencode/big-pickle` free tier) is the only
 release-qualified durable coding provider in this landing. Claude, Codex, and
 Amplifier remain adapter-ready but route through their legacy ownership paths
 until their real live campaigns pass. The checked-in capability manifest is
-the source of truth, and managed WebSocket/REST/control admission follows it
-directly. Historical sections below describe adapter construction and earlier
-phase sequencing; they do not override the current release flags.
+the source of truth for managed terminal admission. All hosted fresh-agent
+modes are disabled in this release. Their separate
+`FRESHELL_MANAGED_FRESH_AGENT_V1=1` opt-in is for isolated qualification only:
+it does not yet share the normal ownership, identity, and naming admission
+path and must remain off in the release. Historical sections below describe
+adapter construction and earlier phase sequencing; they do not override the
+current release flags.
 
 ## Certification state and the two release gates
 
