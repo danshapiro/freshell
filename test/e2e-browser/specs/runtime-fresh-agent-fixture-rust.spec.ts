@@ -53,7 +53,7 @@ async function waitFor<T>(description: string, probe: () => Promise<T | null>, t
 }
 
 function fixtureState(rig: ManagedRuntimeBrowserRig, containerId: string): any {
-  return JSON.parse(rig.ownedContainerExec(containerId, [
+  return JSON.parse(rig.ownedProviderExec(containerId, [
     'cat', '/home/freshell/provider/.freshell-fixture/provider-native-state.json',
   ]))
 }
