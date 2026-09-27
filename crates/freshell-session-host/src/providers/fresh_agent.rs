@@ -37,6 +37,7 @@ const SEND_ACK_TIMEOUT: Duration = Duration::from_secs(55);
 const FORK_TIMEOUT: Duration = Duration::from_secs(55);
 const RETIRE_TIMEOUT: Duration = Duration::from_secs(20);
 const EVENT_CHANNEL_CAPACITY: usize = 256;
+const HOST_ACTOR_STATE_DIR: &str = "/run/freshell-host-actor";
 
 enum ProviderState {
     Claude(FreshClaudeState),
@@ -82,17 +83,12 @@ pub(crate) async fn open_hosted_fresh_agent(
             deterministic_transport(&profile, launch.run_as_uid, launch.run_as_gid).await?
         }
     };
-    // This path is on the soul's provider volume, not the incarnation runtime
-    // directory. It therefore preserves the one-writer command and decision
-    // journal across a session-host replacement without sharing state between
-    // souls.
-    FreshAgentHostActor::open(
-        "/home/freshell/provider/.freshell-host-actor",
-        profile,
-        transport,
-    )
-    .await
-    .map_err(|error| error.to_string())
+    // The supervisor mounts one protected, per-soul directory here across
+    // incarnations. The provider-owned HOME cannot hold the host's command
+    // and decision journal: the provider can change HOME permissions.
+    FreshAgentHostActor::open(HOST_ACTOR_STATE_DIR, profile, transport)
+        .await
+        .map_err(|error| error.to_string())
 }
 
 #[cfg(feature = "fresh-agent-fixtures")]

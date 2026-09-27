@@ -49,6 +49,47 @@ pub struct CreateRuntimeSpec {
     pub provider_volume_name: String,
 }
 
+const HOST_ACTOR_STATE_MOUNT: &str = "/run/freshell-host-actor";
+
+pub(crate) fn host_actor_state_dir(
+    runtime_root: &Path,
+    installation_id: &InstallationId,
+    soul_id: &SoulId,
+) -> PathBuf {
+    let digest =
+        Sha256::digest(format!("{}\0{}", installation_id.as_str(), soul_id.as_str()).as_bytes());
+    runtime_root
+        .join("souls")
+        .join(format!("{digest:x}"))
+        .join("actor")
+}
+
+fn verified_host_actor_state_dir(
+    runtime_root: &Path,
+    installation_id: &InstallationId,
+    soul_id: &SoulId,
+) -> Result<PathBuf, BackendError> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    let expected = host_actor_state_dir(runtime_root, installation_id, soul_id);
+    let canonical = canonical_dir(&expected)?;
+    if canonical != expected {
+        return Err(BackendError::OwnershipMismatch(
+            "host actor state directory escaped its soul path".into(),
+        ));
+    }
+    let metadata = std::fs::metadata(&canonical)
+        .map_err(|error| BackendError::OwnershipMismatch(error.to_string()))?;
+    if metadata.uid() != unsafe { libc::geteuid() }
+        || metadata.permissions().mode() & 0o777 != 0o700
+    {
+        return Err(BackendError::OwnershipMismatch(
+            "host actor state directory permissions changed".into(),
+        ));
+    }
+    Ok(canonical)
+}
+
 #[derive(Debug, Clone)]
 pub struct BackendCreated {
     pub daemon_id: DockerDaemonId,
@@ -390,6 +431,18 @@ impl RuntimeBackend for DockerEngineBackend {
         }
         let binary = canonical_regular_file(&spec.host_binary_path)?;
         let runtime_dir = canonical_dir(&spec.runtime_dir)?;
+        let actor_state_dir = if spec.fresh_agent.is_some() {
+            let runtime_root = runtime_dir.parent().ok_or_else(|| {
+                BackendError::InvalidConfig("runtime directory has no parent".into())
+            })?;
+            Some(verified_host_actor_state_dir(
+                runtime_root,
+                &spec.installation_id,
+                &spec.soul_id,
+            )?)
+        } else {
+            None
+        };
         if !spec.provider_volume_name.starts_with("freshell-provider-")
             || spec.provider_volume_name.len() > 96
         {
@@ -424,6 +477,12 @@ impl RuntimeBackend for DockerEngineBackend {
             format!("{}:/run/freshell:rw", runtime_dir.display()),
             format!("{}:/home/freshell/provider:rw", spec.provider_volume_name),
         ];
+        if let Some(actor_state_dir) = &actor_state_dir {
+            binds.push(format!(
+                "{}:{HOST_ACTOR_STATE_MOUNT}:rw",
+                actor_state_dir.display()
+            ));
+        }
         if let Some(mounts) = &terminal_mounts {
             binds.push(format!(
                 "{}:{}:rw",
@@ -958,6 +1017,35 @@ fn verify_inspect_config(handle: &OwnedRuntimeHandle, value: &Value) -> Result<(
             "provider home volume changed".into(),
         ));
     }
+    let actor_mounts = mounts
+        .iter()
+        .filter(|mount| {
+            mount.get("Destination").and_then(Value::as_str) == Some(HOST_ACTOR_STATE_MOUNT)
+        })
+        .collect::<Vec<_>>();
+    if handle.fresh_agent().is_some() {
+        let runtime_root = handle.runtime_dir().parent().ok_or_else(|| {
+            BackendError::OwnershipMismatch("runtime directory has no parent".into())
+        })?;
+        let expected = verified_host_actor_state_dir(
+            runtime_root,
+            handle.installation_id(),
+            handle.soul_id(),
+        )?;
+        if actor_mounts.len() != 1
+            || actor_mounts[0].get("Source").and_then(Value::as_str)
+                != Some(expected.to_string_lossy().as_ref())
+            || actor_mounts[0].get("RW").and_then(Value::as_bool) != Some(true)
+        {
+            return Err(BackendError::OwnershipMismatch(
+                "fresh-agent actor state mount changed".into(),
+            ));
+        }
+    } else if !actor_mounts.is_empty() {
+        return Err(BackendError::OwnershipMismatch(
+            "non-agent runtime gained an actor state mount".into(),
+        ));
+    }
     if let Some(terminal) = handle.terminal() {
         let expected =
             docker::terminal_mounts(terminal).map_err(BackendError::OwnershipMismatch)?;
@@ -1151,6 +1239,120 @@ fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use freshell_runtime_protocol::{FreshProvider, LaunchNonce};
+    use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn fresh_agent_ownership_requires_the_same_souls_private_actor_mount() {
+        let root = tempfile::tempdir().unwrap();
+        let runtime_dir = root.path().join("incarnation-one");
+        let workspace = root.path().join("workspace");
+        let actor_dir = host_actor_state_dir(
+            root.path(),
+            &InstallationId::parse("installation-one").unwrap(),
+            &SoulId::parse("soul-one").unwrap(),
+        );
+        std::fs::create_dir(&runtime_dir).unwrap();
+        std::fs::create_dir(&workspace).unwrap();
+        std::fs::create_dir_all(&actor_dir).unwrap();
+        std::fs::set_permissions(&actor_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let binary = root.path().join("freshell-session-host");
+        std::fs::write(&binary, b"host").unwrap();
+        let agent = FreshAgentLaunchSpec {
+            session_id: "session-one".into(),
+            provider: FreshProvider::Codex,
+            session_type: "freshcodex".into(),
+            runtime_variant: "test".into(),
+            provider_store_id: "store-one".into(),
+            cwd: workspace.to_string_lossy().into_owned(),
+            workspace_path: workspace.to_string_lossy().into_owned(),
+            git_common_dir: None,
+            run_as_uid: 65_534,
+            run_as_gid: 0,
+            model: None,
+            effort: None,
+            permission_mode: None,
+            sandbox: None,
+            native_session_id: None,
+            fixture_transport: None,
+            provider_bootstrap_files: Vec::new(),
+        };
+        let installation_id = InstallationId::parse("installation-one").unwrap();
+        let soul_id = SoulId::parse("soul-one").unwrap();
+        let incarnation_id = IncarnationId::parse("incarnation-one").unwrap();
+        let env = runtime_host_environment(None, Some(&agent)).unwrap();
+        let handle = OwnedRuntimeHandle::from_registry(
+            installation_id.clone(),
+            soul_id.clone(),
+            incarnation_id.clone(),
+            LaunchNonce::new(),
+            DockerDaemonId::new(),
+            "container-one".into(),
+            "sha256:image".into(),
+            runtime_dir.clone(),
+            binary.clone(),
+            "sha256:config".into(),
+            RuntimeLimits {
+                cpu_milli: 500,
+                memory_bytes: 128 * 1024 * 1024,
+                swap_bytes: 0,
+                pids_max: 64,
+            },
+            None,
+            None,
+            Some(agent),
+            "freshell-provider-aaaaaaaaaaaaaaaaaaaaaaaa".into(),
+        );
+        let mut inspected = serde_json::json!({
+            "Image":"sha256:image",
+            "Config": {
+                "Labels": {
+                    "com.freshell.managed":"true",
+                    "com.freshell.installation-id":installation_id.as_str(),
+                    "com.freshell.soul-id":soul_id.as_str(),
+                    "com.freshell.incarnation-id":incarnation_id.as_str(),
+                },
+                "Env": env,
+            },
+            "HostConfig": {
+                "NetworkMode":"bridge",
+                "PidMode":"",
+                "Privileged":false,
+                "CapAdd":["CHOWN","SETGID","SETUID"],
+                "Tmpfs":runtime_tmpfs(Some("codex")),
+            },
+            "Mounts": [
+                {"Source":binary,"Destination":"/runtime/freshell-session-host","RW":false},
+                {"Source":runtime_dir,"Destination":"/run/freshell","RW":true},
+                {"Name":handle.provider_volume_name(),"Destination":"/home/freshell/provider","RW":true},
+                {"Source":workspace,"Destination":workspace,"RW":true},
+                {"Source":actor_dir,"Destination":HOST_ACTOR_STATE_MOUNT,"RW":true},
+            ],
+        });
+        assert!(verify_inspect_config(&handle, &inspected).is_ok());
+
+        inspected["Mounts"][4]["Source"] = serde_json::json!(host_actor_state_dir(
+            root.path(),
+            &installation_id,
+            &SoulId::parse("soul-other").unwrap()
+        ));
+        assert!(matches!(
+            verify_inspect_config(&handle, &inspected),
+            Err(BackendError::OwnershipMismatch(_))
+        ));
+        inspected["Mounts"][4]["Source"] = serde_json::json!(actor_dir);
+        std::fs::set_permissions(&actor_dir, std::fs::Permissions::from_mode(0o770)).unwrap();
+        assert!(matches!(
+            verify_inspect_config(&handle, &inspected),
+            Err(BackendError::OwnershipMismatch(_))
+        ));
+        std::fs::set_permissions(&actor_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        inspected["Mounts"].as_array_mut().unwrap().remove(4);
+        assert!(matches!(
+            verify_inspect_config(&handle, &inspected),
+            Err(BackendError::OwnershipMismatch(_))
+        ));
+    }
 
     #[test]
     fn parses_content_length_response() {

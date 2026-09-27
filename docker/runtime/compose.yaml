@@ -9,6 +9,9 @@ services:
     volumes:
       - supervisor-registry:/var/lib/freshell-supervisor
       - ${FRESHELL_RUNTIME_CONTROL_DIR:?set runtime control dir}:/run/freshell-supervisor
+      # Docker resolves dynamic host binds on the daemon host, so the
+      # supervisor must see incarnation and per-soul actor paths unchanged.
+      - ${FRESHELL_RUNTIME_ROOT:?set shared runtime root}:${FRESHELL_RUNTIME_ROOT:?set shared runtime root}:rw
       - ${DOCKER_SOCKET:-/var/run/docker.sock}:/var/run/docker.sock
       # Optional real-Claude bootstrap. Same canonical host path on both
       # controller services; unset falls back to a harmless non-credential

@@ -1,6 +1,8 @@
 use crate::{
     admission::AdmissionPolicy,
-    backend::{BackendError, CreateRuntimeSpec, DockerEngineBackend, RuntimeBackend},
+    backend::{
+        host_actor_state_dir, BackendError, CreateRuntimeSpec, DockerEngineBackend, RuntimeBackend,
+    },
     registry::{
         stable_provider_volume_name, BackendCreatedRecord, ExecutionGrantRecord,
         InputJournalDisposition, LaunchPreparation, PreparedLaunch, Registry, RegistryError,
@@ -524,6 +526,16 @@ impl Supervisor {
             let runtime_dir = self.ensure_incarnation_dir(&prepared).map_err(|error| {
                 self.activation_failure(&prepared, state, "ensure_runtime_directory", error)
             })?;
+            if fresh_agent.is_some() {
+                ensure_host_actor_state_dir(
+                    &self.config.runtime_root,
+                    self.registry.installation_id(),
+                    &prepared.soul_id,
+                )
+                .map_err(|error| {
+                    self.activation_failure(&prepared, state, "ensure_host_actor_directory", error)
+                })?;
+            }
             let created = self
                 .backend
                 .create_stopped(&CreateRuntimeSpec {
@@ -1862,6 +1874,56 @@ impl Supervisor {
     }
 }
 
+fn ensure_host_actor_state_dir(
+    runtime_root: &Path,
+    installation_id: &freshell_runtime_protocol::InstallationId,
+    soul_id: &SoulId,
+) -> Result<PathBuf, RuntimeError> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    let actor_dir = host_actor_state_dir(runtime_root, installation_id, soul_id);
+    let souls_dir = actor_dir.parent().and_then(Path::parent).ok_or_else(|| {
+        RuntimeError::new(
+            RuntimeErrorCode::InvalidRequest,
+            "invalid actor storage path",
+        )
+    })?;
+    let soul_dir = actor_dir.parent().expect("actor dir has soul parent");
+    for directory in [souls_dir, soul_dir, actor_dir.as_path()] {
+        match std::fs::symlink_metadata(directory) {
+            Ok(metadata) => {
+                if !metadata.is_dir()
+                    || metadata.file_type().is_symlink()
+                    || metadata.uid() != unsafe { libc::geteuid() }
+                    || metadata.permissions().mode() & 0o777 != 0o700
+                {
+                    return Err(RuntimeError::new(
+                        RuntimeErrorCode::OwnershipMismatch,
+                        format!(
+                            "host actor storage ownership changed: {}",
+                            directory.display()
+                        ),
+                    ));
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                std::fs::create_dir(directory).map_err(io_runtime)?;
+                std::fs::set_permissions(directory, std::fs::Permissions::from_mode(0o700))
+                    .map_err(io_runtime)?;
+            }
+            Err(error) => return Err(io_runtime(error)),
+        }
+    }
+    let canonical = std::fs::canonicalize(&actor_dir).map_err(io_runtime)?;
+    if canonical != actor_dir {
+        return Err(RuntimeError::new(
+            RuntimeErrorCode::OwnershipMismatch,
+            "host actor storage escaped its soul path",
+        ));
+    }
+    Ok(canonical)
+}
+
 #[derive(Clone)]
 pub(crate) struct AuthenticatedHost {
     host_boot_id: HostBootId,
@@ -2088,6 +2150,62 @@ fn release_qualified_workload(
     is_fixture
         || has_fresh_agent
         || (has_terminal && freshell_agent_runtime::managed_provider_enabled(provider))
+}
+
+#[cfg(test)]
+mod host_actor_storage_tests {
+    use super::ensure_host_actor_state_dir;
+    use freshell_runtime_protocol::{InstallationId, SoulId};
+    use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn actor_state_is_private_per_soul_and_survives_incarnation_replacement() {
+        let root = tempfile::tempdir().unwrap();
+        let installation = InstallationId::parse("installation-one").unwrap();
+        let first = SoulId::parse("soul-first").unwrap();
+        let second = SoulId::parse("soul-second").unwrap();
+
+        let first_dir = ensure_host_actor_state_dir(root.path(), &installation, &first).unwrap();
+        let journal = first_dir.join("fresh-agent-state.json");
+        std::fs::write(&journal, b"durable actor state").unwrap();
+        let reopened = ensure_host_actor_state_dir(root.path(), &installation, &first).unwrap();
+        let second_dir = ensure_host_actor_state_dir(root.path(), &installation, &second).unwrap();
+        let other_installation = InstallationId::parse("installation-two").unwrap();
+        let other_install_dir =
+            ensure_host_actor_state_dir(root.path(), &other_installation, &first).unwrap();
+
+        assert_eq!(first_dir, reopened);
+        assert_eq!(std::fs::read(journal).unwrap(), b"durable actor state");
+        assert_ne!(first_dir, second_dir);
+        assert_ne!(first_dir, other_install_dir);
+        assert_eq!(
+            std::fs::metadata(&first_dir).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        assert_eq!(
+            std::fs::metadata(&second_dir).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+    }
+
+    #[test]
+    fn actor_state_rejects_a_symlink_into_another_soul() {
+        let root = tempfile::tempdir().unwrap();
+        let installation = InstallationId::parse("installation-one").unwrap();
+        let first = SoulId::parse("soul-first").unwrap();
+        let second = SoulId::parse("soul-second").unwrap();
+        let first_dir = ensure_host_actor_state_dir(root.path(), &installation, &first).unwrap();
+        let second_dir = super::host_actor_state_dir(root.path(), &installation, &second);
+        std::fs::create_dir_all(second_dir.parent().unwrap()).unwrap();
+        std::fs::set_permissions(
+            second_dir.parent().unwrap(),
+            std::fs::Permissions::from_mode(0o700),
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(&first_dir, &second_dir).unwrap();
+
+        assert!(ensure_host_actor_state_dir(root.path(), &installation, &second).is_err());
+    }
 }
 
 #[cfg(test)]

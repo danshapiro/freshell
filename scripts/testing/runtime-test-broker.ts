@@ -208,13 +208,17 @@ export class RestrictedDockerBroker {
     const labels = parsed.Labels ?? {}
     const incarnationId = stringField(labels, 'com.freshell.incarnation-id')
     const soulId = stringField(labels, 'com.freshell.soul-id')
+    const installationId = stringField(labels, 'com.freshell.installation-id')
     if (labels.project !== 'freshell') return { ok: false, reason: 'wrong project bookkeeping label' }
     if (labels['com.freshell.managed'] !== 'true') return { ok: false, reason: 'missing managed label' }
     if (labels['com.freshell.runtime-test-run-id'] !== this.policy.testRunId) return { ok: false, reason: 'wrong runtime-test run id' }
-    if (!incarnationId || !soulId) return { ok: false, reason: 'missing incarnation/soul labels' }
+    if (!incarnationId || !soulId || !installationId) return { ok: false, reason: 'missing installation/incarnation/soul labels' }
 
     const host = parsed.HostConfig ?? {}
     const terminalWorkload = host.NetworkMode === 'bridge'
+    const freshAgentWorkload = Array.isArray(parsed.Env) && parsed.Env.some((value: unknown) => (
+      typeof value === 'string' && value.startsWith('FRESHELL_HOSTED_FRESH_AGENT=')
+    ))
     if (host.NetworkMode !== 'none' && !terminalWorkload) return { ok: false, reason: 'runtime network must be none or isolated bridge' }
     if (terminalWorkload && !this.policy.allowTerminalWorkloads) return { ok: false, reason: 'terminal workload networking not enabled for this gate' }
     if ((host.PidMode ?? '') !== '') return { ok: false, reason: 'host pid namespace is forbidden' }
@@ -246,6 +250,7 @@ export class RestrictedDockerBroker {
     let runtimeDir = ''
     let providerVolumeName = ''
     let workspacePath = ''
+    let actorStateDir = ''
     for (const bind of binds) {
       const parts = bind.split(':')
       const mode = parts.pop() ?? ''
@@ -263,6 +268,11 @@ export class RestrictedDockerBroker {
         providerVolumeName = source
         continue
       }
+      if (destination === '/run/freshell-host-actor' && mode === 'rw') {
+        if (actorStateDir) return { ok: false, reason: 'duplicate host actor state bind' }
+        actorStateDir = source
+        continue
+      }
       if (terminalWorkload && destination === source && mode === 'rw' && this.isAllowedWorkspacePath(source)) {
         if (!workspacePath) workspacePath = source
         continue
@@ -277,6 +287,14 @@ export class RestrictedDockerBroker {
     }
     if (!binaryBind || !runtimeDir || !providerVolumeName) return { ok: false, reason: 'required binary/runtime/provider-volume bind topology missing' }
     if (terminalWorkload && !workspacePath) return { ok: false, reason: 'terminal workload missing approved workspace bind' }
+    const actorKey = createHash('sha256').update(`${installationId}\0${soulId}`).digest('hex')
+    const expectedActorStateDir = path.join(path.dirname(runtimeDir), 'souls', actorKey, 'actor')
+    if (freshAgentWorkload && actorStateDir !== expectedActorStateDir) {
+      return { ok: false, reason: 'fresh-agent host actor state bind does not match the labeled soul' }
+    }
+    if (!freshAgentWorkload && actorStateDir) {
+      return { ok: false, reason: 'non-agent workload gained a host actor state bind' }
+    }
     if (binds.some((bind) => bind.includes('docker.sock') || bind.includes('/var/lib/freshell-supervisor') || bind.includes('/run/freshell-supervisor'))) {
       return { ok: false, reason: 'management-state mount is forbidden' }
     }

@@ -33,6 +33,11 @@ tmpfs, explicit CPU/memory/PID limits, and no Docker or supervisor-admin socket.
 containers are intentionally outside Compose. Operational restart commands must
 name `web` or `supervisor`; do not use `docker compose down` for an ordinary
 Freshell restart, because that is a project-wide destruction primitive.
+Set `FRESHELL_RUNTIME_ROOT` to a private, persistent directory on the Docker
+host before starting Compose. Compose mounts it at the same absolute path in
+the supervisor so Docker can bind each incarnation's control directory and
+each fresh-agent soul's protected actor journal into its dynamic container.
+Keep this directory across supervisor restarts and incarnation replacement.
 
 Provider credentials are never placed in the persisted terminal environment.
 For managed Claude, `FRESHELL_MANAGED_CLAUDE_CREDENTIAL_FILE` may point at one
