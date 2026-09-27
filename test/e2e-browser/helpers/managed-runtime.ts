@@ -320,7 +320,9 @@ export class ManagedRuntimeBrowserRig {
   }
 
   ownedContainerProcessTable(containerId: string): string {
-    return this.runtime.topOwnedContainerExact(containerId, ['-eo', 'pid,args'])
+    // docker top reports host PIDs, while killOwnedRuntimePidExact signals
+    // inside the container's PID namespace. Read both from the same namespace.
+    return this.runtime.execOwnedContainerExact(containerId, ['ps', '-eo', 'pid,args'])
   }
 
   writeBrowserReceipt(value: unknown): string {
