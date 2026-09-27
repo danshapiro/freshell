@@ -104,7 +104,7 @@ function playwright(spec: string, extraEnv: Record<string, string>) {
     [
       'exec', 'node@22', '--', 'node_modules/.bin/playwright', 'test',
       '--config', 'test/e2e-browser/playwright.config.ts',
-      '--project=rust-chromium', '--reporter=line', spec,
+      '--project=chromium', '--reporter=line', spec,
     ],
     { ...env, ...extraEnv },
     logPath,

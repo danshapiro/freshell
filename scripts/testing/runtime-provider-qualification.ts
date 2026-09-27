@@ -24,7 +24,7 @@ export function selectedProviderFromArgs(args: readonly string[]): string {
 export function runSelectedProviderQualification(args = process.argv.slice(2)): void {
   const provider = selectedProviderFromArgs(args)
   execFileSync('npm', [
-    'run', 'test:e2e:local', '--', '--project=rust-chromium', SPEC,
+    'run', 'test:e2e:local', '--', '--project=chromium', SPEC,
   ], {
     cwd: process.cwd(),
     env: {

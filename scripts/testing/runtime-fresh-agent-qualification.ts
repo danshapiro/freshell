@@ -24,7 +24,7 @@ export function selectedFreshAgentModeFromArgs(args: readonly string[]): string 
 export function runSelectedFreshAgentQualification(args = process.argv.slice(2)): void {
   const mode = selectedFreshAgentModeFromArgs(args)
   execFileSync('npm', [
-    'run', 'test:e2e:local', '--', '--project=rust-chromium', SPEC,
+    'run', 'test:e2e:local', '--', '--project=chromium', SPEC,
   ], {
     cwd: process.cwd(),
     env: {
