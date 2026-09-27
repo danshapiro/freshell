@@ -246,7 +246,9 @@ impl FakeOpencodeServeEnv {
             uuid_like_suffix()
         ));
         std::fs::create_dir_all(&dir).expect("create fake serve temp dir");
-        let script = dir.join("fake-opencode-serve");
+        // Keep CommonJS explicit even if /tmp inherits a foreign package.json
+        // with "type": "module".
+        let script = dir.join("fake-opencode-serve.cjs");
         std::fs::write(&script, FAKE_OPENCODE_SERVE_SOURCE).expect("write fake serve");
         #[cfg(unix)]
         {
