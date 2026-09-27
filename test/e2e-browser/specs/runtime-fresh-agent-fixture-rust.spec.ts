@@ -142,6 +142,7 @@ test.describe.serial('managed fresh-agent deterministic fixture', () => {
       const claude = created[0]
       await post(restarted.baseUrl, restarted.token, `/api/panes/${claude.paneId}/send-keys`, {
         data: PENDING_CONTROL,
+        timeout: 0,
       })
       const pendingState = await waitFor('fixture approval request', async () => {
         const state = fixtureState(rig, claude.view.containerId!)
