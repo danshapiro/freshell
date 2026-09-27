@@ -1786,7 +1786,14 @@ test.describe('Restore Contract Wall (P0.1)', () => {
       // product alert (Pane error banner, TerminalExitBanner, fresh-agent
       // banners, ConnectionErrorOverlay, ...) lacks .monaco-alert and is
       // still counted.
-      await expect(page.locator('[role="alert"]:not(.monaco-alert)')).toHaveCount(0)
+      await expect.poll(async () => page.locator('[role="alert"]:not(.monaco-alert)').evaluateAll(
+        (alerts) => alerts.map((alert) => ({
+          text: alert.textContent?.trim(),
+          className: alert.className,
+          paneId: alert.closest('[data-pane-id]')?.getAttribute('data-pane-id'),
+          tabId: alert.closest('[data-tab-id]')?.getAttribute('data-tab-id'),
+        })),
+      ), { timeout: 10_000 }).toEqual([])
     } finally {
       await context.close().catch(() => {})
       await server.stop()

@@ -163,6 +163,26 @@ test.describe.serial('Phase 2 managed runtime continuity', () => {
   test('P2-G01: real browser shell survives ten graceful/abrupt web replacements', async ({ page }) => {
     test.setTimeout(1_800_000)
 
+    const wsEvents: Array<Record<string, unknown>> = []
+    const recordWsEvent = (event: Record<string, unknown>) => {
+      wsEvents.push({ at: Date.now(), ...event })
+      if (wsEvents.length > 200) wsEvents.shift()
+    }
+    page.on('websocket', (socket) => {
+      recordWsEvent({ event: 'open', url: socket.url() })
+      socket.on('close', () => recordWsEvent({ event: 'close' }))
+      for (const event of ['framesent', 'framereceived'] as const) {
+        socket.on(event, (frame) => {
+          try {
+            const message = JSON.parse(String(frame.payload))
+            recordWsEvent({ event, type: message.type, terminalId: message.terminalId, code: message.code })
+          } catch {
+            recordWsEvent({ event, type: 'non-json' })
+          }
+        })
+      }
+    })
+
     const rig = new ManagedRuntimeBrowserRig()
     try {
       const info = await rig.start()
@@ -224,11 +244,41 @@ test.describe.serial('Phase 2 managed runtime continuity', () => {
         expect(rig.runtime.broker.receipts()).toHaveLength(receiptCount)
         expect(rig.ownedContainerHasPid(originalIdentity.containerId, childPid)).toBe(true)
 
-        const heartbeat = await waitForValue(`heartbeat advance after web cycle ${cycle}`, async () => {
-          const text = await terminal.getVisibleText(pane.terminalId)
-          const value = Number(text.match(/P2_HEARTBEAT:(\d+)/g)?.at(-1)?.split(':')[1] ?? -1)
-          return value > lastHeartbeat ? value : null
-        }, 60_000)
+        let heartbeat: number
+        try {
+          heartbeat = await waitForValue(`heartbeat advance after web cycle ${cycle}`, async () => {
+            const text = await terminal.getVisibleText(pane.terminalId)
+            const value = Number(text.match(/P2_HEARTBEAT:(\d+)/g)?.at(-1)?.split(':')[1] ?? -1)
+            return value > lastHeartbeat ? value : null
+          }, 60_000)
+        } catch (error) {
+          const connection = await page.evaluate(() => ({
+            ws: window.__FRESHELL_TEST_HARNESS__?.getWsReadyState(),
+            redux: window.__FRESHELL_TEST_HARNESS__?.getState()?.connection,
+            managedRuntime: window.__FRESHELL_TEST_HARNESS__?.getState()?.managedRuntime,
+          })).catch(() => null)
+          const webProcess = (() => {
+            try { return rig.web.processEvidence() } catch { return null }
+          })()
+          const output = rig.web.capturedOutput()
+          const text = await terminal.getVisibleText(pane.terminalId).catch(() => '')
+          const paneContent = findTerminalLeaves(await harness.getPaneLayout(pane.tabId))[0]?.content
+          const ownedProcesses = rig.ownedContainerExec(
+            originalIdentity.containerId,
+            ['ps', '-eo', 'pid,stat,args'],
+          )
+          const hostLogs = rig.runtime.containerLogs(originalIdentity.containerId)
+          throw new Error(`${error instanceof Error ? error.message : String(error)}; diagnostics=${JSON.stringify({
+            cycle, lastHeartbeat, connection, webProcess,
+            paneContent,
+            wsEvents: wsEvents.slice(-80),
+            terminalTail: text.slice(-500),
+            ownedProcesses: ownedProcesses.slice(-1200),
+            hostLogsTail: hostLogs.slice(-1200),
+            webStdoutTail: output.stdout.slice(-1500),
+            webStderrTail: output.stderr.slice(-1500),
+          })}`)
+        }
         outputAdvanced = true
         lastHeartbeat = heartbeat
 
@@ -237,7 +287,25 @@ test.describe.serial('Phase 2 managed runtime continuity', () => {
         await terminal.executeCommandInserted(
           `printf '%s\n' ${JSON.stringify(marker)} > "$HOME/p2-web-cycle-${cycle}"`,
         )
-        await waitForOwnedFileValue(rig, originalIdentity.containerId, markerPath, marker, 30_000)
+        try {
+          await waitForOwnedFileValue(rig, originalIdentity.containerId, markerPath, marker, 30_000)
+        } catch (error) {
+          const connection = await page.evaluate(() => ({
+            ws: window.__FRESHELL_TEST_HARNESS__?.getWsReadyState(),
+            redux: window.__FRESHELL_TEST_HARNESS__?.getState()?.connection,
+          })).catch(() => null)
+          const output = rig.web.capturedOutput()
+          const text = await terminal.getVisibleText(pane.terminalId).catch(() => '')
+          throw new Error(`${error instanceof Error ? error.message : String(error)}; diagnostics=${JSON.stringify({
+            cycle, connection, wsEvents: wsEvents.slice(-100),
+            terminalTail: text.slice(-800),
+            paneContent: findTerminalLeaves(await harness.getPaneLayout(pane.tabId))[0]?.content,
+            ownedProcesses: rig.ownedContainerProcessTable(originalIdentity.containerId).slice(-1200),
+            hostLogsTail: rig.runtime.containerLogs(originalIdentity.containerId).slice(-1200),
+            webStdoutTail: output.stdout.slice(-1500),
+            webStderrTail: output.stderr.slice(-1500),
+          })}`)
+        }
 
         expect(await harness.getTabCount()).toBe(1)
         expect(findTerminalLeaves(await harness.getPaneLayout(pane.tabId))).toHaveLength(1)
