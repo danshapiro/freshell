@@ -37,6 +37,7 @@ WORKDIR /build
 COPY Cargo.toml Cargo.lock ./
 COPY crates/ ./crates/
 COPY extensions/ ./extensions/
+COPY docker/runtime/provider-versions.json ./docker/runtime/provider-versions.json
 RUN FRESHELL_BUILD_COMMIT="$FRESHELL_BUILD_COMMIT" cargo build --release -p freshell-server --locked
 
 # ---------------------------------------------------------------------------
