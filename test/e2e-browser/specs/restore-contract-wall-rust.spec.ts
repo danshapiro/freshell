@@ -1761,9 +1761,12 @@ test.describe('Restore Contract Wall (P0.1)', () => {
             timeout: 45_000,
           })
           .toBe(expectedId)
-        const leafX = findFreshAgentLeaf(await harness.getPaneLayout(tabIdX))
-        expect(leafX?.content?.status).not.toBe('error')
-        expect(leafX?.content?.status).not.toBe('creating')
+        await expect
+          .poll(async () => {
+            const status = findFreshAgentLeaf(await harness.getPaneLayout(tabIdX))?.content?.status
+            return typeof status === 'string' && status !== 'creating' && status !== 'error'
+          }, { timeout: 45_000 })
+          .toBe(true)
       }
 
       // Quiet client: no alerts, no noisy error text (donor: restore-sync05).
