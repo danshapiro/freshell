@@ -10112,17 +10112,30 @@ mod tests {
         }
         // The refusal precondition: a handoff owns the durable key's
         // transition, so the kill's fenced stop is typed-blocked.
-        let freshell_ownership::BeginOutcome::Granted { .. } = registry.begin_handoff(
-            "opencode",
-            "ses_1",
-            freshell_ownership::RuntimeOwnerKind::Terminal,
-            "ho-refused-1",
-            None,
-            "test",
-            crate::session_lease::now_epoch_ms() + 1,
-        ) else {
-            panic!("fixture: the handoff begins from the committed Live state")
-        };
+        // Live can be visible before the materialization's attach guard is
+        // released. A handoff correctly waits for that guard, so wait for
+        // the actual handoff precondition instead of racing its release.
+        let handoff_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            match registry.begin_handoff(
+                "opencode",
+                "ses_1",
+                freshell_ownership::RuntimeOwnerKind::Terminal,
+                "ho-refused-1",
+                None,
+                "test",
+                crate::session_lease::now_epoch_ms(),
+            ) {
+                freshell_ownership::BeginOutcome::Granted { .. } => break,
+                freshell_ownership::BeginOutcome::Blocked {
+                    state: freshell_ownership::OwnershipState::Live { .. },
+                    ..
+                } if tokio::time::Instant::now() < handoff_deadline => {
+                    tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                }
+                outcome => panic!("fixture: the handoff could not begin from Live: {outcome:?}"),
+            }
+        }
         while rx.try_recv().is_ok() {}
 
         st.handle_kill(FreshAgentKill {
