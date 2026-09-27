@@ -3,8 +3,8 @@ pub mod docker;
 use crate::registry::OwnedRuntimeHandle;
 use async_trait::async_trait;
 use freshell_runtime_protocol::{
-    DockerDaemonId, FreshAgentLaunchSpec, IncarnationId, InstallationId, RuntimeLimits, SoulId,
-    TerminalLaunchSpec,
+    DockerDaemonId, FreshAgentFixtureTransport, FreshAgentLaunchSpec, FreshProvider, IncarnationId,
+    InstallationId, ProviderBootstrapFile, RuntimeLimits, SoulId, TerminalLaunchSpec,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -790,8 +790,42 @@ struct ExpectedConfig {
     runtime_dir: String,
     limits: RuntimeLimits,
     terminal: Option<TerminalLaunchSpec>,
-    fresh_agent: Option<FreshAgentLaunchSpec>,
+    fresh_agent: Option<ImmutableFreshAgentConfig>,
     provider_volume_name: String,
+}
+
+/// The registry updates session identity and turn settings while a container
+/// runs. Docker's launch proof covers only fields that remain fixed for that
+/// incarnation, including the provider's mounted workspace and bootstrap.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ImmutableFreshAgentConfig {
+    provider: FreshProvider,
+    session_type: String,
+    runtime_variant: String,
+    provider_store_id: String,
+    workspace_path: String,
+    git_common_dir: Option<String>,
+    run_as_uid: u32,
+    run_as_gid: u32,
+    fixture_transport: Option<FreshAgentFixtureTransport>,
+    provider_bootstrap_files: Vec<ProviderBootstrapFile>,
+}
+
+impl From<&FreshAgentLaunchSpec> for ImmutableFreshAgentConfig {
+    fn from(spec: &FreshAgentLaunchSpec) -> Self {
+        Self {
+            provider: spec.provider.clone(),
+            session_type: spec.session_type.clone(),
+            runtime_variant: spec.runtime_variant.clone(),
+            provider_store_id: spec.provider_store_id.clone(),
+            workspace_path: spec.workspace_path.clone(),
+            git_common_dir: spec.git_common_dir.clone(),
+            run_as_uid: spec.run_as_uid,
+            run_as_gid: spec.run_as_gid,
+            fixture_transport: spec.fixture_transport,
+            provider_bootstrap_files: spec.provider_bootstrap_files.clone(),
+        }
+    }
 }
 
 impl ExpectedConfig {
@@ -805,7 +839,7 @@ impl ExpectedConfig {
             runtime_dir: runtime_dir.to_string_lossy().into_owned(),
             limits: spec.limits,
             terminal: spec.terminal.clone(),
-            fresh_agent: spec.fresh_agent.clone(),
+            fresh_agent: spec.fresh_agent.as_ref().map(Into::into),
             provider_volume_name: spec.provider_volume_name.clone(),
         }
     }
@@ -821,7 +855,7 @@ fn immutable_digest_from_handle(handle: &OwnedRuntimeHandle) -> Result<String, B
         runtime_dir: handle.runtime_dir().to_string_lossy().into_owned(),
         limits: handle.requested_limits(),
         terminal: handle.terminal().cloned(),
-        fresh_agent: handle.fresh_agent().cloned(),
+        fresh_agent: handle.fresh_agent().map(Into::into),
         provider_volume_name: handle.provider_volume_name().to_owned(),
     })
 }
@@ -1553,5 +1587,61 @@ mod tests {
             verify_runtime_environment(&leaked, &expected),
             Err(BackendError::OwnershipMismatch(_))
         ));
+    }
+
+    #[test]
+    fn fresh_agent_config_digest_survives_native_identity_and_turn_settings() {
+        let agent = FreshAgentLaunchSpec {
+            session_id: "presentation-one".into(),
+            provider: FreshProvider::Codex,
+            session_type: "freshcodex".into(),
+            runtime_variant: "codex-app-server".into(),
+            provider_store_id: "store-one".into(),
+            cwd: "/workspace".into(),
+            workspace_path: "/workspace".into(),
+            git_common_dir: None,
+            run_as_uid: 65_534,
+            run_as_gid: 0,
+            model: None,
+            effort: None,
+            permission_mode: None,
+            sandbox: None,
+            native_session_id: None,
+            fixture_transport: None,
+            provider_bootstrap_files: Vec::new(),
+        };
+        let digest = |agent: FreshAgentLaunchSpec| {
+            digest_expected(&ExpectedConfig {
+                image_ref: "sha256:image".into(),
+                installation_id: "installation-one".into(),
+                soul_id: "soul-one".into(),
+                incarnation_id: "incarnation-one".into(),
+                host_binary_path: "/runtime/host".into(),
+                runtime_dir: "/runtime/incarnation".into(),
+                limits: RuntimeLimits {
+                    cpu_milli: 500,
+                    memory_bytes: 128 * 1024 * 1024,
+                    swap_bytes: 0,
+                    pids_max: 64,
+                },
+                terminal: None,
+                fresh_agent: Some((&agent).into()),
+                provider_volume_name: "freshell-provider-one".into(),
+            })
+            .unwrap()
+        };
+        let original = digest(agent.clone());
+        let mut running = agent.clone();
+        running.native_session_id = Some("native-one".into());
+        running.session_id = "presentation-fork".into();
+        running.cwd = "/workspace/subdirectory".into();
+        running.model = Some("model-one".into());
+        running.effort = Some("low".into());
+        running.permission_mode = Some("accept-edits".into());
+        running.sandbox = Some("workspace-write".into());
+        assert_eq!(digest(running.clone()), original);
+
+        running.provider_store_id = "store-two".into();
+        assert_ne!(digest(running), original);
     }
 }
