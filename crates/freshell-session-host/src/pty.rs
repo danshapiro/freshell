@@ -570,6 +570,7 @@ mod managed_opencode_identity_tests {
             last_activity_at: Some(created_at),
             project_path: Some(cwd.to_string()),
             has_three_views_marker: Some(0),
+            model: None,
         }
     }
 

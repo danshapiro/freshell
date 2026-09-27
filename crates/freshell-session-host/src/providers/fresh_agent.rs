@@ -246,6 +246,8 @@ impl HostedTransport {
             .expect("suppressed kill lock")
             .insert(session_id.to_string());
         let message = FreshAgentKill {
+            observed_epoch: None,
+            observed_generation: None,
             provider: self.provider_wire(),
             session_id: session_id.to_string(),
             session_type: self.session_type(),
@@ -358,6 +360,9 @@ impl FreshAgentTransport for HostedTransport {
             });
         let create = FreshAgentCreate {
             request_id: format!("host-create-{}", uuid::Uuid::new_v4()),
+            observed_epoch: None,
+            observed_generation: None,
+            naming_handle: None,
             session_type: self.session_type(),
             cwd: Some(profile.cwd.clone()),
             effort: profile.effort.clone(),
@@ -424,6 +429,8 @@ impl FreshAgentTransport for HostedTransport {
         let profile = profile.clone();
         let mut outcomes = self.send_outcomes.subscribe();
         let send = FreshAgentSend {
+            observed_epoch: None,
+            observed_generation: None,
             provider: self.provider_wire(),
             session_id,
             session_type: self.session_type(),
@@ -505,6 +512,8 @@ impl FreshAgentTransport for HostedTransport {
             });
         }
         let message = FreshAgentFork {
+            observed_epoch: None,
+            observed_generation: None,
             provider: self.provider_wire(),
             session_id: current.clone(),
             session_type: self.session_type(),
@@ -708,6 +717,8 @@ impl FreshAgentTransport for HostedTransport {
             FreshAgentOperation::Compact { instructions, cwd } => {
                 let message = FreshAgentCompact {
                     request_id: Some(request_id.as_str().to_string()),
+                    observed_epoch: None,
+                    observed_generation: None,
                     provider: self.provider_wire(),
                     session_id,
                     session_type: self.session_type(),
@@ -729,6 +740,8 @@ impl FreshAgentTransport for HostedTransport {
                 cwd,
             } => {
                 let operation = RollbackRequest {
+                    observed_epoch: None,
+                    observed_generation: None,
                     direction: match direction {
                         FreshAgentRollbackDirection::Undo => RollbackDirection::Undo,
                         FreshAgentRollbackDirection::Redo => RollbackDirection::Redo,
