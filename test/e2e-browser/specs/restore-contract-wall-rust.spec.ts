@@ -1750,50 +1750,73 @@ test.describe('Restore Contract Wall (P0.1)', () => {
         }, { timeout: 45_000 })
         .toBe(true)
 
-      // Fresh agents (§2.6/§2.7/§2.8): identities survive, status not wedged.
-      for (const [tabIdX, expectedId] of [
-        [freshcodexTabId, freshcodexId],
-        [freshopencodeTabId, freshopencodeId],
-        [freshclaudeTabId, freshclaudeId],
-      ] as const) {
-        await expect
-          .poll(async () => leafDurableIdentity(findFreshAgentLeaf(await harness.getPaneLayout(tabIdX))), {
-            timeout: 45_000,
-          })
-          .toBe(expectedId)
-        await expect
-          .poll(async () => {
-            const status = findFreshAgentLeaf(await harness.getPaneLayout(tabIdX))?.content?.status
-            return typeof status === 'string' && status !== 'creating' && status !== 'error'
-          }, { timeout: 45_000 })
-          .toBe(true)
-      }
+      // Fresh agents (§2.6/§2.7/§2.8): identities survive and each pane
+      // resumes without a create failure. A create-failed pane still retains
+      // its identity, so an identity-only check would miss a failed restore.
+      try {
+        for (const [tabIdX, expectedId] of [
+          [freshcodexTabId, freshcodexId],
+          [freshopencodeTabId, freshopencodeId],
+          [freshclaudeTabId, freshclaudeId],
+        ] as const) {
+          await expect
+            .poll(async () => leafDurableIdentity(findFreshAgentLeaf(await harness.getPaneLayout(tabIdX))), {
+              timeout: 45_000,
+            })
+            .toBe(expectedId)
+          await expect
+            .poll(async () => {
+              const content = findFreshAgentLeaf(await harness.getPaneLayout(tabIdX))?.content
+              return !content?.createError
+                && ['connected', 'running', 'idle', 'compacting'].includes(content?.status ?? '')
+            }, { timeout: 45_000 })
+            .toBe(true)
+        }
 
-      // Quiet client: no alerts, no noisy error text (donor: restore-sync05).
-      // (A prior CAVEAT here blamed a freshclaude snapshot 503; that was
-      // stale -- snapshot.rs:133-146 routes freshclaude through the disk+env
-      // claude adapter and the endpoint has not 503'd since wave A. The only
-      // known benign alert source is the transient history-load-error banner
-      // from the snapshot fetch racing pane creation -- see
-      // createFreshclaudePane's note above.)
-      // Monaco's aria scaffold is excluded: setARIAContainer (monaco-editor
-      // esm/vs/base/browser/ui/aria/aria.js) permanently mounts exactly two
-      // EMPTY `role="alert"` divs (.monaco-alert) the moment the editor pane
-      // loads -- screen-reader announcement slots, not user-facing alerts.
-      // Unlike restore-sync05 (this assertion's donor), THIS composition has
-      // an editor pane (pane-ruler-editor above), so a bare getByRole('alert')
-      // count is structurally >=2 here regardless of restart behavior. Every
-      // product alert (Pane error banner, TerminalExitBanner, fresh-agent
-      // banners, ConnectionErrorOverlay, ...) lacks .monaco-alert and is
-      // still counted.
-      await expect.poll(async () => page.locator('[role="alert"]:not(.monaco-alert)').evaluateAll(
-        (alerts) => alerts.map((alert) => ({
-          text: alert.textContent?.trim(),
-          className: alert.className,
-          paneId: alert.closest('[data-pane-id]')?.getAttribute('data-pane-id'),
-          tabId: alert.closest('[data-tab-id]')?.getAttribute('data-tab-id'),
-        })),
-      ), { timeout: 10_000 }).toEqual([])
+        // Quiet client: no alerts, no noisy error text (donor: restore-sync05).
+        // (A prior CAVEAT here blamed a freshclaude snapshot 503; that was
+        // stale -- snapshot.rs:133-146 routes freshclaude through the disk+env
+        // claude adapter and the endpoint has not 503'd since wave A. The only
+        // known benign alert source is the transient history-load-error banner
+        // from the snapshot fetch racing pane creation -- see
+        // createFreshclaudePane's note above.)
+        // Monaco's aria scaffold is excluded: setARIAContainer (monaco-editor
+        // esm/vs/base/browser/ui/aria/aria.js) permanently mounts exactly two
+        // EMPTY `role="alert"` divs (.monaco-alert) the moment the editor pane
+        // loads -- screen-reader announcement slots, not user-facing alerts.
+        // Unlike restore-sync05 (this assertion's donor), THIS composition has
+        // an editor pane (pane-ruler-editor above), so a bare getByRole('alert')
+        // count is structurally >=2 here regardless of restart behavior. Every
+        // product alert (Pane error banner, TerminalExitBanner, fresh-agent
+        // banners, ConnectionErrorOverlay, ...) lacks .monaco-alert and is
+        // still counted.
+        await expect.poll(async () => page.locator('[role="alert"]:not(.monaco-alert)').evaluateAll(
+          (alerts) => alerts.map((alert) => ({
+            text: alert.textContent?.trim(),
+            className: alert.className,
+            paneId: alert.closest('[data-pane-id]')?.getAttribute('data-pane-id'),
+            tabId: alert.closest('[data-tab-id]')?.getAttribute('data-tab-id'),
+          })),
+        ), { timeout: 10_000 }).toEqual([])
+      } catch (error) {
+        const freshAgentState = await Promise.all([
+          ['codex', freshcodexTabId],
+          ['opencode', freshopencodeTabId],
+          ['claude', freshclaudeTabId],
+        ].map(async ([provider, tabId]) => {
+          const content = findFreshAgentLeaf(await harness.getPaneLayout(tabId))?.content
+          return { provider, status: content?.status, createError: content?.createError }
+        }))
+        const captured = server.capturedOutput()
+        const serverLogs = await readServerLogs(info.logsDir)
+        const relevantLogs = [captured.stdout, captured.stderr, serverLogs]
+          .join('\n').split('\n')
+          .filter((line) => /binding_write_failed|create_binding_failed|binding_refused|STALE_BINDING_PAIR|resume record|owner_epoch/i.test(line))
+          .slice(-40)
+        throw new Error(`RULER fresh-agent restore failed: ${String(error)}\n`
+          + `Fresh agents: ${JSON.stringify(freshAgentState)}\n`
+          + `Relevant server logs:\n${relevantLogs.join('\n')}`)
+      }
     } finally {
       await context.close().catch(() => {})
       await server.stop()
