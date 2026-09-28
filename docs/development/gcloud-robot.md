@@ -77,12 +77,33 @@ robot tokens and injects them on the lane control-plane hosts:
 (+ regional `-logging`), `serviceusage.googleapis.com`,
 `containeranalysis.googleapis.com`.
 
-What this buys: a request to those hosts with a **dead or missing
-credential** (the classic culled interactive OAuth token on a shared agent
-host) is brokered as the robot instead of dying as a 401/403. The 2026-09-14
-incident recovery was blocked exactly there — direct tag deletion failing
-on both a dead ambient token and (misleadingly) on the robot's missing
-delete permission.
+**Opt-in only, since 2026-09-26.** The connection is granted to a
+dedicated OneCLI agent, `gcloud-broker`, and to nothing else. For an agent
+holding the grant, the gateway *overwrites* the `Authorization` header on
+those hosts, whatever the caller sent: a valid token for another account is
+replaced just like a dead one. From 2026-09-15 to 2026-09-26 the grant sat on
+the machine-wide `garageserver` agent that every shell uses. So every gcloud,
+Terraform, curl and Node call from garageserver to those hosts ran as this
+robot, and other identities got 403s: deploy-bot on `directordeck` and
+`directordeck-staging`, the glowfer-claws robot, and others. Lanes do not
+need the broker. They authenticate with their own key for the same robot and
+check that it can mint a token before they start.
+
+What the broker is still for: a single command that has to succeed as the
+robot when the local credential is dead or missing, for example during
+incident recovery. Send just that command through the `gcloud-broker` agent.
+Its token comes from the OneCLI admin API and is not stored in any file:
+
+```bash
+tok=$(curl -fsS --noproxy '*' http://127.0.0.1:10254/v1/agents |
+  python3 -c 'import json,sys; print(next(a["accessToken"] for a in json.load(sys.stdin) if a["identifier"]=="gcloud-broker"))')
+HTTPS_PROXY="http://x:$tok@127.0.0.1:10255" https_proxy="$HTTPS_PROXY" \
+  gcloud artifacts docker tags delete ... --project=misc-puttering-project
+```
+
+Do not grant the connection back to `garageserver`, `dandesktop`, or any
+other agent that general-purpose tools use. OneCLI picks the credential by the
+calling agent, not by what the request carries.
 
 Deliberately NOT brokered, so do not "fix" their absence:
 
@@ -96,16 +117,17 @@ Deliberately NOT brokered, so do not "fix" their absence:
   token to their refresh POSTs would corrupt client credential state.
 
 The identity preflight mints via `oauth2.googleapis.com`, which the gateway
-deliberately does not broker: on brokered hosts, a lane whose resolved
-identity has a dead LOCAL credential now fails fast at the preflight instead
-of succeeding silently via brokered control-plane hosts. Keep the robot key
+never brokers, so a lane whose resolved identity has a dead LOCAL credential
+fails fast at the preflight. Keep the robot key
 activated (`$GCLOUD_ROBOT_HOME/scripts/bootstrap-robot.sh`) or pin
 `GCLOUD_IDENT` on such machines.
 
-Consequence for operators: gcloud calls on a brokered host from
-garageserver run as the robot regardless of the active account — including
-admin calls. For IAM/admin operations on those hosts, bypass the gateway:
-`env -u HTTPS_PROXY -u https_proxy -u HTTP_PROXY -u http_proxy gcloud ...`.
+Consequence for operators: with the default proxy settings, gcloud calls
+from garageserver run as the account gcloud selected (`--account`, the lane's
+resolved identity, or the active account). There is no need to unset
+`HTTPS_PROXY` for locally authenticated calls. The OneCLI record for the
+change, including how to revert it, is `garageserver/docs/onecli.md` in the
+`machines` repo, section "The Google Cloud broker".
 
 Facts on disk (garageserver):
 
@@ -117,8 +139,8 @@ Facts on disk (garageserver):
 - Broker key file: `~/.local/share/gcloud-robot/misc-puttering-onecli-broker.json`
   (user-managed key id `9ba89633eb32cfe902738f6d8747e3e193cda7ca`) — a
   SEPARATE key from the lane key, so lane-key rotation never breaks the
-  broker. Connection granted to the `garageserver` OneCLI agent; other
-  agents can be attached from the OneCLI UI
+  broker. Connection granted only to the opt-in `gcloud-broker` OneCLI
+  agent (see above); manage grants from the OneCLI UI
   (`http://192.168.3.150:10254` → Connections → Google Cloud).
 - The robot's repo-level IAM on `freshell-e2e` now carries BOTH
   `roles/artifactregistry.writer` (push) and
@@ -313,7 +335,7 @@ account (export it). All skill scripts are invoked via
    NOTE: this service account also holds a SECOND user-managed key — the
    OneCLI gateway broker key (`9ba89633…`, see the broker section above).
    Pick the row by key id, never "delete all others"; deleting the broker
-   key breaks the garageserver gateway's brokered credentials.
+   key breaks the opt-in `gcloud-broker` path on garageserver's gateway.
 
    ```bash
    gcloud iam service-accounts keys list --managed-by=user \
@@ -401,9 +423,11 @@ for immediacy.)
   credential for that host. It is NOT a Google permission verdict and has
   fooled incident triage before (2026-09-14: it hid both a dead ambient
   token and the robot's missing `artifactregistry.tags.delete` permission
-  behind one identical error). On garageserver's brokered hosts this error
-  should no longer occur; elsewhere it still means the calling credential
-  is dead — fix the credential, not the registry.
+  behind one identical error). Through the default `garageserver` agent
+  (no broker grant), the gateway replaces Google's 401/403 body on the
+  brokered hosts with OneCLI's `access_restricted` JSON instead. Either
+  way it means the calling credential was rejected. Fix the credential, not
+  the registry; do not grant the broker to get rid of the error.
 - A lane prints the ambient-fallback note and then gcloud's
   "Reauthentication failed" → the lane fell back to ambient gcloud: the
   robot is not provisioned (or not activated) on this machine. Provision
