@@ -12,7 +12,8 @@ import { test } from '../helpers/fixtures.js'
 import fs from 'node:fs'
 import path from 'node:path'
 
-import { ManagedRuntimeBrowserRig, P2_OPENCODE_FREE_MODEL, P2_OPENCODE_VERSION, type ManagedRuntimeView } from '../helpers/managed-runtime.js'
+import { ManagedRuntimeBrowserRig, P2_OPENCODE_MODEL, P2_OPENCODE_VERSION, type ManagedRuntimeView } from '../helpers/managed-runtime.js'
+import { OPENCODE_NATIVE_HISTORY_SCRIPT, type NativeHistory } from '../helpers/opencode-native-history.js'
 import { TestHarness } from '../helpers/test-harness.js'
 import { TerminalHelper } from '../helpers/terminal-helpers.js'
 import { openPanePicker } from '../helpers/pane-picker.js'
@@ -318,7 +319,7 @@ test.describe.serial('Phase 2 managed runtime continuity', () => {
     }
   })
 
-  test('P2-G04: real free-tier OpenCode tool turn survives web replacement in one native session', async ({ page }) => {
+  test('P2-G04: OpenAI-authenticated OpenCode tool turn survives web replacement in one native session', async ({ page }) => {
     test.setTimeout(900_000)
 
     const rig = new ManagedRuntimeBrowserRig()
@@ -359,7 +360,7 @@ test.describe.serial('Phase 2 managed runtime continuity', () => {
       if (!view?.containerId || !view.hostBootId) throw new Error('real OpenCode managed view missing ownership identity')
       expect(rig.ownedContainerExec(view.containerId, ['opencode', '--version']).trim()).toBe(P2_OPENCODE_VERSION)
       const processArgs = rig.ownedContainerExec(view.containerId, ['sh', '-lc', "pgrep -af '[o]pencode' || true"])
-      expect(processArgs).toContain(`--model ${P2_OPENCODE_FREE_MODEL}`)
+      expect(processArgs).toContain(`--model ${P2_OPENCODE_MODEL}`)
       expect(processArgs).toContain('--hostname 127.0.0.1')
       expect(processArgs).toContain('--port 4096')
 
@@ -375,6 +376,15 @@ test.describe.serial('Phase 2 managed runtime continuity', () => {
 
       const sessionId = await waitForSessionId(content, 90_000)
       expect(sessionId).toMatch(/^ses_/)
+      const firstTurn = await waitForValue('native OpenCode first reply', () => {
+        const nativeHistory = JSON.parse(rig.ownedProviderExec(view.containerId!, [
+          'node', '--no-warnings', '-e', OPENCODE_NATIVE_HISTORY_SCRIPT,
+          '/home/freshell/provider/.local/share/opencode/opencode.db', sessionId,
+        ])) as NativeHistory
+        if (nativeHistory.nativeSessionId !== sessionId) return null
+        return nativeHistory.turns.find((turn) => turn.text.includes('READY')) ?? null
+      }, 30_000)
+      expect(`${firstTurn.resolvedProvider}/${firstTurn.resolvedModel}`).toBe(P2_OPENCODE_MODEL)
 
       await new Promise((resolve) => setTimeout(resolve, 1_000))
       await terminal.executeCommandInserted(
@@ -424,9 +434,11 @@ test.describe.serial('Phase 2 managed runtime continuity', () => {
         caseId: 'P2-G04',
         status: 'PASS',
         provider: 'opencode',
+        modelProvider: firstTurn.resolvedProvider,
         opencodeVersion: P2_OPENCODE_VERSION,
-        model: P2_OPENCODE_FREE_MODEL,
-        freeTier: true,
+        model: `${firstTurn.resolvedProvider}/${firstTurn.resolvedModel}`,
+        resolvedModel: firstTurn.resolvedModel,
+        freeTier: false,
         nativeSessionId: sessionId,
         sameNativeSession: true,
         sameIncarnation: true,

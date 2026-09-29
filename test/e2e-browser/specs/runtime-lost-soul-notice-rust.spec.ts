@@ -1,7 +1,7 @@
 /**
  * Phase 5 live loss receipt.
  *
- * Uses anonymous OpenCode free-tier state inside the test-owned provider
+ * Uses authenticated OpenCode state inside the test-owned provider
  * volume. The test performs a real turn, retains a diagnostic-only marker,
  * removes every registered resumable copy, terminates only the host-recorded
  * provider PID, and verifies incident-before-cleanup, ended-pane retention,
@@ -14,7 +14,7 @@ import { expect, type Page } from '@playwright/test'
 import { test } from '../helpers/fixtures.js'
 import {
   ManagedRuntimeBrowserRig,
-  P2_OPENCODE_FREE_MODEL,
+  P2_OPENCODE_MODEL,
   P2_OPENCODE_VERSION,
   type ManagedRuntimeView,
 } from '../helpers/managed-runtime.js'
@@ -356,7 +356,7 @@ if (!fs.statSync('/home/freshell/provider/p5-diagnostic-only').isFile()) process
         identity: {
           provider: 'opencode',
           providerVersion: P2_OPENCODE_VERSION,
-          model: P2_OPENCODE_FREE_MODEL,
+          model: P2_OPENCODE_MODEL,
           soulId: before.soulId,
           incarnationId: before.incarnationId,
           containerId: before.containerId,

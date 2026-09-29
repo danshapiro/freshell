@@ -22,7 +22,7 @@ import {
 import { test } from '../helpers/fixtures.js'
 import {
   ManagedRuntimeBrowserRig,
-  P2_OPENCODE_FREE_MODEL,
+  P2_OPENCODE_MODEL,
   P2_OPENCODE_VERSION,
   type ManagedRuntimeView,
 } from '../helpers/managed-runtime.js'
@@ -102,12 +102,12 @@ function providerDefinitions(): ProviderDefinition[] {
       pickerName: /^OpenCode$/i,
       directoryName: /Starting directory for OpenCode/i,
       providerVersion: P2_OPENCODE_VERSION,
-      model: P2_OPENCODE_FREE_MODEL,
+      model: P2_OPENCODE_MODEL,
       reasoningEffort: 'provider-default',
       versionCommand: ['opencode', '--version'],
       versionPattern: new RegExp(`^${P2_OPENCODE_VERSION.replaceAll('.', '\\.')}\\s*$`),
       processBinary: 'opencode',
-      processIdentityNeedles: [P2_OPENCODE_FREE_MODEL],
+      processIdentityNeedles: [P2_OPENCODE_MODEL],
       nativeIdPattern: /^ses_/,
     },
   ]

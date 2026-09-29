@@ -272,14 +272,15 @@ async function gate04RealOpencodeContinuityReceipt(h: RuntimeHarness): Promise<v
   const receipt = requiredExternalReceipt(
     caseId,
     process.env.FRESHELL_RUNTIME_OPENCODE_RECEIPT,
-    'Run the real free-tier OpenCode leg of runtime-terminal-continuity-rust.spec.ts and set FRESHELL_RUNTIME_OPENCODE_RECEIPT.',
+    'Run the real OpenAI-authenticated OpenCode leg of runtime-terminal-continuity-rust.spec.ts and set FRESHELL_RUNTIME_OPENCODE_RECEIPT.',
   )
   h.assert(caseId, receipt.caseId === caseId && receipt.status === 'PASS', 'real-OpenCode receipt is an explicit P2-G04 PASS', receipt)
   h.assert(caseId, receipt.candidateSha === h.candidateSha, 'OpenCode receipt belongs to the exact candidate commit', receipt)
   h.assert(caseId, receipt.runtimeImage === h.imageRef, 'OpenCode receipt used the exact reproducible workload image', receipt)
   h.assert(caseId, receipt.provider === 'opencode', 'gate used the OpenCode provider', receipt)
+  h.assert(caseId, receipt.modelProvider === 'openai', 'gate used the authenticated OpenAI model provider', receipt)
   h.assert(caseId, receipt.opencodeVersion === '1.18.21', 'gate used the pinned OpenCode version', receipt)
-  h.assert(caseId, receipt.model === 'opencode/big-pickle' && receipt.freeTier === true, 'gate used the pinned free-tier OpenCode model', receipt)
+  h.assert(caseId, receipt.model === 'openai/gpt-5.6-luna' && receipt.freeTier === false, 'gate used the explicitly selected authenticated OpenAI model with no free-tier fallback', receipt)
   h.assert(caseId, typeof receipt.nativeSessionId === 'string' && receipt.nativeSessionId.startsWith('ses_'), 'gate captured a native OpenCode session id', receipt)
   h.assert(caseId, receipt.sameNativeSession === true && receipt.sameIncarnation === true, 'native OpenCode identity and OS incarnation survive web restart', receipt)
   h.assert(caseId, receipt.toolCompletionCount === 1 && receipt.followupSucceeded === true, 'long tool completed once and follow-up succeeded', receipt)
@@ -291,6 +292,7 @@ async function gate04RealOpencodeContinuityReceipt(h: RuntimeHarness): Promise<v
     opencode: {
       status: 'PASS',
       version: receipt.opencodeVersion,
+      modelProvider: receipt.modelProvider,
       model: receipt.model,
       freeTier: receipt.freeTier,
       nativeSessionId: receipt.nativeSessionId,

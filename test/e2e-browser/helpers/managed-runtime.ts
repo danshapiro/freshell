@@ -21,7 +21,7 @@ import {
 } from '../../../scripts/testing/fresh-agent-qualification-receipt.js'
 
 export const P2_OPENCODE_VERSION = '1.18.21'
-export const P2_OPENCODE_FREE_MODEL = 'opencode/big-pickle'
+export const P2_OPENCODE_MODEL = 'openai/gpt-5.6-luna'
 
 export type ManagedRuntimeView = {
   soulId: string
@@ -179,7 +179,7 @@ export class ManagedRuntimeBrowserRig {
               enabledProviders: this.enabledProviders,
               providers: {
                 ...(this.enabledProviders.includes('opencode')
-                  ? { opencode: { model: P2_OPENCODE_FREE_MODEL } }
+                  ? { opencode: { model: P2_OPENCODE_MODEL } }
                   : {}),
                 ...this.providerSettings,
               },
@@ -306,7 +306,12 @@ export class ManagedRuntimeBrowserRig {
   }
 
   ownedProviderExec(containerId: string, args: string[]): string {
-    return this.runtime.execOwnedContainerAsExact(containerId, '65534:0', args)
+    // docker exec starts a fresh process and does not inherit the managed PTY's HOME.
+    return this.runtime.execOwnedContainerAsExact(containerId, '65534:0', [
+      'env',
+      'HOME=/home/freshell/provider',
+      ...args,
+    ])
   }
 
   ownedContainerHasPid(containerId: string, pid: number): boolean {

@@ -18,7 +18,7 @@ import { expect, type Page } from '@playwright/test'
 import { test } from '../helpers/fixtures.js'
 import {
   ManagedRuntimeBrowserRig,
-  P2_OPENCODE_FREE_MODEL,
+  P2_OPENCODE_MODEL,
   P2_OPENCODE_VERSION,
   type ManagedRuntimeView,
 } from '../helpers/managed-runtime.js'
@@ -246,8 +246,8 @@ async function waitForReplacementPrompt(
       const h = window.__FRESHELL_TEST_HARNESS__
       return { text: h?.getTerminalBuffer(terminalId), modes: h?.getTerminalModes?.(terminalId) }
     }, terminalId)
-    diagnostic = { ...diagnostic, browserInputReady: rendered.modes?.bracketedPasteMode, browserModelBanner: rendered.text?.includes('Big Pickle') }
-    if (!rendered.text?.includes('Build') || !rendered.text?.includes('Big Pickle') || !rendered.modes?.bracketedPasteMode) return null
+    diagnostic = { ...diagnostic, browserInputReady: rendered.modes?.bracketedPasteMode, browserModelBanner: rendered.text?.includes('GPT-5.6 Luna') }
+    if (!rendered.text?.includes('Build') || !rendered.modes?.bracketedPasteMode) return null
     rig.runtime.assert('PC-OPENCODE', true, 'replacement TUI prompt is source-observed and rendered before input', {
       soulId: view.soulId, incarnationId: view.incarnationId, terminalId: view.terminalId, streamEpoch: sourceEpoch, cursor,
     })
@@ -295,7 +295,7 @@ async function nextNativeAssistantTurn(
 
 function verifyMemoryAnswer(turn: NativeAssistantTurn, projectName: string): void {
   expect(turn.toolCalls, 'conversation recall must not consult workspace files or tools').toEqual([])
-  expect(`${turn.resolvedProvider}/${turn.resolvedModel}`).toBe(P2_OPENCODE_FREE_MODEL)
+  expect(`${turn.resolvedProvider}/${turn.resolvedModel}`).toBe(P2_OPENCODE_MODEL)
   expect(turn.text).toContain(projectName)
 }
 
@@ -387,7 +387,7 @@ test.describe.serial('OpenCode provider qualification', () => {
       expect(rig.ownedContainerExec(first.view.containerId, ['opencode', '--version']).trim())
         .toBe(P2_OPENCODE_VERSION)
       const processArgs = rig.ownedContainerProcessTable(first.view.containerId)
-      expect(processArgs).toContain(P2_OPENCODE_FREE_MODEL)
+      expect(processArgs).toContain(P2_OPENCODE_MODEL)
       const exactLimits = cgroupLimitEvidence(rig, first.view)
       expect(exactLimits.swapMax).toBe('0')
 
@@ -562,7 +562,7 @@ test.describe.serial('OpenCode provider qualification', () => {
         modes: ['opencode'],
         actualProviderBinary: true,
         providerVersion: P2_OPENCODE_VERSION,
-        model: P2_OPENCODE_FREE_MODEL,
+        model: P2_OPENCODE_MODEL,
         reasoningEffort: 'provider-default',
         completedTurn: true,
         nonceSha256: createHash('sha256').update(nonce).digest('hex'),

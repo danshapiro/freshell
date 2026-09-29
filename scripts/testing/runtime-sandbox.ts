@@ -146,14 +146,14 @@ export class RuntimeHarness {
     const providerResults = this.phase === 1
       ? { phase: 'phase-1', externalProviders: 'not-applicable', fixtures: ['heartbeat', 'descendant_spawner', 'cpu_burner', 'memory_allocator', 'native_session', 'security_probe'] }
       : this.phase === 2
-        ? { phase: 'phase-2', opencode: { status: 'pending-live-gate', version: '1.18.21', model: 'opencode/big-pickle', freeTier: true }, workloadImage: 'pinned' }
+        ? { phase: 'phase-2', opencode: { status: 'pending-live-gate', version: '1.18.21', modelProvider: 'openai', model: 'openai/gpt-5.6-luna', freeTier: false }, workloadImage: 'pinned' }
         : this.phase === 3
           ? {
               phase: 'phase-3',
               deterministicFixture: { provider: 'native-session-fixture', status: 'pending-live-gate' },
               providers: {
                 claude: { status: 'pending-receipt', requiredModel: 'haiku', reasoning: 'lowest' },
-                opencode: { status: 'pending-receipt', version: '1.18.21', model: 'opencode/big-pickle', freeTier: true },
+                opencode: { status: 'pending-receipt', version: '1.18.21', modelProvider: 'openai', model: 'openai/gpt-5.6-luna', freeTier: false },
                 codex: { status: 'pending-receipt', version: '0.147.0', requiredModel: 'gpt-5.6-luna', reasoning: 'lowest' },
                 amplifier: { status: 'pending-receipt', version: '0.1.1', commit: '1873aa980535c99a743b17172e4231833f6c8741' },
               },

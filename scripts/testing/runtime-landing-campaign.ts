@@ -119,7 +119,7 @@ const STEPS: Step[] = [
   defineCampaignProducerStep({
     id: 'continuity',
     kind: 'producer',
-    title: 'Phase 2 real browser + free-tier OpenCode continuity',
+    title: 'Phase 2 real browser + authenticated OpenAI-backed OpenCode continuity',
     produces: ['FRESHELL_RUNTIME_BROWSER_RECEIPT', 'FRESHELL_RUNTIME_OPENCODE_RECEIPT'],
     runner: 'playwright',
     run: playwright('test/e2e-browser/specs/runtime-terminal-continuity-rust.spec.ts', {}),

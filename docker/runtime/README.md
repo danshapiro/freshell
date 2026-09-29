@@ -53,7 +53,7 @@ never mounts the containing `.claude` directory or host home.
 
 ## Real-provider acceptance order
 
-OpenCode is the first real-provider Phase 2 acceptance lane. The live gate pins OpenCode 1.18.21 and the anonymous free-tier model `opencode/big-pickle`; it records both in its receipt and fails rather than falling back to a paid model. Managed config forces `snapshot:false` and `autoupdate:false`, so the tested CLI cannot silently replace itself during a gate. A Claude binary being present in this image does not make Claude the first acceptance dependency; it is retained for later provider coverage. Managed OpenCode is one provider runtime per soul rather than the legacy shared serve process.
+OpenCode is the first real-provider Phase 2 acceptance lane. The live gate pins OpenCode 1.18.21 and uses `openai/gpt-5.6-luna` with the configured OpenAI OAuth credential. The receipt reads the actual provider and model from OpenCode's native session database and fails if they differ; it does not silently fall back. Managed config forces `snapshot:false` and `autoupdate:false`, so the tested CLI cannot silently replace itself during a gate. A Claude binary being present in this image does not make Claude the first acceptance dependency; it is retained for later provider coverage. Managed OpenCode is one provider runtime per soul rather than the legacy shared serve process.
 
 OpenCode's TUI JITs a small native render library. Global `/tmp` remains bounded and `noexec`; only managed OpenCode gets a separate bounded 64 MiB `rw,exec,nosuid,nodev` tmpfs at `/run/opencode-tmp`, exposed through `TMPDIR`. Its loopback serve endpoint is fixed at `127.0.0.1:4096` inside the soul-private network namespace, so no web-host port allocator is involved.
 

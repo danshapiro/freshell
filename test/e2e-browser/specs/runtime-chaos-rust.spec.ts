@@ -18,7 +18,7 @@ import {
 import { test } from '../helpers/fixtures.js'
 import {
   ManagedRuntimeBrowserRig,
-  P2_OPENCODE_FREE_MODEL,
+  P2_OPENCODE_MODEL,
   P2_OPENCODE_VERSION,
   type ManagedRuntimeView,
 } from '../helpers/managed-runtime.js'
@@ -481,7 +481,7 @@ test.describe.serial('Phase 5 runtime chaos', () => {
         identity: {
           provider: 'opencode',
           providerVersion: P2_OPENCODE_VERSION,
-          model: P2_OPENCODE_FREE_MODEL,
+          model: P2_OPENCODE_MODEL,
           paneId,
           terminalId,
           ...initialRuntime,

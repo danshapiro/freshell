@@ -1,0 +1,32 @@
+# Optional systemd USER unit for the managed-runtime supervisor.
+#
+# This companion service is required only when freshell-rust is started with
+# managed-runtime-v1 enabled. Keep its registry, control secret, runtime root,
+# and image reference stable across supervisor restarts.
+#
+# Install the unit and the matching freshell-rust drop-in from
+# installers/systemd/freshell-rust.service.d/managed-runtime.conf. Prepare:
+#   ~/.config/freshell/managed-runtime.env with FRESHELL_RUNTIME_IMAGE=sha256:...
+#   ~/.freshell/managed-runtime/control/secret as a private random secret
+# Then run `systemctl --user daemon-reload` and enable both units.
+
+[Unit]
+Description=Freshell managed-runtime supervisor
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/code/freshell
+Environment=HOME=%h
+EnvironmentFile=%h/.config/freshell/managed-runtime.env
+ExecStartPre=/usr/bin/test -S %t/docker.sock
+ExecStart=%h/code/freshell/target/release/freshell-supervisor serve --registry-root %h/.freshell/managed-runtime/registry --control-socket %h/.freshell/managed-runtime/control/supervisor.sock --control-secret-file %h/.freshell/managed-runtime/control/secret --docker-socket %t/docker.sock --runtime-root %h/.freshell/managed-runtime/runtime --host-binary %h/code/freshell/target/release/freshell-session-host --image-ref ${FRESHELL_RUNTIME_IMAGE} --test-run-id managed-runtime
+Restart=on-failure
+RestartSec=2
+TimeoutStopSec=30
+KillMode=control-group
+UMask=0077
+
+[Install]
+WantedBy=default.target

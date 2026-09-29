@@ -10,8 +10,9 @@ legacy.
 
 ## Current release qualification
 
-OpenCode 1.18.21 (`opencode/big-pickle` free tier) is the only
-release-qualified durable coding provider in this landing. Claude, Codex, and
+OpenCode 1.18.21 (`openai/gpt-5.6-luna`, using the configured OpenAI OAuth
+credential) is the only release-qualified durable coding provider in this
+landing. Claude, Codex, and
 Amplifier remain adapter-ready but route through their legacy ownership paths
 until their real live campaigns pass. The checked-in capability manifest is
 the source of truth for managed terminal admission. All hosted fresh-agent
@@ -256,13 +257,13 @@ scan is verification-only after exact recorded-PID handling.
 
 ## Provider acceptance order and test-cost policy
 
-The execution order was revised after the initial Phase 2 shell/Claude implementation: **OpenCode is the first real coding-provider acceptance lane** because its free-tier path makes repeated restart/resource/recovery testing sustainable. The existing shell/Claude wiring on this branch is transitional infrastructure, not permission to declare the provider portion of Phase 2 complete before the OpenCode live gate passes.
+The execution order was revised after the initial Phase 2 shell/Claude implementation: **OpenCode is the first real coding-provider acceptance lane** because garageserver has a working OpenAI-authenticated OpenCode setup. The existing shell/Claude wiring on this branch is transitional infrastructure, not permission to declare the provider portion of Phase 2 complete before the OpenCode live gate passes.
 
 For managed OpenCode, strict per-soul resource isolation requires **one OpenCode provider runtime per soul**. The legacy shared `OpencodeServeManager` is not a valid backing for two managed souls because a shared process cannot satisfy independent hard memory/CPU limits.
 
 Routine real-provider tests use these cost controls:
 
-- OpenCode: free-tier path first/default, with the resolved provider/model recorded.
+- OpenCode: use the configured authenticated provider/model, with the resolved provider/model read from native session data and recorded. The provider credential and model provider must match.
 - Claude: `codingCli.providers.claude.model = "haiku"` and
   `codingCli.providers.claude.effort = "low"`.
 - Codex: `codingCli.providers.codex.model = "gpt-5.6-luna"` and

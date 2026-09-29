@@ -43,8 +43,8 @@
     "notes": "Phase 1 browser/provider entries may explicitly record not applicable. From Phase 2, required native-provider and browser cases must execute. An explicit NOT_APPLICABLE artifact is not permission to skip a required test.",
     "provider_test_cost_policy": {
       "opencode": {
-        "default_lane": "free_tier",
-        "rule": "Use the real OpenCode free-tier path first/default whenever it supports the behavior under test; record the resolved provider/model."
+        "default_lane": "configured_authenticated",
+        "rule": "Use the configured authenticated OpenCode provider/model; credential provider and model provider must match, and the resolved provider/model must be read from native session data and recorded."
       },
       "claude": {
         "model": "Haiku",
@@ -92,7 +92,7 @@
     ],
     "applicability_rule": "Expand actual supported modes and ingresses from the capability manifest. Explicit capability-negative behavior is tested, not marked as an executed positive resume test.",
     "phase_1": "Real compiled supervisor/host, Docker, OS fixture processes, ownership and fault injection. No external coding-provider substitution is claimed.",
-    "phase_2": "Includes OpenCode 1.18.21 with anonymous free-tier model opencode/big-pickle and a real browser; auto-update is disabled and fixture loads establish measured resource boundaries. Claude and Codex are subsequent provider lanes governed by the provider test-cost policy.",
+    "phase_2": "Includes OpenCode 1.18.21 with the authenticated openai/gpt-5.6-luna model and a real browser; auto-update is disabled and fixture loads establish measured resource boundaries. Claude and Codex are subsequent provider lanes governed by the provider test-cost policy.",
     "phase_3": "Every enabled mode executes real create and native resume; each supported ingress must traverse the production launch path. Error/rare-race variants may use actual fixture processes as specified.",
     "phase_4": "Real browser, server, supervisor and host with enabled real-provider smoke set, plus deterministic multi-soul stress fixtures.",
     "phase_5": "Every enabled family proves automatic native recovery is not loss; actual isolated provider state used for the genuine-loss test, complete live mode/ingress campaign and fixture chaos.",
@@ -251,7 +251,7 @@
         },
         {
           "id": "P2.5",
-          "title": "first real coding CLI/server adapter: OpenCode free-tier"
+          "title": "first real coding CLI/server adapter: authenticated OpenCode"
         },
         {
           "id": "P2.6",
@@ -283,7 +283,7 @@
         {
           "id": "P2-G04",
           "required": true,
-          "procedure": "Start OpenCode 1.18.21 with opencode/big-pickle on the anonymous free-tier path, complete a first Bash-tool turn, begin a controlled long Bash tool, SIGKILL/restart web while the tool is running, then run a provider-side tool in a follow-up.",
+          "procedure": "Start OpenCode 1.18.21 with openai/gpt-5.6-luna using the configured OpenAI OAuth credential, complete a first Bash-tool turn, begin a controlled long Bash tool, SIGKILL/restart web while the tool is running, then run a provider-side tool in a follow-up.",
           "pass_assertion": "Same native ses_* session, soul, OS incarnation, container and host boot; tool effects occur exactly once; provider launch count stays one; no paid-model fallback or CLI auto-update.",
           "status": "NOT_RUN"
         },

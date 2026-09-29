@@ -7,7 +7,9 @@ managed state.
 ## Current staged release scope
 
 The current release-qualified durable provider is **OpenCode 1.18.21** with the
-free-tier `opencode/big-pickle` model. Claude, Codex, and Amplifier are
+authenticated `openai/gpt-5.6-luna` model. The managed runtime imports the
+existing OpenAI OAuth credential from OpenCode's auth file; model/provider
+authentication must match. Claude, Codex, and Amplifier are
 adapter-ready but remain explicitly release-disabled as
 `PENDING_LIVE_QUALIFICATION`. Their ordinary legacy routes continue to work;
 they are not eligible for managed ownership, managed-default routing, loss
@@ -34,6 +36,39 @@ may defer it, and the production gate that stays
 
 The mode is stored in the supervisor registry, not in browser local storage.
 Changing it is a fenced, request-deduplicated control transaction.
+
+## Host services
+
+On a self-hosted Linux machine using systemd user services, the managed
+supervisor and web server run as the same user and share a private persistent
+state root. Build the server with `managed-runtime-v1`, plus the supervisor and
+session host:
+
+```bash
+cargo build --release -p freshell-server -p freshell-supervisor \
+  -p freshell-session-host --features freshell-server/managed-runtime-v1
+```
+
+Build the pinned workload image from `docker/runtime/Dockerfile` and record its
+immutable `sha256:` image ID in
+`~/.config/freshell/managed-runtime.env` as `FRESHELL_RUNTIME_IMAGE`. Keep the
+image digest, registry, control socket/secret, and runtime root stable across
+restarts. Create the control secret as a private random value; it is separate
+from provider credentials and is read only by the supervisor and web server.
+
+Install `installers/systemd/freshell-supervisor.service` and
+`installers/systemd/freshell-rust.service.d/managed-runtime.conf` under
+`~/.config/systemd/user/`, then reload systemd. Enable and start the supervisor
+first; verify its control socket exists with mode `0600`. The drop-in enables
+the feature and makes the Rust server depend on the supervisor. Restarting the
+existing production server still requires explicit operator approval. Do not
+run Compose `down` or remove the runtime root during an ordinary rollout.
+
+Route protected runtime API calls through OneCLI. Its credential grant should
+be limited to the server host and `/api/runtime/*`, inject only `x-auth-token`,
+and be granted only to the machine's named agent. The OneCLI bridge must be
+allowed to reach the host's runtime API port; requests must actually use the
+OneCLI proxy rather than bypassing it through `NO_PROXY`.
 
 ## Preflight and dry run
 
@@ -82,7 +117,7 @@ session, or sole remaining session as ownership or identity proof.
 4. Verify the returned inventory revision and rollout mode.
 5. Open one managed agent for every provider currently marked
    `managedEnabled && durableRecoveryEnabled`. For this landing that is
-   OpenCode with `opencode/big-pickle` free tier.
+   OpenCode with `openai/gpt-5.6-luna` and the configured OpenAI credential.
 6. Verify exact provider-native identity capture, one writer per soul, web
    replacement continuity, controller replacement recovery, resource limits,
    and zero false loss notices.

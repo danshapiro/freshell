@@ -10,7 +10,7 @@ import { expect, type Page } from '@playwright/test'
 import { test } from '../helpers/fixtures.js'
 import {
   ManagedRuntimeBrowserRig,
-  P2_OPENCODE_FREE_MODEL,
+  P2_OPENCODE_MODEL,
   P2_OPENCODE_VERSION,
   type ManagedRuntimeView,
 } from '../helpers/managed-runtime.js'
@@ -101,9 +101,8 @@ test.describe.serial('Phase 3 provider resurrection', () => {
     // restart, a provider kill with exact native resurrection, an approval
     // round trip and a follow-up turn. The per-step budgets below are what
     // actually guard correctness; this envelope only has to be larger than
-    // their sum. Observed ~20min against opencode/big-pickle, so 20min was
-    // the envelope AND the observed runtime -- the case died of the envelope,
-    // not of any step.
+    // their sum. The 20-minute envelope was observed for the earlier Big Pickle
+    // lane; the step budgets below remain the correctness guards for this model.
     test.setTimeout(2_400_000)
 
     const rig = new ManagedRuntimeBrowserRig(process.cwd(), 3, {
@@ -160,12 +159,10 @@ test.describe.serial('Phase 3 provider resurrection', () => {
       expect(rig.ownedContainerExec(before.containerId, ['opencode', '--version']).trim()).toBe(P2_OPENCODE_VERSION)
       rig.ownedProviderExec(before.containerId, ['sh', '-lc', 'rm -f "$HOME/p3-tool-effect-count"'])
 
-      // Phrase this as the ordinary file-edit task it is. An earlier wording
-      // ("do not continue until permission is granted") read as manipulation
-      // to the free-tier model, which refused outright -- no tool call, so no
-      // permission prompt, so nothing about Freshell's approval plumbing was
-      // exercised at all. The assertions below are unchanged; only the natural
-      // language that has to survive provider safety behaviour is.
+      // Phrase this as the ordinary file-edit task it is. The earlier
+      // anonymous model refused the prior wording outright, producing no tool
+      // call or permission prompt and therefore not exercising Freshell's
+      // approval plumbing. The prompt remains ordinary and provider-neutral.
       await terminal.executeCommandInserted(
         `Append the exact line P3_APPROVAL_EFFECT to the file $HOME/p3-tool-effect-count. Use the bash tool exactly once and no other tool.`,
         1,
@@ -275,7 +272,7 @@ test.describe.serial('Phase 3 provider resurrection', () => {
           browserInteraction: true,
           provider: 'opencode',
           providerVersion: P2_OPENCODE_VERSION,
-          model: P2_OPENCODE_FREE_MODEL,
+          model: P2_OPENCODE_MODEL,
           paneId,
           terminalId,
           soulId: before.soulId,
