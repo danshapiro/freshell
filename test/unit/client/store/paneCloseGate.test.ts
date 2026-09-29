@@ -436,7 +436,10 @@ describe('closePaneWithCleanup — the acknowledged close gate (F2)', () => {
 
     const originalDetachCall = mockManagedRuntimeViewVisibility.mock.calls.find(([, visibility]) => visibility === 'detached')
     expect(originalDetachCall?.[5]).toEqual(expect.objectContaining({ signal: expect.any(AbortSignal) }))
-    expect((originalDetachCall?.[5] as { signal: AbortSignal }).signal.aborted).toBe(true)
+    // The close gate times out locally, but the original mutation stays
+    // observable so a supervisor commit after the stale repair read can still
+    // deliver its returned fences to reconciliation.
+    expect((originalDetachCall?.[5] as { signal: AbortSignal }).signal.aborted).toBe(false)
     const firstVisibleCall = mockManagedRuntimeViewVisibility.mock.calls.find(([, visibility]) => visibility === 'visible')
     expect(firstVisibleCall?.slice(0, 4)).toEqual([viewId, 'visible', viewRevision, soulRevision])
     expect(firstVisibleCall?.[5]).toEqual(expect.objectContaining({ signal: expect.any(AbortSignal) }))
@@ -523,6 +526,7 @@ describe('closePaneWithCleanup — the acknowledged close gate (F2)', () => {
       visibility,
     ]) => requestedViewId === viewId && visibility === 'visible')
     expect(initialVisibleCall?.slice(0, 4)).toEqual([viewId, 'visible', viewRevision, soulRevision])
+    expect((initialVisibleCall?.[5] as { signal: AbortSignal }).signal.aborted).toBe(false)
 
     const lateDetached = managedViewResult(viewId, 'detached', viewRevision + 1, soulRevision + 1)
     durableViews.set(viewId, lateDetached)
@@ -730,6 +734,7 @@ describe('closePaneWithCleanup — the acknowledged close gate (F2)', () => {
       visibility,
     ]) => viewId === 'view-a' && visibility === 'visible')
     expect(firstRollbackCall?.slice(0, 4)).toEqual(['view-a', 'visible', 4, 9])
+    expect((firstRollbackCall?.[5] as { signal: AbortSignal }).signal.aborted).toBe(false)
 
     const lateVisible = managedViewResult('view-a', 'visible', 5, 10)
     durableViews.set('view-a', lateVisible)
