@@ -97,7 +97,6 @@ import { ReconcileWarmingBanner } from '@/components/ReconcileWarmingBanner'
 import { SetupWizard } from '@/components/SetupWizard'
 import { RecoveryOfferPanel } from '@/components/RecoveryOfferPanel'
 import { MachineChooser } from '@/components/MachineChooser'
-import { ManagedAgentRecoveryStatus } from '@/components/ManagedAgentRecoveryStatus'
 import { ManagedRuntimeNotices } from '@/components/ManagedRuntimeNotices'
 import VirtualDeckPanel from '@/components/VirtualDeckPanel'
 import { ErrorBoundary } from '@/components/ui/error-boundary'
@@ -2526,7 +2525,6 @@ pnpm run serve`}</pre>
       {/* A server-owned machine hydrates its scoped durable workspace during
           bootstrap. Legacy servers retain the older opt-in recovery panel. */}
       {machineIdentity?.mode !== 'server-managed' ? <RecoveryOfferPanel /> : null}
-      <ManagedAgentRecoveryStatus />
       <ManagedRuntimeNotices />
       {/* In-app Stream Deck emulator — self-hides unless deck.virtualDeckOpen */}
       <VirtualDeckPanel />

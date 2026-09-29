@@ -9,7 +9,6 @@ import {
 } from '@/lib/api'
 import { useAppSelector } from '@/store/hooks'
 
-const AUTO_ACK_MS = 10_000
 const POLL_MS = 2_000
 
 function noticeProfileId(deviceId: string | undefined): string {
@@ -20,6 +19,14 @@ function cleanupLabel(summary: ManagedRuntimeIncidentSummary): string {
   if (summary.cleanup.verifiedEmpty) return 'Cleanup was verified empty.'
   if (summary.state === 'cleanup_pending') return 'Cleanup is still pending.'
   return 'Cleanup could not be verified; no unrelated process was touched.'
+}
+
+function isRoutineNotice(notice: ManagedRuntimeNotice): boolean {
+  return notice.kind === 'cleanup_succeeded' || notice.kind === 'ended_without_process'
+}
+
+function isCleanupFailureNotice(notice: ManagedRuntimeNotice): boolean {
+  return notice.kind === 'cleanup_failed'
 }
 
 export function ManagedRuntimeNotices() {
@@ -33,6 +40,13 @@ export function ManagedRuntimeNotices() {
   const [error, setError] = useState<string>()
   const [pollTick, setPollTick] = useState(0)
   const inFlightRef = useRef<AbortController>()
+  const acknowledgedRoutineIdsRef = useRef(new Set<string>())
+  const renderedFailureIdsRef = useRef(new Set<string>())
+
+  useEffect(() => {
+    acknowledgedRoutineIdsRef.current.clear()
+    renderedFailureIdsRef.current.clear()
+  }, [profileId])
 
   useEffect(() => {
     if (!available || connectionStatus !== 'ready') return
@@ -52,12 +66,39 @@ export function ManagedRuntimeNotices() {
     getManagedRuntimeNotices(profileId, 20, { signal: controller.signal })
       .then(async (pending) => {
         if (cancelled) return
-        setNotices(pending)
+        const routine = pending.filter(isRoutineNotice)
+        const failures = pending.filter(isCleanupFailureNotice)
+        setNotices(failures)
         setDetails(undefined)
         setError(undefined)
-        await Promise.allSettled(pending.map((notice) => (
-          recordManagedRuntimeNoticeReceipt(notice.noticeId, profileId, 'rendered')
-        )))
+        const routineToAcknowledge = routine.filter((notice) => {
+          if (acknowledgedRoutineIdsRef.current.has(notice.noticeId)) return false
+          acknowledgedRoutineIdsRef.current.add(notice.noticeId)
+          return true
+        })
+        const failuresToMarkRendered = failures.filter((notice) => {
+          if (notice.deliveryState !== 'pending' || renderedFailureIdsRef.current.has(notice.noticeId)) {
+            return false
+          }
+          renderedFailureIdsRef.current.add(notice.noticeId)
+          return true
+        })
+        await Promise.allSettled([
+          ...routineToAcknowledge.map(async (notice) => {
+            try {
+              await recordManagedRuntimeNoticeReceipt(notice.noticeId, profileId, 'acknowledged')
+            } catch {
+              acknowledgedRoutineIdsRef.current.delete(notice.noticeId)
+            }
+          }),
+          ...failuresToMarkRendered.map(async (notice) => {
+            try {
+              await recordManagedRuntimeNoticeReceipt(notice.noticeId, profileId, 'rendered')
+            } catch {
+              renderedFailureIdsRef.current.delete(notice.noticeId)
+            }
+          }),
+        ])
       })
       .catch((cause) => {
         if (cancelled || isTransientRequestFailure(cause)) return
@@ -70,24 +111,6 @@ export function ManagedRuntimeNotices() {
   }, [available, connectionStatus, inventoryRevision, pollTick, profileId])
 
   const current = notices[0]
-  const currentNoticeId = current?.noticeId
-
-  useEffect(() => {
-    if (!currentNoticeId) return
-    const timer = window.setTimeout(() => {
-      void recordManagedRuntimeNoticeReceipt(currentNoticeId, profileId, 'acknowledged')
-        .then(() => {
-          setNotices((existing) => existing.filter((notice) => notice.noticeId !== currentNoticeId))
-          setDetails(undefined)
-        })
-        .catch((cause) => {
-          if (!isTransientRequestFailure(cause)) {
-            setError(cause instanceof Error ? cause.message : String(cause))
-          }
-        })
-    }, AUTO_ACK_MS)
-    return () => window.clearTimeout(timer)
-  }, [currentNoticeId, profileId])
 
   const dismiss = async () => {
     if (!current) return
@@ -114,24 +137,19 @@ export function ManagedRuntimeNotices() {
 
   if (!current && !error) return null
 
-  const failed = current?.kind === 'cleanup_failed'
   return (
     <section
       aria-label="Managed runtime notice"
-      aria-live={failed || error ? 'assertive' : 'polite'}
-      className="fixed bottom-3 left-1/2 z-50 w-[min(40rem,calc(100vw-1.5rem))] -translate-x-1/2 rounded-lg border border-border bg-background p-3 shadow-xl"
-      role={failed || error ? 'alert' : 'status'}
+      aria-live="assertive"
+      className="fixed bottom-3 left-1/2 z-50 w-[min(40rem,calc(100vw-1.5rem))] -translate-x-1/2 rounded-lg border border-amber-500/50 bg-amber-500/10 p-3 shadow-xl"
+      role="alert"
     >
       {current && (
         <>
           <div className="flex items-start justify-between gap-3">
             <div className="min-w-0">
               <p className="text-sm font-medium">
-                {current.kind === 'cleanup_succeeded'
-                  ? 'Recovered runtime cleanup complete'
-                  : current.kind === 'cleanup_failed'
-                    ? 'Runtime cleanup needs attention'
-                    : 'Terminal session ended'}
+                Runtime cleanup needs attention
               </p>
               <p className="mt-1 text-sm text-muted-foreground">{current.message}</p>
               {details && (
@@ -159,11 +177,6 @@ export function ManagedRuntimeNotices() {
               </button>
             </div>
           </div>
-          {notices.length > 1 && (
-            <p className="mt-2 text-xs text-muted-foreground">
-              {notices.length - 1} more runtime {notices.length === 2 ? 'notice' : 'notices'} pending.
-            </p>
-          )}
         </>
       )}
       {error && <p className="mt-2 text-xs text-destructive">{error}</p>}
@@ -171,6 +184,5 @@ export function ManagedRuntimeNotices() {
   )
 }
 
-export const MANAGED_RUNTIME_NOTICE_AUTO_ACK_MS = AUTO_ACK_MS
 export const MANAGED_RUNTIME_NOTICE_POLL_MS = POLL_MS
 export { noticeProfileId }
