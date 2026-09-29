@@ -48,6 +48,7 @@ Implement the revised durable-runtime UI so automatic recovery stays invisible; 
 - Modify: `src/components/ManagedRuntimeNotices.tsx` to show only cleanup failures in the existing amber error-popup style, silently acknowledge routine success/ended notices, and never show a ready count, startup scan, IDs, or resource controls.
 - Modify: `test/unit/client/components/ManagedRuntimeNotices.test.tsx` to protect actionable-error-only behavior.
 - Delete: `test/unit/client/components/ManagedAgentRecoveryStatus.test.tsx` after its dashboard/resource assertions are replaced by Task 2 card tests.
+- Modify: `test/runtime/gates/phase-4.test.ts` so P4-G06 verifies the retained cleanup-failure notice and the new pane-local recovery card instead of reading the deleted dashboard/resource surface.
 
 **Interfaces:**
 - Consumes: `getManagedRuntimeNotices`, `recordManagedRuntimeNoticeReceipt`, `ManagedRuntimeNotice`, and the existing `managedRuntime.available`/connection selectors.
@@ -69,7 +70,7 @@ Expected: FAIL because the current component renders successful and ended notice
 
 - [ ] **Step 3: Add the minimal production implementation**
 
-Remove only the dashboard import/mount from `App.tsx`; keep the notice mount. In `ManagedRuntimeNotices`, partition fetched notices by `kind === 'cleanup_failed'`; acknowledge non-actionable notices using the existing receipt endpoint, keep polling only while the managed capability and WebSocket are ready, and render the first actionable notice with the existing amber border/background classes, `role="alert"`, its user-facing message, Details when an incident exists, and Dismiss. Remove the 10-second auto-acknowledgement for the actionable error so the user can decide when to dismiss it. Delete the now-orphaned dashboard and resource-editor files.
+Remove only the dashboard import/mount from `App.tsx`; keep the notice mount. In `ManagedRuntimeNotices`, partition fetched notices by `kind === 'cleanup_failed'`; acknowledge non-actionable notices using the existing receipt endpoint, keep polling only while the managed capability and WebSocket are ready, and render the first actionable notice with the existing amber border/background classes, `role="alert"`, its user-facing message, Details when an incident exists, and Dismiss. Remove the 10-second auto-acknowledgement for the actionable error so the user can decide when to dismiss it. Delete the now-orphaned dashboard and resource-editor files. Update P4-G06 in `test/runtime/gates/phase-4.test.ts` to run the retained notice/card tests and assert only the actionable error semantics; do not preserve assertions for removed lifecycle labels, dashboard IDs, Close view, Stop agent, or resource controls.
 
 - [ ] **Step 4: Run the focused test**
 
@@ -100,7 +101,7 @@ Expected: PASS. The App tests must still cover managed-runtime bootstrap indirec
 - [ ] **Step 7: Commit the task**
 
 ```bash
-git add src/App.tsx src/components/ManagedRuntimeNotices.tsx test/unit/client/components/ManagedRuntimeNotices.test.tsx
+git add src/App.tsx src/components/ManagedRuntimeNotices.tsx test/unit/client/components/ManagedRuntimeNotices.test.tsx test/runtime/gates/phase-4.test.ts
 git rm src/components/ManagedAgentRecoveryStatus.tsx src/components/AgentResourceLimits.tsx test/unit/client/components/ManagedAgentRecoveryStatus.test.tsx
 git commit -m "refactor(ui): remove managed runtime dashboard"
 ```
@@ -176,7 +177,7 @@ function ManagedRuntimeRecoveryCard({ recoverySummary, onRetry, onStartFresh }: 
   >
     <span>{blocked
       ? 'This session needs attention before it can continue.'
-      : 'This session could not be recovered. Its existing conversation is still available in history.'}</span>
+    : 'This session could not be recovered. Start a new conversation when you are ready.'}</span>
     {blocked ? <button disabled={retrying} onClick={() => void handleRetry()}>Retry recovery</button>
       : <button onClick={onStartFresh}>Start new conversation</button>}
     {retryError ? <span role="status">{retryError}</span> : null}
@@ -185,7 +186,7 @@ function ManagedRuntimeRecoveryCard({ recoverySummary, onRetry, onStartFresh }: 
 }
 ```
 
-In `buildManagedRuntimeMergePlan`, match and update existing pane locations for `recoveryState === 'lost'` even when `desiredState === 'stopped'`, then keep the visible-only creation path gated to desired running souls; a lost soul absent from local layout must never create a new pane. In `TerminalView`, call `retryManagedRuntimeSoul(terminalContent.soulId, terminalContent.soulIntentRevision)` and then `queueManagedRuntimeRefresh(appStore, 'pane-recovery-retry')`; render the managed card before `TerminalExitBanner` whenever it owns a projected `lost` decision, so the user sees the explicitly labeled `Start new conversation` action. A managed `blocked`/`lost` card takes precedence over the generic exit/relaunch card for that pane; unrelated launch, owner-divergence, and handoff cards keep their existing precedence. For `lost`, use an explicit start-new transition that mints a new `createRequestId`, clears the old durable identity and all managed projection fields only after the user clicks, and is covered by a refresh-after-click test. In `FreshAgentView`, guard both the `.lost` recovery effect and any deferred/reconcile callback on the current managed summary, use the same fenced retry call and inventory refresh, suppress the duplicate generic ended-session card while the managed lost card is visible, and reuse `startNewConversation` for the explicit new-conversation click. A managed `lost` or `blocked` state must retain the old session reference until the user chooses a new conversation; the explicit new-conversation transition must clear `soulId`, `incarnationId`, `runtimeState`, `viewIntentId`, `viewIntentRevision`, `soulIntentRevision`, `incidentId`, `placementGroup`, `resourceSummary`, and `recoverySummary` and mint a new `createRequestId`, while reconcile-driven same-conversation folds preserve their create key.
+In `buildManagedRuntimeMergePlan`, match and update existing pane locations for `recoveryState === 'lost'` even when `desiredState === 'stopped'`, then keep the visible-only creation path gated to desired running souls; a lost soul absent from local layout must never create a new pane. In `TerminalView`, call `retryManagedRuntimeSoul(terminalContent.soulId, terminalContent.soulIntentRevision)` and then `queueManagedRuntimeRefresh(appStore, 'pane-recovery-retry')`; render the managed card before `TerminalExitBanner` whenever it owns a projected `lost` decision, so the user sees the explicitly labeled `Start new conversation` action. A managed `blocked`/`lost` card takes precedence over the generic exit/relaunch card for that pane; unrelated launch, owner-divergence, and handoff cards keep their existing precedence. Add a lifecycle guard at every TerminalView path that responds to an invalid terminal, reconnect, reconcile, or failed attach by minting a create key or sending an identity-less create: while the current managed projection is `blocked` or `lost`, those paths must stop after preserving the pane and wait for the card's Retry or Start new conversation action. Test the effect-driven rejected-terminal path, not only render-time absence of a create. For `lost`, use an explicit start-new transition that mints a new `createRequestId`, clears the old durable identity and all managed projection fields only after the user clicks, and is covered by a refresh-after-click test. In `FreshAgentView`, guard both the `.lost` recovery effect and any deferred/reconcile callback on the current managed summary, use the same fenced retry call and inventory refresh, suppress the duplicate generic ended-session card while the managed lost card is visible, and reuse `startNewConversation` for the explicit new-conversation click. A managed `lost` or `blocked` state must retain the old session reference until the user chooses a new conversation; the explicit new-conversation transition must clear `soulId`, `incarnationId`, `runtimeState`, `viewIntentId`, `viewIntentRevision`, `soulIntentRevision`, `incidentId`, `placementGroup`, `resourceSummary`, and `recoverySummary` and mint a new `createRequestId`, while reconcile-driven same-conversation folds preserve their create key.
 
 - [ ] **Step 4: Run the focused tests**
 
