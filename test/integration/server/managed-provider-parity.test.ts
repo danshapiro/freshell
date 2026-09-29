@@ -58,7 +58,7 @@ class TerminalWire {
     })
     wire.send({
       type: 'hello', token: info.token, protocolVersion: WS_PROTOCOL_VERSION,
-      capabilities: managed ? { managedRuntimeV1: true } : {},
+      capabilities: managed ? { managedRuntimeV1: true, paneReconcileV1: true } : {},
     })
     const ready = await wire.wait(frame => frame.type === 'ready', 10_000)
     if (managed) expect(ready.capabilities?.managedRuntimeV1).toBe(true)
@@ -185,7 +185,7 @@ describe('ordinary and managed terminal provider parity', () => {
     fs.writeFileSync(path.join(workspace, 'opencode.jsonc'), '{ // provider parity\n  "plugin": ["file://parity-plugin.js"]\n}\n')
     fs.writeFileSync(path.join(workspace, '.opencode/opencode.json'), JSON.stringify({ plugin: ['file://parity-plugin.js'] }))
     fs.writeFileSync(path.join(workspace, 'parity-plugin.js'), 'export default {}\n')
-    fs.writeFileSync(path.join(workspace, 'user-tui.json'), JSON.stringify({ plugin: ['file://user-selected-tui.js'] }))
+    fs.writeFileSync(path.join(workspace, 'user-tui.jsonc'), '{ // user-selected\n  "plugin": ["file://user-selected-tui.js"]\n}\n')
     fs.chmodSync(path.join(workspace, '.opencode'), 0o777)
     for (const [source, target] of [
       [fixture, 'parity-provider.mjs'],
@@ -207,7 +207,7 @@ describe('ordinary and managed terminal provider parity', () => {
     }
     rig = new ManagedRuntimeBrowserRig(root, 2, {
       FRESHELL_BIND_HOST: '0.0.0.0',
-      OPENCODE_TUI_CONFIG: path.join(workspace, 'user-tui.json'),
+      OPENCODE_TUI_CONFIG: './user-tui.jsonc',
       OPENCODE_CONFIG_CONTENT: JSON.stringify({ mcp: { vendor: {
         type: 'local', command: ['vendor-tool', '--token', nestedSecretMarker],
         endpoint: `https://${nestedSecretMarker}.example`,
@@ -316,7 +316,7 @@ describe('ordinary and managed terminal provider parity', () => {
     }
     expect(normalized(observed[1])).toEqual(normalized(observed[0]))
     if (provider === 'opencode') {
-      expect(observed[1].tuiConfig).toBe(fs.readFileSync(path.join(workspace, 'user-tui.json'), 'utf8'))
+      expect(observed[1].tuiConfig).toBe(fs.readFileSync(path.join(workspace, 'user-tui.jsonc'), 'utf8'))
       expect(observed[1].inlineConfig).toEqual(observed[0].inlineConfig)
       expect(observed[1].inlineConfig).toMatch(/^[a-f0-9]{64}$/)
     }
@@ -382,6 +382,57 @@ describe('ordinary and managed terminal provider parity', () => {
     ))[1], 90_000).catch(error => {
       throw new Error(`${String(error)}; records: ${JSON.stringify(wire.recordRows())}; output: ${wire.terminalOutput()}`)
     })
+    expect(resumedMcp.authenticatedCall).toMatchObject({ isError: false, count: 0 })
+  }, 360_000)
+
+  it('recovers OpenCode inline and relative JSONC TUI inputs after web restart with its container down', async () => {
+    const wire = await TerminalWire.connect(rig.info, true)
+    sockets.push(wire)
+    const { terminalId, requestId } = await wire.create('opencode', workspace)
+    const first = await waitFor('initial OpenCode launch before web restart', () => wire.recordRows().find(row => (
+      row.provider === 'opencode' && row.kind === 'launch'
+    )))
+    wire.send({ type: 'terminal.input', terminalId, data: 'restart recovery prompt\r' })
+    await waitFor('OpenCode native identity before web restart', () => wire.recordRows().find(row => (
+      row.kind === 'identity' && row.terminalId === terminalId
+    )))
+    const before = await waitFor('OpenCode container before web restart', async () => {
+      const view = await rig.runningViewForTerminal(terminalId)
+      return view?.containerId ? view : undefined
+    })
+    if (!before.containerId) throw new Error('initial OpenCode container missing')
+    await rig.web.kill()
+    rig.runtime.killOwnedRuntimeExact(before.containerId)
+    await rig.restartWebGracefully()
+    const after = await waitFor('replacement after web restart', async () => {
+      const view = await rig.runningViewForTerminal(terminalId)
+      return view?.containerId && view.incarnationId !== before.incarnationId ? view : undefined
+    }, 300_000)
+    expect(after.soulId).toBe(before.soulId)
+    const recoveredWire = await TerminalWire.connect(rig.info, true)
+    sockets.push(recoveredWire)
+    const reconcileId = `provider-parity-reconcile-${randomUUID()}`
+    recoveredWire.send({
+      type: 'pane.reconcile.request', reconcileId,
+      panes: [{ paneKey: 'tab-opencode:pane-opencode', kind: 'terminal', mode: 'opencode',
+        createRequestId: requestId, terminalId }],
+    })
+    const reconcile = await recoveredWire.wait(frame => frame.type === 'pane.reconcile.result'
+      && frame.reconcileId === reconcileId, 30_000)
+    expect(reconcile.verdicts[0].verdict).toBe('attach')
+    await recoveredWire.attach(terminalId)
+    const resumed = await waitFor('resumed OpenCode child after web restart', () => recoveredWire.recordRows().find(row => (
+      row.provider === 'opencode' && row.kind === 'launch' && row.launchId !== first.launchId
+    )), 90_000).catch(error => {
+      throw new Error(`${String(error)}; records: ${JSON.stringify(recoveredWire.recordRows())}; output: ${recoveredWire.terminalOutput()}`)
+    })
+    expect(resumed.inlineConfig).toBe(first.inlineConfig)
+    expect(resumed.inlineConfig).toMatch(/^[a-f0-9]{64}$/)
+    expect(resumed.tuiConfig).toBe(first.tuiConfig)
+    expect(resumed.tuiConfig).toBe(fs.readFileSync(path.join(workspace, 'user-tui.jsonc'), 'utf8'))
+    const resumedMcp = await waitFor('resumed OpenCode MCP after web restart', () => recoveredWire.recordRows().find(row => (
+      row.provider === 'opencode' && row.kind === 'mcp'
+    )), 90_000)
     expect(resumedMcp.authenticatedCall).toMatchObject({ isError: false, count: 0 })
   }, 360_000)
 })

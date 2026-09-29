@@ -13,6 +13,7 @@ use freshell_runtime_protocol::{
     ProviderConfigRoot, SoulId,
 };
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::{
     collections::{HashMap, HashSet},
     fs::OpenOptions,
@@ -31,6 +32,8 @@ const RENEWAL_WINDOW_SECS: u64 = 7 * 24 * 60 * 60;
 pub(crate) struct OpencodeEphemeralInput<'a> {
     pub inline_config: Option<&'a str>,
     pub tui_config_path: Option<&'a str>,
+    pub cwd: Option<&'a Path>,
+    pub workspace: Option<&'a Path>,
 }
 
 #[derive(Clone)]
@@ -419,6 +422,95 @@ fn staged_provider_root_path(directory: &Path, grant_id: &str) -> Result<PathBuf
     Ok(control_dir.join("provider-roots").join(grant_id))
 }
 
+fn recoverable_input_path(directory: &Path, soul_id: &SoulId) -> Result<PathBuf, String> {
+    let control_dir = directory
+        .parent()
+        .ok_or("managed MCP capability directory has no parent")?;
+    Ok(control_dir
+        .join("provider-inputs")
+        .join(format!("{:x}", Sha256::digest(soul_id.as_str().as_bytes()))))
+}
+
+fn retain_recoverable_inputs(
+    directory: &Path,
+    soul_id: &SoulId,
+    grant_id: &str,
+) -> Result<(), String> {
+    let source = staged_provider_root_path(directory, grant_id)?.join("ephemeral");
+    let names = ["inline-config.json", "tui-config.json", "tui-config.jsonc"];
+    if !names.iter().any(|name| source.join(name).is_file()) {
+        return Ok(());
+    }
+    let destination = recoverable_input_path(directory, soul_id)?;
+    if destination.is_dir() {
+        return Ok(());
+    }
+    let parent = destination
+        .parent()
+        .ok_or("managed provider inputs have no parent")?;
+    private_directory(parent)?;
+    let temporary = parent.join(format!(".tmp-{}", uuid::Uuid::new_v4()));
+    private_directory(&temporary)?;
+    private_directory(&temporary.join("ephemeral"))?;
+    let result = (|| {
+        for name in names {
+            let path = source.join(name);
+            if path.is_file() {
+                copy_ephemeral_file(&path, &temporary.join("ephemeral").join(name))?;
+            }
+        }
+        std::fs::rename(&temporary, &destination).map_err(|error| error.to_string())
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_dir_all(&temporary);
+    } else {
+        tracing::info!(
+            soul_id = soul_id.as_str(),
+            "managed_mcp.recoverable_inputs_retained"
+        );
+    }
+    result
+}
+
+fn soul_wants_recovery(views: &[freshell_runtime_protocol::RuntimeView], soul_id: &SoulId) -> bool {
+    views
+        .iter()
+        .any(|view| &view.soul_id == soul_id && view.desired_state == DesiredState::Running)
+}
+
+fn remove_recoverable_inputs(directory: &Path, soul_id: &SoulId) -> Result<(), String> {
+    match std::fs::remove_dir_all(recoverable_input_path(directory, soul_id)?) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.to_string()),
+    }
+}
+
+fn cleanup_unrecoverable_inputs(
+    directory: &Path,
+    views: &[freshell_runtime_protocol::RuntimeView],
+) -> Result<(), String> {
+    let parent = directory
+        .parent()
+        .ok_or("managed MCP capability directory has no parent")?
+        .join("provider-inputs");
+    if !parent.is_dir() {
+        return Ok(());
+    }
+    let keep = views
+        .iter()
+        .filter(|view| view.desired_state == DesiredState::Running)
+        .map(|view| recoverable_input_path(directory, &view.soul_id))
+        .collect::<Result<HashSet<_>, _>>()?;
+    for entry in std::fs::read_dir(&parent).map_err(|error| error.to_string())? {
+        let entry = entry.map_err(|error| error.to_string())?;
+        if entry.path().is_dir() && !keep.contains(&entry.path()) {
+            std::fs::remove_dir_all(entry.path()).map_err(|error| error.to_string())?;
+        }
+    }
+    Ok(())
+}
+
 fn cleanup_orphaned_provider_roots(directory: &Path) -> Result<(), String> {
     let staged_parent = directory
         .parent()
@@ -514,8 +606,29 @@ fn stage_provider_root(
                     write_private_bytes(&ephemeral.join("inline-config.json"), raw.as_bytes())?;
                 }
                 if let Some(raw_path) = opencode_input.tui_config_path {
-                    let path = std::fs::canonicalize(raw_path)
-                        .map_err(|_| "managed OpenCode TUI config is unavailable")?;
+                    let selected = Path::new(raw_path);
+                    let cwd = opencode_input
+                        .cwd
+                        .ok_or("managed OpenCode cwd is unavailable")?;
+                    let workspace = opencode_input
+                        .workspace
+                        .ok_or("managed OpenCode workspace is unavailable")?;
+                    let canonical_workspace = std::fs::canonicalize(workspace)
+                        .map_err(|_| "managed OpenCode workspace is unavailable")?;
+                    let canonical_cwd = std::fs::canonicalize(cwd)
+                        .map_err(|_| "managed OpenCode cwd is unavailable")?;
+                    if !canonical_cwd.starts_with(&canonical_workspace) {
+                        return Err("managed OpenCode cwd escaped workspace".into());
+                    }
+                    let path = std::fs::canonicalize(if selected.is_absolute() {
+                        selected.to_path_buf()
+                    } else {
+                        canonical_cwd.join(selected)
+                    })
+                    .map_err(|_| "managed OpenCode TUI config is unavailable")?;
+                    if !path.starts_with(&canonical_workspace) {
+                        return Err("managed OpenCode TUI config escaped workspace".into());
+                    }
                     if !path.is_file() {
                         return Err("managed OpenCode TUI config must be a file".into());
                     }
@@ -706,6 +819,7 @@ impl CapabilityStore {
         endpoint: String,
         source: Option<(&str, &Path, &[ProviderConfigReference])>,
     ) -> Result<McpCapabilityReference, String> {
+        let retained = recoverable_input_path(directory, &soul_id)?;
         let prior_stage = self
             .grants
             .lock()
@@ -713,7 +827,8 @@ impl CapabilityStore {
             .iter()
             .find(|(_, grant)| grant.soul_id == soul_id)
             .map(|(grant_id, _)| staged_provider_root_path(directory, grant_id))
-            .transpose()?;
+            .transpose()?
+            .or_else(|| retained.is_dir().then_some(retained));
         let replacement = self.issue(
             soul_id.clone(),
             directory,
@@ -820,8 +935,8 @@ pub(crate) fn issue_mcp_capability(
 }
 
 /// A web-server restart restores only grants whose exact incarnation remains
-/// live in the supervisor inventory. The private file is the transient scope
-/// source; no scope bytes enter the durable launch record.
+/// live in the supervisor inventory. Recoverable souls retain their private
+/// OpenCode inputs before stale scopes and incarnation stages are revoked.
 pub(crate) async fn rehydrate_running_capabilities(
     client: &freshell_runtime_client::RuntimeClient,
 ) -> Result<(), String> {
@@ -865,6 +980,9 @@ pub(crate) async fn rehydrate_running_capabilities(
             continue;
         };
         let Some(incarnation_id) = stored.incarnation_id.clone() else {
+            if soul_wants_recovery(&views, &stored.soul_id) {
+                retain_recoverable_inputs(&directory, &stored.soul_id, &grant_id)?;
+            }
             store().revoke(&grant_id, &directory)?;
             continue;
         };
@@ -874,6 +992,9 @@ pub(crate) async fn rehydrate_running_capabilities(
                 && view.desired_state == DesiredState::Running
                 && view.launch_state == LaunchState::Running
         }) {
+            if soul_wants_recovery(&views, &stored.soul_id) {
+                retain_recoverable_inputs(&directory, &stored.soul_id, &grant_id)?;
+            }
             store().revoke(&grant_id, &directory)?;
             continue;
         }
@@ -888,6 +1009,7 @@ pub(crate) async fn rehydrate_running_capabilities(
             .insert(grant_id.clone(), grant);
     }
     cleanup_orphaned_provider_roots(&directory)?;
+    cleanup_unrecoverable_inputs(&directory, &views)?;
     Ok(())
 }
 
@@ -904,14 +1026,11 @@ pub(crate) fn revoke_soul_capabilities(soul_id: &SoulId) -> Result<(), String> {
         .filter(|(_, grant)| &grant.soul_id == soul_id)
         .map(|(grant_id, _)| grant_id.clone())
         .collect::<Vec<_>>();
-    if grant_ids.is_empty() {
-        return Ok(());
-    }
     let directory = capability_dir()?;
     for grant_id in grant_ids {
         store().revoke(&grant_id, &directory)?;
     }
-    Ok(())
+    remove_recoverable_inputs(&directory, soul_id)
 }
 
 /// Existing API handlers retain their ordinary auth gate; a validated managed
@@ -1181,7 +1300,9 @@ mod tests {
                 Some(("opencode", home.path(), &[])),
                 OpencodeEphemeralInput {
                     inline_config: Some(raw),
-                    tui_config_path: Some(tui.to_str().unwrap()),
+                    tui_config_path: Some("./selected-tui.jsonc"),
+                    cwd: Some(home.path()),
+                    workspace: Some(home.path()),
                 },
                 None,
             )
@@ -1216,6 +1337,125 @@ mod tests {
         assert!(!serde_json::to_string(&second)
             .unwrap()
             .contains("nested-secret-byte"));
+    }
+
+    #[test]
+    fn opencode_private_inputs_survive_restarting_after_container_exits() {
+        let control = tempfile::tempdir().unwrap();
+        let capabilities = control.path().join("mcp-capabilities");
+        std::fs::create_dir(&capabilities).unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let tui = home.path().join("selected-tui.jsonc");
+        std::fs::write(&tui, "{ // selected\n\"theme\":\"dark\" }").unwrap();
+        let raw = r#"{"mcp":{"vendor":{"command":["tool","nested-secret-byte"]}}}"#;
+        let soul = SoulId::new();
+        let running = CapabilityStore::default();
+        let first = running
+            .issue(
+                soul.clone(),
+                &capabilities,
+                "http://host.docker.internal:4000".into(),
+                Some(("opencode", home.path(), &[])),
+                OpencodeEphemeralInput {
+                    inline_config: Some(raw),
+                    tui_config_path: Some("./selected-tui.jsonc"),
+                    cwd: Some(home.path()),
+                    workspace: Some(home.path()),
+                },
+                None,
+            )
+            .unwrap();
+        // Startup has no in-memory grant for this stopped incarnation. Preserve
+        // the private inputs before revoking its scope and stage.
+        let restarted = CapabilityStore::default();
+        retain_recoverable_inputs(&capabilities, &soul, &first.grant_id).unwrap();
+        restarted.revoke(&first.grant_id, &capabilities).unwrap();
+        let second = restarted
+            .issue_replacement(
+                soul.clone(),
+                &capabilities,
+                "http://host.docker.internal:4000".into(),
+                Some(("opencode", home.path(), &[])),
+            )
+            .unwrap();
+        let stage = staged_provider_root_path(&capabilities, &second.grant_id).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(stage.join("ephemeral/inline-config.json")).unwrap(),
+            raw
+        );
+        assert_eq!(
+            std::fs::read_to_string(stage.join("ephemeral/tui-config.jsonc")).unwrap(),
+            "{ // selected\n\"theme\":\"dark\" }"
+        );
+        assert!(!grant_path(&capabilities, &first.grant_id).unwrap().exists());
+        assert!(!staged_provider_root_path(&capabilities, &first.grant_id)
+            .unwrap()
+            .exists());
+        remove_recoverable_inputs(&capabilities, &soul).unwrap();
+        assert!(!recoverable_input_path(&capabilities, &soul)
+            .unwrap()
+            .exists());
+    }
+
+    #[test]
+    fn opencode_relative_tui_selection_rejects_workspace_escape() {
+        let control = tempfile::tempdir().unwrap();
+        let capabilities = control.path().join("mcp-capabilities");
+        std::fs::create_dir(&capabilities).unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let allowed = workspace.path().join("allowed.json");
+        std::fs::write(&allowed, "{\"theme\":\"allowed\"}").unwrap();
+        std::fs::write(outside.path().join("tui.jsonc"), "{}").unwrap();
+        std::os::unix::fs::symlink(
+            outside.path().join("tui.jsonc"),
+            workspace.path().join("link.jsonc"),
+        )
+        .unwrap();
+        let store = CapabilityStore::default();
+        let absolute = store
+            .issue(
+                SoulId::new(),
+                &capabilities,
+                "http://host.docker.internal:4000".into(),
+                Some(("opencode", workspace.path(), &[])),
+                OpencodeEphemeralInput {
+                    tui_config_path: Some(allowed.to_str().unwrap()),
+                    cwd: Some(workspace.path()),
+                    workspace: Some(workspace.path()),
+                    ..Default::default()
+                },
+                None,
+            )
+            .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(
+                staged_provider_root_path(&capabilities, &absolute.grant_id)
+                    .unwrap()
+                    .join("ephemeral/tui-config.json")
+            )
+            .unwrap(),
+            "{\"theme\":\"allowed\"}"
+        );
+        for selected in [
+            "./link.jsonc",
+            outside.path().join("tui.jsonc").to_str().unwrap(),
+        ] {
+            let result = store.issue(
+                SoulId::new(),
+                &capabilities,
+                "http://host.docker.internal:4000".into(),
+                Some(("opencode", workspace.path(), &[])),
+                OpencodeEphemeralInput {
+                    tui_config_path: Some(selected),
+                    cwd: Some(workspace.path()),
+                    workspace: Some(workspace.path()),
+                    ..Default::default()
+                },
+                None,
+            );
+            assert!(result.unwrap_err().contains("escaped workspace"));
+        }
     }
 
     #[test]

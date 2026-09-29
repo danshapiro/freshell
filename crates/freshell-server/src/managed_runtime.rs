@@ -187,6 +187,8 @@ impl ManagedTerminalController for ServerManagedRuntimeController {
                         .get("OPENCODE_CONFIG_CONTENT")
                         .map(String::as_str),
                     tui_config_path: request.env.get("OPENCODE_TUI_CONFIG").map(String::as_str),
+                    cwd: Some(&cwd),
+                    workspace: Some(&workspace),
                 }
             } else {
                 Default::default()
