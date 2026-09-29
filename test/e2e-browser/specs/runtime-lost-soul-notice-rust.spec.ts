@@ -5,7 +5,8 @@
  * volume. The test performs a real turn, retains a diagnostic-only marker,
  * removes every registered resumable copy, terminates only the host-recorded
  * provider PID, and verifies incident-before-cleanup, ended-pane retention,
- * one brief notice, and zero foreign/credential access.
+ * a pane-local recovery decision for the lost conversation, and zero
+ * foreign/credential access.
  */
 import fs from 'node:fs'
 import path from 'node:path'
@@ -177,7 +178,7 @@ function writePrivateJson(filePath: string, value: unknown): void {
 }
 
 test.describe.serial('Phase 5 certified provider loss', () => {
-  test('P5-G02: real OpenCode loss persists incident before exact cleanup and shows one brief notice', async ({ page }) => {
+  test('P5-G02: real OpenCode loss persists incident before exact cleanup and shows the actionable pane path', async ({ page }) => {
     test.skip(process.env.FRESHELL_RUNTIME_PHASE5_LIVE !== '1', 'set FRESHELL_RUNTIME_PHASE5_LIVE=1 for the live loss receipt')
     test.setTimeout(1_200_000)
 
@@ -318,14 +319,16 @@ if (!fs.statSync('/home/freshell/provider/p5-diagnostic-only').isFile()) process
       expect(ended.content.incidentId).toBe(result.incidentId)
       expect(ended.content.sessionRef.sessionId).toBe(providerSessionId)
 
-      const notice = await page.getByRole('status', { name: 'Managed runtime notice' }).or(
-        page.getByRole('alert', { name: 'Managed runtime notice' }),
-      ).first()
-      await expect(notice).toBeVisible({ timeout: 60_000 })
-      await expect(notice).toContainText(/Found and cleaned up 1 lost agent process/)
-      await expect(notice).toContainText(/Reference:/)
-      await notice.getByRole('button', { name: 'Details' }).click()
-      await expect(notice).toContainText(/verified empty/i)
+      // Verified cleanup is routine and is acknowledged without a popup. The
+      // lost conversation itself remains in place and owns the actionable
+      // amber card, including the explicitly labeled start-new action.
+      await expect.poll(() => page.locator('[aria-label="Managed runtime notice"]').count(), {
+        timeout: 30_000,
+      }).toBe(0)
+      const paneRecoveryCard = page.locator(`[data-pane-id="${paneId}"] [data-testid="managed-runtime-recovery-card"]`)
+      await expect(paneRecoveryCard).toBeVisible({ timeout: 60_000 })
+      await expect(paneRecoveryCard).toContainText(/could not be recovered/i)
+      await expect(paneRecoveryCard.getByRole('button', { name: 'Start new conversation' })).toBeVisible()
 
       const incident = dataOf(await rig.runtime.adminOk(
         rig.supervisor,
@@ -382,6 +385,8 @@ if (!fs.statSync('/home/freshell/provider/p5-diagnostic-only').isFile()) process
           }],
         },
         browser: {
+          // The durable notice remains in the incident receipt, but routine
+          // success is not rendered as a browser popup.
           displayedNoticeIds: [incidentArtifact.noticeId],
           endedPane: {
             soulId: ended.content.soulId,

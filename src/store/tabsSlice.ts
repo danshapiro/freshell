@@ -1,6 +1,6 @@
 import { createSlice, PayloadAction, createAsyncThunk } from '@reduxjs/toolkit'
 import type { Tab, TerminalStatus, TabMode, ShellType, CodingCliProviderName } from './types'
-import type { ManagedRuntimeProjectionFields } from '@shared/managed-runtime'
+import type { ManagedRuntimeProjectionFields, ManagedRuntimeViewIntent } from '@shared/managed-runtime'
 import { nanoid } from 'nanoid'
 import { closePane, initLayout, restoreLayout, removeLayout, replacePane, setPaneCloseError, updatePaneContent, updatePaneTitleByTerminalId, updatePaneTitle, markTabClosing, clearTabClosing, markPaneClosing, clearPaneClosing, hasAnyClosePending } from './panesSlice'
 import { clearTabAttention, clearPaneAttention } from './turnCompletionSlice.js'
@@ -27,6 +27,7 @@ import type { RootState } from './store'
 import { selectTabIdByTerminalId } from './selectors/paneTerminalSelectors'
 import { loadPersistedLayout, markTabsLoadRecovery } from './persistMiddleware'
 import { createLogger } from '@/lib/client-logger'
+import { updateManagedRuntimeViewVisibility } from '@/lib/api'
 import { mergeSessionMetadataByKey, sessionMetadataKey } from '@/lib/session-metadata'
 import { mergeSessionMetadataForPreferredResumeId } from './persistControl'
 import { migrateLegacyTerminalDurableState, sanitizeSessionRef } from '@shared/session-contract'
@@ -546,6 +547,111 @@ function collectPaneIds(node: PaneNode | undefined): string[] {
   return [...collectPaneIds(node.children[0]), ...collectPaneIds(node.children[1])]
 }
 
+type FrozenManagedViewProjection = {
+  paneId: string
+  viewId: string
+  viewRevision: number
+  soulRevision: number
+}
+
+/**
+ * Freeze the managed-view fences carried by the panes before a close starts.
+ * The pane projection is the last-known view identity for that exact layout;
+ * reading the live inventory while a close is in flight could pair the close
+ * with a newer view revision or a different incarnation.
+ */
+function collectManagedViewProjections(
+  layout: PaneNode | undefined,
+): FrozenManagedViewProjection[] {
+  const byViewId = new Map<string, FrozenManagedViewProjection>()
+  const visit = (node: PaneNode) => {
+    if (node.type === 'split') {
+      visit(node.children[0])
+      visit(node.children[1])
+      return
+    }
+    const content = node.content
+    if (
+      (content.kind !== 'terminal' && content.kind !== 'fresh-agent')
+      || !content.viewIntentId
+      || typeof content.viewIntentRevision !== 'number'
+      || typeof content.soulIntentRevision !== 'number'
+    ) {
+      return
+    }
+    if (!byViewId.has(content.viewIntentId)) {
+      byViewId.set(content.viewIntentId, {
+        paneId: node.id,
+        viewId: content.viewIntentId,
+        viewRevision: content.viewIntentRevision,
+        soulRevision: content.soulIntentRevision,
+      })
+    }
+  }
+  if (layout) visit(layout)
+  return [...byViewId.values()]
+}
+
+/**
+ * Mark every frozen managed view detached as one close transaction. If a
+ * later view refuses the mutation, use each successful response's new fences
+ * to return its view to visible before the pane/tab can be removed.
+ */
+async function detachManagedViews(
+  projections: FrozenManagedViewProjection[],
+): Promise<boolean> {
+  const detached: Array<{ projection: FrozenManagedViewProjection; view: ManagedRuntimeViewIntent }> = []
+  for (const projection of projections) {
+    try {
+      const view = await updateManagedRuntimeViewVisibility(
+        projection.viewId,
+        'detached',
+        projection.viewRevision,
+        projection.soulRevision,
+      )
+      detached.push({ projection, view })
+    } catch (error) {
+      log.warn('managed view detach refused during close; rolling back earlier detaches', {
+        viewId: projection.viewId,
+        paneId: projection.paneId,
+        error: error instanceof Error ? error.message : String(error),
+      })
+      for (const completed of [...detached].reverse()) {
+        try {
+          await updateManagedRuntimeViewVisibility(
+            completed.view.viewId,
+            'visible',
+            completed.view.revision,
+            completed.view.soulIntentRevision,
+          )
+        } catch (rollbackError) {
+          log.error('managed view detach rollback failed after close refusal', {
+            viewId: completed.view.viewId,
+            paneId: completed.projection.paneId,
+            error: rollbackError instanceof Error ? rollbackError.message : String(rollbackError),
+          })
+        }
+      }
+      return false
+    }
+  }
+  return true
+}
+
+function surfaceManagedViewDetachFailure(
+  dispatch: (action: unknown) => void,
+  tabId: string,
+  projections: FrozenManagedViewProjection[],
+) {
+  for (const projection of projections) {
+    dispatch(setPaneCloseError({
+      tabId,
+      paneId: projection.paneId,
+      error: PANE_CLOSE_FAILED_MESSAGE,
+    }))
+  }
+}
+
 /**
  * Delta-r7-round-3 (focused-episode-7 round 2, Finding F2) — the acknowledged
  * close gate. EVERY user- or system-initiated pane removal routes through one
@@ -715,6 +821,7 @@ export const closePaneWithCleanup = createAsyncThunk(
     }
     // F2: confirm the durable close evidence BEFORE the layout loses the pane.
     const identity = collectPaneCloseIdentities(before).filter((i) => i.paneId === paneId)
+    const managedViews = collectManagedViewProjections(before).filter((view) => view.paneId === paneId)
     if (identity.length > 0) {
       // Focused-episode-7 round 5 (Finding F2): freeze THIS pane's identity
       // while the acknowledgement is outstanding — the one shared guard
@@ -724,7 +831,9 @@ export const closePaneWithCleanup = createAsyncThunk(
       // mergePaneContent / restartFreshAgentCreate folds, hydrate re-keys)
       // so the ack always covers exactly the identity the removal drops.
       dispatch(markPaneClosing({ tabId, paneId }))
-      try {
+    }
+    try {
+      if (identity.length > 0) {
         const failed = await awaitPaneCloseEvidence(identity)
         if (failed.length > 0) {
           log.warn('pane close evidence was not confirmed; the pane stays', { tabId, paneId })
@@ -734,11 +843,21 @@ export const closePaneWithCleanup = createAsyncThunk(
           reassertKeptPanesOpen((getState() as RootState).panes.layouts[tabId], tabId, identity)
           return
         }
-      } finally {
-        // The removal flows next (removals are never refused); the freeze
-        // lifts with the wait either way.
-        dispatch(clearPaneClosing({ tabId, paneId }))
       }
+      if (managedViews.length > 0 && !await detachManagedViews(managedViews)) {
+        log.warn('managed view detach was not confirmed; the pane stays', { tabId, paneId })
+        if (identity.length > 0) {
+          surfacePaneCloseFailures(dispatch, tabId, identity.map((item) => ({ identity: item, timedOut: false })))
+        } else {
+          surfaceManagedViewDetachFailure(dispatch, tabId, managedViews)
+        }
+        reassertKeptPanesOpen((getState() as RootState).panes.layouts[tabId], tabId, identity)
+        return
+      }
+    } finally {
+      // The removal flows next (removals are never refused); the freeze
+      // lifts with the evidence and managed-view transaction either way.
+      if (identity.length > 0) dispatch(clearPaneClosing({ tabId, paneId }))
     }
     dispatch(closePane({ tabId, paneId }))
     const after = (getState() as RootState).panes.layouts[tabId]
@@ -820,6 +939,7 @@ export const closeTab = createAsyncThunk(
     const frozenPaneTitles = stateAtClose.panes.paneTitles[tabId]
     const frozenPaneTitleSetByUser = stateAtClose.panes.paneTitleSetByUser?.[tabId]
     const identities = collectPaneCloseIdentities(frozenLayout)
+    const managedViews = collectManagedViewProjections(frozenLayout)
     dispatch(markTabClosing({ tabId }))
     try {
       if (identities.length > 0) {
@@ -842,6 +962,16 @@ export const closeTab = createAsyncThunk(
         for (const identity of identities) {
           markPaneCloseEvidenceConfirmed(identity.createRequestId)
         }
+      }
+      if (managedViews.length > 0 && !await detachManagedViews(managedViews)) {
+        log.warn('managed view detach was not confirmed; the tab stays', { tabId })
+        if (identities.length > 0) {
+          surfacePaneCloseFailures(dispatch, tabId, identities.map((identity) => ({ identity, timedOut: false })))
+        } else {
+          surfaceManagedViewDetachFailure(dispatch, tabId, managedViews)
+        }
+        reassertKeptPanesOpen((getState() as RootState).panes.layouts[tabId], tabId, identities)
+        return
       }
       const tabRegistryState = (stateAtClose as { tabRegistry?: RootState['tabRegistry'] }).tabRegistry
       const serverInstanceId = stateAtClose.connection?.serverInstanceId || UNKNOWN_SERVER_INSTANCE_ID
@@ -979,15 +1109,17 @@ export const replacePaneWithCleanup = createAsyncThunk(
       log.warn('refusing to start a pane replace while a close is already in flight for its tab', { tabId, paneId })
       return
     }
-    const identity = collectPaneCloseIdentities(
-      (getState() as RootState).panes.layouts[tabId],
-    ).filter((i) => i.paneId === paneId)
+    const layout = (getState() as RootState).panes.layouts[tabId]
+    const identity = collectPaneCloseIdentities(layout).filter((i) => i.paneId === paneId)
+    const managedViews = collectManagedViewProjections(layout).filter((view) => view.paneId === paneId)
     if (identity.length > 0) {
       // Focused-episode-7 round 5 (Finding F2): freeze the discarded pane's
       // identity while the acknowledgement is outstanding (the same shared
       // guard as the single-pane close).
       dispatch(markPaneClosing({ tabId, paneId }))
-      try {
+    }
+    try {
+      if (identity.length > 0) {
         const failed = await awaitPaneCloseEvidence(identity)
         if (failed.length > 0) {
           log.warn('replace-pane close evidence was not confirmed; the pane keeps its content', {
@@ -1000,13 +1132,21 @@ export const replacePaneWithCleanup = createAsyncThunk(
           reassertKeptPanesOpen((getState() as RootState).panes.layouts[tabId], tabId, identity)
           return
         }
-        // The gate's own follow-through: lift the freeze first — replacePane
-        // is itself a guarded (identity-changing) reducer and must not be
-        // refused by its owner's mark. Synchronous dispatch, no interleave.
-        dispatch(clearPaneClosing({ tabId, paneId }))
-      } finally {
-        dispatch(clearPaneClosing({ tabId, paneId })) // idempotent: failure/throw paths lift the freeze here
       }
+      if (managedViews.length > 0 && !await detachManagedViews(managedViews)) {
+        log.warn('managed view detach was not confirmed; the pane keeps its content', { tabId, paneId })
+        if (identity.length > 0) {
+          surfacePaneCloseFailures(dispatch, tabId, identity.map((item) => ({ identity: item, timedOut: false })))
+        } else {
+          surfaceManagedViewDetachFailure(dispatch, tabId, managedViews)
+        }
+        reassertKeptPanesOpen((getState() as RootState).panes.layouts[tabId], tabId, identity)
+        return
+      }
+    } finally {
+      // The gate's own follow-through: lift the freeze before replacePane —
+      // replacePane is itself a guarded identity-changing reducer.
+      if (identity.length > 0) dispatch(clearPaneClosing({ tabId, paneId }))
     }
     dispatch(replacePane({ tabId, paneId }))
   }
