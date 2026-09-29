@@ -170,7 +170,6 @@ mod provider_secret_tests {
             },
             mcp_capability: None,
             config: vec![],
-            plugins: vec![],
         };
         assert!(user_provider_config_referenced(&context));
     }

@@ -75,8 +75,8 @@ pub fn provider_launch_context(provider: &str, workspace: &Path) -> Option<Provi
             ]
             .into_iter()
             .filter_map(|entry| {
-                let metadata = std::fs::symlink_metadata(workspace.join(entry)).ok()?;
-                if !metadata.is_file() || metadata.file_type().is_symlink() {
+                let source = approved_config_path(workspace, entry)?;
+                if !source.is_file() {
                     return None;
                 }
                 Some(ProviderConfigReference {
@@ -104,7 +104,7 @@ pub fn provider_launch_context(provider: &str, workspace: &Path) -> Option<Provi
         .into_iter()
         .flat_map(|home| {
             entries.iter().filter_map(move |entry| {
-                let path = home.join(root).join(entry);
+                let path = approved_config_path(&home.join(root), entry)?;
                 let format = if path.is_dir() {
                     "directory"
                 } else if path.is_file() {
@@ -131,8 +131,24 @@ pub fn provider_launch_context(provider: &str, workspace: &Path) -> Option<Provi
         preparation,
         mcp_capability: None,
         config,
-        plugins: Vec::new(),
     })
+}
+
+/// Ordinary symlinked configs are included only when each resolved component
+/// remains in the approved provider or workspace root.
+fn approved_config_path(root: &Path, relative: &str) -> Option<PathBuf> {
+    let canonical_root = std::fs::canonicalize(root).ok()?;
+    let mut current = canonical_root.clone();
+    for component in Path::new(relative).components() {
+        if !matches!(component, std::path::Component::Normal(_)) {
+            return None;
+        }
+        current = std::fs::canonicalize(current.join(component.as_os_str())).ok()?;
+        if !current.starts_with(&canonical_root) {
+            return None;
+        }
+    }
+    Some(current)
 }
 
 pub fn named_provider_onecli_references(
@@ -328,6 +344,34 @@ mod tests {
                 && reference.relative_path == "opencode.json"))
         );
         context.validate("opencode").unwrap();
+    }
+
+    #[test]
+    fn opencode_context_accepts_in_root_links_and_omits_escaping_links() {
+        use std::os::unix::fs::symlink;
+        let root = tempfile::tempdir().unwrap();
+        let workspace = root.path().join("workspace");
+        let outside = root.path().join("outside");
+        fs::create_dir_all(workspace.join("inside")).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(workspace.join("inside/opencode.json"), "{}").unwrap();
+        fs::write(outside.join("opencode.json"), "{}").unwrap();
+        symlink(
+            workspace.join("inside/opencode.json"),
+            workspace.join("opencode.json"),
+        )
+        .unwrap();
+        symlink(&outside, workspace.join(".opencode")).unwrap();
+        let context = provider_launch_context("opencode", &workspace).unwrap();
+        let ProviderPreparation::Opencode { project_config, .. } = context.preparation else {
+            panic!("expected OpenCode preparation");
+        };
+        assert!(project_config
+            .iter()
+            .any(|entry| entry.relative_path == "opencode.json"));
+        assert!(!project_config
+            .iter()
+            .any(|entry| entry.relative_path == ".opencode/opencode.json"));
     }
 
     fn private_file(root: &Path) -> PathBuf {

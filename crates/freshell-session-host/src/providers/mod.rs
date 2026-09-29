@@ -147,7 +147,6 @@ mod provider_secret_context_tests {
                 provider_relative_path: ".claude/freshell-mcp.json".into(),
             }),
             config: Vec::new(),
-            plugins: Vec::new(),
         });
         apply_terminal_context(&mut terminal).unwrap();
         assert_eq!(

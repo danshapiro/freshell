@@ -971,8 +971,6 @@ pub struct ProviderLaunchContext {
     pub mcp_capability: Option<McpCapabilityReference>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub config: Vec<ProviderConfigReference>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub plugins: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1038,27 +1036,33 @@ impl ProviderLaunchContext {
                 "managed provider launch context is unsafe or mismatched",
             )
         };
-        if self.preparation.provider() != provider
-            || self.config.len() > 128
-            || self.plugins.len() > 64
-        {
+        if self.preparation.provider() != provider || self.config.len() > 128 {
             return Err(invalid());
         }
         let mut references: Vec<&ProviderConfigReference> = self.config.iter().collect();
-        let arguments: &[String] = match &self.preparation {
-            ProviderPreparation::Claude { mcp_args } => mcp_args,
+        // These durable fields are limited to exact, non-secret recipes.
+        // Provider-specific free-form launch arguments remain transient.
+        match &self.preparation {
+            ProviderPreparation::Claude { mcp_args } => {
+                if !mcp_args.is_empty()
+                    && !matches!(
+                        (mcp_args.as_slice(), self.mcp_capability.as_ref()),
+                        ([flag, path], Some(capability))
+                            if flag == "--mcp-config"
+                                && path == ".claude/freshell-mcp.json"
+                                && path == &capability.provider_relative_path
+                    )
+                {
+                    return Err(invalid());
+                }
+            }
             ProviderPreparation::Codex {
                 tui_args,
                 sidecar_args,
             } => {
-                if sidecar_args.len() > 128
-                    || sidecar_args
-                        .iter()
-                        .any(|value| !safe_preparation_value(value))
-                {
+                if !tui_args.is_empty() || !sidecar_args.is_empty() {
                     return Err(invalid());
                 }
-                tui_args
             }
             ProviderPreparation::Opencode {
                 project_config,
@@ -1066,25 +1070,17 @@ impl ProviderLaunchContext {
             } => {
                 references.extend(project_config.iter());
                 references.extend(tui_config.iter());
-                &[]
             }
             ProviderPreparation::Amplifier {
                 bundle,
                 resume_args,
             } => {
-                if !safe_preparation_value(bundle) {
+                if bundle != "default" || !resume_args.is_empty() {
                     return Err(invalid());
                 }
-                resume_args
             }
-        };
-        if arguments.len() > 128
-            || arguments.iter().any(|value| !safe_preparation_value(value))
-            || self
-                .plugins
-                .iter()
-                .any(|value| !safe_preparation_value(value))
-        {
+        }
+        if references.len() > 128 {
             return Err(invalid());
         }
         for reference in references {
@@ -1154,20 +1150,6 @@ fn secret_component(value: &str) -> bool {
     )
 }
 
-fn safe_preparation_value(value: &str) -> bool {
-    let lower = value.to_ascii_lowercase();
-    !value.is_empty()
-        && value.len() <= 512
-        && !value.starts_with('/')
-        && !value.chars().any(char::is_control)
-        && !lower.contains("api_key=")
-        && !lower.contains("apikey=")
-        && !lower.contains("token=")
-        && !lower.contains("secret=")
-        && !lower.contains("password=")
-        && !lower.contains("oauth=")
-}
-
 #[cfg(test)]
 mod provider_launch_context_tests {
     use super::*;
@@ -1214,7 +1196,6 @@ mod provider_launch_context_tests {
                 provider_relative_path: ".claude/settings.json".into(),
                 format: "json".into(),
             }],
-            plugins: vec!["example-plugin".into()],
         };
         context.validate("claude").unwrap();
         let encoded = serde_json::to_string(&context).unwrap();
@@ -1228,13 +1209,13 @@ mod provider_launch_context_tests {
     #[test]
     fn raw_secret_payload_and_unapproved_config_paths_are_rejected() {
         let raw = serde_json::json!({
-            "preparation":{"claude":{"mcpArgs":[]}}, "config":[], "plugins":[],
+            "preparation":{"claude":{"mcpArgs":[]}}, "config":[],
             "token":"test-secret-value"
         });
         assert!(serde_json::from_value::<ProviderLaunchContext>(raw).is_err());
         let nested = serde_json::json!({
             "preparation":{"claude":{"mcp_args":[],"apiKey":"test-secret-value"}},
-            "config":[], "plugins":[]
+            "config":[]
         });
         assert!(serde_json::from_value::<ProviderLaunchContext>(nested).is_err());
 
@@ -1247,7 +1228,6 @@ mod provider_launch_context_tests {
                 provider_relative_path: ".claude/.credentials.json".into(),
                 format: "json".into(),
             }],
-            plugins: vec![],
         };
         assert!(context.validate("claude").is_err());
         let mut context = context;
@@ -1258,6 +1238,43 @@ mod provider_launch_context_tests {
             provider_relative_path: ".claude/mcp.json".into(),
         });
         assert!(context.validate("claude").is_err());
+    }
+
+    #[test]
+    fn separated_credential_argument_cannot_enter_a_durable_launch_row() {
+        let mut launch: TerminalLaunchSpec = serde_json::from_value(serde_json::json!({
+            "terminalId":"credential-test", "streamId":"stream-test", "mode":"claude",
+            "program":"claude", "cwd":"/workspace", "runAsUid":65534,
+            "runAsGid":0, "cols":80, "rows":24, "projectKey":"project-test",
+            "workspacePath":"/workspace"
+        }))
+        .unwrap();
+        launch.provider_launch_context = Some(ProviderLaunchContext {
+            preparation: ProviderPreparation::Claude {
+                mcp_args: vec!["--api-key".into(), "fixture-secret-bytes".into()],
+            },
+            mcp_capability: None,
+            config: Vec::new(),
+        });
+        assert!(launch.validate().is_err());
+        let serialized = serde_json::to_string(&launch).unwrap();
+        let restored: TerminalLaunchSpec = serde_json::from_str(&serialized).unwrap();
+        assert!(restored.validate().is_err());
+        launch.provider_launch_context.as_mut().unwrap().preparation =
+            ProviderPreparation::Claude {
+                mcp_args: vec!["--api-key=fixture-secret-bytes".into()],
+            };
+        assert!(launch.validate().is_err());
+        let context = launch.provider_launch_context.as_mut().unwrap();
+        context.preparation = ProviderPreparation::Claude {
+            mcp_args: vec!["--mcp-config".into(), "fixture-secret-bytes".into()],
+        };
+        context.mcp_capability = Some(McpCapabilityReference {
+            grant_id: "grant-test".into(),
+            endpoint: "http://host.docker.internal:3001/api/mcp".into(),
+            provider_relative_path: "fixture-secret-bytes".into(),
+        });
+        assert!(launch.validate().is_err());
     }
 
     #[test]

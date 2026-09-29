@@ -3034,7 +3034,6 @@ mod tests {
                     provider_relative_path: ".amplifier/freshell-mcp.json".into(),
                 }),
                 config: Vec::new(),
-                plugins: Vec::new(),
             }),
         });
         registry.prepare_launch(launch).await.unwrap();
