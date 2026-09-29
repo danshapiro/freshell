@@ -166,6 +166,25 @@ function createTwoPaneStore(opts?: { cridB?: string; terminalIdB?: string; termi
   return store
 }
 
+function createManagedTwoPaneStore() {
+  const store = createStore()
+  store.dispatch(addTab({ id: 'tab-1', mode: 'shell' }))
+  store.dispatch(initLayout({
+    tabId: 'tab-1',
+    paneId: 'pane-1',
+    content: managedTerminalContent('req-a', 'term-a', 'view-a', 2, 7),
+  }))
+  store.dispatch(splitPane({
+    tabId: 'tab-1',
+    paneId: 'pane-1',
+    direction: 'vertical',
+    newContent: managedTerminalContent('req-b', 'term-b', 'view-b', 3, 8),
+    newPaneId: 'pane-2',
+  }))
+  mockSend.mockClear()
+  return store
+}
+
 function paneContents(store: ReturnType<typeof createStore>, tabId: string): Array<{ paneId: string; content: PaneContent }> {
   const root = store.getState().panes.layouts[tabId]
   return root ? collectPaneEntries(root) : []
@@ -261,6 +280,85 @@ describe('closePaneWithCleanup — the acknowledged close gate (F2)', () => {
       'pane-1': 'the pane close could not be recorded durably; the pane was left open',
       'pane-2': 'the pane close could not be recorded durably; the pane was left open',
     })
+  })
+
+  it('a managed detach timeout settles a pane close, clears its close mark, keeps the pane, and reasserts it open', async () => {
+    vi.useFakeTimers()
+    const store = createManagedTwoPaneStore()
+    mockManagedRuntimeViewVisibility.mockReturnValue(new Promise(() => {}))
+
+    const close = store.dispatch(closePaneWithCleanup({ tabId: 'tab-1', paneId: 'pane-2' }))
+    ackAllPaneCloses()
+    await vi.advanceTimersByTimeAsync(KILL_ACK_TIMEOUT_MS + 50)
+    let settled = false
+    void close.then(() => { settled = true })
+    await vi.advanceTimersByTimeAsync(0)
+    expect(settled).toBe(true)
+    await close
+
+    expect(paneContents(store, 'tab-1').map((pane) => pane.paneId)).toEqual(['pane-1', 'pane-2'])
+    expect(paneCloseErrors(store, 'tab-1')).toEqual({
+      'pane-2': 'the pane close could not be recorded durably; the pane was left open',
+    })
+    expect(store.getState().panes.closingPanes?.['tab-1:pane-2']).toBeUndefined()
+    expect(sentCallsOf('pane.opened')).toEqual([
+      expect.objectContaining({ createRequestId: 'req-b', tabId: 'tab-1' }),
+    ])
+  })
+
+  it('a managed detach timeout settles a whole-tab close, clears its close mark, keeps the tab, and reasserts every pane', async () => {
+    vi.useFakeTimers()
+    const store = createManagedTwoPaneStore()
+    mockManagedRuntimeViewVisibility.mockReturnValue(new Promise(() => {}))
+
+    const close = store.dispatch(closeTab('tab-1'))
+    ackPanesClosedBatches()
+    await vi.advanceTimersByTimeAsync(KILL_ACK_TIMEOUT_MS + 50)
+    let settled = false
+    void close.then(() => { settled = true })
+    await vi.advanceTimersByTimeAsync(0)
+    expect(settled).toBe(true)
+    await close
+
+    expect(store.getState().tabs.tabs.some((tab) => tab.id === 'tab-1')).toBe(true)
+    expect(paneContents(store, 'tab-1').map((pane) => pane.paneId)).toEqual(['pane-1', 'pane-2'])
+    expect(store.getState().panes.closingTabs?.['tab-1']).toBeUndefined()
+    expect(paneCloseErrors(store, 'tab-1')).toEqual({
+      'pane-1': 'the pane close could not be recorded durably; the pane was left open',
+      'pane-2': 'the pane close could not be recorded durably; the pane was left open',
+    })
+    expect(sentCallsOf('pane.opened')).toEqual([
+      expect.objectContaining({ createRequestId: 'req-a', tabId: 'tab-1' }),
+      expect.objectContaining({ createRequestId: 'req-b', tabId: 'tab-1' }),
+    ])
+  })
+
+  it('a later managed detach timeout rolls back earlier success with its returned fences before refusing the tab close', async () => {
+    vi.useFakeTimers()
+    const store = createManagedTwoPaneStore()
+    mockManagedRuntimeViewVisibility.mockImplementation((
+      viewId: string,
+      visibility: 'visible' | 'detached',
+    ) => {
+      if (viewId === 'view-a' && visibility === 'detached') {
+        return Promise.resolve(managedViewResult('view-a', 'detached', 4, 9))
+      }
+      if (viewId === 'view-a' && visibility === 'visible') {
+        return Promise.resolve(managedViewResult('view-a', 'visible', 5, 10))
+      }
+      return new Promise(() => {})
+    })
+
+    const close = store.dispatch(closeTab('tab-1'))
+    ackPanesClosedBatches()
+    await vi.advanceTimersByTimeAsync(KILL_ACK_TIMEOUT_MS + 50)
+    await close
+
+    expect(mockManagedRuntimeViewVisibility).toHaveBeenNthCalledWith(1, 'view-a', 'detached', 2, 7)
+    expect(mockManagedRuntimeViewVisibility).toHaveBeenNthCalledWith(2, 'view-b', 'detached', 3, 8)
+    expect(mockManagedRuntimeViewVisibility).toHaveBeenNthCalledWith(3, 'view-a', 'visible', 4, 9)
+    expect(store.getState().tabs.tabs.some((tab) => tab.id === 'tab-1')).toBe(true)
+    expect(paneContents(store, 'tab-1').map((pane) => pane.paneId)).toEqual(['pane-1', 'pane-2'])
   })
 
   it('success: the pane.close is acked BEFORE the layout loses the pane (success → pane gone)', async () => {
@@ -1010,6 +1108,91 @@ describe('replacePaneWithCleanup — the context-menu replace gate (F2)', () => 
     expect((entry?.content as { closeError?: string }).closeError).toBe(
       'the pane close could not be recorded durably; the pane was left open',
     )
+    expect(sentCallsOf('pane.opened')).toEqual([
+      expect.objectContaining({ createRequestId: 'req-b', tabId: 'tab-1' }),
+    ])
+  })
+
+  it('managed success orders close evidence before visibility and replaces only after the visibility PATCH resolves', async () => {
+    const store = createManagedTwoPaneStore()
+    const order: string[] = []
+    let sawReplacement = false
+    const unsubscribe = store.subscribe(() => {
+      if (sawReplacement) return
+      if (paneContents(store, 'tab-1').find((pane) => pane.paneId === 'pane-2')?.content.kind === 'picker') {
+        sawReplacement = true
+        order.push('replace')
+      }
+    })
+    mockSend.mockImplementation((message: unknown) => {
+      if ((message as { type?: string }).type === 'pane.closed') order.push('close-evidence')
+    })
+    let resolveDetach: (view: ReturnType<typeof managedViewResult>) => void = () => {}
+    const detach = new Promise<ReturnType<typeof managedViewResult>>((resolve) => {
+      resolveDetach = resolve
+    })
+    mockManagedRuntimeViewVisibility.mockImplementation(async () => {
+      order.push('visibility-start')
+      const view = await detach
+      order.push('visibility-resolved')
+      return view
+    })
+
+    const replace = store.dispatch(replacePaneWithCleanup({ tabId: 'tab-1', paneId: 'pane-2' }))
+    expect(order).toEqual(['close-evidence'])
+    expect(paneContents(store, 'tab-1').find((pane) => pane.paneId === 'pane-2')?.content.kind).toBe('terminal')
+
+    ackAllPaneCloses()
+    await vi.waitFor(() => expect(order).toEqual(['close-evidence', 'visibility-start']))
+    expect(paneContents(store, 'tab-1').find((pane) => pane.paneId === 'pane-2')?.content.kind).toBe('terminal')
+
+    resolveDetach(managedViewResult('view-b', 'detached', 4, 9))
+    await replace
+    unsubscribe()
+
+    expect(order).toEqual(['close-evidence', 'visibility-start', 'visibility-resolved', 'replace'])
+    expect(paneContents(store, 'tab-1').find((pane) => pane.paneId === 'pane-2')?.content.kind).toBe('picker')
+  })
+
+  it('managed refusal keeps the original content, surfaces the existing close error, and reasserts open', async () => {
+    const store = createManagedTwoPaneStore()
+    mockManagedRuntimeViewVisibility.mockRejectedValue(new Error('managed view refusal'))
+
+    const replace = store.dispatch(replacePaneWithCleanup({ tabId: 'tab-1', paneId: 'pane-2' }))
+    ackAllPaneCloses()
+    await replace
+
+    const entry = paneContents(store, 'tab-1').find((pane) => pane.paneId === 'pane-2')
+    expect(entry?.content.kind).toBe('terminal')
+    expect((entry?.content as { closeError?: string }).closeError).toBe(
+      'the pane close could not be recorded durably; the pane was left open',
+    )
+    expect(store.getState().panes.closingPanes?.['tab-1:pane-2']).toBeUndefined()
+    expect(sentCallsOf('pane.opened')).toEqual([
+      expect.objectContaining({ createRequestId: 'req-b', tabId: 'tab-1' }),
+    ])
+  })
+
+  it('managed detach timeout settles replace without installing a picker', async () => {
+    vi.useFakeTimers()
+    const store = createManagedTwoPaneStore()
+    mockManagedRuntimeViewVisibility.mockReturnValue(new Promise(() => {}))
+
+    const replace = store.dispatch(replacePaneWithCleanup({ tabId: 'tab-1', paneId: 'pane-2' }))
+    ackAllPaneCloses()
+    await vi.advanceTimersByTimeAsync(KILL_ACK_TIMEOUT_MS + 50)
+    let settled = false
+    void replace.then(() => { settled = true })
+    await vi.advanceTimersByTimeAsync(0)
+    expect(settled).toBe(true)
+    await replace
+
+    const entry = paneContents(store, 'tab-1').find((pane) => pane.paneId === 'pane-2')
+    expect(entry?.content.kind).toBe('terminal')
+    expect((entry?.content as { closeError?: string }).closeError).toBe(
+      'the pane close could not be recorded durably; the pane was left open',
+    )
+    expect(store.getState().panes.closingPanes?.['tab-1:pane-2']).toBeUndefined()
     expect(sentCallsOf('pane.opened')).toEqual([
       expect.objectContaining({ createRequestId: 'req-b', tabId: 'tab-1' }),
     ])

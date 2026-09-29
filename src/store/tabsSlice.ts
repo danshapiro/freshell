@@ -555,6 +555,42 @@ type FrozenManagedViewProjection = {
 }
 
 /**
+ * Managed-view visibility mutations do not currently expose an AbortSignal
+ * option. Close must still have the same bounded liveness guarantee as its
+ * durable close-evidence wait, so a half-open PATCH is treated as a refusal
+ * after the existing close bound.
+ */
+export const MANAGED_VIEW_DETACH_TIMEOUT_MS = KILL_ACK_TIMEOUT_MS
+
+function awaitManagedViewVisibilityMutation(
+  mutate: () => Promise<ManagedRuntimeViewIntent>,
+): Promise<ManagedRuntimeViewIntent> {
+  return new Promise((resolve, reject) => {
+    let settled = false
+    const timer = setTimeout(() => {
+      settled = true
+      reject(new Error('managed view visibility mutation timed out'))
+    }, MANAGED_VIEW_DETACH_TIMEOUT_MS)
+
+    const finish = (callback: () => void) => {
+      if (settled) return
+      settled = true
+      clearTimeout(timer)
+      callback()
+    }
+
+    try {
+      mutate().then(
+        (view) => finish(() => resolve(view)),
+        (error) => finish(() => reject(error)),
+      )
+    } catch (error) {
+      finish(() => reject(error))
+    }
+  })
+}
+
+/**
  * Freeze the managed-view fences carried by the panes before a close starts.
  * The pane projection is the last-known view identity for that exact layout;
  * reading the live inventory while a close is in flight could pair the close
@@ -603,12 +639,12 @@ async function detachManagedViews(
   const detached: Array<{ projection: FrozenManagedViewProjection; view: ManagedRuntimeViewIntent }> = []
   for (const projection of projections) {
     try {
-      const view = await updateManagedRuntimeViewVisibility(
+      const view = await awaitManagedViewVisibilityMutation(() => updateManagedRuntimeViewVisibility(
         projection.viewId,
         'detached',
         projection.viewRevision,
         projection.soulRevision,
-      )
+      ))
       detached.push({ projection, view })
     } catch (error) {
       log.warn('managed view detach refused during close; rolling back earlier detaches', {
@@ -618,12 +654,12 @@ async function detachManagedViews(
       })
       for (const completed of [...detached].reverse()) {
         try {
-          await updateManagedRuntimeViewVisibility(
+          await awaitManagedViewVisibilityMutation(() => updateManagedRuntimeViewVisibility(
             completed.view.viewId,
             'visible',
             completed.view.revision,
             completed.view.soulIntentRevision,
-          )
+          ))
         } catch (rollbackError) {
           log.error('managed view detach rollback failed after close refusal', {
             viewId: completed.view.viewId,
