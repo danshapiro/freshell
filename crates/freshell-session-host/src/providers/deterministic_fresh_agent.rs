@@ -47,6 +47,8 @@ struct FixtureState {
     dispatch_count: u64,
     completion_count: u64,
     pending_decision_id: Option<String>,
+    #[serde(default)]
+    create_profile: Option<FreshAgentProfile>,
 }
 
 pub(crate) struct DeterministicFreshAgentTransport {
@@ -78,6 +80,7 @@ impl DeterministicFreshAgentTransport {
                     dispatch_count: 0,
                     completion_count: 0,
                     pending_decision_id: None,
+                    create_profile: None,
                 }
             };
         if profile
@@ -189,8 +192,13 @@ impl DeterministicFreshAgentTransport {
 
 #[async_trait]
 impl FreshAgentTransport for DeterministicFreshAgentTransport {
-    async fn start(&self, _profile: &FreshAgentProfile) -> Result<TransportStart, String> {
+    async fn start(&self, profile: &FreshAgentProfile) -> Result<TransportStart, String> {
         self.spawn_provider_process().await?;
+        {
+            let mut state = self.state.lock().await;
+            state.create_profile = Some(profile.clone());
+            write_provider_state(&self.state_dir, &state, self.run_as_uid, self.run_as_gid).await?;
+        }
         Ok(TransportStart {
             native_session_id: Some(self.state.lock().await.native_session_id.clone()),
         })
@@ -535,6 +543,11 @@ mod tests {
             sandbox: Some("workspace-write".into()),
             provider_store_id: "soul-a".into(),
             native_session_id: None,
+            plugins: None,
+            model_selection: None,
+            session_ref: None,
+            provider_launch_context: None,
+            provider_secret_references: Vec::new(),
         };
         assert_eq!(fixture_native_id(&profile), fixture_native_id(&profile));
         let mut other = profile.clone();
@@ -564,6 +577,11 @@ mod tests {
             sandbox: Some("workspace-write".into()),
             provider_store_id: "soul-native-proof".into(),
             native_session_id: None,
+            plugins: None,
+            model_selection: None,
+            session_ref: None,
+            provider_launch_context: None,
+            provider_secret_references: Vec::new(),
         };
         let transport = DeterministicFreshAgentTransport::open(
             root.path().join("provider"),
@@ -620,6 +638,7 @@ mod tests {
             dispatch_count: 3,
             completion_count: 2,
             pending_decision_id: None,
+            create_profile: None,
         };
         write_state(root.path(), &state).unwrap();
         let mut spec = fixture_resume_spec("fixture-native-codex-exact");

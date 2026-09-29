@@ -236,12 +236,17 @@ fn prepare_provider_features(
     terminal: &freshell_runtime_protocol::TerminalLaunchSpec,
     operation: &str,
 ) -> Result<(), String> {
+    prepare_provider_features_for_identity(terminal.run_as_uid, terminal.run_as_gid, operation)
+}
+
+fn prepare_provider_features_for_identity(
+    uid: u32,
+    gid: u32,
+    operation: &str,
+) -> Result<(), String> {
     let exe = std::env::current_exe().map_err(|error| error.to_string())?;
     let status = std::process::Command::new("/usr/bin/setpriv")
-        .args(crate::provider_identity_args(
-            terminal.run_as_uid,
-            terminal.run_as_gid,
-        ))
+        .args(crate::provider_identity_args(uid, gid))
         .arg(exe)
         .arg("prepare-provider-features")
         .arg(operation)
@@ -252,6 +257,53 @@ fn prepare_provider_features(
     } else {
         Err(format!("prepare provider features failed: {operation}"))
     }
+}
+
+pub fn prepare_fresh_agent_child_environment(
+    launch: &freshell_runtime_protocol::FreshAgentLaunchSpec,
+    child_env: &mut std::collections::BTreeMap<String, String>,
+) -> Result<(), String> {
+    use freshell_runtime_protocol::{FreshProvider, ProviderPreparation};
+    if launch.provider != FreshProvider::Opencode {
+        return Ok(());
+    }
+    if let Some(context) = launch.provider_launch_context.as_ref() {
+        if let ProviderPreparation::Opencode {
+            tui_config,
+            inline_config,
+            ..
+        } = &context.preparation
+        {
+            if let Some(reference) = tui_config {
+                child_env.insert(
+                    "OPENCODE_TUI_CONFIG".into(),
+                    format!(
+                        "/home/freshell/provider/{}",
+                        reference.provider_relative_path
+                    ),
+                );
+            }
+            if *inline_config {
+                let raw = std::fs::read_to_string(
+                    "/run/freshell-private/user-provider/ephemeral/inline-config.json",
+                )
+                .map_err(|_| "managed OpenCode inline config is unavailable")?;
+                child_env.insert("OPENCODE_CONFIG_CONTENT".into(), raw);
+            }
+        }
+    }
+    if !child_env.contains_key("OPENCODE_TUI_CONFIG") {
+        prepare_provider_features_for_identity(
+            launch.run_as_uid,
+            launch.run_as_gid,
+            "opencode-rebind",
+        )?;
+        child_env.insert(
+            "OPENCODE_TUI_CONFIG".into(),
+            "/home/freshell/provider/.freshell/opencode/tui.json".into(),
+        );
+    }
+    Ok(())
 }
 
 pub(crate) fn run_provider_features_worker(args: &[String]) -> Result<(), String> {

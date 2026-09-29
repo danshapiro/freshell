@@ -2293,6 +2293,8 @@ impl FreshClaudeState {
             "model": msg.model,
             "permissionMode": msg.permission_mode,
             "effort": msg.effort,
+            "plugins": msg.plugins,
+            "modelSelection": msg.model_selection,
             "resumeSessionId": resume_sid,
         });
         if let Err(err) = write_line(&mut stdin, &create_req).await {
@@ -19150,6 +19152,36 @@ rl.on('line', (line) => {
     /// row through the identity sink — keyed by the DURABLE cliSessionId, carrying the
     /// FULL create-settings snapshot and the sessionType flavour — AWAITED before the
     /// init-driven broadcast proceeds (durable-before-answer, V8/A11).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn fresh_claude_plugins_reach_the_sidecar_and_kilroy_keeps_its_legacy_flavor() {
+        let _guard = CLAUDE_ENV_LOCK.lock().await;
+        let env = FakeClaudeSidecarEnv::install();
+        let (state, mut rx) = state_with_bus();
+        let mut claude = dedup_create_msg("req-provider-plugin-claude");
+        claude.plugins = Some(vec!["/workspace/.claude/plugins/local".into()]);
+        state.handle_create(claude, None).await;
+        await_claude_created(&mut rx, "req-provider-plugin-claude").await;
+
+        let mut kilroy = dedup_create_msg("req-provider-plugin-kilroy");
+        kilroy.session_type = SessionType::Kilroy;
+        state.handle_create(kilroy, None).await;
+        let created = await_claude_created(&mut rx, "req-provider-plugin-kilroy").await;
+        assert_eq!(created["sessionType"], "kilroy");
+
+        let creates: Vec<Value> = std::fs::read_to_string(env.spawn_log_path())
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(creates.len(), 2);
+        assert_eq!(
+            creates[0]["plugins"],
+            json!(["/workspace/.claude/plugins/local"])
+        );
+        assert_eq!(creates[1]["plugins"], Value::Null);
+        assert_eq!(creates[1]["resumeSessionId"], Value::Null);
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn session_init_records_binding_with_create_settings() {
         let _guard = CLAUDE_ENV_LOCK.lock().await;

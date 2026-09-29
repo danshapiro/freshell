@@ -1137,21 +1137,23 @@ async fn main() -> ExitCode {
     #[cfg(not(feature = "managed-runtime-v1"))]
     let managed_runtime_available = false;
     #[cfg(feature = "managed-runtime-v1")]
-    if let Some(gateway) = fresh_agent_proxy::HostedFreshAgentProxy::from_opt_in(
+    let hosted_fresh_gateway = fresh_agent_proxy::HostedFreshAgentProxy::from_opt_in(
         managed_runtime_client.clone(),
         Arc::clone(&broadcast_tx),
     )
     .unwrap_or_else(|error| {
         eprintln!("managed fresh-agent gateway initialization failed: {error}");
         std::process::exit(1);
-    }) {
+    });
+    #[cfg(feature = "managed-runtime-v1")]
+    if let Some(gateway) = hosted_fresh_gateway.as_ref() {
         fresh_agent_state
             .set_hosted_rest_gateway(gateway.clone())
             .unwrap_or_else(|error| {
                 eprintln!("managed fresh-agent gateway initialization failed: {error}");
                 std::process::exit(1);
             });
-        freshell_ws::hosted_fresh_agent::install_gateway(gateway).unwrap_or_else(|error| {
+        freshell_ws::hosted_fresh_agent::install_gateway(gateway.clone()).unwrap_or_else(|error| {
             eprintln!("managed fresh-agent gateway initialization failed: {error}");
             std::process::exit(1);
         });
@@ -1273,6 +1275,10 @@ async fn main() -> ExitCode {
             }
         });
     if let Some(names) = session_names.clone() {
+        #[cfg(feature = "managed-runtime-v1")]
+        if let Some(gateway) = hosted_fresh_gateway.as_ref() {
+            gateway.set_session_naming(names.clone());
+        }
         // The identity registry is the shared sink holder the session/
         // terminal/directory/resolve surfaces already carry; the fresh-agent
         // states each hold their own OnceLock sink.

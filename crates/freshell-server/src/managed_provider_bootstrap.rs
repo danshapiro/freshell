@@ -7,6 +7,7 @@ use freshell_runtime_protocol::{
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
+#[cfg(test)]
 pub fn provider_launch_context(provider: &str, workspace: &Path) -> Option<ProviderLaunchContext> {
     provider_launch_context_for_managed(provider, workspace, None)
 }

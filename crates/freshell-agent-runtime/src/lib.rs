@@ -1161,6 +1161,7 @@ mod tests {
             provider_permission_mode: None,
             provider_bootstrap_files: Vec::<ProviderBootstrapFile>::new(),
             provider_secret_references: Vec::new(),
+            provider_launch_context: None,
         }
     }
 

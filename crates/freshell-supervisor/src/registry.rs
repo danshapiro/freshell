@@ -1214,6 +1214,9 @@ impl Registry {
             // parent through inventory fallback.
             spec.session_id = child_session_id.clone();
             spec.native_session_id = Some(child_session_id.clone());
+            if let Some(reference) = spec.session_ref.as_mut() {
+                reference.session_id = child_session_id.clone();
+            }
             let now = now_millis();
             tx.execute(
                 "UPDATE incarnations SET fresh_agent_spec=?1,updated_at=?2 WHERE incarnation_id=?3",
@@ -2881,6 +2884,9 @@ mod tests {
             permission_mode: Some("ask".into()),
             sandbox: Some("workspace-write".into()),
             native_session_id: None,
+            plugins: None,
+            model_selection: None,
+            session_ref: None,
             fixture_transport: None,
             provider_bootstrap_files: Vec::new(),
             provider_secret_references: Vec::new(),

@@ -3,8 +3,50 @@
 //! crate deliberately knows nothing about supervisor IPC.
 
 use async_trait::async_trait;
+use serde_json::Value;
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Default)]
+pub struct HostedRestProviderInputs {
+    pub plugins: Option<Vec<String>>,
+    pub model_selection: Option<Option<freshell_protocol::ModelSelection>>,
+    pub permission_mode: Option<String>,
+    pub sandbox: Option<freshell_protocol::Sandbox>,
+}
+
+pub fn provider_inputs(body: &Value) -> Result<HostedRestProviderInputs, String> {
+    let plugins = body
+        .get("plugins")
+        .map(|value| {
+            serde_json::from_value(value.clone()).map_err(|_| "invalid plugins".to_string())
+        })
+        .transpose()?;
+    let model_selection = body
+        .get("modelSelection")
+        .map(|value| {
+            serde_json::from_value(value.clone()).map_err(|_| "invalid modelSelection".to_string())
+        })
+        .transpose()?;
+    let permission_mode = body
+        .get("permissionMode")
+        .map(|value| {
+            serde_json::from_value(value.clone()).map_err(|_| "invalid permissionMode".to_string())
+        })
+        .transpose()?;
+    let sandbox = body
+        .get("sandbox")
+        .map(|value| {
+            serde_json::from_value(value.clone()).map_err(|_| "invalid sandbox".to_string())
+        })
+        .transpose()?;
+    Ok(HostedRestProviderInputs {
+        plugins,
+        model_selection,
+        permission_mode,
+        sandbox,
+    })
+}
+
+#[derive(Clone, Debug, PartialEq)]
 pub struct HostedRestCreate {
     pub request_id: String,
     pub provider: String,
@@ -13,6 +55,10 @@ pub struct HostedRestCreate {
     pub model: Option<String>,
     pub effort: Option<String>,
     pub native_session_id: Option<String>,
+    pub plugins: Option<Vec<String>>,
+    pub model_selection: Option<Option<freshell_protocol::ModelSelection>>,
+    pub permission_mode: Option<String>,
+    pub sandbox: Option<freshell_protocol::Sandbox>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -78,3 +124,27 @@ pub trait HostedFreshAgentRestGateway: Send + Sync {
 }
 
 pub type SharedHostedFreshAgentRestGateway = std::sync::Arc<dyn HostedFreshAgentRestGateway>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hosted_rest_provider_inputs_preserve_explicit_model_clear_and_plugins() {
+        let body = serde_json::json!({
+            "plugins": ["/workspace/plugin"],
+            "modelSelection": null,
+            "permissionMode": "default",
+            "sandbox": "workspace-write"
+        });
+        let inputs = provider_inputs(&body).unwrap();
+        assert_eq!(inputs.plugins, Some(vec!["/workspace/plugin".into()]));
+        assert_eq!(inputs.model_selection, Some(None));
+        assert_eq!(inputs.permission_mode.as_deref(), Some("default"));
+        assert_eq!(
+            inputs.sandbox,
+            Some(freshell_protocol::Sandbox::WorkspaceWrite)
+        );
+        assert!(provider_inputs(&serde_json::json!({"plugins": "wrong"})).is_err());
+    }
+}

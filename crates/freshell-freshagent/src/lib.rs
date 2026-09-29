@@ -4684,6 +4684,10 @@ async fn create_tab(
     let name = body.get("name").and_then(Value::as_str).map(str::to_string);
 
     if let Some(gateway) = state.hosted_rest_gateway() {
+        let provider_inputs = match hosted_rest::provider_inputs(&body) {
+            Ok(inputs) => inputs,
+            Err(error) => return fail_json(StatusCode::BAD_REQUEST, error),
+        };
         let native_session_id = match body.get("sessionRef") {
             None => None,
             Some(value) => match serde_json::from_value::<SessionLocator>(value.clone()) {
@@ -4709,6 +4713,10 @@ async fn create_tab(
                 model,
                 effort,
                 native_session_id,
+                plugins: provider_inputs.plugins,
+                model_selection: provider_inputs.model_selection,
+                permission_mode: provider_inputs.permission_mode,
+                sandbox: provider_inputs.sandbox,
             },
             name,
         )

@@ -10,6 +10,7 @@ use freshell_agent_runtime::host_actor::{
     FreshAgentProfile, FreshAgentTransport, OperationAck, OperationFailure, OperationFailureKind,
     TransportStart,
 };
+use freshell_codex::launch_plan::CodexSidecarLaunchContext;
 use freshell_freshagent::rollback_record::{RollbackDirection, RollbackModeReq, RollbackRequest};
 use freshell_freshagent::{FreshAgentState, FreshClaudeState, FreshCodexState, FreshOpencodeState};
 use freshell_protocol::{
@@ -19,7 +20,8 @@ use freshell_protocol::{
 };
 use freshell_runtime_protocol::{
     AgentEvent, FreshAgentCapture, FreshAgentFixtureTransport, FreshAgentLaunchSpec,
-    FreshAgentRollbackDirection, FreshAgentRollbackMode, FreshProvider, RequestId,
+    FreshAgentRollbackDirection, FreshAgentRollbackMode, FreshProvider, ProviderLaunchContext,
+    ProviderPreparation, RequestId,
 };
 use serde_json::{json, Value};
 use std::{
@@ -66,19 +68,15 @@ pub(crate) async fn open_hosted_fresh_agent(
     _incarnation_state_dir: &std::path::Path,
     launch: FreshAgentLaunchSpec,
 ) -> Result<Arc<FreshAgentHostActor>, String> {
-    let profile = FreshAgentProfile {
-        provider: launch.provider.clone(),
-        runtime_variant: launch.runtime_variant,
-        cwd: launch.cwd,
-        model: launch.model,
-        effort: launch.effort,
-        permission_mode: launch.permission_mode,
-        sandbox: launch.sandbox,
-        provider_store_id: launch.provider_store_id,
-        native_session_id: launch.native_session_id,
-    };
+    let profile = profile_from_launch(&launch);
     let transport: Arc<dyn FreshAgentTransport> = match launch.fixture_transport {
-        None => HostedTransport::new(launch.provider).await,
+        None => {
+            HostedTransport::new_with_context(
+                launch.provider,
+                profile.provider_launch_context.as_ref(),
+            )
+            .await
+        }
         Some(FreshAgentFixtureTransport::Deterministic) => {
             deterministic_transport(&profile, launch.run_as_uid, launch.run_as_gid).await?
         }
@@ -89,6 +87,25 @@ pub(crate) async fn open_hosted_fresh_agent(
     FreshAgentHostActor::open(HOST_ACTOR_STATE_DIR, profile, transport)
         .await
         .map_err(|error| error.to_string())
+}
+
+fn profile_from_launch(launch: &FreshAgentLaunchSpec) -> FreshAgentProfile {
+    FreshAgentProfile {
+        provider: launch.provider.clone(),
+        runtime_variant: launch.runtime_variant.clone(),
+        cwd: launch.cwd.clone(),
+        model: launch.model.clone(),
+        effort: launch.effort.clone(),
+        permission_mode: launch.permission_mode.clone(),
+        sandbox: launch.sandbox.clone(),
+        provider_store_id: launch.provider_store_id.clone(),
+        native_session_id: launch.native_session_id.clone(),
+        plugins: launch.plugins.clone(),
+        model_selection: launch.model_selection.clone(),
+        session_ref: launch.session_ref.clone(),
+        provider_launch_context: launch.provider_launch_context.clone(),
+        provider_secret_references: launch.provider_secret_references.clone(),
+    }
 }
 
 #[cfg(feature = "fresh-agent-fixtures")]
@@ -118,18 +135,42 @@ async fn deterministic_transport(
 }
 
 impl HostedTransport {
+    #[cfg(test)]
     async fn new(provider: FreshProvider) -> Arc<Self> {
+        Self::new_with_context(provider, None).await
+    }
+
+    async fn new_with_context(
+        provider: FreshProvider,
+        context: Option<&ProviderLaunchContext>,
+    ) -> Arc<Self> {
         let (broadcast_tx, broadcast_rx) = broadcast::channel(1024);
         let broadcast_tx = Arc::new(broadcast_tx);
         let state = match provider {
             FreshProvider::Claude | FreshProvider::Kilroy => {
                 ProviderState::Claude(FreshClaudeState::new(Arc::clone(&broadcast_tx)))
             }
-            FreshProvider::Codex => ProviderState::Codex(FreshCodexState::new(
-                Arc::new("host-internal".into()),
-                Arc::clone(&broadcast_tx),
-                json!({"freshAgent":{"enabled":true}}),
-            )),
+            FreshProvider::Codex => {
+                let sidecar_args = context
+                    .and_then(|context| match &context.preparation {
+                        ProviderPreparation::Codex { sidecar_args, .. } => {
+                            Some(sidecar_args.clone())
+                        }
+                        _ => None,
+                    })
+                    .unwrap_or_default();
+                ProviderState::Codex(
+                    FreshCodexState::new(
+                        Arc::new("host-internal".into()),
+                        Arc::clone(&broadcast_tx),
+                        json!({"freshAgent":{"enabled":true}}),
+                    )
+                    .with_sidecar_launch_context(CodexSidecarLaunchContext {
+                        config_args: sidecar_args,
+                        env: Default::default(),
+                    }),
+                )
+            }
             FreshProvider::Opencode => {
                 let owner = FreshAgentState::new(
                     Arc::new("host-internal".into()),
@@ -344,37 +385,7 @@ impl HostedTransport {
 impl FreshAgentTransport for HostedTransport {
     async fn start(&self, profile: &FreshAgentProfile) -> Result<TransportStart, String> {
         *self.profile.lock().expect("profile lock") = Some(profile.clone());
-        let session_ref = profile
-            .native_session_id
-            .as_ref()
-            .map(|session_id| SessionLocator {
-                provider: match self.provider {
-                    FreshProvider::Claude | FreshProvider::Kilroy => "claude",
-                    FreshProvider::Codex => "codex",
-                    FreshProvider::Opencode => "opencode",
-                }
-                .into(),
-                session_id: session_id.clone(),
-            });
-        let create = FreshAgentCreate {
-            request_id: format!("host-create-{}", uuid::Uuid::new_v4()),
-            observed_epoch: None,
-            observed_generation: None,
-            naming_handle: None,
-            session_type: self.session_type(),
-            cwd: Some(profile.cwd.clone()),
-            effort: profile.effort.clone(),
-            legacy_restore_context: None,
-            model: profile.model.clone(),
-            model_selection: None,
-            permission_mode: profile.permission_mode.clone(),
-            plugins: None,
-            provider: Some(self.provider_wire()),
-            resume_session_id: None,
-            sandbox: profile.sandbox.as_deref().and_then(parse_sandbox),
-            session_ref,
-            tab_id: None,
-        };
+        let create = create_request_for_profile(profile);
         match &self.state {
             ProviderState::Claude(state) => state.handle_create(create, None).await,
             ProviderState::Codex(state) => state.handle_create(create, None).await,
@@ -843,6 +854,60 @@ impl FreshAgentTransport for HostedTransport {
     }
 }
 
+fn create_request_for_profile(profile: &FreshAgentProfile) -> FreshAgentCreate {
+    let (provider, session_type, provider_name) = match profile.provider {
+        FreshProvider::Claude => (AgentProvider::Claude, SessionType::Freshclaude, "claude"),
+        FreshProvider::Kilroy => (AgentProvider::Claude, SessionType::Kilroy, "claude"),
+        FreshProvider::Codex => (AgentProvider::Codex, SessionType::Freshcodex, "codex"),
+        FreshProvider::Opencode => (
+            AgentProvider::Opencode,
+            SessionType::Freshopencode,
+            "opencode",
+        ),
+    };
+    FreshAgentCreate {
+        request_id: format!("host-create-{}", uuid::Uuid::new_v4()),
+        observed_epoch: None,
+        observed_generation: None,
+        naming_handle: None,
+        session_type,
+        cwd: Some(profile.cwd.clone()),
+        effort: profile.effort.clone(),
+        legacy_restore_context: None,
+        model: profile.model.clone(),
+        model_selection: profile.model_selection.as_ref().map(|selection| {
+            selection
+                .as_ref()
+                .map(|selection| freshell_protocol::ModelSelection {
+                    kind: selection.kind.clone(),
+                    model_id: selection.model_id.clone(),
+                })
+        }),
+        permission_mode: profile.permission_mode.clone(),
+        plugins: profile.plugins.clone(),
+        provider: Some(provider),
+        resume_session_id: None,
+        sandbox: profile.sandbox.as_deref().and_then(parse_sandbox),
+        session_ref: profile
+            .session_ref
+            .as_ref()
+            .map(|reference| SessionLocator {
+                provider: reference.provider.clone(),
+                session_id: reference.session_id.clone(),
+            })
+            .or_else(|| {
+                profile
+                    .native_session_id
+                    .as_ref()
+                    .map(|session_id| SessionLocator {
+                        provider: provider_name.into(),
+                        session_id: session_id.clone(),
+                    })
+            }),
+        tab_id: None,
+    }
+}
+
 struct BroadcastBridgeOutputs {
     created: watch::Sender<Option<Result<String, ()>>>,
     native: watch::Sender<Option<String>>,
@@ -1125,6 +1190,140 @@ fn parse_send_outcome(value: &Value) -> Option<(String, bool)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fresh_agent_provider_context_round_trip() {
+        for provider in [
+            FreshProvider::Claude,
+            FreshProvider::Codex,
+            FreshProvider::Opencode,
+        ] {
+            let preparation = match provider {
+                FreshProvider::Claude => ProviderPreparation::Claude {
+                    mcp_args: Vec::new(),
+                },
+                FreshProvider::Codex => ProviderPreparation::Codex {
+                    tui_args: Vec::new(),
+                    sidecar_args: vec!["-c".into(), "fixture_option=true".into()],
+                },
+                FreshProvider::Opencode => ProviderPreparation::Opencode {
+                    project_config: Vec::new(),
+                    tui_config: None,
+                    tui_source: None,
+                    inline_config: false,
+                },
+                FreshProvider::Kilroy => unreachable!(),
+            };
+            let profile = FreshAgentProfile {
+                provider: provider.clone(),
+                runtime_variant: provider.as_str().into(),
+                cwd: "/workspace".into(),
+                model: Some("model-a".into()),
+                effort: Some("high".into()),
+                permission_mode: Some("default".into()),
+                sandbox: Some("workspace-write".into()),
+                provider_store_id: "store".into(),
+                native_session_id: Some("exact-native".into()),
+                plugins: Some(vec!["plugin-a".into()]),
+                model_selection: Some(Some(freshell_runtime_protocol::ProviderModelSelection {
+                    kind: "model".into(), model_id: "model-a".into(),
+                })),
+                session_ref: Some(freshell_runtime_protocol::ProviderSessionReference {
+                    provider: provider.as_str().into(), session_id: "exact-native".into(),
+                }),
+                provider_launch_context: Some(ProviderLaunchContext {
+                    preparation,
+                    mcp_capability: None,
+                    config: vec![freshell_runtime_protocol::ProviderConfigReference {
+                        root: freshell_runtime_protocol::ProviderConfigRoot::UserProvider,
+                        relative_path: "settings.json".into(),
+                        provider_relative_path: "provider/settings.json".into(),
+                        format: "json".into(),
+                    }],
+                }),
+                provider_secret_references: vec![freshell_runtime_protocol::ProviderSecretReference {
+                    source_path: "/run/freshell-secrets/onecli".into(),
+                    profile: match provider {
+                        FreshProvider::Claude => freshell_runtime_protocol::ProviderSecretProfile::ClaudeOnecliEnvironment,
+                        FreshProvider::Codex => freshell_runtime_protocol::ProviderSecretProfile::CodexOnecliEnvironment,
+                        FreshProvider::Opencode => freshell_runtime_protocol::ProviderSecretProfile::OpencodeOnecliEnvironment,
+                        FreshProvider::Kilroy => unreachable!(),
+                    },
+                }],
+            };
+            let launch: FreshAgentLaunchSpec = serde_json::from_value(json!({
+                "sessionId":"presentation", "provider":provider, "sessionType":match provider {
+                    FreshProvider::Claude => "freshclaude", FreshProvider::Codex => "freshcodex",
+                    FreshProvider::Opencode => "freshopencode", FreshProvider::Kilroy => unreachable!(),
+                },
+                "runtimeVariant":profile.runtime_variant, "providerStoreId":profile.provider_store_id,
+                "cwd":profile.cwd, "workspacePath":"/workspace", "runAsUid":65534, "runAsGid":0,
+                "model":profile.model, "effort":profile.effort, "permissionMode":profile.permission_mode,
+                "sandbox":profile.sandbox, "nativeSessionId":profile.native_session_id,
+                "plugins":profile.plugins, "modelSelection":profile.model_selection,
+                "sessionRef":profile.session_ref, "providerLaunchContext":profile.provider_launch_context,
+                "providerSecretReferences":profile.provider_secret_references,
+            })).unwrap();
+            assert_eq!(profile_from_launch(&launch), profile);
+            let created = create_request_for_profile(&profile);
+            assert_eq!(created.plugins, profile.plugins);
+            assert_eq!(
+                created
+                    .model_selection
+                    .as_ref()
+                    .and_then(|value| value.as_ref())
+                    .map(|value| value.model_id.as_str()),
+                Some("model-a")
+            );
+            assert_eq!(
+                created
+                    .session_ref
+                    .as_ref()
+                    .map(|value| value.session_id.as_str()),
+                Some("exact-native")
+            );
+            assert!(created.naming_handle.is_none());
+            assert!(created.tab_id.is_none());
+            assert!(created.resume_session_id.is_none());
+            assert!(created.observed_epoch.is_none());
+            assert!(created.observed_generation.is_none());
+            let mut replayed = profile.clone();
+            replayed.provider_store_id = "other-lifecycle-id".into();
+            let other_create = create_request_for_profile(&replayed);
+            let mut first = serde_json::to_value(created).unwrap();
+            let mut second = serde_json::to_value(other_create).unwrap();
+            first.as_object_mut().unwrap().remove("requestId");
+            second.as_object_mut().unwrap().remove("requestId");
+            assert_eq!(first, second);
+            let direct: FreshAgentCreate = serde_json::from_value(json!({
+                "requestId":"direct-lifecycle-id", "provider":provider.as_str(),
+                "sessionType":match provider {
+                    FreshProvider::Claude => "freshclaude", FreshProvider::Codex => "freshcodex",
+                    FreshProvider::Opencode => "freshopencode", FreshProvider::Kilroy => unreachable!(),
+                },
+                "cwd":"/workspace", "model":"model-a", "effort":"high",
+                "permissionMode":"default", "sandbox":"workspace-write",
+                "plugins":["plugin-a"], "modelSelection":{"kind":"model","modelId":"model-a"},
+                "sessionRef":{"provider":provider.as_str(),"sessionId":"exact-native"},
+                "namingHandle":"display-only", "tabId":"display-tab",
+                "observedEpoch":3, "observedGeneration":2,
+            })).unwrap();
+            let mut direct = serde_json::to_value(direct).unwrap();
+            for transient in [
+                "requestId",
+                "namingHandle",
+                "tabId",
+                "observedEpoch",
+                "observedGeneration",
+            ] {
+                direct.as_object_mut().unwrap().remove(transient);
+            }
+            assert_eq!(
+                first, direct,
+                "hosted provider create differs from direct {provider:?}"
+            );
+        }
+    }
 
     #[test]
     fn send_acceptance_parser_is_correlated_and_fail_closed() {

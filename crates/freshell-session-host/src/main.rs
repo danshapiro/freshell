@@ -963,7 +963,7 @@ async fn grant_execution(
                 )
                 .map_err(|error| RuntimeError::new(RuntimeErrorCode::HostUnreachable, error))?;
             }
-            let resolved_secrets = provider_secret_resolution::resolve_child_secrets(
+            let mut resolved_secrets = provider_secret_resolution::resolve_child_secrets(
                 launch.provider.as_str(),
                 &launch.provider_secret_references,
                 Path::new("/run/freshell-secrets"),
@@ -986,6 +986,11 @@ async fn grant_execution(
                     format!("prepare hosted OneCLI auth files: {error}"),
                 )
             })?;
+            providers::prepare_fresh_agent_child_environment(
+                &launch,
+                &mut resolved_secrets.environment,
+            )
+            .map_err(|error| RuntimeError::new(RuntimeErrorCode::HostUnreachable, error))?;
             freshell_platform::managed_child_secrets::install(resolved_secrets.environment)
                 .map_err(|error| RuntimeError::new(RuntimeErrorCode::HostUnreachable, error))?;
             let actor = providers::open_hosted_fresh_agent(&state.state_dir, launch.clone())
@@ -2898,6 +2903,11 @@ mod tests {
                 sandbox: None,
                 provider_store_id: "fixture-store".into(),
                 native_session_id: None,
+                plugins: None,
+                model_selection: None,
+                session_ref: None,
+                provider_launch_context: None,
+                provider_secret_references: Vec::new(),
             },
             transport.clone(),
         )

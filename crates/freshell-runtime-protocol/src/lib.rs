@@ -1258,6 +1258,17 @@ mod provider_launch_context_tests {
         let launch: FreshAgentLaunchSpec = serde_json::from_value(row).unwrap();
         assert!(launch.provider_launch_context.is_none());
         assert!(launch.provider_secret_references.is_empty());
+        assert!(launch.plugins.is_none());
+        assert!(launch.model_selection.is_none());
+        assert!(launch.session_ref.is_none());
+        let mut explicit_clear = launch;
+        explicit_clear.model_selection = Some(None);
+        let encoded = serde_json::to_value(&explicit_clear).unwrap();
+        assert!(encoded.get("modelSelection").unwrap().is_null());
+        assert_eq!(
+            serde_json::from_value::<FreshAgentLaunchSpec>(encoded).unwrap(),
+            explicit_clear
+        );
     }
 
     #[test]
@@ -1542,6 +1553,40 @@ pub enum FreshAgentFixtureTransport {
     Deterministic,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderModelSelection {
+    pub kind: String,
+    pub model_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderSessionReference {
+    pub provider: String,
+    pub session_id: String,
+}
+
+mod double_optional {
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    pub fn serialize<T: Serialize, S: Serializer>(
+        value: &Option<Option<T>>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        match value {
+            Some(inner) => inner.serialize(serializer),
+            None => serializer.serialize_none(),
+        }
+    }
+
+    pub fn deserialize<'de, T: Deserialize<'de>, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Option<Option<T>>, D::Error> {
+        Ok(Some(Option::deserialize(deserializer)?))
+    }
+}
+
 impl FreshProvider {
     pub fn as_str(&self) -> &'static str {
         match self {
@@ -1581,6 +1626,16 @@ pub struct FreshAgentLaunchSpec {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub native_session_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plugins: Option<Vec<String>>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "double_optional"
+    )]
+    pub model_selection: Option<Option<ProviderModelSelection>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_ref: Option<ProviderSessionReference>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fixture_transport: Option<FreshAgentFixtureTransport>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub provider_bootstrap_files: Vec<ProviderBootstrapFile>,
@@ -1606,6 +1661,22 @@ impl FreshAgentLaunchSpec {
             || self.workspace_path.is_empty()
             || self.run_as_uid == 0
             || self.native_session_id.as_deref().is_some_and(str::is_empty)
+            || self
+                .plugins
+                .as_ref()
+                .is_some_and(|plugins| plugins.len() > 64)
+            || self.session_ref.as_ref().is_some_and(|reference| {
+                reference.session_id.is_empty()
+                    || reference.provider
+                        != match self.provider {
+                            FreshProvider::Kilroy => "claude",
+                            _ => self.provider.as_str(),
+                        }
+                    || self
+                        .native_session_id
+                        .as_ref()
+                        .is_some_and(|native| native != &reference.session_id)
+            })
             || self.provider_bootstrap_files.len() > 16
             || self.provider_secret_references.len() > 4
         {
@@ -1629,6 +1700,28 @@ impl FreshAgentLaunchSpec {
                     "managed fresh-agent setting is oversized or contains control characters",
                 ));
             }
+        }
+        if self.plugins.as_ref().is_some_and(|plugins| {
+            plugins.iter().any(|plugin| {
+                plugin.is_empty() || plugin.len() > 1024 || plugin.chars().any(char::is_control)
+            })
+        }) || self
+            .model_selection
+            .as_ref()
+            .and_then(Option::as_ref)
+            .is_some_and(|selection| {
+                selection.kind.is_empty()
+                    || selection.model_id.is_empty()
+                    || selection.kind.len() > 256
+                    || selection.model_id.len() > 256
+                    || selection.kind.chars().any(char::is_control)
+                    || selection.model_id.chars().any(char::is_control)
+            })
+        {
+            return Err(RuntimeError::new(
+                RuntimeErrorCode::InvalidRequest,
+                "managed fresh-agent provider input is invalid",
+            ));
         }
         for file in &self.provider_bootstrap_files {
             let source = std::path::Path::new(&file.source_path);
@@ -3185,6 +3278,9 @@ mod tests {
             permission_mode: Some("ask".into()),
             sandbox: Some("workspace-write".into()),
             native_session_id: Some("native-one".into()),
+            plugins: None,
+            model_selection: None,
+            session_ref: None,
             fixture_transport: None,
             provider_bootstrap_files: Vec::new(),
             provider_secret_references: Vec::new(),

@@ -213,6 +213,13 @@ pub(crate) async fn split_pane(
             },
         };
         let request_id = uuid::Uuid::new_v4().simple().to_string();
+        let provider_inputs = match hosted_rest::provider_inputs(&body) {
+            Ok(inputs) => inputs,
+            Err(error) => {
+                let _ = state.layout.close_pane(&new_pane_id);
+                return fail_json(StatusCode::BAD_REQUEST, error);
+            }
+        };
         let cwd = body.get("cwd").and_then(Value::as_str).map(str::to_string);
         let model = body
             .get("model")
@@ -231,6 +238,10 @@ pub(crate) async fn split_pane(
                 model: model.clone(),
                 effort: effort.clone(),
                 native_session_id,
+                plugins: provider_inputs.plugins,
+                model_selection: provider_inputs.model_selection,
+                permission_mode: provider_inputs.permission_mode,
+                sandbox: provider_inputs.sandbox,
             })
             .await
         {

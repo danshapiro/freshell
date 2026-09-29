@@ -8795,6 +8795,24 @@ mod tests {
     use freshell_protocol::{AgentProvider, SessionType};
     use serde_json::json;
 
+    #[tokio::test]
+    async fn fresh_agent_operation_matrix_parity_opencode() {
+        let (tx, _rx) = tokio::sync::broadcast::channel::<String>(16);
+        let owner = FreshAgentState::new(Arc::new("fixture-token".into()), Arc::new(tx));
+        let state = FreshOpencodeState::new(owner.clone());
+        state
+            .handle_create(create_msg("operation-matrix"), None)
+            .await;
+        let snapshot = owner
+            .get_opencode_snapshot("freshopencode-operation-matrix", None)
+            .await
+            .expect("placeholder snapshot");
+        assert_eq!(snapshot["capabilities"]["send"], true);
+        assert_eq!(snapshot["capabilities"]["interrupt"], true);
+        assert_eq!(snapshot["capabilities"]["approvals"], false);
+        assert_eq!(snapshot["capabilities"]["questions"], false);
+    }
+
     // ── fakes (no real `opencode` process, no network) ──────────────────────
 
     /// Fakes `/session` create (returns a fresh incrementing `ses_N` id each call) and

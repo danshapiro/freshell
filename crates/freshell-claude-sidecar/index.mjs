@@ -412,6 +412,9 @@ function handleCreate(req) {
         // still controls whether approval is required for each tool.
         allowDangerouslySkipPermissions: true,
         effort: req.effort,
+        plugins: Array.isArray(req.plugins)
+          ? req.plugins.map(path => ({ type: 'local', path }))
+          : undefined,
         pathToClaudeCodeExecutable: process.env.CLAUDE_CMD || undefined,
         includePartialMessages: true,
         abortController: abort,

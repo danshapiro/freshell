@@ -6,6 +6,34 @@ use freshell_runtime_protocol::{
 };
 use tokio::net::UnixListener;
 
+#[test]
+fn hosted_created_frame_uses_the_public_request_identity() {
+    let (broadcast, mut receiver) = broadcast::channel(8);
+    let proxy = HostedFreshAgentProxy {
+        client: RuntimeClient::new("/tmp/unopened-fresh-agent-proxy.sock", "fixture"),
+        broadcast: Arc::new(broadcast),
+        aliases: Mutex::new(HashMap::new()),
+        presentation_ids: Mutex::new(HashMap::new()),
+        pollers: Mutex::new(HashSet::new()),
+        fixture_modes: HashSet::new(),
+        naming: OnceLock::new(),
+    };
+    proxy.forward_host_event(
+        AgentEvent::Provider {
+            payload: serde_json::json!({
+                "type":"freshAgent.created", "requestId":"host-internal", "sessionId":"native"
+            }),
+        },
+        "claude",
+        "public",
+        "freshclaude",
+    );
+    assert!(
+        receiver.try_recv().is_err(),
+        "internal create ID must not reach the client"
+    );
+}
+
 #[tokio::test]
 async fn managed_recovery_stop_refuses_without_contacting_the_host() {
     let dir = tempfile::tempdir().unwrap();
@@ -20,6 +48,7 @@ async fn managed_recovery_stop_refuses_without_contacting_the_host() {
         presentation_ids: Mutex::new(HashMap::new()),
         pollers: Mutex::new(HashSet::new()),
         fixture_modes: HashSet::new(),
+        naming: OnceLock::new(),
     });
 
     proxy
@@ -293,6 +322,7 @@ async fn managed_provider_fork_rekeys_the_same_soul_without_launch_or_stop() {
         presentation_ids: Mutex::new(HashMap::from([(soul.clone(), "public-parent".into())])),
         pollers: Mutex::new(HashSet::new()),
         fixture_modes: HashSet::new(),
+        naming: std::sync::OnceLock::new(),
     });
     Arc::clone(&proxy)
         .handle(HostedFreshAgentCommand::Fork(FreshAgentFork {

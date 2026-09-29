@@ -256,6 +256,11 @@ fn profile(provider: FreshProvider, store: &str, native: Option<&str>) -> FreshA
         sandbox: Some("workspace-write".into()),
         provider_store_id: store.into(),
         native_session_id: native.map(str::to_string),
+        plugins: None,
+        model_selection: None,
+        session_ref: None,
+        provider_launch_context: None,
+        provider_secret_references: Vec::new(),
     }
 }
 
@@ -309,7 +314,7 @@ async fn semantic_operations_are_durable_idempotent_and_conflict_on_changed_payl
 }
 
 #[tokio::test]
-async fn unsupported_semantic_operation_is_rejected_before_journal_or_transport_mutation() {
+async fn operation_support_rejects_unsupported_before_journal_or_transport_mutation() {
     let dir = tempfile::tempdir().unwrap();
     let transport = Arc::new(OperationTransport {
         operations: std::sync::Mutex::new(Vec::new()),
