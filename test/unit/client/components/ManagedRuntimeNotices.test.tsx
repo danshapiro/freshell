@@ -1,6 +1,6 @@
 import { configureStore } from '@reduxjs/toolkit'
 import { Provider } from 'react-redux'
-import { act, cleanup, render, screen, waitFor } from '@testing-library/react'
+import { cleanup, render, screen, waitFor } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
@@ -8,8 +8,6 @@ import connectionReducer from '@/store/connectionSlice'
 import managedRuntimeReducer from '@/store/managedRuntimeSlice'
 import tabRegistryReducer from '@/store/tabRegistrySlice'
 import {
-  MANAGED_RUNTIME_NOTICE_AUTO_ACK_MS,
-  MANAGED_RUNTIME_NOTICE_POLL_MS,
   ManagedRuntimeNotices,
   noticeProfileId,
 } from '@/components/ManagedRuntimeNotices'
@@ -99,70 +97,46 @@ describe('ManagedRuntimeNotices', () => {
     vi.useRealTimers()
   })
 
-  it('marks a stable per-profile notice rendered and records explicit dismissal', async () => {
+  it('silently acknowledges routine notices and leaves no popup behind', async () => {
     apiMocks.getManagedRuntimeNotices.mockResolvedValue([{
       noticeId: 'notice-one',
       kind: 'cleanup_succeeded',
-      message: 'Found and cleaned up 1 lost agent process. Details are in the server logs. Reference: ABCD1234.',
-      reference: 'ABCD1234',
+      message: 'Found and cleaned up 1 lost agent process.',
+      reference: 'SUCCESS01',
       incidentIds: ['incident-one'],
       deliveryState: 'pending',
       createdAt: '2026-09-08T00:00:00.000Z',
+    }, {
+      noticeId: 'notice-two',
+      kind: 'ended_without_process',
+      message: 'The managed agent ended without a running process.',
+      reference: 'ENDED001',
+      incidentIds: [],
+      deliveryState: 'pending',
+      createdAt: '2026-09-08T00:00:01.000Z',
     }])
     renderNotices()
 
-    expect(await screen.findByRole('status')).toHaveTextContent('Found and cleaned up 1 lost agent process')
     await waitFor(() => {
       expect(apiMocks.recordManagedRuntimeNoticeReceipt).toHaveBeenCalledWith(
         'notice-one',
         noticeProfileId('device-notice-test'),
-        'rendered',
+        'acknowledged',
       )
-    })
-    await userEvent.click(screen.getByRole('button', { name: 'Details' }))
-    expect(await screen.findByText(/provider state was missing/)).toBeVisible()
-    await userEvent.click(screen.getByRole('button', { name: 'Dismiss' }))
-    await waitFor(() => {
       expect(apiMocks.recordManagedRuntimeNoticeReceipt).toHaveBeenCalledWith(
-        'notice-one',
+        'notice-two',
         noticeProfileId('device-notice-test'),
-        'dismissed',
+        'acknowledged',
       )
     })
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument()
     expect(screen.queryByRole('status')).not.toBeInTheDocument()
+    expect(screen.queryByText('Managed agent recovery')).not.toBeInTheDocument()
+    expect(screen.queryByText(/Resource limits and usage/i)).not.toBeInTheDocument()
+    expect(screen.queryByText('soul-one')).not.toBeInTheDocument()
   })
 
-  it('poll refreshes do not postpone the stable notice auto-ack deadline', async () => {
-    vi.useFakeTimers()
-    apiMocks.getManagedRuntimeNotices.mockImplementation(async () => [{
-      noticeId: 'notice-stable',
-      kind: 'cleanup_succeeded',
-      message: 'Found and cleaned up 1 lost agent process. Details are in the server logs. Reference: STABLE01.',
-      reference: 'STABLE01',
-      incidentIds: ['incident-one'],
-      deliveryState: 'rendered',
-      createdAt: '2026-09-08T00:00:00.000Z',
-    }])
-    renderNotices()
-    await act(async () => {
-      await Promise.resolve()
-      await Promise.resolve()
-    })
-    for (let elapsed = 0; elapsed < MANAGED_RUNTIME_NOTICE_AUTO_ACK_MS; elapsed += MANAGED_RUNTIME_NOTICE_POLL_MS) {
-      await act(async () => {
-        await vi.advanceTimersByTimeAsync(MANAGED_RUNTIME_NOTICE_POLL_MS)
-      })
-    }
-    expect(apiMocks.getManagedRuntimeNotices.mock.calls.length).toBeGreaterThan(2)
-    expect(apiMocks.recordManagedRuntimeNoticeReceipt).toHaveBeenCalledWith(
-      'notice-stable',
-      noticeProfileId('device-notice-test'),
-      'acknowledged',
-    )
-  })
-
-  it('auto-acknowledges only after the notice remained visible long enough', async () => {
-    vi.useFakeTimers()
+  it('renders cleanup failures as an actionable amber alert without auto-acknowledging', async () => {
     apiMocks.getManagedRuntimeNotices.mockResolvedValue([{
       noticeId: 'notice-failed',
       kind: 'cleanup_failed',
@@ -173,23 +147,33 @@ describe('ManagedRuntimeNotices', () => {
       createdAt: '2026-09-08T00:00:00.000Z',
     }])
     renderNotices()
-    await act(async () => {
-      await Promise.resolve()
-      await Promise.resolve()
+    const alert = await screen.findByRole('alert')
+    expect(alert).toHaveTextContent('No unrelated process was touched')
+    expect(alert).toHaveClass('border-amber-500/50', 'bg-amber-500/10')
+    expect(screen.getByRole('button', { name: 'Details' })).toBeVisible()
+    expect(screen.getByRole('button', { name: 'Dismiss' })).toBeVisible()
+    await waitFor(() => {
+      expect(apiMocks.recordManagedRuntimeNoticeReceipt).toHaveBeenCalledWith(
+        'notice-failed',
+        noticeProfileId('device-notice-test'),
+        'rendered',
+      )
     })
-    expect(screen.getByRole('alert')).toHaveTextContent('No unrelated process was touched')
     expect(apiMocks.recordManagedRuntimeNoticeReceipt).not.toHaveBeenCalledWith(
       'notice-failed',
       expect.any(String),
       'acknowledged',
     )
-    await act(async () => {
-      await vi.advanceTimersByTimeAsync(MANAGED_RUNTIME_NOTICE_AUTO_ACK_MS)
+    await userEvent.click(screen.getByRole('button', { name: 'Details' }))
+    expect(await screen.findByText(/provider state was missing/)).toBeVisible()
+    await userEvent.click(screen.getByRole('button', { name: 'Dismiss' }))
+    await waitFor(() => {
+      expect(apiMocks.recordManagedRuntimeNoticeReceipt).toHaveBeenCalledWith(
+        'notice-failed',
+        noticeProfileId('device-notice-test'),
+        'dismissed',
+      )
     })
-    expect(apiMocks.recordManagedRuntimeNoticeReceipt).toHaveBeenCalledWith(
-      'notice-failed',
-      noticeProfileId('device-notice-test'),
-      'acknowledged',
-    )
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument()
   })
 })
