@@ -24,6 +24,7 @@ import {
   RECONCILE_NOTICE_FRESH_BY_RACE,
   repairCodexIdentityMismatch,
   resetPaneForReconcileCreate,
+  startNewManagedRuntimeConversation,
   setPaneCrashTrace,
   setPaneLaunchFailure,
   clearPaneCrashTrace,
@@ -31,6 +32,9 @@ import {
   updatePaneContent,
   updatePaneTitle,
 } from '@/store/panesSlice'
+import { retryManagedRuntimeSoul } from '@/lib/api'
+import { queueManagedRuntimeRefresh } from '@/lib/recovery/managed-runtime-recovery'
+import { isManagedRuntimeRecoveryDecision, ManagedRuntimeRecoveryCard } from '@/components/ManagedRuntimeRecoveryCard'
 import { buildReconcileRequestForPanes, foldVerdicts } from '@/lib/pane-reconcile'
 import type { PaneReconcileRequest, SessionRuntimeOwnerMessage } from '@shared/ws-protocol'
 import {
@@ -72,7 +76,7 @@ import { focusNextTerminalSearchMatch, focusPreviousTerminalSearchMatch, loadTer
 import { isFatalConnectionErrorCode } from '@/store/connectionSlice'
 import { flushPersistedLayoutNow } from '@/store/persistControl'
 import { getWsClient, RECONCILE_VERDICT_WAIT_MS } from '@/lib/ws-client'
-import { resolveTerminalKillFence, sendTerminalKill } from '@/lib/terminal-kill'
+import { resolveTerminalKillFence } from '@/lib/terminal-kill'
 import { foldRefusalFencePair, hasRefusalFencePair, STALE_REFUSAL_MESSAGE_PREFIX } from '@/lib/owner-fence-heal'
 import type { RefusalFencePair } from '@/lib/owner-fence-heal'
 import { sendTerminalKillAndAwait, type KillAck } from '@/lib/kill-ack'
@@ -3458,6 +3462,15 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
     opts?: AttachTerminalOptions,
   ) => {
     if (suppressNetworkEffects) return
+    if (isManagedRuntimeRecoveryDecision(contentRef.current?.recoverySummary)) {
+      log.debug('attach gate declined: managed runtime recovery requires an explicit decision', {
+        terminalId: tid,
+        paneId: paneIdRef.current,
+        intent,
+        recoveryState: contentRef.current?.recoverySummary?.recoveryState,
+      })
+      return
+    }
     // kata b8ke (round-1 review — convergence is bidirectional): while the
     // canonical session's runtime owner is a FRESH-AGENT runtime, this pane's
     // terminal was reaped by the handoff — stop treating it as live. The
@@ -3908,6 +3921,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
     const currentContent = contentRef.current
     if (!tid || !currentContent) return false
     if (!paneRefreshTargetMatchesContent(request.target, currentContent)) return false
+    if (isManagedRuntimeRecoveryDecision(currentContent.recoverySummary)) return false
 
     handledRefreshRequestIdRef.current = request.requestId
     // An explicit pane refresh is user intent, not automatic recovery cycling:
@@ -4066,6 +4080,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
   useEffect(() => {
     if (suppressNetworkEffects) return
     if (!isTerminal || !terminalContent) return
+    if (isManagedRuntimeRecoveryDecision(terminalContent.recoverySummary)) return
     if (shouldWaitForProviderBehavior) return
     const termCandidate = termRef.current
     if (!termCandidate) return
@@ -4145,6 +4160,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
     }
 
     const sendCreate = (requestId: string) => {
+      if (isManagedRuntimeRecoveryDecision(contentRef.current?.recoverySummary)) return
       // Reconcile verdict precedence (Task 12): a folded respawn verdict's
       // server-named sessionRef WINS over any other inference (restore flag,
       // fresh-recovery intent); a folded fresh verdict omits resume identity
@@ -4423,6 +4439,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
         restore: boolean,
         deadTerminalId: string | undefined,
       ): boolean => {
+        if (isManagedRuntimeRecoveryDecision(contentRef.current?.recoverySummary)) return true
         const reqId = requestIdRef.current
         if (!reqId) return false
         if (restore) addTerminalRestoreRequestId(reqId)
@@ -4460,6 +4477,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
       // error card for a standoff, never a silent wedge, never a duplicate
       // (the reconcile verdict is folded, not blindly re-created).
       const resolveReserveExhaustionViaReconcile = () => {
+        if (isManagedRuntimeRecoveryDecision(contentRef.current?.recoverySummary)) return
         resetReconcileRedrive()
         const request = buildReconcileRequestForPanes(appStore.getState(), [
           { tabId, paneId: paneIdRef.current },
@@ -4475,6 +4493,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
       }
 
       const redriveAfterSessionReserved = (requestId: string, retryAfterMs?: number) => {
+        if (isManagedRuntimeRecoveryDecision(contentRef.current?.recoverySummary)) return
         const redriveState = reconcileRedriveRef.current
         const now = Date.now()
         if (redriveState.reserveWindowStart === null) {
@@ -4493,6 +4512,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
           redriveState.timer = null
           if (requestIdRef.current !== requestId) return
           if (terminalIdRef.current) return // anchored meanwhile
+          if (isManagedRuntimeRecoveryDecision(contentRef.current?.recoverySummary)) return
           // Re-send the SAME terminal.create — createRequestId is NEVER
           // re-minted (council rule 2).
           sendCreate(requestId)
@@ -4516,6 +4536,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
       // let the lifecycle effect's createRequestId dependency re-fire the
       // resume create.
       const resumeRecoveryCreate = (deadTerminalId?: string) => {
+        if (isManagedRuntimeRecoveryDecision(contentRef.current?.recoverySummary)) return
         writeLocalXtermNotice(term, '\r\n[Reconnecting...]\r\n')
         const newRequestId = nanoid()
         if (debugRef.current) log.debug('[TRACE resumeSessionId] recovery-create', {
@@ -4561,6 +4582,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
       // points at. Pump bounded same-requestId re-creates instead of minting a
       // fresh recovery identity for a pane that never finished launching.
       const redriveAfterLaunchInvalidTerminal = (deadTerminalId: string | undefined): boolean => {
+        if (isManagedRuntimeRecoveryDecision(contentRef.current?.recoverySummary)) return true
         const requestId = requestIdRef.current
         if (!requestId) return false
         const redriveState = reconcileRedriveRef.current
@@ -4593,6 +4615,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
         const attempt = () => {
           if (requestIdRef.current !== requestId) return
           if (terminalIdRef.current) return // anchored — stop the pump
+          if (isManagedRuntimeRecoveryDecision(contentRef.current?.recoverySummary)) return
           if (redriveState.invalidAttempts >= INVALID_TERMINAL_LAUNCH_RETRY_MAX_ATTEMPTS) {
             failLaunch('The server no longer knows this terminal and recreating it kept failing.', true)
             return
@@ -4608,6 +4631,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
       }
 
       unsub = ws.onMessage((msg) => {
+        if (isManagedRuntimeRecoveryDecision(contentRef.current?.recoverySummary)) return
         const tid = terminalIdRef.current
         const reqId = requestIdRef.current
 
@@ -6983,6 +7007,8 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
     shouldWaitForProviderBehavior,
     terminalContent?.createRequestId,
     terminalContent?.reconcileEpoch,
+    terminalContent?.recoverySummary?.desiredState,
+    terminalContent?.recoverySummary?.recoveryState,
     // reconcilePendingSince: re-run when the pane's pre-verdict wait state
     // changes -- the verdict fold (or the bounded timeout) clears the entry
     // and the deferred mount-create must then proceed (Task 8).
@@ -7130,10 +7156,10 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
   // inherit the abandoned close identity and be omitted from recovery
   // after a server restart. The remint is the terminal lane's
   // clearTerminalContentForRecreate semantics (the dead-live-handle
-  // recovery's path) driven through updateContent: a fresh-nanoid
-  // createRequestId — the lifecycle effect re-fires sendCreate on the id
-  // change itself, so no reconcileEpoch bump (that is only the same-id
-  // fold's signal) — with the live handles cleared, status 'creating', and
+  // recovery's path) driven through the explicit start-new reducer: a
+  // fresh-nanoid createRequestId — the lifecycle effect re-fires sendCreate
+  // on the id change itself, so no reconcileEpoch bump (that is only the
+  // same-id fold's signal) — with the live handles cleared, status 'creating', and
   // the abandoned session identity + presentation state cleared
   // (startFreshConversation semantics: sessionRef / resumeSessionId /
   // codexDurability, plus the znhn#1 rule that the retired session's
@@ -7141,24 +7167,17 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
   const startFreshFromStuckPane = useCallback(async () => {
     const ack = await killStuckTerminalAndAwait('fresh')
     if (!ack) return
-    updateContent({
-      createRequestId: nanoid(),
-      terminalId: undefined,
-      serverInstanceId: undefined,
-      streamId: undefined,
-      status: 'creating',
-      sessionRef: undefined,
-      resumeSessionId: undefined,
-      codexDurability: undefined,
-      crashTrace: undefined,
-      restoreError: undefined,
-      launchFailure: undefined,
-      handoffError: undefined,
-      // A user-driven fresh start is not a reconcile-verdict result — a
-      // stale verdict flag must never steer the new create.
-      pendingReconcile: undefined,
-    })
-  }, [killStuckTerminalAndAwait, updateContent])
+    dispatch(startNewManagedRuntimeConversation({ tabId, paneId }))
+  }, [dispatch, killStuckTerminalAndAwait, paneId, tabId])
+
+  const retryManagedRecovery = useCallback(async () => {
+    const current = contentRef.current
+    if (!current?.soulId || typeof current.soulIntentRevision !== 'number') {
+      throw new Error('Managed recovery is missing its current revision.')
+    }
+    await retryManagedRuntimeSoul(current.soulId, current.soulIntentRevision)
+    await queueManagedRuntimeRefresh(appStore, 'pane-recovery-retry')
+  }, [appStore])
 
   // NOW we can do the conditional return - after all hooks
   if (!isTerminal || !terminalContent) {
@@ -7166,6 +7185,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
   }
 
   const hasFatalConnectionError = isFatalConnectionErrorCode(connectionErrorCode)
+  const managedRecoveryDecision = isManagedRuntimeRecoveryDecision(terminalContent.recoverySummary)
   const showBlockingSpinner = terminalContent.status === 'creating' && !hasFatalConnectionError
   const showInlineOfflineStatus = connectionStatus !== 'ready' && !hasFatalConnectionError
   const showInlineRecoveringStatus = connectionStatus === 'ready' && isAttaching && terminalContent.status !== 'creating' && !wasCreatedFreshRef.current
@@ -7213,7 +7233,8 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
     && terminalRuntimeOwner?.ownerKind === 'vacant'
   )
   const showExitBanner = Boolean(
-    isAgentPane && (activeNotice || terminalContent.crashTrace || settledDead || killedSessionVacant)
+    !managedRecoveryDecision
+    && isAgentPane && (activeNotice || terminalContent.crashTrace || settledDead || killedSessionVacant)
   )
 
   // ── kata b8ke: typed recovery surfaces ──
@@ -7261,6 +7282,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
     : undefined
 
   const retryLaunch = () => {
+    if (managedRecoveryDecision) return
     // The Relaunch discipline: a reconcile-driven respawn create re-fires
     // the lifecycle effect (the reconcileEpoch bump is its ONLY re-fire
     // signal — createRequestId is preserved, never re-minted).
@@ -7273,6 +7295,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
   }
 
   const attachToNamedTerminal = () => {
+    if (managedRecoveryDecision) return
     const terminalId = terminalContent.launchFailure?.terminalId
     if (!terminalId) return
     dispatch(applyReattachToLiveTerminal({ tabId, paneId, terminalId }))
@@ -7281,17 +7304,11 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
   // b8ke ext r16 F3: the typed missing state's explicit START-FRESH
   // action — the ONLY new-session path (operator-initiated, clearly a NEW
   // conversation, never a resume). The stale sessionRef is cleared (a
-  // fresh create spawns identity-less) and the reconcileEpoch bump
-  // re-fires the lifecycle effect into a genuinely new create.
+  // fresh create spawns identity-less). The explicit start-new transition
+  // mints a new create key and clears the managed projection before the
+  // lifecycle effect drives the genuinely new create.
   const startFreshConversation = () => {
-    dispatch(resetPaneForReconcileCreate({
-      tabId,
-      paneId,
-      // 'fresh' clears sessionRef/resumeSessionId/codexDurability — a
-      // genuinely new identity-less conversation.
-      intent: 'fresh',
-      reason: 'session_missing',
-    }))
+    dispatch(startNewManagedRuntimeConversation({ tabId, paneId }))
   }
 
   return (
@@ -7399,6 +7416,15 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
             appStore={appStore}
             tabId={tabId}
             paneId={paneId}
+          />
+        </div>
+      ) : null}
+      {isManagedRuntimeRecoveryDecision(terminalContent.recoverySummary) ? (
+        <div className="pointer-events-auto absolute inset-x-0 top-0 z-20 m-2">
+          <ManagedRuntimeRecoveryCard
+            recoverySummary={terminalContent.recoverySummary}
+            onRetry={retryManagedRecovery}
+            onStartFresh={startFreshConversation}
           />
         </div>
       ) : null}
@@ -7529,6 +7555,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
       {terminalContent
         && terminalContent.mode !== 'shell'
         && terminalContent.status === 'running'
+        && !managedRecoveryDecision
         && stuckEntry !== undefined ? (
         <div className="pointer-events-auto absolute inset-x-0 top-0 z-20 m-2">
           <TerminalStuckCard

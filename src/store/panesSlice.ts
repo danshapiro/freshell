@@ -674,6 +674,25 @@ function findReconcilePaneContent(
   return undefined
 }
 
+/** Clear supervisor-owned identity/projection fields for a user-chosen new
+ * conversation. Reconcile folds deliberately do not use this helper: those
+ * folds preserve the existing create key and managed identity until the
+ * supervisor supplies the next authoritative projection. */
+function clearManagedRuntimeProjection(
+  content: TerminalPaneContent | FreshAgentPaneContent,
+): void {
+  content.soulId = undefined
+  content.incarnationId = undefined
+  content.runtimeState = undefined
+  content.viewIntentId = undefined
+  content.viewIntentRevision = undefined
+  content.soulIntentRevision = undefined
+  content.incidentId = undefined
+  content.placementGroup = undefined
+  content.resourceSummary = undefined
+  content.recoverySummary = undefined
+}
+
 function freshAgentPaneMatchesMaterializedSession(
   content: FreshAgentPaneContent,
   materialized: FreshAgentSessionMaterializedPayload,
@@ -1868,6 +1887,64 @@ export const panesSlice = createSlice({
       reconcileRefreshRequestsForTab(state, tabId)
     },
 
+    /**
+     * Start a genuinely new user-chosen conversation after the old one has
+     * been closed or certified lost. This is intentionally separate from
+     * reconcile folds: a deliberate new conversation mints a new lifecycle
+     * key and drops every managed-runtime projection so an old inventory
+     * snapshot cannot reattach the retired soul.
+     */
+    startNewManagedRuntimeConversation: (
+      state,
+      action: PayloadAction<{ tabId: string; paneId: string }>,
+    ) => {
+      const { tabId, paneId } = action.payload
+      const root = state.layouts[tabId]
+      if (!root) return
+      if (refuseRekeyWhileClosing(state, tabId, paneId, 'startNewManagedRuntimeConversation')) return
+
+      const leaf = findLeaf(root, paneId)
+      if (!leaf || (leaf.content.kind !== 'terminal' && leaf.content.kind !== 'fresh-agent')) return
+
+      const content = leaf.content
+      if (content.kind === 'terminal') {
+        content.terminalId = undefined
+        content.serverInstanceId = undefined
+        content.streamId = undefined
+        content.status = 'creating'
+        content.createRequestId = nanoid()
+        content.sessionRef = undefined
+        content.resumeSessionId = undefined
+        content.codexDurability = undefined
+        content.restoreError = undefined
+        content.reconcileNotice = undefined
+        content.pendingReconcile = undefined
+        content.reconcileEpoch = undefined
+        content.crashTrace = undefined
+        content.launchFailure = undefined
+        content.handoffError = undefined
+        clearManagedRuntimeProjection(content)
+      } else {
+        content.sessionId = undefined
+        content.serverInstanceId = undefined
+        content.status = 'creating'
+        content.createRequestId = nanoid()
+        content.sessionRef = undefined
+        content.resumeSessionId = undefined
+        content.restoreError = undefined
+        content.createError = undefined
+        content.reconcileNotice = undefined
+        content.pendingReconcile = undefined
+        content.reconcileEpoch = undefined
+        content.pendingLocalEcho = undefined
+        content.handoffError = undefined
+        content.namingHandle = undefined
+        content.nameRef = undefined
+        clearManagedRuntimeProjection(content)
+      }
+      reconcileRefreshRequestsForTab(state, tabId)
+    },
+
     requestPaneRefresh: (
       state,
       action: PayloadAction<{ tabId: string; paneId: string }>
@@ -2884,6 +2961,7 @@ export const {
   resetPaneForReconcileCreate,
   applyFreshAgentReconcileAttach,
   resetFreshAgentPaneForReconcileCreate,
+  startNewManagedRuntimeConversation,
   setPaneReconcileNotice,
   clearPaneReconcileNotice,
   setPaneCloseError,
