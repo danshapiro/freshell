@@ -41,6 +41,11 @@ const RETIRE_TIMEOUT: Duration = Duration::from_secs(20);
 const EVENT_CHANNEL_CAPACITY: usize = 256;
 const HOST_ACTOR_STATE_DIR: &str = "/run/freshell-host-actor";
 
+#[cfg(test)]
+trait HostedTransportTestDelegate: FreshAgentTransport {
+    fn record_provider_create(&self, create: &FreshAgentCreate);
+}
+
 enum ProviderState {
     Claude(FreshClaudeState),
     Codex(FreshCodexState),
@@ -63,7 +68,7 @@ struct HostedTransport {
     event_tx: mpsc::Sender<AgentEvent>,
     event_rx: std::sync::Mutex<Option<mpsc::Receiver<AgentEvent>>>,
     #[cfg(test)]
-    test_delegate: Option<Arc<dyn FreshAgentTransport>>,
+    test_delegate: Option<Arc<dyn HostedTransportTestDelegate>>,
 }
 
 pub(crate) async fn open_hosted_fresh_agent(
@@ -222,7 +227,7 @@ impl HostedTransport {
     #[cfg(test)]
     async fn with_test_delegate(
         provider: FreshProvider,
-        delegate: Arc<dyn FreshAgentTransport>,
+        delegate: Arc<dyn HostedTransportTestDelegate>,
     ) -> Arc<Self> {
         let mut hosted = Self::new_with_context(provider, None).await;
         Arc::get_mut(&mut hosted)
@@ -402,9 +407,11 @@ impl FreshAgentTransport for HostedTransport {
     async fn start(&self, profile: &FreshAgentProfile) -> Result<TransportStart, String> {
         #[cfg(test)]
         if let Some(delegate) = self.test_delegate.as_ref() {
-            // Exercise the production hosted create builder even when the
-            // lower provider handler is replaced by the recorder.
-            let _provider_create = create_request_for_profile(profile);
+            // Capture the actual hosted request before the provider handler is
+            // replaced by the recorder. This is the same value the production
+            // branch below passes to `handle_create`.
+            let provider_create = create_request_for_profile(profile);
+            delegate.record_provider_create(&provider_create);
             return delegate.start(profile).await;
         }
         *self.profile.lock().expect("profile lock") = Some(profile.clone());
@@ -1303,6 +1310,14 @@ mod tests {
     }
 
     impl ParityFixtureTransport {
+        fn record_provider_create(&self, create: &FreshAgentCreate) {
+            self.trace.record(
+                "provider_create_request",
+                serde_json::to_value(create).expect("provider create serializes"),
+                "submitted",
+            );
+        }
+
         fn native_id(&self, profile: &FreshAgentProfile) -> String {
             self.trace
                 .native_session_id
@@ -1590,6 +1605,12 @@ mod tests {
         }
     }
 
+    impl HostedTransportTestDelegate for ParityFixtureTransport {
+        fn record_provider_create(&self, create: &FreshAgentCreate) {
+            ParityFixtureTransport::record_provider_create(self, create);
+        }
+    }
+
     fn parity_profile(provider: FreshProvider) -> FreshAgentProfile {
         let preparation = match provider {
             FreshProvider::Claude => ProviderPreparation::Claude {
@@ -1675,49 +1696,47 @@ mod tests {
         ]
     }
 
-    fn parity_direct_create(profile: &FreshAgentProfile) -> FreshAgentCreate {
-        FreshAgentCreate {
-            request_id: format!("direct-create-{}", profile.provider.as_str()),
-            observed_epoch: Some(7),
-            observed_generation: Some(3),
-            naming_handle: Some("display-only-name-handle".into()),
-            session_type: match profile.provider {
-                FreshProvider::Claude => SessionType::Freshclaude,
-                FreshProvider::Codex => SessionType::Freshcodex,
-                FreshProvider::Opencode => SessionType::Freshopencode,
-                FreshProvider::Kilroy => unreachable!(),
-            },
-            cwd: Some(profile.cwd.clone()),
-            effort: profile.effort.clone(),
-            legacy_restore_context: None,
-            model: profile.model.clone(),
-            model_selection: profile.model_selection.as_ref().map(|selection| {
-                selection
-                    .as_ref()
-                    .map(|selection| freshell_protocol::ModelSelection {
-                        kind: selection.kind.clone(),
-                        model_id: selection.model_id.clone(),
-                    })
-            }),
-            permission_mode: profile.permission_mode.clone(),
-            plugins: profile.plugins.clone(),
-            provider: Some(match profile.provider {
-                FreshProvider::Claude => AgentProvider::Claude,
-                FreshProvider::Codex => AgentProvider::Codex,
-                FreshProvider::Opencode => AgentProvider::Opencode,
-                FreshProvider::Kilroy => unreachable!(),
-            }),
-            resume_session_id: None,
-            sandbox: profile.sandbox.as_deref().and_then(parse_sandbox),
-            session_ref: profile
-                .session_ref
-                .as_ref()
-                .map(|reference| SessionLocator {
-                    provider: reference.provider.clone(),
-                    session_id: reference.session_id.clone(),
-                }),
-            tab_id: Some("display-only-tab".into()),
-        }
+    fn direct_ingress_create(profile: &FreshAgentProfile) -> FreshAgentCreate {
+        let session_type = match profile.provider {
+            FreshProvider::Claude => "freshclaude",
+            FreshProvider::Codex => "freshcodex",
+            FreshProvider::Opencode => "freshopencode",
+            FreshProvider::Kilroy => unreachable!(),
+        };
+        let provider = match profile.provider {
+            FreshProvider::Claude => AgentProvider::Claude,
+            FreshProvider::Codex => AgentProvider::Codex,
+            FreshProvider::Opencode => AgentProvider::Opencode,
+            FreshProvider::Kilroy => unreachable!(),
+        };
+        // Model the direct route's decoded wire message, then pass it through
+        // the same shared ingress helper used by the live WebSocket handler.
+        let create = serde_json::from_value(json!({
+            "requestId": format!("direct-create-{}", profile.provider.as_str()),
+            "observedEpoch": 7,
+            "observedGeneration": 3,
+            "namingHandle": "display-only-name-handle",
+            "sessionType": session_type,
+            "cwd": profile.cwd,
+            "effort": profile.effort,
+            "model": profile.model,
+            "modelSelection": profile.model_selection.as_ref().map(|selection| selection.as_ref().map(|selection| json!({
+                "kind": selection.kind,
+                "modelId": selection.model_id,
+            }))),
+            "permissionMode": profile.permission_mode,
+            "plugins": profile.plugins,
+            "provider": provider,
+            "sandbox": profile.sandbox.as_deref().and_then(parse_sandbox),
+            "sessionRef": profile.session_ref.as_ref().map(|reference| json!({
+                "provider": reference.provider,
+                "sessionId": reference.session_id,
+            })),
+            "tabId": "display-only-tab",
+        }))
+        .expect("direct route wire request deserializes");
+        freshell_protocol::direct_provider_create(create)
+            .expect("fixture uses the direct provider ingress")
     }
 
     fn direct_profile_from_create(
@@ -1794,6 +1813,8 @@ mod tests {
         transport: Arc<ParityFixtureTransport>,
         profile: &mut FreshAgentProfile,
     ) {
+        let direct_create = direct_ingress_create(profile);
+        transport.record_provider_create(&direct_create);
         transport.start(profile).await.unwrap();
         transport
             .dispatch(
@@ -1844,6 +1865,8 @@ mod tests {
             }
         }
         Arc::clone(&transport).stop().await.unwrap();
+        let direct_resume_create = direct_ingress_create(profile);
+        transport.record_provider_create(&direct_resume_create);
         transport.start(profile).await.unwrap();
     }
 
@@ -1930,26 +1953,9 @@ mod tests {
             FreshProvider::Opencode,
         ] {
             let seed_profile = parity_profile(provider.clone());
-            let direct_create = parity_direct_create(&seed_profile);
+            let direct_create = direct_ingress_create(&seed_profile);
             let direct_profile = direct_profile_from_create(&direct_create, &seed_profile);
             let hosted_profile = parity_hosted_profile(&seed_profile);
-            let mut direct_wire = serde_json::to_value(direct_create).unwrap();
-            let mut hosted_wire =
-                serde_json::to_value(create_request_for_profile(&hosted_profile)).unwrap();
-            for field in [
-                "requestId",
-                "namingHandle",
-                "tabId",
-                "observedEpoch",
-                "observedGeneration",
-            ] {
-                direct_wire.as_object_mut().unwrap().remove(field);
-                hosted_wire.as_object_mut().unwrap().remove(field);
-            }
-            assert_eq!(
-                direct_wire, hosted_wire,
-                "provider create request differs for {provider:?}"
-            );
             let mut hosted_provider_profile = hosted_profile.clone();
             hosted_provider_profile
                 .provider_launch_context
@@ -1986,8 +1992,32 @@ mod tests {
 
             let direct_rows = trace.rows("direct");
             let hosted_rows = trace.rows("hosted");
+            let normalized_create_requests = |rows: &[TransportObservation]| {
+                rows.iter()
+                    .filter(|row| row.operation == "provider_create_request")
+                    .map(|row| {
+                        let mut request = row.input.clone();
+                        for field in [
+                            "requestId",
+                            "namingHandle",
+                            "tabId",
+                            "observedEpoch",
+                            "observedGeneration",
+                        ] {
+                            request.as_object_mut().unwrap().remove(field);
+                        }
+                        request
+                    })
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(
+                normalized_create_requests(&direct_rows),
+                normalized_create_requests(&hosted_rows),
+                "actual direct-ingress and HostedTransport create requests differ for {provider:?}"
+            );
             let project = |rows: Vec<TransportObservation>| {
                 rows.into_iter()
+                    .filter(|row| row.operation != "provider_create_request")
                     .map(|row| (row.operation, row.input, row.result))
                     .collect::<Vec<_>>()
             };

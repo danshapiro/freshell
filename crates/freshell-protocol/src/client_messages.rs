@@ -906,6 +906,21 @@ pub struct FreshAgentCreate {
     pub naming_handle: Option<String>,
 }
 
+/// Apply the provider-specific direct WebSocket ingress rule to a decoded
+/// fresh-agent create. Direct provider routes accept Claude, Codex, and
+/// OpenCode creates and leave their public request fields unchanged; hosted
+/// transport builds provider requests separately from a launch profile.
+/// Keeping this at the protocol boundary lets route tests and fixtures use
+/// the same normalization as the live ingress.
+pub fn direct_provider_create(create: FreshAgentCreate) -> Option<FreshAgentCreate> {
+    match create.provider {
+        Some(AgentProvider::Claude | AgentProvider::Codex | AgentProvider::Opencode) => {
+            Some(create)
+        }
+        _ => None,
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FreshAgentAttach {

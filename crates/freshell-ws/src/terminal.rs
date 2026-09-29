@@ -1844,6 +1844,9 @@ async fn handle_client_text(
         // The create gate is the SHARED `settings.freshAgent.enabled` flag.
         ClientMessage::FreshAgentCreate(create) => {
             if state.fresh_codex.is_enabled() {
+                let Some(create) = freshell_protocol::direct_provider_create(create) else {
+                    return true;
+                };
                 // D8 (restore-open-sessions-only): thread this connection's
                 // provenance (hello identity + the create's `tabId`) down the
                 // provider `handle_create` chain so the identity-sink binding
@@ -1879,7 +1882,7 @@ async fn handle_client_text(
                                 .instrument(tracing::Span::current()),
                         );
                     }
-                    _ => {}
+                    _ => unreachable!("direct_provider_create only accepts direct providers"),
                 }
             } else {
                 // A create against the DISABLED gate must REFUSE, not
