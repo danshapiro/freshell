@@ -2072,6 +2072,7 @@ fn refresh_terminal_provider_config(
         context,
         &terminal.mode,
         std::path::Path::new(&terminal.workspace_path),
+        std::path::Path::new(&terminal.cwd),
         user_root,
     );
 }
@@ -2089,6 +2090,7 @@ fn refresh_provider_context_from_user_root(
     context: &mut freshell_runtime_protocol::ProviderLaunchContext,
     provider: &str,
     workspace: &std::path::Path,
+    project_dir: &std::path::Path,
     user_root: &std::path::Path,
 ) {
     use freshell_runtime_protocol::{
@@ -2102,7 +2104,7 @@ fn refresh_provider_context_from_user_root(
         "codex" => (".codex", &["skills", "rules"]),
         "opencode" => (
             ".config/opencode",
-            &["plugins", "agents", "commands", "skills"],
+            &["plugin", "plugins", "agents", "commands", "skills"],
         ),
         "amplifier" => (".amplifier", &["bundles", "skills", "agents"]),
         _ => return,
@@ -2160,20 +2162,30 @@ fn refresh_provider_context_from_user_root(
         let Ok(canonical_workspace) = std::fs::canonicalize(workspace) else {
             return;
         };
+        let Ok(project_relative) = project_dir.strip_prefix(workspace) else {
+            return;
+        };
         for name in [
             "opencode.json",
             "opencode.jsonc",
             ".opencode/opencode.json",
             ".opencode/opencode.jsonc",
         ] {
-            let candidate = workspace.join(name);
+            let relative_path = project_relative.join(name);
+            let Some(relative_path) = relative_path
+                .to_str()
+                .map(|path| path.replace(std::path::MAIN_SEPARATOR, "/"))
+            else {
+                continue;
+            };
+            let candidate = workspace.join(&relative_path);
             if safe_provider_config_source(&canonical_workspace, &candidate)
                 .is_some_and(|path| path.is_file())
             {
                 project_config.push(ProviderConfigReference {
                     root: ProviderConfigRoot::Workspace,
-                    relative_path: name.into(),
-                    provider_relative_path: format!(".config/opencode/project/{name}"),
+                    relative_path: relative_path.clone(),
+                    provider_relative_path: format!(".config/opencode/project/{relative_path}"),
                     format: if name.ends_with(".jsonc") {
                         "jsonc"
                     } else {
@@ -2441,6 +2453,7 @@ mod tests {
             &mut context,
             "opencode",
             workspace.path(),
+            workspace.path(),
             &user_root,
         );
         assert!(context
@@ -2453,6 +2466,7 @@ mod tests {
         refresh_provider_context_from_user_root(
             &mut context,
             "opencode",
+            workspace.path(),
             workspace.path(),
             &user_root,
         );

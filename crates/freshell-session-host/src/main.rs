@@ -1288,8 +1288,23 @@ fn copy_provider_config_references_with_ownership(
         .filter(|path| !path.as_os_str().is_empty())
         .map(|path| path.to_string_lossy().into_owned())
         .collect::<std::collections::BTreeSet<_>>();
-    copied.sort_by_key(|path| std::cmp::Reverse(path.components().count()));
+    // A projected file can create several parent directories. Transfer all
+    // of them, including `.freshell` above an OpenCode TUI source, so the
+    // provider can create sibling state such as session-switch signals.
+    let mut ownership_paths = std::collections::BTreeSet::new();
     for path in copied {
+        for ancestor in path.ancestors() {
+            if ancestor == provider_home {
+                break;
+            }
+            if ancestor.starts_with(provider_home) {
+                ownership_paths.insert(ancestor.to_path_buf());
+            }
+        }
+    }
+    let mut ownership_paths = ownership_paths.into_iter().collect::<Vec<_>>();
+    ownership_paths.sort_by_key(|path| std::cmp::Reverse(path.components().count()));
+    for path in ownership_paths {
         // Amplifier's first launch transfers the complete stub and projected
         // config in one bounded walk. Chowning a selected 0700 directory here
         // would make that later walk fail without DAC_OVERRIDE.
@@ -3190,7 +3205,7 @@ mod tests {
         let source_config = workspace.path().join("opencode.json");
         let child_output = workspace.path().join("child-effective-config");
         std::fs::create_dir(&provider_home).unwrap();
-        std::fs::write(&source_config, b"first").unwrap();
+        std::fs::write(&source_config, br#"{"model":"first"}"#).unwrap();
         let context = ProviderLaunchContext {
             preparation: ProviderPreparation::Opencode {
                 project_config: vec![ProviderConfigReference {
@@ -3222,7 +3237,7 @@ mod tests {
             current_gid,
         )
         .unwrap();
-        std::fs::write(&source_config, b"second").unwrap();
+        std::fs::write(&source_config, br#"{"model":"second"}"#).unwrap();
         let mut state = test_host_state();
         Arc::get_mut(&mut state).unwrap().provider_config_paths = ProviderConfigPaths {
             private_mount: workspace.path().join("private-mount"),
@@ -3353,7 +3368,10 @@ mod tests {
             }
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
-        assert_eq!(observed.as_deref(), Some(b"second".as_slice()));
+        assert_eq!(
+            observed.as_deref(),
+            Some(br#"{"model":"second"}"#.as_slice())
+        );
         let mut launched_pty = state.pty.lock().await.take();
         if let Some(mut pty) = launched_pty.take() {
             pty.stop().await;

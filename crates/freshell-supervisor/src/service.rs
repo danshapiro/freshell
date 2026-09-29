@@ -1455,14 +1455,49 @@ impl Supervisor {
         {
             HostResult::TerminalOutput(output) => {
                 if let Some(native_session_id) = output.native_session_id.as_ref() {
-                    self.registry
+                    match self
+                        .registry
                         .record_native_session(
                             soul_id.clone(),
                             handle.incarnation_id().clone(),
                             native_session_id.clone(),
                         )
                         .await
-                        .map_err(map_registry)?;
+                    {
+                        Ok(()) => {}
+                        Err(RegistryError::NativeIdentityConflict) => {
+                            let view = self
+                                .registry
+                                .inventory()
+                                .await
+                                .map_err(map_registry)?
+                                .into_iter()
+                                .find(|view| view.soul_id == soul_id)
+                                .ok_or_else(|| {
+                                    RuntimeError::new(
+                                        RuntimeErrorCode::InvalidRequest,
+                                        "terminal soul disappeared",
+                                    )
+                                })?;
+                            let prior = view
+                                .native_session_id
+                                .as_deref()
+                                .filter(|_| view.terminal_mode.as_deref() == Some("opencode"))
+                                .ok_or_else(|| {
+                                    map_registry(RegistryError::NativeIdentityConflict)
+                                })?;
+                            self.registry
+                                .transition_native_session(
+                                    soul_id.clone(),
+                                    handle.incarnation_id().clone(),
+                                    prior,
+                                    native_session_id,
+                                )
+                                .await
+                                .map_err(map_registry)?;
+                        }
+                        Err(error) => return Err(map_registry(error)),
+                    }
                     // Materialize durable resume evidence while the soul-local
                     // store is still reachable. Repeated probes are idempotent.
                     let _ = self.probe_recovery(soul_id.clone()).await;

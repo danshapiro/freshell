@@ -4797,7 +4797,10 @@ impl TerminalRegistry {
             if let (Some(expected), Some(observed)) =
                 (&descriptor.resume_session_id, &read.native_session_id)
             {
-                if expected != observed {
+                let same_opencode_runtime = descriptor.mode == "opencode"
+                    && read.incarnation_id.as_deref() == Some(descriptor.incarnation_id.as_str())
+                    && read.stream_epoch.as_deref() == Some(descriptor.stream_id.as_str());
+                if expected != observed && !same_opencode_runtime {
                     return Err("managed output native identity mismatch".into());
                 }
             }

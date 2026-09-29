@@ -223,9 +223,10 @@ impl ManagedTerminalController for ServerManagedRuntimeController {
             })
             .transpose()?;
             let mut provider_launch_context =
-                crate::managed_provider_bootstrap::provider_launch_context_for_managed(
+                crate::managed_provider_bootstrap::provider_launch_context_for_managed_at(
                     &request.mode,
                     &workspace,
+                    &cwd,
                     mcp_capability.clone(),
                 );
             if let Some(context) = provider_launch_context.as_mut() {

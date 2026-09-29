@@ -699,6 +699,21 @@ fn opencode_config_path(cwd: &str) -> PathBuf {
     Path::new(cwd).join(".opencode").join("opencode.json")
 }
 
+fn opencode_user_config_root() -> PathBuf {
+    if let Some(config_home) = std::env::var_os("XDG_CONFIG_HOME").filter(|value| !value.is_empty())
+    {
+        PathBuf::from(config_home).join("opencode")
+    } else {
+        #[cfg(windows)]
+        let home = std::env::var_os("USERPROFILE");
+        #[cfg(not(windows))]
+        let home = std::env::var_os("HOME");
+        home.map(PathBuf::from)
+            .unwrap_or_default()
+            .join(".config/opencode")
+    }
+}
+
 fn opencode_sidecar_path(cwd: &str) -> PathBuf {
     Path::new(cwd)
         .join(".opencode")
@@ -851,6 +866,11 @@ fn opencode_inject(
             }
         }
 
+        let config_plan = crate::opencode_config::prepare_opencode_config(
+            Path::new(cwd),
+            &opencode_user_config_root(),
+        )
+        .map_err(|error| McpInjectError::new(error.to_string()))?;
         let existing_sidecar = read_sidecar(cwd);
 
         // User-managed detection (`cw:368-376`).
@@ -859,11 +879,25 @@ fn opencode_inject(
             .and_then(|m| m.get("freshell"))
             .map(|f| !f.is_null())
             .unwrap_or(false);
-        let user_managed = pre_existing_freshell
+        let user_replaced_owned_entry = existing_sidecar.as_ref().is_some_and(|sidecar| {
+            sidecar
+                .get("createdEntry")
+                .and_then(|value| value.as_bool())
+                == Some(true)
+                && sidecar.get("ownedCommand").is_some_and(|command| {
+                    existing_config
+                        .get("mcp")
+                        .and_then(|mcp| mcp.get("freshell"))
+                        .and_then(|entry| entry.get("command"))
+                        != Some(command)
+                })
+        });
+        let user_managed = (pre_existing_freshell || config_plan.user_owns_freshell_mcp)
             && match &existing_sidecar {
                 None => true,
                 Some(sc) => sc.get("createdEntry").and_then(|v| v.as_bool()) == Some(false),
-            };
+            }
+            || user_replaced_owned_entry;
 
         if !user_managed {
             let (server_command, server_args) = build_mcp_server_command(rt, target)?;
@@ -892,7 +926,7 @@ fn opencode_inject(
             std::fs::create_dir_all(&dir_path).map_err(|e| McpInjectError::new(e.to_string()))?;
         }
 
-        let created_entry = !pre_existing_freshell;
+        let created_entry = !pre_existing_freshell && !config_plan.user_owns_freshell_mcp;
 
         // Update sidecar (`cw:400-409`).
         let sidecar = match existing_sidecar {
@@ -900,6 +934,10 @@ fn opencode_inject(
                 let ref_count = sc.get("refCount").and_then(|v| v.as_i64()).unwrap_or(0);
                 if let Some(obj) = sc.as_object_mut() {
                     obj.insert("refCount".to_string(), serde_json::json!(ref_count + 1));
+                    if user_replaced_owned_entry {
+                        obj.insert("createdEntry".to_string(), serde_json::json!(false));
+                        obj.remove("ownedCommand");
+                    }
                 }
                 sc
             }
@@ -909,6 +947,9 @@ fn opencode_inject(
                 "createdDir": !dir_exists,
                 "createdFile": !file_exists,
                 "createdEntry": created_entry,
+                "ownedCommand": if created_entry {
+                    existing_config.get("mcp").and_then(|mcp| mcp.get("freshell")).and_then(|entry| entry.get("command")).cloned()
+                } else { None },
             }),
         };
         write_sidecar(cwd, &sidecar)
@@ -1026,6 +1067,16 @@ fn cleanup_opencode(cwd: &str) {
             let _ = std::fs::remove_file(&sidecar_path);
             return Ok(());
         };
+        if sidecar.get("ownedCommand").is_some_and(|owned| {
+            config
+                .get("mcp")
+                .and_then(|mcp| mcp.get("freshell"))
+                .and_then(|entry| entry.get("command"))
+                != Some(owned)
+        }) {
+            let _ = std::fs::remove_file(&sidecar_path);
+            return Ok(());
+        }
         if let Some(mcp) = config.get_mut("mcp").and_then(|m| m.as_object_mut()) {
             mcp.remove("freshell");
         }

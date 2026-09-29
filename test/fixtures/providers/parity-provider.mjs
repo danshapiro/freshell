@@ -82,7 +82,7 @@ function rpcProbe(recipe) {
   })
   const request = (method, params = {}) => new Promise((resolve, reject) => {
     const id = ++nextId
-    const timer = setTimeout(() => { pending.delete(id); reject(new Error(`${method} timed out: ${stderr.slice(-500)}`)) }, 10_000)
+    const timer = setTimeout(() => { pending.delete(id); reject(new Error(`${method} timed out: ${stderr.slice(-2000)}`)) }, 10_000)
     pending.set(id, response => { clearTimeout(timer); resolve(response) })
     child.stdin.write(`${JSON.stringify({ jsonrpc: '2.0', id, method, params })}\n`)
   })

@@ -782,32 +782,36 @@ fn codex_create_uses_managed_launch(mode: &str, flag_value: Option<&str>) -> boo
 /// `CliLaunchInputs::opencode_rebind_tui_config`, the `mcp_injection`
 /// precedent; same precompute as the WS create path,
 /// `crates/freshell-ws/src/terminal.rs::opencode_rebind_precompute`): install
-/// the plugin + plugin-only tui.json under the real process env's home and
-/// return the tui.json path. Home resolution mirrors
+/// the plugin and merge any user-selected TUI config under the real process
+/// env's home. Home resolution mirrors
 /// `ClaudeSignalWatcher::default_root` (`claude_signal.rs:52-66`):
 /// `%USERPROFILE%` on Windows, `$HOME` otherwise; empty/unset ⇒ `None` ⇒
-/// skip injection. Install failure warn-logs and returns `None` — it must
-/// never block the launch.
-fn opencode_rebind_precompute() -> Option<String> {
+/// skip injection. Malformed selected config refuses the launch.
+fn opencode_rebind_precompute(
+    selected: Option<&str>,
+    cwd: Option<&str>,
+) -> Result<Option<String>, String> {
     #[cfg(windows)]
-    let base = std::env::var("USERPROFILE").ok()?;
+    let base = std::env::var("USERPROFILE").ok();
     #[cfg(not(windows))]
-    let base = std::env::var("HOME").ok()?;
-    if base.is_empty() {
-        return None;
-    }
-    match freshell_platform::opencode_plugin::ensure_rebind_plugin_installed(std::path::Path::new(
-        &base,
-    )) {
-        Ok(tui_config) => Some(tui_config.display().to_string()),
-        Err(error) => {
-            tracing::warn!(
-                %error,
-                "opencode_rebind_plugin_install_failed: launching without rebind signal"
-            );
-            None
+    let base = std::env::var("HOME").ok();
+    let Some(base) = base.filter(|base| !base.is_empty()) else {
+        return Ok(None);
+    };
+    let selected = selected.map(|raw| {
+        let path = std::path::PathBuf::from(raw);
+        if path.is_absolute() {
+            path
+        } else {
+            std::path::Path::new(cwd.unwrap_or(".")).join(path)
         }
-    }
+    });
+    freshell_platform::opencode_plugin::ensure_rebind_plugin_with_user_config(
+        std::path::Path::new(&base),
+        selected.as_deref(),
+    )
+    .map(|path| Some(path.display().to_string()))
+    .map_err(|error| error.to_string())
 }
 
 /// `agentRouteErrorStatus` (`router.ts:54-59`), scoped to the launch errors this
@@ -2611,7 +2615,14 @@ async fn settle_gated_create(inputs: GatedSettleInputs) -> Result<TerminalSpawnR
         // CliLaunchInputs (mcp_injection precedent). Failure must never block
         // the launch.
         let opencode_rebind_tui_config = if mode == "opencode" && !use_managed_runtime {
-            opencode_rebind_precompute()
+            let selected = state
+                .cli_commands
+                .iter()
+                .find(|spec| spec.name == "opencode")
+                .and_then(|spec| spec.base_env.get("OPENCODE_TUI_CONFIG").cloned())
+                .or_else(|| std::env::var("OPENCODE_TUI_CONFIG").ok());
+            opencode_rebind_precompute(selected.as_deref(), cwd.as_deref())
+                .map_err(|error| fail_json(StatusCode::BAD_REQUEST, error))?
         } else {
             None
         };

@@ -433,25 +433,24 @@ pub fn resolve_coding_cli_command(
             command_env.insert(k, v);
         }
         // Freshell TUI rebind plugin (docs/plans/2026-07-28-opencode-tui-rebind.md):
-        // the IO layer installed the plugin + plugin-only tui.json into
+        // the IO layer installed the plugin and generated tui.json into
         // ~/.freshell/opencode/ and passed the tui.json path via
         // inputs.opencode_rebind_tui_config (the mcp_injection precedent — this
         // resolver stays pure). Point this pane's TUI at it via OPENCODE_TUI_CONFIG.
         // Main-config plugins (opencode.json / OPENCODE_CONFIG_CONTENT) load as
         // SERVER plugins only and never reach the TUI plugin host; TUI config
-        // sources MERGE and plugin arrays UNION, so the injected plugin-only file
-        // can never shadow user config (validated on opencode 1.18.8/1.18.9).
-        // Skips (each degrades to today's no-rebind behavior): user-set
-        // OPENCODE_TUI_CONFIG (a path var cannot be merged — preserve the user's
-        // value), the FRESHELL_OPENCODE_REBIND=0/false kill switch (opencode
+        // sources merge, and the IO layer copies a user-selected TUI file
+        // into the generated selector before appending the rebind plugin.
+        // The IO layer copies a user-selected TUI config into the generated
+        // selector before adding this plugin. Skips: the
+        // FRESHELL_OPENCODE_REBIND=0/false kill switch (opencode
         // self-updates in place), and a None input (unresolvable home or install
         // failure at the IO layer, which warn-logs and never blocks the launch).
         let rebind_disabled = matches!(
             merged_env_value(env, &command_env, "FRESHELL_OPENCODE_REBIND").as_deref(),
             Some("0") | Some("false")
         );
-        let user_tui_config = merged_env_value(env, &command_env, "OPENCODE_TUI_CONFIG");
-        if !rebind_disabled && user_tui_config.is_none() {
+        if !rebind_disabled {
             if let Some(tui_config) = &inputs.opencode_rebind_tui_config {
                 command_env.insert("OPENCODE_TUI_CONFIG".to_string(), tui_config.clone());
             }

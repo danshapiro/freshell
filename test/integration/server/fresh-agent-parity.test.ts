@@ -65,6 +65,7 @@ class FreshWire {
 
 describe('hosted fresh-agent provider inputs', () => {
   let rig: ManagedRuntimeBrowserRig
+  let opencodeProject: string
   const wires: FreshWire[] = []
 
   beforeAll(async () => {
@@ -75,16 +76,32 @@ describe('hosted fresh-agent provider inputs', () => {
       fixtureFreshAgentModes: providers.map(row => row.sessionType),
     })
     await rig.start()
+    opencodeProject = fs.mkdtempSync(path.join(root, '.opencode-parity-'))
+    fs.mkdirSync(path.join(opencodeProject, '.opencode'), { recursive: true })
+    fs.writeFileSync(path.join(opencodeProject, '.opencode/opencode.json'), JSON.stringify({
+      provider: { project_fixture: { name: 'project fixture' } },
+      mcp: { project_fixture: { type: 'local', command: ['project-mcp'] } },
+    }))
+    fs.writeFileSync(path.join(opencodeProject, '.opencode/opencode.jsonc'),
+      '{ // project JSONC remains a user source\n "plugin": ["file:///project-plugin.ts",], "theme": "project", }')
     for (const row of providers) {
       const file = path.join(rig.info.homeDir, row.config)
       fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o755 })
       const contents = row.provider === 'codex'
         ? 'fixture_setting = true\n\n[mcp_servers.user_fixture]\ncommand = "user-fixture-mcp"\n'
+        : row.provider === 'opencode'
+          ? '{ // global JSONC\n "provider":{"global_fixture":{"name":"global fixture"}}, "mcp":{"user_fixture":{"type":"local","command":["user-fixture-mcp"]}}, "plugin":["file:///global-plugin.ts",], }'
         : JSON.stringify({ fixtureSetting: true, mcpServers: { user_fixture: { command: 'user-fixture-mcp' } } }) + '\n'
       fs.writeFileSync(file, contents)
       fs.chmodSync(path.dirname(file), 0o755)
       fs.chmodSync(file, 0o644)
     }
+    fs.writeFileSync(path.join(rig.info.homeDir, '.config/opencode/opencode.json'), JSON.stringify({
+      mcp: { other_global: { type: 'local', command: ['other-global-mcp'] } },
+    }))
+    const opencodePlugin = path.join(rig.info.homeDir, '.config/opencode/plugin')
+    fs.mkdirSync(opencodePlugin, { recursive: true, mode: 0o755 })
+    fs.writeFileSync(path.join(opencodePlugin, 'user-plugin.ts'), 'export const User = async () => ({})\n')
   }, 900_000)
 
   afterAll(async () => {
@@ -93,6 +110,7 @@ describe('hosted fresh-agent provider inputs', () => {
       const cleanup = await rig.stop()
       expect(cleanup.ok, cleanup.errors.join('\n')).toBe(true)
     }
+    if (opencodeProject) fs.rmSync(opencodeProject, { recursive: true, force: true })
   }, 180_000)
 
   it.each(providers)('$sessionType retains create settings and exact native resume', async row => {
@@ -100,9 +118,10 @@ describe('hosted fresh-agent provider inputs', () => {
     wires.push(wire)
     const requestId = `fresh-parity-${randomUUID()}`
     const namingHandle = `nh-${randomUUID()}`
+    const cwd = row.provider === 'opencode' ? opencodeProject : root
     wire.send({
       type: 'freshAgent.create', requestId, sessionType: row.sessionType,
-      provider: row.provider, cwd: root, model: 'fixture-model',
+      provider: row.provider, cwd, model: 'fixture-model',
       modelSelection: { kind: 'exact', modelId: 'fixture-model' },
       effort: 'low', permissionMode: 'default', sandbox: 'workspace-write',
       plugins: ['fixture-plugin'], namingHandle, tabId: `tab-${requestId}`,
@@ -124,7 +143,7 @@ describe('hosted fresh-agent provider inputs', () => {
     ]))
     const profile = recorded.createProfile
     expect(profile).toMatchObject({
-      provider: row.provider, cwd: root, model: 'fixture-model', effort: 'low',
+      provider: row.provider, cwd, model: 'fixture-model', effort: 'low',
       permissionMode: 'default', sandbox: 'workspace-write',
       plugins: ['fixture-plugin'],
       modelSelection: { kind: 'exact', modelId: 'fixture-model' },
@@ -144,6 +163,12 @@ describe('hosted fresh-agent provider inputs', () => {
     } else {
       expect(preparation.opencode).toMatchObject({ inline_config: false, tui_config: null })
       expect(JSON.stringify(preparation)).not.toContain('freshell-mcp')
+      expect(preparation.opencode.project_config.map((source: any) => source.relativePath)).toEqual(
+        expect.arrayContaining([
+          `${path.basename(opencodeProject)}/.opencode/opencode.json`,
+          `${path.basename(opencodeProject)}/.opencode/opencode.jsonc`,
+        ]),
+      )
       const tuiConfig = rig.ownedProviderExec(view.containerId!, [
         'cat', '/home/freshell/provider/.freshell/opencode/tui.json',
       ])
@@ -152,11 +177,23 @@ describe('hosted fresh-agent provider inputs', () => {
       ])
     }
     for (const config of profile.providerLaunchContext.config) {
+      if (config.format === 'directory') {
+        if (row.provider === 'opencode' && config.relativePath === 'plugin') {
+          expect(rig.ownedProviderExec(view.containerId!, [
+            'cat', path.posix.join('/home/freshell/provider', config.providerRelativePath, 'user-plugin.ts'),
+          ])).toContain('export const User')
+        }
+        continue
+      }
       const contents = rig.ownedProviderExec(view.containerId!, [
         'cat', path.posix.join('/home/freshell/provider', config.providerRelativePath),
       ])
-      expect(contents).toContain(row.provider === 'codex' ? 'fixture_setting' : 'fixtureSetting')
-      expect(contents).toContain('user-fixture-mcp')
+      if (row.provider === 'opencode') {
+        expect(contents).toMatch(/global_fixture|other_global|project_fixture|project JSONC/)
+      } else {
+        expect(contents).toContain(row.provider === 'codex' ? 'fixture_setting' : 'fixtureSetting')
+        expect(contents).toContain('user-fixture-mcp')
+      }
     }
 
     const sendId = `send-${randomUUID()}`
@@ -167,7 +204,7 @@ describe('hosted fresh-agent provider inputs', () => {
 
     const resumeId = `resume-${randomUUID()}`
     wire.send({ type: 'freshAgent.create', requestId: resumeId,
-      provider: row.provider, sessionType: row.sessionType, cwd: root,
+      provider: row.provider, sessionType: row.sessionType, cwd,
       sessionRef: { provider: row.provider, sessionId: recorded.nativeSessionId } })
     const resumed = await wire.wait(frame => frame.requestId === resumeId
       && (frame.type === 'freshAgent.created' || frame.type === 'freshAgent.create.failed'))

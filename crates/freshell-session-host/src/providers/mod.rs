@@ -117,8 +117,21 @@ pub async fn prepare_terminal(
                 .map(String::as_str),
             Some("0" | "false")
         );
-        if !rebind_disabled && !terminal.env.contains_key("OPENCODE_TUI_CONFIG") {
-            prepare_provider_features(&terminal, "opencode-rebind")?;
+        if !rebind_disabled {
+            let source = terminal
+                .env
+                .get("OPENCODE_TUI_CONFIG")
+                .or_else(|| child_env.get("OPENCODE_TUI_CONFIG"))
+                .cloned();
+            let mut args = vec!["opencode-rebind"];
+            if let Some(source) = source.as_deref() {
+                args.push(source);
+            }
+            prepare_provider_features_for_identity(
+                terminal.run_as_uid,
+                terminal.run_as_gid,
+                &args,
+            )?;
             terminal.env.insert(
                 "OPENCODE_TUI_CONFIG".into(),
                 "/home/freshell/provider/.freshell/opencode/tui.json".into(),
@@ -127,36 +140,31 @@ pub async fn prepare_terminal(
         let permission = terminal
             .env
             .remove("FRESHELL_MANAGED_OPENCODE_BASH_PERMISSION");
-        if terminal
+        let has_mcp = terminal
             .provider_launch_context
             .as_ref()
-            .is_some_and(|context| context.mcp_capability.is_some())
-        {
-            let mut config = terminal
-                .env
-                .get("OPENCODE_CONFIG_CONTENT")
-                .or_else(|| child_env.get("OPENCODE_CONFIG_CONTENT"))
-                .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
-                .filter(serde_json::Value::is_object)
-                .unwrap_or_else(|| serde_json::json!({}));
-            if let Some(permission) = permission {
-                if !config
-                    .get("permission")
-                    .is_some_and(serde_json::Value::is_object)
-                {
-                    config["permission"] = serde_json::json!({});
-                }
-                config["permission"]["bash"] = serde_json::Value::String(permission);
-            }
-            if !config.get("mcp").is_some_and(serde_json::Value::is_object) {
-                config["mcp"] = serde_json::json!({});
-            }
-            if config["mcp"].get("freshell").is_none() {
-                config["mcp"]["freshell"] = serde_json::json!({
-                    "type":"local", "command":["node", "/opt/freshell-mcp/server.js"]
-                });
-            }
-            let config = config.to_string();
+            .is_some_and(|context| context.mcp_capability.is_some());
+        let plan = freshell_platform::opencode_config::prepare_opencode_config(
+            std::path::Path::new(&terminal.cwd),
+            std::path::Path::new("/home/freshell/provider/.config/opencode"),
+        )
+        .map_err(|error| error.to_string())?;
+        let inherited = terminal
+            .env
+            .get("OPENCODE_CONFIG_CONTENT")
+            .or_else(|| child_env.get("OPENCODE_CONFIG_CONTENT"));
+        if inherited.is_some() || permission.is_some() || has_mcp {
+            let config = freshell_platform::opencode_config::merge_owned_entries(
+                inherited.map(String::as_str),
+                &plan,
+                &freshell_platform::opencode_config::OwnedConfigEdits {
+                    disable_snapshots: false,
+                    bash_permission: permission,
+                    freshell_command: has_mcp
+                        .then(|| vec!["node".into(), "/opt/freshell-mcp/server.js".into()]),
+                },
+            )
+            .map_err(|error| error.to_string())?;
             terminal
                 .env
                 .insert("OPENCODE_CONFIG_CONTENT".into(), config.clone());
@@ -236,26 +244,25 @@ fn prepare_provider_features(
     terminal: &freshell_runtime_protocol::TerminalLaunchSpec,
     operation: &str,
 ) -> Result<(), String> {
-    prepare_provider_features_for_identity(terminal.run_as_uid, terminal.run_as_gid, operation)
+    prepare_provider_features_for_identity(terminal.run_as_uid, terminal.run_as_gid, &[operation])
 }
 
-fn prepare_provider_features_for_identity(
-    uid: u32,
-    gid: u32,
-    operation: &str,
-) -> Result<(), String> {
+fn prepare_provider_features_for_identity(uid: u32, gid: u32, args: &[&str]) -> Result<(), String> {
     let exe = std::env::current_exe().map_err(|error| error.to_string())?;
     let status = std::process::Command::new("/usr/bin/setpriv")
         .args(crate::provider_identity_args(uid, gid))
         .arg(exe)
         .arg("prepare-provider-features")
-        .arg(operation)
+        .args(args)
         .status()
         .map_err(|error| format!("prepare provider features: {error}"))?;
     if status.success() {
         Ok(())
     } else {
-        Err(format!("prepare provider features failed: {operation}"))
+        Err(format!(
+            "prepare provider features failed: {}",
+            args.first().unwrap_or(&"unknown")
+        ))
     }
 }
 
@@ -292,12 +299,32 @@ pub fn prepare_fresh_agent_child_environment(
             }
         }
     }
-    if !child_env.contains_key("OPENCODE_TUI_CONFIG") {
-        prepare_provider_features_for_identity(
-            launch.run_as_uid,
-            launch.run_as_gid,
-            "opencode-rebind",
-        )?;
+    let plan = freshell_platform::opencode_config::prepare_opencode_config(
+        std::path::Path::new(&launch.cwd),
+        std::path::Path::new("/home/freshell/provider/.config/opencode"),
+    )
+    .map_err(|error| error.to_string())?;
+    if let Some(inherited) = child_env.get("OPENCODE_CONFIG_CONTENT") {
+        let normalized = freshell_platform::opencode_config::merge_owned_entries(
+            Some(inherited),
+            &plan,
+            &freshell_platform::opencode_config::OwnedConfigEdits::default(),
+        )
+        .map_err(|error| error.to_string())?;
+        child_env.insert("OPENCODE_CONFIG_CONTENT".into(), normalized);
+    }
+    if !matches!(
+        child_env
+            .get("FRESHELL_OPENCODE_REBIND")
+            .map(String::as_str),
+        Some("0" | "false")
+    ) {
+        let source = child_env.get("OPENCODE_TUI_CONFIG").cloned();
+        let mut args = vec!["opencode-rebind"];
+        if let Some(source) = source.as_deref() {
+            args.push(source);
+        }
+        prepare_provider_features_for_identity(launch.run_as_uid, launch.run_as_gid, &args)?;
         child_env.insert(
             "OPENCODE_TUI_CONFIG".into(),
             "/home/freshell/provider/.freshell/opencode/tui.json".into(),
@@ -327,10 +354,21 @@ pub(crate) fn run_provider_features_worker(args: &[String]) -> Result<(), String
                 .and_then(|mut file| std::io::Write::write_all(&mut file, &bytes))
                 .map_err(|error| error.to_string())
         }
-        [operation] if operation == "opencode-rebind" => {
-            freshell_platform::opencode_plugin::ensure_rebind_plugin_installed(provider_home)
-                .map(|_| ())
-                .map_err(|error| error.to_string())
+        [operation] | [operation, _] if operation == "opencode-rebind" => {
+            let selected = args.get(1).map(std::path::Path::new);
+            if let Some(selected) = selected {
+                let canonical = std::fs::canonicalize(selected)
+                    .map_err(|_| "managed OpenCode TUI source is unavailable".to_string())?;
+                if !canonical.starts_with(provider_home) {
+                    return Err("managed OpenCode TUI source is outside the provider home".into());
+                }
+            }
+            freshell_platform::opencode_plugin::ensure_rebind_plugin_with_user_config(
+                provider_home,
+                selected,
+            )
+            .map(|_| ())
+            .map_err(|error| error.to_string())
         }
         _ => Err("unknown provider feature preparation".into()),
     }

@@ -12,20 +12,40 @@ pub fn provider_launch_context(provider: &str, workspace: &Path) -> Option<Provi
     provider_launch_context_for_managed(provider, workspace, None)
 }
 
+#[cfg(test)]
 pub fn provider_launch_context_for_managed(
     provider: &str,
     workspace: &Path,
     mcp_capability: Option<McpCapabilityReference>,
 ) -> Option<ProviderLaunchContext> {
+    provider_launch_context_for_managed_at(provider, workspace, workspace, mcp_capability)
+}
+
+pub fn provider_launch_context_for_managed_at(
+    provider: &str,
+    workspace: &Path,
+    project_dir: &Path,
+    mcp_capability: Option<McpCapabilityReference>,
+) -> Option<ProviderLaunchContext> {
     let home = std::env::var_os("HOME")
         .map(PathBuf::from)
         .unwrap_or_default();
-    provider_launch_context_from_home(provider, workspace, &home, mcp_capability)
+    provider_launch_context_from_home_at(provider, workspace, project_dir, &home, mcp_capability)
 }
 
 pub(crate) fn provider_launch_context_from_home(
     provider: &str,
     workspace: &Path,
+    home: &Path,
+    mcp_capability: Option<McpCapabilityReference>,
+) -> Option<ProviderLaunchContext> {
+    provider_launch_context_from_home_at(provider, workspace, workspace, home, mcp_capability)
+}
+
+fn provider_launch_context_from_home_at(
+    provider: &str,
+    workspace: &Path,
+    project_dir: &Path,
     home: &Path,
     mcp_capability: Option<McpCapabilityReference>,
 ) -> Option<ProviderLaunchContext> {
@@ -72,6 +92,7 @@ pub(crate) fn provider_launch_context_from_home(
             &[
                 "opencode.json",
                 "opencode.jsonc",
+                "plugin",
                 "plugins",
                 "agents",
                 "commands",
@@ -96,6 +117,7 @@ pub(crate) fn provider_launch_context_from_home(
     };
     let preparation = match preparation {
         ProviderPreparation::Opencode { tui_config, .. } => {
+            let project_relative = project_dir.strip_prefix(workspace).ok()?;
             let project_config = [
                 "opencode.json",
                 "opencode.jsonc",
@@ -104,14 +126,18 @@ pub(crate) fn provider_launch_context_from_home(
             ]
             .into_iter()
             .filter_map(|entry| {
-                let source = approved_config_path(workspace, entry)?;
+                let relative_path = project_relative.join(entry);
+                let relative_path = relative_path
+                    .to_str()?
+                    .replace(std::path::MAIN_SEPARATOR, "/");
+                let source = approved_config_path(workspace, &relative_path)?;
                 if !source.is_file() {
                     return None;
                 }
                 Some(ProviderConfigReference {
                     root: ProviderConfigRoot::Workspace,
-                    relative_path: entry.into(),
-                    provider_relative_path: format!(".config/opencode/project/{entry}"),
+                    relative_path: relative_path.clone(),
+                    provider_relative_path: format!(".config/opencode/project/{relative_path}"),
                     format: if entry.ends_with(".jsonc") {
                         "jsonc"
                     } else {
@@ -416,6 +442,52 @@ mod tests {
                 && reference.format == "jsonc"))
         );
         context.validate("opencode").unwrap();
+    }
+
+    #[test]
+    fn opencode_context_uses_project_directory_beneath_workspace() {
+        let workspace = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let project = workspace.path().join("nested-project");
+        fs::create_dir_all(project.join(".opencode")).unwrap();
+        fs::write(project.join(".opencode/opencode.json"), "{}").unwrap();
+        fs::write(project.join(".opencode/opencode.jsonc"), "{ // user\n}").unwrap();
+        let context = provider_launch_context_from_home_at(
+            "opencode",
+            workspace.path(),
+            &project,
+            home.path(),
+            None,
+        )
+        .unwrap();
+        let ProviderPreparation::Opencode { project_config, .. } = context.preparation else {
+            panic!("expected OpenCode preparation");
+        };
+        assert!(project_config
+            .iter()
+            .any(|source| source.relative_path == "nested-project/.opencode/opencode.json"));
+        assert!(project_config
+            .iter()
+            .any(|source| source.relative_path == "nested-project/.opencode/opencode.jsonc"));
+    }
+
+    #[test]
+    fn opencode_context_carries_global_plugin_directory() {
+        let workspace = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let plugin = home.path().join(".config/opencode/plugin");
+        fs::create_dir_all(&plugin).unwrap();
+        fs::write(
+            plugin.join("user-plugin.ts"),
+            "export const User = async () => ({})",
+        )
+        .unwrap();
+        let context =
+            provider_launch_context_from_home("opencode", workspace.path(), home.path(), None)
+                .unwrap();
+        assert!(context.config.iter().any(
+            |reference| reference.relative_path == "plugin" && reference.format == "directory"
+        ));
     }
 
     #[test]

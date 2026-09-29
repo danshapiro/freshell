@@ -1181,14 +1181,18 @@ impl Registry {
             if existing.as_deref() != Some(expected_parent.as_str()) {
                 return Err(RegistryError::NativeIdentityConflict);
             }
-            let encoded: String = tx.query_row(
-                "SELECT fresh_agent_spec FROM incarnations WHERE incarnation_id=?1",
-                params![incarnation_id.as_str()], |row| row.get(0),
+            let (fresh_spec, terminal_spec): (Option<String>, Option<String>) = tx.query_row(
+                "SELECT fresh_agent_spec,terminal_spec FROM incarnations WHERE incarnation_id=?1",
+                params![incarnation_id.as_str()], |row| Ok((row.get(0)?, row.get(1)?)),
             )?;
-            let mut spec: FreshAgentLaunchSpec = serde_json::from_str(&encoded)
-                .map_err(|_| RegistryError::Integrity("invalid fresh-agent launch spec".into()))?;
-            if spec.native_session_id.as_deref() != Some(expected_parent.as_str()) {
-                return Err(RegistryError::NativeIdentityConflict);
+            let mut fresh_spec = fresh_spec.map(|encoded| serde_json::from_str::<FreshAgentLaunchSpec>(&encoded))
+                .transpose().map_err(|_| RegistryError::Integrity("invalid fresh-agent launch spec".into()))?;
+            let terminal_spec = terminal_spec.map(|encoded| serde_json::from_str::<TerminalLaunchSpec>(&encoded))
+                .transpose().map_err(|_| RegistryError::Integrity("invalid terminal launch spec".into()))?;
+            match (&fresh_spec, &terminal_spec) {
+                (Some(spec), _) if spec.native_session_id.as_deref() == Some(expected_parent.as_str()) => {},
+                (None, Some(spec)) if provider == "opencode" && spec.mode == "opencode" => {},
+                _ => return Err(RegistryError::NativeIdentityConflict),
             }
             let conflicting: Option<String> = tx.query_row(
                 "SELECT incarnation_id FROM writer_claims WHERE provider=?1 AND provider_store_id=?2 AND native_session_id=?3",
@@ -1212,16 +1216,21 @@ impl Registry {
             // and the externally resumable presentation key. Persist them
             // together so a web-server restart cannot rediscover the retired
             // parent through inventory fallback.
-            spec.session_id = child_session_id.clone();
-            spec.native_session_id = Some(child_session_id.clone());
-            if let Some(reference) = spec.session_ref.as_mut() {
-                reference.session_id = child_session_id.clone();
-            }
             let now = now_millis();
-            tx.execute(
-                "UPDATE incarnations SET fresh_agent_spec=?1,updated_at=?2 WHERE incarnation_id=?3",
-                params![serde_json::to_string(&spec)?, now, incarnation_id.as_str()],
-            )?;
+            if let Some(spec) = fresh_spec.as_mut() {
+                spec.session_id = child_session_id.clone();
+                spec.native_session_id = Some(child_session_id.clone());
+                if let Some(reference) = spec.session_ref.as_mut() {
+                    reference.session_id = child_session_id.clone();
+                }
+                tx.execute(
+                    "UPDATE incarnations SET fresh_agent_spec=?1,updated_at=?2 WHERE incarnation_id=?3",
+                    params![serde_json::to_string(spec)?, now, incarnation_id.as_str()],
+                )?;
+            }
+            // The terminal launch spec is part of Docker's immutable
+            // ownership digest. The soul row and writer claim carry the live
+            // identity; exact recovery creates a new launch from that id.
             // Any prior resume proof names the old branch. It must be
             // re-materialized from the child before a later replacement.
             tx.execute(
@@ -3444,6 +3453,90 @@ mod tests {
             params![soul.as_str(), prepared.incarnation_id.as_str()], |row| row.get(0),
         ).unwrap();
         assert_eq!((parent_claims, child_claims), (0, 1));
+    }
+
+    #[tokio::test]
+    async fn terminal_opencode_switch_updates_resume_identity_and_writer_claim() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let registry = Registry::open(dir.path(), None).unwrap();
+        let soul = SoulId::new();
+        let mut launch = prep(soul.clone(), RequestId::new(), "opencode-switch");
+        launch.provider = "opencode".into();
+        launch.provider_store_id = "opencode-store".into();
+        launch.terminal = Some(TerminalLaunchSpec {
+            terminal_id: "terminal-switch".into(),
+            stream_id: "stream-switch".into(),
+            mode: "opencode".into(),
+            program: "opencode".into(),
+            args: Vec::new(),
+            env: Default::default(),
+            cwd: workspace.path().to_string_lossy().into_owned(),
+            run_as_uid: 65_534,
+            run_as_gid: 0,
+            cols: 80,
+            rows: 24,
+            project_key: "switch-project".into(),
+            workspace_path: workspace.path().to_string_lossy().into_owned(),
+            git_common_dir: None,
+            create_request_id: None,
+            resume_session_id: None,
+            provider_model: None,
+            provider_reasoning_effort: None,
+            provider_sandbox: None,
+            provider_permission_mode: None,
+            provider_bootstrap_files: Vec::new(),
+            provider_secret_references: Vec::new(),
+            provider_launch_context: None,
+        });
+        let prepared = registry.prepare_launch(launch).await.unwrap();
+        registry
+            .record_native_session(
+                soul.clone(),
+                prepared.incarnation_id.clone(),
+                "ses_Parent".into(),
+            )
+            .await
+            .unwrap();
+        registry
+            .transition_native_session(
+                soul.clone(),
+                prepared.incarnation_id.clone(),
+                "ses_Parent",
+                "ses_Child",
+            )
+            .await
+            .unwrap();
+        registry
+            .transition_native_session(
+                soul.clone(),
+                prepared.incarnation_id.clone(),
+                "ses_Parent",
+                "ses_Child",
+            )
+            .await
+            .unwrap();
+        let view = registry
+            .inventory()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|view| view.soul_id == soul)
+            .unwrap();
+        assert_eq!(view.native_session_id.as_deref(), Some("ses_Child"));
+        assert_eq!(view.terminal_resume_session_id, None);
+        let conn = open_connection(&registry.inner.db_path).unwrap();
+        let claims: Vec<String> = {
+            let mut query = conn
+                .prepare("SELECT native_session_id FROM writer_claims WHERE soul_id=?1")
+                .unwrap();
+            query
+                .query_map(params![soul.as_str()], |row| row.get(0))
+                .unwrap()
+                .map(Result::unwrap)
+                .collect()
+        };
+        assert_eq!(claims, vec!["ses_Child"]);
     }
 
     #[tokio::test]

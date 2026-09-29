@@ -694,8 +694,7 @@ fn stage_provider_root(
             } else {
                 if let Some(raw) = opencode_input.inline_config {
                     if raw.len() > 64 * 1024
-                        || !serde_json::from_str::<serde_json::Value>(raw)
-                            .is_ok_and(|value| value.is_object())
+                        || freshell_platform::opencode_config::parse_jsonc_object(raw).is_none()
                     {
                         return Err("managed OpenCode inline config is invalid".into());
                     }
@@ -1434,7 +1433,7 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         let tui = home.path().join("selected-tui.jsonc");
         std::fs::write(&tui, "{ // selected\n\"plugin\":[\"user-selected-tui\"]}").unwrap();
-        let raw = r#"{"mcp":{"vendor":{"type":"local","command":["tool","--token","nested-secret-byte"]}}}"#;
+        let raw = "{ // user inline JSONC\n\"mcp\":{\"vendor\":{\"type\":\"local\",\"command\":[\"tool\",\"--token\",\"nested-secret-byte\",],},},}";
         let tui_source = approved_tui_source(
             "./selected-tui.jsonc",
             home.path(),

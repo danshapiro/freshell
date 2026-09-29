@@ -3,7 +3,7 @@ import path from 'node:path'
 import os from 'node:os'
 import { randomUUID } from 'node:crypto'
 import WebSocket from 'ws'
-import { afterAll, beforeAll, describe, expect, it } from 'vitest'
+import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest'
 
 import { WS_PROTOCOL_VERSION } from '../../../shared/ws-protocol.js'
 import { ManagedRuntimeBrowserRig } from '../../e2e-browser/helpers/managed-runtime.js'
@@ -129,6 +129,13 @@ function ordinaryProviderArgs(argv: string[], provider: Provider): string[] {
 
 function normalized(record: RecordRow): unknown {
   const env = record.env as Record<string, unknown>
+  const tuiConfig = record.provider === 'opencode' && typeof record.tuiConfig === 'string'
+    ? JSON.parse(record.tuiConfig) as { plugin?: string[]; [key: string]: unknown }
+    : record.tuiConfig
+  if (tuiConfig && typeof tuiConfig === 'object' && Array.isArray(tuiConfig.plugin)) {
+    tuiConfig.plugin = tuiConfig.plugin.map(plugin => plugin.endsWith('/freshell-rebind-plugin.ts')
+      ? '<freshell-rebind-plugin>' : plugin)
+  }
   return {
     provider: record.provider,
     argv: ordinaryProviderArgs(record.argv, record.provider),
@@ -147,7 +154,7 @@ function normalized(record: RecordRow): unknown {
     providerConfig: record.providerConfig,
     providerPlugin: record.providerPlugin,
     projectedProjectConfig: record.projectedProjectConfig,
-    tuiConfig: record.tuiConfig,
+    tuiConfig,
     inlineConfig: record.inlineConfig,
     projectPlugin: record.projectPlugin,
     projectConfig: record.projectConfig,
@@ -211,6 +218,7 @@ describe('ordinary and managed terminal provider parity', () => {
       fs.chmodSync(wrapper, 0o755)
     }
     rig = new ManagedRuntimeBrowserRig(root, 2, {
+      NODE_OPTIONS: '',
       FRESHELL_BIND_HOST: '0.0.0.0',
       OPENCODE_TUI_CONFIG: path.join(webHome, '.config/opencode/tui.jsonc'),
       OPENCODE_CONFIG_CONTENT: JSON.stringify({ mcp: { vendor: {
@@ -220,7 +228,7 @@ describe('ordinary and managed terminal provider parity', () => {
       ...Object.fromEntries(
         providers.map(provider => [`${provider.toUpperCase()}_CMD`, path.join(workspace, `parity-${provider}`)]),
       ),
-    }, {}, 'test', {
+    }, { NODE_OPTIONS: '' }, 'test', {
       enabledProviders: providers,
       providerSettings: {
         claude: { model: 'haiku', effort: 'low' },
@@ -251,6 +259,17 @@ describe('ordinary and managed terminal provider parity', () => {
       fs.writeFileSync(target, content)
     }
   }, 900_000)
+
+  beforeEach(() => {
+    // Vitest shuffles cases. Each case sees the same user-owned inputs even
+    // when a prior recovery case edited them to exercise refresh semantics.
+    fs.writeFileSync(path.join(webHome, '.config/opencode/tui.jsonc'), '{ // home-selected\n  "plugin": ["file://home-selected-tui.js"]\n}\n')
+    fs.writeFileSync(path.join(workspace, '.opencode/opencode.json'), JSON.stringify({ plugin: ['file://parity-plugin.js'] }))
+    const userConfig = path.join(rig.info.homeDir, '.config/opencode')
+    fs.writeFileSync(path.join(userConfig, 'opencode.jsonc'), '{ "plugin": ["file://user-parity-plugin.js"] }\n')
+    fs.rmSync(path.join(userConfig, 'new-provider.jsonc'), { force: true })
+    fs.writeFileSync(path.join(userConfig, 'plugins/parity-plugin.js'), 'export default { name: "parity" }\n')
+  })
 
   afterAll(async () => {
     try {
@@ -307,7 +326,7 @@ describe('ordinary and managed terminal provider parity', () => {
       ))
       mcpResults.push(mcp)
       if (provider !== 'amplifier') {
-        expect(mcp.error).toBeUndefined()
+        expect(mcp.error, `${provider} ${managed ? 'managed' : 'ordinary'} MCP probe`).toBeUndefined()
         expect(mcp.tools).toContain('freshell')
         expect(mcp.isError).toBe(false)
         expect(mcp.call?.ok).toBe(true)
@@ -322,7 +341,9 @@ describe('ordinary and managed terminal provider parity', () => {
     }
     expect(normalized(observed[1])).toEqual(normalized(observed[0]))
     if (provider === 'opencode') {
-      expect(observed[1].tuiConfig).toBe(fs.readFileSync(path.join(webHome, '.config/opencode/tui.jsonc'), 'utf8'))
+      const selected = JSON.parse(observed[1].tuiConfig)
+      expect(selected.plugin, `managed TUI: ${observed[1].tuiConfig}; direct TUI: ${observed[0].tuiConfig}`).toContain('file://home-selected-tui.js')
+      expect(selected.plugin.some((plugin: string) => plugin.endsWith('/freshell-rebind-plugin.ts'))).toBe(true)
       expect(observed[1].inlineConfig).toEqual(observed[0].inlineConfig)
       expect(observed[1].inlineConfig).toMatch(/^[a-f0-9]{64}$/)
     }
@@ -359,6 +380,10 @@ describe('ordinary and managed terminal provider parity', () => {
     await waitFor('OpenCode native identity', () => wire.recordRows().find(row => (
       row.kind === 'identity' && row.terminalId === terminalId
     )))
+    await waitFor('OpenCode resume evidence before replacement', async () => {
+      const view = (await rig.inventory()).find((row: any) => row.terminalId === terminalId)
+      return view?.durabilityState === 'resume_captured' ? view : undefined
+    }, 45_000)
     const before = await waitFor('running OpenCode incarnation', async () => {
       const view = await rig.runningViewForTerminal(terminalId)
       return view?.containerId ? view : undefined
@@ -396,7 +421,9 @@ describe('ordinary and managed terminal provider parity', () => {
     expect(resumed.projectConfig.dotOpencodeJson).toBeNull()
     expect(resumed.projectedProjectConfig).toBeNull()
     expect(resumed.providerOwned).toBe('provider-owned-state')
-    expect(resumed.tuiConfig).toBe(editedTui)
+    expect(JSON.parse(resumed.tuiConfig)).toMatchObject({ theme: 'light' })
+    expect(JSON.parse(resumed.tuiConfig).plugin.some((plugin: string) => plugin.endsWith('/freshell-rebind-plugin.ts'))).toBe(true)
+    expect(fs.readFileSync(path.join(webHome, '.config/opencode/tui.jsonc'), 'utf8')).toBe(editedTui)
     expect(resumed.tuiConfig).not.toBe(first.tuiConfig)
     const resumedMcp = await waitFor('resumed OpenCode MCP probe', () => wire.recordRows().filter(row => (
       row.provider === 'opencode' && row.kind === 'mcp'
@@ -404,6 +431,68 @@ describe('ordinary and managed terminal provider parity', () => {
       throw new Error(`${String(error)}; records: ${JSON.stringify(wire.recordRows())}; output: ${wire.terminalOutput()}`)
     })
     expect(resumedMcp.authenticatedCall).toMatchObject({ isError: false, count: 0 })
+  }, 360_000)
+
+  it('relays a managed OpenCode session switch and restores that native session', async () => {
+    const wire = await TerminalWire.connect(rig.info, true)
+    sockets.push(wire)
+    const { terminalId } = await wire.create('opencode', workspace)
+    wire.send({ type: 'terminal.input', terminalId, data: 'session switch setup\r' })
+    const initial = await waitFor('initial managed OpenCode identity', () => wire.recordRows().find(row => (
+      row.kind === 'identity' && row.terminalId === terminalId
+    )))
+    const before = await waitFor('managed OpenCode container before switch', async () => {
+      const view = await rig.runningViewForTerminal(terminalId)
+      return view?.containerId ? view : undefined
+    })
+    if (!before.containerId) throw new Error('managed OpenCode container missing')
+    const switchedId = `ses_ParitySwitch${Date.now()}`
+    const writeSignal = `
+      const fs = require('node:fs')
+      const path = require('node:path')
+      const { DatabaseSync } = require('node:sqlite')
+      const [previous, next, terminal] = process.argv.slice(1)
+      const home = '/home/freshell/provider'
+      const db = new DatabaseSync(path.join(home, '.local/share/opencode/opencode.db'))
+      const changed = db.prepare('UPDATE session SET id = ? WHERE id = ?').run(next, previous)
+      db.close()
+      if (changed.changes !== 1) throw new Error('native session row was not available')
+      const signals = path.join(home, '.freshell/session-signals/opencode')
+      fs.mkdirSync(signals, { recursive: true })
+      fs.writeFileSync(path.join(signals, terminal + '__' + Date.now() + '.json'),
+        JSON.stringify({ session_id: next }))
+    `
+    rig.ownedProviderExec(before.containerId, [
+      'node', '-e', writeSignal, initial.nativeSession.value, switchedId, terminalId,
+    ])
+    await wire.wait(frame => frame.type === 'terminal.session.associated'
+      && frame.terminalId === terminalId && frame.sessionRef?.sessionId === switchedId, 30_000).catch(async error => {
+      throw new Error(`${String(error)}; inventory: ${JSON.stringify(await rig.inventory())}; web: ${rig.web.capturedOutput().slice(-3000)}`)
+    })
+    await wire.wait(frame => frame.type === 'terminal.meta.updated'
+      && frame.upsert?.some((row: any) => row.terminalId === terminalId && row.sessionId === switchedId), 30_000)
+    await waitFor('switched OpenCode exact resume evidence', async () => {
+      const view = (await rig.inventory()).find((row: any) => row.terminalId === terminalId)
+      return view?.nativeSessionId === switchedId && view?.durabilityState === 'resume_captured' ? view : undefined
+    }, 20_000).catch(async error => {
+      throw new Error(`${String(error)}; inventory: ${JSON.stringify(await rig.inventory())}; supervisor: ${rig.runtime.containerLogs(rig.supervisor.containerId).slice(-4000)}`)
+    })
+    rig.runtime.killOwnedRuntimeExact(before.containerId)
+    const after = await waitFor('replacement OpenCode incarnation after native switch', async () => {
+      const view = await rig.runningViewForTerminal(terminalId)
+      return view?.containerId && view.incarnationId !== before.incarnationId ? view : undefined
+    }, 120_000).catch(async error => {
+      throw new Error(`${String(error)}; inventory: ${JSON.stringify(await rig.inventory())}; supervisor: ${rig.runtime.containerLogs(rig.supervisor.containerId).slice(-4000)}; web: ${rig.web.capturedOutput().slice(-4000)}`)
+    })
+    expect(after.soulId).toBe(before.soulId)
+    expect((await rig.inventory()).find((row: any) => row.terminalId === terminalId)?.nativeSessionId).toBe(switchedId)
+    await wire.wait(frame => frame.type === 'terminal.stream.changed'
+      && frame.terminalId === terminalId && frame.streamId !== before.terminalStreamId, 30_000)
+    await wire.attach(terminalId)
+    const resumed = await waitFor('resumed switched OpenCode launch', () => wire.recordRows().find(row => (
+      row.provider === 'opencode' && row.kind === 'launch' && row.argv.includes(switchedId)
+    )), 90_000)
+    expect(resumed.argv).toContain(switchedId)
   }, 360_000)
 
   it('recovers OpenCode inline and home JSONC TUI inputs after web restart with its container down', async () => {
@@ -451,7 +540,9 @@ describe('ordinary and managed terminal provider parity', () => {
     })
     expect(resumed.inlineConfig).toBe(first.inlineConfig)
     expect(resumed.inlineConfig).toMatch(/^[a-f0-9]{64}$/)
-    expect(resumed.tuiConfig).toBe(editedTui)
+    expect(JSON.parse(resumed.tuiConfig)).toMatchObject({ theme: 'solarized' })
+    expect(JSON.parse(resumed.tuiConfig).plugin.some((plugin: string) => plugin.endsWith('/freshell-rebind-plugin.ts'))).toBe(true)
+    expect(fs.readFileSync(path.join(webHome, '.config/opencode/tui.jsonc'), 'utf8')).toBe(editedTui)
     expect(resumed.tuiConfig).not.toBe(first.tuiConfig)
     const resumedMcp = await waitFor('resumed OpenCode MCP after web restart', () => recoveredWire.recordRows().find(row => (
       row.provider === 'opencode' && row.kind === 'mcp'

@@ -142,6 +142,15 @@ impl HostedPty {
                 Arc::clone(&exited),
             );
         }
+        if launch.mode == "opencode" {
+            spawn_opencode_signal_relay(
+                &launch.terminal_id,
+                launch.run_as_uid,
+                launch.run_as_gid,
+                Arc::clone(&native_session_id),
+                Arc::clone(&exited),
+            );
+        }
         let codex = if let Some(prepared) = prepared_codex {
             if let Err(error) = prepared.sidecar.adopt(&launch.terminal_id, 0).await {
                 pty.kill();
@@ -499,7 +508,9 @@ fn spawn_opencode_identity_watcher(
                     let session_id = String::from_utf8_lossy(&output.stdout).trim().to_string();
                     if session_id.starts_with("ses_") {
                         if let Ok(mut slot) = native_session_id.lock() {
-                            *slot = Some(session_id.clone());
+                            if slot.is_none() {
+                                *slot = Some(session_id.clone());
+                            }
                         }
                         tracing::info!(terminal_id = %terminal_id, session_id = %session_id,
                             "managed_opencode.native_session_discovered");
@@ -513,6 +524,89 @@ fn spawn_opencode_identity_watcher(
                     "managed_opencode.identity_helper_spawn_failed"),
             }
         });
+}
+
+/// The TUI plugin writes switch signals inside the soul's provider home.
+/// Relay the latest observed native id through the existing output batch,
+/// which the host associates with its pane using the normal guard ladder.
+fn spawn_opencode_signal_relay(
+    terminal_id: &str,
+    provider_uid: u32,
+    provider_gid: u32,
+    native_session_id: Arc<Mutex<Option<String>>>,
+    exited: Arc<AtomicBool>,
+) {
+    let signal_root = PathBuf::from("/home/freshell/provider/.freshell/session-signals/opencode");
+    let terminal_id = terminal_id.to_string();
+    let _ = thread::Builder::new()
+        .name(format!(
+            "opencode-signal-{}",
+            terminal_id.chars().take(12).collect::<String>()
+        ))
+        .spawn(move || {
+            // The provider HOME is 0700 and this trusted host intentionally
+            // lacks DAC_OVERRIDE. Set the filesystem identity on this
+            // dedicated reader thread so it can see the provider's signals.
+            #[cfg(target_os = "linux")]
+            unsafe {
+                libc::setfsgid(provider_gid);
+                libc::setfsuid(provider_uid);
+                if libc::setfsuid(u32::MAX) != provider_uid as libc::c_int {
+                    tracing::warn!(terminal_id = %terminal_id, provider_uid,
+                        "managed_opencode.signal_relay_identity_unavailable");
+                    return;
+                }
+            }
+            let mut last_file = None;
+            while !exited.load(Ordering::SeqCst) {
+                if let Some((name, session_id)) = latest_opencode_signal(&signal_root, &terminal_id)
+                {
+                    if last_file.as_deref() != Some(name.as_str()) {
+                        if let Ok(mut slot) = native_session_id.lock() {
+                            *slot = Some(session_id.clone());
+                        }
+                        tracing::info!(terminal_id = %terminal_id, session_id = %session_id,
+                            "managed_opencode.signal_relayed");
+                        last_file = Some(name);
+                    }
+                }
+                thread::sleep(Duration::from_millis(250));
+            }
+        });
+}
+
+fn latest_opencode_signal(root: &Path, terminal_id: &str) -> Option<(String, String)> {
+    let prefix = format!("{terminal_id}__");
+    let mut signals = std::fs::read_dir(root)
+        .ok()?
+        .filter_map(Result::ok)
+        .filter_map(|entry| {
+            let name = entry.file_name().into_string().ok()?;
+            if !name.starts_with(&prefix) || !name.ends_with(".json") {
+                return None;
+            }
+            Some((name, entry.path()))
+        })
+        .collect::<Vec<_>>();
+    signals.sort_by(|left, right| right.0.cmp(&left.0));
+    for (name, path) in signals {
+        let Ok(raw) = std::fs::read(&path) else {
+            continue;
+        };
+        let Ok(value) = serde_json::from_slice::<serde_json::Value>(&raw) else {
+            continue;
+        };
+        let Some(session_id) = value.get("session_id").and_then(serde_json::Value::as_str) else {
+            continue;
+        };
+        if session_id
+            .strip_prefix("ses_")
+            .is_some_and(|id| !id.is_empty() && id.bytes().all(|byte| byte.is_ascii_alphanumeric()))
+        {
+            return Some((name, session_id.to_string()));
+        }
+    }
+    None
 }
 
 pub(crate) fn run_opencode_identity_worker(args: &[String]) -> Result<(), String> {
@@ -550,7 +644,7 @@ fn worker_arg(args: &[String], name: &str) -> Result<String, String> {
 
 #[cfg(test)]
 mod managed_opencode_identity_tests {
-    use super::select_opencode_session;
+    use super::{latest_opencode_signal, select_opencode_session};
     use freshell_sessions::parse::opencode::OpencodeSessionRow;
 
     fn row(id: &str, cwd: &str, created_at: i64) -> OpencodeSessionRow {
@@ -564,6 +658,23 @@ mod managed_opencode_identity_tests {
             has_three_views_marker: Some(0),
             model: None,
         }
+    }
+
+    #[test]
+    fn signal_relay_selects_latest_valid_switch_for_its_terminal() {
+        let root = tempfile::tempdir().unwrap();
+        for (name, body) in [
+            ("term__000001.json", r#"{"session_id":"ses_First"}"#),
+            ("term__000002.json", r#"{"session_id":"ses_Second"}"#),
+            ("term__000003.json", r#"{"hello":true}"#),
+            ("other__000004.json", r#"{"session_id":"ses_Foreign"}"#),
+        ] {
+            std::fs::write(root.path().join(name), body).unwrap();
+        }
+        assert_eq!(
+            latest_opencode_signal(root.path(), "term"),
+            Some(("term__000002.json".into(), "ses_Second".into()))
+        );
     }
 
     #[test]

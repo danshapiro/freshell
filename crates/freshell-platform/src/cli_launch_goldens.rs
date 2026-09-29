@@ -664,14 +664,12 @@ fn g_o3_opencode_resume_suppresses_model() {
     );
 }
 
-/// Rebind skip (a) — the user already set `OPENCODE_TUI_CONFIG` in the
-/// process env: a path var cannot be merged, so the resolver must NOT
-/// inject at all (the user's raw process-env value passes through to the
-/// PTY untouched; no freshell files are forced on the pane).
+/// The IO layer merges a user-selected TUI file into its generated selector.
 #[test]
-fn opencode_rebind_skips_when_user_tui_config_set() {
+fn opencode_rebind_uses_merged_selector_when_user_tui_config_set() {
     let mut inputs = opencode_inputs();
-    inputs.opencode_rebind_tui_config = Some(golden_rebind_tui_config());
+    let merged = golden_rebind_tui_config();
+    inputs.opencode_rebind_tui_config = Some(merged.clone());
     let launch = resolve_coding_cli_command(
         &specs(),
         &inputs,
@@ -679,7 +677,7 @@ fn opencode_rebind_skips_when_user_tui_config_set() {
     )
     .unwrap()
     .unwrap();
-    assert!(!launch.env.contains_key("OPENCODE_TUI_CONFIG"));
+    assert_eq!(launch.env.get("OPENCODE_TUI_CONFIG"), Some(&merged));
 }
 
 /// Rebind skip (b) — the `FRESHELL_OPENCODE_REBIND` kill switch set to `0`

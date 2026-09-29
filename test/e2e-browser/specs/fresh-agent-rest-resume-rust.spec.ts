@@ -132,10 +132,13 @@ async function bootOpencodeServer(): Promise<{
   await fsp.mkdir(projectDir, { recursive: true })
   await fsp.mkdir(binDir, { recursive: true })
   const fakeOpencode = path.join(binDir, 'opencode')
-  await fsp.copyFile(OPENCODE_FIXTURE, fakeOpencode)
+  const fakeProgram = path.join(binDir, 'fake-opencode.cjs')
+  await fsp.copyFile(OPENCODE_FIXTURE, fakeProgram)
+  await fsp.writeFile(fakeOpencode, `#!/bin/sh\nexec node "${fakeProgram}" "$@"\n`)
   await fsp.chmod(fakeOpencode, 0o755)
   const server = new RustServer({
     env: {
+      NODE_OPTIONS: '',
       PATH: `${binDir}${path.delimiter}${process.env.PATH ?? ''}`,
       OPENCODE_CMD: fakeOpencode,
       FAKE_OPENCODE_AUDIT_LOG: auditLogPath,

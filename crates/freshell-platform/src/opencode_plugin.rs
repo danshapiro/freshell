@@ -1,9 +1,8 @@
 //! Freshell's opencode TUI rebind plugin: embedded source and idempotent
 //! install of TWO freshell-owned files into ~/.freshell/opencode/ — the
-//! plugin itself and a plugin-only tui.json pointing at it. The tui.json
-//! is injected per-pane via OPENCODE_TUI_CONFIG (cli_launch.rs); TUI config
-//! sources merge and plugin arrays union, so a plugin-only file can never
-//! shadow the user's own TUI config.
+//! plugin itself and a generated tui.json pointing at it. When the user has
+//! selected a TUI config, its settings and plugins are copied into that
+//! generated file before the rebind plugin is appended.
 
 use percent_encoding::{utf8_percent_encode, AsciiSet, CONTROLS};
 use std::io::Write;
@@ -101,17 +100,57 @@ fn write_atomic_if_changed(path: &Path, content: &str) -> std::io::Result<()> {
 }
 
 /// Idempotently materialize BOTH freshell-owned files into
-/// `~/.freshell/opencode/`: the plugin source and the plugin-only tui.json
-/// pointing at it. Atomic (tmp + rename); rewrites only when content
+/// `~/.freshell/opencode/`: the plugin source and generated tui.json.
+/// Atomic (tmp + rename); rewrites only when content
 /// differs, so a running opencode never observes a torn file. Returns the
 /// tui.json path — the value cli_launch.rs injects as OPENCODE_TUI_CONFIG.
 /// Bun caches failed imports for the process lifetime, so this MUST run
 /// (and succeed) before the TUI launches.
 pub fn ensure_rebind_plugin_installed(home: &Path) -> std::io::Result<PathBuf> {
+    ensure_rebind_plugin_with_user_config(home, None)
+}
+
+/// Materialize a TUI selector that includes Freshell's plugin and every key
+/// from the user's selected TUI config. The user file remains byte-for-byte
+/// unchanged; only the file under `.freshell/opencode` is regenerated.
+pub fn ensure_rebind_plugin_with_user_config(
+    home: &Path,
+    selected: Option<&Path>,
+) -> std::io::Result<PathBuf> {
     let plugin = rebind_plugin_path(home);
     write_atomic_if_changed(&plugin, REBIND_PLUGIN_SOURCE)?;
     let tui_json = tui_config_path(home);
-    write_atomic_if_changed(&tui_json, &tui_config_content(&plugin))?;
+    let content = if let Some(selected) = selected {
+        let raw = std::fs::read_to_string(selected)?;
+        let mut config = crate::opencode_config::parse_jsonc_object(&raw).ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "OpenCode TUI config contains malformed JSONC or is not an object",
+            )
+        })?;
+        let plugins = config
+            .as_object_mut()
+            .expect("validated object")
+            .entry("plugin")
+            .or_insert_with(|| serde_json::json!([]));
+        let Some(plugins) = plugins.as_array_mut() else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "OpenCode TUI plugin list is not an array",
+            ));
+        };
+        let own = plugin_file_spec(&plugin);
+        if !plugins
+            .iter()
+            .any(|entry| entry.as_str() == Some(own.as_str()))
+        {
+            plugins.push(serde_json::Value::String(own));
+        }
+        config.to_string()
+    } else {
+        tui_config_content(&plugin)
+    };
+    write_atomic_if_changed(&tui_json, &content)?;
     Ok(tui_json)
 }
 
@@ -209,5 +248,35 @@ mod tests {
             plugin_file_spec(Path::new(r"C:\Users\dev\p.ts")),
             "file:///C:/Users/dev/p.ts"
         );
+    }
+
+    #[test]
+    fn selected_user_tui_config_and_rebind_plugin_are_both_loaded() {
+        let home = tempfile::tempdir().unwrap();
+        let selected = home.path().join("selected-tui.jsonc");
+        let raw = "{ // keep the source\n \"theme\":\"dark\",\"plugin\":[\"file:///user.ts\",], }";
+        std::fs::write(&selected, raw).unwrap();
+        let generated =
+            ensure_rebind_plugin_with_user_config(home.path(), Some(&selected)).unwrap();
+        let effective: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(generated).unwrap()).unwrap();
+        assert_eq!(effective["theme"], "dark");
+        assert_eq!(effective["plugin"].as_array().unwrap().len(), 2);
+        assert_eq!(effective["plugin"][0], "file:///user.ts");
+        assert_eq!(std::fs::read_to_string(selected).unwrap(), raw);
+    }
+
+    #[test]
+    fn malformed_selected_tui_config_is_refused_without_editing_source() {
+        let home = tempfile::tempdir().unwrap();
+        let selected = home.path().join("selected-tui.jsonc");
+        let raw = "{\"plugin\":[\"fixture-secret\",}";
+        std::fs::write(&selected, raw).unwrap();
+        let error =
+            ensure_rebind_plugin_with_user_config(home.path(), Some(&selected)).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert!(!error.to_string().contains("fixture-secret"));
+        assert_eq!(std::fs::read_to_string(selected).unwrap(), raw);
+        assert!(!tui_config_path(home.path()).exists());
     }
 }

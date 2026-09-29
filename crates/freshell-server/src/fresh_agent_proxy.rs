@@ -453,9 +453,10 @@ impl HostedFreshAgentProxy {
             tracing::warn!(%error, "fresh_agent.create.capability_failed");
         })?;
         let mut provider_launch_context =
-            crate::managed_provider_bootstrap::provider_launch_context_for_managed(
+            crate::managed_provider_bootstrap::provider_launch_context_for_managed_at(
                 provider.as_str(),
                 &workspace,
+                &cwd,
                 Some(mcp_capability.clone()),
             );
         // Fresh agents use the direct provider transports. Those transports

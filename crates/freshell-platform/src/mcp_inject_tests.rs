@@ -790,6 +790,113 @@ fn opencode_user_managed_entry_untouched() {
     assert!(!opencode_sidecar_path(&cwd).exists());
 }
 
+#[test]
+fn opencode_preserves_jsonc_sources_and_user_freshell_server() {
+    let scratch = Scratch::new("oc-jsonc-runtime");
+    let ws = Scratch::new("oc-jsonc-project");
+    let rt = fake_rt(scratch.path(), false);
+    let cwd = ws.str();
+    let config_dir = ws.path().join(".opencode");
+    std::fs::create_dir_all(&config_dir).unwrap();
+    let jsonc = r#"{
+      // This source is owned by the user.
+      "provider": {"demo": {"name": "Demo"}},
+      "plugin": ["file:///plugin.ts"],
+      "mcp": {"freshell": {"type": "local", "command": ["user-server"]}},
+    }"#;
+    std::fs::write(config_dir.join("opencode.jsonc"), jsonc).unwrap();
+
+    generate_mcp_injection(&rt, "opencode", "t1", Some(&cwd), ProviderTarget::Unix).unwrap();
+    let generated = config_dir.join("opencode.json");
+    assert!(!generated.exists(), "a user-owned Freshell entry must win");
+    assert_eq!(
+        std::fs::read_to_string(config_dir.join("opencode.jsonc")).unwrap(),
+        jsonc
+    );
+    cleanup_mcp_config(&rt, "t1", "opencode", Some(&cwd));
+    assert_eq!(
+        std::fs::read_to_string(config_dir.join("opencode.jsonc")).unwrap(),
+        jsonc
+    );
+}
+
+#[test]
+fn opencode_refuses_malformed_jsonc_without_writing_generated_config() {
+    let scratch = Scratch::new("oc-jsonc-bad-runtime");
+    let ws = Scratch::new("oc-jsonc-bad-project");
+    let rt = fake_rt(scratch.path(), false);
+    let cwd = ws.str();
+    let config_dir = ws.path().join(".opencode");
+    std::fs::create_dir_all(&config_dir).unwrap();
+    std::fs::write(config_dir.join("opencode.jsonc"), "{broken // user input").unwrap();
+    let error = generate_mcp_injection(&rt, "opencode", "t1", Some(&cwd), ProviderTarget::Unix)
+        .unwrap_err();
+    assert!(error.message.contains("opencode.jsonc"), "{error}");
+    assert!(!config_dir.join("opencode.json").exists());
+    assert!(!opencode_sidecar_path(&cwd).exists());
+}
+
+#[test]
+fn opencode_generated_entry_with_jsonc_source_cleans_up_after_final_reference() {
+    let scratch = Scratch::new("oc-jsonc-ref-runtime");
+    let ws = Scratch::new("oc-jsonc-ref-project");
+    let rt = fake_rt(scratch.path(), false);
+    let cwd = ws.str();
+    let dir = ws.path().join(".opencode");
+    std::fs::create_dir_all(&dir).unwrap();
+    let user_jsonc = "{ // user's own settings\n\"plugin\":[\"file:///user.ts\"],\"mcp\":{\"user\":{\"type\":\"local\",\"command\":[\"user-mcp\"]}},}";
+    std::fs::write(dir.join("opencode.jsonc"), user_jsonc).unwrap();
+
+    generate_mcp_injection(&rt, "opencode", "t1", Some(&cwd), ProviderTarget::Unix).unwrap();
+    generate_mcp_injection(&rt, "opencode", "t2", Some(&cwd), ProviderTarget::Unix).unwrap();
+    assert_eq!(
+        read_sidecar(&cwd).unwrap()["refCount"],
+        serde_json::json!(2)
+    );
+    cleanup_mcp_config(&rt, "t1", "opencode", Some(&cwd));
+    assert!(dir.join("opencode.json").is_file());
+    assert_eq!(
+        std::fs::read_to_string(dir.join("opencode.jsonc")).unwrap(),
+        user_jsonc
+    );
+    cleanup_mcp_config(&rt, "t2", "opencode", Some(&cwd));
+    assert!(!dir.join("opencode.json").exists());
+    assert!(!opencode_sidecar_path(&cwd).exists());
+    assert_eq!(
+        std::fs::read_to_string(dir.join("opencode.jsonc")).unwrap(),
+        user_jsonc
+    );
+}
+
+#[test]
+fn opencode_cleanup_preserves_user_replacement_of_generated_entry() {
+    let scratch = Scratch::new("oc-owned-replaced-runtime");
+    let ws = Scratch::new("oc-owned-replaced-project");
+    let rt = fake_rt(scratch.path(), false);
+    let cwd = ws.str();
+    generate_mcp_injection(&rt, "opencode", "t1", Some(&cwd), ProviderTarget::Unix).unwrap();
+    let path = opencode_config_path(&cwd);
+    let mut config: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    config["mcp"]["freshell"]["command"] = serde_json::json!(["user-replacement"]);
+    std::fs::write(&path, config.to_string()).unwrap();
+    generate_mcp_injection(&rt, "opencode", "t2", Some(&cwd), ProviderTarget::Unix).unwrap();
+    let unchanged: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    assert_eq!(
+        unchanged["mcp"]["freshell"]["command"],
+        serde_json::json!(["user-replacement"])
+    );
+    cleanup_mcp_config(&rt, "t1", "opencode", Some(&cwd));
+    cleanup_mcp_config(&rt, "t2", "opencode", Some(&cwd));
+    let preserved: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    assert_eq!(
+        preserved["mcp"]["freshell"]["command"],
+        serde_json::json!(["user-replacement"])
+    );
+}
+
 /// Merge preserves other config keys; cleanup rewrites without freshell.
 #[test]
 fn opencode_merge_preserves_other_keys_and_cleanup_rewrites() {
