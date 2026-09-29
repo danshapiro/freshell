@@ -827,9 +827,9 @@ fn opencode_inject(
         if file_exists {
             let text = std::fs::read_to_string(&config_path)
                 .map_err(|e| McpInjectError::new(e.to_string()))?;
-            let parsed: serde_json::Value = serde_json::from_str(&text).map_err(|_| {
+            let parsed = crate::opencode_config::parse_jsonc_value(&text).ok_or_else(|| {
                 McpInjectError::new(format!(
-                    "Cannot inject MCP config: existing {} contains malformed JSON. Please fix or remove the file manually, then retry.",
+                    "Cannot inject MCP config: existing {} contains malformed JSONC. Please fix or remove the file manually, then retry.",
                     config_path.display()
                 ))
             })?;

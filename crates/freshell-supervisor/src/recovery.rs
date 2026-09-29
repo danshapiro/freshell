@@ -2432,11 +2432,11 @@ mod tests {
     }
 
     #[test]
-    fn recovery_refreshes_new_provider_config_selectors() {
+    fn recovery_refreshes_provider_config_from_nondefault_xdg_root() {
         use freshell_runtime_protocol::{ProviderLaunchContext, ProviderPreparation};
         let workspace = tempfile::tempdir().unwrap();
         let home = tempfile::tempdir().unwrap();
-        let user_root = home.path().join(".config/opencode");
+        let user_root = home.path().join("custom-xdg/opencode");
         std::fs::create_dir_all(&user_root).unwrap();
         std::fs::write(user_root.join("old.jsonc"), "{}").unwrap();
         let mut context = ProviderLaunchContext {
@@ -2478,6 +2478,11 @@ mod tests {
             .config
             .iter()
             .any(|reference| reference.relative_path == "new-provider.jsonc"));
+        assert!(context.config.iter().all(|reference| {
+            reference
+                .provider_relative_path
+                .starts_with(".config/opencode/")
+        }));
         let ProviderPreparation::Opencode { project_config, .. } = &context.preparation else {
             panic!("wrong provider")
         };

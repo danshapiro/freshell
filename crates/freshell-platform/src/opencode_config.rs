@@ -146,8 +146,12 @@ fn is_direct_owned_mcp_entry(project_dir: &Path, entry: &Value) -> bool {
 }
 
 pub fn parse_jsonc_object(raw: &str) -> Option<Value> {
-    let value: Value = serde_json::from_str(&jsonc_to_strict_json(raw)).ok()?;
+    let value = parse_jsonc_value(raw)?;
     value.is_object().then_some(value)
+}
+
+pub fn parse_jsonc_value(raw: &str) -> Option<Value> {
+    serde_json::from_str(&jsonc_to_strict_json(raw)).ok()
 }
 
 fn validate_mcp_field(value: &Value, path: &Path) -> Result<(), ConfigError> {

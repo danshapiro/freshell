@@ -139,17 +139,10 @@ fn workload_mounts(
             )?)
         } else if context.is_some() {
             let home = std::env::var_os("HOME");
-            let relative = match provider {
-                "claude" => ".claude",
-                "codex" => ".codex",
-                "opencode" => ".config/opencode",
-                "amplifier" => ".amplifier",
-                _ => return Err("unapproved provider user root".into()),
-            };
-            if let Some(home) = home
-                .as_ref()
-                .filter(|home| Path::new(home).join(relative).exists())
-            {
+            let user_root_exists = home.as_ref().is_some_and(|home| {
+                provider_user_root_path(Path::new(home), provider).is_some_and(|path| path.exists())
+            });
+            if let Some(home) = home.as_ref().filter(|_| user_root_exists) {
                 Some(approved_user_provider_root(Path::new(home), provider)?)
             } else if context.is_some_and(user_provider_config_referenced) {
                 return Err("referenced provider user root is unavailable".into());
@@ -253,20 +246,46 @@ fn user_provider_config_referenced(context: &ProviderLaunchContext) -> bool {
 }
 
 fn approved_user_provider_root(home: &Path, provider: &str) -> Result<PathBuf, String> {
-    let relative = match provider {
-        "claude" => ".claude",
-        "codex" => ".codex",
-        "opencode" => ".config/opencode",
-        "amplifier" => ".amplifier",
+    let canonical_home = canonical_dir(home, "HOME")?;
+    let (candidate, boundary) = match provider {
+        "claude" => (canonical_home.join(".claude"), canonical_home.clone()),
+        "codex" => (canonical_home.join(".codex"), canonical_home.clone()),
+        "amplifier" => (canonical_home.join(".amplifier"), canonical_home.clone()),
+        "opencode" => {
+            let config_home = std::env::var_os("XDG_CONFIG_HOME")
+                .filter(|value| !value.is_empty())
+                .map(PathBuf::from)
+                .unwrap_or_else(|| canonical_home.join(".config"));
+            let canonical_config_home = canonical_dir(&config_home, "XDG_CONFIG_HOME")?;
+            (
+                canonical_config_home.join("opencode"),
+                canonical_config_home,
+            )
+        }
         _ => return Err("unapproved provider user root".into()),
     };
-    let canonical_home = canonical_dir(home, "HOME")?;
-    let root = canonical_dir(&canonical_home.join(relative), "provider user root")?;
-    if !root.starts_with(canonical_home) {
-        return Err("provider user root escaped HOME".into());
+    let root = canonical_dir(&candidate, "provider user root")?;
+    if !root.starts_with(&boundary) {
+        return Err("provider user root escaped its approved source root".into());
     }
     reject_management_path(&root)?;
     Ok(root)
+}
+
+fn provider_user_root_path(home: &Path, provider: &str) -> Option<PathBuf> {
+    match provider {
+        "claude" => Some(home.join(".claude")),
+        "codex" => Some(home.join(".codex")),
+        "opencode" => Some(
+            std::env::var_os("XDG_CONFIG_HOME")
+                .filter(|value| !value.is_empty())
+                .map(PathBuf::from)
+                .unwrap_or_else(|| home.join(".config"))
+                .join("opencode"),
+        ),
+        "amplifier" => Some(home.join(".amplifier")),
+        _ => None,
+    }
 }
 
 fn canonical_dir(path: &Path, label: &str) -> Result<PathBuf, String> {

@@ -182,6 +182,7 @@ describe('ordinary and managed terminal provider parity', () => {
   let rig: ManagedRuntimeBrowserRig
   let workspace: string
   let webHome: string
+  let xdgConfigHome: string
   let inheritedFreshellUrl: string | undefined
   const sockets: TerminalWire[] = []
 
@@ -190,8 +191,9 @@ describe('ordinary and managed terminal provider parity', () => {
     delete process.env.FRESHELL_URL
     workspace = fs.mkdtempSync(path.join(root, '.provider-parity-'))
     webHome = fs.mkdtempSync(path.join(os.tmpdir(), 'freshell-parity-home-'))
-    fs.mkdirSync(path.join(webHome, '.config/opencode'), { recursive: true })
-    fs.writeFileSync(path.join(webHome, '.config/opencode/tui.jsonc'), '{ // home-selected\n  "plugin": ["file://home-selected-tui.js"]\n}\n')
+    xdgConfigHome = path.join(webHome, 'custom-xdg')
+    fs.mkdirSync(path.join(xdgConfigHome, 'opencode'), { recursive: true })
+    fs.writeFileSync(path.join(xdgConfigHome, 'opencode/tui.jsonc'), '{ // home-selected\n  "plugin": ["file://home-selected-tui.js"]\n}\n')
     fs.chmodSync(workspace, 0o777)
     fs.mkdirSync(path.join(workspace, '.opencode'), { mode: 0o777 })
     fs.writeFileSync(path.join(workspace, 'opencode.jsonc'), '{ // provider parity\n  "plugin": ["file://parity-plugin.js"]\n}\n')
@@ -220,7 +222,8 @@ describe('ordinary and managed terminal provider parity', () => {
     rig = new ManagedRuntimeBrowserRig(root, 2, {
       NODE_OPTIONS: '',
       FRESHELL_BIND_HOST: '0.0.0.0',
-      OPENCODE_TUI_CONFIG: path.join(webHome, '.config/opencode/tui.jsonc'),
+      XDG_CONFIG_HOME: xdgConfigHome,
+      OPENCODE_TUI_CONFIG: path.join(xdgConfigHome, 'opencode/tui.jsonc'),
       OPENCODE_CONFIG_CONTENT: JSON.stringify({ mcp: { vendor: {
         type: 'local', command: ['vendor-tool', '--token', nestedSecretMarker],
         endpoint: `https://${nestedSecretMarker}.example`,
@@ -228,7 +231,7 @@ describe('ordinary and managed terminal provider parity', () => {
       ...Object.fromEntries(
         providers.map(provider => [`${provider.toUpperCase()}_CMD`, path.join(workspace, `parity-${provider}`)]),
       ),
-    }, { NODE_OPTIONS: '' }, 'test', {
+    }, { NODE_OPTIONS: '', XDG_CONFIG_HOME: xdgConfigHome }, 'test', {
       enabledProviders: providers,
       providerSettings: {
         claude: { model: 'haiku', effort: 'low' },
@@ -241,7 +244,7 @@ describe('ordinary and managed terminal provider parity', () => {
     for (const [directory, filename, content] of [
       ['.claude', 'settings.json', JSON.stringify({ paritySetting: true })],
       ['.codex', 'config.toml', 'parity_setting = true\n'],
-      ['.config/opencode', 'opencode.jsonc', '{ "plugin": ["file://user-parity-plugin.js"] }\n'],
+      ['custom-xdg/opencode', 'opencode.jsonc', '{ "plugin": ["file://user-parity-plugin.js"] }\n'],
       ['.amplifier', 'config.yaml', 'parity_setting: true\n'],
     ]) {
       const location = path.join(rig.info.homeDir, directory)
@@ -251,7 +254,7 @@ describe('ordinary and managed terminal provider parity', () => {
     for (const [directory, relative, content] of [
       ['.claude', 'plugins/parity-plugin.txt', 'claude parity plugin\n'],
       ['.codex', 'skills/parity/SKILL.md', 'codex parity skill\n'],
-      ['.config/opencode', 'plugins/parity-plugin.js', 'export default { name: "parity" }\n'],
+      ['custom-xdg/opencode', 'plugins/parity-plugin.js', 'export default { name: "parity" }\n'],
       ['.amplifier', 'bundles/parity-bundle.yaml', 'name: parity\n'],
     ]) {
       const target = path.join(rig.info.homeDir, directory, relative)
@@ -263,9 +266,9 @@ describe('ordinary and managed terminal provider parity', () => {
   beforeEach(() => {
     // Vitest shuffles cases. Each case sees the same user-owned inputs even
     // when a prior recovery case edited them to exercise refresh semantics.
-    fs.writeFileSync(path.join(webHome, '.config/opencode/tui.jsonc'), '{ // home-selected\n  "plugin": ["file://home-selected-tui.js"]\n}\n')
+    fs.writeFileSync(path.join(xdgConfigHome, 'opencode/tui.jsonc'), '{ // home-selected\n  "plugin": ["file://home-selected-tui.js"]\n}\n')
     fs.writeFileSync(path.join(workspace, '.opencode/opencode.json'), JSON.stringify({ plugin: ['file://parity-plugin.js'] }))
-    const userConfig = path.join(rig.info.homeDir, '.config/opencode')
+    const userConfig = path.join(xdgConfigHome, 'opencode')
     fs.writeFileSync(path.join(userConfig, 'opencode.jsonc'), '{ "plugin": ["file://user-parity-plugin.js"] }\n')
     fs.rmSync(path.join(userConfig, 'new-provider.jsonc'), { force: true })
     fs.writeFileSync(path.join(userConfig, 'plugins/parity-plugin.js'), 'export default { name: "parity" }\n')
@@ -391,12 +394,12 @@ describe('ordinary and managed terminal provider parity', () => {
     if (!before.containerId) throw new Error('initial OpenCode container missing')
     rig.ownedProviderExec(before.containerId, ['sh', '-c',
       'printf provider-owned-state > /home/freshell/provider/.config/opencode/plugins/provider-owned.txt'])
-    fs.writeFileSync(path.join(rig.info.homeDir, '.config/opencode/new-provider.jsonc'), '{"replacement":true}\n')
-    fs.writeFileSync(path.join(rig.info.homeDir, '.config/opencode/opencode.jsonc'), '{"replacementOriginal":true}\n')
-    fs.rmSync(path.join(rig.info.homeDir, '.config/opencode/plugins/parity-plugin.js'))
+    fs.writeFileSync(path.join(xdgConfigHome, 'opencode/new-provider.jsonc'), '{"replacement":true}\n')
+    fs.writeFileSync(path.join(xdgConfigHome, 'opencode/opencode.jsonc'), '{"replacementOriginal":true}\n')
+    fs.rmSync(path.join(xdgConfigHome, 'opencode/plugins/parity-plugin.js'))
     fs.rmSync(path.join(workspace, '.opencode/opencode.json'))
     const editedTui = '{ // changed before replacement\n  "theme": "light"\n}\n'
-    fs.writeFileSync(path.join(webHome, '.config/opencode/tui.jsonc'), editedTui)
+    fs.writeFileSync(path.join(xdgConfigHome, 'opencode/tui.jsonc'), editedTui)
     rig.runtime.killOwnedRuntimeExact(before.containerId)
     const after = await waitFor('replacement OpenCode incarnation', async () => {
       const view = await rig.runningViewForTerminal(terminalId)
@@ -423,7 +426,7 @@ describe('ordinary and managed terminal provider parity', () => {
     expect(resumed.providerOwned).toBe('provider-owned-state')
     expect(JSON.parse(resumed.tuiConfig)).toMatchObject({ theme: 'light' })
     expect(JSON.parse(resumed.tuiConfig).plugin.some((plugin: string) => plugin.endsWith('/freshell-rebind-plugin.ts'))).toBe(true)
-    expect(fs.readFileSync(path.join(webHome, '.config/opencode/tui.jsonc'), 'utf8')).toBe(editedTui)
+    expect(fs.readFileSync(path.join(xdgConfigHome, 'opencode/tui.jsonc'), 'utf8')).toBe(editedTui)
     expect(resumed.tuiConfig).not.toBe(first.tuiConfig)
     const resumedMcp = await waitFor('resumed OpenCode MCP probe', () => wire.recordRows().filter(row => (
       row.provider === 'opencode' && row.kind === 'mcp'
@@ -513,7 +516,7 @@ describe('ordinary and managed terminal provider parity', () => {
     if (!before.containerId) throw new Error('initial OpenCode container missing')
     await rig.web.kill()
     const editedTui = '{ // changed while web is down\n  "theme": "solarized"\n}\n'
-    fs.writeFileSync(path.join(webHome, '.config/opencode/tui.jsonc'), editedTui)
+    fs.writeFileSync(path.join(xdgConfigHome, 'opencode/tui.jsonc'), editedTui)
     rig.runtime.killOwnedRuntimeExact(before.containerId)
     await rig.restartWebGracefully()
     const after = await waitFor('replacement after web restart', async () => {
@@ -542,7 +545,7 @@ describe('ordinary and managed terminal provider parity', () => {
     expect(resumed.inlineConfig).toMatch(/^[a-f0-9]{64}$/)
     expect(JSON.parse(resumed.tuiConfig)).toMatchObject({ theme: 'solarized' })
     expect(JSON.parse(resumed.tuiConfig).plugin.some((plugin: string) => plugin.endsWith('/freshell-rebind-plugin.ts'))).toBe(true)
-    expect(fs.readFileSync(path.join(webHome, '.config/opencode/tui.jsonc'), 'utf8')).toBe(editedTui)
+    expect(fs.readFileSync(path.join(xdgConfigHome, 'opencode/tui.jsonc'), 'utf8')).toBe(editedTui)
     expect(resumed.tuiConfig).not.toBe(first.tuiConfig)
     const resumedMcp = await waitFor('resumed OpenCode MCP after web restart', () => recoveredWire.recordRows().find(row => (
       row.provider === 'opencode' && row.kind === 'mcp'

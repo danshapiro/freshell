@@ -49,6 +49,27 @@ fn provider_launch_context_from_home_at(
     home: &Path,
     mcp_capability: Option<McpCapabilityReference>,
 ) -> Option<ProviderLaunchContext> {
+    let xdg_config_home = std::env::var_os("XDG_CONFIG_HOME")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from);
+    provider_launch_context_from_home_at_with_xdg(
+        provider,
+        workspace,
+        project_dir,
+        home,
+        xdg_config_home.as_deref(),
+        mcp_capability,
+    )
+}
+
+fn provider_launch_context_from_home_at_with_xdg(
+    provider: &str,
+    workspace: &Path,
+    project_dir: &Path,
+    home: &Path,
+    xdg_config_home: Option<&Path>,
+    mcp_capability: Option<McpCapabilityReference>,
+) -> Option<ProviderLaunchContext> {
     let mcp_enabled = mcp_capability.is_some();
     let (root, entries, preparation) = match provider {
         "claude" => (
@@ -156,7 +177,14 @@ fn provider_launch_context_from_home_at(
         }
         other => other,
     };
-    let provider_root = home.join(root);
+    let default_xdg_config_home = home.join(".config");
+    let provider_root = if provider == "opencode" {
+        xdg_config_home
+            .unwrap_or(&default_xdg_config_home)
+            .join("opencode")
+    } else {
+        home.join(root)
+    };
     let mut selected = entries
         .iter()
         .map(|entry| (*entry).to_owned())
@@ -488,6 +516,46 @@ mod tests {
         assert!(context.config.iter().any(
             |reference| reference.relative_path == "plugin" && reference.format == "directory"
         ));
+    }
+
+    #[test]
+    fn opencode_context_uses_effective_xdg_config_home_for_global_sources() {
+        let workspace = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let xdg = tempfile::tempdir().unwrap();
+        let global = xdg.path().join("opencode");
+        fs::create_dir_all(global.join("plugin")).unwrap();
+        fs::write(global.join("opencode.jsonc"), "{ // xdg global\n}").unwrap();
+        fs::write(global.join("plugin/user.ts"), "export default {}\n").unwrap();
+        fs::create_dir_all(home.path().join(".config/opencode")).unwrap();
+        fs::write(home.path().join(".config/opencode/opencode.json"), "{}").unwrap();
+
+        let context = provider_launch_context_from_home_at_with_xdg(
+            "opencode",
+            workspace.path(),
+            workspace.path(),
+            home.path(),
+            Some(xdg.path()),
+            None,
+        )
+        .unwrap();
+
+        assert!(context.config.iter().any(|reference| {
+            reference.relative_path == "opencode.jsonc" && reference.format == "jsonc"
+        }));
+        assert!(context.config.iter().any(|reference| {
+            reference.relative_path == "plugin" && reference.format == "directory"
+        }));
+        assert!(context.config.iter().all(|reference| {
+            reference
+                .provider_relative_path
+                .starts_with(".config/opencode/")
+        }));
+        assert!(!context
+            .config
+            .iter()
+            .any(|reference| reference.relative_path == "opencode.json"));
+        context.validate("opencode").unwrap();
     }
 
     #[test]

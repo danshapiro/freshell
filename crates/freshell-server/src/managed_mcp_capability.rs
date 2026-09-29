@@ -354,7 +354,11 @@ pub(crate) fn approved_tui_source(
     if !canonical_selected.is_file() {
         return Err("managed OpenCode TUI config must be a file".into());
     }
-    let provider_root = home.join(".config/opencode");
+    let provider_root = std::env::var_os("XDG_CONFIG_HOME")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home.join(".config"))
+        .join("opencode");
     let canonical_provider_root = std::fs::canonicalize(&provider_root).ok();
     let (root, approved_root, selected_root) = if let Some(canonical_provider_root) =
         canonical_provider_root
@@ -648,11 +652,25 @@ fn stage_provider_root(
     let temporary = parent.join(format!("{grant_id}.tmp-{}", uuid::Uuid::new_v4()));
     private_directory(&temporary)?;
     let result = (|| {
-        let source = home.join(provider_dir);
-        let canonical_home = std::fs::canonicalize(home).map_err(|error| error.to_string())?;
+        let (source, source_boundary) = if provider == "opencode" {
+            let config_home = std::env::var_os("XDG_CONFIG_HOME")
+                .filter(|value| !value.is_empty())
+                .map(PathBuf::from)
+                .unwrap_or_else(|| home.join(".config"));
+            (config_home.join("opencode"), config_home)
+        } else {
+            (home.join(provider_dir), home.to_path_buf())
+        };
         let canonical_root = match std::fs::canonicalize(&source) {
-            Ok(root) if root.starts_with(&canonical_home) => Some(root),
-            Ok(_) => return Err("managed provider root escaped HOME".into()),
+            Ok(root) => {
+                let canonical_boundary =
+                    std::fs::canonicalize(&source_boundary).map_err(|error| error.to_string())?;
+                if root.starts_with(&canonical_boundary) {
+                    Some(root)
+                } else {
+                    return Err("managed provider root escaped its approved source root".into());
+                }
+            }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
             Err(error) => return Err(error.to_string()),
         };
@@ -773,7 +791,11 @@ fn stage_tui_source(
     let root = if reference.root == ProviderConfigRoot::Workspace {
         workspace.to_path_buf()
     } else {
-        home.join(".config/opencode")
+        std::env::var_os("XDG_CONFIG_HOME")
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from)
+            .unwrap_or_else(|| home.join(".config"))
+            .join("opencode")
     };
     let canonical_root = std::fs::canonicalize(root)
         .map_err(|_| "managed OpenCode TUI source root is unavailable")?;

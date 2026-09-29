@@ -1,5 +1,6 @@
 import fs from 'node:fs'
 import path from 'node:path'
+import os from 'node:os'
 import { randomUUID } from 'node:crypto'
 import WebSocket from 'ws'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
@@ -11,7 +12,7 @@ const root = path.resolve(import.meta.dirname, '../../..')
 const providers = [
   { provider: 'claude', sessionType: 'freshclaude', config: '.claude/settings.json' },
   { provider: 'codex', sessionType: 'freshcodex', config: '.codex/config.toml' },
-  { provider: 'opencode', sessionType: 'freshopencode', config: '.config/opencode/opencode.jsonc' },
+  { provider: 'opencode', sessionType: 'freshopencode', config: 'custom-xdg/opencode/opencode.jsonc' },
 ] as const
 
 async function waitFor<T>(label: string, probe: () => T | undefined | Promise<T | undefined>, timeoutMs = 90_000): Promise<T> {
@@ -66,15 +67,20 @@ class FreshWire {
 describe('hosted fresh-agent provider inputs', () => {
   let rig: ManagedRuntimeBrowserRig
   let opencodeProject: string
+  let homeDir: string
   const wires: FreshWire[] = []
 
   beforeAll(async () => {
-    rig = new ManagedRuntimeBrowserRig(root, 2, { FRESHELL_BIND_HOST: '0.0.0.0' }, {}, 'test', {
+    homeDir = fs.mkdtempSync(path.join(os.tmpdir(), 'fresh-provider-parity-home-'))
+    const xdgConfigHome = path.join(homeDir, 'custom-xdg')
+    rig = new ManagedRuntimeBrowserRig(root, 2, {
+      FRESHELL_BIND_HOST: '0.0.0.0', XDG_CONFIG_HOME: xdgConfigHome,
+    }, { XDG_CONFIG_HOME: xdgConfigHome }, 'test', {
       enabledProviders: [],
       providerSettings: {},
       freshAgentModes: providers.map(row => row.sessionType),
       fixtureFreshAgentModes: providers.map(row => row.sessionType),
-    })
+    }, homeDir)
     await rig.start()
     opencodeProject = fs.mkdtempSync(path.join(root, '.opencode-parity-'))
     fs.mkdirSync(path.join(opencodeProject, '.opencode'), { recursive: true })
@@ -96,10 +102,10 @@ describe('hosted fresh-agent provider inputs', () => {
       fs.chmodSync(path.dirname(file), 0o755)
       fs.chmodSync(file, 0o644)
     }
-    fs.writeFileSync(path.join(rig.info.homeDir, '.config/opencode/opencode.json'), JSON.stringify({
+    fs.writeFileSync(path.join(rig.info.homeDir, 'custom-xdg/opencode/opencode.json'), JSON.stringify({
       mcp: { other_global: { type: 'local', command: ['other-global-mcp'] } },
     }))
-    const opencodePlugin = path.join(rig.info.homeDir, '.config/opencode/plugin')
+    const opencodePlugin = path.join(rig.info.homeDir, 'custom-xdg/opencode/plugin')
     fs.mkdirSync(opencodePlugin, { recursive: true, mode: 0o755 })
     fs.writeFileSync(path.join(opencodePlugin, 'user-plugin.ts'), 'export const User = async () => ({})\n')
   }, 900_000)
@@ -111,6 +117,7 @@ describe('hosted fresh-agent provider inputs', () => {
       expect(cleanup.ok, cleanup.errors.join('\n')).toBe(true)
     }
     if (opencodeProject) fs.rmSync(opencodeProject, { recursive: true, force: true })
+    if (homeDir) fs.rmSync(homeDir, { recursive: true, force: true })
   }, 180_000)
 
   it.each(providers)('$sessionType retains create settings and exact native resume', async row => {
