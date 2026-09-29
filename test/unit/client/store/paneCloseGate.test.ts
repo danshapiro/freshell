@@ -1,9 +1,10 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { configureStore } from '@reduxjs/toolkit'
 
-const { mockSend, handlers } = vi.hoisted(() => ({
+const { mockSend, handlers, mockManagedRuntimeViewVisibility } = vi.hoisted(() => ({
   mockSend: vi.fn(),
   handlers: new Set<(msg: unknown) => void>(),
+  mockManagedRuntimeViewVisibility: vi.fn(),
 }))
 
 vi.mock('@/lib/ws-client', () => ({
@@ -16,6 +17,10 @@ vi.mock('@/lib/ws-client', () => ({
       }
     },
   }),
+}))
+
+vi.mock('@/lib/api', () => ({
+  updateManagedRuntimeViewVisibility: mockManagedRuntimeViewVisibility,
 }))
 
 import tabsReducer, {
@@ -95,6 +100,46 @@ function freshAgentContent(crid: string): PaneContent {
   } as PaneContent
 }
 
+function managedTerminalContent(
+  crid: string,
+  terminalId: string,
+  viewIntentId: string,
+  viewIntentRevision: number,
+  soulIntentRevision: number,
+): PaneContent {
+  return {
+    ...terminalContent(crid, terminalId),
+    viewIntentId,
+    viewIntentRevision,
+    soulIntentRevision,
+    soulId: `soul-${viewIntentId}`,
+  } as PaneContent
+}
+
+function managedViewResult(
+  viewIntentId: string,
+  visibility: 'visible' | 'detached',
+  revision: number,
+  soulIntentRevision: number,
+) {
+  return {
+    viewId: viewIntentId,
+    soulId: `soul-${viewIntentId}`,
+    ownerId: 'owner-1',
+    workspaceId: 'workspace-1',
+    kind: 'automatic_primary' as const,
+    preferredTabId: 'tab-1',
+    preferredPaneId: `pane-${viewIntentId}`,
+    title: viewIntentId,
+    placementGroup: 'default',
+    visibility,
+    revision,
+    soulIntentRevision,
+    createdAt: 1,
+    updatedAt: 2,
+  }
+}
+
 function createStore() {
   return configureStore({
     reducer: { tabs: tabsReducer, panes: panesReducer, connection: connectionReducer },
@@ -137,6 +182,7 @@ function paneCloseErrors(store: ReturnType<typeof createStore>, tabId: string) {
 beforeEach(() => {
   mockSend.mockClear()
   handlers.clear()
+  mockManagedRuntimeViewVisibility.mockReset()
 })
 
 afterEach(() => {
@@ -144,6 +190,79 @@ afterEach(() => {
 })
 
 describe('closePaneWithCleanup — the acknowledged close gate (F2)', () => {
+  it('detaches a managed pane after close evidence and before removing its layout', async () => {
+    const store = createStore()
+    store.dispatch(addTab({ id: 'tab-1', mode: 'shell' }))
+    store.dispatch(initLayout({
+      tabId: 'tab-1',
+      paneId: 'pane-1',
+      content: terminalContent('req-a', 'term-a'),
+    }))
+    store.dispatch(splitPane({
+      tabId: 'tab-1',
+      paneId: 'pane-1',
+      direction: 'vertical',
+      newContent: managedTerminalContent('req-b', 'term-b', 'view-b', 4, 9),
+      newPaneId: 'pane-2',
+    }))
+    mockSend.mockClear()
+    mockManagedRuntimeViewVisibility.mockResolvedValue(
+      managedViewResult('view-b', 'detached', 5, 10),
+    )
+
+    const close = store.dispatch(closePaneWithCleanup({ tabId: 'tab-1', paneId: 'pane-2' }))
+    ackAllPaneCloses()
+    await close
+
+    expect(mockManagedRuntimeViewVisibility).toHaveBeenCalledWith(
+      'view-b',
+      'detached',
+      4,
+      9,
+    )
+    expect(paneContents(store, 'tab-1').map((pane) => pane.paneId)).toEqual(['pane-1'])
+  })
+
+  it('keeps the tab open, reasserts panes, and rolls back earlier managed detaches when one refuses', async () => {
+    const store = createStore()
+    store.dispatch(addTab({ id: 'tab-1', mode: 'shell' }))
+    store.dispatch(initLayout({
+      tabId: 'tab-1',
+      paneId: 'pane-1',
+      content: managedTerminalContent('req-a', 'term-a', 'view-a', 2, 7),
+    }))
+    store.dispatch(splitPane({
+      tabId: 'tab-1',
+      paneId: 'pane-1',
+      direction: 'vertical',
+      newContent: managedTerminalContent('req-b', 'term-b', 'view-b', 3, 8),
+      newPaneId: 'pane-2',
+    }))
+    mockSend.mockClear()
+    mockManagedRuntimeViewVisibility
+      .mockResolvedValue(managedViewResult('view-a', 'visible', 6, 12))
+      .mockResolvedValueOnce(managedViewResult('view-a', 'detached', 4, 9))
+      .mockRejectedValueOnce(new Error('managed view refusal'))
+
+    const close = store.dispatch(closeTab('tab-1'))
+    ackPanesClosedBatches()
+    await close
+
+    expect(store.getState().tabs.tabs.some((tab) => tab.id === 'tab-1')).toBe(true)
+    expect(paneContents(store, 'tab-1').map((pane) => pane.paneId)).toEqual(['pane-1', 'pane-2'])
+    expect(mockManagedRuntimeViewVisibility).toHaveBeenNthCalledWith(1, 'view-a', 'detached', 2, 7)
+    expect(mockManagedRuntimeViewVisibility).toHaveBeenNthCalledWith(2, 'view-b', 'detached', 3, 8)
+    expect(mockManagedRuntimeViewVisibility).toHaveBeenNthCalledWith(3, 'view-a', 'visible', 4, 9)
+    expect(sentCallsOf('pane.opened')).toEqual([
+      expect.objectContaining({ createRequestId: 'req-a', tabId: 'tab-1' }),
+      expect.objectContaining({ createRequestId: 'req-b', tabId: 'tab-1' }),
+    ])
+    expect(paneCloseErrors(store, 'tab-1')).toEqual({
+      'pane-1': 'the pane close could not be recorded durably; the pane was left open',
+      'pane-2': 'the pane close could not be recorded durably; the pane was left open',
+    })
+  })
+
   it('success: the pane.close is acked BEFORE the layout loses the pane (success → pane gone)', async () => {
     const store = createTwoPaneStore()
     const close = store.dispatch(closePaneWithCleanup({ tabId: 'tab-1', paneId: 'pane-2' }))
