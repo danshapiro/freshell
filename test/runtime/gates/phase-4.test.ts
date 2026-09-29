@@ -276,16 +276,31 @@ async function gate05StoppedHistoryRetained(h: RuntimeHarness): Promise<void> {
 
 async function gate06StatusAndAccessibility(h: RuntimeHarness): Promise<void> {
   const caseId = 'P4-G06'
-  runFocusedNodeTest(h, 'test/unit/client/components/ManagedAgentRecoveryStatus.test.tsx')
-  const source = fs.readFileSync(
-    path.join(h.repoRoot, 'src/components/ManagedAgentRecoveryStatus.tsx'),
+  runFocusedNodeTest(h, 'test/unit/client/components/ManagedRuntimeNotices.test.tsx')
+  runFocusedNodeTest(h, 'test/unit/client/components/ManagedRuntimeRecoveryCard.test.tsx')
+  const noticeSource = fs.readFileSync(
+    path.join(h.repoRoot, 'src/components/ManagedRuntimeNotices.tsx'),
     'utf8',
   )
-  for (const label of ['Reconnecting', 'Restarting agent', 'Recovery blocked', 'Ready', 'Stopped']) {
-    h.assert(caseId, source.includes(`'${label}'`), `UI has distinct ${label} state`, label)
-  }
-  h.assert(caseId, source.includes('aria-label="Managed agent recovery"') && source.includes('role="alert"'), 'recovery surface exposes semantic labels and assertive errors')
-  h.assert(caseId, source.includes('Retry recovery') && source.includes('Close view') && source.includes('Stop agent'), 'recovery actions are keyboard-native buttons with distinct labels')
+  h.assert(
+    caseId,
+    noticeSource.includes("notice.kind === 'cleanup_failed'")
+      && noticeSource.includes("'acknowledged'")
+      && noticeSource.includes('role="alert"')
+      && noticeSource.includes('Dismiss'),
+    'cleanup failures retain one actionable accessible notice while routine notices are acknowledged',
+  )
+  const recoveryCardSource = fs.readFileSync(
+    path.join(h.repoRoot, 'src/components/ManagedRuntimeRecoveryCard.tsx'),
+    'utf8',
+  )
+  h.assert(
+    caseId,
+    recoveryCardSource.includes('role="alert"')
+      && recoveryCardSource.includes('Retry recovery')
+      && recoveryCardSource.includes('Start new conversation'),
+    'pane-local recovery card exposes only explicit retry and start-new actions',
+  )
 }
 
 async function gate07ResourceLimits(h: RuntimeHarness): Promise<void> {
