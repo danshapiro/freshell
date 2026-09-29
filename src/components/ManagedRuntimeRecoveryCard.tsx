@@ -1,0 +1,81 @@
+import { useState } from 'react'
+import type { ManagedRuntimeRecoverySummary } from '@shared/managed-runtime'
+
+export type ManagedRuntimeRecoveryCardProps = {
+  recoverySummary?: ManagedRuntimeRecoverySummary
+  onRetry: () => Promise<void>
+  onStartFresh: () => void
+}
+
+/** Whether a managed projection owns the pane's recovery decision. */
+export function isManagedRuntimeRecoveryDecision(
+  recoverySummary?: ManagedRuntimeRecoverySummary,
+): boolean {
+  return recoverySummary?.recoveryState === 'blocked'
+    || recoverySummary?.recoveryState === 'lost'
+}
+
+export function ManagedRuntimeRecoveryCard({
+  recoverySummary,
+  onRetry,
+  onStartFresh,
+}: ManagedRuntimeRecoveryCardProps) {
+  const [retrying, setRetrying] = useState(false)
+  const [retryError, setRetryError] = useState<string>()
+  const recoveryState = recoverySummary?.recoveryState
+
+  if (recoveryState !== 'blocked' && recoveryState !== 'lost') return null
+
+  const blocked = recoveryState === 'blocked'
+  const handleRetry = async () => {
+    if (retrying) return
+    setRetrying(true)
+    setRetryError(undefined)
+    try {
+      await onRetry()
+    } catch (error) {
+      setRetryError(error instanceof Error ? error.message : 'Retry failed. Try again.')
+    } finally {
+      setRetrying(false)
+    }
+  }
+
+  return (
+    <div
+      role="alert"
+      data-testid="managed-runtime-recovery-card"
+      className="pointer-events-auto flex items-center justify-between gap-2 rounded-md border border-amber-500/50 bg-amber-500/10 px-3 py-2 text-sm"
+    >
+      <div className="min-w-0">
+        <span>
+          {blocked
+            ? 'This session needs attention before it can continue.'
+            : 'This session could not be recovered. Start a new conversation when you are ready.'}
+        </span>
+        {retryError ? (
+          <span role="status" className="ml-2 text-xs text-amber-700 dark:text-amber-300">
+            {retryError}
+          </span>
+        ) : null}
+      </div>
+      {blocked ? (
+        <button
+          type="button"
+          disabled={retrying}
+          onClick={() => void handleRetry()}
+          className="shrink-0 rounded border border-border/70 px-2 py-1 text-xs"
+        >
+          {retrying ? 'Retrying…' : 'Retry recovery'}
+        </button>
+      ) : (
+        <button
+          type="button"
+          onClick={onStartFresh}
+          className="shrink-0 rounded border border-border/70 px-2 py-1 text-xs"
+        >
+          Start new conversation
+        </button>
+      )}
+    </div>
+  )
+}

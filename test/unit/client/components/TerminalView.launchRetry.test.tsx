@@ -1,9 +1,9 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
-import { act, render, cleanup } from '@testing-library/react'
+import { act, render, cleanup, screen } from '@testing-library/react'
 import { configureStore } from '@reduxjs/toolkit'
 import { Provider } from 'react-redux'
 import tabsReducer from '@/store/tabsSlice'
-import panesReducer from '@/store/panesSlice'
+import panesReducer, { updatePaneContent } from '@/store/panesSlice'
 import settingsReducer, { defaultSettings } from '@/store/settingsSlice'
 import connectionReducer from '@/store/connectionSlice'
 import { resetPersistedLayoutCacheForTests, resetPersistFlushListenersForTests } from '@/store/persistMiddleware'
@@ -224,6 +224,7 @@ function withCurrentAttachRequestId<T extends { type?: string; terminalId?: stri
 }
 
 let messageHandler: ((msg: any) => void) | null = null
+let lastMessageCallback: ((msg: any) => void) | null = null
 let reconnectHandler: (() => void) | null = null
 let requestAnimationFrameSpy: ReturnType<typeof vi.spyOn> | null = null
 let cancelAnimationFrameSpy: ReturnType<typeof vi.spyOn> | null = null
@@ -346,6 +347,7 @@ describe('launch-time INVALID_TERMINAL_ID bounded retry', () => {
     terminalInstances.length = 0
     runtimeMocks.instances.length = 0
     wsMocks.onMessage.mockImplementation((callback: (msg: any) => void) => {
+      lastMessageCallback = callback
       messageHandler = (msg: any) => callback(withCurrentAttachRequestId(msg))
       return () => { messageHandler = null }
     })
@@ -378,6 +380,7 @@ describe('launch-time INVALID_TERMINAL_ID bounded retry', () => {
     requestAnimationFrameSpy = null
     cancelAnimationFrameSpy = null
     reconnectHandler = null
+    lastMessageCallback = null
     installPerfAuditBridge(null)
   })
 
@@ -478,5 +481,64 @@ describe('launch-time INVALID_TERMINAL_ID bounded retry', () => {
     const total = sentCreates().length
     await act(async () => { vi.advanceTimersByTime(60_000) })
     expect(sentCreates().length).toBe(total)
+  })
+
+  it('keeps a blocked managed pane from re-creating after a rejected-terminal callback', async () => {
+    const { store, paneContent } = makeStore()
+    const rendered = render(
+      <Provider store={store}>
+        <TerminalView tabId={TAB} paneId={PANE} paneContent={paneContent} />
+      </Provider>,
+    )
+    await act(async () => {
+      await Promise.resolve()
+      await Promise.resolve()
+    })
+    const createsBeforeManagedDecision = sentCreates().length
+    expect(createsBeforeManagedDecision).toBeGreaterThan(0)
+
+    store.dispatch(updatePaneContent({
+      tabId: TAB,
+      paneId: PANE,
+      content: {
+        ...paneContent,
+        terminalId: 'term-managed-lost',
+        status: 'error',
+        mode: 'opencode',
+        soulId: 'soul-managed',
+        soulIntentRevision: 4,
+        recoverySummary: {
+          desiredState: 'stopped',
+          recoveryState: 'blocked',
+          reason: 'provider_unavailable',
+          durabilityState: 'resume_captured',
+          allocationState: 'verified_durable',
+        },
+      },
+    }))
+    const managedPane = store.getState().panes.layouts[TAB]
+    if (managedPane.type !== 'leaf') throw new Error('expected managed leaf')
+    await act(async () => {
+      rendered.rerender(
+        <Provider store={store}>
+          <TerminalView tabId={TAB} paneId={PANE} paneContent={managedPane.content} />
+        </Provider>,
+      )
+      await Promise.resolve()
+      await Promise.resolve()
+    })
+
+    expect(screen.getByTestId('managed-runtime-recovery-card')).toBeInTheDocument()
+    expect(wsMocks.send.mock.calls.some(([message]) => message?.type === 'terminal.attach')).toBe(false)
+    const createsBeforeRejectedTerminal = sentCreates().length
+    expect(lastMessageCallback).not.toBeNull()
+    await act(async () => {
+      lastMessageCallback?.({
+        type: 'error',
+        code: 'INVALID_TERMINAL_ID',
+        terminalId: 'term-managed-lost',
+      })
+    })
+    expect(sentCreates()).toHaveLength(createsBeforeRejectedTerminal)
   })
 })
