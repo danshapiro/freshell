@@ -492,6 +492,7 @@ export async function updateManagedRuntimeViewVisibility(
   expectedRevision: number,
   expectedSoulIntentRevision: number,
   requestId = createManagedRuntimeRequestId(),
+  options: ApiRequestOptions = {},
 ): Promise<ManagedRuntimeViewIntent> {
   return ManagedRuntimeViewIntentSchema.parse(
     await api.patch(`/api/runtime/views/${encodeURIComponent(viewId)}`, {
@@ -499,7 +500,7 @@ export async function updateManagedRuntimeViewVisibility(
       visibility,
       expectedRevision,
       expectedSoulIntentRevision,
-    }),
+    }, options),
   )
 }
 

@@ -1,10 +1,11 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { configureStore } from '@reduxjs/toolkit'
 
-const { mockSend, handlers, mockManagedRuntimeViewVisibility } = vi.hoisted(() => ({
+const { mockSend, handlers, mockManagedRuntimeViewVisibility, mockGetManagedRuntimeSoul } = vi.hoisted(() => ({
   mockSend: vi.fn(),
   handlers: new Set<(msg: unknown) => void>(),
   mockManagedRuntimeViewVisibility: vi.fn(),
+  mockGetManagedRuntimeSoul: vi.fn(),
 }))
 
 vi.mock('@/lib/ws-client', () => ({
@@ -21,6 +22,7 @@ vi.mock('@/lib/ws-client', () => ({
 
 vi.mock('@/lib/api', () => ({
   updateManagedRuntimeViewVisibility: mockManagedRuntimeViewVisibility,
+  getManagedRuntimeSoul: mockGetManagedRuntimeSoul,
 }))
 
 import tabsReducer, {
@@ -77,6 +79,10 @@ function firstSendIndexOf(type: string): number {
 
 function sentCallsOf(type: string): Array<Record<string, unknown>> {
   return mockSend.mock.calls.map(([m]) => m as Record<string, unknown>).filter((m) => m.type === type)
+}
+
+function expectManagedVisibilityCall(index: number, expected: [string, 'visible' | 'detached', number, number]) {
+  expect(mockManagedRuntimeViewVisibility.mock.calls[index - 1]?.slice(0, 4)).toEqual(expected)
 }
 
 function terminalContent(crid: string, terminalId?: string): PaneContent {
@@ -140,6 +146,21 @@ function managedViewResult(
   }
 }
 
+function managedSoulDetail(
+  viewIntentId: string,
+  visibility: 'visible' | 'detached',
+  revision: number,
+  soulIntentRevision: number,
+) {
+  return {
+    revision: 100,
+    readiness: {},
+    soul: { intentRevision: soulIntentRevision },
+    viewIntents: [managedViewResult(viewIntentId, visibility, revision, soulIntentRevision)],
+    actualUsage: null,
+  }
+}
+
 function createStore() {
   return configureStore({
     reducer: { tabs: tabsReducer, panes: panesReducer, connection: connectionReducer },
@@ -185,6 +206,34 @@ function createManagedTwoPaneStore() {
   return store
 }
 
+const managedCloseCases = [
+  {
+    name: 'pane',
+    viewId: 'view-b',
+    viewRevision: 3,
+    soulRevision: 8,
+    start: (store: ReturnType<typeof createManagedTwoPaneStore>) => store.dispatch(
+      closePaneWithCleanup({ tabId: 'tab-1', paneId: 'pane-2' }),
+    ),
+  },
+  {
+    name: 'tab',
+    viewId: 'view-a',
+    viewRevision: 2,
+    soulRevision: 7,
+    start: (store: ReturnType<typeof createManagedTwoPaneStore>) => store.dispatch(closeTab('tab-1')),
+  },
+  {
+    name: 'replace',
+    viewId: 'view-b',
+    viewRevision: 3,
+    soulRevision: 8,
+    start: (store: ReturnType<typeof createManagedTwoPaneStore>) => store.dispatch(
+      replacePaneWithCleanup({ tabId: 'tab-1', paneId: 'pane-2' }),
+    ),
+  },
+]
+
 function paneContents(store: ReturnType<typeof createStore>, tabId: string): Array<{ paneId: string; content: PaneContent }> {
   const root = store.getState().panes.layouts[tabId]
   return root ? collectPaneEntries(root) : []
@@ -202,6 +251,7 @@ beforeEach(() => {
   mockSend.mockClear()
   handlers.clear()
   mockManagedRuntimeViewVisibility.mockReset()
+  mockGetManagedRuntimeSoul.mockReset()
 })
 
 afterEach(() => {
@@ -233,12 +283,7 @@ describe('closePaneWithCleanup — the acknowledged close gate (F2)', () => {
     ackAllPaneCloses()
     await close
 
-    expect(mockManagedRuntimeViewVisibility).toHaveBeenCalledWith(
-      'view-b',
-      'detached',
-      4,
-      9,
-    )
+    expectManagedVisibilityCall(1, ['view-b', 'detached', 4, 9])
     expect(paneContents(store, 'tab-1').map((pane) => pane.paneId)).toEqual(['pane-1'])
   })
 
@@ -269,9 +314,9 @@ describe('closePaneWithCleanup — the acknowledged close gate (F2)', () => {
 
     expect(store.getState().tabs.tabs.some((tab) => tab.id === 'tab-1')).toBe(true)
     expect(paneContents(store, 'tab-1').map((pane) => pane.paneId)).toEqual(['pane-1', 'pane-2'])
-    expect(mockManagedRuntimeViewVisibility).toHaveBeenNthCalledWith(1, 'view-a', 'detached', 2, 7)
-    expect(mockManagedRuntimeViewVisibility).toHaveBeenNthCalledWith(2, 'view-b', 'detached', 3, 8)
-    expect(mockManagedRuntimeViewVisibility).toHaveBeenNthCalledWith(3, 'view-a', 'visible', 4, 9)
+    expectManagedVisibilityCall(1, ['view-a', 'detached', 2, 7])
+    expectManagedVisibilityCall(2, ['view-b', 'detached', 3, 8])
+    expectManagedVisibilityCall(3, ['view-a', 'visible', 4, 9])
     expect(sentCallsOf('pane.opened')).toEqual([
       expect.objectContaining({ createRequestId: 'req-a', tabId: 'tab-1' }),
       expect.objectContaining({ createRequestId: 'req-b', tabId: 'tab-1' }),
@@ -354,9 +399,137 @@ describe('closePaneWithCleanup — the acknowledged close gate (F2)', () => {
     await vi.advanceTimersByTimeAsync(KILL_ACK_TIMEOUT_MS + 50)
     await close
 
-    expect(mockManagedRuntimeViewVisibility).toHaveBeenNthCalledWith(1, 'view-a', 'detached', 2, 7)
-    expect(mockManagedRuntimeViewVisibility).toHaveBeenNthCalledWith(2, 'view-b', 'detached', 3, 8)
-    expect(mockManagedRuntimeViewVisibility).toHaveBeenNthCalledWith(3, 'view-a', 'visible', 4, 9)
+    expectManagedVisibilityCall(1, ['view-a', 'detached', 2, 7])
+    expectManagedVisibilityCall(2, ['view-b', 'detached', 3, 8])
+    expect(mockManagedRuntimeViewVisibility.mock.calls.find(([viewId, visibility]) => (
+      viewId === 'view-a' && visibility === 'visible'
+    ))?.slice(0, 4)).toEqual(['view-a', 'visible', 4, 9])
+    expect(store.getState().tabs.tabs.some((tab) => tab.id === 'tab-1')).toBe(true)
+    expect(paneContents(store, 'tab-1').map((pane) => pane.paneId)).toEqual(['pane-1', 'pane-2'])
+  })
+
+  it.each(managedCloseCases)('repairs a late managed detach outcome for a $name close after the local timeout', async ({
+    viewId,
+    viewRevision,
+    soulRevision,
+    start,
+  }) => {
+    vi.useFakeTimers()
+    const store = createManagedTwoPaneStore()
+    let resolveDetach: (view: ReturnType<typeof managedViewResult>) => void = () => {}
+    const lateDetach = new Promise<ReturnType<typeof managedViewResult>>((resolve) => {
+      resolveDetach = resolve
+    })
+    mockManagedRuntimeViewVisibility.mockImplementation((
+      requestedViewId: string,
+      visibility: 'visible' | 'detached',
+    ) => {
+      if (visibility === 'detached') return lateDetach
+      return Promise.resolve(managedViewResult(requestedViewId, 'visible', viewRevision + 1, soulRevision + 1))
+    })
+
+    const close = start(store)
+    ackAllPaneCloses()
+    ackPanesClosedBatches()
+    await vi.advanceTimersByTimeAsync(KILL_ACK_TIMEOUT_MS + 50)
+    await close
+
+    const originalDetachCall = mockManagedRuntimeViewVisibility.mock.calls.find(([, visibility]) => visibility === 'detached')
+    expect(originalDetachCall?.[5]).toEqual(expect.objectContaining({ signal: expect.any(AbortSignal) }))
+    expect((originalDetachCall?.[5] as { signal: AbortSignal }).signal.aborted).toBe(true)
+    const firstVisibleCall = mockManagedRuntimeViewVisibility.mock.calls.find(([, visibility]) => visibility === 'visible')
+    expect(firstVisibleCall?.slice(0, 4)).toEqual([viewId, 'visible', viewRevision, soulRevision])
+    expect(firstVisibleCall?.[5]).toEqual(expect.objectContaining({ signal: expect.any(AbortSignal) }))
+    expect((firstVisibleCall?.[5] as { signal: AbortSignal }).signal.aborted).toBe(false)
+
+    resolveDetach(managedViewResult(viewId, 'detached', viewRevision + 1, soulRevision + 1))
+    await vi.advanceTimersByTimeAsync(0)
+    expect(mockManagedRuntimeViewVisibility.mock.calls.filter(([, visibility]) => visibility === 'visible')).toHaveLength(1)
+  })
+
+  it.each(managedCloseCases)('uses authoritative fences after a stale visible repair for a $name close', async ({
+    viewId,
+    viewRevision,
+    soulRevision,
+    start,
+  }) => {
+    vi.useFakeTimers()
+    const store = createManagedTwoPaneStore()
+    let resolveDetach: (view: ReturnType<typeof managedViewResult>) => void = () => {}
+    const lateDetach = new Promise<ReturnType<typeof managedViewResult>>((resolve) => {
+      resolveDetach = resolve
+    })
+    let visibleAttempts = 0
+    mockManagedRuntimeViewVisibility.mockImplementation((
+      requestedViewId: string,
+      visibility: 'visible' | 'detached',
+    ) => {
+      if (visibility === 'detached') return lateDetach
+      visibleAttempts += 1
+      if (visibleAttempts === 1) return Promise.reject(new Error('stale managed view revision'))
+      return Promise.resolve(managedViewResult(requestedViewId, 'visible', 41, 52))
+    })
+    mockGetManagedRuntimeSoul.mockResolvedValue(
+      managedSoulDetail(viewId, 'detached', 40, 52),
+    )
+
+    const close = start(store)
+    ackAllPaneCloses()
+    ackPanesClosedBatches()
+    await vi.advanceTimersByTimeAsync(KILL_ACK_TIMEOUT_MS + 50)
+    await close
+    resolveDetach(managedViewResult(viewId, 'detached', viewRevision + 1, soulRevision + 1))
+    await vi.advanceTimersByTimeAsync(0)
+    await vi.advanceTimersByTimeAsync(0)
+
+    expect(mockGetManagedRuntimeSoul).toHaveBeenCalledWith(
+      `soul-${viewId}`,
+      expect.objectContaining({ signal: expect.any(AbortSignal) }),
+    )
+    const visibleCalls = mockManagedRuntimeViewVisibility.mock.calls.filter(([, visibility]) => visibility === 'visible')
+    expect(visibleCalls[1]?.slice(0, 4)).toEqual([viewId, 'visible', 40, 52])
+  })
+
+  it('repairs a rollback visibility PATCH that resolves after its local timeout', async () => {
+    vi.useFakeTimers()
+    const store = createManagedTwoPaneStore()
+    let resolveSecondDetach: (view: ReturnType<typeof managedViewResult>) => void = () => {}
+    const secondDetach = new Promise<ReturnType<typeof managedViewResult>>((resolve) => {
+      resolveSecondDetach = resolve
+    })
+    let resolveRollback: (view: ReturnType<typeof managedViewResult>) => void = () => {}
+    const lateRollback = new Promise<ReturnType<typeof managedViewResult>>((resolve) => {
+      resolveRollback = resolve
+    })
+    let rollbackVisibleAttempts = 0
+    mockManagedRuntimeViewVisibility.mockImplementation((
+      viewId: string,
+      visibility: 'visible' | 'detached',
+    ) => {
+      if (viewId === 'view-a' && visibility === 'detached') {
+        return Promise.resolve(managedViewResult('view-a', 'detached', 4, 9))
+      }
+      if (viewId === 'view-b' && visibility === 'detached') return secondDetach
+      if (viewId === 'view-a' && visibility === 'visible') {
+        rollbackVisibleAttempts += 1
+        return rollbackVisibleAttempts === 1
+          ? lateRollback
+          : Promise.resolve(managedViewResult('view-a', 'visible', 5, 10))
+      }
+      return Promise.resolve(managedViewResult(viewId, 'visible', 5, 10))
+    })
+
+    const close = store.dispatch(closeTab('tab-1'))
+    ackPanesClosedBatches()
+    await vi.advanceTimersByTimeAsync(KILL_ACK_TIMEOUT_MS + 50)
+    await vi.advanceTimersByTimeAsync(0)
+    await vi.advanceTimersByTimeAsync(KILL_ACK_TIMEOUT_MS + 50)
+    await close
+
+    expect(mockManagedRuntimeViewVisibility.mock.calls.filter(([, visibility]) => visibility === 'visible')).toHaveLength(3)
+    resolveSecondDetach(managedViewResult('view-b', 'detached', 4, 9))
+    resolveRollback(managedViewResult('view-a', 'visible', 5, 10))
+    await vi.advanceTimersByTimeAsync(0)
     expect(store.getState().tabs.tabs.some((tab) => tab.id === 'tab-1')).toBe(true)
     expect(paneContents(store, 'tab-1').map((pane) => pane.paneId)).toEqual(['pane-1', 'pane-2'])
   })
