@@ -544,6 +544,8 @@ describe('managed runtime recovery merge', () => {
       status: 'error',
       mode: 'opencode',
       shell: 'system',
+      namingHandle: 'old-managed-name-handle',
+      nameRef: { kind: 'pending', id: 'old-managed-name-handle' },
       soulId: 'soul-one',
       incarnationId: 'incarnation-one',
       viewIntentId: 'view-one',
@@ -577,6 +579,8 @@ describe('managed runtime recovery merge', () => {
     expect(content.content.createRequestId).not.toBe(oldCreateRequestId)
     expect(content.content.status).toBe('creating')
     expect(content.content.terminalId).toBeUndefined()
+    expect(content.content.namingHandle).toBeUndefined()
+    expect(content.content.nameRef).toBeUndefined()
     expect(content.content.soulId).toBeUndefined()
     expect(content.content.incarnationId).toBeUndefined()
     expect(content.content.viewIntentId).toBeUndefined()
