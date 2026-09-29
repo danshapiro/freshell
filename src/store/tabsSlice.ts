@@ -27,7 +27,7 @@ import type { RootState } from './store'
 import { selectTabIdByTerminalId } from './selectors/paneTerminalSelectors'
 import { loadPersistedLayout, markTabsLoadRecovery } from './persistMiddleware'
 import { createLogger } from '@/lib/client-logger'
-import { updateManagedRuntimeViewVisibility } from '@/lib/api'
+import { getManagedRuntimeSoul, updateManagedRuntimeViewVisibility } from '@/lib/api'
 import { mergeSessionMetadataByKey, sessionMetadataKey } from '@/lib/session-metadata'
 import { mergeSessionMetadataForPreferredResumeId } from './persistControl'
 import { migrateLegacyTerminalDurableState, sanitizeSessionRef } from '@shared/session-contract'
@@ -549,27 +549,41 @@ function collectPaneIds(node: PaneNode | undefined): string[] {
 
 type FrozenManagedViewProjection = {
   paneId: string
+  soulId?: string
   viewId: string
   viewRevision: number
   soulRevision: number
 }
 
-/**
- * Managed-view visibility mutations do not currently expose an AbortSignal
- * option. Close must still have the same bounded liveness guarantee as its
- * durable close-evidence wait, so a half-open PATCH is treated as a refusal
- * after the existing close bound.
- */
 export const MANAGED_VIEW_DETACH_TIMEOUT_MS = KILL_ACK_TIMEOUT_MS
 
-function awaitManagedViewVisibilityMutation(
-  mutate: () => Promise<ManagedRuntimeViewIntent>,
-): Promise<ManagedRuntimeViewIntent> {
+class ManagedRuntimeRequestTimeoutError extends Error {
+  constructor(operation: string) {
+    super(`${operation} timed out`)
+    this.name = 'ManagedRuntimeRequestTimeoutError'
+  }
+}
+
+function isManagedRuntimeRequestTimeout(error: unknown): error is ManagedRuntimeRequestTimeoutError {
+  return error instanceof ManagedRuntimeRequestTimeoutError
+}
+
+/**
+ * Keep managed-runtime close work bounded while still attaching a rejection
+ * handler to the original request. The server may commit an aborted PATCH,
+ * so callers use the timeout as an unknown outcome and reconcile it below.
+ */
+function awaitBoundedManagedRuntimeRequest<T>(
+  operation: string,
+  request: (signal: AbortSignal) => Promise<T>,
+): Promise<T> {
+  const controller = new AbortController()
   return new Promise((resolve, reject) => {
     let settled = false
     const timer = setTimeout(() => {
       settled = true
-      reject(new Error('managed view visibility mutation timed out'))
+      controller.abort()
+      reject(new ManagedRuntimeRequestTimeoutError(operation))
     }, MANAGED_VIEW_DETACH_TIMEOUT_MS)
 
     const finish = (callback: () => void) => {
@@ -580,7 +594,7 @@ function awaitManagedViewVisibilityMutation(
     }
 
     try {
-      mutate().then(
+      request(controller.signal).then(
         (view) => finish(() => resolve(view)),
         (error) => finish(() => reject(error)),
       )
@@ -588,6 +602,23 @@ function awaitManagedViewVisibilityMutation(
       finish(() => reject(error))
     }
   })
+}
+
+function updateManagedViewVisibilityWithSignal(
+  viewId: string,
+  visibility: 'visible' | 'detached',
+  expectedRevision: number,
+  expectedSoulIntentRevision: number,
+  signal: AbortSignal,
+): Promise<ManagedRuntimeViewIntent> {
+  return updateManagedRuntimeViewVisibility(
+    viewId,
+    visibility,
+    expectedRevision,
+    expectedSoulIntentRevision,
+    undefined,
+    { signal },
+  )
 }
 
 /**
@@ -618,6 +649,7 @@ function collectManagedViewProjections(
     if (!byViewId.has(content.viewIntentId)) {
       byViewId.set(content.viewIntentId, {
         paneId: node.id,
+        soulId: content.soulId,
         viewId: content.viewIntentId,
         viewRevision: content.viewIntentRevision,
         soulRevision: content.soulIntentRevision,
@@ -628,10 +660,155 @@ function collectManagedViewProjections(
   return [...byViewId.values()]
 }
 
+type ManagedViewRepairFence = {
+  viewRevision: number
+  soulRevision: number
+}
+
+function managedRuntimeErrorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error)
+}
+
+/**
+ * A timed-out PATCH has an unknown durable outcome. Reassert visible with the
+ * original fence first so the common case is one cheap, fenced mutation. If
+ * the server already accepted the late detach, the stale response is followed
+ * by one bounded authoritative read and a retry with current fences.
+ */
+async function repairManagedViewAfterTimeout(
+  projection: FrozenManagedViewProjection,
+  fence: ManagedViewRepairFence,
+  operation: 'detach' | 'rollback',
+): Promise<void> {
+  let immediateError: unknown
+  try {
+    const repaired = await awaitBoundedManagedRuntimeRequest(
+      'managed view visibility repair',
+      (signal) => updateManagedViewVisibilityWithSignal(
+        projection.viewId,
+        'visible',
+        fence.viewRevision,
+        fence.soulRevision,
+        signal,
+      ),
+    )
+    if (repaired.visibility === 'visible') return
+    immediateError = new Error(`repair returned ${repaired.visibility}`)
+  } catch (error) {
+    immediateError = error
+  }
+
+  if (!projection.soulId) {
+    log.error('managed view authoritative repair failed', {
+      event: 'managed_view_visibility_repair_failed',
+      operation,
+      phase: 'read',
+      paneId: projection.paneId,
+      viewId: projection.viewId,
+      reason: 'missing_soul_id',
+      error: managedRuntimeErrorMessage(immediateError),
+    })
+    return
+  }
+
+  let authoritative: Awaited<ReturnType<typeof getManagedRuntimeSoul>>
+  try {
+    authoritative = await awaitBoundedManagedRuntimeRequest(
+      'managed runtime soul read',
+      (signal) => getManagedRuntimeSoul(projection.soulId!, { signal }),
+    )
+  } catch (error) {
+    log.error('managed view authoritative repair failed', {
+      event: 'managed_view_visibility_repair_failed',
+      operation,
+      phase: 'read',
+      paneId: projection.paneId,
+      soulId: projection.soulId,
+      viewId: projection.viewId,
+      error: managedRuntimeErrorMessage(error),
+    })
+    return
+  }
+
+  const currentView = authoritative.viewIntents.find((view) => view.viewId === projection.viewId)
+  if (!currentView) {
+    log.error('managed view authoritative repair failed', {
+      event: 'managed_view_visibility_repair_failed',
+      operation,
+      phase: 'read',
+      paneId: projection.paneId,
+      soulId: projection.soulId,
+      viewId: projection.viewId,
+      reason: 'view_missing',
+      error: managedRuntimeErrorMessage(immediateError),
+    })
+    return
+  }
+  if (currentView.visibility === 'visible') return
+  if (currentView.visibility !== 'detached') {
+    log.error('managed view authoritative repair failed', {
+      event: 'managed_view_visibility_repair_failed',
+      operation,
+      phase: 'read',
+      paneId: projection.paneId,
+      soulId: projection.soulId,
+      viewId: projection.viewId,
+      reason: 'unexpected_visibility',
+      visibility: currentView.visibility,
+      error: managedRuntimeErrorMessage(immediateError),
+    })
+    return
+  }
+
+  try {
+    const repaired = await awaitBoundedManagedRuntimeRequest(
+      'managed view authoritative visibility repair',
+      (signal) => updateManagedViewVisibilityWithSignal(
+        currentView.viewId,
+        'visible',
+        currentView.revision,
+        authoritative.soul.intentRevision,
+        signal,
+      ),
+    )
+    if (repaired.visibility === 'visible') return
+    log.error('managed view authoritative repair failed', {
+      event: 'managed_view_visibility_repair_failed',
+      operation,
+      phase: 'retry',
+      paneId: projection.paneId,
+      soulId: projection.soulId,
+      viewId: projection.viewId,
+      reason: 'retry_returned_non_visible',
+      visibility: repaired.visibility,
+    })
+  } catch (error) {
+    log.error('managed view authoritative repair failed', {
+      event: 'managed_view_visibility_repair_failed',
+      operation,
+      phase: 'retry',
+      paneId: projection.paneId,
+      soulId: projection.soulId,
+      viewId: projection.viewId,
+      error: managedRuntimeErrorMessage(error),
+    })
+  }
+}
+
+function scheduleManagedViewRepair(
+  projection: FrozenManagedViewProjection,
+  fence: ManagedViewRepairFence,
+  operation: 'detach' | 'rollback',
+) {
+  void repairManagedViewAfterTimeout(projection, fence, operation)
+}
+
 /**
  * Mark every frozen managed view detached as one close transaction. If a
  * later view refuses the mutation, use each successful response's new fences
- * to return its view to visible before the pane/tab can be removed.
+ * to return its view to visible before the pane/tab can be removed. Every
+ * timeout also starts a bounded late-outcome repair because aborting a request
+ * cannot undo a PATCH already accepted by the server.
  */
 async function detachManagedViews(
   projections: FrozenManagedViewProjection[],
@@ -639,33 +816,55 @@ async function detachManagedViews(
   const detached: Array<{ projection: FrozenManagedViewProjection; view: ManagedRuntimeViewIntent }> = []
   for (const projection of projections) {
     try {
-      const view = await awaitManagedViewVisibilityMutation(() => updateManagedRuntimeViewVisibility(
-        projection.viewId,
-        'detached',
-        projection.viewRevision,
-        projection.soulRevision,
-      ))
+      const view = await awaitBoundedManagedRuntimeRequest(
+        'managed view visibility mutation',
+        (signal) => updateManagedViewVisibilityWithSignal(
+          projection.viewId,
+          'detached',
+          projection.viewRevision,
+          projection.soulRevision,
+          signal,
+        ),
+      )
       detached.push({ projection, view })
     } catch (error) {
+      if (isManagedRuntimeRequestTimeout(error)) {
+        scheduleManagedViewRepair(projection, {
+          viewRevision: projection.viewRevision,
+          soulRevision: projection.soulRevision,
+        }, 'detach')
+      }
       log.warn('managed view detach refused during close; rolling back earlier detaches', {
         viewId: projection.viewId,
         paneId: projection.paneId,
-        error: error instanceof Error ? error.message : String(error),
+        error: managedRuntimeErrorMessage(error),
       })
       for (const completed of [...detached].reverse()) {
         try {
-          await awaitManagedViewVisibilityMutation(() => updateManagedRuntimeViewVisibility(
-            completed.view.viewId,
-            'visible',
-            completed.view.revision,
-            completed.view.soulIntentRevision,
-          ))
+          await awaitBoundedManagedRuntimeRequest(
+            'managed view rollback mutation',
+            (signal) => updateManagedViewVisibilityWithSignal(
+              completed.view.viewId,
+              'visible',
+              completed.view.revision,
+              completed.view.soulIntentRevision,
+              signal,
+            ),
+          )
         } catch (rollbackError) {
-          log.error('managed view detach rollback failed after close refusal', {
-            viewId: completed.view.viewId,
-            paneId: completed.projection.paneId,
-            error: rollbackError instanceof Error ? rollbackError.message : String(rollbackError),
-          })
+          if (isManagedRuntimeRequestTimeout(rollbackError)) {
+            scheduleManagedViewRepair(completed.projection, {
+              viewRevision: completed.view.revision,
+              soulRevision: completed.view.soulIntentRevision,
+            }, 'rollback')
+          } else {
+            log.error('managed view detach rollback failed after close refusal', {
+              event: 'managed_view_visibility_rollback_failed',
+              viewId: completed.view.viewId,
+              paneId: completed.projection.paneId,
+              error: managedRuntimeErrorMessage(rollbackError),
+            })
+          }
         }
       }
       return false
