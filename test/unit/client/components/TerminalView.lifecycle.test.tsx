@@ -4293,9 +4293,9 @@ describe('TerminalView lifecycle updates', () => {
       await waitFor(() => {
         expect(createCalls()).toHaveLength(2)
       })
-      expect(createCalls()[1]).toMatchObject({
-        requestId: 'req-b8ke',
-      })
+      const retiredRequestId = createCalls()[0].requestId
+      expect(createCalls()[1].requestId).toEqual(expect.any(String))
+      expect(createCalls()[1].requestId).not.toBe(retiredRequestId)
       expect(createCalls()[1].sessionRef).toBeUndefined()
       const leaf = store.getState().panes.layouts['tab-b8ke']
       expect(
