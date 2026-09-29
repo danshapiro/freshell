@@ -113,6 +113,10 @@ session, or sole remaining session as ownership or identity proof.
 1. Run the dry run and resolve all blockers.
 2. Run the repository's managed provider acceptance tests for the intended
    provider/mode.
+   For the isolated OpenCode browser gate, set
+   `FRESHELL_MANAGED_OPENCODE_AUTH_FILE` to the existing OpenCode `auth.json`
+   path; the gate's temporary server home cannot discover the host credential
+   automatically and will fail before launching if the reference is absent.
 3. Apply `managed-opt-in` with the current control epoch and a unique request ID.
 4. Verify the returned inventory revision and rollout mode.
 5. Open one managed agent for every provider currently marked

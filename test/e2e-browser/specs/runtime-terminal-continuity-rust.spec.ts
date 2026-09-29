@@ -18,6 +18,18 @@ import { TestHarness } from '../helpers/test-harness.js'
 import { TerminalHelper } from '../helpers/terminal-helpers.js'
 import { openPanePicker } from '../helpers/pane-picker.js'
 
+function requireOpenCodeAuthFile(): string {
+  const configured = process.env.FRESHELL_MANAGED_OPENCODE_AUTH_FILE
+  if (!configured) {
+    throw new Error('P2-G04 requires FRESHELL_MANAGED_OPENCODE_AUTH_FILE to point at the existing OpenCode auth.json')
+  }
+  const authFile = path.resolve(configured)
+  if (!fs.statSync(authFile).isFile()) {
+    throw new Error(`P2-G04 OpenCode auth reference is not a file: ${authFile}`)
+  }
+  return authFile
+}
+
 function findTerminalLeaves(node: any, out: any[] = []): any[] {
   if (!node) return out
   if (node.type === 'leaf' && node.content?.kind === 'terminal') out.push(node)
@@ -322,7 +334,13 @@ test.describe.serial('Phase 2 managed runtime continuity', () => {
   test('P2-G04: OpenAI-authenticated OpenCode tool turn survives web replacement in one native session', async ({ page }) => {
     test.setTimeout(900_000)
 
-    const rig = new ManagedRuntimeBrowserRig()
+    // The rig runs the web server with an isolated HOME. Pass the host auth
+    // file explicitly; otherwise the managed runtime starts without the
+    // configured provider credential and OpenCode silently uses its default.
+    const authFile = requireOpenCodeAuthFile()
+    const rig = new ManagedRuntimeBrowserRig(process.cwd(), 2, {
+      FRESHELL_MANAGED_OPENCODE_AUTH_FILE: authFile,
+    })
     try {
       const info = await rig.start()
       await page.goto(`${info.baseUrl}/?token=${info.token}&e2e=1`)
@@ -359,6 +377,13 @@ test.describe.serial('Phase 2 managed runtime continuity', () => {
       const view = await waitForRunningView(rig, terminalId, 90_000)
       if (!view?.containerId || !view.hostBootId) throw new Error('real OpenCode managed view missing ownership identity')
       expect(rig.ownedContainerExec(view.containerId, ['opencode', '--version']).trim()).toBe(P2_OPENCODE_VERSION)
+      const authProbe = rig.ownedProviderExec(view.containerId, [
+        'node', '--no-warnings', '-e',
+        "const fs=require('node:fs');const auth=JSON.parse(fs.readFileSync('/home/freshell/provider/.local/share/opencode/auth.json','utf8'));const openai=auth.openai;if(!openai||typeof openai.access!=='string'||typeof openai.refresh!=='string')process.exit(2);process.stdout.write('openai credential present')",
+      ])
+      expect(authProbe.trim()).toBe('openai credential present')
+      const availableModels = rig.ownedProviderExec(view.containerId, ['opencode', 'models', 'openai'])
+      expect(availableModels).toContain(P2_OPENCODE_MODEL.split('/')[1])
       const processArgs = rig.ownedContainerExec(view.containerId, ['sh', '-lc', "pgrep -af '[o]pencode' || true"])
       expect(processArgs).toContain(`--model ${P2_OPENCODE_MODEL}`)
       expect(processArgs).toContain('--hostname 127.0.0.1')
