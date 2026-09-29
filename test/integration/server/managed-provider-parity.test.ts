@@ -351,6 +351,10 @@ describe('ordinary and managed terminal provider parity', () => {
     const first = await waitFor('initial OpenCode launch', () => wire.recordRows().find(row => (
       row.provider === 'opencode' && row.kind === 'launch'
     )))
+    const initialMcp = await waitFor('initial OpenCode MCP probe', () => wire.recordRows().find(row => (
+      row.provider === 'opencode' && row.kind === 'mcp'
+    )))
+    expect(initialMcp.authenticatedCall).toMatchObject({ isError: false, count: 0 })
     wire.send({ type: 'terminal.input', terminalId, data: 'replacement parity prompt\r' })
     await waitFor('OpenCode native identity', () => wire.recordRows().find(row => (
       row.kind === 'identity' && row.terminalId === terminalId
@@ -372,8 +376,16 @@ describe('ordinary and managed terminal provider parity', () => {
     const after = await waitFor('replacement OpenCode incarnation', async () => {
       const view = await rig.runningViewForTerminal(terminalId)
       return view?.containerId && view.incarnationId !== before.incarnationId ? view : undefined
-    }, 300_000)
+    }, 300_000).catch(async error => {
+      const inventory = await rig.inventory()
+      const supervisorLogs = rig.runtime.containerLogs(rig.supervisor.containerId)
+      throw new Error(`${String(error)}; inventory: ${JSON.stringify(inventory)}; supervisor logs: ${supervisorLogs}`)
+    })
     expect(after.soulId).toBe(before.soulId)
+    await wire.wait(frame => frame.type === 'terminal.stream.changed'
+      && frame.terminalId === terminalId
+      && frame.reason === 'new_pty_session'
+      && frame.streamId !== before.terminalStreamId, 10_000)
     await wire.attach(terminalId)
     const resumed = await waitFor('resumed OpenCode child observation', () => wire.recordRows().find(row => (
       row.provider === 'opencode' && row.kind === 'launch' && row.launchId !== first.launchId
