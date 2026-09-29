@@ -217,5 +217,24 @@ describe('hosted fresh-agent provider inputs', () => {
       && (frame.type === 'freshAgent.created' || frame.type === 'freshAgent.create.failed'))
     expect(resumed.type, JSON.stringify(resumed)).toBe('freshAgent.created')
     expect(resumed.sessionRef?.sessionId).toBe(recorded.nativeSessionId)
+    const evidenceDir = process.env.FRESHELL_PROVIDER_PARITY_ROWS_DIR
+    if (evidenceDir) {
+      const sentinel = 'fixture-secret-byte'
+      rig.runtime.execOwnedContainerExact(rig.supervisor.containerId, [
+        'node', '-e', `const fs=require('fs');const p='/var/lib/freshell-supervisor';for(const f of fs.readdirSync(p).filter(x=>x.startsWith('runtime.sqlite3'))){if(fs.readFileSync(p+'/'+f).includes('${sentinel}'))process.exit(4)}`,
+      ])
+      for (const material of [
+        JSON.stringify(rig.runtime.inspectContainer(view.containerId!)),
+        rig.runtime.containerLogs(view.containerId!),
+        rig.runtime.containerLogs(rig.supervisor.containerId),
+        fs.readFileSync(path.join(rig.runtime.evidenceDir, 'lifecycle.jsonl'), 'utf8'),
+      ]) expect(material).not.toContain(sentinel)
+      fs.writeFileSync(path.join(evidenceDir, `fresh-hosted-${row.provider}.json`), JSON.stringify({
+        provider: row.provider, nativeSessionId: recorded.nativeSessionId,
+        configCount: profile.providerLaunchContext.config.length,
+        plugin: profile.plugins,
+        secretHygiene: { registry: true, supervisor: true, eventJournal: true, docker: true },
+      }))
+    }
   }, 240_000)
 })

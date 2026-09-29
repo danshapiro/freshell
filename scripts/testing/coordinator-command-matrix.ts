@@ -114,6 +114,7 @@ function isRetiredServerConfigSelector(arg: string): boolean {
   if ([
     'test/integration/server/managed-provider-parity.test.ts',
     'test/integration/server/fresh-agent-parity.test.ts',
+    'test/integration/server/provider-parity-contract.test.ts',
   ].includes(normalized.replace(/^\.\//, ''))) {
     return false
   }

@@ -28,6 +28,7 @@ export const RUNTIME_RECEIPT_ARTIFACTS: Record<string, RuntimeReceiptArtifact> =
   FRESHELL_RUNTIME_PHASE5_LOSS_RECEIPT: { slug: 'real-opencode-loss', defaultCaseId: 'P5-G02' },
   FRESHELL_RUNTIME_PHASE5_CHAOS_RECEIPT: { slug: 'browser-chaos', defaultCaseId: 'P5-G09' },
   FRESHELL_RUNTIME_PHASE5_SOAK_RECEIPT: { slug: 'phase5-soak', defaultCaseId: 'P5-G10' },
+  FRESHELL_RUNTIME_PROVIDER_PARITY_LOCAL_RECEIPT: { slug: 'provider-parity-local', defaultCaseId: 'PC-PARITY-CLAUDE' },
 }
 
 function artifactFor(envName: string): RuntimeReceiptArtifact {

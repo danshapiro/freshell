@@ -2164,6 +2164,43 @@ mod tests {
                 direct_mcp_enabled, hosted_mcp_enabled,
                 "hosted provider MCP must match direct absence"
             );
+            if let Ok(directory) = std::env::var("FRESHELL_PROVIDER_PARITY_ROWS_DIR") {
+                let provider_rows = |rows: &[TransportObservation]| {
+                    rows.iter()
+                        .map(|row| {
+                            let mut input = row.input.clone();
+                            if row.operation == "provider_create_request" {
+                                for field in [
+                                    "requestId",
+                                    "namingHandle",
+                                    "tabId",
+                                    "observedEpoch",
+                                    "observedGeneration",
+                                ] {
+                                    input.as_object_mut().unwrap().remove(field);
+                                }
+                            }
+                            json!({"operation": row.operation, "input": input, "result": row.result})
+                        })
+                        .collect::<Vec<_>>()
+                };
+                let evidence = json!({
+                    "provider": provider.as_str(),
+                    "direct": {"profile": profile, "operations": provider_rows(&direct_rows), "mcpExposed": direct_mcp_enabled},
+                    "managed": {"profile": hosted_provider_profile, "operations": provider_rows(&hosted_rows), "mcpExposed": hosted_mcp_enabled},
+                    "recovery": {
+                        "replacementObserved": create_rows.len() == 2,
+                        "sameNativeSession": create_rows[1].input["nativeSessionId"] == resumed_native,
+                    },
+                });
+                std::fs::create_dir_all(&directory).unwrap();
+                std::fs::write(
+                    std::path::Path::new(&directory)
+                        .join(format!("fresh-{}.json", provider.as_str())),
+                    serde_json::to_vec(&evidence).unwrap(),
+                )
+                .unwrap();
+            }
         }
     }
 

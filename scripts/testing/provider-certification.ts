@@ -22,6 +22,7 @@
  */
 import fs from 'node:fs'
 import path from 'node:path'
+import { PROVIDER_PARITY_CASE_IDS } from './provider-parity-receipt.js'
 
 export const PENDING_LIVE_PROVIDER_CERTIFICATION = 'pending_live_provider_certification'
 export const DEFERRED_CASE_STATUS = 'DEFERRED_LIVE_PROVIDER_CERTIFICATION'
@@ -362,7 +363,7 @@ export function providerCertificationCaseIds(manifest: CapabilityManifest): stri
 export const RELEASE_SCOPE_CASE_ID = 'PC-SCOPE'
 
 export function certificationCaseIds(manifest: CapabilityManifest): string[] {
-  return [RELEASE_SCOPE_CASE_ID, ...providerCertificationCaseIds(manifest)]
+  return [RELEASE_SCOPE_CASE_ID, ...PROVIDER_PARITY_CASE_IDS, ...providerCertificationCaseIds(manifest)]
 }
 
 export type ProductionCertificationStatus = {

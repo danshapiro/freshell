@@ -26,6 +26,7 @@ import {
   type ProviderQualificationRow,
 } from '../../../../scripts/testing/provider-qualification-receipt.js'
 import { parseGateArgs } from '../../../../scripts/testing/runtime-gate-args.js'
+import { PROVIDER_PARITY_CASE_IDS } from '../../../../scripts/testing/provider-parity-receipt.js'
 
 const repoRoot = path.resolve(__dirname, '../../../..')
 
@@ -89,7 +90,8 @@ describe('checked-in provider certification manifest', () => {
 
   it('puts the release-scope audit first in the full certification case set', () => {
     expect(certificationCaseIds(loadCapabilityManifest(repoRoot))).toEqual([
-      RELEASE_SCOPE_CASE_ID, 'PC-SHELL', 'PC-CLAUDE', 'PC-OPENCODE', 'PC-CODEX', 'PC-AMPLIFIER',
+      RELEASE_SCOPE_CASE_ID, ...PROVIDER_PARITY_CASE_IDS,
+      'PC-SHELL', 'PC-CLAUDE', 'PC-OPENCODE', 'PC-CODEX', 'PC-AMPLIFIER',
     ])
   })
 
@@ -188,6 +190,23 @@ describe('gate outcome resolution', () => {
     })
     expect(outcome.status).toBe('FAIL')
     expect(outcome.exitCode).toBe(1)
+  })
+
+  it('never treats a deferred live credential as a local parity result', () => {
+    const result = resolveGateOutcome({
+      mode: 'landing',
+      caseResults: [
+        { caseId: 'PC-CLAUDE', status: DEFERRED_CASE_STATUS, provider: 'claude' },
+        { caseId: 'PC-PARITY-CLAUDE', status: DEFERRED_CASE_STATUS, provider: 'claude' },
+      ],
+      expectedCaseIds: ['PC-CLAUDE', 'PC-PARITY-CLAUDE'],
+      cleanupOk: true,
+      unsafeBrokerAttempts: 0,
+      deferred: ['claude'],
+      deferrableProviders: ['claude'],
+    })
+    expect(result.status).toBe('FAIL')
+    expect(result.failures.join(' ')).toContain('PC-PARITY-CLAUDE')
   })
 
   it('fails a landing run with any genuine failure or unsafe broker attempt', () => {

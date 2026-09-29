@@ -72,8 +72,8 @@ class TerminalWire {
   terminalOutput(): string { return this.frames.filter(frame => frame.type === 'terminal.output').map(frame => frame.data).join('').slice(-4000) }
   recordRows(): RecordRow[] { return this.records }
 
-  wait(predicate: (frame: any) => boolean, timeoutMs: number): Promise<any> {
-    return waitFor('WebSocket frame', () => this.frames.find(predicate), timeoutMs).catch(error => {
+  wait(predicate: (frame: any) => boolean, timeoutMs: number, fromIndex = 0): Promise<any> {
+    return waitFor('WebSocket frame', () => this.frames.slice(fromIndex).find(predicate), timeoutMs).catch(error => {
       throw new Error(`${String(error)}; received ${JSON.stringify(this.frames.slice(-12))}`)
     })
   }
@@ -90,11 +90,20 @@ class TerminalWire {
   }
 
   async attach(terminalId: string): Promise<void> {
-    const attachRequestId = `provider-parity-attach-${randomUUID()}`
-    this.send({ type: 'terminal.attach', terminalId, intent: 'viewport_hydrate',
-      cols: 80, rows: 24, sinceSeq: 0, attachRequestId, priority: 'background' })
-    await this.wait(message => message.type === 'terminal.attach.ready'
-      && message.terminalId === terminalId && message.attachRequestId === attachRequestId, 10_000)
+    for (let attempt = 0; attempt < 4; attempt++) {
+      const attachRequestId = `provider-parity-attach-${randomUUID()}`
+      const fromIndex = this.frames.length
+      this.send({ type: 'terminal.attach', terminalId, intent: 'viewport_hydrate',
+        cols: 80, rows: 24, sinceSeq: 0, attachRequestId, priority: 'background' })
+      const frame = await this.wait(message => message.terminalId === terminalId && (
+        (message.type === 'terminal.attach.ready' && message.attachRequestId === attachRequestId)
+        || (message.type === 'error' && message.code === 'INTERNAL_ERROR'
+          && message.message?.includes('managed output read timed out'))
+      ), 10_000, fromIndex)
+      if (frame.type === 'terminal.attach.ready') return
+      await new Promise(resolve => setTimeout(resolve, 250))
+    }
+    throw new Error(`managed output replay timed out repeatedly for ${terminalId}`)
   }
 
   async close(): Promise<void> {
@@ -111,8 +120,17 @@ function ordinaryProviderArgs(argv: string[], provider: Provider): string[] {
   const result: string[] = []
   for (let index = 0; index < argv.length; index++) {
     const arg = argv[index]
-    if (arg === '--mcp-config' || arg === '--mcp-config-file') { index++; continue }
-    if (arg === '-c' && argv[index + 1]?.startsWith('mcp_servers.freshell.')) { index++; continue }
+    if (arg === '--mcp-config' || arg === '--mcp-config-file') {
+      result.push(arg, '<managed-mcp-config>')
+      index++
+      continue
+    }
+    if (arg === '-c' && argv[index + 1]?.startsWith('mcp_servers.freshell.')) {
+      const setting = argv[index + 1].slice(0, argv[index + 1].indexOf('=') + 1)
+      result.push(arg, `${setting}<managed-mcp-command>`)
+      index++
+      continue
+    }
     if (provider === 'codex' && argv[index - 1] === '--remote') {
       result.push('<codex-local-endpoint>')
     } else if (provider === 'opencode' && argv[index - 1] === '--port') {
@@ -124,7 +142,24 @@ function ordinaryProviderArgs(argv: string[], provider: Provider): string[] {
       result.push(arg)
     }
   }
-  return result
+  if (provider !== 'claude' && provider !== 'codex') return result
+  const flags = new Set(provider === 'claude'
+    ? ['--settings', '--mcp-config', '--model', '--effort', '--session-id', '--resume']
+    : ['--remote', '-c', '--model', '--sandbox', '--ask-for-approval'])
+  const pairs: Array<{ key: string; flag: string; value: string }> = []
+  const positional: string[] = []
+  for (let index = 0; index < result.length; index++) {
+    const flag = result[index]
+    if (!flags.has(flag) || result[index + 1] === undefined) {
+      positional.push(flag)
+      continue
+    }
+    const value = result[++index]
+    const key = flag === '-c' ? `${flag}:${value.slice(0, value.indexOf('='))}` : flag
+    pairs.push({ key, flag, value })
+  }
+  if (new Set(pairs.map(pair => pair.key)).size !== pairs.length) return result
+  return [...positional, ...pairs.sort((left, right) => left.key.localeCompare(right.key)).flatMap(pair => [pair.flag, pair.value])]
 }
 
 function normalized(record: RecordRow): unknown {
@@ -294,6 +329,7 @@ describe('ordinary and managed terminal provider parity', () => {
     const mcpResults: RecordRow[] = []
     const identities: RecordRow[] = []
     let managedSoulId: string | undefined
+    let managedTerminalId: string | undefined
     for (const managed of [false, true]) {
       if (provider === 'opencode') makeReadableTree(path.join(workspace, '.opencode'))
       const wire = await TerminalWire.connect(rig.info, managed)
@@ -310,6 +346,9 @@ describe('ordinary and managed terminal provider parity', () => {
         throw new Error(`${String(error)}; records: ${JSON.stringify(wire.recordRows())}; output: ${wire.terminalOutput()}`)
       })
       observed.push(launch)
+      if (managed) {
+        managedTerminalId = terminalId
+      }
       if (provider === 'opencode' && managed) {
         const view = await waitFor('managed OpenCode container for secret inspection', async () => {
           const value = await rig.runningViewForTerminal(terminalId)
@@ -335,8 +374,8 @@ describe('ordinary and managed terminal provider parity', () => {
         expect(mcp.call?.ok).toBe(true)
         expect(mcp.authenticatedCall).toMatchObject({ isError: false, count: 0, truncated: false })
       }
+      wire.send({ type: 'terminal.input', terminalId, data: 'provider parity prompt\r' })
       if (provider === 'codex' || provider === 'opencode') {
-        wire.send({ type: 'terminal.input', terminalId, data: 'provider parity prompt\r' })
         identities.push(await waitFor(`${provider} ${managed ? 'managed' : 'ordinary'} native identity`, () => (
           wire.recordRows().find(row => row.provider === provider && row.kind === 'identity' && row.terminalId === terminalId)
         )))
@@ -365,6 +404,64 @@ describe('ordinary and managed terminal provider parity', () => {
       ? { error: mcpResults[0].error }
       : { tools: mcpResults[0].tools, call: mcpResults[0].call })
     expect(observed[1].mcpRecipePresent).toBe(observed[0].mcpRecipePresent)
+    const evidenceDir = process.env.FRESHELL_PROVIDER_PARITY_ROWS_DIR
+    if (evidenceDir) {
+      const before = await waitFor('managed provider view for receipt', async () => {
+        const view = await rig.runningViewForTerminal(managedTerminalId!)
+        return view?.containerId && view.nativeSessionId ? view : undefined
+      }).catch(async error => {
+        throw new Error(`${String(error)}; inventory=${JSON.stringify(await rig.inventory())}`)
+      })
+      const probe = await rig.runtime.adminOk(rig.supervisor,
+        rig.runtime.probeRecoveryBody(before.soulId))
+      await waitFor(`${provider} verified resume evidence`, async () => {
+        const view = await rig.runningViewForTerminal(managedTerminalId!)
+        return view?.durabilityState === 'resume_captured' ? view : undefined
+      }).catch(async error => {
+        throw new Error(`${String(error)}; probe=${JSON.stringify(probe)}; inventory=${JSON.stringify(await rig.inventory())}`)
+      })
+      rig.runtime.killOwnedRuntimeExact(before.containerId!)
+      const after = await waitFor(`${provider} replacement incarnation`, async () => {
+        const view = await rig.runningViewForTerminal(managedTerminalId!)
+        return view?.containerId && view.incarnationId !== before.incarnationId
+          && view.recoveryState === 'live' ? view : undefined
+      }, 90_000).catch(async error => {
+        throw new Error(`${String(error)}; inventory=${JSON.stringify(await rig.inventory())}`)
+      })
+      expect(after.soulId).toBe(before.soulId)
+      expect(after.nativeSessionId).toBe(before.nativeSessionId)
+      const recoveryWire = await TerminalWire.connect(rig.info, true)
+      sockets.push(recoveryWire)
+      await recoveryWire.attach(managedTerminalId!).catch(async error => {
+        throw new Error(`${String(error)}; before=${JSON.stringify(before)}; after=${JSON.stringify(after)}; inventory=${JSON.stringify(await rig.inventory())}; supervisor=${rig.runtime.containerLogs(rig.supervisor.containerId).slice(-4000)}`)
+      })
+      const resumed = await waitFor(`${provider} resumed child`, () => recoveryWire.recordRows().find(row =>
+        row.provider === provider && row.kind === 'launch' && row.launchId !== observed[1].launchId), 90_000)
+      expect(resumed.providerConfig).toEqual(observed[1].providerConfig)
+      expect(resumed.providerPlugin).toEqual(observed[1].providerPlugin)
+      const resumedMcp = await waitFor(`${provider} resumed MCP`, () => recoveryWire.recordRows().find(row =>
+        row.provider === provider && row.kind === 'mcp'), 90_000)
+      expect(resumedMcp.error).toBe(mcpResults[1].error)
+      if (!resumedMcp.error) expect(resumedMcp.call).toEqual(mcpResults[1].call)
+      const managedView = after.containerId!
+      const inspect = JSON.stringify(rig.runtime.inspectContainer(managedView))
+      const supervisorLogs = rig.runtime.containerLogs(rig.supervisor.containerId)
+      const providerLogs = rig.runtime.containerLogs(managedView)
+      rig.runtime.execOwnedContainerExact(rig.supervisor.containerId, [
+        'node', '-e', `const fs=require('fs');const p='/var/lib/freshell-supervisor';for(const f of fs.readdirSync(p).filter(x=>x.startsWith('runtime.sqlite3'))){if(fs.readFileSync(p+'/'+f).includes('${nestedSecretMarker}'))process.exit(4)}`,
+      ])
+      for (const material of [inspect, supervisorLogs, providerLogs, fs.readFileSync(rig.runtime.evidenceDir + '/lifecycle.jsonl', 'utf8')]) {
+        expect(material).not.toContain(nestedSecretMarker)
+      }
+      const launch = observed.map(row => normalized(row))
+      fs.writeFileSync(path.join(evidenceDir, `terminal-${provider}.json`), JSON.stringify({
+        provider,
+        direct: { launch: launch[0], mcp: mcpResults[0], nativeIdentity: identities[0] ?? observed[0].nativeSession },
+        managed: { launch: launch[1], mcp: mcpResults[1], nativeIdentity: identities[1] ?? observed[1].nativeSession },
+        recovery: { replacementObserved: true, sameNativeSession: after.nativeSessionId === before.nativeSessionId },
+        secretHygiene: { registry: true, supervisor: true, eventJournal: true, docker: true },
+      }))
+    }
     if (managedSoulId) await rig.stopSoul(managedSoulId)
   }, 180_000)
 

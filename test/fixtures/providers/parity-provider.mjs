@@ -139,6 +139,7 @@ const pluginPath = providerHome && pluginRelativePath ? path.join(providerHome, 
 const nativeIdArgIndex = provider === 'claude'
   ? Math.max(argv.indexOf('--session-id'), argv.indexOf('--resume'))
   : provider === 'amplifier' && argv.includes('resume') ? argv.length - 2 : -1
+const nativeId = nativeIdArgIndex >= 0 ? argv[nativeIdArgIndex + 1] : null
 append({
   kind: 'launch',
   launchId,
@@ -209,5 +210,23 @@ if (provider === 'codex' || provider === 'opencode') {
   })
   terminal.on('exit', code => { process.exitCode = code ?? 1 })
 } else {
+  process.stdin.on('data', () => {
+    if (!nativeId) return
+    if (provider === 'claude') {
+      const sessionDir = path.join(providerHome, 'projects', 'provider-parity')
+      fs.mkdirSync(sessionDir, { recursive: true })
+      fs.appendFileSync(path.join(sessionDir, `${nativeId}.jsonl`),
+        `${JSON.stringify({ type: 'user', sessionId: nativeId, cwd, message: { role: 'user', content: 'fixture prompt' } })}\n`)
+    } else if (provider === 'amplifier') {
+      const projects = path.join(providerHome, 'projects')
+      for (const project of fs.readdirSync(projects)) {
+        const events = path.join(projects, project, 'sessions', nativeId, 'events.jsonl')
+        if (fs.existsSync(events)) {
+          fs.appendFileSync(events, `${JSON.stringify({ event: 'prompt:submit', text: 'fixture prompt' })}\n`)
+          break
+        }
+      }
+    }
+  })
   process.stdin.resume()
 }
