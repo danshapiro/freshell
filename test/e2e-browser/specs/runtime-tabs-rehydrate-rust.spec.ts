@@ -291,17 +291,18 @@ test.describe.serial('Phase 4 managed-runtime tab rehydration', () => {
         expect(after?.terminalId).toBe(before.terminalId)
       }
 
-      const statusPanel = page.getByRole('complementary', { name: 'Managed agent recovery' })
-      await expect(statusPanel).toBeVisible({ timeout: 30_000 })
-      const panelDetails = statusPanel.locator(':scope > details')
-      const summary = panelDetails.locator(':scope > summary')
-      if (!(await panelDetails.evaluate((details: HTMLDetailsElement) => details.open))) {
-        await summary.click()
-      }
-
       const closeSoulId = initialSoulIds[0]
-      const closeSection = statusPanel.getByRole('region').filter({ hasText: closeSoulId })
-      await closeSection.getByRole('button', { name: 'Close view' }).click()
+      const stateBeforeClose = await browserState(page)
+      const closeTabId = stateBeforeClose.tabs.tabs.find((tab: any) => tab.soulId === closeSoulId)?.id
+      const closePaneId = expectedTabIds
+        .map((tabId: string) => stateBeforeClose.panes.layouts[tabId])
+        .find((node: any) => node?.type === 'leaf' && node.content?.soulId === closeSoulId)?.id
+      expect(closeTabId).toEqual(expect.any(String))
+      expect(closePaneId).toEqual(expect.any(String))
+      // Ordinary pane close is the durable view intent action. It detaches the
+      // managed view after close evidence succeeds; it never stops the soul.
+      await page.locator(`[data-context="tab"][data-tab-id="${closeTabId}"]`).click()
+      await page.locator(`[data-pane-id="${closePaneId}"] button[title="Close pane"]`).click()
       const closeOutcome = await waitForValue('detached view with live soul', async () => {
         const snapshot = await rig.inventorySnapshot()
         const view = snapshot.viewIntents.find((candidate: any) => candidate.soulId === closeSoulId)
@@ -315,10 +316,25 @@ test.describe.serial('Phase 4 managed-runtime tab rehydration', () => {
         timeout: 30_000,
       }).toBe(2)
 
+      // Reconnect the browser to force the normal inventory refresh path. A
+      // detached view must remain absent after reconciliation; the live soul
+      // is intentionally not recreated as a replacement conversation.
+      const priorReadyAt = await harness.getLastReadyAt()
+      await rig.restartWebGracefully()
+      await harness.waitForConnectionAfter(priorReadyAt, 90_000)
+      await expect.poll(async () => visibleManagedTabs(await browserState(page)).length, {
+        timeout: 30_000,
+      }).toBe(2)
+      const afterCloseRefresh = await browserState(page)
+      expect(afterCloseRefresh.tabs.tabs.some((tab: any) => tab.soulId === closeSoulId)).toBe(false)
+
       const stopSoulId = initialSoulIds[1]
-      const stopSection = statusPanel.getByRole('region').filter({ hasText: stopSoulId })
-      page.once('dialog', (dialog) => void dialog.accept())
-      await stopSection.getByRole('button', { name: 'Stop agent' }).click()
+      const stopTabId = afterCloseRefresh.tabs.tabs.find((tab: any) => tab.soulId === stopSoulId)?.id
+      expect(stopTabId).toEqual(expect.any(String))
+      // Retain stop coverage through the existing terminal shift-close path.
+      await page.locator(`[data-context="tab"][data-tab-id="${stopTabId}"]`)
+        .getByRole('button', { name: /close/i })
+        .click({ modifiers: ['Shift'] })
       const stopOutcome = await waitForValue('explicitly stopped soul', async () => {
         const snapshot = await rig.inventorySnapshot()
         const soul = latestSoul(snapshot, stopSoulId)
@@ -381,6 +397,9 @@ test.describe.serial('Phase 4 managed-runtime tab rehydration', () => {
             return after?.terminalId === before.terminalId
           }),
           closeViewKeepsAgent: closeOutcome.soul.launchState === 'running',
+          closeViewNotRecreatedAfterInventoryRefresh: afterCloseRefresh.tabs.tabs.every(
+            (tab: any) => tab.soulId !== closeSoulId,
+          ),
           stopAgentStopsRuntime: stopOutcome.soul.launchState === 'stopped',
           oldClientNoDuplicate: createdReply.terminalId === compatibilitySoul.terminalId
             && rig.runtime.broker.receipts().length === receiptCountBefore,

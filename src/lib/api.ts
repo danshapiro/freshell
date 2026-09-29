@@ -23,6 +23,7 @@ import {
   ManagedRuntimeRepairAuditSchema,
   ManagedRuntimeSoulDetailSchema,
   ManagedRuntimeUpdateLimitsResultSchema,
+  ManagedRuntimeViewIntentSchema,
   type ManagedRuntimeIncidentSummary,
   type ManagedRuntimeInventorySnapshot,
   type ManagedRuntimeLimits,
@@ -34,6 +35,7 @@ import {
   type ManagedRuntimeRolloutMode,
   type ManagedRuntimeSoulDetail,
   type ManagedRuntimeUpdateLimitsResult,
+  type ManagedRuntimeViewIntent,
   type ManagedRuntimeViewVisibility,
 } from '@shared/managed-runtime'
 import { parseFreshAgentModelCapabilitiesResponse } from '@/lib/fresh-agent-model-capabilities'
@@ -490,13 +492,15 @@ export async function updateManagedRuntimeViewVisibility(
   expectedRevision: number,
   expectedSoulIntentRevision: number,
   requestId = createManagedRuntimeRequestId(),
-): Promise<unknown> {
-  return api.patch(`/api/runtime/views/${encodeURIComponent(viewId)}`, {
-    requestId,
-    visibility,
-    expectedRevision,
-    expectedSoulIntentRevision,
-  })
+): Promise<ManagedRuntimeViewIntent> {
+  return ManagedRuntimeViewIntentSchema.parse(
+    await api.patch(`/api/runtime/views/${encodeURIComponent(viewId)}`, {
+      requestId,
+      visibility,
+      expectedRevision,
+      expectedSoulIntentRevision,
+    }),
+  )
 }
 
 export async function getManagedRuntimeIncidentSummary(
