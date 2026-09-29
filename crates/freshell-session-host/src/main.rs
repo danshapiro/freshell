@@ -49,6 +49,22 @@ struct HostState {
     child: Mutex<Option<Child>>,
     pty: Mutex<Option<HostedPty>>,
     fresh_agent: Mutex<Option<Arc<freshell_agent_runtime::host_actor::FreshAgentHostActor>>>,
+    provider_config_paths: ProviderConfigPaths,
+}
+
+#[derive(Clone)]
+struct ProviderConfigPaths {
+    private_mount: PathBuf,
+    provider_home: PathBuf,
+}
+
+impl Default for ProviderConfigPaths {
+    fn default() -> Self {
+        Self {
+            private_mount: PathBuf::from("/run/freshell-private"),
+            provider_home: PathBuf::from("/home/freshell/provider"),
+        }
+    }
 }
 
 /// A managed session host runs inside a CPU-capped container, so
@@ -157,6 +173,7 @@ async fn serve(args: &[String]) -> Result<(), String> {
         child: Mutex::new(None),
         pty: Mutex::new(None),
         fresh_agent: Mutex::new(None),
+        provider_config_paths: ProviderConfigPaths::default(),
     });
 
     loop {
@@ -824,6 +841,7 @@ async fn grant_execution(
                     &terminal.workspace_path,
                     terminal.run_as_uid,
                     terminal.run_as_gid,
+                    &state.provider_config_paths,
                 )
                 .map_err(|error| RuntimeError::new(RuntimeErrorCode::HostUnreachable, error))?;
             }
@@ -940,6 +958,7 @@ async fn grant_execution(
                     &launch.workspace_path,
                     launch.run_as_uid,
                     launch.run_as_gid,
+                    &state.provider_config_paths,
                 )
                 .map_err(|error| RuntimeError::new(RuntimeErrorCode::HostUnreachable, error))?;
             }
@@ -1220,11 +1239,50 @@ fn copy_provider_config_references(
             0,
         )?;
     }
+    let projected = copied
+        .iter()
+        .filter_map(|path| path.strip_prefix(provider_home).ok())
+        .filter(|path| !path.as_os_str().is_empty())
+        .map(|path| path.to_string_lossy().into_owned())
+        .collect::<std::collections::BTreeSet<_>>();
     copied.sort_by_key(|path| std::cmp::Reverse(path.components().count()));
     for path in copied {
         set_owner(&path, run_as_uid, run_as_gid)?;
     }
+    let manifest = write_projection_manifest(provider_home, &projected)?;
+    set_owner(&manifest, run_as_uid, run_as_gid)?;
     Ok(())
+}
+
+const PROVIDER_PROJECTION_MANIFEST: &str = ".freshell-config-projection.json";
+
+fn write_projection_manifest(
+    provider_home: &Path,
+    entries: &std::collections::BTreeSet<String>,
+) -> Result<PathBuf, String> {
+    let manifest = provider_home.join(PROVIDER_PROJECTION_MANIFEST);
+    let temporary = provider_home.join(format!(
+        "{PROVIDER_PROJECTION_MANIFEST}.tmp-{}",
+        std::process::id()
+    ));
+    std::fs::write(
+        &temporary,
+        serde_json::to_vec(entries).map_err(|error| error.to_string())?,
+    )
+    .map_err(|error| error.to_string())?;
+    set_mode(&temporary, 0o600)?;
+    std::fs::rename(&temporary, &manifest).map_err(|error| error.to_string())?;
+    Ok(manifest)
+}
+
+fn read_projection_manifest(
+    provider_home: &Path,
+) -> Result<std::collections::BTreeSet<String>, String> {
+    match std::fs::read(provider_home.join(PROVIDER_PROJECTION_MANIFEST)) {
+        Ok(bytes) => serde_json::from_slice(&bytes).map_err(|error| error.to_string()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Default::default()),
+        Err(error) => Err(error.to_string()),
+    }
 }
 
 fn provider_config_references(
@@ -1248,11 +1306,12 @@ fn refresh_provider_context(
     workspace: &str,
     run_as_uid: u32,
     run_as_gid: u32,
+    paths: &ProviderConfigPaths,
 ) -> Result<(), String> {
     let Some(context) = context else {
         return Ok(());
     };
-    let private_mount = Path::new("/run/freshell-private");
+    let private_mount = &paths.private_mount;
     let user_root = private_mount.join("user-provider");
     if provider_config_references(context).iter().any(|reference| {
         reference.root == freshell_runtime_protocol::ProviderConfigRoot::UserProvider
@@ -1265,7 +1324,7 @@ fn refresh_provider_context(
         provider,
         Path::new(workspace),
         &user_root,
-        Path::new("/home/freshell/provider"),
+        &paths.provider_home,
         run_as_uid,
         run_as_gid,
     )
@@ -1311,15 +1370,7 @@ fn refresh_provider_config_references(
     }
     let exe = std::env::current_exe().map_err(|error| error.to_string())?;
     let status = std::process::Command::new("/usr/bin/setpriv")
-        .args([
-            "--reuid",
-            &run_as_uid.to_string(),
-            "--regid",
-            &run_as_gid.to_string(),
-            "--clear-groups",
-            "--no-new-privs",
-            "--",
-        ])
+        .args(provider_identity_args(run_as_uid, run_as_gid))
         .arg(exe)
         .arg("refresh-provider-config")
         .arg(stage.path())
@@ -1333,6 +1384,23 @@ fn refresh_provider_config_references(
             "provider-owned config refresh failed with status {status}"
         ))
     }
+}
+
+fn provider_identity_args(uid: u32, gid: u32) -> Vec<String> {
+    let group_option = if uid == unsafe { libc::geteuid() } && gid == unsafe { libc::getegid() } {
+        "--keep-groups"
+    } else {
+        "--clear-groups"
+    };
+    vec![
+        "--reuid".into(),
+        uid.to_string(),
+        "--regid".into(),
+        gid.to_string(),
+        group_option.into(),
+        "--no-new-privs".into(),
+        "--".into(),
+    ]
 }
 
 fn allow_provider_read_stage(path: &Path, gid: u32) -> Result<(), String> {
@@ -1367,8 +1435,14 @@ fn apply_staged_provider_config(stage: &Path, provider_home: &Path) -> Result<()
     )
     .map_err(|error| error.to_string())?;
     let projection = stage.join("projection");
+    let previous = read_projection_manifest(provider_home)?;
+    let current = read_projection_manifest(&projection)?;
     let mut paths = Vec::with_capacity(destinations.len());
-    for relative in &destinations {
+    for relative in destinations
+        .iter()
+        .chain(previous.iter())
+        .chain(current.iter())
+    {
         let path = Path::new(relative);
         if path.as_os_str().is_empty()
             || path.is_absolute()
@@ -1392,16 +1466,26 @@ fn apply_staged_provider_config(stage: &Path, provider_home: &Path) -> Result<()
                 return Err("provider config refresh parent cannot be a symlink".into());
             }
         }
-        paths.push(path.to_path_buf());
+        if destinations
+            .iter()
+            .any(|destination| destination == relative)
+        {
+            paths.push(path.to_path_buf());
+        }
     }
     paths.sort();
     paths.dedup();
-    paths.sort_by_key(|path| std::cmp::Reverse(path.components().count()));
-    for path in &paths {
-        let destination = provider_home.join(path);
+    let mut stale = previous.difference(&current).collect::<Vec<_>>();
+    stale.sort_by_key(|path| std::cmp::Reverse(Path::new(path).components().count()));
+    for relative in stale {
+        let destination = provider_home.join(relative);
         if let Ok(metadata) = std::fs::symlink_metadata(&destination) {
             if metadata.is_dir() {
-                std::fs::remove_dir_all(&destination).map_err(|error| error.to_string())?;
+                match std::fs::remove_dir(&destination) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::DirectoryNotEmpty => {}
+                    Err(error) => return Err(error.to_string()),
+                }
             } else {
                 std::fs::remove_file(&destination).map_err(|error| error.to_string())?;
             }
@@ -1424,6 +1508,7 @@ fn apply_staged_provider_config(stage: &Path, provider_home: &Path) -> Result<()
             )?;
         }
     }
+    write_projection_manifest(provider_home, &current)?;
     Ok(())
 }
 
@@ -2516,6 +2601,11 @@ mod tests {
             gid,
         )
         .unwrap();
+        std::fs::write(
+            destination.join(".claude/plugins/provider-created.js"),
+            b"durable",
+        )
+        .unwrap();
         std::fs::write(source.join("settings.json"), b"second").unwrap();
         std::fs::remove_file(source.join("plugins/old.js")).unwrap();
         std::fs::write(source.join("plugins/new.js"), b"new").unwrap();
@@ -2540,6 +2630,10 @@ mod tests {
             std::fs::read(destination.join(".claude/plugins/new.js")).unwrap(),
             b"new"
         );
+        assert_eq!(
+            std::fs::read(destination.join(".claude/plugins/provider-created.js")).unwrap(),
+            b"durable"
+        );
         std::fs::remove_file(source.join("settings.json")).unwrap();
         refresh_provider_config_references(
             &context,
@@ -2552,6 +2646,16 @@ mod tests {
         )
         .unwrap();
         assert!(!destination.join(".claude/settings.json").exists());
+    }
+
+    #[test]
+    fn provider_identity_command_uses_clear_groups_only_when_switching_identity() {
+        let uid = unsafe { libc::geteuid() };
+        let gid = unsafe { libc::getegid() };
+        assert!(provider_identity_args(uid, gid).contains(&"--keep-groups".into()));
+        assert!(
+            provider_identity_args(uid.saturating_add(1), gid).contains(&"--clear-groups".into())
+        );
     }
     use async_trait::async_trait;
     use freshell_agent_runtime::host_actor::{
@@ -2969,25 +3073,76 @@ mod tests {
 
     #[tokio::test]
     async fn exact_resume_grant_reuses_provider_home_and_launches_one_real_worker() {
+        use freshell_runtime_protocol::{
+            ProviderConfigReference, ProviderConfigRoot, ProviderLaunchContext, ProviderPreparation,
+        };
         use std::os::unix::fs::PermissionsExt;
 
-        let state = test_host_state();
         let workspace = tempfile::tempdir().unwrap();
         std::fs::set_permissions(workspace.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
-        let launcher = workspace.path().join("exact-resume-provider");
-        std::fs::write(&launcher, "#!/bin/sh\nexec sleep 60\n").unwrap();
-        std::fs::set_permissions(&launcher, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let provider_home = workspace.path().join("provider-home");
+        let source_config = workspace.path().join("opencode.json");
+        let child_output = workspace.path().join("child-effective-config");
+        std::fs::create_dir(&provider_home).unwrap();
+        std::fs::write(&source_config, b"first").unwrap();
+        let context = ProviderLaunchContext {
+            preparation: ProviderPreparation::Opencode {
+                project_config: vec![ProviderConfigReference {
+                    root: ProviderConfigRoot::Workspace,
+                    relative_path: "opencode.json".into(),
+                    provider_relative_path: ".config/opencode/opencode.json".into(),
+                    format: "json".into(),
+                }],
+                tui_config: None,
+            },
+            mcp_capability: None,
+            config: Vec::new(),
+        };
         let current_uid = unsafe { libc::geteuid() };
         let current_gid = unsafe { libc::getegid() };
-        let run_as_uid = if current_uid == 0 {
-            65_534
-        } else {
-            current_uid
+        if current_uid == 0 {
+            // The separate setpriv integration test covers provider-UID refresh.
+            return;
+        }
+        copy_provider_config_references(
+            &context,
+            "opencode",
+            workspace.path(),
+            workspace.path(),
+            &provider_home,
+            current_uid,
+            current_gid,
+        )
+        .unwrap();
+        std::fs::write(&source_config, b"second").unwrap();
+        let mut state = test_host_state();
+        Arc::get_mut(&mut state).unwrap().provider_config_paths = ProviderConfigPaths {
+            private_mount: workspace.path().join("private-mount"),
+            provider_home: provider_home.clone(),
         };
+        let launcher = workspace.path().join("exact-resume-provider");
+        std::fs::write(
+            &launcher,
+            "#!/bin/sh\ncat \"$TEST_CONFIG_PATH\" > \"$TEST_OUTPUT_PATH\"\nexec sleep 60\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&launcher, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let run_as_uid = current_uid;
         let native_session_id = "ses_exact_recovery";
         let environment = std::collections::BTreeMap::from([
             ("HOME".into(), "/home/freshell/provider".into()),
             ("PATH".into(), "/usr/bin:/bin".into()),
+            (
+                "TEST_CONFIG_PATH".into(),
+                provider_home
+                    .join(".config/opencode/opencode.json")
+                    .to_string_lossy()
+                    .into_owned(),
+            ),
+            (
+                "TEST_OUTPUT_PATH".into(),
+                child_output.to_string_lossy().into_owned(),
+            ),
         ]);
         let terminal = TerminalLaunchSpec {
             terminal_id: "terminal-exact-resume".into(),
@@ -3012,7 +3167,7 @@ mod tests {
             provider_permission_mode: None,
             provider_bootstrap_files: Vec::new(),
             provider_secret_references: Vec::new(),
-            provider_launch_context: None,
+            provider_launch_context: Some(context),
         };
         let resume_spec = ResumeSpec {
             schema_version: freshell_runtime_protocol::RESUME_SPEC_SCHEMA_VERSION,
@@ -3082,6 +3237,15 @@ mod tests {
         ));
         assert_eq!(state.persisted.lock().await.worker_launch_count, 1);
         assert!(state.pty.lock().await.is_some());
+        let mut observed = None;
+        for _ in 0..100 {
+            if let Ok(value) = std::fs::read(&child_output) {
+                observed = Some(value);
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert_eq!(observed.as_deref(), Some(b"second".as_slice()));
         let mut launched_pty = state.pty.lock().await.take();
         if let Some(mut pty) = launched_pty.take() {
             pty.stop().await;
@@ -3112,6 +3276,7 @@ mod tests {
             child: Mutex::new(None),
             pty: Mutex::new(None),
             fresh_agent: Mutex::new(None),
+            provider_config_paths: ProviderConfigPaths::default(),
         })
     }
 

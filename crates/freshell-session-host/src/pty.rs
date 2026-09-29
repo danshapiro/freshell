@@ -90,16 +90,8 @@ impl HostedPty {
                 });
             }
         });
-        let mut provider_args = vec![
-            "--reuid".to_string(),
-            launch.run_as_uid.to_string(),
-            "--regid".to_string(),
-            launch.run_as_gid.to_string(),
-            "--clear-groups".to_string(),
-            "--no-new-privs".to_string(),
-            "--".to_string(),
-            launch.program.clone(),
-        ];
+        let mut provider_args = crate::provider_identity_args(launch.run_as_uid, launch.run_as_gid);
+        provider_args.push(launch.program.clone());
         provider_args.extend(launch.args.clone());
         let spec = SpawnSpec {
             program: "/usr/bin/setpriv".to_string(),

@@ -221,7 +221,7 @@ impl ManagedTerminalController for ServerManagedRuntimeController {
                     // carrying either across this boundary would reintroduce a
                     // web dependency and persist a credential. Phase 3 replaces
                     // this with the scoped durable tool router.
-                    args: managed_provider_args(&request.mode, request.spec.args),
+                    args: managed_provider_args(&request.mode, request.spec.args)?,
                     env,
                     cwd: cwd.to_string_lossy().into_owned(),
                     run_as_uid,
@@ -716,21 +716,14 @@ fn managed_provider_env(
     env
 }
 
-fn managed_provider_args(mode: &str, args: Vec<String>) -> Vec<String> {
-    if mode != "claude" {
-        return args;
-    }
-    let mut out = Vec::with_capacity(args.len());
-    let mut index = 0;
-    while index < args.len() {
-        if args[index] == "--mcp-config" && index + 1 < args.len() {
-            index += 2;
-            continue;
-        }
-        out.push(args[index].clone());
-        index += 1;
-    }
-    out
+fn managed_provider_args(mode: &str, args: Vec<String>) -> Result<Vec<String>, String> {
+    let settings = (mode == "claude").then(|| {
+        freshell_platform::cli_launch::claude_settings_json(
+            freshell_platform::cli_launch::ProviderTarget::Unix,
+        )
+    });
+    freshell_runtime_protocol::durable_managed_terminal_args(mode, args, settings.as_deref())
+        .map_err(|error| error.message)
 }
 
 fn provider_label(provider: &str) -> &str {
@@ -1011,9 +1004,35 @@ mod tests {
             "s1".into(),
         ];
         assert_eq!(
-            managed_provider_args("claude", args),
-            vec!["--settings", "{}", "--session-id", "s1"]
+            managed_provider_args("claude", args).unwrap(),
+            vec![
+                "--settings".to_string(),
+                freshell_platform::cli_launch::claude_settings_json(
+                    freshell_platform::cli_launch::ProviderTarget::Unix,
+                ),
+                "--session-id".to_string(),
+                "s1".to_string(),
+            ]
         );
+    }
+
+    #[test]
+    fn managed_terminal_argument_path_rejects_credential_flags_before_persistence() {
+        for mode in ["claude", "codex", "opencode", "amplifier"] {
+            for arguments in [
+                vec!["--api-key", "fixture-secret-bytes"],
+                vec!["--api-key=fixture-secret-bytes"],
+            ] {
+                assert!(
+                    managed_provider_args(
+                        mode,
+                        arguments.into_iter().map(str::to_string).collect()
+                    )
+                    .is_err(),
+                    "{mode}"
+                );
+            }
+        }
     }
 }
 

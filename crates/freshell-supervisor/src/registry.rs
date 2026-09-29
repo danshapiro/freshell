@@ -415,6 +415,11 @@ impl Registry {
         &self,
         input: LaunchPreparation,
     ) -> Result<PreparedLaunch, RegistryError> {
+        if let Some(terminal) = &input.terminal {
+            terminal
+                .validate()
+                .map_err(|error| RegistryError::InvalidState(error.message))?;
+        }
         let installation_id = self.installation_id().clone();
         self.run_blocking(move |mut conn| {
             failpoint("prepare")?;
@@ -3036,6 +3041,31 @@ mod tests {
                 config: Vec::new(),
             }),
         });
+        for raw in [
+            vec!["--api-key".into(), secret.into()],
+            vec![format!("--api-key={secret}")],
+        ] {
+            assert!(freshell_runtime_protocol::durable_managed_terminal_args(
+                "amplifier",
+                raw.clone(),
+                None
+            )
+            .is_err());
+            let mut raw_launch = launch.clone();
+            raw_launch.terminal.as_mut().unwrap().args = raw;
+            assert!(matches!(
+                registry.prepare_launch(raw_launch).await,
+                Err(RegistryError::InvalidState(_))
+            ));
+            let conn = open_connection(&registry.inner.db_path).unwrap();
+            let rows: i64 = conn
+                .query_row("SELECT COUNT(*) FROM incarnations", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(rows, 0, "raw terminal argv reached durable registry");
+        }
+        assert!(!serde_json::to_string(launch.terminal.as_ref().unwrap())
+            .unwrap()
+            .contains(secret));
         registry.prepare_launch(launch).await.unwrap();
 
         let conn = open_connection(&registry.inner.db_path).unwrap();

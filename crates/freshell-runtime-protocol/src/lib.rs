@@ -6,7 +6,7 @@
 
 use hmac::{Hmac, Mac};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
-use sha2::Sha256;
+use sha2::{Digest, Sha256};
 use std::fmt;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
@@ -1601,6 +1601,7 @@ impl TerminalLaunchSpec {
                 "managed terminal launch exceeds argv/env/bootstrap bounds",
             ));
         }
+        validate_managed_terminal_args(&self.mode, &self.args)?;
         for name in self.env.keys() {
             let upper = name.to_ascii_uppercase();
             if [
@@ -1687,6 +1688,137 @@ impl TerminalLaunchSpec {
         }
         Ok(())
     }
+}
+
+/// Durable argv accepts only provider launch selectors. Credential-bearing
+/// switches must be resolved through the child-only OneCLI path instead.
+pub fn validate_managed_terminal_args(mode: &str, args: &[String]) -> Result<(), RuntimeError> {
+    if !matches!(mode, "claude" | "codex" | "opencode" | "amplifier") {
+        return Ok(()); // Legacy shell and Kilroy launches keep their contract.
+    }
+    let invalid = || {
+        RuntimeError::new(
+            RuntimeErrorCode::InvalidRequest,
+            "managed provider arguments must use an approved non-secret recipe",
+        )
+    };
+    let mut index = 0;
+    while index < args.len() {
+        let flag = args[index].as_str();
+        if mode == "codex" && flag == "resume" && index + 1 < args.len() {
+            if !safe_selector(&args[index + 1]) {
+                return Err(invalid());
+            }
+            index += 2;
+            continue;
+        }
+        if mode == "amplifier"
+            && args[index..].starts_with(&[
+                "session".into(),
+                "resume".into(),
+                "--full-history".into(),
+            ])
+            && index + 3 < args.len()
+        {
+            if !safe_selector(&args[index + 3]) {
+                return Err(invalid());
+            }
+            index += 4;
+            continue;
+        }
+        let value = args.get(index + 1).ok_or_else(invalid)?;
+        let allowed = match (mode, flag) {
+            ("claude", "--settings") => {
+                let digest = format!("{:x}", sha2::Sha256::digest(value.as_bytes()));
+                matches!(
+                    digest.as_str(),
+                    "aa8900bab7bd9bcbb64634d60593a9217c1639b539cea23318122b3428d123c6"
+                        | "d2dcb96c036160b2469bcd732fdc8d767dd481f9c0c864ce47d58ed057652c4d"
+                )
+            }
+            ("claude", "--mcp-config") => matches!(
+                value.as_str(),
+                ".claude/freshell-mcp.json" | "/home/freshell/provider/.claude/freshell-mcp.json"
+            ),
+            ("claude", "--session-id" | "--resume") => safe_selector(value),
+            ("claude", "--model" | "--effort" | "--permission-mode") => safe_selector(value),
+            ("codex", "-c") => {
+                matches!(
+                    value.as_str(),
+                    "tui.notification_method=bel"
+                        | "tui.notifications=['agent-turn-complete']"
+                        | "features.apps=false"
+                ) || value
+                    .strip_prefix("model_reasoning_effort=\"")
+                    .and_then(|part| part.strip_suffix('"'))
+                    .is_some_and(safe_selector)
+            }
+            ("codex", "--model" | "--sandbox") => safe_selector(value),
+            ("codex", "--remote") => value
+                .strip_prefix("ws://127.0.0.1:")
+                .is_some_and(|port| port.parse::<u16>().is_ok_and(|port| port > 0)),
+            ("opencode", "--hostname") => value == "127.0.0.1",
+            ("opencode", "--port") => value.parse::<u16>().is_ok(),
+            ("opencode", "--session" | "--model") => safe_selector(value),
+            _ => false,
+        };
+        if !allowed {
+            return Err(invalid());
+        }
+        index += 2;
+    }
+    Ok(())
+}
+
+/// Convert the web process's ordinary launch argv into its durable recipe.
+/// Claude's web-owned MCP file is omitted and its settings are regenerated
+/// from the shipped non-secret recipe before validation.
+pub fn durable_managed_terminal_args(
+    mode: &str,
+    args: Vec<String>,
+    claude_settings: Option<&str>,
+) -> Result<Vec<String>, RuntimeError> {
+    if mode != "claude" {
+        validate_managed_terminal_args(mode, &args)?;
+        return Ok(args);
+    }
+    let invalid = || {
+        RuntimeError::new(
+            RuntimeErrorCode::InvalidRequest,
+            "managed Claude launch argument is incomplete or unsupported",
+        )
+    };
+    let mut out = Vec::with_capacity(args.len());
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--mcp-config" => {
+                args.get(index + 1).ok_or_else(invalid)?;
+                index += 2;
+            }
+            "--settings" => {
+                args.get(index + 1).ok_or_else(invalid)?;
+                out.push("--settings".into());
+                out.push(claude_settings.ok_or_else(invalid)?.into());
+                index += 2;
+            }
+            _ => {
+                out.push(args[index].clone());
+                index += 1;
+            }
+        }
+    }
+    validate_managed_terminal_args(mode, &out)?;
+    Ok(out)
+}
+
+fn safe_selector(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 256
+        && value.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric()
+                || matches!(byte, b'.' | b'_' | b'-' | b':' | b'/' | b'@' | b'+')
+        })
 }
 
 fn validate_provider_secrets(
@@ -2548,6 +2680,68 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn durable_terminal_argument_recipe_preserves_provider_options_and_legacy_modes() {
+        for (provider, args) in [
+            (
+                "claude",
+                vec!["--model", "claude-sonnet", "--session-id", "session-1"],
+            ),
+            (
+                "codex",
+                vec![
+                    "-c",
+                    "tui.notification_method=bel",
+                    "--model",
+                    "gpt-6",
+                    "resume",
+                    "thread-1",
+                ],
+            ),
+            (
+                "opencode",
+                vec![
+                    "--hostname",
+                    "127.0.0.1",
+                    "--port",
+                    "0",
+                    "--session",
+                    "ses_1",
+                ],
+            ),
+            (
+                "amplifier",
+                vec!["session", "resume", "--full-history", "session-1"],
+            ),
+        ] {
+            let args = args.into_iter().map(str::to_string).collect::<Vec<_>>();
+            assert_eq!(
+                durable_managed_terminal_args(provider, args.clone(), None).unwrap(),
+                args
+            );
+        }
+        let legacy = vec!["--api-key".into(), "legacy-value".into()];
+        assert_eq!(
+            durable_managed_terminal_args("kilroy", legacy.clone(), None).unwrap(),
+            legacy
+        );
+    }
+
+    #[test]
+    fn durable_terminal_argument_recipe_rejects_separated_and_inline_credentials() {
+        for provider in ["claude", "codex", "opencode", "amplifier"] {
+            for args in [
+                vec!["--api-key".into(), "fixture-secret-bytes".into()],
+                vec!["--api-key=fixture-secret-bytes".into()],
+            ] {
+                assert!(
+                    durable_managed_terminal_args(provider, args, None).is_err(),
+                    "{provider}"
+                );
+            }
+        }
+    }
 
     #[test]
     fn ids_reject_control_characters_and_are_distinct() {
