@@ -113,7 +113,8 @@ function nanoid(size = 21) {
 
 // ── clean env (server/sdk-bridge.ts:64-66) ──────────────────────────────────
 function createClaudeSdkCleanEnv(env = process.env) {
-  const { CLAUDECODE: _c, ANTHROPIC_API_KEY: _k, ...cleanEnv } = env
+  const { CLAUDECODE: _c, ANTHROPIC_API_KEY: apiKey, FRESHELL_CLAUDE_ONECLI_API_KEY: onecliApiKey, ...cleanEnv } = env
+  if (onecliApiKey === '1' && apiKey) cleanEnv.ANTHROPIC_API_KEY = apiKey
   return cleanEnv
 }
 

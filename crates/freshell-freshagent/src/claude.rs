@@ -9539,6 +9539,12 @@ async fn spawn_sidecar() -> Result<(Child, ChildStdin, ChildStdout, String), Str
     // (the SDK's clean-env passes FRESHELL_CLAUDE_SIDECAR_ID through — it strips only
     // CLAUDECODE + ANTHROPIC_API_KEY).
     cmd.env(CLAUDE_SIDECAR_OWNERSHIP_ENV, &ownership_id);
+    if let Some(environment) = freshell_platform::managed_child_secrets::snapshot() {
+        if environment.contains_key("ANTHROPIC_API_KEY") {
+            cmd.env("FRESHELL_CLAUDE_ONECLI_API_KEY", "1");
+        }
+        cmd.envs(environment);
+    }
     cmd.stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());

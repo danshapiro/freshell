@@ -18,7 +18,10 @@ pub struct PreparedCodexLaunch {
     pub remote_args: [String; 4],
 }
 
-pub async fn prepare(terminal: &TerminalLaunchSpec) -> Result<PreparedCodexLaunch, String> {
+pub async fn prepare(
+    terminal: &TerminalLaunchSpec,
+    child_secret_env: &std::collections::BTreeMap<String, String>,
+) -> Result<PreparedCodexLaunch, String> {
     if terminal.mode != "codex" {
         return Err("Codex launch adapter received another provider".into());
     }
@@ -31,7 +34,24 @@ pub async fn prepare(terminal: &TerminalLaunchSpec) -> Result<PreparedCodexLaunc
         // The managed session host owns the sidecar inside the soul enclosure.
         // It has no web-owned MCP context to inherit, so use the explicit
         // empty launch context rather than silently reintroducing web state.
-        sidecar_context: CodexSidecarLaunchContext::default(),
+        sidecar_context: CodexSidecarLaunchContext {
+            config_args: terminal
+                .provider_launch_context
+                .as_ref()
+                .and_then(|context| {
+                    if let freshell_runtime_protocol::ProviderPreparation::Codex {
+                        sidecar_args,
+                        ..
+                    } = &context.preparation
+                    {
+                        Some(sidecar_args.clone())
+                    } else {
+                        None
+                    }
+                })
+                .unwrap_or_default(),
+            env: child_secret_env.clone(),
+        },
     };
     let launch = CodexTerminalLaunchManager::global()
         .plan_create_with_retry_uncancellable(

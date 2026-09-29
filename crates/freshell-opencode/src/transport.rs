@@ -266,6 +266,9 @@ impl ProcessSpawner for TokioProcessSpawner {
         for (key, value) in &req.env {
             cmd.env(key, value);
         }
+        if let Some(environment) = freshell_platform::managed_child_secrets::snapshot() {
+            cmd.envs(environment);
+        }
         cmd.stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());

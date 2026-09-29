@@ -1,9 +1,11 @@
 #[cfg(unix)]
 use freshell_runtime_protocol::ProviderSecretProfile;
 use freshell_runtime_protocol::ProviderSecretReference;
+use freshell_runtime_protocol::{
+    ProviderConfigReference, ProviderConfigRoot, ProviderLaunchContext, ProviderPreparation,
+};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
-#[cfg(unix)]
 use std::path::{Path, PathBuf};
 
 /// This is the provider-effective model configured by the approved OneCLI
@@ -11,6 +13,181 @@ use std::path::{Path, PathBuf};
 pub const AMPLIFIER_MODEL: &str = "glm-5.3";
 pub const AMPLIFIER_REASONING_EFFORT: &str = "provider-default";
 pub const AMPLIFIER_PROGRAM: &str = "/usr/local/bin/freshell-amplifier-onecli";
+
+pub fn provider_launch_context(provider: &str, workspace: &Path) -> Option<ProviderLaunchContext> {
+    let (root, entries, preparation) = match provider {
+        "claude" => (
+            ".claude",
+            &[
+                "settings.json",
+                "settings.local.json",
+                "CLAUDE.md",
+                "plugins",
+                "skills",
+                "commands",
+                "hooks",
+                "agents",
+            ][..],
+            ProviderPreparation::Claude {
+                mcp_args: Vec::new(),
+            },
+        ),
+        "codex" => (
+            ".codex",
+            &["config.toml", "AGENTS.md", "skills", "rules"][..],
+            ProviderPreparation::Codex {
+                tui_args: Vec::new(),
+                sidecar_args: Vec::new(),
+            },
+        ),
+        "opencode" => (
+            ".config/opencode",
+            &[
+                "opencode.json",
+                "opencode.jsonc",
+                "plugins",
+                "agents",
+                "commands",
+                "skills",
+            ][..],
+            ProviderPreparation::Opencode {
+                project_config: Vec::new(),
+                tui_config: None,
+            },
+        ),
+        "amplifier" => (
+            ".amplifier",
+            &["config.yaml", "config.yml", "bundles", "skills", "agents"][..],
+            ProviderPreparation::Amplifier {
+                bundle: "default".into(),
+                resume_args: Vec::new(),
+            },
+        ),
+        _ => return None,
+    };
+    let preparation = match preparation {
+        ProviderPreparation::Opencode { tui_config, .. } => {
+            let project_config = [
+                "opencode.json",
+                "opencode.jsonc",
+                ".opencode/opencode.json",
+                ".opencode/opencode.jsonc",
+            ]
+            .into_iter()
+            .filter_map(|entry| {
+                let metadata = std::fs::symlink_metadata(workspace.join(entry)).ok()?;
+                if !metadata.is_file() || metadata.file_type().is_symlink() {
+                    return None;
+                }
+                Some(ProviderConfigReference {
+                    root: ProviderConfigRoot::Workspace,
+                    relative_path: entry.into(),
+                    provider_relative_path: format!(".config/opencode/project/{entry}"),
+                    format: if entry.ends_with(".jsonc") {
+                        "jsonc"
+                    } else {
+                        "json"
+                    }
+                    .into(),
+                })
+            })
+            .collect();
+            ProviderPreparation::Opencode {
+                project_config,
+                tui_config,
+            }
+        }
+        other => other,
+    };
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    let config = home
+        .into_iter()
+        .flat_map(|home| {
+            entries.iter().filter_map(move |entry| {
+                let path = home.join(root).join(entry);
+                let format = if path.is_dir() {
+                    "directory"
+                } else if path.is_file() {
+                    match path.extension().and_then(|value| value.to_str()) {
+                        Some("json") => "json",
+                        Some("jsonc") => "jsonc",
+                        Some("toml") => "toml",
+                        Some("yaml" | "yml") => "yaml",
+                        _ => "text",
+                    }
+                } else {
+                    return None;
+                };
+                Some(ProviderConfigReference {
+                    root: ProviderConfigRoot::UserProvider,
+                    relative_path: (*entry).into(),
+                    provider_relative_path: format!("{root}/{entry}"),
+                    format: format.into(),
+                })
+            })
+        })
+        .collect();
+    Some(ProviderLaunchContext {
+        preparation,
+        mcp_capability: None,
+        config,
+        plugins: Vec::new(),
+    })
+}
+
+pub fn named_provider_onecli_references(
+    provider: &str,
+) -> Result<Vec<ProviderSecretReference>, String> {
+    use freshell_runtime_protocol::ProviderSecretProfile;
+    let (prefix, environment, auth_file) = match provider {
+        "claude" => (
+            "CLAUDE",
+            ProviderSecretProfile::ClaudeOnecliEnvironment,
+            ProviderSecretProfile::ClaudeOnecliAuthFile,
+        ),
+        "codex" => (
+            "CODEX",
+            ProviderSecretProfile::CodexOnecliEnvironment,
+            ProviderSecretProfile::CodexOnecliAuthFile,
+        ),
+        "opencode" => (
+            "OPENCODE",
+            ProviderSecretProfile::OpencodeOnecliEnvironment,
+            ProviderSecretProfile::OpencodeOnecliAuthFile,
+        ),
+        "amplifier" => (
+            "AMPLIFIER",
+            ProviderSecretProfile::AmplifierOnecliEnvironment,
+            ProviderSecretProfile::AmplifierOnecliKeysFile,
+        ),
+        _ => return Ok(Vec::new()),
+    };
+    let mut references = Vec::new();
+    for (suffix, profile) in [("ENV_FILE", environment), ("AUTH_FILE", auth_file)] {
+        let key = format!("FRESHELL_MANAGED_{prefix}_ONECLI_{suffix}");
+        if let Some(path) = std::env::var_os(&key).filter(|value| !value.is_empty()) {
+            let path = std::path::PathBuf::from(path);
+            let metadata = std::fs::symlink_metadata(&path)
+                .map_err(|error| format!("{key}: OneCLI grant unavailable: {error}"))?;
+            if !metadata.is_file() || metadata.file_type().is_symlink() {
+                return Err(format!("{key}: OneCLI grant must be a regular file"));
+            }
+            #[cfg(unix)]
+            if metadata.permissions().mode() & 0o077 != 0 {
+                return Err(format!("{key}: OneCLI grant must be private"));
+            }
+            let source_path = std::fs::canonicalize(path)
+                .map_err(|error| format!("{key}: OneCLI grant unavailable: {error}"))?
+                .to_string_lossy()
+                .into_owned();
+            references.push(ProviderSecretReference {
+                source_path,
+                profile,
+            });
+        }
+    }
+    Ok(references)
+}
 
 #[cfg(not(unix))]
 pub fn amplifier_secret_references(
@@ -123,6 +300,35 @@ fn validate_amplifier_bootstrap(
 mod tests {
     use super::*;
     use std::fs;
+
+    #[test]
+    fn named_provider_launch_context_uses_only_approved_nonsecret_roots() {
+        for provider in ["claude", "codex", "opencode", "amplifier"] {
+            let context = provider_launch_context(provider, Path::new("/tmp")).unwrap();
+            context.validate(provider).unwrap();
+            assert!(context.validate("different-provider").is_err());
+            assert!(context.config.iter().all(|reference| {
+                reference.root == ProviderConfigRoot::UserProvider
+                    && !reference.relative_path.contains("auth")
+                    && !reference.relative_path.contains("credentials")
+                    && !reference.relative_path.contains("keys.env")
+            }));
+        }
+        assert!(provider_launch_context("kilroy", Path::new("/tmp")).is_none());
+    }
+
+    #[test]
+    fn opencode_context_names_existing_workspace_configuration() {
+        let workspace = tempfile::tempdir().unwrap();
+        fs::write(workspace.path().join("opencode.json"), "{}").unwrap();
+        let context = provider_launch_context("opencode", workspace.path()).unwrap();
+        assert!(
+            matches!(context.preparation, ProviderPreparation::Opencode { ref project_config, .. }
+            if project_config.iter().any(|reference| reference.root == ProviderConfigRoot::Workspace
+                && reference.relative_path == "opencode.json"))
+        );
+        context.validate("opencode").unwrap();
+    }
 
     fn private_file(root: &Path) -> PathBuf {
         let path = root.join("keys.env");

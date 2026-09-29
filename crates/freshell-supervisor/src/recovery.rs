@@ -576,7 +576,7 @@ impl Supervisor {
             .prepare_replacement(
                 start.clone(),
                 replacement_terminal,
-                start.context.fresh_agent.clone(),
+                fresh_without_raw_bootstrap(start.context.fresh_agent.clone()),
                 resume_spec.clone(),
                 path,
             )
@@ -1951,6 +1951,17 @@ fn terminal_without_first_boot_state(
     })
 }
 
+fn fresh_without_raw_bootstrap(
+    agent: Option<freshell_runtime_protocol::FreshAgentLaunchSpec>,
+) -> Option<freshell_runtime_protocol::FreshAgentLaunchSpec> {
+    agent.map(|mut agent| {
+        if agent.provider != freshell_runtime_protocol::FreshProvider::Kilroy {
+            agent.provider_bootstrap_files.clear();
+        }
+        agent
+    })
+}
+
 fn map_registry(error: RegistryError) -> RuntimeError {
     let code = match &error {
         RegistryError::Busy => RuntimeErrorCode::RegistryBusy,
@@ -2006,6 +2017,8 @@ mod tests {
             native_session_id: Some("thread-exact".into()),
             fixture_transport: None,
             provider_bootstrap_files: Vec::new(),
+            provider_secret_references: Vec::new(),
+            provider_launch_context: None,
         };
 
         let settings = fresh_agent_replay_settings(&agent);
@@ -2115,6 +2128,7 @@ mod tests {
                 provider_relative_path: ".local/share/opencode/auth.json".into(),
             }],
             provider_secret_references: Vec::new(),
+            provider_launch_context: None,
         };
 
         let replacement = terminal_without_first_boot_state(Some(terminal.clone())).unwrap();

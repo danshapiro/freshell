@@ -32,6 +32,7 @@ default = []
 real-transport = ["dep:reqwest", "dep:libc", "tokio/process", "tokio/io-util"]
 
 [dependencies]
+freshell-platform = { path = "../freshell-platform" }
 # Dynamic JSON parsing that mirrors the TS `Record<string, unknown>` event/property
 # model (JSON.parse parity, corruption-tolerant). preserve_order matches the object model.
 serde_json = { workspace = true }

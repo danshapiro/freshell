@@ -911,6 +911,14 @@ pub struct ProviderBootstrapFile {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ProviderSecretProfile {
+    ClaudeOnecliEnvironment,
+    ClaudeOnecliAuthFile,
+    CodexOnecliEnvironment,
+    CodexOnecliAuthFile,
+    OpencodeOnecliEnvironment,
+    OpencodeOnecliAuthFile,
+    AmplifierOnecliEnvironment,
+    AmplifierOnecliKeysFile,
     /// The approved OneCLI deployment: Amplifier's VLLM module talks to the
     /// LunaRoute-compatible upstream through the credentialed HTTPS proxy
     /// referenced by the user's private keys.env.
@@ -922,6 +930,30 @@ pub enum ProviderSecretProfile {
     LegacyAmplifierOnecliAnthropicHaikuLow,
 }
 
+impl ProviderSecretProfile {
+    pub fn provider(self) -> &'static str {
+        match self {
+            Self::ClaudeOnecliEnvironment | Self::ClaudeOnecliAuthFile => "claude",
+            Self::CodexOnecliEnvironment | Self::CodexOnecliAuthFile => "codex",
+            Self::OpencodeOnecliEnvironment | Self::OpencodeOnecliAuthFile => "opencode",
+            Self::AmplifierOnecliEnvironment
+            | Self::AmplifierOnecliKeysFile
+            | Self::AmplifierOnecliLunarouteGlm53
+            | Self::LegacyAmplifierOnecliAnthropicHaikuLow => "amplifier",
+        }
+    }
+
+    pub fn auth_relative_path(self) -> Option<&'static str> {
+        match self {
+            Self::ClaudeOnecliAuthFile => Some(".claude/.credentials.json"),
+            Self::CodexOnecliAuthFile => Some(".codex/auth.json"),
+            Self::OpencodeOnecliAuthFile => Some(".local/share/opencode/auth.json"),
+            Self::AmplifierOnecliKeysFile => Some(".amplifier/keys.env"),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ProviderSecretReference {
@@ -929,6 +961,367 @@ pub struct ProviderSecretReference {
     /// session host reads its read-only mount immediately before child spawn.
     pub source_path: String,
     pub profile: ProviderSecretProfile,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ProviderLaunchContext {
+    pub preparation: ProviderPreparation,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mcp_capability: Option<McpCapabilityReference>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub config: Vec<ProviderConfigReference>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub plugins: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub enum ProviderPreparation {
+    Claude {
+        mcp_args: Vec<String>,
+    },
+    Codex {
+        tui_args: Vec<String>,
+        sidecar_args: Vec<String>,
+    },
+    Opencode {
+        project_config: Vec<ProviderConfigReference>,
+        tui_config: Option<ProviderConfigReference>,
+    },
+    Amplifier {
+        bundle: String,
+        resume_args: Vec<String>,
+    },
+}
+
+impl ProviderPreparation {
+    pub fn provider(&self) -> &'static str {
+        match self {
+            Self::Claude { .. } => "claude",
+            Self::Codex { .. } => "codex",
+            Self::Opencode { .. } => "opencode",
+            Self::Amplifier { .. } => "amplifier",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct McpCapabilityReference {
+    pub grant_id: String,
+    pub endpoint: String,
+    pub provider_relative_path: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderConfigRoot {
+    Workspace,
+    UserProvider,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ProviderConfigReference {
+    pub root: ProviderConfigRoot,
+    pub relative_path: String,
+    pub provider_relative_path: String,
+    pub format: String,
+}
+
+impl ProviderLaunchContext {
+    pub fn validate(&self, provider: &str) -> Result<(), RuntimeError> {
+        let invalid = || {
+            RuntimeError::new(
+                RuntimeErrorCode::InvalidRequest,
+                "managed provider launch context is unsafe or mismatched",
+            )
+        };
+        if self.preparation.provider() != provider
+            || self.config.len() > 128
+            || self.plugins.len() > 64
+        {
+            return Err(invalid());
+        }
+        let mut references: Vec<&ProviderConfigReference> = self.config.iter().collect();
+        let arguments: &[String] = match &self.preparation {
+            ProviderPreparation::Claude { mcp_args } => mcp_args,
+            ProviderPreparation::Codex {
+                tui_args,
+                sidecar_args,
+            } => {
+                if sidecar_args.len() > 128
+                    || sidecar_args
+                        .iter()
+                        .any(|value| !safe_preparation_value(value))
+                {
+                    return Err(invalid());
+                }
+                tui_args
+            }
+            ProviderPreparation::Opencode {
+                project_config,
+                tui_config,
+            } => {
+                references.extend(project_config.iter());
+                references.extend(tui_config.iter());
+                &[]
+            }
+            ProviderPreparation::Amplifier {
+                bundle,
+                resume_args,
+            } => {
+                if !safe_preparation_value(bundle) {
+                    return Err(invalid());
+                }
+                resume_args
+            }
+        };
+        if arguments.len() > 128
+            || arguments.iter().any(|value| !safe_preparation_value(value))
+            || self
+                .plugins
+                .iter()
+                .any(|value| !safe_preparation_value(value))
+        {
+            return Err(invalid());
+        }
+        for reference in references {
+            if !safe_relative_path(&reference.relative_path)
+                || !safe_relative_path(&reference.provider_relative_path)
+                || !matches!(
+                    reference.format.as_str(),
+                    "json" | "jsonc" | "toml" | "yaml" | "text" | "directory"
+                )
+                || reference.relative_path.split('/').any(secret_component)
+                || reference
+                    .provider_relative_path
+                    .split('/')
+                    .any(secret_component)
+                || (reference.root == ProviderConfigRoot::UserProvider && provider == "shell")
+            {
+                return Err(invalid());
+            }
+        }
+        if let Some(capability) = &self.mcp_capability {
+            if !capability.grant_id.starts_with("grant-")
+                || capability.grant_id.len() > 128
+                || !capability
+                    .grant_id
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+                || !safe_relative_path(&capability.provider_relative_path)
+                || capability.endpoint.len() > 512
+                || !(capability.endpoint.starts_with("http://")
+                    || capability.endpoint.starts_with("https://"))
+                || capability.endpoint.contains(['?', '#', '@', '\n', '\r'])
+                || capability.endpoint.starts_with("http://127.")
+                || capability.endpoint.starts_with("https://127.")
+                || capability.endpoint.starts_with("http://localhost")
+                || capability.endpoint.starts_with("https://localhost")
+                || capability.endpoint.starts_with("http://[::1]")
+                || capability.endpoint.starts_with("https://[::1]")
+            {
+                return Err(invalid());
+            }
+        }
+        Ok(())
+    }
+}
+
+fn safe_relative_path(value: &str) -> bool {
+    let path = std::path::Path::new(value);
+    !value.is_empty()
+        && value.len() <= 512
+        && !path.is_absolute()
+        && path
+            .components()
+            .all(|component| matches!(component, std::path::Component::Normal(_)))
+        && !value.chars().any(char::is_control)
+}
+
+fn secret_component(value: &str) -> bool {
+    matches!(
+        value.to_ascii_lowercase().as_str(),
+        ".credentials.json"
+            | "auth.json"
+            | "keys.env"
+            | ".env"
+            | "credentials"
+            | "secrets"
+            | "token.json"
+    )
+}
+
+fn safe_preparation_value(value: &str) -> bool {
+    let lower = value.to_ascii_lowercase();
+    !value.is_empty()
+        && value.len() <= 512
+        && !value.starts_with('/')
+        && !value.chars().any(char::is_control)
+        && !lower.contains("api_key=")
+        && !lower.contains("apikey=")
+        && !lower.contains("token=")
+        && !lower.contains("secret=")
+        && !lower.contains("password=")
+        && !lower.contains("oauth=")
+}
+
+#[cfg(test)]
+mod provider_launch_context_tests {
+    use super::*;
+
+    #[test]
+    fn old_terminal_launch_row_deserializes_without_provider_context() {
+        let row = serde_json::json!({
+            "terminalId":"terminal-old", "streamId":"stream-old", "mode":"claude",
+            "program":"claude", "cwd":"/workspace", "runAsUid":65534,
+            "runAsGid":0, "cols":80, "rows":24, "projectKey":"project-old",
+            "workspacePath":"/workspace"
+        });
+        let launch: TerminalLaunchSpec = serde_json::from_value(row).unwrap();
+        assert!(launch.provider_launch_context.is_none());
+    }
+
+    #[test]
+    fn old_fresh_agent_row_deserializes_without_context_or_secret_references() {
+        let row = serde_json::json!({
+            "sessionId":"old-fresh", "provider":"claude", "sessionType":"freshclaude",
+            "runtimeVariant":"claude-sdk", "providerStoreId":"old-store",
+            "cwd":"/workspace", "workspacePath":"/workspace", "runAsUid":65534,
+            "runAsGid":0
+        });
+        let launch: FreshAgentLaunchSpec = serde_json::from_value(row).unwrap();
+        assert!(launch.provider_launch_context.is_none());
+        assert!(launch.provider_secret_references.is_empty());
+    }
+
+    #[test]
+    fn typed_provider_context_round_trips_without_secret_material() {
+        let context = ProviderLaunchContext {
+            preparation: ProviderPreparation::Claude {
+                mcp_args: vec!["--mcp-config".into(), ".claude/freshell-mcp.json".into()],
+            },
+            mcp_capability: Some(McpCapabilityReference {
+                grant_id: "grant-opaque-reference".into(),
+                endpoint: "http://host.docker.internal:3001/api/mcp".into(),
+                provider_relative_path: ".claude/freshell-mcp.json".into(),
+            }),
+            config: vec![ProviderConfigReference {
+                root: ProviderConfigRoot::UserProvider,
+                relative_path: "settings.json".into(),
+                provider_relative_path: ".claude/settings.json".into(),
+                format: "json".into(),
+            }],
+            plugins: vec!["example-plugin".into()],
+        };
+        context.validate("claude").unwrap();
+        let encoded = serde_json::to_string(&context).unwrap();
+        assert!(!encoded.contains("test-secret-value"));
+        assert_eq!(
+            serde_json::from_str::<ProviderLaunchContext>(&encoded).unwrap(),
+            context
+        );
+    }
+
+    #[test]
+    fn raw_secret_payload_and_unapproved_config_paths_are_rejected() {
+        let raw = serde_json::json!({
+            "preparation":{"claude":{"mcpArgs":[]}}, "config":[], "plugins":[],
+            "token":"test-secret-value"
+        });
+        assert!(serde_json::from_value::<ProviderLaunchContext>(raw).is_err());
+        let nested = serde_json::json!({
+            "preparation":{"claude":{"mcp_args":[],"apiKey":"test-secret-value"}},
+            "config":[], "plugins":[]
+        });
+        assert!(serde_json::from_value::<ProviderLaunchContext>(nested).is_err());
+
+        let context = ProviderLaunchContext {
+            preparation: ProviderPreparation::Claude { mcp_args: vec![] },
+            mcp_capability: None,
+            config: vec![ProviderConfigReference {
+                root: ProviderConfigRoot::UserProvider,
+                relative_path: ".credentials.json".into(),
+                provider_relative_path: ".claude/.credentials.json".into(),
+                format: "json".into(),
+            }],
+            plugins: vec![],
+        };
+        assert!(context.validate("claude").is_err());
+        let mut context = context;
+        context.config.clear();
+        context.mcp_capability = Some(McpCapabilityReference {
+            grant_id: "grant-local-control".into(),
+            endpoint: "http://127.0.0.1:10254/api/mcp".into(),
+            provider_relative_path: ".claude/mcp.json".into(),
+        });
+        assert!(context.validate("claude").is_err());
+    }
+
+    #[test]
+    fn onecli_profiles_match_only_their_named_provider() {
+        for (provider, profiles) in [
+            (
+                "claude",
+                [
+                    ProviderSecretProfile::ClaudeOnecliEnvironment,
+                    ProviderSecretProfile::ClaudeOnecliAuthFile,
+                ],
+            ),
+            (
+                "codex",
+                [
+                    ProviderSecretProfile::CodexOnecliEnvironment,
+                    ProviderSecretProfile::CodexOnecliAuthFile,
+                ],
+            ),
+            (
+                "opencode",
+                [
+                    ProviderSecretProfile::OpencodeOnecliEnvironment,
+                    ProviderSecretProfile::OpencodeOnecliAuthFile,
+                ],
+            ),
+            (
+                "amplifier",
+                [
+                    ProviderSecretProfile::AmplifierOnecliEnvironment,
+                    ProviderSecretProfile::AmplifierOnecliKeysFile,
+                ],
+            ),
+        ] {
+            for profile in profiles {
+                let references = [ProviderSecretReference {
+                    source_path: "/private/onecli-grant".into(),
+                    profile,
+                }];
+                assert!(validate_provider_secrets(provider, &references).is_ok());
+                assert!(validate_provider_secrets("wrong-provider", &references).is_err());
+            }
+        }
+        assert!(validate_provider_secrets(
+            "amplifier",
+            &[ProviderSecretReference {
+                source_path: "/private/legacy".into(),
+                profile: ProviderSecretProfile::LegacyAmplifierOnecliAnthropicHaikuLow,
+            }]
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn terminal_launch_rejects_raw_secret_environment() {
+        let row = serde_json::json!({
+            "terminalId":"terminal-secret", "streamId":"stream-secret", "mode":"codex",
+            "program":"codex", "cwd":"/workspace", "runAsUid":65534,
+            "runAsGid":0, "cols":80, "rows":24, "projectKey":"project-secret",
+            "workspacePath":"/workspace", "env":{"OPENAI_API_KEY":"fixture-secret-value"}
+        });
+        let launch: TerminalLaunchSpec = serde_json::from_value(row).unwrap();
+        assert!(launch.validate().is_err());
+    }
 }
 
 /// Fresh-agent provider hosted inside one managed soul enclosure. Kilroy is
@@ -994,6 +1387,10 @@ pub struct FreshAgentLaunchSpec {
     pub fixture_transport: Option<FreshAgentFixtureTransport>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub provider_bootstrap_files: Vec<ProviderBootstrapFile>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub provider_secret_references: Vec<ProviderSecretReference>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_launch_context: Option<ProviderLaunchContext>,
 }
 
 impl FreshAgentLaunchSpec {
@@ -1013,6 +1410,7 @@ impl FreshAgentLaunchSpec {
             || self.run_as_uid == 0
             || self.native_session_id.as_deref().is_some_and(str::is_empty)
             || self.provider_bootstrap_files.len() > 16
+            || self.provider_secret_references.len() > 4
         {
             return Err(RuntimeError::new(
                 RuntimeErrorCode::InvalidRequest,
@@ -1055,6 +1453,16 @@ impl FreshAgentLaunchSpec {
                     "managed provider bootstrap file path is unsafe",
                 ));
             }
+        }
+        if let Some(context) = &self.provider_launch_context {
+            context.validate(self.provider.as_str())?;
+        }
+        validate_provider_secrets(self.provider.as_str(), &self.provider_secret_references)?;
+        if self.provider != FreshProvider::Kilroy && !self.provider_bootstrap_files.is_empty() {
+            return Err(RuntimeError::new(
+                RuntimeErrorCode::InvalidRequest,
+                "raw credential bootstrap is unsupported for named managed providers",
+            ));
         }
         Ok(())
     }
@@ -1144,6 +1552,8 @@ pub struct TerminalLaunchSpec {
     pub provider_bootstrap_files: Vec<ProviderBootstrapFile>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub provider_secret_references: Vec<ProviderSecretReference>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_launch_context: Option<ProviderLaunchContext>,
 }
 
 impl TerminalLaunchSpec {
@@ -1173,6 +1583,26 @@ impl TerminalLaunchSpec {
                 RuntimeErrorCode::InvalidRequest,
                 "managed terminal launch exceeds argv/env/bootstrap bounds",
             ));
+        }
+        for name in self.env.keys() {
+            let upper = name.to_ascii_uppercase();
+            if [
+                "TOKEN",
+                "API_KEY",
+                "SECRET",
+                "PASSWORD",
+                "CREDENTIAL",
+                "OAUTH",
+                "PROXY",
+            ]
+            .iter()
+            .any(|marker| upper.contains(marker))
+            {
+                return Err(RuntimeError::new(
+                    RuntimeErrorCode::InvalidRequest,
+                    "managed provider secrets must use a OneCLI reference",
+                ));
+            }
         }
         for (name, value) in [
             ("providerModel", self.provider_model.as_deref()),
@@ -1219,22 +1649,52 @@ impl TerminalLaunchSpec {
         }
         for secret in &self.provider_secret_references {
             let source = std::path::Path::new(&secret.source_path);
-            if self.mode != "amplifier"
-                || !source.is_absolute()
-                || secret.source_path.chars().any(char::is_control)
-                || !matches!(
-                    secret.profile,
-                    ProviderSecretProfile::AmplifierOnecliLunarouteGlm53
-                )
-            {
+            if !source.is_absolute() || secret.source_path.chars().any(char::is_control) {
                 return Err(RuntimeError::new(
                     RuntimeErrorCode::InvalidRequest,
                     "managed provider secret reference is unsafe or unsupported",
                 ));
             }
         }
+        validate_provider_secrets(&self.mode, &self.provider_secret_references)?;
+        if let Some(context) = &self.provider_launch_context {
+            context.validate(&self.mode)?;
+        }
+        if matches!(self.mode.as_str(), "claude" | "codex" | "opencode")
+            && !self.provider_bootstrap_files.is_empty()
+        {
+            return Err(RuntimeError::new(
+                RuntimeErrorCode::InvalidRequest,
+                "raw credential bootstrap is unsupported for named managed providers",
+            ));
+        }
         Ok(())
     }
+}
+
+fn validate_provider_secrets(
+    provider: &str,
+    references: &[ProviderSecretReference],
+) -> Result<(), RuntimeError> {
+    let mut seen = std::collections::BTreeSet::new();
+    for reference in references {
+        if reference.profile.provider() != provider
+            || !std::path::Path::new(&reference.source_path).is_absolute()
+            || reference.source_path.len() > 1024
+            || reference.source_path.chars().any(char::is_control)
+            || !seen.insert(reference.profile as u8)
+            || matches!(
+                reference.profile,
+                ProviderSecretProfile::LegacyAmplifierOnecliAnthropicHaikuLow
+            )
+        {
+            return Err(RuntimeError::new(
+                RuntimeErrorCode::InvalidRequest,
+                "managed OneCLI profile is unsafe or belongs to another provider",
+            ));
+        }
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -2262,6 +2722,7 @@ mod tests {
             provider_permission_mode: Some("on-request".into()),
             provider_bootstrap_files: Vec::new(),
             provider_secret_references: Vec::new(),
+            provider_launch_context: None,
         };
         assert!(spec.validate().is_ok());
         spec.provider_model = Some("bad\0model".into());
@@ -2294,10 +2755,9 @@ mod tests {
             sandbox: Some("workspace-write".into()),
             native_session_id: Some("native-one".into()),
             fixture_transport: None,
-            provider_bootstrap_files: vec![ProviderBootstrapFile {
-                source_path: "/credential-reference-only".into(),
-                provider_relative_path: ".provider/config.json".into(),
-            }],
+            provider_bootstrap_files: Vec::new(),
+            provider_secret_references: Vec::new(),
+            provider_launch_context: None,
         }
     }
 
@@ -2438,7 +2898,13 @@ mod tests {
             RuntimeErrorCode::InvalidRequest
         );
 
-        let mut unsafe_agent = fresh_agent_launch(FreshProvider::Opencode, "freshopencode");
+        let mut unsafe_agent = fresh_agent_launch(FreshProvider::Kilroy, "kilroy");
+        unsafe_agent
+            .provider_bootstrap_files
+            .push(ProviderBootstrapFile {
+                source_path: "/credential-reference-only".into(),
+                provider_relative_path: ".provider/config.json".into(),
+            });
         unsafe_agent.provider_bootstrap_files[0].provider_relative_path =
             "../../run/freshell/secret".into();
         assert_eq!(

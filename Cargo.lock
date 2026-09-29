@@ -1358,6 +1358,7 @@ dependencies = [
 name = "freshell-opencode"
 version = "0.1.0"
 dependencies = [
+ "freshell-platform",
  "libc",
  "reqwest",
  "serde",

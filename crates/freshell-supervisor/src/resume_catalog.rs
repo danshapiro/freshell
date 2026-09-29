@@ -86,6 +86,19 @@ pub fn exact_resume_candidate(
                 .map(|file| CredentialReference {
                     provider_relative_path: file.provider_relative_path.clone(),
                 })
+                .chain(
+                    agent
+                        .provider_secret_references
+                        .iter()
+                        .filter_map(|reference| {
+                            reference
+                                .profile
+                                .auth_relative_path()
+                                .map(|path| CredentialReference {
+                                    provider_relative_path: path.into(),
+                                })
+                        }),
+                )
                 .collect(),
             identity_provenance: IdentityProvenance::ProviderObserved,
             durable_position: DurablePosition {
@@ -203,9 +216,27 @@ fn enrich_resume_spec(
     spec.image_ref = Some(context.prior_handle.image_ref().to_string());
     spec.credential_references = terminal
         .into_iter()
-        .flat_map(|terminal| terminal.provider_bootstrap_files.iter())
-        .map(|file| CredentialReference {
-            provider_relative_path: file.provider_relative_path.clone(),
+        .flat_map(|terminal| {
+            terminal
+                .provider_bootstrap_files
+                .iter()
+                .map(|file| CredentialReference {
+                    provider_relative_path: file.provider_relative_path.clone(),
+                })
+                .chain(
+                    terminal
+                        .provider_secret_references
+                        .iter()
+                        .filter_map(|reference| {
+                            reference
+                                .profile
+                                .auth_relative_path()
+                                .map(|path| CredentialReference {
+                                    provider_relative_path: path.into(),
+                                })
+                        }),
+                )
+                .collect::<Vec<_>>()
         })
         .collect();
     spec.identity_provenance = provenance;
@@ -340,6 +371,8 @@ mod tests {
             native_session_id: Some("thread-native-42".into()),
             fixture_transport: None,
             provider_bootstrap_files: Vec::new(),
+            provider_secret_references: Vec::new(),
+            provider_launch_context: None,
         });
 
         let resume = exact_resume_candidate(&context, Some("thread-native-42"))
@@ -382,6 +415,8 @@ mod tests {
                 freshell_runtime_protocol::FreshAgentFixtureTransport::Deterministic,
             ),
             provider_bootstrap_files: Vec::new(),
+            provider_secret_references: Vec::new(),
+            provider_launch_context: None,
         });
 
         let resume = exact_resume_candidate(&context, Some("thread-fixture-42"))

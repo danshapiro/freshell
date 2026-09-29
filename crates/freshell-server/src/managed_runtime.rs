@@ -2,10 +2,10 @@
 
 use freshell_runtime_client::{ClientError, RuntimeClient};
 use freshell_runtime_protocol::{
-    DesiredState, LaunchRequest, LaunchState, ProviderBootstrapFile, RecoveryBlockReason,
-    RecoveryOutcome, RecoveryProbe, RecoveryResult, RecoveryTrigger, RequestId, RuntimeErrorCode,
-    RuntimeLimits, RuntimeProfile, RuntimeView, SoulId, StopOutcome, TerminalLaunchSpec,
-    ViewIntentKind, ViewIntentRequest, ViewVisibilityIntent,
+    DesiredState, LaunchRequest, LaunchState, RecoveryBlockReason, RecoveryOutcome, RecoveryProbe,
+    RecoveryResult, RecoveryTrigger, RequestId, RuntimeErrorCode, RuntimeLimits, RuntimeProfile,
+    RuntimeView, SoulId, StopOutcome, TerminalLaunchSpec, ViewIntentKind, ViewIntentRequest,
+    ViewVisibilityIntent,
 };
 use freshell_terminal::registry::{
     ManagedOutputChunk, ManagedOutputRead, ManagedTerminalController, ManagedTerminalDescriptor,
@@ -175,13 +175,19 @@ impl ManagedTerminalController for ServerManagedRuntimeController {
             // server's resolved child environment wholesale (which can carry
             // AUTH_TOKEN, provider API keys, cloud credentials, proxy creds, ...).
             let env = managed_provider_env(&request.mode, &request.env);
-            let provider_secret_references = if request.mode == "amplifier" {
-                crate::managed_provider_bootstrap::amplifier_secret_references(
-                    request.provider_model.as_deref(),
-                    request.provider_reasoning_effort.as_deref(),
-                )?
-            } else {
-                Vec::new()
+            let provider_secret_references = {
+                let references =
+                    crate::managed_provider_bootstrap::named_provider_onecli_references(
+                        &request.mode,
+                    )?;
+                if request.mode == "amplifier" && references.is_empty() {
+                    crate::managed_provider_bootstrap::amplifier_secret_references(
+                        request.provider_model.as_deref(),
+                        request.provider_reasoning_effort.as_deref(),
+                    )?
+                } else {
+                    references
+                }
             };
             let program = if request.mode == "amplifier" {
                 crate::managed_provider_bootstrap::AMPLIFIER_PROGRAM.to_string()
@@ -231,8 +237,13 @@ impl ManagedTerminalController for ServerManagedRuntimeController {
                     provider_reasoning_effort: request.provider_reasoning_effort.clone(),
                     provider_sandbox: request.provider_sandbox.clone(),
                     provider_permission_mode: request.provider_permission_mode.clone(),
-                    provider_bootstrap_files: provider_bootstrap_files(&request.mode)?,
+                    provider_bootstrap_files: Vec::new(),
                     provider_secret_references,
+                    provider_launch_context:
+                        crate::managed_provider_bootstrap::provider_launch_context(
+                            &request.mode,
+                            &workspace,
+                        ),
                 }),
                 view_intent: Some(ViewIntentRequest {
                     owner_id: String::new(),
@@ -722,136 +733,6 @@ fn managed_provider_args(mode: &str, args: Vec<String>) -> Vec<String> {
     out
 }
 
-fn provider_bootstrap_files(mode: &str) -> Result<Vec<ProviderBootstrapFile>, String> {
-    struct BootstrapSpec {
-        env_key: &'static str,
-        fallbacks: Vec<PathBuf>,
-        provider_relative_path: &'static str,
-    }
-
-    let specs: Vec<BootstrapSpec> = match mode {
-        "claude" => {
-            let mut paths = Vec::new();
-            if let Ok(dir) = std::env::var("CLAUDE_CONFIG_DIR") {
-                if !dir.trim().is_empty() {
-                    paths.push(PathBuf::from(dir).join(".credentials.json"));
-                }
-            }
-            if let Ok(home) = std::env::var("HOME") {
-                if !home.trim().is_empty() {
-                    paths.push(
-                        PathBuf::from(home)
-                            .join(".claude")
-                            .join(".credentials.json"),
-                    );
-                }
-            }
-            vec![BootstrapSpec {
-                env_key: "FRESHELL_MANAGED_CLAUDE_CREDENTIAL_FILE",
-                fallbacks: paths,
-                provider_relative_path: ".claude/.credentials.json",
-            }]
-        }
-        "opencode" => {
-            let mut paths = Vec::new();
-            if let Ok(data) = std::env::var("XDG_DATA_HOME") {
-                if !data.trim().is_empty() {
-                    paths.push(PathBuf::from(data).join("opencode").join("auth.json"));
-                }
-            }
-            if let Ok(home) = std::env::var("HOME") {
-                if !home.trim().is_empty() {
-                    paths.push(
-                        PathBuf::from(home)
-                            .join(".local")
-                            .join("share")
-                            .join("opencode")
-                            .join("auth.json"),
-                    );
-                }
-            }
-            vec![BootstrapSpec {
-                env_key: "FRESHELL_MANAGED_OPENCODE_AUTH_FILE",
-                fallbacks: paths,
-                provider_relative_path: ".local/share/opencode/auth.json",
-            }]
-        }
-        "codex" => {
-            let mut paths = Vec::new();
-            if let Ok(dir) = std::env::var("CODEX_HOME") {
-                if !dir.trim().is_empty() {
-                    paths.push(PathBuf::from(dir).join("auth.json"));
-                }
-            }
-            if let Ok(home) = std::env::var("HOME") {
-                if !home.trim().is_empty() {
-                    paths.push(PathBuf::from(home).join(".codex").join("auth.json"));
-                }
-            }
-            vec![BootstrapSpec {
-                env_key: "FRESHELL_MANAGED_CODEX_AUTH_FILE",
-                fallbacks: paths,
-                provider_relative_path: ".codex/auth.json",
-            }]
-        }
-        "amplifier" => Vec::new(),
-        _ => return Ok(Vec::new()),
-    };
-
-    let mut files = Vec::with_capacity(specs.len());
-    for spec in specs {
-        let explicit = std::env::var(spec.env_key)
-            .ok()
-            .filter(|value| !value.trim().is_empty());
-        let candidate = explicit
-            .as_ref()
-            .map(PathBuf::from)
-            .or_else(|| spec.fallbacks.into_iter().find(|path| path.is_file()));
-        if let Some(candidate) = candidate {
-            let file =
-                provider_bootstrap_file_from_candidate(candidate, spec.provider_relative_path)
-                    .map_err(|error| format!("{}: {error}", spec.env_key))?;
-            files.push(file);
-        }
-    }
-    Ok(files)
-}
-
-#[cfg(test)]
-fn provider_bootstrap_files_from_candidate(
-    mode: &str,
-    candidate: Option<PathBuf>,
-) -> Result<Vec<ProviderBootstrapFile>, String> {
-    let Some(candidate) = candidate else {
-        return Ok(Vec::new());
-    };
-    if !candidate.is_file() {
-        return Err(format!("not a readable file: {}", candidate.display()));
-    }
-    let provider_relative_path = match mode {
-        "claude" => ".claude/.credentials.json",
-        "opencode" => ".local/share/opencode/auth.json",
-        "codex" => ".codex/auth.json",
-        _ => return Ok(Vec::new()),
-    };
-    provider_bootstrap_file_from_candidate(candidate, provider_relative_path).map(|file| vec![file])
-}
-
-fn provider_bootstrap_file_from_candidate(
-    candidate: PathBuf,
-    provider_relative_path: &str,
-) -> Result<ProviderBootstrapFile, String> {
-    if !candidate.is_file() {
-        return Err(format!("not a readable file: {}", candidate.display()));
-    }
-    let canonical = std::fs::canonicalize(&candidate)
-        .map_err(|error| format!("canonicalize provider bootstrap reference: {error}"))?;
-    Ok(ProviderBootstrapFile {
-        source_path: canonical.to_string_lossy().into_owned(),
-        provider_relative_path: provider_relative_path.to_string(),
-    })
-}
-
 fn provider_label(provider: &str) -> &str {
     match provider {
         "claude" => "Claude",
@@ -1120,20 +1001,6 @@ mod tests {
     }
 
     #[test]
-    fn opencode_bootstrap_reference_targets_soul_auth_store_without_persisting_bytes() {
-        let dir = tempfile::tempdir().unwrap();
-        let auth = dir.path().join("auth.json");
-        std::fs::write(&auth, r#"{"opencode":{"key":"secret-bytes"}}"#).unwrap();
-        let files = provider_bootstrap_files_from_candidate("opencode", Some(auth)).unwrap();
-        assert_eq!(files.len(), 1);
-        assert_eq!(
-            files[0].provider_relative_path,
-            ".local/share/opencode/auth.json"
-        );
-        assert!(!files[0].source_path.contains("secret-bytes"));
-    }
-
-    #[test]
     fn managed_claude_strips_web_bound_mcp_tempfile_only() {
         let args = vec![
             "--settings".into(),
@@ -1147,16 +1014,6 @@ mod tests {
             managed_provider_args("claude", args),
             vec!["--settings", "{}", "--session-id", "s1"]
         );
-    }
-    #[test]
-    fn codex_bootstrap_reference_targets_soul_auth_store_without_persisting_bytes() {
-        let dir = tempfile::tempdir().unwrap();
-        let auth = dir.path().join("auth.json");
-        std::fs::write(&auth, r#"{"tokens":{"access_token":"secret-bytes"}}"#).unwrap();
-        let files = provider_bootstrap_files_from_candidate("codex", Some(auth)).unwrap();
-        assert_eq!(files.len(), 1);
-        assert_eq!(files[0].provider_relative_path, ".codex/auth.json");
-        assert!(!files[0].source_path.contains("secret-bytes"));
     }
 }
 

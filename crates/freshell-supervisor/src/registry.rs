@@ -2878,6 +2878,8 @@ mod tests {
             native_session_id: None,
             fixture_transport: None,
             provider_bootstrap_files: Vec::new(),
+            provider_secret_references: Vec::new(),
+            provider_launch_context: None,
         });
         let prepared = registry.prepare_launch(launch).await.unwrap();
         let runtime_dir = format!("/tmp/freshell-runtime-test/{}", prepared.incarnation_id);
@@ -2982,7 +2984,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn amplifier_onecli_persists_only_the_secret_reference() {
+    async fn provider_secret_registry_persists_source_and_capability_reference_without_contents() {
         let dir = tempfile::tempdir().unwrap();
         let workspace = tempfile::tempdir().unwrap();
         let keys = workspace.path().join("keys.env");
@@ -3021,6 +3023,19 @@ mod tests {
                 profile:
                     freshell_runtime_protocol::ProviderSecretProfile::AmplifierOnecliLunarouteGlm53,
             }],
+            provider_launch_context: Some(freshell_runtime_protocol::ProviderLaunchContext {
+                preparation: freshell_runtime_protocol::ProviderPreparation::Amplifier {
+                    bundle: "default".into(),
+                    resume_args: Vec::new(),
+                },
+                mcp_capability: Some(freshell_runtime_protocol::McpCapabilityReference {
+                    grant_id: "grant-registry-reference".into(),
+                    endpoint: "http://host.docker.internal:3001/api/mcp".into(),
+                    provider_relative_path: ".amplifier/freshell-mcp.json".into(),
+                }),
+                config: Vec::new(),
+                plugins: Vec::new(),
+            }),
         });
         registry.prepare_launch(launch).await.unwrap();
 
@@ -3034,6 +3049,7 @@ mod tests {
             .unwrap();
         assert!(terminal_json.contains(&keys.to_string_lossy().to_string()));
         assert!(terminal_json.contains("amplifier_onecli_lunaroute_glm53"));
+        assert!(terminal_json.contains("grant-registry-reference"));
         assert!(!terminal_json.contains("onecli.example.invalid"));
         assert!(!terminal_json.contains(secret));
         drop(conn);
@@ -3480,6 +3496,7 @@ mod tests {
             provider_permission_mode: None,
             provider_bootstrap_files: Vec::new(),
             provider_secret_references: Vec::new(),
+            provider_launch_context: None,
         };
         let mut launch = prep(soul.clone(), RequestId::new(), "exact-resume");
         launch.provider = "opencode".into();

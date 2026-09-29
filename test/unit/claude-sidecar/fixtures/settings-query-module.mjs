@@ -1,6 +1,7 @@
 // Controlled SDK implementation used through the production sidecar import seam.
 let generations = 0
 export function query({ prompt, options }) {
+  process.stdout.write(`${JSON.stringify({ type: 'probe.auth-env', apiKeyVisible: options.env.ANTHROPIC_API_KEY === 'onecli-test-key', oauthVisible: options.env.CLAUDE_CODE_OAUTH_TOKEN === 'onecli-test-oauth' })}\n`)
   const generation = ++generations
   const durable = options.resume ?? 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'
   const queue = []

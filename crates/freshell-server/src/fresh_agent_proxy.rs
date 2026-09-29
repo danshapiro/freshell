@@ -443,6 +443,15 @@ impl HostedFreshAgentProxy {
                 .contains(&session_type)
                 .then_some(FreshAgentFixtureTransport::Deterministic),
             provider_bootstrap_files: provider_bootstrap_files(&provider).map_err(|_| ())?,
+            provider_secret_references:
+                crate::managed_provider_bootstrap::named_provider_onecli_references(
+                    provider.as_str(),
+                )
+                .map_err(|_| ())?,
+            provider_launch_context: crate::managed_provider_bootstrap::provider_launch_context(
+                provider.as_str(),
+                &workspace,
+            ),
         };
         let project_key = format!("project-{}", stable_hex(&workspace.to_string_lossy()));
         let request = LaunchRequest {
@@ -1089,21 +1098,14 @@ fn provider_bootstrap_files(
         .filter(|value| !value.is_empty())
         .map(PathBuf::from);
     let (override_key, fallback, relative) = match provider {
-        FreshProvider::Claude | FreshProvider::Kilroy => (
+        FreshProvider::Kilroy => (
             "FRESHELL_MANAGED_CLAUDE_CREDENTIAL_FILE",
             home.map(|value| value.join(".claude/.credentials.json")),
             ".claude/.credentials.json",
         ),
-        FreshProvider::Codex => (
-            "FRESHELL_MANAGED_CODEX_AUTH_FILE",
-            home.map(|value| value.join(".codex/auth.json")),
-            ".codex/auth.json",
-        ),
-        FreshProvider::Opencode => (
-            "FRESHELL_MANAGED_OPENCODE_AUTH_FILE",
-            home.map(|value| value.join(".local/share/opencode/auth.json")),
-            ".local/share/opencode/auth.json",
-        ),
+        FreshProvider::Claude | FreshProvider::Codex | FreshProvider::Opencode => {
+            return Ok(Vec::new())
+        }
     };
     let candidate = std::env::var(override_key)
         .ok()

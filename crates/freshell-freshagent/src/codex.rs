@@ -7133,6 +7133,9 @@ impl FreshCodexState {
         for (key, value) in &spec.env {
             cmd.env(key, value);
         }
+        if let Some(environment) = freshell_platform::managed_child_secrets::snapshot() {
+            cmd.envs(environment);
+        }
         cmd.stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());

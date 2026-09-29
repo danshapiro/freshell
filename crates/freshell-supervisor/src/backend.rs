@@ -506,6 +506,12 @@ impl RuntimeBackend for DockerEngineBackend {
                     source.display()
                 ));
             }
+            if let Some(source) = &mounts.provider_user_root {
+                binds.push(format!(
+                    "{}:/run/freshell-private/user-provider:ro",
+                    source.display()
+                ));
+            }
         }
         let host_env = runtime_host_environment(spec.terminal.as_ref(), spec.fresh_agent.as_ref())?;
         let cap_add: Vec<&str> = if spec.terminal.is_some() || spec.fresh_agent.is_some() {
@@ -777,6 +783,12 @@ fn runtime_tmpfs(mode: Option<&str>) -> std::collections::BTreeMap<String, Strin
             "rw,exec,nosuid,nodev,size=64m,mode=1777".to_string(),
         );
     }
+    if matches!(mode, Some("claude" | "codex" | "opencode" | "amplifier")) {
+        mounts.insert(
+            "/run/freshell-private".to_string(),
+            "rw,noexec,nosuid,nodev,size=16m,mode=0700".to_string(),
+        );
+    }
     mounts
 }
 
@@ -809,6 +821,8 @@ struct ImmutableFreshAgentConfig {
     run_as_gid: u32,
     fixture_transport: Option<FreshAgentFixtureTransport>,
     provider_bootstrap_files: Vec<ProviderBootstrapFile>,
+    provider_secret_references: Vec<freshell_runtime_protocol::ProviderSecretReference>,
+    provider_launch_context: Option<freshell_runtime_protocol::ProviderLaunchContext>,
 }
 
 impl From<&FreshAgentLaunchSpec> for ImmutableFreshAgentConfig {
@@ -824,6 +838,8 @@ impl From<&FreshAgentLaunchSpec> for ImmutableFreshAgentConfig {
             run_as_gid: spec.run_as_gid,
             fixture_transport: spec.fixture_transport,
             provider_bootstrap_files: spec.provider_bootstrap_files.clone(),
+            provider_secret_references: spec.provider_secret_references.clone(),
+            provider_launch_context: spec.provider_launch_context.clone(),
         }
     }
 }
@@ -1120,20 +1136,33 @@ fn verify_workload_mounts(
                 ));
             }
         }
-        for (index, source) in expected.provider_secret_files.iter().enumerate() {
-            let source_text = source.to_string_lossy();
-            let destination = format!("/run/freshell-secrets/provider-{index}");
-            let found = mounts.iter().any(|mount| {
-                mount.get("Source").and_then(Value::as_str) == Some(source_text.as_ref())
-                    && mount.get("Destination").and_then(Value::as_str)
-                        == Some(destination.as_str())
-                    && mount.get("RW").and_then(Value::as_bool) == Some(false)
-            });
-            if !found {
-                return Err(BackendError::OwnershipMismatch(
-                    "provider secret-reference mount changed".into(),
-                ));
-            }
+    }
+    for (index, source) in expected.provider_secret_files.iter().enumerate() {
+        let source_text = source.to_string_lossy();
+        let destination = format!("/run/freshell-secrets/provider-{index}");
+        let found = mounts.iter().any(|mount| {
+            mount.get("Source").and_then(Value::as_str) == Some(source_text.as_ref())
+                && mount.get("Destination").and_then(Value::as_str) == Some(destination.as_str())
+                && mount.get("RW").and_then(Value::as_bool) == Some(false)
+        });
+        if !found {
+            return Err(BackendError::OwnershipMismatch(
+                "provider secret-reference mount changed".into(),
+            ));
+        }
+    }
+    if let Some(source) = expected.provider_user_root.as_ref() {
+        let source_text = source.to_string_lossy();
+        let found = mounts.iter().any(|mount| {
+            mount.get("Source").and_then(Value::as_str) == Some(source_text.as_ref())
+                && mount.get("Destination").and_then(Value::as_str)
+                    == Some("/run/freshell-private/user-provider")
+                && mount.get("RW").and_then(Value::as_bool) == Some(false)
+        });
+        if !found {
+            return Err(BackendError::OwnershipMismatch(
+                "provider user config mount changed".into(),
+            ));
         }
     }
     for (index, source) in expected.provider_bootstrap_files.iter().enumerate() {
@@ -1310,6 +1339,8 @@ mod tests {
             native_session_id: None,
             fixture_transport: None,
             provider_bootstrap_files: Vec::new(),
+            provider_secret_references: Vec::new(),
+            provider_launch_context: None,
         };
         let installation_id = InstallationId::parse("installation-one").unwrap();
         let soul_id = SoulId::parse("soul-one").unwrap();
@@ -1407,7 +1438,11 @@ mod tests {
             opencode.get("/run/opencode-tmp").map(String::as_str),
             Some("rw,exec,nosuid,nodev,size=64m,mode=1777")
         );
-        assert_eq!(opencode.len(), 2);
+        assert_eq!(opencode.len(), 3);
+        assert_eq!(
+            opencode.get("/run/freshell-private").map(String::as_str),
+            Some("rw,noexec,nosuid,nodev,size=16m,mode=0700")
+        );
 
         let shell = runtime_tmpfs(Some("shell"));
         assert_eq!(shell.len(), 1);
@@ -1451,6 +1486,7 @@ mod tests {
             provider_permission_mode: None,
             provider_bootstrap_files: Vec::new(),
             provider_secret_references: Vec::new(),
+            provider_launch_context: None,
         };
         let env = runtime_host_environment(Some(&terminal), None).unwrap();
         assert!(env
@@ -1464,7 +1500,7 @@ mod tests {
     }
 
     #[test]
-    fn amplifier_onecli_secret_mount_is_reference_only_in_docker_json() {
+    fn provider_secret_mount_is_reference_only_in_docker_json() {
         use freshell_runtime_protocol::{ProviderSecretProfile, ProviderSecretReference};
 
         let root = tempfile::tempdir().unwrap();
@@ -1472,6 +1508,11 @@ mod tests {
         let keys = root.path().join("keys.env");
         let secret = "amplifier-onecli-secret-sentinel";
         std::fs::write(&keys, format!("LUNAROUTE_API_KEY={secret}\n")).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&keys, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
         let keys = std::fs::canonicalize(keys).unwrap();
         let workspace = std::fs::canonicalize(workspace.path()).unwrap();
         let terminal = TerminalLaunchSpec {
@@ -1500,6 +1541,7 @@ mod tests {
                 source_path: keys.to_string_lossy().into_owned(),
                 profile: ProviderSecretProfile::AmplifierOnecliLunarouteGlm53,
             }],
+            provider_launch_context: None,
         };
         let mounts = docker::terminal_mounts(&terminal).unwrap();
         let binds: Vec<String> = mounts
@@ -1609,6 +1651,8 @@ mod tests {
             native_session_id: None,
             fixture_transport: None,
             provider_bootstrap_files: Vec::new(),
+            provider_secret_references: Vec::new(),
+            provider_launch_context: None,
         };
         let digest = |agent: FreshAgentLaunchSpec| {
             digest_expected(&ExpectedConfig {
