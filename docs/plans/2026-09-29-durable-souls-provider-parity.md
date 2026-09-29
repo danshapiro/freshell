@@ -23,7 +23,7 @@ Implement durable souls for Claude CLI, Codex CLI, Amplifier, and fresh Claude, 
 
 **Goal:** A managed soul exposes the same provider-visible launch inputs, MCP/config/plugin behavior, create fields, and supported operations as the corresponding ordinary session for Claude CLI, Codex CLI, Amplifier, fresh Claude, fresh Codex, and fresh OpenCode. The only managed-specific behavior is durable lifecycle ownership, private state placement, resource accounting, and child-only OneCLI secret resolution.
 
-**Architecture:** Carry a typed, non-secret provider launch context through the runtime protocol and registry. The session host materializes provider-specific MCP/config/plugin state inside the soul at launch and forwards the same provider settings that the ordinary adapters already use. A shared parity fixture captures provider-visible behavior from direct and managed routes, while live qualification remains an explicit gate for credentials that are not available in the local test environment.
+**Architecture:** Carry a typed, non-secret provider preparation context through the runtime protocol and registry. It stores provider-specific preparation inputs and ownership metadata, never arbitrary host paths or resolved credentials. The session host recreates MCP/config/plugin state inside the soul; an image-packaged MCP runtime uses a per-incarnation capability file to reach the same Freshell tools as an ordinary child, while OneCLI remains the only provider-secret path. A shared parity fixture captures provider-visible behavior from direct and managed routes, while live qualification remains an explicit gate for credentials that are not available in the local test environment.
 
 **Tech Stack:** Rust workspace crates (`freshell-runtime-protocol`, `freshell-supervisor`, `freshell-session-host`, `freshell-platform`, `freshell-ws`, `freshell-freshagent`, provider adapters), TypeScript/Vitest/Playwright runtime gates, Docker-backed session hosts, JSONL structured logs, and the existing OneCLI typed secret-reference flow.
 
@@ -32,9 +32,11 @@ Implement durable souls for Claude CLI, Codex CLI, Amplifier, and fresh Claude, 
 - Work only in `/home/dan/code/freshell/.worktrees/durable-souls-provider-parity` on branch `the-usual/durable-souls-provider-parity`, based on `12e5e9f55fa049fd33b81f8f7ff64f451605b907`; never edit the main checkout.
 - Use pnpm `10.34.5`, `pnpm run test:vitest run ...` for focused Vitest work, and the repository coordination gate for broad tests. Do not use npm-era lockfile commands.
 - Preserve the existing managed runtime ownership boundary: private per-soul provider homes and journals, exact supervisor ownership, bounded host IPC, no Docker socket, and no raw secret bytes in registry rows, Docker JSON, logs, or event journals.
+- Managed MCP uses the image-packaged Freshell MCP runtime and a per-incarnation capability file created by the server controller. The durable launch record stores only the capability-file reference and endpoint metadata; the capability bytes are mounted/read only for the provider child and are recreated or revoked with the incarnation. The ordinary web `AUTH_TOKEN` never appears in durable launch JSON, logs, or event journals.
 - The provider-visible behavior contract must match the ordinary path after normalizing only lifecycle-owned values: soul/provider-home paths, managed endpoint/port, terminal/session identifiers, provider store roots, and generated temporary paths.
 - Provider-native differences remain explicit and shared by both routes: Claude/Kilroy native fork remains unsupported, OpenCode approval/question remains unsupported, and Codex redo remains unsupported unless the existing provider itself changes.
 - OneCLI is the only managed secret lookup path. Extend the existing typed reference, authenticated host grant, bounded parser, and child-only environment mapping. Do not add a second secret store, persist secret bytes, forward host-local OneCLI control URLs, or place provider credentials in a durable launch context.
+- Existing raw Claude/Codex/OpenCode credential-file bootstrap is removed from managed launches, fresh launches, and recovery. Provider credentials are materialized through typed OneCLI profiles or the provider's explicit OneCLI file grant; a generic config reference cannot carry credentials. Ordinary non-secret config remains available from the approved workspace/provider roots.
 - Existing live-provider deferral is allowed only for the external credential/contract receipt. It must not disable local managed adapter code, fake-provider parity coverage, or qualification-mode routing for the six requested modes.
 - Do not broaden the change to Kilroy, Gemini, Kimi, or unrelated legacy provider behavior.
 - Every behavior change receives a failing behavior test first, a focused green test, an impacted-test run, a focused commit, and task-level independent review. Do not weaken or skip existing tests.
@@ -52,13 +54,15 @@ Implement durable souls for Claude CLI, Codex CLI, Amplifier, and fresh Claude, 
 - Modify: `crates/freshell-supervisor/src/backend/docker.rs`
 - Modify: `crates/freshell-supervisor/src/backend.rs`
 - Modify: `crates/freshell-supervisor/src/registry.rs`
+- Modify: `crates/freshell-supervisor/src/recovery.rs`
+- Modify: `crates/freshell-supervisor/src/resume_catalog.rs`
 - Modify: `crates/freshell-runtime-protocol/src/lib.rs` protocol tests
 - Test: `crates/freshell-session-host/src/provider_secret_resolution.rs` tests and `crates/freshell-runtime-protocol/src/lib.rs` tests
 
 **Interfaces:**
-- Add a serializable `ProviderLaunchContext` owned by `freshell-runtime-protocol` and optional `provider_launch_context` fields on `TerminalLaunchSpec` and `FreshAgentLaunchSpec`. It contains only provider-visible ordinary inputs: a typed `McpLaunchRecipe` (command, argument recipe, context-variable names, and provider target), `ProviderConfigReference` entries for files already visible to the approved workspace/provider home, and plugin/config selectors. It contains no resolved token, API key, OAuth payload, or secret value.
-- Add `ProviderSecretProfile` variants for the named providers' OneCLI-backed provider credentials. Keep the current Amplifier profile and legacy rejection behavior. `provider_secret_references` remains a list of typed file references, never a value map.
-- The session host resolves a `ProviderLaunchContext` into provider-native argv/env/config files at spawn time. Generated MCP files are written under the soul-owned runtime directory and are recreated on replacement; the durable record keeps only the recipe and approved source references.
+- Add a serializable `ProviderLaunchContext` owned by `freshell-runtime-protocol` and optional `provider_launch_context` fields on `TerminalLaunchSpec` and `FreshAgentLaunchSpec`. It contains a typed provider preparation variant, approved workspace-relative non-secret config references, plugin selectors, and an `McpCapabilityReference` containing only an endpoint and an ephemeral capability-file reference. It contains no resolved token, API key, OAuth payload, arbitrary absolute config path, or opaque provider JSON.
+- Add `ProviderSecretProfile` variants for the named providers' OneCLI-backed provider credentials and add `provider_secret_references` to `FreshAgentLaunchSpec`. Keep the current Amplifier profile and legacy rejection behavior. The existing raw credential bootstrap references are removed from managed provider launch construction and recovery; a typed OneCLI file grant is the only provider-secret input.
+- The session host resolves a `ProviderLaunchContext` into provider-native argv/env/config files at spawn time. Generated MCP files are written under the soul-owned runtime directory and are recreated on replacement. The capability file is mounted only for the incarnation and is never copied into provider state; the durable record keeps only its canonical reference and ordinary preparation inputs.
 - Extend `resolve_child_environment` with a provider/profile dispatch table. Every profile has an explicit allowlist and validation; host-local `ONECLI_URL`/`NO_PROXY` stay excluded, and all provider API values are child-only.
 
 - [ ] **Step 1: Write the failing behavioral tests**
@@ -77,26 +81,33 @@ Implement the following shape in `freshell-runtime-protocol` (field names may ga
 
 ```rust
 pub struct ProviderLaunchContext {
-    pub mcp: Option<McpLaunchRecipe>,
-    pub config: Vec<ProviderConfigReference>,
+    pub preparation: ProviderPreparation,
+    pub mcp_capability: Option<McpCapabilityReference>,
+    pub config: Vec<WorkspaceConfigReference>,
     pub plugins: Vec<String>,
 }
 
-pub struct McpLaunchRecipe {
-    pub command: String,
-    pub args: Vec<String>,
-    pub context_env: Vec<String>,
-    pub target: String,
+pub enum ProviderPreparation {
+    Claude { mcp_args: Vec<String> },
+    Codex { tui_args: Vec<String>, sidecar_args: Vec<String> },
+    Opencode { project_config: String, tui_config: Option<String> },
+    Amplifier { bundle: String, resume_args: Vec<String> },
 }
 
-pub struct ProviderConfigReference {
+pub struct McpCapabilityReference {
     pub source_path: String,
+    pub endpoint: String,
+    pub provider_relative_path: String,
+}
+
+pub struct WorkspaceConfigReference {
+    pub workspace_relative_path: String,
     pub provider_relative_path: String,
     pub format: String,
 }
 ```
 
-Validate bounded lengths, absolute source paths, safe relative destinations, known context variable names, and provider-specific target values. Extend Docker mount calculation and registry round trips to carry these references. Have `managed_runtime` construct the context from the same platform launch recipe used by the ordinary path. Extend the existing OneCLI parser with typed provider profiles and preserve its child-only output contract.
+Validate bounded lengths, safe relative workspace paths, canonical capability-file references, known formats, and provider-specific preparation variants. Extend Docker mount calculation, registry/recovery round trips, and immutable expected-config digests to carry these references. Have `managed_runtime` construct the context from provider-specific preparation results returned by the same platform launch helpers used by the ordinary path. Extend the existing OneCLI parser with typed provider profiles and preserve its child-only output contract. Reject the old raw credential bootstrap path for managed Claude, Codex, and OpenCode and add equivalent typed secret references to fresh-agent mounts.
 
 - [ ] **Step 4: Run the focused tests**
 
@@ -117,7 +128,7 @@ Expected: PASS, with all existing backward-compatibility and ownership tests gre
 - [ ] **Step 7: Commit the task**
 
 ```bash
-git add crates/freshell-runtime-protocol/src/lib.rs crates/freshell-server/src/managed_runtime.rs crates/freshell-server/src/managed_provider_bootstrap.rs crates/freshell-session-host/src/provider_secret_resolution.rs crates/freshell-supervisor/src/backend/docker.rs crates/freshell-supervisor/src/backend.rs crates/freshell-supervisor/src/registry.rs test/unit/tooling/runtime-provider-context.test.ts
+git add crates/freshell-runtime-protocol/src/lib.rs crates/freshell-server/src/managed_runtime.rs crates/freshell-server/src/managed_provider_bootstrap.rs crates/freshell-session-host/src/provider_secret_resolution.rs crates/freshell-supervisor/src/backend/docker.rs crates/freshell-supervisor/src/backend.rs crates/freshell-supervisor/src/registry.rs crates/freshell-supervisor/src/recovery.rs crates/freshell-supervisor/src/resume_catalog.rs test/unit/tooling/runtime-provider-context.test.ts
 git commit -m "feat(runtime): carry provider parity context and onecli profiles"
 ```
 
@@ -132,11 +143,17 @@ git commit -m "feat(runtime): carry provider parity context and onecli profiles"
 - Modify: `crates/freshell-session-host/src/providers/codex.rs`
 - Modify: `crates/freshell-session-host/src/providers/mod.rs`
 - Modify: `crates/freshell-freshagent/src/terminal_tabs.rs`
-- Test: `crates/freshell-server/src/managed_runtime.rs`, `crates/freshell-ws/src/terminal.rs`, `crates/freshell-platform/src/cli_launch_goldens.rs`, and new `test/integration/server/managed-provider-parity.rs`
+- Modify: `tools/freshell-mcp/http-client.ts`
+- Modify: `tools/freshell-mcp/server.ts`
+- Modify: `docker/runtime/Dockerfile`
+- Modify: `docker/runtime/README.md`
+- Modify: `packages/freshell-mcp-runtime/package.json`
+- Test: `crates/freshell-server/src/managed_runtime.rs`, `crates/freshell-ws/src/terminal.rs`, `crates/freshell-platform/src/cli_launch_goldens.rs`, `docker/runtime` image probe, and new `test/integration/server/managed-provider-parity.rs`
 
 **Interfaces:**
-- The managed terminal route consumes `ProviderLaunchContext` from Task 1 and uses the same `resolve_cli_launch`, `generate_mcp_injection`, and Codex managed rendering helpers as the ordinary route. It must retain ordinary Claude `--mcp-config`, Codex TUI/app-server MCP recipes, OpenCode config/TUI environment, provider args, and plugin selectors.
-- `session-host` materializes the recipe inside the soul and supplies the provider child with the same context variables as the ordinary route through an ephemeral host-owned bridge. No web-owned temporary path or credential is required to be durable; the provider-visible MCP server behavior and tool results must be identical.
+- The managed terminal route consumes `ProviderLaunchContext` from Task 1 and uses provider-specific preparation adapters built from the same `resolve_cli_launch`, `generate_mcp_injection`, and Codex managed rendering helpers as the ordinary route. It must retain ordinary Claude `--mcp-config`, Codex TUI/app-server MCP recipes, OpenCode config/TUI environment, provider args, and plugin selectors.
+- Package `tools/freshell-mcp/server.ts` and its runtime dependencies into the pinned managed image at a stable path. The controller creates a mode-0600 per-incarnation capability file containing the endpoint and scoped value; supervisor mounts the reference at the requested provider path, and the session host passes it only to the MCP child as `FRESHELL_URL`/`FRESHELL_TOKEN` after validating the grant. The child can perform the same `tools/list`/`tools/call` actions as an ordinary session, while the web `AUTH_TOKEN` is never serialized or logged.
+- `session-host` materializes provider config and the packaged MCP command inside the soul, and revokes/removes the capability file when the incarnation stops. Recovery recreates the capability file and generated MCP/config state before exact native resume. The provider-visible MCP server behavior and tool results must be identical.
 - Managed terminal provider selection becomes qualification-capable for `claude`, `codex`, `amplifier`, and `opencode`; live release flags remain governed by the manifest in Task 6.
 
 - [ ] **Step 1: Write the failing behavioral tests**
@@ -151,7 +168,7 @@ Expected: FAIL because managed Claude strips MCP args, managed Codex durable lau
 
 - [ ] **Step 3: Add the minimal production implementation**
 
-Remove the managed-only argument stripping and minimal OpenCode env replacement. Build the managed terminal context from the same platform launch inputs as the ordinary route, carry it through `TerminalLaunchSpec`, and materialize it in the session host before `HostedPty::spawn`. Reuse `ManagedCodexMcpRenderings` for the durable Codex TUI and app-server. Move OpenCode rebind/config merge into the soul-owned preparation path and preserve both `.opencode/opencode.json` and `.opencode/opencode.jsonc` entries. Make Amplifier launch the configured ordinary bundle with the typed OneCLI child environment rather than a hard-coded model wrapper; keep the approved OneCLI profile as a launch validation rule, not a feature restriction.
+Remove the managed-only argument stripping and minimal OpenCode env replacement. Build the provider-specific preparation context from the same platform launch inputs as the ordinary route, carry it through `TerminalLaunchSpec`, and materialize it in the session host before `HostedPty::spawn`. Reuse `ManagedCodexMcpRenderings` for the durable Codex TUI and app-server. Add the image-packaged MCP runtime and capability-file mount, with an offline image probe that runs `tools/list`/`tools/call` against a fake endpoint. Move OpenCode rebind/config merge into the soul-owned preparation path and preserve both `.opencode/opencode.json` and `.opencode/opencode.jsonc` entries. Make Amplifier launch the configured ordinary bundle with the typed OneCLI child environment rather than a hard-coded model wrapper; keep the approved OneCLI profile as a launch validation rule, not a feature restriction. Remove managed Claude/Codex/OpenCode raw credential-file bootstrap and use the Task 1 OneCLI grant.
 
 - [ ] **Step 4: Run the focused tests**
 
@@ -161,7 +178,7 @@ Expected: PASS, including fake list/call MCP behavior and normalized argv/env/co
 
 - [ ] **Step 5: Refactor while green**
 
-Make one shared provider-launch-context builder the only place that chooses provider target, MCP recipe, and ordinary config selectors. Keep lifecycle-owned paths and ids normalized in the test comparator rather than changing provider behavior to satisfy the test.
+Make provider-specific preparation adapters the only place that choose each provider's target, MCP recipe, and ordinary config selectors, behind one shared lifecycle context. Keep lifecycle-owned paths and ids normalized in the test comparator rather than changing provider behavior to satisfy the test.
 
 - [ ] **Step 6: Run impacted-test verification**
 
@@ -172,7 +189,7 @@ Expected: PASS, including all existing non-managed CLI launch goldens and Codex 
 - [ ] **Step 7: Commit the task**
 
 ```bash
-git add crates/freshell-server/src/managed_runtime.rs crates/freshell-ws/src/terminal.rs crates/freshell-platform/src/cli_launch.rs crates/freshell-platform/src/mcp_inject.rs crates/freshell-session-host/src/pty.rs crates/freshell-session-host/src/providers/codex.rs crates/freshell-session-host/src/providers/mod.rs crates/freshell-freshagent/src/terminal_tabs.rs test/integration/server/managed-provider-parity.rs
+git add crates/freshell-server/src/managed_runtime.rs crates/freshell-ws/src/terminal.rs crates/freshell-platform/src/cli_launch.rs crates/freshell-platform/src/mcp_inject.rs crates/freshell-session-host/src/pty.rs crates/freshell-session-host/src/providers/codex.rs crates/freshell-session-host/src/providers/mod.rs crates/freshell-freshagent/src/terminal_tabs.rs tools/freshell-mcp/http-client.ts tools/freshell-mcp/server.ts docker/runtime/Dockerfile docker/runtime/README.md packages/freshell-mcp-runtime/package.json test/integration/server/managed-provider-parity.rs
 git commit -m "feat(runtime): preserve managed terminal provider capabilities"
 ```
 
@@ -184,15 +201,17 @@ git commit -m "feat(runtime): preserve managed terminal provider capabilities"
 - Modify: `crates/freshell-agent-runtime/src/host_actor.rs`
 - Modify: `crates/freshell-freshagent/src/claude.rs`
 - Modify: `crates/freshell-freshagent/src/codex.rs`
-- Modify: `crates/freshell-freshagent/src/opencode.rs`
+- Modify: `crates/freshell-freshagent/src/opencode_ws.rs`
 - Modify: `crates/freshell-freshagent/src/terminal_tabs.rs`
+- Modify: `crates/freshell-claude-sidecar/index.mjs`
+- Modify: `crates/freshell-supervisor/src/backend/docker.rs`
 - Modify: `crates/freshell-supervisor/src/recovery.rs`
 - Modify: `crates/freshell-supervisor/src/resume_catalog.rs`
 - Test: `crates/freshell-session-host/src/providers/fresh_agent.rs`, `crates/freshell-agent-runtime/src/host_actor_tests.rs`, and `test/integration/server/fresh-agent-parity.rs`
 
 **Interfaces:**
-- Extend `FreshAgentLaunchSpec` and `FreshAgentProfile` with the public create inputs that affect provider behavior: `plugins`, `model_selection`, `naming_handle`, `legacy_restore_context`, exact `session_ref`/native resume identity, provider config references, and the Task 1 launch context. Add serde defaults so old registry rows still recover.
-- `HostedTransport::start` must construct a `FreshAgentCreate` containing the persisted values rather than hard-coded `None`. The direct REST/MCP path and hosted path use the same provider transport builders for Claude, Codex, and OpenCode.
+- Extend `FreshAgentLaunchSpec` and `FreshAgentProfile` with the provider-affecting create inputs: `plugins`, `model_selection`, `naming_handle`, `legacy_restore_context`, exact `session_ref`/native resume identity, provider config references, OneCLI secret references, and the Task 1 launch context. Keep control-plane fields (`request_id`, observed epoch/generation, tab id, and the deliberately rejected legacy resume shortcut) out of the provider profile. Add serde defaults so old registry rows still recover.
+- `HostedTransport::start` must construct a `FreshAgentCreate` containing the persisted values rather than hard-coded `None`. The direct REST/MCP path and hosted path use the same provider transport builders for Claude, Codex, and OpenCode. The exact provider-specific resume rule remains in each adapter; do not apply a universal rejection to `session_ref`.
 - Keep provider-native operation support identical between direct and hosted routes. The host must report the existing unsupported results rather than silently dropping a request.
 
 - [ ] **Step 1: Write the failing behavioral tests**
@@ -207,7 +226,7 @@ Expected: FAIL because hosted create currently drops plugins, model selection, n
 
 - [ ] **Step 3: Add the minimal production implementation**
 
-Thread the fields from `FreshAgentCreate` through `fresh_agent_proxy` into `FreshAgentLaunchSpec`, through `HostedTransport::start` into the provider create request, and into each provider transport. Persist only non-secret references and ordinary config selectors. Ensure fresh Claude and fresh Codex use the same MCP/config materialization as their direct routes; fresh OpenCode uses the same project config merge and TUI rebind preparation. Keep the existing Claude fork, OpenCode approval/question, and Codex redo capability decisions explicit and shared.
+Thread the provider-affecting fields from `FreshAgentCreate` through `fresh_agent_proxy` into `FreshAgentLaunchSpec`, through `HostedTransport::start` into the provider create request, and into each provider transport. Persist only non-secret references and ordinary config selectors; add fresh-agent secret mounts through the same typed OneCLI references as terminal launches. Update `crates/freshell-claude-sidecar/index.mjs` to accept the plugin/MCP/config context and update Codex sidecar launch context construction instead of using `default()`. Ensure fresh Claude and fresh Codex use the same MCP/config materialization as their direct routes; fresh OpenCode uses `opencode_ws.rs` plus the same project config merge and TUI rebind preparation. Keep the existing Claude fork, OpenCode approval/question, and Codex redo capability decisions explicit and shared.
 
 - [ ] **Step 4: Run the focused tests**
 
@@ -228,7 +247,7 @@ Expected: PASS, including existing direct fresh-agent control, resume, rollback,
 - [ ] **Step 7: Commit the task**
 
 ```bash
-git add crates/freshell-server/src/fresh_agent_proxy.rs crates/freshell-session-host/src/providers/fresh_agent.rs crates/freshell-agent-runtime/src/host_actor.rs crates/freshell-freshagent/src/claude.rs crates/freshell-freshagent/src/codex.rs crates/freshell-freshagent/src/opencode.rs crates/freshell-freshagent/src/terminal_tabs.rs crates/freshell-supervisor/src/recovery.rs crates/freshell-supervisor/src/resume_catalog.rs test/integration/server/fresh-agent-parity.rs
+git add crates/freshell-server/src/fresh_agent_proxy.rs crates/freshell-session-host/src/providers/fresh_agent.rs crates/freshell-agent-runtime/src/host_actor.rs crates/freshell-freshagent/src/claude.rs crates/freshell-freshagent/src/codex.rs crates/freshell-freshagent/src/opencode_ws.rs crates/freshell-claude-sidecar/index.mjs crates/freshell-supervisor/src/backend/docker.rs crates/freshell-supervisor/src/recovery.rs crates/freshell-supervisor/src/resume_catalog.rs test/integration/server/fresh-agent-parity.rs
 git commit -m "feat(fresh-agent): preserve hosted provider inputs"
 ```
 
@@ -241,7 +260,8 @@ git commit -m "feat(fresh-agent): preserve hosted provider inputs"
 - Modify: `crates/freshell-freshagent/src/terminal_tabs.rs`
 - Modify: `crates/freshell-session-host/src/providers/fresh_agent.rs`
 - Modify: `crates/freshell-session-host/src/providers/opencode.rs`
-- Test: `crates/freshell-opencode/src/serve.rs` tests, `crates/freshell-platform/src/mcp_inject_tests.rs`, and `test/e2e-browser/specs/fresh-agent-rest-resume-rust.spec.ts`
+- Modify: `crates/freshell-freshagent/src/opencode_ws.rs`
+- Test: `crates/freshell-opencode/src/serve.rs` tests, `crates/freshell-platform/src/mcp_inject_tests.rs`, an offline pinned-image `opencode debug config` probe, and `test/e2e-browser/specs/fresh-agent-rest-resume-rust.spec.ts`
 
 **Interfaces:**
 - The OpenCode preparation helper accepts an existing project directory and returns a provider-visible config plan that preserves user entries from both `.opencode/opencode.json` and `.opencode/opencode.jsonc`, user MCP servers, `OPENCODE_TUI_CONFIG`, provider settings, and plugins. Freshell-owned entries are tagged and cleaned up by reference counting without deleting user entries.
@@ -259,7 +279,7 @@ Expected: FAIL because managed OpenCode replaces inline config, skips TUI rebind
 
 - [ ] **Step 3: Add the minimal production implementation**
 
-Replace the managed minimal config with the shared merge/cleanup helper. Treat `.jsonc` as a preserved user source and write only the Freshell-owned generated representation needed by the provider. Install/use the same rebind plugin for managed and direct routes, carry user `OPENCODE_TUI_CONFIG` forward, and expose the same MCP command recipe to the soul-owned provider runtime.
+Replace the managed minimal config with the shared merge/cleanup helper. Treat `.jsonc` as a preserved user source, follow the pinned OpenCode 1.18.21 effective precedence observed by the offline probe, and write only the Freshell-owned generated representation needed by the provider. Install/use the same rebind plugin for managed and direct routes, carry user `OPENCODE_TUI_CONFIG` forward, and expose the same MCP command recipe to the soul-owned provider runtime. The fixture must cover two souls, restart/re-materialization, malformed JSONC, and final cleanup without deleting user entries.
 
 - [ ] **Step 4: Run the focused tests**
 
@@ -280,7 +300,7 @@ Expected: PASS for the affected OpenCode and fresh-agent flows; the known baseli
 - [ ] **Step 7: Commit the task**
 
 ```bash
-git add crates/freshell-opencode/src/serve.rs crates/freshell-platform/src/mcp_inject.rs crates/freshell-ws/src/terminal.rs crates/freshell-freshagent/src/terminal_tabs.rs crates/freshell-session-host/src/providers/fresh_agent.rs crates/freshell-session-host/src/providers/opencode.rs test/e2e-browser/specs/fresh-agent-rest-resume-rust.spec.ts
+git add crates/freshell-opencode/src/serve.rs crates/freshell-platform/src/mcp_inject.rs crates/freshell-ws/src/terminal.rs crates/freshell-freshagent/src/terminal_tabs.rs crates/freshell-freshagent/src/opencode_ws.rs crates/freshell-session-host/src/providers/fresh_agent.rs crates/freshell-session-host/src/providers/opencode.rs test/e2e-browser/specs/fresh-agent-rest-resume-rust.spec.ts
 git commit -m "fix(opencode): preserve managed config and mcp parity"
 ```
 
@@ -289,6 +309,8 @@ git commit -m "fix(opencode): preserve managed config and mcp parity"
 **Files:**
 - Create: `test/integration/server/provider-parity-fixture.rs`
 - Create: `test/integration/server/provider-parity-contract.rs`
+- Create: `scripts/testing/provider-parity-receipt.ts`
+- Create: `test/unit/tooling/testing/provider-parity-receipt.test.ts`
 - Modify: `test/e2e-browser/specs/runtime-managed-provider-qualification-rust.spec.ts`
 - Modify: `test/e2e-browser/specs/runtime-fresh-agent-qualification-rust.spec.ts`
 - Modify: `test/e2e-browser/specs/mcp-bridge-rust.spec.ts`
@@ -296,12 +318,13 @@ git commit -m "fix(opencode): preserve managed config and mcp parity"
 - Modify: `test/e2e-browser/specs/agent-continuity-matrix.spec.ts`
 - Modify: `test/runtime/gate-manifest.json`
 - Modify: `scripts/testing/runtime-landing-campaign.ts`
+- Modify: `scripts/testing/runtime-receipts.ts`
 - Test: the new integration contract and affected runtime gate tests
 
 **Interfaces:**
 - The parity fixture exposes a deterministic provider executable/sidecar for Claude CLI, Codex CLI, Amplifier, fresh Claude, fresh Codex, and fresh OpenCode. It records provider-visible argv/env/config/plugin/MCP operations and emits structured JSONL events without including secret bytes.
 - A normalized comparison removes only the lifecycle-owned values listed in Global Constraints. Any missing provider feature, changed ordinary config, missing MCP tool, dropped plugin, or changed supported operation fails the contract.
-- Gate cases are named `PC-PARITY-CLAUDE`, `PC-PARITY-CODEX`, `PC-PARITY-OPENCODE`, `PC-PARITY-AMPLIFIER`, `FA-PARITY-FRESHCLAUDE`, `FA-PARITY-FRESHCODEX`, and `FA-PARITY-FRESHOPENCODE`. Live provider credential cases remain deferrable only through the existing typed certification mechanism.
+- Gate cases are named `PC-PARITY-CLAUDE`, `PC-PARITY-CODEX`, `PC-PARITY-OPENCODE`, `PC-PARITY-AMPLIFIER`, `FA-PARITY-FRESHCLAUDE`, `FA-PARITY-FRESHCODEX`, and `FA-PARITY-FRESHOPENCODE`. They use a distinct `provider-parity-local` receipt kind validated by `scripts/testing/provider-parity-receipt.ts`; the existing live receipt validators continue to reject deterministic/fixture rows. Live provider credential cases remain deferrable only through the existing typed certification mechanism.
 
 - [ ] **Step 1: Write the failing behavioral tests**
 
@@ -315,7 +338,7 @@ Expected: FAIL because the managed paths currently omit at least one provider-vi
 
 - [ ] **Step 3: Add the minimal production and gate coverage**
 
-Wire the fixture through the existing qualification feature, add the seven gate cases, and make the runtime receipt include provider-visible parity, MCP tool result, normalized operation matrix, exact resume identity, and secret-hygiene evidence. Keep live provider receipts under the existing `PENDING_LIVE_PROVIDER_CERTIFICATION` deferral; a deferred live case never makes a local parity case pass by omission.
+Wire the fixture through the existing qualification feature, add the seven gate cases, and make the local parity receipt include provider-visible parity, MCP tool result, normalized operation matrix, exact resume identity, and secret-hygiene evidence. Keep live provider receipts under the existing `PENDING_LIVE_PROVIDER_CERTIFICATION` deferral; a deferred live case never makes a local parity case pass by omission. Add a validator test proving a local receipt cannot satisfy the live receipt validator and a missing provider row fails the local parity validator.
 
 - [ ] **Step 4: Run the focused tests**
 
@@ -325,7 +348,7 @@ Expected: PASS for every deterministic parity case and for manifest validation, 
 
 - [ ] **Step 5: Refactor while green**
 
-Keep the comparator provider-neutral and put provider-specific expectations in a small table containing only the known operation differences. Reuse existing runtime receipt validation instead of inventing a second certification format.
+Keep the comparator provider-neutral and put provider-specific expectations in a small table containing only the known operation differences. Reuse shared receipt parsing and validation helpers, while keeping the `provider-parity-local` discriminated lane separate from live certification so a fixture cannot satisfy a live receipt.
 
 - [ ] **Step 6: Run impacted-test verification**
 
@@ -336,7 +359,7 @@ Expected: PASS for all locally runnable cases; any external credential case is p
 - [ ] **Step 7: Commit the task**
 
 ```bash
-git add test/integration/server/provider-parity-fixture.rs test/integration/server/provider-parity-contract.rs test/e2e-browser/specs/runtime-managed-provider-qualification-rust.spec.ts test/e2e-browser/specs/runtime-fresh-agent-qualification-rust.spec.ts test/e2e-browser/specs/mcp-bridge-rust.spec.ts test/e2e-browser/specs/restore-matrix.spec.ts test/e2e-browser/specs/agent-continuity-matrix.spec.ts test/runtime/gate-manifest.json scripts/testing/runtime-landing-campaign.ts
+git add test/integration/server/provider-parity-fixture.rs test/integration/server/provider-parity-contract.rs scripts/testing/provider-parity-receipt.ts test/unit/tooling/testing/provider-parity-receipt.test.ts test/e2e-browser/specs/runtime-managed-provider-qualification-rust.spec.ts test/e2e-browser/specs/runtime-fresh-agent-qualification-rust.spec.ts test/e2e-browser/specs/mcp-bridge-rust.spec.ts test/e2e-browser/specs/restore-matrix.spec.ts test/e2e-browser/specs/agent-continuity-matrix.spec.ts test/runtime/gate-manifest.json scripts/testing/runtime-landing-campaign.ts scripts/testing/runtime-receipts.ts
 git commit -m "test(runtime): certify managed provider feature parity"
 ```
 
