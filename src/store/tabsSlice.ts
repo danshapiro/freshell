@@ -618,8 +618,9 @@ function logManagedRuntimeUncertainOutcome(
 
 /**
  * Keep managed-runtime close work bounded while still attaching a rejection
- * handler to the original request. The server may commit an aborted PATCH,
- * so callers use the timeout as an unknown outcome and reconcile it below.
+ * handler to the original request. The server may commit a PATCH after the
+ * client-side wait expires, so the original request must remain observable
+ * through the reconciliation window instead of being aborted at the timeout.
  * `onLateSettlement` is deliberately separate from the bounded promise: a
  * timeout settles the close gate, while the original request remains observed
  * until it resolves or rejects.
@@ -638,7 +639,6 @@ function awaitBoundedManagedRuntimeRequest<T>(
     const timer = setTimeout(() => {
       timedOut = true
       settled = true
-      controller.abort()
       lateGraceTimer = setTimeout(() => {
         if (lateSettled) return
         try {
@@ -1003,8 +1003,8 @@ function managedViewTimeoutHooks(
  * Mark every frozen managed view detached as one close transaction. If a
  * later view refuses the mutation, use each successful response's new fences
  * to return its view to visible before the pane/tab can be removed. Every
- * timeout also starts a bounded late-outcome repair because aborting a request
- * cannot undo a PATCH already accepted by the server.
+ * timeout also starts a bounded late-outcome repair while the original
+ * visibility mutation remains observable.
  */
 async function detachManagedViews(
   projections: FrozenManagedViewProjection[],
