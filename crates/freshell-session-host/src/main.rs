@@ -1033,31 +1033,14 @@ async fn grant_execution(
 fn prepare_provider_state_for_fresh_launch(
     terminal: &mut TerminalLaunchSpec,
 ) -> Result<(), RuntimeError> {
-    providers::prepare_provider_state_before_bootstrap(terminal).map_err(|error| {
-        RuntimeError::new(
-            RuntimeErrorCode::HostUnreachable,
-            format!("prepare managed provider state: {error}"),
-        )
-    })?;
-    prepare_provider_context(
-        terminal.provider_launch_context.as_ref(),
-        &terminal.mode,
-        &terminal.workspace_path,
-        terminal.run_as_uid,
-        terminal.run_as_gid,
-    )
-    .map_err(|error| {
-        RuntimeError::new(
-            RuntimeErrorCode::HostUnreachable,
-            format!("prepare provider config: {error}"),
-        )
-    })?;
-    transfer_host_created_provider_state(terminal).map_err(|error| {
-        RuntimeError::new(
-            RuntimeErrorCode::HostUnreachable,
-            format!("transfer managed provider state: {error}"),
-        )
-    })?;
+    prepare_provider_state_before_bootstrap_with(
+        terminal,
+        providers::prepare_provider_state_before_bootstrap,
+        transfer_host_created_provider_state,
+        |terminal| {
+            prepare_provider_context_for_fresh_launch(terminal, &ProviderConfigPaths::default())
+        },
+    )?;
     prepare_provider_bootstrap_files(
         &terminal.provider_bootstrap_files,
         terminal.run_as_uid,
@@ -1067,6 +1050,32 @@ fn prepare_provider_state_for_fresh_launch(
         RuntimeError::new(
             RuntimeErrorCode::HostUnreachable,
             format!("prepare provider bootstrap: {error}"),
+        )
+    })
+}
+
+fn prepare_provider_state_before_bootstrap_with(
+    terminal: &mut TerminalLaunchSpec,
+    prepare_state: impl FnOnce(&mut TerminalLaunchSpec) -> Result<(), String>,
+    transfer_state: impl FnOnce(&TerminalLaunchSpec) -> Result<(), String>,
+    prepare_context: impl FnOnce(&TerminalLaunchSpec) -> Result<(), String>,
+) -> Result<(), RuntimeError> {
+    prepare_state(terminal).map_err(|error| {
+        RuntimeError::new(
+            RuntimeErrorCode::HostUnreachable,
+            format!("prepare managed provider state: {error}"),
+        )
+    })?;
+    prepare_context(terminal).map_err(|error| {
+        RuntimeError::new(
+            RuntimeErrorCode::HostUnreachable,
+            format!("prepare provider config: {error}"),
+        )
+    })?;
+    transfer_state(terminal).map_err(|error| {
+        RuntimeError::new(
+            RuntimeErrorCode::HostUnreachable,
+            format!("transfer managed provider state: {error}"),
         )
     })
 }
@@ -1216,7 +1225,34 @@ fn copy_provider_config_references(
     run_as_uid: u32,
     run_as_gid: u32,
 ) -> Result<(), String> {
+    copy_provider_config_references_with_ownership(
+        context,
+        provider,
+        workspace,
+        user_provider_root,
+        provider_home,
+        (run_as_uid, run_as_gid),
+        ProviderConfigOwnership::Immediate,
+    )
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ProviderConfigOwnership {
+    Immediate,
+    DeferAmplifierTree,
+}
+
+fn copy_provider_config_references_with_ownership(
+    context: &freshell_runtime_protocol::ProviderLaunchContext,
+    provider: &str,
+    workspace: &Path,
+    user_provider_root: &Path,
+    provider_home: &Path,
+    run_as: (u32, u32),
+    ownership: ProviderConfigOwnership,
+) -> Result<(), String> {
     use freshell_runtime_protocol::ProviderConfigRoot;
+    let (run_as_uid, run_as_gid) = run_as;
     context.validate(provider).map_err(|error| error.message)?;
     let mut copied = Vec::new();
     let mut entries = 0usize;
@@ -1247,11 +1283,25 @@ fn copy_provider_config_references(
         .collect::<std::collections::BTreeSet<_>>();
     copied.sort_by_key(|path| std::cmp::Reverse(path.components().count()));
     for path in copied {
-        set_owner(&path, run_as_uid, run_as_gid)?;
+        // Amplifier's first launch transfers the complete stub and projected
+        // config in one bounded walk. Chowning a selected 0700 directory here
+        // would make that later walk fail without DAC_OVERRIDE.
+        if should_transfer_projected_path(&path, provider_home, ownership) {
+            set_owner(&path, run_as_uid, run_as_gid)?;
+        }
     }
     let manifest = write_projection_manifest(provider_home, &projected)?;
     set_owner(&manifest, run_as_uid, run_as_gid)?;
     Ok(())
+}
+
+fn should_transfer_projected_path(
+    path: &Path,
+    provider_home: &Path,
+    ownership: ProviderConfigOwnership,
+) -> bool {
+    ownership != ProviderConfigOwnership::DeferAmplifierTree
+        || !path.starts_with(provider_home.join(".amplifier"))
 }
 
 const PROVIDER_PROJECTION_MANIFEST: &str = ".freshell-config-projection.json";
@@ -1519,7 +1569,51 @@ fn prepare_provider_context(
     run_as_uid: u32,
     run_as_gid: u32,
 ) -> Result<(), String> {
-    let private_mount_parent = Path::new("/run/freshell-private");
+    prepare_provider_context_at(
+        context,
+        provider,
+        workspace,
+        run_as_uid,
+        run_as_gid,
+        &ProviderConfigPaths::default(),
+        ProviderConfigOwnership::Immediate,
+    )
+}
+
+fn prepare_provider_context_for_fresh_launch(
+    terminal: &TerminalLaunchSpec,
+    paths: &ProviderConfigPaths,
+) -> Result<(), String> {
+    let ownership = first_launch_config_ownership(&terminal.mode);
+    prepare_provider_context_at(
+        terminal.provider_launch_context.as_ref(),
+        &terminal.mode,
+        &terminal.workspace_path,
+        terminal.run_as_uid,
+        terminal.run_as_gid,
+        paths,
+        ownership,
+    )
+}
+
+fn first_launch_config_ownership(provider: &str) -> ProviderConfigOwnership {
+    if provider == "amplifier" {
+        ProviderConfigOwnership::DeferAmplifierTree
+    } else {
+        ProviderConfigOwnership::Immediate
+    }
+}
+
+fn prepare_provider_context_at(
+    context: Option<&freshell_runtime_protocol::ProviderLaunchContext>,
+    provider: &str,
+    workspace: &str,
+    run_as_uid: u32,
+    run_as_gid: u32,
+    paths: &ProviderConfigPaths,
+    ownership: ProviderConfigOwnership,
+) -> Result<(), String> {
+    let private_mount_parent = &paths.private_mount;
     if !private_mount_parent.exists() {
         if context.is_some_and(|context| {
             provider_config_references(context).iter().any(|reference| {
@@ -1529,14 +1623,14 @@ fn prepare_provider_context(
             return Err("provider user config mount is unavailable".into());
         }
         if let Some(context) = context {
-            return copy_provider_config_references(
+            return copy_provider_config_references_with_ownership(
                 context,
                 provider,
                 Path::new(workspace),
                 private_mount_parent,
-                Path::new("/home/freshell/provider"),
-                run_as_uid,
-                run_as_gid,
+                &paths.provider_home,
+                (run_as_uid, run_as_gid),
+                ownership,
             );
         }
         return Ok(());
@@ -1544,14 +1638,14 @@ fn prepare_provider_context(
     std::fs::create_dir_all(private_mount_parent).map_err(|error| error.to_string())?;
     set_mode(private_mount_parent, 0o700)?;
     if let Some(context) = context {
-        copy_provider_config_references(
+        copy_provider_config_references_with_ownership(
             context,
             provider,
             Path::new(workspace),
             &private_mount_parent.join("user-provider"),
-            Path::new("/home/freshell/provider"),
-            run_as_uid,
-            run_as_gid,
+            &paths.provider_home,
+            (run_as_uid, run_as_gid),
+            ownership,
         )?;
     }
     Ok(())
@@ -3333,5 +3427,127 @@ mod tests {
         .unwrap_err();
         assert!(error.contains("refuses symlink"));
         assert_eq!(std::fs::read(&outside).unwrap(), b"sentinel");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn first_amplifier_launch_transfers_stub_and_projected_config_together() {
+        use freshell_runtime_protocol::{
+            ProviderConfigReference, ProviderConfigRoot, ProviderLaunchContext, ProviderPreparation,
+        };
+        use std::{cell::Cell, os::unix::fs::PermissionsExt, process::Command};
+
+        let root = tempfile::tempdir().unwrap();
+        let workspace = root.path().join("workspace");
+        let user_provider_root = root.path().join("private/user-provider");
+        let provider_home = root.path().join("provider");
+        let amplifier_home = provider_home.join(".amplifier");
+        let paths = ProviderConfigPaths {
+            private_mount: root.path().join("private"),
+            provider_home: provider_home.clone(),
+        };
+        let selected_bundle = user_provider_root.join("bundles/ordinary");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(&selected_bundle).unwrap();
+        std::fs::create_dir_all(&provider_home).unwrap();
+        std::fs::write(selected_bundle.join("bundle.yaml"), b"name: ordinary\n").unwrap();
+        std::fs::write(selected_bundle.join("auth.json"), b"fixture-secret").unwrap();
+
+        let context = ProviderLaunchContext {
+            preparation: ProviderPreparation::Amplifier {
+                bundle: "default".into(),
+                resume_args: Vec::new(),
+            },
+            mcp_capability: None,
+            config: vec![ProviderConfigReference {
+                root: ProviderConfigRoot::UserProvider,
+                relative_path: "bundles".into(),
+                provider_relative_path: ".amplifier/bundles".into(),
+                format: "directory".into(),
+            }],
+        };
+        let mut terminal: TerminalLaunchSpec = serde_json::from_value(serde_json::json!({
+            "terminalId":"amplifier-first-launch", "streamId":"amplifier-stream",
+            "mode":"amplifier", "program":"amplifier", "args":[],
+            "cwd":workspace, "runAsUid":unsafe { libc::geteuid() },
+            "runAsGid":unsafe { libc::getegid() }, "cols":80, "rows":24,
+            "projectKey":"amplifier-project", "workspacePath":workspace,
+            "resumeSessionId":"session-first-launch"
+        }))
+        .unwrap();
+        terminal.provider_launch_context = Some(context);
+
+        // Docker's host has CHOWN but no DAC_OVERRIDE. Once the selected
+        // bundle is provider-owned and 0700, that host cannot walk it. The
+        // fixture uses one OS uid, so model the distinct host/provider DAC
+        // identities while the callbacks perform the real stub, ownership
+        // transfer, and config projection operations.
+        let provider_only_bundle = Cell::new(false);
+        let ownership_transferred = Cell::new(false);
+        prepare_provider_state_before_bootstrap_with(
+            &mut terminal,
+            |terminal| {
+                freshell_sessions::amplifier_stub::ensure_session(
+                    &amplifier_home,
+                    terminal.resume_session_id.as_deref().unwrap(),
+                    &terminal.cwd,
+                    &terminal.terminal_id,
+                )
+                .map(|_| ())
+                .map_err(|error| error.to_string())
+            },
+            |terminal| {
+                if provider_only_bundle.get() {
+                    return Err("host cannot traverse provider-owned 0700 bundle".into());
+                }
+                transfer_owned_tree(
+                    &amplifier_home,
+                    terminal.run_as_uid,
+                    terminal.run_as_gid,
+                    10_000,
+                )?;
+                ownership_transferred.set(true);
+                Ok(())
+            },
+            |terminal| {
+                if ownership_transferred.get() {
+                    return Err("host cannot project into a provider-owned Amplifier home".into());
+                }
+                prepare_provider_context_for_fresh_launch(terminal, &paths)?;
+                let projected = amplifier_home.join("bundles");
+                assert_eq!(
+                    std::fs::metadata(&projected).unwrap().permissions().mode() & 0o777,
+                    0o700
+                );
+                provider_only_bundle.set(should_transfer_projected_path(
+                    &projected,
+                    &provider_home,
+                    first_launch_config_ownership(&terminal.mode),
+                ));
+                Ok(())
+            },
+        )
+        .expect("a first Amplifier launch must transfer state after an accessible projection");
+
+        let projected_bundle = amplifier_home.join("bundles/ordinary/bundle.yaml");
+        assert!(ownership_transferred.get());
+        assert!(!amplifier_home.join("bundles/ordinary/auth.json").exists());
+        let output = Command::new("/usr/bin/setpriv")
+            .args([
+                "--reuid",
+                &terminal.run_as_uid.to_string(),
+                "--regid",
+                &terminal.run_as_gid.to_string(),
+                "--keep-groups",
+                "--no-new-privs",
+                "--",
+                "cat",
+            ])
+            .arg(&projected_bundle)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "provider child: {output:?}");
+        assert_eq!(output.stdout, b"name: ordinary\n");
+        assert!(amplifier_home.join("projects").is_dir());
     }
 }
