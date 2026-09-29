@@ -78,7 +78,10 @@ describe('hosted fresh-agent provider inputs', () => {
     for (const row of providers) {
       const file = path.join(rig.info.homeDir, row.config)
       fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o755 })
-      fs.writeFileSync(file, row.provider === 'codex' ? 'fixture_setting = true\n' : '{"fixtureSetting":true}\n')
+      const contents = row.provider === 'codex'
+        ? 'fixture_setting = true\n\n[mcp_servers.user_fixture]\ncommand = "user-fixture-mcp"\n'
+        : JSON.stringify({ fixtureSetting: true, mcpServers: { user_fixture: { command: 'user-fixture-mcp' } } }) + '\n'
+      fs.writeFileSync(file, contents)
       fs.chmodSync(path.dirname(file), 0o755)
       fs.chmodSync(file, 0o644)
     }
@@ -128,8 +131,33 @@ describe('hosted fresh-agent provider inputs', () => {
     })
     expect(profile.providerLaunchContext.config.length).toBeGreaterThan(0)
     expect(profile.providerLaunchContext.mcpCapability.grantId).toMatch(/^grant-/)
-    expect(JSON.stringify(profile.providerLaunchContext.preparation)).not.toContain('freshell-mcp')
+    for (const reference of profile.providerSecretReferences ?? []) {
+      expect(reference.sourcePath).toMatch(/onecli/)
+      expect(reference.profile).toMatch(new RegExp(`^${row.provider}_onecli_`))
+    }
     expect(JSON.stringify(recorded)).not.toContain('fixture-secret-byte')
+    const preparation = profile.providerLaunchContext.preparation
+    if (row.provider === 'claude') {
+      expect(preparation.claude?.mcp_args).toEqual([])
+    } else if (row.provider === 'codex') {
+      expect(preparation.codex).toMatchObject({ tui_args: [], sidecar_args: [] })
+    } else {
+      expect(preparation.opencode).toMatchObject({ inline_config: false, tui_config: null })
+      expect(JSON.stringify(preparation)).not.toContain('freshell-mcp')
+      const tuiConfig = rig.ownedProviderExec(view.containerId!, [
+        'cat', '/home/freshell/provider/.freshell/opencode/tui.json',
+      ])
+      expect(JSON.parse(tuiConfig).plugin).toEqual([
+        expect.stringContaining('freshell-rebind-plugin.ts'),
+      ])
+    }
+    for (const config of profile.providerLaunchContext.config) {
+      const contents = rig.ownedProviderExec(view.containerId!, [
+        'cat', path.posix.join('/home/freshell/provider', config.providerRelativePath),
+      ])
+      expect(contents).toContain(row.provider === 'codex' ? 'fixture_setting' : 'fixtureSetting')
+      expect(contents).toContain('user-fixture-mcp')
+    }
 
     const sendId = `send-${randomUUID()}`
     wire.send({ type: 'freshAgent.send', provider: row.provider, sessionType: row.sessionType,

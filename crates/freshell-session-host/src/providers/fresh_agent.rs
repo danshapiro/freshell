@@ -1287,6 +1287,61 @@ mod tests {
             assert!(created.resume_session_id.is_none());
             assert!(created.observed_epoch.is_none());
             assert!(created.observed_generation.is_none());
+            // Provider-only context is carried beside the provider create wire
+            // request. Pin the full observable shape here so a hosted start
+            // cannot silently lose ordinary config, TUI, MCP, or OneCLI
+            // references while the public FreshAgentCreate remains equal.
+            let context = profile.provider_launch_context.as_ref().unwrap();
+            assert_eq!(context.config.len(), 1);
+            assert_eq!(context.config[0].relative_path, "settings.json");
+            assert_eq!(
+                context.config[0].provider_relative_path,
+                "provider/settings.json"
+            );
+            assert_eq!(profile.provider_secret_references.len(), 1);
+            assert_eq!(
+                profile.provider_secret_references[0].source_path,
+                "/run/freshell-secrets/onecli"
+            );
+            assert!(serde_json::to_string(&profile)
+                .unwrap()
+                .find("fixture-secret-byte")
+                .is_none());
+            match (&provider, &context.preparation) {
+                (FreshProvider::Claude, ProviderPreparation::Claude { mcp_args }) => {
+                    assert!(
+                        mcp_args.is_empty(),
+                        "direct fresh Claude adds no Freshell MCP"
+                    );
+                }
+                (
+                    FreshProvider::Codex,
+                    ProviderPreparation::Codex {
+                        tui_args,
+                        sidecar_args,
+                    },
+                ) => {
+                    assert!(
+                        tui_args.is_empty(),
+                        "direct fresh Codex adds no Freshell TUI MCP"
+                    );
+                    assert_eq!(sidecar_args, &["-c", "fixture_option=true"]);
+                }
+                (
+                    FreshProvider::Opencode,
+                    ProviderPreparation::Opencode {
+                        project_config,
+                        tui_config,
+                        inline_config,
+                        ..
+                    },
+                ) => {
+                    assert!(project_config.is_empty());
+                    assert!(tui_config.is_none());
+                    assert!(!inline_config);
+                }
+                _ => panic!("provider preparation did not match provider {provider:?}"),
+            }
             let mut replayed = profile.clone();
             replayed.provider_store_id = "other-lifecycle-id".into();
             let other_create = create_request_for_profile(&replayed);
