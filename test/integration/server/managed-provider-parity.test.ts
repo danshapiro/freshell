@@ -1,5 +1,6 @@
 import fs from 'node:fs'
 import path from 'node:path'
+import os from 'node:os'
 import { randomUUID } from 'node:crypto'
 import WebSocket from 'ws'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
@@ -173,6 +174,7 @@ function makeReadableTree(directory: string): void {
 describe('ordinary and managed terminal provider parity', () => {
   let rig: ManagedRuntimeBrowserRig
   let workspace: string
+  let webHome: string
   let inheritedFreshellUrl: string | undefined
   const sockets: TerminalWire[] = []
 
@@ -180,6 +182,9 @@ describe('ordinary and managed terminal provider parity', () => {
     inheritedFreshellUrl = process.env.FRESHELL_URL
     delete process.env.FRESHELL_URL
     workspace = fs.mkdtempSync(path.join(root, '.provider-parity-'))
+    webHome = fs.mkdtempSync(path.join(os.tmpdir(), 'freshell-parity-home-'))
+    fs.mkdirSync(path.join(webHome, '.config/opencode'), { recursive: true })
+    fs.writeFileSync(path.join(webHome, '.config/opencode/tui.jsonc'), '{ // home-selected\n  "plugin": ["file://home-selected-tui.js"]\n}\n')
     fs.chmodSync(workspace, 0o777)
     fs.mkdirSync(path.join(workspace, '.opencode'), { mode: 0o777 })
     fs.writeFileSync(path.join(workspace, 'opencode.jsonc'), '{ // provider parity\n  "plugin": ["file://parity-plugin.js"]\n}\n')
@@ -207,7 +212,7 @@ describe('ordinary and managed terminal provider parity', () => {
     }
     rig = new ManagedRuntimeBrowserRig(root, 2, {
       FRESHELL_BIND_HOST: '0.0.0.0',
-      OPENCODE_TUI_CONFIG: './user-tui.jsonc',
+      OPENCODE_TUI_CONFIG: path.join(webHome, '.config/opencode/tui.jsonc'),
       OPENCODE_CONFIG_CONTENT: JSON.stringify({ mcp: { vendor: {
         type: 'local', command: ['vendor-tool', '--token', nestedSecretMarker],
         endpoint: `https://${nestedSecretMarker}.example`,
@@ -223,7 +228,7 @@ describe('ordinary and managed terminal provider parity', () => {
         opencode: { model: 'openai/gpt-5.6-luna', effort: 'low' },
         amplifier: { model: 'glm-5.3', effort: 'provider-default' },
       },
-    })
+    }, webHome)
     await rig.start()
     for (const [directory, filename, content] of [
       ['.claude', 'settings.json', JSON.stringify({ paritySetting: true })],
@@ -256,6 +261,7 @@ describe('ordinary and managed terminal provider parity', () => {
       }
     } finally {
       if (workspace) fs.rmSync(workspace, { recursive: true, force: true })
+      if (webHome) fs.rmSync(webHome, { recursive: true, force: true })
       if (inheritedFreshellUrl === undefined) delete process.env.FRESHELL_URL
       else process.env.FRESHELL_URL = inheritedFreshellUrl
     }
@@ -316,7 +322,7 @@ describe('ordinary and managed terminal provider parity', () => {
     }
     expect(normalized(observed[1])).toEqual(normalized(observed[0]))
     if (provider === 'opencode') {
-      expect(observed[1].tuiConfig).toBe(fs.readFileSync(path.join(workspace, 'user-tui.jsonc'), 'utf8'))
+      expect(observed[1].tuiConfig).toBe(fs.readFileSync(path.join(webHome, '.config/opencode/tui.jsonc'), 'utf8'))
       expect(observed[1].inlineConfig).toEqual(observed[0].inlineConfig)
       expect(observed[1].inlineConfig).toMatch(/^[a-f0-9]{64}$/)
     }
@@ -360,6 +366,8 @@ describe('ordinary and managed terminal provider parity', () => {
     fs.writeFileSync(path.join(rig.info.homeDir, '.config/opencode/opencode.jsonc'), '{"replacementOriginal":true}\n')
     fs.rmSync(path.join(rig.info.homeDir, '.config/opencode/plugins/parity-plugin.js'))
     fs.rmSync(path.join(workspace, '.opencode/opencode.json'))
+    const editedTui = '{ // changed before replacement\n  "theme": "light"\n}\n'
+    fs.writeFileSync(path.join(webHome, '.config/opencode/tui.jsonc'), editedTui)
     rig.runtime.killOwnedRuntimeExact(before.containerId)
     const after = await waitFor('replacement OpenCode incarnation', async () => {
       const view = await rig.runningViewForTerminal(terminalId)
@@ -376,7 +384,8 @@ describe('ordinary and managed terminal provider parity', () => {
     expect(resumed.projectConfig.dotOpencodeJson).toBeNull()
     expect(resumed.projectedProjectConfig).toBeNull()
     expect(resumed.providerOwned).toBe('provider-owned-state')
-    expect(resumed.tuiConfig).toBe(first.tuiConfig)
+    expect(resumed.tuiConfig).toBe(editedTui)
+    expect(resumed.tuiConfig).not.toBe(first.tuiConfig)
     const resumedMcp = await waitFor('resumed OpenCode MCP probe', () => wire.recordRows().filter(row => (
       row.provider === 'opencode' && row.kind === 'mcp'
     ))[1], 90_000).catch(error => {
@@ -385,7 +394,7 @@ describe('ordinary and managed terminal provider parity', () => {
     expect(resumedMcp.authenticatedCall).toMatchObject({ isError: false, count: 0 })
   }, 360_000)
 
-  it('recovers OpenCode inline and relative JSONC TUI inputs after web restart with its container down', async () => {
+  it('recovers OpenCode inline and home JSONC TUI inputs after web restart with its container down', async () => {
     const wire = await TerminalWire.connect(rig.info, true)
     sockets.push(wire)
     const { terminalId, requestId } = await wire.create('opencode', workspace)
@@ -402,6 +411,8 @@ describe('ordinary and managed terminal provider parity', () => {
     })
     if (!before.containerId) throw new Error('initial OpenCode container missing')
     await rig.web.kill()
+    const editedTui = '{ // changed while web is down\n  "theme": "solarized"\n}\n'
+    fs.writeFileSync(path.join(webHome, '.config/opencode/tui.jsonc'), editedTui)
     rig.runtime.killOwnedRuntimeExact(before.containerId)
     await rig.restartWebGracefully()
     const after = await waitFor('replacement after web restart', async () => {
@@ -428,8 +439,8 @@ describe('ordinary and managed terminal provider parity', () => {
     })
     expect(resumed.inlineConfig).toBe(first.inlineConfig)
     expect(resumed.inlineConfig).toMatch(/^[a-f0-9]{64}$/)
-    expect(resumed.tuiConfig).toBe(first.tuiConfig)
-    expect(resumed.tuiConfig).toBe(fs.readFileSync(path.join(workspace, 'user-tui.jsonc'), 'utf8'))
+    expect(resumed.tuiConfig).toBe(editedTui)
+    expect(resumed.tuiConfig).not.toBe(first.tuiConfig)
     const resumedMcp = await waitFor('resumed OpenCode MCP after web restart', () => recoveredWire.recordRows().find(row => (
       row.provider === 'opencode' && row.kind === 'mcp'
     )), 90_000)

@@ -987,6 +987,8 @@ pub enum ProviderPreparation {
     Opencode {
         project_config: Vec<ProviderConfigReference>,
         tui_config: Option<ProviderConfigReference>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tui_source: Option<ProviderConfigReference>,
         #[serde(default)]
         inline_config: bool,
     },
@@ -1094,6 +1096,7 @@ impl ProviderLaunchContext {
             ProviderPreparation::Opencode {
                 project_config,
                 tui_config,
+                tui_source,
                 inline_config,
             } => {
                 if project_config
@@ -1122,6 +1125,20 @@ impl ProviderLaunchContext {
                                 reference.relative_path.as_str(),
                                 reference.provider_relative_path.as_str(),
                             ))
+                    {
+                        return Err(invalid());
+                    }
+                }
+                if let Some(source) = tui_source {
+                    let Some(staged) = tui_config else {
+                        return Err(invalid());
+                    };
+                    if !matches!(
+                        source.root,
+                        ProviderConfigRoot::Workspace | ProviderConfigRoot::UserProvider
+                    ) || source.format != staged.format
+                        || source.provider_relative_path != staged.provider_relative_path
+                        || !safe_relative_path(&source.relative_path)
                     {
                         return Err(invalid());
                     }
@@ -1261,12 +1278,31 @@ mod provider_launch_context_tests {
             preparation: ProviderPreparation::Opencode {
                 project_config: Vec::new(),
                 tui_config: Some(reference),
+                tui_source: None,
                 inline_config: true,
             },
             mcp_capability: Some(capability),
             config: Vec::new(),
         };
         context.validate("opencode").unwrap();
+        if let ProviderPreparation::Opencode { tui_source, .. } = &mut context.preparation {
+            *tui_source = Some(ProviderConfigReference {
+                root: ProviderConfigRoot::UserProvider,
+                relative_path: "tui.jsonc".into(),
+                provider_relative_path: ".freshell/opencode/user-tui.jsonc".into(),
+                format: "jsonc".into(),
+            });
+        }
+        context.validate("opencode").unwrap();
+        let encoded = serde_json::to_string(&context).unwrap();
+        assert!(encoded.contains("tui_source"));
+        if let ProviderPreparation::Opencode { tui_source, .. } = &mut context.preparation {
+            tui_source.as_mut().unwrap().relative_path = "../outside.jsonc".into();
+        }
+        assert!(context.validate("opencode").is_err());
+        if let ProviderPreparation::Opencode { tui_source, .. } = &mut context.preparation {
+            tui_source.as_mut().unwrap().relative_path = "tui.jsonc".into();
+        }
         if let ProviderPreparation::Opencode { tui_config, .. } = &mut context.preparation {
             tui_config.as_mut().unwrap().provider_relative_path =
                 ".freshell/opencode/other.jsonc".into();

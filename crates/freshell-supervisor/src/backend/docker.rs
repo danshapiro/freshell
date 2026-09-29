@@ -323,6 +323,7 @@ mod provider_secret_tests {
                     format: "json".into(),
                 }],
                 tui_config: None,
+                tui_source: None,
                 inline_config: false,
             },
             mcp_capability: None,

@@ -79,6 +79,7 @@ pub(crate) fn provider_launch_context_from_home(
             ProviderPreparation::Opencode {
                 project_config: Vec::new(),
                 tui_config: None,
+                tui_source: None,
                 inline_config: false,
             },
         ),
@@ -122,6 +123,7 @@ pub(crate) fn provider_launch_context_from_home(
             ProviderPreparation::Opencode {
                 project_config,
                 tui_config,
+                tui_source: None,
                 inline_config: false,
             }
         }

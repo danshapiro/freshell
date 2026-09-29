@@ -3140,6 +3140,7 @@ mod tests {
                 preparation: freshell_runtime_protocol::ProviderPreparation::Opencode {
                     project_config: Vec::new(),
                     tui_config: None,
+                    tui_source: None,
                     inline_config: true,
                 },
                 mcp_capability: Some(freshell_runtime_protocol::McpCapabilityReference {

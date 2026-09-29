@@ -617,8 +617,22 @@ impl Supervisor {
                 .and_then(|context| context.mcp_capability.as_ref())
                 .is_some()
             {
+                let tui_source = terminal
+                    .provider_launch_context
+                    .as_ref()
+                    .and_then(|context| {
+                        if let freshell_runtime_protocol::ProviderPreparation::Opencode {
+                            tui_source,
+                            ..
+                        } = &context.preparation
+                        {
+                            tui_source.as_ref()
+                        } else {
+                            None
+                        }
+                    });
                 let refreshed_capability = self
-                    .issue_replacement_mcp_capability(&soul_id, &terminal.mode)
+                    .issue_replacement_mcp_capability(&soul_id, &terminal.mode, tui_source, &terminal.workspace_path)
                     .await
                     .and_then(|reference| {
                         crate::backend::docker::staged_provider_root_for_grant(
@@ -2373,6 +2387,7 @@ mod tests {
                 preparation: freshell_runtime_protocol::ProviderPreparation::Opencode {
                     project_config: Vec::new(),
                     tui_config: None,
+                    tui_source: None,
                     inline_config: false,
                 },
                 mcp_capability: Some(freshell_runtime_protocol::McpCapabilityReference {
@@ -2413,6 +2428,7 @@ mod tests {
             preparation: ProviderPreparation::Opencode {
                 project_config: vec![],
                 tui_config: None,
+                tui_source: None,
                 inline_config: false,
             },
             mcp_capability: None,

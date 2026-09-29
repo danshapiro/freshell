@@ -1530,7 +1530,15 @@ impl Supervisor {
             ));
         }
         let response = self
-            .mcp_capability_callback(action, soul_id, Some(incarnation_id), Some(grant_id), None)
+            .mcp_capability_callback(
+                action,
+                soul_id,
+                Some(incarnation_id),
+                Some(grant_id),
+                None,
+                None,
+                None,
+            )
             .await?;
         if response != b"ok" {
             return Err(RuntimeError::new(
@@ -1545,9 +1553,19 @@ impl Supervisor {
         &self,
         soul_id: &SoulId,
         provider: &str,
+        tui_source: Option<&freshell_runtime_protocol::ProviderConfigReference>,
+        workspace: &str,
     ) -> Result<freshell_runtime_protocol::McpCapabilityReference, RuntimeError> {
         let response = self
-            .mcp_capability_callback("issue", soul_id, None, None, Some(provider))
+            .mcp_capability_callback(
+                "issue",
+                soul_id,
+                None,
+                None,
+                Some(provider),
+                tui_source,
+                Some(workspace),
+            )
             .await?;
         serde_json::from_slice(&response).map_err(|_| {
             RuntimeError::new(
@@ -1564,6 +1582,8 @@ impl Supervisor {
         incarnation_id: Option<&IncarnationId>,
         grant_id: Option<&str>,
         provider: Option<&str>,
+        tui_source: Option<&freshell_runtime_protocol::ProviderConfigReference>,
+        workspace: Option<&str>,
     ) -> Result<Vec<u8>, RuntimeError> {
         if self.config.control_secret.contains(['\r', '\n']) {
             return Err(RuntimeError::new(
@@ -1578,6 +1598,8 @@ impl Supervisor {
             "incarnationId": incarnation_id,
             "grantId": grant_id,
             "provider": provider,
+            "tuiSource": tui_source,
+            "workspace": workspace,
         }))
         .map_err(|error| RuntimeError::new(RuntimeErrorCode::InvalidRequest, error.to_string()))?;
         let callback_socket = self.config.control_socket_path.with_file_name("mcp.sock");

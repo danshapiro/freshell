@@ -76,6 +76,7 @@ export class ManagedRuntimeBrowserRig {
   info!: TestServerInfo
   private serverBin = ''
   private readonly serverEnv: Record<string, string>
+  private readonly webHomeDir: string | undefined
   private readonly supervisorEnv: Record<string, string>
   private readonly supervisorBinaryKind: 'test' | 'release'
   private readonly enabledProviders: string[]
@@ -96,10 +97,12 @@ export class ManagedRuntimeBrowserRig {
       freshAgentModes?: string[]
       fixtureFreshAgentModes?: string[]
     } = { enabledProviders: ['opencode'] },
+    webHomeDir?: string,
   ) {
     this.repoRoot = fs.realpathSync(repoRoot)
     this.runtime = new RuntimeHarness(this.repoRoot, undefined, phase)
     this.serverEnv = { ...serverEnv }
+    this.webHomeDir = webHomeDir
     this.supervisorEnv = { ...supervisorEnv }
     this.supervisorBinaryKind = supervisorBinaryKind
     this.enabledProviders = [...qualificationProviders.enabledProviders]
@@ -155,6 +158,7 @@ export class ManagedRuntimeBrowserRig {
     })
     this.web = new RustServer({
       preserveHomeOnStop: true,
+      homeDir: this.webHomeDir,
       env: {
         FRESHELL_MANAGED_RUNTIME_V1: '1',
         ...(this.freshAgentModes.length > 0

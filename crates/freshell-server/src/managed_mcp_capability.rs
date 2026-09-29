@@ -32,6 +32,7 @@ const RENEWAL_WINDOW_SECS: u64 = 7 * 24 * 60 * 60;
 pub(crate) struct OpencodeEphemeralInput<'a> {
     pub inline_config: Option<&'a str>,
     pub tui_config_path: Option<&'a str>,
+    pub tui_source: Option<&'a ProviderConfigReference>,
     pub cwd: Option<&'a Path>,
     pub workspace: Option<&'a Path>,
 }
@@ -211,6 +212,8 @@ struct CapabilityCallback {
     incarnation_id: Option<IncarnationId>,
     grant_id: Option<String>,
     provider: Option<String>,
+    tui_source: Option<ProviderConfigReference>,
+    workspace: Option<PathBuf>,
 }
 
 fn apply_callback(
@@ -235,6 +238,8 @@ fn apply_callback(
                 directory,
                 endpoint.into(),
                 Some((&provider, home, &references)),
+                callback.tui_source.as_ref(),
+                callback.workspace.as_deref(),
             )?;
             serde_json::to_vec(&reference).map_err(|error| error.to_string())
         }
@@ -321,6 +326,89 @@ fn provider_source_references(
     )
     .ok_or("managed provider config selectors are unavailable")?;
     Ok(context.config)
+}
+
+pub(crate) fn approved_tui_source(
+    raw_path: &str,
+    cwd: &Path,
+    workspace: &Path,
+    home: &Path,
+) -> Result<ProviderConfigReference, String> {
+    let canonical_workspace = std::fs::canonicalize(workspace)
+        .map_err(|_| "managed OpenCode workspace is unavailable")?;
+    let canonical_cwd =
+        std::fs::canonicalize(cwd).map_err(|_| "managed OpenCode cwd is unavailable")?;
+    if !canonical_cwd.starts_with(&canonical_workspace) {
+        return Err("managed OpenCode cwd escaped workspace".into());
+    }
+    let selected = Path::new(raw_path);
+    let candidate = if selected.is_absolute() {
+        selected.to_path_buf()
+    } else {
+        canonical_cwd.join(selected)
+    };
+    let mut normalized = PathBuf::new();
+    for component in candidate.components() {
+        match component {
+            std::path::Component::RootDir => normalized.push("/"),
+            std::path::Component::Normal(part) => normalized.push(part),
+            std::path::Component::ParentDir => {
+                normalized.pop();
+            }
+            std::path::Component::CurDir => {}
+            _ => return Err("managed OpenCode TUI config is unsafe".into()),
+        }
+    }
+    let canonical_selected = std::fs::canonicalize(&normalized)
+        .map_err(|_| "managed OpenCode TUI config is unavailable")?;
+    if !canonical_selected.is_file() {
+        return Err("managed OpenCode TUI config must be a file".into());
+    }
+    let provider_root = home.join(".config/opencode");
+    let canonical_provider_root = std::fs::canonicalize(&provider_root).ok();
+    let (root, relative) = if let Some(provider_root) = canonical_provider_root
+        .as_ref()
+        .filter(|root| normalized.starts_with(root))
+    {
+        (
+            ProviderConfigRoot::UserProvider,
+            normalized.strip_prefix(provider_root).unwrap(),
+        )
+    } else if normalized.starts_with(&canonical_workspace) {
+        (
+            ProviderConfigRoot::Workspace,
+            normalized.strip_prefix(&canonical_workspace).unwrap(),
+        )
+    } else {
+        return Err("managed OpenCode TUI config escaped approved roots".into());
+    };
+    let approved_root = if root == ProviderConfigRoot::Workspace {
+        &canonical_workspace
+    } else {
+        canonical_provider_root.as_ref().unwrap()
+    };
+    if !canonical_selected.starts_with(approved_root)
+        || relative.as_os_str().is_empty()
+        || relative
+            .components()
+            .any(|component| !matches!(component, std::path::Component::Normal(_)))
+    {
+        return Err("managed OpenCode TUI config escaped approved roots".into());
+    }
+    let format = if raw_path.to_ascii_lowercase().ends_with(".jsonc") {
+        "jsonc"
+    } else {
+        "json"
+    };
+    Ok(ProviderConfigReference {
+        root,
+        relative_path: relative
+            .to_str()
+            .ok_or("managed OpenCode TUI path is invalid")?
+            .replace(std::path::MAIN_SEPARATOR, "/"),
+        provider_relative_path: format!(".freshell/opencode/user-tui.{format}"),
+        format: format.into(),
+    })
 }
 
 fn is_secret_component(name: &str) -> bool {
@@ -437,7 +525,12 @@ fn retain_recoverable_inputs(
     grant_id: &str,
 ) -> Result<(), String> {
     let source = staged_provider_root_path(directory, grant_id)?.join("ephemeral");
-    let names = ["inline-config.json", "tui-config.json", "tui-config.jsonc"];
+    let source_is_durable = source.join("tui-source.json").is_file();
+    let names = if source_is_durable {
+        &["inline-config.json"][..]
+    } else {
+        &["inline-config.json", "tui-config.json", "tui-config.jsonc"][..]
+    };
     if !names.iter().any(|name| source.join(name).is_file()) {
         return Ok(());
     }
@@ -453,7 +546,7 @@ fn retain_recoverable_inputs(
     private_directory(&temporary)?;
     private_directory(&temporary.join("ephemeral"))?;
     let result = (|| {
-        for name in names {
+        for &name in names {
             let path = source.join(name);
             if path.is_file() {
                 copy_ephemeral_file(&path, &temporary.join("ephemeral").join(name))?;
@@ -589,7 +682,7 @@ fn stage_provider_root(
             let ephemeral = temporary.join("ephemeral");
             private_directory(&ephemeral)?;
             if let Some(prior_stage) = prior_stage {
-                for name in ["inline-config.json", "tui-config.json", "tui-config.jsonc"] {
+                for name in ["inline-config.json"] {
                     let source = prior_stage.join("ephemeral").join(name);
                     if source.is_file() {
                         copy_ephemeral_file(&source, &ephemeral.join(name))?;
@@ -605,39 +698,41 @@ fn stage_provider_root(
                     }
                     write_private_bytes(&ephemeral.join("inline-config.json"), raw.as_bytes())?;
                 }
-                if let Some(raw_path) = opencode_input.tui_config_path {
-                    let selected = Path::new(raw_path);
-                    let cwd = opencode_input
+            }
+            let selected_source = opencode_input.tui_source;
+            let selected_source = if let Some(source) = selected_source {
+                Some(source.clone())
+            } else if let Some(raw_path) = opencode_input.tui_config_path {
+                Some(approved_tui_source(
+                    raw_path,
+                    opencode_input
                         .cwd
-                        .ok_or("managed OpenCode cwd is unavailable")?;
-                    let workspace = opencode_input
+                        .ok_or("managed OpenCode cwd is unavailable")?,
+                    opencode_input
                         .workspace
-                        .ok_or("managed OpenCode workspace is unavailable")?;
-                    let canonical_workspace = std::fs::canonicalize(workspace)
-                        .map_err(|_| "managed OpenCode workspace is unavailable")?;
-                    let canonical_cwd = std::fs::canonicalize(cwd)
-                        .map_err(|_| "managed OpenCode cwd is unavailable")?;
-                    if !canonical_cwd.starts_with(&canonical_workspace) {
-                        return Err("managed OpenCode cwd escaped workspace".into());
+                        .ok_or("managed OpenCode workspace is unavailable")?,
+                    home,
+                )?)
+            } else {
+                None
+            };
+            if let Some(reference) = selected_source.as_ref() {
+                let workspace = opencode_input
+                    .workspace
+                    .ok_or("managed OpenCode workspace is unavailable")?;
+                stage_tui_source(reference, workspace, home, &ephemeral)?;
+                write_private_bytes(
+                    &ephemeral.join("tui-source.json"),
+                    &serde_json::to_vec(reference).map_err(|error| error.to_string())?,
+                )?;
+            } else if let Some(prior_stage) = prior_stage {
+                // Existing launch rows from before typed source references keep
+                // their previous staged selection until they are recreated.
+                for name in ["tui-config.json", "tui-config.jsonc"] {
+                    let source = prior_stage.join("ephemeral").join(name);
+                    if source.is_file() {
+                        copy_ephemeral_file(&source, &ephemeral.join(name))?;
                     }
-                    let path = std::fs::canonicalize(if selected.is_absolute() {
-                        selected.to_path_buf()
-                    } else {
-                        canonical_cwd.join(selected)
-                    })
-                    .map_err(|_| "managed OpenCode TUI config is unavailable")?;
-                    if !path.starts_with(&canonical_workspace) {
-                        return Err("managed OpenCode TUI config escaped workspace".into());
-                    }
-                    if !path.is_file() {
-                        return Err("managed OpenCode TUI config must be a file".into());
-                    }
-                    let name = if raw_path.to_ascii_lowercase().ends_with(".jsonc") {
-                        "tui-config.jsonc"
-                    } else {
-                        "tui-config.json"
-                    };
-                    copy_ephemeral_file(&path, &ephemeral.join(name))?;
                 }
             }
         }
@@ -648,6 +743,47 @@ fn stage_provider_root(
         let _ = std::fs::remove_dir_all(&temporary);
     }
     result
+}
+
+fn stage_tui_source(
+    reference: &ProviderConfigReference,
+    workspace: &Path,
+    home: &Path,
+    destination: &Path,
+) -> Result<(), String> {
+    if !matches!(
+        reference.root,
+        ProviderConfigRoot::Workspace | ProviderConfigRoot::UserProvider
+    ) || !matches!(reference.format.as_str(), "json" | "jsonc")
+        || reference.provider_relative_path
+            != format!(".freshell/opencode/user-tui.{}", reference.format)
+        || reference.relative_path.is_empty()
+        || reference.relative_path.len() > 512
+        || reference.relative_path.chars().any(char::is_control)
+        || reference
+            .relative_path
+            .split('/')
+            .any(|part| part.is_empty() || part == "." || part == "..")
+        || reference.relative_path.contains('\\')
+    {
+        return Err("managed OpenCode TUI source is unsafe".into());
+    }
+    let root = if reference.root == ProviderConfigRoot::Workspace {
+        workspace.to_path_buf()
+    } else {
+        home.join(".config/opencode")
+    };
+    let canonical_root = std::fs::canonicalize(root)
+        .map_err(|_| "managed OpenCode TUI source root is unavailable")?;
+    let selected = std::fs::canonicalize(canonical_root.join(&reference.relative_path))
+        .map_err(|_| "managed OpenCode TUI config is unavailable")?;
+    if !selected.starts_with(&canonical_root) || !selected.is_file() {
+        return Err("managed OpenCode TUI config escaped approved roots".into());
+    }
+    copy_ephemeral_file(
+        &selected,
+        &destination.join(format!("tui-config.{}", reference.format)),
+    )
 }
 
 fn write_private_bytes(path: &Path, bytes: &[u8]) -> Result<(), String> {
@@ -818,6 +954,8 @@ impl CapabilityStore {
         directory: &Path,
         endpoint: String,
         source: Option<(&str, &Path, &[ProviderConfigReference])>,
+        tui_source: Option<&ProviderConfigReference>,
+        workspace: Option<&Path>,
     ) -> Result<McpCapabilityReference, String> {
         let retained = recoverable_input_path(directory, &soul_id)?;
         let prior_stage = self
@@ -834,7 +972,11 @@ impl CapabilityStore {
             directory,
             endpoint,
             source,
-            OpencodeEphemeralInput::default(),
+            OpencodeEphemeralInput {
+                tui_source,
+                workspace,
+                ..Default::default()
+            },
             prior_stage.as_deref(),
         )?;
         let prior = self
@@ -1290,6 +1432,13 @@ mod tests {
         let tui = home.path().join("selected-tui.jsonc");
         std::fs::write(&tui, "{ // selected\n\"plugin\":[\"user-selected-tui\"]}").unwrap();
         let raw = r#"{"mcp":{"vendor":{"type":"local","command":["tool","--token","nested-secret-byte"]}}}"#;
+        let tui_source = approved_tui_source(
+            "./selected-tui.jsonc",
+            home.path(),
+            home.path(),
+            home.path(),
+        )
+        .unwrap();
         let store = CapabilityStore::default();
         let soul = SoulId::new();
         let first = store
@@ -1301,6 +1450,7 @@ mod tests {
                 OpencodeEphemeralInput {
                     inline_config: Some(raw),
                     tui_config_path: Some("./selected-tui.jsonc"),
+                    tui_source: Some(&tui_source),
                     cwd: Some(home.path()),
                     workspace: Some(home.path()),
                 },
@@ -1316,12 +1466,15 @@ mod tests {
             std::fs::read_to_string(first_stage.join("ephemeral/tui-config.jsonc")).unwrap(),
             "{ // selected\n\"plugin\":[\"user-selected-tui\"]}"
         );
+        std::fs::write(&tui, "{ // edited\n\"plugin\":[\"new-tui\"]}").unwrap();
         let second = store
             .issue_replacement(
                 soul,
                 &capabilities,
                 "http://host.docker.internal:4000".into(),
                 Some(("opencode", home.path(), &[])),
+                Some(&tui_source),
+                Some(home.path()),
             )
             .unwrap();
         let second_stage = staged_provider_root_path(&capabilities, &second.grant_id).unwrap();
@@ -1332,7 +1485,7 @@ mod tests {
         );
         assert_eq!(
             std::fs::read_to_string(second_stage.join("ephemeral/tui-config.jsonc")).unwrap(),
-            "{ // selected\n\"plugin\":[\"user-selected-tui\"]}"
+            "{ // edited\n\"plugin\":[\"new-tui\"]}"
         );
         assert!(!serde_json::to_string(&second)
             .unwrap()
@@ -1348,6 +1501,13 @@ mod tests {
         let tui = home.path().join("selected-tui.jsonc");
         std::fs::write(&tui, "{ // selected\n\"theme\":\"dark\" }").unwrap();
         let raw = r#"{"mcp":{"vendor":{"command":["tool","nested-secret-byte"]}}}"#;
+        let tui_source = approved_tui_source(
+            "./selected-tui.jsonc",
+            home.path(),
+            home.path(),
+            home.path(),
+        )
+        .unwrap();
         let soul = SoulId::new();
         let running = CapabilityStore::default();
         let first = running
@@ -1359,6 +1519,7 @@ mod tests {
                 OpencodeEphemeralInput {
                     inline_config: Some(raw),
                     tui_config_path: Some("./selected-tui.jsonc"),
+                    tui_source: Some(&tui_source),
                     cwd: Some(home.path()),
                     workspace: Some(home.path()),
                 },
@@ -1369,6 +1530,10 @@ mod tests {
         // the private inputs before revoking its scope and stage.
         let restarted = CapabilityStore::default();
         retain_recoverable_inputs(&capabilities, &soul, &first.grant_id).unwrap();
+        let retained = recoverable_input_path(&capabilities, &soul).unwrap();
+        assert!(retained.join("ephemeral/inline-config.json").is_file());
+        assert!(!retained.join("ephemeral/tui-config.jsonc").exists());
+        std::fs::write(&tui, "{ // edited\n\"theme\":\"light\" }").unwrap();
         restarted.revoke(&first.grant_id, &capabilities).unwrap();
         let second = restarted
             .issue_replacement(
@@ -1376,6 +1541,8 @@ mod tests {
                 &capabilities,
                 "http://host.docker.internal:4000".into(),
                 Some(("opencode", home.path(), &[])),
+                Some(&tui_source),
+                Some(home.path()),
             )
             .unwrap();
         let stage = staged_provider_root_path(&capabilities, &second.grant_id).unwrap();
@@ -1385,7 +1552,7 @@ mod tests {
         );
         assert_eq!(
             std::fs::read_to_string(stage.join("ephemeral/tui-config.jsonc")).unwrap(),
-            "{ // selected\n\"theme\":\"dark\" }"
+            "{ // edited\n\"theme\":\"light\" }"
         );
         assert!(!grant_path(&capabilities, &first.grant_id).unwrap().exists());
         assert!(!staged_provider_root_path(&capabilities, &first.grant_id)
@@ -1454,8 +1621,82 @@ mod tests {
                 },
                 None,
             );
-            assert!(result.unwrap_err().contains("escaped workspace"));
+            assert!(result.unwrap_err().contains("escaped approved roots"));
         }
+    }
+
+    #[test]
+    fn opencode_provider_home_tui_source_is_approved_and_reread_safely() {
+        let control = tempfile::tempdir().unwrap();
+        let capabilities = control.path().join("mcp-capabilities");
+        std::fs::create_dir(&capabilities).unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let provider_root = home.path().join(".config/opencode");
+        std::fs::create_dir_all(&provider_root).unwrap();
+        let tui = provider_root.join("tui.jsonc");
+        std::fs::write(&tui, "{ // home\n\"theme\":\"dark\" }").unwrap();
+        let source = approved_tui_source(
+            tui.to_str().unwrap(),
+            workspace.path(),
+            workspace.path(),
+            home.path(),
+        )
+        .unwrap();
+        assert_eq!(source.root, ProviderConfigRoot::UserProvider);
+        assert_eq!(source.relative_path, "tui.jsonc");
+        let store = CapabilityStore::default();
+        let soul = SoulId::new();
+        let first = store
+            .issue(
+                soul.clone(),
+                &capabilities,
+                "http://host.docker.internal:4000".into(),
+                Some(("opencode", home.path(), &[])),
+                OpencodeEphemeralInput {
+                    tui_source: Some(&source),
+                    workspace: Some(workspace.path()),
+                    ..Default::default()
+                },
+                None,
+            )
+            .unwrap();
+        let first_stage = staged_provider_root_path(&capabilities, &first.grant_id).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(first_stage.join("ephemeral/tui-config.jsonc")).unwrap(),
+            "{ // home\n\"theme\":\"dark\" }"
+        );
+        std::fs::write(&tui, "{ // home edited\n\"theme\":\"light\" }").unwrap();
+        let second = store
+            .issue_replacement(
+                soul,
+                &capabilities,
+                "http://host.docker.internal:4000".into(),
+                Some(("opencode", home.path(), &[])),
+                Some(&source),
+                Some(workspace.path()),
+            )
+            .unwrap();
+        let second_stage = staged_provider_root_path(&capabilities, &second.grant_id).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(second_stage.join("ephemeral/tui-config.jsonc")).unwrap(),
+            "{ // home edited\n\"theme\":\"light\" }"
+        );
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("tui.jsonc"), "{}").unwrap();
+        std::fs::remove_file(&tui).unwrap();
+        std::os::unix::fs::symlink(outside.path().join("tui.jsonc"), &tui).unwrap();
+        assert!(store
+            .issue_replacement(
+                SoulId::new(),
+                &capabilities,
+                "http://host.docker.internal:4000".into(),
+                Some(("opencode", home.path(), &[])),
+                Some(&source),
+                Some(workspace.path()),
+            )
+            .unwrap_err()
+            .contains("escaped approved roots"));
     }
 
     #[test]

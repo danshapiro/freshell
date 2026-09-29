@@ -180,6 +180,22 @@ impl ManagedTerminalController for ServerManagedRuntimeController {
             };
             let args = managed_provider_args(&request.mode, request.spec.args)?;
             let request_id = stable_request_id(create_key)?;
+            let tui_source = if request.mode == "opencode" {
+                request
+                    .env
+                    .get("OPENCODE_TUI_CONFIG")
+                    .map(|raw| {
+                        let home = std::env::var_os("HOME")
+                            .map(std::path::PathBuf::from)
+                            .ok_or("managed provider HOME is unavailable")?;
+                        crate::managed_mcp_capability::approved_tui_source(
+                            raw, &cwd, &workspace, &home,
+                        )
+                    })
+                    .transpose()?
+            } else {
+                None
+            };
             let opencode_input = if request.mode == "opencode" {
                 crate::managed_mcp_capability::OpencodeEphemeralInput {
                     inline_config: request
@@ -187,6 +203,7 @@ impl ManagedTerminalController for ServerManagedRuntimeController {
                         .get("OPENCODE_CONFIG_CONTENT")
                         .map(String::as_str),
                     tui_config_path: request.env.get("OPENCODE_TUI_CONFIG").map(String::as_str),
+                    tui_source: tui_source.as_ref(),
                     cwd: Some(&cwd),
                     workspace: Some(&workspace),
                 }
@@ -215,6 +232,7 @@ impl ManagedTerminalController for ServerManagedRuntimeController {
                 if let freshell_runtime_protocol::ProviderPreparation::Opencode {
                     inline_config,
                     tui_config,
+                    tui_source: context_tui_source,
                     ..
                 } = &mut context.preparation
                 {
@@ -239,6 +257,7 @@ impl ManagedTerminalController for ServerManagedRuntimeController {
                             .into(),
                             format: if jsonc { "jsonc" } else { "json" }.into(),
                         });
+                        *context_tui_source = tui_source.clone();
                     }
                 }
             }
