@@ -167,6 +167,7 @@ pub enum RecoveryTrigger {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum RecoveryBlockReason {
+    CapabilityPending,
     CredentialsExpired,
     RateLimited,
     ProviderUnavailable,
@@ -1010,6 +1011,8 @@ pub struct McpCapabilityReference {
     pub grant_id: String,
     pub endpoint: String,
     pub provider_relative_path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_gateway_address: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1050,7 +1053,8 @@ impl ProviderLaunchContext {
                         ([flag, path], Some(capability))
                             if flag == "--mcp-config"
                                 && path == ".claude/freshell-mcp.json"
-                                && path == &capability.provider_relative_path
+                                && (capability.provider_relative_path == ".freshell/mcp-capability.json"
+                                    || path == &capability.provider_relative_path)
                     )
                 {
                     return Err(invalid());
@@ -1060,7 +1064,20 @@ impl ProviderLaunchContext {
                 tui_args,
                 sidecar_args,
             } => {
-                if !tui_args.is_empty() || !sidecar_args.is_empty() {
+                let valid_recipe = |args: &[String]| {
+                    args.len() == 6
+                        && args[0] == "-c"
+                        && args[1] == "mcp_servers.freshell.command=\"node\""
+                        && args[2] == "-c"
+                        && args[3] == "mcp_servers.freshell.args=[\"/opt/freshell-mcp/server.js\"]"
+                        && args[4] == "-c"
+                        && args[5] == "mcp_servers.freshell.env_vars=[\"FRESHELL\", \"FRESHELL_URL\", \"FRESHELL_TOKEN\", \"FRESHELL_TERMINAL_ID\", \"FRESHELL_TAB_ID\", \"FRESHELL_PANE_ID\"]"
+                };
+                if (!tui_args.is_empty() || !sidecar_args.is_empty())
+                    && (self.mcp_capability.is_none()
+                        || !valid_recipe(tui_args)
+                        || !valid_recipe(sidecar_args))
+                {
                     return Err(invalid());
                 }
             }
@@ -1118,6 +1135,14 @@ impl ProviderLaunchContext {
                 || capability.endpoint.starts_with("https://localhost")
                 || capability.endpoint.starts_with("http://[::1]")
                 || capability.endpoint.starts_with("https://[::1]")
+                || capability
+                    .host_gateway_address
+                    .as_ref()
+                    .is_some_and(|address| {
+                        address.parse::<std::net::Ipv4Addr>().map_or(true, |ip| {
+                            ip.is_loopback() || ip.is_unspecified() || ip.is_multicast()
+                        })
+                    })
             {
                 return Err(invalid());
             }
@@ -1189,6 +1214,7 @@ mod provider_launch_context_tests {
                 grant_id: "grant-opaque-reference".into(),
                 endpoint: "http://host.docker.internal:3001/api/mcp".into(),
                 provider_relative_path: ".claude/freshell-mcp.json".into(),
+                host_gateway_address: Some("192.168.3.150".into()),
             }),
             config: vec![ProviderConfigReference {
                 root: ProviderConfigRoot::UserProvider,
@@ -1204,6 +1230,44 @@ mod provider_launch_context_tests {
             serde_json::from_str::<ProviderLaunchContext>(&encoded).unwrap(),
             context
         );
+    }
+
+    #[test]
+    fn managed_codex_replaces_web_owned_mcp_args_with_soul_recipe() {
+        let args = vec![
+            "-c".into(),
+            "tui.notification_method=bel".into(),
+            "-c".into(),
+            "mcp_servers.freshell.command=\"node\"".into(),
+            "-c".into(),
+            "mcp_servers.freshell.args=[\"/web/tools/server.ts\"]".into(),
+            "-c".into(),
+            "mcp_servers.freshell.env_vars=[\"FRESHELL\"]".into(),
+            "--model".into(),
+            "gpt-5.6-luna".into(),
+        ];
+        assert_eq!(
+            durable_managed_terminal_args("codex", args, None).unwrap(),
+            vec![
+                "-c",
+                "tui.notification_method=bel",
+                "--model",
+                "gpt-5.6-luna"
+            ]
+        );
+    }
+
+    #[test]
+    fn managed_codex_accepts_only_the_packaged_mcp_recipe_after_preparation() {
+        let args = vec![
+            "-c".into(), "mcp_servers.freshell.command=\"node\"".into(),
+            "-c".into(), "mcp_servers.freshell.args=[\"/opt/freshell-mcp/server.js\"]".into(),
+            "-c".into(), "mcp_servers.freshell.env_vars=[\"FRESHELL\", \"FRESHELL_URL\", \"FRESHELL_TOKEN\", \"FRESHELL_TERMINAL_ID\", \"FRESHELL_TAB_ID\", \"FRESHELL_PANE_ID\"]".into(),
+        ];
+        assert!(validate_managed_terminal_args("codex", &args).is_ok());
+        let mut unsafe_args = args;
+        unsafe_args[3] = "mcp_servers.freshell.args=[\"/tmp/other.js\"]".into();
+        assert!(validate_managed_terminal_args("codex", &unsafe_args).is_err());
     }
 
     #[test]
@@ -1236,7 +1300,16 @@ mod provider_launch_context_tests {
             grant_id: "grant-local-control".into(),
             endpoint: "http://127.0.0.1:10254/api/mcp".into(),
             provider_relative_path: ".claude/mcp.json".into(),
+            host_gateway_address: None,
         });
+        assert!(context.validate("claude").is_err());
+        context.mcp_capability.as_mut().unwrap().endpoint =
+            "http://host.docker.internal:3001/api/mcp".into();
+        context
+            .mcp_capability
+            .as_mut()
+            .unwrap()
+            .host_gateway_address = Some("127.0.0.1".into());
         assert!(context.validate("claude").is_err());
     }
 
@@ -1273,6 +1346,7 @@ mod provider_launch_context_tests {
             grant_id: "grant-test".into(),
             endpoint: "http://host.docker.internal:3001/api/mcp".into(),
             provider_relative_path: "fixture-secret-bytes".into(),
+            host_gateway_address: None,
         });
         assert!(launch.validate().is_err());
     }
@@ -1742,12 +1816,16 @@ pub fn validate_managed_terminal_args(mode: &str, args: &[String]) -> Result<(),
             ),
             ("claude", "--session-id" | "--resume") => safe_selector(value),
             ("claude", "--model" | "--effort" | "--permission-mode") => safe_selector(value),
+            ("claude", "--plugin-dir") => safe_selector(value),
             ("codex", "-c") => {
                 matches!(
                     value.as_str(),
                     "tui.notification_method=bel"
                         | "tui.notifications=['agent-turn-complete']"
                         | "features.apps=false"
+                        | "mcp_servers.freshell.command=\"node\""
+                        | "mcp_servers.freshell.args=[\"/opt/freshell-mcp/server.js\"]"
+                        | "mcp_servers.freshell.env_vars=[\"FRESHELL\", \"FRESHELL_URL\", \"FRESHELL_TOKEN\", \"FRESHELL_TERMINAL_ID\", \"FRESHELL_TAB_ID\", \"FRESHELL_PANE_ID\"]"
                 ) || value
                     .strip_prefix("model_reasoning_effort=\"")
                     .and_then(|part| part.strip_suffix('"'))
@@ -1760,6 +1838,7 @@ pub fn validate_managed_terminal_args(mode: &str, args: &[String]) -> Result<(),
             ("opencode", "--hostname") => value == "127.0.0.1",
             ("opencode", "--port") => value.parse::<u16>().is_ok(),
             ("opencode", "--session" | "--model") => safe_selector(value),
+            ("amplifier", "--bundle" | "--provider" | "--model" | "--mode") => safe_selector(value),
             _ => false,
         };
         if !allowed {
@@ -1778,6 +1857,32 @@ pub fn durable_managed_terminal_args(
     args: Vec<String>,
     claude_settings: Option<&str>,
 ) -> Result<Vec<String>, RuntimeError> {
+    if mode == "codex" {
+        let mut out = Vec::with_capacity(args.len());
+        let mut index = 0;
+        while index < args.len() {
+            if args[index] == "-c" {
+                let value = args.get(index + 1).ok_or_else(|| {
+                    RuntimeError::new(
+                        RuntimeErrorCode::InvalidRequest,
+                        "incomplete Codex config argument",
+                    )
+                })?;
+                if value
+                    .strip_prefix("mcp_servers.freshell.")
+                    .and_then(|value| value.split_once('='))
+                    .is_some_and(|(key, _)| matches!(key, "command" | "args" | "env_vars"))
+                {
+                    index += 2;
+                    continue;
+                }
+            }
+            out.push(args[index].clone());
+            index += 1;
+        }
+        validate_managed_terminal_args(mode, &out)?;
+        return Ok(out);
+    }
     if mode != "claude" {
         validate_managed_terminal_args(mode, &args)?;
         return Ok(args);
@@ -2741,6 +2846,15 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn claude_provider_native_plugin_argument_survives_durable_recipe() {
+        let args = vec!["--plugin-dir".into(), "/workspace/claude-plugin".into()];
+        assert_eq!(
+            durable_managed_terminal_args("claude", args.clone(), None).unwrap(),
+            args
+        );
     }
 
     #[test]

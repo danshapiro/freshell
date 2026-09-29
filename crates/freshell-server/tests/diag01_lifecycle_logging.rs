@@ -121,6 +121,7 @@ async fn boot_server(server_binary: &std::path::Path, home: &std::path::Path) ->
         .env("PORT", port.to_string())
         .env("AUTH_TOKEN", AUTH_TOKEN)
         .env("FRESHELL_BIND_HOST", "127.0.0.1")
+        .env_remove("FRESHELL_MANAGED_RUNTIME_V1")
         .env("FRESHELL_HOME", home)
         .env("HOME", home)
         .env("CODEX_CMD", format!("node {}", fake_codex_app_server_cmd()))

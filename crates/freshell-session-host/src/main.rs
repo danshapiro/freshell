@@ -124,6 +124,7 @@ async fn run() -> Result<(), String> {
         Some("opencode-identity-worker") => pty::run_opencode_identity_worker(&args[2..]),
         Some("provider-probe-worker") => providers::run_probe_worker(&args[2..]),
         Some("refresh-provider-config") => refresh_provider_config_worker(&args[2..]),
+        Some("prepare-provider-features") => providers::run_provider_features_worker(&args[2..]),
         _ => Err("usage: freshell-session-host <serve|worker|fixture-child|fresh-agent-fixture-worker|opencode-identity-worker|provider-probe-worker|refresh-provider-config> ...".into()),
     }
 }
@@ -881,7 +882,7 @@ async fn grant_execution(
                 &state.state_dir,
                 state.incarnation_id.clone(),
                 &terminal,
-                resolved_secrets.environment,
+                prepared.child_env,
                 prepared.codex,
             )
             .await
@@ -1390,9 +1391,6 @@ fn refresh_provider_config_references(
     run_as_gid: u32,
 ) -> Result<(), String> {
     context.validate(provider).map_err(|error| error.message)?;
-    if provider_config_references(context).is_empty() {
-        return Ok(());
-    }
     let stage = tempfile::tempdir().map_err(|error| error.to_string())?;
     let projection = stage.path().join("projection");
     std::fs::create_dir(&projection).map_err(|error| error.to_string())?;

@@ -3037,6 +3037,7 @@ mod tests {
                     grant_id: "grant-registry-reference".into(),
                     endpoint: "http://host.docker.internal:3001/api/mcp".into(),
                     provider_relative_path: ".amplifier/freshell-mcp.json".into(),
+                    host_gateway_address: None,
                 }),
                 config: Vec::new(),
             }),

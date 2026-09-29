@@ -109,9 +109,61 @@ pub fn check_auth(provided: Option<&str>, expected: &str) -> bool {
     }
 }
 
+/// A managed MCP bearer is usable only after it is bound to one soul
+/// incarnation and while that incarnation's grant is live.
+pub fn check_scoped_auth(
+    provided: Option<&str>,
+    expected_scope: &str,
+    soul_id: &str,
+    incarnation_id: Option<&str>,
+    expires_at: u64,
+    now: u64,
+) -> bool {
+    !soul_id.is_empty()
+        && incarnation_id.is_some_and(|id| !id.is_empty())
+        && now < expires_at
+        && check_auth(provided, expected_scope)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn scoped_auth_requires_bound_live_incarnation() {
+        assert!(check_scoped_auth(
+            Some("scope"),
+            "scope",
+            "soul-1",
+            Some("inc-1"),
+            11,
+            10
+        ));
+        assert!(!check_scoped_auth(
+            Some("scope"),
+            "scope",
+            "soul-1",
+            None,
+            11,
+            10
+        ));
+        assert!(!check_scoped_auth(
+            Some("scope"),
+            "scope",
+            "soul-1",
+            Some("inc-1"),
+            10,
+            10
+        ));
+        assert!(!check_scoped_auth(
+            Some("other"),
+            "scope",
+            "soul-1",
+            Some("inc-1"),
+            11,
+            10
+        ));
+    }
 
     #[test]
     fn check_auth_is_constant_time_and_rejects_absent() {

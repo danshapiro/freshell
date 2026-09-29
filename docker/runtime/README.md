@@ -39,28 +39,35 @@ the supervisor so Docker can bind each incarnation's control directory and
 each fresh-agent soul's protected actor journal into its dynamic container.
 Keep this directory across supervisor restarts and incarnation replacement.
 
-Provider credentials are never placed in the persisted terminal environment.
-For managed Claude, `FRESHELL_MANAGED_CLAUDE_CREDENTIAL_FILE` may point at one
-canonical `.credentials.json` file; the supervisor records only that path,
-Docker mounts only that file read-only, and the session host copies it into the
-soul-owned provider volume with mode `0600`. Phase 2 strips the legacy web-bound
-Freshell MCP config from managed Claude; Phase 3 supplies the durable tool router.
+The image includes the same Freshell MCP tool as an ordinary terminal at
+`/opt/freshell-mcp/server.js`. It is built from this checkout and deployed with
+the frozen workspace lock, so a managed provider can launch it without a web
+server worktree mount. Check the image with
+`pnpm exec tsx scripts/testing/probe-managed-mcp-image.ts --image <image>`;
+the probe calls `tools/list` and `tools/call` through a fake local endpoint.
+The controller supplies each incarnation's scoped MCP grant in the
+provider environment. Provider MCP configuration, including user entries,
+keeps its ordinary semantics.
 
-When web/supervisor are themselves containers, an enabled Claude credential
-reference must be mounted read-only into both controller containers at that
-same canonical host path. `compose.yaml` carries this exact-file mount; it
-never mounts the containing `.claude` directory or host home.
+Provider credentials and MCP capability bytes are never placed in durable
+launch records or terminal environment snapshots. Managed providers obtain
+secrets through child-only OneCLI grants; the live MCP capability belongs to
+the current incarnation and is recreated on replacement. Kilroy retains its
+separate legacy credential bootstrap.
 
 ## Real-provider acceptance order
 
-OpenCode is the first real-provider Phase 2 acceptance lane. The live gate pins OpenCode 1.18.21 and uses `openai/gpt-5.6-luna` with the configured OpenAI OAuth credential. The receipt reads the actual provider and model from OpenCode's native session database and fails if they differ; it does not silently fall back. Managed config forces `snapshot:false` and `autoupdate:false`, so the tested CLI cannot silently replace itself during a gate. A Claude binary being present in this image does not make Claude the first acceptance dependency; it is retained for later provider coverage. Managed OpenCode is one provider runtime per soul rather than the legacy shared serve process.
+OpenCode is the first real-provider Phase 2 acceptance lane. The live gate pins OpenCode 1.18.21 and uses `openai/gpt-5.6-luna` with the configured OpenAI OAuth credential. The receipt reads the actual provider and model from OpenCode's native session database and fails if they differ; it does not silently fall back. Managed OpenCode is one provider runtime per soul rather than the legacy shared serve process. Its ordinary JSON, JSONC, plugin, and TUI rebind configuration is retained.
 
-P2-G04 runs its web server with an isolated home directory, so set
-`FRESHELL_MANAGED_OPENCODE_AUTH_FILE` to the existing host `auth.json` path
-before running the browser gate. The test passes that path explicitly to the
-managed-runtime credential bootstrap, checks the copied credential and model
-catalog before prompting, and fails early if the reference is absent. It never
-prints credential contents.
+P2-G04 runs its web server with an isolated home directory. Configure a private
+OneCLI grant through `FRESHELL_MANAGED_OPENCODE_ONECLI_ENV_FILE` or
+`FRESHELL_MANAGED_OPENCODE_ONECLI_AUTH_FILE` before the browser gate. The
+session host resolves the grant only for the provider child.
+
+Amplifier launches the ordinary configured CLI and bundle. The image carries
+the generic Amplifier app and a pinned vLLM module for existing profiles; it
+does not force that provider, model, or a particular OneCLI profile. Amplifier's
+bundle resolver selects any additional modules named by the ordinary bundle.
 
 OpenCode's TUI JITs a small native render library. Global `/tmp` remains bounded and `noexec`; only managed OpenCode gets a separate bounded 64 MiB `rw,exec,nosuid,nodev` tmpfs at `/run/opencode-tmp`, exposed through `TMPDIR`. Its loopback serve endpoint is fixed at `127.0.0.1:4096` inside the soul-private network namespace, so no web-host port allocator is involved.
 

@@ -571,6 +571,98 @@ impl Supervisor {
         } else {
             start.context.terminal.clone()
         };
+        let mut replacement_terminal = replacement_terminal;
+        if replacement_terminal.as_ref().is_some_and(|terminal| {
+            matches!(
+                terminal.mode.as_str(),
+                "claude" | "codex" | "opencode" | "amplifier"
+            ) && terminal
+                .provider_launch_context
+                .as_ref()
+                .and_then(|context| context.mcp_capability.as_ref())
+                .is_none()
+        }) {
+            let reason = RecoveryBlockReason::CapabilityPending;
+            self.registry
+                .mark_recovery_blocked(
+                    soul_id.clone(),
+                    Some(attempt_id.clone()),
+                    reason,
+                    vec!["managed MCP capability must be reissued before replacement".into()],
+                )
+                .await
+                .map_err(map_registry)?;
+            return Ok(RecoveryResult {
+                outcome: RecoveryOutcome::Blocked,
+                view: self.view_for(&prior_incarnation_id).await?,
+                probe: Some(blocked(
+                    path,
+                    reason,
+                    "managed MCP capability must be reissued before replacement",
+                    Some(2_000),
+                )),
+                prior_incarnation_id: Some(prior_incarnation_id),
+                attempt_id: Some(attempt_id),
+                expected_native_session_id: resume_spec
+                    .as_ref()
+                    .map(|spec| spec.provider_session.native_session_id.clone()),
+                observed_native_session_id: None,
+                incident_id: None,
+            });
+        }
+        if let Some(terminal) = replacement_terminal.as_mut() {
+            if terminal
+                .provider_launch_context
+                .as_ref()
+                .and_then(|context| context.mcp_capability.as_ref())
+                .is_some()
+            {
+                let refreshed_capability = self
+                    .issue_replacement_mcp_capability(&soul_id, &terminal.mode)
+                    .await
+                    .and_then(|reference| {
+                        crate::backend::docker::staged_provider_root_for_grant(
+                            &reference.grant_id,
+                        )
+                        .map(|staged_root| (reference, staged_root))
+                        .map_err(|error| {
+                            RuntimeError::new(
+                                    RuntimeErrorCode::HostUnreachable,
+                                    format!("capability_pending: staged provider root unavailable: {error}"),
+                                )
+                        })
+                    });
+                let (reference, staged_root) = match refreshed_capability {
+                    Ok(refreshed) => refreshed,
+                    Err(error) => {
+                        let reason = RecoveryBlockReason::CapabilityPending;
+                        self.registry
+                            .mark_recovery_blocked(
+                                soul_id.clone(),
+                                Some(attempt_id.clone()),
+                                reason,
+                                vec![error.message.clone()],
+                            )
+                            .await
+                            .map_err(map_registry)?;
+                        return Ok(RecoveryResult {
+                            outcome: RecoveryOutcome::Blocked,
+                            view: self.view_for(&prior_incarnation_id).await?,
+                            probe: Some(blocked(path, reason, &error.message, Some(2_000))),
+                            prior_incarnation_id: Some(prior_incarnation_id),
+                            attempt_id: Some(attempt_id),
+                            expected_native_session_id: resume_spec
+                                .as_ref()
+                                .map(|spec| spec.provider_session.native_session_id.clone()),
+                            observed_native_session_id: None,
+                            incident_id: None,
+                        });
+                    }
+                };
+                replace_terminal_mcp_reference(terminal, reference);
+                refresh_terminal_provider_config(terminal, &staged_root);
+            }
+        }
         let prepared = match self
             .registry
             .prepare_replacement(
@@ -623,7 +715,11 @@ impl Supervisor {
         match launch {
             Ok(_) => {}
             Err(error) => {
-                let reason = classify_provider_failure(&error.message);
+                let reason = if error.message.starts_with("capability_pending:") {
+                    RecoveryBlockReason::CapabilityPending
+                } else {
+                    classify_provider_failure(&error.message)
+                };
                 crate::service::append_event(
                     &self.config.lifecycle_log,
                     "supervisor.recovery.activation_failed",
@@ -1951,6 +2047,139 @@ fn terminal_without_first_boot_state(
     })
 }
 
+fn refresh_terminal_provider_config(
+    terminal: &mut TerminalLaunchSpec,
+    user_root: &std::path::Path,
+) {
+    let Some(context) = terminal.provider_launch_context.as_mut() else {
+        return;
+    };
+    refresh_provider_context_from_user_root(
+        context,
+        &terminal.mode,
+        std::path::Path::new(&terminal.workspace_path),
+        user_root,
+    );
+}
+
+fn replace_terminal_mcp_reference(
+    terminal: &mut TerminalLaunchSpec,
+    reference: freshell_runtime_protocol::McpCapabilityReference,
+) {
+    if let Some(context) = terminal.provider_launch_context.as_mut() {
+        context.mcp_capability = Some(reference);
+    }
+}
+
+fn refresh_provider_context_from_user_root(
+    context: &mut freshell_runtime_protocol::ProviderLaunchContext,
+    provider: &str,
+    workspace: &std::path::Path,
+    user_root: &std::path::Path,
+) {
+    use freshell_runtime_protocol::{
+        ProviderConfigReference, ProviderConfigRoot, ProviderPreparation,
+    };
+    let (provider_dir, directories): (&str, &[&str]) = match provider {
+        "claude" => (
+            ".claude",
+            &["plugins", "skills", "commands", "hooks", "agents"],
+        ),
+        "codex" => (".codex", &["skills", "rules"]),
+        "opencode" => (
+            ".config/opencode",
+            &["plugins", "agents", "commands", "skills"],
+        ),
+        "amplifier" => (".amplifier", &["bundles", "skills", "agents"]),
+        _ => return,
+    };
+    let mut config = Vec::new();
+    if let Ok(canonical_root) = std::fs::canonicalize(user_root) {
+        if let Ok(entries) = std::fs::read_dir(&canonical_root) {
+            for entry in entries.flatten() {
+                let name = entry.file_name();
+                let Some(name) = name.to_str() else { continue };
+                let Some(source) = safe_provider_config_source(&canonical_root, &entry.path())
+                else {
+                    continue;
+                };
+                let format = if source.is_dir() {
+                    if !directories.contains(&name) {
+                        continue;
+                    }
+                    "directory"
+                } else if source.is_file() {
+                    match source.extension().and_then(|ext| ext.to_str()) {
+                        Some("json") => "json",
+                        Some("jsonc") => "jsonc",
+                        Some("toml") => "toml",
+                        Some("yaml" | "yml") => "yaml",
+                        Some("md") => "text",
+                        _ => continue,
+                    }
+                } else {
+                    continue;
+                };
+                if matches!(
+                    name.to_ascii_lowercase().as_str(),
+                    "auth.json" | ".credentials.json" | "keys.env" | ".env" | "token.json"
+                ) {
+                    continue;
+                }
+                config.push(ProviderConfigReference {
+                    root: ProviderConfigRoot::UserProvider,
+                    relative_path: name.to_string(),
+                    provider_relative_path: format!("{provider_dir}/{name}"),
+                    format: format.into(),
+                });
+            }
+        }
+    }
+    config.sort_by(|left, right| {
+        left.provider_relative_path
+            .cmp(&right.provider_relative_path)
+    });
+    context.config = config;
+
+    if let ProviderPreparation::Opencode { project_config, .. } = &mut context.preparation {
+        project_config.clear();
+        let Ok(canonical_workspace) = std::fs::canonicalize(workspace) else {
+            return;
+        };
+        for name in [
+            "opencode.json",
+            "opencode.jsonc",
+            ".opencode/opencode.json",
+            ".opencode/opencode.jsonc",
+        ] {
+            let candidate = workspace.join(name);
+            if safe_provider_config_source(&canonical_workspace, &candidate)
+                .is_some_and(|path| path.is_file())
+            {
+                project_config.push(ProviderConfigReference {
+                    root: ProviderConfigRoot::Workspace,
+                    relative_path: name.into(),
+                    provider_relative_path: format!(".config/opencode/project/{name}"),
+                    format: if name.ends_with(".jsonc") {
+                        "jsonc"
+                    } else {
+                        "json"
+                    }
+                    .into(),
+                });
+            }
+        }
+    }
+}
+
+fn safe_provider_config_source(
+    root: &std::path::Path,
+    candidate: &std::path::Path,
+) -> Option<std::path::PathBuf> {
+    let canonical = std::fs::canonicalize(candidate).ok()?;
+    canonical.starts_with(root).then_some(canonical)
+}
+
 fn fresh_without_raw_bootstrap(
     agent: Option<freshell_runtime_protocol::FreshAgentLaunchSpec>,
 ) -> Option<freshell_runtime_protocol::FreshAgentLaunchSpec> {
@@ -2137,5 +2366,88 @@ mod tests {
         assert_eq!(replacement.terminal_id, terminal.terminal_id);
         assert_eq!(replacement.program, terminal.program);
         assert_eq!(replacement.args, terminal.args);
+
+        let mut replacement = replacement;
+        replacement.provider_launch_context =
+            Some(freshell_runtime_protocol::ProviderLaunchContext {
+                preparation: freshell_runtime_protocol::ProviderPreparation::Opencode {
+                    project_config: Vec::new(),
+                    tui_config: None,
+                },
+                mcp_capability: Some(freshell_runtime_protocol::McpCapabilityReference {
+                    grant_id: "grant-prior".into(),
+                    endpoint: "http://host.docker.internal:3001".into(),
+                    provider_relative_path: ".freshell/mcp-capability.json".into(),
+                    host_gateway_address: None,
+                }),
+                config: Vec::new(),
+            });
+        replace_terminal_mcp_reference(
+            &mut replacement,
+            freshell_runtime_protocol::McpCapabilityReference {
+                grant_id: "grant-new".into(),
+                endpoint: "http://host.docker.internal:4001".into(),
+                provider_relative_path: ".freshell/mcp-capability.json".into(),
+                host_gateway_address: None,
+            },
+        );
+        let reference = replacement
+            .provider_launch_context
+            .unwrap()
+            .mcp_capability
+            .unwrap();
+        assert_eq!(reference.grant_id, "grant-new");
+        assert_eq!(reference.endpoint, "http://host.docker.internal:4001");
+    }
+
+    #[test]
+    fn recovery_refreshes_new_provider_config_selectors() {
+        use freshell_runtime_protocol::{ProviderLaunchContext, ProviderPreparation};
+        let workspace = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let user_root = home.path().join(".config/opencode");
+        std::fs::create_dir_all(&user_root).unwrap();
+        std::fs::write(user_root.join("old.jsonc"), "{}").unwrap();
+        let mut context = ProviderLaunchContext {
+            preparation: ProviderPreparation::Opencode {
+                project_config: vec![],
+                tui_config: None,
+            },
+            mcp_capability: None,
+            config: vec![],
+        };
+        refresh_provider_context_from_user_root(
+            &mut context,
+            "opencode",
+            workspace.path(),
+            &user_root,
+        );
+        assert!(context
+            .config
+            .iter()
+            .any(|reference| reference.relative_path == "old.jsonc"));
+        std::fs::remove_file(user_root.join("old.jsonc")).unwrap();
+        std::fs::write(user_root.join("new-provider.jsonc"), "{}").unwrap();
+        std::fs::write(workspace.path().join("opencode.jsonc"), "{}").unwrap();
+        refresh_provider_context_from_user_root(
+            &mut context,
+            "opencode",
+            workspace.path(),
+            &user_root,
+        );
+        assert!(!context
+            .config
+            .iter()
+            .any(|reference| reference.relative_path == "old.jsonc"));
+        assert!(context
+            .config
+            .iter()
+            .any(|reference| reference.relative_path == "new-provider.jsonc"));
+        let ProviderPreparation::Opencode { project_config, .. } = &context.preparation else {
+            panic!("wrong provider")
+        };
+        assert!(project_config
+            .iter()
+            .any(|reference| reference.relative_path == "opencode.jsonc"));
     }
 }

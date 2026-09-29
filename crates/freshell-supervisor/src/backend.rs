@@ -162,7 +162,7 @@ impl DockerEngineBackend {
         }
     }
 
-    async fn daemon_id(&self) -> Result<DockerDaemonId, BackendError> {
+    async fn daemon_info(&self) -> Result<(DockerDaemonId, bool), BackendError> {
         let response = self
             .request("GET", &format!("{DOCKER_API}/info"), None)
             .await?;
@@ -175,7 +175,21 @@ impl DockerEngineBackend {
             .get("ID")
             .and_then(Value::as_str)
             .ok_or_else(|| BackendError::Malformed("docker /info returned no ID".into()))?;
-        DockerDaemonId::parse(id.to_owned()).map_err(|e| BackendError::Malformed(e.to_string()))
+        let id = DockerDaemonId::parse(id.to_owned())
+            .map_err(|e| BackendError::Malformed(e.to_string()))?;
+        let rootless = value
+            .get("SecurityOptions")
+            .and_then(Value::as_array)
+            .is_some_and(|options| {
+                options
+                    .iter()
+                    .any(|option| option.as_str() == Some("name=rootless"))
+            });
+        Ok((id, rootless))
+    }
+
+    async fn daemon_id(&self) -> Result<DockerDaemonId, BackendError> {
+        self.daemon_info().await.map(|(id, _)| id)
     }
 
     async fn inspect_value(&self, container_id: &str) -> Result<Option<Value>, BackendError> {
@@ -274,11 +288,16 @@ fn docker_create_body(
     spec: &CreateRuntimeSpec,
     binds: Vec<String>,
     host_env: Vec<String>,
-    cap_add: Vec<&str>,
+    extra_hosts: Vec<String>,
     runtime_tmpfs_config: BTreeMap<String, String>,
     requested_limits: String,
     memory_swap: u64,
 ) -> Value {
+    let cap_add: Vec<&str> = if spec.terminal.is_some() || spec.fresh_agent.is_some() {
+        vec!["CHOWN", "SETGID", "SETUID"]
+    } else {
+        Vec::new()
+    };
     json!({
         "Image": spec.image_ref,
         "Env": host_env,
@@ -301,6 +320,7 @@ fn docker_create_body(
         "HostConfig": {
             "AutoRemove": false,
             "NetworkMode": if spec.terminal.is_some() || spec.fresh_agent.is_some() { "bridge" } else { "none" },
+            "ExtraHosts": extra_hosts,
             "PidMode": "",
             "ReadonlyRootfs": true,
             "Privileged": false,
@@ -316,6 +336,39 @@ fn docker_create_body(
             "Tmpfs": runtime_tmpfs_config
         }
     })
+}
+
+fn workload_mcp_capability<'a>(
+    terminal: Option<&'a TerminalLaunchSpec>,
+    fresh_agent: Option<&'a FreshAgentLaunchSpec>,
+) -> Option<&'a freshell_runtime_protocol::McpCapabilityReference> {
+    terminal
+        .and_then(|terminal| terminal.provider_launch_context.as_ref())
+        .and_then(|context| context.mcp_capability.as_ref())
+        .or_else(|| {
+            fresh_agent
+                .and_then(|agent| agent.provider_launch_context.as_ref())
+                .and_then(|context| context.mcp_capability.as_ref())
+        })
+}
+
+fn host_gateway_alias(rootless: bool, host_address: Option<&str>) -> Result<String, BackendError> {
+    if !rootless {
+        return Ok("host.docker.internal:host-gateway".into());
+    }
+    // Rootless Docker's host-gateway points into its network namespace, where
+    // the web listener does not live. The web controller records its own
+    // routable address in the current capability reference.
+    let address = host_address
+        .ok_or_else(|| BackendError::Unavailable("managed MCP host address is unavailable".into()))?
+        .parse::<std::net::Ipv4Addr>()
+        .map_err(|_| BackendError::InvalidConfig("managed MCP host address is invalid".into()))?;
+    if address.is_loopback() || address.is_unspecified() {
+        return Err(BackendError::Unavailable(
+            "rootless Docker has no routable host address".into(),
+        ));
+    }
+    Ok(format!("host.docker.internal:{address}"))
 }
 
 fn runtime_host_environment(
@@ -464,7 +517,7 @@ impl RuntimeBackend for DockerEngineBackend {
         .map_err(BackendError::InvalidConfig)?;
         let expected = ExpectedConfig::new(spec, &binary, &runtime_dir);
         let immutable_config_digest = digest_expected(&expected)?;
-        let daemon_id = self.daemon_id().await?;
+        let (daemon_id, rootless) = self.daemon_info().await?;
         let memory_swap = spec
             .limits
             .memory_bytes
@@ -512,13 +565,14 @@ impl RuntimeBackend for DockerEngineBackend {
                     source.display()
                 ));
             }
+            if let Some(source) = &mounts.mcp_capability_file {
+                binds.push(format!(
+                    "{}:/run/freshell/mcp-capability.json:ro",
+                    source.display()
+                ));
+            }
         }
         let host_env = runtime_host_environment(spec.terminal.as_ref(), spec.fresh_agent.as_ref())?;
-        let cap_add: Vec<&str> = if spec.terminal.is_some() || spec.fresh_agent.is_some() {
-            vec!["CHOWN", "SETGID", "SETUID"]
-        } else {
-            Vec::new()
-        };
         let runtime_mode = spec
             .terminal
             .as_ref()
@@ -529,11 +583,21 @@ impl RuntimeBackend for DockerEngineBackend {
                     .map(|agent| agent.provider.as_str())
             });
         let runtime_tmpfs_config = runtime_tmpfs(runtime_mode);
+        let extra_hosts = if let Some(reference) =
+            workload_mcp_capability(spec.terminal.as_ref(), spec.fresh_agent.as_ref())
+        {
+            vec![host_gateway_alias(
+                rootless,
+                reference.host_gateway_address.as_deref(),
+            )?]
+        } else {
+            Vec::new()
+        };
         let body = docker_create_body(
             spec,
             binds,
             host_env,
-            cap_add,
+            extra_hosts,
             runtime_tmpfs_config,
             requested_limits,
             memory_swap,
@@ -1165,6 +1229,20 @@ fn verify_workload_mounts(
             ));
         }
     }
+    if let Some(source) = expected.mcp_capability_file.as_ref() {
+        let source_text = source.to_string_lossy();
+        let found = mounts.iter().any(|mount| {
+            mount.get("Source").and_then(Value::as_str) == Some(source_text.as_ref())
+                && mount.get("Destination").and_then(Value::as_str)
+                    == Some("/run/freshell/mcp-capability.json")
+                && mount.get("RW").and_then(Value::as_bool) == Some(false)
+        });
+        if !found {
+            return Err(BackendError::OwnershipMismatch(
+                "managed MCP capability mount changed".into(),
+            ));
+        }
+    }
     for (index, source) in expected.provider_bootstrap_files.iter().enumerate() {
         let source_text = source.to_string_lossy();
         let destination = format!("/run/freshell-bootstrap/provider-{index}");
@@ -1450,6 +1528,20 @@ mod tests {
     }
 
     #[test]
+    fn rootless_docker_uses_controller_host_address_for_mcp() {
+        assert_eq!(
+            host_gateway_alias(false, None).unwrap(),
+            "host.docker.internal:host-gateway"
+        );
+        assert_eq!(
+            host_gateway_alias(true, Some("192.168.3.150")).unwrap(),
+            "host.docker.internal:192.168.3.150"
+        );
+        assert!(host_gateway_alias(true, None).is_err());
+        assert!(host_gateway_alias(true, Some("127.0.0.1")).is_err());
+    }
+
+    #[test]
     fn parses_chunked_response() {
         let response = parse_http_response(
             b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n4\r\ntest\r\n0\r\n\r\n",
@@ -1577,7 +1669,7 @@ mod tests {
             &spec,
             binds,
             Vec::new(),
-            vec!["CHOWN", "SETGID", "SETUID"],
+            Vec::new(),
             BTreeMap::new(),
             serde_json::to_string(&spec.limits).unwrap(),
             spec.limits.memory_bytes,

@@ -15,6 +15,21 @@ COPY crates/freshell-claude-sidecar/*.mjs crates/freshell-claude-sidecar/
 RUN npm install --global pnpm@10.34.5 \
  && pnpm --filter freshell-claude-sidecar --prod --frozen-lockfile --config.node-linker=hoisted deploy /opt/freshell-claude-sidecar
 
+# Bundle Freshell-owned MCP code from this checkout, then export only its
+# lockfile-pinned runtime dependencies. The resulting entry has no worktree
+# links and can run inside any managed soul.
+FROM node-source AS mcp-runtime
+WORKDIR /mcp-workspace
+COPY package.json pnpm-lock.yaml pnpm-workspace.yaml ./
+COPY packages/freshell-mcp-runtime/package.json packages/freshell-mcp-runtime/
+COPY tools/freshell-mcp/*.ts tools/freshell-mcp/
+COPY tools/node-client-runtime/*.ts tools/node-client-runtime/
+RUN npm install --global pnpm@10.34.5 \
+ && pnpm --filter freshell-mcp-runtime install --frozen-lockfile --ignore-scripts \
+ && pnpm --filter freshell-mcp-runtime exec esbuild ../../tools/freshell-mcp/server.ts \
+      --bundle --platform=node --format=esm --packages=external --outfile=server.js \
+ && pnpm --filter freshell-mcp-runtime --prod --frozen-lockfile --config.node-linker=hoisted deploy /opt/freshell-mcp
+
 FROM ubuntu@sha256:33ceb71981b602c1a7443a53469e4dba065f7503eab3078a2d7a57a2ab987517
 ARG CLAUDE_CODE_VERSION=2.1.263
 ARG CODEX_VERSION=0.147.0
@@ -56,13 +71,13 @@ RUN apt-get update \
  && /opt/amplifier-src/.venv/bin/python -c 'import importlib.metadata as m; assert m.version("openai") == "2.8.1"; assert m.version("openai-harmony") == "0.0.8"; assert m.version("amplifier-module-provider-vllm") == "1.0.0"' \
  && /lib/x86_64-linux-gnu/libc.so.6 | grep -F '2.39'
 
-COPY --chmod=0755 docker/runtime/amplifier-onecli /usr/local/bin/freshell-amplifier-onecli
-COPY --chmod=0644 docker/runtime/amplifier-onecli-lunaroute-glm53.yaml /etc/freshell/amplifier-onecli-lunaroute-glm53.yaml
-
 # FreshClaude/Kilroy run inside the soul host, so their JS SDK bridge and its
 # pinned dependency must be part of the workload image rather than resolved
 # through a web-server worktree path.
 COPY --from=claude-sidecar /opt/freshell-claude-sidecar/ /opt/freshell-claude-sidecar/
+COPY --from=mcp-runtime /opt/freshell-mcp/ /opt/freshell-mcp/
+# The MCP server reports the same application version as the ordinary entry.
+COPY package.json /opt/package.json
 
 WORKDIR /workspace
 CMD ["/bin/bash"]

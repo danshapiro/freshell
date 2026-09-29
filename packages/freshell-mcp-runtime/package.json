@@ -3,9 +3,12 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
+  "devDependencies": {
+    "esbuild": "0.28.2"
+  },
   "dependencies": {
     "@modelcontextprotocol/sdk": "1.30.0",
     "zod": "4.3.6"
   },
-  "files": ["generated"]
+  "files": ["server.js"]
 }

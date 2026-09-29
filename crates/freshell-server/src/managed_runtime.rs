@@ -176,24 +176,29 @@ impl ManagedTerminalController for ServerManagedRuntimeController {
             // AUTH_TOKEN, provider API keys, cloud credentials, proxy creds, ...).
             let env = managed_provider_env(&request.mode, &request.env);
             let provider_secret_references = {
-                let references =
-                    crate::managed_provider_bootstrap::named_provider_onecli_references(
-                        &request.mode,
-                    )?;
-                if request.mode == "amplifier" && references.is_empty() {
-                    crate::managed_provider_bootstrap::amplifier_secret_references(
-                        request.provider_model.as_deref(),
-                        request.provider_reasoning_effort.as_deref(),
-                    )?
-                } else {
-                    references
+                crate::managed_provider_bootstrap::named_provider_onecli_references(&request.mode)?
+            };
+            let args = managed_provider_args(&request.mode, request.spec.args)?;
+            let request_id = stable_request_id(create_key)?;
+            let mcp_capability = matches!(
+                request.mode.as_str(),
+                "claude" | "codex" | "opencode" | "amplifier"
+            )
+            .then(|| crate::managed_mcp_capability::issue_mcp_capability(&soul_id, &request.mode))
+            .transpose()?;
+            let provider_launch_context =
+                crate::managed_provider_bootstrap::provider_launch_context_for_managed(
+                    &request.mode,
+                    &workspace,
+                    mcp_capability.clone(),
+                );
+            if mcp_capability.is_some() && provider_launch_context.is_none() {
+                if let Some(capability) = &mcp_capability {
+                    let _ =
+                        crate::managed_mcp_capability::revoke_mcp_capability(&capability.grant_id);
                 }
-            };
-            let program = if request.mode == "amplifier" {
-                crate::managed_provider_bootstrap::AMPLIFIER_PROGRAM.to_string()
-            } else {
-                request.spec.program
-            };
+                return Err("managed provider preparation unavailable".into());
+            }
             let launch = LaunchRequest {
                 soul_id: soul_id.clone(),
                 provider: request.mode.clone(),
@@ -214,14 +219,8 @@ impl ManagedTerminalController for ServerManagedRuntimeController {
                     terminal_id: request.terminal_id.clone(),
                     stream_id: request.stream_id.clone(),
                     mode: request.mode.clone(),
-                    program,
-                    // Phase 2's managed provider has no durable Freshell MCP
-                    // tool-router yet. The legacy --mcp-config file is web-owned
-                    // temporary state and its child server needs FRESHELL_TOKEN;
-                    // carrying either across this boundary would reintroduce a
-                    // web dependency and persist a credential. Phase 3 replaces
-                    // this with the scoped durable tool router.
-                    args: managed_provider_args(&request.mode, request.spec.args)?,
+                    program: request.spec.program,
+                    args,
                     env,
                     cwd: cwd.to_string_lossy().into_owned(),
                     run_as_uid,
@@ -239,11 +238,7 @@ impl ManagedTerminalController for ServerManagedRuntimeController {
                     provider_permission_mode: request.provider_permission_mode.clone(),
                     provider_bootstrap_files: Vec::new(),
                     provider_secret_references,
-                    provider_launch_context:
-                        crate::managed_provider_bootstrap::provider_launch_context(
-                            &request.mode,
-                            &workspace,
-                        ),
+                    provider_launch_context,
                 }),
                 view_intent: Some(ViewIntentRequest {
                     owner_id: String::new(),
@@ -257,12 +252,17 @@ impl ManagedTerminalController for ServerManagedRuntimeController {
                 }),
                 expected_control_epoch: None,
             };
-            let request_id = stable_request_id(create_key)?;
-            let result = self
-                .client
-                .launch(request_id, launch)
-                .await
-                .map_err(|e| e.to_string())?;
+            let result = match self.client.launch(request_id, launch).await {
+                Ok(result) => result,
+                Err(error) => {
+                    if let Some(capability) = &mcp_capability {
+                        let _ = crate::managed_mcp_capability::revoke_mcp_capability(
+                            &capability.grant_id,
+                        );
+                    }
+                    return Err(error.to_string());
+                }
+            };
             Ok(ManagedTerminalDescriptor {
                 soul_id: result.view.soul_id.to_string(),
                 incarnation_id: result.view.incarnation_id.to_string(),
@@ -349,8 +349,14 @@ impl ManagedTerminalController for ServerManagedRuntimeController {
         Box::pin(async move {
             let soul_key = terminal.soul_id;
             let soul = SoulId::parse(&soul_key).map_err(|e| e.to_string())?;
-            match self.client.stop(soul).await.map_err(|e| e.to_string())? {
+            match self
+                .client
+                .stop(soul.clone())
+                .await
+                .map_err(|e| e.to_string())?
+            {
                 StopOutcome::VerifiedEmpty => {
+                    crate::managed_mcp_capability::revoke_soul_capabilities(&soul)?;
                     self.recovery.in_flight.lock().await.remove(&soul_key);
                     self.recovery.blocked.lock().await.remove(&soul_key);
                     Ok(())
@@ -520,6 +526,7 @@ fn automatic_retryable(result: &RecoveryResult) -> bool {
         result.probe.as_ref(),
         Some(RecoveryProbe::Blocked {
             reason: RecoveryBlockReason::RateLimited
+                | RecoveryBlockReason::CapabilityPending
                 | RecoveryBlockReason::ProviderUnavailable
                 | RecoveryBlockReason::StoreUnreadable
                 | RecoveryBlockReason::WorkspaceUnavailable
@@ -696,24 +703,78 @@ fn managed_provider_env(
     );
     if mode == "opencode" {
         env.insert("TMPDIR".into(), "/run/opencode-tmp".into());
-        // The legacy inline OpenCode config may contain credential-shaped
-        // values. Never persist it in supervisor state. Rebuild a minimal,
-        // non-secret config and accept only the explicit permission enum used
-        // by managed-runtime policy and its live browser proof.
+        if let Some(value) = source
+            .get("FRESHELL_OPENCODE_REBIND")
+            .filter(|value| matches!(value.as_str(), "0" | "false"))
+        {
+            env.insert("FRESHELL_OPENCODE_REBIND".into(), value.clone());
+        }
+        // The ordinary inline provider configuration is part of the launch
+        // recipe. Keep its non-secret fields and plugin list; named secrets
+        // are supplied separately by OneCLI at child spawn.
+        let mut config = source
+            .get("OPENCODE_CONFIG_CONTENT")
+            .filter(|raw| raw.len() <= 64 * 1024)
+            .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
+            .filter(serde_json::Value::is_object)
+            .unwrap_or_else(|| serde_json::json!({}));
+        strip_named_secret_fields(&mut config);
         let permission = source
             .get("FRESHELL_MANAGED_OPENCODE_BASH_PERMISSION")
             .map(String::as_str)
             .filter(|value| matches!(*value, "ask" | "allow" | "deny"));
-        let mut config = serde_json::json!({
-            "snapshot": false,
-            "autoupdate": false,
-        });
         if let Some(permission) = permission {
-            config["permission"] = serde_json::json!({ "bash": permission });
+            if !config
+                .get("permission")
+                .is_some_and(serde_json::Value::is_object)
+            {
+                config["permission"] = serde_json::json!({});
+            }
+            config["permission"]["bash"] = serde_json::Value::String(permission.into());
         }
-        env.insert("OPENCODE_CONFIG_CONTENT".into(), config.to_string());
+        if config
+            .as_object()
+            .is_some_and(|entries| !entries.is_empty())
+        {
+            env.insert("OPENCODE_CONFIG_CONTENT".into(), config.to_string());
+        }
     }
     env
+}
+
+fn strip_named_secret_fields(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Object(fields) => fields.retain(|name, field| {
+            let name = name
+                .to_ascii_lowercase()
+                .chars()
+                .filter(char::is_ascii_alphanumeric)
+                .collect::<String>();
+            let secret = [
+                "secret",
+                "password",
+                "credential",
+                "apikey",
+                "accesstoken",
+                "refreshtoken",
+                "authorization",
+                "privatekey",
+            ]
+            .iter()
+            .any(|suffix| name.ends_with(suffix))
+                || name == "token";
+            if !secret {
+                strip_named_secret_fields(field);
+            }
+            !secret
+        }),
+        serde_json::Value::Array(values) => {
+            for field in values {
+                strip_named_secret_fields(field);
+            }
+        }
+        _ => {}
+    }
 }
 
 fn managed_provider_args(mode: &str, args: Vec<String>) -> Result<Vec<String>, String> {
@@ -948,14 +1009,7 @@ mod tests {
             env.get("XDG_CONFIG_HOME").map(String::as_str),
             Some("/home/freshell/provider/.config")
         );
-        let config: serde_json::Value = serde_json::from_str(
-            env.get("OPENCODE_CONFIG_CONTENT")
-                .expect("managed OpenCode config"),
-        )
-        .unwrap();
-        assert_eq!(config["snapshot"], false);
-        assert_eq!(config["autoupdate"], false);
-        assert!(config.get("permission").is_none());
+        assert!(!env.contains_key("OPENCODE_CONFIG_CONTENT"));
         assert_eq!(
             env.get("TMPDIR").map(String::as_str),
             Some("/run/opencode-tmp")
@@ -963,6 +1017,43 @@ mod tests {
         assert!(!env.contains_key("OPENCODE_TUI_CONFIG"));
         assert!(!env.contains_key("OPENCODE_API_KEY"));
         assert!(!env.values().any(|value| value.contains("do-not-persist")));
+    }
+
+    #[test]
+    fn managed_opencode_keeps_ordinary_safe_inline_plugin_configuration() {
+        let source = std::collections::BTreeMap::from([
+            (
+                "OPENCODE_CONFIG_CONTENT".into(),
+                r#"{"plugin":["file:///workspace/plugin.ts"],"snapshot":true,"maxTokens":8192}"#
+                    .into(),
+            ),
+            ("FRESHELL_OPENCODE_REBIND".into(), "0".into()),
+        ]);
+        let env = managed_provider_env("opencode", &source);
+        let config: serde_json::Value =
+            serde_json::from_str(env.get("OPENCODE_CONFIG_CONTENT").unwrap()).unwrap();
+        assert_eq!(config["plugin"][0], "file:///workspace/plugin.ts");
+        assert_eq!(config["snapshot"], true);
+        assert_eq!(config["maxTokens"], 8192);
+        assert_eq!(
+            env.get("FRESHELL_OPENCODE_REBIND").map(String::as_str),
+            Some("0")
+        );
+    }
+
+    #[test]
+    fn managed_opencode_keeps_safe_fields_beside_onecli_secret_fields() {
+        let source = std::collections::BTreeMap::from([(
+            "OPENCODE_CONFIG_CONTENT".into(),
+            r#"{"plugin":["file:///workspace/plugin.ts"],"provider":{"apiKey":"raw-secret","model":"ordinary-model"}}"#.into(),
+        )]);
+        let env = managed_provider_env("opencode", &source);
+        let config: serde_json::Value =
+            serde_json::from_str(env.get("OPENCODE_CONFIG_CONTENT").unwrap()).unwrap();
+        assert_eq!(config["plugin"][0], "file:///workspace/plugin.ts");
+        assert_eq!(config["provider"]["model"], "ordinary-model");
+        assert!(config["provider"].get("apiKey").is_none());
+        assert!(!env.values().any(|value| value.contains("raw-secret")));
     }
 
     #[test]
@@ -987,10 +1078,27 @@ mod tests {
             "ask-with-secret-text".to_string(),
         )]);
         let env = managed_provider_env("opencode", &source);
+        assert!(!env.contains_key("OPENCODE_CONFIG_CONTENT"));
+        assert!(!env.values().any(|value| value.contains("secret-text")));
+    }
+
+    #[test]
+    fn managed_opencode_bash_policy_preserves_other_ordinary_permissions() {
+        let source = std::collections::BTreeMap::from([
+            (
+                "OPENCODE_CONFIG_CONTENT".into(),
+                r#"{"permission":{"read":"allow"}}"#.into(),
+            ),
+            (
+                "FRESHELL_MANAGED_OPENCODE_BASH_PERMISSION".into(),
+                "ask".into(),
+            ),
+        ]);
+        let env = managed_provider_env("opencode", &source);
         let config: serde_json::Value =
             serde_json::from_str(env.get("OPENCODE_CONFIG_CONTENT").unwrap()).unwrap();
-        assert!(config.get("permission").is_none());
-        assert!(!env.values().any(|value| value.contains("secret-text")));
+        assert_eq!(config["permission"]["bash"], "ask");
+        assert_eq!(config["permission"]["read"], "allow");
     }
 
     #[test]

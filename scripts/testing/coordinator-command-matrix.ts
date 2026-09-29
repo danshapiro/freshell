@@ -109,6 +109,12 @@ export function classifyCommand(input: CoordinatorInput): CommandDisposition {
 
 function isRetiredServerConfigSelector(arg: string): boolean {
   const normalized = arg.replaceAll('\\', '/')
+  // This one integration spec exercises the Rust server through its owned
+  // Docker/WebSocket fixture and is still a Vitest test, despite living in
+  // the otherwise retired Node-server integration directory.
+  if (normalized.replace(/^\.\//, '') === 'test/integration/server/managed-provider-parity.test.ts') {
+    return false
+  }
   return /(?:^|[/=])(?:vitest\.)?server\.config(?:\.[^/]+)?$/.test(normalized)
     || /(?:^|[/=])test\/(?:unit\/|integration\/)?server(?:\/|$)/.test(normalized)
 }

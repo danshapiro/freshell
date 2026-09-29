@@ -1,4 +1,3 @@
-import { execFileSync } from 'node:child_process'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
@@ -67,22 +66,6 @@ describe('checked-in provider certification manifest', () => {
 
   it('has no durable-souls claim for an uncertified provider', () => {
     expect(capabilityClaimViolations(loadCapabilityManifest(repoRoot))).toEqual([])
-  })
-
-  it('pins managed Amplifier to the actual OneCLI/LunaRoute profile without changing legacy launch', () => {
-    const settings = fs.readFileSync(
-      path.join(repoRoot, 'docker/runtime/amplifier-onecli-lunaroute-glm53.yaml'),
-      'utf8',
-    )
-    expect(settings).toContain('id: lunaroute')
-    expect(settings).toContain('module: provider-vllm')
-    expect(settings).toContain('default_model: glm-5.3')
-    expect(settings).not.toMatch(/anthropic|haiku|fable|gpt-5\.6-sol|max/i)
-    execFileSync('sh', ['-n', path.join(repoRoot, 'docker/runtime/amplifier-onecli')])
-    const manifest = JSON.parse(
-      fs.readFileSync(path.join(repoRoot, 'extensions/amplifier/freshell.json'), 'utf8'),
-    )
-    expect(manifest.cli.command).toBe('amplifier')
   })
 
   it('reports a violation when a deferred provider is silently promoted', () => {

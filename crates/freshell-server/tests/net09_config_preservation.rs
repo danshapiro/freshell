@@ -134,6 +134,7 @@ async fn network_mutation_preserves_every_unmanaged_top_level_key() {
     let bin = discover_server_binary();
     let mut child = Command::new(&bin)
         .env("PORT", port.to_string())
+        .env_remove("FRESHELL_MANAGED_RUNTIME_V1")
         .env("AUTH_TOKEN", AUTH_TOKEN)
         .env("FRESHELL_HOME", home.path())
         .env("HOME", home.path())
@@ -177,6 +178,7 @@ async fn network_mutation_preserves_every_unmanaged_top_level_key() {
     let port2 = allocate_ephemeral_port();
     let mut child2 = Command::new(&bin)
         .env("PORT", port2.to_string())
+        .env_remove("FRESHELL_MANAGED_RUNTIME_V1")
         .env("AUTH_TOKEN", AUTH_TOKEN)
         .env("FRESHELL_HOME", home.path())
         .env("HOME", home.path())

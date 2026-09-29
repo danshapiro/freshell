@@ -3516,6 +3516,39 @@ mod managed_runtime_id_tests {
     };
     use std::sync::Arc;
 
+    #[test]
+    fn managed_codex_provider_context_keeps_tui_and_sidecar_mcp_recipes() {
+        let setup = super::build_codex_managed_launch_setup(
+            "terminal-mcp-context".into(),
+            freshell_platform::ShellType::System,
+            freshell_platform::HostOs::Linux,
+            false,
+            Some("/tmp"),
+            Some("tab-mcp"),
+            Some("pane-mcp"),
+        )
+        .unwrap();
+        assert!(!setup.tui_mcp_injection.args.is_empty());
+        assert!(!setup.sidecar_context.config_args.is_empty());
+        assert!(setup
+            .tui_mcp_injection
+            .args
+            .iter()
+            .any(|arg| arg.contains("mcp_servers.freshell")));
+        assert!(setup
+            .sidecar_context
+            .config_args
+            .iter()
+            .any(|arg| arg.contains("mcp_servers.freshell")));
+        assert_eq!(
+            setup
+                .terminal_env
+                .get("FRESHELL_TERMINAL_ID")
+                .map(String::as_str),
+            Some("terminal-mcp-context")
+        );
+    }
+
     struct LookupOnlyController {
         descriptor: ManagedTerminalDescriptor,
     }
@@ -6057,6 +6090,11 @@ pub(crate) async fn handle_create(
     } else {
         cli_provider_settings(state, &mode)
     };
+    // Codex model, sandbox, and approval belong to the app-server plan on
+    // both routes. The managed launch still carries them separately to the
+    // soul's sidecar; the TUI gets the ordinary CLI settings tuple.
+    let (cli_permission_mode, cli_model, cli_effort, cli_sandbox) =
+        cli_provider_settings(state, &mode);
 
     // opencode: allocate the loopback control endpoint BEFORE building the launch
     // (`ws:2471-2473`; `local-port.ts:13-41`), via the freshell-opencode
@@ -6205,10 +6243,10 @@ pub(crate) async fn handle_create(
         target,
         resume_session_id: resume_session_id.as_deref(),
         launch_intent,
-        permission_mode: permission_mode.as_deref(),
-        model: model.as_deref(),
-        effort: effort.as_deref(),
-        sandbox: sandbox.as_deref(),
+        permission_mode: cli_permission_mode.as_deref(),
+        model: cli_model.as_deref(),
+        effort: cli_effort.as_deref(),
+        sandbox: cli_sandbox.as_deref(),
         codex_remote_ws_url: codex_remote_ws_url.as_deref(),
         opencode_server: opencode_endpoint
             .as_ref()

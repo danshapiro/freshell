@@ -2,7 +2,31 @@ use freshell_runtime_protocol::{
     FreshAgentLaunchSpec, ProviderBootstrapFile, ProviderConfigRoot, ProviderLaunchContext,
     ProviderSecretReference, TerminalLaunchSpec,
 };
-use std::path::{Path, PathBuf};
+use std::{
+    path::{Path, PathBuf},
+    sync::OnceLock,
+};
+
+static CAPABILITY_DIR: OnceLock<PathBuf> = OnceLock::new();
+
+pub fn configure_capability_dir(control_socket: &Path) -> Result<(), String> {
+    let control_dir = control_socket
+        .parent()
+        .ok_or("managed runtime control socket has no parent")?;
+    let control_dir = if control_dir.exists() {
+        std::fs::canonicalize(control_dir).map_err(|error| error.to_string())?
+    } else if control_dir.is_absolute() {
+        control_dir.to_path_buf()
+    } else {
+        return Err("managed runtime control directory must be absolute".into());
+    };
+    let directory = std::env::var_os("FRESHELL_RUNTIME_CAPABILITY_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| control_dir.join("mcp-capabilities"));
+    CAPABILITY_DIR
+        .set(directory)
+        .map_err(|_| "managed MCP capability directory already configured".into())
+}
 
 /// Exact extra-mount set for a Phase 2 terminal workload. Every source is
 /// canonicalized before Docker sees it; destinations preserve the host's
@@ -14,6 +38,7 @@ pub struct TerminalMounts {
     pub provider_bootstrap_files: Vec<PathBuf>,
     pub provider_secret_files: Vec<PathBuf>,
     pub provider_user_root: Option<PathBuf>,
+    pub mcp_capability_file: Option<PathBuf>,
 }
 
 pub fn terminal_mounts(spec: &TerminalLaunchSpec) -> Result<TerminalMounts, String> {
@@ -106,19 +131,112 @@ fn workload_mounts(
         reject_management_path(&source)?;
         provider_secret_files.push(source);
     }
-    let provider_user_root = if context.is_some_and(user_provider_config_referenced) {
-        let home = std::env::var_os("HOME").ok_or("provider user config requires HOME")?;
-        Some(approved_user_provider_root(Path::new(&home), provider)?)
-    } else {
-        None
-    };
+    let provider_user_root =
+        if let Some(capability) = context.and_then(|context| context.mcp_capability.as_ref()) {
+            Some(approved_staged_provider_root(
+                &capability_directory()?,
+                &capability.grant_id,
+            )?)
+        } else if context.is_some() {
+            let home = std::env::var_os("HOME");
+            let relative = match provider {
+                "claude" => ".claude",
+                "codex" => ".codex",
+                "opencode" => ".config/opencode",
+                "amplifier" => ".amplifier",
+                _ => return Err("unapproved provider user root".into()),
+            };
+            if let Some(home) = home
+                .as_ref()
+                .filter(|home| Path::new(home).join(relative).exists())
+            {
+                Some(approved_user_provider_root(Path::new(home), provider)?)
+            } else if context.is_some_and(user_provider_config_referenced) {
+                return Err("referenced provider user root is unavailable".into());
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+    let mcp_capability_file = context
+        .and_then(|context| context.mcp_capability.as_ref())
+        .map(|capability| {
+            let directory = capability_directory()?;
+            if !capability.grant_id.starts_with("grant-")
+                || capability.grant_id.len() > 128
+                || !capability
+                    .grant_id
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+            {
+                return Err("invalid managed MCP grant id".to_string());
+            }
+            let source = directory.join(format!("{}.json", capability.grant_id));
+            let canonical = std::fs::canonicalize(&source)
+                .map_err(|error| format!("managed MCP grant unavailable: {error}"))?;
+            if canonical != source || !canonical.is_file() {
+                return Err("managed MCP grant must be a canonical regular file".into());
+            }
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                if std::fs::metadata(&canonical)
+                    .map_err(|error| error.to_string())?
+                    .permissions()
+                    .mode()
+                    & 0o077
+                    != 0
+                {
+                    return Err("managed MCP grant must be private".into());
+                }
+            }
+            Ok(canonical)
+        })
+        .transpose()?;
     Ok(TerminalMounts {
         workspace,
         git_common_dir,
         provider_bootstrap_files,
         provider_secret_files,
         provider_user_root,
+        mcp_capability_file,
     })
+}
+
+fn capability_directory() -> Result<PathBuf, String> {
+    let directory = CAPABILITY_DIR
+        .get()
+        .cloned()
+        .or_else(|| std::env::var_os("FRESHELL_RUNTIME_CAPABILITY_DIR").map(PathBuf::from))
+        .ok_or("managed MCP capability directory is unavailable")?;
+    std::fs::canonicalize(&directory)
+        .map_err(|error| format!("managed MCP capability directory unavailable: {error}"))
+}
+
+pub(crate) fn staged_provider_root_for_grant(grant_id: &str) -> Result<PathBuf, String> {
+    approved_staged_provider_root(&capability_directory()?, grant_id)
+}
+
+fn approved_staged_provider_root(directory: &Path, grant_id: &str) -> Result<PathBuf, String> {
+    if !grant_id.starts_with("grant-")
+        || grant_id.len() > 128
+        || !grant_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+    {
+        return Err("invalid managed MCP grant id".into());
+    }
+    let expected = directory
+        .parent()
+        .ok_or("managed MCP capability directory has no parent")?
+        .join("provider-roots")
+        .join(grant_id);
+    let canonical = canonical_dir(&expected, "managed provider root")?;
+    if canonical != expected {
+        return Err("managed provider root must be canonical".into());
+    }
+    Ok(canonical)
 }
 
 fn user_provider_config_referenced(context: &ProviderLaunchContext) -> bool {
@@ -151,9 +269,47 @@ fn approved_user_provider_root(home: &Path, provider: &str) -> Result<PathBuf, S
     Ok(root)
 }
 
+fn canonical_dir(path: &Path, label: &str) -> Result<PathBuf, String> {
+    let canonical = std::fs::canonicalize(path).map_err(|e| format!("{label}: {e}"))?;
+    if !canonical.is_dir() {
+        return Err(format!("{label} is not a directory"));
+    }
+    Ok(canonical)
+}
+
+fn reject_management_path(path: &Path) -> Result<(), String> {
+    let text = path.to_string_lossy();
+    for forbidden in [
+        "docker.sock",
+        "/var/lib/freshell-supervisor",
+        "/run/freshell-supervisor",
+    ] {
+        if text.contains(forbidden) {
+            return Err(format!(
+                "managed terminal mount exposes forbidden path {text}"
+            ));
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod provider_secret_tests {
     use super::*;
+
+    #[test]
+    fn managed_provider_root_is_derived_from_grant_not_supervisor_home() {
+        let control = tempfile::tempdir().unwrap();
+        let capabilities = control.path().join("mcp-capabilities");
+        let staged = control.path().join("provider-roots/grant-test");
+        std::fs::create_dir_all(&capabilities).unwrap();
+        std::fs::create_dir_all(&staged).unwrap();
+        assert_eq!(
+            approved_staged_provider_root(&capabilities, "grant-test").unwrap(),
+            staged
+        );
+        assert!(approved_staged_provider_root(&capabilities, "../outside").is_err());
+    }
 
     #[test]
     fn nested_opencode_user_config_requires_the_approved_root_mount() {
@@ -214,28 +370,4 @@ mod provider_secret_tests {
         assert!(durable.contains(&canonical_grant.to_string_lossy().to_string()));
         assert!(!durable.contains("fixture-secret-bytes"));
     }
-}
-
-fn canonical_dir(path: &Path, label: &str) -> Result<PathBuf, String> {
-    let canonical = std::fs::canonicalize(path).map_err(|e| format!("{label}: {e}"))?;
-    if !canonical.is_dir() {
-        return Err(format!("{label} is not a directory"));
-    }
-    Ok(canonical)
-}
-
-fn reject_management_path(path: &Path) -> Result<(), String> {
-    let text = path.to_string_lossy();
-    for forbidden in [
-        "docker.sock",
-        "/var/lib/freshell-supervisor",
-        "/run/freshell-supervisor",
-    ] {
-        if text.contains(forbidden) {
-            return Err(format!(
-                "managed terminal mount exposes forbidden path {text}"
-            ));
-        }
-    }
-    Ok(())
 }

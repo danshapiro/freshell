@@ -190,6 +190,7 @@ export class RuntimeHarness {
       allowedImageRefs: new Set([this.imageRef]),
       allowTerminalWorkloads: this.phase >= 2,
       allowedWorkspaceRoots: new Set(this.phase >= 2 ? this.phase2WorkspaceRoots() : []),
+      allowedProviderUserRoots: new Set(this.phase >= 2 ? this.phase2ProviderUserRoots() : []),
       allowedBootstrapFiles: new Set(this.phase >= 2 ? this.phase2BootstrapFiles() : []),
       testRunId: this.runId,
       logPath: path.join(this.evidenceDir, 'broker.jsonl'),
@@ -1045,6 +1046,17 @@ export class RuntimeHarness {
       roots.add(fs.realpathSync(path.isAbsolute(common) ? common : path.join(this.repoRoot, common)))
     } catch {}
     return [...roots]
+  }
+
+  private phase2ProviderUserRoots(): string[] {
+    const roots: string[] = []
+    for (const relative of ['.claude', '.codex', '.config/opencode', '.amplifier']) {
+      try {
+        const root = fs.realpathSync(path.join(os.homedir(), relative))
+        if (fs.statSync(root).isDirectory()) roots.push(root)
+      } catch {}
+    }
+    return roots
   }
 
   private buildBinaries(): void {
