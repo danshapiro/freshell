@@ -5,10 +5,11 @@ import { configureStore, type Middleware } from '@reduxjs/toolkit'
 import panesReducer from '@/store/panesSlice'
 import settingsReducer, { previewServerSettingsPatch, updateSettingsLocal } from '@/store/settingsSlice'
 import sessionsReducer, { applySessionsPatch, applyContextUsageExtras } from '@/store/sessionsSlice'
-import freshAgentReducer, { applyRuntimeOwner, sessionError, sessionExited, sessionInit, sessionMetadataReceived, setSessionStatus, markSessionLost } from '@/store/freshAgentSlice'
+import freshAgentReducer, { applyRuntimeOwner, historyPageReceived, sessionError, sessionExited, sessionInit, sessionMetadataReceived, sessionSnapshotReceived, setSessionStatus, markSessionLost } from '@/store/freshAgentSlice'
 import { selectPaneOwnerFence } from '@/store/selectors/runtimeOwner'
 import tabsReducer from '@/store/tabsSlice'
 import connectionReducer from '@/store/connectionSlice'
+import managedRuntimeReducer from '@/store/managedRuntimeSlice'
 import { FreshAgentView, IDLE_INCOMPLETE_MAX_RETRIES, locatorMatchesPane } from '@/components/fresh-agent/FreshAgentView'
 import { FreshAgentSettingsButton } from '@/components/fresh-agent/FreshAgentSettingsButton'
 import {
@@ -36,6 +37,7 @@ import {
 } from '@/lib/fresh-agent-rollback'
 import { getFreshAgentPaneActions } from '@/lib/pane-action-registry'
 import type { PaneNode } from '@/store/paneTypes'
+import { resetManagedRuntimeRefreshForTest } from '@/lib/recovery/managed-runtime-recovery'
 
 const CLAUDE_THREAD_ID = '550e8400-e29b-41d4-a716-446655440000'
 
@@ -75,6 +77,8 @@ const apiMock = vi.hoisted(() => ({
   post: vi.fn(),
   requestSessionHandoff: vi.fn(),
   setSessionMetadata: vi.fn().mockResolvedValue(undefined),
+  getManagedRuntimeInventory: vi.fn(),
+  retryManagedRuntimeSoul: vi.fn(),
 }))
 
 const saveServerSettingsPatchSpy = vi.hoisted(() => vi.fn((patch: unknown) => ({
@@ -95,6 +99,8 @@ vi.mock('@/lib/api', async () => {
     getFreshAgentModelCapabilities: apiMock.getFreshAgentModelCapabilities,
     requestSessionHandoff: apiMock.requestSessionHandoff,
     setSessionMetadata: apiMock.setSessionMetadata,
+    getManagedRuntimeInventory: apiMock.getManagedRuntimeInventory,
+    retryManagedRuntimeSoul: apiMock.retryManagedRuntimeSoul,
   }
 })
 
@@ -115,6 +121,7 @@ function createStore(tabTitleSetByUser = false, extraMiddleware: Middleware[] = 
       // The status-strip context meter reads the session indexer's tokenUsage
       // from this slice (wsSnapshotReceived un-gates applySessionsPatch).
       sessions: sessionsReducer,
+      managedRuntime: managedRuntimeReducer,
     },
     middleware: (getDefaultMiddleware) =>
       getDefaultMiddleware({
@@ -278,6 +285,8 @@ beforeEach(() => {
   apiMock.post.mockReset()
   apiMock.requestSessionHandoff.mockReset()
   apiMock.setSessionMetadata.mockReset()
+  apiMock.getManagedRuntimeInventory.mockReset()
+  apiMock.retryManagedRuntimeSoul.mockReset()
   apiMock.post.mockResolvedValue({ title: null, source: 'none' })
   apiMock.requestSessionHandoff.mockResolvedValue({
     ok: true,
@@ -286,6 +295,21 @@ beforeEach(() => {
     owner: { kind: 'terminal', terminalId: 't-default', mode: 'codex' },
   })
   apiMock.setSessionMetadata.mockResolvedValue(undefined)
+  apiMock.retryManagedRuntimeSoul.mockResolvedValue(undefined)
+  apiMock.getManagedRuntimeInventory.mockResolvedValue({
+    revision: 1,
+    readiness: {
+      inventoryRevision: 1,
+      initialScanState: 'complete',
+      blockedSubsystems: [],
+      startupRecoveryConcurrencyLimit: 1,
+      startupRecoveryPeak: 0,
+    },
+    souls: [],
+    viewIntents: [],
+    pendingProjectionCount: 0,
+  })
+  resetManagedRuntimeRefreshForTest()
   saveServerSettingsPatchSpy.mockClear()
   window.localStorage.removeItem('freshopencode.modelMru.v2')
   window.localStorage.removeItem('freshopencode.modelLevelMru.v1')
@@ -6019,6 +6043,191 @@ describe('FreshAgentView', () => {
       expect(layout.content.sessionId).toBe('thread-child')
     })
     expect(wsMock.send).not.toHaveBeenCalledWith(expect.objectContaining({ type: 'freshAgent.kill' }))
+  })
+
+  it.each(['blocked', 'lost'] as const)(
+    'does not re-drive a managed %s projection from the Fresh Agent .lost recovery effect',
+    async (recoveryState) => {
+      vi.useFakeTimers()
+      try {
+        const store = createStore()
+        const locator = {
+          sessionId: 'managed-recovery-thread',
+          sessionType: 'freshcodex' as const,
+          provider: 'codex' as const,
+        }
+        store.dispatch(sessionInit(locator))
+        store.dispatch(sessionSnapshotReceived({
+          ...locator,
+          latestTurnId: 'turn-before-loss',
+          status: 'idle',
+        }))
+        store.dispatch(historyPageReceived({
+          ...locator,
+          turns: [],
+        }))
+        store.dispatch(initLayout({
+          tabId: 'tab-1',
+          paneId: 'pane-1',
+          content: {
+            kind: 'fresh-agent',
+            sessionType: 'freshcodex',
+            provider: 'codex',
+            createRequestId: 'managed-recovery-create',
+            sessionId: locator.sessionId,
+            sessionRef: { provider: 'codex', sessionId: locator.sessionId },
+            status: 'idle',
+            soulId: 'managed-soul',
+            soulIntentRevision: 12,
+            recoverySummary: {
+              desiredState: 'running',
+              recoveryState,
+              reason: 'provider_unavailable',
+              durabilityState: 'resume_captured',
+              allocationState: 'verified_durable',
+            },
+          },
+        }))
+
+        render(
+          <Provider store={store}>
+            <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
+          </Provider>,
+        )
+
+        expect(screen.getByTestId('managed-runtime-recovery-card')).toBeInTheDocument()
+        wsMock.send.mockClear()
+
+        act(() => store.dispatch(markSessionLost(locator)))
+        await act(async () => {
+          await vi.advanceTimersByTimeAsync(0)
+        })
+
+        expect(sentFreshAgentMessages('freshAgent.create').filter((message) => (
+          !message.sessionRef && !message.resumeSessionId
+        ))).toHaveLength(0)
+        expect(wsMock.send.mock.calls.some(([message]) => (
+          message?.type === 'pane.reconcile.request'
+        ))).toBe(false)
+      } finally {
+        vi.useRealTimers()
+      }
+    },
+  )
+
+  it('does not re-drive a deferred .lost callback after a managed projection arrives', async () => {
+    vi.useFakeTimers()
+    // Keep the callback alive through the projection update so this test
+    // exercises the callback's own managed-runtime guard, not only the effect
+    // guard. The callback is still driven by the real fake-timer queue below.
+    const clearTimeoutSpy = vi.spyOn(globalThis, 'clearTimeout').mockImplementation(() => {})
+    try {
+      const store = createStore()
+      const locator = {
+        sessionId: 'managed-deferred-recovery-thread',
+        sessionType: 'freshcodex' as const,
+        provider: 'codex' as const,
+      }
+      store.dispatch(sessionInit(locator))
+      store.dispatch(sessionSnapshotReceived({
+        ...locator,
+        latestTurnId: 'turn-before-loss',
+        status: 'idle',
+      }))
+      store.dispatch(historyPageReceived({ ...locator, turns: [] }))
+      store.dispatch(initLayout({
+        tabId: 'tab-1',
+        paneId: 'pane-1',
+        content: {
+          kind: 'fresh-agent',
+          sessionType: 'freshcodex',
+          provider: 'codex',
+          createRequestId: 'managed-deferred-recovery-create',
+          sessionId: locator.sessionId,
+          sessionRef: { provider: 'codex', sessionId: locator.sessionId },
+          status: 'idle',
+        },
+      }))
+
+      render(
+        <Provider store={store}>
+          <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
+        </Provider>,
+      )
+      wsMock.send.mockClear()
+
+      act(() => store.dispatch(markSessionLost(locator)))
+      const current = getFreshAgentPaneContent(store)
+      act(() => store.dispatch(updatePaneContent({
+        tabId: 'tab-1',
+        paneId: 'pane-1',
+        content: {
+          ...current,
+          soulId: 'managed-deferred-soul',
+          soulIntentRevision: 13,
+          recoverySummary: {
+            desiredState: 'running',
+            recoveryState: 'lost',
+            reason: 'provider_unavailable',
+            durabilityState: 'resume_captured',
+            allocationState: 'verified_durable',
+          },
+        },
+      })))
+
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(0)
+      })
+
+      expect(sentFreshAgentMessages('freshAgent.create').filter((message) => (
+        !message.sessionRef && !message.resumeSessionId
+      ))).toHaveLength(0)
+      expect(wsMock.send.mock.calls.some(([message]) => (
+        message?.type === 'pane.reconcile.request'
+      ))).toBe(false)
+    } finally {
+      clearTimeoutSpy.mockRestore()
+      vi.useRealTimers()
+    }
+  })
+
+  it('retries a blocked managed Fresh Agent with its current soul revision and refreshes inventory', async () => {
+    const store = createStore()
+    store.dispatch(initLayout({
+      tabId: 'tab-1',
+      paneId: 'pane-1',
+      content: {
+        kind: 'fresh-agent',
+        sessionType: 'freshcodex',
+        provider: 'codex',
+        createRequestId: 'managed-retry-create',
+        sessionId: 'managed-retry-thread',
+        sessionRef: { provider: 'codex', sessionId: 'managed-retry-thread' },
+        status: 'error',
+        soulId: 'managed-retry-soul',
+        soulIntentRevision: 19,
+        recoverySummary: {
+          desiredState: 'running',
+          recoveryState: 'blocked',
+          reason: 'provider_unavailable',
+          durabilityState: 'resume_captured',
+          allocationState: 'verified_durable',
+        },
+      },
+    }))
+
+    render(
+      <Provider store={store}>
+        <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
+      </Provider>,
+    )
+
+    fireEvent.click(screen.getByRole('button', { name: 'Retry recovery' }))
+
+    await waitFor(() => {
+      expect(apiMock.retryManagedRuntimeSoul).toHaveBeenCalledWith('managed-retry-soul', 19)
+      expect(apiMock.getManagedRuntimeInventory).toHaveBeenCalledTimes(1)
+    })
   })
 
   it('follows a managed same-soul fork even when another view issued the request', async () => {

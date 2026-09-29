@@ -1923,6 +1923,8 @@ export const panesSlice = createSlice({
         content.crashTrace = undefined
         content.launchFailure = undefined
         content.handoffError = undefined
+        content.namingHandle = undefined
+        content.nameRef = undefined
         clearManagedRuntimeProjection(content)
       } else {
         content.sessionId = undefined
