@@ -987,6 +987,8 @@ pub enum ProviderPreparation {
     Opencode {
         project_config: Vec<ProviderConfigReference>,
         tui_config: Option<ProviderConfigReference>,
+        #[serde(default)]
+        inline_config: bool,
     },
     Amplifier {
         bundle: String,
@@ -1020,6 +1022,8 @@ pub struct McpCapabilityReference {
 pub enum ProviderConfigRoot {
     Workspace,
     UserProvider,
+    /// Fixed files staged beside an incarnation's private MCP grant.
+    Ephemeral,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1039,7 +1043,13 @@ impl ProviderLaunchContext {
                 "managed provider launch context is unsafe or mismatched",
             )
         };
-        if self.preparation.provider() != provider || self.config.len() > 128 {
+        if self.preparation.provider() != provider
+            || self.config.len() > 128
+            || self
+                .config
+                .iter()
+                .any(|reference| reference.root == ProviderConfigRoot::Ephemeral)
+        {
             return Err(invalid());
         }
         let mut references: Vec<&ProviderConfigReference> = self.config.iter().collect();
@@ -1084,9 +1094,38 @@ impl ProviderLaunchContext {
             ProviderPreparation::Opencode {
                 project_config,
                 tui_config,
+                inline_config,
             } => {
+                if project_config
+                    .iter()
+                    .any(|reference| reference.root == ProviderConfigRoot::Ephemeral)
+                {
+                    return Err(invalid());
+                }
                 references.extend(project_config.iter());
                 references.extend(tui_config.iter());
+                if *inline_config && self.mcp_capability.is_none() {
+                    return Err(invalid());
+                }
+                if let Some(reference) = tui_config {
+                    if self.mcp_capability.is_none() {
+                        return Err(invalid());
+                    }
+                    let expected = match reference.format.as_str() {
+                        "json" => Some(("tui-config.json", ".freshell/opencode/user-tui.json")),
+                        "jsonc" => Some(("tui-config.jsonc", ".freshell/opencode/user-tui.jsonc")),
+                        _ => None,
+                    };
+                    if reference.root != ProviderConfigRoot::Ephemeral
+                        || expected
+                            != Some((
+                                reference.relative_path.as_str(),
+                                reference.provider_relative_path.as_str(),
+                            ))
+                    {
+                        return Err(invalid());
+                    }
+                }
             }
             ProviderPreparation::Amplifier {
                 bundle,
@@ -1202,6 +1241,37 @@ mod provider_launch_context_tests {
         let launch: FreshAgentLaunchSpec = serde_json::from_value(row).unwrap();
         assert!(launch.provider_launch_context.is_none());
         assert!(launch.provider_secret_references.is_empty());
+    }
+
+    #[test]
+    fn opencode_tui_reference_is_fixed_and_keeps_jsonc_format() {
+        let reference = ProviderConfigReference {
+            root: ProviderConfigRoot::Ephemeral,
+            relative_path: "tui-config.jsonc".into(),
+            provider_relative_path: ".freshell/opencode/user-tui.jsonc".into(),
+            format: "jsonc".into(),
+        };
+        let capability = McpCapabilityReference {
+            grant_id: "grant-tui".into(),
+            endpoint: "http://host.docker.internal:3001".into(),
+            provider_relative_path: ".freshell/mcp-capability.json".into(),
+            host_gateway_address: None,
+        };
+        let mut context = ProviderLaunchContext {
+            preparation: ProviderPreparation::Opencode {
+                project_config: Vec::new(),
+                tui_config: Some(reference),
+                inline_config: true,
+            },
+            mcp_capability: Some(capability),
+            config: Vec::new(),
+        };
+        context.validate("opencode").unwrap();
+        if let ProviderPreparation::Opencode { tui_config, .. } = &mut context.preparation {
+            tui_config.as_mut().unwrap().provider_relative_path =
+                ".freshell/opencode/other.jsonc".into();
+        }
+        assert!(context.validate("opencode").is_err());
     }
 
     #[test]

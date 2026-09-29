@@ -1259,16 +1259,17 @@ fn copy_provider_config_references_with_ownership(
     let mut entries = 0usize;
     for reference in provider_config_references(context) {
         let source_root = match reference.root {
-            ProviderConfigRoot::Workspace => workspace,
-            ProviderConfigRoot::UserProvider => user_provider_root,
+            ProviderConfigRoot::Workspace => workspace.to_path_buf(),
+            ProviderConfigRoot::UserProvider => user_provider_root.to_path_buf(),
+            ProviderConfigRoot::Ephemeral => user_provider_root.join("ephemeral"),
         };
         let source = source_root.join(&reference.relative_path);
         let destination = provider_home.join(&reference.provider_relative_path);
-        if !destination.starts_with(provider_home) || !source.starts_with(source_root) {
+        if !destination.starts_with(provider_home) || !source.starts_with(&source_root) {
             return Err("provider config escaped its approved root".into());
         }
         copy_provider_config_entry(
-            source_root,
+            &source_root,
             &source,
             &destination,
             &mut copied,
@@ -1343,6 +1344,7 @@ fn provider_config_references(
     if let freshell_runtime_protocol::ProviderPreparation::Opencode {
         project_config,
         tui_config,
+        ..
     } = &context.preparation
     {
         references.extend(project_config.iter());
@@ -2626,6 +2628,7 @@ mod tests {
                     },
                 ],
                 tui_config: None,
+                inline_config: false,
             },
             mcp_capability: None,
             config: Vec::new(),
@@ -3186,6 +3189,7 @@ mod tests {
                     format: "json".into(),
                 }],
                 tui_config: None,
+                inline_config: false,
             },
             mcp_capability: None,
             config: Vec::new(),

@@ -246,7 +246,7 @@ fn user_provider_config_referenced(context: &ProviderLaunchContext) -> bool {
         .any(|reference| reference.root == ProviderConfigRoot::UserProvider)
         || matches!(
             &context.preparation,
-            freshell_runtime_protocol::ProviderPreparation::Opencode { project_config, tui_config }
+            freshell_runtime_protocol::ProviderPreparation::Opencode { project_config, tui_config, .. }
                 if project_config.iter().chain(tui_config.iter())
                     .any(|reference| reference.root == ProviderConfigRoot::UserProvider)
         )
@@ -323,6 +323,7 @@ mod provider_secret_tests {
                     format: "json".into(),
                 }],
                 tui_config: None,
+                inline_config: false,
             },
             mcp_capability: None,
             config: vec![],

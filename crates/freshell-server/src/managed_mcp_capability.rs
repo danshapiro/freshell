@@ -14,7 +14,7 @@ use freshell_runtime_protocol::{
 };
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fs::OpenOptions,
     io::Write,
     path::{Path, PathBuf},
@@ -25,6 +25,13 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 const CAPABILITY_PATH: &str = ".freshell/mcp-capability.json";
 const GRANT_LIFETIME_SECS: u64 = 30 * 24 * 60 * 60;
+const RENEWAL_WINDOW_SECS: u64 = 7 * 24 * 60 * 60;
+
+#[derive(Clone, Copy, Default)]
+pub(crate) struct OpencodeEphemeralInput<'a> {
+    pub inline_config: Option<&'a str>,
+    pub tui_config_path: Option<&'a str>,
+}
 
 #[derive(Clone)]
 struct Grant {
@@ -164,6 +171,32 @@ pub(crate) async fn spawn_callback_server() -> Result<(), String> {
         }
     });
     Ok(())
+}
+
+pub(crate) fn spawn_renewal_loop(client: freshell_runtime_client::RuntimeClient) {
+    tokio::spawn(async move {
+        let mut timer = tokio::time::interval(std::time::Duration::from_secs(60 * 60));
+        timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            timer.tick().await;
+            match client.inventory().await {
+                Ok(views) => {
+                    let active = views
+                        .into_iter()
+                        .filter(|view| {
+                            view.desired_state == DesiredState::Running
+                                && view.launch_state == LaunchState::Running
+                        })
+                        .map(|view| (view.soul_id, view.incarnation_id))
+                        .collect::<HashSet<_>>();
+                    store().renew_active_at(now_secs(), &active);
+                }
+                Err(error) => {
+                    tracing::warn!(error = %error, "managed_mcp.renewal_inventory_failed")
+                }
+            }
+        }
+    });
 }
 
 #[derive(Deserialize)]
@@ -415,6 +448,8 @@ fn stage_provider_root(
     provider: &str,
     home: &Path,
     references: &[ProviderConfigReference],
+    opencode_input: OpencodeEphemeralInput<'_>,
+    prior_stage: Option<&Path>,
 ) -> Result<PathBuf, String> {
     let provider_dir = provider_root_name(provider)?;
     let staged = staged_provider_root_path(directory, grant_id)?;
@@ -458,6 +493,41 @@ fn stage_provider_root(
                 &mut entries,
             )?;
         }
+        if provider == "opencode" {
+            let ephemeral = temporary.join("ephemeral");
+            private_directory(&ephemeral)?;
+            if let Some(prior_stage) = prior_stage {
+                for name in ["inline-config.json", "tui-config.json", "tui-config.jsonc"] {
+                    let source = prior_stage.join("ephemeral").join(name);
+                    if source.is_file() {
+                        copy_ephemeral_file(&source, &ephemeral.join(name))?;
+                    }
+                }
+            } else {
+                if let Some(raw) = opencode_input.inline_config {
+                    if raw.len() > 64 * 1024
+                        || !serde_json::from_str::<serde_json::Value>(raw)
+                            .is_ok_and(|value| value.is_object())
+                    {
+                        return Err("managed OpenCode inline config is invalid".into());
+                    }
+                    write_private_bytes(&ephemeral.join("inline-config.json"), raw.as_bytes())?;
+                }
+                if let Some(raw_path) = opencode_input.tui_config_path {
+                    let path = std::fs::canonicalize(raw_path)
+                        .map_err(|_| "managed OpenCode TUI config is unavailable")?;
+                    if !path.is_file() {
+                        return Err("managed OpenCode TUI config must be a file".into());
+                    }
+                    let name = if raw_path.to_ascii_lowercase().ends_with(".jsonc") {
+                        "tui-config.jsonc"
+                    } else {
+                        "tui-config.json"
+                    };
+                    copy_ephemeral_file(&path, &ephemeral.join(name))?;
+                }
+            }
+        }
         std::fs::rename(&temporary, &staged).map_err(|error| error.to_string())?;
         Ok(staged.clone())
     })();
@@ -465,6 +535,28 @@ fn stage_provider_root(
         let _ = std::fs::remove_dir_all(&temporary);
     }
     result
+}
+
+fn write_private_bytes(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(path).map_err(|error| error.to_string())?;
+    file.write_all(bytes).map_err(|error| error.to_string())?;
+    file.sync_all().map_err(|error| error.to_string())
+}
+
+fn copy_ephemeral_file(source: &Path, destination: &Path) -> Result<(), String> {
+    let metadata = std::fs::metadata(source).map_err(|error| error.to_string())?;
+    if !metadata.is_file() || metadata.len() > 64 * 1024 {
+        return Err("managed OpenCode config file is invalid".into());
+    }
+    let bytes = std::fs::read(source).map_err(|error| error.to_string())?;
+    write_private_bytes(destination, &bytes)
 }
 
 #[derive(Serialize)]
@@ -487,21 +579,37 @@ struct StoredCapabilityFile {
     expires_at: u64,
 }
 
+fn restored_grant_at(
+    stored: StoredCapabilityFile,
+    incarnation_id: IncarnationId,
+    path: PathBuf,
+    current_endpoint: &str,
+    now: u64,
+) -> Grant {
+    let current = stored.endpoint == current_endpoint && !stored.scope.is_empty();
+    Grant {
+        soul_id: stored.soul_id,
+        incarnation_id: Some(incarnation_id),
+        token: if current { stored.scope } else { String::new() },
+        expires_at: if current {
+            stored
+                .expires_at
+                .max(now.saturating_add(GRANT_LIFETIME_SECS))
+        } else {
+            0
+        },
+        endpoint: stored.endpoint,
+        path,
+    }
+}
+
 fn restored_grant(
     stored: StoredCapabilityFile,
     incarnation_id: IncarnationId,
     path: PathBuf,
     current_endpoint: &str,
 ) -> Grant {
-    let current = stored.endpoint == current_endpoint && stored.expires_at > now_secs();
-    Grant {
-        soul_id: stored.soul_id,
-        incarnation_id: Some(incarnation_id),
-        token: if current { stored.scope } else { String::new() },
-        expires_at: if current { stored.expires_at } else { 0 },
-        endpoint: stored.endpoint,
-        path,
-    }
+    restored_grant_at(stored, incarnation_id, path, current_endpoint, now_secs())
 }
 
 fn write_capability(path: &Path, grant: &Grant) -> Result<(), String> {
@@ -527,18 +635,45 @@ fn write_capability(path: &Path, grant: &Grant) -> Result<(), String> {
 }
 
 impl CapabilityStore {
+    fn renew_active_at(&self, now: u64, active: &HashSet<(SoulId, IncarnationId)>) {
+        for grant in self.grants.lock().unwrap().values_mut() {
+            if !grant.incarnation_id.as_ref().is_some_and(|incarnation| {
+                active.contains(&(grant.soul_id.clone(), incarnation.clone()))
+            }) || grant.token.is_empty()
+                || grant.expires_at > now.saturating_add(RENEWAL_WINDOW_SECS)
+            {
+                continue;
+            }
+            let previous = grant.expires_at;
+            grant.expires_at = now.saturating_add(GRANT_LIFETIME_SECS);
+            if let Err(error) = write_capability(&grant.path, grant) {
+                grant.expires_at = previous;
+                tracing::warn!(error = %error, "managed_mcp.expiry_renewal_failed");
+            }
+        }
+    }
     fn issue(
         &self,
         soul_id: SoulId,
         directory: &Path,
         endpoint: String,
         source: Option<(&str, &Path, &[ProviderConfigReference])>,
+        opencode_input: OpencodeEphemeralInput<'_>,
+        prior_stage: Option<&Path>,
     ) -> Result<McpCapabilityReference, String> {
         let grant_id = format!("grant-{}", uuid::Uuid::new_v4());
         let path = grant_path(directory, &grant_id)?;
         let staged_provider_root = source
             .map(|(provider, home, references)| {
-                stage_provider_root(directory, &grant_id, provider, home, references)
+                stage_provider_root(
+                    directory,
+                    &grant_id,
+                    provider,
+                    home,
+                    references,
+                    opencode_input,
+                    prior_stage,
+                )
             })
             .transpose()?;
         let grant = Grant {
@@ -571,7 +706,22 @@ impl CapabilityStore {
         endpoint: String,
         source: Option<(&str, &Path, &[ProviderConfigReference])>,
     ) -> Result<McpCapabilityReference, String> {
-        let replacement = self.issue(soul_id.clone(), directory, endpoint, source)?;
+        let prior_stage = self
+            .grants
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|(_, grant)| grant.soul_id == soul_id)
+            .map(|(grant_id, _)| staged_provider_root_path(directory, grant_id))
+            .transpose()?;
+        let replacement = self.issue(
+            soul_id.clone(),
+            directory,
+            endpoint,
+            source,
+            OpencodeEphemeralInput::default(),
+            prior_stage.as_deref(),
+        )?;
         let prior = self
             .grants
             .lock()
@@ -637,28 +787,15 @@ impl CapabilityStore {
     }
 
     fn authenticates(&self, token: &str) -> bool {
-        self.grants.lock().unwrap().values_mut().any(|grant| {
-            if freshell_api::check_scoped_auth(
+        self.grants.lock().unwrap().values().any(|grant| {
+            freshell_api::check_scoped_auth(
                 Some(token),
                 &grant.token,
                 grant.soul_id.as_str(),
                 grant.incarnation_id.as_ref().map(IncarnationId::as_str),
                 grant.expires_at,
                 now_secs(),
-            ) {
-                if grant.expires_at <= now_secs() + 7 * 24 * 60 * 60 {
-                    let renewed = now_secs() + GRANT_LIFETIME_SECS;
-                    let previous = grant.expires_at;
-                    grant.expires_at = renewed;
-                    if let Err(error) = write_capability(&grant.path, grant) {
-                        grant.expires_at = previous;
-                        tracing::warn!(error = %error, "managed_mcp.expiry_renewal_failed");
-                    }
-                }
-                true
-            } else {
-                false
-            }
+            )
         })
     }
 }
@@ -666,6 +803,7 @@ impl CapabilityStore {
 pub(crate) fn issue_mcp_capability(
     soul_id: &SoulId,
     provider: &str,
+    opencode_input: OpencodeEphemeralInput<'_>,
 ) -> Result<McpCapabilityReference, String> {
     let home = std::env::var_os("HOME")
         .map(PathBuf::from)
@@ -676,6 +814,8 @@ pub(crate) fn issue_mcp_capability(
         &capability_dir()?,
         endpoint()?,
         Some((provider, &home, &references)),
+        opencode_input,
+        None,
     )
 }
 
@@ -737,10 +877,15 @@ pub(crate) async fn rehydrate_running_capabilities(
             store().revoke(&grant_id, &directory)?;
             continue;
         }
-        store().grants.lock().unwrap().insert(
-            grant_id.clone(),
-            restored_grant(stored, incarnation_id, path, &endpoint()?),
-        );
+        let grant = restored_grant(stored, incarnation_id, path, &endpoint()?);
+        if !grant.token.is_empty() {
+            write_capability(&grant.path, &grant)?;
+        }
+        store()
+            .grants
+            .lock()
+            .unwrap()
+            .insert(grant_id.clone(), grant);
     }
     cleanup_orphaned_provider_roots(&directory)?;
     Ok(())
@@ -826,8 +971,16 @@ mod tests {
             }
             .into(),
         });
-        let staged =
-            stage_provider_root(&capabilities, "grant-test", "claude", home.path(), &refs).unwrap();
+        let staged = stage_provider_root(
+            &capabilities,
+            "grant-test",
+            "claude",
+            home.path(),
+            &refs,
+            OpencodeEphemeralInput::default(),
+            None,
+        )
+        .unwrap();
         assert_eq!(
             std::fs::read_to_string(staged.join("settings.json")).unwrap(),
             "current setting"
@@ -846,6 +999,8 @@ mod tests {
                 &capabilities,
                 "http://host.docker.internal:4000".into(),
                 Some(("claude", home.path(), &refs)),
+                OpencodeEphemeralInput::default(),
+                None,
             )
             .unwrap();
         let issued_stage = staged_provider_root_path(&capabilities, &reference.grant_id).unwrap();
@@ -920,6 +1075,150 @@ mod tests {
     }
 
     #[test]
+    fn idle_grant_renews_without_calls_and_restart_rehydrates_expired_scope() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = CapabilityStore::default();
+        let soul = SoulId::new();
+        let incarnation = IncarnationId::new();
+        let reference = store
+            .issue(
+                soul.clone(),
+                dir.path(),
+                "http://host.docker.internal:4000".into(),
+                None,
+                OpencodeEphemeralInput::default(),
+                None,
+            )
+            .unwrap();
+        store
+            .activate(
+                &reference.grant_id,
+                soul.clone(),
+                incarnation.clone(),
+                dir.path(),
+                &reference.endpoint,
+            )
+            .unwrap();
+        let path = grant_path(dir.path(), &reference.grant_id).unwrap();
+        let initial: StoredCapabilityFile =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        let due = initial.expires_at - RENEWAL_WINDOW_SECS + 1;
+        let active = HashSet::from([(soul.clone(), incarnation.clone())]);
+        store.renew_active_at(due, &HashSet::new());
+        let still_initial: StoredCapabilityFile =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(still_initial.expires_at, initial.expires_at);
+        store.renew_active_at(due, &active);
+        let renewed: StoredCapabilityFile =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(renewed.scope, initial.scope);
+        assert!(renewed.expires_at > initial.expires_at);
+        assert!(freshell_api::check_scoped_auth(
+            Some(&renewed.scope),
+            &renewed.scope,
+            soul.as_str(),
+            Some(incarnation.as_str()),
+            renewed.expires_at,
+            initial.expires_at + 1,
+        ));
+        let after_idle = restored_grant_at(
+            StoredCapabilityFile {
+                expires_at: initial.expires_at - 1,
+                ..renewed
+            },
+            incarnation.clone(),
+            path.clone(),
+            &reference.endpoint,
+            initial.expires_at + 1,
+        );
+        assert_eq!(after_idle.token, initial.scope);
+        assert!(after_idle.expires_at > initial.expires_at + 1);
+        assert!(!freshell_api::check_scoped_auth(
+            Some(&initial.scope),
+            &initial.scope,
+            soul.as_str(),
+            Some(incarnation.as_str()),
+            initial.expires_at - 1,
+            initial.expires_at + 1,
+        ));
+        assert!(freshell_api::check_scoped_auth(
+            Some(&after_idle.token),
+            &after_idle.token,
+            soul.as_str(),
+            Some(incarnation.as_str()),
+            after_idle.expires_at,
+            initial.expires_at + 1,
+        ));
+        write_capability(&path, &after_idle).unwrap();
+        let reopened = CapabilityStore::default();
+        reopened
+            .grants
+            .lock()
+            .unwrap()
+            .insert(reference.grant_id.clone(), after_idle);
+        assert!(reopened.authenticates(&initial.scope));
+        store.revoke(&reference.grant_id, dir.path()).unwrap();
+        reopened.grants.lock().unwrap().remove(&reference.grant_id);
+        assert!(!reopened.authenticates(&initial.scope));
+    }
+
+    #[test]
+    fn opencode_private_stage_survives_reissue_without_durable_secret_bytes() {
+        let control = tempfile::tempdir().unwrap();
+        let capabilities = control.path().join("mcp-capabilities");
+        std::fs::create_dir(&capabilities).unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let tui = home.path().join("selected-tui.jsonc");
+        std::fs::write(&tui, "{ // selected\n\"plugin\":[\"user-selected-tui\"]}").unwrap();
+        let raw = r#"{"mcp":{"vendor":{"type":"local","command":["tool","--token","nested-secret-byte"]}}}"#;
+        let store = CapabilityStore::default();
+        let soul = SoulId::new();
+        let first = store
+            .issue(
+                soul.clone(),
+                &capabilities,
+                "http://host.docker.internal:4000".into(),
+                Some(("opencode", home.path(), &[])),
+                OpencodeEphemeralInput {
+                    inline_config: Some(raw),
+                    tui_config_path: Some(tui.to_str().unwrap()),
+                },
+                None,
+            )
+            .unwrap();
+        let first_stage = staged_provider_root_path(&capabilities, &first.grant_id).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(first_stage.join("ephemeral/inline-config.json")).unwrap(),
+            raw
+        );
+        assert_eq!(
+            std::fs::read_to_string(first_stage.join("ephemeral/tui-config.jsonc")).unwrap(),
+            "{ // selected\n\"plugin\":[\"user-selected-tui\"]}"
+        );
+        let second = store
+            .issue_replacement(
+                soul,
+                &capabilities,
+                "http://host.docker.internal:4000".into(),
+                Some(("opencode", home.path(), &[])),
+            )
+            .unwrap();
+        let second_stage = staged_provider_root_path(&capabilities, &second.grant_id).unwrap();
+        assert!(!first_stage.exists());
+        assert_eq!(
+            std::fs::read_to_string(second_stage.join("ephemeral/inline-config.json")).unwrap(),
+            raw
+        );
+        assert_eq!(
+            std::fs::read_to_string(second_stage.join("ephemeral/tui-config.jsonc")).unwrap(),
+            "{ // selected\n\"plugin\":[\"user-selected-tui\"]}"
+        );
+        assert!(!serde_json::to_string(&second)
+            .unwrap()
+            .contains("nested-secret-byte"));
+    }
+
+    #[test]
     fn managed_mcp_grant_is_private_scoped_rotated_and_revoked() {
         let dir = tempfile::tempdir().unwrap();
         let soul = SoulId::new();
@@ -931,6 +1230,8 @@ mod tests {
                 soul.clone(),
                 dir.path(),
                 "http://host.docker.internal:4000".into(),
+                None,
+                OpencodeEphemeralInput::default(),
                 None,
             )
             .unwrap();
@@ -982,6 +1283,19 @@ mod tests {
             .unwrap()
             .expires_at = now_secs() + 1;
         assert!(store.authenticates(replacement["scope"].as_str().unwrap()));
+        let active_incarnation = store
+            .grants
+            .lock()
+            .unwrap()
+            .get(&reference.grant_id)
+            .unwrap()
+            .incarnation_id
+            .clone()
+            .unwrap();
+        store.renew_active_at(
+            now_secs(),
+            &HashSet::from([(soul.clone(), active_incarnation)]),
+        );
         let renewed: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
         assert!(renewed["expiresAt"].as_u64().unwrap() > now_secs() + 7 * 24 * 60 * 60);
@@ -1010,6 +1324,8 @@ mod tests {
                 soul.clone(),
                 dir.path(),
                 "http://host.docker.internal:4000".into(),
+                None,
+                OpencodeEphemeralInput::default(),
                 None,
             )
             .unwrap();
@@ -1089,6 +1405,8 @@ mod tests {
                 soul.clone(),
                 &capability_dir().unwrap(),
                 endpoint().unwrap(),
+                None,
+                OpencodeEphemeralInput::default(),
                 None,
             )
             .unwrap();

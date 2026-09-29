@@ -3099,6 +3099,79 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn opencode_inline_secret_stays_out_of_registry_row_and_digest() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let workspace_path = std::fs::canonicalize(workspace.path()).unwrap();
+        let secret = "nested-command-argument-secret";
+        let private_stage = tempfile::tempdir().unwrap();
+        std::fs::write(
+            private_stage.path().join("inline-config.json"),
+            format!(r#"{{"mcp":{{"vendor":{{"type":"local","command":["tool","--token","{secret}"]}}}}}}"#),
+        ).unwrap();
+        let registry = Registry::open(dir.path(), None).unwrap();
+        let mut launch = prep(SoulId::new(), RequestId::new(), "typed-opencode-launch");
+        launch.provider = "opencode".into();
+        launch.terminal = Some(TerminalLaunchSpec {
+            terminal_id: "terminal-inline".into(),
+            stream_id: "stream-inline".into(),
+            mode: "opencode".into(),
+            program: "/bin/true".into(),
+            args: Vec::new(),
+            env: std::collections::BTreeMap::new(),
+            cwd: workspace_path.to_string_lossy().into_owned(),
+            run_as_uid: 65_534,
+            run_as_gid: 0,
+            cols: 80,
+            rows: 24,
+            project_key: "inline-test".into(),
+            workspace_path: workspace_path.to_string_lossy().into_owned(),
+            git_common_dir: None,
+            create_request_id: None,
+            resume_session_id: None,
+            provider_model: None,
+            provider_reasoning_effort: None,
+            provider_sandbox: None,
+            provider_permission_mode: None,
+            provider_bootstrap_files: Vec::new(),
+            provider_secret_references: Vec::new(),
+            provider_launch_context: Some(freshell_runtime_protocol::ProviderLaunchContext {
+                preparation: freshell_runtime_protocol::ProviderPreparation::Opencode {
+                    project_config: Vec::new(),
+                    tui_config: None,
+                    inline_config: true,
+                },
+                mcp_capability: Some(freshell_runtime_protocol::McpCapabilityReference {
+                    grant_id: "grant-inline".into(),
+                    endpoint: "http://host.docker.internal:3001".into(),
+                    provider_relative_path: ".freshell/mcp-capability.json".into(),
+                    host_gateway_address: None,
+                }),
+                config: Vec::new(),
+            }),
+        });
+        let digest_input = serde_json::to_vec(launch.terminal.as_ref().unwrap()).unwrap();
+        assert!(!String::from_utf8_lossy(&digest_input).contains(secret));
+        registry.prepare_launch(launch).await.unwrap();
+        let conn = open_connection(&registry.inner.db_path).unwrap();
+        let (row, digest): (String, String) = conn.query_row(
+            "SELECT i.terminal_spec,c.payload_digest FROM incarnations i JOIN commands c ON c.incarnation_id=i.incarnation_id LIMIT 1",
+            [], |row| Ok((row.get(0)?, row.get(1)?)),
+        ).unwrap();
+        assert!(row.contains("inline_config"));
+        assert!(!row.contains(secret));
+        assert!(!digest.contains(secret));
+        for candidate in [
+            registry.inner.db_path.clone(),
+            registry.inner.db_path.with_extension("sqlite3-wal"),
+        ] {
+            if let Ok(bytes) = std::fs::read(candidate) {
+                assert!(!String::from_utf8_lossy(&bytes).contains(secret));
+            }
+        }
+    }
+
     #[test]
     fn second_supervisor_cannot_own_same_registry() {
         let dir = tempfile::tempdir().unwrap();

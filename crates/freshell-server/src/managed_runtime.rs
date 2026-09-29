@@ -180,18 +180,66 @@ impl ManagedTerminalController for ServerManagedRuntimeController {
             };
             let args = managed_provider_args(&request.mode, request.spec.args)?;
             let request_id = stable_request_id(create_key)?;
+            let opencode_input = if request.mode == "opencode" {
+                crate::managed_mcp_capability::OpencodeEphemeralInput {
+                    inline_config: request
+                        .env
+                        .get("OPENCODE_CONFIG_CONTENT")
+                        .map(String::as_str),
+                    tui_config_path: request.env.get("OPENCODE_TUI_CONFIG").map(String::as_str),
+                }
+            } else {
+                Default::default()
+            };
             let mcp_capability = matches!(
                 request.mode.as_str(),
                 "claude" | "codex" | "opencode" | "amplifier"
             )
-            .then(|| crate::managed_mcp_capability::issue_mcp_capability(&soul_id, &request.mode))
+            .then(|| {
+                crate::managed_mcp_capability::issue_mcp_capability(
+                    &soul_id,
+                    &request.mode,
+                    opencode_input,
+                )
+            })
             .transpose()?;
-            let provider_launch_context =
+            let mut provider_launch_context =
                 crate::managed_provider_bootstrap::provider_launch_context_for_managed(
                     &request.mode,
                     &workspace,
                     mcp_capability.clone(),
                 );
+            if let Some(context) = provider_launch_context.as_mut() {
+                if let freshell_runtime_protocol::ProviderPreparation::Opencode {
+                    inline_config,
+                    tui_config,
+                    ..
+                } = &mut context.preparation
+                {
+                    *inline_config = opencode_input.inline_config.is_some();
+                    if opencode_input.tui_config_path.is_some() {
+                        let jsonc = opencode_input
+                            .tui_config_path
+                            .is_some_and(|path| path.to_ascii_lowercase().ends_with(".jsonc"));
+                        *tui_config = Some(freshell_runtime_protocol::ProviderConfigReference {
+                            root: freshell_runtime_protocol::ProviderConfigRoot::Ephemeral,
+                            relative_path: if jsonc {
+                                "tui-config.jsonc"
+                            } else {
+                                "tui-config.json"
+                            }
+                            .into(),
+                            provider_relative_path: if jsonc {
+                                ".freshell/opencode/user-tui.jsonc"
+                            } else {
+                                ".freshell/opencode/user-tui.json"
+                            }
+                            .into(),
+                            format: if jsonc { "jsonc" } else { "json" }.into(),
+                        });
+                    }
+                }
+            }
             if mcp_capability.is_some() && provider_launch_context.is_none() {
                 if let Some(capability) = &mcp_capability {
                     let _ =
@@ -709,72 +757,21 @@ fn managed_provider_env(
         {
             env.insert("FRESHELL_OPENCODE_REBIND".into(), value.clone());
         }
-        // The ordinary inline provider configuration is part of the launch
-        // recipe. Keep its non-secret fields and plugin list; named secrets
-        // are supplied separately by OneCLI at child spawn.
-        let mut config = source
-            .get("OPENCODE_CONFIG_CONTENT")
-            .filter(|raw| raw.len() <= 64 * 1024)
-            .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
-            .filter(serde_json::Value::is_object)
-            .unwrap_or_else(|| serde_json::json!({}));
-        strip_named_secret_fields(&mut config);
-        let permission = source
+        // Arbitrary inline JSON can carry credentials in values such as MCP
+        // command arguments. It is staged beside the private incarnation grant,
+        // never serialized into the supervisor's durable launch environment.
+        if let Some(permission) = source
             .get("FRESHELL_MANAGED_OPENCODE_BASH_PERMISSION")
             .map(String::as_str)
-            .filter(|value| matches!(*value, "ask" | "allow" | "deny"));
-        if let Some(permission) = permission {
-            if !config
-                .get("permission")
-                .is_some_and(serde_json::Value::is_object)
-            {
-                config["permission"] = serde_json::json!({});
-            }
-            config["permission"]["bash"] = serde_json::Value::String(permission.into());
-        }
-        if config
-            .as_object()
-            .is_some_and(|entries| !entries.is_empty())
+            .filter(|value| matches!(*value, "ask" | "allow" | "deny"))
         {
-            env.insert("OPENCODE_CONFIG_CONTENT".into(), config.to_string());
+            env.insert(
+                "FRESHELL_MANAGED_OPENCODE_BASH_PERMISSION".into(),
+                permission.into(),
+            );
         }
     }
     env
-}
-
-fn strip_named_secret_fields(value: &mut serde_json::Value) {
-    match value {
-        serde_json::Value::Object(fields) => fields.retain(|name, field| {
-            let name = name
-                .to_ascii_lowercase()
-                .chars()
-                .filter(char::is_ascii_alphanumeric)
-                .collect::<String>();
-            let secret = [
-                "secret",
-                "password",
-                "credential",
-                "apikey",
-                "accesstoken",
-                "refreshtoken",
-                "authorization",
-                "privatekey",
-            ]
-            .iter()
-            .any(|suffix| name.ends_with(suffix))
-                || name == "token";
-            if !secret {
-                strip_named_secret_fields(field);
-            }
-            !secret
-        }),
-        serde_json::Value::Array(values) => {
-            for field in values {
-                strip_named_secret_fields(field);
-            }
-        }
-        _ => {}
-    }
 }
 
 fn managed_provider_args(mode: &str, args: Vec<String>) -> Result<Vec<String>, String> {
@@ -1020,7 +1017,7 @@ mod tests {
     }
 
     #[test]
-    fn managed_opencode_keeps_ordinary_safe_inline_plugin_configuration() {
+    fn managed_opencode_inline_plugin_configuration_is_child_only() {
         let source = std::collections::BTreeMap::from([
             (
                 "OPENCODE_CONFIG_CONTENT".into(),
@@ -1030,11 +1027,7 @@ mod tests {
             ("FRESHELL_OPENCODE_REBIND".into(), "0".into()),
         ]);
         let env = managed_provider_env("opencode", &source);
-        let config: serde_json::Value =
-            serde_json::from_str(env.get("OPENCODE_CONFIG_CONTENT").unwrap()).unwrap();
-        assert_eq!(config["plugin"][0], "file:///workspace/plugin.ts");
-        assert_eq!(config["snapshot"], true);
-        assert_eq!(config["maxTokens"], 8192);
+        assert!(!env.contains_key("OPENCODE_CONFIG_CONTENT"));
         assert_eq!(
             env.get("FRESHELL_OPENCODE_REBIND").map(String::as_str),
             Some("0")
@@ -1042,18 +1035,26 @@ mod tests {
     }
 
     #[test]
-    fn managed_opencode_keeps_safe_fields_beside_onecli_secret_fields() {
+    fn managed_opencode_does_not_filter_inline_json_by_field_name() {
         let source = std::collections::BTreeMap::from([(
             "OPENCODE_CONFIG_CONTENT".into(),
             r#"{"plugin":["file:///workspace/plugin.ts"],"provider":{"apiKey":"raw-secret","model":"ordinary-model"}}"#.into(),
         )]);
         let env = managed_provider_env("opencode", &source);
-        let config: serde_json::Value =
-            serde_json::from_str(env.get("OPENCODE_CONFIG_CONTENT").unwrap()).unwrap();
-        assert_eq!(config["plugin"][0], "file:///workspace/plugin.ts");
-        assert_eq!(config["provider"]["model"], "ordinary-model");
-        assert!(config["provider"].get("apiKey").is_none());
+        assert!(!env.contains_key("OPENCODE_CONFIG_CONTENT"));
         assert!(!env.values().any(|value| value.contains("raw-secret")));
+    }
+
+    #[test]
+    fn managed_opencode_never_persists_nested_inline_secret_values() {
+        let source = std::collections::BTreeMap::from([(
+            "OPENCODE_CONFIG_CONTENT".into(),
+            r#"{"mcp":{"vendor":{"type":"local","command":["tool","--token","nested-secret-byte"]}},"provider":{"endpoint":"https://nested-secret-byte.example"}}"#.into(),
+        )]);
+        let env = managed_provider_env("opencode", &source);
+        let serialized = serde_json::to_string(&env).unwrap();
+        assert!(!serialized.contains("nested-secret-byte"));
+        assert!(!env.contains_key("OPENCODE_CONFIG_CONTENT"));
     }
 
     #[test]
@@ -1064,13 +1065,11 @@ mod tests {
                 allowed.to_string(),
             )]);
             let env = managed_provider_env("opencode", &source);
-            let config: serde_json::Value = serde_json::from_str(
-                env.get("OPENCODE_CONFIG_CONTENT")
-                    .expect("managed OpenCode config"),
-            )
-            .unwrap();
-            assert_eq!(config["permission"]["bash"], allowed);
-            assert!(!env.contains_key("FRESHELL_MANAGED_OPENCODE_BASH_PERMISSION"));
+            assert_eq!(
+                env.get("FRESHELL_MANAGED_OPENCODE_BASH_PERMISSION")
+                    .map(String::as_str),
+                Some(allowed)
+            );
         }
 
         let source = std::collections::BTreeMap::from([(
@@ -1095,10 +1094,12 @@ mod tests {
             ),
         ]);
         let env = managed_provider_env("opencode", &source);
-        let config: serde_json::Value =
-            serde_json::from_str(env.get("OPENCODE_CONFIG_CONTENT").unwrap()).unwrap();
-        assert_eq!(config["permission"]["bash"], "ask");
-        assert_eq!(config["permission"]["read"], "allow");
+        assert!(!env.contains_key("OPENCODE_CONFIG_CONTENT"));
+        assert_eq!(
+            env.get("FRESHELL_MANAGED_OPENCODE_BASH_PERMISSION")
+                .map(String::as_str),
+            Some("ask")
+        );
     }
 
     #[test]

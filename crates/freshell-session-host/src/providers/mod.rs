@@ -85,6 +85,31 @@ pub async fn prepare_terminal(
         prepare_provider_features(&terminal, "claude-mcp")?;
     }
     if terminal.mode == "opencode" {
+        if let Some(context) = terminal.provider_launch_context.as_ref() {
+            if let freshell_runtime_protocol::ProviderPreparation::Opencode {
+                tui_config,
+                inline_config,
+                ..
+            } = &context.preparation
+            {
+                if let Some(reference) = tui_config {
+                    terminal.env.insert(
+                        "OPENCODE_TUI_CONFIG".into(),
+                        format!(
+                            "/home/freshell/provider/{}",
+                            reference.provider_relative_path
+                        ),
+                    );
+                }
+                if *inline_config {
+                    let raw = std::fs::read_to_string(
+                        "/run/freshell-private/user-provider/ephemeral/inline-config.json",
+                    )
+                    .map_err(|_| "managed OpenCode inline config is unavailable")?;
+                    terminal.env.insert("OPENCODE_CONFIG_CONTENT".into(), raw);
+                }
+            }
+        }
         let rebind_disabled = matches!(
             terminal
                 .env
@@ -99,6 +124,9 @@ pub async fn prepare_terminal(
                 "/home/freshell/provider/.freshell/opencode/tui.json".into(),
             );
         }
+        let permission = terminal
+            .env
+            .remove("FRESHELL_MANAGED_OPENCODE_BASH_PERMISSION");
         if terminal
             .provider_launch_context
             .as_ref()
@@ -107,9 +135,19 @@ pub async fn prepare_terminal(
             let mut config = terminal
                 .env
                 .get("OPENCODE_CONFIG_CONTENT")
+                .or_else(|| child_env.get("OPENCODE_CONFIG_CONTENT"))
                 .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
                 .filter(serde_json::Value::is_object)
                 .unwrap_or_else(|| serde_json::json!({}));
+            if let Some(permission) = permission {
+                if !config
+                    .get("permission")
+                    .is_some_and(serde_json::Value::is_object)
+                {
+                    config["permission"] = serde_json::json!({});
+                }
+                config["permission"]["bash"] = serde_json::Value::String(permission);
+            }
             if !config.get("mcp").is_some_and(serde_json::Value::is_object) {
                 config["mcp"] = serde_json::json!({});
             }
@@ -118,9 +156,11 @@ pub async fn prepare_terminal(
                     "type":"local", "command":["node", "/opt/freshell-mcp/server.js"]
                 });
             }
+            let config = config.to_string();
             terminal
                 .env
-                .insert("OPENCODE_CONFIG_CONTENT".into(), config.to_string());
+                .insert("OPENCODE_CONFIG_CONTENT".into(), config.clone());
+            child_env.insert("OPENCODE_CONFIG_CONTENT".into(), config);
         }
     }
     apply_terminal_context(&mut terminal)?;

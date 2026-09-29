@@ -12,11 +12,12 @@ type RecordRow = { provider: Provider; kind: 'launch' | 'mcp' | 'identity'; [key
 const root = path.resolve(import.meta.dirname, '../../..')
 const fixture = path.join(root, 'test/fixtures/providers/parity-provider.mjs')
 const providers: Provider[] = ['claude', 'codex', 'opencode', 'amplifier']
+const nestedSecretMarker = 'nested-secret-byte'
 
-async function waitFor<T>(label: string, probe: () => T | undefined, timeoutMs = 45_000): Promise<T> {
+async function waitFor<T>(label: string, probe: () => T | undefined | Promise<T | undefined>, timeoutMs = 45_000): Promise<T> {
   const deadline = Date.now() + timeoutMs
   while (Date.now() < deadline) {
-    const value = probe()
+    const value = await probe()
     if (value !== undefined) return value
     await new Promise(resolve => setTimeout(resolve, 100))
   }
@@ -67,6 +68,7 @@ class TerminalWire {
   send(frame: unknown): void { this.socket.send(JSON.stringify(frame)) }
 
   recentFrames(): any[] { return this.frames.slice(-12) }
+  terminalOutput(): string { return this.frames.filter(frame => frame.type === 'terminal.output').map(frame => frame.data).join('').slice(-4000) }
   recordRows(): RecordRow[] { return this.records }
 
   wait(predicate: (frame: any) => boolean, timeoutMs: number): Promise<any> {
@@ -82,12 +84,16 @@ class TerminalWire {
       message.requestId === requestId && (message.type === 'terminal.created' || message.type === 'error')
     ), 90_000)
     if (frame.type === 'error') throw new Error(`${provider} terminal.create failed: ${JSON.stringify(frame)}`)
+    await this.attach(frame.terminalId)
+    return { requestId, terminalId: frame.terminalId }
+  }
+
+  async attach(terminalId: string): Promise<void> {
     const attachRequestId = `provider-parity-attach-${randomUUID()}`
-    this.send({ type: 'terminal.attach', terminalId: frame.terminalId, intent: 'viewport_hydrate',
+    this.send({ type: 'terminal.attach', terminalId, intent: 'viewport_hydrate',
       cols: 80, rows: 24, sinceSeq: 0, attachRequestId, priority: 'background' })
     await this.wait(message => message.type === 'terminal.attach.ready'
-      && message.terminalId === frame.terminalId && message.attachRequestId === attachRequestId, 10_000)
-    return { requestId, terminalId: frame.terminalId }
+      && message.terminalId === terminalId && message.attachRequestId === attachRequestId, 10_000)
   }
 
   async close(): Promise<void> {
@@ -133,10 +139,15 @@ function normalized(record: RecordRow): unknown {
       FRESHELL_TERMINAL_ID_PRESENT: Boolean(env.FRESHELL_TERMINAL_ID),
       FRESHELL_TAB_ID: env.FRESHELL_TAB_ID,
       FRESHELL_PANE_ID: env.FRESHELL_PANE_ID,
-      OPENCODE_TUI_CONFIG_PRESENT: Boolean(env.OPENCODE_TUI_CONFIG),
+      ...(record.provider === 'opencode'
+        ? { OPENCODE_TUI_CONFIG_PRESENT: Boolean(env.OPENCODE_TUI_CONFIG) }
+        : {}),
     },
     providerConfig: record.providerConfig,
     providerPlugin: record.providerPlugin,
+    projectedProjectConfig: record.projectedProjectConfig,
+    tuiConfig: record.tuiConfig,
+    inlineConfig: record.inlineConfig,
     projectPlugin: record.projectPlugin,
     projectConfig: record.projectConfig,
     nativeSession: record.nativeSession?.source === 'argv'
@@ -174,6 +185,7 @@ describe('ordinary and managed terminal provider parity', () => {
     fs.writeFileSync(path.join(workspace, 'opencode.jsonc'), '{ // provider parity\n  "plugin": ["file://parity-plugin.js"]\n}\n')
     fs.writeFileSync(path.join(workspace, '.opencode/opencode.json'), JSON.stringify({ plugin: ['file://parity-plugin.js'] }))
     fs.writeFileSync(path.join(workspace, 'parity-plugin.js'), 'export default {}\n')
+    fs.writeFileSync(path.join(workspace, 'user-tui.json'), JSON.stringify({ plugin: ['file://user-selected-tui.js'] }))
     fs.chmodSync(path.join(workspace, '.opencode'), 0o777)
     for (const [source, target] of [
       [fixture, 'parity-provider.mjs'],
@@ -195,6 +207,11 @@ describe('ordinary and managed terminal provider parity', () => {
     }
     rig = new ManagedRuntimeBrowserRig(root, 2, {
       FRESHELL_BIND_HOST: '0.0.0.0',
+      OPENCODE_TUI_CONFIG: path.join(workspace, 'user-tui.json'),
+      OPENCODE_CONFIG_CONTENT: JSON.stringify({ mcp: { vendor: {
+        type: 'local', command: ['vendor-tool', '--token', nestedSecretMarker],
+        endpoint: `https://${nestedSecretMarker}.example`,
+      } } }),
       ...Object.fromEntries(
         providers.map(provider => [`${provider.toUpperCase()}_CMD`, path.join(workspace, `parity-${provider}`)]),
       ),
@@ -248,7 +265,9 @@ describe('ordinary and managed terminal provider parity', () => {
     const observed: RecordRow[] = []
     const mcpResults: RecordRow[] = []
     const identities: RecordRow[] = []
+    let managedSoulId: string | undefined
     for (const managed of [false, true]) {
+      if (provider === 'opencode') makeReadableTree(path.join(workspace, '.opencode'))
       const wire = await TerminalWire.connect(rig.info, managed)
       sockets.push(wire)
       let terminalId: string
@@ -260,9 +279,23 @@ describe('ordinary and managed terminal provider parity', () => {
       const launch = await waitFor(`${provider} ${managed ? 'managed' : 'ordinary'} launch`, () => (
         wire.recordRows().find(row => row.provider === provider && row.kind === 'launch')
       )).catch(error => {
-        throw new Error(`${String(error)}; recent frames: ${JSON.stringify(wire.recentFrames())}`)
+        throw new Error(`${String(error)}; records: ${JSON.stringify(wire.recordRows())}; output: ${wire.terminalOutput()}`)
       })
       observed.push(launch)
+      if (provider === 'opencode' && managed) {
+        const view = await waitFor('managed OpenCode container for secret inspection', async () => {
+          const value = await rig.runningViewForTerminal(terminalId)
+          return value?.containerId ? value : undefined
+        })
+        if (!view.containerId) throw new Error('managed OpenCode container missing')
+        managedSoulId = view.soulId
+        expect(JSON.stringify(rig.runtime.inspectContainer(view.containerId))).not.toContain(nestedSecretMarker)
+        expect(rig.runtime.containerLogs(view.containerId)).not.toContain(nestedSecretMarker)
+        expect(rig.runtime.containerLogs(rig.supervisor.containerId)).not.toContain(nestedSecretMarker)
+        if (fs.existsSync(rig.info.debugLogPath)) {
+          expect(fs.readFileSync(rig.info.debugLogPath, 'utf8')).not.toContain(nestedSecretMarker)
+        }
+      }
       const mcp = await waitFor(`${provider} ${managed ? 'managed' : 'ordinary'} MCP probe`, () => (
         wire.recordRows().find(row => row.provider === provider && row.kind === 'mcp')
       ))
@@ -282,6 +315,11 @@ describe('ordinary and managed terminal provider parity', () => {
       }
     }
     expect(normalized(observed[1])).toEqual(normalized(observed[0]))
+    if (provider === 'opencode') {
+      expect(observed[1].tuiConfig).toBe(fs.readFileSync(path.join(workspace, 'user-tui.json'), 'utf8'))
+      expect(observed[1].inlineConfig).toEqual(observed[0].inlineConfig)
+      expect(observed[1].inlineConfig).toMatch(/^[a-f0-9]{64}$/)
+    }
     if (provider === 'claude' || provider === 'amplifier') {
       expect(observed[0].nativeSession).toMatchObject({ source: 'argv', value: expect.any(String) })
       expect(observed[1].nativeSession).toMatchObject({ source: 'argv', value: expect.any(String) })
@@ -297,5 +335,53 @@ describe('ordinary and managed terminal provider parity', () => {
       ? { error: mcpResults[0].error }
       : { tools: mcpResults[0].tools, call: mcpResults[0].call })
     expect(observed[1].mcpRecipePresent).toBe(observed[0].mcpRecipePresent)
+    if (managedSoulId) await rig.stopSoul(managedSoulId)
   }, 180_000)
+
+  it('resumed OpenCode child sees refreshed config and keeps provider-owned state', async () => {
+    const wire = await TerminalWire.connect(rig.info, true)
+    sockets.push(wire)
+    const { terminalId } = await wire.create('opencode', workspace)
+    const first = await waitFor('initial OpenCode launch', () => wire.recordRows().find(row => (
+      row.provider === 'opencode' && row.kind === 'launch'
+    )))
+    wire.send({ type: 'terminal.input', terminalId, data: 'replacement parity prompt\r' })
+    await waitFor('OpenCode native identity', () => wire.recordRows().find(row => (
+      row.kind === 'identity' && row.terminalId === terminalId
+    )))
+    const before = await waitFor('running OpenCode incarnation', async () => {
+      const view = await rig.runningViewForTerminal(terminalId)
+      return view?.containerId ? view : undefined
+    })
+    if (!before.containerId) throw new Error('initial OpenCode container missing')
+    rig.ownedProviderExec(before.containerId, ['sh', '-c',
+      'printf provider-owned-state > /home/freshell/provider/.config/opencode/plugins/provider-owned.txt'])
+    fs.writeFileSync(path.join(rig.info.homeDir, '.config/opencode/new-provider.jsonc'), '{"replacement":true}\n')
+    fs.writeFileSync(path.join(rig.info.homeDir, '.config/opencode/opencode.jsonc'), '{"replacementOriginal":true}\n')
+    fs.rmSync(path.join(rig.info.homeDir, '.config/opencode/plugins/parity-plugin.js'))
+    fs.rmSync(path.join(workspace, '.opencode/opencode.json'))
+    rig.runtime.killOwnedRuntimeExact(before.containerId)
+    const after = await waitFor('replacement OpenCode incarnation', async () => {
+      const view = await rig.runningViewForTerminal(terminalId)
+      return view?.containerId && view.incarnationId !== before.incarnationId ? view : undefined
+    }, 300_000)
+    expect(after.soulId).toBe(before.soulId)
+    await wire.attach(terminalId)
+    const resumed = await waitFor('resumed OpenCode child observation', () => wire.recordRows().find(row => (
+      row.provider === 'opencode' && row.kind === 'launch' && row.launchId !== first.launchId
+    )), 90_000)
+    expect(resumed.providerConfig['new-provider.jsonc']).toEqual({ replacement: true })
+    expect(resumed.providerConfig['opencode.jsonc']).toEqual({ replacementOriginal: true })
+    expect(resumed.providerPlugin).toBeNull()
+    expect(resumed.projectConfig.dotOpencodeJson).toBeNull()
+    expect(resumed.projectedProjectConfig).toBeNull()
+    expect(resumed.providerOwned).toBe('provider-owned-state')
+    expect(resumed.tuiConfig).toBe(first.tuiConfig)
+    const resumedMcp = await waitFor('resumed OpenCode MCP probe', () => wire.recordRows().filter(row => (
+      row.provider === 'opencode' && row.kind === 'mcp'
+    ))[1], 90_000).catch(error => {
+      throw new Error(`${String(error)}; records: ${JSON.stringify(wire.recordRows())}; output: ${wire.terminalOutput()}`)
+    })
+    expect(resumedMcp.authenticatedCall).toMatchObject({ isError: false, count: 0 })
+  }, 360_000)
 })

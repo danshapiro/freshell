@@ -2373,6 +2373,7 @@ mod tests {
                 preparation: freshell_runtime_protocol::ProviderPreparation::Opencode {
                     project_config: Vec::new(),
                     tui_config: None,
+                    inline_config: false,
                 },
                 mcp_capability: Some(freshell_runtime_protocol::McpCapabilityReference {
                     grant_id: "grant-prior".into(),
@@ -2412,6 +2413,7 @@ mod tests {
             preparation: ProviderPreparation::Opencode {
                 project_config: vec![],
                 tui_config: None,
+                inline_config: false,
             },
             mcp_capability: None,
             config: vec![],

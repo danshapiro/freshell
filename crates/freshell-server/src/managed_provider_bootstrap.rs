@@ -79,6 +79,7 @@ pub(crate) fn provider_launch_context_from_home(
             ProviderPreparation::Opencode {
                 project_config: Vec::new(),
                 tui_config: None,
+                inline_config: false,
             },
         ),
         "amplifier" => (
@@ -121,6 +122,7 @@ pub(crate) fn provider_launch_context_from_home(
             ProviderPreparation::Opencode {
                 project_config,
                 tui_config,
+                inline_config: false,
             }
         }
         other => other,

@@ -3,12 +3,14 @@
 // The wrapper basename supplies the provider, so no test-only environment has
 // to cross the managed launch allowlist.
 import { spawn } from 'node:child_process'
+import { createHash, randomUUID } from 'node:crypto'
 import fs from 'node:fs'
 import path from 'node:path'
 
 const provider = path.basename(process.argv[1]).replace(/^parity-/, '')
 const argv = process.argv.slice(2)
 const cwd = process.cwd()
+const launchId = randomUUID()
 
 function readJson(file) {
   try { return JSON.parse(fs.readFileSync(file, 'utf8')) } catch { return null }
@@ -139,6 +141,7 @@ const nativeIdArgIndex = provider === 'claude'
   : provider === 'amplifier' && argv.includes('resume') ? argv.length - 2 : -1
 append({
   kind: 'launch',
+  launchId,
   argv,
   cwd,
   env: {
@@ -150,13 +153,29 @@ append({
     FRESHELL_PANE_ID: process.env.FRESHELL_PANE_ID,
     OPENCODE_TUI_CONFIG: process.env.OPENCODE_TUI_CONFIG,
   },
+  tuiConfig: provider === 'opencode' && process.env.OPENCODE_TUI_CONFIG
+    ? fs.readFileSync(process.env.OPENCODE_TUI_CONFIG, 'utf8') : null,
+  inlineConfig: provider === 'opencode'
+    ? (() => {
+      try {
+        const vendor = JSON.parse(process.env.OPENCODE_CONFIG_CONTENT ?? '')?.mcp?.vendor
+        return vendor ? createHash('sha256').update(JSON.stringify(vendor)).digest('hex') : null
+      } catch { return null }
+    })()
+    : null,
   providerConfig: providerHome ? Object.fromEntries(
-    ['settings.json', 'config.toml', 'opencode.json', 'opencode.jsonc', 'config.yaml']
+    ['settings.json', 'config.toml', 'opencode.json', 'opencode.jsonc', 'config.yaml', 'new-provider.jsonc']
       .map(name => [name, readJson(path.join(providerHome, name)) ?? (fs.existsSync(path.join(providerHome, name)) ? fs.readFileSync(path.join(providerHome, name), 'utf8') : null)])
       .filter(([, value]) => value !== null),
   ) : {},
   providerPlugin: pluginPath && fs.existsSync(pluginPath) ? fs.readFileSync(pluginPath, 'utf8') : null,
+  providerOwned: providerHome && fs.existsSync(path.join(providerHome, 'plugins/provider-owned.txt'))
+    ? fs.readFileSync(path.join(providerHome, 'plugins/provider-owned.txt'), 'utf8') : null,
   projectPlugin: existing('parity-plugin.js'),
+  projectedProjectConfig: provider === 'opencode' && providerHome
+    ? (fs.existsSync(path.join(providerHome, 'project/.opencode/opencode.json'))
+      ? fs.readFileSync(path.join(providerHome, 'project/.opencode/opencode.json'), 'utf8') : null)
+    : null,
   nativeSession: nativeIdArgIndex >= 0 && argv[nativeIdArgIndex + 1]
     ? { source: 'argv', value: argv[nativeIdArgIndex + 1] }
     : { source: 'provider-store', value: null },

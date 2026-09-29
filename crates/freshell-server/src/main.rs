@@ -1127,6 +1127,7 @@ async fn main() -> ExitCode {
                     eprintln!("managed MCP grant recovery failed: {error}");
                     std::process::exit(1);
                 });
+            managed_mcp_capability::spawn_renewal_loop(client.clone());
         }
         registry.set_managed_controller(controller.map(|controller| {
             controller as Arc<dyn freshell_terminal::registry::ManagedTerminalController>
