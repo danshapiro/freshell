@@ -253,7 +253,7 @@ export function buildManagedRuntimeMergePlan(
 
   for (const view of views) {
     const soul = souls.get(view.soulId)
-    if (!soul || soul.desiredState !== 'running') continue
+    if (!soul) continue
 
     const exactOnly = view.kind === 'explicit'
     const location = locations.find((candidate) => {
@@ -286,6 +286,12 @@ export function buildManagedRuntimeMergePlan(
       })
       continue
     }
+
+    // A stopped/lost soul is a decision that belongs to an existing pane. It
+    // must never reconstruct a view after the supervisor has certified that
+    // the old conversation cannot continue. Only a desired running soul may
+    // create a missing visible view.
+    if (soul.desiredState !== 'running') continue
 
     // Detached/hidden intents update a still-present local view honestly but
     // never manufacture a new one. A later supervisor startup may promote an

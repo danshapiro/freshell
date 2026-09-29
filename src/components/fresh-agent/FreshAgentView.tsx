@@ -19,8 +19,10 @@ import { getWsClient, RECONCILE_VERDICT_WAIT_MS } from '@/lib/ws-client'
 import { sendSuppressedAwareFreshAgentFrame } from '@/lib/fresh-agent-configure'
 import { KILL_ACK_TIMEOUT_MESSAGE, KILL_FAILED_MESSAGE, sendFreshAgentKillAndAwait, sendFreshAgentRecoveryStopAndAwait } from '@/lib/kill-ack'
 import { createLogger } from '@/lib/client-logger'
-import { api, getFreshAgentModelCapabilities, getFreshAgentThreadSnapshot, setSessionMetadata } from '@/lib/api'
-import { clearReconcilePendingPane, consumePaneRefreshRequest, mergePaneContent, updatePaneContent } from '@/store/panesSlice'
+import { api, getFreshAgentModelCapabilities, getFreshAgentThreadSnapshot, retryManagedRuntimeSoul, setSessionMetadata } from '@/lib/api'
+import { clearReconcilePendingPane, consumePaneRefreshRequest, mergePaneContent, startNewManagedRuntimeConversation, updatePaneContent } from '@/store/panesSlice'
+import { isManagedRuntimeRecoveryDecision, ManagedRuntimeRecoveryCard } from '@/components/ManagedRuntimeRecoveryCard'
+import { queueManagedRuntimeRefresh } from '@/lib/recovery/managed-runtime-recovery'
 import { FRESH_AGENT_MODEL_CATALOG_UNAVAILABLE_NOTICE } from '@/lib/fresh-agent-model-capabilities'
 import { applyRefusalFence, clearPendingCreateFailure, clearRestoreFailure, clearSessionError, clearSessionLost, sessionError, setSessionStatus } from '@/store/freshAgentSlice'
 import { openSessionTab } from '@/store/tabsSlice'
@@ -685,6 +687,7 @@ export function FreshAgentView({
   const dispatch = useAppDispatch()
   const ws = getWsClient()
   const appStore = useAppStore()
+  const managedRecoveryDecision = isManagedRuntimeRecoveryDecision(paneContent.recoverySummary)
   const terminalFontSize = useAppSelector(
     (state) => state.settings.settings.terminal?.fontSize,
   ) ?? 16
@@ -1300,7 +1303,7 @@ export function FreshAgentView({
 
   const sendFencedFreshAgentAttach = useCallback((attempt: AttachmentAttempt): boolean => {
     const content = paneContentRef.current
-    if (!isMountedRef.current || !content.sessionId) return false
+    if (!isMountedRef.current || !content.sessionId || isManagedRuntimeRecoveryDecision(content.recoverySummary)) return false
     // One state read (review N1): the suppression check and the current-round
     // identity check observe the same store snapshot — nothing dispatches in
     // between. A queued callback may never upgrade itself to a newer fence.
@@ -1402,7 +1405,7 @@ export function FreshAgentView({
    * retry frame carries exactly the same fields, plus the route cwd. */
   const sendFreshAgentSendFrame = useCallback((requestId: string, text: string, cwd?: string) => {
     const current = paneContentRef.current
-    if (!current.sessionId) return
+    if (!current.sessionId || isManagedRuntimeRecoveryDecision(current.recoverySummary)) return
     // b8ke ext r8 F5: the send is a lifecycle producer — it carries the
     // observed (epoch, generation) fence so a queued send landing after a
     // crash + generation advance is typed-refused server-side, never an
@@ -1425,7 +1428,7 @@ export function FreshAgentView({
         ...(getEffectiveFreshAgentEffort(current, providerDefaults) ? { effort: getEffectiveFreshAgentEffort(current, providerDefaults) } : {}),
       },
     })
-  }, [providerDefaults, sendFreshAgentMessage])
+  }, [appStore, providerDefaults, sendFreshAgentMessage])
 
   /** Task 10: re-issue a failed send under a fresh requestId with the
    * retained text + route cwd. The retry gets its own pending-metadata entry
@@ -1625,29 +1628,18 @@ export function FreshAgentView({
       setLocalEcho(null)
       alwaysAllowToolsRef.current.clear()
       pendingAutoTitleBySessionIdRef.current.clear()
-      dispatch(updatePaneContent({
-        tabId,
-        paneId,
-        content: {
-          ...current,
-          createRequestId: nanoid(),
-          sessionId: undefined,
-          sessionRef: undefined,
-          resumeSessionId: undefined,
-          restoreError: undefined,
-          createError: undefined,
-          status: 'creating',
-          pendingLocalEcho: undefined,
-          // Unified agent names: a deliberate NEW conversation never
-          // inherits the previous conversation's pre-durable identity or
-          // canonical projection — the new conversation mints its own
-          // handle and gets its own name lifecycle.
-          namingHandle: undefined,
-          nameRef: undefined,
-        },
-      }))
+      dispatch(startNewManagedRuntimeConversation({ tabId, paneId }))
     })()
   }, [appStore, commitSnapshot, dispatch, paneId, sendFreshAgentMessage, setLocalEcho, tabId])
+
+  const retryManagedRecovery = useCallback(async () => {
+    const current = paneContentRef.current
+    if (!current.soulId || typeof current.soulIntentRevision !== 'number') {
+      throw new Error('Managed recovery is missing its current revision.')
+    }
+    await retryManagedRuntimeSoul(current.soulId, current.soulIntentRevision)
+    await queueManagedRuntimeRefresh(appStore, 'pane-recovery-retry')
+  }, [appStore])
 
   const sendFork = useCallback((atTurnId?: string) => {
     const current = paneContentRef.current
@@ -1777,13 +1769,17 @@ export function FreshAgentView({
       sendRollback(direction, 'step')
       return
     }
-  }, [descriptor?.label, sendFork, sendFreshAgentMessage, sendRollback, startNewConversation])
+  }, [appStore, descriptor?.label, sendFork, sendFreshAgentMessage, sendRollback, startNewConversation])
 
   useEffect(() => {
     if (!refreshRequest) return
     if (handledRefreshRequestIdRef.current === refreshRequest.requestId) return
     const current = paneContentRef.current
     if (!paneRefreshTargetMatchesContent(refreshRequest.target, current)) return
+    if (isManagedRuntimeRecoveryDecision(current.recoverySummary)) {
+      dispatch(consumePaneRefreshRequest({ tabId, paneId, requestId: refreshRequest.requestId }))
+      return
+    }
 
     handledRefreshRequestIdRef.current = refreshRequest.requestId
     commitSnapshot(null)
@@ -1839,8 +1835,9 @@ export function FreshAgentView({
       clearTimeout(restoreTimeoutRef.current)
       restoreTimeoutRef.current = null
     }
-    const nextRequestId = nanoid()
     const current = paneContentRef.current
+    if (isManagedRuntimeRecoveryDecision(current.recoverySummary)) return
+    const nextRequestId = nanoid()
     // Codex threads don't carry Claude's UUID-format durable identity, so they
     // resolve their canonical resume id through the codex-specific helper
     // instead of getCanonicalDurableSessionId/getCanonicalPaneResumeSessionId
@@ -1891,6 +1888,7 @@ export function FreshAgentView({
   const restartStuckSidecar = useCallback(() => {
     if (recoveryStopPendingRef.current) return
     const current = paneContentRef.current
+    if (isManagedRuntimeRecoveryDecision(current.recoverySummary)) return
     // b8ke ext F2: the kill target is the pane's DURABLE session —
     // content.sessionId OR the restored pane's sessionRef.sessionId
     // (pre-ext a sessionRef-only pane skipped the kill and re-drove
@@ -1949,6 +1947,7 @@ export function FreshAgentView({
   const lostReconcileRef = useRef<PaneReconcileRequest | null>(null)
 
   const reconcileLostPane = useCallback(() => {
+    if (isManagedRuntimeRecoveryDecision(paneContentRef.current.recoverySummary)) return
     const request = buildReconcileRequestForPanes(appStore.getState(), [{ tabId, paneId }])
     if (!request) {
       // The pane lost its reconcilable state (no createRequestId) -- fall
@@ -1998,6 +1997,7 @@ export function FreshAgentView({
     state.timer = setTimeout(() => {
       state.timer = null
       const current = paneContentRef.current
+      if (isManagedRuntimeRecoveryDecision(current.recoverySummary)) return
       if (current.sessionId) {
         // Attach loser: re-send the (fenced, divergence-gated) attach
         // directly — the attach effect keys on sessionId, which has not
@@ -2012,6 +2012,7 @@ export function FreshAgentView({
   }, [captureFreshAgentAttachmentAttempt, clearReserveRedrive, dispatch, paneId, reconcileLostPane, sendFencedFreshAgentAttach, tabId])
 
   useEffect(() => {
+    if (managedRecoveryDecision) return
     if (paneContent.sessionId) return
     if (paneContent.restoreError) return
     if (
@@ -2083,6 +2084,10 @@ export function FreshAgentView({
         return
       }
       const current = paneContentRef.current
+      if (isManagedRuntimeRecoveryDecision(current.recoverySummary)) {
+        release?.()
+        return
+      }
       if (current.sessionId) {
         release?.()
         return
@@ -2136,6 +2141,7 @@ export function FreshAgentView({
     appStore,
     buildCreateMessage,
     dispatch,
+    managedRecoveryDecision,
     paneId,
     paneContent,
     // reconcilePendingSince: re-run when the pane's pre-verdict wait state
@@ -2161,6 +2167,10 @@ export function FreshAgentView({
           return
         }
         const latest = paneContentRef.current
+        if (isManagedRuntimeRecoveryDecision(latest.recoverySummary)) {
+          release?.()
+          return
+        }
         if (latest.sessionId) {
           release?.()
           return
@@ -2210,14 +2220,17 @@ export function FreshAgentView({
     paneId,
     paneContent.sessionId,
     paneContent.status,
+    paneContent.recoverySummary?.desiredState,
+    paneContent.recoverySummary?.recoveryState,
     releasePendingRebind,
     sendFreshAgentMessage,
     ws,
   ])
 
   useEffect(() => {
+    if (managedRecoveryDecision) return
     if (!paneContent.sessionId) return
-    const attempt = captureFreshAgentAttachmentAttempt(paneContent)
+    const attempt = captureFreshAgentAttachmentAttempt(paneContentRef.current)
     const sendAttach = () => {
       sendFencedFreshAgentAttach(attempt)
     }
@@ -2243,6 +2256,7 @@ export function FreshAgentView({
     paneContent.createRequestId,
     paneContent.reconcileEpoch,
     paneContent.provider,
+    managedRecoveryDecision,
     paneContent.sessionId,
     paneContent.sessionRef?.provider,
     paneContent.sessionRef?.sessionId,
@@ -2260,6 +2274,7 @@ export function FreshAgentView({
       queueMicrotask(() => {
         if (!isMountedRef.current) return
         const current = paneContentRef.current
+        if (isManagedRuntimeRecoveryDecision(current.recoverySummary)) return
         if (!current.sessionId) return
         const attempt = captureFreshAgentAttachmentAttempt(current)
         const sendAttach = () => {
@@ -2289,6 +2304,7 @@ export function FreshAgentView({
     paneId,
     paneContent.sessionId,
     paneContent.reconcileEpoch,
+    managedRecoveryDecision,
     markSnapshotDirty,
     requestSnapshotRefresh,
     sendFencedFreshAgentAttach,
@@ -2319,6 +2335,7 @@ export function FreshAgentView({
   useEffect(() => {
     if (typeof ws.onMessage !== 'function') return
     const unsubscribe = ws.onMessage((message) => {
+      if (isManagedRuntimeRecoveryDecision(paneContentRef.current.recoverySummary)) return
       if (message.type === 'pane.reconcile.result') {
         // Fold-ownership rule (pane-reconcile.ts): fold ONLY the result whose
         // reconcileId this view minted for its .lost reconcile; foreign
@@ -2326,6 +2343,7 @@ export function FreshAgentView({
         const lostRequest = lostReconcileRef.current
         if (lostRequest && message.reconcileId === lostRequest.reconcileId) {
           lostReconcileRef.current = null
+          if (isManagedRuntimeRecoveryDecision(paneContentRef.current.recoverySummary)) return
           foldVerdicts(dispatch, lostRequest, message)
           // markSessionLost's counterpart: an attach fold where the durable id
           // equals the old sessionId leaves the SAME freshAgent session entry
@@ -2635,6 +2653,7 @@ export function FreshAgentView({
   }, [agentSession?.cwd, appStore, captureFreshAgentAttachmentAttempt, clearReserveRedrive, commitSnapshot, descriptor?.label, dispatch, markSnapshotDirty, migratePendingAutoTitle, paneContent, paneContent.createRequestId, paneId, recordPendingSendMetadata, redriveAfterSessionReserved, releasePendingRebind, requestRevealRefresh, requestSnapshotRefresh, resendPendingMessage, sendFencedFreshAgentAttach, sendFreshAgentMessage, setLocalEcho, tabId, ws])
 
   useEffect(() => {
+    if (managedRecoveryDecision) return
     if (!snapshotThreadId) return
     // kata b8ke: a divergent pane (the canonical session's runtime owner is
     // the other kind) stops ALL old-kind snapshot traffic — polling, event
@@ -2890,6 +2909,7 @@ export function FreshAgentView({
       }
       if (paneContent.provider === 'codex' && isUnmaterializedCodexThreadError(error)) {
         const fresh = paneContentRef.current
+        if (isManagedRuntimeRecoveryDecision(fresh.recoverySummary)) return
         setLoadError(null)
         commitSnapshot(null)
         dispatch(updatePaneContent({
@@ -2909,6 +2929,7 @@ export function FreshAgentView({
       }
       if (paneContent.provider === 'opencode' && isLostFreshOpencodeThreadError(error)) {
         const fresh = paneContentRef.current
+        if (isManagedRuntimeRecoveryDecision(fresh.recoverySummary)) return
         setLoadError(null)
         commitSnapshot(null)
         dispatch(updatePaneContent({
@@ -3051,12 +3072,14 @@ export function FreshAgentView({
     // paneContentRef.current inside the effect.
   }, [
     agentSession?.lost,
+    appStore,
     captureFreshAgentAttachmentAttempt,
     claudeSession,
     isRestoring,
     dispatch,
     paneContent.provider,
     paneContent.createRequestId,
+    managedRecoveryDecision,
     paneContent.sessionId,
     paneContent.sessionType,
     paneId,
@@ -3169,6 +3192,7 @@ export function FreshAgentView({
   // elsewhere in this file) that predates this effect and must not be
   // double-driven.
   useEffect(() => {
+    if (managedRecoveryDecision) return
     if (paneContent.provider !== 'claude' && paneContent.provider !== 'codex') return
     if (!paneContent.sessionId || !agentSession?.lost) return
     // fresh-eyes F4: the connectionStatus dep also fires on ready->disconnected.
@@ -3184,6 +3208,7 @@ export function FreshAgentView({
       restoreTimeoutRef.current = window.setTimeout(() => {
         restoreTimeoutRef.current = null
         if (paneContentRef.current.sessionId !== sessionIdForRecovery) return
+        if (isManagedRuntimeRecoveryDecision(paneContentRef.current.recoverySummary)) return
         if (!agentSession?.lost) return
         if (isFreshAgentReconcileActive()) reconcileLostPane()
         else triggerRecovery()
@@ -3203,6 +3228,7 @@ export function FreshAgentView({
     agentSession?.lost,
     connectionStatus,
     paneContent.provider,
+    managedRecoveryDecision,
     paneContent.sessionId,
     reconcileLostPane,
     triggerRecovery,
@@ -3238,7 +3264,7 @@ export function FreshAgentView({
     : (agentSession as { lastError?: string } | undefined)?.lastError ?? null
   // sessionEnded gates everything: a stale snapshot can still claim
   // capabilities.send after the provider process died.
-  const canSend = !sessionEnded && (snapshot?.capabilities?.send === true || (
+  const canSend = !managedRecoveryDecision && !sessionEnded && (snapshot?.capabilities?.send === true || (
     paneContent.provider === 'claude'
     && Boolean(paneContent.sessionId)
     && !isRestoring
@@ -3254,7 +3280,7 @@ export function FreshAgentView({
   // disabled so a user cannot submit text, get a local echo, and issue an
   // old-kind send the server's generation fence would refuse with a
   // misleading failure instead of the pane's recoverable attach action.
-  const composerDisabled = !paneContent.sessionId || sessionEnded || (!canSend && !isBusy) || Boolean(ownerDivergence)
+  const composerDisabled = managedRecoveryDecision || !paneContent.sessionId || sessionEnded || (!canSend && !isBusy) || Boolean(ownerDivergence)
 
   useEffect(() => {
     const outgoing = outgoingTurnRef.current
@@ -3307,7 +3333,7 @@ export function FreshAgentView({
   /** Core outgoing-message path shared by direct sends and queue flushes. */
   const sendUserText = useCallback((text: string) => {
     const current = paneContentRef.current
-    if (!current.sessionId) return
+    if (!current.sessionId || isManagedRuntimeRecoveryDecision(current.recoverySummary)) return
     const requestId = nanoid()
     outgoingTurnRef.current = { requestId, text, sawBusy: false, previousTurns: snapshotRef.current?.turns ?? [] }
     // Task 16: a new send starts a fresh idle-incomplete re-poll budget.
@@ -3641,6 +3667,7 @@ export function FreshAgentView({
                       type="button"
                       className="fresh-agent-error-action rounded border border-border/70 px-2 py-1"
                       onClick={() => {
+                        if (isManagedRuntimeRecoveryDecision(paneContentRef.current.recoverySummary)) return
                         const nextRequestId = nanoid()
                         dispatch(updatePaneContent({
                           tabId,
@@ -3785,7 +3812,14 @@ export function FreshAgentView({
                   paneId={paneId}
                 />
               ) : null}
-              {sessionEnded ? (
+              {isManagedRuntimeRecoveryDecision(paneContent.recoverySummary) ? (
+                <ManagedRuntimeRecoveryCard
+                  recoverySummary={paneContent.recoverySummary}
+                  onRetry={retryManagedRecovery}
+                  onStartFresh={startNewConversation}
+                />
+              ) : null}
+              {!managedRecoveryDecision && sessionEnded ? (
                 <div className="fresh-agent-session-ended-card flex flex-wrap items-center justify-between gap-2 rounded-md border border-destructive/50 bg-destructive/10 px-3 py-2 text-sm">
                   <span>This session has ended{sessionErrorMessage ? '' : ' (the agent process exited)'}.</span>
                   <div className="flex flex-wrap gap-2">
@@ -4049,6 +4083,7 @@ export function FreshAgentView({
     freshOpenCodeRouteCwd,
     canRedoNow,
     canRollback,
+    agentSession?.cwd,
     effectiveStatus,
     globalExpandThinking,
     effectiveShowTimecodes,
@@ -4057,6 +4092,7 @@ export function FreshAgentView({
     isBusy,
     isRestoring,
     loadError,
+    managedRecoveryDecision,
     localEcho,
     modelDialogOpen,
     closeModelDialog,
@@ -4073,6 +4109,7 @@ export function FreshAgentView({
     queuedMessages,
     hidden,
     requestRevealRefresh,
+    retryManagedRecovery,
     restartStuckSidecar,
     rewindToTurn,
     openDelegationSession,
@@ -4093,6 +4130,7 @@ export function FreshAgentView({
     sendFreshAgentMessage,
     tabId,
     terminalFontSize,
+    triggerRecovery,
   ])
 
   useEffect(() => {

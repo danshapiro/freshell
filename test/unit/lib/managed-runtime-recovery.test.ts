@@ -2,7 +2,7 @@ import { configureStore } from '@reduxjs/toolkit'
 import { describe, expect, it } from 'vitest'
 import tabsReducer, { addTab, setActiveTab, updateTab } from '@/store/tabsSlice'
 import { handleUiCommand } from '@/lib/ui-commands'
-import panesReducer from '@/store/panesSlice'
+import panesReducer, { startNewManagedRuntimeConversation } from '@/store/panesSlice'
 import managedRuntimeReducer from '@/store/managedRuntimeSlice'
 import {
   applyManagedRuntimeMergePlan,
@@ -438,5 +438,165 @@ describe('managed runtime recovery merge', () => {
         reason: 'CREDENTIALS_EXPIRED',
       },
     })
+  })
+
+  it('updates an already represented stopped/lost terminal in place without creating a replacement', () => {
+    const state = baseState()
+    state.tabs.tabs[0].mode = 'opencode'
+    state.panes.layouts['user-tab'].content = {
+      kind: 'terminal',
+      createRequestId: 'create-one',
+      terminalId: 'terminal-one',
+      streamId: 'stream-one',
+      status: 'exited',
+      mode: 'opencode',
+      shell: 'system',
+      sessionRef: { provider: 'opencode', sessionId: 'ses_one' },
+      soulId: 'soul-one',
+      viewIntentId: 'view-one',
+    }
+    const lost = soul({
+      launchState: 'stopped',
+      desiredState: 'stopped',
+      recoveryState: 'lost',
+      recoveryReason: 'provider_state_missing',
+      terminalId: undefined,
+      terminalStreamId: undefined,
+      terminalCreateRequestId: undefined,
+    })
+
+    const plan = buildManagedRuntimeMergePlan(snapshot([lost]), state)
+
+    expect(plan.creates).toHaveLength(0)
+    expect(plan.updates).toHaveLength(1)
+    expect(plan.updates[0]).toMatchObject({ tabId: 'user-tab', paneId: 'user-pane' })
+    expect(plan.updates[0].content).toMatchObject({
+      kind: 'terminal',
+      soulId: 'soul-one',
+      viewIntentId: 'view-one',
+      recoverySummary: { desiredState: 'stopped', recoveryState: 'lost' },
+    })
+  })
+
+  it('updates an already represented stopped/lost Fresh Agent in place', () => {
+    const state = baseState()
+    state.tabs.tabs[0].mode = 'freshopencode'
+    state.panes.layouts['user-tab'].content = {
+      kind: 'fresh-agent',
+      createRequestId: 'fresh-create-one',
+      status: 'exited',
+      sessionType: 'freshopencode',
+      provider: 'opencode',
+      sessionId: 'ses_one',
+      resumeSessionId: 'ses_one',
+      sessionRef: { provider: 'opencode', sessionId: 'ses_one' },
+      soulId: 'soul-one',
+      viewIntentId: 'view-one',
+      incarnationId: 'incarnation-one',
+    }
+    const lost = soul({
+      launchState: 'stopped',
+      desiredState: 'stopped',
+      recoveryState: 'lost',
+      terminalId: undefined,
+      terminalStreamId: undefined,
+      terminalMode: undefined,
+      terminalCwd: undefined,
+      terminalCreateRequestId: undefined,
+    })
+
+    const plan = buildManagedRuntimeMergePlan(snapshot([lost]), state)
+
+    expect(plan.creates).toHaveLength(0)
+    expect(plan.updates).toHaveLength(1)
+    expect(plan.updates[0].content).toMatchObject({
+      kind: 'fresh-agent',
+      soulId: 'soul-one',
+      viewIntentId: 'view-one',
+      sessionRef: { provider: 'opencode', sessionId: 'ses_one' },
+      recoverySummary: { desiredState: 'stopped', recoveryState: 'lost' },
+    })
+  })
+
+  it('never creates a pane for an absent stopped/lost view', () => {
+    const lost = soul({
+      launchState: 'stopped',
+      desiredState: 'stopped',
+      recoveryState: 'lost',
+      terminalId: undefined,
+      terminalStreamId: undefined,
+      terminalCreateRequestId: undefined,
+    })
+    const plan = buildManagedRuntimeMergePlan(snapshot([lost]), baseState())
+
+    expect(plan.creates).toHaveLength(0)
+    expect(plan.updates).toHaveLength(0)
+  })
+
+  it('clears a lost managed terminal before an old inventory snapshot can reattach it', () => {
+    const state = baseState()
+    state.tabs.tabs[0].mode = 'opencode'
+    state.panes.layouts['user-tab'].content = {
+      kind: 'terminal',
+      createRequestId: 'old-create',
+      terminalId: 'terminal-one',
+      streamId: 'stream-one',
+      status: 'error',
+      mode: 'opencode',
+      shell: 'system',
+      soulId: 'soul-one',
+      incarnationId: 'incarnation-one',
+      viewIntentId: 'view-one',
+      viewIntentRevision: 2,
+      soulIntentRevision: 3,
+      incidentId: 'incident-one',
+      placementGroup: 'Recovered agents',
+      resourceSummary: {
+        configured: soul().configuredLimits,
+        effective: soul().effectiveLimits,
+      },
+      recoverySummary: {
+        desiredState: 'stopped',
+        recoveryState: 'lost',
+        reason: 'provider_state_missing',
+        durabilityState: 'resume_captured',
+        allocationState: 'verified_durable',
+      },
+    }
+    const store = storeWithState(state)
+    const oldCreateRequestId = store.getState().panes.layouts['user-tab'].type === 'leaf'
+      ? store.getState().panes.layouts['user-tab'].content.createRequestId
+      : undefined
+
+    store.dispatch(startNewManagedRuntimeConversation({ tabId: 'user-tab', paneId: 'user-pane' }))
+
+    const content = store.getState().panes.layouts['user-tab']
+    if (content.type !== 'leaf' || content.content.kind !== 'terminal') {
+      throw new Error('expected a terminal pane after starting a new conversation')
+    }
+    expect(content.content.createRequestId).not.toBe(oldCreateRequestId)
+    expect(content.content.status).toBe('creating')
+    expect(content.content.terminalId).toBeUndefined()
+    expect(content.content.soulId).toBeUndefined()
+    expect(content.content.incarnationId).toBeUndefined()
+    expect(content.content.viewIntentId).toBeUndefined()
+    expect(content.content.viewIntentRevision).toBeUndefined()
+    expect(content.content.soulIntentRevision).toBeUndefined()
+    expect(content.content.incidentId).toBeUndefined()
+    expect(content.content.placementGroup).toBeUndefined()
+    expect(content.content.resourceSummary).toBeUndefined()
+    expect(content.content.recoverySummary).toBeUndefined()
+
+    const oldInventoryPlan = buildManagedRuntimeMergePlan(
+      snapshot([soul({
+        desiredState: 'stopped',
+        launchState: 'stopped',
+        recoveryState: 'lost',
+        recoveryReason: 'provider_state_missing',
+      })]),
+      store.getState() as any,
+    )
+    expect(oldInventoryPlan.creates).toHaveLength(0)
+    expect(oldInventoryPlan.updates).toHaveLength(0)
   })
 })
