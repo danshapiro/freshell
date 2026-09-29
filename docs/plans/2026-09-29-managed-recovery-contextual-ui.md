@@ -115,8 +115,9 @@ Do not modify `HostStatsPane` or the managed-runtime backend/API contracts in th
 - Modify: `src/lib/recovery/managed-runtime-recovery.ts` so an already represented `desiredState: 'stopped', recoveryState: 'lost'` soul updates its existing pane projection without creating a new tab or launching a replacement.
 - Modify: `test/unit/lib/managed-runtime-recovery.test.ts` with terminal and Fresh Agent live-to-lost merge coverage, including the no-create rule for absent lost views.
 - Modify: `src/components/fresh-agent/FreshAgentView.tsx` recovery effects and deferred reconcile callbacks so managed `blocked`/`lost` projections cannot arm provider recovery or an identity-less create before the explicit user action.
-- Modify: `src/components/TerminalView.tsx` to render the card only for projected `blocked`/`lost` states, retry the same soul with its revision fence, refresh inventory, and reuse the existing explicit start-fresh action for lost sessions.
+- Modify: `src/components/TerminalView.tsx` to render the card for projected `blocked`/`lost` states before any generic terminal-exit presentation, retry the same soul with its revision fence, refresh inventory, and reuse an explicit start-new action for lost sessions.
 - Modify: `src/components/fresh-agent/FreshAgentView.tsx` to render the same card, retry with the projected revision, refresh inventory, and reuse the existing kill-before-new-conversation action for lost sessions.
+- Modify: `src/store/panesSlice.ts` and the explicit start-new handlers so a user-chosen new conversation mints a new `createRequestId` and clears every managed projection field; reconcile-driven same-conversation folds keep their existing create key.
 - Modify: `test/unit/client/components/TerminalView.launchRetry.test.tsx` or the nearest existing TerminalView focused fixture to cover managed blocked/lost presentation and no automatic replacement.
 - Modify: `test/unit/client/components/fresh-agent/FreshAgentView.test.tsx` with a focused managed blocked/lost case if its existing fixture can provide the projection without broad lifecycle setup.
 
@@ -126,7 +127,7 @@ Do not modify `HostStatsPane` or the managed-runtime backend/API contracts in th
 
 - [ ] **Step 1: Write the failing behavioral test**
 
-Create `ManagedRuntimeRecoveryCard.test.tsx` with a minimal provider-free render of the card. Cover: `live` and `recovering` render nothing; `blocked` renders one yellow alert and “Retry recovery”, calls the supplied async retry callback once, and reports a failed retry in the same card; `lost` renders a yellow alert explaining that the existing conversation could not be recovered and an explicitly labeled “Start new conversation” button that calls only after a user click. Extend `test/unit/lib/managed-runtime-recovery.test.ts` with real merge-plan cases proving a represented stopped/lost terminal and Fresh Agent receive the lost projection while an absent lost view produces no create. Add a FreshAgentView regression fixture proving managed blocked/lost state prevents both the normal `.lost` effect and a deferred fresh verdict from arming an identity-less create. Assert that no test path creates a session during render.
+Create `ManagedRuntimeRecoveryCard.test.tsx` with a minimal provider-free render of the card. Cover: `live` and `recovering` render nothing; `blocked` renders one yellow alert and “Retry recovery”, calls the supplied async retry callback once, and reports a failed retry in the same card; `lost` renders a yellow alert explaining that the existing conversation could not be recovered and an explicitly labeled “Start new conversation” button that calls only after a user click. Extend `test/unit/lib/managed-runtime-recovery.test.ts` with real merge-plan cases proving a represented stopped/lost terminal and Fresh Agent receive the lost projection while an absent lost view produces no create. Add a FreshAgentView regression fixture proving managed blocked/lost state prevents both the normal `.lost` effect and a deferred fresh verdict from arming an identity-less create. Add a reducer/component regression that clicks start-new, mints a new `createRequestId`, clears every managed projection field, then applies an old inventory snapshot and proves the lost soul is not reattached. Assert that no test path creates a session during render.
 
 - [ ] **Step 2: Run the test and verify the intended failure**
 
@@ -140,7 +141,7 @@ Expected: FAIL because the component does not yet exist.
 
 - [ ] **Step 3: Add the minimal production implementation**
 
-Implement the card with this decision table and prop shape:
+Implement the card with this decision table and prop shape. The retry handler must own its async state: catch a rejected retry, keep the alert mounted, and show a short retry-failed message; do not discard the promise from the button handler.
 
 ```tsx
 type Props = {
@@ -150,6 +151,20 @@ type Props = {
 }
 
 function ManagedRuntimeRecoveryCard({ recoverySummary, onRetry, onStartFresh }: Props) {
+  const [retryError, setRetryError] = useState<string>()
+  const [retrying, setRetrying] = useState(false)
+  const handleRetry = async () => {
+    if (retrying) return
+    setRetrying(true)
+    setRetryError(undefined)
+    try {
+      await onRetry()
+    } catch (error) {
+      setRetryError(error instanceof Error ? error.message : 'Retry failed. Try again.')
+    } finally {
+      setRetrying(false)
+    }
+  }
   const summary = recoverySummary
   if (!summary || !['blocked', 'lost'].includes(summary.recoveryState)) return null
   const blocked = summary.recoveryState === 'blocked'
@@ -162,14 +177,15 @@ function ManagedRuntimeRecoveryCard({ recoverySummary, onRetry, onStartFresh }: 
     <span>{blocked
       ? 'This session needs attention before it can continue.'
       : 'This session could not be recovered. Its existing conversation is still available in history.'}</span>
-    {blocked ? <button onClick={() => void onRetry()}>Retry recovery</button>
+    {blocked ? <button disabled={retrying} onClick={() => void handleRetry()}>Retry recovery</button>
       : <button onClick={onStartFresh}>Start new conversation</button>}
+    {retryError ? <span role="status">{retryError}</span> : null}
   </div>
   )
 }
 ```
 
-In `buildManagedRuntimeMergePlan`, match and update existing pane locations for `recoveryState === 'lost'` even when `desiredState === 'stopped'`, then keep the visible-only creation path gated to desired running souls; a lost soul absent from local layout must never create a new pane. In `TerminalView`, call `retryManagedRuntimeSoul(terminalContent.soulId, terminalContent.soulIntentRevision)` and then `queueManagedRuntimeRefresh(appStore, 'pane-recovery-retry')`; do not render the card when a more specific launch, owner-divergence, handoff, or existing terminal-exit card already owns the decision. For `lost`, reuse the existing `startFreshConversation`, which explicitly clears the old durable identity only after the user clicks. In `FreshAgentView`, guard both the `.lost` recovery effect and any deferred/reconcile callback on the current managed summary, use the same fenced retry call and inventory refresh, suppress the duplicate generic ended-session card while the managed lost card is visible, and reuse `startNewConversation` for the explicit new-conversation click. A managed `lost` or `blocked` state must retain the old session reference until the user chooses a new conversation; a new-conversation transition must clear `soulId`, `incarnationId`, `runtimeState`, `viewIntentId`, `viewIntentRevision`, `soulIntentRevision`, `incidentId`, `placementGroup`, `resourceSummary`, and `recoverySummary` so an old inventory snapshot cannot reattach the new pane to the retired soul.
+In `buildManagedRuntimeMergePlan`, match and update existing pane locations for `recoveryState === 'lost'` even when `desiredState === 'stopped'`, then keep the visible-only creation path gated to desired running souls; a lost soul absent from local layout must never create a new pane. In `TerminalView`, call `retryManagedRuntimeSoul(terminalContent.soulId, terminalContent.soulIntentRevision)` and then `queueManagedRuntimeRefresh(appStore, 'pane-recovery-retry')`; render the managed card before `TerminalExitBanner` whenever it owns a projected `lost` decision, so the user sees the explicitly labeled `Start new conversation` action. A managed `blocked`/`lost` card takes precedence over the generic exit/relaunch card for that pane; unrelated launch, owner-divergence, and handoff cards keep their existing precedence. For `lost`, use an explicit start-new transition that mints a new `createRequestId`, clears the old durable identity and all managed projection fields only after the user clicks, and is covered by a refresh-after-click test. In `FreshAgentView`, guard both the `.lost` recovery effect and any deferred/reconcile callback on the current managed summary, use the same fenced retry call and inventory refresh, suppress the duplicate generic ended-session card while the managed lost card is visible, and reuse `startNewConversation` for the explicit new-conversation click. A managed `lost` or `blocked` state must retain the old session reference until the user chooses a new conversation; the explicit new-conversation transition must clear `soulId`, `incarnationId`, `runtimeState`, `viewIntentId`, `viewIntentRevision`, `soulIntentRevision`, `incidentId`, `placementGroup`, `resourceSummary`, and `recoverySummary` and mint a new `createRequestId`, while reconcile-driven same-conversation folds preserve their create key.
 
 - [ ] **Step 4: Run the focused tests**
 
@@ -204,7 +220,13 @@ pnpm run test:vitest run \
   --config config/vitest/vitest.config.ts
 ```
 
-If the managed-runtime browser specs have a stable configured backend, run the affected selectors through the repository’s configured e2e wrapper and preserve the existing unrelated baseline failure in the run ledger.
+Run the affected local-only browser spec explicitly; cloud coverage is not a substitute because these specs are excluded from the cloud Playwright configuration:
+
+```bash
+pnpm run test:e2e:local --project=chromium test/e2e-browser/specs/runtime-lost-soul-notice-rust.spec.ts
+```
+
+If the local provider/supervisor fixture cannot run, record the concrete environment failure in the run ledger and do not claim this behavior is covered. Preserve the existing unrelated baseline failure in the run ledger.
 
 - [ ] **Step 7: Commit the task**
 
@@ -218,7 +240,9 @@ The task is complete only when existing agent panes, session history, explicit n
 ### Task 3: Preserve managed view intent on ordinary close and align product examples
 
 **Files:**
-- Modify: `src/components/panes/PaneContainer.tsx` (or the shared close thunk if that is the smallest existing seam) to mark a managed view `detached` with its current view/soul revision before removing the pane, preserving close failure behavior when the server does not acknowledge the visibility change.
+- Modify: `src/store/tabsSlice.ts` as the shared close seam used by ordinary pane close and every direct `closeTab` caller (`TabBar`, `App`, UI commands, and context menus). Add a managed-view detach helper that uses the frozen pane projection fields and preserves close failure behavior when the server does not acknowledge the visibility change.
+- Modify: `src/components/panes/PaneContainer.tsx` only if its close path needs to pass managed projection data into the shared thunk; do not add a second tab-close implementation there.
+- Modify: `src/lib/api.ts` if needed to parse the visibility response as a `ManagedRuntimeViewIntent`, so a failed multi-view close can roll back already-detached views with their returned revision fences.
 - Modify: `test/unit/client/components/panes/PaneContainer.test.tsx` or the focused close-thunk test to cover managed detach-before-close and the refusal/error path.
 - Modify: `test/e2e-browser/specs/runtime-tabs-rehydrate-rust.spec.ts` to replace dashboard Close view interaction with ordinary pane close and assert the running soul remains detached after an inventory refresh; retain Stop agent coverage through the existing terminal shift-close path or rig action as appropriate.
 - Modify: `test/e2e-browser/specs/runtime-lost-soul-notice-rust.spec.ts` to stop expecting a routine success notice and instead assert the actionable cleanup-failure or pane-local error path actually rendered; retain incident persistence, exact cleanup, identity, and receipt assertions consistent with what the UI displays.
@@ -226,11 +250,11 @@ The task is complete only when existing agent panes, session history, explicit n
 
 **Interfaces:**
 - Consumes: managed pane projection fields (`viewIntentId`, `viewIntentRevision`, `soulIntentRevision`), `updateManagedRuntimeViewVisibility`, existing pane close acknowledgements, and existing browser helpers.
-- Produces: ordinary pane/tab close detaches a managed view before layout removal, while unmanaged pane close behavior remains unchanged.
+- Produces: ordinary pane/tab close transactionally detaches managed views before layout removal, while unmanaged pane close behavior remains unchanged.
 
 - [ ] **Step 1: Write the failing behavioral test**
 
-Add a focused close test with a managed terminal pane carrying a view ID and both revision values. Assert the visibility PATCH is sent with `detached` and the current revisions before the close thunk removes the pane; assert an API refusal leaves the pane visible and exposes its existing close error surface. Add a browser assertion that the affected managed view is not recreated after a later inventory refresh.
+Add a focused close test with a managed terminal pane carrying a view ID and both revision values. Assert the close evidence is confirmed first, then the visibility PATCH is sent with `detached` and the current revisions, and only then does the close thunk remove the pane. Assert a visibility refusal leaves the pane visible, reasserts the pane-open evidence, and exposes its existing close error surface; if a multi-view tab close detached an earlier view before a later refusal, assert the helper rolls that view back to `visible` using the response revision before leaving the tab in place. Add a browser assertion that the affected managed view is not recreated after a later inventory refresh.
 
 - [ ] **Step 2: Run the test and verify the intended failure**
 
@@ -244,7 +268,7 @@ Expected: FAIL because ordinary close currently journals pane removal without up
 
 - [ ] **Step 3: Add the minimal production implementation**
 
-Before the existing `closePaneWithCleanup` dispatch for managed terminal and Fresh Agent panes, send `updateManagedRuntimeViewVisibility(viewIntentId, 'detached', viewIntentRevision, soulIntentRevision)`. Await the acknowledgement; on failure, leave the pane in place and use the existing pane-close error path. Keep terminal detach and Fresh Agent kill/close sequencing intact, and skip the managed PATCH for panes without a view intent.
+In the shared `tabsSlice` close flow, after the existing close evidence succeeds and before the reducer removes the frozen pane/tab, send `updateManagedRuntimeViewVisibility(viewIntentId, 'detached', viewIntentRevision, soulIntentRevision)` for every managed view in that frozen layout. Await every acknowledgement. If any detach refuses or times out, roll back each already-detached view to `visible` using the returned view revision and the unchanged soul revision, reassert the pane-open evidence, surface the existing close error on the kept pane(s), and return without removing layout state. Only after all managed detaches succeed may `closePaneWithCleanup` or `closeTab` commit the existing removal. Keep terminal detach and Fresh Agent kill/close sequencing intact, and skip the managed PATCH for panes without a view intent. Because `TabBar`, `App`, UI commands, and context menus already dispatch `closeTab`, the shared thunk covers ordinary tab close as well as the pane path.
 
 - [ ] **Step 4: Run the focused test**
 
@@ -254,7 +278,7 @@ Expected: PASS, including unchanged unmanaged close behavior.
 
 - [ ] **Step 5: Refactor while green**
 
-Keep the managed-detach operation in one helper used by pane and tab close paths, preserve revision fencing, and avoid reintroducing a global stop/detach control surface.
+Keep the managed-detach operation in one helper used by pane and tab close paths, preserve revision fencing, make its rollback explicit and testable, and avoid reintroducing a global stop/detach control surface.
 
 - [ ] **Step 6: Run impacted-test verification**
 
@@ -269,11 +293,17 @@ pnpm run test:vitest run \
   --config config/vitest/vitest.config.ts
 ```
 
-If the configured e2e backend and runtime fixtures are available, run the two affected specs with the repository’s e2e wrapper. Do not weaken or skip their backend identity and cleanup assertions because the dashboard was removed.
+Run both affected local-only specs explicitly; they are excluded from cloud selection:
+
+```bash
+pnpm run test:e2e:local --project=chromium test/e2e-browser/specs/runtime-tabs-rehydrate-rust.spec.ts test/e2e-browser/specs/runtime-lost-soul-notice-rust.spec.ts
+```
+
+Do not weaken or skip their backend identity and cleanup assertions because the dashboard was removed. If the local fixture cannot run, record the concrete environment failure and leave the task unverified rather than treating a cloud run as equivalent coverage.
 
 - [ ] **Step 7: Commit the task**
 
 ```bash
-git add src/components/panes/PaneContainer.tsx test/unit/client/components/panes/PaneContainer.test.tsx test/e2e-browser/specs/runtime-tabs-rehydrate-rust.spec.ts test/e2e-browser/specs/runtime-lost-soul-notice-rust.spec.ts docs/index.html
+git add src/store/tabsSlice.ts src/lib/api.ts src/components/panes/PaneContainer.tsx test/unit/client/components/panes/PaneContainer.test.tsx test/e2e-browser/specs/runtime-tabs-rehydrate-rust.spec.ts test/e2e-browser/specs/runtime-lost-soul-notice-rust.spec.ts docs/index.html
 git commit -m "fix(ui): preserve managed view intent on close"
 ```
