@@ -444,7 +444,98 @@ describe('closePaneWithCleanup — the acknowledged close gate (F2)', () => {
 
     resolveDetach(managedViewResult(viewId, 'detached', viewRevision + 1, soulRevision + 1))
     await vi.advanceTimersByTimeAsync(0)
-    expect(mockManagedRuntimeViewVisibility.mock.calls.filter(([, visibility]) => visibility === 'visible')).toHaveLength(1)
+    expect(mockManagedRuntimeViewVisibility.mock.calls.filter(([, visibility]) => visibility === 'visible')).toHaveLength(2)
+  })
+
+  it.each(managedCloseCases)('keeps watching a timed out $name detach after a stale repair read still says visible', async ({
+    viewId,
+    viewRevision,
+    soulRevision,
+    start,
+  }) => {
+    vi.useFakeTimers()
+    const store = createManagedTwoPaneStore()
+    const durableViews = new Map([
+      ['view-a', managedViewResult('view-a', 'visible', 2, 7)],
+      ['view-b', managedViewResult('view-b', 'visible', 3, 8)],
+    ])
+    let resolveDetach: (view: ReturnType<typeof managedViewResult>) => void = () => {}
+    const lateDetach = new Promise<ReturnType<typeof managedViewResult>>((resolve) => {
+      resolveDetach = resolve
+    })
+    let targetVisibleAttempts = 0
+    const authoritativeSnapshots: Array<{ visibility: string; revision: number; soulIntentRevision: number }> = []
+    mockManagedRuntimeViewVisibility.mockImplementation((
+      requestedViewId: string,
+      visibility: 'visible' | 'detached',
+    ) => {
+      if (requestedViewId === viewId && visibility === 'detached') return lateDetach
+      if (requestedViewId === viewId && visibility === 'visible') {
+        targetVisibleAttempts += 1
+        if (targetVisibleAttempts === 1) return Promise.reject(new Error('stale managed view revision'))
+        const repaired = managedViewResult(viewId, 'visible', viewRevision + 2, soulRevision + 2)
+        durableViews.set(viewId, repaired)
+        return Promise.resolve(repaired)
+      }
+      const current = durableViews.get(requestedViewId) ?? managedViewResult(requestedViewId, visibility, 1, 1)
+      const next = managedViewResult(
+        requestedViewId,
+        visibility,
+        current.revision + 1,
+        current.soulIntentRevision + 1,
+      )
+      durableViews.set(requestedViewId, next)
+      return Promise.resolve(next)
+    })
+    mockGetManagedRuntimeSoul.mockImplementation(async (soulId: string) => {
+      const currentViewId = soulId.replace(/^soul-/, '')
+      const current = durableViews.get(currentViewId)!
+      authoritativeSnapshots.push({
+        visibility: current.visibility,
+        revision: current.revision,
+        soulIntentRevision: current.soulIntentRevision,
+      })
+      return managedSoulDetail(
+        currentViewId,
+        current.visibility,
+        current.revision,
+        current.soulIntentRevision,
+      )
+    })
+
+    const close = start(store)
+    ackAllPaneCloses()
+    ackPanesClosedBatches()
+    await vi.advanceTimersByTimeAsync(KILL_ACK_TIMEOUT_MS + 50)
+    await close
+
+    expect(mockGetManagedRuntimeSoul).toHaveBeenCalledWith(
+      `soul-${viewId}`,
+      expect.objectContaining({ signal: expect.any(AbortSignal) }),
+    )
+    expect(authoritativeSnapshots).toEqual([{
+      visibility: 'visible',
+      revision: viewRevision,
+      soulIntentRevision: soulRevision,
+    }])
+    const initialVisibleCall = mockManagedRuntimeViewVisibility.mock.calls.find(([
+      requestedViewId,
+      visibility,
+    ]) => requestedViewId === viewId && visibility === 'visible')
+    expect(initialVisibleCall?.slice(0, 4)).toEqual([viewId, 'visible', viewRevision, soulRevision])
+
+    const lateDetached = managedViewResult(viewId, 'detached', viewRevision + 1, soulRevision + 1)
+    durableViews.set(viewId, lateDetached)
+    resolveDetach(lateDetached)
+    await vi.advanceTimersByTimeAsync(0)
+
+    expect(mockManagedRuntimeViewVisibility.mock.calls.filter(([requestedViewId, visibility]) => (
+      requestedViewId === viewId && visibility === 'visible'
+    )).map((call) => call.slice(0, 4))).toEqual([
+      [viewId, 'visible', viewRevision, soulRevision],
+      [viewId, 'visible', viewRevision + 1, soulRevision + 1],
+    ])
+    expect(durableViews.get(viewId)?.visibility).toBe('visible')
   })
 
   it.each(managedCloseCases)('uses authoritative fences after a stale visible repair for a $name close', async ({
@@ -490,6 +581,39 @@ describe('closePaneWithCleanup — the acknowledged close gate (F2)', () => {
     expect(visibleCalls[1]?.slice(0, 4)).toEqual([viewId, 'visible', 40, 52])
   })
 
+  it('records a structured uncertainty when a late detach rejects and authoritative reconciliation fails', async () => {
+    vi.useFakeTimers()
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
+    const store = createManagedTwoPaneStore()
+    let rejectDetach: (error: Error) => void = () => {}
+    const lateDetach = new Promise<ReturnType<typeof managedViewResult>>((_, reject) => {
+      rejectDetach = reject
+    })
+    mockManagedRuntimeViewVisibility.mockImplementation((
+      viewId: string,
+      visibility: 'visible' | 'detached',
+    ) => {
+      if (viewId === 'view-b' && visibility === 'detached') return lateDetach
+      return Promise.reject(new Error('visible repair unavailable'))
+    })
+    mockGetManagedRuntimeSoul.mockRejectedValue(new Error('authoritative read unavailable'))
+
+    const close = store.dispatch(closePaneWithCleanup({ tabId: 'tab-1', paneId: 'pane-2' }))
+    ackAllPaneCloses()
+    await vi.advanceTimersByTimeAsync(KILL_ACK_TIMEOUT_MS + 50)
+    await close
+
+    rejectDetach(new Error('detach response lost'))
+    await vi.advanceTimersByTimeAsync(0)
+
+    expect(errorSpy.mock.calls.some((args) => args.some((arg) => (
+      typeof arg === 'object'
+      && arg !== null
+      && (arg as { event?: unknown }).event === 'managed_view_visibility_uncertain_outcome'
+    )))).toBe(true)
+    errorSpy.mockRestore()
+  })
+
   it('repairs a rollback visibility PATCH that resolves after its local timeout', async () => {
     vi.useFakeTimers()
     const store = createManagedTwoPaneStore()
@@ -532,6 +656,99 @@ describe('closePaneWithCleanup — the acknowledged close gate (F2)', () => {
     await vi.advanceTimersByTimeAsync(0)
     expect(store.getState().tabs.tabs.some((tab) => tab.id === 'tab-1')).toBe(true)
     expect(paneContents(store, 'tab-1').map((pane) => pane.paneId)).toEqual(['pane-1', 'pane-2'])
+  })
+
+  it('keeps watching a timed out rollback after a stale repair read and repairs its late visible commit', async () => {
+    vi.useFakeTimers()
+    const store = createManagedTwoPaneStore()
+    const durableViews = new Map([
+      ['view-a', managedViewResult('view-a', 'visible', 2, 7)],
+      ['view-b', managedViewResult('view-b', 'visible', 3, 8)],
+    ])
+    let resolveSecondDetach: (view: ReturnType<typeof managedViewResult>) => void = () => {}
+    const secondDetach = new Promise<ReturnType<typeof managedViewResult>>((resolve) => {
+      resolveSecondDetach = resolve
+    })
+    let resolveRollback: (view: ReturnType<typeof managedViewResult>) => void = () => {}
+    const lateRollback = new Promise<ReturnType<typeof managedViewResult>>((resolve) => {
+      resolveRollback = resolve
+    })
+    let rollbackVisibleAttempts = 0
+    const authoritativeSnapshots: Array<{ visibility: string; revision: number; soulIntentRevision: number }> = []
+    mockManagedRuntimeViewVisibility.mockImplementation((
+      viewId: string,
+      visibility: 'visible' | 'detached',
+    ) => {
+      if (viewId === 'view-a' && visibility === 'detached') {
+        const detached = managedViewResult('view-a', 'detached', 4, 9)
+        durableViews.set(viewId, detached)
+        return Promise.resolve(detached)
+      }
+      if (viewId === 'view-b' && visibility === 'detached') return secondDetach
+      if (viewId === 'view-a' && visibility === 'visible') {
+        rollbackVisibleAttempts += 1
+        if (rollbackVisibleAttempts === 1) return lateRollback
+        if (rollbackVisibleAttempts === 2) return Promise.reject(new Error('stale rollback fence'))
+        const repaired = managedViewResult('view-a', 'visible', 6, 11)
+        durableViews.set(viewId, repaired)
+        return Promise.resolve(repaired)
+      }
+      const current = durableViews.get(viewId) ?? managedViewResult(viewId, visibility, 1, 1)
+      const next = managedViewResult(viewId, visibility, current.revision + 1, current.soulIntentRevision + 1)
+      durableViews.set(viewId, next)
+      return Promise.resolve(next)
+    })
+    mockGetManagedRuntimeSoul.mockImplementation(async (soulId: string) => {
+      const viewId = soulId.replace(/^soul-/, '')
+      const current = durableViews.get(viewId)!
+      authoritativeSnapshots.push({
+        visibility: current.visibility,
+        revision: current.revision,
+        soulIntentRevision: current.soulIntentRevision,
+      })
+      return managedSoulDetail(viewId, current.visibility, current.revision, current.soulIntentRevision)
+    })
+
+    const close = store.dispatch(closeTab('tab-1'))
+    ackPanesClosedBatches()
+    await vi.advanceTimersByTimeAsync(KILL_ACK_TIMEOUT_MS + 50)
+    await vi.advanceTimersByTimeAsync(0)
+    await vi.advanceTimersByTimeAsync(KILL_ACK_TIMEOUT_MS + 50)
+    await close
+
+    expect(mockGetManagedRuntimeSoul).toHaveBeenCalledWith(
+      'soul-view-a',
+      expect.objectContaining({ signal: expect.any(AbortSignal) }),
+    )
+    expect(authoritativeSnapshots).toEqual([{
+      visibility: 'detached',
+      revision: 4,
+      soulIntentRevision: 9,
+    }])
+    const firstRollbackCall = mockManagedRuntimeViewVisibility.mock.calls.find(([
+      viewId,
+      visibility,
+    ]) => viewId === 'view-a' && visibility === 'visible')
+    expect(firstRollbackCall?.slice(0, 4)).toEqual(['view-a', 'visible', 4, 9])
+
+    const lateVisible = managedViewResult('view-a', 'visible', 5, 10)
+    durableViews.set('view-a', lateVisible)
+    resolveRollback(lateVisible)
+    await vi.advanceTimersByTimeAsync(0)
+
+    const rollbackVisibleCalls = mockManagedRuntimeViewVisibility.mock.calls
+      .filter(([viewId, visibility]) => viewId === 'view-a' && visibility === 'visible')
+      .map((call) => call.slice(0, 4))
+    expect(rollbackVisibleCalls).toEqual([
+      ['view-a', 'visible', 4, 9],
+      ['view-a', 'visible', 4, 9],
+      ['view-a', 'visible', 4, 9],
+      ['view-a', 'visible', 5, 10],
+    ])
+    expect(durableViews.get('view-a')?.visibility).toBe('visible')
+
+    resolveSecondDetach(managedViewResult('view-b', 'detached', 4, 9))
+    await vi.advanceTimersByTimeAsync(0)
   })
 
   it('success: the pane.close is acked BEFORE the layout loses the pane (success → pane gone)', async () => {
