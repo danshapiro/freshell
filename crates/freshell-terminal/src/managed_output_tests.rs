@@ -234,3 +234,29 @@ fn managed_epoch_transition_rejects_a_different_native_conversation() {
     );
     assert_eq!(registry.managed_output_cursor("terminal-stable"), Some(206));
 }
+
+#[test]
+fn managed_opencode_same_runtime_accepts_a_signaled_session_switch() {
+    let (registry, controller) = fixture();
+    {
+        let mut response = controller.response.lock().unwrap();
+        response.stream_epoch = Some("epoch-old".into());
+        response.incarnation_id = Some("incarnation-old".into());
+        response.reset_required = false;
+        response.retained_from_seq = 206;
+        response.head_seq = 206;
+        response.native_session_id = Some("ses_Switched".into());
+        response.chunks.clear();
+    }
+    let read = immediate(registry.refresh_managed_output("terminal-stable", 65536)).unwrap();
+    assert_eq!(read.native_session_id.as_deref(), Some("ses_Switched"));
+    assert_eq!(
+        registry
+            .managed_descriptor("terminal-stable")
+            .unwrap()
+            .resume_session_id
+            .as_deref(),
+        Some("ses_Switched")
+    );
+    assert_eq!(registry.managed_output_cursor("terminal-stable"), Some(206));
+}

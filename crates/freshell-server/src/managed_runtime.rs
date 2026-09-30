@@ -2,10 +2,10 @@
 
 use freshell_runtime_client::{ClientError, RuntimeClient};
 use freshell_runtime_protocol::{
-    DesiredState, LaunchRequest, LaunchState, ProviderBootstrapFile, RecoveryBlockReason,
-    RecoveryOutcome, RecoveryProbe, RecoveryResult, RecoveryTrigger, RequestId, RuntimeErrorCode,
-    RuntimeLimits, RuntimeProfile, RuntimeView, SoulId, StopOutcome, TerminalLaunchSpec,
-    ViewIntentKind, ViewIntentRequest, ViewVisibilityIntent,
+    DesiredState, LaunchRequest, LaunchState, RecoveryBlockReason, RecoveryOutcome, RecoveryProbe,
+    RecoveryResult, RecoveryTrigger, RequestId, RuntimeErrorCode, RuntimeLimits, RuntimeProfile,
+    RuntimeView, SoulId, StopOutcome, TerminalLaunchSpec, ViewIntentKind, ViewIntentRequest,
+    ViewVisibilityIntent,
 };
 use freshell_terminal::registry::{
     ManagedOutputChunk, ManagedOutputRead, ManagedTerminalController, ManagedTerminalDescriptor,
@@ -175,19 +175,100 @@ impl ManagedTerminalController for ServerManagedRuntimeController {
             // server's resolved child environment wholesale (which can carry
             // AUTH_TOKEN, provider API keys, cloud credentials, proxy creds, ...).
             let env = managed_provider_env(&request.mode, &request.env);
-            let provider_secret_references = if request.mode == "amplifier" {
-                crate::managed_provider_bootstrap::amplifier_secret_references(
-                    request.provider_model.as_deref(),
-                    request.provider_reasoning_effort.as_deref(),
-                )?
-            } else {
-                Vec::new()
+            let provider_secret_references = {
+                crate::managed_provider_bootstrap::named_provider_onecli_references(&request.mode)?
             };
-            let program = if request.mode == "amplifier" {
-                crate::managed_provider_bootstrap::AMPLIFIER_PROGRAM.to_string()
+            let args = managed_provider_args(&request.mode, request.spec.args)?;
+            let request_id = stable_request_id(create_key)?;
+            let tui_source = if request.mode == "opencode" {
+                request
+                    .env
+                    .get("OPENCODE_TUI_CONFIG")
+                    .map(|raw| {
+                        let home = std::env::var_os("HOME")
+                            .map(std::path::PathBuf::from)
+                            .ok_or("managed provider HOME is unavailable")?;
+                        crate::managed_mcp_capability::approved_tui_source(
+                            raw, &cwd, &workspace, &home,
+                        )
+                    })
+                    .transpose()?
             } else {
-                request.spec.program
+                None
             };
+            let opencode_input = if request.mode == "opencode" {
+                crate::managed_mcp_capability::OpencodeEphemeralInput {
+                    inline_config: request
+                        .env
+                        .get("OPENCODE_CONFIG_CONTENT")
+                        .map(String::as_str),
+                    tui_config_path: request.env.get("OPENCODE_TUI_CONFIG").map(String::as_str),
+                    tui_source: tui_source.as_ref(),
+                    cwd: Some(&cwd),
+                    workspace: Some(&workspace),
+                }
+            } else {
+                Default::default()
+            };
+            let mcp_capability = matches!(
+                request.mode.as_str(),
+                "claude" | "codex" | "opencode" | "amplifier"
+            )
+            .then(|| {
+                crate::managed_mcp_capability::issue_mcp_capability(
+                    &soul_id,
+                    &request.mode,
+                    opencode_input,
+                )
+            })
+            .transpose()?;
+            let mut provider_launch_context =
+                crate::managed_provider_bootstrap::provider_launch_context_for_managed_at(
+                    &request.mode,
+                    &workspace,
+                    &cwd,
+                    mcp_capability.clone(),
+                );
+            if let Some(context) = provider_launch_context.as_mut() {
+                if let freshell_runtime_protocol::ProviderPreparation::Opencode {
+                    inline_config,
+                    tui_config,
+                    tui_source: context_tui_source,
+                    ..
+                } = &mut context.preparation
+                {
+                    *inline_config = opencode_input.inline_config.is_some();
+                    if opencode_input.tui_config_path.is_some() {
+                        let jsonc = opencode_input
+                            .tui_config_path
+                            .is_some_and(|path| path.to_ascii_lowercase().ends_with(".jsonc"));
+                        *tui_config = Some(freshell_runtime_protocol::ProviderConfigReference {
+                            root: freshell_runtime_protocol::ProviderConfigRoot::Ephemeral,
+                            relative_path: if jsonc {
+                                "tui-config.jsonc"
+                            } else {
+                                "tui-config.json"
+                            }
+                            .into(),
+                            provider_relative_path: if jsonc {
+                                ".freshell/opencode/user-tui.jsonc"
+                            } else {
+                                ".freshell/opencode/user-tui.json"
+                            }
+                            .into(),
+                            format: if jsonc { "jsonc" } else { "json" }.into(),
+                        });
+                        *context_tui_source = tui_source.clone();
+                    }
+                }
+            }
+            if mcp_capability.is_some() && provider_launch_context.is_none() {
+                if let Some(capability) = &mcp_capability {
+                    let _ =
+                        crate::managed_mcp_capability::revoke_mcp_capability(&capability.grant_id);
+                }
+                return Err("managed provider preparation unavailable".into());
+            }
             let launch = LaunchRequest {
                 soul_id: soul_id.clone(),
                 provider: request.mode.clone(),
@@ -208,14 +289,8 @@ impl ManagedTerminalController for ServerManagedRuntimeController {
                     terminal_id: request.terminal_id.clone(),
                     stream_id: request.stream_id.clone(),
                     mode: request.mode.clone(),
-                    program,
-                    // Phase 2's managed provider has no durable Freshell MCP
-                    // tool-router yet. The legacy --mcp-config file is web-owned
-                    // temporary state and its child server needs FRESHELL_TOKEN;
-                    // carrying either across this boundary would reintroduce a
-                    // web dependency and persist a credential. Phase 3 replaces
-                    // this with the scoped durable tool router.
-                    args: managed_provider_args(&request.mode, request.spec.args),
+                    program: request.spec.program,
+                    args,
                     env,
                     cwd: cwd.to_string_lossy().into_owned(),
                     run_as_uid,
@@ -231,8 +306,9 @@ impl ManagedTerminalController for ServerManagedRuntimeController {
                     provider_reasoning_effort: request.provider_reasoning_effort.clone(),
                     provider_sandbox: request.provider_sandbox.clone(),
                     provider_permission_mode: request.provider_permission_mode.clone(),
-                    provider_bootstrap_files: provider_bootstrap_files(&request.mode)?,
+                    provider_bootstrap_files: Vec::new(),
                     provider_secret_references,
+                    provider_launch_context,
                 }),
                 view_intent: Some(ViewIntentRequest {
                     owner_id: String::new(),
@@ -246,12 +322,17 @@ impl ManagedTerminalController for ServerManagedRuntimeController {
                 }),
                 expected_control_epoch: None,
             };
-            let request_id = stable_request_id(create_key)?;
-            let result = self
-                .client
-                .launch(request_id, launch)
-                .await
-                .map_err(|e| e.to_string())?;
+            let result = match self.client.launch(request_id, launch).await {
+                Ok(result) => result,
+                Err(error) => {
+                    if let Some(capability) = &mcp_capability {
+                        let _ = crate::managed_mcp_capability::revoke_mcp_capability(
+                            &capability.grant_id,
+                        );
+                    }
+                    return Err(error.to_string());
+                }
+            };
             Ok(ManagedTerminalDescriptor {
                 soul_id: result.view.soul_id.to_string(),
                 incarnation_id: result.view.incarnation_id.to_string(),
@@ -338,8 +419,14 @@ impl ManagedTerminalController for ServerManagedRuntimeController {
         Box::pin(async move {
             let soul_key = terminal.soul_id;
             let soul = SoulId::parse(&soul_key).map_err(|e| e.to_string())?;
-            match self.client.stop(soul).await.map_err(|e| e.to_string())? {
+            match self
+                .client
+                .stop(soul.clone())
+                .await
+                .map_err(|e| e.to_string())?
+            {
                 StopOutcome::VerifiedEmpty => {
+                    crate::managed_mcp_capability::revoke_soul_capabilities(&soul)?;
                     self.recovery.in_flight.lock().await.remove(&soul_key);
                     self.recovery.blocked.lock().await.remove(&soul_key);
                     Ok(())
@@ -509,6 +596,7 @@ fn automatic_retryable(result: &RecoveryResult) -> bool {
         result.probe.as_ref(),
         Some(RecoveryProbe::Blocked {
             reason: RecoveryBlockReason::RateLimited
+                | RecoveryBlockReason::CapabilityPending
                 | RecoveryBlockReason::ProviderUnavailable
                 | RecoveryBlockReason::StoreUnreadable
                 | RecoveryBlockReason::WorkspaceUnavailable
@@ -685,171 +773,37 @@ fn managed_provider_env(
     );
     if mode == "opencode" {
         env.insert("TMPDIR".into(), "/run/opencode-tmp".into());
-        // The legacy inline OpenCode config may contain credential-shaped
-        // values. Never persist it in supervisor state. Rebuild a minimal,
-        // non-secret config and accept only the explicit permission enum used
-        // by managed-runtime policy and its live browser proof.
-        let permission = source
+        if let Some(value) = source
+            .get("FRESHELL_OPENCODE_REBIND")
+            .filter(|value| matches!(value.as_str(), "0" | "false"))
+        {
+            env.insert("FRESHELL_OPENCODE_REBIND".into(), value.clone());
+        }
+        // Arbitrary inline JSON can carry credentials in values such as MCP
+        // command arguments. It is staged beside the private incarnation grant,
+        // never serialized into the supervisor's durable launch environment.
+        if let Some(permission) = source
             .get("FRESHELL_MANAGED_OPENCODE_BASH_PERMISSION")
             .map(String::as_str)
-            .filter(|value| matches!(*value, "ask" | "allow" | "deny"));
-        let mut config = serde_json::json!({
-            "snapshot": false,
-            "autoupdate": false,
-        });
-        if let Some(permission) = permission {
-            config["permission"] = serde_json::json!({ "bash": permission });
+            .filter(|value| matches!(*value, "ask" | "allow" | "deny"))
+        {
+            env.insert(
+                "FRESHELL_MANAGED_OPENCODE_BASH_PERMISSION".into(),
+                permission.into(),
+            );
         }
-        env.insert("OPENCODE_CONFIG_CONTENT".into(), config.to_string());
     }
     env
 }
 
-fn managed_provider_args(mode: &str, args: Vec<String>) -> Vec<String> {
-    if mode != "claude" {
-        return args;
-    }
-    let mut out = Vec::with_capacity(args.len());
-    let mut index = 0;
-    while index < args.len() {
-        if args[index] == "--mcp-config" && index + 1 < args.len() {
-            index += 2;
-            continue;
-        }
-        out.push(args[index].clone());
-        index += 1;
-    }
-    out
-}
-
-fn provider_bootstrap_files(mode: &str) -> Result<Vec<ProviderBootstrapFile>, String> {
-    struct BootstrapSpec {
-        env_key: &'static str,
-        fallbacks: Vec<PathBuf>,
-        provider_relative_path: &'static str,
-    }
-
-    let specs: Vec<BootstrapSpec> = match mode {
-        "claude" => {
-            let mut paths = Vec::new();
-            if let Ok(dir) = std::env::var("CLAUDE_CONFIG_DIR") {
-                if !dir.trim().is_empty() {
-                    paths.push(PathBuf::from(dir).join(".credentials.json"));
-                }
-            }
-            if let Ok(home) = std::env::var("HOME") {
-                if !home.trim().is_empty() {
-                    paths.push(
-                        PathBuf::from(home)
-                            .join(".claude")
-                            .join(".credentials.json"),
-                    );
-                }
-            }
-            vec![BootstrapSpec {
-                env_key: "FRESHELL_MANAGED_CLAUDE_CREDENTIAL_FILE",
-                fallbacks: paths,
-                provider_relative_path: ".claude/.credentials.json",
-            }]
-        }
-        "opencode" => {
-            let mut paths = Vec::new();
-            if let Ok(data) = std::env::var("XDG_DATA_HOME") {
-                if !data.trim().is_empty() {
-                    paths.push(PathBuf::from(data).join("opencode").join("auth.json"));
-                }
-            }
-            if let Ok(home) = std::env::var("HOME") {
-                if !home.trim().is_empty() {
-                    paths.push(
-                        PathBuf::from(home)
-                            .join(".local")
-                            .join("share")
-                            .join("opencode")
-                            .join("auth.json"),
-                    );
-                }
-            }
-            vec![BootstrapSpec {
-                env_key: "FRESHELL_MANAGED_OPENCODE_AUTH_FILE",
-                fallbacks: paths,
-                provider_relative_path: ".local/share/opencode/auth.json",
-            }]
-        }
-        "codex" => {
-            let mut paths = Vec::new();
-            if let Ok(dir) = std::env::var("CODEX_HOME") {
-                if !dir.trim().is_empty() {
-                    paths.push(PathBuf::from(dir).join("auth.json"));
-                }
-            }
-            if let Ok(home) = std::env::var("HOME") {
-                if !home.trim().is_empty() {
-                    paths.push(PathBuf::from(home).join(".codex").join("auth.json"));
-                }
-            }
-            vec![BootstrapSpec {
-                env_key: "FRESHELL_MANAGED_CODEX_AUTH_FILE",
-                fallbacks: paths,
-                provider_relative_path: ".codex/auth.json",
-            }]
-        }
-        "amplifier" => Vec::new(),
-        _ => return Ok(Vec::new()),
-    };
-
-    let mut files = Vec::with_capacity(specs.len());
-    for spec in specs {
-        let explicit = std::env::var(spec.env_key)
-            .ok()
-            .filter(|value| !value.trim().is_empty());
-        let candidate = explicit
-            .as_ref()
-            .map(PathBuf::from)
-            .or_else(|| spec.fallbacks.into_iter().find(|path| path.is_file()));
-        if let Some(candidate) = candidate {
-            let file =
-                provider_bootstrap_file_from_candidate(candidate, spec.provider_relative_path)
-                    .map_err(|error| format!("{}: {error}", spec.env_key))?;
-            files.push(file);
-        }
-    }
-    Ok(files)
-}
-
-#[cfg(test)]
-fn provider_bootstrap_files_from_candidate(
-    mode: &str,
-    candidate: Option<PathBuf>,
-) -> Result<Vec<ProviderBootstrapFile>, String> {
-    let Some(candidate) = candidate else {
-        return Ok(Vec::new());
-    };
-    if !candidate.is_file() {
-        return Err(format!("not a readable file: {}", candidate.display()));
-    }
-    let provider_relative_path = match mode {
-        "claude" => ".claude/.credentials.json",
-        "opencode" => ".local/share/opencode/auth.json",
-        "codex" => ".codex/auth.json",
-        _ => return Ok(Vec::new()),
-    };
-    provider_bootstrap_file_from_candidate(candidate, provider_relative_path).map(|file| vec![file])
-}
-
-fn provider_bootstrap_file_from_candidate(
-    candidate: PathBuf,
-    provider_relative_path: &str,
-) -> Result<ProviderBootstrapFile, String> {
-    if !candidate.is_file() {
-        return Err(format!("not a readable file: {}", candidate.display()));
-    }
-    let canonical = std::fs::canonicalize(&candidate)
-        .map_err(|error| format!("canonicalize provider bootstrap reference: {error}"))?;
-    Ok(ProviderBootstrapFile {
-        source_path: canonical.to_string_lossy().into_owned(),
-        provider_relative_path: provider_relative_path.to_string(),
-    })
+fn managed_provider_args(mode: &str, args: Vec<String>) -> Result<Vec<String>, String> {
+    let settings = (mode == "claude").then(|| {
+        freshell_platform::cli_launch::claude_settings_json(
+            freshell_platform::cli_launch::ProviderTarget::Unix,
+        )
+    });
+    freshell_runtime_protocol::durable_managed_terminal_args(mode, args, settings.as_deref())
+        .map_err(|error| error.message)
 }
 
 fn provider_label(provider: &str) -> &str {
@@ -1074,14 +1028,7 @@ mod tests {
             env.get("XDG_CONFIG_HOME").map(String::as_str),
             Some("/home/freshell/provider/.config")
         );
-        let config: serde_json::Value = serde_json::from_str(
-            env.get("OPENCODE_CONFIG_CONTENT")
-                .expect("managed OpenCode config"),
-        )
-        .unwrap();
-        assert_eq!(config["snapshot"], false);
-        assert_eq!(config["autoupdate"], false);
-        assert!(config.get("permission").is_none());
+        assert!(!env.contains_key("OPENCODE_CONFIG_CONTENT"));
         assert_eq!(
             env.get("TMPDIR").map(String::as_str),
             Some("/run/opencode-tmp")
@@ -1092,6 +1039,47 @@ mod tests {
     }
 
     #[test]
+    fn managed_opencode_inline_plugin_configuration_is_child_only() {
+        let source = std::collections::BTreeMap::from([
+            (
+                "OPENCODE_CONFIG_CONTENT".into(),
+                r#"{"plugin":["file:///workspace/plugin.ts"],"snapshot":true,"maxTokens":8192}"#
+                    .into(),
+            ),
+            ("FRESHELL_OPENCODE_REBIND".into(), "0".into()),
+        ]);
+        let env = managed_provider_env("opencode", &source);
+        assert!(!env.contains_key("OPENCODE_CONFIG_CONTENT"));
+        assert_eq!(
+            env.get("FRESHELL_OPENCODE_REBIND").map(String::as_str),
+            Some("0")
+        );
+    }
+
+    #[test]
+    fn managed_opencode_does_not_filter_inline_json_by_field_name() {
+        let source = std::collections::BTreeMap::from([(
+            "OPENCODE_CONFIG_CONTENT".into(),
+            r#"{"plugin":["file:///workspace/plugin.ts"],"provider":{"apiKey":"raw-secret","model":"ordinary-model"}}"#.into(),
+        )]);
+        let env = managed_provider_env("opencode", &source);
+        assert!(!env.contains_key("OPENCODE_CONFIG_CONTENT"));
+        assert!(!env.values().any(|value| value.contains("raw-secret")));
+    }
+
+    #[test]
+    fn managed_opencode_never_persists_nested_inline_secret_values() {
+        let source = std::collections::BTreeMap::from([(
+            "OPENCODE_CONFIG_CONTENT".into(),
+            r#"{"mcp":{"vendor":{"type":"local","command":["tool","--token","nested-secret-byte"]}},"provider":{"endpoint":"https://nested-secret-byte.example"}}"#.into(),
+        )]);
+        let env = managed_provider_env("opencode", &source);
+        let serialized = serde_json::to_string(&env).unwrap();
+        assert!(!serialized.contains("nested-secret-byte"));
+        assert!(!env.contains_key("OPENCODE_CONFIG_CONTENT"));
+    }
+
+    #[test]
     fn managed_opencode_permission_policy_is_sanitized_and_persistable() {
         for allowed in ["ask", "allow", "deny"] {
             let source = std::collections::BTreeMap::from([(
@@ -1099,13 +1087,11 @@ mod tests {
                 allowed.to_string(),
             )]);
             let env = managed_provider_env("opencode", &source);
-            let config: serde_json::Value = serde_json::from_str(
-                env.get("OPENCODE_CONFIG_CONTENT")
-                    .expect("managed OpenCode config"),
-            )
-            .unwrap();
-            assert_eq!(config["permission"]["bash"], allowed);
-            assert!(!env.contains_key("FRESHELL_MANAGED_OPENCODE_BASH_PERMISSION"));
+            assert_eq!(
+                env.get("FRESHELL_MANAGED_OPENCODE_BASH_PERMISSION")
+                    .map(String::as_str),
+                Some(allowed)
+            );
         }
 
         let source = std::collections::BTreeMap::from([(
@@ -1113,24 +1099,29 @@ mod tests {
             "ask-with-secret-text".to_string(),
         )]);
         let env = managed_provider_env("opencode", &source);
-        let config: serde_json::Value =
-            serde_json::from_str(env.get("OPENCODE_CONFIG_CONTENT").unwrap()).unwrap();
-        assert!(config.get("permission").is_none());
+        assert!(!env.contains_key("OPENCODE_CONFIG_CONTENT"));
         assert!(!env.values().any(|value| value.contains("secret-text")));
     }
 
     #[test]
-    fn opencode_bootstrap_reference_targets_soul_auth_store_without_persisting_bytes() {
-        let dir = tempfile::tempdir().unwrap();
-        let auth = dir.path().join("auth.json");
-        std::fs::write(&auth, r#"{"opencode":{"key":"secret-bytes"}}"#).unwrap();
-        let files = provider_bootstrap_files_from_candidate("opencode", Some(auth)).unwrap();
-        assert_eq!(files.len(), 1);
+    fn managed_opencode_bash_policy_preserves_other_ordinary_permissions() {
+        let source = std::collections::BTreeMap::from([
+            (
+                "OPENCODE_CONFIG_CONTENT".into(),
+                r#"{"permission":{"read":"allow"}}"#.into(),
+            ),
+            (
+                "FRESHELL_MANAGED_OPENCODE_BASH_PERMISSION".into(),
+                "ask".into(),
+            ),
+        ]);
+        let env = managed_provider_env("opencode", &source);
+        assert!(!env.contains_key("OPENCODE_CONFIG_CONTENT"));
         assert_eq!(
-            files[0].provider_relative_path,
-            ".local/share/opencode/auth.json"
+            env.get("FRESHELL_MANAGED_OPENCODE_BASH_PERMISSION")
+                .map(String::as_str),
+            Some("ask")
         );
-        assert!(!files[0].source_path.contains("secret-bytes"));
     }
 
     #[test]
@@ -1144,19 +1135,35 @@ mod tests {
             "s1".into(),
         ];
         assert_eq!(
-            managed_provider_args("claude", args),
-            vec!["--settings", "{}", "--session-id", "s1"]
+            managed_provider_args("claude", args).unwrap(),
+            vec![
+                "--settings".to_string(),
+                freshell_platform::cli_launch::claude_settings_json(
+                    freshell_platform::cli_launch::ProviderTarget::Unix,
+                ),
+                "--session-id".to_string(),
+                "s1".to_string(),
+            ]
         );
     }
+
     #[test]
-    fn codex_bootstrap_reference_targets_soul_auth_store_without_persisting_bytes() {
-        let dir = tempfile::tempdir().unwrap();
-        let auth = dir.path().join("auth.json");
-        std::fs::write(&auth, r#"{"tokens":{"access_token":"secret-bytes"}}"#).unwrap();
-        let files = provider_bootstrap_files_from_candidate("codex", Some(auth)).unwrap();
-        assert_eq!(files.len(), 1);
-        assert_eq!(files[0].provider_relative_path, ".codex/auth.json");
-        assert!(!files[0].source_path.contains("secret-bytes"));
+    fn managed_terminal_argument_path_rejects_credential_flags_before_persistence() {
+        for mode in ["claude", "codex", "opencode", "amplifier"] {
+            for arguments in [
+                vec!["--api-key", "fixture-secret-bytes"],
+                vec!["--api-key=fixture-secret-bytes"],
+            ] {
+                assert!(
+                    managed_provider_args(
+                        mode,
+                        arguments.into_iter().map(str::to_string).collect()
+                    )
+                    .is_err(),
+                    "{mode}"
+                );
+            }
+        }
     }
 }
 

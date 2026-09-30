@@ -99,6 +99,21 @@ describe('coordinator command matrix', () => {
     }
   })
 
+  it.each([
+    'test/integration/server/managed-provider-parity.test.ts',
+    'test/integration/server/fresh-agent-parity.test.ts',
+    'test/integration/server/provider-parity-contract.test.ts',
+  ])('allows the Rust-server parity Vitest spec by its exact path only (%s)', spec => {
+    const args = ['run', spec, '--config', 'config/vitest/vitest.config.ts']
+    expectPhase(classifyCommand({ commandKey: 'test:vitest', forwardedArgs: args }), {
+      runner: 'vitest', config: 'direct', args,
+    })
+    expect(classifyCommand({
+      commandKey: 'test:vitest',
+      forwardedArgs: ['run', 'test/integration/server/other.test.ts', '--config', 'config/vitest/vitest.config.ts'],
+    }).kind).toBe('rejected')
+  })
+
   it('never emits passWithNoTests and accepts direct retained Vitest configs', () => {
     const disposition = classifyCommand({
       commandKey: 'test:vitest',

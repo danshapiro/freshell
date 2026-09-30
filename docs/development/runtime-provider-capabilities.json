@@ -5,6 +5,7 @@
     {
       "provider": "shell",
       "certificationState": "certified",
+      "qualificationReady": true,
       "managedEnabled": true,
       "durableRecoveryEnabled": false,
       "managedModes": [
@@ -28,6 +29,7 @@
     {
       "provider": "claude",
       "certificationState": "pending_live_provider_certification",
+      "qualificationReady": true,
       "managedEnabled": false,
       "durableRecoveryEnabled": false,
       "managedModes": [
@@ -39,7 +41,7 @@
       "resumeCommand": "claude --resume <exact-session-id>",
       "zeroTurnPolicy": "preallocated-id-is-not-durable-before-transcript",
       "checkpointPolicy": "provider-transcript-only",
-      "bootstrap": ".claude/.credentials.json copied before privilege drop",
+      "bootstrap": "typed Claude OneCLI environment/auth-file reference resolved for provider child; legacy Kilroy raw bootstrap is separate",
       "liveGate": "haiku-lowest-reasoning",
       "blockedReason": "PENDING_LIVE_QUALIFICATION",
       "recoveryPaths": [
@@ -53,6 +55,7 @@
     {
       "provider": "opencode",
       "certificationState": "certified",
+      "qualificationReady": true,
       "managedEnabled": true,
       "durableRecoveryEnabled": true,
       "managedModes": [
@@ -64,7 +67,7 @@
       "resumeCommand": "opencode --session <exact-ses-id>",
       "zeroTurnPolicy": "session-row-must-materialize",
       "checkpointPolicy": "provider-sqlite-only-no-live-copy",
-      "bootstrap": ".local/share/opencode/auth.json copied before privilege drop",
+      "bootstrap": "typed OpenCode OneCLI environment/auth-file reference resolved for provider child",
       "liveGate": "opencode-1.18.21-big-pickle-free-tier",
       "blockedReason": null,
       "recoveryPaths": [
@@ -78,6 +81,7 @@
     {
       "provider": "codex",
       "certificationState": "pending_live_provider_certification",
+      "qualificationReady": true,
       "managedEnabled": false,
       "durableRecoveryEnabled": false,
       "managedModes": [
@@ -89,7 +93,7 @@
       "resumeCommand": "codex resume <exact-thread-id>",
       "zeroTurnPolicy": "no-durable-thread-until-provider-materializes",
       "checkpointPolicy": "provider-rollout-only",
-      "bootstrap": ".codex/auth.json copied before privilege drop",
+      "bootstrap": "typed Codex OneCLI environment/auth-file reference resolved for provider child",
       "liveGate": "gpt-5.6-luna-lowest-reasoning",
       "blockedReason": "PENDING_LIVE_QUALIFICATION",
       "recoveryPaths": [
@@ -103,6 +107,7 @@
     {
       "provider": "amplifier",
       "certificationState": "pending_live_provider_certification",
+      "qualificationReady": true,
       "managedEnabled": false,
       "durableRecoveryEnabled": false,
       "managedModes": [
@@ -114,7 +119,7 @@
       "resumeCommand": "amplifier session resume --full-history <exact-id>",
       "zeroTurnPolicy": "stub-is-not-durable-conversation-proof",
       "checkpointPolicy": "provider-session-directory",
-      "bootstrap": "approved private keys.env reference resolved into child-only env plus image-pinned OneCLI Haiku/low profile; raw OAuth forbidden",
+      "bootstrap": "optional typed Amplifier OneCLI environment/auth-file reference resolved for provider child; ordinary configured bundle/provider/model/plugins/operations",
       "liveGate": "provider-approved-lowest-cost-model",
       "blockedReason": "PENDING_LIVE_QUALIFICATION",
       "recoveryPaths": [
@@ -128,6 +133,7 @@
     {
       "provider": "gemini",
       "certificationState": "not_applicable",
+      "qualificationReady": false,
       "managedEnabled": false,
       "durableRecoveryEnabled": false,
       "managedModes": [
@@ -148,6 +154,7 @@
     {
       "provider": "kimi",
       "certificationState": "not_applicable",
+      "qualificationReady": false,
       "managedEnabled": false,
       "durableRecoveryEnabled": false,
       "managedModes": [
@@ -170,6 +177,8 @@
     {
       "mode": "freshclaude",
       "provider": "claude",
+      "qualificationReady": true,
+      "releaseDeferralReason": "pending_live_provider_certification",
       "runtimeVariant": "claude-agent-sdk",
       "hostOwnedImplementation": true,
       "enabledInReleaseScope": false,
@@ -180,6 +189,8 @@
     {
       "mode": "kilroy",
       "provider": "claude",
+      "qualificationReady": true,
+      "releaseDeferralReason": "pending_live_provider_certification",
       "runtimeVariant": "kilroy-claude-agent-sdk",
       "hostOwnedImplementation": true,
       "enabledInReleaseScope": false,
@@ -190,6 +201,8 @@
     {
       "mode": "freshcodex",
       "provider": "codex",
+      "qualificationReady": true,
+      "releaseDeferralReason": "pending_live_provider_certification",
       "runtimeVariant": "codex-app-server",
       "hostOwnedImplementation": true,
       "enabledInReleaseScope": false,
@@ -200,6 +213,8 @@
     {
       "mode": "freshopencode",
       "provider": "opencode",
+      "qualificationReady": true,
+      "releaseDeferralReason": "pending_live_provider_certification",
       "runtimeVariant": "opencode-per-soul-http",
       "hostOwnedImplementation": true,
       "enabledInReleaseScope": false,
@@ -237,7 +252,7 @@
         "claude"
       ],
       "policy": "blocked",
-      "identityRule": "FRESH_AGENT_GLOBALLY_DISABLED_IN_RELEASE_SCOPE",
+      "identityRule": "PENDING_LIVE_PROVIDER_CERTIFICATION",
       "enabledInReleaseScope": false
     },
     {
@@ -247,7 +262,7 @@
         "claude"
       ],
       "policy": "blocked",
-      "identityRule": "FRESH_AGENT_GLOBALLY_DISABLED_IN_RELEASE_SCOPE",
+      "identityRule": "PENDING_LIVE_PROVIDER_CERTIFICATION",
       "enabledInReleaseScope": false
     },
     {
@@ -257,7 +272,7 @@
         "opencode"
       ],
       "policy": "blocked",
-      "identityRule": "FRESH_AGENT_GLOBALLY_DISABLED_IN_RELEASE_SCOPE",
+      "identityRule": "PENDING_LIVE_PROVIDER_CERTIFICATION",
       "enabledInReleaseScope": false
     },
     {
@@ -267,7 +282,7 @@
         "codex"
       ],
       "policy": "blocked",
-      "identityRule": "FRESH_AGENT_GLOBALLY_DISABLED_IN_RELEASE_SCOPE",
+      "identityRule": "PENDING_LIVE_PROVIDER_CERTIFICATION",
       "enabledInReleaseScope": false
     },
     {

@@ -18,6 +18,7 @@ type RuntimeSurface = {
 const ALLOWED_LISTENER_PATHS = [
   'scripts/testing/coordinator-endpoint.ts',
   'scripts/testing/runtime-test-broker.ts',
+  'scripts/testing/probe-managed-mcp-image.ts',
   'test/e2e-browser/helpers/echo-ws-fixture.ts',
   'test/e2e-browser/helpers/harness-06/target-server.ts',
   'test/e2e-browser/helpers/harness-06/update-feed.ts',

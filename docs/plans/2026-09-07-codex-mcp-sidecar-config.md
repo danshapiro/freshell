@@ -21,6 +21,11 @@ Fix managed Codex startup so the Codex TUI and its separate app-server receive t
 
 **Architecture:** Resolve the Freshell MCP command recipe once, render it separately for the TUI execution target and the host-native app-server execution target, and add a value-free Codex `env_vars` declaration that forwards the six existing `FRESHELL_*` names from each parent process. Carry the host-side rendering and parent environment through the managed launch plan only to a newly spawned app-server; a verified survivor remains deliberately unmodified. Reserve the terminal identity before restore preplanning, retain it with the prepared launch, and make failed adoption tear down the still-owned sidecar transactionally.
 
+This applies to web-managed Codex sessions and to a durable session-host
+app-server after host replacement. Render the same provider-visible Freshell MCP
+recipe for each target's path namespace; keep ordinary Codex MCP servers,
+plugins, configuration, approved user roots, and native operations intact.
+
 **Tech Stack:** Rust 2021 workspace; Tokio process spawning and WebSocket proxy; `freshell-platform` MCP injection/target helpers; existing Rust fake-sidecar integration tests; existing opt-in real Codex provider-contract harness for final acceptance.
 
 ## Global Constraints

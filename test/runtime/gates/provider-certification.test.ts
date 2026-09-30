@@ -31,6 +31,8 @@ import {
 import { validateProviderQualificationReceipt } from '../../../scripts/testing/provider-qualification-receipt.js'
 import { readCandidateReceiptSource } from '../../../scripts/testing/runtime-receipt-source.js'
 import { defaultReceiptFileName } from '../../../scripts/testing/runtime-receipts.js'
+import { runProviderParityFixture } from '../../integration/server/provider-parity-fixture.js'
+import { PROVIDER_PARITY_CASE_IDS, loadProviderParityLocalReceipt } from '../../../scripts/testing/provider-parity-receipt.js'
 import type { RuntimeHarness } from '../../../scripts/testing/runtime-sandbox.js'
 
 export function providerCertificationCaseIdsFor(repoRoot: string): string[] {
@@ -100,6 +102,17 @@ export async function runProviderCertificationGate(
 
   caseResults.push({ caseId: 'PC-SCOPE', status: 'PASS' })
   h.recordLifecycle('gate.case.passed', { caseId: 'PC-SCOPE' })
+
+  const localSource = process.env.FRESHELL_RUNTIME_PROVIDER_PARITY_LOCAL_RECEIPT
+  const localParity = localSource
+    ? loadProviderParityLocalReceipt(localSource, h.candidateSha)
+    : await runProviderParityFixture(h.repoRoot, path.join(h.browserDir, 'provider-parity-local-events.jsonl'))
+  h.writeBrowserArtifact('provider-parity-local', localParity)
+  for (const caseId of PROVIDER_PARITY_CASE_IDS) {
+    h.assert(caseId, localParity.rows.some(row => row.caseId === caseId), 'local provider parity fixture produced this case')
+    caseResults.push({ caseId, status: 'PASS' })
+    h.recordLifecycle('gate.case.passed', { caseId, receiptKind: 'provider-parity-local' })
+  }
 
   const receipt = readProviderReceipt(h, 'PC-RECEIPT')
 
@@ -231,6 +244,7 @@ function assertNoProductionPromise(
   manifest: CapabilityManifest,
   row: ProviderRow,
 ): void {
+  h.assert(caseId, row.qualificationReady === true, `${row.provider} adapter is ready for explicit qualification`, row)
   h.assert(caseId, row.managedEnabled === false, `${row.provider} is not managed-enabled while uncertified`, row)
   h.assert(caseId, row.durableRecoveryEnabled === false, `${row.provider} claims no durable recovery while uncertified`, row)
   h.assert(caseId, row.blockedReason === 'PENDING_LIVE_QUALIFICATION', `${row.provider} carries the typed pending reason`, row)

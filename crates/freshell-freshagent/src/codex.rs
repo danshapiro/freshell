@@ -303,6 +303,7 @@ fn codex_quiet_window_ms_from_env() -> u64 {
 /// Shared, cheaply-cloneable freshcodex WS state (mergeable into the server app + WsState).
 #[derive(Clone)]
 pub struct FreshCodexState {
+    sidecar_launch_context: CodexSidecarLaunchContext,
     /// The shared WS broadcast bus (pre-serialized frames), fanned out by every
     /// `freshell-ws` connection. `freshAgent.created` / `freshAgent.send.accepted` /
     /// `freshAgent.event` are pushed here so the oracle's capture socket records them.
@@ -767,6 +768,7 @@ impl FreshCodexState {
             .and_then(Value::as_bool)
             .unwrap_or(false);
         Self {
+            sidecar_launch_context: CodexSidecarLaunchContext::default(),
             broadcast_tx,
             sessions: Arc::new(TokioMutex::new(HashMap::new())),
             fresh_agent_enabled: Arc::new(AtomicBool::new(enabled)),
@@ -791,6 +793,11 @@ impl FreshCodexState {
             snapshot_pause_after_capture: Arc::new(StdMutex::new(None)),
             controls: Default::default(),
         }
+    }
+
+    pub fn with_sidecar_launch_context(mut self, context: CodexSidecarLaunchContext) -> Self {
+        self.sidecar_launch_context = context;
+        self
     }
 
     /// The configured wedged-sidecar quiet window, in milliseconds.
@@ -7106,11 +7113,7 @@ impl FreshCodexState {
         let ownership_id = mint_ownership_id();
         // The canonical argv + env: `-c features.apps=false app-server --listen <ws_url>`
         // plus the ownership tag the /proc reaper keys on (S5.d.1 unification).
-        let spec = codex_sidecar_spawn_spec(
-            &ws_url,
-            &ownership_id,
-            &CodexSidecarLaunchContext::default(),
-        );
+        let spec = codex_sidecar_spawn_spec(&ws_url, &ownership_id, &self.sidecar_launch_context);
         let codex_cmd = std::env::var("CODEX_CMD").unwrap_or_else(|_| "codex".to_string());
         // Whitespace-split so a test fixture can point `CODEX_CMD` at an interpreter plus
         // script (e.g. `CODEX_CMD="node /path/fake-app-server.mjs"`) without needing the
@@ -7132,6 +7135,9 @@ impl FreshCodexState {
         // our sidecar).
         for (key, value) in &spec.env {
             cmd.env(key, value);
+        }
+        if let Some(environment) = freshell_platform::managed_child_secrets::snapshot() {
+            cmd.envs(environment);
         }
         cmd.stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -26668,6 +26674,23 @@ pub(crate) mod tests {
             json!(100),
             "the record's lastOpAtMs is the revision floor (basis 7 loses)"
         );
+    }
+
+    #[test]
+    fn fresh_agent_operation_matrix_parity_codex() {
+        let snapshot = build_codex_snapshot_json(
+            "native",
+            &codex_raw_thread_updated_at_7(),
+            false,
+            Some(HistoryMode::Paginated),
+            None,
+            false,
+        )
+        .unwrap();
+        assert_eq!(snapshot["capabilities"]["send"], true);
+        assert_eq!(snapshot["capabilities"]["fork"], true);
+        assert_eq!(snapshot["capabilities"]["undo"], true);
+        assert_eq!(snapshot["capabilities"]["redo"], false);
     }
 
     #[test]

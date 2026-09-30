@@ -117,6 +117,19 @@ const productionReadiness = productionCertificationStatus(capabilities)
 
 const STEPS: Step[] = [
   defineCampaignProducerStep({
+    id: 'provider-parity-local',
+    kind: 'producer',
+    title: 'Deterministic direct and managed provider parity',
+    produces: ['FRESHELL_RUNTIME_PROVIDER_PARITY_LOCAL_RECEIPT'],
+    runner: 'receipt',
+    run: (env: NodeJS.ProcessEnv, logPath: string) => runLogged(
+      mise,
+      ['exec', 'node@22', '--', 'node_modules/.bin/tsx', 'scripts/testing/run-provider-parity-local.ts'],
+      env,
+      logPath,
+    ),
+  }),
+  defineCampaignProducerStep({
     id: 'continuity',
     kind: 'producer',
     title: 'Phase 2 real browser + authenticated OpenAI-backed OpenCode continuity',

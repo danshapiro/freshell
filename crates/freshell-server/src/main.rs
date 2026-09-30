@@ -38,6 +38,8 @@ mod kilroy_lane;
 mod legacy_local_seed;
 mod logging;
 mod machines;
+#[cfg(feature = "managed-runtime-v1")]
+mod managed_mcp_capability;
 mod managed_ports;
 #[cfg(feature = "managed-runtime-v1")]
 mod managed_provider_bootstrap;
@@ -904,6 +906,35 @@ async fn main() -> ExitCode {
     // restart), so the bind host is resolved only now, AFTER the settings
     // store loads. `FRESHELL_BIND_HOST` still outranks it (platform-side).
     let bind_host = resolve_bind_host(&settings_store.get().await.network);
+    #[cfg(feature = "managed-runtime-v1")]
+    if std::env::var("FRESHELL_MANAGED_RUNTIME_V1").ok().as_deref() == Some("1") {
+        let control_socket =
+            std::env::var_os("FRESHELL_RUNTIME_CONTROL_SOCKET").unwrap_or_else(|| {
+                eprintln!("managed runtime requires FRESHELL_RUNTIME_CONTROL_SOCKET");
+                std::process::exit(1);
+            });
+        let control_secret_file = std::env::var_os("FRESHELL_RUNTIME_CONTROL_SECRET_FILE")
+            .unwrap_or_else(|| {
+                eprintln!("managed runtime requires FRESHELL_RUNTIME_CONTROL_SECRET_FILE");
+                std::process::exit(1);
+            });
+        managed_mcp_capability::configure(
+            &bind_host,
+            port,
+            Path::new(&control_socket),
+            Path::new(&control_secret_file),
+        )
+        .unwrap_or_else(|error| {
+            eprintln!("managed MCP initialization failed: {error}");
+            std::process::exit(1);
+        });
+        managed_mcp_capability::spawn_callback_server()
+            .await
+            .unwrap_or_else(|error| {
+                eprintln!("managed MCP callback initialization failed: {error}");
+                std::process::exit(1);
+            });
+    }
     // GAP1 (CFG-03 checklist follow-up): the boot-time `config.fallback`
     // notice, if the primary config needed to fall back at boot. `None` for
     // a healthy config or an ordinary fresh install. Threaded into
@@ -1089,6 +1120,15 @@ async fn main() -> ExitCode {
         let client = controller
             .as_ref()
             .map(|controller| controller.runtime_client());
+        if let Some(client) = client.as_ref() {
+            managed_mcp_capability::rehydrate_running_capabilities(client)
+                .await
+                .unwrap_or_else(|error| {
+                    eprintln!("managed MCP grant recovery failed: {error}");
+                    std::process::exit(1);
+                });
+            managed_mcp_capability::spawn_renewal_loop(client.clone());
+        }
         registry.set_managed_controller(controller.map(|controller| {
             controller as Arc<dyn freshell_terminal::registry::ManagedTerminalController>
         }));
@@ -1097,21 +1137,23 @@ async fn main() -> ExitCode {
     #[cfg(not(feature = "managed-runtime-v1"))]
     let managed_runtime_available = false;
     #[cfg(feature = "managed-runtime-v1")]
-    if let Some(gateway) = fresh_agent_proxy::HostedFreshAgentProxy::from_opt_in(
+    let hosted_fresh_gateway = fresh_agent_proxy::HostedFreshAgentProxy::from_opt_in(
         managed_runtime_client.clone(),
         Arc::clone(&broadcast_tx),
     )
     .unwrap_or_else(|error| {
         eprintln!("managed fresh-agent gateway initialization failed: {error}");
         std::process::exit(1);
-    }) {
+    });
+    #[cfg(feature = "managed-runtime-v1")]
+    if let Some(gateway) = hosted_fresh_gateway.as_ref() {
         fresh_agent_state
             .set_hosted_rest_gateway(gateway.clone())
             .unwrap_or_else(|error| {
                 eprintln!("managed fresh-agent gateway initialization failed: {error}");
                 std::process::exit(1);
             });
-        freshell_ws::hosted_fresh_agent::install_gateway(gateway).unwrap_or_else(|error| {
+        freshell_ws::hosted_fresh_agent::install_gateway(gateway.clone()).unwrap_or_else(|error| {
             eprintln!("managed fresh-agent gateway initialization failed: {error}");
             std::process::exit(1);
         });
@@ -1233,6 +1275,10 @@ async fn main() -> ExitCode {
             }
         });
     if let Some(names) = session_names.clone() {
+        #[cfg(feature = "managed-runtime-v1")]
+        if let Some(gateway) = hosted_fresh_gateway.as_ref() {
+            gateway.set_session_naming(names.clone());
+        }
         // The identity registry is the shared sink holder the session/
         // terminal/directory/resolve surfaces already carry; the fresh-agent
         // states each hold their own OnceLock sink.
@@ -3278,6 +3324,12 @@ async fn main() -> ExitCode {
         .layer(axum::middleware::from_fn(
             logging::request_logging_middleware,
         ));
+
+    #[cfg(feature = "managed-runtime-v1")]
+    let app = app.layer(axum::middleware::from_fn_with_state(
+        Arc::clone(&auth_token),
+        managed_mcp_capability::scoped_auth_middleware,
+    ));
 
     // Slice 2 (Task 2.2): the boot listener is served through the
     // RebindController — the same transactional bind/swap path the network

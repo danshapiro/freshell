@@ -117,6 +117,7 @@ async fn nested_json_encoded_secrets_in_client_log_strings_are_redacted() {
         .env("PORT", port.to_string())
         .env("AUTH_TOKEN", &token)
         .env("FRESHELL_BIND_HOST", "127.0.0.1")
+        .env_remove("FRESHELL_MANAGED_RUNTIME_V1")
         .env("HOME", &home_path)
         .env("FRESHELL_HOME", &home_path)
         .stdout(Stdio::piped())
@@ -229,6 +230,7 @@ async fn client_log_entries_are_emitted_into_the_structured_log() {
         .env("PORT", port.to_string())
         .env("AUTH_TOKEN", &token)
         .env("FRESHELL_BIND_HOST", "127.0.0.1")
+        .env_remove("FRESHELL_MANAGED_RUNTIME_V1")
         .env("HOME", &home_path)
         .env("FRESHELL_HOME", &home_path)
         // `debug`, not the default `info` threshold `logging::init` falls back

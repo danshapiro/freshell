@@ -415,6 +415,11 @@ impl Registry {
         &self,
         input: LaunchPreparation,
     ) -> Result<PreparedLaunch, RegistryError> {
+        if let Some(terminal) = &input.terminal {
+            terminal
+                .validate()
+                .map_err(|error| RegistryError::InvalidState(error.message))?;
+        }
         let installation_id = self.installation_id().clone();
         self.run_blocking(move |mut conn| {
             failpoint("prepare")?;
@@ -1176,14 +1181,18 @@ impl Registry {
             if existing.as_deref() != Some(expected_parent.as_str()) {
                 return Err(RegistryError::NativeIdentityConflict);
             }
-            let encoded: String = tx.query_row(
-                "SELECT fresh_agent_spec FROM incarnations WHERE incarnation_id=?1",
-                params![incarnation_id.as_str()], |row| row.get(0),
+            let (fresh_spec, terminal_spec): (Option<String>, Option<String>) = tx.query_row(
+                "SELECT fresh_agent_spec,terminal_spec FROM incarnations WHERE incarnation_id=?1",
+                params![incarnation_id.as_str()], |row| Ok((row.get(0)?, row.get(1)?)),
             )?;
-            let mut spec: FreshAgentLaunchSpec = serde_json::from_str(&encoded)
-                .map_err(|_| RegistryError::Integrity("invalid fresh-agent launch spec".into()))?;
-            if spec.native_session_id.as_deref() != Some(expected_parent.as_str()) {
-                return Err(RegistryError::NativeIdentityConflict);
+            let mut fresh_spec = fresh_spec.map(|encoded| serde_json::from_str::<FreshAgentLaunchSpec>(&encoded))
+                .transpose().map_err(|_| RegistryError::Integrity("invalid fresh-agent launch spec".into()))?;
+            let terminal_spec = terminal_spec.map(|encoded| serde_json::from_str::<TerminalLaunchSpec>(&encoded))
+                .transpose().map_err(|_| RegistryError::Integrity("invalid terminal launch spec".into()))?;
+            match (&fresh_spec, &terminal_spec) {
+                (Some(spec), _) if spec.native_session_id.as_deref() == Some(expected_parent.as_str()) => {},
+                (None, Some(spec)) if provider == "opencode" && spec.mode == "opencode" => {},
+                _ => return Err(RegistryError::NativeIdentityConflict),
             }
             let conflicting: Option<String> = tx.query_row(
                 "SELECT incarnation_id FROM writer_claims WHERE provider=?1 AND provider_store_id=?2 AND native_session_id=?3",
@@ -1207,13 +1216,21 @@ impl Registry {
             // and the externally resumable presentation key. Persist them
             // together so a web-server restart cannot rediscover the retired
             // parent through inventory fallback.
-            spec.session_id = child_session_id.clone();
-            spec.native_session_id = Some(child_session_id.clone());
             let now = now_millis();
-            tx.execute(
-                "UPDATE incarnations SET fresh_agent_spec=?1,updated_at=?2 WHERE incarnation_id=?3",
-                params![serde_json::to_string(&spec)?, now, incarnation_id.as_str()],
-            )?;
+            if let Some(spec) = fresh_spec.as_mut() {
+                spec.session_id = child_session_id.clone();
+                spec.native_session_id = Some(child_session_id.clone());
+                if let Some(reference) = spec.session_ref.as_mut() {
+                    reference.session_id = child_session_id.clone();
+                }
+                tx.execute(
+                    "UPDATE incarnations SET fresh_agent_spec=?1,updated_at=?2 WHERE incarnation_id=?3",
+                    params![serde_json::to_string(spec)?, now, incarnation_id.as_str()],
+                )?;
+            }
+            // The terminal launch spec is part of Docker's immutable
+            // ownership digest. The soul row and writer claim carry the live
+            // identity; exact recovery creates a new launch from that id.
             // Any prior resume proof names the old branch. It must be
             // re-materialized from the child before a later replacement.
             tx.execute(
@@ -2876,8 +2893,13 @@ mod tests {
             permission_mode: Some("ask".into()),
             sandbox: Some("workspace-write".into()),
             native_session_id: None,
+            plugins: None,
+            model_selection: None,
+            session_ref: None,
             fixture_transport: None,
             provider_bootstrap_files: Vec::new(),
+            provider_secret_references: Vec::new(),
+            provider_launch_context: None,
         });
         let prepared = registry.prepare_launch(launch).await.unwrap();
         let runtime_dir = format!("/tmp/freshell-runtime-test/{}", prepared.incarnation_id);
@@ -2982,7 +3004,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn amplifier_onecli_persists_only_the_secret_reference() {
+    async fn provider_secret_registry_persists_source_and_capability_reference_without_contents() {
         let dir = tempfile::tempdir().unwrap();
         let workspace = tempfile::tempdir().unwrap();
         let keys = workspace.path().join("keys.env");
@@ -3021,7 +3043,45 @@ mod tests {
                 profile:
                     freshell_runtime_protocol::ProviderSecretProfile::AmplifierOnecliLunarouteGlm53,
             }],
+            provider_launch_context: Some(freshell_runtime_protocol::ProviderLaunchContext {
+                preparation: freshell_runtime_protocol::ProviderPreparation::Amplifier {
+                    bundle: "default".into(),
+                    resume_args: Vec::new(),
+                },
+                mcp_capability: Some(freshell_runtime_protocol::McpCapabilityReference {
+                    grant_id: "grant-registry-reference".into(),
+                    endpoint: "http://host.docker.internal:3001/api/mcp".into(),
+                    provider_relative_path: ".amplifier/freshell-mcp.json".into(),
+                    host_gateway_address: None,
+                }),
+                config: Vec::new(),
+            }),
         });
+        for raw in [
+            vec!["--api-key".into(), secret.into()],
+            vec![format!("--api-key={secret}")],
+        ] {
+            assert!(freshell_runtime_protocol::durable_managed_terminal_args(
+                "amplifier",
+                raw.clone(),
+                None
+            )
+            .is_err());
+            let mut raw_launch = launch.clone();
+            raw_launch.terminal.as_mut().unwrap().args = raw;
+            assert!(matches!(
+                registry.prepare_launch(raw_launch).await,
+                Err(RegistryError::InvalidState(_))
+            ));
+            let conn = open_connection(&registry.inner.db_path).unwrap();
+            let rows: i64 = conn
+                .query_row("SELECT COUNT(*) FROM incarnations", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(rows, 0, "raw terminal argv reached durable registry");
+        }
+        assert!(!serde_json::to_string(launch.terminal.as_ref().unwrap())
+            .unwrap()
+            .contains(secret));
         registry.prepare_launch(launch).await.unwrap();
 
         let conn = open_connection(&registry.inner.db_path).unwrap();
@@ -3034,6 +3094,7 @@ mod tests {
             .unwrap();
         assert!(terminal_json.contains(&keys.to_string_lossy().to_string()));
         assert!(terminal_json.contains("amplifier_onecli_lunaroute_glm53"));
+        assert!(terminal_json.contains("grant-registry-reference"));
         assert!(!terminal_json.contains("onecli.example.invalid"));
         assert!(!terminal_json.contains(secret));
         drop(conn);
@@ -3051,6 +3112,80 @@ mod tests {
             !String::from_utf8_lossy(&durable_bytes).contains(secret),
             "OneCLI secret bytes must never enter supervisor durable state"
         );
+    }
+
+    #[tokio::test]
+    async fn opencode_inline_secret_stays_out_of_registry_row_and_digest() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let workspace_path = std::fs::canonicalize(workspace.path()).unwrap();
+        let secret = "nested-command-argument-secret";
+        let private_stage = tempfile::tempdir().unwrap();
+        std::fs::write(
+            private_stage.path().join("inline-config.json"),
+            format!(r#"{{"mcp":{{"vendor":{{"type":"local","command":["tool","--token","{secret}"]}}}}}}"#),
+        ).unwrap();
+        let registry = Registry::open(dir.path(), None).unwrap();
+        let mut launch = prep(SoulId::new(), RequestId::new(), "typed-opencode-launch");
+        launch.provider = "opencode".into();
+        launch.terminal = Some(TerminalLaunchSpec {
+            terminal_id: "terminal-inline".into(),
+            stream_id: "stream-inline".into(),
+            mode: "opencode".into(),
+            program: "/bin/true".into(),
+            args: Vec::new(),
+            env: std::collections::BTreeMap::new(),
+            cwd: workspace_path.to_string_lossy().into_owned(),
+            run_as_uid: 65_534,
+            run_as_gid: 0,
+            cols: 80,
+            rows: 24,
+            project_key: "inline-test".into(),
+            workspace_path: workspace_path.to_string_lossy().into_owned(),
+            git_common_dir: None,
+            create_request_id: None,
+            resume_session_id: None,
+            provider_model: None,
+            provider_reasoning_effort: None,
+            provider_sandbox: None,
+            provider_permission_mode: None,
+            provider_bootstrap_files: Vec::new(),
+            provider_secret_references: Vec::new(),
+            provider_launch_context: Some(freshell_runtime_protocol::ProviderLaunchContext {
+                preparation: freshell_runtime_protocol::ProviderPreparation::Opencode {
+                    project_config: Vec::new(),
+                    tui_config: None,
+                    tui_source: None,
+                    inline_config: true,
+                },
+                mcp_capability: Some(freshell_runtime_protocol::McpCapabilityReference {
+                    grant_id: "grant-inline".into(),
+                    endpoint: "http://host.docker.internal:3001".into(),
+                    provider_relative_path: ".freshell/mcp-capability.json".into(),
+                    host_gateway_address: None,
+                }),
+                config: Vec::new(),
+            }),
+        });
+        let digest_input = serde_json::to_vec(launch.terminal.as_ref().unwrap()).unwrap();
+        assert!(!String::from_utf8_lossy(&digest_input).contains(secret));
+        registry.prepare_launch(launch).await.unwrap();
+        let conn = open_connection(&registry.inner.db_path).unwrap();
+        let (row, digest): (String, String) = conn.query_row(
+            "SELECT i.terminal_spec,c.payload_digest FROM incarnations i JOIN commands c ON c.incarnation_id=i.incarnation_id LIMIT 1",
+            [], |row| Ok((row.get(0)?, row.get(1)?)),
+        ).unwrap();
+        assert!(row.contains("inline_config"));
+        assert!(!row.contains(secret));
+        assert!(!digest.contains(secret));
+        for candidate in [
+            registry.inner.db_path.clone(),
+            registry.inner.db_path.with_extension("sqlite3-wal"),
+        ] {
+            if let Ok(bytes) = std::fs::read(candidate) {
+                assert!(!String::from_utf8_lossy(&bytes).contains(secret));
+            }
+        }
     }
 
     #[test]
@@ -3321,6 +3456,90 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn terminal_opencode_switch_updates_resume_identity_and_writer_claim() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let registry = Registry::open(dir.path(), None).unwrap();
+        let soul = SoulId::new();
+        let mut launch = prep(soul.clone(), RequestId::new(), "opencode-switch");
+        launch.provider = "opencode".into();
+        launch.provider_store_id = "opencode-store".into();
+        launch.terminal = Some(TerminalLaunchSpec {
+            terminal_id: "terminal-switch".into(),
+            stream_id: "stream-switch".into(),
+            mode: "opencode".into(),
+            program: "opencode".into(),
+            args: Vec::new(),
+            env: Default::default(),
+            cwd: workspace.path().to_string_lossy().into_owned(),
+            run_as_uid: 65_534,
+            run_as_gid: 0,
+            cols: 80,
+            rows: 24,
+            project_key: "switch-project".into(),
+            workspace_path: workspace.path().to_string_lossy().into_owned(),
+            git_common_dir: None,
+            create_request_id: None,
+            resume_session_id: None,
+            provider_model: None,
+            provider_reasoning_effort: None,
+            provider_sandbox: None,
+            provider_permission_mode: None,
+            provider_bootstrap_files: Vec::new(),
+            provider_secret_references: Vec::new(),
+            provider_launch_context: None,
+        });
+        let prepared = registry.prepare_launch(launch).await.unwrap();
+        registry
+            .record_native_session(
+                soul.clone(),
+                prepared.incarnation_id.clone(),
+                "ses_Parent".into(),
+            )
+            .await
+            .unwrap();
+        registry
+            .transition_native_session(
+                soul.clone(),
+                prepared.incarnation_id.clone(),
+                "ses_Parent",
+                "ses_Child",
+            )
+            .await
+            .unwrap();
+        registry
+            .transition_native_session(
+                soul.clone(),
+                prepared.incarnation_id.clone(),
+                "ses_Parent",
+                "ses_Child",
+            )
+            .await
+            .unwrap();
+        let view = registry
+            .inventory()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|view| view.soul_id == soul)
+            .unwrap();
+        assert_eq!(view.native_session_id.as_deref(), Some("ses_Child"));
+        assert_eq!(view.terminal_resume_session_id, None);
+        let conn = open_connection(&registry.inner.db_path).unwrap();
+        let claims: Vec<String> = {
+            let mut query = conn
+                .prepare("SELECT native_session_id FROM writer_claims WHERE soul_id=?1")
+                .unwrap();
+            query
+                .query_map(params![soul.as_str()], |row| row.get(0))
+                .unwrap()
+                .map(Result::unwrap)
+                .collect()
+        };
+        assert_eq!(claims, vec!["ses_Child"]);
+    }
+
+    #[tokio::test]
     async fn accepted_fresh_agent_turn_settings_are_part_of_exact_recovery_profile() {
         let dir = tempfile::tempdir().unwrap();
         let workspace = tempfile::tempdir().unwrap();
@@ -3480,6 +3699,7 @@ mod tests {
             provider_permission_mode: None,
             provider_bootstrap_files: Vec::new(),
             provider_secret_references: Vec::new(),
+            provider_launch_context: None,
         };
         let mut launch = prep(soul.clone(), RequestId::new(), "exact-resume");
         launch.provider = "opencode".into();

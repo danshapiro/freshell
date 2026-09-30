@@ -327,6 +327,7 @@ async fn browser01_proxy_through_the_real_binary() {
         .env("PORT", port.to_string())
         .env("AUTH_TOKEN", &token)
         .env("FRESHELL_BIND_HOST", "127.0.0.1")
+        .env_remove("FRESHELL_MANAGED_RUNTIME_V1")
         .env("HOME", home.path())
         .env("FRESHELL_HOME", home.path())
         .env_remove("RUST_LOG")

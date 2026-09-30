@@ -155,9 +155,36 @@ describe('fresh-agent live mode selection', () => {
     'rejects empty, broadened, duplicate, aliased, or unknown selection %j before launch',
     (value) => expect(() => parseFreshAgentQualificationModes(value)).toThrow(FRESH_AGENT_QUALIFICATION_MODES_ENV),
   )
+
+  it.each(['false', 'missing'])('rejects qualification when a selectable mode loses readiness (%s)', (state) => {
+    const manifest = JSON.parse(fs.readFileSync(
+      path.resolve(__dirname, '../../../../docs/development/runtime-provider-capabilities.json'),
+      'utf8',
+    ))
+    const candidate = manifest.freshAgentModes.find((entry: { mode: string }) => entry.mode === 'freshcodex')
+    if (state === 'false') candidate.qualificationReady = false
+    else delete candidate.qualificationReady
+    expect(() => parseFreshAgentQualificationModes('freshclaude', manifest))
+      .toThrow(/freshcodex.*qualificationReady/i)
+  })
 })
 
 describe('fresh-agent release scope truth', () => {
+  it('admits the three requested fresh adapters for qualification while live release remains deferred', () => {
+    const manifest = JSON.parse(fs.readFileSync(
+      path.resolve(__dirname, '../../../../docs/development/runtime-provider-capabilities.json'),
+      'utf8',
+    ))
+    for (const mode of ['freshclaude', 'freshcodex', 'freshopencode']) {
+      const candidate = manifest.freshAgentModes.find((entry: { mode: string }) => entry.mode === mode)
+      expect(candidate?.qualificationReady).toBe(true)
+      expect(candidate?.certified).toBe(false)
+      expect(candidate?.enabledInReleaseScope).toBe(false)
+      expect(candidate?.releaseDeferralReason).toBe('pending_live_provider_certification')
+      const doorway = manifest.doorways.find((entry: { id: string }) => entry.id === `rest-${mode}-create`)
+      expect(doorway?.identityRule).toBe('PENDING_LIVE_PROVIDER_CERTIFICATION')
+    }
+  })
   it('records host-owned implementation without promoting any fresh mode', () => {
     const manifest = JSON.parse(fs.readFileSync(
       path.resolve(__dirname, '../../../../docs/development/runtime-provider-capabilities.json'),
@@ -184,6 +211,15 @@ describe('fresh-agent release scope truth', () => {
     ))
     manifest.freshAgentModes[0].enabledInReleaseScope = true
     expect(freshAgentReleaseScopeViolations(manifest, []).join(' ')).toMatch(/freshclaude.*live|receipt|certif/i)
+  })
+
+  it('rejects a disabled fresh adapter without an explicit live deferral', () => {
+    const manifest = JSON.parse(fs.readFileSync(
+      path.resolve(__dirname, '../../../../docs/development/runtime-provider-capabilities.json'),
+      'utf8',
+    ))
+    manifest.freshAgentModes[0].releaseDeferralReason = 'missing_mcp'
+    expect(freshAgentReleaseScopeViolations(manifest, []).join(' ')).toMatch(/freshclaude.*live.*deferral/i)
   })
 
   it('keeps the global fresh-agent flag equal to the per-mode release scope', () => {

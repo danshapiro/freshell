@@ -87,9 +87,9 @@ afterEach(() => {
   children.clear()
 })
 
-function sidecar() {
+function sidecar(extraEnv: Record<string, string> = {}) {
   const child = spawn(process.execPath, [fileURLToPath(new URL('../../../crates/freshell-claude-sidecar/index.mjs', import.meta.url))], {
-    env: { ...process.env, FRESHELL_CLAUDE_SDK_QUERY_MODULE: fileURLToPath(new URL('./fixtures/settings-query-module.mjs', import.meta.url)) },
+    env: { ...process.env, FRESHELL_CLAUDE_SDK_QUERY_MODULE: fileURLToPath(new URL('./fixtures/settings-query-module.mjs', import.meta.url)), ...extraEnv },
     stdio: ['pipe', 'pipe', 'pipe'],
   })
   children.add(child)
@@ -103,6 +103,18 @@ function sidecar() {
   }
   return { send, waitFor, frames }
 }
+
+describe('Claude sidecar OneCLI child environment', () => {
+  it('passes a managed OneCLI API key to the SDK child without inheriting ambient keys', async () => {
+    const unmanaged = sidecar({ ANTHROPIC_API_KEY: 'onecli-test-key' })
+    unmanaged.send({ type: 'create', requestId: 'unmanaged', cwd: '/tmp' })
+    expect((await unmanaged.waitFor('probe.auth-env')).apiKeyVisible).toBe(false)
+
+    const managed = sidecar({ ANTHROPIC_API_KEY: 'onecli-test-key', CLAUDE_CODE_OAUTH_TOKEN: 'onecli-test-oauth', FRESHELL_CLAUDE_ONECLI_API_KEY: '1' })
+    managed.send({ type: 'create', requestId: 'managed', cwd: '/tmp' })
+    expect(await managed.waitFor('probe.auth-env')).toMatchObject({ apiKeyVisible: true, oauthVisible: true })
+  })
+})
 
 describe('Claude sidecar configuration protocol', () => {
   it('preserves conversation identity and applies new effort to the next prompt', async () => {

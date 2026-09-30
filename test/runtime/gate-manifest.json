@@ -897,6 +897,13 @@
     "source_manifest": "docs/development/runtime-provider-capabilities.json",
     "provider_certification_case_ids": [
       "PC-SCOPE",
+      "PC-PARITY-CLAUDE",
+      "PC-PARITY-CODEX",
+      "PC-PARITY-OPENCODE",
+      "PC-PARITY-AMPLIFIER",
+      "FA-PARITY-FRESHCLAUDE",
+      "FA-PARITY-FRESHCODEX",
+      "FA-PARITY-FRESHOPENCODE",
       "PC-SHELL",
       "PC-CLAUDE",
       "PC-OPENCODE",

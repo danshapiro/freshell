@@ -9,7 +9,8 @@ pub use freshell_runtime_protocol::{
 };
 use freshell_runtime_protocol::{
     CommandState, FreshAgentCapture, FreshAgentRollbackDirection, FreshAgentRollbackMode,
-    FreshAgentTurnSettings, RequestId,
+    FreshAgentTurnSettings, ProviderLaunchContext, ProviderModelSelection, ProviderSecretReference,
+    ProviderSessionReference, RequestId,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -26,6 +27,26 @@ use tokio::sync::Mutex;
 pub const DEFAULT_EVENT_BYTES: usize = 4 * 1024 * 1024;
 pub const DEFAULT_EVENT_COUNT: usize = 4_096;
 
+mod double_optional {
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    pub fn serialize<T: Serialize, S: Serializer>(
+        value: &Option<Option<T>>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        match value {
+            Some(inner) => inner.serialize(serializer),
+            None => serializer.serialize_none(),
+        }
+    }
+
+    pub fn deserialize<'de, T: Deserialize<'de>, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Option<Option<T>>, D::Error> {
+        Ok(Some(Option::deserialize(deserializer)?))
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FreshAgentProfile {
@@ -38,6 +59,20 @@ pub struct FreshAgentProfile {
     pub sandbox: Option<String>,
     pub provider_store_id: String,
     pub native_session_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plugins: Option<Vec<String>>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "double_optional"
+    )]
+    pub model_selection: Option<Option<ProviderModelSelection>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_ref: Option<ProviderSessionReference>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_launch_context: Option<ProviderLaunchContext>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub provider_secret_references: Vec<ProviderSecretReference>,
 }
 
 impl FreshAgentProfile {
@@ -46,6 +81,28 @@ impl FreshAgentProfile {
             || self.cwd.is_empty()
             || self.provider_store_id.is_empty()
             || self.native_session_id.as_deref().is_some_and(str::is_empty)
+            || self.plugins.as_ref().is_some_and(|plugins| {
+                plugins.len() > 64
+                    || plugins.iter().any(|plugin| {
+                        plugin.is_empty()
+                            || plugin.len() > 1024
+                            || plugin.chars().any(char::is_control)
+                    })
+            })
+            || self.session_ref.as_ref().is_some_and(|reference| {
+                reference.session_id.is_empty()
+                    || self
+                        .native_session_id
+                        .as_ref()
+                        .is_some_and(|native| native != &reference.session_id)
+            })
+        {
+            return Err(ActorError::InvalidProfile);
+        }
+        if self
+            .provider_launch_context
+            .as_ref()
+            .is_some_and(|context| context.validate(self.provider.as_str()).is_err())
         {
             return Err(ActorError::InvalidProfile);
         }
@@ -634,6 +691,9 @@ impl FreshAgentHostActor {
                     return Err(ActorError::AmbiguousDispatch);
                 }
                 state.profile.native_session_id = Some(transition.child_session_id.clone());
+                if let Some(reference) = state.profile.session_ref.as_mut() {
+                    reference.session_id = transition.child_session_id.clone();
+                }
                 if let Some(command) = state.commands.get_mut(request_id.as_str()) {
                     command.provider_ack_id = Some(transition.child_session_id.clone());
                     command.state = CommandState::Completed;
@@ -774,6 +834,9 @@ impl FreshAgentHostActor {
         if let Some(native_session_id) = native_session_id {
             if state.profile.native_session_id.as_deref() != Some(&native_session_id) {
                 state.profile.native_session_id = Some(native_session_id.clone());
+                if let Some(reference) = state.profile.session_ref.as_mut() {
+                    reference.session_id = native_session_id.clone();
+                }
                 push_event_bounded(
                     &mut state,
                     AgentEvent::Started { native_session_id },

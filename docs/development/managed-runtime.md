@@ -18,8 +18,7 @@ until their real live campaigns pass. The checked-in capability manifest is
 the source of truth for managed terminal admission. All hosted fresh-agent
 modes are disabled in this release. Their separate
 `FRESHELL_MANAGED_FRESH_AGENT_V1=1` opt-in is for isolated qualification only:
-it does not yet share the normal ownership, identity, and naming admission
-path and must remain off in the release. Historical sections below describe
+their live candidate-bound certification receipts are still pending. Historical sections below describe
 adapter construction and earlier phase sequencing; they do not override the
 current release flags.
 
@@ -32,6 +31,7 @@ are tracked on separate axes in
 | Field | Meaning |
 |---|---|
 | `certificationState` | Whether a live, candidate-bound certification campaign has actually passed for this provider. One of `certified`, `pending_live_provider_certification`, `not_applicable`. |
+| `qualificationReady` | Whether the adapter can run in an explicitly selected qualification build. It does not enable a release route. |
 | `managedEnabled` | Whether managed routing may own this provider at all. |
 | `durableRecoveryEnabled` | Whether a durable-soul recovery promise is made for it. |
 
@@ -306,26 +306,25 @@ souls fail closed rather than being silently replaced.
 
 Managed terminal specs use an explicit non-secret environment allowlist. Server
 `AUTH_TOKEN`/`FRESHELL_TOKEN`, provider API/OAuth variables, cloud credentials,
-and proxy credentials are never serialized into the supervisor registry. A
-real Claude credential can instead be supplied by exact
-`FRESHELL_MANAGED_CLAUDE_CREDENTIAL_FILE` reference; Docker mounts only that
-file read-only and the host copies its bytes into the soul-owned provider volume.
-Codex and OpenCode use the analogous
-`FRESHELL_MANAGED_CODEX_AUTH_FILE` and
-`FRESHELL_MANAGED_OPENCODE_AUTH_FILE` references. Amplifier instead accepts one
-typed `FRESHELL_MANAGED_AMPLIFIER_ONECLI_KEYS_FILE` reference, restricted to
-the approved private `~/.amplifier/keys.env` used by `amplifier-onecli`. The
-runtime does not source or execute that file: the session host parses a bounded
-allowlist and maps only the approved provider-vLLM upstream/API-key pair plus
-canonical proxy and certificate transport into the Amplifier child. Host-local
-`ONECLI_URL` and `NO_PROXY` are deliberately not forwarded into the enclosure,
-so container loopback cannot impersonate the host gateway and the qualified
-upstream cannot bypass it. The pinned runtime image installs the exact
-provider-vLLM source and `glm-5.3` profile used by the approved OneCLI route;
-reasoning remains the provider's native default. Raw OAuth and the obsolete
-Anthropic/Haiku profile fail closed. Every source is canonicalized and admitted
-by the runtime broker as an exact read-only single-file mount. The registry and
-Docker create JSON contain only canonical references, never secret bytes.
+and proxy credentials are never serialized into the supervisor registry. For
+Claude, Codex, OpenCode, and Amplifier, configure provider-specific OneCLI
+grants before launch. `FRESHELL_MANAGED_<PROVIDER>_ONECLI_ENV_FILE` references
+a private environment grant; `FRESHELL_MANAGED_<PROVIDER>_ONECLI_AUTH_FILE`
+references a private provider auth-file grant. The controller records only
+typed, canonical file references. The broker mounts each grant read-only, and
+the session host resolves its bounded contents immediately before launching
+the provider child. Environment values reach only that child; auth-file grants
+are staged in the enclosure's temporary auth directory and linked into the
+provider home. Raw credential bytes are absent from durable registry state,
+launch receipts, Docker create JSON, and logs.
+
+Amplifier uses its ordinary configured bundle, provider, model, plugins, and
+operations. An optional OneCLI environment or auth-file grant supplies its
+credentials; no Amplifier provider/model profile is imposed by Freshell.
+The legacy Kilroy fresh mode still has its separate raw Claude credential
+bootstrap path. That exception does not apply to fresh Claude, Codex, or
+OpenCode. OneCLI secret transport does not change ordinary MCP, configuration,
+plugin, root, or operation behavior.
 
 The supported Phase 2 backend is rootless Docker. Its bind-mount ownership maps
 the host user's workspace to container uid/gid 0. Freshell therefore keeps the
@@ -338,11 +337,14 @@ inside the provider PTY and fails if that boundary changes. Git receives an
 ephemeral process-local `safe.directory` for the already-approved workspace; no
 global git config is modified.
 
-Managed providers strip web-owned MCP/rebind machinery. Managed Claude omits
-the legacy temporary `--mcp-config`; managed OpenCode omits the host rebind
-plugin, project-local Freshell MCP mutation, host-side SQLite locator, and
-web-side loopback SSE lane. OpenCode runs one pinned provider runtime per soul
-on private loopback, with provider-native identity learned inside the enclosure.
+Managed providers retain ordinary provider capabilities: configured MCP servers,
+provider config files (including `opencode.json` and `opencode.jsonc`), plugins,
+approved user-provider roots, and provider-native operations. Freshell renders
+its own MCP connection for each execution target, including the Codex TUI and
+durable session-host app-server. The provider still runs in a soul-owned home;
+OpenCode runs one pinned runtime per soul on private loopback, with native
+identity learned inside that runtime. The web controller does not own provider
+processes or reach into private provider state.
 The managed fresh-agent adapter routes create/send, interrupt, permission
 resolutions, compact, rollback, event history, read-only transcript capture, and
 supported provider-native fork operations through the session host. The Rust web
@@ -421,7 +423,7 @@ is not complete until it has zero calls into these legacy ownership paths.
   `docker/runtime/provider-versions.json`.
 - Transactional resource admission, named profiles, bounded host replay/spool,
   durable input request dedupe, provider-home/worktree mounts, and safe
-  credential-file bootstrap are Phase 2 contracts.
+  typed OneCLI grant resolution are Phase 2 contracts.
 - Browser continuity remains P2-G01. Under the revised execution order, P2-G04 is the real-OpenCode continuity receipt; Claude and Codex become subsequent provider lanes using the test-cost policy above.
 - Gate evidence is intentionally untracked under `.runtime-evidence/<candidate-sha>/<run-id>/`
   so each tested commit carries its own reproducible evidence rather than a

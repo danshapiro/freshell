@@ -112,6 +112,14 @@ pub(crate) async fn associate_managed_session(
     terminal_id: &str,
     session_id: &str,
 ) {
+    if state
+        .identity
+        .session_ref_for(terminal_id)
+        .is_some_and(|bound| bound.provider == "opencode" && bound.session_id != session_id)
+    {
+        crate::opencode_signal::apply_managed_opencode_signal(state, terminal_id, session_id).await;
+        return;
+    }
     associate_session_identity(state, terminal_id, session_id, true).await;
 }
 

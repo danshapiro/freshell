@@ -76,6 +76,9 @@ pub struct ProviderCapability {
     pub provider: &'static str,
     /// Certification is the outer bound on every other release promise below.
     pub certification_state: CertificationState,
+    /// The adapter can run in an explicitly selected qualification build.
+    /// This does not authorize a release claim.
+    pub qualification_ready: bool,
     pub managed_enabled: bool,
     /// True only when Phase 3 can prove exact durable conversation recovery.
     /// A managed shell remains useful but is intentionally not counted as an
@@ -103,6 +106,7 @@ pub const PROVIDER_CAPABILITIES: &[ProviderCapability] = &[
     ProviderCapability {
         provider: "shell",
         certification_state: CertificationState::Certified,
+        qualification_ready: true,
         managed_enabled: true,
         durable_recovery_enabled: false,
         recovery_paths: &[RecoveryPath::Reattach, RecoveryPath::PristineSeed],
@@ -120,6 +124,7 @@ pub const PROVIDER_CAPABILITIES: &[ProviderCapability] = &[
     ProviderCapability {
         provider: "claude",
         certification_state: CertificationState::PendingLiveProviderCertification,
+        qualification_ready: true,
         managed_enabled: false,
         durable_recovery_enabled: false,
         recovery_paths: &[
@@ -135,13 +140,14 @@ pub const PROVIDER_CAPABILITIES: &[ProviderCapability] = &[
         resume_command: Some("claude --resume <exact-session-id>"),
         zero_turn_policy: "preallocated-id-is-not-durable-before-transcript",
         checkpoint_policy: "provider-transcript-only",
-        bootstrap: ".claude/.credentials.json copied before privilege drop",
+        bootstrap: "typed Claude OneCLI environment/auth-file reference resolved for provider child; legacy Kilroy raw bootstrap is separate",
         live_gate: "haiku-lowest-reasoning",
         blocked_reason: Some("PENDING_LIVE_QUALIFICATION"),
     },
     ProviderCapability {
         provider: "opencode",
         certification_state: CertificationState::Certified,
+        qualification_ready: true,
         managed_enabled: true,
         durable_recovery_enabled: true,
         recovery_paths: &[
@@ -157,13 +163,14 @@ pub const PROVIDER_CAPABILITIES: &[ProviderCapability] = &[
         resume_command: Some("opencode --session <exact-ses-id>"),
         zero_turn_policy: "session-row-must-materialize",
         checkpoint_policy: "provider-sqlite-only-no-live-copy",
-        bootstrap: ".local/share/opencode/auth.json copied before privilege drop",
+        bootstrap: "typed OpenCode OneCLI environment/auth-file reference resolved for provider child",
         live_gate: "opencode-1.18.21-big-pickle-free-tier",
         blocked_reason: None,
     },
     ProviderCapability {
         provider: "codex",
         certification_state: CertificationState::PendingLiveProviderCertification,
+        qualification_ready: true,
         managed_enabled: false,
         durable_recovery_enabled: false,
         recovery_paths: &[
@@ -179,13 +186,14 @@ pub const PROVIDER_CAPABILITIES: &[ProviderCapability] = &[
         resume_command: Some("codex resume <exact-thread-id>"),
         zero_turn_policy: "no-durable-thread-until-provider-materializes",
         checkpoint_policy: "provider-rollout-only",
-        bootstrap: ".codex/auth.json copied before privilege drop",
+        bootstrap: "typed Codex OneCLI environment/auth-file reference resolved for provider child",
         live_gate: "gpt-5.6-luna-lowest-reasoning",
         blocked_reason: Some("PENDING_LIVE_QUALIFICATION"),
     },
     ProviderCapability {
         provider: "amplifier",
         certification_state: CertificationState::PendingLiveProviderCertification,
+        qualification_ready: true,
         managed_enabled: false,
         durable_recovery_enabled: false,
         recovery_paths: &[
@@ -201,13 +209,14 @@ pub const PROVIDER_CAPABILITIES: &[ProviderCapability] = &[
         resume_command: Some("amplifier session resume --full-history <exact-id>"),
         zero_turn_policy: "stub-is-not-durable-conversation-proof",
         checkpoint_policy: "provider-session-directory",
-        bootstrap: "approved private keys.env reference resolved into child-only env plus image-pinned OneCLI Haiku/low profile; raw OAuth forbidden",
+        bootstrap: "optional typed Amplifier OneCLI environment/auth-file reference resolved for provider child; ordinary configured bundle/provider/model/plugins/operations",
         live_gate: "provider-approved-lowest-cost-model",
         blocked_reason: Some("PENDING_LIVE_QUALIFICATION"),
     },
     ProviderCapability {
         provider: "gemini",
         certification_state: CertificationState::NotApplicable,
+        qualification_ready: false,
         managed_enabled: false,
         durable_recovery_enabled: false,
         recovery_paths: &[],
@@ -225,6 +234,7 @@ pub const PROVIDER_CAPABILITIES: &[ProviderCapability] = &[
     ProviderCapability {
         provider: "kimi",
         certification_state: CertificationState::NotApplicable,
+        qualification_ready: false,
         managed_enabled: false,
         durable_recovery_enabled: false,
         recovery_paths: &[],
@@ -1161,6 +1171,7 @@ mod tests {
             provider_permission_mode: None,
             provider_bootstrap_files: Vec::<ProviderBootstrapFile>::new(),
             provider_secret_references: Vec::new(),
+            provider_launch_context: None,
         }
     }
 
@@ -1548,6 +1559,11 @@ mod tests {
                 entry["certificationState"],
                 capability.certification_state.as_str(),
                 "manifest certification state drifted for {}",
+                capability.provider
+            );
+            assert_eq!(
+                entry["qualificationReady"], capability.qualification_ready,
+                "manifest qualification readiness drifted for {}",
                 capability.provider
             );
         }

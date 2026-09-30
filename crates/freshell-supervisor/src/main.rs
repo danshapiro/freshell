@@ -26,6 +26,7 @@ async fn run() -> Result<(), String> {
     let rest = &args[2..];
     let registry_root = PathBuf::from(required_arg(rest, "--registry-root")?);
     let control_socket = PathBuf::from(required_arg(rest, "--control-socket")?);
+    freshell_supervisor::backend::docker::configure_capability_dir(&control_socket)?;
     let control_secret_file = PathBuf::from(required_arg(rest, "--control-secret-file")?);
     let docker_socket = PathBuf::from(required_arg(rest, "--docker-socket")?);
     let runtime_root = PathBuf::from(required_arg(rest, "--runtime-root")?);
@@ -76,6 +77,7 @@ async fn run() -> Result<(), String> {
         default_backend(docker_socket),
         SupervisorConfig {
             runtime_root,
+            control_socket_path: control_socket.clone(),
             host_binary_path,
             image_ref,
             test_run_id,

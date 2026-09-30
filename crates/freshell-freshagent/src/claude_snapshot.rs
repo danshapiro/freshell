@@ -1230,6 +1230,19 @@ pub(crate) fn apply_pending_overlay(
 mod tests {
     use super::*;
 
+    #[test]
+    fn fresh_agent_operation_matrix_parity_claude_and_kilroy() {
+        for session_type in ["freshclaude", "kilroy"] {
+            let snapshot = build_claude_snapshot_json(session_type, "native", "", 0, None);
+            assert_eq!(snapshot["sessionType"], session_type);
+            assert_eq!(snapshot["capabilities"]["send"], true);
+            assert_eq!(snapshot["capabilities"]["interrupt"], true);
+            assert_eq!(snapshot["capabilities"]["fork"], false);
+            assert_eq!(snapshot["capabilities"]["undo"], true);
+            assert_eq!(snapshot["capabilities"]["redo"], true);
+        }
+    }
+
     fn temp_home() -> tempfile::TempDir {
         tempfile::tempdir().expect("tempdir")
     }

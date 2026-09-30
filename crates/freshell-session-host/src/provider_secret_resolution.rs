@@ -1,4 +1,4 @@
-use freshell_runtime_protocol::{ProviderSecretProfile, TerminalLaunchSpec};
+use freshell_runtime_protocol::{ProviderSecretProfile, ProviderSecretReference};
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;
@@ -8,9 +8,13 @@ const MAX_VALUE_BYTES: usize = 16 * 1024;
 const ALLOWED_NAMES: &[&str] = &[
     "ANTHROPIC_API_KEY",
     "ANTHROPIC_BASE_URL",
+    "CLAUDE_CODE_OAUTH_TOKEN",
     "CURL_CA_BUNDLE",
     "GLM_RUNPOD_API_KEY",
     "GLM_RUNPOD_BASE_URL",
+    "GEMINI_API_KEY",
+    "GOOGLE_API_KEY",
+    "GOOGLE_GENERATIVE_AI_API_KEY",
     "HTTPS_PROXY",
     "LUNAROUTE_API_KEY",
     "LUNAROUTE_BASE_URL",
@@ -20,6 +24,8 @@ const ALLOWED_NAMES: &[&str] = &[
     "ONECLI_URL",
     "OPENAI_API_KEY",
     "OPENAI_BASE_URL",
+    "OPENCODE_API_KEY",
+    "OPENROUTER_API_KEY",
     "REQUESTS_CA_BUNDLE",
     "SSL_CERT_FILE",
     "https_proxy",
@@ -32,27 +38,48 @@ const CERTIFICATE_CHILD_NAMES: &[&str] = &[
     "SSL_CERT_FILE",
 ];
 
-pub fn resolve_child_environment(
-    terminal: &TerminalLaunchSpec,
-) -> Result<BTreeMap<String, String>, String> {
-    if terminal.provider_secret_references.is_empty() {
-        return Ok(BTreeMap::new());
+#[derive(Default)]
+pub struct ResolvedProviderSecrets {
+    pub environment: BTreeMap<String, String>,
+    pub auth_files: Vec<(&'static str, Vec<u8>)>,
+}
+
+pub fn resolve_child_secrets(
+    provider: &str,
+    references: &[ProviderSecretReference],
+    mount_root: &Path,
+) -> Result<ResolvedProviderSecrets, String> {
+    let mut resolved = ResolvedProviderSecrets::default();
+    for (index, reference) in references.iter().enumerate() {
+        if reference.profile.provider() != provider {
+            return Err("OneCLI profile belongs to another provider".into());
+        }
+        let mount = mount_root.join(format!("provider-{index}"));
+        let metadata = fs::symlink_metadata(&mount)
+            .map_err(|error| format!("OneCLI grant is unavailable: {error}"))?;
+        if !metadata.is_file()
+            || metadata.file_type().is_symlink()
+            || metadata.len() > MAX_KEYS_BYTES
+        {
+            return Err("OneCLI grant must be a bounded regular file".into());
+        }
+        let raw = fs::read(&mount).map_err(|error| format!("read OneCLI grant: {error}"))?;
+        if let Some(relative) = reference.profile.auth_relative_path() {
+            if raw.is_empty() {
+                return Err("OneCLI auth-file grant is empty".into());
+            }
+            resolved.auth_files.push((relative, raw));
+        } else {
+            let text =
+                std::str::from_utf8(&raw).map_err(|_| "OneCLI environment grant is not UTF-8")?;
+            for (name, value) in resolve_profile(reference.profile, text)? {
+                if resolved.environment.insert(name, value).is_some() {
+                    return Err("OneCLI grants set the same child environment key".into());
+                }
+            }
+        }
     }
-    if terminal.mode != "amplifier" || terminal.provider_secret_references.len() != 1 {
-        return Err(
-            "provider secret references are supported only for one Amplifier OneCLI profile".into(),
-        );
-    }
-    let reference = &terminal.provider_secret_references[0];
-    let mount = Path::new("/run/freshell-secrets/provider-0");
-    let metadata = fs::symlink_metadata(mount)
-        .map_err(|error| format!("Amplifier OneCLI keys reference is unavailable: {error}"))?;
-    if !metadata.is_file() || metadata.file_type().is_symlink() || metadata.len() > MAX_KEYS_BYTES {
-        return Err("Amplifier OneCLI keys reference must be a bounded regular file".into());
-    }
-    let raw = fs::read_to_string(mount)
-        .map_err(|error| format!("read Amplifier OneCLI keys reference: {error}"))?;
-    resolve_profile(reference.profile, &raw)
+    Ok(resolved)
 }
 
 fn resolve_profile(
@@ -61,6 +88,22 @@ fn resolve_profile(
 ) -> Result<BTreeMap<String, String>, String> {
     let parsed = parse_keys_env(raw)?;
     match profile {
+        ProviderSecretProfile::ClaudeOnecliEnvironment => {
+            resolve_provider_environment(&parsed, &["ANTHROPIC_API_KEY", "ANTHROPIC_BASE_URL", "CLAUDE_CODE_OAUTH_TOKEN"])
+        }
+        ProviderSecretProfile::CodexOnecliEnvironment => {
+            resolve_provider_environment(&parsed, &["OPENAI_API_KEY", "OPENAI_BASE_URL"])
+        }
+        ProviderSecretProfile::OpencodeOnecliEnvironment => {
+            resolve_provider_environment(&parsed, &["ANTHROPIC_API_KEY", "ANTHROPIC_BASE_URL", "OPENAI_API_KEY", "OPENAI_BASE_URL", "GOOGLE_GENERATIVE_AI_API_KEY", "GOOGLE_API_KEY", "GEMINI_API_KEY", "OPENROUTER_API_KEY", "OPENCODE_API_KEY"])
+        }
+        ProviderSecretProfile::AmplifierOnecliEnvironment => {
+            resolve_provider_environment(&parsed, &["ANTHROPIC_API_KEY", "ANTHROPIC_BASE_URL", "OPENAI_API_KEY", "OPENAI_BASE_URL", "LUNAROUTE_API_KEY", "LUNAROUTE_BASE_URL", "GLM_RUNPOD_API_KEY", "GLM_RUNPOD_BASE_URL", "GOOGLE_API_KEY", "GEMINI_API_KEY", "OPENROUTER_API_KEY"])
+        }
+        ProviderSecretProfile::ClaudeOnecliAuthFile
+        | ProviderSecretProfile::CodexOnecliAuthFile
+        | ProviderSecretProfile::OpencodeOnecliAuthFile
+        | ProviderSecretProfile::AmplifierOnecliKeysFile => Err("OneCLI auth-file grant cannot be parsed as an environment profile".into()),
         ProviderSecretProfile::AmplifierOnecliLunarouteGlm53 => {
             // The approved proxy may replace a provider placeholder key, so
             // only non-emptiness is required here. The credentialed gateway
@@ -109,6 +152,42 @@ fn resolve_profile(
     }
 }
 
+fn resolve_provider_environment(
+    parsed: &BTreeMap<String, String>,
+    provider_names: &[&str],
+) -> Result<BTreeMap<String, String>, String> {
+    let mut child = BTreeMap::new();
+    for (name, value) in parsed {
+        if provider_names.contains(&name.as_str())
+            || CERTIFICATE_CHILD_NAMES.contains(&name.as_str())
+        {
+            child.insert(name.clone(), value.clone());
+        } else if matches!(name.as_str(), "HTTPS_PROXY" | "https_proxy") {
+            reject_proxy_placeholder(value)?;
+            validate_container_proxy(value)?;
+            child.insert(name.clone(), value.clone());
+        } else if !matches!(
+            name.as_str(),
+            "ONECLI_URL" | "ONECLI_GATEWAY" | "NO_PROXY" | "no_proxy"
+        ) {
+            return Err(format!("OneCLI environment profile does not allow {name}"));
+        }
+    }
+    if child.is_empty()
+        || !child
+            .keys()
+            .any(|name| provider_names.contains(&name.as_str()))
+    {
+        return Err("OneCLI environment profile has no provider values".into());
+    }
+    if let (Some(upper), Some(lower)) = (child.get("HTTPS_PROXY"), child.get("https_proxy")) {
+        if upper != lower {
+            return Err("OneCLI HTTPS proxy values conflict".into());
+        }
+    }
+    Ok(child)
+}
+
 fn validate_https_upstream(value: &str) -> Result<(), String> {
     let url = url::Url::parse(value)
         .map_err(|_| "LUNAROUTE_BASE_URL must be a valid credential-free HTTPS URL".to_string())?;
@@ -154,23 +233,23 @@ fn parse_keys_env(raw: &str) -> Result<BTreeMap<String, String>, String> {
         if let Some(rest) = line.strip_prefix("export ") {
             line = rest.trim_start();
         }
-        let (name, encoded) = line
-            .split_once('=')
-            .ok_or_else(|| format!("Amplifier keys.env line {line_number} must be NAME=VALUE"))?;
+        let (name, encoded) = line.split_once('=').ok_or_else(|| {
+            format!("OneCLI environment grant line {line_number} must be NAME=VALUE")
+        })?;
         if !ALLOWED_NAMES.contains(&name) {
             return Err(format!(
-                "Amplifier keys.env line {line_number} uses unsupported name {name:?}"
+                "OneCLI environment grant line {line_number} uses unsupported name {name:?}"
             ));
         }
         if values.contains_key(name) {
             return Err(format!(
-                "Amplifier keys.env line {line_number} duplicates {name}"
+                "OneCLI environment grant line {line_number} duplicates {name}"
             ));
         }
         let value = decode_value(encoded, &values, line_number)?;
         if value.is_empty() || value.len() > MAX_VALUE_BYTES {
             return Err(format!(
-                "Amplifier keys.env line {line_number} has an empty or oversized value"
+                "OneCLI environment grant line {line_number} has an empty or oversized value"
             ));
         }
         values.insert(name.to_string(), value);
@@ -189,13 +268,13 @@ fn decode_value(
         || encoded.contains('\0')
     {
         return Err(format!(
-            "Amplifier keys.env line {line_number} contains unsupported encoding or shell execution syntax"
+            "OneCLI environment grant line {line_number} contains unsupported encoding or shell execution syntax"
         ));
     }
     if encoded.starts_with('\'') {
         if encoded.len() < 2 || !encoded.ends_with('\'') {
             return Err(format!(
-                "Amplifier keys.env line {line_number} has malformed single quotes"
+                "OneCLI environment grant line {line_number} has malformed single quotes"
             ));
         }
         return Ok(encoded[1..encoded.len() - 1].to_string());
@@ -203,14 +282,14 @@ fn decode_value(
     let value = if encoded.starts_with('"') {
         if encoded.len() < 2 || !encoded.ends_with('"') {
             return Err(format!(
-                "Amplifier keys.env line {line_number} has malformed double quotes"
+                "OneCLI environment grant line {line_number} has malformed double quotes"
             ));
         }
         &encoded[1..encoded.len() - 1]
     } else {
         if encoded.chars().any(char::is_whitespace) {
             return Err(format!(
-                "Amplifier keys.env line {line_number} must quote whitespace"
+                "OneCLI environment grant line {line_number} must quote whitespace"
             ));
         }
         encoded
@@ -234,7 +313,7 @@ fn expand_references(
         }
         let (name, next) = if bytes.get(index + 1) == Some(&b'{') {
             let close = value[index + 2..].find('}').ok_or_else(|| {
-                format!("Amplifier keys.env line {line_number} has an unterminated reference")
+                format!("OneCLI environment grant line {line_number} has an unterminated reference")
             })? + index
                 + 2;
             (&value[index + 2..close], close + 1)
@@ -248,11 +327,11 @@ fn expand_references(
         };
         if name.is_empty() || !ALLOWED_NAMES.contains(&name) {
             return Err(format!(
-                "Amplifier keys.env line {line_number} has unsupported reference {name:?}"
+                "OneCLI environment grant line {line_number} has unsupported reference {name:?}"
             ));
         }
         let resolved = prior.get(name).ok_or_else(|| {
-            format!("Amplifier keys.env line {line_number} references {name} before it is defined")
+            format!("OneCLI environment grant line {line_number} references {name} before it is defined")
         })?;
         out.push_str(resolved);
         index = next;
@@ -281,6 +360,100 @@ fn required<'a>(values: &'a BTreeMap<String, String>, name: &str) -> Result<&'a 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use freshell_runtime_protocol::ProviderSecretReference;
+
+    #[test]
+    fn provider_secret_profiles_accept_only_their_provider_and_keep_controls_out_of_child() {
+        let cases = [
+            (
+                "claude",
+                ProviderSecretProfile::ClaudeOnecliEnvironment,
+                "ANTHROPIC_API_KEY=claude-fixture\n",
+            ),
+            (
+                "codex",
+                ProviderSecretProfile::CodexOnecliEnvironment,
+                "OPENAI_API_KEY=codex-fixture\n",
+            ),
+            (
+                "opencode",
+                ProviderSecretProfile::OpencodeOnecliEnvironment,
+                "OPENROUTER_API_KEY=opencode-fixture\n",
+            ),
+            (
+                "amplifier",
+                ProviderSecretProfile::AmplifierOnecliEnvironment,
+                "OPENAI_API_KEY=amplifier-fixture\n",
+            ),
+        ];
+        for (provider, profile, value) in cases {
+            let root = tempfile::tempdir().unwrap();
+            fs::write(
+                root.path().join("provider-0"),
+                format!("ONECLI_URL=http://127.0.0.1:10254\nNO_PROXY=localhost\n{value}"),
+            )
+            .unwrap();
+            let references = [ProviderSecretReference {
+                source_path: root
+                    .path()
+                    .join("provider-0")
+                    .to_string_lossy()
+                    .into_owned(),
+                profile,
+            }];
+            let resolved = resolve_child_secrets(provider, &references, root.path()).unwrap();
+            assert_eq!(resolved.environment.len(), 1);
+            assert!(resolved
+                .environment
+                .values()
+                .any(|value| value.ends_with("-fixture")));
+            assert!(!resolved.environment.contains_key("ONECLI_URL"));
+            assert!(!resolved.environment.contains_key("NO_PROXY"));
+            assert!(resolve_child_secrets("wrong-provider", &references, root.path()).is_err());
+        }
+    }
+
+    #[test]
+    fn provider_secret_file_grants_return_only_provider_relative_auth_files() {
+        let cases = [
+            (
+                "claude",
+                ProviderSecretProfile::ClaudeOnecliAuthFile,
+                ".claude/.credentials.json",
+            ),
+            (
+                "codex",
+                ProviderSecretProfile::CodexOnecliAuthFile,
+                ".codex/auth.json",
+            ),
+            (
+                "opencode",
+                ProviderSecretProfile::OpencodeOnecliAuthFile,
+                ".local/share/opencode/auth.json",
+            ),
+            (
+                "amplifier",
+                ProviderSecretProfile::AmplifierOnecliKeysFile,
+                ".amplifier/keys.env",
+            ),
+        ];
+        for (provider, profile, expected) in cases {
+            let root = tempfile::tempdir().unwrap();
+            let mount = root.path().join("provider-0");
+            fs::write(&mount, "fake-OneCLI-auth-file").unwrap();
+            let references = [ProviderSecretReference {
+                source_path: mount.to_string_lossy().into_owned(),
+                profile,
+            }];
+            let resolved = resolve_child_secrets(provider, &references, root.path()).unwrap();
+            assert!(resolved.environment.is_empty());
+            assert_eq!(
+                resolved.auth_files,
+                vec![(expected, b"fake-OneCLI-auth-file".to_vec())]
+            );
+            assert!(resolve_child_secrets("wrong-provider", &references, root.path()).is_err());
+        }
+    }
 
     #[test]
     fn resolves_actual_onecli_lunaroute_profile_to_vllm_child_environment() {

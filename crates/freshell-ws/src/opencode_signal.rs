@@ -2,7 +2,7 @@
 //!
 //! The freshell TUI plugin (extensions/opencode/freshell-rebind-plugin.ts,
 //! injected per-pane via OPENCODE_TUI_CONFIG pointing at the freshell-owned
-//! plugin-only tui.json) writes
+//! generated tui.json) writes
 //! `$HOME/.freshell/session-signals/opencode/<terminal_id>__<nonce>.json`
 //! on every in-TUI session switch. This module drains those files.
 //!
@@ -227,17 +227,14 @@ fn parse_signal_file(path: &Path) -> Option<ParsedSignal> {
 /// `hello_grace_stays_generous`.
 pub(crate) const OPENCODE_HELLO_GRACE_MS: i64 = 120_000;
 
-/// Injection skips the server CAN see at warn time, re-derived from its own
-/// process env with zero plumbing: the FRESHELL_OPENCODE_REBIND kill switch
-/// and a user-set OPENCODE_TUI_CONFIG. Per-pane env overrides and opencode's
-/// `--pure` are NOT visible here -- the WARN text names them and stays
-/// advisory for those.
+/// The process-wide kill switch suppresses missing-plugin warnings. Per-pane
+/// overrides and opencode's `--pure` are not visible here.
 fn opencode_injection_disabled_by_env() -> bool {
     let kill_switch = matches!(
         std::env::var("FRESHELL_OPENCODE_REBIND").ok().as_deref(),
         Some("0") | Some("false")
     );
-    kill_switch || std::env::var("OPENCODE_TUI_CONFIG").is_ok()
+    kill_switch
 }
 
 /// One heartbeat pass (invariants.rs `warn_unresolved_terminal_identities`
@@ -354,6 +351,26 @@ pub async fn drain_and_rebind_opencode(state: &WsState, watcher: &OpencodeSignal
     }
 }
 
+/// A managed soul reports plugin switch identities through its output batch.
+/// Apply those identities through the same rebind guards as direct signal
+/// files. The soul retains its signal file across a host replacement.
+pub(crate) async fn apply_managed_opencode_signal(
+    state: &WsState,
+    terminal_id: &str,
+    session_id: &str,
+) {
+    if !is_valid_opencode_session_id(session_id) {
+        return;
+    }
+    let signal = OpencodeSignal {
+        path: PathBuf::new(),
+        terminal_id: terminal_id.to_string(),
+        session_id: session_id.to_string(),
+        source: Some("managed-opencode-tui-plugin".into()),
+    };
+    let _ = apply_opencode_signal(state, &signal).await;
+}
+
 /// Guards (2)-(4): A13 live-owner, ledger A8 retired-inclusive, fresh-agent.
 /// `false` (warn-logged where meaningful) = the target session must NOT be
 /// bound to this terminal — a deliberate refusal, which still counts as
@@ -364,9 +381,14 @@ fn target_session_guards_pass(state: &WsState, sig: &OpencodeSignal) -> bool {
             .registry
             .live_session_owner(Some(&state.identity), "opencode", &sig.session_id)
     {
-        tracing::warn!(terminal_id = %sig.terminal_id, owner = %owner,
-            "opencode_rebind_refused: target session already live-owned (A13)");
-        return false;
+        // A managed soul durably records the new native id before the web
+        // process applies its relay. Its own pane is therefore an expected
+        // owner; a different live pane remains a conflicting writer.
+        if owner != sig.terminal_id {
+            tracing::warn!(terminal_id = %sig.terminal_id, owner = %owner,
+                "opencode_rebind_refused: target session already live-owned (A13)");
+            return false;
+        }
     }
     if let Some(existing) = state
         .identity

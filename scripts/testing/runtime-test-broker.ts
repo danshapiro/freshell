@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto'
 import fs from 'node:fs'
 import http, { type IncomingMessage, type ServerResponse } from 'node:http'
+import os from 'node:os'
 import path from 'node:path'
 
 const DOCKER_API_PREFIX = '/v1.47'
@@ -37,6 +38,7 @@ export type RestrictedDockerBrokerPolicy = {
   allowedImageRefs: Set<string>
   allowTerminalWorkloads?: boolean
   allowedWorkspaceRoots?: Set<string>
+  allowedProviderUserRoots?: Set<string>
   allowedBootstrapFiles?: Set<string>
   testRunId: string
   logPath: string
@@ -220,6 +222,17 @@ export class RestrictedDockerBroker {
       typeof value === 'string' && value.startsWith('FRESHELL_HOSTED_FRESH_AGENT=')
     ))
     if (host.NetworkMode !== 'none' && !terminalWorkload) return { ok: false, reason: 'runtime network must be none or isolated bridge' }
+    const extraHosts = Array.isArray(host.ExtraHosts) ? host.ExtraHosts : []
+    const localAddresses = new Set(Object.values(os.networkInterfaces()).flatMap((interfaces) => (
+      interfaces?.filter((network) => network.family === 'IPv4' && !network.internal).map((network) => network.address) ?? []
+    )))
+    if (extraHosts.some((entry: unknown) => {
+      if (entry === 'host.docker.internal:host-gateway') return false
+      if (typeof entry !== 'string' || !entry.startsWith('host.docker.internal:')) return true
+      return !localAddresses.has(entry.slice('host.docker.internal:'.length))
+    })) {
+      return { ok: false, reason: 'unapproved runtime host gateway' }
+    }
     if (terminalWorkload && !this.policy.allowTerminalWorkloads) return { ok: false, reason: 'terminal workload networking not enabled for this gate' }
     if ((host.PidMode ?? '') !== '') return { ok: false, reason: 'host pid namespace is forbidden' }
     if (host.ReadonlyRootfs !== true) return { ok: false, reason: 'runtime rootfs must be readonly' }
@@ -237,8 +250,14 @@ export class RestrictedDockerBroker {
 
     const tmpfs = host.Tmpfs ?? {}
     if (tmpfs['/tmp'] !== 'rw,noexec,nosuid,nodev,size=128m') return { ok: false, reason: 'runtime /tmp must remain bounded and noexec' }
+    if (tmpfs['/run/freshell-private'] !== undefined && tmpfs['/run/freshell-private'] !== 'rw,noexec,nosuid,nodev,size=16m,mode=0700') {
+      return { ok: false, reason: 'provider private tmpfs must be bounded and noexec' }
+    }
     const tmpfsKeys = Object.keys(tmpfs).sort()
-    const allowedTmpfsKeys = tmpfsKeys.includes('/run/opencode-tmp') ? ['/run/opencode-tmp', '/tmp'] : ['/tmp']
+    const allowedTmpfsKeys = ['/tmp']
+    if (tmpfsKeys.includes('/run/freshell-private')) allowedTmpfsKeys.push('/run/freshell-private')
+    if (tmpfsKeys.includes('/run/opencode-tmp')) allowedTmpfsKeys.push('/run/opencode-tmp')
+    allowedTmpfsKeys.sort()
     if (JSON.stringify(tmpfsKeys) !== JSON.stringify(allowedTmpfsKeys)) return { ok: false, reason: `unexpected runtime tmpfs topology: ${tmpfsKeys.join(',')}` }
     if (tmpfs['/run/opencode-tmp'] !== undefined && tmpfs['/run/opencode-tmp'] !== 'rw,exec,nosuid,nodev,size=64m,mode=1777') {
       return { ok: false, reason: 'OpenCode exec tmpfs must be bounded and nosuid/nodev' }
@@ -282,6 +301,16 @@ export class RestrictedDockerBroker {
       }
       if (terminalWorkload && /^\/run\/freshell-secrets\/provider-\d+$/.test(destination) && mode === 'ro' && this.policy.allowedBootstrapFiles?.has(source)) {
         continue
+      }
+      if (terminalWorkload && destination === '/run/freshell/mcp-capability.json' && mode === 'ro') {
+        const relative = path.relative(path.dirname(this.policy.runtimeRootPrefix), source)
+        if (/^scenarios\/[^/]+\/control\/mcp-capabilities\/grant-[a-zA-Z0-9-]+\.json$/.test(relative)) continue
+      }
+      if (terminalWorkload && destination === '/run/freshell-private/user-provider' && mode === 'ro') {
+        const relative = path.relative(path.dirname(this.policy.runtimeRootPrefix), source)
+        if (/^scenarios\/[^/]+\/control\/provider-roots\/grant-[a-zA-Z0-9-]+$/.test(relative)) continue
+        if (/(?:^|\/)(?:\.claude|\.codex|\.amplifier|\.config\/opencode)$/.test(source)
+          && (this.isAllowedWorkspacePath(source) || this.policy.allowedProviderUserRoots?.has(source))) continue
       }
       return { ok: false, reason: `unapproved bind ${bind}` }
     }

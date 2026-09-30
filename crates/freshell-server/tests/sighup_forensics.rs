@@ -101,6 +101,7 @@ async fn sighup_triggers_graceful_shutdown_and_logs_forensics() {
     let port = allocate_ephemeral_port();
     let mut child = Command::new(&binary)
         .env("PORT", port.to_string())
+        .env_remove("FRESHELL_MANAGED_RUNTIME_V1")
         .env("AUTH_TOKEN", AUTH_TOKEN)
         .env("FRESHELL_HOME", home.path())
         .env("HOME", home.path())

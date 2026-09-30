@@ -16,7 +16,7 @@ Amplifier is the only coding-CLI provider in freshell with **none** of the codeb
 
 **The core finding from research:** Amplifier already ships a durable signal freshell ignores. Every session writes a **schema-versioned** event log — `~/.amplifier/projects/<slug>/sessions/<id>/events.jsonl`, schema `amplifier.log` ver `1.0.0` — carrying `session:start`, `session:config`, `prompt:submit`, `prompt:complete`, `orchestrator:complete`, `session:resume`, `session:end`, with `session_id` on every record. This plan replaces the timing heuristics with that contract, reusing freshell's existing cross-provider plumbing wherever it exists (a hard requirement — the DRY survey confirmed the WS broadcast pipe, association coordinator/controller pattern, and watcher stack are all generic and reusable).
 
-MCP availability is **not** assumed anywhere in this plan; everything reads Amplifier's on-disk contract. `amplifierd` (localhost REST/SSE daemon) exists upstream but is optional, immature, and not required.
+Lifecycle recovery does not depend on MCP; everything here reads Amplifier's on-disk contract. An Amplifier bundle that mounts `tool-mcp` retains its ordinary MCP tools in managed sessions. `amplifierd` (localhost REST/SSE daemon) is optional and not required for recovery.
 
 ---
 
@@ -52,7 +52,7 @@ Phase 0 (live experiments against `amplifier 2026.07.06-7ec5dcd`, core 1.6.0, dr
 
 **Non-Goals**
 
-- No dependency on `amplifierd`, MCP, or any network endpoint.
+- No dependency on `amplifierd`, MCP, or any network endpoint for lifecycle recovery; ordinary bundle MCP remains available.
 - No parsing of `content_block:*` / `tool:pre/post` noise for streaming/rendering (out of scope).
 - No changes to codex/opencode/claude association behavior (only mechanical ledger extraction in Phase 4).
 - No attempt to pre-assign session IDs (E9: impossible today; upstream ask filed).

@@ -26,6 +26,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
     net::{UnixListener, UnixStream},
     sync::Mutex,
     time::{sleep, Duration, Instant},
@@ -34,6 +35,7 @@ use tokio::{
 #[derive(Clone)]
 pub struct SupervisorConfig {
     pub runtime_root: PathBuf,
+    pub control_socket_path: PathBuf,
     pub host_binary_path: PathBuf,
     pub image_ref: String,
     pub test_run_id: String,
@@ -48,6 +50,16 @@ pub(crate) struct LaunchWorkload {
     pub(crate) terminal: Option<TerminalLaunchSpec>,
     pub(crate) fresh_agent: Option<FreshAgentLaunchSpec>,
     pub(crate) resume_spec: Option<ResumeSpec>,
+}
+
+struct McpCapabilityRequest<'a> {
+    action: &'a str,
+    soul_id: &'a SoulId,
+    incarnation_id: Option<&'a IncarnationId>,
+    grant_id: Option<&'a str>,
+    provider: Option<&'a str>,
+    tui_source: Option<&'a freshell_runtime_protocol::ProviderConfigReference>,
+    workspace: Option<&'a str>,
 }
 
 #[derive(Clone)]
@@ -528,6 +540,30 @@ impl Supervisor {
         limits: RuntimeLimits,
     ) -> Result<LaunchResult, RuntimeError> {
         let mut state = prepared.state;
+        if let Some(capability) = workload
+            .terminal
+            .as_ref()
+            .and_then(|terminal| terminal.provider_launch_context.as_ref())
+            .or_else(|| {
+                workload
+                    .fresh_agent
+                    .as_ref()
+                    .and_then(|agent| agent.provider_launch_context.as_ref())
+            })
+            .and_then(|context| context.mcp_capability.as_ref())
+        {
+            self.notify_mcp_capability(
+                "activate",
+                &capability.endpoint,
+                &prepared.soul_id,
+                &prepared.incarnation_id,
+                &capability.grant_id,
+            )
+            .await
+            .map_err(|error| {
+                self.activation_failure(&prepared, state, "capability_pending", error)
+            })?;
+        }
         if state == LaunchState::Prepared {
             let runtime_dir = self.ensure_incarnation_dir(&prepared).map_err(|error| {
                 self.activation_failure(&prepared, state, "ensure_runtime_directory", error)
@@ -1429,14 +1465,49 @@ impl Supervisor {
         {
             HostResult::TerminalOutput(output) => {
                 if let Some(native_session_id) = output.native_session_id.as_ref() {
-                    self.registry
+                    match self
+                        .registry
                         .record_native_session(
                             soul_id.clone(),
                             handle.incarnation_id().clone(),
                             native_session_id.clone(),
                         )
                         .await
-                        .map_err(map_registry)?;
+                    {
+                        Ok(()) => {}
+                        Err(RegistryError::NativeIdentityConflict) => {
+                            let view = self
+                                .registry
+                                .inventory()
+                                .await
+                                .map_err(map_registry)?
+                                .into_iter()
+                                .find(|view| view.soul_id == soul_id)
+                                .ok_or_else(|| {
+                                    RuntimeError::new(
+                                        RuntimeErrorCode::InvalidRequest,
+                                        "terminal soul disappeared",
+                                    )
+                                })?;
+                            let prior = view
+                                .native_session_id
+                                .as_deref()
+                                .filter(|_| view.terminal_mode.as_deref() == Some("opencode"))
+                                .ok_or_else(|| {
+                                    map_registry(RegistryError::NativeIdentityConflict)
+                                })?;
+                            self.registry
+                                .transition_native_session(
+                                    soul_id.clone(),
+                                    handle.incarnation_id().clone(),
+                                    prior,
+                                    native_session_id,
+                                )
+                                .await
+                                .map_err(map_registry)?;
+                        }
+                        Err(error) => return Err(map_registry(error)),
+                    }
                     // Materialize durable resume evidence while the soul-local
                     // store is still reachable. Repeated probes are idempotent.
                     let _ = self.probe_recovery(soul_id.clone()).await;
@@ -1476,6 +1547,124 @@ impl Supervisor {
                 "unexpected runtime metrics reply",
             )),
         }
+    }
+
+    async fn notify_mcp_capability(
+        &self,
+        action: &str,
+        endpoint: &str,
+        soul_id: &SoulId,
+        incarnation_id: &IncarnationId,
+        grant_id: &str,
+    ) -> Result<(), RuntimeError> {
+        if endpoint
+            .strip_prefix("http://host.docker.internal:")
+            .and_then(|value| value.parse::<u16>().ok())
+            .filter(|port| *port != 0)
+            .is_none()
+        {
+            return Err(RuntimeError::new(
+                RuntimeErrorCode::InvalidRequest,
+                "invalid managed MCP endpoint",
+            ));
+        }
+        if !matches!(action, "activate" | "revoke") {
+            return Err(RuntimeError::new(
+                RuntimeErrorCode::InvalidRequest,
+                "invalid managed MCP action",
+            ));
+        }
+        let response = self
+            .mcp_capability_callback(McpCapabilityRequest {
+                action,
+                soul_id,
+                incarnation_id: Some(incarnation_id),
+                grant_id: Some(grant_id),
+                provider: None,
+                tui_source: None,
+                workspace: None,
+            })
+            .await?;
+        if response != b"ok" {
+            return Err(RuntimeError::new(
+                RuntimeErrorCode::HostUnreachable,
+                "capability_pending: server rejected scoped grant",
+            ));
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn issue_replacement_mcp_capability(
+        &self,
+        soul_id: &SoulId,
+        provider: &str,
+        tui_source: Option<&freshell_runtime_protocol::ProviderConfigReference>,
+        workspace: &str,
+    ) -> Result<freshell_runtime_protocol::McpCapabilityReference, RuntimeError> {
+        let response = self
+            .mcp_capability_callback(McpCapabilityRequest {
+                action: "issue",
+                soul_id,
+                incarnation_id: None,
+                grant_id: None,
+                provider: Some(provider),
+                tui_source,
+                workspace: Some(workspace),
+            })
+            .await?;
+        serde_json::from_slice(&response).map_err(|_| {
+            RuntimeError::new(
+                RuntimeErrorCode::HostUnreachable,
+                "capability_pending: server returned an invalid scoped grant reference",
+            )
+        })
+    }
+
+    async fn mcp_capability_callback(
+        &self,
+        request: McpCapabilityRequest<'_>,
+    ) -> Result<Vec<u8>, RuntimeError> {
+        if self.config.control_secret.contains(['\r', '\n']) {
+            return Err(RuntimeError::new(
+                RuntimeErrorCode::InvalidRequest,
+                "invalid managed runtime control secret",
+            ));
+        }
+        let body = serde_json::to_vec(&serde_json::json!({
+            "action": request.action,
+            "controlSecret": self.config.control_secret,
+            "soulId": request.soul_id,
+            "incarnationId": request.incarnation_id,
+            "grantId": request.grant_id,
+            "provider": request.provider,
+            "tuiSource": request.tui_source,
+            "workspace": request.workspace,
+        }))
+        .map_err(|error| RuntimeError::new(RuntimeErrorCode::InvalidRequest, error.to_string()))?;
+        let callback_socket = self.config.control_socket_path.with_file_name("mcp.sock");
+        let exchange = async {
+            let mut socket = UnixStream::connect(&callback_socket).await?;
+            socket.write_all(&body).await?;
+            socket.shutdown().await?;
+            let mut response = Vec::new();
+            socket.read_to_end(&mut response).await?;
+            Ok::<_, std::io::Error>(response)
+        };
+        let response = tokio::time::timeout(Duration::from_secs(5), exchange)
+            .await
+            .map_err(|_| {
+                RuntimeError::new(
+                    RuntimeErrorCode::HostUnreachable,
+                    "capability_pending: server callback timed out",
+                )
+            })?
+            .map_err(|error| {
+                RuntimeError::new(
+                    RuntimeErrorCode::HostUnreachable,
+                    format!("capability_pending: server callback unavailable: {error}"),
+                )
+            })?;
+        Ok(response)
     }
 
     async fn stop(
@@ -1549,6 +1738,31 @@ impl Supervisor {
             .mark_stop_outcome(handle.incarnation_id().clone(), outcome)
             .await
             .map_err(map_registry)?;
+        if outcome == StopOutcome::VerifiedEmpty {
+            if let Some(capability) = handle
+                .terminal()
+                .and_then(|terminal| terminal.provider_launch_context.as_ref())
+                .or_else(|| {
+                    handle
+                        .fresh_agent()
+                        .and_then(|agent| agent.provider_launch_context.as_ref())
+                })
+                .and_then(|context| context.mcp_capability.as_ref())
+            {
+                if let Err(error) = self
+                    .notify_mcp_capability(
+                        "revoke",
+                        &capability.endpoint,
+                        &soul_id,
+                        handle.incarnation_id(),
+                        &capability.grant_id,
+                    )
+                    .await
+                {
+                    tracing::warn!(soul_id = %soul_id, error = ?error, "supervisor.mcp_capability_revoke_failed");
+                }
+            }
+        }
         append_event(
             &self.config.lifecycle_log,
             "supervisor.stop_outcome",

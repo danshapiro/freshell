@@ -285,6 +285,7 @@ async fn shutdown_reaps_terminal_and_codex_sidecar_within_5s() {
 
     let mut child = Command::new(&server_binary)
         .env("PORT", port.to_string())
+        .env_remove("FRESHELL_MANAGED_RUNTIME_V1")
         .env("AUTH_TOKEN", AUTH_TOKEN)
         .env("FRESHELL_HOME", home.path())
         .env("HOME", home.path())
@@ -564,6 +565,7 @@ async fn sigkill_restart_reaps_tracked_freshagent_sidecar_via_store() {
     // Generation 1: boot, create a freshcodex fresh-agent session.
     let mut server1 = Command::new(&server_binary)
         .env("PORT", port1.to_string())
+        .env_remove("FRESHELL_MANAGED_RUNTIME_V1")
         .env("AUTH_TOKEN", AUTH_TOKEN)
         .env("FRESHELL_HOME", home.path())
         .env("HOME", home.path())
@@ -708,6 +710,7 @@ async fn sigkill_restart_reaps_tracked_freshagent_sidecar_via_store() {
     let port2 = allocate_ephemeral_port();
     let mut server2 = Command::new(&server_binary)
         .env("PORT", port2.to_string())
+        .env_remove("FRESHELL_MANAGED_RUNTIME_V1")
         .env("AUTH_TOKEN", AUTH_TOKEN)
         .env("FRESHELL_HOME", home.path())
         .env("HOME", home.path())

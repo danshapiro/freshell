@@ -1844,6 +1844,9 @@ async fn handle_client_text(
         // The create gate is the SHARED `settings.freshAgent.enabled` flag.
         ClientMessage::FreshAgentCreate(create) => {
             if state.fresh_codex.is_enabled() {
+                let Some(create) = freshell_protocol::direct_provider_create(create) else {
+                    return true;
+                };
                 // D8 (restore-open-sessions-only): thread this connection's
                 // provenance (hello identity + the create's `tabId`) down the
                 // provider `handle_create` chain so the identity-sink binding
@@ -1879,7 +1882,7 @@ async fn handle_client_text(
                                 .instrument(tracing::Span::current()),
                         );
                     }
-                    _ => {}
+                    _ => unreachable!("direct_provider_create only accepts direct providers"),
                 }
             } else {
                 // A create against the DISABLED gate must REFUSE, not
@@ -2729,32 +2732,36 @@ fn codex_create_uses_managed_launch(mode: &str, flag_value: Option<&str>) -> boo
 /// Freshell opencode TUI rebind plugin — the IO-layer half of the injection
 /// (`cli_launch.rs` consumes the result via
 /// `CliLaunchInputs::opencode_rebind_tui_config`, the `mcp_injection`
-/// precedent): install the plugin + plugin-only tui.json under the real
-/// process env's home and return the tui.json path. Home resolution mirrors
+/// precedent): install the plugin and merge any user-selected TUI config
+/// under the real process env's home. Home resolution mirrors
 /// `ClaudeSignalWatcher::default_root` (`claude_signal.rs:52-66`):
 /// `%USERPROFILE%` on Windows, `$HOME` otherwise; empty/unset ⇒ `None` ⇒
-/// skip injection. Install failure warn-logs and returns `None` — it must
-/// never block the launch.
-fn opencode_rebind_precompute() -> Option<String> {
+/// skip injection. Malformed selected config refuses the launch.
+fn opencode_rebind_precompute(
+    selected: Option<&str>,
+    cwd: Option<&str>,
+) -> Result<Option<String>, String> {
     #[cfg(windows)]
-    let base = std::env::var("USERPROFILE").ok()?;
+    let base = std::env::var("USERPROFILE").ok();
     #[cfg(not(windows))]
-    let base = std::env::var("HOME").ok()?;
-    if base.is_empty() {
-        return None;
-    }
-    match freshell_platform::opencode_plugin::ensure_rebind_plugin_installed(std::path::Path::new(
-        &base,
-    )) {
-        Ok(tui_config) => Some(tui_config.display().to_string()),
-        Err(error) => {
-            tracing::warn!(
-                %error,
-                "opencode_rebind_plugin_install_failed: launching without rebind signal"
-            );
-            None
+    let base = std::env::var("HOME").ok();
+    let Some(base) = base.filter(|base| !base.is_empty()) else {
+        return Ok(None);
+    };
+    let selected = selected.map(|raw| {
+        let path = std::path::PathBuf::from(raw);
+        if path.is_absolute() {
+            path
+        } else {
+            std::path::Path::new(cwd.unwrap_or(".")).join(path)
         }
-    }
+    });
+    freshell_platform::opencode_plugin::ensure_rebind_plugin_with_user_config(
+        std::path::Path::new(&base),
+        selected.as_deref(),
+    )
+    .map(|path| Some(path.display().to_string()))
+    .map_err(|error| error.to_string())
 }
 
 /// Provider settings `codingCli.providers[mode]` (`ws:2317-2319`) as
@@ -3515,6 +3522,39 @@ mod managed_runtime_id_tests {
         ManagedTerminalFuture, ManagedTerminalLaunch,
     };
     use std::sync::Arc;
+
+    #[test]
+    fn managed_codex_provider_context_keeps_tui_and_sidecar_mcp_recipes() {
+        let setup = super::build_codex_managed_launch_setup(
+            "terminal-mcp-context".into(),
+            freshell_platform::ShellType::System,
+            freshell_platform::HostOs::Linux,
+            false,
+            Some("/tmp"),
+            Some("tab-mcp"),
+            Some("pane-mcp"),
+        )
+        .unwrap();
+        assert!(!setup.tui_mcp_injection.args.is_empty());
+        assert!(!setup.sidecar_context.config_args.is_empty());
+        assert!(setup
+            .tui_mcp_injection
+            .args
+            .iter()
+            .any(|arg| arg.contains("mcp_servers.freshell")));
+        assert!(setup
+            .sidecar_context
+            .config_args
+            .iter()
+            .any(|arg| arg.contains("mcp_servers.freshell")));
+        assert_eq!(
+            setup
+                .terminal_env
+                .get("FRESHELL_TERMINAL_ID")
+                .map(String::as_str),
+            Some("terminal-mcp-context")
+        );
+    }
 
     struct LookupOnlyController {
         descriptor: ManagedTerminalDescriptor,
@@ -6057,6 +6097,11 @@ pub(crate) async fn handle_create(
     } else {
         cli_provider_settings(state, &mode)
     };
+    // Codex model, sandbox, and approval belong to the app-server plan on
+    // both routes. The managed launch still carries them separately to the
+    // soul's sidecar; the TUI gets the ordinary CLI settings tuple.
+    let (cli_permission_mode, cli_model, cli_effort, cli_sandbox) =
+        cli_provider_settings(state, &mode);
 
     // opencode: allocate the loopback control endpoint BEFORE building the launch
     // (`ws:2471-2473`; `local-port.ts:13-41`), via the freshell-opencode
@@ -6193,7 +6238,19 @@ pub(crate) async fn handle_create(
     // CliLaunchInputs (mcp_injection precedent). Failure must never block the
     // launch.
     let opencode_rebind_tui_config = if mode == "opencode" && !use_managed_runtime {
-        opencode_rebind_precompute()
+        let selected = state
+            .cli_commands
+            .iter()
+            .find(|spec| spec.name == "opencode")
+            .and_then(|spec| spec.base_env.get("OPENCODE_TUI_CONFIG").cloned())
+            .or_else(|| std::env::var("OPENCODE_TUI_CONFIG").ok());
+        match opencode_rebind_precompute(selected.as_deref(), resolved_cwd.as_deref()) {
+            Ok(config) => config,
+            Err(error) => {
+                return send_create_error(out, ErrorCode::PtySpawnFailed, error, &create.request_id)
+                    .await
+            }
+        }
     } else {
         None
     };
@@ -6205,10 +6262,10 @@ pub(crate) async fn handle_create(
         target,
         resume_session_id: resume_session_id.as_deref(),
         launch_intent,
-        permission_mode: permission_mode.as_deref(),
-        model: model.as_deref(),
-        effort: effort.as_deref(),
-        sandbox: sandbox.as_deref(),
+        permission_mode: cli_permission_mode.as_deref(),
+        model: cli_model.as_deref(),
+        effort: cli_effort.as_deref(),
+        sandbox: cli_sandbox.as_deref(),
         codex_remote_ws_url: codex_remote_ws_url.as_deref(),
         opencode_server: opencode_endpoint
             .as_ref()
@@ -7389,7 +7446,14 @@ pub async fn respawn_agent_terminal(
     // `handle_create` (the respawn seam derives launch params identically;
     // failure must never block the launch).
     let opencode_rebind_tui_config = if mode == "opencode" {
-        opencode_rebind_precompute()
+        let selected = state
+            .cli_commands
+            .iter()
+            .find(|spec| spec.name == "opencode")
+            .and_then(|spec| spec.base_env.get("OPENCODE_TUI_CONFIG").cloned())
+            .or_else(|| std::env::var("OPENCODE_TUI_CONFIG").ok());
+        opencode_rebind_precompute(selected.as_deref(), resolved_cwd.as_deref())
+            .map_err(RespawnError::LaunchUnresolvable)?
     } else {
         None
     };

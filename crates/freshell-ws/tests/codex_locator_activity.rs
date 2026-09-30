@@ -241,9 +241,20 @@ async fn fresh_pane_locator_identity_reaches_activity_and_turn_complete() {
             .expect("open rollout for append");
         writeln!(f, "{}", codex_event_line("task_started", now_ms())).expect("append task_started");
     }
-    // Let the busy edge land before completing the turn (mirrors the
-    // seed-then-append shape of activity.rs's rollout-lane unit tests).
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    // Wait for the busy edge before completing the turn. A fixed sleep can
+    // let a loaded watcher drain both appended events in one batch.
+    let busy = wait_for_frame(&mut ws, |v| {
+        v["type"] == "codex.activity.updated"
+            && v["upsert"].as_array().is_some_and(|rows| {
+                rows.iter().any(|row| {
+                    row["terminalId"] == terminal_id.as_str()
+                        && row["sessionId"] == THREAD
+                        && row["phase"] == "busy"
+                })
+            })
+    })
+    .await;
+    assert!(busy, "expected Codex busy activity before task_complete");
     {
         use std::io::Write;
         let mut f = std::fs::OpenOptions::new()

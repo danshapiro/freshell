@@ -162,7 +162,7 @@ impl DockerEngineBackend {
         }
     }
 
-    async fn daemon_id(&self) -> Result<DockerDaemonId, BackendError> {
+    async fn daemon_info(&self) -> Result<(DockerDaemonId, bool), BackendError> {
         let response = self
             .request("GET", &format!("{DOCKER_API}/info"), None)
             .await?;
@@ -175,7 +175,21 @@ impl DockerEngineBackend {
             .get("ID")
             .and_then(Value::as_str)
             .ok_or_else(|| BackendError::Malformed("docker /info returned no ID".into()))?;
-        DockerDaemonId::parse(id.to_owned()).map_err(|e| BackendError::Malformed(e.to_string()))
+        let id = DockerDaemonId::parse(id.to_owned())
+            .map_err(|e| BackendError::Malformed(e.to_string()))?;
+        let rootless = value
+            .get("SecurityOptions")
+            .and_then(Value::as_array)
+            .is_some_and(|options| {
+                options
+                    .iter()
+                    .any(|option| option.as_str() == Some("name=rootless"))
+            });
+        Ok((id, rootless))
+    }
+
+    async fn daemon_id(&self) -> Result<DockerDaemonId, BackendError> {
+        self.daemon_info().await.map(|(id, _)| id)
     }
 
     async fn inspect_value(&self, container_id: &str) -> Result<Option<Value>, BackendError> {
@@ -274,11 +288,16 @@ fn docker_create_body(
     spec: &CreateRuntimeSpec,
     binds: Vec<String>,
     host_env: Vec<String>,
-    cap_add: Vec<&str>,
+    extra_hosts: Vec<String>,
     runtime_tmpfs_config: BTreeMap<String, String>,
     requested_limits: String,
     memory_swap: u64,
 ) -> Value {
+    let cap_add: Vec<&str> = if spec.terminal.is_some() || spec.fresh_agent.is_some() {
+        vec!["CHOWN", "SETGID", "SETUID"]
+    } else {
+        Vec::new()
+    };
     json!({
         "Image": spec.image_ref,
         "Env": host_env,
@@ -301,6 +320,7 @@ fn docker_create_body(
         "HostConfig": {
             "AutoRemove": false,
             "NetworkMode": if spec.terminal.is_some() || spec.fresh_agent.is_some() { "bridge" } else { "none" },
+            "ExtraHosts": extra_hosts,
             "PidMode": "",
             "ReadonlyRootfs": true,
             "Privileged": false,
@@ -316,6 +336,39 @@ fn docker_create_body(
             "Tmpfs": runtime_tmpfs_config
         }
     })
+}
+
+fn workload_mcp_capability<'a>(
+    terminal: Option<&'a TerminalLaunchSpec>,
+    fresh_agent: Option<&'a FreshAgentLaunchSpec>,
+) -> Option<&'a freshell_runtime_protocol::McpCapabilityReference> {
+    terminal
+        .and_then(|terminal| terminal.provider_launch_context.as_ref())
+        .and_then(|context| context.mcp_capability.as_ref())
+        .or_else(|| {
+            fresh_agent
+                .and_then(|agent| agent.provider_launch_context.as_ref())
+                .and_then(|context| context.mcp_capability.as_ref())
+        })
+}
+
+fn host_gateway_alias(rootless: bool, host_address: Option<&str>) -> Result<String, BackendError> {
+    if !rootless {
+        return Ok("host.docker.internal:host-gateway".into());
+    }
+    // Rootless Docker's host-gateway points into its network namespace, where
+    // the web listener does not live. The web controller records its own
+    // routable address in the current capability reference.
+    let address = host_address
+        .ok_or_else(|| BackendError::Unavailable("managed MCP host address is unavailable".into()))?
+        .parse::<std::net::Ipv4Addr>()
+        .map_err(|_| BackendError::InvalidConfig("managed MCP host address is invalid".into()))?;
+    if address.is_loopback() || address.is_unspecified() {
+        return Err(BackendError::Unavailable(
+            "rootless Docker has no routable host address".into(),
+        ));
+    }
+    Ok(format!("host.docker.internal:{address}"))
 }
 
 fn runtime_host_environment(
@@ -464,7 +517,7 @@ impl RuntimeBackend for DockerEngineBackend {
         .map_err(BackendError::InvalidConfig)?;
         let expected = ExpectedConfig::new(spec, &binary, &runtime_dir);
         let immutable_config_digest = digest_expected(&expected)?;
-        let daemon_id = self.daemon_id().await?;
+        let (daemon_id, rootless) = self.daemon_info().await?;
         let memory_swap = spec
             .limits
             .memory_bytes
@@ -506,13 +559,20 @@ impl RuntimeBackend for DockerEngineBackend {
                     source.display()
                 ));
             }
+            if let Some(source) = &mounts.provider_user_root {
+                binds.push(format!(
+                    "{}:/run/freshell-private/user-provider:ro",
+                    source.display()
+                ));
+            }
+            if let Some(source) = &mounts.mcp_capability_file {
+                binds.push(format!(
+                    "{}:/run/freshell/mcp-capability.json:ro",
+                    source.display()
+                ));
+            }
         }
         let host_env = runtime_host_environment(spec.terminal.as_ref(), spec.fresh_agent.as_ref())?;
-        let cap_add: Vec<&str> = if spec.terminal.is_some() || spec.fresh_agent.is_some() {
-            vec!["CHOWN", "SETGID", "SETUID"]
-        } else {
-            Vec::new()
-        };
         let runtime_mode = spec
             .terminal
             .as_ref()
@@ -523,11 +583,21 @@ impl RuntimeBackend for DockerEngineBackend {
                     .map(|agent| agent.provider.as_str())
             });
         let runtime_tmpfs_config = runtime_tmpfs(runtime_mode);
+        let extra_hosts = if let Some(reference) =
+            workload_mcp_capability(spec.terminal.as_ref(), spec.fresh_agent.as_ref())
+        {
+            vec![host_gateway_alias(
+                rootless,
+                reference.host_gateway_address.as_deref(),
+            )?]
+        } else {
+            Vec::new()
+        };
         let body = docker_create_body(
             spec,
             binds,
             host_env,
-            cap_add,
+            extra_hosts,
             runtime_tmpfs_config,
             requested_limits,
             memory_swap,
@@ -777,6 +847,12 @@ fn runtime_tmpfs(mode: Option<&str>) -> std::collections::BTreeMap<String, Strin
             "rw,exec,nosuid,nodev,size=64m,mode=1777".to_string(),
         );
     }
+    if matches!(mode, Some("claude" | "codex" | "opencode" | "amplifier")) {
+        mounts.insert(
+            "/run/freshell-private".to_string(),
+            "rw,noexec,nosuid,nodev,size=16m,mode=0700".to_string(),
+        );
+    }
     mounts
 }
 
@@ -809,6 +885,8 @@ struct ImmutableFreshAgentConfig {
     run_as_gid: u32,
     fixture_transport: Option<FreshAgentFixtureTransport>,
     provider_bootstrap_files: Vec<ProviderBootstrapFile>,
+    provider_secret_references: Vec<freshell_runtime_protocol::ProviderSecretReference>,
+    provider_launch_context: Option<freshell_runtime_protocol::ProviderLaunchContext>,
 }
 
 impl From<&FreshAgentLaunchSpec> for ImmutableFreshAgentConfig {
@@ -824,6 +902,8 @@ impl From<&FreshAgentLaunchSpec> for ImmutableFreshAgentConfig {
             run_as_gid: spec.run_as_gid,
             fixture_transport: spec.fixture_transport,
             provider_bootstrap_files: spec.provider_bootstrap_files.clone(),
+            provider_secret_references: spec.provider_secret_references.clone(),
+            provider_launch_context: spec.provider_launch_context.clone(),
         }
     }
 }
@@ -1120,20 +1200,47 @@ fn verify_workload_mounts(
                 ));
             }
         }
-        for (index, source) in expected.provider_secret_files.iter().enumerate() {
-            let source_text = source.to_string_lossy();
-            let destination = format!("/run/freshell-secrets/provider-{index}");
-            let found = mounts.iter().any(|mount| {
-                mount.get("Source").and_then(Value::as_str) == Some(source_text.as_ref())
-                    && mount.get("Destination").and_then(Value::as_str)
-                        == Some(destination.as_str())
-                    && mount.get("RW").and_then(Value::as_bool) == Some(false)
-            });
-            if !found {
-                return Err(BackendError::OwnershipMismatch(
-                    "provider secret-reference mount changed".into(),
-                ));
-            }
+    }
+    for (index, source) in expected.provider_secret_files.iter().enumerate() {
+        let source_text = source.to_string_lossy();
+        let destination = format!("/run/freshell-secrets/provider-{index}");
+        let found = mounts.iter().any(|mount| {
+            mount.get("Source").and_then(Value::as_str) == Some(source_text.as_ref())
+                && mount.get("Destination").and_then(Value::as_str) == Some(destination.as_str())
+                && mount.get("RW").and_then(Value::as_bool) == Some(false)
+        });
+        if !found {
+            return Err(BackendError::OwnershipMismatch(
+                "provider secret-reference mount changed".into(),
+            ));
+        }
+    }
+    if let Some(source) = expected.provider_user_root.as_ref() {
+        let source_text = source.to_string_lossy();
+        let found = mounts.iter().any(|mount| {
+            mount.get("Source").and_then(Value::as_str) == Some(source_text.as_ref())
+                && mount.get("Destination").and_then(Value::as_str)
+                    == Some("/run/freshell-private/user-provider")
+                && mount.get("RW").and_then(Value::as_bool) == Some(false)
+        });
+        if !found {
+            return Err(BackendError::OwnershipMismatch(
+                "provider user config mount changed".into(),
+            ));
+        }
+    }
+    if let Some(source) = expected.mcp_capability_file.as_ref() {
+        let source_text = source.to_string_lossy();
+        let found = mounts.iter().any(|mount| {
+            mount.get("Source").and_then(Value::as_str) == Some(source_text.as_ref())
+                && mount.get("Destination").and_then(Value::as_str)
+                    == Some("/run/freshell/mcp-capability.json")
+                && mount.get("RW").and_then(Value::as_bool) == Some(false)
+        });
+        if !found {
+            return Err(BackendError::OwnershipMismatch(
+                "managed MCP capability mount changed".into(),
+            ));
         }
     }
     for (index, source) in expected.provider_bootstrap_files.iter().enumerate() {
@@ -1308,8 +1415,13 @@ mod tests {
             permission_mode: None,
             sandbox: None,
             native_session_id: None,
+            plugins: None,
+            model_selection: None,
+            session_ref: None,
             fixture_transport: None,
             provider_bootstrap_files: Vec::new(),
+            provider_secret_references: Vec::new(),
+            provider_launch_context: None,
         };
         let installation_id = InstallationId::parse("installation-one").unwrap();
         let soul_id = SoulId::parse("soul-one").unwrap();
@@ -1407,11 +1519,29 @@ mod tests {
             opencode.get("/run/opencode-tmp").map(String::as_str),
             Some("rw,exec,nosuid,nodev,size=64m,mode=1777")
         );
-        assert_eq!(opencode.len(), 2);
+        assert_eq!(opencode.len(), 3);
+        assert_eq!(
+            opencode.get("/run/freshell-private").map(String::as_str),
+            Some("rw,noexec,nosuid,nodev,size=16m,mode=0700")
+        );
 
         let shell = runtime_tmpfs(Some("shell"));
         assert_eq!(shell.len(), 1);
         assert!(!shell.contains_key("/run/opencode-tmp"));
+    }
+
+    #[test]
+    fn rootless_docker_uses_controller_host_address_for_mcp() {
+        assert_eq!(
+            host_gateway_alias(false, None).unwrap(),
+            "host.docker.internal:host-gateway"
+        );
+        assert_eq!(
+            host_gateway_alias(true, Some("192.168.3.150")).unwrap(),
+            "host.docker.internal:192.168.3.150"
+        );
+        assert!(host_gateway_alias(true, None).is_err());
+        assert!(host_gateway_alias(true, Some("127.0.0.1")).is_err());
     }
 
     #[test]
@@ -1451,6 +1581,7 @@ mod tests {
             provider_permission_mode: None,
             provider_bootstrap_files: Vec::new(),
             provider_secret_references: Vec::new(),
+            provider_launch_context: None,
         };
         let env = runtime_host_environment(Some(&terminal), None).unwrap();
         assert!(env
@@ -1464,7 +1595,7 @@ mod tests {
     }
 
     #[test]
-    fn amplifier_onecli_secret_mount_is_reference_only_in_docker_json() {
+    fn provider_secret_mount_is_reference_only_in_docker_json() {
         use freshell_runtime_protocol::{ProviderSecretProfile, ProviderSecretReference};
 
         let root = tempfile::tempdir().unwrap();
@@ -1472,6 +1603,11 @@ mod tests {
         let keys = root.path().join("keys.env");
         let secret = "amplifier-onecli-secret-sentinel";
         std::fs::write(&keys, format!("LUNAROUTE_API_KEY={secret}\n")).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&keys, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
         let keys = std::fs::canonicalize(keys).unwrap();
         let workspace = std::fs::canonicalize(workspace.path()).unwrap();
         let terminal = TerminalLaunchSpec {
@@ -1500,6 +1636,7 @@ mod tests {
                 source_path: keys.to_string_lossy().into_owned(),
                 profile: ProviderSecretProfile::AmplifierOnecliLunarouteGlm53,
             }],
+            provider_launch_context: None,
         };
         let mounts = docker::terminal_mounts(&terminal).unwrap();
         let binds: Vec<String> = mounts
@@ -1535,7 +1672,7 @@ mod tests {
             &spec,
             binds,
             Vec::new(),
-            vec!["CHOWN", "SETGID", "SETUID"],
+            Vec::new(),
             BTreeMap::new(),
             serde_json::to_string(&spec.limits).unwrap(),
             spec.limits.memory_bytes,
@@ -1607,8 +1744,13 @@ mod tests {
             permission_mode: None,
             sandbox: None,
             native_session_id: None,
+            plugins: None,
+            model_selection: None,
+            session_ref: None,
             fixture_transport: None,
             provider_bootstrap_files: Vec::new(),
+            provider_secret_references: Vec::new(),
+            provider_launch_context: None,
         };
         let digest = |agent: FreshAgentLaunchSpec| {
             digest_expected(&ExpectedConfig {

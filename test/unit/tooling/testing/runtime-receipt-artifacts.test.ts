@@ -26,6 +26,7 @@ describe('runtime receipt artifact naming', () => {
       'FRESHELL_RUNTIME_PHASE5_LOSS_RECEIPT',
       'FRESHELL_RUNTIME_PHASE5_PROVIDER_RECEIPT',
       'FRESHELL_RUNTIME_PHASE5_SOAK_RECEIPT',
+      'FRESHELL_RUNTIME_PROVIDER_PARITY_LOCAL_RECEIPT',
     ])
   })
 
@@ -40,6 +41,8 @@ describe('runtime receipt artifact naming', () => {
       .toBe('p5-g10-phase5-soak')
     expect(receiptArtifactName('FRESHELL_RUNTIME_PHASE5_PROVIDER_RECEIPT', 'P5-G01'))
       .toBe('p5-g01-provider-matrix')
+    expect(receiptArtifactName('FRESHELL_RUNTIME_PROVIDER_PARITY_LOCAL_RECEIPT', 'PC-PARITY-CLAUDE'))
+      .toBe('pc-parity-claude-provider-parity-local')
   })
 
   it('keeps the producer defaults byte-identical to the shared table', () => {
@@ -49,6 +52,8 @@ describe('runtime receipt artifact naming', () => {
     expect(defaultReceiptFileName('FRESHELL_RUNTIME_PHASE4_BROWSER_RECEIPT')).toBe('p4-g08-runtime-tabs-rehydrate.json')
     expect(defaultReceiptFileName('FRESHELL_RUNTIME_PHASE5_LOSS_RECEIPT')).toBe('p5-g02-real-opencode-loss.json')
     expect(defaultReceiptFileName('FRESHELL_RUNTIME_PHASE5_CHAOS_RECEIPT')).toBe('p5-g09-browser-chaos.json')
+    expect(defaultReceiptFileName('FRESHELL_RUNTIME_PROVIDER_PARITY_LOCAL_RECEIPT'))
+      .toBe('pc-parity-claude-provider-parity-local.json')
   })
 
   it('rejects a receipt it has no canonical name for', () => {

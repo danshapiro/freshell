@@ -13,7 +13,8 @@
 //   known_files re-snapshot, which completes before the Enter reaches this
 //   process.
 // - resume (`resume` ANYWHERE in argv — resumeArgs are appended LAST after
-//   `-c` overrides): prints `codex: resumed session <id>`, writes nothing.
+//   `-c` overrides): resumes the exact thread through the managed proxy when
+//   present, prints `codex: resumed session <id>`, writes nothing.
 // - argv mirrored to FAKE_CODEX_TERMINAL_ARGV_LOG as JSONL.
 import fs from 'node:fs'
 import path from 'node:path'
@@ -84,50 +85,59 @@ function writeRollout(threadId, firstPrompt) {
   fs.writeFileSync(file, `${lines.join('\n')}\n`)
 }
 
+// Best-effort managed-topology handshake; resolves the app-server's thread
+// id (or null when absent/unreachable). Never delays rollout materialization
+// by more than a bounded budget: the pane contract is Enter-anchored.
+async function managedThread(sessionId) {
+  const remoteIdx = argv.indexOf('--remote')
+  if (remoteIdx === -1 || !argv[remoteIdx + 1]) return null
+  try {
+    const { WebSocket } = await import('ws')
+    const ws = new WebSocket(argv[remoteIdx + 1])
+    const rpc = (method, params) => new Promise((resolve, reject) => {
+      const id = `${method}-${Date.now()}`
+      const to = setTimeout(() => reject(new Error('rpc timeout')), 3000)
+      const onMsg = (data) => {
+        try {
+          const m = JSON.parse(data.toString())
+          if (m.id === id) {
+            clearTimeout(to)
+            ws.off('message', onMsg)
+            m.error ? reject(new Error(m.error.message || 'rpc error')) : resolve(m.result)
+          }
+        } catch { /* ignore stray frames */ }
+      }
+      ws.on('message', onMsg)
+      ws.send(JSON.stringify({ jsonrpc: '2.0', id, method, params }))
+    })
+    await new Promise((resolve, reject) => {
+      ws.on('open', resolve)
+      ws.on('error', reject)
+      setTimeout(() => reject(new Error('connect timeout')), 3000)
+    })
+    await rpc('initialize', { clientInfo: { name: 'fake-codex-terminal', version: '1.0.0' } })
+    ws.send(JSON.stringify({ jsonrpc: '2.0', method: 'initialized' }))
+    const result = sessionId
+      ? await rpc('thread/resume', { threadId: sessionId, cwd: process.cwd() })
+      : await rpc('thread/start', { cwd: process.cwd() })
+    ws.close()
+    return result?.thread?.id ?? null
+  } catch {
+    return null
+  }
+}
+
 const resumeIndex = argv.indexOf('resume')
 if (resumeIndex !== -1) {
   const sessionId = argv[resumeIndex + 1] ?? ''
+  managedThread(sessionId).then(resumedId => {
+    if (resumedId && resumedId !== sessionId) {
+      process.stderr.write(`codex: resumed wrong session ${resumedId}\r\n`)
+      process.exitCode = 1
+    }
+  })
   process.stdout.write(`codex: resumed session ${sessionId}\r\n`)
 } else {
-  // Best-effort managed-topology handshake; resolves the app-server's thread
-  // id (or null when absent/unreachable). Never delays rollout materialization
-  // by more than a bounded budget: the pane contract is Enter-anchored.
-  async function startManagedThread() {
-    const remoteIdx = argv.indexOf('--remote')
-    if (remoteIdx === -1 || !argv[remoteIdx + 1]) return null
-    try {
-      const { WebSocket } = await import('ws')
-      const ws = new WebSocket(argv[remoteIdx + 1])
-      const rpc = (method, params) => new Promise((resolve, reject) => {
-        const id = `${method}-${Date.now()}`
-        const to = setTimeout(() => reject(new Error('rpc timeout')), 3000)
-        const onMsg = (data) => {
-          try {
-            const m = JSON.parse(data.toString())
-            if (m.id === id) {
-              clearTimeout(to)
-              ws.off('message', onMsg)
-              m.error ? reject(new Error(m.error.message || 'rpc error')) : resolve(m.result)
-            }
-          } catch { /* ignore stray frames */ }
-        }
-        ws.on('message', onMsg)
-        ws.send(JSON.stringify({ jsonrpc: '2.0', id, method, params }))
-      })
-      await new Promise((resolve, reject) => {
-        ws.on('open', resolve)
-        ws.on('error', reject)
-        setTimeout(() => reject(new Error('connect timeout')), 3000)
-      })
-      await rpc('initialize', { clientInfo: { name: 'fake-codex-terminal', version: '1.0.0' } })
-      ws.send(JSON.stringify({ jsonrpc: '2.0', method: 'initialized' }))
-      const result = await rpc('thread/start', { cwd: process.cwd() })
-      ws.close()
-      return result?.thread?.id ?? null
-    } catch {
-      return null
-    }
-  }
 
   process.stdout.write('codex> \r\n')
   let wrote = false
@@ -149,7 +159,7 @@ if (resumeIndex !== -1) {
       process.stdout.write(`codex: session ${threadId} started\r\n`)
     }
     const gate = process.env.FAKE_CODEX_TERMINAL_ROLLOUT_GATE_PATH
-    startManagedThread().then((managedThreadId) => {
+    managedThread().then((managedThreadId) => {
       const finishWith = () => finish(managedThreadId)
       if (gate) {
         const poll = setInterval(() => {

@@ -47,6 +47,8 @@ struct FixtureState {
     dispatch_count: u64,
     completion_count: u64,
     pending_decision_id: Option<String>,
+    #[serde(default)]
+    create_profile: Option<FreshAgentProfile>,
 }
 
 pub(crate) struct DeterministicFreshAgentTransport {
@@ -78,6 +80,7 @@ impl DeterministicFreshAgentTransport {
                     dispatch_count: 0,
                     completion_count: 0,
                     pending_decision_id: None,
+                    create_profile: None,
                 }
             };
         if profile
@@ -125,7 +128,12 @@ impl DeterministicFreshAgentTransport {
             command
                 .arg("fresh-agent-fixture-worker")
                 .arg("--provider")
-                .arg(self.provider.as_str());
+                .arg(self.provider.as_str())
+                .arg("--observation-file")
+                .arg(self.state_dir.join("provider-child-observation.json"));
+            if let Some(secrets) = freshell_platform::managed_child_secrets::snapshot() {
+                command.envs(secrets);
+            }
             command
         };
         command.kill_on_drop(true);
@@ -189,8 +197,13 @@ impl DeterministicFreshAgentTransport {
 
 #[async_trait]
 impl FreshAgentTransport for DeterministicFreshAgentTransport {
-    async fn start(&self, _profile: &FreshAgentProfile) -> Result<TransportStart, String> {
+    async fn start(&self, profile: &FreshAgentProfile) -> Result<TransportStart, String> {
         self.spawn_provider_process().await?;
+        {
+            let mut state = self.state.lock().await;
+            state.create_profile = Some(profile.clone());
+            write_provider_state(&self.state_dir, &state, self.run_as_uid, self.run_as_gid).await?;
+        }
         Ok(TransportStart {
             native_session_id: Some(self.state.lock().await.native_session_id.clone()),
         })
@@ -292,13 +305,32 @@ impl FreshAgentTransport for DeterministicFreshAgentTransport {
 }
 
 pub(crate) async fn run_worker(args: &[String]) -> Result<(), String> {
-    if args.len() != 2 || args[0] != "--provider" {
+    if args.len() != 4 || args[0] != "--provider" || args[2] != "--observation-file" {
         return Err("fresh-agent fixture worker requires --provider <exact-provider>".into());
     }
     match args[1].as_str() {
         "claude" | "kilroy" | "codex" | "opencode" => {}
         _ => return Err("fresh-agent fixture worker provider is not allowlisted".into()),
     }
+    let child_key = match args[1].as_str() {
+        "claude" => "ANTHROPIC_API_KEY",
+        "codex" => "OPENAI_API_KEY",
+        "opencode" => "OPENROUTER_API_KEY",
+        _ => "ANTHROPIC_API_KEY",
+    };
+    let child_digest = std::env::var(child_key)
+        .ok()
+        .map(|value| format!("{:x}", Sha256::digest(value.as_bytes())));
+    fs::write(
+        &args[3],
+        serde_json::to_vec(&json!({
+            "argv": ["fresh-agent-fixture-worker", "--provider", args[1]],
+            "env": {(child_key): child_digest},
+            "onecliControlPresent": std::env::var_os("ONECLI_URL").is_some(),
+        }))
+        .map_err(|error| format!("record redacted fixture worker observation: {error}"))?,
+    )
+    .map_err(|error| format!("write redacted fixture worker observation: {error}"))?;
     loop {
         tokio::time::sleep(Duration::from_secs(3600)).await;
     }
@@ -535,6 +567,11 @@ mod tests {
             sandbox: Some("workspace-write".into()),
             provider_store_id: "soul-a".into(),
             native_session_id: None,
+            plugins: None,
+            model_selection: None,
+            session_ref: None,
+            provider_launch_context: None,
+            provider_secret_references: Vec::new(),
         };
         assert_eq!(fixture_native_id(&profile), fixture_native_id(&profile));
         let mut other = profile.clone();
@@ -564,6 +601,11 @@ mod tests {
             sandbox: Some("workspace-write".into()),
             provider_store_id: "soul-native-proof".into(),
             native_session_id: None,
+            plugins: None,
+            model_selection: None,
+            session_ref: None,
+            provider_launch_context: None,
+            provider_secret_references: Vec::new(),
         };
         let transport = DeterministicFreshAgentTransport::open(
             root.path().join("provider"),
@@ -620,6 +662,7 @@ mod tests {
             dispatch_count: 3,
             completion_count: 2,
             pending_decision_id: None,
+            create_profile: None,
         };
         write_state(root.path(), &state).unwrap();
         let mut spec = fixture_resume_spec("fixture-native-codex-exact");

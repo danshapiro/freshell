@@ -1,4 +1,3 @@
-import { execFileSync } from 'node:child_process'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
@@ -27,6 +26,7 @@ import {
   type ProviderQualificationRow,
 } from '../../../../scripts/testing/provider-qualification-receipt.js'
 import { parseGateArgs } from '../../../../scripts/testing/runtime-gate-args.js'
+import { PROVIDER_PARITY_CASE_IDS } from '../../../../scripts/testing/provider-parity-receipt.js'
 
 const repoRoot = path.resolve(__dirname, '../../../..')
 
@@ -53,6 +53,16 @@ describe('checked-in provider certification manifest', () => {
     expect(certifiedDurableProviders(manifest)).toEqual(['opencode'])
   })
 
+  it('keeps adapter readiness independent of live release certification', () => {
+    const manifest = loadCapabilityManifest(repoRoot)
+    for (const provider of ['claude', 'codex', 'amplifier']) {
+      const row = manifest.providers.find((candidate) => candidate.provider === provider)
+      expect(row?.qualificationReady).toBe(true)
+      expect(row?.certificationState).toBe(PENDING_LIVE_PROVIDER_CERTIFICATION)
+      expect(row?.managedEnabled).toBe(false)
+    }
+  })
+
   it('publishes a typed deferred-provider manifest with the live gate for each', () => {
     const rows = deferredProviderManifest(loadCapabilityManifest(repoRoot))
     expect(rows).toHaveLength(3)
@@ -67,22 +77,6 @@ describe('checked-in provider certification manifest', () => {
 
   it('has no durable-souls claim for an uncertified provider', () => {
     expect(capabilityClaimViolations(loadCapabilityManifest(repoRoot))).toEqual([])
-  })
-
-  it('pins managed Amplifier to the actual OneCLI/LunaRoute profile without changing legacy launch', () => {
-    const settings = fs.readFileSync(
-      path.join(repoRoot, 'docker/runtime/amplifier-onecli-lunaroute-glm53.yaml'),
-      'utf8',
-    )
-    expect(settings).toContain('id: lunaroute')
-    expect(settings).toContain('module: provider-vllm')
-    expect(settings).toContain('default_model: glm-5.3')
-    expect(settings).not.toMatch(/anthropic|haiku|fable|gpt-5\.6-sol|max/i)
-    execFileSync('sh', ['-n', path.join(repoRoot, 'docker/runtime/amplifier-onecli')])
-    const manifest = JSON.parse(
-      fs.readFileSync(path.join(repoRoot, 'extensions/amplifier/freshell.json'), 'utf8'),
-    )
-    expect(manifest.cli.command).toBe('amplifier')
   })
 
   it('reports a violation when a deferred provider is silently promoted', () => {
@@ -106,7 +100,8 @@ describe('checked-in provider certification manifest', () => {
 
   it('puts the release-scope audit first in the full certification case set', () => {
     expect(certificationCaseIds(loadCapabilityManifest(repoRoot))).toEqual([
-      RELEASE_SCOPE_CASE_ID, 'PC-SHELL', 'PC-CLAUDE', 'PC-OPENCODE', 'PC-CODEX', 'PC-AMPLIFIER',
+      RELEASE_SCOPE_CASE_ID, ...PROVIDER_PARITY_CASE_IDS,
+      'PC-SHELL', 'PC-CLAUDE', 'PC-OPENCODE', 'PC-CODEX', 'PC-AMPLIFIER',
     ])
   })
 
@@ -205,6 +200,23 @@ describe('gate outcome resolution', () => {
     })
     expect(outcome.status).toBe('FAIL')
     expect(outcome.exitCode).toBe(1)
+  })
+
+  it('never treats a deferred live credential as a local parity result', () => {
+    const result = resolveGateOutcome({
+      mode: 'landing',
+      caseResults: [
+        { caseId: 'PC-CLAUDE', status: DEFERRED_CASE_STATUS, provider: 'claude' },
+        { caseId: 'PC-PARITY-CLAUDE', status: DEFERRED_CASE_STATUS, provider: 'claude' },
+      ],
+      expectedCaseIds: ['PC-CLAUDE', 'PC-PARITY-CLAUDE'],
+      cleanupOk: true,
+      unsafeBrokerAttempts: 0,
+      deferred: ['claude'],
+      deferrableProviders: ['claude'],
+    })
+    expect(result.status).toBe('FAIL')
+    expect(result.failures.join(' ')).toContain('PC-PARITY-CLAUDE')
   })
 
   it('fails a landing run with any genuine failure or unsafe broker attempt', () => {

@@ -13,6 +13,8 @@ import { resolve, dirname } from 'path'
 import { fileURLToPath } from 'url'
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js'
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
+import { Client } from '@modelcontextprotocol/sdk/client/index.js'
+import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js'
 import { TOOL_DESCRIPTION, INSTRUCTIONS, INPUT_SCHEMA, executeAction } from './freshell-tool.js'
 
 /**
@@ -51,5 +53,45 @@ server.tool(
   },
 )
 
-const transport = new StdioServerTransport()
-await server.connect(transport)
+async function selfTest(): Promise<void> {
+  const client = new Client({ name: 'freshell-mcp-image-probe', version: findPackageVersion() })
+  const transport = new StdioClientTransport({
+    command: process.execPath,
+    args: [...process.execArgv, fileURLToPath(import.meta.url)],
+    env: process.env as Record<string, string>,
+    stderr: 'pipe',
+  })
+
+  try {
+    await client.connect(transport)
+    const tools = await client.listTools()
+    if (!tools.tools.some(tool => tool.name === 'freshell')) {
+      throw new Error('Freshell tool was not registered')
+    }
+
+    const response = await client.callTool({ name: 'freshell', arguments: { action: 'health' } })
+    const content = (response.content as Array<{ type: string; text?: string }> | undefined)?.[0]
+    if (response.isError || content?.type !== 'text' || typeof content.text !== 'string') {
+      throw new Error('Freshell health tool returned an error')
+    }
+    const result = JSON.parse(content.text) as { probe?: string }
+    if (result.probe !== 'freshell-mcp-image') {
+      throw new Error('Freshell health tool did not reach the probe endpoint')
+    }
+    process.stdout.write(JSON.stringify({ tool: 'freshell', action: 'health', ok: true }) + '\n')
+  } finally {
+    await client.close()
+  }
+}
+
+if (process.argv[2] === '--self-test') {
+  try {
+    await selfTest()
+  } catch (error) {
+    console.error(error instanceof Error ? error.message : String(error))
+    process.exitCode = 1
+  }
+} else {
+  const transport = new StdioServerTransport()
+  await server.connect(transport)
+}

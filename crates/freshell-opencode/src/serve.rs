@@ -53,163 +53,24 @@ pub const OPENCODE_CONFIG_CONTENT_ENV: &str = "OPENCODE_CONFIG_CONTENT";
 /// the behavioral arbiter).
 pub const OPENCODE_SNAPSHOTS_DISABLED_CONFIG: &str = "{\"snapshot\": false}";
 
-/// Delta-r1 F3: the effective snapshots-disabled `OPENCODE_CONFIG_CONTENT` value.
-/// A user could legitimately populate this env var with inline config (the repo
-/// documents server plugins flowing through it), so the managed launch MERGES the
-/// snapshots pin INTO an inherited JSON document instead of replacing it:
-/// - `None`/absent → exactly [`OPENCODE_SNAPSHOTS_DISABLED_CONFIG`];
-/// - a JSONC OBJECT → the same document with top-level `"snapshot": false` forced
-///   (a user-supplied `snapshot` key is overwritten — conversation rollback must
-///   never re-apply file state; that pin is the entire point of the decision).
-///   Focused ep1-r4 F1: the inherited document is normalized through
-///   [`jsonc_to_strict_json`] FIRST because OpenCode parses this lane with its
-///   JSONC parser (1.18.21 `ConfigParse.jsonc` → `jsonc-parser` with
-///   `allowTrailingComma`) — the merge accepts EXACTLY the same dialect the
-///   vendored CLI would, never replacing valid comment/trailing-comma config;
-/// - MALFORMED (unparseable even after JSONC normalization, or a JSON value that
-///   isn't an object — a document with no
-///   top-level key space can't take the pin) → replaced by the bare pin document,
-///   with a structured warning naming ONLY the replaced value's byte length.
-///   Focused ep1-r2 F5: inline config can carry credential-shaped fields (API
-///   keys, authorization headers), so the warning NEVER logs any content
-///   substring.
-pub fn merged_opencode_config_content(inherited: Option<&str>) -> String {
-    match inherited.filter(|raw| !raw.is_empty()) {
-        None => OPENCODE_SNAPSHOTS_DISABLED_CONFIG.to_string(),
-        Some(raw) => match serde_json::from_str::<Value>(&jsonc_to_strict_json(raw)) {
-            Ok(Value::Object(mut map)) => {
-                map.insert("snapshot".to_string(), Value::Bool(false));
-                Value::Object(map).to_string()
-            }
-            _ => {
-                tracing::warn!(
-                    replaced_value_bytes_len = raw.len(),
-                    "freshell_opencode.config_content.malformed_inline_config_replaced"
-                );
-                OPENCODE_SNAPSHOTS_DISABLED_CONFIG.to_string()
-            }
-        },
-    }
-}
-
-/// Focused ep1-r4 F1: normalize the JSONC dialect OpenCode's own config loader
-/// accepts for this lane (1.18.21 `ConfigParse.jsonc` — `jsonc-parser` with
-/// `allowTrailingComma: true`) into the strict JSON `serde_json` parses, so the
-/// merge accepts EXACTLY the same documents the vendored CLI would have:
-///   (1) strip `//` line and TERMINATED `/* */` block comments (each replaced
-///       by ONE space so adjacent value tokens are never fused — `1/**/2` →
-///       `1 2`, not `12`); string-literal-aware, so a URL's `//`, a `\"`
-///       before a closer, or a literal `/*` inside a quoted string survive
-///       VERBATIM; an UNTERMINATED block comment's tail survives VERBATIM too
-///       (jsonc-parser rejects it lexically) — stripping it to EOF could leave
-///       a VALID strict document, silently accepting malformed JSONC
-///       (ep2-r4);
-///   (2) drop a comma whose next non-whitespace character is `}` or `]`
-///       (whitespace between the comma and the closer — including a stripped
-///       comment's space — is left in place).
-/// Anything still unparseable after normalization keeps the existing
-/// content-free malformed path above (the warning NEVER logs content — F5).
-fn jsonc_to_strict_json(raw: &str) -> String {
-    let stripped = {
-        // Pass (1): comment strip, one left-to-right scan.
-        let chars: Vec<char> = raw.chars().collect();
-        let mut out = String::with_capacity(raw.len());
-        let mut i = 0;
-        let mut in_string = false;
-        while i < chars.len() {
-            let c = chars[i];
-            if in_string {
-                out.push(c);
-                // `\` escapes the NEXT char verbatim (it can never end the string).
-                if c == '\\' && i + 1 < chars.len() {
-                    out.push(chars[i + 1]);
-                    i += 1;
-                } else if c == '"' {
-                    in_string = false;
-                }
-                i += 1;
-            } else if c == '"' {
-                in_string = true;
-                out.push(c);
-                i += 1;
-            } else if c == '/' && chars.get(i + 1) == Some(&'/') {
-                // Line comment: ONE space; runs to (never consuming) the line
-                // break — LF or bare CR alike (ep2-r1 F3: jsonc-parser, the
-                // parser the vendored CLI's ConfigParse.jsonc delegates to,
-                // ends line comments on either), or to EOF.
-                out.push(' ');
-                i += 2;
-                while i < chars.len() && chars[i] != '\n' && chars[i] != '\r' {
-                    i += 1;
-                }
-            } else if c == '/' && chars.get(i + 1) == Some(&'*') {
-                // Block comment: ONE space; runs through the closer. An
-                // UNTERMINATED block comment keeps its tail VERBATIM (ep2-r4:
-                // stripping to EOF can leave a VALID strict document —
-                // `{"a":1}/* dangling` → `{"a":1} ` — silently accepting
-                // malformed JSONC into the merge. The parser OpenCode actually
-                // delegates to errors lexically on it; the merge must accept
-                // exactly the same document set, so the tail survives verbatim
-                // and the strict parse rejects it).
-                let comment_start = i;
-                out.push(' ');
-                i += 2;
-                let mut closed = false;
-                while i < chars.len() {
-                    if chars[i] == '*' && chars.get(i + 1) == Some(&'/') {
-                        i += 2;
-                        closed = true;
-                        break;
-                    }
-                    i += 1;
-                }
-                if !closed {
-                    out.extend(chars[comment_start..].iter());
-                }
-            } else {
-                out.push(c);
-                i += 1;
-            }
-        }
-        out
+/// Merge the snapshots pin into valid user JSONC. Refuse malformed input
+/// before starting the shared serve; the error never includes source bytes.
+pub fn merged_opencode_config_content(inherited: Option<&str>) -> Result<String, ServeError> {
+    let Some(raw) = inherited.filter(|raw| !raw.is_empty()) else {
+        return Ok(OPENCODE_SNAPSHOTS_DISABLED_CONFIG.to_string());
     };
-    // Pass (2): trailing-comma drop over the comment-stripped text.
-    let chars: Vec<char> = stripped.chars().collect();
-    let mut out = String::with_capacity(stripped.len());
-    let mut i = 0;
-    let mut in_string = false;
-    while i < chars.len() {
-        let c = chars[i];
-        if in_string {
-            out.push(c);
-            if c == '\\' && i + 1 < chars.len() {
-                out.push(chars[i + 1]);
-                i += 1;
-            } else if c == '"' {
-                in_string = false;
-            }
-            i += 1;
-        } else if c == '"' {
-            in_string = true;
-            out.push(c);
-            i += 1;
-        } else if c == ',' {
-            let mut j = i + 1;
-            while matches!(chars.get(j), Some(' ' | '\t' | '\n' | '\r')) {
-                j += 1;
-            }
-            if matches!(chars.get(j), Some('}' | ']')) {
-                i += 1; // trailing comma: drop it, keep the whitespace run
-            } else {
-                out.push(c);
-                i += 1;
-            }
-        } else {
-            out.push(c);
-            i += 1;
-        }
-    }
-    out
+    freshell_platform::opencode_config::merge_owned_entries(
+        Some(raw),
+        &freshell_platform::opencode_config::OpencodeConfigPlan {
+            sources: Vec::new(),
+            user_owns_freshell_mcp: false,
+        },
+        &freshell_platform::opencode_config::OwnedConfigEdits {
+            disable_snapshots: true,
+            ..Default::default()
+        },
+    )
+    .map_err(|_| ServeError::InvalidConfig)
 }
 
 /// A boxed, `Send` future — the object-safe async return used by the injected IO
@@ -449,6 +310,7 @@ pub type Route = Option<String>;
 /// DEV-0001 outcome; its message contains "did not become healthy" verbatim.
 #[derive(Clone, Debug, PartialEq)]
 pub enum ServeError {
+    InvalidConfig,
     ShuttingDown,
     StartupAborted,
     StartupFailed(String),
@@ -492,6 +354,7 @@ pub enum ServeError {
 impl std::fmt::Display for ServeError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            ServeError::InvalidConfig => write!(f, "OpenCode inline config contains malformed JSONC or is not an object"),
             ServeError::ShuttingDown => write!(f, "opencode serve manager is shutting down"),
             ServeError::StartupAborted => write!(f, "opencode serve startup was aborted"),
             ServeError::StartupFailed(s) => write!(f, "opencode serve failed to start: {s}"),
@@ -553,6 +416,7 @@ impl ServeError {
         matches!(
             self,
             ServeError::Undelivered(_)
+                | ServeError::InvalidConfig
                 | ServeError::ShuttingDown
                 | ServeError::StartupAborted
                 | ServeError::StartupFailed(_)
@@ -864,7 +728,7 @@ impl OpencodeServeManager {
         };
         env.push((
             OPENCODE_CONFIG_CONTENT_ENV.to_string(),
-            merged_opencode_config_content(inherited.as_deref()),
+            merged_opencode_config_content(inherited.as_deref())?,
         ));
         let process: Arc<dyn ServeProcess> = self
             .inner
@@ -2381,6 +2245,7 @@ fn encode_path_segment(segment: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use freshell_platform::opencode_config::jsonc_to_strict_json;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     // ── display_error_chain (transport diagnostics preservation) ─────────────
@@ -3425,22 +3290,41 @@ mod tests {
     #[test]
     fn merged_config_absent_writes_the_bare_pin_document() {
         assert_eq!(
-            merged_opencode_config_content(None),
+            merged_opencode_config_content(None).unwrap(),
             OPENCODE_SNAPSHOTS_DISABLED_CONFIG
         );
         // An empty inherited value merges as absent, never a malformed warning.
         assert_eq!(
-            merged_opencode_config_content(Some("")),
+            merged_opencode_config_content(Some("")).unwrap(),
             OPENCODE_SNAPSHOTS_DISABLED_CONFIG
         );
+    }
+
+    #[test]
+    fn launch_config_refuses_malformed_jsonc_without_exposing_source() {
+        let malformed = "{\"provider\":{\"apiKey\":\"fixture-secret\"},";
+        let error = merged_opencode_config_content(Some(malformed)).unwrap_err();
+        assert_eq!(error, ServeError::InvalidConfig);
+        assert!(!error.to_string().contains("fixture-secret"));
+        let valid = merged_opencode_config_content(Some(
+            "{ // user comment\n \"plugin\":[\"file:///user-plugin.ts\",], }",
+        ))
+        .unwrap();
+        let value: Value = serde_json::from_str(&valid).unwrap();
+        assert_eq!(
+            value["plugin"],
+            serde_json::json!(["file:///user-plugin.ts"])
+        );
+        assert_eq!(value["snapshot"], false);
     }
 
     #[test]
     fn merged_config_merges_into_an_inherited_object_and_forces_the_pin() {
         let user =
             r#"{"plugin":["file:///home/me/plugin.ts"],"model":"openai/gpt-5","theme":"dark"}"#;
-        let parsed: Value = serde_json::from_str(&merged_opencode_config_content(Some(user)))
-            .expect("merged is valid JSON");
+        let parsed: Value =
+            serde_json::from_str(&merged_opencode_config_content(Some(user)).unwrap())
+                .expect("merged is valid JSON");
         assert_eq!(
             parsed,
             serde_json::json!({
@@ -3453,9 +3337,10 @@ mod tests {
         );
         // A user-supplied top-level `snapshot` NEVER wins — the rollback decision
         // pins it (that is the point of the managed lane).
-        let overridden: Value = serde_json::from_str(&merged_opencode_config_content(Some(
-            r#"{"snapshot":true,"autoupdate":false}"#,
-        )))
+        let overridden: Value = serde_json::from_str(
+            &merged_opencode_config_content(Some(r#"{"snapshot":true,"autoupdate":false}"#))
+                .unwrap(),
+        )
         .expect("merged is valid JSON");
         assert_eq!(
             overridden,
@@ -3518,42 +3403,19 @@ mod tests {
         }
     }
 
-    /// Focused-review ep1-r2 F5 (log hygiene): the malformed-inline-config
-    /// warning must never copy user config into persistent logs — an inline
-    /// OpenCode document can carry credential-shaped fields (API keys,
-    /// authorization headers), and a truncated/malformed secret-bearing value
-    /// would otherwise leak. The warn names ONLY the replaced value's byte
-    /// length; NO substring of the content appears in any traced field.
+    /// Malformed inline config is refused without exposing source content in
+    /// errors or structured events.
     #[test]
-    fn merged_config_malformed_is_replaced_with_a_content_free_length_only_warning() {
+    fn merged_config_malformed_is_refused_without_source_content() {
         let (events, _guard) = config_capture::capture();
         let malformed = "not-json-at-all{ this is longer than twenty four chars }";
-        let replaced = merged_opencode_config_content(Some(malformed));
-        assert_eq!(replaced, OPENCODE_SNAPSHOTS_DISABLED_CONFIG);
+        let error = merged_opencode_config_content(Some(malformed)).unwrap_err();
+        assert_eq!(error, ServeError::InvalidConfig);
+        assert!(!error.to_string().contains(malformed));
         let events = events.lock().expect("capture lock");
-        let warn = events
+        assert!(events
             .iter()
-            .find(|fields| {
-                fields.get("message").map(String::as_str)
-                    == Some("freshell_opencode.config_content.malformed_inline_config_replaced")
-            })
-            .expect("a malformed inline config warns loudly");
-        assert_eq!(
-            warn.get("replaced_value_bytes_len")
-                .cloned()
-                .unwrap_or_default(),
-            malformed.len().to_string(),
-            "the warning names ONLY the replaced value's byte length: {warn:?}"
-        );
-        for (field, value) in warn.iter() {
-            for n in [8usize, 16, 24, malformed.len()] {
-                let needle = &malformed[..n.min(malformed.len())];
-                assert!(
-                    !value.contains(needle),
-                    "no content substring ({needle:?}) may appear in any traced field ({field}={value:?})"
-                );
-            }
-        }
+            .all(|fields| fields.values().all(|value| !value.contains(malformed))));
     }
 
     // ── focused ep1-r4 F1: OpenCode (v1.18.21) parses OPENCODE_CONFIG_CONTENT
@@ -3637,8 +3499,9 @@ mod tests {
             "log": "https://logs.example/tail", /* a block comment before the closer */
             "snapshot": true,
         }"#;
-        let merged: Value = serde_json::from_str(&merged_opencode_config_content(Some(user)))
-            .expect("the merged document is valid strict JSON");
+        let merged: Value =
+            serde_json::from_str(&merged_opencode_config_content(Some(user)).unwrap())
+                .expect("the merged document is valid strict JSON");
         assert_eq!(
             merged,
             serde_json::json!({
@@ -3666,8 +3529,9 @@ mod tests {
     fn merged_config_valid_jsonc_never_emits_the_malformed_warning() {
         let (events, _guard) = config_capture::capture();
         let jsonc = "{\n  // line comment\n  \"share\": \"disabled\", /* block */\n  \"autoupdate\": false,\n}";
-        let merged: Value = serde_json::from_str(&merged_opencode_config_content(Some(jsonc)))
-            .expect("the merged document is valid strict JSON");
+        let merged: Value =
+            serde_json::from_str(&merged_opencode_config_content(Some(jsonc)).unwrap())
+                .expect("the merged document is valid strict JSON");
         assert_eq!(
             merged,
             serde_json::json!({ "share": "disabled", "autoupdate": false, "snapshot": false })
@@ -3682,33 +3546,17 @@ mod tests {
         );
     }
 
-    /// A document unparseable even AFTER comment/trailing-comma normalization
-    /// keeps the existing content-free replace+warn behavior (F5 unchanged).
+    /// A document unparseable after JSONC normalization is refused.
     #[test]
-    fn merged_config_unparseable_after_jsonc_normalization_still_warns_content_free() {
+    fn merged_config_unparseable_after_jsonc_normalization_is_refused() {
         let (events, _guard) = config_capture::capture();
         let malformed = "{ \"model\": , // no value\n }";
-        let replaced = merged_opencode_config_content(Some(malformed));
-        assert_eq!(replaced, OPENCODE_SNAPSHOTS_DISABLED_CONFIG);
+        let error = merged_opencode_config_content(Some(malformed)).unwrap_err();
+        assert_eq!(error, ServeError::InvalidConfig);
         let events = events.lock().expect("capture lock");
-        let warn = events
+        assert!(events
             .iter()
-            .find(|fields| {
-                fields.get("message").map(String::as_str)
-                    == Some("freshell_opencode.config_content.malformed_inline_config_replaced")
-            })
-            .expect("a genuinely unparseable document still warns loudly");
-        assert_eq!(
-            warn.get("replaced_value_bytes_len")
-                .cloned()
-                .unwrap_or_default(),
-            malformed.len().to_string(),
-            "length-only, content-free (F5): {warn:?}"
-        );
-        assert!(
-            warn.values().all(|v| !v.contains("model")),
-            "no content substring survives into the warning: {warn:?}"
-        );
+            .all(|fields| fields.values().all(|value| !value.contains("model"))));
     }
 
     /// Focused ep2-r1 F3: `jsonc-parser` (the parser OpenCode's 1.18.21
@@ -3737,38 +3585,28 @@ mod tests {
         // The full valid document on bare-CR line endings merges — never the
         // malformed branch.
         let cr_only = "{\r  // provider pin\r  \"model\": \"dev/m-x\",\r}\r";
-        let merged: Value = serde_json::from_str(&merged_opencode_config_content(Some(cr_only)))
-            .expect("CR-only JSONC is valid after normalization");
+        let merged: Value =
+            serde_json::from_str(&merged_opencode_config_content(Some(cr_only)).unwrap())
+                .expect("CR-only JSONC is valid after normalization");
         assert_eq!(
             merged,
             serde_json::json!({ "model": "dev/m-x", "snapshot": false })
         );
     }
 
-    /// A non-object JSON value can't take a top-level pin either — same
-    /// replace+warn, content-free (F5).
+    /// A non-object JSON value cannot take the top-level pin.
     #[test]
-    fn merged_config_json_scalars_and_arrays_are_replaced_with_the_warning() {
+    fn merged_config_json_scalars_and_arrays_are_refused() {
         let (events, _guard) = config_capture::capture();
         let scalar = r#"["plugin-x"]"#;
         assert_eq!(
             merged_opencode_config_content(Some(scalar)),
-            OPENCODE_SNAPSHOTS_DISABLED_CONFIG
+            Err(ServeError::InvalidConfig)
         );
         let events = events.lock().expect("capture lock");
-        assert_eq!(events.len(), 1, "one warn per replaced malformed value");
-        assert_eq!(
-            events[0]
-                .get("replaced_value_bytes_len")
-                .cloned()
-                .unwrap_or_default(),
-            scalar.len().to_string(),
-        );
-        assert!(
-            events[0].values().all(|v| !v.contains("plugin-x")),
-            "no content substring survives into the warning: {:?}",
-            events[0]
-        );
+        assert!(events
+            .iter()
+            .all(|fields| fields.values().all(|value| !value.contains("plugin-x"))));
     }
 
     /// 2026-09-20 incident: the daemon discard that killed the shared serve left

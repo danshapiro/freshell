@@ -6,7 +6,7 @@
 
 use hmac::{Hmac, Mac};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
-use sha2::Sha256;
+use sha2::{Digest, Sha256};
 use std::fmt;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
@@ -167,6 +167,7 @@ pub enum RecoveryTrigger {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum RecoveryBlockReason {
+    CapabilityPending,
     CredentialsExpired,
     RateLimited,
     ProviderUnavailable,
@@ -911,6 +912,14 @@ pub struct ProviderBootstrapFile {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ProviderSecretProfile {
+    ClaudeOnecliEnvironment,
+    ClaudeOnecliAuthFile,
+    CodexOnecliEnvironment,
+    CodexOnecliAuthFile,
+    OpencodeOnecliEnvironment,
+    OpencodeOnecliAuthFile,
+    AmplifierOnecliEnvironment,
+    AmplifierOnecliKeysFile,
     /// The approved OneCLI deployment: Amplifier's VLLM module talks to the
     /// LunaRoute-compatible upstream through the credentialed HTTPS proxy
     /// referenced by the user's private keys.env.
@@ -922,6 +931,30 @@ pub enum ProviderSecretProfile {
     LegacyAmplifierOnecliAnthropicHaikuLow,
 }
 
+impl ProviderSecretProfile {
+    pub fn provider(self) -> &'static str {
+        match self {
+            Self::ClaudeOnecliEnvironment | Self::ClaudeOnecliAuthFile => "claude",
+            Self::CodexOnecliEnvironment | Self::CodexOnecliAuthFile => "codex",
+            Self::OpencodeOnecliEnvironment | Self::OpencodeOnecliAuthFile => "opencode",
+            Self::AmplifierOnecliEnvironment
+            | Self::AmplifierOnecliKeysFile
+            | Self::AmplifierOnecliLunarouteGlm53
+            | Self::LegacyAmplifierOnecliAnthropicHaikuLow => "amplifier",
+        }
+    }
+
+    pub fn auth_relative_path(self) -> Option<&'static str> {
+        match self {
+            Self::ClaudeOnecliAuthFile => Some(".claude/.credentials.json"),
+            Self::CodexOnecliAuthFile => Some(".codex/auth.json"),
+            Self::OpencodeOnecliAuthFile => Some(".local/share/opencode/auth.json"),
+            Self::AmplifierOnecliKeysFile => Some(".amplifier/keys.env"),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ProviderSecretReference {
@@ -929,6 +962,574 @@ pub struct ProviderSecretReference {
     /// session host reads its read-only mount immediately before child spawn.
     pub source_path: String,
     pub profile: ProviderSecretProfile,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ProviderLaunchContext {
+    pub preparation: ProviderPreparation,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mcp_capability: Option<McpCapabilityReference>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub config: Vec<ProviderConfigReference>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub enum ProviderPreparation {
+    Claude {
+        mcp_args: Vec<String>,
+    },
+    Codex {
+        tui_args: Vec<String>,
+        sidecar_args: Vec<String>,
+    },
+    Opencode {
+        project_config: Vec<ProviderConfigReference>,
+        tui_config: Option<ProviderConfigReference>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tui_source: Option<ProviderConfigReference>,
+        #[serde(default)]
+        inline_config: bool,
+    },
+    Amplifier {
+        bundle: String,
+        resume_args: Vec<String>,
+    },
+}
+
+impl ProviderPreparation {
+    pub fn provider(&self) -> &'static str {
+        match self {
+            Self::Claude { .. } => "claude",
+            Self::Codex { .. } => "codex",
+            Self::Opencode { .. } => "opencode",
+            Self::Amplifier { .. } => "amplifier",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct McpCapabilityReference {
+    pub grant_id: String,
+    pub endpoint: String,
+    pub provider_relative_path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_gateway_address: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderConfigRoot {
+    Workspace,
+    UserProvider,
+    /// Fixed files staged beside an incarnation's private MCP grant.
+    Ephemeral,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ProviderConfigReference {
+    pub root: ProviderConfigRoot,
+    pub relative_path: String,
+    pub provider_relative_path: String,
+    pub format: String,
+}
+
+impl ProviderLaunchContext {
+    pub fn validate(&self, provider: &str) -> Result<(), RuntimeError> {
+        let invalid = || {
+            RuntimeError::new(
+                RuntimeErrorCode::InvalidRequest,
+                "managed provider launch context is unsafe or mismatched",
+            )
+        };
+        if self.preparation.provider() != provider
+            || self.config.len() > 128
+            || self
+                .config
+                .iter()
+                .any(|reference| reference.root == ProviderConfigRoot::Ephemeral)
+        {
+            return Err(invalid());
+        }
+        let mut references: Vec<&ProviderConfigReference> = self.config.iter().collect();
+        // These durable fields are limited to exact, non-secret recipes.
+        // Provider-specific free-form launch arguments remain transient.
+        match &self.preparation {
+            ProviderPreparation::Claude { mcp_args } => {
+                if !mcp_args.is_empty()
+                    && !matches!(
+                        (mcp_args.as_slice(), self.mcp_capability.as_ref()),
+                        ([flag, path], Some(capability))
+                            if flag == "--mcp-config"
+                                && path == ".claude/freshell-mcp.json"
+                                && (capability.provider_relative_path == ".freshell/mcp-capability.json"
+                                    || path == &capability.provider_relative_path)
+                    )
+                {
+                    return Err(invalid());
+                }
+            }
+            ProviderPreparation::Codex {
+                tui_args,
+                sidecar_args,
+            } => {
+                let valid_recipe = |args: &[String]| {
+                    args.len() == 6
+                        && args[0] == "-c"
+                        && args[1] == "mcp_servers.freshell.command=\"node\""
+                        && args[2] == "-c"
+                        && args[3] == "mcp_servers.freshell.args=[\"/opt/freshell-mcp/server.js\"]"
+                        && args[4] == "-c"
+                        && args[5] == "mcp_servers.freshell.env_vars=[\"FRESHELL\", \"FRESHELL_URL\", \"FRESHELL_TOKEN\", \"FRESHELL_TERMINAL_ID\", \"FRESHELL_TAB_ID\", \"FRESHELL_PANE_ID\"]"
+                };
+                if (!tui_args.is_empty() || !sidecar_args.is_empty())
+                    && (self.mcp_capability.is_none()
+                        || !valid_recipe(tui_args)
+                        || !valid_recipe(sidecar_args))
+                {
+                    return Err(invalid());
+                }
+            }
+            ProviderPreparation::Opencode {
+                project_config,
+                tui_config,
+                tui_source,
+                inline_config,
+            } => {
+                if project_config
+                    .iter()
+                    .any(|reference| reference.root == ProviderConfigRoot::Ephemeral)
+                {
+                    return Err(invalid());
+                }
+                references.extend(project_config.iter());
+                references.extend(tui_config.iter());
+                if *inline_config && self.mcp_capability.is_none() {
+                    return Err(invalid());
+                }
+                if let Some(reference) = tui_config {
+                    if self.mcp_capability.is_none() {
+                        return Err(invalid());
+                    }
+                    let expected = match reference.format.as_str() {
+                        "json" => Some(("tui-config.json", ".freshell/opencode/user-tui.json")),
+                        "jsonc" => Some(("tui-config.jsonc", ".freshell/opencode/user-tui.jsonc")),
+                        _ => None,
+                    };
+                    if reference.root != ProviderConfigRoot::Ephemeral
+                        || expected
+                            != Some((
+                                reference.relative_path.as_str(),
+                                reference.provider_relative_path.as_str(),
+                            ))
+                    {
+                        return Err(invalid());
+                    }
+                }
+                if let Some(source) = tui_source {
+                    let Some(staged) = tui_config else {
+                        return Err(invalid());
+                    };
+                    if !matches!(
+                        source.root,
+                        ProviderConfigRoot::Workspace | ProviderConfigRoot::UserProvider
+                    ) || source.format != staged.format
+                        || source.provider_relative_path != staged.provider_relative_path
+                        || !safe_relative_path(&source.relative_path)
+                    {
+                        return Err(invalid());
+                    }
+                }
+            }
+            ProviderPreparation::Amplifier {
+                bundle,
+                resume_args,
+            } => {
+                if bundle != "default" || !resume_args.is_empty() {
+                    return Err(invalid());
+                }
+            }
+        }
+        if references.len() > 128 {
+            return Err(invalid());
+        }
+        for reference in references {
+            if !safe_relative_path(&reference.relative_path)
+                || !safe_relative_path(&reference.provider_relative_path)
+                || !matches!(
+                    reference.format.as_str(),
+                    "json" | "jsonc" | "toml" | "yaml" | "text" | "directory"
+                )
+                || reference.relative_path.split('/').any(secret_component)
+                || reference
+                    .provider_relative_path
+                    .split('/')
+                    .any(secret_component)
+                || (reference.root == ProviderConfigRoot::UserProvider && provider == "shell")
+            {
+                return Err(invalid());
+            }
+        }
+        if let Some(capability) = &self.mcp_capability {
+            if !capability.grant_id.starts_with("grant-")
+                || capability.grant_id.len() > 128
+                || !capability
+                    .grant_id
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+                || !safe_relative_path(&capability.provider_relative_path)
+                || capability.endpoint.len() > 512
+                || !(capability.endpoint.starts_with("http://")
+                    || capability.endpoint.starts_with("https://"))
+                || capability.endpoint.contains(['?', '#', '@', '\n', '\r'])
+                || capability.endpoint.starts_with("http://127.")
+                || capability.endpoint.starts_with("https://127.")
+                || capability.endpoint.starts_with("http://localhost")
+                || capability.endpoint.starts_with("https://localhost")
+                || capability.endpoint.starts_with("http://[::1]")
+                || capability.endpoint.starts_with("https://[::1]")
+                || capability
+                    .host_gateway_address
+                    .as_ref()
+                    .is_some_and(|address| {
+                        address.parse::<std::net::Ipv4Addr>().map_or(true, |ip| {
+                            ip.is_loopback() || ip.is_unspecified() || ip.is_multicast()
+                        })
+                    })
+            {
+                return Err(invalid());
+            }
+        }
+        Ok(())
+    }
+}
+
+fn safe_relative_path(value: &str) -> bool {
+    let path = std::path::Path::new(value);
+    !value.is_empty()
+        && value.len() <= 512
+        && !path.is_absolute()
+        && path
+            .components()
+            .all(|component| matches!(component, std::path::Component::Normal(_)))
+        && !value.chars().any(char::is_control)
+}
+
+fn secret_component(value: &str) -> bool {
+    matches!(
+        value.to_ascii_lowercase().as_str(),
+        ".credentials.json"
+            | "auth.json"
+            | "keys.env"
+            | ".env"
+            | "credentials"
+            | "secrets"
+            | "token.json"
+    )
+}
+
+#[cfg(test)]
+mod provider_launch_context_tests {
+    use super::*;
+
+    #[test]
+    fn old_terminal_launch_row_deserializes_without_provider_context() {
+        let row = serde_json::json!({
+            "terminalId":"terminal-old", "streamId":"stream-old", "mode":"claude",
+            "program":"claude", "cwd":"/workspace", "runAsUid":65534,
+            "runAsGid":0, "cols":80, "rows":24, "projectKey":"project-old",
+            "workspacePath":"/workspace"
+        });
+        let launch: TerminalLaunchSpec = serde_json::from_value(row).unwrap();
+        assert!(launch.provider_launch_context.is_none());
+    }
+
+    #[test]
+    fn old_fresh_agent_row_deserializes_without_context_or_secret_references() {
+        let row = serde_json::json!({
+            "sessionId":"old-fresh", "provider":"claude", "sessionType":"freshclaude",
+            "runtimeVariant":"claude-sdk", "providerStoreId":"old-store",
+            "cwd":"/workspace", "workspacePath":"/workspace", "runAsUid":65534,
+            "runAsGid":0
+        });
+        let launch: FreshAgentLaunchSpec = serde_json::from_value(row).unwrap();
+        assert!(launch.provider_launch_context.is_none());
+        assert!(launch.provider_secret_references.is_empty());
+        assert!(launch.plugins.is_none());
+        assert!(launch.model_selection.is_none());
+        assert!(launch.session_ref.is_none());
+        let mut explicit_clear = launch;
+        explicit_clear.model_selection = Some(None);
+        let encoded = serde_json::to_value(&explicit_clear).unwrap();
+        assert!(encoded.get("modelSelection").unwrap().is_null());
+        assert_eq!(
+            serde_json::from_value::<FreshAgentLaunchSpec>(encoded).unwrap(),
+            explicit_clear
+        );
+    }
+
+    #[test]
+    fn opencode_tui_reference_is_fixed_and_keeps_jsonc_format() {
+        let reference = ProviderConfigReference {
+            root: ProviderConfigRoot::Ephemeral,
+            relative_path: "tui-config.jsonc".into(),
+            provider_relative_path: ".freshell/opencode/user-tui.jsonc".into(),
+            format: "jsonc".into(),
+        };
+        let capability = McpCapabilityReference {
+            grant_id: "grant-tui".into(),
+            endpoint: "http://host.docker.internal:3001".into(),
+            provider_relative_path: ".freshell/mcp-capability.json".into(),
+            host_gateway_address: None,
+        };
+        let mut context = ProviderLaunchContext {
+            preparation: ProviderPreparation::Opencode {
+                project_config: Vec::new(),
+                tui_config: Some(reference),
+                tui_source: None,
+                inline_config: true,
+            },
+            mcp_capability: Some(capability),
+            config: Vec::new(),
+        };
+        context.validate("opencode").unwrap();
+        if let ProviderPreparation::Opencode { tui_source, .. } = &mut context.preparation {
+            *tui_source = Some(ProviderConfigReference {
+                root: ProviderConfigRoot::UserProvider,
+                relative_path: "tui.jsonc".into(),
+                provider_relative_path: ".freshell/opencode/user-tui.jsonc".into(),
+                format: "jsonc".into(),
+            });
+        }
+        context.validate("opencode").unwrap();
+        let encoded = serde_json::to_string(&context).unwrap();
+        assert!(encoded.contains("tui_source"));
+        if let ProviderPreparation::Opencode { tui_source, .. } = &mut context.preparation {
+            tui_source.as_mut().unwrap().relative_path = "../outside.jsonc".into();
+        }
+        assert!(context.validate("opencode").is_err());
+        if let ProviderPreparation::Opencode { tui_source, .. } = &mut context.preparation {
+            tui_source.as_mut().unwrap().relative_path = "tui.jsonc".into();
+        }
+        if let ProviderPreparation::Opencode { tui_config, .. } = &mut context.preparation {
+            tui_config.as_mut().unwrap().provider_relative_path =
+                ".freshell/opencode/other.jsonc".into();
+        }
+        assert!(context.validate("opencode").is_err());
+    }
+
+    #[test]
+    fn typed_provider_context_round_trips_without_secret_material() {
+        let context = ProviderLaunchContext {
+            preparation: ProviderPreparation::Claude {
+                mcp_args: vec!["--mcp-config".into(), ".claude/freshell-mcp.json".into()],
+            },
+            mcp_capability: Some(McpCapabilityReference {
+                grant_id: "grant-opaque-reference".into(),
+                endpoint: "http://host.docker.internal:3001/api/mcp".into(),
+                provider_relative_path: ".claude/freshell-mcp.json".into(),
+                host_gateway_address: Some("192.168.3.150".into()),
+            }),
+            config: vec![ProviderConfigReference {
+                root: ProviderConfigRoot::UserProvider,
+                relative_path: "settings.json".into(),
+                provider_relative_path: ".claude/settings.json".into(),
+                format: "json".into(),
+            }],
+        };
+        context.validate("claude").unwrap();
+        let encoded = serde_json::to_string(&context).unwrap();
+        assert!(!encoded.contains("test-secret-value"));
+        assert_eq!(
+            serde_json::from_str::<ProviderLaunchContext>(&encoded).unwrap(),
+            context
+        );
+    }
+
+    #[test]
+    fn managed_codex_replaces_web_owned_mcp_args_with_soul_recipe() {
+        let args = vec![
+            "-c".into(),
+            "tui.notification_method=bel".into(),
+            "-c".into(),
+            "mcp_servers.freshell.command=\"node\"".into(),
+            "-c".into(),
+            "mcp_servers.freshell.args=[\"/web/tools/server.ts\"]".into(),
+            "-c".into(),
+            "mcp_servers.freshell.env_vars=[\"FRESHELL\"]".into(),
+            "--model".into(),
+            "gpt-5.6-luna".into(),
+        ];
+        assert_eq!(
+            durable_managed_terminal_args("codex", args, None).unwrap(),
+            vec![
+                "-c",
+                "tui.notification_method=bel",
+                "--model",
+                "gpt-5.6-luna"
+            ]
+        );
+    }
+
+    #[test]
+    fn managed_codex_accepts_only_the_packaged_mcp_recipe_after_preparation() {
+        let args = vec![
+            "-c".into(), "mcp_servers.freshell.command=\"node\"".into(),
+            "-c".into(), "mcp_servers.freshell.args=[\"/opt/freshell-mcp/server.js\"]".into(),
+            "-c".into(), "mcp_servers.freshell.env_vars=[\"FRESHELL\", \"FRESHELL_URL\", \"FRESHELL_TOKEN\", \"FRESHELL_TERMINAL_ID\", \"FRESHELL_TAB_ID\", \"FRESHELL_PANE_ID\"]".into(),
+        ];
+        assert!(validate_managed_terminal_args("codex", &args).is_ok());
+        let mut unsafe_args = args;
+        unsafe_args[3] = "mcp_servers.freshell.args=[\"/tmp/other.js\"]".into();
+        assert!(validate_managed_terminal_args("codex", &unsafe_args).is_err());
+    }
+
+    #[test]
+    fn raw_secret_payload_and_unapproved_config_paths_are_rejected() {
+        let raw = serde_json::json!({
+            "preparation":{"claude":{"mcpArgs":[]}}, "config":[],
+            "token":"test-secret-value"
+        });
+        assert!(serde_json::from_value::<ProviderLaunchContext>(raw).is_err());
+        let nested = serde_json::json!({
+            "preparation":{"claude":{"mcp_args":[],"apiKey":"test-secret-value"}},
+            "config":[]
+        });
+        assert!(serde_json::from_value::<ProviderLaunchContext>(nested).is_err());
+
+        let context = ProviderLaunchContext {
+            preparation: ProviderPreparation::Claude { mcp_args: vec![] },
+            mcp_capability: None,
+            config: vec![ProviderConfigReference {
+                root: ProviderConfigRoot::UserProvider,
+                relative_path: ".credentials.json".into(),
+                provider_relative_path: ".claude/.credentials.json".into(),
+                format: "json".into(),
+            }],
+        };
+        assert!(context.validate("claude").is_err());
+        let mut context = context;
+        context.config.clear();
+        context.mcp_capability = Some(McpCapabilityReference {
+            grant_id: "grant-local-control".into(),
+            endpoint: "http://127.0.0.1:10254/api/mcp".into(),
+            provider_relative_path: ".claude/mcp.json".into(),
+            host_gateway_address: None,
+        });
+        assert!(context.validate("claude").is_err());
+        context.mcp_capability.as_mut().unwrap().endpoint =
+            "http://host.docker.internal:3001/api/mcp".into();
+        context
+            .mcp_capability
+            .as_mut()
+            .unwrap()
+            .host_gateway_address = Some("127.0.0.1".into());
+        assert!(context.validate("claude").is_err());
+    }
+
+    #[test]
+    fn separated_credential_argument_cannot_enter_a_durable_launch_row() {
+        let mut launch: TerminalLaunchSpec = serde_json::from_value(serde_json::json!({
+            "terminalId":"credential-test", "streamId":"stream-test", "mode":"claude",
+            "program":"claude", "cwd":"/workspace", "runAsUid":65534,
+            "runAsGid":0, "cols":80, "rows":24, "projectKey":"project-test",
+            "workspacePath":"/workspace"
+        }))
+        .unwrap();
+        launch.provider_launch_context = Some(ProviderLaunchContext {
+            preparation: ProviderPreparation::Claude {
+                mcp_args: vec!["--api-key".into(), "fixture-secret-bytes".into()],
+            },
+            mcp_capability: None,
+            config: Vec::new(),
+        });
+        assert!(launch.validate().is_err());
+        let serialized = serde_json::to_string(&launch).unwrap();
+        let restored: TerminalLaunchSpec = serde_json::from_str(&serialized).unwrap();
+        assert!(restored.validate().is_err());
+        launch.provider_launch_context.as_mut().unwrap().preparation =
+            ProviderPreparation::Claude {
+                mcp_args: vec!["--api-key=fixture-secret-bytes".into()],
+            };
+        assert!(launch.validate().is_err());
+        let context = launch.provider_launch_context.as_mut().unwrap();
+        context.preparation = ProviderPreparation::Claude {
+            mcp_args: vec!["--mcp-config".into(), "fixture-secret-bytes".into()],
+        };
+        context.mcp_capability = Some(McpCapabilityReference {
+            grant_id: "grant-test".into(),
+            endpoint: "http://host.docker.internal:3001/api/mcp".into(),
+            provider_relative_path: "fixture-secret-bytes".into(),
+            host_gateway_address: None,
+        });
+        assert!(launch.validate().is_err());
+    }
+
+    #[test]
+    fn onecli_profiles_match_only_their_named_provider() {
+        for (provider, profiles) in [
+            (
+                "claude",
+                [
+                    ProviderSecretProfile::ClaudeOnecliEnvironment,
+                    ProviderSecretProfile::ClaudeOnecliAuthFile,
+                ],
+            ),
+            (
+                "codex",
+                [
+                    ProviderSecretProfile::CodexOnecliEnvironment,
+                    ProviderSecretProfile::CodexOnecliAuthFile,
+                ],
+            ),
+            (
+                "opencode",
+                [
+                    ProviderSecretProfile::OpencodeOnecliEnvironment,
+                    ProviderSecretProfile::OpencodeOnecliAuthFile,
+                ],
+            ),
+            (
+                "amplifier",
+                [
+                    ProviderSecretProfile::AmplifierOnecliEnvironment,
+                    ProviderSecretProfile::AmplifierOnecliKeysFile,
+                ],
+            ),
+        ] {
+            for profile in profiles {
+                let references = [ProviderSecretReference {
+                    source_path: "/private/onecli-grant".into(),
+                    profile,
+                }];
+                assert!(validate_provider_secrets(provider, &references).is_ok());
+                assert!(validate_provider_secrets("wrong-provider", &references).is_err());
+            }
+        }
+        assert!(validate_provider_secrets(
+            "amplifier",
+            &[ProviderSecretReference {
+                source_path: "/private/legacy".into(),
+                profile: ProviderSecretProfile::LegacyAmplifierOnecliAnthropicHaikuLow,
+            }]
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn terminal_launch_rejects_raw_secret_environment() {
+        let row = serde_json::json!({
+            "terminalId":"terminal-secret", "streamId":"stream-secret", "mode":"codex",
+            "program":"codex", "cwd":"/workspace", "runAsUid":65534,
+            "runAsGid":0, "cols":80, "rows":24, "projectKey":"project-secret",
+            "workspacePath":"/workspace", "env":{"OPENAI_API_KEY":"fixture-secret-value"}
+        });
+        let launch: TerminalLaunchSpec = serde_json::from_value(row).unwrap();
+        assert!(launch.validate().is_err());
+    }
 }
 
 /// Fresh-agent provider hosted inside one managed soul enclosure. Kilroy is
@@ -950,6 +1551,40 @@ pub enum FreshProvider {
 #[serde(rename_all = "snake_case")]
 pub enum FreshAgentFixtureTransport {
     Deterministic,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderModelSelection {
+    pub kind: String,
+    pub model_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderSessionReference {
+    pub provider: String,
+    pub session_id: String,
+}
+
+mod double_optional {
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    pub fn serialize<T: Serialize, S: Serializer>(
+        value: &Option<Option<T>>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        match value {
+            Some(inner) => inner.serialize(serializer),
+            None => serializer.serialize_none(),
+        }
+    }
+
+    pub fn deserialize<'de, T: Deserialize<'de>, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Option<Option<T>>, D::Error> {
+        Ok(Some(Option::deserialize(deserializer)?))
+    }
 }
 
 impl FreshProvider {
@@ -991,9 +1626,23 @@ pub struct FreshAgentLaunchSpec {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub native_session_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plugins: Option<Vec<String>>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "double_optional"
+    )]
+    pub model_selection: Option<Option<ProviderModelSelection>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_ref: Option<ProviderSessionReference>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fixture_transport: Option<FreshAgentFixtureTransport>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub provider_bootstrap_files: Vec<ProviderBootstrapFile>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub provider_secret_references: Vec<ProviderSecretReference>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_launch_context: Option<ProviderLaunchContext>,
 }
 
 impl FreshAgentLaunchSpec {
@@ -1012,7 +1661,24 @@ impl FreshAgentLaunchSpec {
             || self.workspace_path.is_empty()
             || self.run_as_uid == 0
             || self.native_session_id.as_deref().is_some_and(str::is_empty)
+            || self
+                .plugins
+                .as_ref()
+                .is_some_and(|plugins| plugins.len() > 64)
+            || self.session_ref.as_ref().is_some_and(|reference| {
+                reference.session_id.is_empty()
+                    || reference.provider
+                        != match self.provider {
+                            FreshProvider::Kilroy => "claude",
+                            _ => self.provider.as_str(),
+                        }
+                    || self
+                        .native_session_id
+                        .as_ref()
+                        .is_some_and(|native| native != &reference.session_id)
+            })
             || self.provider_bootstrap_files.len() > 16
+            || self.provider_secret_references.len() > 4
         {
             return Err(RuntimeError::new(
                 RuntimeErrorCode::InvalidRequest,
@@ -1035,6 +1701,28 @@ impl FreshAgentLaunchSpec {
                 ));
             }
         }
+        if self.plugins.as_ref().is_some_and(|plugins| {
+            plugins.iter().any(|plugin| {
+                plugin.is_empty() || plugin.len() > 1024 || plugin.chars().any(char::is_control)
+            })
+        }) || self
+            .model_selection
+            .as_ref()
+            .and_then(Option::as_ref)
+            .is_some_and(|selection| {
+                selection.kind.is_empty()
+                    || selection.model_id.is_empty()
+                    || selection.kind.len() > 256
+                    || selection.model_id.len() > 256
+                    || selection.kind.chars().any(char::is_control)
+                    || selection.model_id.chars().any(char::is_control)
+            })
+        {
+            return Err(RuntimeError::new(
+                RuntimeErrorCode::InvalidRequest,
+                "managed fresh-agent provider input is invalid",
+            ));
+        }
         for file in &self.provider_bootstrap_files {
             let source = std::path::Path::new(&file.source_path);
             let relative = std::path::Path::new(&file.provider_relative_path);
@@ -1055,6 +1743,16 @@ impl FreshAgentLaunchSpec {
                     "managed provider bootstrap file path is unsafe",
                 ));
             }
+        }
+        if let Some(context) = &self.provider_launch_context {
+            context.validate(self.provider.as_str())?;
+        }
+        validate_provider_secrets(self.provider.as_str(), &self.provider_secret_references)?;
+        if self.provider != FreshProvider::Kilroy && !self.provider_bootstrap_files.is_empty() {
+            return Err(RuntimeError::new(
+                RuntimeErrorCode::InvalidRequest,
+                "raw credential bootstrap is unsupported for named managed providers",
+            ));
         }
         Ok(())
     }
@@ -1144,6 +1842,8 @@ pub struct TerminalLaunchSpec {
     pub provider_bootstrap_files: Vec<ProviderBootstrapFile>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub provider_secret_references: Vec<ProviderSecretReference>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_launch_context: Option<ProviderLaunchContext>,
 }
 
 impl TerminalLaunchSpec {
@@ -1173,6 +1873,27 @@ impl TerminalLaunchSpec {
                 RuntimeErrorCode::InvalidRequest,
                 "managed terminal launch exceeds argv/env/bootstrap bounds",
             ));
+        }
+        validate_managed_terminal_args(&self.mode, &self.args)?;
+        for name in self.env.keys() {
+            let upper = name.to_ascii_uppercase();
+            if [
+                "TOKEN",
+                "API_KEY",
+                "SECRET",
+                "PASSWORD",
+                "CREDENTIAL",
+                "OAUTH",
+                "PROXY",
+            ]
+            .iter()
+            .any(|marker| upper.contains(marker))
+            {
+                return Err(RuntimeError::new(
+                    RuntimeErrorCode::InvalidRequest,
+                    "managed provider secrets must use a OneCLI reference",
+                ));
+            }
         }
         for (name, value) in [
             ("providerModel", self.provider_model.as_deref()),
@@ -1219,22 +1940,214 @@ impl TerminalLaunchSpec {
         }
         for secret in &self.provider_secret_references {
             let source = std::path::Path::new(&secret.source_path);
-            if self.mode != "amplifier"
-                || !source.is_absolute()
-                || secret.source_path.chars().any(char::is_control)
-                || !matches!(
-                    secret.profile,
-                    ProviderSecretProfile::AmplifierOnecliLunarouteGlm53
-                )
-            {
+            if !source.is_absolute() || secret.source_path.chars().any(char::is_control) {
                 return Err(RuntimeError::new(
                     RuntimeErrorCode::InvalidRequest,
                     "managed provider secret reference is unsafe or unsupported",
                 ));
             }
         }
+        validate_provider_secrets(&self.mode, &self.provider_secret_references)?;
+        if let Some(context) = &self.provider_launch_context {
+            context.validate(&self.mode)?;
+        }
+        if matches!(self.mode.as_str(), "claude" | "codex" | "opencode")
+            && !self.provider_bootstrap_files.is_empty()
+        {
+            return Err(RuntimeError::new(
+                RuntimeErrorCode::InvalidRequest,
+                "raw credential bootstrap is unsupported for named managed providers",
+            ));
+        }
         Ok(())
     }
+}
+
+/// Durable argv accepts only provider launch selectors. Credential-bearing
+/// switches must be resolved through the child-only OneCLI path instead.
+pub fn validate_managed_terminal_args(mode: &str, args: &[String]) -> Result<(), RuntimeError> {
+    if !matches!(mode, "claude" | "codex" | "opencode" | "amplifier") {
+        return Ok(()); // Legacy shell and Kilroy launches keep their contract.
+    }
+    let invalid = || {
+        RuntimeError::new(
+            RuntimeErrorCode::InvalidRequest,
+            "managed provider arguments must use an approved non-secret recipe",
+        )
+    };
+    let mut index = 0;
+    while index < args.len() {
+        let flag = args[index].as_str();
+        if mode == "codex" && flag == "resume" && index + 1 < args.len() {
+            if !safe_selector(&args[index + 1]) {
+                return Err(invalid());
+            }
+            index += 2;
+            continue;
+        }
+        if mode == "amplifier"
+            && args[index..].starts_with(&[
+                "session".into(),
+                "resume".into(),
+                "--full-history".into(),
+            ])
+            && index + 3 < args.len()
+        {
+            if !safe_selector(&args[index + 3]) {
+                return Err(invalid());
+            }
+            index += 4;
+            continue;
+        }
+        let value = args.get(index + 1).ok_or_else(invalid)?;
+        let allowed = match (mode, flag) {
+            ("claude", "--settings") => {
+                let digest = format!("{:x}", sha2::Sha256::digest(value.as_bytes()));
+                matches!(
+                    digest.as_str(),
+                    "aa8900bab7bd9bcbb64634d60593a9217c1639b539cea23318122b3428d123c6"
+                        | "d2dcb96c036160b2469bcd732fdc8d767dd481f9c0c864ce47d58ed057652c4d"
+                )
+            }
+            ("claude", "--mcp-config") => matches!(
+                value.as_str(),
+                ".claude/freshell-mcp.json" | "/home/freshell/provider/.claude/freshell-mcp.json"
+            ),
+            ("claude", "--session-id" | "--resume") => safe_selector(value),
+            ("claude", "--model" | "--effort" | "--permission-mode") => safe_selector(value),
+            ("claude", "--plugin-dir") => safe_selector(value),
+            ("codex", "-c") => {
+                matches!(
+                    value.as_str(),
+                    "tui.notification_method=bel"
+                        | "tui.notifications=['agent-turn-complete']"
+                        | "features.apps=false"
+                        | "mcp_servers.freshell.command=\"node\""
+                        | "mcp_servers.freshell.args=[\"/opt/freshell-mcp/server.js\"]"
+                        | "mcp_servers.freshell.env_vars=[\"FRESHELL\", \"FRESHELL_URL\", \"FRESHELL_TOKEN\", \"FRESHELL_TERMINAL_ID\", \"FRESHELL_TAB_ID\", \"FRESHELL_PANE_ID\"]"
+                ) || value
+                    .strip_prefix("model_reasoning_effort=\"")
+                    .and_then(|part| part.strip_suffix('"'))
+                    .is_some_and(safe_selector)
+            }
+            ("codex", "--model" | "--sandbox") => safe_selector(value),
+            ("codex", "--remote") => value
+                .strip_prefix("ws://127.0.0.1:")
+                .is_some_and(|port| port.parse::<u16>().is_ok_and(|port| port > 0)),
+            ("opencode", "--hostname") => value == "127.0.0.1",
+            ("opencode", "--port") => value.parse::<u16>().is_ok(),
+            ("opencode", "--session" | "--model") => safe_selector(value),
+            ("amplifier", "--bundle" | "--provider" | "--model" | "--mode") => safe_selector(value),
+            _ => false,
+        };
+        if !allowed {
+            return Err(invalid());
+        }
+        index += 2;
+    }
+    Ok(())
+}
+
+/// Convert the web process's ordinary launch argv into its durable recipe.
+/// Claude's web-owned MCP file is omitted and its settings are regenerated
+/// from the shipped non-secret recipe before validation.
+pub fn durable_managed_terminal_args(
+    mode: &str,
+    args: Vec<String>,
+    claude_settings: Option<&str>,
+) -> Result<Vec<String>, RuntimeError> {
+    if mode == "codex" {
+        let mut out = Vec::with_capacity(args.len());
+        let mut index = 0;
+        while index < args.len() {
+            if args[index] == "-c" {
+                let value = args.get(index + 1).ok_or_else(|| {
+                    RuntimeError::new(
+                        RuntimeErrorCode::InvalidRequest,
+                        "incomplete Codex config argument",
+                    )
+                })?;
+                if value
+                    .strip_prefix("mcp_servers.freshell.")
+                    .and_then(|value| value.split_once('='))
+                    .is_some_and(|(key, _)| matches!(key, "command" | "args" | "env_vars"))
+                {
+                    index += 2;
+                    continue;
+                }
+            }
+            out.push(args[index].clone());
+            index += 1;
+        }
+        validate_managed_terminal_args(mode, &out)?;
+        return Ok(out);
+    }
+    if mode != "claude" {
+        validate_managed_terminal_args(mode, &args)?;
+        return Ok(args);
+    }
+    let invalid = || {
+        RuntimeError::new(
+            RuntimeErrorCode::InvalidRequest,
+            "managed Claude launch argument is incomplete or unsupported",
+        )
+    };
+    let mut out = Vec::with_capacity(args.len());
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--mcp-config" => {
+                args.get(index + 1).ok_or_else(invalid)?;
+                index += 2;
+            }
+            "--settings" => {
+                args.get(index + 1).ok_or_else(invalid)?;
+                out.push("--settings".into());
+                out.push(claude_settings.ok_or_else(invalid)?.into());
+                index += 2;
+            }
+            _ => {
+                out.push(args[index].clone());
+                index += 1;
+            }
+        }
+    }
+    validate_managed_terminal_args(mode, &out)?;
+    Ok(out)
+}
+
+fn safe_selector(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 256
+        && value.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric()
+                || matches!(byte, b'.' | b'_' | b'-' | b':' | b'/' | b'@' | b'+')
+        })
+}
+
+fn validate_provider_secrets(
+    provider: &str,
+    references: &[ProviderSecretReference],
+) -> Result<(), RuntimeError> {
+    let mut seen = std::collections::BTreeSet::new();
+    for reference in references {
+        if reference.profile.provider() != provider
+            || !std::path::Path::new(&reference.source_path).is_absolute()
+            || reference.source_path.len() > 1024
+            || reference.source_path.chars().any(char::is_control)
+            || !seen.insert(reference.profile as u8)
+            || matches!(
+                reference.profile,
+                ProviderSecretProfile::LegacyAmplifierOnecliAnthropicHaikuLow
+            )
+        {
+            return Err(RuntimeError::new(
+                RuntimeErrorCode::InvalidRequest,
+                "managed OneCLI profile is unsafe or belongs to another provider",
+            ));
+        }
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -2073,6 +2986,77 @@ mod tests {
     use super::*;
 
     #[test]
+    fn durable_terminal_argument_recipe_preserves_provider_options_and_legacy_modes() {
+        for (provider, args) in [
+            (
+                "claude",
+                vec!["--model", "claude-sonnet", "--session-id", "session-1"],
+            ),
+            (
+                "codex",
+                vec![
+                    "-c",
+                    "tui.notification_method=bel",
+                    "--model",
+                    "gpt-6",
+                    "resume",
+                    "thread-1",
+                ],
+            ),
+            (
+                "opencode",
+                vec![
+                    "--hostname",
+                    "127.0.0.1",
+                    "--port",
+                    "0",
+                    "--session",
+                    "ses_1",
+                ],
+            ),
+            (
+                "amplifier",
+                vec!["session", "resume", "--full-history", "session-1"],
+            ),
+        ] {
+            let args = args.into_iter().map(str::to_string).collect::<Vec<_>>();
+            assert_eq!(
+                durable_managed_terminal_args(provider, args.clone(), None).unwrap(),
+                args
+            );
+        }
+        let legacy = vec!["--api-key".into(), "legacy-value".into()];
+        assert_eq!(
+            durable_managed_terminal_args("kilroy", legacy.clone(), None).unwrap(),
+            legacy
+        );
+    }
+
+    #[test]
+    fn durable_terminal_argument_recipe_rejects_separated_and_inline_credentials() {
+        for provider in ["claude", "codex", "opencode", "amplifier"] {
+            for args in [
+                vec!["--api-key".into(), "fixture-secret-bytes".into()],
+                vec!["--api-key=fixture-secret-bytes".into()],
+            ] {
+                assert!(
+                    durable_managed_terminal_args(provider, args, None).is_err(),
+                    "{provider}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn claude_provider_native_plugin_argument_survives_durable_recipe() {
+        let args = vec!["--plugin-dir".into(), "/workspace/claude-plugin".into()];
+        assert_eq!(
+            durable_managed_terminal_args("claude", args.clone(), None).unwrap(),
+            args
+        );
+    }
+
+    #[test]
     fn ids_reject_control_characters_and_are_distinct() {
         assert!(SoulId::parse("bad\nvalue").is_err());
         assert_ne!(SoulId::new(), SoulId::new());
@@ -2262,6 +3246,7 @@ mod tests {
             provider_permission_mode: Some("on-request".into()),
             provider_bootstrap_files: Vec::new(),
             provider_secret_references: Vec::new(),
+            provider_launch_context: None,
         };
         assert!(spec.validate().is_ok());
         spec.provider_model = Some("bad\0model".into());
@@ -2293,11 +3278,13 @@ mod tests {
             permission_mode: Some("ask".into()),
             sandbox: Some("workspace-write".into()),
             native_session_id: Some("native-one".into()),
+            plugins: None,
+            model_selection: None,
+            session_ref: None,
             fixture_transport: None,
-            provider_bootstrap_files: vec![ProviderBootstrapFile {
-                source_path: "/credential-reference-only".into(),
-                provider_relative_path: ".provider/config.json".into(),
-            }],
+            provider_bootstrap_files: Vec::new(),
+            provider_secret_references: Vec::new(),
+            provider_launch_context: None,
         }
     }
 
@@ -2438,7 +3425,13 @@ mod tests {
             RuntimeErrorCode::InvalidRequest
         );
 
-        let mut unsafe_agent = fresh_agent_launch(FreshProvider::Opencode, "freshopencode");
+        let mut unsafe_agent = fresh_agent_launch(FreshProvider::Kilroy, "kilroy");
+        unsafe_agent
+            .provider_bootstrap_files
+            .push(ProviderBootstrapFile {
+                source_path: "/credential-reference-only".into(),
+                provider_relative_path: ".provider/config.json".into(),
+            });
         unsafe_agent.provider_bootstrap_files[0].provider_relative_path =
             "../../run/freshell/secret".into();
         assert_eq!(

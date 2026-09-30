@@ -22,6 +22,7 @@
  */
 import fs from 'node:fs'
 import path from 'node:path'
+import { PROVIDER_PARITY_CASE_IDS } from './provider-parity-receipt.js'
 
 export const PENDING_LIVE_PROVIDER_CERTIFICATION = 'pending_live_provider_certification'
 export const DEFERRED_CASE_STATUS = 'DEFERRED_LIVE_PROVIDER_CERTIFICATION'
@@ -42,6 +43,7 @@ export type CaseStatus = 'PASS' | 'FAIL' | 'BLOCKED' | typeof DEFERRED_CASE_STAT
 export type ProviderRow = {
   provider: string
   certificationState: CertificationState
+  qualificationReady?: boolean
   managedEnabled: boolean
   durableRecoveryEnabled: boolean
   managedModes: string[]
@@ -54,6 +56,8 @@ export type ProviderRow = {
 export type FreshAgentModeRow = {
   mode: string
   provider: string
+  qualificationReady?: boolean
+  releaseDeferralReason?: string
   runtimeVariant: string
   hostOwnedImplementation: boolean
   enabledInReleaseScope: boolean
@@ -130,6 +134,10 @@ export function freshAgentReleaseScopeViolations(
     violations.push('releaseScope.freshAgentEnabled must exactly match the per-mode release scope')
   }
   for (const row of rows) {
+    if (!row.enabledInReleaseScope
+      && row.releaseDeferralReason !== PENDING_LIVE_PROVIDER_CERTIFICATION) {
+      violations.push(`${row.mode} requires an explicit live certification deferral`)
+    }
     if (!row.hostOwnedImplementation && row.enabledInReleaseScope) {
       violations.push(`${row.mode} is released without a host-owned implementation`)
     }
@@ -362,7 +370,7 @@ export function providerCertificationCaseIds(manifest: CapabilityManifest): stri
 export const RELEASE_SCOPE_CASE_ID = 'PC-SCOPE'
 
 export function certificationCaseIds(manifest: CapabilityManifest): string[] {
-  return [RELEASE_SCOPE_CASE_ID, ...providerCertificationCaseIds(manifest)]
+  return [RELEASE_SCOPE_CASE_ID, ...PROVIDER_PARITY_CASE_IDS, ...providerCertificationCaseIds(manifest)]
 }
 
 export type ProductionCertificationStatus = {

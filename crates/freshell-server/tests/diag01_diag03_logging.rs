@@ -128,6 +128,7 @@ async fn diag01_diag03_operator_experience() {
         .env("PORT", port.to_string())
         .env("AUTH_TOKEN", &token)
         .env("FRESHELL_BIND_HOST", "127.0.0.1")
+        .env_remove("FRESHELL_MANAGED_RUNTIME_V1")
         .env("HOME", &home_path)
         .env("FRESHELL_HOME", &home_path)
         // Deliberately tiny so a modest request loop forces multiple
