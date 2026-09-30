@@ -43,6 +43,7 @@ export type CaseStatus = 'PASS' | 'FAIL' | 'BLOCKED' | typeof DEFERRED_CASE_STAT
 export type ProviderRow = {
   provider: string
   certificationState: CertificationState
+  qualificationReady?: boolean
   managedEnabled: boolean
   durableRecoveryEnabled: boolean
   managedModes: string[]
@@ -55,6 +56,8 @@ export type ProviderRow = {
 export type FreshAgentModeRow = {
   mode: string
   provider: string
+  qualificationReady?: boolean
+  releaseDeferralReason?: string
   runtimeVariant: string
   hostOwnedImplementation: boolean
   enabledInReleaseScope: boolean
@@ -131,6 +134,10 @@ export function freshAgentReleaseScopeViolations(
     violations.push('releaseScope.freshAgentEnabled must exactly match the per-mode release scope')
   }
   for (const row of rows) {
+    if (!row.enabledInReleaseScope
+      && row.releaseDeferralReason !== PENDING_LIVE_PROVIDER_CERTIFICATION) {
+      violations.push(`${row.mode} requires an explicit live certification deferral`)
+    }
     if (!row.hostOwnedImplementation && row.enabledInReleaseScope) {
       violations.push(`${row.mode} is released without a host-owned implementation`)
     }

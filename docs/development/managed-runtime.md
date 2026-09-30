@@ -18,8 +18,7 @@ until their real live campaigns pass. The checked-in capability manifest is
 the source of truth for managed terminal admission. All hosted fresh-agent
 modes are disabled in this release. Their separate
 `FRESHELL_MANAGED_FRESH_AGENT_V1=1` opt-in is for isolated qualification only:
-it does not yet share the normal ownership, identity, and naming admission
-path and must remain off in the release. Historical sections below describe
+their live candidate-bound certification receipts are still pending. Historical sections below describe
 adapter construction and earlier phase sequencing; they do not override the
 current release flags.
 
@@ -32,6 +31,7 @@ are tracked on separate axes in
 | Field | Meaning |
 |---|---|
 | `certificationState` | Whether a live, candidate-bound certification campaign has actually passed for this provider. One of `certified`, `pending_live_provider_certification`, `not_applicable`. |
+| `qualificationReady` | Whether the adapter can run in an explicitly selected qualification build. It does not enable a release route. |
 | `managedEnabled` | Whether managed routing may own this provider at all. |
 | `durableRecoveryEnabled` | Whether a durable-soul recovery promise is made for it. |
 
@@ -326,6 +326,12 @@ reasoning remains the provider's native default. Raw OAuth and the obsolete
 Anthropic/Haiku profile fail closed. Every source is canonicalized and admitted
 by the runtime broker as an exact read-only single-file mount. The registry and
 Docker create JSON contain only canonical references, never secret bytes.
+When a managed provider needs a named secret, configure its approved OneCLI
+grant before launch. The web controller passes only the grant reference. The
+session host resolves the grant for the provider child and keeps its values out
+of the supervisor registry, launch receipts, and logs. This secret transport
+does not change the provider's ordinary MCP, configuration, plugin, root, or
+operation behavior.
 
 The supported Phase 2 backend is rootless Docker. Its bind-mount ownership maps
 the host user's workspace to container uid/gid 0. Freshell therefore keeps the
@@ -338,11 +344,14 @@ inside the provider PTY and fails if that boundary changes. Git receives an
 ephemeral process-local `safe.directory` for the already-approved workspace; no
 global git config is modified.
 
-Managed providers strip web-owned MCP/rebind machinery. Managed Claude omits
-the legacy temporary `--mcp-config`; managed OpenCode omits the host rebind
-plugin, project-local Freshell MCP mutation, host-side SQLite locator, and
-web-side loopback SSE lane. OpenCode runs one pinned provider runtime per soul
-on private loopback, with provider-native identity learned inside the enclosure.
+Managed providers retain ordinary provider capabilities: configured MCP servers,
+provider config files (including `opencode.json` and `opencode.jsonc`), plugins,
+approved user-provider roots, and provider-native operations. Freshell renders
+its own MCP connection for each execution target, including the Codex TUI and
+durable session-host app-server. The provider still runs in a soul-owned home;
+OpenCode runs one pinned runtime per soul on private loopback, with native
+identity learned inside that runtime. The web controller does not own provider
+processes or reach into private provider state.
 The managed fresh-agent adapter routes create/send, interrupt, permission
 resolutions, compact, rollback, event history, read-only transcript capture, and
 supported provider-native fork operations through the session host. The Rust web

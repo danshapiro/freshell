@@ -25,6 +25,11 @@ shell are `certified`; the legacy extension providers are `not_applicable`. The
 manifest's `certification` block names the deferred set, the landing gate that
 may defer it, and the production gate that stays
 `BLOCKED_PENDING_LIVE_PROVIDER_CERTIFICATION` until it is empty.
+Qualification builds admit the ready Claude CLI, Codex CLI, and Amplifier
+adapters and the fresh Claude, Codex, and OpenCode modes. Their ordinary MCP,
+provider configuration, plugins, approved user roots, and native operations
+remain available. Qualification readiness does not enable a release route;
+only the missing live certification receipts defer release.
 
 ## Modes
 
@@ -154,6 +159,11 @@ The keys file is parsed, never sourced; host-local OneCLI control URLs are not
 forwarded into the container, while provider/proxy secret values exist only in
 the child environment. A raw OAuth file, a different reference, malformed
 transport URL, or an unapproved model fails closed.
+Configure that private file through OneCLI before selecting Amplifier for a
+managed qualification run. The controller stores its canonical path reference;
+the session host resolves approved values only into the Amplifier child process.
+The supervisor registry and logs never receive the secret values. Ordinary
+Amplifier bundle MCP remains available when the bundle mounts `tool-mcp`.
 
 These values and bootstrap paths make a live campaign reproducible. They do
 not certify or enable Claude, Codex, or Amplifier; the capability manifest

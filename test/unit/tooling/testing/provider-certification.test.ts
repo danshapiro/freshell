@@ -53,6 +53,16 @@ describe('checked-in provider certification manifest', () => {
     expect(certifiedDurableProviders(manifest)).toEqual(['opencode'])
   })
 
+  it('keeps adapter readiness independent of live release certification', () => {
+    const manifest = loadCapabilityManifest(repoRoot)
+    for (const provider of ['claude', 'codex', 'amplifier']) {
+      const row = manifest.providers.find((candidate) => candidate.provider === provider)
+      expect(row?.qualificationReady).toBe(true)
+      expect(row?.certificationState).toBe(PENDING_LIVE_PROVIDER_CERTIFICATION)
+      expect(row?.managedEnabled).toBe(false)
+    }
+  })
+
   it('publishes a typed deferred-provider manifest with the live gate for each', () => {
     const rows = deferredProviderManifest(loadCapabilityManifest(repoRoot))
     expect(rows).toHaveLength(3)

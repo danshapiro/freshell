@@ -233,6 +233,10 @@ OpenCode permissions are controlled by the OpenCode configuration for the OS use
 
 Amplifier loads the freshell MCP only if its bundle mounts `tool-mcp` (the default `anchors` bundle does not). Add `tool-mcp` to your Amplifier bundle to enable orchestration.
 
+For managed Amplifier sessions, set up the approved private
+`~/.amplifier/keys.env` through OneCLI. Freshell reads that reference when the
+session starts and gives the provider child only the values it needs.
+
 ### Standalone CLI and MCP client
 
 The Rust server is the only Freshell HTTP/WebSocket backend. The Node programs

@@ -1,9 +1,19 @@
-//! Compile-time fenced routing policy for pending live-provider qualification.
+//! Compile-time fenced routing policy for ready adapters awaiting live certification.
 
 use std::collections::BTreeSet;
 
 pub const QUALIFICATION_PROVIDER_ENV: &str = "FRESHELL_MANAGED_PROVIDER_QUALIFICATION";
-const PENDING_TERMINAL_PROVIDERS: &[&str] = &["claude", "codex", "amplifier"];
+fn pending_terminal_adapters() -> Vec<&'static str> {
+    crate::PROVIDER_CAPABILITIES
+        .iter()
+        .filter(|capability| {
+            capability.qualification_ready
+                && capability.certification_state
+                    == crate::CertificationState::PendingLiveProviderCertification
+        })
+        .map(|capability| capability.provider)
+        .collect()
+}
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct QualificationPolicy {
@@ -22,18 +32,16 @@ pub fn qualification_policy_from_value(value: Option<&str>) -> Result<Qualificat
     };
     if value.is_empty() {
         return Err(format!(
-            "{QUALIFICATION_PROVIDER_ENV} must name one or more comma-separated pending terminal providers"
+            "{QUALIFICATION_PROVIDER_ENV} must name one or more comma-separated ready terminal adapters"
         ));
     }
+    let allowed = pending_terminal_adapters();
     let mut requested = BTreeSet::new();
     for provider in value.split(',') {
-        if provider.is_empty()
-            || provider.trim() != provider
-            || !PENDING_TERMINAL_PROVIDERS.contains(&provider)
-        {
+        if provider.is_empty() || provider.trim() != provider || !allowed.contains(&provider) {
             return Err(format!(
                 "{QUALIFICATION_PROVIDER_ENV} contains unsupported provider {provider:?}; allowed values are {}",
-                PENDING_TERMINAL_PROVIDERS.join(",")
+                allowed.join(",")
             ));
         }
         if !requested.insert(provider.to_string()) {
@@ -71,6 +79,19 @@ mod tests {
     use super::*;
 
     #[test]
+    fn requested_terminal_adapters_are_ready_independently_of_release_certification() {
+        for provider in ["claude", "codex", "amplifier"] {
+            let capability = crate::capability(provider).unwrap();
+            assert!(capability.qualification_ready, "{provider}");
+            assert_eq!(
+                capability.certification_state,
+                crate::CertificationState::PendingLiveProviderCertification
+            );
+            assert!(!capability.managed_enabled);
+        }
+    }
+
+    #[test]
     fn qualification_selection_is_bounded_to_pending_terminal_providers() {
         for value in [
             "shell",
@@ -104,7 +125,7 @@ mod tests {
     #[test]
     fn ordinary_build_ignores_the_qualification_environment_switch() {
         let policy = qualification_policy_from_value(Some("claude,codex,amplifier")).unwrap();
-        for provider in PENDING_TERMINAL_PROVIDERS {
+        for provider in pending_terminal_adapters() {
             assert!(!policy.permits(provider));
         }
     }

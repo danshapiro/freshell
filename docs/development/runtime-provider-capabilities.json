@@ -5,6 +5,7 @@
     {
       "provider": "shell",
       "certificationState": "certified",
+      "qualificationReady": true,
       "managedEnabled": true,
       "durableRecoveryEnabled": false,
       "managedModes": [
@@ -28,6 +29,7 @@
     {
       "provider": "claude",
       "certificationState": "pending_live_provider_certification",
+      "qualificationReady": true,
       "managedEnabled": false,
       "durableRecoveryEnabled": false,
       "managedModes": [
@@ -53,6 +55,7 @@
     {
       "provider": "opencode",
       "certificationState": "certified",
+      "qualificationReady": true,
       "managedEnabled": true,
       "durableRecoveryEnabled": true,
       "managedModes": [
@@ -78,6 +81,7 @@
     {
       "provider": "codex",
       "certificationState": "pending_live_provider_certification",
+      "qualificationReady": true,
       "managedEnabled": false,
       "durableRecoveryEnabled": false,
       "managedModes": [
@@ -103,6 +107,7 @@
     {
       "provider": "amplifier",
       "certificationState": "pending_live_provider_certification",
+      "qualificationReady": true,
       "managedEnabled": false,
       "durableRecoveryEnabled": false,
       "managedModes": [
@@ -128,6 +133,7 @@
     {
       "provider": "gemini",
       "certificationState": "not_applicable",
+      "qualificationReady": false,
       "managedEnabled": false,
       "durableRecoveryEnabled": false,
       "managedModes": [
@@ -148,6 +154,7 @@
     {
       "provider": "kimi",
       "certificationState": "not_applicable",
+      "qualificationReady": false,
       "managedEnabled": false,
       "durableRecoveryEnabled": false,
       "managedModes": [
@@ -170,6 +177,8 @@
     {
       "mode": "freshclaude",
       "provider": "claude",
+      "qualificationReady": true,
+      "releaseDeferralReason": "pending_live_provider_certification",
       "runtimeVariant": "claude-agent-sdk",
       "hostOwnedImplementation": true,
       "enabledInReleaseScope": false,
@@ -180,6 +189,8 @@
     {
       "mode": "kilroy",
       "provider": "claude",
+      "qualificationReady": true,
+      "releaseDeferralReason": "pending_live_provider_certification",
       "runtimeVariant": "kilroy-claude-agent-sdk",
       "hostOwnedImplementation": true,
       "enabledInReleaseScope": false,
@@ -190,6 +201,8 @@
     {
       "mode": "freshcodex",
       "provider": "codex",
+      "qualificationReady": true,
+      "releaseDeferralReason": "pending_live_provider_certification",
       "runtimeVariant": "codex-app-server",
       "hostOwnedImplementation": true,
       "enabledInReleaseScope": false,
@@ -200,6 +213,8 @@
     {
       "mode": "freshopencode",
       "provider": "opencode",
+      "qualificationReady": true,
+      "releaseDeferralReason": "pending_live_provider_certification",
       "runtimeVariant": "opencode-per-soul-http",
       "hostOwnedImplementation": true,
       "enabledInReleaseScope": false,
@@ -237,7 +252,7 @@
         "claude"
       ],
       "policy": "blocked",
-      "identityRule": "FRESH_AGENT_GLOBALLY_DISABLED_IN_RELEASE_SCOPE",
+      "identityRule": "PENDING_LIVE_PROVIDER_CERTIFICATION",
       "enabledInReleaseScope": false
     },
     {
@@ -247,7 +262,7 @@
         "claude"
       ],
       "policy": "blocked",
-      "identityRule": "FRESH_AGENT_GLOBALLY_DISABLED_IN_RELEASE_SCOPE",
+      "identityRule": "PENDING_LIVE_PROVIDER_CERTIFICATION",
       "enabledInReleaseScope": false
     },
     {
@@ -257,7 +272,7 @@
         "opencode"
       ],
       "policy": "blocked",
-      "identityRule": "FRESH_AGENT_GLOBALLY_DISABLED_IN_RELEASE_SCOPE",
+      "identityRule": "PENDING_LIVE_PROVIDER_CERTIFICATION",
       "enabledInReleaseScope": false
     },
     {
@@ -267,7 +282,7 @@
         "codex"
       ],
       "policy": "blocked",
-      "identityRule": "FRESH_AGENT_GLOBALLY_DISABLED_IN_RELEASE_SCOPE",
+      "identityRule": "PENDING_LIVE_PROVIDER_CERTIFICATION",
       "enabledInReleaseScope": false
     },
     {

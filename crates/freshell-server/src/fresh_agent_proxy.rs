@@ -459,9 +459,10 @@ impl HostedFreshAgentProxy {
                 &cwd,
                 Some(mcp_capability.clone()),
             );
-        // Fresh agents use the direct provider transports. Those transports
-        // currently do not inject Freshell's terminal MCP server. Retain the
-        // staged user root, while preserving that provider-visible behavior.
+        // Fresh agents use the direct provider transports, which currently do
+        // not inject Freshell's terminal MCP server. Retain ordinary provider
+        // MCP/config files, plugins, and the staged user root; only remove
+        // terminal-specific Freshell injection to match the direct route.
         if let Some(context) = provider_launch_context.as_mut() {
             match &mut context.preparation {
                 freshell_runtime_protocol::ProviderPreparation::Claude { mcp_args } => {

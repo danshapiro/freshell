@@ -76,6 +76,9 @@ pub struct ProviderCapability {
     pub provider: &'static str,
     /// Certification is the outer bound on every other release promise below.
     pub certification_state: CertificationState,
+    /// The adapter can run in an explicitly selected qualification build.
+    /// This does not authorize a release claim.
+    pub qualification_ready: bool,
     pub managed_enabled: bool,
     /// True only when Phase 3 can prove exact durable conversation recovery.
     /// A managed shell remains useful but is intentionally not counted as an
@@ -103,6 +106,7 @@ pub const PROVIDER_CAPABILITIES: &[ProviderCapability] = &[
     ProviderCapability {
         provider: "shell",
         certification_state: CertificationState::Certified,
+        qualification_ready: true,
         managed_enabled: true,
         durable_recovery_enabled: false,
         recovery_paths: &[RecoveryPath::Reattach, RecoveryPath::PristineSeed],
@@ -120,6 +124,7 @@ pub const PROVIDER_CAPABILITIES: &[ProviderCapability] = &[
     ProviderCapability {
         provider: "claude",
         certification_state: CertificationState::PendingLiveProviderCertification,
+        qualification_ready: true,
         managed_enabled: false,
         durable_recovery_enabled: false,
         recovery_paths: &[
@@ -142,6 +147,7 @@ pub const PROVIDER_CAPABILITIES: &[ProviderCapability] = &[
     ProviderCapability {
         provider: "opencode",
         certification_state: CertificationState::Certified,
+        qualification_ready: true,
         managed_enabled: true,
         durable_recovery_enabled: true,
         recovery_paths: &[
@@ -164,6 +170,7 @@ pub const PROVIDER_CAPABILITIES: &[ProviderCapability] = &[
     ProviderCapability {
         provider: "codex",
         certification_state: CertificationState::PendingLiveProviderCertification,
+        qualification_ready: true,
         managed_enabled: false,
         durable_recovery_enabled: false,
         recovery_paths: &[
@@ -186,6 +193,7 @@ pub const PROVIDER_CAPABILITIES: &[ProviderCapability] = &[
     ProviderCapability {
         provider: "amplifier",
         certification_state: CertificationState::PendingLiveProviderCertification,
+        qualification_ready: true,
         managed_enabled: false,
         durable_recovery_enabled: false,
         recovery_paths: &[
@@ -208,6 +216,7 @@ pub const PROVIDER_CAPABILITIES: &[ProviderCapability] = &[
     ProviderCapability {
         provider: "gemini",
         certification_state: CertificationState::NotApplicable,
+        qualification_ready: false,
         managed_enabled: false,
         durable_recovery_enabled: false,
         recovery_paths: &[],
@@ -225,6 +234,7 @@ pub const PROVIDER_CAPABILITIES: &[ProviderCapability] = &[
     ProviderCapability {
         provider: "kimi",
         certification_state: CertificationState::NotApplicable,
+        qualification_ready: false,
         managed_enabled: false,
         durable_recovery_enabled: false,
         recovery_paths: &[],
@@ -1549,6 +1559,11 @@ mod tests {
                 entry["certificationState"],
                 capability.certification_state.as_str(),
                 "manifest certification state drifted for {}",
+                capability.provider
+            );
+            assert_eq!(
+                entry["qualificationReady"], capability.qualification_ready,
+                "manifest qualification readiness drifted for {}",
                 capability.provider
             );
         }

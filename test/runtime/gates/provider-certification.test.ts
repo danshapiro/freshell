@@ -244,6 +244,7 @@ function assertNoProductionPromise(
   manifest: CapabilityManifest,
   row: ProviderRow,
 ): void {
+  h.assert(caseId, row.qualificationReady === true, `${row.provider} adapter is ready for explicit qualification`, row)
   h.assert(caseId, row.managedEnabled === false, `${row.provider} is not managed-enabled while uncertified`, row)
   h.assert(caseId, row.durableRecoveryEnabled === false, `${row.provider} claims no durable recovery while uncertified`, row)
   h.assert(caseId, row.blockedReason === 'PENDING_LIVE_QUALIFICATION', `${row.provider} carries the typed pending reason`, row)
