@@ -128,7 +128,12 @@ impl DeterministicFreshAgentTransport {
             command
                 .arg("fresh-agent-fixture-worker")
                 .arg("--provider")
-                .arg(self.provider.as_str());
+                .arg(self.provider.as_str())
+                .arg("--observation-file")
+                .arg(self.state_dir.join("provider-child-observation.json"));
+            if let Some(secrets) = freshell_platform::managed_child_secrets::snapshot() {
+                command.envs(secrets);
+            }
             command
         };
         command.kill_on_drop(true);
@@ -300,13 +305,32 @@ impl FreshAgentTransport for DeterministicFreshAgentTransport {
 }
 
 pub(crate) async fn run_worker(args: &[String]) -> Result<(), String> {
-    if args.len() != 2 || args[0] != "--provider" {
+    if args.len() != 4 || args[0] != "--provider" || args[2] != "--observation-file" {
         return Err("fresh-agent fixture worker requires --provider <exact-provider>".into());
     }
     match args[1].as_str() {
         "claude" | "kilroy" | "codex" | "opencode" => {}
         _ => return Err("fresh-agent fixture worker provider is not allowlisted".into()),
     }
+    let child_key = match args[1].as_str() {
+        "claude" => "ANTHROPIC_API_KEY",
+        "codex" => "OPENAI_API_KEY",
+        "opencode" => "OPENROUTER_API_KEY",
+        _ => "ANTHROPIC_API_KEY",
+    };
+    let child_digest = std::env::var(child_key)
+        .ok()
+        .map(|value| format!("{:x}", Sha256::digest(value.as_bytes())));
+    fs::write(
+        &args[3],
+        serde_json::to_vec(&json!({
+            "argv": ["fresh-agent-fixture-worker", "--provider", args[1]],
+            "env": {(child_key): child_digest},
+            "onecliControlPresent": std::env::var_os("ONECLI_URL").is_some(),
+        }))
+        .map_err(|error| format!("record redacted fixture worker observation: {error}"))?,
+    )
+    .map_err(|error| format!("write redacted fixture worker observation: {error}"))?;
     loop {
         tokio::time::sleep(Duration::from_secs(3600)).await;
     }

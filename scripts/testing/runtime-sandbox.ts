@@ -86,6 +86,11 @@ export function phase2BootstrapFiles(
   ]) {
     addRegularFile(env[key]?.trim())
   }
+  for (const provider of ['CLAUDE', 'CODEX', 'OPENCODE']) {
+    for (const suffix of ['ENV_FILE', 'AUTH_FILE']) {
+      addRegularFile(env[`FRESHELL_MANAGED_${provider}_ONECLI_${suffix}`]?.trim())
+    }
+  }
   for (const grant of configuredAmplifierOnecliGrantFiles(env)) files.add(grant)
   return [...files]
 }

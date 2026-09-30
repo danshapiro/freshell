@@ -7,6 +7,7 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 
 import { WS_PROTOCOL_VERSION } from '../../../shared/ws-protocol.js'
 import { ManagedRuntimeBrowserRig } from '../../e2e-browser/helpers/managed-runtime.js'
+import { exposeGrantsToHarness, fakeOnecliGrants, withMissingGrant } from './provider-parity-onecli.js'
 
 const root = path.resolve(import.meta.dirname, '../../..')
 const providers = [
@@ -68,13 +69,18 @@ describe('hosted fresh-agent provider inputs', () => {
   let rig: ManagedRuntimeBrowserRig
   let opencodeProject: string
   let homeDir: string
+  let onecli: ReturnType<typeof fakeOnecliGrants>
+  let restoreOnecliEnvironment: (() => void) | undefined
   const wires: FreshWire[] = []
 
   beforeAll(async () => {
     homeDir = fs.mkdtempSync(path.join(os.tmpdir(), 'fresh-provider-parity-home-'))
+    onecli = fakeOnecliGrants(providers.map(row => row.provider))
+    restoreOnecliEnvironment = exposeGrantsToHarness(onecli.serverEnv)
     const xdgConfigHome = path.join(homeDir, 'custom-xdg')
     rig = new ManagedRuntimeBrowserRig(root, 2, {
       FRESHELL_BIND_HOST: '0.0.0.0', XDG_CONFIG_HOME: xdgConfigHome,
+      ...onecli.serverEnv,
     }, { XDG_CONFIG_HOME: xdgConfigHome }, 'test', {
       enabledProviders: [],
       providerSettings: {},
@@ -118,6 +124,8 @@ describe('hosted fresh-agent provider inputs', () => {
     }
     if (opencodeProject) fs.rmSync(opencodeProject, { recursive: true, force: true })
     if (homeDir) fs.rmSync(homeDir, { recursive: true, force: true })
+    if (onecli) fs.rmSync(onecli.directory, { recursive: true, force: true })
+    restoreOnecliEnvironment?.()
   }, 180_000)
 
   it.each(providers)('$sessionType retains create settings and exact native resume', async row => {
@@ -126,13 +134,14 @@ describe('hosted fresh-agent provider inputs', () => {
     const requestId = `fresh-parity-${randomUUID()}`
     const namingHandle = `nh-${randomUUID()}`
     const cwd = row.provider === 'opencode' ? opencodeProject : root
-    wire.send({
+    const createRequest = {
       type: 'freshAgent.create', requestId, sessionType: row.sessionType,
       provider: row.provider, cwd, model: 'fixture-model',
       modelSelection: { kind: 'exact', modelId: 'fixture-model' },
       effort: 'low', permissionMode: 'default', sandbox: 'workspace-write',
       plugins: ['fixture-plugin'], namingHandle, tabId: `tab-${requestId}`,
-    })
+    }
+    wire.send(createRequest)
     const created = await wire.wait(frame => frame.requestId === requestId
       && (frame.type === 'freshAgent.created' || frame.type === 'freshAgent.create.failed'))
     if (created.type === 'freshAgent.create.failed') {
@@ -157,10 +166,21 @@ describe('hosted fresh-agent provider inputs', () => {
     })
     expect(profile.providerLaunchContext.config.length).toBeGreaterThan(0)
     expect(profile.providerLaunchContext.mcpCapability.grantId).toMatch(/^grant-/)
-    for (const reference of profile.providerSecretReferences ?? []) {
+    expect(profile.providerSecretReferences).toHaveLength(1)
+    for (const reference of profile.providerSecretReferences) {
       expect(reference.sourcePath).toMatch(/onecli/)
       expect(reference.profile).toMatch(new RegExp(`^${row.provider}_onecli_`))
     }
+    const childObservation = await waitFor('redacted fresh provider worker observation', () => {
+      try {
+        return JSON.parse(rig.ownedProviderExec(view.containerId!, [
+          'cat', '/home/freshell/provider/.freshell-fixture/provider-child-observation.json',
+        ]))
+      } catch { return undefined }
+    })
+    expect(childObservation.argv).toEqual(['fresh-agent-fixture-worker', '--provider', row.provider])
+    expect(childObservation.env[onecli.childKeys[row.provider]]).toBe(onecli.childDigests[row.provider])
+    expect(childObservation.onecliControlPresent).toBe(false)
     expect(JSON.stringify(recorded)).not.toContain('fixture-secret-byte')
     const preparation = profile.providerLaunchContext.preparation
     if (row.provider === 'claude') {
@@ -217,6 +237,16 @@ describe('hosted fresh-agent provider inputs', () => {
       && (frame.type === 'freshAgent.created' || frame.type === 'freshAgent.create.failed'))
     expect(resumed.type, JSON.stringify(resumed)).toBe('freshAgent.created')
     expect(resumed.sessionRef?.sessionId).toBe(recorded.nativeSessionId)
+    let unapprovedReferenceRejected = false
+    await withMissingGrant(onecli.grants[row.provider], async () => {
+      const badRequestId = `bad-grant-${randomUUID()}`
+      wire.send({ ...createRequest, requestId: badRequestId,
+        namingHandle: `nh-${badRequestId}`, tabId: `tab-${badRequestId}` })
+      const bad = await wire.wait(frame => frame.requestId === badRequestId
+        && (frame.type === 'freshAgent.created' || frame.type === 'freshAgent.create.failed'))
+      unapprovedReferenceRejected = bad.type === 'freshAgent.create.failed'
+    })
+    expect(unapprovedReferenceRejected).toBe(true)
     const evidenceDir = process.env.FRESHELL_PROVIDER_PARITY_ROWS_DIR
     if (evidenceDir) {
       const sentinel = 'fixture-secret-byte'
@@ -234,6 +264,14 @@ describe('hosted fresh-agent provider inputs', () => {
         configCount: profile.providerLaunchContext.config.length,
         plugin: profile.plugins,
         secretHygiene: { registry: true, supervisor: true, eventJournal: true, docker: true },
+        onecli: {
+          approvedReference: profile.providerSecretReferences[0].sourcePath === onecli.grants[row.provider]
+            && childObservation.env[onecli.childKeys[row.provider]] === onecli.childDigests[row.provider],
+          unapprovedReferenceRejected,
+          referenceProfile: profile.providerSecretReferences[0].profile,
+          childEnvironmentKey: onecli.childKeys[row.provider],
+          childValueSha256: childObservation.env[onecli.childKeys[row.provider]],
+        },
       }))
     }
   }, 240_000)

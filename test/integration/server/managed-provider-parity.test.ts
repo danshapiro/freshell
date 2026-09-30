@@ -7,6 +7,7 @@ import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest'
 
 import { WS_PROTOCOL_VERSION } from '../../../shared/ws-protocol.js'
 import { ManagedRuntimeBrowserRig } from '../../e2e-browser/helpers/managed-runtime.js'
+import { exposeGrantsToHarness, fakeOnecliGrants, withMissingGrant } from './provider-parity-onecli.js'
 
 type Provider = 'claude' | 'codex' | 'opencode' | 'amplifier'
 type RecordRow = { provider: Provider; kind: 'launch' | 'mcp' | 'identity'; [key: string]: any }
@@ -226,6 +227,8 @@ describe('ordinary and managed terminal provider parity', () => {
   let webHome: string
   let xdgConfigHome: string
   let inheritedFreshellUrl: string | undefined
+  let onecli: ReturnType<typeof fakeOnecliGrants>
+  let restoreOnecliEnvironment: (() => void) | undefined
   const sockets: TerminalWire[] = []
 
   beforeAll(async () => {
@@ -233,6 +236,8 @@ describe('ordinary and managed terminal provider parity', () => {
     delete process.env.FRESHELL_URL
     workspace = fs.mkdtempSync(path.join(root, '.provider-parity-'))
     webHome = fs.mkdtempSync(path.join(os.tmpdir(), 'freshell-parity-home-'))
+    onecli = fakeOnecliGrants(providers)
+    restoreOnecliEnvironment = exposeGrantsToHarness(onecli.serverEnv)
     xdgConfigHome = path.join(webHome, 'custom-xdg')
     fs.mkdirSync(path.join(xdgConfigHome, 'opencode'), { recursive: true })
     fs.writeFileSync(path.join(xdgConfigHome, 'opencode/tui.jsonc'), '{ // home-selected\n  "plugin": ["file://home-selected-tui.js"]\n}\n')
@@ -270,6 +275,7 @@ describe('ordinary and managed terminal provider parity', () => {
         type: 'local', command: ['vendor-tool', '--token', nestedSecretMarker],
         endpoint: `https://${nestedSecretMarker}.example`,
       } } }),
+      ...onecli.serverEnv,
       ...Object.fromEntries(
         providers.map(provider => [`${provider.toUpperCase()}_CMD`, path.join(workspace, `parity-${provider}`)]),
       ),
@@ -326,6 +332,8 @@ describe('ordinary and managed terminal provider parity', () => {
     } finally {
       if (workspace) fs.rmSync(workspace, { recursive: true, force: true })
       if (webHome) fs.rmSync(webHome, { recursive: true, force: true })
+      if (onecli) fs.rmSync(onecli.directory, { recursive: true, force: true })
+      restoreOnecliEnvironment?.()
       if (inheritedFreshellUrl === undefined) delete process.env.FRESHELL_URL
       else process.env.FRESHELL_URL = inheritedFreshellUrl
     }
@@ -355,6 +363,9 @@ describe('ordinary and managed terminal provider parity', () => {
       observed.push(launch)
       if (managed) {
         managedTerminalId = terminalId
+        expect(launch.onecliChildDigest).toBe(onecli.childDigests[provider])
+      } else {
+        expect(launch.onecliChildDigest).not.toBe(onecli.childDigests[provider])
       }
       if (provider === 'opencode' && managed) {
         const view = await waitFor('managed OpenCode container for secret inspection', async () => {
@@ -452,14 +463,27 @@ describe('ordinary and managed terminal provider parity', () => {
       if (!resumedMcp.error) expect(resumedMcp.call).toEqual(mcpResults[1].call)
       const managedView = after.containerId!
       const inspect = JSON.stringify(rig.runtime.inspectContainer(managedView))
+      const approvedReference = inspect.includes(onecli.grants[provider])
+        && observed[1].onecliChildDigest === onecli.childDigests[provider]
+      expect(approvedReference).toBe(true)
       const supervisorLogs = rig.runtime.containerLogs(rig.supervisor.containerId)
       const providerLogs = rig.runtime.containerLogs(managedView)
       rig.runtime.execOwnedContainerExact(rig.supervisor.containerId, [
-        'node', '-e', `const fs=require('fs');const p='/var/lib/freshell-supervisor';for(const f of fs.readdirSync(p).filter(x=>x.startsWith('runtime.sqlite3'))){if(fs.readFileSync(p+'/'+f).includes('${nestedSecretMarker}'))process.exit(4)}`,
+        'node', '-e', `const fs=require('fs');const p='/var/lib/freshell-supervisor';for(const f of fs.readdirSync(p).filter(x=>x.startsWith('runtime.sqlite3'))){const value=fs.readFileSync(p+'/'+f);if(['${nestedSecretMarker}','fixture-secret-byte'].some(marker=>value.includes(marker)))process.exit(4)}`,
       ])
       for (const material of [inspect, supervisorLogs, providerLogs, fs.readFileSync(rig.runtime.evidenceDir + '/lifecycle.jsonl', 'utf8')]) {
         expect(material).not.toContain(nestedSecretMarker)
+        expect(material).not.toContain('fixture-secret-byte')
       }
+      let unapprovedReferenceRejected = false
+      await withMissingGrant(onecli.grants[provider], async () => {
+        try {
+          await recoveryWire.create(provider, workspace)
+        } catch (error) {
+          unapprovedReferenceRejected = /OneCLI grant unavailable|OneCLI grant/i.test(String(error))
+        }
+      })
+      expect(unapprovedReferenceRejected).toBe(true)
       const launch = observed.map(row => normalized(row))
       fs.writeFileSync(path.join(evidenceDir, `terminal-${provider}.json`), JSON.stringify({
         provider,
@@ -467,6 +491,10 @@ describe('ordinary and managed terminal provider parity', () => {
         managed: { launch: launch[1], mcp: mcpResults[1], nativeIdentity: identities[1] ?? observed[1].nativeSession },
         recovery: { replacementObserved: true, sameNativeSession: after.nativeSessionId === before.nativeSessionId },
         secretHygiene: { registry: true, supervisor: true, eventJournal: true, docker: true },
+        onecli: { approvedReference, unapprovedReferenceRejected,
+          referenceProfile: `${provider}_onecli_environment`,
+          childEnvironmentKey: onecli.childKeys[provider],
+          childValueSha256: observed[1].onecliChildDigest },
       }))
     }
     if (managedSoulId) await rig.stopSoul(managedSoulId)

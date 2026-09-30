@@ -25,6 +25,10 @@ afterEach(() => {
 })
 
 describe('live Amplifier OneCLI qualification grants', () => {
+  it.each(['CLAUDE', 'CODEX', 'OPENCODE'])('admits a named %s OneCLI grant to the sandbox broker', provider => {
+    const grant = privateGrant(`${provider.toLowerCase()}.env`)
+    expect(phase2BootstrapFiles({ [`FRESHELL_MANAGED_${provider}_ONECLI_ENV_FILE`]: grant })).toEqual([grant])
+  })
   it.each(['ENV_FILE', 'AUTH_FILE'])('accepts and admits the documented %s grant', (suffix) => {
     const grant = privateGrant('grant.env')
     const key = `FRESHELL_MANAGED_AMPLIFIER_ONECLI_${suffix}`

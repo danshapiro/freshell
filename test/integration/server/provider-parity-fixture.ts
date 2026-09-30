@@ -73,9 +73,22 @@ function terminalTrace(record: any, route: 'direct' | 'managed'): ProviderVisibl
 function freshTrace(record: any, route: 'direct' | 'managed'): ProviderVisibleTrace {
   const observed = record[route]
   const profile = observed.profile
+  const createRequest = observed.operations.find((row: any) => row.operation === 'provider_create_request')?.input
+  const transportStart = observed.operations.find((row: any) => row.operation === 'create_resume')?.input
+  if (!createRequest || !transportStart || !Array.isArray(transportStart.providerSecretReferences)
+    || transportStart.providerSecretReferences.length === 0) {
+    throw new Error(`${record.provider} ${route} has no provider transport input evidence`)
+  }
   return {
-    argv: [],
-    env: {},
+    // This deterministic fresh fixture observes the provider transport call.
+    // Keep every start field; JSON object key order has no meaning here.
+    argv: ['transport.start', ...Object.entries(transportStart)
+      .sort(([left], [right]) => left.localeCompare(right))
+      .map(([key, value]) => `${key}=${JSON.stringify(value)}`)],
+    env: {
+      providerSecretReferences: transportStart.providerSecretReferences,
+      providerLaunchContext: transportStart.providerLaunchContext,
+    },
     config: {
       cwd: profile.cwd,
       model: profile.model,
@@ -115,7 +128,7 @@ export async function runProviderParityFixture(repoRoot: string, eventsTarget?: 
         caseId: `PC-PARITY-${provider.toUpperCase()}` as ProviderParityRow['caseId'],
         direct: terminalTrace(record, 'direct'), managed: terminalTrace(record, 'managed'),
         secretHygiene: record.secretHygiene,
-        onecli: { approvedReference: true, unapprovedReferenceRejected: true },
+        onecli: record.onecli,
         recovery: record.recovery,
       }
       writeFixtureRow(directory, row)
@@ -130,7 +143,7 @@ export async function runProviderParityFixture(repoRoot: string, eventsTarget?: 
         caseId: `FA-PARITY-FRESH${provider.toUpperCase()}` as ProviderParityRow['caseId'],
         direct: freshTrace(record, 'direct'), managed: freshTrace(record, 'managed'),
         secretHygiene: hosted.secretHygiene,
-        onecli: { approvedReference: true, unapprovedReferenceRejected: true },
+        onecli: hosted.onecli,
         recovery: record.recovery,
       }
       writeFixtureRow(directory, row)

@@ -140,9 +140,15 @@ const nativeIdArgIndex = provider === 'claude'
   ? Math.max(argv.indexOf('--session-id'), argv.indexOf('--resume'))
   : provider === 'amplifier' && argv.includes('resume') ? argv.length - 2 : -1
 const nativeId = nativeIdArgIndex >= 0 ? argv[nativeIdArgIndex + 1] : null
+const onecliKey = {
+  claude: 'ANTHROPIC_API_KEY', codex: 'OPENAI_API_KEY',
+  opencode: 'OPENROUTER_API_KEY', amplifier: 'OPENAI_API_KEY',
+}[provider]
 append({
   kind: 'launch',
   launchId,
+  onecliChildDigest: process.env[onecliKey]
+    ? createHash('sha256').update(process.env[onecliKey]).digest('hex') : null,
   argv,
   cwd,
   env: {

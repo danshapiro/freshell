@@ -28,7 +28,9 @@ function rows(): ProviderParityRow[] {
     direct: structuredClone(trace),
     managed: structuredClone(trace),
     secretHygiene: { registry: true, supervisor: true, eventJournal: true, docker: true },
-    onecli: { approvedReference: true, unapprovedReferenceRejected: true },
+    onecli: { approvedReference: true, unapprovedReferenceRejected: true,
+      referenceProfile: `${caseId.replace(/^PC-PARITY-|^FA-PARITY-FRESH/, '').toLowerCase()}_onecli_environment`,
+      childEnvironmentKey: 'OPENAI_API_KEY', childValueSha256: 'a'.repeat(64) },
     recovery: { replacementObserved: true, sameNativeSession: true },
   }))
 }
@@ -44,6 +46,18 @@ describe('provider parity local receipt', () => {
     const lostOperation = rows()
     lostOperation[4].managed.operations = ['create', 'send', 'resume']
     expect(() => validateProviderParityReceipt({ ...receipt, rows: lostOperation })).toThrow(/FA-PARITY-FRESHCLAUDE.*operations/i)
+    const lostFreshInput = rows()
+    lostFreshInput[4].managed.argv.splice(1, 1)
+    expect(() => validateProviderParityReceipt({ ...receipt, rows: lostFreshInput })).toThrow(/FA-PARITY-FRESHCLAUDE.*argv/i)
+    const lostFreshEnvironment = rows()
+    delete lostFreshEnvironment[5].managed.env.FRESHELL
+    expect(() => validateProviderParityReceipt({ ...receipt, rows: lostFreshEnvironment })).toThrow(/FA-PARITY-FRESHCODEX.*env/i)
+    const emptyFreshBoundary = rows()
+    emptyFreshBoundary[6].direct.argv = []
+    emptyFreshBoundary[6].managed.argv = []
+    emptyFreshBoundary[6].direct.env = {}
+    emptyFreshBoundary[6].managed.env = {}
+    expect(() => validateProviderParityReceipt({ ...receipt, rows: emptyFreshBoundary })).toThrow(/FA-PARITY-FRESHOPENCODE.*provider-visible/i)
     const reorderedObjectKeys = rows()
     reorderedObjectKeys[0].managed.config = { setting: true, model: 'fixture' }
     reorderedObjectKeys[0].direct.config = { model: 'fixture', setting: true }

@@ -27,7 +27,13 @@ export type ProviderParityRow = {
   direct: ProviderVisibleTrace
   managed: ProviderVisibleTrace
   secretHygiene: { registry: boolean; supervisor: boolean; eventJournal: boolean; docker: boolean }
-  onecli: { approvedReference: boolean; unapprovedReferenceRejected: boolean }
+  onecli: {
+    approvedReference: boolean
+    unapprovedReferenceRejected: boolean
+    referenceProfile: string
+    childEnvironmentKey: string
+    childValueSha256: string
+  }
   recovery: { replacementObserved: boolean; sameNativeSession: boolean }
 }
 export type ProviderParityReceipt = {
@@ -75,6 +81,10 @@ export function validateProviderParityReceipt(value: unknown): ProviderParityRec
       if (!Array.isArray(trace.argv) || !Array.isArray(trace.plugins) || !Array.isArray(trace.operations)
         || typeof trace.nativeSessionId !== 'string' || !trace.nativeSessionId
         || !trace.env || !trace.config) throw new Error(`${row.caseId}.${route} is missing provider-visible evidence`)
+      if (row.caseId.startsWith('FA-PARITY-')
+        && (trace.argv.length === 0 || Object.keys(record(trace.env, `${row.caseId}.${route}.env`)).length === 0)) {
+        throw new Error(`${row.caseId}.${route} is missing provider-visible argv or environment evidence`)
+      }
       const mcp = record(trace.mcp, `${row.caseId}.${route}.mcp`)
       if (typeof mcp.exposed !== 'boolean' || !Array.isArray(mcp.tools)
         || (mcp.exposed && mcp.call == null) || (!mcp.exposed && (mcp.tools.length || mcp.call != null))) {
@@ -91,6 +101,14 @@ export function validateProviderParityReceipt(value: unknown): ProviderParityRec
     const onecli = record(row.onecli, `${row.caseId}.onecli`)
     if (onecli.approvedReference !== true || onecli.unapprovedReferenceRejected !== true) {
       throw new Error(`${row.caseId} OneCLI reference validation is not proven`)
+    }
+    const expectedProvider = row.caseId.replace(/^PC-PARITY-|^FA-PARITY-FRESH/, '').toLowerCase()
+    if (typeof onecli.referenceProfile !== 'string'
+      || !onecli.referenceProfile.startsWith(`${expectedProvider}_onecli_`)
+      || typeof onecli.childEnvironmentKey !== 'string' || !onecli.childEnvironmentKey
+      || typeof onecli.childValueSha256 !== 'string'
+      || !/^[a-f0-9]{64}$/.test(onecli.childValueSha256)) {
+      throw new Error(`${row.caseId} OneCLI reference and redacted child effect are missing`)
     }
     const recovery = record(row.recovery, `${row.caseId}.recovery`)
     if (recovery.replacementObserved !== true || recovery.sameNativeSession !== true) {
