@@ -396,7 +396,7 @@ fn apply_terminal_context(
             arg.clone()
         }
     };
-    let mut prepared_args = match &context.preparation {
+    let prepared_args = match &context.preparation {
         ProviderPreparation::Claude { mcp_args } => mcp_args.iter().map(rewrite).collect(),
         ProviderPreparation::Codex { tui_args, .. } => tui_args.iter().map(rewrite).collect(),
         ProviderPreparation::Opencode { .. } => Vec::new(),
@@ -412,8 +412,20 @@ fn apply_terminal_context(
             args
         }
     };
-    prepared_args.append(&mut terminal.args);
-    terminal.args = prepared_args;
+    let insert_at = match &context.preparation {
+        ProviderPreparation::Claude { .. } => terminal
+            .args
+            .windows(2)
+            .position(|pair| pair[0] == "--settings")
+            .map_or(0, |index| index + 2),
+        ProviderPreparation::Codex { .. } => terminal
+            .args
+            .windows(2)
+            .position(|pair| pair[0] == "-c" && pair[1].starts_with("tui.notifications="))
+            .map_or(0, |index| index + 2),
+        ProviderPreparation::Opencode { .. } | ProviderPreparation::Amplifier { .. } => 0,
+    };
+    terminal.args.splice(insert_at..insert_at, prepared_args);
     Ok(())
 }
 
@@ -564,7 +576,7 @@ mod provider_secret_context_tests {
         let mut terminal: freshell_runtime_protocol::TerminalLaunchSpec =
             serde_json::from_value(serde_json::json!({
                 "terminalId":"terminal-context", "streamId":"stream-context", "mode":"claude",
-                "program":"claude", "args":["--plugin-dir","/workspace/plugins/ordinary","--session-id","native-one"], "cwd":"/workspace",
+                "program":"claude", "args":["--settings","{}","--plugin-dir","/workspace/plugins/ordinary","--session-id","native-one"], "cwd":"/workspace",
                 "runAsUid":65534,"runAsGid":0,"cols":80,"rows":24,
                 "projectKey":"project-context","workspacePath":"/workspace"
             }))
@@ -585,6 +597,8 @@ mod provider_secret_context_tests {
         assert_eq!(
             terminal.args,
             [
+                "--settings",
+                "{}",
                 "--mcp-config",
                 "/home/freshell/provider/.claude/freshell-mcp.json",
                 "--plugin-dir",

@@ -142,24 +142,7 @@ function ordinaryProviderArgs(argv: string[], provider: Provider): string[] {
       result.push(arg)
     }
   }
-  if (provider !== 'claude' && provider !== 'codex') return result
-  const flags = new Set(provider === 'claude'
-    ? ['--settings', '--mcp-config', '--model', '--effort', '--session-id', '--resume']
-    : ['--remote', '-c', '--model', '--sandbox', '--ask-for-approval'])
-  const pairs: Array<{ key: string; flag: string; value: string }> = []
-  const positional: string[] = []
-  for (let index = 0; index < result.length; index++) {
-    const flag = result[index]
-    if (!flags.has(flag) || result[index + 1] === undefined) {
-      positional.push(flag)
-      continue
-    }
-    const value = result[++index]
-    const key = flag === '-c' ? `${flag}:${value.slice(0, value.indexOf('='))}` : flag
-    pairs.push({ key, flag, value })
-  }
-  if (new Set(pairs.map(pair => pair.key)).size !== pairs.length) return result
-  return [...positional, ...pairs.sort((left, right) => left.key.localeCompare(right.key)).flatMap(pair => [pair.flag, pair.value])]
+  return result
 }
 
 function normalized(record: RecordRow): unknown {
@@ -199,6 +182,30 @@ function normalized(record: RecordRow): unknown {
     mcpRecipePresent: record.mcpRecipePresent,
   }
 }
+
+describe('managed provider parity argv comparison', () => {
+  it.each([
+    {
+      provider: 'claude' as const,
+      first: ['--model', 'haiku', '--effort', 'low', '-p', 'prompt'],
+      reordered: ['--effort', 'low', '--model', 'haiku', '-p', 'prompt'],
+    },
+    {
+      provider: 'codex' as const,
+      first: ['--model', 'gpt-5.6-luna', '--sandbox', 'workspace-write', 'app-server'],
+      reordered: ['--sandbox', 'workspace-write', '--model', 'gpt-5.6-luna', 'app-server'],
+    },
+  ])('$provider flag order remains provider-visible', ({ provider, first, reordered }) => {
+    const record = (argv: string[]): RecordRow => ({
+      provider,
+      kind: 'launch',
+      argv,
+      env: {},
+    })
+
+    expect(normalized(record(first))).not.toEqual(normalized(record(reordered)))
+  })
+})
 
 function makeReadableTree(directory: string): void {
   fs.chmodSync(directory, 0o755)
