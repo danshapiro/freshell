@@ -52,6 +52,16 @@ pub(crate) struct LaunchWorkload {
     pub(crate) resume_spec: Option<ResumeSpec>,
 }
 
+struct McpCapabilityRequest<'a> {
+    action: &'a str,
+    soul_id: &'a SoulId,
+    incarnation_id: Option<&'a IncarnationId>,
+    grant_id: Option<&'a str>,
+    provider: Option<&'a str>,
+    tui_source: Option<&'a freshell_runtime_protocol::ProviderConfigReference>,
+    workspace: Option<&'a str>,
+}
+
 #[derive(Clone)]
 pub struct Supervisor {
     pub(crate) registry: Registry,
@@ -1565,15 +1575,15 @@ impl Supervisor {
             ));
         }
         let response = self
-            .mcp_capability_callback(
+            .mcp_capability_callback(McpCapabilityRequest {
                 action,
                 soul_id,
-                Some(incarnation_id),
-                Some(grant_id),
-                None,
-                None,
-                None,
-            )
+                incarnation_id: Some(incarnation_id),
+                grant_id: Some(grant_id),
+                provider: None,
+                tui_source: None,
+                workspace: None,
+            })
             .await?;
         if response != b"ok" {
             return Err(RuntimeError::new(
@@ -1592,15 +1602,15 @@ impl Supervisor {
         workspace: &str,
     ) -> Result<freshell_runtime_protocol::McpCapabilityReference, RuntimeError> {
         let response = self
-            .mcp_capability_callback(
-                "issue",
+            .mcp_capability_callback(McpCapabilityRequest {
+                action: "issue",
                 soul_id,
-                None,
-                None,
-                Some(provider),
+                incarnation_id: None,
+                grant_id: None,
+                provider: Some(provider),
                 tui_source,
-                Some(workspace),
-            )
+                workspace: Some(workspace),
+            })
             .await?;
         serde_json::from_slice(&response).map_err(|_| {
             RuntimeError::new(
@@ -1612,13 +1622,7 @@ impl Supervisor {
 
     async fn mcp_capability_callback(
         &self,
-        action: &str,
-        soul_id: &SoulId,
-        incarnation_id: Option<&IncarnationId>,
-        grant_id: Option<&str>,
-        provider: Option<&str>,
-        tui_source: Option<&freshell_runtime_protocol::ProviderConfigReference>,
-        workspace: Option<&str>,
+        request: McpCapabilityRequest<'_>,
     ) -> Result<Vec<u8>, RuntimeError> {
         if self.config.control_secret.contains(['\r', '\n']) {
             return Err(RuntimeError::new(
@@ -1627,14 +1631,14 @@ impl Supervisor {
             ));
         }
         let body = serde_json::to_vec(&serde_json::json!({
-            "action": action,
+            "action": request.action,
             "controlSecret": self.config.control_secret,
-            "soulId": soul_id,
-            "incarnationId": incarnation_id,
-            "grantId": grant_id,
-            "provider": provider,
-            "tuiSource": tui_source,
-            "workspace": workspace,
+            "soulId": request.soul_id,
+            "incarnationId": request.incarnation_id,
+            "grantId": request.grant_id,
+            "provider": request.provider,
+            "tuiSource": request.tui_source,
+            "workspace": request.workspace,
         }))
         .map_err(|error| RuntimeError::new(RuntimeErrorCode::InvalidRequest, error.to_string()))?;
         let callback_socket = self.config.control_socket_path.with_file_name("mcp.sock");
