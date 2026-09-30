@@ -237,16 +237,18 @@ describe('hosted fresh-agent provider inputs', () => {
       && (frame.type === 'freshAgent.created' || frame.type === 'freshAgent.create.failed'))
     expect(resumed.type, JSON.stringify(resumed)).toBe('freshAgent.created')
     expect(resumed.sessionRef?.sessionId).toBe(recorded.nativeSessionId)
-    let unapprovedReferenceRejected = false
+    let rejectedCreate: { requestType: string; responseType: string } | undefined
     await withMissingGrant(onecli.grants[row.provider], async () => {
       const badRequestId = `bad-grant-${randomUUID()}`
       wire.send({ ...createRequest, requestId: badRequestId,
         namingHandle: `nh-${badRequestId}`, tabId: `tab-${badRequestId}` })
       const bad = await wire.wait(frame => frame.requestId === badRequestId
         && (frame.type === 'freshAgent.created' || frame.type === 'freshAgent.create.failed'))
-      unapprovedReferenceRejected = bad.type === 'freshAgent.create.failed'
+      if (bad.type === 'freshAgent.create.failed') {
+        rejectedCreate = { requestType: 'freshAgent.create', responseType: bad.type }
+      }
     })
-    expect(unapprovedReferenceRejected).toBe(true)
+    expect(rejectedCreate).toBeDefined()
     const evidenceDir = process.env.FRESHELL_PROVIDER_PARITY_ROWS_DIR
     if (evidenceDir) {
       const sentinel = 'fixture-secret-byte'
@@ -265,12 +267,14 @@ describe('hosted fresh-agent provider inputs', () => {
         plugin: profile.plugins,
         secretHygiene: { registry: true, supervisor: true, eventJournal: true, docker: true },
         onecli: {
-          approvedReference: profile.providerSecretReferences[0].sourcePath === onecli.grants[row.provider]
-            && childObservation.env[onecli.childKeys[row.provider]] === onecli.childDigests[row.provider],
-          unapprovedReferenceRejected,
-          referenceProfile: profile.providerSecretReferences[0].profile,
-          childEnvironmentKey: onecli.childKeys[row.provider],
-          childValueSha256: childObservation.env[onecli.childKeys[row.provider]],
+          reference: { provider: row.provider, profile: profile.providerSecretReferences[0].profile,
+            sourcePath: profile.providerSecretReferences[0].sourcePath,
+            environmentKey: onecli.childKeys[row.provider], grantValueSha256: onecli.childDigests[row.provider] },
+          child: { provider: row.provider, argv: childObservation.argv,
+            environmentKey: onecli.childKeys[row.provider],
+            valueSha256: childObservation.env[onecli.childKeys[row.provider]],
+            onecliControlPresent: childObservation.onecliControlPresent },
+          rejection: { provider: row.provider, sourcePath: onecli.grants[row.provider], ...rejectedCreate! },
         },
       }))
     }

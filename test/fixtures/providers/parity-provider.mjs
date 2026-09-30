@@ -149,6 +149,7 @@ append({
   launchId,
   onecliChildDigest: process.env[onecliKey]
     ? createHash('sha256').update(process.env[onecliKey]).digest('hex') : null,
+  onecliControlPresent: Boolean(process.env.ONECLI_URL),
   argv,
   cwd,
   env: {

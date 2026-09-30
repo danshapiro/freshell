@@ -20,7 +20,7 @@ describe('direct and managed provider parity contract', () => {
     const row = receipt.rows.find(candidate => candidate.caseId === caseId)
     expect(row).toBeDefined()
     expect(row!.direct).toEqual(row!.managed)
-    expect(row!.onecli.unapprovedReferenceRejected).toBe(true)
+    expect(row!.onecli.rejection.responseType).toBe(caseId.startsWith('FA-') ? 'freshAgent.create.failed' : 'error')
     expect(Object.values(row!.secretHygiene).every(Boolean)).toBe(true)
   })
 })

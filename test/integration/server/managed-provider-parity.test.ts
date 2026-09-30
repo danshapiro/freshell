@@ -466,6 +466,7 @@ describe('ordinary and managed terminal provider parity', () => {
       const approvedReference = inspect.includes(onecli.grants[provider])
         && observed[1].onecliChildDigest === onecli.childDigests[provider]
       expect(approvedReference).toBe(true)
+      expect(observed[1].onecliControlPresent).toBe(false)
       const supervisorLogs = rig.runtime.containerLogs(rig.supervisor.containerId)
       const providerLogs = rig.runtime.containerLogs(managedView)
       rig.runtime.execOwnedContainerExact(rig.supervisor.containerId, [
@@ -475,15 +476,17 @@ describe('ordinary and managed terminal provider parity', () => {
         expect(material).not.toContain(nestedSecretMarker)
         expect(material).not.toContain('fixture-secret-byte')
       }
-      let unapprovedReferenceRejected = false
+      let rejectedCreate: { requestType: string; responseType: string } | undefined
       await withMissingGrant(onecli.grants[provider], async () => {
         try {
           await recoveryWire.create(provider, workspace)
         } catch (error) {
-          unapprovedReferenceRejected = /OneCLI grant unavailable|OneCLI grant/i.test(String(error))
+          if (/OneCLI grant unavailable|OneCLI grant/i.test(String(error))) {
+            rejectedCreate = { requestType: 'terminal.create', responseType: 'error' }
+          }
         }
       })
-      expect(unapprovedReferenceRejected).toBe(true)
+      expect(rejectedCreate).toBeDefined()
       const launch = observed.map(row => normalized(row))
       fs.writeFileSync(path.join(evidenceDir, `terminal-${provider}.json`), JSON.stringify({
         provider,
@@ -491,10 +494,14 @@ describe('ordinary and managed terminal provider parity', () => {
         managed: { launch: launch[1], mcp: mcpResults[1], nativeIdentity: identities[1] ?? observed[1].nativeSession },
         recovery: { replacementObserved: true, sameNativeSession: after.nativeSessionId === before.nativeSessionId },
         secretHygiene: { registry: true, supervisor: true, eventJournal: true, docker: true },
-        onecli: { approvedReference, unapprovedReferenceRejected,
-          referenceProfile: `${provider}_onecli_environment`,
-          childEnvironmentKey: onecli.childKeys[provider],
-          childValueSha256: observed[1].onecliChildDigest },
+        onecli: {
+          reference: { provider, profile: `${provider}_onecli_environment`, sourcePath: onecli.grants[provider],
+            environmentKey: onecli.childKeys[provider], grantValueSha256: onecli.childDigests[provider] },
+          child: { provider, argv: launch[1].argv, environmentKey: onecli.childKeys[provider],
+            valueSha256: observed[1].onecliChildDigest,
+            onecliControlPresent: observed[1].onecliControlPresent },
+          rejection: { provider, sourcePath: onecli.grants[provider], ...rejectedCreate! },
+        },
       }))
     }
     if (managedSoulId) await rig.stopSoul(managedSoulId)

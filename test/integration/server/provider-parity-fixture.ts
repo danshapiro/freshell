@@ -52,6 +52,7 @@ function terminalTrace(record: any, route: 'direct' | 'managed'): ProviderVisibl
   const plugins = [launch.providerPlugin, launch.projectPlugin]
     .filter((value): value is string => typeof value === 'string')
   return {
+    provider: record.provider,
     argv: launch.argv,
     env: launch.env,
     config: {
@@ -80,6 +81,7 @@ function freshTrace(record: any, route: 'direct' | 'managed'): ProviderVisibleTr
     throw new Error(`${record.provider} ${route} has no provider transport input evidence`)
   }
   return {
+    provider: record.provider,
     // This deterministic fresh fixture observes the provider transport call.
     // Keep every start field; JSON object key order has no meaning here.
     argv: ['transport.start', ...Object.entries(transportStart)

@@ -13,6 +13,7 @@ export const PROVIDER_PARITY_CASE_IDS = [
 
 export type ProviderParityCaseId = typeof PROVIDER_PARITY_CASE_IDS[number]
 export type ProviderVisibleTrace = {
+  provider: string
   argv: string[]
   env: Record<string, unknown>
   config: unknown
@@ -28,11 +29,9 @@ export type ProviderParityRow = {
   managed: ProviderVisibleTrace
   secretHygiene: { registry: boolean; supervisor: boolean; eventJournal: boolean; docker: boolean }
   onecli: {
-    approvedReference: boolean
-    unapprovedReferenceRejected: boolean
-    referenceProfile: string
-    childEnvironmentKey: string
-    childValueSha256: string
+    reference: { provider: string; profile: string; sourcePath: string; environmentKey: string; grantValueSha256: string }
+    child: { provider: string; argv: string[]; environmentKey: string; valueSha256: string; onecliControlPresent: boolean }
+    rejection: { provider: string; sourcePath: string; requestType: string; responseType: string }
   }
   recovery: { replacementObserved: boolean; sameNativeSession: boolean }
 }
@@ -45,6 +44,14 @@ export type ProviderParityReceipt = {
 }
 
 const ids = new Set<string>(PROVIDER_PARITY_CASE_IDS)
+// Digests of the deterministic fake values created by fakeOnecliGrants. The
+// receipt checks these known fixture effects without storing the values.
+const onecliFixture = {
+  claude: { key: 'ANTHROPIC_API_KEY', digest: 'eadc44b07a22ac1dd3cff288bf4226793a69df213ff1164ed0aeb847ac80a3c0' },
+  codex: { key: 'OPENAI_API_KEY', digest: '269cb5ee8be6c7d7e6bcbed95231b3a3e5db2edbb1d119ff9ed84f159506b725' },
+  opencode: { key: 'OPENROUTER_API_KEY', digest: '1fda073dcaeb3ac7f140977cf00a53209524d21011aa868317d2ed5801f7eca5' },
+  amplifier: { key: 'OPENAI_API_KEY', digest: 'daa3f3c6a1b01fadf1299f1e80bc095aeb4e6235d696f13592b7533ebff7a502' },
+} as const
 
 function record(value: unknown, label: string): Record<string, unknown> {
   if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error(`${label} must be an object`)
@@ -76,14 +83,28 @@ export function validateProviderParityReceipt(value: unknown): ProviderParityRec
     const row = record(raw, `provider parity row ${index}`) as unknown as ProviderParityRow
     if (!ids.has(row.caseId) || found.has(row.caseId)) throw new Error(`unknown or duplicate parity case ${row.caseId}`)
     found.add(row.caseId)
+    const provider = row.caseId.replace(/^PC-PARITY-|^FA-PARITY-FRESH/, '').toLowerCase() as keyof typeof onecliFixture
+    const fresh = row.caseId.startsWith('FA-PARITY-')
     for (const route of ['direct', 'managed'] as const) {
       const trace = record(row[route], `${row.caseId}.${route}`)
+      if (trace.provider !== provider) throw new Error(`${row.caseId}.${route} provider transport identity differs from case`)
       if (!Array.isArray(trace.argv) || !Array.isArray(trace.plugins) || !Array.isArray(trace.operations)
         || typeof trace.nativeSessionId !== 'string' || !trace.nativeSessionId
         || !trace.env || !trace.config) throw new Error(`${row.caseId}.${route} is missing provider-visible evidence`)
       if (row.caseId.startsWith('FA-PARITY-')
         && (trace.argv.length === 0 || Object.keys(record(trace.env, `${row.caseId}.${route}.env`)).length === 0)) {
         throw new Error(`${row.caseId}.${route} is missing provider-visible argv or environment evidence`)
+      }
+      if (fresh) {
+        const env = record(trace.env, `${row.caseId}.${route}.env`)
+        const config = record(trace.config, `${row.caseId}.${route}.config`)
+        if (trace.argv[0] !== 'transport.start'
+          || !trace.argv.some((argument: unknown) => typeof argument === 'string' && argument.includes('providerSecretReferences='))
+          || !Array.isArray(env.providerSecretReferences) || !Array.isArray(config.providerSecretReferences)) {
+          throw new Error(`${row.caseId}.${route} is missing provider transport inputs`)
+        }
+      } else if (trace.argv.length === 0 || !('providerConfig' in record(trace.config, `${row.caseId}.${route}.config`))) {
+        throw new Error(`${row.caseId}.${route} is missing provider transport inputs`)
       }
       const mcp = record(trace.mcp, `${row.caseId}.${route}.mcp`)
       if (typeof mcp.exposed !== 'boolean' || !Array.isArray(mcp.tools)
@@ -99,16 +120,45 @@ export function validateProviderParityReceipt(value: unknown): ProviderParityRec
       if (hygiene[field] !== true) throw new Error(`${row.caseId}.secretHygiene.${field} is not proven`)
     }
     const onecli = record(row.onecli, `${row.caseId}.onecli`)
-    if (onecli.approvedReference !== true || onecli.unapprovedReferenceRejected !== true) {
-      throw new Error(`${row.caseId} OneCLI reference validation is not proven`)
+    const reference = record(onecli.reference, `${row.caseId}.onecli.reference`)
+    const child = record(onecli.child, `${row.caseId}.onecli.child`)
+    const rejection = record(onecli.rejection, `${row.caseId}.onecli.rejection`)
+    const fixture = onecliFixture[provider]
+    if (reference.provider !== provider || reference.profile !== `${provider}_onecli_environment`
+      || typeof reference.sourcePath !== 'string'
+      || !path.basename(path.dirname(reference.sourcePath)).startsWith('freshell-parity-onecli-')
+      || path.basename(reference.sourcePath) !== `${provider}.env`
+      || reference.environmentKey !== fixture.key || reference.grantValueSha256 !== fixture.digest) {
+      throw new Error(`${row.caseId} OneCLI approved reference observation differs from the case fixture`)
     }
-    const expectedProvider = row.caseId.replace(/^PC-PARITY-|^FA-PARITY-FRESH/, '').toLowerCase()
-    if (typeof onecli.referenceProfile !== 'string'
-      || !onecli.referenceProfile.startsWith(`${expectedProvider}_onecli_`)
-      || typeof onecli.childEnvironmentKey !== 'string' || !onecli.childEnvironmentKey
-      || typeof onecli.childValueSha256 !== 'string'
-      || !/^[a-f0-9]{64}$/.test(onecli.childValueSha256)) {
-      throw new Error(`${row.caseId} OneCLI reference and redacted child effect are missing`)
+    if (child.provider !== provider || child.environmentKey !== reference.environmentKey
+      || child.valueSha256 !== reference.grantValueSha256 || child.onecliControlPresent !== false
+      || !Array.isArray(child.argv)
+      || (fresh
+        ? JSON.stringify(child.argv) !== JSON.stringify(['fresh-agent-fixture-worker', '--provider', provider])
+        : JSON.stringify(child.argv) !== JSON.stringify(row.managed.argv))) {
+      throw new Error(`${row.caseId} OneCLI redacted child observation differs from the grant or transport`)
+    }
+    if (rejection.provider !== provider || rejection.sourcePath !== reference.sourcePath
+      || rejection.requestType !== (fresh ? 'freshAgent.create' : 'terminal.create')
+      || rejection.responseType !== (fresh ? 'freshAgent.create.failed' : 'error')) {
+      throw new Error(`${row.caseId} OneCLI failed-create rejection observation is missing`)
+    }
+    if (fresh) {
+      const sourcePath = '/run/freshell-secrets/onecli/env'
+      const profile = reference.profile as string
+      for (const route of ['direct', 'managed'] as const) {
+        const trace = row[route]
+        const references = (trace.env as { providerSecretReferences: unknown }).providerSecretReferences
+        equal(references, trace.config && (trace.config as { providerSecretReferences: unknown }).providerSecretReferences,
+          `${row.caseId}.${route}.providerSecretReferences`)
+        if (!trace.argv.some(argument => typeof argument === 'string'
+          && argument.includes(sourcePath) && argument.includes(profile))
+          || !Array.isArray(references) || !references.some(candidate => {
+          const value = candidate as Record<string, unknown>
+          return value?.sourcePath === sourcePath && value?.profile === reference.profile
+        })) throw new Error(`${row.caseId}.${route} OneCLI reference is absent from provider transport inputs`)
+      }
     }
     const recovery = record(row.recovery, `${row.caseId}.recovery`)
     if (recovery.replacementObserved !== true || recovery.sameNativeSession !== true) {
