@@ -7,8 +7,8 @@ managed state.
 ## Current staged release scope
 
 The current release-qualified durable provider is **OpenCode 1.18.21** with the
-authenticated `openai/gpt-5.6-luna` model. The managed runtime imports the
-existing OpenAI OAuth credential from OpenCode's auth file; model/provider
+authenticated `openai/gpt-5.6-luna` model. Supply its configured OpenAI
+credential through a typed OneCLI environment or auth-file grant; model/provider
 authentication must match. Claude, Codex, and Amplifier are
 adapter-ready but remain explicitly release-disabled as
 `PENDING_LIVE_QUALIFICATION`. Their ordinary legacy routes continue to work;
@@ -118,10 +118,12 @@ session, or sole remaining session as ownership or identity proof.
 1. Run the dry run and resolve all blockers.
 2. Run the repository's managed provider acceptance tests for the intended
    provider/mode.
-   For the isolated OpenCode browser gate, set
-   `FRESHELL_MANAGED_OPENCODE_AUTH_FILE` to the existing OpenCode `auth.json`
-   path; the gate's temporary server home cannot discover the host credential
-   automatically and will fail before launching if the reference is absent.
+   The P2-G04 isolated browser test harness currently requires
+   `FRESHELL_MANAGED_OPENCODE_AUTH_FILE` to point to its existing OpenCode
+   `auth.json`; its temporary server home cannot discover the host credential.
+   This is a test-harness-only legacy input, not the managed provider contract.
+   Production launches use `FRESHELL_MANAGED_<PROVIDER>_ONECLI_ENV_FILE` or
+   `FRESHELL_MANAGED_<PROVIDER>_ONECLI_AUTH_FILE` as typed OneCLI references.
 3. Apply `managed-opt-in` with the current control epoch and a unique request ID.
 4. Verify the returned inventory revision and rollout mode.
 5. Open one managed agent for every provider currently marked
@@ -148,26 +150,19 @@ policy rather than relying on a provider default:
 }
 ```
 
-For Amplifier, optionally point
-`FRESHELL_MANAGED_AMPLIFIER_ONECLI_KEYS_FILE` at the approved private
-`~/.amplifier/keys.env` (that canonical file is the default). No second endpoint
-variable is required: the approved file is the source of truth for the
-LunaRoute upstream and OneCLI proxy transport. The runtime image pins the same
-provider-vllm source used by that setup and `glm-5.3`; the native
-`session:config` event is the provider-effective authority for model/reasoning.
-The keys file is parsed, never sourced; host-local OneCLI control URLs are not
-forwarded into the container, while provider/proxy secret values exist only in
-the child environment. A raw OAuth file, a different reference, malformed
-transport URL, or an unapproved model fails closed.
-Configure that private file through OneCLI before selecting Amplifier for a
-managed qualification run. The controller stores its canonical path reference;
-the session host resolves approved values only into the Amplifier child process.
-The supervisor registry and logs never receive the secret values. Ordinary
-Amplifier bundle MCP remains available when the bundle mounts `tool-mcp`.
+For Amplifier, configure the desired bundle, provider, model, plugins, and
+operations as for an ordinary Amplifier session. If the provider needs a
+secret, supply its private OneCLI environment grant with
+`FRESHELL_MANAGED_AMPLIFIER_ONECLI_ENV_FILE`, or an auth-file grant with
+`FRESHELL_MANAGED_AMPLIFIER_ONECLI_AUTH_FILE`. The controller stores only the
+typed canonical reference; the session host resolves it for the child. The
+supervisor registry and logs never receive secret values. The native
+`session:config` event records the effective model and reasoning. Bundle MCP
+remains available when the bundle mounts `tool-mcp`.
 
-These values and bootstrap paths make a live campaign reproducible. They do
-not certify or enable Claude, Codex, or Amplifier; the capability manifest
-remains authoritative until a later, receipt-bearing promotion change.
+These values and typed grant references make a live campaign reproducible.
+They do not certify or enable Claude, Codex, or Amplifier; the capability
+manifest remains authoritative until a later, receipt-bearing promotion change.
 
 ## Enabling managed default
 

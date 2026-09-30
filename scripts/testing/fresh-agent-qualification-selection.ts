@@ -1,3 +1,8 @@
+import {
+  loadCapabilityManifest,
+  type CapabilityManifest,
+} from './provider-certification.js'
+
 export const FRESH_AGENT_QUALIFICATION_MODES_ENV =
   'FRESHELL_RUNTIME_FRESH_AGENT_QUALIFICATION_MODES'
 
@@ -16,7 +21,21 @@ export type QualifiableFreshAgentMode = typeof QUALIFIABLE_FRESH_AGENT_MODES[num
  */
 export function parseFreshAgentQualificationModes(
   value: string,
+  manifest: CapabilityManifest = loadCapabilityManifest(process.cwd()),
 ): QualifiableFreshAgentMode[] {
+  for (const mode of QUALIFIABLE_FRESH_AGENT_MODES) {
+    const rows = manifest.freshAgentModes.filter((row) => row.mode === mode)
+    if (rows.length !== 1 || rows[0].qualificationReady !== true) {
+      throw new Error(`${mode} qualificationReady must be true in exactly one capability row before fresh-agent qualification`)
+    }
+  }
+  const unexpectedReady = manifest.freshAgentModes.filter((row) => (
+    row.qualificationReady === true
+    && !QUALIFIABLE_FRESH_AGENT_MODES.includes(row.mode as QualifiableFreshAgentMode)
+  ))
+  if (unexpectedReady.length) {
+    throw new Error(`fresh-agent qualificationReady has unsupported modes: ${unexpectedReady.map((row) => row.mode).join(',')}`)
+  }
   if (!value) throw selectionError('must name at least one mode')
   const allowed = new Set<string>(QUALIFIABLE_FRESH_AGENT_MODES)
   const selected: QualifiableFreshAgentMode[] = []

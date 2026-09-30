@@ -233,9 +233,11 @@ OpenCode permissions are controlled by the OpenCode configuration for the OS use
 
 Amplifier loads the freshell MCP only if its bundle mounts `tool-mcp` (the default `anchors` bundle does not). Add `tool-mcp` to your Amplifier bundle to enable orchestration.
 
-For managed Amplifier sessions, set up the approved private
-`~/.amplifier/keys.env` through OneCLI. Freshell reads that reference when the
-session starts and gives the provider child only the values it needs.
+Managed Amplifier sessions use the configured bundle, provider, model, and
+plugins. If the provider needs a secret, give Freshell a private OneCLI grant
+through `FRESHELL_MANAGED_AMPLIFIER_ONECLI_ENV_FILE` or
+`FRESHELL_MANAGED_AMPLIFIER_ONECLI_AUTH_FILE`. Freshell resolves the grant for
+the provider child when the session starts.
 
 ### Standalone CLI and MCP client
 

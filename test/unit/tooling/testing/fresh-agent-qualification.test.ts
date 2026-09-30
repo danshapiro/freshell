@@ -155,6 +155,18 @@ describe('fresh-agent live mode selection', () => {
     'rejects empty, broadened, duplicate, aliased, or unknown selection %j before launch',
     (value) => expect(() => parseFreshAgentQualificationModes(value)).toThrow(FRESH_AGENT_QUALIFICATION_MODES_ENV),
   )
+
+  it.each(['false', 'missing'])('rejects qualification when a selectable mode loses readiness (%s)', (state) => {
+    const manifest = JSON.parse(fs.readFileSync(
+      path.resolve(__dirname, '../../../../docs/development/runtime-provider-capabilities.json'),
+      'utf8',
+    ))
+    const candidate = manifest.freshAgentModes.find((entry: { mode: string }) => entry.mode === 'freshcodex')
+    if (state === 'false') candidate.qualificationReady = false
+    else delete candidate.qualificationReady
+    expect(() => parseFreshAgentQualificationModes('freshclaude', manifest))
+      .toThrow(/freshcodex.*qualificationReady/i)
+  })
 })
 
 describe('fresh-agent release scope truth', () => {
