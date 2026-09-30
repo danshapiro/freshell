@@ -5,6 +5,7 @@ import net from 'node:net'
 import os from 'node:os'
 import path from 'node:path'
 
+import { configuredAmplifierOnecliGrantFiles } from './runtime-amplifier-onecli.js'
 import { RestrictedDockerBroker, type BrokerEvent, type BrokerReceipt } from './runtime-test-broker.js'
 
 export const PHASE1_RUNTIME_IMAGE_TAG = 'ubuntu:24.04'
@@ -65,6 +66,28 @@ export type FreshAgentQualificationBuildRecord = {
   serverBinary: string
   supervisorBinary: string
   sessionHostBinary: string
+}
+
+export function phase2BootstrapFiles(
+  env: NodeJS.ProcessEnv = process.env,
+): string[] {
+  const files = new Set<string>()
+  const addRegularFile = (candidate: string | undefined) => {
+    if (!candidate) return
+    try {
+      const resolved = fs.realpathSync(candidate)
+      if (fs.statSync(resolved).isFile()) files.add(resolved)
+    } catch {}
+  }
+  for (const key of [
+    'FRESHELL_MANAGED_CLAUDE_CREDENTIAL_FILE',
+    'FRESHELL_MANAGED_OPENCODE_AUTH_FILE',
+    'FRESHELL_MANAGED_CODEX_AUTH_FILE',
+  ]) {
+    addRegularFile(env[key]?.trim())
+  }
+  for (const grant of configuredAmplifierOnecliGrantFiles(env)) files.add(grant)
+  return [...files]
 }
 
 export class RuntimeGateAssertionError extends Error {
@@ -1017,26 +1040,7 @@ export class RuntimeHarness {
   }
 
   private phase2BootstrapFiles(): string[] {
-    const files = new Set<string>()
-    const addRegularFile = (candidate: string | undefined) => {
-      if (!candidate) return
-      try {
-        const resolved = fs.realpathSync(candidate)
-        if (fs.statSync(resolved).isFile()) files.add(resolved)
-      } catch {}
-    }
-    for (const key of [
-      'FRESHELL_MANAGED_CLAUDE_CREDENTIAL_FILE',
-      'FRESHELL_MANAGED_OPENCODE_AUTH_FILE',
-      'FRESHELL_MANAGED_CODEX_AUTH_FILE',
-      'FRESHELL_MANAGED_AMPLIFIER_ONECLI_KEYS_FILE',
-    ]) {
-      const configured = process.env[key]?.trim()
-      addRegularFile(configured)
-    }
-    const amplifierHome = path.join(os.homedir(), '.amplifier')
-    addRegularFile(path.join(amplifierHome, 'keys.env'))
-    return [...files]
+    return phase2BootstrapFiles()
   }
 
   private phase2WorkspaceRoots(): string[] {

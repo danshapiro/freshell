@@ -15,6 +15,7 @@ import path from 'node:path'
 import { expect, type Page } from '@playwright/test'
 
 import type { ProviderQualificationRow } from '../../../scripts/testing/provider-qualification-receipt.js'
+import { requireAmplifierOnecliBootstrap } from '../../../scripts/testing/runtime-amplifier-onecli.js'
 import {
   QUALIFICATION_PROVIDER_SELECTION_ENV,
   parseQualificationProviderSelection,
@@ -47,19 +48,6 @@ type ProviderDefinition = {
   processBinary: string
   processIdentityNeedles: string[]
   nativeIdPattern: RegExp
-}
-
-function requireAmplifierOnecliBootstrap(): void {
-  const keys = process.env.FRESHELL_MANAGED_AMPLIFIER_ONECLI_KEYS_FILE?.trim()
-    || path.join(process.env.HOME ?? '', '.amplifier', 'keys.env')
-  let regular = false
-  try {
-    const stat = fs.lstatSync(keys)
-    regular = stat.isFile() && !stat.isSymbolicLink() && (stat.mode & 0o077) === 0
-  } catch {}
-  if (!path.isAbsolute(keys) || !regular) {
-    throw new Error(`Amplifier OneCLI keys reference is missing, linked, or not private: ${keys}`)
-  }
 }
 
 function providerDefinitions(): ProviderDefinition[] {
