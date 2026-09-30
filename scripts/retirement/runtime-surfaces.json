@@ -72,11 +72,6 @@
       "role": "container-deployment"
     },
     {
-      "id": "container-runtime-amplifier-provider",
-      "path": "docker/runtime/amplifier-onecli-lunaroute-glm53.yaml",
-      "role": "provider-config"
-    },
-    {
       "id": "docker-sandbox-entrypoint",
       "path": "docker/sandbox/entrypoint.sh",
       "role": "container-entrypoint"
@@ -107,6 +102,11 @@
     {
       "id": "service-systemd-rust",
       "path": "installers/systemd/freshell-rust.service",
+      "role": "rust-service"
+    },
+    {
+      "id": "service-systemd-supervisor",
+      "path": "installers/systemd/freshell-supervisor.service",
       "role": "rust-service"
     },
     {
@@ -337,6 +337,17 @@
       "listener": "non-backend"
     },
     {
+      "id": "scripts-probe-managed-mcp-image",
+      "path": "scripts/testing/probe-managed-mcp-image.ts",
+      "role": "non-backend-listener",
+      "listener": "non-backend"
+    },
+    {
+      "id": "scripts-probe-opencode-config",
+      "path": "scripts/testing/probe-opencode-config.sh",
+      "role": "test-tool"
+    },
+    {
       "id": "listener-native-session-names-runner",
       "path": "scripts/testing/native-session-names.mjs",
       "role": "non-backend-listener",
@@ -541,6 +552,12 @@
     {
       "id": "assertion-test-runtime-boundary",
       "path": "test/unit/architecture/rust-only-server-runtime.test.ts",
+      "role": "test-listener-assertion",
+      "listener": "assertion-only"
+    },
+    {
+      "id": "assertion-test-mcp-self-test",
+      "path": "test/unit/mcp/self-test.test.ts",
       "role": "test-listener-assertion",
       "listener": "assertion-only"
     },

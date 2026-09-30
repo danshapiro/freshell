@@ -71,6 +71,9 @@ export const NON_BACKEND_LISTENER_PATHS = [
   // The qualification harness brokers Docker API calls through a local Unix
   // socket. It has no Freshell PTYs or application state.
   'scripts/testing/runtime-test-broker.ts',
+  // The image self-test binds a loopback health stub while probing the
+  // packaged MCP client; it does not serve Freshell application traffic.
+  'scripts/testing/probe-managed-mcp-image.ts',
   // The native session-names contract runner: its pickFreePort binds
   // loopback :0 transiently (probe-and-close) to hand a free port to the
   // CHILD freshell-server / provider CLI processes it launches inside the
