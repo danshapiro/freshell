@@ -21,14 +21,14 @@ Fix Freshell automatic session naming so a configured OneCLI Gemini credential r
 
 **Goal:** Automatic session naming uses OneCLI's configured Gemini credential route first, falls back to existing direct Gemini keys only when OneCLI is not configured or explicitly reports no connected Gemini credential, uses Codex's initiating event message, and leaves the supported test suite green.
 
-**Architecture:** Keep the existing direct-key Gemini transport for non-naming AI features. Add a session-name-specific capability and transport used by the unified naming worker, automatic title sweep, and session title endpoint; it sends no direct key through a configured OneCLI route and retries with the existing direct key only for OneCLI's explicit missing-credential responses. Teach Codex parsing to feed both supported user-message record shapes through the same existing normalization and title extraction path. Repair OpenCode's readiness qualification first and require a full green Cloud Vitest checkpoint before the naming or parser tasks.
+**Architecture:** Keep the existing direct-key Gemini transport for non-naming AI features. Add a session-name-specific capability and transport used by the unified naming worker, automatic title sweep, and session title endpoint; it sends no direct key through a configured OneCLI route and retries with the existing direct key only for OneCLI's explicit missing-credential responses. Teach Codex parsing to feed both supported user-message record shapes through the same existing normalization and title extraction path. Repair OpenCode readiness using the configured model identity, then require a full green Cloud Vitest checkpoint before the naming or parser tasks.
 
 **Tech Stack:** Rust (Axum, Tokio, reqwest with rustls, serde_json), React/TypeScript, Vitest, Playwright, Cargo, pnpm 10.34.5.
 
 ## Global Constraints
 
 - Preserve the current direct-key sources and precedence: non-empty GOOGLE_GENERATIVE_AI_API_KEY wins at boot, settings.ai.geminiApiKey is the existing fallback, and a later non-empty settings save force-updates the shared key cell. Do not add a new credential store, dependency, live Gemini call, or user setting.
-- Use a scheme-appropriate OneCLI gateway proxy variable (HTTPS_PROXY/https_proxy for production Gemini HTTPS; HTTP_PROXY/http_proxy only for the HTTP test endpoint) and the OneCLI aoc_ marker. Do not use ONECLI_URL as a request endpoint. Treat NO_PROXY/no_proxy bypass for generativelanguage.googleapis.com as absence of an applicable proxy route. In production, requests still target the Gemini API host so OneCLI can apply host policy and inject its configured credential; the Rust client must trust the OneCLI CA through the platform's existing SSL_CERT_FILE configuration.
+- Resolve the applicable OneCLI proxy exactly as reqwest's locked environment matcher does: uppercase before lowercase for the scheme-specific, ALL_PROXY, and NO_PROXY variables; valid scheme-specific proxy before ALL_PROXY fallback; REQUEST_METHOD disables the environment proxy; and NO_PROXY supports wildcard, exact-host, and domain-suffix bypasses. Require the OneCLI aoc_ authorization marker on the effective parsed proxy. Do not use ONECLI_URL as a request endpoint. In production, requests still target the Gemini API host so OneCLI can apply host policy and inject its configured credential; the Rust client must trust the OneCLI CA through the platform's existing SSL_CERT_FILE configuration.
 - Retry with a direct key only when a non-success response from the configured OneCLI route has JSON error exactly credential_not_found or app_not_connected. Never use a direct key after network/TLS errors, proxy authentication failures, access_restricted, approval/policy errors, generic upstream 401/403 responses, or any other response. Do not log prompts, direct keys, proxy URLs, proxy authorization, or response bodies.
 - Keep OneCLI credential routing scoped to session naming. The existing shared Gemini transport and its direct-key behavior remain in place for terminal summaries and other non-naming AI features. Keep the existing title toggle semantics and the settings key-cell update behavior.
 - Use pnpm 10.34.5 and the repo-owned test entry points. Every Vitest invocation must set FRESHELL_VITEST_BACKEND=cloud; broad agent gates also set GCLOUD_ROBOT_REQUIRE=1 and a meaningful FRESHELL_TEST_SUMMARY. Keep the configured FRESHELL_E2E_BACKEND=cloud for cloud-compatible browser specs. The OpenCode runtime qualification is marked local-only because it needs the Docker supervisor; run that one through its direct local Chromium script because Cloud E2E excludes it. Do not substitute local Vitest.
@@ -66,16 +66,18 @@ Fix Freshell automatic session naming so a configured OneCLI Gemini credential r
 
 **Interfaces:**
 - Consumes: openCodeTerminalReady(rawOutput: string): boolean and the current GPT-5.6 Luna model banner in the qualification spec.
-- Produces: hasOpenCodePromptModelText(renderedText: string, expectedVisibleModel: string): boolean and openCodeTerminalReady(rawOutput: string, expectedVisibleModel: string): boolean. The browser qualification uses the same model-text predicate as source output, plus the browser's bracketedPasteMode value.
+- Produces: hasOpenCodePromptModelText(renderedText: string, expectedModelTexts: readonly string[]): boolean and openCodeTerminalReady(rawOutput: string, expectedModelTexts: readonly string[]): boolean. The qualification supplies the configured model's provider-visible label and model ID, so either form is accepted when the provider catalog supplies or falls back to that name. Source and browser checks use the same model-text predicate, plus the browser's bracketedPasteMode value.
 
 - [ ] **Step 1: Add the current-model behavioral case while preserving the existing failing negative**
 
 Add this case to the existing readiness describe block. Keep the current free-tier banner negative, last-mode-wins cases, and ANSI-colored valid prompt case unchanged.
 
 ~~~ts
-it('accepts the current configured model prompt and rejects the generic banner', () => {
-  expect(openCodeTerminalReady('\x1b[?2004h\x1b[24;1HBuild  GPT-5.6 Luna  OpenCode Zen', 'GPT-5.6 Luna')).toBe(true)
-  expect(openCodeTerminalReady('\x1b[?2004hBuild Expensive model', 'GPT-5.6 Luna')).toBe(false)
+it('accepts either configured model name and rejects a generic banner', () => {
+  const modelTexts = ['GPT-5.6 Luna', 'openai/gpt-5.6-luna']
+  expect(openCodeTerminalReady('\x1b[?2004h\x1b[24;1HBuild  GPT-5.6 Luna  OpenCode Zen', modelTexts)).toBe(true)
+  expect(openCodeTerminalReady('\x1b[?2004h\x1b[24;1HBuild openai/gpt-5.6-luna', modelTexts)).toBe(true)
+  expect(openCodeTerminalReady('\x1b[?2004hBuild Expensive model', modelTexts)).toBe(false)
 })
 ~~~
 
@@ -87,11 +89,11 @@ Expected: FAIL at the existing free-tier-banner assertion because the helper acc
 
 - [ ] **Step 3: Require the configured visible model in the helper and browser gate**
 
-In opencode-native-history.ts, add hasOpenCodePromptModelText. It returns false for an empty expected model, locates that exact expected model in rendered text, and returns true only when Build occurs within the preceding 160 characters. Update openCodeTerminalReady to take the expected model, require that the final bracketed-paste mode is h, strip VT controls, then call the shared predicate.
+In opencode-native-history.ts, add hasOpenCodePromptModelText. It returns false for an empty expected-model list or when none of its non-empty exact model strings appears after Build in the same visible header line. Do not impose an unverified character-distance limit. Update openCodeTerminalReady to take the expected model strings, require that the final bracketed-paste mode is h, strip VT controls, then call the shared predicate.
 
-Update every unit test call to supply its expected model: Big Pickle for the historical fixture and GPT-5.6 Luna for the current configured model. Preserve the negative free-tier banner, the disabled-input and no-input-mode cases, last-mode-wins behavior, and ANSI stripping.
+Update every unit test call to supply its expected model strings. Cover both the provider-visible GPT-5.6 Luna label and the pinned openai/gpt-5.6-luna model ID; preserve the negative free-tier banner, disabled-input and no-input-mode cases, last-mode-wins behavior, and ANSI stripping.
 
-In runtime-opencode-provider-qualification-rust.spec.ts, pass GPT-5.6 Luna to source readiness. Keep browserModelBanner as a diagnostic derived from hasOpenCodePromptModelText(rendered.text, 'GPT-5.6 Luna'), and do not accept replacement readiness unless that predicate and rendered.modes?.bracketedPasteMode are both true. Do not make the source helper or browser gate accept Build alone.
+In runtime-opencode-provider-qualification-rust.spec.ts, pass both configured model strings to source readiness. Keep browserModelBanner as a diagnostic derived from hasOpenCodePromptModelText(rendered.text, modelTexts), and do not accept replacement readiness unless that predicate and rendered.modes?.bracketedPasteMode are both true. Do not make the source helper or browser gate accept Build alone.
 
 - [ ] **Step 4: Re-run the focused test and the affected browser qualification**
 
@@ -131,51 +133,40 @@ git commit -m "fix: require the configured OpenCode model for readiness"
 - Modify: crates/freshell-server/src/auto_title_sweep.rs
 - Modify: crates/freshell-server/src/sessions.rs
 - Modify: crates/freshell-server/src/session_name_generation_tests.rs
+- Modify: test/e2e-browser/helpers/unified-agent-names.ts
+- Modify: test/e2e-browser/helpers/unified-agent-names-modes.ts
+- Modify: test/e2e-browser/specs/unified-agent-names-freshcodex.spec.ts
 
 **Interfaces:**
 - Consumes: AiKeyCell with its current environment-over-settings boot precedence and force-applied non-empty settings writes; GeminiTransport; the current worker, title-sweep, and generate-title call paths.
 - Produces:
   - GeminiCredentialRoute::{Direct, OneCliProxy}, deriving Clone, Copy, Debug, Eq, and PartialEq.
   - GeminiSessionNameAuth::from_environment(direct_key: AiKeyCell, gemini_base_url: &str) -> Self, plus enabled() -> bool and direct_key() -> Option<String>. enabled() is true when an applicable OneCLI proxy route exists or a non-empty direct key exists; direct_key() returns None for an empty key.
-  - GeminiSessionNameAuth::route_for(gemini_base_url: &str, scheme_proxy: Option<&str>, no_proxy: Option<&str>) -> GeminiCredentialRoute, so scheme selection and NO_PROXY matching can be tested without changing process environment.
+  - GeminiProxyEnvironment::from_environment() -> Self and GeminiProxyEnvironment::literal(https_proxy: Option<&str>, http_proxy: Option<&str>, all_proxy: Option<&str>, no_proxy: Option<&str>, request_method_present: bool) -> Self; the literal constructor is test-only and does not read process environment. A shared first-present helper selects the uppercase variable when present, including an empty value, otherwise lowercase.
+  - GeminiProxyEnvironment and GeminiSessionNameAuth::route_for(gemini_base_url: &str, proxy_environment: &GeminiProxyEnvironment) -> GeminiCredentialRoute, so proxy selection can be tested with literal inputs without changing process environment.
   - GeminiSessionNameHttp::new(client: reqwest::Client, auth: GeminiSessionNameAuth, base_url: String), implementing GeminiTransport.
-  - OneCLI route mode is true only when the scheme-relevant HTTP proxy setting contains the OneCLI aoc_ marker and NO_PROXY/no_proxy does not bypass the Gemini hostname. Match the Gemini hostname exactly or by a comma-separated NO_PROXY domain suffix, including the tested `.googleapis.com` suffix. The direct key remains available for Task 3's explicit missing-credential retry.
+  - Capture the proxy environment once when building the session-name transport, with the same variable precedence as reqwest's locked hyper-util matcher: uppercase before lowercase for HTTPS_PROXY/https_proxy, HTTP_PROXY/http_proxy, ALL_PROXY/all_proxy, and NO_PROXY/no_proxy. A valid scheme-specific proxy takes precedence; an absent or unparseable scheme proxy falls back to ALL_PROXY. REQUEST_METHOD disables environment proxies as reqwest does. For the Gemini hostname, NO_PROXY matching must support wildcard, exact hosts, case-insensitive domain suffixes, and leading-dot suffixes; a nonmatching entry must not bypass the proxy. Select OneCliProxy only when the effective parsed proxy carries the OneCLI aoc_ authorization marker. Keep proxy values private and out of logs. The direct key remains available for Task 3's explicit missing-credential retry.
 
 - [ ] **Step 1: Add red transport and direct-fallback tests**
 
-Add this route-selection unit case in ai_title.rs. It must use literal inputs and must not mutate process environment.
+Add route-selection unit cases in ai_title.rs. They use literal GeminiProxyEnvironment values and do not mutate process environment. Cover HTTPS and HTTP scheme proxies, ALL_PROXY fallback, a valid generic scheme proxy taking precedence over a OneCLI ALL_PROXY, malformed scheme proxy falling back to ALL_PROXY, NO_PROXY exact-host, .googleapis.com, wildcard, and nonmatching-domain behavior, REQUEST_METHOD disabling environment proxies, and a focused first-present helper case proving uppercase precedence even when its value is empty.
 
 ~~~rust
 #[test]
-fn onecli_route_detection_requires_scheme_marker_and_honors_no_proxy() {
+fn onecli_route_detection_matches_effective_reqwest_proxy() {
     let gemini = "https://generativelanguage.googleapis.com/v1beta";
     assert_eq!(
         GeminiSessionNameAuth::route_for(
             gemini,
-            Some("http://aoc_fixture@127.0.0.1:10255"),
-            None,
+            &GeminiProxyEnvironment::literal(
+                Some("http://aoc_fixture@127.0.0.1:10255"),
+                None,
+                None,
+                None,
+                false,
+            ),
         ),
         GeminiCredentialRoute::OneCliProxy,
-    );
-    assert_eq!(
-        GeminiSessionNameAuth::route_for(gemini, Some("http://proxy.example:8080"), None),
-        GeminiCredentialRoute::Direct,
-    );
-    assert_eq!(
-        GeminiSessionNameAuth::route_for(
-            gemini,
-            Some("http://aoc_fixture@127.0.0.1:10255"),
-            Some("generativelanguage.googleapis.com"),
-        ),
-        GeminiCredentialRoute::Direct,
-    );
-    assert_eq!(
-        GeminiSessionNameAuth::route_for(
-            gemini,
-            Some("http://aoc_fixture@127.0.0.1:10255"),
-            Some(".googleapis.com"),
-        ),
-        GeminiCredentialRoute::Direct,
     );
 }
 ~~~
@@ -184,15 +175,27 @@ Add `#[tokio::test] async fn direct_session_name_route_uses_existing_key_when_on
 
 Add `#[tokio::test] async fn session_name_onecli_route_omits_direct_key()` in ai_title.rs. Use a loopback Gemini responder, a `GeminiSessionNameAuth` with the OneCLI route selected and a synthetic direct key available, and a reqwest client with `.no_proxy()`. Call `generate_content` and assert one request, no x-goog-api-key, and the returned generated title. The proxy-route choice itself is covered by the literal route-selection test above; this test isolates the transport's header behavior.
 
+Add startFakeOneCliGeminiProxy and activityGeneratesOneSharedShortNameViaOneCliProxy in test/e2e-browser/helpers/unified-agent-names.ts and test/e2e-browser/helpers/unified-agent-names-modes.ts, plus the spec case in test/e2e-browser/specs/unified-agent-names-freshcodex.spec.ts. The proxy starts on loopback, returns a deterministic Gemini candidates response, and records only the destination hostname, path, whether x-goog-api-key was present, and whether the parsed prompt contains the expected first message. Do not retain or print proxy authorization, the proxy URL, request body, or key value. bootJourney accepts this fixture and a synthetic direct fallback key; the owned server receives FRESHELL_GEMINI_BASE_URL=http://generativelanguage.googleapis.com/v1beta, HTTP_PROXY and http_proxy set to the fixture URL with an aoc_ test marker, NO_PROXY and no_proxy empty, and GOOGLE_GENERATIVE_AI_API_KEY set to a sentinel. The browser journey creates a fresh Codex pane, sends “Repair the sardine factory line”, and waits until the generated saved name is visible in the pane, tab, and sidebar. Assert exactly one proxy request to generativelanguage.googleapis.com at /v1beta/models/gemini-3.5-flash-lite:generateContent, that its prompt contains the entered message, and that x-goog-api-key was absent. Add this spec:
+
+~~~ts
+test('activity uses the OneCLI route before the direct fallback key', async ({ browser }) => {
+  await activityGeneratesOneSharedShortNameViaOneCliProxy('freshcodex', browser)
+})
+~~~
+
 - [ ] **Step 2: Run the route tests and confirm the OneCLI path is missing**
 
-Run: cargo test -p freshell-server onecli_route_detection_requires_scheme_marker_and_honors_no_proxy
+Run: cargo test -p freshell-server onecli_route_detection_matches_effective_reqwest_proxy
 
 Expected: FAIL because the production `GeminiSessionNameAuth` route interface is missing; compilation points only to the absent route implementation referenced by the test. It must not fail from malformed test syntax, an unavailable dependency, or an existing test regression.
 
+Run: FRESHELL_E2E_BACKEND=cloud GCLOUD_ROBOT_REQUIRE=1 pnpm run test:e2e --project=chromium --grep='OneCLI route' test/e2e-browser/specs/unified-agent-names-freshcodex.spec.ts
+
+Expected: FAIL at the assertion that the OneCLI-routed request omitted x-goog-api-key, because the existing naming transport sends its direct key on the proxy request. The Cloud receipt must show the route case selected and the synthetic proxy request received; this case proves proxy routing, not Codex transcript parsing.
+
 - [ ] **Step 3: Add the session-name-specific route, capability, and transport**
 
-In ai_title.rs, keep GeminiHttp and its direct-key behavior unchanged for terminal summaries and other non-naming consumers. Add GeminiCredentialRoute, GeminiSessionNameAuth, and GeminiSessionNameHttp with the interfaces above. Resolve the proxy for the scheme of gemini_base_url: HTTPS_PROXY/https_proxy for the production HTTPS Gemini URL, and HTTP_PROXY/http_proxy for the explicit HTTP e2e seam. Require the OneCLI aoc_ marker. If NO_PROXY/no_proxy matches generativelanguage.googleapis.com, select Direct because reqwest will bypass the gateway. Do not include proxy URL or proxy authorization in any logs.
+In ai_title.rs, keep GeminiHttp and its direct-key behavior unchanged for terminal summaries and other non-naming consumers. Add GeminiCredentialRoute, GeminiProxyEnvironment, GeminiSessionNameAuth, and GeminiSessionNameHttp with the interfaces above. Mirror the locked hyper-util environment matcher that backs reqwest 0.13.4: resolve uppercase-before-lowercase variables, use the valid scheme-specific proxy or fall back to ALL_PROXY when absent or unparseable, and disable environment proxy selection when REQUEST_METHOD is present. Apply NO_PROXY/no_proxy host matching before checking the effective parsed proxy's OneCLI authorization marker. Keep the resolver narrowly scoped to the Gemini destination and covered for the complete listed proxy precedence and bypass behavior. Do not include proxy URL or proxy authorization in any logs.
 
 In GeminiSessionNameHttp::generate_content, preserve the current generateContent URL, JSON body, content type, candidate parsing, thought-part filtering, and output behavior. With route Direct, preserve the current AiKeyCell header behavior. With route OneCliProxy, send the request to the Gemini API hostname without x-goog-api-key. Do not change the autoGenerateTitles toggle or direct key precedence.
 
@@ -200,9 +203,9 @@ In main.rs, build the existing generic GeminiHttp for current summary behavior a
 
 - [ ] **Step 4: Run the focused Rust transport tests**
 
-Run: cargo test -p freshell-server onecli_route_detection_requires_scheme_marker_and_honors_no_proxy
+Run: cargo test -p freshell-server onecli_route_detection_matches_effective_reqwest_proxy
 
-Expected: PASS for route selection with and without the OneCLI marker and with NO_PROXY matching the Gemini hostname or its Google API domain suffix.
+Expected: PASS for route selection across effective scheme and ALL proxy precedence, and for exact, suffix, wildcard, nonmatching, and CGI-bypass cases.
 
 Run: cargo test -p freshell-server direct_session_name_route_uses_existing_key_when_onecli_proxy_is_absent
 
@@ -222,10 +225,14 @@ Run: cargo test -p freshell-server
 
 Expected: PASS for all Rust server tests, including automatic naming, manual title generation, summary endpoints, and existing direct-key behavior.
 
+Run: FRESHELL_E2E_BACKEND=cloud GCLOUD_ROBOT_REQUIRE=1 pnpm run test:e2e --project=chromium --grep='OneCLI route' test/e2e-browser/specs/unified-agent-names-freshcodex.spec.ts
+
+Expected: PASS with the selected browser route case, the generated prompt observed by the synthetic proxy, no x-goog-api-key on the OneCLI request, and the same saved name visible in the pane, tab, and sidebar. The Cloud receipt must confirm selection.
+
 - [ ] **Step 7: Commit the complete OneCLI-first route**
 
 ~~~bash
-git add crates/freshell-server/src/ai_title.rs crates/freshell-server/src/main.rs crates/freshell-server/src/session_name_generation.rs crates/freshell-server/src/auto_title_sweep.rs crates/freshell-server/src/sessions.rs crates/freshell-server/src/session_name_generation_tests.rs
+git add crates/freshell-server/src/ai_title.rs crates/freshell-server/src/main.rs crates/freshell-server/src/session_name_generation.rs crates/freshell-server/src/auto_title_sweep.rs crates/freshell-server/src/sessions.rs crates/freshell-server/src/session_name_generation_tests.rs test/e2e-browser/helpers/unified-agent-names.ts test/e2e-browser/helpers/unified-agent-names-modes.ts test/e2e-browser/specs/unified-agent-names-freshcodex.spec.ts
 git commit -m "feat: route automatic session naming through OneCLI"
 ~~~
 
@@ -288,9 +295,6 @@ git commit -m "fix: limit Gemini key fallback to unconnected OneCLI routes"
 - Modify: crates/freshell-sessions/src/parse/codex.rs
 - Modify: crates/freshell-sessions/tests/codex_fixture_parity.rs
 - Modify: crates/freshell-sessions/src/directory_index.rs
-- Modify: test/e2e-browser/helpers/unified-agent-names.ts
-- Modify: test/e2e-browser/helpers/unified-agent-names-modes.ts
-- Modify: test/e2e-browser/specs/unified-agent-names-freshcodex.spec.ts
 
 **Interfaces:**
 - Consumes: parse_codex_session_content(&str) -> ParsedSessionMeta, extract_user_authored_text(&str), normalize_first_user_message(&str), extract_title_from_message(&str, usize), and CodexSource::scan() -> Vec<IndexedSession>.
@@ -328,16 +332,6 @@ assert_eq!(
 );
 ~~~
 
-Add startFakeOneCliGeminiProxy(replyText) to unified-agent-names.ts. It starts a loopback HTTP proxy, returns a deterministic Gemini candidates response, and records only destination hostname, path, whether x-goog-api-key was present, and whether the posted prompt contains the expected first message. It must not store or print proxy authorization, the full proxy URL, the request body, or any key value. Extend bootJourney's options to accept this fixture and a synthetic direct key; set FRESHELL_GEMINI_BASE_URL to http://generativelanguage.googleapis.com/v1beta, HTTP_PROXY and http_proxy to the fixture URL containing an aoc_ test marker, NO_PROXY and no_proxy to empty, and GOOGLE_GENERATIVE_AI_API_KEY to a sentinel string.
-
-Add activityGeneratesOneSharedShortNameViaOneCliProxy(mode, browser) to unified-agent-names-modes.ts. It boots a fresh Codex journey through the fixture, creates the pane through the browser, sends “Repair the sardine factory line”, waits for the shared saved title, then asserts exactly one request reached generativelanguage.googleapis.com at /v1beta/models/gemini-3.5-flash-lite:generateContent, the expected prompt was present, and x-goog-api-key was absent. Add this spec to unified-agent-names-freshcodex.spec.ts:
-
-~~~ts
-test('activity uses the OneCLI route before the direct fallback key', async ({ browser }) => {
-  await activityGeneratesOneSharedShortNameViaOneCliProxy('freshcodex', browser)
-})
-~~~
-
 - [ ] **Step 2: Run the focused Cargo tests and confirm the intended failure**
 
 Run: cargo test -p freshell-sessions --test codex_fixture_parity
@@ -347,10 +341,6 @@ Expected: FAIL because the event_msg message text is currently discarded, so the
 Run: cargo test -p freshell-sessions codex_source_scans_fixture_and_uses_parsed_session_id
 
 Expected: FAIL because the real Codex source/index projection currently has no first_user_message to carry.
-
-Run: FRESHELL_E2E_BACKEND=cloud GCLOUD_ROBOT_REQUIRE=1 pnpm run test:e2e --project=chromium --grep='OneCLI route' test/e2e-browser/specs/unified-agent-names-freshcodex.spec.ts
-
-Expected: FAIL because the real Codex event_msg prompt is still discarded and naming receives no initiating prompt; the parser unit test above independently confirms that cause. The owned server must launch and the Cloud receipt must show the OneCLI route case selected.
 
 - [ ] **Step 3: Parse both Codex user-message record shapes through the shared normalizer**
 
@@ -366,10 +356,6 @@ Run: cargo test -p freshell-sessions codex_source_scans_fixture_and_uses_parsed_
 
 Expected: PASS with IndexedSession.first_user_message equal to Sanitized prompt.
 
-Run: FRESHELL_E2E_BACKEND=cloud GCLOUD_ROBOT_REQUIRE=1 pnpm run test:e2e --project=chromium --grep='OneCLI route' test/e2e-browser/specs/unified-agent-names-freshcodex.spec.ts
-
-Expected: PASS with the proxy request evidence and the same saved name visible in the pane, tab, sidebar, and canonical session-name record. The Cloud receipt must show the test was selected.
-
 - [ ] **Step 5: Refactor while green**
 
 Keep the two JSON record shapes as inputs to the existing shared extraction, normalization, and title helpers. Do not duplicate text cleanup or alter semantic-event timestamp accounting.
@@ -384,15 +370,11 @@ Run: cargo test -p freshell-server
 
 Expected: PASS for server consumers of IndexedSession and automatic naming.
 
-Run: FRESHELL_E2E_BACKEND=cloud GCLOUD_ROBOT_REQUIRE=1 pnpm run test:e2e --project=chromium test/e2e-browser/specs/unified-agent-names-freshcodex.spec.ts
-
-Expected: PASS for the full affected fresh-Codex naming spec; inspect pnpm run test:status before dispatch and wait if the shared gate is occupied.
-
 - [ ] **Step 7: Commit the complete parser change**
 
 ~~~bash
-git add crates/freshell-sessions/src/parse/codex.rs crates/freshell-sessions/tests/codex_fixture_parity.rs crates/freshell-sessions/src/directory_index.rs test/e2e-browser/helpers/unified-agent-names.ts test/e2e-browser/helpers/unified-agent-names-modes.ts test/e2e-browser/specs/unified-agent-names-freshcodex.spec.ts
-git commit -m "fix: parse Codex event messages and cover OneCLI naming route"
+git add crates/freshell-sessions/src/parse/codex.rs crates/freshell-sessions/tests/codex_fixture_parity.rs crates/freshell-sessions/src/directory_index.rs
+git commit -m "fix: parse Codex event messages for naming"
 ~~~
 
 ## Final Gate After All Tasks
@@ -422,7 +404,8 @@ Expected: PASS; the browser qualification is excluded from Cloud E2E because its
 
 - The complete dispatcher-authored User Request block is copied unchanged once above; all six active obligations are assigned to tasks or gates: OneCLI-first auth, existing-key fallback when route is absent or explicitly unconnected, no fallback on other authorization/policy failures, both Codex user-message record shapes, OpenCode readiness repair, and a green suite before naming/parser work plus a final complete gate.
 - The OneCLI transport is session-name-specific; terminal summary callers keep the existing direct transport. The new e2e proxy uses only synthetic credentials and local traffic. The exact OneCLI missing response codes are durably recorded in run-state before the plan commit.
-- The OpenCode unit and browser contracts share one visible model predicate, preserve final bracketed-paste mode, ANSI output, and free-tier rejection, and the full Cloud Vitest checkpoint blocks later tasks.
+- The session-name route detector mirrors reqwest's effective scheme and ALL proxy selection, variable precedence, CGI disabling, and NO_PROXY host bypass semantics; the browser route case proves proxy routing and shared-name presentation, while parser coverage is independently provided by fixture parity and CodexSource indexing.
+- The OpenCode unit and browser contracts share one visible model predicate, accept the configured display label or pinned model ID, preserve final bracketed-paste mode, ANSI output, and free-tier rejection, and the full Cloud Vitest checkpoint blocks later tasks.
 - Codex parsing uses the existing text cleaning and title helpers; fixture parity and CodexSource scanning prove the prompt reaches IndexedSession, the value already consumed by the naming sweep.
 - The two allowed OneCLI errors are exact JSON error-field matches. access_restricted, approval_required, generic status failures, transport/TLS failures, malformed response bodies, and a missing direct key have no key retry. No proxy route selects the existing direct-key source and precedence.
 - The plan adds no dependency, changes no data format or migration, and adds no end-user setting. Structured fallback logging omits credentials, prompt, proxy URL, and response body.
@@ -438,4 +421,4 @@ git add docs/plans/2026-09-30-onecli-session-naming.md
 git commit -m "docs: add implementation plan for onecli session naming"
 ~~~
 
-After verifying the commit contains only this plan, update the external run-state record with the absolute plan path, feature name, commit SHA, self-review result, Stage 1 completion time, and Stage 2 as current with next action “validate load-bearing assumptions”.
+After verifying the commit contains only this plan, update the external run-state record with the absolute plan path, feature name, amendment commit SHA, plan self-review result, and Stage 2 completion. Record the LB-5 acceptable path and the load-bearing receipt, then set Stage 3 as current with next action “run the independent plan review”.
