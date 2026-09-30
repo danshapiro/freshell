@@ -217,6 +217,95 @@ pub fn merge_owned_entries(
     Ok(config.to_string())
 }
 
+/// Normalize the JSONC accepted by OpenCode's `jsonc-parser` (comments and
+/// trailing commas) without changing string literals or accepting dangling
+/// block comments.
+pub fn jsonc_to_strict_json(raw: &str) -> String {
+    let chars: Vec<char> = raw.chars().collect();
+    let mut stripped = String::with_capacity(raw.len());
+    let mut i = 0;
+    let mut in_string = false;
+    while i < chars.len() {
+        let c = chars[i];
+        if in_string {
+            stripped.push(c);
+            if c == '\\' && i + 1 < chars.len() {
+                stripped.push(chars[i + 1]);
+                i += 1;
+            } else if c == '"' {
+                in_string = false;
+            }
+            i += 1;
+        } else if c == '"' {
+            in_string = true;
+            stripped.push(c);
+            i += 1;
+        } else if c == '/' && chars.get(i + 1) == Some(&'/') {
+            stripped.push(' ');
+            i += 2;
+            while i < chars.len() && chars[i] != '\n' && chars[i] != '\r' {
+                i += 1;
+            }
+        } else if c == '/' && chars.get(i + 1) == Some(&'*') {
+            let start = i;
+            stripped.push(' ');
+            i += 2;
+            let mut closed = false;
+            while i < chars.len() {
+                if chars[i] == '*' && chars.get(i + 1) == Some(&'/') {
+                    i += 2;
+                    closed = true;
+                    break;
+                }
+                i += 1;
+            }
+            if !closed {
+                stripped.extend(chars[start..].iter());
+            }
+        } else {
+            stripped.push(c);
+            i += 1;
+        }
+    }
+
+    let chars: Vec<char> = stripped.chars().collect();
+    let mut out = String::with_capacity(stripped.len());
+    let mut i = 0;
+    in_string = false;
+    while i < chars.len() {
+        let c = chars[i];
+        if in_string {
+            out.push(c);
+            if c == '\\' && i + 1 < chars.len() {
+                out.push(chars[i + 1]);
+                i += 1;
+            } else if c == '"' {
+                in_string = false;
+            }
+            i += 1;
+        } else if c == '"' {
+            in_string = true;
+            out.push(c);
+            i += 1;
+        } else if c == ',' {
+            let mut j = i + 1;
+            while matches!(chars.get(j), Some(' ' | '\t' | '\n' | '\r')) {
+                j += 1;
+            }
+            if matches!(chars.get(j), Some('}' | ']')) {
+                i += 1;
+            } else {
+                out.push(c);
+                i += 1;
+            }
+        } else {
+            out.push(c);
+            i += 1;
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -370,93 +459,4 @@ mod tests {
         assert_eq!(config["permission"]["edit"], "ask");
         assert_eq!(config["permission"]["bash"], "allow");
     }
-}
-
-/// Normalize the JSONC accepted by OpenCode's `jsonc-parser` (comments and
-/// trailing commas) without changing string literals or accepting dangling
-/// block comments.
-pub fn jsonc_to_strict_json(raw: &str) -> String {
-    let chars: Vec<char> = raw.chars().collect();
-    let mut stripped = String::with_capacity(raw.len());
-    let mut i = 0;
-    let mut in_string = false;
-    while i < chars.len() {
-        let c = chars[i];
-        if in_string {
-            stripped.push(c);
-            if c == '\\' && i + 1 < chars.len() {
-                stripped.push(chars[i + 1]);
-                i += 1;
-            } else if c == '"' {
-                in_string = false;
-            }
-            i += 1;
-        } else if c == '"' {
-            in_string = true;
-            stripped.push(c);
-            i += 1;
-        } else if c == '/' && chars.get(i + 1) == Some(&'/') {
-            stripped.push(' ');
-            i += 2;
-            while i < chars.len() && chars[i] != '\n' && chars[i] != '\r' {
-                i += 1;
-            }
-        } else if c == '/' && chars.get(i + 1) == Some(&'*') {
-            let start = i;
-            stripped.push(' ');
-            i += 2;
-            let mut closed = false;
-            while i < chars.len() {
-                if chars[i] == '*' && chars.get(i + 1) == Some(&'/') {
-                    i += 2;
-                    closed = true;
-                    break;
-                }
-                i += 1;
-            }
-            if !closed {
-                stripped.extend(chars[start..].iter());
-            }
-        } else {
-            stripped.push(c);
-            i += 1;
-        }
-    }
-
-    let chars: Vec<char> = stripped.chars().collect();
-    let mut out = String::with_capacity(stripped.len());
-    let mut i = 0;
-    in_string = false;
-    while i < chars.len() {
-        let c = chars[i];
-        if in_string {
-            out.push(c);
-            if c == '\\' && i + 1 < chars.len() {
-                out.push(chars[i + 1]);
-                i += 1;
-            } else if c == '"' {
-                in_string = false;
-            }
-            i += 1;
-        } else if c == '"' {
-            in_string = true;
-            out.push(c);
-            i += 1;
-        } else if c == ',' {
-            let mut j = i + 1;
-            while matches!(chars.get(j), Some(' ' | '\t' | '\n' | '\r')) {
-                j += 1;
-            }
-            if matches!(chars.get(j), Some('}' | ']')) {
-                i += 1;
-            } else {
-                out.push(c);
-                i += 1;
-            }
-        } else {
-            out.push(c);
-            i += 1;
-        }
-    }
-    out
 }
