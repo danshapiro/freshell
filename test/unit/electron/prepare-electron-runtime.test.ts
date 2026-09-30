@@ -360,6 +360,14 @@ describe('prepare-electron-runtime staging', () => {
     }
   })
 
+  it('exports the generated MCP runtime tree from the workspace packaging manifest', () => {
+    const manifest = JSON.parse(readFileSync(
+      new URL('../../../packages/freshell-mcp-runtime/package.json', import.meta.url),
+      'utf8',
+    )) as { files?: unknown }
+    expect(manifest.files).toEqual(['generated'])
+  })
+
   it('stages the portable runtime from pnpm deploy exports', async () => {
     const sourceRoot = temporaryRoot()
     const outputRoot = path.join(temporaryRoot(), 'electron-runtime')
