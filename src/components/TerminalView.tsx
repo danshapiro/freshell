@@ -3512,17 +3512,14 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
         // disposed
       }
     }
-    const cols = Math.max(2, term.cols || 80)
-    const rows = Math.max(2, term.rows || 24)
+    let cols = Math.max(2, term.cols || 80)
+    let rows = Math.max(2, term.rows || 24)
     syncGeometryEpochForViewport(tid, cols, rows)
     let attachRequestId = `${paneIdRef.current}:${++attachCounterRef.current}:${nanoid(6)}`
     const writeQueue = writeQueueRef.current
     const hasInFlightWrites = writeQueue?.hasInFlightWrites() === true
     const expectedStreamId = getTerminalCheckpointStreamId()
-    const checkpointInput = buildCheckpointReplayInput(tid, { cols, rows })
     const checkpointDecision = getCheckpointDeltaReplayDecision(tid, { cols, rows })
-    const expectedGeometryEpoch = checkpointInput?.geometryEpoch ?? geometryEpochRef.current
-    const expectedGeometryAuthority = checkpointInput?.geometryAuthority ?? geometryAuthorityRef.current
     const explicitSinceSeq = typeof opts?.sinceSeq === 'number'
       ? Math.max(0, Math.floor(opts.sinceSeq))
       : undefined
@@ -3589,6 +3586,16 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
     let surfaceQuarantined = hasInFlightWrites
     let deferContentReconstruction = opts?.deferViewportClearUntilContent === true
     const sendAttach = ({ preserveDeliveryGapNotice = false }: { preserveDeliveryGapNotice?: boolean } = {}) => {
+      const projectedCols = Math.max(2, term.cols || 80)
+      const projectedRows = Math.max(2, term.rows || 24)
+      if (cols !== projectedCols || rows !== projectedRows) {
+        syncGeometryEpochForViewport(tid, projectedCols, projectedRows)
+        cols = projectedCols
+        rows = projectedRows
+      }
+      const checkpointInput = buildCheckpointReplayInput(tid, { cols, rows })
+      const expectedGeometryEpoch = checkpointInput?.geometryEpoch ?? geometryEpochRef.current
+      const expectedGeometryAuthority = checkpointInput?.geometryAuthority ?? geometryAuthorityRef.current
       // A content probe can wait through a visibility change before creating
       // its reset ticket. Project visibility at the actual wire boundary so
       // a now-hidden pane cannot claim geometry, including as first viewer.
@@ -3825,6 +3832,16 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
         surfaceQuarantined = false
         deferContentReconstruction = false
         repairContentReconstructionRef.current = null
+        // Reconstruction crossed an asynchronous boundary. Fit the current
+        // visible viewport even if its original pre-attach fit was skipped.
+        const currentRuntime = runtimeRef.current
+        if (currentRuntime && !hiddenRef.current) {
+          try {
+            currentRuntime.fit()
+          } catch {
+            // disposed
+          }
+        }
         log.debug('Terminal reconstruction completed', { paneId: paneIdRef.current, terminalId: tid, generation: ticket.generation })
         // This replacement belongs to the admitted delivery-gap repair;
         // preserve its notice while the replacement replay is outstanding.
