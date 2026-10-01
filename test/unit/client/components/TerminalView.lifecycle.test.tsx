@@ -10796,6 +10796,10 @@ describe('TerminalView lifecycle updates', () => {
         'the notice is chrome, never surface bytes',
       ).toBe(false)
 
+      // Hold the actual reset completion: authorizing a reconstruction is
+      // separate from completing it and receiving the replacement replay.
+      term.deferWrites = true
+
       // The hydrate's content establishes the new baseline: the surface
       // is replaced exactly when the content arrives — never before. The
       // clear and the replacement apply as ONE flush-time unit.
@@ -10826,11 +10830,24 @@ describe('TerminalView lifecycle updates', () => {
       await flushFrames()
       await flushFrames()
       expect(reconstructionWrites(term)).toHaveLength(1)
+      expect(term.pendingWriteCallbacks).toHaveLength(1)
+      expect(repairAttaches()).toHaveLength(1)
+      expect(screen.getByTestId('restore-delivery-gap-notice').textContent).toContain('output gap 2-5')
       expect(term.clear).not.toHaveBeenCalled()
       expect(terminalWriteStrings(term)).not.toContain('REBUILT')
+      act(() => { term.releasePendingWrites() })
+      await flushFrames()
+      expect(repairAttaches()).toHaveLength(2)
+      // The second attach belongs to the same repair. Its empty reset surface
+      // must retain the honest notice while the server replay is outstanding.
+      expect(screen.getByTestId('restore-delivery-gap-notice').textContent).toContain('output gap 2-5')
       replayReconstructedSurface(terminalId, repair[0]!.attachRequestId, 8, 'REBUILT')
       await flushFrames()
       expectTerminalWriteContaining(term, 'REBUILT')
+      act(() => { term.releasePendingWrites() })
+      await flushFrames()
+      expect(screen.getByTestId('restore-delivery-gap-notice').textContent).toContain('output gap 2-5')
+      expect(terminalWriteStrings(term).some((entry) => entry.includes('Output gap'))).toBe(false)
       expect(screen.queryByTestId('restore-recovery-retry')).toBeNull()
     })
 
@@ -13369,6 +13386,45 @@ describe('TerminalView lifecycle updates', () => {
         term.write.mockImplementation((_data: string, callback?: () => void) => { if (callback) held.push(callback) })
         return held
       }
+
+      it('projects a deferred delivery-gap reconstruction as keepalive when hidden before content arrives', async () => {
+        const { terminalId, paneId, tabId, store, term, rerenderAt } = await setupPacedPane({ mode: 'codex' })
+        const pump = captureRaf()
+        act(() => { ready(terminalId, 1); deliverOutput('single', terminalId, 1, PREFIX + '\x07'); pump() })
+        expect(readPacedCheckpoint(terminalId, paneId)).toBeNull()
+        term.write.mockClear()
+        wsMocks.send.mockClear()
+        const held = holdWrites(term)
+
+        act(() => { messageHandler!({ type: 'terminal.output.gap', terminalId, fromSeq: 2, toSeq: 5, reason: 'queue_overflow' }); pump() })
+        const probe = attachMessagesFor(terminalId)[0]!
+        expect(probe).toMatchObject({ intent: 'viewport_hydrate', sinceSeq: 0 })
+        expect(term.write).not.toHaveBeenCalled()
+        rerenderAt(true)
+        expect(term.write).not.toHaveBeenCalled()
+        expect(attachMessagesFor(terminalId)).toHaveLength(1)
+
+        act(() => { ready(terminalId, 8); deliverOutput('single', terminalId, 1, 'REBUILT\r\n'); pump() })
+        expect(term.write.mock.calls.map(([data]: [string]) => data)).toEqual([RESET])
+        expect(held).toHaveLength(1)
+        expect(attachMessagesFor(terminalId)).toHaveLength(1)
+        act(() => { held.shift()!(); pump() })
+        const replacement = attachMessagesFor(terminalId).at(-1)!
+        expect(replacement.attachRequestId).not.toBe(probe.attachRequestId)
+        expect(replacement).toMatchObject({ terminalId, intent: 'keepalive_delta', sinceSeq: 0, surfaceReset: true })
+        expect(attachMessagesFor(terminalId)).toHaveLength(2)
+
+        act(() => { ready(terminalId, 1); deliverOutput('single', terminalId, 1, 'REBUILT\r\n'); pump(); held.shift()!(); pump() })
+        expect(creditMessages().at(-1)).toMatchObject({ attachRequestId: replacement.attachRequestId, consumedSeq: 1 })
+        expect(store.getState().panes.layouts[tabId]).toMatchObject({ content: { terminalId } })
+        expect(term.clear).not.toHaveBeenCalled()
+        expect(screen.queryByTestId('restore-recovery-retry')).toBeNull()
+        // The replacement send consumes no additional recovery admission.
+        const before = attachMessagesFor(terminalId).length
+        for (let attempt = 0; attempt < 3; attempt++) act(() => { reconnectHandler!(); pump(); while (held.length) { held.shift()!(); pump() } })
+        expect(attachMessagesFor(terminalId)).toHaveLength(before + 2)
+        expect(screen.getByTestId('restore-recovery-retry')).toBeTruthy()
+      })
 
       it.each(ENVELOPES)('credits a page-ending incomplete SGR after the real %s write completes', async (envelope) => {
         const { terminalId, paneId, term } = await setupPacedPane({ suffix: `sgr-${envelope}`, mode: 'codex' })
