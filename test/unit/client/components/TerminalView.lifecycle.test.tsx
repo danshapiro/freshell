@@ -13828,6 +13828,84 @@ describe('TerminalView lifecycle updates', () => {
         expect(readPacedCheckpoint(terminalId, paneId)).toBeNull()
       })
 
+      it.each(['explicit gap', 'malformed batch', 'stream mismatch'] as const)(
+        'a failed stream write pins target-reaching loss completion until fresh reconstruction (%s)',
+        async loss => {
+          const { terminalId, paneId, term } = await setupPacedPane({ mode: 'codex' })
+          const pump = captureRaf()
+          const emulatorCount = terminalInstances.length
+          // Charge a recovery attempt before the failure so later successful
+          // same-generation writes cannot silently refund that attempt.
+          act(() => { reconnectHandler!(); pump(); ready(terminalId, 2) })
+          expect(attachMessagesFor(terminalId)).toHaveLength(2)
+          term.write.mockImplementationOnce(() => { throw new Error('accepted surface write rejected') })
+          act(() => { deliverOutput('single', terminalId, 1, PREFIX); pump() })
+          expect(terminalWriteStrings(term).at(-1)).toBe(PREFIX)
+          expect(screen.queryByText('Recovering terminal output...')).not.toBeNull()
+
+          act(() => {
+            if (loss === 'explicit gap') {
+              messageHandler!({ type: 'terminal.output.gap', terminalId, fromSeq: 2, toSeq: 2, reason: 'replay_window_exceeded' })
+            } else if (loss === 'malformed batch') {
+              messageHandler!({
+                type: 'terminal.output.batch', terminalId, source: 'replay',
+                seqStart: 2, seqEnd: 2, data: 'REJECTED', serializedBytes: -1,
+                segments: [{ seqStart: 2, seqEnd: 2, endOffset: 8, rawFrameCount: 1 }],
+              })
+            } else {
+              messageHandler!({ type: 'terminal.output', terminalId, streamId: 'other-stream', seqStart: 2, seqEnd: 2, data: 'REJECTED' })
+            }
+            pump()
+          })
+          // Reporting seq 2 lost does not report or repair seq 1's failed
+          // accepted write, even though the gap reaches the replay target.
+          expect(screen.queryByText('Recovering terminal output...')).not.toBeNull()
+          expect(creditMessages()).toEqual([])
+          expect(readPacedCheckpoint(terminalId, paneId)).toBeNull()
+          act(() => { deliverOutput('single', terminalId, 3, 'LATER-LIVE\r\n', 'live'); pump() })
+          expectTerminalWriteContaining(term, 'LATER-LIVE')
+          expect(creditMessages()).toEqual([])
+          expect(readPacedCheckpoint(terminalId, paneId)).toBeNull()
+
+          const held = holdWrites(term)
+          act(() => { reconnectHandler!(); pump() })
+          expect(reconstructionWrites(term)).toHaveLength(1)
+          expect(held).toHaveLength(1)
+          expect(attachMessagesFor(terminalId)).toHaveLength(2)
+          // Two further admissions consume the remaining budget. The next
+          // attempt is refused while the latest admitted reset still owns
+          // its callback and must be allowed to finish the reconstruction.
+          act(() => { reconnectHandler!(); pump(); reconnectHandler!(); pump() })
+          expect(screen.getByTestId('restore-recovery-retry')).toBeTruthy()
+          expect(attachMessagesFor(terminalId)).toHaveLength(2)
+          act(() => { held.shift()!(); pump() })
+          expect(reconstructionWrites(term)).toHaveLength(2)
+          expect(held).toHaveLength(1)
+          expect(attachMessagesFor(terminalId)).toHaveLength(2)
+          expect(creditMessages()).toEqual([])
+          act(() => { held.shift()!(); pump() })
+          const freshAttach = attachMessagesFor(terminalId).at(-1)
+          expect(attachMessagesFor(terminalId)).toHaveLength(3)
+          expect(freshAttach).toMatchObject({ terminalId, sinceSeq: 0, surfaceReset: true })
+          act(() => {
+            ready(terminalId, 3)
+            messageHandler!({ type: 'terminal.output', terminalId, seqStart: 1, seqEnd: 3, source: 'replay', data: 'REBUILT\r\n' })
+            pump()
+          })
+          expect(held).toHaveLength(1)
+          expect(screen.queryByText('Recovering terminal output...')).not.toBeNull()
+          expect(creditMessages()).toEqual([])
+          expect(readPacedCheckpoint(terminalId, paneId)).toBeNull()
+          act(() => { held.shift()!(); pump() })
+          expect(creditMessages().at(-1)).toMatchObject({ attachRequestId: freshAttach.attachRequestId, consumedSeq: 3 })
+          expect(readPacedCheckpoint(terminalId, paneId)?.surfaceCoverageSeq).toBe(3)
+          expect(screen.queryByText('Recovering terminal output...')).toBeNull()
+          expect(screen.queryByTestId('restore-recovery-retry')).toBeNull()
+          expect(terminalInstances).toHaveLength(emulatorCount)
+          expect(sentMessages().filter(msg => msg?.type === 'terminal.create' || msg?.type === 'terminal.kill')).toEqual([])
+        },
+      )
+
       const projections = [
         { name: 'f01-opencode-startup', buffer: 'alternate', mouse: 'any', paste: true, wrap: true, hidden: false },
         { name: 'f04-alt-fold', buffer: 'alternate', mouse: 'none', paste: false, wrap: true, hidden: false },
