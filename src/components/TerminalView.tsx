@@ -1762,14 +1762,19 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
   useLayoutEffect(() => {
     const previous = reconstructionEligibilityRef.current
     reconstructionEligibilityRef.current = { connectionStatus, hidden, activeTabId, terminalId: terminalContent?.terminalId }
+    const ticket = localReconstructionRef.current
+    // terminal.created installs its ID before starting reconstruction; the
+    // following store render confirms that same owner rather than replacing
+    // it. A different or removed pane terminal still invalidates the ticket.
+    const terminalChanged = previous.terminalId !== terminalContent?.terminalId
+      && (!ticket || ticket.terminalId !== terminalContent?.terminalId)
     // WsClient invokes reconnect listeners before dispatching ready to React.
     // That ready commit belongs to the ticket's already-ready transport.
     const changed = previous.hidden !== hidden || previous.activeTabId !== activeTabId
-      || previous.terminalId !== terminalContent?.terminalId
+      || terminalChanged
       || (previous.connectionStatus !== connectionStatus && connectionStatus !== 'ready')
     if (!changed) return
     reconstructionEligibilityEpochRef.current += 1
-    const ticket = localReconstructionRef.current
     if (!ticket) return
     ticket.abandoned = true
     ticket.queue.setActiveGeneration(`${ticket.generation}:abandoned`, { dropQueuedStaleWrites: true })
