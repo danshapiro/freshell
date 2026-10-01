@@ -13831,9 +13831,10 @@ describe('TerminalView lifecycle updates', () => {
       it.each(['explicit gap', 'malformed batch', 'stream mismatch'] as const)(
         'a failed stream write pins target-reaching loss completion until fresh reconstruction (%s)',
         async loss => {
-          const { terminalId, paneId, term } = await setupPacedPane({ mode: 'codex' })
+          const { store, terminalId, paneId, term } = await setupPacedPane({ mode: 'codex' })
           const pump = captureRaf()
           const emulatorCount = terminalInstances.length
+          act(() => { store.dispatch(setConnectionStatus('ready')) })
           // Charge a recovery attempt before the failure so later successful
           // same-generation writes cannot silently refund that attempt.
           act(() => { reconnectHandler!(); pump(); ready(terminalId, 2) })
