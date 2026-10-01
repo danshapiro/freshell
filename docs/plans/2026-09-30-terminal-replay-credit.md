@@ -77,7 +77,7 @@ These responsibilities form one independently reviewable repair. Existing parser
 - Produces: a normal same-stream replay/live ownership rule preserving ordinary pending CSI/OSC until continuation, while matching known startup-query remainders retain intentional suppression and generation/discontinuity resets retire obsolete ownership.
 - Produces: mounted reconstruction using the existing `terminal.attach` shape (`sinceSeq: 0`, internal `viewport_hydrate`, `surfaceReset: true`) and optional existing `terminal.modes.sync`. Hidden panes retain the existing wire `keepalive_delta` projection without losing those full-hydrate/freshness semantics.
 
-- [ ] **Step 1: Write the failing behavioral tests**
+- [x] **Step 1: Write the failing behavioral tests**
 
 Add a nested `describe('replay credit regression', ...)` inside the existing paced describe in `TerminalView.lifecycle.test.tsx`, reusing `setupPacedPane`, `captureRaf`, `creditMessages`, `attachMessagesFor`, `latestAttachRequestIdForTerminal`, `latestStreamIdByTerminal`, `__readTerminalSurfaceCheckpointForTests`, and the existing `reconnectHandler`. All are already defined/imported in that test file. Use this complete primary regression and envelope helper:
 
@@ -391,7 +391,7 @@ The lifecycle cases exercise mounted reconstruction where reconnect/hide/reveal 
 
 The smallest browser fixture uses shell terminals because the same startup parser and paced replay path handle Codex output. Codex-mode filtering and completion are covered through the actual component integration path above; no external provider CLI or synthetic server is needed.
 
-- [ ] **Step 2: Run the tests and verify the intended failure**
+- [x] **Step 2: Run the tests and verify the intended failure**
 
 Run in the feature worktree:
 
@@ -402,7 +402,7 @@ GCLOUD_ROBOT_REQUIRE=1 pnpm run test:e2e --project=chromium test/e2e-browser/spe
 
 Expected: component regressions fail because mixed successful writes do not credit `seqEnd`, buffered-only frames are falsely checkpointed, the adapter turns throws into success, old checkpoints/partial surface content survive false clear-based hydration, old untagged input enters before reconstruction fences, final replay completion loses an ordinary pending SGR/OSC, and fresh output cannot refund recovery when safe coverage is pinned. The standalone queue failure test fails because the thrown write escapes its RAF instead of reporting failure and continuing. The actual browser spec must match and attempt four Chromium tests; its primary intended failure is missing browser credit for the exact observed incomplete-SGR page end, with no following real Rust replay continuation. The fourth browser case additionally must distinguish a truly live continuation after final replay completion; its missing ordinary prefix control is separate from page pacing. Setup, fixture path, routing, identity, syntax, or provider failures are not acceptable RED evidence. Correct such problems before changing production behavior.
 
-- [ ] **Step 3: Add the minimal production implementation**
+- [x] **Step 3: Add the minimal production implementation**
 
 **3.1 Successful stream consumption and write failure settlement.** `handleTerminalOutput` must supply its completion for every successful nonempty cleaned write, including mixed filtered/pending input; it reports byte fidelity separately. Complete stream consumption only inside the active generation/surface write scope, using the accepted original sequence end, never just the cleaned prefix length. Strict application/checkpoint advancement remains conditional on the existing byte-fidelity, contiguity, identity, and scope rules. A fully preprocessed no-write range executes its actual acknowledgement as a generation-scoped queue task behind earlier writes; buffering can acknowledge owned bytes but cannot certify reconstructable coverage. An absent queue/surface, failed enqueue, or thrown write never acknowledges consumption.
 
@@ -430,17 +430,17 @@ Guard real stream attach completion with successful ordered consumption and the 
 
 These corrected steps state decisions and intended production behavior. The accepted falsifications removed the earlier component implementation drafts; newly authored unexecuted implementation code is intentionally absent from this Stage 2 amendment. The implementer must realize the specified interfaces/invariants and prove the behavioral tests; source supersedes plan code drafts once execution begins.
 
-- [ ] **Step 4: Run the focused tests**
+- [x] **Step 4: Run the focused tests**
 
 Run the same two commands from Step 2.
 
 Expected: every selected component/queue test passes; the new browser file executes and passes exactly four Chromium tests. Their attached wire evidence proves actual application credit releases the real next Rust page, and the fourth case retains ordinary pending bytes until the actual live continuation after the final replay target. Mounted reconnect reconstruction reproduces each prefix once. Report the exact passed/failed/skipped counts from the runner rather than treating exit zero as proof of coverage.
 
-- [ ] **Step 5: Refactor while green**
+- [x] **Step 5: Refactor while green**
 
 Keep one guarded accepted-success decision for consumption, recovery progress, strict application, and real attach completion, with separate eligibility for each. Remove duplicate no-op credit tasks, premature mixed-frame completion, and comments equating empty cleaned bytes with safe null-screen filtering. Keep ordinary phase carry distinct from known-query discard and true generation/loss resets. Keep mounted reconstruction as one local non-coalescing write plus one guarded post-hook task; consolidate failure scope/counter cleanup only while stale successful mutation hooks remain intact. Do not create a reset framework, new range ledger, persisted parser snapshot, or wider renderer recreation path. Keep the browser fixture local to its spec. Run the Step 2 focused cloud commands again after the refactor and require the same selected passing counts, including four actual browser tests.
 
-- [ ] **Step 6: Run impacted-test verification**
+- [x] **Step 6: Run impacted-test verification**
 
 The changed component and serial queue serve all terminal modes and both negotiated and legacy restores, so the impacted set includes whole component lifecycle coverage, write scopes, strict sequencing/checkpoint modules, parser filters, scroll input, the actual Rust paced protocol, and the real browser replay/lifecycle donors. This shared terminal behavior also requires the final full suite after task review; the coordinator runs that logical gate once, as recorded below, with the three already-proven baseline failures excluded by exact title. Implementers/fixers run the focused commands in this step and do not repeat the coordinator broad gate. Do not add `skip` markers, remove tests, or alter baseline expectations.
 
@@ -456,7 +456,7 @@ GCLOUD_ROBOT_REQUIRE=1 pnpm run test:e2e --project=chromium test/e2e-browser/spe
 Expected: typecheck and every included test pass. The Rust command runs the real `crates/freshell-ws/tests/paced_replay.rs` target, including partial-page credit gating, input during replay, stale generations, and disconnect. The cloud browser output must show the new file's four tests and positive matching counts for each selected donor; inspect cloud skips and titles before interpreting coverage. If an existing donor is cloud-ineligible, select its eligible behavioral subset or add the missing behavior to the new eligible spec; a skipped donor is not evidence. No configured lane may silently switch to local.
 
 
-- [ ] **Step 7: Commit the task**
+- [x] **Step 7: Commit the task**
 
 ```bash
 git add src/components/TerminalView.tsx src/components/terminal/terminal-write-queue.ts test/unit/client/components/TerminalView.lifecycle.test.tsx test/unit/client/components/terminal/terminal-write-queue.test.ts test/e2e-browser/specs/terminal-replay-credit-rust.spec.ts
