@@ -13558,7 +13558,7 @@ describe('TerminalView lifecycle updates', () => {
         return { ...pane, pump }
       }
 
-      it('uses the resized viewport and checkpoint after a held reconstruction callback completes', async () => {
+      it.each(['before completion', 'pending at completion'] as const)('uses the resized viewport and checkpoint after a held reconstruction callback completes (layout %s)', async (layoutTiming) => {
         let notifyResize: (() => void) | undefined
         vi.stubGlobal('ResizeObserver', class extends MockResizeObserver {
           constructor(callback: () => void) { super(); notifyResize = callback }
@@ -13574,16 +13574,24 @@ describe('TerminalView lifecycle updates', () => {
 
         const runtime = runtimeMocks.instances.at(-1)!
         runtime.fit.mockImplementation(() => { term.cols = 132; term.rows = 40 })
-        act(() => { notifyResize!(); pump() })
         const resizeMessages = () => sentMessages().filter(msg => msg?.type === 'terminal.resize' && msg.terminalId === terminalId)
-        expect(resizeMessages().at(-1)).toMatchObject({ cols: 132, rows: 40 })
-        expect(attachMessagesFor(terminalId)).toEqual([])
-        act(() => { held.shift()!(); pump() })
+        if (layoutTiming === 'before completion') {
+          act(() => { notifyResize!(); pump() })
+          expect(resizeMessages().at(-1)).toMatchObject({ cols: 132, rows: 40 })
+          expect(attachMessagesFor(terminalId)).toEqual([])
+          act(() => { held.shift()!(); pump() })
+        } else {
+          // The post-hook task precedes the requested layout flush. The
+          // replacement boundary must fit rather than read the old size.
+          act(() => { held.shift()!() })
+          act(() => { notifyResize!(); pump() })
+          expect(resizeMessages()).toEqual([])
+        }
         const replacement = attachMessagesFor(terminalId).at(-1)!
         expect(replacement).toMatchObject({ intent: 'viewport_hydrate', sinceSeq: 0, surfaceReset: true, cols: 132, rows: 40 })
         act(() => { ready(terminalId, 3); deliverOutput('single', terminalId, 1, 'RESIZED-BASELINE\r\n'); deliverOutput('single', terminalId, 2, 'MORE\r\n'); deliverOutput('single', terminalId, 3, 'DONE\r\n'); pump(); while (held.length) { held.shift()!(); pump() } })
         expect(readPacedCheckpoint(terminalId, paneId)).toMatchObject({ cols: 132, rows: 40, parserAppliedSeq: 3, surfaceCoverageSeq: 3 })
-        expect(readPacedCheckpoint(terminalId, paneId)!.geometryEpoch).toBeGreaterThan(originalEpoch)
+        expect(readPacedCheckpoint(terminalId, paneId)!.geometryEpoch).toBe(originalEpoch + 1)
         const resizeCount = resizeMessages().length
         act(() => { notifyResize!(); pump() })
         expect(resizeMessages()).toHaveLength(resizeCount)

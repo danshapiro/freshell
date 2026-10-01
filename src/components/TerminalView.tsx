@@ -3504,22 +3504,27 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
       supersededTicket.queue.setActiveGeneration(`${supersededTicket.generation}:superseded`, { dropQueuedStaleWrites: true })
       clearQuarantineRepair()
     }
-    const runtime = runtimeRef.current
-    if (runtime && !hiddenRef.current && !opts?.skipPreAttachFit) {
-      try {
-        runtime.fit()
-      } catch {
-        // disposed
+    const fitViewport = () => {
+      const runtime = runtimeRef.current
+      if (runtime && !hiddenRef.current) {
+        try {
+          runtime.fit()
+        } catch {
+          // disposed
+        }
       }
     }
-    let cols = Math.max(2, term.cols || 80)
-    let rows = Math.max(2, term.rows || 24)
-    syncGeometryEpochForViewport(tid, cols, rows)
+    if (!opts?.skipPreAttachFit) fitViewport()
+    const plannedViewport = {
+      cols: Math.max(2, term.cols || 80),
+      rows: Math.max(2, term.rows || 24),
+    }
+    syncGeometryEpochForViewport(tid, plannedViewport.cols, plannedViewport.rows)
     let attachRequestId = `${paneIdRef.current}:${++attachCounterRef.current}:${nanoid(6)}`
     const writeQueue = writeQueueRef.current
     const hasInFlightWrites = writeQueue?.hasInFlightWrites() === true
     const expectedStreamId = getTerminalCheckpointStreamId()
-    const checkpointDecision = getCheckpointDeltaReplayDecision(tid, { cols, rows })
+    const checkpointDecision = getCheckpointDeltaReplayDecision(tid, plannedViewport)
     const explicitSinceSeq = typeof opts?.sinceSeq === 'number'
       ? Math.max(0, Math.floor(opts.sinceSeq))
       : undefined
@@ -3586,12 +3591,10 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
     let surfaceQuarantined = hasInFlightWrites
     let deferContentReconstruction = opts?.deferViewportClearUntilContent === true
     const sendAttach = ({ preserveDeliveryGapNotice = false }: { preserveDeliveryGapNotice?: boolean } = {}) => {
-      const projectedCols = Math.max(2, term.cols || 80)
-      const projectedRows = Math.max(2, term.rows || 24)
-      if (cols !== projectedCols || rows !== projectedRows) {
-        syncGeometryEpochForViewport(tid, projectedCols, projectedRows)
-        cols = projectedCols
-        rows = projectedRows
+      const cols = Math.max(2, term.cols || 80)
+      const rows = Math.max(2, term.rows || 24)
+      if (cols !== plannedViewport.cols || rows !== plannedViewport.rows) {
+        syncGeometryEpochForViewport(tid, cols, rows)
       }
       const checkpointInput = buildCheckpointReplayInput(tid, { cols, rows })
       const expectedGeometryEpoch = checkpointInput?.geometryEpoch ?? geometryEpochRef.current
@@ -3834,14 +3837,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
         repairContentReconstructionRef.current = null
         // Reconstruction crossed an asynchronous boundary. Fit the current
         // visible viewport even if its original pre-attach fit was skipped.
-        const currentRuntime = runtimeRef.current
-        if (currentRuntime && !hiddenRef.current) {
-          try {
-            currentRuntime.fit()
-          } catch {
-            // disposed
-          }
-        }
+        fitViewport()
         log.debug('Terminal reconstruction completed', { paneId: paneIdRef.current, terminalId: tid, generation: ticket.generation })
         // This replacement belongs to the admitted delivery-gap repair;
         // preserve its notice while the replacement replay is outstanding.
