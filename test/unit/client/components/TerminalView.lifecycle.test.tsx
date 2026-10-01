@@ -6193,11 +6193,12 @@ describe('TerminalView lifecycle updates', () => {
       return attach
     }
 
-    async function seedHeldSurface(suffix: string, bridge?: ReturnType<typeof createPerfAuditBridge>) {
+    async function seedHeldSurface(suffix: string, bridge?: ReturnType<typeof createPerfAuditBridge>, fromStore = false) {
       if (bridge) installPerfAuditBridge(bridge)
       const lane = await renderTerminalHarness({
         status: 'running', terminalId: `term-held-${suffix}`,
         serverInstanceId: 'server-held', streamId: `stream-held-${suffix}`, clearSends: false,
+        fromStore,
       })
       const { terminalId, term } = lane
       const firstAttach = sentMessages().find((msg) => msg?.type === 'terminal.attach' && msg.terminalId === terminalId)!
@@ -7836,7 +7837,7 @@ describe('TerminalView lifecycle updates', () => {
       }, { paneId: 'pane-v2-stream' })?.parserAppliedSeq).toBe(3)
     })
 
-    it('does not checkpoint across a stripped middle batch segment when adjacent renderable segments coalesce', async () => {
+    it('keeps strict application before a stripped middle batch segment while ordered coverage advances', async () => {
       const rafCallbacks: FrameRequestCallback[] = []
       requestAnimationFrameSpy?.mockImplementation((cb: FrameRequestCallback) => {
         rafCallbacks.push(cb)
@@ -8992,7 +8993,7 @@ describe('TerminalView lifecycle updates', () => {
       expect(term.clear).not.toHaveBeenCalled()
     })
 
-    it('drops quarantined replay and forces a clearing hydrate when quarantine repair times out before writes drain', async () => {
+    it('drops quarantined replay and reconstructs after timed-out old writes drain', async () => {
       const bridge = createPerfAuditBridge()
       const { terminalId, term, pump, held, firstAttach, attaches, release } = await seedHeldSurface('timeout', bridge)
       // The fixture owns RAF ordering; fake only the quarantine clock/poll.
@@ -9074,7 +9075,7 @@ describe('TerminalView lifecycle updates', () => {
     })
 
     it('cancels quarantined repair after invalid-terminal replacement before writes drain', async () => {
-      const { terminalId, store, tabId, term, pump, held, attaches, release } = await seedHeldSurface('invalid')
+      const { terminalId, store, tabId, term, pump, held, attaches, release } = await seedHeldSurface('invalid', undefined, true)
       act(() => { reconnectHandler!(); pump() })
       expect(attaches()).toEqual([])
       // No newer attach has reached the wire. A terminal-scoped legacy error
@@ -10816,8 +10817,8 @@ describe('TerminalView lifecycle updates', () => {
           attachRequestId: repair[0]!.attachRequestId,
         })
       })
-      // BEFORE the flush: neither the clear nor the content applied — the
-      // pre-gap surface is intact (the round-4 atomic clear-then-write).
+      // Before the ordered reconstruction flush, the pre-gap surface remains
+      // intact and no replacement content has been applied.
       expect(term.clear).not.toHaveBeenCalled()
       expect(
         terminalWriteStrings(term).some((entry) => entry.includes('REBUILT')),
@@ -11025,9 +11026,8 @@ describe('TerminalView lifecycle updates', () => {
       ).toBe(false)
       expectTerminalWriteContaining(term, 'PRE-GAP-VISIBLE')
 
-      // The clear is STILL ARMED: the next frame that will actually write
-      // bytes consumes it — clear-then-write, exactly once, at that frame
-      // (applied at flush time as ONE atomic unit with the content).
+      // The next accepted rendering frame authorizes the ordered reset.
+      // Replacement content comes from the new full attach after that boundary.
       const clearCallsBefore = term.clear.mock.calls.length
       expect(clearCallsBefore).toBe(0)
       act(() => {
@@ -12524,7 +12524,7 @@ describe('TerminalView lifecycle updates', () => {
       expect(screen.queryByTestId('restore-recovery-retry')).toBeNull()
     })
 
-    it('recovery bounding: genuine coverage progress resets the progressless counter', async () => {
+    it('recovery bounding: newly consumed stream positions reset the progressless counter', async () => {
       const { terminalId } = await renderResumablePane('recovery-progress')
 
       const attachCount = () => attachMessagesFor(terminalId).length

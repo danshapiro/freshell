@@ -534,11 +534,8 @@ type AttachTerminalOptions = {
   replayPageBytes?: number
   priority?: TerminalAttachPriority
   sinceSeq?: number
-  /** Delivery-loss repair fallback (responsive-terminal-restore WS3):
-   *  attach as a full hydrate WITHOUT clearing the viewport first — the
-   *  surface is replaced only when the hydrate's content actually arrives
-   *  (the deferred content reset). If the repair dies before content, the
-   *  pre-gap surface stays visible. Never on the wire. */
+  /** Preserve the pre-gap surface until accepted rendering content authorizes
+   *  ordered reconstruction and a replacement full attach. Never on the wire. */
   deferViewportClearUntilContent?: boolean
   /**
    * Internal recovery-accounting hint (never on the wire): the reconcile
@@ -1085,12 +1082,9 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
     abandoned: boolean
   } | null>(null)
   const repairContentReconstructionRef = useRef<{ attachRequestId: string; begin: () => void } | null>(null)
-  // Bounded automatic recovery accounting (WS2): consecutive progressless
-  // attach attempts vs the coverage cursor; gates automatic re-attach
-  // cycling and drives the visible retry state. Never kills or replaces.
-  // Round-4 reversal (plan:166): the streak resets ONLY on genuine parser
-  // progress (an ADVANCE of the applied surface) or an explicit user
-  // retry — never on attach.ready/reconnect completions.
+  // Bounded automatic recovery compares attempts with the original stream
+  // consumption high-water. Only newly consumed positions or explicit user
+  // retry/refresh reset the streak; attach.ready/completion alone cannot.
   const recoveryAccountingRef = useRef<TerminalRecoveryAccounting>(createTerminalRecoveryAccounting())
   // Delivery-loss repair fallback (responsive-terminal-restore WS3): the
   // attach generation of a full-hydrate repair that must NOT clear the
@@ -1315,35 +1309,12 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
     quarantineRepairRef.current = null
   }, [])
 
-  // Deferred content reset (responsive-terminal-restore WS3, delivery-loss
-  // repair fallback): when a hydrate attach deferred its viewport clear
-  // (`deferViewportClearUntilContent`), the pre-gap surface stays visible
-  // until that generation's first RENDERING frame — replacement content
-  // the sequence validator ACCEPTED and whose write path will write bytes
-  // to xterm — actually establishes the new baseline (round-3 fix: the
-  // clear consumes at the render moment, never on mere envelope arrival —
-  // a rejected duplicate/overlap or a fully filtered frame such as the
-  // OSC52-only case renders nothing and must leave the clear armed).
-  // The consumption runs inside `handleTerminalOutput` immediately before
-  // the triggering frame's write is enqueued, so the surface is always
-  // cleared-then-written; if the enqueue fails (no surface), the caller
-  // re-arms the pending clear because nothing rendered. Two paths retire
-  // the pending clear WITHOUT wiping: the repair dying without content
-  // (nothing is cleared and the pre-gap surface survives), and — the
-  // round-2 disarm — a `replay_window_exceeded` gap in this generation
-  // (the server declared the prefix unreconstructible, so the pre-gap
-  // screen is the best available surface and the existing honest-loss UX
-  // proceeds; see the gap arm).
-  // Round-4 F2: the consumption returns the clear as a THUNK instead of
-  // running it synchronously — the caller hands it to the write queue as
-  // `clearBeforeWrite`, so the clear applies INSIDE the same
-  // generation-guarded queue item as the replacement bytes (atomic
-  // clear-then-write at flush time: a dropped generation drops clear+write
-  // together, a stale generation is refused at apply time, and an
-  // in-flight earlier write completes before the clear runs). The two
-  // no-wipe retirement paths (death without content; the round-2
-  // declared-unreconstructible disarm) are unchanged.
-  const consumeRepairContentReset = useCallback((terminalId: string, attachRequestId?: unknown): (() => void) | null => {
+  // Delivery loss preserves the old screen until an accepted frame contains
+  // replacement content. That frame authorizes ordered local reconstruction;
+  // its bytes are requested again from zero after the reset completes. Rejected
+  // or fully filtered frames leave this armed. Death before content or a
+  // replay_window_exceeded gap disarms it without wiping the old screen.
+  const consumeRepairContentReconstruction = useCallback((terminalId: string, attachRequestId?: unknown): (() => void) | null => {
     if (repairContentResetPendingRef.current !== attachRequestId) return null
     const repair = repairContentReconstructionRef.current
     if (!repair || repair.attachRequestId !== attachRequestId || terminalIdRef.current !== terminalId) return null
@@ -1423,25 +1394,6 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
     })
   }, [ws])
 
-  // A consumption advance with no write of its own (a fully pre-filtered
-  // frame) rides the write queue as a task so the SAME drain-tick coalescing
-  // applies: the credit flushes once per drain, never per frame. Armed for
-  // the current paced attach generation only — non-negotiated panes keep
-  // today's queue traffic byte-identical.
-  const schedulePacedReplayCreditFlush = useCallback((
-    outputSource: TerminalOutputSource,
-    attachRequestId: string | undefined,
-  ) => {
-    const paced = pacedReplayRef.current
-    if (!paced || !attachRequestId || paced.attachRequestId !== attachRequestId) return
-    const queue = writeQueueRef.current
-    if (!queue) {
-      flushPacedReplayCredit()
-      return
-    }
-    queue.enqueueTask(() => {}, { mode: outputSource, generation: attachRequestId })
-  }, [flushPacedReplayCredit])
-
   const recordTerminalPerfAuditEvent = useCallback((event: string, data: Record<string, unknown> = {}) => {
     const payload = Object.fromEntries(Object.entries({
       event,
@@ -1490,19 +1442,10 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
         return
       }
       if (!pending.queue.hasInFlightWrites()) {
-        // The frozen window closed with the queue drained: NOW repair
-        // (WS2 — never decide while an earlier write can still mutate the
-        // surface). The quarantined attach deferred the applied-surface
-        // reset, so the repair ALWAYS rebuilds from a full hydrate: a
-        // quarantine arms only while a write is in flight, that write's
-        // completion always lands in the completedWrites ledger (the write
-        // wrapper reports every completion, including a disposed-surface
-        // throw), and the drain only happens after in-flight writes
-        // complete — so the window provably mutated the surface and the
-        // pre-quarantine checkpoint under-describes it. The former
-        // completedWrites === 0 resume branch was unreachable in
-        // production shapes and was removed (M-2); the ledger stays in the
-        // audit event as the honest evidence.
+        // Timeout retired the queued reset. Once the old physical write has
+        // drained, start a bounded full reconstruction. Successful stale
+        // completions remain in the mutation ledger; failed writes instead
+        // leave checkpoint uncertainty pinned until a genuine reset.
         clearQuarantineRepair(attachRequestId)
         recordTerminalPerfAuditEvent('terminal.catchup.surface_quarantine_repair', {
           terminalId,
@@ -1600,7 +1543,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
   // contiguity-gated — only a range that starts exactly at the cursor's next
   // position extends it, so unknown mutations, lost ranges, and unapplied
   // ranges can never be jumped past (the cursor pins below them until a
-  // surface reset). Genuine progress here resets the recovery accounting.
+  // surface reset). Recovery progress is tracked independently by consumption.
   const advanceSurfaceCoverageForRange = useCallback((seqStart: number, seqEnd: number): boolean => {
     const coverage = surfaceCoverageSeqRef.current
     if (seqStart !== coverage + 1 || seqEnd <= coverage) return false
@@ -2353,12 +2296,11 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
     data: string,
     onWritten?: () => void,
     options?: TerminalWriteQueueOptions,
-    clearBeforeWrite?: () => void,
   ): boolean => {
     if (!data) return false
     const queue = writeQueueRef.current
     if (!queue || !termRef.current) return false
-    queue.enqueue(data, onWritten, clearBeforeWrite ? { ...options, clearBeforeWrite } : options)
+    queue.enqueue(data, onWritten, options)
     return true
   }, [])
 
@@ -2498,31 +2440,13 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
     if (preprocessingPending || (cleaned.length > 0 && !submittedBytesEqualInput)) {
       unsafeSurfaceCheckpointRef.current = true
     }
-    // THE RENDER MOMENT (responsive-terminal-restore WS3, round-3 fix;
-    // round-4 atomicity): a deferred repair clear consumes ONLY here —
-    // the sequence validator already accepted this frame (the caller
-    // runs the acceptance before submitting), and `cleaned` non-empty
-    // proves the frame's write path WILL write bytes to xterm. The
-    // consumed clear is returned as a THUNK and handed to the write
-    // queue as `clearBeforeWrite` on the SAME generation-guarded item as
-    // the replacement write: the flush applies clear-then-write as ONE
-    // atomic unit — a dropped generation drops clear+write together
-    // (the old surface survives a disconnect/supersede mid-window), a
-    // stale-generation write can never apply after the clear (the
-    // generation is checked at apply time), and an in-flight earlier
-    // write completes BEFORE the clear runs (the queue is serial). A
-    // rejected or fully filtered frame (`cleaned === ''`) never reaches
-    // this point and leaves the clear armed for the next writing frame.
-    // Rejected/filtered frames of a LATER generation than the armed one
-    // no-op the ref check inside, exactly like before.
-    let consumedDeferredClear: (() => void) | null = null
-    if (cleaned && tid) {
-      consumedDeferredClear = consumeRepairContentReset(tid, writeOptions?.generation)
-    }
-    if (consumedDeferredClear) {
-      // Rendering content authorizes reconstruction, not stream consumption.
-      // Replay is requested again only after a real replacement baseline.
-      consumedDeferredClear()
+    // The sequence validator already accepted this range. Only nonempty
+    // rendering content may authorize replacement of the preserved screen.
+    const beginReconstruction = cleaned && tid
+      ? consumeRepairContentReconstruction(tid, writeOptions?.generation)
+      : null
+    if (beginReconstruction) {
+      beginReconstruction()
       return { submittedWrite: false, submittedBytesEqualInput: false, preParserConsumedAllBytes: false, preprocessingPending }
     }
     const submittedWrite = cleaned
@@ -2530,17 +2454,8 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
           cleaned,
           () => onWritten?.(submittedBytesEqualInput),
           writeOptions,
-          consumedDeferredClear ?? undefined,
         )
       : false
-    if (consumedDeferredClear && !submittedWrite) {
-      // Nothing will render (no surface / disposed write): the clear was
-      // consumed for content that never renders — re-arm it. Nothing else
-      // can touch the ref inside this synchronous block, so the re-arm is
-      // exact.
-      repairContentResetPendingRef.current = writeOptions?.generation ?? null
-    }
-
     for (const event of osc.events) {
       handleOsc52Event(event, outputSource, mode)
     }
@@ -2550,7 +2465,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
       preParserConsumedAllBytes: cleaned === '',
       preprocessingPending,
     }
-  }, [consumeRepairContentReset, dispatch, enqueueTerminalWrite, handleOsc52Event, sendInput, tabId])
+  }, [consumeRepairContentReconstruction, dispatch, enqueueTerminalWrite, handleOsc52Event, sendInput, tabId])
 
   const findNext = useCallback((value: string = searchQuery) => {
     const terminalId = terminalIdRef.current
@@ -3551,7 +3466,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
       return
     }
     // Bounded automatic recovery (WS2): consecutive attach/hydrate attempts
-    // without a coverage-cursor advance count against a bounded limit; past
+    // without a new consumed stream position count against a bounded limit; past
     // it, automatic cycling STOPS and the visible retry state shows (the
     // surface content is preserved). Never kills, replaces, or changes
     // identity. Explicit user paths (pane refresh, the retry control) reset
@@ -3641,13 +3556,9 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
           surfaceWritesSinceFresh: surfaceWritesSinceFreshRef.current,
         })
       } else {
-        // A fresh surface has NO usable delta window: any checkpointed sinceSeq
-        // would continue content onto a blank xterm (data hole). Force the full
-        // hydrate. Wipe ONLY when a marker exists — a marker means an EARLIER
-        // claim was abandoned mid-hydration (trap-door), so this surface may
-        // hold partial replay content; a genuinely fresh surface (marker null,
-        // flag just set at construction/user-reset) is blank by construction
-        // and must not pay a spurious term.clear().
+        // A fresh surface needs the retained full baseline. Applied content
+        // from an interrupted hydrate or a user reset requires ordered mounted
+        // reconstruction; an untouched constructor surface is already blank.
         if (effectiveIntent !== 'viewport_hydrate') {
           effectiveIntent = 'viewport_hydrate'
           fullHydrateFallbackReason = 'surface_fresh'
@@ -3688,166 +3599,163 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
     let surfaceQuarantined = hasInFlightWrites
     let deferContentReconstruction = opts?.deferViewportClearUntilContent === true
     const sendAttach = () => {
-    localReconstructionRef.current = null
-    failedConsumptionGenerationRef.current = null
-    writeQueue?.setActiveGeneration(attachRequestId, { dropQueuedStaleWrites: true })
-    if (!surfaceQuarantined) {
-      clearQuarantineRepair()
-    }
-    if (surfaceQuarantined) {
-      log.warn('Quarantining terminal attach while writes are still in flight', {
-        paneId: paneIdRef.current,
-        terminalId: tid,
-        attachRequestId,
-        intent: effectiveIntent,
-        requestedIntent: intent,
-        sinceSeq,
-        clearViewportFirst,
-      })
-    }
-
-    setIsAttaching(true)
-    setTruncatedHistoryGap(null)
-    setRetentionLossNotice(null)
-    setDeliveryGapNotice(null)
-
-    // Startup probes must not leak across attach generations.
-    resetStartupProbeParser()
-
-    if (effectiveIntent === 'viewport_hydrate') {
-      if (!surfaceQuarantined && !deferContentReconstruction) {
-        // A live hydrate rebuilds the surface from zero — new surface
-        // generation (epoch), zero applied, zero coverage. A QUARANTINED
-        // hydrate defers this reset: the surface is frozen pending the
-        // bounded drain wait, and the repair decides whether to resume the
-        // survived checkpoint or rebuild.
-        resetParserAppliedSurface()
+      localReconstructionRef.current = null
+      failedConsumptionGenerationRef.current = null
+      writeQueue?.setActiveGeneration(attachRequestId, { dropQueuedStaleWrites: true })
+      if (!surfaceQuarantined) {
+        clearQuarantineRepair()
       }
-      applySeqState(beginAttach(createAttachSeqState({ lastSeq: 0 })))
-    } else {
-      // Delta resume: the surface keeps its rendered content and its
-      // coverage position (≥ the resume baseline by construction — the
-      // baseline came from this surface's own checkpoint); only the seq
-      // state re-bases to the resume position.
-      applySeqState(beginAttach(createAttachSeqState({
-        lastSeq: deltaSeq,
-        parserAppliedSeq: deltaSeq,
-      })))
-    }
+      if (surfaceQuarantined) {
+        log.warn('Quarantining terminal attach while writes are still in flight', {
+          paneId: paneIdRef.current,
+          terminalId: tid,
+          attachRequestId,
+          intent: effectiveIntent,
+          requestedIntent: intent,
+          sinceSeq,
+          clearViewportFirst,
+        })
+      }
 
-    deferredAttachStateRef.current = {
-      mode: 'attaching',
-      pendingIntent: effectiveIntent,
-      pendingSinceSeq: sinceSeq,
-      pendingReason: opts?.priority === 'background' ? 'background_catchup' : 'initial_hydrate',
-    }
+      setIsAttaching(true)
+      setTruncatedHistoryGap(null)
+      setRetentionLossNotice(null)
+      setDeliveryGapNotice(null)
 
-    // Paced replay consumption (Workstream 1): arm the frontier for THIS
-    // generation only on a negotiated connection — the next attach replaces
-    // it; non-negotiated attaches never arm one.
-    const pacedReplayNegotiated = isPacedReplayNegotiated()
-    pacedReplayRef.current = pacedReplayNegotiated
-      ? beginPacedReplayConsumption({ terminalId: tid, attachRequestId, sinceSeq })
-      : null
+      // Startup probes must not leak across attach generations.
+      resetStartupProbeParser()
 
-    // Per-generation deferred content reset (delivery-loss repair
-    // fallback): armed only for the hydrate that asked to defer its
-    // viewport clear until its content establishes the new baseline.
-    repairContentResetPendingRef.current = deferContentReconstruction
-      ? attachRequestId
-      : null
+      if (effectiveIntent === 'viewport_hydrate') {
+        if (!surfaceQuarantined && !deferContentReconstruction) {
+          // The surface is constructor-blank or its guarded reconstruction
+          // completed. A quarantine/content probe preserves the old baseline
+          // until the later ordered physical reconstruction succeeds.
+          resetParserAppliedSurface()
+        }
+        applySeqState(beginAttach(createAttachSeqState({ lastSeq: 0 })))
+      } else {
+        // Delta resume: the surface keeps its rendered content and its
+        // coverage position (≥ the resume baseline by construction — the
+        // baseline came from this surface's own checkpoint); only the seq
+        // state re-bases to the resume position.
+        applySeqState(beginAttach(createAttachSeqState({
+          lastSeq: deltaSeq,
+          parserAppliedSeq: deltaSeq,
+        })))
+      }
 
-    currentAttachRef.current = {
-      requestId: attachRequestId,
-      intent: effectiveIntent,
-      terminalId: tid,
-      sinceSeq,
-      cols,
-      rows,
-      surfaceQuarantined,
-      expectedStreamId,
-      geometryEpoch: expectedGeometryEpoch,
-      geometryAuthority: expectedGeometryAuthority,
-      expectedGeometryEpoch,
-      expectedGeometryAuthority,
-    }
-    if (fullHydrateFallbackReason) {
-      recordTerminalPerfAuditEvent('terminal.catchup.full_hydrate_fallback', {
-        terminalId: tid,
-        attachRequestId,
-        requestedIntent: intent,
+      deferredAttachStateRef.current = {
+        mode: 'attaching',
+        pendingIntent: effectiveIntent,
+        pendingSinceSeq: sinceSeq,
+        pendingReason: opts?.priority === 'background' ? 'background_catchup' : 'initial_hydrate',
+      }
+
+      // Paced replay consumption (Workstream 1): arm the frontier for THIS
+      // generation only on a negotiated connection — the next attach replaces
+      // it; non-negotiated attaches never arm one.
+      const pacedReplayNegotiated = isPacedReplayNegotiated()
+      pacedReplayRef.current = pacedReplayNegotiated
+        ? beginPacedReplayConsumption({ terminalId: tid, attachRequestId, sinceSeq })
+        : null
+
+      // Only this probe generation's accepted rendering content may authorize
+      // the deferred reconstruction and replacement full attach.
+      repairContentResetPendingRef.current = deferContentReconstruction
+        ? attachRequestId
+        : null
+
+      currentAttachRef.current = {
+        requestId: attachRequestId,
         intent: effectiveIntent,
-        sinceSeq,
-        deltaSeq,
-        streamId: expectedStreamId,
-        reason: fullHydrateFallbackReason,
-        hasInFlightWrites,
-      })
-    }
-    if (surfaceQuarantined) {
-      recordTerminalPerfAuditEvent('terminal.catchup.surface_quarantined', {
         terminalId: tid,
-        attachRequestId,
-        requestedIntent: intent,
-        intent: effectiveIntent,
         sinceSeq,
-        streamId: expectedStreamId,
-        parserAppliedSeq: parserAppliedSeqRef.current,
-        reason: 'in_flight_writes',
-      })
-    }
-    suppressNextMatchingResizeRef.current = opts?.suppressNextMatchingResize
-      ? { terminalId: tid, cols, rows }
-      : null
+        cols,
+        rows,
+        surfaceQuarantined,
+        expectedStreamId,
+        geometryEpoch: expectedGeometryEpoch,
+        geometryAuthority: expectedGeometryAuthority,
+        expectedGeometryEpoch,
+        expectedGeometryAuthority,
+      }
+      if (fullHydrateFallbackReason) {
+        recordTerminalPerfAuditEvent('terminal.catchup.full_hydrate_fallback', {
+          terminalId: tid,
+          attachRequestId,
+          requestedIntent: intent,
+          intent: effectiveIntent,
+          sinceSeq,
+          deltaSeq,
+          streamId: expectedStreamId,
+          reason: fullHydrateFallbackReason,
+          hasInFlightWrites,
+        })
+      }
+      if (surfaceQuarantined) {
+        recordTerminalPerfAuditEvent('terminal.catchup.surface_quarantined', {
+          terminalId: tid,
+          attachRequestId,
+          requestedIntent: intent,
+          intent: effectiveIntent,
+          sinceSeq,
+          streamId: expectedStreamId,
+          parserAppliedSeq: parserAppliedSeqRef.current,
+          reason: 'in_flight_writes',
+        })
+      }
+      suppressNextMatchingResizeRef.current = opts?.suppressNextMatchingResize
+        ? { terminalId: tid, cols, rows }
+        : null
 
-    // surfaceReset is claimed on the wire whenever the surface is fresh AND
-    // this attach actually rebuilds it — independently of the wire intent
-    // swap (hidden panes attach as keepalive_delta yet still need the
-    // preamble: background hydration is exactly where a recreated hidden
-    // pane receives its mode bytes). A partial-hydrate EXEMPTION resume
-    // re-claims nothing (its preamble was already delivered with the
-    // interrupted attach) but re-targets the coupled marker to THIS
-    // generation so the claim's consumption sites (its replay content
-    // applying, or its attach completing) keep working across the
-    // continuation.
-    const claimSurfaceReset = surfaceFreshRef.current && effectiveIntent === 'viewport_hydrate'
-    if (surfaceFreshRef.current) {
-      surfaceFreshMarkerRef.current = { attachRequestId }
-    }
-    ws.send(buildTerminalAttachMessage({
-      content: contentRef.current,
-      terminalId: tid,
-      tabId,
-      intent: wireIntent,
-      cols,
-      rows,
-      sinceSeq,
-      attachRequestId,
-      priority: opts?.priority ?? 'foreground',
-      // b8ke ext r8 F2: the attach carries the pane's observed ownership
-      // fence — terminal.attach participates in the coordinator (a queued
-      // cross-device attach is generation-fenced server-side).
-      ownerFence: selectPaneOwnerFence(appStore.getState(), contentRef.current ?? {}) ?? undefined,
-      // Paced replay negotiation (Workstream 1): negotiated attaches —
-      // fresh AND delta, with or without explicit options — request
-      // page-sized delivery and never carry the legacy truncation budget.
-      // Non-negotiated stays byte-identical to today.
-      ...(pacedReplayNegotiated
-        ? { replayPageBytes: opts?.replayPageBytes ?? REPLAY_PAGE_BYTES }
-        : opts?.maxReplayBytes ? { maxReplayBytes: opts.maxReplayBytes } : {}),
-      ...(claimSurfaceReset ? { surfaceReset: true } : {}),
-    }))
-    rememberSentViewport(tid, cols, rows)
-    lastSentViewportRef.current = { terminalId: tid, cols, rows }
-    if (hiddenViewportAttach) {
-      // The server did not apply these dims; do not let them suppress the next
-      // visible-pane resize (reveal-time heal path).
-      forgetSentViewport(tid)
-      lastSentViewportRef.current = null
-    }
-    if (surfaceQuarantined) {
-      scheduleQuarantineRepair(tid, attachRequestId)
-    }
+      // surfaceReset is claimed on the wire whenever the surface is fresh AND
+      // this attach actually rebuilds it — independently of the wire intent
+      // swap (hidden panes attach as keepalive_delta yet still need the
+      // preamble: background hydration is exactly where a recreated hidden
+      // pane receives its mode bytes). A partial-hydrate EXEMPTION resume
+      // re-claims nothing (its preamble was already delivered with the
+      // interrupted attach) but re-targets the coupled marker to THIS
+      // generation so the claim's consumption sites (its replay content
+      // applying, or its attach completing) keep working across the
+      // continuation.
+      const claimSurfaceReset = surfaceFreshRef.current && effectiveIntent === 'viewport_hydrate'
+      if (surfaceFreshRef.current) {
+        surfaceFreshMarkerRef.current = { attachRequestId }
+      }
+      ws.send(buildTerminalAttachMessage({
+        content: contentRef.current,
+        terminalId: tid,
+        tabId,
+        intent: wireIntent,
+        cols,
+        rows,
+        sinceSeq,
+        attachRequestId,
+        priority: opts?.priority ?? 'foreground',
+        // b8ke ext r8 F2: the attach carries the pane's observed ownership
+        // fence — terminal.attach participates in the coordinator (a queued
+        // cross-device attach is generation-fenced server-side).
+        ownerFence: selectPaneOwnerFence(appStore.getState(), contentRef.current ?? {}) ?? undefined,
+        // Paced replay negotiation (Workstream 1): negotiated attaches —
+        // fresh AND delta, with or without explicit options — request
+        // page-sized delivery and never carry the legacy truncation budget.
+        // Non-negotiated stays byte-identical to today.
+        ...(pacedReplayNegotiated
+          ? { replayPageBytes: opts?.replayPageBytes ?? REPLAY_PAGE_BYTES }
+          : opts?.maxReplayBytes ? { maxReplayBytes: opts.maxReplayBytes } : {}),
+        ...(claimSurfaceReset ? { surfaceReset: true } : {}),
+      }))
+      rememberSentViewport(tid, cols, rows)
+      lastSentViewportRef.current = { terminalId: tid, cols, rows }
+      if (hiddenViewportAttach) {
+        // The server did not apply these dims; do not let them suppress the next
+        // visible-pane resize (reveal-time heal path).
+        forgetSentViewport(tid)
+        lastSentViewportRef.current = null
+      }
+      if (surfaceQuarantined) {
+        scheduleQuarantineRepair(tid, attachRequestId)
+      }
     }
 
     const beginMountedReconstruction = () => {
