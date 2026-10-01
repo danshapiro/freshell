@@ -13420,6 +13420,9 @@ describe('TerminalView lifecycle updates', () => {
         expect(term.clear).not.toHaveBeenCalled()
         expect(screen.queryByTestId('restore-recovery-retry')).toBeNull()
         // The replacement send consumes no additional recovery admission.
+        // Reconnect while visible so this checks admission, independent of
+        // the hidden-pane lifetime/background scheduling contract.
+        rerenderAt(false)
         const before = attachMessagesFor(terminalId).length
         for (let attempt = 0; attempt < 3; attempt++) act(() => { reconnectHandler!(); pump(); while (held.length) { held.shift()!(); pump() } })
         expect(attachMessagesFor(terminalId)).toHaveLength(before + 2)

@@ -178,7 +178,6 @@ for (const pathName of ['refresh', 'tab-switch', 'reconnect', 'final-live'] as c
       await expect(page.getByText('Recovering terminal output...', { exact: true })).toBeVisible()
       if (secondTabId) await selectTab(page, harness, secondTabId)
       wire.release()
-      if (secondTabId) await selectTab(page, harness, tabId!)
       const currentCredit = () => wire!.events.find(e => e.direction === 'client' && e.message.type === 'terminal.replay.credit' && e.message.terminalId === terminalId && e.message.consumedSeq === boundarySeq)?.message
       await expect.poll(currentCredit, { timeout: 15_000 }).toBeTruthy()
       const firstCredit = currentCredit()!
@@ -208,6 +207,23 @@ for (const pathName of ['refresh', 'tab-switch', 'reconnect', 'final-live'] as c
           await expect.poll(() => wire!.events.some(e => e.direction === 'server' && e.message.terminalId === terminalId && e.message.attachRequestId === newId && e.message.seqStart! > boundarySeq && e.message.data?.includes(DONE)), { timeout: 30_000 }).toBe(true)
         }
       }
+      if (secondTabId) {
+        // Complete actual replay while hidden, then cut the transport. A
+        // hidden pane retains its backend terminal without claiming viewport
+        // geometry; revealing it performs the mounted reconstruction.
+        await expect.poll(() => harness.getTerminalBuffer(terminalId), { timeout: 30_000 }).toContain(DONE)
+        const hiddenReconnectIndex = wire.events.length
+        await harness.forceDisconnect()
+        await harness.waitForConnection()
+        const revealIndex = wire.events.length
+        expect(wire.events.slice(hiddenReconnectIndex, revealIndex).filter(e => e.direction === 'client' && e.message.type === 'terminal.attach' && e.message.terminalId === terminalId)).toEqual([])
+        await selectTab(page, harness, tabId!)
+        const revealAttach = () => wire!.events.slice(revealIndex).find(e => e.direction === 'client' && e.message.type === 'terminal.attach' && e.message.terminalId === terminalId)?.message
+        await expect.poll(revealAttach, { timeout: 30_000 }).toBeTruthy()
+        expect(revealAttach()).toMatchObject({ intent: 'viewport_hydrate', sinceSeq: 0, surfaceReset: true })
+        const revealId = revealAttach()!.attachRequestId
+        await expect.poll(() => wire!.events.some(e => e.direction === 'client' && e.message.type === 'terminal.replay.credit' && e.message.terminalId === terminalId && e.message.attachRequestId === revealId && e.message.consumedSeq === boundarySeq), { timeout: 30_000 }).toBe(true)
+      }
       await expect(page.getByText('Recovering terminal output...', { exact: true })).toHaveCount(0)
       await expect.poll(() => harness.getTerminalBuffer(terminalId), { timeout: 30_000 }).toContain(DONE)
       const buffer = (await harness.getTerminalBuffer(terminalId))!
@@ -235,7 +251,7 @@ for (const pathName of ['refresh', 'tab-switch', 'reconnect', 'final-live'] as c
       console.log(JSON.stringify({ event: 'replay_credit_wire', pathName, terminalId, boundarySeq,
         frames: wire?.events.filter(event => event.message.terminalId === terminalId).map(({ direction, message }) => ({
           direction, type: message.type, attachRequestId: message.attachRequestId,
-          streamId: message.streamId, source: message.source, sinceSeq: message.sinceSeq,
+          streamId: message.streamId, source: message.source, intent: message.intent, sinceSeq: message.sinceSeq,
           consumedSeq: message.consumedSeq, seqStart: message.seqStart, seqEnd: message.seqEnd,
           headSeq: message.headSeq, replayToSeq: message.replayToSeq, surfaceReset: message.surfaceReset,
           incompleteSgr: message.data?.endsWith(SGR), completed: message.data?.includes(DONE),

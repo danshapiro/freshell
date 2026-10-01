@@ -3584,21 +3584,17 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
       clearViewportFirst = true
       fullHydrateFallbackReason = checkpointDecision.reason
     }
-    // Geometry authority invariant (attach-geometry-resume-panes): a pane that
-    // is not visible must never CLAIM viewport geometry on the wire — servers
-    // resize the PTY unconditionally for viewport_hydrate regardless of who
-    // else is attached, so a hidden hydrating tab stamps stale/never-fitted
-    // dims over the visible pane's size. The swap is wire-token-only: all
-    // bookkeeping keeps viewport_hydrate semantics (sinceSeq 0, surface reset,
-    // currentAttachRef/deferredAttachState intents); keepalive_delta is
-    // replay-identical (replay keys off since_seq) and never resizes.
-    const hiddenViewportAttach = effectiveIntent === 'viewport_hydrate' && hiddenRef.current
-    const wireIntent = hiddenViewportAttach ? 'keepalive_delta' : effectiveIntent
     const deltaSeq = Math.max(0, Math.floor(explicitSinceSeq ?? (checkpointDecision.ok ? checkpointDecision.sinceSeq : 0)))
     const sinceSeq = effectiveIntent === 'viewport_hydrate' ? 0 : deltaSeq
     let surfaceQuarantined = hasInFlightWrites
     let deferContentReconstruction = opts?.deferViewportClearUntilContent === true
-    const sendAttach = () => {
+    const sendAttach = (preserveDeliveryGapNotice = false) => {
+      // A content probe can wait through a visibility change before creating
+      // its reset ticket. Project visibility at the actual wire boundary so
+      // a now-hidden pane cannot claim geometry, including as first viewer.
+      // Internal full-hydrate semantics still own sinceSeq 0 and surfaceReset.
+      const hiddenViewportAttach = effectiveIntent === 'viewport_hydrate' && hiddenRef.current
+      const wireIntent = hiddenViewportAttach ? 'keepalive_delta' : effectiveIntent
       localReconstructionRef.current = null
       failedConsumptionGenerationRef.current = null
       writeQueue?.setActiveGeneration(attachRequestId, { dropQueuedStaleWrites: true })
@@ -3620,7 +3616,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
       setIsAttaching(true)
       setTruncatedHistoryGap(null)
       setRetentionLossNotice(null)
-      setDeliveryGapNotice(null)
+      if (!preserveDeliveryGapNotice) setDeliveryGapNotice(null)
 
       // Startup probes must not leak across attach generations.
       resetStartupProbeParser()
@@ -3830,7 +3826,9 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
         deferContentReconstruction = false
         repairContentReconstructionRef.current = null
         log.debug('Terminal reconstruction completed', { paneId: paneIdRef.current, terminalId: tid, generation: ticket.generation })
-        sendAttach()
+        // This replacement belongs to the admitted delivery-gap repair;
+        // preserve its notice while the replacement replay is outstanding.
+        sendAttach(opts?.deferViewportClearUntilContent === true)
       }, { generation: ticket.generation, mode: 'replay' })
     }
     const needsMountedReconstruction = effectiveIntent === 'viewport_hydrate'
