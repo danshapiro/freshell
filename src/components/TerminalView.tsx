@@ -3260,7 +3260,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
     })
     const completedAttachOnGap = !nextSeqState.pendingReplay
       && (Boolean(previousSeqState.pendingReplay) || previousSeqState.awaitingFreshSequence)
-    if (completedAttachOnGap) {
+    if (completedAttachOnGap && failedConsumptionGenerationRef.current !== currentAttachRef.current?.requestId) {
       resetStartupProbeParser({ discardReplayRemainder: Boolean(previousSeqState.pendingReplay) })
       setIsAttaching(false)
       markAttachComplete()
@@ -3409,7 +3409,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
       })
       const completedAttachOnGap = !nextSeqState.pendingReplay
         && (Boolean(previousSeqState.pendingReplay) || previousSeqState.awaitingFreshSequence)
-      if (completedAttachOnGap) {
+      if (completedAttachOnGap && failedConsumptionGenerationRef.current !== current?.requestId) {
         resetStartupProbeParser({ discardReplayRemainder: Boolean(previousSeqState.pendingReplay) })
         setIsAttaching(false)
         markAttachComplete()
@@ -5307,7 +5307,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
               reason: msg.reason ?? 'output_gap',
             })
           }
-          if (completedAttachOnGap) {
+          if (completedAttachOnGap && failedConsumptionGenerationRef.current !== currentAttachRef.current?.requestId) {
             setIsAttaching(false)
             markAttachComplete()
           }
