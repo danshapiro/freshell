@@ -13558,6 +13558,41 @@ describe('TerminalView lifecycle updates', () => {
         return { ...pane, pump }
       }
 
+      it('uses the resized viewport and checkpoint after a held reconstruction callback completes', async () => {
+        let notifyResize: (() => void) | undefined
+        vi.stubGlobal('ResizeObserver', class extends MockResizeObserver {
+          constructor(callback: () => void) { super(); notifyResize = callback }
+        })
+        const { terminalId, paneId, term, pump } = await dirtyPane()
+        const originalEpoch = readPacedCheckpoint(terminalId, paneId)!.geometryEpoch
+        const held = holdWrites(term)
+        wsMocks.send.mockClear()
+        act(() => { reconnectHandler!(); pump() })
+        expect(term.write.mock.calls.at(-1)?.[0]).toBe(RESET)
+        expect(held).toHaveLength(1)
+        expect(attachMessagesFor(terminalId)).toEqual([])
+
+        const runtime = runtimeMocks.instances.at(-1)!
+        runtime.fit.mockImplementation(() => { term.cols = 132; term.rows = 40 })
+        act(() => { notifyResize!(); pump() })
+        const resizeMessages = () => sentMessages().filter(msg => msg?.type === 'terminal.resize' && msg.terminalId === terminalId)
+        expect(resizeMessages().at(-1)).toMatchObject({ cols: 132, rows: 40 })
+        expect(attachMessagesFor(terminalId)).toEqual([])
+        act(() => { held.shift()!(); pump() })
+        const replacement = attachMessagesFor(terminalId).at(-1)!
+        expect(replacement).toMatchObject({ intent: 'viewport_hydrate', sinceSeq: 0, surfaceReset: true, cols: 132, rows: 40 })
+        act(() => { ready(terminalId, 3); deliverOutput('single', terminalId, 1, 'RESIZED-BASELINE\r\n'); deliverOutput('single', terminalId, 2, 'MORE\r\n'); deliverOutput('single', terminalId, 3, 'DONE\r\n'); pump(); while (held.length) { held.shift()!(); pump() } })
+        expect(readPacedCheckpoint(terminalId, paneId)).toMatchObject({ cols: 132, rows: 40, parserAppliedSeq: 3, surfaceCoverageSeq: 3 })
+        expect(readPacedCheckpoint(terminalId, paneId)!.geometryEpoch).toBeGreaterThan(originalEpoch)
+        const resizeCount = resizeMessages().length
+        act(() => { notifyResize!(); pump() })
+        expect(resizeMessages()).toHaveLength(resizeCount)
+        act(() => { reconnectHandler!(); pump() })
+        expect(attachMessagesFor(terminalId).at(-1)).toMatchObject({ intent: 'transport_reconnect', sinceSeq: 3, cols: 132, rows: 40 })
+        expect(terminalInstances.at(-1)).toBe(term)
+        expect(sentMessages().some(msg => msg?.type === 'terminal.kill')).toBe(false)
+      })
+
       it('waits for reset success and the post-hook task before advertising a full hydrate', async () => {
         const { terminalId, paneId, term, pump } = await dirtyPane()
         const held = holdWrites(term), old = latestAttachRequestIdForTerminal(terminalId)
