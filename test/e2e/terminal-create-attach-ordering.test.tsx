@@ -63,6 +63,7 @@ const wsHarness = vi.hoisted(() => {
 
 vi.mock('@/lib/ws-client', () => ({
   getWsClient: () => ({
+    isReady: true,
     send: wsHarness.send,
     connect: wsHarness.connect,
     onMessage: wsHarness.onMessage,
@@ -588,6 +589,12 @@ describe('terminal create/attach ordering (e2e)', () => {
     })
     expect(lastSent('terminal.attach')).toBeUndefined()
 
+    let completeReset: (() => void) | undefined
+    terminalInstances[0].write.mockImplementation((data: string, callback?: () => void) => {
+      if (data === '\x18\x1bc\x1b[?25h') completeReset = callback
+      else callback?.()
+    })
+
     // The enriched refusal frame, delivered through the mock wire:
     // RESTORE_UNAVAILABLE + the terminal id that still owns the session.
     wsHarness.emit({
@@ -607,6 +614,12 @@ describe('terminal create/attach ordering (e2e)', () => {
     expect(folded.status).toBe('running')
     expect(folded.restoreError).toBeUndefined()
     expect(folded.createRequestId).toBe('req-order-revive')
+
+    // The existing surface contains the revival notice. Its ordered reset
+    // must finish before the healthy backend terminal is attached.
+    await waitFor(() => expect(completeReset).toBeTypeOf('function'))
+    expect(lastSent('terminal.attach', 'term-order-live')).toBeUndefined()
+    act(() => completeReset!())
 
     // 2. A FRESH terminal.attach for the NAMED id leaves the client — and no
     //    second terminal.create ever goes out (never a duplicate writer).

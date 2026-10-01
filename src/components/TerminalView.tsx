@@ -2354,7 +2354,10 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
     setPendingOsc52Event(event)
   }, [attemptOsc52ClipboardWrite])
 
-  const resetStartupProbeParser = useCallback((opts?: { discardReplayRemainder?: boolean }) => {
+  const resetStartupProbeParser = useCallback((opts?: {
+    discardReplayRemainder?: boolean
+    preserveRenderingFragments?: boolean
+  }) => {
     const pendingProbe = startupProbeStateRef.current
     if (opts?.discardReplayRemainder) {
       const boundary = getTerminalStartupProbeReplayBoundary(pendingProbe)
@@ -2369,6 +2372,8 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
     } else {
       startupProbeReplayDiscardStateRef.current = { remainder: null, buffered: '', resumeState: null }
       startupProbeStateRef.current = createTerminalStartupProbeState()
+    }
+    if (!opts?.preserveRenderingFragments) {
       osc52ParserRef.current = createOsc52ParserState()
       turnCompleteSignalStateRef.current = createTurnCompleteSignalParserState()
     }
@@ -2377,8 +2382,16 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
   // Only recognized obsolete queries change ownership at the phase edge.
   // Ordinary rendering fragments stay with the intact replay/live stream.
   const finishStartupProbeReplay = useCallback(() => {
-    const boundary = getTerminalStartupProbeReplayBoundary(startupProbeStateRef.current)
-    if (boundary.remainder) resetStartupProbeParser({ discardReplayRemainder: true })
+    const state = startupProbeStateRef.current
+    const boundary = getTerminalStartupProbeReplayBoundary(state)
+    if (boundary.remainder) {
+      resetStartupProbeParser({ discardReplayRemainder: true, preserveRenderingFragments: true })
+    } else if (!state.pending) {
+      // Historical text may have disarmed startup detection. A fresh live
+      // query can still need its reply; ordinary unfinished controls retain
+      // their parser ownership until their same-stream continuation arrives.
+      startupProbeStateRef.current = boundary.resumeState ?? createTerminalStartupProbeState()
+    }
   }, [resetStartupProbeParser])
 
   const handleTerminalOutput = useCallback((
@@ -5264,8 +5277,15 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
           }
           const previousSeqState = seqStateRef.current
           const gapDecision = onOutputGap(previousSeqState, { fromSeq: msg.fromSeq, toSeq: msg.toSeq })
-          resetStartupProbeParser()
           const nextSeqState = gapDecision.state
+          const completedAttachOnGap = !nextSeqState.pendingReplay
+            && (Boolean(previousSeqState.pendingReplay) || previousSeqState.awaitingFreshSequence)
+          // Capture a recognized old query's remainder before retiring the
+          // discontinuous rendering state, so matching live suffixes stay
+          // suppressed and divergent live bytes can be restored intact.
+          resetStartupProbeParser({
+            discardReplayRemainder: completedAttachOnGap && Boolean(previousSeqState.pendingReplay),
+          })
           applySeqState(nextSeqState)
           markPacedReplayReceived(msg.attachRequestId, msg.toSeq)
           resetParserAppliedSurface(parserAppliedSeqRef.current)
@@ -5282,10 +5302,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
               reason: msg.reason ?? 'output_gap',
             })
           }
-          const completedAttachOnGap = !nextSeqState.pendingReplay
-            && (Boolean(previousSeqState.pendingReplay) || previousSeqState.awaitingFreshSequence)
           if (completedAttachOnGap) {
-            resetStartupProbeParser({ discardReplayRemainder: Boolean(previousSeqState.pendingReplay) })
             setIsAttaching(false)
             markAttachComplete()
           }
