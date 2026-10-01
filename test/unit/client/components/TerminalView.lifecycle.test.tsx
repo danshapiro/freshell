@@ -13572,18 +13572,37 @@ describe('TerminalView lifecycle updates', () => {
         expect(attachMessagesFor(terminalId)).toHaveLength(2)
       })
 
-      it('drops a pending reset when a superseding automatic attempt is refused', async () => {
+      it.each(['queued', 'submitted'] as const)('preserves the admitted reset when a newer automatic attempt is refused ($0)', async phase => {
         const { terminalId, term, pump } = await dirtyPane()
-        const before = term.write.mock.calls.length
+        const held = holdWrites(term)
         act(() => {
-          // Each attempt supersedes the preceding unsent ticket. The final
-          // request reaches the bound before any reset has been submitted.
-          for (let attempt = 0; attempt < 4; attempt++) reconnectHandler!()
+          for (let attempt = 0; attempt < 3; attempt++) reconnectHandler!()
+          if (phase === 'submitted') pump()
         })
+        expect(held).toHaveLength(phase === 'submitted' ? 1 : 0)
+        act(() => { reconnectHandler!() })
         expect(screen.getByTestId('restore-recovery-retry')).toBeTruthy()
         act(() => pump())
-        expect(term.write.mock.calls).toHaveLength(before)
+        expect(held).toHaveLength(1)
+        expect(reconstructionWrites(term)).toHaveLength(1)
         expect(attachMessagesFor(terminalId)).toHaveLength(1)
+        act(() => { held.shift()!(); pump() })
+        expect(attachMessagesFor(terminalId)).toHaveLength(2)
+        expect(attachMessagesFor(terminalId).at(-1)).toMatchObject({ sinceSeq: 0, surfaceReset: true })
+        // The last admitted operation already owns its budget. Its genuine
+        // success must request and finish the replacement content, even when
+        // a later request was refused; the surface cannot remain reset-only.
+        act(() => {
+          ready(terminalId, 2)
+          messageHandler!({ type: 'terminal.output', terminalId, seqStart: 1, seqEnd: 2, source: 'replay', data: 'REBUILT-AFTER-ADMITTED-RESET\r\n' })
+          pump()
+        })
+        expect(held).toHaveLength(1)
+        expect(creditMessages().at(-1)).not.toMatchObject({ consumedSeq: 2 })
+        act(() => { held.shift()!(); pump() })
+        expect(creditMessages().at(-1)).toMatchObject({ attachRequestId: latestAttachRequestIdForTerminal(terminalId), consumedSeq: 2 })
+        expectTerminalWriteContaining(term, 'REBUILT-AFTER-ADMITTED-RESET')
+        expect(screen.getByTestId('restore-recovery-retry')).toBeTruthy()
       })
 
       it.each(['refresh', 'retry'] as const)('keeps consumed high-water after explicit %s while replaying the same bytes', async action => {

@@ -193,10 +193,14 @@ for (const pathName of ['refresh', 'tab-switch', 'reconnect', 'final-live'] as c
         await expect.poll(() => wire!.events.some(e => e.direction === 'server' && e.message.terminalId === terminalId && e.message.attachRequestId === firstCredit.attachRequestId && e.message.seqStart! > boundarySeq && (e.message.data?.includes(';255m') || e.message.data?.includes(DONE))), { timeout: 15_000 }).toBe(true)
         if (pathName === 'reconnect') {
           await expect.poll(() => wire!.hasHeldContinuation()).toBe(true)
+          // Initial page bootstrap can supersede an earlier mount attach.
+          // Only an attach emitted after this actual disconnect proves the
+          // mounted transport recovery path.
+          const disconnectedEventIndex = wire.events.length
           await harness.forceDisconnect()
           wire.resumeContinuation()
           await harness.waitForConnection()
-          const newAttach = () => wire!.events.find(e => e.direction === 'client' && e.message.type === 'terminal.attach' && e.message.terminalId === terminalId && e.message.attachRequestId !== firstCredit.attachRequestId)?.message
+          const newAttach = () => wire!.events.slice(disconnectedEventIndex).find(e => e.direction === 'client' && e.message.type === 'terminal.attach' && e.message.terminalId === terminalId && e.message.attachRequestId !== firstCredit.attachRequestId)?.message
           await expect.poll(newAttach, { timeout: 30_000 }).toBeTruthy()
           expect(newAttach()).toMatchObject({ sinceSeq: 0, surfaceReset: true })
           const newId = newAttach()!.attachRequestId
@@ -226,6 +230,17 @@ for (const pathName of ['refresh', 'tab-switch', 'reconnect', 'final-live'] as c
       await expect.poll(() => harness.getTerminalBuffer(terminalId)).toContain('REPLAY-INPUT-WORKS')
       expect(terminalIdOfTabFromState(await harness.getState(), tabId!)).toBe(terminalId)
     } finally {
+      // Keep public protocol diagnostics in the cloud receipt; Cloud Run does
+      // not retain Playwright's local attachment files after the task exits.
+      console.log(JSON.stringify({ event: 'replay_credit_wire', pathName, terminalId, boundarySeq,
+        frames: wire?.events.filter(event => event.message.terminalId === terminalId).map(({ direction, message }) => ({
+          direction, type: message.type, attachRequestId: message.attachRequestId,
+          streamId: message.streamId, source: message.source, sinceSeq: message.sinceSeq,
+          consumedSeq: message.consumedSeq, seqStart: message.seqStart, seqEnd: message.seqEnd,
+          headSeq: message.headSeq, replayToSeq: message.replayToSeq, surfaceReset: message.surfaceReset,
+          incompleteSgr: message.data?.endsWith(SGR), completed: message.data?.includes(DONE),
+        })),
+      }))
       await testInfo.attach('replay-credit-wire', { body: Buffer.from(JSON.stringify({ pathName, terminalId, boundarySeq, events: wire?.events ?? [] })), contentType: 'application/json' })
       await owned?.context.close()
       await server.stop()
