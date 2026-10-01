@@ -396,7 +396,7 @@ The smallest browser fixture uses shell terminals because the same startup parse
 Run in the feature worktree:
 
 ```bash
-GCLOUD_ROBOT_REQUIRE=1 pnpm run test:cloud --config=default test/unit/client/components/TerminalView.lifecycle.test.tsx test/unit/client/components/terminal/terminal-write-queue.test.ts -t 'replay credit regression|settles a thrown write'
+GCLOUD_ROBOT_REQUIRE=1 pnpm run test:cloud --config=default --shards=1 test/unit/client/components/TerminalView.lifecycle.test.tsx test/unit/client/components/terminal/terminal-write-queue.test.ts -t 'replay credit regression|settles a thrown write'
 GCLOUD_ROBOT_REQUIRE=1 pnpm run test:e2e --project=chromium test/e2e-browser/specs/terminal-replay-credit-rust.spec.ts
 ```
 
