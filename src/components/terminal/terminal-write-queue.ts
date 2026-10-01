@@ -48,6 +48,8 @@ type TerminalWriteQueueArgs = {
    * the surface still matches its last checkpoint.
    */
   onWriteCompleted?: (item: { mode: TerminalWriteQueueMode; generation: string | undefined }) => void
+  /** A surface write failed before completion; no success hooks ran. */
+  onWriteFailed?: (item: { mode: TerminalWriteQueueMode; generation: string | undefined; error: unknown }) => void
   budgetMs?: number
   now?: () => number
   requestFrame?: (cb: FrameRequestCallback) => number
@@ -178,13 +180,17 @@ export function createTerminalWriteQueue(args: TerminalWriteQueueArgs): Terminal
       item.clearBeforeWrite?.()
       args.write(item.data, onWritten)
     } catch (error) {
-      if (!didWriteComplete) {
-        didWriteComplete = true
-        scope.complete()
-        decrementInFlightWrites(item.generation)
-        submittedWriteInFlight = false
+      // A callback/hook exception after completion is not a failed write.
+      if (didWriteComplete) throw error
+      didWriteComplete = true
+      scope.complete()
+      decrementInFlightWrites(item.generation)
+      submittedWriteInFlight = false
+      try {
+        args.onWriteFailed?.({ mode: item.mode, generation: item.generation, error })
+      } finally {
+        continueAfterWriteCompletion()
       }
-      throw error
     }
   }
 

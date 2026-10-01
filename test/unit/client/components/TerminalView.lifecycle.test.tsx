@@ -14091,7 +14091,7 @@ describe('TerminalView lifecycle updates', () => {
         act(() => { deliverOutput('single', terminalId, 3, 'NEW' + OSC52_ONLY_FRAME, 'live'); pump() })
         // Reception/submission alone must not clear the progressless budget.
         const before = attachMessagesFor(terminalId).length
-        if (outcome === 'supersede') act(() => { reconnectHandler!(); held.splice(0).forEach(cb => cb()); pump() })
+        if (outcome === 'supersede') act(() => { reconnectHandler!(); while (held.length) { held.shift()!(); pump() } })
         else if (outcome === 'success') act(() => { held.shift()!(); pump() })
         term.write.mockImplementation((_data: string, done?: () => void) => done?.())
         for (let i = 0; i < 4; i++) act(() => { reconnectHandler!(); pump(); ready(terminalId, 1) })

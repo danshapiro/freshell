@@ -409,14 +409,9 @@ type StartupProbeReplayDiscardState = {
 type TerminalOutputSubmission = {
   submittedWrite: boolean
   submittedBytesEqualInput: boolean
-  /**
-   * M2 (task-4 review): the null-screen-effect pre-parsers fully consumed the
-   * frame — the exact `cleaned === ''` condition computed below. Distinguishes
-   * full pre-parser consumption from an enqueue failure (no write queue,
-   * disposed surface, thrown write): both yield `submittedWrite === false`,
-   * but only the former is genuine consumption.
-   */
+  /** Empty preprocessing output can include bytes still owned by a parser. */
   preParserConsumedAllBytes: boolean
+  preprocessingPending: boolean
 }
 
 function resolveMinimumContrastRatio(theme?: { isDark?: boolean } | null): number {
@@ -1073,6 +1068,22 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
   // DISTINCT from parserAppliedSeqRef, which never advances across a
   // filtered or lost range and keeps its strict checkpoint semantics.
   const surfaceCoverageSeqRef = useRef(0)
+  // Sticky for this physical baseline: a rendered prefix or owned parser
+  // fragment makes even an older checkpoint insufficient to resume it.
+  const unsafeSurfaceCheckpointRef = useRef(false)
+  const failedConsumptionGenerationRef = useRef<string | null>(null)
+  const reconstructionEligibilityEpochRef = useRef(0)
+  const localReconstructionRef = useRef<{
+    generation: string
+    terminalId: string
+    terminalInstanceId: string
+    terminal: Terminal
+    queue: TerminalWriteQueue
+    eligibilityEpoch: number
+    succeeded: boolean
+    abandoned: boolean
+  } | null>(null)
+  const repairContentReconstructionRef = useRef<{ attachRequestId: string; begin: () => void } | null>(null)
   // Bounded automatic recovery accounting (WS2): consecutive progressless
   // attach attempts vs the coverage cursor; gates automatic re-attach
   // cycling and drives the visible retry state. Never kills or replaces.
@@ -1244,6 +1255,9 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
   ])
 
   const getCheckpointDeltaReplayDecision = useCallback((terminalId: string, dimensions?: { cols?: number; rows?: number }) => {
+    if (unsafeSurfaceCheckpointRef.current) {
+      return { ok: false as const, reason: 'parser_busy' as const }
+    }
     const checkpointInput = buildCheckpointReplayInput(terminalId, dimensions)
     if (!checkpointInput) {
       return { ok: false as const, reason: 'missing_checkpoint' as const }
@@ -1330,15 +1344,11 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
   // declared-unreconstructible disarm) are unchanged.
   const consumeRepairContentReset = useCallback((terminalId: string, attachRequestId?: unknown): (() => void) | null => {
     if (repairContentResetPendingRef.current !== attachRequestId) return null
+    const repair = repairContentReconstructionRef.current
+    if (!repair || repair.attachRequestId !== attachRequestId || terminalIdRef.current !== terminalId) return null
     repairContentResetPendingRef.current = null
-    return () => {
-      try {
-        termRef.current?.clear()
-      } catch {
-        // disposed
-      }
-      clearTerminalCursor(terminalId)
-    }
+    repairContentReconstructionRef.current = null
+    return repair.begin
   }, [])
 
   // ── Paced terminal replay consumption (responsive-terminal-restore
@@ -1391,6 +1401,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
   }, [])
 
   const flushPacedReplayCredit = useCallback(() => {
+    if (localReconstructionRef.current) return
     const paced = pacedReplayRef.current
     if (!paced) return
     const activeAttach = currentAttachRef.current
@@ -1450,16 +1461,31 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
       const pending = quarantineRepairRef.current
       if (!pending || pending.attachRequestId !== attachRequestId) return
       const activeAttach = currentAttachRef.current
+      const localTicket = localReconstructionRef.current
+      const ownsLocalTicket = localTicket?.generation === attachRequestId
       if (
         !mountedRef.current
         || pending.terminalId !== terminalId
         || terminalIdRef.current !== terminalId
-        || !activeAttach
-        || activeAttach.terminalId !== terminalId
-        || activeAttach.requestId !== attachRequestId
+        || (!ownsLocalTicket && (!activeAttach || activeAttach.terminalId !== terminalId || activeAttach.requestId !== attachRequestId))
         || writeQueueRef.current !== pending.queue
       ) {
         clearQuarantineRepair(attachRequestId)
+        return
+      }
+      if (ownsLocalTicket && !pending.timedOut) {
+        // Its own ordered task owns the successful post-hook boundary;
+        // a quiet interval between queued items cannot stand in for it.
+        if (Date.now() - pending.startedAt >= QUARANTINE_REPAIR_TIMEOUT_MS) {
+          localTicket.abandoned = true
+          pending.timedOut = true
+          pending.queue.setActiveGeneration(`${attachRequestId}:quarantine-timeout`, { dropQueuedStaleWrites: true })
+          log.warn('Terminal reconstruction timed out waiting for surface writes', {
+            paneId: paneIdRef.current, terminalId, generation: attachRequestId,
+          })
+          recordTerminalPerfAuditEvent('terminal.catchup.surface_quarantine_timeout', { terminalId, attachRequestId, reason: 'in_flight_writes_timeout' })
+        }
+        pending.timer = setTimeout(poll, QUARANTINE_REPAIR_POLL_MS)
         return
       }
       if (!pending.queue.hasInFlightWrites()) {
@@ -1536,6 +1562,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
     } | null,
     parserAppliedSeq: number,
   ) => {
+    if (unsafeSurfaceCheckpointRef.current) return
     if (!terminalId || !Number.isFinite(parserAppliedSeq)) return
     if (attach?.surfaceQuarantined === true) return
     if (!attach || attach.terminalId !== terminalId) return
@@ -1577,11 +1604,6 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
     const coverage = surfaceCoverageSeqRef.current
     if (seqStart !== coverage + 1 || seqEnd <= coverage) return false
     surfaceCoverageSeqRef.current = seqEnd
-    const wasExhausted = recoveryAccountingRef.current.exhausted
-    recoveryAccountingRef.current = recordRecoveryProgress(recoveryAccountingRef.current, seqEnd, Date.now())
-    if (wasExhausted && !recoveryAccountingRef.current.exhausted) {
-      setRecoveryExhausted(false)
-    }
     return true
   }, [])
 
@@ -1792,6 +1814,22 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
       }
     }
   }, [hidden, paneId])
+
+  useLayoutEffect(() => {
+    reconstructionEligibilityEpochRef.current += 1
+    const ticket = localReconstructionRef.current
+    if (!ticket) return
+    ticket.abandoned = true
+    ticket.queue.setActiveGeneration(`${ticket.generation}:abandoned`, { dropQueuedStaleWrites: true })
+    clearQuarantineRepair()
+    if (hidden) {
+      deferredAttachStateRef.current = {
+        mode: 'waiting_for_geometry', pendingIntent: 'viewport_hydrate',
+        pendingSinceSeq: 0, pendingReason: 'initial_hydrate',
+      }
+      setIsAttaching(false)
+    }
+  }, [connectionStatus, hidden, activeTabId, terminalContent?.terminalId, clearQuarantineRepair])
 
   useEffect(() => {
     warnExternalLinksRef.current = settings.terminal.warnExternalLinks
@@ -2310,39 +2348,9 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
   ): boolean => {
     if (!data) return false
     const queue = writeQueueRef.current
-    if (queue) {
-      queue.enqueue(data, onWritten, clearBeforeWrite ? { ...options, clearBeforeWrite } : options)
-      return true
-    }
-    const term = termRef.current
-    if (!term) return false
-    const mode = options?.mode ?? 'live'
-    const generation = options?.generation ?? 'no-attach'
-    const scope = beginTerminalOutputWriteScope({
-      terminalInstanceId: terminalInstanceIdRef.current,
-      source: mode,
-      attachRequestId: options?.generation,
-      generation,
-      suppressExternalSideEffects: mode === 'replay',
-    })
-    try {
-      // No write queue (the direct fallback): the clear runs
-      // synchronously immediately before the direct write — the same
-      // clear-then-write ordering, in one synchronous step.
-      clearBeforeWrite?.()
-      term.write(data, () => {
-        try {
-          onWritten?.()
-        } finally {
-          scope.complete()
-        }
-      })
-      return true
-    } catch {
-      // disposed
-      scope.complete()
-      return false
-    }
+    if (!queue || !termRef.current) return false
+    queue.enqueue(data, onWritten, clearBeforeWrite ? { ...options, clearBeforeWrite } : options)
+    return true
   }, [])
 
   const attemptOsc52ClipboardWrite = useCallback((text: string) => {
@@ -2410,15 +2418,24 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
     } else {
       startupProbeReplayDiscardStateRef.current = { remainder: null, buffered: '', resumeState: null }
       startupProbeStateRef.current = createTerminalStartupProbeState()
+      osc52ParserRef.current = createOsc52ParserState()
+      turnCompleteSignalStateRef.current = createTurnCompleteSignalParserState()
     }
   }, [])
+
+  // Only recognized obsolete queries change ownership at the phase edge.
+  // Ordinary rendering fragments stay with the intact replay/live stream.
+  const finishStartupProbeReplay = useCallback(() => {
+    const boundary = getTerminalStartupProbeReplayBoundary(startupProbeStateRef.current)
+    if (boundary.remainder) resetStartupProbeParser({ discardReplayRemainder: true })
+  }, [resetStartupProbeParser])
 
   const handleTerminalOutput = useCallback((
     raw: string,
     mode: TerminalPaneContent['mode'],
     tid: string | undefined,
     allowReplies: boolean,
-    onParserApplied?: () => void,
+    onWritten?: (submittedBytesEqualInput: boolean) => void,
     writeOptions?: TerminalWriteQueueOptions,
   ): TerminalOutputSubmission => {
     const outputSource = writeOptions?.mode ?? 'live'
@@ -2462,6 +2479,16 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
     }
 
     const submittedBytesEqualInput = cleaned === raw
+    const turnState = turnCompleteSignalStateRef.current
+    const discard = startupProbeReplayDiscardStateRef.current
+    const preprocessingPending = Boolean(
+      startupProbeStateRef.current.pending || osc52ParserRef.current.pending
+      || turnState.inOsc || turnState.inCsi || turnState.inDcs || turnState.pendingEsc
+      || discard.remainder || discard.buffered,
+    )
+    if (preprocessingPending || (cleaned.length > 0 && !submittedBytesEqualInput)) {
+      unsafeSurfaceCheckpointRef.current = true
+    }
     // THE RENDER MOMENT (responsive-terminal-restore WS3, round-3 fix;
     // round-4 atomicity): a deferred repair clear consumes ONLY here —
     // the sequence validator already accepted this frame (the caller
@@ -2483,10 +2510,16 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
     if (cleaned && tid) {
       consumedDeferredClear = consumeRepairContentReset(tid, writeOptions?.generation)
     }
+    if (consumedDeferredClear) {
+      // Rendering content authorizes reconstruction, not stream consumption.
+      // Replay is requested again only after a real replacement baseline.
+      consumedDeferredClear()
+      return { submittedWrite: false, submittedBytesEqualInput: false, preParserConsumedAllBytes: false, preprocessingPending }
+    }
     const submittedWrite = cleaned
       ? enqueueTerminalWrite(
           cleaned,
-          submittedBytesEqualInput ? onParserApplied : undefined,
+          () => onWritten?.(submittedBytesEqualInput),
           writeOptions,
           consumedDeferredClear ?? undefined,
         )
@@ -2506,6 +2539,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
       submittedWrite,
       submittedBytesEqualInput: submittedWrite && submittedBytesEqualInput,
       preParserConsumedAllBytes: cleaned === '',
+      preprocessingPending,
     }
   }, [consumeRepairContentReset, dispatch, enqueueTerminalWrite, handleOsc52Event, sendInput, tabId])
 
@@ -2728,6 +2762,8 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
     surfaceWritesSinceFreshRef.current = 0
     // A brand-new surface has no covered stream position.
     surfaceCoverageSeqRef.current = 0
+    unsafeSurfaceCheckpointRef.current = false
+    failedConsumptionGenerationRef.current = null
     const writeQueue = createTerminalWriteQueue({
       terminalInstanceId,
       // One paced-replay credit per drain tick (Workstream 1): the flush is
@@ -2760,6 +2796,17 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
           pendingQuarantine.completedWrites += 1
         }
       },
+      onWriteFailed: ({ generation, error }) => {
+        if (terminalInstanceIdRef.current !== terminalInstanceId) return
+        unsafeSurfaceCheckpointRef.current = true
+        if (generation === currentAttachRef.current?.requestId) {
+          failedConsumptionGenerationRef.current = generation ?? null
+        }
+        log.warn('Terminal surface write failed', {
+          paneId, terminalId: terminalIdRef.current, generation,
+          errorType: error instanceof Error ? error.name : typeof error,
+        })
+      },
       write: (data, onWritten) => {
         const recordForTest = (phase: 'submitted' | 'written') => {
           try {
@@ -2780,12 +2827,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
           onWritten?.()
         }
         recordForTest('submitted')
-        try {
-          term.write(data, completeWrite)
-        } catch {
-          // disposed
-          onWritten?.()
-        }
+        term.write(data, completeWrite)
       },
     })
     writeQueueRef.current = writeQueue
@@ -3084,6 +3126,8 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
     const wrapperEl = wrapperRef.current
     return () => {
       clearQuarantineRepair()
+      const ticket = localReconstructionRef.current
+      if (ticket?.terminalInstanceId === terminalInstanceId) ticket.abandoned = true
       requestModeBypass.dispose()
       filePathLinkDisposable?.dispose()
       urlLinkDisposable?.dispose()
@@ -3252,6 +3296,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
       ? Math.max(fromSeq, Math.floor(explicitToSeq))
       : fromSeq
     const gapDecision = onOutputGap(previousSeqState, { fromSeq, toSeq })
+    resetStartupProbeParser()
     const nextSeqState = gapDecision.state
     applySeqState(nextSeqState)
     resetParserAppliedSurface(parserAppliedSeqRef.current)
@@ -3312,6 +3357,9 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
     terminalId: string
     attachRequestId?: string
   }) => {
+    // The unsent local interval owns admission, including the legacy null
+    // attach exception. Old untagged bytes must never reach preprocessing.
+    if (localReconstructionRef.current?.terminalId === msg.terminalId) return false
     const current = currentAttachRef.current
     if (!current) return true
     if (!msg.attachRequestId) {
@@ -3394,6 +3442,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
       ? msg.seqEnd
       : (typeof msg.toSeq === 'number' ? msg.toSeq : undefined)
     if (typeof fromSeq === 'number' && typeof toSeq === 'number') {
+      resetStartupProbeParser()
       const previousSeqState = seqStateRef.current
       const gapDecision = onOutputGap(previousSeqState, { fromSeq, toSeq })
       const nextSeqState = gapDecision.state
@@ -3490,6 +3539,8 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
       })
       return
     }
+    const supersededTicket = localReconstructionRef.current
+    if (supersededTicket) supersededTicket.abandoned = true
     // Bounded automatic recovery (WS2): consecutive attach/hydrate attempts
     // without a coverage-cursor advance count against a bounded limit; past
     // it, automatic cycling STOPS and the visible retry state shows (the
@@ -3497,7 +3548,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
     // identity. Explicit user paths (pane refresh, the retry control) reset
     // the accounting before they get here.
     const recoveryDecision = beginRecoveryAttempt(recoveryAccountingRef.current, {
-      coverageSeq: surfaceCoverageSeqRef.current,
+      coverageSeq: recoveryAccountingRef.current.lastProgressSeq,
       now: Date.now(),
       attemptKey: opts?.recoveryAttemptKey,
     })
@@ -3532,7 +3583,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
     const cols = Math.max(2, term.cols || 80)
     const rows = Math.max(2, term.rows || 24)
     syncGeometryEpochForViewport(tid, cols, rows)
-    const attachRequestId = `${paneIdRef.current}:${++attachCounterRef.current}:${nanoid(6)}`
+    let attachRequestId = `${paneIdRef.current}:${++attachCounterRef.current}:${nanoid(6)}`
     const writeQueue = writeQueueRef.current
     const hasInFlightWrites = writeQueue?.hasInFlightWrites() === true
     const expectedStreamId = getTerminalCheckpointStreamId()
@@ -3600,7 +3651,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
       effectiveIntent = 'viewport_hydrate'
       clearViewportFirst = true
       fullHydrateFallbackReason = 'in_flight_writes'
-    } else if (effectiveIntent !== 'viewport_hydrate' && explicitSinceSeq === undefined && !checkpointDecision.ok) {
+    } else if (effectiveIntent !== 'viewport_hydrate' && !checkpointDecision.ok && (explicitSinceSeq === undefined || unsafeSurfaceCheckpointRef.current)) {
       effectiveIntent = 'viewport_hydrate'
       clearViewportFirst = true
       fullHydrateFallbackReason = checkpointDecision.reason
@@ -3617,7 +3668,11 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
     const wireIntent = hiddenViewportAttach ? 'keepalive_delta' : effectiveIntent
     const deltaSeq = Math.max(0, Math.floor(explicitSinceSeq ?? (checkpointDecision.ok ? checkpointDecision.sinceSeq : 0)))
     const sinceSeq = effectiveIntent === 'viewport_hydrate' ? 0 : deltaSeq
-    const surfaceQuarantined = hasInFlightWrites
+    let surfaceQuarantined = hasInFlightWrites
+    let deferContentReconstruction = opts?.deferViewportClearUntilContent === true
+    const sendAttach = () => {
+    localReconstructionRef.current = null
+    failedConsumptionGenerationRef.current = null
     writeQueue?.setActiveGeneration(attachRequestId, { dropQueuedStaleWrites: true })
     if (!surfaceQuarantined) {
       clearQuarantineRepair()
@@ -3643,20 +3698,13 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
     resetStartupProbeParser()
 
     if (effectiveIntent === 'viewport_hydrate') {
-      if (!surfaceQuarantined) {
+      if (!surfaceQuarantined && !deferContentReconstruction) {
         // A live hydrate rebuilds the surface from zero — new surface
         // generation (epoch), zero applied, zero coverage. A QUARANTINED
         // hydrate defers this reset: the surface is frozen pending the
         // bounded drain wait, and the repair decides whether to resume the
         // survived checkpoint or rebuild.
         resetParserAppliedSurface()
-        if (clearViewportFirst) {
-          try {
-            termRef.current?.clear()
-          } catch {
-            // disposed
-          }
-        }
       }
       applySeqState(beginAttach(createAttachSeqState({ lastSeq: 0 })))
     } else {
@@ -3688,7 +3736,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
     // Per-generation deferred content reset (delivery-loss repair
     // fallback): armed only for the hydrate that asked to defer its
     // viewport clear until its content establishes the new baseline.
-    repairContentResetPendingRef.current = opts?.deferViewportClearUntilContent === true
+    repairContentResetPendingRef.current = deferContentReconstruction
       ? attachRequestId
       : null
 
@@ -3782,6 +3830,81 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
     }
     if (surfaceQuarantined) {
       scheduleQuarantineRepair(tid, attachRequestId)
+    }
+    }
+
+    const beginMountedReconstruction = () => {
+      if (!writeQueue || termRef.current !== term || terminalIdRef.current !== tid) return
+      const previous = localReconstructionRef.current
+      if (previous) previous.abandoned = true
+      clearQuarantineRepair()
+      const ticket = {
+        generation: `${attachRequestId}:reconstruct:${nanoid(6)}`,
+        terminalId: tid, terminalInstanceId: terminalInstanceIdRef.current,
+        terminal: term, queue: writeQueue,
+        eligibilityEpoch: reconstructionEligibilityEpochRef.current,
+        succeeded: false, abandoned: false,
+      }
+      localReconstructionRef.current = ticket
+      pacedReplayRef.current = null
+      writeQueue.setActiveGeneration(ticket.generation, { dropQueuedStaleWrites: true })
+      setIsAttaching(true)
+      log.debug('Reconstructing mounted terminal surface', { paneId: paneIdRef.current, terminalId: tid, generation: ticket.generation })
+      if (writeQueue.hasInFlightWrites()) scheduleQuarantineRepair(tid, ticket.generation)
+      writeQueue.enqueue('\x18\x1bc\x1b[?25h', () => { ticket.succeeded = true }, {
+        generation: ticket.generation, mode: 'replay', coalesce: false,
+      })
+      writeQueue.enqueueTask(() => {
+        if (
+          !ticket.succeeded || ticket.abandoned || localReconstructionRef.current !== ticket
+          || !mountedRef.current || termRef.current !== ticket.terminal
+          || terminalInstanceIdRef.current !== ticket.terminalInstanceId
+          || terminalIdRef.current !== ticket.terminalId || writeQueueRef.current !== ticket.queue
+          || reconstructionEligibilityEpochRef.current !== ticket.eligibilityEpoch || !ws.isReady
+          || !collectAllTerminalIds(appStore.getState().panes.layouts).has(tid)
+        ) {
+          ticket.abandoned = true
+          clearQuarantineRepair()
+          log.warn('Terminal reconstruction abandoned', { paneId: paneIdRef.current, terminalId: tid, generation: ticket.generation, succeeded: ticket.succeeded })
+          return
+        }
+        const quarantine = quarantineRepairRef.current
+        if (quarantine?.attachRequestId === ticket.generation) {
+          recordTerminalPerfAuditEvent('terminal.catchup.surface_quarantine_repair', {
+            terminalId: tid, attachRequestId: ticket.generation, resumable: false,
+            completedWritesDuringQuarantine: Math.max(0, quarantine.completedWrites - 1),
+          })
+        }
+        clearQuarantineRepair()
+        resetStartupProbeParser()
+        unsafeSurfaceCheckpointRef.current = false
+        resetParserAppliedSurface()
+        clearTerminalCursor(tid)
+        surfaceFreshRef.current = true
+        surfaceFreshMarkerRef.current = null
+        surfaceWritesSinceFreshRef.current = 0
+        surfaceQuarantined = false
+        deferContentReconstruction = false
+        repairContentReconstructionRef.current = null
+        log.debug('Terminal reconstruction completed', { paneId: paneIdRef.current, terminalId: tid, generation: ticket.generation })
+        sendAttach()
+      }, { generation: ticket.generation, mode: 'replay' })
+    }
+    const needsMountedReconstruction = effectiveIntent === 'viewport_hydrate'
+      && (hasInFlightWrites || unsafeSurfaceCheckpointRef.current || surfaceWritesSinceFreshRef.current > 0 || surfaceCoverageSeqRef.current > 0)
+    if (opts?.deferViewportClearUntilContent) {
+      repairContentReconstructionRef.current = {
+        attachRequestId,
+        begin: () => {
+          attachRequestId = `${paneIdRef.current}:${++attachCounterRef.current}:${nanoid(6)}`
+          beginMountedReconstruction()
+        },
+      }
+      sendAttach()
+    } else if (needsMountedReconstruction) {
+      beginMountedReconstruction()
+    } else {
+      sendAttach()
     }
   }, [
     suppressNetworkEffects,
@@ -4543,7 +4666,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
           }
         }
 
-        const completeParserAppliedFrame = (input: {
+        const completeAcceptedOutput = (input: {
           attachRequestId?: string
           mode: TerminalPaneContent['mode']
           terminalInstanceId: string
@@ -4551,47 +4674,47 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
           seqStart: number
           seqEnd: number
           completedAttach: boolean
+          submittedBytesEqualInput: boolean
+          safeCoverage: boolean
+          noWrite: boolean
         }) => {
           const activeAttach = currentAttachRef.current
           if (!activeAttach || activeAttach.requestId !== input.attachRequestId) return
+          if (activeAttach.terminalId !== tid || terminalIdRef.current !== tid) return
           if (terminalInstanceIdRef.current !== input.terminalInstanceId) return
-          if (!shouldAllowTerminalOutputSideEffect({
+          if (failedConsumptionGenerationRef.current === input.attachRequestId) return
+          const allowedByWriteScope = shouldAllowTerminalOutputSideEffect({
             terminalInstanceId: input.terminalInstanceId,
             effect: 'parser_applied_checkpoint',
             mode: input.mode,
             generation: input.attachRequestId,
-          })) {
+          })
+          if (input.noWrite) {
+            if (getTerminalOutputWriteScope(input.terminalInstanceId)) return
+          } else if (!allowedByWriteScope) {
             return
           }
-          const nextSeqState = markParserAppliedSeq(seqStateRef.current, input.parserAppliedSeq)
-          applySeqState(nextSeqState)
-          markParserAppliedFrame(tid, nextSeqState.parserAppliedSeq, activeAttach)
-          // Surface-coverage cursor (WS2): an applied frame advances BOTH
-          // cursors — the coverage advance is contiguity-gated against the
-          // coverage cursor itself, so it extends past null-screen-effect
-          // filtered ranges the strict applied position refuses to cross,
-          // but never past a lost/unapplied hole. The advance persists the
-          // checkpoint so the coverage position survives an interrupt even
-          // when the strict applied position did not move (mixed page).
-          advanceSurfaceCoverageAndPersist(
-            tid,
-            activeAttach,
-            input.seqStart,
-            input.seqEnd,
-          )
-          // Paced replay consumption (Workstream 1): the write-queue applied
-          // this frame — the consumption frontier advances independent of the
-          // parser-applied checkpoint's quarantine clamping (the checkpoint
-          // still refuses filtered/lost ranges; the frontier is about
-          // consumption, not surface state).
-          advancePacedReplayConsumption(input.attachRequestId, input.parserAppliedSeq)
+          // Successful ownership of original stream bytes is independent of
+          // fidelity, safe coverage, and the replay target (live can exceed it).
+          advancePacedReplayConsumption(input.attachRequestId, input.seqEnd)
+          const wasExhausted = recoveryAccountingRef.current.exhausted
+          recoveryAccountingRef.current = recordRecoveryProgress(recoveryAccountingRef.current, input.seqEnd, Date.now())
+          if (wasExhausted && !recoveryAccountingRef.current.exhausted) setRecoveryExhausted(false)
+          if (input.submittedBytesEqualInput) {
+            const nextSeqState = markParserAppliedSeq(seqStateRef.current, input.parserAppliedSeq)
+            applySeqState(nextSeqState)
+            markParserAppliedFrame(tid, nextSeqState.parserAppliedSeq, activeAttach)
+          }
+          if (input.safeCoverage && !unsafeSurfaceCheckpointRef.current) {
+            advanceSurfaceCoverageAndPersist(tid, activeAttach, input.seqStart, input.seqEnd)
+          }
           if (input.completedAttach) {
             completeAttachGeneration({
               attachRequestId: input.attachRequestId,
               mode: input.mode,
               terminalInstanceId: input.terminalInstanceId,
               terminalId: tid,
-              allowWithoutWriteScope: false,
+              allowWithoutWriteScope: input.noWrite,
             })
           }
         }
@@ -4605,6 +4728,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
         }) => {
           const activeAttach = currentAttachRef.current
           if (!activeAttach || activeAttach.requestId !== input.attachRequestId) return false
+          if (failedConsumptionGenerationRef.current === input.attachRequestId) return false
           if (input.terminalId && activeAttach.terminalId !== input.terminalId) return false
           if (terminalInstanceIdRef.current !== input.terminalInstanceId) return false
           const allowedByWriteScope = shouldAllowTerminalOutputSideEffect({
@@ -4656,7 +4780,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
             && !startupProbeReplayDiscardStateRef.current.remainder
             && !startupProbeReplayDiscardStateRef.current.buffered
           ) {
-            resetStartupProbeParser({ discardReplayRemainder: Boolean(input.previousSeqState.pendingReplay) })
+            finishStartupProbeReplay()
           }
           const replayDiscard = consumeStartupProbeReplayDiscard(raw, startupProbeReplayDiscardStateRef.current)
           if (replayDiscard.resumeState) {
@@ -4664,43 +4788,26 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
           }
           raw = replayDiscard.raw
           const inputBytesEqualSubmission = raw === input.raw
+          if (!inputBytesEqualSubmission) unsafeSurfaceCheckpointRef.current = true
           const outputTerminalInstanceId = terminalInstanceIdRef.current
-          const completeNoWriteReplayAttach = () => {
-            completeAttachGeneration({
-              attachRequestId: input.attachRequestId,
-              mode: input.mode,
-              terminalInstanceId: outputTerminalInstanceId,
-              terminalId: tid,
-              allowWithoutWriteScope: true,
-            })
-          }
-          const queueNoWriteReplayAttachCompletion = () => {
-            const queue = writeQueueRef.current
-            if (queue) {
-              queue.enqueueTask(completeNoWriteReplayAttach, {
-                mode: input.outputSource,
-                generation: input.attachRequestId,
-              })
-              return
-            }
-            completeNoWriteReplayAttach()
-          }
+          const complete = (submittedBytesEqualInput: boolean, safeCoverage: boolean, noWrite: boolean) => completeAcceptedOutput({
+            attachRequestId: input.attachRequestId,
+            mode: input.mode,
+            terminalInstanceId: outputTerminalInstanceId,
+            parserAppliedSeq: input.parserAppliedSeq,
+            seqStart: input.seqStart,
+            seqEnd: input.seqEnd,
+            completedAttach: input.completedAttach,
+            submittedBytesEqualInput: inputBytesEqualSubmission && submittedBytesEqualInput,
+            safeCoverage,
+            noWrite,
+          })
           const submission = handleTerminalOutput(
             raw,
             input.mode,
             tid,
             input.outputSource === 'live',
-            inputBytesEqualSubmission
-              ? () => completeParserAppliedFrame({
-                  attachRequestId: input.attachRequestId,
-                  mode: input.mode,
-                  terminalInstanceId: outputTerminalInstanceId,
-                  parserAppliedSeq: input.parserAppliedSeq,
-                  seqStart: input.seqStart,
-                  seqEnd: input.seqEnd,
-                  completedAttach: input.completedAttach,
-                })
-              : undefined,
+            (equal) => complete(equal, inputBytesEqualSubmission && equal, false),
             {
               mode: input.outputSource,
               generation: input.attachRequestId,
@@ -4711,46 +4818,20 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
             || !inputBytesEqualSubmission
             || !submission.submittedBytesEqualInput
           ) {
-            // Paced replay consumption (Workstream 1): a frame the
-            // null-screen-effect pre-parsers fully consumed (nothing reached
-            // the queue, no replay-discard mutation) IS consumed — the
-            // frontier advances without any xterm write. M2 (task-4 review):
-            // `preParserConsumedAllBytes` is the exact `cleaned === ''`
-            // condition, so an enqueue failure (no write queue, disposed
-            // surface, thrown write) can NEVER masquerade as consumption —
-            // unconsumed bytes must never be credited. Partial or unknown
-            // mutations keep today's quarantine and forfeit the range's
-            // credit (the server's retention/expiry handling covers it).
-            if (
-              !submission.submittedWrite
-              && inputBytesEqualSubmission
-              && submission.preParserConsumedAllBytes
-            ) {
-              advancePacedReplayConsumption(input.attachRequestId, input.seqEnd)
-              schedulePacedReplayCreditFlush(input.outputSource, input.attachRequestId)
-              // Surface-coverage cursor (WS2): a fully pre-filtered frame
-              // advances ONLY the coverage cursor (the strict applied
-              // position stays pinned below it and keeps the unapplied-range
-              // quarantine above) — and persists it, so a disconnect right
-              // after a filtered page resumes from past it instead of
-              // re-delivering (and re-firing) the filtered bytes.
-              advanceSurfaceCoverageAndPersist(
-                tid,
-                currentAttachRef.current,
-                input.seqStart,
-                input.seqEnd,
-              )
-            }
             applySeqState(markOutputRangeUnapplied(seqStateRef.current, {
               fromSeq: input.seqStart,
               toSeq: input.seqEnd,
             }))
-            if (input.completedAttach && frameOverlapsReplay) {
-              queueNoWriteReplayAttachCompletion()
+            if (!submission.submittedWrite && submission.preParserConsumedAllBytes && termRef.current) {
+              writeQueueRef.current?.enqueueTask(() => complete(
+                false,
+                inputBytesEqualSubmission && !submission.preprocessingPending,
+                true,
+              ), { mode: input.outputSource, generation: input.attachRequestId })
             }
           }
           if (input.completedAttach && frameOverlapsReplay) {
-            resetStartupProbeParser({ discardReplayRemainder: true })
+            finishStartupProbeReplay()
           }
           markFirstOutputIfNeeded(raw)
         }
@@ -4944,6 +5025,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
           }
 
           if (tid && batchDecision.implicitGaps.length > 0) {
+            resetStartupProbeParser()
             // Implicit gap (responsive-terminal-restore): the batch jumped
             // forward across sequences no gap frame declared. The seq state
             // already folded the hole (known lost range + quarantine, the
@@ -4971,6 +5053,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
           }
 
           if (tid && batchDecision.freshReset) {
+            resetStartupProbeParser()
             clearTerminalCursor(tid)
             resetParserAppliedSurface()
           }
@@ -5064,6 +5147,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
           }
 
           if (tid && frameDecision.implicitGap) {
+            resetStartupProbeParser()
             // Implicit gap (responsive-terminal-restore): the frame jumped
             // forward across sequences no gap frame declared. The seq state
             // already folded the hole (known lost range + quarantine, the
@@ -5089,6 +5173,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
           }
 
           if (tid && frameDecision.freshReset) {
+            resetStartupProbeParser()
             clearTerminalCursor(tid)
             resetParserAppliedSurface()
           }
@@ -5225,6 +5310,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
           }
           const previousSeqState = seqStateRef.current
           const gapDecision = onOutputGap(previousSeqState, { fromSeq: msg.fromSeq, toSeq: msg.toSeq })
+          resetStartupProbeParser()
           const nextSeqState = gapDecision.state
           applySeqState(nextSeqState)
           markPacedReplayReceived(msg.attachRequestId, msg.toSeq)
