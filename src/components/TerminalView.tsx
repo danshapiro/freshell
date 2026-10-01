@@ -3240,8 +3240,12 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
       ? Math.max(fromSeq, Math.floor(explicitToSeq))
       : fromSeq
     const gapDecision = onOutputGap(previousSeqState, { fromSeq, toSeq })
-    resetStartupProbeParser()
     const nextSeqState = gapDecision.state
+    const completedAttachOnGap = !nextSeqState.pendingReplay
+      && (Boolean(previousSeqState.pendingReplay) || previousSeqState.awaitingFreshSequence)
+    resetStartupProbeParser({
+      discardReplayRemainder: completedAttachOnGap && Boolean(previousSeqState.pendingReplay),
+    })
     applySeqState(nextSeqState)
     resetParserAppliedSurface(parserAppliedSeqRef.current)
     recordTerminalPerfAuditEvent('terminal.catchup.surface_quarantined', {
@@ -3258,10 +3262,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
       reason: input.reason,
       invalidReason: input.invalidReason,
     })
-    const completedAttachOnGap = !nextSeqState.pendingReplay
-      && (Boolean(previousSeqState.pendingReplay) || previousSeqState.awaitingFreshSequence)
     if (completedAttachOnGap && failedConsumptionGenerationRef.current !== currentAttachRef.current?.requestId) {
-      resetStartupProbeParser({ discardReplayRemainder: Boolean(previousSeqState.pendingReplay) })
       setIsAttaching(false)
       markAttachComplete()
     }
@@ -3386,10 +3387,14 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
       ? msg.seqEnd
       : (typeof msg.toSeq === 'number' ? msg.toSeq : undefined)
     if (typeof fromSeq === 'number' && typeof toSeq === 'number') {
-      resetStartupProbeParser()
       const previousSeqState = seqStateRef.current
       const gapDecision = onOutputGap(previousSeqState, { fromSeq, toSeq })
       const nextSeqState = gapDecision.state
+      const completedAttachOnGap = !nextSeqState.pendingReplay
+        && (Boolean(previousSeqState.pendingReplay) || previousSeqState.awaitingFreshSequence)
+      resetStartupProbeParser({
+        discardReplayRemainder: completedAttachOnGap && Boolean(previousSeqState.pendingReplay),
+      })
       applySeqState(nextSeqState)
       resetParserAppliedSurface(parserAppliedSeqRef.current, {
         surfaceCoverageSeq: surfaceCoverageSeqRef.current,
@@ -3407,10 +3412,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
         highestObservedSeq: nextSeqState.highestObservedSeq,
         reason: 'stream_identity_mismatch',
       })
-      const completedAttachOnGap = !nextSeqState.pendingReplay
-        && (Boolean(previousSeqState.pendingReplay) || previousSeqState.awaitingFreshSequence)
       if (completedAttachOnGap && failedConsumptionGenerationRef.current !== current?.requestId) {
-        resetStartupProbeParser({ discardReplayRemainder: Boolean(previousSeqState.pendingReplay) })
         setIsAttaching(false)
         markAttachComplete()
       }
@@ -4996,8 +4998,12 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
             return
           }
 
+          const completedAttachOnBatch = !batchDecision.state.pendingReplay
+            && (Boolean(previousSeqState.pendingReplay) || previousSeqState.awaitingFreshSequence)
           if (tid && batchDecision.implicitGaps.length > 0) {
-            resetStartupProbeParser()
+            resetStartupProbeParser({
+              discardReplayRemainder: completedAttachOnBatch && Boolean(previousSeqState.pendingReplay),
+            })
             // Implicit gap (responsive-terminal-restore): the batch jumped
             // forward across sequences no gap frame declared. The seq state
             // already folded the hole (known lost range + quarantine, the
@@ -5031,8 +5037,6 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
           }
 
           const mode = contentRef.current?.mode || 'shell'
-          const completedAttachOnBatch = !batchDecision.state.pendingReplay
-            && (Boolean(previousSeqState.pendingReplay) || previousSeqState.awaitingFreshSequence)
           applySeqState(batchDecision.state)
           markPacedReplayReceived(msg.attachRequestId, batchSeqEnd)
 
@@ -5118,8 +5122,12 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
             return
           }
 
+          const completedAttachOnFrame = !frameDecision.state.pendingReplay
+            && (Boolean(previousSeqState.pendingReplay) || previousSeqState.awaitingFreshSequence)
           if (tid && frameDecision.implicitGap) {
-            resetStartupProbeParser()
+            resetStartupProbeParser({
+              discardReplayRemainder: completedAttachOnFrame && Boolean(previousSeqState.pendingReplay),
+            })
             // Implicit gap (responsive-terminal-restore): the frame jumped
             // forward across sequences no gap frame declared. The seq state
             // already folded the hole (known lost range + quarantine, the
@@ -5155,8 +5163,6 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
             && msg.seqEnd >= previousSeqState.pendingReplay.fromSeq
             && msg.seqStart <= previousSeqState.pendingReplay.toSeq,
           )
-          const completedAttachOnFrame = !frameDecision.state.pendingReplay
-            && (Boolean(previousSeqState.pendingReplay) || previousSeqState.awaitingFreshSequence)
           applySeqState(frameDecision.state)
           markPacedReplayReceived(msg.attachRequestId, msg.seqEnd)
           submitAcceptedOutput({
