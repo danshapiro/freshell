@@ -20,9 +20,9 @@ Repair Freshell's terminal replay deadlock so the Codex pane finishes rendering 
 ### Accepted tradeoffs and residuals
 - The clean origin/main baseline has three pre-existing failures: OpenCode free-tier readiness, required systemd service visibility through Docker ignore rules, and a stale runtime manifest entry. They may remain recorded outside this replay repair.
 
-**Goal:** A restored Codex terminal finishes its replay, renders the continuation of an escape sequence across a page boundary, and remains usable through tab changes, connection recovery, and browser refresh.
+**Goal:** A restored Codex terminal finishes rendering across replay-page and replay-to-live boundaries, remains usable through tab changes, reconnects, and browser refresh, and recovers without duplicated content or false exhaustion when fresh output succeeds.
 
-**Architecture:** A successful, ordered xterm write acknowledges transport consumption of the entire accepted sequence range, including bytes retained by preprocessing; this acknowledgement is distinct from the strict applied checkpoint. An ordered queue task acknowledges a range with no xterm write, while pending rendering bytes and mixed rendering invalidate delta eligibility until a real surface rebuild. Failed, abandoned, or stale writes never acknowledge consumption, save coverage, or complete a later attach generation.
+**Architecture:** Successful ordered stream consumption advances replay credit and recovery liveness independently of strict applied/checkpoint coverage, while ordinary pending rendering bytes survive intact same-generation replay-to-live transitions. A mounted surface that needs reconstruction uses one replay-scoped non-coalescing local CAN/RIS/cursor-visible write; only genuine completion followed by all queue hooks and a guarded ordered task establishes a fresh zero baseline and sends the existing surfaceReset full-hydrate attach. Old input is fenced before preprocessing throughout that local interval, and failure, supersession, or abandonment never authorizes an attach or falsely clears new-generation uncertainty.
 
 **Tech Stack:** React 18, TypeScript, xterm 6, the existing serial terminal write queue, Vitest component integration tests, Playwright Chromium, and the Rust/Axum paced replay implementation.
 
@@ -32,11 +32,14 @@ Repair Freshell's terminal replay deadlock so the Codex pane finishes rendering 
 - Respect `AGENTS.md`, especially worktree ownership, process ownership, test coordination, and the PR branch model. The user has authorized PR creation and merging for this change. The coordinator owns the external run record and workflow transitions.
 - pnpm is exactly `10.34.5`; Node is at least `22.5`; Rust meets the workspace `1.96` requirement. Keep frozen installs and the existing lockfile. No dependencies or server protocol changes are needed. Relative TypeScript imports include `.js`.
 - `FRESHELL_VITEST_BACKEND=cloud` and `FRESHELL_E2E_BACKEND=cloud` are already configured. Use `GCLOUD_ROBOT_REQUIRE=1` on cloud gates. Focused `test:vitest` delegates locally regardless of this setting; use `test:cloud --config=default` instead. Rust and source-runtime lanes remain local as designed, as does Electron; this is not a fallback from cloud.
-- Keep the existing serial/coalesced write order, generation checks, scoped side effects, stale completed-write mutation ledger, negotiated/legacy compatibility, and strict applied/checkpoint distinction. Do not bypass Rust's page-end credit requirement or issue credits from a test harness.
+- Keep serial/coalesced stream-write order, generation checks, scoped side effects, the stale completed-write mutation ledger, negotiated/legacy compatibility, and strict applied/checkpoint integrity. Local reconstruction is a hard non-coalescing boundary. Do not bypass Rust's page-end credit requirement or issue credits from a test harness.
+- For mounted reconstruction use only the selected executed controls `\x18\x1bc\x1b[?25h` (CAN, RIS, cursor visible), established in `reports/load-bearing-validator-lbf-4.md`, under replay side-effect suppression. An epoch update, `term.clear()`, direct JavaScript `term.reset()`, or bare RIS does not substitute for this operation. Keep genuinely new blank-surface handling separate; do not recreate the terminal instance or add a reset framework.
+- Reconstruction uses the existing supported mode projection, including the empty projection. Preserve the intentional omissions of focus-reporting `?1004`, synchronized-output `?2026`, and XTMODIFYKEYS. The server's optional tagged mode preamble precedes replay and bypasses ordinary output preprocessing. Neither mode traffic nor local reset bytes has a stream range or counts toward credit, checkpoint, or recovery progress.
 - Use a public synthetic escape fragment, never the captured private transcript. The diagnosis is already proven: preprocessing held an incomplete SGR suffix, wrote a visible prefix, and suppressed the only completion callback needed to credit the page.
 - Do not use live user panes or production port `3001`. Browser tests own isolated `RustServer` instances, random ports, temporary homes, and their processes. Follow the existing test fixtures' cleanup; do not use broad process kills. Do not restart or deploy the source service.
-- No new UI feature, end-user documentation, mock redesign, migration, or secret is required. Keep the existing recovering state and recovery behavior. Use the existing structured logger for failures; never log terminal output bytes or tokens.
-- Record the three accepted baseline failures and evidence under `.worktrees/.the-usual-logs/terminal-replay-credit/reports/`. Do not fix or weaken their tests in this repair. Their exact titles are listed under Step 6.
+- No new UI feature, end-user documentation, mock redesign, migration, or secret is required. Keep the existing recovering/retry UI, progressless-attempt bound, explicit user retry/refresh semantics, honest gap notices, and healthy backend terminal identity. Correct fresh-output accounting and ordinary rendering-fragment ownership; do not weaken existing meaningful behavior tests. Use the existing structured logger for failure/reconstruction lifecycle events; never log terminal output bytes or tokens.
+- The implementer owns RED/GREEN/refactor, focused impacted verification, and the repair commit. The task coordinator owns the one final broad full-suite gate after task review/repairs, plus the authorized PR/check/merge workflow. Do not duplicate that broad run inside every implementation or fixing turn.
+- Record the three accepted baseline failures and evidence under `.worktrees/.the-usual-logs/terminal-replay-credit/reports/`. Do not fix or weaken their tests in this repair. Their exact titles are listed under Coordinator Final Suite Gate.
 
 ---
 
@@ -44,22 +47,23 @@ Repair Freshell's terminal replay deadlock so the Codex pane finishes rendering 
 
 | File | Responsibility |
 | --- | --- |
-| `src/components/TerminalView.tsx` | Separate successful ordered consumption from strict application; classify pending preprocessing; make no-write acknowledgement ordered; prevent unsafe checkpoint reuse and credit after failure. |
-| `src/components/terminal/terminal-write-queue.ts` | Settle a thrown surface write without firing success callbacks, retain balanced scopes/counters, report failure, and continue scheduling serial work. |
-| `test/unit/client/components/TerminalView.lifecycle.test.tsx` | Exercise the real component adapter with single/batched output, held callbacks, filtering, pending controls, failure, supersession, and reconnect. |
+| `src/components/TerminalView.tsx` | Separate successful consumption/recovery progress from checkpoint application; preserve ordinary replay/live pending bytes; order and fence mounted reconstruction; prevent stale/failure acknowledgement and unsafe checkpoint reuse. |
+| `src/components/terminal/terminal-write-queue.ts` | Settle a thrown surface write without success, balance scopes/counters, preserve stale mutation hooks, and provide serial non-coalescing write/post-hook task ordering. |
+| `test/unit/client/components/TerminalView.lifecycle.test.tsx` | Exercise actual component consumption, fresh/progressless recovery, final replay/live ownership, local-ticket fences, reset completion/failure/staleness, mode/empty projection, and lifecycle paths. |
 | `test/unit/client/components/terminal/terminal-write-queue.test.ts` | Prove failure settlement releases scope/counters without successful acknowledgement and subsequent queue scheduling still works. |
-| `test/e2e-browser/specs/terminal-replay-credit-rust.spec.ts` | Prove real browser credits release real Rust replay pages and scrolling/keyboard input work through reload, reconnect, and tab switching. |
+| `test/e2e-browser/specs/terminal-replay-credit-rust.spec.ts` | Four actual browser/Rust tests prove replay-page and replay/live continuation, mounted reconstruction without duplicates, and scrolling/typing through refresh, reconnect, and tab switching. |
 | This plan | Agent implementation intent and pre-implementation code drafts; source becomes authoritative once execution starts. |
 
-These responsibilities form one independently reviewable repair. Existing parser and pure paced-consumption modules already have the needed behavior; do not change their public interfaces unless implementation evidence requires it.
+These responsibilities form one independently reviewable repair. Existing parsers can buffer the required controls, but their component ownership/reset boundary must change. Existing paced-credit and recovery high-water helpers provide the needed monotonic decisions; do not introduce protocol fields, persisted parser state, or an unrelated range ledger. The accepted architecture decisions and their evidence are recorded in `reports/load-bearing-validator-lbf-1.md` through `load-bearing-validator-lbf-4.md` under `.worktrees/.the-usual-logs/terminal-replay-credit/`; the preparation report is `reports/plan-amendment-preparation.md`. Evidence remains in those reports.
 
 ### Task 1: Restore terminal replay progress without unsafe acknowledgements
 
 **Files:**
-- Modify: `src/components/TerminalView.tsx:409` (submission result), `:1246` (delta decision), `:1263` (surface reset), `:1377` (paced completion), `:1524` (checkpoint persistence), `:2421` (output submission), `:2765` (queue adapter), `:4544` (ordered completion), `:4635` (accepted output).
+- Modify: `src/components/TerminalView.tsx:409` (submission result), `:1246` (checkpoint eligibility), `:1263` (baseline bookkeeping), `:1377` (paced completion), `:1524`/`:1576` (checkpoint/recovery separation), `:2398` (phase ownership), `:2421` (output submission), `:2765` (queue adapter), `:3310` (input fence), `:3493` (attach/reconstruction ordering), `:4544`/`:4635` (accepted success), `:5582` (mode admission).
 - Modify: `src/components/terminal/terminal-write-queue.ts:34` (failure interface), `:161` (write settlement).
 - Test: `test/unit/client/components/TerminalView.lifecycle.test.tsx:13714`.
 - Test: `test/unit/client/components/terminal/terminal-write-queue.test.ts`.
+- Test: `test/unit/client/lib/terminal-recovery-accounting.test.ts`, `test/unit/client/lib/terminal-startup-probes.test.ts`, and `test/unit/client/lib/terminal-surface-checkpoint.test.ts` as impacted behavioral contracts.
 - Create: `test/e2e-browser/specs/terminal-replay-credit-rust.spec.ts`.
 
 **Interfaces:**
@@ -68,7 +72,10 @@ These responsibilities form one independently reviewable repair. Existing parser
 - Produces: `TerminalWriteQueueArgs.onWriteFailed?: (item: { mode: TerminalWriteQueueMode; generation: string | undefined; error: unknown }) => void`; it runs only for a thrown `clearBeforeWrite`/write before successful completion and never substitutes for a success callback.
 - Produces: `TerminalOutputSubmission` retains `submittedWrite`, `submittedBytesEqualInput`, and `preParserConsumedAllBytes` (meaning only `cleaned === ''`, not proof of checkpoint safety), and adds `preprocessingPending: boolean`.
 - Produces: `handleTerminalOutput(raw: string, mode: TerminalPaneContent['mode'], tid: string | undefined, allowReplies: boolean, onWritten?: (submittedBytesEqualInput: boolean) => void, writeOptions?: TerminalWriteQueueOptions): TerminalOutputSubmission`; every successful nonempty write invokes this callback with its fidelity result.
-- Produces: one surface-scoped `surfaceCheckpointUnsafeRef: MutableRefObject<boolean>` and one attach-scoped `failedConsumptionAttachRef: MutableRefObject<string | undefined>`. Only a true baseline-zero surface reset clears the former; an attach generation change replaces the latter. These refs protect distinct facts rather than representing new persisted cursors.
+- Produces: surface-scoped unsafe-checkpoint state, attach-scoped failed-consumption state, and one local reconstruction ticket owning the pending interval. The ticket captures a unique unsent generation, terminal/surface/queue identity, connection eligibility, and genuine-success/abandonment status; no new server field or persistent state is introduced. Only a newly constructed blank surface or the guarded post-hook reconstruction boundary retires old-baseline uncertainty.
+- Consumes: `recordRecoveryProgress` and `beginRecoveryAttempt` from `src/lib/terminal-recovery-accounting.ts`. Successful original stream sequence ends, including live positions above replay target, supply independent recovery progress; replaying a previously consumed position never refunds an attempt.
+- Produces: a normal same-stream replay/live ownership rule preserving ordinary pending CSI/OSC until continuation, while matching known startup-query remainders retain intentional suppression and generation/discontinuity resets retire obsolete ownership.
+- Produces: mounted reconstruction using the existing `terminal.attach` shape (`sinceSeq: 0`, internal `viewport_hydrate`, `surfaceReset: true`) and optional existing `terminal.modes.sync`. Hidden panes retain the existing wire `keepalive_delta` projection without losing those full-hydrate/freshness semantics.
 
 - [ ] **Step 1: Write the failing behavioral tests**
 
@@ -196,75 +203,47 @@ it('a buffered-only CSI can credit but cannot save reconstructable coverage', as
   expect(creditMessages().at(-1)).toMatchObject({ consumedSeq: 2 })
 })
 
-it('invalidates a prior checkpoint after a mixed rendered prefix before reconnect', async () => {
-  const { terminalId, paneId } = await setupPacedPane({ suffix: 'old-checkpoint', mode: 'codex' })
-  const pumpRaf = captureRaf()
-  act(() => {
-    messageHandler!({ type: 'terminal.attach.ready', terminalId, headSeq: 3, replayFromSeq: 1, replayToSeq: 3 })
-    deliverOutput('single', terminalId, 1, 'BASE\r\n')
-    pumpRaf()
-  })
-  expect(readPacedCheckpoint(terminalId, paneId)).toMatchObject({ parserAppliedSeq: 1, surfaceCoverageSeq: 1 })
-  act(() => { deliverOutput('single', terminalId, 2, PREFIX + INCOMPLETE_SGR); pumpRaf() })
-  expect(creditMessages().at(-1)).toMatchObject({ consumedSeq: 2 })
-  act(() => reconnectHandler?.())
-  await waitFor(() => expect(attachMessagesFor(terminalId).at(-1)).toMatchObject({ sinceSeq: 0, intent: 'viewport_hydrate' }))
-})
 
-it('the actual xterm adapter never acknowledges a thrown write or a later filtered range', async () => {
-  const { store, tabId, terminalId, paneId, term } = await setupPacedPane({ suffix: 'throw-mixed', mode: 'codex' })
-  const pumpRaf = captureRaf()
-  term.write.mockImplementation(() => { throw new Error('synthetic disposed surface') })
-  act(() => {
-    messageHandler!({ type: 'terminal.attach.ready', terminalId, headSeq: 3, replayFromSeq: 1, replayToSeq: 3 })
-    deliverOutput('single', terminalId, 1, PREFIX + INCOMPLETE_SGR)
-    deliverOutput('single', terminalId, 2, ';255m')
-    deliverOutput('single', terminalId, 3, OSC52_ONLY_FRAME)
-    pumpRaf()
-  })
-  expect(term.write).toHaveBeenCalled()
-  expect(creditMessages()).toEqual([])
-  expect(readPacedCheckpoint(terminalId, paneId)).toBeNull()
-  term.write.mockImplementation((_data: string, callback?: () => void) => callback?.())
-  const failedAttach = latestAttachRequestIdForTerminal(terminalId)
-  act(() => store.dispatch(requestPaneRefresh({ tabId, paneId })))
-  await waitFor(() => expect(latestAttachRequestIdForTerminal(terminalId)).not.toBe(failedAttach))
-  act(() => {
-    messageHandler!({ type: 'terminal.attach.ready', terminalId, headSeq: 1, replayFromSeq: 1, replayToSeq: 1 })
-    deliverOutput('single', terminalId, 1, 'RECOVERED\r\n')
-    pumpRaf()
-  })
-  expect(creditMessages()).toEqual([expect.objectContaining({
-    attachRequestId: latestAttachRequestIdForTerminal(terminalId), consumedSeq: 1,
-  })])
-})
-
-it.each([false, true])('superseded mixed and no-write work never acknowledges the old generation (inflight=%s)', async (inflight) => {
-  const { store, tabId, paneId, terminalId, term } = await setupPacedPane({ suffix: `stale-${inflight}`, mode: 'codex' })
-  const pumpRaf = captureRaf()
-  const held: Array<() => void> = []
-  term.write.mockImplementation((_data: string, callback?: () => void) => { if (callback) held.push(callback) })
-  const oldAttach = latestAttachRequestIdForTerminal(terminalId)
-  act(() => {
-    messageHandler!({ type: 'terminal.attach.ready', terminalId, headSeq: 3, replayFromSeq: 1, replayToSeq: 3 })
-    deliverOutput('single', terminalId, 1, PREFIX + INCOMPLETE_SGR)
-    deliverOutput('single', terminalId, 2, ';255m')
-    deliverOutput('single', terminalId, 3, OSC52_ONLY_FRAME)
-    if (inflight) pumpRaf()
-  })
-  act(() => store.dispatch(requestPaneRefresh({ tabId, paneId })))
-  await waitFor(() => expect(latestAttachRequestIdForTerminal(terminalId)).not.toBe(oldAttach))
-  act(() => {
-    held.splice(0).forEach((callback) => callback())
-    pumpRaf()
-  })
-  expect(creditMessages().filter((message) => message.attachRequestId === oldAttach)).toEqual([])
-  expect(readPacedCheckpoint(terminalId, paneId)).toBeNull()
-  if (!inflight) expect(term.write).not.toHaveBeenCalled()
-})
 ```
 
 Also parameterize the buffered-only test with an incomplete OSC (`'\x1b]0;title'`, continuation `'\x07AFTER\r\n'`) so both renderable CSI and OSC buffering are exercised. Keep the existing fully completed OSC52-only coverage/checkpoint eligibility regression green. Add a stale/unmounted late mixed-write completion using the same held callback, `const deliver = messageHandler!; cleanup(); held.splice(0).forEach(cb => cb())`, and assert zero old-generation credit/checkpoint. Keep existing refresh, hidden reveal, exit, replay-gap, and legacy strict mixed-BEL tests intact.
+
+The earlier draft's synchronous reconnect/refresh tests are replaced by the following behavioral cases because mounted reconstruction now owns an unsent local ticket. Add these cases to the same `replay credit regression` describe so the focused selector executes all of them. Use the actual component adapter and existing held-callback/RAF helpers; do not infer a sent attach from a local ticket or release reset success through a disposal/exception callback.
+
+**Final replay target 1 followed by live sequence 2:** For every row below, ready has `headSeq: 1`, `replayFromSeq: 1`, and `replayToSeq: 1`; seq 1 is replay and seq 2 is explicitly live in the same attach/stream. Run ordinary SGR/OSC through single output, barrier-free batch, and barrier-segment batch. For mixed writes, hold the real callback and supply the live continuation both before and after releasing it; concatenate actual submitted writes when coalescing changes their grouping. Seq 1 can receive credit only on its successful write or ordered no-write task; no replay credit may exceed target 1. Check strict checkpoint/safe coverage separately from rendered output and consumption.
+
+| Case | Replay seq 1 | Live seq 2 | Required result |
+| --- | --- | --- | --- |
+| Mixed SGR | Public visible prefix plus `ESC[38;5;2;48;2;33;58` | `;255mAFTER` and newline | Prefix once; the complete SGR and AFTER reach xterm; no orphan printable color continuation. |
+| Buffered-only SGR | Only that incomplete SGR | Same continuation | No seq-1 write; its task can acknowledge ownership, with no safe checkpoint; the complete SGR is submitted on seq 2. |
+| Mixed ordinary OSC | Public visible prefix plus `ESC]0;title` | BEL and AFTER/newline | Complete title OSC reaches xterm, without treating its terminator as an orphan completion signal. |
+| Buffered-only ordinary OSC | Only `ESC]0;title` | BEL and AFTER/newline | No seq-1 write/safe coverage; complete ordinary OSC reaches xterm on seq 2. |
+| Recognized old startup query | `ESC]11;?` without visible prefix | Matching BEL and AFTER/newline | Suppress the old query remainder; render AFTER; emit no obsolete startup reply or query fragment. |
+| Generation/discontinuity reset | Ordinary fragment or recognized query above | Continuation under another attach/stream, or after an explicit gap | Do not join obsolete pending/discard bytes across the discontinuity; new generation reconstructs through the guarded baseline path. |
+
+Also queue a buffered-only fragment behind a held preceding real write. A no-write ownership acknowledgement must not pass that held write. Retain the original target-2 tests above: they prove continuation on another replay page and are distinct coverage.
+
+**Recovery progress independent of checkpoint coverage:**
+
+1. Establish safe seq 1, then a successfully rendered mixed prefix at seq 2 and continuation at seq 3, leaving safe coverage pinned at 1. Complete genuinely newer ordinary seq 4. Drive more independent keyless automatic reconnects than the existing attempt limit, with genuinely newer successfully completed output after each; every attach proceeds, each output appears once, and no exhausted strip appears. Invoke the actual reconnect handler, never user refresh/retry.
+2. Repeat without any genuinely newer output: every full hydrate only reapplies already consumed ranges, and all callbacks/tasks complete. After the initial exemption, require the existing number of allowed progressless reconnects and refusal of the next, or the existing deadline if deliberately advanced; each local reconstruction plus its resulting attach is one attempt. Empty attaches and re-rendering the same history cannot refund attempts.
+3. Hold a genuinely newer mixed write after a progressless attempt. Submission alone cannot refund an attempt or clear visible exhaustion; successful current-generation completion does, even with safe coverage pinned.
+4. Throw through the actual adapter or supersede the newer range before/during its write. No failed/late success or later same-generation filtered task can refund recovery. A valid later generation can recover normally.
+5. Successfully consume live output above a completed replay target 1. This must count as recovery liveness despite replay credit remaining capped at 1; repeated old live/replay sequence positions do not count twice.
+
+**Mounted reconstruction, old-message fence, and mode controls:**
+
+1. Create a prior safe checkpoint and successfully render an unterminated current-line prefix plus incomplete SGR. Require the next automatic reconnect to refuse the old delta checkpoint. Hold the reset write: no new full-hydrate attach is sent until genuine reset success, every reset hook, and its ordered continuation have completed. After pumping that continuation require `sinceSeq: 0` and `surfaceReset: true`, and replay the prefix exactly once. A new incoming incomplete fragment after attach must remain unsafe/pending after subsequent mode/write completions.
+2. Begin reconstruction while an old real write is in flight. Old completion remains a surface mutation but cannot update current stream state; the local reset is submitted only afterward. Verify the ordering of actual write submission, completion hooks, final task, mode preamble, and replay. Freshness/marker advertisement must occur after the reset's own applied/completed hooks, rather than be consumed by them.
+3. Make the actual reset write throw; let its queued task run. Require no attach, freshness publication, checkpoint eligibility, credit, or recovery refund; queue scopes/counters settle. A merely adjacent task is not success evidence. The subsequent valid recovery generation can establish its own successful baseline.
+4. Supersede before reset submission and after submission with a held callback. A dropped write is never submitted; an already submitted old reset may mutate its old surface but never authorize the new one. Cover unmount, terminal/surface replacement, connection loss/new eligibility, refresh, and tab change. No abandoned ticket sends attach or clears uncertainty.
+5. While the unsent local ticket owns reconstruction, deliver old tagged **and truly untagged** `terminal.attach.ready`, `terminal.output`, `terminal.output.batch`, `terminal.output.gap`, and `terminal.modes.sync`. Capture the callback argument of the latest `wsMocks.onMessage` invocation and deliver directly to it so `withCurrentAttachRequestId` cannot silently stamp the untagged cases. Require rejection before preprocessing/mode admission: no bytes, parser-state pollution, ready-state mutation, gap notice, credit, checkpoint, or recovery progress. After the ticket finishes, a real current-generation frame must still be accepted normally. Setting current attach to null alone fails this test because the old gate accepts null.
+6. Use the public exact mode projection fixtures under `port/oracle/baselines/mode-preamble/`: `f01-opencode-startup.json`, `f04-alt-fold.json`, `f06-ris.json`, `f13-cursor-visibility-restore.json`, `f15-empty-tracker.json`, and `f16-wraparound-disable.json`. Require the component to submit local reset, then only the supported tagged mode bytes through direct replay queue admission, then stream replay. Check alternate-buffer/paste/mouse/wrap/cursor behavior through actual emulator coverage where the fixture supports it; never assert a static fixture string without running the protected behavior.
+7. In the empty projection path, send ready and replay with no mode frame and require completion. Cursor-visible default comes from the selected local reset; a tracked-hidden preamble can intentionally hide it again. No omitted focus `?1004`, sync-output `?2026`, or XTMODIFYKEYS mode is manufactured.
+8. Protect local cancellation of stale incomplete OSC/DCS payloads and hidden cursor state: actual selected reset controls must cancel obsolete title/query payloads, normalize visibility, and establish a blank buffer/cursor baseline before replay. Use production-submitted control bytes with the real emulator/queue in behavioral coverage: load the actual published xterm through Vitest's `vi.importActual`, create one disposable unopened terminal, and delegate the mocked component surface's write operation to that actual emulator while retaining the component's genuine queue callbacks. Read its normal/alternate buffers, cursor position, mode/query responses, and title/data observers; dispose it in test cleanup. Feed component-received mode frames through its normal adapter, rather than independently assembling an expected reset in the test. The exact capability was executed by LBF-4; these cases protect production admission/ownership and bytes without a new production helper or reset framework.
+9. Require local reset and mode synchronization to have no sequence range and no credit, strict application, coverage save, or recovery refund of their own. Existing successful stream credit may flush on a drain, but neither local control is its justification.
+
+Keep the existing meaningful negotiated/legacy strict mixed-BEL, hidden reveal, exit, checkpoint, gap, fresh-claim, user retry/refresh, and stale callback tests. Where reconstruction changes asynchronous timing, update test actions to pump the real ordered boundary; retain the protected behavioral assertions rather than weakening them to fit a mock. The browser reconnect case below also proves that the first-line partial prefix was physically erased and replayed once.
 
 In `terminal-write-queue.test.ts`, add this complete failure settlement test. It runs queue behavior, not source text:
 
@@ -388,7 +367,7 @@ await fs.writeFile(writerFile, [
 ].join('\n'))
 ```
 
-Register exactly three tests, with `test.setTimeout(120_000)` inside each, parameterized over `['refresh', 'tab-switch', 'reconnect'] as const`. For each test use the following actions and concrete assertions in this order (these are precise patch steps, not optional alternative coverage):
+Register the first three tests, with `test.setTimeout(120_000)` inside each, parameterized over `['refresh', 'tab-switch', 'reconnect'] as const`. Add the distinct fourth replay-to-live test below; the new file must contain and execute exactly four Chromium tests. For each of these three lifecycle tests use the following actions and concrete assertions in this order (these are precise patch steps, not optional alternative coverage):
 
 1. Create `root = await fs.mkdtemp(path.join(os.tmpdir(), 'freshell-replay-credit-'))`, instantiate `new RustServer()`, `info = await server.start()`, and `owned = await createFreshE2ePage(browser, info)`; install the collector on `owned.context` before the page's first navigation. Use `try/finally` to close only `owned.context`, then `server.stop()`, then `fs.rm(root, { recursive: true, force: true })`.
 2. `installRecoveryOfferAutoDecline(page)`; navigate to `${info.baseUrl}/?token=${info.token}&e2e=1`; create `new TestHarness(page)`; `waitForHarness()`, `waitForConnection()`, and `selectShellFromPicker(page)`. Obtain the active tab ID from `harness.getActiveTabId()` and terminal ID from `terminalIdOfTabFromState(await harness.getState(), tabId)` using `expect.poll` until non-null. Assert `.xterm:visible` exists. Set the collector target to this ID.
@@ -399,6 +378,16 @@ Register exactly three tests, with `test.setTimeout(120_000)` inside each, param
 7. Wait for the recovering text count to be zero and for the original terminal buffer to contain `DONE`. Count exact marker occurrences with `buffer.split(marker).length - 1`; require exactly one `REPLAY-PREFIX`, exactly one `DONE`, and exactly one each of `REPLAY-ROW-000`, `REPLAY-ROW-090`, and `REPLAY-ROW-179`. Require no printable `'[38;5;2;48;2;33;58'` fragment. This detects duplicate reapplication and lost scrollback.
 8. Use the original visible `.xterm-viewport` locator; poll `scrollHeight > clientHeight`, record `scrollTop`, hover it and `page.mouse.wheel(0, -700)`, then poll its `scrollTop` is smaller. Click `.xterm:visible` and type `echo "REPLAY-INPUT-""WORKS"`, press Enter, and poll the buffer contains the contiguous `REPLAY-INPUT-WORKS` marker. Its command echo cannot satisfy the result.
 9. Attach JSON evidence through `testInfo.attach('replay-credit-wire', { body: Buffer.from(JSON.stringify({ pathName, terminalId, boundarySeq, events: wire.events })), contentType: 'application/json' })`. Assertion failure artifacts must retain the same public wire evidence through a `finally` attachment, rather than losing it on a timeout. Assert the original terminal ID remains present in the pane state; no recreate/kill is part of recovery.
+
+**Fourth test: final replay control continues in actual live output.** Name it `retains the final replay SGR until its actual live continuation`. Reuse the owned Rust/identity/PTY/writer/route fixture, actual wire evidence, scroll/input assertions, and cleanup above, with these precise differences:
+
+1. Keep the writer release file absent after its actual first-stage server output ends in the incomplete SGR. Record that frame's `seqEnd` as the boundary; no continuation/final-marker output may have been produced yet.
+2. Flush persistence and reload the real browser. Retain the real `terminal.attach.ready` bounds in the route evidence and require its `replayToSeq`/head to equal that boundary. Do not make the continuation retained output before this attach or present it as another replay page.
+3. Release that **final** replay frame to the application and require actual client-generated credit for its exact end, under the current attach ID. Require the recovering status to finish through the actual successful consumption edge without discarding the ordinary pending rendering bytes.
+4. Only now create the owned release file. Require actual server `source: 'live'` output in the same stream/attach, at a sequence above the completed replay target, containing the SGR continuation and final marker. The collector must record real ready bounds and stream identity as well as output/credit; no relabeling, injected receive, or fabricated credit is allowed.
+5. Require the visible prefix and final marker once, rows once, and no printable `;255m` or orphan SGR fragment; run the same real wheel/keyboard checks. Attach ready/credit/live-continuation evidence even when assertions fail.
+
+The lifecycle cases exercise mounted reconstruction where reconnect/hide/reveal must replace a dirty surface; require that resulting attach to carry `surfaceReset: true` as well as `sinceSeq: 0`. A browser reload's genuinely new blank surface keeps its existing initial fresh attach. Preserve the terminal ID and prove the unterminated first-line prefix is physically erased before mounted replay through exact marker counts in the real xterm buffer. The local reset is never a wire credit or sequence-bearing server output. Mode-projection/empty-path details are protected by the component/queue/emulator cases above; no extra external provider fixture is needed.
 
 The smallest browser fixture uses shell terminals because the same startup parser and paced replay path handle Codex output. Codex-mode filtering and completion are covered through the actual component integration path above; no external provider CLI or synthetic server is needed.
 
@@ -411,209 +400,61 @@ GCLOUD_ROBOT_REQUIRE=1 pnpm run test:cloud --config=default test/unit/client/com
 GCLOUD_ROBOT_REQUIRE=1 pnpm run test:e2e --project=chromium test/e2e-browser/specs/terminal-replay-credit-rust.spec.ts
 ```
 
-Expected: component regressions fail because a successful mixed write does not credit `seqEnd`, buffered-only frames are falsely persisted as reconstructable coverage, the adapter turns a thrown write into success, and a prior checkpoint is reused after mixed rendering. The standalone queue failure test fails because the thrown write escapes its RAF instead of reporting failure and continuing. The actual browser spec must match and attempt three Chromium tests; its primary intended failure is missing browser credit for the exact observed incomplete-SGR page end, with no following real Rust replay continuation. Setup, fixture path, routing, identity, syntax, or provider failures are not acceptable RED evidence. Correct such problems before changing production behavior.
+Expected: component regressions fail because mixed successful writes do not credit `seqEnd`, buffered-only frames are falsely checkpointed, the adapter turns throws into success, old checkpoints/partial surface content survive false clear-based hydration, old untagged input enters before reconstruction fences, final replay completion loses an ordinary pending SGR/OSC, and fresh output cannot refund recovery when safe coverage is pinned. The standalone queue failure test fails because the thrown write escapes its RAF instead of reporting failure and continuing. The actual browser spec must match and attempt four Chromium tests; its primary intended failure is missing browser credit for the exact observed incomplete-SGR page end, with no following real Rust replay continuation. The fourth browser case additionally must distinguish a truly live continuation after final replay completion; its missing ordinary prefix control is separate from page pacing. Setup, fixture path, routing, identity, syntax, or provider failures are not acceptable RED evidence. Correct such problems before changing production behavior.
 
 - [ ] **Step 3: Add the minimal production implementation**
 
-**3.1 Queue failure settlement.** Add `onWriteFailed` to `TerminalWriteQueueArgs`. Replace its `runItem` catch with the following patch; keep the existing success body and stale `onWriteCompleted` behavior intact:
+**3.1 Successful stream consumption and write failure settlement.** `handleTerminalOutput` must supply its completion for every successful nonempty cleaned write, including mixed filtered/pending input; it reports byte fidelity separately. Complete stream consumption only inside the active generation/surface write scope, using the accepted original sequence end, never just the cleaned prefix length. Strict application/checkpoint advancement remains conditional on the existing byte-fidelity, contiguity, identity, and scope rules. A fully preprocessed no-write range executes its actual acknowledgement as a generation-scoped queue task behind earlier writes; buffering can acknowledge owned bytes but cannot certify reconstructable coverage. An absent queue/surface, failed enqueue, or thrown write never acknowledges consumption.
 
-```ts
-} catch (error) {
-  if (didWriteComplete) throw error
-  didWriteComplete = true
-  scope.complete()
-  decrementInFlightWrites(item.generation)
-  submittedWriteInFlight = false
-  try {
-    args.onWriteFailed?.({ mode: item.mode, generation: item.generation, error })
-  } finally {
-    continueAfterWriteCompletion()
-  }
-}
-```
+Remove the component adapter's thrown-write success fallback. The queue's failure path closes its scope, balances in-flight state, reports `onWriteFailed`, and schedules following work without calling successful callbacks or successful applied/completed hooks. Do not swallow exceptions from callbacks that had already completed successfully. A failed accepted stream range pins all later same-generation consumption/checkpoint/recovery/completion decisions; a later attach generation can establish a new valid state. Preserve the stale **successful** completed-write mutation ledger. Failure may have followed a local clear or partial mutation, so retain uncertainty; a failure from another surface cannot mark the current replacement's generation successful or failed.
 
-This catch handles a synchronous surface/clear failure, not an exception thrown by a successful callback. Do not swallow a callback error after `didWriteComplete` became true. The existing finally in the success path still closes scope and balances in-flight counters. The flush loop can then process ordered tasks; the component's failed-generation guard below makes those tasks unable to claim the failed range.
+**3.2 Independent recovery liveness.** Make the guarded ordered accepted-success edge supply the original `seqEnd` to recovery's monotonic progress decision, independently of strict application, safe coverage, or the target-capped paced frontier. New successful mixed, ordinary, and genuinely consumed no-write output can advance liveness; reception, submission, reset/mode bytes, failed/dropped work, an empty attach, and re-rendering previously consumed history cannot. Keep the recovery high-water across same-stream full hydration, including a zero surface baseline. Update the existing visible exhausted state when genuine newer success clears accounting. Keep the current initial exemption, progressless bound/deadline, episode-key semantics, and explicit user refresh/retry actions. One local reconstruction and its resulting attach are one logical recovery attempt: do not count the preparatory write/task as another attempt or refund attempts when it completes. Remove coverage-contiguity as the sole automatic progress gate; do not introduce a second recovery ledger or persist parser state.
 
-**3.2 Component adapter.** Remove the adapter's `try/catch` that calls `onWritten` after `term.write` throws. Keep the submitted/written test events and successful `completeWrite` wrapper, with the final call simply `term.write(data, completeWrite)`. Add `onWriteFailed` at the queue construction:
+**3.3 Pending rendering ownership and checkpoint safety.** Classify pending state across startup preprocessing, OSC52, turn-signal parsing, and replay-discard buffering; `cleaned === ''` alone proves neither a completed null-screen effect nor checkpoint safety. A mixed successfully rendered prefix or unresolved ordinary rendering fragment makes an older saved surface checkpoint unusable. Block both new unsafe checkpoint saves and reuse, including an explicit internal `sinceSeq` that would otherwise bypass eligibility. Genuinely completed null-screen filtering can keep its established coverage eligibility; strict applied state remains conservative.
 
-```ts
-onWriteFailed: ({ generation, mode, error }) => {
-  if (terminalInstanceIdRef.current !== terminalInstanceId) return
-  // A failure can occur after a clear or partial surface mutation.
-  surfaceCheckpointUnsafeRef.current = true
-  if (currentAttachRef.current?.requestId === generation) {
-    failedConsumptionAttachRef.current = generation
-  }
-  const quarantine = quarantineRepairRef.current
-  if (quarantine) quarantine.completedWrites += 1
-  log.warn('Terminal output write failed', {
-    paneId: paneIdRef.current,
-    terminalId: terminalIdRef.current,
-    attachRequestId: generation,
-    outputSource: mode,
-    error: error instanceof Error ? error.message : String(error),
-  })
-},
-```
+At an intact same-terminal/stream/attach replay-to-live phase change, retain ordinary pending CSI/OSC in its current owner until continuation. Preserve deliberate matching old-startup-query remainder suppression/resume, without obsolete replies. True generation, stream, renderer, disposal, or explicit loss/gap discontinuity retires obsolete pending/discard ownership. Changing when a destructive reset runs does not substitute for retaining those bytes. Normal mode preamble bypasses output preprocessing and cannot later overwrite new pending state.
 
-A stale failure must not mark the **new** generation failed. It still invalidates surface reconstruction and the quarantine mutation decision because the old submission may have changed the same surface. No output data belongs in logs.
+**3.4 Mounted reconstruction decision and local ownership.** Use the verified mounted mechanism whenever this repair requires a true replacement baseline before full hydration of a dirty mounted surface. A genuinely newly constructed blank surface keeps its existing initial fresh attach; a healthy valid checkpoint delta keeps its existing resume. Bookkeeping-only epochs, `term.clear()`, or direct JavaScript reset never retire dirty-baseline uncertainty. Preserve bounded quarantine handling and the existing intentional gap/no-wipe behavior when reconstruction is abandoned before submission; do not automatically erase a healthy surface on a rejected or fully filtered frame.
 
-**3.3 Checkpoint safety.** Define the two refs near existing surface/attach refs. At the start of `getCheckpointDeltaReplayDecision`, return `{ ok: false as const, reason: 'surface_changed' as const }` when the unsafe ref is true; include the same ref guard in `persistSurfaceCheckpointForAttach` so another applied/null-only frame cannot replace an old unsafe checkpoint with a falsely safe one. Do not treat `seqState.surfaceSafeForDeltaReplay === false` as sufficient here: the existing pure completed null-screen filter case legitimately advances coverage despite strict unapplied quarantine.
+Create one unique unsent local reconstruction ticket bound to terminal, surface, queue, and connection eligibility. Install its generation and drop obsolete queued work before local reset admission. Fence old tagged **and untagged** ready/output(single/batch)/gap/mode frames for this terminal before preprocessing throughout the owned interval; explicitly address the existing null-current-attach acceptance exception. The ticket is local lifecycle ownership, not a backend attach or wire/protocol extension. Teardown, terminal/surface change, reconnect eligibility change, refresh, tab change, or superseding attach invalidates its authorization. Do not recreate the emulator, backend terminal, or input/layout registration, and do not add a generic reset framework.
 
-Extend `resetParserAppliedSurface` options with `rebuildSurface?: boolean`. Reset the unsafe ref only on `opts?.rebuildSurface === true`; in the existing non-quarantined viewport-hydrate reset at line 3652, use `resetParserAppliedSurface(0, { rebuildSurface: true })`. Fresh xterm construction also initializes the ref to false. All other reset callers keep their current arguments and preserve the unsafe latch: the local-notice epoch bump at 1645, terminal identity bookkeeping at 1711, loss/quarantine bookkeeping at 3257/3401/3425, launch/terminal abandonment at 4257/4290/4349/4440/4489/5954/6146/6536, sequence-domain reset at 4975/5093, and the applied-position gap handlers at 4970/5088/5231/5359/5443/5479/5497/5502. A new terminal receives either a new xterm or a non-quarantined full hydrate before becoming checkpoint-eligible. Quarantine preparation and ordinary reconnect generation changes must not clear it. No new persistence schema is needed.
+**3.5 Executed local control and post-hook baseline boundary.** Submit the validator-executed controls `\x18\x1bc\x1b[?25h` as one **non-coalescing** direct queue write under replay side-effect suppression, owned by that local ticket. Bypass ordinary preprocessing; assign no stream sequence. CAN cancels obsolete OSC/DCS payloads before RIS, and the cursor-visible control establishes the default that an empty server projection cannot restore. Capability and exact controls were executed in `reports/load-bearing-validator-lbf-4.md`, especially its selected observation; do not replace them with an invented reset sequence.
 
-In `attachTerminal`, reset `failedConsumptionAttachRef` to `undefined` when installing a **different** request ID. Do not clear it from `onDrain`, attach-ready, another frame, or same-generation replay completion.
+Its genuine successful callback only marks that ticket's success. Do not publish freshness or send attach inside that callback: the queue still has applied/completed hooks and scope/counter settlement to run. Enqueue an ordered task under the same ticket; only after all hooks does it recheck genuine success, non-abandonment, active ticket/generation, mounted/current surface, terminal ID, queue identity, and current connection eligibility. A following task without a success flag cannot authorize anything.
 
-An unsafe surface must also override an explicit `sinceSeq` supplied by an internal reveal/recovery caller. Replace the fallback condition at line 3603 with the following branch, so an explicit cursor cannot bypass the surface guard:
+At that guarded boundary, retire **only the old baseline's** preprocessing/discard/unsafe state, zero applied/coverage with a new surface epoch, publish freshness with fresh-write bookkeeping reset, and install the real next attach generation/fence before permitting its messages. Then send existing full-hydrate semantics with `sinceSeq: 0` and `surfaceReset: true`. No later reset callback/task may clear uncertainty or parser bytes after current-generation output has entered preprocessing. Local reset completion never advances stream/recovery cursors, and it must not refund recovery attempts or complete a stream attach.
 
-```ts
-} else if (effectiveIntent !== 'viewport_hydrate' && surfaceCheckpointUnsafeRef.current) {
-  effectiveIntent = 'viewport_hydrate'
-  clearViewportFirst = true
-  fullHydrateFallbackReason = 'surface_changed'
-} else if (effectiveIntent !== 'viewport_hydrate' && explicitSinceSeq === undefined && !checkpointDecision.ok) {
-  effectiveIntent = 'viewport_hydrate'
-  clearViewportFirst = true
-  fullHydrateFallbackReason = checkpointDecision.reason
-}
-```
+**3.6 Server projection and actual attach completion.** Reuse the existing server ready → optional tagged mode sync → replay order. Keep mode sync in direct generation-guarded replay queue admission and preserve its supported projection, including intentionally omitted focus/synchronized-output/XTMODIFYKEYS controls. Internal full-hydrate freshness still requests `surfaceReset` when a hidden pane's wire intent is `keepalive_delta`. An empty projection produces no mode frame; do not wait for one. A tracked-hidden preamble can hide the cursor after the local visible default, and alternate/paste/mouse/wrap projections must apply before replay.
 
-**3.4 Preprocessing result.** Change `handleTerminalOutput` callback to `(submittedBytesEqualInput: boolean) => void`. After running all three preprocessors, classify retained/control-parser state:
+Guard real stream attach completion with successful ordered consumption and the existing active attach/terminal/surface rules. A mixed nonempty frame cannot queue a no-write completion before its real callback; a no-write frame completes only through its actual ordered task. Keep the genuine empty-window ready/completion path and fresh marker bookkeeping. Delete duplicate no-op credit tasks or completion branches once the ordered edges own those responsibilities. Log write/reconstruction failure through the existing structured logger with terminal/pane/generation identifiers and outcome, never raw terminal bytes or tokens.
 
-```ts
-const turnState = turnCompleteSignalStateRef.current
-const preprocessingPending = Boolean(
-  startupProbeStateRef.current.pending
-  || osc52ParserRef.current.pending
-  || turnState.pendingEsc
-  || turnState.inCsi
-  || turnState.inOsc
-  || turnState.inDcs
-  || startupProbeReplayDiscardStateRef.current.buffered,
-)
-const submittedBytesEqualInput = cleaned === raw
-if (preprocessingPending || (cleaned !== '' && !submittedBytesEqualInput)) {
-  surfaceCheckpointUnsafeRef.current = true
-}
-```
-
-The replay-discard caller additionally invalidates the surface when its own `inputBytesEqualSubmission` is false and either a write is submitted or discard buffering remains. Fully completed deliberate discard of only null-screen bytes can use the safe no-write coverage rule only when no renderable pending state remains.
-
-Supply the completion for every nonempty successful write:
-
-```ts
-const submittedWrite = cleaned
-  ? enqueueTerminalWrite(
-      cleaned,
-      () => onWritten?.(submittedBytesEqualInput),
-      writeOptions,
-      consumedDeferredClear ?? undefined,
-    )
-  : false
-```
-
-Return `preprocessingPending` alongside the existing submission fields. Keep repair clear atomicity, preprocessing side effects and their scope guards, OSC52 handling, and startup replay-boundary discard behavior unchanged.
-
-**3.5 Ordered acknowledgement helper.** Remove consumption advancement and attach completion from `completeParserAppliedFrame`; it remains solely the existing strict applied/save operation, with active generation, surface identity, and parser-applied write-scope guards. It must also refuse the failed attach generation. Add a distinct accepted-range completion inside the same message-handler scope:
-
-```ts
-const completeConsumedOutput = (input: {
-  attachRequestId?: string
-  mode: TerminalPaneContent['mode']
-  terminalInstanceId: string
-  seqStart: number
-  seqEnd: number
-  parserAppliedSeq: number
-  completedAttach: boolean
-  hadWrite: boolean
-  strictApplied: boolean
-  safeNoWriteCoverage: boolean
-}) => {
-  const attach = currentAttachRef.current
-  if (!attach || attach.requestId !== input.attachRequestId || attach.terminalId !== tid) return
-  if (terminalInstanceIdRef.current !== input.terminalInstanceId) return
-  if (input.attachRequestId !== undefined && failedConsumptionAttachRef.current === input.attachRequestId) return
-  const scope = getTerminalOutputWriteScope(input.terminalInstanceId)
-  if (input.hadWrite) {
-    if (!scope || scope.generation !== input.attachRequestId) return
-  } else if (scope) return
-
-  if (input.strictApplied) {
-    completeParserAppliedFrame(input)
-  } else if (input.safeNoWriteCoverage) {
-    advanceSurfaceCoverageAndPersist(tid, attach, input.seqStart, input.seqEnd)
-  }
-  advancePacedReplayConsumption(input.attachRequestId, input.seqEnd)
-  if (input.completedAttach) {
-    completeAttachGeneration({
-      attachRequestId: input.attachRequestId,
-      mode: input.mode,
-      terminalInstanceId: input.terminalInstanceId,
-      terminalId: tid,
-      allowWithoutWriteScope: !input.hadWrite,
-    })
-  }
-}
-```
-
-`completeParserAppliedFrame` no longer needs its `completedAttach` property; it accepts the structural subset provided here. Keep `completeAttachGeneration`'s original guards and fresh-marker bookkeeping. The existing `onDrain` still sends at most one coalesced credit and applies existing received/target ceilings.
-
-**3.6 Replace accepted-output routing.** In `submitAcceptedOutput` always pass this callback to `handleTerminalOutput`:
-
-```ts
-(bytesUnchanged) => completeConsumedOutput({
-  attachRequestId: input.attachRequestId,
-  mode: input.mode,
-  terminalInstanceId: outputTerminalInstanceId,
-  seqStart: input.seqStart,
-  seqEnd: input.seqEnd,
-  parserAppliedSeq: input.parserAppliedSeq,
-  completedAttach: input.completedAttach,
-  hadWrite: true,
-  strictApplied: inputBytesEqualSubmission && bytesUnchanged,
-  safeNoWriteCoverage: false,
-})
-```
-
-Preserve `markOutputRangeUnapplied` for all non-strict submissions and real failures; never mark mixed rendering as strict application just to release transport. For `!submission.submittedWrite && submission.preParserConsumedAllBytes`, enqueue the **actual** `completeConsumedOutput` operation with the original `mode` and `generation`, not an empty task after synchronous state movement. Set `hadWrite: false`, `strictApplied: false`, and `safeNoWriteCoverage: inputBytesEqualSubmission && !submission.preprocessingPending`; use the complete immutable input/surface ID captured above. This ordered task is allowed to credit pending buffered-only input because preprocessing owns it, but cannot save coverage for it.
-
-If the write queue or terminal surface is absent, do not acknowledge even a no-write range. If a nonempty cleaned write cannot enqueue, mark `failedConsumptionAttachRef` for the active generation and `surfaceCheckpointUnsafeRef` true; never fall through to no-write success. A synchronous direct-write exception already returns false and must follow that same failure route. If later range callbacks/tasks run in this attach, the failed-generation guard pins consumption and checkpoint state below the failure.
-
-Delete now-unused `schedulePacedReplayCreditFlush`, `completeNoWriteReplayAttach`, and `queueNoWriteReplayAttachCompletion` after their responsibilities are owned by the ordered completion. Keep the existing empty-attach ready/completion path for a genuinely empty replay window. In particular, remove the old branch that queues no-write attach completion for a **mixed nonempty** write before its callback has completed.
+These corrected steps state decisions and intended production behavior. The accepted falsifications removed the earlier component implementation drafts; newly authored unexecuted implementation code is intentionally absent from this Stage 2 amendment. The implementer must realize the specified interfaces/invariants and prove the behavioral tests; source supersedes plan code drafts once execution begins.
 
 - [ ] **Step 4: Run the focused tests**
 
 Run the same two commands from Step 2.
 
-Expected: every selected component/queue test passes; the new browser file executes and passes exactly three Chromium tests. Their attached wire evidence proves the application credits the actual incomplete-SGR page end and the Rust server supplies the continuation afterward. Report the exact passed/failed/skipped counts from the runner rather than treating exit zero as proof of coverage.
+Expected: every selected component/queue test passes; the new browser file executes and passes exactly four Chromium tests. Their attached wire evidence proves actual application credit releases the real next Rust page, and the fourth case retains ordinary pending bytes until the actual live continuation after the final replay target. Mounted reconnect reconstruction reproduces each prefix once. Report the exact passed/failed/skipped counts from the runner rather than treating exit zero as proof of coverage.
 
 - [ ] **Step 5: Refactor while green**
 
-Keep completion decisions in `completeConsumedOutput`; remove duplicate credit/attach completion branches and outdated comments that equate `cleaned === ''` with a completed null-screen filter. Keep the strict helper narrowly responsible for checkpoint application. Consolidate queue scope/counter settlement only if both success and failure paths remain readable and the stale completion ledger still runs on successful old-generation writes. Keep test fixture helpers local to their spec following the donor convention; avoid a generic replay fault-injection framework or a new range ledger. Run the Step 2 focused cloud commands again after the refactor and require the same passing counts.
+Keep one guarded accepted-success decision for consumption, recovery progress, strict application, and real attach completion, with separate eligibility for each. Remove duplicate no-op credit tasks, premature mixed-frame completion, and comments equating empty cleaned bytes with safe null-screen filtering. Keep ordinary phase carry distinct from known-query discard and true generation/loss resets. Keep mounted reconstruction as one local non-coalescing write plus one guarded post-hook task; consolidate failure scope/counter cleanup only while stale successful mutation hooks remain intact. Do not create a reset framework, new range ledger, persisted parser snapshot, or wider renderer recreation path. Keep the browser fixture local to its spec. Run the Step 2 focused cloud commands again after the refactor and require the same selected passing counts, including four actual browser tests.
 
 - [ ] **Step 6: Run impacted-test verification**
 
-The changed component and serial queue serve all terminal modes and both negotiated and legacy restores, so the impacted set includes whole component lifecycle coverage, write scopes, strict sequencing/checkpoint modules, parser filters, scroll input, the actual Rust paced protocol, and the real browser replay/lifecycle donors. The final full suite checks unrelated caller regressions while keeping the three already-proven baseline failures excluded by exact test title. Do not add `skip` markers, remove tests, or alter baseline expectations.
+The changed component and serial queue serve all terminal modes and both negotiated and legacy restores, so the impacted set includes whole component lifecycle coverage, write scopes, strict sequencing/checkpoint modules, parser filters, scroll input, the actual Rust paced protocol, and the real browser replay/lifecycle donors. This shared terminal behavior also requires the final full suite after task review; the coordinator runs that logical gate once, as recorded below, with the three already-proven baseline failures excluded by exact title. Implementers/fixers run the focused commands in this step and do not repeat the coordinator broad gate. Do not add `skip` markers, remove tests, or alter baseline expectations.
 
 Run:
 
 ```bash
 pnpm run typecheck:client
-GCLOUD_ROBOT_REQUIRE=1 pnpm run test:cloud --config=default test/unit/client/components/TerminalView.lifecycle.test.tsx test/unit/client/components/TerminalView.scroll-input-policy.test.tsx test/unit/client/components/terminal/terminal-write-queue.test.ts test/unit/client/lib/paced-replay-consumption.test.ts test/unit/client/lib/terminal-attach-seq-state.test.ts test/unit/client/lib/terminal-surface-checkpoint.test.ts test/unit/client/lib/terminal-output-write-scope.test.ts test/unit/client/lib/terminal-output-side-effects.test.ts test/unit/client/lib/terminal-startup-probes.test.ts test/unit/client/lib/terminal-osc52.test.ts test/unit/client/lib/turn-complete-signal.test.ts test/unit/shared/turn-complete-signal.test.ts test/e2e/terminal-osc52-policy-flow.test.tsx
+GCLOUD_ROBOT_REQUIRE=1 pnpm run test:cloud --config=default test/unit/client/components/TerminalView.lifecycle.test.tsx test/unit/client/components/TerminalView.scroll-input-policy.test.tsx test/unit/client/components/terminal/terminal-write-queue.test.ts test/unit/client/lib/paced-replay-consumption.test.ts test/unit/client/lib/terminal-recovery-accounting.test.ts test/unit/client/lib/terminal-attach-seq-state.test.ts test/unit/client/lib/terminal-surface-checkpoint.test.ts test/unit/client/lib/terminal-output-write-scope.test.ts test/unit/client/lib/terminal-output-side-effects.test.ts test/unit/client/lib/terminal-startup-probes.test.ts test/unit/client/lib/terminal-osc52.test.ts test/unit/client/lib/turn-complete-signal.test.ts test/unit/shared/turn-complete-signal.test.ts test/e2e/terminal-osc52-policy-flow.test.tsx
 pnpm run test:integration --test paced_replay
 GCLOUD_ROBOT_REQUIRE=1 pnpm run test:e2e --project=chromium test/e2e-browser/specs/terminal-replay-credit-rust.spec.ts test/e2e-browser/specs/paced-restore-convergence-rust.spec.ts test/e2e-browser/specs/opencode-replay-write-progression.spec.ts test/e2e-browser/specs/reconnection.spec.ts
-GCLOUD_ROBOT_REQUIRE=1 FRESHELL_TEST_SUMMARY=terminal-replay-credit-repair pnpm run test --testNamePattern='^(?!.*(?:keeps the free-tier model banner part of readiness and handles ANSI styling|keeps every manifest-owned file visible through both ignore filters|requires executable runtime evidence to be fully Rust-only)).*$'
 ```
 
-Expected: typecheck and every included test pass. The Rust command runs the real `crates/freshell-ws/tests/paced_replay.rs` target, including partial-page credit gating, input during replay, stale generations, and disconnect. The cloud browser output must show the new file's three tests and positive matching counts for each selected donor; inspect cloud skips and titles before interpreting coverage. If an existing donor is cloud-ineligible, select its eligible behavioral subset or add the missing behavior to the new eligible spec; a skipped donor is not evidence. No configured lane may silently switch to local.
+Expected: typecheck and every included test pass. The Rust command runs the real `crates/freshell-ws/tests/paced_replay.rs` target, including partial-page credit gating, input during replay, stale generations, and disconnect. The cloud browser output must show the new file's four tests and positive matching counts for each selected donor; inspect cloud skips and titles before interpreting coverage. If an existing donor is cloud-ineligible, select its eligible behavioral subset or add the missing behavior to the new eligible spec; a skipped donor is not evidence. No configured lane may silently switch to local.
 
-The final command keeps the full-suite coordinator gate and configured cloud default lane because `--testNamePattern` is an option value, not a path selector. Source-runtime and Cargo keep their existing local phases. It excludes only these accepted pre-existing titles, which were observed in the clean base command `GCLOUD_ROBOT_REQUIRE=1 FRESHELL_TEST_SUMMARY=terminal-replay-credit-base scripts/base-gate.sh test`:
-
-1. `test/unit/tooling/testing/opencode-native-history.test.ts` → `keeps the free-tier model banner part of readiness and handles ANSI styling` (free-tier readiness).
-2. `test/unit/tooling/distribution-runtime.test.ts` → `keeps every manifest-owned file visible through both ignore filters` (`installers/systemd/freshell-supervisor.service` hidden).
-3. `test/unit/architecture/rust-only-server-runtime.test.ts` → `requires executable runtime evidence to be fully Rust-only` (stale `service-systemd-supervisor` manifest row).
-
-Store commands, exact counts, backend identity, and the comparison with those baseline failures in the external execution report. Report the included suite as passing with these three baseline exclusions; do not claim the unfiltered baseline is green. If a new failure appears, investigate and resolve it within this repair's scope or send the coordinator a substantiated disposition; do not classify it as pre-existing without evidence.
 
 - [ ] **Step 7: Commit the task**
 
@@ -624,25 +465,53 @@ git commit -m "fix: acknowledge ordered terminal replay consumption"
 
 Expected: a focused repair commit with these files and a clean feature worktree. The external reports are outside the worktree and remain untracked by this branch. The coordinator then performs specification-plus-quality review for the single repair task, resolves findings according to the scope rule, and completes the authorized PR/check/merge process in `the-usual`. Follow `AGENTS.md` for updating local main by fast-forward only and worktree cleanup after integration. Never deploy or restart the live self-hosted service as part of landing.
 
+## Coordinator Final Suite Gate
+
+After Task 1's focused verification, commit, specification-plus-quality review, and any required repairs, the task coordinator owns the **one required final broad full-suite gate**. Implementers and fixers do not duplicate it. The shared terminal/queue lifecycle changes justify this full regression gate in addition to focused and actual browser/Rust evidence.
+
+Run from the reviewed feature worktree:
+
+```bash
+GCLOUD_ROBOT_REQUIRE=1 FRESHELL_TEST_SUMMARY=terminal-replay-credit-repair pnpm run test --testNamePattern='^(?!.*(?:keeps the free-tier model banner part of readiness and handles ANSI styling|keeps every manifest-owned file visible through both ignore filters|requires executable runtime evidence to be fully Rust-only)).*$'
+```
+
+Expected: every included phase/test passes on its configured backend, with exactly the accepted baseline title exclusions below. Record phase/test counts, backend, reviewed commit, and the evidence receipt in the external run reports. Required PR checks still run through the authorized integration workflow; this logical gate does not waive them.
+
+This command keeps the full-suite coordinator gate and configured cloud default lane because `--testNamePattern` is an option value, not a path selector. Source-runtime and Cargo keep their existing local phases. It excludes only these accepted pre-existing titles, which were observed in the clean base command `GCLOUD_ROBOT_REQUIRE=1 FRESHELL_TEST_SUMMARY=terminal-replay-credit-base scripts/base-gate.sh test`:
+
+1. `test/unit/tooling/testing/opencode-native-history.test.ts` → `keeps the free-tier model banner part of readiness and handles ANSI styling` (free-tier readiness).
+2. `test/unit/tooling/distribution-runtime.test.ts` → `keeps every manifest-owned file visible through both ignore filters` (`installers/systemd/freshell-supervisor.service` hidden).
+3. `test/unit/architecture/rust-only-server-runtime.test.ts` → `requires executable runtime evidence to be fully Rust-only` (stale `service-systemd-supervisor` manifest row).
+
+Store commands, exact counts, backend identity, and the comparison with those baseline failures in the external execution report. Report the included suite as passing with these three baseline exclusions; do not claim the unfiltered baseline is green. If a new failure appears, investigate and resolve it within this repair's scope or send the coordinator a substantiated disposition; do not classify it as pre-existing without evidence.
+
+
 ## Verification and Scope Map
 
 | Requirement | Observable evidence |
 | --- | --- |
-| Codex pane finishes rendering | Codex component single/batch tests receive the held SGR continuation; actual browser receives server continuation after application credit and recovering text disappears. |
+| Codex pane finishes rendering | Codex single/batch/barrier component paths preserve SGR/OSC across replay pages and final replay-to-live; four actual browser/Rust tests show generated credit, real continuation, and recovering completion. |
 | Scrolling and typing respond | Actual browser viewport changes after a wheel event and a real PTY emits an echo marker that typed command text cannot satisfy. |
 | Tab switching | Browser holds the incident-shaped replay boundary, switches away/reveals, and then completes the same terminal without duplication. |
-| Reconnecting | Browser disconnects after successful mixed-prefix consumption; next generation full-hydrates with `sinceSeq: 0`, then renders continuation once. Prior-checkpoint component test also proves old delta state is refused. |
+| Reconnecting | Browser disconnects after mixed-prefix success; guarded mounted CAN/RIS/cursor-visible reconstruction precedes `sinceSeq: 0`/`surfaceReset` full hydrate, and markers render once. Component tests reject old checkpoint/explicit delta and old tagged/untagged traffic. |
 | Refreshing | Browser reload starts a new surface and real retained replay reproduces all markers once. Component supersession protects refresh before/after an in-flight callback. |
-| Stale/failure/checkpoint safety | Held callback, queued/in-flight supersession, unmount, throw-adapter, queue settlement, buffered-only CSI/OSC, and strict checkpoint regressions. |
-| Red/green/refactor and integration coverage | Step 2 intended RED; Step 4 GREEN; Step 5 cleanup and rerun; Step 6 real Rust target/browser/cloud/full-suite gates. |
+| Stale/failure/checkpoint safety | Held callbacks, local ticket success/failure/abandonment, pre-preprocessing old-message rejection, post-hook baseline order, mode/empty projection, pending generation/loss controls, and strict/coverage integrity. |
+| Fresh output versus progressless recovery | Real component keyless reconnects stay available after newer successful mixed/live output despite pinned safe coverage; repeated history/empty attaches exhaust normally. Local reset/mode traffic cannot refund attempts. |
+| Red/green/refactor and integration coverage | Step 2 RED; Step 4 GREEN; Step 5 cleanup/rerun; Step 6 focused typecheck/cloud/Rust/browser; coordinator final full suite once after task review. |
 | Dedicated branch, preserved work, focused commits | Existing worktree/base, explicit add list, local repair commit, authorized PR to main after review. |
 | Baseline failures remain recorded | Exact three-title final-suite exclusions plus retained clean-base log; no unrelated baseline fixes. |
 | No live service mutation/secrets/process interference | Only owned test fixtures and ports; no source service operations or credential retrieval. OneCLI remains mandatory if a later authorized operation truly requires secrets. |
 
 ## Planning Self-review
 
-The complete dispatcher-authored User Request above is included once and unchanged. Every active requirement maps to Task 1 and the observable evidence table. The plan contains no provider stub, synthetic replay response, fabricated browser credit, production restart, new dependency, checkpoint schema migration, or unrelated baseline repair. Pure unit and component test doubles only isolate callbacks; real Rust PTYs and actual browser wire routing prove the production boundary.
+The complete dispatcher-authored User Request appears once and unchanged, and Task 1 remains the single complete repair. All planner-owned fields reconcile the accepted LBF-1/LBF-2/LBF-3 corrections with the selected LBF-4 mounted mechanism and all its mandatory integration conditions. Original clean-base/historical receipts remain outside the branch unchanged.
 
-The central draft explicitly separates ordered transport consumption, strict parser application, and reconstruction-safe coverage. Mixed rendering cannot release an old saved checkpoint on reconnect; no-write buffered controls can release transport without saving false coverage. Queue failure settlement releases bookkeeping while component guards prevent later same-generation acknowledgements. The final gate acknowledges the baseline exceptions without weakening test code.
+The earlier falsified component reconstruction/completion drafts have been removed in favor of precise decisions and intended behavior. The only newly selected control bytes are the validator-executed `\x18\x1bc\x1b[?25h`, cited to `reports/load-bearing-validator-lbf-4.md`; no fresh unexecuted component replacement code has entered this correction. Retained initial test/fixture drafts are pre-implementation history and do not assert that the source already implements these decisions.
 
-Pre-implementation code in this document is a draft. During execution the source tree supersedes code blocks; repair/review fixes must not backport implementation into this plan. The User Request, Goal, Architecture, Global Constraints, and task intent remain authoritative.
+Self-review covered: independent successful-output recovery progress; final target-1/live-seq-2 SGR/OSC and known-probe/generation controls; genuine reset success; old tagged/untagged ready/output/gap/mode rejection before preprocessing; every reset hook before freshness/attach; same surface/terminal/queue/connection ownership; old-state retirement before any new preprocessing; no local control stream/recovery credit; exact supported/omitted/empty mode behavior; four actual browser/Rust tests with consistent expected counts; configured cloud commands; and coordinator ownership of the single final broad gate after review.
+
+The amendment artifact audit confirmed exact User Request equality, one task with Steps 1–7, no prohibited placeholders, all four retained non-shell code blocks drawn unchanged from the original plan, no component implementation block in Step 3, one coordinator broad-gate command, and 26 existing production/test/fixture paths. The new browser file is explicitly declared for creation. `git diff --check` passed. These are planning checks; implementation and test execution remain pending.
+
+Pure/component doubles isolate callbacks and ownership. Actual owned Rust PTYs, actual browser wire routing, real xterm duplicate/content and scrolling/typing assertions, and meaningful emulator/mode behavior protect the user-visible outcome. No fake provider, fabricated output/credit, new dependency, persisted parser snapshot, production restart, unrelated baseline fix, or coverage weakening is planned.
+
+During execution the source supersedes plan code drafts; do not backport source/review repairs into the plan. The User Request, Goal, Architecture, Global Constraints, and task intent remain authoritative.
