@@ -3550,12 +3550,6 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
       })
       return
     }
-    const supersededTicket = localReconstructionRef.current
-    if (supersededTicket) {
-      supersededTicket.abandoned = true
-      supersededTicket.queue.setActiveGeneration(`${supersededTicket.generation}:superseded`, { dropQueuedStaleWrites: true })
-      clearQuarantineRepair()
-    }
     // Bounded automatic recovery (WS2): consecutive attach/hydrate attempts
     // without a coverage-cursor advance count against a bounded limit; past
     // it, automatic cycling STOPS and the visible retry state shows (the
@@ -3587,6 +3581,14 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
     }
     const term = termRef.current
     if (!term) return
+    // A refused retry cannot cancel the reconstruction already admitted by
+    // the recovery budget. Only an admitted replacement owns supersession.
+    const supersededTicket = localReconstructionRef.current
+    if (supersededTicket) {
+      supersededTicket.abandoned = true
+      supersededTicket.queue.setActiveGeneration(`${supersededTicket.generation}:superseded`, { dropQueuedStaleWrites: true })
+      clearQuarantineRepair()
+    }
     const runtime = runtimeRef.current
     if (runtime && !hiddenRef.current && !opts?.skipPreAttachFit) {
       try {

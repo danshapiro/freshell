@@ -8995,7 +8995,8 @@ describe('TerminalView lifecycle updates', () => {
     it('drops quarantined replay and forces a clearing hydrate when quarantine repair times out before writes drain', async () => {
       const bridge = createPerfAuditBridge()
       const { terminalId, term, pump, held, firstAttach, attaches, release } = await seedHeldSurface('timeout', bridge)
-      vi.useFakeTimers()
+      // The fixture owns RAF ordering; fake only the quarantine clock/poll.
+      vi.useFakeTimers({ toFake: ['Date', 'setTimeout', 'clearTimeout'] })
       try {
         act(() => { reconnectHandler!(); pump() })
         const firstTicket = bridge.snapshot().perfEvents.find(event => event.event === 'terminal.catchup.surface_quarantined')!
@@ -9073,10 +9074,13 @@ describe('TerminalView lifecycle updates', () => {
     })
 
     it('cancels quarantined repair after invalid-terminal replacement before writes drain', async () => {
-      const { terminalId, term, pump, firstAttach, held, attaches, release } = await seedHeldSurface('invalid')
+      const { terminalId, store, tabId, term, pump, held, attaches, release } = await seedHeldSurface('invalid')
       act(() => { reconnectHandler!(); pump() })
       expect(attaches()).toEqual([])
-      act(() => { messageHandler!({ type: 'error', code: 'INVALID_TERMINAL_ID', terminalId, requestId: firstAttach.attachRequestId, message: 'gone' }) })
+      // No newer attach has reached the wire. A terminal-scoped legacy error
+      // reports the terminal gone; an old attach-tagged error is obsolete.
+      act(() => { messageHandler!({ type: 'error', code: 'INVALID_TERMINAL_ID', terminalId, message: 'gone' }) })
+      expect((store.getState().panes.layouts[tabId] as { content: any }).content.terminalId).toBeUndefined()
       wsMocks.send.mockClear()
       release()
       await act(async () => { await new Promise(resolve => setTimeout(resolve, 50)); pump() })
