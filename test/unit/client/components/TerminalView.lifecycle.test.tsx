@@ -13808,6 +13808,74 @@ describe('TerminalView lifecycle updates', () => {
         expect(screen.getByTestId('restore-recovery-retry')).toBeTruthy()
       })
 
+      it.each(
+        (['malformed batch', 'stream mismatch', 'single jump', 'batch jump'] as const).flatMap(loss =>
+          (['matching', 'split matching', 'split divergent'] as const).map(suffix => ({ loss, suffix })),
+        ),
+      )('preserves recognized obsolete query suffix ownership through $loss with $suffix live bytes', async ({ loss, suffix }) => {
+        terminalThemeMocks.getTerminalTheme.mockReturnValue({ background: '#112233' })
+        const { store, terminalId, paneId, term } = await setupPacedPane({ mode: 'opencode' })
+        const pump = captureRaf()
+        const emulatorCount = terminalInstances.length
+        act(() => { store.dispatch(setConnectionStatus('ready')); ready(terminalId, 2); deliverOutput('single', terminalId, 1, '\x1b]11;'); pump() })
+        expect(terminalWriteStrings(term)).toEqual([])
+        expect(sentMessages().filter(msg => msg?.type === 'terminal.input')).toEqual([])
+        expect(readPacedCheckpoint(terminalId, paneId)).toBeNull()
+
+        act(() => {
+          if (loss === 'malformed batch') {
+            messageHandler!({
+              type: 'terminal.output.batch', terminalId, source: 'replay',
+              seqStart: 2, seqEnd: 2, data: 'REJECTED', serializedBytes: -1,
+              segments: [{ seqStart: 2, seqEnd: 2, endOffset: 8, rawFrameCount: 1 }],
+            })
+          } else if (loss === 'stream mismatch') {
+            messageHandler!({ type: 'terminal.output', terminalId, streamId: 'other-stream', seqStart: 2, seqEnd: 2, data: 'REJECTED' })
+          }
+          pump()
+        })
+
+        const held = holdWrites(term)
+        const envelope = loss === 'batch jump' ? 'batch' : 'single'
+        const notices = loss === 'single jump' || loss === 'batch jump'
+          ? ['\r\n[Output gap 2-2: unexplained sequence jump]\r\n']
+          : []
+        const creditsBeforeMatching = creditMessages().slice()
+        act(() => { deliverOutput(envelope, terminalId, 3, suffix === 'matching' ? '?\x07AFTER\r\n' : '?', 'live'); pump() })
+        if (notices.length) {
+          expect(terminalWriteStrings(term)[0]).toBe(notices[0])
+          act(() => { held.shift()!(); pump() })
+        }
+
+        let creditsBeforeCompletion = creditsBeforeMatching
+        if (suffix !== 'matching') {
+          // A possibly obsolete first byte belongs to the boundary until the
+          // next frame either matches the rest or proves it is fresh content.
+          expect(terminalWriteStrings(term)).toEqual(notices)
+          expect(held).toHaveLength(0)
+          expect(sentMessages().filter(msg => msg?.type === 'terminal.input')).toEqual([])
+          creditsBeforeCompletion = creditMessages().slice()
+          act(() => { deliverOutput(envelope, terminalId, 4, suffix === 'split matching' ? '\x07AFTER\r\n' : 'xAFTER\r\n', 'live'); pump() })
+        }
+
+        const fresh = suffix === 'split divergent' ? '?xAFTER\r\n' : 'AFTER\r\n'
+        expect(terminalWriteStrings(term)).toEqual([...notices, fresh])
+        expect(held).toHaveLength(1)
+        expect(creditMessages()).toEqual(creditsBeforeCompletion)
+        expect(readPacedCheckpoint(terminalId, paneId)).toBeNull()
+        expect(sentMessages().filter(msg => msg?.type === 'terminal.input')).toEqual([])
+        act(() => { held.shift()!(); pump() })
+        expect(creditMessages().at(-1)).toMatchObject({ attachRequestId: latestAttachRequestIdForTerminal(terminalId), consumedSeq: 2 })
+        expect(screen.queryByText('Recovering terminal output...')).toBeNull()
+        expect(readPacedCheckpoint(terminalId, paneId)).toBeNull()
+
+        act(() => { deliverOutput(envelope, terminalId, suffix === 'matching' ? 4 : 5, 'FRESH\r\n', 'live'); pump(); held.shift()!(); pump() })
+        expect(terminalWriteStrings(term)).toEqual([...notices, fresh, 'FRESH\r\n'])
+        expect(sentMessages().filter(msg => msg?.type === 'terminal.input' || msg?.type === 'terminal.create' || msg?.type === 'terminal.kill')).toEqual([])
+        expect(attachMessagesFor(terminalId)).toHaveLength(1)
+        expect(terminalInstances).toHaveLength(emulatorCount)
+      })
+
       it.each(['generation', 'gap'] as const)('retires an ordinary pending fragment across a $0 discontinuity', async discontinuity => {
         const { terminalId, term } = await setupPacedPane({ mode: 'codex' })
         const pump = captureRaf()
