@@ -1,4 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
+import { readFileSync } from 'node:fs'
 import { act, render, cleanup, waitFor, screen, fireEvent, within } from '@testing-library/react'
 import { configureStore } from '@reduxjs/toolkit'
 import { Provider } from 'react-redux'
@@ -13828,6 +13829,354 @@ describe('TerminalView lifecycle updates', () => {
         }
       }
     }
+
+    describe('replay credit regression', () => {
+      const INCOMPLETE_SGR = '\x1b[38;5;2;48;2;33;58'
+      const CONTINUATION = ';255mAFTER\r\n'
+      const PREFIX = 'BEFORE\r\n'
+      const RESET = '\x18\x1bc\x1b[?25h'
+      const ENVELOPES = ['single', 'batch', 'barrier-batch'] as const
+
+      function deliverOutput(envelope: typeof ENVELOPES[number], terminalId: string, seq: number, data: string, source: 'replay' | 'live' = 'replay') {
+        if (envelope === 'single') {
+          messageHandler!({ type: 'terminal.output', terminalId, seqStart: seq, seqEnd: seq, data, source })
+        } else {
+          messageHandler!({
+            type: 'terminal.output.batch', terminalId, source,
+            seqStart: seq, seqEnd: seq, serializedBytes: data.length + 256, data,
+            segments: [{ seqStart: seq, seqEnd: seq, endOffset: data.length, rawFrameCount: 1,
+              ...(envelope === 'barrier-batch' ? { barrier: 'control' } : {}) }],
+          })
+        }
+      }
+
+      function ready(terminalId: string, target: number) {
+        messageHandler!({ type: 'terminal.attach.ready', terminalId, headSeq: target, replayFromSeq: 1, replayToSeq: target })
+      }
+
+      function readPacedCheckpoint(terminalId: string, paneId: string) {
+        return __readTerminalSurfaceCheckpointForTests(terminalId, {
+          streamId: latestStreamIdByTerminal.get(terminalId), serverInstanceId: 'srv-paced',
+        }, { paneId })
+      }
+
+      function holdWrites(term: typeof terminalInstances[number]) {
+        const held: Array<() => void> = []
+        term.write.mockImplementation((_data: string, callback?: () => void) => { if (callback) held.push(callback) })
+        return held
+      }
+
+      it.each(ENVELOPES)('credits a page-ending incomplete SGR after the real %s write completes', async (envelope) => {
+        const { terminalId, paneId, term } = await setupPacedPane({ suffix: `sgr-${envelope}`, mode: 'codex' })
+        const pump = captureRaf()
+        const held = holdWrites(term)
+        act(() => { ready(terminalId, 2); deliverOutput(envelope, terminalId, 1, PREFIX + INCOMPLETE_SGR); pump() })
+        expect(term.write.mock.calls.map(([data]: [string]) => data)).toEqual([PREFIX])
+        expect(creditMessages()).toEqual([])
+        expect(held).toHaveLength(1)
+        act(() => { held.shift()!(); pump() })
+        expect(creditMessages()).toEqual([expect.objectContaining({ terminalId, consumedSeq: 1, attachRequestId: latestAttachRequestIdForTerminal(terminalId) })])
+        act(() => { deliverOutput(envelope, terminalId, 2, CONTINUATION); pump() })
+        expect(term.write.mock.calls.map(([data]: [string]) => data)).toEqual([PREFIX, INCOMPLETE_SGR + CONTINUATION])
+        expect(creditMessages().at(-1)).toMatchObject({ consumedSeq: 1 })
+        act(() => { held.shift()!(); pump() })
+        expect(creditMessages().at(-1)).toMatchObject({ consumedSeq: 2 })
+        expect(readPacedCheckpoint(terminalId, paneId)).toBeNull()
+      })
+
+      it.each([
+        { label: 'OSC52', data: PREFIX + OSC52_ONLY_FRAME },
+        { label: 'Codex BEL', data: PREFIX + '\x07' },
+      ])('credits a mixed $label frame without claiming strict applied progress', async ({ data }) => {
+        const { terminalId, paneId, term } = await setupPacedPane({ mode: 'codex' })
+        const pump = captureRaf(), held = holdWrites(term)
+        act(() => { ready(terminalId, 1); deliverOutput('single', terminalId, 1, data); pump() })
+        expect(term.write.mock.calls.map(([value]: [string]) => value)).toEqual([PREFIX])
+        expect(creditMessages()).toEqual([])
+        act(() => { held.shift()!(); pump() })
+        expect(creditMessages().at(-1)).toMatchObject({ consumedSeq: 1 })
+        expect(readPacedCheckpoint(terminalId, paneId)).toBeNull()
+      })
+
+      it('orders fully filtered acknowledgement behind a held visible write', async () => {
+        const { terminalId, paneId, term } = await setupPacedPane()
+        const pump = captureRaf(), held = holdWrites(term)
+        act(() => { ready(terminalId, 2); deliverOutput('single', terminalId, 1, PREFIX); deliverOutput('single', terminalId, 2, OSC52_ONLY_FRAME); pump() })
+        expect(creditMessages()).toEqual([])
+        expect(readPacedCheckpoint(terminalId, paneId)).toBeNull()
+        expect(term.write).toHaveBeenCalledTimes(1)
+        act(() => { held.shift()!(); pump() })
+        expect(creditMessages()).toEqual([expect.objectContaining({ consumedSeq: 2 })])
+        expect(readPacedCheckpoint(terminalId, paneId)).toMatchObject({ parserAppliedSeq: 1, surfaceCoverageSeq: 2 })
+      })
+
+      it.each([
+        { label: 'CSI', fragment: INCOMPLETE_SGR, continuation: CONTINUATION },
+        { label: 'OSC', fragment: '\x1b]0;title', continuation: '\x07AFTER\r\n' },
+      ])('buffered-only $label can credit but cannot save reconstructable coverage', async ({ fragment, continuation }) => {
+        const { terminalId, paneId, term } = await setupPacedPane({ mode: 'codex' })
+        const pump = captureRaf()
+        act(() => { ready(terminalId, 2); deliverOutput('single', terminalId, 1, fragment) })
+        expect(creditMessages()).toEqual([])
+        expect(term.write).not.toHaveBeenCalled()
+        act(() => pump())
+        expect(creditMessages().at(-1)).toMatchObject({ consumedSeq: 1 })
+        expect(readPacedCheckpoint(terminalId, paneId)).toBeNull()
+        act(() => { deliverOutput('single', terminalId, 2, continuation); pump() })
+        expect(term.write.mock.calls.map(([data]: [string]) => data)).toEqual([fragment + continuation])
+        expect(creditMessages().at(-1)).toMatchObject({ consumedSeq: 2 })
+      })
+
+      const finalCases = ENVELOPES.flatMap(envelope => ['SGR', 'OSC'].flatMap(kind => [false, true].flatMap(bufferedOnly => ['before', 'after'].map(timing => ({ envelope, kind, bufferedOnly, timing })))))
+      it.each(finalCases)('retains final replay $kind into live ($envelope, buffered=$bufferedOnly, continuation=$timing completion)', async ({ envelope, kind, bufferedOnly, timing }) => {
+        const { terminalId, paneId, term } = await setupPacedPane({ mode: 'codex' })
+        const pump = captureRaf(), held = holdWrites(term)
+        const fragment = kind === 'SGR' ? INCOMPLETE_SGR : '\x1b]0;title'
+        const continuation = kind === 'SGR' ? CONTINUATION : '\x07AFTER\r\n'
+        const prefix = bufferedOnly ? '' : PREFIX
+        act(() => { ready(terminalId, 1); deliverOutput(envelope, terminalId, 1, prefix + fragment); pump() })
+        expect(creditMessages()).toEqual(bufferedOnly ? [expect.objectContaining({ consumedSeq: 1 })] : [])
+        if (timing === 'after') act(() => { held.splice(0).forEach(cb => cb()); pump() })
+        act(() => { deliverOutput(envelope, terminalId, 2, continuation, 'live'); pump() })
+        act(() => { while (held.length) { held.shift()!(); pump() } })
+        expect(term.write.mock.calls.map(([data]: [string]) => data).join('')).toBe(prefix + fragment + continuation)
+        expect(creditMessages().every(msg => msg.consumedSeq <= 1)).toBe(true)
+        expect(creditMessages().at(-1)).toMatchObject({ consumedSeq: 1 })
+        expect(readPacedCheckpoint(terminalId, paneId)).toBeNull()
+      })
+
+      it('orders buffered ownership behind earlier real output and suppresses a known old startup query remainder', async () => {
+        const { terminalId, term } = await setupPacedPane({ mode: 'codex' })
+        const pump = captureRaf(), held = holdWrites(term)
+        act(() => { ready(terminalId, 2); deliverOutput('single', terminalId, 1, PREFIX); pump(); deliverOutput('single', terminalId, 2, '\x1b]11;?'); pump() })
+        expect(creditMessages()).toEqual([])
+        act(() => { held.shift()!(); pump(); deliverOutput('single', terminalId, 3, '\x07AFTER\r\n', 'live'); pump(); held.splice(0).forEach(cb => cb()); pump() })
+        expect(term.write.mock.calls.map(([data]: [string]) => data).join('')).toBe(PREFIX + 'AFTER\r\n')
+        expect(sentMessages().filter(msg => msg.type === 'terminal.input')).toEqual([])
+      })
+
+      it('ignores an unmounted late mixed-write completion', async () => {
+        const { terminalId, paneId, term } = await setupPacedPane({ mode: 'codex' })
+        const pump = captureRaf(), held = holdWrites(term)
+        act(() => { ready(terminalId, 1); deliverOutput('single', terminalId, 1, PREFIX + INCOMPLETE_SGR); pump() })
+        const deliver = messageHandler!
+        cleanup()
+        act(() => { held.splice(0).forEach(cb => cb()); pump(); deliver({ type: 'terminal.output', terminalId, seqStart: 2, seqEnd: 2, data: CONTINUATION }) })
+        expect(creditMessages()).toEqual([])
+        expect(readPacedCheckpoint(terminalId, paneId)).toBeNull()
+      })
+
+      async function dirtyPane() {
+        const pane = await setupPacedPane({ mode: 'codex' })
+        const pump = captureRaf()
+        act(() => { ready(pane.terminalId, 1); deliverOutput('single', pane.terminalId, 1, 'SAFE\r\n'); pump() })
+        expect(readPacedCheckpoint(pane.terminalId, pane.paneId)).toMatchObject({ surfaceCoverageSeq: 1 })
+        act(() => { deliverOutput('single', pane.terminalId, 2, 'PARTIAL' + INCOMPLETE_SGR, 'live'); pump() })
+        return { ...pane, pump }
+      }
+
+      it('waits for reset success and the post-hook task before advertising a full hydrate', async () => {
+        const { terminalId, paneId, term, pump } = await dirtyPane()
+        const held = holdWrites(term), old = latestAttachRequestIdForTerminal(terminalId)
+        act(() => { reconnectHandler!(); pump() })
+        expect(attachMessagesFor(terminalId)).toHaveLength(1)
+        expect(term.write.mock.calls.at(-1)?.[0]).toBe(RESET)
+        expect(creditMessages().every(msg => msg.consumedSeq <= 1)).toBe(true)
+        act(() => held.shift()!())
+        expect(attachMessagesFor(terminalId)).toHaveLength(1)
+        act(() => pump())
+        expect(attachMessagesFor(terminalId).at(-1)).toMatchObject({ sinceSeq: 0, surfaceReset: true })
+        expect(latestAttachRequestIdForTerminal(terminalId)).not.toBe(old)
+        act(() => { ready(terminalId, 1); messageHandler!({ type: 'terminal.modes.sync', terminalId, data: '\x1b[?25h' }); deliverOutput('single', terminalId, 1, 'NEW' + INCOMPLETE_SGR); pump() })
+        act(() => { while (held.length) { held.shift()!(); pump() } })
+        expect(readPacedCheckpoint(terminalId, paneId)).toBeNull()
+        act(() => reconnectHandler!())
+        expect(attachMessagesFor(terminalId)).toHaveLength(2)
+      })
+
+      it.each(['tagged', 'untagged'])('fences old %s ready/output/batch/gap/modes before preprocessing during local reconstruction', async (tagged) => {
+        const { terminalId, term, pump } = await dirtyPane()
+        const held = holdWrites(term)
+        const old = latestAttachRequestIdForTerminal(terminalId)
+        const streamId = latestStreamIdByTerminal.get(terminalId)
+        const direct = wsMocks.onMessage.mock.calls.at(-1)![0]
+        act(() => { reconnectHandler!(); pump() })
+        const writes = term.write.mock.calls.length, credits = creditMessages().length
+        const tags = tagged === 'tagged' ? { attachRequestId: old, streamId } : {}
+        act(() => {
+          direct({ type: 'terminal.attach.ready', terminalId, headSeq: 500, replayFromSeq: 1, replayToSeq: 500, ...tags })
+          direct({ type: 'terminal.output', terminalId, seqStart: 3, seqEnd: 3, data: 'OLD\x1b]0;POLLUTION', ...tags })
+          direct({ type: 'terminal.output.batch', terminalId, source: 'live', seqStart: 4, seqEnd: 4, serializedBytes: 300, data: 'OLD', segments: [{ seqStart: 4, seqEnd: 4, endOffset: 3, rawFrameCount: 1 }], ...tags })
+          direct({ type: 'terminal.output.gap', terminalId, fromSeq: 1, toSeq: 4, reason: 'queue_overflow', ...tags })
+          direct({ type: 'terminal.modes.sync', terminalId, data: '\x1b[?1049h', ...tags })
+          pump()
+        })
+        expect(term.write.mock.calls).toHaveLength(writes)
+        expect(creditMessages()).toHaveLength(credits)
+        expect(screen.queryByText(/output was lost/i)).toBeNull()
+        act(() => { held.shift()!(); pump(); ready(terminalId, 1); deliverOutput('single', terminalId, 1, 'CURRENT'); pump(); held.splice(0).forEach(cb => cb()); pump() })
+        expect(term.write.mock.calls.at(-1)?.[0]).toBe('CURRENT')
+        expect(creditMessages().at(-1)).toMatchObject({ consumedSeq: 1 })
+      })
+
+      it('settles an actual reset throw without attach or success and permits later recovery', async () => {
+        const { terminalId, paneId, term, pump } = await dirtyPane()
+        term.write.mockImplementation((data: string, cb?: () => void) => { if (data === RESET) throw new Error('reset rejected'); cb?.() })
+        act(() => { reconnectHandler!(); pump() })
+        expect(attachMessagesFor(terminalId)).toHaveLength(1)
+        expect(readPacedCheckpoint(terminalId, paneId)).toMatchObject({ surfaceCoverageSeq: 1 })
+        term.write.mockImplementation((_data: string, cb?: () => void) => cb?.())
+        act(() => { reconnectHandler!(); pump() })
+        expect(attachMessagesFor(terminalId)).toHaveLength(2)
+        expect(attachMessagesFor(terminalId).at(-1)).toMatchObject({ sinceSeq: 0, surfaceReset: true })
+      })
+
+      it.each(['before', 'after'])('supersedes a reset %s submission without authorizing the old ticket', async timing => {
+        const { store, tabId, paneId, terminalId, term, pump } = await dirtyPane()
+        const held = holdWrites(term)
+        act(() => { reconnectHandler!(); if (timing === 'after') pump(); store.dispatch(requestPaneRefresh({ tabId, paneId })); pump() })
+        expect(attachMessagesFor(terminalId)).toHaveLength(1)
+        act(() => { held.shift()!(); pump() })
+        if (timing === 'after') {
+          expect(attachMessagesFor(terminalId)).toHaveLength(1)
+          act(() => { held.shift()!(); pump() })
+        }
+        expect(attachMessagesFor(terminalId)).toHaveLength(2)
+      })
+
+      it.each(['unmount', 'connection', 'hidden'])('abandons an in-flight reset on %s and rejects its late success', async change => {
+        const { store, terminalId, term, rerenderAt, pump } = await dirtyPane()
+        const held = holdWrites(term)
+        act(() => { reconnectHandler!(); pump() })
+        if (change === 'unmount') cleanup()
+        else if (change === 'connection') act(() => { setWsIsReady(false); store.dispatch(setConnectionStatus('disconnected')) })
+        else rerenderAt(true)
+        act(() => { held.splice(0).forEach(cb => cb()); pump() })
+        expect(attachMessagesFor(terminalId)).toHaveLength(1)
+      })
+
+      it('waits for an old in-flight mutation before reset and excludes its late credit', async () => {
+        const { terminalId, term } = await setupPacedPane({ mode: 'codex' })
+        const pump = captureRaf(), held = holdWrites(term)
+        act(() => { ready(terminalId, 1); deliverOutput('single', terminalId, 1, 'OLD' + INCOMPLETE_SGR); pump(); reconnectHandler!(); pump() })
+        expect(term.write.mock.calls.map(([data]: [string]) => data)).toEqual(['OLD'])
+        expect(attachMessagesFor(terminalId)).toHaveLength(1)
+        act(() => { held.shift()!(); pump() })
+        expect(term.write.mock.calls.at(-1)?.[0]).toBe(RESET)
+        expect(creditMessages()).toEqual([])
+        act(() => { held.shift()!(); pump() })
+        expect(attachMessagesFor(terminalId).at(-1)).toMatchObject({ sinceSeq: 0, surfaceReset: true })
+      })
+
+      it.each([true, false])('counts genuinely newer mixed/live consumption independently of pinned coverage (fresh=$fresh)', async fresh => {
+        const { terminalId, term, pump } = await dirtyPane()
+        act(() => { deliverOutput('single', terminalId, 3, CONTINUATION, 'live'); deliverOutput('single', terminalId, 4, 'FRESH\r\n', 'live'); pump() })
+        for (let attempt = 0; attempt < 5; attempt++) {
+          const before = attachMessagesFor(terminalId).length
+          act(() => { reconnectHandler!(); pump() })
+          if (!fresh && attempt >= 3) { expect(attachMessagesFor(terminalId)).toHaveLength(before); break }
+          expect(attachMessagesFor(terminalId)).toHaveLength(before + 1)
+          act(() => { ready(terminalId, 3); deliverOutput('single', terminalId, 1, 'SAFE\r\n'); deliverOutput('single', terminalId, 2, 'PARTIAL' + INCOMPLETE_SGR); deliverOutput('single', terminalId, 3, CONTINUATION); pump() })
+          if (fresh) act(() => { deliverOutput('single', terminalId, 5 + attempt, 'NEW' + OSC52_ONLY_FRAME, 'live'); pump() })
+        }
+        expect(term.write).toHaveBeenCalled()
+        expect(screen.queryByTestId('restore-recovery-retry') !== null).toBe(!fresh)
+      })
+
+      it.each(['success', 'throw', 'supersede'] as const)('only genuine newer completion refunds a progressless attempt ($0)', async outcome => {
+        const { terminalId, term, pump } = await dirtyPane()
+        act(() => { reconnectHandler!(); pump(); ready(terminalId, 1); deliverOutput('single', terminalId, 1, 'SAFE\r\n'); pump() })
+        const held = holdWrites(term)
+        if (outcome === 'throw') term.write.mockImplementation(() => { throw new Error('newer range rejected') })
+        act(() => { deliverOutput('single', terminalId, 3, 'NEW' + OSC52_ONLY_FRAME, 'live'); pump() })
+        // Reception/submission alone must not clear the progressless budget.
+        const before = attachMessagesFor(terminalId).length
+        if (outcome === 'supersede') act(() => { reconnectHandler!(); held.splice(0).forEach(cb => cb()); pump() })
+        else if (outcome === 'success') act(() => { held.shift()!(); pump() })
+        term.write.mockImplementation((_data: string, done?: () => void) => done?.())
+        for (let i = 0; i < 4; i++) act(() => { reconnectHandler!(); pump(); ready(terminalId, 1) })
+        // Success resets to three fresh attempts; failure and stale completion
+        // leave the earlier progressless attempt(s) charged.
+        expect(attachMessagesFor(terminalId).length - before).toBe(outcome === 'success' ? 3 : 2)
+        expect(screen.getByTestId('restore-recovery-retry')).toBeTruthy()
+      })
+
+      it.each(['generation', 'gap'] as const)('retires an ordinary pending fragment across a $0 discontinuity', async discontinuity => {
+        const { terminalId, term } = await setupPacedPane({ mode: 'codex' })
+        const pump = captureRaf()
+        act(() => { ready(terminalId, 2); deliverOutput('single', terminalId, 1, INCOMPLETE_SGR); pump() })
+        if (discontinuity === 'generation') act(() => { reconnectHandler!(); pump(); ready(terminalId, 1) })
+        else act(() => messageHandler!({ type: 'terminal.output.gap', terminalId, fromSeq: 2, toSeq: 2, reason: 'replay_window_exceeded' }))
+        const before = term.write.mock.calls.length
+        act(() => { deliverOutput('single', terminalId, discontinuity === 'generation' ? 1 : 3, CONTINUATION, 'live'); pump() })
+        expect(term.write.mock.calls.slice(before).map(([data]: [string]) => data).join('')).toBe(CONTINUATION)
+      })
+
+      it('a failed stream write pins later same-generation filtered credit and recovery', async () => {
+        const { terminalId, paneId, term } = await setupPacedPane()
+        const pump = captureRaf()
+        term.write.mockImplementation(() => { throw new Error('surface rejected') })
+        act(() => { ready(terminalId, 2); deliverOutput('single', terminalId, 1, PREFIX); pump(); deliverOutput('single', terminalId, 2, OSC52_ONLY_FRAME); pump() })
+        expect(creditMessages()).toEqual([])
+        expect(readPacedCheckpoint(terminalId, paneId)).toBeNull()
+      })
+
+      const projections = [
+        { name: 'f01-opencode-startup', buffer: 'alternate', mouse: 'any', paste: true, wrap: true, hidden: false },
+        { name: 'f04-alt-fold', buffer: 'alternate', mouse: 'none', paste: false, wrap: true, hidden: false },
+        { name: 'f06-ris', buffer: 'normal', mouse: 'none', paste: false, wrap: true, hidden: true },
+        { name: 'f13-cursor-visibility-restore', buffer: 'normal', mouse: 'none', paste: false, wrap: true, hidden: false },
+        { name: 'f15-empty-tracker', buffer: 'normal', mouse: 'none', paste: false, wrap: true, hidden: false },
+        { name: 'f16-wraparound-disable', buffer: 'normal', mouse: 'vt200', paste: false, wrap: false, hidden: false },
+      ]
+      it.each(projections)('reconstructs the actual emulator before supported $name projection and replay', async projection => {
+        const actual = await vi.importActual<typeof import('@xterm/xterm')>('@xterm/xterm')
+        const emulator = new actual.Terminal({ cols: 80, rows: 24, allowProposedApi: true })
+        const { terminalId, term, pump } = await dirtyPane()
+        const data: string[] = [], titles: string[] = []
+        emulator.onData(value => data.push(value)); emulator.onTitleChange(value => titles.push(value))
+        const realWrite = (bytes: string) => new Promise<void>(done => emulator.write(bytes, done))
+        try {
+          await realWrite('\x1b[?25lOLD\x1b]0;OBSOLETE')
+          term.write.mockImplementation((bytes: string, done?: () => void) => emulator.write(bytes, done))
+          const attachCount = attachMessagesFor(terminalId).length
+          act(() => { reconnectHandler!(); pump() })
+          await waitFor(() => { act(() => pump()); expect(attachMessagesFor(terminalId)).toHaveLength(attachCount + 1) })
+          expect(emulator.buffer.active.cursorX).toBe(0)
+          expect(emulator.buffer.active.cursorY).toBe(0)
+          expect(emulator.buffer.normal.getLine(0)?.translateToString(true)).toBe('')
+          expect(data).toEqual([]); expect(titles).toEqual([])
+          const fixture = JSON.parse(readFileSync(`port/oracle/baselines/mode-preamble/${projection.name}.json`, 'utf8'))
+          act(() => { ready(terminalId, 1); if (fixture.expectedSyncData) messageHandler!({ type: 'terminal.modes.sync', terminalId, data: fixture.expectedSyncData }); deliverOutput('single', terminalId, 1, 'PUBLIC-REPLAY'); pump() })
+          await waitFor(() => { act(() => pump()); expect(creditMessages().at(-1)).toMatchObject({ attachRequestId: latestAttachRequestIdForTerminal(terminalId), consumedSeq: 1 }) })
+          expect(emulator.buffer.active.type).toBe(projection.buffer)
+          expect(emulator.buffer.active.getLine(0)?.translateToString(true)).toBe('PUBLIC-REPLAY')
+          expect(emulator.modes.mouseTrackingMode).toBe(projection.mouse)
+          expect(emulator.modes.bracketedPasteMode).toBe(projection.paste)
+          expect(emulator.modes.wraparoundMode).toBe(projection.wrap)
+          expect(emulator.modes.sendFocusMode).toBe(false)
+          expect(emulator.modes.synchronizedOutputMode).toBe(false)
+          await realWrite('\x1b[?25$p')
+          expect(data.at(-1)).toBe(projection.hidden ? '\x1b[?25;2$y' : '\x1b[?25;1$y')
+        } finally { emulator.dispose() }
+      })
+
+      it('cancels an obsolete DCS payload without emitting its reply during reconstruction', async () => {
+        const actual = await vi.importActual<typeof import('@xterm/xterm')>('@xterm/xterm')
+        const emulator = new actual.Terminal({ cols: 80, rows: 24, allowProposedApi: true })
+        const { terminalId, term, pump } = await dirtyPane()
+        const data: string[] = []
+        emulator.onData(value => data.push(value))
+        try {
+          await new Promise<void>(done => emulator.write('OLD\x1bP$qm', done))
+          term.write.mockImplementation((bytes: string, done?: () => void) => emulator.write(bytes, done))
+          act(() => { reconnectHandler!(); pump() })
+          await waitFor(() => { act(() => pump()); expect(attachMessagesFor(terminalId)).toHaveLength(2) })
+          expect(data).toEqual([])
+          expect(emulator.buffer.active.cursorX).toBe(0)
+        } finally { emulator.dispose() }
+      })
+    })
 
     it('negotiated attaches send replayPageBytes and omit maxReplayBytes (fresh, refresh, and reconnect attaches)', async () => {
       const { store, tabId, paneId, terminalId } = await setupPacedPane({ suffix: 'params' })
