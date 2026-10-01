@@ -210,12 +210,16 @@ for (const pathName of ['refresh', 'tab-switch', 'reconnect', 'final-live'] as c
       for (const marker of ['REPLAY-PREFIX', DONE, 'REPLAY-ROW-000', 'REPLAY-ROW-090', 'REPLAY-ROW-179']) expect(buffer.split(marker).length - 1, marker).toBe(1)
       expect(buffer).not.toContain('[38;5;2;48;2;33;58')
       expect(buffer).not.toContain(';255m')
-      const viewport = page.locator('.xterm:visible .xterm-viewport')
-      await expect.poll(() => viewport.evaluate(e => e.scrollHeight > e.clientHeight)).toBe(true)
-      const scrollTop = await viewport.evaluate(e => e.scrollTop)
-      await viewport.hover()
+      // xterm 6 renders its viewport through a custom scrollable element;
+      // the legacy .xterm-viewport has no DOM scroll range. Observe the real
+      // scrollbar moving when the user wheels the terminal screen.
+      const slider = page.locator('.xterm:visible .xterm-scrollable-element > .scrollbar.vertical > .slider')
+      const sliderTop = () => slider.evaluate(e => Number.parseFloat((e as HTMLElement).style.top))
+      await expect.poll(sliderTop).toBeGreaterThan(0)
+      const scrollTop = await sliderTop()
+      await page.locator('.xterm:visible .xterm-screen').hover()
       await page.mouse.wheel(0, -700)
-      await expect.poll(() => viewport.evaluate(e => e.scrollTop)).toBeLessThan(scrollTop)
+      await expect.poll(sliderTop).toBeLessThan(scrollTop)
       await page.locator('.xterm:visible').click()
       await page.keyboard.type('echo "REPLAY-INPUT-""WORKS"')
       await page.keyboard.press('Enter')

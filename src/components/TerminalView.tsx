@@ -1073,6 +1073,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
   const unsafeSurfaceCheckpointRef = useRef(false)
   const failedConsumptionGenerationRef = useRef<string | null>(null)
   const reconstructionEligibilityEpochRef = useRef(0)
+  const reconstructionEligibilityRef = useRef({ connectionStatus, hidden, activeTabId, terminalId: terminalContent?.terminalId })
   const localReconstructionRef = useRef<{
     generation: string
     terminalId: string
@@ -1816,6 +1817,14 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
   }, [hidden, paneId])
 
   useLayoutEffect(() => {
+    const previous = reconstructionEligibilityRef.current
+    reconstructionEligibilityRef.current = { connectionStatus, hidden, activeTabId, terminalId: terminalContent?.terminalId }
+    // WsClient invokes reconnect listeners before dispatching ready to React.
+    // That ready commit belongs to the ticket's already-ready transport.
+    const changed = previous.hidden !== hidden || previous.activeTabId !== activeTabId
+      || previous.terminalId !== terminalContent?.terminalId
+      || (previous.connectionStatus !== connectionStatus && connectionStatus !== 'ready')
+    if (!changed) return
     reconstructionEligibilityEpochRef.current += 1
     const ticket = localReconstructionRef.current
     if (!ticket) return
@@ -2773,6 +2782,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
         flushPacedReplayCredit()
       },
       onItemApplied: (item) => {
+        if (terminalInstanceIdRef.current !== terminalInstanceId) return
         surfaceWritesSinceFreshRef.current += 1
         // Coupled clear (plan round-3): the marker-bearing attach's own
         // replay content applied ⇒ the delivered mode preamble is on the
@@ -2791,6 +2801,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
       // beyond its last checkpoint, so the repair must rebuild instead of
       // resuming a checkpoint that under-describes the surface.
       onWriteCompleted: () => {
+        if (terminalInstanceIdRef.current !== terminalInstanceId) return
         const pendingQuarantine = quarantineRepairRef.current
         if (pendingQuarantine) {
           pendingQuarantine.completedWrites += 1
@@ -3846,11 +3857,29 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
         succeeded: false, abandoned: false,
       }
       localReconstructionRef.current = ticket
+      unsafeSurfaceCheckpointRef.current = true
       pacedReplayRef.current = null
       writeQueue.setActiveGeneration(ticket.generation, { dropQueuedStaleWrites: true })
       setIsAttaching(true)
       log.debug('Reconstructing mounted terminal surface', { paneId: paneIdRef.current, terminalId: tid, generation: ticket.generation })
-      if (writeQueue.hasInFlightWrites()) scheduleQuarantineRepair(tid, ticket.generation)
+      if (fullHydrateFallbackReason) {
+        recordTerminalPerfAuditEvent('terminal.catchup.full_hydrate_fallback', {
+          terminalId: tid, attachRequestId, localGeneration: ticket.generation,
+          requestedIntent: intent, intent: effectiveIntent, sinceSeq, deltaSeq,
+          streamId: expectedStreamId, reason: fullHydrateFallbackReason,
+          hasInFlightWrites, phase: 'reconstruction_pending',
+        })
+        fullHydrateFallbackReason = null
+      }
+      if (writeQueue.hasInFlightWrites()) {
+        recordTerminalPerfAuditEvent('terminal.catchup.surface_quarantined', {
+          terminalId: tid, attachRequestId, localGeneration: ticket.generation,
+          requestedIntent: intent, intent: effectiveIntent, sinceSeq,
+          streamId: expectedStreamId, reason: 'in_flight_writes',
+          phase: 'reconstruction_pending',
+        })
+        scheduleQuarantineRepair(tid, ticket.generation)
+      }
       writeQueue.enqueue('\x18\x1bc\x1b[?25h', () => { ticket.succeeded = true }, {
         generation: ticket.generation, mode: 'replay', coalesce: false,
       })
@@ -5659,7 +5688,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
           }
           // Ledger A15: re-write a loss notice recorded while un-anchored --
           // the attach's clear/hydrate wiped the immediate write.
-          if (pendingLossNoticeRef.current) {
+          if (pendingLossNoticeRef.current && !localReconstructionRef.current) {
             writeLocalXtermNotice(term, pendingLossNoticeRef.current)
             pendingLossNoticeRef.current = null
           }
@@ -5887,7 +5916,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
           // Ledger A15: re-write a loss notice recorded while un-anchored --
           // the anchor's term.clear()/re-hydrate above wiped the immediate
           // write (same deferred pattern as reconcileNotice).
-          if (pendingLossNoticeRef.current) {
+          if (pendingLossNoticeRef.current && !localReconstructionRef.current) {
             writeLocalXtermNotice(term, pendingLossNoticeRef.current)
             pendingLossNoticeRef.current = null
           }
