@@ -751,9 +751,9 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
   // corrupted the repaired screen), so the notice rides React state —
   // which the repair attach's generation change (dropQueuedStaleWrites,
   // a WRITE-queue concern) cannot discard. Set when the delivery-loss
-  // repair initiates; cleared by the next attach (like the retention
-  // notice) and by a retention-gap resolution (the authoritative
-  // honest-loss state then takes over).
+  // repair initiates and retained through that repair's reconstruction
+  // attach; cleared by the next independent attach or a retention-gap
+  // resolution (the authoritative honest-loss state then takes over).
   const [deliveryGapNotice, setDeliveryGapNotice] = useState<{
     fromSeq: number
     toSeq: number
@@ -3588,7 +3588,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
     const sinceSeq = effectiveIntent === 'viewport_hydrate' ? 0 : deltaSeq
     let surfaceQuarantined = hasInFlightWrites
     let deferContentReconstruction = opts?.deferViewportClearUntilContent === true
-    const sendAttach = (preserveDeliveryGapNotice = false) => {
+    const sendAttach = ({ preserveDeliveryGapNotice = false }: { preserveDeliveryGapNotice?: boolean } = {}) => {
       // A content probe can wait through a visibility change before creating
       // its reset ticket. Project visibility at the actual wire boundary so
       // a now-hidden pane cannot claim geometry, including as first viewer.
@@ -3828,7 +3828,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
         log.debug('Terminal reconstruction completed', { paneId: paneIdRef.current, terminalId: tid, generation: ticket.generation })
         // This replacement belongs to the admitted delivery-gap repair;
         // preserve its notice while the replacement replay is outstanding.
-        sendAttach(opts?.deferViewportClearUntilContent === true)
+        sendAttach({ preserveDeliveryGapNotice: opts?.deferViewportClearUntilContent === true })
       }, { generation: ticket.generation, mode: 'replay' })
     }
     const needsMountedReconstruction = effectiveIntent === 'viewport_hydrate'

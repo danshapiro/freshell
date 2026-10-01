@@ -10727,7 +10727,7 @@ describe('TerminalView lifecycle updates', () => {
       expect(repairAttaches().length).toBe(1)
     })
 
-    it('a queue_overflow gap with no valid checkpoint falls back to a full hydrate that never clears before content', async () => {
+    it.each([false, true])('a queue_overflow gap with no valid checkpoint falls back to a full hydrate that never clears before content (replacement retention loss=%s)', async (retentionLost) => {
       // No valid checkpoint exists (no streamId was ever established):
       // the repair may fall back to a full hydrate — but the viewport is
       // NOT cleared before the new baseline is actually established by
@@ -10800,9 +10800,8 @@ describe('TerminalView lifecycle updates', () => {
       // separate from completing it and receiving the replacement replay.
       term.deferWrites = true
 
-      // The hydrate's content establishes the new baseline: the surface
-      // is replaced exactly when the content arrives — never before. The
-      // clear and the replacement apply as ONE flush-time unit.
+      // Accepted probe content authorizes the ordered reset. The replacement
+      // attach requests that content again after the reset completes.
       act(() => {
         messageHandler!({
           type: 'terminal.attach.ready',
@@ -10841,12 +10840,31 @@ describe('TerminalView lifecycle updates', () => {
       // The second attach belongs to the same repair. Its empty reset surface
       // must retain the honest notice while the server replay is outstanding.
       expect(screen.getByTestId('restore-delivery-gap-notice').textContent).toContain('output gap 2-5')
-      replayReconstructedSurface(terminalId, repair[0]!.attachRequestId, 8, 'REBUILT')
+      const replacement = repairAttaches().at(-1)!
+      if (retentionLost) {
+        // Retention can expire between the probe and replacement attach.
+        // Its authoritative notice must replace the preserved delivery notice.
+        act(() => {
+          messageHandler!({ type: 'terminal.attach.ready', terminalId, attachRequestId: replacement.attachRequestId, headSeq: 8, replayFromSeq: 1, replayToSeq: 8 })
+          messageHandler!({ type: 'terminal.output.gap', terminalId, attachRequestId: replacement.attachRequestId, fromSeq: 1, toSeq: 3, reason: 'replay_window_exceeded', headSeq: 8, oldestRetainedSeq: 4 })
+          messageHandler!({ type: 'terminal.output', terminalId, attachRequestId: replacement.attachRequestId, seqStart: 4, seqEnd: 8, data: 'RETAINED', source: 'replay' })
+        })
+      } else {
+        replayReconstructedSurface(terminalId, repair[0]!.attachRequestId, 8, 'REBUILT')
+      }
       await flushFrames()
-      expectTerminalWriteContaining(term, 'REBUILT')
+      expectTerminalWriteContaining(term, retentionLost ? 'RETAINED' : 'REBUILT')
+      expect(term.pendingWriteCallbacks).toHaveLength(1)
       act(() => { term.releasePendingWrites() })
       await flushFrames()
-      expect(screen.getByTestId('restore-delivery-gap-notice').textContent).toContain('output gap 2-5')
+      expect(sentMessages().filter(msg => msg?.type === 'terminal.replay.credit').at(-1)).toMatchObject({ terminalId, attachRequestId: replacement.attachRequestId, consumedSeq: 8 })
+      if (retentionLost) {
+        expect(screen.queryByTestId('restore-delivery-gap-notice')).toBeNull()
+        expect(screen.getByTestId('restore-retention-loss-notice')).toHaveAttribute('role', 'status')
+      } else {
+        expect(screen.getByTestId('restore-delivery-gap-notice').textContent).toContain('output gap 2-5')
+      }
+      expect(reconstructionWrites(term)).toHaveLength(1)
       expect(terminalWriteStrings(term).some((entry) => entry.includes('Output gap'))).toBe(false)
       expect(screen.queryByTestId('restore-recovery-retry')).toBeNull()
     })
@@ -13417,6 +13435,8 @@ describe('TerminalView lifecycle updates', () => {
         act(() => { ready(terminalId, 1); deliverOutput('single', terminalId, 1, 'REBUILT\r\n'); pump(); held.shift()!(); pump() })
         expect(creditMessages().at(-1)).toMatchObject({ attachRequestId: replacement.attachRequestId, consumedSeq: 1 })
         expect(store.getState().panes.layouts[tabId]).toMatchObject({ content: { terminalId } })
+        expect(terminalInstances.at(-1)).toBe(term)
+        expect(sentMessages().some(msg => msg?.type === 'terminal.kill')).toBe(false)
         expect(term.clear).not.toHaveBeenCalled()
         expect(screen.queryByTestId('restore-recovery-retry')).toBeNull()
         // The replacement send consumes no additional recovery admission.
