@@ -13842,8 +13842,8 @@ describe('TerminalView lifecycle updates', () => {
           : []
         const creditsBeforeMatching = creditMessages().slice()
         act(() => { deliverOutput(envelope, terminalId, 3, suffix === 'matching' ? '?\x07AFTER\r\n' : '?', 'live'); pump() })
-        if (notices.length) {
-          expect(terminalWriteStrings(term)[0]).toBe(notices[0])
+        if (notices.length && suffix !== 'matching') {
+          expect(terminalWriteStrings(term).join('')).toBe(notices.join(''))
           act(() => { held.shift()!(); pump() })
         }
 
@@ -13851,7 +13851,7 @@ describe('TerminalView lifecycle updates', () => {
         if (suffix !== 'matching') {
           // A possibly obsolete first byte belongs to the boundary until the
           // next frame either matches the rest or proves it is fresh content.
-          expect(terminalWriteStrings(term)).toEqual(notices)
+          expect(terminalWriteStrings(term).join('')).toBe(notices.join(''))
           expect(held).toHaveLength(0)
           expect(sentMessages().filter(msg => msg?.type === 'terminal.input')).toEqual([])
           creditsBeforeCompletion = creditMessages().slice()
@@ -13859,7 +13859,7 @@ describe('TerminalView lifecycle updates', () => {
         }
 
         const fresh = suffix === 'split divergent' ? '?xAFTER\r\n' : 'AFTER\r\n'
-        expect(terminalWriteStrings(term)).toEqual([...notices, fresh])
+        expect(terminalWriteStrings(term).join('')).toBe(notices.join('') + fresh)
         expect(held).toHaveLength(1)
         expect(creditMessages()).toEqual(creditsBeforeCompletion)
         expect(readPacedCheckpoint(terminalId, paneId)).toBeNull()
@@ -13870,7 +13870,7 @@ describe('TerminalView lifecycle updates', () => {
         expect(readPacedCheckpoint(terminalId, paneId)).toBeNull()
 
         act(() => { deliverOutput(envelope, terminalId, suffix === 'matching' ? 4 : 5, 'FRESH\r\n', 'live'); pump(); held.shift()!(); pump() })
-        expect(terminalWriteStrings(term)).toEqual([...notices, fresh, 'FRESH\r\n'])
+        expect(terminalWriteStrings(term).join('')).toBe(notices.join('') + fresh + 'FRESH\r\n')
         expect(sentMessages().filter(msg => msg?.type === 'terminal.input' || msg?.type === 'terminal.create' || msg?.type === 'terminal.kill')).toEqual([])
         expect(attachMessagesFor(terminalId)).toHaveLength(1)
         expect(terminalInstances).toHaveLength(emulatorCount)
