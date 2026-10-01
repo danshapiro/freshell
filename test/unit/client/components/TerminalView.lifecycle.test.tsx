@@ -13572,6 +13572,51 @@ describe('TerminalView lifecycle updates', () => {
         expect(attachMessagesFor(terminalId)).toHaveLength(2)
       })
 
+      it('drops a pending reset when a superseding automatic attempt is refused', async () => {
+        const { terminalId, term, pump } = await dirtyPane()
+        const before = term.write.mock.calls.length
+        act(() => {
+          // Each attempt supersedes the preceding unsent ticket. The final
+          // request reaches the bound before any reset has been submitted.
+          for (let attempt = 0; attempt < 4; attempt++) reconnectHandler!()
+        })
+        expect(screen.getByTestId('restore-recovery-retry')).toBeTruthy()
+        act(() => pump())
+        expect(term.write.mock.calls).toHaveLength(before)
+        expect(attachMessagesFor(terminalId)).toHaveLength(1)
+      })
+
+      it.each(['refresh', 'retry'] as const)('keeps consumed high-water after explicit %s while replaying the same bytes', async action => {
+        const { store, tabId, paneId, terminalId, pump } = await dirtyPane()
+        act(() => {
+          deliverOutput('single', terminalId, 3, CONTINUATION, 'live')
+          deliverOutput('single', terminalId, 4, 'NEW-LIVE\r\n', 'live')
+          pump()
+        })
+        if (action === 'retry') {
+          for (let attempt = 0; attempt < 4; attempt++) act(() => { reconnectHandler!(); pump() })
+          expect(screen.getByTestId('restore-recovery-retry')).toBeTruthy()
+          fireEvent.click(screen.getByRole('button', { name: 'Retry terminal restore' }))
+        } else {
+          act(() => { store.dispatch(requestPaneRefresh({ tabId, paneId })) })
+        }
+        act(() => pump())
+        const afterExplicit = attachMessagesFor(terminalId).length
+        act(() => {
+          ready(terminalId, 4)
+          deliverOutput('single', terminalId, 1, 'SAFE\r\n')
+          deliverOutput('single', terminalId, 2, 'PARTIAL' + INCOMPLETE_SGR)
+          deliverOutput('single', terminalId, 3, CONTINUATION)
+          deliverOutput('single', terminalId, 4, 'NEW-LIVE\r\n')
+          pump()
+        })
+        // Explicit user intent resets the streak, with one attempt charged
+        // for its attach. Re-consuming positions 1..4 refunds nothing.
+        for (let attempt = 0; attempt < 3; attempt++) act(() => { reconnectHandler!(); pump() })
+        expect(attachMessagesFor(terminalId)).toHaveLength(afterExplicit + 2)
+        expect(screen.getByTestId('restore-recovery-retry')).toBeTruthy()
+      })
+
       it('waits for an old in-flight mutation before reset and excludes its late credit', async () => {
         const { terminalId, term } = await setupPacedPane({ mode: 'codex' })
         const pump = captureRaf(), held = holdWrites(term)
