@@ -328,7 +328,7 @@ const MOUNTED_RECONSTRUCTION = '\x18\x1bc\x1b[?25h'
 
 function captureWriteFrames() {
   const callbacks: FrameRequestCallback[] = []
-  requestAnimationFrameSpy!.mockImplementation((callback) => {
+  vi.mocked(requestAnimationFrame).mockImplementation((callback) => {
     callbacks.push(callback)
     return callbacks.length
   })
