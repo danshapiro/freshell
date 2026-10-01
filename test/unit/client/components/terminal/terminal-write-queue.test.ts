@@ -6,6 +6,39 @@ import {
 } from '@/lib/terminal-output-write-scope'
 
 describe('createTerminalWriteQueue', () => {
+  it('settles a thrown write without success and schedules following ordered work', () => {
+    const raf: FrameRequestCallback[] = []
+    const failed = vi.fn()
+    const successful = vi.fn()
+    const laterTask = vi.fn()
+    const completed = vi.fn()
+    const write = vi.fn((data: string, callback?: () => void) => {
+      if (data === 'bad') throw new Error('write rejected')
+      callback?.()
+    })
+    const queue = createTerminalWriteQueue({
+      terminalInstanceId: 'surface-throw', write,
+      onWriteFailed: failed, onWriteCompleted: completed,
+      requestFrame: (callback) => { raf.push(callback); return raf.length },
+      cancelFrame: () => {},
+    })
+    queue.setActiveGeneration('A')
+    queue.enqueue('bad', successful, { generation: 'A', coalesce: false })
+    queue.enqueueTask(laterTask, { generation: 'A' })
+    expect(() => { while (raf.length) raf.shift()!(0) }).not.toThrow()
+    expect(successful).not.toHaveBeenCalled()
+    expect(completed).not.toHaveBeenCalled()
+    expect(failed).toHaveBeenCalledWith(expect.objectContaining({ generation: 'A', error: expect.any(Error) }))
+    expect(laterTask).toHaveBeenCalledOnce()
+    expect(queue.hasInFlightWrites()).toBe(false)
+    expect(getTerminalOutputWriteScope('surface-throw')).toBeNull()
+    queue.setActiveGeneration('B')
+    queue.enqueue('good', successful, { generation: 'B' })
+    while (raf.length) raf.shift()!(0)
+    expect(successful).toHaveBeenCalledOnce()
+    expect(completed).toHaveBeenCalledWith({ mode: 'live', generation: 'B' })
+  })
+
   it('processes queued writes in time slices and preserves order', () => {
     const writes: string[] = []
     const rafCallbacks: FrameRequestCallback[] = []

@@ -1,4 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
+import { readFileSync } from 'node:fs'
 import { act, render, cleanup, waitFor, screen, fireEvent, within } from '@testing-library/react'
 import { configureStore } from '@reduxjs/toolkit'
 import { Provider } from 'react-redux'
@@ -321,6 +322,23 @@ function createSettingsState(overrides: Record<string, unknown> = {}) {
 
 function terminalWriteStrings(term: { write: { mock: { calls: Array<[unknown]> } } }): string[] {
   return term.write.mock.calls.map(([data]) => String(data))
+}
+
+const MOUNTED_RECONSTRUCTION = '\x18\x1bc\x1b[?25h'
+
+function captureWriteFrames() {
+  const callbacks: FrameRequestCallback[] = []
+  vi.mocked(requestAnimationFrame).mockImplementation((callback) => {
+    callbacks.push(callback)
+    return callbacks.length
+  })
+  return () => {
+    while (callbacks.length) callbacks.shift()!(0)
+  }
+}
+
+function reconstructionWrites(term: { write: { mock: { calls: Array<[unknown]> } } }) {
+  return terminalWriteStrings(term).filter((data) => data === MOUNTED_RECONSTRUCTION)
 }
 
 function expectTerminalWriteContaining(term: { write: { mock: { calls: Array<[unknown]> } } }, text: string) {
@@ -5328,7 +5346,13 @@ describe('TerminalView lifecycle updates', () => {
           requestId: createMsg.requestId,
           terminalId: 'term-new',
         })
-        vi.advanceTimersByTime(17) // Flush the post-anchor notice write.
+      })
+      act(() => { vi.advanceTimersByTime(34) })
+      const attach = sentMessages().find((m) => m?.type === 'terminal.attach' && m.terminalId === 'term-new')
+      expect(attach?.surfaceReset).toBe(true)
+      act(() => {
+        messageHandler!({ type: 'terminal.attach.ready', terminalId: 'term-new', attachRequestId: attach.attachRequestId, headSeq: 0, replayFromSeq: 1, replayToSeq: 0 })
+        vi.advanceTimersByTime(17)
       })
       // The notice is written AGAIN after the anchor (post-clear), so it
       // survives the hydrate wipe.
@@ -6155,6 +6179,50 @@ describe('TerminalView lifecycle updates', () => {
         term: terminalInstances[terminalInstances.length - 1],
         requestId,
         terminalId: terminalId || 'term-v2-stream',
+      }
+    }
+
+    function replayReconstructedSurface(terminalId: string, probeAttachId: string, headSeq: number, data: string) {
+      const attach = sentMessages().filter(msg => msg?.type === 'terminal.attach' && msg.terminalId === terminalId).at(-1)!
+      expect(attach.attachRequestId).not.toBe(probeAttachId)
+      expect(attach).toMatchObject({ intent: 'viewport_hydrate', sinceSeq: 0, surfaceReset: true })
+      act(() => {
+        messageHandler!({ type: 'terminal.attach.ready', terminalId, attachRequestId: attach.attachRequestId, headSeq, replayFromSeq: 1, replayToSeq: headSeq })
+        messageHandler!({ type: 'terminal.output', terminalId, attachRequestId: attach.attachRequestId, seqStart: 1, seqEnd: headSeq, data, source: 'replay' })
+      })
+      return attach
+    }
+
+    async function seedHeldSurface(suffix: string, bridge?: ReturnType<typeof createPerfAuditBridge>, fromStore = false) {
+      if (bridge) installPerfAuditBridge(bridge)
+      const lane = await renderTerminalHarness({
+        status: 'running', terminalId: `term-held-${suffix}`,
+        serverInstanceId: 'server-held', streamId: `stream-held-${suffix}`, clearSends: false,
+        fromStore,
+      })
+      const { terminalId, term } = lane
+      const firstAttach = sentMessages().find((msg) => msg?.type === 'terminal.attach' && msg.terminalId === terminalId)!
+      act(() => { messageHandler!({ type: 'terminal.output', terminalId, seqStart: 1, seqEnd: 1, data: 'TRUSTED', attachRequestId: firstAttach.attachRequestId }) })
+      const checkpoint = () => __readTerminalSurfaceCheckpointForTests(terminalId, {
+        streamId: `stream-held-${suffix}`, serverInstanceId: 'server-held',
+      }, { paneId: lane.paneId })
+      expect(checkpoint()).toMatchObject({ parserAppliedSeq: 1, surfaceCoverageSeq: 1 })
+      const pump = captureWriteFrames()
+      const held: Array<{ data: string; callback: () => void }> = []
+      term.write.mockClear()
+      term.write.mockImplementation((data: string, callback?: () => void) => {
+        if (callback) held.push({ data, callback })
+      })
+      act(() => {
+        messageHandler!({ type: 'terminal.output', terminalId, seqStart: 2, seqEnd: 2, data: 'OLD-IN-FLIGHT', attachRequestId: firstAttach.attachRequestId })
+        pump()
+      })
+      expect(held.map(item => item.data)).toEqual(['OLD-IN-FLIGHT'])
+      wsMocks.send.mockClear()
+      return {
+        ...lane, firstAttach, checkpoint, pump, held,
+        attaches: () => sentMessages().filter(msg => msg?.type === 'terminal.attach' && msg.terminalId === terminalId),
+        release: () => act(() => { const item = held.shift()!; item.callback(); pump() }),
       }
     }
 
@@ -7769,7 +7837,7 @@ describe('TerminalView lifecycle updates', () => {
       }, { paneId: 'pane-v2-stream' })?.parserAppliedSeq).toBe(3)
     })
 
-    it('does not checkpoint across a stripped middle batch segment when adjacent renderable segments coalesce', async () => {
+    it('keeps strict application before a stripped middle batch segment while ordered coverage advances', async () => {
       const rafCallbacks: FrameRequestCallback[] = []
       requestAnimationFrameSpy?.mockImplementation((cb: FrameRequestCallback) => {
         rafCallbacks.push(cb)
@@ -7823,7 +7891,7 @@ describe('TerminalView lifecycle updates', () => {
         rafCallbacks.shift()?.(16)
       })
 
-      expect(delayedCallbacks.map(({ data }) => data)).toEqual(['AB'])
+      expect(delayedCallbacks.map(({ data }) => data)).toEqual(['A'])
       expect(__readTerminalSurfaceCheckpointForTests(terminalId, {
         streamId,
         serverInstanceId: 'server-output-batch-stripped-middle-coalesced',
@@ -7831,7 +7899,12 @@ describe('TerminalView lifecycle updates', () => {
 
       act(() => {
         delayedCallbacks[0]?.callback()
+        while (rafCallbacks.length) rafCallbacks.shift()!(16)
       })
+
+      expect(delayedCallbacks.map(({ data }) => data)).toEqual(['A', 'B'])
+      act(() => { delayedCallbacks[1].callback() })
+      expect(delayedCallbacks.map(({ data }) => data).join('')).toBe('AB')
 
       expect(__readTerminalSurfaceCheckpointForTests(terminalId, {
         streamId,
@@ -7846,7 +7919,7 @@ describe('TerminalView lifecycle updates', () => {
       expect(wsMocks.send).toHaveBeenCalledWith(expect.objectContaining({
         type: 'terminal.attach',
         terminalId,
-        sinceSeq: 1,
+        sinceSeq: 3,
       }))
     })
 
@@ -8167,7 +8240,7 @@ describe('TerminalView lifecycle updates', () => {
       expect(wsMocks.send).toHaveBeenCalledWith(expect.objectContaining({
         type: 'terminal.attach',
         terminalId,
-        sinceSeq: 1,
+        sinceSeq: 2,
       }))
     })
 
@@ -8427,7 +8500,7 @@ describe('TerminalView lifecycle updates', () => {
       expect(wsMocks.send).toHaveBeenCalledWith(expect.objectContaining({
         type: 'terminal.attach',
         terminalId,
-        sinceSeq: 1,
+        sinceSeq: 2,
       }))
     })
 
@@ -8854,804 +8927,191 @@ describe('TerminalView lifecycle updates', () => {
     })
 
     it('does not let stale write callbacks advance the current parser-applied cursor', async () => {
-      const { terminalId, term } = await renderTerminalHarness({
-        status: 'running',
-        terminalId: 'term-stale-write-callback',
-        serverInstanceId: 'server-a',
-        streamId: 'stream-1',
-        ackInitialAttach: false,
-        clearSends: false,
-      })
-
-      const firstAttach = wsMocks.send.mock.calls
-        .map(([msg]) => msg)
-        .find((msg) => msg?.type === 'terminal.attach' && msg?.terminalId === terminalId)
-      expect(firstAttach?.attachRequestId).toBeTruthy()
-
+      const lane = await seedHeldSurface('stale-callback')
+      const { terminalId, term, held, pump, firstAttach, checkpoint, attaches, release } = lane
+      const staleCallback = held[0].callback
+      act(() => { reconnectHandler!(); pump() })
+      expect(attaches()).toEqual([])
+      expect(checkpoint()).toMatchObject({ attachRequestId: firstAttach.attachRequestId, parserAppliedSeq: 1 })
+      release()
+      expect(held.map(item => item.data)).toEqual([MOUNTED_RECONSTRUCTION])
+      expect(attaches()).toEqual([])
+      expect(checkpoint()).toMatchObject({ parserAppliedSeq: 1 })
+      release()
+      const current = attaches().at(-1)!
+      expect(current).toMatchObject({ intent: 'viewport_hydrate', sinceSeq: 0, surfaceReset: true })
+      expect(current.attachRequestId).not.toBe(firstAttach.attachRequestId)
+      expect(checkpoint()).toBeNull()
       act(() => {
-        messageHandler!({
-          type: 'terminal.attach.ready',
-          terminalId,
-          headSeq: 1,
-          replayFromSeq: 1,
-          replayToSeq: 1,
-          attachRequestId: firstAttach!.attachRequestId,
-        })
-        messageHandler!({
-          type: 'terminal.output',
-          terminalId,
-          seqStart: 1,
-          seqEnd: 1,
-          data: 'first replay text',
-          attachRequestId: firstAttach!.attachRequestId,
-        })
+        messageHandler!({ type: 'terminal.attach.ready', terminalId, headSeq: 4, replayFromSeq: 1, replayToSeq: 4, attachRequestId: current.attachRequestId })
+        messageHandler!({ type: 'terminal.output', terminalId, seqStart: 1, seqEnd: 4, data: 'CURRENT-FULL-REPLAY', attachRequestId: current.attachRequestId })
+        pump()
+        staleCallback()
       })
-
-      const initialCheckpoint = __readTerminalSurfaceCheckpointForTests(terminalId, {
-        streamId: 'stream-1',
-        serverInstanceId: 'server-a',
-      }, { paneId: 'pane-v2-stream' })
-      expect(initialCheckpoint?.attachRequestId).toBe(firstAttach?.attachRequestId)
-      expect(initialCheckpoint?.parserAppliedSeq).toBe(1)
-
-      const delayedCallbacks: Array<{ data: string; callback: () => void }> = []
-      term.write.mockImplementation((data: string, onWritten?: () => void) => {
-        if (onWritten) delayedCallbacks.push({ data, callback: onWritten })
-      })
-
-      act(() => {
-        messageHandler!({
-          type: 'terminal.output',
-          terminalId,
-          seqStart: 2,
-          seqEnd: 2,
-          data: 'old replay text',
-          attachRequestId: firstAttach!.attachRequestId,
-        })
-      })
-
-      expect(delayedCallbacks).toHaveLength(1)
-
-      wsMocks.send.mockClear()
-      act(() => {
-        reconnectHandler?.()
-      })
-
-      const secondAttach = wsMocks.send.mock.calls
-        .map(([msg]) => msg)
-        .find((msg) => msg?.type === 'terminal.attach' && msg?.terminalId === terminalId)
-      expect(secondAttach?.attachRequestId).toBeTruthy()
-      expect(secondAttach?.attachRequestId).not.toBe(firstAttach?.attachRequestId)
-      expect(secondAttach).toMatchObject({
-        type: 'terminal.attach',
-        terminalId,
-        intent: 'viewport_hydrate',
-        sinceSeq: 0,
-      })
-
-      act(() => {
-        messageHandler!({
-          type: 'terminal.attach.ready',
-          terminalId,
-          headSeq: 4,
-          replayFromSeq: 2,
-          replayToSeq: 4,
-          attachRequestId: secondAttach!.attachRequestId,
-        })
-        messageHandler!({
-          type: 'terminal.output',
-          terminalId,
-          seqStart: 2,
-          seqEnd: 4,
-          data: 'current replay text',
-          attachRequestId: secondAttach!.attachRequestId,
-        })
-      })
-
-      expect(delayedCallbacks.map(({ data }) => data)).toEqual(['old replay text'])
-
-      act(() => {
-        delayedCallbacks.find(({ data }) => data === 'old replay text')?.callback()
-      })
-
-      expect(delayedCallbacks.map(({ data }) => data)).toEqual([
-        'old replay text',
-        'current replay text',
-      ])
-
-      const checkpointAfterStaleCallback = __readTerminalSurfaceCheckpointForTests(terminalId, {
-        streamId: 'stream-1',
-        serverInstanceId: 'server-a',
-      }, { paneId: 'pane-v2-stream' })
-      expect(checkpointAfterStaleCallback).not.toBeNull()
-      expect(checkpointAfterStaleCallback?.attachRequestId).toBe(firstAttach?.attachRequestId)
-      expect(checkpointAfterStaleCallback?.parserAppliedSeq).toBe(1)
-
-      const currentAttach = wsMocks.send.mock.calls
-        .map(([msg]) => msg)
-        .find((msg) => msg?.type === 'terminal.attach' && msg?.terminalId === terminalId)
-      expect(currentAttach?.attachRequestId).toBe(secondAttach?.attachRequestId)
-
-      wsMocks.send.mockClear()
-      term.clear.mockClear()
-      act(() => {
-        delayedCallbacks.find(({ data }) => data === 'current replay text')?.callback()
-      })
-
-      await waitFor(() => {
-        expect(wsMocks.send).toHaveBeenCalledWith(expect.objectContaining({
-          type: 'terminal.attach',
-          terminalId,
-          intent: 'viewport_hydrate',
-          sinceSeq: 0,
-          attachRequestId: expect.any(String),
-        }))
-      })
-      expect(term.clear).toHaveBeenCalledTimes(1)
-
-      const checkpointAfterCurrentCallback = __readTerminalSurfaceCheckpointForTests(terminalId, {
-        streamId: 'stream-1',
-        serverInstanceId: 'server-a',
-      }, { paneId: 'pane-v2-stream' })
-      expect(checkpointAfterCurrentCallback?.attachRequestId).toBe(firstAttach?.attachRequestId)
-      expect(checkpointAfterCurrentCallback?.parserAppliedSeq).toBe(1)
+      expect(checkpoint()).toBeNull()
+      expect(held.map(item => item.data)).toEqual(['CURRENT-FULL-REPLAY'])
+      release()
+      expect(checkpoint()).toMatchObject({ attachRequestId: current.attachRequestId, parserAppliedSeq: 4, surfaceCoverageSeq: 4 })
+      act(() => { reconnectHandler!() })
+      expect(attaches().at(-1)).toMatchObject({ intent: 'transport_reconnect', sinceSeq: 4 })
+      expect(reconstructionWrites(term)).toHaveLength(1)
+      expect(term.clear).not.toHaveBeenCalled()
     })
 
     it('fails closed from delta attach when writes are in flight and repairs quarantine after drain', async () => {
       const bridge = createPerfAuditBridge()
-      installPerfAuditBridge(bridge)
-      const { terminalId, term } = await renderTerminalHarness({
-        status: 'running',
-        terminalId: 'term-in-flight-delta',
-        serverInstanceId: 'server-a',
-        streamId: 'stream-delta',
-        clearSends: false,
-      })
-
-      const firstAttach = wsMocks.send.mock.calls
-        .map(([msg]) => msg)
-        .find((msg) => msg?.type === 'terminal.attach' && msg?.terminalId === terminalId)
-      expect(firstAttach?.attachRequestId).toBeTruthy()
-
+      const lane = await seedHeldSurface('delta', bridge)
+      const { terminalId, term, pump, firstAttach, checkpoint, attaches, held, release } = lane
+      act(() => { reconnectHandler!(); pump() })
+      expect(attaches()).toEqual([])
+      const fallback = bridge.snapshot().perfEvents.filter(event => event.event === 'terminal.catchup.full_hydrate_fallback')
+      const quarantines = bridge.snapshot().perfEvents.filter(event => event.event === 'terminal.catchup.surface_quarantined')
+      expect(fallback).toEqual([expect.objectContaining({ terminalId, timestamp: expect.any(Number), requestedIntent: 'transport_reconnect', intent: 'viewport_hydrate', reason: 'in_flight_writes', hasInFlightWrites: true, phase: 'reconstruction_pending' })])
+      expect(quarantines).toEqual([expect.objectContaining({ terminalId, timestamp: expect.any(Number), requestedIntent: 'transport_reconnect', intent: 'viewport_hydrate', reason: 'in_flight_writes', phase: 'reconstruction_pending' })])
       act(() => {
-        messageHandler!({
-          type: 'terminal.output',
-          terminalId,
-          seqStart: 1,
-          seqEnd: 1,
-          data: 'checkpointed text',
-          attachRequestId: firstAttach!.attachRequestId,
-        })
+        messageHandler!({ type: 'terminal.attach.ready', terminalId, headSeq: 3, replayFromSeq: 2, replayToSeq: 3, attachRequestId: firstAttach.attachRequestId })
+        messageHandler!({ type: 'terminal.output', terminalId, seqStart: 2, seqEnd: 3, data: 'QUARANTINED-OLD-REPLAY', attachRequestId: firstAttach.attachRequestId })
+        pump()
       })
-
-      const initialCheckpoint = __readTerminalSurfaceCheckpointForTests(terminalId, {
-        streamId: 'stream-delta',
-        serverInstanceId: 'server-a',
-      }, { paneId: 'pane-v2-stream' })
-      expect(initialCheckpoint?.attachRequestId).toBe(firstAttach?.attachRequestId)
-      expect(initialCheckpoint?.parserAppliedSeq).toBe(1)
-
-      const delayedCallbacks: Array<{ data: string; callback: () => void }> = []
-      term.write.mockImplementation((data: string, onWritten?: () => void) => {
-        if (onWritten) delayedCallbacks.push({ data, callback: onWritten })
-      })
-
-      act(() => {
-        messageHandler!({
-          type: 'terminal.output',
-          terminalId,
-          seqStart: 2,
-          seqEnd: 2,
-          data: 'old in-flight delta text',
-          attachRequestId: firstAttach!.attachRequestId,
-        })
-      })
-      expect(delayedCallbacks).toHaveLength(1)
-
-      wsMocks.send.mockClear()
-      act(() => {
-        reconnectHandler?.()
-      })
-
-      const secondAttach = wsMocks.send.mock.calls
-        .map(([msg]) => msg)
-        .find((msg) => msg?.type === 'terminal.attach' && msg?.terminalId === terminalId)
-      expect(secondAttach).toMatchObject({
-        type: 'terminal.attach',
-        terminalId,
-        intent: 'viewport_hydrate',
-        sinceSeq: 0,
-        attachRequestId: expect.any(String),
-      })
-      const fallbackEvents = bridge.snapshot().perfEvents
-        .filter((event) => event.event === 'terminal.catchup.full_hydrate_fallback')
-      expect(fallbackEvents).toEqual([
-        expect.objectContaining({
-          event: 'terminal.catchup.full_hydrate_fallback',
-          timestamp: expect.any(Number),
-          terminalId,
-          attachRequestId: secondAttach!.attachRequestId,
-          requestedIntent: 'transport_reconnect',
-          intent: 'viewport_hydrate',
-          reason: 'in_flight_writes',
-          hasInFlightWrites: true,
-        }),
-      ])
-      const quarantineEvents = bridge.snapshot().perfEvents
-        .filter((event) => event.event === 'terminal.catchup.surface_quarantined')
-      expect(quarantineEvents).toEqual([
-        expect.objectContaining({
-          event: 'terminal.catchup.surface_quarantined',
-          timestamp: expect.any(Number),
-          terminalId,
-          attachRequestId: secondAttach!.attachRequestId,
-          requestedIntent: 'transport_reconnect',
-          intent: 'viewport_hydrate',
-          reason: 'in_flight_writes',
-        }),
-      ])
-      expect(bridge.snapshot().milestones['terminal.catchup.full_hydrate_fallback']).toBeUndefined()
-      expect(bridge.snapshot().metadata['terminal.catchup.full_hydrate_fallback']).toBeUndefined()
-      expect(bridge.snapshot().milestones['terminal.catchup.surface_quarantined']).toBeUndefined()
-      expect(bridge.snapshot().metadata['terminal.catchup.surface_quarantined']).toBeUndefined()
-
-      act(() => {
-        messageHandler!({
-          type: 'terminal.attach.ready',
-          terminalId,
-          headSeq: 3,
-          replayFromSeq: 2,
-          replayToSeq: 3,
-          attachRequestId: secondAttach!.attachRequestId,
-        })
-        messageHandler!({
-          type: 'terminal.output',
-          terminalId,
-          seqStart: 2,
-          seqEnd: 3,
-          data: 'quarantined replay text',
-          attachRequestId: secondAttach!.attachRequestId,
-        })
-      })
-
-      expect(delayedCallbacks.map(({ data }) => data)).toEqual(['old in-flight delta text'])
-
-      act(() => {
-        delayedCallbacks.find(({ data }) => data === 'old in-flight delta text')?.callback()
-      })
-
-      expect(delayedCallbacks.map(({ data }) => data)).toEqual([
-        'old in-flight delta text',
-        'quarantined replay text',
-      ])
-
-      wsMocks.send.mockClear()
-      term.clear.mockClear()
-      act(() => {
-        delayedCallbacks.find(({ data }) => data === 'quarantined replay text')?.callback()
-      })
-
-      await waitFor(() => {
-        expect(wsMocks.send).toHaveBeenCalledWith(expect.objectContaining({
-          type: 'terminal.attach',
-          terminalId,
-          intent: 'viewport_hydrate',
-          sinceSeq: 0,
-          attachRequestId: expect.any(String),
-        }))
-      })
-      expect(term.clear).toHaveBeenCalledTimes(1)
-
-      const checkpointAfterCallbacks = __readTerminalSurfaceCheckpointForTests(terminalId, {
-        streamId: 'stream-delta',
-        serverInstanceId: 'server-a',
-      }, { paneId: 'pane-v2-stream' })
-      expect(checkpointAfterCallbacks?.attachRequestId).toBe(firstAttach?.attachRequestId)
-      expect(checkpointAfterCallbacks?.parserAppliedSeq).toBe(1)
-
-      wsMocks.send.mockClear()
-      act(() => {
-        reconnectHandler?.()
-      })
-
-      expect(wsMocks.send).toHaveBeenCalledWith(expect.objectContaining({
-        type: 'terminal.attach',
-        terminalId,
-        intent: 'viewport_hydrate',
-        sinceSeq: 0,
-        attachRequestId: expect.any(String),
-      }))
+      expect(held.map(item => item.data)).toEqual(['OLD-IN-FLIGHT'])
+      release()
+      expect(held.map(item => item.data)).toEqual([MOUNTED_RECONSTRUCTION])
+      expect(attaches()).toEqual([])
+      expect(checkpoint()).toMatchObject({ parserAppliedSeq: 1 })
+      release()
+      expect(attaches()).toHaveLength(1)
+      expect(attaches()[0]).toMatchObject({ attachRequestId: fallback[0].attachRequestId, intent: 'viewport_hydrate', sinceSeq: 0, surfaceReset: true })
+      expect(bridge.snapshot().perfEvents.filter(event => event.event === 'terminal.catchup.surface_quarantine_repair')).toEqual([expect.objectContaining({ terminalId, resumable: false, completedWritesDuringQuarantine: 1 })])
+      expect(checkpoint()).toBeNull()
+      expect(terminalWriteStrings(term)).not.toContain('QUARANTINED-OLD-REPLAY')
+      for (const event of ['terminal.catchup.full_hydrate_fallback', 'terminal.catchup.surface_quarantined']) {
+        expect(bridge.snapshot().metadata[event]).toBeUndefined()
+        expect(bridge.snapshot().milestones[event]).toBeUndefined()
+      }
+      act(() => { reconnectHandler!(); pump() })
+      expect(attaches().at(-1)).toMatchObject({ intent: 'viewport_hydrate', sinceSeq: 0, surfaceReset: true })
+      expect(term.clear).not.toHaveBeenCalled()
     })
 
-    it('drops quarantined replay and forces a clearing hydrate when quarantine repair times out before writes drain', async () => {
-      const { terminalId, term } = await renderTerminalHarness({
-        status: 'running',
-        terminalId: 'term-in-flight-quarantine-timeout',
-        serverInstanceId: 'server-a',
-        streamId: 'stream-timeout',
-        clearSends: false,
-      })
-
-      const firstAttach = wsMocks.send.mock.calls
-        .map(([msg]) => msg)
-        .find((msg) => msg?.type === 'terminal.attach' && msg?.terminalId === terminalId)
-      expect(firstAttach?.attachRequestId).toBeTruthy()
-
-      act(() => {
-        messageHandler!({
-          type: 'terminal.output',
-          terminalId,
-          seqStart: 1,
-          seqEnd: 1,
-          data: 'checkpointed text',
-          attachRequestId: firstAttach!.attachRequestId,
+    it('drops quarantined replay and reconstructs after timed-out old writes drain', async () => {
+      const bridge = createPerfAuditBridge()
+      const { terminalId, term, pump, held, firstAttach, attaches, release } = await seedHeldSurface('timeout', bridge)
+      // The fixture owns RAF ordering; fake only the quarantine clock/poll.
+      vi.useFakeTimers({ toFake: ['Date', 'setTimeout', 'clearTimeout'] })
+      try {
+        act(() => { reconnectHandler!(); pump() })
+        const firstTicket = bridge.snapshot().perfEvents.find(event => event.event === 'terminal.catchup.surface_quarantined')!
+        expect(attaches()).toEqual([])
+        act(() => {
+          messageHandler!({ type: 'terminal.output', terminalId, seqStart: 2, seqEnd: 3, data: 'QUARANTINED-TIMEOUT', attachRequestId: firstAttach.attachRequestId })
+          vi.advanceTimersByTime(2_100)
+          pump()
         })
-      })
-
-      const delayedCallbacks: Array<{ data: string; callback: () => void }> = []
-      term.write.mockImplementation((data: string, onWritten?: () => void) => {
-        if (onWritten) delayedCallbacks.push({ data, callback: onWritten })
-      })
-
-      act(() => {
-        messageHandler!({
-          type: 'terminal.output',
-          terminalId,
-          seqStart: 2,
-          seqEnd: 2,
-          data: 'old in-flight timeout text',
-          attachRequestId: firstAttach!.attachRequestId,
-        })
-      })
-      expect(delayedCallbacks.map(({ data }) => data)).toEqual(['old in-flight timeout text'])
-
-      vi.useFakeTimers()
-      wsMocks.send.mockClear()
-      act(() => {
-        reconnectHandler?.()
-      })
-
-      const quarantinedAttach = wsMocks.send.mock.calls
-        .map(([msg]) => msg)
-        .find((msg) => msg?.type === 'terminal.attach' && msg?.terminalId === terminalId)
-      expect(quarantinedAttach).toMatchObject({
-        type: 'terminal.attach',
-        terminalId,
-        intent: 'viewport_hydrate',
-        sinceSeq: 0,
-        attachRequestId: expect.any(String),
-      })
-
-      act(() => {
-        messageHandler!({
-          type: 'terminal.attach.ready',
-          terminalId,
-          headSeq: 3,
-          replayFromSeq: 2,
-          replayToSeq: 3,
-          attachRequestId: quarantinedAttach!.attachRequestId,
-        })
-        messageHandler!({
-          type: 'terminal.output',
-          terminalId,
-          seqStart: 2,
-          seqEnd: 3,
-          data: 'quarantined replay timeout text',
-          attachRequestId: quarantinedAttach!.attachRequestId,
-        })
-      })
-      expect(delayedCallbacks.map(({ data }) => data)).toEqual(['old in-flight timeout text'])
-
-      act(() => {
-        vi.advanceTimersByTime(2_100)
-      })
-
-      wsMocks.send.mockClear()
-      term.clear.mockClear()
-      act(() => {
-        delayedCallbacks.find(({ data }) => data === 'old in-flight timeout text')?.callback()
-      })
-
-      expect(terminalWriteStrings(term)).not.toContain('quarantined replay timeout text')
-
-      act(() => {
-        vi.advanceTimersByTime(100)
-      })
-
-      expect(wsMocks.send).toHaveBeenCalledWith(expect.objectContaining({
-        type: 'terminal.attach',
-        terminalId,
-        intent: 'viewport_hydrate',
-        sinceSeq: 0,
-        attachRequestId: expect.any(String),
-      }))
-      expect(term.clear).toHaveBeenCalledTimes(1)
-      const repairAttach = wsMocks.send.mock.calls
-        .map(([msg]) => msg)
-        .find((msg) => msg?.type === 'terminal.attach' && msg?.terminalId === terminalId)
-      expect(repairAttach?.attachRequestId).not.toBe(quarantinedAttach?.attachRequestId)
+        expect(reconstructionWrites(term)).toEqual([])
+        expect(bridge.snapshot().perfEvents.some(event => event.event === 'terminal.catchup.surface_quarantine_timeout')).toBe(true)
+        release()
+        expect(held).toEqual([])
+        expect(attaches()).toEqual([])
+        act(() => { vi.advanceTimersByTime(100); pump() })
+        expect(held.map(item => item.data)).toEqual([MOUNTED_RECONSTRUCTION])
+        expect(attaches()).toEqual([])
+        release()
+        expect(attaches()).toHaveLength(1)
+        expect(attaches()[0]).toMatchObject({ intent: 'viewport_hydrate', sinceSeq: 0, surfaceReset: true })
+        expect(attaches()[0].attachRequestId).not.toBe(firstTicket.attachRequestId)
+        expect(terminalWriteStrings(term)).not.toContain('QUARANTINED-TIMEOUT')
+        expect(reconstructionWrites(term)).toHaveLength(1)
+        expect(term.clear).not.toHaveBeenCalled()
+      } finally { vi.useRealTimers() }
     })
 
     it('records repeated in-flight full-hydrate fallback and quarantine audit events separately', async () => {
-      const { terminalId, term } = await renderTerminalHarness({
-        status: 'running',
-        terminalId: 'term-repeat-fallback-quarantine',
-        serverInstanceId: 'server-a',
-        streamId: 'stream-repeat',
-        clearSends: false,
-      })
-
-      const firstAttach = wsMocks.send.mock.calls
-        .map(([msg]) => msg)
-        .find((msg) => msg?.type === 'terminal.attach' && msg?.terminalId === terminalId)
-      expect(firstAttach?.attachRequestId).toBeTruthy()
-
-      act(() => {
-        messageHandler!({
-          type: 'terminal.output',
-          terminalId,
-          seqStart: 1,
-          seqEnd: 1,
-          data: 'checkpoint before repeat fallback',
-          attachRequestId: firstAttach!.attachRequestId,
-        })
-      })
-
-      const delayedCallbacks: Array<() => void> = []
-      term.write.mockImplementation((_data: string, onWritten?: () => void) => {
-        if (onWritten) delayedCallbacks.push(onWritten)
-      })
-      act(() => {
-        messageHandler!({
-          type: 'terminal.output',
-          terminalId,
-          seqStart: 2,
-          seqEnd: 2,
-          data: 'held in-flight write',
-          attachRequestId: firstAttach!.attachRequestId,
-        })
-      })
-      expect(delayedCallbacks).toHaveLength(1)
-
       const bridge = createPerfAuditBridge()
-      installPerfAuditBridge(bridge)
+      const { terminalId, pump, attaches, held, release } = await seedHeldSurface('repeat', bridge)
       let now = 200
-      const performanceNowSpy = vi.spyOn(performance, 'now').mockImplementation(() => {
-        now += 0.01
-        return now
-      })
+      const clock = vi.spyOn(performance, 'now').mockImplementation(() => now += 0.01)
       try {
-        wsMocks.send.mockClear()
-        act(() => {
-          reconnectHandler?.()
-          reconnectHandler?.()
-        })
-
-        const reconnectAttaches = sentMessages()
-          .filter((msg) => msg?.type === 'terminal.attach' && msg?.terminalId === terminalId)
-        expect(reconnectAttaches).toHaveLength(2)
-        expect(reconnectAttaches[0]?.attachRequestId).not.toBe(reconnectAttaches[1]?.attachRequestId)
-
-        const fallbackEvents = bridge.snapshot().perfEvents
-          .filter((event) => event.event === 'terminal.catchup.full_hydrate_fallback')
-        expect(fallbackEvents).toHaveLength(2)
-        expect(fallbackEvents[0]).toEqual(expect.objectContaining({
-          event: 'terminal.catchup.full_hydrate_fallback',
-          timestamp: expect.any(Number),
-          terminalId,
-          attachRequestId: reconnectAttaches[0]!.attachRequestId,
-          requestedIntent: 'transport_reconnect',
-          intent: 'viewport_hydrate',
-          reason: 'in_flight_writes',
-          hasInFlightWrites: true,
-        }))
-        expect(fallbackEvents[1]).toEqual(expect.objectContaining({
-          event: 'terminal.catchup.full_hydrate_fallback',
-          timestamp: expect.any(Number),
-          terminalId,
-          attachRequestId: reconnectAttaches[1]!.attachRequestId,
-          requestedIntent: 'transport_reconnect',
-          intent: 'viewport_hydrate',
-          reason: 'in_flight_writes',
-          hasInFlightWrites: true,
-        }))
-        expect(Number(fallbackEvents[0]!.timestamp)).toBeLessThan(Number(fallbackEvents[1]!.timestamp))
-
-        const quarantineEvents = bridge.snapshot().perfEvents
-          .filter((event) => event.event === 'terminal.catchup.surface_quarantined')
-        expect(quarantineEvents).toHaveLength(2)
-        expect(quarantineEvents[0]).toEqual(expect.objectContaining({
-          event: 'terminal.catchup.surface_quarantined',
-          timestamp: expect.any(Number),
-          terminalId,
-          attachRequestId: reconnectAttaches[0]!.attachRequestId,
-          requestedIntent: 'transport_reconnect',
-          intent: 'viewport_hydrate',
-          reason: 'in_flight_writes',
-        }))
-        expect(quarantineEvents[1]).toEqual(expect.objectContaining({
-          event: 'terminal.catchup.surface_quarantined',
-          timestamp: expect.any(Number),
-          terminalId,
-          attachRequestId: reconnectAttaches[1]!.attachRequestId,
-          requestedIntent: 'transport_reconnect',
-          intent: 'viewport_hydrate',
-          reason: 'in_flight_writes',
-        }))
-        expect(Number(quarantineEvents[0]!.timestamp)).toBeLessThan(Number(quarantineEvents[1]!.timestamp))
-
-        expect(bridge.snapshot().metadata['terminal.catchup.full_hydrate_fallback']).toBeUndefined()
-        expect(bridge.snapshot().milestones['terminal.catchup.full_hydrate_fallback']).toBeUndefined()
-        expect(bridge.snapshot().metadata['terminal.catchup.surface_quarantined']).toBeUndefined()
-        expect(bridge.snapshot().milestones['terminal.catchup.surface_quarantined']).toBeUndefined()
-      } finally {
-        performanceNowSpy.mockRestore()
-      }
+        act(() => { reconnectHandler!(); reconnectHandler!(); pump() })
+        expect(attaches()).toEqual([])
+        const fallbacks = bridge.snapshot().perfEvents.filter(event => event.event === 'terminal.catchup.full_hydrate_fallback')
+        const quarantines = bridge.snapshot().perfEvents.filter(event => event.event === 'terminal.catchup.surface_quarantined')
+        for (const events of [fallbacks, quarantines]) {
+          expect(events).toHaveLength(2)
+          expect(events[0].attachRequestId).not.toBe(events[1].attachRequestId)
+          expect(events[0].localGeneration).not.toBe(events[1].localGeneration)
+          expect(Number(events[0].timestamp)).toBeLessThan(Number(events[1].timestamp))
+          for (const event of events) expect(event).toMatchObject({ terminalId, requestedIntent: 'transport_reconnect', intent: 'viewport_hydrate', reason: 'in_flight_writes', phase: 'reconstruction_pending' })
+        }
+        expect(fallbacks.every(event => event.hasInFlightWrites === true)).toBe(true)
+        release()
+        expect(held.map(item => item.data)).toEqual([MOUNTED_RECONSTRUCTION])
+        release()
+        expect(attaches()).toHaveLength(1)
+        expect(attaches()[0].attachRequestId).toBe(fallbacks[1].attachRequestId)
+        for (const event of ['terminal.catchup.full_hydrate_fallback', 'terminal.catchup.surface_quarantined']) {
+          expect(bridge.snapshot().metadata[event]).toBeUndefined()
+          expect(bridge.snapshot().milestones[event]).toBeUndefined()
+        }
+      } finally { clock.mockRestore() }
     })
 
     it('does not clear the old surface when full hydrate starts with in-flight writes', async () => {
-      const { store, tabId, paneId, terminalId, term } = await renderTerminalHarness({
-        status: 'running',
-        terminalId: 'term-in-flight-full-hydrate',
-        serverInstanceId: 'server-a',
-        streamId: 'stream-in-flight',
-        clearSends: false,
-      })
-
-      const firstAttach = wsMocks.send.mock.calls
-        .map(([msg]) => msg)
-        .find((msg) => msg?.type === 'terminal.attach' && msg?.terminalId === terminalId)
-      expect(firstAttach?.attachRequestId).toBeTruthy()
-
-      act(() => {
-        messageHandler!({
-          type: 'terminal.output',
-          terminalId,
-          seqStart: 1,
-          seqEnd: 1,
-          data: 'trusted text',
-          attachRequestId: firstAttach!.attachRequestId,
-        })
-      })
-
-      const trustedCheckpoint = __readTerminalSurfaceCheckpointForTests(terminalId, {
-        streamId: 'stream-in-flight',
-        serverInstanceId: 'server-a',
-      }, { paneId: 'pane-v2-stream' })
-      expect(trustedCheckpoint?.parserAppliedSeq).toBe(1)
-
-      const delayedCallbacks: Array<() => void> = []
-      term.write.mockImplementation((_data: string, onWritten?: () => void) => {
-        if (onWritten) delayedCallbacks.push(onWritten)
-      })
-
-      act(() => {
-        messageHandler!({
-          type: 'terminal.output',
-          terminalId,
-          seqStart: 2,
-          seqEnd: 2,
-          data: 'in-flight text',
-          attachRequestId: firstAttach!.attachRequestId,
-        })
-      })
-      expect(delayedCallbacks).toHaveLength(1)
-
-      term.clear.mockClear()
-      wsMocks.send.mockClear()
-      act(() => {
-        store.dispatch(requestPaneRefresh({ tabId, paneId }))
-      })
-
-      await waitFor(() => {
-        expect(wsMocks.send).toHaveBeenCalledWith(expect.objectContaining({
-          type: 'terminal.attach',
-          terminalId,
-          intent: 'viewport_hydrate',
-          sinceSeq: 0,
-          attachRequestId: expect.any(String),
-        }))
-      })
+      const { store, tabId, paneId, term, pump, held, attaches, release } = await seedHeldSurface('refresh')
+      act(() => { store.dispatch(requestPaneRefresh({ tabId, paneId })) })
+      act(() => pump())
+      expect(attaches()).toEqual([])
+      expect(reconstructionWrites(term)).toEqual([])
+      act(() => { reconnectHandler!(); pump() })
+      expect(attaches()).toEqual([])
+      expect(held.map(item => item.data)).toEqual(['OLD-IN-FLIGHT'])
+      release()
+      expect(held.map(item => item.data)).toEqual([MOUNTED_RECONSTRUCTION])
+      expect(attaches()).toEqual([])
+      release()
+      expect(attaches()).toHaveLength(1)
+      expect(attaches()[0]).toMatchObject({ intent: 'viewport_hydrate', sinceSeq: 0, surfaceReset: true })
+      expect(reconstructionWrites(term)).toHaveLength(1)
       expect(term.clear).not.toHaveBeenCalled()
-
-      wsMocks.send.mockClear()
-      act(() => {
-        reconnectHandler?.()
-      })
-
-      expect(wsMocks.send).toHaveBeenCalledWith(expect.objectContaining({
-        type: 'terminal.attach',
-        terminalId,
-        intent: 'viewport_hydrate',
-        sinceSeq: 0,
-        attachRequestId: expect.any(String),
-      }))
     })
 
     it('cancels quarantined repair after invalid-terminal replacement before writes drain', async () => {
-      const { terminalId, term } = await renderTerminalHarness({
-        status: 'running',
-        terminalId: 'term-quarantine-invalid',
-        serverInstanceId: 'server-a',
-        streamId: 'stream-invalid',
-        clearSends: false,
-      })
-
-      const firstAttach = wsMocks.send.mock.calls
-        .map(([msg]) => msg)
-        .find((msg) => msg?.type === 'terminal.attach' && msg?.terminalId === terminalId)
-      expect(firstAttach?.attachRequestId).toBeTruthy()
-
-      act(() => {
-        messageHandler!({
-          type: 'terminal.output',
-          terminalId,
-          seqStart: 1,
-          seqEnd: 1,
-          data: 'trusted text',
-          attachRequestId: firstAttach!.attachRequestId,
-        })
-      })
-
-      const delayedCallbacks: Array<() => void> = []
-      term.write.mockImplementation((_data: string, onWritten?: () => void) => {
-        if (onWritten) delayedCallbacks.push(onWritten)
-      })
-
-      act(() => {
-        messageHandler!({
-          type: 'terminal.output',
-          terminalId,
-          seqStart: 2,
-          seqEnd: 2,
-          data: 'old in-flight text',
-          attachRequestId: firstAttach!.attachRequestId,
-        })
-      })
-      expect(delayedCallbacks).toHaveLength(1)
-
+      const { terminalId, store, tabId, term, pump, held, attaches, release } = await seedHeldSurface('invalid', undefined, true)
+      act(() => { reconnectHandler!(); pump() })
+      expect(attaches()).toEqual([])
+      // No newer attach has reached the wire. A terminal-scoped legacy error
+      // reports the terminal gone; an old attach-tagged error is obsolete.
+      act(() => { messageHandler!({ type: 'error', code: 'INVALID_TERMINAL_ID', terminalId, message: 'gone' }) })
+      expect((store.getState().panes.layouts[tabId] as { content: any }).content.terminalId).toBeUndefined()
       wsMocks.send.mockClear()
-      act(() => {
-        reconnectHandler?.()
-      })
-
-      const quarantineAttach = wsMocks.send.mock.calls
-        .map(([msg]) => msg)
-        .find((msg) => msg?.type === 'terminal.attach' && msg?.terminalId === terminalId)
-      expect(quarantineAttach).toMatchObject({
-        type: 'terminal.attach',
-        terminalId,
-        intent: 'viewport_hydrate',
-        sinceSeq: 0,
-      })
-
-      act(() => {
-        messageHandler!({
-          type: 'error',
-          code: 'INVALID_TERMINAL_ID',
-          terminalId,
-          message: 'gone',
-        })
-      })
-
-      wsMocks.send.mockClear()
-      await act(async () => {
-        delayedCallbacks.forEach((callback) => callback())
-        await new Promise((resolve) => setTimeout(resolve, 50))
-      })
-
-      expect(wsMocks.send.mock.calls
-        .map(([msg]) => msg)
-        .filter((msg) => msg?.type === 'terminal.attach' && msg?.terminalId === terminalId)).toHaveLength(0)
+      release()
+      await act(async () => { await new Promise(resolve => setTimeout(resolve, 50)); pump() })
+      expect(attaches()).toEqual([])
+      expect(held.map(item => item.data)).not.toContain(MOUNTED_RECONSTRUCTION)
+      expect(reconstructionWrites(term)).toEqual([])
     })
 
     it('handles tagged invalid-terminal errors from quarantine repair attaches', async () => {
-      const { terminalId, term, store, tabId, requestId } = await renderTerminalHarness({
-        status: 'running',
-        terminalId: 'term-quarantine-repair-invalid',
-        serverInstanceId: 'server-a',
-        streamId: 'stream-repair-invalid',
-        clearSends: false,
-      })
-
-      const firstAttach = wsMocks.send.mock.calls
-        .map(([msg]) => msg)
-        .find((msg) => msg?.type === 'terminal.attach' && msg?.terminalId === terminalId)
-      expect(firstAttach?.attachRequestId).toBeTruthy()
-
-      act(() => {
-        messageHandler!({
-          type: 'terminal.output',
-          terminalId,
-          seqStart: 1,
-          seqEnd: 1,
-          data: 'trusted text',
-          attachRequestId: firstAttach!.attachRequestId,
-        })
-      })
-
-      const delayedCallbacks: Array<() => void> = []
-      term.write.mockImplementation((_data: string, onWritten?: () => void) => {
-        if (onWritten) delayedCallbacks.push(onWritten)
-      })
-
-      act(() => {
-        messageHandler!({
-          type: 'terminal.output',
-          terminalId,
-          seqStart: 2,
-          seqEnd: 2,
-          data: 'old in-flight text',
-          attachRequestId: firstAttach!.attachRequestId,
-        })
-      })
-      expect(delayedCallbacks).toHaveLength(1)
-
-      wsMocks.send.mockClear()
-      act(() => {
-        reconnectHandler?.()
-      })
-
-      const quarantineAttach = wsMocks.send.mock.calls
-        .map(([msg]) => msg)
-        .find((msg) => msg?.type === 'terminal.attach' && msg?.terminalId === terminalId)
-      expect(quarantineAttach).toMatchObject({
-        type: 'terminal.attach',
-        terminalId,
-        intent: 'viewport_hydrate',
-        sinceSeq: 0,
-      })
-      expect(quarantineAttach?.attachRequestId).toBeTruthy()
-
-      wsMocks.send.mockClear()
-      await act(async () => {
-        delayedCallbacks.forEach((callback) => callback())
-        await new Promise((resolve) => setTimeout(resolve, 50))
-      })
-
-      const repairAttach = wsMocks.send.mock.calls
-        .map(([msg]) => msg)
-        .find((msg) => msg?.type === 'terminal.attach' && msg?.terminalId === terminalId)
-      expect(repairAttach).toMatchObject({
-        type: 'terminal.attach',
-        terminalId,
-        intent: 'viewport_hydrate',
-        sinceSeq: 0,
-      })
-      expect(repairAttach?.attachRequestId).toBeTruthy()
-      expect(repairAttach?.attachRequestId).not.toBe(quarantineAttach?.attachRequestId)
-
-      act(() => {
-        messageHandler!({
-          type: 'error',
-          code: 'INVALID_TERMINAL_ID',
-          terminalId,
-          requestId: repairAttach!.attachRequestId,
-          message: 'Terminal not running',
-        })
-      })
-
+      const { terminalId, store, tabId, requestId, pump, firstAttach, attaches, release } = await seedHeldSurface('repair-invalid')
+      act(() => { reconnectHandler!(); pump() })
+      expect(attaches()).toEqual([])
+      release()
+      expect(attaches()).toEqual([])
+      release()
+      const repairAttach = attaches()[0]!
+      expect(repairAttach).toMatchObject({ intent: 'viewport_hydrate', sinceSeq: 0, surfaceReset: true })
+      expect(repairAttach.attachRequestId).not.toBe(firstAttach.attachRequestId)
+      act(() => { messageHandler!({ type: 'error', code: 'INVALID_TERMINAL_ID', terminalId, requestId: repairAttach.attachRequestId, message: 'Terminal not running' }) })
       await waitFor(() => {
         const layout = store.getState().panes.layouts[tabId] as { type: 'leaf'; content: any }
         expect(layout.content.terminalId).toBeUndefined()
         expect(layout.content.status).toBe('creating')
         expect(layout.content.createRequestId).not.toBe(requestId)
       })
-
       const layout = store.getState().panes.layouts[tabId] as { type: 'leaf'; content: any }
-      expect(restoreMocks.addTerminalFreshRecoveryRequestId).toHaveBeenCalledWith(
-        layout.content.createRequestId,
-        'fresh_after_restore_unavailable',
-      )
-
+      expect(restoreMocks.addTerminalFreshRecoveryRequestId).toHaveBeenCalledWith(layout.content.createRequestId, 'fresh_after_restore_unavailable')
       wsMocks.send.mockClear()
-      await act(async () => {
-        await new Promise((resolve) => setTimeout(resolve, 50))
-      })
-
-      expect(wsMocks.send.mock.calls
-        .map(([msg]) => msg)
-        .filter((msg) => msg?.type === 'terminal.attach' && msg?.terminalId === terminalId)).toHaveLength(0)
+      await act(async () => { await new Promise(resolve => setTimeout(resolve, 50)); pump() })
+      expect(attaches()).toEqual([])
     })
 
     it('keeps queued viewport_hydrate intent when reconnect fires before the first hidden attach completes', async () => {
@@ -10705,7 +10165,9 @@ describe('TerminalView lifecycle updates', () => {
         expect(terminalWriteStrings(term).some((data) => data.includes('PRIOR-SURFACE-MARKER'))).toBe(true)
       })
       // First generation's clearViewportFirst viewport bookkeeping fired.
-      expect(term.clear).toHaveBeenCalledTimes(1)
+      expect(term.clear).not.toHaveBeenCalled()
+      expect(reconstructionWrites(term)).toHaveLength(0)
+      expect(firstAttach.surfaceReset).toBe(true)
 
       // Drop the checkpoint generation 1 recorded so generation 2's delta
       // decision is missing_checkpoint again (the same full-hydrate branch a
@@ -10750,7 +10212,9 @@ describe('TerminalView lifecycle updates', () => {
 
       // (a) BOTH generations cleared the surface — the second attach did not
       // degrade into keepalive bookkeeping (which skips the clear branch).
-      expect(term.clear).toHaveBeenCalledTimes(2)
+      expect(term.clear).not.toHaveBeenCalled()
+      expect(reconstructionWrites(term)).toHaveLength(1)
+      expect(secondAttach).toMatchObject({ intent: 'keepalive_delta', surfaceReset: true })
       // (b) Each generation replayed only its own seq window, exactly once.
       const writes = terminalWriteStrings(term)
       expect(writes.filter((data) => data.includes('PRIOR-SURFACE-MARKER'))).toHaveLength(1)
@@ -11263,7 +10727,7 @@ describe('TerminalView lifecycle updates', () => {
       expect(repairAttaches().length).toBe(1)
     })
 
-    it('a queue_overflow gap with no valid checkpoint falls back to a full hydrate that never clears before content', async () => {
+    it.each([false, true])('a queue_overflow gap with no valid checkpoint falls back to a full hydrate that never clears before content (replacement retention loss=%s)', async (retentionLost) => {
       // No valid checkpoint exists (no streamId was ever established):
       // the repair may fall back to a full hydrate — but the viewport is
       // NOT cleared before the new baseline is actually established by
@@ -11332,9 +10796,12 @@ describe('TerminalView lifecycle updates', () => {
         'the notice is chrome, never surface bytes',
       ).toBe(false)
 
-      // The hydrate's content establishes the new baseline: the surface
-      // is replaced exactly when the content arrives — never before. The
-      // clear and the replacement apply as ONE flush-time unit.
+      // Hold the actual reset completion: authorizing a reconstruction is
+      // separate from completing it and receiving the replacement replay.
+      term.deferWrites = true
+
+      // Accepted probe content authorizes the ordered reset. The replacement
+      // attach requests that content again after the reset completes.
       act(() => {
         messageHandler!({
           type: 'terminal.attach.ready',
@@ -11353,15 +10820,52 @@ describe('TerminalView lifecycle updates', () => {
           attachRequestId: repair[0]!.attachRequestId,
         })
       })
-      // BEFORE the flush: neither the clear nor the content applied — the
-      // pre-gap surface is intact (the round-4 atomic clear-then-write).
+      // Before the ordered reconstruction flush, the pre-gap surface remains
+      // intact and no replacement content has been applied.
       expect(term.clear).not.toHaveBeenCalled()
       expect(
         terminalWriteStrings(term).some((entry) => entry.includes('REBUILT')),
       ).toBe(false)
       await flushFrames()
-      expect(term.clear).toHaveBeenCalledTimes(1)
-      expectTerminalWriteContaining(term, 'REBUILT')
+      await flushFrames()
+      expect(reconstructionWrites(term)).toHaveLength(1)
+      expect(term.pendingWriteCallbacks).toHaveLength(1)
+      expect(repairAttaches()).toHaveLength(1)
+      expect(screen.getByTestId('restore-delivery-gap-notice').textContent).toContain('output gap 2-5')
+      expect(term.clear).not.toHaveBeenCalled()
+      expect(terminalWriteStrings(term)).not.toContain('REBUILT')
+      act(() => { term.releasePendingWrites() })
+      await flushFrames()
+      expect(repairAttaches()).toHaveLength(2)
+      // The second attach belongs to the same repair. Its empty reset surface
+      // must retain the honest notice while the server replay is outstanding.
+      expect(screen.getByTestId('restore-delivery-gap-notice').textContent).toContain('output gap 2-5')
+      const replacement = repairAttaches().at(-1)!
+      if (retentionLost) {
+        // Retention can expire between the probe and replacement attach.
+        // Its authoritative notice must replace the preserved delivery notice.
+        act(() => {
+          messageHandler!({ type: 'terminal.attach.ready', terminalId, attachRequestId: replacement.attachRequestId, headSeq: 8, replayFromSeq: 1, replayToSeq: 8 })
+          messageHandler!({ type: 'terminal.output.gap', terminalId, attachRequestId: replacement.attachRequestId, fromSeq: 1, toSeq: 3, reason: 'replay_window_exceeded', headSeq: 8, oldestRetainedSeq: 4 })
+          messageHandler!({ type: 'terminal.output', terminalId, attachRequestId: replacement.attachRequestId, seqStart: 4, seqEnd: 8, data: 'RETAINED', source: 'replay' })
+        })
+      } else {
+        replayReconstructedSurface(terminalId, repair[0]!.attachRequestId, 8, 'REBUILT')
+      }
+      await flushFrames()
+      expectTerminalWriteContaining(term, retentionLost ? 'RETAINED' : 'REBUILT')
+      expect(term.pendingWriteCallbacks).toHaveLength(1)
+      act(() => { term.releasePendingWrites() })
+      await flushFrames()
+      expect(sentMessages().filter(msg => msg?.type === 'terminal.replay.credit').at(-1)).toMatchObject({ terminalId, attachRequestId: replacement.attachRequestId, consumedSeq: 8 })
+      if (retentionLost) {
+        expect(screen.queryByTestId('restore-delivery-gap-notice')).toBeNull()
+        expect(screen.getByTestId('restore-retention-loss-notice')).toHaveAttribute('role', 'status')
+      } else {
+        expect(screen.getByTestId('restore-delivery-gap-notice').textContent).toContain('output gap 2-5')
+      }
+      expect(reconstructionWrites(term)).toHaveLength(1)
+      expect(terminalWriteStrings(term).some((entry) => entry.includes('Output gap'))).toBe(false)
       expect(screen.queryByTestId('restore-recovery-retry')).toBeNull()
     })
 
@@ -11557,9 +11061,8 @@ describe('TerminalView lifecycle updates', () => {
       ).toBe(false)
       expectTerminalWriteContaining(term, 'PRE-GAP-VISIBLE')
 
-      // The clear is STILL ARMED: the next frame that will actually write
-      // bytes consumes it — clear-then-write, exactly once, at that frame
-      // (applied at flush time as ONE atomic unit with the content).
+      // The next accepted rendering frame authorizes the ordered reset.
+      // Replacement content comes from the new full attach after that boundary.
       const clearCallsBefore = term.clear.mock.calls.length
       expect(clearCallsBefore).toBe(0)
       act(() => {
@@ -11575,7 +11078,12 @@ describe('TerminalView lifecycle updates', () => {
       // BEFORE the flush: the clear+write is queued, nothing applied.
       expect(term.clear).not.toHaveBeenCalled()
       await flushFrames()
-      expect(term.clear).toHaveBeenCalledTimes(1)
+      await flushFrames()
+      expect(reconstructionWrites(term)).toHaveLength(1)
+      expect(term.clear).not.toHaveBeenCalled()
+      expect(terminalWriteStrings(term)).not.toContain('REBUILT-LATE')
+      replayReconstructedSurface(terminalId, repair[0]!.attachRequestId, 12, 'REBUILT-LATE')
+      await flushFrames()
       expectTerminalWriteContaining(term, 'REBUILT-LATE')
       const writes = term.write.mock.calls.map(([data]: [string]) => String(data)).join('')
       expect(
@@ -11682,12 +11190,17 @@ describe('TerminalView lifecycle updates', () => {
       // BEFORE the flush: the clear+write is queued, nothing applied.
       expect(term.clear).not.toHaveBeenCalled()
       await flushFrames()
-      expect(term.clear).toHaveBeenCalledTimes(1)
+      await flushFrames()
+      expect(reconstructionWrites(term)).toHaveLength(1)
+      expect(term.clear).not.toHaveBeenCalled()
+      expect(terminalWriteStrings(term)).not.toContain('REBUILT-LATE')
+      replayReconstructedSurface(terminalId, repair[0]!.attachRequestId, 10, 'REBUILT-LATE')
+      await flushFrames()
       expectTerminalWriteContaining(term, 'REBUILT-LATE')
       expect(screen.queryByTestId('restore-recovery-retry')).toBeNull()
     })
 
-    it('a supersede between the armed clear and the flush preserves the OLD surface — clear and replacement write drop together', async () => {
+    it('a repair abandoned before reset submission preserves the OLD surface and drops replacement content', async () => {
       // Round-4 F2 race (a), REAL async scheduling: the deferred clear is
       // armed and the first replacement content enqueued, then a
       // superseding attach lands BEFORE the animation-frame flush runs.
@@ -11696,7 +11209,7 @@ describe('TerminalView lifecycle updates', () => {
       // of the write queue wipes the surface and the supersede then
       // discards the replacement — the pre-gap content is gone forever.
       wsMocks.capabilities = { pacedTerminalReplayV1: true }
-      const { terminalId, term } = await renderTerminalHarness({
+      const { terminalId, term, store } = await renderTerminalHarness({
         status: 'running',
         terminalId: 'term-v2-clear-atomic-supersede',
         ackInitialAttach: false,
@@ -11767,15 +11280,19 @@ describe('TerminalView lifecycle updates', () => {
           reason: 'queue_overflow',
         })
       })
-      expect(repairAttaches().length).toBe(2)
+      expect(repairAttaches().length).toBe(1)
+      // The old gap cannot create an attach through the local-ticket fence.
+      // Losing transport eligibility abandons the queued reset before it runs.
+      act(() => { store.dispatch(setConnectionStatus('disconnected')) })
 
       // Now the flush runs: the dropped generation's clear AND write are
       // gone together — the OLD surface survives intact.
       await flushFrames()
       expect(term.clear).not.toHaveBeenCalled()
+      expect(reconstructionWrites(term)).toHaveLength(0)
       expect(
         terminalWriteStrings(term).some((entry) => entry.includes('REPLACEMENT-BASE')),
-        'the superseded replacement never mutates the surface',
+        'the abandoned replacement never mutates the surface',
       ).toBe(false)
       expectTerminalWriteContaining(term, 'PRE-GAP-VISIBLE')
     })
@@ -11905,8 +11422,8 @@ describe('TerminalView lifecycle updates', () => {
       laneA.term.write.mockClear()
       messageHandler!({ type: 'terminal.output', terminalId: laneA.terminalId, seqStart: 3, seqEnd: 3, data: frame3Data })
       await flushFrames()
-      const referenceStream = terminalWriteStrings(laneA.term).join('')
-      expect(referenceStream).toBe(frame2Data + frame3Data)
+      const referenceStream = frame1Data + terminalWriteStrings(laneA.term).join('')
+      expect(referenceStream).toBe(frame1Data + frame2Data + frame3Data)
 
       // LANE B — the gapped repair: frames 1..2 applied live (frame 2
       // submits nothing — its partial escape is held in flight), the gap
@@ -11946,8 +11463,8 @@ describe('TerminalView lifecycle updates', () => {
       expect(repair[0]).toMatchObject({
         type: 'terminal.attach',
         terminalId: laneB.terminalId,
-        intent: 'transport_reconnect',
-        sinceSeq: 1,
+        intent: 'viewport_hydrate',
+        sinceSeq: 0,
         attachRequestId: expect.any(String),
       })
 
@@ -11982,12 +11499,18 @@ describe('TerminalView lifecycle updates', () => {
       })
       await flushFrames()
 
+      await flushFrames()
+      expect(reconstructionWrites(termB)).toHaveLength(1)
+      const resetIndex = terminalWriteStrings(termB).indexOf(MOUNTED_RECONSTRUCTION)
+      replayReconstructedSurface(laneB.terminalId, repairArid, 3, frame1Data + frame2Data + frame3Data)
+      await flushFrames()
+
       // THE CONTENT COMPARISON (not notice-presence): the repaired
       // surface received EXACTLY the uninterrupted reference byte stream —
       // byte-for-byte, in order, with the escape sequence completed
       // exactly as the uninterrupted lane parsed it. Any surface-written
       // notice (the pre-fix behavior) breaks the equality.
-      const repairedStream = terminalWriteStrings(termB).join('')
+      const repairedStream = terminalWriteStrings(termB).slice(resetIndex + 1).join('')
       expect(repairedStream).toBe(referenceStream)
       expect(
         terminalWriteStrings(termB).some((entry) => entry.includes('Output gap')),
@@ -12173,17 +11696,24 @@ describe('TerminalView lifecycle updates', () => {
       // The in-flight stream write completes, THEN the queue applies the
       // clear+write item: the live bytes land BEFORE the clear — no
       // post-clear mutation.
-      const clearCallsBefore = term.clear.mock.calls.length
+      const resetCountBefore = reconstructionWrites(term).length
       term.releasePendingWrites()
       await flushFrames()
-      expect(term.clear.mock.calls.length).toBe(clearCallsBefore + 1)
-      const clearOrder = term.clear.mock.invocationCallOrder[clearCallsBefore]
-      expect(clearOrder).toBeTruthy()
-      expect(
-        inFlightWriteOrder,
-        'the in-flight write completes before the clear applies — no post-clear mutation',
-      ).toBeLessThan(clearOrder!)
+      expect(reconstructionWrites(term)).toHaveLength(resetCountBefore + 1)
+      expect(term.clear).not.toHaveBeenCalled()
+      const resetIndex = term.write.mock.calls.findIndex(([data]: [string]) => data === MOUNTED_RECONSTRUCTION)
+      const resetOrder = term.write.mock.invocationCallOrder[resetIndex]
+      expect(inFlightWriteOrder, 'the stale write is submitted and completed before reconstruction').toBeLessThan(resetOrder)
+      expect(term.pendingWriteCallbacks).toHaveLength(1)
+      expect(repairAttaches()).toHaveLength(1)
+      term.releasePendingWrites()
+      await flushFrames()
+      replayReconstructedSurface(terminalId, repair[0]!.attachRequestId, 6, 'REPLACEMENT-AFTER-CLEAR')
+      await flushFrames()
       expectTerminalWriteContaining(term, 'REPLACEMENT-AFTER-CLEAR')
+      const replacementOrder = term.write.mock.invocationCallOrder[term.write.mock.calls.findIndex(([data]: [string]) => data === 'REPLACEMENT-AFTER-CLEAR')]
+      expect(resetOrder).toBeLessThan(replacementOrder)
+      term.releasePendingWrites()
     })
 
     it('repeated negotiated queue_overflow gaps exhaust to the visible retry strip', async () => {
@@ -12441,6 +11971,10 @@ describe('TerminalView lifecycle updates', () => {
         reconnectHandler?.()
       })
 
+      expect(sentMessages().filter(msg => msg?.type === 'terminal.attach')).toEqual([])
+      const resetWrite = submittedWrites.find(entry => entry.data === MOUNTED_RECONSTRUCTION)
+      expect(resetWrite?.onWritten).toBeTypeOf('function')
+      act(() => { resetWrite!.onWritten!() })
       expect(wsMocks.send).toHaveBeenCalledWith(expect.objectContaining({
         type: 'terminal.attach',
         terminalId,
@@ -13025,7 +12559,7 @@ describe('TerminalView lifecycle updates', () => {
       expect(screen.queryByTestId('restore-recovery-retry')).toBeNull()
     })
 
-    it('recovery bounding: genuine coverage progress resets the progressless counter', async () => {
+    it('recovery bounding: newly consumed stream positions reset the progressless counter', async () => {
       const { terminalId } = await renderResumablePane('recovery-progress')
 
       const attachCount = () => attachMessagesFor(terminalId).length
@@ -13291,7 +12825,7 @@ describe('TerminalView lifecycle updates', () => {
       expect(screen.getByTestId('restore-recovery-retry')).toBeTruthy()
     })
 
-    it('recovery bounding: a gap-tainted generation never resets the streak on completion', async () => {
+    it('recovery bounding: fresh retained output refunds once after a gap, while completion alone does not', async () => {
       const { terminalId } = await renderResumablePane('recovery-gap-taint')
 
       const attachCount = () => attachMessagesFor(terminalId).length
@@ -13333,12 +12867,12 @@ describe('TerminalView lifecycle updates', () => {
 
       // Flaps 2 and 3: the gap-poisoned pane's further progressless
       // reconnects accumulate to the bound; the 4th is declined.
-      for (let flap = 1; flap <= 2; flap += 1) {
+      for (let flap = 1; flap <= 3; flap += 1) {
         act(() => { reconnectHandler?.() })
         expect(attachCount()).toBe(2 + flap)
       }
       act(() => { reconnectHandler?.() })
-      expect(attachCount(), 'the bound still trips for gap-poisoned cycles').toBe(4)
+      expect(attachCount(), 'the bound still trips for gap-poisoned cycles').toBe(5)
       expect(screen.getByTestId('restore-recovery-retry')).toBeTruthy()
     })
 
@@ -13415,7 +12949,8 @@ describe('TerminalView lifecycle updates', () => {
         // the surface decision is FROZEN (quarantined hydrate, no wipe yet).
         act(() => { reconnectHandler?.() })
         const quarantinedAttach = attachMessagesFor(terminalId).at(-1)
-        expect(quarantinedAttach).toMatchObject({ intent: 'viewport_hydrate', sinceSeq: 0 })
+        expect(quarantinedAttach).toBeUndefined()
+        expect(reconstructionWrites(term)).toHaveLength(0)
         expect(term.clear).not.toHaveBeenCalled()
 
         // The stale in-flight write completes during the frozen window — its
@@ -13426,7 +12961,12 @@ describe('TerminalView lifecycle updates', () => {
         withheldWriteCallbacks.splice(0).forEach((cb) => cb())
       })
 
-      // The drained repair fires on the next poll tick (~16ms): it must
+      expect(reconstructionWrites(term)).toHaveLength(1)
+      expect(attachMessagesFor(terminalId)).toEqual([])
+      expect(withheldWriteCallbacks).toHaveLength(1)
+      act(() => { withheldWriteCallbacks.splice(0).forEach(cb => cb()) })
+
+      // The reset completion publishes the guarded boundary: it must
       // REBUILD from a full hydrate (the stale completion's bytes are on
       // the surface beyond the checkpoint) and record the honest decision.
       const repairEvent = await waitFor(() => {
@@ -13828,6 +13368,669 @@ describe('TerminalView lifecycle updates', () => {
         }
       }
     }
+
+    describe('replay credit regression', () => {
+      const INCOMPLETE_SGR = '\x1b[38;5;2;48;2;33;58'
+      const CONTINUATION = ';255mAFTER\r\n'
+      const PREFIX = 'BEFORE\r\n'
+      const RESET = '\x18\x1bc\x1b[?25h'
+      const ENVELOPES = ['single', 'batch', 'barrier-batch'] as const
+
+      function deliverOutput(envelope: typeof ENVELOPES[number], terminalId: string, seq: number, data: string, source: 'replay' | 'live' = 'replay') {
+        if (envelope === 'single') {
+          messageHandler!({ type: 'terminal.output', terminalId, seqStart: seq, seqEnd: seq, data, source })
+        } else {
+          messageHandler!({
+            type: 'terminal.output.batch', terminalId, source,
+            seqStart: seq, seqEnd: seq, serializedBytes: data.length + 256, data,
+            segments: [{ seqStart: seq, seqEnd: seq, endOffset: data.length, rawFrameCount: 1,
+              ...(envelope === 'barrier-batch' ? { barrier: 'control' } : {}) }],
+          })
+        }
+      }
+
+      function ready(terminalId: string, target: number) {
+        messageHandler!({ type: 'terminal.attach.ready', terminalId, headSeq: target, replayFromSeq: 1, replayToSeq: target })
+      }
+
+      function readPacedCheckpoint(terminalId: string, paneId: string) {
+        return __readTerminalSurfaceCheckpointForTests(terminalId, {
+          streamId: latestStreamIdByTerminal.get(terminalId), serverInstanceId: 'srv-paced',
+        }, { paneId })
+      }
+
+      function holdWrites(term: typeof terminalInstances[number]) {
+        const held: Array<() => void> = []
+        term.write.mockImplementation((_data: string, callback?: () => void) => { if (callback) held.push(callback) })
+        return held
+      }
+
+      it('projects a deferred delivery-gap reconstruction as keepalive when hidden before content arrives', async () => {
+        const { terminalId, paneId, tabId, store, term, rerenderAt } = await setupPacedPane({ mode: 'codex' })
+        const pump = captureRaf()
+        act(() => { ready(terminalId, 1); deliverOutput('single', terminalId, 1, PREFIX + '\x07'); pump() })
+        expect(readPacedCheckpoint(terminalId, paneId)).toBeNull()
+        term.write.mockClear()
+        wsMocks.send.mockClear()
+        const held = holdWrites(term)
+
+        act(() => { messageHandler!({ type: 'terminal.output.gap', terminalId, fromSeq: 2, toSeq: 5, reason: 'queue_overflow' }); pump() })
+        const probe = attachMessagesFor(terminalId)[0]!
+        expect(probe).toMatchObject({ intent: 'viewport_hydrate', sinceSeq: 0 })
+        expect(term.write).not.toHaveBeenCalled()
+        rerenderAt(true)
+        expect(term.write).not.toHaveBeenCalled()
+        expect(attachMessagesFor(terminalId)).toHaveLength(1)
+
+        act(() => { ready(terminalId, 8); deliverOutput('single', terminalId, 1, 'REBUILT\r\n'); pump() })
+        expect(term.write.mock.calls.map(([data]: [string]) => data)).toEqual([RESET])
+        expect(held).toHaveLength(1)
+        expect(attachMessagesFor(terminalId)).toHaveLength(1)
+        act(() => { held.shift()!(); pump() })
+        const replacement = attachMessagesFor(terminalId).at(-1)!
+        expect(replacement.attachRequestId).not.toBe(probe.attachRequestId)
+        expect(replacement).toMatchObject({ terminalId, intent: 'keepalive_delta', sinceSeq: 0, surfaceReset: true })
+        expect(attachMessagesFor(terminalId)).toHaveLength(2)
+
+        act(() => { ready(terminalId, 1); deliverOutput('single', terminalId, 1, 'REBUILT\r\n'); pump(); held.shift()!(); pump() })
+        expect(creditMessages().at(-1)).toMatchObject({ attachRequestId: replacement.attachRequestId, consumedSeq: 1 })
+        expect(store.getState().panes.layouts[tabId]).toMatchObject({ content: { terminalId } })
+        expect(terminalInstances.at(-1)).toBe(term)
+        expect(sentMessages().some(msg => msg?.type === 'terminal.kill')).toBe(false)
+        expect(term.clear).not.toHaveBeenCalled()
+        expect(screen.queryByTestId('restore-recovery-retry')).toBeNull()
+        // The replacement send consumes no additional recovery admission.
+        // Reconnect while visible so this checks admission, independent of
+        // the hidden-pane lifetime/background scheduling contract.
+        rerenderAt(false)
+        const before = attachMessagesFor(terminalId).length
+        for (let attempt = 0; attempt < 3; attempt++) act(() => { reconnectHandler!(); pump(); while (held.length) { held.shift()!(); pump() } })
+        expect(attachMessagesFor(terminalId)).toHaveLength(before + 2)
+        expect(screen.getByTestId('restore-recovery-retry')).toBeTruthy()
+      })
+
+      it.each(ENVELOPES)('credits a page-ending incomplete SGR after the real %s write completes', async (envelope) => {
+        const { terminalId, paneId, term } = await setupPacedPane({ suffix: `sgr-${envelope}`, mode: 'codex' })
+        const pump = captureRaf()
+        const held = holdWrites(term)
+        act(() => { ready(terminalId, 2); deliverOutput(envelope, terminalId, 1, PREFIX + INCOMPLETE_SGR); pump() })
+        expect(term.write.mock.calls.map(([data]: [string]) => data)).toEqual([PREFIX])
+        expect(creditMessages()).toEqual([])
+        expect(held).toHaveLength(1)
+        act(() => { held.shift()!(); pump() })
+        expect(creditMessages()).toEqual([expect.objectContaining({ terminalId, consumedSeq: 1, attachRequestId: latestAttachRequestIdForTerminal(terminalId) })])
+        act(() => { deliverOutput(envelope, terminalId, 2, CONTINUATION); pump() })
+        expect(term.write.mock.calls.map(([data]: [string]) => data)).toEqual([PREFIX, INCOMPLETE_SGR + CONTINUATION])
+        expect(creditMessages().at(-1)).toMatchObject({ consumedSeq: 1 })
+        act(() => { held.shift()!(); pump() })
+        expect(creditMessages().at(-1)).toMatchObject({ consumedSeq: 2 })
+        expect(readPacedCheckpoint(terminalId, paneId)).toBeNull()
+      })
+
+      it.each([
+        { label: 'OSC52', data: PREFIX + OSC52_ONLY_FRAME },
+        { label: 'Codex BEL', data: PREFIX + '\x07' },
+      ])('credits a mixed $label frame without claiming strict applied progress', async ({ data }) => {
+        const { terminalId, paneId, term } = await setupPacedPane({ mode: 'codex' })
+        const pump = captureRaf(), held = holdWrites(term)
+        act(() => { ready(terminalId, 1); deliverOutput('single', terminalId, 1, data); pump() })
+        expect(term.write.mock.calls.map(([value]: [string]) => value)).toEqual([PREFIX])
+        expect(creditMessages()).toEqual([])
+        act(() => { held.shift()!(); pump() })
+        expect(creditMessages().at(-1)).toMatchObject({ consumedSeq: 1 })
+        expect(readPacedCheckpoint(terminalId, paneId)).toBeNull()
+      })
+
+      it('orders fully filtered acknowledgement behind a held visible write', async () => {
+        const { terminalId, paneId, term } = await setupPacedPane()
+        const pump = captureRaf(), held = holdWrites(term)
+        act(() => { ready(terminalId, 2); deliverOutput('single', terminalId, 1, PREFIX); deliverOutput('single', terminalId, 2, OSC52_ONLY_FRAME); pump() })
+        expect(creditMessages()).toEqual([])
+        expect(readPacedCheckpoint(terminalId, paneId)).toBeNull()
+        expect(term.write).toHaveBeenCalledTimes(1)
+        act(() => { held.shift()!(); pump() })
+        expect(creditMessages()).toEqual([expect.objectContaining({ consumedSeq: 2 })])
+        expect(readPacedCheckpoint(terminalId, paneId)).toMatchObject({ parserAppliedSeq: 1, surfaceCoverageSeq: 2 })
+      })
+
+      it.each([
+        { label: 'CSI', fragment: INCOMPLETE_SGR, continuation: CONTINUATION },
+        { label: 'OSC', fragment: '\x1b]0;title', continuation: '\x07AFTER\r\n' },
+      ])('buffered-only $label can credit but cannot save reconstructable coverage', async ({ fragment, continuation }) => {
+        const { terminalId, paneId, term } = await setupPacedPane({ mode: 'codex' })
+        const pump = captureRaf()
+        act(() => { ready(terminalId, 2); deliverOutput('single', terminalId, 1, fragment) })
+        expect(creditMessages()).toEqual([])
+        expect(term.write).not.toHaveBeenCalled()
+        act(() => pump())
+        expect(creditMessages().at(-1)).toMatchObject({ consumedSeq: 1 })
+        expect(readPacedCheckpoint(terminalId, paneId)).toBeNull()
+        act(() => { deliverOutput('single', terminalId, 2, continuation); pump() })
+        expect(term.write.mock.calls.map(([data]: [string]) => data)).toEqual([fragment + continuation])
+        expect(creditMessages().at(-1)).toMatchObject({ consumedSeq: 2 })
+      })
+
+      const finalCases = ENVELOPES.flatMap(envelope => ['SGR', 'OSC'].flatMap(kind => [false, true].flatMap(bufferedOnly => ['before', 'after'].map(timing => ({ envelope, kind, bufferedOnly, timing })))))
+      it.each(finalCases)('retains final replay $kind into live ($envelope, buffered=$bufferedOnly, continuation=$timing completion)', async ({ envelope, kind, bufferedOnly, timing }) => {
+        const { terminalId, paneId, term } = await setupPacedPane({ mode: 'codex' })
+        const pump = captureRaf(), held = holdWrites(term)
+        const fragment = kind === 'SGR' ? INCOMPLETE_SGR : '\x1b]0;title'
+        const continuation = kind === 'SGR' ? CONTINUATION : '\x07AFTER\r\n'
+        const prefix = bufferedOnly ? '' : PREFIX
+        act(() => { ready(terminalId, 1); deliverOutput(envelope, terminalId, 1, prefix + fragment); pump() })
+        expect(creditMessages()).toEqual(bufferedOnly ? [expect.objectContaining({ consumedSeq: 1 })] : [])
+        if (timing === 'after') act(() => { held.splice(0).forEach(cb => cb()); pump() })
+        act(() => { deliverOutput(envelope, terminalId, 2, continuation, 'live'); pump() })
+        act(() => { while (held.length) { held.shift()!(); pump() } })
+        expect(term.write.mock.calls.map(([data]: [string]) => data).join('')).toBe(prefix + fragment + continuation)
+        expect(creditMessages().every(msg => msg.consumedSeq <= 1)).toBe(true)
+        expect(creditMessages().at(-1)).toMatchObject({ consumedSeq: 1 })
+        expect(readPacedCheckpoint(terminalId, paneId)).toBeNull()
+      })
+
+      it('orders buffered ownership behind earlier real output and suppresses a known old startup query remainder', async () => {
+        const { terminalId, term } = await setupPacedPane({ mode: 'codex' })
+        const pump = captureRaf(), held = holdWrites(term)
+        act(() => { ready(terminalId, 2); deliverOutput('single', terminalId, 1, PREFIX); pump(); deliverOutput('single', terminalId, 2, '\x1b]11;?'); pump() })
+        expect(creditMessages()).toEqual([])
+        act(() => { held.shift()!(); pump(); deliverOutput('single', terminalId, 3, '\x07AFTER\r\n', 'live'); pump(); held.splice(0).forEach(cb => cb()); pump() })
+        expect(term.write.mock.calls.map(([data]: [string]) => data).join('')).toBe(PREFIX + 'AFTER\r\n')
+        expect(sentMessages().filter(msg => msg.type === 'terminal.input')).toEqual([])
+      })
+
+      it('ignores an unmounted late mixed-write completion', async () => {
+        const { terminalId, paneId, term } = await setupPacedPane({ mode: 'codex' })
+        const pump = captureRaf(), held = holdWrites(term)
+        act(() => { ready(terminalId, 1); deliverOutput('single', terminalId, 1, PREFIX + INCOMPLETE_SGR); pump() })
+        const deliver = messageHandler!
+        cleanup()
+        act(() => { held.splice(0).forEach(cb => cb()); pump(); deliver({ type: 'terminal.output', terminalId, seqStart: 2, seqEnd: 2, data: CONTINUATION }) })
+        expect(creditMessages()).toEqual([])
+        expect(readPacedCheckpoint(terminalId, paneId)).toBeNull()
+      })
+
+      async function dirtyPane() {
+        const pane = await setupPacedPane({ mode: 'codex' })
+        const pump = captureRaf()
+        act(() => { ready(pane.terminalId, 1); deliverOutput('single', pane.terminalId, 1, 'SAFE\r\n'); pump() })
+        expect(readPacedCheckpoint(pane.terminalId, pane.paneId)).toMatchObject({ surfaceCoverageSeq: 1 })
+        act(() => { deliverOutput('single', pane.terminalId, 2, 'PARTIAL' + INCOMPLETE_SGR, 'live'); pump() })
+        return { ...pane, pump }
+      }
+
+      it.each(['before completion', 'pending at completion'] as const)('uses the resized viewport and checkpoint after a held reconstruction callback completes (layout %s)', async (layoutTiming) => {
+        let notifyResize: (() => void) | undefined
+        vi.stubGlobal('ResizeObserver', class extends MockResizeObserver {
+          constructor(callback: () => void) { super(); notifyResize = callback }
+        })
+        const { terminalId, paneId, term, pump } = await dirtyPane()
+        const originalEpoch = readPacedCheckpoint(terminalId, paneId)!.geometryEpoch
+        const held = holdWrites(term)
+        wsMocks.send.mockClear()
+        act(() => { reconnectHandler!(); pump() })
+        expect(term.write.mock.calls.at(-1)?.[0]).toBe(RESET)
+        expect(held).toHaveLength(1)
+        expect(attachMessagesFor(terminalId)).toEqual([])
+
+        const runtime = runtimeMocks.instances.at(-1)!
+        runtime.fit.mockImplementation(() => { term.cols = 132; term.rows = 40 })
+        const resizeMessages = () => sentMessages().filter(msg => msg?.type === 'terminal.resize' && msg.terminalId === terminalId)
+        if (layoutTiming === 'before completion') {
+          act(() => { notifyResize!(); pump() })
+          expect(resizeMessages().at(-1)).toMatchObject({ cols: 132, rows: 40 })
+          expect(attachMessagesFor(terminalId)).toEqual([])
+          act(() => { held.shift()!(); pump() })
+        } else {
+          // The post-hook task precedes the requested layout flush. The
+          // replacement boundary must fit rather than read the old size.
+          act(() => { held.shift()!() })
+          act(() => { notifyResize!(); pump() })
+          expect(resizeMessages()).toEqual([])
+        }
+        const replacement = attachMessagesFor(terminalId).at(-1)!
+        expect(replacement).toMatchObject({ intent: 'viewport_hydrate', sinceSeq: 0, surfaceReset: true, cols: 132, rows: 40 })
+        act(() => { ready(terminalId, 3); deliverOutput('single', terminalId, 1, 'RESIZED-BASELINE\r\n'); deliverOutput('single', terminalId, 2, 'MORE\r\n'); deliverOutput('single', terminalId, 3, 'DONE\r\n'); pump(); while (held.length) { held.shift()!(); pump() } })
+        expect(readPacedCheckpoint(terminalId, paneId)).toMatchObject({ cols: 132, rows: 40, parserAppliedSeq: 3, surfaceCoverageSeq: 3 })
+        expect(readPacedCheckpoint(terminalId, paneId)!.geometryEpoch).toBe(originalEpoch + 1)
+        const resizeCount = resizeMessages().length
+        act(() => { notifyResize!(); pump() })
+        expect(resizeMessages()).toHaveLength(resizeCount)
+        act(() => { reconnectHandler!(); pump() })
+        expect(attachMessagesFor(terminalId).at(-1)).toMatchObject({ intent: 'transport_reconnect', sinceSeq: 3, cols: 132, rows: 40 })
+        expect(terminalInstances.at(-1)).toBe(term)
+        expect(sentMessages().some(msg => msg?.type === 'terminal.kill')).toBe(false)
+      })
+
+      it('waits for reset success and the post-hook task before advertising a full hydrate', async () => {
+        const { terminalId, paneId, term, pump } = await dirtyPane()
+        const held = holdWrites(term), old = latestAttachRequestIdForTerminal(terminalId)
+        act(() => { reconnectHandler!(); pump() })
+        expect(attachMessagesFor(terminalId)).toHaveLength(1)
+        expect(term.write.mock.calls.at(-1)?.[0]).toBe(RESET)
+        expect(creditMessages().every(msg => msg.consumedSeq <= 1)).toBe(true)
+        act(() => held.shift()!())
+        expect(attachMessagesFor(terminalId)).toHaveLength(1)
+        act(() => pump())
+        expect(attachMessagesFor(terminalId).at(-1)).toMatchObject({ sinceSeq: 0, surfaceReset: true })
+        expect(latestAttachRequestIdForTerminal(terminalId)).not.toBe(old)
+        act(() => { ready(terminalId, 1); messageHandler!({ type: 'terminal.modes.sync', terminalId, data: '\x1b[?25h' }); deliverOutput('single', terminalId, 1, 'NEW' + INCOMPLETE_SGR); pump() })
+        act(() => { while (held.length) { held.shift()!(); pump() } })
+        expect(readPacedCheckpoint(terminalId, paneId)).toBeNull()
+        act(() => reconnectHandler!())
+        expect(attachMessagesFor(terminalId)).toHaveLength(2)
+      })
+
+      it.each(['tagged', 'untagged'])('fences old %s ready/output/batch/gap/modes before preprocessing during local reconstruction', async (tagged) => {
+        const { terminalId, term, pump } = await dirtyPane()
+        const held = holdWrites(term)
+        const old = latestAttachRequestIdForTerminal(terminalId)
+        const streamId = latestStreamIdByTerminal.get(terminalId)
+        const direct = wsMocks.onMessage.mock.calls.at(-1)![0]
+        act(() => { reconnectHandler!(); pump() })
+        const writes = term.write.mock.calls.length, credits = creditMessages().length
+        const tags = tagged === 'tagged' ? { attachRequestId: old, streamId } : {}
+        act(() => {
+          direct({ type: 'terminal.attach.ready', terminalId, headSeq: 500, replayFromSeq: 1, replayToSeq: 500, ...tags })
+          direct({ type: 'terminal.output', terminalId, seqStart: 3, seqEnd: 3, data: 'OLD\x1b]0;POLLUTION', ...tags })
+          direct({ type: 'terminal.output.batch', terminalId, source: 'live', seqStart: 4, seqEnd: 4, serializedBytes: 300, data: 'OLD', segments: [{ seqStart: 4, seqEnd: 4, endOffset: 3, rawFrameCount: 1 }], ...tags })
+          direct({ type: 'terminal.output.gap', terminalId, fromSeq: 1, toSeq: 4, reason: 'queue_overflow', ...tags })
+          direct({ type: 'terminal.modes.sync', terminalId, data: '\x1b[?1049h', ...tags })
+          pump()
+        })
+        expect(term.write.mock.calls).toHaveLength(writes)
+        expect(creditMessages()).toHaveLength(credits)
+        expect(screen.queryByText(/output was lost/i)).toBeNull()
+        act(() => { held.shift()!(); pump(); ready(terminalId, 1); deliverOutput('single', terminalId, 1, 'CURRENT'); pump(); held.splice(0).forEach(cb => cb()); pump() })
+        expect(term.write.mock.calls.at(-1)?.[0]).toBe('CURRENT')
+        expect(creditMessages().at(-1)).toMatchObject({ consumedSeq: 1 })
+      })
+
+      it('settles an actual reset throw without attach or success and permits later recovery', async () => {
+        const { terminalId, paneId, term, pump } = await dirtyPane()
+        term.write.mockImplementation((data: string, cb?: () => void) => { if (data === RESET) throw new Error('reset rejected'); cb?.() })
+        act(() => { reconnectHandler!(); pump() })
+        expect(attachMessagesFor(terminalId)).toHaveLength(1)
+        expect(readPacedCheckpoint(terminalId, paneId)).toMatchObject({ surfaceCoverageSeq: 1 })
+        term.write.mockImplementation((_data: string, cb?: () => void) => cb?.())
+        act(() => { reconnectHandler!(); pump() })
+        expect(attachMessagesFor(terminalId)).toHaveLength(2)
+        expect(attachMessagesFor(terminalId).at(-1)).toMatchObject({ sinceSeq: 0, surfaceReset: true })
+      })
+
+      it.each(['before', 'after'])('supersedes a reset %s submission without authorizing the old ticket', async timing => {
+        const { store, tabId, paneId, terminalId, term, pump } = await dirtyPane()
+        const held = holdWrites(term)
+        act(() => { reconnectHandler!(); if (timing === 'after') pump() })
+        // Let React execute the refresh effect before flushing the queue;
+        // otherwise the purported "before" case submits the old reset.
+        act(() => { store.dispatch(requestPaneRefresh({ tabId, paneId })) })
+        act(() => pump())
+        expect(attachMessagesFor(terminalId)).toHaveLength(1)
+        act(() => { held.shift()!(); pump() })
+        if (timing === 'after') {
+          expect(attachMessagesFor(terminalId)).toHaveLength(1)
+          act(() => { held.shift()!(); pump() })
+        }
+        expect(attachMessagesFor(terminalId)).toHaveLength(2)
+      })
+
+      it.each(['unmount', 'connection', 'hidden'])('abandons an in-flight reset on %s and rejects its late success', async change => {
+        const { store, terminalId, term, rerenderAt, pump } = await dirtyPane()
+        const held = holdWrites(term)
+        act(() => { reconnectHandler!(); pump() })
+        if (change === 'unmount') cleanup()
+        else if (change === 'connection') act(() => { setWsIsReady(false); store.dispatch(setConnectionStatus('disconnected')) })
+        else rerenderAt(true)
+        act(() => { held.splice(0).forEach(cb => cb()); pump() })
+        expect(attachMessagesFor(terminalId)).toHaveLength(1)
+      })
+
+      it('keeps the new transport ticket when React commits ready after the reconnect callback', async () => {
+        const { store, terminalId, term, pump } = await dirtyPane()
+        act(() => { store.dispatch(setConnectionStatus('disconnected')) })
+        const held = holdWrites(term)
+        act(() => { reconnectHandler!(); store.dispatch(setConnectionStatus('ready')) })
+        act(() => pump())
+        expect(held).toHaveLength(1)
+        expect(attachMessagesFor(terminalId)).toHaveLength(1)
+        act(() => { held.shift()!(); pump() })
+        expect(attachMessagesFor(terminalId).at(-1)).toMatchObject({ sinceSeq: 0, surfaceReset: true })
+        expect(attachMessagesFor(terminalId)).toHaveLength(2)
+      })
+
+      it.each(['queued', 'submitted'] as const)('preserves the admitted reset when a newer automatic attempt is refused ($0)', async phase => {
+        const { terminalId, term, pump } = await dirtyPane()
+        const held = holdWrites(term)
+        act(() => {
+          for (let attempt = 0; attempt < 3; attempt++) reconnectHandler!()
+          if (phase === 'submitted') pump()
+        })
+        expect(held).toHaveLength(phase === 'submitted' ? 1 : 0)
+        act(() => { reconnectHandler!() })
+        expect(screen.getByTestId('restore-recovery-retry')).toBeTruthy()
+        act(() => pump())
+        expect(held).toHaveLength(1)
+        expect(reconstructionWrites(term)).toHaveLength(1)
+        expect(attachMessagesFor(terminalId)).toHaveLength(1)
+        act(() => { held.shift()!(); pump() })
+        expect(attachMessagesFor(terminalId)).toHaveLength(2)
+        expect(attachMessagesFor(terminalId).at(-1)).toMatchObject({ sinceSeq: 0, surfaceReset: true })
+        // The last admitted operation already owns its budget. Its genuine
+        // success must request and finish the replacement content, even when
+        // a later request was refused; the surface cannot remain reset-only.
+        act(() => {
+          ready(terminalId, 2)
+          messageHandler!({ type: 'terminal.output', terminalId, seqStart: 1, seqEnd: 2, source: 'replay', data: 'REBUILT-AFTER-ADMITTED-RESET\r\n' })
+          pump()
+        })
+        expect(held).toHaveLength(1)
+        expect(creditMessages().at(-1)).not.toMatchObject({ consumedSeq: 2 })
+        act(() => { held.shift()!(); pump() })
+        expect(creditMessages().at(-1)).toMatchObject({ attachRequestId: latestAttachRequestIdForTerminal(terminalId), consumedSeq: 2 })
+        expectTerminalWriteContaining(term, 'REBUILT-AFTER-ADMITTED-RESET')
+        expect(screen.getByTestId('restore-recovery-retry')).toBeTruthy()
+      })
+
+      it.each(['refresh', 'retry'] as const)('keeps consumed high-water after explicit %s while replaying the same bytes', async action => {
+        const { store, tabId, paneId, terminalId, pump } = await dirtyPane()
+        act(() => {
+          deliverOutput('single', terminalId, 3, CONTINUATION, 'live')
+          deliverOutput('single', terminalId, 4, 'NEW-LIVE\r\n', 'live')
+          pump()
+        })
+        if (action === 'retry') {
+          for (let attempt = 0; attempt < 4; attempt++) act(() => { reconnectHandler!(); pump() })
+          expect(screen.getByTestId('restore-recovery-retry')).toBeTruthy()
+          fireEvent.click(screen.getByRole('button', { name: 'Retry terminal restore' }))
+        } else {
+          act(() => { store.dispatch(requestPaneRefresh({ tabId, paneId })) })
+        }
+        act(() => pump())
+        const afterExplicit = attachMessagesFor(terminalId).length
+        act(() => {
+          ready(terminalId, 4)
+          deliverOutput('single', terminalId, 1, 'SAFE\r\n')
+          deliverOutput('single', terminalId, 2, 'PARTIAL' + INCOMPLETE_SGR)
+          deliverOutput('single', terminalId, 3, CONTINUATION)
+          deliverOutput('single', terminalId, 4, 'NEW-LIVE\r\n')
+          pump()
+        })
+        // Explicit user intent resets the streak, with one attempt charged
+        // for its attach. Re-consuming positions 1..4 refunds nothing.
+        for (let attempt = 0; attempt < 3; attempt++) act(() => { reconnectHandler!(); pump() })
+        expect(attachMessagesFor(terminalId)).toHaveLength(afterExplicit + 2)
+        expect(screen.getByTestId('restore-recovery-retry')).toBeTruthy()
+      })
+
+      it('waits for an old in-flight mutation before reset and excludes its late credit', async () => {
+        const { terminalId, term } = await setupPacedPane({ mode: 'codex' })
+        const pump = captureRaf(), held = holdWrites(term)
+        act(() => { ready(terminalId, 1); deliverOutput('single', terminalId, 1, 'OLD' + INCOMPLETE_SGR); pump(); reconnectHandler!(); pump() })
+        expect(term.write.mock.calls.map(([data]: [string]) => data)).toEqual(['OLD'])
+        expect(attachMessagesFor(terminalId)).toHaveLength(1)
+        act(() => { held.shift()!(); pump() })
+        expect(term.write.mock.calls.at(-1)?.[0]).toBe(RESET)
+        expect(creditMessages()).toEqual([])
+        act(() => { held.shift()!(); pump() })
+        expect(attachMessagesFor(terminalId).at(-1)).toMatchObject({ sinceSeq: 0, surfaceReset: true })
+      })
+
+      it.each([true, false])('counts genuinely newer mixed/live consumption independently of pinned coverage (fresh=$fresh)', async fresh => {
+        const { terminalId, term, pump } = await dirtyPane()
+        act(() => { deliverOutput('single', terminalId, 3, CONTINUATION, 'live'); deliverOutput('single', terminalId, 4, 'FRESH\r\n', 'live'); pump() })
+        for (let attempt = 0; attempt < 5; attempt++) {
+          const before = attachMessagesFor(terminalId).length
+          act(() => { reconnectHandler!(); pump() })
+          if (!fresh && attempt >= 3) { expect(attachMessagesFor(terminalId)).toHaveLength(before); break }
+          expect(attachMessagesFor(terminalId)).toHaveLength(before + 1)
+          act(() => { ready(terminalId, 3); deliverOutput('single', terminalId, 1, 'SAFE\r\n'); deliverOutput('single', terminalId, 2, 'PARTIAL' + INCOMPLETE_SGR); deliverOutput('single', terminalId, 3, CONTINUATION); pump() })
+          if (fresh) act(() => { deliverOutput('single', terminalId, 5 + attempt, 'NEW' + OSC52_ONLY_FRAME, 'live'); pump() })
+        }
+        expect(term.write).toHaveBeenCalled()
+        expect(screen.queryByTestId('restore-recovery-retry') !== null).toBe(!fresh)
+      })
+
+      it.each(['success', 'throw', 'supersede'] as const)('only genuine newer completion refunds a progressless attempt ($0)', async outcome => {
+        const { terminalId, term, pump } = await dirtyPane()
+        act(() => { reconnectHandler!(); pump(); ready(terminalId, 1); deliverOutput('single', terminalId, 1, 'SAFE\r\n'); pump() })
+        const held = holdWrites(term)
+        if (outcome === 'throw') term.write.mockImplementation(() => { throw new Error('newer range rejected') })
+        act(() => { deliverOutput('single', terminalId, 3, 'NEW' + OSC52_ONLY_FRAME, 'live'); pump() })
+        // Reception/submission alone must not clear the progressless budget.
+        const before = attachMessagesFor(terminalId).length
+        if (outcome === 'supersede') act(() => { reconnectHandler!(); while (held.length) { held.shift()!(); pump() } })
+        else if (outcome === 'success') act(() => { held.shift()!(); pump() })
+        term.write.mockImplementation((_data: string, done?: () => void) => done?.())
+        for (let i = 0; i < 4; i++) act(() => { reconnectHandler!(); pump(); ready(terminalId, 1) })
+        // Success resets to three fresh attempts; failure and stale completion
+        // leave the earlier progressless attempt(s) charged.
+        expect(attachMessagesFor(terminalId).length - before).toBe(outcome === 'success' ? 3 : 2)
+        expect(screen.getByTestId('restore-recovery-retry')).toBeTruthy()
+      })
+
+      it.each(
+        (['malformed batch', 'stream mismatch', 'single jump', 'batch jump'] as const).flatMap(loss =>
+          (['matching', 'split matching', 'split divergent'] as const).map(suffix => ({ loss, suffix })),
+        ),
+      )('preserves recognized obsolete query suffix ownership through $loss with $suffix live bytes', async ({ loss, suffix }) => {
+        terminalThemeMocks.getTerminalTheme.mockReturnValue({ background: '#112233' })
+        const { store, terminalId, paneId, term } = await setupPacedPane({ mode: 'opencode' })
+        const pump = captureRaf()
+        const emulatorCount = terminalInstances.length
+        act(() => { store.dispatch(setConnectionStatus('ready')); ready(terminalId, 2); deliverOutput('single', terminalId, 1, '\x1b]11;'); pump() })
+        expect(terminalWriteStrings(term)).toEqual([])
+        expect(sentMessages().filter(msg => msg?.type === 'terminal.input')).toEqual([])
+        expect(readPacedCheckpoint(terminalId, paneId)).toBeNull()
+
+        act(() => {
+          if (loss === 'malformed batch') {
+            messageHandler!({
+              type: 'terminal.output.batch', terminalId, source: 'replay',
+              seqStart: 2, seqEnd: 2, data: 'REJECTED', serializedBytes: -1,
+              segments: [{ seqStart: 2, seqEnd: 2, endOffset: 8, rawFrameCount: 1 }],
+            })
+          } else if (loss === 'stream mismatch') {
+            messageHandler!({ type: 'terminal.output', terminalId, streamId: 'other-stream', seqStart: 2, seqEnd: 2, data: 'REJECTED' })
+          }
+          pump()
+        })
+
+        const held = holdWrites(term)
+        const envelope = loss === 'batch jump' ? 'batch' : 'single'
+        const notices = loss === 'single jump' || loss === 'batch jump'
+          ? ['\r\n[Output gap 2-2: unexplained sequence jump]\r\n']
+          : []
+        const creditsBeforeMatching = creditMessages().slice()
+        act(() => { deliverOutput(envelope, terminalId, 3, suffix === 'matching' ? '?\x07AFTER\r\n' : '?', 'live'); pump() })
+        if (notices.length && suffix !== 'matching') {
+          expect(terminalWriteStrings(term).join('')).toBe(notices.join(''))
+          act(() => { held.shift()!(); pump() })
+        }
+
+        let creditsBeforeCompletion = creditsBeforeMatching
+        if (suffix !== 'matching') {
+          // A possibly obsolete first byte belongs to the boundary until the
+          // next frame either matches the rest or proves it is fresh content.
+          expect(terminalWriteStrings(term).join('')).toBe(notices.join(''))
+          expect(held).toHaveLength(0)
+          expect(sentMessages().filter(msg => msg?.type === 'terminal.input')).toEqual([])
+          creditsBeforeCompletion = creditMessages().slice()
+          act(() => { deliverOutput(envelope, terminalId, 4, suffix === 'split matching' ? '\x07AFTER\r\n' : 'xAFTER\r\n', 'live'); pump() })
+        }
+
+        const fresh = suffix === 'split divergent' ? '?xAFTER\r\n' : 'AFTER\r\n'
+        expect(terminalWriteStrings(term).join('')).toBe(notices.join('') + fresh)
+        expect(held).toHaveLength(1)
+        expect(creditMessages()).toEqual(creditsBeforeCompletion)
+        expect(readPacedCheckpoint(terminalId, paneId)).toBeNull()
+        expect(sentMessages().filter(msg => msg?.type === 'terminal.input')).toEqual([])
+        act(() => { held.shift()!(); pump() })
+        expect(creditMessages().at(-1)).toMatchObject({ attachRequestId: latestAttachRequestIdForTerminal(terminalId), consumedSeq: 2 })
+        expect(screen.queryByText('Recovering terminal output...')).toBeNull()
+        expect(readPacedCheckpoint(terminalId, paneId)).toBeNull()
+
+        act(() => { deliverOutput(envelope, terminalId, suffix === 'matching' ? 4 : 5, 'FRESH\r\n', 'live'); pump(); held.shift()!(); pump() })
+        expect(terminalWriteStrings(term).join('')).toBe(notices.join('') + fresh + 'FRESH\r\n')
+        expect(sentMessages().filter(msg => msg?.type === 'terminal.input' || msg?.type === 'terminal.create' || msg?.type === 'terminal.kill')).toEqual([])
+        expect(attachMessagesFor(terminalId)).toHaveLength(1)
+        expect(terminalInstances).toHaveLength(emulatorCount)
+      })
+
+      it.each(['generation', 'gap'] as const)('retires an ordinary pending fragment across a $0 discontinuity', async discontinuity => {
+        const { terminalId, term } = await setupPacedPane({ mode: 'codex' })
+        const pump = captureRaf()
+        act(() => { ready(terminalId, 2); deliverOutput('single', terminalId, 1, INCOMPLETE_SGR); pump() })
+        if (discontinuity === 'generation') act(() => { reconnectHandler!(); pump(); ready(terminalId, 1) })
+        else act(() => messageHandler!({ type: 'terminal.output.gap', terminalId, fromSeq: 2, toSeq: 2, reason: 'replay_window_exceeded' }))
+        const before = term.write.mock.calls.length
+        act(() => { deliverOutput('single', terminalId, discontinuity === 'generation' ? 1 : 3, CONTINUATION, 'live'); pump() })
+        expect(term.write.mock.calls.slice(before).map(([data]: [string]) => data).join('')).toBe(CONTINUATION)
+      })
+
+      it('a failed stream write pins later same-generation filtered credit and recovery', async () => {
+        const { terminalId, paneId, term } = await setupPacedPane()
+        const pump = captureRaf()
+        term.write.mockImplementation(() => { throw new Error('surface rejected') })
+        act(() => { ready(terminalId, 2); deliverOutput('single', terminalId, 1, PREFIX); pump(); deliverOutput('single', terminalId, 2, OSC52_ONLY_FRAME); pump() })
+        expect(creditMessages()).toEqual([])
+        expect(readPacedCheckpoint(terminalId, paneId)).toBeNull()
+      })
+
+      it.each(['explicit gap', 'malformed batch', 'stream mismatch'] as const)(
+        'a failed stream write pins target-reaching loss completion until fresh reconstruction (%s)',
+        async loss => {
+          const { store, terminalId, paneId, term } = await setupPacedPane({ mode: 'codex' })
+          const pump = captureRaf()
+          const emulatorCount = terminalInstances.length
+          act(() => { store.dispatch(setConnectionStatus('ready')) })
+          // Charge a recovery attempt before the failure so later successful
+          // same-generation writes cannot silently refund that attempt.
+          act(() => { reconnectHandler!(); pump(); ready(terminalId, 2) })
+          expect(attachMessagesFor(terminalId)).toHaveLength(2)
+          term.write.mockImplementationOnce(() => { throw new Error('accepted surface write rejected') })
+          act(() => { deliverOutput('single', terminalId, 1, PREFIX); pump() })
+          expect(terminalWriteStrings(term).at(-1)).toBe(PREFIX)
+          expect(screen.queryByText('Recovering terminal output...')).not.toBeNull()
+
+          act(() => {
+            if (loss === 'explicit gap') {
+              messageHandler!({ type: 'terminal.output.gap', terminalId, fromSeq: 2, toSeq: 2, reason: 'replay_window_exceeded' })
+            } else if (loss === 'malformed batch') {
+              messageHandler!({
+                type: 'terminal.output.batch', terminalId, source: 'replay',
+                seqStart: 2, seqEnd: 2, data: 'REJECTED', serializedBytes: -1,
+                segments: [{ seqStart: 2, seqEnd: 2, endOffset: 8, rawFrameCount: 1 }],
+              })
+            } else {
+              messageHandler!({ type: 'terminal.output', terminalId, streamId: 'other-stream', seqStart: 2, seqEnd: 2, data: 'REJECTED' })
+            }
+            pump()
+          })
+          // Reporting seq 2 lost does not report or repair seq 1's failed
+          // accepted write, even though the gap reaches the replay target.
+          expect(screen.queryByText('Recovering terminal output...')).not.toBeNull()
+          expect(creditMessages()).toEqual([])
+          expect(readPacedCheckpoint(terminalId, paneId)).toBeNull()
+          act(() => { deliverOutput('single', terminalId, 3, 'LATER-LIVE\r\n', 'live'); pump() })
+          expectTerminalWriteContaining(term, 'LATER-LIVE')
+          expect(creditMessages()).toEqual([])
+          expect(readPacedCheckpoint(terminalId, paneId)).toBeNull()
+
+          const held = holdWrites(term)
+          act(() => { reconnectHandler!(); pump() })
+          expect(reconstructionWrites(term)).toHaveLength(1)
+          expect(held).toHaveLength(1)
+          expect(attachMessagesFor(terminalId)).toHaveLength(2)
+          // Two further admissions consume the remaining budget. The next
+          // attempt is refused while the latest admitted reset still owns
+          // its callback and must be allowed to finish the reconstruction.
+          act(() => { reconnectHandler!(); pump(); reconnectHandler!(); pump() })
+          expect(screen.getByTestId('restore-recovery-retry')).toBeTruthy()
+          expect(attachMessagesFor(terminalId)).toHaveLength(2)
+          act(() => { held.shift()!(); pump() })
+          expect(reconstructionWrites(term)).toHaveLength(2)
+          expect(held).toHaveLength(1)
+          expect(attachMessagesFor(terminalId)).toHaveLength(2)
+          expect(creditMessages()).toEqual([])
+          act(() => { held.shift()!(); pump() })
+          const freshAttach = attachMessagesFor(terminalId).at(-1)
+          expect(attachMessagesFor(terminalId)).toHaveLength(3)
+          expect(freshAttach).toMatchObject({ terminalId, sinceSeq: 0, surfaceReset: true })
+          act(() => {
+            ready(terminalId, 3)
+            messageHandler!({ type: 'terminal.output', terminalId, seqStart: 1, seqEnd: 3, source: 'replay', data: 'REBUILT\r\n' })
+            pump()
+          })
+          expect(held).toHaveLength(1)
+          expect(screen.queryByText('Recovering terminal output...')).not.toBeNull()
+          expect(creditMessages()).toEqual([])
+          expect(readPacedCheckpoint(terminalId, paneId)).toBeNull()
+          act(() => { held.shift()!(); pump() })
+          expect(creditMessages().at(-1)).toMatchObject({ attachRequestId: freshAttach.attachRequestId, consumedSeq: 3 })
+          expect(readPacedCheckpoint(terminalId, paneId)?.surfaceCoverageSeq).toBe(3)
+          expect(screen.queryByText('Recovering terminal output...')).toBeNull()
+          expect(screen.queryByTestId('restore-recovery-retry')).toBeNull()
+          expect(terminalInstances).toHaveLength(emulatorCount)
+          expect(sentMessages().filter(msg => msg?.type === 'terminal.create' || msg?.type === 'terminal.kill')).toEqual([])
+        },
+      )
+
+      const projections = [
+        { name: 'f01-opencode-startup', buffer: 'alternate', mouse: 'any', paste: true, wrap: true, hidden: false },
+        { name: 'f04-alt-fold', buffer: 'alternate', mouse: 'none', paste: false, wrap: true, hidden: false },
+        { name: 'f06-ris', buffer: 'normal', mouse: 'none', paste: false, wrap: true, hidden: true },
+        { name: 'f13-cursor-visibility-restore', buffer: 'normal', mouse: 'none', paste: false, wrap: true, hidden: false },
+        { name: 'f15-empty-tracker', buffer: 'normal', mouse: 'none', paste: false, wrap: true, hidden: false },
+        { name: 'f16-wraparound-disable', buffer: 'normal', mouse: 'vt200', paste: false, wrap: false, hidden: false },
+      ]
+      it.each(projections)('reconstructs the actual emulator before supported $name projection and replay', async projection => {
+        const actual = await vi.importActual<typeof import('@xterm/xterm')>('@xterm/xterm')
+        const emulator = new actual.Terminal({ cols: 80, rows: 24, allowProposedApi: true })
+        const { terminalId, term, pump } = await dirtyPane()
+        const data: string[] = [], titles: string[] = []
+        emulator.onData(value => data.push(value)); emulator.onTitleChange(value => titles.push(value))
+        const realWrite = (bytes: string) => new Promise<void>(done => emulator.write(bytes, done))
+        try {
+          await realWrite('\x1b[?25lOLD\x1b]0;OBSOLETE')
+          term.write.mockImplementation((bytes: string, done?: () => void) => emulator.write(bytes, done))
+          const attachCount = attachMessagesFor(terminalId).length
+          act(() => { reconnectHandler!(); pump() })
+          await waitFor(() => { act(() => pump()); expect(attachMessagesFor(terminalId)).toHaveLength(attachCount + 1) })
+          expect(emulator.buffer.active.cursorX).toBe(0)
+          expect(emulator.buffer.active.cursorY).toBe(0)
+          expect(emulator.buffer.normal.getLine(0)?.translateToString(true)).toBe('')
+          expect(data).toEqual([]); expect(titles).toEqual([])
+          const fixture = JSON.parse(readFileSync(`port/oracle/baselines/mode-preamble/${projection.name}.json`, 'utf8'))
+          act(() => { ready(terminalId, 1); if (fixture.expectedSyncData) messageHandler!({ type: 'terminal.modes.sync', terminalId, data: fixture.expectedSyncData }); deliverOutput('single', terminalId, 1, 'PUBLIC-REPLAY'); pump() })
+          await waitFor(() => { act(() => pump()); expect(creditMessages().at(-1)).toMatchObject({ attachRequestId: latestAttachRequestIdForTerminal(terminalId), consumedSeq: 1 }) })
+          expect(emulator.buffer.active.type).toBe(projection.buffer)
+          expect(emulator.buffer.active.getLine(0)?.translateToString(true)).toBe('PUBLIC-REPLAY')
+          expect(emulator.modes.mouseTrackingMode).toBe(projection.mouse)
+          expect(emulator.modes.bracketedPasteMode).toBe(projection.paste)
+          expect(emulator.modes.wraparoundMode).toBe(projection.wrap)
+          expect(emulator.modes.sendFocusMode).toBe(false)
+          expect(emulator.modes.synchronizedOutputMode).toBe(false)
+          await realWrite('\x1b[?25$p')
+          expect(data.at(-1)).toBe(projection.hidden ? '\x1b[?25;2$y' : '\x1b[?25;1$y')
+        } finally { emulator.dispose() }
+      })
+
+      it('cancels an obsolete DCS payload without emitting its reply during reconstruction', async () => {
+        const actual = await vi.importActual<typeof import('@xterm/xterm')>('@xterm/xterm')
+        const emulator = new actual.Terminal({ cols: 80, rows: 24, allowProposedApi: true })
+        const { terminalId, term, pump } = await dirtyPane()
+        const data: string[] = []
+        emulator.onData(value => data.push(value))
+        try {
+          await new Promise<void>(done => emulator.write('OLD\x1bP$qm', done))
+          term.write.mockImplementation((bytes: string, done?: () => void) => emulator.write(bytes, done))
+          act(() => { reconnectHandler!(); pump() })
+          await waitFor(() => { act(() => pump()); expect(attachMessagesFor(terminalId)).toHaveLength(2) })
+          expect(data).toEqual([])
+          expect(emulator.buffer.active.cursorX).toBe(0)
+        } finally { emulator.dispose() }
+      })
+    })
 
     it('negotiated attaches send replayPageBytes and omit maxReplayBytes (fresh, refresh, and reconnect attaches)', async () => {
       const { store, tabId, paneId, terminalId } = await setupPacedPane({ suffix: 'params' })
@@ -15050,7 +15253,8 @@ describe('terminal.modes.sync (surface-reset mode preamble)', () => {
     expect(second.surfaceReset).toBe(true)
     expect(second.sinceSeq).toBe(0)
     await waitFor(() => {
-      expect(term.clear).toHaveBeenCalled()
+      expect(reconstructionWrites(term)).toHaveLength(1)
+      expect(term.clear).not.toHaveBeenCalled()
     })
   })
 

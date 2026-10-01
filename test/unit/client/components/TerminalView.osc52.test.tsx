@@ -426,6 +426,13 @@ describe('TerminalView OSC52 policy handling', () => {
     clipboardMocks.copyText.mockClear()
     wsMocks.send.mockClear()
 
+    let completeReplay: (() => void) | undefined
+    terminalInstances[0].write.mockImplementation((data: string, callback?: () => void) => {
+      ioEvents.push({ kind: 'write', data })
+      if (data === 'pending replay write') completeReplay = callback
+      else callback?.()
+    })
+
     act(() => {
       messageHandler!({
         type: 'terminal.attach.ready',
@@ -446,6 +453,7 @@ describe('TerminalView OSC52 policy handling', () => {
     await waitFor(() => {
       expect(writeEvents().map((event) => event.data)).toContain('pending replay write')
     })
+    expect(completeReplay).toBeTypeOf('function')
 
     act(() => {
       messageHandler!({
@@ -472,6 +480,9 @@ describe('TerminalView OSC52 policy handling', () => {
       })),
     )
     expect(clipboardMocks.copyText).toHaveBeenCalledWith('copy')
+    expect(writeEvents().map((event) => event.data)).toEqual(['pending replay write'])
+    act(() => completeReplay!())
+    await waitFor(() => expect(writeEvents().map((event) => event.data)).toEqual(['pending replay write', 'live']))
   })
 
   it('ask + Yes copies once and keeps ask policy', async () => {

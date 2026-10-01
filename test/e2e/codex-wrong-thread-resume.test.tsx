@@ -67,6 +67,7 @@ const runtimeHarness = vi.hoisted(() => ({
 
 vi.mock('@/lib/ws-client', () => ({
   getWsClient: () => ({
+    isReady: true,
     send: wsHarness.send,
     connect: wsHarness.connect,
     onMessage: wsHarness.onMessage,
@@ -279,6 +280,15 @@ describe('codex wrong-thread resume e2e', () => {
       sessionRef: { provider: 'codex', sessionId: 'thread-new' },
     })
 
+    const term = runtimeHarness.terminals[0]
+    let completeReset: (() => void) | undefined
+    term.write.mockImplementation((data: string, callback?: () => void) => {
+      if (data === '\x18\x1bc\x1b[?25h') completeReset = callback
+      else callback?.()
+    })
+    act(() => term.emitData('queued'))
+    expect(sentMessages().some((msg) => msg?.type === 'terminal.input' && msg.terminalId === 'term-old')).toBe(false)
+
     act(() => {
       wsHarness.emit({
         type: 'terminal.created',
@@ -287,16 +297,26 @@ describe('codex wrong-thread resume e2e', () => {
       })
     })
 
+    await waitFor(() => expect(completeReset).toBeTypeOf('function'))
+    expect(sentMessages().some((msg) => msg?.type === 'terminal.attach' && msg.terminalId === 'term-new')).toBe(false)
+    expect((findLeaf(store.getState().panes.layouts['tab-1'], 'pane-1')?.content as TerminalPaneContent).terminalId).toBe('term-new')
+    act(() => completeReset!())
+
     await waitFor(() => {
       expect(sentMessages().some((msg) => msg?.type === 'terminal.attach' && msg.terminalId === 'term-new')).toBe(true)
     })
 
-    const term = runtimeHarness.terminals[0]
     act(() => {
       term.emitData('hello')
     })
 
     expect(sentMessages().some((msg) => msg?.type === 'terminal.input' && msg.terminalId === 'term-old')).toBe(false)
+    expect(sentMessages()).toContainEqual({
+      type: 'terminal.input',
+      terminalId: 'term-new',
+      data: 'queued',
+      expectedSessionRef: { provider: 'codex', sessionId: 'thread-new' },
+    })
     expect(sentMessages()).toContainEqual({
       type: 'terminal.input',
       terminalId: 'term-new',
