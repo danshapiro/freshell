@@ -101,7 +101,9 @@ fn sessions_router_state(
         broadcast_tx: Arc::new(tx),
         terminals_revision: Arc::new(std::sync::atomic::AtomicI64::new(0)),
         sessions_revision: Arc::new(std::sync::atomic::AtomicI64::new(0)),
-        ai_key: crate::ai_title::AiKeyCell::init(None, None),
+        name_auth: crate::ai_title::GeminiSessionNameAuth::direct_for_test(
+            crate::ai_title::AiKeyCell::init(None, None),
+        ),
         gemini: Arc::new(FakeGemini(Err("unused".into()))),
         metadata,
         index: None,

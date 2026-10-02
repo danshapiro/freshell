@@ -314,7 +314,10 @@ fn generator_with(
 ) -> Arc<SessionNameGenerator> {
     Arc::new(SessionNameGenerator::new(
         settings_for(dir),
-        AiKeyCell::init(key.map(str::to_string), None),
+        crate::ai_title::GeminiSessionNameAuth::direct_for_test(AiKeyCell::init(
+            key.map(str::to_string),
+            None,
+        )),
         transport,
     ))
 }
@@ -577,7 +580,10 @@ async fn releasing_the_gated_http_fixture_saves_a_short_ai_name() {
     let fixture = start_gated_http_gemini("Sardine crash investigation").await;
     let generator = Arc::new(SessionNameGenerator::new(
         settings_for(dir.path()),
-        AiKeyCell::init(Some("gen-key".to_string()), None),
+        crate::ai_title::GeminiSessionNameAuth::direct_for_test(AiKeyCell::init(
+            Some("gen-key".to_string()),
+            None,
+        )),
         fixture.transport("gen-key"),
     ));
     let target = pending("h-http");
@@ -1274,7 +1280,7 @@ async fn capability_pause_consumes_nothing_and_resumes_on_the_wake() {
     let generation_transport = CountingTransport::new("Woke AI name");
     let generator = Arc::new(SessionNameGenerator::new(
         settings_for(dir.path()),
-        cell.clone(),
+        crate::ai_title::GeminiSessionNameAuth::direct_for_test(cell.clone()),
         generation_transport.clone(),
     ));
 
@@ -2353,7 +2359,10 @@ async fn the_worker_alternates_native_and_generation_under_sustained_native_requ
 
     let generator = Arc::new(SessionNameGenerator::new(
         settings_for(dir.path()),
-        AiKeyCell::init(Some("alt-key".to_string()), None),
+        crate::ai_title::GeminiSessionNameAuth::direct_for_test(AiKeyCell::init(
+            Some("alt-key".to_string()),
+            None,
+        )),
         Arc::new(LoggingGeneration {
             order: Arc::clone(&order),
         }),
@@ -2463,7 +2472,11 @@ async fn run_worker_child_role(role: &str, dir: &Path) {
         "failing_worker" => (FailingTransport::new(), Arc::new(NoRouteNative)),
         other => panic!("unknown child role {other}"),
     };
-    let generator = Arc::new(SessionNameGenerator::new(settings, cell, transport));
+    let generator = Arc::new(SessionNameGenerator::new(
+        settings,
+        crate::ai_title::GeminiSessionNameAuth::direct_for_test(cell),
+        transport,
+    ));
     let worker = SessionNameWorker::start(store, native, generator);
     let deadline = std::time::Instant::now() + Duration::from_secs(120);
     while !stop_path.exists() {

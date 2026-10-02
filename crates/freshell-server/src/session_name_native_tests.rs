@@ -1118,7 +1118,9 @@ fn inert_generation(
     }
     Arc::new(crate::session_name_generation::SessionNameGenerator::new(
         crate::settings_store::SettingsStore::load(Some(dir), vec![]),
-        crate::ai_title::AiKeyCell::init(None, None),
+        crate::ai_title::GeminiSessionNameAuth::direct_for_test(crate::ai_title::AiKeyCell::init(
+            None, None,
+        )),
         Arc::new(NeverTransport),
     ))
 }
@@ -2039,7 +2041,9 @@ async fn an_opencode_native_series_resumes_when_the_shared_serve_arrives_after_b
     ));
     let generator = Arc::new(crate::session_name_generation::SessionNameGenerator::new(
         crate::settings_store::SettingsStore::load(Some(dir.path()), vec![]),
-        crate::ai_title::AiKeyCell::init(None, None),
+        crate::ai_title::GeminiSessionNameAuth::direct_for_test(crate::ai_title::AiKeyCell::init(
+            None, None,
+        )),
         Arc::new(NeverGemini) as Arc<dyn crate::ai_title::GeminiTransport>,
     ));
     let worker = super::SessionNameWorker::start(Arc::clone(&store), dispatch, generator);
