@@ -83,7 +83,7 @@ it('accepts either configured model name and rejects a generic banner', () => {
 
 - [ ] **Step 2: Run the focused Cloud Vitest test and confirm the intended failure**
 
-Run: FRESHELL_VITEST_BACKEND=cloud pnpm run test:vitest run test/unit/tooling/testing/opencode-native-history.test.ts --config config/vitest/vitest.config.ts
+Run: FRESHELL_VITEST_BACKEND=cloud GCLOUD_ROBOT_REQUIRE=1 pnpm run test:cloud --config=default test/unit/tooling/testing/opencode-native-history.test.ts
 
 Expected: FAIL at the existing free-tier-banner assertion because the helper accepts any rendered Build text. The positive GPT-5.6 Luna case must pass; setup, config loading, and unrelated tests must not be the reason for failure.
 
@@ -97,11 +97,11 @@ In runtime-opencode-provider-qualification-rust.spec.ts, pass both configured mo
 
 - [ ] **Step 4: Re-run the focused test and the affected browser qualification**
 
-Run: FRESHELL_VITEST_BACKEND=cloud pnpm run test:vitest run test/unit/tooling/testing/opencode-native-history.test.ts --config config/vitest/vitest.config.ts
+Run: FRESHELL_VITEST_BACKEND=cloud GCLOUD_ROBOT_REQUIRE=1 pnpm run test:cloud --config=default test/unit/tooling/testing/opencode-native-history.test.ts
 
 Expected: PASS, including the generic free-tier banner negative, ANSI-colored valid prompt, current GPT-5.6 Luna prompt, and existing mode boundaries.
 
-Run: pnpm run test:e2e:chromium test/e2e-browser/specs/runtime-opencode-provider-qualification-rust.spec.ts
+Run: FRESHELL_RUNTIME_OPENCODE_QUALIFICATION_LIVE=1 pnpm run test:e2e:chromium test/e2e-browser/specs/runtime-opencode-provider-qualification-rust.spec.ts
 
 Expected: PASS locally against the Docker-backed qualification, with both source and rendered browser readiness requiring GPT-5.6 Luna and bracketed paste enabled. This spec is local-only in the Cloud E2E config.
 
@@ -394,7 +394,7 @@ Expected: PASS with a selected OneCLI route case, no direct key on the configure
 
 - [ ] Re-run the affected local-only OpenCode qualification after all code changes:
 
-Run: pnpm run test:e2e:chromium test/e2e-browser/specs/runtime-opencode-provider-qualification-rust.spec.ts
+Run: FRESHELL_RUNTIME_OPENCODE_QUALIFICATION_LIVE=1 pnpm run test:e2e:chromium test/e2e-browser/specs/runtime-opencode-provider-qualification-rust.spec.ts
 
 Expected: PASS; the browser qualification is excluded from Cloud E2E because its Docker supervisor is local-only.
 
@@ -405,7 +405,7 @@ Expected: PASS; the browser qualification is excluded from Cloud E2E because its
 - The complete dispatcher-authored User Request block is copied unchanged once above; all six active obligations are assigned to tasks or gates: OneCLI-first auth, existing-key fallback when route is absent or explicitly unconnected, no fallback on other authorization/policy failures, both Codex user-message record shapes, OpenCode readiness repair, and a green suite before naming/parser work plus a final complete gate.
 - The OneCLI transport is session-name-specific; terminal summary callers keep the existing direct transport. The new e2e proxy uses only synthetic credentials and local traffic. The exact OneCLI missing response codes are durably recorded in run-state before the plan commit.
 - The session-name route detector mirrors reqwest's effective scheme and ALL proxy selection, variable precedence, CGI disabling, and NO_PROXY host bypass semantics; the browser route case proves proxy routing and shared-name presentation, while parser coverage is independently provided by fixture parity and CodexSource indexing.
-- The OpenCode unit and browser contracts share one visible model predicate, accept the configured display label or pinned model ID, preserve final bracketed-paste mode, ANSI output, and free-tier rejection, and the full Cloud Vitest checkpoint blocks later tasks.
+- The OpenCode unit and browser contracts share one visible model predicate, accept the configured display label or pinned model ID, preserve final bracketed-paste mode, ANSI output, and free-tier rejection. Both focused unit commands use `test:cloud`, and both local live-qualification commands set `FRESHELL_RUNTIME_OPENCODE_QUALIFICATION_LIVE=1`; the full Cloud Vitest checkpoint blocks later tasks.
 - Codex parsing uses the existing text cleaning and title helpers; fixture parity and CodexSource scanning prove the prompt reaches IndexedSession, the value already consumed by the naming sweep.
 - The two allowed OneCLI errors are exact JSON error-field matches. access_restricted, approval_required, generic status failures, transport/TLS failures, malformed response bodies, and a missing direct key have no key retry. No proxy route selects the existing direct-key source and precedence.
 - The plan adds no dependency, changes no data format or migration, and adds no end-user setting. Structured fallback logging omits credentials, prompt, proxy URL, and response body.
