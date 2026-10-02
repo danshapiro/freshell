@@ -363,4 +363,215 @@ mod tests {
             .unwrap();
         assert_eq!(title.as_deref(), Some("Flux repair"));
     }
+
+    #[test]
+    fn onecli_route_detection_matches_effective_reqwest_proxy() {
+        let https_gemini = "https://generativelanguage.googleapis.com/v1beta";
+        let http_gemini = "http://generativelanguage.googleapis.com/v1beta";
+        let route = |base_url: &str, env: &GeminiProxyEnvironment| {
+            GeminiSessionNameAuth::route_for(base_url, env)
+        };
+        let env = |https: Option<&str>, http: Option<&str>, all: Option<&str>, no: Option<&str>, cgi| {
+            GeminiProxyEnvironment::literal(https, http, all, no, cgi)
+        };
+
+        assert_eq!(
+            route(
+                https_gemini,
+                &env(Some("http://aoc_fixture@127.0.0.1:10255"), None, None, None, false),
+            ),
+            GeminiCredentialRoute::OneCliProxy,
+        );
+        assert_eq!(
+            route(
+                http_gemini,
+                &env(None, Some("http://aoc_fixture@127.0.0.1:10255"), None, None, false),
+            ),
+            GeminiCredentialRoute::OneCliProxy,
+        );
+        assert_eq!(
+            route(
+                https_gemini,
+                &env(None, None, Some("http://aoc_fixture@127.0.0.1:10255"), None, false),
+            ),
+            GeminiCredentialRoute::OneCliProxy,
+        );
+        assert_eq!(
+            route(
+                https_gemini,
+                &env(
+                    Some("http://ordinary-proxy.example:8080"),
+                    None,
+                    Some("http://aoc_fixture@127.0.0.1:10255"),
+                    None,
+                    false,
+                ),
+            ),
+            GeminiCredentialRoute::Direct,
+            "a valid scheme-specific proxy takes precedence over ALL_PROXY",
+        );
+        assert_eq!(
+            route(
+                https_gemini,
+                &env(
+                    Some("not a proxy"),
+                    None,
+                    Some("http://aoc_fixture@127.0.0.1:10255"),
+                    None,
+                    false,
+                ),
+            ),
+            GeminiCredentialRoute::OneCliProxy,
+            "an unparseable scheme-specific proxy falls back to ALL_PROXY",
+        );
+
+        for no_proxy in [
+            "generativelanguage.googleapis.com",
+            ".googleapis.com",
+            "*",
+        ] {
+            assert_eq!(
+                route(
+                    https_gemini,
+                    &env(
+                        Some("http://aoc_fixture@127.0.0.1:10255"),
+                        None,
+                        None,
+                        Some(no_proxy),
+                        false,
+                    ),
+                ),
+                GeminiCredentialRoute::Direct,
+                "NO_PROXY entry {no_proxy:?} bypasses the proxy",
+            );
+        }
+        assert_eq!(
+            route(
+                https_gemini,
+                &env(
+                    Some("http://aoc_fixture@127.0.0.1:10255"),
+                    None,
+                    None,
+                    Some("notgoogleapis.com"),
+                    false,
+                ),
+            ),
+            GeminiCredentialRoute::OneCliProxy,
+            "a nonmatching domain must not bypass the proxy",
+        );
+        assert_eq!(
+            route(
+                https_gemini,
+                &env(
+                    Some("http://aoc_fixture@127.0.0.1:10255"),
+                    None,
+                    None,
+                    None,
+                    true,
+                ),
+            ),
+            GeminiCredentialRoute::Direct,
+            "REQUEST_METHOD disables environment proxies",
+        );
+        assert_eq!(
+            first_present(Some(""), Some("http://aoc_fixture@127.0.0.1:10255")),
+            Some(""),
+            "an empty uppercase variable still wins over lowercase",
+        );
+    }
+
+    #[tokio::test]
+    async fn direct_session_name_route_uses_existing_key_when_onecli_proxy_is_absent() {
+        use axum::{routing::post, Json, Router};
+        use std::sync::{Arc, Mutex};
+
+        let observed_keys = Arc::new(Mutex::new(Vec::new()));
+        let observed = Arc::clone(&observed_keys);
+        let app = Router::new().route(
+            "/v1beta/models/gemini-3.5-flash-lite:generateContent",
+            post(move |headers: axum::http::HeaderMap, Json(_body): Json<serde_json::Value>| {
+                let observed = Arc::clone(&observed);
+                async move {
+                    observed.lock().unwrap().push(
+                        headers
+                            .get("x-goog-api-key")
+                            .and_then(|value| value.to_str().ok())
+                            .map(str::to_string),
+                    );
+                    Json(serde_json::json!({
+                        "candidates": [{ "content": { "parts": [{ "text": "Flux repair" }] } }]
+                    }))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let key_cell = AiKeyCell::init(Some("synthetic-direct-key".into()), None);
+        let auth = GeminiSessionNameAuth {
+            direct_key: key_cell,
+            route: GeminiCredentialRoute::Direct,
+        };
+        assert_eq!(auth.route(), GeminiCredentialRoute::Direct);
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let http = GeminiSessionNameHttp::new(
+            client,
+            auth,
+            format!("http://{addr}/v1beta"),
+        );
+        let title = http
+            .generate_content("hello world".into(), SESSION_TITLE_MAX_OUTPUT_TOKENS)
+            .await
+            .unwrap();
+
+        assert_eq!(title, "Flux repair");
+        assert_eq!(
+            *observed_keys.lock().unwrap(),
+            vec![Some("synthetic-direct-key".to_string())],
+        );
+    }
+
+    #[tokio::test]
+    async fn session_name_onecli_route_omits_direct_key() {
+        use axum::{routing::post, Json, Router};
+        use std::sync::{Arc, Mutex};
+
+        let observed_keys = Arc::new(Mutex::new(Vec::new()));
+        let observed = Arc::clone(&observed_keys);
+        let app = Router::new().route(
+            "/v1beta/models/gemini-3.5-flash-lite:generateContent",
+            post(move |headers: axum::http::HeaderMap, Json(_body): Json<serde_json::Value>| {
+                let observed = Arc::clone(&observed);
+                async move {
+                    observed.lock().unwrap().push(headers.contains_key("x-goog-api-key"));
+                    Json(serde_json::json!({
+                        "candidates": [{ "content": { "parts": [{ "text": "Flux repair" }] } }]
+                    }))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let key_cell = AiKeyCell::init(Some("synthetic-direct-key".into()), None);
+        let auth = GeminiSessionNameAuth {
+            direct_key: key_cell,
+            route: GeminiCredentialRoute::OneCliProxy,
+        };
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let http = GeminiSessionNameHttp::new(
+            client,
+            auth,
+            format!("http://{addr}/v1beta"),
+        );
+        let title = http
+            .generate_content("hello world".into(), SESSION_TITLE_MAX_OUTPUT_TOKENS)
+            .await
+            .unwrap();
+
+        assert_eq!(title, "Flux repair");
+        assert_eq!(*observed_keys.lock().unwrap(), vec![false]);
+    }
 }

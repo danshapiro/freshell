@@ -58,6 +58,18 @@ export interface FakeGemini {
   release: () => void
 }
 
+export interface FakeOneCliGeminiProxy {
+  /** Ephemeral fixture setting used only to configure the owned test server. */
+  proxyUrl: string
+  requests: Array<{
+    destinationHostname: string
+    path: string
+    hasApiKey: boolean
+    promptContainsExpectedFirstMessage: boolean
+  }>
+  close: () => Promise<void>
+}
+
 /** A local fake Gemini answering the Rust-only FRESHELL_GEMINI_BASE_URL seam
  * (auto-title-rust.spec.ts's pattern): deterministic short names, an
  * optional hold for the late-generation races. */
@@ -100,6 +112,62 @@ export async function startFakeGemini(replyText: string, opts?: { hold?: boolean
     requests,
     hold: held,
     release: () => { held = false },
+    close: () => new Promise<void>((resolve) => server.close(() => resolve())),
+  }
+}
+
+/** Local HTTP proxy with a synthetic OneCLI authorization marker. It records
+ * only safe request observations; request bodies and authorization values are
+ * discarded after checking the expected prompt. */
+export async function startFakeOneCliGeminiProxy(
+  replyText: string,
+  expectedFirstMessage: string,
+): Promise<FakeOneCliGeminiProxy> {
+  const requests: FakeOneCliGeminiProxy['requests'] = []
+  const server = http.createServer((req, res) => {
+    let body = ''
+    req.on('data', (chunk: Buffer) => { body += chunk.toString() })
+    req.on('end', () => {
+      let destination: URL | undefined
+      try {
+        destination = new URL(req.url ?? '', `http://${req.headers.host ?? 'localhost'}`)
+      } catch {
+        destination = undefined
+      }
+      let promptContainsExpectedFirstMessage = false
+      try {
+        const parsed = JSON.parse(body) as {
+          contents?: Array<{ parts?: Array<{ text?: unknown }> }>
+        }
+        const prompt = parsed.contents?.flatMap((content) => content.parts ?? [])
+          .map((part) => typeof part.text === 'string' ? part.text : '')
+          .join('\n') ?? ''
+        promptContainsExpectedFirstMessage = prompt.includes(expectedFirstMessage)
+      } catch {
+        // The observation stays false for malformed or non-JSON requests.
+      }
+
+      requests.push({
+        destinationHostname: destination?.hostname.toLowerCase() ?? '',
+        path: destination ? `${destination.pathname}${destination.search}` : '',
+        hasApiKey: typeof req.headers['x-goog-api-key'] === 'string',
+        promptContainsExpectedFirstMessage,
+      })
+
+      if (req.method === 'POST' && destination?.pathname === GEMINI_GENERATE_PATH) {
+        res.writeHead(200, { 'content-type': 'application/json' })
+        res.end(JSON.stringify({ candidates: [{ content: { parts: [{ text: replyText }] } }] }))
+      } else {
+        res.writeHead(404, { 'content-type': 'application/json' })
+        res.end('{}')
+      }
+    })
+  })
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve))
+  const port = (server.address() as AddressInfo).port
+  return {
+    proxyUrl: `http://aoc_test_marker@127.0.0.1:${port}`,
+    requests,
     close: () => new Promise<void>((resolve) => server.close(() => resolve())),
   }
 }
