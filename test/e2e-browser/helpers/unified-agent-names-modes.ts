@@ -264,9 +264,15 @@ export async function activityGeneratesOneSharedShortNameViaOneCliProxy(
     await sendFirstMessage(page, harness, handle, mode, expectedFirstMessage)
     handle = await refreshHandle(harness, handle, mode)
     expect(handle.nameRef).toBeTruthy()
+    const durableSessionId = handle.sessionId
+      ?? (handle.nameRef?.kind === 'session' ? handle.nameRef.sessionId : undefined)
+    if (mode === 'freshcodex') {
+      expect(durableSessionId, 'the fresh Codex OneCLI journey needs a durable session ID for the sidebar assertion').toBeTruthy()
+    }
 
     await expectSharedName(harness, handle.nameRef!, AI_NAME, {
-      page, server: journey.server, tabId: handle.tabId, sessionId: handle.sessionId,
+      page, server: journey.server, tabId: handle.tabId,
+      sessionId: mode === 'freshcodex' ? durableSessionId : handle.sessionId,
     })
     expect(proxy.requests).toEqual([{
       destinationHostname: 'generativelanguage.googleapis.com',

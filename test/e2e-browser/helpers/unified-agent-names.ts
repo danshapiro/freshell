@@ -166,7 +166,7 @@ export async function startFakeOneCliGeminiProxy(
   await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve))
   const port = (server.address() as AddressInfo).port
   return {
-    proxyUrl: `http://aoc_test_marker@127.0.0.1:${port}`,
+    proxyUrl: `http://%61oc_test_marker@127.0.0.1:${port}`,
     requests,
     close: () => new Promise<void>((resolve) => server.close(() => resolve())),
   }

@@ -767,6 +767,22 @@ mod tests {
         assert!(!GeminiSessionNameAuth::direct_for_test(no_key).enabled());
     }
 
+    #[test]
+    fn onecli_route_detection_decodes_encoded_proxy_username_and_password() {
+        let https_gemini = "https://generativelanguage.googleapis.com/v1beta";
+        for proxy in [
+            "http://%61oc_fixture@127.0.0.1:10255",
+            "http://proxy:%61oc_fixture@127.0.0.1:10255",
+        ] {
+            let environment = GeminiProxyEnvironment::literal(Some(proxy), None, None, None, false);
+            assert_eq!(
+                GeminiSessionNameAuth::route_for(https_gemini, &environment),
+                GeminiCredentialRoute::OneCliProxy,
+                "a percent-encoded OneCLI marker in either proxy credential selects the proxy route",
+            );
+        }
+    }
+
     #[tokio::test]
     async fn direct_session_name_route_uses_existing_key_when_onecli_proxy_is_absent() {
         use axum::{routing::post, Json, Router};
