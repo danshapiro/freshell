@@ -411,10 +411,47 @@ fn parse_proxy(proxy: &str) -> Option<bool> {
         .split_once('@')
         .map(|(userinfo, _host_port)| userinfo);
     Some(userinfo.is_some_and(|userinfo| {
-        userinfo
-            .split([':', '@'])
-            .any(|component| component.starts_with("aoc_"))
+        let (username, password) = userinfo
+            .split_once(':')
+            .map_or((userinfo, None), |(username, password)| {
+                (username, Some(password))
+            });
+        decode_proxy_credential(username).starts_with("aoc_")
+            || password
+                .is_some_and(|password| decode_proxy_credential(password).starts_with("aoc_"))
     }))
+}
+
+/// Decode URI userinfo the way the locked hyper-util proxy matcher does:
+/// valid `%HH` sequences become bytes, malformed sequences remain literal,
+/// plus signs are unchanged, and invalid UTF-8 is replaced lossily.
+fn decode_proxy_credential(value: &str) -> String {
+    let encoded = value.as_bytes();
+    let mut decoded = Vec::with_capacity(encoded.len());
+    let mut index = 0;
+    while index < encoded.len() {
+        if encoded[index] == b'%' && index + 2 < encoded.len() {
+            if let (Some(high), Some(low)) =
+                (hex_value(encoded[index + 1]), hex_value(encoded[index + 2]))
+            {
+                decoded.push((high << 4) | low);
+                index += 3;
+                continue;
+            }
+        }
+        decoded.push(encoded[index]);
+        index += 1;
+    }
+    String::from_utf8_lossy(&decoded).into_owned()
+}
+
+fn hex_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
 }
 
 fn extract_candidate_text(value: &serde_json::Value) -> String {
