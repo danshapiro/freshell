@@ -5,7 +5,7 @@ import os from 'node:os'
 import path from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
-import { nativeTurnProof, openCodeTerminalReady, selectNativeAssistantTurn } from '../../../e2e-browser/helpers/opencode-native-history.js'
+import { hasOpenCodePromptModelText, nativeTurnProof, openCodeTerminalReady, selectNativeAssistantTurn } from '../../../e2e-browser/helpers/opencode-native-history.js'
 import { readOpenCodeNativeHistory } from '../../../e2e-browser/helpers/provider-native-history/opencode.js'
 
 let root: string
@@ -95,18 +95,33 @@ describe('live recovery proves new native assistant responses, never TUI echo or
 
 describe('resumed OpenCode readiness is an input-mode signal, not a home-screen placeholder', () => {
   it('recognizes a resumed conversation that renders no Ask anything placeholder', () => {
-    expect(openCodeTerminalReady('\x1b[?2004h\x1b[24;1HBuild  Big Pickle  OpenCode Zen')).toBe(true)
+    expect(openCodeTerminalReady('\x1b[?2004h\x1b[24;1HBuild  Big Pickle  OpenCode Zen', ['Big Pickle'])).toBe(true)
   })
 
   it('does not treat echoed text or a disabled input mode as a ready TUI', () => {
-    expect(openCodeTerminalReady('Build Big Pickle')).toBe(false)
-    expect(openCodeTerminalReady('\x1b[?2004hBuild Big Pickle\x1b[?2004l')).toBe(false)
-    expect(openCodeTerminalReady('\x1b[?2004h')).toBe(false)
-    expect(openCodeTerminalReady('')).toBe(false)
+    expect(openCodeTerminalReady('Build Big Pickle', ['Big Pickle'])).toBe(false)
+    expect(openCodeTerminalReady('\x1b[?2004hBuild Big Pickle\x1b[?2004l', ['Big Pickle'])).toBe(false)
+    expect(openCodeTerminalReady('\x1b[?2004h', ['Big Pickle'])).toBe(false)
+    expect(openCodeTerminalReady('', ['Big Pickle'])).toBe(false)
   })
 
   it('keeps the free-tier model banner part of readiness and handles ANSI styling', () => {
-    expect(openCodeTerminalReady('\x1b[?2004hBuild Expensive model')).toBe(false)
-    expect(openCodeTerminalReady('\x1b[?2004h\x1b[32mBuild\x1b[0m \x1b[31mBig Pickle\x1b[0m')).toBe(true)
+    expect(openCodeTerminalReady('\x1b[?2004hBuild Expensive model', ['Big Pickle'])).toBe(false)
+    expect(openCodeTerminalReady('\x1b[?2004h\x1b[32mBuild\x1b[0m \x1b[31mBig Pickle\x1b[0m', ['Big Pickle'])).toBe(true)
+  })
+
+  it('accepts either configured model name and rejects a generic banner', () => {
+    const modelTexts = ['GPT-5.6 Luna', 'openai/gpt-5.6-luna']
+    expect(openCodeTerminalReady('\x1b[?2004h\x1b[24;1HBuild  GPT-5.6 Luna  OpenCode Zen', modelTexts)).toBe(true)
+    expect(openCodeTerminalReady('\x1b[?2004h\x1b[24;1HBuild openai/gpt-5.6-luna', modelTexts)).toBe(true)
+    expect(openCodeTerminalReady('\x1b[?2004hBuild Expensive model', modelTexts)).toBe(false)
+  })
+
+  it('requires a non-empty configured model on the Build header line', () => {
+    const modelTexts = ['GPT-5.6 Luna', 'openai/gpt-5.6-luna']
+    expect(hasOpenCodePromptModelText('Build  GPT-5.6 Luna  OpenCode Zen', modelTexts)).toBe(true)
+    expect(hasOpenCodePromptModelText('Build generic banner\nGPT-5.6 Luna', modelTexts)).toBe(false)
+    expect(hasOpenCodePromptModelText('Build GPT-5.6 Luna', ['', ''])).toBe(false)
+    expect(openCodeTerminalReady('\x1b[?2004hBuild GPT-5.6 Luna', [])).toBe(false)
   })
 })

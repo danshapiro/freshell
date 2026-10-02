@@ -25,7 +25,7 @@ import {
 import { openPanePicker } from '../helpers/pane-picker.js'
 import { TerminalHelper } from '../helpers/terminal-helpers.js'
 import { TestHarness } from '../helpers/test-harness.js'
-import { nativeTurnProof, openCodeTerminalReady, selectNativeAssistantTurn, type NativeAssistantTurn } from '../helpers/opencode-native-history.js'
+import { hasOpenCodePromptModelText, nativeTurnProof, openCodeTerminalReady, selectNativeAssistantTurn, type NativeAssistantTurn } from '../helpers/opencode-native-history.js'
 import type { ProviderQualificationRow } from '../../../scripts/testing/provider-qualification-receipt.js'
 
 function leavesByMode(node: any, mode: string): any[] {
@@ -210,6 +210,7 @@ async function waitForReplacementPrompt(
 ): Promise<void> {
   const terminalId = view.terminalId
   if (!terminalId) throw new Error('replacement provider has no terminal identity')
+  const modelTexts = ['GPT-5.6 Luna', P2_OPENCODE_MODEL]
   let diagnostic: Record<string, unknown> = { soulId: view.soulId, incarnationId: view.incarnationId, terminalId }
   let sourceEpoch = ''
   let cursor = 0
@@ -237,8 +238,9 @@ async function waitForReplacementPrompt(
       sourceText = (sourceText + frame.data).slice(-512 * 1024)
       cursor = Math.max(cursor, frame.seqEnd)
     }
-    diagnostic = { ...diagnostic, sourceReady: openCodeTerminalReady(sourceText), cursor }
-    if (!openCodeTerminalReady(sourceText)) return null
+    const sourceReady = openCodeTerminalReady(sourceText, modelTexts)
+    diagnostic = { ...diagnostic, sourceReady, cursor }
+    if (!sourceReady) return null
     const leaf = leavesByMode(await harness.getPaneLayout(tabId), 'opencode').find((row) => row.id === paneId)
     diagnostic = { ...diagnostic, paneStreamId: leaf?.content?.streamId, paneIncarnationId: leaf?.content?.incarnationId }
     if (leaf?.content?.streamId !== sourceEpoch || leaf?.content?.incarnationId !== view.incarnationId) return null
@@ -246,8 +248,9 @@ async function waitForReplacementPrompt(
       const h = window.__FRESHELL_TEST_HARNESS__
       return { text: h?.getTerminalBuffer(terminalId), modes: h?.getTerminalModes?.(terminalId) }
     }, terminalId)
-    diagnostic = { ...diagnostic, browserInputReady: rendered.modes?.bracketedPasteMode, browserModelBanner: rendered.text?.includes('GPT-5.6 Luna') }
-    if (!rendered.text?.includes('Build') || !rendered.modes?.bracketedPasteMode) return null
+    const browserModelBanner = hasOpenCodePromptModelText(rendered.text ?? '', modelTexts)
+    diagnostic = { ...diagnostic, browserInputReady: rendered.modes?.bracketedPasteMode, browserModelBanner }
+    if (!browserModelBanner || !rendered.modes?.bracketedPasteMode) return null
     rig.runtime.assert('PC-OPENCODE', true, 'replacement TUI prompt is source-observed and rendered before input', {
       soulId: view.soulId, incarnationId: view.incarnationId, terminalId: view.terminalId, streamEpoch: sourceEpoch, cursor,
     })
