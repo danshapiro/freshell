@@ -294,6 +294,14 @@ impl GeminiSessionNameAuth {
             route: GeminiCredentialRoute::Direct,
         }
     }
+
+    #[cfg(test)]
+    pub(crate) fn onecli_for_test(direct_key: AiKeyCell) -> Self {
+        Self {
+            direct_key,
+            route: GeminiCredentialRoute::OneCliProxy,
+        }
+    }
 }
 
 /// Name-specific Gemini transport. Unlike [`GeminiHttp`], it leaves the
@@ -325,6 +333,7 @@ impl GeminiTransport for GeminiSessionNameHttp {
             GeminiCredentialRoute::Direct => self.auth.direct_key(),
             GeminiCredentialRoute::OneCliProxy => None,
         };
+        let fallback_key = self.auth.direct_key();
         let route = self.auth.route;
         let url = format!(
             "{}/models/{GEMINI_MODEL}:generateContent",
@@ -335,17 +344,50 @@ impl GeminiTransport for GeminiSessionNameHttp {
                 return Err("no gemini api key".to_string());
             }
             let request =
-                build_gemini_request(&client, &url, prompt, max_output_tokens, direct_key)?;
-            send_gemini_request(request).await.map_err(|reason| {
-                if reason.starts_with("gemini http ") {
-                    reason
-                } else {
-                    // reqwest errors can include details from its proxy
-                    // connection. The naming worker logs returned errors, so
-                    // keep those details out of diagnostics.
-                    "gemini request failed".to_string()
+                build_gemini_request(&client, &url, prompt.clone(), max_output_tokens, direct_key)?;
+            let response = request
+                .send()
+                .await
+                .map_err(|_| "gemini request failed".to_string())?;
+            let status = response.status();
+
+            if !status.is_success() {
+                // Only an explicit structured OneCLI credential error can
+                // authorize the one direct-key retry. A status by itself,
+                // unreadable body, or any other response remains an error.
+                let body = response
+                    .bytes()
+                    .await
+                    .map_err(|_| format!("gemini http {status}"))?;
+                if route == GeminiCredentialRoute::OneCliProxy {
+                    if let (Some(classification), Some(key)) = (
+                        classify_onecli_credential_error(status, &body),
+                        fallback_key.filter(|key| !key.is_empty()),
+                    ) {
+                        tracing::debug!(
+                            target: "freshell_server::ai_title",
+                            operation = "onecli_direct_key_fallback",
+                            classification,
+                            "ai_title.onecli_direct_key_fallback"
+                        );
+                        let retry = build_gemini_request(
+                            &client,
+                            &url,
+                            prompt,
+                            max_output_tokens,
+                            Some(key),
+                        )?;
+                        return send_gemini_request(retry)
+                            .await
+                            .map_err(safe_session_name_request_error);
+                    }
                 }
-            })
+                return Err(format!("gemini http {status}"));
+            }
+
+            parse_gemini_success_response(response)
+                .await
+                .map_err(safe_session_name_request_error)
         })
     }
 }
@@ -380,9 +422,42 @@ async fn send_gemini_request(request: reqwest::RequestBuilder) -> Result<String,
     if !status.is_success() {
         return Err(format!("gemini http {status}"));
     }
+    parse_gemini_success_response(response).await
+}
+
+async fn parse_gemini_success_response(response: reqwest::Response) -> Result<String, String> {
     let bytes = response.bytes().await.map_err(|e| e.to_string())?;
     let value: serde_json::Value = serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
     Ok(extract_candidate_text(&value))
+}
+
+/// Return the OneCLI classification that permits direct-key fallback. This
+/// deliberately ignores HTTP status classes and accepts only the two exact
+/// top-level JSON error values from a non-success response.
+fn classify_onecli_credential_error(
+    status: reqwest::StatusCode,
+    body: &[u8],
+) -> Option<&'static str> {
+    if status.is_success() {
+        return None;
+    }
+    let value: serde_json::Value = serde_json::from_slice(body).ok()?;
+    match value.get("error")?.as_str()? {
+        "credential_not_found" => Some("credential_not_found"),
+        "app_not_connected" => Some("app_not_connected"),
+        _ => None,
+    }
+}
+
+fn safe_session_name_request_error(reason: String) -> String {
+    if reason.starts_with("gemini http ") {
+        reason
+    } else {
+        // reqwest errors can include details from its proxy connection. The
+        // naming worker logs returned errors, so keep those details out of
+        // diagnostics.
+        "gemini request failed".to_string()
+    }
 }
 
 fn first_present<'a>(upper: Option<&'a str>, lower: Option<&'a str>) -> Option<&'a str> {
@@ -527,6 +602,91 @@ pub async fn generate_ai_session_title(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const TEST_DIRECT_FALLBACK_KEY: &str = "direct-fallback-sentinel";
+
+    struct SessionNameResponseFixture {
+        base_url: String,
+        observed_keys: Arc<std::sync::Mutex<Vec<Option<String>>>>,
+    }
+
+    async fn start_session_name_response_fixture(
+        responses: Vec<(axum::http::StatusCode, String)>,
+    ) -> SessionNameResponseFixture {
+        use axum::body::Body;
+        use axum::routing::post;
+        use axum::{http::Response, Router};
+        use std::collections::VecDeque;
+        use std::sync::Mutex;
+
+        let observed_keys = Arc::new(Mutex::new(Vec::new()));
+        let observed = Arc::clone(&observed_keys);
+        let responses = Arc::new(Mutex::new(VecDeque::from(responses)));
+        let app = Router::new().route(
+            "/v1beta/models/gemini-3.5-flash-lite:generateContent",
+            post(move |headers: axum::http::HeaderMap| {
+                let observed = Arc::clone(&observed);
+                let responses = Arc::clone(&responses);
+                async move {
+                    observed.lock().unwrap().push(
+                        headers
+                            .get("x-goog-api-key")
+                            .and_then(|value| value.to_str().ok())
+                            .map(str::to_string),
+                    );
+                    let (status, body) = responses
+                        .lock()
+                        .unwrap()
+                        .pop_front()
+                        .expect("fixture has a response for each request");
+                    let mut response = Response::new(Body::from(body));
+                    *response.status_mut() = status;
+                    response
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        SessionNameResponseFixture {
+            base_url: format!("http://{addr}/v1beta"),
+            observed_keys,
+        }
+    }
+
+    fn onecli_session_name_transport(
+        fixture: &SessionNameResponseFixture,
+        direct_key: Option<&str>,
+    ) -> GeminiSessionNameHttp {
+        let auth = GeminiSessionNameAuth {
+            direct_key: AiKeyCell::init(direct_key.map(str::to_string), None),
+            route: GeminiCredentialRoute::OneCliProxy,
+        };
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        GeminiSessionNameHttp::new(client, auth, fixture.base_url.clone())
+    }
+
+    fn assert_onecli_fallback_keys(observed_keys: &std::sync::Mutex<Vec<Option<String>>>) {
+        let observed = observed_keys.lock().unwrap();
+        assert_eq!(observed.len(), 2, "fallback makes exactly two requests");
+        assert!(
+            observed[0].is_none(),
+            "the OneCLI request has no direct key"
+        );
+        assert!(
+            observed[1].as_deref() == Some(TEST_DIRECT_FALLBACK_KEY),
+            "the single fallback request carries the existing direct key"
+        );
+    }
+
+    fn assert_onecli_no_fallback_key(observed_keys: &std::sync::Mutex<Vec<Option<String>>>) {
+        let observed = observed_keys.lock().unwrap();
+        assert_eq!(observed.len(), 1, "a rejected response makes one request");
+        assert!(
+            observed[0].is_none(),
+            "a rejected OneCLI request has no direct key"
+        );
+    }
 
     #[test]
     fn key_cell_boot_env_wins_over_settings_nonforcing() {
@@ -912,5 +1072,112 @@ mod tests {
 
         assert_eq!(title, "Flux repair");
         assert_eq!(*observed_keys.lock().unwrap(), vec![false]);
+    }
+
+    #[tokio::test]
+    async fn onecli_missing_credential_retries_with_direct_key() {
+        let fixture = start_session_name_response_fixture(vec![
+            (
+                axum::http::StatusCode::UNAUTHORIZED,
+                r#"{"error":"credential_not_found"}"#.to_string(),
+            ),
+            (
+                axum::http::StatusCode::OK,
+                r#"{"candidates":[{"content":{"parts":[{"text":"Flux repair"}]}}]}"#.to_string(),
+            ),
+        ])
+        .await;
+        let transport = onecli_session_name_transport(&fixture, Some(TEST_DIRECT_FALLBACK_KEY));
+
+        let title = transport
+            .generate_content("hello world".into(), SESSION_TITLE_MAX_OUTPUT_TOKENS)
+            .await
+            .unwrap();
+
+        assert_eq!(title, "Flux repair");
+        assert_onecli_fallback_keys(&fixture.observed_keys);
+    }
+
+    #[tokio::test]
+    async fn onecli_missing_app_retries_with_direct_key() {
+        let fixture = start_session_name_response_fixture(vec![
+            (
+                axum::http::StatusCode::UNAUTHORIZED,
+                r#"{"error":"app_not_connected"}"#.to_string(),
+            ),
+            (
+                axum::http::StatusCode::OK,
+                r#"{"candidates":[{"content":{"parts":[{"text":"Flux repair"}]}}]}"#.to_string(),
+            ),
+        ])
+        .await;
+        let transport = onecli_session_name_transport(&fixture, Some(TEST_DIRECT_FALLBACK_KEY));
+
+        let title = transport
+            .generate_content("hello world".into(), SESSION_TITLE_MAX_OUTPUT_TOKENS)
+            .await
+            .unwrap();
+
+        assert_eq!(title, "Flux repair");
+        assert_onecli_fallback_keys(&fixture.observed_keys);
+    }
+
+    #[tokio::test]
+    async fn onecli_missing_credential_does_not_retry_other_failures() {
+        let cases = [
+            (
+                axum::http::StatusCode::FORBIDDEN,
+                r#"{"error":"access_restricted"}"#,
+            ),
+            (
+                axum::http::StatusCode::FORBIDDEN,
+                r#"{"error":"approval_required"}"#,
+            ),
+            (axum::http::StatusCode::UNAUTHORIZED, "unauthorized"),
+            (axum::http::StatusCode::FORBIDDEN, "forbidden"),
+            (axum::http::StatusCode::UNAUTHORIZED, "{malformed-json"),
+            (
+                axum::http::StatusCode::PROXY_AUTHENTICATION_REQUIRED,
+                "proxy auth",
+            ),
+        ];
+
+        for (status, body) in cases {
+            let fixture =
+                start_session_name_response_fixture(vec![(status, body.to_string())]).await;
+            let transport = onecli_session_name_transport(&fixture, Some(TEST_DIRECT_FALLBACK_KEY));
+
+            let error = transport
+                .generate_content("hello world".into(), SESSION_TITLE_MAX_OUTPUT_TOKENS)
+                .await
+                .expect_err("unapproved fallback cases remain errors");
+
+            assert!(
+                error.contains(&status.as_u16().to_string()),
+                "the original HTTP status remains visible"
+            );
+            assert_onecli_no_fallback_key(&fixture.observed_keys);
+        }
+    }
+
+    #[tokio::test]
+    async fn onecli_missing_credential_without_direct_key_does_not_retry() {
+        let fixture = start_session_name_response_fixture(vec![(
+            axum::http::StatusCode::UNAUTHORIZED,
+            r#"{"error":"credential_not_found"}"#.to_string(),
+        )])
+        .await;
+        let transport = onecli_session_name_transport(&fixture, None);
+
+        let error = transport
+            .generate_content("hello world".into(), SESSION_TITLE_MAX_OUTPUT_TOKENS)
+            .await
+            .expect_err("a missing direct key cannot be used for fallback");
+
+        assert!(
+            error.contains("401"),
+            "the original HTTP status remains visible"
+        );
+        assert_onecli_no_fallback_key(&fixture.observed_keys);
     }
 }
