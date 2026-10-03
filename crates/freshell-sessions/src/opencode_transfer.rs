@@ -108,6 +108,11 @@ const PINNED_MIGRATIONS: &[&str] = &[
     "20260622202450_simplify_session_input",
 ];
 
+// The pinned v1.18.21 source creates this journal table but registers no data
+// migrations that write to it. Its only supported state is therefore empty.
+// When the provider adds one, its exact name/state must be qualified here.
+const PINNED_DATA_MIGRATIONS: &[&str] = &[];
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TransferError {
     Blocked(String),
@@ -410,21 +415,15 @@ pub fn export_exact_session(
         let mut asset_resolver = AssetResolver::new(
             inventory.tool_output_directory(&source_path),
             options.workspace_mount.as_deref(),
-            extraction.path(),
-        )?;
+        );
         asset_resolver.resolve_rows(&mut rows)?;
         let assets = asset_resolver.metadata();
-        let asset_bytes = asset_resolver.copied_bytes;
         let payload_path = extraction.path().join("bundle.json");
         let mut row_digests = Vec::with_capacity(rows.len());
         let (payload_bytes, payload_sha256) = {
             let file = File::create(&payload_path)?;
             let mut hasher = Sha256::new();
-            let mut writer = HashingWriter::new(
-                file,
-                &mut hasher,
-                MAX_BUNDLE_BYTES.saturating_sub(asset_bytes),
-            );
+            let mut writer = HashingWriter::new(file, &mut hasher, MAX_BUNDLE_BYTES);
             let serialized = serde_json::to_writer(
                 &mut writer,
                 &TransferPayload {
@@ -538,26 +537,16 @@ impl<W: Write> Write for HashingWriter<'_, W> {
 struct AssetResolver<'a> {
     tool_output_root: PathBuf,
     workspace_mount: Option<&'a Path>,
-    extraction_root: PathBuf,
     assets: BTreeMap<String, SerializedAssetMetadata>,
-    tool_output_mappings: BTreeMap<PathBuf, String>,
-    copied_bytes: u64,
 }
 
 impl<'a> AssetResolver<'a> {
-    fn new(
-        tool_output_root: PathBuf,
-        workspace_mount: Option<&'a Path>,
-        extraction_root: &Path,
-    ) -> Result<Self, TransferError> {
-        Ok(Self {
+    fn new(tool_output_root: PathBuf, workspace_mount: Option<&'a Path>) -> Self {
+        Self {
             tool_output_root,
             workspace_mount,
-            extraction_root: extraction_root.to_path_buf(),
             assets: BTreeMap::new(),
-            tool_output_mappings: BTreeMap::new(),
-            copied_bytes: 0,
-        })
+        }
     }
 
     fn metadata(&self) -> Vec<SerializedAssetMetadata> {
@@ -707,14 +696,6 @@ impl<'a> AssetResolver<'a> {
         Ok(changed)
     }
 
-    fn tool_output_root(&self) -> Result<PathBuf, TransferError> {
-        fs::canonicalize(&self.tool_output_root).map_err(|error| {
-            TransferError::Blocked(format!(
-                "pinned OpenCode tool-output directory is unavailable: {error}"
-            ))
-        })
-    }
-
     fn is_tool_output_path(&self, path: &Path) -> Result<bool, TransferError> {
         let root = match fs::canonicalize(&self.tool_output_root) {
             Ok(root) => root,
@@ -733,112 +714,10 @@ impl<'a> AssetResolver<'a> {
             && file_name.is_some_and(|name| name.starts_with("tool_") && name.len() > 5))
     }
 
-    fn copy_tool_output(&mut self, path: &Path) -> Result<String, TransferError> {
-        let root = self.tool_output_root()?;
-        let metadata = fs::symlink_metadata(path).map_err(|error| {
-            TransferError::Blocked(format!(
-                "pinned OpenCode tool-output file is unavailable: {error}"
-            ))
-        })?;
-        if metadata.file_type().is_symlink() || !metadata.is_file() {
-            return Err(TransferError::Blocked(
-                "tool-output reference is not a regular write-once file".into(),
-            ));
-        }
-        let canonical = fs::canonicalize(path).map_err(|error| {
-            TransferError::Blocked(format!("tool-output path cannot be resolved: {error}"))
-        })?;
-        let name = canonical
-            .file_name()
-            .and_then(|value| value.to_str())
-            .ok_or_else(|| {
-                TransferError::Blocked("tool-output path has no valid file name".into())
-            })?;
-        if canonical.parent() != Some(root.as_path())
-            || !name.starts_with("tool_")
-            || name.len() <= 5
-        {
-            return Err(TransferError::Blocked(
-                "tool-output reference is outside the pinned write-once directory".into(),
-            ));
-        }
-        if let Some(target) = self.tool_output_mappings.get(&canonical) {
-            return Ok(target.clone());
-        }
-
-        let source_relative_path = name.to_string();
-        let file = File::open(&canonical).map_err(|error| {
-            TransferError::Blocked(format!("tool-output file cannot be read: {error}"))
-        })?;
-        let before = file.metadata()?;
-        let assets_directory = self.extraction_root.join("assets").join("sha256");
-        fs::create_dir_all(&assets_directory)?;
-        let mut temporary = Builder::new()
-            .prefix("asset-")
-            .tempfile_in(&assets_directory)?;
-        let mut hasher = Sha256::new();
-        let mut copied = 0_u64;
-        let mut buffer = [0_u8; 256 * 1024];
-        let mut reader = file;
-        loop {
-            let count = reader.read(&mut buffer)?;
-            if count == 0 {
-                break;
-            }
-            copied = copied
-                .checked_add(count as u64)
-                .ok_or_else(|| TransferError::Blocked("tool-output bundle size overflow".into()))?;
-            if self.copied_bytes.saturating_add(copied) > MAX_BUNDLE_BYTES {
-                return Err(TransferError::Blocked(
-                    "exact-session bundle exceeds 8 GiB".into(),
-                ));
-            }
-            hasher.update(&buffer[..count]);
-            temporary.write_all(&buffer[..count])?;
-        }
-        let after = reader.metadata()?;
-        if before.len() != copied
-            || after.len() != copied
-            || before.modified().ok() != after.modified().ok()
-        {
-            return Err(TransferError::Blocked(
-                "write-once tool-output bytes changed while being snapshotted".into(),
-            ));
-        }
-        let sha256 = hex::encode(hasher.finalize());
-        let target_relative_path = format!("assets/sha256/{sha256}");
-        let target = self.extraction_root.join(&target_relative_path);
-        if target.exists() {
-            let existing_digest = digest_reader(&mut File::open(&target)?)?;
-            if existing_digest != sha256 {
-                return Err(TransferError::Blocked(
-                    "content-addressed asset path contains different bytes".into(),
-                ));
-            }
-        } else {
-            temporary.flush()?;
-            temporary.as_file().sync_all()?;
-            temporary
-                .persist(&target)
-                .map_err(|error| TransferError::Io(error.error.to_string()))?;
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                fs::set_permissions(&target, fs::Permissions::from_mode(0o400))?;
-            }
-        }
-        self.copied_bytes = self.copied_bytes.saturating_add(copied);
-        self.tool_output_mappings
-            .insert(canonical.clone(), target_relative_path.clone());
-        let metadata = SerializedAssetMetadata {
-            kind: "write_once_tool_output".into(),
-            source_relative_path,
-            target_relative_path: target_relative_path.clone(),
-            size_bytes: copied,
-            sha256,
-        };
-        self.assets.insert(target_relative_path.clone(), metadata);
-        Ok(target_relative_path)
+    fn copy_tool_output(&self, _path: &Path) -> Result<String, TransferError> {
+        Err(TransferError::Blocked(
+            "pinned OpenCode v1.18.21 tool-output files have no write-once retention contract and cleanup removes them after seven days".into(),
+        ))
     }
 
     fn verify_workspace_file(&self, path: &Path) -> Result<SerializedAssetMetadata, TransferError> {
@@ -909,6 +788,40 @@ impl<'a> AssetResolver<'a> {
 }
 
 fn decode_file_url(url: &str) -> Result<PathBuf, TransferError> {
+    #[cfg(windows)]
+    {
+        return Ok(PathBuf::from(decode_windows_file_url_path(url)?));
+    }
+
+    #[cfg(not(windows))]
+    {
+        let path = PathBuf::from(decode_local_file_url_path(url)?);
+        if !path.is_absolute() {
+            return Err(TransferError::Blocked(
+                "file URL must resolve to an absolute path".into(),
+            ));
+        }
+        Ok(path)
+    }
+}
+
+#[cfg_attr(not(any(windows, test)), allow(dead_code))]
+fn decode_windows_file_url_path(url: &str) -> Result<String, TransferError> {
+    let path = decode_local_file_url_path(url)?;
+    let drive_path = path.strip_prefix('/').ok_or_else(|| {
+        TransferError::Blocked("file URL must use a local absolute drive path".into())
+    })?;
+    let bytes = drive_path.as_bytes();
+    if bytes.len() < 3 || !bytes[0].is_ascii_alphabetic() || bytes[1] != b':' || bytes[2] != b'/' {
+        return Err(TransferError::Blocked(
+            "Windows file URL must contain a drive-letter absolute path; UNC paths are unsupported"
+                .into(),
+        ));
+    }
+    Ok(drive_path.replace('/', "\\"))
+}
+
+fn decode_local_file_url_path(url: &str) -> Result<String, TransferError> {
     if url.contains('?') || url.contains('#') {
         return Err(TransferError::Blocked(
             "file URL query and fragment components are unsupported".into(),
@@ -952,12 +865,6 @@ fn decode_file_url(url: &str) -> Result<PathBuf, TransferError> {
     }
     let path = String::from_utf8(decoded)
         .map_err(|_| TransferError::Blocked("file URL is not valid UTF-8".into()))?;
-    let path = PathBuf::from(path);
-    if !path.is_absolute() {
-        return Err(TransferError::Blocked(
-            "file URL must resolve to an absolute path".into(),
-        ));
-    }
     Ok(path)
 }
 
@@ -1229,8 +1136,22 @@ fn prepare_extraction_root(path: &Path) -> Result<PathBuf, TransferError> {
             false
         }
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            fs::create_dir_all(path)?;
-            true
+            #[cfg(unix)]
+            {
+                fs::create_dir_all(path)?;
+                true
+            }
+            #[cfg(windows)]
+            {
+                windows_acl::create_private_directory(path)?;
+                true
+            }
+            #[cfg(not(any(unix, windows)))]
+            {
+                return Err(TransferError::Blocked(
+                    "private extraction roots are unsupported on this platform".into(),
+                ));
+            }
         }
         Err(error) => return Err(error.into()),
     };
@@ -1247,9 +1168,322 @@ fn prepare_extraction_root(path: &Path) -> Result<PathBuf, TransferError> {
             ));
         }
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        let _ = newly_created;
+        let evidence = windows_acl::read_acl_evidence(path)?;
+        if !windows_acl_is_private(&evidence) {
+            return Err(TransferError::Blocked(
+                "Windows extraction root ACL is not restricted to the current user".into(),
+            ));
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
     let _ = newly_created;
     Ok(path.to_path_buf())
+}
+
+#[cfg_attr(not(any(windows, test)), allow(dead_code))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct WindowsAclEvidence {
+    owner_is_current_user: bool,
+    dacl_present: bool,
+    dacl_protected: bool,
+    ace_count: usize,
+    current_user_has_full_access: bool,
+    all_children_inherit_current_user_access: bool,
+}
+
+#[cfg_attr(not(any(windows, test)), allow(dead_code))]
+fn windows_acl_is_private(evidence: &WindowsAclEvidence) -> bool {
+    evidence.owner_is_current_user
+        && evidence.dacl_present
+        && evidence.dacl_protected
+        && evidence.ace_count == 1
+        && evidence.current_user_has_full_access
+        && evidence.all_children_inherit_current_user_access
+}
+
+#[cfg(windows)]
+mod windows_acl {
+    use std::ffi::c_void;
+    use std::mem::size_of;
+    use std::os::windows::ffi::OsStrExt;
+    use std::path::Path;
+    use std::ptr::{addr_of, null_mut};
+    use std::slice;
+
+    use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, LocalFree, HANDLE, HLOCAL};
+    use windows_sys::Win32::Security::Authorization::{
+        ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
+        GetNamedSecurityInfoW, SDDL_REVISION_1, SE_FILE_OBJECT,
+    };
+    use windows_sys::Win32::Security::{
+        AclSizeInformation, EqualSid, GetAce, GetAclInformation, GetLengthSid,
+        GetSecurityDescriptorControl, GetSecurityDescriptorDacl, GetTokenInformation, TokenUser,
+        ACCESS_ALLOWED_ACE, ACE_HEADER, ACL_SIZE_INFORMATION, CONTAINER_INHERIT_ACE,
+        DACL_SECURITY_INFORMATION, OBJECT_INHERIT_ACE, OWNER_SECURITY_INFORMATION,
+        PSECURITY_DESCRIPTOR, PSID, SECURITY_ATTRIBUTES, SE_DACL_PROTECTED, TOKEN_QUERY,
+        TOKEN_USER,
+    };
+    use windows_sys::Win32::Storage::FileSystem::{CreateDirectoryW, FILE_ALL_ACCESS};
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+
+    use super::{TransferError, WindowsAclEvidence};
+
+    struct TokenHandle(HANDLE);
+
+    impl Drop for TokenHandle {
+        fn drop(&mut self) {
+            unsafe {
+                CloseHandle(self.0);
+            }
+        }
+    }
+
+    struct LocalSecurityDescriptor(PSECURITY_DESCRIPTOR);
+
+    impl Drop for LocalSecurityDescriptor {
+        fn drop(&mut self) {
+            unsafe {
+                LocalFree(self.0 as HLOCAL);
+            }
+        }
+    }
+
+    pub(super) fn create_private_directory(path: &Path) -> Result<(), TransferError> {
+        let current_user_sid = current_user_sid()?;
+        let sid_string = sid_to_string(&current_user_sid)?;
+        let sddl = format!("D:P(A;OICI;FA;;;{sid_string})");
+        create_directory_with_sddl(path, &sddl).map(|_| ())
+    }
+
+    fn create_directory_with_sddl(path: &Path, sddl: &str) -> Result<bool, TransferError> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(|error| {
+                TransferError::Blocked(format!(
+                    "Windows extraction root parent is unavailable: {error}"
+                ))
+            })?;
+        }
+        let descriptor = security_descriptor(sddl)?;
+        let mut attributes = SECURITY_ATTRIBUTES {
+            nLength: size_of::<SECURITY_ATTRIBUTES>() as u32,
+            lpSecurityDescriptor: descriptor.0,
+            bInheritHandle: 0,
+        };
+        let path: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+        let created = unsafe { CreateDirectoryW(path.as_ptr(), &mut attributes) };
+        if created != 0 {
+            return Ok(true);
+        }
+        let error = unsafe { GetLastError() };
+        if error == windows_sys::Win32::Foundation::ERROR_ALREADY_EXISTS {
+            return Ok(false);
+        }
+        Err(TransferError::Blocked(format!(
+            "Windows could not create a private extraction root (error {error})"
+        )))
+    }
+
+    pub(super) fn read_acl_evidence(path: &Path) -> Result<WindowsAclEvidence, TransferError> {
+        let path: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+        let mut owner: PSID = null_mut();
+        let mut dacl = null_mut();
+        let mut descriptor: PSECURITY_DESCRIPTOR = null_mut();
+        let error = unsafe {
+            GetNamedSecurityInfoW(
+                path.as_ptr(),
+                SE_FILE_OBJECT,
+                OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+                &mut owner,
+                null_mut(),
+                &mut dacl,
+                null_mut(),
+                &mut descriptor,
+            )
+        };
+        if error != 0 {
+            return Err(TransferError::Blocked(format!(
+                "Windows extraction root ACL cannot be read (error {error})"
+            )));
+        }
+        let descriptor = LocalSecurityDescriptor(descriptor);
+        let current_user_sid = current_user_sid()?;
+        let owner_is_current_user =
+            unsafe { !owner.is_null() && EqualSid(owner, current_user_sid.as_ptr() as PSID) != 0 };
+
+        let mut control = 0u16;
+        let mut revision = 0u32;
+        if unsafe { GetSecurityDescriptorControl(descriptor.0, &mut control, &mut revision) } == 0 {
+            return Err(TransferError::Blocked(
+                "Windows extraction root ACL control flags cannot be read".into(),
+            ));
+        }
+        let mut dacl_present = 0;
+        let mut queried_dacl = null_mut();
+        let mut dacl_defaulted = 0;
+        if unsafe {
+            GetSecurityDescriptorDacl(
+                descriptor.0,
+                &mut dacl_present,
+                &mut queried_dacl,
+                &mut dacl_defaulted,
+            )
+        } == 0
+        {
+            return Err(TransferError::Blocked(
+                "Windows extraction root DACL cannot be read".into(),
+            ));
+        }
+
+        let mut ace_count = 0usize;
+        let mut current_user_has_full_access = false;
+        let mut all_children_inherit_current_user_access = false;
+        if dacl_present != 0 && !queried_dacl.is_null() {
+            let mut acl_info = ACL_SIZE_INFORMATION::default();
+            if unsafe {
+                GetAclInformation(
+                    queried_dacl,
+                    &mut acl_info as *mut _ as *mut c_void,
+                    size_of::<ACL_SIZE_INFORMATION>() as u32,
+                    AclSizeInformation,
+                )
+            } == 0
+            {
+                return Err(TransferError::Blocked(
+                    "Windows extraction root access list cannot be read".into(),
+                ));
+            }
+            ace_count = acl_info.AceCount as usize;
+            if ace_count == 1 {
+                let mut ace_pointer: *mut c_void = null_mut();
+                if unsafe { GetAce(queried_dacl, 0, &mut ace_pointer) } != 0
+                    && !ace_pointer.is_null()
+                {
+                    let header = unsafe { *(ace_pointer as *const ACE_HEADER) };
+                    if header.AceType == 0 {
+                        let ace = unsafe { &*(ace_pointer as *const ACCESS_ALLOWED_ACE) };
+                        let ace_sid = addr_of!(ace.SidStart) as PSID;
+                        current_user_has_full_access = unsafe {
+                            EqualSid(ace_sid, current_user_sid.as_ptr() as PSID) != 0
+                                && ace.Mask == FILE_ALL_ACCESS
+                        };
+                        all_children_inherit_current_user_access = u32::from(header.AceFlags)
+                            == (OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE);
+                    }
+                }
+            }
+        }
+
+        Ok(WindowsAclEvidence {
+            owner_is_current_user,
+            dacl_present: dacl_present != 0 && !queried_dacl.is_null(),
+            dacl_protected: control & SE_DACL_PROTECTED != 0,
+            ace_count,
+            current_user_has_full_access,
+            all_children_inherit_current_user_access,
+        })
+    }
+
+    fn current_user_sid() -> Result<Vec<u8>, TransferError> {
+        let mut token = null_mut();
+        if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) } == 0 {
+            return Err(TransferError::Blocked(
+                "Windows current-user identity cannot be read".into(),
+            ));
+        }
+        let token = TokenHandle(token);
+        let mut required = 0u32;
+        unsafe {
+            GetTokenInformation(token.0, TokenUser, null_mut(), 0, &mut required);
+        }
+        if required == 0 {
+            return Err(TransferError::Blocked(
+                "Windows current-user identity has no user SID".into(),
+            ));
+        }
+        let mut buffer = vec![0u8; required as usize];
+        if unsafe {
+            GetTokenInformation(
+                token.0,
+                TokenUser,
+                buffer.as_mut_ptr() as *mut c_void,
+                required,
+                &mut required,
+            )
+        } == 0
+        {
+            return Err(TransferError::Blocked(
+                "Windows current-user SID cannot be read".into(),
+            ));
+        }
+        let user = unsafe { &*(buffer.as_ptr() as *const TOKEN_USER) };
+        if user.User.Sid.is_null() {
+            return Err(TransferError::Blocked(
+                "Windows current-user token has no user SID".into(),
+            ));
+        }
+        let length = unsafe { GetLengthSid(user.User.Sid) } as usize;
+        if length == 0 {
+            return Err(TransferError::Blocked(
+                "Windows current-user SID has an invalid length".into(),
+            ));
+        }
+        Ok(unsafe { slice::from_raw_parts(user.User.Sid as *const u8, length) }.to_vec())
+    }
+
+    fn sid_to_string(sid: &[u8]) -> Result<String, TransferError> {
+        let mut pointer = null_mut();
+        if unsafe { ConvertSidToStringSidW(sid.as_ptr() as PSID, &mut pointer) } == 0 {
+            return Err(TransferError::Blocked(
+                "Windows current-user SID cannot be formatted".into(),
+            ));
+        }
+        let mut length = 0;
+        unsafe {
+            while *pointer.add(length) != 0 {
+                length += 1;
+            }
+        }
+        let value = unsafe { String::from_utf16_lossy(slice::from_raw_parts(pointer, length)) };
+        unsafe {
+            LocalFree(pointer as HLOCAL);
+        }
+        Ok(value)
+    }
+
+    fn security_descriptor(sddl: &str) -> Result<LocalSecurityDescriptor, TransferError> {
+        let sddl: Vec<u16> = sddl.encode_utf16().chain(Some(0)).collect();
+        let mut descriptor: PSECURITY_DESCRIPTOR = null_mut();
+        if unsafe {
+            ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                sddl.as_ptr(),
+                SDDL_REVISION_1,
+                &mut descriptor,
+                null_mut(),
+            )
+        } == 0
+        {
+            return Err(TransferError::Blocked(
+                "Windows private extraction ACL could not be created".into(),
+            ));
+        }
+        Ok(LocalSecurityDescriptor(descriptor))
+    }
+
+    #[cfg(test)]
+    pub(super) fn create_test_directory_with_world_access(
+        path: &Path,
+    ) -> Result<(), TransferError> {
+        if create_directory_with_sddl(path, "D:P(A;OICI;FA;;;WD)")? {
+            Ok(())
+        } else {
+            Err(TransferError::Blocked(
+                "test extraction directory unexpectedly exists".into(),
+            ))
+        }
+    }
 }
 
 fn write_owner_pid(directory: &Path) -> Result<(), TransferError> {
@@ -1503,6 +1737,16 @@ fn migration_fingerprint(connection: &Connection) -> Result<String, TransferErro
             Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
         })?
         .collect::<Result<Vec<_>, _>>()?;
+    let data_migration_names: BTreeSet<_> = data_migrations
+        .iter()
+        .map(|(name, _)| name.as_str())
+        .collect();
+    let expected_data_migrations: BTreeSet<_> = PINNED_DATA_MIGRATIONS.iter().copied().collect();
+    if data_migration_names != expected_data_migrations {
+        return Err(TransferError::Blocked(
+            "source data-migration journal does not match OpenCode v1.18.21".into(),
+        ));
+    }
     let bytes = serde_json::to_vec(&(rows, data_migrations))
         .map_err(|error| TransferError::Serialization(error.to_string()))?;
     Ok(digest(&bytes))
@@ -1924,4 +2168,91 @@ fn digest_reader(reader: &mut impl Read) -> Result<String, TransferError> {
         hasher.update(&buffer[..read]);
     }
     Ok(hex::encode(hasher.finalize()))
+}
+
+#[cfg(test)]
+mod windows_file_url_tests {
+    use super::*;
+
+    #[test]
+    fn decodes_windows_drive_letter_file_urls() {
+        assert_eq!(
+            decode_windows_file_url_path("file:///C:/Users/Dan/tool%20output/tool_1").unwrap(),
+            r"C:\Users\Dan\tool output\tool_1"
+        );
+        assert_eq!(
+            decode_windows_file_url_path("file://localhost/d:/OpenCode/tool-output/tool_2")
+                .unwrap(),
+            r"d:\OpenCode\tool-output\tool_2"
+        );
+    }
+
+    #[test]
+    fn rejects_unc_file_urls_as_unsupported() {
+        assert!(matches!(
+            decode_windows_file_url_path("file://server/share/tool-output/tool_1"),
+            Err(TransferError::Blocked(_))
+        ));
+    }
+}
+
+#[cfg(test)]
+mod windows_extraction_acl_tests {
+    use super::*;
+
+    #[test]
+    fn shared_windows_acl_evidence_is_not_private() {
+        let shared = WindowsAclEvidence {
+            owner_is_current_user: true,
+            dacl_present: true,
+            dacl_protected: false,
+            ace_count: 2,
+            current_user_has_full_access: true,
+            all_children_inherit_current_user_access: false,
+        };
+
+        assert!(!windows_acl_is_private(&shared));
+    }
+
+    #[test]
+    fn accepts_a_protected_current_user_only_windows_acl() {
+        let private = WindowsAclEvidence {
+            owner_is_current_user: true,
+            dacl_present: true,
+            dacl_protected: true,
+            ace_count: 1,
+            current_user_has_full_access: true,
+            all_children_inherit_current_user_access: true,
+        };
+
+        assert!(windows_acl_is_private(&private));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn rejects_a_shared_existing_directory_without_changing_its_acl() {
+        let temporary = tempfile::tempdir().unwrap();
+        let path = temporary.path().join("shared-extraction-root");
+        windows_acl::create_test_directory_with_world_access(&path).unwrap();
+        let before = windows_acl::read_acl_evidence(&path).unwrap();
+        assert!(!windows_acl_is_private(&before));
+
+        let result = prepare_extraction_root(&path);
+
+        assert!(matches!(result, Err(TransferError::Blocked(_))));
+        assert_eq!(windows_acl::read_acl_evidence(&path).unwrap(), before);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn creates_a_private_windows_extraction_root_and_reuses_it() {
+        let temporary = tempfile::tempdir().unwrap();
+        let path = temporary.path().join("private-extraction-root");
+
+        assert_eq!(prepare_extraction_root(&path).unwrap(), path);
+        assert!(windows_acl_is_private(
+            &windows_acl::read_acl_evidence(&path).unwrap()
+        ));
+        assert_eq!(prepare_extraction_root(&path).unwrap(), path);
+    }
 }
