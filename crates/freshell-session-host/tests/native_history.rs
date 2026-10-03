@@ -64,6 +64,11 @@ fn write_codex_rows(home: &Path, id: &str, rows: &[Value]) {
     .unwrap();
 }
 
+fn codex_response_message(role: &str, index: usize, text: &str) -> Value {
+    json!({"type":"response_item","payload":{"type":"message","role":role,"id":format!("{role}-{index}"),
+        "content":[{"type":if role == "user" { "input_text" } else { "output_text" },"text":text}]}})
+}
+
 #[test]
 fn history_binary_reads_exact_saved_codex_rollout_without_a_runtime() {
     let home = tempfile::tempdir().unwrap();
@@ -211,6 +216,303 @@ fn history_binary_deduplicates_codex_response_agent_and_completion_mirrors() {
             if order.contains(&0) {
                 assert_eq!(assistant["items"][0]["id"], format!("assistant-{turn}"));
             }
+        }
+    }
+}
+
+#[test]
+fn history_binary_associates_codex_message_mirrors_across_turn_context() {
+    for modern_first in [false, true] {
+        for context_first in [false, true] {
+            for context_has_id in [true, false] {
+                for (start_position, start_has_id) in [
+                    ("none", false),
+                    ("before", false),
+                    ("before", true),
+                    ("after", false),
+                    ("after", true),
+                ] {
+                    for order in [
+                        &[0, 1, 2][..],
+                        &[0, 2, 1][..],
+                        &[1, 0, 2][..],
+                        &[1, 2, 0][..],
+                        &[2, 0, 1][..],
+                        &[2, 1, 0][..],
+                        &[1, 2][..],
+                        &[2, 1][..],
+                    ] {
+                        let home = tempfile::tempdir().unwrap();
+                        let mut rows = vec![
+                            json!({"type":"session_meta","payload":{"id":"context-mirrors","history_mode":"legacy"}}),
+                        ];
+                        for index in 0..2 {
+                            let id = format!("saved-turn-{index}");
+                            let mut context =
+                                json!({"type":"turn_context","payload":{"model":"saved-model"}});
+                            if context_has_id {
+                                context["payload"]["turn_id"] = json!(id);
+                            }
+                            let mut started =
+                                json!({"type":"event_msg","payload":{"type":"task_started"}});
+                            if start_has_id {
+                                started["payload"]["turn_id"] = json!(id);
+                            }
+                            let legacy = json!({"type":"event_msg","payload":{"type":"user_message","message":"Repeated saved prompt"}});
+                            let response =
+                                codex_response_message("user", index, "Repeated saved prompt");
+                            if context_first {
+                                rows.push(context.clone());
+                            }
+                            if start_position == "before" {
+                                rows.push(started.clone());
+                            }
+                            rows.push(if modern_first {
+                                response.clone()
+                            } else {
+                                legacy.clone()
+                            });
+                            if start_position == "after" {
+                                rows.push(started);
+                            }
+                            if !context_first {
+                                rows.push(context);
+                            }
+                            rows.push(if modern_first { legacy } else { response });
+                            let mut completed = json!({"type":"event_msg","payload":{"type":"task_complete","last_agent_message":"Repeated saved answer"}});
+                            if context_has_id {
+                                completed["payload"]["turn_id"] = json!(id);
+                            }
+                            let messages = [
+                                codex_response_message("assistant", index, "Repeated saved answer"),
+                                json!({"type":"event_msg","payload":{"type":"agent_message","message":"Repeated saved answer","phase":"final"}}),
+                                completed,
+                            ];
+                            for &source in order {
+                                rows.push(messages[source].clone());
+                            }
+                        }
+                        write_codex_rows(home.path(), "context-mirrors", &rows);
+                        let result = history(home.path(), "codex", "context-mirrors");
+                        assert!(
+                            result.status.success(),
+                            "{}",
+                            String::from_utf8_lossy(&result.stderr)
+                        );
+                        let body: Value = serde_json::from_slice(&result.stdout).unwrap();
+                        let turns = body["turns"].as_array().unwrap();
+                        let case = format!("modern_first={modern_first}, context_first={context_first}, context_has_id={context_has_id}, start={start_position}/{start_has_id}, sources={order:?}");
+                        assert_eq!(turns.len(), 4, "{case}: {body}");
+                        assert_ne!(
+                            turns[0]["turnId"], turns[2]["turnId"],
+                            "distinct completed turns: {case}"
+                        );
+                        for (index, turn) in turns.iter().enumerate() {
+                            assert_eq!(
+                                turn["role"],
+                                if index % 2 == 0 { "user" } else { "assistant" },
+                                "{case}"
+                            );
+                            assert_eq!(turn["items"].as_array().unwrap().len(), 1, "{case}");
+                            assert_eq!(
+                                turn["items"][0]["text"],
+                                if index % 2 == 0 {
+                                    "Repeated saved prompt"
+                                } else {
+                                    "Repeated saved answer"
+                                },
+                                "{case}"
+                            );
+                            if index % 2 == 0 || order.contains(&0) {
+                                assert_eq!(
+                                    turn["items"][0]["id"],
+                                    if index % 2 == 0 {
+                                        format!("user-{}:part:0", index / 2)
+                                    } else {
+                                        format!("assistant-{}", index / 2)
+                                    },
+                                    "{case}"
+                                );
+                            }
+                            let saved_id =
+                                if context_has_id || (start_position != "none" && start_has_id) {
+                                    format!("saved-turn-{}", index / 2)
+                                } else {
+                                    format!("native-history-{}", index / 2)
+                                };
+                            assert_eq!(
+                                turn["turnId"]
+                                    .as_str()
+                                    .unwrap()
+                                    .split(":row-")
+                                    .next()
+                                    .unwrap(),
+                                saved_id,
+                                "{case}"
+                            );
+                        }
+                        assert_eq!(body["capabilities"]["send"], false);
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn history_binary_preserves_codex_task_boundaries_without_context_or_completion_text() {
+    for end in ["task_complete", "turn_aborted", "next_task_started"] {
+        for has_id in [false, true] {
+            let home = tempfile::tempdir().unwrap();
+            let mut rows = vec![
+                json!({"type":"session_meta","payload":{"id":"task-boundaries","history_mode":"legacy"}}),
+            ];
+            for index in 0..2 {
+                let id = format!("task-{index}");
+                let mut started = json!({"type":"event_msg","payload":{"type":"task_started"}});
+                if has_id {
+                    started["payload"]["turn_id"] = json!(id);
+                }
+                rows.extend([
+                    started,
+                    json!({"type":"event_msg","payload":{"type":"user_message","message":"Repeated saved prompt"}}),
+                    codex_response_message("user", index, "Repeated saved prompt"),
+                    codex_response_message("assistant", index, "Repeated saved answer"),
+                    json!({"type":"event_msg","payload":{"type":"agent_message","message":"Repeated saved answer"}}),
+                ]);
+                if end != "next_task_started" {
+                    let mut completed = json!({"type":"event_msg","payload":{"type":end,"last_agent_message":null}});
+                    if has_id {
+                        completed["payload"]["turn_id"] = json!(id);
+                    }
+                    rows.push(completed);
+                }
+            }
+            write_codex_rows(home.path(), "task-boundaries", &rows);
+            let result = history(home.path(), "codex", "task-boundaries");
+            assert!(
+                result.status.success(),
+                "{}",
+                String::from_utf8_lossy(&result.stderr)
+            );
+            let body: Value = serde_json::from_slice(&result.stdout).unwrap();
+            let turns = body["turns"].as_array().unwrap();
+            assert_eq!(turns.len(), 4, "end={end}, id={has_id}: {body}");
+            assert_ne!(
+                turns[0]["turnId"], turns[2]["turnId"],
+                "distinct tasks: end={end}, id={has_id}"
+            );
+            for (index, turn) in turns.iter().enumerate() {
+                assert_eq!(turn["items"].as_array().unwrap().len(), 1);
+                assert_eq!(
+                    turn["items"][0]["id"],
+                    if index % 2 == 0 {
+                        format!("user-{}:part:0", index / 2)
+                    } else {
+                        format!("assistant-{}", index / 2)
+                    }
+                );
+                let saved_id = if has_id {
+                    format!("task-{}", index / 2)
+                } else {
+                    format!("native-history-{}", index / 2)
+                };
+                assert_eq!(
+                    turn["turnId"]
+                        .as_str()
+                        .unwrap()
+                        .split(":row-")
+                        .next()
+                        .unwrap(),
+                    saved_id,
+                    "end={end}, id={has_id}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn history_binary_keeps_delayed_codex_messages_and_tools_in_their_named_turn() {
+    for next_has_id in [false, true] {
+        for completion_has_text in [false, true] {
+            let home = tempfile::tempdir().unwrap();
+            let mut next = json!({"type":"event_msg","payload":{"type":"task_started"}});
+            if next_has_id {
+                next["payload"]["turn_id"] = json!("named-1");
+            }
+            let rows = [
+                json!({"type":"session_meta","payload":{"id":"delayed-turn","history_mode":"legacy"}}),
+                json!({"type":"event_msg","payload":{"type":"task_started","turn_id":"named-0"}}),
+                json!({"type":"turn_context","payload":{"turn_id":"named-0"}}),
+                codex_response_message("user", 0, "Repeated saved prompt"),
+                json!({"type":"response_item","payload":{"type":"custom_tool_call","call_id":"custom-0","name":"apply_patch","input":"saved patch"}}),
+                codex_response_message("assistant", 0, "Repeated saved answer"),
+                next,
+                json!({"type":"event_msg","payload":{"type":"user_message","message":"Repeated saved prompt"}}),
+                json!({"type":"event_msg","payload":{"type":"task_complete","turn_id":"named-0",
+                    "last_agent_message": if completion_has_text { json!("Repeated saved answer") } else { Value::Null }}}),
+                json!({"type":"event_msg","payload":{"type":"item_completed","turn_id":"named-0",
+                    "item":{"type":"DynamicToolCall","id":"custom-0","tool":"apply_patch","arguments":"saved patch","status":"completed",
+                        "content_items":[{"type":"inputText","text":"Delayed saved tool result"}],"success":true}}}),
+                json!({"type":"turn_context","payload":{"turn_id":"named-1"}}),
+                codex_response_message("user", 1, "Repeated saved prompt"),
+                codex_response_message("assistant", 1, "Repeated saved answer"),
+                json!({"type":"event_msg","payload":{"type":"task_complete","turn_id":"named-1","last_agent_message":"Repeated saved answer"}}),
+            ];
+            write_codex_rows(home.path(), "delayed-turn", &rows);
+            let result = history(home.path(), "codex", "delayed-turn");
+            assert!(
+                result.status.success(),
+                "{}",
+                String::from_utf8_lossy(&result.stderr)
+            );
+            let body: Value = serde_json::from_slice(&result.stdout).unwrap();
+            let turns = body["turns"].as_array().unwrap();
+            assert_eq!(
+                turns.len(),
+                5,
+                "next_id={next_has_id}, completion_text={completion_has_text}: {body}"
+            );
+            for (turn, (role, source)) in turns.iter().zip([
+                ("user", 0),
+                ("tool", 0),
+                ("assistant", 0),
+                ("user", 1),
+                ("assistant", 1),
+            ]) {
+                assert_eq!(turn["role"], role);
+                let items = turn["items"].as_array().unwrap();
+                assert_eq!(items.len(), 1);
+                assert_eq!(
+                    items[0]["id"],
+                    if role == "tool" {
+                        "custom-0".to_owned()
+                    } else if role == "user" {
+                        format!("user-{source}:part:0")
+                    } else {
+                        format!("assistant-{source}")
+                    }
+                );
+                assert_eq!(
+                    turn["turnId"]
+                        .as_str()
+                        .unwrap()
+                        .split(":row-")
+                        .next()
+                        .unwrap(),
+                    format!("named-{source}")
+                );
+            }
+            let tool = turns[1]["items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|item| item["kind"] == "dynamic_tool")
+                .unwrap();
+            assert_eq!(tool["id"], "custom-0");
+            assert_eq!(tool["status"], "completed");
+            assert_eq!(tool["contentItems"][0]["text"], "Delayed saved tool result");
         }
     }
 }
