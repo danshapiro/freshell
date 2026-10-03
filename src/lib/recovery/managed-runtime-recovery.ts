@@ -1,6 +1,7 @@
 import { resolveFreshAgentRuntimeProvider } from '@shared/fresh-agent'
 import type { AppStore, RootState } from '@/store/store'
 import { addTab, updateTab } from '@/store/tabsSlice'
+import { withManagedVisibilityTransition } from '@/store/managedVisibilityCoordinator.js'
 import { initLayout, updatePaneContent } from '@/store/panesSlice'
 import type { PaneContent, PaneNode, TerminalPaneContent } from '@/store/paneTypes'
 import type { Tab, TerminalStatus } from '@/store/types'
@@ -396,14 +397,19 @@ async function runManagedRuntimeRefresh(
     store.dispatch(managedRuntimeRefreshStarted(reason))
     try {
       const snapshot = await getManagedRuntimeInventory()
-      if (snapshot.revision >= store.getState().managedRuntime.revision) {
-        const plan = buildManagedRuntimeMergePlan(snapshot, store.getState())
-        applyManagedRuntimeMergePlan(store, plan)
-        store.dispatch(managedRuntimeSnapshotReceived({
-          snapshot,
-          reconstructedViewCount: plan.representedViewCount,
-        }))
-      }
+      await withManagedVisibilityTransition(async () => {
+        // Visibility transitions may commit a newer inventory while this GET
+        // is in flight. Recheck its revision and plan against current local
+        // state only after it owns the same queue as close, detach, and reopen.
+        if (snapshot.revision >= store.getState().managedRuntime.revision) {
+          const plan = buildManagedRuntimeMergePlan(snapshot, store.getState())
+          applyManagedRuntimeMergePlan(store, plan)
+          store.dispatch(managedRuntimeSnapshotReceived({
+            snapshot,
+            reconstructedViewCount: plan.representedViewCount,
+          }))
+        }
+      })
     } catch (error) {
       if (!isTransientRequestFailure(error)) {
         store.dispatch(managedRuntimeRefreshFailed(

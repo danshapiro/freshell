@@ -1636,7 +1636,16 @@ function resolveManagedViewIntentsToRemove(
     throw new Error(MANAGED_VIEW_CLOSE_FAILED_MESSAGE)
   }
   if (!runtime.available) {
-    if (hasKnownMarker) throw new Error(MANAGED_VIEW_CLOSE_FAILED_MESSAGE)
+    const matchesCachedManagedIdentity = terminalTargets.some(({ content }) => (
+      isManagedRuntimeProjection(content)
+      && runtime.souls.some((soul) => (
+        (content.terminalId && soul.terminalId === content.terminalId)
+        || (content.createRequestId && soul.terminalCreateRequestId === content.createRequestId)
+      ))
+    ))
+    if (hasKnownMarker || matchesCachedManagedIdentity) {
+      throw new Error(MANAGED_VIEW_CLOSE_FAILED_MESSAGE)
+    }
     return { viewIntentIds: [], paneIds: [] }
   }
 
@@ -1797,6 +1806,71 @@ function prepareManagedRuntimeReopenLayout(
   }
 
   return { layout: visit(layout), viewIntentIds: [...viewIntentIds] }
+}
+
+function locallyRepresentedManagedReopenViews(
+  state: RootState,
+  viewIntentIds: string[],
+  snapshot: ManagedRuntimeInventorySnapshot,
+): { representedViewIntentIds: Set<string>; ambiguous: boolean } {
+  const targetViews = viewIntentIds.map((viewIntentId) => {
+    const matches = snapshot.viewIntents.filter((view) => view.viewId === viewIntentId)
+    if (matches.length !== 1) throw new Error(MANAGED_VIEW_CLOSE_FAILED_MESSAGE)
+    const view = matches[0]!
+    const souls = snapshot.souls.filter((soul) => soul.soulId === view.soulId)
+    if (souls.length !== 1) throw new Error(MANAGED_VIEW_CLOSE_FAILED_MESSAGE)
+    return { view, soul: souls[0]! }
+  })
+  const candidates: Array<{
+    viewIntentId?: string
+    soulId?: string
+    terminalId?: string
+    createRequestId?: string
+  }> = []
+
+  for (const tab of state.tabs.tabs) {
+    const layout = state.panes.layouts[tab.id]
+    if (!layout) {
+      candidates.push({
+        viewIntentId: tab.viewIntentId,
+        soulId: tab.soulId,
+        createRequestId: tab.createRequestId,
+      })
+      continue
+    }
+    for (const { content } of collectPaneEntries(layout)) {
+      if (content.kind !== 'terminal') continue
+      candidates.push({
+        viewIntentId: content.viewIntentId,
+        soulId: content.soulId,
+        terminalId: content.terminalId,
+        createRequestId: content.createRequestId,
+      })
+    }
+  }
+
+  const representedViewIntentIds = new Set<string>()
+  for (const candidate of candidates) {
+    if (candidate.viewIntentId) {
+      if (viewIntentIds.includes(candidate.viewIntentId)) {
+        representedViewIntentIds.add(candidate.viewIntentId)
+      }
+      // A different nonempty view ID is authoritative; terminal handles do
+      // not let one managed view claim another view's local pane.
+      continue
+    }
+    const matches = targetViews.filter(({ soul }) => (
+      (!candidate.soulId || candidate.soulId === soul.soulId)
+      && (
+        (candidate.terminalId && candidate.terminalId === soul.terminalId)
+        || (candidate.createRequestId && candidate.createRequestId === soul.terminalCreateRequestId)
+      )
+    ))
+    if (matches.length > 1) return { representedViewIntentIds, ambiguous: true }
+    if (matches.length === 1) representedViewIntentIds.add(matches[0]!.view.viewId)
+  }
+
+  return { representedViewIntentIds, ambiguous: false }
 }
 
 /**
@@ -2518,6 +2592,20 @@ export const reopenClosedTab = createAsyncThunk(
         restoredLayout = prepared.layout
         managedViewIntentIds = prepared.viewIntentIds
         if (managedViewIntentIds.length === 0) throw new Error(MANAGED_VIEW_CLOSE_FAILED_MESSAGE)
+        const localRepresentations = locallyRepresentedManagedReopenViews(
+          getState() as RootState,
+          managedViewIntentIds,
+          runtimeSnapshot,
+        )
+        if (localRepresentations.ambiguous) throw new Error(MANAGED_VIEW_CLOSE_FAILED_MESSAGE)
+        if (localRepresentations.representedViewIntentIds.size > 0) {
+          if (localRepresentations.representedViewIntentIds.size !== managedViewIntentIds.length) {
+            throw new Error(MANAGED_VIEW_CLOSE_FAILED_MESSAGE)
+          }
+          applyManagedRuntimeInventory(runtimeSnapshot, dispatch, getState as () => RootState)
+          dispatch(consumeClosedEntry({ tabId: entry.tab.id, closedAt: entry.closedAt }))
+          return
+        }
         applyManagedRuntimeInventory(runtimeSnapshot, dispatch, getState as () => RootState)
       }
 
