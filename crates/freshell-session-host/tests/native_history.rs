@@ -360,6 +360,260 @@ fn history_binary_associates_codex_message_mirrors_across_turn_context() {
 }
 
 #[test]
+fn history_binary_associates_resumed_input_after_an_abrupt_codex_turn() {
+    let fixture: Vec<Value> =
+        include_str!("../../../test/fixtures/coding-cli/codex/task-events.sanitized.jsonl")
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+    let task_started = |id: Option<&str>| {
+        let mut row = fixture[2].clone();
+        let payload = row["payload"].as_object_mut().unwrap();
+        payload.remove("turn_id");
+        if let Some(id) = id {
+            payload.insert("turn_id".into(), json!(id));
+        }
+        row
+    };
+    for progress in ["assistant", "tool", "both", "input_only"] {
+        for prior_has_id in [true, false] {
+            for same_prompt in [false, true] {
+                for modern_first in [false, true] {
+                    for context_first in [false, true] {
+                        for start_has_id in [true, false] {
+                            for context_has_id in [true, false] {
+                                let home = tempfile::tempdir().unwrap();
+                                // Keep the supported fixture's user-before-task-start order,
+                                // then simulate an exit before any completion or abort record.
+                                let mut rows = fixture[..3].to_vec();
+                                rows[2] = task_started(prior_has_id.then_some("turn-1"));
+                                rows.extend([
+                                if prior_has_id {
+                                    json!({"type":"turn_context","payload":{"turn_id":"turn-1"}})
+                                } else {
+                                    json!({"type":"turn_context","payload":{"model":"saved-model"}})
+                                },
+                                codex_response_message("user", 0, "Sanitized prompt"),
+                            ]);
+                                if progress == "tool" || progress == "both" {
+                                    rows.push(json!({"type":"response_item","payload":{"type":"custom_tool_call",
+                                    "call_id":"interrupted-tool","name":"apply_patch","input":"Saved unfinished patch"}}));
+                                }
+                                if progress == "assistant" || progress == "both" {
+                                    rows.extend([
+                                    codex_response_message("assistant", 0, "Saved partial answer"),
+                                    json!({"type":"event_msg","payload":{"type":"agent_message","message":"Saved partial answer","phase":"commentary"}}),
+                                ]);
+                                }
+                                let prompt = if same_prompt {
+                                    "Sanitized prompt"
+                                } else {
+                                    "Resumed prompt"
+                                };
+                                let mut user = fixture[1].clone();
+                                user["payload"]["message"] = json!(prompt);
+                                let response = codex_response_message("user", 1, prompt);
+                                rows.push(if modern_first {
+                                    response.clone()
+                                } else {
+                                    user.clone()
+                                });
+                                let started = task_started(start_has_id.then_some("turn-2"));
+                                let context = if context_has_id {
+                                    json!({"type":"turn_context","payload":{"turn_id":"turn-2"}})
+                                } else {
+                                    json!({"type":"turn_context","payload":{"model":"saved-model"}})
+                                };
+                                rows.extend(if context_first {
+                                    [context, started]
+                                } else {
+                                    [started, context]
+                                });
+                                rows.push(if modern_first { user } else { response });
+                                rows.push(codex_response_message(
+                                    "assistant",
+                                    1,
+                                    "Saved resumed answer",
+                                ));
+                                write_codex_rows(home.path(), "session-activity", &rows);
+                                let result = history(home.path(), "codex", "session-activity");
+                                assert!(
+                                    result.status.success(),
+                                    "{}",
+                                    String::from_utf8_lossy(&result.stderr)
+                                );
+                                let body: Value = serde_json::from_slice(&result.stdout).unwrap();
+                                let turns = body["turns"].as_array().unwrap();
+                                let case = format!("progress={progress}, prior_id={prior_has_id}, same_prompt={same_prompt}, modern_first={modern_first}, context_first={context_first}, start_id={start_has_id}, context_id={context_has_id}");
+                                let prior_id = if prior_has_id {
+                                    "turn-1"
+                                } else {
+                                    "native-history-0"
+                                };
+                                let mut expected =
+                                    vec![("user", prior_id, "user-0:part:0", "Sanitized prompt")];
+                                if progress == "tool" || progress == "both" {
+                                    expected.push(("tool", prior_id, "interrupted-tool", ""));
+                                }
+                                if progress == "assistant" || progress == "both" {
+                                    expected.push((
+                                        "assistant",
+                                        prior_id,
+                                        "assistant-0",
+                                        "Saved partial answer",
+                                    ));
+                                }
+                                let resumed_id = if start_has_id || context_has_id {
+                                    "turn-2"
+                                } else {
+                                    "native-history-1"
+                                };
+                                expected.extend([
+                                    ("user", resumed_id, "user-1:part:0", prompt),
+                                    (
+                                        "assistant",
+                                        resumed_id,
+                                        "assistant-1",
+                                        "Saved resumed answer",
+                                    ),
+                                ]);
+                                assert_eq!(turns.len(), expected.len(), "{case}: {body}");
+                                for (turn, (role, id, item_id, text)) in turns.iter().zip(expected)
+                                {
+                                    assert_eq!(turn["role"], role, "{case}");
+                                    assert_eq!(
+                                        turn["items"].as_array().unwrap().len(),
+                                        1,
+                                        "{case}"
+                                    );
+                                    assert_eq!(turn["items"][0]["id"], item_id, "{case}");
+                                    assert_eq!(
+                                        turn["turnId"]
+                                            .as_str()
+                                            .unwrap()
+                                            .split(":row-")
+                                            .next()
+                                            .unwrap(),
+                                        id,
+                                        "native task association: {case}: {body}"
+                                    );
+                                    if role == "tool" {
+                                        assert_eq!(turn["items"][0]["status"], "running", "{case}");
+                                        assert_eq!(
+                                            turn["items"][0]["arguments"], "Saved unfinished patch",
+                                            "{case}"
+                                        );
+                                    } else {
+                                        assert_eq!(turn["items"][0]["text"], text, "{case}");
+                                    }
+                                }
+                                assert_eq!(body["capabilities"]["send"], false);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn history_binary_binds_legacy_resumed_prompt_after_an_unfinished_codex_task() {
+    let fixture: Vec<Value> =
+        include_str!("../../../test/fixtures/coding-cli/codex/task-events.sanitized.jsonl")
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+    for same_prompt in [false, true] {
+        for prior_has_id in [false, true] {
+            for next_has_id in [false, true] {
+                let home = tempfile::tempdir().unwrap();
+                let mut rows = fixture[..3].to_vec();
+                if !prior_has_id {
+                    rows[2]["payload"]
+                        .as_object_mut()
+                        .unwrap()
+                        .remove("turn_id");
+                }
+                rows.push(json!({"type":"event_msg","payload":{"type":"agent_message","message":"Unfinished legacy answer","phase":"commentary"}}));
+                let prompt = if same_prompt {
+                    "Sanitized prompt"
+                } else {
+                    "Resumed legacy prompt"
+                };
+                let mut resumed = fixture[1].clone();
+                resumed["payload"]["message"] = json!(prompt);
+                let mut started = fixture[2].clone();
+                let mut completed = fixture[4].clone();
+                for row in [&mut started, &mut completed] {
+                    if next_has_id {
+                        row["payload"]["turn_id"] = json!("turn-2");
+                    } else {
+                        row["payload"].as_object_mut().unwrap().remove("turn_id");
+                    }
+                }
+                rows.extend([resumed, started, completed]);
+                write_codex_rows(home.path(), "session-activity", &rows);
+                let result = history(home.path(), "codex", "session-activity");
+                assert!(
+                    result.status.success(),
+                    "{}",
+                    String::from_utf8_lossy(&result.stderr)
+                );
+                let body: Value = serde_json::from_slice(&result.stdout).unwrap();
+                let turns = body["turns"].as_array().unwrap();
+                let case = format!(
+                    "same_prompt={same_prompt}, prior_id={prior_has_id}, next_id={next_has_id}"
+                );
+                assert_eq!(turns.len(), 4, "{case}: {body}");
+                let prior_id = if prior_has_id {
+                    "turn-1"
+                } else {
+                    "native-history-0"
+                };
+                let next_id = if next_has_id {
+                    "turn-2"
+                } else {
+                    "native-history-1"
+                };
+                for (turn, (role, id, item_id, text)) in turns.iter().zip([
+                    ("user", prior_id, "native-line-1:part:0", "Sanitized prompt"),
+                    (
+                        "assistant",
+                        prior_id,
+                        "native-line-3",
+                        "Unfinished legacy answer",
+                    ),
+                    ("user", next_id, "native-line-4:part:0", prompt),
+                    (
+                        "assistant",
+                        next_id,
+                        "native-line-6",
+                        "Sanitized completion",
+                    ),
+                ]) {
+                    assert_eq!(turn["role"], role, "{case}");
+                    assert_eq!(
+                        turn["turnId"]
+                            .as_str()
+                            .unwrap()
+                            .split(":row-")
+                            .next()
+                            .unwrap(),
+                        id,
+                        "{case}"
+                    );
+                    assert_eq!(turn["items"].as_array().unwrap().len(), 1, "{case}");
+                    assert_eq!(turn["items"][0]["id"], item_id, "{case}");
+                    assert_eq!(turn["items"][0]["text"], text, "{case}");
+                }
+                assert_eq!(body["capabilities"]["send"], false);
+            }
+        }
+    }
+}
+
+#[test]
 fn history_binary_preserves_codex_task_boundaries_without_context_or_completion_text() {
     for end in ["task_complete", "turn_aborted", "next_task_started"] {
         for has_id in [false, true] {
