@@ -564,8 +564,28 @@ impl<'a> AssetResolver<'a> {
                 _ => &[],
             };
             for column in columns {
-                let Some(SerializedSqlValue::Text { value }) = row.values.get_mut(*column) else {
-                    continue;
+                let nullable = row.table == "session" && *column == "revert";
+                let value = match row.values.get_mut(*column) {
+                    Some(SerializedSqlValue::Text { value }) => value,
+                    Some(SerializedSqlValue::Null) if nullable => continue,
+                    Some(SerializedSqlValue::Null) => {
+                        return Err(TransferError::Blocked(format!(
+                            "native {}.{} JSON data is NULL",
+                            row.table, column
+                        )))
+                    }
+                    Some(_) => {
+                        return Err(TransferError::Blocked(format!(
+                            "native {}.{} JSON data is not stored as text",
+                            row.table, column
+                        )))
+                    }
+                    None => {
+                        return Err(TransferError::Blocked(format!(
+                            "native {}.{} JSON column is missing",
+                            row.table, column
+                        )))
+                    }
                 };
                 let mut decoded: serde_json::Value =
                     serde_json::from_str(value).map_err(|error| {
@@ -2053,6 +2073,9 @@ fn read_rows(
             serialize_row(row, table, &names)
         })?
         .collect::<Result<Vec<_>, _>>()?;
+    for row in &rows {
+        validate_primary_key(row)?;
+    }
     Ok(rows)
 }
 
@@ -2097,8 +2120,25 @@ fn primary_key_columns(table: &str) -> &'static [&'static str] {
         "project_directory" => &["project_id", "directory"],
         "todo" => &["session_id", "position"],
         "event_sequence" => &["aggregate_id"],
+        "session_context_epoch" => &["session_id"],
         _ => &["id"],
     }
+}
+
+fn validate_primary_key(row: &SerializedRow) -> Result<(), TransferError> {
+    let expected_key_length = primary_key_columns(&row.table).len();
+    if row.key.len() != expected_key_length
+        || row
+            .key
+            .iter()
+            .any(|value| matches!(value, SerializedSqlValue::Null))
+    {
+        return Err(TransferError::Blocked(format!(
+            "native {} row is missing its complete primary key",
+            row.table
+        )));
+    }
+    Ok(())
 }
 
 fn value_text(row: &SerializedRow, key: &str) -> Result<Option<String>, TransferError> {
