@@ -1,4 +1,5 @@
 import { useState } from 'react'
+import { managedRecoveryBlockedMessage } from '@/lib/managed-runtime-recovery-message'
 import type { ManagedRuntimeRecoverySummary } from '@shared/managed-runtime'
 
 export type ManagedRuntimeRecoveryCardProps = {
@@ -49,7 +50,7 @@ export function ManagedRuntimeRecoveryCard({
       <div className="min-w-0">
         <span>
           {blocked
-            ? 'This session needs attention before it can continue.'
+            ? `This session needs attention before it can continue. ${managedRecoveryBlockedMessage(recoverySummary?.reason)}`
             : 'This session could not be recovered. Start a new conversation when you are ready.'}
         </span>
         {actionError ? (

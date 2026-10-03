@@ -44,10 +44,14 @@ const runtimeMocks = vi.hoisted(() => ({
   instances: [] as Array<{ fit: ReturnType<typeof vi.fn> }>,
 }))
 
+const retryManagedRuntimeSoul = vi.hoisted(() => vi.fn())
+const queueManagedRuntimeRefresh = vi.hoisted(() => vi.fn().mockResolvedValue(undefined))
+vi.mock('@/lib/recovery/managed-runtime-recovery', () => ({ queueManagedRuntimeRefresh }))
 const stopManagedRuntimeSoul = vi.hoisted(() => vi.fn())
 vi.mock('@/lib/api', async (importOriginal) => ({
   ...await importOriginal<typeof import('@/lib/api')>(),
   stopManagedRuntimeSoul,
+  retryManagedRuntimeSoul,
 }))
 
 vi.mock('@/lib/ws-client', () => ({
@@ -653,6 +657,66 @@ describe('launch-time INVALID_TERMINAL_ID bounded retry', () => {
     expect(await within(card).findByRole('status')).toHaveTextContent('Server is unavailable')
     expect(button).toBeEnabled()
     expect((store.getState().panes.layouts[TAB] as { content: TerminalPaneContent }).content).toMatchObject(content)
+  })
+
+  it.each(['blocked', 'lost'] as const)('shows only the managed %s decision when a prior launch failure exists', async (recoveryState) => {
+    const { store, paneContent } = makeStore()
+    const content: TerminalPaneContent = { ...paneContent, status: 'error', soulId: 'same-soul', soulIntentRevision: 19,
+      launchFailure: { code: 'LAUNCH_FAILED', message: 'Old launch failed', retryable: true },
+      recoverySummary: { desiredState: 'running', recoveryState, reason: 'STORE_UNREADABLE',
+        durabilityState: 'resume_captured', allocationState: 'verified_durable' } }
+    store.dispatch(updatePaneContent({ tabId: TAB, paneId: PANE, content }))
+    render(<Provider store={store}><TerminalView tabId={TAB} paneId={PANE} paneContent={content} /></Provider>)
+    expect(screen.getAllByRole('alert')).toHaveLength(1)
+    expect(screen.queryByTestId('terminal-launch-failure-card')).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'Retry', exact: true })).not.toBeInTheDocument()
+  })
+
+  it('clears prior managed retry feedback when a different terminal conversation occupies the pane', async () => {
+    retryManagedRuntimeSoul.mockRejectedValueOnce(new Error('Old conversation repair failed'))
+    const { store, paneContent } = makeStore()
+    const content: TerminalPaneContent = { ...paneContent, status: 'error', soulId: 'old-retry-soul', soulIntentRevision: 19,
+      recoverySummary: { desiredState: 'running', recoveryState: 'blocked', reason: 'STORE_UNREADABLE',
+        durabilityState: 'resume_captured', allocationState: 'verified_durable' } }
+    store.dispatch(updatePaneContent({ tabId: TAB, paneId: PANE, content }))
+    const view = render(<Provider store={store}><TerminalView tabId={TAB} paneId={PANE} paneContent={content} /></Provider>)
+    fireEvent.click(screen.getByRole('button', { name: 'Retry recovery' }))
+    expect(await within(screen.getByTestId('managed-runtime-recovery-card')).findByRole('status')).toHaveTextContent('Old conversation repair failed')
+    const replacement = { ...content, createRequestId: 'new-retry-create', soulId: 'new-retry-soul' }
+    act(() => store.dispatch(updatePaneContent({ tabId: TAB, paneId: PANE, content: replacement })))
+    view.rerender(<Provider store={store}><TerminalView tabId={TAB} paneId={PANE} paneContent={replacement} /></Provider>)
+    expect(within(screen.getByTestId('managed-runtime-recovery-card')).queryByRole('status')).toBeNull()
+  })
+
+  it.each(['repair', 'reason', 'stale_result', 'stale_error', 'different_create', 'different_soul'] as const)('handles a managed terminal retry: %s', async (scenario) => {
+    let resolve!: (value: unknown) => void
+    let reject!: (error: Error) => void
+    retryManagedRuntimeSoul.mockReset()
+    queueManagedRuntimeRefresh.mockClear()
+    retryManagedRuntimeSoul.mockReturnValueOnce(new Promise((res, rej) => { resolve = res; reject = rej }))
+    const { store, paneContent } = makeStore()
+    const content: TerminalPaneContent = { ...paneContent, status: 'error', soulId: 'retry-soul', soulIntentRevision: 19,
+      recoverySummary: { desiredState: 'running', recoveryState: 'blocked', reason: 'STORE_UNREADABLE',
+        durabilityState: 'resume_captured', allocationState: 'verified_durable' } }
+    store.dispatch(updatePaneContent({ tabId: TAB, paneId: PANE, content }))
+    render(<Provider store={store}><TerminalView tabId={TAB} paneId={PANE} paneContent={content} /></Provider>)
+    const card = screen.getByTestId('managed-runtime-recovery-card')
+    fireEvent.click(within(card).getByRole('button', { name: 'Retry recovery' }))
+    expect(retryManagedRuntimeSoul).toHaveBeenCalledWith('retry-soul', 19)
+    const stale = scenario.startsWith('stale') || scenario.startsWith('different')
+    if (stale) act(() => store.dispatch(updatePaneContent({ tabId: TAB, paneId: PANE, content: { ...content,
+      ...(scenario === 'different_create' ? { createRequestId: 'another-create' }
+        : scenario === 'different_soul' ? { soulId: 'another-soul' } : { soulIntentRevision: 20 }),
+    } })))
+    await act(async () => {
+      if (scenario === 'stale_error') reject(new Error('Obsolete retry failure'))
+      else resolve({ outcome: 'blocked', view: { soulId: 'retry-soul', intentRevision: 19, recoveryReason: 'OLD_RUNTIME_NOT_EMPTY' },
+        probe: { kind: 'blocked', data: { reason: 'OLD_RUNTIME_NOT_EMPTY', retry_hint: { manualRetry: true,
+          ...(scenario === 'reason' ? {} : { repair: 'Confirm the old process has stopped, then retry.' }) } } } })
+    })
+    if (stale) expect(within(card).queryByRole('status')).toBeNull()
+    else expect(await within(card).findByRole('status')).toHaveTextContent(scenario === 'repair'
+      ? 'Confirm the old process has stopped, then retry.' : 'The previous agent process could not be confirmed stopped. Check it before retrying recovery.')
   })
 
   it('keeps a blocked managed pane from re-creating after a rejected-terminal callback', async () => {

@@ -33,9 +33,8 @@ import {
   updatePaneContent,
   updatePaneTitle,
 } from '@/store/panesSlice'
-import { retryManagedRuntimeSoul } from '@/lib/api'
+import { retryManagedConversation } from '@/lib/managed-runtime-retry'
 import { confirmManagedRuntimeStopped } from '@/lib/managed-runtime-stop'
-import { queueManagedRuntimeRefresh } from '@/lib/recovery/managed-runtime-recovery'
 import { isManagedRuntimeRecoveryDecision, ManagedRuntimeRecoveryCard } from '@/components/ManagedRuntimeRecoveryCard'
 import { buildReconcileRequestForPanes, foldVerdicts } from '@/lib/pane-reconcile'
 import type { PaneReconcileRequest, SessionRuntimeOwnerMessage } from '@shared/ws-protocol'
@@ -7174,12 +7173,13 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
 
   const retryManagedRecovery = useCallback(async () => {
     const current = contentRef.current
-    if (!current?.soulId || typeof current.soulIntentRevision !== 'number') {
-      throw new Error('Managed recovery is missing its current revision.')
-    }
-    await retryManagedRuntimeSoul(current.soulId, current.soulIntentRevision)
-    await queueManagedRuntimeRefresh(appStore, 'pane-recovery-retry')
-  }, [appStore])
+    if (!current) return
+    await retryManagedConversation(current, () => {
+      const root = appStore.getState().panes.layouts[tabId]
+      const latest = root ? findPaneContent(root, paneId) : null
+      return latest?.kind === 'terminal' ? latest : null
+    }, appStore)
+  }, [appStore, paneId, tabId])
 
   // NOW we can do the conditional return - after all hooks
   if (!isTerminal || !terminalContent) {
@@ -7276,10 +7276,9 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
     }))
   }
 
-  // The typed launch-failure card: rendered only while NOT divergent — the
-  // live owner record (the divergence card) is the authoritative surface
-  // when both would show.
-  const typedLaunchFailure = freshAgentOwnerDivergence === null
+  // Managed recovery and owner divergence own the current decision. An old
+  // launch failure must not add a competing alert or obsolete retry action.
+  const typedLaunchFailure = !managedRecoveryDecision && freshAgentOwnerDivergence === null
     ? terminalContent.launchFailure
     : undefined
 
@@ -7441,6 +7440,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
       {isManagedRuntimeRecoveryDecision(terminalContent.recoverySummary) ? (
         <div className="pointer-events-auto absolute inset-x-0 top-0 z-20 m-2">
           <ManagedRuntimeRecoveryCard
+            key={`${terminalContent.createRequestId}:${terminalContent.soulId}:${terminalContent.recoverySummary?.recoveryState}`}
             recoverySummary={terminalContent.recoverySummary}
             onRetry={retryManagedRecovery}
             onStartFresh={startFreshConversation}

@@ -143,7 +143,9 @@ for (const kind of ['terminal', 'fresh-agent'] as const) {
       retries.push(route.request().postDataJSON())
       await route.fulfill(retries.length === 1
         ? { status: 409, json: { message: 'The provider is still unavailable. Try again.' } }
-        : { json: { ok: true } })
+        : { json: { outcome: 'blocked', view: { soulId: SOUL_ID, intentRevision: INTENT_REVISION, recoveryReason: 'STORE_UNREADABLE' },
+          probe: { kind: 'blocked', data: { reason: 'STORE_UNREADABLE', retry_hint: { manualRetry: true,
+            repair: 'Restore read access to the saved conversation store, then retry recovery.' } } } } })
     })
     await page.route(/\/api\/runtime\/souls(?:\?.*)?$/, async (route) => {
       inventoryRefreshes += 1
@@ -152,6 +154,7 @@ for (const kind of ['terminal', 'fresh-agent'] as const) {
     const card = page.getByTestId('managed-runtime-recovery-card')
     await expect(card).toBeVisible()
     await expect(card).toContainText('This session needs attention before it can continue.')
+    await expect(card).toContainText('The provider is unavailable. Check its availability, then retry recovery.')
     if (kind === 'fresh-agent') await expect(page.getByText(SAVED_HISTORY_TEXT, { exact: true })).toBeVisible()
     await card.getByRole('button', { name: 'Retry recovery', exact: true }).click()
     await expect(card.getByRole('status')).toHaveText('The provider is still unavailable. Try again.')
@@ -159,7 +162,7 @@ for (const kind of ['terminal', 'fresh-agent'] as const) {
     expect(inventoryRefreshes).toBe(0)
     await card.getByRole('button', { name: 'Retry recovery', exact: true }).click()
     await expect.poll(() => inventoryRefreshes).toBe(1)
-    await expect(card.getByRole('status')).toBeHidden()
+    await expect(card.getByRole('status')).toHaveText('Restore read access to the saved conversation store, then retry recovery.')
     expect(retries).toHaveLength(2)
     for (const retry of retries) {
       expect(retry.expectedIntentRevision).toBe(INTENT_REVISION)
@@ -241,7 +244,39 @@ for (const kind of ['terminal', 'fresh-agent'] as const) {
     for (const field of ['soulId', 'incarnationId', 'soulIntentRevision', 'viewIntentId', 'recoverySummary', 'resourceSummary', 'sessionRef', 'resumeSessionId']) {
       expect(replacement[field as keyof typeof replacement]).toBeUndefined()
     }
-    if (replacement.kind === 'fresh-agent') expect(replacement.sessionId).toBeUndefined()
+    if (replacement.kind === 'fresh-agent') {
+      expect(replacement.sessionId).toBeUndefined()
+      const tabsBeforeInventory = await page.evaluate(() => window.__FRESHELL_TEST_HARNESS__!.getState().tabs.tabs.map((tab) => tab.id))
+      const newSoulId = 'new-contextual-soul'
+      const runtimeSessionId = 'new-runtime-session'
+      const inventoryRevision = 101
+      await page.route(/\/api\/runtime\/souls(?:\?.*)?$/, (route) => route.fulfill({ json: {
+        revision: inventoryRevision, readiness: { ...readiness, inventoryRevision }, pendingProjectionCount: 0,
+        souls: [{ soulId: newSoulId, incarnationId: 'new-incarnation', intentRevision: 1,
+          executionGeneration: 1, launchState: 'running', cleanupState: 'none',
+          desiredState: 'running', recoveryState: 'live', durabilityState: 'unknown', allocationState: 'allocated',
+          provider: 'codex', freshAgentSessionId: runtimeSessionId, freshAgentSessionType: 'freshcodex',
+          evidenceRevision: 0, successfulRecoveriesInWindow: 0 }],
+        viewIntents: [{ viewId: 'new-contextual-view', soulId: newSoulId, ownerId: 'fixture-owner', workspaceId: 'fixture-workspace',
+          kind: 'automatic_primary', preferredTabId: 'new-preferred-tab', preferredPaneId: 'new-preferred-pane',
+          title: 'New conversation', placementGroup: '', visibility: 'visible', revision: 1, soulIntentRevision: 1,
+          createdAt: 1, updatedAt: 1 }],
+      } }))
+      await harness.receiveWsMessage({ type: 'freshAgent.created', requestId: replacement.createRequestId,
+        sessionId: runtimeSessionId, sessionType: 'freshcodex', provider: 'codex', runtimeProvider: 'codex' })
+      await expect.poll(async () => {
+        const content = await paneContent(page)
+        return content.kind === 'fresh-agent' ? content.sessionId : undefined
+      }).toBe(runtimeSessionId)
+      await harness.receiveWsMessage({ type: 'runtime.inventory.changed', revision: inventoryRevision,
+        readiness: { ...readiness, inventoryRevision } })
+      await expect.poll(async () => (await paneContent(page)).soulId).toBe(newSoulId)
+      expect(await page.evaluate(() => window.__FRESHELL_TEST_HARNESS__!.getState().tabs.tabs.map((tab) => tab.id))).toEqual(tabsBeforeInventory)
+      expect(await paneContent(page)).toMatchObject({ kind: 'fresh-agent', sessionId: runtimeSessionId,
+        createRequestId: replacement.createRequestId, viewIntentId: 'new-contextual-view' })
+      const afterInventoryMessages = await harness.getSentWsMessages() as Array<{ type?: string }>
+      expect(afterInventoryMessages.filter((message) => message.type === 'terminal.create')).toEqual([])
+    }
   })
 }
 

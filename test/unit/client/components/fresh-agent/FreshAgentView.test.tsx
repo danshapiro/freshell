@@ -6742,6 +6742,53 @@ describe('FreshAgentView', () => {
     })
   })
 
+  it('clears prior managed retry feedback when a different Fresh Agent conversation occupies the pane', async () => {
+    apiMock.retryManagedRuntimeSoul.mockRejectedValueOnce(new Error('Old conversation repair failed'))
+    const store = createStore()
+    const content = { kind: 'fresh-agent' as const, sessionType: 'freshcodex' as const, provider: 'codex',
+      createRequestId: 'old-retry-create', status: 'error' as const, soulId: 'old-retry-soul', soulIntentRevision: 19,
+      recoverySummary: { desiredState: 'running' as const, recoveryState: 'blocked' as const, reason: 'STORE_UNREADABLE',
+        durabilityState: 'resume_captured' as const, allocationState: 'verified_durable' as const } }
+    store.dispatch(initLayout({ tabId: 'tab-1', paneId: 'pane-1', content }))
+    render(<Provider store={store}><StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" /></Provider>)
+    fireEvent.click(screen.getByRole('button', { name: 'Retry recovery' }))
+    expect(await within(screen.getByTestId('managed-runtime-recovery-card')).findByRole('status')).toHaveTextContent('Old conversation repair failed')
+    act(() => store.dispatch(updatePaneContent({ tabId: 'tab-1', paneId: 'pane-1', content: {
+      ...content, createRequestId: 'new-retry-create', soulId: 'new-retry-soul',
+    } })))
+    expect(within(screen.getByTestId('managed-runtime-recovery-card')).queryByRole('status')).toBeNull()
+  })
+
+  it.each(['repair', 'reason', 'stale_result', 'stale_error', 'different_create', 'different_soul'] as const)('handles a managed Fresh Agent retry: %s', async (scenario) => {
+    let resolve!: (value: unknown) => void
+    let reject!: (error: Error) => void
+    apiMock.retryManagedRuntimeSoul.mockReturnValueOnce(new Promise((res, rej) => { resolve = res; reject = rej }))
+    const store = createStore()
+    const content = { kind: 'fresh-agent' as const, sessionType: 'freshcodex' as const, provider: 'codex',
+      createRequestId: 'retry-create', status: 'error' as const, soulId: 'retry-soul', soulIntentRevision: 19,
+      recoverySummary: { desiredState: 'running' as const, recoveryState: 'blocked' as const, reason: 'STORE_UNREADABLE',
+        durabilityState: 'resume_captured' as const, allocationState: 'verified_durable' as const } }
+    store.dispatch(initLayout({ tabId: 'tab-1', paneId: 'pane-1', content }))
+    render(<Provider store={store}><StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" /></Provider>)
+    const card = screen.getByTestId('managed-runtime-recovery-card')
+    fireEvent.click(within(card).getByRole('button', { name: 'Retry recovery' }))
+    expect(apiMock.retryManagedRuntimeSoul).toHaveBeenCalledWith('retry-soul', 19)
+    const stale = scenario.startsWith('stale') || scenario.startsWith('different')
+    if (stale) act(() => store.dispatch(updatePaneContent({ tabId: 'tab-1', paneId: 'pane-1', content: { ...content,
+      ...(scenario === 'different_create' ? { createRequestId: 'another-create' }
+        : scenario === 'different_soul' ? { soulId: 'another-soul' } : { soulIntentRevision: 20 }),
+    } })))
+    await act(async () => {
+      if (scenario === 'stale_error') reject(new Error('Obsolete retry failure'))
+      else resolve({ outcome: 'blocked', view: { soulId: 'retry-soul', intentRevision: 19, recoveryReason: 'OLD_RUNTIME_NOT_EMPTY' },
+        probe: { kind: 'blocked', data: { reason: 'OLD_RUNTIME_NOT_EMPTY', retry_hint: { manualRetry: true,
+          ...(scenario === 'reason' ? {} : { repair: 'Confirm the old process has stopped, then retry.' }) } } } })
+    })
+    if (stale) expect(within(card).queryByRole('status')).toBeNull()
+    else expect(await within(card).findByRole('status')).toHaveTextContent(scenario === 'repair'
+      ? 'Confirm the old process has stopped, then retry.' : 'The previous agent process could not be confirmed stopped. Check it before retrying recovery.')
+  })
+
   it.each([
     ['freshclaude', 'claude'], ['kilroy', 'claude'], ['freshcodex', 'codex'], ['freshopencode', 'opencode'],
   ] as const)('stops the persisted managed soul before replacing a restored %s conversation', async (sessionType, provider) => {
