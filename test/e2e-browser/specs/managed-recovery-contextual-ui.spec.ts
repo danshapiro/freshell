@@ -287,6 +287,60 @@ for (const kind of ['terminal', 'fresh-agent'] as const) {
   }
 }
 
+test('shared Fresh session puts the recovery decision on its originating pane despite layout order', async ({ freshellPage, page, terminal, harness }) => {
+  await terminal.waitForTerminal()
+  await installPane(page, 'fresh-agent', 'live')
+  const identity = await page.evaluate(({ sessionId, model }) => {
+    const harness = window.__FRESHELL_TEST_HARNESS__!
+    const state = harness.getState()
+    const tabId = state.tabs.activeTabId!
+    const mirrorPaneId = state.panes.activePane[tabId]
+    const originPaneId = 'shared-session-origin-pane'
+    harness.setFreshAgentNetworkEffectsSuppressed(originPaneId, true)
+    const content = (createRequestId: string) => ({ kind: 'fresh-agent', sessionType: 'freshcodex', provider: 'codex',
+      createRequestId, sessionId, sessionRef: { provider: 'codex', sessionId }, status: 'idle',
+      initialCwd: '/tmp', settingsDismissed: true, model, effort: 'low' })
+    harness.dispatch({ type: 'panes/updatePaneContent', payload: { tabId, paneId: mirrorPaneId, content: content('mirror-create') } })
+    harness.dispatch({ type: 'panes/splitPane', payload: { tabId, paneId: mirrorPaneId, direction: 'horizontal',
+      newPaneId: originPaneId, newContent: content('origin-create'), activate: false } })
+    harness.clearSentWsMessages?.()
+    return { tabId, mirrorPaneId, originPaneId, tabIds: state.tabs.tabs.map((tab) => tab.id) }
+  }, { sessionId: SESSION_ID, model: FRESHCODEX_DEFAULT_MODEL })
+  const inventoryRevision = 171
+  await page.route(/\/api\/runtime\/souls(?:\?.*)?$/, (route) => route.fulfill({ json: {
+    revision: inventoryRevision, readiness: { ...readiness, inventoryRevision }, pendingProjectionCount: 0,
+    souls: [{ soulId: SOUL_ID, incarnationId: 'shared-incarnation', intentRevision: INTENT_REVISION,
+      executionGeneration: 1, launchState: 'stopped', cleanupState: 'none', desiredState: 'stopped',
+      recoveryState: 'lost', recoveryReason: 'provider_state_missing', durabilityState: 'resume_captured',
+      allocationState: 'verified_durable', provider: 'codex', nativeSessionId: SESSION_ID,
+      freshAgentSessionId: SESSION_ID, freshAgentSessionType: 'freshcodex', freshAgentCreateRequestId: 'origin-create',
+      evidenceRevision: 1, successfulRecoveriesInWindow: 0 }],
+    viewIntents: [{ viewId: 'shared-origin-view', soulId: SOUL_ID, ownerId: 'fixture-owner', workspaceId: 'fixture-workspace',
+      kind: 'automatic_primary', preferredTabId: identity.tabId, preferredPaneId: identity.originPaneId,
+      title: 'Retained conversation', placementGroup: '', visibility: 'visible', revision: 1,
+      soulIntentRevision: INTENT_REVISION, createdAt: 1, updatedAt: 1 }],
+  } }))
+  await harness.receiveWsMessage({ type: 'runtime.inventory.changed', revision: inventoryRevision, readiness: { ...readiness, inventoryRevision } })
+  const card = page.getByTestId('managed-runtime-recovery-card')
+  await expect(card).toBeVisible()
+  expect(await card.evaluate((element) => element.closest('[data-pane-id]')?.getAttribute('data-pane-id'))).toBe(identity.originPaneId)
+  await expect(card.getByRole('button', { name: 'Start new conversation', exact: true })).toBeVisible()
+  await expect(card.getByRole('button', { name: 'Retry recovery', exact: true })).toBeHidden()
+  const panes = await page.evaluate((tabId) => {
+    const root = window.__FRESHELL_TEST_HARNESS__!.getState().panes.layouts[tabId]
+    if (root?.type !== 'split') throw new Error('Expected the original two panes')
+    return root.children.map((node) => {
+      if (node.type !== 'leaf') throw new Error('Expected a leaf')
+      return { id: node.id, content: node.content }
+    })
+  }, identity.tabId)
+  expect(panes[0]).toMatchObject({ id: identity.mirrorPaneId, content: { createRequestId: 'mirror-create' } })
+  expect(panes[0].content.recoverySummary).toBeUndefined()
+  expect(panes[1]).toMatchObject({ id: identity.originPaneId, content: { createRequestId: 'origin-create',
+    viewIntentId: 'shared-origin-view', recoverySummary: { desiredState: 'stopped', recoveryState: 'lost' } } })
+  expect(await page.evaluate(() => window.__FRESHELL_TEST_HARNESS__!.getState().tabs.tabs.map((tab) => tab.id))).toEqual(identity.tabIds)
+})
+
 for (const deliveryOrder of ['ack-first', 'inventory-first'] as const) {
   test(`concurrent Fresh launches preserve their panes with ${deliveryOrder} inventory delivery`, async ({ freshellPage, page, terminal, harness }) => {
     await terminal.waitForTerminal()

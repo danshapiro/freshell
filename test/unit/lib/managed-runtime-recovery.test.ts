@@ -369,6 +369,71 @@ describe('managed runtime recovery merge', () => {
     expect(plan.creates).toHaveLength(1)
   })
 
+  it.each(['create', 'view'] as const)('prefers the originating Fresh %s identity over an earlier pane sharing its session', (identity) => {
+    const state = baseState()
+    const content = { kind: 'fresh-agent', status: 'connected', sessionType: 'freshcodex', provider: 'codex', sessionId: 'shared-runtime' }
+    state.panes.layouts['user-tab'] = { type: 'split', id: 'split-root', direction: 'horizontal', sizes: [50, 50], children: [
+      { type: 'leaf', id: 'other-pane', content: { ...content, createRequestId: 'other-create' } },
+      { type: 'leaf', id: 'origin-pane', content: { ...content, createRequestId: 'origin-create',
+        ...(identity === 'view' ? { viewIntentId: 'view-one' } : {}) } },
+    ] }
+    const inventory = snapshot([soul({ provider: 'codex', nativeSessionId: undefined, terminalId: undefined,
+      terminalCreateRequestId: undefined, freshAgentSessionId: 'shared-runtime', freshAgentSessionType: 'freshcodex',
+      freshAgentCreateRequestId: identity === 'create' ? 'origin-create' : 'other-create',
+      recoveryState: 'lost', desiredState: 'stopped', recoveryReason: 'provider_state_missing',
+    })])
+    const store = storeWithState(state)
+    const plan = buildManagedRuntimeMergePlan(inventory, store.getState() as any)
+    expect(plan.creates).toHaveLength(0)
+    expect(plan.updates.map((update) => update.paneId)).toEqual(['origin-pane'])
+    applyManagedRuntimeMergePlan(store as any, plan)
+    const panes = store.getState().panes.layouts['user-tab'].children
+    expect(panes[0].content.recoverySummary).toBeUndefined()
+    expect(panes[1].content).toMatchObject({ createRequestId: 'origin-create', viewIntentId: 'view-one',
+      recoverySummary: { recoveryState: 'lost', desiredState: 'stopped' } })
+  })
+
+  it.each([true, false])('preserves an explicit Fresh view sharing the automatic view creation seed (origin present: %s)', (originPresent) => {
+    const state = baseState()
+    const content = { kind: 'fresh-agent', createRequestId: 'source-create', status: 'connected',
+      sessionType: 'freshcodex', provider: 'codex', sessionId: 'shared-runtime', soulId: 'soul-one' }
+    const explicitPane = { type: 'leaf', id: 'explicit-pane', content: { ...content, viewIntentId: 'z-explicit' } }
+    state.panes.layouts['user-tab'] = originPresent
+      ? { type: 'split', id: 'split-root', direction: 'horizontal', sizes: [50, 50], children: [explicitPane,
+        { type: 'leaf', id: 'origin-pane', content: { ...content, createRequestId: 'reminted-create', viewIntentId: 'a-automatic' } }] }
+      : explicitPane
+    const inventory = snapshot([soul({ provider: 'codex', nativeSessionId: undefined, terminalId: undefined,
+      terminalCreateRequestId: undefined, freshAgentSessionId: 'shared-runtime', freshAgentSessionType: 'freshcodex',
+      freshAgentCreateRequestId: 'source-create',
+    })], [view({ viewId: 'a-automatic' }), view({ viewId: 'z-explicit', kind: 'explicit' })])
+    const plan = buildManagedRuntimeMergePlan(inventory, state)
+    expect(plan.updates.find((update) => update.content.viewIntentId === 'z-explicit')?.paneId).toBe('explicit-pane')
+    if (originPresent) {
+      expect(plan.creates).toHaveLength(0)
+      expect(plan.updates.find((update) => update.content.viewIntentId === 'a-automatic')?.paneId).toBe('origin-pane')
+    } else {
+      expect(plan.updates).toHaveLength(1)
+      expect(plan.creates.map((create) => create.content.viewIntentId)).toEqual(['a-automatic'])
+    }
+    const store = storeWithState(state)
+    applyManagedRuntimeMergePlan(store as any, plan)
+    expect(buildManagedRuntimeMergePlan(inventory, store.getState() as any).creates).toHaveLength(0)
+  })
+
+  it('adopts a restored Fresh pane through native identity when its local create key was reminted', () => {
+    const state = baseState()
+    state.panes.layouts['user-tab'].content = { kind: 'fresh-agent', createRequestId: 'restored-local-create',
+      status: 'connected', sessionType: 'freshcodex', provider: 'codex', sessionId: 'native-one',
+      sessionRef: { provider: 'codex', sessionId: 'native-one' } }
+    const plan = buildManagedRuntimeMergePlan(snapshot([soul({ provider: 'codex', nativeSessionId: 'native-one',
+      terminalId: undefined, terminalCreateRequestId: undefined, freshAgentSessionId: 'runtime-one',
+      freshAgentSessionType: 'freshcodex', freshAgentCreateRequestId: 'original-server-create',
+    })]), state)
+    expect(plan.creates).toHaveLength(0)
+    expect(plan.updates[0]).toMatchObject({ paneId: 'user-pane', content: { kind: 'fresh-agent',
+      createRequestId: 'restored-local-create', viewIntentId: 'view-one' } })
+  })
+
   it.each(['ack-first', 'inventory-first'] as const)('correlates concurrent Fresh launches with %s delivery and still restores unrelated cold views', (order) => {
     const state = baseState()
     state.panes.layouts['user-tab'] = { type: 'split', id: 'split-root', direction: 'horizontal', sizes: [50, 50], children: [

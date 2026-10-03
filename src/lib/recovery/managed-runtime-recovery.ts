@@ -180,42 +180,61 @@ function updateExistingContent(
   return existing
 }
 
-function paneMatchesView(
+/** Prefer view identity, then source creation, runtime, and saved-session identity. */
+function paneMatchPriority(
   location: PaneLocation,
   soul: ManagedRuntimeSoul,
   view: ManagedRuntimeViewIntent,
-  exactOnly: boolean,
-): boolean {
+): number {
   const content = location.content
-  if (content.kind !== 'terminal' && content.kind !== 'fresh-agent') return false
-  if (content.viewIntentId === view.viewId) return true
-  if (exactOnly) return false
-  if (content.soulId === soul.soulId) return true
-  if (content.kind === 'terminal' && soul.terminalId && content.terminalId === soul.terminalId) {
-    return true
-  }
+  if (content.kind !== 'terminal' && content.kind !== 'fresh-agent') return 0
+  if (content.viewIntentId === view.viewId) return 4
+  // A conversation may have several views. Its creation seed and shared
+  // session identity must never overwrite another view's existing binding.
+  if (view.kind === 'explicit' || content.viewIntentId) return 0
   // The originating pane knows its createRequestId long before the server
   // answers with a terminalId. Without this, the whole create round trip is a
   // window in which the pane is invisible to the matcher and the reconciler
   // manufactures a SECOND view of the same soul — a duplicate tab over one
   // writer, and a pane whose output the user never sees.
   if (soul.terminalCreateRequestId && content.createRequestId === soul.terminalCreateRequestId) {
-    return true
+    return 3
   }
   // The persisted create request binds inventory before the created ack;
   // the runtime session ID also supports older inventory after that ack.
   const freshProvider = clientProviderFor(soul)
-  if (content.kind === 'fresh-agent'
+  const freshAgent = content.kind === 'fresh-agent'
     && content.provider === freshProvider
     && content.sessionType === soul.freshAgentSessionType
-    && ((soul.freshAgentCreateRequestId && content.createRequestId === soul.freshAgentCreateRequestId)
-      || (soul.freshAgentSessionId && content.sessionId === soul.freshAgentSessionId))) return true
+    ? content : undefined
+  if (freshAgent && soul.freshAgentCreateRequestId && freshAgent.createRequestId === soul.freshAgentCreateRequestId) return 3
+  if (content.soulId === soul.soulId) return 2
+  if (content.kind === 'terminal' && soul.terminalId && content.terminalId === soul.terminalId) return 2
+  if (freshAgent && soul.freshAgentSessionId && freshAgent.sessionId === soul.freshAgentSessionId) return 1
   const sessionRef = sessionRefFor(soul)
-  return Boolean(
-    sessionRef
-      && content.sessionRef?.provider === sessionRef.provider
-      && content.sessionRef.sessionId === sessionRef.sessionId,
-  )
+  if (sessionRef
+    && content.sessionRef?.provider === sessionRef.provider
+    && content.sessionRef.sessionId === sessionRef.sessionId) return 1
+  return 0
+}
+
+function findPaneForView(
+  locations: PaneLocation[],
+  soul: ManagedRuntimeSoul,
+  view: ManagedRuntimeViewIntent,
+  claimed: Set<string>,
+): PaneLocation | undefined {
+  let location: PaneLocation | undefined
+  let bestPriority = 0
+  for (const candidate of locations) {
+    if (claimed.has(`${candidate.tabId}:${candidate.paneId}`)) continue
+    const priority = paneMatchPriority(candidate, soul, view)
+    if (priority > bestPriority) {
+      location = candidate
+      bestPriority = priority
+    }
+  }
+  return location
 }
 
 function collisionFreeTabId(
@@ -261,11 +280,7 @@ export function buildManagedRuntimeMergePlan(
     const soul = souls.get(view.soulId)
     if (!soul) continue
 
-    const exactOnly = view.kind === 'explicit'
-    const location = locations.find((candidate) => {
-      const key = `${candidate.tabId}:${candidate.paneId}`
-      return !claimed.has(key) && paneMatchesView(candidate, soul, view, exactOnly)
-    })
+    const location = findPaneForView(locations, soul, view, claimed)
     const fields = managedProjectionFields(soul, view)
     const status = terminalStatus(soul)
     const sessionRef = sessionRefFor(soul)
