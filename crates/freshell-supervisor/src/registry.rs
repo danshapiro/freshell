@@ -2594,7 +2594,7 @@ fn load_recovery_context(
 
 pub(crate) fn load_inventory(conn: &Connection) -> Result<Vec<RuntimeView>, RegistryError> {
     let mut stmt = conn.prepare(
-        "SELECT i.soul_id,i.incarnation_id,i.launch_state,i.cleanup_state,s.intent_revision,i.container_id,i.host_boot_id,i.execution_generation,i.effective_limits,i.terminal_id,s.project_key,s.resource_profile,s.desired_state,s.recovery_state,s.durability_state,s.allocation_state,s.provider,s.native_session_id,s.recovery_reason,i.prior_incarnation_id,s.recovery_attempt_id,s.evidence_revision,s.successful_recoveries_in_window,i.terminal_spec,s.configured_limits,(SELECT MAX(v.revision) FROM view_intents v WHERE v.soul_id=i.soul_id),s.loss_incident_id,i.fresh_agent_spec FROM incarnations i JOIN souls s ON s.soul_id=i.soul_id ORDER BY i.created_at,i.incarnation_id",
+        "SELECT i.soul_id,i.incarnation_id,i.launch_state,i.cleanup_state,s.intent_revision,i.container_id,i.host_boot_id,i.execution_generation,i.effective_limits,i.terminal_id,s.project_key,s.resource_profile,s.desired_state,s.recovery_state,s.durability_state,s.allocation_state,s.provider,s.native_session_id,s.recovery_reason,i.prior_incarnation_id,s.recovery_attempt_id,s.evidence_revision,s.successful_recoveries_in_window,i.terminal_spec,s.configured_limits,(SELECT MAX(v.revision) FROM view_intents v WHERE v.soul_id=i.soul_id),s.loss_incident_id,i.fresh_agent_spec,s.creation_seed_ref FROM incarnations i JOIN souls s ON s.soul_id=i.soul_id ORDER BY i.created_at,i.incarnation_id",
     )?;
     let mut rows = stmt.query([])?;
     let mut out = Vec::new();
@@ -2643,6 +2643,11 @@ pub(crate) fn load_inventory(conn: &Connection) -> Result<Vec<RuntimeView>, Regi
             fresh_agent_session_id: fresh_agent_spec
                 .as_ref()
                 .map(|spec| spec.session_id.clone()),
+            fresh_agent_create_request_id: if fresh_agent_spec.is_some() {
+                Some(row.get(28)?)
+            } else {
+                None
+            },
             fresh_agent_session_type: fresh_agent_spec
                 .as_ref()
                 .map(|spec| spec.session_type.clone()),
@@ -3337,6 +3342,54 @@ mod tests {
                 .await,
             Err(RegistryError::InputConflict)
         ));
+    }
+
+    #[tokio::test]
+    async fn fresh_create_inventory_correlates_launch_without_mislabeling_non_fresh_seeds() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let registry = Registry::open(dir.path(), None).unwrap();
+        let fresh_soul = SoulId::new();
+        let prepared =
+            materialize_fresh_runtime(&registry, fresh_soul.clone(), workspace.path()).await;
+        let non_fresh_soul = SoulId::new();
+        materialize_test_runtime(&registry, non_fresh_soul.clone()).await;
+        let inventory = registry.inventory().await.unwrap();
+        let fresh = inventory
+            .iter()
+            .find(|view| view.soul_id == fresh_soul)
+            .unwrap();
+        assert_eq!(fresh.native_session_id, None);
+        assert_eq!(
+            serde_json::to_value(fresh).unwrap()["freshAgentCreateRequestId"],
+            "seed"
+        );
+        let non_fresh = inventory
+            .iter()
+            .find(|view| view.soul_id == non_fresh_soul)
+            .unwrap();
+        assert!(serde_json::to_value(non_fresh)
+            .unwrap()
+            .get("freshAgentCreateRequestId")
+            .is_none());
+        registry
+            .record_native_session(
+                fresh_soul.clone(),
+                prepared.incarnation_id,
+                "native-observed".into(),
+            )
+            .await
+            .unwrap();
+        let inventory = registry.inventory().await.unwrap();
+        let fresh = inventory
+            .iter()
+            .find(|view| view.soul_id == fresh_soul)
+            .unwrap();
+        assert_eq!(fresh.native_session_id.as_deref(), Some("native-observed"));
+        assert_eq!(
+            serde_json::to_value(fresh).unwrap()["freshAgentCreateRequestId"],
+            "seed"
+        );
     }
 
     #[tokio::test]
