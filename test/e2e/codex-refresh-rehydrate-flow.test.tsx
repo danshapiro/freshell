@@ -274,6 +274,10 @@ describe('codex refresh rehydrate flow (e2e)', () => {
 
   afterEach(() => {
     cleanup()
+    // A previous test's store can still have a debounced layout write armed.
+    // Settle it before the next test clears localStorage, or that old store
+    // can repopulate this shared per-window key and race the next store.
+    window.dispatchEvent(new Event('pagehide'))
     vi.restoreAllMocks()
     vi.unstubAllGlobals()
   })
