@@ -135,22 +135,33 @@ fn history_binary_keeps_codex_tool_output_with_its_invocation() {
 
 #[test]
 fn history_binary_reads_exact_saved_opencode_rows_without_a_daemon() {
-    for journal_mode in ["DELETE", "WAL"] {
+    for (has_revert, journal_mode, keep_open) in [
+        (false, "DELETE", false),
+        (false, "WAL", false),
+        (false, "WAL", true),
+        (true, "DELETE", false),
+        (true, "WAL", false),
+        (true, "WAL", true),
+    ] {
         let home = tempfile::tempdir().unwrap();
         let directory = home.path().join(".local/share/opencode");
         std::fs::create_dir_all(&directory).unwrap();
         let db = Connection::open(directory.join("opencode.db")).unwrap();
         db.pragma_update(None, "journal_mode", journal_mode)
             .unwrap();
-        db.execute_batch("CREATE TABLE session (id TEXT PRIMARY KEY, title TEXT, directory TEXT, time_created INTEGER, time_updated INTEGER, revert TEXT);
+        db.execute_batch("CREATE TABLE session (id TEXT PRIMARY KEY, title TEXT, directory TEXT, time_created INTEGER, time_updated INTEGER);
         CREATE TABLE message (id TEXT PRIMARY KEY, session_id TEXT, time_created INTEGER, data TEXT);
         CREATE TABLE part (id TEXT PRIMARY KEY, session_id TEXT, message_id TEXT, time_created INTEGER, data TEXT);").unwrap();
+        if has_revert {
+            db.execute_batch("ALTER TABLE session ADD COLUMN revert TEXT")
+                .unwrap();
+        }
         for (id, text) in [
             ("ses_selected", "Saved OpenCode answer"),
             ("ses_other", "Other conversation must not appear"),
         ] {
             db.execute(
-                "INSERT INTO session VALUES (?1,'Saved name','/workspace',1,2,NULL)",
+                "INSERT INTO session (id,title,directory,time_created,time_updated) VALUES (?1,'Saved name','/workspace',1,2)",
                 [id],
             )
             .unwrap();
@@ -180,13 +191,20 @@ fn history_binary_reads_exact_saved_opencode_rows_without_a_daemon() {
                 .unwrap();
             }
         }
-        drop(db);
+        let writer = if keep_open {
+            Some(db)
+        } else {
+            drop(db);
+            None
+        };
         let before = std::fs::read(directory.join("opencode.db")).unwrap();
         if journal_mode == "WAL" {
             assert_eq!(&before[18..20], &[2, 2]);
         }
-        assert!(!directory.join("opencode.db-wal").exists());
-        assert!(!directory.join("opencode.db-shm").exists());
+        assert_eq!(directory.join("opencode.db-wal").exists(), keep_open);
+        assert_eq!(directory.join("opencode.db-shm").exists(), keep_open);
+        let wal_before =
+            keep_open.then(|| std::fs::read(directory.join("opencode.db-wal")).unwrap());
         let result = history(home.path(), "opencode", "ses_selected");
         assert!(
             result.status.success(),
@@ -206,11 +224,48 @@ fn history_binary_reads_exact_saved_opencode_rows_without_a_daemon() {
             std::fs::read(directory.join("opencode.db")).unwrap(),
             before
         );
-        assert!(!directory.join("opencode.db-wal").exists());
-        assert!(!directory.join("opencode.db-shm").exists());
+        assert_eq!(directory.join("opencode.db-wal").exists(), keep_open);
+        assert_eq!(directory.join("opencode.db-shm").exists(), keep_open);
+        if let Some(wal_before) = wal_before {
+            assert_eq!(
+                std::fs::read(directory.join("opencode.db-wal")).unwrap(),
+                wal_before
+            );
+        }
         assert!(!history(home.path(), "opencode", "missing-session")
             .status
             .success());
+        drop(writer);
+        if has_revert {
+            let db = Connection::open(directory.join("opencode.db")).unwrap();
+            db.execute(
+                "UPDATE session SET revert = ?1 WHERE id = 'ses_selected'",
+                [json!({"messageID":"ses_selected-assistant"}).to_string()],
+            )
+            .unwrap();
+            drop(db);
+            let before = std::fs::read(directory.join("opencode.db")).unwrap();
+            let result = history(home.path(), "opencode", "ses_selected");
+            assert!(
+                result.status.success(),
+                "{}",
+                String::from_utf8_lossy(&result.stderr)
+            );
+            let body: Value = serde_json::from_slice(&result.stdout).unwrap();
+            assert_eq!(body["turns"].as_array().unwrap().len(), 1);
+            assert_eq!(body["turns"][0]["items"][0]["text"], "Saved user prompt");
+            let tail = body["rolledBackTurns"].as_array().unwrap();
+            assert_eq!(tail.len(), 1);
+            assert_eq!(tail[0]["items"][0]["text"], "Saved OpenCode answer");
+            assert_eq!(tail[0]["rolledBack"], true);
+            assert_eq!(tail[0]["restorable"], false);
+            assert_eq!(
+                std::fs::read(directory.join("opencode.db")).unwrap(),
+                before
+            );
+            assert!(!directory.join("opencode.db-wal").exists());
+            assert!(!directory.join("opencode.db-shm").exists());
+        }
     }
 }
 
