@@ -11,7 +11,7 @@ import settingsReducer, { previewServerSettingsPatch, updateSettingsLocal } from
 import sessionsReducer, { applySessionsPatch, applyContextUsageExtras } from '@/store/sessionsSlice'
 import freshAgentReducer, { applyRuntimeOwner, historyPageReceived, sessionError, sessionExited, sessionInit, sessionMetadataReceived, sessionSnapshotReceived, setSessionStatus, markSessionLost } from '@/store/freshAgentSlice'
 import { selectPaneOwnerFence } from '@/store/selectors/runtimeOwner'
-import tabsReducer from '@/store/tabsSlice'
+import tabsReducer, { closeTab } from '@/store/tabsSlice'
 import connectionReducer from '@/store/connectionSlice'
 import managedRuntimeReducer from '@/store/managedRuntimeSlice'
 import { FreshAgentView, IDLE_INCOMPLETE_MAX_RETRIES, locatorMatchesPane } from '@/components/fresh-agent/FreshAgentView'
@@ -85,6 +85,8 @@ const apiMock = vi.hoisted(() => ({
   getManagedRuntimeInventory: vi.fn(),
   retryManagedRuntimeSoul: vi.fn(),
   stopManagedRuntimeSoul: vi.fn(),
+  updateManagedRuntimeViewVisibility: vi.fn(),
+  getManagedRuntimeSoul: vi.fn(),
 }))
 
 const saveServerSettingsPatchSpy = vi.hoisted(() => vi.fn((patch: unknown) => ({
@@ -108,6 +110,8 @@ vi.mock('@/lib/api', async () => {
     getManagedRuntimeInventory: apiMock.getManagedRuntimeInventory,
     retryManagedRuntimeSoul: apiMock.retryManagedRuntimeSoul,
     stopManagedRuntimeSoul: apiMock.stopManagedRuntimeSoul,
+    updateManagedRuntimeViewVisibility: apiMock.updateManagedRuntimeViewVisibility,
+    getManagedRuntimeSoul: apiMock.getManagedRuntimeSoul,
   }
 })
 
@@ -295,6 +299,8 @@ beforeEach(() => {
   apiMock.getManagedRuntimeInventory.mockReset()
   apiMock.retryManagedRuntimeSoul.mockReset()
   apiMock.stopManagedRuntimeSoul.mockReset()
+  apiMock.updateManagedRuntimeViewVisibility.mockReset()
+  apiMock.getManagedRuntimeSoul.mockReset()
   apiMock.post.mockResolvedValue({ title: null, source: 'none' })
   apiMock.requestSessionHandoff.mockResolvedValue({
     ok: true,
@@ -383,6 +389,60 @@ afterEach(() => {
 })
 
 describe('FreshAgentView', () => {
+  it('renders and dismisses a failed close while keeping the stopped managed conversation', async () => {
+    const store = createStore()
+    const handlers = new Set<(message: unknown) => void>()
+    wsMock.onMessage.mockImplementation((handler) => {
+      handlers.add(handler)
+      return () => { handlers.delete(handler) }
+    })
+    wsMock.send.mockImplementation((message) => {
+      if (message.type === 'panes.closed') {
+        for (const handler of [...handlers]) handler({
+          type: 'panes.closed.result', requestId: message.requestId, success: true,
+        })
+      }
+    })
+    apiMock.updateManagedRuntimeViewVisibility
+      .mockRejectedValueOnce(new Error('View update refused'))
+      .mockResolvedValue({ visibility: 'visible', revision: 4, soulIntentRevision: 8 })
+    apiMock.getManagedRuntimeSoul.mockResolvedValue({
+      soul: { soulId: 'close-retained-soul', intentRevision: 8 },
+      viewIntents: [{ viewId: 'close-retained-view', visibility: 'visible', revision: 3, soulIntentRevision: 8 }],
+    })
+    apiMock.getFreshAgentThreadSnapshot.mockResolvedValue({ status: 'exited', turns: [
+      { id: 'saved-turn', role: 'assistant', items: [{ id: 'saved-text', kind: 'text', text: 'Saved conversation remains here' }] },
+    ] })
+    const content = {
+      kind: 'fresh-agent' as const, sessionType: 'freshcodex' as const, provider: 'codex' as const,
+      createRequestId: 'close-retained-create', sessionId: 'close-retained-thread',
+      sessionRef: { provider: 'codex' as const, sessionId: 'close-retained-thread' },
+      soulId: 'close-retained-soul', viewIntentId: 'close-retained-view',
+      viewIntentRevision: 2, soulIntentRevision: 7, status: 'exited' as const,
+    }
+    store.dispatch(initLayout({ tabId: 'tab-1', paneId: 'pane-1', content }))
+    store.dispatch(sessionInit({
+      sessionType: 'freshcodex', provider: 'codex', sessionId: 'close-retained-thread',
+    }))
+    store.dispatch(sessionExited({
+      sessionType: 'freshcodex', provider: 'codex', sessionId: 'close-retained-thread',
+    }))
+    render(<Provider store={store}><StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" /></Provider>)
+    expect(await screen.findByText('Saved conversation remains here')).toBeInTheDocument()
+    expect(screen.queryByText(/Close failed/)).toBeNull()
+    await act(async () => { await store.dispatch(closeTab('tab-1')) })
+    const notice = await screen.findByText('Close failed: The pane could not be closed, so it was left open. Try again.')
+    expect(notice.closest('[role="alert"]')).toBeInTheDocument()
+    expect(screen.queryByText(/Agent error:/)).toBeNull()
+    expect(apiMock.updateManagedRuntimeViewVisibility).toHaveBeenCalled()
+    expect(screen.getByText('Saved conversation remains here')).toBeInTheDocument()
+    fireEvent.click(within(notice.closest('[role="alert"]') as HTMLElement).getByRole('button', { name: 'Dismiss' }))
+    expect(screen.queryByText(/Close failed/)).toBeNull()
+    expect(getFreshAgentPaneContent(store)).toMatchObject(content)
+    expect(sentFreshAgentMessages('freshAgent.create')).toHaveLength(0)
+    expect(sentFreshAgentMessages('freshAgent.kill')).toHaveLength(0)
+  })
+
   describe('outgoing message queue', () => {
     async function setup(status = 'running', canSend = true, provider: 'codex' | 'claude' = 'codex') {
       const store = createStore()
