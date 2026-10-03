@@ -11,6 +11,12 @@ import { useAppSelector } from '@/store/hooks'
 
 const POLL_MS = 2_000
 
+type NoticeDetails = {
+  noticeId: string
+  profileId: string
+  summary: ManagedRuntimeIncidentSummary
+}
+
 function noticeProfileId(deviceId: string | undefined): string {
   return `profile:${deviceId || 'local-user'}`
 }
@@ -37,7 +43,12 @@ export function ManagedRuntimeNotices() {
   const profileId = useMemo(() => noticeProfileId(deviceId), [deviceId])
   const [notices, setNotices] = useState<ManagedRuntimeNotice[]>([])
   const current = notices[0]
-  const [details, setDetails] = useState<ManagedRuntimeIncidentSummary>()
+  const [loadedDetails, setLoadedDetails] = useState<NoticeDetails>()
+  const details = loadedDetails
+    && loadedDetails.noticeId === current?.noticeId
+    && loadedDetails.profileId === profileId
+    ? loadedDetails.summary
+    : undefined
   const [error, setError] = useState<string>()
   const [pollTick, setPollTick] = useState(0)
   const inFlightRef = useRef<AbortController>()
@@ -49,7 +60,7 @@ export function ManagedRuntimeNotices() {
   currentNoticeRef.current = { noticeId: current?.noticeId, profileId }
 
   useEffect(() => {
-    setDetails(undefined)
+    setLoadedDetails(undefined)
   }, [current?.noticeId, profileId])
 
   useEffect(() => {
@@ -123,7 +134,7 @@ export function ManagedRuntimeNotices() {
     try {
       await recordManagedRuntimeNoticeReceipt(current.noticeId, profileId, 'dismissed')
       setNotices((existing) => existing.filter((notice) => notice.noticeId !== current.noticeId))
-      setDetails(undefined)
+      setLoadedDetails(undefined)
       setError(undefined)
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : String(cause))
@@ -141,7 +152,7 @@ export function ManagedRuntimeNotices() {
     try {
       const summary = await getManagedRuntimeIncidentSummary(incidentId)
       if (!isCurrentNotice()) return
-      setDetails(summary)
+      setLoadedDetails({ noticeId, profileId, summary })
       setError(undefined)
     } catch (cause) {
       if (!isCurrentNotice()) return
