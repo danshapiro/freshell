@@ -314,6 +314,25 @@ afterEach(() => {
 })
 
 describe('closePaneWithCleanup — the acknowledged close gate (F2)', () => {
+  it('does not roll back a stopped hidden view when a later tab detach fails', async () => {
+    const store = createManagedTwoPaneStore()
+    installManagedViewBackend()
+    mockManagedRuntimeViewVisibility
+      .mockResolvedValueOnce({ ...managedViewResult('view-a', 'visible', 4, 9), visibility: 'hidden' })
+      .mockRejectedValueOnce(new Error('second view refused'))
+    const close = store.dispatch(closeTab('tab-1'))
+    ackPanesClosedBatches()
+    await close
+    expect(store.getState().tabs.tabs.some((tab) => tab.id === 'tab-1')).toBe(true)
+    expect(paneCloseErrors(store, 'tab-1')).toHaveProperty('pane-1')
+    expect(mockManagedRuntimeViewVisibility.mock.calls.filter(([viewId, visibility]) => (
+      viewId === 'view-a' && visibility === 'visible'
+    ))).toHaveLength(0)
+    expect(mockManagedRuntimeViewVisibility.mock.calls.filter(([viewId, visibility]) => (
+      viewId === 'view-b' && visibility === 'visible'
+    ))).toHaveLength(1)
+  })
+
   it.each(managedCloseCases.flatMap((closeCase) => [
     { ...closeCase, identity: 'durable' },
     { ...closeCase, identity: 'legacy' },
