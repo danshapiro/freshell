@@ -448,6 +448,59 @@ describe('crossTabSync', () => {
     expect(storeA.getState().panes.layouts.t1).toMatchObject({ type: 'leaf', id: 'pane-b' })
   })
 
+  it('preserves a newer same-topology sibling pane title when closing another pane', async () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(new Date(100))
+    resetPersistedLayoutCacheForTests()
+
+    const splitLayout = {
+      type: 'split', id: 'split-shared', direction: 'horizontal', sizes: [50, 50],
+      children: [
+        { type: 'leaf', id: 'pane-a', content: { kind: 'browser', browserInstanceId: 'browser-a', url: 'https://a.example', devToolsOpen: false } },
+        { type: 'leaf', id: 'pane-b', content: { kind: 'browser', browserInstanceId: 'browser-b', url: 'https://b.example', devToolsOpen: false } },
+      ],
+    }
+    localStorage.setItem(OWN_LAYOUT_KEY, JSON.stringify({
+      version: 3,
+      persistedAt: 100,
+      tabs: { activeTabId: 't1', tabs: [{ id: 't1', title: 'Shared', createdAt: 1, updatedAt: 1 }] },
+      panes: { version: 6, layouts: { t1: splitLayout }, activePane: { t1: 'pane-a' }, paneTitles: {}, paneTitleSetByUser: {} },
+      tombstones: [],
+    }))
+
+    const makeStore = () => configureStore({
+      reducer: { tabs: tabsReducer, panes: panesReducer },
+      middleware: (getDefault) => getDefault().concat(persistMiddleware as any),
+    })
+    const storeA = makeStore()
+    const storeB = makeStore()
+    for (const store of [storeA, storeB]) {
+      store.dispatch({
+        ...hydrateTabs({
+          tabs: [{ id: 't1', title: 'Shared', createdAt: 1, updatedAt: 1 }],
+          activeTabId: 't1', renameRequestTabId: null, tombstones: [],
+        }),
+        meta: { skipPersist: true },
+      })
+      store.dispatch({
+        ...hydratePanes({ layouts: { t1: splitLayout } as any, activePane: { t1: 'pane-a' }, paneTitles: {}, paneTitleSetByUser: {} }),
+        meta: { skipPersist: true },
+      })
+    }
+    cleanups.push(installCrossTabSync(storeA as any), installCrossTabSync(storeB as any))
+
+    storeB.dispatch(updatePaneTitle({
+      tabId: 't1', paneId: 'pane-b', title: 'Q renamed by B', setByUser: true,
+    }))
+    storeB.dispatch(flushPersistedLayoutNow())
+    expect(JSON.parse(localStorage.getItem(OWN_LAYOUT_KEY)!).panes.paneTitles.t1['pane-b']).toBe('Q renamed by B')
+
+    await storeA.dispatch(closePaneWithCleanup({ tabId: 't1', paneId: 'pane-a' }) as any)
+
+    const durable = JSON.parse(localStorage.getItem(OWN_LAYOUT_KEY)!)
+    expect(durable.panes.paneTitles?.t1?.['pane-b']).toBe('Q renamed by B')
+  })
+
   it('refuses a stale explicit sibling close instead of restoring the pane closed by the other store', async () => {
     vi.useFakeTimers()
     vi.setSystemTime(new Date(100))

@@ -822,6 +822,11 @@ function mergeTerminalState(
 
   // If both leaves, apply smart merge for terminal and fresh-agent content
   if (incoming.type === 'leaf' && local.type === 'leaf') {
+    // A topology winner may promote a different sibling leaf into this
+    // position after a split closes. Runtime handles belong to the pane ID;
+    // never merge the former sibling's session identity into that new pane.
+    if (incoming.id !== local.id) return incoming
+
     if (incoming.content?.kind === 'terminal' && local.content?.kind === 'terminal') {
       const localSessionRef = sanitizeSessionRef(local.content.sessionRef)
       if (incoming.content.createRequestId === local.content.createRequestId) {

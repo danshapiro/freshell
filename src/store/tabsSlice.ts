@@ -64,10 +64,14 @@ export type Tombstone = { id: string; deletedAt: number }
 
 /**
  * A close may proceed over a newer same-key write only when that write left
- * the pane identities and split topology intact. This permits title-only
- * freshness while refusing to serialize a stale tree over a sibling close.
+ * the topology and all surviving display titles intact. The pane being
+ * closed is excluded because its title leaves with it; every other title is
+ * part of the full-layout payload this close would persist.
  */
-function hasNewerConflictingSharedLayout(getState: () => RootState): boolean {
+function hasNewerConflictingSharedLayout(
+  getState: () => RootState,
+  closingPane?: { tabId: string; paneId: string },
+): boolean {
   try {
     if (typeof localStorage === 'undefined') return false
     const key = getWindowLayoutKey()
@@ -83,12 +87,34 @@ function hasNewerConflictingSharedLayout(getState: () => RootState): boolean {
 
     const state = getState()
     const locallyClosedTabIds = new Set((state.tabs.tombstones ?? []).map((entry) => entry.id))
-    return !sameLayoutTopology(
+    if (!sameLayoutTopology(
       state.tabs.tabs,
       state.panes.layouts,
       persisted,
       locallyClosedTabIds,
-    )
+    )) return true
+
+    const persistedTabsById = new Map(persisted.tabs.tabs.map((tab) => [tab.id, tab]))
+    for (const tab of state.tabs.tabs) {
+      const sharedTab = persistedTabsById.get(tab.id)
+      if (!sharedTab
+        || tab.title !== sharedTab.title
+        || Boolean(tab.titleSetByUser) !== Boolean(sharedTab.titleSetByUser)) {
+        return true
+      }
+    }
+
+    for (const [tabId, layout] of Object.entries(state.panes.layouts)) {
+      for (const { paneId } of collectPaneEntries(layout)) {
+        if (closingPane?.tabId === tabId && closingPane.paneId === paneId) continue
+        const localTitle = state.panes.paneTitles?.[tabId]?.[paneId]
+        const sharedTitle = persisted.panes.paneTitles?.[tabId]?.[paneId]
+        const localTitleSetByUser = state.panes.paneTitleSetByUser?.[tabId]?.[paneId] === true
+        const sharedTitleSetByUser = persisted.panes.paneTitleSetByUser?.[tabId]?.[paneId] === true
+        if (localTitle !== sharedTitle || localTitleSetByUser !== sharedTitleSetByUser) return true
+      }
+    }
+    return false
   } catch {
     // A storage read/parse failure is not itself a pane-close failure. The
     // flush guard below still refuses any stale full-layout write it can prove.
@@ -1768,6 +1794,8 @@ function isManagedViewRepresentedLocally(
 type ManagedViewCloseResolution = {
   viewIntentIds: string[]
   paneIds: string[]
+  viewIntentIdsByPane: Record<string, string[]>
+  viewIntentIdsByTab: Record<string, string[]>
   snapshot?: ManagedRuntimeInventorySnapshot
 }
 
@@ -1786,7 +1814,9 @@ function resolveManagedViewIntentsToRemove(
   const terminalTargets = targetEntries.filter((entry) => isManagedRuntimeProjection(entry.content))
   const tabMarkerViewIntentId = tab?.viewIntentId
   const tabViewIntentId = !layout && paneId === undefined ? tab?.viewIntentId : undefined
-  if (terminalTargets.length === 0 && !tabViewIntentId) return { viewIntentIds: [], paneIds: [] }
+  if (terminalTargets.length === 0 && !tabViewIntentId) {
+    return { viewIntentIds: [], paneIds: [], viewIntentIdsByPane: {}, viewIntentIdsByTab: {} }
+  }
 
   const runtime = selectManagedRuntime(state)
   const hasKnownMarker = terminalTargets.some(({ content }) => (
@@ -1809,7 +1839,7 @@ function resolveManagedViewIntentsToRemove(
     if (hasKnownMarker || matchesCachedManagedIdentity) {
       throw new Error(MANAGED_VIEW_CLOSE_FAILED_MESSAGE)
     }
-    return { viewIntentIds: [], paneIds: [] }
+    return { viewIntentIds: [], paneIds: [], viewIntentIdsByPane: {}, viewIntentIdsByTab: {} }
   }
 
   return getManagedRuntimeInventory().then((snapshot) => {
@@ -1817,6 +1847,7 @@ function resolveManagedViewIntentsToRemove(
 
     const targetViewIntentIds = new Set<string>()
     const paneIds = new Set<string>()
+    const viewIntentIdsByPane = new Map<string, Set<string>>()
     if (tabViewIntentId) {
       const matches = snapshot.viewIntents.filter((view) => view.viewId === tabViewIntentId)
       if (matches.length !== 1) throw new Error(MANAGED_VIEW_CLOSE_FAILED_MESSAGE)
@@ -1848,7 +1879,12 @@ function resolveManagedViewIntentsToRemove(
       }
       if (resolution.kind === 'resolved') {
         paneIds.add(targetPaneId)
-        for (const viewIntentId of resolution.viewIntentIds) targetViewIntentIds.add(viewIntentId)
+        for (const viewIntentId of resolution.viewIntentIds) {
+          targetViewIntentIds.add(viewIntentId)
+          const ids = viewIntentIdsByPane.get(targetPaneId) ?? new Set<string>()
+          ids.add(viewIntentId)
+          viewIntentIdsByPane.set(targetPaneId, ids)
+        }
       }
     }
 
@@ -1859,9 +1895,21 @@ function resolveManagedViewIntentsToRemove(
       paneId,
       targetViewIntentIds,
     )
+    const removableViewIntentIds = [...targetViewIntentIds]
+      .filter((viewIntentId) => !otherRepresentations.has(viewIntentId))
+    const removable = new Set(removableViewIntentIds)
+    const removableByPane: Record<string, string[]> = {}
+    for (const [targetPaneId, ids] of viewIntentIdsByPane) {
+      const removableIds = [...ids].filter((viewIntentId) => removable.has(viewIntentId))
+      if (removableIds.length > 0) removableByPane[targetPaneId] = removableIds
+    }
     return {
-      viewIntentIds: [...targetViewIntentIds].filter((viewIntentId) => !otherRepresentations.has(viewIntentId)),
+      viewIntentIds: removableViewIntentIds,
       paneIds: [...paneIds],
+      viewIntentIdsByPane: removableByPane,
+      viewIntentIdsByTab: tabViewIntentId && removable.has(tabViewIntentId)
+        ? { [tabId]: [tabViewIntentId] }
+        : {},
       snapshot,
     }
   }).catch((error) => {
@@ -2402,6 +2450,78 @@ async function persistManagedViewVisibility(
   }
 }
 
+/**
+ * A same-key close can be canceled at its final persistence boundary. In that
+ * case cross-window replay runs when the close freeze is released and can
+ * restore the original pane after this thunk has already recorded it closed
+ * and detached its managed view. Reconcile those side effects only for the
+ * exact original pane identities that replay left displayed.
+ */
+async function reconcileManagedCloseAfterReplay(
+  options: {
+    tabId: string
+    paneTargets: PaneCloseTarget[]
+    closeIdentities: PaneCloseIdentity[]
+    resolution: ManagedViewCloseResolution
+    localCloseMutationApplied: boolean
+    dispatch: (action: unknown) => void
+    getState: () => RootState
+  },
+): Promise<void> {
+  const { tabId, paneTargets, closeIdentities, resolution, localCloseMutationApplied, dispatch, getState } = options
+  const getStillRepresentedViewIds = (state: RootState): string[] => {
+    const layout = state.panes.layouts[tabId]
+    const stillRepresentedPaneIds = new Set(paneTargets.flatMap(({ paneId, identity }) => {
+      const content = layout ? findPaneContent(layout, paneId) : null
+      return samePaneCloseTargetIdentity(identity, content) ? [paneId] : []
+    }))
+    const viewIntentIds = new Set<string>()
+    for (const paneId of stillRepresentedPaneIds) {
+      for (const viewIntentId of resolution.viewIntentIdsByPane[paneId] ?? []) {
+        viewIntentIds.add(viewIntentId)
+      }
+    }
+    const tab = state.tabs.tabs.find((candidate) => candidate.id === tabId)
+    if (tab) {
+      for (const viewIntentId of resolution.viewIntentIdsByTab[tabId] ?? []) {
+        if (tab.viewIntentId === viewIntentId) viewIntentIds.add(viewIntentId)
+      }
+    }
+    return [...viewIntentIds]
+  }
+
+  const currentState = getState()
+  const currentLayout = currentState.panes.layouts[tabId]
+  if (!localCloseMutationApplied) return
+  const restoredPaneIds = new Set(paneTargets.flatMap(({ paneId, identity }) => {
+    const content = currentLayout ? findPaneContent(currentLayout, paneId) : null
+    return samePaneCloseTargetIdentity(identity, content) ? [paneId] : []
+  }))
+  reassertKeptPanesOpen(
+    currentLayout,
+    tabId,
+    closeIdentities.filter(({ paneId }) => restoredPaneIds.has(paneId)),
+  )
+
+  const initialViewIntentIds = getStillRepresentedViewIds(currentState)
+  if (initialViewIntentIds.length === 0) return
+  try {
+    await withManagedVisibilityTransition(async () => {
+      // A queued visibility transition may have allowed the pane to change
+      // again. Re-check its exact identity immediately before restoring it.
+      const currentViewIntentIds = getStillRepresentedViewIds(getState())
+      if (currentViewIntentIds.length === 0) return
+      await persistManagedViewVisibility(currentViewIntentIds, 'visible', dispatch, getState)
+    })
+  } catch (error) {
+    log.warn('could not reconcile managed close state after shared-layout replay', {
+      tabId,
+      viewIntentIds: initialViewIntentIds,
+      error: error instanceof Error ? error.message : String(error),
+    })
+  }
+}
+
 function clearDetachedManagedTabProjection(
   tabId: string,
   detachedViewIntentIds: string[],
@@ -2450,7 +2570,7 @@ export const closePaneWithCleanup = createAsyncThunk(
       await dispatch(closeTab(tabId))
       return
     }
-    if (hasNewerConflictingSharedLayout(getState as () => RootState)) {
+    if (hasNewerConflictingSharedLayout(getState as () => RootState, { tabId, paneId })) {
       log.warn('refusing a pane close based on a stale shared layout', { tabId, paneId })
       dispatch(setPaneCloseError({ tabId, paneId, error: STALE_SHARED_LAYOUT_CLOSE_MESSAGE }))
       return
@@ -2473,6 +2593,9 @@ export const closePaneWithCleanup = createAsyncThunk(
     const identity = collectPaneCloseIdentities(before).filter((i) => i.paneId === paneId)
     const targetContent = before ? findPaneContent(before, paneId) : null
     const targetIdentity = targetContent ? paneCloseTargetIdentity(targetContent) : undefined
+    const paneTargets = targetIdentity ? [{ paneId, identity: targetIdentity }] : []
+    let managedViews: ManagedViewCloseResolution | undefined
+    let localCloseMutationApplied = false
     const freezePane = targetIdentity !== undefined
     if (freezePane) {
       // Freeze the pane identity while its close acknowledgement and managed
@@ -2499,7 +2622,7 @@ export const closePaneWithCleanup = createAsyncThunk(
           }
         }
 
-        if (hasNewerConflictingSharedLayout(getState as () => RootState)) {
+        if (hasNewerConflictingSharedLayout(getState as () => RootState, { tabId, paneId })) {
           log.warn('refusing to continue a pane close after a conflicting shared layout arrived', { tabId, paneId })
           dispatch(setPaneCloseError({ tabId, paneId, error: STALE_SHARED_LAYOUT_CLOSE_MESSAGE }))
           reassertKeptPanesOpen((getState() as RootState).panes.layouts[tabId], tabId, identity)
@@ -2515,7 +2638,6 @@ export const closePaneWithCleanup = createAsyncThunk(
           identity,
         )) return
 
-        let managedViews: ManagedViewCloseResolution
         try {
           const resolution = resolveManagedViewIntentsToRemove(
             getState() as RootState,
@@ -2574,7 +2696,7 @@ export const closePaneWithCleanup = createAsyncThunk(
           identity,
         )) return
 
-        if (hasNewerConflictingSharedLayout(getState as () => RootState)) {
+        if (hasNewerConflictingSharedLayout(getState as () => RootState, { tabId, paneId })) {
           log.warn('refusing to remove a pane after a conflicting shared layout arrived', { tabId, paneId })
           dispatch(setPaneCloseError({ tabId, paneId, error: STALE_SHARED_LAYOUT_CLOSE_MESSAGE }))
           reassertKeptPanesOpen((getState() as RootState).panes.layouts[tabId], tabId, identity)
@@ -2594,6 +2716,7 @@ export const closePaneWithCleanup = createAsyncThunk(
         }
         dispatch(closePane({ tabId, paneId }))
         const after = (getState() as RootState).panes.layouts[tabId]
+        localCloseMutationApplied = hasPaneToRemove && (!after || !findPaneContent(after, paneId))
         if (after && findPaneContent(after, paneId)) {
           if (hasPaneToRemove && !closePersistenceAlreadyPending) {
             clearLocalClosePersistencePending(getState)
@@ -2619,6 +2742,17 @@ export const closePaneWithCleanup = createAsyncThunk(
       })
     } finally {
       if (freezePane) dispatch(clearPaneClosing({ tabId, paneId }))
+      if (managedViews) {
+        await reconcileManagedCloseAfterReplay({
+          tabId,
+          paneTargets,
+          closeIdentities: identity,
+          resolution: managedViews,
+          localCloseMutationApplied,
+          dispatch,
+          getState: getState as () => RootState,
+        })
+      }
     }
   }
 )
@@ -2678,7 +2812,8 @@ export const closeTab = createAsyncThunk(
     const frozenPaneTitles = stateAtClose.panes.paneTitles[tabId]
     const frozenPaneTitleSetByUser = stateAtClose.panes.paneTitleSetByUser?.[tabId]
     const identities = collectPaneCloseIdentities(frozenLayout)
-    const managedViews = collectManagedViewProjections(frozenLayout)
+    let managedViews: ManagedViewCloseResolution | undefined
+    let localCloseMutationApplied = false
     dispatch(markTabClosing({ tabId }))
     try {
       await withManagedVisibilityTransition(async () => {
@@ -2714,7 +2849,6 @@ export const closeTab = createAsyncThunk(
           identities,
         )) return
 
-        let managedViews: ManagedViewCloseResolution
         try {
           const resolution = resolveManagedViewIntentsToRemove(
             getState() as RootState,
@@ -2888,6 +3022,7 @@ export const closeTab = createAsyncThunk(
         )
         dispatch(removeTab(tabId))
         dispatch(removeLayout({ tabId }))
+        localCloseMutationApplied = true
 
         // Clean up attention and drafts for the tab and all its panes
         dispatch(clearTabAttention({ tabId }))
@@ -2902,6 +3037,17 @@ export const closeTab = createAsyncThunk(
       // covers the failure return and any throw — a stuck flag would freeze
       // the kept tab forever.
       dispatch(clearTabClosing({ tabId }))
+      if (managedViews) {
+        await reconcileManagedCloseAfterReplay({
+          tabId,
+          paneTargets: frozenPaneCloseTargets,
+          closeIdentities: identities,
+          resolution: managedViews,
+          localCloseMutationApplied,
+          dispatch,
+          getState: getState as () => RootState,
+        })
+      }
     }
   }
 )
@@ -2964,6 +3110,9 @@ export const replacePaneWithCleanup = createAsyncThunk(
     const identity = collectPaneCloseIdentities(before).filter((i) => i.paneId === paneId)
     const targetContent = before ? findPaneContent(before, paneId) : null
     const targetIdentity = targetContent ? paneCloseTargetIdentity(targetContent) : undefined
+    const paneTargets = targetIdentity ? [{ paneId, identity: targetIdentity }] : []
+    let managedViews: ManagedViewCloseResolution | undefined
+    let localCloseMutationApplied = false
     const freezePane = targetIdentity !== undefined
     if (freezePane) {
       dispatch(markPaneClosing({ tabId, paneId }))
@@ -3001,7 +3150,6 @@ export const replacePaneWithCleanup = createAsyncThunk(
           identity,
         )) return
 
-        let managedViews: ManagedViewCloseResolution
         try {
           const resolution = resolveManagedViewIntentsToRemove(
             getState() as RootState,
@@ -3088,6 +3236,7 @@ export const replacePaneWithCleanup = createAsyncThunk(
           return
         }
         if (afterContent?.kind === 'picker') {
+          localCloseMutationApplied = hadPaneToReplace
           clearDetachedManagedTabProjection(
             tabId,
             managedViews.viewIntentIds,
@@ -3099,6 +3248,17 @@ export const replacePaneWithCleanup = createAsyncThunk(
       })
     } finally {
       if (paneFreezeHeld) dispatch(clearPaneClosing({ tabId, paneId }))
+      if (managedViews) {
+        await reconcileManagedCloseAfterReplay({
+          tabId,
+          paneTargets,
+          closeIdentities: identity,
+          resolution: managedViews,
+          localCloseMutationApplied,
+          dispatch,
+          getState: getState as () => RootState,
+        })
+      }
     }
   }
 )

@@ -316,6 +316,17 @@ close marker when legacy-name evidence capture defers the write. The five
 focused suites passed (101 tests), `pnpm run typecheck:client` passed, and
 `git diff --check` passed. Independent review of this repair is pending.
 
+**Task 2 review 3 follow-up (2026-10-03):** Close preflight now also refuses a
+newer same-key layout whose surviving tab or pane titles differ, since the
+close would serialize that older full title map. Late persistence cancellation
+after a local pane removal or replacement now waits for shared-layout replay,
+then restores `pane.opened` and visible status only for the exact original
+managed panes that replay put back. The pane-tree merge uses pane IDs to avoid
+folding a former sibling's runtime identity into a restored leaf. Ordinary
+detach failures still retain the existing retry behavior. The affected focused
+suites passed (313 tests), client typecheck and `git diff --check` passed; the
+independent review of this follow-up is pending.
+
 ## Task 3: Reopen only from current identity and clear close evidence
 
 **Files:**
