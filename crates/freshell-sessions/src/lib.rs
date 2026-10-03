@@ -21,6 +21,7 @@ pub mod amplifier;
 pub mod amplifier_stub;
 pub mod bundle_config;
 pub mod codex_locator;
+pub mod codex_segments;
 pub mod directory_index;
 pub mod meta;
 pub mod opencode_locator;

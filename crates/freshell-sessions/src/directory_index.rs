@@ -41,6 +41,10 @@ use std::time::{Duration, Instant};
 
 use tokio::sync::Mutex as AsyncMutex;
 
+use crate::codex_segments::{
+    compose_codex_segments, scan_codex_file_bytes_evidence, CodexComposition, CodexFileEvidence,
+    CodexSegmentEntry, CodexUnresolvedIdentity,
+};
 use crate::meta::ParsedSessionMeta;
 use crate::provider_layout::ProviderLayout;
 use crate::{parse_codex_session_content, parse_session_content, ParseSessionOptions};
@@ -201,6 +205,16 @@ pub trait SessionSource: Send + Sync {
     /// never re-parsed unless it actually changes. Corruption-tolerant —
     /// never panics.
     fn parse(&self, path: &Path) -> Option<IndexedSession>;
+
+    /// Parse Codex's strict per-file composition evidence alongside the
+    /// display row. Other providers keep the default path and never carry
+    /// Codex-specific cache state.
+    fn parse_with_codex_evidence(
+        &self,
+        path: &Path,
+    ) -> (Option<IndexedSession>, Option<CodexFileEvidence>) {
+        (self.parse(path), None)
+    }
 
     /// Batch C: direct-listed sources (opencode's single sqlite db, which
     /// enumerates MANY sessions in ONE query rather than one file per
@@ -557,10 +571,19 @@ impl CodexSource {
     /// call, ignoring any incremental cache. Test/perf use only — mirrors
     /// `ClaudeSource::scan()`.
     pub fn scan(&self) -> Vec<IndexedSession> {
-        self.discover()
+        let entries = self
+            .discover()
             .into_iter()
-            .filter_map(|stat| self.parse(&stat.path))
-            .collect()
+            .map(|stat| {
+                let (item, evidence) = self.parse_with_codex_evidence(&stat.path);
+                CodexSegmentEntry {
+                    path: stat.path,
+                    item,
+                    evidence,
+                }
+            })
+            .collect();
+        compose_codex_segments(entries).items
     }
 }
 
@@ -585,6 +608,13 @@ impl SessionSource for CodexSource {
 
     fn parse(&self, path: &Path) -> Option<IndexedSession> {
         parse_codex_file(path)
+    }
+
+    fn parse_with_codex_evidence(
+        &self,
+        path: &Path,
+    ) -> (Option<IndexedSession>, Option<CodexFileEvidence>) {
+        parse_codex_file_with_evidence(path)
     }
 }
 
@@ -649,6 +679,23 @@ fn walk_jsonl_recursive(dir: &Path, out: &mut Vec<FileStat>) {
 /// gate (:756, :1124) applies to every provider, not just claude.
 fn parse_codex_file(path: &Path) -> Option<IndexedSession> {
     let content = String::from_utf8_lossy(&std::fs::read(path).ok()?).into_owned();
+    parse_codex_content(&content, path)
+}
+
+fn parse_codex_file_with_evidence(
+    path: &Path,
+) -> (Option<IndexedSession>, Option<CodexFileEvidence>) {
+    let Ok(bytes) = std::fs::read(path) else {
+        return (None, None);
+    };
+    let content = String::from_utf8_lossy(&bytes).into_owned();
+    (
+        parse_codex_content(&content, path),
+        Some(scan_codex_file_bytes_evidence(&bytes)),
+    )
+}
+
+fn parse_codex_content(content: &str, path: &Path) -> Option<IndexedSession> {
     let meta = parse_codex_session_content(&content);
     meta.cwd.as_ref()?;
     let fallback = extract_codex_session_id_from_filename(path);
@@ -981,6 +1028,11 @@ struct FileEntry {
     mtime_ms: i64,
     size: u64,
     item: Option<IndexedSession>,
+    /// Strict Codex identity/interval evidence, stored independently from
+    /// `item` so a known same-id file excluded from rendering still blocks a
+    /// partial composition.
+    #[serde(default)]
+    codex_evidence: Option<CodexFileEvidence>,
 }
 
 /// The cached, TTL-refreshed session index composed from one or more
@@ -1109,6 +1161,12 @@ struct CachedSnapshot {
     /// published THIS generation (`getScanFailures` parity — see
     /// [`SessionIndex::scan_failures`]).
     scan_failures: HashSet<String>,
+    /// Known same-id Codex file groups that were not composed. Published
+    /// atomically with rows so quarantine sees one generation of evidence.
+    unresolved_codex_identities: Arc<Vec<CodexUnresolvedIdentity>>,
+    /// Chronological source paths for accepted multi-file rows, keyed by
+    /// canonical embedded id. This remains internal to Rust consumers.
+    codex_segment_paths: Arc<HashMap<String, Vec<PathBuf>>>,
 }
 
 /// Bookkeeping for the persistent parse-cache's opportunistic-save gating
@@ -1220,6 +1278,29 @@ impl SessionIndex {
             .as_ref()
             .map(|c| sorted_names(&c.scan_failures))
             .unwrap_or_default()
+    }
+
+    /// Read unresolved known-id Codex groups from the currently published
+    /// generation. This is a short point-in-time read with the same
+    /// stale-while-revalidate behavior as `snapshot()`; paths are Rust-only
+    /// evidence and are never part of the client session-directory payload.
+    pub fn unresolved_codex_identities(&self) -> Vec<CodexUnresolvedIdentity> {
+        self.snapshot
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|snapshot| snapshot.unresolved_codex_identities.as_ref().clone())
+            .unwrap_or_default()
+    }
+
+    /// Chronological file paths for an accepted multi-file Codex row. A
+    /// single-file row continues to use `IndexedSession::source_file`.
+    pub fn codex_segment_paths(&self, session_id: &str) -> Option<Vec<PathBuf>> {
+        self.snapshot
+            .lock()
+            .unwrap()
+            .as_ref()
+            .and_then(|snapshot| snapshot.codex_segment_paths.get(session_id).cloned())
     }
 
     /// Fire-and-forget refresh (`requestRefresh` parity): gives a degraded
@@ -1789,7 +1870,7 @@ impl SessionIndex {
                     .as_ref()
                     .map(|c| c.scan_failures.clone())
                     .unwrap_or_default();
-                let (items, changed, amplifier_root_dirs) = refresh_snapshot(
+                let refreshed = refresh_snapshot(
                     &sources,
                     &mut cache,
                     &mut direct,
@@ -1797,11 +1878,25 @@ impl SessionIndex {
                     scoped_paths,
                     scoped_providers,
                 );
-                (items, changed, failures, amplifier_root_dirs)
+                (
+                    refreshed.items,
+                    refreshed.changed,
+                    failures,
+                    refreshed.amplifier_root_dirs,
+                    refreshed.unresolved_codex_identities,
+                    refreshed.codex_segment_paths,
+                )
             }
         })
         .await;
-        let (items, changed, failures, amplifier_root_dirs) = match sweep_result {
+        let (
+            items,
+            changed,
+            failures,
+            amplifier_root_dirs,
+            unresolved_codex_identities,
+            codex_segment_paths,
+        ) = match sweep_result {
             Ok(result) => result,
             Err(join_err) => {
                 // `discover`/`parse` are documented never-panic (every
@@ -1828,6 +1923,8 @@ impl SessionIndex {
             }
         };
         let items = Arc::new(items);
+        let unresolved_codex_identities = Arc::new(unresolved_codex_identities);
+        let codex_segment_paths = Arc::new(codex_segment_paths);
         let failure_names = sorted_names(&failures);
         {
             // ONE lock write publishes the snapshot AND its scan failures as
@@ -1839,6 +1936,8 @@ impl SessionIndex {
                 items: Arc::clone(&items),
                 fetched_at: Instant::now(),
                 scan_failures: failures,
+                unresolved_codex_identities,
+                codex_segment_paths,
             });
         } // guard dropped here — never held across an .await.
           // Self-correction report (amplifier watch-reduction design
@@ -2010,21 +2109,31 @@ fn parse_scoped_path(
     path: &Path,
     sources: &[Arc<dyn SessionSource>],
     provider_hint: Option<&str>,
-) -> (Option<IndexedSession>, Option<String>) {
+) -> (
+    Option<IndexedSession>,
+    Option<String>,
+    Option<CodexFileEvidence>,
+) {
     if let Some(name) = provider_hint {
         if let Some(source) = sources.iter().find(|s| s.provider_name() == Some(name)) {
-            return (source.parse(path), Some(name.to_owned()));
+            let (item, evidence) = source.parse_with_codex_evidence(path);
+            return (item, Some(name.to_owned()), evidence);
         }
     }
     for source in sources {
         if source.direct_change_token().is_some() {
             continue;
         }
-        if let Some(item) = source.parse(path) {
-            return (Some(item), source.provider_name().map(str::to_owned));
+        let (item, evidence) = source.parse_with_codex_evidence(path);
+        if item.is_some()
+            || evidence
+                .as_ref()
+                .is_some_and(|evidence| evidence.session_id.is_some())
+        {
+            return (item, source.provider_name().map(str::to_owned), evidence);
         }
     }
-    (None, None)
+    (None, None, None)
 }
 
 /// One incremental refresh sweep across all sources:
@@ -2054,6 +2163,14 @@ fn parse_scoped_path(
 /// version of this module had (see the module doc comment). Analogously, a
 /// sweep over an unchanged direct-listed source costs 2 stats (db + db-wal),
 /// not a query.
+struct RefreshedSnapshot {
+    items: Vec<IndexedSession>,
+    changed: usize,
+    amplifier_root_dirs: Option<Vec<PathBuf>>,
+    unresolved_codex_identities: Vec<CodexUnresolvedIdentity>,
+    codex_segment_paths: HashMap<String, Vec<PathBuf>>,
+}
+
 fn refresh_snapshot(
     sources: &[Arc<dyn SessionSource>],
     cache: &mut HashMap<PathBuf, FileEntry>,
@@ -2061,7 +2178,7 @@ fn refresh_snapshot(
     scan_failures: &mut HashSet<String>,
     scoped_paths: HashMap<PathBuf, String>,
     scoped_providers: HashSet<String>,
-) -> (Vec<IndexedSession>, usize, Option<Vec<PathBuf>>) {
+) -> RefreshedSnapshot {
     let is_full = scoped_paths.is_empty() && scoped_providers.is_empty();
     let mut discovered: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
     let mut fully_discovered_providers = HashSet::<String>::new();
@@ -2216,7 +2333,7 @@ fn refresh_snapshot(
                     }
                 }
             } else {
-                let item = source.parse(&stat.path);
+                let (item, codex_evidence) = source.parse_with_codex_evidence(&stat.path);
                 // A content-IDENTICAL rewrite (editor autosave, a repeated
                 // provider write: same bytes, only mtime/size moved)
                 // re-parses to exactly the cached item. Count ONLY a re-parse
@@ -2226,9 +2343,11 @@ fn refresh_snapshot(
                 // broadcast fans a spurious `sessions.changed` out to every
                 // client. The stat bookkeeping (mtime_ms/size) is refreshed
                 // either way so the NEXT sweep treats the file as unchanged.
-                let content_moved = cache
-                    .get(&stat.path)
-                    .is_none_or(|entry| entry.item != item || entry.source_name != source_name);
+                let content_moved = cache.get(&stat.path).is_none_or(|entry| {
+                    entry.item != item
+                        || entry.codex_evidence != codex_evidence
+                        || entry.source_name != source_name
+                });
                 cache.insert(
                     stat.path.clone(),
                     FileEntry {
@@ -2236,6 +2355,7 @@ fn refresh_snapshot(
                         mtime_ms: stat.mtime_ms,
                         size: stat.size,
                         item,
+                        codex_evidence,
                     },
                 );
                 if content_moved {
@@ -2271,7 +2391,7 @@ fn refresh_snapshot(
                         .get(path)
                         .is_some_and(|e| e.mtime_ms == stat.mtime_ms && e.size == stat.size);
                     if !unchanged {
-                        let (item, resolved_source) =
+                        let (item, resolved_source, codex_evidence) =
                             parse_scoped_path(path, sources, Some(watcher_provider));
                         // Same content-identical-rewrite rule as the discover
                         // arm above: a watcher-scoped re-parse whose parsed
@@ -2279,7 +2399,9 @@ fn refresh_snapshot(
                         // change — else it bumps the generation and wakes a
                         // spurious `sessions.changed` broadcast.
                         let content_moved = cache.get(path).is_none_or(|entry| {
-                            entry.item != item || entry.source_name != resolved_source
+                            entry.item != item
+                                || entry.codex_evidence != codex_evidence
+                                || entry.source_name != resolved_source
                         });
                         cache.insert(
                             path.clone(),
@@ -2288,6 +2410,7 @@ fn refresh_snapshot(
                                 mtime_ms: stat.mtime_ms,
                                 size: stat.size,
                                 item,
+                                codex_evidence,
                             },
                         );
                         if content_moved {
@@ -2357,10 +2480,22 @@ fn refresh_snapshot(
     }
     changed = changed.saturating_add(cache_len_before_prune - cache.len());
 
+    let codex_entries = cache
+        .iter()
+        .filter(|(_, entry)| entry.source_name.as_deref() == Some("codex"))
+        .map(|(path, entry)| CodexSegmentEntry {
+            path: path.clone(),
+            item: entry.item.clone(),
+            evidence: entry.codex_evidence.clone(),
+        })
+        .collect();
+    let codex_composition: CodexComposition = compose_codex_segments(codex_entries);
     let mut items: Vec<IndexedSession> = cache
         .values()
+        .filter(|entry| entry.source_name.as_deref() != Some("codex"))
         .filter_map(|entry| entry.item.clone())
         .collect();
+    items.extend(codex_composition.items.iter().cloned());
     for entry in direct_cache.values() {
         items.extend(entry.items.iter().cloned());
     }
@@ -2369,7 +2504,13 @@ fn refresh_snapshot(
             .cmp(&a.last_activity_at)
             .then_with(|| b.key().cmp(&a.key()))
     });
-    (items, changed, amplifier_root_dirs)
+    RefreshedSnapshot {
+        items,
+        changed,
+        amplifier_root_dirs,
+        unresolved_codex_identities: codex_composition.unresolved_identities,
+        codex_segment_paths: codex_composition.segment_paths,
+    }
 }
 
 // -- Persistent parse cache (self-hosting-readiness bake-in, "kill the cold
@@ -2406,10 +2547,9 @@ fn refresh_snapshot(
 /// Schema version for the persisted parse-cache file. Bump on any format
 /// change so an old (or a future, if this ever needs to roll back) file is
 /// cleanly discarded -- never partially or incorrectly deserialized into a
-/// mismatched shape. (v2: `IndexedSession.token_usage` added — a v1 cache
-/// would load every session with `token_usage: None` forever, hiding usage
-/// data that already exists on disk from the fresh-agent strip meter.)
-const CACHE_SCHEMA_VERSION: u32 = 2;
+/// mismatched shape. (v3: per-file Codex continuation evidence added; v2
+/// entries do not have enough information to certify multi-file groups.)
+const CACHE_SCHEMA_VERSION: u32 = 3;
 
 /// See "File location"/"Filename" above.
 const CACHE_FILENAME: &str = "rust-session-cache.json";
@@ -3588,6 +3728,8 @@ pub(crate) mod tests {
             items: Arc::clone(&good_snapshot),
             fetched_at: Instant::now(),
             scan_failures: HashSet::new(),
+            unresolved_codex_identities: Arc::new(Vec::new()),
+            codex_segment_paths: Arc::new(HashMap::new()),
         })));
         let file_cache = Arc::new(StdMutex::new(HashMap::new()));
         let direct_cache = Arc::new(StdMutex::new(HashMap::new()));
@@ -3901,6 +4043,154 @@ pub(crate) mod tests {
         std::fs::read_to_string(path).unwrap()
     }
 
+    fn codex_continuation_fixtures() -> (String, String) {
+        let fixture_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../test/fixtures/coding-cli/codex");
+        (
+            std::fs::read_to_string(
+                fixture_dir.join("multi-file-continuation-older.sanitized.jsonl"),
+            )
+            .unwrap(),
+            std::fs::read_to_string(
+                fixture_dir.join("multi-file-continuation-newer.sanitized.jsonl"),
+            )
+            .unwrap(),
+        )
+    }
+
+    fn copied_large_codex_transcript(content: &str) -> String {
+        let lines: Vec<&str> = content.lines().collect();
+        let mut copied = String::from(lines[0]);
+        copied.push('\n');
+        for index in 0..2000usize {
+            let template =
+                serde_json::from_str::<serde_json::Value>(lines[1 + index % (lines.len() - 1)])
+                    .unwrap();
+            let timestamp_seconds = index + 1;
+            let timestamp = format!(
+                "2026-10-03T{:02}:{:02}:{:02}.000Z",
+                timestamp_seconds / 3600,
+                (timestamp_seconds / 60) % 60,
+                timestamp_seconds % 60,
+            );
+            let mut record = template;
+            record["timestamp"] = serde_json::Value::String(timestamp);
+            record["ordinal"] = serde_json::Value::from(index as u64);
+            copied.push_str(&serde_json::to_string(&record).unwrap());
+            copied.push('\n');
+        }
+        copied
+    }
+
+    fn codex_continuation_fixture_at(
+        second: u64,
+        user_message: &str,
+        assistant_message: &str,
+        total_tokens: u64,
+    ) -> String {
+        let timestamp = |millis: u64| {
+            format!(
+                "2026-10-03T00:{:02}:{:02}.{:03}Z",
+                (second + millis / 1000) / 60,
+                (second + millis / 1000) % 60,
+                millis % 1000,
+            )
+        };
+        let id = "b7936c10-4935-441c-837c-c1f33cafec2d";
+        let records = [
+            serde_json::json!({
+                "timestamp": timestamp(0),
+                "type": "session_meta",
+                "payload": {
+                    "id": id,
+                    "session_id": id,
+                    "cwd": "/sanitized/project",
+                    "source": "vscode",
+                    "thread_source": "user",
+                    "cli_version": "0.156.0",
+                    "originator": "codex-vscode",
+                    "history_mode": "paginated"
+                }
+            }),
+            serde_json::json!({
+                "timestamp": timestamp(1),
+                "ordinal": 0,
+                "type": "event_msg",
+                "payload": {"type": "user_message", "message": user_message}
+            }),
+            serde_json::json!({
+                "timestamp": timestamp(2),
+                "ordinal": 1,
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": assistant_message}]
+                }
+            }),
+            serde_json::json!({
+                "timestamp": timestamp(3),
+                "ordinal": 2,
+                "type": "event_msg",
+                "payload": {
+                    "type": "token_count",
+                    "info": {
+                        "total_token_usage": {
+                            "input_tokens": total_tokens,
+                            "cached_input_tokens": 20,
+                            "output_tokens": 10,
+                            "total_tokens": total_tokens + 10
+                        },
+                        "last_token_usage": {
+                            "input_tokens": total_tokens - 20,
+                            "cached_input_tokens": 10,
+                            "output_tokens": 8,
+                            "total_tokens": total_tokens - 2
+                        },
+                        "model_context_window": 258400
+                    }
+                }
+            }),
+            serde_json::json!({
+                "timestamp": timestamp(4),
+                "ordinal": 3,
+                "type": "world_state",
+                "payload": {"state": "sanitized"}
+            }),
+        ];
+        records
+            .iter()
+            .map(|record| serde_json::to_string(record).unwrap())
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n"
+    }
+
+    fn write_codex_pair(home: &Path, older: &str, newer: &str) -> (PathBuf, PathBuf) {
+        let sessions = home.join(".codex").join("sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        let older_path = sessions.join("z-older-rollout.jsonl");
+        let newer_path = sessions.join("a-newer-rollout.jsonl");
+        std::fs::write(&older_path, older).unwrap();
+        std::fs::write(&newer_path, newer).unwrap();
+        (older_path, newer_path)
+    }
+
+    fn assert_uncomposed_same_id_rows(source: &CodexSource, label: &str) {
+        let rows = source.scan();
+        assert_eq!(
+            rows.len(),
+            2,
+            "{label}: keep both renderable rows for quarantine"
+        );
+        assert!(
+            rows.iter().all(|row| {
+                row.session_id == "b7936c10-4935-441c-837c-c1f33cafec2d" && row.provider == "codex"
+            }),
+            "{label}: both rows must keep the shared embedded identity"
+        );
+    }
+
     /// A `<home>/.codex/sessions/…` layout. `nested` controls whether the
     /// fixture is placed directly in `sessions/` or several levels deep
     /// (codex's real `sessions/YYYY/MM/DD/*.jsonl` layout) — proving
@@ -3936,6 +4226,499 @@ pub(crate) mod tests {
             Some("Sanitized prompt")
         );
         std::fs::remove_dir_all(codex_home.parent().unwrap()).ok();
+    }
+
+    #[tokio::test]
+    async fn codex_source_composes_the_reported_same_id_rollout_shape() {
+        let home = unique_temp_dir("codex-continuation-compose");
+        let (older, newer) = codex_continuation_fixtures();
+        let (older_path, newer_path) = write_codex_pair(&home, &older, &newer);
+
+        let source = Arc::new(CodexSource::new(home.join(".codex")));
+        let direct = source.scan();
+        assert_eq!(direct.len(), 1, "a verified continuation is one session");
+        assert_eq!(direct[0].session_id, "b7936c10-4935-441c-837c-c1f33cafec2d");
+        assert_eq!(direct[0].source_file.as_deref(), Some(newer_path.as_path()));
+
+        let index =
+            SessionIndex::with_ttl_and_cache_path(vec![source], Duration::from_secs(60), None);
+        let rows = index.snapshot().await;
+        assert_eq!(
+            rows.len(),
+            1,
+            "the cached index uses the same composition policy"
+        );
+        let row = &rows[0];
+        assert_eq!(row.session_id, "b7936c10-4935-441c-837c-c1f33cafec2d");
+        assert_eq!(row.source_file.as_deref(), Some(newer_path.as_path()));
+        assert_eq!(
+            index.codex_segment_paths(&row.session_id).as_deref(),
+            Some([older_path.clone(), newer_path.clone()].as_slice()),
+            "the index retains every accepted segment in persisted-record order"
+        );
+        assert_eq!(
+            row.first_user_message.as_deref(),
+            Some("Older first request")
+        );
+        assert_eq!(row.title.as_deref(), Some("Continuation title"));
+        assert_eq!(row.summary.as_deref(), Some("Continuation summary"));
+        assert_eq!(
+            row.token_usage.as_ref().map(|usage| usage.total_tokens),
+            Some(780)
+        );
+        assert_eq!(
+            row.created_at,
+            crate::time::parse_timestamp_ms(&serde_json::json!("2026-10-03T00:00:00.000Z"))
+        );
+        assert_eq!(
+            row.last_activity_at,
+            crate::time::parse_timestamp_ms(&serde_json::json!("2026-10-03T00:00:10.009Z"))
+                .unwrap()
+        );
+
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn codex_source_keeps_ambiguous_same_id_files_separate() {
+        let (older, valid_newer) = codex_continuation_fixtures();
+        let large_copy = copied_large_codex_transcript(&older);
+        assert_eq!(large_copy.lines().count(), 2001);
+
+        let mut cases =
+            vec![
+            (
+                "byte-identical copied files",
+                large_copy.clone(),
+                large_copy.clone(),
+            ),
+            (
+                "overlapping or interleaved ranges",
+                older
+                    .clone()
+                    .replace("00:00:05.000000Z", "00:00:10.005000Z"),
+                valid_newer.clone(),
+            ),
+            (
+                "equal cross-file boundary",
+                older.clone(),
+                valid_newer.replace("00:00:10.001000Z", "00:00:05.000000Z"),
+            ),
+            (
+                "malformed JSONL",
+                older.clone(),
+                format!("{valid_newer}{{broken json}}\n"),
+            ),
+            (
+                "unterminated JSONL",
+                older.clone(),
+                valid_newer.trim_end().to_string(),
+            ),
+            (
+                "unknown top-level variant",
+                older.clone(),
+                valid_newer.replace(
+                    "\"type\":\"retained_context\"",
+                    "\"type\":\"future_variant\"",
+                ),
+            ),
+            (
+                "missing outer timestamp",
+                older.clone(),
+                valid_newer.replace(
+                    "{\"timestamp\":\"2026-10-03T00:00:10.009000Z\",\"ordinal\":8,",
+                    "{\"ordinal\":8,",
+                ),
+            ),
+            (
+                "invalid outer timestamp",
+                older.clone(),
+                valid_newer.replace("00:00:10.009000Z", "not-a-time"),
+            ),
+            (
+                "timestamp regression",
+                older.clone(),
+                valid_newer.replace("00:00:10.009000Z", "00:00:10.003000Z"),
+            ),
+            (
+                "invalid ordinal",
+                older.clone(),
+                valid_newer.replace(
+                    "\"timestamp\":\"2026-10-03T00:00:10.009000Z\",\"ordinal\":8",
+                    "\"timestamp\":\"2026-10-03T00:00:10.009000Z\",\"ordinal\":\"invalid\"",
+                ),
+            ),
+            (
+                "regressing ordinal",
+                older.clone(),
+                valid_newer.replace(
+                    "\"timestamp\":\"2026-10-03T00:00:10.009000Z\",\"ordinal\":8",
+                    "\"timestamp\":\"2026-10-03T00:00:10.009000Z\",\"ordinal\":6",
+                ),
+            ),
+            (
+                "conflicting embedded ownership",
+                older.clone(),
+                valid_newer.replace(
+                    "\"session_id\":\"b7936c10-4935-441c-837c-c1f33cafec2d\"",
+                    "\"session_id\":\"00000000-0000-4000-8000-000000000000\"",
+                ),
+            ),
+            (
+                "conflicting cwd",
+                older.clone(),
+                valid_newer.replace("/sanitized/project", "/different/project"),
+            ),
+            (
+                "conflicting source",
+                older.clone(),
+                valid_newer.replace("\"source\":\"vscode\"", "\"source\":\"cli\""),
+            ),
+            (
+                "unsupported source shape",
+                older.replace("\"source\":\"vscode\"", "\"source\":{}"),
+                valid_newer.replace("\"source\":\"vscode\"", "\"source\":{}"),
+            ),
+            (
+                "unknown source value",
+                older.replace(
+                    "\"source\":\"vscode\"",
+                    "\"source\":\"future_source\"",
+                ),
+                valid_newer.replace("\"source\":\"vscode\"", "\"source\":\"future_source\""),
+            ),
+            (
+                "conflicting thread source",
+                older.clone(),
+                valid_newer.replace(
+                    "\"thread_source\":\"user\"",
+                    "\"thread_source\":\"subagent\"",
+                ),
+            ),
+            (
+                "subagent thread classification",
+                older.replace("\"thread_source\":\"user\"", "\"thread_source\":\"subagent\""),
+                valid_newer
+                    .replace("\"thread_source\":\"user\"", "\"thread_source\":\"subagent\""),
+            ),
+            (
+                "conflicting CLI version",
+                older.clone(),
+                valid_newer.replace("\"cli_version\":\"0.156.0\"", "\"cli_version\":\"0.155.0\""),
+            ),
+            (
+                "conflicting originator",
+                older.clone(),
+                valid_newer.replace(
+                    "\"originator\":\"codex-vscode\"",
+                    "\"originator\":\"codex-cli\"",
+                ),
+            ),
+            (
+                "conflicting history mode",
+                older.clone(),
+                valid_newer.replace(
+                    "\"history_mode\":\"paginated\"",
+                    "\"history_mode\":\"legacy\"",
+                ),
+            ),
+            (
+                "missing required metadata",
+                older.clone(),
+                valid_newer.replace("\"originator\":\"codex-vscode\",", ""),
+            ),
+            (
+                "fork id evidence",
+                older.clone(),
+                valid_newer.replace(
+                    "\"history_mode\":\"paginated\"",
+                    "\"history_mode\":\"paginated\",\"forked_from_id\":\"parent\"",
+                ),
+            ),
+            (
+                "fork ordinal evidence",
+                older.clone(),
+                valid_newer.replace(
+                    "\"history_mode\":\"paginated\"",
+                    "\"history_mode\":\"paginated\",\"forked_from_ordinal_exclusive\":5",
+                ),
+            ),
+            (
+                "parent evidence",
+                older.clone(),
+                valid_newer.replace(
+                    "\"history_mode\":\"paginated\"",
+                    "\"history_mode\":\"paginated\",\"parent_thread_id\":\"parent\"",
+                ),
+            ),
+            (
+                "subagent evidence",
+                older.clone(),
+                valid_newer.replace(
+                    "\"history_mode\":\"paginated\"",
+                    "\"history_mode\":\"paginated\",\"subagent_history_start_ordinal\":0",
+                ),
+            ),
+            (
+                "referenced history prefix evidence",
+                older.clone(),
+                valid_newer.replace(
+                    "\"history_mode\":\"paginated\"",
+                    "\"history_mode\":\"paginated\",\"history_base\":{\"rollout_id\":\"prefix\"}",
+                ),
+            ),
+        ];
+        let mut non_first_line = String::from(
+            "{\"timestamp\":\"2026-10-03T00:00:09.999Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"task_started\"}}\n",
+        );
+        non_first_line.push_str(&valid_newer);
+        cases.push(("header after first line", older.clone(), non_first_line));
+
+        let header = valid_newer.lines().next().unwrap();
+        let later_header = header
+            .replace("00:00:10.000Z", "00:00:10.010Z")
+            .replace(
+                "\"type\":\"session_meta\"",
+                "\"ordinal\":9,\"type\":\"session_meta\"",
+            )
+            .replace("/sanitized/project", "/contradictory/project");
+        let mut contradictory_header = valid_newer.clone();
+        contradictory_header.push_str(&later_header);
+        contradictory_header.push('\n');
+        cases.push((
+            "later contradictory metadata",
+            older.clone(),
+            contradictory_header,
+        ));
+
+        let home = unique_temp_dir("codex-continuation-ambiguous");
+        let source = CodexSource::new(home.join(".codex"));
+        for (label, older_content, newer_content) in cases {
+            write_codex_pair(&home, &older_content, &newer_content);
+            assert_uncomposed_same_id_rows(&source, label);
+        }
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[tokio::test]
+    async fn codex_source_keeps_cwdless_same_id_members_in_unresolved_identity_sidecar() {
+        let home = unique_temp_dir("codex-continuation-hidden-member");
+        let (older, newer) = codex_continuation_fixtures();
+        let cwdless = newer.replace("\"cwd\":\"/sanitized/project\",", "");
+        let (older_path, newer_path) = write_codex_pair(&home, &older, &cwdless);
+        let source = Arc::new(CodexSource::new(home.join(".codex")));
+        let index =
+            SessionIndex::with_ttl_and_cache_path(vec![source], Duration::from_secs(60), None);
+
+        let rows = index.snapshot().await;
+        assert_eq!(rows.len(), 1, "the cwd-less segment remains non-renderable");
+        assert_eq!(rows[0].source_file.as_deref(), Some(older_path.as_path()));
+        assert_eq!(
+            index.unresolved_codex_identities(),
+            vec![CodexUnresolvedIdentity {
+                session_id: "b7936c10-4935-441c-837c-c1f33cafec2d".to_string(),
+                paths: vec![newer_path, older_path],
+            }],
+            "the hidden member prevents partial composition and remains available to quarantine"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[tokio::test]
+    async fn codex_continuation_composition_survives_refresh_and_cache_reload() {
+        let home = unique_temp_dir("codex-continuation-refresh");
+        let (older, newer) = codex_continuation_fixtures();
+        let (older_path, newer_path) = write_codex_pair(&home, &older, &newer);
+        let newest_path = home
+            .join(".codex")
+            .join("sessions")
+            .join("m-latest-rollout.jsonl");
+        let cache_dir = unique_temp_dir("codex-continuation-refresh-cache");
+        let cache_path = cache_path_in(&cache_dir);
+        let source = Arc::new(CodexSource::new(home.join(".codex")));
+        let index = SessionIndex::with_ttl_and_cache_path(
+            vec![source.clone()],
+            Duration::from_secs(3600),
+            Some(cache_path.clone()),
+        );
+        let first = index.snapshot().await;
+        assert_eq!(first.len(), 1);
+        assert_eq!(
+            index.codex_segment_paths(&first[0].session_id),
+            Some(vec![older_path.clone(), newer_path.clone()])
+        );
+
+        let first_generation = *index.subscribe_changes().borrow();
+        let newest_before_append = source.parse(&newer_path).unwrap();
+        use std::io::Write;
+        let mut newest_file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&newer_path)
+            .unwrap();
+        writeln!(
+            newest_file,
+            "{{\"timestamp\":\"2026-10-03T00:00:10.010000Z\",\"ordinal\":9,\"type\":\"world_state\",\"payload\":{{\"state\":\"appended\"}}}}"
+        )
+        .unwrap();
+        drop(newest_file);
+        assert_eq!(
+            source.parse(&newer_path).unwrap(),
+            newest_before_append,
+            "the append changes evidence but not the display row"
+        );
+        index.mark_dirty(&[(newer_path.clone(), "codex".to_string())]);
+        assert!(
+            wait_until(Duration::from_secs(3), || {
+                index
+                    .file_cache
+                    .lock()
+                    .unwrap()
+                    .get(&newer_path)
+                    .is_some_and(|entry| {
+                        entry
+                            .codex_evidence
+                            .as_ref()
+                            .and_then(|evidence| evidence.interval)
+                            .is_some_and(|interval| {
+                                interval.end_nanos
+                                    == chrono::DateTime::parse_from_rfc3339(
+                                        "2026-10-03T00:00:10.010000Z",
+                                    )
+                                    .unwrap()
+                                    .timestamp_nanos_opt()
+                                    .unwrap()
+                            })
+                    })
+            })
+            .await,
+            "the append refreshes persisted-record evidence"
+        );
+        assert!(
+            *index.subscribe_changes().borrow() > first_generation,
+            "an evidence-only change advances the published generation"
+        );
+        assert_eq!(index.persist_state.lock().unwrap().changed_since_save, 1);
+        let after_append = index.snapshot().await;
+        assert_eq!(after_append.len(), 1);
+        assert_eq!(
+            index.codex_segment_paths(&after_append[0].session_id),
+            Some(vec![older_path.clone(), newer_path.clone()])
+        );
+        assert_eq!(
+            after_append[0].source_file.as_deref(),
+            Some(newer_path.as_path())
+        );
+
+        std::fs::write(
+            &newest_path,
+            codex_continuation_fixture_at(
+                20,
+                "Latest continuation request",
+                "Latest continuation summary",
+                1800,
+            ),
+        )
+        .unwrap();
+        index.mark_provider_dirty("codex");
+        assert!(
+            wait_until(Duration::from_secs(3), || {
+                index
+                    .codex_segment_paths("b7936c10-4935-441c-837c-c1f33cafec2d")
+                    .is_some_and(|paths| {
+                        paths == vec![older_path.clone(), newer_path.clone(), newest_path.clone()]
+                    })
+            })
+            .await,
+            "the new segment is composed with cached siblings in transcript order"
+        );
+        let after_third = index.snapshot().await;
+        assert_eq!(after_third.len(), 1);
+        assert_eq!(
+            after_third[0].source_file.as_deref(),
+            Some(newest_path.as_path())
+        );
+        assert_eq!(
+            after_third[0].title.as_deref(),
+            Some("Latest continuation request")
+        );
+        assert_eq!(
+            after_third[0].summary.as_deref(),
+            Some("Latest continuation summary")
+        );
+        assert_eq!(
+            after_third[0]
+                .token_usage
+                .as_ref()
+                .map(|usage| usage.total_tokens),
+            Some(1798)
+        );
+
+        save_cache_file(&cache_path, &index.file_cache.lock().unwrap()).unwrap();
+        let reloaded = SessionIndex::with_ttl_and_cache_path(
+            vec![Arc::new(CodexSource::new(home.join(".codex")))],
+            Duration::from_secs(3600),
+            Some(cache_path.clone()),
+        );
+        assert_eq!(
+            reloaded.file_cache.lock().unwrap().len(),
+            3,
+            "all path-keyed entries reload from the serialized cache"
+        );
+        let reloaded_rows = reloaded.snapshot().await;
+        assert_eq!(reloaded_rows.len(), 1);
+        assert_eq!(
+            reloaded.codex_segment_paths(&reloaded_rows[0].session_id),
+            Some(vec![
+                older_path.clone(),
+                newer_path.clone(),
+                newest_path.clone()
+            ])
+        );
+
+        let old_schema_path = cache_path_in(&cache_dir.join("old-schema"));
+        save_cache_file(&old_schema_path, &index.file_cache.lock().unwrap()).unwrap();
+        let mut old_schema: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&old_schema_path).unwrap()).unwrap();
+        old_schema["schema_version"] = serde_json::Value::from(2);
+        std::fs::write(&old_schema_path, serde_json::to_vec(&old_schema).unwrap()).unwrap();
+        let old_schema_index = SessionIndex::with_ttl_and_cache_path(
+            vec![Arc::new(CodexSource::new(home.join(".codex")))],
+            Duration::from_secs(3600),
+            Some(old_schema_path),
+        );
+        assert!(old_schema_index.file_cache.lock().unwrap().is_empty());
+        assert_eq!(old_schema_index.snapshot().await.len(), 1);
+        assert!(old_schema_index
+            .file_cache
+            .lock()
+            .unwrap()
+            .values()
+            .all(|entry| entry.codex_evidence.is_some()));
+
+        std::fs::remove_file(&older_path).unwrap();
+        reloaded.mark_provider_dirty("codex");
+        assert!(
+            wait_until(Duration::from_secs(3), || {
+                reloaded
+                    .codex_segment_paths("b7936c10-4935-441c-837c-c1f33cafec2d")
+                    .is_some_and(|paths| paths == vec![newer_path.clone(), newest_path.clone()])
+            })
+            .await,
+            "the delete refresh removes the stale oldest path"
+        );
+        let after_delete = reloaded.snapshot().await;
+        assert_eq!(after_delete.len(), 1);
+        assert_eq!(
+            after_delete[0].source_file.as_deref(),
+            Some(newest_path.as_path())
+        );
+        assert!(!reloaded
+            .codex_segment_paths(&after_delete[0].session_id)
+            .unwrap()
+            .contains(&older_path));
+
+        std::fs::remove_dir_all(&home).ok();
+        std::fs::remove_dir_all(&cache_dir).ok();
     }
 
     #[test]
@@ -5138,6 +5921,7 @@ pub(crate) mod tests {
                     mtime_ms: matching_stat.mtime_ms,
                     size: matching_stat.size,
                     item: source.parse(&matching_path),
+                    codex_evidence: None,
                 },
             ),
             (
@@ -5147,6 +5931,7 @@ pub(crate) mod tests {
                     mtime_ms: child_stat.mtime_ms,
                     size: child_stat.size,
                     item: Some(legacy_child),
+                    codex_evidence: None,
                 },
             ),
         ]);
@@ -5363,6 +6148,7 @@ pub(crate) mod tests {
                     mtime_ms: canonical_stat.mtime_ms,
                     size: canonical_stat.size,
                     item: source.parse(&canonical_path),
+                    codex_evidence: None,
                 },
             ),
             (
@@ -5372,6 +6158,7 @@ pub(crate) mod tests {
                     mtime_ms: nested_stat.mtime_ms,
                     size: nested_stat.size,
                     item: source.parse(&nested_path),
+                    codex_evidence: None,
                 },
             ),
         ]);
@@ -5462,6 +6249,7 @@ pub(crate) mod tests {
                 mtime_ms: 1,
                 size: 2,
                 item: None,
+                codex_evidence: None,
             },
         );
         let result = save_cache_file(&path, &cache);
