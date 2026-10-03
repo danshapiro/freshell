@@ -81,8 +81,24 @@ fn read_opencode(home: &Path, id: &str) -> Result<Value, String> {
     connection
         .execute_batch("BEGIN")
         .map_err(|e| e.to_string())?;
+    // Older native schemas predate revert; inspect capabilities without migrating the store.
+    let mut has_revert = false;
+    let mut columns = connection
+        .prepare("PRAGMA table_info(session)")
+        .map_err(|e| e.to_string())?;
+    for name in columns
+        .query_map([], |row| row.get::<_, String>(1))
+        .map_err(|e| e.to_string())?
+    {
+        has_revert |= name.map_err(|e| e.to_string())? == "revert";
+    }
+    let session_query = if has_revert {
+        "SELECT title, time_updated, revert FROM session WHERE id = ?1"
+    } else {
+        "SELECT title, time_updated, NULL FROM session WHERE id = ?1"
+    };
     let mut info: Value = connection.query_row(
-        "SELECT title, time_updated, revert FROM session WHERE id = ?1", [id],
+        session_query, [id],
         |row| Ok(json!({"id":id,"title":row.get::<_, String>(0)?,"time":{"updated":row.get::<_, i64>(1)?},
             "revert":row.get::<_, Option<String>>(2)?.and_then(|text| serde_json::from_str::<Value>(&text).ok())})))
         .optional().map_err(|e| e.to_string())?.ok_or("saved native session not found")?;
