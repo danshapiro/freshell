@@ -364,6 +364,16 @@ visible update, plus preservation of a surviving sibling representation.
 Thirteen focused suites passed (433 tests), client typecheck and
 `git diff --check` passed. Independent review of this repair is pending.
 
+**Task 2 review 7 repair (2026-10-03):** Managed visibility restoration now
+promotes each view independently and checks the exact original tab/pane
+representation after each mutation. If one view disappears, compensation
+closes and detaches only that view when no exact sibling remains, or reopens
+the surviving sibling with its own tab identity; remaining restored views are
+still promoted. Regressions cover a partial replay that removes view A while
+view B remains, both with and without another exact representation of A.
+Thirteen focused suites passed (436 tests), client typecheck and
+`git diff --check` passed. Independent review of this repair is pending.
+
 ## Task 3: Reopen only from current identity and clear close evidence
 
 **Files:**

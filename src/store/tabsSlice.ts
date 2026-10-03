@@ -2400,7 +2400,7 @@ async function persistManagedViewVisibility(
   getState: () => RootState,
   options: {
     initialSnapshot?: ManagedRuntimeInventorySnapshot
-    afterVisibilityMutation?: () => boolean
+    afterVisibilityMutation?: (viewIntentId: string) => boolean
   } = {},
 ): Promise<void> {
   if (viewIntentIds.length === 0) return
@@ -2437,7 +2437,7 @@ async function persistManagedViewVisibility(
       mutationError = error
       break
     }
-    if (options.afterVisibilityMutation && !options.afterVisibilityMutation()) break
+    if (options.afterVisibilityMutation && !options.afterVisibilityMutation(view.viewId)) break
   }
 
   let confirmedSnapshot: ManagedRuntimeInventorySnapshot
@@ -2588,6 +2588,10 @@ async function reconcileManagedCloseAfterReplay(
 
       const representationWasRestored = (state: RootState) => (
         getStillRepresentedCloseIdentities(state).length > 0
+      )
+      const originalViewStillRepresented = (state: RootState, viewIntentId: string) => (
+        state.tabs.tabs.some((tab) => tab.id === tabId)
+        && getStillRepresentedViewIds(state).includes(viewIntentId)
       )
       const reconcileViewAfterOriginalDisappears = async (viewIntentId: string): Promise<void> => {
         const ensureVisibleForCurrentRepresentation = async (): Promise<boolean> => {
@@ -2751,24 +2755,39 @@ async function reconcileManagedCloseAfterReplay(
         return
       }
 
-      try {
-        await persistManagedViewVisibility(visibleViewIntentIds, 'visible', dispatch, getState, {
-          initialSnapshot,
-          afterVisibilityMutation: () => representationWasRestored(getState()),
-        })
-      } catch (error) {
-        if (!representationWasRestored(getState())) {
-          for (const viewIntentId of visibleViewIntentIds) {
+      let visibilityReconciliationError: unknown
+      let hasVisibilityReconciliationError = false
+      for (const viewIntentId of visibleViewIntentIds) {
+        if (!originalViewStillRepresented(getState(), viewIntentId)) {
+          try {
             await reconcileViewAfterOriginalDisappears(viewIntentId)
+          } catch (error) {
+            if (!hasVisibilityReconciliationError) visibilityReconciliationError = error
+            hasVisibilityReconciliationError = true
+          }
+          continue
+        }
+        try {
+          await persistManagedViewVisibility([viewIntentId], 'visible', dispatch, getState, {
+            initialSnapshot,
+            afterVisibilityMutation: (mutatedViewIntentId) => (
+              originalViewStillRepresented(getState(), mutatedViewIntentId)
+            ),
+          })
+        } catch (error) {
+          if (!hasVisibilityReconciliationError) visibilityReconciliationError = error
+          hasVisibilityReconciliationError = true
+        }
+        if (!originalViewStillRepresented(getState(), viewIntentId)) {
+          try {
+            await reconcileViewAfterOriginalDisappears(viewIntentId)
+          } catch (error) {
+            if (!hasVisibilityReconciliationError) visibilityReconciliationError = error
+            hasVisibilityReconciliationError = true
           }
         }
-        throw error
       }
-      if (!representationWasRestored(getState())) {
-        for (const viewIntentId of visibleViewIntentIds) {
-          await reconcileViewAfterOriginalDisappears(viewIntentId)
-        }
-      }
+      if (hasVisibilityReconciliationError) throw visibilityReconciliationError
     })
   } catch (error) {
     log.warn('could not reconcile managed close state after shared-layout replay', {

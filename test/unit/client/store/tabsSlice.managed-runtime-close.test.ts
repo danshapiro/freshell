@@ -2555,6 +2555,169 @@ describe('closeTab managed runtime visibility', () => {
     }
   })
 
+  it.each([[false, false], [true, false], [false, true]] as const)(
+    'reconciles each view after partial replay (exact sibling: %s, A PATCH rejected: %s)',
+    async (keepExactSibling, rejectAVisibility) => {
+      vi.useFakeTimers()
+      vi.setSystemTime(new Date(100))
+      resetPersistedLayoutCacheForTests()
+
+      const layoutWindowId = 'managed-close-multi-view-partial-replay'
+      const layoutKey = `freshell.layout.v3.${layoutWindowId}`
+      sessionStorage.setItem(LAYOUT_WINDOW_ID_STORAGE_KEY, layoutWindowId)
+      const views = [view('view-a', 0), view('view-b', 1)]
+      let serverSnapshot = inventory(8, views)
+      const paneA = managedContent(views[0]!)
+      const paneB = managedContent(views[1]!)
+      const bothPanes = {
+        type: 'split', id: 'managed-close-both', direction: 'horizontal', sizes: [50, 50],
+        children: [
+          { type: 'leaf', id: 'managed-pane-0', content: paneA },
+          { type: 'leaf', id: 'managed-pane-1', content: paneB },
+        ],
+      }
+      const siblingPane = { type: 'leaf', id: 'sibling-pane', content: paneA }
+      const writeLayout = (
+        persistedAt: number,
+        layout: unknown,
+        paneTitles: Record<string, Record<string, string>> = {},
+        includeExactSibling = false,
+      ) => {
+        const layouts = { 'managed-tab': layout, ...(includeExactSibling ? { 'sibling-tab': siblingPane } : {}) }
+        const activePane = layout && typeof layout === 'object' && 'type' in layout && layout.type === 'leaf'
+          ? (layout as { id: string }).id
+          : 'managed-pane-0'
+        return JSON.stringify({
+          version: 3,
+          persistedAt,
+          tabs: {
+            activeTabId: 'managed-tab',
+            tabs: [
+              { id: 'managed-tab', title: 'Managed agents', createdAt: 1 },
+              ...(includeExactSibling ? [{ id: 'sibling-tab', title: 'Exact sibling', createdAt: 2 }] : []),
+            ],
+          },
+          panes: {
+            version: 6,
+            layouts,
+            activePane: { 'managed-tab': activePane, ...(includeExactSibling ? { 'sibling-tab': 'sibling-pane' } : {}) },
+            paneTitles,
+            paneTitleSetByUser: Object.fromEntries(Object.entries(paneTitles).map(([tabId, titles]) => [
+              tabId,
+              Object.fromEntries(Object.keys(titles).map((paneId) => [paneId, true])),
+            ])),
+          },
+          tombstones: [],
+        })
+      }
+      localStorage.setItem(layoutKey, writeLayout(100, bothPanes))
+
+      const store = createStore(['view-a', 'view-b'], serverSnapshot, [persistMiddleware as any])
+      const visiblePatchStarted = deferred<void>()
+      const finishVisiblePatch = deferred<void>()
+      let firstVisibleView = true
+      let newerTitleEnvelopePublished = false
+      apiMocks.getManagedRuntimeInventory.mockImplementation(async () => serverSnapshot)
+      apiMocks.updateManagedRuntimeViewVisibility.mockImplementation(async (
+        viewId: string,
+        visibility: ManagedRuntimeViewIntent['visibility'],
+      ) => {
+        if (viewId === 'view-a' && visibility === 'detached' && !newerTitleEnvelopePublished) {
+          newerTitleEnvelopePublished = true
+          localStorage.setItem(layoutKey, writeLayout(300, bothPanes, {
+            'managed-tab': { 'managed-pane-1': 'Q renamed in another window' },
+          }))
+        }
+        if (viewId === 'view-a' && visibility === 'visible' && firstVisibleView) {
+          firstVisibleView = false
+          visiblePatchStarted.resolve()
+          await finishVisiblePatch.promise
+          if (rejectAVisibility) throw new Error('view A visibility response was lost')
+        }
+        serverSnapshot = withVisibility(serverSnapshot, viewId, visibility)
+        return serverSnapshot.viewIntents.find((entry) => entry.viewId === viewId)
+      })
+
+      const cleanupSync = installCrossTabSync(store as any)
+      let closing: Promise<unknown> | undefined
+      try {
+        closing = store.dispatch(closeTab('managed-tab'))
+        const closeStep = await Promise.race([
+          visiblePatchStarted.promise.then(() => 'visible-patch-started' as const),
+          closing.then(() => 'close-finished' as const),
+        ])
+        expect(closeStep).toBe('visible-patch-started')
+
+        const survivingPane = { type: 'leaf', id: 'managed-pane-1', content: paneB }
+        const partialReplay = writeLayout(301, survivingPane, {
+          'managed-tab': { 'managed-pane-1': 'Q renamed in another window' },
+        }, keepExactSibling)
+        localStorage.setItem(layoutKey, partialReplay)
+        window.dispatchEvent(new StorageEvent('storage', { key: layoutKey, newValue: partialReplay }))
+        expect(newerTitleEnvelopePublished).toBe(true)
+        expect(store.getState().panes.layouts['managed-tab']).toMatchObject({
+          type: 'leaf', id: 'managed-pane-1', content: { viewIntentId: 'view-b' },
+        })
+        expect(store.getState().tabs.tabs.find((tab) => tab.id === 'managed-tab')?.viewIntentId).toBeUndefined()
+        if (keepExactSibling) {
+          expect(store.getState().panes.layouts['sibling-tab']).toMatchObject({
+            type: 'leaf', id: 'sibling-pane', content: { viewIntentId: 'view-a' },
+          })
+        }
+
+        finishVisiblePatch.resolve()
+        await closing
+
+        expect(store.getState().panes.layouts['managed-tab']).toMatchObject({
+          type: 'leaf', id: 'managed-pane-1', content: { viewIntentId: 'view-b' },
+        })
+        expect(serverSnapshot.viewIntents.map(({ viewId, visibility }) => [viewId, visibility])).toEqual([
+          ['view-a', keepExactSibling ? 'visible' : 'detached'],
+          ['view-b', 'visible'],
+        ])
+        expect(apiMocks.updateManagedRuntimeViewVisibility.mock.calls.map(([viewId, visibility]) => [viewId, visibility])).toEqual(
+          rejectAVisibility
+            ? [
+              ['view-a', 'detached'],
+              ['view-b', 'detached'],
+              ['view-a', 'visible'],
+              ['view-b', 'visible'],
+            ]
+            : [
+              ['view-a', 'detached'],
+              ['view-b', 'detached'],
+              ['view-a', 'visible'],
+              ...(keepExactSibling ? [] : [['view-a', 'detached']]),
+              ['view-b', 'visible'],
+            ],
+        )
+        expect(wsMock.sent.some((message: any) => (
+          message.type === 'pane.closed' && message.createRequestId === paneA.createRequestId
+        ))).toBe(!keepExactSibling)
+        expect(wsMock.sent.some((message: any) => (
+          message.type === 'pane.opened' && message.createRequestId === paneB.createRequestId
+        ))).toBe(true)
+        expect(wsMock.sent.some((message: any) => (
+          message.type === 'pane.opened'
+          && message.tabId === 'sibling-tab'
+          && message.createRequestId === paneA.createRequestId
+        ))).toBe(keepExactSibling)
+      } finally {
+        finishVisiblePatch.resolve()
+        await Promise.allSettled([closing].filter(Boolean) as Promise<unknown>[])
+        cleanupSync()
+        clearLocalClosePersistencePending()
+        resetAuthoritativeLocalLayoutPersistedAtForTests()
+        resetPersistedLayoutCacheForTests()
+        resetPersistFlushListenersForTests()
+        resetPersistBroadcastForTests()
+        localStorage.clear()
+        sessionStorage.removeItem(LAYOUT_WINDOW_ID_STORAGE_KEY)
+        vi.useRealTimers()
+      }
+    },
+  )
+
   it('does not replace a different pane identity replayed when replacement thaws', async () => {
     vi.useFakeTimers()
     vi.setSystemTime(new Date(100))
