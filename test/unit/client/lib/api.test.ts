@@ -60,6 +60,14 @@ describe('managed runtime stop outcome', () => {
     await expect(stopManagedRuntimeSoul('soul', 8)).rejects.toThrow()
   })
 
+  it('retains the authoritative Fresh launch correlation when reading inventory', async () => {
+    const inventory = structuredClone(lostFreshAgentInventory)
+    Object.assign(inventory.souls[0], { freshAgentCreateRequestId: 'original-fresh-create' })
+    mockFetch.mockResolvedValueOnce(mockJson(inventory))
+    const parsed = await getManagedRuntimeInventory()
+    expect(parsed.souls[0]).toMatchObject({ freshAgentCreateRequestId: 'original-fresh-create', freshAgentSessionType: 'freshopencode' })
+  })
+
   it('accepts the persisted lost Fresh Agent inventory serialized by the real Rust route', async () => {
     // Captured by restored_web_stops_persisted_lost_soul_only_after_verified_cleanup.
     mockFetch.mockResolvedValueOnce(mockJson(lostFreshAgentInventory))

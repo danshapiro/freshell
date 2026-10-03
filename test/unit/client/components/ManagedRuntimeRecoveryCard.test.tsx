@@ -45,6 +45,18 @@ describe('ManagedRuntimeRecoveryCard', () => {
     await waitFor(() => expect(onRetry).toHaveBeenCalledTimes(1))
   })
 
+  it('explains exhausted automatic attempts and allows explicit recovery of the retained conversation', async () => {
+    const onRetry = vi.fn().mockResolvedValue(undefined)
+    const onStartFresh = vi.fn()
+    render(<ManagedRuntimeRecoveryCard recoverySummary={{ ...summary('blocked'), reason: 'BLOCKED_RETRY_BUDGET' }}
+      onRetry={onRetry} onStartFresh={onStartFresh} />)
+    expect(screen.getByRole('alert')).toHaveTextContent('Automatic recovery attempts have been exhausted.')
+    expect(screen.getByRole('alert')).not.toHaveTextContent('BLOCKED_RETRY_BUDGET')
+    fireEvent.click(screen.getByRole('button', { name: 'Retry recovery' }))
+    await waitFor(() => expect(onRetry).toHaveBeenCalledTimes(1))
+    expect(onStartFresh).not.toHaveBeenCalled()
+  })
+
   it('keeps the blocked alert and reports retry failures in the same card', async () => {
     const onRetry = vi.fn().mockRejectedValue(new Error('Provider is unavailable'))
     render(

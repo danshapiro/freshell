@@ -99,6 +99,7 @@ export const ManagedRuntimeSoulSchema = z.object({
   terminalCreateRequestId: z.string().optional(),
   terminalResumeSessionId: z.string().optional(),
   freshAgentSessionId: z.string().optional(),
+  freshAgentCreateRequestId: z.string().optional(),
   freshAgentSessionType: z.string().optional(),
   freshAgentRuntimeVariant: z.string().optional(),
   projectKey: z.string().optional(),

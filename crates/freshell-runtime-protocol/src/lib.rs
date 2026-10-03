@@ -2626,6 +2626,9 @@ pub struct RuntimeView {
     pub terminal_resume_session_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fresh_agent_session_id: Option<String>,
+    /// Original Fresh create request, persisted as the soul creation seed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fresh_agent_create_request_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fresh_agent_session_type: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

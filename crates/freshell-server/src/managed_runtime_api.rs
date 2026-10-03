@@ -1186,6 +1186,7 @@ mod tests {
             terminal_create_request_id: Some("create-test".into()),
             terminal_resume_session_id: Some("ses_test".into()),
             fresh_agent_session_id: None,
+            fresh_agent_create_request_id: None,
             fresh_agent_session_type: None,
             fresh_agent_runtime_variant: None,
             project_key: Some("workspace".into()),
