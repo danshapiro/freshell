@@ -2664,19 +2664,16 @@ export function FreshAgentView({
   }, [agentSession?.cwd, appStore, captureFreshAgentAttachmentAttempt, clearReserveRedrive, commitSnapshot, descriptor?.label, dispatch, markSnapshotDirty, migratePendingAutoTitle, paneContent, paneContent.createRequestId, paneId, recordPendingSendMetadata, redriveAfterSessionReserved, releasePendingRebind, requestRevealRefresh, requestSnapshotRefresh, resendPendingMessage, sendFencedFreshAgentAttach, sendFreshAgentMessage, setLocalEcho, tabId, ws])
 
   useEffect(() => {
-    if (managedRecoveryDecision) return
     if (!snapshotThreadId) return
     // kata b8ke: a divergent pane (the canonical session's runtime owner is
     // the other kind) stops ALL old-kind snapshot traffic — polling, event
     // refreshes, and this identity fetch alike. Read via the ref so the
     // identity-deps discipline below is not disturbed.
     if (ownerDivergenceRef.current) return
-    // agentSession is the provider-agnostic session-meta selector (see above);
-    // for claude it's the same entry as claudeSession, so this also covers
-    // claude's existing behavior. Skip the snapshot fetch while a resumable
-    // provider is lost -- fetching against a dead thread id is a guaranteed
-    // 404 and triggerRecovery (below) is what should react to `.lost`.
-    if ((paneContent.provider === 'claude' || paneContent.provider === 'codex') && agentSession?.lost) return
+    // Unmanaged lost threads use lifecycle recovery below. Managed
+    // intervention retains the durable identity: its read-only GET can
+    // still show saved history while runtime recovery awaits a decision.
+    if (!managedRecoveryDecision && (paneContent.provider === 'claude' || paneContent.provider === 'codex') && agentSession?.lost) return
     setLoadError(null)
     const sessionId = snapshotThreadId
     const provider = paneContent.provider
@@ -2815,6 +2812,7 @@ export function FreshAgentView({
         idleIncompleteRetryCountRef.current = 0
       }
       const fresh = paneContentRef.current
+      if (isManagedRuntimeRecoveryDecision(fresh.recoverySummary)) return
       const nextStatus = (resolved.status as FreshAgentPaneContent['status']) ?? fresh.status
       const snapshotSessionRef = provider === 'opencode' && resolved.sessionId && resolved.sessionId !== sessionId
         ? { provider, sessionId: resolved.sessionId }
@@ -2911,6 +2909,12 @@ export function FreshAgentView({
       // fetches carry no signal (A2), so this can no longer fire.
       if (error instanceof Error && error.name === 'AbortError') return
       if (isStaleSnapshotRequest()) return
+      // A history refusal must not initiate an attach/resume or clear the
+      // saved identity while the pane requires explicit intervention.
+      if (isManagedRuntimeRecoveryDecision(paneContentRef.current.recoverySummary)) {
+        setLoadError(error instanceof Error ? error.message : 'Failed to load session')
+        return
+      }
       if (paneContent.provider === 'claude' && claudeSession && isRestoring) {
         // While a restore is in flight the snapshot legitimately 404s.
         // Outside of restore, swallowing here left dead Claude sessions as
@@ -3731,7 +3735,7 @@ export function FreshAgentView({
                   onDismiss={() => dispatch(clearSessionError(sessionRecordLocator))}
                 />
               ) : null}
-              {effectiveStatus === 'stuck' ? (
+              {effectiveStatus === 'stuck' && !managedRecoveryDecision ? (
                 <div
                   className="fresh-agent-stuck-card flex items-center justify-between gap-2 rounded-md border border-amber-500/50 bg-amber-500/10 px-3 py-2 text-sm"
                   role="alert"

@@ -10,6 +10,7 @@ const SESSION_ID = 'd4430000-0000-4444-8444-000000000091'
 const SOUL_ID = 'contextual-recovery-soul'
 const INTENT_REVISION = 19
 const CREATE_REQUEST_ID = 'contextual-recovery-create'
+const SAVED_HISTORY_TEXT = 'Saved conversation before recovery'
 const readiness = {
   inventoryRevision: 100,
   initialScanState: 'complete',
@@ -46,7 +47,10 @@ async function installPane(page: Page, kind: PaneKind, recoveryState: RecoverySt
     capabilities: { send: true, interrupt: true, approvals: true, questions: true, fork: false },
     settings: { model: FRESHCODEX_DEFAULT_MODEL, effort: 'low' },
     tokenUsage: { inputTokens: 0, outputTokens: 0, totalTokens: 0 },
-    pendingApprovals: [], pendingQuestions: [], turns: [], extensions: {},
+    pendingApprovals: [], pendingQuestions: [],
+    turns: [{ id: 'saved-turn', turnId: 'saved-turn', source: 'durable', role: 'assistant', summary: '',
+      items: [{ id: 'saved-text', kind: 'text', text: SAVED_HISTORY_TEXT }] }],
+    extensions: {},
   } }))
   await page.evaluate(({ kind, summary, sessionId, soulId, revision, createRequestId, model }) => {
     const harness = window.__FRESHELL_TEST_HARNESS__!
@@ -139,6 +143,7 @@ for (const kind of ['terminal', 'fresh-agent'] as const) {
     const card = page.getByTestId('managed-runtime-recovery-card')
     await expect(card).toBeVisible()
     await expect(card).toContainText('This session needs attention before it can continue.')
+    if (kind === 'fresh-agent') await expect(page.getByText(SAVED_HISTORY_TEXT, { exact: true })).toBeVisible()
     await card.getByRole('button', { name: 'Retry recovery', exact: true }).click()
     await expect(card.getByRole('status')).toHaveText('The provider is still unavailable. Try again.')
     await expect(page.getByRole('alert', { name: 'Managed runtime notice' })).toBeHidden()
@@ -179,6 +184,7 @@ for (const kind of ['terminal', 'fresh-agent'] as const) {
     await expect(card).toContainText('This session could not be recovered.')
     await expect(card.getByRole('button', { name: 'Retry recovery', exact: true })).toBeHidden()
     if (kind === 'fresh-agent') {
+      await expect(page.getByText(SAVED_HISTORY_TEXT, { exact: true })).toBeVisible()
       await expect(page.getByRole('textbox', { name: 'Chat message input' })).toBeDisabled()
       await harness.receiveWsMessage({
         type: 'freshAgent.event', sessionId: SESSION_ID, sessionType: 'freshcodex', provider: 'codex',
@@ -201,6 +207,7 @@ for (const kind of ['terminal', 'fresh-agent'] as const) {
     expect(beforeChoice.filter((message) => ['terminal.create', 'terminal.attach', 'freshAgent.create', 'freshAgent.attach', 'pane.reconcile.request'].includes(message.type ?? ''))).toEqual([])
     await card.getByRole('button', { name: 'Start new conversation', exact: true }).click()
     await expect(card.getByRole('status')).toContainText('Your conversation has been kept')
+    if (kind === 'fresh-agent') await expect(page.getByText(SAVED_HISTORY_TEXT, { exact: true })).toBeVisible()
     expect(await paneContent(page)).toMatchObject({ createRequestId: CREATE_REQUEST_ID, soulId: SOUL_ID, sessionRef: before.sessionRef })
     await card.getByRole('button', { name: 'Start new conversation', exact: true }).click()
     try {

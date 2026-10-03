@@ -6048,6 +6048,63 @@ describe('FreshAgentView', () => {
     expect(wsMock.send).not.toHaveBeenCalledWith(expect.objectContaining({ type: 'freshAgent.kill' }))
   })
 
+  it.each([
+    ['freshclaude', 'claude', 'blocked'], ['freshclaude', 'claude', 'lost'],
+    ['freshcodex', 'codex', 'blocked'], ['freshcodex', 'codex', 'lost'],
+    ['freshopencode', 'opencode', 'blocked'], ['freshopencode', 'opencode', 'lost'],
+  ] as const)('reloads saved %s/%s history during %s intervention without starting a runtime', async (sessionType, provider, recoveryState) => {
+    const store = createStore()
+    const sessionId = provider === 'claude' ? CLAUDE_THREAD_ID : 'saved-history-thread'
+    const locator = { sessionId, sessionType, provider }
+    store.dispatch(sessionInit(locator))
+    store.dispatch(markSessionLost(locator))
+    apiMock.getFreshAgentThreadSnapshot.mockResolvedValue({
+      status: 'idle', capabilities: { send: true, interrupt: true, fork: true },
+      turns: [{ id: 'saved-turn', turnId: 'saved-turn', source: 'durable', role: 'assistant', summary: '',
+        items: [{ id: 'saved-text', kind: 'text', text: 'Saved conversation before recovery' }] }],
+    })
+    const content = {
+      kind: 'fresh-agent' as const, sessionType, provider, sessionId,
+      sessionRef: { provider, sessionId }, resumeSessionId: sessionId,
+      createRequestId: 'saved-history-request', status: 'stuck' as const,
+      soulId: 'saved-history-soul', soulIntentRevision: 12,
+      recoverySummary: {
+        desiredState: 'running' as const, recoveryState, reason: 'provider_unavailable',
+        durabilityState: 'resume_captured' as const, allocationState: 'verified_durable' as const,
+      },
+    }
+    store.dispatch(initLayout({ tabId: 'tab-1', paneId: 'pane-1', content }))
+    render(<Provider store={store}><StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" /></Provider>)
+    expect(await screen.findByText('Saved conversation before recovery')).toBeInTheDocument()
+    expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledWith(sessionType, provider, sessionId, expect.any(Object))
+    expect(screen.getByTestId('managed-runtime-recovery-card')).toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: /restart sidecar and resume session/i })).not.toBeInTheDocument()
+    const layout = store.getState().panes.layouts['tab-1']
+    expect(layout?.type === 'leaf' && layout.content).toEqual(content)
+    expect(wsMock.send).not.toHaveBeenCalledWith(expect.objectContaining({ type: expect.stringMatching(/^freshAgent\.|^pane\.reconcile/) }))
+    expect(apiMock.stopManagedRuntimeSoul).not.toHaveBeenCalled()
+    expect(apiMock.retryManagedRuntimeSoul).not.toHaveBeenCalled()
+  })
+
+  it.each(['blocked', 'lost'] as const)('keeps %s history snapshot refusal read-only', async (recoveryState) => {
+    const store = createStore()
+    apiMock.getFreshAgentThreadSnapshot.mockRejectedValue(new ApiError(409, 'Saved history is temporarily unavailable', {
+      code: 'RESTORE_UNAVAILABLE', ownerGeneration: 8, ownerKind: 'fresh-agent',
+    }))
+    store.dispatch(initLayout({ tabId: 'tab-1', paneId: 'pane-1', content: {
+      kind: 'fresh-agent', sessionType: 'freshopencode', provider: 'opencode',
+      sessionId: 'saved-refused-thread', sessionRef: { provider: 'opencode', sessionId: 'saved-refused-thread' },
+      createRequestId: 'saved-refused-request', status: 'idle', soulId: 'saved-refused-soul', soulIntentRevision: 12,
+      recoverySummary: { desiredState: 'running', recoveryState, reason: 'provider_unavailable', durabilityState: 'resume_captured', allocationState: 'verified_durable' },
+    } }))
+    render(<Provider store={store}><StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" /></Provider>)
+    expect(await screen.findByText(/Saved history is temporarily unavailable/)).toBeInTheDocument()
+    expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledTimes(1)
+    expect(wsMock.send).not.toHaveBeenCalledWith(expect.objectContaining({ type: expect.stringMatching(/^freshAgent\.|^pane\.reconcile/) }))
+    const layout = store.getState().panes.layouts['tab-1']
+    expect(layout?.type === 'leaf' && layout.content).toMatchObject({ sessionId: 'saved-refused-thread', createRequestId: 'saved-refused-request', soulIntentRevision: 12 })
+  })
+
   it.each(['blocked', 'lost'] as const)(
     'does not re-drive a managed %s projection from the Fresh Agent .lost recovery effect',
     async (recoveryState) => {
