@@ -7189,7 +7189,8 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
   const hasFatalConnectionError = isFatalConnectionErrorCode(connectionErrorCode)
   const managedRecoveryDecision = isManagedRuntimeRecoveryDecision(terminalContent.recoverySummary)
   const managedTerminal = Boolean(terminalContent.soulId || terminalContent.recoverySummary)
-  const managedAutomaticRecovery = terminalContent.recoverySummary?.recoveryState === 'live'
+  const managedAutomaticRecovery = (managedTerminal && !terminalContent.recoverySummary)
+    || terminalContent.recoverySummary?.recoveryState === 'live'
     || terminalContent.recoverySummary?.recoveryState === 'recovering'
   // Keep recovery diagnostics in state, but show only actionable failures.
   const visibleNotice = managedTerminal ? null : activeNotice

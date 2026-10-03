@@ -121,6 +121,7 @@ interface StoreOptions {
   status?: TerminalPaneContent['status']
   withSessionRef?: boolean
   crashTrace?: CrashTrace
+  managed?: boolean
   recoveryState?: NonNullable<TerminalPaneContent['recoverySummary']>['recoveryState']
   lifecycle?: {
     lastTerminalId?: string
@@ -137,6 +138,7 @@ function makeStore(opts: StoreOptions = {}) {
     status: opts.status ?? 'exited',
     mode: mode as TerminalPaneContent['mode'],
     shell: 'system',
+    ...(opts.managed ? { soulId: 'managed-soul' } : {}),
     ...(opts.recoveryState ? { soulId: 'managed-soul', recoverySummary: { desiredState: 'running' as const, recoveryState: opts.recoveryState, reason: 'provider_unavailable', durabilityState: 'resume_captured' as const, allocationState: 'verified_durable' as const } } : {}),
     ...(opts.crashTrace ? { crashTrace: opts.crashTrace } : {}),
     ...(opts.withSessionRef === false
@@ -486,6 +488,17 @@ describe('TerminalView exited-pane error banner', () => {
     expect(screen.getByRole('alert')).toHaveTextContent('process exited (code 137)')
     expect(screen.getByRole('button', { name: `Relaunch ${mode} session` })).toBeInTheDocument()
     expect(screen.queryByText(/crashed 3 times/)).toBeNull()
+  })
+
+  it('keeps managed recovery invisible while the first summary is pending', async () => {
+    const { store, paneContent } = makeStore({ mode: 'codex', managed: true,
+      lifecycle: { lastTerminalId: 'term-crashed', exit: { exitCode: 137, at: Date.now() } } })
+    await renderPane(store, paneContent)
+    act(() => messageHandler!({ type: 'terminal.status', terminalId: 'term-crashed', status: 'recovering',
+      attempt: 1, maxAttempts: 3, exitCode: 137 }))
+    expect(store.getState().terminalLifecycle.byPaneId[PANE].notice?.kind).toBe('recovering')
+    expect(screen.queryByRole('alert')).toBeNull()
+    expect(screen.queryByText(/auto-resuming/)).toBeNull()
   })
 
   it('terminal.replaced writes a persistent crash trace onto pane content and shows the trace strip', async () => {
