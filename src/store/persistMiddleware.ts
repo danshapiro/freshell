@@ -28,7 +28,12 @@ import {
 import { createLogger } from '@/lib/client-logger'
 import { getSelectedMachineId } from '@/lib/machine-identity'
 import { consumeArmedPreMigrationEvidenceClear } from '@/lib/recovery/layout-health'
-import { flushPersistedLayoutNow } from './persistControl'
+import {
+  clearLocalClosePersistencePending,
+  flushPersistedLayoutNow,
+  getAuthoritativeLocalLayoutPersistedAt,
+  observeAuthoritativeLocalLayoutPersistedAt,
+} from './persistControl'
 import { sanitizeSessionRef } from '@shared/session-contract'
 import { normalizeFreshAgentEffortOverride, normalizeFreshAgentPaneModelSelection } from './paneTypes'
 import {
@@ -598,6 +603,7 @@ export const persistMiddleware: Middleware<{}, PersistState> = (store) => {
     if (!tabsDirty && !panesDirty && !tabRecencyDirty && !turnCompletionDirty) return
 
     const state = store.getState()
+    const layoutKey = getWindowLayoutKey()
     // Consume-and-reset: only the write cycle in progress right now may be
     // authorized by this specific user action. A later, unrelated dirty
     // cycle must not inherit an intent flag from a previous close.
@@ -609,7 +615,7 @@ export const persistMiddleware: Middleware<{}, PersistState> = (store) => {
         const nextTabs = state.tabs?.tabs ?? []
 
         if (nextTabs.length === 0) {
-          const existingRaw = localStorage.getItem(getWindowLayoutKey())
+          const existingRaw = localStorage.getItem(layoutKey)
           const existingParsed = existingRaw ? parsePersistedLayoutRaw(existingRaw) : null
           // If existingRaw exists but fails to parse, we can't prove it's
           // safe to overwrite -- conservatively treat it as worth
@@ -710,8 +716,25 @@ export const persistMiddleware: Middleware<{}, PersistState> = (store) => {
             (persistablePanesSection as Record<string, any>).paneTitles ?? {},
             (persistablePanesSection as Record<string, any>).paneTitleSetByUser ?? {},
           )
+          const existingRaw = localStorage.getItem(layoutKey)
+          const previousPersistedAt = existingRaw
+            ? parsePersistedLayoutRaw(existingRaw)?.persistedAt
+            : undefined
+          const now = Date.now()
+          const authoritativePersistedAt = getAuthoritativeLocalLayoutPersistedAt(layoutKey)
+          const previousAuthoritativePersistedAt = Math.max(
+            typeof previousPersistedAt === 'number'
+              ? previousPersistedAt
+              : Number.NEGATIVE_INFINITY,
+            typeof authoritativePersistedAt === 'number'
+              ? authoritativePersistedAt
+              : Number.NEGATIVE_INFINITY,
+          )
+          const persistedAt = Number.isFinite(previousAuthoritativePersistedAt)
+            ? Math.max(now, previousAuthoritativePersistedAt + 1)
+            : now
           const layoutPayload = {
-            persistedAt: Date.now(),
+            persistedAt,
             version: LAYOUT_SCHEMA_VERSION,
             machineId: selectStampMachineId(state),
             tabs: {
@@ -730,11 +753,16 @@ export const persistMiddleware: Middleware<{}, PersistState> = (store) => {
           }
 
           const raw = JSON.stringify(layoutPayload)
-          localStorage.setItem(getWindowLayoutKey(), raw)
+          localStorage.setItem(layoutKey, raw)
+          observeAuthoritativeLocalLayoutPersistedAt(layoutKey, persistedAt)
+          // Release the close barrier only after the authoritative layout
+          // envelope is durable. A throwing setItem reaches the catch below
+          // and leaves the marker armed for a later successful flush.
+          clearLocalClosePersistencePending()
           localStorage.removeItem(getWindowFreshAgentBackupKey())
           localStorage.removeItem(getWindowFreshAgentCommitMarkerKey())
           localStorage.removeItem(getWindowFreshAgentPendingMarkerKey())
-          broadcastPersistedRaw(getWindowLayoutKey(), raw)
+          broadcastPersistedRaw(layoutKey, raw)
           // Durable boundary (e2r5 review finding 1): an armed post-rebuild
           // pre-migration evidence clear is consumed ONLY here — after the
           // rebuilt envelope is durably written. A reload before this line

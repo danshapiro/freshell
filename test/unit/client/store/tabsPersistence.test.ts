@@ -14,8 +14,8 @@ const localStorageMock = (() => {
 
 Object.defineProperty(globalThis, 'localStorage', { value: localStorageMock, writable: true })
 
-import tabsReducer, { updateTab, removeTab } from '@/store/tabsSlice'
-import panesReducer, { replacePane } from '@/store/panesSlice'
+import tabsReducer, { closePaneWithCleanup, closeTab, replacePaneWithCleanup, updateTab, removeTab } from '@/store/tabsSlice'
+import panesReducer, { replacePane, splitPane, updatePaneContent } from '@/store/panesSlice'
 import machineIdentityReducer, { setMachineReady } from '@/store/machineIdentitySlice'
 import tabRecencyReducer, {
   loadPersistedTabRecency,
@@ -29,7 +29,12 @@ import {
   resetPersistedLayoutCacheForTests,
 } from '@/store/persistMiddleware'
 import { onPersistBroadcast, resetPersistBroadcastForTests } from '@/store/persistBroadcast'
-import { flushPersistedLayoutNow } from '@/store/persistControl'
+import {
+  clearLocalClosePersistencePending,
+  flushPersistedLayoutNow,
+  isLocalClosePersistencePending,
+  resetAuthoritativeLocalLayoutPersistedAtForTests,
+} from '@/store/persistControl'
 import { MACHINE_ID_STORAGE_KEY, TAB_RECENCY_STORAGE_KEY } from '@/store/storage-keys'
 import { parsePersistedLayoutRaw } from '@/store/persistedState'
 import { handleUiCommand } from '@/lib/ui-commands'
@@ -114,11 +119,14 @@ describe('tabs persistence - skipPersist + strip volatile fields', () => {
   beforeEach(() => {
     localStorageMock.clear()
     vi.useFakeTimers()
+    resetAuthoritativeLocalLayoutPersistedAtForTests()
     resetPersistFlushListenersForTests()
     resetPersistBroadcastForTests()
   })
 
   afterEach(() => {
+    clearLocalClosePersistencePending()
+    resetAuthoritativeLocalLayoutPersistedAtForTests()
     vi.useRealTimers()
     vi.restoreAllMocks()
   })
@@ -606,12 +614,16 @@ describe('persist flush failure retry', () => {
   beforeEach(() => {
     localStorageMock.clear()
     vi.useFakeTimers()
+    clearLocalClosePersistencePending()
+    resetAuthoritativeLocalLayoutPersistedAtForTests()
     resetPersistFlushListenersForTests()
     resetPersistBroadcastForTests()
     resetPersistedLayoutCacheForTests()
   })
 
   afterEach(() => {
+    clearLocalClosePersistencePending()
+    resetAuthoritativeLocalLayoutPersistedAtForTests()
     vi.useRealTimers()
     vi.restoreAllMocks()
   })
@@ -694,5 +706,110 @@ describe('persist flush failure retry', () => {
     expect(
       consoleErrors.map((args) => args.map(String).join(' ')).join('\n'),
     ).not.toContain('empty_tabs_write_refused')
+  })
+
+  it('persists a successful close immediately with a strictly newer timestamp', async () => {
+    vi.setSystemTime(new Date(50_000))
+    const store = makeRecencyStore()
+    store.dispatch(updatePaneContent({
+      tabId: 'tab-1',
+      paneId: 'pane-1',
+      content: { kind: 'browser', url: 'https://close.example', devToolsOpen: false },
+    }))
+    store.dispatch(updateTab({ id: 'tab-1', updates: { title: 'Before close' } }))
+    store.dispatch(flushPersistedLayoutNow())
+    const beforeRaw = localStorage.getItem(LAYOUT_STORAGE_KEY)
+    expect(beforeRaw).not.toBeNull()
+    const beforePersistedAt = JSON.parse(beforeRaw!).persistedAt as number
+
+    const closeResult = await store.dispatch(closeTab('tab-1') as any)
+    expect(closeResult).toMatchObject({ meta: { requestStatus: 'fulfilled' } })
+
+    const closedRaw = localStorage.getItem(LAYOUT_STORAGE_KEY)
+    expect(closedRaw).not.toBeNull()
+    const closedLayout = JSON.parse(closedRaw!)
+    expect(closedLayout.tabs.tabs).toEqual([])
+    expect(closedLayout.panes.layouts).toEqual({})
+    expect(closedLayout.persistedAt).toBeGreaterThan(beforePersistedAt)
+    expect(isLocalClosePersistencePending()).toBe(false)
+  })
+
+  it('keeps the close marker pending across a failed immediate flush until a retry succeeds', async () => {
+    ;(globalThis as any).__ALLOW_CONSOLE_ERROR__ = true
+    vi.spyOn(console, 'error').mockImplementation(() => {})
+    vi.setSystemTime(new Date(50_000))
+    const store = makeRecencyStore()
+    store.dispatch(updatePaneContent({
+      tabId: 'tab-1',
+      paneId: 'pane-1',
+      content: { kind: 'browser', url: 'https://close.example', devToolsOpen: false },
+    }))
+    store.dispatch(updateTab({ id: 'tab-1', updates: { title: 'Before close' } }))
+    store.dispatch(flushPersistedLayoutNow())
+    const beforeRaw = localStorage.getItem(LAYOUT_STORAGE_KEY)
+    expect(beforeRaw).not.toBeNull()
+    const beforePersistedAt = JSON.parse(beforeRaw!).persistedAt as number
+
+    failFirstLayoutWrite()
+    const closeResult = await store.dispatch(closeTab('tab-1') as any)
+    expect(closeResult).toMatchObject({ meta: { requestStatus: 'fulfilled' } })
+
+    expect(localStorage.getItem(LAYOUT_STORAGE_KEY)).toBe(beforeRaw)
+    expect(isLocalClosePersistencePending()).toBe(true)
+
+    store.dispatch(flushPersistedLayoutNow())
+
+    const closedRaw = localStorage.getItem(LAYOUT_STORAGE_KEY)
+    expect(closedRaw).not.toBeNull()
+    const closedLayout = JSON.parse(closedRaw!)
+    expect(closedLayout.tabs.tabs).toEqual([])
+    expect(closedLayout.panes.layouts).toEqual({})
+    expect(closedLayout.persistedAt).toBeGreaterThan(beforePersistedAt)
+    expect(isLocalClosePersistencePending()).toBe(false)
+  })
+
+  it('persists a successful pane removal immediately', async () => {
+    vi.setSystemTime(new Date(50_000))
+    const store = makeRecencyStore()
+    store.dispatch(updatePaneContent({
+      tabId: 'tab-1',
+      paneId: 'pane-1',
+      content: { kind: 'browser', url: 'https://close.example', devToolsOpen: false },
+    }))
+    store.dispatch(splitPane({
+      tabId: 'tab-1',
+      paneId: 'pane-1',
+      direction: 'horizontal',
+      newPaneId: 'pane-2',
+      newContent: { kind: 'browser', url: 'https://sibling.example', devToolsOpen: false },
+    }))
+    store.dispatch(flushPersistedLayoutNow())
+
+    await store.dispatch(closePaneWithCleanup({ tabId: 'tab-1', paneId: 'pane-1' }) as any)
+
+    const persistedLayout = JSON.parse(localStorage.getItem(LAYOUT_STORAGE_KEY)!).panes.layouts['tab-1']
+    expect(persistedLayout).toMatchObject({ type: 'leaf', id: 'pane-2' })
+    expect(isLocalClosePersistencePending()).toBe(false)
+  })
+
+  it('persists a successful pane replacement immediately', async () => {
+    vi.setSystemTime(new Date(50_000))
+    const store = makeRecencyStore()
+    store.dispatch(updatePaneContent({
+      tabId: 'tab-1',
+      paneId: 'pane-1',
+      content: { kind: 'browser', url: 'https://replace.example', devToolsOpen: false },
+    }))
+    store.dispatch(flushPersistedLayoutNow())
+
+    await store.dispatch(replacePaneWithCleanup({ tabId: 'tab-1', paneId: 'pane-1' }) as any)
+
+    const persistedLayout = JSON.parse(localStorage.getItem(LAYOUT_STORAGE_KEY)!).panes.layouts['tab-1']
+    expect(persistedLayout).toMatchObject({
+      type: 'leaf',
+      id: 'pane-1',
+      content: { kind: 'picker' },
+    })
+    expect(isLocalClosePersistencePending()).toBe(false)
   })
 })

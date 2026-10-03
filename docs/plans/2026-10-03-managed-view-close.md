@@ -239,41 +239,44 @@ Task 3 reopen and the no-local-pane recovery-panel action use the same queue.
 
 **Files:**
 - Modify: src/store/crossTabSync.ts, src/store/persistControl.ts,
-  src/store/persistMiddleware.ts, and src/lib/recovery/managed-runtime-recovery.ts
+  src/store/persistMiddleware.ts, src/store/tabsSlice.ts, and
+  src/lib/recovery/managed-runtime-recovery.ts
 - Test: test/unit/client/store/crossTabSync.test.ts,
-  test/unit/client/store/tabsPersistence.test.ts, and
+  test/unit/client/store/tabsPersistence.test.ts,
+  test/unit/client/store/persistControl.test.ts, and
   test/unit/lib/managed-runtime-recovery.test.ts
 
-- [ ] Step 1: Add the same-key stale StorageEvent case after a managed split
+- [x] Step 1: Add the same-key stale StorageEvent case after a managed split
   close but before the normal debounce, plus a failed-immediate-flush case.
   Assert that the stale event does not restore the pane and that protection
   ends after a later successful flush. Add automatic-primary and explicit
   views for one soul; a pane with a different nonempty view ID must not be
   claimed through soul, terminal, create-request, or session fallback. Preserve
   fallback adoption when the pane has no view ID.
-- [ ] **Step 2: Run the tests and verify the intended failures**
+- [x] **Step 2: Run the tests and verify the intended failures**
 
   Run: pnpm run test:vitest run test/unit/client/store/crossTabSync.test.ts test/unit/client/store/tabsPersistence.test.ts test/unit/lib/managed-runtime-recovery.test.ts --config config/vitest/vitest.config.ts
 
   Expected: FAIL because the current own-key path can rehydrate a just-closed
   pane before persistence, and fallback matching can replace another view's
   nonempty identity.
-- [ ] Step 3: Mark a successful close, pane removal, or replacement as a
+- [x] Step 3: Mark a successful close, pane removal, or replacement as a
   persistence boundary and synchronously request the existing layout flush.
   If storage fails, keep the close-protection marker active until a later
   successful flush. Generate persistedAt monotonically above the current
   authoritative local envelope so an equal-millisecond stale event cannot
   pass the recency check.
-- [ ] Step 4: In the own-key full-hydration path, do not apply an incoming
+- [x] Step 4: In the own-key full-hydration path, do not apply an incoming
   layout while a local close is awaiting durable persistence. Do not advance
   the recency floor for a rejected event. A successful close write advances
   the floor before a previously queued stale event can restore the pane.
-- [ ] Step 5: Reject fallback matching when a pane has a different nonempty
+- [x] Step 5: Reject fallback matching when a pane has a different nonempty
   view ID; keep the current identity when it matches exactly. Continue
   adopting a pane with no view ID only when existing fallback identity is
   unique and unclaimed.
 - [ ] Step 6: Run the task tests and client typecheck, refactor while green,
-  then obtain an independent task review.
+  then obtain an independent task review. The focused test and typecheck runs
+  are green; independent review remains pending.
 
   Run: pnpm run test:vitest run test/unit/client/store/crossTabSync.test.ts test/unit/client/store/tabsPersistence.test.ts test/unit/client/store/persistControl.test.ts test/unit/lib/managed-runtime-recovery.test.ts --config config/vitest/vitest.config.ts
 

@@ -606,6 +606,70 @@ describe('managed runtime recovery merge', () => {
     )
   })
 
+  it('keeps a marked explicit pane from being claimed by a same-soul automatic view', () => {
+    const state = baseState()
+    const automaticView = view({
+      viewId: 'view-automatic',
+      kind: 'automatic_primary',
+      preferredTabId: 'tab-automatic',
+      preferredPaneId: 'pane-automatic',
+    })
+    const explicitView = view({
+      viewId: 'view-explicit',
+      kind: 'explicit',
+      preferredTabId: 'tab-explicit',
+      preferredPaneId: 'pane-explicit',
+    })
+    const sharedSoul = soul({
+      terminalId: 'terminal-shared',
+      terminalCreateRequestId: 'create-shared',
+      nativeSessionId: 'ses_shared',
+    })
+    const sharedHandles = {
+      kind: 'terminal' as const,
+      createRequestId: 'create-shared',
+      terminalId: 'terminal-shared',
+      status: 'running' as const,
+      mode: 'opencode' as const,
+      soulId: 'soul-one',
+      sessionRef: { provider: 'opencode' as const, sessionId: 'ses_shared' },
+    }
+    state.panes.layouts['user-tab'] = {
+      type: 'split',
+      id: 'shared-soul-split',
+      direction: 'horizontal',
+      sizes: [50, 50],
+      children: [
+        {
+          type: 'leaf',
+          id: 'pane-explicit-marker',
+          content: { ...sharedHandles, viewIntentId: 'view-explicit' },
+        },
+        {
+          type: 'leaf',
+          id: 'pane-unmarked',
+          content: { ...sharedHandles },
+        },
+      ],
+    } as any
+
+    const plan = buildManagedRuntimeMergePlan(
+      snapshot([sharedSoul], [automaticView, explicitView]),
+      state,
+    )
+
+    expect(plan.creates).toHaveLength(0)
+    expect(plan.updates).toHaveLength(2)
+    expect(plan.updates.find((update) => update.paneId === 'pane-explicit-marker')?.content).toMatchObject({
+      kind: 'terminal',
+      viewIntentId: 'view-explicit',
+    })
+    expect(plan.updates.find((update) => update.paneId === 'pane-unmarked')?.content).toMatchObject({
+      kind: 'terminal',
+      viewIntentId: 'view-automatic',
+    })
+  })
+
   it('projects blocked recovery honestly instead of substituting a fresh session', () => {
     const blocked = soul({
       launchState: 'stopped',

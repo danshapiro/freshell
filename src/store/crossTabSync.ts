@@ -11,7 +11,12 @@ import { hydrateTabs } from './tabsSlice'
 import { getPendingBrowserPreferencesWriteState } from './browserPreferencesPersistence'
 import { parsePersistedLayoutRaw, type ParsedPersistedLayout } from './persistedState'
 import { getPersistBroadcastSourceId, onPersistBroadcast, PERSIST_BROADCAST_CHANNEL_NAME } from './persistBroadcast'
-import { shouldPreserveLocalCanonicalResumeSessionId } from './persistControl'
+import {
+  getAuthoritativeLocalLayoutPersistedAt,
+  isLocalClosePersistencePending,
+  observeAuthoritativeLocalLayoutPersistedAt,
+  shouldPreserveLocalCanonicalResumeSessionId,
+} from './persistControl'
 import { getBootLoadedLayoutRaw } from './persistMiddleware'
 import { BROWSER_PREFERENCES_STORAGE_KEY, TAB_RECENCY_STORAGE_KEY } from './storage-keys'
 import { getWindowLayoutKey, isDerivedLayoutKey } from './window-layout-keys'
@@ -408,14 +413,22 @@ export function installCrossTabSync(store: StoreLike): () => void {
   // Storage events and BroadcastChannel can both deliver the same persisted payload.
   // Dedupe by exact raw value so we don't hydrate twice.
   const lastProcessedRawByKey = new Map<string, string>()
-  let currentLocalLayoutPersistedAt: number | undefined
+  let currentLocalLayoutPersistedAt = getAuthoritativeLocalLayoutPersistedAt(ownLayoutKey)
   for (const key of [ownLayoutKey, BROWSER_PREFERENCES_STORAGE_KEY, TAB_RECENCY_STORAGE_KEY]) {
     const existingRaw = localStorage.getItem(key)
     if (typeof existingRaw === 'string') {
       lastProcessedRawByKey.set(key, existingRaw)
       if (key === ownLayoutKey) {
         const parsed = parsePersistedLayoutRaw(existingRaw)
-        currentLocalLayoutPersistedAt = parsed?.persistedAt
+        if (typeof parsed?.persistedAt === 'number') {
+          if (
+            typeof currentLocalLayoutPersistedAt !== 'number'
+            || parsed.persistedAt > currentLocalLayoutPersistedAt
+          ) {
+            currentLocalLayoutPersistedAt = parsed.persistedAt
+          }
+          observeAuthoritativeLocalLayoutPersistedAt(ownLayoutKey, parsed.persistedAt)
+        }
       }
     }
   }
@@ -425,6 +438,7 @@ export function installCrossTabSync(store: StoreLike): () => void {
     if (typeof currentLocalLayoutPersistedAt !== 'number' || candidate > currentLocalLayoutPersistedAt) {
       currentLocalLayoutPersistedAt = candidate
     }
+    observeAuthoritativeLocalLayoutPersistedAt(getWindowLayoutKey(), candidate)
   }
 
   const tryDedupeAndMark = (key: string, raw: string): boolean => {
@@ -437,6 +451,15 @@ export function installCrossTabSync(store: StoreLike): () => void {
     // Ignore a foreign-machine layout entirely: no dispatch, no dedupe
     // mark, no authoritative-persistedAt merge (the event is not ours).
     if (isDerivedLayoutKey(key) && isForeignIncomingLayout(store, raw)) return
+    // A same-key layout event can arrive while the local close has already
+    // changed Redux but has not yet reached durable storage. Do not hydrate
+    // that old layout over the close, and leave both raw dedupe and the
+    // persistedAt floor untouched so a later valid event can still apply.
+    if (
+      isDerivedLayoutKey(key)
+      && key === getWindowLayoutKey()
+      && isLocalClosePersistencePending()
+    ) return
     const previousRaw = lastProcessedRawByKey.get(key)
     if (!tryDedupeAndMark(key, raw)) return
     // Unified agent names (Task 7): an OLD envelope arriving later through
@@ -526,8 +549,8 @@ export function installCrossTabSync(store: StoreLike): () => void {
       return
     }
     lastProcessedRawByKey.set(msg.key, msg.raw)
-    if (isDerivedLayoutKey(msg.key)) {
-      currentLocalLayoutPersistedAt = parsePersistedLayoutRaw(msg.raw)?.persistedAt
+    if (isDerivedLayoutKey(msg.key) && msg.key === getWindowLayoutKey()) {
+      mergeAuthoritativeLayoutPersistedAt(parsePersistedLayoutRaw(msg.raw)?.persistedAt)
     }
   })
 

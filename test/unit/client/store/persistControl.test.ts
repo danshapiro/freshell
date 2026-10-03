@@ -11,9 +11,12 @@ import {
 } from '@/store/persistMiddleware'
 import {
   buildTerminalDurableSessionRefUpdate,
+  getAuthoritativeLocalLayoutPersistedAt,
   flushPersistedLayoutNow,
   getCanonicalDurableSessionId,
   getPreferredResumeSessionId,
+  observeAuthoritativeLocalLayoutPersistedAt,
+  resetAuthoritativeLocalLayoutPersistedAtForTests,
 } from '@/store/persistControl'
 import tabsReducer, { addTab, updateTab } from '@/store/tabsSlice'
 
@@ -25,12 +28,14 @@ describe('persistControl', () => {
     localStorage.clear()
     sessionStorage.setItem('freshell.layout-window-id.v1', WINDOW_ID)
     vi.useFakeTimers()
+    resetAuthoritativeLocalLayoutPersistedAtForTests()
     resetPersistFlushListenersForTests()
     resetPersistedLayoutCacheForTests()
     resetPersistedPanesCacheForTests()
   })
 
   afterEach(() => {
+    resetAuthoritativeLocalLayoutPersistedAtForTests()
     vi.useRealTimers()
   })
 
@@ -83,6 +88,13 @@ describe('persistControl', () => {
     }))
 
     expect(setItemSpy).not.toHaveBeenCalled()
+  })
+
+  it('retains the highest authoritative layout timestamp', () => {
+    observeAuthoritativeLocalLayoutPersistedAt(OWN_LAYOUT_KEY, 150)
+    observeAuthoritativeLocalLayoutPersistedAt(OWN_LAYOUT_KEY, 100)
+
+    expect(getAuthoritativeLocalLayoutPersistedAt(OWN_LAYOUT_KEY)).toBe(150)
   })
 
   it('prefers a canonical durable cliSessionId over a named restore token', () => {

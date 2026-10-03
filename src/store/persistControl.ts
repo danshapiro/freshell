@@ -6,6 +6,43 @@ import { sanitizeSessionRef, type SessionRef } from '@shared/session-contract'
 
 export const flushPersistedLayoutNow = createAction('persist/flushNow')
 
+let localClosePersistencePending = false
+const authoritativeLocalLayoutPersistedAtByKey = new Map<string, number>()
+
+/** Mark that local close state must reach durable layout storage before hydration. */
+export function markLocalClosePersistencePending(): void {
+  localClosePersistencePending = true
+}
+
+export function isLocalClosePersistencePending(): boolean {
+  return localClosePersistencePending
+}
+
+/** Clear the close barrier after its layout write succeeds or a no-op is canceled. */
+export function clearLocalClosePersistencePending(): void {
+  localClosePersistencePending = false
+}
+
+/** Keep the accepted local-layout recency floor available to persistence. */
+export function observeAuthoritativeLocalLayoutPersistedAt(key: string, candidate?: number): void {
+  if (!key || typeof candidate !== 'number' || !Number.isFinite(candidate)) return
+  const current = authoritativeLocalLayoutPersistedAtByKey.get(key)
+  if (
+    typeof current !== 'number'
+    || candidate > current
+  ) {
+    authoritativeLocalLayoutPersistedAtByKey.set(key, candidate)
+  }
+}
+
+export function getAuthoritativeLocalLayoutPersistedAt(key: string): number | undefined {
+  return authoritativeLocalLayoutPersistedAtByKey.get(key)
+}
+
+export function resetAuthoritativeLocalLayoutPersistedAtForTests(): void {
+  authoritativeLocalLayoutPersistedAtByKey.clear()
+}
+
 function sessionRefEquals(a?: SessionRef, b?: SessionRef): boolean {
   return a?.provider === b?.provider && a?.sessionId === b?.sessionId
 }

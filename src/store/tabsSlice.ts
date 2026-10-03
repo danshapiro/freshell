@@ -35,7 +35,13 @@ import { loadPersistedLayout, markTabsLoadRecovery } from './persistMiddleware'
 import { createLogger } from '@/lib/client-logger'
 import { getManagedRuntimeSoul, updateManagedRuntimeViewVisibility } from '@/lib/api'
 import { mergeSessionMetadataByKey, sessionMetadataKey } from '@/lib/session-metadata'
-import { mergeSessionMetadataForPreferredResumeId } from './persistControl'
+import {
+  clearLocalClosePersistencePending,
+  flushPersistedLayoutNow,
+  isLocalClosePersistencePending,
+  markLocalClosePersistencePending,
+  mergeSessionMetadataForPreferredResumeId,
+} from './persistControl'
 import { migrateLegacyTerminalDurableState, sanitizeSessionRef } from '@shared/session-contract'
 import { sanitizeTabsAgainstLayouts } from '@/lib/tab-fallback-identity'
 import { TabNameSourceSchema, type TabNameSource } from '@shared/session-names'
@@ -2516,9 +2522,16 @@ export const closePaneWithCleanup = createAsyncThunk(
           identity,
         )) return
 
+        const layoutBeforeRemoval = (getState() as RootState).panes.layouts[tabId]
+        const closePersistenceAlreadyPending = isLocalClosePersistencePending()
+        const hasPaneToRemove = Boolean(layoutBeforeRemoval && findPaneContent(layoutBeforeRemoval, paneId))
+        if (hasPaneToRemove) markLocalClosePersistencePending()
         dispatch(closePane({ tabId, paneId }))
         const after = (getState() as RootState).panes.layouts[tabId]
         if (after && findPaneContent(after, paneId)) {
+          if (hasPaneToRemove && !closePersistenceAlreadyPending) {
+            clearLocalClosePersistencePending()
+          }
           log.warn('pane removal was refused after managed view detachment; the pane stays open', { tabId, paneId })
           dispatch(setPaneCloseError({ tabId, paneId, error: PANE_CLOSE_REMOVAL_REFUSED_MESSAGE }))
           reassertKeptPanesOpen(after, tabId, identity)
@@ -2535,6 +2548,7 @@ export const closePaneWithCleanup = createAsyncThunk(
           clearDraft(paneId)
           dispatch(clearPaneAttention({ paneId }))
           dispatch(clearTabAttention({ tabId }))
+          if (hasPaneToRemove) dispatch(flushPersistedLayoutNow())
         }
       })
     } finally {
@@ -2801,6 +2815,7 @@ export const closeTab = createAsyncThunk(
         // the freeze above, the current layout equals it by construction.
         const paneIds = collectPaneIds(frozenLayout)
 
+        markLocalClosePersistencePending()
         dispatch(removeTab(tabId))
         dispatch(removeLayout({ tabId }))
 
@@ -2810,6 +2825,7 @@ export const closeTab = createAsyncThunk(
           dispatch(clearPaneAttention({ paneId }))
           clearDraft(paneId)
         }
+        dispatch(flushPersistedLayoutNow())
       })
     } finally {
       // removeLayout already cleared the flag on the success path; this
@@ -2978,10 +2994,17 @@ export const replacePaneWithCleanup = createAsyncThunk(
           dispatch(clearPaneClosing({ tabId, paneId }))
           paneFreezeHeld = false
         }
+        const layoutBeforeReplacement = (getState() as RootState).panes.layouts[tabId]
+        const hadPaneToReplace = Boolean(layoutBeforeReplacement && findPaneContent(layoutBeforeReplacement, paneId))
+        const closePersistenceAlreadyPending = isLocalClosePersistencePending()
+        if (hadPaneToReplace) markLocalClosePersistencePending()
         dispatch(replacePane({ tabId, paneId }))
         const after = (getState() as RootState).panes.layouts[tabId]
         const afterContent = after ? findPaneContent(after, paneId) : null
         if (afterContent && afterContent.kind !== 'picker') {
+          if (hadPaneToReplace && !closePersistenceAlreadyPending) {
+            clearLocalClosePersistencePending()
+          }
           log.warn('pane replacement was refused after managed view detachment; the pane keeps its content', { tabId, paneId })
           dispatch(setPaneCloseError({ tabId, paneId, error: PANE_CLOSE_REMOVAL_REFUSED_MESSAGE }))
           reassertKeptPanesOpen(after, tabId, identity)
@@ -2994,6 +3017,7 @@ export const replacePaneWithCleanup = createAsyncThunk(
             dispatch,
             getState as () => RootState,
           )
+          if (hadPaneToReplace) dispatch(flushPersistedLayoutNow())
         }
       })
     } finally {

@@ -1,13 +1,18 @@
 import { describe, it, expect, afterEach, beforeEach, vi } from 'vitest'
 import { configureStore } from '@reduxjs/toolkit'
 
-import tabsReducer, { hydrateTabs } from '../../../../src/store/tabsSlice'
+import tabsReducer, { closeTab, hydrateTabs } from '../../../../src/store/tabsSlice'
 import panesReducer, { hydratePanes, hydratePaneTitles } from '../../../../src/store/panesSlice'
 import machineIdentityReducer, { setMachineReady } from '../../../../src/store/machineIdentitySlice'
 import tabRecencyReducer from '../../../../src/store/tabRecencySlice'
 import settingsReducer, { setLocalSettings, updateSettingsLocal } from '../../../../src/store/settingsSlice'
 import tabRegistryReducer, { setTabRegistrySearchRangeDays } from '../../../../src/store/tabRegistrySlice'
 import { installCrossTabSync } from '../../../../src/store/crossTabSync'
+import {
+  clearLocalClosePersistencePending,
+  isLocalClosePersistencePending,
+  resetAuthoritativeLocalLayoutPersistedAtForTests,
+} from '../../../../src/store/persistControl'
 import {
   persistMiddleware,
   PERSIST_DEBOUNCE_MS,
@@ -47,6 +52,8 @@ describe('crossTabSync', () => {
   })
 
   afterEach(() => {
+    clearLocalClosePersistencePending()
+    resetAuthoritativeLocalLayoutPersistedAtForTests()
     vi.useRealTimers()
     localStorage.clear()
     sessionStorage.removeItem(LAYOUT_WINDOW_ID_STORAGE_KEY)
@@ -145,6 +152,160 @@ describe('crossTabSync', () => {
 
     expect(store.getState().panes.layouts['tab-1']?.id).toBe('split-remote')
     expect(store.getState().panes.activePane['tab-1']).toBe('pane-a')
+  })
+
+  it('rejects a stale own-key layout during a close without advancing the recency floor', async () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(new Date(100))
+    let injected = false
+    let barrierWasPending = false
+    let staleManagedPaneWasRestored = false
+    let foreignTitleWasAccepted = false
+    const injectCloseWindowEvents = () => (next: (action: any) => any) => (action: any) => {
+      const result = next(action)
+      if (!injected && action?.type === 'tabs/removeTab') {
+        injected = true
+        barrierWasPending = isLocalClosePersistencePending()
+        window.dispatchEvent(new StorageEvent('storage', {
+          key: OWN_LAYOUT_KEY,
+          newValue: JSON.stringify({
+            version: 3,
+            persistedAt: 200,
+            tabs: { activeTabId: 't1', tabs: [{ id: 't1', createRequestId: 't1', title: 'T1', createdAt: 1 }] },
+            panes: {
+              version: 6,
+              layouts: {
+                t1: {
+                  type: 'split',
+                  id: 'stale-managed-split',
+                  direction: 'horizontal',
+                  sizes: [50, 50],
+                  children: [
+                    {
+                      type: 'leaf',
+                      id: 'pane-managed',
+                      content: {
+                        kind: 'terminal',
+                        createRequestId: 'managed-create',
+                        terminalId: 'managed-terminal',
+                        status: 'running',
+                        mode: 'opencode',
+                        soulId: 'managed-soul',
+                        viewIntentId: 'managed-view',
+                      },
+                    },
+                    {
+                      type: 'leaf',
+                      id: 'pane-keep',
+                      content: { kind: 'browser', url: 'https://keep.example', devToolsOpen: false },
+                    },
+                  ],
+                },
+              },
+              activePane: { t1: 'pane-managed' },
+              paneTitles: { t1: { 'pane-keep': 'Stale own-key title' } },
+              paneTitleSetByUser: {},
+            },
+            tombstones: [],
+          }),
+        }))
+        const afterOwnKey = store.getState().panes.layouts.t1 as any
+        staleManagedPaneWasRestored = afterOwnKey?.type === 'split'
+          && afterOwnKey.children.some((child: any) => child.id === 'pane-managed')
+
+        window.dispatchEvent(new StorageEvent('storage', {
+          key: REMOTE_LAYOUT_KEY,
+          newValue: JSON.stringify({
+            version: 3,
+            persistedAt: 150,
+            tabs: { activeTabId: 't1', tabs: [{ id: 't1', createRequestId: 't1', title: 'T1', createdAt: 1 }] },
+            panes: {
+              version: 6,
+              layouts: {
+                t1: {
+                  type: 'leaf',
+                  id: 'pane-keep',
+                  content: { kind: 'browser', url: 'https://keep.example', devToolsOpen: false },
+                },
+              },
+              activePane: { t1: 'pane-keep' },
+              paneTitles: { t1: { 'pane-keep': 'Newer than the local envelope' } },
+              paneTitleSetByUser: {},
+            },
+            tombstones: [],
+          }),
+        }))
+        foreignTitleWasAccepted = store.getState().panes.paneTitles.t1?.['pane-keep']
+          === 'Newer than the local envelope'
+      }
+      return result
+    }
+    const store = configureStore({
+      reducer: { tabs: tabsReducer, panes: panesReducer, tabRegistry: tabRegistryReducer },
+      middleware: (getDefault) => getDefault().concat(
+        persistMiddleware as any,
+        injectCloseWindowEvents as any,
+      ),
+    })
+    store.dispatch({
+      ...hydrateTabs({
+        tabs: [{ id: 't1', createRequestId: 't1', title: 'T1', createdAt: 1 }],
+        activeTabId: 't1',
+        renameRequestTabId: null,
+        tombstones: [],
+      } as any),
+      meta: { skipPersist: true },
+    })
+    store.dispatch({
+      ...hydratePanes({
+        layouts: {
+          t1: {
+            type: 'leaf',
+            id: 'pane-keep',
+            content: { kind: 'browser', url: 'https://keep.example', devToolsOpen: false },
+          },
+        } as any,
+        activePane: { t1: 'pane-keep' },
+        paneTitles: { t1: { 'pane-keep': 'Local title' } },
+        paneTitleSetByUser: {},
+      }),
+      meta: { skipPersist: true },
+    })
+    localStorage.setItem(OWN_LAYOUT_KEY, JSON.stringify({
+      version: 3,
+      persistedAt: 100,
+      tabs: { activeTabId: 't1', tabs: [{ id: 't1', createRequestId: 't1', title: 'T1', createdAt: 1 }] },
+      panes: {
+        version: 6,
+        layouts: {
+          t1: {
+            type: 'leaf',
+            id: 'pane-keep',
+            content: { kind: 'browser', url: 'https://keep.example', devToolsOpen: false },
+          },
+        },
+        activePane: { t1: 'pane-keep' },
+        paneTitles: { t1: { 'pane-keep': 'Local title' } },
+        paneTitleSetByUser: {},
+      },
+      tombstones: [],
+    }))
+    cleanups.push(installCrossTabSync(store as any))
+
+    await store.dispatch(closeTab('t1') as any)
+
+    expect(injected).toBe(true)
+    expect(barrierWasPending).toBe(true)
+    expect(staleManagedPaneWasRestored).toBe(false)
+    expect(foreignTitleWasAccepted).toBe(true)
+    expect(store.getState().tabs.tabs).toEqual([])
+    expect(store.getState().panes.layouts.t1).toBeUndefined()
+    expect(isLocalClosePersistencePending()).toBe(false)
+    const closedRaw = localStorage.getItem(OWN_LAYOUT_KEY)
+    expect(closedRaw).not.toBeNull()
+    const closedLayout = JSON.parse(closedRaw!)
+    expect(closedLayout.tabs.tabs).toEqual([])
+    expect(closedLayout.persistedAt).toBeGreaterThan(150)
   })
 
   it('preserves canonical resume identity when an OWN-key flush (duplicate tab) rehydrates a fresh-agent pane', () => {
