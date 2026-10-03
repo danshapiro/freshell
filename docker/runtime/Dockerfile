@@ -17,7 +17,8 @@ RUN npm install --global pnpm@10.34.5 \
 
 # Bundle Freshell-owned MCP code from this checkout, then export only its
 # lockfile-pinned runtime dependencies. The resulting entry has no worktree
-# links and can run inside any managed soul.
+# links and can run inside any managed soul. Keep build tools local to the
+# package, and bundle into its published files before the production deploy.
 FROM node-source AS mcp-runtime
 WORKDIR /mcp-workspace
 COPY package.json pnpm-lock.yaml pnpm-workspace.yaml ./
@@ -27,8 +28,9 @@ COPY tools/node-client-runtime/*.ts tools/node-client-runtime/
 RUN npm install --global pnpm@10.34.5 \
  && pnpm --filter freshell-mcp-runtime install --frozen-lockfile --ignore-scripts \
  && pnpm --filter freshell-mcp-runtime exec esbuild ../../tools/freshell-mcp/server.ts \
-      --bundle --platform=node --format=esm --packages=external --outfile=server.js \
- && pnpm --filter freshell-mcp-runtime --prod --frozen-lockfile --config.node-linker=hoisted deploy /opt/freshell-mcp
+      --bundle --platform=node --format=esm --packages=external --outfile=generated/server.js \
+ && pnpm --filter freshell-mcp-runtime --prod --frozen-lockfile --config.node-linker=hoisted deploy /opt/freshell-mcp \
+ && mv /opt/freshell-mcp/generated/server.js /opt/freshell-mcp/server.js
 
 FROM ubuntu@sha256:33ceb71981b602c1a7443a53469e4dba065f7503eab3078a2d7a57a2ab987517
 ARG CLAUDE_CODE_VERSION=2.1.263
