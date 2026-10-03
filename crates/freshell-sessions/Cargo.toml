@@ -50,6 +50,15 @@ tracing = "0.1"
 # parent repository while preserving the checkout as `cwd`.
 freshell-platform = { path = "../freshell-platform" }
 
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61.2", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Threading",
+] }
+
 [dev-dependencies]
 # The opencode SQLite parity test builds fixture databases with a writable connection
 # before the parser opens them read-only (same bundled engine, unified by cargo).
