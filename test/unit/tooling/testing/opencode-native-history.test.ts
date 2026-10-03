@@ -124,4 +124,12 @@ describe('resumed OpenCode readiness is an input-mode signal, not a home-screen 
     expect(hasOpenCodePromptModelText('Build GPT-5.6 Luna', ['', ''])).toBe(false)
     expect(openCodeTerminalReady('\x1b[?2004hBuild GPT-5.6 Luna', [])).toBe(false)
   })
+
+  it.each(['Big Pickle', 'GPT-5.6 Luna'])('recognizes the configured %s model with ANSI styling and active input', (model) => {
+    const banner = `\x1b[32mBuild\x1b[0m \x1b[31m${model}\x1b[0m`
+    expect(openCodeTerminalReady(`\x1b[?2004h${banner}`, [model])).toBe(true)
+    expect(openCodeTerminalReady(banner, [model])).toBe(false)
+    expect(openCodeTerminalReady(`\x1b[?2004h${banner}\x1b[?2004l`, [model])).toBe(false)
+    expect(openCodeTerminalReady(`\x1b[?2004h\x1b[31m${model}\x1b[0m`, [model])).toBe(false)
+  })
 })
