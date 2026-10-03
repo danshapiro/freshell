@@ -1,7 +1,13 @@
 type LayoutLike = {
-  tabs?: { tabs?: Array<{ id?: unknown }> }
-  panes?: { layouts?: Record<string, unknown> }
+  tabs?: { tabs?: Array<{ id?: unknown; title?: unknown; titleSetByUser?: unknown }> }
+  panes?: {
+    layouts?: Record<string, unknown>
+    paneTitles?: Record<string, Record<string, unknown>>
+    paneTitleSetByUser?: Record<string, Record<string, unknown>>
+  }
 }
+
+export type IgnoredPaneTitle = { tabId: string; paneId: string }
 
 function leafIdentity(content: any): unknown[] {
   if (!content || typeof content !== 'object') return [null]
@@ -79,4 +85,41 @@ export function layoutTopologySignature(
 
 export function persistedLayoutTopologySignature(persisted: LayoutLike): string {
   return layoutTopologySignature(persisted.tabs?.tabs, persisted.panes?.layouts)
+}
+
+/** Signature for a pending close write, including display metadata it would overwrite. */
+export function layoutClosePersistenceSignature(
+  tabs: Array<{ id?: unknown; title?: unknown; titleSetByUser?: unknown }> | undefined,
+  layouts: Record<string, unknown> | undefined,
+  paneTitles: Record<string, Record<string, unknown>> | undefined,
+  paneTitleSetByUser: Record<string, Record<string, unknown>> | undefined,
+  ignoredPaneTitle?: IgnoredPaneTitle,
+): string {
+  const sortedNestedEntries = (metadata: Record<string, Record<string, unknown>> | undefined) => (
+    Object.keys(metadata ?? {}).sort().flatMap((tabId) => {
+      const entries = Object.keys(metadata?.[tabId] ?? {}).sort()
+        .filter((paneId) => !(ignoredPaneTitle?.tabId === tabId && ignoredPaneTitle.paneId === paneId))
+        .map((paneId) => [paneId, metadata?.[tabId]?.[paneId]])
+      return entries.length > 0 ? [[tabId, entries]] : []
+    })
+  )
+  return JSON.stringify({
+    topology: layoutTopologySignature(tabs, layouts),
+    tabTitles: (tabs ?? []).map((tab) => [tab.id, tab.title, Boolean(tab.titleSetByUser)]),
+    paneTitles: sortedNestedEntries(paneTitles),
+    paneTitleSetByUser: sortedNestedEntries(paneTitleSetByUser),
+  })
+}
+
+export function persistedLayoutClosePersistenceSignature(
+  persisted: LayoutLike,
+  ignoredPaneTitle?: IgnoredPaneTitle,
+): string {
+  return layoutClosePersistenceSignature(
+    persisted.tabs?.tabs,
+    persisted.panes?.layouts,
+    persisted.panes?.paneTitles,
+    persisted.panes?.paneTitleSetByUser,
+    ignoredPaneTitle,
+  )
 }

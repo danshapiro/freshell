@@ -6,7 +6,7 @@ import type { Tab } from './types'
 import { nanoid } from 'nanoid'
 import { broadcastPersistedRaw } from './persistBroadcast'
 import { isWellFormedPaneTree } from './paneTreeValidation.js'
-import { persistedLayoutTopologySignature } from './layout-topology.js'
+import { persistedLayoutClosePersistenceSignature } from './layout-topology.js'
 import {
   PANES_SCHEMA_VERSION,
   LAYOUT_SCHEMA_VERSION,
@@ -33,7 +33,7 @@ import {
   clearLocalClosePersistencePending,
   flushPersistedLayoutNow,
   getAuthoritativeLocalLayoutPersistedAt,
-  getLocalClosePersistenceTopology,
+  getLocalClosePersistenceLayout,
   getLocalLayoutBaselinePersistedAt,
   getLocalLayoutWriteTimestamp,
   initializeLocalLayoutBaselinePersistedAt,
@@ -651,29 +651,32 @@ export const persistMiddleware: Middleware<{}, PersistState> = (store) => {
             || existingPersistedAt > localBaselinePersistedAt
           )
         const persistedLayout = existingRaw ? parsePersistedLayoutRaw(existingRaw) : null
-        const closeTopology = getLocalClosePersistenceTopology(persistControlOwner)
-        const closeTopologyStillMatches = explicitCloseIntent
-          && closeTopology?.layoutKey === layoutKey
+        const closeLayout = getLocalClosePersistenceLayout(persistControlOwner)
+        const closeLayoutStillMatches = explicitCloseIntent
+          && closeLayout?.layoutKey === layoutKey
           && persistedLayout !== null
-          && closeTopology.topologySignature === persistedLayoutTopologySignature(persistedLayout)
+          && closeLayout.layoutSignature === persistedLayoutClosePersistenceSignature(
+            persistedLayout,
+            closeLayout.ignoredPaneTitle,
+          )
         if (
           sharedIsNewer
-          && !closeTopologyStillMatches
+          && !closeLayoutStillMatches
         ) {
           // Another same-key document has already committed a layout that this
           // Redux tree has not applied. Do not turn its newer envelope into a
           // stamp for our stale payload. Keep dirty state armed; the matching
           // StorageEvent will reconcile Redux and trigger a safe retry.
-          log.warn('Skipped stale layout persistence because shared topology is newer than this store', {
+          log.warn('Skipped stale layout persistence because shared layout is newer than this store', {
             reason: 'persist_stale_layout_refused',
             layoutKey,
             localBaselinePersistedAt,
             existingPersistedAt,
             explicitCloseIntent,
           })
-          if (localClosePending && closeTopology?.layoutKey === layoutKey) {
+          if (localClosePending && closeLayout?.layoutKey === layoutKey) {
             // The close already changed Redux, but a conflicting same-key
-            // topology landed after its last preflight and before this flush.
+            // layout landed after its last preflight and before this flush.
             // Cancel the unsaved close so crossTabSync can replay that raw
             // after the pane/tab freeze clears. This leaves dirty state armed
             // for the replayed topology and never publishes the stale tree.

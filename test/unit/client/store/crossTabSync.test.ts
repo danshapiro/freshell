@@ -1,8 +1,8 @@
 import { describe, it, expect, afterEach, beforeEach, vi } from 'vitest'
 import { configureStore } from '@reduxjs/toolkit'
 
-import tabsReducer, { closePaneWithCleanup, closeTab, hydrateTabs } from '../../../../src/store/tabsSlice'
-import panesReducer, { clearPaneClosing, closePane, hydratePanes, hydratePaneTitles, markPaneClosing, updatePaneTitle } from '../../../../src/store/panesSlice'
+import tabsReducer, { closePaneWithCleanup, closeTab, hydrateTabs, removeTab, replacePaneWithCleanup } from '../../../../src/store/tabsSlice'
+import panesReducer, { clearPaneClosing, closePane, hydratePanes, hydratePaneTitles, markPaneClosing, replacePane, updatePaneTitle } from '../../../../src/store/panesSlice'
 import machineIdentityReducer, { setMachineReady } from '../../../../src/store/machineIdentitySlice'
 import tabRecencyReducer from '../../../../src/store/tabRecencySlice'
 import settingsReducer, { setLocalSettings, updateSettingsLocal } from '../../../../src/store/settingsSlice'
@@ -51,6 +51,52 @@ const REMOTE_LAYOUT_KEY = 'freshell.layout.v3.layout-window-remote'
 
 describe('crossTabSync', () => {
   const cleanups: Array<() => void> = []
+
+  const createTitleMetadataStore = (extraMiddleware: any[] = []) => {
+    const splitLayout = {
+      type: 'split', id: 'split-shared', direction: 'horizontal', sizes: [50, 50],
+      children: [
+        { type: 'leaf', id: 'pane-a', content: { kind: 'browser', browserInstanceId: 'browser-a', url: 'https://a.example', devToolsOpen: false } },
+        { type: 'leaf', id: 'pane-b', content: { kind: 'browser', browserInstanceId: 'browser-b', url: 'https://b.example', devToolsOpen: false } },
+      ],
+    }
+    const persisted = (persistedAt: number, paneTitles: Record<string, Record<string, string>> = {}, paneTitleSetByUser: Record<string, Record<string, boolean>> = {}) => JSON.stringify({
+      version: 3,
+      persistedAt,
+      tabs: { activeTabId: 't1', tabs: [{ id: 't1', title: 'Shared', createdAt: 1, updatedAt: 1 }] },
+      panes: { version: 6, layouts: { t1: splitLayout }, activePane: { t1: 'pane-a' }, paneTitles, paneTitleSetByUser },
+      tombstones: [],
+    })
+    localStorage.setItem(OWN_LAYOUT_KEY, persisted(100))
+
+    const actions: string[] = []
+    const recordActions = () => (next: (action: any) => any) => (action: any) => {
+      actions.push(action?.type)
+      return next(action)
+    }
+    const store = configureStore({
+      reducer: { tabs: tabsReducer, panes: panesReducer },
+      middleware: (getDefault) => getDefault().concat(persistMiddleware as any, recordActions as any, ...extraMiddleware),
+    })
+    store.dispatch({
+      ...hydrateTabs({
+        tabs: [{ id: 't1', title: 'Shared', createdAt: 1, updatedAt: 1 }],
+        activeTabId: 't1', renameRequestTabId: null, tombstones: [],
+      }),
+      meta: { skipPersist: true },
+    })
+    store.dispatch({
+      ...hydratePanes({
+        layouts: { t1: splitLayout } as any,
+        activePane: { t1: 'pane-a' },
+        paneTitles: {},
+        paneTitleSetByUser: {},
+      }),
+      meta: { skipPersist: true },
+    })
+    cleanups.push(installCrossTabSync(store as any))
+    return { store, actions, persisted }
+  }
 
   beforeEach(() => {
     sessionStorage.setItem(LAYOUT_WINDOW_ID_STORAGE_KEY, OWN_WINDOW_ID)
@@ -499,6 +545,129 @@ describe('crossTabSync', () => {
 
     const durable = JSON.parse(localStorage.getItem(OWN_LAYOUT_KEY)!)
     expect(durable.panes.paneTitles?.t1?.['pane-b']).toBe('Q renamed by B')
+  })
+
+  it('keeps a closeTab retryable when shared storage has a newer sibling pane title', async () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(new Date(100))
+    resetPersistedLayoutCacheForTests()
+    const { store, actions, persisted } = createTitleMetadataStore()
+    const secondTab = { id: 't2', title: 'Close this tab', createdAt: 2 }
+    const secondLayout = {
+      type: 'leaf', id: 'pane-c',
+      content: { kind: 'browser', browserInstanceId: 'browser-c', url: 'https://c.example', devToolsOpen: false },
+    }
+    const newerRaw = JSON.parse(persisted(101, { t1: { 'pane-b': 'Q renamed by B' } }, { t1: { 'pane-b': true } }))
+    newerRaw.tabs.tabs.push(secondTab)
+    newerRaw.panes.layouts.t2 = secondLayout
+    newerRaw.panes.activePane.t2 = 'pane-c'
+    localStorage.setItem(OWN_LAYOUT_KEY, JSON.stringify(newerRaw))
+    store.dispatch({
+      ...hydrateTabs({
+        tabs: [{ id: 't1', title: 'Shared', createdAt: 1, updatedAt: 1 }, secondTab],
+        activeTabId: 't1', renameRequestTabId: null, tombstones: [],
+      }),
+      meta: { skipPersist: true },
+    })
+    store.dispatch({
+      ...hydratePanes({
+        layouts: {
+          t1: {
+            type: 'split', id: 'split-shared', direction: 'horizontal', sizes: [50, 50],
+            children: [
+              { type: 'leaf', id: 'pane-a', content: { kind: 'browser', browserInstanceId: 'browser-a', url: 'https://a.example', devToolsOpen: false } },
+              { type: 'leaf', id: 'pane-b', content: { kind: 'browser', browserInstanceId: 'browser-b', url: 'https://b.example', devToolsOpen: false } },
+            ],
+          },
+          t2: secondLayout,
+        } as any,
+        activePane: { t1: 'pane-a', t2: 'pane-c' },
+        paneTitles: {},
+        paneTitleSetByUser: {},
+      }),
+      meta: { skipPersist: true },
+    })
+    actions.length = 0
+
+    await store.dispatch(closeTab('t2') as any)
+
+    expect(store.getState().tabs.tabs.map((tab) => tab.id)).toEqual(['t1', 't2'])
+    expect(actions).not.toContain(removeTab.type)
+    const durable = JSON.parse(localStorage.getItem(OWN_LAYOUT_KEY)!)
+    expect(durable.panes.paneTitles?.t1?.['pane-b']).toBe('Q renamed by B')
+  })
+
+  it('keeps a replacePane retryable when shared storage has a newer sibling pane title', async () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(new Date(100))
+    resetPersistedLayoutCacheForTests()
+    const { store, actions, persisted } = createTitleMetadataStore()
+    localStorage.setItem(OWN_LAYOUT_KEY, persisted(101, { t1: { 'pane-b': 'Q renamed by B' } }, { t1: { 'pane-b': true } }))
+    actions.length = 0
+
+    await store.dispatch(replacePaneWithCleanup({ tabId: 't1', paneId: 'pane-a' }) as any)
+
+    expect(store.getState().panes.layouts.t1).toMatchObject({
+      type: 'split',
+      children: [
+        { type: 'leaf', id: 'pane-a', content: { kind: 'browser', browserInstanceId: 'browser-a' } },
+        { type: 'leaf', id: 'pane-b', content: { kind: 'browser', browserInstanceId: 'browser-b' } },
+      ],
+    })
+    expect(actions).not.toContain(replacePane.type)
+    const durable = JSON.parse(localStorage.getItem(OWN_LAYOUT_KEY)!)
+    expect(durable.panes.paneTitles?.t1?.['pane-b']).toBe('Q renamed by B')
+  })
+
+  it('cancels a pane close when a newer sibling title arrives after preflight but before flush', async () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(new Date(100))
+    resetPersistedLayoutCacheForTests()
+    let injected = false
+    const injectAfterClose = () => (next: (action: any) => any) => (action: any) => {
+      const result = next(action)
+      if (!injected && action?.type === closePane.type) {
+        injected = true
+        const raw = JSON.stringify({
+          version: 3,
+          persistedAt: 101,
+          tabs: { activeTabId: 't1', tabs: [{ id: 't1', title: 'Shared', createdAt: 1, updatedAt: 1 }] },
+          panes: {
+            version: 6,
+            layouts: {
+              t1: {
+                type: 'split', id: 'split-shared', direction: 'horizontal', sizes: [50, 50],
+                children: [
+                  { type: 'leaf', id: 'pane-a', content: { kind: 'browser', browserInstanceId: 'browser-a', url: 'https://a.example', devToolsOpen: false } },
+                  { type: 'leaf', id: 'pane-b', content: { kind: 'browser', browserInstanceId: 'browser-b', url: 'https://b.example', devToolsOpen: false } },
+                ],
+              },
+            },
+            activePane: { t1: 'pane-a' },
+            paneTitles: { t1: { 'pane-b': 'Q renamed after preflight' } },
+            paneTitleSetByUser: { t1: { 'pane-b': true } },
+          },
+          tombstones: [],
+        })
+        localStorage.setItem(OWN_LAYOUT_KEY, raw)
+        window.dispatchEvent(new StorageEvent('storage', { key: OWN_LAYOUT_KEY, newValue: raw }))
+      }
+      return result
+    }
+    const { store, persisted } = createTitleMetadataStore([injectAfterClose as any])
+
+    await store.dispatch(closePaneWithCleanup({ tabId: 't1', paneId: 'pane-a' }) as any)
+
+    expect(injected).toBe(true)
+    expect(store.getState().panes.layouts.t1).toMatchObject({
+      type: 'split',
+      children: [
+        { type: 'leaf', id: 'pane-a', content: { kind: 'browser', browserInstanceId: 'browser-a' } },
+        { type: 'leaf', id: 'pane-b', content: { kind: 'browser', browserInstanceId: 'browser-b' } },
+      ],
+    })
+    const durable = JSON.parse(localStorage.getItem(OWN_LAYOUT_KEY) || persisted(100))
+    expect(durable.panes.paneTitles?.t1?.['pane-b']).toBe('Q renamed after preflight')
   })
 
   it('refuses a stale explicit sibling close instead of restoring the pane closed by the other store', async () => {

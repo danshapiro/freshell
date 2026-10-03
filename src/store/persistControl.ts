@@ -12,8 +12,12 @@ const defaultPersistControlOwner = {}
 const ownerKey = (owner?: PersistControlOwner) => owner ?? defaultPersistControlOwner
 
 let localClosePersistencePendingByOwner = new WeakSet<PersistControlOwner>()
-export type LocalClosePersistenceTopology = { layoutKey: string; topologySignature: string }
-let localClosePersistenceTopologyByOwner = new WeakMap<PersistControlOwner, LocalClosePersistenceTopology>()
+export type LocalClosePersistenceLayout = {
+  layoutKey: string
+  layoutSignature: string
+  ignoredPaneTitle?: { tabId: string; paneId: string }
+}
+let localClosePersistenceLayoutByOwner = new WeakMap<PersistControlOwner, LocalClosePersistenceLayout>()
 let authoritativeLocalLayoutPersistedAtByOwner = new WeakMap<PersistControlOwner, Map<string, number>>()
 let localLayoutBaselinePersistedAtByOwner = new WeakMap<PersistControlOwner, Map<string, number | null>>()
 // A rejected same-key event must not advance the acceptance/freshness floor,
@@ -26,16 +30,21 @@ let localLayoutWriteTimestampByOwner = new WeakMap<PersistControlOwner, Map<stri
 export function markLocalClosePersistencePending(
   owner?: PersistControlOwner,
   layoutKey?: string,
-  topologySignature?: string,
+  layoutSignature?: string,
+  ignoredPaneTitle?: { tabId: string; paneId: string },
 ): void {
   const resolvedOwner = ownerKey(owner)
   if (
     !localClosePersistencePendingByOwner.has(resolvedOwner)
     && typeof layoutKey === 'string'
     && layoutKey.length > 0
-    && typeof topologySignature === 'string'
+    && typeof layoutSignature === 'string'
   ) {
-    localClosePersistenceTopologyByOwner.set(resolvedOwner, { layoutKey, topologySignature })
+    localClosePersistenceLayoutByOwner.set(resolvedOwner, {
+      layoutKey,
+      layoutSignature,
+      ...(ignoredPaneTitle ? { ignoredPaneTitle } : {}),
+    })
   }
   localClosePersistencePendingByOwner.add(resolvedOwner)
 }
@@ -48,14 +57,14 @@ export function isLocalClosePersistencePending(owner?: PersistControlOwner): boo
 export function clearLocalClosePersistencePending(owner?: PersistControlOwner): void {
   const resolvedOwner = ownerKey(owner)
   localClosePersistencePendingByOwner.delete(resolvedOwner)
-  localClosePersistenceTopologyByOwner.delete(resolvedOwner)
+  localClosePersistenceLayoutByOwner.delete(resolvedOwner)
 }
 
-/** Snapshot of the topology from which a pending close was committed. */
-export function getLocalClosePersistenceTopology(
+/** Snapshot of the layout and display metadata from which a close was committed. */
+export function getLocalClosePersistenceLayout(
   owner?: PersistControlOwner,
-): LocalClosePersistenceTopology | undefined {
-  return localClosePersistenceTopologyByOwner.get(ownerKey(owner))
+): LocalClosePersistenceLayout | undefined {
+  return localClosePersistenceLayoutByOwner.get(ownerKey(owner))
 }
 
 /** Keep the accepted local-layout recency floor available to persistence. */
@@ -136,7 +145,7 @@ export function resetAuthoritativeLocalLayoutPersistedAtForTests(): void {
   localLayoutBaselinePersistedAtByOwner = new WeakMap()
   localLayoutWriteTimestampByOwner = new WeakMap()
   localClosePersistencePendingByOwner = new WeakSet()
-  localClosePersistenceTopologyByOwner = new WeakMap()
+  localClosePersistenceLayoutByOwner = new WeakMap()
 }
 
 function sessionRefEquals(a?: SessionRef, b?: SessionRef): boolean {

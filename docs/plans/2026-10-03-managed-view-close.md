@@ -327,6 +327,21 @@ detach failures still retain the existing retry behavior. The affected focused
 suites passed (313 tests), client typecheck and `git diff --check` passed; the
 independent review of this follow-up is pending.
 
+**Task 2 review 4 repair (2026-10-03):** Close and replacement preflight now
+refuse newer same-key envelopes that change surviving title metadata, with
+checks after each asynchronous boundary. The final flush barrier compares the
+full title metadata as well as topology, while excluding only the pane title
+that the pane-close or replacement removes. A late tab-close replay restores
+managed visibility only if the tab itself survived tombstone hydration.
+Replacement now checks the captured pane identity again after releasing its
+close freeze, before dispatching the picker replacement. Regressions cover
+closeTab with a renamed pane in another surviving tab, replacePane with a
+renamed sibling, a sibling title arriving after close preflight, a tombstoned
+tab with an orphan pane layout, and a different managed identity replayed at
+the replacement thaw boundary. Seven focused suites passed (352 tests),
+`pnpm run typecheck:client` passed, and `git diff --check` passed. Independent
+review of this repair is pending.
+
 ## Task 3: Reopen only from current identity and clear close evidence
 
 **Files:**

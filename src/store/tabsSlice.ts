@@ -45,7 +45,7 @@ import {
 } from './persistControl'
 import { parsePersistedLayoutRaw } from './persistedState.js'
 import { getWindowLayoutKey } from './window-layout-keys'
-import { layoutTopologySignature, sameLayoutTopology } from './layout-topology.js'
+import { layoutClosePersistenceSignature, sameLayoutTopology } from './layout-topology.js'
 import { migrateLegacyTerminalDurableState, sanitizeSessionRef } from '@shared/session-contract'
 import { sanitizeTabsAgainstLayouts } from '@/lib/tab-fallback-identity'
 import { TabNameSourceSchema, type TabNameSource } from '@shared/session-names'
@@ -120,6 +120,21 @@ function hasNewerConflictingSharedLayout(
     // flush guard below still refuses any stale full-layout write it can prove.
     return false
   }
+}
+
+function refuseStaleSharedLayoutClose(
+  dispatch: (action: unknown) => void,
+  getState: () => RootState,
+  tabId: string,
+  paneIds: string[],
+  closingPane?: { tabId: string; paneId: string },
+): boolean {
+  if (!hasNewerConflictingSharedLayout(getState, closingPane)) return false
+  log.warn('refusing a close based on a stale shared layout', { tabId, paneIds })
+  for (const paneId of paneIds) {
+    dispatch(setPaneCloseError({ tabId, paneId, error: STALE_SHARED_LAYOUT_CLOSE_MESSAGE }))
+  }
+  return true
 }
 
 function matchesDesiredResumeContentKind(
@@ -2464,11 +2479,21 @@ async function reconcileManagedCloseAfterReplay(
     closeIdentities: PaneCloseIdentity[]
     resolution: ManagedViewCloseResolution
     localCloseMutationApplied: boolean
+    managedViewDetachmentConfirmed: boolean
     dispatch: (action: unknown) => void
     getState: () => RootState
   },
 ): Promise<void> {
-  const { tabId, paneTargets, closeIdentities, resolution, localCloseMutationApplied, dispatch, getState } = options
+  const {
+    tabId,
+    paneTargets,
+    closeIdentities,
+    resolution,
+    localCloseMutationApplied,
+    managedViewDetachmentConfirmed,
+    dispatch,
+    getState,
+  } = options
   const getStillRepresentedViewIds = (state: RootState): string[] => {
     const layout = state.panes.layouts[tabId]
     const stillRepresentedPaneIds = new Set(paneTargets.flatMap(({ paneId, identity }) => {
@@ -2491,8 +2516,12 @@ async function reconcileManagedCloseAfterReplay(
   }
 
   const currentState = getState()
+  // Pane hydration is independent from tab hydration. A tombstoned tab can
+  // therefore leave an orphan layout behind; close compensation applies only
+  // when the original tab itself survived that reconciliation.
+  if (!currentState.tabs.tabs.some((tab) => tab.id === tabId)) return
+  if (!localCloseMutationApplied && !managedViewDetachmentConfirmed) return
   const currentLayout = currentState.panes.layouts[tabId]
-  if (!localCloseMutationApplied) return
   const restoredPaneIds = new Set(paneTargets.flatMap(({ paneId, identity }) => {
     const content = currentLayout ? findPaneContent(currentLayout, paneId) : null
     return samePaneCloseTargetIdentity(identity, content) ? [paneId] : []
@@ -2596,6 +2625,7 @@ export const closePaneWithCleanup = createAsyncThunk(
     const paneTargets = targetIdentity ? [{ paneId, identity: targetIdentity }] : []
     let managedViews: ManagedViewCloseResolution | undefined
     let localCloseMutationApplied = false
+    let managedViewDetachmentConfirmed = false
     const freezePane = targetIdentity !== undefined
     if (freezePane) {
       // Freeze the pane identity while its close acknowledgement and managed
@@ -2637,7 +2667,6 @@ export const closePaneWithCleanup = createAsyncThunk(
           targetIdentity,
           identity,
         )) return
-
         try {
           const resolution = resolveManagedViewIntentsToRemove(
             getState() as RootState,
@@ -2674,6 +2703,7 @@ export const closePaneWithCleanup = createAsyncThunk(
               getState as () => RootState,
               { initialSnapshot: managedViews.snapshot },
             )
+            managedViewDetachmentConfirmed = true
           } catch (error) {
             log.warn('managed view detachment was not confirmed; the pane stays open', {
               tabId,
@@ -2711,7 +2741,14 @@ export const closePaneWithCleanup = createAsyncThunk(
           markLocalClosePersistencePending(
             getState,
             getWindowLayoutKey(),
-            layoutTopologySignature(stateBeforeRemoval.tabs.tabs, stateBeforeRemoval.panes.layouts),
+            layoutClosePersistenceSignature(
+              stateBeforeRemoval.tabs.tabs,
+              stateBeforeRemoval.panes.layouts,
+              stateBeforeRemoval.panes.paneTitles,
+              stateBeforeRemoval.panes.paneTitleSetByUser,
+              { tabId, paneId },
+            ),
+            { tabId, paneId },
           )
         }
         dispatch(closePane({ tabId, paneId }))
@@ -2749,6 +2786,7 @@ export const closePaneWithCleanup = createAsyncThunk(
           closeIdentities: identity,
           resolution: managedViews,
           localCloseMutationApplied,
+          managedViewDetachmentConfirmed,
           dispatch,
           getState: getState as () => RootState,
         })
@@ -2812,8 +2850,16 @@ export const closeTab = createAsyncThunk(
     const frozenPaneTitles = stateAtClose.panes.paneTitles[tabId]
     const frozenPaneTitleSetByUser = stateAtClose.panes.paneTitleSetByUser?.[tabId]
     const identities = collectPaneCloseIdentities(frozenLayout)
+    const frozenPaneIds = collectPaneIds(frozenLayout)
+    if (refuseStaleSharedLayoutClose(
+      dispatch,
+      getState as () => RootState,
+      tabId,
+      frozenPaneIds,
+    )) return
     let managedViews: ManagedViewCloseResolution | undefined
     let localCloseMutationApplied = false
+    let managedViewDetachmentConfirmed = false
     dispatch(markTabClosing({ tabId }))
     try {
       await withManagedVisibilityTransition(async () => {
@@ -2848,6 +2894,15 @@ export const closeTab = createAsyncThunk(
           frozenPaneCloseTargets,
           identities,
         )) return
+        if (refuseStaleSharedLayoutClose(
+          dispatch,
+          getState as () => RootState,
+          tabId,
+          frozenPaneIds,
+        )) {
+          reassertKeptPanesOpen((getState() as RootState).panes.layouts[tabId], tabId, identities)
+          return
+        }
 
         try {
           const resolution = resolveManagedViewIntentsToRemove(
@@ -2880,6 +2935,15 @@ export const closeTab = createAsyncThunk(
           frozenPaneCloseTargets,
           identities,
         )) return
+        if (refuseStaleSharedLayoutClose(
+          dispatch,
+          getState as () => RootState,
+          tabId,
+          frozenPaneIds,
+        )) {
+          reassertKeptPanesOpen((getState() as RootState).panes.layouts[tabId], tabId, identities)
+          return
+        }
         if (managedViews.viewIntentIds.length > 0) {
           try {
             await persistManagedViewVisibility(
@@ -2889,6 +2953,7 @@ export const closeTab = createAsyncThunk(
               getState as () => RootState,
               { initialSnapshot: managedViews.snapshot },
             )
+            managedViewDetachmentConfirmed = true
           } catch (error) {
             log.warn('managed view detachment was not confirmed; the tab stays open', {
               tabId,
@@ -2914,6 +2979,15 @@ export const closeTab = createAsyncThunk(
           frozenPaneCloseTargets,
           identities,
         )) return
+        if (refuseStaleSharedLayoutClose(
+          dispatch,
+          getState as () => RootState,
+          tabId,
+          frozenPaneIds,
+        )) {
+          reassertKeptPanesOpen((getState() as RootState).panes.layouts[tabId], tabId, identities)
+          return
+        }
 
         const tabRegistryState = (stateAtClose as { tabRegistry?: RootState['tabRegistry'] }).tabRegistry
         const serverInstanceId = stateAtClose.connection?.serverInstanceId || UNKNOWN_SERVER_INSTANCE_ID
@@ -3018,7 +3092,12 @@ export const closeTab = createAsyncThunk(
         markLocalClosePersistencePending(
           getState,
           getWindowLayoutKey(),
-          layoutTopologySignature(stateAtClose.tabs.tabs, stateAtClose.panes.layouts),
+          layoutClosePersistenceSignature(
+            stateAtClose.tabs.tabs,
+            stateAtClose.panes.layouts,
+            stateAtClose.panes.paneTitles,
+            stateAtClose.panes.paneTitleSetByUser,
+          ),
         )
         dispatch(removeTab(tabId))
         dispatch(removeLayout({ tabId }))
@@ -3044,6 +3123,7 @@ export const closeTab = createAsyncThunk(
           closeIdentities: identities,
           resolution: managedViews,
           localCloseMutationApplied,
+          managedViewDetachmentConfirmed,
           dispatch,
           getState: getState as () => RootState,
         })
@@ -3111,8 +3191,16 @@ export const replacePaneWithCleanup = createAsyncThunk(
     const targetContent = before ? findPaneContent(before, paneId) : null
     const targetIdentity = targetContent ? paneCloseTargetIdentity(targetContent) : undefined
     const paneTargets = targetIdentity ? [{ paneId, identity: targetIdentity }] : []
+    if (refuseStaleSharedLayoutClose(
+      dispatch,
+      getState as () => RootState,
+      tabId,
+      [paneId],
+      { tabId, paneId },
+    )) return
     let managedViews: ManagedViewCloseResolution | undefined
     let localCloseMutationApplied = false
+    let managedViewDetachmentConfirmed = false
     const freezePane = targetIdentity !== undefined
     if (freezePane) {
       dispatch(markPaneClosing({ tabId, paneId }))
@@ -3149,6 +3237,16 @@ export const replacePaneWithCleanup = createAsyncThunk(
           targetIdentity,
           identity,
         )) return
+        if (refuseStaleSharedLayoutClose(
+          dispatch,
+          getState as () => RootState,
+          tabId,
+          [paneId],
+          { tabId, paneId },
+        )) {
+          reassertKeptPanesOpen((getState() as RootState).panes.layouts[tabId], tabId, identity)
+          return
+        }
 
         try {
           const resolution = resolveManagedViewIntentsToRemove(
@@ -3177,6 +3275,16 @@ export const replacePaneWithCleanup = createAsyncThunk(
           targetIdentity,
           identity,
         )) return
+        if (refuseStaleSharedLayoutClose(
+          dispatch,
+          getState as () => RootState,
+          tabId,
+          [paneId],
+          { tabId, paneId },
+        )) {
+          reassertKeptPanesOpen((getState() as RootState).panes.layouts[tabId], tabId, identity)
+          return
+        }
         if (managedViews.viewIntentIds.length > 0) {
           try {
             await persistManagedViewVisibility(
@@ -3186,6 +3294,7 @@ export const replacePaneWithCleanup = createAsyncThunk(
               getState as () => RootState,
               { initialSnapshot: managedViews.snapshot },
             )
+            managedViewDetachmentConfirmed = true
           } catch (error) {
             log.warn('managed view detachment was not confirmed; the pane keeps its content', {
               tabId,
@@ -3207,10 +3316,41 @@ export const replacePaneWithCleanup = createAsyncThunk(
           targetIdentity,
           identity,
         )) return
+        if (refuseStaleSharedLayoutClose(
+          dispatch,
+          getState as () => RootState,
+          tabId,
+          [paneId],
+          { tabId, paneId },
+        )) {
+          reassertKeptPanesOpen((getState() as RootState).panes.layouts[tabId], tabId, identity)
+          return
+        }
 
         if (paneFreezeHeld) {
           dispatch(clearPaneClosing({ tabId, paneId }))
           paneFreezeHeld = false
+        }
+        // Releasing the close freeze can synchronously replay a queued
+        // same-key layout. Never replace the pane until the original identity
+        // and its surviving titles have been revalidated after that replay.
+        if (targetIdentity && paneCloseTargetChanged(
+          dispatch,
+          getState as () => RootState,
+          tabId,
+          paneId,
+          targetIdentity,
+          identity,
+        )) return
+        if (refuseStaleSharedLayoutClose(
+          dispatch,
+          getState as () => RootState,
+          tabId,
+          [paneId],
+          { tabId, paneId },
+        )) {
+          reassertKeptPanesOpen((getState() as RootState).panes.layouts[tabId], tabId, identity)
+          return
         }
         const layoutBeforeReplacement = (getState() as RootState).panes.layouts[tabId]
         const hadPaneToReplace = Boolean(layoutBeforeReplacement && findPaneContent(layoutBeforeReplacement, paneId))
@@ -3220,7 +3360,14 @@ export const replacePaneWithCleanup = createAsyncThunk(
           markLocalClosePersistencePending(
             getState,
             getWindowLayoutKey(),
-            layoutTopologySignature(stateBeforeReplacement.tabs.tabs, stateBeforeReplacement.panes.layouts),
+            layoutClosePersistenceSignature(
+              stateBeforeReplacement.tabs.tabs,
+              stateBeforeReplacement.panes.layouts,
+              stateBeforeReplacement.panes.paneTitles,
+              stateBeforeReplacement.panes.paneTitleSetByUser,
+              { tabId, paneId },
+            ),
+            { tabId, paneId },
           )
         }
         dispatch(replacePane({ tabId, paneId }))
@@ -3255,6 +3402,7 @@ export const replacePaneWithCleanup = createAsyncThunk(
           closeIdentities: identity,
           resolution: managedViews,
           localCloseMutationApplied,
+          managedViewDetachmentConfirmed,
           dispatch,
           getState: getState as () => RootState,
         })

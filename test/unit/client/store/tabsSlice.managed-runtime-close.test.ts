@@ -1,7 +1,7 @@
 import { configureStore } from '@reduxjs/toolkit'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import tabsReducer, { addTab, closePaneWithCleanup, closeTab, detachManagedRuntimeView, reopenClosedTab, replacePaneWithCleanup, updateTab } from '../../../../src/store/tabsSlice'
-import panesReducer, { closePane, initLayout, replacePane, splitPane, updatePaneContent } from '../../../../src/store/panesSlice'
+import panesReducer, { clearPaneClosing, clearTabClosing, closePane, initLayout, replacePane, splitPane, updatePaneContent } from '../../../../src/store/panesSlice'
 import managedRuntimeReducer, { managedRuntimeSnapshotReceived, setManagedRuntimeAvailable } from '../../../../src/store/managedRuntimeSlice'
 import tabRegistryReducer from '../../../../src/store/tabRegistrySlice'
 import {
@@ -1889,7 +1889,7 @@ describe('closeTab managed runtime visibility', () => {
         injected = true
         const otherWindowRaw = JSON.stringify({
           version: 3,
-          persistedAt: 101,
+          persistedAt: 102,
           tabs: { activeTabId: 'managed-tab', tabs: [{ id: 'managed-tab', title: 'Managed agents', createdAt: 1 }] },
           panes: {
             version: 6,
@@ -1981,7 +1981,13 @@ describe('closeTab managed runtime visibility', () => {
         const otherWindowRaw = JSON.stringify({
           version: 3,
           persistedAt: 101,
-          tabs: { activeTabId: 'managed-tab', tabs: [{ id: 'managed-tab', title: 'Managed agents', createdAt: 1 }] },
+          tabs: {
+            activeTabId: 'unrelated-tab',
+            tabs: [
+              { id: 'managed-tab', title: 'Managed agents', createdAt: 1 },
+              { id: 'unrelated-tab', title: 'Unrelated tab', createdAt: 2 },
+            ],
+          },
           panes: {
             version: 6,
             layouts: { 'managed-tab': { type: 'leaf', id: 'managed-pane-0', content: managedPaneContent } },
@@ -2025,6 +2031,171 @@ describe('closeTab managed runtime visibility', () => {
       expect(wsMock.sent.some((message: any) => (
         message.type === 'pane.opened' && message.createRequestId === managedPaneContent.createRequestId
       ))).toBe(true)
+    } finally {
+      cleanupSync()
+      clearLocalClosePersistencePending()
+      resetAuthoritativeLocalLayoutPersistedAtForTests()
+      resetPersistedLayoutCacheForTests()
+      resetPersistFlushListenersForTests()
+      resetPersistBroadcastForTests()
+      localStorage.clear()
+      sessionStorage.removeItem(LAYOUT_WINDOW_ID_STORAGE_KEY)
+      vi.useRealTimers()
+    }
+  })
+
+  it('does not reopen an orphaned managed view when tombstones cancel tab-close replay', async () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(new Date(100))
+    resetPersistedLayoutCacheForTests()
+
+    const layoutWindowId = 'managed-tab-tombstone-cancel'
+    const layoutKey = `freshell.layout.v3.${layoutWindowId}`
+    sessionStorage.setItem(LAYOUT_WINDOW_ID_STORAGE_KEY, layoutWindowId)
+    const managedView = view('view-a', 0)
+    let serverSnapshot = inventory(8, [managedView])
+    const managedPaneContent = managedContent(managedView)
+    const originalLayout = { type: 'leaf', id: 'managed-pane-0', content: managedPaneContent }
+    const conflictingLayout = {
+      type: 'split', id: 'other-window-split', direction: 'horizontal', sizes: [50, 50],
+      children: [
+        originalLayout,
+        { type: 'leaf', id: 'other-pane', content: { kind: 'browser', browserInstanceId: 'other-browser', url: 'https://other.example', devToolsOpen: false } },
+      ],
+    }
+    localStorage.setItem(layoutKey, JSON.stringify({
+      version: 3,
+      persistedAt: 100,
+      tabs: { activeTabId: 'managed-tab', tabs: [{ id: 'managed-tab', title: 'Managed agents', createdAt: 1 }] },
+      panes: { version: 6, layouts: { 'managed-tab': originalLayout }, activePane: { 'managed-tab': 'managed-pane-0' }, paneTitles: {}, paneTitleSetByUser: {} },
+      tombstones: [],
+    }))
+
+    let injected = false
+    const injectOtherWindowLayout = () => (next: (action: any) => any) => (action: any) => {
+      const result = next(action)
+      if (!injected && action?.type === clearTabClosing.type) {
+        injected = true
+        const otherWindowRaw = JSON.stringify({
+          version: 3,
+          persistedAt: 150,
+          tabs: {
+            activeTabId: 'unrelated-tab',
+            tabs: [
+              { id: 'managed-tab', title: 'Managed agents', createdAt: 1 },
+              { id: 'unrelated-tab', title: 'Unrelated tab', createdAt: 2 },
+            ],
+          },
+          panes: { version: 6, layouts: { 'managed-tab': conflictingLayout }, activePane: { 'managed-tab': 'managed-pane-0' }, paneTitles: {}, paneTitleSetByUser: {} },
+          tombstones: [],
+        })
+        localStorage.setItem(layoutKey, otherWindowRaw)
+        window.dispatchEvent(new StorageEvent('storage', { key: layoutKey, newValue: otherWindowRaw }))
+      }
+      return result
+    }
+    const store = createStore(['view-a'], serverSnapshot, [persistMiddleware as any, injectOtherWindowLayout as any])
+    store.dispatch(addTab({ id: 'unrelated-tab', title: 'Unrelated tab', activate: false }))
+    store.dispatch(flushPersistedLayoutNow())
+    apiMocks.getManagedRuntimeInventory.mockImplementation(async () => serverSnapshot)
+    apiMocks.updateManagedRuntimeViewVisibility.mockImplementation(async (viewId: string, visibility: ManagedRuntimeViewIntent['visibility']) => {
+      serverSnapshot = withVisibility(serverSnapshot, viewId, visibility)
+      return serverSnapshot.viewIntents.find((entry) => entry.viewId === viewId)
+    })
+
+    const cleanupSync = installCrossTabSync(store as any)
+    try {
+      await store.dispatch(closeTab('managed-tab'))
+
+      expect(injected).toBe(true)
+      expect(store.getState().tabs.tabs.map((tab) => tab.id)).toEqual(['unrelated-tab'])
+      expect(store.getState().tabs.tombstones).toContainEqual(expect.objectContaining({ id: 'managed-tab' }))
+      expect(store.getState().panes.layouts['managed-tab']).toMatchObject({
+        type: 'split',
+        children: [
+          { type: 'leaf', id: 'managed-pane-0', content: { viewIntentId: 'view-a' } },
+          { type: 'leaf', id: 'other-pane' },
+        ],
+      })
+      expect(serverSnapshot.viewIntents[0]?.visibility).toBe('detached')
+      expect(wsMock.sent.some((message: any) => (
+        message.type === 'pane.opened' && message.createRequestId === managedPaneContent.createRequestId
+      ))).toBe(false)
+      expect(apiMocks.updateManagedRuntimeViewVisibility).toHaveBeenCalledTimes(1)
+      expect(apiMocks.updateManagedRuntimeViewVisibility).toHaveBeenCalledWith('view-a', 'detached', 2, 5)
+    } finally {
+      cleanupSync()
+      clearLocalClosePersistencePending()
+      resetAuthoritativeLocalLayoutPersistedAtForTests()
+      resetPersistedLayoutCacheForTests()
+      resetPersistFlushListenersForTests()
+      resetPersistBroadcastForTests()
+      localStorage.clear()
+      sessionStorage.removeItem(LAYOUT_WINDOW_ID_STORAGE_KEY)
+      vi.useRealTimers()
+    }
+  })
+
+  it('does not replace a different pane identity replayed when replacement thaws', async () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(new Date(100))
+    resetPersistedLayoutCacheForTests()
+
+    const layoutWindowId = 'managed-replace-thaw-identity'
+    const layoutKey = `freshell.layout.v3.${layoutWindowId}`
+    sessionStorage.setItem(LAYOUT_WINDOW_ID_STORAGE_KEY, layoutWindowId)
+    const viewA = view('view-a', 0)
+    const viewB = view('view-b', 0)
+    let serverSnapshot = inventory(8, [viewA, viewB])
+    const contentA = managedContent(viewA)
+    const contentB = managedContent(viewB)
+    const initialLayout = { type: 'leaf', id: 'managed-pane-0', content: contentA }
+    localStorage.setItem(layoutKey, JSON.stringify({
+      version: 3,
+      persistedAt: 100,
+      tabs: { activeTabId: 'managed-tab', tabs: [{ id: 'managed-tab', title: 'Managed agents', createdAt: 1, viewIntentId: 'view-a' }] },
+      panes: { version: 6, layouts: { 'managed-tab': initialLayout }, activePane: { 'managed-tab': 'managed-pane-0' }, paneTitles: {}, paneTitleSetByUser: {} },
+      tombstones: [],
+    }))
+
+    let injected = false
+    const replaceActions: unknown[] = []
+    const injectDifferentViewWhileThawing = () => (next: (action: any) => any) => (action: any) => {
+      if (action?.type === replacePane.type) replaceActions.push(action)
+      if (!injected && action?.type === clearPaneClosing.type) {
+        injected = true
+        const otherWindowRaw = JSON.stringify({
+          version: 3,
+          persistedAt: 101,
+          tabs: { activeTabId: 'managed-tab', tabs: [{ id: 'managed-tab', title: 'Managed agents', createdAt: 1, viewIntentId: 'view-b' }] },
+          panes: { version: 6, layouts: { 'managed-tab': { type: 'leaf', id: 'managed-pane-0', content: contentB } }, activePane: { 'managed-tab': 'managed-pane-0' }, paneTitles: {}, paneTitleSetByUser: {} },
+          tombstones: [],
+        })
+        localStorage.setItem(layoutKey, otherWindowRaw)
+        window.dispatchEvent(new StorageEvent('storage', { key: layoutKey, newValue: otherWindowRaw }))
+      }
+      return next(action)
+    }
+    const store = createStore(['view-a'], serverSnapshot, [persistMiddleware as any, injectDifferentViewWhileThawing as any])
+    apiMocks.getManagedRuntimeInventory.mockImplementation(async () => serverSnapshot)
+    apiMocks.updateManagedRuntimeViewVisibility.mockImplementation(async (viewId: string, visibility: ManagedRuntimeViewIntent['visibility']) => {
+      serverSnapshot = withVisibility(serverSnapshot, viewId, visibility)
+      return serverSnapshot.viewIntents.find((entry) => entry.viewId === viewId)
+    })
+
+    const cleanupSync = installCrossTabSync(store as any)
+    try {
+      await store.dispatch(replacePaneWithCleanup({ tabId: 'managed-tab', paneId: 'managed-pane-0' }))
+
+      expect(injected).toBe(true)
+      expect(replaceActions).toHaveLength(0)
+      expect(store.getState().panes.layouts['managed-tab']).toMatchObject({
+        type: 'leaf', id: 'managed-pane-0', content: { viewIntentId: 'view-b' },
+      })
+      expect(serverSnapshot.viewIntents.find((entry) => entry.viewId === 'view-b')?.visibility).toBe('visible')
+      expect(wsMock.sent.some((message: any) => (
+        message.type === 'pane.closed' && message.createRequestId === contentB.createRequestId
+      ))).toBe(false)
     } finally {
       cleanupSync()
       clearLocalClosePersistencePending()
