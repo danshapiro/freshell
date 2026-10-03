@@ -1812,7 +1812,7 @@ function locallyRepresentedManagedReopenViews(
   state: RootState,
   viewIntentIds: string[],
   snapshot: ManagedRuntimeInventorySnapshot,
-): { representedViewIntentIds: Set<string>; ambiguous: boolean } {
+): { representedViewIntentIds: Set<string>; representationCountByViewIntentId: Map<string, number>; ambiguous: boolean } {
   const targetViews = viewIntentIds.map((viewIntentId) => {
     const matches = snapshot.viewIntents.filter((view) => view.viewId === viewIntentId)
     if (matches.length !== 1) throw new Error(MANAGED_VIEW_CLOSE_FAILED_MESSAGE)
@@ -1850,10 +1850,18 @@ function locallyRepresentedManagedReopenViews(
   }
 
   const representedViewIntentIds = new Set<string>()
+  const representationCountByViewIntentId = new Map<string, number>()
+  const recordRepresentation = (viewIntentId: string) => {
+    representedViewIntentIds.add(viewIntentId)
+    representationCountByViewIntentId.set(
+      viewIntentId,
+      (representationCountByViewIntentId.get(viewIntentId) ?? 0) + 1,
+    )
+  }
   for (const candidate of candidates) {
     if (candidate.viewIntentId) {
       if (viewIntentIds.includes(candidate.viewIntentId)) {
-        representedViewIntentIds.add(candidate.viewIntentId)
+        recordRepresentation(candidate.viewIntentId)
       }
       // A different nonempty view ID is authoritative; terminal handles do
       // not let one managed view claim another view's local pane.
@@ -1866,11 +1874,20 @@ function locallyRepresentedManagedReopenViews(
         || (candidate.createRequestId && candidate.createRequestId === soul.terminalCreateRequestId)
       )
     ))
-    if (matches.length > 1) return { representedViewIntentIds, ambiguous: true }
-    if (matches.length === 1) representedViewIntentIds.add(matches[0]!.view.viewId)
+    if (matches.length > 1) {
+      return { representedViewIntentIds, representationCountByViewIntentId, ambiguous: true }
+    }
+    if (matches.length === 1) recordRepresentation(matches[0]!.view.viewId)
   }
 
-  return { representedViewIntentIds, ambiguous: false }
+  return { representedViewIntentIds, representationCountByViewIntentId, ambiguous: false }
+}
+
+function isSingleManagedPaneReopen(layout: PaneNode, viewIntentIds: string[]): boolean {
+  return layout.type === 'leaf'
+    && layout.content.kind === 'terminal'
+    && viewIntentIds.length === 1
+    && layout.content.viewIntentId === viewIntentIds[0]
 }
 
 /**
@@ -2599,7 +2616,14 @@ export const reopenClosedTab = createAsyncThunk(
         )
         if (localRepresentations.ambiguous) throw new Error(MANAGED_VIEW_CLOSE_FAILED_MESSAGE)
         if (localRepresentations.representedViewIntentIds.size > 0) {
-          if (localRepresentations.representedViewIntentIds.size !== managedViewIntentIds.length) {
+          const viewIntentId = managedViewIntentIds[0]
+          const alreadyRepresentedExactlyOnce = viewIntentId !== undefined
+            && localRepresentations.representationCountByViewIntentId.get(viewIntentId) === 1
+          if (
+            localRepresentations.representedViewIntentIds.size !== managedViewIntentIds.length
+            || !isSingleManagedPaneReopen(restoredLayout, managedViewIntentIds)
+            || !alreadyRepresentedExactlyOnce
+          ) {
             throw new Error(MANAGED_VIEW_CLOSE_FAILED_MESSAGE)
           }
           applyManagedRuntimeInventory(runtimeSnapshot, dispatch, getState as () => RootState)

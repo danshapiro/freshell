@@ -702,6 +702,67 @@ describe('closeTab managed runtime visibility', () => {
     expect(representedViews).toHaveLength(1)
   })
 
+  it('keeps a mixed saved layout retryable when refresh projects its managed view before retry', async () => {
+    let serverSnapshot = inventory(8, [view('view-a', 0)])
+    const store = createStore(['view-a'], serverSnapshot)
+    store.dispatch(splitPane({
+      tabId: 'managed-tab',
+      paneId: 'managed-pane-0',
+      direction: 'vertical',
+      newPaneId: 'saved-editor-pane',
+      newContent: {
+        kind: 'editor',
+        filePath: '/workspace/notes.md',
+        language: 'markdown',
+        readOnly: false,
+        content: 'keep this editor pane',
+        viewMode: 'source',
+      },
+    }))
+    let failNextConfirmation = false
+    apiMocks.getManagedRuntimeInventory.mockImplementation(async () => {
+      if (failNextConfirmation) {
+        failNextConfirmation = false
+        throw new Error('confirmation GET failed')
+      }
+      return serverSnapshot
+    })
+    apiMocks.updateManagedRuntimeViewVisibility.mockImplementation(async (viewId: string, visibility: ManagedRuntimeViewIntent['visibility']) => {
+      serverSnapshot = withVisibility(serverSnapshot, viewId, visibility)
+      if (visibility === 'visible') {
+        failNextConfirmation = true
+        throw new Error('PATCH response lost after commit')
+      }
+      return serverSnapshot.viewIntents.find((entry) => entry.viewId === viewId)
+    })
+
+    await store.dispatch(closeTab('managed-tab'))
+    const savedEntry = store.getState().tabRegistry.reopenStack[0]!
+    expect(collectPaneContents(savedEntry.layout).some((content) => (
+      content.kind === 'editor' && content.filePath === '/workspace/notes.md'
+    ))).toBe(true)
+
+    const firstReopen = await store.dispatch(reopenClosedTab())
+    expect(reopenClosedTab.rejected.match(firstReopen)).toBe(true)
+    expect(serverSnapshot.viewIntents[0]?.visibility).toBe('visible')
+
+    await queueManagedRuntimeRefresh(store as any, 'after-ambiguous-mixed-promotion')
+    expect(store.getState().tabs.tabs).toHaveLength(1)
+
+    const retry = await store.dispatch(reopenClosedTab())
+
+    expect(reopenClosedTab.rejected.match(retry)).toBe(true)
+    expect(store.getState().tabs.tabs).toHaveLength(1)
+    expect(store.getState().tabRegistry.reopenStack).toEqual([savedEntry])
+    const localContents = Object.values(store.getState().panes.layouts)
+      .flatMap((layout) => layout ? collectPaneContents(layout) : [])
+    expect(localContents.filter((content) => content.kind === 'terminal' && content.viewIntentId === 'view-a')).toHaveLength(1)
+    expect(localContents.some((content) => content.kind === 'editor' && content.filePath === '/workspace/notes.md')).toBe(false)
+    expect(collectPaneContents(store.getState().tabRegistry.reopenStack[0]!.layout)).toEqual(
+      collectPaneContents(savedEntry.layout),
+    )
+  })
+
   it('retains a multi-view reopen entry when only some saved views are already represented', async () => {
     let serverSnapshot = inventory(8, [view('view-a', 0), view('view-b', 1)])
     const store = createStore(['view-a', 'view-b'], serverSnapshot)

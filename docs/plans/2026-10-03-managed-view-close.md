@@ -67,6 +67,14 @@ The shared visibility coordinator remains in use. Task 2 persistence and
 cross-tab changes, and the separate fallback-matcher change, remain out of
 this repair.
 
+After a committed promotion with a failed confirmation read, if a retry finds
+any saved managed view already represented locally, it may consume that entry
+only when the saved layout is exactly one managed pane and there is exactly
+one local representation of its view. For a mixed, split, repeated, partial,
+or multiply represented layout, that retry fails and keeps the entry; a set of
+distinct view IDs alone does not prove that the saved pane topology has been
+restored.
+
 ## Load-bearing decisions
 
 The immutable base is commit
