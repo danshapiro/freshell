@@ -449,11 +449,11 @@ async fn restored_web_reads_exact_persisted_lost_native_history_without_starting
     let directory = home.join(".local/share/opencode");
     std::fs::create_dir_all(&directory).unwrap();
     let connection = rusqlite::Connection::open(directory.join("opencode.db")).unwrap();
-    connection.execute_batch("CREATE TABLE session (id TEXT PRIMARY KEY,title TEXT,time_updated INTEGER,revert TEXT);
+    connection.execute_batch("CREATE TABLE session (id TEXT PRIMARY KEY,title TEXT,time_updated INTEGER);
       CREATE TABLE message (id TEXT PRIMARY KEY,session_id TEXT,time_created INTEGER,data TEXT);
       CREATE TABLE part (id TEXT PRIMARY KEY,session_id TEXT,message_id TEXT,time_created INTEGER,data TEXT);
-      INSERT INTO session VALUES ('retained-thread','Durable name',2,NULL);
-      INSERT INTO session VALUES ('foreign-thread','Foreign',2,NULL);").unwrap();
+      INSERT INTO session VALUES ('retained-thread','Durable name',2);
+      INSERT INTO session VALUES ('foreign-thread','Foreign',2);").unwrap();
     let saved_text = "Actual saved managed answer\n".repeat(50_000);
     assert!(saved_text.len() > freshell_runtime_protocol::MAX_CONTROL_FRAME_BYTES);
     for (id, text) in [
