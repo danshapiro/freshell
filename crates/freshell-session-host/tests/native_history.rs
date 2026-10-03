@@ -51,6 +51,19 @@ fn rollout(home: &Path, id: &str, text: &str) {
     .unwrap();
 }
 
+fn write_codex_rows(home: &Path, id: &str, rows: &[Value]) {
+    let root = home.join(".codex/sessions/2026/10/03");
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(
+        root.join(format!("rollout-2026-10-03-{id}.jsonl")),
+        rows.iter()
+            .map(Value::to_string)
+            .collect::<Vec<_>>()
+            .join("\n"),
+    )
+    .unwrap();
+}
+
 #[test]
 fn history_binary_reads_exact_saved_codex_rollout_without_a_runtime() {
     let home = tempfile::tempdir().unwrap();
@@ -102,6 +115,104 @@ fn history_binary_reads_supported_codex_task_event_transcript() {
     assert_eq!(body["turns"][1]["role"], "assistant");
     assert_eq!(body["turns"][1]["items"][0]["text"], "Sanitized completion");
     assert_eq!(body["capabilities"]["send"], false);
+}
+
+#[test]
+fn history_binary_reads_interrupted_codex_agent_message_events() {
+    let home = tempfile::tempdir().unwrap();
+    let mut rows = vec![json!({"type":"session_meta","payload":{"id":"interrupted-events"}})];
+    for turn in 0..2 {
+        rows.extend([
+            json!({"type":"turn_context","payload":{"turn_id":format!("interrupted-turn-{turn}")}}),
+            json!({"type":"event_msg","payload":{"type":"user_message","message":"Repeated interrupted prompt"}}),
+            json!({"type":"event_msg","payload":{"type":"task_started","turn_id":format!("interrupted-turn-{turn}")}}),
+            // AgentMessageEvent has a message and optional phase; it need not have a turn id.
+            json!({"type":"event_msg","payload":{"type":"agent_message","message":"Saved answer before interruption","phase":"commentary"}}),
+            json!({"type":"event_msg","payload":{"type":"turn_aborted","turn_id":format!("interrupted-turn-{turn}"),"reason":"interrupted"}}),
+        ]);
+    }
+    write_codex_rows(home.path(), "interrupted-events", &rows);
+    let result = history(home.path(), "codex", "interrupted-events");
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let body: Value = serde_json::from_slice(&result.stdout).unwrap();
+    let turns = body["turns"].as_array().unwrap();
+    assert_eq!(turns.len(), 4);
+    for (index, turn) in turns.iter().enumerate() {
+        assert_eq!(
+            turn["role"],
+            if index % 2 == 0 { "user" } else { "assistant" }
+        );
+        assert_eq!(turn["items"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            turn["items"][0]["text"],
+            if index % 2 == 0 {
+                "Repeated interrupted prompt"
+            } else {
+                "Saved answer before interruption"
+            }
+        );
+    }
+    assert_eq!(body["capabilities"]["send"], false);
+}
+
+#[test]
+fn history_binary_deduplicates_codex_response_agent_and_completion_mirrors() {
+    for order in [
+        &[0, 1, 2][..],
+        &[0, 2, 1][..],
+        &[1, 0, 2][..],
+        &[1, 2, 0][..],
+        &[2, 0, 1][..],
+        &[2, 1, 0][..],
+        &[1, 2][..],
+        &[2, 1][..],
+    ] {
+        let home = tempfile::tempdir().unwrap();
+        let mut rows =
+            vec![json!({"type":"session_meta","payload":{"id":"three-message-formats"}})];
+        for turn in 0..2 {
+            rows.extend([
+                json!({"type":"turn_context","payload":{"turn_id":format!("triple-turn-{turn}")}}),
+                json!({"type":"event_msg","payload":{"type":"user_message","message":"Repeated saved prompt"}}),
+            ]);
+            let messages = [
+                json!({"type":"response_item","payload":{"type":"message","role":"assistant","id":format!("assistant-{turn}"),
+                    "content":[{"type":"output_text","text":"Repeated saved answer"}]}}),
+                json!({"type":"event_msg","payload":{"type":"agent_message","message":"Repeated saved answer","phase":"final"}}),
+                json!({"type":"event_msg","payload":{"type":"task_complete","turn_id":format!("triple-turn-{turn}"),"last_agent_message":"Repeated saved answer"}}),
+            ];
+            for &index in order {
+                rows.push(messages[index].clone());
+            }
+        }
+        write_codex_rows(home.path(), "three-message-formats", &rows);
+        let result = history(home.path(), "codex", "three-message-formats");
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        let body: Value = serde_json::from_slice(&result.stdout).unwrap();
+        let turns = body["turns"].as_array().unwrap();
+        assert_eq!(turns.len(), 4, "order {order:?}");
+        for turn in 0..2 {
+            let assistant = &turns[turn * 2 + 1];
+            assert_eq!(assistant["role"], "assistant");
+            assert_eq!(
+                assistant["items"].as_array().unwrap().len(),
+                1,
+                "order {order:?}"
+            );
+            assert_eq!(assistant["items"][0]["text"], "Repeated saved answer");
+            if order.contains(&0) {
+                assert_eq!(assistant["items"][0]["id"], format!("assistant-{turn}"));
+            }
+        }
+    }
 }
 
 #[test]
