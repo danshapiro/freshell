@@ -38,10 +38,14 @@ import { mergeSessionMetadataByKey, sessionMetadataKey } from '@/lib/session-met
 import {
   clearLocalClosePersistencePending,
   flushPersistedLayoutNow,
+  getLocalLayoutBaselinePersistedAt,
   isLocalClosePersistencePending,
   markLocalClosePersistencePending,
   mergeSessionMetadataForPreferredResumeId,
 } from './persistControl'
+import { parsePersistedLayoutRaw } from './persistedState.js'
+import { getWindowLayoutKey } from './window-layout-keys'
+import { layoutTopologySignature, sameLayoutTopology } from './layout-topology.js'
 import { migrateLegacyTerminalDurableState, sanitizeSessionRef } from '@shared/session-contract'
 import { sanitizeTabsAgainstLayouts } from '@/lib/tab-fallback-identity'
 import { TabNameSourceSchema, type TabNameSource } from '@shared/session-names'
@@ -53,8 +57,44 @@ import { withManagedVisibilityTransition } from './managedVisibilityCoordinator.
 const log = createLogger('TabsSlice')
 const MANAGED_VIEW_CLOSE_FAILED_MESSAGE =
   'the managed view could not be detached from recovery; the tab was left open'
+const STALE_SHARED_LAYOUT_CLOSE_MESSAGE =
+  'the layout changed in another window; retry the close after it updates'
 
 export type Tombstone = { id: string; deletedAt: number }
+
+/**
+ * A close may proceed over a newer same-key write only when that write left
+ * the pane identities and split topology intact. This permits title-only
+ * freshness while refusing to serialize a stale tree over a sibling close.
+ */
+function hasNewerConflictingSharedLayout(getState: () => RootState): boolean {
+  try {
+    if (typeof localStorage === 'undefined') return false
+    const key = getWindowLayoutKey()
+    const raw = localStorage.getItem(key)
+    if (raw === null) return false
+    const persisted = parsePersistedLayoutRaw(raw)
+    if (!persisted) return false
+    const baseline = getLocalLayoutBaselinePersistedAt(key, getState)
+    if (
+      typeof persisted.persistedAt !== 'number'
+      || (typeof baseline === 'number' && persisted.persistedAt <= baseline)
+    ) return false
+
+    const state = getState()
+    const locallyClosedTabIds = new Set((state.tabs.tombstones ?? []).map((entry) => entry.id))
+    return !sameLayoutTopology(
+      state.tabs.tabs,
+      state.panes.layouts,
+      persisted,
+      locallyClosedTabIds,
+    )
+  } catch {
+    // A storage read/parse failure is not itself a pane-close failure. The
+    // flush guard below still refuses any stale full-layout write it can prove.
+    return false
+  }
+}
 
 function matchesDesiredResumeContentKind(
   content: PaneContent,
@@ -2410,6 +2450,11 @@ export const closePaneWithCleanup = createAsyncThunk(
       await dispatch(closeTab(tabId))
       return
     }
+    if (hasNewerConflictingSharedLayout(getState as () => RootState)) {
+      log.warn('refusing a pane close based on a stale shared layout', { tabId, paneId })
+      dispatch(setPaneCloseError({ tabId, paneId, error: STALE_SHARED_LAYOUT_CLOSE_MESSAGE }))
+      return
+    }
     // Delta-round-8 (Finding F2), strengthened delta-round-9 (the review's
     // single Major) — the close-op serialization rule, the same shared guard
     // the reducers consult: ONE close op per TAB at a time, any scope. ANY
@@ -2452,6 +2497,13 @@ export const closePaneWithCleanup = createAsyncThunk(
             reassertKeptPanesOpen((getState() as RootState).panes.layouts[tabId], tabId, identity)
             return
           }
+        }
+
+        if (hasNewerConflictingSharedLayout(getState as () => RootState)) {
+          log.warn('refusing to continue a pane close after a conflicting shared layout arrived', { tabId, paneId })
+          dispatch(setPaneCloseError({ tabId, paneId, error: STALE_SHARED_LAYOUT_CLOSE_MESSAGE }))
+          reassertKeptPanesOpen((getState() as RootState).panes.layouts[tabId], tabId, identity)
+          return
         }
 
         if (targetIdentity && paneCloseTargetChanged(
@@ -2522,10 +2574,24 @@ export const closePaneWithCleanup = createAsyncThunk(
           identity,
         )) return
 
+        if (hasNewerConflictingSharedLayout(getState as () => RootState)) {
+          log.warn('refusing to remove a pane after a conflicting shared layout arrived', { tabId, paneId })
+          dispatch(setPaneCloseError({ tabId, paneId, error: STALE_SHARED_LAYOUT_CLOSE_MESSAGE }))
+          reassertKeptPanesOpen((getState() as RootState).panes.layouts[tabId], tabId, identity)
+          return
+        }
+
         const layoutBeforeRemoval = (getState() as RootState).panes.layouts[tabId]
         const closePersistenceAlreadyPending = isLocalClosePersistencePending(getState)
         const hasPaneToRemove = Boolean(layoutBeforeRemoval && findPaneContent(layoutBeforeRemoval, paneId))
-        if (hasPaneToRemove) markLocalClosePersistencePending(getState)
+        if (hasPaneToRemove) {
+          const stateBeforeRemoval = getState() as RootState
+          markLocalClosePersistencePending(
+            getState,
+            getWindowLayoutKey(),
+            layoutTopologySignature(stateBeforeRemoval.tabs.tabs, stateBeforeRemoval.panes.layouts),
+          )
+        }
         dispatch(closePane({ tabId, paneId }))
         const after = (getState() as RootState).panes.layouts[tabId]
         if (after && findPaneContent(after, paneId)) {
@@ -2815,7 +2881,11 @@ export const closeTab = createAsyncThunk(
         // the freeze above, the current layout equals it by construction.
         const paneIds = collectPaneIds(frozenLayout)
 
-        markLocalClosePersistencePending(getState)
+        markLocalClosePersistencePending(
+          getState,
+          getWindowLayoutKey(),
+          layoutTopologySignature(stateAtClose.tabs.tabs, stateAtClose.panes.layouts),
+        )
         dispatch(removeTab(tabId))
         dispatch(removeLayout({ tabId }))
 
@@ -2997,7 +3067,14 @@ export const replacePaneWithCleanup = createAsyncThunk(
         const layoutBeforeReplacement = (getState() as RootState).panes.layouts[tabId]
         const hadPaneToReplace = Boolean(layoutBeforeReplacement && findPaneContent(layoutBeforeReplacement, paneId))
         const closePersistenceAlreadyPending = isLocalClosePersistencePending(getState)
-        if (hadPaneToReplace) markLocalClosePersistencePending(getState)
+        if (hadPaneToReplace) {
+          const stateBeforeReplacement = getState() as RootState
+          markLocalClosePersistencePending(
+            getState,
+            getWindowLayoutKey(),
+            layoutTopologySignature(stateBeforeReplacement.tabs.tabs, stateBeforeReplacement.panes.layouts),
+          )
+        }
         dispatch(replacePane({ tabId, paneId }))
         const after = (getState() as RootState).panes.layouts[tabId]
         const afterContent = after ? findPaneContent(after, paneId) : null

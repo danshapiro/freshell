@@ -104,6 +104,8 @@ describe('the persistence flush gate keeps uncaptured legacy labels alive', () =
     const migration = await import('@/lib/session-name-migration')
     expect(migration.listCapturedMigrationEnvelopes(localStorageMock)).toHaveLength(0)
     expect(storageMap.get(LAYOUT_KEY)).toBe(legacyRaw)
+    migration.resetLegacyNameCaptureFailureForTests()
+    migration.captureLegacyLayoutEnvelope(LAYOUT_KEY, legacyRaw, localStorageMock)
 
     // Pre-pin the fresh-agent commit marker for the seeded raw so the
     // import-time storage migration classifies it already-migrated.
@@ -122,6 +124,7 @@ describe('the persistence flush gate keeps uncaptured legacy labels alive', () =
     const { persistMiddleware, resetPersistFlushListenersForTests } =
       await import('@/store/persistMiddleware')
     const { default: tabsReducer, addTab } = await import('@/store/tabsSlice')
+    const { default: panesReducer } = await import('@/store/panesSlice')
     const { configureStore } = await import('@reduxjs/toolkit')
 
     // The storage migration (self-executing at import) must have left the
@@ -131,7 +134,7 @@ describe('the persistence flush gate keeps uncaptured legacy labels alive', () =
     vi.useFakeTimers()
     resetPersistFlushListenersForTests()
     const store = configureStore({
-      reducer: { tabs: tabsReducer },
+      reducer: { tabs: tabsReducer, panes: panesReducer },
       middleware: (getDefault) => getDefault().concat(persistMiddleware as any),
     })
 
@@ -154,6 +157,68 @@ describe('the persistence flush gate keeps uncaptured legacy labels alive', () =
     expect(
       envelopes.some((envelope) => envelope.storageKey === LAYOUT_KEY && envelope.raw === legacyRaw),
     ).toBe(true)
+
+    vi.useRealTimers()
+  })
+
+  it('keeps an immediate close dirty and armed when capture defers its flush, then retries after capture succeeds', async () => {
+    vi.resetModules()
+    storageMap.clear()
+    const legacyRaw = legacyLayoutRaw()
+    storageMap.set(LAYOUT_KEY, legacyRaw)
+    failEnvelopeWrites = true
+    sessionStorage.setItem('freshell.layout-window-id.v1', WINDOW_ID)
+
+    const migration = await import('@/lib/session-name-migration')
+    migration.resetLegacyNameCaptureFailureForTests()
+    migration.captureLegacyLayoutEnvelope(LAYOUT_KEY, legacyRaw, localStorageMock)
+    const persisted = await import('@/store/persistedState')
+    const wlk = await import('@/store/window-layout-keys')
+    const hash = persisted.hashPersistedLayoutRaw(legacyRaw)
+    storageMap.set(wlk.getWindowFreshAgentCommitMarkerKey(), JSON.stringify({
+      version: 1,
+      migration: persisted.LAYOUT_FRESH_AGENT_MIGRATION_ID,
+      backupKey: persisted.LAYOUT_FRESH_AGENT_BACKUP_KEY,
+      originalHash: hash,
+      migratedHash: hash,
+      committedAt: 1234,
+    }))
+
+    const { persistMiddleware, resetPersistFlushListenersForTests } = await import('@/store/persistMiddleware')
+    const { flushPersistedLayoutNow, isLocalClosePersistencePending, markLocalClosePersistencePending } =
+      await import('@/store/persistControl')
+    const { default: tabsReducer, addTab, removeTab } = await import('@/store/tabsSlice')
+    const { default: panesReducer } = await import('@/store/panesSlice')
+    const { configureStore } = await import('@reduxjs/toolkit')
+
+    vi.useFakeTimers()
+    resetPersistFlushListenersForTests()
+    const store = configureStore({
+      reducer: { tabs: tabsReducer, panes: panesReducer },
+      middleware: (getDefault) => getDefault().concat(persistMiddleware as any),
+    })
+
+    // Build the user close and force its immediate boundary flush while the
+    // evidence envelope write is still failing.
+    store.dispatch(addTab({ mode: 'shell' }))
+    markLocalClosePersistencePending(store.getState)
+    for (const tab of store.getState().tabs.tabs) store.dispatch(removeTab(tab.id))
+    store.dispatch(flushPersistedLayoutNow())
+
+    expect(storageMap.get(LAYOUT_KEY)).toBe(legacyRaw)
+    expect(isLocalClosePersistencePending(store.getState)).toBe(true)
+
+    // Once capture can persist its evidence, the same dirty close cycle is
+    // retryable without another user action or unrelated state mutation.
+    failEnvelopeWrites = false
+    store.dispatch(flushPersistedLayoutNow())
+    const closedRaw = storageMap.get(LAYOUT_KEY)
+    expect(closedRaw).not.toBe(legacyRaw)
+    expect(JSON.parse(closedRaw!).tabs.tabs).toEqual([])
+    expect(isLocalClosePersistencePending(store.getState)).toBe(false)
+    expect(migration.listCapturedMigrationEnvelopes(localStorageMock)).toContainEqual(
+      expect.objectContaining({ storageKey: LAYOUT_KEY, raw: legacyRaw }),
+    )
     vi.useRealTimers()
   })
 })

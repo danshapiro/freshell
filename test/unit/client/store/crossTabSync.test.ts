@@ -2,7 +2,7 @@ import { describe, it, expect, afterEach, beforeEach, vi } from 'vitest'
 import { configureStore } from '@reduxjs/toolkit'
 
 import tabsReducer, { closePaneWithCleanup, closeTab, hydrateTabs } from '../../../../src/store/tabsSlice'
-import panesReducer, { hydratePanes, hydratePaneTitles, updatePaneTitle } from '../../../../src/store/panesSlice'
+import panesReducer, { clearPaneClosing, closePane, hydratePanes, hydratePaneTitles, markPaneClosing, updatePaneTitle } from '../../../../src/store/panesSlice'
 import machineIdentityReducer, { setMachineReady } from '../../../../src/store/machineIdentitySlice'
 import tabRecencyReducer from '../../../../src/store/tabRecencySlice'
 import settingsReducer, { setLocalSettings, updateSettingsLocal } from '../../../../src/store/settingsSlice'
@@ -12,6 +12,7 @@ import {
   clearLocalClosePersistencePending,
   flushPersistedLayoutNow,
   getAuthoritativeLocalLayoutPersistedAt,
+  getLocalLayoutBaselinePersistedAt,
   isLocalClosePersistencePending,
   resetAuthoritativeLocalLayoutPersistedAtForTests,
 } from '../../../../src/store/persistControl'
@@ -31,6 +32,7 @@ import { BROWSER_PREFERENCES_STORAGE_KEY, MACHINE_ID_STORAGE_KEY, TAB_RECENCY_ST
 import { resolveLocalSettings } from '@shared/settings'
 import { listCapturedMigrationEnvelopes } from '@/lib/session-name-migration'
 import { sessionMetadataKey } from '@/lib/session-metadata'
+import { sameLayoutTopology } from '@/store/layout-topology.js'
 
 // Delta round 3, finding 1 + e3r1 findings 3/4: layout envelopes are keyed
 // per window by the mint-once layout-window-id
@@ -164,11 +166,14 @@ describe('crossTabSync', () => {
     let barrierWasPending = false
     let staleManagedPaneWasRestored = false
     let foreignTitleWasAccepted = false
+    let ownFloorAfterRejectedEvent: number | undefined
+    let acceptedFloorBeforeRejectedEvent: number | undefined
     const injectCloseWindowEvents = () => (next: (action: any) => any) => (action: any) => {
       const result = next(action)
       if (!injected && action?.type === 'tabs/removeTab') {
         injected = true
         barrierWasPending = isLocalClosePersistencePending(store.getState)
+        acceptedFloorBeforeRejectedEvent = getAuthoritativeLocalLayoutPersistedAt(OWN_LAYOUT_KEY, store.getState)
         window.dispatchEvent(new StorageEvent('storage', {
           key: OWN_LAYOUT_KEY,
           newValue: JSON.stringify({
@@ -215,6 +220,7 @@ describe('crossTabSync', () => {
         const afterOwnKey = store.getState().panes.layouts.t1 as any
         staleManagedPaneWasRestored = afterOwnKey?.type === 'split'
           && afterOwnKey.children.some((child: any) => child.id === 'pane-managed')
+        ownFloorAfterRejectedEvent = getAuthoritativeLocalLayoutPersistedAt(OWN_LAYOUT_KEY, store.getState)
 
         window.dispatchEvent(new StorageEvent('storage', {
           key: REMOTE_LAYOUT_KEY,
@@ -300,6 +306,7 @@ describe('crossTabSync', () => {
     expect(injected).toBe(true)
     expect(barrierWasPending).toBe(true)
     expect(staleManagedPaneWasRestored).toBe(false)
+    expect(ownFloorAfterRejectedEvent).toBe(acceptedFloorBeforeRejectedEvent)
     expect(foreignTitleWasAccepted).toBe(true)
     expect(store.getState().tabs.tabs).toEqual([])
     expect(store.getState().panes.layouts.t1).toBeUndefined()
@@ -308,7 +315,7 @@ describe('crossTabSync', () => {
     expect(closedRaw).not.toBeNull()
     const closedLayout = JSON.parse(closedRaw!)
     expect(closedLayout.tabs.tabs).toEqual([])
-    expect(closedLayout.persistedAt).toBeGreaterThan(150)
+    expect(closedLayout.persistedAt).toBeGreaterThan(200)
   })
 
   it('does not let a stale duplicate-tab debounce rewrite a committed close before its storage event arrives', async () => {
@@ -394,6 +401,11 @@ describe('crossTabSync', () => {
     storeB.dispatch(flushPersistedLayoutNow())
     const bCommittedRaw = localStorage.getItem(OWN_LAYOUT_KEY)
     expect(bCommittedRaw).not.toBeNull()
+    expect(sameLayoutTopology(
+      storeA.getState().tabs.tabs,
+      storeA.getState().panes.layouts,
+      JSON.parse(bCommittedRaw!),
+    )).toBe(true)
     const bCommittedPersistedAt = JSON.parse(bCommittedRaw!).persistedAt as number
     expect(bCommittedPersistedAt).toBeGreaterThan(100)
 
@@ -434,6 +446,239 @@ describe('crossTabSync', () => {
     expect(afterReconciliation.panes.layouts.t1).toMatchObject({ type: 'leaf', id: 'pane-b' })
     expect(afterReconciliation.persistedAt).toBeGreaterThan(closedPersistedAt)
     expect(storeA.getState().panes.layouts.t1).toMatchObject({ type: 'leaf', id: 'pane-b' })
+  })
+
+  it('refuses a stale explicit sibling close instead of restoring the pane closed by the other store', async () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(new Date(100))
+    resetPersistedLayoutCacheForTests()
+
+    const splitLayout = {
+      type: 'split',
+      id: 'split-shared',
+      direction: 'horizontal',
+      sizes: [50, 50],
+      children: [
+        { type: 'leaf', id: 'pane-a', content: { kind: 'browser', browserInstanceId: 'browser-a', url: 'https://a.example', devToolsOpen: false } },
+        { type: 'leaf', id: 'pane-b', content: { kind: 'browser', browserInstanceId: 'browser-b', url: 'https://b.example', devToolsOpen: false } },
+      ],
+    }
+    localStorage.setItem(OWN_LAYOUT_KEY, JSON.stringify({
+      version: 3,
+      persistedAt: 100,
+      tabs: { activeTabId: 't1', tabs: [{ id: 't1', title: 'Shared', createdAt: 1, updatedAt: 1 }] },
+      panes: { version: 6, layouts: { t1: splitLayout }, activePane: { t1: 'pane-a' }, paneTitles: {}, paneTitleSetByUser: {} },
+      tombstones: [],
+    }))
+
+    const makeSharedStore = () => configureStore({
+      reducer: { tabs: tabsReducer, panes: panesReducer },
+      middleware: (getDefault) => getDefault().concat(persistMiddleware as any),
+    })
+    const storeA = makeSharedStore()
+    const storeB = makeSharedStore()
+    for (const store of [storeA, storeB]) {
+      store.dispatch({
+        ...hydrateTabs({
+          tabs: [{ id: 't1', title: 'Shared', createdAt: 1, updatedAt: 1 }],
+          activeTabId: 't1', renameRequestTabId: null, tombstones: [],
+        }),
+        meta: { skipPersist: true },
+      })
+      store.dispatch({
+        ...hydratePanes({
+          layouts: { t1: splitLayout } as any,
+          activePane: { t1: 'pane-a' }, paneTitles: {}, paneTitleSetByUser: {},
+        }),
+        meta: { skipPersist: true },
+      })
+    }
+    cleanups.push(installCrossTabSync(storeA as any), installCrossTabSync(storeB as any))
+
+    await storeA.dispatch(closePaneWithCleanup({ tabId: 't1', paneId: 'pane-a' }) as any)
+    const aCloseRaw = localStorage.getItem(OWN_LAYOUT_KEY)!
+    expect(JSON.parse(aCloseRaw).panes.layouts.t1).toMatchObject({ type: 'leaf', id: 'pane-b' })
+
+    // B has not received A's same-key event. Closing pane-b against B's old
+    // split would leave pane-a and publish a newer full tree, undoing A.
+    await storeB.dispatch(closePaneWithCleanup({ tabId: 't1', paneId: 'pane-b' }) as any)
+
+    const durable = JSON.parse(localStorage.getItem(OWN_LAYOUT_KEY)!)
+    expect(durable.panes.layouts.t1).toMatchObject({ type: 'leaf', id: 'pane-b' })
+    expect(storeB.getState().panes.layouts.t1).toMatchObject({ type: 'split' })
+  })
+
+  it('reconciles an own-key close that commits after the local close preflight but before its flush', async () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(new Date(100))
+    resetPersistedLayoutCacheForTests()
+
+    const splitLayout = {
+      type: 'split', id: 'split-shared', direction: 'horizontal', sizes: [50, 50],
+      children: [
+        { type: 'leaf', id: 'pane-a', content: { kind: 'browser', browserInstanceId: 'browser-a', url: 'https://a.example', devToolsOpen: false } },
+        { type: 'leaf', id: 'pane-b', content: { kind: 'browser', browserInstanceId: 'browser-b', url: 'https://b.example', devToolsOpen: false } },
+      ],
+    }
+    localStorage.setItem(OWN_LAYOUT_KEY, JSON.stringify({
+      version: 3, persistedAt: 100,
+      tabs: { activeTabId: 't1', tabs: [{ id: 't1', title: 'Shared', createdAt: 1, updatedAt: 1 }] },
+      panes: { version: 6, layouts: { t1: splitLayout }, activePane: { t1: 'pane-a' }, paneTitles: {}, paneTitleSetByUser: {} },
+      tombstones: [],
+    }))
+
+    const makeStore = (extra?: any) => configureStore({
+      reducer: { tabs: tabsReducer, panes: panesReducer },
+      middleware: (getDefault) => getDefault().concat(persistMiddleware as any, ...(extra ? [extra] : [])),
+    })
+    const storeA = makeStore()
+    let injected = false
+    const commitAWhileBRemovesQ = () => (next: (action: any) => any) => (action: any) => {
+      const result = next(action)
+      if (!injected && action?.type === closePane.type) {
+        injected = true
+        // A closes P and durably publishes its surviving Q topology only
+        // after B passed the first shared-layout preflight and began closing Q.
+        storeA.dispatch(closePane({ tabId: 't1', paneId: 'pane-a' }))
+        storeA.dispatch(flushPersistedLayoutNow())
+        const aCloseRaw = localStorage.getItem(OWN_LAYOUT_KEY)!
+        expect(JSON.parse(aCloseRaw).panes.layouts.t1).toMatchObject({ type: 'leaf', id: 'pane-b' })
+        window.dispatchEvent(new StorageEvent('storage', { key: OWN_LAYOUT_KEY, newValue: aCloseRaw }))
+      }
+      return result
+    }
+    const storeB = makeStore(commitAWhileBRemovesQ as any)
+    const hydrateBase = (store: ReturnType<typeof makeStore>) => {
+      store.dispatch({
+        ...hydrateTabs({
+          tabs: [{ id: 't1', title: 'Shared', createdAt: 1, updatedAt: 1 }],
+          activeTabId: 't1', renameRequestTabId: null, tombstones: [],
+        }),
+        meta: { skipPersist: true },
+      })
+      store.dispatch({
+        ...hydratePanes({ layouts: { t1: splitLayout } as any, activePane: { t1: 'pane-a' }, paneTitles: {}, paneTitleSetByUser: {} }),
+        meta: { skipPersist: true },
+      })
+    }
+    hydrateBase(storeA)
+    hydrateBase(storeB)
+    cleanups.push(installCrossTabSync(storeA as any), installCrossTabSync(storeB as any))
+
+    await storeB.dispatch(closePaneWithCleanup({ tabId: 't1', paneId: 'pane-b' }) as any)
+
+    expect(injected).toBe(true)
+    expect(storeA.getState().panes.layouts.t1).toMatchObject({ type: 'leaf', id: 'pane-b' })
+    expect(storeB.getState().panes.layouts.t1).toMatchObject({ type: 'leaf', id: 'pane-b' })
+    expect(JSON.parse(localStorage.getItem(OWN_LAYOUT_KEY)!).panes.layouts.t1).toMatchObject({ type: 'leaf', id: 'pane-b' })
+  })
+
+  it('does not accept or flush a same-key close while a pane close freezes the local tree; it replays it after thaw', () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(new Date(100))
+    resetPersistedLayoutCacheForTests()
+
+    const splitLayout = {
+      type: 'split', id: 'split-shared', direction: 'horizontal', sizes: [50, 50],
+      children: [
+        { type: 'leaf', id: 'pane-a', content: { kind: 'browser', browserInstanceId: 'browser-a', url: 'https://a.example', devToolsOpen: false } },
+        { type: 'leaf', id: 'pane-b', content: { kind: 'browser', browserInstanceId: 'browser-b', url: 'https://b.example', devToolsOpen: false } },
+      ],
+    }
+    localStorage.setItem(OWN_LAYOUT_KEY, JSON.stringify({
+      version: 3, persistedAt: 100,
+      tabs: { activeTabId: 't1', tabs: [{ id: 't1', title: 'Shared', createdAt: 1, updatedAt: 1 }] },
+      panes: { version: 6, layouts: { t1: splitLayout }, activePane: { t1: 'pane-a' }, paneTitles: {}, paneTitleSetByUser: {} },
+      tombstones: [],
+    }))
+    const store = configureStore({
+      reducer: { tabs: tabsReducer, panes: panesReducer },
+      middleware: (getDefault) => getDefault().concat(persistMiddleware as any),
+    })
+    store.dispatch({
+      ...hydrateTabs({ tabs: [{ id: 't1', title: 'Shared', createdAt: 1, updatedAt: 1 }], activeTabId: 't1', renameRequestTabId: null, tombstones: [] }),
+      meta: { skipPersist: true },
+    })
+    store.dispatch({
+      ...hydratePanes({ layouts: { t1: splitLayout } as any, activePane: { t1: 'pane-a' }, paneTitles: {}, paneTitleSetByUser: {} }),
+      meta: { skipPersist: true },
+    })
+    cleanups.push(installCrossTabSync(store as any))
+
+    store.dispatch(updatePaneTitle({ tabId: 't1', paneId: 'pane-a', title: 'local pending title', setByUser: true }))
+    store.dispatch(markPaneClosing({ tabId: 't1', paneId: 'pane-b' }))
+    const baseFloor = getLocalLayoutBaselinePersistedAt(OWN_LAYOUT_KEY, store.getState)
+    const remoteCloseRaw = JSON.stringify({
+      version: 3, persistedAt: 101,
+      tabs: { activeTabId: 't1', tabs: [{ id: 't1', title: 'Shared', createdAt: 1, updatedAt: 1 }] },
+      panes: {
+        version: 6,
+        layouts: { t1: { type: 'leaf', id: 'pane-b', content: splitLayout.children[1].content } },
+        activePane: { t1: 'pane-b' }, paneTitles: {}, paneTitleSetByUser: {},
+      },
+      tombstones: [],
+    })
+    localStorage.setItem(OWN_LAYOUT_KEY, remoteCloseRaw)
+
+    window.dispatchEvent(new StorageEvent('storage', { key: OWN_LAYOUT_KEY, newValue: remoteCloseRaw }))
+
+    expect(store.getState().panes.layouts.t1).toMatchObject({ type: 'split' })
+    expect(getLocalLayoutBaselinePersistedAt(OWN_LAYOUT_KEY, store.getState)).toBe(baseFloor)
+    expect(JSON.parse(localStorage.getItem(OWN_LAYOUT_KEY)!).persistedAt).toBe(101)
+
+    store.dispatch(clearPaneClosing({ tabId: 't1', paneId: 'pane-b' }))
+    expect(store.getState().panes.layouts.t1).toMatchObject({ type: 'leaf', id: 'pane-b' })
+    expect(JSON.parse(localStorage.getItem(OWN_LAYOUT_KEY)!).panes.layouts.t1).toMatchObject({ type: 'leaf', id: 'pane-b' })
+  })
+
+  it('applies a same-key topology close newer than its topology baseline despite a higher foreign-title floor', () => {
+    resetPersistedLayoutCacheForTests()
+    const splitLayout = {
+      type: 'split', id: 'split-shared', direction: 'horizontal', sizes: [50, 50],
+      children: [
+        { type: 'leaf', id: 'pane-a', content: { kind: 'browser', browserInstanceId: 'browser-a', url: 'https://a.example', devToolsOpen: false } },
+        { type: 'leaf', id: 'pane-b', content: { kind: 'browser', browserInstanceId: 'browser-b', url: 'https://b.example', devToolsOpen: false } },
+      ],
+    }
+    localStorage.setItem(OWN_LAYOUT_KEY, JSON.stringify({
+      version: 3, persistedAt: 100,
+      tabs: { activeTabId: 't1', tabs: [{ id: 't1', title: 'Shared', createdAt: 1, updatedAt: 1 }] },
+      panes: { version: 6, layouts: { t1: splitLayout }, activePane: { t1: 'pane-a' }, paneTitles: {}, paneTitleSetByUser: {} },
+      tombstones: [],
+    }))
+    const store = configureStore({ reducer: { tabs: tabsReducer, panes: panesReducer } })
+    store.dispatch({
+      ...hydrateTabs({ tabs: [{ id: 't1', title: 'Shared', createdAt: 1, updatedAt: 1 }], activeTabId: 't1', renameRequestTabId: null, tombstones: [] }),
+      meta: { skipPersist: true },
+    })
+    store.dispatch({
+      ...hydratePanes({ layouts: { t1: splitLayout } as any, activePane: { t1: 'pane-a' }, paneTitles: {}, paneTitleSetByUser: {} }),
+      meta: { skipPersist: true },
+    })
+    cleanups.push(installCrossTabSync(store as any))
+
+    window.dispatchEvent(new StorageEvent('storage', {
+      key: REMOTE_LAYOUT_KEY,
+      newValue: JSON.stringify({
+        version: 3, persistedAt: 1000,
+        tabs: { activeTabId: null, tabs: [] },
+        panes: { version: 6, layouts: { t1: splitLayout }, activePane: {}, paneTitles: { t1: { 'pane-a': 'Foreign newer title' } }, paneTitleSetByUser: { t1: { 'pane-a': true } } },
+        tombstones: [],
+      }),
+    }))
+    expect(getAuthoritativeLocalLayoutPersistedAt(OWN_LAYOUT_KEY, store.getState)).toBe(1000)
+
+    const ownCloseRaw = JSON.stringify({
+      version: 3, persistedAt: 101,
+      tabs: { activeTabId: 't1', tabs: [{ id: 't1', title: 'Shared', createdAt: 1, updatedAt: 1 }] },
+      panes: { version: 6, layouts: { t1: { type: 'leaf', id: 'pane-b', content: splitLayout.children[1].content } }, activePane: { t1: 'pane-b' }, paneTitles: {}, paneTitleSetByUser: {} },
+      tombstones: [],
+    })
+    window.dispatchEvent(new StorageEvent('storage', { key: OWN_LAYOUT_KEY, newValue: ownCloseRaw }))
+
+    expect(store.getState().panes.layouts.t1).toMatchObject({ type: 'leaf', id: 'pane-b' })
+    expect(getLocalLayoutBaselinePersistedAt(OWN_LAYOUT_KEY, store.getState)).toBe(101)
+    expect(getAuthoritativeLocalLayoutPersistedAt(OWN_LAYOUT_KEY, store.getState)).toBe(1000)
   })
 
   it('preserves canonical resume identity when an OWN-key flush (duplicate tab) rehydrates a fresh-agent pane', () => {

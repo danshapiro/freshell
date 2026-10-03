@@ -301,6 +301,21 @@ the repair. After the repair, ten focused suites passed (244 tests), client
 typecheck passed, and `git diff --check` passed. The requested independent
 review of this follow-up is pending.
 
+**Task 2 review 2 repair (2026-10-03):** Added two-store coverage for a stale
+explicit sibling close, a same-key close arriving while the local pane tree is
+frozen, an own-key close below a higher foreign-title floor, and an own-key
+close that commits after the local close preflight but before its flush. A
+conflicting layout discovered at the flush boundary now cancels the unsaved
+local close and lets the queued shared topology reconcile after the close
+freeze clears. Successful local writes supersede deferred pre-close events;
+failed writes leave them queued for retry. Rejected own-key events do not
+advance accepted topology/title floors. A separate per-store write-stamp
+high-water keeps the next successful timestamp monotonic without authorizing
+the rejected payload. Immediate close flushes also retain dirty work and the
+close marker when legacy-name evidence capture defers the write. The five
+focused suites passed (101 tests), `pnpm run typecheck:client` passed, and
+`git diff --check` passed. Independent review of this repair is pending.
+
 ## Task 3: Reopen only from current identity and clear close evidence
 
 **Files:**

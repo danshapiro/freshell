@@ -12,21 +12,50 @@ const defaultPersistControlOwner = {}
 const ownerKey = (owner?: PersistControlOwner) => owner ?? defaultPersistControlOwner
 
 let localClosePersistencePendingByOwner = new WeakSet<PersistControlOwner>()
+export type LocalClosePersistenceTopology = { layoutKey: string; topologySignature: string }
+let localClosePersistenceTopologyByOwner = new WeakMap<PersistControlOwner, LocalClosePersistenceTopology>()
 let authoritativeLocalLayoutPersistedAtByOwner = new WeakMap<PersistControlOwner, Map<string, number>>()
 let localLayoutBaselinePersistedAtByOwner = new WeakMap<PersistControlOwner, Map<string, number | null>>()
+// A rejected same-key event must not advance the acceptance/freshness floor,
+// but a later write still must not emit a lower persistedAt than a timestamp
+// it has already observed. Keep that serialization high-water separate from
+// the topology baseline and authoritative recency floor.
+let localLayoutWriteTimestampByOwner = new WeakMap<PersistControlOwner, Map<string, number>>()
 
 /** Mark that local close state must reach durable layout storage before hydration. */
-export function markLocalClosePersistencePending(owner?: PersistControlOwner): void {
-  localClosePersistencePendingByOwner.add(ownerKey(owner))
+export function markLocalClosePersistencePending(
+  owner?: PersistControlOwner,
+  layoutKey?: string,
+  topologySignature?: string,
+): void {
+  const resolvedOwner = ownerKey(owner)
+  if (
+    !localClosePersistencePendingByOwner.has(resolvedOwner)
+    && typeof layoutKey === 'string'
+    && layoutKey.length > 0
+    && typeof topologySignature === 'string'
+  ) {
+    localClosePersistenceTopologyByOwner.set(resolvedOwner, { layoutKey, topologySignature })
+  }
+  localClosePersistencePendingByOwner.add(resolvedOwner)
 }
 
 export function isLocalClosePersistencePending(owner?: PersistControlOwner): boolean {
   return localClosePersistencePendingByOwner.has(ownerKey(owner))
 }
 
-/** Clear the close barrier after its layout write succeeds or a no-op is canceled. */
+/** Clear the barrier after a durable write or when a stale close is abandoned. */
 export function clearLocalClosePersistencePending(owner?: PersistControlOwner): void {
-  localClosePersistencePendingByOwner.delete(ownerKey(owner))
+  const resolvedOwner = ownerKey(owner)
+  localClosePersistencePendingByOwner.delete(resolvedOwner)
+  localClosePersistenceTopologyByOwner.delete(resolvedOwner)
+}
+
+/** Snapshot of the topology from which a pending close was committed. */
+export function getLocalClosePersistenceTopology(
+  owner?: PersistControlOwner,
+): LocalClosePersistenceTopology | undefined {
+  return localClosePersistenceTopologyByOwner.get(ownerKey(owner))
 }
 
 /** Keep the accepted local-layout recency floor available to persistence. */
@@ -78,6 +107,21 @@ export function getLocalLayoutBaselinePersistedAt(
   return localLayoutBaselinePersistedAtByOwner.get(owner)?.get(key)
 }
 
+export function observeLocalLayoutWriteTimestamp(
+  key: string,
+  candidate?: number,
+  owner?: PersistControlOwner,
+): void {
+  if (!key || typeof candidate !== 'number' || !Number.isFinite(candidate)) return
+  const ownerTimestamps = getOrCreateMap(localLayoutWriteTimestampByOwner, ownerKey(owner))
+  const current = ownerTimestamps.get(key)
+  if (typeof current !== 'number' || candidate > current) ownerTimestamps.set(key, candidate)
+}
+
+export function getLocalLayoutWriteTimestamp(key: string, owner?: PersistControlOwner): number | undefined {
+  return localLayoutWriteTimestampByOwner.get(ownerKey(owner))?.get(key)
+}
+
 function getOrCreateMap<K, V>(weakMap: WeakMap<PersistControlOwner, Map<K, V>>, owner: PersistControlOwner): Map<K, V> {
   let values = weakMap.get(owner)
   if (!values) {
@@ -90,7 +134,9 @@ function getOrCreateMap<K, V>(weakMap: WeakMap<PersistControlOwner, Map<K, V>>, 
 export function resetAuthoritativeLocalLayoutPersistedAtForTests(): void {
   authoritativeLocalLayoutPersistedAtByOwner = new WeakMap()
   localLayoutBaselinePersistedAtByOwner = new WeakMap()
+  localLayoutWriteTimestampByOwner = new WeakMap()
   localClosePersistencePendingByOwner = new WeakSet()
+  localClosePersistenceTopologyByOwner = new WeakMap()
 }
 
 function sessionRefEquals(a?: SessionRef, b?: SessionRef): boolean {

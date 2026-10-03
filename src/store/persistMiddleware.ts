@@ -6,6 +6,7 @@ import type { Tab } from './types'
 import { nanoid } from 'nanoid'
 import { broadcastPersistedRaw } from './persistBroadcast'
 import { isWellFormedPaneTree } from './paneTreeValidation.js'
+import { persistedLayoutTopologySignature } from './layout-topology.js'
 import {
   PANES_SCHEMA_VERSION,
   LAYOUT_SCHEMA_VERSION,
@@ -32,9 +33,12 @@ import {
   clearLocalClosePersistencePending,
   flushPersistedLayoutNow,
   getAuthoritativeLocalLayoutPersistedAt,
+  getLocalClosePersistenceTopology,
   getLocalLayoutBaselinePersistedAt,
+  getLocalLayoutWriteTimestamp,
   initializeLocalLayoutBaselinePersistedAt,
   isLocalClosePersistencePending,
+  observeLocalLayoutWriteTimestamp,
   observeAuthoritativeLocalLayoutPersistedAt,
   setLocalLayoutBaselinePersistedAt,
 } from './persistControl'
@@ -641,24 +645,42 @@ export const persistMiddleware: Middleware<{}, PersistState> = (store) => {
           : undefined
         const localBaselinePersistedAt = getLocalLayoutBaselinePersistedAt(layoutKey, persistControlOwner)
         const explicitCloseIntent = localClosePending || userClosedTabsIntent
-        if (
-          !explicitCloseIntent
-          && typeof existingPersistedAt === 'number'
+        const sharedIsNewer = typeof existingPersistedAt === 'number'
           && (
             typeof localBaselinePersistedAt !== 'number'
             || existingPersistedAt > localBaselinePersistedAt
           )
+        const persistedLayout = existingRaw ? parsePersistedLayoutRaw(existingRaw) : null
+        const closeTopology = getLocalClosePersistenceTopology(persistControlOwner)
+        const closeTopologyStillMatches = explicitCloseIntent
+          && closeTopology?.layoutKey === layoutKey
+          && persistedLayout !== null
+          && closeTopology.topologySignature === persistedLayoutTopologySignature(persistedLayout)
+        if (
+          sharedIsNewer
+          && !closeTopologyStillMatches
         ) {
           // Another same-key document has already committed a layout that this
           // Redux tree has not applied. Do not turn its newer envelope into a
           // stamp for our stale payload. Keep dirty state armed; the matching
           // StorageEvent will reconcile Redux and trigger a safe retry.
-          log.warn('Skipped stale layout persistence because shared storage is newer than this store', {
+          log.warn('Skipped stale layout persistence because shared topology is newer than this store', {
             reason: 'persist_stale_layout_refused',
             layoutKey,
             localBaselinePersistedAt,
             existingPersistedAt,
+            explicitCloseIntent,
           })
+          if (localClosePending && closeTopology?.layoutKey === layoutKey) {
+            // The close already changed Redux, but a conflicting same-key
+            // topology landed after its last preflight and before this flush.
+            // Cancel the unsaved close so crossTabSync can replay that raw
+            // after the pane/tab freeze clears. This leaves dirty state armed
+            // for the replayed topology and never publishes the stale tree.
+            clearLocalClosePersistencePending(persistControlOwner)
+            userClosedTabsIntent = false
+            store.dispatch(flushPersistedLayoutNow())
+          }
           return
         }
       }
@@ -729,6 +751,12 @@ export const persistMiddleware: Middleware<{}, PersistState> = (store) => {
               'failing; uncaptured legacy labels stay in their source keys for retry.',
             { reason: 'legacy_name_capture_pending' },
           )
+          // This is a deferred write, not a consumed dirty cycle. In
+          // particular, an immediate close must keep both its close barrier
+          // and the authorization to persist an empty-tabs result until the
+          // capture succeeds.
+          userClosedTabsIntent = closedByUser
+          return
         } else {
           // Prune tombstones older than 1 hour
           const TOMBSTONE_MAX_AGE_MS = 60 * 60 * 1000
@@ -779,12 +807,16 @@ export const persistMiddleware: Middleware<{}, PersistState> = (store) => {
             : undefined
           const now = Date.now()
           const authoritativePersistedAt = getAuthoritativeLocalLayoutPersistedAt(layoutKey, persistControlOwner)
+          const writeTimestampHighWater = getLocalLayoutWriteTimestamp(layoutKey, persistControlOwner)
           const previousAuthoritativePersistedAt = Math.max(
             typeof previousPersistedAt === 'number'
               ? previousPersistedAt
               : Number.NEGATIVE_INFINITY,
             typeof authoritativePersistedAt === 'number'
               ? authoritativePersistedAt
+              : Number.NEGATIVE_INFINITY,
+            typeof writeTimestampHighWater === 'number'
+              ? writeTimestampHighWater
               : Number.NEGATIVE_INFINITY,
           )
           const persistedAt = Number.isFinite(previousAuthoritativePersistedAt)
@@ -811,6 +843,7 @@ export const persistMiddleware: Middleware<{}, PersistState> = (store) => {
 
           const raw = JSON.stringify(layoutPayload)
           localStorage.setItem(layoutKey, raw)
+          observeLocalLayoutWriteTimestamp(layoutKey, persistedAt, persistControlOwner)
           observeAuthoritativeLocalLayoutPersistedAt(layoutKey, persistedAt, persistControlOwner)
           setLocalLayoutBaselinePersistedAt(layoutKey, persistedAt, persistControlOwner)
           // Release the close barrier only after the authoritative layout

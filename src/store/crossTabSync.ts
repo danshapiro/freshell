@@ -2,6 +2,7 @@ import { z } from 'zod'
 import { mergeLocalSettings, resolveLocalSettings } from '@shared/settings'
 import { getSelectedMachineId } from '@/lib/machine-identity'
 import { captureLegacyLayoutEnvelope } from '@/lib/session-name-migration'
+import { createLogger } from '@/lib/client-logger'
 import { paneTitleMetadataEquals } from './hydrate-pane-metadata-merge'
 import type { PanesState } from './paneTypes'
 import { hydratePanes, hydratePaneTitles } from './panesSlice'
@@ -17,6 +18,7 @@ import {
   flushPersistedLayoutNow,
   initializeLocalLayoutBaselinePersistedAt,
   isLocalClosePersistencePending,
+  observeLocalLayoutWriteTimestamp,
   observeAuthoritativeLocalLayoutPersistedAt,
   setLocalLayoutBaselinePersistedAt,
   shouldPreserveLocalCanonicalResumeSessionId,
@@ -32,9 +34,19 @@ import {
 } from './tabRecencySlice'
 import { parseBrowserPreferencesRaw, resolveBrowserPreferenceSettings } from '@/lib/browser-preferences'
 
+const log = createLogger('CrossTabSync')
+
 type StoreLike = {
   dispatch: (action: any) => any
   getState: () => any
+  subscribe?: (listener: () => void) => () => void
+}
+
+function hasPaneCloseInFlight(store: StoreLike): boolean {
+  const panes = store.getState()?.panes
+  if (!panes) return false
+  if (Object.values(panes.closingTabs ?? {}).some((closing) => closing === true)) return true
+  return Object.values(panes.closingPanes ?? {}).some((closing) => closing === true)
 }
 
 const DEFAULT_CLOSED_TAB_RETENTION_DAYS = 30
@@ -201,11 +213,14 @@ function dispatchHydrateLayoutFromPersisted(
   store: StoreLike,
   raw: string,
   localLayoutPersistedAt?: number,
+  preserveLocalPaneTitlesAt?: number,
 ) {
   const parsed = parsePersistedLayoutRaw(raw)
   if (!parsed) return
   const state = store.getState()
   const localLayouts = (state?.panes?.layouts || {}) as Record<string, unknown>
+  const localPaneTitles = state?.panes?.paneTitles
+  const localPaneTitleSetByUser = state?.panes?.paneTitleSetByUser
   const protectedLayouts = Object.fromEntries(
     Object.entries(parsed.panes.layouts || {}).map(([tabId, node]) => [
       tabId,
@@ -267,6 +282,29 @@ function dispatchHydrateLayoutFromPersisted(
       remoteLayoutPersistedAt: parsed.persistedAt,
     },
   })
+
+  if (
+    typeof preserveLocalPaneTitlesAt === 'number'
+    && typeof parsed.persistedAt === 'number'
+    && preserveLocalPaneTitlesAt > parsed.persistedAt
+    && localPaneTitles
+  ) {
+    // A foreign title event has its own recency floor, independent from the
+    // same-key topology baseline. Apply the incoming structure while
+    // retaining newer local title metadata for panes that remain present.
+    store.dispatch({
+      ...hydratePaneTitles({
+        paneTitles: localPaneTitles,
+        paneTitleSetByUser: localPaneTitleSetByUser ?? {},
+        layouts: localLayouts,
+      }),
+      meta: {
+        source: 'cross-tab',
+        localLayoutPersistedAt: parsed.persistedAt,
+        remoteLayoutPersistedAt: preserveLocalPaneTitlesAt,
+      },
+    })
+  }
 }
 
 function dispatchHydrateBrowserPreferencesFromPersisted(
@@ -381,6 +419,7 @@ function handleIncomingRaw(
   raw: string,
   previousRaw?: string,
   localLayoutPersistedAt?: number,
+  preserveLocalPaneTitlesAt?: number,
 ) {
   if (isDerivedLayoutKey(key)) {
     if (key === getWindowLayoutKey()) {
@@ -388,7 +427,7 @@ function handleIncomingRaw(
       // layout-window id (pre-rotation, or a pre-change window during a
       // deploy transition) wrote this envelope — same-window envelope
       // replacement, full hydrate.
-      dispatchHydrateLayoutFromPersisted(store, raw, localLayoutPersistedAt)
+      dispatchHydrateLayoutFromPersisted(store, raw, localLayoutPersistedAt, preserveLocalPaneTitlesAt)
     } else {
       // ANOTHER window's key: title-only.
       dispatchHydratePaneTitlesFromPersisted(store, raw, localLayoutPersistedAt)
@@ -420,11 +459,13 @@ export function installCrossTabSync(store: StoreLike): () => void {
   const persistControlOwner = store.getState
   const persistBroadcastSourceId = getPersistBroadcastSourceId(persistControlOwner)
   let currentLocalLayoutPersistedAt = getAuthoritativeLocalLayoutPersistedAt(ownLayoutKey, persistControlOwner)
+  let deferredOwnLayoutRaw: string | null = null
   for (const key of [ownLayoutKey, BROWSER_PREFERENCES_STORAGE_KEY, TAB_RECENCY_STORAGE_KEY]) {
     const existingRaw = localStorage.getItem(key)
     if (typeof existingRaw === 'string') {
       if (key === ownLayoutKey) {
         const parsed = parsePersistedLayoutRaw(existingRaw)
+        observeLocalLayoutWriteTimestamp(key, parsed?.persistedAt, persistControlOwner)
         const knownBaseline = getLocalLayoutBaselinePersistedAt(ownLayoutKey, persistControlOwner)
         if (knownBaseline === undefined) {
           const initialBaseline = parsed?.persistedAt ?? null
@@ -468,19 +509,46 @@ export function installCrossTabSync(store: StoreLike): () => void {
     return true
   }
 
+  const deferOwnLayoutRaw = (raw: string) => {
+    const incomingAt = parsePersistedLayoutRaw(raw)?.persistedAt
+    const pendingAt = deferredOwnLayoutRaw === null
+      ? undefined
+      : parsePersistedLayoutRaw(deferredOwnLayoutRaw)?.persistedAt
+    if (
+      deferredOwnLayoutRaw === null
+      || (typeof incomingAt === 'number'
+        ? typeof pendingAt !== 'number' || incomingAt >= pendingAt
+        : typeof pendingAt !== 'number')
+    ) {
+      deferredOwnLayoutRaw = raw
+    }
+  }
+
   const handleIncomingRawDeduped = (key: string, raw: string) => {
     // Ignore a foreign-machine layout entirely: no dispatch, no dedupe
     // mark, no authoritative-persistedAt merge (the event is not ours).
     if (isDerivedLayoutKey(key) && isForeignIncomingLayout(store, raw)) return
-    // A same-key layout event can arrive while the local close has already
-    // changed Redux but has not yet reached durable storage. Do not hydrate
-    // that old layout over the close, and leave both raw dedupe and the
-    // persistedAt floor untouched so a later valid event can still apply.
+    if (isDerivedLayoutKey(key) && key === getWindowLayoutKey()) {
+      // Preserve monotonically increasing emitted stamps even when this raw
+      // is rejected/deferred. This serialization high-water does not
+      // authorize hydration or advance either accepted recency floor.
+      observeLocalLayoutWriteTimestamp(key, parsePersistedLayoutRaw(raw)?.persistedAt, persistControlOwner)
+    }
+    // Do not mark a same-key event processed while the close reducers are
+    // freezing a pane tree or its final layout write is pending. Hydration
+    // during that window would preserve the stale tree, while a timestamp
+    // alone could falsely certify it as applied and flush it over the close.
     if (
       isDerivedLayoutKey(key)
       && key === getWindowLayoutKey()
-      && isLocalClosePersistencePending(persistControlOwner)
-    ) return
+      && (
+        hasPaneCloseInFlight(store)
+        || isLocalClosePersistencePending(persistControlOwner)
+      )
+    ) {
+      deferOwnLayoutRaw(raw)
+      return
+    }
     const previousRaw = lastProcessedRawByKey.get(key)
     if (!tryDedupeAndMark(key, raw)) return
     // Unified agent names (Task 7): an OLD envelope arriving later through
@@ -493,6 +561,28 @@ export function installCrossTabSync(store: StoreLike): () => void {
         captureLegacyLayoutEnvelope(key, raw)
       } catch {
         // Capture is best-effort here; the next ready edge re-captures.
+      }
+    }
+    if (key === getWindowLayoutKey()) {
+      const incomingPersistedAt = parsePersistedLayoutRaw(raw)?.persistedAt
+      const acceptedTopologyAt = getLocalLayoutBaselinePersistedAt(key, persistControlOwner)
+      if (
+        typeof incomingPersistedAt === 'number'
+        && typeof acceptedTopologyAt === 'number'
+        && incomingPersistedAt < acceptedTopologyAt
+      ) {
+        // A raw event may have been deferred while a close froze the Redux
+        // tree. If that close then persisted a newer topology, replaying the
+        // queued raw would resurrect the tree that the close removed. It is
+        // now stale against the accepted topology baseline, even if a
+        // foreign title event has a still-higher authoritative floor.
+        log.debug('Ignored a stale same-key layout after close reconciliation', {
+          reason: 'cross_tab_stale_own_layout',
+          layoutKey: key,
+          incomingPersistedAt,
+          acceptedTopologyAt,
+        })
+        return
       }
     }
     // Resolve the own key DYNAMICALLY at every classification/floor point
@@ -508,13 +598,23 @@ export function installCrossTabSync(store: StoreLike): () => void {
     // another window's strictly-newer title).
     const foreignLayoutKey = isDerivedLayoutKey(key) && key !== getWindowLayoutKey()
     const paneTitleMetadataBefore = foreignLayoutKey ? paneTitleMetadataOf(store) : undefined
-    handleIncomingRaw(store, key, raw, previousRaw, currentLocalLayoutPersistedAt)
+    const ownTopologyBaseline = key === getWindowLayoutKey()
+      ? getLocalLayoutBaselinePersistedAt(key, persistControlOwner)
+      : undefined
+    handleIncomingRaw(
+      store,
+      key,
+      raw,
+      previousRaw,
+      key === getWindowLayoutKey() ? ownTopologyBaseline ?? undefined : currentLocalLayoutPersistedAt,
+      key === getWindowLayoutKey() ? currentLocalLayoutPersistedAt : undefined,
+    )
     if (key === getWindowLayoutKey()) {
       const incomingPersistedAt = parsePersistedLayoutRaw(raw)?.persistedAt
       const ownLayoutWasApplied = typeof incomingPersistedAt === 'number'
         && (
-          typeof currentLocalLayoutPersistedAt !== 'number'
-          || incomingPersistedAt >= currentLocalLayoutPersistedAt
+          typeof ownTopologyBaseline !== 'number'
+          || incomingPersistedAt >= ownTopologyBaseline
         )
       if (ownLayoutWasApplied) {
         setLocalLayoutBaselinePersistedAt(key, incomingPersistedAt, persistControlOwner)
@@ -527,8 +627,8 @@ export function installCrossTabSync(store: StoreLike): () => void {
       // (equal titles, or sharing no panes) replaces nothing and must not
       // move the floor — a foreign no-op at a higher stamp would
       // otherwise reject a different window's strictly-newer title
-      mergeAuthoritativeLayoutPersistedAt(incomingPersistedAt)
       if (ownLayoutWasApplied) {
+        mergeAuthoritativeLayoutPersistedAt(incomingPersistedAt)
         // A stale local flush may have been refused while this same-key
         // event was queued. Hydration makes that dirty state safe to retry.
         store.dispatch(flushPersistedLayoutNow())
@@ -550,6 +650,17 @@ export function installCrossTabSync(store: StoreLike): () => void {
         mergeAuthoritativeLayoutPersistedAt(parsePersistedLayoutRaw(raw)?.persistedAt)
       }
     }
+  }
+
+  const replayDeferredOwnLayoutIfReady = () => {
+    if (
+      deferredOwnLayoutRaw === null
+      || hasPaneCloseInFlight(store)
+      || isLocalClosePersistencePending(persistControlOwner)
+    ) return
+    const raw = deferredOwnLayoutRaw
+    deferredOwnLayoutRaw = null
+    handleIncomingRawDeduped(getWindowLayoutKey(), raw)
   }
 
   // Install-time staleness check (delta round 3, finding 2, belt-and-braces):
@@ -580,25 +691,38 @@ export function installCrossTabSync(store: StoreLike): () => void {
     && (bootRawChanged || sharedEnvelopeIsNewer)
     && !isForeignIncomingLayout(store, currentRaw)
   ) {
-    // The local comparison version is the newest layout this store actually
-    // accepted, never a raw value another document wrote while this Redux
-    // tree was stale.
-    const comparisonPersistedAt = typeof currentLocalLayoutPersistedAt === 'number'
-      ? currentLocalLayoutPersistedAt
-      : bootPersistedAt
-    handleIncomingRaw(store, ownLayoutKey, currentRaw, bootRaw ?? undefined, comparisonPersistedAt)
-    const currentWasApplied = typeof currentPersistedAt === 'number'
-      && (
-        typeof comparisonPersistedAt !== 'number'
-        || currentPersistedAt >= comparisonPersistedAt
+    if (hasPaneCloseInFlight(store) || isLocalClosePersistencePending(persistControlOwner)) {
+      deferOwnLayoutRaw(currentRaw)
+    } else {
+      // Same-key structure is compared with the last accepted topology
+      // version. The authoritative floor can be higher because of a foreign
+      // title event and must not block a newer local-key topology.
+      const comparisonPersistedAt = typeof localBaselinePersistedAt === 'number'
+        ? localBaselinePersistedAt
+        : bootPersistedAt
+      handleIncomingRaw(
+        store,
+        ownLayoutKey,
+        currentRaw,
+        bootRaw ?? undefined,
+        comparisonPersistedAt,
+        currentLocalLayoutPersistedAt,
       )
-    if (currentWasApplied) {
-      setLocalLayoutBaselinePersistedAt(ownLayoutKey, currentPersistedAt, persistControlOwner)
-      mergeAuthoritativeLayoutPersistedAt(currentPersistedAt)
-      lastProcessedRawByKey.set(ownLayoutKey, currentRaw)
-      store.dispatch(flushPersistedLayoutNow())
+      const currentWasApplied = typeof currentPersistedAt === 'number'
+        && (
+          typeof comparisonPersistedAt !== 'number'
+          || currentPersistedAt >= comparisonPersistedAt
+        )
+      if (currentWasApplied) {
+        setLocalLayoutBaselinePersistedAt(ownLayoutKey, currentPersistedAt, persistControlOwner)
+        mergeAuthoritativeLayoutPersistedAt(currentPersistedAt)
+        lastProcessedRawByKey.set(ownLayoutKey, currentRaw)
+        store.dispatch(flushPersistedLayoutNow())
+      }
     }
   }
+
+  const unsubscribeStore = store.subscribe?.(replayDeferredOwnLayoutIfReady) ?? (() => {})
 
   // Keep dedupe state in sync with local writes too. Otherwise, if we process a remote raw,
   // then diverge locally (persisted raw changes), a later remote event with the original raw
@@ -611,9 +735,24 @@ export function installCrossTabSync(store: StoreLike): () => void {
     lastProcessedRawByKey.set(msg.key, msg.raw)
     if (isDerivedLayoutKey(msg.key) && msg.key === getWindowLayoutKey()) {
       const persistedAt = parsePersistedLayoutRaw(msg.raw)?.persistedAt
+      observeLocalLayoutWriteTimestamp(msg.key, persistedAt, persistControlOwner)
       mergeAuthoritativeLayoutPersistedAt(persistedAt)
       if (typeof persistedAt === 'number') {
         setLocalLayoutBaselinePersistedAt(msg.key, persistedAt, persistControlOwner)
+      }
+      const deferredAt = deferredOwnLayoutRaw === null
+        ? undefined
+        : parsePersistedLayoutRaw(deferredOwnLayoutRaw)?.persistedAt
+      if (
+        deferredOwnLayoutRaw !== null
+        && typeof persistedAt === 'number'
+        && (typeof deferredAt !== 'number' || persistedAt >= deferredAt)
+      ) {
+        // A durable local close based on the frozen pre-close tree explicitly
+        // supersedes any same-key event deferred during that close. A failed
+        // write never reaches this broadcast path, so its deferred event
+        // remains available for retry/reconciliation.
+        deferredOwnLayoutRaw = null
       }
     }
   })
@@ -661,6 +800,7 @@ export function installCrossTabSync(store: StoreLike): () => void {
 
   return () => {
     unsubscribeLocal()
+    unsubscribeStore()
     window.removeEventListener('storage', onStorage)
     if (channel) {
       try {
