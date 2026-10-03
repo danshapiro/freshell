@@ -1072,9 +1072,10 @@ function managedViewTimeoutHooks(
 }
 
 /**
- * Mark every frozen managed view detached as one close transaction. If a
- * later view refuses the mutation, use each successful response's new fences
- * to return its view to visible before the pane/tab can be removed. Every
+ * Confirm every frozen managed view detached or already closed as one close
+ * transaction. If a later view refuses the mutation, use each completed
+ * detach response's new fences to return its view to visible before the
+ * pane/tab can be removed. Every
  * timeout also starts a bounded late-outcome repair while the original
  * visibility mutation remains observable. Other failed responses reconcile
  * the failing view too, because a rejected response does not prove refusal.
@@ -1084,7 +1085,7 @@ async function detachManagedViews(
   tabId: string,
   getState: () => unknown,
 ): Promise<boolean> {
-  const detached: Array<{ projection: ManagedViewCloseProjection; view: ManagedRuntimeViewIntent }> = []
+  const completedDetaches: Array<{ projection: ManagedViewCloseProjection; view: ManagedRuntimeViewIntent }> = []
   const owned: ManagedViewCloseProjection[] = []
   for (const frozenProjection of projections) {
     const projection = ownManagedViewProjection(frozenProjection, tabId, getState)
@@ -1104,7 +1105,10 @@ async function detachManagedViews(
           soulRevision: projection.soulRevision,
         }, 'detach'),
       )
-      detached.push({ projection, view })
+      // A verified stop may already have hidden this view before the
+      // browser saw its new fences. That successful no-op has no detach
+      // mutation to roll back if a later view refuses this close.
+      if (view.visibility === 'detached') completedDetaches.push({ projection, view })
     } catch (error) {
       log.warn('managed view detach refused during close; rolling back earlier detaches', {
         event: 'managed_view_visibility_detach_unconfirmed',
@@ -1117,7 +1121,7 @@ async function detachManagedViews(
         // just as a timeout can. Read current fences before compensating it.
         await repairManagedViewAuthoritatively(projection, 'detach', error)
       }
-      for (const completed of [...detached].reverse()) {
+      for (const completed of [...completedDetaches].reverse()) {
         try {
           await awaitBoundedManagedRuntimeRequest(
             'managed view rollback mutation',

@@ -332,6 +332,136 @@ async fn start_control(
     (socket, control)
 }
 
+async fn set_view_visibility(
+    router: &Router,
+    view: &ViewIntent,
+    visibility: ViewVisibilityIntent,
+) -> (StatusCode, serde_json::Value) {
+    let response = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PATCH")
+                .uri(format!("/api/runtime/views/{}", view.view_id))
+                .header("x-auth-token", "web-token")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "requestId": RequestId::new(), "visibility": visibility,
+                        "expectedRevision": view.revision,
+                        "expectedSoulIntentRevision": view.soul_intent_revision,
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = response.status();
+    let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    (status, serde_json::from_slice(&bytes).unwrap())
+}
+
+async fn automatic_view(registry: &Registry, soul: &RuntimeView) -> ViewIntent {
+    registry
+        .upsert_view_intent(UpsertViewIntentRequest {
+            soul_id: soul.soul_id.clone(),
+            view_id: None,
+            intent: ViewIntentRequest::default(),
+            expected_revision: None,
+            expected_soul_intent_revision: soul.intent_revision,
+            expected_control_epoch: None,
+        })
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn stopped_hidden_view_satisfies_stale_detach_without_mutating_new_authority() {
+    let temp = tempfile::tempdir().unwrap();
+    let (registry, before) = fixture_soul(temp.path(), false).await;
+    let frozen = automatic_view(&registry, &before).await;
+    let backend = Arc::new(StopBackend::default());
+    let (socket, control) = start_control(temp.path(), registry.clone(), backend).await;
+    let web = web_router(&socket, temp.path()).await;
+    let (status, stopped) = stop(&web, &before, before.intent_revision).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(stopped["outcome"], "verified_empty");
+    let hidden = registry.inventory_snapshot().await.unwrap().view_intents[0].clone();
+    assert_eq!(hidden.visibility, ViewVisibilityIntent::Hidden);
+    assert!(hidden.revision > frozen.revision);
+    assert!(hidden.soul_intent_revision > frozen.soul_intent_revision);
+
+    // Ordinary pane close and tab Shift-close still carry the pre-kill
+    // projection until the inventory broadcast reaches that browser.
+    for _ in 0..2 {
+        let (status, body) =
+            set_view_visibility(&web, &frozen, ViewVisibilityIntent::Detached).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(serde_json::from_value::<ViewIntent>(body).unwrap(), hidden);
+        assert_eq!(
+            registry.inventory_snapshot().await.unwrap().view_intents[0],
+            hidden
+        );
+    }
+    let mut future = hidden.clone();
+    future.revision += 1;
+    let (status, _) = set_view_visibility(&web, &future, ViewVisibilityIntent::Detached).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    future.revision = hidden.revision;
+    future.soul_intent_revision += 1;
+    let (status, _) = set_view_visibility(&web, &future, ViewVisibilityIntent::Detached).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    // A stale visible write still cannot reopen a stopped view.
+    let (status, _) = set_view_visibility(&web, &frozen, ViewVisibilityIntent::Visible).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    // A newer explicit visible view is authority even while stopped.
+    let (status, _) = set_view_visibility(&web, &hidden, ViewVisibilityIntent::Visible).await;
+    assert_eq!(status, StatusCode::OK);
+    let visible = registry.inventory_snapshot().await.unwrap().view_intents[0].clone();
+    let (status, _) = set_view_visibility(&web, &frozen, ViewVisibilityIntent::Detached).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(
+        registry.inventory_snapshot().await.unwrap().view_intents[0],
+        visible
+    );
+    control.abort();
+    let _ = control.await;
+}
+
+#[tokio::test]
+async fn stale_detach_cannot_close_running_or_cleanup_unconfirmed_views() {
+    let temp = tempfile::tempdir().unwrap();
+    let (registry, before) = fixture_soul(temp.path(), false).await;
+    let frozen = automatic_view(&registry, &before).await;
+    let backend = Arc::new(StopBackend::default());
+    let (socket, control) = start_control(temp.path(), registry.clone(), backend.clone()).await;
+    let web = web_router(&socket, temp.path()).await;
+    let (status, _) = set_view_visibility(&web, &frozen, ViewVisibilityIntent::Visible).await;
+    assert_eq!(status, StatusCode::OK);
+    let newer = registry.inventory_snapshot().await.unwrap().view_intents[0].clone();
+    let (status, _) = set_view_visibility(&web, &frozen, ViewVisibilityIntent::Detached).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(
+        registry.inventory_snapshot().await.unwrap().view_intents[0],
+        newer
+    );
+    backend.uncertain.store(true, Ordering::SeqCst);
+    let (status, stopped) = stop(&web, &before, before.intent_revision).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(stopped["outcome"], "termination_unconfirmed");
+    let hidden = registry.inventory_snapshot().await.unwrap().view_intents[0].clone();
+    assert_eq!(hidden.visibility, ViewVisibilityIntent::Hidden);
+    let (status, _) = set_view_visibility(&web, &frozen, ViewVisibilityIntent::Detached).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(
+        registry.inventory_snapshot().await.unwrap().view_intents[0],
+        hidden
+    );
+    control.abort();
+    let _ = control.await;
+}
+
 #[tokio::test]
 async fn restored_web_stops_persisted_lost_soul_only_after_verified_cleanup() {
     let temp = tempfile::tempdir().unwrap();

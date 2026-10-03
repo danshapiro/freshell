@@ -538,6 +538,27 @@ impl Registry {
                 params![current.soul_id.as_str()],
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )?;
+            // A successful kill hides the automatic view and advances both
+            // fences before its inventory broadcast reaches the browser.
+            // An older detach can acknowledge that already-closed view;
+            // it must not mutate a newer visible view or trust stop intent
+            // before the owned runtime has been verified empty.
+            if visibility == ViewVisibilityIntent::Detached
+                && current.visibility == ViewVisibilityIntent::Hidden
+                && desired == "stopped"
+                && expected_revision <= current.revision
+                && expected_soul_intent_revision <= soul_revision
+            {
+                let verified_empty: bool = tx.query_row(
+                    "SELECT EXISTS (SELECT 1 FROM incarnations WHERE soul_id=?1) AND NOT EXISTS (SELECT 1 FROM incarnations WHERE soul_id=?1 AND (launch_state<>'stopped' OR cleanup_state<>'verified_empty'))",
+                    params![current.soul_id.as_str()],
+                    |row| row.get(0),
+                )?;
+                if verified_empty {
+                    tx.commit()?;
+                    return Ok(current);
+                }
+            }
             if current.revision != expected_revision {
                 return Err(RegistryError::StaleIntentRevision {
                     expected: expected_revision,

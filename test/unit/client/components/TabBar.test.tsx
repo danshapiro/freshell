@@ -23,8 +23,9 @@ import {
 } from '@shared/settings'
 
 // Mock the ws-client module
-const { mockSend, wsMessageHandlers } = vi.hoisted(() => ({
+const { mockSend, wsMessageHandlers, mockManagedVisibility } = vi.hoisted(() => ({
   mockSend: vi.fn(),
+  mockManagedVisibility: vi.fn(),
   wsMessageHandlers: new Set<(msg: unknown) => void>(),
 }))
 vi.mock('@/lib/ws-client', () => ({
@@ -84,6 +85,7 @@ function ackAllPaneCloses() {
 
 // Mock the api module so the repo-icon meta probe thunk never hits the network
 vi.mock('@/lib/api', () => ({
+  updateManagedRuntimeViewVisibility: mockManagedVisibility,
   api: {
     get: vi.fn().mockRejectedValue(new Error('no server in tests')),
     post: vi.fn(),
@@ -271,6 +273,7 @@ function renderWithStore(
 describe('TabBar', () => {
   beforeEach(() => {
     mockSend.mockClear()
+    mockManagedVisibility.mockReset()
   })
 
   afterEach(() => {
@@ -792,6 +795,39 @@ describe('TabBar', () => {
       await waitFor(() => {
         expect(store.getState().tabs.tabs).toEqual([])
       })
+    })
+
+    it('Shift-closes a managed terminal when kill hides its view before the inventory update', async () => {
+      const node: PaneNode = {
+        type: 'leaf', id: 'managed-terminal-pane',
+        content: {
+          kind: 'terminal', mode: 'codex', status: 'running',
+          createRequestId: 'managed-terminal-create', terminalId: 'managed-terminal',
+          soulId: 'managed-terminal-soul', viewIntentId: 'managed-terminal-view',
+          viewIntentRevision: 2, soulIntentRevision: 7,
+        },
+      }
+      const store = createStore(
+        { tabs: [createTab({ id: 'tab-1' })], activeTabId: 'tab-1' }, {},
+        { layouts: { 'tab-1': node }, activePane: { 'tab-1': node.id } },
+      )
+      let stopped = false
+      mockManagedVisibility.mockImplementation(async (viewId, visibility, revision, soulRevision) => {
+        expect(stopped).toBe(true)
+        expect([viewId, visibility, revision, soulRevision]).toEqual(['managed-terminal-view', 'detached', 2, 7])
+        return { viewId, soulId: 'managed-terminal-soul', visibility: 'hidden', revision: 3, soulIntentRevision: 8 }
+      })
+      renderWithStore(<TabBar />, store)
+      fireEvent.click(screen.getByTitle('Close (Shift+Click to kill)'), { shiftKey: true })
+      expect(mockManagedVisibility).not.toHaveBeenCalled()
+      stopped = true
+      ackAllTerminalKills()
+      await waitFor(() => expect(mockSend).toHaveBeenCalledWith(expect.objectContaining({ type: 'panes.closed' })))
+      expect(store.getState().panes.layouts['tab-1']).toEqual(node)
+      ackAllPaneCloses()
+      await waitFor(() => expect(store.getState().tabs.tabs).toEqual([]))
+      expect(store.getState().panes.layouts['tab-1']).toBeUndefined()
+      expect(mockManagedVisibility).toHaveBeenCalledTimes(1)
     })
 
     // b8ke ext r20 F2: the shift-close kill of a session-backed pane
