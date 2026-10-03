@@ -302,6 +302,8 @@ export type FreshAgentPaneContent = {
   restoreError?: RestoreError
   initialCwd?: string
   createError?: FreshAgentCreateError
+  /** Volatile close failure, shown in the pane's dismissible yellow error banner. */
+  closeError?: string
   modelSelection?: FreshAgentModelSelection
   model?: string
   permissionMode?: string
