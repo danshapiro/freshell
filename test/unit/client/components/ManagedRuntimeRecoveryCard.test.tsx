@@ -31,13 +31,14 @@ describe('ManagedRuntimeRecoveryCard', () => {
     const onRetry = vi.fn().mockResolvedValue(undefined)
     render(
       <ManagedRuntimeRecoveryCard
-        recoverySummary={summary('blocked')}
+        recoverySummary={{ ...summary('blocked'), reason: 'STORE_UNREADABLE' }}
         onRetry={onRetry}
         onStartFresh={vi.fn()}
       />,
     )
 
     const alert = screen.getByRole('alert')
+    expect(alert).toHaveTextContent('Check that the saved conversation store is readable, then retry recovery.')
     expect(alert).toHaveClass('border-amber-500/50', 'bg-amber-500/10')
     expect(screen.getByRole('button', { name: 'Retry recovery' })).toBeInTheDocument()
     fireEvent.click(screen.getByRole('button', { name: 'Retry recovery' }))

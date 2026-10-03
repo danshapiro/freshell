@@ -2,7 +2,7 @@ import { configureStore } from '@reduxjs/toolkit'
 import { describe, expect, it } from 'vitest'
 import tabsReducer, { addTab, setActiveTab, updateTab } from '@/store/tabsSlice'
 import { handleUiCommand } from '@/lib/ui-commands'
-import panesReducer, { startNewManagedRuntimeConversation } from '@/store/panesSlice'
+import panesReducer, { startNewManagedRuntimeConversation, updatePaneContent } from '@/store/panesSlice'
 import managedRuntimeReducer from '@/store/managedRuntimeSlice'
 import {
   applyManagedRuntimeMergePlan,
@@ -286,6 +286,38 @@ describe('managed runtime recovery merge', () => {
       soulId: 'soul-one',
       viewIntentId: 'view-one',
     })
+  })
+
+  it('binds the newly launched Fresh Agent after start-new before native identity arrives', () => {
+    const state = baseState()
+    state.tabs.tabs[0].mode = 'freshcodex'
+    state.panes.layouts['user-tab'].content = {
+      kind: 'fresh-agent', createRequestId: 'old-create', status: 'error',
+      sessionType: 'freshcodex', provider: 'codex', sessionId: 'old-native',
+      sessionRef: { provider: 'codex', sessionId: 'old-native' },
+      soulId: 'old-soul', viewIntentId: 'old-view',
+    }
+    const store = storeWithState(state)
+    store.dispatch(startNewManagedRuntimeConversation({ tabId: 'user-tab', paneId: 'user-pane' }))
+    const restarted = store.getState().panes.layouts['user-tab'].content
+    store.dispatch(updatePaneContent({ tabId: 'user-tab', paneId: 'user-pane', content: {
+      ...restarted, sessionId: 'fresh-runtime-id', status: 'connected',
+    } }))
+    const inventory = snapshot([soul({
+      provider: 'codex', nativeSessionId: undefined, freshAgentSessionId: 'fresh-runtime-id',
+      freshAgentSessionType: 'freshcodex', terminalId: undefined,
+      terminalCreateRequestId: undefined, terminalMode: undefined,
+    })])
+    const plan = buildManagedRuntimeMergePlan(inventory, store.getState() as any)
+    expect(plan.creates).toHaveLength(0)
+    expect(plan.updates).toHaveLength(1)
+    applyManagedRuntimeMergePlan(store as any, plan)
+    expect(store.getState().tabs.tabs).toHaveLength(1)
+    expect(store.getState().panes.layouts['user-tab'].content).toMatchObject({
+      kind: 'fresh-agent', createRequestId: restarted.createRequestId,
+      sessionId: 'fresh-runtime-id', soulId: 'soul-one', viewIntentId: 'view-one',
+    })
+    expect(store.getState().panes.layouts['user-tab'].content.sessionRef).toBeUndefined()
   })
 
   it('does not adopt an unrelated pane that merely lacks a terminal id', () => {
