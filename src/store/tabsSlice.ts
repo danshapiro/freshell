@@ -1150,16 +1150,17 @@ async function detachManagedViews(
   return true
 }
 
+// A view-update failure must not be described as a close-evidence failure.
 function surfaceManagedViewDetachFailure(
   dispatch: (action: unknown) => void,
   tabId: string,
-  projections: FrozenManagedViewProjection[],
+  panes: ReadonlyArray<{ paneId: string }>,
 ) {
-  for (const projection of projections) {
+  for (const pane of panes) {
     dispatch(setPaneCloseError({
       tabId,
-      paneId: projection.paneId,
-      error: PANE_CLOSE_FAILED_MESSAGE,
+      paneId: pane.paneId,
+      error: 'The pane could not be closed, so it was left open. Try again.',
     }))
   }
 }
@@ -1358,11 +1359,7 @@ export const closePaneWithCleanup = createAsyncThunk(
       }
       if (managedViews.length > 0 && !await detachManagedViews(managedViews, tabId, getState)) {
         log.warn('managed view detach was not confirmed; the pane stays', { tabId, paneId })
-        if (identity.length > 0) {
-          surfacePaneCloseFailures(dispatch, tabId, identity.map((item) => ({ identity: item, timedOut: false })))
-        } else {
-          surfaceManagedViewDetachFailure(dispatch, tabId, managedViews)
-        }
+        surfaceManagedViewDetachFailure(dispatch, tabId, identity.length > 0 ? identity : managedViews)
         reassertKeptPanesOpen((getState() as RootState).panes.layouts[tabId], tabId, identity)
         return
       }
@@ -1477,11 +1474,7 @@ export const closeTab = createAsyncThunk(
       }
       if (managedViews.length > 0 && !await detachManagedViews(managedViews, tabId, getState)) {
         log.warn('managed view detach was not confirmed; the tab stays', { tabId })
-        if (identities.length > 0) {
-          surfacePaneCloseFailures(dispatch, tabId, identities.map((identity) => ({ identity, timedOut: false })))
-        } else {
-          surfaceManagedViewDetachFailure(dispatch, tabId, managedViews)
-        }
+        surfaceManagedViewDetachFailure(dispatch, tabId, identities.length > 0 ? identities : managedViews)
         reassertKeptPanesOpen((getState() as RootState).panes.layouts[tabId], tabId, identities)
         return
       }
@@ -1647,11 +1640,7 @@ export const replacePaneWithCleanup = createAsyncThunk(
       }
       if (managedViews.length > 0 && !await detachManagedViews(managedViews, tabId, getState)) {
         log.warn('managed view detach was not confirmed; the pane keeps its content', { tabId, paneId })
-        if (identity.length > 0) {
-          surfacePaneCloseFailures(dispatch, tabId, identity.map((item) => ({ identity: item, timedOut: false })))
-        } else {
-          surfaceManagedViewDetachFailure(dispatch, tabId, managedViews)
-        }
+        surfaceManagedViewDetachFailure(dispatch, tabId, identity.length > 0 ? identity : managedViews)
         reassertKeptPanesOpen((getState() as RootState).panes.layouts[tabId], tabId, identity)
         return
       }
