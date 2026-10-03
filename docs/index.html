@@ -737,14 +737,12 @@ body { background: hsl(var(--background)); color: hsl(var(--foreground)); transi
           <span class="tab-label">Fresh Agent</span>
           <span class="tab-close"><i data-lucide="x" class="icon-xs"></i></span>
         </div>
-        <!-- Durable Souls: agents the supervisor recovered before any browser
-             connected arrive in a Recovered agents group. They appear without
-             stealing focus; closing a view is not stopping the agent. -->
+        <!-- Existing agent panes keep their conversations and placement. -->
         <div class="tab" data-tab="recovered">
           <span class="tab-icons">
-            <i data-lucide="life-buoy" class="icon-xs"></i>
+            <i data-lucide="terminal" class="icon-xs"></i>
           </span>
-          <span class="tab-label">Recovered agents</span>
+          <span class="tab-label">Agents</span>
           <span class="tab-close"><i data-lucide="x" class="icon-xs"></i></span>
         </div>
         <!-- Arrow buttons (< >) appear at edges when tabs overflow. Not shown in this mock since tabs fit. -->
@@ -844,14 +842,11 @@ body { background: hsl(var(--background)); color: hsl(var(--foreground)); transi
       </div>
 
       <!-- Claude Code -->
-      <!-- Durable Souls: agents the supervisor recovered before any browser
-           connected. Each keeps its exact conversation; a blocked one stays
-           visible and honest instead of becoming a blank fresh session. -->
+      <!-- A blocked agent keeps its conversation and asks for intervention. -->
       <div class="tab-panel" id="panel-recovered">
         <div class="split-h">
           <div class="pane" style="flex:.5">
-            <div class="pane-header active"><i data-lucide="terminal" class="icon"></i><span class="pane-header-title">OpenCode — recovered</span><span class="pane-header-meta">~/code/freshell</span><div class="pane-btns"><span class="pane-btn"><i data-lucide="maximize-2" class="icon-xs"></i></span><span class="pane-btn"><i data-lucide="x" class="icon-xs"></i></span></div></div>
-            <div class="terminal-inline-status">Ready — resumed the same session after a server restart.</div>
+            <div class="pane-header active"><i data-lucide="terminal" class="icon"></i><span class="pane-header-title">OpenCode</span><span class="pane-header-meta">~/code/freshell</span><div class="pane-btns"><span class="pane-btn"><i data-lucide="maximize-2" class="icon-xs"></i></span><span class="pane-btn"><i data-lucide="x" class="icon-xs"></i></span></div></div>
             <div class="terminal" id="term-recovered"></div>
           </div>
           <div class="divider-v"><div class="dots"><span></span><span></span><span></span></div></div>
