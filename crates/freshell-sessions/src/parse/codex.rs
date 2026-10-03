@@ -398,11 +398,19 @@ pub fn parse_codex_session_content(content: &str) -> ParsedSessionMeta {
             .and_then(|p| p.get("role"))
             .and_then(Value::as_str);
 
-        if ty == Some("response_item")
-            && payload_type == Some("message")
-            && payload_role == Some("user")
-        {
-            let text = extract_text_content(obj.get("payload").and_then(|p| p.get("content")));
+        let user_message_text = match (ty, payload_type, payload_role) {
+            (Some("response_item"), Some("message"), Some("user")) => Some(extract_text_content(
+                obj.get("payload").and_then(|p| p.get("content")),
+            )),
+            (Some("event_msg"), Some("user_message"), _) => obj
+                .get("payload")
+                .and_then(|p| p.get("message"))
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            _ => None,
+        };
+
+        if let Some(text) = user_message_text {
             let user_text = extract_user_authored_text(&text);
             if first_user_message.is_none() {
                 if let Some(ut) = &user_text {

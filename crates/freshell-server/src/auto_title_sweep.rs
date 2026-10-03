@@ -31,7 +31,7 @@ pub struct AutoTitleSweepState {
     pub registry: freshell_terminal::TerminalRegistry,
     pub broadcast_tx: Arc<tokio::sync::broadcast::Sender<String>>,
     pub sessions_revision: Arc<AtomicI64>,
-    pub ai_key: crate::ai_title::AiKeyCell,
+    pub auth: crate::ai_title::GeminiSessionNameAuth,
     pub gemini: Arc<dyn crate::ai_title::GeminiTransport>,
     /// Node's module-level `pendingAiTitles` set (`server/index.ts:866`):
     /// at most ONE in-flight Gemini call per `provider:sessionId` key.
@@ -385,7 +385,7 @@ async fn refresh_terminal_meta(
 pub async fn run_auto_title_pass(state: &AutoTitleSweepState, sessions: &[SweepSession]) -> bool {
     use crate::auto_title::{compute_session_title_sync, SessionTerminal};
     let settings = state.settings.get().await; // hoisted, like server/index.ts:878
-    let ai_will_auto_name = state.ai_key.enabled() && settings.sidebar.auto_generate_titles;
+    let ai_will_auto_name = state.auth.enabled() && settings.sidebar.auto_generate_titles;
     let overrides = state.settings.session_overrides(); // freshness-reloading read
     let mut changed = false;
 
@@ -901,7 +901,9 @@ mod tests {
             registry: freshell_terminal::TerminalRegistry::new(),
             broadcast_tx: std::sync::Arc::new(tx),
             sessions_revision: std::sync::Arc::new(std::sync::atomic::AtomicI64::new(0)),
-            ai_key: crate::ai_title::AiKeyCell::init(ai_key.map(str::to_string), None),
+            auth: crate::ai_title::GeminiSessionNameAuth::direct_for_test(
+                crate::ai_title::AiKeyCell::init(ai_key.map(str::to_string), None),
+            ),
             gemini: std::sync::Arc::new(FakeGemini(Ok("AI Title".into()))),
             pending_ai_titles: Default::default(),
             terminal_meta: Default::default(),

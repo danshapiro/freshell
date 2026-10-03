@@ -95,6 +95,7 @@ installers/*
 !installers/systemd/
 installers/systemd/*
 !installers/systemd/freshell-rust.service
+!installers/systemd/freshell-supervisor.service
 
 # Distribution guard fixtures are checked in and needed by the default
 # Cloud Run lane. Re-include only the six controls; sibling dist/node_modules

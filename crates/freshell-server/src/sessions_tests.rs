@@ -13,9 +13,11 @@ fn state(dir: &std::path::Path) -> super::SessionsState {
         broadcast_tx: std::sync::Arc::new(tx),
         terminals_revision: std::sync::Arc::new(std::sync::atomic::AtomicI64::new(0)),
         sessions_revision: std::sync::Arc::new(std::sync::atomic::AtomicI64::new(0)),
+        name_auth: crate::ai_title::GeminiSessionNameAuth::direct_for_test(
+            crate::ai_title::AiKeyCell::init(None, None),
+        ),
         // AI disabled by default; tests that exercise the AI branch
         // overwrite these fields (the no-key path never touches gemini).
-        ai_key: crate::ai_title::AiKeyCell::init(None, None),
         gemini: std::sync::Arc::new(FakeGemini(Err("unused in default test state".into()))),
         metadata: crate::session_metadata::SessionMetadataStore::new(dir.join(".freshell")),
         index: None,
@@ -692,7 +694,9 @@ async fn patch_override_is_visible_through_session_directory_overlay() {
         broadcast_tx: std::sync::Arc::new(tx),
         terminals_revision: std::sync::Arc::new(std::sync::atomic::AtomicI64::new(0)),
         sessions_revision: std::sync::Arc::new(std::sync::atomic::AtomicI64::new(0)),
-        ai_key: crate::ai_title::AiKeyCell::init(None, None),
+        name_auth: crate::ai_title::GeminiSessionNameAuth::direct_for_test(
+            crate::ai_title::AiKeyCell::init(None, None),
+        ),
         gemini: std::sync::Arc::new(FakeGemini(Err("unused in default test state".into()))),
         metadata: crate::session_metadata::SessionMetadataStore::new(home.join(".freshell")),
         index: None,
@@ -1001,7 +1005,9 @@ async fn deleted_session_disappears_from_session_directory_overlay() {
         broadcast_tx: std::sync::Arc::new(tx),
         terminals_revision: std::sync::Arc::new(std::sync::atomic::AtomicI64::new(0)),
         sessions_revision: std::sync::Arc::new(std::sync::atomic::AtomicI64::new(0)),
-        ai_key: crate::ai_title::AiKeyCell::init(None, None),
+        name_auth: crate::ai_title::GeminiSessionNameAuth::direct_for_test(
+            crate::ai_title::AiKeyCell::init(None, None),
+        ),
         gemini: std::sync::Arc::new(FakeGemini(Err("unused in default test state".into()))),
         metadata: crate::session_metadata::SessionMetadataStore::new(home.join(".freshell")),
         index: None,
@@ -1140,7 +1146,9 @@ async fn post_generate_title(
 async fn generate_title_uses_gemini_when_key_present_and_broadcasts_sessions_changed() {
     let dir = tempfile::tempdir().unwrap();
     let mut st = state(dir.path());
-    st.ai_key = crate::ai_title::AiKeyCell::init(Some("k".into()), None);
+    st.name_auth = crate::ai_title::GeminiSessionNameAuth::direct_for_test(
+        crate::ai_title::AiKeyCell::init(Some("k".into()), None),
+    );
     st.gemini = std::sync::Arc::new(FakeGemini(Ok("  Sardine crash investigation  ".into())));
     let mut rx = st.broadcast_tx.subscribe();
     let sid = uuid_like();
@@ -1174,7 +1182,9 @@ async fn generate_title_uses_gemini_when_key_present_and_broadcasts_sessions_cha
 async fn kilroy_generate_title_keeps_the_retained_server_side_ai_titling() {
     let dir = tempfile::tempdir().unwrap();
     let mut st = state(dir.path());
-    st.ai_key = crate::ai_title::AiKeyCell::init(Some("k".into()), None);
+    st.name_auth = crate::ai_title::GeminiSessionNameAuth::direct_for_test(
+        crate::ai_title::AiKeyCell::init(Some("k".into()), None),
+    );
     st.gemini = std::sync::Arc::new(FakeGemini(Ok("Kilroy AI Title".into())));
     st.metadata
         .set("claude", "s-kilroy-gen", "kilroy", Some("explicit"))
@@ -1216,7 +1226,9 @@ async fn kilroy_generate_title_keeps_the_retained_server_side_ai_titling() {
 async fn generate_title_gemini_error_returns_200_none_with_error_and_no_write() {
     let dir = tempfile::tempdir().unwrap();
     let mut st = state(dir.path());
-    st.ai_key = crate::ai_title::AiKeyCell::init(Some("k".into()), None);
+    st.name_auth = crate::ai_title::GeminiSessionNameAuth::direct_for_test(
+        crate::ai_title::AiKeyCell::init(Some("k".into()), None),
+    );
     st.gemini = std::sync::Arc::new(FakeGemini(Err("boom".into())));
     let sid = uuid_like();
     let body = body_json(post_generate_title(&st, &format!("gemini:{sid}"), "hello").await).await;
@@ -1237,7 +1249,9 @@ async fn generate_title_after_user_rename_is_still_ladder_blocked_for_ai() {
     // the RETAINED ladder runs on an excluded provider.
     let dir = tempfile::tempdir().unwrap();
     let mut st = state(dir.path());
-    st.ai_key = crate::ai_title::AiKeyCell::init(Some("k".into()), None);
+    st.name_auth = crate::ai_title::GeminiSessionNameAuth::direct_for_test(
+        crate::ai_title::AiKeyCell::init(Some("k".into()), None),
+    );
     st.gemini = std::sync::Arc::new(FakeGemini(Ok("AI Title".into())));
     let sid = uuid_like();
     st.settings
@@ -1276,7 +1290,9 @@ async fn generate_title_provider_generated_short_circuits_without_write() {
     std::fs::copy(&fixture, project.join("real-corrupted.jsonl")).unwrap();
 
     let mut st = state(&home);
-    st.ai_key = crate::ai_title::AiKeyCell::init(Some("k".into()), None);
+    st.name_auth = crate::ai_title::GeminiSessionNameAuth::direct_for_test(
+        crate::ai_title::AiKeyCell::init(Some("k".into()), None),
+    );
     st.gemini = std::sync::Arc::new(FakeGemini(Ok("AI Title".into())));
     st.index = Some(std::sync::Arc::new(
         freshell_sessions::directory_index::SessionIndex::with_ttl_and_cache_path(

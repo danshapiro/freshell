@@ -26,7 +26,7 @@ use freshell_protocol::session_names::{
 use serde_json::Value;
 
 use super::{GenerationOutcome, IndexedNameInput, SessionNameGenerator};
-use crate::ai_title::{AiKeyCell, BoxFuture, GeminiHttp, GeminiTransport};
+use crate::ai_title::{AiKeyCell, BoxFuture, GeminiHttp, GeminiSessionNameHttp, GeminiTransport};
 use crate::session_name_native::{
     NativeCallResult, NativeFuture, NativeNameAttempt, NativeNameBackend, NativeNameReadback,
     NativeNameTarget, NativeProbeFuture, SessionNameWorker,
@@ -314,7 +314,10 @@ fn generator_with(
 ) -> Arc<SessionNameGenerator> {
     Arc::new(SessionNameGenerator::new(
         settings_for(dir),
-        AiKeyCell::init(key.map(str::to_string), None),
+        crate::ai_title::GeminiSessionNameAuth::direct_for_test(AiKeyCell::init(
+            key.map(str::to_string),
+            None,
+        )),
         transport,
     ))
 }
@@ -379,6 +382,59 @@ impl GatedHttpGemini {
 
     fn release(&self) {
         let _ = self.open.send(true);
+    }
+}
+
+struct OneCliFallbackGemini {
+    base_url: String,
+    observed_fallback_headers: Arc<Mutex<Vec<bool>>>,
+}
+
+async fn start_onecli_fallback_gemini() -> OneCliFallbackGemini {
+    use axum::body::Body;
+    use axum::routing::post;
+    use axum::{http::Response, Router};
+
+    let observed_fallback_headers = Arc::new(Mutex::new(Vec::new()));
+    let observed = Arc::clone(&observed_fallback_headers);
+    let requests = Arc::new(AtomicU32::new(0));
+    let request_count = Arc::clone(&requests);
+    let app = Router::new().route(
+        "/v1beta/models/gemini-3.5-flash-lite:generateContent",
+        post(move |headers: axum::http::HeaderMap| {
+            let observed = Arc::clone(&observed);
+            let request_count = Arc::clone(&request_count);
+            async move {
+                observed.lock().unwrap().push(
+                    headers
+                        .get("x-goog-api-key")
+                        .and_then(|value| value.to_str().ok())
+                        == Some("worker-fallback-sentinel"),
+                );
+                let response_number = request_count.fetch_add(1, Ordering::SeqCst);
+                let (status, body) = if response_number == 0 {
+                    (
+                        axum::http::StatusCode::UNAUTHORIZED,
+                        r#"{"error":"credential_not_found"}"#,
+                    )
+                } else {
+                    (
+                        axum::http::StatusCode::OK,
+                        r#"{"candidates":[{"content":{"parts":[{"text":"Sardine crash investigation"}]}}]}"#,
+                    )
+                };
+                let mut response = Response::new(Body::from(body));
+                *response.status_mut() = status;
+                response
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    OneCliFallbackGemini {
+        base_url: format!("http://{addr}/v1beta"),
+        observed_fallback_headers,
     }
 }
 
@@ -577,7 +633,10 @@ async fn releasing_the_gated_http_fixture_saves_a_short_ai_name() {
     let fixture = start_gated_http_gemini("Sardine crash investigation").await;
     let generator = Arc::new(SessionNameGenerator::new(
         settings_for(dir.path()),
-        AiKeyCell::init(Some("gen-key".to_string()), None),
+        crate::ai_title::GeminiSessionNameAuth::direct_for_test(AiKeyCell::init(
+            Some("gen-key".to_string()),
+            None,
+        )),
         fixture.transport("gen-key"),
     ));
     let target = pending("h-http");
@@ -650,6 +709,74 @@ async fn releasing_the_gated_http_fixture_saves_a_short_ai_name() {
         .native_sync
         .expect("the accepted AI name projects a native series");
     assert_eq!(sync.desired_revision, interim.record.revision + 1);
+}
+
+/// The real worker uses the session-name transport's explicit OneCLI
+/// missing-credential fallback and persists the generated title through the
+/// normal durable name-store path.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn onecli_missing_credential_worker_fallback_saves_ai_name() {
+    let dir = temp_data_dir();
+    let store = open_store(dir.path());
+    let fixture = start_onecli_fallback_gemini().await;
+    let auth = crate::ai_title::GeminiSessionNameAuth::onecli_for_test(AiKeyCell::init(
+        Some("worker-fallback-sentinel".to_string()),
+        None,
+    ));
+    let client = reqwest::Client::builder().no_proxy().build().unwrap();
+    let transport = Arc::new(GeminiSessionNameHttp::new(
+        client,
+        auth.clone(),
+        fixture.base_url.clone(),
+    ));
+    let generator = Arc::new(SessionNameGenerator::new(
+        settings_for(dir.path()),
+        auth,
+        transport,
+    ));
+    let target = pending("h-onecli-fallback");
+    ensure_pending(
+        &store,
+        "h-onecli-fallback",
+        NamedProvider::Claude,
+        Some("/w/onecli-fallback"),
+    )
+    .await
+    .expect("ensure");
+    arm_with_message(
+        &store,
+        target.clone(),
+        "freshclaude",
+        "Investigate the crash",
+    )
+    .await;
+
+    let worker = SessionNameWorker::start(
+        Arc::clone(&store),
+        Arc::new(NoRouteNative),
+        Arc::clone(&generator),
+    );
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        if let Some(update) = get_one(&store, target.clone()).await {
+            if update.record.source == NameSource::FreshellAi {
+                assert_eq!(update.record.name, "Sardine crash investigation");
+                break;
+            }
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the worker must save the fallback answer"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    worker.abort();
+
+    assert_eq!(
+        *fixture.observed_fallback_headers.lock().unwrap(),
+        vec![false, true],
+        "the worker makes one keyless OneCLI request and one direct-key fallback"
+    );
 }
 
 /// A provider-authored title never suppresses generation: it lands at its
@@ -1274,7 +1401,7 @@ async fn capability_pause_consumes_nothing_and_resumes_on_the_wake() {
     let generation_transport = CountingTransport::new("Woke AI name");
     let generator = Arc::new(SessionNameGenerator::new(
         settings_for(dir.path()),
-        cell.clone(),
+        crate::ai_title::GeminiSessionNameAuth::direct_for_test(cell.clone()),
         generation_transport.clone(),
     ));
 
@@ -2353,7 +2480,10 @@ async fn the_worker_alternates_native_and_generation_under_sustained_native_requ
 
     let generator = Arc::new(SessionNameGenerator::new(
         settings_for(dir.path()),
-        AiKeyCell::init(Some("alt-key".to_string()), None),
+        crate::ai_title::GeminiSessionNameAuth::direct_for_test(AiKeyCell::init(
+            Some("alt-key".to_string()),
+            None,
+        )),
         Arc::new(LoggingGeneration {
             order: Arc::clone(&order),
         }),
@@ -2463,7 +2593,11 @@ async fn run_worker_child_role(role: &str, dir: &Path) {
         "failing_worker" => (FailingTransport::new(), Arc::new(NoRouteNative)),
         other => panic!("unknown child role {other}"),
     };
-    let generator = Arc::new(SessionNameGenerator::new(settings, cell, transport));
+    let generator = Arc::new(SessionNameGenerator::new(
+        settings,
+        crate::ai_title::GeminiSessionNameAuth::direct_for_test(cell),
+        transport,
+    ));
     let worker = SessionNameWorker::start(store, native, generator);
     let deadline = std::time::Instant::now() + Duration::from_secs(120);
     while !stop_path.exists() {

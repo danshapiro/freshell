@@ -1,6 +1,7 @@
 import { test } from '../helpers/fixtures.js'
 import {
   activityGeneratesOneSharedShortName,
+  activityGeneratesOneSharedShortNameViaOneCliProxy,
   everyApplicableRenameEntryConverges,
   manualNameSurvivesLateGenerationAndSwitch,
   pendingNameSurvivesMaterializeAndReopen,
@@ -19,6 +20,10 @@ import {
 test.setTimeout(360_000)
 
 test.describe('[freshcodex] unified agent names', () => {
+  test('activity uses the OneCLI route before the direct fallback key', async ({ browser }) => {
+    await activityGeneratesOneSharedShortNameViaOneCliProxy('freshcodex', browser)
+  })
+
   test('activity generates one shared short name', async ({ browser }) => {
     await activityGeneratesOneSharedShortName('freshcodex', browser)
   })

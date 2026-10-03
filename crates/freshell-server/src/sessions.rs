@@ -63,13 +63,13 @@ pub struct SessionsState {
     /// every `codingCliIndexer.refresh()` call, which the legacy PATCH
     /// route always triggers.
     pub sessions_revision: Arc<std::sync::atomic::AtomicI64>,
-    /// Task 6: the process-local Gemini key cell -- `generate_title` gates its
-    /// AI branch on key presence ONLY, never on
+    /// Session-name credential capability -- `generate_title` gates its AI
+    /// branch on an applicable OneCLI route or direct key ONLY, never on
     /// `settings.sidebar.autoGenerateTitles` (that gate belongs exclusively to
     /// the background sweep; real Node asymmetry, Scope Decision 7,
     /// `sessions-router.ts:181-184`).
-    pub ai_key: crate::ai_title::AiKeyCell,
-    /// Trait-injected Gemini transport (same seam as
+    pub name_auth: crate::ai_title::GeminiSessionNameAuth,
+    /// Session-name Gemini transport (same seam as
     /// `AutoTitleSweepState.gemini`) so tests fake the wire -- no live calls.
     pub gemini: Arc<dyn crate::ai_title::GeminiTransport>,
     /// Delta-review round 4, finding 1: the SESSION-06 metadata store —
@@ -675,7 +675,7 @@ async fn generate_title(
         }
     }
 
-    if !state.ai_key.enabled() {
+    if !state.name_auth.enabled() {
         // (2) AI disabled: the first-message heuristic (`sessions-router.ts:196-209`).
         let heuristic = extract_title_from_message(first_message, 50);
         if heuristic.is_empty() {

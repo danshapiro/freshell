@@ -961,18 +961,33 @@ async fn main() -> ExitCode {
         .get("FRESHELL_GEMINI_BASE_URL")
         .filter(|v| !v.is_empty())
         .unwrap_or_else(|| ai_title::GEMINI_DEFAULT_BASE_URL.to_string());
-    let gemini: std::sync::Arc<dyn ai_title::GeminiTransport> = std::sync::Arc::new(
-        ai_title::GeminiHttp::new(reqwest::Client::new(), ai_key.clone(), gemini_base_url),
-    );
+    let gemini: std::sync::Arc<dyn ai_title::GeminiTransport> =
+        std::sync::Arc::new(ai_title::GeminiHttp::new(
+            reqwest::Client::new(),
+            ai_key.clone(),
+            gemini_base_url.clone(),
+        ));
+    // Session naming alone uses the OneCLI proxy credential route when the
+    // effective reqwest proxy is marked as OneCLI. The generic transport above
+    // remains direct-key-only for summaries and other AI features.
+    let session_name_auth =
+        ai_title::GeminiSessionNameAuth::from_environment(ai_key.clone(), &gemini_base_url);
+    let session_name_gemini: std::sync::Arc<dyn ai_title::GeminiTransport> =
+        std::sync::Arc::new(ai_title::GeminiSessionNameHttp::new(
+            reqwest::Client::new(),
+            session_name_auth.clone(),
+            gemini_base_url,
+        ));
     // Unified agent names (Task 4): the generation participant of the ONE
     // shared serial naming worker — execution only, never another loop.
-    // Capability (the naming toggle + the Gemini key) is checked before
-    // selection, so disabled naming pauses without consuming anything.
+    // Capability (the naming toggle + the OneCLI/direct credential route) is
+    // checked before selection, so disabled naming pauses without consuming
+    // anything.
     let session_name_generator =
         std::sync::Arc::new(session_name_generation::SessionNameGenerator::new(
             settings_store.clone(),
-            ai_key.clone(),
-            gemini.clone(),
+            session_name_auth.clone(),
+            session_name_gemini.clone(),
         ));
 
     // The shared server→client broadcast bus (pre-serialized frames). REST handlers
@@ -2589,8 +2604,8 @@ async fn main() -> ExitCode {
                 registry: registry.clone(),
                 broadcast_tx: Arc::clone(&broadcast_tx),
                 sessions_revision: Arc::clone(&sessions_revision),
-                ai_key: ai_key.clone(),
-                gemini: gemini.clone(),
+                auth: session_name_auth.clone(),
+                gemini: session_name_gemini.clone(),
                 pending_ai_titles: Default::default(),
                 // Task 18: the SAME registry `ws_state.terminal_meta` holds,
                 // so the sweep's meta refresh feeds the handshake + broadcasts.
@@ -3099,9 +3114,9 @@ async fn main() -> ExitCode {
         ))
         .merge(network::router(network_state))
         .merge(session_directory::router(session_directory_state))
-        // Task 7: `POST /api/ai/terminals/:terminalId/summary` — the SAME key
-        // cell / Gemini transport the sweep and generate-title use, plus the
-        // shared terminal registry for the scrollback snapshot.
+        // Task 7: `POST /api/ai/terminals/:terminalId/summary` keeps the
+        // generic direct-key Gemini transport, plus the shared terminal
+        // registry for the scrollback snapshot.
         .merge(ai_router::router(ai_router::AiRouterState {
             auth_token: Arc::clone(&auth_token),
             registry: registry.clone(),
@@ -3122,13 +3137,14 @@ async fn main() -> ExitCode {
             // unified sequence instead of drifting out of sync with the
             // sweep/fresh-agent producers.
             sessions_revision: Arc::clone(&sessions_revision),
-            // Task 6: the SAME key cell / Gemini transport the auto-title
-            // sweep uses (generate-title's AI branch gates on key presence
-            // ONLY -- never on `settings.sidebar.autoGenerateTitles`), plus
+            // Task 6: the SAME session-name auth / Gemini transport the
+            // auto-title sweep uses (generate-title's AI branch gates on
+            // credential-route availability ONLY -- never on
+            // `settings.sidebar.autoGenerateTitles`), plus
             // the shared session index for the provider-generated
             // short-circuit.
-            ai_key: ai_key.clone(),
-            gemini: gemini.clone(),
+            name_auth: session_name_auth.clone(),
+            gemini: session_name_gemini.clone(),
             // Delta-review round 4, finding 1: the same SESSION-06 metadata
             // store the sweep and the directory read — the kilroy-lane
             // seam's per-session `sessionType` discriminator for this

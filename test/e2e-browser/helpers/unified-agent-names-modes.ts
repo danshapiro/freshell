@@ -25,7 +25,9 @@ import {
   refreshHandle,
   sendFirstMessage,
   startFakeGemini,
+  startFakeOneCliGeminiProxy,
   type FakeGemini,
+  type FakeOneCliGeminiProxy,
   type NamedAgentHandle,
   type UnifiedNamesServer,
 } from './unified-agent-names.js'
@@ -59,17 +61,41 @@ export const AI_NAME = 'Sardine factory fix'
 export interface Journey {
   server: UnifiedNamesServer
   gemini: FakeGemini | null
+  oneCliGeminiProxy: FakeOneCliGeminiProxy | null
   cleanup: () => Promise<void>
 }
 
-export async function bootJourney(mode: UnifiedAgentMode, opts: { gemini?: FakeGemini | null; env?: Record<string, string>; setupHome?: (homeDir: string) => Promise<void> } = {}): Promise<Journey> {
-  const server = await bootUnifiedNamesServer({ mode, gemini: opts.gemini ?? null, env: opts.env, setupHome: opts.setupHome })
+export async function bootJourney(mode: UnifiedAgentMode, opts: {
+  gemini?: FakeGemini | null
+  oneCliGeminiProxy?: FakeOneCliGeminiProxy | null
+  directFallbackKey?: string
+  env?: Record<string, string>
+  setupHome?: (homeDir: string) => Promise<void>
+} = {}): Promise<Journey> {
+  const oneCliEnv = opts.oneCliGeminiProxy
+    ? {
+        FRESHELL_GEMINI_BASE_URL: 'http://generativelanguage.googleapis.com/v1beta',
+        HTTP_PROXY: opts.oneCliGeminiProxy.proxyUrl,
+        http_proxy: opts.oneCliGeminiProxy.proxyUrl,
+        NO_PROXY: '',
+        no_proxy: '',
+        GOOGLE_GENERATIVE_AI_API_KEY: opts.directFallbackKey ?? 'unified-names-direct-fallback-sentinel',
+      }
+    : {}
+  const server = await bootUnifiedNamesServer({
+    mode,
+    gemini: opts.gemini ?? null,
+    env: { ...oneCliEnv, ...(opts.env ?? {}) },
+    setupHome: opts.setupHome,
+  })
   return {
     server,
     gemini: opts.gemini ?? null,
+    oneCliGeminiProxy: opts.oneCliGeminiProxy ?? null,
     cleanup: async () => {
       await server.stop()
       await opts.gemini?.close().catch(() => {})
+      await opts.oneCliGeminiProxy?.close().catch(() => {})
     },
   }
 }
@@ -219,6 +245,44 @@ export async function activityGeneratesOneSharedShortName(mode: UnifiedAgentMode
       } finally {
         await journey.cleanup()
       }
+  }
+}
+
+export async function activityGeneratesOneSharedShortNameViaOneCliProxy(
+  mode: UnifiedAgentMode,
+  browser: Browser,
+): Promise<void> {
+  const expectedFirstMessage = 'Repair the sardine factory line'
+  const proxy = await startFakeOneCliGeminiProxy(AI_NAME, expectedFirstMessage)
+  const journey = await bootJourney(mode, {
+    oneCliGeminiProxy: proxy,
+    directFallbackKey: 'synthetic-direct-fallback-key',
+  })
+  try {
+    const { page, harness, context } = await connect(journey, browser)
+    let handle = await createNamedAgent(harness, mode, { entry: 'ui', page, server: journey.server })
+    await sendFirstMessage(page, harness, handle, mode, expectedFirstMessage)
+    handle = await refreshHandle(harness, handle, mode)
+    expect(handle.nameRef).toBeTruthy()
+    const durableSessionId = handle.sessionId
+      ?? (handle.nameRef?.kind === 'session' ? handle.nameRef.sessionId : undefined)
+    if (mode === 'freshcodex') {
+      expect(durableSessionId, 'the fresh Codex OneCLI journey needs a durable session ID for the sidebar assertion').toBeTruthy()
+    }
+
+    await expectSharedName(harness, handle.nameRef!, AI_NAME, {
+      page, server: journey.server, tabId: handle.tabId,
+      sessionId: mode === 'freshcodex' ? durableSessionId : handle.sessionId,
+    })
+    expect(proxy.requests).toEqual([{
+      destinationHostname: 'generativelanguage.googleapis.com',
+      path: '/v1beta/models/gemini-3.5-flash-lite:generateContent',
+      hasApiKey: false,
+      promptContainsExpectedFirstMessage: true,
+    }])
+    await context.close()
+  } finally {
+    await journey.cleanup()
   }
 }
 

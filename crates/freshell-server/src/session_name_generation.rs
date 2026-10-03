@@ -26,7 +26,8 @@
 //! document (short current-document transactions; the Gemini call itself
 //! happens OUTSIDE them); clock injection for the document's retry
 //! arithmetic is the store's data-dir-keyed test hook. A disabled naming
-//! toggle or a missing key pauses the work without consumption — the
+//! toggle or a missing OneCLI/direct credential route pauses the work without
+//! consumption — the
 //! worker's ≤500ms poll re-evaluates capability, so a pause is discovered
 //! and resumed within one poll of the capability arriving. The ONE
 //! explicit wake caller today is the scoped compatibility route
@@ -50,7 +51,7 @@ use uuid::Uuid;
 
 use freshell_protocol::session_names::SessionNameRef;
 
-use crate::ai_title::{self, AiKeyCell, GeminiTransport};
+use crate::ai_title::{self, GeminiSessionNameAuth, GeminiTransport};
 use crate::session_names::{SessionNames, MAX_GENERATION_STARTS};
 use crate::settings_store::SettingsStore;
 
@@ -128,8 +129,8 @@ pub(crate) struct IndexedNameInput {
 /// `main` and handed to [`crate::session_name_native::SessionNameWorker::start`];
 /// [`Self::run_due_attempt`] performs one claimed attempt under the worker's
 /// already-held background guard. Capability (the naming toggle and the
-/// Gemini key) is checked by the worker BEFORE selection, so disabled
-/// naming or a missing key pauses the work without consuming anything and
+/// OneCLI/direct credential route) is checked by the worker BEFORE selection,
+/// so disabled naming or missing credentials pauses the work without consuming anything and
 /// without monopolizing the worker; the worker's ≤500ms poll re-evaluates
 /// capability, so a pause is discovered and resumed within one poll of the
 /// capability arriving. The ONE explicit wake caller today is the scoped
@@ -139,7 +140,7 @@ pub(crate) struct IndexedNameInput {
 /// mechanism.
 pub struct SessionNameGenerator {
     settings: SettingsStore,
-    ai_key: AiKeyCell,
+    auth: GeminiSessionNameAuth,
     transport: Arc<dyn GeminiTransport>,
     wake: Arc<tokio::sync::Notify>,
 }
@@ -147,23 +148,24 @@ pub struct SessionNameGenerator {
 impl SessionNameGenerator {
     pub fn new(
         settings: SettingsStore,
-        ai_key: AiKeyCell,
+        auth: GeminiSessionNameAuth,
         transport: Arc<dyn GeminiTransport>,
     ) -> Self {
         Self {
             settings,
-            ai_key,
+            auth,
             transport,
             wake: Arc::new(tokio::sync::Notify::new()),
         }
     }
 
-    /// Whether generation may run right now: the Gemini key cell holds a key
-    /// AND the user's `sidebar.autoGenerateTitles` setting is on. A `false`
+    /// Whether generation may run right now: session naming has an applicable
+    /// OneCLI route or a direct key AND the user's `sidebar.autoGenerateTitles`
+    /// setting is on. A `false`
     /// answer is a capability pause — the armed series keeps its whole
     /// allowance and stays discoverable; nothing is consumed.
     pub async fn capability_ready(&self) -> bool {
-        if !self.ai_key.enabled() {
+        if !self.auth.enabled() {
             return false;
         }
         self.settings.get().await.sidebar.auto_generate_titles
