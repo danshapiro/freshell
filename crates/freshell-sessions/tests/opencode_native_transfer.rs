@@ -461,6 +461,78 @@ fn blocks_sources_without_a_pinned_migration_journal() {
 }
 
 #[test]
+fn accepts_the_pinned_empty_data_migration_registry() {
+    let fixture = TestDir::new("empty-data-migration-registry");
+    let database = fixture.path().join("opencode.db");
+    let _source = create_synthetic_source(&database);
+    let inventory = HostOpenCodeInventory::new(fixture.path().join("unused.db"))
+        .with_channel_database(database);
+
+    let snapshot = export_exact_session(
+        &inventory,
+        "ses_root",
+        ExportOptions::new(fixture.path().join("extract")),
+    )
+    .expect("pinned v1.18.21 has no registered data migrations");
+
+    assert_eq!(snapshot.manifest().assets.len(), 0);
+}
+
+#[test]
+fn blocks_unregistered_data_migration_rows() {
+    let fixture = TestDir::new("unknown-data-migration");
+    let database = fixture.path().join("opencode.db");
+    let source = create_synthetic_source(&database);
+    source
+        .execute(
+            "INSERT INTO data_migration (name, time_completed) VALUES ('future-session-rewrite', 999)",
+            [],
+        )
+        .unwrap();
+    let extraction_root = fixture.path().join("extract");
+    let inventory = HostOpenCodeInventory::new(fixture.path().join("unused.db"))
+        .with_channel_database(database);
+
+    let result = export_exact_session(
+        &inventory,
+        "ses_root",
+        ExportOptions::new(extraction_root.clone()),
+    );
+
+    assert!(
+        matches!(result, Err(TransferError::Blocked(_))),
+        "unknown data migration state must not be certified as the pinned version"
+    );
+    assert_eq!(fs::read_dir(extraction_root).unwrap().count(), 0);
+}
+
+#[test]
+fn blocks_an_incomplete_pinned_database_migration_set() {
+    let fixture = TestDir::new("incomplete-migration-set");
+    let database = fixture.path().join("opencode.db");
+    let source = create_synthetic_source(&database);
+    source
+        .execute(
+            "DELETE FROM migration WHERE id = ?1",
+            [TEST_MIGRATIONS[TEST_MIGRATIONS.len() - 1]],
+        )
+        .unwrap();
+    let inventory = HostOpenCodeInventory::new(fixture.path().join("unused.db"))
+        .with_channel_database(database);
+
+    let result = export_exact_session(
+        &inventory,
+        "ses_root",
+        ExportOptions::new(fixture.path().join("extract")),
+    );
+
+    assert!(
+        matches!(result, Err(TransferError::Blocked(_))),
+        "missing one required v1.18.21 migration must block the snapshot"
+    );
+}
+
+#[test]
 fn blocks_unclassified_external_uris_in_native_file_parts() {
     let fixture = TestDir::new("unsupported-file-uri");
     let database = fixture.path().join("opencode.db");
@@ -950,94 +1022,54 @@ fn preserves_inline_data_file_parts_without_external_assets() {
 }
 
 #[test]
-fn copies_write_once_tool_output_by_content_digest_and_remaps_its_typed_marker() {
-    let fixture = TestDir::new("tool-output");
+fn blocks_tool_output_files_even_after_same_length_rewrite_with_restored_timestamp() {
+    let fixture = TestDir::new("mutable-tool-output");
     let data_home = fixture.path().join("provider");
     let tool_output_directory = data_home.join("tool-output");
     fs::create_dir_all(&tool_output_directory).unwrap();
     let output_path = tool_output_directory.join("tool_123456789");
-    fs::write(&output_path, b"IMMUTABLE_TOOL_OUTPUT_BYTES").unwrap();
-    let v2_output_path = tool_output_directory.join("tool_v2_987654321");
-    fs::write(&v2_output_path, b"IMMUTABLE_V2_TOOL_OUTPUT_BYTES").unwrap();
+    fs::write(&output_path, b"OLD_TOOL_BYTES").unwrap();
+    let original_modified = fs::metadata(&output_path).unwrap().modified().unwrap();
+    fs::write(&output_path, b"NEW_TOOL_BYTES").unwrap();
+    fs::File::open(&output_path)
+        .unwrap()
+        .set_times(std::fs::FileTimes::new().set_modified(original_modified))
+        .unwrap();
+    assert_eq!(
+        fs::metadata(&output_path).unwrap().modified().unwrap(),
+        original_modified,
+        "the synthetic rewrite preserves length and timestamp"
+    );
     let database = data_home.join("opencode.db");
     let source = create_synthetic_source(&database);
-    let marker = format!(
-        "... output truncated; full content saved to {} ...",
-        output_path.display()
-    );
-    let data = serde_json::json!({"type":"text", "text":marker}).to_string();
+    let data = serde_json::json!({
+        "type":"file",
+        "mime":"text/plain",
+        "url":format!("file://{}", output_path.display())
+    })
+    .to_string();
     source
         .execute(
             "UPDATE part SET data = ?1 WHERE id = 'part_ses_root'",
             [data],
         )
         .unwrap();
-    let v2_marker = format!(
-        "... output truncated; full content saved to {} ...",
-        v2_output_path.display()
-    );
-    source
-        .execute(
-            "UPDATE session_message SET data = ?1 WHERE id = 'v2_root'",
-            [serde_json::json!({"parts":[{"type":"text","text":v2_marker}]}).to_string()],
-        )
-        .unwrap();
+    let extraction_root = fixture.path().join("extract");
     let inventory = HostOpenCodeInventory::new(fixture.path().join("unused.db"))
         .with_channel_database(database);
-    let snapshot = export_exact_session(
+
+    let result = export_exact_session(
         &inventory,
         "ses_root",
-        ExportOptions::new(fixture.path().join("extract")),
-    )
-    .unwrap();
+        ExportOptions::new(extraction_root.clone()),
+    );
 
-    assert_eq!(snapshot.manifest().assets.len(), 2);
-    for (source_name, expected_bytes) in [
-        ("tool_123456789", b"IMMUTABLE_TOOL_OUTPUT_BYTES".as_slice()),
-        (
-            "tool_v2_987654321",
-            b"IMMUTABLE_V2_TOOL_OUTPUT_BYTES".as_slice(),
-        ),
-    ] {
-        let asset = snapshot
-            .manifest()
-            .assets
-            .iter()
-            .find(|asset| asset.source_relative_path == source_name)
-            .unwrap();
-        assert_eq!(asset.kind, "write_once_tool_output");
-        assert_eq!(asset.size_bytes, expected_bytes.len() as u64);
-        assert_eq!(
-            asset.sha256,
-            format!("{:x}", Sha256::digest(expected_bytes))
-        );
-        let mut staged = String::new();
-        snapshot
-            .open_asset(&asset.target_relative_path)
-            .unwrap()
-            .read_to_string(&mut staged)
-            .unwrap();
-        assert_eq!(staged.as_bytes(), expected_bytes);
-    }
-    let mut payload = String::new();
-    snapshot
-        .open_payload()
-        .unwrap()
-        .read_to_string(&mut payload)
-        .unwrap();
-    assert!(!payload.contains(&output_path.to_string_lossy().to_string()));
-    assert!(!payload.contains(&v2_output_path.to_string_lossy().to_string()));
-    for asset in &snapshot.manifest().assets {
-        assert!(payload.contains(&asset.target_relative_path));
-    }
-    assert_eq!(
-        fs::read(output_path).unwrap(),
-        b"IMMUTABLE_TOOL_OUTPUT_BYTES"
+    assert!(
+        matches!(result, Err(TransferError::Blocked(_))),
+        "the pinned writer's path and unchanged metadata do not prove immutable bytes"
     );
-    assert_eq!(
-        fs::read(v2_output_path).unwrap(),
-        b"IMMUTABLE_V2_TOOL_OUTPUT_BYTES"
-    );
+    assert_eq!(fs::read_dir(extraction_root).unwrap().count(), 0);
+    assert_eq!(fs::read(output_path).unwrap(), b"NEW_TOOL_BYTES");
 }
 
 #[test]
@@ -1068,21 +1100,26 @@ fn opencode_db_override_keeps_tool_output_resolution_at_the_provider_data_home()
     let inventory = HostOpenCodeInventory::new(provider_data_home.join("opencode.db"))
         .with_effective_database_override(database.as_os_str(), fixture.path().to_path_buf());
 
-    let snapshot = export_exact_session(
+    let extraction_root = fixture.path().join("extract");
+    let result = export_exact_session(
         &inventory,
         "ses_root",
-        ExportOptions::new(fixture.path().join("extract")),
-    )
-    .expect("tool-output discovery follows the provider data home, not OPENCODE_DB");
-
-    assert_eq!(snapshot.manifest().assets.len(), 1);
-    assert_eq!(
-        snapshot.manifest().assets[0].source_relative_path,
-        "tool_override_123"
+        ExportOptions::new(extraction_root.clone())
+            .with_workspace_mount(provider_data_home.clone()),
     );
+
+    assert!(
+        matches!(
+            result,
+            Err(TransferError::Blocked(reason))
+                if reason.contains("no write-once retention contract")
+        ),
+        "the provider-home tool-output path must be blocked even when OPENCODE_DB is overridden"
+    );
+    assert_eq!(fs::read_dir(extraction_root).unwrap().count(), 0);
     assert_eq!(
-        snapshot.manifest().assets[0].size_bytes,
-        b"OVERRIDE_TOOL_OUTPUT_BYTES".len() as u64
+        fs::read(output_path).unwrap(),
+        b"OVERRIDE_TOOL_OUTPUT_BYTES"
     );
 }
 
