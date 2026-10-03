@@ -333,6 +333,10 @@ pub fn router(state: ManagedRuntimeApiState) -> Router {
         .route("/api/runtime/readiness", get(runtime_readiness))
         .route("/api/runtime/souls", get(list_souls))
         .route("/api/runtime/souls/{soul_id}", get(get_soul))
+        .route(
+            "/api/runtime/souls/{soul_id}/history",
+            get(read_native_history),
+        )
         .route("/api/runtime/souls/{soul_id}/retry", post(retry_soul))
         .route("/api/runtime/souls/{soul_id}/stop", post(stop_soul))
         .route("/api/runtime/souls/{soul_id}/limits", patch(update_limits))
@@ -502,6 +506,28 @@ async fn retry_soul(
         .await
     {
         Ok(result) => Json(result).into_response(),
+        Err(error) => client_error(error),
+    }
+}
+
+async fn read_native_history(
+    State(state): State<ManagedRuntimeApiState>,
+    headers: HeaderMap,
+    AxumPath(raw): AxumPath<String>,
+) -> Response {
+    if !is_authed(&headers, &state.auth_token) {
+        return unauthorized();
+    }
+    let soul = match SoulId::parse(raw) {
+        Ok(soul) => soul,
+        Err(error) => return bad_request(error.to_string()),
+    };
+    let client = match runtime_client(&state) {
+        Ok(client) => client,
+        Err(response) => return response,
+    };
+    match client.fresh_agent_history(soul).await {
+        Ok(snapshot) => Json(snapshot).into_response(),
         Err(error) => client_error(error),
     }
 }

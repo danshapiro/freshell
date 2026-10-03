@@ -1,0 +1,77 @@
+{
+  "sessionType": "freshcodex",
+  "provider": "codex",
+  "threadId": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+  "revision": 0,
+  "status": "idle",
+  "summary": "",
+  "capabilities": {
+    "send": false,
+    "interrupt": false,
+    "approvals": false,
+    "questions": false,
+    "fork": false,
+    "worktrees": false,
+    "diffs": false,
+    "childThreads": false,
+    "undo": false,
+    "redo": false,
+    "settingScopes": {
+      "model": "per-send",
+      "effort": "per-send",
+      "sandbox": "per-send",
+      "permissionMode": "per-send"
+    }
+  },
+  "tokenUsage": {
+    "inputTokens": 0,
+    "outputTokens": 0,
+    "cachedTokens": 0,
+    "totalTokens": 0
+  },
+  "pendingApprovals": [],
+  "pendingQuestions": [],
+  "worktrees": [],
+  "diffs": [],
+  "childThreads": [],
+  "turns": [
+    {
+      "id": "persisted-turn:row-0",
+      "turnId": "persisted-turn:row-0",
+      "ordinal": 0,
+      "source": "durable",
+      "role": "user",
+      "summary": "Saved native user prompt",
+      "summaryKind": "echo",
+      "items": [
+        {
+          "id": "native-line-2:part:0",
+          "kind": "text",
+          "text": "Saved native user prompt"
+        }
+      ]
+    },
+    {
+      "id": "persisted-turn:row-1",
+      "turnId": "persisted-turn:row-1",
+      "ordinal": 1,
+      "source": "durable",
+      "role": "assistant",
+      "summary": "Saved native Codex answer",
+      "summaryKind": "echo",
+      "items": [
+        {
+          "id": "native-line-3",
+          "kind": "text",
+          "text": "Saved native Codex answer"
+        }
+      ]
+    }
+  ],
+  "extensions": {
+    "codex": {
+      "ownerKind": "vacant",
+      "nativeHistoryAvailable": true
+    }
+  }
+}

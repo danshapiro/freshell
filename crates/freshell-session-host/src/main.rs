@@ -116,6 +116,15 @@ async fn run() -> Result<(), String> {
     match args.get(1).map(String::as_str) {
         Some("serve") => serve(&args[2..]).await,
         Some("worker") => worker(&args[2..]).await,
+        Some("native-history-only") => {
+            let snapshot = freshell_freshagent::native_history::read(
+                &required_arg(&args[2..], "--provider")?,
+                Path::new(&required_arg(&args[2..], "--provider-home")?),
+                &required_arg(&args[2..], "--session-id")?,
+            )?;
+            println!("{snapshot}");
+            Ok(())
+        }
         Some("fixture-child") => fixture_child(&args[2..]).await,
         #[cfg(feature = "fresh-agent-fixtures")]
         Some("fresh-agent-fixture-worker") => providers::run_fresh_agent_fixture_worker(&args[2..]).await,

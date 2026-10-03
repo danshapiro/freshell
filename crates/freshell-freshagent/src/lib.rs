@@ -46,6 +46,7 @@ pub mod layout_store;
 pub mod layout_tree;
 pub mod model_capabilities;
 pub mod naming;
+pub mod native_history;
 pub mod opencode_ws;
 pub mod pane_ops;
 mod pane_resize;
