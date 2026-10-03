@@ -1,6 +1,6 @@
 import { configureStore } from '@reduxjs/toolkit'
 import { Provider } from 'react-redux'
-import { cleanup, render, screen, waitFor } from '@testing-library/react'
+import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
@@ -8,9 +8,11 @@ import connectionReducer from '@/store/connectionSlice'
 import managedRuntimeReducer from '@/store/managedRuntimeSlice'
 import tabRegistryReducer from '@/store/tabRegistrySlice'
 import {
+  MANAGED_RUNTIME_NOTICE_POLL_MS,
   ManagedRuntimeNotices,
   noticeProfileId,
 } from '@/components/ManagedRuntimeNotices'
+import type { ManagedRuntimeIncidentSummary, ManagedRuntimeNotice } from '@shared/managed-runtime'
 
 const apiMocks = vi.hoisted(() => ({
   getManagedRuntimeNotices: vi.fn(),
@@ -22,6 +24,27 @@ vi.mock('@/lib/api', async (importOriginal) => {
   const original = await importOriginal<typeof import('@/lib/api')>()
   return { ...original, ...apiMocks }
 })
+
+const incidentSummary: ManagedRuntimeIncidentSummary = {
+  incidentId: 'incident-one',
+  correlationId: 'correlation-one',
+  soulId: 'soul-one',
+  provider: 'opencode',
+  state: 'closed',
+  reasonCode: 'all_applicable_recovery_paths_definitively_unavailable',
+  observedCause: 'provider state was missing',
+  cleanup: {
+    ownedHandleRef: 'registry://incarnation-one',
+    ownershipVerified: true,
+    gracefulAttempt: 'not_required',
+    forcedAttempt: 'not_required',
+    verifiedEmpty: true,
+    verifiedAt: '2026-09-08T00:00:00.000Z',
+    foreignObjectsTouched: 0,
+  },
+  createdAt: '2026-09-08T00:00:00.000Z',
+  updatedAt: '2026-09-08T00:00:01.000Z',
+}
 
 function runtimeState() {
   return {
@@ -65,31 +88,48 @@ function renderNotices() {
   return store
 }
 
+function cleanupFailure(noticeId: string): ManagedRuntimeNotice {
+  return {
+    noticeId,
+    kind: 'cleanup_failed',
+    message: `Cleanup needs attention: ${noticeId}`,
+    reference: noticeId,
+    incidentIds: ['incident-one'],
+    deliveryState: 'pending',
+    createdAt: '2026-09-08T00:00:00.000Z',
+  }
+}
+
+async function renderPollingNotices(notices: ManagedRuntimeNotice[]) {
+  vi.useFakeTimers()
+  apiMocks.getManagedRuntimeNotices.mockResolvedValue(notices)
+  await act(async () => { renderNotices() })
+}
+
+async function pollNotices() {
+  await act(async () => { await vi.advanceTimersByTimeAsync(MANAGED_RUNTIME_NOTICE_POLL_MS) })
+}
+
+async function clickNoticeButton(name: 'Details' | 'Dismiss') {
+  await act(async () => { fireEvent.click(screen.getByRole('button', { name })) })
+}
+
+function deferredDetails() {
+  let resolve!: (value: ManagedRuntimeIncidentSummary) => void
+  let reject!: (error: Error) => void
+  const promise = new Promise<ManagedRuntimeIncidentSummary>((onResolve, onReject) => {
+    resolve = onResolve
+    reject = onReject
+  })
+  return { promise, resolve, reject }
+}
+
 describe('ManagedRuntimeNotices', () => {
   beforeEach(() => {
     vi.useRealTimers()
     vi.clearAllMocks()
     apiMocks.recordManagedRuntimeNoticeReceipt.mockResolvedValue(undefined)
-    apiMocks.getManagedRuntimeIncidentSummary.mockResolvedValue({
-      incidentId: 'incident-one',
-      correlationId: 'correlation-one',
-      soulId: 'soul-one',
-      provider: 'opencode',
-      state: 'closed',
-      reasonCode: 'all_applicable_recovery_paths_definitively_unavailable',
-      observedCause: 'provider state was missing',
-      cleanup: {
-        ownedHandleRef: 'registry://incarnation-one',
-        ownershipVerified: true,
-        gracefulAttempt: 'not_required',
-        forcedAttempt: 'not_required',
-        verifiedEmpty: true,
-        verifiedAt: '2026-09-08T00:00:00.000Z',
-        foreignObjectsTouched: 0,
-      },
-      createdAt: '2026-09-08T00:00:00.000Z',
-      updatedAt: '2026-09-08T00:00:01.000Z',
-    })
+    apiMocks.getManagedRuntimeIncidentSummary.mockResolvedValue(incidentSummary)
   })
 
   afterEach(() => {
@@ -176,4 +216,76 @@ describe('ManagedRuntimeNotices', () => {
     })
     expect(screen.queryByRole('alert')).not.toBeInTheDocument()
   })
+
+  it('keeps opened incident details visible across repeated polls of the same warning', async () => {
+    await renderPollingNotices([cleanupFailure('notice-one')])
+    await clickNoticeButton('Details')
+    expect(screen.getByRole('alert')).toHaveTextContent('provider state was missing')
+
+    for (let poll = 0; poll < 2; poll += 1) {
+      await pollNotices()
+      expect(screen.getByRole('alert')).toHaveTextContent('provider state was missing')
+    }
+    expect(apiMocks.getManagedRuntimeNotices).toHaveBeenCalledTimes(3)
+    expect(apiMocks.getManagedRuntimeIncidentSummary).toHaveBeenCalledTimes(1)
+  })
+
+  it('clears opened details when polling replaces the visible warning', async () => {
+    await renderPollingNotices([cleanupFailure('notice-one')])
+    await clickNoticeButton('Details')
+    expect(screen.getByRole('alert')).toHaveTextContent('provider state was missing')
+
+    apiMocks.getManagedRuntimeNotices.mockResolvedValue([cleanupFailure('notice-two')])
+    await pollNotices()
+    expect(screen.getByRole('alert')).toHaveTextContent('Cleanup needs attention: notice-two')
+    expect(screen.getByRole('alert')).not.toHaveTextContent('provider state was missing')
+  })
+
+  it('clears opened details when dismissing advances to the next queued warning', async () => {
+    await renderPollingNotices([cleanupFailure('notice-one'), cleanupFailure('notice-two')])
+    await clickNoticeButton('Details')
+    expect(screen.getByRole('alert')).toHaveTextContent('provider state was missing')
+
+    await clickNoticeButton('Dismiss')
+    expect(screen.getByRole('alert')).toHaveTextContent('Cleanup needs attention: notice-two')
+    expect(screen.getByRole('alert')).not.toHaveTextContent('provider state was missing')
+  })
+
+  it.each(['success', 'failure'] as const)(
+    'ignores a late Details %s after its warning is dismissed',
+    async (result) => {
+      await renderPollingNotices([cleanupFailure('notice-one')])
+      const pending = deferredDetails()
+      apiMocks.getManagedRuntimeIncidentSummary.mockReturnValue(pending.promise)
+      await clickNoticeButton('Details')
+      await clickNoticeButton('Dismiss')
+      expect(screen.queryByRole('alert')).not.toBeInTheDocument()
+
+      await act(async () => {
+        if (result === 'success') pending.resolve(incidentSummary)
+        else pending.reject(new Error('Old details request failed'))
+      })
+      expect(screen.queryByRole('alert')).not.toBeInTheDocument()
+    },
+  )
+
+  it.each(['success', 'failure'] as const)(
+    'ignores a late Details %s after polling replaces its warning',
+    async (result) => {
+      await renderPollingNotices([cleanupFailure('notice-one')])
+      const pending = deferredDetails()
+      apiMocks.getManagedRuntimeIncidentSummary.mockReturnValue(pending.promise)
+      await clickNoticeButton('Details')
+      apiMocks.getManagedRuntimeNotices.mockResolvedValue([cleanupFailure('notice-two')])
+      await pollNotices()
+
+      await act(async () => {
+        if (result === 'success') pending.resolve(incidentSummary)
+        else pending.reject(new Error('Old details request failed'))
+      })
+      expect(screen.getByRole('alert')).toHaveTextContent('Cleanup needs attention: notice-two')
+      expect(screen.getByRole('alert')).not.toHaveTextContent('provider state was missing')
+      expect(screen.getByRole('alert')).not.toHaveTextContent('Old details request failed')
+    },
+  )
 })

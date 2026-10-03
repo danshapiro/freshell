@@ -36,12 +36,21 @@ export function ManagedRuntimeNotices() {
   const deviceId = useAppSelector((state) => state.tabRegistry?.deviceId)
   const profileId = useMemo(() => noticeProfileId(deviceId), [deviceId])
   const [notices, setNotices] = useState<ManagedRuntimeNotice[]>([])
+  const current = notices[0]
   const [details, setDetails] = useState<ManagedRuntimeIncidentSummary>()
   const [error, setError] = useState<string>()
   const [pollTick, setPollTick] = useState(0)
   const inFlightRef = useRef<AbortController>()
   const acknowledgedRoutineIdsRef = useRef(new Set<string>())
   const renderedFailureIdsRef = useRef(new Set<string>())
+  // Polls replace notice objects; the stable notice/profile identity owns
+  // opened details and any response still pending when the warning changes.
+  const currentNoticeRef = useRef({ noticeId: current?.noticeId, profileId })
+  currentNoticeRef.current = { noticeId: current?.noticeId, profileId }
+
+  useEffect(() => {
+    setDetails(undefined)
+  }, [current?.noticeId, profileId])
 
   useEffect(() => {
     acknowledgedRoutineIdsRef.current.clear()
@@ -69,7 +78,6 @@ export function ManagedRuntimeNotices() {
         const routine = pending.filter(isRoutineNotice)
         const failures = pending.filter(isCleanupFailureNotice)
         setNotices(failures)
-        setDetails(undefined)
         setError(undefined)
         const routineToAcknowledge = routine.filter((notice) => {
           if (acknowledgedRoutineIdsRef.current.has(notice.noticeId)) return false
@@ -110,8 +118,6 @@ export function ManagedRuntimeNotices() {
     }
   }, [available, connectionStatus, inventoryRevision, pollTick, profileId])
 
-  const current = notices[0]
-
   const dismiss = async () => {
     if (!current) return
     try {
@@ -126,11 +132,19 @@ export function ManagedRuntimeNotices() {
 
   const loadDetails = async () => {
     const incidentId = current?.incidentIds[0]
-    if (!incidentId) return
+    const noticeId = current?.noticeId
+    if (!incidentId || !noticeId) return
+    const isCurrentNotice = () => (
+      currentNoticeRef.current.noticeId === noticeId
+      && currentNoticeRef.current.profileId === profileId
+    )
     try {
-      setDetails(await getManagedRuntimeIncidentSummary(incidentId))
+      const summary = await getManagedRuntimeIncidentSummary(incidentId)
+      if (!isCurrentNotice()) return
+      setDetails(summary)
       setError(undefined)
     } catch (cause) {
+      if (!isCurrentNotice()) return
       setError(cause instanceof Error ? cause.message : String(cause))
     }
   }
