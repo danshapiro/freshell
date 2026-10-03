@@ -80,7 +80,7 @@ fn limits() -> RuntimeLimits {
     }
 }
 
-async fn certified_lost_soul(root: &std::path::Path) -> (Registry, RuntimeView) {
+async fn fixture_soul(root: &std::path::Path, certify_loss: bool) -> (Registry, RuntimeView) {
     let registry = Registry::open(root, None).unwrap();
     let soul_id = SoulId::new();
     let fresh_agent: FreshAgentLaunchSpec = serde_json::from_value(json!({
@@ -131,6 +131,11 @@ async fn certified_lost_soul(root: &std::path::Path) -> (Registry, RuntimeView) 
         .mark_running(prepared.incarnation_id)
         .await
         .unwrap();
+    if !certify_loss {
+        let view = registry.inventory().await.unwrap().pop().unwrap();
+        assert_eq!(view.desired_state, DesiredState::Running);
+        return (registry, view);
+    }
     let context = registry.recovery_context(soul_id.clone()).await.unwrap();
     let paths = [
         (
@@ -259,24 +264,23 @@ async fn stop(
     (status, serde_json::from_slice(&body).unwrap())
 }
 
-#[tokio::test]
-async fn restored_web_stops_persisted_lost_soul_only_after_verified_cleanup() {
-    let temp = tempfile::tempdir().unwrap();
-    let (registry, before) = certified_lost_soul(temp.path()).await;
-    let backend = Arc::new(StopBackend::default());
-    backend.uncertain.store(true, Ordering::SeqCst);
-    let socket = temp.path().join("control.sock");
+async fn start_control(
+    root: &std::path::Path,
+    registry: Registry,
+    backend: Arc<StopBackend>,
+) -> (PathBuf, tokio::task::JoinHandle<()>) {
+    let socket = root.join("control.sock");
     let supervisor = Supervisor::new(
         registry.clone(),
         backend.clone(),
         SupervisorConfig {
-            runtime_root: temp.path().into(),
+            runtime_root: root.into(),
             control_socket_path: socket.clone(),
             host_binary_path: std::env::current_exe().unwrap(),
             image_ref: format!("sha256:{}", "b".repeat(64)),
             test_run_id: "stop-lost-fixture".into(),
             control_secret: "test-control-secret".into(),
-            lifecycle_log: temp.path().join("lifecycle.jsonl"),
+            lifecycle_log: root.join("lifecycle.jsonl"),
             admission: AdmissionPolicy::default(),
         },
     )
@@ -291,6 +295,16 @@ async fn restored_web_stops_persisted_lost_soul_only_after_verified_cleanup() {
     })
     .await
     .unwrap();
+    (socket, control)
+}
+
+#[tokio::test]
+async fn restored_web_stops_persisted_lost_soul_only_after_verified_cleanup() {
+    let temp = tempfile::tempdir().unwrap();
+    let (registry, before) = fixture_soul(temp.path(), true).await;
+    let backend = Arc::new(StopBackend::default());
+    backend.uncertain.store(true, Ordering::SeqCst);
+    let (socket, control) = start_control(temp.path(), registry.clone(), backend.clone()).await;
 
     // Rebuild web state from persisted inventory, with no session alias cache.
     drop(web_router(&socket, temp.path()).await);
@@ -352,6 +366,42 @@ async fn restored_web_stops_persisted_lost_soul_only_after_verified_cleanup() {
     assert_eq!(
         *backend.stopped.lock().unwrap(),
         vec![(before.soul_id.clone(), before.incarnation_id.clone()); 2]
+    );
+    control.abort();
+    let _ = control.await;
+}
+
+#[tokio::test]
+async fn running_soul_uncertain_stop_returns_the_revision_for_immediate_retry() {
+    let temp = tempfile::tempdir().unwrap();
+    let (registry, before) = fixture_soul(temp.path(), false).await;
+    let backend = Arc::new(StopBackend::default());
+    backend.uncertain.store(true, Ordering::SeqCst);
+    let (socket, control) = start_control(temp.path(), registry.clone(), backend.clone()).await;
+    let router = web_router(&socket, temp.path()).await;
+
+    let (status, uncertain) = stop(&router, &before, before.intent_revision).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(uncertain["outcome"], "termination_unconfirmed");
+    assert_eq!(uncertain["soul"]["desiredState"], "stopped");
+    let returned_revision = uncertain["soul"]["intentRevision"].as_u64().unwrap();
+    assert_eq!(returned_revision, before.intent_revision + 1);
+    assert_eq!(uncertain["soul"]["soulId"], before.soul_id.as_str());
+    assert_eq!(uncertain["soul"]["nativeSessionId"], "retained-thread");
+
+    let (status, _) = stop(&router, &before, before.intent_revision).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(backend.stopped.lock().unwrap().len(), 1);
+
+    backend.uncertain.store(false, Ordering::SeqCst);
+    let (status, verified) = stop(&router, &before, returned_revision).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(verified["outcome"], "verified_empty");
+    assert_eq!(verified["soul"]["intentRevision"], returned_revision);
+    assert_eq!(verified["soul"]["nativeSessionId"], "retained-thread");
+    assert_eq!(
+        *backend.stopped.lock().unwrap(),
+        vec![(before.soul_id, before.incarnation_id); 2]
     );
     control.abort();
     let _ = control.await;
