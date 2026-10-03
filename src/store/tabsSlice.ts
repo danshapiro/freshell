@@ -1,6 +1,11 @@
 import { createSlice, PayloadAction, createAsyncThunk } from '@reduxjs/toolkit'
 import type { Tab, TerminalStatus, TabMode, ShellType, CodingCliProviderName } from './types'
-import type { ManagedRuntimeProjectionFields, ManagedRuntimeViewIntent } from '@shared/managed-runtime'
+import type {
+  ManagedRuntimeInventorySnapshot,
+  ManagedRuntimeProjectionFields,
+  ManagedRuntimeViewIntent,
+  ManagedRuntimeViewVisibility,
+} from '@shared/managed-runtime'
 import { nanoid } from 'nanoid'
 import { closePane, initLayout, restoreLayout, removeLayout, replacePane, setPaneCloseError, updatePaneContent, updatePaneTitleByTerminalId, updatePaneTitle, markTabClosing, clearTabClosing, markPaneClosing, clearPaneClosing, hasAnyClosePending } from './panesSlice'
 import { clearTabAttention, clearPaneAttention } from './turnCompletionSlice.js'
@@ -21,7 +26,7 @@ import {
 } from '@/lib/tab-registry-snapshot'
 import { UNKNOWN_SERVER_INSTANCE_ID } from './tabRegistryConstants'
 import { KILL_ACK_TIMEOUT_MS, PANE_CLOSE_ACK_TIMEOUT_MESSAGE, PANE_CLOSE_FAILED_MESSAGE, PANE_CLOSE_REMOVAL_REFUSED_MESSAGE, sendPaneClosedAndAwait, sendPaneOpened, sendPanesClosedAndAwait } from '@/lib/kill-ack'
-import { collectSessionPaneIdentities, collectPaneContents, findPaneContent } from '@/lib/pane-utils'
+import { collectSessionPaneIdentities, collectPaneContents, collectPaneEntries, findPaneContent } from '@/lib/pane-utils'
 import { markPaneCloseEvidenceConfirmed } from '@/lib/pane-close-evidence-marks'
 import type { RootState } from './store'
 import { selectTabIdByTerminalId } from './selectors/paneTerminalSelectors'
@@ -33,9 +38,14 @@ import { mergeSessionMetadataForPreferredResumeId } from './persistControl'
 import { migrateLegacyTerminalDurableState, sanitizeSessionRef } from '@shared/session-contract'
 import { sanitizeTabsAgainstLayouts } from '@/lib/tab-fallback-identity'
 import { TabNameSourceSchema, type TabNameSource } from '@shared/session-names'
+import { getManagedRuntimeInventory, updateManagedRuntimeViewVisibility } from '@/lib/api'
+import { managedRuntimeSnapshotReceived, selectManagedRuntime } from './managedRuntimeSlice'
+import { withManagedVisibilityTransition } from './managedVisibilityCoordinator.js'
 
 
 const log = createLogger('TabsSlice')
+const MANAGED_VIEW_CLOSE_FAILED_MESSAGE =
+  'the managed view could not be detached from recovery; the tab was left open'
 
 export type Tombstone = { id: string; deletedAt: number }
 
@@ -1308,6 +1318,290 @@ function reassertKeptPanesOpen(
   }
 }
 
+function collectManagedViewIntentIds(tab: Tab | undefined, layout: PaneNode | undefined): string[] {
+  const viewIntentIds = new Set<string>()
+  const add = (value: unknown) => {
+    if (typeof value === 'string' && value.length > 0) viewIntentIds.add(value)
+  }
+
+  // Once a layout exists, its live pane projections are authoritative. The
+  // tab-level projection can outlive a managed pane replaced by a picker.
+  if (!layout) add(tab?.viewIntentId)
+  if (layout) {
+    for (const content of collectPaneContents(layout)) {
+      add((content as { viewIntentId?: unknown }).viewIntentId)
+    }
+  }
+  return [...viewIntentIds]
+}
+
+function isManagedRuntimeProjection(content: PaneContent): content is Extract<PaneContent, { kind: 'terminal' }> {
+  return content.kind === 'terminal'
+}
+
+function hasManagedRuntimeMarker(content: Extract<PaneContent, { kind: 'terminal' }>): boolean {
+  return [content.viewIntentId, content.soulId, content.incarnationId, content.runtimeState]
+    .some((value) => typeof value === 'string' && value.length > 0)
+}
+
+function applyManagedRuntimeInventory(
+  snapshot: ManagedRuntimeInventorySnapshot,
+  dispatch: (action: unknown) => void,
+  getState: () => RootState,
+): void {
+  dispatch(managedRuntimeSnapshotReceived({
+    snapshot,
+    reconstructedViewCount: selectManagedRuntime(getState()).reconstructedViewCount,
+  }))
+}
+
+type ManagedViewResolution =
+  | { kind: 'resolved'; viewIntentIds: string[] }
+  | { kind: 'none'; viewIntentIds: [] }
+  | { kind: 'unresolved'; viewIntentIds: string[] }
+
+function resolveManagedViewForTerminal(
+  content: Extract<PaneContent, { kind: 'terminal' }>,
+  snapshot: ManagedRuntimeInventorySnapshot,
+): ManagedViewResolution {
+  if (content.viewIntentId) {
+    const matches = snapshot.viewIntents.filter((view) => view.viewId === content.viewIntentId)
+    return matches.length === 1
+      ? { kind: 'resolved', viewIntentIds: [matches[0]!.viewId] }
+      : { kind: 'unresolved', viewIntentIds: [content.viewIntentId] }
+  }
+
+  const identityMatchedSouls = snapshot.souls.filter((soul) => (
+    (content.terminalId && soul.terminalId === content.terminalId)
+    || (content.createRequestId && soul.terminalCreateRequestId === content.createRequestId)
+  ))
+  const matchedSouls = content.soulId
+    ? identityMatchedSouls.filter((soul) => soul.soulId === content.soulId)
+    : identityMatchedSouls
+  if (matchedSouls.length > 1) return { kind: 'unresolved', viewIntentIds: [] }
+
+  const matchedSoul = matchedSouls[0]
+  if (matchedSoul) {
+    const views = snapshot.viewIntents.filter((view) => view.soulId === matchedSoul.soulId)
+    if (views.length === 1) return { kind: 'resolved', viewIntentIds: [views[0]!.viewId] }
+    return { kind: 'unresolved', viewIntentIds: views.map((view) => view.viewId) }
+  }
+
+  const inventoryComplete = snapshot.readiness.initialScanState === 'complete'
+    && snapshot.pendingProjectionCount === 0
+  if (
+    hasManagedRuntimeMarker(content)
+    || !inventoryComplete
+  ) {
+    return { kind: 'unresolved', viewIntentIds: [] }
+  }
+  return { kind: 'none', viewIntentIds: [] }
+}
+
+function possibleManagedViewIdsForOtherRepresentation(
+  content: PaneContent,
+  snapshot: ManagedRuntimeInventorySnapshot,
+): string[] {
+  if (!isManagedRuntimeProjection(content)) return []
+  if (content.viewIntentId) return [content.viewIntentId]
+
+  const souls = content.soulId
+    ? snapshot.souls.filter((soul) => soul.soulId === content.soulId)
+    : snapshot.souls.filter((soul) => (
+      (content.terminalId && soul.terminalId === content.terminalId)
+      || (content.createRequestId && soul.terminalCreateRequestId === content.createRequestId)
+    ))
+  const soulIds = new Set(souls.map((soul) => soul.soulId))
+  return snapshot.viewIntents
+    .filter((view) => soulIds.has(view.soulId))
+    .map((view) => view.viewId)
+}
+
+function collectOtherLocalManagedViewIds(
+  state: RootState,
+  snapshot: ManagedRuntimeInventorySnapshot,
+  targetTabId: string,
+  targetPaneId?: string,
+): Set<string> {
+  const viewIntentIds = new Set<string>()
+  for (const tab of state.tabs.tabs) {
+    const layout = state.panes.layouts[tab.id]
+    if (tab.id !== targetTabId && !layout && tab.viewIntentId) viewIntentIds.add(tab.viewIntentId)
+  }
+  for (const [tabId, layout] of Object.entries(state.panes.layouts)) {
+    if (tabId === targetTabId && !targetPaneId) continue
+    for (const entry of collectPaneEntries(layout)) {
+      if (tabId === targetTabId && entry.paneId === targetPaneId) continue
+      for (const viewIntentId of possibleManagedViewIdsForOtherRepresentation(entry.content, snapshot)) {
+        viewIntentIds.add(viewIntentId)
+      }
+    }
+  }
+  return viewIntentIds
+}
+
+/** Resolve exact close targets before detaching the local representation. */
+type ManagedViewCloseResolution = {
+  viewIntentIds: string[]
+  paneIds: string[]
+  snapshot?: ManagedRuntimeInventorySnapshot
+}
+
+function resolveManagedViewIntentsToRemove(
+  state: RootState,
+  tabId: string,
+  paneId: string | undefined,
+  dispatch: (action: unknown) => void,
+  getState: () => RootState,
+): ManagedViewCloseResolution | Promise<ManagedViewCloseResolution> {
+  const tab = state.tabs.tabs.find((item) => item.id === tabId)
+  const layout = state.panes.layouts[tabId]
+  const targetEntries = layout
+    ? collectPaneEntries(layout).filter((entry) => paneId === undefined || entry.paneId === paneId)
+    : []
+  const terminalTargets = targetEntries.filter((entry) => isManagedRuntimeProjection(entry.content))
+  const tabViewIntentId = !layout && paneId === undefined ? tab?.viewIntentId : undefined
+  if (terminalTargets.length === 0 && !tabViewIntentId) return { viewIntentIds: [], paneIds: [] }
+
+  const runtime = selectManagedRuntime(state)
+  const hasKnownMarker = terminalTargets.some(({ content }) => (
+    isManagedRuntimeProjection(content) && hasManagedRuntimeMarker(content)
+  )) || Boolean(tabViewIntentId)
+  if (!runtime.available) {
+    if (hasKnownMarker) throw new Error(MANAGED_VIEW_CLOSE_FAILED_MESSAGE)
+    return { viewIntentIds: [], paneIds: [] }
+  }
+
+  return getManagedRuntimeInventory().then((snapshot) => {
+    applyManagedRuntimeInventory(snapshot, dispatch, getState)
+
+    const targetViewIntentIds = new Set<string>()
+    const paneIds = new Set<string>()
+    if (tabViewIntentId) {
+      const matches = snapshot.viewIntents.filter((view) => view.viewId === tabViewIntentId)
+      if (matches.length !== 1) throw new Error(MANAGED_VIEW_CLOSE_FAILED_MESSAGE)
+      targetViewIntentIds.add(tabViewIntentId)
+    }
+    for (const { paneId: targetPaneId, content } of terminalTargets) {
+      if (!isManagedRuntimeProjection(content)) continue
+      const resolution = resolveManagedViewForTerminal(content, snapshot)
+      if (resolution.kind === 'unresolved') {
+        paneIds.add(targetPaneId)
+        throw Object.assign(new Error(MANAGED_VIEW_CLOSE_FAILED_MESSAGE), { paneIds: [...paneIds] })
+      }
+      if (resolution.kind === 'resolved') {
+        paneIds.add(targetPaneId)
+        for (const viewIntentId of resolution.viewIntentIds) targetViewIntentIds.add(viewIntentId)
+      }
+    }
+
+    const otherRepresentations = collectOtherLocalManagedViewIds(state, snapshot, tabId, paneId)
+    return {
+      viewIntentIds: [...targetViewIntentIds].filter((viewIntentId) => !otherRepresentations.has(viewIntentId)),
+      paneIds: [...paneIds],
+      snapshot,
+    }
+  }).catch((error) => {
+    log.warn('could not resolve managed views before local close', {
+      tabId,
+      paneId,
+      error: error instanceof Error ? error.message : String(error),
+    })
+    throw new Error(MANAGED_VIEW_CLOSE_FAILED_MESSAGE)
+  })
+}
+
+function isPromiseLike<T>(value: T | Promise<T>): value is Promise<T> {
+  return typeof (value as { then?: unknown } | null)?.then === 'function'
+}
+
+/**
+ * Persist a managed view visibility change and synchronize the inventory
+ * revision before the caller changes local layout state. A close can otherwise
+ * race an older inventory GET: after the tab is removed, that GET could still
+ * see a visible view and recreate it. The final snapshot advances the store's
+ * revision while the local pane is still present, so older responses are
+ * rejected by the managed-runtime refresh path.
+ *
+ * Repeated panes may reference one view intent; mutate each intent only once.
+ * If a later view mutation fails, the verification read still records any
+ * earlier successful changes. The caller keeps the tab and a retry uses the
+ * current per-view revisions.
+ */
+async function persistManagedViewVisibility(
+  viewIntentIds: string[],
+  visibility: ManagedRuntimeViewVisibility,
+  dispatch: (action: unknown) => void,
+  getState: () => RootState,
+  options: {
+    initialSnapshot?: ManagedRuntimeInventorySnapshot
+  } = {},
+): Promise<void> {
+  if (viewIntentIds.length === 0) return
+  if (!selectManagedRuntime(getState()).available) throw new Error(MANAGED_VIEW_CLOSE_FAILED_MESSAGE)
+
+  const initialSnapshot = options.initialSnapshot ?? await getManagedRuntimeInventory()
+  applyManagedRuntimeInventory(initialSnapshot, dispatch, getState)
+  const currentViews = new Map<string, ManagedRuntimeViewIntent[]>()
+  for (const view of initialSnapshot.viewIntents) {
+    const matches = currentViews.get(view.viewId) ?? []
+    matches.push(view)
+    currentViews.set(view.viewId, matches)
+  }
+  const targetViews = viewIntentIds.map((viewIntentId) => {
+    const matches = currentViews.get(viewIntentId) ?? []
+    if (matches.length !== 1) throw new Error(MANAGED_VIEW_CLOSE_FAILED_MESSAGE)
+    return matches[0]!
+  })
+
+  const needsMutation = targetViews.some((view) => view.visibility !== visibility)
+  if (!needsMutation) return
+
+  let mutationError: unknown
+  for (const view of targetViews) {
+    if (view.visibility === visibility) continue
+    try {
+      await updateManagedRuntimeViewVisibility(
+        view.viewId,
+        visibility,
+        view.revision,
+        view.soulIntentRevision,
+      )
+    } catch (error) {
+      mutationError = error
+      break
+    }
+  }
+
+  let confirmedSnapshot: ManagedRuntimeInventorySnapshot
+  try {
+    confirmedSnapshot = await getManagedRuntimeInventory()
+  } catch (error) {
+    log.warn('could not confirm managed view visibility after update', {
+      viewIntentIds,
+      visibility,
+      error: error instanceof Error ? error.message : String(error),
+    })
+    throw error
+  }
+  applyManagedRuntimeInventory(confirmedSnapshot, dispatch, getState)
+
+  const confirmedViews = new Map<string, ManagedRuntimeViewIntent[]>()
+  for (const view of confirmedSnapshot.viewIntents) {
+    const matches = confirmedViews.get(view.viewId) ?? []
+    matches.push(view)
+    confirmedViews.set(view.viewId, matches)
+  }
+  const unconfirmedIds = viewIntentIds.filter((viewIntentId) => {
+    const matches = confirmedViews.get(viewIntentId) ?? []
+    return matches.length !== 1 || matches[0]!.visibility !== visibility
+  })
+  if (mutationError !== undefined) throw mutationError
+  if (unconfirmedIds.length > 0) {
+    throw new Error(`Managed view visibility was not confirmed for ${unconfirmedIds.join(', ')}`)
+  }
+}
+
 /**
  * Close a pane and clean up its attention state.
  * If the target pane is the tab's only pane, closes the tab instead.
@@ -1316,7 +1610,8 @@ function reassertKeptPanesOpen(
 export const closePaneWithCleanup = createAsyncThunk(
   'tabs/closePaneWithCleanup',
   async ({ tabId, paneId }: { tabId: string; paneId: string }, { dispatch, getState }) => {
-    const before = (getState() as RootState).panes.layouts[tabId]
+    const initialState = getState() as RootState
+    const before = initialState.panes.layouts[tabId]
     if (before?.type === 'leaf' && before.id === paneId) {
       await dispatch(closeTab(tabId))
       return
@@ -1332,68 +1627,88 @@ export const closePaneWithCleanup = createAsyncThunk(
     // removal, the second removal was refused by the last-leaf rule, and the
     // survivor stayed displayed under a durable close record (its ack
     // SUCCEEDED, so no heal fired) — recovery omitted a genuinely open pane.
-    if (hasAnyClosePending((getState() as RootState).panes, tabId)) {
+    if (hasAnyClosePending(initialState.panes, tabId)) {
       log.warn('refusing to start a pane close while a close is already in flight for its tab', { tabId, paneId })
       return
     }
-    // F2: confirm the durable close evidence BEFORE the layout loses the pane.
     const identity = collectPaneCloseIdentities(before).filter((i) => i.paneId === paneId)
-    const managedViews = collectManagedViewProjections(before).filter((view) => view.paneId === paneId)
-    if (identity.length > 0) {
-      // Focused-episode-7 round 5 (Finding F2): freeze THIS pane's identity
-      // while the acknowledgement is outstanding — the one shared guard
-      // (`isPaneClosePending`) refuses every identity-changing fold of the
-      // pane (clearDeadTerminals/clearTerminalLiveHandles re-mints,
-      // repairCodexIdentityMismatch, identity-changing updatePaneContent /
-      // mergePaneContent / restartFreshAgentCreate folds, hydrate re-keys)
-      // so the ack always covers exactly the identity the removal drops.
+    const freezePane = identity.length > 0
+    if (freezePane) {
+      // Freeze the pane identity while its close acknowledgement and managed
+      // visibility transition are outstanding.
       dispatch(markPaneClosing({ tabId, paneId }))
     }
     try {
-      if (identity.length > 0) {
-        const failed = await awaitPaneCloseEvidence(identity)
-        if (failed.length > 0) {
-          log.warn('pane close evidence was not confirmed; the pane stays', { tabId, paneId })
-          surfacePaneCloseFailures(dispatch, tabId, failed)
-          // The display check (round-8 F2) re-reads the CURRENT layout
-          // post-wait — re-assert only what is still displayed.
+      await withManagedVisibilityTransition(async () => {
+        if (identity.length > 0) {
+          const failed = await awaitPaneCloseEvidence(identity)
+          if (failed.length > 0) {
+            log.warn('pane close evidence was not confirmed; the pane stays', { tabId, paneId })
+            surfacePaneCloseFailures(dispatch, tabId, failed)
+            reassertKeptPanesOpen((getState() as RootState).panes.layouts[tabId], tabId, identity)
+            return
+          }
+        }
+
+        let managedViews: ManagedViewCloseResolution
+        try {
+          const resolution = resolveManagedViewIntentsToRemove(
+            getState() as RootState,
+            tabId,
+            paneId,
+            dispatch,
+            getState as () => RootState,
+          )
+          managedViews = isPromiseLike(resolution) ? await resolution : resolution
+        } catch (error) {
+          log.warn('managed view identity could not be resolved; the pane stays open', {
+            tabId,
+            paneId,
+            error: error instanceof Error ? error.message : String(error),
+          })
+          dispatch(setPaneCloseError({ tabId, paneId, error: MANAGED_VIEW_CLOSE_FAILED_MESSAGE }))
           reassertKeptPanesOpen((getState() as RootState).panes.layouts[tabId], tabId, identity)
           return
         }
-      }
-      if (managedViews.length > 0 && !await detachManagedViews(managedViews, tabId, getState)) {
-        log.warn('managed view detach was not confirmed; the pane stays', { tabId, paneId })
-        surfaceManagedViewDetachFailure(dispatch, tabId, identity.length > 0 ? identity : managedViews)
-        reassertKeptPanesOpen((getState() as RootState).panes.layouts[tabId], tabId, identity)
-        return
-      }
+        if (managedViews.viewIntentIds.length > 0) {
+          try {
+            await persistManagedViewVisibility(
+              managedViews.viewIntentIds,
+              'detached',
+              dispatch,
+              getState as () => RootState,
+              { initialSnapshot: managedViews.snapshot },
+            )
+          } catch (error) {
+            log.warn('managed view detachment was not confirmed; the pane stays open', {
+              tabId,
+              paneId,
+              viewIntentIds: managedViews.viewIntentIds,
+              error: error instanceof Error ? error.message : String(error),
+            })
+            dispatch(setPaneCloseError({ tabId, paneId, error: MANAGED_VIEW_CLOSE_FAILED_MESSAGE }))
+            reassertKeptPanesOpen((getState() as RootState).panes.layouts[tabId], tabId, identity)
+            return
+          }
+        }
+
+        dispatch(closePane({ tabId, paneId }))
+        const after = (getState() as RootState).panes.layouts[tabId]
+        if (after && findPaneContent(after, paneId)) {
+          log.warn('pane removal was refused after managed view detachment; the pane stays open', { tabId, paneId })
+          dispatch(setPaneCloseError({ tabId, paneId, error: PANE_CLOSE_REMOVAL_REFUSED_MESSAGE }))
+          reassertKeptPanesOpen(after, tabId, identity)
+          return
+        }
+
+        if (before !== after) {
+          clearDraft(paneId)
+          dispatch(clearPaneAttention({ paneId }))
+          dispatch(clearTabAttention({ tabId }))
+        }
+      })
     } finally {
-      // The removal flows next (removals are never refused); the freeze
-      // lifts with the evidence and managed-view transaction either way.
-      if (identity.length > 0) dispatch(clearPaneClosing({ tabId, paneId }))
-    }
-    dispatch(closePane({ tabId, paneId }))
-    const after = (getState() as RootState).panes.layouts[tabId]
-    // Delta-round-9 — the removal-refusal compensation: the ack SUCCEEDED but
-    // the layout refused the removal (the last-leaf rule — the pane became
-    // the tab's only pane while the acknowledgement was outstanding). The
-    // pane stays displayed and running under a durable close record, and the
-    // ack's success means no failure/timeout heal ever fires: recovery would
-    // omit a genuinely open pane. Treat the close as failed for durable
-    // purposes — re-assert the pane open (the fenced consume ⇒ the survivor
-    // is restorable again) and surface the normal error chrome. The per-tab
-    // close serialization above makes the two-gated-thunk interleave
-    // unreachable; this is the defense for EVERY removal path.
-    if (identity.length > 0 && after && findPaneContent(after, paneId)) {
-      log.warn('the pane close evidence committed but the layout refused the removal; the pane stays open and is re-asserted', { tabId, paneId })
-      dispatch(setPaneCloseError({ tabId, paneId, error: PANE_CLOSE_REMOVAL_REFUSED_MESSAGE }))
-      reassertKeptPanesOpen(after, tabId, identity)
-      return
-    }
-    if (before !== after) {
-      clearDraft(paneId)
-      dispatch(clearPaneAttention({ paneId }))
-      dispatch(clearTabAttention({ tabId }))
+      if (freezePane) dispatch(clearPaneClosing({ tabId, paneId }))
     }
   }
 )
@@ -1455,142 +1770,186 @@ export const closeTab = createAsyncThunk(
     const managedViews = collectManagedViewProjections(frozenLayout)
     dispatch(markTabClosing({ tabId }))
     try {
-      if (identities.length > 0) {
-        const ack = await sendPanesClosedAndAwait(tabId, identities, { timeoutMs: KILL_ACK_TIMEOUT_MS })
-        if (!ack.ok) {
-          log.warn('tab close evidence was not confirmed; the tab stays', {
+      await withManagedVisibilityTransition(async () => {
+        if (identities.length > 0) {
+          const ack = await sendPanesClosedAndAwait(tabId, identities, { timeoutMs: KILL_ACK_TIMEOUT_MS })
+          if (!ack.ok) {
+            log.warn('tab close evidence was not confirmed; the tab stays', {
+              tabId,
+              gatedPanes: identities.map((i) => i.paneId),
+            })
+            const timedOut = ack.timedOut === true
+            surfacePaneCloseFailures(dispatch, tabId, identities.map((identity) => ({ identity, timedOut })))
+            reassertKeptPanesOpen((getState() as RootState).panes.layouts[tabId], tabId, identities)
+            return
+          }
+          for (const identity of identities) {
+            markPaneCloseEvidenceConfirmed(identity.createRequestId)
+          }
+        }
+
+        let managedViews: ManagedViewCloseResolution
+        try {
+          const resolution = resolveManagedViewIntentsToRemove(
+            getState() as RootState,
             tabId,
-            gatedPanes: identities.map((i) => i.paneId),
+            undefined,
+            dispatch,
+            getState as () => RootState,
+          )
+          managedViews = isPromiseLike(resolution) ? await resolution : resolution
+        } catch (error) {
+          log.warn('managed view identity could not be resolved; the tab stays open', {
+            tabId,
+            error: error instanceof Error ? error.message : String(error),
           })
-          const timedOut = ack.timedOut === true
-          surfacePaneCloseFailures(dispatch, tabId, identities.map((identity) => ({ identity, timedOut })))
-          // The display check (round-8 F2) re-reads the CURRENT layout
-          // post-wait — re-assert only what is still displayed.
+          for (const identity of identities) {
+            dispatch(setPaneCloseError({
+              tabId,
+              paneId: identity.paneId,
+              error: MANAGED_VIEW_CLOSE_FAILED_MESSAGE,
+            }))
+          }
           reassertKeptPanesOpen((getState() as RootState).panes.layouts[tabId], tabId, identities)
           return
         }
-        // Confirmed: mark every identity so the detach middleware's belt
-        // skips the redundant duplicate sends (the one-shot mark/consume
-        // pattern).
-        for (const identity of identities) {
-          markPaneCloseEvidenceConfirmed(identity.createRequestId)
+        if (managedViews.viewIntentIds.length > 0) {
+          try {
+            await persistManagedViewVisibility(
+              managedViews.viewIntentIds,
+              'detached',
+              dispatch,
+              getState as () => RootState,
+              { initialSnapshot: managedViews.snapshot },
+            )
+          } catch (error) {
+            log.warn('managed view detachment was not confirmed; the tab stays open', {
+              tabId,
+              viewIntentIds: managedViews.viewIntentIds,
+              error: error instanceof Error ? error.message : String(error),
+            })
+            for (const identity of identities) {
+              dispatch(setPaneCloseError({
+                tabId,
+                paneId: identity.paneId,
+                error: MANAGED_VIEW_CLOSE_FAILED_MESSAGE,
+              }))
+            }
+            reassertKeptPanesOpen((getState() as RootState).panes.layouts[tabId], tabId, identities)
+            return
+          }
         }
-      }
-      if (managedViews.length > 0 && !await detachManagedViews(managedViews, tabId, getState)) {
-        log.warn('managed view detach was not confirmed; the tab stays', { tabId })
-        surfaceManagedViewDetachFailure(dispatch, tabId, identities.length > 0 ? identities : managedViews)
-        reassertKeptPanesOpen((getState() as RootState).panes.layouts[tabId], tabId, identities)
-        return
-      }
-      const tabRegistryState = (stateAtClose as { tabRegistry?: RootState['tabRegistry'] }).tabRegistry
-      const serverInstanceId = stateAtClose.connection?.serverInstanceId || UNKNOWN_SERVER_INSTANCE_ID
-      if (frozenTab && frozenLayout && tabRegistryState) {
-        const paneCount = countPaneLeaves(frozenLayout)
-        const openDurationMs = Math.max(0, Date.now() - (frozenTab.createdAt || Date.now()))
-        const keep = shouldKeepClosedTab({
-          openDurationMs,
-          paneCount,
-          titleSetByUser: !!frozenTab.titleSetByUser,
-        })
-        if (keep) {
-          dispatch(recordClosedTabSnapshot(buildClosedTabRegistryRecord({
-            tab: frozenTab,
+
+        const tabRegistryState = (stateAtClose as { tabRegistry?: RootState['tabRegistry'] }).tabRegistry
+        const serverInstanceId = stateAtClose.connection?.serverInstanceId || UNKNOWN_SERVER_INSTANCE_ID
+        if (frozenTab && frozenLayout && tabRegistryState) {
+          const paneCount = countPaneLeaves(frozenLayout)
+          const openDurationMs = Math.max(0, Date.now() - (frozenTab.createdAt || Date.now()))
+          const keep = shouldKeepClosedTab({
+            openDurationMs,
+            paneCount,
+            titleSetByUser: !!frozenTab.titleSetByUser,
+          })
+          if (keep) {
+            dispatch(recordClosedTabSnapshot(buildClosedTabRegistryRecord({
+              tab: frozenTab,
+              layout: frozenLayout,
+              serverInstanceId,
+              paneTitles: frozenPaneTitles,
+              extensions: stateAtClose.extensions?.entries,
+              deviceId: tabRegistryState.deviceId,
+              deviceLabel: tabRegistryState.deviceLabel,
+              revision: 0,
+              updatedAt: Date.now(),
+            })))
+          }
+        }
+
+        // Push to the reopen stack so Alt+H can restore this tab
+        if (frozenTab && frozenLayout) {
+          dispatch(pushReopenEntry({
+            tab: { ...frozenTab },
             layout: frozenLayout,
-            serverInstanceId,
-            paneTitles: frozenPaneTitles,
-            extensions: stateAtClose.extensions?.entries,
-            deviceId: tabRegistryState.deviceId,
-            deviceLabel: tabRegistryState.deviceLabel,
-            revision: 0,
-            updatedAt: Date.now(),
-          })))
-        }
-      }
-
-      // Push to the reopen stack so Alt+H can restore this tab
-      if (frozenTab && frozenLayout) {
-        dispatch(pushReopenEntry({
-          tab: { ...frozenTab },
-          layout: frozenLayout,
-          paneTitles: frozenPaneTitles || {},
-          paneTitleSetByUser: frozenPaneTitleSetByUser || {},
-          closedAt: Date.now(),
-        }))
-      }
-
-      // Closing a tab counts as a user touch on its sessions: ratchet each
-      // one's locally-stored activity timestamp at close-commit time so the
-      // just-closed session floats to the top of the grey section under the
-      // default 'activity' sort (the grey tier consumes the ratchet with
-      // presence-priority — compareByStatusTiers in
-      // selectors/sidebarSelectors.ts). Two loops over the frozen pre-close
-      // snapshot, both ratchet-only (updateSessionActivity never lowers a
-      // stored value):
-      //
-      // 1. Canonical session refs — collectSessionRefsFromTabs covers both
-      //    layout leaves and layout-less tabs (buildTabFallbackLocator).
-      // 2. Leaf contents whose own locators are empty but still correspond
-      //    to sidebar rows: registry-only canonical identity (sessionRef /
-      //    codex durability known only to the terminal directory),
-      //    identity-less live-terminal fallback rows keyed
-      //    `<mode>:terminal:<terminalId>`, and terminals whose directory
-      //    entry hasn't loaded yet — liveTerminalRowIdentity resolves the
-      //    right key (or none) per content.
-      //
-      // Unconditional by design: REST/MCP/server-broadcast closes flow
-      // through this same thunk on every connected client (ui-commands.ts
-      // tab.close → closeTab), so a mirrored close ratchets too —
-      // harmless-to-useful under ratchet-only semantics. The app-level
-      // grey-transition touch watcher (store/sessionGreyTouch.ts) also
-      // touches tier-visible keys at close; the overlap is equally harmless.
-      if (frozenTab) {
-        const touchedAt = Date.now()
-        for (const ref of collectSessionRefsFromTabs([frozenTab], stateAtClose.panes)) {
-          dispatch(updateSessionActivity({
-            sessionId: ref.sessionId,
-            provider: ref.provider,
-            lastInputAt: touchedAt,
+            paneTitles: frozenPaneTitles || {},
+            paneTitleSetByUser: frozenPaneTitleSetByUser || {},
+            closedAt: Date.now(),
           }))
         }
-        if (frozenLayout) {
-          const directoryItems = (stateAtClose as {
-            terminalDirectory?: RootState['terminalDirectory']
-          }).terminalDirectory?.windows?.sidebar?.items
-          for (const content of collectPaneContents(frozenLayout)) {
-            const identity = liveTerminalRowIdentity(
-              content,
-              content.kind === 'terminal' && content.terminalId
-                ? directoryItems?.find((item) => item.terminalId === content.terminalId)
-                : undefined,
-            )
-            if (!identity) continue
-            // identity.key is pre-composed and contains colons, so
-            // makeSessionKey passes it through unchanged (provider is kept
-            // for dispatch parity with the canonical loop above, not for
-            // key construction).
+
+        // Closing a tab counts as a user touch on its sessions: ratchet each
+        // one's locally-stored activity timestamp at close-commit time so the
+        // just-closed session floats to the top of the grey section under the
+        // default 'activity' sort (the grey tier consumes the ratchet with
+        // presence-priority — compareByStatusTiers in
+        // selectors/sidebarSelectors.ts). Two loops over the frozen pre-close
+        // snapshot, both ratchet-only (updateSessionActivity never lowers a
+        // stored value):
+        //
+        // 1. Canonical session refs — collectSessionRefsFromTabs covers both
+        //    layout leaves and layout-less tabs (buildTabFallbackLocator).
+        // 2. Leaf contents whose own locators are empty but still correspond
+        //    to sidebar rows: registry-only canonical identity (sessionRef /
+        //    codex durability known only to the terminal directory),
+        //    identity-less live-terminal fallback rows keyed
+        //    `<mode>:terminal:<terminalId>`, and terminals whose directory
+        //    entry hasn't loaded yet — liveTerminalRowIdentity resolves the
+        //    right key (or none) per content.
+        //
+        // Unconditional by design: REST/MCP/server-broadcast closes flow
+        // through this same thunk on every connected client (ui-commands.ts
+        // tab.close → closeTab), so a mirrored close ratchets too —
+        // harmless-to-useful under ratchet-only semantics. The app-level
+        // grey-transition touch watcher (store/sessionGreyTouch.ts) also
+        // touches tier-visible keys at close; the overlap is equally harmless.
+        if (frozenTab) {
+          const touchedAt = Date.now()
+          for (const ref of collectSessionRefsFromTabs([frozenTab], stateAtClose.panes)) {
             dispatch(updateSessionActivity({
-              sessionId: identity.key,
-              provider: identity.provider,
+              sessionId: ref.sessionId,
+              provider: ref.provider,
               lastInputAt: touchedAt,
             }))
           }
+          if (frozenLayout) {
+            const directoryItems = (stateAtClose as {
+              terminalDirectory?: RootState['terminalDirectory']
+            }).terminalDirectory?.windows?.sidebar?.items
+            for (const content of collectPaneContents(frozenLayout)) {
+              const identity = liveTerminalRowIdentity(
+                content,
+                content.kind === 'terminal' && content.terminalId
+                  ? directoryItems?.find((item) => item.terminalId === content.terminalId)
+                  : undefined,
+              )
+              if (!identity) continue
+              // identity.key is pre-composed and contains colons, so
+              // makeSessionKey passes it through unchanged (provider is kept
+              // for dispatch parity with the canonical loop above, not for
+              // key construction).
+              dispatch(updateSessionActivity({
+                sessionId: identity.key,
+                provider: identity.provider,
+                lastInputAt: touchedAt,
+              }))
+            }
+          }
         }
-      }
 
-      // The frozen set is authoritative (F3): remove the tab and the layout
-      // and clean up exactly the panes the acknowledged batch covered — with
-      // the freeze above, the current layout equals it by construction.
-      const paneIds = collectPaneIds(frozenLayout)
+        // The frozen set is authoritative (F3): remove the tab and the layout
+        // and clean up exactly the panes the acknowledged batch covered — with
+        // the freeze above, the current layout equals it by construction.
+        const paneIds = collectPaneIds(frozenLayout)
 
-      dispatch(removeTab(tabId))
-      dispatch(removeLayout({ tabId }))
+        dispatch(removeTab(tabId))
+        dispatch(removeLayout({ tabId }))
 
-      // Clean up attention and drafts for the tab and all its panes
-      dispatch(clearTabAttention({ tabId }))
-      for (const paneId of paneIds) {
-        dispatch(clearPaneAttention({ paneId }))
-        clearDraft(paneId)
-      }
+        // Clean up attention and drafts for the tab and all its panes
+        dispatch(clearTabAttention({ tabId }))
+        for (const paneId of paneIds) {
+          dispatch(clearPaneAttention({ paneId }))
+          clearDraft(paneId)
+        }
+      })
     } finally {
       // removeLayout already cleared the flag on the success path; this
       // covers the failure return and any throw — a stuck flag would freeze
@@ -1598,6 +1957,29 @@ export const closeTab = createAsyncThunk(
       dispatch(clearTabClosing({ tabId }))
     }
   }
+)
+
+/** Detach a recovery-panel view that has no local tab or pane representation. */
+export const detachManagedRuntimeView = createAsyncThunk(
+  'tabs/detachManagedRuntimeView',
+  async (viewIntentId: string, { dispatch, getState }) => {
+    await withManagedVisibilityTransition(async () => {
+      if (!selectManagedRuntime(getState() as RootState).available) {
+        throw new Error(MANAGED_VIEW_CLOSE_FAILED_MESSAGE)
+      }
+      const snapshot = await getManagedRuntimeInventory()
+      applyManagedRuntimeInventory(snapshot, dispatch, getState as () => RootState)
+      const matches = snapshot.viewIntents.filter((view) => view.viewId === viewIntentId)
+      if (matches.length !== 1) throw new Error(MANAGED_VIEW_CLOSE_FAILED_MESSAGE)
+      await persistManagedViewVisibility(
+        [viewIntentId],
+        'detached',
+        dispatch,
+        getState as () => RootState,
+        { initialSnapshot: snapshot },
+      )
+    })
+  },
 )
 
 /**
@@ -1614,46 +1996,91 @@ export const replacePaneWithCleanup = createAsyncThunk(
     // single-pane close of the discarded pane, so it rejects while ANY close
     // touching the tab is already outstanding — the pane's own close, a
     // DIFFERENT pane's close, or the whole tab's — never deferred.
-    if (hasAnyClosePending((getState() as RootState).panes, tabId)) {
+    const initialState = getState() as RootState
+    if (hasAnyClosePending(initialState.panes, tabId)) {
       log.warn('refusing to start a pane replace while a close is already in flight for its tab', { tabId, paneId })
       return
     }
-    const layout = (getState() as RootState).panes.layouts[tabId]
-    const identity = collectPaneCloseIdentities(layout).filter((i) => i.paneId === paneId)
-    const managedViews = collectManagedViewProjections(layout).filter((view) => view.paneId === paneId)
-    if (identity.length > 0) {
-      // Focused-episode-7 round 5 (Finding F2): freeze the discarded pane's
-      // identity while the acknowledgement is outstanding (the same shared
-      // guard as the single-pane close).
+    const before = initialState.panes.layouts[tabId]
+    const identity = collectPaneCloseIdentities(before).filter((i) => i.paneId === paneId)
+    const freezePane = identity.length > 0
+    if (freezePane) {
       dispatch(markPaneClosing({ tabId, paneId }))
     }
+    let paneFreezeHeld = freezePane
     try {
-      if (identity.length > 0) {
-        const failed = await awaitPaneCloseEvidence(identity)
-        if (failed.length > 0) {
-          log.warn('replace-pane close evidence was not confirmed; the pane keeps its content', {
+      await withManagedVisibilityTransition(async () => {
+        if (identity.length > 0) {
+          const failed = await awaitPaneCloseEvidence(identity)
+          if (failed.length > 0) {
+            log.warn('replace-pane close evidence was not confirmed; the pane keeps its content', {
+              tabId,
+              paneId,
+            })
+            surfacePaneCloseFailures(dispatch, tabId, failed)
+            reassertKeptPanesOpen((getState() as RootState).panes.layouts[tabId], tabId, identity)
+            return
+          }
+        }
+
+        let managedViews: ManagedViewCloseResolution
+        try {
+          const resolution = resolveManagedViewIntentsToRemove(
+            getState() as RootState,
             tabId,
             paneId,
+            dispatch,
+            getState as () => RootState,
+          )
+          managedViews = isPromiseLike(resolution) ? await resolution : resolution
+        } catch (error) {
+          log.warn('managed view identity could not be resolved; the pane keeps its content', {
+            tabId,
+            paneId,
+            error: error instanceof Error ? error.message : String(error),
           })
-          surfacePaneCloseFailures(dispatch, tabId, failed)
-          // The display check (round-8 F2) re-reads the CURRENT layout
-          // post-wait — re-assert only what is still displayed.
+          dispatch(setPaneCloseError({ tabId, paneId, error: MANAGED_VIEW_CLOSE_FAILED_MESSAGE }))
           reassertKeptPanesOpen((getState() as RootState).panes.layouts[tabId], tabId, identity)
           return
         }
-      }
-      if (managedViews.length > 0 && !await detachManagedViews(managedViews, tabId, getState)) {
-        log.warn('managed view detach was not confirmed; the pane keeps its content', { tabId, paneId })
-        surfaceManagedViewDetachFailure(dispatch, tabId, identity.length > 0 ? identity : managedViews)
-        reassertKeptPanesOpen((getState() as RootState).panes.layouts[tabId], tabId, identity)
-        return
-      }
+        if (managedViews.viewIntentIds.length > 0) {
+          try {
+            await persistManagedViewVisibility(
+              managedViews.viewIntentIds,
+              'detached',
+              dispatch,
+              getState as () => RootState,
+              { initialSnapshot: managedViews.snapshot },
+            )
+          } catch (error) {
+            log.warn('managed view detachment was not confirmed; the pane keeps its content', {
+              tabId,
+              paneId,
+              viewIntentIds: managedViews.viewIntentIds,
+              error: error instanceof Error ? error.message : String(error),
+            })
+            dispatch(setPaneCloseError({ tabId, paneId, error: MANAGED_VIEW_CLOSE_FAILED_MESSAGE }))
+            reassertKeptPanesOpen((getState() as RootState).panes.layouts[tabId], tabId, identity)
+            return
+          }
+        }
+
+        if (paneFreezeHeld) {
+          dispatch(clearPaneClosing({ tabId, paneId }))
+          paneFreezeHeld = false
+        }
+        dispatch(replacePane({ tabId, paneId }))
+        const after = (getState() as RootState).panes.layouts[tabId]
+        const afterContent = after ? findPaneContent(after, paneId) : null
+        if (afterContent && afterContent.kind !== 'picker') {
+          log.warn('pane replacement was refused after managed view detachment; the pane keeps its content', { tabId, paneId })
+          dispatch(setPaneCloseError({ tabId, paneId, error: PANE_CLOSE_REMOVAL_REFUSED_MESSAGE }))
+          reassertKeptPanesOpen(after, tabId, identity)
+        }
+      })
     } finally {
-      // The gate's own follow-through: lift the freeze before replacePane —
-      // replacePane is itself a guarded identity-changing reducer.
-      if (identity.length > 0) dispatch(clearPaneClosing({ tabId, paneId }))
+      if (paneFreezeHeld) dispatch(clearPaneClosing({ tabId, paneId }))
     }
-    dispatch(replacePane({ tabId, paneId }))
   }
 )
 
@@ -1665,6 +2092,7 @@ export const reopenClosedTab = createAsyncThunk(
     if (stack.length === 0) return
 
     const entry = stack[stack.length - 1]
+    const managedViewIntentIds = collectManagedViewIntentIds(entry.tab, entry.layout)
     dispatch(popReopenEntry())
 
     const newTabId = nanoid()
@@ -1678,8 +2106,7 @@ export const reopenClosedTab = createAsyncThunk(
       codingCliProvider: entry.tab.codingCliProvider,
       resumeSessionId: entry.tab.resumeSessionId,
       sessionMetadataByKey: entry.tab.sessionMetadataByKey,
-      // Unified agent names (Task 6): the reopened tab keeps the frozen
-      // pointer — restoreLayout preserves the layout's pane ids verbatim.
+      // The reopened tab keeps the frozen unified-name pointer.
       nameSource: entry.tab.nameSource,
     }))
     dispatch(restoreLayout({
@@ -1687,7 +2114,25 @@ export const reopenClosedTab = createAsyncThunk(
       layout: entry.layout,
       paneTitles: entry.paneTitles,
       paneTitleSetByUser: entry.paneTitleSetByUser,
+      preserveManagedRuntimeHandles: true,
     }))
+
+    try {
+      await withManagedVisibilityTransition(async () => {
+        await persistManagedViewVisibility(
+          managedViewIntentIds,
+          'visible',
+          dispatch,
+          getState as () => RootState,
+        )
+      })
+    } catch (error) {
+      log.warn('reopened tab is local but its managed view could not be made visible for recovery', {
+        tabId: newTabId,
+        viewIntentIds: managedViewIntentIds,
+        error: error instanceof Error ? error.message : String(error),
+      })
+    }
   }
 )
 

@@ -1,0 +1,544 @@
+import { configureStore } from '@reduxjs/toolkit'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import tabsReducer, { addTab, closePaneWithCleanup, closeTab, reopenClosedTab, replacePaneWithCleanup } from '../../../../src/store/tabsSlice'
+import panesReducer, { initLayout, splitPane, updatePaneContent } from '../../../../src/store/panesSlice'
+import managedRuntimeReducer, { managedRuntimeSnapshotReceived, setManagedRuntimeAvailable } from '../../../../src/store/managedRuntimeSlice'
+import tabRegistryReducer from '../../../../src/store/tabRegistrySlice'
+import {
+  buildManagedRuntimeMergePlan,
+  queueManagedRuntimeRefresh,
+  resetManagedRuntimeRefreshForTest,
+} from '../../../../src/lib/recovery/managed-runtime-recovery'
+import type {
+  ManagedRuntimeInventorySnapshot,
+  ManagedRuntimeSoul,
+  ManagedRuntimeViewIntent,
+} from '@shared/managed-runtime'
+
+const apiMocks = vi.hoisted(() => ({
+  getManagedRuntimeInventory: vi.fn(),
+  updateManagedRuntimeViewVisibility: vi.fn(),
+}))
+
+vi.mock('@/lib/api', async (importOriginal) => {
+  const original = await importOriginal<typeof import('@/lib/api')>()
+  return { ...original, ...apiMocks }
+})
+
+const wsMock = vi.hoisted(() => ({
+  handlers: new Set<(message: unknown) => void>(),
+  sent: [] as unknown[],
+}))
+
+vi.mock('@/lib/ws-client', () => ({
+  getWsClient: () => ({
+    send: (message: unknown) => {
+      wsMock.sent.push(message)
+      const frame = message as { type?: string; requestId?: string }
+      if (frame.type === 'pane.closed') {
+        const paneFrame = message as { createRequestId?: string }
+        for (const handler of [...wsMock.handlers]) {
+          handler({ type: 'pane.closed.result', createRequestId: paneFrame.createRequestId, success: true })
+        }
+        return
+      }
+      if (frame.type !== 'panes.closed' || !frame.requestId) return
+      for (const handler of [...wsMock.handlers]) {
+        handler({ type: 'panes.closed.result', requestId: frame.requestId, success: true })
+      }
+    },
+    onMessage: (handler: (message: unknown) => void) => {
+      wsMock.handlers.add(handler)
+      return () => wsMock.handlers.delete(handler)
+    },
+  }),
+  resetWsClientForTests: vi.fn(),
+}))
+
+function soul(soulId: string): ManagedRuntimeSoul {
+  return {
+    soulId,
+    incarnationId: `incarnation-${soulId}`,
+    launchState: 'running',
+    cleanupState: 'none',
+    intentRevision: 5,
+    executionGeneration: 1,
+    effectiveLimits: { cpuMilli: 500, memoryBytes: 134_217_728, swapBytes: 0, pidsMax: 64 },
+    configuredLimits: { cpuMilli: 500, memoryBytes: 134_217_728, swapBytes: 0, pidsMax: 64 },
+    terminalId: `terminal-${soulId}`,
+    terminalStreamId: `stream-${soulId}`,
+    terminalMode: 'opencode',
+    terminalCwd: '/workspace',
+    terminalCreateRequestId: `create-${soulId}`,
+    projectKey: 'workspace-one',
+    profile: 'default_agent',
+    desiredState: 'running',
+    recoveryState: 'live',
+    durabilityState: 'resume_captured',
+    allocationState: 'verified_durable',
+    provider: 'opencode',
+    nativeSessionId: `session-${soulId}`,
+    evidenceRevision: 2,
+    successfulRecoveriesInWindow: 1,
+  }
+}
+
+function view(viewId: string, paneIndex: number): ManagedRuntimeViewIntent {
+  return {
+    viewId,
+    soulId: `soul-${viewId}`,
+    ownerId: 'installation-one',
+    workspaceId: 'workspace-one',
+    kind: 'automatic_primary',
+    preferredTabId: 'managed-tab',
+    preferredPaneId: `managed-pane-${paneIndex}`,
+    title: `Managed ${viewId}`,
+    placementGroup: 'Recovered agents',
+    visibility: 'visible',
+    revision: 2,
+    soulIntentRevision: 5,
+    createdAt: 1,
+    updatedAt: 2,
+  }
+}
+
+function inventory(
+  revision: number,
+  viewIntents: ManagedRuntimeViewIntent[],
+): ManagedRuntimeInventorySnapshot {
+  const soulIds = [...new Set(viewIntents.map((entry) => entry.soulId))]
+  return {
+    revision,
+    readiness: {
+      inventoryRevision: revision,
+      initialScanState: 'complete',
+      initialScanStartedAt: 1,
+      initialScanFinishedAt: 2,
+      blockedSubsystems: [],
+      startupRecoveryConcurrencyLimit: 4,
+      startupRecoveryPeak: 2,
+      initialScanDurationMs: 1,
+    },
+    souls: soulIds.map(soul),
+    viewIntents,
+    pendingProjectionCount: 0,
+  }
+}
+
+function managedContent(viewIntent: ManagedRuntimeViewIntent) {
+  const managedSoul = soul(viewIntent.soulId)
+  return {
+    kind: 'terminal' as const,
+    createRequestId: managedSoul.terminalCreateRequestId!,
+    terminalId: managedSoul.terminalId,
+    streamId: managedSoul.terminalStreamId,
+    status: 'running' as const,
+    mode: 'opencode' as const,
+    shell: 'system' as const,
+    sessionRef: { provider: 'opencode' as const, sessionId: managedSoul.nativeSessionId! },
+    soulId: viewIntent.soulId,
+    viewIntentId: viewIntent.viewId,
+    viewIntentRevision: viewIntent.revision,
+    soulIntentRevision: viewIntent.soulIntentRevision,
+  }
+}
+
+function createStore(viewRefs: string[], current = inventory(8, [...new Map(
+  viewRefs.map((viewId, index) => [viewId, view(viewId, index)]),
+).values()])) {
+  const store = configureStore({
+    reducer: {
+      tabs: tabsReducer,
+      panes: panesReducer,
+      managedRuntime: managedRuntimeReducer,
+      tabRegistry: tabRegistryReducer,
+    },
+  })
+  store.dispatch(managedRuntimeSnapshotReceived({ snapshot: current, reconstructedViewCount: 0 }))
+  const firstView = current.viewIntents.find((entry) => entry.viewId === viewRefs[0])!
+  store.dispatch(addTab({
+    id: 'managed-tab',
+    title: 'Managed agents',
+    mode: 'opencode',
+    viewIntentId: firstView.viewId,
+    viewIntentRevision: firstView.revision,
+    soulIntentRevision: firstView.soulIntentRevision,
+  }))
+  store.dispatch(initLayout({
+    tabId: 'managed-tab',
+    paneId: 'managed-pane-0',
+    content: managedContent(firstView),
+  }))
+  for (let index = 1; index < viewRefs.length; index += 1) {
+    const nextView = current.viewIntents.find((entry) => entry.viewId === viewRefs[index])!
+    store.dispatch(splitPane({
+      tabId: 'managed-tab',
+      paneId: 'managed-pane-0',
+      direction: 'vertical',
+      newPaneId: `managed-pane-${index}`,
+      newContent: managedContent(nextView),
+    }))
+  }
+  return store
+}
+
+function withVisibility(
+  snapshot: ManagedRuntimeInventorySnapshot,
+  viewId: string,
+  visibility: ManagedRuntimeViewIntent['visibility'],
+): ManagedRuntimeInventorySnapshot {
+  return {
+    ...snapshot,
+    revision: snapshot.revision + 1,
+    readiness: { ...snapshot.readiness, inventoryRevision: snapshot.revision + 1 },
+    viewIntents: snapshot.viewIntents.map((entry) => entry.viewId === viewId
+      ? { ...entry, visibility, revision: entry.revision + 1, updatedAt: entry.updatedAt + 1 }
+      : entry),
+  }
+}
+
+function deferred<T>() {
+  let resolve!: (value: T) => void
+  let reject!: (reason?: unknown) => void
+  const promise = new Promise<T>((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise
+    reject = rejectPromise
+  })
+  return { promise, resolve, reject }
+}
+
+describe('closeTab managed runtime visibility', () => {
+  beforeEach(() => {
+    vi.clearAllMocks()
+    wsMock.handlers.clear()
+    wsMock.sent = []
+    resetManagedRuntimeRefreshForTest()
+  })
+
+  afterEach(() => {
+    resetManagedRuntimeRefreshForTest()
+  })
+
+  it('detaches a created terminal whose local view projection is delayed', async () => {
+    let serverSnapshot = inventory(8, [view('view-a', 0)])
+    const store = createStore(['view-a'], serverSnapshot)
+    store.dispatch(updatePaneContent({
+      tabId: 'managed-tab',
+      paneId: 'managed-pane-0',
+      content: {
+        kind: 'terminal',
+        createRequestId: 'create-soul-view-a',
+        terminalId: 'terminal-soul-view-a',
+        status: 'running',
+        mode: 'opencode',
+      },
+    }))
+    apiMocks.getManagedRuntimeInventory.mockImplementation(async () => serverSnapshot)
+    apiMocks.updateManagedRuntimeViewVisibility.mockImplementation(async (viewId: string, visibility: ManagedRuntimeViewIntent['visibility']) => {
+      serverSnapshot = withVisibility(serverSnapshot, viewId, visibility)
+      return serverSnapshot.viewIntents.find((entry) => entry.viewId === viewId)
+    })
+
+    await store.dispatch(closeTab('managed-tab'))
+
+    expect(apiMocks.updateManagedRuntimeViewVisibility).toHaveBeenCalledWith('view-a', 'detached', 2, 5)
+    expect(store.getState().tabs.tabs).toHaveLength(0)
+    expect(serverSnapshot.viewIntents[0]?.visibility).toBe('detached')
+  })
+
+  it('keeps a still-creating terminal open while its managed view has not committed', async () => {
+    const baseSnapshot = inventory(8, [view('view-a', 0)])
+    const pendingSnapshot: ManagedRuntimeInventorySnapshot = {
+      ...baseSnapshot,
+      souls: [{
+        ...soul('soul-view-a'),
+        launchState: 'starting',
+        terminalId: undefined,
+        terminalStreamId: undefined,
+      }],
+      viewIntents: [],
+      pendingProjectionCount: 1,
+    }
+    const store = createStore(['view-a'], baseSnapshot)
+    store.dispatch(updatePaneContent({
+      tabId: 'managed-tab',
+      paneId: 'managed-pane-0',
+      content: {
+        kind: 'terminal',
+        createRequestId: 'create-soul-view-a',
+        status: 'creating',
+        mode: 'opencode',
+      },
+    }))
+    apiMocks.getManagedRuntimeInventory.mockResolvedValue(pendingSnapshot)
+
+    await store.dispatch(closeTab('managed-tab'))
+
+    expect(store.getState().tabs.tabs).toHaveLength(1)
+    expect(store.getState().panes.layouts['managed-tab']?.type).toBe('leaf')
+    expect((store.getState().panes.layouts['managed-tab'] as any)?.content.closeError).toContain('managed view')
+    expect(apiMocks.updateManagedRuntimeViewVisibility).not.toHaveBeenCalled()
+  })
+
+  it('keeps a known managed view open when managed-runtime capability is unavailable', async () => {
+    const store = createStore(['view-a'])
+    store.dispatch(setManagedRuntimeAvailable(false))
+
+    await store.dispatch(closeTab('managed-tab'))
+
+    expect(store.getState().tabs.tabs).toHaveLength(1)
+    expect(store.getState().panes.layouts['managed-tab']?.type).toBe('leaf')
+    expect((store.getState().panes.layouts['managed-tab'] as any)?.content.closeError).toContain('managed view')
+    expect(apiMocks.updateManagedRuntimeViewVisibility).not.toHaveBeenCalled()
+  })
+
+  it('keeps the pane open when managed inventory cannot be fetched', async () => {
+    const store = createStore(['view-a'])
+    apiMocks.getManagedRuntimeInventory.mockRejectedValue(new Error('inventory offline'))
+
+    await store.dispatch(closeTab('managed-tab'))
+
+    expect(store.getState().tabs.tabs).toHaveLength(1)
+    expect(store.getState().panes.layouts['managed-tab']?.type).toBe('leaf')
+    expect((store.getState().panes.layouts['managed-tab'] as any)?.content.closeError).toContain('managed view')
+    expect(wsMock.sent.some((message: any) => message.type === 'pane.opened')).toBe(true)
+  })
+
+  it('keeps the pane open when terminal identity matches multiple managed views', async () => {
+    const primaryView = view('view-a', 0)
+    const otherViewOfSameSoul = { ...view('view-b', 1), soulId: primaryView.soulId, kind: 'explicit' as const }
+    const current = inventory(8, [primaryView, otherViewOfSameSoul])
+    const store = createStore(['view-a'], current)
+    store.dispatch(updatePaneContent({
+      tabId: 'managed-tab',
+      paneId: 'managed-pane-0',
+      content: {
+        kind: 'terminal',
+        createRequestId: 'create-soul-view-a',
+        terminalId: 'terminal-soul-view-a',
+        status: 'running',
+        mode: 'opencode',
+      },
+    }))
+    apiMocks.getManagedRuntimeInventory.mockResolvedValue(current)
+
+    await store.dispatch(closeTab('managed-tab'))
+
+    expect(store.getState().tabs.tabs).toHaveLength(1)
+    expect((store.getState().panes.layouts['managed-tab'] as any)?.content.closeError).toContain('managed view')
+    expect(apiMocks.updateManagedRuntimeViewVisibility).not.toHaveBeenCalled()
+  })
+
+  it('detaches each distinct managed view and makes an older in-flight inventory harmless', async () => {
+    const initialViews = [view('view-a', 0), view('view-b', 1)]
+    let serverSnapshot = inventory(8, initialViews)
+    const store = createStore(['view-a', 'view-b'], serverSnapshot)
+    const delayedInventory = deferred<ManagedRuntimeInventorySnapshot>()
+    let inventoryCall = 0
+    apiMocks.getManagedRuntimeInventory.mockImplementation(() => {
+      inventoryCall += 1
+      if (inventoryCall === 1) return delayedInventory.promise
+      return Promise.resolve(serverSnapshot)
+    })
+    apiMocks.updateManagedRuntimeViewVisibility.mockImplementation(async (viewId: string, visibility: ManagedRuntimeViewIntent['visibility']) => {
+      const current = serverSnapshot.viewIntents.find((entry) => entry.viewId === viewId)!
+      expect(current.visibility).toBe('visible')
+      serverSnapshot = withVisibility(serverSnapshot, viewId, visibility)
+      return serverSnapshot.viewIntents.find((entry) => entry.viewId === viewId)
+    })
+
+    const staleRefresh = queueManagedRuntimeRefresh(store as any, 'delayed-before-close')
+    const closed = store.dispatch(closeTab('managed-tab'))
+    await closed
+
+    expect(apiMocks.updateManagedRuntimeViewVisibility).toHaveBeenCalledTimes(2)
+    expect(apiMocks.updateManagedRuntimeViewVisibility).toHaveBeenNthCalledWith(
+      1,
+      'view-a',
+      'detached',
+      2,
+      5,
+    )
+    expect(apiMocks.updateManagedRuntimeViewVisibility).toHaveBeenNthCalledWith(
+      2,
+      'view-b',
+      'detached',
+      2,
+      5,
+    )
+    expect(store.getState().tabs.tabs).toHaveLength(0)
+    expect(store.getState().managedRuntime.viewIntents.map((entry) => entry.visibility)).toEqual([
+      'detached',
+      'detached',
+    ])
+    expect(store.getState().managedRuntime.souls.every((entry) => entry.desiredState === 'running')).toBe(true)
+
+    delayedInventory.resolve(inventory(9, initialViews))
+    await staleRefresh
+
+    expect(store.getState().tabs.tabs).toHaveLength(0)
+    expect(buildManagedRuntimeMergePlan(serverSnapshot, store.getState() as any).creates).toHaveLength(0)
+  })
+
+  it('deduplicates a managed view referenced by two panes', async () => {
+    const views = [view('view-a', 0)]
+    let serverSnapshot = inventory(8, views)
+    const store = createStore(['view-a', 'view-a'], serverSnapshot)
+    apiMocks.getManagedRuntimeInventory.mockImplementation(async () => serverSnapshot)
+    apiMocks.updateManagedRuntimeViewVisibility.mockImplementation(async (viewId: string, visibility: ManagedRuntimeViewIntent['visibility']) => {
+      serverSnapshot = withVisibility(serverSnapshot, viewId, visibility)
+      return serverSnapshot.viewIntents[0]
+    })
+
+    await store.dispatch(closeTab('managed-tab'))
+
+    expect(apiMocks.updateManagedRuntimeViewVisibility).toHaveBeenCalledTimes(1)
+    expect(serverSnapshot.viewIntents[0].visibility).toBe('detached')
+  })
+
+  it('keeps a multi-view tab open after partial detachment and retry completes remaining views', async () => {
+    let serverSnapshot = inventory(8, [view('view-a', 0), view('view-b', 1)])
+    const store = createStore(['view-a', 'view-b'], serverSnapshot)
+    let failSecond = true
+    apiMocks.getManagedRuntimeInventory.mockImplementation(async () => serverSnapshot)
+    apiMocks.updateManagedRuntimeViewVisibility.mockImplementation(async (viewId: string, visibility: ManagedRuntimeViewIntent['visibility']) => {
+      if (viewId === 'view-b' && failSecond) {
+        failSecond = false
+        throw new Error('view update rejected')
+      }
+      serverSnapshot = withVisibility(serverSnapshot, viewId, visibility)
+      return serverSnapshot.viewIntents.find((entry) => entry.viewId === viewId)
+    })
+
+    await store.dispatch(closeTab('managed-tab'))
+    expect(store.getState().tabs.tabs).toHaveLength(1)
+    expect(serverSnapshot.viewIntents.map((entry) => entry.visibility)).toEqual(['detached', 'visible'])
+    expect(wsMock.sent.some((message: any) => message.type === 'pane.opened')).toBe(true)
+
+    await store.dispatch(closeTab('managed-tab'))
+    expect(store.getState().tabs.tabs).toHaveLength(0)
+    expect(serverSnapshot.viewIntents.map((entry) => entry.visibility)).toEqual(['detached', 'detached'])
+    expect(apiMocks.updateManagedRuntimeViewVisibility).toHaveBeenCalledTimes(3)
+  })
+
+  it('detaches a removed split pane while keeping the surviving view visible', async () => {
+    let serverSnapshot = inventory(8, [view('view-a', 0), view('view-b', 1)])
+    const store = createStore(['view-a', 'view-b'], serverSnapshot)
+    apiMocks.getManagedRuntimeInventory.mockImplementation(async () => serverSnapshot)
+    apiMocks.updateManagedRuntimeViewVisibility.mockImplementation(async (viewId: string, visibility: ManagedRuntimeViewIntent['visibility']) => {
+      serverSnapshot = withVisibility(serverSnapshot, viewId, visibility)
+      return serverSnapshot.viewIntents.find((entry) => entry.viewId === viewId)
+    })
+
+    await store.dispatch(closePaneWithCleanup({ tabId: 'managed-tab', paneId: 'managed-pane-0' }))
+
+    expect(apiMocks.updateManagedRuntimeViewVisibility).toHaveBeenCalledTimes(1)
+    expect(apiMocks.updateManagedRuntimeViewVisibility).toHaveBeenCalledWith('view-a', 'detached', 2, 5)
+    expect(serverSnapshot.viewIntents.map((entry) => entry.visibility)).toEqual(['detached', 'visible'])
+    expect(store.getState().tabs.tabs).toHaveLength(1)
+  })
+
+  it('keeps a shared managed view visible while another pane still represents it', async () => {
+    let serverSnapshot = inventory(8, [view('view-a', 0)])
+    const store = createStore(['view-a', 'view-a'], serverSnapshot)
+    apiMocks.getManagedRuntimeInventory.mockImplementation(async () => serverSnapshot)
+    apiMocks.updateManagedRuntimeViewVisibility.mockImplementation(async (viewId: string, visibility: ManagedRuntimeViewIntent['visibility']) => {
+      serverSnapshot = withVisibility(serverSnapshot, viewId, visibility)
+      return serverSnapshot.viewIntents[0]
+    })
+
+    await store.dispatch(closePaneWithCleanup({ tabId: 'managed-tab', paneId: 'managed-pane-0' }))
+
+    expect(apiMocks.updateManagedRuntimeViewVisibility).not.toHaveBeenCalled()
+    expect(serverSnapshot.viewIntents[0].visibility).toBe('visible')
+  })
+
+  it('detaches the managed view discarded by replace-pane', async () => {
+    let serverSnapshot = inventory(8, [view('view-a', 0), view('view-b', 1)])
+    const store = createStore(['view-a', 'view-b'], serverSnapshot)
+    apiMocks.getManagedRuntimeInventory.mockImplementation(async () => serverSnapshot)
+    apiMocks.updateManagedRuntimeViewVisibility.mockImplementation(async (viewId: string, visibility: ManagedRuntimeViewIntent['visibility']) => {
+      serverSnapshot = withVisibility(serverSnapshot, viewId, visibility)
+      return serverSnapshot.viewIntents.find((entry) => entry.viewId === viewId)
+    })
+
+    await store.dispatch(replacePaneWithCleanup({ tabId: 'managed-tab', paneId: 'managed-pane-0' }))
+
+    expect(apiMocks.updateManagedRuntimeViewVisibility).toHaveBeenCalledTimes(1)
+    expect(apiMocks.updateManagedRuntimeViewVisibility).toHaveBeenCalledWith('view-a', 'detached', 2, 5)
+    expect(serverSnapshot.viewIntents.map((entry) => entry.visibility)).toEqual(['detached', 'visible'])
+    const layout = store.getState().panes.layouts['managed-tab']
+    expect(layout && collectContent(layout, 'managed-pane-0')?.kind).toBe('picker')
+
+    await store.dispatch(closeTab('managed-tab'))
+    expect(serverSnapshot.viewIntents.map((entry) => entry.visibility)).toEqual(['detached', 'detached'])
+
+  })
+
+  it('does not let a close race a reopened view visibility promotion', async () => {
+    let serverSnapshot = inventory(10, [{ ...view('view-a', 0), visibility: 'detached', revision: 3 }])
+    const store = createStore(['view-a'], serverSnapshot)
+    apiMocks.getManagedRuntimeInventory.mockImplementation(async () => serverSnapshot)
+    const patchStarted = deferred<void>()
+    const finishPatch = deferred<void>()
+    apiMocks.updateManagedRuntimeViewVisibility.mockImplementation(async (viewId: string, visibility: ManagedRuntimeViewIntent['visibility']) => {
+      patchStarted.resolve()
+      await finishPatch.promise
+      serverSnapshot = withVisibility(serverSnapshot, viewId, visibility)
+      return serverSnapshot.viewIntents[0]
+    })
+    await store.dispatch(closeTab('managed-tab'))
+
+    const reopened = store.dispatch(reopenClosedTab())
+    await patchStarted.promise
+    const reopenedTabId = store.getState().tabs.tabs[0]?.id
+    expect(reopenedTabId).toBeTruthy()
+    const closeDuringPromotion = store.dispatch(closeTab(reopenedTabId!))
+    expect(store.getState().tabs.tabs).toHaveLength(1)
+    expect(apiMocks.updateManagedRuntimeViewVisibility).toHaveBeenCalledTimes(1)
+
+    finishPatch.resolve()
+    await Promise.all([reopened, closeDuringPromotion])
+
+    expect(store.getState().tabs.tabs).toHaveLength(0)
+    expect(serverSnapshot.viewIntents[0].visibility).toBe('detached')
+    expect(apiMocks.updateManagedRuntimeViewVisibility).toHaveBeenCalledTimes(2)
+  })
+
+  it('detaches a shared view when concurrent closes remove its last representations', async () => {
+    let serverSnapshot = inventory(8, [view('view-a', 0)])
+    const store = createStore(['view-a'], serverSnapshot)
+    store.dispatch(addTab({
+      id: 'managed-tab-second',
+      title: 'Second managed tab',
+      mode: 'opencode',
+      viewIntentId: 'view-a',
+      viewIntentRevision: 2,
+      soulIntentRevision: 5,
+    }))
+    store.dispatch(initLayout({
+      tabId: 'managed-tab-second',
+      paneId: 'managed-pane-second',
+      content: managedContent(view('view-a', 1)),
+    }))
+    apiMocks.getManagedRuntimeInventory.mockImplementation(async () => serverSnapshot)
+    apiMocks.updateManagedRuntimeViewVisibility.mockImplementation(async (viewId: string, visibility: ManagedRuntimeViewIntent['visibility']) => {
+      serverSnapshot = withVisibility(serverSnapshot, viewId, visibility)
+      return serverSnapshot.viewIntents[0]
+    })
+
+    await Promise.all([
+      store.dispatch(closeTab('managed-tab')),
+      store.dispatch(closeTab('managed-tab-second')),
+    ])
+
+    expect(store.getState().tabs.tabs).toHaveLength(0)
+    expect(serverSnapshot.viewIntents[0].visibility).toBe('detached')
+    expect(apiMocks.updateManagedRuntimeViewVisibility).toHaveBeenCalledTimes(1)
+  })
+})
+
+function collectContent(node: { type: 'leaf'; id: string; content: unknown } | { type: 'split'; children: [any, any] }, paneId: string): any {
+  if (node.type === 'leaf') return node.id === paneId ? node.content : undefined
+  return collectContent(node.children[0], paneId) ?? collectContent(node.children[1], paneId)
+}

@@ -997,12 +997,23 @@ function mergeTerminalState(
  * snapshot's non-empty createRequestId survives so it remains the same
  * durable pane, while every volatile runtime field still resets.
  */
-function stripStaleIds(content: PaneContent, preserveCreateRequestIds = false): PaneContentInput {
+function stripStaleIds(
+  content: PaneContent,
+  preserveCreateRequestIds = false,
+  preserveManagedRuntimeHandles = false,
+): PaneContentInput {
   if (content.kind === 'terminal') {
     const { terminalId: _terminalId, createRequestId, status: _status, ...rest } = content
+    const preserveManagedHandles = preserveManagedRuntimeHandles
+      && typeof content.viewIntentId === 'string'
+      && content.viewIntentId.length > 0
     return {
       ...rest,
-      ...(preserveCreateRequestIds && createRequestId ? { createRequestId } : {}),
+      ...(preserveManagedHandles ? {
+        terminalId: content.terminalId,
+        status: content.status,
+        createRequestId,
+      } : preserveCreateRequestIds && createRequestId ? { createRequestId } : {}),
     }
   }
   if (content.kind === 'browser') {
@@ -1032,12 +1043,20 @@ function stripStaleIds(content: PaneContent, preserveCreateRequestIds = false): 
 /**
  * Walk a PaneNode tree, normalizing each leaf's content with fresh IDs.
  */
-function normalizeRestoredTree(node: PaneNode, preserveCreateRequestIds = false): PaneNode {
+function normalizeRestoredTree(
+  node: PaneNode,
+  preserveCreateRequestIds = false,
+  preserveManagedRuntimeHandles = false,
+): PaneNode {
   if (node.type === 'leaf') {
     return {
       type: 'leaf',
       id: node.id,
-      content: normalizePaneContent(stripStaleIds(node.content, preserveCreateRequestIds)),
+      content: normalizePaneContent(stripStaleIds(
+        node.content,
+        preserveCreateRequestIds,
+        preserveManagedRuntimeHandles,
+      )),
     }
   }
   return {
@@ -1046,8 +1065,8 @@ function normalizeRestoredTree(node: PaneNode, preserveCreateRequestIds = false)
     direction: node.direction,
     sizes: node.sizes,
     children: [
-      normalizeRestoredTree(node.children[0], preserveCreateRequestIds),
-      normalizeRestoredTree(node.children[1], preserveCreateRequestIds),
+      normalizeRestoredTree(node.children[0], preserveCreateRequestIds, preserveManagedRuntimeHandles),
+      normalizeRestoredTree(node.children[1], preserveCreateRequestIds, preserveManagedRuntimeHandles),
     ],
   }
 }
@@ -1200,13 +1219,26 @@ export const panesSlice = createSlice({
         paneTitleSetByUser?: Record<string, boolean>
         /** Same-machine bootstrap only; ordinary/cross-device restores remint. */
         preserveCreateRequestIds?: boolean
+        /** Reopen only after refreshing managed handles from supervisor inventory. */
+        preserveManagedRuntimeHandles?: boolean
       }>
     ) => {
-      const { tabId, layout, paneTitles, paneTitleSetByUser, preserveCreateRequestIds } = action.payload
+      const {
+        tabId,
+        layout,
+        paneTitles,
+        paneTitleSetByUser,
+        preserveCreateRequestIds,
+        preserveManagedRuntimeHandles,
+      } = action.payload
       if (refuseMutationWhileClosing(state, tabId, 'restoreLayout')) return
       if (state.layouts[tabId]) return
 
-      const normalizedLayout = normalizeRestoredTree(layout, preserveCreateRequestIds)
+      const normalizedLayout = normalizeRestoredTree(
+        layout,
+        preserveCreateRequestIds,
+        preserveManagedRuntimeHandles,
+      )
       state.layouts[tabId] = normalizedLayout
       state.activePane[tabId] = findFirstLeafId(normalizedLayout)
       state.paneTitles[tabId] = paneTitles
