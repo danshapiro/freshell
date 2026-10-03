@@ -1,7 +1,7 @@
 //! Read a selected native transcript without creating a provider runtime.
 use rusqlite::{Connection, OpenFlags, OptionalExtension};
 use serde_json::{json, Value};
-use std::path::Path;
+use std::{io::Read, path::Path};
 
 pub const MAX_HISTORY_BYTES: u64 = 16 * 1024 * 1024;
 
@@ -10,6 +10,7 @@ pub fn read(provider: &str, home: &Path, session_id: &str) -> Result<Value, Stri
         return Err("invalid native session identity".into());
     }
     let mut snapshot = match provider {
+        "claude" | "kilroy" => read_claude(home, session_id, provider)?,
         "codex" => crate::codex::native_history::read(home, session_id)?,
         "opencode" => read_opencode(home, session_id)?,
         _ => return Err("native history reader does not support this provider".into()),
@@ -22,8 +23,13 @@ pub fn read(provider: &str, home: &Path, session_id: &str) -> Result<Value, Stri
         }
     }
     snapshot["status"] = json!("idle");
-    snapshot["extensions"][provider]["ownerKind"] = json!("vacant");
-    snapshot["extensions"][provider]["nativeHistoryAvailable"] = json!(true);
+    let wire_provider = if provider == "kilroy" {
+        "claude"
+    } else {
+        provider
+    };
+    snapshot["extensions"][wire_provider]["ownerKind"] = json!("vacant");
+    snapshot["extensions"][wire_provider]["nativeHistoryAvailable"] = json!(true);
     if serde_json::to_vec(&snapshot)
         .map_err(|e| e.to_string())?
         .len() as u64
@@ -35,10 +41,38 @@ pub fn read(provider: &str, home: &Path, session_id: &str) -> Result<Value, Stri
 }
 
 fn read_opencode(home: &Path, id: &str) -> Result<Value, String> {
-    let connection = Connection::open_with_flags(
-        home.join(".local/share/opencode/opencode.db"),
-        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-    )
+    let path = home.join(".local/share/opencode/opencode.db");
+    let companions_absent =
+        || !path.with_extension("db-wal").exists() && !path.with_extension("db-shm").exists();
+    // A clean WAL close removes its companions. SQLite otherwise needs a writable
+    // directory even for READ_ONLY. Only the companion-free snapshot is immutable;
+    // existing WAL uses SQLite's normal transaction so committed rows remain visible.
+    let metadata = std::fs::metadata(&path).map_err(|e| e.to_string())?;
+    let fingerprint = (
+        metadata.len(),
+        metadata.modified().map_err(|e| e.to_string())?,
+    );
+    let immutable = companions_absent();
+    let connection = if immutable {
+        let absolute = path.canonicalize().map_err(|e| e.to_string())?;
+        let uri_path = absolute
+            .to_str()
+            .ok_or("native database path is not UTF-8")?
+            .replace('%', "%25")
+            .replace('?', "%3F")
+            .replace('#', "%23");
+        Connection::open_with_flags(
+            format!("file:{uri_path}?immutable=1"),
+            OpenFlags::SQLITE_OPEN_READ_ONLY
+                | OpenFlags::SQLITE_OPEN_NO_MUTEX
+                | OpenFlags::SQLITE_OPEN_URI,
+        )
+    } else {
+        Connection::open_with_flags(
+            &path,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+    }
     .map_err(|e| e.to_string())?;
     connection
         .busy_timeout(std::time::Duration::from_secs(2))
@@ -90,10 +124,57 @@ fn read_opencode(home: &Path, id: &str) -> Result<Value, String> {
         }
         messages.push(json!({"info":message,"parts":parts}));
     }
+    if immutable {
+        let current = std::fs::metadata(&path).map_err(|e| e.to_string())?;
+        if !companions_absent()
+            || (
+                current.len(),
+                current.modified().map_err(|e| e.to_string())?,
+            ) != fingerprint
+        {
+            return Err(
+                "native database changed during history read; retry the history read".into(),
+            );
+        }
+    }
     Ok(crate::build_opencode_snapshot_json(
         id,
         &info,
         &json!(messages),
+        None,
+    ))
+}
+
+fn read_claude(home: &Path, id: &str, provider: &str) -> Result<Value, String> {
+    let path = crate::claude_snapshot::find_transcript(&home.join(".claude"), id)
+        .ok_or("saved native session not found")?;
+    let file = std::fs::File::open(path).map_err(|e| e.to_string())?;
+    let metadata = file.metadata().map_err(|e| e.to_string())?;
+    if metadata.len() > MAX_HISTORY_BYTES {
+        return Err("native transcript exceeds history read limit".into());
+    }
+    let mut transcript = String::new();
+    file.take(MAX_HISTORY_BYTES + 1)
+        .read_to_string(&mut transcript)
+        .map_err(|e| e.to_string())?;
+    if transcript.len() as u64 > MAX_HISTORY_BYTES {
+        return Err("native transcript exceeds history read limit".into());
+    }
+    let revision = metadata
+        .modified()
+        .ok()
+        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|duration| duration.as_millis().min(i64::MAX as u128) as i64)
+        .unwrap_or(0);
+    Ok(crate::claude_snapshot::build_claude_snapshot_json(
+        if provider == "kilroy" {
+            "kilroy"
+        } else {
+            "freshclaude"
+        },
+        id,
+        &transcript,
+        revision,
         None,
     ))
 }
