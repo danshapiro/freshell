@@ -462,6 +462,10 @@ export async function retryManagedRuntimeSoul(
 
 const ManagedRuntimeStopResultSchema = z.object({
   outcome: z.enum(['verified_empty', 'blocked_ownership', 'backend_unavailable', 'termination_unconfirmed']),
+  soul: z.object({
+    soulId: z.string().min(1),
+    intentRevision: z.number().int().nonnegative(),
+  }),
 })
 
 export type ManagedRuntimeStopResult = z.infer<typeof ManagedRuntimeStopResultSchema>

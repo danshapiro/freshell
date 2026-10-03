@@ -1,3 +1,4 @@
+import { useState } from 'react'
 import type { LaunchFailure } from '@/store/paneTypes'
 
 /**
@@ -19,9 +20,23 @@ export function TerminalLaunchFailureCard({ failure, onRetry, onAttach, onOpenFr
   onRetry: () => void
   onAttach?: () => void
   onOpenFresh?: () => void
-  onStartFresh?: () => void
+  onStartFresh?: () => void | Promise<void>
 }) {
+  const [starting, setStarting] = useState(false)
+  const [startError, setStartError] = useState<string>()
   const sessionMissing = failure.code === 'SESSION_MISSING'
+  const handleStartFresh = async () => {
+    if (starting || !onStartFresh) return
+    setStarting(true)
+    setStartError(undefined)
+    try {
+      await onStartFresh()
+    } catch (error) {
+      setStartError(error instanceof Error ? error.message : 'Cleanup failed. Your conversation has been kept.')
+    } finally {
+      setStarting(false)
+    }
+  }
   return (
     <div
       role="alert"
@@ -29,7 +44,10 @@ export function TerminalLaunchFailureCard({ failure, onRetry, onAttach, onOpenFr
       aria-label={`Launch failed: ${failure.code}`}
       className="pointer-events-auto absolute inset-x-0 top-0 z-20 m-2 flex items-center justify-between gap-2 rounded-md border border-amber-500/50 bg-amber-500/10 px-3 py-2 text-sm"
     >
-      <span>{failureTitle(failure)}</span>
+      <div>
+        <span>{failureTitle(failure)}</span>
+        {startError ? <span role="status" className="ml-2 text-xs text-amber-700 dark:text-amber-300">{startError}</span> : null}
+      </div>
       <div className="flex shrink-0 gap-2">
         {failure.terminalId !== undefined && onAttach !== undefined ? (
           <button
@@ -67,9 +85,10 @@ export function TerminalLaunchFailureCard({ failure, onRetry, onAttach, onOpenFr
             className="shrink-0 rounded border border-amber-500/70 px-2 py-1 text-xs"
             aria-label="Start a fresh conversation (a new session — the old one is gone)"
             data-testid="terminal-launch-failure-start-fresh"
-            onClick={onStartFresh}
+            disabled={starting}
+            onClick={() => void handleStartFresh()}
           >
-            Start fresh
+            {starting ? 'Starting…' : 'Start fresh'}
           </button>
         ) : null}
       </div>

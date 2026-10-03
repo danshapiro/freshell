@@ -168,10 +168,10 @@ for (const kind of ['terminal', 'fresh-agent'] as const) {
     await page.route(`**/api/runtime/souls/${SOUL_ID}/stop`, async (route) => {
       stopRequests.push(route.request().postDataJSON())
       if (stopRequests.length === 1) {
-        await route.fulfill({ json: { outcome: 'termination_unconfirmed' } })
+        await route.fulfill({ json: { outcome: 'termination_unconfirmed', soul: { soulId: SOUL_ID, intentRevision: INTENT_REVISION } } })
       } else {
         await verifiedStop
-        await route.fulfill({ json: { outcome: 'verified_empty', soul: { freshAgentSessionId: SESSION_ID } } })
+        await route.fulfill({ json: { outcome: 'verified_empty', soul: { soulId: SOUL_ID, intentRevision: INTENT_REVISION, freshAgentSessionId: SESSION_ID } } })
       }
     })
     const card = page.getByTestId('managed-runtime-recovery-card')
