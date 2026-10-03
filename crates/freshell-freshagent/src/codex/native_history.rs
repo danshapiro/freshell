@@ -78,8 +78,10 @@ pub(super) fn read_rollout(path: &Path, id: &str) -> Result<Value, String> {
                         .or_else(|| payload.get("id").filter(|id| id.is_string()))
                         .cloned()
                         .unwrap_or_else(|| json!(format!("native-line-{line}")));
-                    if item["type"] == "userMessage" && turn.finished {
-                        activate_turn(&mut turns, &mut turn, None, false);
+                    if item["type"] == "userMessage"
+                        && turn.starts_new_input(&item, MessageSource::Response)
+                    {
+                        advance_turn(&mut turns, &mut turn);
                     }
                     upsert_transcript_item(&mut turn, item, MessageSource::Response);
                 }
@@ -111,12 +113,11 @@ pub(super) fn read_rollout(path: &Path, id: &str) -> Result<Value, String> {
                 } else {
                     if let Some(id) = payload["turn_id"].as_str() {
                         activate_turn(&mut turns, &mut turn, Some(id), false);
-                    } else if item
-                        .as_ref()
-                        .is_some_and(|item| item["type"] == "userMessage")
-                        && turn.finished
-                    {
-                        activate_turn(&mut turns, &mut turn, None, false);
+                    } else if item.as_ref().is_some_and(|item| {
+                        item["type"] == "userMessage"
+                            && turn.starts_new_input(item, MessageSource::Event)
+                    }) {
+                        advance_turn(&mut turns, &mut turn);
                     }
                     &mut turn
                 };
@@ -176,6 +177,24 @@ impl NativeTurn {
     fn has_items(&self) -> bool {
         !self.value["items"].as_array().unwrap().is_empty()
     }
+
+    fn starts_new_input(&self, item: &Value, source: MessageSource) -> bool {
+        if self.finished {
+            return true;
+        }
+        let items = self.value["items"].as_array().unwrap();
+        if items.is_empty() {
+            return false;
+        }
+        // Only the still-pending input prefix can contain a mirrored user record.
+        // A new input after provider output starts a task even if an exit omitted
+        // its completion; its later task/context records bind the pending identity.
+        !(items.iter().all(|item| item["type"] == "userMessage")
+            && self
+                .mirror
+                .as_ref()
+                .is_some_and(|previous| previous.matches(item, source)))
+    }
 }
 
 fn activate_turn(
@@ -194,12 +213,7 @@ fn activate_turn(
     let can_bind = !(turn.named || turn.finished || starts_task && turn.started);
     let can_start_current = id.is_none() && !turn.started && !turn.finished;
     if !can_bind && !can_start_current {
-        let has_items = turn.has_items();
-        let previous =
-            std::mem::replace(turn, NativeTurn::new(turns.len() + usize::from(has_items)));
-        if has_items {
-            turns.push(previous);
-        }
+        advance_turn(turns, turn);
     }
     if let Some(id) = id {
         turn.value["id"] = json!(id);
@@ -208,9 +222,25 @@ fn activate_turn(
     turn.started |= starts_task;
 }
 
+fn advance_turn(turns: &mut Vec<NativeTurn>, turn: &mut NativeTurn) {
+    let has_items = turn.has_items();
+    let previous = std::mem::replace(turn, NativeTurn::new(turns.len() + usize::from(has_items)));
+    if has_items {
+        turns.push(previous);
+    }
+}
+
 struct MessageMirror {
     item: Value,
     sources: Vec<MessageSource>,
+}
+
+impl MessageMirror {
+    fn matches(&self, item: &Value, source: MessageSource) -> bool {
+        !self.sources.contains(&source)
+            && self.item["type"] == item["type"]
+            && message_text(&self.item) == message_text(item)
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -246,15 +276,12 @@ fn message_text(item: &Value) -> Option<String> {
 }
 
 fn upsert_transcript_item(turn: &mut NativeTurn, item: Value, source: MessageSource) {
-    let Some(text) = message_text(&item) else {
+    if message_text(&item).is_none() {
         upsert_item(&mut turn.value, item);
         return;
-    };
+    }
     if let Some(previous) = turn.mirror.as_mut() {
-        if !previous.sources.contains(&source)
-            && previous.item["type"] == item["type"]
-            && message_text(&previous.item).as_deref() == Some(text.as_str())
-        {
+        if previous.matches(&item, source) {
             // A message may be recorded as a response, an agent event, and a task
             // completion. Each source mirrors this occurrence once; repeated
             // messages from the same source start a new occurrence.
