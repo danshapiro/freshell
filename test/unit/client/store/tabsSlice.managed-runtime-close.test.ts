@@ -752,6 +752,139 @@ describe('closeTab managed runtime visibility', () => {
     expect(store.getState().tabRegistry.reopenStack).toHaveLength(0)
   })
 
+  it('keeps an automatic-primary tab intact when reopening an explicit sibling view', async () => {
+    const primaryView = view('primary-view', 0)
+    const explicitView: ManagedRuntimeViewIntent = {
+      ...view('explicit-view', 1),
+      soulId: primaryView.soulId,
+      kind: 'explicit',
+      preferredTabId: 'explicit-tab',
+      preferredPaneId: 'explicit-pane',
+    }
+    let serverSnapshot = inventory(8, [primaryView, explicitView])
+    const store = createStore(['primary-view'], serverSnapshot)
+    store.dispatch(updatePaneContent({
+      tabId: 'managed-tab',
+      paneId: 'managed-pane-0',
+      content: {
+        kind: 'terminal',
+        terminalId: 'terminal-soul-primary-view',
+        createRequestId: 'create-soul-primary-view',
+        soulId: primaryView.soulId,
+        status: 'running',
+        mode: 'opencode',
+      },
+    }))
+    store.dispatch(addTab({
+      id: 'explicit-tab',
+      title: 'Explicit view',
+      mode: 'opencode',
+      viewIntentId: explicitView.viewId,
+      viewIntentRevision: explicitView.revision,
+      soulIntentRevision: explicitView.soulIntentRevision,
+    }))
+    store.dispatch(initLayout({
+      tabId: 'explicit-tab',
+      paneId: 'explicit-pane',
+      content: managedContent(explicitView),
+    }))
+    apiMocks.getManagedRuntimeInventory.mockImplementation(async () => serverSnapshot)
+    apiMocks.updateManagedRuntimeViewVisibility.mockImplementation(async (
+      viewId: string,
+      visibility: ManagedRuntimeViewIntent['visibility'],
+    ) => {
+      serverSnapshot = withVisibility(serverSnapshot, viewId, visibility)
+      return serverSnapshot.viewIntents.find((entry) => entry.viewId === viewId)
+    })
+    const primaryLayoutBeforeClose = store.getState().panes.layouts['managed-tab']
+
+    await store.dispatch(closeTab('explicit-tab'))
+    expect(store.getState().tabs.tabs.map((tab) => tab.id)).toEqual(['managed-tab'])
+    expect(store.getState().tabRegistry.reopenStack).toHaveLength(1)
+
+    const result = await store.dispatch(reopenClosedTab())
+
+    expect(reopenClosedTab.fulfilled.match(result)).toBe(true)
+    expect(store.getState().tabs.tabs.map((tab) => tab.id)).toHaveLength(2)
+    expect(store.getState().tabs.tabs.find((tab) => tab.id === 'managed-tab')?.viewIntentId).toBe('primary-view')
+    expect(store.getState().panes.layouts['managed-tab']).toEqual(primaryLayoutBeforeClose)
+    const explicitTab = store.getState().tabs.tabs.find((tab) => tab.id !== 'managed-tab')!
+    const reopenedContent = store.getState().panes.layouts[explicitTab.id]
+    expect(reopenedContent?.type).toBe('leaf')
+    if (reopenedContent?.type === 'leaf' && reopenedContent.content.kind === 'terminal') {
+      expect(reopenedContent.content.viewIntentId).toBe('explicit-view')
+    }
+    expect(store.getState().tabRegistry.reopenStack).toHaveLength(0)
+  })
+
+  it('uses the saved tab view marker to resolve an unmarked pane after a sibling view is added', async () => {
+    const primaryView = view('primary-view', 0)
+    let serverSnapshot = inventory(8, [primaryView])
+    const store = createStore(['primary-view'], serverSnapshot)
+    store.dispatch(updatePaneContent({
+      tabId: 'managed-tab',
+      paneId: 'managed-pane-0',
+      content: {
+        kind: 'terminal',
+        terminalId: 'terminal-soul-primary-view',
+        createRequestId: 'create-soul-primary-view',
+        soulId: primaryView.soulId,
+        status: 'running',
+        mode: 'opencode',
+      },
+    }))
+    apiMocks.getManagedRuntimeInventory.mockImplementation(async () => serverSnapshot)
+    apiMocks.updateManagedRuntimeViewVisibility.mockImplementation(async (
+      viewId: string,
+      visibility: ManagedRuntimeViewIntent['visibility'],
+    ) => {
+      serverSnapshot = withVisibility(serverSnapshot, viewId, visibility)
+      return serverSnapshot.viewIntents.find((entry) => entry.viewId === viewId)
+    })
+
+    await store.dispatch(closeTab('managed-tab'))
+    const savedEntry = store.getState().tabRegistry.reopenStack[0]!
+    expect(savedEntry.tab.viewIntentId).toBe('primary-view')
+    expect(savedEntry.layout.type).toBe('leaf')
+    if (savedEntry.layout.type === 'leaf' && savedEntry.layout.content.kind === 'terminal') {
+      expect(savedEntry.layout.content.viewIntentId).toBeUndefined()
+    }
+    const explicitSibling: ManagedRuntimeViewIntent = {
+      ...view('explicit-sibling', 1),
+      soulId: primaryView.soulId,
+      kind: 'explicit',
+      preferredTabId: 'explicit-sibling-tab',
+      preferredPaneId: 'explicit-sibling-pane',
+    }
+    const nextRevision = serverSnapshot.revision + 1
+    serverSnapshot = {
+      ...serverSnapshot,
+      revision: nextRevision,
+      readiness: { ...serverSnapshot.readiness, inventoryRevision: nextRevision },
+      viewIntents: [...serverSnapshot.viewIntents, explicitSibling],
+    }
+    const detachedPrimaryRevision = serverSnapshot.viewIntents.find((entry) => entry.viewId === 'primary-view')!.revision
+
+    const result = await store.dispatch(reopenClosedTab())
+
+    expect(reopenClosedTab.fulfilled.match(result)).toBe(true)
+    expect(apiMocks.updateManagedRuntimeViewVisibility).toHaveBeenLastCalledWith(
+      'primary-view',
+      'visible',
+      detachedPrimaryRevision,
+      primaryView.soulIntentRevision,
+    )
+    const reopenedTab = store.getState().tabs.tabs.find((tab) => tab.id !== 'managed-tab')
+    expect(reopenedTab).toBeDefined()
+    const reopenedLayout = reopenedTab && store.getState().panes.layouts[reopenedTab.id]
+    expect(reopenedLayout?.type).toBe('leaf')
+    if (reopenedLayout?.type === 'leaf' && reopenedLayout.content.kind === 'terminal') {
+      expect(reopenedLayout.content.viewIntentId).toBe('primary-view')
+      expect(reopenedLayout.content.terminalId).toBe('terminal-soul-primary-view')
+    }
+    expect(store.getState().tabRegistry.reopenStack).toHaveLength(0)
+  })
+
   it('restores a mixed saved layout around a view projected before retry', async () => {
     let serverSnapshot = inventory(8, [view('view-a', 0)])
     const store = createStore(['view-a'], serverSnapshot)

@@ -79,6 +79,15 @@ contains unrelated local panes or is closing, the operation retains the entry
 and fails before changing local tabs or layouts. A set of distinct view IDs
 alone does not prove that the saved pane topology has been restored.
 
+Local retry matching treats pane view IDs as authoritative and carries the
+containing tab view marker for unmarked panes. A tab marker can identify only
+its own view; shared terminal handles cannot make that pane represent a
+different view. Handle-only inference is accepted only for one fresh automatic
+view on the matched soul. For an unmarked saved preferred pane, the saved tab
+view marker disambiguates a handle-matched soul only when fresh inventory
+confirms that exact view belongs to that soul; sibling-view ambiguity remains
+retryable.
+
 ## Load-bearing decisions
 
 The immutable base is commit

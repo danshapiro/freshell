@@ -1743,9 +1743,18 @@ function resolveManagedReopenTarget(
       if (hasManagedRuntimeMarker(content)) throw new Error(MANAGED_VIEW_CLOSE_FAILED_MESSAGE)
       return undefined
     } else {
-      const matches = snapshot.viewIntents.filter((candidate) => candidate.soulId === identityMatchedSouls[0]!.soulId)
-      if (matches.length !== 1) throw new Error(MANAGED_VIEW_CLOSE_FAILED_MESSAGE)
-      view = matches[0]!
+      const matchedSoul = identityMatchedSouls[0]!
+      if (fallbackViewIntentId) {
+        const matches = snapshot.viewIntents.filter((candidate) => candidate.viewId === fallbackViewIntentId)
+        if (matches.length !== 1 || matches[0]!.soulId !== matchedSoul.soulId) {
+          throw new Error(MANAGED_VIEW_CLOSE_FAILED_MESSAGE)
+        }
+        view = matches[0]!
+      } else {
+        const matches = snapshot.viewIntents.filter((candidate) => candidate.soulId === matchedSoul.soulId)
+        if (matches.length !== 1) throw new Error(MANAGED_VIEW_CLOSE_FAILED_MESSAGE)
+        view = matches[0]!
+      }
     }
   }
 
@@ -1861,10 +1870,12 @@ function locallyRepresentedManagedReopenViews(
   type Candidate = {
     tabId: string
     pane?: PaneNode
-    viewIntentId?: string
+    paneViewIntentId?: string
+    tabViewIntentId?: string
     soulId?: string
     terminalId?: string
     createRequestId?: string
+    terminalPaneCount: number
   }
   const candidates: Candidate[] = []
 
@@ -1873,12 +1884,14 @@ function locallyRepresentedManagedReopenViews(
     if (!layout) {
       candidates.push({
         tabId: tab.id,
-        viewIntentId: tab.viewIntentId,
+        tabViewIntentId: tab.viewIntentId,
         soulId: tab.soulId,
         createRequestId: tab.createRequestId,
+        terminalPaneCount: 0,
       })
       continue
     }
+    const tabCandidates: Omit<Candidate, 'terminalPaneCount'>[] = []
     const visit = (node: PaneNode) => {
       if (node.type === 'split') {
         visit(node.children[0])
@@ -1887,16 +1900,21 @@ function locallyRepresentedManagedReopenViews(
       }
       const { content } = node
       if (content.kind !== 'terminal') return
-      candidates.push({
+      tabCandidates.push({
         tabId: tab.id,
         pane: node,
-        viewIntentId: content.viewIntentId,
+        paneViewIntentId: content.viewIntentId,
+        tabViewIntentId: tab.viewIntentId,
         soulId: content.soulId,
         terminalId: content.terminalId,
         createRequestId: content.createRequestId,
       })
     }
     visit(layout)
+    candidates.push(...tabCandidates.map((candidate) => ({
+      ...candidate,
+      terminalPaneCount: tabCandidates.length,
+    })))
   }
 
   const representedViewIntentIds = new Set<string>()
@@ -1912,31 +1930,55 @@ function locallyRepresentedManagedReopenViews(
     matches.push({ tabId: candidate.tabId, pane: candidate.pane })
     representationsByViewIntentId.set(viewIntentId, matches)
   }
+  const ambiguousResult = () => ({
+    representedViewIntentIds,
+    representationCountByViewIntentId,
+    representationsByViewIntentId,
+    ambiguous: true,
+  })
   for (const candidate of candidates) {
-    if (candidate.viewIntentId) {
-      if (viewIntentIds.includes(candidate.viewIntentId)) {
-        recordRepresentation(candidate.viewIntentId, candidate)
+    if (candidate.paneViewIntentId) {
+      if (viewIntentIds.includes(candidate.paneViewIntentId)) {
+        recordRepresentation(candidate.paneViewIntentId, candidate)
       }
       // A different nonempty view ID is authoritative; terminal handles do
       // not let one managed view claim another view's local pane.
       continue
     }
-    const matches = targetViews.filter(({ soul }) => (
+    if (candidate.tabViewIntentId) {
+      const matches = targetViews.filter(({ view }) => view.viewId === candidate.tabViewIntentId)
+      if (matches.length === 1) {
+        const target = matches[0]!
+        const paneIsIdentifiedByTabMarker = !candidate.pane
+          || candidate.terminalPaneCount === 1
+          || candidate.pane.id === target.view.preferredPaneId
+        if (paneIsIdentifiedByTabMarker) recordRepresentation(target.view.viewId, candidate)
+      }
+      // A tab marker is authoritative for that tab; shared writer handles
+      // cannot make it represent a different saved view.
+      continue
+    }
+
+    const identityMatchedSouls = snapshot.souls.filter((soul) => (
       (!candidate.soulId || candidate.soulId === soul.soulId)
       && (
         (candidate.terminalId && candidate.terminalId === soul.terminalId)
         || (candidate.createRequestId && candidate.createRequestId === soul.terminalCreateRequestId)
       )
     ))
-    if (matches.length > 1) {
-      return {
-        representedViewIntentIds,
-        representationCountByViewIntentId,
-        representationsByViewIntentId,
-        ambiguous: true,
-      }
+    if (identityMatchedSouls.length > 1) {
+      return ambiguousResult()
     }
-    if (matches.length === 1) recordRepresentation(matches[0]!.view.viewId, candidate)
+    if (identityMatchedSouls.length === 0) continue
+    const soulViews = snapshot.viewIntents.filter((view) => view.soulId === identityMatchedSouls[0]!.soulId)
+    const targetedViews = soulViews.filter((view) => viewIntentIds.includes(view.viewId))
+    if (targetedViews.some((view) => view.kind === 'explicit')) {
+      return ambiguousResult()
+    }
+    if (targetedViews.length > 0 && soulViews.length !== 1) {
+      return ambiguousResult()
+    }
+    if (targetedViews.length === 1) recordRepresentation(targetedViews[0]!.viewId, candidate)
   }
 
   return {
