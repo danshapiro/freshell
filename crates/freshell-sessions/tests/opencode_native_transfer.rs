@@ -282,6 +282,18 @@ fn create_synthetic_source(database: &Path) -> Connection {
     connection
 }
 
+fn with_selected_workspace_mount(
+    inventory: HostOpenCodeInventory,
+    managed_mount: PathBuf,
+) -> HostOpenCodeInventory {
+    inventory.with_trusted_workspace_mount(
+        "prj_kept",
+        Some("wrk_kept".into()),
+        "/synthetic/worktree",
+        managed_mount,
+    )
+}
+
 #[test]
 fn exports_exact_recursive_native_closure_and_omits_account_and_derived_rows() {
     let fixture = TestDir::new("exact-closure");
@@ -1284,8 +1296,7 @@ fn opencode_db_override_keeps_tool_output_resolution_at_the_provider_data_home()
     let result = export_exact_session(
         &inventory,
         "ses_root",
-        ExportOptions::new(extraction_root.clone())
-            .with_workspace_mount(provider_data_home.clone()),
+        ExportOptions::new(extraction_root.clone()),
     );
 
     assert!(
@@ -1324,13 +1335,15 @@ fn keeps_a_file_reference_only_under_the_exact_workspace_mount() {
             [data],
         )
         .unwrap();
-    let inventory = HostOpenCodeInventory::new(fixture.path().join("unused.db"))
-        .with_channel_database(database);
+    let inventory = with_selected_workspace_mount(
+        HostOpenCodeInventory::new(fixture.path().join("unused.db"))
+            .with_channel_database(database),
+        workspace_mount.clone(),
+    );
     let snapshot = export_exact_session(
         &inventory,
         "ses_root",
-        ExportOptions::new(fixture.path().join("extract"))
-            .with_workspace_mount(workspace_mount.clone()),
+        ExportOptions::new(fixture.path().join("extract")),
     )
     .unwrap();
     let [asset] = snapshot.manifest().assets.as_slice() else {
@@ -1358,11 +1371,275 @@ fn keeps_a_file_reference_only_under_the_exact_workspace_mount() {
         export_exact_session(
             &inventory,
             "ses_root",
-            ExportOptions::new(fixture.path().join("outside-extract"))
-                .with_workspace_mount(workspace_mount),
+            ExportOptions::new(fixture.path().join("outside-extract")),
         ),
         Err(TransferError::Blocked(_))
     ));
+}
+
+#[test]
+fn blocks_workspace_file_from_a_different_session_workspace_mapping() {
+    let fixture = TestDir::new("workspace-file-mismatch");
+    let database = fixture.path().join("opencode.db");
+    let source = create_synthetic_source(&database);
+    let selected_workspace = fixture.path().join("selected-workspace");
+    let other_workspace = fixture.path().join("other-workspace");
+    fs::create_dir_all(&selected_workspace).unwrap();
+    fs::create_dir_all(&other_workspace).unwrap();
+    let foreign_file = other_workspace.join("prompt.txt");
+    fs::write(&foreign_file, b"belongs to a different workspace").unwrap();
+    let data = serde_json::json!({
+        "type":"file",
+        "mime":"text/plain",
+        "url":format!("file://{}", foreign_file.display())
+    })
+    .to_string();
+    source
+        .execute(
+            "UPDATE part SET data = ?1 WHERE id = 'part_ses_root'",
+            [data],
+        )
+        .unwrap();
+    drop(source);
+
+    let inventory = with_selected_workspace_mount(
+        HostOpenCodeInventory::new(fixture.path().join("unused.db"))
+            .with_channel_database(database),
+        selected_workspace,
+    );
+    let extraction_root = fixture.path().join("mismatched-extract");
+    let result = export_exact_session(
+        &inventory,
+        "ses_root",
+        ExportOptions::new(extraction_root.clone()),
+    );
+
+    assert!(
+        matches!(result, Err(TransferError::Blocked(_))),
+        "a path from a different workspace must not be certified through the selected session's trusted mount"
+    );
+    assert_eq!(fs::read_dir(extraction_root).unwrap().count(), 0);
+}
+
+#[test]
+fn blocks_git_objects_available_only_through_process_environment() {
+    const FIXTURE_ENV: &str = "FRESHELL_OPENCODE_TEST_EXTERNAL_OBJECT_STORE_FIXTURE";
+    if let Some(fixture_path) = std::env::var_os(FIXTURE_ENV) {
+        let fixture = PathBuf::from(fixture_path);
+        let database = fixture.join("opencode.db");
+        let inventory = with_selected_workspace_mount(
+            HostOpenCodeInventory::new(fixture.join("unused.db")).with_channel_database(database),
+            fixture.join("workspace"),
+        );
+        let extraction_root = fixture.join("external-environment-extract");
+        let result = export_exact_session(
+            &inventory,
+            "ses_root",
+            ExportOptions::new(extraction_root.clone()),
+        );
+        assert!(
+            matches!(result, Err(TransferError::Blocked(_))),
+            "an external object store from GIT_ALTERNATE_OBJECT_DIRECTORIES must not certify the snapshot"
+        );
+        assert_eq!(fs::read_dir(extraction_root).unwrap().count(), 0);
+        return;
+    }
+
+    let fixture = TestDir::new("git-env-alternate");
+    let workspace_mount = fixture.path().join("workspace");
+    let external_store = fixture.path().join("external-objects.git");
+    fs::create_dir_all(&workspace_mount).unwrap();
+    run_git_command(&workspace_mount, &["init", "-q"], None);
+    run_git_command(
+        &workspace_mount,
+        &["init", "--bare", "-q", external_store.to_str().unwrap()],
+        None,
+    );
+    let blob = run_git_command(
+        &workspace_mount,
+        &[
+            "--git-dir",
+            external_store.to_str().unwrap(),
+            "hash-object",
+            "-w",
+            "--stdin",
+        ],
+        Some(b"environment-only snapshot blob"),
+    );
+    let tree = run_git_command(
+        &workspace_mount,
+        &["--git-dir", external_store.to_str().unwrap(), "mktree"],
+        Some(format!("100644 blob {}\tsnapshot.txt\n", blob.trim()).as_bytes()),
+    );
+    let database = fixture.path().join("opencode.db");
+    let source = create_synthetic_source(&database);
+    source
+        .execute(
+            "UPDATE part SET data = ?1 WHERE id = 'part_ses_root'",
+            [serde_json::json!({"type":"snapshot", "snapshot":tree.trim()}).to_string()],
+        )
+        .unwrap();
+    drop(source);
+
+    let executable = std::env::current_exe().unwrap();
+    let mut child = Command::new(executable);
+    child
+        .args([
+            "--exact",
+            "blocks_git_objects_available_only_through_process_environment",
+            "--nocapture",
+        ])
+        .env(FIXTURE_ENV, fixture.path());
+    for (key, _) in std::env::vars_os() {
+        if key
+            .to_string_lossy()
+            .to_ascii_uppercase()
+            .starts_with("GIT_")
+        {
+            child.env_remove(key);
+        }
+    }
+    child.env(
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+        external_store.join("objects"),
+    );
+    let output = child.output().expect("run isolated regression child");
+    assert!(
+        output.status.success(),
+        "child regression failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn malformed_json_blocks_every_reference_traversal_field() {
+    let cases = [
+        (
+            "message",
+            "UPDATE message SET data = ?1 WHERE id = 'msg_ses_root'",
+        ),
+        (
+            "part",
+            "UPDATE part SET data = ?1 WHERE id = 'part_ses_root'",
+        ),
+        (
+            "session_message",
+            "UPDATE session_message SET data = ?1 WHERE id = 'v2_root'",
+        ),
+        (
+            "session_input",
+            "UPDATE session_input SET prompt = ?1 WHERE id = 'input_root'",
+        ),
+        (
+            "session",
+            "UPDATE session SET revert = ?1 WHERE id = 'ses_root'",
+        ),
+        ("event", "UPDATE event SET data = ?1 WHERE id = 'evt_root'"),
+        (
+            "session_context_epoch",
+            "UPDATE session_context_epoch SET snapshot = ?1 WHERE session_id = 'ses_root'",
+        ),
+    ];
+
+    for (table, update) in cases {
+        let fixture = TestDir::new(&format!("malformed-json-{table}"));
+        let database = fixture.path().join("opencode.db");
+        let source = create_synthetic_source(&database);
+        source.execute(update, [r#"{"truncated":"#]).unwrap();
+        drop(source);
+
+        let inventory = HostOpenCodeInventory::new(fixture.path().join("unused.db"))
+            .with_channel_database(database);
+        let extraction_root = fixture.path().join("extract");
+        let result = export_exact_session(
+            &inventory,
+            "ses_root",
+            ExportOptions::new(extraction_root.clone()),
+        );
+        assert!(
+            matches!(result, Err(TransferError::Blocked(_))),
+            "malformed JSON in {table} must block the transfer"
+        );
+        assert_eq!(
+            fs::read_dir(extraction_root).unwrap().count(),
+            0,
+            "malformed JSON in {table} must not publish a bundle"
+        );
+    }
+}
+
+#[test]
+fn verifies_a_repeated_git_tree_in_each_selected_session_workspace() {
+    let fixture = TestDir::new("git-tree-cross-workspace");
+    let root_workspace = fixture.path().join("root-workspace");
+    let child_workspace = fixture.path().join("child-workspace");
+    fs::create_dir_all(&root_workspace).unwrap();
+    fs::create_dir_all(&child_workspace).unwrap();
+    run_git_command(&root_workspace, &["init", "-q"], None);
+    run_git_command(&child_workspace, &["init", "-q"], None);
+    let blob = run_git_command(
+        &root_workspace,
+        &["hash-object", "-w", "--stdin"],
+        Some(b"root workspace only snapshot blob"),
+    );
+    let tree = run_git_command(
+        &root_workspace,
+        &["mktree"],
+        Some(format!("100644 blob {}\tsnapshot.txt\n", blob.trim()).as_bytes()),
+    );
+
+    let database = fixture.path().join("opencode.db");
+    let source = create_synthetic_source(&database);
+    source
+        .execute_batch(
+            "INSERT INTO project (id, worktree, time_created, time_updated, sandboxes)
+             VALUES ('prj_other', '/synthetic/other', 2, 2, '[]');
+             INSERT INTO workspace (id, type, name, project_id, time_used)
+             VALUES ('wrk_other', 'directory', 'other', 'prj_other', 2);
+             INSERT INTO project_directory (project_id, directory, time_created)
+             VALUES ('prj_other', '/synthetic/other', 2);
+             UPDATE session
+             SET project_id = 'prj_other', workspace_id = 'wrk_other',
+                 directory = '/synthetic/other'
+             WHERE id = 'ses_child';",
+        )
+        .unwrap();
+    let revert = serde_json::json!({"snapshot":tree.trim()}).to_string();
+    source
+        .execute(
+            "UPDATE session SET revert = ?1 WHERE id IN ('ses_root', 'ses_child')",
+            [revert],
+        )
+        .unwrap();
+    drop(source);
+
+    let inventory = HostOpenCodeInventory::new(fixture.path().join("unused.db"))
+        .with_channel_database(database)
+        .with_trusted_workspace_mount(
+            "prj_kept",
+            Some("wrk_kept".into()),
+            "/synthetic/worktree",
+            root_workspace,
+        )
+        .with_trusted_workspace_mount(
+            "prj_other",
+            Some("wrk_other".into()),
+            "/synthetic/other",
+            child_workspace,
+        );
+    let extraction_root = fixture.path().join("extract");
+    let result = export_exact_session(
+        &inventory,
+        "ses_root",
+        ExportOptions::new(extraction_root.clone()),
+    );
+
+    assert!(
+        matches!(result, Err(TransferError::Blocked(_))),
+        "the child workspace must resolve the repeated tree in its own Git store"
+    );
+    assert_eq!(fs::read_dir(extraction_root).unwrap().count(), 0);
 }
 
 #[test]
@@ -1412,13 +1689,15 @@ fn verifies_snapshot_trees_through_an_accessible_alternate_store_and_blocks_miss
             [serde_json::json!({"snapshot":tree.trim()}).to_string()],
         )
         .unwrap();
-    let inventory = HostOpenCodeInventory::new(fixture.path().join("unused.db"))
-        .with_channel_database(database.clone());
+    let inventory = with_selected_workspace_mount(
+        HostOpenCodeInventory::new(fixture.path().join("unused.db"))
+            .with_channel_database(database.clone()),
+        workspace_mount.clone(),
+    );
     let snapshot = export_exact_session(
         &inventory,
         "ses_root",
-        ExportOptions::new(fixture.path().join("extract"))
-            .with_workspace_mount(workspace_mount.clone()),
+        ExportOptions::new(fixture.path().join("extract")),
     )
     .expect("alternate object store under the exact mounted path is available");
     let git_assets: Vec<_> = snapshot
@@ -1472,8 +1751,7 @@ fn verifies_snapshot_trees_through_an_accessible_alternate_store_and_blocks_miss
         export_exact_session(
             &inventory,
             "ses_root",
-            ExportOptions::new(fixture.path().join("external-alternate-extract"))
-                .with_workspace_mount(workspace_mount.clone()),
+            ExportOptions::new(fixture.path().join("external-alternate-extract")),
         ),
         Err(TransferError::Blocked(_))
     ));
@@ -1489,8 +1767,7 @@ fn verifies_snapshot_trees_through_an_accessible_alternate_store_and_blocks_miss
         export_exact_session(
             &inventory,
             "ses_root",
-            ExportOptions::new(fixture.path().join("missing-tree-extract"))
-                .with_workspace_mount(workspace_mount),
+            ExportOptions::new(fixture.path().join("missing-tree-extract")),
         ),
         Err(TransferError::Blocked(_))
     ));
@@ -1499,6 +1776,15 @@ fn verifies_snapshot_trees_through_an_accessible_alternate_store_and_blocks_miss
 fn run_git_command(cwd: &Path, args: &[&str], stdin: Option<&[u8]>) -> String {
     let mut command = Command::new("git");
     command.current_dir(cwd).args(args);
+    for (key, _) in std::env::vars_os() {
+        if key
+            .to_string_lossy()
+            .to_ascii_uppercase()
+            .starts_with("GIT_")
+        {
+            command.env_remove(key);
+        }
+    }
     if stdin.is_some() {
         command.stdin(Stdio::piped());
     }
