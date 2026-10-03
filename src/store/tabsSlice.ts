@@ -817,17 +817,20 @@ type ManagedViewRepairFence = {
   soulRevision: number
 }
 
+const MANAGED_VIEW_AUTHORITATIVE_REPAIR_ATTEMPTS = 2
+
 /**
- * A timed-out PATCH has an unknown durable outcome. Reassert visible with the
- * original fence first so the common case is one cheap, fenced mutation. If
- * the server already accepted the late detach, the stale response is followed
- * by one bounded authoritative read and a retry with current fences.
+ * An authoritative read is a snapshot, so even a visible result needs an
+ * acknowledged visible PATCH to fence a queued detach. The caller owns the
+ * finite attempt budget; one reread handles a detach winning between read
+ * and PATCH without an unbounded retry loop.
  */
 async function repairManagedViewFromAuthoritativeDetail(
   projection: ManagedViewCloseProjection,
   operation: 'detach' | 'rollback',
   authoritative: Awaited<ReturnType<typeof getManagedRuntimeSoul>>,
-  previousError?: unknown,
+  previousError: unknown,
+  attemptsRemaining: number,
 ): Promise<void> {
   if (!projection.canRepair()) return
   const currentView = authoritative.viewIntents.find((view) => view.viewId === projection.viewId)
@@ -844,8 +847,7 @@ async function repairManagedViewFromAuthoritativeDetail(
     })
     return
   }
-  if (currentView.visibility === 'visible') return
-  if (currentView.visibility !== 'detached') {
+  if (currentView.visibility !== 'visible' && currentView.visibility !== 'detached') {
     log.error('managed view authoritative repair failed', {
       event: 'managed_view_visibility_uncertain_outcome',
       operation,
@@ -861,6 +863,9 @@ async function repairManagedViewFromAuthoritativeDetail(
   }
 
   try {
+    // A visible read can precede the queued detach's commit. The acknowledged
+    // PATCH advances the view revision even when it is already visible, so
+    // that original detach can no longer commit using its old fence.
     const repaired = await awaitBoundedManagedRuntimeRequest(
       'managed view authoritative visibility repair',
       (signal) => updateManagedViewRepairWithSignal(projection, {
@@ -891,6 +896,12 @@ async function repairManagedViewFromAuthoritativeDetail(
     })
   } catch (error) {
     if (error instanceof ManagedViewRepairSupersededError || !projection.canRepair()) return
+    if (attemptsRemaining > 0 && !isManagedRuntimeRequestTimeout(error)) {
+      // The detach may have won between GET and PATCH. Re-read once with a
+      // finite budget; persistent failure remains a diagnosed uncertainty.
+      await repairManagedViewAuthoritatively(projection, operation, error, attemptsRemaining)
+      return
+    }
     log.error('managed view authoritative repair failed', {
       event: 'managed_view_visibility_uncertain_outcome',
       operation,
@@ -907,6 +918,7 @@ async function repairManagedViewAuthoritatively(
   projection: ManagedViewCloseProjection,
   operation: 'detach' | 'rollback',
   previousError?: unknown,
+  attemptsRemaining = MANAGED_VIEW_AUTHORITATIVE_REPAIR_ATTEMPTS,
 ): Promise<void> {
   if (!projection.canRepair()) return
   if (!projection.soulId) {
@@ -949,11 +961,12 @@ async function repairManagedViewAuthoritatively(
             operation,
             outcome.value,
             previousError,
+            attemptsRemaining - 1,
           )
         },
       },
     )
-    await repairManagedViewFromAuthoritativeDetail(projection, operation, authoritative, previousError)
+    await repairManagedViewFromAuthoritativeDetail(projection, operation, authoritative, previousError, attemptsRemaining - 1)
   } catch (error) {
     if (!projection.canRepair()) return
     log.error('managed view authoritative repair failed', {
