@@ -118,12 +118,11 @@ session, or sole remaining session as ownership or identity proof.
 1. Run the dry run and resolve all blockers.
 2. Run the repository's managed provider acceptance tests for the intended
    provider/mode.
-   The P2-G04 isolated browser test harness currently requires
-   `FRESHELL_MANAGED_OPENCODE_AUTH_FILE` to point to its existing OpenCode
-   `auth.json`; its temporary server home cannot discover the host credential.
-   This is a test-harness-only legacy input, not the managed provider contract.
-   Production launches use `FRESHELL_MANAGED_<PROVIDER>_ONECLI_ENV_FILE` or
-   `FRESHELL_MANAGED_<PROVIDER>_ONECLI_AUTH_FILE` as typed OneCLI references.
+   The P2-G04 isolated browser test harness requires
+   `FRESHELL_MANAGED_OPENCODE_ONECLI_AUTH_FILE` to point to the private
+   existing OpenCode `auth.json`; its temporary server home cannot discover
+   the host credential. This uses the same typed OneCLI reference as managed
+   provider launches.
 3. Apply `managed-opt-in` with the current control epoch and a unique request ID.
 4. Verify the returned inventory revision and rollout mode.
 5. Open one managed agent for every provider currently marked

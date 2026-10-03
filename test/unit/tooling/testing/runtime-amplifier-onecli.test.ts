@@ -49,6 +49,16 @@ describe('live Amplifier OneCLI qualification grants', () => {
     expect(phase2BootstrapFiles(env)).toEqual([environmentGrant, authGrant])
   })
 
+  it('admits only the typed OpenCode OneCLI auth grant, not the legacy raw auth path', () => {
+    const onecliGrant = privateGrant('onecli-auth.json')
+    const legacyAuth = privateGrant('legacy-auth.json')
+
+    expect(phase2BootstrapFiles({
+      FRESHELL_MANAGED_OPENCODE_ONECLI_AUTH_FILE: onecliGrant,
+      FRESHELL_MANAGED_OPENCODE_AUTH_FILE: legacyAuth,
+    })).toEqual([onecliGrant])
+  })
+
   it('rejects a missing grant even when the old keys-file input is set', () => {
     const legacyKeys = privateGrant('keys.env')
     const env = { FRESHELL_MANAGED_AMPLIFIER_ONECLI_KEYS_FILE: legacyKeys }

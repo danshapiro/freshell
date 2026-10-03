@@ -283,7 +283,7 @@
         {
           "id": "P2-G04",
           "required": true,
-          "procedure": "Start OpenCode 1.18.21 with openai/gpt-5.6-luna using the explicit FRESHELL_MANAGED_OPENCODE_AUTH_FILE reference to the configured OpenAI OAuth credential; verify the managed provider volume contains the OpenAI credential and the requested model is available; complete a first Bash-tool turn, begin a controlled long Bash tool, SIGKILL/restart web while the tool is running, then run a provider-side tool in a follow-up.",
+          "procedure": "Start OpenCode 1.18.21 with openai/gpt-5.6-luna using the explicit FRESHELL_MANAGED_OPENCODE_ONECLI_AUTH_FILE reference to the configured private OpenAI OAuth credential; verify the managed provider volume contains the OpenAI credential and the requested model is available; complete a first Bash-tool turn, begin a controlled long Bash tool, SIGKILL/restart web while the tool is running, then run a provider-side tool in a follow-up.",
           "pass_assertion": "Same native ses_* session, soul, OS incarnation, container and host boot; tool effects occur exactly once; provider launch count stays one; no paid-model fallback or CLI auto-update.",
           "status": "NOT_RUN"
         },

@@ -22,10 +22,19 @@ import {
   P2_OPENCODE_VERSION,
   type ManagedRuntimeView,
 } from '../helpers/managed-runtime.js'
+import { requireOpenCodeAuthFile } from '../helpers/opencode-auth-file.js'
 import { openPanePicker } from '../helpers/pane-picker.js'
 import { TerminalHelper } from '../helpers/terminal-helpers.js'
 import { TestHarness } from '../helpers/test-harness.js'
-import { hasOpenCodePromptModelText, nativeTurnProof, openCodeTerminalReady, selectNativeAssistantTurn, type NativeAssistantTurn } from '../helpers/opencode-native-history.js'
+import {
+  hasOpenCodePromptModelText,
+  nativeTurnProof,
+  openCodeCredentialFailureMessage,
+  openCodeTerminalReady,
+  OPENCODE_NATIVE_HISTORY_SCRIPT,
+  selectNativeAssistantTurn,
+  type NativeAssistantTurn,
+} from '../helpers/opencode-native-history.js'
 import type { ProviderQualificationRow } from '../../../scripts/testing/provider-qualification-receipt.js'
 
 function leavesByMode(node: any, mode: string): any[] {
@@ -41,10 +50,13 @@ async function waitForValue<T>(
   description: string,
   probe: () => T | null | undefined | Promise<T | null | undefined>,
   timeoutMs: number,
+  abortProbe?: () => Error | null | undefined | Promise<Error | null | undefined>,
 ): Promise<T> {
   const deadline = Date.now() + timeoutMs
   let lastError: unknown
   while (Date.now() < deadline) {
+    const abortError = await abortProbe?.()
+    if (abortError) throw abortError
     try {
       const value = await probe()
       if (value !== null && value !== undefined) return value
@@ -275,10 +287,8 @@ async function paneSessionId(
 
 function nativeAssistantTurns(rig: ManagedRuntimeBrowserRig, view: ManagedRuntimeView, sessionId: string): NativeAssistantTurn[] {
   if (!view.containerId) throw new Error('native evidence probe has no exact owned container')
-  const probe = path.join(rig.repoRoot, 'test/e2e-browser/helpers/provider-native-history/probe-cli.ts')
-  const tsxLoader = path.join(rig.repoRoot, 'node_modules/tsx/dist/loader.mjs')
   const raw = rig.ownedProviderExec(view.containerId, [
-    'node', '--no-warnings', '--import', tsxLoader, probe, 'opencode',
+    'node', '--no-warnings', '-e', OPENCODE_NATIVE_HISTORY_SCRIPT,
     '/home/freshell/provider/.local/share/opencode/opencode.db', sessionId,
   ])
   const evidence = JSON.parse(raw)
@@ -288,12 +298,20 @@ function nativeAssistantTurns(rig: ManagedRuntimeBrowserRig, view: ManagedRuntim
 }
 
 async function nextNativeAssistantTurn(
+  page: Page,
+  terminalId: string,
   rig: ManagedRuntimeBrowserRig, view: ManagedRuntimeView, sessionId: string,
   priorMessageIds: ReadonlySet<string>, expectedText: string,
 ): Promise<NativeAssistantTurn> {
   return waitForValue('the correlated completed native assistant response, not a rendered echo', () => (
     selectNativeAssistantTurn(nativeAssistantTurns(rig, view, sessionId), priorMessageIds, expectedText)
-  ), 180_000)
+  ), 180_000, async () => {
+    const terminalOutput = await page.evaluate((id) => (
+      window.__FRESHELL_TEST_HARNESS__?.getTerminalBuffer?.(id) ?? ''
+    ), terminalId)
+    const failure = openCodeCredentialFailureMessage(terminalOutput)
+    return failure ? new Error(failure) : undefined
+  })
 }
 
 function verifyMemoryAnswer(turn: NativeAssistantTurn, projectName: string): void {
@@ -345,11 +363,15 @@ test.describe.serial('OpenCode provider qualification', () => {
     )
     test.setTimeout(1_800_000)
 
+    const authFile = requireOpenCodeAuthFile(process.env, 'OpenCode provider qualification')
     const blockerEvidence = runBlockerMatrixTests(process.cwd())
     const rig = new ManagedRuntimeBrowserRig(
       process.cwd(),
       5,
-      {},
+      {
+        FRESHELL_BIND_HOST: '0.0.0.0',
+        FRESHELL_MANAGED_OPENCODE_ONECLI_AUTH_FILE: authFile,
+      },
       { FRESHELL_RUNTIME_OBSERVER_INTERVAL_MS: '750' },
       'release',
     )
@@ -391,6 +413,13 @@ test.describe.serial('OpenCode provider qualification', () => {
         .toBe(P2_OPENCODE_VERSION)
       const processArgs = rig.ownedContainerProcessTable(first.view.containerId)
       expect(processArgs).toContain(P2_OPENCODE_MODEL)
+      const authProbe = rig.ownedProviderExec(first.view.containerId, [
+        'node', '--no-warnings', '-e',
+        "const fs=require('node:fs');const auth=JSON.parse(fs.readFileSync('/home/freshell/provider/.local/share/opencode/auth.json','utf8'));const openai=auth.openai;if(!openai||typeof openai.access!=='string'||typeof openai.refresh!=='string')process.exit(2);process.stdout.write('OpenAI credential present')",
+      ])
+      expect(authProbe.trim()).toBe('OpenAI credential present')
+      const availableModels = rig.ownedProviderExec(first.view.containerId, ['opencode', 'models', 'openai'])
+      expect(availableModels).toContain(P2_OPENCODE_MODEL.split('/')[1])
       const exactLimits = cgroupLimitEvidence(rig, first.view)
       expect(exactLimits.swapMax).toBe('0')
 
@@ -406,7 +435,7 @@ test.describe.serial('OpenCode provider qualification', () => {
         await paneSessionId(harness, tabId, first.paneId)
       ), 120_000)
       expect(nativeSessionId).toMatch(/^ses_/)
-      const firstAnswer = await nextNativeAssistantTurn(rig, first.view, nativeSessionId, new Set(), nonce)
+      const firstAnswer = await nextNativeAssistantTurn(page, first.terminalId, rig, first.view, nativeSessionId, new Set(), nonce)
       verifyMemoryAnswer(firstAnswer, nonce)
       const nativeTurnProofs = [nativeTurnProof('initial', nativeSessionId, firstAnswer, nonce)]
 
@@ -435,7 +464,7 @@ test.describe.serial('OpenCode provider qualification', () => {
       await waitForReplacementPrompt(page, harness, rig, tabId, first.paneId, afterHostCrash)
       const beforeRecall = new Set(nativeAssistantTurns(rig, afterHostCrash, nativeSessionId).map((turn) => turn.messageId))
       await executeInPane(page, first.paneId, 'What is the name of the project we chose earlier?')
-      const recalledAnswer = await nextNativeAssistantTurn(rig, afterHostCrash, nativeSessionId, beforeRecall, nonce)
+      const recalledAnswer = await nextNativeAssistantTurn(page, first.terminalId, rig, afterHostCrash, nativeSessionId, beforeRecall, nonce)
       verifyMemoryAnswer(recalledAnswer, nonce)
       expect(recalledAnswer.messageId).not.toBe(firstAnswer.messageId)
       nativeTurnProofs.push(nativeTurnProof('after_session_host_crash', nativeSessionId, recalledAnswer, nonce))
@@ -469,7 +498,7 @@ test.describe.serial('OpenCode provider qualification', () => {
       await waitForReplacementPrompt(page, harness, rig, tabId, first.paneId, afterProviderCrash)
       const beforeProviderFollowup = new Set(nativeAssistantTurns(rig, afterProviderCrash, nativeSessionId).map((turn) => turn.messageId))
       await executeInPane(page, first.paneId, 'Please remind me of the project name we selected.')
-      const providerAnswer = await nextNativeAssistantTurn(rig, afterProviderCrash, nativeSessionId, beforeProviderFollowup, nonce)
+      const providerAnswer = await nextNativeAssistantTurn(page, first.terminalId, rig, afterProviderCrash, nativeSessionId, beforeProviderFollowup, nonce)
       verifyMemoryAnswer(providerAnswer, nonce)
       expect(providerAnswer.messageId).not.toBe(recalledAnswer.messageId)
       nativeTurnProofs.push(nativeTurnProof('after_provider_process_crash', nativeSessionId, providerAnswer, nonce))
@@ -486,7 +515,7 @@ test.describe.serial('OpenCode provider qualification', () => {
       const secondSessionId = await waitForValue('second exact OpenCode session id', async () => (
         await paneSessionId(harness, tabId, second.paneId)
       ), 120_000)
-      const secondAnswer = await nextNativeAssistantTurn(rig, second.view, secondSessionId, new Set(), secondNonce)
+      const secondAnswer = await nextNativeAssistantTurn(page, second.terminalId, rig, second.view, secondSessionId, new Set(), secondNonce)
       verifyMemoryAnswer(secondAnswer, secondNonce)
       expect(secondAnswer.text).not.toContain(nonce)
       expect(second.view.soulId).not.toBe(first.view.soulId)

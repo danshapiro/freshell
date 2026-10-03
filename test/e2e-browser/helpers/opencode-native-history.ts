@@ -4,6 +4,13 @@ export type { NativeAssistantTurn, NativeHistory } from './provider-native-histo
 export { nativeTurnProof } from './provider-native-history/proof.js'
 import type { NativeAssistantTurn } from './provider-native-history/types.js'
 
+export function openCodeCredentialFailureMessage(output: string): string | null {
+  if (/\bToken refresh failed:\s*401\b/i.test(stripVTControlCharacters(output))) {
+    return 'OpenCode credential refresh was rejected with HTTP 401; provide a currently valid OpenAI auth grant'
+  }
+  return null
+}
+
 /**
  * Self-contained query-only form of the current OpenCode native-history reader.
  * Runtime chaos tests execute it only through an ownership-checked provider

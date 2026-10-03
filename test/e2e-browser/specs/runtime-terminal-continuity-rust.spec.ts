@@ -13,22 +13,11 @@ import fs from 'node:fs'
 import path from 'node:path'
 
 import { ManagedRuntimeBrowserRig, P2_OPENCODE_MODEL, P2_OPENCODE_VERSION, type ManagedRuntimeView } from '../helpers/managed-runtime.js'
+import { requireOpenCodeAuthFile } from '../helpers/opencode-auth-file.js'
 import { OPENCODE_NATIVE_HISTORY_SCRIPT, type NativeHistory } from '../helpers/opencode-native-history.js'
 import { TestHarness } from '../helpers/test-harness.js'
 import { TerminalHelper } from '../helpers/terminal-helpers.js'
 import { openPanePicker } from '../helpers/pane-picker.js'
-
-function requireOpenCodeAuthFile(): string {
-  const configured = process.env.FRESHELL_MANAGED_OPENCODE_AUTH_FILE
-  if (!configured) {
-    throw new Error('P2-G04 requires FRESHELL_MANAGED_OPENCODE_AUTH_FILE to point at the existing OpenCode auth.json')
-  }
-  const authFile = path.resolve(configured)
-  if (!fs.statSync(authFile).isFile()) {
-    throw new Error(`P2-G04 OpenCode auth reference is not a file: ${authFile}`)
-  }
-  return authFile
-}
 
 function findTerminalLeaves(node: any, out: any[] = []): any[] {
   if (!node) return out
@@ -334,12 +323,13 @@ test.describe.serial('Phase 2 managed runtime continuity', () => {
   test('P2-G04: OpenAI-authenticated OpenCode tool turn survives web replacement in one native session', async ({ page }) => {
     test.setTimeout(900_000)
 
-    // The rig runs the web server with an isolated HOME. Pass the host auth
-    // file explicitly; otherwise the managed runtime starts without the
-    // configured provider credential and OpenCode silently uses its default.
+    // The rig runs the web server with an isolated HOME. Pass the existing
+    // private auth file as a typed OneCLI grant; otherwise OpenCode silently
+    // uses its default model in the managed provider volume.
     const authFile = requireOpenCodeAuthFile()
     const rig = new ManagedRuntimeBrowserRig(process.cwd(), 2, {
-      FRESHELL_MANAGED_OPENCODE_AUTH_FILE: authFile,
+      FRESHELL_BIND_HOST: '0.0.0.0',
+      FRESHELL_MANAGED_OPENCODE_ONECLI_AUTH_FILE: authFile,
     })
     try {
       const info = await rig.start()
