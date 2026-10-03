@@ -24,6 +24,7 @@ pub mod codex_locator;
 pub mod directory_index;
 pub mod meta;
 pub mod opencode_locator;
+pub mod opencode_transfer;
 pub mod parse;
 pub mod provider_layout;
 pub mod resume_input;

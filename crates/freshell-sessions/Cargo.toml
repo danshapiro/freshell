@@ -27,7 +27,10 @@ notify = "6"
 # node:sqlite -> rusqlite: the opencode.db read-only listing parser. `bundled`
 # compiles the SQLite amalgamation so the parser is not coupled to the host's
 # libsqlite3 version (deterministic across dev/CI/Windows).
-rusqlite = { version = "0.31", features = ["bundled"] }
+rusqlite = { version = "0.31", features = ["backup", "bundled"] }
+sha2 = "0.10"
+hex = "0.4"
+tempfile = "3"
 # SYNC-06 resume-resolve parity: the `shared/resume-input-parser.ts` port's
 # candidate-extraction regexes + hint tables (`resume_input.rs`). `(?-u:\b)`
 # keeps JS's ASCII \b word-boundary semantics. Same major already a direct
