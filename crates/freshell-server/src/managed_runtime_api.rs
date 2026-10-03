@@ -373,7 +373,7 @@ async fn runtime_readiness(
     }
     let client = match runtime_client(&state) {
         Ok(client) => client,
-        Err(response) => return response,
+        Err(rejection) => return rejection.into_response(),
     };
     match client.inventory_snapshot().await {
         Ok(snapshot) => Json(json!({
@@ -396,7 +396,7 @@ async fn list_souls(
     }
     let client = match runtime_client(&state) {
         Ok(client) => client,
-        Err(response) => return response,
+        Err(rejection) => return rejection.into_response(),
     };
     match client.inventory_snapshot().await {
         Ok(mut snapshot) => {
@@ -434,7 +434,7 @@ async fn get_soul(
     };
     let client = match runtime_client(&state) {
         Ok(client) => client,
-        Err(response) => return response,
+        Err(rejection) => return rejection.into_response(),
     };
     let snapshot = match client.inventory_snapshot().await {
         Ok(snapshot) => snapshot,
@@ -483,7 +483,7 @@ async fn retry_soul(
     }
     let request_id = match mutation_request_id(body.request_id) {
         Ok(request_id) => request_id,
-        Err(response) => return response,
+        Err(rejection) => return rejection.into_response(),
     };
     let Some(revision) = body.expected_intent_revision else {
         return bad_request("expectedIntentRevision is required");
@@ -494,7 +494,7 @@ async fn retry_soul(
     };
     let client = match runtime_client(&state) {
         Ok(client) => client,
-        Err(response) => return response,
+        Err(rejection) => return rejection.into_response(),
     };
     match client
         .recover_expected_with_request_id(
@@ -524,7 +524,7 @@ async fn read_native_history(
     };
     let client = match runtime_client(&state) {
         Ok(client) => client,
-        Err(response) => return response,
+        Err(rejection) => return rejection.into_response(),
     };
     match client.fresh_agent_history(soul).await {
         Ok(snapshot) => Json(snapshot).into_response(),
@@ -543,7 +543,7 @@ async fn stop_soul(
     }
     let request_id = match mutation_request_id(body.request_id) {
         Ok(request_id) => request_id,
-        Err(response) => return response,
+        Err(rejection) => return rejection.into_response(),
     };
     let Some(revision) = body.expected_intent_revision else {
         return bad_request("expectedIntentRevision is required");
@@ -554,7 +554,7 @@ async fn stop_soul(
     };
     let client = match runtime_client(&state) {
         Ok(client) => client,
-        Err(response) => return response,
+        Err(rejection) => return rejection.into_response(),
     };
     match client
         .stop_expected_with_request_id(request_id, soul, Some(revision))
@@ -588,7 +588,7 @@ async fn update_limits(
     }
     let request_id = match mutation_request_id(body.request_id) {
         Ok(request_id) => request_id,
-        Err(response) => return response,
+        Err(rejection) => return rejection.into_response(),
     };
     let Some(revision) = body.expected_intent_revision else {
         return bad_request("expectedIntentRevision is required");
@@ -599,7 +599,7 @@ async fn update_limits(
     };
     let client = match runtime_client(&state) {
         Ok(client) => client,
-        Err(response) => return response,
+        Err(rejection) => return rejection.into_response(),
     };
     match client
         .update_limits_with_request_id(
@@ -634,7 +634,7 @@ async fn incident_summary(
     };
     let client = match runtime_client(&state) {
         Ok(client) => client,
-        Err(response) => return response,
+        Err(rejection) => return rejection.into_response(),
     };
     match client.incident_summary(incident_id).await {
         Ok(summary) => Json(summary).into_response(),
@@ -662,7 +662,7 @@ async fn pending_notices(
     };
     let client = match runtime_client(&state) {
         Ok(client) => client,
-        Err(response) => return response,
+        Err(rejection) => return rejection.into_response(),
     };
     match client
         .pending_notices(profile_id, query.limit.unwrap_or(20))
@@ -692,7 +692,7 @@ async fn record_notice_receipt(
     }
     let request_id = match mutation_request_id(body.request_id) {
         Ok(request_id) => request_id,
-        Err(response) => return response,
+        Err(rejection) => return rejection.into_response(),
     };
     let notice_id = match NoticeId::parse(raw) {
         Ok(notice_id) => notice_id,
@@ -700,7 +700,7 @@ async fn record_notice_receipt(
     };
     let client = match runtime_client(&state) {
         Ok(client) => client,
-        Err(response) => return response,
+        Err(rejection) => return rejection.into_response(),
     };
     match client
         .record_notice_receipt_with_request_id(request_id, notice_id, body.profile_id, body.state)
@@ -720,7 +720,7 @@ async fn runtime_metrics_snapshot(
     }
     let client = match runtime_client(&state) {
         Ok(client) => client,
-        Err(response) => return response,
+        Err(rejection) => return rejection.into_response(),
     };
     match client.runtime_metrics_snapshot().await {
         Ok(snapshot) => Json(snapshot).into_response(),
@@ -766,11 +766,11 @@ async fn migration_response(
     }
     let request_id = match mutation_request_id(body.request_id) {
         Ok(request_id) => request_id,
-        Err(response) => return response,
+        Err(rejection) => return rejection.into_response(),
     };
     let client = match runtime_client(&state) {
         Ok(client) => client,
-        Err(response) => return response,
+        Err(rejection) => return rejection.into_response(),
     };
     match client
         .migration_plan_with_request_id(
@@ -808,11 +808,11 @@ async fn repair_runtime(
     }
     let request_id = match mutation_request_id(body.request_id) {
         Ok(request_id) => request_id,
-        Err(response) => return response,
+        Err(rejection) => return rejection.into_response(),
     };
     let client = match runtime_client(&state) {
         Ok(client) => client,
-        Err(response) => return response,
+        Err(rejection) => return rejection.into_response(),
     };
     match client
         .repair_audit_with_request_id(request_id, body.apply)
@@ -844,7 +844,7 @@ async fn upsert_view(
     }
     let request_id = match mutation_request_id(body.request_id) {
         Ok(request_id) => request_id,
-        Err(response) => return response,
+        Err(rejection) => return rejection.into_response(),
     };
     let soul = match SoulId::parse(raw) {
         Ok(soul) => soul,
@@ -862,7 +862,7 @@ async fn upsert_view(
     };
     let client = match runtime_client(&state) {
         Ok(client) => client,
-        Err(response) => return response,
+        Err(rejection) => return rejection.into_response(),
     };
     match client
         .upsert_view_intent_with_request_id(
@@ -903,7 +903,7 @@ async fn update_view(
     }
     let request_id = match mutation_request_id(body.request_id) {
         Ok(request_id) => request_id,
-        Err(response) => return response,
+        Err(rejection) => return rejection.into_response(),
     };
     let view_id = match ViewIntentId::parse(raw) {
         Ok(view_id) => view_id,
@@ -916,7 +916,7 @@ async fn update_view(
     };
     let client = match runtime_client(&state) {
         Ok(client) => client,
-        Err(response) => return response,
+        Err(rejection) => return rejection.into_response(),
     };
     match client
         .update_view_visibility_with_request_id(
@@ -966,20 +966,33 @@ fn projection_event_is_current(
         || event.view_intent.visibility == ViewVisibilityIntent::Hidden
 }
 
-fn mutation_request_id(raw: Option<String>) -> Result<RequestId, Response> {
-    let Some(raw) = raw.filter(|value| !value.trim().is_empty()) else {
-        return Err(bad_request("requestId is required"));
-    };
-    RequestId::parse(raw).map_err(|error| bad_request(error.to_string()))
+#[derive(Debug)]
+struct ApiRejection {
+    status: StatusCode,
+    message: String,
 }
 
-fn runtime_client(state: &ManagedRuntimeApiState) -> Result<RuntimeClient, Response> {
-    state.client.clone().ok_or_else(|| {
-        (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(json!({"error": "Managed runtime unavailable"})),
-        )
-            .into_response()
+impl IntoResponse for ApiRejection {
+    fn into_response(self) -> Response {
+        (self.status, Json(json!({"error": self.message}))).into_response()
+    }
+}
+
+fn mutation_request_id(raw: Option<String>) -> Result<RequestId, ApiRejection> {
+    let rejection = |message: String| ApiRejection {
+        status: StatusCode::BAD_REQUEST,
+        message,
+    };
+    let Some(raw) = raw.filter(|value| !value.trim().is_empty()) else {
+        return Err(rejection("requestId is required".into()));
+    };
+    RequestId::parse(raw).map_err(|error| rejection(error.to_string()))
+}
+
+fn runtime_client(state: &ManagedRuntimeApiState) -> Result<RuntimeClient, ApiRejection> {
+    state.client.clone().ok_or_else(|| ApiRejection {
+        status: StatusCode::SERVICE_UNAVAILABLE,
+        message: "Managed runtime unavailable".into(),
     })
 }
 

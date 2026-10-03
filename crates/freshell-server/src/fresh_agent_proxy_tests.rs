@@ -569,3 +569,76 @@ fn hosted_snapshot_unknown_capability_payloads_fail_closed_without_falsifying_kn
         assert!(projected["rollback"].get("redoableTurnIds").is_none());
     }
 }
+
+#[tokio::test]
+async fn rollback_commands_keep_direction_target_and_request_fences() {
+    for direction in [
+        FreshAgentRollbackDirection::Undo,
+        FreshAgentRollbackDirection::Redo,
+    ] {
+        let root = tempfile::tempdir().unwrap();
+        let socket = root.path().join("rollback.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let soul = SoulId::new();
+        let expected_soul = soul.clone();
+        let server = tokio::spawn(async move {
+            for index in 0..2 {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let request: Envelope<AdminCommand> = read_frame(&mut stream).await.unwrap();
+                let result = match request.body {
+                    AdminCommand::Health if index == 0 => AdminResult::Health {
+                        control_epoch: 77,
+                        installation_id: InstallationId::new(),
+                    },
+                    AdminCommand::FreshAgentRollback(rollback) if index == 1 => {
+                        assert_eq!(request.request_id.as_str(), "rollback-ui-request");
+                        assert_eq!(rollback.soul_id, expected_soul);
+                        assert_eq!(rollback.direction, direction);
+                        assert_eq!(rollback.mode, FreshAgentRollbackMode::ToTurn);
+                        assert_eq!(rollback.turn_id.as_deref(), Some("turn-selected"));
+                        assert_eq!(rollback.cwd.as_deref(), Some("/workspace"));
+                        assert_eq!(rollback.expected_control_epoch, Some(77));
+                        AdminResult::FreshAgentCommand {
+                            state: freshell_runtime_protocol::CommandState::Completed,
+                        }
+                    }
+                    other => panic!("unexpected rollback request {other:?}"),
+                };
+                write_frame(
+                    &mut stream,
+                    &AdminReply {
+                        request_id: request.request_id,
+                        result: Ok(result),
+                    },
+                )
+                .await
+                .unwrap();
+            }
+        });
+        let (broadcast, _) = broadcast::channel(16);
+        let proxy = Arc::new(HostedFreshAgentProxy {
+            client: RuntimeClient::new(&socket, "0123456789abcdef"),
+            broadcast: Arc::new(broadcast),
+            aliases: Mutex::new(HashMap::from([(
+                ("codex".into(), "public-thread".into()),
+                soul,
+            )])),
+            presentation_ids: Mutex::new(HashMap::new()),
+            pollers: Mutex::new(HashSet::new()),
+            fixture_modes: HashSet::new(),
+            naming: OnceLock::new(),
+        });
+        let message = serde_json::json!({"provider":"codex","sessionId":"public-thread","sessionType":"freshcodex",
+            "requestId":"rollback-ui-request","mode":"toTurn","turnId":"turn-selected","cwd":"/workspace"});
+        let command = match direction {
+            FreshAgentRollbackDirection::Undo => {
+                HostedFreshAgentCommand::Undo(serde_json::from_value(message).unwrap())
+            }
+            FreshAgentRollbackDirection::Redo => {
+                HostedFreshAgentCommand::Redo(serde_json::from_value(message).unwrap())
+            }
+        };
+        proxy.handle(command).await;
+        server.await.unwrap();
+    }
+}

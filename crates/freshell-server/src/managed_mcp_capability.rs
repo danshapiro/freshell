@@ -703,11 +703,9 @@ fn stage_provider_root(
             let ephemeral = temporary.join("ephemeral");
             private_directory(&ephemeral)?;
             if let Some(prior_stage) = prior_stage {
-                for name in ["inline-config.json"] {
-                    let source = prior_stage.join("ephemeral").join(name);
-                    if source.is_file() {
-                        copy_ephemeral_file(&source, &ephemeral.join(name))?;
-                    }
+                let source = prior_stage.join("ephemeral").join("inline-config.json");
+                if source.is_file() {
+                    copy_ephemeral_file(&source, &ephemeral.join("inline-config.json"))?;
                 }
             } else {
                 if let Some(raw) = opencode_input.inline_config {
