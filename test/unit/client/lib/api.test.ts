@@ -39,8 +39,8 @@ describe('managed runtime stop outcome', () => {
 
   it.each(['verified_empty', 'termination_unconfirmed', 'blocked_ownership', 'backend_unavailable'])(
     'returns the authoritative %s outcome while allowing additive soul fields', async (outcome) => {
-      mockFetch.mockResolvedValueOnce(mockJson({ outcome, soul: { freshAgentSessionId: 'retained-thread' } }))
-      expect(await stopManagedRuntimeSoul('persisted/soul', 8, 'stop-request')).toEqual({ outcome })
+      mockFetch.mockResolvedValueOnce(mockJson({ outcome, soul: { soulId: 'persisted/soul', intentRevision: 9, freshAgentSessionId: 'retained-thread' } }))
+      expect(await stopManagedRuntimeSoul('persisted/soul', 8, 'stop-request')).toEqual({ outcome, soul: { soulId: 'persisted/soul', intentRevision: 9 } })
       expect(mockFetch).toHaveBeenCalledWith('/api/runtime/souls/persisted%2Fsoul/stop', expect.objectContaining({
         method: 'POST', body: JSON.stringify({ requestId: 'stop-request', expectedIntentRevision: 8 }),
       }))
@@ -48,6 +48,14 @@ describe('managed runtime stop outcome', () => {
   )
 
   it.each([{}, { outcome: 'stopped' }, { outcome: null }])('rejects a successful HTTP response without a known cleanup outcome: %j', async (body) => {
+    mockFetch.mockResolvedValueOnce(mockJson(body))
+    await expect(stopManagedRuntimeSoul('soul', 8)).rejects.toThrow()
+  })
+
+  it.each([
+    { outcome: 'verified_empty' }, { outcome: 'verified_empty', soul: {} },
+    { outcome: 'verified_empty', soul: { soulId: 'soul', intentRevision: -1 } },
+  ])('rejects a stop response without valid returned revision authority: %j', async (body) => {
     mockFetch.mockResolvedValueOnce(mockJson(body))
     await expect(stopManagedRuntimeSoul('soul', 8)).rejects.toThrow()
   })

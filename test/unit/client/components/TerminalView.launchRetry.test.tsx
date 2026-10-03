@@ -492,7 +492,7 @@ describe('launch-time INVALID_TERMINAL_ID bounded retry', () => {
   it.each(['verified_empty', 'termination_unconfirmed', 'blocked_ownership', 'backend_unavailable', 'http_failure', 'missing_revision', 'missing_soul'])(
     'waits for exact-soul cleanup before replacing a lost terminal: %s', async (outcome) => {
       stopManagedRuntimeSoul.mockReset()
-      let resolveStop!: (value: { outcome: string }) => void
+      let resolveStop!: (value: unknown) => void
       let rejectStop!: (error: Error) => void
       stopManagedRuntimeSoul.mockReturnValueOnce(new Promise((resolve, reject) => { resolveStop = resolve; rejectStop = reject }))
       const { store, paneContent } = makeStore()
@@ -523,7 +523,7 @@ describe('launch-time INVALID_TERMINAL_ID bounded retry', () => {
 
       await act(async () => {
         if (outcome === 'http_failure') rejectStop(new Error('Server is unavailable'))
-        else resolveStop({ outcome })
+        else resolveStop({ outcome, soul: { soulId: content.soulId, intentRevision: 21 } })
       })
       const after = (store.getState().panes.layouts[TAB] as { content: TerminalPaneContent }).content
       if (outcome === 'verified_empty') {
@@ -538,22 +538,121 @@ describe('launch-time INVALID_TERMINAL_ID bounded retry', () => {
     },
   )
 
-  it('does not reset a different terminal pane when an earlier stop completes', async () => {
+  it.each([
+    ['recovery', 'verified_empty'], ['recovery', 'termination_unconfirmed'], ['recovery', 'http_failure'],
+    ['launch', 'verified_empty'], ['launch', 'termination_unconfirmed'], ['launch', 'http_failure'],
+  ] as const)('does not alter a different terminal pane after a late %s card %s stop result', async (surface, outcome) => {
     stopManagedRuntimeSoul.mockReset()
-    let resolveStop!: (value: { outcome: string }) => void
-    stopManagedRuntimeSoul.mockReturnValueOnce(new Promise((resolve) => { resolveStop = resolve }))
+    let resolveStop!: (value: unknown) => void
+    let rejectStop!: (error: Error) => void
+    stopManagedRuntimeSoul.mockReturnValueOnce(new Promise((resolve, reject) => { resolveStop = resolve; rejectStop = reject }))
     const { store, paneContent } = makeStore()
     const content: TerminalPaneContent = { ...paneContent, status: 'error', soulId: 'old-soul', soulIntentRevision: 21,
-      recoverySummary: { desiredState: 'stopped', recoveryState: 'lost', durabilityState: 'resume_captured', allocationState: 'verified_durable' } }
+      ...(surface === 'recovery'
+        ? { recoverySummary: { desiredState: 'stopped', recoveryState: 'lost', durabilityState: 'resume_captured', allocationState: 'verified_durable' } as const }
+        : { launchFailure: { code: 'SESSION_MISSING', message: 'The durable session is gone.', retryable: false } as const }),
+    }
     store.dispatch(updatePaneContent({ tabId: TAB, paneId: PANE, content }))
-    const rendered = render(<Provider store={store}><TerminalView tabId={TAB} paneId={PANE} paneContent={content} /></Provider>)
-    fireEvent.click(screen.getByRole('button', { name: 'Start new conversation' }))
+    render(<Provider store={store}><TerminalView tabId={TAB} paneId={PANE} paneContent={content} /></Provider>)
+    const card = screen.getByTestId(surface === 'recovery' ? 'managed-runtime-recovery-card' : 'terminal-launch-failure-card')
+    fireEvent.click(surface === 'recovery'
+      ? within(card).getByRole('button', { name: 'Start new conversation' })
+      : within(card).getByTestId('terminal-launch-failure-start-fresh'))
     await waitFor(() => expect(stopManagedRuntimeSoul).toHaveBeenCalledWith('old-soul', 21))
     const replacement = { ...content, createRequestId: 'different-create', soulId: 'different-soul' }
     act(() => store.dispatch(updatePaneContent({ tabId: TAB, paneId: PANE, content: replacement })))
-    rendered.rerender(<Provider store={store}><TerminalView tabId={TAB} paneId={PANE} paneContent={replacement} /></Provider>)
-    await act(async () => resolveStop({ outcome: 'verified_empty' }))
+    // The mounted prop/ref is intentionally stale; the store already owns a different pane.
+    await act(async () => {
+      if (outcome === 'http_failure') rejectStop(new Error('Stale request failed'))
+      else resolveStop({ outcome, soul: { soulId: 'old-soul', intentRevision: 22 } })
+    })
     expect((store.getState().panes.layouts[TAB] as { content: TerminalPaneContent }).content).toMatchObject(replacement)
+    expect(within(card).queryByRole('status')).toBeNull()
+  })
+
+  it.each(['newer_pane', 'older_result', 'wrong_soul'])('does not replace terminal authority after a %s stop response', async (scenario) => {
+    stopManagedRuntimeSoul.mockReset()
+    let resolveStop!: (value: unknown) => void
+    stopManagedRuntimeSoul.mockReturnValueOnce(new Promise((resolve) => { resolveStop = resolve }))
+    const { store, paneContent } = makeStore()
+    const content: TerminalPaneContent = { ...paneContent, status: 'error', soulId: 'same-soul', soulIntentRevision: 21,
+      recoverySummary: { desiredState: 'stopped', recoveryState: 'lost', durabilityState: 'resume_captured', allocationState: 'verified_durable' } }
+    store.dispatch(updatePaneContent({ tabId: TAB, paneId: PANE, content }))
+    render(<Provider store={store}><TerminalView tabId={TAB} paneId={PANE} paneContent={content} /></Provider>)
+    fireEvent.click(screen.getByRole('button', { name: 'Start new conversation' }))
+    if (scenario === 'newer_pane') act(() => store.dispatch(updatePaneContent({ tabId: TAB, paneId: PANE, content: { ...content, soulIntentRevision: 24 } })))
+    await act(async () => resolveStop({ outcome: 'verified_empty', soul: {
+      soulId: scenario === 'wrong_soul' ? 'different-soul' : 'same-soul',
+      intentRevision: scenario === 'older_result' ? 20 : 22,
+    } }))
+    const after = (store.getState().panes.layouts[TAB] as { content: TerminalPaneContent }).content
+    expect(after).toMatchObject({ ...content, soulIntentRevision: scenario === 'newer_pane' ? 24 : 21 })
+    const card = screen.getByTestId('managed-runtime-recovery-card')
+    if (scenario === 'newer_pane') expect(within(card).queryByRole('status')).toBeNull()
+    else expect(await within(card).findByRole('status')).toHaveTextContent('Your conversation has been kept')
+  })
+
+  it('immediately retries a running SESSION_MISSING terminal with the committed stop revision', async () => {
+    stopManagedRuntimeSoul.mockReset()
+    let serverRevision = 21
+    let running = true
+    let resolveVerified!: (value: unknown) => void
+    stopManagedRuntimeSoul.mockImplementation((_soulId: string, revision: number) => {
+      if (revision !== serverRevision) return Promise.reject(new Error('Stale intent revision'))
+      if (running) {
+        running = false
+        serverRevision += 1
+        return Promise.resolve({ outcome: 'termination_unconfirmed', soul: { soulId: 'running-soul', intentRevision: serverRevision } })
+      }
+      return new Promise((resolve) => { resolveVerified = resolve })
+    })
+    const { store, paneContent } = makeStore()
+    const content: TerminalPaneContent = { ...paneContent, status: 'error', terminalId: 'old-terminal',
+      soulId: 'running-soul', soulIntentRevision: 21,
+      sessionRef: { provider: 'codex', sessionId: 'retained-thread' },
+      launchFailure: { code: 'SESSION_MISSING', message: 'The durable session is gone.', retryable: false },
+    }
+    store.dispatch(updatePaneContent({ tabId: TAB, paneId: PANE, content }))
+    render(<Provider store={store}><TerminalView tabId={TAB} paneId={PANE} paneContent={content} /></Provider>)
+    const card = screen.getByTestId('terminal-launch-failure-card')
+    wsMocks.send.mockClear()
+    fireEvent.click(within(card).getByTestId('terminal-launch-failure-start-fresh'))
+    expect(await within(card).findByRole('status')).toHaveTextContent('Your conversation has been kept')
+    const retained = (store.getState().panes.layouts[TAB] as { content: TerminalPaneContent }).content
+    expect(retained).toMatchObject({ createRequestId: content.createRequestId, soulId: 'running-soul', soulIntentRevision: 22, sessionRef: content.sessionRef })
+    fireEvent.click(within(card).getByTestId('terminal-launch-failure-start-fresh'))
+    await waitFor(() => expect(stopManagedRuntimeSoul).toHaveBeenNthCalledWith(2, 'running-soul', 22))
+    expect(within(card).getByTestId('terminal-launch-failure-start-fresh')).toBeDisabled()
+    expect(sentCreates()).toHaveLength(0)
+    await act(async () => resolveVerified({ outcome: 'verified_empty', soul: { soulId: 'running-soul', intentRevision: 22 } }))
+    expect((store.getState().panes.layouts[TAB] as { content: TerminalPaneContent }).content.createRequestId).not.toBe(content.createRequestId)
+  })
+
+  it('reports a rejected SESSION_MISSING start-fresh request inline and retains identity while pending', async () => {
+    stopManagedRuntimeSoul.mockReset()
+    let rejectStop!: (error: Error) => void
+    stopManagedRuntimeSoul.mockReturnValueOnce(new Promise((_resolve, reject) => { rejectStop = reject }))
+    const { store, paneContent } = makeStore()
+    const content: TerminalPaneContent = { ...paneContent, status: 'error', terminalId: 'retained-terminal',
+      soulId: 'missing-session-soul', soulIntentRevision: 6, sessionRef: { provider: 'codex', sessionId: 'retained-thread' },
+      launchFailure: { code: 'SESSION_MISSING', message: 'The durable session is gone.', retryable: false },
+    }
+    store.dispatch(updatePaneContent({ tabId: TAB, paneId: PANE, content }))
+    render(<Provider store={store}><TerminalView tabId={TAB} paneId={PANE} paneContent={content} /></Provider>)
+    const card = screen.getByTestId('terminal-launch-failure-card')
+    const button = within(card).getByTestId('terminal-launch-failure-start-fresh')
+    wsMocks.send.mockClear()
+    fireEvent.click(button)
+    expect(button).toBeDisabled()
+    expect(button).toHaveTextContent('Starting…')
+    fireEvent.click(button)
+    expect(stopManagedRuntimeSoul).toHaveBeenCalledTimes(1)
+    expect((store.getState().panes.layouts[TAB] as { content: TerminalPaneContent }).content).toMatchObject(content)
+    expect(sentCreates()).toHaveLength(0)
+    await act(async () => rejectStop(new Error('Server is unavailable')))
+    expect(await within(card).findByRole('status')).toHaveTextContent('Server is unavailable')
+    expect(button).toBeEnabled()
+    expect((store.getState().panes.layouts[TAB] as { content: TerminalPaneContent }).content).toMatchObject(content)
   })
 
   it('keeps a blocked managed pane from re-creating after a rejected-terminal callback', async () => {

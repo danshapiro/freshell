@@ -40,7 +40,7 @@ import {
 } from '@/lib/fresh-agent-registry'
 import { cn } from '@/lib/utils'
 import { Loader2 } from 'lucide-react'
-import { collectPaneEntries, paneRefreshTargetMatchesContent } from '@/lib/pane-utils'
+import { collectPaneEntries, findPaneContent, paneRefreshTargetMatchesContent } from '@/lib/pane-utils'
 import { getCanonicalDurableSessionId, getPreferredResumeSessionId } from '@/store/persistControl'
 import { isValidClaudeSessionId } from '@/lib/claude-session-id'
 import {
@@ -1580,9 +1580,18 @@ export function FreshAgentView({
     // A managed loss may already be stopped and absent from the web alias cache.
     // Its persisted soul is the cleanup authority before replacing identity.
     if (current.soulId || isManagedRuntimeRecoveryDecision(current.recoverySummary)) {
-      await confirmManagedRuntimeStopped(current)
-      if (paneContentRef.current.soulId !== current.soulId
-        || paneContentRef.current.createRequestId !== current.createRequestId) return
+      const confirmed = await confirmManagedRuntimeStopped(current, {
+        getCurrent: () => {
+          const root = appStore.getState().panes.layouts[tabId]
+          const latest = root ? findPaneContent(root, paneId) : null
+          return latest?.kind === 'fresh-agent' ? latest : null
+        },
+        applyIntentRevision: (soulIntentRevision) => {
+          paneContentRef.current = { ...paneContentRef.current, soulIntentRevision }
+          dispatch(mergePaneContent({ tabId, paneId, updates: { soulIntentRevision } }))
+        },
+      })
+      if (!confirmed) return
     } else {
       // Unmanaged sessions still await their durable close acknowledgement,
       // including a restored pane whose only identity is its sessionRef.

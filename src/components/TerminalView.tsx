@@ -29,6 +29,7 @@ import {
   setPaneLaunchFailure,
   clearPaneCrashTrace,
   splitPane,
+  mergePaneContent,
   updatePaneContent,
   updatePaneTitle,
 } from '@/store/panesSlice'
@@ -7312,9 +7313,19 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
     const current = contentRef.current
     if (!current) return
     if (current.soulId || isManagedRuntimeRecoveryDecision(current.recoverySummary)) {
-      await confirmManagedRuntimeStopped(current)
-      if (contentRef.current?.soulId !== current.soulId
-        || contentRef.current?.createRequestId !== current.createRequestId) return
+      const confirmed = await confirmManagedRuntimeStopped(current, {
+        getCurrent: () => {
+          const root = appStore.getState().panes.layouts[tabId]
+          const latest = root ? findPaneContent(root, paneId) : null
+          return latest?.kind === 'terminal' ? latest : null
+        },
+        applyIntentRevision: (soulIntentRevision) => {
+          const latest = contentRef.current
+          if (latest) contentRef.current = { ...latest, soulIntentRevision }
+          dispatch(mergePaneContent({ tabId, paneId, updates: { soulIntentRevision } }))
+        },
+      })
+      if (!confirmed) return
     }
     dispatch(startNewManagedRuntimeConversation({ tabId, paneId }))
   }
