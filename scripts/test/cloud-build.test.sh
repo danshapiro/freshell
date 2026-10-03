@@ -35,6 +35,7 @@ cat > "$FAKE_DIR/gcloud" << 'FAKE'
 #!/usr/bin/env bash
 echo "FAKE_GCLOUD: $@" >> "${FAKE_GCLOUD_LOG:-/dev/null}"
 [ -n "${CLOUDSDK_CORE_DISABLE_PROMPTS:-}" ] && echo "PROMPTS_DISABLED=1" >> "${FAKE_GCLOUD_LOG:-/dev/null}"
+[[ " $* " == *" --quiet "* ]] && echo "QUIET=1" >> "${FAKE_GCLOUD_LOG:-/dev/null}"
 if [[ "$*" == *"artifacts docker images describe"* ]]; then exit 0; fi
 if [[ "$*" == *"artifacts repositories describe"* ]]; then exit 0; fi
 if [[ "$*" == *"auth print-access-token"* ]]; then echo "fake-token"; exit 0; fi
@@ -91,15 +92,21 @@ check "vitest-cloud.sh build --local-build calls docker build" \
   grep -q 'build' "$FAKE_DOCKER_LOG"
 
 # Check 20 (kata e83z): the build lanes run non-interactive under agents —
-# the wrapper must disable gcloud prompts (TTY-gated) and mint an identity
-# preflight token BEFORE any build/submit work. Every invocation runs under
-# `env -u CLOUDSDK_CORE_DISABLE_PROMPTS` so a host export cannot skew the
-# TTY-side assertion.
+# the Vitest wrapper passes `--quiet` and explicit project/account flags, and
+# mints an identity preflight token BEFORE any build/submit work. The e2e
+# wrapper still uses its existing TTY-gated prompt environment.
 rm -f "$FAKE_GCLOUD_LOG"; touch "$FAKE_GCLOUD_LOG"
 env -u CLOUDSDK_CORE_DISABLE_PROMPTS PATH="$FAKE_DIR:$PATH" bash scripts/vitest-cloud.sh build >/dev/null 2>&1 </dev/null || true
-check "vitest build lane: prompts disabled (non-TTY) + preflight token mint precedes builds submit" \
+check "vitest build lane: every gcloud call supplies --quiet, project, and account" \
+  awk '
+    /^FAKE_GCLOUD:/ {
+      seen = 1
+      if ($0 !~ /--project=[^ ]+/ || $0 !~ /--account=[^ ]+/ || $0 !~ /--quiet/) bad = 1
+    }
+    END { exit !(seen && !bad) }
+  ' "$FAKE_GCLOUD_LOG"
+check "vitest build lane: preflight token precedes builds submit" \
   bash -c '
-    grep -q "PROMPTS_DISABLED=1" "$1" || exit 1
     tok="$(grep -n "auth print-access-token" "$1" | head -1 | cut -d: -f1)"
     sub="$(grep -n "builds submit" "$1" | head -1 | cut -d: -f1)"
     [ -n "$tok" ] && [ -n "$sub" ] && [ "$tok" -lt "$sub" ]

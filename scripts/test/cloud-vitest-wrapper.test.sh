@@ -361,19 +361,19 @@ check "SIGINT mid-run still deletes the run's own job" \
   grep -q 'run jobs delete' "$FAKE_GCLOUD_LOG"
 
 # Check 16 (kata e83z): TTY-gated prompt disabling + identity preflight.
-# FAKE8: prompts-env recording + failing-token mode. Every invocation runs
-# under `env -u CLOUDSDK_CORE_DISABLE_PROMPTS` so a host export can never
-# skew the TTY-side assertions.
+# FAKE8: explicit-context, non-interactive `--quiet`, and failing-token mode.
 FAKE8_DIR=$(mktemp -d)
 FAKE8_LOG="$FAKE8_DIR/gcloud.log"
 export FAKE8_LOG
 cat > "$FAKE8_DIR/gcloud" << 'FAKE8'
 #!/usr/bin/env bash
 echo "FAKE_GCLOUD: $@" >> "${FAKE8_LOG:?set FAKE8_LOG}"
-[ -n "${CLOUDSDK_CORE_DISABLE_PROMPTS:-}" ] && echo "PROMPTS_DISABLED=1" >> "$FAKE8_LOG"
-if [ -n "${CLOUDSDK_CORE_DISABLE_PROMPTS:-}" ] && {
-  [[ " $* " != *" --project="* ]] || [[ " $* " != *" --account="* ]]
-}; then
+if [[ " $* " == *" --quiet "* ]]; then echo "QUIET=1" >> "$FAKE8_LOG"; fi
+if compgen -e | grep -q '^CLOUDSDK_'; then
+  echo "CLOUDSDK_* environment defaults are forbidden" >&2
+  exit 64
+fi
+if [[ " $* " != *" --project="* ]] || [[ " $* " != *" --account="* ]]; then
   echo "explicit --project and --account are required" >&2
   exit 64
 fi
@@ -401,18 +401,18 @@ chmod +x "$FAKE8_DIR/gcloud"
 
 run8() { # suite-level helper: run the run lane under FAKE8; stdin: caller's
   rm -f "$FAKE8_LOG"; touch "$FAKE8_LOG"
-  env -u CLOUDSDK_CORE_DISABLE_PROMPTS PATH="$FAKE8_DIR:$PATH" \
+  env CLOUDSDK_CORE_ACCOUNT=ambient-account@example.invalid \
+    CLOUDSDK_CORE_PROJECT=ambient-project CLOUDSDK_CORE_DISABLE_PROMPTS=1 \
+    PATH="$FAKE8_DIR:$PATH" \
     bash "$SCRIPT" run --cloud --config=default --shards=2 2>&1
 }
 
 V8_OUT=$(run8 < /dev/null) && V8_RC=0 || V8_RC=$?
-check "non-TTY stdin exports CLOUDSDK_CORE_DISABLE_PROMPTS=1 to gcloud children" \
-  bash -c 'grep -q "PROMPTS_DISABLED=1" "$1"' _ "$FAKE8_LOG"
-check "non-TTY cloud calls include explicit account and project context" \
+check "non-TTY cloud calls use --quiet and explicit account/project context" \
   awk '
     /^FAKE_GCLOUD:/ {
       seen = 1
-      if ($0 !~ /--account=[^ ]+/ || $0 !~ /--project=[^ ]+/) bad = 1
+      if ($0 !~ /--account=[^ ]+/ || $0 !~ /--project=[^ ]+/ || $0 !~ /--quiet/) bad = 1
     }
     END { exit !(seen && !bad) }
   ' "$FAKE8_LOG"
@@ -420,8 +420,9 @@ check "non-TTY cloud calls include explicit account and project context" \
 rm -f "$FAKE8_LOG"; touch "$FAKE8_LOG"
 check "TTY stdin leaves prompts enabled (humans keep interactive reauth)" \
   bash -c '
-    script -qec "env -u CLOUDSDK_CORE_DISABLE_PROMPTS PATH=\"$1:\$PATH\" bash \"$2\" run --cloud --config=default --shards=2" /dev/null >/dev/null 2>&1 || true
-    ! grep -q "PROMPTS_DISABLED=1" "$3"
+    script -qec "PATH=\"$1:\$PATH\" bash \"$2\" run --cloud --config=default --shards=2" /dev/null >/dev/null 2>&1 || true
+    grep -q "FAKE_GCLOUD: auth print-access-token" "$3" &&
+    ! grep -qE "FAKE_GCLOUD: (info|auth print-access-token).*--quiet" "$3"
   ' _ "$FAKE8_DIR" "$SCRIPT" "$FAKE8_LOG"
 
 rm -f "$FAKE8_LOG"; touch "$FAKE8_LOG"
@@ -435,7 +436,7 @@ check "identity preflight mints a token before any build/submit work" \
   ' _ "$FAKE8_LOG"
 
 rm -f "$FAKE8_LOG"; touch "$FAKE8_LOG"
-V8F_OUT=$(env -u CLOUDSDK_CORE_DISABLE_PROMPTS PATH="$FAKE8_DIR:$PATH" FAKE8_TOKEN_FAIL=1 bash "$SCRIPT" run --cloud --config=default --shards=2 2>&1 < /dev/null) && V8F_RC=0 || V8F_RC=$?
+V8F_OUT=$(env PATH="$FAKE8_DIR:$PATH" FAKE8_TOKEN_FAIL=1 bash "$SCRIPT" run --cloud --config=default --shards=2 2>&1 < /dev/null) && V8F_RC=0 || V8F_RC=$?
 check "failed preflight exits fast: no builds submit, no job create, loud attributable error" \
   bash -c '
     [ "$1" != "0" ] &&

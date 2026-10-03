@@ -59,14 +59,13 @@ IMAGE_REMOTE="${GCP_REGION}-docker.pkg.dev/${GCP_PROJECT}/${GCP_REPO}/${IMAGE_NA
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
-# kata e83z: non-TTY stdin is the agent case (bash -c, tool harnesses, CI).
-# The identity preflight below is the guaranteed fail-fast leg; this export is
-# defense-in-depth — verified in gcloud's CanPrompt() source to be honored as
-# the --quiet equivalent even where auto-detection does not apply. Humans at
-# a real terminal keep interactive reauth (the export is deliberately withheld
-# on TTY stdin).
+# Non-TTY invocations use the explicit `--quiet` flag on gcloud commands.
+# The local gcloud wrapper rejects all CLOUDSDK_* environment defaults, so
+# this lane supplies account/project on the command line and keeps prompt
+# control there too. Humans at a real terminal keep interactive reauth.
+GCP_NONINTERACTIVE=0
 if [ ! -t 0 ]; then
-  export CLOUDSDK_CORE_DISABLE_PROMPTS=1
+  GCP_NONINTERACTIVE=1
 fi
 
 # Shared gcloud identity ladder (gcloud-robot). Sourcing only defines
@@ -74,6 +73,19 @@ fi
 # gcloud-free and silent.
 # shellcheck source=scripts/lib/gcp-identity.sh
 . "$SCRIPT_DIR/lib/gcp-identity.sh"
+
+# The shared-machine gcloud wrapper rejects every CLOUDSDK_* environment
+# default, including account/project exports from the identity bridge. Keep
+# the resolved values in GCP_ACCOUNT/GCP_PROJECT and pass them as CLI flags.
+clear_gcloud_environment_defaults() {
+  local name
+  while IFS= read -r name; do
+    case "$name" in
+      CLOUDSDK_*) unset "$name" ;;
+    esac
+  done < <(compgen -e)
+}
+clear_gcloud_environment_defaults
 
 # Commit-addressed image tag — mirrors scripts/e2e-cloud.sh (wrap-review r3):
 # a cloud run must execute the code at the CURRENT HEAD — with only a mutable
@@ -102,12 +114,22 @@ DEFAULT_CONFIGS="config/vitest/vitest.config.ts"
 # Helpers
 # ---------------------------------------------------------------------------
 gcloud_flags() {
-  # No identity may legitimately resolve (rung 4: ambient gcloud). An empty
-  # pin omits --account entirely rather than passing gcloud an empty value.
+  local quiet_flag=""
+  [ "$GCP_NONINTERACTIVE" = "1" ] && quiet_flag="--quiet"
   if [ -n "${GCP_ACCOUNT:-}" ]; then
-    echo "--account=${GCP_ACCOUNT} --project=${GCP_PROJECT} --region=${GCP_REGION}"
+    echo "--account=${GCP_ACCOUNT} --project=${GCP_PROJECT} --region=${GCP_REGION} ${quiet_flag}"
   else
-    echo "--project=${GCP_PROJECT} --region=${GCP_REGION}"
+    echo "--project=${GCP_PROJECT} --region=${GCP_REGION} ${quiet_flag}"
+  fi
+}
+
+gcloud_context_flags() {
+  local quiet_flag=""
+  [ "$GCP_NONINTERACTIVE" = "1" ] && quiet_flag="--quiet"
+  if [ -n "${GCP_ACCOUNT:-}" ]; then
+    echo "--account=${GCP_ACCOUNT} --project=${GCP_PROJECT} ${quiet_flag}"
+  else
+    echo "--project=${GCP_PROJECT} ${quiet_flag}"
   fi
 }
 
@@ -127,21 +149,7 @@ unique_job_name() {
 
 # gcloud artifacts commands use --location, not --region
 gcloud_artifacts_flags() {
-  if [ -n "${GCP_ACCOUNT:-}" ]; then
-    echo "--account=${GCP_ACCOUNT} --project=${GCP_PROJECT} --location=${GCP_REGION}"
-  else
-    echo "--project=${GCP_PROJECT} --location=${GCP_REGION}"
-  fi
-}
-
-# Prints a pinned --account flag, or NOTHING (not even an empty word) when no
-# identity resolved — for the gcloud calls that pin inline instead of via
-# gcloud_flags(). An empty expansion inside an unquoted $() yields no argv
-# word, which is exactly what "omit --account" needs; always exits 0.
-account_flag() {
-  if [ -n "${GCP_ACCOUNT:-}" ]; then
-    printf -- '--account=%s' "${GCP_ACCOUNT}"
-  fi
+  echo "$(gcloud_context_flags) --location=${GCP_REGION}"
 }
 
 # kata e83z: cheap live-credential check at lane start — fails in seconds,
@@ -149,18 +157,23 @@ account_flag() {
 # The error names the resolved identity and its source so the failure path is
 # as attributable as the success path.
 identity_preflight() {
+  # The identity bridge exports CLOUDSDK_CORE_ACCOUNT/PROJECT for ordinary
+  # gcloud installations. This lane always supplies explicit flags, so clear
+  # those defaults before calling the guarded machine wrapper.
+  clear_gcloud_environment_defaults
+
   # Resolve the SDK's bin directory only after the lane has selected its
   # account. The shared-machine gcloud wrapper rejects environment defaults,
   # so even this informational command must carry explicit cloud context.
   if command -v gcloud &>/dev/null; then
     local sdk_root
-    sdk_root="$(gcloud info $(account_flag) --project="$GCP_PROJECT" --format="value(installation.sdk_root)" 2>/dev/null || true)"
+    sdk_root="$(gcloud info $(gcloud_context_flags) --format="value(installation.sdk_root)" 2>/dev/null || true)"
     if [ -n "$sdk_root" ] && [ -d "$sdk_root/bin" ] && ! echo "$PATH" | grep -q "$sdk_root/bin"; then
       export PATH="$sdk_root/bin:$PATH"
     fi
   fi
 
-  if ! gcloud auth print-access-token $(account_flag) --project="$GCP_PROJECT" >/dev/null 2>&1; then
+  if ! gcloud auth print-access-token $(gcloud_context_flags) >/dev/null 2>&1; then
     echo "[vitest-cloud] ERROR: identity preflight failed for ${GCP_ACCOUNT:-(ambient gcloud)} (source: ${FRESHELL_GCP_IDENTITY_SOURCE:-unresolved}) - gcloud auth print-access-token could not mint a token." >&2
     echo "[vitest-cloud] Fix the credential/identity (docs/development/gcloud-robot.md) and re-run the lane." >&2
     exit 1
@@ -290,8 +303,7 @@ cmd_build() {
     echo "[vitest-cloud] Building Docker image via Cloud Build (tag: $tag)..."
     gcloud builds submit \
       --config "$ROOT/docker/cloud-run/cloudbuild.yaml" \
-      $(account_flag) \
-      --project="$GCP_PROJECT" \
+      $(gcloud_context_flags) \
       --substitutions=_IMAGE="${remote_base}:${tag}",_FRESHELL_BUILD_COMMIT="$build_commit" \
       "$ROOT"
     echo "[vitest-cloud] Cloud Build complete: ${remote_base}:${tag}"
@@ -339,7 +351,7 @@ cmd_push() {
   fi
 
   # Authenticate Docker to Artifact Registry using an access token.
-  gcloud auth print-access-token $(account_flag) --project="$GCP_PROJECT" | \
+  gcloud auth print-access-token $(gcloud_context_flags) | \
     docker login -u oauth2accesstoken --password-stdin \
       "https://${GCP_REGION}-docker.pkg.dev"
 
@@ -508,7 +520,7 @@ cmd_run() {
 
   # Ensure image exists in remote registry
   if ! gcloud artifacts docker images describe "$IMAGE_REMOTE" \
-      $(account_flag) --project="$GCP_PROJECT" &>/dev/null 2>&1; then
+      $(gcloud_context_flags) &>/dev/null 2>&1; then
     echo "[vitest-cloud] Remote image not found, building and pushing..."
     cmd_build
   fi
