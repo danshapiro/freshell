@@ -1509,6 +1509,7 @@ version = "0.1.0"
 dependencies = [
  "chrono",
  "freshell-platform",
+ "hex",
  "libc",
  "notify",
  "regex",
@@ -1516,6 +1517,8 @@ dependencies = [
  "saphyr",
  "serde",
  "serde_json",
+ "sha2",
+ "tempfile",
  "tokio",
  "tracing",
  "tracing-subscriber",
