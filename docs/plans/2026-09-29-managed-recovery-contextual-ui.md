@@ -222,13 +222,19 @@ pnpm run test:vitest run \
   --config config/vitest/vitest.config.ts
 ```
 
-Run the affected local-only browser spec explicitly; cloud coverage is not a substitute because these specs are excluded from the cloud Playwright configuration:
+Run the primary contextual browser coverage on the configured cloud backend:
 
 ```bash
-pnpm run test:e2e:local --project=chromium test/e2e-browser/specs/runtime-lost-soul-notice-rust.spec.ts
+GCLOUD_ROBOT_REQUIRE=1 pnpm run test:e2e --project=chromium --workers=1 test/e2e-browser/specs/managed-recovery-contextual-ui.spec.ts
 ```
 
-If the local provider/supervisor fixture cannot run, record the concrete environment failure in the run ledger and do not claim this behavior is covered. Preserve the existing unrelated baseline failure in the run ledger.
+The separate live loss qualification is local-only and requires explicit opt-in plus configured provider credentials. Run it only in the owned disposable rig:
+
+```bash
+FRESHELL_RUNTIME_PHASE5_LIVE=1 pnpm run test:e2e:local --project=chromium --workers=1 test/e2e-browser/specs/runtime-lost-soul-notice-rust.spec.ts
+```
+
+Live credential qualification remains deferred for this landing. A run without `FRESHELL_RUNTIME_PHASE5_LIVE=1` skips the loss test and provides no loss evidence. Record any concrete fixture failure in the external ledger; do not treat deterministic cloud coverage as live provider qualification. Preserve the existing unrelated baseline failure in the run ledger.
 
 - [x] **Step 7: Commit the task**
 
@@ -245,7 +251,7 @@ The task is complete only when existing agent panes, session history, explicit n
 - Modify: `src/store/tabsSlice.ts` as the shared close seam used by ordinary pane close and every direct `closeTab` caller (`TabBar`, `App`, UI commands, and context menus). Add a managed-view detach helper that uses the frozen pane projection fields and preserves close failure behavior when the server does not acknowledge the visibility change.
 - Modify: `src/components/panes/PaneContainer.tsx` only if its close path needs to pass managed projection data into the shared thunk; do not add a second tab-close implementation there.
 - Modify: `src/lib/api.ts` if needed to parse the visibility response as a `ManagedRuntimeViewIntent`, so a failed multi-view close can roll back already-detached views with their returned revision fences.
-- Modify: `test/unit/client/components/panes/PaneContainer.test.tsx` or the focused close-thunk test to cover managed detach-before-close and the refusal/error path.
+- Modify: `test/unit/client/store/paneCloseGate.test.ts` to cover managed detach-before-close and the refusal/error path through the shared close thunks; retain `test/unit/client/components/panes/PaneContainer.test.tsx` as component regression coverage.
 - Modify: `test/e2e-browser/specs/runtime-tabs-rehydrate-rust.spec.ts` to replace dashboard Close view interaction with ordinary pane close and assert the running soul remains detached after an inventory refresh; retain Stop agent coverage through the existing terminal shift-close path or rig action as appropriate.
 - Modify: `test/e2e-browser/specs/runtime-lost-soul-notice-rust.spec.ts` to stop expecting a routine success notice and instead assert the actionable cleanup-failure or pane-local error path actually rendered; retain incident persistence, exact cleanup, identity, and receipt assertions consistent with what the UI displays.
 - Modify: `docs/index.html` to remove the routine “Restarting agent”/cleanup-notice mock and show the contextual amber intervention card in the affected pane.
@@ -263,7 +269,7 @@ Add a focused close test with a managed terminal pane carrying a view ID and bot
 Run:
 
 ```bash
-pnpm run test:vitest run test/unit/client/components/panes/PaneContainer.test.tsx --config config/vitest/vitest.config.ts
+pnpm run test:vitest run test/unit/client/store/paneCloseGate.test.ts --config config/vitest/vitest.config.ts
 ```
 
 Expected: FAIL because ordinary close currently journals pane removal without updating the managed view intent’s visibility.
@@ -288,6 +294,7 @@ Run:
 
 ```bash
 pnpm run test:vitest run \
+  test/unit/client/store/paneCloseGate.test.ts \
   test/unit/client/components/panes/PaneContainer.test.tsx \
   test/unit/client/components/panes/PaneContainer.createContent.test.tsx \
   test/unit/client/components/ManagedRuntimeNotices.test.tsx \
@@ -295,18 +302,18 @@ pnpm run test:vitest run \
   --config config/vitest/vitest.config.ts
 ```
 
-Run both affected local-only specs explicitly; they are excluded from cloud selection:
+Run the owned real supervisor/Docker shell rehydration rig explicitly; this spec is excluded from cloud selection and needs no provider credentials:
 
 ```bash
-pnpm run test:e2e:local --project=chromium test/e2e-browser/specs/runtime-tabs-rehydrate-rust.spec.ts test/e2e-browser/specs/runtime-lost-soul-notice-rust.spec.ts
+pnpm run test:e2e:local --project=chromium --workers=1 test/e2e-browser/specs/runtime-tabs-rehydrate-rust.spec.ts
 ```
 
-Do not weaken or skip their backend identity and cleanup assertions because the dashboard was removed. If the local fixture cannot run, record the concrete environment failure and leave the task unverified rather than treating a cloud run as equivalent coverage.
+Run the configured cloud contextual spec from Task 2 for rendered pane decisions. The separate live loss command from Task 2 includes `FRESHELL_RUNTIME_PHASE5_LIVE=1` and remains deferred pending provider credential qualification. Do not weaken the local rig’s backend identity and cleanup assertions because the dashboard was removed. If the local fixture cannot run, record the concrete environment failure and leave that qualification unverified rather than treating a cloud run as equivalent coverage.
 
 - [x] **Step 7: Commit the task**
 
 ```bash
-git add src/store/tabsSlice.ts src/lib/api.ts src/components/panes/PaneContainer.tsx test/unit/client/components/panes/PaneContainer.test.tsx test/e2e-browser/specs/runtime-tabs-rehydrate-rust.spec.ts test/e2e-browser/specs/runtime-lost-soul-notice-rust.spec.ts docs/index.html
+git add src/store/tabsSlice.ts src/lib/api.ts src/components/panes/PaneContainer.tsx test/unit/client/store/paneCloseGate.test.ts test/unit/client/components/panes/PaneContainer.test.tsx test/e2e-browser/specs/runtime-tabs-rehydrate-rust.spec.ts test/e2e-browser/specs/runtime-lost-soul-notice-rust.spec.ts docs/index.html
 git commit -m "fix(ui): preserve managed view intent on close"
 ```
 
