@@ -5,6 +5,7 @@ import type { Page } from '@playwright/test'
 import type { ManagedRuntimeNotice, ManagedRuntimeRecoverySummary } from '@shared/managed-runtime.js'
 import { FRESHCODEX_DEFAULT_MODEL } from '@shared/fresh-agent-models.js'
 import { test, expect } from '../helpers/fixtures.js'
+import { RawWsClient } from '../helpers/raw-clients.js'
 
 type PaneKind = 'terminal' | 'fresh-agent'
 type RecoveryState = ManagedRuntimeRecoverySummary['recoveryState']
@@ -226,6 +227,46 @@ async function changeRecoveryState(page: Page, recoveryState: RecoveryState) {
     } })
   }, recoverySummary(recoveryState))
 }
+
+test('managed terminal status and replacement events keep automatic recovery invisible', async ({ freshellPage, page, terminal, harness, serverInfo }) => {
+  await terminal.waitForTerminal()
+  const client = await RawWsClient.connect(serverInfo.wsUrl)
+  let replacementId: string
+  try {
+    client.hello(serverInfo.token)
+    await client.nextJsonMessage('ready', 10_000)
+    client.sendJson({ type: 'terminal.create', requestId: 'contextual-replacement-shell', mode: 'shell', shell: 'system' })
+    replacementId = (await client.nextJsonMessage<{ terminalId: string }>('terminal.created', 10_000)).terminalId
+  } finally { await client.dispose() }
+  await installPane(page, 'terminal', 'live')
+  await page.evaluate(() => {
+    const harness = window.__FRESHELL_TEST_HARNESS__!
+    const state = harness.getState()
+    const tabId = state.tabs.activeTabId!
+    const paneId = state.panes.activePane[tabId]
+    harness.setTerminalNetworkEffectsSuppressed(paneId, false)
+    harness.dispatch({ type: 'panes/updatePaneContent', payload: { tabId, paneId, content: { ...state.panes.layouts[tabId].content } } })
+  })
+  await expect.poll(async () => (await harness.getSentWsMessages() as Array<{ type?: string }>).some((frame) => frame.type === 'terminal.attach')).toBe(true)
+  const before = await paneContent(page)
+  if (before.kind !== 'terminal' || !before.terminalId) throw new Error('Expected the retained terminal identity')
+  await harness.receiveWsMessage({ type: 'terminal.status', terminalId: before.terminalId, status: 'recovering',
+    attempt: 2, maxAttempts: 3, exitCode: 137 })
+  await expect(page.getByText(/auto-resuming/)).toBeHidden()
+  await changeRecoveryState(page, 'recovering')
+  await harness.receiveWsMessage({ type: 'terminal.replaced', oldTerminalId: before.terminalId,
+    newTerminalId: replacementId, exitCode: 137, attempt: 2, maxAttempts: 3 })
+  await expect.poll(() => paneContent(page)).toMatchObject({ terminalId: replacementId,
+    crashTrace: { exitCode: 137 }, sessionRef: before.sessionRef, soulId: before.soulId,
+    createRequestId: before.createRequestId })
+  await expect(page.getByTestId('terminal-xterm-container')).toBeVisible()
+  await expect(page.getByTestId('crash-trace')).toBeHidden()
+  await expect(page.getByText(/auto-resumed|auto-resuming|Recovering terminal output/)).toBeHidden()
+  await expect(page.getByTestId('managed-runtime-recovery-card')).toBeHidden()
+  await changeRecoveryState(page, 'blocked')
+  await expect(page.getByTestId('managed-runtime-recovery-card')).toBeVisible()
+  await expect(page.getByRole('button', { name: 'Retry recovery', exact: true })).toBeVisible()
+})
 
 for (const kind of ['terminal', 'fresh-agent'] as const) {
   test(`${kind}: healthy and recovering managed panes leave routine recovery chrome hidden`, async ({ freshellPage, page, terminal }) => {
