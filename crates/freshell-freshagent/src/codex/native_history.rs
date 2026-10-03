@@ -81,7 +81,12 @@ pub(crate) fn read(home: &Path, id: &str) -> Result<Value, String> {
                         .or_else(|| payload.get("id").filter(|id| id.is_string()))
                         .cloned()
                         .unwrap_or_else(|| json!(format!("native-line-{line}")));
-                    upsert_transcript_item(&mut turn, item, false, &mut message_mirrors);
+                    upsert_transcript_item(
+                        &mut turn,
+                        item,
+                        MessageSource::Response,
+                        &mut message_mirrors,
+                    );
                 }
             }
             Some("event_msg") => {
@@ -100,7 +105,11 @@ pub(crate) fn read(home: &Path, id: &str) -> Result<Value, String> {
                     upsert_transcript_item(
                         target.unwrap_or(&mut turn),
                         item,
-                        true,
+                        if payload["type"] == "task_complete" {
+                            MessageSource::Completion
+                        } else {
+                            MessageSource::Event
+                        },
                         &mut message_mirrors,
                     );
                 } else if payload["type"] == "task_started" {
@@ -126,12 +135,20 @@ pub(crate) fn read(home: &Path, id: &str) -> Result<Value, String> {
 
 struct MessageMirror {
     item: Value,
-    from_event: bool,
+    sources: Vec<MessageSource>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum MessageSource {
+    Response,
+    Event,
+    Completion,
 }
 
 fn normalize_message_event(payload: &Value, line: usize) -> Option<Value> {
     let (kind, field) = match payload["type"].as_str()? {
         "user_message" => ("userMessage", "message"),
+        "agent_message" => ("agentMessage", "message"),
         "task_complete" => ("agentMessage", "last_agent_message"),
         _ => return None,
     };
@@ -156,7 +173,7 @@ fn message_text(item: &Value) -> Option<String> {
 fn upsert_transcript_item(
     turn: &mut Value,
     item: Value,
-    from_event: bool,
+    source: MessageSource,
     mirrors: &mut HashMap<String, MessageMirror>,
 ) {
     let Some(text) = message_text(&item) else {
@@ -164,22 +181,25 @@ fn upsert_transcript_item(
         return;
     };
     let turn_id = turn["id"].as_str().unwrap().to_owned();
-    if let Some(previous) = mirrors.remove(&turn_id) {
-        if previous.from_event != from_event
+    if let Some(previous) = mirrors.get_mut(&turn_id) {
+        if !previous.sources.contains(&source)
             && previous.item["type"] == item["type"]
             && message_text(&previous.item).as_deref() == Some(text.as_str())
         {
-            // Events mirror response messages, but use different ids. Keep the rich
-            // response item in either record order, pairing each occurrence once.
-            if !from_event {
+            // A message may be recorded as a response, an agent event, and a task
+            // completion. Each source mirrors this occurrence once; repeated
+            // messages from the same source start a new occurrence.
+            previous.sources.push(source);
+            if source == MessageSource::Response {
                 if let Some(existing) = turn["items"]
                     .as_array_mut()
                     .unwrap()
                     .iter_mut()
                     .find(|old| old["id"] == previous.item["id"])
                 {
-                    *existing = item;
+                    *existing = item.clone();
                 }
+                previous.item = item;
             }
             return;
         }
@@ -188,7 +208,7 @@ fn upsert_transcript_item(
         turn_id,
         MessageMirror {
             item: item.clone(),
-            from_event,
+            sources: vec![source],
         },
     );
     upsert_item(turn, item);
