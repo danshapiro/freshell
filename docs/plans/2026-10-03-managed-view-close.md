@@ -1,8 +1,8 @@
 # Managed views stay closed after a tab close — Implementation Plan
 
-> **For agentic workers:** Execute this plan task by task with a fresh
-> implementer and a specification-plus-quality review after every task. Track
-> progress with the checkbox steps below.
+> For agentic workers: execute the tasks in order with a fresh implementer and
+> a specification-plus-quality review after each task. Keep the checkboxes and
+> run record current.
 
 ## User Request
 
@@ -22,205 +22,301 @@ closed by fixing the managed-view recovery root cause.
   for a later reopen.
 - Automatic-primary view promotion during supervisor startup remains unchanged.
 
-**Goal:** Closing a shell or coding CLI tab removes its managed view from the
-client without stopping the process or allowing a later runtime inventory
-refresh to recreate the tab.
+**Goal:** A successful close keeps the local tab or pane closed through later
+managed-runtime refreshes, persisted-layout events, and reopen activity, while
+the managed process remains available for an explicit reopen.
 
-**Architecture:** Route tab close, pane close, and pane replacement through the
-existing managed-runtime visibility API. Read current revisions, detach only
-views with no remaining local pane, verify the resulting inventory before
-removing local state, and compensate on partial failure. Reopen restores the
-local tab with current supervisor handles before making views visible again,
-and consumes the exact saved entry that was restored.
+**Architecture:** Keep the existing managed-view visibility API and durable
+pane-close evidence. Before removing a managed representation, resolve its
+exact view intent from current local identity or an authoritative inventory
+match. If identity, capability, or detachment cannot be confirmed, retain the
+local content and report a retryable error. Serialize each browser's managed
+visibility transitions with their associated local layout changes, route the
+recovery panel through the same coordinator, and do not compensate a failed
+close by changing a view back to visible. Protect committed closes from stale
+own-key layout hydration. Reopen only from a complete fresh managed identity,
+reassert the pane as open, and consume only the saved entry that was restored.
 
-**Tech Stack:** React, Redux Toolkit, TypeScript, Vitest, Playwright, Rust
-managed-runtime API.
+**Tech Stack:** React, Redux Toolkit, TypeScript, Vitest, existing Rust
+managed-runtime and WebSocket contracts.
 
 ## Global Constraints
 
 - Use pnpm 10.34.5 and the repo-owned test commands.
-- Keep the managed process running when a view is detached. Do not alter
+- Keep the managed process running when its view is detached. Do not alter
   supervisor startup promotion, server recovery policy, or Electron crash
   recovery.
 - Keep the live Freshell server on port 3001 running. Do not deploy, restart,
   create a PR, merge, or push this branch.
-- Keep the implementation within the dedicated worktree and the requested
-  managed-view close/reopen behavior.
+- Work only in the dedicated worktree and within the requested close/reopen
+  behavior. Do not add a server endpoint or persistent machine-state format.
 - Keep the configured cloud test backend. Do not silently substitute local
   testing for a configured cloud lane.
-- Do not change persisted machine state or introduce new server endpoints.
+- Preserve the User Request block above verbatim.
 
----
+## Load-bearing decisions
 
-## Cause and existing evidence
-
-Managed runtime inventory can report a running view as `visible`. Recovery
-creates a local tab for any visible view with no matching pane. The ordinary
-tab close path already waits for the pane-close acknowledgement and removes the
-local tab, but it does not change the view intent to `detached`; a later
-inventory refresh therefore sees an unmatched visible view and creates the tab
-again. The recovery panel already updates visibility through the existing API.
-
-The immutable base commit is
-`091b24bf0e0e8c00a9e8e9384db52f0cff9dd2f5`. The focused baseline receipt is
-`/home/dan/code/freshell/.worktrees/.the-usual-logs/managed-view-close/reports/workspace-baseline.md`.
+The immutable base is commit
+091b24bf0e0e8c00a9e8e9384db52f0cff9dd2f5. The focused baseline receipt is
+/home/dan/code/freshell/.worktrees/.the-usual-logs/managed-view-close/reports/workspace-baseline.md.
 It records two unrelated failing tests at base; classify them as pre-existing
-only when they recur in final verification.
+only if the same failures recur in final verification.
+
+- F01 and F02 are verified: detachment is durable against ordinary runtime
+  activity, and closing a view does not stop its managed process. Keep the
+  existing startup promotion and process lifecycle behavior.
+- F03 is falsified: a managed terminal can be allocated before the local pane
+  receives its view ID, and pane-close evidence does not detach the intent.
+  Resolve the view using authoritative terminal/create identity; if allocation
+  or projection is still unresolved, retain the pane and allow retry.
+- F04 is falsified: a known view plus unavailable managed-runtime capability
+  is not a successful detach. Keep its pane/tab until authoritative detachment
+  succeeds.
+- F05 is falsified as a coherent-snapshot claim. Inventory revision and rows
+  are read separately, so equal revisions do not prove identical contents.
+  Use only the narrower fence established by the report: in the specified
+  unchanged-visibility history, a confirming read after a successful mutation
+  and revision-monotonic application fence an older pre-mutation response. Do
+  not claim a general snapshot transaction.
+- F06 is falsified: delayed own-key storage hydration can restore a just-closed
+  pane before the normal persistence debounce. Persist the close promptly and
+  keep stale own-key hydration from applying while that close is not durably
+  written.
+- F07 is falsified: fallback matching may not replace a pane's different,
+  nonempty view ID. Existing installation-shared view ownership remains in
+  effect; detaching prevents recovery of missing representations but does not
+  remove an already-open representation on another client. Per-device view
+  ownership is outside this repair.
+- F08 is falsified: current locks do not cover reopen and the recovery panel's
+  direct visibility write. Serialize client-side visibility writers together
+  with their local commit/restore, and make a close requested during promotion
+  wait and execute instead of resolving as a no-op. Remove visible rollback
+  compensation; retain local content on a partial failure.
+- F09 is falsified: reattaching with the same create request does not consume
+  durable close evidence. Reassert each restored pane as open through the
+  existing pane-open contract.
+- F10's original permissive fallback is unproven. Remove reliance on it: a
+  failed or incomplete fresh preflight returns before local restore or saved
+  entry consumption, then releases the queue so the same entry can be retried.
+  This simpler seam was verified as feasible by source inspection.
+
+The detailed source evidence and limits are recorded in
+/home/dan/code/freshell/.worktrees/.the-usual-logs/managed-view-close/reports/.
 
 ## File responsibilities
 
-- `src/store/tabsSlice.ts`: find the removed view intents, serialize visibility
-  changes, guard close/replacement, and restore a closed tab.
-- `src/store/panesSlice.ts`: preserve current managed terminal handles when
-  restoring a local managed-runtime layout.
-- `src/store/tabRegistrySlice.ts`: consume one exact entry from the local
-  reopen stack.
-- `src/components/ManagedAgentRecoveryStatus.tsx`: route a close through the
-  view's actual local pane when one exists; retain the existing API path for a
-  view with no local pane.
-- `test/unit/client/store/tabsSlice.managed-runtime-close.test.ts`: protect
-  close, pane representation, failure recovery, inventory races, and reopen
-  ordering at the Redux/API boundary.
-- `test/unit/client/components/ManagedAgentRecoveryStatus.test.tsx`: protect
-  recovery-panel routing when its top-level tab projection is stale.
+- src/store/managedVisibilityCoordinator.ts: expose
+  withManagedVisibilityTransition<T>(operation: () => Promise<T>): Promise<T>
+  as one FIFO queue shared by this browser's managed visibility writers.
+- src/store/tabsSlice.ts: resolve exact managed close targets, coordinate
+  visibility transitions, keep content on failure, reopen from authoritative
+  identity, and consume the exact restored entry.
+- src/store/panesSlice.ts: preserve managed handles and reject recovery
+  fallback across different nonempty view IDs.
+- src/lib/recovery/managed-runtime-recovery.ts: keep exact view identity while
+  matching and updating existing panes.
+- src/components/ManagedAgentRecoveryStatus.tsx: route a direct view detach
+  through the same serialized store operation as tab and pane close.
+- src/store/crossTabSync.ts: reject stale own-key full-layout hydration while
+  a local close commit is awaiting durable persistence.
+- src/store/persistControl.ts: export
+  markLocalClosePersistencePending(), isLocalClosePersistencePending(), and
+  clearLocalClosePersistencePending() for the close-write barrier.
+- src/store/persistMiddleware.ts: clear the barrier only after a successful
+  layout write and stamp each persisted layout with a strictly newer
+  persistedAt value.
+- src/store/tabRegistrySlice.ts: remove only the exact saved entry restored.
+- test/unit/client/store/tabsSlice.managed-runtime-close.test.ts: cover exact
+  identity, unavailable capability, close/reopen order, partial failure,
+  open evidence, and exact-entry consumption.
+- test/unit/client/store/tabsPersistence.test.ts: cover immediate close
+  persistence and failed-flush protection.
+- test/unit/client/store/crossTabSync.test.ts: cover delayed same-key storage
+  events and close-persistence gating.
+- test/unit/lib/managed-runtime-recovery.test.ts: cover matching panes that
+  carry a different nonempty view ID.
+- test/unit/client/components/ManagedAgentRecoveryStatus.test.tsx: cover panel
+  routing through the shared store operation.
 
-## Task 1: Detach views before local close
-
-**Files:**
-- Modify: `src/store/tabsSlice.ts`
-- Modify: `src/components/ManagedAgentRecoveryStatus.tsx`
-- Test: `test/unit/client/store/tabsSlice.managed-runtime-close.test.ts`
-- Test: `test/unit/client/components/ManagedAgentRecoveryStatus.test.tsx`
-
-**Interfaces:**
-- Consume the existing `getManagedRuntimeInventory()` and
-  `updateManagedRuntimeViewVisibility(viewId, visibility, expectedRevision, expectedSoulIntentRevision, requestId?)`
-  API functions.
-- Keep the existing exported `closeTab`, `closePaneWithCleanup`, and
-  `replacePaneWithCleanup` thunk interfaces.
-- Keep `buildManagedRuntimeMergePlan` as the recovery projection that ignores
-  detached views without a local pane.
-
-- [x] **Step 1: Write behavior tests for close and recovery**
-
-  Cover whole-tab close, split-pane close, replacement, duplicate view
-  references, shared representations, partial detachment failure and retry,
-  delayed stale inventory, concurrent close, stale tab projection, and
-  recovery-panel routing.
-
-- [x] **Step 2: Run the focused tests and confirm the missing behavior**
-
-  Run: `pnpm run test:vitest run test/unit/client/store/tabsSlice.managed-runtime-close.test.ts test/unit/client/store/tabsSlice.test.ts test/unit/client/store/paneCloseGate.test.ts test/unit/client/components/ManagedAgentRecoveryStatus.test.tsx test/unit/client/components/TabBar.test.tsx test/unit/lib/managed-runtime-recovery.test.ts --config config/vitest/vitest.config.ts`
-
-  Expected: the new close-path cases fail because closing local state leaves
-  its managed view visible in runtime inventory.
-
-- [x] **Step 3: Add the shared close and recovery-panel integration**
-
-  After the close acknowledgement, collect distinct view IDs from current pane
-  projections, excluding views still shown elsewhere. Under per-view locks,
-  read fresh revisions, set each view to `detached`, read and dispatch a final
-  inventory, and verify the targets are no longer visible before removing local
-  state. Keep the managed process running. On partial failure, compensate
-  visible local views, keep the tab or pane open, and reassert pane-open
-  evidence. Treat a current layout as authoritative over stale top-level tab
-  metadata.
-
-- [x] **Step 4: Run the focused test set**
-
-  Run: `pnpm run test:vitest run test/unit/client/store/tabsSlice.managed-runtime-close.test.ts test/unit/client/store/tabsSlice.test.ts test/unit/client/store/paneCloseGate.test.ts test/unit/client/components/ManagedAgentRecoveryStatus.test.tsx test/unit/client/components/TabBar.test.tsx test/unit/lib/managed-runtime-recovery.test.ts --config config/vitest/vitest.config.ts`
-
-  Expected: PASS.
-
-- [x] **Step 5: Refactor while green**
-
-  Keep inventory revision handling and per-view close serialization in shared
-  helpers. Preserve synchronous behavior for ordinary tabs with no managed
-  view IDs.
-
-- [ ] **Step 6: Run impacted-test verification**
-
-  Run the focused command above plus `pnpm run typecheck:client`.
-
-  Expected: PASS.
-
-- [ ] **Step 7: Commit the task**
-
-  Commit the close path, recovery-panel routing, and their focused tests as one
-  behavior change after independent task review.
-
-## Task 2: Reopen the selected entry without creating duplicates
+## Task 1: Resolve and detach managed views before local close
 
 **Files:**
-- Modify: `src/store/tabsSlice.ts`
-- Modify: `src/store/panesSlice.ts`
-- Modify: `src/store/tabRegistrySlice.ts`
-- Test: `test/unit/client/store/tabsSlice.managed-runtime-close.test.ts`
+- Create: src/store/managedVisibilityCoordinator.ts
+- Modify: src/store/tabsSlice.ts and src/components/ManagedAgentRecoveryStatus.tsx
+- Test: test/unit/client/store/tabsSlice.managed-runtime-close.test.ts and
+  test/unit/client/components/ManagedAgentRecoveryStatus.test.tsx
 
-**Interfaces:**
-- `ClosedTabEntry` remains the saved tab, layout, pane-title maps, and
-  `closedAt` timestamp.
-- Add an exact-entry consumption action keyed by the saved tab ID and
-  `closedAt`; do not make reopen depend on removing the current stack top after
-  an asynchronous request.
-- Keep the public `reopenClosedTab()` thunk interface.
+**Interface:** the coordinator exports
+withManagedVisibilityTransition<T>(operation: () => Promise<T>): Promise<T>.
+Task 3 reopen and the no-local-pane recovery-panel action use the same queue.
 
-- [ ] **Step 1: Add the delayed-inventory race test**
+- [ ] Step 1: Add named behavior cases for delayed view projection, still-creating
+  allocation, capability loss for a known view, close requested during reopen
+  promotion, and direct recovery-panel detach overlapping local close. For every
+  failed close case, assert the original local pane or tab remains.
+- [ ] **Step 2: Run the tests and verify the intended failures**
 
-  Close two managed tabs, begin reopening the newest one with its inventory
-  request held, then close a third tab while that request is pending. Resolve
-  inventory and verify that local restore removes only the selected saved
-  entry; the tab closed during the request remains the next reopen target and
-  each saved tab can be restored once.
+  Run: pnpm run test:vitest run test/unit/client/store/tabsSlice.managed-runtime-close.test.ts test/unit/client/components/ManagedAgentRecoveryStatus.test.tsx --config config/vitest/vitest.config.ts
 
-- [ ] **Step 2: Run the test and verify the intended failure**
+  Expected: FAIL because the current code skips unresolved or unavailable view
+  intents and lets local close/reopen and panel writes overtake each other.
+- [ ] **Step 3: Add the client-side transition coordinator**
 
-  Run: `pnpm run test:vitest run test/unit/client/store/tabsSlice.managed-runtime-close.test.ts --config config/vitest/vitest.config.ts`
+  Hold its FIFO slot across close evidence, current inventory resolution,
+  visibility mutation and confirmation, and the associated local removal.
+  Remove the managed-promotion fulfilled-no-op guard. A close that arrives
+  during reopen waits for the transition and then runs. Route a no-local-pane
+  recovery-panel detach through an exported store thunk using this coordinator;
+  local panel targets continue to call the gated close thunks.
+- [ ] Step 4: Resolve an unprojected view only from one authoritative
+  inventory row matched through the pane's terminal ID or create request ID
+  to its soul and view. A nonempty local view ID remains authoritative. Add
+  coverage for a created terminal whose view projection is delayed and for a
+  still-creating terminal whose view has not committed. An ambiguous match,
+  unresolved creation, failed inventory request, or unavailable capability
+  for a known managed view keeps the pane and sets the existing retryable close
+  error. After a successful complete inventory, a settled pane with no managed
+  marker or matching managed terminal may use the ordinary close path. Do not
+  infer detachment from a missing row or a pane-close ack when creation or
+  managed identity is still unresolved.
+- [ ] Step 5: Detach only views with no other local representation. After a
+  successful mutation, fetch and apply a confirming inventory and require the
+  target to be detached before removing local content. If a multi-view close
+  partly fails, retain the source layout and report the failure; do not write
+  visible compensation. Reassert retained panes as open after an ambiguous or
+  failed close acknowledgement or visibility mutation. A later GET must be
+  applied through the existing managed-runtime revision guard; do not infer
+  equal-revision snapshot coherence.
+- [ ] Step 6: Run impacted close, panel, pane-gate, recovery, and tab-bar tests,
+  then client typecheck. Refactor while green and obtain an independent task
+  review.
 
-  Expected: FAIL because the current unconditional stack pop consumes the
-  entry added by the unrelated close and leaves the already restored entry
-  available for a duplicate reopen.
-
-- [ ] **Step 3: Consume the captured entry after local restore**
-
-  Add a reducer that locates the selected `ClosedTabEntry` by `tab.id` and
-  `closedAt` and removes that element only. Dispatch it after `addTab` and
-  `restoreLayout` have committed the local restore. Keep reopen serialization,
-  current-handle hydration, and the close-during-promotion guard.
-
-- [ ] **Step 4: Run focused and impacted tests**
-
-  Run: `pnpm run test:vitest run test/unit/client/store/tabsSlice.managed-runtime-close.test.ts test/unit/client/store/tabsSlice.test.ts test/unit/client/store/tabsSlice.reopen.test.ts test/unit/client/store/tabsSlice.closed-registry.test.ts test/unit/client/store/paneCloseGate.test.ts test/unit/client/components/TabBar.test.tsx --config config/vitest/vitest.config.ts`
+  Run: pnpm run test:vitest run test/unit/client/store/tabsSlice.managed-runtime-close.test.ts test/unit/client/store/tabsSlice.test.ts test/unit/client/store/paneCloseGate.test.ts test/unit/client/components/ManagedAgentRecoveryStatus.test.tsx test/unit/client/components/TabBar.test.tsx test/unit/lib/managed-runtime-recovery.test.ts --config config/vitest/vitest.config.ts
 
   Expected: PASS.
 
-- [ ] **Step 5: Refactor while green**
+  Run: pnpm run typecheck:client
 
-  Use one exact-entry action for successful local restore. Keep visibility
-  promotion failure recoverable without restoring the consumed entry or
-  reopening a duplicate tab.
+  Expected: PASS.
+- [ ] Step 7: Commit only the coordinator, close and panel code, and their
+  focused tests with a focused commit message.
 
-- [ ] **Step 6: Run client typecheck**
+## Task 2: Protect closed layouts from alternate restore and matching paths
 
-  Run: `pnpm run typecheck:client`
+**Files:**
+- Modify: src/store/crossTabSync.ts, src/store/persistControl.ts,
+  src/store/persistMiddleware.ts, and src/lib/recovery/managed-runtime-recovery.ts
+- Test: test/unit/client/store/crossTabSync.test.ts,
+  test/unit/client/store/tabsPersistence.test.ts, and
+  test/unit/lib/managed-runtime-recovery.test.ts
+
+- [ ] Step 1: Add the same-key stale StorageEvent case after a managed split
+  close but before the normal debounce, plus a failed-immediate-flush case.
+  Assert that the stale event does not restore the pane and that protection
+  ends after a later successful flush. Add automatic-primary and explicit
+  views for one soul; a pane with a different nonempty view ID must not be
+  claimed through soul, terminal, create-request, or session fallback. Preserve
+  fallback adoption when the pane has no view ID.
+- [ ] **Step 2: Run the tests and verify the intended failures**
+
+  Run: pnpm run test:vitest run test/unit/client/store/crossTabSync.test.ts test/unit/client/store/tabsPersistence.test.ts test/unit/lib/managed-runtime-recovery.test.ts --config config/vitest/vitest.config.ts
+
+  Expected: FAIL because the current own-key path can rehydrate a just-closed
+  pane before persistence, and fallback matching can replace another view's
+  nonempty identity.
+- [ ] Step 3: Mark a successful close, pane removal, or replacement as a
+  persistence boundary and synchronously request the existing layout flush.
+  If storage fails, keep the close-protection marker active until a later
+  successful flush. Generate persistedAt monotonically above the current
+  authoritative local envelope so an equal-millisecond stale event cannot
+  pass the recency check.
+- [ ] Step 4: In the own-key full-hydration path, do not apply an incoming
+  layout while a local close is awaiting durable persistence. Do not advance
+  the recency floor for a rejected event. A successful close write advances
+  the floor before a previously queued stale event can restore the pane.
+- [ ] Step 5: Reject fallback matching when a pane has a different nonempty
+  view ID; keep the current identity when it matches exactly. Continue
+  adopting a pane with no view ID only when existing fallback identity is
+  unique and unclaimed.
+- [ ] Step 6: Run the task tests and client typecheck, refactor while green,
+  then obtain an independent task review.
+
+  Run: pnpm run test:vitest run test/unit/client/store/crossTabSync.test.ts test/unit/client/store/tabsPersistence.test.ts test/unit/client/store/persistControl.test.ts test/unit/lib/managed-runtime-recovery.test.ts --config config/vitest/vitest.config.ts
 
   Expected: PASS.
 
-- [ ] **Step 7: Commit the task**
+  Run: pnpm run typecheck:client
 
-  Commit the exact-entry reducer, reopen change, and delayed-request regression
-  test with a focused message.
+  Expected: PASS.
+- [ ] Step 7: Commit only persistence gating, identity matching, and their
+  focused tests with a focused commit message.
+
+## Task 3: Reopen only from current identity and clear close evidence
+
+**Files:**
+- Modify: src/store/tabsSlice.ts, src/store/panesSlice.ts,
+  src/store/tabRegistrySlice.ts, and src/lib/kill-ack.ts only if the existing
+  correlated pane-open result cannot be observed by the reopen caller
+- Test: test/unit/client/store/tabsSlice.managed-runtime-close.test.ts,
+  test/unit/client/store/tabsSlice.reopen.test.ts,
+  test/unit/client/store/tabRegistrySlice.test.ts, and
+  test/unit/client/lib/kill-ack.test.ts
+
+**Interface:** tabRegistrySlice exports consumeClosedEntry(entry: { tabId: string;
+closedAt: number }): reducer action; reopenClosedTab remains the public thunk.
+
+- [ ] Step 1: Add cases for unavailable runtime, rejected inventory GET, missing
+  view, missing soul, missing terminal handle, conflicting saved view identity,
+  queue release and retry, pane-open reassertion for the preserved create
+  request, close during promotion, and an unrelated close while reopen waits.
+  On failed preflight assert there is no tab/layout mutation, no entry
+  consumption, and no terminal-create request.
+- [ ] **Step 2: Run the reopen tests and verify the intended failures**
+
+  Run: pnpm run test:vitest run test/unit/client/store/tabsSlice.managed-runtime-close.test.ts test/unit/client/store/tabsSlice.reopen.test.ts test/unit/client/store/tabRegistrySlice.test.ts test/unit/client/lib/kill-ack.test.ts --config config/vitest/vitest.config.ts
+
+  Expected: FAIL because current reopen proceeds with stale or partial cached
+  identity, omits pane.opened, and pops whichever entry is now on top.
+- [ ] Step 3: Under the shared managed-visibility coordinator, fetch current
+  inventory before changing local tabs, layouts, or the reopen stack. For a
+  managed entry, validate every terminal leaf against its exact view and
+  running soul and require the current terminal/create identity needed by the
+  attach lifecycle. Do not use cached handles after failed or incomplete
+  preflight. On failure, leave state and the saved entry untouched, report a
+  retryable error, and release both queues in finally.
+- [ ] Step 4: On a valid preflight, preserve the saved view identity while
+  hydrating current handles, restore the local tab, and send pane.opened for
+  each restored create request so existing durable close evidence is
+  consumed. Keep the existing correlated failure/reconnect retry behavior.
+  Promote detached views only after the local representation exists. A later
+  promotion failure leaves that local tab usable and the exact entry consumed.
+- [ ] Step 5: Consume only the captured closed entry keyed by its saved tab ID
+  and closedAt value, after local restore. Do not pop an unrelated newer entry.
+  Keep the close/reopen coordinator held until open assertion and promotion
+  have settled, so a pending close runs afterward rather than being dropped.
+- [ ] Step 6: Run impacted reopen, close, pane, tab-registry, kill-ack, and
+  tab-bar tests, then client typecheck. Refactor while green and obtain an
+  independent task review.
+
+  Run: pnpm run test:vitest run test/unit/client/store/tabsSlice.managed-runtime-close.test.ts test/unit/client/store/tabsSlice.test.ts test/unit/client/store/tabsSlice.reopen.test.ts test/unit/client/store/tabsSlice.closed-registry.test.ts test/unit/client/store/tabRegistrySlice.test.ts test/unit/client/store/paneCloseGate.test.ts test/unit/client/components/TabBar.test.tsx test/unit/client/lib/kill-ack.test.ts --config config/vitest/vitest.config.ts
+
+  Expected: PASS.
+
+  Run: pnpm run typecheck:client
+
+  Expected: PASS.
+- [ ] Step 7: Commit only the reopen code and focused tests with a focused
+  commit message.
 
 ## Final verification and review
 
-1. Run the configured full repository suite once on final `HEAD`:
-   `pnpm run test`. Carry forward only the two base failures in the baseline
-   receipt when the same failures recur; investigate every new failure.
-2. Run `pnpm run typecheck:client` and `git diff --check` on final `HEAD`.
-3. Run the configured e2e suite only for any added browser specs. The
-   Docker-supervisor browser rig is marked local-only and excluded from the
-   configured cloud lane; this change adds no server API or process-lifecycle
-   behavior, so close/recovery correctness is covered at the Redux/API
-   boundary.
+1. Run the configured full repository suite once on final HEAD with pnpm run
+   test. Carry forward only the two base failures in the baseline receipt if
+   the same failures recur; investigate every new failure.
+2. Run pnpm run typecheck:client and git diff --check on final HEAD.
+3. Do not add a browser spec or change server process lifecycle. The behavior
+   is exercised at the Redux/API and existing storage-event boundaries; the
+   Docker-supervisor browser rig is local-only and excluded from the configured
+   cloud lane.
 4. Review the complete committed delta independently before returning the
-   branch.
+   branch. Do not push, deploy, restart the live server, create a PR, or merge.
