@@ -1,6 +1,6 @@
 import { configureStore } from '@reduxjs/toolkit'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import tabsReducer, { addTab, closePaneWithCleanup, closeTab, detachManagedRuntimeView, reopenClosedTab, replacePaneWithCleanup } from '../../../../src/store/tabsSlice'
+import tabsReducer, { addTab, closePaneWithCleanup, closeTab, detachManagedRuntimeView, reopenClosedTab, replacePaneWithCleanup, updateTab } from '../../../../src/store/tabsSlice'
 import panesReducer, { initLayout, splitPane, updatePaneContent } from '../../../../src/store/panesSlice'
 import managedRuntimeReducer, { managedRuntimeSnapshotReceived, setManagedRuntimeAvailable } from '../../../../src/store/managedRuntimeSlice'
 import tabRegistryReducer from '../../../../src/store/tabRegistrySlice'
@@ -1563,6 +1563,20 @@ describe('closeTab managed runtime visibility', () => {
   it('detaches the managed view discarded by replace-pane', async () => {
     let serverSnapshot = inventory(8, [view('view-a', 0), view('view-b', 1)])
     const store = createStore(['view-a', 'view-b'], serverSnapshot)
+    const siblingView = serverSnapshot.viewIntents.find((entry) => entry.viewId === 'view-b')!
+    const siblingSoul = serverSnapshot.souls.find((entry) => entry.soulId === siblingView.soulId)!
+    store.dispatch(updateTab({
+      id: 'managed-tab',
+      updates: {
+        viewIntentId: siblingView.viewId,
+        viewIntentRevision: siblingView.revision,
+        soulIntentRevision: siblingView.soulIntentRevision,
+        soulId: siblingSoul.soulId,
+        incarnationId: siblingSoul.incarnationId,
+        runtimeState: siblingSoul.launchState,
+        placementGroup: siblingView.placementGroup,
+      },
+    }))
     apiMocks.getManagedRuntimeInventory.mockImplementation(async () => serverSnapshot)
     apiMocks.updateManagedRuntimeViewVisibility.mockImplementation(async (viewId: string, visibility: ManagedRuntimeViewIntent['visibility']) => {
       serverSnapshot = withVisibility(serverSnapshot, viewId, visibility)
@@ -1576,12 +1590,168 @@ describe('closeTab managed runtime visibility', () => {
     expect(serverSnapshot.viewIntents.map((entry) => entry.visibility)).toEqual(['detached', 'visible'])
     const layout = store.getState().panes.layouts['managed-tab']
     expect(layout && collectContent(layout, 'managed-pane-0')?.kind).toBe('picker')
+    expect(store.getState().tabs.tabs[0]?.viewIntentId).toBe('view-b')
+    expect(collectContent(layout!, 'managed-pane-1')).toMatchObject({
+      kind: 'terminal',
+      viewIntentId: 'view-b',
+    })
 
     await store.dispatch(closeTab('managed-tab'))
     expect(serverSnapshot.viewIntents.map((entry) => entry.visibility)).toEqual(['detached', 'detached'])
     await store.dispatch(reopenClosedTab())
     expect(serverSnapshot.viewIntents.map((entry) => entry.visibility)).toEqual(['detached', 'visible'])
     expect(buildManagedRuntimeMergePlan(serverSnapshot, store.getState() as any).creates).toHaveLength(0)
+  })
+
+  it('preserves a fresh shell when closing and reopening a tab after replacing its managed pane', async () => {
+    const managedView = view('view-a', 0)
+    let serverSnapshot = inventory(8, [managedView])
+    const store = createStore(['view-a'], serverSnapshot)
+    apiMocks.getManagedRuntimeInventory.mockImplementation(async () => serverSnapshot)
+    apiMocks.updateManagedRuntimeViewVisibility.mockImplementation(async (
+      viewId: string,
+      visibility: ManagedRuntimeViewIntent['visibility'],
+    ) => {
+      serverSnapshot = withVisibility(serverSnapshot, viewId, visibility)
+      return serverSnapshot.viewIntents.find((entry) => entry.viewId === viewId)
+    })
+
+    await store.dispatch(replacePaneWithCleanup({ tabId: 'managed-tab', paneId: 'managed-pane-0' }))
+    const freshShell = {
+      kind: 'terminal' as const,
+      createRequestId: 'fresh-shell-create',
+      terminalId: 'fresh-shell-terminal',
+      status: 'running' as const,
+      mode: 'shell' as const,
+    }
+    store.dispatch(updatePaneContent({
+      tabId: 'managed-tab',
+      paneId: 'managed-pane-0',
+      content: freshShell,
+    }))
+
+    await store.dispatch(closeTab('managed-tab'))
+    const entry = store.getState().tabRegistry.reopenStack[0]!
+    expect(entry.layout).toMatchObject({ type: 'leaf', id: 'managed-pane-0', content: freshShell })
+    expect(entry.tab.viewIntentId).toBeUndefined()
+
+    const reopened = await store.dispatch(reopenClosedTab())
+
+    expect(reopenClosedTab.fulfilled.match(reopened)).toBe(true)
+    const reopenedTab = store.getState().tabs.tabs[0]!
+    const reopenedLayout = store.getState().panes.layouts[reopenedTab.id]
+    expect(reopenedLayout).toMatchObject({
+      type: 'leaf',
+      id: 'managed-pane-0',
+      content: {
+        kind: 'terminal',
+        createRequestId: 'fresh-shell-create',
+        mode: 'shell',
+        status: 'creating',
+        terminalId: undefined,
+      },
+    })
+    expect(collectContent(reopenedLayout!, 'managed-pane-0')?.viewIntentId).toBeUndefined()
+    expect(reopenedTab.viewIntentId).toBeUndefined()
+    expect(serverSnapshot.viewIntents.find((viewIntent) => viewIntent.viewId === 'view-a')?.visibility).toBe('detached')
+    expect(apiMocks.updateManagedRuntimeViewVisibility).toHaveBeenCalledTimes(1)
+    expect(apiMocks.updateManagedRuntimeViewVisibility).toHaveBeenCalledWith('view-a', 'detached', 2, 5)
+    expect(store.getState().tabRegistry.reopenStack).toHaveLength(0)
+  })
+
+  it('reopens a saved editor after replacing the managed pane and closing the tab', async () => {
+    const managedView = view('view-a', 0)
+    let serverSnapshot = inventory(8, [managedView])
+    const store = createStore(['view-a'], serverSnapshot)
+    apiMocks.getManagedRuntimeInventory.mockImplementation(async () => serverSnapshot)
+    apiMocks.updateManagedRuntimeViewVisibility.mockImplementation(async (
+      viewId: string,
+      visibility: ManagedRuntimeViewIntent['visibility'],
+    ) => {
+      serverSnapshot = withVisibility(serverSnapshot, viewId, visibility)
+      return serverSnapshot.viewIntents.find((entry) => entry.viewId === viewId)
+    })
+
+    await store.dispatch(replacePaneWithCleanup({ tabId: 'managed-tab', paneId: 'managed-pane-0' }))
+    const savedEditor = {
+      kind: 'editor' as const,
+      filePath: '/workspace/notes.md',
+      language: 'markdown',
+      readOnly: false,
+      content: 'keep this editor pane',
+      viewMode: 'source' as const,
+      wordWrap: true,
+    }
+    store.dispatch(updatePaneContent({
+      tabId: 'managed-tab',
+      paneId: 'managed-pane-0',
+      content: savedEditor,
+    }))
+
+    await store.dispatch(closeTab('managed-tab'))
+    const entry = store.getState().tabRegistry.reopenStack[0]!
+    expect(entry.layout).toMatchObject({ type: 'leaf', id: 'managed-pane-0', content: savedEditor })
+
+    const reopened = await store.dispatch(reopenClosedTab())
+
+    expect(reopenClosedTab.fulfilled.match(reopened)).toBe(true)
+    const reopenedTab = store.getState().tabs.tabs[0]!
+    expect(store.getState().panes.layouts[reopenedTab.id]).toMatchObject({
+      type: 'leaf',
+      id: 'managed-pane-0',
+      content: savedEditor,
+    })
+    expect(serverSnapshot.viewIntents.find((viewIntent) => viewIntent.viewId === 'view-a')?.visibility).toBe('detached')
+    expect(store.getState().tabRegistry.reopenStack).toHaveLength(0)
+  })
+
+  it('reopens the remaining editor after closing the tab preferred managed pane', async () => {
+    const managedView = view('view-a', 0)
+    let serverSnapshot = inventory(8, [managedView])
+    const store = createStore(['view-a'], serverSnapshot)
+    store.dispatch(splitPane({
+      tabId: 'managed-tab',
+      paneId: 'managed-pane-0',
+      direction: 'vertical',
+      newPaneId: 'editor-pane',
+      newContent: {
+        kind: 'editor',
+        filePath: '/workspace/remaining.md',
+        language: 'markdown',
+        readOnly: false,
+        content: 'keep the remaining pane',
+        viewMode: 'source',
+        wordWrap: true,
+      },
+    }))
+    apiMocks.getManagedRuntimeInventory.mockImplementation(async () => serverSnapshot)
+    apiMocks.updateManagedRuntimeViewVisibility.mockImplementation(async (
+      viewId: string,
+      visibility: ManagedRuntimeViewIntent['visibility'],
+    ) => {
+      serverSnapshot = withVisibility(serverSnapshot, viewId, visibility)
+      return serverSnapshot.viewIntents.find((entry) => entry.viewId === viewId)
+    })
+
+    await store.dispatch(closePaneWithCleanup({ tabId: 'managed-tab', paneId: 'managed-pane-0' }))
+    expect(store.getState().panes.layouts['managed-tab']).toMatchObject({
+      type: 'leaf',
+      id: 'editor-pane',
+      content: { kind: 'editor', filePath: '/workspace/remaining.md' },
+    })
+
+    await store.dispatch(closeTab('managed-tab'))
+    const reopened = await store.dispatch(reopenClosedTab())
+
+    expect(reopenClosedTab.fulfilled.match(reopened)).toBe(true)
+    const reopenedTab = store.getState().tabs.tabs[0]!
+    expect(store.getState().panes.layouts[reopenedTab.id]).toMatchObject({
+      type: 'leaf',
+      id: 'editor-pane',
+      content: { kind: 'editor', filePath: '/workspace/remaining.md' },
+    })
+    expect(serverSnapshot.viewIntents.find((viewIntent) => viewIntent.viewId === 'view-a')?.visibility).toBe('detached')
+    expect(store.getState().tabRegistry.reopenStack).toHaveLength(0)
   })
 
   it('does not let a close race a reopened view visibility promotion', async () => {

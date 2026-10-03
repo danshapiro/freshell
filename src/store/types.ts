@@ -55,6 +55,8 @@ export interface SessionListMetadata {
 export interface Tab extends ManagedRuntimeProjectionFields {
   id: string
   createRequestId: string
+  /** Preserve pane create-request IDs when reopening after a managed pane was replaced. */
+  preserveCreateRequestIdsOnNextReopen?: boolean
   title: string
   description?: string
   codingCliProvider?: CodingCliProviderName

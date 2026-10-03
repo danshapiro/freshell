@@ -1217,7 +1217,7 @@ export const panesSlice = createSlice({
         layout: PaneNode
         paneTitles: Record<string, string>
         paneTitleSetByUser?: Record<string, boolean>
-        /** Same-machine bootstrap only; ordinary/cross-device restores remint. */
+        /** Keep durable create IDs for same-machine recovery of replaced managed panes. */
         preserveCreateRequestIds?: boolean
         /** Reopen only after refreshing managed handles from supervisor inventory. */
         preserveManagedRuntimeHandles?: boolean

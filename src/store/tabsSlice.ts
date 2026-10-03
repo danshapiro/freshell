@@ -2356,6 +2356,40 @@ async function persistManagedViewVisibility(
   }
 }
 
+function clearDetachedManagedTabProjection(
+  tabId: string,
+  detachedViewIntentIds: string[],
+  dispatch: (action: unknown) => void,
+  getState: () => RootState,
+): void {
+  const state = getState()
+  const tab = state.tabs.tabs.find((entry) => entry.id === tabId)
+  const viewIntentId = tab?.viewIntentId
+  if (!viewIntentId || !detachedViewIntentIds.includes(viewIntentId)) return
+
+  const remainingLayout = state.panes.layouts[tabId]
+  if (remainingLayout && collectPaneEntries(remainingLayout).some(({ content }) => (
+    content.kind === 'terminal' && content.viewIntentId === viewIntentId
+  ))) return
+
+  dispatch(updateTab({
+    id: tabId,
+    updates: {
+      preserveCreateRequestIdsOnNextReopen: true,
+      soulId: undefined,
+      incarnationId: undefined,
+      runtimeState: undefined,
+      viewIntentId: undefined,
+      viewIntentRevision: undefined,
+      soulIntentRevision: undefined,
+      incidentId: undefined,
+      placementGroup: undefined,
+      resourceSummary: undefined,
+      recoverySummary: undefined,
+    },
+  }))
+}
+
 /**
  * Close a pane and clean up its attention state.
  * If the target pane is the tab's only pane, closes the tab instead.
@@ -2492,6 +2526,12 @@ export const closePaneWithCleanup = createAsyncThunk(
         }
 
         if (before !== after) {
+          clearDetachedManagedTabProjection(
+            tabId,
+            managedViews.viewIntentIds,
+            dispatch,
+            getState as () => RootState,
+          )
           clearDraft(paneId)
           dispatch(clearPaneAttention({ paneId }))
           dispatch(clearTabAttention({ tabId }))
@@ -2945,6 +2985,15 @@ export const replacePaneWithCleanup = createAsyncThunk(
           log.warn('pane replacement was refused after managed view detachment; the pane keeps its content', { tabId, paneId })
           dispatch(setPaneCloseError({ tabId, paneId, error: PANE_CLOSE_REMOVAL_REFUSED_MESSAGE }))
           reassertKeptPanesOpen(after, tabId, identity)
+          return
+        }
+        if (afterContent?.kind === 'picker') {
+          clearDetachedManagedTabProjection(
+            tabId,
+            managedViews.viewIntentIds,
+            dispatch,
+            getState as () => RootState,
+          )
         }
       })
     } finally {
@@ -2963,6 +3012,7 @@ export const reopenClosedTab = createAsyncThunk(
 
       const entry = stack[stack.length - 1]
       const runtime = selectManagedRuntime(state)
+      const preserveCreateRequestIds = entry.tab.preserveCreateRequestIdsOnNextReopen === true
       const needsManagedPreflight = hasManagedRuntimeReopenCandidate(entry.tab, entry.layout, runtime)
       let runtimeSnapshot: ManagedRuntimeInventorySnapshot | undefined
       let restoredLayout = entry.layout
@@ -3039,13 +3089,18 @@ export const reopenClosedTab = createAsyncThunk(
             dispatch(removeTab(redundantTabId))
             dispatch(removeLayout({ tabId: redundantTabId }))
           }
-          const { id: _savedTabId, ...savedTabFields } = entry.tab
+          const {
+            id: _savedTabId,
+            preserveCreateRequestIdsOnNextReopen: _preserveCreateRequestIdsOnNextReopen,
+            ...savedTabFields
+          } = entry.tab
           dispatch(updateTab({ id: mergePlan.targetTabId, updates: savedTabFields }))
           dispatch(restoreLayout({
             tabId: mergePlan.targetTabId,
             layout: restoredLayout,
             paneTitles: entry.paneTitles,
             paneTitleSetByUser: entry.paneTitleSetByUser,
+            preserveCreateRequestIds,
             preserveManagedRuntimeHandles: true,
             replaceExistingLayout: true,
           }))
@@ -3092,6 +3147,7 @@ export const reopenClosedTab = createAsyncThunk(
           layout: restoredLayout,
           paneTitles: entry.paneTitles,
           paneTitleSetByUser: entry.paneTitleSetByUser,
+          preserveCreateRequestIds,
           preserveManagedRuntimeHandles: true,
         }))
         localRestoreCommitted = true
