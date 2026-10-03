@@ -6,7 +6,7 @@
 //! payload is a new JSON document containing the selected session closure,
 //! never a copy of the host database.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
@@ -159,6 +159,29 @@ pub struct HostOpenCodeInventory {
     working_directory: PathBuf,
     default_database: PathBuf,
     channel_databases: Vec<PathBuf>,
+    workspace_mounts: Vec<WorkspaceMountMapping>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct WorkspaceIdentity {
+    project_id: String,
+    workspace_id: Option<String>,
+    directory: String,
+}
+
+#[derive(Debug, Clone)]
+struct WorkspaceMountMapping {
+    identity: WorkspaceIdentity,
+    managed_mount: PathBuf,
+}
+
+/// A workspace root resolved from a trusted host inventory and bound to one
+/// selected provider session. This type is private so unverified paths cannot
+/// be passed directly into file or Git verification.
+#[derive(Debug, Clone)]
+struct ResolvedWorkspaceMount {
+    canonical_root: PathBuf,
+    identity: WorkspaceIdentity,
 }
 
 impl HostOpenCodeInventory {
@@ -168,6 +191,7 @@ impl HostOpenCodeInventory {
             working_directory: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
             default_database,
             channel_databases: Vec::new(),
+            workspace_mounts: Vec::new(),
         }
     }
 
@@ -184,6 +208,30 @@ impl HostOpenCodeInventory {
 
     pub fn with_channel_database(mut self, path: PathBuf) -> Self {
         self.channel_databases.push(path);
+        self
+    }
+
+    /// Add a managed mount resolved by the trusted host workspace inventory.
+    /// The source identity must come from the selected OpenCode session's
+    /// project/workspace/directory records; `managed_mount` must be the host
+    /// resolver's corresponding managed workspace root, never a client path.
+    /// Export binds this mapping to selected session rows before verifying any
+    /// file or Git reference. A plain path without this identity is rejected.
+    pub fn with_trusted_workspace_mount(
+        mut self,
+        project_id: impl Into<String>,
+        workspace_id: Option<String>,
+        session_directory: impl Into<String>,
+        managed_mount: PathBuf,
+    ) -> Self {
+        self.workspace_mounts.push(WorkspaceMountMapping {
+            identity: WorkspaceIdentity {
+                project_id: project_id.into(),
+                workspace_id,
+                directory: session_directory.into(),
+            },
+            managed_mount,
+        });
         self
     }
 
@@ -252,20 +300,11 @@ impl HostOpenCodeInventory {
 #[derive(Debug, Clone)]
 pub struct ExportOptions {
     extraction_root: PathBuf,
-    workspace_mount: Option<PathBuf>,
 }
 
 impl ExportOptions {
     pub fn new(extraction_root: PathBuf) -> Self {
-        Self {
-            extraction_root,
-            workspace_mount: None,
-        }
-    }
-
-    pub fn with_workspace_mount(mut self, workspace_mount: PathBuf) -> Self {
-        self.workspace_mount = Some(workspace_mount);
-        self
+        Self { extraction_root }
     }
 }
 
@@ -326,7 +365,7 @@ impl OpenCodeTransferManifest {
     }
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct SerializedAssetMetadata {
     pub kind: String,
     pub source_relative_path: String,
@@ -412,9 +451,10 @@ pub fn export_exact_session(
         let migration_journal_fingerprint = migration_fingerprint(&snapshot)?;
         let sqlite_version = snapshot.query_row("SELECT sqlite_version()", [], |row| row.get(0))?;
         let mut rows = collect_exact_closure(&snapshot, root_session_id)?;
+        let workspace_mounts = resolve_workspace_mounts(&rows, &inventory.workspace_mounts)?;
         let mut asset_resolver = AssetResolver::new(
             inventory.tool_output_directory(&source_path),
-            options.workspace_mount.as_deref(),
+            &workspace_mounts,
         );
         asset_resolver.resolve_rows(&mut rows)?;
         let assets = asset_resolver.metadata();
@@ -534,17 +574,81 @@ impl<W: Write> Write for HashingWriter<'_, W> {
     }
 }
 
+fn resolve_workspace_mounts(
+    rows: &[SerializedRow],
+    mappings: &[WorkspaceMountMapping],
+) -> Result<HashMap<String, ResolvedWorkspaceMount>, TransferError> {
+    let mut resolved = HashMap::new();
+    for session in rows.iter().filter(|row| row.table == "session") {
+        let session_id = required_text(session, "id")?;
+        let identity = WorkspaceIdentity {
+            project_id: required_text(session, "project_id")?,
+            workspace_id: value_text(session, "workspace_id")?,
+            directory: required_text(session, "directory")?,
+        };
+        let mut matches = mappings
+            .iter()
+            .filter(|mapping| mapping.identity == identity);
+        let Some(mapping) = matches.next() else {
+            continue;
+        };
+        if matches.next().is_some() {
+            return Err(TransferError::Blocked(format!(
+                "trusted workspace mapping is ambiguous for session {session_id}"
+            )));
+        }
+        let canonical_root = fs::canonicalize(&mapping.managed_mount).map_err(|error| {
+            TransferError::Blocked(format!(
+                "trusted managed workspace mount is unavailable for session {session_id}: {error}"
+            ))
+        })?;
+        if !fs::metadata(&canonical_root)?.is_dir() {
+            return Err(TransferError::Blocked(format!(
+                "trusted managed workspace mount is not a directory for session {session_id}"
+            )));
+        }
+        resolved.insert(
+            session_id,
+            ResolvedWorkspaceMount {
+                canonical_root,
+                identity,
+            },
+        );
+    }
+    Ok(resolved)
+}
+
+fn session_id_for_reference_row(row: &SerializedRow) -> Result<String, TransferError> {
+    let key = match row.table.as_str() {
+        "message" | "part" | "session_message" | "session_input" | "session_context_epoch" => {
+            "session_id"
+        }
+        "session" => "id",
+        "event" => "aggregate_id",
+        _ => {
+            return Err(TransferError::Blocked(format!(
+                "{} row has no supported session identity for JSON reference traversal",
+                row.table
+            )))
+        }
+    };
+    required_text(row, key)
+}
+
 struct AssetResolver<'a> {
     tool_output_root: PathBuf,
-    workspace_mount: Option<&'a Path>,
+    workspace_mounts: &'a HashMap<String, ResolvedWorkspaceMount>,
     assets: BTreeMap<String, SerializedAssetMetadata>,
 }
 
 impl<'a> AssetResolver<'a> {
-    fn new(tool_output_root: PathBuf, workspace_mount: Option<&'a Path>) -> Self {
+    fn new(
+        tool_output_root: PathBuf,
+        workspace_mounts: &'a HashMap<String, ResolvedWorkspaceMount>,
+    ) -> Self {
         Self {
             tool_output_root,
-            workspace_mount,
+            workspace_mounts,
             assets: BTreeMap::new(),
         }
     }
@@ -564,6 +668,7 @@ impl<'a> AssetResolver<'a> {
                 _ => &[],
             };
             for column in columns {
+                let session_id = session_id_for_reference_row(row)?;
                 let nullable = row.table == "session" && *column == "revert";
                 let value = match row.values.get_mut(*column) {
                     Some(SerializedSqlValue::Text { value }) => value,
@@ -595,7 +700,7 @@ impl<'a> AssetResolver<'a> {
                         ))
                     })?;
                 let tree_reference_context = row.table == "session" && *column == "revert";
-                if self.walk_json(&mut decoded, tree_reference_context)? {
+                if self.walk_json(&mut decoded, tree_reference_context, &session_id)? {
                     *value = serde_json::to_string(&decoded)
                         .map_err(|error| TransferError::Serialization(error.to_string()))?;
                 }
@@ -608,6 +713,7 @@ impl<'a> AssetResolver<'a> {
         &mut self,
         value: &mut serde_json::Value,
         tree_reference_context: bool,
+        session_id: &str,
     ) -> Result<bool, TransferError> {
         match value {
             serde_json::Value::Object(object) => {
@@ -624,7 +730,7 @@ impl<'a> AssetResolver<'a> {
                             TransferError::Blocked("native file part has no recognized URL".into())
                         })?
                         .to_string();
-                    let replacement = self.resolve_file_url(&url)?;
+                    let replacement = self.resolve_file_url(&url, session_id)?;
                     if replacement != url {
                         object.insert("url".into(), serde_json::Value::String(replacement));
                         changed = true;
@@ -640,7 +746,7 @@ impl<'a> AssetResolver<'a> {
                                 "snapshot part has no content-addressed Git tree ID".into(),
                             )
                         })?;
-                    self.record_git_tree(tree)?;
+                    self.record_git_tree(tree, session_id)?;
                 }
                 if tree_reference_context {
                     if let Some(reference) = object.get("snapshot").or_else(|| object.get("tree")) {
@@ -649,18 +755,18 @@ impl<'a> AssetResolver<'a> {
                                 "revert snapshot reference is not a Git object ID".into(),
                             )
                         })?;
-                        self.record_git_tree(tree)?;
+                        self.record_git_tree(tree, session_id)?;
                     }
                 }
                 for nested in object.values_mut() {
-                    changed |= self.walk_json(nested, false)?;
+                    changed |= self.walk_json(nested, false, session_id)?;
                 }
                 Ok(changed)
             }
             serde_json::Value::Array(values) => {
                 let mut changed = false;
                 for nested in values {
-                    changed |= self.walk_json(nested, tree_reference_context)?;
+                    changed |= self.walk_json(nested, tree_reference_context, session_id)?;
                 }
                 Ok(changed)
             }
@@ -669,7 +775,7 @@ impl<'a> AssetResolver<'a> {
         }
     }
 
-    fn resolve_file_url(&mut self, url: &str) -> Result<String, TransferError> {
+    fn resolve_file_url(&mut self, url: &str, session_id: &str) -> Result<String, TransferError> {
         if url.starts_with("data:") {
             return Ok(url.to_string());
         }
@@ -683,7 +789,7 @@ impl<'a> AssetResolver<'a> {
             let target = self.copy_tool_output(&path)?;
             return Ok(target);
         }
-        let asset = self.verify_workspace_file(&path)?;
+        let asset = self.verify_workspace_file(&path, session_id)?;
         self.assets
             .insert(asset.target_relative_path.clone(), asset);
         Ok(url.to_string())
@@ -740,15 +846,17 @@ impl<'a> AssetResolver<'a> {
         ))
     }
 
-    fn verify_workspace_file(&self, path: &Path) -> Result<SerializedAssetMetadata, TransferError> {
-        let workspace_mount = self.workspace_mount.ok_or_else(|| {
+    fn verify_workspace_file(
+        &self,
+        path: &Path,
+        session_id: &str,
+    ) -> Result<SerializedAssetMetadata, TransferError> {
+        let workspace_mount = self.workspace_mounts.get(session_id).ok_or_else(|| {
             TransferError::Blocked(
-                "native file path cannot be verified without the exact workspace mount".into(),
+                "native file path cannot be verified without a trusted mapping for the selected workspace".into(),
             )
         })?;
-        let mount = fs::canonicalize(workspace_mount).map_err(|error| {
-            TransferError::Blocked(format!("exact workspace mount is unavailable: {error}"))
-        })?;
+        let mount = &workspace_mount.canonical_root;
         let metadata = fs::symlink_metadata(path).map_err(|error| {
             TransferError::Blocked(format!("workspace file reference is unavailable: {error}"))
         })?;
@@ -762,7 +870,7 @@ impl<'a> AssetResolver<'a> {
                 "workspace file reference cannot be resolved: {error}"
             ))
         })?;
-        let relative = canonical.strip_prefix(&mount).map_err(|_| {
+        let relative = canonical.strip_prefix(mount).map_err(|_| {
             TransferError::Blocked(
                 "workspace file reference is outside the exact managed mount".into(),
             )
@@ -782,25 +890,31 @@ impl<'a> AssetResolver<'a> {
         })
     }
 
-    fn record_git_tree(&mut self, tree: &str) -> Result<(), TransferError> {
-        if self.assets.values().any(|asset| {
-            asset.kind == "git_tree_reference" && asset.source_relative_path.ends_with(tree)
-        }) {
-            return Ok(());
-        }
-        let mount = self.workspace_mount.ok_or_else(|| {
+    fn record_git_tree(&mut self, tree: &str, session_id: &str) -> Result<(), TransferError> {
+        let mount = self.workspace_mounts.get(session_id).ok_or_else(|| {
             TransferError::Blocked(
-                "snapshot reference cannot be verified without the exact workspace mount".into(),
+                "snapshot reference cannot be verified without a trusted mapping for the selected workspace".into(),
             )
         })?;
-        let store = inspect_git_tree(mount, tree)?;
+        let store = inspect_git_tree(&mount.canonical_root, tree)?;
+        let identity_bytes = serde_json::to_vec(&mount.identity)
+            .map_err(|error| TransferError::Serialization(error.to_string()))?;
+        let source_identity = format!("workspace:{}:{}", digest(&identity_bytes), store.identity);
         let metadata = SerializedAssetMetadata {
             kind: "git_tree_reference".into(),
-            source_relative_path: store.identity.clone(),
-            target_relative_path: store.identity,
+            source_relative_path: source_identity.clone(),
+            target_relative_path: source_identity,
             size_bytes: store.closure_bytes,
             sha256: store.closure_sha256,
         };
+        if let Some(existing) = self.assets.get(&metadata.target_relative_path) {
+            if existing == &metadata {
+                return Ok(());
+            }
+            return Err(TransferError::Blocked(
+                "Git tree asset identity resolved to conflicting workspace content".into(),
+            ));
+        }
         self.assets
             .insert(metadata.target_relative_path.clone(), metadata);
         Ok(())
@@ -894,6 +1008,11 @@ struct GitTreeInspection {
     closure_sha256: String,
 }
 
+struct GitRepository {
+    work_tree: PathBuf,
+    git_dir: PathBuf,
+}
+
 fn inspect_git_tree(mount: &Path, tree: &str) -> Result<GitTreeInspection, TransferError> {
     if !(tree.len() == 40 || tree.len() == 64) || !tree.bytes().all(|byte| byte.is_ascii_hexdigit())
     {
@@ -904,8 +1023,8 @@ fn inspect_git_tree(mount: &Path, tree: &str) -> Result<GitTreeInspection, Trans
     let mount = fs::canonicalize(mount).map_err(|error| {
         TransferError::Blocked(format!("exact workspace mount is unavailable: {error}"))
     })?;
-    let top_level = git_output(&mount, &["rev-parse", "--show-toplevel"])?;
-    let top_level = PathBuf::from(String::from_utf8_lossy(&top_level.stdout).trim());
+    let top_level = git_text_in_mount(&mount, &["rev-parse", "--show-toplevel"])?;
+    let top_level = PathBuf::from(top_level.trim());
     let top_level = fs::canonicalize(top_level).map_err(|error| {
         TransferError::Blocked(format!("workspace Git root cannot be resolved: {error}"))
     })?;
@@ -914,8 +1033,17 @@ fn inspect_git_tree(mount: &Path, tree: &str) -> Result<GitTreeInspection, Trans
             "snapshot Git root is not the exact managed workspace mount".into(),
         ));
     }
-    let git_dir = git_path(&mount, "--absolute-git-dir")?;
-    let common_dir = git_path(&mount, "--git-common-dir")?;
+    let git_dir = git_path_in_mount(&mount, "--absolute-git-dir")?;
+    if !git_dir.starts_with(&mount) {
+        return Err(TransferError::Blocked(
+            "snapshot Git directory is outside the exact managed workspace mount".into(),
+        ));
+    }
+    let repository = GitRepository {
+        work_tree: mount.clone(),
+        git_dir,
+    };
+    let common_dir = git_path_in_repository(&repository, "--git-common-dir")?;
     let common_dir = if common_dir.is_absolute() {
         common_dir
     } else {
@@ -926,16 +1054,15 @@ fn inspect_git_tree(mount: &Path, tree: &str) -> Result<GitTreeInspection, Trans
             "workspace Git common directory is unavailable: {error}"
         ))
     })?;
-    if !git_dir.starts_with(&mount) || !common_dir.starts_with(&mount) {
+    if !repository.git_dir.starts_with(&mount) || !common_dir.starts_with(&mount) {
         return Err(TransferError::Blocked(
             "snapshot object store is outside the exact managed workspace mount".into(),
         ));
     }
-    let object_format = String::from_utf8_lossy(
-        &git_output(&mount, &["rev-parse", "--show-object-format"])?.stdout,
-    )
-    .trim()
-    .to_string();
+    let object_format =
+        git_text_in_repository(&repository, &["rev-parse", "--show-object-format"])?
+            .trim()
+            .to_string();
     let expected_id_length = match object_format.as_str() {
         "sha1" => 40,
         "sha256" => 64,
@@ -981,13 +1108,13 @@ fn inspect_git_tree(mount: &Path, tree: &str) -> Result<GitTreeInspection, Trans
             alternate_identity.push(relative.to_string_lossy().replace('\\', "/"));
         }
     }
-    let object_type = git_text(&mount, &["cat-file", "-t", tree])?;
+    let object_type = git_text_in_repository(&repository, &["cat-file", "-t", tree])?;
     if object_type.trim() != "tree" {
         return Err(TransferError::Blocked(
             "snapshot reference does not name a Git tree object".into(),
         ));
     }
-    let entries = git_output(&mount, &["ls-tree", "-r", "-t", "-z", tree])?;
+    let entries = git_output_in_repository(&repository, &["ls-tree", "-r", "-t", "-z", tree])?;
     let mut objects = BTreeSet::new();
     objects.insert(tree.to_string());
     for entry in entries
@@ -1012,8 +1139,8 @@ fn inspect_git_tree(mount: &Path, tree: &str) -> Result<GitTreeInspection, Trans
     let mut object_records = Vec::with_capacity(objects.len());
     let mut closure_bytes = 0_u64;
     for object in objects {
-        let object_kind = git_text(&mount, &["cat-file", "-t", &object])?;
-        let object_size = git_text(&mount, &["cat-file", "-s", &object])?
+        let object_kind = git_text_in_repository(&repository, &["cat-file", "-t", &object])?;
+        let object_size = git_text_in_repository(&repository, &["cat-file", "-s", &object])?
             .trim()
             .parse::<u64>()
             .map_err(|_| TransferError::Blocked("Git object size is invalid".into()))?;
@@ -1038,9 +1165,8 @@ fn inspect_git_tree(mount: &Path, tree: &str) -> Result<GitTreeInspection, Trans
     })
 }
 
-fn git_path(mount: &Path, argument: &str) -> Result<PathBuf, TransferError> {
-    let output = git_output(mount, &["rev-parse", argument])?;
-    let path = PathBuf::from(String::from_utf8_lossy(&output.stdout).trim());
+fn git_path_in_mount(mount: &Path, argument: &str) -> Result<PathBuf, TransferError> {
+    let path = PathBuf::from(git_text_in_mount(mount, &["rev-parse", argument])?.trim());
     if path.is_absolute() {
         fs::canonicalize(path).map_err(|error| {
             TransferError::Blocked(format!("workspace Git path is unavailable: {error}"))
@@ -1052,23 +1178,84 @@ fn git_path(mount: &Path, argument: &str) -> Result<PathBuf, TransferError> {
     }
 }
 
-fn git_text(mount: &Path, arguments: &[&str]) -> Result<String, TransferError> {
-    let output = git_output(mount, arguments)?;
+fn git_path_in_repository(
+    repository: &GitRepository,
+    argument: &str,
+) -> Result<PathBuf, TransferError> {
+    let path = PathBuf::from(git_text_in_repository(repository, &["rev-parse", argument])?.trim());
+    if path.is_absolute() {
+        fs::canonicalize(path).map_err(|error| {
+            TransferError::Blocked(format!("workspace Git path is unavailable: {error}"))
+        })
+    } else {
+        fs::canonicalize(repository.work_tree.join(path)).map_err(|error| {
+            TransferError::Blocked(format!("workspace Git path is unavailable: {error}"))
+        })
+    }
+}
+
+fn git_text_in_mount(mount: &Path, arguments: &[&str]) -> Result<String, TransferError> {
+    let output = git_output_in_mount(mount, arguments)?;
     String::from_utf8(output.stdout)
         .map_err(|_| TransferError::Blocked("Git returned non-UTF-8 metadata".into()))
 }
 
-fn git_output(mount: &Path, arguments: &[&str]) -> Result<Output, TransferError> {
-    let output = Command::new("git")
-        .args(["-C", mount.to_string_lossy().as_ref()])
-        .args(arguments)
+fn git_text_in_repository(
+    repository: &GitRepository,
+    arguments: &[&str],
+) -> Result<String, TransferError> {
+    let output = git_output_in_repository(repository, arguments)?;
+    String::from_utf8(output.stdout)
+        .map_err(|_| TransferError::Blocked("Git returned non-UTF-8 metadata".into()))
+}
+
+fn git_output_in_mount(mount: &Path, arguments: &[&str]) -> Result<Output, TransferError> {
+    let mut command = sanitized_git_command();
+    command.arg("-C").arg(mount).args(arguments);
+    checked_git_output(command)
+}
+
+fn git_output_in_repository(
+    repository: &GitRepository,
+    arguments: &[&str],
+) -> Result<Output, TransferError> {
+    let mut command = sanitized_git_command();
+    command
+        .arg("--git-dir")
+        .arg(&repository.git_dir)
+        .arg("--work-tree")
+        .arg(&repository.work_tree)
+        .args(arguments);
+    checked_git_output(command)
+}
+
+fn sanitized_git_command() -> Command {
+    let mut command = Command::new("git");
+    for (key, _) in std::env::vars_os() {
+        if key
+            .to_string_lossy()
+            .to_ascii_uppercase()
+            .starts_with("GIT_")
+        {
+            command.env_remove(key);
+        }
+    }
+    command
         .env("GIT_NO_LAZY_FETCH", "1")
         .env("GIT_NO_REPLACE_OBJECTS", "1")
         .env("GIT_CONFIG_NOSYSTEM", "1")
-        .output()
-        .map_err(|error| {
-            TransferError::Blocked(format!("local Git object-store check failed: {error}"))
-        })?;
+        .env("GIT_OPTIONAL_LOCKS", "0");
+    #[cfg(windows)]
+    command.env("GIT_CONFIG_GLOBAL", "NUL");
+    #[cfg(not(windows))]
+    command.env("GIT_CONFIG_GLOBAL", "/dev/null");
+    command
+}
+
+fn checked_git_output(mut command: Command) -> Result<Output, TransferError> {
+    let output = command.output().map_err(|error| {
+        TransferError::Blocked(format!("local Git object-store check failed: {error}"))
+    })?;
     if !output.status.success() {
         return Err(TransferError::Blocked(format!(
             "local Git object-store check failed: {}",
