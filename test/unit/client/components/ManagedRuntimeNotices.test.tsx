@@ -14,6 +14,7 @@ import {
   noticeProfileId,
 } from '@/components/ManagedRuntimeNotices'
 import type { ManagedRuntimeIncidentSummary, ManagedRuntimeNotice } from '@shared/managed-runtime'
+import { ApiError } from '@/lib/api'
 
 const apiMocks = vi.hoisted(() => ({
   getManagedRuntimeNotices: vi.fn(),
@@ -140,6 +141,47 @@ describe('ManagedRuntimeNotices', () => {
   afterEach(() => {
     cleanup()
     vi.useRealTimers()
+    vi.restoreAllMocks()
+  })
+
+  it('logs a background fetch failure without showing a decisionless popup', async () => {
+    const cause = new Error('Notices service refused the request')
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    apiMocks.getManagedRuntimeNotices.mockRejectedValue(cause)
+    await act(async () => { renderNotices() })
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument()
+    expect(screen.queryByText(cause.message)).not.toBeInTheDocument()
+    expect(warn).toHaveBeenCalledWith('[ManagedRuntimeNotices]', expect.objectContaining({
+      event: 'managed_runtime_notices_fetch_failed', profileId: noticeProfileId('device-notice-test'), err: cause,
+    }))
+  })
+
+  it('keeps actionable cleanup context and action errors when background polling fails', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    await renderPollingNotices([cleanupFailure('notice-one')])
+    await clickNoticeButton('Details')
+    expect(screen.getByRole('alert')).toHaveTextContent('provider state was missing')
+    apiMocks.getManagedRuntimeIncidentSummary.mockRejectedValue(new Error('Details request refused'))
+    await clickNoticeButton('Details')
+    expect(screen.getByRole('alert')).toHaveTextContent('Details request refused')
+    apiMocks.getManagedRuntimeNotices.mockRejectedValue(new Error('Background notices request refused'))
+    await pollNotices()
+    const alert = screen.getByRole('alert')
+    expect(alert).toHaveTextContent('Cleanup needs attention: notice-one')
+    expect(alert).toHaveTextContent('provider state was missing')
+    expect(alert).toHaveTextContent('Details request refused')
+    expect(alert).not.toHaveTextContent('Background notices request refused')
+    expect(screen.getByRole('button', { name: 'Details' })).toBeVisible()
+    expect(screen.getByRole('button', { name: 'Dismiss' })).toBeVisible()
+    expect(warn).toHaveBeenCalledWith('[ManagedRuntimeNotices]', expect.objectContaining({ event: 'managed_runtime_notices_fetch_failed' }))
+  })
+
+  it('keeps expected background unavailability quiet during server recovery', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    apiMocks.getManagedRuntimeNotices.mockRejectedValue(new ApiError(503, 'Server is restarting'))
+    await act(async () => { renderNotices() })
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument()
+    expect(warn).not.toHaveBeenCalled()
   })
 
   it('silently acknowledges routine notices and leaves no popup behind', async () => {

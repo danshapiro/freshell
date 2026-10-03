@@ -8,8 +8,10 @@ import {
   recordManagedRuntimeNoticeReceipt,
 } from '@/lib/api'
 import { useAppSelector } from '@/store/hooks'
+import { createLogger } from '@/lib/client-logger'
 
 const POLL_MS = 2_000
+const log = createLogger('ManagedRuntimeNotices')
 
 type NoticeDetails = {
   noticeId: string
@@ -120,8 +122,8 @@ export function ManagedRuntimeNotices() {
         ])
       })
       .catch((cause) => {
-        if (cancelled || isTransientRequestFailure(cause)) return
-        setError(cause instanceof Error ? cause.message : String(cause))
+        if (cancelled || controller.signal.aborted || isTransientRequestFailure(cause)) return
+        log.warn({ event: 'managed_runtime_notices_fetch_failed', profileId, err: cause })
       })
     return () => {
       cancelled = true
@@ -160,7 +162,7 @@ export function ManagedRuntimeNotices() {
     }
   }
 
-  if (!current && !error) return null
+  if (!current) return null
 
   return (
     <section
@@ -169,41 +171,37 @@ export function ManagedRuntimeNotices() {
       className="fixed bottom-3 left-1/2 z-50 w-[min(40rem,calc(100vw-1.5rem))] -translate-x-1/2 rounded-lg border border-amber-500/50 bg-amber-500/10 p-3 shadow-xl"
       role="alert"
     >
-      {current && (
-        <>
-          <div className="flex items-start justify-between gap-3">
-            <div className="min-w-0">
-              <p className="text-sm font-medium">
-                Runtime cleanup needs attention
-              </p>
-              <p className="mt-1 text-sm text-muted-foreground">{current.message}</p>
-              {details && (
-                <p className="mt-2 text-xs text-muted-foreground">
-                  {details.observedCause} {cleanupLabel(details)}
-                </p>
-              )}
-            </div>
-            <div className="flex shrink-0 gap-2">
-              {current.incidentIds.length > 0 && (
-                <button
-                  className="rounded border border-border px-2 py-1 text-xs hover:bg-muted"
-                  onClick={() => void loadDetails()}
-                  type="button"
-                >
-                  Details
-                </button>
-              )}
-              <button
-                className="rounded border border-border px-2 py-1 text-xs hover:bg-muted"
-                onClick={() => void dismiss()}
-                type="button"
-              >
-                Dismiss
-              </button>
-            </div>
-          </div>
-        </>
-      )}
+      <div className="flex items-start justify-between gap-3">
+        <div className="min-w-0">
+          <p className="text-sm font-medium">
+            Runtime cleanup needs attention
+          </p>
+          <p className="mt-1 text-sm text-muted-foreground">{current.message}</p>
+          {details && (
+            <p className="mt-2 text-xs text-muted-foreground">
+              {details.observedCause} {cleanupLabel(details)}
+            </p>
+          )}
+        </div>
+        <div className="flex shrink-0 gap-2">
+          {current.incidentIds.length > 0 && (
+            <button
+              className="rounded border border-border px-2 py-1 text-xs hover:bg-muted"
+              onClick={() => void loadDetails()}
+              type="button"
+            >
+              Details
+            </button>
+          )}
+          <button
+            className="rounded border border-border px-2 py-1 text-xs hover:bg-muted"
+            onClick={() => void dismiss()}
+            type="button"
+          >
+            Dismiss
+          </button>
+        </div>
+      </div>
       {error && <p className="mt-2 text-xs text-destructive">{error}</p>}
     </section>
   )
