@@ -432,13 +432,13 @@ async fn parse_gemini_success_response(response: reqwest::Response) -> Result<St
 }
 
 /// Return the OneCLI classification that permits direct-key fallback. This
-/// deliberately ignores HTTP status classes and accepts only the two exact
-/// top-level JSON error values from a non-success response.
+/// accepts only the two exact top-level JSON error values from a non-success
+/// response, except for HTTP 407 which never authorizes direct-key fallback.
 fn classify_onecli_credential_error(
     status: reqwest::StatusCode,
     body: &[u8],
 ) -> Option<&'static str> {
-    if status.is_success() {
+    if status.is_success() || status == reqwest::StatusCode::PROXY_AUTHENTICATION_REQUIRED {
         return None;
     }
     let value: serde_json::Value = serde_json::from_slice(body).ok()?;
@@ -1139,6 +1139,14 @@ mod tests {
             (
                 axum::http::StatusCode::PROXY_AUTHENTICATION_REQUIRED,
                 "proxy auth",
+            ),
+            (
+                axum::http::StatusCode::PROXY_AUTHENTICATION_REQUIRED,
+                r#"{"error":"credential_not_found"}"#,
+            ),
+            (
+                axum::http::StatusCode::PROXY_AUTHENTICATION_REQUIRED,
+                r#"{"error":"app_not_connected"}"#,
             ),
         ];
 
