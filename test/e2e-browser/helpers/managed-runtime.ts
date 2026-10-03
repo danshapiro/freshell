@@ -160,6 +160,9 @@ export class ManagedRuntimeBrowserRig {
       preserveHomeOnStop: true,
       homeDir: this.webHomeDir,
       env: {
+        // Managed MCP calls back from Docker workloads, so this owned
+        // ephemeral-port server must override RustServer's loopback default.
+        FRESHELL_BIND_HOST: '0.0.0.0',
         FRESHELL_MANAGED_RUNTIME_V1: '1',
         ...(this.freshAgentModes.length > 0
           ? { FRESHELL_MANAGED_FRESH_AGENT_V1: '1' }
