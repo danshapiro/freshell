@@ -6113,6 +6113,101 @@ describe('FreshAgentView', () => {
     expect(wsMock.send).not.toHaveBeenCalledWith(expect.objectContaining({ type: 'freshAgent.kill' }))
   })
 
+  it.each(([
+    ['freshclaude', 'claude'], ['freshcodex', 'codex'], ['freshopencode', 'opencode'],
+  ] as const).flatMap(([sessionType, provider]) => (
+    (['blocked', 'lost'] as const).flatMap((recoveryState) => (
+      (['running', 'starting'] as const).flatMap((status) => (
+        [false, true].map((missingSoul) => ({ sessionType, provider, recoveryState, status, missingSoul }))
+      ))
+    ))
+  )))('loads saved history once for $provider $recoveryState with stale $status (missing soul $missingSoul)', async ({ sessionType, provider, recoveryState, status, missingSoul }) => {
+    vi.useFakeTimers()
+    try {
+      const store = createStore()
+      const sessionId = provider === 'claude' ? CLAUDE_THREAD_ID : 'quiet-history-thread'
+      const locator = { sessionType, provider, sessionId }
+      store.dispatch(sessionInit(locator))
+      store.dispatch(setSessionStatus({ ...locator, status }))
+      apiMock.getFreshAgentThreadSnapshot.mockResolvedValue({
+        status: 'idle', capabilities: { send: true },
+        turns: [{ id: 'quiet-turn', role: 'assistant', items: [{ id: 'quiet-text', kind: 'text', text: 'Retained history while awaiting a decision' }] }],
+      })
+      const content = {
+        kind: 'fresh-agent' as const, ...locator, createRequestId: 'quiet-history-request', status,
+        soulId: missingSoul ? undefined : 'quiet-history-soul', soulIntentRevision: 12,
+        recoverySummary: { desiredState: 'running' as const, recoveryState,
+          durabilityState: 'resume_captured' as const, allocationState: 'verified_durable' as const },
+      }
+      store.dispatch(initLayout({ tabId: 'tab-1', paneId: 'pane-1', content }))
+      await act(async () => {
+        render(<Provider store={store}><StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" /></Provider>)
+        await vi.advanceTimersByTimeAsync(0)
+      })
+      expect(screen.getByText('Retained history while awaiting a decision')).toBeInTheDocument()
+      expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledTimes(1)
+      expect(apiMock.getFreshAgentThreadSnapshot.mock.calls[0][3].soulId).toBe(content.soulId)
+      for (let poll = 0; poll < 5; poll += 1) {
+        await act(async () => { await vi.advanceTimersByTimeAsync(3_000 + SNAPSHOT_DEBOUNCE_MS) })
+      }
+      expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledTimes(1)
+      expect(getFreshAgentPaneContent(store)).toEqual(content)
+      expect(screen.getByTestId('managed-runtime-recovery-card')).toBeInTheDocument()
+      expect(wsMock.send).not.toHaveBeenCalledWith(expect.objectContaining({ type: expect.stringMatching(/^freshAgent\.|^pane\.reconcile/) }))
+    } finally {
+      cleanup()
+      vi.useRealTimers()
+    }
+  })
+
+  it('stops active busy polling on managed intervention and resumes it after recovery', async () => {
+    vi.useFakeTimers()
+    try {
+      const store = createStore()
+      const locator = { sessionType: 'freshcodex' as const, provider: 'codex' as const, sessionId: 'poll-transition-thread' }
+      store.dispatch(sessionInit(locator))
+      store.dispatch(setSessionStatus({ ...locator, status: 'running' }))
+      apiMock.getFreshAgentThreadSnapshot.mockResolvedValue({ status: 'running', turns: [], capabilities: { send: true } })
+      const recoverySummary = { desiredState: 'running' as const, recoveryState: 'live' as const,
+        durabilityState: 'resume_captured' as const, allocationState: 'verified_durable' as const }
+      store.dispatch(initLayout({ tabId: 'tab-1', paneId: 'pane-1', content: {
+        kind: 'fresh-agent', ...locator, createRequestId: 'poll-transition-request', status: 'running',
+        soulId: 'poll-transition-soul', soulIntentRevision: 7, recoverySummary,
+      } }))
+      await act(async () => {
+        render(<Provider store={store}><StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" /></Provider>)
+        await vi.advanceTimersByTimeAsync(0)
+      })
+      const initialReads = apiMock.getFreshAgentThreadSnapshot.mock.calls.length
+      await act(async () => { await vi.advanceTimersByTimeAsync(3_000 + SNAPSHOT_DEBOUNCE_MS) })
+      expect(apiMock.getFreshAgentThreadSnapshot.mock.calls.length).toBeGreaterThan(initialReads)
+      await act(async () => {
+        store.dispatch(updatePaneContent({ tabId: 'tab-1', paneId: 'pane-1', content: {
+          ...getFreshAgentPaneContent(store), recoverySummary: { ...recoverySummary, recoveryState: 'blocked' },
+        } }))
+      })
+      await act(async () => { await vi.advanceTimersByTimeAsync(SNAPSHOT_DEBOUNCE_MS) })
+      const interventionReads = apiMock.getFreshAgentThreadSnapshot.mock.calls.length
+      expect(apiMock.getFreshAgentThreadSnapshot.mock.calls.at(-1)?.[3].soulId).toBe('poll-transition-soul')
+      for (let poll = 0; poll < 5; poll += 1) {
+        await act(async () => { await vi.advanceTimersByTimeAsync(3_000 + SNAPSHOT_DEBOUNCE_MS) })
+      }
+      expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledTimes(interventionReads)
+      await act(async () => {
+        store.dispatch(updatePaneContent({ tabId: 'tab-1', paneId: 'pane-1', content: {
+          ...getFreshAgentPaneContent(store), recoverySummary: { ...recoverySummary, recoveryState: 'recovering' },
+        } }))
+      })
+      await act(async () => { await vi.advanceTimersByTimeAsync(SNAPSHOT_DEBOUNCE_MS) })
+      const resumedReads = apiMock.getFreshAgentThreadSnapshot.mock.calls.length
+      await act(async () => { await vi.advanceTimersByTimeAsync(3_000 + SNAPSHOT_DEBOUNCE_MS) })
+      expect(apiMock.getFreshAgentThreadSnapshot.mock.calls.length).toBeGreaterThan(resumedReads)
+    } finally {
+      cleanup()
+      vi.useRealTimers()
+    }
+  })
+
   it.each([
     ['freshclaude', 'claude', 'blocked'], ['freshclaude', 'claude', 'lost'],
     ['freshcodex', 'codex', 'blocked'], ['freshcodex', 'codex', 'lost'],

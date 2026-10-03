@@ -42,7 +42,7 @@ async function paneContent(page: Page) {
   })
 }
 
-async function installPane(page: Page, kind: PaneKind, recoveryState: RecoveryState, missingSoul = false) {
+async function installPane(page: Page, kind: PaneKind, recoveryState: RecoveryState, missingSoul = false, staleStatus?: 'running' | 'starting') {
   await page.route('**/api/runtime/notices?**', (route) => route.fulfill({ json: { notices: [] } }))
   if (!missingSoul) await page.route('**/api/fresh-agent/threads/**', (route) => route.fulfill({ json: {
     sessionType: 'freshcodex', provider: 'codex', sessionId: SESSION_ID, threadId: SESSION_ID,
@@ -61,7 +61,7 @@ async function installPane(page: Page, kind: PaneKind, recoveryState: RecoverySt
       turn.role === 'assistant' && item.kind === 'text' ? { ...item, text: SAVED_HISTORY_TEXT } : item
     )) })),
   } }))
-  await page.evaluate(({ kind, summary, sessionId, soulId, revision, createRequestId, model, missingSoul }) => {
+  await page.evaluate(({ kind, summary, sessionId, soulId, revision, createRequestId, model, missingSoul, staleStatus }) => {
     const harness = window.__FRESHELL_TEST_HARNESS__!
     const state = harness.getState()
     const tabId = state.tabs.activeTabId!
@@ -75,6 +75,11 @@ async function installPane(page: Page, kind: PaneKind, recoveryState: RecoverySt
     // production managed-recovery guard must stop creates and attaches.
     harness.setFreshAgentNetworkEffectsSuppressed(paneId, true)
     harness.setTerminalNetworkEffectsSuppressed(paneId, summary.recoveryState === 'live' || summary.recoveryState === 'recovering')
+    if (kind === 'fresh-agent' && staleStatus) {
+      const locator = { sessionType: 'freshcodex', provider: 'codex', sessionId }
+      harness.dispatch({ type: 'freshAgent/sessionInit', payload: locator })
+      harness.dispatch({ type: 'freshAgent/setSessionStatus', payload: { ...locator, status: staleStatus } })
+    }
     const managed = {
       soulId: missingSoul ? undefined : soulId, soulIntentRevision: revision, incarnationId: 'contextual-incarnation',
       viewIntentId: 'contextual-view', viewIntentRevision: 4,
@@ -89,8 +94,8 @@ async function installPane(page: Page, kind: PaneKind, recoveryState: RecoverySt
       status: summary.recoveryState === 'live' ? 'running' : 'error',
     } : {
       kind: 'fresh-agent', sessionType: 'freshcodex', provider: 'codex',
-      ...(summary.recoveryState === 'lost' ? {} : { sessionId }),
-      ...identity, ...managed, status: missingSoul ? 'error' : 'idle', model, effort: 'low',
+      ...(summary.recoveryState === 'lost' && !staleStatus ? {} : { sessionId }),
+      ...identity, ...managed, status: staleStatus ?? (missingSoul ? 'error' : 'idle'), model, effort: 'low',
       ...(missingSoul ? { closeError: 'Previous close was not confirmed' } : {}),
       initialCwd: '/tmp', settingsDismissed: true,
     }
@@ -98,8 +103,30 @@ async function installPane(page: Page, kind: PaneKind, recoveryState: RecoverySt
     harness.clearSentWsMessages?.()
   }, {
     kind, summary: recoverySummary(recoveryState), sessionId: SESSION_ID, soulId: SOUL_ID,
-    revision: INTENT_REVISION, createRequestId: CREATE_REQUEST_ID, model: FRESHCODEX_DEFAULT_MODEL, missingSoul,
+    revision: INTENT_REVISION, createRequestId: CREATE_REQUEST_ID, model: FRESHCODEX_DEFAULT_MODEL, missingSoul, staleStatus,
   })
+}
+
+for (const recoveryState of ['blocked', 'lost'] as const) {
+  for (const status of ['running', 'starting'] as const) {
+    test(`fresh-agent: ${recoveryState} stale ${status} reads history once while awaiting intervention`, async ({ freshellPage, page, terminal, harness }) => {
+      await terminal.waitForTerminal()
+      let historyReads = 0
+      page.on('request', (request) => {
+        if (request.url().includes(`/api/runtime/souls/${SOUL_ID}/history`)) historyReads += 1
+      })
+      await installPane(page, 'fresh-agent', recoveryState, false, status)
+      await expect(page.getByText(SAVED_HISTORY_TEXT, { exact: true })).toBeVisible()
+      expect(historyReads).toBe(1)
+      const before = await paneContent(page)
+      await page.waitForTimeout(6_500)
+      expect(historyReads).toBe(1)
+      expect(await paneContent(page)).toEqual(before)
+      await expect(page.getByTestId('managed-runtime-recovery-card')).toBeVisible()
+      const messages = await harness.getSentWsMessages() as Array<{ type?: string }>
+      expect(messages.filter((message) => ['freshAgent.create', 'freshAgent.attach', 'pane.reconcile.request'].includes(message.type ?? ''))).toEqual([])
+    })
+  }
 }
 
 test('fresh-agent: cold lost pane without a soul retains saved history and a close warning after refused start-new', async ({ freshellPage, page, terminal, harness, serverInfo }) => {

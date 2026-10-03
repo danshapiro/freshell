@@ -3379,7 +3379,7 @@ export function FreshAgentView({
   // transport event is missed, the pane self-heals within a few seconds
   // instead of stranding on an empty turn with a stop button.
   useEffect(() => {
-    if (hidden || !paneContent.sessionId) return
+    if (hidden || managedRecoveryDecision || !paneContent.sessionId) return
     // kata b8ke: the runtime-owner transition stops old-kind scheduling
     // IMMEDIATELY — while the canonical session is owned by the other kind,
     // no fallback poll re-arms (the effect re-runs on the divergence flip
@@ -3391,7 +3391,7 @@ export function FreshAgentView({
       requestSnapshotRefresh('poll')
     }, 3000)
     return () => window.clearInterval(timer)
-  }, [effectiveStatus, hidden, isBusy, ownerDivergence, paneContent.sessionId, requestSnapshotRefresh])
+  }, [effectiveStatus, hidden, isBusy, managedRecoveryDecision, ownerDivergence, paneContent.sessionId, requestSnapshotRefresh])
 
   useEffect(() => {
     if (!notice) return
