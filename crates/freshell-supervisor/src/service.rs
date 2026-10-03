@@ -461,8 +461,15 @@ impl Supervisor {
                     )
                     .await
                     .map_err(map_backend)?;
+                // Kilroy uses the Claude transcript contract, with its own session type.
+                let wire_provider =
+                    if agent.provider == freshell_runtime_protocol::FreshProvider::Kilroy {
+                        "claude"
+                    } else {
+                        agent.provider.as_str()
+                    };
                 if snapshot["threadId"].as_str() != Some(native_id)
-                    || snapshot["provider"].as_str() != Some(agent.provider.as_str())
+                    || snapshot["provider"].as_str() != Some(wire_provider)
                 {
                     return Err(RuntimeError::new(
                         RuntimeErrorCode::OwnershipMismatch,

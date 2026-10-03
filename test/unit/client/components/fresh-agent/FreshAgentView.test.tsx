@@ -1,3 +1,5 @@
+import savedCodexTools from '../../../../fixtures/managed-native-history/codex-tools.json'
+import savedClaudeNativeHistory from '../../../../fixtures/managed-native-history/claude.json'
 import savedCodexNativeHistory from '../../../../fixtures/managed-native-history/codex.json'
 import savedOpenCodeNativeHistory from '../../../../fixtures/managed-native-history/opencode.json'
 import { describe, expect, it, vi, beforeEach, afterEach } from 'vitest'
@@ -6079,7 +6081,7 @@ describe('FreshAgentView', () => {
     store.dispatch(initLayout({ tabId: 'tab-1', paneId: 'pane-1', content }))
     render(<Provider store={store}><StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" /></Provider>)
     expect(await screen.findByText('Saved conversation before recovery')).toBeInTheDocument()
-    expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledWith(sessionType, provider, sessionId, expect.objectContaining(provider === 'claude' ? {} : { soulId: 'saved-history-soul' }))
+    expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledWith(sessionType, provider, sessionId, expect.objectContaining({ soulId: 'saved-history-soul' }))
     expect(screen.getByTestId('managed-runtime-recovery-card')).toBeInTheDocument()
     expect(screen.queryByRole('button', { name: /restart sidecar and resume session/i })).not.toBeInTheDocument()
     const layout = store.getState().panes.layouts['tab-1']
@@ -6089,24 +6091,52 @@ describe('FreshAgentView', () => {
     expect(apiMock.retryManagedRuntimeSoul).not.toHaveBeenCalled()
   })
 
-  it.each([['freshcodex', 'codex', savedCodexNativeHistory], ['freshopencode', 'opencode', savedOpenCodeNativeHistory]] as const)(
-    'shows actual history-only binary output on a cold lost %s reload', async (sessionType, provider, captured) => {
+  it.each([
+    ['freshclaude', 'claude', 'lost', savedClaudeNativeHistory],
+    ['freshclaude', 'claude', 'blocked', savedClaudeNativeHistory],
+    ['freshcodex', 'codex', 'lost', savedCodexNativeHistory],
+    ['freshopencode', 'opencode', 'lost', savedOpenCodeNativeHistory],
+  ] as const)(
+    'shows actual history-only binary output on a cold %s/%s %s reload', async (sessionType, provider, recoveryState, captured) => {
       const store = createStore()
       const history = FreshAgentSnapshotSchema.parse(captured)
       apiMock.getFreshAgentThreadSnapshot.mockResolvedValue(history)
       const content = { kind: 'fresh-agent' as const, sessionType, provider, sessionId: history.threadId,
         createRequestId: 'native-reload', status: 'error' as const, soulId: 'durable-native-soul', soulIntentRevision: 7,
-        recoverySummary: { desiredState: 'stopped' as const, recoveryState: 'lost' as const,
+        recoverySummary: { desiredState: 'stopped' as const, recoveryState,
           durabilityState: 'resume_captured' as const, allocationState: 'verified_durable' as const } }
       store.dispatch(initLayout({ tabId: 'tab-1', paneId: 'pane-1', content }))
       render(<Provider store={store}><StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" /></Provider>)
-      expect(await screen.findByText(`Saved native ${provider === 'codex' ? 'Codex' : 'OpenCode'} answer`)).toBeInTheDocument()
+      expect(await screen.findByText(`Saved native ${provider === 'claude' ? 'Claude' : provider === 'codex' ? 'Codex' : 'OpenCode'} answer`)).toBeInTheDocument()
       expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledWith(sessionType, provider, history.threadId, expect.objectContaining({ soulId: content.soulId }))
       expect(getFreshAgentPaneContent(store)).toEqual(content)
       expect(sentFreshAgentMessages('freshAgent.create')).toHaveLength(0)
       expect(sentFreshAgentMessages('freshAgent.attach')).toHaveLength(0)
     },
   )
+
+  it('renders persisted native Codex custom tool invocation and result after cold reload', async () => {
+    const store = createStore()
+    const history = FreshAgentSnapshotSchema.parse(savedCodexTools)
+    apiMock.getFreshAgentThreadSnapshot.mockResolvedValue(history)
+    const content = { kind: 'fresh-agent' as const, sessionType: 'freshcodex' as const, provider: 'codex' as const,
+      sessionId: history.threadId, createRequestId: 'native-tools-reload', status: 'error' as const,
+      soulId: 'tools-soul', soulIntentRevision: 7,
+      recoverySummary: { desiredState: 'stopped' as const, recoveryState: 'lost' as const,
+        durabilityState: 'resume_captured' as const, allocationState: 'verified_durable' as const } }
+    store.dispatch(initLayout({ tabId: 'tab-1', paneId: 'pane-1', content }))
+    render(<Provider store={store}><StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" /></Provider>)
+    fireEvent.click(await screen.findByRole('button', { name: 'Toggle activity details' }))
+    const tool = await screen.findByRole('button', { name: 'apply_patch tool call' })
+    expect(screen.getAllByRole('button', { name: 'apply_patch tool call' })).toHaveLength(1)
+    fireEvent.click(tool)
+    expect(await screen.findByText(/Patch saved/)).toBeInTheDocument()
+    expect(screen.getByText(/\*\*\* Begin Patch/, { selector: 'pre' })).toBeInTheDocument()
+    expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledWith('freshcodex', 'codex', history.threadId, expect.objectContaining({ soulId: content.soulId }))
+    expect(getFreshAgentPaneContent(store)).toEqual(content)
+    expect(sentFreshAgentMessages('freshAgent.create')).toHaveLength(0)
+    expect(sentFreshAgentMessages('freshAgent.attach')).toHaveLength(0)
+  })
 
   it('keeps an initial history read read-only when Retry recovery clears intervention', async () => {
     const store = createStore()

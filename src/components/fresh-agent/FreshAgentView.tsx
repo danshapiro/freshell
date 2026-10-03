@@ -2693,7 +2693,7 @@ export function FreshAgentView({
     const provider = paneContent.provider
     const requestSessionType = paneContent.sessionType
     const requestCreateRequestId = paneContent.createRequestId
-    const requestSoulId = managedRecoveryDecision && (provider === 'codex' || provider === 'opencode') ? paneContent.soulId : undefined
+    const requestSoulId = managedRecoveryDecision ? paneContent.soulId : undefined
     const requestSoulRevision = requestSoulId ? paneContent.soulIntentRevision : undefined
     const isStaleSnapshotRequest = () => (
       paneContentRef.current.createRequestId !== requestCreateRequestId
