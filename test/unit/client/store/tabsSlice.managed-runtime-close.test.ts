@@ -43,6 +43,9 @@ vi.mock('@/lib/api', async (importOriginal) => {
 const wsMock = vi.hoisted(() => ({
   handlers: new Set<(message: unknown) => void>(),
   sent: [] as unknown[],
+  holdPaneOpenedResults: false,
+  paneOpenedResultResolvers: new Map<string, () => void>(),
+  onPaneOpened: undefined as undefined | ((identity: { createRequestId: string; tabId: string }) => void),
 }))
 
 vi.mock('@/lib/ws-client', () => ({
@@ -59,8 +62,16 @@ vi.mock('@/lib/ws-client', () => ({
       }
       if (frame.type === 'pane.opened') {
         const paneFrame = message as { createRequestId?: string }
-        for (const handler of [...wsMock.handlers]) {
-          handler({ type: 'pane.opened.result', createRequestId: paneFrame.createRequestId, success: true })
+        const resolve = () => {
+          for (const handler of [...wsMock.handlers]) {
+            handler({ type: 'pane.opened.result', createRequestId: paneFrame.createRequestId, success: true })
+          }
+        }
+        if (paneFrame.createRequestId && wsMock.holdPaneOpenedResults) {
+          wsMock.paneOpenedResultResolvers.set(paneFrame.createRequestId, resolve)
+        } else resolve()
+        if (paneFrame.createRequestId) {
+          wsMock.onPaneOpened?.({ createRequestId: paneFrame.createRequestId, tabId: (message as { tabId?: string }).tabId ?? '' })
         }
         return
       }
@@ -230,11 +241,125 @@ function deferred<T>() {
   return { promise, resolve, reject }
 }
 
+function createCancelledManagedPaneCloseFixture(layoutWindowId: string) {
+  vi.useFakeTimers()
+  vi.setSystemTime(new Date(100))
+  resetPersistedLayoutCacheForTests()
+
+  const layoutKey = `freshell.layout.v3.${layoutWindowId}`
+  sessionStorage.setItem(LAYOUT_WINDOW_ID_STORAGE_KEY, layoutWindowId)
+  const managedView = view('view-a', 0)
+  let serverSnapshot = inventory(8, [managedView])
+  const managedPaneContent = managedContent(managedView)
+  const splitLayout = {
+    type: 'split', id: 'managed-close-split', direction: 'horizontal', sizes: [50, 50],
+    children: [
+      { type: 'leaf', id: 'managed-pane-0', content: managedPaneContent },
+      { type: 'leaf', id: 'keep-pane', content: { kind: 'browser', browserInstanceId: 'keep-browser', url: 'https://keep.example', devToolsOpen: false } },
+    ],
+  }
+  localStorage.setItem(layoutKey, JSON.stringify({
+    version: 3,
+    persistedAt: 100,
+    tabs: { activeTabId: 'managed-tab', tabs: [{ id: 'managed-tab', title: 'Managed agents', createdAt: 1 }] },
+    panes: { version: 6, layouts: { 'managed-tab': splitLayout }, activePane: { 'managed-tab': 'managed-pane-0' }, paneTitles: {}, paneTitleSetByUser: {} },
+    tombstones: [],
+  }))
+
+  let injectedCloseLayout = false
+  const injectOtherWindowClose = () => (next: (action: any) => any) => (action: any) => {
+    const result = next(action)
+    if (!injectedCloseLayout && action?.type === closePane.type) {
+      injectedCloseLayout = true
+      const otherWindowRaw = JSON.stringify({
+        version: 3,
+        persistedAt: 102,
+        tabs: { activeTabId: 'managed-tab', tabs: [{ id: 'managed-tab', title: 'Managed agents', createdAt: 1 }] },
+        panes: { version: 6, layouts: { 'managed-tab': { type: 'leaf', id: 'managed-pane-0', content: managedPaneContent } }, activePane: { 'managed-tab': 'managed-pane-0' }, paneTitles: {}, paneTitleSetByUser: {} },
+        tombstones: [],
+      })
+      localStorage.setItem(layoutKey, otherWindowRaw)
+      window.dispatchEvent(new StorageEvent('storage', { key: layoutKey, newValue: otherWindowRaw }))
+    }
+    return result
+  }
+
+  const store = createStore(['view-a'], serverSnapshot, [persistMiddleware as any, injectOtherWindowClose as any])
+  store.dispatch(splitPane({
+    tabId: 'managed-tab',
+    paneId: 'managed-pane-0',
+    direction: 'horizontal',
+    newPaneId: 'keep-pane',
+    newContent: { kind: 'browser', browserInstanceId: 'keep-browser', url: 'https://keep.example', devToolsOpen: false },
+  }))
+  apiMocks.getManagedRuntimeInventory.mockImplementation(async () => serverSnapshot)
+  apiMocks.updateManagedRuntimeViewVisibility.mockImplementation(async (viewId: string, visibility: ManagedRuntimeViewIntent['visibility']) => {
+    serverSnapshot = withVisibility(serverSnapshot, viewId, visibility)
+    return serverSnapshot.viewIntents.find((entry) => entry.viewId === viewId)
+  })
+  const cleanupSync = installCrossTabSync(store as any)
+
+  const tombstone = (keepSiblingRepresentation = false) => {
+    const siblingLayout = {
+      type: 'leaf',
+      id: 'sibling-pane',
+      content: managedPaneContent,
+    }
+    const tombstonedRaw = JSON.stringify({
+      version: 3,
+      persistedAt: 103,
+      tabs: {
+        activeTabId: keepSiblingRepresentation ? 'sibling-tab' : 'unrelated-tab',
+        tabs: keepSiblingRepresentation
+          ? [
+            { id: 'sibling-tab', title: 'Sibling representation', createdAt: 2 },
+            { id: 'unrelated-tab', title: 'Unrelated tab', createdAt: 3 },
+          ]
+          : [{ id: 'unrelated-tab', title: 'Unrelated tab', createdAt: 2 }],
+      },
+      panes: {
+        version: 6,
+        layouts: keepSiblingRepresentation ? { 'sibling-tab': siblingLayout } : {},
+        activePane: keepSiblingRepresentation ? { 'sibling-tab': 'sibling-pane' } : {},
+        paneTitles: {},
+        paneTitleSetByUser: {},
+      },
+      tombstones: [{ id: 'managed-tab', deletedAt: 102 }],
+    })
+    localStorage.setItem(layoutKey, tombstonedRaw)
+    window.dispatchEvent(new StorageEvent('storage', { key: layoutKey, newValue: tombstonedRaw }))
+  }
+
+  const cleanup = () => {
+    cleanupSync()
+    clearLocalClosePersistencePending()
+    resetAuthoritativeLocalLayoutPersistedAtForTests()
+    resetPersistedLayoutCacheForTests()
+    resetPersistFlushListenersForTests()
+    resetPersistBroadcastForTests()
+    localStorage.clear()
+    sessionStorage.removeItem(LAYOUT_WINDOW_ID_STORAGE_KEY)
+    vi.useRealTimers()
+  }
+  return {
+    store,
+    managedPaneContent,
+    startClose: () => store.dispatch(closePaneWithCleanup({ tabId: 'managed-tab', paneId: 'managed-pane-0' })),
+    tombstone,
+    cleanup,
+    getServerSnapshot: () => serverSnapshot,
+    setServerSnapshot: (snapshot: ManagedRuntimeInventorySnapshot) => { serverSnapshot = snapshot },
+  }
+}
+
 describe('closeTab managed runtime visibility', () => {
   beforeEach(() => {
     vi.clearAllMocks()
     wsMock.handlers.clear()
     wsMock.sent = []
+    wsMock.holdPaneOpenedResults = false
+    wsMock.paneOpenedResultResolvers.clear()
+    wsMock.onPaneOpened = undefined
     resetManagedRuntimeRefreshForTest()
   })
 
@@ -2253,6 +2378,180 @@ describe('closeTab managed runtime visibility', () => {
       localStorage.clear()
       sessionStorage.removeItem(LAYOUT_WINDOW_ID_STORAGE_KEY)
       vi.useRealTimers()
+    }
+  })
+
+  it('does not reopen managed state when a tab is tombstoned during close compensation inventory lookup', async () => {
+    const fixture = createCancelledManagedPaneCloseFixture('managed-close-inventory-tombstone')
+    const compensationInventoryStarted = deferred<void>()
+    const finishCompensationInventory = deferred<ManagedRuntimeInventorySnapshot>()
+    let inventoryCalls = 0
+    apiMocks.getManagedRuntimeInventory.mockImplementation(() => {
+      inventoryCalls += 1
+      if (inventoryCalls === 3) {
+        compensationInventoryStarted.resolve()
+        return finishCompensationInventory.promise
+      }
+      return Promise.resolve(fixture.getServerSnapshot())
+    })
+
+    let closing: Promise<unknown> | undefined
+    try {
+      closing = fixture.startClose()
+      await compensationInventoryStarted.promise
+
+      expect(fixture.store.getState().tabs.tabs.some((tab) => tab.id === 'managed-tab')).toBe(true)
+      expect(fixture.store.getState().panes.layouts['managed-tab']).toMatchObject({
+        type: 'leaf', id: 'managed-pane-0', content: { viewIntentId: 'view-a' },
+      })
+
+      expect(wsMock.sent.some((message: any) => (
+        message.type === 'pane.opened' && message.createRequestId === fixture.managedPaneContent.createRequestId
+      ))).toBe(false)
+
+      fixture.tombstone()
+
+      expect(fixture.store.getState().tabs.tabs.some((tab) => tab.id === 'managed-tab')).toBe(false)
+      expect(fixture.store.getState().panes.layouts['managed-tab']).toMatchObject({
+        type: 'leaf', id: 'managed-pane-0', content: { viewIntentId: 'view-a' },
+      })
+
+      finishCompensationInventory.resolve(fixture.getServerSnapshot())
+      await closing
+
+      expect(fixture.store.getState().tabs.tabs.some((tab) => tab.id === 'managed-tab')).toBe(false)
+      expect(fixture.getServerSnapshot().viewIntents[0]?.visibility).toBe('detached')
+      expect(apiMocks.updateManagedRuntimeViewVisibility).toHaveBeenCalledTimes(1)
+      expect(apiMocks.updateManagedRuntimeViewVisibility).toHaveBeenCalledWith('view-a', 'detached', 2, 5)
+      expect(wsMock.sent.some((message: any) => (
+        message.type === 'pane.opened' && message.createRequestId === fixture.managedPaneContent.createRequestId
+      ))).toBe(false)
+    } finally {
+      finishCompensationInventory.resolve(fixture.getServerSnapshot())
+      await Promise.allSettled([closing].filter(Boolean) as Promise<unknown>[])
+      fixture.cleanup()
+    }
+  })
+
+  it.each(['pane.opened acknowledgement', 'visible mutation'] as const)(
+    'recloses and detaches when the tab is tombstoned during the %s await',
+    async (boundary) => {
+      const fixture = createCancelledManagedPaneCloseFixture(`managed-close-late-${boundary.replaceAll(/[ .]/g, '-')}`)
+      const paneOpened = deferred<void>()
+      const compensationInventoryStarted = deferred<void>()
+      const finishCompensationInventory = deferred<ManagedRuntimeInventorySnapshot>()
+      const visiblePatchStarted = deferred<void>()
+      const finishVisiblePatch = deferred<void>()
+      let inventoryCalls = 0
+      apiMocks.getManagedRuntimeInventory.mockImplementation(() => {
+        inventoryCalls += 1
+        if (boundary === 'pane.opened acknowledgement' && inventoryCalls === 3) {
+          compensationInventoryStarted.resolve()
+          return finishCompensationInventory.promise
+        }
+        return Promise.resolve(fixture.getServerSnapshot())
+      })
+      wsMock.holdPaneOpenedResults = boundary === 'pane.opened acknowledgement'
+      wsMock.onPaneOpened = ({ createRequestId }) => {
+        if (createRequestId === fixture.managedPaneContent.createRequestId) paneOpened.resolve()
+      }
+      apiMocks.updateManagedRuntimeViewVisibility.mockImplementation(async (
+        viewId: string,
+        visibility: ManagedRuntimeViewIntent['visibility'],
+      ) => {
+        if (boundary === 'visible mutation' && visibility === 'visible') {
+          visiblePatchStarted.resolve()
+          await finishVisiblePatch.promise
+        }
+        const updatedSnapshot = withVisibility(fixture.getServerSnapshot(), viewId, visibility)
+        fixture.setServerSnapshot(updatedSnapshot)
+        return updatedSnapshot.viewIntents.find((entry) => entry.viewId === viewId)
+      })
+
+      let closing: Promise<unknown> | undefined
+      try {
+        closing = fixture.startClose()
+        if (boundary === 'pane.opened acknowledgement') {
+          await compensationInventoryStarted.promise
+          expect(fixture.store.getState().tabs.tabs.some((tab) => tab.id === 'managed-tab')).toBe(true)
+          finishCompensationInventory.resolve(fixture.getServerSnapshot())
+          await vi.waitFor(() => expect(wsMock.sent.some((message: any) => (
+            message.type === 'pane.opened'
+            && message.createRequestId === fixture.managedPaneContent.createRequestId
+          ))).toBe(true))
+          await paneOpened.promise
+          fixture.tombstone()
+          wsMock.paneOpenedResultResolvers.get(fixture.managedPaneContent.createRequestId)?.()
+        } else {
+          await visiblePatchStarted.promise
+          fixture.tombstone()
+          finishVisiblePatch.resolve()
+        }
+        await closing
+
+        expect(fixture.store.getState().tabs.tabs.some((tab) => tab.id === 'managed-tab')).toBe(false)
+        expect(fixture.getServerSnapshot().viewIntents[0]?.visibility).toBe('detached')
+        expect(apiMocks.updateManagedRuntimeViewVisibility.mock.calls.map((call) => call[1])).toEqual(
+          boundary === 'pane.opened acknowledgement'
+            ? ['detached']
+            : ['detached', 'visible', 'detached'],
+        )
+        expect(wsMock.sent.filter((message: any) => (
+          message.type === 'pane.closed' && message.createRequestId === fixture.managedPaneContent.createRequestId
+        ))).toHaveLength(2)
+      } finally {
+        finishCompensationInventory.resolve(fixture.getServerSnapshot())
+        finishVisiblePatch.resolve()
+        wsMock.paneOpenedResultResolvers.get(fixture.managedPaneContent.createRequestId)?.()
+        await Promise.allSettled([closing].filter(Boolean) as Promise<unknown>[])
+        fixture.cleanup()
+      }
+    },
+  )
+
+  it('keeps a sibling exact managed view visible when the canceled pane is tombstoned during its visible mutation', async () => {
+    const fixture = createCancelledManagedPaneCloseFixture('managed-close-sibling-representation')
+    const visiblePatchStarted = deferred<void>()
+    const finishVisiblePatch = deferred<void>()
+    apiMocks.updateManagedRuntimeViewVisibility.mockImplementation(async (
+      viewId: string,
+      visibility: ManagedRuntimeViewIntent['visibility'],
+    ) => {
+      if (visibility === 'visible') {
+        visiblePatchStarted.resolve()
+        await finishVisiblePatch.promise
+      }
+      const updatedSnapshot = withVisibility(fixture.getServerSnapshot(), viewId, visibility)
+      fixture.setServerSnapshot(updatedSnapshot)
+      return updatedSnapshot.viewIntents.find((entry) => entry.viewId === viewId)
+    })
+
+    let closing: Promise<unknown> | undefined
+    try {
+      closing = fixture.startClose()
+      await visiblePatchStarted.promise
+      fixture.tombstone(true)
+      finishVisiblePatch.resolve()
+      await closing
+
+      expect(fixture.store.getState().tabs.tabs.map((tab) => tab.id)).toContain('sibling-tab')
+      expect(fixture.store.getState().panes.layouts['sibling-tab']).toMatchObject({
+        type: 'leaf', id: 'sibling-pane', content: { viewIntentId: 'view-a' },
+      })
+      expect(fixture.getServerSnapshot().viewIntents[0]?.visibility).toBe('visible')
+      expect(apiMocks.updateManagedRuntimeViewVisibility.mock.calls.map((call) => call[1])).toEqual(['detached', 'visible'])
+      expect(wsMock.sent.filter((message: any) => (
+        message.type === 'pane.closed' && message.createRequestId === fixture.managedPaneContent.createRequestId
+      ))).toHaveLength(1)
+      expect(wsMock.sent.some((message: any) => (
+        message.type === 'pane.opened'
+        && message.tabId === 'sibling-tab'
+        && message.createRequestId === fixture.managedPaneContent.createRequestId
+      ))).toBe(true)
+    } finally {
+      finishVisiblePatch.resolve()
+      await Promise.allSettled([closing].filter(Boolean) as Promise<unknown>[])
+      fixture.cleanup()
     }
   })
 

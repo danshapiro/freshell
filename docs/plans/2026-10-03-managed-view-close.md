@@ -351,6 +351,19 @@ the queue; the orphan receives neither `pane.opened` nor a visible promotion.
 The nine focused suites passed (384 tests), client typecheck and
 `git diff --check` passed. Independent review of this repair is pending.
 
+**Task 2 review 6 repair (2026-10-03):** Close compensation now fetches and
+applies managed inventory inside the visibility queue, then checks that the
+original tab and exact pane identity still exist before sending pane-open
+evidence. It waits for the correlated pane-open result and rechecks after that
+acknowledgement and after the visibility update plus confirming inventory
+read. If the original tab disappears, compensation recloses each exact pane
+identity and detaches its view only when no active exact view representation
+remains; a sibling representation is reopened and kept visible. Regressions
+cover tombstones during inventory lookup, pane-open acknowledgement, and the
+visible update, plus preservation of a surviving sibling representation.
+Thirteen focused suites passed (433 tests), client typecheck and
+`git diff --check` passed. Independent review of this repair is pending.
+
 ## Task 3: Reopen only from current identity and clear close evidence
 
 **Files:**

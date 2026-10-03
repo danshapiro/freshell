@@ -26,7 +26,16 @@ import {
   shouldKeepClosedTab,
 } from '@/lib/tab-registry-snapshot'
 import { UNKNOWN_SERVER_INSTANCE_ID } from './tabRegistryConstants'
-import { KILL_ACK_TIMEOUT_MS, PANE_CLOSE_ACK_TIMEOUT_MESSAGE, PANE_CLOSE_FAILED_MESSAGE, PANE_CLOSE_REMOVAL_REFUSED_MESSAGE, sendPaneClosedAndAwait, sendPaneOpened, sendPanesClosedAndAwait } from '@/lib/kill-ack'
+import {
+  KILL_ACK_TIMEOUT_MS,
+  PANE_CLOSE_ACK_TIMEOUT_MESSAGE,
+  PANE_CLOSE_FAILED_MESSAGE,
+  PANE_CLOSE_REMOVAL_REFUSED_MESSAGE,
+  sendPaneClosedAndAwait,
+  sendPaneOpened,
+  sendPaneOpenedAndAwait,
+  sendPanesClosedAndAwait,
+} from '@/lib/kill-ack'
 import { collectSessionPaneIdentities, collectPaneContents, collectPaneEntries, findPaneContent } from '@/lib/pane-utils'
 import { markPaneCloseEvidenceConfirmed } from '@/lib/pane-close-evidence-marks'
 import type { RootState } from './store'
@@ -2391,6 +2400,7 @@ async function persistManagedViewVisibility(
   getState: () => RootState,
   options: {
     initialSnapshot?: ManagedRuntimeInventorySnapshot
+    afterVisibilityMutation?: () => boolean
   } = {},
 ): Promise<void> {
   if (viewIntentIds.length === 0) return
@@ -2427,6 +2437,7 @@ async function persistManagedViewVisibility(
       mutationError = error
       break
     }
+    if (options.afterVisibilityMutation && !options.afterVisibilityMutation()) break
   }
 
   let confirmedSnapshot: ManagedRuntimeInventorySnapshot
@@ -2467,10 +2478,10 @@ async function persistManagedViewVisibility(
 
 /**
  * A same-key close can be canceled at its final persistence boundary. In that
- * case cross-window replay runs when the close freeze is released and can
- * restore the original pane after this thunk has already recorded it closed
- * and detached its managed view. Reconcile those side effects only for the
- * exact original pane identities that replay left displayed.
+ * case cross-window replay can restore the original pane after this thunk has
+ * already recorded it closed and detached its managed view. Reconcile those
+ * side effects at each async boundary, using exact active pane/view identity
+ * so a tombstone cannot leave an orphan open or hide a surviving sibling.
  */
 async function reconcileManagedCloseAfterReplay(
   options: {
@@ -2514,6 +2525,33 @@ async function reconcileManagedCloseAfterReplay(
     }
     return [...viewIntentIds]
   }
+  const getStillRepresentedCloseIdentities = (state: RootState): PaneCloseIdentity[] => {
+    if (!state.tabs.tabs.some((tab) => tab.id === tabId)) return []
+    const layout = state.panes.layouts[tabId]
+    return paneTargets.flatMap(({ paneId, identity }) => {
+      const content = layout ? findPaneContent(layout, paneId) : null
+      if (!samePaneCloseTargetIdentity(identity, content)) return []
+      return closeIdentities.filter((closeIdentity) => closeIdentity.paneId === paneId)
+    })
+  }
+  const activeRepresentationsForView = (state: RootState, viewIntentId: string) => {
+    let represented = false
+    const paneIdentities = new Map<string, { createRequestId: string; tabId: string }>()
+    for (const tab of state.tabs.tabs) {
+      if (tab.viewIntentId === viewIntentId) represented = true
+      const layout = state.panes.layouts[tab.id]
+      if (!layout) continue
+      for (const { content } of collectPaneEntries(layout)) {
+        if (content.kind !== 'terminal' || content.viewIntentId !== viewIntentId) continue
+        represented = true
+        if (content.createRequestId) {
+          const key = `${tab.id}:${content.createRequestId}`
+          paneIdentities.set(key, { createRequestId: content.createRequestId, tabId: tab.id })
+        }
+      }
+    }
+    return { represented, paneIdentities: [...paneIdentities.values()] }
+  }
 
   const currentState = getState()
   // Pane hydration is independent from tab hydration. A tombstoned tab can
@@ -2524,15 +2562,10 @@ async function reconcileManagedCloseAfterReplay(
   const initialViewIntentIds = getStillRepresentedViewIds(currentState)
   const reassertRestoredPaneEvidence = (state: RootState) => {
     if (!state.tabs.tabs.some((tab) => tab.id === tabId)) return
-    const layout = state.panes.layouts[tabId]
-    const restoredPaneIds = new Set(paneTargets.flatMap(({ paneId, identity }) => {
-      const content = layout ? findPaneContent(layout, paneId) : null
-      return samePaneCloseTargetIdentity(identity, content) ? [paneId] : []
-    }))
     reassertKeptPanesOpen(
-      layout,
+      state.panes.layouts[tabId],
       tabId,
-      closeIdentities.filter(({ paneId }) => restoredPaneIds.has(paneId)),
+      getStillRepresentedCloseIdentities(state),
     )
   }
   if (initialViewIntentIds.length === 0) {
@@ -2547,10 +2580,195 @@ async function reconcileManagedCloseAfterReplay(
       // evidence or making any view visible.
       const stateAfterAcquire = getState()
       if (!stateAfterAcquire.tabs.tabs.some((tab) => tab.id === tabId)) return
-      reassertRestoredPaneEvidence(stateAfterAcquire)
       const currentViewIntentIds = getStillRepresentedViewIds(stateAfterAcquire)
-      if (currentViewIntentIds.length === 0) return
-      await persistManagedViewVisibility(currentViewIntentIds, 'visible', dispatch, getState)
+      if (currentViewIntentIds.length === 0) {
+        reassertRestoredPaneEvidence(stateAfterAcquire)
+        return
+      }
+
+      const representationWasRestored = (state: RootState) => (
+        getStillRepresentedCloseIdentities(state).length > 0
+      )
+      const reconcileViewAfterOriginalDisappears = async (viewIntentId: string): Promise<void> => {
+        const ensureVisibleForCurrentRepresentation = async (): Promise<boolean> => {
+          const openedIdentities = new Set<string>()
+          let active = activeRepresentationsForView(getState(), viewIntentId)
+          if (!active.represented) return false
+          while (true) {
+            active = activeRepresentationsForView(getState(), viewIntentId)
+            if (!active.represented) return false
+            const identity = active.paneIdentities.find((candidate) => {
+              const key = `${candidate.tabId}:${candidate.createRequestId}`
+              return !openedIdentities.has(key)
+            })
+            if (!identity) break
+            const identityKey = `${identity.tabId}:${identity.createRequestId}`
+            openedIdentities.add(identityKey)
+            const ack = await sendPaneOpenedAndAwait(identity)
+            active = activeRepresentationsForView(getState(), viewIntentId)
+            if (!ack.ok || !active.represented) return false
+          }
+          active = activeRepresentationsForView(getState(), viewIntentId)
+          if (!active.represented) return false
+          await persistManagedViewVisibility([viewIntentId], 'visible', dispatch, getState, {
+            afterVisibilityMutation: () => activeRepresentationsForView(getState(), viewIntentId).represented,
+          })
+          return activeRepresentationsForView(getState(), viewIntentId).represented
+        }
+
+        if (await ensureVisibleForCurrentRepresentation()) return
+
+        let current = getState()
+        let active = activeRepresentationsForView(current, viewIntentId)
+        if (active.represented) return
+        const closeIdentitiesForView = new Map<string, PaneCloseIdentity>()
+        for (const sourcePane of paneTargets) {
+          if (!resolution.viewIntentIdsByPane[sourcePane.paneId]?.includes(viewIntentId)) continue
+          for (const identity of closeIdentities.filter(({ paneId }) => paneId === sourcePane.paneId)) {
+            closeIdentitiesForView.set(identity.createRequestId, identity)
+          }
+        }
+        for (const closeIdentity of closeIdentitiesForView.values()) {
+          current = getState()
+          active = activeRepresentationsForView(current, viewIntentId)
+          if (active.represented) {
+            if (await ensureVisibleForCurrentRepresentation()) return
+            current = getState()
+            active = activeRepresentationsForView(current, viewIntentId)
+            if (active.represented) return
+          }
+          const ack = await sendPaneClosedAndAwait(closeIdentity)
+          if (!ack.ok) return
+          current = getState()
+          active = activeRepresentationsForView(current, viewIntentId)
+          if (active.represented) {
+            if (await ensureVisibleForCurrentRepresentation()) return
+            current = getState()
+            active = activeRepresentationsForView(current, viewIntentId)
+            if (active.represented) return
+          }
+        }
+
+        current = getState()
+        active = activeRepresentationsForView(current, viewIntentId)
+        if (active.represented) {
+          if (await ensureVisibleForCurrentRepresentation()) return
+          current = getState()
+          active = activeRepresentationsForView(current, viewIntentId)
+          if (active.represented) return
+        }
+        await persistManagedViewVisibility([viewIntentId], 'detached', dispatch, getState, {
+          afterVisibilityMutation: () => !activeRepresentationsForView(getState(), viewIntentId).represented,
+        })
+        current = getState()
+        active = activeRepresentationsForView(current, viewIntentId)
+        if (active.represented) await ensureVisibleForCurrentRepresentation()
+      }
+
+      let initialSnapshot: ManagedRuntimeInventorySnapshot
+      try {
+        // Take inventory inside the serialized transition, then recheck the
+        // exact original pane before sending open evidence. A tab tombstone
+        // can land while this request is in flight and leave only an orphan
+        // pane layout in Redux.
+        initialSnapshot = await getManagedRuntimeInventory()
+      } catch (error) {
+        const stateAfterFailedInventory = getState()
+        if (representationWasRestored(stateAfterFailedInventory)) {
+          for (const identity of getStillRepresentedCloseIdentities(stateAfterFailedInventory)) {
+            const ack = await sendPaneOpenedAndAwait({
+              createRequestId: identity.createRequestId,
+              tabId,
+            })
+            const stateAfterOpen = getState()
+            const identityStillDisplayed = getStillRepresentedCloseIdentities(stateAfterOpen).some((candidate) => (
+              candidate.paneId === identity.paneId
+              && candidate.createRequestId === identity.createRequestId
+            ))
+            if (!identityStillDisplayed) {
+              for (const viewIntentId of currentViewIntentIds) {
+                await reconcileViewAfterOriginalDisappears(viewIntentId)
+              }
+              break
+            }
+            if (!ack.ok) break
+          }
+        }
+        throw error
+      }
+      applyManagedRuntimeInventory(initialSnapshot, dispatch, getState)
+
+      const stateAfterInventory = getState()
+      if (!representationWasRestored(stateAfterInventory)) {
+        // If the original pane disappeared but an exact view representation
+        // remains in another active tab, preserve that representation. If no
+        // active representation remains, the original close already left
+        // the view detached and its close evidence intact.
+        for (const viewIntentId of currentViewIntentIds) {
+          if (activeRepresentationsForView(getState(), viewIntentId).represented) {
+            await reconcileViewAfterOriginalDisappears(viewIntentId)
+          }
+        }
+        return
+      }
+
+      for (const originalIdentity of getStillRepresentedCloseIdentities(stateAfterInventory)) {
+        const latest = getState()
+        const exactIdentityRemains = getStillRepresentedCloseIdentities(latest).some((candidate) => (
+          candidate.paneId === originalIdentity.paneId
+          && candidate.createRequestId === originalIdentity.createRequestId
+        ))
+        if (!exactIdentityRemains) {
+          for (const viewIntentId of currentViewIntentIds) {
+            await reconcileViewAfterOriginalDisappears(viewIntentId)
+          }
+          return
+        }
+        const ack = await sendPaneOpenedAndAwait({
+          createRequestId: originalIdentity.createRequestId,
+          tabId,
+        })
+        const stateAfterOpen = getState()
+        const exactIdentityStillRemains = getStillRepresentedCloseIdentities(stateAfterOpen).some((candidate) => (
+          candidate.paneId === originalIdentity.paneId
+          && candidate.createRequestId === originalIdentity.createRequestId
+        ))
+        if (!exactIdentityStillRemains) {
+          for (const viewIntentId of currentViewIntentIds) {
+            await reconcileViewAfterOriginalDisappears(viewIntentId)
+          }
+          return
+        }
+        if (!ack.ok) return
+      }
+
+      const stateBeforeVisibility = getState()
+      const visibleViewIntentIds = getStillRepresentedViewIds(stateBeforeVisibility)
+      if (!representationWasRestored(stateBeforeVisibility) || visibleViewIntentIds.length === 0) {
+        for (const viewIntentId of currentViewIntentIds) {
+          await reconcileViewAfterOriginalDisappears(viewIntentId)
+        }
+        return
+      }
+
+      try {
+        await persistManagedViewVisibility(visibleViewIntentIds, 'visible', dispatch, getState, {
+          initialSnapshot,
+          afterVisibilityMutation: () => representationWasRestored(getState()),
+        })
+      } catch (error) {
+        if (!representationWasRestored(getState())) {
+          for (const viewIntentId of visibleViewIntentIds) {
+            await reconcileViewAfterOriginalDisappears(viewIntentId)
+          }
+        }
+        throw error
+      }
+      if (!representationWasRestored(getState())) {
+        for (const viewIntentId of visibleViewIntentIds) {
+          await reconcileViewAfterOriginalDisappears(viewIntentId)
+        }
+      }
     })
   } catch (error) {
     log.warn('could not reconcile managed close state after shared-layout replay', {

@@ -444,6 +444,22 @@ export function sendPaneOpened(
   })
 }
 
+/** Send an open re-assertion and wait for its correlated durable result. */
+export function sendPaneOpenedAndAwait(
+  identity: { createRequestId: string; tabId: string },
+  opts?: { timeoutMs?: number; send?: (msg: unknown) => void },
+): Promise<KillAck> {
+  const wait = awaitCloseFrame((msg) => {
+    const m = msg as Record<string, unknown>
+    if (m.type === 'pane.opened.result' && m.createRequestId === identity.createRequestId) {
+      return { ok: m.success !== false, error: typeof m.error === 'string' ? m.error : undefined }
+    }
+    return null
+  }, opts?.timeoutMs ?? KILL_ACK_TIMEOUT_MS)
+  sendPaneOpened(identity, opts)
+  return wait
+}
+
 /**
  * The per-ready OPEN re-assertion sweep (focused-episode-7 round 3, Finding
  * F2): on every ws `ready` (first connect AND every reconnect), assert every
