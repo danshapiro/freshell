@@ -9,6 +9,7 @@ import panesReducer, {
   resetFreshAgentPaneForReconcileCreate,
   clearReconcileWarming,
 } from '@/store/panesSlice'
+import tabsReducer, { addTab } from '@/store/tabsSlice'
 import type { DeadSessionEntry, PaneNode, ReconcileWarmingState } from '@/store/paneTypes'
 import { buildRestoreError } from '@shared/session-contract'
 import { DeadSessionPanel } from '@/components/DeadSessionPanel'
@@ -105,14 +106,19 @@ function renderWithStore(opts: {
       ...(opts.reconcileWarming?.paneRefs ?? []).map((r) => r.paneId),
     ])]
   const captured: string[] = []
+  const tabs = tabsReducer(
+    { tabs: [], activeTabId: null, renameRequestTabId: null, tombstones: [] },
+    addTab({ id: 'tab-1', status: 'running' }),
+  )
   const store = configureStore({
-    reducer: { panes: panesReducer },
+    reducer: { panes: panesReducer, tabs: tabsReducer },
     middleware: (getDefault) =>
       getDefault().concat(() => (next) => (action: any) => {
         if (typeof action?.type === 'string') captured.push(action.type)
         return next(action)
       }),
     preloadedState: {
+      tabs,
       panes: {
         layouts: paneIds.length > 0 ? { 'tab-1': layoutFor(paneIds, opts.extraContentByPane ?? {}) } : {},
         activePane: {},
