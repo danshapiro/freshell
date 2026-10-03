@@ -494,3 +494,71 @@ async fn restored_web_reads_exact_persisted_lost_native_history_without_starting
     control.abort();
     let _ = control.await;
 }
+
+#[tokio::test]
+async fn unavailable_runtime_and_invalid_mutation_keep_their_http_error_contracts() {
+    let root = tempfile::tempdir().unwrap();
+    let (tx, _) = tokio::sync::broadcast::channel(16);
+    let router = router(
+        ManagedRuntimeApiState::new(
+            Arc::new("web-token".into()),
+            None,
+            None,
+            Arc::new(PaneLedger::new(Some(root.path().join("ledger")))),
+            Arc::new(tx),
+        )
+        .await
+        .unwrap(),
+    );
+    for (method, uri, body, status, error) in [
+        (
+            "GET",
+            "/api/runtime/souls/retained-soul/history",
+            None,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Managed runtime unavailable",
+        ),
+        (
+            "POST",
+            "/api/runtime/souls/retained-soul/stop",
+            Some(json!({"expectedIntentRevision":1})),
+            StatusCode::BAD_REQUEST,
+            "requestId is required",
+        ),
+        (
+            "POST",
+            "/api/runtime/souls/retained-soul/stop",
+            Some(json!({"requestId":" ","expectedIntentRevision":1})),
+            StatusCode::BAD_REQUEST,
+            "requestId is required",
+        ),
+        (
+            "POST",
+            "/api/runtime/souls/retained-soul/stop",
+            Some(json!({"requestId":"valid-request","expectedIntentRevision":1})),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Managed runtime unavailable",
+        ),
+    ] {
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(method)
+                    .uri(uri)
+                    .header("x-auth-token", "web-token")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        body.map(|body| body.to_string()).unwrap_or_default(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), status);
+        let body: serde_json::Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(body, json!({"error":error}));
+    }
+}
