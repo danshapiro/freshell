@@ -79,6 +79,102 @@ fn history_binary_reads_exact_saved_codex_rollout_without_a_runtime() {
 }
 
 #[test]
+fn history_binary_reads_supported_codex_task_event_transcript() {
+    let home = tempfile::tempdir().unwrap();
+    let root = home.path().join(".codex/sessions/2026/10/03");
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(
+        root.join("rollout-2026-10-03-session-activity.jsonl"),
+        include_str!("../../../test/fixtures/coding-cli/codex/task-events.sanitized.jsonl"),
+    )
+    .unwrap();
+    let result = history(home.path(), "codex", "session-activity");
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let body: Value = serde_json::from_slice(&result.stdout).unwrap();
+    assert_eq!(body["threadId"], "session-activity");
+    assert_eq!(body["turns"].as_array().unwrap().len(), 2);
+    assert_eq!(body["turns"][0]["role"], "user");
+    assert_eq!(body["turns"][0]["items"][0]["text"], "Sanitized prompt");
+    assert_eq!(body["turns"][1]["role"], "assistant");
+    assert_eq!(body["turns"][1]["items"][0]["text"], "Sanitized completion");
+    assert_eq!(body["capabilities"]["send"], false);
+}
+
+#[test]
+fn history_binary_deduplicates_codex_message_mirrors_in_either_record_order() {
+    for modern_first in [false, true] {
+        let home = tempfile::tempdir().unwrap();
+        let root = home.path().join(".codex/sessions/2026/10/03");
+        std::fs::create_dir_all(&root).unwrap();
+        let mut rows = vec![json!({"type":"session_meta","payload":{"id":"mixed-messages"}})];
+        for turn in 0..4 {
+            rows.push(
+                json!({"type":"turn_context","payload":{"turn_id":format!("mixed-turn-{turn}")}}),
+            );
+            for (role, event_type, text_key, text) in [
+                ("user", "user_message", "message", "Repeated saved prompt"),
+                (
+                    "assistant",
+                    "task_complete",
+                    "last_agent_message",
+                    "Repeated saved answer",
+                ),
+            ] {
+                let modern = json!({"type":"response_item","payload":{"type":"message","role":role,
+                    "id":format!("{role}-{turn}"),"content":[{"type":if role == "user" {"input_text"} else {"output_text"},"text":text}]}});
+                let legacy = json!({"type":"event_msg","payload":{"type":event_type,
+                    "turn_id":format!("mixed-turn-{turn}"),text_key:text}});
+                if turn == 2 {
+                    rows.push(legacy);
+                } else if turn == 3 {
+                    rows.push(modern);
+                } else if modern_first {
+                    rows.extend([modern, legacy]);
+                } else {
+                    rows.extend([legacy, modern]);
+                }
+            }
+        }
+        std::fs::write(
+            root.join("rollout-2026-10-03-mixed-messages.jsonl"),
+            rows.iter()
+                .map(Value::to_string)
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+        .unwrap();
+        let result = history(home.path(), "codex", "mixed-messages");
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        let body: Value = serde_json::from_slice(&result.stdout).unwrap();
+        let turns = body["turns"].as_array().unwrap();
+        assert_eq!(turns.len(), 8);
+        for (index, turn) in turns.iter().enumerate() {
+            assert_eq!(
+                turn["role"],
+                if index % 2 == 0 { "user" } else { "assistant" }
+            );
+            assert_eq!(turn["items"].as_array().unwrap().len(), 1);
+            assert_eq!(
+                turn["items"][0]["text"],
+                if index % 2 == 0 {
+                    "Repeated saved prompt"
+                } else {
+                    "Repeated saved answer"
+                }
+            );
+        }
+    }
+}
+
+#[test]
 fn history_binary_reports_oversize_instead_of_truncating_the_transcript() {
     let home = tempfile::tempdir().unwrap();
     rollout(home.path(), "large-thread", "Saved answer");
