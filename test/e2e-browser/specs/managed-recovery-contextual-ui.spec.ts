@@ -1,4 +1,6 @@
 import nativeCodexHistory from '../../fixtures/managed-native-history/codex.json' with { type: 'json' }
+import fs from 'node:fs/promises'
+import path from 'node:path'
 import type { Page } from '@playwright/test'
 import type { ManagedRuntimeNotice, ManagedRuntimeRecoverySummary } from '@shared/managed-runtime.js'
 import { FRESHCODEX_DEFAULT_MODEL } from '@shared/fresh-agent-models.js'
@@ -42,7 +44,7 @@ async function paneContent(page: Page) {
 
 async function installPane(page: Page, kind: PaneKind, recoveryState: RecoveryState, missingSoul = false) {
   await page.route('**/api/runtime/notices?**', (route) => route.fulfill({ json: { notices: [] } }))
-  await page.route('**/api/fresh-agent/threads/**', (route) => route.fulfill({ json: {
+  if (!missingSoul) await page.route('**/api/fresh-agent/threads/**', (route) => route.fulfill({ json: {
     sessionType: 'freshcodex', provider: 'codex', sessionId: SESSION_ID, threadId: SESSION_ID,
     revision: 1, latestTurnId: null, status: 'idle',
     capabilities: { send: true, interrupt: true, approvals: true, questions: true, fork: false },
@@ -100,17 +102,31 @@ async function installPane(page: Page, kind: PaneKind, recoveryState: RecoverySt
   })
 }
 
-test('fresh-agent: cold lost pane without a soul retains saved history and a close warning after refused start-new', async ({ freshellPage, page, terminal, harness }) => {
+test('fresh-agent: cold lost pane without a soul retains saved history and a close warning after refused start-new', async ({ freshellPage, page, terminal, harness, serverInfo }) => {
   await terminal.waitForTerminal()
+  const sessions = path.join(serverInfo.homeDir, '.codex', 'sessions', '2026', '03', '01')
+  await fs.mkdir(sessions, { recursive: true })
+  const events = await fs.readFile('test/fixtures/coding-cli/codex/task-events.sanitized.jsonl', 'utf8')
+  const tools = await fs.readFile('test/fixtures/managed-native-history/codex-tools.jsonl', 'utf8')
+  const transcript = events.replace('session-activity', SESSION_ID)
+    .replace('Sanitized completion', SAVED_HISTORY_TEXT) + tools.split('\n').slice(1).join('\n')
+  const rollout = path.join(sessions, `rollout-${SESSION_ID}.jsonl`)
+  await fs.writeFile(rollout, transcript)
+  const modified = (await fs.stat(rollout)).mtimeMs
   let stopRequests = 0
   await page.route('**/api/runtime/souls/*/stop', async (route) => {
     stopRequests += 1
     await route.fulfill({ status: 404, json: { message: 'No managed soul' } })
   })
-  const historyRead = page.waitForRequest('**/api/fresh-agent/threads/**')
+  const historyRead = page.waitForResponse('**/api/fresh-agent/threads/**')
   await installPane(page, 'fresh-agent', 'lost', true)
-  expect((await historyRead).method()).toBe('GET')
+  const response = await historyRead
+  expect(response.request().method()).toBe('GET')
+  expect(response.status()).toBe(200)
+  const snapshot = await response.json()
+  await expect(page.getByText('Sanitized prompt', { exact: true })).toBeVisible()
   await expect(page.getByText(SAVED_HISTORY_TEXT, { exact: true })).toBeVisible()
+  expect(snapshot.extensions.codex.nativeHistoryAvailable).toBe(true)
   const closeWarning = page.getByText('Close failed: Previous close was not confirmed', { exact: true })
   await expect(closeWarning).toBeVisible()
   const before = await paneContent(page)
@@ -125,6 +141,8 @@ test('fresh-agent: cold lost pane without a soul retains saved history and a clo
   await expect(closeWarning).toBeVisible()
   expect(await paneContent(page)).toEqual(before)
   expect(stopRequests).toBe(0)
+  expect(await fs.readFile(rollout, 'utf8')).toBe(transcript)
+  expect((await fs.stat(rollout)).mtimeMs).toBe(modified)
   const messages = await harness.getSentWsMessages() as Array<{ type?: string }>
   expect(messages.filter((message) => ['freshAgent.kill', 'freshAgent.create', 'freshAgent.attach', 'pane.reconcile.request'].includes(message.type ?? ''))).toEqual([])
 })
