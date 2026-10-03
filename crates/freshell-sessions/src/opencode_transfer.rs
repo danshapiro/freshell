@@ -1080,7 +1080,7 @@ fn inspect_git_tree(mount: &Path, tree: &str) -> Result<GitTreeInspection, Trans
     let objects_dir = common_dir.join("objects");
     let alternates = objects_dir.join("info").join("alternates");
     let mut alternate_identity = Vec::new();
-    if let Ok(contents) = fs::read_to_string(&alternates) {
+    if let Some(contents) = read_alternates_file(&alternates)? {
         for line in contents.lines().filter(|line| !line.trim().is_empty()) {
             let candidate = PathBuf::from(line);
             let candidate = if candidate.is_absolute() {
@@ -1097,6 +1097,14 @@ fn inspect_git_tree(mount: &Path, tree: &str) -> Result<GitTreeInspection, Trans
                 return Err(TransferError::Blocked(
                     "alternate Git object store is outside the exact managed workspace mount"
                         .into(),
+                ));
+            }
+            let nested_alternates = candidate.join("info").join("alternates");
+            if read_alternates_file(&nested_alternates)?
+                .is_some_and(|nested| nested.lines().any(|line| !line.trim().is_empty()))
+            {
+                return Err(TransferError::Blocked(
+                    "nested Git object store alternates are unsupported".into(),
                 ));
             }
             let relative = candidate.strip_prefix(&mount).map_err(|_| {
@@ -1162,6 +1170,26 @@ fn inspect_git_tree(mount: &Path, tree: &str) -> Result<GitTreeInspection, Trans
         identity,
         closure_bytes,
         closure_sha256: digest(&object_bytes),
+    })
+}
+
+fn read_alternates_file(path: &Path) -> Result<Option<String>, TransferError> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(TransferError::Blocked(format!(
+                "Git alternate metadata is unavailable: {error}"
+            )))
+        }
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(TransferError::Blocked(
+            "Git alternate metadata is not a regular file".into(),
+        ));
+    }
+    fs::read_to_string(path).map(Some).map_err(|error| {
+        TransferError::Blocked(format!("Git alternate metadata cannot be read: {error}"))
     })
 }
 
