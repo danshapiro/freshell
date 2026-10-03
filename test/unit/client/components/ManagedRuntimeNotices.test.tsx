@@ -1,4 +1,5 @@
 import { configureStore } from '@reduxjs/toolkit'
+import { Profiler, type ProfilerOnRenderCallback } from 'react'
 import { Provider } from 'react-redux'
 import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
@@ -58,7 +59,7 @@ function runtimeState() {
   }
 }
 
-function renderNotices() {
+function renderNotices(onRender?: ProfilerOnRenderCallback) {
   const store = configureStore({
     reducer: {
       connection: connectionReducer,
@@ -82,7 +83,11 @@ function renderNotices() {
   })
   render(
     <Provider store={store}>
-      <ManagedRuntimeNotices />
+      {onRender ? (
+        <Profiler id="managed-runtime-notice" onRender={onRender}>
+          <ManagedRuntimeNotices />
+        </Profiler>
+      ) : <ManagedRuntimeNotices />}
     </Provider>,
   )
   return store
@@ -100,10 +105,10 @@ function cleanupFailure(noticeId: string): ManagedRuntimeNotice {
   }
 }
 
-async function renderPollingNotices(notices: ManagedRuntimeNotice[]) {
+async function renderPollingNotices(notices: ManagedRuntimeNotice[], onRender?: ProfilerOnRenderCallback) {
   vi.useFakeTimers()
   apiMocks.getManagedRuntimeNotices.mockResolvedValue(notices)
-  await act(async () => { renderNotices() })
+  await act(async () => { renderNotices(onRender) })
 }
 
 async function pollNotices() {
@@ -239,6 +244,24 @@ describe('ManagedRuntimeNotices', () => {
     await pollNotices()
     expect(screen.getByRole('alert')).toHaveTextContent('Cleanup needs attention: notice-two')
     expect(screen.getByRole('alert')).not.toHaveTextContent('provider state was missing')
+  })
+
+  it('never commits the old incident cause under a replacement warning before effects run', async () => {
+    const committedAlerts: string[] = []
+    await renderPollingNotices([cleanupFailure('notice-one')], () => {
+      // Profiler observes the actual committed DOM before passive effects.
+      committedAlerts.push(screen.queryByRole('alert')?.textContent ?? '')
+    })
+    await clickNoticeButton('Details')
+    expect(screen.getByRole('alert')).toHaveTextContent('provider state was missing')
+
+    apiMocks.getManagedRuntimeNotices.mockResolvedValue([cleanupFailure('notice-two')])
+    await pollNotices()
+    const replacementAlerts = committedAlerts.filter((text) => text.includes('Cleanup needs attention: notice-two'))
+    expect(replacementAlerts.length).toBeGreaterThan(0)
+    for (const text of replacementAlerts) {
+      expect(text).not.toContain('provider state was missing')
+    }
   })
 
   it('clears opened details when dismissing advances to the next queued warning', async () => {
