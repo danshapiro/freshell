@@ -563,4 +563,25 @@ mod tests {
         let meta = parse_codex_session_content(content);
         assert_eq!(meta.is_subagent, Some(true));
     }
+
+    #[test]
+    fn display_projection_remains_tolerant_of_rollout_only_records() {
+        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(
+            "../../test/fixtures/coding-cli/codex/multi-file-continuation-newer.sanitized.jsonl",
+        );
+        let content = std::fs::read_to_string(path).unwrap();
+        let meta = parse_codex_session_content(&content);
+
+        assert_eq!(
+            meta.session_id.as_deref(),
+            Some("b7936c10-4935-441c-837c-c1f33cafec2d")
+        );
+        assert_eq!(meta.cwd.as_deref(), Some("/sanitized/project"));
+        assert_eq!(meta.title.as_deref(), Some("Continuation title"));
+        assert_eq!(meta.summary.as_deref(), Some("Continuation summary"));
+        assert_eq!(
+            meta.token_usage.as_ref().map(|usage| usage.total_tokens),
+            Some(780)
+        );
+    }
 }

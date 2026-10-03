@@ -1,0 +1,10 @@
+{"timestamp":"2026-10-03T00:00:10.000Z","type":"session_meta","payload":{"id":"b7936c10-4935-441c-837c-c1f33cafec2d","session_id":"b7936c10-4935-441c-837c-c1f33cafec2d","cwd":"/sanitized/project","source":"vscode","thread_source":"user","cli_version":"0.156.0","originator":"codex-vscode","history_mode":"paginated"}}
+{"timestamp":"2026-10-03T00:00:10.001000Z","ordinal":0,"type":"compacted","payload":{"message":"Sanitized compaction record","replacement_history":[{"type":"message","timestamp":"not-an-outer-timestamp","content":"not flattened"}]}}
+{"timestamp":"2026-10-03T00:00:10.002000Z","ordinal":1,"type":"event_msg","payload":{"type":"user_message","message":"Continuation title"}}
+{"timestamp":"2026-10-03T00:00:10.004000Z","ordinal":2,"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Continuation summary"}]}}
+{"timestamp":"2026-10-03T00:00:10.004000Z","ordinal":3,"type":"inter_agent_communication","payload":{"message":"Sanitized inter-agent record"}}
+{"timestamp":"2026-10-03T00:00:10.006000Z","ordinal":4,"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":800,"cached_input_tokens":200,"output_tokens":100,"total_tokens":900},"last_token_usage":{"input_tokens":700,"cached_input_tokens":150,"output_tokens":80,"total_tokens":780},"model_context_window":258400}}}
+{"timestamp":"2026-10-03T00:00:10.007000Z","ordinal":5,"type":"token_usage_record","payload":{"total_token_usage":{"input_tokens":800,"cached_input_tokens":200,"output_tokens":100,"total_tokens":900}}}
+{"timestamp":"2026-10-03T00:00:10.008000Z","ordinal":6,"type":"turn_context","payload":{"cwd":"/sanitized/project","model":"sanitized-model"}}
+{"timestamp":"2026-10-03T00:00:10.008000Z","ordinal":7,"type":"inter_agent_communication_metadata","payload":{"agent_id":"sanitized-agent","nickname":"sanitized"}}
+{"timestamp":"2026-10-03T00:00:10.009000Z","ordinal":8,"type":"retained_context","payload":{"context":"sanitized"}}
