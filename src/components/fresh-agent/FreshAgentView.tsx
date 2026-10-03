@@ -281,10 +281,11 @@ function mergeSnapshotForDisplay(
   const nextIdentity = getSnapshotIdentity(next)
   if (!previousIdentity || previousIdentity !== nextIdentity) return next
   // Cold native reads report an idle, vacant owner without reading turns.
-  // During intervention that absence cannot erase history already displayed.
+  // That absence cannot erase loaded intervention history, including while the
+  // live actor resumes. An authoritative empty result may still replace it.
   const providerState = next.extensions?.[next.provider]
   if (
-    managedIntervention
+    (managedIntervention || previous.extensions?.[previous.provider]?.nativeHistoryAvailable === true)
     && previous.turns.length > 0
     && next.turns.length === 0
     && next.status === 'idle'
@@ -292,8 +293,13 @@ function mergeSnapshotForDisplay(
     && providerState.statusFromLiveState !== true
     && providerState.nativeHistoryAvailable !== true
   ) return previous
+  // Native reads and live actors have different revision bases. Requests fence
+  // source transitions; the revision comparison applies within one source.
+  const sameRevisionSource = (previous.extensions?.[previous.provider]?.nativeHistoryAvailable === true)
+    === (providerState?.nativeHistoryAvailable === true)
   if (
-    typeof previous.revision === 'number'
+    sameRevisionSource
+    && typeof previous.revision === 'number'
     && typeof next.revision === 'number'
     && next.revision < previous.revision
   ) {
@@ -838,6 +844,7 @@ export function FreshAgentView({
   const [loadError, setLoadError] = useState<string | null>(null)
   const [snapshotRefreshNonce, setSnapshotRefreshNonce] = useState(0)
   const snapshotRefreshTriggerRef = useRef<SnapshotTrigger>('identity')
+  const snapshotRequestAuthorityRef = useRef({ next: 0, applied: 0, generation: 0, nativeSource: false })
   // A hidden pane keeps its last good transcript until a transcript-changing
   // event says that it is no longer current. On reveal, the old DOM remains
   // mounted but is concealed behind a refresh state so the user never reads a
@@ -2693,12 +2700,25 @@ export function FreshAgentView({
     const provider = paneContent.provider
     const requestSessionType = paneContent.sessionType
     const requestCreateRequestId = paneContent.createRequestId
-    const requestSoulId = managedRecoveryDecision ? paneContent.soulId : undefined
-    const requestSoulRevision = requestSoulId ? paneContent.soulIntentRevision : undefined
+    const requestPaneSoulId = paneContent.soulId
+    const requestPaneSoulRevision = paneContent.soulIntentRevision
+    const requestSoulId = managedRecoveryDecision ? requestPaneSoulId : undefined
+    const requestSerial = ++snapshotRequestAuthorityRef.current.next
+    if (snapshotRequestAuthorityRef.current.nativeSource !== Boolean(requestSoulId)) {
+      snapshotRequestAuthorityRef.current.nativeSource = Boolean(requestSoulId)
+      snapshotRequestAuthorityRef.current.generation += 1
+    }
+    const requestReadGeneration = snapshotRequestAuthorityRef.current.generation
     const isStaleSnapshotRequest = () => (
       paneContentRef.current.createRequestId !== requestCreateRequestId
-      || (requestSoulId !== undefined && (paneContentRef.current.soulId !== requestSoulId
-        || paneContentRef.current.soulIntentRevision !== requestSoulRevision))
+      || paneContentRef.current.soulId !== requestPaneSoulId
+      || paneContentRef.current.soulIntentRevision !== requestPaneSoulRevision
+      || requestSerial < snapshotRequestAuthorityRef.current.applied
+      // Ordinary reads from before intervention never regain authority after Retry.
+      // The initial native read can still supply history while a resumed live read waits.
+      || (requestReadGeneration !== snapshotRequestAuthorityRef.current.generation
+        && (!requestSoulId || snapshotRequestAuthorityRef.current.nativeSource))
+      || (!requestSoulId && isManagedRuntimeRecoveryDecision(paneContentRef.current.recoverySummary))
       || paneContentRef.current.provider !== provider
       || paneContentRef.current.sessionType !== requestSessionType
       || snapshotThreadIdRef.current !== sessionId
@@ -2735,6 +2755,7 @@ export function FreshAgentView({
         isManagedRuntimeRecoveryDecision(paneContentRef.current.recoverySummary),
       )
       const snapshotAccepted = displaySnapshot !== previousSnapshot
+      if (snapshotAccepted) snapshotRequestAuthorityRef.current.applied = requestSerial
       const snapshotStatusAuthoritative = !requestSoulId && (provider === 'codex'
         || resolved.extensions?.[provider]?.statusFromLiveState === true)
       const outgoing = outgoingTurnRef.current
@@ -3057,7 +3078,9 @@ export function FreshAgentView({
       }
       setLoadError(error instanceof Error ? error.message : 'Failed to load session')
     }
-    const key = makeSnapshotKey({ sessionType: requestSessionType, provider, threadId: sessionId, cwd: requestCwd, soulId: requestSoulId, soulIntentRevision: requestSoulRevision })
+    // Keep provider reads and native reads distinct, with pane authority in both keys.
+    const key = makeSnapshotKey({ sessionType: requestSessionType, provider, threadId: sessionId, cwd: requestCwd,
+      soulId: requestPaneSoulId, soulIntentRevision: requestPaneSoulRevision }) + `:read-generation:${requestReadGeneration}`
     void getSnapshotScheduler().schedule(key, trigger, () =>
       // NO signal: the run may execute on behalf of other panes sharing the
       // key, or after this effect cleaned up (A2). Staleness is handled by
