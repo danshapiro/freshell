@@ -236,6 +236,7 @@ test.describe.serial('Phase 4 managed-runtime tab rehydration', () => {
       }, browserTabId)
       await expect.poll(() => harness.getActiveTabId()).toBe(browserTabId)
       const activePaneBefore = (await browserState(page)).panes.activePane[browserTabId]
+      expect(activePaneBefore).toEqual(expect.any(String))
       const layoutStorageKey = await prunePersistedLayoutToTab(page, browserTabId)
       expect(layoutStorageKey.length).toBeGreaterThan(0)
 
@@ -252,6 +253,11 @@ test.describe.serial('Phase 4 managed-runtime tab rehydration', () => {
       )
       expect(rehydrated.tabs.activeTabId).toBe(browserTabId)
       expect(rehydrated.panes.activePane[browserTabId]).toBe(activePaneBefore)
+      const focusObservations = [{
+        stage: 'rehydration',
+        activeTabId: rehydrated.tabs.activeTabId,
+        activePaneId: rehydrated.panes.activePane[rehydrated.tabs.activeTabId] ?? null,
+      }]
       expect(visibleManagedTabs(rehydrated).map((tab: any) => tab.viewIntentId).sort()).toEqual(
         initialSnapshot.viewIntents.map((view: any) => view.viewId).sort(),
       )
@@ -278,6 +284,12 @@ test.describe.serial('Phase 4 managed-runtime tab rehydration', () => {
           [browserTabId, ...expectedTabIds].sort(),
         )
         expect(state.tabs.activeTabId).toBe(browserTabId)
+        expect(state.panes.activePane[browserTabId]).toBe(activePaneBefore)
+        focusObservations.push({
+          stage: `web_restart_${cycle}`,
+          activeTabId: state.tabs.activeTabId,
+          activePaneId: state.panes.activePane[state.tabs.activeTabId] ?? null,
+        })
         expect(new Set(visibleManagedTabs(state).map((tab: any) => tab.viewIntentId)).size).toBe(3)
         expect(visibleManagedTabs(state).map((tab: any) => tab.soulId).sort()).toEqual(initialSoulIds)
       }
@@ -378,8 +390,8 @@ test.describe.serial('Phase 4 managed-runtime tab rehydration', () => {
         candidateSha: rig.runtime.candidateSha,
         browser: {
           browserInteraction: true,
-          coldStartAgents: 3,
-          restartCycles: 3,
+          coldStartAgents: initialSoulIds.length,
+          restartCycles: focusObservations.length - 1,
           deterministicPlacement: recoveredPaneIds.join('|') === expectedPaneIds.join('|'),
           singleViewPerIntent: new Set(
             finalState.tabs.tabs
@@ -387,7 +399,13 @@ test.describe.serial('Phase 4 managed-runtime tab rehydration', () => {
               .filter(Boolean),
           ).size === finalState.tabs.tabs.filter((tab: any) => tab.viewIntentId).length,
           existingLayoutPreserved: Boolean(finalState.tabs.tabs.find((tab: any) => tab.id === browserTabId)),
-          focusStable: finalState.tabs.activeTabId === browserTabId,
+          // Only automatic restore/restart observations belong to this
+          // guarantee; the close/stop interactions deliberately move focus.
+          focusStable: focusObservations.every((observed) => (
+            observed.activeTabId === browserTabId && observed.activePaneId === activePaneBefore
+          )),
+          expectedFocus: { activeTabId: browserTabId, activePaneId: activePaneBefore },
+          focusObservations,
           sameSoulIds: initialSoulIds.every((soulId: string) => (
             afterRestarts.souls.some((soul: any) => soul.soulId === soulId)
           )),
@@ -410,6 +428,8 @@ test.describe.serial('Phase 4 managed-runtime tab rehydration', () => {
           createdTabIds: created.map((response) => response.tabId),
         },
       }
+      expect(receipt.browser.focusObservations).toHaveLength(4)
+      expect(receipt.browser.focusStable).toBe(true)
       const receiptPath = rig.writePhase4BrowserReceipt(receipt)
       // eslint-disable-next-line no-console
       console.log(`[P4-G08] runtime tab rehydration receipt: ${receiptPath}`)
