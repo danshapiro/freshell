@@ -20,7 +20,7 @@ Fix managed OpenCode resume for pre-existing host sessions by transferring and v
 
 **Goal:** A managed OpenCode terminal resumes the exact pre-existing native conversation with its complete required history before launching, and unresolved or incomplete recovery remains retryable instead of being declared lost.
 
-**Architecture:** Add an OpenCode-specific, bounded native-history transfer from the selected host session into the soul-owned provider store. The transfer uses a consistent source snapshot, a versioned structural manifest, a transactional destination import, and independent destination verification before PTY spawn; it never copies unrelated host conversations or places history bodies in the control protocol, registry, logs, or incident records. Fence transfer, readiness, loss certification, and restoration with durable identity/revision checks, then reconcile the exact seven conversations and withdraw only their eight false-loss incidents and dependent exports.
+**Architecture:** Add an OpenCode-specific, bounded native-history transfer from the selected host session into the soul-owned provider store. Before PTY spawn, independently verify that a consistent source snapshot has been imported in full; after spawn, require a provider-produced signal that OpenCode actually adopted the exact root before treating the conversation as restored or accepting input. Keep the immutable import-baseline manifest valid across legitimate later provider writes, and never copy unrelated host conversations or place history bodies in control metadata, registry rows, logs, or incident records. Fence transfer, readiness, loss certification, and restoration with durable identity/revision checks, then reconcile the exact seven conversations and withdraw only their eight false-loss incidents and dependent exports.
 
 **Tech Stack:** Rust workspace crates, SQLite/rusqlite, serde protocol messages, Tokio session-host lifecycle, fake OpenCode integration fixtures, Vitest helper tests, and Playwright managed-runtime coverage.
 
@@ -32,7 +32,7 @@ Fix managed OpenCode resume for pre-existing host sessions by transferring and v
 - Keep OpenCode history separate from provider configuration, credentials, bootstrap files, and control-frame metadata. Resolve source identity on the trusted host from the selected provider store; never accept an arbitrary filesystem path from the client.
 - Preserve exact native IDs, parent/child edges, row ordering, timestamps, opaque provider data, and required provider-owned referenced assets. Fail closed on partial, unreadable, unsupported, ambiguous, or conflicting source state.
 - Do not modify unrelated runtime records or delete the only recoverable copy. Remove the exact false-loss artifacts only after independent continuity verification; leave unrelated incidents, notices, writer claims, and user stop intent intact.
-- Do not restart the self-hosted Freshell server without the exact approval word `APPROVED`. Any requested live data correction is limited to the seven verified sessions and their eight exact false-loss records, and occurs only after source and destination continuity are proven.
+- Finish implementation, verification, review, and the authorized PR before any production restoration. Do not restart the self-hosted Freshell server without the exact approval word `APPROVED`. Any live data correction is limited to the seven verified sessions and their eight exact false-loss records, and occurs only after source and destination continuity are proven.
 - Every PR targets `main`; wait for required checks and merge through the PR, then fast-forward local `main` from `origin/main`.
 
 ---
@@ -45,12 +45,12 @@ The load-bearing stage must settle the precise source snapshot mechanism, provid
 - Host-side native history module under `crates/freshell-sessions/` or another existing SQLite-owning crate selected by load-bearing validation: read a consistent source snapshot, compute the exact recursive session closure and dependency manifest, and expose an exact-session export without mutating the source.
 - `crates/freshell-server/src/managed_runtime.rs` and, only if required by the validated transfer channel, `crates/freshell-supervisor/src/backend.rs`: resolve/stage the selected source snapshot and bind it to the launch incarnation without exposing the host-wide store.
 - `crates/freshell-session-host/src/main.rs`: import and verify the exact history before provider setup reaches PTY spawn; incomplete transfer must fail the launch as blocked and retryable.
-- `crates/freshell-agent-runtime/src/lib.rs` and `docs/development/runtime-provider-capabilities.json`: distinguish requested identity from verified/imported and provider-observed identity; report readiness only after complete history verification; declare native import as a recovery path.
+- `crates/freshell-agent-runtime/src/lib.rs`, `crates/freshell-session-host/src/pty.rs`, and `docs/development/runtime-provider-capabilities.json`: distinguish requested identity, pre-spawn import verification, and post-spawn provider-observed adoption; declare native import as a recovery path.
 - `crates/freshell-supervisor/src/registry.rs`, `recovery.rs`, `loss_report.rs`, `loss_report_tests.rs`, and notice/outbox helpers: enforce durable materialization/loss fencing, support explicit restoration of a Lost soul, prevent stale cleanup/export from undoing restoration, and retract exact false incident data.
 - `crates/freshell-session-host/src/main.rs` tests, `crates/freshell-agent-runtime/src/lib.rs` tests, supervisor unit tests, and `test/e2e-browser/specs/runtime-provider-resurrection-rust.spec.ts`: prove the exact user-visible handoff, failures, recovery, and future writes under the same native session ID.
 - `test/unit/tooling/testing/provider-native-history.test.ts` and fake OpenCode fixtures: build deterministic synthetic SQLite graphs, validate exact structural transfer and source WAL handling without real conversation bodies.
 
-The transfer interface must be defined before task 2: a bounded staged-source handle plus manifest/version/digest and a destination import receipt. The receipt is not readiness by itself; readiness additionally requires the destination DB to independently verify the complete expected session/dependency graph and the provider to reopen the exact root ID. The supervisor's loss fence must capture the exact native identity and current intent/materialization generation, and its commit must fail if either changes before the loss transaction.
+The transfer interface must be defined before task 2: a bounded staged-source handle plus manifest/version/digest and a destination import receipt. Pre-spawn imported readiness independently verifies every imported row and dependency. Post-spawn adoption is a separate state requiring an actual provider-produced signal for the exact root; neither the requested argument, an imported row, nor generic process liveness proves adoption. The immutable import-baseline manifest must allow legitimate subsequent provider writes without masking removal or corruption of imported history. The supervisor's loss fence must capture the exact native identity and current intent/materialization generation, and its commit must fail if either changes before the loss transaction.
 
 ## Tasks
 
@@ -116,11 +116,11 @@ git commit -m "feat(sessions): export exact OpenCode history snapshots"
 
 **Interfaces:**
 - Consumes: task 1's immutable staged snapshot handle, exact root/descendant manifest, source generation/digest, destination relative path, provider/runtime schema version, and exact incarnation identity.
-- Produces: an idempotent `ImportReceipt` proving destination root/child/message/part IDs and relationships match the source manifest. The session host must complete and verify the receipt before calling `HostedPty::spawn`; any partial/ambiguous/conflicting import returns blocked and cannot launch.
+- Produces: an idempotent `ImportReceipt` proving the source snapshot's exact imported baseline is present in the destination. The session host completes independent structural verification before `HostedPty::spawn`; any partial/ambiguous/conflicting import returns blocked and retryable and cannot launch. The receipt does not claim OpenCode has adopted the root.
 
 - [ ] **Step 1: Write failing protocol, import, and launch-order tests**
 
-Add protocol serialization/validation tests for an OpenCode-only optional transfer reference, exact requested ID/provider-store binding, bounded metadata, and rejection for another provider or mismatched root. Add destination DB tests showing atomic rollback on injected mid-import failure, idempotent replay of the same digest, conflict rejection for a different digest under an existing native ID, exact graph/opaque value preservation, and exclusion of an unrelated session. Extend the grant-handler test with an event log and assert `snapshot -> import -> independent verify -> provider spawn`, plus no spawn for missing, unsupported, or partially imported data.
+Add protocol serialization/validation tests for an OpenCode-only optional transfer reference, exact requested ID/provider-store binding, bounded metadata, and rejection for another provider or mismatched root. Add destination DB tests showing atomic rollback on injected mid-import failure, idempotent replay of the same digest, rejection of a conflicting source import without rejecting legitimate later destination appends, exact imported graph/opaque value preservation, and exclusion of an unrelated session. Extend the grant-handler test with an event log and assert `snapshot -> import -> independent verify -> provider spawn`; assert provider adoption remains pending until a separate post-spawn signal, and no spawn occurs for missing, unsupported, or partial imports.
 
 - [ ] **Step 2: Run the focused tests and verify the intended failure**
 
@@ -130,7 +130,7 @@ Expected: FAIL because the typed transfer reference, atomic importer, and pre-sp
 
 - [ ] **Step 3: Add typed handoff, importer, and pre-spawn integration**
 
-Add optional serde-compatible OpenCode transfer metadata to the persisted launch spec and its validation. Resolve the staged source on the trusted host, transfer it through the narrow private handoff selected in the load-bearing stage, and import only the manifest's exact graph inside one destination transaction. Verify the destination from a separate read-only connection, write a durable import-complete marker keyed by digest/generation, then allow PTY spawn. Retries with the same source digest are idempotent; stale, partial, conflicting, unsupported, or oversized transfers fail closed. Do not reuse `ProviderBootstrapFile`, `ProviderConfigReference`, or transcript projections for the history payload.
+Add optional serde-compatible OpenCode transfer metadata to the persisted launch spec and its validation. Resolve the staged source on the trusted host, transfer it through the narrow private handoff selected in the load-bearing stage, and import only the manifest's exact graph inside one destination transaction. Verify the destination from a separate read-only connection, write a durable import-baseline receipt keyed by digest/generation, then allow PTY spawn. Retries with the same source digest are idempotent. A different source digest that conflicts with an existing import blocks for explicit reconciliation; legitimate provider appends remain allowed and do not rewrite the import baseline. Stale, partial, unsupported, or oversized transfers fail closed. Do not reuse `ProviderBootstrapFile`, `ProviderConfigReference`, or transcript projections for the history payload.
 
 - [ ] **Step 4: Run the focused tests**
 
@@ -155,7 +155,7 @@ git add crates/freshell-runtime-protocol crates/freshell-server/src/managed_runt
 git commit -m "feat(runtime): import OpenCode history before managed launch"
 ```
 
-### Task 3: Readiness Requires Imported History and Provider-Observed Identity
+### Task 3: Separate Verified Import from Provider Adoption
 
 **Files:**
 - Modify: `crates/freshell-agent-runtime/src/lib.rs`
@@ -165,27 +165,27 @@ git commit -m "feat(runtime): import OpenCode history before managed launch"
 
 **Interfaces:**
 - Consumes: requested resume ID, import receipt/manifest digest, and independently probed destination DB.
-- Produces: distinct requested, imported, and provider-observed identity evidence. `Ready` requires the exact imported closure to match and the provider to reopen the exact root; row presence or an argv resume flag alone is insufficient. Unresolved import remains `Blocked`.
+- Produces: distinct requested, imported, and provider-observed identity evidence. `ImportedVerified` means the import-baseline rows/dependencies match before spawn; `ProviderObserved` means a provider-produced post-spawn signal confirms the exact root was adopted. Neither a matching DB row nor an argv resume flag proves provider adoption. User input and successful restore publication wait for `ProviderObserved`; unknown/unresolved states remain blocked.
 
 - [ ] **Step 1: Write failing readiness and identity tests**
 
-Extend the OpenCode probe tests: exact session row with no complete messages/parts is not ready; partial child/message/part graph is blocked; exact complete graph with matching import receipt is ready; exact complete local store without a required import receipt is not misreported as newly adopted. Extend PTY identity tests so a requested ID is not reported as observed until the provider watcher or an explicit post-launch check confirms it. Add a capability test requiring `NativeImport` and exact import evidence.
+Extend the OpenCode probe tests: exact session row with no complete messages/parts is not imported-verified; partial child/message/part graph is blocked; a complete graph matching the import baseline is `ImportedVerified` before spawn; later provider-created rows do not invalidate that baseline, while removal or corruption of an imported row does. Extend PTY identity tests so requested ID and process liveness are not reported as provider adoption; only the pinned provider's independently identified success signal changes state to `ProviderObserved`, while an explicit provider rejection stays blocked. Add a capability test requiring `NativeImport` and exact import evidence.
 
 - [ ] **Step 2: Run tests and verify the intended failure**
 
 Run: `cargo test -p freshell-agent-runtime opencode_probe && cargo test -p freshell-session-host requested_resume_is_not_observed`
 
-Expected: FAIL because current probe checks only `session.id`, and PTY initializes provider identity from the requested ID.
+Expected: FAIL because current probe checks only `session.id`, and PTY initializes provider identity from the requested ID without a separate post-spawn adoption signal.
 
 - [ ] **Step 3: Strengthen readiness evidence**
 
-Make the read-only probe validate the stored manifest against exact root/descendant sessions, messages, parts, and required provider-owned dependencies. Preserve the three-way `Ready` / definitive absence / `Blocked` distinction. Track request intent separately from verified import and observed runtime identity; never derive observed identity from `--session`. Declare OpenCode's import recovery path and keep its importer verdict unresolved until the receipt is independently verified.
+Make the read-only pre-spawn probe validate the immutable import baseline against exact root/descendant sessions, messages, parts, and required dependencies, while allowing identified legitimate destination evolution and rejecting loss/corruption of baseline rows. Preserve `Ready` / definitive absence / `Blocked` at the import layer and add a separate post-spawn provider-observed adoption state based on the signal verified in load-bearing validation. Track request intent separately from both states; never derive observation from `--session`, row presence, or liveness. Do not require post-spawn adoption before spawn. Declare OpenCode's import recovery path and keep its source verdict unresolved until import evidence is durable.
 
 - [ ] **Step 4: Run the focused tests**
 
 Run: `cargo test -p freshell-agent-runtime opencode_probe && cargo test -p freshell-session-host requested_resume_is_not_observed`
 
-Expected: PASS with complete history accepted, incomplete history blocked, and requested-only identity not treated as provider confirmation.
+Expected: PASS with complete import baseline accepted pre-spawn, incomplete/corrupted baseline blocked, provider-written additions accepted, and requested-only identity not treated as provider confirmation; post-spawn rejection never publishes restored success.
 
 - [ ] **Step 5: Refactor while green**
 
@@ -219,7 +219,7 @@ git commit -m "fix(runtime): require verified OpenCode history for readiness"
 
 - [ ] **Step 1: Write failing loss-fence and ownership tests**
 
-Add tests proving `Allocated`/`Materializing` OpenCode souls cannot produce `Lost`; unresolved or available `NativeImport` blocks loss; a transfer or native identity recorded after the final probe prevents `prepare_loss`; an absent complete source set can still produce true loss; simultaneous claims for the same `(provider, store, native id)` across two souls yield one winner; and cleanup for the losing soul cannot delete the winner's exact claim. Include a zero-input requested-ID case so request presence cannot masquerade as dispatched or durable history.
+Add tests proving `Allocated`/`Materializing` OpenCode souls cannot produce `Lost`; unresolved or available `NativeImport` blocks loss; a transfer or native identity recorded after the final probe prevents `prepare_loss`; an absent complete source set can still produce true loss; simultaneous claims for the same `(provider, source-store identity, native id)` across two different destination soul stores yield one winner; and cleanup for the losing soul cannot delete the winner's exact claim. Include a zero-input requested-ID case so request presence cannot masquerade as dispatched or durable history.
 
 - [ ] **Step 2: Run tests and verify the intended failure**
 
@@ -235,7 +235,7 @@ Use the per-soul lifecycle lock for materialization and explicit recovery probes
 
 Run: `cargo test -p freshell-supervisor materializing_cannot_be_lost && cargo test -p freshell-supervisor loss_commit_rejects_newer_materialization && cargo test -p freshell-supervisor native_id_has_one_writer`
 
-Expected: PASS for stale-writer rejection, one exact claim owner, blocked unresolved paths, and a preserved genuine-loss path.
+Expected: PASS for stale-writer rejection, one source-root owner across distinct destination stores, blocked unresolved paths, and a preserved genuine-loss path.
 
 - [ ] **Step 5: Refactor while green**
 
@@ -271,7 +271,7 @@ git commit -m "fix(supervisor): fence managed OpenCode loss decisions"
 
 - [ ] **Step 1: Write failing restore and withdrawal tests**
 
-Add an end-to-end registry fixture containing a Lost soul, its exact `loss_incidents` row, loss-created stop tombstone, pending open/final export events, open/closed JSON exports, incident JSONL entry, and a batched notice that also references an unrelated incident. Assert restore is rejected for stale incident/revision, ambiguous writer ownership, or unverified history; accepted restore publishes a newer view revision; repeating restore is idempotent; stale cleanup/export workers cannot stop the restored runtime or recreate the false incident; exact false records and exports disappear; unrelated incident/notice references and user stop tombstones remain. Add the duplicate-root case and require only the canonical soul to own/reopen that native ID.
+Add a registry/filesystem fixture containing a Lost soul, its exact `loss_incidents` row, loss-created stop tombstone, pending open/final export events, open/closed JSON exports, incident JSONL entry, and a batched notice that also references an unrelated incident. Assert restore is rejected for stale incident/revision, ambiguous source-root ownership, or unverified import; restore remains pending until the provider's post-spawn adoption signal; launch failure remains retryable; and an already-claimed cleanup worker can affect only the old incarnation. After adopted restore, assert repeated correction is idempotent; exact false records and exports disappear; unrelated incident/notice references and separate user stop tombstones remain. If crash retry needs a temporary progress marker, assert it contains only exact IDs/revision/status and is deleted after withdrawal completes. Add the duplicate-root case and require one canonical soul to own/reopen that source root.
 
 - [ ] **Step 2: Run tests and verify the intended failure**
 
@@ -281,7 +281,7 @@ Expected: FAIL because Lost souls have no restore transition and incident export
 
 - [ ] **Step 3: Add revisioned restore and exact incident withdrawal**
 
-Under the lifecycle lock, first prove the source transfer and canonical exact writer claim. In one immediate SQLite transaction, compare incident ID, intent revision, evidence generation, and current state; claim/cancel pending cleanup and exports; move the soul/incarnation to the restored state; publish a newer view revision; remove only the exact false loss incident and its loss-created stop tombstone; and recompute affected notice/outbox projections without dropping unrelated incident references. Export workers and cleanup workers must re-read the durable canceled/corrected state after taking their claim/lock and before writing or signaling. After the DB transition commits, remove only the matching open/closed JSON files and the exact matching lines from active and rotated incident JSONL files under the same export serialization mechanism. Repeated calls must be safe.
+Under the lifecycle lock, stage restoration with the exact incident/revision and source-root owner, durably invalidate cleanup for the old exact incarnation, verify the imported baseline, launch the new incarnation, and wait for the independent provider-adoption signal before publishing restored success. Preserve retryable correction state and do not withdraw false incident records if launch/adoption fails. After adoption, use a durable compare-and-set to publish the restored view and claim exact false-incident withdrawal. Serialize export and cleanup workers against this correction state through their filesystem effect. Remove only the exact false `loss_incidents` rows, loss-created stop tombstones, export outbox entries, notice/projection references, open/closed JSON files, and exact JSONL lines. A minimal ID/revision/status progress marker may bridge DB and filesystem cleanup if required; delete it once every targeted surface is withdrawn and stale workers can no longer recreate them. Never retain the false certificate/body or a backup archive. Repeated calls must be safe.
 
 - [ ] **Step 4: Run focused tests**
 
@@ -306,41 +306,41 @@ git add crates/freshell-supervisor crates/freshell-server
 git commit -m "feat(supervisor): restore souls and retract false loss incidents"
 ```
 
-### Task 6: Prove Managed Resume End to End and Restore the Seven Conversations
+### Task 6: Prove Managed Resume End to End and Prepare the Production Runbook
 
 **Files:**
 - Modify: `test/e2e-browser/specs/runtime-provider-resurrection-rust.spec.ts`
 - Modify: existing synthetic managed-runtime fixture and provider-native-history helper files used by that spec
-- Modify: only the smallest runtime recovery fixture/API needed to exercise the production restore path
-- Runbook/PR evidence: `<logs_dir>/reports/managed-opencode-restoration.md` (external run artifact; do not commit real session contents)
+- Modify: only the smallest synthetic runtime fixture/API needed to exercise the production transfer and restore paths
+- Create: `<logs_dir>/reports/managed-opencode-restoration.md` (post-merge runbook; no real session contents or false incident exports)
 
 **Interfaces:**
-- Consumes: production launch and restore behavior from tasks 1–5, plus synthetic E2E source DBs for automated tests and the exact seven host native roots for the requested live data repair.
-- Produces: automated proof that a fresh soul can read the complete original synthetic conversation, launch on the same exact ID, append a new turn, and re-open it; operational proof for all seven real roots and eight incident references containing IDs/counts/digests only, not transcript bodies; only after that proof, remove the exact false incident data and files.
+- Consumes: production launch and restore behavior from tasks 1–5 and isolated synthetic OpenCode source DBs.
+- Produces: automated proof that a fresh soul imports and verifies a complete synthetic conversation before spawn, receives the provider's exact post-spawn adoption signal before accepting input, appends a new synthetic turn under the same ID, and reopens without losing imported rows; a body-free, exact-target production runbook to use only after PR merge and the required `APPROVED` restart authorization.
 
 - [ ] **Step 1: Write the failing managed-runtime continuity scenario**
 
-Extend the existing managed OpenCode resurrection spec with an isolated host source DB and empty soul provider volume. Seed a synthetic root plus descendants, ordered messages, linked parts, and an unrelated session. Launch the managed soul with the exact root, assert source snapshot/import/readiness precede PTY spawn, read all expected synthetic history from the provider, send a synthetic follow-up, and assert the added rows append under the same root ID while all original row IDs/edges remain. Then simulate an interrupted partial transfer and an unresolved host source; assert neither creates a Lost view, loss certificate, cleanup signal, or incident export. Retain the existing positive test that a truly absent, fully checked source may be lost.
+Extend the existing managed OpenCode resurrection spec with an isolated host source DB and empty soul provider volume. Seed a synthetic root plus descendants, ordered messages, linked parts, and an unrelated session. Assert source snapshot/import/independent baseline verification precede PTY spawn, and the post-spawn provider signal precedes user input or restored success. Read all expected synthetic history, send a synthetic follow-up, and assert new rows append under the same root ID while imported row identities and required data remain. Simulate an interrupted partial transfer, an unresolved source, provider rejection, and a stale cleanup result; assert none creates a Lost view, false incident export, or second writer. Retain the positive test that a truly absent, fully checked source may be lost.
 
 - [ ] **Step 2: Run the focused test and verify the intended failure**
 
-Run: `FRESHELL_TEST_SUMMARY='managed OpenCode source-to-soul resume' pnpm run test:e2e:local --project=rust-chromium --grep='managed OpenCode source-to-soul resume' test/e2e-browser/specs/runtime-provider-resurrection-rust.spec.ts`
+Run: `FRESHELL_TEST_SUMMARY='managed OpenCode source-to-soul resume' GCLOUD_ROBOT_REQUIRE=1 pnpm run test:e2e:cloud --project=rust-chromium --grep='managed OpenCode source-to-soul resume' test/e2e-browser/specs/runtime-provider-resurrection-rust.spec.ts`
 
-Expected: FAIL because the current launch does not transfer host-side native history into an empty soul store.
+Expected: FAIL because the current launch does not transfer host-side native history or independently observe provider adoption.
 
 - [ ] **Step 3: Complete E2E wiring and run exact-scope restore**
 
-Implement only test harness integration necessary to drive the production transfer/restore interfaces. Run the synthetic E2E until it proves exact full-history continuity and future append. Then use the same production restore operation for the seven verified existing native roots. Resolve duplicate ownership before starting either soul; restore only one canonical soul for the shared root. For each root, require an independent provider-readable history check plus a synthetic append/reopen check in a disposable copy before removing its false incident artifacts. Never send a test prompt to the real conversation. Store an operational receipt containing root/soul/incident identifiers, graph counts, digests, and status only; do not store bodies or preserve the false incident exports as evidence.
+Implement only synthetic test harness integration needed to drive production interfaces. Run the E2E until it proves import verification, provider adoption, exact full-history continuity, and future append. Prepare the post-merge production runbook with exact API sequence, preflight fields, canonical-owner check, post-adoption withdrawal order, rollback/retry behavior, and the exact `APPROVED` restart gate. Do not read or mutate real session state in this task, and never send a test prompt to a real conversation. The later authorized repair receipt may contain only target IDs, graph counts, digests, revision/status codes, and completion status; it must not retain transcript bodies or obsolete incident exports.
 
 - [ ] **Step 4: Run E2E and live restoration verification**
 
-Run: `FRESHELL_TEST_SUMMARY='managed OpenCode source-to-soul resume' pnpm run test:e2e:local --project=rust-chromium --grep='managed OpenCode source-to-soul resume' test/e2e-browser/specs/runtime-provider-resurrection-rust.spec.ts`
+Run: `FRESHELL_TEST_SUMMARY='managed OpenCode source-to-soul resume cloud' GCLOUD_ROBOT_REQUIRE=1 pnpm run test:e2e:cloud --project=rust-chromium --grep='managed OpenCode source-to-soul resume' test/e2e-browser/specs/runtime-provider-resurrection-rust.spec.ts`
 
-Expected: PASS for synthetic exact-history resume, new-turn append/reopen, fail-closed partial transfer, and false-loss prevention. The operational receipt reports seven restored roots, one canonical owner per root, eight false incident references withdrawn, and zero transcript bodies recorded.
+Expected: PASS for synthetic exact-history import, pre-spawn verification, post-spawn adoption, new-turn append/reopen, fail-closed partial transfer, stale cleanup fencing, and false-loss prevention. The runbook contains no real session contents or incident exports.
 
 - [ ] **Step 5: Refactor while green**
 
-Remove temporary test-only hooks and duplicated fixture setup. Confirm false incident cleanup is driven only by the exact verified set and is idempotent. Re-run the focused E2E and inspect the operational receipt for body-free output.
+Remove temporary test-only hooks and duplicated fixture setup. Confirm false incident cleanup is driven only by the exact verified target set and is idempotent. Re-run the configured cloud E2E and inspect the runbook for exact restart and data-restoration gates.
 
 - [ ] **Step 6: Run impacted-test and full verification**
 
@@ -355,12 +355,11 @@ git add test/e2e-browser/specs/runtime-provider-resurrection-rust.spec.ts test/e
 git commit -m "test(runtime): prove managed OpenCode history recovery"
 ```
 
-## Completion Gate
+## Code and PR Completion Gate
 
 - [ ] All six task commits are reviewed; the branch is clean and based on current `origin/main`.
-- [ ] The original seven native roots and all required recursive history/dependencies remain intact; each root has one canonical managed writer and passes provider-readable reopen plus synthetic append/reopen verification.
-- [ ] The eight false-lost soul/incident references are reconciled; exact incident DB rows, loss-created tombstones, pending/delivered exports, notices/projections, open/closed JSON files, and active/rotated JSONL entries no longer surface these false incidents. Unrelated incidents, notices, and user stop intent remain.
+- [ ] Synthetic coverage proves exact import, provider adoption, append/reopen, single-writer ownership across different destination stores, fail-closed source handling, and exact false-incident withdrawal while preserving unrelated notices and user stop intent.
 - [ ] Incomplete or unresolved source transfer cannot launch or become Lost; a truly absent complete source inventory can still follow existing true-loss behavior.
 - [ ] The full supported suite and affected E2E coverage pass; whole-branch and final delta reviews have no unresolved must-fix findings.
 - [ ] Open and merge the authorized PR targeting `main`, wait for required checks, merge, fast-forward local `main`, and clean up the feature worktree per repository instructions.
-- [ ] Do not restart the self-hosted Freshell server; that requires the explicit word `APPROVED`.
+- [ ] **Post-merge live restoration (separate approval gate):** verify the exact seven source roots and eight incident references using only body-free metadata; resolve the canonical duplicate owner; then request exact `APPROVED` before restarting/deploying the self-hosted server. After approval, use the merged restore flow, verify imported history and provider adoption for all seven roots, withdraw the eight exact false incidents and dependent exports, verify unrelated incidents/notices/user stops remain, and delete any temporary withdrawal-progress marker. Until this finishes, report the live restoration as pending; PR merge alone is not completion of the data repair.
