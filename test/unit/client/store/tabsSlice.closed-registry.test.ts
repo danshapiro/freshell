@@ -57,11 +57,11 @@ describe('tabsSlice closed registry capture', () => {
 
     store.dispatch(initLayout({
       tabId,
-      content: { kind: 'terminal', mode: 'shell' },
+      content: { kind: 'terminal', mode: 'shell', status: 'running' },
     }))
     store.dispatch(addPane({
       tabId,
-      newContent: { kind: 'terminal', mode: 'shell' },
+      newContent: { kind: 'terminal', mode: 'shell', status: 'running' },
     }))
 
     await store.dispatch(closeTab(tabId) as any)
@@ -82,7 +82,7 @@ describe('tabsSlice closed registry capture', () => {
 
     store.dispatch(initLayout({
       tabId,
-      content: { kind: 'terminal', mode: 'shell' },
+      content: { kind: 'terminal', mode: 'shell', status: 'running' },
     }))
 
     await store.dispatch(closeTab(tabId) as any)
@@ -107,14 +107,14 @@ describe('tabsSlice closed registry capture', () => {
     const firstId = store.getState().tabs.tabs[0]!.id
     store.dispatch(initLayout({
       tabId: firstId,
-      content: { kind: 'terminal', mode: 'shell' },
+      content: { kind: 'terminal', mode: 'shell', status: 'running' },
     }))
 
     store.dispatch(addTab({ title: 'Second' }))
     const secondId = store.getState().tabs.tabs[1]!.id
     store.dispatch(initLayout({
       tabId: secondId,
-      content: { kind: 'terminal', mode: 'claude' },
+      content: { kind: 'terminal', mode: 'claude', status: 'running' },
     }))
 
     await store.dispatch(closeTab(secondId) as any)
@@ -163,13 +163,13 @@ describe('tabsSlice closed registry capture — unified agent names (Task 6)', (
     store.dispatch(initLayout({
       tabId,
       paneId: 'p-agent',
-      content: { kind: 'terminal', mode: 'claude' },
+      content: { kind: 'terminal', mode: 'claude', status: 'running' },
     }))
     // A second pane makes the closed tab registry-keepable (the single-pane
     // short-lived rule would drop the snapshot).
     store.dispatch(addPane({
       tabId,
-      newContent: { kind: 'terminal', mode: 'shell' },
+      newContent: { kind: 'terminal', mode: 'shell', status: 'running' },
     }))
     // The lifecycle middleware is not registered in this harness; pin the
     // pointer explicitly the way any resolved tab would carry it.

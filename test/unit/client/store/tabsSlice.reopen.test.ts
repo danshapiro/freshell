@@ -65,7 +65,7 @@ describe('reopenClosedTab', () => {
 
     store.dispatch(addTab({ title: 'Will Close' }))
     const closeId = store.getState().tabs.tabs[1]!.id
-    store.dispatch(initLayout({ tabId: closeId, content: { kind: 'terminal', mode: 'shell' } }))
+    store.dispatch(initLayout({ tabId: closeId, content: { kind: 'terminal', mode: 'shell', status: 'running' } }))
 
     await store.dispatch(closeTab(closeId) as any)
     expect(store.getState().tabs.tabs).toHaveLength(1)
@@ -90,11 +90,11 @@ describe('reopenClosedTab', () => {
 
     store.dispatch(addTab({ title: 'First Closed' }))
     const firstId = store.getState().tabs.tabs[1]!.id
-    store.dispatch(initLayout({ tabId: firstId, content: { kind: 'terminal', mode: 'shell' } }))
+    store.dispatch(initLayout({ tabId: firstId, content: { kind: 'terminal', mode: 'shell', status: 'running' } }))
 
     store.dispatch(addTab({ title: 'Second Closed' }))
     const secondId = store.getState().tabs.tabs[2]!.id
-    store.dispatch(initLayout({ tabId: secondId, content: { kind: 'terminal', mode: 'shell' } }))
+    store.dispatch(initLayout({ tabId: secondId, content: { kind: 'terminal', mode: 'shell', status: 'running' } }))
 
     await store.dispatch(closeTab(secondId) as any)
     await store.dispatch(closeTab(firstId) as any)
@@ -130,7 +130,7 @@ describe('reopenClosedTab', () => {
 
     store.dispatch(addTab({ title: 'Split Tab' }))
     const splitTabId = store.getState().tabs.tabs[1]!.id
-    store.dispatch(initLayout({ tabId: splitTabId, content: { kind: 'terminal', mode: 'shell' } }))
+    store.dispatch(initLayout({ tabId: splitTabId, content: { kind: 'terminal', mode: 'shell', status: 'running' } }))
 
     // Add a split pane
     const firstPaneId = store.getState().panes.activePane[splitTabId]
@@ -175,7 +175,7 @@ describe('reopenClosedTab', () => {
 
     store.dispatch(addTab({ title: 'Closed' }))
     const closeId = store.getState().tabs.tabs[1]!.id
-    store.dispatch(initLayout({ tabId: closeId, content: { kind: 'terminal', mode: 'shell' } }))
+    store.dispatch(initLayout({ tabId: closeId, content: { kind: 'terminal', mode: 'shell', status: 'running' } }))
 
     await store.dispatch(closeTab(closeId) as any)
     expect(store.getState().tabRegistry.reopenStack).toHaveLength(1)
@@ -193,7 +193,7 @@ describe('reopenClosedTab', () => {
 
     store.dispatch(addTab({ title: 'Renamed Panes' }))
     const tabId = store.getState().tabs.tabs[1]!.id
-    store.dispatch(initLayout({ tabId, content: { kind: 'terminal', mode: 'shell' } }))
+    store.dispatch(initLayout({ tabId, content: { kind: 'terminal', mode: 'shell', status: 'running' } }))
 
     const paneId = store.getState().panes.activePane[tabId]
     store.dispatch(updatePaneTitle({ tabId, paneId, title: 'User Title', setByUser: true }))

@@ -621,7 +621,7 @@ describe('tabsSlice', () => {
       // Initialize pane
       store.dispatch(initLayout({
         tabId,
-        content: { kind: 'terminal', mode: 'shell' },
+        content: { kind: 'terminal', mode: 'shell', status: 'running' },
       }))
 
       expect(store.getState().panes.layouts[tabId]).toBeDefined()
@@ -662,6 +662,7 @@ describe('tabsSlice', () => {
       return {
         kind: 'terminal' as const,
         mode: 'claude' as const,
+        status: 'running' as const,
         resumeSessionId: sessionId,
         sessionRef: { provider: 'claude', sessionId },
       }
@@ -692,7 +693,7 @@ describe('tabsSlice', () => {
       const store = createRatchetStore()
       store.dispatch(addTab({ mode: 'shell' }))
       const tabId = store.getState().tabs.tabs[0].id
-      store.dispatch(initLayout({ tabId, content: { kind: 'terminal', mode: 'shell' } }))
+      store.dispatch(initLayout({ tabId, content: { kind: 'terminal', mode: 'shell', status: 'running' } }))
 
       await store.dispatch(closeTab(tabId))
 
@@ -709,6 +710,7 @@ describe('tabsSlice', () => {
         content: {
           kind: 'terminal',
           mode: 'claude',
+          status: 'running',
           resumeSessionId: VALID_CLAUDE_SESSION_ID,
         },
       }))
@@ -768,14 +770,14 @@ describe('tabsSlice', () => {
       const tabId = store.getState().tabs.tabs[0].id
       store.dispatch(initLayout({
         tabId,
-        content: { kind: 'terminal', mode: 'opencode', terminalId: 'term-op-1' },
+        content: { kind: 'terminal', mode: 'opencode', terminalId: 'term-op-1', status: 'running' },
       }))
       const leafId = (store.getState().panes.layouts[tabId] as any).id
       store.dispatch(splitPane({
         tabId,
         paneId: leafId,
         direction: 'horizontal',
-        newContent: { kind: 'terminal', mode: 'opencode', terminalId: 'term-op-2' },
+        newContent: { kind: 'terminal', mode: 'opencode', terminalId: 'term-op-2', status: 'running' },
       }))
 
       const beforeClose = Date.now()
@@ -804,7 +806,7 @@ describe('tabsSlice', () => {
       const tabId = store.getState().tabs.tabs[0].id
       store.dispatch(initLayout({
         tabId,
-        content: { kind: 'terminal', mode: 'codex', terminalId: 'term-cx-1', codexDurability },
+        content: { kind: 'terminal', mode: 'codex', terminalId: 'term-cx-1', codexDurability, status: 'running' },
       }))
 
       const beforeClose = Date.now()
@@ -835,7 +837,7 @@ describe('tabsSlice', () => {
       const tabId = store.getState().tabs.tabs[0].id
       store.dispatch(initLayout({
         tabId,
-        content: { kind: 'terminal', mode: 'claude', terminalId: 'term-ref-1' },
+        content: { kind: 'terminal', mode: 'claude', terminalId: 'term-ref-1', status: 'running' },
       }))
 
       const beforeClose = Date.now()
@@ -864,7 +866,7 @@ describe('tabsSlice', () => {
       const tabId = store.getState().tabs.tabs[0].id
       store.dispatch(initLayout({
         tabId,
-        content: { kind: 'terminal', mode: 'codex', terminalId: 'term-cx-2' },
+        content: { kind: 'terminal', mode: 'codex', terminalId: 'term-cx-2', status: 'running' },
       }))
 
       const beforeClose = Date.now()
@@ -885,7 +887,7 @@ describe('tabsSlice', () => {
       const tabId = store.getState().tabs.tabs[0].id
       store.dispatch(initLayout({
         tabId,
-        content: { kind: 'terminal', mode: 'opencode', terminalId: 'term-miss-1' },
+        content: { kind: 'terminal', mode: 'opencode', terminalId: 'term-miss-1', status: 'running' },
       }))
 
       const beforeClose = Date.now()

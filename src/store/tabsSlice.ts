@@ -1366,18 +1366,39 @@ function hasManagedRuntimeMarker(content: Extract<PaneContent, { kind: 'terminal
     .some((value) => typeof value === 'string' && value.length > 0)
 }
 
-type PaneCloseTargetIdentity = string | PaneContent
+type ManagedTerminalCloseIdentity = {
+  kind: 'managed-terminal-close-identity'
+  createRequestId?: string
+  viewIntentId?: string
+  soulId?: string
+  incarnationId?: string
+  terminalId?: string
+  sessionProvider?: string
+  sessionId?: string
+  hasManagedMarker: boolean
+  isCreating: boolean
+}
+
+type PaneCloseTargetIdentity = string | PaneContent | ManagedTerminalCloseIdentity
 
 function paneCloseTargetIdentity(content: PaneContent): PaneCloseTargetIdentity {
   if (content.kind === 'terminal') {
-    if (content.createRequestId) return JSON.stringify(['terminal', 'create', content.createRequestId])
-    if (content.viewIntentId) return JSON.stringify(['terminal', 'view', content.viewIntentId])
-    if (content.soulId) return JSON.stringify(['terminal', 'soul', content.soulId])
-    if (content.terminalId) return JSON.stringify(['terminal', 'terminal', content.terminalId])
-    if (content.sessionRef) {
-      return JSON.stringify(['terminal', 'session', content.sessionRef.provider, content.sessionRef.sessionId])
+    // The view/soul/creation handles fence which managed view this pane is
+    // about. A terminal.created fold may add its first terminal ID while the
+    // create request remains stable, but a known terminal ID may never be
+    // replaced during an asynchronous close.
+    return {
+      kind: 'managed-terminal-close-identity',
+      createRequestId: content.createRequestId,
+      viewIntentId: content.viewIntentId,
+      soulId: content.soulId,
+      incarnationId: content.incarnationId,
+      terminalId: content.terminalId,
+      sessionProvider: content.sessionRef?.provider,
+      sessionId: content.sessionRef?.sessionId,
+      hasManagedMarker: hasManagedRuntimeMarker(content),
+      isCreating: content.status === 'creating',
     }
-    return content
   }
   if (content.kind === 'fresh-agent') {
     if (content.createRequestId) return JSON.stringify(['fresh-agent', 'create', content.createRequestId])
@@ -1394,6 +1415,29 @@ function samePaneCloseTargetIdentity(
   current: PaneContent | null,
 ): boolean {
   if (!current) return false
+  if (typeof original === 'object' && 'kind' in original && original.kind === 'managed-terminal-close-identity') {
+    if (current.kind !== 'terminal') return false
+    const currentIdentity = paneCloseTargetIdentity(current)
+    if (
+      typeof currentIdentity !== 'object'
+      || !('kind' in currentIdentity)
+      || currentIdentity.kind !== 'managed-terminal-close-identity'
+    ) return false
+    if (
+      original.createRequestId !== currentIdentity.createRequestId
+      || original.viewIntentId !== currentIdentity.viewIntentId
+      || original.soulId !== currentIdentity.soulId
+      || original.incarnationId !== currentIdentity.incarnationId
+      || original.sessionProvider !== currentIdentity.sessionProvider
+      || original.sessionId !== currentIdentity.sessionId
+      || original.hasManagedMarker !== currentIdentity.hasManagedMarker
+    ) return false
+    const terminalIdMatches = original.terminalId === currentIdentity.terminalId
+      || (!original.terminalId && Boolean(currentIdentity.terminalId) && Boolean(original.createRequestId))
+    const creationStateMatches = original.isCreating === currentIdentity.isCreating
+      || (original.isCreating && !currentIdentity.isCreating && Boolean(original.createRequestId))
+    return terminalIdMatches && creationStateMatches
+  }
   if (typeof original !== 'string') return current === original
   return paneCloseTargetIdentity(current) === original
 }
@@ -1526,6 +1570,38 @@ function collectOtherLocalManagedViewIds(
   return viewIntentIds
 }
 
+function isManagedViewRepresentedLocally(
+  state: RootState,
+  view: ManagedRuntimeViewIntent,
+  soul: ManagedRuntimeSoul | undefined,
+): boolean {
+  for (const tab of state.tabs.tabs) {
+    const layout = state.panes.layouts[tab.id]
+    if (!layout) {
+      if (
+        tab.viewIntentId === view.viewId
+        || (!tab.viewIntentId && tab.soulId === view.soulId)
+        || (!tab.viewIntentId && soul?.terminalCreateRequestId === tab.createRequestId)
+      ) return true
+      continue
+    }
+    for (const { content } of collectPaneEntries(layout)) {
+      if (!isManagedRuntimeProjection(content)) continue
+      if (content.viewIntentId) {
+        if (content.viewIntentId === view.viewId) return true
+        continue
+      }
+      if (content.soulId && content.soulId !== view.soulId) continue
+      if (
+        (content.soulId && content.soulId === view.soulId)
+        || (content.terminalId && content.terminalId === soul?.terminalId)
+        || (content.createRequestId && content.createRequestId === soul?.terminalCreateRequestId)
+      ) return true
+    }
+  }
+  return false
+}
+
 /** Resolve exact close targets before detaching the local representation. */
 type ManagedViewCloseResolution = {
   viewIntentIds: string[]
@@ -1553,6 +1629,12 @@ function resolveManagedViewIntentsToRemove(
   const hasKnownMarker = terminalTargets.some(({ content }) => (
     isManagedRuntimeProjection(content) && hasManagedRuntimeMarker(content)
   )) || Boolean(tabViewIntentId)
+  const unresolvedCreation = terminalTargets.some(({ content }) => (
+    isManagedRuntimeProjection(content) && content.status === 'creating'
+  ))
+  if (!runtime.available && unresolvedCreation) {
+    throw new Error(MANAGED_VIEW_CLOSE_FAILED_MESSAGE)
+  }
   if (!runtime.available) {
     if (hasKnownMarker) throw new Error(MANAGED_VIEW_CLOSE_FAILED_MESSAGE)
     return { viewIntentIds: [], paneIds: [] }
@@ -1798,9 +1880,16 @@ async function persistManagedViewVisibility(
     const matches = confirmedViews.get(viewIntentId) ?? []
     return matches.length !== 1 || matches[0]!.visibility !== visibility
   })
-  if (mutationError !== undefined) throw mutationError
   if (unconfirmedIds.length > 0) {
+    if (mutationError !== undefined) throw mutationError
     throw new Error(`Managed view visibility was not confirmed for ${unconfirmedIds.join(', ')}`)
+  }
+  if (mutationError !== undefined) {
+    log.warn('managed view update reported an error but inventory confirms the requested visibility', {
+      viewIntentIds,
+      visibility,
+      error: mutationError instanceof Error ? mutationError.message : String(mutationError),
+    })
   }
 }
 
@@ -2238,8 +2327,21 @@ export const detachManagedRuntimeView = createAsyncThunk(
       }
       const snapshot = await getManagedRuntimeInventory()
       applyManagedRuntimeInventory(snapshot, dispatch, getState as () => RootState)
+      if (
+        snapshot.readiness.initialScanState !== 'complete'
+        || snapshot.pendingProjectionCount !== 0
+      ) {
+        throw new Error(MANAGED_VIEW_CLOSE_FAILED_MESSAGE)
+      }
       const matches = snapshot.viewIntents.filter((view) => view.viewId === viewIntentId)
       if (matches.length !== 1) throw new Error(MANAGED_VIEW_CLOSE_FAILED_MESSAGE)
+      const targetView = matches[0]!
+      const souls = snapshot.souls.filter((soul) => soul.soulId === targetView.soulId)
+      if (souls.length !== 1) throw new Error(MANAGED_VIEW_CLOSE_FAILED_MESSAGE)
+      const targetSoul = souls[0]!
+      if (isManagedViewRepresentedLocally(getState() as RootState, targetView, targetSoul)) {
+        throw new Error(MANAGED_VIEW_CLOSE_FAILED_MESSAGE)
+      }
       await persistManagedViewVisibility(
         [viewIntentId],
         'detached',
