@@ -440,6 +440,186 @@ fn exports_exact_recursive_native_closure_and_omits_account_and_derived_rows() {
 }
 
 #[test]
+fn exports_distinct_manifest_keys_for_each_selected_context_epoch() {
+    let fixture = TestDir::new("context-epoch-keys");
+    let database = fixture.path().join("opencode.db");
+    let source = create_synthetic_source(&database);
+    for session_id in ["ses_child", "ses_grandchild"] {
+        source
+            .execute(
+                "INSERT INTO session_context_epoch (session_id, baseline, snapshot, baseline_seq)
+                 VALUES (?1, 'baseline', ?2, 1)",
+                params![session_id, format!("{{\"session\":\"{session_id}\"}}")],
+            )
+            .unwrap();
+    }
+    let inventory = HostOpenCodeInventory::new(fixture.path().join("unused.db"))
+        .with_channel_database(database);
+
+    let snapshot = export_exact_session(
+        &inventory,
+        "ses_root",
+        ExportOptions::new(fixture.path().join("extract")),
+    )
+    .expect("context epochs for selected descendants are exported");
+
+    let keys = snapshot
+        .manifest()
+        .row_digests()
+        .iter()
+        .filter(|row| row.table == "session_context_epoch")
+        .map(|row| serde_json::to_value(&row.key).unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        keys,
+        [
+            serde_json::json!([{"type":"text","value":"ses_root"}]),
+            serde_json::json!([{"type":"text","value":"ses_child"}]),
+            serde_json::json!([{"type":"text","value":"ses_grandchild"}]),
+        ]
+    );
+}
+
+#[test]
+fn blocks_selected_rows_with_incomplete_primary_keys_without_publishing_a_bundle() {
+    let fixture = TestDir::new("missing-selected-primary-key");
+    let database = fixture.path().join("opencode.db");
+    let source = create_synthetic_source(&database);
+    source
+        .execute(
+            "INSERT INTO permission
+             (id, project_id, action, resource, time_created, time_updated)
+             VALUES (NULL, 'prj_kept', 'read', 'missing-key', 2, 2)",
+            [],
+        )
+        .unwrap();
+    let extraction_root = fixture.path().join("extract");
+    let inventory = HostOpenCodeInventory::new(fixture.path().join("unused.db"))
+        .with_channel_database(database);
+
+    let result = export_exact_session(
+        &inventory,
+        "ses_root",
+        ExportOptions::new(extraction_root.clone()),
+    );
+
+    assert!(
+        matches!(result, Err(TransferError::Blocked(_))),
+        "a selected row without its complete primary key must remain unresolved"
+    );
+    assert_eq!(fs::read_dir(extraction_root).unwrap().count(), 0);
+}
+
+fn assert_non_text_selected_json_value_blocks_without_mutating_source(
+    label: &str,
+    invalid_value: rusqlite::types::Value,
+    expected_storage_class: &str,
+) {
+    let fixture = TestDir::new(label);
+    let database = fixture.path().join("opencode.db");
+    let source = create_synthetic_source(&database);
+    let source = if expected_storage_class == "integer" {
+        drop(source);
+        set_part_data_to_integer_storage_class(&database);
+        Connection::open(&database).unwrap()
+    } else {
+        source
+            .execute(
+                "UPDATE part SET data = ?1 WHERE id = 'part_ses_root'",
+                [invalid_value],
+            )
+            .unwrap();
+        source
+    };
+    let before: (String, String) = source
+        .query_row(
+            "SELECT typeof(data), quote(data) FROM part WHERE id = 'part_ses_root'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(before.0, expected_storage_class);
+
+    let extraction_root = fixture.path().join("extract");
+    let inventory = HostOpenCodeInventory::new(fixture.path().join("unused.db"))
+        .with_channel_database(database);
+    let result = export_exact_session(
+        &inventory,
+        "ses_root",
+        ExportOptions::new(extraction_root.clone()),
+    );
+
+    assert!(
+        matches!(result, Err(TransferError::Blocked(_))),
+        "selected JSON columns stored as {expected_storage_class} must remain unresolved"
+    );
+    assert_eq!(fs::read_dir(extraction_root).unwrap().count(), 0);
+    let after: (String, String) = source
+        .query_row(
+            "SELECT typeof(data), quote(data) FROM part WHERE id = 'part_ses_root'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(after, before, "export leaves the source row unchanged");
+}
+
+fn set_part_data_to_integer_storage_class(database: &Path) {
+    // SQLite applies TEXT affinity on assignment, so create this synthetic
+    // malformed row while the fixture schema temporarily has BLOB affinity.
+    // Restore the exact pinned schema before the exporter opens the source.
+    let change_part_data_affinity = |from: &str, to: &str| {
+        let connection = Connection::open(database).unwrap();
+        connection
+            .execute_batch("PRAGMA writable_schema = ON;")
+            .unwrap();
+        let changed = connection
+            .execute(
+                "UPDATE sqlite_master SET sql = replace(sql, ?1, ?2)
+                 WHERE type = 'table' AND name = 'part'",
+                params![from, to],
+            )
+            .unwrap();
+        assert_eq!(changed, 1, "the synthetic part schema is present");
+        drop(connection);
+    };
+
+    change_part_data_affinity("`data` text NOT NULL", "`data` BLOB NOT NULL");
+    let connection = Connection::open(database).unwrap();
+    connection
+        .execute("UPDATE part SET data = 42 WHERE id = 'part_ses_root'", [])
+        .unwrap();
+    let storage_class: String = connection
+        .query_row(
+            "SELECT typeof(data) FROM part WHERE id = 'part_ses_root'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(storage_class, "integer");
+    drop(connection);
+    change_part_data_affinity("`data` BLOB NOT NULL", "`data` text NOT NULL");
+}
+
+#[test]
+fn blocks_blob_values_in_selected_json_columns() {
+    assert_non_text_selected_json_value_blocks_without_mutating_source(
+        "blob-json-column",
+        rusqlite::types::Value::Blob(b"{}".to_vec()),
+        "blob",
+    );
+}
+
+#[test]
+fn blocks_integer_values_in_selected_json_columns() {
+    assert_non_text_selected_json_value_blocks_without_mutating_source(
+        "integer-json-column",
+        rusqlite::types::Value::Integer(42),
+        "integer",
+    );
+}
+
+#[test]
 fn blocks_sources_without_a_pinned_migration_journal() {
     let fixture = TestDir::new("missing-migration-journal");
     let database = fixture.path().join("opencode.db");
