@@ -18,6 +18,8 @@ import {
   requestSessionHandoff,
   SessionHandoffErrorCodeSchema,
   SessionHandoffResultSchema,
+  stopManagedRuntimeSoul,
+  getManagedRuntimeInventory,
 } from '@/lib/api'
 import {
   RestoreStaleRevisionResponseSchema,
@@ -27,9 +29,40 @@ import {
 import {
   codexContractSnapshot,
 } from '../../../fixtures/fresh-agent/codex/contract-fixtures.js'
+import lostFreshAgentInventory from '../../../fixtures/managed-runtime/lost-fresh-agent-inventory.json'
 
 const mockFetch = vi.fn()
 global.fetch = mockFetch
+
+describe('managed runtime stop outcome', () => {
+  beforeEach(() => mockFetch.mockReset())
+
+  it.each(['verified_empty', 'termination_unconfirmed', 'blocked_ownership', 'backend_unavailable'])(
+    'returns the authoritative %s outcome while allowing additive soul fields', async (outcome) => {
+      mockFetch.mockResolvedValueOnce(mockJson({ outcome, soul: { freshAgentSessionId: 'retained-thread' } }))
+      expect(await stopManagedRuntimeSoul('persisted/soul', 8, 'stop-request')).toEqual({ outcome })
+      expect(mockFetch).toHaveBeenCalledWith('/api/runtime/souls/persisted%2Fsoul/stop', expect.objectContaining({
+        method: 'POST', body: JSON.stringify({ requestId: 'stop-request', expectedIntentRevision: 8 }),
+      }))
+    },
+  )
+
+  it.each([{}, { outcome: 'stopped' }, { outcome: null }])('rejects a successful HTTP response without a known cleanup outcome: %j', async (body) => {
+    mockFetch.mockResolvedValueOnce(mockJson(body))
+    await expect(stopManagedRuntimeSoul('soul', 8)).rejects.toThrow()
+  })
+
+  it('accepts the persisted lost Fresh Agent inventory serialized by the real Rust route', async () => {
+    // Captured by restored_web_stops_persisted_lost_soul_only_after_verified_cleanup.
+    mockFetch.mockResolvedValueOnce(mockJson(lostFreshAgentInventory))
+    const inventory = await getManagedRuntimeInventory()
+    expect(inventory.souls[0]).toMatchObject({
+      freshAgentSessionId: 'fresh-retained-thread', freshAgentSessionType: 'freshopencode',
+      freshAgentRuntimeVariant: 'opencode', nativeSessionId: 'retained-thread',
+      desiredState: 'stopped', recoveryState: 'lost', cleanupState: 'termination_unconfirmed',
+    })
+  })
+})
 
 function mockJson(value: unknown) {
   return {

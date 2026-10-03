@@ -4,7 +4,7 @@ import type { ManagedRuntimeRecoverySummary } from '@shared/managed-runtime'
 export type ManagedRuntimeRecoveryCardProps = {
   recoverySummary?: ManagedRuntimeRecoverySummary
   onRetry: () => Promise<void>
-  onStartFresh: () => void
+  onStartFresh: () => void | Promise<void>
 }
 
 /** Whether a managed projection owns the pane's recovery decision. */
@@ -20,23 +20,23 @@ export function ManagedRuntimeRecoveryCard({
   onRetry,
   onStartFresh,
 }: ManagedRuntimeRecoveryCardProps) {
-  const [retrying, setRetrying] = useState(false)
-  const [retryError, setRetryError] = useState<string>()
+  const [pending, setPending] = useState(false)
+  const [actionError, setActionError] = useState<string>()
   const recoveryState = recoverySummary?.recoveryState
 
   if (recoveryState !== 'blocked' && recoveryState !== 'lost') return null
 
   const blocked = recoveryState === 'blocked'
-  const handleRetry = async () => {
-    if (retrying) return
-    setRetrying(true)
-    setRetryError(undefined)
+  const handleAction = async () => {
+    if (pending) return
+    setPending(true)
+    setActionError(undefined)
     try {
-      await onRetry()
+      await (blocked ? onRetry() : onStartFresh())
     } catch (error) {
-      setRetryError(error instanceof Error ? error.message : 'Retry failed. Try again.')
+      setActionError(error instanceof Error ? error.message : 'The action failed. Try again.')
     } finally {
-      setRetrying(false)
+      setPending(false)
     }
   }
 
@@ -52,28 +52,29 @@ export function ManagedRuntimeRecoveryCard({
             ? 'This session needs attention before it can continue.'
             : 'This session could not be recovered. Start a new conversation when you are ready.'}
         </span>
-        {retryError ? (
+        {actionError ? (
           <span role="status" className="ml-2 text-xs text-amber-700 dark:text-amber-300">
-            {retryError}
+            {actionError}
           </span>
         ) : null}
       </div>
       {blocked ? (
         <button
           type="button"
-          disabled={retrying}
-          onClick={() => void handleRetry()}
+          disabled={pending}
+          onClick={() => void handleAction()}
           className="shrink-0 rounded border border-border/70 px-2 py-1 text-xs"
         >
-          {retrying ? 'Retrying…' : 'Retry recovery'}
+          {pending ? 'Retrying…' : 'Retry recovery'}
         </button>
       ) : (
         <button
           type="button"
-          onClick={onStartFresh}
+          disabled={pending}
+          onClick={() => void handleAction()}
           className="shrink-0 rounded border border-border/70 px-2 py-1 text-xs"
         >
-          Start new conversation
+          {pending ? 'Starting…' : 'Start new conversation'}
         </button>
       )}
     </div>

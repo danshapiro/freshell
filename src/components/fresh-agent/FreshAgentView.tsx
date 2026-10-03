@@ -23,6 +23,7 @@ import { api, getFreshAgentModelCapabilities, getFreshAgentThreadSnapshot, retry
 import { clearReconcilePendingPane, consumePaneRefreshRequest, mergePaneContent, startNewManagedRuntimeConversation, updatePaneContent } from '@/store/panesSlice'
 import { isManagedRuntimeRecoveryDecision, ManagedRuntimeRecoveryCard } from '@/components/ManagedRuntimeRecoveryCard'
 import { queueManagedRuntimeRefresh } from '@/lib/recovery/managed-runtime-recovery'
+import { confirmManagedRuntimeStopped } from '@/lib/managed-runtime-stop'
 import { FRESH_AGENT_MODEL_CATALOG_UNAVAILABLE_NOTICE } from '@/lib/fresh-agent-model-capabilities'
 import { applyRefusalFence, clearPendingCreateFailure, clearRestoreFailure, clearSessionError, clearSessionLost, sessionError, setSessionStatus } from '@/store/freshAgentSlice'
 import { openSessionTab } from '@/store/tabsSlice'
@@ -1574,22 +1575,17 @@ export function FreshAgentView({
     } as const
   }, [providerDefaults, tabId])
 
-  const startNewConversation = useCallback(() => {
+  const startNewConversation = useCallback(async () => {
     const current = paneContentRef.current
-    // Focused-episode-6 round 2 (Finding 6): a session-bearing conversation
-    // replacement AWAITS the old session's durable close before swapping the
-    // pane — a close the server cannot record is not a close, and dropping
-    // the conversation anyway would leave a live server session open on no
-    // tab. On failure the current conversation stays (the killed fold's
-    // session-error banner — or the await's timeout write — explains it).
-    void (async () => {
-      // b8ke ext F2: the kill target is the pane's DURABLE session —
-      // content.sessionId OR the restored pane's sessionRef.sessionId
-      // (the sessionRef's provider must match the pane's). Pre-ext the
-      // content.sessionId gate skipped the awaited kill entirely for a
-      // sessionRef-only restored pane, clearing the durable reference
-      // and starting a blank conversation while the prior runtime
-      // stayed live and unrepresented.
+    // A managed loss may already be stopped and absent from the web alias cache.
+    // Its persisted soul is the cleanup authority before replacing identity.
+    if (current.soulId || isManagedRuntimeRecoveryDecision(current.recoverySummary)) {
+      await confirmManagedRuntimeStopped(current)
+      if (paneContentRef.current.soulId !== current.soulId
+        || paneContentRef.current.createRequestId !== current.createRequestId) return
+    } else {
+      // Unmanaged sessions still await their durable close acknowledgement,
+      // including a restored pane whose only identity is its sessionRef.
       const killSessionId = current.sessionId
         ?? (current.sessionRef?.provider === current.provider
           ? current.sessionRef.sessionId
@@ -1622,15 +1618,21 @@ export function FreshAgentView({
           return
         }
       }
-      commitSnapshot(null)
-      setLoadError(null)
-      setQueuedMessages([])
-      setLocalEcho(null)
-      alwaysAllowToolsRef.current.clear()
-      pendingAutoTitleBySessionIdRef.current.clear()
-      dispatch(startNewManagedRuntimeConversation({ tabId, paneId }))
-    })()
+    }
+    commitSnapshot(null)
+    setLoadError(null)
+    setQueuedMessages([])
+    setLocalEcho(null)
+    alwaysAllowToolsRef.current.clear()
+    pendingAutoTitleBySessionIdRef.current.clear()
+    dispatch(startNewManagedRuntimeConversation({ tabId, paneId }))
   }, [appStore, commitSnapshot, dispatch, paneId, sendFreshAgentMessage, setLocalEcho, tabId])
+
+  const handleStartNewConversation = useCallback(() => {
+    void startNewConversation().catch((error: unknown) => {
+      setLoadError(error instanceof Error ? error.message : 'Cleanup failed. Your conversation has been kept.')
+    })
+  }, [startNewConversation])
 
   const retryManagedRecovery = useCallback(async () => {
     const current = paneContentRef.current
@@ -1706,7 +1708,7 @@ export function FreshAgentView({
   const runSlashCommand = useCallback((command: FreshAgentSlashCommand, args: string) => {
     const current = paneContentRef.current
     if (command.action === 'new') {
-      startNewConversation()
+      handleStartNewConversation()
       return
     }
     if (command.action === 'model') {
@@ -1769,7 +1771,7 @@ export function FreshAgentView({
       sendRollback(direction, 'step')
       return
     }
-  }, [appStore, descriptor?.label, sendFork, sendFreshAgentMessage, sendRollback, startNewConversation])
+  }, [appStore, descriptor?.label, sendFork, sendFreshAgentMessage, sendRollback, handleStartNewConversation])
 
   useEffect(() => {
     if (!refreshRequest) return
@@ -3739,7 +3741,7 @@ export function FreshAgentView({
                       type="button"
                       className="fresh-agent-stuck-action shrink-0 rounded border border-border/70 px-2 py-1 text-xs"
                       aria-label="Start new conversation"
-                      onClick={startNewConversation}
+                      onClick={handleStartNewConversation}
                     >
                       Start new conversation
                     </button>
@@ -3837,7 +3839,7 @@ export function FreshAgentView({
                     <button
                       type="button"
                       className="fresh-agent-session-ended-action rounded border border-border/70 px-2 py-1 text-xs"
-                      onClick={startNewConversation}
+                      onClick={handleStartNewConversation}
                     >
                       Start new session
                     </button>
