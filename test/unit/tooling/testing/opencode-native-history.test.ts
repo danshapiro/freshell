@@ -105,8 +105,11 @@ describe('resumed OpenCode readiness is an input-mode signal, not a home-screen 
     expect(openCodeTerminalReady('')).toBe(false)
   })
 
-  it('keeps the free-tier model banner part of readiness and handles ANSI styling', () => {
-    expect(openCodeTerminalReady('\x1b[?2004hBuild Expensive model')).toBe(false)
-    expect(openCodeTerminalReady('\x1b[?2004h\x1b[32mBuild\x1b[0m \x1b[31mBig Pickle\x1b[0m')).toBe(true)
+  it.each(['Big Pickle', 'GPT-5.6 Luna'])('recognizes the configured %s model with ANSI styling and active input', (model) => {
+    const banner = `\x1b[32mBuild\x1b[0m \x1b[31m${model}\x1b[0m`
+    expect(openCodeTerminalReady(`\x1b[?2004h${banner}`)).toBe(true)
+    expect(openCodeTerminalReady(banner)).toBe(false)
+    expect(openCodeTerminalReady(`\x1b[?2004h${banner}\x1b[?2004l`)).toBe(false)
+    expect(openCodeTerminalReady(`\x1b[?2004h\x1b[31m${model}\x1b[0m`)).toBe(false)
   })
 })
