@@ -2523,14 +2523,14 @@ export const closePaneWithCleanup = createAsyncThunk(
         )) return
 
         const layoutBeforeRemoval = (getState() as RootState).panes.layouts[tabId]
-        const closePersistenceAlreadyPending = isLocalClosePersistencePending()
+        const closePersistenceAlreadyPending = isLocalClosePersistencePending(getState)
         const hasPaneToRemove = Boolean(layoutBeforeRemoval && findPaneContent(layoutBeforeRemoval, paneId))
-        if (hasPaneToRemove) markLocalClosePersistencePending()
+        if (hasPaneToRemove) markLocalClosePersistencePending(getState)
         dispatch(closePane({ tabId, paneId }))
         const after = (getState() as RootState).panes.layouts[tabId]
         if (after && findPaneContent(after, paneId)) {
           if (hasPaneToRemove && !closePersistenceAlreadyPending) {
-            clearLocalClosePersistencePending()
+            clearLocalClosePersistencePending(getState)
           }
           log.warn('pane removal was refused after managed view detachment; the pane stays open', { tabId, paneId })
           dispatch(setPaneCloseError({ tabId, paneId, error: PANE_CLOSE_REMOVAL_REFUSED_MESSAGE }))
@@ -2815,7 +2815,7 @@ export const closeTab = createAsyncThunk(
         // the freeze above, the current layout equals it by construction.
         const paneIds = collectPaneIds(frozenLayout)
 
-        markLocalClosePersistencePending()
+        markLocalClosePersistencePending(getState)
         dispatch(removeTab(tabId))
         dispatch(removeLayout({ tabId }))
 
@@ -2996,14 +2996,14 @@ export const replacePaneWithCleanup = createAsyncThunk(
         }
         const layoutBeforeReplacement = (getState() as RootState).panes.layouts[tabId]
         const hadPaneToReplace = Boolean(layoutBeforeReplacement && findPaneContent(layoutBeforeReplacement, paneId))
-        const closePersistenceAlreadyPending = isLocalClosePersistencePending()
-        if (hadPaneToReplace) markLocalClosePersistencePending()
+        const closePersistenceAlreadyPending = isLocalClosePersistencePending(getState)
+        if (hadPaneToReplace) markLocalClosePersistencePending(getState)
         dispatch(replacePane({ tabId, paneId }))
         const after = (getState() as RootState).panes.layouts[tabId]
         const afterContent = after ? findPaneContent(after, paneId) : null
         if (afterContent && afterContent.kind !== 'picker') {
           if (hadPaneToReplace && !closePersistenceAlreadyPending) {
-            clearLocalClosePersistencePending()
+            clearLocalClosePersistencePending(getState)
           }
           log.warn('pane replacement was refused after managed view detachment; the pane keeps its content', { tabId, paneId })
           dispatch(setPaneCloseError({ tabId, paneId, error: PANE_CLOSE_REMOVAL_REFUSED_MESSAGE }))

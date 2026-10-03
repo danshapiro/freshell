@@ -32,7 +32,11 @@ import {
   clearLocalClosePersistencePending,
   flushPersistedLayoutNow,
   getAuthoritativeLocalLayoutPersistedAt,
+  getLocalLayoutBaselinePersistedAt,
+  initializeLocalLayoutBaselinePersistedAt,
+  isLocalClosePersistencePending,
   observeAuthoritativeLocalLayoutPersistedAt,
+  setLocalLayoutBaselinePersistedAt,
 } from './persistControl'
 import { sanitizeSessionRef } from '@shared/session-contract'
 import { normalizeFreshAgentEffortOverride, normalizeFreshAgentPaneModelSelection } from './paneTypes'
@@ -570,6 +574,7 @@ function selectStampMachineId(state: PersistState): string | undefined {
 }
 
 export const persistMiddleware: Middleware<{}, PersistState> = (store) => {
+  const persistControlOwner = store.getState
   let tabsDirty = false
   let panesDirty = false
   let tabRecencyDirty = false
@@ -595,6 +600,28 @@ export const persistMiddleware: Middleware<{}, PersistState> = (store) => {
   // protecting the persisted layout.
   let userClosedTabsIntent = false
 
+  // The Redux tree was loaded from this raw envelope (or from the current
+  // key when the loader did not run). Remember that baseline now, before a
+  // duplicate document can replace shared localStorage while this store has
+  // pending debounce work.
+  try {
+    const bootRaw = getBootLoadedLayoutRaw()
+    const baselineRaw = bootRaw === undefined
+      ? localStorage.getItem(getWindowLayoutKey())
+      : bootRaw
+    const baselinePersistedAt = baselineRaw
+      ? parsePersistedLayoutRaw(baselineRaw)?.persistedAt ?? null
+      : null
+    const layoutKey = getWindowLayoutKey()
+    initializeLocalLayoutBaselinePersistedAt(layoutKey, baselinePersistedAt, persistControlOwner)
+    if (typeof baselinePersistedAt === 'number') {
+      observeAuthoritativeLocalLayoutPersistedAt(layoutKey, baselinePersistedAt, persistControlOwner)
+    }
+  } catch {
+    // The first flush will conservatively compare against whatever raw can
+    // be read then; this setup is only a baseline hint.
+  }
+
   const canUseStorage = () => typeof localStorage !== 'undefined'
 
   const flush = () => {
@@ -602,15 +629,45 @@ export const persistMiddleware: Middleware<{}, PersistState> = (store) => {
     if (!canUseStorage()) return
     if (!tabsDirty && !panesDirty && !tabRecencyDirty && !turnCompletionDirty) return
 
-    const state = store.getState()
-    const layoutKey = getWindowLayoutKey()
-    // Consume-and-reset: only the write cycle in progress right now may be
-    // authorized by this specific user action. A later, unrelated dirty
-    // cycle must not inherit an intent flag from a previous close.
-    const closedByUser = userClosedTabsIntent
-    userClosedTabsIntent = false
-
+    let closedByUser = userClosedTabsIntent
     try {
+      const state = store.getState()
+      const layoutKey = getWindowLayoutKey()
+      const localClosePending = isLocalClosePersistencePending(persistControlOwner)
+      if (tabsDirty || panesDirty) {
+        const existingRaw = localStorage.getItem(layoutKey)
+        const existingPersistedAt = existingRaw
+          ? parsePersistedLayoutRaw(existingRaw)?.persistedAt
+          : undefined
+        const localBaselinePersistedAt = getLocalLayoutBaselinePersistedAt(layoutKey, persistControlOwner)
+        const explicitCloseIntent = localClosePending || userClosedTabsIntent
+        if (
+          !explicitCloseIntent
+          && typeof existingPersistedAt === 'number'
+          && (
+            typeof localBaselinePersistedAt !== 'number'
+            || existingPersistedAt > localBaselinePersistedAt
+          )
+        ) {
+          // Another same-key document has already committed a layout that this
+          // Redux tree has not applied. Do not turn its newer envelope into a
+          // stamp for our stale payload. Keep dirty state armed; the matching
+          // StorageEvent will reconcile Redux and trigger a safe retry.
+          log.warn('Skipped stale layout persistence because shared storage is newer than this store', {
+            reason: 'persist_stale_layout_refused',
+            layoutKey,
+            localBaselinePersistedAt,
+            existingPersistedAt,
+          })
+          return
+        }
+      }
+      // Consume-and-reset: only the write cycle in progress right now may be
+      // authorized by this specific user action. A later, unrelated dirty
+      // cycle must not inherit an intent flag from a previous close.
+      closedByUser = userClosedTabsIntent
+      userClosedTabsIntent = false
+
       if (tabsDirty || panesDirty) {
         const nextTabs = state.tabs?.tabs ?? []
 
@@ -721,7 +778,7 @@ export const persistMiddleware: Middleware<{}, PersistState> = (store) => {
             ? parsePersistedLayoutRaw(existingRaw)?.persistedAt
             : undefined
           const now = Date.now()
-          const authoritativePersistedAt = getAuthoritativeLocalLayoutPersistedAt(layoutKey)
+          const authoritativePersistedAt = getAuthoritativeLocalLayoutPersistedAt(layoutKey, persistControlOwner)
           const previousAuthoritativePersistedAt = Math.max(
             typeof previousPersistedAt === 'number'
               ? previousPersistedAt
@@ -754,15 +811,16 @@ export const persistMiddleware: Middleware<{}, PersistState> = (store) => {
 
           const raw = JSON.stringify(layoutPayload)
           localStorage.setItem(layoutKey, raw)
-          observeAuthoritativeLocalLayoutPersistedAt(layoutKey, persistedAt)
+          observeAuthoritativeLocalLayoutPersistedAt(layoutKey, persistedAt, persistControlOwner)
+          setLocalLayoutBaselinePersistedAt(layoutKey, persistedAt, persistControlOwner)
           // Release the close barrier only after the authoritative layout
           // envelope is durable. A throwing setItem reaches the catch below
           // and leaves the marker armed for a later successful flush.
-          clearLocalClosePersistencePending()
+          clearLocalClosePersistencePending(persistControlOwner)
           localStorage.removeItem(getWindowFreshAgentBackupKey())
           localStorage.removeItem(getWindowFreshAgentCommitMarkerKey())
           localStorage.removeItem(getWindowFreshAgentPendingMarkerKey())
-          broadcastPersistedRaw(layoutKey, raw)
+          broadcastPersistedRaw(layoutKey, raw, persistControlOwner)
           // Durable boundary (e2r5 review finding 1): an armed post-rebuild
           // pre-migration evidence clear is consumed ONLY here — after the
           // rebuilt envelope is durably written. A reload before this line
@@ -791,7 +849,7 @@ export const persistMiddleware: Middleware<{}, PersistState> = (store) => {
           paneLastInputAt: persistedTabRecency.paneLastInputAt,
         })
         localStorage.setItem(TAB_RECENCY_STORAGE_KEY, rawTabRecency)
-        broadcastPersistedRaw(TAB_RECENCY_STORAGE_KEY, rawTabRecency)
+        broadcastPersistedRaw(TAB_RECENCY_STORAGE_KEY, rawTabRecency, persistControlOwner)
       }
 
       if (turnCompletionDirty) {
@@ -802,7 +860,7 @@ export const persistMiddleware: Middleware<{}, PersistState> = (store) => {
         // builds out of the persisted key.
         const rawTurnCompletion = JSON.stringify({ version: 1 })
         localStorage.setItem(TURN_COMPLETION_STORAGE_KEY, rawTurnCompletion)
-        broadcastPersistedRaw(TURN_COMPLETION_STORAGE_KEY, rawTurnCompletion)
+        broadcastPersistedRaw(TURN_COMPLETION_STORAGE_KEY, rawTurnCompletion, persistControlOwner)
       }
     } catch (err) {
       // Task-008b review F1 (landed by task-010): a failed flush must not

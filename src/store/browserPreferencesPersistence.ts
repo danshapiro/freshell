@@ -253,7 +253,7 @@ export const browserPreferencesPersistenceMiddleware: Middleware<{}, BrowserPref
     try {
       const raw = JSON.stringify(buildBrowserPreferencesRecord(store.getState()))
       localStorage.setItem(BROWSER_PREFERENCES_STORAGE_KEY, raw)
-      broadcastPersistedRaw(BROWSER_PREFERENCES_STORAGE_KEY, raw)
+      broadcastPersistedRaw(BROWSER_PREFERENCES_STORAGE_KEY, raw, store.getState)
       dirty = false
       retrySuppressed = false
       resetPendingWriteState(store.getState as BrowserPreferencesMiddlewareGetState)

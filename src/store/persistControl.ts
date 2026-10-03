@@ -6,41 +6,91 @@ import { sanitizeSessionRef, type SessionRef } from '@shared/session-contract'
 
 export const flushPersistedLayoutNow = createAction('persist/flushNow')
 
-let localClosePersistencePending = false
-const authoritativeLocalLayoutPersistedAtByKey = new Map<string, number>()
+type PersistControlOwner = object
+
+const defaultPersistControlOwner = {}
+const ownerKey = (owner?: PersistControlOwner) => owner ?? defaultPersistControlOwner
+
+let localClosePersistencePendingByOwner = new WeakSet<PersistControlOwner>()
+let authoritativeLocalLayoutPersistedAtByOwner = new WeakMap<PersistControlOwner, Map<string, number>>()
+let localLayoutBaselinePersistedAtByOwner = new WeakMap<PersistControlOwner, Map<string, number | null>>()
 
 /** Mark that local close state must reach durable layout storage before hydration. */
-export function markLocalClosePersistencePending(): void {
-  localClosePersistencePending = true
+export function markLocalClosePersistencePending(owner?: PersistControlOwner): void {
+  localClosePersistencePendingByOwner.add(ownerKey(owner))
 }
 
-export function isLocalClosePersistencePending(): boolean {
-  return localClosePersistencePending
+export function isLocalClosePersistencePending(owner?: PersistControlOwner): boolean {
+  return localClosePersistencePendingByOwner.has(ownerKey(owner))
 }
 
 /** Clear the close barrier after its layout write succeeds or a no-op is canceled. */
-export function clearLocalClosePersistencePending(): void {
-  localClosePersistencePending = false
+export function clearLocalClosePersistencePending(owner?: PersistControlOwner): void {
+  localClosePersistencePendingByOwner.delete(ownerKey(owner))
 }
 
 /** Keep the accepted local-layout recency floor available to persistence. */
-export function observeAuthoritativeLocalLayoutPersistedAt(key: string, candidate?: number): void {
+export function observeAuthoritativeLocalLayoutPersistedAt(
+  key: string,
+  candidate?: number,
+  owner?: PersistControlOwner,
+): void {
   if (!key || typeof candidate !== 'number' || !Number.isFinite(candidate)) return
-  const current = authoritativeLocalLayoutPersistedAtByKey.get(key)
+  const ownerFloors = getOrCreateMap(authoritativeLocalLayoutPersistedAtByOwner, ownerKey(owner))
+  const current = ownerFloors.get(key)
   if (
     typeof current !== 'number'
     || candidate > current
   ) {
-    authoritativeLocalLayoutPersistedAtByKey.set(key, candidate)
+    ownerFloors.set(key, candidate)
   }
 }
 
-export function getAuthoritativeLocalLayoutPersistedAt(key: string): number | undefined {
-  return authoritativeLocalLayoutPersistedAtByKey.get(key)
+export function getAuthoritativeLocalLayoutPersistedAt(key: string, owner?: PersistControlOwner): number | undefined {
+  return authoritativeLocalLayoutPersistedAtByOwner.get(ownerKey(owner))?.get(key)
+}
+
+/** Initialize the persisted version represented by this store's current Redux tree. */
+export function initializeLocalLayoutBaselinePersistedAt(
+  key: string,
+  candidate: number | null,
+  owner: PersistControlOwner,
+): void {
+  if (!key) return
+  const ownerBaselines = getOrCreateMap(localLayoutBaselinePersistedAtByOwner, owner)
+  if (!ownerBaselines.has(key)) ownerBaselines.set(key, candidate)
+}
+
+/** Record the exact persisted version that was applied to this store or written by it. */
+export function setLocalLayoutBaselinePersistedAt(
+  key: string,
+  candidate: number | null,
+  owner: PersistControlOwner,
+): void {
+  if (!key) return
+  getOrCreateMap(localLayoutBaselinePersistedAtByOwner, owner).set(key, candidate)
+}
+
+export function getLocalLayoutBaselinePersistedAt(
+  key: string,
+  owner: PersistControlOwner,
+): number | null | undefined {
+  return localLayoutBaselinePersistedAtByOwner.get(owner)?.get(key)
+}
+
+function getOrCreateMap<K, V>(weakMap: WeakMap<PersistControlOwner, Map<K, V>>, owner: PersistControlOwner): Map<K, V> {
+  let values = weakMap.get(owner)
+  if (!values) {
+    values = new Map<K, V>()
+    weakMap.set(owner, values)
+  }
+  return values
 }
 
 export function resetAuthoritativeLocalLayoutPersistedAtForTests(): void {
-  authoritativeLocalLayoutPersistedAtByKey.clear()
+  authoritativeLocalLayoutPersistedAtByOwner = new WeakMap()
+  localLayoutBaselinePersistedAtByOwner = new WeakMap()
+  localClosePersistencePendingByOwner = new WeakSet()
 }
 
 function sessionRefEquals(a?: SessionRef, b?: SessionRef): boolean {

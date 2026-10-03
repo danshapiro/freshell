@@ -3,13 +3,25 @@ import { nanoid } from 'nanoid'
 export const PERSIST_BROADCAST_CHANNEL_NAME = 'freshell.persist.v2'
 
 let sourceId: string | null = null
-export function getPersistBroadcastSourceId(): string {
-  if (sourceId) return sourceId
+let sourceIdByOwner = new WeakMap<object, string>()
+
+function createSourceId(): string {
   if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
-    sourceId = crypto.randomUUID()
-  } else {
-    sourceId = nanoid()
+    return crypto.randomUUID()
   }
+  return nanoid()
+}
+
+export function getPersistBroadcastSourceId(owner?: object): string {
+  if (owner) {
+    let ownerSourceId = sourceIdByOwner.get(owner)
+    if (!ownerSourceId) {
+      ownerSourceId = createSourceId()
+      sourceIdByOwner.set(owner, ownerSourceId)
+    }
+    return ownerSourceId
+  }
+  if (!sourceId) sourceId = createSourceId()
   return sourceId
 }
 
@@ -39,12 +51,12 @@ function notifyListeners(msg: PersistBroadcastMessage): void {
   }
 }
 
-export function broadcastPersistedRaw(key: string, raw: string): void {
+export function broadcastPersistedRaw(key: string, raw: string, owner?: object): void {
   const msg: PersistBroadcastMessage = {
     type: 'persist',
     key,
     raw,
-    sourceId: getPersistBroadcastSourceId(),
+    sourceId: getPersistBroadcastSourceId(owner),
   }
 
   // Always notify in-process listeners, even if BroadcastChannel is unavailable.
@@ -62,5 +74,6 @@ export function broadcastPersistedRaw(key: string, raw: string): void {
 
 export function resetPersistBroadcastForTests(): void {
   sourceId = null
+  sourceIdByOwner = new WeakMap()
   listeners.clear()
 }

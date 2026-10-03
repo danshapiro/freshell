@@ -275,8 +275,8 @@ Task 3 reopen and the no-local-pane recovery-panel action use the same queue.
   adopting a pane with no view ID only when existing fallback identity is
   unique and unclaimed.
 - [ ] Step 6: Run the task tests and client typecheck, refactor while green,
-  then obtain an independent task review. The focused test and typecheck runs
-  are green; independent review remains pending.
+  then obtain an independent task review. The Task 2 tests and client
+  typecheck are green; the follow-up independent review remains pending.
 
   Run: pnpm run test:vitest run test/unit/client/store/crossTabSync.test.ts test/unit/client/store/tabsPersistence.test.ts test/unit/client/store/persistControl.test.ts test/unit/lib/managed-runtime-recovery.test.ts --config config/vitest/vitest.config.ts
 
@@ -285,8 +285,21 @@ Task 3 reopen and the no-local-pane recovery-panel action use the same queue.
   Run: pnpm run typecheck:client
 
   Expected: PASS.
-- [ ] Step 7: Commit only persistence gating, identity matching, and their
+- [x] Step 7: Commit persistence gating, identity matching, and their
   focused tests with a focused commit message.
+
+**Review 2 follow-up repair (2026-10-03):** A second independent review found
+that another document sharing the same layout key could flush its stale pane
+tree after a close and stamp it newer than the close. The two-store regression
+now controls the debounce and StorageEvent delivery, verifies that the closing
+store commits even after an unseen shared write, confirms that the stale store
+does not rewrite storage or advance its timestamp floor, and checks that its
+retained dirty work retries only after applying the close. Close barriers,
+layout baselines and timestamp floors are scoped to each store, and in-process
+persist broadcasts carry the writer identity. The regression was red before
+the repair. After the repair, ten focused suites passed (244 tests), client
+typecheck passed, and `git diff --check` passed. The requested independent
+review of this follow-up is pending.
 
 ## Task 3: Reopen only from current identity and clear close evidence
 

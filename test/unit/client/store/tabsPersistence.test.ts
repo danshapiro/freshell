@@ -731,7 +731,7 @@ describe('persist flush failure retry', () => {
     expect(closedLayout.tabs.tabs).toEqual([])
     expect(closedLayout.panes.layouts).toEqual({})
     expect(closedLayout.persistedAt).toBeGreaterThan(beforePersistedAt)
-    expect(isLocalClosePersistencePending()).toBe(false)
+    expect(isLocalClosePersistencePending(store.getState)).toBe(false)
   })
 
   it('keeps the close marker pending across a failed immediate flush until a retry succeeds', async () => {
@@ -755,7 +755,7 @@ describe('persist flush failure retry', () => {
     expect(closeResult).toMatchObject({ meta: { requestStatus: 'fulfilled' } })
 
     expect(localStorage.getItem(LAYOUT_STORAGE_KEY)).toBe(beforeRaw)
-    expect(isLocalClosePersistencePending()).toBe(true)
+    expect(isLocalClosePersistencePending(store.getState)).toBe(true)
 
     store.dispatch(flushPersistedLayoutNow())
 
@@ -765,7 +765,7 @@ describe('persist flush failure retry', () => {
     expect(closedLayout.tabs.tabs).toEqual([])
     expect(closedLayout.panes.layouts).toEqual({})
     expect(closedLayout.persistedAt).toBeGreaterThan(beforePersistedAt)
-    expect(isLocalClosePersistencePending()).toBe(false)
+    expect(isLocalClosePersistencePending(store.getState)).toBe(false)
   })
 
   it('persists a successful pane removal immediately', async () => {
@@ -789,7 +789,7 @@ describe('persist flush failure retry', () => {
 
     const persistedLayout = JSON.parse(localStorage.getItem(LAYOUT_STORAGE_KEY)!).panes.layouts['tab-1']
     expect(persistedLayout).toMatchObject({ type: 'leaf', id: 'pane-2' })
-    expect(isLocalClosePersistencePending()).toBe(false)
+    expect(isLocalClosePersistencePending(store.getState)).toBe(false)
   })
 
   it('persists a successful pane replacement immediately', async () => {
@@ -810,6 +810,6 @@ describe('persist flush failure retry', () => {
       id: 'pane-1',
       content: { kind: 'picker' },
     })
-    expect(isLocalClosePersistencePending()).toBe(false)
+    expect(isLocalClosePersistencePending(store.getState)).toBe(false)
   })
 })

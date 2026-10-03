@@ -1,8 +1,8 @@
 import { describe, it, expect, afterEach, beforeEach, vi } from 'vitest'
 import { configureStore } from '@reduxjs/toolkit'
 
-import tabsReducer, { closeTab, hydrateTabs } from '../../../../src/store/tabsSlice'
-import panesReducer, { hydratePanes, hydratePaneTitles } from '../../../../src/store/panesSlice'
+import tabsReducer, { closePaneWithCleanup, closeTab, hydrateTabs } from '../../../../src/store/tabsSlice'
+import panesReducer, { hydratePanes, hydratePaneTitles, updatePaneTitle } from '../../../../src/store/panesSlice'
 import machineIdentityReducer, { setMachineReady } from '../../../../src/store/machineIdentitySlice'
 import tabRecencyReducer from '../../../../src/store/tabRecencySlice'
 import settingsReducer, { setLocalSettings, updateSettingsLocal } from '../../../../src/store/settingsSlice'
@@ -10,12 +10,15 @@ import tabRegistryReducer, { setTabRegistrySearchRangeDays } from '../../../../s
 import { installCrossTabSync } from '../../../../src/store/crossTabSync'
 import {
   clearLocalClosePersistencePending,
+  flushPersistedLayoutNow,
+  getAuthoritativeLocalLayoutPersistedAt,
   isLocalClosePersistencePending,
   resetAuthoritativeLocalLayoutPersistedAtForTests,
 } from '../../../../src/store/persistControl'
 import {
   persistMiddleware,
   PERSIST_DEBOUNCE_MS,
+  resetPersistedLayoutCacheForTests,
   resetPersistFlushListenersForTests,
 } from '../../../../src/store/persistMiddleware'
 import {
@@ -165,7 +168,7 @@ describe('crossTabSync', () => {
       const result = next(action)
       if (!injected && action?.type === 'tabs/removeTab') {
         injected = true
-        barrierWasPending = isLocalClosePersistencePending()
+        barrierWasPending = isLocalClosePersistencePending(store.getState)
         window.dispatchEvent(new StorageEvent('storage', {
           key: OWN_LAYOUT_KEY,
           newValue: JSON.stringify({
@@ -300,12 +303,137 @@ describe('crossTabSync', () => {
     expect(foreignTitleWasAccepted).toBe(true)
     expect(store.getState().tabs.tabs).toEqual([])
     expect(store.getState().panes.layouts.t1).toBeUndefined()
-    expect(isLocalClosePersistencePending()).toBe(false)
+    expect(isLocalClosePersistencePending(store.getState)).toBe(false)
     const closedRaw = localStorage.getItem(OWN_LAYOUT_KEY)
     expect(closedRaw).not.toBeNull()
     const closedLayout = JSON.parse(closedRaw!)
     expect(closedLayout.tabs.tabs).toEqual([])
     expect(closedLayout.persistedAt).toBeGreaterThan(150)
+  })
+
+  it('does not let a stale duplicate-tab debounce rewrite a committed close before its storage event arrives', async () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(new Date(100))
+    resetPersistedLayoutCacheForTests()
+
+    const splitLayout = {
+      type: 'split',
+      id: 'split-shared',
+      direction: 'horizontal',
+      sizes: [50, 50],
+      children: [
+        {
+          type: 'leaf',
+          id: 'pane-a',
+          content: { kind: 'browser', browserInstanceId: 'browser-a', url: 'https://a.example', devToolsOpen: false },
+        },
+        {
+          type: 'leaf',
+          id: 'pane-b',
+          content: { kind: 'browser', browserInstanceId: 'browser-b', url: 'https://b.example', devToolsOpen: false },
+        },
+      ],
+    }
+    const baseRaw = JSON.stringify({
+      version: 3,
+      persistedAt: 100,
+      tabs: {
+        activeTabId: 't1',
+        tabs: [{ id: 't1', title: 'Shared', createdAt: 1, updatedAt: 1 }],
+      },
+      panes: {
+        version: 6,
+        layouts: { t1: splitLayout },
+        activePane: { t1: 'pane-a' },
+        paneTitles: {},
+        paneTitleSetByUser: {},
+      },
+      tombstones: [],
+    })
+    localStorage.setItem(OWN_LAYOUT_KEY, baseRaw)
+
+    const makeSharedStore = () => configureStore({
+      reducer: { tabs: tabsReducer, panes: panesReducer },
+      middleware: (getDefault) => getDefault().concat(persistMiddleware as any),
+    })
+    const storeA = makeSharedStore()
+    const storeB = makeSharedStore()
+    const hydrateBase = (store: ReturnType<typeof makeSharedStore>) => {
+      store.dispatch({
+        ...hydrateTabs({
+          tabs: [{ id: 't1', title: 'Shared', createdAt: 1, updatedAt: 1 }],
+          activeTabId: 't1',
+          renameRequestTabId: null,
+          tombstones: [],
+        }),
+        meta: { skipPersist: true },
+      })
+      store.dispatch({
+        ...hydratePanes({
+          layouts: { t1: splitLayout } as any,
+          activePane: { t1: 'pane-a' },
+          paneTitles: {},
+          paneTitleSetByUser: {},
+        }),
+        meta: { skipPersist: true },
+      })
+    }
+    hydrateBase(storeA)
+    hydrateBase(storeB)
+    cleanups.push(installCrossTabSync(storeA as any), installCrossTabSync(storeB as any))
+
+    // Let B commit one same-key update that A has not seen, then give B a
+    // second pending debounce. A's close must still reach storage even though
+    // the shared envelope is already newer than A's accepted baseline.
+    storeB.dispatch(updatePaneTitle({
+      tabId: 't1',
+      paneId: 'pane-a',
+      title: 'B committed title for pane being closed',
+      setByUser: true,
+    }))
+    storeB.dispatch(flushPersistedLayoutNow())
+    const bCommittedRaw = localStorage.getItem(OWN_LAYOUT_KEY)
+    expect(bCommittedRaw).not.toBeNull()
+    const bCommittedPersistedAt = JSON.parse(bCommittedRaw!).persistedAt as number
+    expect(bCommittedPersistedAt).toBeGreaterThan(100)
+
+    // B's next debounce is pending when A closes pane-a. Place the close
+    // 100 ms before B's debounce so the stale write runs while A's trailing
+    // clearPaneClosing flush is still pending.
+    storeB.dispatch(updatePaneTitle({
+      tabId: 't1',
+      paneId: 'pane-a',
+      title: 'B pending title for pane being closed',
+      setByUser: true,
+    }))
+    vi.advanceTimersByTime(PERSIST_DEBOUNCE_MS - 100)
+
+    await storeA.dispatch(closePaneWithCleanup({ tabId: 't1', paneId: 'pane-a' }) as any)
+    const closedRaw = localStorage.getItem(OWN_LAYOUT_KEY)
+    expect(closedRaw).not.toBeNull()
+    const closedPersistedAt = JSON.parse(closedRaw!).persistedAt as number
+    expect(JSON.parse(closedRaw!).panes.layouts.t1).toMatchObject({ type: 'leaf', id: 'pane-b' })
+    expect(closedPersistedAt).toBeGreaterThan(bCommittedPersistedAt)
+
+    // B has not received A's queued StorageEvent yet. Its dirty stale tree
+    // must not be given a newer timestamp than A's durable close.
+    vi.advanceTimersByTime(100)
+    const afterStaleDebounceRaw = localStorage.getItem(OWN_LAYOUT_KEY)
+    expect(afterStaleDebounceRaw).not.toBeNull()
+    expect(JSON.parse(afterStaleDebounceRaw!).panes.layouts.t1).toMatchObject({ type: 'leaf', id: 'pane-b' })
+    expect(getAuthoritativeLocalLayoutPersistedAt(OWN_LAYOUT_KEY, storeB.getState)).toBe(bCommittedPersistedAt)
+
+    // Deliver the event for the latest shared write. In a correct run that
+    // is still A's close; if B had rewritten its stale tree, A would hydrate
+    // the resurrected split here. B should adopt the close before retrying
+    // its still-dirty write; the retry may get a newer timestamp but must
+    // keep the complete closed topology.
+    window.dispatchEvent(new StorageEvent('storage', { key: OWN_LAYOUT_KEY, newValue: afterStaleDebounceRaw }))
+    expect(storeB.getState().panes.layouts.t1).toMatchObject({ type: 'leaf', id: 'pane-b' })
+    const afterReconciliation = JSON.parse(localStorage.getItem(OWN_LAYOUT_KEY)!)
+    expect(afterReconciliation.panes.layouts.t1).toMatchObject({ type: 'leaf', id: 'pane-b' })
+    expect(afterReconciliation.persistedAt).toBeGreaterThan(closedPersistedAt)
+    expect(storeA.getState().panes.layouts.t1).toMatchObject({ type: 'leaf', id: 'pane-b' })
   })
 
   it('preserves canonical resume identity when an OWN-key flush (duplicate tab) rehydrates a fresh-agent pane', () => {
@@ -1374,7 +1502,7 @@ describe('crossTabSync', () => {
     // persistMiddleware broadcasts the window's own flush; the in-process
     // listener records the raw in the dedupe map (a later identical
     // STORAGE event for the same key is deduped) and never hydrates.
-    broadcastPersistedRaw(OWN_LAYOUT_KEY, raw)
+    broadcastPersistedRaw(OWN_LAYOUT_KEY, raw, storeLike.getState)
 
     let hydrateCalls = dispatchSpy.mock.calls
       .map((c) => c[0])
