@@ -8,6 +8,7 @@ import { afterEach, describe, expect, it } from 'vitest'
 import {
   PHASE5_LOSS_ASSERTIONS_FILE,
   PHASE5_LOSS_INCIDENT_FILE,
+  buildPhase5LossReceipt,
   phase5LossRetainedBundle,
   validatePhase5LossReceipt,
 } from '../../../../scripts/testing/runtime-phase5-loss-evidence.js'
@@ -140,7 +141,7 @@ function createFixture(): {
     updatedAt: '2026-09-09T20:00:00.010Z',
   }
   const assertions = {
-    schemaVersion: 1,
+    schemaVersion: 2,
     caseId: 'P5-G02',
     candidateSha: sha,
     receiptRunId: runId,
@@ -173,7 +174,12 @@ function createFixture(): {
       }],
     },
     browser: {
-      displayedNoticeIds: [incident.noticeId],
+      routineNoticeCount: 0,
+      recoveryCards: [{
+        paneId: 'pane-phase5',
+        lossMessageVisible: true,
+        startNewConversationEnabled: true,
+      }],
       endedPane: {
         soulId,
         incarnationId,
@@ -267,7 +273,8 @@ function createFixture(): {
     },
     summary: {
       provider: 'opencode', soulId, incarnationId, incidentId,
-      exactCleanupVerified: true, displayedNoticeCount: 1, foreignObjectsTouched: 0,
+      exactCleanupVerified: true, routineNoticeCount: 0,
+      actionableRecoveryCardCount: 1, foreignObjectsTouched: 0,
     },
   }
   return {
@@ -306,10 +313,68 @@ describe('Phase 5 loss receipt validation', () => {
     expect(retained.index.sourceReceiptSha256).toMatch(/^[0-9a-f]{64}$/)
   })
 
+  it('builds a receipt for one actionable lost-pane card and no routine popup', () => {
+    const fx = createFixture()
+    const receipt = buildPhase5LossReceipt({
+      ...fx,
+      candidateSha: sha,
+      runtimeImage,
+      receiptRunId: runId,
+      candidateBefore: fx.receipt.candidateIntegrity.before,
+      candidateAfter: fx.receipt.candidateIntegrity.after,
+    })
+    expect(receipt.summary).toEqual(fx.receipt.summary)
+    expect(validatePhase5LossReceipt({
+      ...fx, candidateSha: sha, runtimeImage, receipt,
+    }).summary).toEqual(fx.receipt.summary)
+  })
+
+  it.each([
+    ['missing cards', (row: any) => { delete row.browser.recoveryCards }, /missing.*recoveryCards/i],
+    ['no card', (row: any) => { row.browser.recoveryCards = [] }, /exactly one.*card/i],
+    ['duplicate cards', (row: any) => { row.browser.recoveryCards.push({ ...row.browser.recoveryCards[0] }) }, /exactly one.*card/i],
+    ['wrong pane', (row: any) => { row.browser.recoveryCards[0].paneId = 'pane-unrelated' }, /exact.*pane/i],
+    ['missing pane identity', (row: any) => { delete row.browser.recoveryCards[0].paneId }, /missing.*paneId/i],
+    ['hidden loss message', (row: any) => { row.browser.recoveryCards[0].lossMessageVisible = false }, /loss message/i],
+    ['disabled action', (row: any) => { row.browser.recoveryCards[0].startNewConversationEnabled = false }, /actionable/i],
+    ['missing action', (row: any) => { delete row.browser.recoveryCards[0].startNewConversationEnabled }, /missing.*startNewConversationEnabled/i],
+    ['unintended popup', (row: any) => { row.browser.routineNoticeCount = 1 }, /routine.*popup/i],
+    ['missing popup measurement', (row: any) => { delete row.browser.routineNoticeCount }, /missing.*routineNoticeCount/i],
+    ['invalid popup measurement', (row: any) => { row.browser.routineNoticeCount = -1 }, /notice count/i],
+    ['fabricated displayed notice', (row: any) => { row.browser.displayedNoticeIds = ['notice-unobserved'] }, /unknown.*displayedNoticeIds/i],
+  ] as const)('rejects %s in the measured browser evidence', (_name, mutate, error) => {
+    const fx = createFixture()
+    fx.rewrite(PHASE5_LOSS_ASSERTIONS_FILE, mutate)
+    fx.rehash(PHASE5_LOSS_ASSERTIONS_FILE)
+    expect(() => validatePhase5LossReceipt({
+      ...fx, candidateSha: sha, runtimeImage, receipt: fx.receipt,
+    })).toThrow(error)
+  })
+
   it('rejects schema v1 and unknown receipt fields', () => {
     const fx = createFixture()
     expect(() => validatePhase5LossReceipt({ ...fx, candidateSha: sha, runtimeImage, receipt: { ...fx.receipt, schemaVersion: 1 } })).toThrow(/schema v2/i)
     expect(() => validatePhase5LossReceipt({ ...fx, candidateSha: sha, runtimeImage, receipt: { ...fx.receipt, credentialsTouched: false } })).toThrow(/unknown field/i)
+  })
+
+  it('rejects the previous assertion schema that claimed a routine notice was displayed', () => {
+    const fx = createFixture()
+    fx.rewrite(PHASE5_LOSS_ASSERTIONS_FILE, (row) => { row.schemaVersion = 1 })
+    fx.rehash(PHASE5_LOSS_ASSERTIONS_FILE)
+    expect(() => validatePhase5LossReceipt({
+      ...fx, candidateSha: sha, runtimeImage, receipt: fx.receipt,
+    })).toThrow(/wrong schema/i)
+  })
+
+  it.each([
+    ['popup', (summary: any) => { summary.routineNoticeCount = 1 }],
+    ['card', (summary: any) => { summary.actionableRecoveryCardCount = 0 }],
+  ] as const)('rejects a %s summary that contradicts hashed browser evidence', (_name, mutate) => {
+    const fx = createFixture()
+    mutate(fx.receipt.summary)
+    expect(() => validatePhase5LossReceipt({
+      ...fx, candidateSha: sha, runtimeImage, receipt: fx.receipt,
+    })).toThrow(/summary/i)
   })
 
   it.each([
@@ -348,7 +413,7 @@ describe('Phase 5 loss receipt validation', () => {
     for (const mutation of [
       (row: any) => { row.test.total = 0; row.test.passed = 0 },
       (row: any) => { row.test.skipped = 1 },
-      (row: any) => { row.browser.displayedNoticeIds = [] },
+      (row: any) => { row.browser.recoveryCards = [] },
     ]) {
       const fx = createFixture()
       fx.rewrite(PHASE5_LOSS_ASSERTIONS_FILE, mutation)
@@ -422,6 +487,7 @@ describe('Phase 5 loss receipt validation', () => {
     for (const [file, mutation] of [
       [PHASE5_LOSS_INCIDENT_FILE, (row: any) => { row.cleanup.foreignObjectsTouched = 1 }],
       [PHASE5_LOSS_INCIDENT_FILE, (row: any) => { row.cleanup.ownedHandleRef = 'registry://wrong' }],
+      [PHASE5_LOSS_INCIDENT_FILE, (row: any) => { row.noticeId = '' }],
       [PHASE5_LOSS_ASSERTIONS_FILE, (row: any) => { row.providerState.credentialIntegrity[0].afterSha256 = '1'.repeat(64) }],
       [PHASE5_LOSS_ASSERTIONS_FILE, (row: any) => { row.browser.endedPane.incarnationId = 'incarnation-wrong' }],
     ] as const) {
