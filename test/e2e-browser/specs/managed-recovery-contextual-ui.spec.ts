@@ -129,6 +129,46 @@ for (const recoveryState of ['blocked', 'lost'] as const) {
   }
 }
 
+test('background notices failure stays quiet and preserves an existing cleanup warning', async ({ freshellPage, page, terminal }) => {
+  await terminal.waitForTerminal()
+  let fail = true
+  let failures = 0
+  await page.route('**/api/runtime/notices?**', (route) => {
+    if (fail) {
+      failures += 1
+      return route.fulfill({ status: 400, json: { message: 'Background notices refused' } })
+    }
+    return route.fulfill({ json: { notices: [{ noticeId: 'cleanup-failed', kind: 'cleanup_failed',
+      message: 'Cleanup still needs a decision.', reference: 'FAIL0001', incidentIds: ['incident-one'],
+      deliveryState: 'pending', createdAt: '2026-10-02T00:00:00.000Z' }] } })
+  })
+  await page.route('**/api/runtime/notices/*/receipt', (route) => route.fulfill({ json: { ok: true } }))
+  await page.route('**/api/runtime/incidents/incident-one/summary', (route) => route.fulfill({ json: {
+    incidentId: 'incident-one', correlationId: 'correlation-one', soulId: SOUL_ID, provider: 'codex',
+    state: 'cleanup_failed', reasonCode: 'cleanup_unconfirmed', observedCause: 'Saved actionable cleanup cause.',
+    cleanup: { ownedHandleRef: 'registry://contextual-incarnation', ownershipVerified: false, gracefulAttempt: 'not_attempted', forcedAttempt: 'not_attempted', verifiedEmpty: false, foreignObjectsTouched: 0 },
+    createdAt: '2026-10-02T00:00:00.000Z', updatedAt: '2026-10-02T00:00:01.000Z',
+  } }))
+  await page.evaluate(() => window.__FRESHELL_TEST_HARNESS__!.dispatch({ type: 'managedRuntime/setManagedRuntimeAvailable', payload: true }))
+  await expect.poll(() => failures).toBeGreaterThan(0)
+  await page.evaluate(() => new Promise<void>((resolve) => requestAnimationFrame(() => requestAnimationFrame(() => resolve()))))
+  const popup = page.getByRole('alert', { name: 'Managed runtime notice' })
+  await expect(popup).toBeHidden()
+  fail = false
+  await expect(popup).toBeVisible()
+  await popup.getByRole('button', { name: 'Details', exact: true }).click()
+  await expect(popup).toContainText('Saved actionable cleanup cause.')
+  fail = true
+  const priorFailures = failures
+  await expect.poll(() => failures).toBeGreaterThan(priorFailures)
+  await page.evaluate(() => new Promise<void>((resolve) => requestAnimationFrame(() => requestAnimationFrame(() => resolve()))))
+  await expect(popup).toContainText('Cleanup still needs a decision.')
+  await expect(popup).toContainText('Saved actionable cleanup cause.')
+  await expect(popup).not.toContainText('Background notices refused')
+  await expect(popup.getByRole('button', { name: 'Details', exact: true })).toBeVisible()
+  await expect(popup.getByRole('button', { name: 'Dismiss', exact: true })).toBeVisible()
+})
+
 test('fresh-agent: cold lost pane without a soul retains saved history and a close warning after refused start-new', async ({ freshellPage, page, terminal, harness, serverInfo }) => {
   await terminal.waitForTerminal()
   const sessions = path.join(serverInfo.homeDir, '.codex', 'sessions', '2026', '03', '01')
