@@ -174,6 +174,7 @@ function normalizePaneContent(
     const pendingLocalEcho = normalizeFreshAgentPendingLocalEcho(rawFreshAgent.pendingLocalEcho)
     const modelEffortLevels = normalizeFreshAgentModelEffortLevels(rawFreshAgent.modelEffortLevels)
     const freshHandoffError = normalizeHandoffError(rawFreshAgent.handoffError)
+    const closeError = typeof input.closeError === 'string' ? input.closeError : undefined
     const rawModelLabel = rawFreshAgent.modelLabel
     const modelLabel =
       rawModelLabel && typeof rawModelLabel === 'object'
@@ -227,6 +228,7 @@ function normalizePaneContent(
           restoreError: existingRestoreError,
           initialCwd: input.initialCwd,
           createError: input.createError,
+          closeError,
           modelSelection: normalizeFreshAgentModelSelection(
             (input as { modelSelection?: unknown }).modelSelection,
             (input as { model?: unknown }).model,
@@ -298,6 +300,7 @@ function normalizePaneContent(
     return {
       kind: 'fresh-agent',
       ...normalizeManagedRuntimeProjection(rawFreshAgent),
+      closeError,
       sessionType: input.sessionType,
       provider: input.provider,
       sessionId: input.sessionId,
@@ -2761,13 +2764,13 @@ export const panesSlice = createSlice({
     // Delta-r7-r3 (focused-episode-7 round 2 Finding F2): the close gate's
     // failure surface — the unconfirmed-close reason carried on the pane
     // itself (TerminalView renders it as the xterm "[Close failed]" notice
-    // and clears it). Terminal panes only: the fresh-agent lane has its own
-    // session-error banner.
+    // and clears it). Fresh Agent panes show it through their existing
+    // yellow error banner, independently of any preceding kill's result.
     setPaneCloseError: (
       state,
       action: PayloadAction<{ tabId: string; paneId: string; error: string }>
     ) => {
-      const content = findReconcileTerminalContent(state, action.payload.tabId, action.payload.paneId)
+      const content = findReconcilePaneContent(state, action.payload.tabId, action.payload.paneId)
       if (!content) return
       content.closeError = action.payload.error
     },
@@ -2776,7 +2779,7 @@ export const panesSlice = createSlice({
       state,
       action: PayloadAction<{ tabId: string; paneId: string }>
     ) => {
-      const content = findReconcileTerminalContent(state, action.payload.tabId, action.payload.paneId)
+      const content = findReconcilePaneContent(state, action.payload.tabId, action.payload.paneId)
       if (!content) return
       content.closeError = undefined
     },

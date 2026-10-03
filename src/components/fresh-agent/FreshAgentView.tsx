@@ -20,7 +20,7 @@ import { sendSuppressedAwareFreshAgentFrame } from '@/lib/fresh-agent-configure'
 import { KILL_ACK_TIMEOUT_MESSAGE, KILL_FAILED_MESSAGE, sendFreshAgentKillAndAwait, sendFreshAgentRecoveryStopAndAwait } from '@/lib/kill-ack'
 import { createLogger } from '@/lib/client-logger'
 import { api, getFreshAgentModelCapabilities, getFreshAgentThreadSnapshot, retryManagedRuntimeSoul, setSessionMetadata } from '@/lib/api'
-import { clearReconcilePendingPane, consumePaneRefreshRequest, mergePaneContent, startNewManagedRuntimeConversation, updatePaneContent } from '@/store/panesSlice'
+import { clearPaneCloseError, clearReconcilePendingPane, consumePaneRefreshRequest, mergePaneContent, startNewManagedRuntimeConversation, updatePaneContent } from '@/store/panesSlice'
 import { isManagedRuntimeRecoveryDecision, ManagedRuntimeRecoveryCard } from '@/components/ManagedRuntimeRecoveryCard'
 import { queueManagedRuntimeRefresh } from '@/lib/recovery/managed-runtime-recovery'
 import { confirmManagedRuntimeStopped } from '@/lib/managed-runtime-stop'
@@ -3783,6 +3783,12 @@ export function FreshAgentView({
                 <FreshAgentApprovalBanner
                   text={`Agent error: ${sessionErrorMessage}`}
                   onDismiss={() => dispatch(clearSessionError(sessionRecordLocator))}
+                />
+              ) : null}
+              {paneContent.closeError ? (
+                <FreshAgentApprovalBanner
+                  text={`Close failed: ${paneContent.closeError}`}
+                  onDismiss={() => dispatch(clearPaneCloseError({ tabId, paneId }))}
                 />
               ) : null}
               {effectiveStatus === 'stuck' && !managedRecoveryDecision ? (
