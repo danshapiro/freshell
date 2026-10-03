@@ -5,15 +5,15 @@
 //! supervisor's registry-backed `OwnedRuntimeHandle` boundary.
 
 use freshell_runtime_protocol::{
-    read_frame, write_frame, AcknowledgeViewProjectionRequest, AdminCommand, AdminReply,
-    AdminResult, ControlRole, Envelope, FreshAgentCapture, FreshAgentCaptureRequest,
-    FreshAgentCompactRequest, FreshAgentForkRequest, FreshAgentInterruptRequest,
-    FreshAgentReadEventsRequest, FreshAgentResolveRequest, FreshAgentRollbackDirection,
-    FreshAgentRollbackMode, FreshAgentRollbackRequest, FreshAgentSendRequest, IncidentId,
-    IncidentSummaryRequest, LaunchRequest, LossIncidentSummary, ManagedRolloutMode, MigrationPlan,
-    MigrationPlanRequest, NoticeDeliveryState, NoticeId, NoticeReceiptRequest,
-    PendingNoticesRequest, PendingViewProjectionsRequest, RecoverRequest, RecoveryProbeRequest,
-    RecoveryTrigger, RepairAudit, RepairRequest, RequestId, RuntimeError, RuntimeErrorCode,
+    write_frame, AcknowledgeViewProjectionRequest, AdminCommand, AdminReply, AdminResult,
+    ControlRole, Envelope, FreshAgentCapture, FreshAgentCaptureRequest, FreshAgentCompactRequest,
+    FreshAgentForkRequest, FreshAgentInterruptRequest, FreshAgentReadEventsRequest,
+    FreshAgentResolveRequest, FreshAgentRollbackDirection, FreshAgentRollbackMode,
+    FreshAgentRollbackRequest, FreshAgentSendRequest, IncidentId, IncidentSummaryRequest,
+    LaunchRequest, LossIncidentSummary, ManagedRolloutMode, MigrationPlan, MigrationPlanRequest,
+    NoticeDeliveryState, NoticeId, NoticeReceiptRequest, PendingNoticesRequest,
+    PendingViewProjectionsRequest, RecoverRequest, RecoveryProbeRequest, RecoveryTrigger,
+    RepairAudit, RepairRequest, RequestId, RuntimeError, RuntimeErrorCode,
     RuntimeInventorySnapshot, RuntimeMetricsRequest, RuntimeMetricsSnapshot, RuntimeNotice,
     RuntimeView, SoulId, StopOutcome, StopRequest, TerminalInputRequest, TerminalReadOutputRequest,
     TerminalResizeRequest, UpdateLimitsRequest, UpdateLimitsResult, UpdateViewVisibilityRequest,
@@ -812,6 +812,28 @@ impl RuntimeClient {
         }
     }
 
+    pub async fn fresh_agent_history(
+        &self,
+        soul_id: SoulId,
+    ) -> Result<serde_json::Value, ClientError> {
+        let epoch = self.current_epoch().await?;
+        match self
+            .request(
+                RequestId::new(),
+                AdminCommand::FreshAgentReadHistory(
+                    freshell_runtime_protocol::FreshAgentReadHistoryRequest {
+                        soul_id,
+                        expected_control_epoch: Some(epoch),
+                    },
+                ),
+            )
+            .await?
+        {
+            AdminResult::FreshAgentHistory(snapshot) => Ok(snapshot),
+            _ => Err(ClientError::UnexpectedResult),
+        }
+    }
+
     pub async fn metrics(
         &self,
         soul_id: SoulId,
@@ -964,6 +986,11 @@ impl RuntimeClient {
         body: AdminCommand,
     ) -> Result<AdminResult, ClientError> {
         let mut stream = UnixStream::connect(self.socket_path.as_ref()).await?;
+        let reply_limit = if matches!(body, AdminCommand::FreshAgentReadHistory(_)) {
+            freshell_runtime_protocol::MAX_NATIVE_HISTORY_FRAME_BYTES
+        } else {
+            freshell_runtime_protocol::MAX_CONTROL_FRAME_BYTES
+        };
         let envelope = Envelope {
             protocol_version: CONTROL_PROTOCOL_VERSION,
             request_id,
@@ -974,9 +1001,10 @@ impl RuntimeClient {
         write_frame(&mut stream, &envelope)
             .await
             .map_err(|error| ClientError::Protocol(error.to_string()))?;
-        let reply: AdminReply = read_frame(&mut stream)
-            .await
-            .map_err(|error| ClientError::Protocol(error.to_string()))?;
+        let reply: AdminReply =
+            freshell_runtime_protocol::read_frame_with_limit(&mut stream, reply_limit)
+                .await
+                .map_err(|error| ClientError::Protocol(error.to_string()))?;
         reply.result.map_err(runtime_error)
     }
 }
@@ -988,7 +1016,9 @@ fn runtime_error(error: RuntimeError) -> ClientError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use freshell_runtime_protocol::{write_frame, AdminReply, AdminResult, InstallationId};
+    use freshell_runtime_protocol::{
+        read_frame, write_frame, AdminReply, AdminResult, InstallationId,
+    };
     use tokio::net::UnixListener;
 
     #[tokio::test]
