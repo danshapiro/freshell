@@ -269,6 +269,26 @@ test.describe.serial('Phase 5 certified provider loss', () => {
       // Retain only a diagnostic marker; remove OpenCode session DB/artifacts
       // and all Freshell checkpoint copies without reading or mutating host
       // credentials. Then terminate exactly the recorded provider PID.
+      // Observe the entire transition so a popup that flashes and disappears
+      // cannot be certified as invisible from its final DOM state alone.
+      await page.evaluate(() => {
+        const selector = '[aria-label="Managed runtime notice"]'
+        const observation = {
+          maximumCount: document.querySelectorAll(selector).length,
+          observer: new MutationObserver((records) => {
+            const addedNotice = records.some((record) => Array.from(record.addedNodes)
+              .some((node) => node instanceof Element
+                && (node.matches(selector) || node.querySelector(selector) !== null)))
+            observation.maximumCount = Math.max(
+              observation.maximumCount,
+              document.querySelectorAll(selector).length,
+              addedNotice ? 1 : 0,
+            )
+          }),
+        }
+        observation.observer.observe(document.body, { childList: true, subtree: true })
+        ;(window as any).__FRESHELL_PHASE5_NOTICE_OBSERVATION__ = observation
+      })
       rig.runtime.killOwnedRuntimePidExact(before.containerId, workerPid)
       rig.ownedContainerExec(before.containerId, [
         'node', '-e', String.raw`
@@ -328,7 +348,33 @@ if (!fs.statSync('/home/freshell/provider/p5-diagnostic-only').isFile()) process
       const paneRecoveryCard = page.locator(`[data-pane-id="${paneId}"] [data-testid="managed-runtime-recovery-card"]`)
       await expect(paneRecoveryCard).toBeVisible({ timeout: 60_000 })
       await expect(paneRecoveryCard).toContainText(/could not be recovered/i)
-      await expect(paneRecoveryCard.getByRole('button', { name: 'Start new conversation' })).toBeVisible()
+      const startNewConversation = paneRecoveryCard.getByRole('button', { name: 'Start new conversation' })
+      await expect(startNewConversation).toBeVisible()
+      await expect(startNewConversation).toBeEnabled()
+      const visibleRecoveryCards = page.locator('[data-testid="managed-runtime-recovery-card"]:visible')
+      await expect(visibleRecoveryCards).toHaveCount(1)
+      const recoveryCards = await visibleRecoveryCards.evaluateAll((cards) => cards.map((card) => {
+        const button = Array.from(card.querySelectorAll('button'))
+          .find((candidate) => candidate.textContent?.trim() === 'Start new conversation')
+        return {
+          paneId: card.closest('[data-pane-id]')?.getAttribute('data-pane-id'),
+          lossMessageVisible: /could not be recovered/i.test(card.textContent ?? ''),
+          startNewConversationEnabled: !!button && !button.disabled
+            && button.getClientRects().length > 0,
+        }
+      }))
+      const routineNoticeCount = await page.evaluate(() => {
+        const observation = (window as any).__FRESHELL_PHASE5_NOTICE_OBSERVATION__
+        if (!observation) throw new Error('loss notice observation is missing')
+        observation.observer.disconnect()
+        const maximumCount = Math.max(
+          observation.maximumCount,
+          document.querySelectorAll('[aria-label="Managed runtime notice"]').length,
+        )
+        delete (window as any).__FRESHELL_PHASE5_NOTICE_OBSERVATION__
+        return maximumCount
+      })
+      expect(routineNoticeCount).toBe(0)
 
       const incident = dataOf(await rig.runtime.adminOk(
         rig.supervisor,
@@ -351,7 +397,7 @@ if (!fs.statSync('/home/freshell/provider/p5-diagnostic-only').isFile()) process
       expect(result.view.intentRevision).toBe(before.intentRevision + 1)
       writePrivateJson(path.join(rig.runtime.evidenceDir, PHASE5_LOSS_INCIDENT_FILE), incidentArtifact)
       writePrivateJson(path.join(rig.runtime.evidenceDir, PHASE5_LOSS_ASSERTIONS_FILE), {
-        schemaVersion: 1,
+        schemaVersion: 2,
         candidateSha: rig.runtime.candidateSha,
         receiptRunId: rig.runtime.runId,
         caseId: 'P5-G02',
@@ -385,9 +431,8 @@ if (!fs.statSync('/home/freshell/provider/p5-diagnostic-only').isFile()) process
           }],
         },
         browser: {
-          // The durable notice remains in the incident receipt, but routine
-          // success is not rendered as a browser popup.
-          displayedNoticeIds: [incidentArtifact.noticeId],
+          routineNoticeCount,
+          recoveryCards,
           endedPane: {
             soulId: ended.content.soulId,
             incarnationId: before.incarnationId,
