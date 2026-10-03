@@ -79,6 +79,7 @@ const apiMock = vi.hoisted(() => ({
   setSessionMetadata: vi.fn().mockResolvedValue(undefined),
   getManagedRuntimeInventory: vi.fn(),
   retryManagedRuntimeSoul: vi.fn(),
+  stopManagedRuntimeSoul: vi.fn(),
 }))
 
 const saveServerSettingsPatchSpy = vi.hoisted(() => vi.fn((patch: unknown) => ({
@@ -101,6 +102,7 @@ vi.mock('@/lib/api', async () => {
     setSessionMetadata: apiMock.setSessionMetadata,
     getManagedRuntimeInventory: apiMock.getManagedRuntimeInventory,
     retryManagedRuntimeSoul: apiMock.retryManagedRuntimeSoul,
+    stopManagedRuntimeSoul: apiMock.stopManagedRuntimeSoul,
   }
 })
 
@@ -287,6 +289,7 @@ beforeEach(() => {
   apiMock.setSessionMetadata.mockReset()
   apiMock.getManagedRuntimeInventory.mockReset()
   apiMock.retryManagedRuntimeSoul.mockReset()
+  apiMock.stopManagedRuntimeSoul.mockReset()
   apiMock.post.mockResolvedValue({ title: null, source: 'none' })
   apiMock.requestSessionHandoff.mockResolvedValue({
     ok: true,
@@ -6228,6 +6231,82 @@ describe('FreshAgentView', () => {
       expect(apiMock.retryManagedRuntimeSoul).toHaveBeenCalledWith('managed-retry-soul', 19)
       expect(apiMock.getManagedRuntimeInventory).toHaveBeenCalledTimes(1)
     })
+  })
+
+  it.each([
+    ['freshclaude', 'claude'], ['kilroy', 'claude'], ['freshcodex', 'codex'], ['freshopencode', 'opencode'],
+  ] as const)('stops the persisted managed soul before replacing a restored %s conversation', async (sessionType, provider) => {
+    const store = createStore()
+    let resolveStop!: (result: { outcome: string }) => void
+    apiMock.stopManagedRuntimeSoul.mockReturnValueOnce(new Promise((resolve) => { resolveStop = resolve }))
+    const content = {
+      kind: 'fresh-agent' as const, sessionType, provider, createRequestId: 'lost-restored-create',
+      sessionRef: { provider, sessionId: CLAUDE_RESTORE_THREAD_ID }, status: 'error' as const,
+      soulId: 'persisted-lost-soul', soulIntentRevision: 17,
+      recoverySummary: { desiredState: 'stopped' as const, recoveryState: 'lost' as const,
+        durabilityState: 'resume_captured' as const, allocationState: 'verified_durable' as const },
+    }
+    store.dispatch(initLayout({ tabId: 'tab-1', paneId: 'pane-1', content }))
+    render(<Provider store={store}><StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" /></Provider>)
+    wsMock.send.mockClear()
+
+    fireEvent.click(screen.getByRole('button', { name: 'Start new conversation' }))
+    await waitFor(() => expect(apiMock.stopManagedRuntimeSoul).toHaveBeenCalledWith('persisted-lost-soul', 17))
+    expect(getFreshAgentPaneContent(store)).toMatchObject(content)
+    expect(sentFreshAgentMessages('freshAgent.kill')).toHaveLength(0)
+    expect(sentFreshAgentMessages('freshAgent.create')).toHaveLength(0)
+    await act(async () => resolveStop({ outcome: 'verified_empty' }))
+    await waitFor(() => expect(getFreshAgentPaneContent(store).createRequestId).not.toBe(content.createRequestId))
+    expect(getFreshAgentPaneContent(store).soulId).toBeUndefined()
+    expect(getFreshAgentPaneContent(store).sessionRef).toBeUndefined()
+  })
+
+  it.each(['termination_unconfirmed', 'blocked_ownership', 'backend_unavailable', 'http_failure', 'missing_revision', 'missing_soul'])(
+    'retains a lost managed Fresh Agent and reports %s cleanup inline', async (outcome) => {
+      const store = createStore()
+      if (outcome === 'http_failure') apiMock.stopManagedRuntimeSoul.mockRejectedValueOnce(new Error('Server is unavailable'))
+      else apiMock.stopManagedRuntimeSoul.mockResolvedValueOnce({ outcome })
+      const content = {
+        kind: 'fresh-agent' as const, sessionType: 'freshcodex' as const, provider: 'codex' as const,
+        createRequestId: 'lost-create', sessionId: 'lost-thread',
+        sessionRef: { provider: 'codex' as const, sessionId: 'lost-thread' }, status: 'error' as const,
+        soulId: outcome === 'missing_soul' ? undefined : 'lost-soul',
+        soulIntentRevision: outcome === 'missing_revision' ? undefined : 9,
+        recoverySummary: { desiredState: 'stopped' as const, recoveryState: 'lost' as const,
+          durabilityState: 'resume_captured' as const, allocationState: 'verified_durable' as const },
+      }
+      store.dispatch(initLayout({ tabId: 'tab-1', paneId: 'pane-1', content }))
+      render(<Provider store={store}><StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" /></Provider>)
+      const retained = getFreshAgentPaneContent(store)
+      wsMock.send.mockClear()
+      fireEvent.click(screen.getByRole('button', { name: 'Start new conversation' }))
+      expect(await screen.findByRole('status')).toHaveTextContent(outcome === 'http_failure' ? 'Server is unavailable' : 'Your conversation has been kept')
+      expect(getFreshAgentPaneContent(store)).toMatchObject(retained)
+      expect(sentFreshAgentMessages('freshAgent.kill')).toHaveLength(0)
+      expect(sentFreshAgentMessages('freshAgent.create')).toHaveLength(0)
+    },
+  )
+
+  it('does not reset a different Fresh Agent pane when an earlier stop completes', async () => {
+    const store = createStore()
+    let resolveStop!: (result: { outcome: string }) => void
+    apiMock.stopManagedRuntimeSoul.mockReturnValueOnce(new Promise((resolve) => { resolveStop = resolve }))
+    const content = {
+      kind: 'fresh-agent' as const, sessionType: 'freshcodex' as const, provider: 'codex' as const,
+      createRequestId: 'old-lost-create', sessionRef: { provider: 'codex' as const, sessionId: 'old-thread' },
+      status: 'error' as const, soulId: 'old-soul', soulIntentRevision: 11,
+      recoverySummary: { desiredState: 'stopped' as const, recoveryState: 'lost' as const,
+        durabilityState: 'resume_captured' as const, allocationState: 'verified_durable' as const },
+    }
+    store.dispatch(initLayout({ tabId: 'tab-1', paneId: 'pane-1', content }))
+    render(<Provider store={store}><StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" /></Provider>)
+    fireEvent.click(screen.getByRole('button', { name: 'Start new conversation' }))
+    await waitFor(() => expect(apiMock.stopManagedRuntimeSoul).toHaveBeenCalledWith('old-soul', 11))
+    const replacement = { ...content, createRequestId: 'different-create', soulId: 'different-soul',
+      sessionRef: { provider: 'codex' as const, sessionId: 'different-thread' } }
+    act(() => store.dispatch(updatePaneContent({ tabId: 'tab-1', paneId: 'pane-1', content: replacement })))
+    await act(async () => resolveStop({ outcome: 'verified_empty' }))
+    expect(getFreshAgentPaneContent(store)).toMatchObject(replacement)
   })
 
   it('follows a managed same-soul fork even when another view issued the request', async () => {

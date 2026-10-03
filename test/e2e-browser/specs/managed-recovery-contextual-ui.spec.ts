@@ -75,7 +75,8 @@ async function installPane(page: Page, kind: PaneKind, recoveryState: RecoverySt
       ...root.content, ...identity, ...managed, mode: 'codex',
       status: summary.recoveryState === 'live' ? 'running' : 'error',
     } : {
-      kind: 'fresh-agent', sessionType: 'freshcodex', provider: 'codex', sessionId,
+      kind: 'fresh-agent', sessionType: 'freshcodex', provider: 'codex',
+      ...(summary.recoveryState === 'lost' ? {} : { sessionId }),
       ...identity, ...managed, status: 'idle', model, effort: 'low',
       initialCwd: '/tmp', settingsDismissed: true,
     }
@@ -157,10 +158,22 @@ for (const kind of ['terminal', 'fresh-agent'] as const) {
     })
   })
 
-  test(`${kind}: lost identity remains until Start new conversation is chosen`, async ({ freshellPage, page, terminal, harness }) => {
+  test(`${kind}: lost identity remains until explicit start-new cleanup is verified`, async ({ freshellPage, page, terminal, harness }) => {
     await terminal.waitForTerminal()
     await installPane(page, kind, 'lost')
     const before = await paneContent(page)
+    const stopRequests: Array<{ expectedIntentRevision: number; requestId: string }> = []
+    let releaseVerifiedStop!: () => void
+    const verifiedStop = new Promise<void>((resolve) => { releaseVerifiedStop = resolve })
+    await page.route(`**/api/runtime/souls/${SOUL_ID}/stop`, async (route) => {
+      stopRequests.push(route.request().postDataJSON())
+      if (stopRequests.length === 1) {
+        await route.fulfill({ json: { outcome: 'termination_unconfirmed' } })
+      } else {
+        await verifiedStop
+        await route.fulfill({ json: { outcome: 'verified_empty', soul: { freshAgentSessionId: SESSION_ID } } })
+      }
+    })
     const card = page.getByTestId('managed-runtime-recovery-card')
     await expect(card).toBeVisible()
     await expect(card).toContainText('This session could not be recovered.')
@@ -187,14 +200,21 @@ for (const kind of ['terminal', 'fresh-agent'] as const) {
     const beforeChoice = await harness.getSentWsMessages() as Array<{ type?: string }>
     expect(beforeChoice.filter((message) => ['terminal.create', 'terminal.attach', 'freshAgent.create', 'freshAgent.attach', 'pane.reconcile.request'].includes(message.type ?? ''))).toEqual([])
     await card.getByRole('button', { name: 'Start new conversation', exact: true }).click()
-    if (kind === 'fresh-agent') {
-      await expect.poll(async () => (await harness.getSentWsMessages() as Array<{ type?: string; sessionId?: string }>)
-        .filter((message) => message.type === 'freshAgent.kill' && message.sessionId === SESSION_ID).length).toBe(1)
-      // A replacement must wait for the server's durable-close acknowledgement.
+    await expect(card.getByRole('status')).toContainText('Your conversation has been kept')
+    expect(await paneContent(page)).toMatchObject({ createRequestId: CREATE_REQUEST_ID, soulId: SOUL_ID, sessionRef: before.sessionRef })
+    await card.getByRole('button', { name: 'Start new conversation', exact: true }).click()
+    try {
+      await expect(card.getByRole('button', { name: 'Starting…', exact: true })).toBeDisabled()
+      await expect.poll(() => stopRequests.length).toBe(2)
+      expect(stopRequests).toEqual([
+        { expectedIntentRevision: INTENT_REVISION, requestId: expect.any(String) },
+        { expectedIntentRevision: INTENT_REVISION, requestId: expect.any(String) },
+      ])
       expect((await paneContent(page)).createRequestId).toBe(CREATE_REQUEST_ID)
-      await harness.receiveWsMessage({
-        type: 'freshAgent.killed', sessionId: SESSION_ID, sessionType: 'freshcodex', provider: 'codex', success: true,
-      })
+      const pendingMessages = await harness.getSentWsMessages() as Array<{ type?: string }>
+      expect(pendingMessages.filter((message) => ['freshAgent.kill', 'freshAgent.create', 'terminal.create'].includes(message.type ?? ''))).toEqual([])
+    } finally {
+      releaseVerifiedStop()
     }
     await expect(card).toBeHidden()
     await expect.poll(async () => (await paneContent(page)).createRequestId).not.toBe(CREATE_REQUEST_ID)
