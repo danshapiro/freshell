@@ -231,7 +231,8 @@ async function gate02GenuineLossCertificateAndCleanup(h: RuntimeHarness): Promis
   const real = receipt.lossValidation
   h.assert(caseId, real.provider === 'opencode', 'real isolated OpenCode loss ran through the browser evidence builder', real)
   h.assert(caseId, real.exactCleanupVerified === true && real.foreignObjectsTouched === 0, 'hashed incident and broker evidence prove exact isolated cleanup', real)
-  h.assert(caseId, real.displayedNoticeCount === 1, 'hashed browser evidence proves exactly one truthful notice', real)
+  h.assert(caseId, real.routineNoticeCount === 0 && real.actionableRecoveryCardCount === 1,
+    'hashed browser evidence proves routine popups stay hidden and the exact lost pane offers one recovery decision', real)
 }
 
 async function gate03EveryRecoverableAlternativeWins(h: RuntimeHarness): Promise<void> {

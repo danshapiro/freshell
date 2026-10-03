@@ -41,7 +41,8 @@ export type Phase5LossSummary = {
   incarnationId: string
   incidentId: string
   exactCleanupVerified: true
-  displayedNoticeCount: 1
+  routineNoticeCount: 0
+  actionableRecoveryCardCount: 1
   foreignObjectsTouched: 0
 }
 
@@ -81,7 +82,8 @@ export function buildPhase5LossReceipt(input: {
     path.join(input.evidenceDir, PHASE5_LOSS_ASSERTIONS_FILE),
     'utf8',
   ))
-  const identity = assertions.identity
+  const identity = validateIdentity(assertions.identity)
+  const browserSummary = validateLossBrowser(assertions.browser, identity)
   const receipt = {
     schemaVersion: 2,
     kind: 'phase5_loss',
@@ -96,15 +98,7 @@ export function buildPhase5LossReceipt(input: {
       failures: [],
     },
     artifacts: refs,
-    summary: {
-      provider: identity.provider,
-      soulId: identity.soulId,
-      incarnationId: identity.incarnationId,
-      incidentId: identity.incidentId,
-      exactCleanupVerified: true,
-      displayedNoticeCount: 1,
-      foreignObjectsTouched: 0,
-    },
+    summary: lossSummary(identity, browserSummary),
   }
   validatePhase5LossReceipt({ ...input, receipt })
   return receipt
@@ -131,7 +125,7 @@ export function validatePhase5LossReceipt(input: {
     'schemaVersion', 'caseId', 'candidateSha', 'receiptRunId', 'test',
     'identity', 'intent', 'providerState', 'browser',
   ], 'loss assertion artifact')
-  if (assertions.schemaVersion !== 1 || assertions.caseId !== 'P5-G02') {
+  if (assertions.schemaVersion !== 2 || assertions.caseId !== 'P5-G02') {
     throw new Error('loss assertion artifact has the wrong schema or case')
   }
   equalString(assertions.candidateSha, input.candidateSha, 'loss assertions candidate SHA')
@@ -146,31 +140,36 @@ export function validatePhase5LossReceipt(input: {
     throw new Error('loss was not bound to the exact checked intent revision')
   }
   validateProviderState(assertions.providerState)
-  validateEndedPane(assertions.browser, identity)
+  const browserSummary = validateLossBrowser(assertions.browser, identity)
 
   const capability = capabilityFor(loaded.json.capabilityInventory, identity.provider)
   const incident = validateIncident(loaded.json.incident, identity, capability, checkedRevision, input)
-  const displayedNoticeIds = object(assertions.browser, 'loss browser evidence').displayedNoticeIds
-  if (displayedNoticeIds[0] !== loaded.json.incident.noticeId) {
-    throw new Error('displayed loss notice does not match the durable incident notice')
-  }
   validateLifecycle(loaded.jsonl.lifecycle, identity, incident.certificateSha256)
   validateBrokerDestructiveTargets(loaded.jsonl.broker, identity.containerId)
   validateCleanupContainsContainer(loaded.json.cleanup, identity.containerId)
 
-  const summary: Phase5LossSummary = {
+  const summary = lossSummary(identity, browserSummary)
+  if (stableJson(loaded.receipt.summary) !== stableJson(summary)) {
+    throw new Error('loss receipt summary differs from evidence-derived summary')
+  }
+  return { ...loaded, summary }
+}
+
+type LossBrowserSummary = Pick<Phase5LossSummary, 'routineNoticeCount' | 'actionableRecoveryCardCount'>
+
+function lossSummary(
+  identity: ReturnType<typeof validateIdentity>,
+  browser: LossBrowserSummary,
+): Phase5LossSummary {
+  return {
     provider: identity.provider,
     soulId: identity.soulId,
     incarnationId: identity.incarnationId,
     incidentId: identity.incidentId,
     exactCleanupVerified: true,
-    displayedNoticeCount: 1,
+    ...browser,
     foreignObjectsTouched: 0,
   }
-  if (stableJson(loaded.receipt.summary) !== stableJson(summary)) {
-    throw new Error('loss receipt summary differs from evidence-derived summary')
-  }
-  return { ...loaded, summary }
 }
 
 export function phase5LossRetainedBundle(
@@ -215,6 +214,7 @@ function validateIdentity(value: unknown): {
   containerId: string
   nativeSessionIdHash: string
   incidentId: string
+  paneId: string
 } {
   const identity = object(value, 'loss identity')
   exactKeys(identity, [
@@ -271,17 +271,29 @@ function validateProviderState(value: unknown): void {
   }
 }
 
-function validateEndedPane(browserValue: unknown, identity: ReturnType<typeof validateIdentity>): void {
+function validateLossBrowser(
+  browserValue: unknown,
+  identity: ReturnType<typeof validateIdentity>,
+): LossBrowserSummary {
   const browser = object(browserValue, 'loss browser evidence')
-  exactKeys(browser, ['displayedNoticeIds', 'endedPane'], 'loss browser evidence')
-  const notices = array(browser.displayedNoticeIds, 'displayed notice ids')
-  if (notices.length !== 1) throw new Error('loss browser evidence must display exactly one notice')
+  exactKeys(browser, ['routineNoticeCount', 'recoveryCards', 'endedPane'], 'loss browser evidence')
+  const routineNoticeCount = integer(browser.routineNoticeCount, 'routine notice count')
+  if (routineNoticeCount !== 0) throw new Error('loss browser evidence must suppress routine popups')
+  const cards = array(browser.recoveryCards, 'loss recovery cards')
+  const actionableRecoveryCardCount = cards.length
+  if (actionableRecoveryCardCount !== 1) throw new Error('loss browser evidence must display exactly one recovery card')
+  const card = object(cards[0], 'loss recovery card')
+  exactKeys(card, ['paneId', 'lossMessageVisible', 'startNewConversationEnabled'], 'loss recovery card')
+  if (card.paneId !== identity.paneId) throw new Error('loss recovery card must belong to the exact lost pane')
+  if (card.lossMessageVisible !== true) throw new Error('loss recovery card must display the loss message')
+  if (card.startNewConversationEnabled !== true) throw new Error('loss recovery card must be actionable')
   const pane = object(browser.endedPane, 'ended pane evidence')
   exactKeys(pane, ['soulId', 'incarnationId', 'incidentId', 'nativeSessionIdHash', 'recoveryState'], 'ended pane evidence')
   for (const key of ['soulId', 'incarnationId', 'incidentId', 'nativeSessionIdHash'] as const) {
     if (pane[key] !== identity[key]) throw new Error(`ended pane does not retain exact ${key}`)
   }
   if (pane.recoveryState !== 'lost') throw new Error('ended pane is not retained in lost state')
+  return { routineNoticeCount, actionableRecoveryCardCount }
 }
 
 function capabilityFor(inventory: Record<string, any>, provider: string): Record<string, any> {
@@ -307,6 +319,7 @@ function validateIncident(
     'cleanup', 'noticeId', 'updatedAt',
   ], 'loss incident artifact')
   equalString(value.incidentId, identity.incidentId, 'loss incident id')
+  nonEmptyString(value.noticeId, 'durable loss incident notice id')
   if (value.event !== 'soul.loss.finalized' || value.cleanupState !== 'closed') throw new Error('loss incident is not a closed final incident')
   const certificate = object(value.certificate, 'loss certificate')
   exactKeys(certificate, [
