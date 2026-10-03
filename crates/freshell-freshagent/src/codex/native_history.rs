@@ -8,7 +8,11 @@ use std::{
 pub(crate) fn read(home: &Path, id: &str) -> Result<Value, String> {
     let path = super::locate_thread_rollout(&home.join(".codex/sessions"), id)
         .ok_or("saved native session not found")?;
-    let file = std::fs::File::open(&path).map_err(|e| e.to_string())?;
+    read_rollout(&path, id)
+}
+
+pub(super) fn read_rollout(path: &Path, id: &str) -> Result<Value, String> {
+    let file = std::fs::File::open(path).map_err(|e| e.to_string())?;
     if file.metadata().map_err(|e| e.to_string())?.len() > crate::native_history::MAX_HISTORY_BYTES
     {
         return Err("native transcript exceeds history read limit".into());

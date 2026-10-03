@@ -9,12 +9,16 @@ pub fn read(provider: &str, home: &Path, session_id: &str) -> Result<Value, Stri
     if session_id.is_empty() || session_id.contains(['/', '\\']) {
         return Err("invalid native session identity".into());
     }
-    let mut snapshot = match provider {
+    let snapshot = match provider {
         "claude" | "kilroy" => read_claude(home, session_id, provider)?,
         "codex" => crate::codex::native_history::read(home, session_id)?,
         "opencode" => read_opencode(home, session_id)?,
         _ => return Err("native history reader does not support this provider".into()),
     };
+    readonly_snapshot(provider, snapshot)
+}
+
+pub(crate) fn readonly_snapshot(provider: &str, mut snapshot: Value) -> Result<Value, String> {
     if let Some(capabilities) = snapshot["capabilities"].as_object_mut() {
         for value in capabilities.values_mut() {
             if value.is_boolean() {
