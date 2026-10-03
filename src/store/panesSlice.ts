@@ -1221,6 +1221,8 @@ export const panesSlice = createSlice({
         preserveCreateRequestIds?: boolean
         /** Reopen only after refreshing managed handles from supervisor inventory. */
         preserveManagedRuntimeHandles?: boolean
+        /** Rebuild an existing projection tab with the captured closed layout. */
+        replaceExistingLayout?: boolean
       }>
     ) => {
       const {
@@ -1230,9 +1232,20 @@ export const panesSlice = createSlice({
         paneTitleSetByUser,
         preserveCreateRequestIds,
         preserveManagedRuntimeHandles,
+        replaceExistingLayout,
       } = action.payload
       if (refuseMutationWhileClosing(state, tabId, 'restoreLayout')) return
-      if (state.layouts[tabId]) return
+      const previousLayout = state.layouts[tabId]
+      if (previousLayout && !replaceExistingLayout) return
+
+      if (previousLayout) {
+        for (const leaf of collectLeaves(previousLayout)) {
+          if (state.focusEpochByPaneId) delete state.focusEpochByPaneId[leaf.id]
+          if (state.closingPanes) delete state.closingPanes[`${tabId}:${leaf.id}`]
+        }
+        if (state.zoomedPane) delete state.zoomedPane[tabId]
+        if (state.paneTitleSetByUser) delete state.paneTitleSetByUser[tabId]
+      }
 
       const normalizedLayout = normalizeRestoredTree(
         layout,

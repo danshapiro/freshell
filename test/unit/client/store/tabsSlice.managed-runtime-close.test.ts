@@ -702,7 +702,57 @@ describe('closeTab managed runtime visibility', () => {
     expect(representedViews).toHaveLength(1)
   })
 
-  it('keeps a mixed saved layout retryable when refresh projects its managed view before retry', async () => {
+  it('runs fresh managed preflight when a managed tab marker survives an empty runtime cache', async () => {
+    let serverSnapshot = inventory(8, [view('view-a', 0)])
+    const store = createStore(['view-a'], serverSnapshot)
+    store.dispatch(updatePaneContent({
+      tabId: 'managed-tab',
+      paneId: 'managed-pane-0',
+      content: {
+        kind: 'terminal',
+        terminalId: 'terminal-soul-view-a',
+        createRequestId: 'create-soul-view-a',
+        status: 'running',
+        mode: 'opencode',
+      },
+    }))
+    apiMocks.getManagedRuntimeInventory.mockImplementation(async () => serverSnapshot)
+    apiMocks.updateManagedRuntimeViewVisibility.mockImplementation(async (viewId: string, visibility: ManagedRuntimeViewIntent['visibility']) => {
+      serverSnapshot = withVisibility(serverSnapshot, viewId, visibility)
+      return serverSnapshot.viewIntents.find((entry) => entry.viewId === viewId)
+    })
+
+    await store.dispatch(closeTab('managed-tab'))
+    const savedEntry = store.getState().tabRegistry.reopenStack[0]!
+    expect(savedEntry.tab.viewIntentId).toBe('view-a')
+    expect(savedEntry.layout.type).toBe('leaf')
+    if (savedEntry.layout.type === 'leaf' && savedEntry.layout.content.kind === 'terminal') {
+      expect(savedEntry.layout.content.viewIntentId).toBeUndefined()
+    }
+    store.dispatch(managedRuntimeSnapshotReceived({
+      snapshot: inventory(serverSnapshot.revision + 1, []),
+      reconstructedViewCount: 0,
+    }))
+    apiMocks.getManagedRuntimeInventory.mockClear()
+    apiMocks.getManagedRuntimeInventory.mockImplementation(async () => serverSnapshot)
+
+    const result = await store.dispatch(reopenClosedTab())
+
+    expect(apiMocks.getManagedRuntimeInventory).toHaveBeenCalledTimes(2)
+    expect(reopenClosedTab.fulfilled.match(result)).toBe(true)
+    const reopened = store.getState().panes.layouts[
+      store.getState().tabs.tabs[0]!.id
+    ]
+    expect(reopened?.type).toBe('leaf')
+    if (reopened?.type === 'leaf' && reopened.content.kind === 'terminal') {
+      expect(reopened.content.viewIntentId).toBe('view-a')
+      expect(reopened.content.terminalId).toBe('terminal-soul-view-a')
+      expect(reopened.content.createRequestId).toBe('create-soul-view-a')
+    }
+    expect(store.getState().tabRegistry.reopenStack).toHaveLength(0)
+  })
+
+  it('restores a mixed saved layout around a view projected before retry', async () => {
     let serverSnapshot = inventory(8, [view('view-a', 0)])
     const store = createStore(['view-a'], serverSnapshot)
     store.dispatch(splitPane({
@@ -751,19 +801,142 @@ describe('closeTab managed runtime visibility', () => {
 
     const retry = await store.dispatch(reopenClosedTab())
 
-    expect(reopenClosedTab.rejected.match(retry)).toBe(true)
+    expect(reopenClosedTab.fulfilled.match(retry)).toBe(true)
     expect(store.getState().tabs.tabs).toHaveLength(1)
-    expect(store.getState().tabRegistry.reopenStack).toEqual([savedEntry])
+    expect(store.getState().tabRegistry.reopenStack).toHaveLength(0)
     const localContents = Object.values(store.getState().panes.layouts)
       .flatMap((layout) => layout ? collectPaneContents(layout) : [])
     expect(localContents.filter((content) => content.kind === 'terminal' && content.viewIntentId === 'view-a')).toHaveLength(1)
-    expect(localContents.some((content) => content.kind === 'editor' && content.filePath === '/workspace/notes.md')).toBe(false)
-    expect(collectPaneContents(store.getState().tabRegistry.reopenStack[0]!.layout)).toEqual(
-      collectPaneContents(savedEntry.layout),
-    )
+    expect(localContents.some((content) => content.kind === 'editor' && content.filePath === '/workspace/notes.md')).toBe(true)
+    const restoredLayout = store.getState().panes.layouts[store.getState().tabs.tabs[0]!.id]
+    expect(restoredLayout?.type).toBe('split')
+    if (restoredLayout?.type === 'split' && savedEntry.layout.type === 'split') {
+      expect(restoredLayout.id).toBe(savedEntry.layout.id)
+      expect(restoredLayout.direction).toBe(savedEntry.layout.direction)
+      expect(restoredLayout.sizes).toEqual(savedEntry.layout.sizes)
+      expect(restoredLayout.children.map((child) => child.id)).toEqual(savedEntry.layout.children.map((child) => child.id))
+    }
   })
 
-  it('retains a multi-view reopen entry when only some saved views are already represented', async () => {
+  it('merges a partially projected split layout and keeps the entry until promotion can be confirmed', async () => {
+    let serverSnapshot = inventory(8, [view('view-a', 0), view('view-b', 1)])
+    const store = createStore(['view-a', 'view-b'], serverSnapshot)
+    let failNextConfirmation = false
+    let failPromotionFor: string | null = 'view-a'
+    apiMocks.getManagedRuntimeInventory.mockImplementation(async () => {
+      if (failNextConfirmation) {
+        failNextConfirmation = false
+        throw new Error('confirmation GET failed')
+      }
+      return serverSnapshot
+    })
+    apiMocks.updateManagedRuntimeViewVisibility.mockImplementation(async (viewId: string, visibility: ManagedRuntimeViewIntent['visibility']) => {
+      serverSnapshot = withVisibility(serverSnapshot, viewId, visibility)
+      if (visibility === 'visible' && failPromotionFor === viewId) {
+        failPromotionFor = viewId === 'view-a' ? 'view-b' : null
+        failNextConfirmation = true
+        throw new Error('PATCH response lost after commit')
+      }
+      return serverSnapshot.viewIntents.find((entry) => entry.viewId === viewId)
+    })
+
+    await store.dispatch(closeTab('managed-tab'))
+    const savedEntry = store.getState().tabRegistry.reopenStack[0]!
+    const firstReopen = await store.dispatch(reopenClosedTab())
+    expect(reopenClosedTab.rejected.match(firstReopen)).toBe(true)
+
+    await queueManagedRuntimeRefresh(store as any, 'project-one-view-before-split-retry')
+    expect(store.getState().tabs.tabs).toHaveLength(1)
+
+    const mergeAttempt = await store.dispatch(reopenClosedTab())
+    expect(reopenClosedTab.rejected.match(mergeAttempt)).toBe(true)
+    expect(serverSnapshot.viewIntents.every((entry) => entry.visibility === 'visible')).toBe(true)
+    expect(store.getState().tabs.tabs).toHaveLength(1)
+    expect(store.getState().tabRegistry.reopenStack).toEqual([savedEntry])
+    let restoredLayout = store.getState().panes.layouts[store.getState().tabs.tabs[0]!.id]
+    expect(restoredLayout?.type).toBe('split')
+    expect(collectPaneContents(restoredLayout!)
+      .filter((content) => content.kind === 'terminal' && content.viewIntentId)
+      .map((content) => content.kind === 'terminal' ? content.viewIntentId : undefined)
+      .sort()).toEqual(['view-a', 'view-b'])
+
+    const finalRetry = await store.dispatch(reopenClosedTab())
+
+    expect(reopenClosedTab.fulfilled.match(finalRetry)).toBe(true)
+    expect(store.getState().tabs.tabs).toHaveLength(1)
+    expect(store.getState().tabRegistry.reopenStack).toHaveLength(0)
+    restoredLayout = store.getState().panes.layouts[store.getState().tabs.tabs[0]!.id]
+    expect(restoredLayout?.type).toBe('split')
+    if (restoredLayout?.type === 'split' && savedEntry.layout.type === 'split') {
+      expect(restoredLayout.id).toBe(savedEntry.layout.id)
+      expect(restoredLayout.direction).toBe(savedEntry.layout.direction)
+      expect(restoredLayout.sizes).toEqual(savedEntry.layout.sizes)
+      expect(restoredLayout.children.map((child) => child.id)).toEqual(savedEntry.layout.children.map((child) => child.id))
+    }
+  })
+
+  it('restores repeated managed leaves inside the saved split without adding another projected tab', async () => {
+    let serverSnapshot = inventory(8, [view('view-a', 0)])
+    const store = createStore(['view-a'], serverSnapshot)
+    store.dispatch(splitPane({
+      tabId: 'managed-tab',
+      paneId: 'managed-pane-0',
+      direction: 'vertical',
+      newPaneId: 'saved-repeat-pane',
+      newContent: managedContent(view('view-a', 0)),
+    }))
+    let failNextConfirmation = false
+    apiMocks.getManagedRuntimeInventory.mockImplementation(async () => {
+      if (failNextConfirmation) {
+        failNextConfirmation = false
+        throw new Error('confirmation GET failed')
+      }
+      return serverSnapshot
+    })
+    apiMocks.updateManagedRuntimeViewVisibility.mockImplementation(async (viewId: string, visibility: ManagedRuntimeViewIntent['visibility']) => {
+      serverSnapshot = withVisibility(serverSnapshot, viewId, visibility)
+      if (visibility === 'visible') {
+        failNextConfirmation = true
+        throw new Error('PATCH response lost after commit')
+      }
+      return serverSnapshot.viewIntents.find((entry) => entry.viewId === viewId)
+    })
+
+    await store.dispatch(closeTab('managed-tab'))
+    const savedEntry = store.getState().tabRegistry.reopenStack[0]!
+    const firstReopen = await store.dispatch(reopenClosedTab())
+    expect(reopenClosedTab.rejected.match(firstReopen)).toBe(true)
+    await queueManagedRuntimeRefresh(store as any, 'project-one-view-before-repeated-pane-retry')
+    serverSnapshot = withVisibility(serverSnapshot, 'view-a', 'detached')
+
+    const mergeAttempt = await store.dispatch(reopenClosedTab())
+
+    expect(reopenClosedTab.rejected.match(mergeAttempt)).toBe(true)
+    expect(store.getState().tabRegistry.reopenStack).toEqual([savedEntry])
+    let restoredLayout = store.getState().panes.layouts[store.getState().tabs.tabs[0]!.id]
+    expect(restoredLayout?.type).toBe('split')
+    expect(collectPaneContents(restoredLayout!).filter((content) => (
+      content.kind === 'terminal' && content.viewIntentId === 'view-a'
+    ))).toHaveLength(2)
+
+    const retry = await store.dispatch(reopenClosedTab())
+    expect(reopenClosedTab.fulfilled.match(retry)).toBe(true)
+    expect(store.getState().tabs.tabs).toHaveLength(1)
+    expect(store.getState().tabRegistry.reopenStack).toHaveLength(0)
+    restoredLayout = store.getState().panes.layouts[store.getState().tabs.tabs[0]!.id]
+    expect(restoredLayout?.type).toBe('split')
+    expect(collectPaneContents(restoredLayout!).filter((content) => (
+      content.kind === 'terminal' && content.viewIntentId === 'view-a'
+    ))).toHaveLength(2)
+    if (restoredLayout?.type === 'split' && savedEntry.layout.type === 'split') {
+      expect(restoredLayout.id).toBe(savedEntry.layout.id)
+      expect(restoredLayout.direction).toBe(savedEntry.layout.direction)
+      expect(restoredLayout.sizes).toEqual(savedEntry.layout.sizes)
+      expect(restoredLayout.children.map((child) => child.id)).toEqual(savedEntry.layout.children.map((child) => child.id))
+    }
+  })
+
+  it('folds separate managed projections into the saved split layout', async () => {
     let serverSnapshot = inventory(8, [view('view-a', 0), view('view-b', 1)])
     const store = createStore(['view-a', 'view-b'], serverSnapshot)
     apiMocks.getManagedRuntimeInventory.mockImplementation(async () => serverSnapshot)
@@ -778,12 +951,23 @@ describe('closeTab managed runtime visibility', () => {
       paneId: 'already-open-pane-a',
       content: managedContent(view('view-a', 0)),
     }))
+    store.dispatch(addTab({ id: 'already-open-b', title: 'Already open B', mode: 'opencode' }))
+    store.dispatch(initLayout({
+      tabId: 'already-open-b',
+      paneId: 'already-open-pane-b',
+      content: managedContent(view('view-b', 1)),
+    }))
 
     const result = await store.dispatch(reopenClosedTab())
 
-    expect(reopenClosedTab.rejected.match(result)).toBe(true)
+    expect(reopenClosedTab.fulfilled.match(result)).toBe(true)
     expect(store.getState().tabs.tabs.map((tab) => tab.id)).toEqual(['already-open-a'])
-    expect(store.getState().tabRegistry.reopenStack).toHaveLength(1)
+    expect(store.getState().tabRegistry.reopenStack).toHaveLength(0)
+    const restoredLayout = store.getState().panes.layouts['already-open-a']
+    expect(restoredLayout?.type).toBe('split')
+    expect(collectPaneContents(restoredLayout!).filter((content) => (
+      content.kind === 'terminal' && (content.viewIntentId === 'view-a' || content.viewIntentId === 'view-b')
+    ))).toHaveLength(2)
   })
 
   it.each(['terminalId', 'createRequestId'] as const)(

@@ -1705,7 +1705,8 @@ function hasManagedRuntimeReopenCandidate(
   layout: PaneNode | undefined,
   runtime: ReturnType<typeof selectManagedRuntime>,
 ): boolean {
-  if (!layout) return Boolean(tab?.viewIntentId || tab?.soulId || tab?.incarnationId || tab?.runtimeState)
+  if (tab?.viewIntentId || tab?.soulId || tab?.incarnationId || tab?.runtimeState) return true
+  if (!layout) return false
   return collectPaneContents(layout).some((content) => {
     if (content.kind !== 'terminal') return false
     if (hasManagedRuntimeMarker(content)) return true
@@ -1720,6 +1721,7 @@ function hasManagedRuntimeReopenCandidate(
 function resolveManagedReopenTarget(
   content: Extract<PaneContent, { kind: 'terminal' }>,
   snapshot: ManagedRuntimeInventorySnapshot,
+  fallbackViewIntentId?: string,
 ): { view: ManagedRuntimeViewIntent; soul: ManagedRuntimeSoul; terminalCreateRequestId: string } | undefined {
   let view: ManagedRuntimeViewIntent | undefined
   if (content.viewIntentId) {
@@ -1733,13 +1735,18 @@ function resolveManagedReopenTarget(
       || (content.createRequestId && soul.terminalCreateRequestId === content.createRequestId)
     ))
     if (identityMatchedSouls.length > 1) throw new Error(MANAGED_VIEW_CLOSE_FAILED_MESSAGE)
-    if (identityMatchedSouls.length === 0) {
+    if (identityMatchedSouls.length === 0 && fallbackViewIntentId) {
+      const matches = snapshot.viewIntents.filter((candidate) => candidate.viewId === fallbackViewIntentId)
+      if (matches.length !== 1) throw new Error(MANAGED_VIEW_CLOSE_FAILED_MESSAGE)
+      view = matches[0]!
+    } else if (identityMatchedSouls.length === 0) {
       if (hasManagedRuntimeMarker(content)) throw new Error(MANAGED_VIEW_CLOSE_FAILED_MESSAGE)
       return undefined
+    } else {
+      const matches = snapshot.viewIntents.filter((candidate) => candidate.soulId === identityMatchedSouls[0]!.soulId)
+      if (matches.length !== 1) throw new Error(MANAGED_VIEW_CLOSE_FAILED_MESSAGE)
+      view = matches[0]!
     }
-    const matches = snapshot.viewIntents.filter((candidate) => candidate.soulId === identityMatchedSouls[0]!.soulId)
-    if (matches.length !== 1) throw new Error(MANAGED_VIEW_CLOSE_FAILED_MESSAGE)
-    view = matches[0]!
   }
 
   if (content.soulId && content.soulId !== view.soulId) {
@@ -1766,8 +1773,32 @@ function resolveManagedReopenTarget(
 function prepareManagedRuntimeReopenLayout(
   layout: PaneNode,
   snapshot: ManagedRuntimeInventorySnapshot,
+  tab: Tab,
 ): { layout: PaneNode; viewIntentIds: string[] } {
   const viewIntentIds = new Set<string>()
+  const terminalLeaves: Extract<PaneNode, { type: 'leaf' }>[] = []
+  const collectTerminalLeaves = (node: PaneNode) => {
+    if (node.type === 'split') {
+      collectTerminalLeaves(node.children[0])
+      collectTerminalLeaves(node.children[1])
+    } else if (node.content.kind === 'terminal') {
+      terminalLeaves.push(node)
+    }
+  }
+  collectTerminalLeaves(layout)
+  const tabViewMatches = tab.viewIntentId
+    ? snapshot.viewIntents.filter((view) => view.viewId === tab.viewIntentId)
+    : []
+  const tabSoulViewMatches = tab.soulId
+    ? snapshot.viewIntents.filter((view) => view.soulId === tab.soulId)
+    : []
+  const tabManagedViewId = tab.viewIntentId
+    ?? (tabSoulViewMatches.length === 1 ? tabSoulViewMatches[0]!.viewId : undefined)
+  const preferredPaneLeaf = tabViewMatches.length === 1
+    ? terminalLeaves.find((leaf) => leaf.id === tabViewMatches[0]!.preferredPaneId)
+    : undefined
+  const fallbackPaneId = preferredPaneLeaf?.id
+    ?? (terminalLeaves.length === 1 ? terminalLeaves[0]!.id : undefined)
   const visit = (node: PaneNode): PaneNode => {
     if (node.type === 'split') {
       return {
@@ -1776,7 +1807,8 @@ function prepareManagedRuntimeReopenLayout(
       }
     }
     if (node.content.kind !== 'terminal') return node
-    const target = resolveManagedReopenTarget(node.content, snapshot)
+    const fallbackViewIntentId = fallbackPaneId === node.id ? tabManagedViewId : undefined
+    const target = resolveManagedReopenTarget(node.content, snapshot, fallbackViewIntentId)
     if (!target) return node
     const { view, soul, terminalCreateRequestId } = target
     viewIntentIds.add(view.viewId)
@@ -1812,7 +1844,12 @@ function locallyRepresentedManagedReopenViews(
   state: RootState,
   viewIntentIds: string[],
   snapshot: ManagedRuntimeInventorySnapshot,
-): { representedViewIntentIds: Set<string>; representationCountByViewIntentId: Map<string, number>; ambiguous: boolean } {
+): {
+  representedViewIntentIds: Set<string>
+  representationCountByViewIntentId: Map<string, number>
+  representationsByViewIntentId: Map<string, ManagedReopenLocalRepresentation[]>
+  ambiguous: boolean
+} {
   const targetViews = viewIntentIds.map((viewIntentId) => {
     const matches = snapshot.viewIntents.filter((view) => view.viewId === viewIntentId)
     if (matches.length !== 1) throw new Error(MANAGED_VIEW_CLOSE_FAILED_MESSAGE)
@@ -1821,47 +1858,64 @@ function locallyRepresentedManagedReopenViews(
     if (souls.length !== 1) throw new Error(MANAGED_VIEW_CLOSE_FAILED_MESSAGE)
     return { view, soul: souls[0]! }
   })
-  const candidates: Array<{
+  type Candidate = {
+    tabId: string
+    pane?: PaneNode
     viewIntentId?: string
     soulId?: string
     terminalId?: string
     createRequestId?: string
-  }> = []
+  }
+  const candidates: Candidate[] = []
 
   for (const tab of state.tabs.tabs) {
     const layout = state.panes.layouts[tab.id]
     if (!layout) {
       candidates.push({
+        tabId: tab.id,
         viewIntentId: tab.viewIntentId,
         soulId: tab.soulId,
         createRequestId: tab.createRequestId,
       })
       continue
     }
-    for (const { content } of collectPaneEntries(layout)) {
-      if (content.kind !== 'terminal') continue
+    const visit = (node: PaneNode) => {
+      if (node.type === 'split') {
+        visit(node.children[0])
+        visit(node.children[1])
+        return
+      }
+      const { content } = node
+      if (content.kind !== 'terminal') return
       candidates.push({
+        tabId: tab.id,
+        pane: node,
         viewIntentId: content.viewIntentId,
         soulId: content.soulId,
         terminalId: content.terminalId,
         createRequestId: content.createRequestId,
       })
     }
+    visit(layout)
   }
 
   const representedViewIntentIds = new Set<string>()
   const representationCountByViewIntentId = new Map<string, number>()
-  const recordRepresentation = (viewIntentId: string) => {
+  const representationsByViewIntentId = new Map<string, ManagedReopenLocalRepresentation[]>()
+  const recordRepresentation = (viewIntentId: string, candidate: Candidate) => {
     representedViewIntentIds.add(viewIntentId)
     representationCountByViewIntentId.set(
       viewIntentId,
       (representationCountByViewIntentId.get(viewIntentId) ?? 0) + 1,
     )
+    const matches = representationsByViewIntentId.get(viewIntentId) ?? []
+    matches.push({ tabId: candidate.tabId, pane: candidate.pane })
+    representationsByViewIntentId.set(viewIntentId, matches)
   }
   for (const candidate of candidates) {
     if (candidate.viewIntentId) {
       if (viewIntentIds.includes(candidate.viewIntentId)) {
-        recordRepresentation(candidate.viewIntentId)
+        recordRepresentation(candidate.viewIntentId, candidate)
       }
       // A different nonempty view ID is authoritative; terminal handles do
       // not let one managed view claim another view's local pane.
@@ -1875,19 +1929,155 @@ function locallyRepresentedManagedReopenViews(
       )
     ))
     if (matches.length > 1) {
-      return { representedViewIntentIds, representationCountByViewIntentId, ambiguous: true }
+      return {
+        representedViewIntentIds,
+        representationCountByViewIntentId,
+        representationsByViewIntentId,
+        ambiguous: true,
+      }
     }
-    if (matches.length === 1) recordRepresentation(matches[0]!.view.viewId)
+    if (matches.length === 1) recordRepresentation(matches[0]!.view.viewId, candidate)
   }
 
-  return { representedViewIntentIds, representationCountByViewIntentId, ambiguous: false }
+  return {
+    representedViewIntentIds,
+    representationCountByViewIntentId,
+    representationsByViewIntentId,
+    ambiguous: false,
+  }
 }
 
-function isSingleManagedPaneReopen(layout: PaneNode, viewIntentIds: string[]): boolean {
-  return layout.type === 'leaf'
-    && layout.content.kind === 'terminal'
-    && viewIntentIds.length === 1
-    && layout.content.viewIntentId === viewIntentIds[0]
+interface ManagedReopenLocalRepresentation {
+  tabId: string
+  pane?: PaneNode
+}
+
+function stableReopenContent(content: PaneContent): string {
+  if (content.kind === 'terminal' && content.viewIntentId) {
+    return JSON.stringify({ kind: content.kind, viewIntentId: content.viewIntentId })
+  }
+  const omitted = content.kind === 'browser'
+    ? new Set(['browserInstanceId'])
+    : new Set([
+        'terminalId', 'createRequestId', 'status', 'serverInstanceId', 'streamId', 'sessionId',
+        'restoreError', 'reconcileNotice', 'closeError', 'pendingReconcile', 'reconcileEpoch',
+        'launchFailure', 'handoffError', 'createError',
+      ])
+  const stable = Object.fromEntries(Object.entries(content).filter(([key]) => !omitted.has(key)))
+  return JSON.stringify(stable)
+}
+
+function sameRestoredPaneTopology(expected: PaneNode, actual: PaneNode): boolean {
+  if (expected.type !== actual.type || expected.id !== actual.id) return false
+  if (expected.type === 'leaf' && actual.type === 'leaf') {
+    return expected.content.kind === actual.content.kind
+      && stableReopenContent(expected.content) === stableReopenContent(actual.content)
+  }
+  if (expected.type !== 'split' || actual.type !== 'split') return false
+  return expected.direction === actual.direction
+    && expected.sizes[0] === actual.sizes[0]
+    && expected.sizes[1] === actual.sizes[1]
+    && sameRestoredPaneTopology(expected.children[0], actual.children[0])
+    && sameRestoredPaneTopology(expected.children[1], actual.children[1])
+}
+
+function findAlreadyRestoredManagedReopenTab(
+  state: RootState,
+  preparedLayout: PaneNode,
+): Tab | undefined {
+  return state.tabs.tabs.find((tab) => {
+    const layout = state.panes.layouts[tab.id]
+    return layout !== undefined && sameRestoredPaneTopology(preparedLayout, layout)
+  })
+}
+
+function planRedundantManagedProjectionTabRemoval(
+  state: RootState,
+  viewIntentIds: string[],
+  representationsByViewIntentId: Map<string, ManagedReopenLocalRepresentation[]>,
+  keepTabId: string,
+): string[] {
+  const paneViewByTab = new Map<string, Map<string, string>>()
+  const candidateTabIds = new Set<string>()
+  for (const viewIntentId of viewIntentIds) {
+    for (const representation of representationsByViewIntentId.get(viewIntentId) ?? []) {
+      candidateTabIds.add(representation.tabId)
+      if (!representation.pane) continue
+      const panes = paneViewByTab.get(representation.tabId) ?? new Map<string, string>()
+      panes.set(representation.pane.id, viewIntentId)
+      paneViewByTab.set(representation.tabId, panes)
+    }
+  }
+
+  const redundantTabIds = [...candidateTabIds].filter((tabId) => tabId !== keepTabId)
+  for (const tabId of redundantTabIds) {
+    if (state.panes.closingTabs?.[tabId] || hasAnyClosePending(state.panes, tabId)) {
+      throw new Error(MANAGED_VIEW_CLOSE_FAILED_MESSAGE)
+    }
+    const layout = state.panes.layouts[tabId]
+    if (!layout) continue
+    let safeProjectionLayout = true
+    const visit = (node: PaneNode) => {
+      if (node.type === 'split') {
+        visit(node.children[0])
+        visit(node.children[1])
+        return
+      }
+      if (node.content.kind !== 'terminal' || !paneViewByTab.get(tabId)?.has(node.id)) {
+        safeProjectionLayout = false
+      }
+    }
+    visit(layout)
+    if (!safeProjectionLayout) throw new Error(MANAGED_VIEW_CLOSE_FAILED_MESSAGE)
+  }
+  return redundantTabIds
+}
+
+function planManagedReopenProjectionMerge(
+  state: RootState,
+  viewIntentIds: string[],
+  representationsByViewIntentId: Map<string, ManagedReopenLocalRepresentation[]>,
+  representationCountByViewIntentId: Map<string, number>,
+): { targetTabId: string; redundantTabIds: string[] } {
+  const representationTabs = new Map<string, Map<string, PaneNode | undefined>>()
+  for (const viewIntentId of viewIntentIds) {
+    const count = representationCountByViewIntentId.get(viewIntentId) ?? 0
+    if (count > 1) throw new Error(MANAGED_VIEW_CLOSE_FAILED_MESSAGE)
+    for (const representation of representationsByViewIntentId.get(viewIntentId) ?? []) {
+      const panes = representationTabs.get(representation.tabId) ?? new Map<string, PaneNode | undefined>()
+      panes.set(viewIntentId, representation.pane)
+      representationTabs.set(representation.tabId, panes)
+    }
+  }
+  const tabIds = [...representationTabs.keys()]
+  if (tabIds.length === 0) throw new Error(MANAGED_VIEW_CLOSE_FAILED_MESSAGE)
+
+  for (const tabId of tabIds) {
+    if (state.panes.closingTabs?.[tabId] || hasAnyClosePending(state.panes, tabId)) {
+      throw new Error(MANAGED_VIEW_CLOSE_FAILED_MESSAGE)
+    }
+    const layout = state.panes.layouts[tabId]
+    const paneToView = new Map<string, string>()
+    for (const [viewIntentId, pane] of representationTabs.get(tabId)!) {
+      if (pane) paneToView.set(pane.id, viewIntentId)
+    }
+    if (!layout) continue
+    let safeProjectionLayout = true
+    const visit = (node: PaneNode) => {
+      if (node.type === 'split') {
+        visit(node.children[0])
+        visit(node.children[1])
+        return
+      }
+      if (node.content.kind !== 'terminal' || !paneToView.has(node.id)) {
+        safeProjectionLayout = false
+      }
+    }
+    visit(layout)
+    if (!safeProjectionLayout) throw new Error(MANAGED_VIEW_CLOSE_FAILED_MESSAGE)
+  }
+
+  return { targetTabId: tabIds[0]!, redundantTabIds: tabIds.slice(1) }
 }
 
 /**
@@ -2605,7 +2795,7 @@ export const reopenClosedTab = createAsyncThunk(
         ) {
           throw new Error(MANAGED_VIEW_CLOSE_FAILED_MESSAGE)
         }
-        const prepared = prepareManagedRuntimeReopenLayout(entry.layout, runtimeSnapshot)
+        const prepared = prepareManagedRuntimeReopenLayout(entry.layout, runtimeSnapshot, entry.tab)
         restoredLayout = prepared.layout
         managedViewIntentIds = prepared.viewIntentIds
         if (managedViewIntentIds.length === 0) throw new Error(MANAGED_VIEW_CLOSE_FAILED_MESSAGE)
@@ -2616,17 +2806,83 @@ export const reopenClosedTab = createAsyncThunk(
         )
         if (localRepresentations.ambiguous) throw new Error(MANAGED_VIEW_CLOSE_FAILED_MESSAGE)
         if (localRepresentations.representedViewIntentIds.size > 0) {
-          const viewIntentId = managedViewIntentIds[0]
-          const alreadyRepresentedExactlyOnce = viewIntentId !== undefined
-            && localRepresentations.representationCountByViewIntentId.get(viewIntentId) === 1
-          if (
-            localRepresentations.representedViewIntentIds.size !== managedViewIntentIds.length
-            || !isSingleManagedPaneReopen(restoredLayout, managedViewIntentIds)
-            || !alreadyRepresentedExactlyOnce
-          ) {
+          const currentState = getState() as RootState
+          const alreadyRestoredTab = findAlreadyRestoredManagedReopenTab(currentState, restoredLayout)
+          if (alreadyRestoredTab) {
+            if (currentState.panes.closingTabs?.[alreadyRestoredTab.id] || hasAnyClosePending(currentState.panes, alreadyRestoredTab.id)) {
+              throw new Error(MANAGED_VIEW_CLOSE_FAILED_MESSAGE)
+            }
+            const redundantTabIds = planRedundantManagedProjectionTabRemoval(
+              currentState,
+              managedViewIntentIds,
+              localRepresentations.representationsByViewIntentId,
+              alreadyRestoredTab.id,
+            )
+            applyManagedRuntimeInventory(runtimeSnapshot, dispatch, getState as () => RootState)
+            for (const redundantTabId of redundantTabIds) {
+              dispatch(removeTab(redundantTabId))
+              dispatch(removeLayout({ tabId: redundantTabId }))
+            }
+            for (const { paneId, content } of collectPaneEntries(restoredLayout)) {
+              if (content.kind !== 'terminal' || !content.viewIntentId) continue
+              dispatch(updatePaneContent({
+                tabId: alreadyRestoredTab.id,
+                paneId,
+                content,
+              }))
+            }
+            dispatch(setActiveTab(alreadyRestoredTab.id))
+            for (const identity of collectPaneCloseIdentities(restoredLayout)) {
+              sendPaneOpened({ createRequestId: identity.createRequestId, tabId: alreadyRestoredTab.id })
+            }
+            await persistManagedViewVisibility(
+              managedViewIntentIds,
+              'visible',
+              dispatch,
+              getState as () => RootState,
+              { initialSnapshot: runtimeSnapshot },
+            )
+            dispatch(consumeClosedEntry({ tabId: entry.tab.id, closedAt: entry.closedAt }))
+            return
+          }
+
+          const mergePlan = planManagedReopenProjectionMerge(
+            currentState,
+            managedViewIntentIds,
+            localRepresentations.representationsByViewIntentId,
+            localRepresentations.representationCountByViewIntentId,
+          )
+          applyManagedRuntimeInventory(runtimeSnapshot, dispatch, getState as () => RootState)
+
+          for (const redundantTabId of mergePlan.redundantTabIds) {
+            dispatch(removeTab(redundantTabId))
+            dispatch(removeLayout({ tabId: redundantTabId }))
+          }
+          const { id: _savedTabId, ...savedTabFields } = entry.tab
+          dispatch(updateTab({ id: mergePlan.targetTabId, updates: savedTabFields }))
+          dispatch(restoreLayout({
+            tabId: mergePlan.targetTabId,
+            layout: restoredLayout,
+            paneTitles: entry.paneTitles,
+            paneTitleSetByUser: entry.paneTitleSetByUser,
+            preserveManagedRuntimeHandles: true,
+            replaceExistingLayout: true,
+          }))
+          dispatch(setActiveTab(mergePlan.targetTabId))
+          const mergedLayout = (getState() as RootState).panes.layouts[mergePlan.targetTabId]
+          if (!mergedLayout || !sameRestoredPaneTopology(restoredLayout, mergedLayout)) {
             throw new Error(MANAGED_VIEW_CLOSE_FAILED_MESSAGE)
           }
-          applyManagedRuntimeInventory(runtimeSnapshot, dispatch, getState as () => RootState)
+          for (const identity of collectPaneCloseIdentities(restoredLayout)) {
+            sendPaneOpened({ createRequestId: identity.createRequestId, tabId: mergePlan.targetTabId })
+          }
+          await persistManagedViewVisibility(
+            managedViewIntentIds,
+            'visible',
+            dispatch,
+            getState as () => RootState,
+            { initialSnapshot: runtimeSnapshot },
+          )
           dispatch(consumeClosedEntry({ tabId: entry.tab.id, closedAt: entry.closedAt }))
           return
         }
