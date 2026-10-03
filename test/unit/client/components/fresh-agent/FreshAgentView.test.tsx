@@ -38,6 +38,7 @@ import {
 import { getFreshAgentPaneActions } from '@/lib/pane-action-registry'
 import type { PaneNode } from '@/store/paneTypes'
 import { resetManagedRuntimeRefreshForTest } from '@/lib/recovery/managed-runtime-recovery'
+import { FreshAgentSnapshotSchema } from '@shared/fresh-agent-contract'
 
 const CLAUDE_THREAD_ID = '550e8400-e29b-41d4-a716-446655440000'
 
@@ -6084,6 +6085,87 @@ describe('FreshAgentView', () => {
     expect(wsMock.send).not.toHaveBeenCalledWith(expect.objectContaining({ type: expect.stringMatching(/^freshAgent\.|^pane\.reconcile/) }))
     expect(apiMock.stopManagedRuntimeSoul).not.toHaveBeenCalled()
     expect(apiMock.retryManagedRuntimeSoul).not.toHaveBeenCalled()
+  })
+
+  it.each([
+    ['freshcodex', 'codex', 'blocked'], ['freshcodex', 'codex', 'lost'],
+    ['freshopencode', 'opencode', 'blocked'], ['freshopencode', 'opencode', 'lost'],
+  ] as const)('keeps loaded %s/%s turns when %s history GET returns a cold empty snapshot', async (sessionType, provider, recoveryState) => {
+    const store = createStore()
+    const sessionId = 'loaded-history-thread'
+    // Native cold GETs stamp a vacant owner and idle/empty transcript, even
+    // when the durable conversation still exists. Neither provider resumes.
+    const cold = FreshAgentSnapshotSchema.parse({
+      sessionType, provider, threadId: sessionId,
+      ...(provider === 'opencode' ? { sessionId, latestTurnId: null } : { summary: '' }),
+      revision: 0, status: 'idle',
+      capabilities: { send: true, interrupt: provider === 'opencode', approvals: false, questions: false,
+        fork: true, worktrees: false, diffs: provider === 'opencode', childThreads: false,
+        undo: provider === 'opencode', redo: provider === 'opencode' },
+      tokenUsage: { inputTokens: 0, outputTokens: 0, cachedTokens: 0, totalTokens: 0 },
+      pendingApprovals: [], pendingQuestions: [], worktrees: [], diffs: [], childThreads: [], turns: [],
+      extensions: { [provider]: { ownerKind: 'vacant', ownerEpoch: 1, ownerGeneration: 2 } },
+    })
+    apiMock.getFreshAgentThreadSnapshot.mockResolvedValue({ ...cold,
+      extensions: { [provider]: { statusFromLiveState: true } },
+      turns: [{ id: 'loaded-turn', turnId: 'loaded-turn', source: 'durable', role: 'assistant', summary: '',
+        items: [{ id: 'loaded-text', kind: 'text', text: 'Already loaded durable conversation' }] }],
+    })
+    const content = {
+      kind: 'fresh-agent' as const, sessionType, provider, sessionId,
+      sessionRef: { provider, sessionId }, resumeSessionId: sessionId, createRequestId: 'loaded-history-request',
+      status: 'idle' as const, soulId: 'loaded-history-soul', soulIntentRevision: 12,
+    }
+    store.dispatch(initLayout({ tabId: 'tab-1', paneId: 'pane-1', content }))
+    render(<Provider store={store}><StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" /></Provider>)
+    expect(await screen.findByText('Already loaded durable conversation')).toBeInTheDocument()
+    let resolveCold!: (snapshot: typeof cold) => void
+    apiMock.getFreshAgentThreadSnapshot.mockReturnValue(new Promise((resolve) => { resolveCold = resolve }))
+    wsMock.send.mockClear()
+    act(() => store.dispatch(updatePaneContent({ tabId: 'tab-1', paneId: 'pane-1', content: {
+      ...content, recoverySummary: { desiredState: 'running', recoveryState, reason: 'provider_unavailable',
+        durabilityState: 'resume_captured', allocationState: 'verified_durable' },
+    } })))
+    await waitFor(() => expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledTimes(2))
+    await act(async () => resolveCold(cold))
+    expect(screen.getByText('Already loaded durable conversation')).toBeInTheDocument()
+    expect(screen.getByTestId('managed-runtime-recovery-card')).toBeInTheDocument()
+    expect(wsMock.send).not.toHaveBeenCalledWith(expect.objectContaining({ type: expect.stringMatching(/^freshAgent\.|^pane\.reconcile/) }))
+
+    // A real authoritative empty update still replaces the transcript, even
+    // while intervention is visible; only the cold unavailable read is kept.
+    apiMock.getFreshAgentThreadSnapshot.mockResolvedValue({ ...cold, revision: 1,
+      extensions: { [provider]: { statusFromLiveState: true } },
+    })
+    act(() => store.dispatch(markSessionLost({ sessionType, provider, sessionId })))
+    await waitFor(() => expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledTimes(3))
+    await waitFor(() => expect(screen.queryByText('Already loaded durable conversation')).not.toBeInTheDocument())
+    expect(wsMock.send).not.toHaveBeenCalledWith(expect.objectContaining({ type: expect.stringMatching(/^freshAgent\.|^pane\.reconcile/) }))
+  })
+
+  it('shows a lost Claude history refusal without claiming that runtime restoration is pending', async () => {
+    const store = createStore()
+    const locator = { sessionType: 'freshclaude' as const, provider: 'claude' as const, sessionId: CLAUDE_THREAD_ID }
+    store.dispatch(sessionInit(locator))
+    store.dispatch(markSessionLost(locator))
+    apiMock.getFreshAgentThreadSnapshot.mockRejectedValue(new ApiError(404, 'Saved Claude transcript could not be read', {
+      code: 'FRESH_AGENT_LOST_SESSION',
+    }))
+    const content = {
+      kind: 'fresh-agent' as const, ...locator, sessionRef: { provider: locator.provider, sessionId: locator.sessionId },
+      resumeSessionId: locator.sessionId, createRequestId: 'claude-history-refused', status: 'idle' as const,
+      soulId: 'claude-history-soul', soulIntentRevision: 12,
+      recoverySummary: { desiredState: 'stopped' as const, recoveryState: 'lost' as const, reason: 'provider_unavailable',
+        durabilityState: 'resume_captured' as const, allocationState: 'verified_durable' as const },
+    }
+    store.dispatch(initLayout({ tabId: 'tab-1', paneId: 'pane-1', content }))
+    render(<Provider store={store}><StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" /></Provider>)
+    expect(await screen.findByText(/Saved Claude transcript could not be read/)).toBeInTheDocument()
+    expect(screen.queryByText('Restoring session...')).not.toBeInTheDocument()
+    expect(screen.getByTestId('managed-runtime-recovery-card')).toBeInTheDocument()
+    const layout = store.getState().panes.layouts['tab-1']
+    expect(layout?.type === 'leaf' && layout.content).toEqual(content)
+    expect(wsMock.send).not.toHaveBeenCalledWith(expect.objectContaining({ type: expect.stringMatching(/^freshAgent\.|^pane\.reconcile/) }))
   })
 
   it.each(['blocked', 'lost'] as const)('keeps %s history snapshot refusal read-only', async (recoveryState) => {
