@@ -460,15 +460,21 @@ export async function retryManagedRuntimeSoul(
   })
 }
 
+const ManagedRuntimeStopResultSchema = z.object({
+  outcome: z.enum(['verified_empty', 'blocked_ownership', 'backend_unavailable', 'termination_unconfirmed']),
+})
+
+export type ManagedRuntimeStopResult = z.infer<typeof ManagedRuntimeStopResultSchema>
+
 export async function stopManagedRuntimeSoul(
   soulId: string,
   expectedIntentRevision: number,
   requestId = createManagedRuntimeRequestId(),
-): Promise<unknown> {
-  return api.post(`/api/runtime/souls/${encodeURIComponent(soulId)}/stop`, {
+): Promise<ManagedRuntimeStopResult> {
+  return ManagedRuntimeStopResultSchema.parse(await api.post(`/api/runtime/souls/${encodeURIComponent(soulId)}/stop`, {
     requestId,
     expectedIntentRevision,
-  })
+  }))
 }
 
 export async function updateManagedRuntimeLimits(

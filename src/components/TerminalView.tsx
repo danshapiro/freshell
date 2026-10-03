@@ -33,6 +33,7 @@ import {
   updatePaneTitle,
 } from '@/store/panesSlice'
 import { retryManagedRuntimeSoul } from '@/lib/api'
+import { confirmManagedRuntimeStopped } from '@/lib/managed-runtime-stop'
 import { queueManagedRuntimeRefresh } from '@/lib/recovery/managed-runtime-recovery'
 import { isManagedRuntimeRecoveryDecision, ManagedRuntimeRecoveryCard } from '@/components/ManagedRuntimeRecoveryCard'
 import { buildReconcileRequestForPanes, foldVerdicts } from '@/lib/pane-reconcile'
@@ -7307,7 +7308,14 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
   // fresh create spawns identity-less). The explicit start-new transition
   // mints a new create key and clears the managed projection before the
   // lifecycle effect drives the genuinely new create.
-  const startFreshConversation = () => {
+  const startFreshConversation = async () => {
+    const current = contentRef.current
+    if (!current) return
+    if (current.soulId || isManagedRuntimeRecoveryDecision(current.recoverySummary)) {
+      await confirmManagedRuntimeStopped(current)
+      if (contentRef.current?.soulId !== current.soulId
+        || contentRef.current?.createRequestId !== current.createRequestId) return
+    }
     dispatch(startNewManagedRuntimeConversation({ tabId, paneId }))
   }
 

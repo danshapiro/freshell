@@ -1452,6 +1452,7 @@ dependencies = [
  "freshell-runtime-observability",
  "freshell-runtime-protocol",
  "freshell-sessions",
+ "freshell-supervisor",
  "freshell-terminal",
  "freshell-ws",
  "futures-util",

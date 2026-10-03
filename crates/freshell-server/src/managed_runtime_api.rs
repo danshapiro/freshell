@@ -1039,6 +1039,10 @@ fn atomic_write_json(path: &Path, document: &ProjectionDocument) -> Result<(), S
 }
 
 #[cfg(test)]
+#[path = "managed_runtime_api_stop_tests.rs"]
+mod stop_contract_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use freshell_runtime_protocol::{

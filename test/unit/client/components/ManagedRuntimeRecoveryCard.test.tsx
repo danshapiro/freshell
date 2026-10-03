@@ -75,4 +75,19 @@ describe('ManagedRuntimeRecoveryCard', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Start new conversation' }))
     expect(onStartFresh).toHaveBeenCalledTimes(1)
   })
+
+  it('waits for start-new cleanup and reports failures in the lost card', async () => {
+    let reject!: (error: Error) => void
+    const onStartFresh = vi.fn(() => new Promise<void>((_resolve, rejectPromise) => { reject = rejectPromise }))
+    render(<ManagedRuntimeRecoveryCard recoverySummary={summary('lost')} onRetry={vi.fn()} onStartFresh={onStartFresh} />)
+
+    fireEvent.click(screen.getByRole('button', { name: 'Start new conversation' }))
+    expect(screen.getByRole('button', { name: 'Starting…' })).toBeDisabled()
+    fireEvent.click(screen.getByRole('button', { name: 'Starting…' }))
+    expect(onStartFresh).toHaveBeenCalledTimes(1)
+
+    reject(new Error('Cleanup could not be confirmed. Your conversation has been kept. Try again.'))
+    expect(await screen.findByRole('status')).toHaveTextContent('Your conversation has been kept')
+    expect(screen.getByRole('button', { name: 'Start new conversation' })).toBeEnabled()
+  })
 })

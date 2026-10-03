@@ -138,6 +138,9 @@ regex = "1"
 # lock's own unix-only implementation.
 libc = "0.2"
 
+[target.'cfg(unix)'.dev-dependencies]
+freshell-supervisor = { path = "../freshell-supervisor" }
+
 [dev-dependencies]
 # `ServiceExt::oneshot` for in-process axum router handler tests (`sessions.rs`).
 tower = { version = "0.5", features = ["util"] }

@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
-import { act, render, cleanup, screen } from '@testing-library/react'
+import { act, render, cleanup, screen, fireEvent, waitFor, within } from '@testing-library/react'
 import { configureStore } from '@reduxjs/toolkit'
 import { Provider } from 'react-redux'
 import tabsReducer from '@/store/tabsSlice'
@@ -42,6 +42,12 @@ const terminalThemeMocks = vi.hoisted(() => ({
 
 const runtimeMocks = vi.hoisted(() => ({
   instances: [] as Array<{ fit: ReturnType<typeof vi.fn> }>,
+}))
+
+const stopManagedRuntimeSoul = vi.hoisted(() => vi.fn())
+vi.mock('@/lib/api', async (importOriginal) => ({
+  ...await importOriginal<typeof import('@/lib/api')>(),
+  stopManagedRuntimeSoul,
 }))
 
 vi.mock('@/lib/ws-client', () => ({
@@ -481,6 +487,73 @@ describe('launch-time INVALID_TERMINAL_ID bounded retry', () => {
     const total = sentCreates().length
     await act(async () => { vi.advanceTimersByTime(60_000) })
     expect(sentCreates().length).toBe(total)
+  })
+
+  it.each(['verified_empty', 'termination_unconfirmed', 'blocked_ownership', 'backend_unavailable', 'http_failure', 'missing_revision', 'missing_soul'])(
+    'waits for exact-soul cleanup before replacing a lost terminal: %s', async (outcome) => {
+      stopManagedRuntimeSoul.mockReset()
+      let resolveStop!: (value: { outcome: string }) => void
+      let rejectStop!: (error: Error) => void
+      stopManagedRuntimeSoul.mockReturnValueOnce(new Promise((resolve, reject) => { resolveStop = resolve; rejectStop = reject }))
+      const { store, paneContent } = makeStore()
+      const content: TerminalPaneContent = {
+        ...paneContent, status: 'error', mode: 'codex', terminalId: 'lost-terminal',
+        sessionRef: { provider: 'codex', sessionId: 'retained-thread' }, resumeSessionId: 'retained-thread',
+        soulId: outcome === 'missing_soul' ? undefined : 'persisted-lost-terminal-soul',
+        soulIntentRevision: outcome === 'missing_revision' ? undefined : 21,
+        recoverySummary: { desiredState: 'stopped', recoveryState: 'lost',
+          durabilityState: 'resume_captured', allocationState: 'verified_durable' },
+      }
+      store.dispatch(updatePaneContent({ tabId: TAB, paneId: PANE, content }))
+      render(<Provider store={store}><TerminalView tabId={TAB} paneId={PANE} paneContent={content} /></Provider>)
+      const retained = (store.getState().panes.layouts[TAB] as { content: TerminalPaneContent }).content
+      wsMocks.send.mockClear()
+      fireEvent.click(screen.getByRole('button', { name: 'Start new conversation' }))
+      if (outcome.startsWith('missing_')) {
+        expect(await within(screen.getByTestId('managed-runtime-recovery-card')).findByRole('status')).toHaveTextContent('Your conversation has been kept')
+        expect(stopManagedRuntimeSoul).not.toHaveBeenCalled()
+        expect((store.getState().panes.layouts[TAB] as { content: TerminalPaneContent }).content).toMatchObject(retained)
+        expect(sentCreates()).toHaveLength(0)
+        return
+      }
+      await waitFor(() => expect(stopManagedRuntimeSoul).toHaveBeenCalledWith(content.soulId, 21))
+      expect((store.getState().panes.layouts[TAB] as { content: TerminalPaneContent }).content).toMatchObject(content)
+      expect(sentCreates()).toHaveLength(0)
+      expect(screen.getByRole('button', { name: 'Starting…' })).toBeDisabled()
+
+      await act(async () => {
+        if (outcome === 'http_failure') rejectStop(new Error('Server is unavailable'))
+        else resolveStop({ outcome })
+      })
+      const after = (store.getState().panes.layouts[TAB] as { content: TerminalPaneContent }).content
+      if (outcome === 'verified_empty') {
+        expect(after.createRequestId).not.toBe(content.createRequestId)
+        expect(after.soulId).toBeUndefined()
+        expect(after.sessionRef).toBeUndefined()
+      } else {
+        expect(after).toMatchObject(content)
+        expect(await within(screen.getByTestId('managed-runtime-recovery-card')).findByRole('status')).toHaveTextContent(outcome === 'http_failure' ? 'Server is unavailable' : 'Your conversation has been kept')
+        expect(sentCreates()).toHaveLength(0)
+      }
+    },
+  )
+
+  it('does not reset a different terminal pane when an earlier stop completes', async () => {
+    stopManagedRuntimeSoul.mockReset()
+    let resolveStop!: (value: { outcome: string }) => void
+    stopManagedRuntimeSoul.mockReturnValueOnce(new Promise((resolve) => { resolveStop = resolve }))
+    const { store, paneContent } = makeStore()
+    const content: TerminalPaneContent = { ...paneContent, status: 'error', soulId: 'old-soul', soulIntentRevision: 21,
+      recoverySummary: { desiredState: 'stopped', recoveryState: 'lost', durabilityState: 'resume_captured', allocationState: 'verified_durable' } }
+    store.dispatch(updatePaneContent({ tabId: TAB, paneId: PANE, content }))
+    const rendered = render(<Provider store={store}><TerminalView tabId={TAB} paneId={PANE} paneContent={content} /></Provider>)
+    fireEvent.click(screen.getByRole('button', { name: 'Start new conversation' }))
+    await waitFor(() => expect(stopManagedRuntimeSoul).toHaveBeenCalledWith('old-soul', 21))
+    const replacement = { ...content, createRequestId: 'different-create', soulId: 'different-soul' }
+    act(() => store.dispatch(updatePaneContent({ tabId: TAB, paneId: PANE, content: replacement })))
+    rendered.rerender(<Provider store={store}><TerminalView tabId={TAB} paneId={PANE} paneContent={replacement} /></Provider>)
+    await act(async () => resolveStop({ outcome: 'verified_empty' }))
+    expect((store.getState().panes.layouts[TAB] as { content: TerminalPaneContent }).content).toMatchObject(replacement)
   })
 
   it('keeps a blocked managed pane from re-creating after a rejected-terminal callback', async () => {
