@@ -6138,6 +6138,169 @@ describe('FreshAgentView', () => {
     expect(sentFreshAgentMessages('freshAgent.attach')).toHaveLength(0)
   })
 
+  it.each([
+    ['freshcodex', 'codex', savedCodexNativeHistory, 0],
+    ['freshopencode', 'opencode', savedOpenCodeNativeHistory, 1000],
+  ] as const)('uses distinct live and native revision bases across %s/%s recovery', async (sessionType, provider, captured, nativeRevision) => {
+    const store = createStore()
+    const native = FreshAgentSnapshotSchema.parse(captured)
+    native.revision = nativeRevision
+    const live = { ...native, revision: 100, extensions: { [provider]: { statusFromLiveState: true } },
+      turns: [{ id: 'live-turn', turnId: 'live-turn', role: 'assistant' as const, source: 'durable' as const,
+        summary: '', items: [{ id: 'live-text', kind: 'text' as const, text: 'Previously loaded live answer' }] }] }
+    apiMock.getFreshAgentThreadSnapshot.mockResolvedValue(live)
+    const content = { kind: 'fresh-agent' as const, sessionType, provider, sessionId: native.threadId,
+      createRequestId: 'revision-source-request', status: 'idle' as const, soulId: 'revision-source-soul', soulIntentRevision: 5 }
+    store.dispatch(initLayout({ tabId: 'tab-1', paneId: 'pane-1', content }))
+    render(<Provider store={store}><StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" /></Provider>)
+    expect(await screen.findByText('Previously loaded live answer')).toBeInTheDocument()
+    const loaded = getFreshAgentPaneContent(store)
+    apiMock.getFreshAgentThreadSnapshot.mockResolvedValue(native)
+    wsMock.send.mockClear()
+    act(() => store.dispatch(updatePaneContent({ tabId: 'tab-1', paneId: 'pane-1', content: { ...loaded,
+      recoverySummary: { desiredState: 'running', recoveryState: 'blocked', durabilityState: 'resume_captured', allocationState: 'verified_durable' } } })))
+    expect(await screen.findByText(`Saved native ${provider === 'codex' ? 'Codex' : 'OpenCode'} answer`)).toBeInTheDocument()
+    expect(screen.queryByText('Previously loaded live answer')).not.toBeInTheDocument()
+    expect(getFreshAgentPaneContent(store).sessionId).toBe(native.threadId)
+    expect(wsMock.send).not.toHaveBeenCalledWith(expect.objectContaining({ type: expect.stringMatching(/^freshAgent\.|^pane\.reconcile/) }))
+    // A resumed live read uses its own revision basis, even when below native history's.
+    apiMock.getFreshAgentThreadSnapshot.mockResolvedValue({ ...live, revision: 101,
+      turns: [{ ...live.turns[0], items: [{ id: 'resumed-text', kind: 'text', text: 'Resumed live answer' }] }] })
+    act(() => store.dispatch(updatePaneContent({ tabId: 'tab-1', paneId: 'pane-1', content: { ...loaded,
+      recoverySummary: { desiredState: 'running', recoveryState: 'healthy', durabilityState: 'resume_captured', allocationState: 'verified_durable' } } })))
+    expect(await screen.findByText('Resumed live answer')).toBeInTheDocument()
+  })
+
+  it.each([
+    ['success', 5, 'race-soul'], ['failure', 5, 'race-soul'],
+    ['success', 6, 'race-soul'], ['failure', 6, 'race-soul'],
+    ['success', 5, 'replaced-race-soul'], ['failure', 5, 'replaced-race-soul'],
+  ] as const)('ignores an ordinary snapshot %s after intervention history at revision %s for %s', async (outcome, currentRevision, currentSoulId) => {
+    const store = createStore()
+    let resolveLive!: (value: unknown) => void
+    let rejectLive!: (error: Error) => void
+    apiMock.getFreshAgentThreadSnapshot.mockReturnValueOnce(new Promise((resolve, reject) => { resolveLive = resolve; rejectLive = reject }))
+    const native = FreshAgentSnapshotSchema.parse(savedCodexNativeHistory)
+    const content = { kind: 'fresh-agent' as const, sessionType: 'freshcodex' as const, provider: 'codex' as const,
+      sessionId: native.threadId, createRequestId: 'live-to-native-race', status: 'idle' as const,
+      soulId: 'race-soul', soulIntentRevision: 5 }
+    store.dispatch(initLayout({ tabId: 'tab-1', paneId: 'pane-1', content }))
+    render(<Provider store={store}><StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" /></Provider>)
+    await waitFor(() => expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledTimes(1))
+    apiMock.getFreshAgentThreadSnapshot.mockResolvedValue(native)
+    const blocked = { ...content, soulId: currentSoulId, soulIntentRevision: currentRevision,
+      recoverySummary: { desiredState: 'running' as const, recoveryState: 'blocked' as const,
+        durabilityState: 'resume_captured' as const, allocationState: 'verified_durable' as const } }
+    act(() => store.dispatch(updatePaneContent({ tabId: 'tab-1', paneId: 'pane-1', content: blocked })))
+    expect(await screen.findByText('Saved native Codex answer')).toBeInTheDocument()
+    const identity = getFreshAgentPaneContent(store)
+    wsMock.send.mockClear()
+    await act(async () => {
+      if (outcome === 'failure') rejectLive(new ApiError(404, 'Old ordinary snapshot failed', { code: 'FRESH_AGENT_LOST_SESSION' }))
+      else resolveLive({ ...native, revision: 999, extensions: { codex: { statusFromLiveState: true } },
+        turns: [{ id: 'old-live', turnId: 'old-live', role: 'assistant', summary: '', items: [{ id: 'old-live-text', kind: 'text', text: 'Old ordinary snapshot answer' }] }] })
+    })
+    expect(screen.getByText('Saved native Codex answer')).toBeInTheDocument()
+    expect(screen.queryByText('Old ordinary snapshot answer')).not.toBeInTheDocument()
+    expect(screen.queryByText(/Old ordinary snapshot failed/)).not.toBeInTheDocument()
+    expect(getFreshAgentPaneContent(store)).toEqual(identity)
+    expect(wsMock.send).not.toHaveBeenCalledWith(expect.objectContaining({ type: expect.stringMatching(/^freshAgent\.|^pane\.reconcile/) }))
+  })
+
+  it.each(['success', 'failure'] as const)('keeps an ordinary snapshot %s fenced after Retry while both current reads are pending', async (outcome) => {
+    const store = createStore()
+    let resolveOld!: (value: unknown) => void
+    let rejectOld!: (error: Error) => void
+    let resolveNative!: (value: unknown) => void
+    apiMock.getFreshAgentThreadSnapshot.mockReturnValueOnce(new Promise((resolve, reject) => { resolveOld = resolve; rejectOld = reject }))
+    const native = FreshAgentSnapshotSchema.parse(savedCodexNativeHistory)
+    const content = { kind: 'fresh-agent' as const, sessionType: 'freshcodex' as const, provider: 'codex' as const,
+      sessionId: native.threadId, createRequestId: 'retry-with-old-live-read', status: 'idle' as const,
+      soulId: 'retry-read-soul', soulIntentRevision: 5 }
+    store.dispatch(initLayout({ tabId: 'tab-1', paneId: 'pane-1', content }))
+    render(<Provider store={store}><StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" /></Provider>)
+    await waitFor(() => expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledTimes(1))
+    apiMock.getFreshAgentThreadSnapshot.mockReturnValueOnce(new Promise((resolve) => { resolveNative = resolve }))
+    const blocked = { ...content, recoverySummary: { desiredState: 'running' as const, recoveryState: 'blocked' as const,
+      durabilityState: 'resume_captured' as const, allocationState: 'verified_durable' as const } }
+    act(() => store.dispatch(updatePaneContent({ tabId: 'tab-1', paneId: 'pane-1', content: blocked })))
+    await waitFor(() => expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledTimes(2))
+    apiMock.getFreshAgentThreadSnapshot.mockReturnValue(new Promise(() => {}))
+    apiMock.retryManagedRuntimeSoul.mockImplementation(async () => {
+      store.dispatch(updatePaneContent({ tabId: 'tab-1', paneId: 'pane-1', content: { ...blocked,
+        recoverySummary: { ...blocked.recoverySummary, recoveryState: 'recovering' } } }))
+    })
+    fireEvent.click(screen.getByRole('button', { name: 'Retry recovery' }))
+    await waitFor(() => expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledTimes(3))
+    const current = getFreshAgentPaneContent(store)
+    wsMock.send.mockClear()
+    await act(async () => {
+      if (outcome === 'failure') rejectOld(new ApiError(404, 'Before-Retry ordinary read failed', { code: 'FRESH_AGENT_LOST_SESSION' }))
+      else resolveOld({ ...native, revision: 999, extensions: { codex: { statusFromLiveState: true } },
+        turns: [{ id: 'pre-retry', turnId: 'pre-retry', role: 'assistant', summary: '', items: [{ id: 'pre-retry-text', kind: 'text', text: 'Before-Retry ordinary answer' }] }] })
+    })
+    expect(screen.queryByText('Before-Retry ordinary answer')).not.toBeInTheDocument()
+    expect(screen.queryByText(/Before-Retry ordinary read failed/)).not.toBeInTheDocument()
+    expect(getFreshAgentPaneContent(store)).toEqual(current)
+    expect(wsMock.send).not.toHaveBeenCalledWith(expect.objectContaining({ type: expect.stringMatching(/^freshAgent\.|^pane\.reconcile/) }))
+    // The initial saved-history read is still useful and has no live actor authority.
+    await act(async () => resolveNative(native))
+    expect(await screen.findByText('Saved native Codex answer')).toBeInTheDocument()
+    expect(getFreshAgentPaneContent(store)).toEqual(current)
+  })
+
+  it('keeps saved native history through a vacant resumed read and accepts an authoritative live empty update', async () => {
+    const store = createStore()
+    const native = FreshAgentSnapshotSchema.parse(savedOpenCodeNativeHistory)
+    native.revision = 1000
+    apiMock.getFreshAgentThreadSnapshot.mockResolvedValue(native)
+    const content = { kind: 'fresh-agent' as const, sessionType: 'freshopencode' as const, provider: 'opencode' as const,
+      sessionId: native.threadId, sessionRef: { provider: 'opencode' as const, sessionId: native.threadId }, resumeSessionId: native.threadId,
+      createRequestId: 'native-to-vacant-read', status: 'idle' as const, soulId: 'native-vacant-soul', soulIntentRevision: 5,
+      recoverySummary: { desiredState: 'running' as const, recoveryState: 'blocked' as const,
+        durabilityState: 'resume_captured' as const, allocationState: 'verified_durable' as const } }
+    store.dispatch(initLayout({ tabId: 'tab-1', paneId: 'pane-1', content }))
+    render(<Provider store={store}><StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" /></Provider>)
+    expect(await screen.findByText('Saved native OpenCode answer')).toBeInTheDocument()
+    const empty = { ...native, revision: 0, latestTurnId: null, turns: [],
+      extensions: { opencode: { ownerKind: 'vacant', ownerEpoch: 1, ownerGeneration: 2 } } }
+    apiMock.getFreshAgentThreadSnapshot.mockResolvedValue(empty)
+    const recovering = { ...content, recoverySummary: { ...content.recoverySummary, recoveryState: 'recovering' as const } }
+    act(() => store.dispatch(updatePaneContent({ tabId: 'tab-1', paneId: 'pane-1', content: recovering })))
+    await waitFor(() => expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledTimes(2))
+    await act(async () => {})
+    expect(screen.getByText('Saved native OpenCode answer')).toBeInTheDocument()
+    apiMock.getFreshAgentThreadSnapshot.mockResolvedValue({ ...empty,
+      extensions: { opencode: { statusFromLiveState: true } } })
+    act(() => store.dispatch(updatePaneContent({ tabId: 'tab-1', paneId: 'pane-1', content: { ...recovering, soulIntentRevision: 6 } })))
+    await waitFor(() => expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledTimes(3))
+    await waitFor(() => expect(screen.queryByText('Saved native OpenCode answer')).not.toBeInTheDocument())
+    expect(getFreshAgentPaneContent(store).sessionId).toBe(native.threadId)
+  })
+
+  it('ignores initial native history after a newer resumed live snapshot has rendered', async () => {
+    const store = createStore()
+    let resolveNative!: (value: unknown) => void
+    apiMock.getFreshAgentThreadSnapshot.mockReturnValueOnce(new Promise((resolve) => { resolveNative = resolve }))
+    const native = FreshAgentSnapshotSchema.parse(savedCodexNativeHistory)
+    const content = { kind: 'fresh-agent' as const, sessionType: 'freshcodex' as const, provider: 'codex' as const,
+      sessionId: native.threadId, createRequestId: 'native-to-live-race', status: 'idle' as const,
+      soulId: 'native-to-live-soul', soulIntentRevision: 5,
+      recoverySummary: { desiredState: 'running' as const, recoveryState: 'blocked' as const,
+        durabilityState: 'resume_captured' as const, allocationState: 'verified_durable' as const } }
+    store.dispatch(initLayout({ tabId: 'tab-1', paneId: 'pane-1', content }))
+    render(<Provider store={store}><StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" /></Provider>)
+    await waitFor(() => expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledTimes(1))
+    apiMock.getFreshAgentThreadSnapshot.mockResolvedValue({ ...native, revision: 101, extensions: { codex: { statusFromLiveState: true } },
+      turns: [{ id: 'new-live', turnId: 'new-live', role: 'assistant', summary: '', items: [{ id: 'new-live-text', kind: 'text', text: 'New resumed live answer' }] }] })
+    act(() => store.dispatch(updatePaneContent({ tabId: 'tab-1', paneId: 'pane-1', content: { ...content,
+      recoverySummary: { ...content.recoverySummary, recoveryState: 'healthy' } } })))
+    expect(await screen.findByText('New resumed live answer')).toBeInTheDocument()
+    await act(async () => resolveNative(native))
+    expect(screen.getByText('New resumed live answer')).toBeInTheDocument()
+    expect(screen.queryByText('Saved native Codex answer')).not.toBeInTheDocument()
+  })
+
   it('keeps an initial history read read-only when Retry recovery clears intervention', async () => {
     const store = createStore()
     let resolveHistory!: (result: unknown) => void
