@@ -1,6 +1,5 @@
 use serde_json::{json, Value};
 use std::{
-    collections::HashMap,
     io::{BufRead, Read},
     path::Path,
 };
@@ -18,8 +17,7 @@ pub(super) fn read_rollout(path: &Path, id: &str) -> Result<Value, String> {
         return Err("native transcript exceeds history read limit".into());
     }
     let mut turns = Vec::new();
-    let mut turn = json!({"id":"native-history-0","items":[]});
-    let mut message_mirrors = HashMap::new();
+    let mut turn = NativeTurn::new(0);
     for (line, row) in std::io::BufReader::new(file)
         .take(crate::native_history::MAX_HISTORY_BYTES + 1)
         .lines()
@@ -34,12 +32,7 @@ pub(super) fn read_rollout(path: &Path, id: &str) -> Result<Value, String> {
         match row["type"].as_str() {
             Some("turn_context") => {
                 if let Some(next) = payload["turn_id"].as_str() {
-                    if turn["id"] != next {
-                        if !turn["items"].as_array().unwrap().is_empty() {
-                            turns.push(turn);
-                        }
-                        turn = json!({"id":next,"items":[]});
-                    }
+                    activate_turn(&mut turns, &mut turn, Some(next), false);
                 }
             }
             Some("response_item") => {
@@ -49,7 +42,7 @@ pub(super) fn read_rollout(path: &Path, id: &str) -> Result<Value, String> {
                     "function_call_output" | "custom_tool_call_output" | "tool_search_output"
                 ) {
                     let call_id = payload["call_id"].as_str();
-                    let items = turn["items"].as_array_mut().unwrap();
+                    let items = turn.value["items"].as_array_mut().unwrap();
                     if let Some(call) = items
                         .iter_mut()
                         .rev()
@@ -74,7 +67,7 @@ pub(super) fn read_rollout(path: &Path, id: &str) -> Result<Value, String> {
                         let item = json!({"id":call_id.map(str::to_owned).unwrap_or_else(|| format!("native-line-{line}")),"type":"dynamicToolCall",
                             "tool":payload["name"].as_str().unwrap_or("tool output"),"status":"completed",
                             "contentItems":output_content(if item_type == "tool_search_output" { &payload["tools"] } else { &payload["output"] })});
-                        upsert_item(&mut turn, item);
+                        upsert_item(&mut turn.value, item);
                     }
                     continue;
                 }
@@ -85,48 +78,68 @@ pub(super) fn read_rollout(path: &Path, id: &str) -> Result<Value, String> {
                         .or_else(|| payload.get("id").filter(|id| id.is_string()))
                         .cloned()
                         .unwrap_or_else(|| json!(format!("native-line-{line}")));
-                    upsert_transcript_item(
-                        &mut turn,
-                        item,
-                        MessageSource::Response,
-                        &mut message_mirrors,
-                    );
+                    if item["type"] == "userMessage" && turn.finished {
+                        activate_turn(&mut turns, &mut turn, None, false);
+                    }
+                    upsert_transcript_item(&mut turn, item, MessageSource::Response);
                 }
             }
             Some("event_msg") => {
+                if payload["type"] == "task_started" {
+                    activate_turn(&mut turns, &mut turn, payload["turn_id"].as_str(), true);
+                    continue;
+                }
                 let item = if payload["type"] == "item_completed" {
                     normalize_completed(&payload["item"])
                 } else {
                     normalize_message_event(payload, line)
                         .or_else(|| normalize_legacy_event(payload))
                 };
+                let finished = matches!(
+                    payload["type"].as_str(),
+                    Some("task_complete" | "turn_aborted")
+                );
+                if item.is_none() && !finished {
+                    continue;
+                }
+                // A delayed completion still belongs to its recorded turn.
+                let previous = payload["turn_id"]
+                    .as_str()
+                    .and_then(|id| turns.iter().position(|turn| turn.has_id(id)));
+                let target = if let Some(previous) = previous {
+                    &mut turns[previous]
+                } else {
+                    if let Some(id) = payload["turn_id"].as_str() {
+                        activate_turn(&mut turns, &mut turn, Some(id), false);
+                    } else if item
+                        .as_ref()
+                        .is_some_and(|item| item["type"] == "userMessage")
+                        && turn.finished
+                    {
+                        activate_turn(&mut turns, &mut turn, None, false);
+                    }
+                    &mut turn
+                };
                 if let Some(item) = item {
-                    // Completed actions enrich their earlier response item by call identity.
-                    // A delayed completion still belongs to its recorded turn.
-                    let target = payload["turn_id"]
-                        .as_str()
-                        .and_then(|id| turns.iter_mut().find(|turn: &&mut Value| turn["id"] == id));
                     upsert_transcript_item(
-                        target.unwrap_or(&mut turn),
+                        target,
                         item,
                         if payload["type"] == "task_complete" {
                             MessageSource::Completion
                         } else {
                             MessageSource::Event
                         },
-                        &mut message_mirrors,
                     );
-                } else if payload["type"] == "task_started" {
-                    // A new task can follow an aborted task without an assistant reply.
-                    message_mirrors.remove(turn["id"].as_str().unwrap());
                 }
+                target.finished |= finished;
             }
             _ => {}
         }
     }
-    if !turn["items"].as_array().unwrap().is_empty() {
+    if turn.has_items() {
         turns.push(turn);
     }
+    let turns: Vec<_> = turns.into_iter().map(|turn| turn.value).collect();
     super::build_codex_snapshot_json(
         id,
         &json!({"thread":{"id":id,"status":"idle","turns":turns}}),
@@ -135,6 +148,64 @@ pub(super) fn read_rollout(path: &Path, id: &str) -> Result<Value, String> {
         None,
         false,
     )
+}
+
+struct NativeTurn {
+    value: Value,
+    mirror: Option<MessageMirror>,
+    named: bool,
+    started: bool,
+    finished: bool,
+}
+
+impl NativeTurn {
+    fn new(index: usize) -> Self {
+        Self {
+            value: json!({"id":format!("native-history-{index}"),"items":[]}),
+            mirror: None,
+            named: false,
+            started: false,
+            finished: false,
+        }
+    }
+
+    fn has_id(&self, id: &str) -> bool {
+        self.value["id"] == id
+    }
+
+    fn has_items(&self) -> bool {
+        !self.value["items"].as_array().unwrap().is_empty()
+    }
+}
+
+fn activate_turn(
+    turns: &mut Vec<NativeTurn>,
+    turn: &mut NativeTurn,
+    id: Option<&str>,
+    starts_task: bool,
+) {
+    if id.is_some_and(|id| turn.has_id(id)) {
+        turn.named = true;
+        turn.started |= starts_task;
+        return;
+    }
+    // A pre-context message belongs to the still-unnamed task. Bind its identity
+    // without losing its mirror; completed or newly started tasks never share it.
+    let can_bind = !(turn.named || turn.finished || starts_task && turn.started);
+    let can_start_current = id.is_none() && !turn.started && !turn.finished;
+    if !can_bind && !can_start_current {
+        let has_items = turn.has_items();
+        let previous =
+            std::mem::replace(turn, NativeTurn::new(turns.len() + usize::from(has_items)));
+        if has_items {
+            turns.push(previous);
+        }
+    }
+    if let Some(id) = id {
+        turn.value["id"] = json!(id);
+        turn.named = true;
+    }
+    turn.started |= starts_task;
 }
 
 struct MessageMirror {
@@ -174,18 +245,12 @@ fn message_text(item: &Value) -> Option<String> {
     }
 }
 
-fn upsert_transcript_item(
-    turn: &mut Value,
-    item: Value,
-    source: MessageSource,
-    mirrors: &mut HashMap<String, MessageMirror>,
-) {
+fn upsert_transcript_item(turn: &mut NativeTurn, item: Value, source: MessageSource) {
     let Some(text) = message_text(&item) else {
-        upsert_item(turn, item);
+        upsert_item(&mut turn.value, item);
         return;
     };
-    let turn_id = turn["id"].as_str().unwrap().to_owned();
-    if let Some(previous) = mirrors.get_mut(&turn_id) {
+    if let Some(previous) = turn.mirror.as_mut() {
         if !previous.sources.contains(&source)
             && previous.item["type"] == item["type"]
             && message_text(&previous.item).as_deref() == Some(text.as_str())
@@ -195,7 +260,7 @@ fn upsert_transcript_item(
             // messages from the same source start a new occurrence.
             previous.sources.push(source);
             if source == MessageSource::Response {
-                if let Some(existing) = turn["items"]
+                if let Some(existing) = turn.value["items"]
                     .as_array_mut()
                     .unwrap()
                     .iter_mut()
@@ -208,14 +273,11 @@ fn upsert_transcript_item(
             return;
         }
     }
-    mirrors.insert(
-        turn_id,
-        MessageMirror {
-            item: item.clone(),
-            sources: vec![source],
-        },
-    );
-    upsert_item(turn, item);
+    turn.mirror = Some(MessageMirror {
+        item: item.clone(),
+        sources: vec![source],
+    });
+    upsert_item(&mut turn.value, item);
 }
 
 fn normalize_item(item: &Value) -> Option<Value> {
