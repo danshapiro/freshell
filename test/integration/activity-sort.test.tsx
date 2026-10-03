@@ -83,6 +83,7 @@ describe('Activity sort integration', () => {
       content: {
         kind: 'terminal',
         mode: 'claude',
+        status: 'running',
         resumeSessionId: claudeSessionId,
         sessionRef: { provider: 'claude', sessionId: claudeSessionId },
       },
