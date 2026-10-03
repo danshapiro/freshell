@@ -26,9 +26,9 @@ Identify the root cause of KataTracker item `rrx7` and repair the Codex multi-fi
 - Codex's provider-indexed history for this exact session was not inspected. Keep resume by canonical ID and do not claim this repair verifies provider-side history reconstruction.
 - Lifetime collision-signature suppression may suppress the same signature if it clears and recurs before process restart. Distinct source-file sets remain separately diagnosable.
 
-**Goal:** The reported Codex session, continued across sequential rollout files with one session ID, appears once in sidebar and history, exposes all source files to bounded transcript search, carries the earliest creation and latest activity times, and produces no integrity alert. A copied or otherwise ambiguous same-ID group remains quarantined, while unchanged collisions do not produce per-request ERROR logs.
+**Goal:** The reported Codex session, continued across sequential rollout files with one session ID, appears once in sidebar and history, exposes all source files to bounded transcript search, carries the earliest creation and latest activity times, and produces no integrity alert. A copied or otherwise ambiguous same-ID group remains quarantined, including when a member cannot render because required metadata is missing, while unchanged collisions do not produce per-request ERROR logs.
 
-**Architecture:** Preserve the path-keyed per-file cache, retain identity evidence even for non-renderable same-ID files, and compose rows at snapshot publication only when ownership, metadata, lineage markers, and complete persisted-record write intervals agree. Carry every accepted source path into bounded directory search, keep quarantine for unresolved identities, and suppress repeated collision logs by the full signature while including a stable full-signature identifier in each event. The visible row continues to resume through the canonical session ID.
+**Architecture:** Preserve the path-keyed per-file cache, retain identity evidence independently of renderable rows, and compose rows at snapshot publication only when ownership, metadata, lineage markers, and complete persisted-record write intervals agree. Publish unresolved identity groups alongside rows in the same snapshot generation so the directory route can quarantine and log every known member, including files without a renderable row. Carry every accepted source path into bounded directory search, and suppress repeated collision logs by the full signature while including a stable full-signature identifier in each event. The visible row continues to resume through the canonical session ID.
 
 **Tech Stack:** Rust workspace (`freshell-sessions`, `freshell-server`), React/TypeScript client, Vitest, Rust tests, and Playwright browser tests.
 
@@ -66,7 +66,7 @@ as proof of the original red state.
 
 **Interfaces:**
 - Consumes: `parse_codex_session_content(&str) -> ParsedSessionMeta`; path-keyed `FileEntry` cache; `IndexedSession` snapshot rows.
-- Produces: a serde-serialized `IndexedSession.codex_segment_evidence: Vec<CodexSegmentEvidence>` per cached rollout and a snapshot composition helper that keeps one `IndexedSession` for a structurally accepted continuation group. Retain the existing `source_file` as the deterministic latest-segment representative for compatibility, and retain all per-segment evidence and paths in chronological order for downstream consumers.
+- Produces: serde-serialized per-file Codex identity/segment evidence in `FileEntry`, independent of `item: Option<IndexedSession>`, plus a same-generation unresolved-identity sidecar from `SessionIndex`. A snapshot composition helper keeps one `IndexedSession` for a structurally accepted continuation group. Retain the existing `source_file` as the deterministic latest-segment representative for compatibility, and retain all per-segment evidence and paths in chronological order for downstream consumers.
 
 - [ ] **Step 1: Write the failing behavioral tests and sanitized fixtures**
 
@@ -96,9 +96,10 @@ conflicting required metadata, and fork/parent/subagent/history-base evidence.
 Assert every renderable ambiguous member remains a separate same-ID row so
 the server can quarantine the whole identity. Also assert that a file with a
 known matching ID but missing `cwd` is retained as non-renderable identity
-evidence and prevents partial composition. Generate a 2,001-line copied
-transcript from the small sanitized fixture in the test helper instead of
-checking in a needlessly large file.
+evidence, prevents partial composition, and appears in the snapshot's
+unresolved-identity sidecar with its renderable sibling. Generate a
+2,001-line copied transcript from the small sanitized fixture in the test
+helper instead of checking in a needlessly large file.
 
 Add `codex_continuation_composition_survives_refresh_and_cache_reload`:
 after the first two files compose, append to the newest file, create a third
@@ -121,9 +122,11 @@ continue to demonstrate their current behavior.
 - [ ] **Step 3: Add the minimal evidence and composition implementation**
 
 In the new `codex_segments` module define serde-compatible per-file identity
-and interval evidence. Preserve known `session_meta` identity and lineage
-even when the normal parser returns no renderable row (for example, missing
-`cwd`). Require the first line to be a valid `session_meta` and validate
+and interval evidence. Store that evidence on the path-keyed `FileEntry`
+independently of `item`, so a known identity survives when the normal parser
+returns no renderable row (for example, missing `cwd`). Keep the existing
+single-file display parser's `Option<IndexedSession>` behavior. Require the
+first line to be a valid `session_meta` and validate
 `payload.id == payload.session_id` for multi-file composition. Retain exact
 structured values for required matching metadata (`cwd`, `source`,
 `thread_source`, `cli_version`, `originator`, and `history_mode`) and every
@@ -157,8 +160,16 @@ provenance or every possible same-ID history. Sort by interval extrema and
 require each previous end to be strictly earlier than the next start. If any
 member conflicts, is non-renderable, or lacks complete evidence, publish no
 partial composition: preserve all renderable same-ID rows for quarantine and
-retain known-ID evidence for hidden members. Filename suffixes, mtime, and
-traversal order never establish chronology.
+retain known-ID evidence for hidden members. Build an unresolved-identity
+sidecar from the full file cache after each full or scoped reconciliation;
+it must include all known member paths for every uncomposed same-ID group
+with at least two members. Publish it atomically with the rows and scan
+failures in `CachedSnapshot`, and expose it through a narrow `SessionIndex`
+read method that preserves the existing stale-while-revalidate behavior.
+Evidence-only additions, changes, and removals must advance refresh change
+detection and persistence accounting. Persist the evidence with `FileEntry`
+and bump `CACHE_SCHEMA_VERSION`. Filename suffixes, mtime, and traversal
+order never establish chronology.
 
 For an accepted group set `created_at` to the earliest segment, activity to
 the latest segment, `first_user_message` to the earliest nonempty segment,
@@ -216,8 +227,8 @@ git commit -m "fix(sessions): merge verified Codex continuations"
 - Test: `test/unit/client/components/HistoryView.a11y.test.tsx`
 
 **Interfaces:**
-- Consumes: `IndexedSession` with all Codex segment paths/evidence; existing `search_session_file` user/full-text tiers; existing `SessionDirectoryState` and `integrityError` response shape.
-- Produces: private `DirItem` source-path collection; a bounded multi-file search that returns at most one logical row; a process-shared collision-signature gate that emits one structured event per newly observed full collision signature.
+- Consumes: one coherent `SessionIndex` snapshot of rendered `IndexedSession` rows and unresolved same-ID groups; existing `search_session_file` user/full-text tiers; existing `SessionDirectoryState` and `integrityError` response shape.
+- Produces: private `DirItem` source-path collection; a bounded multi-file search that returns at most one logical row; route quarantine/logging that unions rendered row paths with unresolved index evidence; a process-shared collision-signature gate that emits one structured event per newly observed full collision signature.
 
 - [ ] **Step 1: Write failing route, logging, and UI behavior tests**
 
@@ -243,6 +254,19 @@ Add a production-index route test that copies the same 2,001-line Codex file
 to a second path and asserts both persisted rows are absent, the existing
 additive `integrityError` remains, healthy rows and matching live placeholders
 remain, and pagination/filtering cannot hide the conflict.
+
+Add a second production-index route test with exactly one renderable Codex
+row and one same-ID file whose first-line identity is valid but whose `cwd`
+is missing. Assert the rendered row is quarantined, `integrityError` is
+present, a healthy unrelated row remains, and neither the response nor its
+items expose source paths. Capture the collision event and assert its full
+signature includes both the renderable and hidden member paths. Remove the
+hidden file and assert a refreshed request restores the row without stale
+integrity evidence. Then move the hidden member to a different path and
+reopen the persistent index cache; assert the same identity is still
+quarantined and the refreshed full signature reflects the new path. This
+covers evidence-only path changes through refresh, persistence, and cache
+reload rather than only testing the pure collision helper.
 
 Capture actual tracing events while issuing concurrent and repeated identical
 requests, performing an unchanged refresh, and changing one colliding source
@@ -274,9 +298,11 @@ pnpm run test:vitest run test/unit/client/components/Sidebar.test.tsx test/unit/
 ```
 
 Expected: route coverage already sees one composed row from Task 1, while
-multi-file search cannot yet find the older segment and repeated requests
-still emit repeated collision events without a full-signature identifier.
-The copied-file route should continue to quarantine both rows.
+multi-file search cannot yet find the older segment, a renderable row plus
+same-ID non-renderable evidence is not yet quarantined by the route, and
+repeated requests still emit repeated collision events without a
+full-signature identifier. The copied-file route should continue to
+quarantine both rows.
 
 - [ ] **Step 3: Add multi-source search and collision-state logging**
 
@@ -288,6 +314,13 @@ existing `limit * 10` scan ceiling so many segments cannot bypass the bound.
 If a segment read fails, continue searching later segments; retain any match
 and report `partialReason: "io_error"`. Preserve paging order, snippets, tier
 semantics, and existing `partial` wire behavior.
+
+Merge the same-generation unresolved identity groups from `SessionIndex`
+with row-derived collisions before filtering. Treat their complete member
+paths as persisted sources even when only one or none of those files has a
+renderable row; quarantine every rendered row for that identity and include
+the evidence-only members in the collision signature and diagnostic counts.
+Do not synthesize a visible row solely to represent a non-renderable file.
 
 Store process-lifetime full collision signatures in shared
 `SessionDirectoryState` memory as an
