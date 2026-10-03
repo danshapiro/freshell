@@ -5,6 +5,7 @@ import { configureStore } from '@reduxjs/toolkit'
 import { Provider } from 'react-redux'
 import tabsReducer, { setActiveTab } from '@/store/tabsSlice'
 import panesReducer, {
+  updatePaneContent,
   removeLayout,
   requestPaneRefresh,
   setPaneCloseError,
@@ -5930,6 +5931,21 @@ describe('TerminalView lifecycle updates', () => {
       expect(queryByTestId('loader')).toBeNull()
       expect(queryByText('Reconnecting...')).toBeNull()
       expect(queryByText('Recovering terminal output...')).not.toBeNull()
+    })
+
+    it('keeps managed output attachment invisible while actually requesting retained output', async () => {
+      const { tabId, paneId, paneContent, store } = setupNonBlockingTerminal('ready')
+      const managedContent: TerminalPaneContent = { ...paneContent, soulId: 'managed-soul', recoverySummary: {
+        desiredState: 'running', recoveryState: 'recovering', reason: 'provider_unavailable',
+        durabilityState: 'resume_captured', allocationState: 'verified_durable',
+      } }
+      store.dispatch(updatePaneContent({ tabId, paneId, content: managedContent }))
+      render(<Provider store={store}><TerminalView tabId={tabId} paneId={paneId} paneContent={managedContent} /></Provider>)
+      await waitFor(() => expect(wsMocks.send).toHaveBeenCalledWith(expect.objectContaining({
+        type: 'terminal.attach', terminalId: 'term-non-blocking', sinceSeq: 0,
+      })))
+      expect(screen.queryByText('Recovering terminal output...')).toBeNull()
+      expect(screen.queryByTestId('loader')).toBeNull()
     })
 
     it('does not show recovering banner on fresh terminal creation', async () => {

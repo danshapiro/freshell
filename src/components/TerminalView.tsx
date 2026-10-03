@@ -7188,9 +7188,15 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
 
   const hasFatalConnectionError = isFatalConnectionErrorCode(connectionErrorCode)
   const managedRecoveryDecision = isManagedRuntimeRecoveryDecision(terminalContent.recoverySummary)
+  const managedTerminal = Boolean(terminalContent.soulId || terminalContent.recoverySummary)
+  const managedAutomaticRecovery = terminalContent.recoverySummary?.recoveryState === 'live'
+    || terminalContent.recoverySummary?.recoveryState === 'recovering'
+  // Keep recovery diagnostics in state, but show only actionable failures.
+  const visibleNotice = managedTerminal ? null : activeNotice
+  const visibleCrashTrace = managedTerminal ? null : terminalContent.crashTrace
   const showBlockingSpinner = terminalContent.status === 'creating' && !hasFatalConnectionError
   const showInlineOfflineStatus = connectionStatus !== 'ready' && !hasFatalConnectionError
-  const showInlineRecoveringStatus = connectionStatus === 'ready' && isAttaching && terminalContent.status !== 'creating' && !wasCreatedFreshRef.current
+  const showInlineRecoveringStatus = !managedTerminal && connectionStatus === 'ready' && isAttaching && terminalContent.status !== 'creating' && !wasCreatedFreshRef.current
   const inlineStatusMessage = showInlineOfflineStatus
     ? 'Offline: input will queue until reconnected.'
     : (showInlineRecoveringStatus ? 'Recovering terminal output...' : null)
@@ -7234,9 +7240,12 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
     && freshAgentOwnerDivergence === null
     && terminalRuntimeOwner?.ownerKind === 'vacant'
   )
+  const showSettledDead = settledDead && (!managedAutomaticRecovery || Boolean(
+    autoResumeSettle && autoResumeSettle.exitCode !== 0 && !activeNotice
+  ))
   const showExitBanner = Boolean(
     !managedRecoveryDecision
-    && isAgentPane && (activeNotice || terminalContent.crashTrace || settledDead || killedSessionVacant)
+    && isAgentPane && (visibleNotice || visibleCrashTrace || showSettledDead || killedSessionVacant)
   )
 
   // ── kata b8ke: typed recovery surfaces ──
@@ -7589,11 +7598,11 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
           <TerminalExitBanner
             mode={terminalContent.mode ?? 'agent'}
             exitCode={exitRecord?.exitCode ?? null}
-            notice={activeNotice ?? null}
-            crashTrace={terminalContent.crashTrace ?? null}
-            settledDead={settledDead}
+            notice={visibleNotice ?? null}
+            crashTrace={visibleCrashTrace ?? null}
+            settledDead={showSettledDead}
             vacantRecovery={killedSessionVacant}
-            resumeCycles={resumeCycles}
+            resumeCycles={managedTerminal ? null : resumeCycles}
             canResume={Boolean(
               terminalContent.sessionRef && terminalContent.sessionRef.provider === terminalContent.mode
             )}
