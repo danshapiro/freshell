@@ -274,11 +274,23 @@ function shouldClearStaleLocalEcho(
 function mergeSnapshotForDisplay(
   previous: FreshAgentSnapshot | null,
   next: FreshAgentSnapshot,
+  managedIntervention = false,
 ): FreshAgentSnapshot {
   if (!previous) return next
   const previousIdentity = getSnapshotIdentity(previous)
   const nextIdentity = getSnapshotIdentity(next)
   if (!previousIdentity || previousIdentity !== nextIdentity) return next
+  // Cold native reads report an idle, vacant owner without reading turns.
+  // During intervention that absence cannot erase history already displayed.
+  const providerState = next.extensions?.[next.provider]
+  if (
+    managedIntervention
+    && previous.turns.length > 0
+    && next.turns.length === 0
+    && next.status === 'idle'
+    && providerState?.ownerKind === 'vacant'
+    && providerState.statusFromLiveState !== true
+  ) return previous
   if (
     typeof previous.revision === 'number'
     && typeof next.revision === 'number'
@@ -1167,7 +1179,8 @@ export function FreshAgentView({
       && claudeSession?.restoreFailureMessage,
   )
   const isRestoring = Boolean(
-    paneContent.provider === 'claude'
+    !managedRecoveryDecision
+      && paneContent.provider === 'claude'
       && paneContent.sessionId
       && !snapshot
       && Boolean(claudeSession?.latestTurnId !== undefined || claudeSession?.lost)
@@ -2711,7 +2724,11 @@ export function FreshAgentView({
         autoTitleSentRef.current = true
       }
       const previousSnapshot = snapshotRef.current
-      const displaySnapshot = mergeSnapshotForDisplay(previousSnapshot, resolved)
+      const displaySnapshot = mergeSnapshotForDisplay(
+        previousSnapshot,
+        resolved,
+        isManagedRuntimeRecoveryDecision(paneContentRef.current.recoverySummary),
+      )
       const snapshotAccepted = displaySnapshot !== previousSnapshot
       const snapshotStatusAuthoritative = provider === 'codex'
         || resolved.extensions?.[provider]?.statusFromLiveState === true
