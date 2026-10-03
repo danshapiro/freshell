@@ -26,6 +26,8 @@ fn task_events_stream_matches_reference() {
         created_at: Some(1_772_323_200_000),
         last_activity_at: Some(1_772_323_206_000),
         message_count: 7,
+        title: Some("Sanitized prompt".to_string()),
+        first_user_message: Some("Sanitized prompt".to_string()),
         token_usage: Some(TokenSummary {
             input_tokens: 100,
             output_tokens: 10,
@@ -48,6 +50,23 @@ fn task_events_stream_matches_reference() {
     // None (explicit, beyond the full-struct equality below; validator-A4-A3).
     assert_eq!(meta.title_source, None);
     assert_eq!(meta, expected);
+}
+
+#[test]
+fn event_user_message_matches_response_item_for_naming_input() {
+    let event_msg = r#"{"type":"event_msg","payload":{"type":"user_message","message":"  \nRepair the sardine factory\nwith safe retries  "}}"#;
+    let response_item = r#"{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"  \nRepair the sardine factory\nwith safe retries  "}]}}"#;
+
+    let event = parse_codex_session_content(event_msg);
+    let response = parse_codex_session_content(response_item);
+
+    assert_eq!(
+        event.first_user_message.as_deref(),
+        Some("Repair the sardine factory\nwith safe retries")
+    );
+    assert_eq!(event.first_user_message, response.first_user_message);
+    assert_eq!(event.title, response.title);
+    assert_eq!(event.title.as_deref(), Some("Repair the sardine factory"));
 }
 
 #[test]

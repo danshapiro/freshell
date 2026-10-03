@@ -3931,6 +3931,10 @@ pub(crate) mod tests {
         assert_eq!(items[0].session_id, "session-activity");
         assert_eq!(items[0].provider, "codex");
         assert_eq!(items[0].cwd.as_deref(), Some("/project/codex"));
+        assert_eq!(
+            items[0].first_user_message.as_deref(),
+            Some("Sanitized prompt")
+        );
         std::fs::remove_dir_all(codex_home.parent().unwrap()).ok();
     }
 
