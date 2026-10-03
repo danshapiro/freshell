@@ -318,6 +318,12 @@ export const tabRegistrySlice = createSlice({
     popReopenEntry: (state) => {
       state.reopenStack.pop()
     },
+    consumeClosedEntry: (state, action: PayloadAction<{ tabId: string; closedAt: number }>) => {
+      const index = state.reopenStack.findIndex((entry) => (
+        entry.tab.id === action.payload.tabId && entry.closedAt === action.payload.closedAt
+      ))
+      if (index >= 0) state.reopenStack.splice(index, 1)
+    },
   },
 })
 
@@ -335,6 +341,7 @@ export const {
   clearTabRegistryLocalClosed,
   pushReopenEntry,
   popReopenEntry,
+  consumeClosedEntry,
 } = tabRegistrySlice.actions
 
 export default tabRegistrySlice.reducer

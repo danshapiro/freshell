@@ -54,6 +54,19 @@ managed-runtime and WebSocket contracts.
   testing for a configured cloud lane.
 - Preserve the User Request block above verbatim.
 
+## Task 1 review repair scope adjustment
+
+The Task 1 review found that the reopen visibility promotion already present in
+the branch could consume a saved entry while leaving a local tab whose view
+was still detached. To make that existing behavior safe, this repair pulls
+forward only the Task 3 reopen contract needed at that seam: complete fresh
+inventory preflight with current terminal/create handles, `pane.opened`
+assertions for restored panes, promotion confirmation before consuming the
+exact saved entry, and rollback of local restoration when promotion fails.
+The shared visibility coordinator remains in use. Task 2 persistence and
+cross-tab changes, and the separate fallback-matcher change, remain out of
+this repair.
+
 ## Load-bearing decisions
 
 The immutable base is commit

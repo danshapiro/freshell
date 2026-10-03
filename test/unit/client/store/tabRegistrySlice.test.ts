@@ -7,6 +7,7 @@ import reducer, {
   recordClosedTabSnapshot,
   pushReopenEntry,
   popReopenEntry,
+  consumeClosedEntry,
 } from '../../../../src/store/tabRegistrySlice'
 import type { ClosedTabEntry } from '../../../../src/store/tabRegistrySlice'
 import {
@@ -153,6 +154,20 @@ describe('tabRegistrySlice', () => {
     it('popReopenEntry on empty stack is a no-op', () => {
       const state = reducer(undefined, popReopenEntry())
       expect(state.reopenStack).toEqual([])
+    })
+
+    it('consumes only the saved entry that was restored', () => {
+      const restored = makeClosedTabEntry({ closedAt: 1 })
+      const newer = makeClosedTabEntry({
+        tab: { ...makeClosedTabEntry().tab, id: 'tab-2' },
+        closedAt: 2,
+      })
+      let state = reducer(undefined, pushReopenEntry(restored))
+      state = reducer(state, pushReopenEntry(newer))
+
+      state = reducer(state, consumeClosedEntry({ tabId: restored.tab.id, closedAt: restored.closedAt }))
+
+      expect(state.reopenStack).toEqual([newer])
     })
 
     it('caps stack at 20 entries', () => {
