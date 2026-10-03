@@ -24,10 +24,26 @@ use tower::ServiceExt;
 struct StopBackend {
     uncertain: AtomicBool,
     stopped: Mutex<Vec<(SoulId, IncarnationId)>>,
+    history_home: Option<PathBuf>,
 }
 
 #[async_trait]
 impl RuntimeBackend for StopBackend {
+    async fn read_native_history(
+        &self,
+        handle: &OwnedRuntimeHandle,
+        provider: &str,
+        native_id: &str,
+        _: &std::path::Path,
+    ) -> Result<serde_json::Value, BackendError> {
+        assert_eq!(handle.fresh_agent().unwrap().provider.as_str(), provider);
+        freshell_freshagent::native_history::read(
+            provider,
+            self.history_home.as_deref().expect("owned native fixture"),
+            native_id,
+        )
+        .map_err(BackendError::Unavailable)
+    }
     async fn create_stopped(&self, _: &CreateRuntimeSpec) -> Result<BackendCreated, BackendError> {
         unreachable!()
     }
@@ -403,6 +419,78 @@ async fn running_soul_uncertain_stop_returns_the_revision_for_immediate_retry() 
         *backend.stopped.lock().unwrap(),
         vec![(before.soul_id, before.incarnation_id); 2]
     );
+    control.abort();
+    let _ = control.await;
+}
+
+#[tokio::test]
+async fn restored_web_reads_exact_persisted_lost_native_history_without_starting_runtime() {
+    let temp = tempfile::tempdir().unwrap();
+    let (registry, before) = fixture_soul(temp.path(), true).await;
+    let home = temp.path().join("owned-provider-store");
+    let directory = home.join(".local/share/opencode");
+    std::fs::create_dir_all(&directory).unwrap();
+    let connection = rusqlite::Connection::open(directory.join("opencode.db")).unwrap();
+    connection.execute_batch("CREATE TABLE session (id TEXT PRIMARY KEY,title TEXT,time_updated INTEGER,revert TEXT);
+      CREATE TABLE message (id TEXT PRIMARY KEY,session_id TEXT,time_created INTEGER,data TEXT);
+      CREATE TABLE part (id TEXT PRIMARY KEY,session_id TEXT,message_id TEXT,time_created INTEGER,data TEXT);
+      INSERT INTO session VALUES ('retained-thread','Durable name',2,NULL);
+      INSERT INTO session VALUES ('foreign-thread','Foreign',2,NULL);").unwrap();
+    let saved_text = "Actual saved managed answer\n".repeat(50_000);
+    assert!(saved_text.len() > freshell_runtime_protocol::MAX_CONTROL_FRAME_BYTES);
+    for (id, text) in [
+        ("retained-thread", saved_text.as_str()),
+        ("foreign-thread", "Foreign history"),
+    ] {
+        connection
+            .execute(
+                "INSERT INTO message VALUES (?1,?2,1,?3)",
+                rusqlite::params![
+                    format!("{id}-message"),
+                    id,
+                    json!({"role":"assistant","time":{"created":1,"completed":2}}).to_string()
+                ],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO part VALUES (?1,?2,?3,1,?4)",
+                rusqlite::params![
+                    format!("{id}-part"),
+                    id,
+                    format!("{id}-message"),
+                    json!({"type":"text","text":text}).to_string()
+                ],
+            )
+            .unwrap();
+    }
+    drop(connection);
+    let backend = Arc::new(StopBackend {
+        history_home: Some(home),
+        ..Default::default()
+    });
+    let (socket, control) = start_control(temp.path(), registry.clone(), backend.clone()).await;
+    // Reconstruct the web API: no provider actor, running-soul lookup or alias cache.
+    drop(web_router(&socket, temp.path()).await);
+    let router = web_router(&socket, temp.path()).await;
+    let response = router
+        .oneshot(
+            Request::builder()
+                .uri(format!("/api/runtime/souls/{}/history", before.soul_id))
+                .header("x-auth-token", "web-token")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: serde_json::Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert_eq!(body["threadId"], "retained-thread");
+    assert_eq!(body["turns"][0]["items"][0]["text"], saved_text);
+    assert_eq!(body["capabilities"]["send"], false);
+    assert_eq!(registry.inventory().await.unwrap().pop().unwrap(), before);
+    assert!(backend.stopped.lock().unwrap().is_empty());
     control.abort();
     let _ = control.await;
 }

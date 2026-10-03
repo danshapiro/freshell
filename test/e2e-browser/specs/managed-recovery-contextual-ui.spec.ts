@@ -1,3 +1,4 @@
+import nativeCodexHistory from '../../fixtures/managed-native-history/codex.json'
 import type { Page } from '@playwright/test'
 import type { ManagedRuntimeNotice, ManagedRuntimeRecoverySummary } from '@shared/managed-runtime.js'
 import { FRESHCODEX_DEFAULT_MODEL } from '@shared/fresh-agent-models.js'
@@ -51,6 +52,12 @@ async function installPane(page: Page, kind: PaneKind, recoveryState: RecoverySt
     turns: [{ id: 'saved-turn', turnId: 'saved-turn', source: 'durable', role: 'assistant', summary: '',
       items: [{ id: 'saved-text', kind: 'text', text: SAVED_HISTORY_TEXT }] }],
     extensions: {},
+  } }))
+  await page.route(`**/api/runtime/souls/${SOUL_ID}/history`, (route) => route.fulfill({ json: {
+    ...nativeCodexHistory, threadId: SESSION_ID,
+    turns: nativeCodexHistory.turns.map((turn) => ({ ...turn, items: turn.items.map((item) => (
+      turn.role === 'assistant' && item.kind === 'text' ? { ...item, text: SAVED_HISTORY_TEXT } : item
+    )) })),
   } }))
   await page.evaluate(({ kind, summary, sessionId, soulId, revision, createRequestId, model }) => {
     const harness = window.__FRESHELL_TEST_HARNESS__!
@@ -126,7 +133,9 @@ for (const kind of ['terminal', 'fresh-agent'] as const) {
 
   test(`${kind}: blocked retry preserves its soul revision and shows failure inside the pane`, async ({ freshellPage, page, terminal }) => {
     await terminal.waitForTerminal()
+    const historyRead = kind === 'fresh-agent' ? page.waitForRequest(`**/api/runtime/souls/${SOUL_ID}/history`) : null
     await installPane(page, kind, 'blocked')
+    if (historyRead) expect((await historyRead).method()).toBe('GET')
     const retries: Array<{ requestId: string; expectedIntentRevision: number }> = []
     let inventoryRefreshes = 0
     await page.route(`**/api/runtime/souls/${SOUL_ID}/retry`, async (route) => {
@@ -165,7 +174,9 @@ for (const kind of ['terminal', 'fresh-agent'] as const) {
 
   test(`${kind}: lost identity remains until explicit start-new cleanup is verified`, async ({ freshellPage, page, terminal, harness }) => {
     await terminal.waitForTerminal()
+    const historyRead = kind === 'fresh-agent' ? page.waitForRequest(`**/api/runtime/souls/${SOUL_ID}/history`) : null
     await installPane(page, kind, 'lost')
+    if (historyRead) expect((await historyRead).method()).toBe('GET')
     const before = await paneContent(page)
     const stopRequests: Array<{ expectedIntentRevision: number; requestId: string }> = []
     let releaseVerifiedStop!: () => void

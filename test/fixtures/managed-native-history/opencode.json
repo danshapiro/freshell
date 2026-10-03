@@ -1,0 +1,80 @@
+{
+  "sessionType": "freshopencode",
+  "provider": "opencode",
+  "threadId": "ses_saved",
+  "sessionId": "ses_saved",
+  "revision": 2,
+  "latestTurnId": "2",
+  "status": "idle",
+  "summary": "Saved",
+  "capabilities": {
+    "send": false,
+    "interrupt": false,
+    "approvals": false,
+    "questions": false,
+    "fork": false,
+    "worktrees": false,
+    "diffs": false,
+    "childThreads": false,
+    "undo": false,
+    "redo": false,
+    "settingScopes": {
+      "model": "per-send",
+      "effort": "per-send",
+      "sandbox": "unsupported",
+      "permissionMode": "unsupported"
+    }
+  },
+  "tokenUsage": {
+    "inputTokens": 0,
+    "outputTokens": 0,
+    "totalTokens": 0
+  },
+  "pendingApprovals": [],
+  "pendingQuestions": [],
+  "worktrees": [],
+  "diffs": [],
+  "childThreads": [],
+  "turns": [
+    {
+      "id": "1",
+      "turnId": "1",
+      "messageId": "1",
+      "ordinal": 0,
+      "source": "durable",
+      "role": "user",
+      "summary": "Saved native user prompt",
+      "summaryKind": "echo",
+      "items": [
+        {
+          "id": "1",
+          "kind": "text",
+          "text": "Saved native user prompt"
+        }
+      ]
+    },
+    {
+      "id": "2",
+      "turnId": "2",
+      "messageId": "2",
+      "ordinal": 1,
+      "source": "durable",
+      "role": "assistant",
+      "summary": "Saved native OpenCode answer",
+      "summaryKind": "echo",
+      "items": [
+        {
+          "id": "2",
+          "kind": "text",
+          "text": "Saved native OpenCode answer"
+        }
+      ]
+    }
+  ],
+  "extensions": {
+    "opencode": {
+      "ownerKind": "vacant",
+      "nativeHistoryAvailable": true
+    }
+  }
+}

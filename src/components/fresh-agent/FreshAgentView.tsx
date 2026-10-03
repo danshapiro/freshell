@@ -290,6 +290,7 @@ function mergeSnapshotForDisplay(
     && next.status === 'idle'
     && providerState?.ownerKind === 'vacant'
     && providerState.statusFromLiveState !== true
+    && providerState.nativeHistoryAvailable !== true
   ) return previous
   if (
     typeof previous.revision === 'number'
@@ -2692,8 +2693,12 @@ export function FreshAgentView({
     const provider = paneContent.provider
     const requestSessionType = paneContent.sessionType
     const requestCreateRequestId = paneContent.createRequestId
+    const requestSoulId = managedRecoveryDecision && (provider === 'codex' || provider === 'opencode') ? paneContent.soulId : undefined
+    const requestSoulRevision = requestSoulId ? paneContent.soulIntentRevision : undefined
     const isStaleSnapshotRequest = () => (
       paneContentRef.current.createRequestId !== requestCreateRequestId
+      || (requestSoulId !== undefined && (paneContentRef.current.soulId !== requestSoulId
+        || paneContentRef.current.soulIntentRevision !== requestSoulRevision))
       || paneContentRef.current.provider !== provider
       || paneContentRef.current.sessionType !== requestSessionType
       || snapshotThreadIdRef.current !== sessionId
@@ -2730,8 +2735,8 @@ export function FreshAgentView({
         isManagedRuntimeRecoveryDecision(paneContentRef.current.recoverySummary),
       )
       const snapshotAccepted = displaySnapshot !== previousSnapshot
-      const snapshotStatusAuthoritative = provider === 'codex'
-        || resolved.extensions?.[provider]?.statusFromLiveState === true
+      const snapshotStatusAuthoritative = !requestSoulId && (provider === 'codex'
+        || resolved.extensions?.[provider]?.statusFromLiveState === true)
       const outgoing = outgoingTurnRef.current
       if (
         outgoing && outgoing.requestId === requestOutgoingTurnId
@@ -2786,6 +2791,8 @@ export function FreshAgentView({
           }, Math.min(250, remaining))
         }
       }
+      // This read has no live actor authority, even if Retry cleared the intervention while it ran.
+      if (requestSoulId) return
       const echo = localEchoRef.current
       const echoPendingMetadata = echo ? pendingSendMetadataRef.current.get(echo.requestId) : undefined
       const landedEcho = echo
@@ -2928,7 +2935,7 @@ export function FreshAgentView({
       if (isStaleSnapshotRequest()) return
       // A history refusal must not initiate an attach/resume or clear the
       // saved identity while the pane requires explicit intervention.
-      if (isManagedRuntimeRecoveryDecision(paneContentRef.current.recoverySummary)) {
+      if (requestSoulId || isManagedRuntimeRecoveryDecision(paneContentRef.current.recoverySummary)) {
         setLoadError(error instanceof Error ? error.message : 'Failed to load session')
         return
       }
@@ -3050,12 +3057,13 @@ export function FreshAgentView({
       }
       setLoadError(error instanceof Error ? error.message : 'Failed to load session')
     }
-    const key = makeSnapshotKey({ sessionType: requestSessionType, provider, threadId: sessionId, cwd: requestCwd })
+    const key = makeSnapshotKey({ sessionType: requestSessionType, provider, threadId: sessionId, cwd: requestCwd, soulId: requestSoulId, soulIntentRevision: requestSoulRevision })
     void getSnapshotScheduler().schedule(key, trigger, () =>
       // NO signal: the run may execute on behalf of other panes sharing the
       // key, or after this effect cleaned up (A2). Staleness is handled by
       // isStaleSnapshotRequest() when the outcome is applied, not by aborting.
       getFreshAgentThreadSnapshot(requestSessionType, provider, sessionId, {
+        ...(requestSoulId ? { soulId: requestSoulId } : {}),
         ...(requestCwd ? { cwd: requestCwd } : {}),
         trigger,
       }),
@@ -3110,6 +3118,8 @@ export function FreshAgentView({
     isRestoring,
     dispatch,
     paneContent.provider,
+    paneContent.soulId,
+    paneContent.soulIntentRevision,
     paneContent.createRequestId,
     managedRecoveryDecision,
     paneContent.sessionId,

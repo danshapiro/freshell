@@ -683,11 +683,12 @@ export async function getFreshAgentThreadSnapshot(
   sessionType: string,
   provider: string,
   threadId: string,
-  query: { revision?: number; cwd?: string; trigger?: string; signal?: AbortSignal } = {},
+  query: { revision?: number; cwd?: string; trigger?: string; signal?: AbortSignal; soulId?: string } = {},
   options: ApiRequestOptions = {},
 ): Promise<any> {
   const signal = query.signal ?? options.signal
   const data = await api.get(
+    query.soulId ? `/api/runtime/souls/${encodeURIComponent(query.soulId)}/history` :
     `/api/fresh-agent/threads/${encodeURIComponent(sessionType)}/${encodeURIComponent(provider)}/${encodeURIComponent(threadId)}${buildQueryString([
       ['revision', query.revision],
       ['cwd', query.cwd],

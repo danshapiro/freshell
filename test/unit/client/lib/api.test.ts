@@ -327,6 +327,12 @@ describe('visible-first read-model helpers', () => {
     )
   })
 
+  it('reads managed history from the exact soul after web restart without an alias lookup', async () => {
+    mockFetch.mockResolvedValueOnce(mockJson(codexContractSnapshot))
+    await getFreshAgentThreadSnapshot('freshcodex', 'codex', 'presentation-alias', { soulId: 'retained-soul' })
+    expect(mockFetch).toHaveBeenCalledWith('/api/runtime/souls/retained-soul/history', expect.any(Object))
+  })
+
   it('appends the snapshot trigger to the fresh-agent snapshot query when provided', async () => {
     mockFetch.mockResolvedValueOnce(mockJson(codexContractSnapshot))
 

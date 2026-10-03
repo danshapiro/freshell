@@ -34,9 +34,9 @@ const BACKOFF_MAX_MS = 30_000
 const DEBOUNCED_TRIGGERS: ReadonlySet<SnapshotTrigger> = new Set(['event', 'send-accepted', 'reveal', 'reconnect'])
 
 export function makeSnapshotKey(input: {
-  sessionType: string; provider: string; threadId: string; cwd?: string
+  sessionType: string; provider: string; threadId: string; cwd?: string; soulId?: string; soulIntentRevision?: number
 }): string {
-  return `${input.sessionType}:${input.provider}:${input.threadId}:${input.cwd ?? ''}`
+  return `${input.sessionType}:${input.provider}:${input.threadId}:${input.cwd ?? ''}${input.soulId ? `:soul:${input.soulId}:${input.soulIntentRevision ?? ''}` : ''}`
 }
 
 type Resolver<T> = (outcome: SnapshotOutcome<T>) => void

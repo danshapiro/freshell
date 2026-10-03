@@ -1,4 +1,5 @@
 pub mod docker;
+mod native_history;
 
 use crate::registry::OwnedRuntimeHandle;
 use async_trait::async_trait;
@@ -116,6 +117,17 @@ pub struct BackendInspection {
 
 #[async_trait]
 pub trait RuntimeBackend: Send + Sync {
+    async fn read_native_history(
+        &self,
+        _handle: &OwnedRuntimeHandle,
+        _provider: &str,
+        _native_id: &str,
+        _reader_binary: &Path,
+    ) -> Result<Value, BackendError> {
+        Err(BackendError::Unavailable(
+            "native history reader unavailable".into(),
+        ))
+    }
     async fn create_stopped(
         &self,
         spec: &CreateRuntimeSpec,
@@ -249,6 +261,16 @@ impl DockerEngineBackend {
         path: &str,
         body: Option<&Value>,
     ) -> Result<DockerResponse, BackendError> {
+        self.request_bounded(method, path, body, u64::MAX).await
+    }
+
+    async fn request_bounded(
+        &self,
+        method: &str,
+        path: &str,
+        body: Option<&Value>,
+        limit: u64,
+    ) -> Result<DockerResponse, BackendError> {
         let mut stream = UnixStream::connect(&self.socket_path)
             .await
             .map_err(|e| BackendError::Unavailable(e.to_string()))?;
@@ -277,9 +299,15 @@ impl DockerEngineBackend {
             .map_err(|e| BackendError::Unavailable(e.to_string()))?;
         let mut raw = Vec::new();
         stream
+            .take(limit.saturating_add(1))
             .read_to_end(&mut raw)
             .await
             .map_err(|e| BackendError::Unavailable(e.to_string()))?;
+        if raw.len() as u64 > limit {
+            return Err(BackendError::Malformed(
+                "docker response exceeds history read limit".into(),
+            ));
+        }
         parse_http_response(&raw)
     }
 }
@@ -470,6 +498,22 @@ fn runtime_host_environment(
 
 #[async_trait]
 impl RuntimeBackend for DockerEngineBackend {
+    async fn read_native_history(
+        &self,
+        handle: &OwnedRuntimeHandle,
+        provider: &str,
+        native_id: &str,
+        reader_binary: &Path,
+    ) -> Result<Value, BackendError> {
+        self.read_history_helper(
+            handle,
+            provider,
+            native_id,
+            reader_binary,
+            std::time::Duration::from_secs(20),
+        )
+        .await
+    }
     async fn create_stopped(
         &self,
         spec: &CreateRuntimeSpec,

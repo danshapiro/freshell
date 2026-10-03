@@ -429,6 +429,48 @@ impl Supervisor {
                 self.fresh_agent_interrupt(request.soul_id).await?;
                 Ok(AdminResult::FreshAgentInterrupted)
             }
+            AdminCommand::FreshAgentReadHistory(request) => {
+                self.registry
+                    .assert_epoch(request.expected_control_epoch)
+                    .map_err(map_registry)?;
+                let context = self
+                    .registry
+                    .recovery_context(request.soul_id)
+                    .await
+                    .map_err(map_registry)?;
+                let handle = &context.prior_handle;
+                let agent = handle.fresh_agent().ok_or_else(|| {
+                    RuntimeError::new(
+                        RuntimeErrorCode::InvalidRequest,
+                        "soul is not a fresh agent",
+                    )
+                })?;
+                let native_id = context.native_session_id.as_deref().ok_or_else(|| {
+                    RuntimeError::new(
+                        RuntimeErrorCode::InvalidRequest,
+                        "saved native session identity unavailable",
+                    )
+                })?;
+                let snapshot = self
+                    .backend
+                    .read_native_history(
+                        handle,
+                        agent.provider.as_str(),
+                        native_id,
+                        &self.config.host_binary_path,
+                    )
+                    .await
+                    .map_err(map_backend)?;
+                if snapshot["threadId"].as_str() != Some(native_id)
+                    || snapshot["provider"].as_str() != Some(agent.provider.as_str())
+                {
+                    return Err(RuntimeError::new(
+                        RuntimeErrorCode::OwnershipMismatch,
+                        "native history identity mismatch",
+                    ));
+                }
+                Ok(AdminResult::FreshAgentHistory(snapshot))
+            }
             AdminCommand::FreshAgentReadEvents(request) => {
                 self.registry
                     .assert_epoch(request.expected_control_epoch)
@@ -2186,7 +2228,13 @@ pub async fn serve_control(supervisor: Supervisor, socket_path: &Path) -> Result
                     )),
                 },
             };
-            let _ = write_frame(&mut stream, &reply).await;
+            let limit = if matches!(reply.result, Ok(AdminResult::FreshAgentHistory(_))) {
+                freshell_runtime_protocol::MAX_NATIVE_HISTORY_FRAME_BYTES
+            } else {
+                freshell_runtime_protocol::MAX_CONTROL_FRAME_BYTES
+            };
+            let _ =
+                freshell_runtime_protocol::write_frame_with_limit(&mut stream, &reply, limit).await;
         });
     }
 }

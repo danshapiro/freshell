@@ -72,6 +72,7 @@ async-trait = "0.1"
 serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = "0.10"
+rusqlite = { version = "0.31", features = ["bundled"] }
 # `<think>`/`<thinking>` balanced-tag segmentation for opencode assistant text
 # (`itemsFromAssistantTextPart`/`normalizeBalancedThinkTags`, normalize.ts:100-189) needs a
 # backreference (`<(thinking|think)...>...</\1>`) to match only same-name open/close pairs --
