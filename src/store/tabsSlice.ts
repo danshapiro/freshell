@@ -1524,10 +1524,21 @@ function samePaneCloseTargetIdentity(
       || original.viewIntentId !== currentIdentity.viewIntentId
       || original.soulId !== currentIdentity.soulId
       || original.incarnationId !== currentIdentity.incarnationId
-      || original.sessionProvider !== currentIdentity.sessionProvider
-      || original.sessionId !== currentIdentity.sessionId
       || original.hasManagedMarker !== currentIdentity.hasManagedMarker
     ) return false
+    const samePaneHandle = Boolean(original.terminalId && original.terminalId === currentIdentity.terminalId)
+      || Boolean(original.createRequestId && original.createRequestId === currentIdentity.createRequestId)
+    const sessionIdentityMatches = original.sessionProvider === currentIdentity.sessionProvider
+      && original.sessionId === currentIdentity.sessionId
+    const sessionIdentityWasEnriched = !original.sessionProvider
+      && !original.sessionId
+      && Boolean(currentIdentity.sessionProvider || currentIdentity.sessionId)
+      && samePaneHandle
+    // A directory/session association can arrive while close waits for its
+    // acknowledgement. That enriches the same pane when its terminal or
+    // create-request handle is stable; changing or dropping an identity that
+    // was already known still means this close targets different contents.
+    if (!sessionIdentityMatches && !sessionIdentityWasEnriched) return false
     const terminalIdMatches = original.terminalId === currentIdentity.terminalId
       || (!original.terminalId && Boolean(currentIdentity.terminalId) && Boolean(original.createRequestId))
     const creationStateMatches = original.isCreating === currentIdentity.isCreating

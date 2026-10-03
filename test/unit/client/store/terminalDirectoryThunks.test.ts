@@ -634,7 +634,7 @@ describe('mid-ack-wait identity binding stranding (composition)', () => {
     const tabId = store.getState().tabs.tabs[0].id
     store.dispatch(initLayout({
       tabId,
-      content: { kind: 'terminal', mode: 'opencode', terminalId: 't-strand' },
+      content: { kind: 'terminal', mode: 'opencode', terminalId: 't-strand', status: 'running' },
     }))
 
     // The binding lands mid-wait: the ws mock routes it through the real
