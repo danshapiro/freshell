@@ -6235,6 +6235,7 @@ describe('FreshAgentView', () => {
     ['success', 5, 'race-soul'], ['failure', 5, 'race-soul'],
     ['success', 6, 'race-soul'], ['failure', 6, 'race-soul'],
     ['success', 5, 'replaced-race-soul'], ['failure', 5, 'replaced-race-soul'],
+    ['success', 5, undefined], ['failure', 5, undefined],
   ] as const)('ignores an ordinary snapshot %s after intervention history at revision %s for %s', async (outcome, currentRevision, currentSoulId) => {
     const store = createStore()
     let resolveLive!: (value: unknown) => void
@@ -6243,7 +6244,7 @@ describe('FreshAgentView', () => {
     const native = FreshAgentSnapshotSchema.parse(savedCodexNativeHistory)
     const content = { kind: 'fresh-agent' as const, sessionType: 'freshcodex' as const, provider: 'codex' as const,
       sessionId: native.threadId, createRequestId: 'live-to-native-race', status: 'idle' as const,
-      soulId: 'race-soul', soulIntentRevision: 5 }
+      soulId: currentSoulId === undefined ? undefined : 'race-soul', soulIntentRevision: 5 }
     store.dispatch(initLayout({ tabId: 'tab-1', paneId: 'pane-1', content }))
     render(<Provider store={store}><StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" /></Provider>)
     await waitFor(() => expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledTimes(1))
@@ -6538,15 +6539,18 @@ describe('FreshAgentView', () => {
     expect(wsMock.send).not.toHaveBeenCalledWith(expect.objectContaining({ type: expect.stringMatching(/^freshAgent\.|^pane\.reconcile/) }))
   })
 
-  it.each(['blocked', 'lost'] as const)('keeps %s history snapshot refusal read-only', async (recoveryState) => {
+  it.each([
+    ['blocked', 'opencode', false], ['lost', 'opencode', false],
+    ['blocked', 'codex', true], ['lost', 'codex', true],
+  ] as const)('keeps %s %s history snapshot refusal read-only (missing soul %s)', async (recoveryState, provider, missingSoul) => {
     const store = createStore()
     apiMock.getFreshAgentThreadSnapshot.mockRejectedValue(new ApiError(409, 'Saved history is temporarily unavailable', {
       code: 'RESTORE_UNAVAILABLE', ownerGeneration: 8, ownerKind: 'fresh-agent',
     }))
     store.dispatch(initLayout({ tabId: 'tab-1', paneId: 'pane-1', content: {
-      kind: 'fresh-agent', sessionType: 'freshopencode', provider: 'opencode',
-      sessionId: 'saved-refused-thread', sessionRef: { provider: 'opencode', sessionId: 'saved-refused-thread' },
-      createRequestId: 'saved-refused-request', status: 'idle', soulId: 'saved-refused-soul', soulIntentRevision: 12,
+      kind: 'fresh-agent', sessionType: provider === 'codex' ? 'freshcodex' : 'freshopencode', provider,
+      sessionId: 'saved-refused-thread', sessionRef: { provider, sessionId: 'saved-refused-thread' },
+      createRequestId: 'saved-refused-request', status: 'idle', soulId: missingSoul ? undefined : 'saved-refused-soul', soulIntentRevision: 12,
       recoverySummary: { desiredState: 'running', recoveryState, reason: 'provider_unavailable', durabilityState: 'resume_captured', allocationState: 'verified_durable' },
     } }))
     render(<Provider store={store}><StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" /></Provider>)
@@ -6793,6 +6797,35 @@ describe('FreshAgentView', () => {
     { id: 'retained-turn', role: 'assistant', items: [{ id: 'retained-text', kind: 'text', text: 'Conversation retained before starting new' }] },
   ] }
 
+  it('reads a cold lost conversation without a soul as history without adopting live status or starting a runtime', async () => {
+    const store = createStore()
+    apiMock.getFreshAgentThreadSnapshot.mockResolvedValue({ ...retainedBeforeStartNewSnapshot,
+      status: 'running', capabilities: { send: true, interrupt: true, fork: true },
+      extensions: { codex: { statusFromLiveState: true } },
+    })
+    const content = {
+      kind: 'fresh-agent' as const, sessionType: 'freshcodex' as const, provider: 'codex' as const,
+      createRequestId: 'cold-lost-create', sessionRef: { provider: 'codex' as const, sessionId: 'cold-lost-thread' },
+      status: 'error' as const, closeError: 'Previous close was not confirmed', soulIntentRevision: 9,
+      recoverySummary: { desiredState: 'stopped' as const, recoveryState: 'lost' as const,
+        durabilityState: 'resume_captured' as const, allocationState: 'verified_durable' as const },
+    }
+    store.dispatch(initLayout({ tabId: 'tab-1', paneId: 'pane-1', content }))
+    render(<Provider store={store}><StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" /></Provider>)
+    expect(await screen.findByText('Conversation retained before starting new')).toBeInTheDocument()
+    expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledWith('freshcodex', 'codex', 'cold-lost-thread', expect.not.objectContaining({ soulId: expect.anything() }))
+    expect(getFreshAgentPaneContent(store)).toEqual(content)
+    expect(screen.getByRole('textbox', { name: 'Chat message input' })).toBeDisabled()
+    expect(wsMock.send).not.toHaveBeenCalledWith(expect.objectContaining({ type: expect.stringMatching(/^freshAgent\.|^pane\.reconcile/) }))
+    fireEvent.click(screen.getByRole('button', { name: 'Start new conversation' }))
+    expect(await screen.findByRole('status')).toHaveTextContent('Your conversation has been kept')
+    expect(getFreshAgentPaneContent(store)).toEqual(content)
+    expect(screen.getByText('Conversation retained before starting new')).toBeInTheDocument()
+    expect(screen.getByText('Close failed: Previous close was not confirmed')).toBeInTheDocument()
+    expect(apiMock.stopManagedRuntimeSoul).not.toHaveBeenCalled()
+    expect(wsMock.send).not.toHaveBeenCalledWith(expect.objectContaining({ type: expect.stringMatching(/^freshAgent\.|^pane\.reconcile/) }))
+  })
+
   it.each([
     ['freshclaude', 'claude'], ['kilroy', 'claude'], ['freshcodex', 'codex'], ['freshopencode', 'opencode'],
   ] as const)('clears a failed close only after stopping the persisted managed soul and replacing a restored %s conversation', async (sessionType, provider) => {
@@ -6845,14 +6878,9 @@ describe('FreshAgentView', () => {
         recoverySummary: { desiredState: 'stopped' as const, recoveryState: 'lost' as const,
           durabilityState: 'resume_captured' as const, allocationState: 'verified_durable' as const },
       }
-      // Without a soul there is no native-history route. Load the existing
-      // conversation before its managed projection loses that identity.
-      store.dispatch(initLayout({ tabId: 'tab-1', paneId: 'pane-1', content: {
-        ...content, ...(outcome === 'missing_soul' ? { recoverySummary: undefined } : {}),
-      } }))
+      store.dispatch(initLayout({ tabId: 'tab-1', paneId: 'pane-1', content }))
       render(<Provider store={store}><StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" /></Provider>)
       expect(await screen.findByText('Conversation retained before starting new')).toBeInTheDocument()
-      if (outcome === 'missing_soul') act(() => store.dispatch(updatePaneContent({ tabId: 'tab-1', paneId: 'pane-1', content })))
       expect(screen.getByText('Close failed: Previous close was not confirmed')).toBeInTheDocument()
       const retained = getFreshAgentPaneContent(store)
       wsMock.send.mockClear()
