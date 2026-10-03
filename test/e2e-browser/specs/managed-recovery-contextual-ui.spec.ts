@@ -1,4 +1,4 @@
-import nativeCodexHistory from '../../fixtures/managed-native-history/codex.json'
+import nativeCodexHistory from '../../fixtures/managed-native-history/codex.json' with { type: 'json' }
 import type { Page } from '@playwright/test'
 import type { ManagedRuntimeNotice, ManagedRuntimeRecoverySummary } from '@shared/managed-runtime.js'
 import { FRESHCODEX_DEFAULT_MODEL } from '@shared/fresh-agent-models.js'
