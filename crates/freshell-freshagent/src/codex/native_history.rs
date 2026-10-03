@@ -1,5 +1,6 @@
 use serde_json::{json, Value};
 use std::{
+    collections::HashMap,
     io::{BufRead, Read},
     path::Path,
 };
@@ -14,6 +15,7 @@ pub(crate) fn read(home: &Path, id: &str) -> Result<Value, String> {
     }
     let mut turns = Vec::new();
     let mut turn = json!({"id":"native-history-0","items":[]});
+    let mut message_mirrors = HashMap::new();
     for (line, row) in std::io::BufReader::new(file)
         .take(crate::native_history::MAX_HISTORY_BYTES + 1)
         .lines()
@@ -79,14 +81,15 @@ pub(crate) fn read(home: &Path, id: &str) -> Result<Value, String> {
                         .or_else(|| payload.get("id").filter(|id| id.is_string()))
                         .cloned()
                         .unwrap_or_else(|| json!(format!("native-line-{line}")));
-                    upsert_item(&mut turn, item);
+                    upsert_transcript_item(&mut turn, item, false, &mut message_mirrors);
                 }
             }
             Some("event_msg") => {
                 let item = if payload["type"] == "item_completed" {
                     normalize_completed(&payload["item"])
                 } else {
-                    normalize_legacy_event(payload)
+                    normalize_message_event(payload, line)
+                        .or_else(|| normalize_legacy_event(payload))
                 };
                 if let Some(item) = item {
                     // Completed actions enrich their earlier response item by call identity.
@@ -94,7 +97,15 @@ pub(crate) fn read(home: &Path, id: &str) -> Result<Value, String> {
                     let target = payload["turn_id"]
                         .as_str()
                         .and_then(|id| turns.iter_mut().find(|turn: &&mut Value| turn["id"] == id));
-                    upsert_item(target.unwrap_or(&mut turn), item);
+                    upsert_transcript_item(
+                        target.unwrap_or(&mut turn),
+                        item,
+                        true,
+                        &mut message_mirrors,
+                    );
+                } else if payload["type"] == "task_started" {
+                    // A new task can follow an aborted task without an assistant reply.
+                    message_mirrors.remove(turn["id"].as_str().unwrap());
                 }
             }
             _ => {}
@@ -111,6 +122,76 @@ pub(crate) fn read(home: &Path, id: &str) -> Result<Value, String> {
         None,
         false,
     )
+}
+
+struct MessageMirror {
+    item: Value,
+    from_event: bool,
+}
+
+fn normalize_message_event(payload: &Value, line: usize) -> Option<Value> {
+    let (kind, field) = match payload["type"].as_str()? {
+        "user_message" => ("userMessage", "message"),
+        "task_complete" => ("agentMessage", "last_agent_message"),
+        _ => return None,
+    };
+    let text = payload[field].as_str().filter(|text| !text.is_empty())?;
+    let mut item = json!({"id":format!("native-line-{line}"),"type":kind});
+    if kind == "userMessage" {
+        item["content"] = json!([{"type":"input_text","text":text}]);
+    } else {
+        item["text"] = json!(text);
+    }
+    Some(item)
+}
+
+fn message_text(item: &Value) -> Option<String> {
+    match item["type"].as_str()? {
+        "userMessage" => Some(text_parts(&item["content"])),
+        "agentMessage" => Some(item["text"].as_str().unwrap_or("").to_owned()),
+        _ => None,
+    }
+}
+
+fn upsert_transcript_item(
+    turn: &mut Value,
+    item: Value,
+    from_event: bool,
+    mirrors: &mut HashMap<String, MessageMirror>,
+) {
+    let Some(text) = message_text(&item) else {
+        upsert_item(turn, item);
+        return;
+    };
+    let turn_id = turn["id"].as_str().unwrap().to_owned();
+    if let Some(previous) = mirrors.remove(&turn_id) {
+        if previous.from_event != from_event
+            && previous.item["type"] == item["type"]
+            && message_text(&previous.item).as_deref() == Some(text.as_str())
+        {
+            // Events mirror response messages, but use different ids. Keep the rich
+            // response item in either record order, pairing each occurrence once.
+            if !from_event {
+                if let Some(existing) = turn["items"]
+                    .as_array_mut()
+                    .unwrap()
+                    .iter_mut()
+                    .find(|old| old["id"] == previous.item["id"])
+                {
+                    *existing = item;
+                }
+            }
+            return;
+        }
+    }
+    mirrors.insert(
+        turn_id,
+        MessageMirror {
+            item: item.clone(),
+            from_event,
+        },
+    );
+    upsert_item(turn, item);
 }
 
 fn normalize_item(item: &Value) -> Option<Value> {
