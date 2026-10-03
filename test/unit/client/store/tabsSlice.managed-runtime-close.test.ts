@@ -408,10 +408,22 @@ describe('closeTab managed runtime visibility', () => {
   })
 
   it('keeps the pane open when terminal identity matches multiple managed views', async () => {
-    const primaryView = view('view-a', 0)
+    const primaryView = { ...view('view-a', 0), preferredPaneId: 'different-pane' }
     const otherViewOfSameSoul = { ...view('view-b', 1), soulId: primaryView.soulId, kind: 'explicit' as const }
     const current = inventory(8, [primaryView, otherViewOfSameSoul])
     const store = createStore(['view-a'], current)
+    store.dispatch(splitPane({
+      tabId: 'managed-tab',
+      paneId: 'managed-pane-0',
+      direction: 'vertical',
+      newPaneId: 'unrelated-pane',
+      newContent: {
+        kind: 'terminal',
+        createRequestId: 'unrelated-create',
+        status: 'running',
+        mode: 'shell',
+      },
+    }))
     store.dispatch(updatePaneContent({
       tabId: 'managed-tab',
       paneId: 'managed-pane-0',
@@ -428,7 +440,11 @@ describe('closeTab managed runtime visibility', () => {
     await store.dispatch(closeTab('managed-tab'))
 
     expect(store.getState().tabs.tabs).toHaveLength(1)
-    expect((store.getState().panes.layouts['managed-tab'] as any)?.content.closeError).toContain('managed view')
+    const layout = store.getState().panes.layouts['managed-tab']
+    expect(layout?.type).toBe('split')
+    expect(collectPaneContents(layout).some((content) => (
+      content.kind === 'terminal' && content.closeError?.includes('managed view')
+    ))).toBe(true)
     expect(apiMocks.updateManagedRuntimeViewVisibility).not.toHaveBeenCalled()
   })
 
@@ -801,13 +817,44 @@ describe('closeTab managed runtime visibility', () => {
     await store.dispatch(closeTab('explicit-tab'))
     expect(store.getState().tabs.tabs.map((tab) => tab.id)).toEqual(['managed-tab'])
     expect(store.getState().tabRegistry.reopenStack).toHaveLength(1)
+    expect(store.getState().panes.layouts['managed-tab']).toEqual(primaryLayoutBeforeClose)
+    expect(serverSnapshot.viewIntents.find((entry) => entry.viewId === 'explicit-view')?.visibility).toBe('detached')
+    expect(serverSnapshot.viewIntents.find((entry) => entry.viewId === 'primary-view')?.visibility).toBe('visible')
+    expect(apiMocks.updateManagedRuntimeViewVisibility).toHaveBeenCalledWith(
+      'explicit-view',
+      'detached',
+      explicitView.revision,
+      explicitView.soulIntentRevision,
+    )
+
+    await queueManagedRuntimeRefresh(store as any, 'after-detaching-explicit-sibling')
+    expect(store.getState().tabs.tabs.map((tab) => tab.id)).toEqual(['managed-tab'])
+    expect(serverSnapshot.viewIntents.find((entry) => entry.viewId === 'explicit-view')?.visibility).toBe('detached')
+    expect(store.getState().tabRegistry.reopenStack).toHaveLength(1)
+    expect(store.getState().tabs.tabs.some((tab) => tab.viewIntentId === 'explicit-view')).toBe(false)
+    expect(Object.values(store.getState().panes.layouts).flatMap((layout) => (
+      layout ? collectPaneContents(layout) : []
+    )).some((content) => (
+      content.kind === 'terminal' && content.viewIntentId === 'explicit-view'
+    ))).toBe(false)
+    const refreshedPrimaryLayout = store.getState().panes.layouts['managed-tab']
+    expect(refreshedPrimaryLayout?.type).toBe('leaf')
+    if (refreshedPrimaryLayout?.type === 'leaf' && refreshedPrimaryLayout.content.kind === 'terminal') {
+      expect(refreshedPrimaryLayout.content.viewIntentId).toBe('primary-view')
+      expect(refreshedPrimaryLayout.content.terminalId).toBe('terminal-soul-primary-view')
+    }
 
     const result = await store.dispatch(reopenClosedTab())
 
     expect(reopenClosedTab.fulfilled.match(result)).toBe(true)
     expect(store.getState().tabs.tabs.map((tab) => tab.id)).toHaveLength(2)
     expect(store.getState().tabs.tabs.find((tab) => tab.id === 'managed-tab')?.viewIntentId).toBe('primary-view')
-    expect(store.getState().panes.layouts['managed-tab']).toEqual(primaryLayoutBeforeClose)
+    const finalPrimaryLayout = store.getState().panes.layouts['managed-tab']
+    expect(finalPrimaryLayout?.type).toBe('leaf')
+    if (finalPrimaryLayout?.type === 'leaf' && finalPrimaryLayout.content.kind === 'terminal') {
+      expect(finalPrimaryLayout.content.viewIntentId).toBe('primary-view')
+      expect(finalPrimaryLayout.content.terminalId).toBe('terminal-soul-primary-view')
+    }
     const explicitTab = store.getState().tabs.tabs.find((tab) => tab.id !== 'managed-tab')!
     const reopenedContent = store.getState().panes.layouts[explicitTab.id]
     expect(reopenedContent?.type).toBe('leaf')
@@ -815,6 +862,53 @@ describe('closeTab managed runtime visibility', () => {
       expect(reopenedContent.content.viewIntentId).toBe('explicit-view')
     }
     expect(store.getState().tabRegistry.reopenStack).toHaveLength(0)
+  })
+
+  it('closes an unmarked preferred primary view without detaching its explicit sibling', async () => {
+    const primaryView = view('primary-view', 0)
+    const explicitView: ManagedRuntimeViewIntent = {
+      ...view('explicit-view', 1),
+      soulId: primaryView.soulId,
+      kind: 'explicit',
+      preferredTabId: 'explicit-tab',
+      preferredPaneId: 'explicit-pane',
+    }
+    let serverSnapshot = inventory(8, [primaryView, explicitView])
+    const store = createStore(['primary-view'], serverSnapshot)
+    store.dispatch(updatePaneContent({
+      tabId: 'managed-tab',
+      paneId: 'managed-pane-0',
+      content: {
+        kind: 'terminal',
+        terminalId: 'terminal-soul-primary-view',
+        createRequestId: 'create-soul-primary-view',
+        soulId: primaryView.soulId,
+        status: 'running',
+        mode: 'opencode',
+      },
+    }))
+    apiMocks.getManagedRuntimeInventory.mockImplementation(async () => serverSnapshot)
+    apiMocks.updateManagedRuntimeViewVisibility.mockImplementation(async (
+      viewId: string,
+      visibility: ManagedRuntimeViewIntent['visibility'],
+    ) => {
+      serverSnapshot = withVisibility(serverSnapshot, viewId, visibility)
+      return serverSnapshot.viewIntents.find((entry) => entry.viewId === viewId)
+    })
+
+    await store.dispatch(closeTab('managed-tab'))
+
+    expect(store.getState().tabs.tabs).toHaveLength(0)
+    expect(store.getState().tabRegistry.reopenStack).toHaveLength(1)
+    expect(serverSnapshot.viewIntents.find((entry) => entry.viewId === 'primary-view')?.visibility).toBe('detached')
+    expect(serverSnapshot.viewIntents.find((entry) => entry.viewId === 'explicit-view')?.visibility).toBe('visible')
+    expect(apiMocks.updateManagedRuntimeViewVisibility).toHaveBeenCalledTimes(1)
+    expect(apiMocks.updateManagedRuntimeViewVisibility).toHaveBeenCalledWith(
+      'primary-view',
+      'detached',
+      primaryView.revision,
+      primaryView.soulIntentRevision,
+    )
   })
 
   it('uses the saved tab view marker to resolve an unmarked pane after a sibling view is added', async () => {

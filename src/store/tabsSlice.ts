@@ -1489,9 +1489,101 @@ type ManagedViewResolution =
   | { kind: 'none'; viewIntentIds: [] }
   | { kind: 'unresolved'; viewIntentIds: string[] }
 
+export type ManagedLocalViewIdentityResolution = {
+  viewIntentIds: string[]
+  ambiguous: boolean
+}
+
+type ManagedLocalRuntimeIdentity = {
+  viewIntentId?: string
+  soulId?: string
+  terminalId?: string
+  createRequestId?: string
+}
+
+function managedSoulsForLocalIdentity(
+  identity: ManagedLocalRuntimeIdentity,
+  snapshot: ManagedRuntimeInventorySnapshot,
+): ManagedRuntimeSoul[] {
+  return snapshot.souls.filter((soul) => (
+    (identity.soulId && identity.soulId === soul.soulId)
+    || (identity.terminalId && identity.terminalId === soul.terminalId)
+    || (identity.createRequestId && identity.createRequestId === soul.terminalCreateRequestId)
+  ))
+}
+
+function resolveUnmarkedManagedLocalIdentity(
+  identity: ManagedLocalRuntimeIdentity,
+  snapshot: ManagedRuntimeInventorySnapshot,
+): ManagedLocalViewIdentityResolution {
+  const identityMatchedSouls = managedSoulsForLocalIdentity(identity, snapshot)
+  if (identityMatchedSouls.length > 1) {
+    const viewIntentIds = [...new Set(identityMatchedSouls.flatMap((soul) => (
+      snapshot.viewIntents.filter((view) => view.soulId === soul.soulId).map((view) => view.viewId)
+    )))]
+    return { viewIntentIds, ambiguous: true }
+  }
+  if (identityMatchedSouls.length === 0) return { viewIntentIds: [], ambiguous: false }
+
+  const matchedSoul = identityMatchedSouls[0]!
+  const soulViews = snapshot.viewIntents.filter((view) => view.soulId === matchedSoul.soulId)
+  if (soulViews.length !== 1 || soulViews[0]!.kind === 'explicit') {
+    return { viewIntentIds: soulViews.map((view) => view.viewId), ambiguous: soulViews.length > 0 }
+  }
+  return { viewIntentIds: [soulViews[0]!.viewId], ambiguous: false }
+}
+
+/** Resolve an unmarked local tab without aliasing sibling views of the same soul. */
+export function resolveManagedLocalTabViewIdentity(
+  identity: ManagedLocalRuntimeIdentity,
+  snapshot: ManagedRuntimeInventorySnapshot,
+): ManagedLocalViewIdentityResolution {
+  if (identity.viewIntentId) return { viewIntentIds: [identity.viewIntentId], ambiguous: false }
+  return resolveUnmarkedManagedLocalIdentity(identity, snapshot)
+}
+
+/** Resolve one local terminal without aliasing sibling views of the same soul. */
+export function resolveManagedLocalViewIdentity(
+  content: PaneContent,
+  snapshot: ManagedRuntimeInventorySnapshot,
+  tabViewIntentId?: string,
+  paneId?: string,
+  terminalPaneCount = 1,
+): ManagedLocalViewIdentityResolution {
+  if (!isManagedRuntimeProjection(content)) return { viewIntentIds: [], ambiguous: false }
+  if (content.viewIntentId) return { viewIntentIds: [content.viewIntentId], ambiguous: false }
+
+  if (tabViewIntentId) {
+    const tabViews = snapshot.viewIntents.filter((view) => view.viewId === tabViewIntentId)
+    if (tabViews.length > 1) return { viewIntentIds: [tabViewIntentId], ambiguous: true }
+    const tabView = tabViews[0]
+    if (terminalPaneCount === 1 || paneId === tabView?.preferredPaneId) {
+      if (tabView) {
+        const matchedSouls = managedSoulsForLocalIdentity(content, snapshot)
+        if (
+          matchedSouls.length > 0
+          && (matchedSouls.length !== 1 || matchedSouls[0]!.soulId !== tabView.soulId)
+        ) {
+          const inferredIdentity = resolveUnmarkedManagedLocalIdentity(content, snapshot)
+          return {
+            viewIntentIds: [...new Set([tabViewIntentId, ...inferredIdentity.viewIntentIds])],
+            ambiguous: true,
+          }
+        }
+      }
+      return tabView
+        ? { viewIntentIds: [tabViewIntentId], ambiguous: false }
+        : { viewIntentIds: [tabViewIntentId], ambiguous: true }
+    }
+  }
+
+  return resolveUnmarkedManagedLocalIdentity(content, snapshot)
+}
+
 function resolveManagedViewForTerminal(
   content: Extract<PaneContent, { kind: 'terminal' }>,
   snapshot: ManagedRuntimeInventorySnapshot,
+  fallbackViewIntentId?: string,
 ): ManagedViewResolution {
   if (content.viewIntentId) {
     const matches = snapshot.viewIntents.filter((view) => view.viewId === content.viewIntentId)
@@ -1510,9 +1602,24 @@ function resolveManagedViewForTerminal(
   if (matchedSouls.length > 1) return { kind: 'unresolved', viewIntentIds: [] }
 
   const matchedSoul = matchedSouls[0]
+  if (fallbackViewIntentId) {
+    const views = snapshot.viewIntents.filter((view) => view.viewId === fallbackViewIntentId)
+    if (views.length !== 1) return { kind: 'unresolved', viewIntentIds: [fallbackViewIntentId] }
+    const fallbackView = views[0]!
+    if (
+      (content.soulId && content.soulId !== fallbackView.soulId)
+      || (identityMatchedSouls.length > 0 && !identityMatchedSouls.some((soul) => soul.soulId === fallbackView.soulId))
+      || (matchedSoul && matchedSoul.soulId !== fallbackView.soulId)
+    ) {
+      return { kind: 'unresolved', viewIntentIds: [fallbackViewIntentId] }
+    }
+    return { kind: 'resolved', viewIntentIds: [fallbackViewIntentId] }
+  }
   if (matchedSoul) {
     const views = snapshot.viewIntents.filter((view) => view.soulId === matchedSoul.soulId)
-    if (views.length === 1) return { kind: 'resolved', viewIntentIds: [views[0]!.viewId] }
+    if (views.length === 1 && views[0]!.kind === 'automatic_primary') {
+      return { kind: 'resolved', viewIntentIds: [views[0]!.viewId] }
+    }
     return { kind: 'unresolved', viewIntentIds: views.map((view) => view.viewId) }
   }
 
@@ -1528,44 +1635,56 @@ function resolveManagedViewForTerminal(
   return { kind: 'none', viewIntentIds: [] }
 }
 
-function possibleManagedViewIdsForOtherRepresentation(
-  content: PaneContent,
-  snapshot: ManagedRuntimeInventorySnapshot,
-): string[] {
-  if (!isManagedRuntimeProjection(content)) return []
-  if (content.viewIntentId) return [content.viewIntentId]
-
-  const souls = content.soulId
-    ? snapshot.souls.filter((soul) => soul.soulId === content.soulId)
-    : snapshot.souls.filter((soul) => (
-      (content.terminalId && soul.terminalId === content.terminalId)
-      || (content.createRequestId && soul.terminalCreateRequestId === content.createRequestId)
-    ))
-  const soulIds = new Set(souls.map((soul) => soul.soulId))
-  return snapshot.viewIntents
-    .filter((view) => soulIds.has(view.soulId))
-    .map((view) => view.viewId)
-}
-
 function collectOtherLocalManagedViewIds(
   state: RootState,
   snapshot: ManagedRuntimeInventorySnapshot,
   targetTabId: string,
   targetPaneId?: string,
+  targetViewIntentIds: Set<string> = new Set(),
 ): Set<string> {
   const viewIntentIds = new Set<string>()
+  const addLayoutRepresentations = (
+    tabId: string,
+    layout: PaneNode,
+    tabViewIntentId?: string,
+  ) => {
+    if (tabId === targetTabId && !targetPaneId) return
+    const entries = collectPaneEntries(layout)
+    const terminalPaneCount = entries.filter(({ content }) => isManagedRuntimeProjection(content)).length
+    for (const entry of entries) {
+      if (tabId === targetTabId && entry.paneId === targetPaneId) continue
+      const identity = resolveManagedLocalViewIdentity(
+        entry.content,
+        snapshot,
+        tabViewIntentId,
+        entry.paneId,
+        terminalPaneCount,
+      )
+      if (identity.ambiguous && identity.viewIntentIds.some((id) => targetViewIntentIds.has(id))) {
+        throw new Error(MANAGED_VIEW_CLOSE_FAILED_MESSAGE)
+      }
+      for (const id of identity.viewIntentIds) viewIntentIds.add(id)
+    }
+  }
+
+  const representedLayoutTabIds = new Set<string>()
   for (const tab of state.tabs.tabs) {
     const layout = state.panes.layouts[tab.id]
-    if (tab.id !== targetTabId && !layout && tab.viewIntentId) viewIntentIds.add(tab.viewIntentId)
+    if (tab.id !== targetTabId && !layout) {
+      const identity = resolveManagedLocalTabViewIdentity(tab, snapshot)
+      if (identity.ambiguous && identity.viewIntentIds.some((id) => targetViewIntentIds.has(id))) {
+        throw new Error(MANAGED_VIEW_CLOSE_FAILED_MESSAGE)
+      }
+      for (const id of identity.viewIntentIds) viewIntentIds.add(id)
+      continue
+    }
+    if (!layout) continue
+    representedLayoutTabIds.add(tab.id)
+    addLayoutRepresentations(tab.id, layout, tab.viewIntentId)
   }
   for (const [tabId, layout] of Object.entries(state.panes.layouts)) {
-    if (tabId === targetTabId && !targetPaneId) continue
-    for (const entry of collectPaneEntries(layout)) {
-      if (tabId === targetTabId && entry.paneId === targetPaneId) continue
-      for (const viewIntentId of possibleManagedViewIdsForOtherRepresentation(entry.content, snapshot)) {
-        viewIntentIds.add(viewIntentId)
-      }
-    }
+    if (!layout || representedLayoutTabIds.has(tabId)) continue
+    addLayoutRepresentations(tabId, layout)
   }
   return viewIntentIds
 }
@@ -1573,30 +1692,27 @@ function collectOtherLocalManagedViewIds(
 function isManagedViewRepresentedLocally(
   state: RootState,
   view: ManagedRuntimeViewIntent,
-  soul: ManagedRuntimeSoul | undefined,
+  snapshot: ManagedRuntimeInventorySnapshot,
 ): boolean {
   for (const tab of state.tabs.tabs) {
     const layout = state.panes.layouts[tab.id]
     if (!layout) {
-      if (
-        tab.viewIntentId === view.viewId
-        || (!tab.viewIntentId && tab.soulId === view.soulId)
-        || (!tab.viewIntentId && soul?.terminalCreateRequestId === tab.createRequestId)
-      ) return true
+      const identity = resolveManagedLocalTabViewIdentity(tab, snapshot)
+      if (identity.viewIntentIds.includes(view.viewId)) return true
       continue
     }
-    for (const { content } of collectPaneEntries(layout)) {
+    const entries = collectPaneEntries(layout)
+    const terminalPaneCount = entries.filter(({ content }) => isManagedRuntimeProjection(content)).length
+    for (const { paneId, content } of entries) {
       if (!isManagedRuntimeProjection(content)) continue
-      if (content.viewIntentId) {
-        if (content.viewIntentId === view.viewId) return true
-        continue
-      }
-      if (content.soulId && content.soulId !== view.soulId) continue
-      if (
-        (content.soulId && content.soulId === view.soulId)
-        || (content.terminalId && content.terminalId === soul?.terminalId)
-        || (content.createRequestId && content.createRequestId === soul?.terminalCreateRequestId)
-      ) return true
+      const identity = resolveManagedLocalViewIdentity(
+        content,
+        snapshot,
+        tab.viewIntentId,
+        paneId,
+        terminalPaneCount,
+      )
+      if (identity.viewIntentIds.includes(view.viewId)) return true
     }
   }
   return false
@@ -1622,13 +1738,14 @@ function resolveManagedViewIntentsToRemove(
     ? collectPaneEntries(layout).filter((entry) => paneId === undefined || entry.paneId === paneId)
     : []
   const terminalTargets = targetEntries.filter((entry) => isManagedRuntimeProjection(entry.content))
+  const tabMarkerViewIntentId = tab?.viewIntentId
   const tabViewIntentId = !layout && paneId === undefined ? tab?.viewIntentId : undefined
   if (terminalTargets.length === 0 && !tabViewIntentId) return { viewIntentIds: [], paneIds: [] }
 
   const runtime = selectManagedRuntime(state)
   const hasKnownMarker = terminalTargets.some(({ content }) => (
     isManagedRuntimeProjection(content) && hasManagedRuntimeMarker(content)
-  )) || Boolean(tabViewIntentId)
+  )) || Boolean(tabMarkerViewIntentId)
   const unresolvedCreation = terminalTargets.some(({ content }) => (
     isManagedRuntimeProjection(content) && content.status === 'creating'
   ))
@@ -1659,9 +1776,26 @@ function resolveManagedViewIntentsToRemove(
       if (matches.length !== 1) throw new Error(MANAGED_VIEW_CLOSE_FAILED_MESSAGE)
       targetViewIntentIds.add(tabViewIntentId)
     }
+    const terminalEntries = layout
+      ? collectPaneEntries(layout).filter(({ content }) => isManagedRuntimeProjection(content))
+      : []
+    const tabMarkerMatches = tabMarkerViewIntentId
+      ? snapshot.viewIntents.filter((view) => view.viewId === tabMarkerViewIntentId)
+      : []
+    const tabMarkerView = tabMarkerMatches.length === 1 ? tabMarkerMatches[0] : undefined
+    const markedPaneId = tabMarkerView
+      ? terminalEntries.find(({ paneId: candidatePaneId }) => (
+        candidatePaneId === tabMarkerView.preferredPaneId
+      ))?.paneId ?? (terminalEntries.length === 1 ? terminalEntries[0]!.paneId : undefined)
+      : undefined
     for (const { paneId: targetPaneId, content } of terminalTargets) {
       if (!isManagedRuntimeProjection(content)) continue
-      const resolution = resolveManagedViewForTerminal(content, snapshot)
+      const fallbackViewIntentId = tabMarkerViewIntentId
+        && targetPaneId === markedPaneId
+        && !content.viewIntentId
+        ? tabMarkerViewIntentId
+        : undefined
+      const resolution = resolveManagedViewForTerminal(content, snapshot, fallbackViewIntentId)
       if (resolution.kind === 'unresolved') {
         paneIds.add(targetPaneId)
         throw Object.assign(new Error(MANAGED_VIEW_CLOSE_FAILED_MESSAGE), { paneIds: [...paneIds] })
@@ -1672,7 +1806,13 @@ function resolveManagedViewIntentsToRemove(
       }
     }
 
-    const otherRepresentations = collectOtherLocalManagedViewIds(state, snapshot, tabId, paneId)
+    const otherRepresentations = collectOtherLocalManagedViewIds(
+      state,
+      snapshot,
+      tabId,
+      paneId,
+      targetViewIntentIds,
+    )
     return {
       viewIntentIds: [...targetViewIntentIds].filter((viewIntentId) => !otherRepresentations.has(viewIntentId)),
       paneIds: [...paneIds],
@@ -2661,8 +2801,7 @@ export const detachManagedRuntimeView = createAsyncThunk(
       const targetView = matches[0]!
       const souls = snapshot.souls.filter((soul) => soul.soulId === targetView.soulId)
       if (souls.length !== 1) throw new Error(MANAGED_VIEW_CLOSE_FAILED_MESSAGE)
-      const targetSoul = souls[0]!
-      if (isManagedViewRepresentedLocally(getState() as RootState, targetView, targetSoul)) {
+      if (isManagedViewRepresentedLocally(getState() as RootState, targetView, snapshot)) {
         throw new Error(MANAGED_VIEW_CLOSE_FAILED_MESSAGE)
       }
       await persistManagedViewVisibility(
