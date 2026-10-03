@@ -6789,37 +6789,50 @@ describe('FreshAgentView', () => {
       ? 'Confirm the old process has stopped, then retry.' : 'The previous agent process could not be confirmed stopped. Check it before retrying recovery.')
   })
 
+  const retainedBeforeStartNewSnapshot = { status: 'idle', turns: [
+    { id: 'retained-turn', role: 'assistant', items: [{ id: 'retained-text', kind: 'text', text: 'Conversation retained before starting new' }] },
+  ] }
+
   it.each([
     ['freshclaude', 'claude'], ['kilroy', 'claude'], ['freshcodex', 'codex'], ['freshopencode', 'opencode'],
-  ] as const)('stops the persisted managed soul before replacing a restored %s conversation', async (sessionType, provider) => {
+  ] as const)('clears a failed close only after stopping the persisted managed soul and replacing a restored %s conversation', async (sessionType, provider) => {
     const store = createStore()
     let resolveStop!: (result: unknown) => void
     apiMock.stopManagedRuntimeSoul.mockReturnValueOnce(new Promise((resolve) => { resolveStop = resolve }))
+    apiMock.getFreshAgentThreadSnapshot.mockResolvedValue(retainedBeforeStartNewSnapshot)
     const content = {
       kind: 'fresh-agent' as const, sessionType, provider, createRequestId: 'lost-restored-create',
       sessionRef: { provider, sessionId: CLAUDE_RESTORE_THREAD_ID }, status: 'error' as const,
       soulId: 'persisted-lost-soul', soulIntentRevision: 17,
+      closeError: 'Previous close was not confirmed',
       recoverySummary: { desiredState: 'stopped' as const, recoveryState: 'lost' as const,
         durabilityState: 'resume_captured' as const, allocationState: 'verified_durable' as const },
     }
     store.dispatch(initLayout({ tabId: 'tab-1', paneId: 'pane-1', content }))
     render(<Provider store={store}><StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" /></Provider>)
+    expect(await screen.findByText('Conversation retained before starting new')).toBeInTheDocument()
+    expect(screen.getByText('Close failed: Previous close was not confirmed')).toBeInTheDocument()
     wsMock.send.mockClear()
 
     fireEvent.click(screen.getByRole('button', { name: 'Start new conversation' }))
     await waitFor(() => expect(apiMock.stopManagedRuntimeSoul).toHaveBeenCalledWith('persisted-lost-soul', 17))
     expect(getFreshAgentPaneContent(store)).toMatchObject(content)
+    expect(screen.getByText('Close failed: Previous close was not confirmed')).toBeInTheDocument()
+    expect(screen.getByText('Conversation retained before starting new')).toBeInTheDocument()
     expect(sentFreshAgentMessages('freshAgent.kill')).toHaveLength(0)
     expect(sentFreshAgentMessages('freshAgent.create')).toHaveLength(0)
     await act(async () => resolveStop({ outcome: 'verified_empty', soul: { soulId: 'persisted-lost-soul', intentRevision: 17 } }))
     await waitFor(() => expect(getFreshAgentPaneContent(store).createRequestId).not.toBe(content.createRequestId))
     expect(getFreshAgentPaneContent(store).soulId).toBeUndefined()
     expect(getFreshAgentPaneContent(store).sessionRef).toBeUndefined()
+    expect(getFreshAgentPaneContent(store).closeError).toBeUndefined()
+    expect(screen.queryByText('Close failed: Previous close was not confirmed')).toBeNull()
   })
 
   it.each(['termination_unconfirmed', 'blocked_ownership', 'backend_unavailable', 'http_failure', 'missing_revision', 'missing_soul'])(
     'retains a lost managed Fresh Agent and reports %s cleanup inline', async (outcome) => {
       const store = createStore()
+      apiMock.getFreshAgentThreadSnapshot.mockResolvedValue(retainedBeforeStartNewSnapshot)
       if (outcome === 'http_failure') apiMock.stopManagedRuntimeSoul.mockRejectedValueOnce(new Error('Server is unavailable'))
       else apiMock.stopManagedRuntimeSoul.mockResolvedValueOnce({ outcome, soul: { soulId: 'lost-soul', intentRevision: 9 } })
       const content = {
@@ -6828,16 +6841,26 @@ describe('FreshAgentView', () => {
         sessionRef: { provider: 'codex' as const, sessionId: 'lost-thread' }, status: 'error' as const,
         soulId: outcome === 'missing_soul' ? undefined : 'lost-soul',
         soulIntentRevision: outcome === 'missing_revision' ? undefined : 9,
+        closeError: 'Previous close was not confirmed',
         recoverySummary: { desiredState: 'stopped' as const, recoveryState: 'lost' as const,
           durabilityState: 'resume_captured' as const, allocationState: 'verified_durable' as const },
       }
-      store.dispatch(initLayout({ tabId: 'tab-1', paneId: 'pane-1', content }))
+      // Without a soul there is no native-history route. Load the existing
+      // conversation before its managed projection loses that identity.
+      store.dispatch(initLayout({ tabId: 'tab-1', paneId: 'pane-1', content: {
+        ...content, ...(outcome === 'missing_soul' ? { recoverySummary: undefined } : {}),
+      } }))
       render(<Provider store={store}><StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" /></Provider>)
+      expect(await screen.findByText('Conversation retained before starting new')).toBeInTheDocument()
+      if (outcome === 'missing_soul') act(() => store.dispatch(updatePaneContent({ tabId: 'tab-1', paneId: 'pane-1', content })))
+      expect(screen.getByText('Close failed: Previous close was not confirmed')).toBeInTheDocument()
       const retained = getFreshAgentPaneContent(store)
       wsMock.send.mockClear()
       fireEvent.click(screen.getByRole('button', { name: 'Start new conversation' }))
       expect(await screen.findByRole('status')).toHaveTextContent(outcome === 'http_failure' ? 'Server is unavailable' : 'Your conversation has been kept')
       expect(getFreshAgentPaneContent(store)).toMatchObject(retained)
+      expect(screen.getByText('Close failed: Previous close was not confirmed')).toBeInTheDocument()
+      expect(screen.getByText('Conversation retained before starting new')).toBeInTheDocument()
       expect(sentFreshAgentMessages('freshAgent.kill')).toHaveLength(0)
       expect(sentFreshAgentMessages('freshAgent.create')).toHaveLength(0)
     },
