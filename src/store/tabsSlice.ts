@@ -549,11 +549,55 @@ function collectPaneIds(node: PaneNode | undefined): string[] {
 
 type FrozenManagedViewProjection = {
   paneId: string
+  createRequestId?: string
   soulId?: string
   viewId: string
   viewRevision: number
   soulRevision: number
 }
+
+type ManagedViewCloseProjection = FrozenManagedViewProjection & {
+  canRepair: () => boolean
+  allowOlderRepairs: () => void
+}
+
+// Close ownership is ephemeral and belongs to one Redux store. A retry takes
+// its view only when it reaches the visibility transaction after evidence.
+const managedViewCloseOwners = new WeakMap<() => unknown, Map<string, { failed: boolean }>>()
+
+function ownManagedViewProjection(
+  projection: FrozenManagedViewProjection,
+  tabId: string,
+  getState: () => unknown,
+): ManagedViewCloseProjection {
+  let owners = managedViewCloseOwners.get(getState)
+  if (!owners) {
+    owners = new Map()
+    managedViewCloseOwners.set(getState, owners)
+  }
+  const owner = { failed: false }
+  owners.set(projection.viewId, owner)
+  return {
+    ...projection,
+    canRepair: () => {
+      const state = getState() as RootState
+      const layout = state.panes.layouts[tabId]
+      const content = layout ? findPaneContent(layout, projection.paneId) : undefined
+      if (
+        !content || (content.kind !== 'terminal' && content.kind !== 'fresh-agent')
+        || content.createRequestId !== projection.createRequestId
+        || content.viewIntentId !== projection.viewId || content.soulId !== projection.soulId
+      ) return false
+      // A newer pending visibility transaction decides visibility. If it
+      // fails and keeps the pane, older late outcomes can repair it again.
+      const latest = owners.get(projection.viewId)
+      return latest === owner || latest?.failed === true
+    },
+    allowOlderRepairs: () => { owner.failed = true },
+  }
+}
+
+class ManagedViewRepairSupersededError extends Error {}
 
 export const MANAGED_VIEW_DETACH_TIMEOUT_MS = KILL_ACK_TIMEOUT_MS
 /**
@@ -600,11 +644,12 @@ function logManagedRuntimeLateSettlementFailure(
 }
 
 function logManagedRuntimeUncertainOutcome(
-  projection: FrozenManagedViewProjection,
+  projection: ManagedViewCloseProjection,
   operation: 'detach' | 'rollback',
   phase: string,
   error?: unknown,
 ) {
+  if (!projection.canRepair()) return
   log.error('managed view visibility outcome is uncertain', {
     event: 'managed_view_visibility_uncertain_outcome',
     operation,
@@ -714,6 +759,19 @@ function updateManagedViewVisibilityWithSignal(
   )
 }
 
+function updateManagedViewRepairWithSignal(
+  projection: ManagedViewCloseProjection,
+  fence: ManagedViewRepairFence,
+  signal: AbortSignal,
+): Promise<ManagedRuntimeViewIntent> {
+  // The bounded request schedules its callback in a microtask, so check at
+  // the actual send as well as after each asynchronous read/response.
+  if (!projection.canRepair()) throw new ManagedViewRepairSupersededError()
+  return updateManagedViewVisibilityWithSignal(
+    projection.viewId, 'visible', fence.viewRevision, fence.soulRevision, signal,
+  )
+}
+
 /**
  * Freeze the managed-view fences carried by the panes before a close starts.
  * The pane projection is the last-known view identity for that exact layout;
@@ -742,6 +800,7 @@ function collectManagedViewProjections(
     if (!byViewId.has(content.viewIntentId)) {
       byViewId.set(content.viewIntentId, {
         paneId: node.id,
+        createRequestId: content.createRequestId,
         soulId: content.soulId,
         viewId: content.viewIntentId,
         viewRevision: content.viewIntentRevision,
@@ -765,11 +824,12 @@ type ManagedViewRepairFence = {
  * by one bounded authoritative read and a retry with current fences.
  */
 async function repairManagedViewFromAuthoritativeDetail(
-  projection: FrozenManagedViewProjection,
+  projection: ManagedViewCloseProjection,
   operation: 'detach' | 'rollback',
   authoritative: Awaited<ReturnType<typeof getManagedRuntimeSoul>>,
   previousError?: unknown,
 ): Promise<void> {
+  if (!projection.canRepair()) return
   const currentView = authoritative.viewIntents.find((view) => view.viewId === projection.viewId)
   if (!currentView) {
     log.error('managed view authoritative repair failed', {
@@ -803,22 +863,20 @@ async function repairManagedViewFromAuthoritativeDetail(
   try {
     const repaired = await awaitBoundedManagedRuntimeRequest(
       'managed view authoritative visibility repair',
-      (signal) => updateManagedViewVisibilityWithSignal(
-        currentView.viewId,
-        'visible',
-        currentView.revision,
-        authoritative.soul.intentRevision,
-        signal,
-      ),
+      (signal) => updateManagedViewRepairWithSignal(projection, {
+        viewRevision: currentView.revision,
+        soulRevision: authoritative.soul.intentRevision,
+      }, signal),
       {
         onGraceExpired: () => {
           logManagedRuntimeUncertainOutcome(projection, operation, 'authoritative_repair_grace_expired')
         },
         onLateSettlement: (outcome) => {
-          void repairManagedViewAfterLateOutcome(projection, operation, outcome)
+          return repairManagedViewAfterLateOutcome(projection, operation, outcome)
         },
       },
     )
+    if (!projection.canRepair()) return
     if (repaired.visibility === 'visible') return
     log.error('managed view authoritative repair failed', {
       event: 'managed_view_visibility_uncertain_outcome',
@@ -832,6 +890,7 @@ async function repairManagedViewFromAuthoritativeDetail(
       error: previousError ? managedRuntimeErrorMessage(previousError) : undefined,
     })
   } catch (error) {
+    if (error instanceof ManagedViewRepairSupersededError || !projection.canRepair()) return
     log.error('managed view authoritative repair failed', {
       event: 'managed_view_visibility_uncertain_outcome',
       operation,
@@ -845,10 +904,11 @@ async function repairManagedViewFromAuthoritativeDetail(
 }
 
 async function repairManagedViewAuthoritatively(
-  projection: FrozenManagedViewProjection,
+  projection: ManagedViewCloseProjection,
   operation: 'detach' | 'rollback',
   previousError?: unknown,
 ): Promise<void> {
+  if (!projection.canRepair()) return
   if (!projection.soulId) {
     log.error('managed view authoritative repair failed', {
       event: 'managed_view_visibility_uncertain_outcome',
@@ -871,6 +931,7 @@ async function repairManagedViewAuthoritatively(
           logManagedRuntimeUncertainOutcome(projection, operation, 'authoritative_read_grace_expired', previousError)
         },
         onLateSettlement: (outcome) => {
+          if (!projection.canRepair()) return
           if (!outcome.ok) {
             log.error('managed view authoritative repair failed', {
               event: 'managed_view_visibility_uncertain_outcome',
@@ -883,7 +944,7 @@ async function repairManagedViewAuthoritatively(
             })
             return
           }
-          void repairManagedViewFromAuthoritativeDetail(
+          return repairManagedViewFromAuthoritativeDetail(
             projection,
             operation,
             outcome.value,
@@ -894,6 +955,7 @@ async function repairManagedViewAuthoritatively(
     )
     await repairManagedViewFromAuthoritativeDetail(projection, operation, authoritative, previousError)
   } catch (error) {
+    if (!projection.canRepair()) return
     log.error('managed view authoritative repair failed', {
       event: 'managed_view_visibility_uncertain_outcome',
       operation,
@@ -907,10 +969,11 @@ async function repairManagedViewAuthoritatively(
 }
 
 async function repairManagedViewAfterLateOutcome(
-  projection: FrozenManagedViewProjection,
+  projection: ManagedViewCloseProjection,
   operation: 'detach' | 'rollback',
   outcome: ManagedRuntimeRequestOutcome<ManagedRuntimeViewIntent>,
 ): Promise<void> {
+  if (!projection.canRepair()) return
   if (!outcome.ok) {
     await repairManagedViewAuthoritatively(projection, operation, outcome.error)
     return
@@ -919,22 +982,20 @@ async function repairManagedViewAfterLateOutcome(
   try {
     const repaired = await awaitBoundedManagedRuntimeRequest(
       'managed view late visibility repair',
-      (signal) => updateManagedViewVisibilityWithSignal(
-        outcome.value.viewId,
-        'visible',
-        outcome.value.revision,
-        outcome.value.soulIntentRevision,
-        signal,
-      ),
+      (signal) => updateManagedViewRepairWithSignal(projection, {
+        viewRevision: outcome.value.revision,
+        soulRevision: outcome.value.soulIntentRevision,
+      }, signal),
       {
         onGraceExpired: () => {
           logManagedRuntimeUncertainOutcome(projection, operation, 'late_repair_grace_expired')
         },
         onLateSettlement: (lateOutcome) => {
-          void repairManagedViewAfterLateOutcome(projection, operation, lateOutcome)
+          return repairManagedViewAfterLateOutcome(projection, operation, lateOutcome)
         },
       },
     )
+    if (!projection.canRepair()) return
     if (repaired.visibility === 'visible') return
     await repairManagedViewAuthoritatively(
       projection,
@@ -942,38 +1003,36 @@ async function repairManagedViewAfterLateOutcome(
       new Error(`late repair returned ${repaired.visibility}`),
     )
   } catch (error) {
+    if (error instanceof ManagedViewRepairSupersededError || !projection.canRepair()) return
     await repairManagedViewAuthoritatively(projection, operation, error)
   }
 }
 
 async function repairManagedViewAfterTimeout(
-  projection: FrozenManagedViewProjection,
+  projection: ManagedViewCloseProjection,
   fence: ManagedViewRepairFence,
   operation: 'detach' | 'rollback',
 ): Promise<void> {
+  if (!projection.canRepair()) return
   let immediateError: unknown
   try {
     const repaired = await awaitBoundedManagedRuntimeRequest(
       'managed view visibility repair',
-      (signal) => updateManagedViewVisibilityWithSignal(
-        projection.viewId,
-        'visible',
-        fence.viewRevision,
-        fence.soulRevision,
-        signal,
-      ),
+      (signal) => updateManagedViewRepairWithSignal(projection, fence, signal),
       {
         onGraceExpired: () => {
           logManagedRuntimeUncertainOutcome(projection, operation, 'repair_grace_expired')
         },
         onLateSettlement: (outcome) => {
-          void repairManagedViewAfterLateOutcome(projection, operation, outcome)
+          return repairManagedViewAfterLateOutcome(projection, operation, outcome)
         },
       },
     )
+    if (!projection.canRepair()) return
     if (repaired.visibility === 'visible') return
     immediateError = new Error(`repair returned ${repaired.visibility}`)
   } catch (error) {
+    if (error instanceof ManagedViewRepairSupersededError || !projection.canRepair()) return
     immediateError = error
   }
 
@@ -981,7 +1040,7 @@ async function repairManagedViewAfterTimeout(
 }
 
 function managedViewTimeoutHooks(
-  projection: FrozenManagedViewProjection,
+  projection: ManagedViewCloseProjection,
   fence: ManagedViewRepairFence,
   operation: 'detach' | 'rollback',
 ): ManagedRuntimeRequestHooks<ManagedRuntimeViewIntent> {
@@ -994,7 +1053,7 @@ function managedViewTimeoutHooks(
       logManagedRuntimeUncertainOutcome(projection, operation, 'mutation_grace_expired')
     },
     onLateSettlement: (outcome) => {
-      void timeoutRepair.then(() => repairManagedViewAfterLateOutcome(projection, operation, outcome))
+      return timeoutRepair.then(() => repairManagedViewAfterLateOutcome(projection, operation, outcome))
     },
   }
 }
@@ -1004,13 +1063,19 @@ function managedViewTimeoutHooks(
  * later view refuses the mutation, use each successful response's new fences
  * to return its view to visible before the pane/tab can be removed. Every
  * timeout also starts a bounded late-outcome repair while the original
- * visibility mutation remains observable.
+ * visibility mutation remains observable. Other failed responses reconcile
+ * the failing view too, because a rejected response does not prove refusal.
  */
 async function detachManagedViews(
   projections: FrozenManagedViewProjection[],
+  tabId: string,
+  getState: () => unknown,
 ): Promise<boolean> {
-  const detached: Array<{ projection: FrozenManagedViewProjection; view: ManagedRuntimeViewIntent }> = []
-  for (const projection of projections) {
+  const detached: Array<{ projection: ManagedViewCloseProjection; view: ManagedRuntimeViewIntent }> = []
+  const owned: ManagedViewCloseProjection[] = []
+  for (const frozenProjection of projections) {
+    const projection = ownManagedViewProjection(frozenProjection, tabId, getState)
+    owned.push(projection)
     try {
       const view = await awaitBoundedManagedRuntimeRequest(
         'managed view visibility mutation',
@@ -1029,27 +1094,31 @@ async function detachManagedViews(
       detached.push({ projection, view })
     } catch (error) {
       log.warn('managed view detach refused during close; rolling back earlier detaches', {
+        event: 'managed_view_visibility_detach_unconfirmed',
         viewId: projection.viewId,
         paneId: projection.paneId,
         error: managedRuntimeErrorMessage(error),
       })
+      if (!isManagedRuntimeRequestTimeout(error)) {
+        // Transport and response-body failures can follow a committed PATCH
+        // just as a timeout can. Read current fences before compensating it.
+        await repairManagedViewAuthoritatively(projection, 'detach', error)
+      }
       for (const completed of [...detached].reverse()) {
         try {
           await awaitBoundedManagedRuntimeRequest(
             'managed view rollback mutation',
-            (signal) => updateManagedViewVisibilityWithSignal(
-              completed.view.viewId,
-              'visible',
-              completed.view.revision,
-              completed.view.soulIntentRevision,
-              signal,
-            ),
+            (signal) => updateManagedViewRepairWithSignal(completed.projection, {
+              viewRevision: completed.view.revision,
+              soulRevision: completed.view.soulIntentRevision,
+            }, signal),
             managedViewTimeoutHooks(completed.projection, {
               viewRevision: completed.view.revision,
               soulRevision: completed.view.soulIntentRevision,
             }, 'rollback'),
           )
         } catch (rollbackError) {
+          if (rollbackError instanceof ManagedViewRepairSupersededError || !completed.projection.canRepair()) continue
           if (!isManagedRuntimeRequestTimeout(rollbackError)) {
             log.error('managed view detach rollback failed after close refusal', {
               event: 'managed_view_visibility_rollback_failed',
@@ -1057,9 +1126,11 @@ async function detachManagedViews(
               paneId: completed.projection.paneId,
               error: managedRuntimeErrorMessage(rollbackError),
             })
+            await repairManagedViewAuthoritatively(completed.projection, 'rollback', rollbackError)
           }
         }
       }
+      for (const view of owned) view.allowOlderRepairs()
       return false
     }
   }
@@ -1272,7 +1343,7 @@ export const closePaneWithCleanup = createAsyncThunk(
           return
         }
       }
-      if (managedViews.length > 0 && !await detachManagedViews(managedViews)) {
+      if (managedViews.length > 0 && !await detachManagedViews(managedViews, tabId, getState)) {
         log.warn('managed view detach was not confirmed; the pane stays', { tabId, paneId })
         if (identity.length > 0) {
           surfacePaneCloseFailures(dispatch, tabId, identity.map((item) => ({ identity: item, timedOut: false })))
@@ -1391,7 +1462,7 @@ export const closeTab = createAsyncThunk(
           markPaneCloseEvidenceConfirmed(identity.createRequestId)
         }
       }
-      if (managedViews.length > 0 && !await detachManagedViews(managedViews)) {
+      if (managedViews.length > 0 && !await detachManagedViews(managedViews, tabId, getState)) {
         log.warn('managed view detach was not confirmed; the tab stays', { tabId })
         if (identities.length > 0) {
           surfacePaneCloseFailures(dispatch, tabId, identities.map((identity) => ({ identity, timedOut: false })))
@@ -1561,7 +1632,7 @@ export const replacePaneWithCleanup = createAsyncThunk(
           return
         }
       }
-      if (managedViews.length > 0 && !await detachManagedViews(managedViews)) {
+      if (managedViews.length > 0 && !await detachManagedViews(managedViews, tabId, getState)) {
         log.warn('managed view detach was not confirmed; the pane keeps its content', { tabId, paneId })
         if (identity.length > 0) {
           surfacePaneCloseFailures(dispatch, tabId, identity.map((item) => ({ identity: item, timedOut: false })))
