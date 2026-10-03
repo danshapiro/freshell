@@ -20,7 +20,9 @@ const BLOCKED_REASONS: Record<string, string> = {
 }
 
 export function managedRecoveryBlockedMessage(reason?: string): string {
-  const known = reason && BLOCKED_REASONS[reason.trim().toUpperCase()]
+  const code = reason?.trim().toUpperCase()
+  // The registry persists this verdict with a prefix; probes use RETRY_BUDGET.
+  const known = code && BLOCKED_REASONS[code === 'BLOCKED_RETRY_BUDGET' ? 'RETRY_BUDGET' : code]
   return known || (reason?.trim()
     ? `Recovery is blocked: ${reason.trim()}. Address this problem, then retry recovery.`
     : 'Recovery is still blocked. Check the provider, project folder, and saved conversation store, then retry recovery.')

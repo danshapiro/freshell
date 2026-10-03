@@ -1,3 +1,4 @@
+import { resolveFreshAgentRuntimeProvider } from '@shared/fresh-agent'
 import type { AppStore, RootState } from '@/store/store'
 import { addTab, updateTab } from '@/store/tabsSlice'
 import { initLayout, updatePaneContent } from '@/store/panesSlice'
@@ -99,9 +100,17 @@ export function managedProjectionFields(
   }
 }
 
+function clientProviderFor(soul: ManagedRuntimeSoul) {
+  // Kilroy is a distinct managed provider using the public Claude transport.
+  return soul.provider === 'kilroy' && soul.freshAgentSessionType === 'kilroy'
+    ? resolveFreshAgentRuntimeProvider(soul.freshAgentSessionType)
+    : soul.provider
+}
+
 function sessionRefFor(soul: ManagedRuntimeSoul) {
-  return soul.provider && soul.nativeSessionId
-    ? { provider: soul.provider, sessionId: soul.nativeSessionId }
+  const provider = clientProviderFor(soul)
+  return provider && soul.nativeSessionId
+    ? { provider, sessionId: soul.nativeSessionId }
     : undefined
 }
 
@@ -193,12 +202,14 @@ function paneMatchesView(
   if (soul.terminalCreateRequestId && content.createRequestId === soul.terminalCreateRequestId) {
     return true
   }
-  // Fresh runtime identity is available before the provider creates its
-  // durable native session. Adopt the originating pane through that window.
-  if (content.kind === 'fresh-agent' && soul.freshAgentSessionId
-    && content.sessionId === soul.freshAgentSessionId
-    && content.provider === soul.provider
-    && content.sessionType === soul.freshAgentSessionType) return true
+  // The persisted create request binds inventory before the created ack;
+  // the runtime session ID also supports older inventory after that ack.
+  const freshProvider = clientProviderFor(soul)
+  if (content.kind === 'fresh-agent'
+    && content.provider === freshProvider
+    && content.sessionType === soul.freshAgentSessionType
+    && ((soul.freshAgentCreateRequestId && content.createRequestId === soul.freshAgentCreateRequestId)
+      || (soul.freshAgentSessionId && content.sessionId === soul.freshAgentSessionId))) return true
   const sessionRef = sessionRefFor(soul)
   return Boolean(
     sessionRef

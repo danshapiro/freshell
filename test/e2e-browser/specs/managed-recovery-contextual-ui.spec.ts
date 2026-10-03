@@ -175,7 +175,8 @@ for (const kind of ['terminal', 'fresh-agent'] as const) {
     })
   })
 
-  test(`${kind}: lost identity remains until explicit start-new cleanup is verified`, async ({ freshellPage, page, terminal, harness }) => {
+  for (const deliveryOrder of (kind === 'fresh-agent' ? ['ack-first', 'inventory-first'] : ['ack-first'])) {
+  test(`${kind}: lost identity remains until explicit start-new cleanup is verified (${deliveryOrder})`, async ({ freshellPage, page, terminal, harness }) => {
     await terminal.waitForTerminal()
     const historyRead = kind === 'fresh-agent' ? page.waitForRequest(`**/api/runtime/souls/${SOUL_ID}/history`) : null
     await installPane(page, kind, 'lost')
@@ -256,27 +257,96 @@ for (const kind of ['terminal', 'fresh-agent'] as const) {
           executionGeneration: 1, launchState: 'running', cleanupState: 'none',
           desiredState: 'running', recoveryState: 'live', durabilityState: 'unknown', allocationState: 'allocated',
           provider: 'codex', freshAgentSessionId: runtimeSessionId, freshAgentSessionType: 'freshcodex',
+          freshAgentCreateRequestId: replacement.createRequestId,
           evidenceRevision: 0, successfulRecoveriesInWindow: 0 }],
         viewIntents: [{ viewId: 'new-contextual-view', soulId: newSoulId, ownerId: 'fixture-owner', workspaceId: 'fixture-workspace',
           kind: 'automatic_primary', preferredTabId: 'new-preferred-tab', preferredPaneId: 'new-preferred-pane',
           title: 'New conversation', placementGroup: '', visibility: 'visible', revision: 1, soulIntentRevision: 1,
           createdAt: 1, updatedAt: 1 }],
       } }))
-      await harness.receiveWsMessage({ type: 'freshAgent.created', requestId: replacement.createRequestId,
-        sessionId: runtimeSessionId, sessionType: 'freshcodex', provider: 'codex', runtimeProvider: 'codex' })
-      await expect.poll(async () => {
-        const content = await paneContent(page)
-        return content.kind === 'fresh-agent' ? content.sessionId : undefined
-      }).toBe(runtimeSessionId)
+      const acknowledge = async () => {
+        await harness.receiveWsMessage({ type: 'freshAgent.created', requestId: replacement.createRequestId,
+          sessionId: runtimeSessionId, sessionType: 'freshcodex', provider: 'codex', runtimeProvider: 'codex' })
+        await expect.poll(async () => {
+          const content = await paneContent(page)
+          return content.kind === 'fresh-agent' ? content.sessionId : undefined
+        }).toBe(runtimeSessionId)
+      }
+      if (deliveryOrder === 'ack-first') await acknowledge()
       await harness.receiveWsMessage({ type: 'runtime.inventory.changed', revision: inventoryRevision,
         readiness: { ...readiness, inventoryRevision } })
       await expect.poll(async () => (await paneContent(page)).soulId).toBe(newSoulId)
+      if (deliveryOrder === 'inventory-first') await acknowledge()
       expect(await page.evaluate(() => window.__FRESHELL_TEST_HARNESS__!.getState().tabs.tabs.map((tab) => tab.id))).toEqual(tabsBeforeInventory)
       expect(await paneContent(page)).toMatchObject({ kind: 'fresh-agent', sessionId: runtimeSessionId,
         createRequestId: replacement.createRequestId, viewIntentId: 'new-contextual-view' })
       const afterInventoryMessages = await harness.getSentWsMessages() as Array<{ type?: string }>
       expect(afterInventoryMessages.filter((message) => message.type === 'terminal.create')).toEqual([])
     }
+  })
+  }
+}
+
+for (const deliveryOrder of ['ack-first', 'inventory-first'] as const) {
+  test(`concurrent Fresh launches preserve their panes with ${deliveryOrder} inventory delivery`, async ({ freshellPage, page, terminal, harness }) => {
+    await terminal.waitForTerminal()
+    await page.route('**/api/fresh-agent/threads/**', (route) => route.fulfill({ status: 404, json: { message: 'Conversation is not yet available' } }))
+    const identity = await page.evaluate((model) => {
+      const harness = window.__FRESHELL_TEST_HARNESS__!
+      const state = harness.getState()
+      const tabId = state.tabs.activeTabId!
+      const paneId = state.panes.activePane[tabId]
+      const secondPaneId = 'concurrent-second-pane'
+      harness.setFreshAgentNetworkEffectsSuppressed(paneId, true)
+      harness.setFreshAgentNetworkEffectsSuppressed(secondPaneId, true)
+      const content = (createRequestId: string) => ({ kind: 'fresh-agent', sessionType: 'freshcodex', provider: 'codex',
+        createRequestId, status: 'creating', initialCwd: '/tmp', settingsDismissed: true, model, effort: 'low' })
+      harness.dispatch({ type: 'panes/updatePaneContent', payload: { tabId, paneId, content: content('concurrent-first-create') } })
+      harness.dispatch({ type: 'panes/splitPane', payload: { tabId, paneId, direction: 'horizontal',
+        newPaneId: secondPaneId, newContent: content('concurrent-second-create'), activate: false } })
+      harness.clearSentWsMessages?.()
+      return { tabId, paneIds: [paneId, secondPaneId], tabIds: state.tabs.tabs.map((tab) => tab.id) }
+    }, FRESHCODEX_DEFAULT_MODEL)
+    const inventoryRevision = 151
+    const keys = ['first', 'second']
+    await page.route(/\/api\/runtime\/souls(?:\?.*)?$/, (route) => route.fulfill({ json: {
+      revision: inventoryRevision, readiness: { ...readiness, inventoryRevision }, pendingProjectionCount: 0,
+      souls: [...keys].reverse().map((key) => ({ soulId: `concurrent-${key}-soul`, incarnationId: `concurrent-${key}-incarnation`,
+        intentRevision: 1, executionGeneration: 1, launchState: 'running', cleanupState: 'none',
+        desiredState: 'running', recoveryState: 'live', durabilityState: 'unknown', allocationState: 'allocated',
+        provider: 'codex', freshAgentSessionId: `concurrent-${key}-runtime`, freshAgentSessionType: 'freshcodex',
+        freshAgentCreateRequestId: `concurrent-${key}-create`, evidenceRevision: 0, successfulRecoveriesInWindow: 0 })),
+      viewIntents: [...keys].reverse().map((key) => ({ viewId: `concurrent-${key}-view`, soulId: `concurrent-${key}-soul`,
+        ownerId: 'fixture-owner', workspaceId: 'fixture-workspace', kind: 'automatic_primary',
+        preferredTabId: identity.tabId, preferredPaneId: `concurrent-${key}-preferred-pane`, title: 'Concurrent conversation',
+        placementGroup: '', visibility: 'visible', revision: 1, soulIntentRevision: 1, createdAt: 1, updatedAt: 1 })),
+    } }))
+    const readPanes = () => page.evaluate((tabId) => {
+      const root = window.__FRESHELL_TEST_HARNESS__!.getState().panes.layouts[tabId]
+      if (root?.type !== 'split') throw new Error('Expected two original panes')
+      return root.children.map((node) => {
+        if (node.type !== 'leaf') throw new Error('Expected original leaf')
+        return { id: node.id, content: node.content }
+      })
+    }, identity.tabId)
+    const acknowledge = async () => {
+      for (const key of keys) await harness.receiveWsMessage({ type: 'freshAgent.created', requestId: `concurrent-${key}-create`,
+        sessionId: `concurrent-${key}-runtime`, sessionType: 'freshcodex', provider: 'codex', runtimeProvider: 'codex' })
+      await expect.poll(async () => (await readPanes()).map((pane) => pane.content.kind === 'fresh-agent' ? pane.content.sessionId : undefined))
+        .toEqual(keys.map((key) => `concurrent-${key}-runtime`))
+    }
+    if (deliveryOrder === 'ack-first') await acknowledge()
+    await harness.receiveWsMessage({ type: 'runtime.inventory.changed', revision: inventoryRevision, readiness: { ...readiness, inventoryRevision } })
+    await expect.poll(async () => (await readPanes()).map((pane) => pane.content.soulId)).toEqual(keys.map((key) => `concurrent-${key}-soul`))
+    if (deliveryOrder === 'inventory-first') await acknowledge()
+    const panes = await readPanes()
+    for (const [index, key] of keys.entries()) expect(panes[index]).toMatchObject({ id: identity.paneIds[index], content: {
+      kind: 'fresh-agent', createRequestId: `concurrent-${key}-create`, sessionId: `concurrent-${key}-runtime`,
+      soulId: `concurrent-${key}-soul`, viewIntentId: `concurrent-${key}-view`,
+    } })
+    expect(await page.evaluate(() => window.__FRESHELL_TEST_HARNESS__!.getState().tabs.tabs.map((tab) => tab.id))).toEqual(identity.tabIds)
+    const messages = await harness.getSentWsMessages() as Array<{ type?: string }>
+    expect(messages.filter((message) => message.type === 'terminal.create')).toEqual([])
   })
 }
 
