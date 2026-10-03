@@ -1643,6 +1643,97 @@ fn verifies_a_repeated_git_tree_in_each_selected_session_workspace() {
 }
 
 #[test]
+fn blocks_snapshot_objects_available_only_through_a_nested_external_alternate() {
+    let fixture = TestDir::new("git-nested-alternate");
+    let workspace_mount = fixture.path().join("workspace");
+    let direct_alternate = workspace_mount.join(".alternate-objects.git");
+    let external_alternate = fixture.path().join("external-objects.git");
+    fs::create_dir_all(&workspace_mount).unwrap();
+    run_git_command(&workspace_mount, &["init", "-q"], None);
+    run_git_command(
+        &workspace_mount,
+        &["init", "--bare", "-q", direct_alternate.to_str().unwrap()],
+        None,
+    );
+    run_git_command(
+        &workspace_mount,
+        &["init", "--bare", "-q", external_alternate.to_str().unwrap()],
+        None,
+    );
+
+    let external_blob = run_git_command(
+        &workspace_mount,
+        &[
+            "--git-dir",
+            external_alternate.to_str().unwrap(),
+            "hash-object",
+            "-w",
+            "--stdin",
+        ],
+        Some(b"nested external snapshot blob"),
+    );
+    let tree = run_git_command(
+        &workspace_mount,
+        &["--git-dir", external_alternate.to_str().unwrap(), "mktree"],
+        Some(format!("100644 blob {}\tsnapshot.txt\n", external_blob.trim()).as_bytes()),
+    );
+
+    let direct_objects = direct_alternate.join("objects");
+    fs::write(
+        workspace_mount.join(".git/objects/info/alternates"),
+        format!("{}\n", direct_objects.display()),
+    )
+    .unwrap();
+    fs::write(
+        direct_objects.join("info/alternates"),
+        format!("{}/objects\n", external_alternate.display()),
+    )
+    .unwrap();
+    assert_eq!(
+        run_git_command(&workspace_mount, &["cat-file", "-t", tree.trim()], None).trim(),
+        "tree",
+        "the fixture must expose the tree only through the nested external store"
+    );
+    let tree_object_path = |objects: &Path| objects.join(&tree.trim()[..2]).join(&tree.trim()[2..]);
+    assert!(
+        !tree_object_path(&direct_objects).exists()
+            && !tree_object_path(&workspace_mount.join(".git/objects")).exists(),
+        "the referenced tree must exist only in the outside nested store"
+    );
+
+    let database = fixture.path().join("opencode.db");
+    let source = create_synthetic_source(&database);
+    source
+        .execute(
+            "UPDATE part SET data = ?1 WHERE id = 'part_ses_root'",
+            [serde_json::json!({"type":"snapshot", "snapshot":tree.trim()}).to_string()],
+        )
+        .unwrap();
+    drop(source);
+    let inventory = with_selected_workspace_mount(
+        HostOpenCodeInventory::new(fixture.path().join("unused.db"))
+            .with_channel_database(database),
+        workspace_mount,
+    );
+    let extraction_root = fixture.path().join("nested-alternate-extract");
+    let result = export_exact_session(
+        &inventory,
+        "ses_root",
+        ExportOptions::new(extraction_root.clone()),
+    );
+
+    assert!(
+        matches!(result, Err(TransferError::Blocked(_))),
+        "a nested alternate may not supply Git objects from outside the workspace mount"
+    );
+    assert_eq!(
+        fs::read_dir(extraction_root).unwrap().count(),
+        0,
+        "a blocked nested alternate must not publish a bundle"
+    );
+}
+
+#[test]
 fn verifies_snapshot_trees_through_an_accessible_alternate_store_and_blocks_missing_objects() {
     let fixture = TestDir::new("git-snapshot");
     let workspace_mount = fixture.path().join("workspace");
