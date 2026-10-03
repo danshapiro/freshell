@@ -314,6 +314,46 @@ afterEach(() => {
 })
 
 describe('closePaneWithCleanup — the acknowledged close gate (F2)', () => {
+  it.each(managedCloseCases.flatMap((closeCase) => [
+    { ...closeCase, identity: 'durable' },
+    { ...closeCase, identity: 'legacy' },
+  ]))('retains the panes and reports the actual close failure after a refused $name view update ($identity identity)', async ({ name, start, identity }) => {
+    let store = createManagedTwoPaneStore()
+    if (identity === 'legacy') {
+      const state = structuredClone(store.getState())
+      for (const { content } of collectPaneEntries(state.panes.layouts['tab-1'])) {
+        delete (content as { createRequestId?: string }).createRequestId
+      }
+      store = createStore(state)
+    }
+    installManagedViewBackend()
+    mockManagedRuntimeViewVisibility.mockRejectedValueOnce(new Error('managed view refusal'))
+
+    const close = start(store)
+    if (identity === 'durable') {
+      expect(mockManagedRuntimeViewVisibility).not.toHaveBeenCalled()
+      if (name === 'tab') ackPanesClosedBatches()
+      else ackAllPaneCloses()
+    }
+    await close
+
+    expect(store.getState().tabs.tabs.some((tab) => tab.id === 'tab-1')).toBe(true)
+    expect(paneContents(store, 'tab-1').map(({ paneId, content }) => [paneId, content.kind])).toEqual([
+      ['pane-1', 'terminal'],
+      ['pane-2', 'terminal'],
+    ])
+    const failedPaneIds = name === 'tab' ? ['pane-1', 'pane-2'] : ['pane-2']
+    expect(paneCloseErrors(store, 'tab-1')).toEqual(Object.fromEntries(
+      failedPaneIds.map((paneId) => [paneId, 'The pane could not be closed, so it was left open. Try again.']),
+    ))
+    expect(store.getState().panes.closingTabs?.['tab-1']).toBeUndefined()
+    expect(store.getState().panes.closingPanes?.['tab-1:pane-2']).toBeUndefined()
+    expect(mockManagedRuntimeViewVisibility.mock.calls[0]?.[1]).toBe('detached')
+    expect(sentCallsOf('pane.opened').map((message) => message.createRequestId)).toEqual(
+      identity === 'legacy' ? [] : name === 'tab' ? ['req-a', 'req-b'] : ['req-b'],
+    )
+  })
+
   it('bounds unacknowledged visible repair attempts and records the unresolved outcome', async () => {
     vi.useFakeTimers()
     const store = createManagedTwoPaneStore()
@@ -665,8 +705,8 @@ describe('closePaneWithCleanup — the acknowledged close gate (F2)', () => {
       expect.objectContaining({ createRequestId: 'req-b', tabId: 'tab-1' }),
     ])
     expect(paneCloseErrors(store, 'tab-1')).toEqual({
-      'pane-1': 'the pane close could not be recorded durably; the pane was left open',
-      'pane-2': 'the pane close could not be recorded durably; the pane was left open',
+      'pane-1': 'The pane could not be closed, so it was left open. Try again.',
+      'pane-2': 'The pane could not be closed, so it was left open. Try again.',
     })
   })
 
@@ -686,7 +726,7 @@ describe('closePaneWithCleanup — the acknowledged close gate (F2)', () => {
 
     expect(paneContents(store, 'tab-1').map((pane) => pane.paneId)).toEqual(['pane-1', 'pane-2'])
     expect(paneCloseErrors(store, 'tab-1')).toEqual({
-      'pane-2': 'the pane close could not be recorded durably; the pane was left open',
+      'pane-2': 'The pane could not be closed, so it was left open. Try again.',
     })
     expect(store.getState().panes.closingPanes?.['tab-1:pane-2']).toBeUndefined()
     expect(sentCallsOf('pane.opened')).toEqual([
@@ -712,8 +752,8 @@ describe('closePaneWithCleanup — the acknowledged close gate (F2)', () => {
     expect(paneContents(store, 'tab-1').map((pane) => pane.paneId)).toEqual(['pane-1', 'pane-2'])
     expect(store.getState().panes.closingTabs?.['tab-1']).toBeUndefined()
     expect(paneCloseErrors(store, 'tab-1')).toEqual({
-      'pane-1': 'the pane close could not be recorded durably; the pane was left open',
-      'pane-2': 'the pane close could not be recorded durably; the pane was left open',
+      'pane-1': 'The pane could not be closed, so it was left open. Try again.',
+      'pane-2': 'The pane could not be closed, so it was left open. Try again.',
     })
     expect(sentCallsOf('pane.opened')).toEqual([
       expect.objectContaining({ createRequestId: 'req-a', tabId: 'tab-1' }),
@@ -1883,7 +1923,7 @@ describe('replacePaneWithCleanup — the context-menu replace gate (F2)', () => 
     expect(paneContents(store, 'tab-1').find((pane) => pane.paneId === 'pane-2')?.content.kind).toBe('picker')
   })
 
-  it('managed refusal keeps the original content, surfaces the existing close error, and reasserts open', async () => {
+  it('managed refusal keeps the original content, surfaces the close failure, and reasserts open', async () => {
     mockGetManagedRuntimeSoul.mockResolvedValue(managedSoulDetail('view-b', 'visible', 3, 8))
     const store = createManagedTwoPaneStore()
     mockManagedRuntimeViewVisibility
@@ -1897,7 +1937,7 @@ describe('replacePaneWithCleanup — the context-menu replace gate (F2)', () => 
     const entry = paneContents(store, 'tab-1').find((pane) => pane.paneId === 'pane-2')
     expect(entry?.content.kind).toBe('terminal')
     expect((entry?.content as { closeError?: string }).closeError).toBe(
-      'the pane close could not be recorded durably; the pane was left open',
+      'The pane could not be closed, so it was left open. Try again.',
     )
     expect(store.getState().panes.closingPanes?.['tab-1:pane-2']).toBeUndefined()
     expect(sentCallsOf('pane.opened')).toEqual([
@@ -1922,7 +1962,7 @@ describe('replacePaneWithCleanup — the context-menu replace gate (F2)', () => 
     const entry = paneContents(store, 'tab-1').find((pane) => pane.paneId === 'pane-2')
     expect(entry?.content.kind).toBe('terminal')
     expect((entry?.content as { closeError?: string }).closeError).toBe(
-      'the pane close could not be recorded durably; the pane was left open',
+      'The pane could not be closed, so it was left open. Try again.',
     )
     expect(store.getState().panes.closingPanes?.['tab-1:pane-2']).toBeUndefined()
     expect(sentCallsOf('pane.opened')).toEqual([
