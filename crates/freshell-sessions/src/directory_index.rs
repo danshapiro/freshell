@@ -1169,6 +1169,15 @@ struct CachedSnapshot {
     codex_segment_paths: Arc<HashMap<String, Vec<PathBuf>>>,
 }
 
+/// Fields copied together from one published generation. The identity list
+/// stays behind an `Arc` here so consumers that only need rows and failures
+/// do not clone the full quarantine sidecar.
+type SnapshotRead = (
+    Arc<Vec<IndexedSession>>,
+    Vec<String>,
+    Arc<Vec<CodexUnresolvedIdentity>>,
+);
+
 /// Bookkeeping for the persistent parse-cache's opportunistic-save gating
 /// (module doc comment's "Persistent parse cache" section).
 #[derive(Default)]
@@ -1460,8 +1469,35 @@ impl SessionIndex {
     /// stale failures. Same stale-while-revalidate semantics as
     /// [`Self::snapshot`].
     pub async fn snapshot_with_failures(&self) -> (Arc<Vec<IndexedSession>>, Vec<String>) {
-        if let Some(pair) = self.cached_pair(true) {
-            return pair;
+        let (items, failures, _) = self.snapshot_read().await;
+        (items, failures)
+    }
+
+    /// [`Self::snapshot_with_failures`] plus unresolved Codex identity
+    /// evidence from the SAME published generation, copied under ONE lock
+    /// acquisition. Session-directory consumers that combine rows with
+    /// quarantine evidence must use this accessor rather than pairing
+    /// `snapshot_with_failures()` with `unresolved_codex_identities()`.
+    /// Stale-while-revalidate timing is unchanged: a stale snapshot is
+    /// returned immediately while refresh runs in the background, and only
+    /// a cold cache waits for its first refresh.
+    pub async fn snapshot_with_failures_and_unresolved_codex_identities(
+        &self,
+    ) -> (
+        Arc<Vec<IndexedSession>>,
+        Vec<String>,
+        Vec<CodexUnresolvedIdentity>,
+    ) {
+        let (items, failures, unresolved) = self.snapshot_read().await;
+        (items, failures, unresolved.as_ref().clone())
+    }
+
+    /// Return one coherent published generation, refreshing according to the
+    /// same cold-cache and stale-while-revalidate policy for all public
+    /// snapshot accessors.
+    async fn snapshot_read(&self) -> SnapshotRead {
+        if let Some(snapshot) = self.cached_snapshot_read(true) {
+            return snapshot;
         }
         // Stale or absent. Try to become this round's sweeper WITHOUT
         // blocking -- `try_lock_owned` never waits, so a caller that
@@ -1469,18 +1505,19 @@ impl SessionIndex {
         // in-flight sweep.
         match Arc::clone(&self.refresh_lock).try_lock_owned() {
             Ok(guard) => {
-                if let Some(stale) = self.cached_pair(false) {
+                if let Some(stale) = self.cached_snapshot_read(false) {
                     // Someone must read fresh data eventually, but not THIS
                     // caller, and not by blocking anyone else either.
                     self.spawn_background_refresh(guard);
                     return stale;
                 }
                 // Truly cold: nothing to serve, so wait for the (only) sweep.
-                self.run_refresh_inline(guard).await
+                let _ = self.run_refresh_inline(guard).await;
+                self.cached_snapshot_read(false).unwrap_or_default()
             }
             Err(_) => {
                 // Another caller is already sweeping this round.
-                if let Some(stale) = self.cached_pair(false) {
+                if let Some(stale) = self.cached_snapshot_read(false) {
                     return stale;
                 }
                 // Truly cold AND racing another cold-start caller: wait for
@@ -1488,9 +1525,9 @@ impl SessionIndex {
                 // B-T5's "N concurrent misses -> 1 sweep" guarantee for the
                 // cold-cache case).
                 let guard = self.refresh_lock.lock().await;
-                let pair = self
-                    .cached_pair(true)
-                    .or_else(|| self.cached_pair(false))
+                let snapshot = self
+                    .cached_snapshot_read(true)
+                    .or_else(|| self.cached_snapshot_read(false))
                     .unwrap_or_default();
                 drop(guard);
                 // D5-1: this caller held `refresh_lock` (however briefly),
@@ -1522,7 +1559,7 @@ impl SessionIndex {
                         .await;
                     }
                 }
-                pair
+                snapshot
             }
         }
     }
@@ -1561,6 +1598,15 @@ impl SessionIndex {
     /// await point). `require_fresh` applies the TTL window; `false` is the
     /// stale-while-revalidate read.
     fn cached_pair(&self, require_fresh: bool) -> Option<(Arc<Vec<IndexedSession>>, Vec<String>)> {
+        self.cached_snapshot_read(require_fresh)
+            .map(|(items, failures, _)| (items, failures))
+    }
+
+    /// The cached rows, scan failures, and unresolved Codex identities from
+    /// the SAME generation, read under ONE lock acquisition. The identity
+    /// `Arc` is cloned while the snapshot lock is held; the published vector
+    /// itself is immutable thereafter.
+    fn cached_snapshot_read(&self, require_fresh: bool) -> Option<SnapshotRead> {
         let guard = self.snapshot.lock().unwrap();
         match guard.as_ref() {
             Some(c) if !require_fresh || c.fetched_at.elapsed() < self.ttl => {
@@ -1577,7 +1623,11 @@ impl SessionIndex {
                         return None;
                     }
                 }
-                Some((Arc::clone(&c.items), sorted_names(&c.scan_failures)))
+                Some((
+                    Arc::clone(&c.items),
+                    sorted_names(&c.scan_failures),
+                    Arc::clone(&c.unresolved_codex_identities),
+                ))
             }
             _ => None,
         }
@@ -4521,6 +4571,63 @@ pub(crate) mod tests {
             }],
             "the hidden member prevents partial composition and remains available to quarantine"
         );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[tokio::test]
+    async fn snapshot_with_codex_identity_evidence_returns_one_coherent_generation() {
+        let home = unique_temp_dir("codex-continuation-snapshot-generation");
+        let (older, newer) = codex_continuation_fixtures();
+        let (older_path, newer_path) = write_codex_pair(
+            &home,
+            &older,
+            &newer.replace("\"cwd\":\"/sanitized/project\",", ""),
+        );
+        let source = Arc::new(CodexSource::new(home.join(".codex")));
+        let index =
+            SessionIndex::with_ttl_and_cache_path(vec![source], Duration::from_secs(60), None);
+
+        let (rows, failures, unresolved) = index
+            .snapshot_with_failures_and_unresolved_codex_identities()
+            .await;
+        assert_eq!(rows.len(), 1, "the cwd-less segment is evidence-only");
+        assert!(failures.is_empty());
+        assert_eq!(rows[0].source_file.as_deref(), Some(older_path.as_path()));
+        assert_eq!(
+            unresolved,
+            vec![CodexUnresolvedIdentity {
+                session_id: "b7936c10-4935-441c-837c-c1f33cafec2d".to_string(),
+                paths: vec![newer_path.clone(), older_path.clone()],
+            }],
+            "rows and identity evidence must come from the same published generation"
+        );
+
+        std::fs::remove_file(&newer_path).unwrap();
+        index.mark_provider_dirty("codex");
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let (rows, failures, unresolved) = index
+                .snapshot_with_failures_and_unresolved_codex_identities()
+                .await;
+            if unresolved.is_empty() {
+                assert!(failures.is_empty());
+                assert_eq!(rows.len(), 1);
+                assert_eq!(rows[0].source_file.as_deref(), Some(older_path.as_path()));
+                break;
+            }
+            assert_eq!(rows.len(), 1, "stale reads must stay on the old generation");
+            assert!(failures.is_empty());
+            assert_eq!(
+                unresolved[0].paths,
+                vec![newer_path.clone(), older_path.clone()]
+            );
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the recovery generation must be published after the dirty refresh"
+            );
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+
         std::fs::remove_dir_all(&home).ok();
     }
 
