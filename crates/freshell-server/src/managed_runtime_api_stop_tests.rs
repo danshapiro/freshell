@@ -97,20 +97,38 @@ fn limits() -> RuntimeLimits {
 }
 
 async fn fixture_soul(root: &std::path::Path, certify_loss: bool) -> (Registry, RuntimeView) {
+    fixture_fresh_soul(
+        root,
+        certify_loss,
+        "opencode",
+        "freshopencode",
+        "retained-thread",
+    )
+    .await
+}
+
+async fn fixture_fresh_soul(
+    root: &std::path::Path,
+    certify_loss: bool,
+    provider: &str,
+    session_type: &str,
+    native_id: &str,
+) -> (Registry, RuntimeView) {
     let registry = Registry::open(root, None).unwrap();
     let soul_id = SoulId::new();
     let fresh_agent: FreshAgentLaunchSpec = serde_json::from_value(json!({
-        "sessionId": "fresh-retained-thread", "provider": "opencode", "sessionType": "freshopencode",
-        "runtimeVariant": "opencode", "providerStoreId": "store-test", "cwd": "/workspace",
+        "sessionId": "fresh-retained-thread", "provider": provider, "sessionType": session_type,
+        "runtimeVariant": provider, "providerStoreId": "store-test", "cwd": "/workspace",
         "workspacePath": "/workspace", "runAsUid": 1000, "runAsGid": 1000,
-        "nativeSessionId": "retained-thread"
-    })).unwrap();
+        "nativeSessionId": native_id
+    }))
+    .unwrap();
     let prepared = registry
         .prepare_launch(LaunchPreparation {
             soul_id: soul_id.clone(),
-            provider: "opencode".into(),
+            provider: provider.into(),
             provider_store_id: "store-test".into(),
-            native_session_id: Some("retained-thread".into()),
+            native_session_id: Some(native_id.into()),
             creation_seed_ref: "seed-test".into(),
             request_id: RequestId::new(),
             payload_digest: "payload-test".into(),
@@ -560,5 +578,72 @@ async fn unavailable_runtime_and_invalid_mutation_keep_their_http_error_contract
             serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
                 .unwrap();
         assert_eq!(body, json!({"error":error}));
+    }
+}
+
+#[tokio::test]
+async fn restored_api_reads_managed_claude_and_kilroy_native_history_without_an_actor() {
+    for (provider, session_type) in [("claude", "freshclaude"), ("kilroy", "kilroy")] {
+        let temp = tempfile::tempdir().unwrap();
+        let id = "44444444-4444-4444-8444-444444444444";
+        let (registry, before) =
+            fixture_fresh_soul(temp.path(), false, provider, session_type, id).await;
+        registry
+            .mark_recovery_blocked(
+                before.soul_id.clone(),
+                None,
+                RecoveryBlockReason::StoreUnreadable,
+                vec!["fixture native store temporarily unavailable".into()],
+            )
+            .await
+            .unwrap();
+        let handle = registry.begin_stop(before.soul_id.clone()).await.unwrap();
+        registry
+            .mark_stop_outcome(handle.incarnation_id().clone(), StopOutcome::VerifiedEmpty)
+            .await
+            .unwrap();
+        let before = registry.inventory().await.unwrap().pop().unwrap();
+        assert_eq!(before.desired_state, DesiredState::Stopped);
+        let home = temp.path().join("owned-provider-store");
+        let directory = home.join(".claude/projects/-workspace");
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::write(
+            directory.join(format!("{id}.jsonl")),
+            include_str!("../../../test/fixtures/managed-native-history/claude.jsonl"),
+        )
+        .unwrap();
+        let backend = Arc::new(StopBackend {
+            history_home: Some(home),
+            ..Default::default()
+        });
+        let (socket, control) = start_control(temp.path(), registry.clone(), backend.clone()).await;
+        drop(web_router(&socket, temp.path()).await);
+        let response = web_router(&socket, temp.path())
+            .await
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/runtime/souls/{}/history", before.soul_id))
+                    .header("x-auth-token", "web-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: serde_json::Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(body["threadId"], id);
+        assert_eq!(body["sessionType"], session_type);
+        assert_eq!(body["provider"], "claude");
+        assert!(body["turns"]
+            .to_string()
+            .contains("Saved native Claude answer"));
+        assert!(body["turns"].to_string().contains("toolu_native"));
+        assert_eq!(body["capabilities"]["send"], false);
+        assert_eq!(registry.inventory().await.unwrap().pop().unwrap(), before);
+        assert!(backend.stopped.lock().unwrap().is_empty());
+        control.abort();
+        let _ = control.await;
     }
 }

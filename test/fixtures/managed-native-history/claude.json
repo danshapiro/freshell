@@ -1,0 +1,105 @@
+{
+  "sessionType": "freshclaude",
+  "provider": "claude",
+  "threadId": "44444444-4444-4444-8444-444444444444",
+  "sessionId": "44444444-4444-4444-8444-444444444444",
+  "revision": 0,
+  "latestTurnId": "native-tool-result",
+  "status": "idle",
+  "capabilities": {
+    "send": false,
+    "interrupt": false,
+    "approvals": false,
+    "questions": false,
+    "fork": false,
+    "undo": false,
+    "redo": false,
+    "settingScopes": {
+      "model": "per-send",
+      "effort": "per-send",
+      "permissionMode": "per-send",
+      "sandbox": "unsupported"
+    }
+  },
+  "tokenUsage": {
+    "inputTokens": 0,
+    "outputTokens": 0,
+    "totalTokens": 0
+  },
+  "pendingApprovals": [],
+  "pendingQuestions": [],
+  "worktrees": [],
+  "diffs": [],
+  "childThreads": [],
+  "turns": [
+    {
+      "id": "native-user",
+      "turnId": "native-user",
+      "ordinal": 0,
+      "source": "durable",
+      "role": "user",
+      "timestamp": "2026-10-03T10:00:00Z",
+      "summary": "Saved native user prompt",
+      "summaryKind": "echo",
+      "items": [
+        {
+          "id": "native-user-i0",
+          "kind": "text",
+          "text": "Saved native user prompt"
+        }
+      ]
+    },
+    {
+      "id": "native-answer",
+      "turnId": "native-answer",
+      "messageId": "msg_native",
+      "ordinal": 1,
+      "source": "durable",
+      "role": "assistant",
+      "timestamp": "2026-10-03T10:00:01Z",
+      "summary": "Saved native Claude answer",
+      "summaryKind": "echo",
+      "items": [
+        {
+          "id": "native-answer-i0",
+          "kind": "text",
+          "text": "Saved native Claude answer"
+        },
+        {
+          "id": "native-answer-i1",
+          "kind": "tool_use",
+          "toolUseId": "toolu_native",
+          "name": "Bash",
+          "input": {
+            "command": "pwd"
+          }
+        }
+      ]
+    },
+    {
+      "id": "native-tool-result",
+      "turnId": "native-tool-result",
+      "ordinal": 2,
+      "source": "durable",
+      "role": "user",
+      "timestamp": "2026-10-03T10:00:02Z",
+      "summary": "Tool result",
+      "summaryKind": "echo",
+      "items": [
+        {
+          "id": "native-tool-result-i0",
+          "kind": "tool_result",
+          "toolUseId": "toolu_native",
+          "content": "/workspace",
+          "isError": false
+        }
+      ]
+    }
+  ],
+  "extensions": {
+    "claude": {
+      "ownerKind": "vacant",
+      "nativeHistoryAvailable": true
+    }
+  }
+}

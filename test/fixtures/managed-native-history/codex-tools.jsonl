@@ -1,0 +1,10 @@
+{"type": "session_meta", "payload": {"id": "rich-tools", "cwd": "/workspace", "history_mode": "paginated"}}
+{"type": "turn_context", "payload": {"turn_id": "native-turn"}}
+{"type": "response_item", "payload": {"type": "message", "id": "user-native", "role": "user", "content": [{"type": "input_text", "text": "Saved coding request"}]}}
+{"type": "response_item", "payload": {"type": "custom_tool_call", "id": "response-custom", "call_id": "custom-1", "name": "apply_patch", "input": "*** Begin Patch\n*** End Patch"}}
+{"type": "response_item", "payload": {"type": "custom_tool_call_output", "call_id": "custom-1", "output": [{"type": "input_text", "text": "Patch saved"}]}}
+{"type": "response_item", "payload": {"type": "web_search_call", "id": "search-1", "status": "completed", "action": {"type": "search", "query": "SQLite WAL"}}}
+{"type": "response_item", "payload": {"type": "image_generation_call", "id": "image-1", "status": "completed", "result": "saved-image", "revised_prompt": "diagram"}}
+{"type": "event_msg", "payload": {"type": "item_completed", "turn_id": "native-turn", "item": {"type": "CommandExecution", "id": "command-1", "command": ["pwd"], "cwd": "/workspace", "status": "completed", "aggregated_output": "/workspace", "exit_code": 0}}}
+{"type": "event_msg", "payload": {"type": "item_completed", "turn_id": "native-turn", "item": {"type": "DynamicToolCall", "id": "custom-1", "tool": "apply_patch", "arguments": "*** Begin Patch\n*** End Patch", "status": "completed", "content_items": [{"type": "inputText", "text": "Patch saved"}], "success": true}}}
+{"type": "event_msg", "payload": {"type": "item_completed", "turn_id": "native-turn", "item": {"type": "McpToolCall", "id": "mcp-1", "server": "fixture", "tool": "lookup", "arguments": {"query": "saved"}, "status": "completed", "result": {"content": [{"type": "text", "text": "MCP saved result"}]}}}}

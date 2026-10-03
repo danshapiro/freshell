@@ -22,6 +22,7 @@ fn history(home: &Path, provider: &str, session: &str) -> std::process::Output {
             "--provider-home",
         ])
         .arg(home)
+        .env("CLAUDE_CMD", &probe)
         .env("CODEX_CMD", &probe)
         .env("OPENCODE_CMD", &probe)
         .output()
@@ -134,70 +135,260 @@ fn history_binary_keeps_codex_tool_output_with_its_invocation() {
 
 #[test]
 fn history_binary_reads_exact_saved_opencode_rows_without_a_daemon() {
-    let home = tempfile::tempdir().unwrap();
-    let directory = home.path().join(".local/share/opencode");
-    std::fs::create_dir_all(&directory).unwrap();
-    let db = Connection::open(directory.join("opencode.db")).unwrap();
-    db.execute_batch("CREATE TABLE session (id TEXT PRIMARY KEY, title TEXT, directory TEXT, time_created INTEGER, time_updated INTEGER, revert TEXT);
+    for journal_mode in ["DELETE", "WAL"] {
+        let home = tempfile::tempdir().unwrap();
+        let directory = home.path().join(".local/share/opencode");
+        std::fs::create_dir_all(&directory).unwrap();
+        let db = Connection::open(directory.join("opencode.db")).unwrap();
+        db.pragma_update(None, "journal_mode", journal_mode)
+            .unwrap();
+        db.execute_batch("CREATE TABLE session (id TEXT PRIMARY KEY, title TEXT, directory TEXT, time_created INTEGER, time_updated INTEGER, revert TEXT);
         CREATE TABLE message (id TEXT PRIMARY KEY, session_id TEXT, time_created INTEGER, data TEXT);
         CREATE TABLE part (id TEXT PRIMARY KEY, session_id TEXT, message_id TEXT, time_created INTEGER, data TEXT);").unwrap();
-    for (id, text) in [
-        ("ses_selected", "Saved OpenCode answer"),
-        ("ses_other", "Other conversation must not appear"),
-    ] {
-        db.execute(
-            "INSERT INTO session VALUES (?1,'Saved name','/workspace',1,2,NULL)",
-            [id],
-        )
-        .unwrap();
-        for (message, role, text) in [
-            (format!("{id}-user"), "user", "Saved user prompt"),
-            (format!("{id}-assistant"), "assistant", text),
+        for (id, text) in [
+            ("ses_selected", "Saved OpenCode answer"),
+            ("ses_other", "Other conversation must not appear"),
         ] {
             db.execute(
-                "INSERT INTO message VALUES (?1,?2,?3,?4)",
-                rusqlite::params![
-                    message,
-                    id,
-                    if role == "user" { 1 } else { 2 },
-                    json!({"role":role,"time":{"created":1,"completed":2}}).to_string()
-                ],
+                "INSERT INTO session VALUES (?1,'Saved name','/workspace',1,2,NULL)",
+                [id],
             )
             .unwrap();
-            db.execute(
-                "INSERT INTO part VALUES (?1,?2,?3,1,?4)",
-                rusqlite::params![
-                    format!("{message}-text"),
-                    id,
-                    message,
-                    json!({"type":"text","text":text}).to_string()
-                ],
-            )
-            .unwrap();
+            for (message, role, text) in [
+                (format!("{id}-user"), "user", "Saved user prompt"),
+                (format!("{id}-assistant"), "assistant", text),
+            ] {
+                db.execute(
+                    "INSERT INTO message VALUES (?1,?2,?3,?4)",
+                    rusqlite::params![
+                        message,
+                        id,
+                        if role == "user" { 1 } else { 2 },
+                        json!({"role":role,"time":{"created":1,"completed":2}}).to_string()
+                    ],
+                )
+                .unwrap();
+                db.execute(
+                    "INSERT INTO part VALUES (?1,?2,?3,1,?4)",
+                    rusqlite::params![
+                        format!("{message}-text"),
+                        id,
+                        message,
+                        json!({"type":"text","text":text}).to_string()
+                    ],
+                )
+                .unwrap();
+            }
         }
+        drop(db);
+        let before = std::fs::read(directory.join("opencode.db")).unwrap();
+        if journal_mode == "WAL" {
+            assert_eq!(&before[18..20], &[2, 2]);
+        }
+        assert!(!directory.join("opencode.db-wal").exists());
+        assert!(!directory.join("opencode.db-shm").exists());
+        let result = history(home.path(), "opencode", "ses_selected");
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        let body: Value = serde_json::from_slice(&result.stdout).unwrap();
+        assert_eq!(body["threadId"], "ses_selected");
+        assert_eq!(body["turns"].as_array().unwrap().len(), 2);
+        assert_eq!(body["turns"][0]["items"][0]["text"], "Saved user prompt");
+        assert_eq!(
+            body["turns"][1]["items"][0]["text"],
+            "Saved OpenCode answer"
+        );
+        assert_eq!(body["capabilities"]["send"], false);
+        assert_eq!(
+            std::fs::read(directory.join("opencode.db")).unwrap(),
+            before
+        );
+        assert!(!directory.join("opencode.db-wal").exists());
+        assert!(!directory.join("opencode.db-shm").exists());
+        assert!(!history(home.path(), "opencode", "missing-session")
+            .status
+            .success());
     }
-    drop(db);
-    let before = std::fs::read(directory.join("opencode.db")).unwrap();
-    let result = history(home.path(), "opencode", "ses_selected");
+}
+
+#[test]
+fn history_binary_reads_managed_claude_transcript_and_tools_from_exact_provider_home() {
+    let home = tempfile::tempdir().unwrap();
+    let directory = home.path().join(".claude/projects/-workspace");
+    std::fs::create_dir_all(&directory).unwrap();
+    let id = "44444444-4444-4444-8444-444444444444";
+    let native = include_str!("../../../test/fixtures/managed-native-history/claude.jsonl");
+    std::fs::write(directory.join(format!("{id}.jsonl")), native).unwrap();
+    std::fs::write(
+        directory.join("foreign.jsonl"),
+        native.replace("Saved native Claude answer", "Foreign history"),
+    )
+    .unwrap();
+    for provider in ["claude", "kilroy"] {
+        let result = history(home.path(), provider, id);
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        let body: Value = serde_json::from_slice(&result.stdout).unwrap();
+        assert_eq!(body["threadId"], id);
+        assert_eq!(body["provider"], "claude");
+        let captured: Value = serde_json::from_str(include_str!(
+            "../../../test/fixtures/managed-native-history/claude.json"
+        ))
+        .unwrap();
+        assert_eq!(body["turns"], captured["turns"]);
+        assert!(result
+            .stdout
+            .windows(b"Saved native Claude answer".len())
+            .any(|part| part == b"Saved native Claude answer"));
+        assert!(body["turns"].to_string().contains("toolu_native"));
+        assert!(body["turns"].to_string().contains("/workspace"));
+        assert!(!body.to_string().contains("Foreign history"));
+        assert_eq!(body["capabilities"]["send"], false);
+        assert_eq!(
+            std::fs::read_to_string(directory.join(format!("{id}.jsonl"))).unwrap(),
+            native
+        );
+    }
+    assert!(!history(home.path(), "claude", "missing").status.success());
+}
+
+#[test]
+fn history_binary_preserves_custom_tools_and_persisted_completed_actions() {
+    let home = tempfile::tempdir().unwrap();
+    let directory = home.path().join(".codex/sessions/2026/10/03");
+    std::fs::create_dir_all(&directory).unwrap();
+    std::fs::write(
+        directory.join("rollout-rich-tools.jsonl"),
+        include_str!("../../../test/fixtures/managed-native-history/codex-tools.jsonl"),
+    )
+    .unwrap();
+    let result = history(home.path(), "codex", "rich-tools");
     assert!(
         result.status.success(),
         "{}",
         String::from_utf8_lossy(&result.stderr)
     );
     let body: Value = serde_json::from_slice(&result.stdout).unwrap();
-    assert_eq!(body["threadId"], "ses_selected");
-    assert_eq!(body["turns"].as_array().unwrap().len(), 2);
-    assert_eq!(body["turns"][0]["items"][0]["text"], "Saved user prompt");
+    let captured: Value = serde_json::from_str(include_str!(
+        "../../../test/fixtures/managed-native-history/codex-tools.json"
+    ))
+    .unwrap();
+    assert_eq!(body["turns"], captured["turns"]);
+    let items: Vec<_> = body["turns"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .flat_map(|turn| turn["items"].as_array().unwrap())
+        .collect();
+    let custom: Vec<_> = items
+        .iter()
+        .filter(|item| item["kind"] == "dynamic_tool" && item["tool"] == "apply_patch")
+        .collect();
     assert_eq!(
-        body["turns"][1]["items"][0]["text"],
-        "Saved OpenCode answer"
+        custom.len(),
+        1,
+        "call and completed event must not duplicate"
     );
-    assert_eq!(body["capabilities"]["send"], false);
-    assert_eq!(
-        std::fs::read(directory.join("opencode.db")).unwrap(),
-        before
+    assert_eq!(custom[0]["status"], "completed");
+    assert_eq!(custom[0]["contentItems"][0]["text"], "Patch saved");
+    assert!(items.iter().any(|item| item["kind"] == "command"
+        && item["output"] == "/workspace"
+        && item["exitCode"] == 0));
+    assert!(items
+        .iter()
+        .any(|item| item["kind"] == "web_search" && item["query"] == "SQLite WAL"));
+    assert!(items
+        .iter()
+        .any(|item| item["kind"] == "image_generation" && item["result"] == "saved-image"));
+    assert!(items.iter().any(|item| item["kind"] == "mcp_tool"
+        && item["result"]["content"][0]["text"] == "MCP saved result"));
+}
+
+#[test]
+fn history_binary_preserves_legacy_persisted_tool_events() {
+    let home = tempfile::tempdir().unwrap();
+    rollout(home.path(), "legacy-tools", "Saved answer");
+    let path = home
+        .path()
+        .join(".codex/sessions/2026/10/03/rollout-2026-10-03-legacy-tools.jsonl");
+    use std::io::Write;
+    let mut file = std::fs::OpenOptions::new().append(true).open(path).unwrap();
+    for payload in [
+        json!({"type":"patch_apply_end","call_id":"patch-1","success":true,"status":"completed","stdout":"Saved patch","stderr":"","changes":{"/workspace/saved.rs":{"type":"update","unified_diff":"+saved change","move_path":null}}}),
+        json!({"type":"mcp_tool_call_end","call_id":"mcp-legacy","invocation":{"server":"fixture","tool":"lookup","arguments":{"saved":true}},"result":{"Ok":{"content":[{"type":"text","text":"Legacy MCP result"}]}}}),
+        json!({"type":"web_search_end","call_id":"search-legacy","query":"saved search","action":{"type":"search","query":"saved search"}}),
+    ] {
+        writeln!(file, "\n{}", json!({"type":"event_msg","payload":payload})).unwrap();
+    }
+    let result = history(home.path(), "codex", "legacy-tools");
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
     );
-    assert!(!history(home.path(), "opencode", "missing-session")
-        .status
-        .success());
+    let body: Value = serde_json::from_slice(&result.stdout).unwrap();
+    let items: Vec<_> = body["turns"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .flat_map(|turn| turn["items"].as_array().unwrap())
+        .collect();
+    assert!(items
+        .iter()
+        .any(|item| item["kind"] == "file_change"
+            && item["changes"][0]["path"] == "/workspace/saved.rs"));
+    assert!(items.iter().any(|item| item["kind"] == "mcp_tool"
+        && item["result"]["content"][0]["text"] == "Legacy MCP result"));
+    assert!(items
+        .iter()
+        .any(|item| item["kind"] == "web_search" && item["query"] == "saved search"));
+}
+
+#[test]
+fn history_binary_keeps_native_shell_and_tool_search_outputs() {
+    let home = tempfile::tempdir().unwrap();
+    rollout(home.path(), "other-tools", "Saved answer");
+    let path = home
+        .path()
+        .join(".codex/sessions/2026/10/03/rollout-2026-10-03-other-tools.jsonl");
+    use std::io::Write;
+    let mut file = std::fs::OpenOptions::new().append(true).open(path).unwrap();
+    for payload in [
+        json!({"type":"local_shell_call","call_id":"shell-1","status":"completed","action":{"type":"exec","command":["pwd"],"working_directory":"/workspace"}}),
+        json!({"type":"function_call_output","call_id":"shell-1","output":"Saved shell output"}),
+        json!({"type":"tool_search_call","call_id":"search-tools","execution":"client","arguments":{"query":"saved"}}),
+        json!({"type":"tool_search_output","call_id":"search-tools","status":"completed","execution":"client","tools":[{"name":"native-search-tool"}]}),
+    ] {
+        writeln!(
+            file,
+            "\n{}",
+            json!({"type":"response_item","payload":payload})
+        )
+        .unwrap();
+    }
+    let result = history(home.path(), "codex", "other-tools");
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let body: Value = serde_json::from_slice(&result.stdout).unwrap();
+    let items: Vec<_> = body["turns"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .flat_map(|turn| turn["items"].as_array().unwrap())
+        .collect();
+    assert!(items.iter().any(|item| item["kind"] == "command"
+        && item["command"] == "pwd"
+        && item["output"] == "Saved shell output"));
+    assert!(items.iter().any(|item| item["kind"] == "dynamic_tool"
+        && item["tool"] == "tool_search"
+        && item["contentItems"][0]["name"] == "native-search-tool"));
 }
