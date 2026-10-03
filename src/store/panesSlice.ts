@@ -1938,6 +1938,7 @@ export const panesSlice = createSlice({
         content.resumeSessionId = undefined
         content.restoreError = undefined
         content.createError = undefined
+        content.closeError = undefined
         content.reconcileNotice = undefined
         content.pendingReconcile = undefined
         content.reconcileEpoch = undefined
