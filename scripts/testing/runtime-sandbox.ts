@@ -81,7 +81,6 @@ export function phase2BootstrapFiles(
   }
   for (const key of [
     'FRESHELL_MANAGED_CLAUDE_CREDENTIAL_FILE',
-    'FRESHELL_MANAGED_OPENCODE_AUTH_FILE',
     'FRESHELL_MANAGED_CODEX_AUTH_FILE',
   ]) {
     addRegularFile(env[key]?.trim())

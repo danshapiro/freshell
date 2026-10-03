@@ -5,7 +5,7 @@ import os from 'node:os'
 import path from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
-import { hasOpenCodePromptModelText, nativeTurnProof, openCodeTerminalReady, selectNativeAssistantTurn } from '../../../e2e-browser/helpers/opencode-native-history.js'
+import { hasOpenCodePromptModelText, nativeTurnProof, openCodeCredentialFailureMessage, openCodeTerminalReady, selectNativeAssistantTurn } from '../../../e2e-browser/helpers/opencode-native-history.js'
 import { readOpenCodeNativeHistory } from '../../../e2e-browser/helpers/provider-native-history/opencode.js'
 
 let root: string
@@ -36,6 +36,13 @@ function read(session = 'ses_owned') {
 }
 
 describe('live recovery proves new native assistant responses, never TUI echo or replay', () => {
+  it('surfaces an OpenAI token refresh rejection instead of waiting for the native response timeout', () => {
+    expect(openCodeCredentialFailureMessage('\u001b[31mToken refresh failed: 401\u001b[0m'))
+      .toMatch(/credential refresh was rejected.*401/i)
+    expect(openCodeCredentialFailureMessage('Token refresh failed: 403')).toBeNull()
+    expect(openCodeCredentialFailureMessage('GPT-5.6 Luna')).toBeNull()
+  })
+
   it('reads only completed assistant messages for the exact native session', () => {
     message('echo', 'ses_owned', 'user', 'nonce-in-echo')
     message('unfinished', 'ses_owned', 'assistant', 'nonce-unfinished', null)
