@@ -4,6 +4,10 @@
 # and exit statuses.
 set -euo pipefail
 
+# The agent shell exports BASH_ENV to load machine-specific gcloud settings.
+# This harness needs its child Bash processes to keep the fake identity below.
+unset BASH_ENV
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 cd "$ROOT"
@@ -367,6 +371,12 @@ cat > "$FAKE8_DIR/gcloud" << 'FAKE8'
 #!/usr/bin/env bash
 echo "FAKE_GCLOUD: $@" >> "${FAKE8_LOG:?set FAKE8_LOG}"
 [ -n "${CLOUDSDK_CORE_DISABLE_PROMPTS:-}" ] && echo "PROMPTS_DISABLED=1" >> "$FAKE8_LOG"
+if [ -n "${CLOUDSDK_CORE_DISABLE_PROMPTS:-}" ] && {
+  [[ " $* " != *" --project="* ]] || [[ " $* " != *" --account="* ]]
+}; then
+  echo "explicit --project and --account are required" >&2
+  exit 64
+fi
 case "$*" in
   *"auth print-access-token"*)
     if [ -n "${FAKE8_TOKEN_FAIL:-}" ]; then
@@ -398,6 +408,14 @@ run8() { # suite-level helper: run the run lane under FAKE8; stdin: caller's
 V8_OUT=$(run8 < /dev/null) && V8_RC=0 || V8_RC=$?
 check "non-TTY stdin exports CLOUDSDK_CORE_DISABLE_PROMPTS=1 to gcloud children" \
   bash -c 'grep -q "PROMPTS_DISABLED=1" "$1"' _ "$FAKE8_LOG"
+check "non-TTY cloud calls include explicit account and project context" \
+  awk '
+    /^FAKE_GCLOUD:/ {
+      seen = 1
+      if ($0 !~ /--account=[^ ]+/ || $0 !~ /--project=[^ ]+/) bad = 1
+    }
+    END { exit !(seen && !bad) }
+  ' "$FAKE8_LOG"
 
 rm -f "$FAKE8_LOG"; touch "$FAKE8_LOG"
 check "TTY stdin leaves prompts enabled (humans keep interactive reauth)" \

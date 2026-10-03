@@ -11,6 +11,10 @@
 # network, no real credentials, no real IAM answers (skill trap 11).
 set -euo pipefail
 
+# The agent shell exports BASH_ENV to load machine-specific gcloud settings.
+# Child Bash processes here must retain each test's deliberately scrubbed env.
+unset BASH_ENV
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 cd "$ROOT"
@@ -449,14 +453,13 @@ reset_green() {
 }
 
 # Every gcloud invocation that COULD pin an account DID pin this exact one:
-# the accounts log must contain one token per logged gcloud call (the bare
-# `gcloud info` PATH-probe call takes no flags and is excluded), all equal to
-# the expected value, and non-empty — an omit/present mix or an empty log
-# both fail.
+# the accounts log must contain one token per logged gcloud call, except for
+# the legacy e2e wrapper's bare `gcloud info` PATH probe. The Vitest wrapper
+# resolves its SDK path after identity selection and pins that call too.
 accounts_all_equal() {
   [ -s "$GREEN_LOG.accounts" ] || return 1
   local calls tokens
-  calls=$(grep '^GCLOUD_ARGS:' "$GREEN_LOG" | grep -vc '^GCLOUD_ARGS: info ')
+  calls=$(awk '/^GCLOUD_ARGS: info / { if ($0 ~ /--account=/) n++; next } /^GCLOUD_ARGS:/ { n++ } END { print n+0 }' "$GREEN_LOG")
   tokens=$(wc -l < "$GREEN_LOG.accounts")
   [ "$calls" -gt 0 ] && [ "$calls" -eq "$tokens" ] && \
     [ "$(sort -u "$GREEN_LOG.accounts" | wc -l)" = "1" ] && \

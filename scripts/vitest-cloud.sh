@@ -96,15 +96,6 @@ image_tag_for_head() {
   echo "$sha"
 }
 
-# Ensure gcloud's bin dir is on PATH (for docker-credential-gcloud used by
-# Docker when pushing to Artifact Registry).
-if command -v gcloud &>/dev/null; then
-  GCLOUD_BIN="$(gcloud info --format="value(installation.sdk_root)" 2>/dev/null)/bin"
-  if [ -d "$GCLOUD_BIN" ] && ! echo "$PATH" | grep -q "$GCLOUD_BIN"; then
-    export PATH="$GCLOUD_BIN:$PATH"
-  fi
-fi
-
 DEFAULT_CONFIGS="config/vitest/vitest.config.ts"
 
 # ---------------------------------------------------------------------------
@@ -158,7 +149,18 @@ account_flag() {
 # The error names the resolved identity and its source so the failure path is
 # as attributable as the success path.
 identity_preflight() {
-  if ! gcloud auth print-access-token $(account_flag) >/dev/null 2>&1; then
+  # Resolve the SDK's bin directory only after the lane has selected its
+  # account. The shared-machine gcloud wrapper rejects environment defaults,
+  # so even this informational command must carry explicit cloud context.
+  if command -v gcloud &>/dev/null; then
+    local sdk_root
+    sdk_root="$(gcloud info $(account_flag) --project="$GCP_PROJECT" --format="value(installation.sdk_root)" 2>/dev/null || true)"
+    if [ -n "$sdk_root" ] && [ -d "$sdk_root/bin" ] && ! echo "$PATH" | grep -q "$sdk_root/bin"; then
+      export PATH="$sdk_root/bin:$PATH"
+    fi
+  fi
+
+  if ! gcloud auth print-access-token $(account_flag) --project="$GCP_PROJECT" >/dev/null 2>&1; then
     echo "[vitest-cloud] ERROR: identity preflight failed for ${GCP_ACCOUNT:-(ambient gcloud)} (source: ${FRESHELL_GCP_IDENTITY_SOURCE:-unresolved}) - gcloud auth print-access-token could not mint a token." >&2
     echo "[vitest-cloud] Fix the credential/identity (docs/development/gcloud-robot.md) and re-run the lane." >&2
     exit 1
@@ -337,7 +339,7 @@ cmd_push() {
   fi
 
   # Authenticate Docker to Artifact Registry using an access token.
-  gcloud auth print-access-token $(account_flag) | \
+  gcloud auth print-access-token $(account_flag) --project="$GCP_PROJECT" | \
     docker login -u oauth2accesstoken --password-stdin \
       "https://${GCP_REGION}-docker.pkg.dev"
 
