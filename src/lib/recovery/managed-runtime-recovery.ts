@@ -204,6 +204,12 @@ function paneMatchesView(
   if (soul.terminalCreateRequestId && content.createRequestId === soul.terminalCreateRequestId) {
     return true
   }
+  // Fresh runtime identity is available before the provider creates its
+  // durable native session. Adopt the originating pane through that window.
+  if (content.kind === 'fresh-agent' && soul.freshAgentSessionId
+    && content.sessionId === soul.freshAgentSessionId
+    && content.provider === soul.provider
+    && content.sessionType === soul.freshAgentSessionType) return true
   const sessionRef = sessionRefFor(soul)
   return Boolean(
     sessionRef

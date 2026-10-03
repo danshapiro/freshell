@@ -19,10 +19,10 @@ import { getWsClient, RECONCILE_VERDICT_WAIT_MS } from '@/lib/ws-client'
 import { sendSuppressedAwareFreshAgentFrame } from '@/lib/fresh-agent-configure'
 import { KILL_ACK_TIMEOUT_MESSAGE, KILL_FAILED_MESSAGE, sendFreshAgentKillAndAwait, sendFreshAgentRecoveryStopAndAwait } from '@/lib/kill-ack'
 import { createLogger } from '@/lib/client-logger'
-import { api, getFreshAgentModelCapabilities, getFreshAgentThreadSnapshot, retryManagedRuntimeSoul, setSessionMetadata } from '@/lib/api'
+import { api, getFreshAgentModelCapabilities, getFreshAgentThreadSnapshot, setSessionMetadata } from '@/lib/api'
 import { clearPaneCloseError, clearReconcilePendingPane, consumePaneRefreshRequest, mergePaneContent, startNewManagedRuntimeConversation, updatePaneContent } from '@/store/panesSlice'
+import { retryManagedConversation } from '@/lib/managed-runtime-retry'
 import { isManagedRuntimeRecoveryDecision, ManagedRuntimeRecoveryCard } from '@/components/ManagedRuntimeRecoveryCard'
-import { queueManagedRuntimeRefresh } from '@/lib/recovery/managed-runtime-recovery'
 import { confirmManagedRuntimeStopped } from '@/lib/managed-runtime-stop'
 import { FRESH_AGENT_MODEL_CATALOG_UNAVAILABLE_NOTICE } from '@/lib/fresh-agent-model-capabilities'
 import { applyRefusalFence, clearPendingCreateFailure, clearRestoreFailure, clearSessionError, clearSessionLost, sessionError, setSessionStatus } from '@/store/freshAgentSlice'
@@ -1666,12 +1666,13 @@ export function FreshAgentView({
 
   const retryManagedRecovery = useCallback(async () => {
     const current = paneContentRef.current
-    if (!current.soulId || typeof current.soulIntentRevision !== 'number') {
-      throw new Error('Managed recovery is missing its current revision.')
-    }
-    await retryManagedRuntimeSoul(current.soulId, current.soulIntentRevision)
-    await queueManagedRuntimeRefresh(appStore, 'pane-recovery-retry')
-  }, [appStore])
+    if (!current) return
+    await retryManagedConversation(current, () => {
+      const root = appStore.getState().panes.layouts[tabId]
+      const latest = root ? findPaneContent(root, paneId) : null
+      return latest?.kind === 'fresh-agent' ? latest : null
+    }, appStore)
+  }, [appStore, paneId, tabId])
 
   const sendFork = useCallback((atTurnId?: string) => {
     const current = paneContentRef.current
@@ -3885,6 +3886,7 @@ export function FreshAgentView({
               ) : null}
               {isManagedRuntimeRecoveryDecision(paneContent.recoverySummary) ? (
                 <ManagedRuntimeRecoveryCard
+                  key={`${paneContent.createRequestId}:${paneContent.soulId}:${paneContent.recoverySummary?.recoveryState}`}
                   recoverySummary={paneContent.recoverySummary}
                   onRetry={retryManagedRecovery}
                   onStartFresh={startNewConversation}
