@@ -2136,6 +2136,126 @@ describe('closeTab managed runtime visibility', () => {
     }
   })
 
+  it('does not reopen managed state when a tab is tombstoned while close compensation waits in the visibility queue', async () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(new Date(100))
+    resetPersistedLayoutCacheForTests()
+
+    const layoutWindowId = 'managed-close-queued-tombstone'
+    const layoutKey = `freshell.layout.v3.${layoutWindowId}`
+    sessionStorage.setItem(LAYOUT_WINDOW_ID_STORAGE_KEY, layoutWindowId)
+    const managedView = view('view-a', 0)
+    let serverSnapshot = inventory(8, [managedView])
+    const managedPaneContent = managedContent(managedView)
+    const splitLayout = {
+      type: 'split', id: 'managed-close-split', direction: 'horizontal', sizes: [50, 50],
+      children: [
+        { type: 'leaf', id: 'managed-pane-0', content: managedPaneContent },
+        { type: 'leaf', id: 'keep-pane', content: { kind: 'browser', browserInstanceId: 'keep-browser', url: 'https://keep.example', devToolsOpen: false } },
+      ],
+    }
+    localStorage.setItem(layoutKey, JSON.stringify({
+      version: 3,
+      persistedAt: 100,
+      tabs: { activeTabId: 'managed-tab', tabs: [{ id: 'managed-tab', title: 'Managed agents', createdAt: 1 }] },
+      panes: { version: 6, layouts: { 'managed-tab': splitLayout }, activePane: { 'managed-tab': 'managed-pane-0' }, paneTitles: {}, paneTitleSetByUser: {} },
+      tombstones: [],
+    }))
+
+    let injectedCloseLayout = false
+    const injectOtherWindowClose = () => (next: (action: any) => any) => (action: any) => {
+      const result = next(action)
+      if (!injectedCloseLayout && action?.type === closePane.type) {
+        injectedCloseLayout = true
+        const otherWindowRaw = JSON.stringify({
+          version: 3,
+          persistedAt: 102,
+          tabs: { activeTabId: 'managed-tab', tabs: [{ id: 'managed-tab', title: 'Managed agents', createdAt: 1 }] },
+          panes: { version: 6, layouts: { 'managed-tab': { type: 'leaf', id: 'managed-pane-0', content: managedPaneContent } }, activePane: { 'managed-tab': 'managed-pane-0' }, paneTitles: {}, paneTitleSetByUser: {} },
+          tombstones: [],
+        })
+        localStorage.setItem(layoutKey, otherWindowRaw)
+        window.dispatchEvent(new StorageEvent('storage', { key: layoutKey, newValue: otherWindowRaw }))
+      }
+      return result
+    }
+
+    const store = createStore(['view-a'], serverSnapshot, [persistMiddleware as any, injectOtherWindowClose as any])
+    store.dispatch(splitPane({
+      tabId: 'managed-tab',
+      paneId: 'managed-pane-0',
+      direction: 'horizontal',
+      newPaneId: 'keep-pane',
+      newContent: { kind: 'browser', browserInstanceId: 'keep-browser', url: 'https://keep.example', devToolsOpen: false },
+    }))
+    apiMocks.getManagedRuntimeInventory.mockImplementation(async () => serverSnapshot)
+    const patchStarted = deferred<void>()
+    const finishPatch = deferred<void>()
+    apiMocks.updateManagedRuntimeViewVisibility.mockImplementation(async (viewId: string, visibility: ManagedRuntimeViewIntent['visibility']) => {
+      if (visibility === 'detached') {
+        patchStarted.resolve(undefined)
+        await finishPatch.promise
+      }
+      serverSnapshot = withVisibility(serverSnapshot, viewId, visibility)
+      return serverSnapshot.viewIntents.find((entry) => entry.viewId === viewId)
+    })
+
+    const queueStarted = deferred<void>()
+    const releaseQueue = deferred<void>()
+    let queuedTransition: Promise<void> | undefined
+    let closing: Promise<unknown> | undefined
+    const cleanupSync = installCrossTabSync(store as any)
+    try {
+      closing = store.dispatch(closePaneWithCleanup({ tabId: 'managed-tab', paneId: 'managed-pane-0' }))
+      await patchStarted.promise
+      queuedTransition = withManagedVisibilityTransition(async () => {
+        queueStarted.resolve(undefined)
+        await releaseQueue.promise
+      })
+      finishPatch.resolve(undefined)
+      await queueStarted.promise
+
+      const tombstonedRaw = JSON.stringify({
+        version: 3,
+        persistedAt: 103,
+        tabs: { activeTabId: 'unrelated-tab', tabs: [{ id: 'unrelated-tab', title: 'Unrelated tab', createdAt: 2 }] },
+        panes: { version: 6, layouts: {}, activePane: {}, paneTitles: {}, paneTitleSetByUser: {} },
+        tombstones: [{ id: 'managed-tab', deletedAt: 102 }],
+      })
+      localStorage.setItem(layoutKey, tombstonedRaw)
+      window.dispatchEvent(new StorageEvent('storage', { key: layoutKey, newValue: tombstonedRaw }))
+
+      expect(store.getState().tabs.tabs.some((tab) => tab.id === 'managed-tab')).toBe(false)
+      expect(store.getState().panes.layouts['managed-tab']).toMatchObject({
+        type: 'leaf', id: 'managed-pane-0', content: { viewIntentId: 'view-a' },
+      })
+
+      releaseQueue.resolve(undefined)
+      await queuedTransition
+      await closing
+
+      expect(serverSnapshot.viewIntents[0]?.visibility).toBe('detached')
+      expect(apiMocks.updateManagedRuntimeViewVisibility).toHaveBeenCalledTimes(1)
+      expect(apiMocks.updateManagedRuntimeViewVisibility).toHaveBeenCalledWith('view-a', 'detached', 2, 5)
+      expect(wsMock.sent.some((message: any) => (
+        message.type === 'pane.opened' && message.createRequestId === managedPaneContent.createRequestId
+      ))).toBe(false)
+    } finally {
+      finishPatch.resolve(undefined)
+      releaseQueue.resolve(undefined)
+      await Promise.allSettled([queuedTransition, closing].filter(Boolean) as Promise<unknown>[])
+      cleanupSync()
+      clearLocalClosePersistencePending()
+      resetAuthoritativeLocalLayoutPersistedAtForTests()
+      resetPersistedLayoutCacheForTests()
+      resetPersistFlushListenersForTests()
+      resetPersistBroadcastForTests()
+      localStorage.clear()
+      sessionStorage.removeItem(LAYOUT_WINDOW_ID_STORAGE_KEY)
+      vi.useRealTimers()
+    }
+  })
+
   it('does not replace a different pane identity replayed when replacement thaws', async () => {
     vi.useFakeTimers()
     vi.setSystemTime(new Date(100))

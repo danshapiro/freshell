@@ -342,6 +342,15 @@ the replacement thaw boundary. Seven focused suites passed (352 tests),
 `pnpm run typecheck:client` passed, and `git diff --check` passed. Independent
 review of this repair is pending.
 
+**Task 2 review 5 repair (2026-10-03):** Managed-close compensation now waits
+for the visibility queue before reasserting pane-open evidence. After acquiring
+the queue it checks that the tab still exists, then rechecks exact pane
+identity before restoring managed visibility. A regression holds the queue,
+applies a same-key tombstone that leaves an orphan pane layout, then releases
+the queue; the orphan receives neither `pane.opened` nor a visible promotion.
+The nine focused suites passed (384 tests), client typecheck and
+`git diff --check` passed. Independent review of this repair is pending.
+
 ## Task 3: Reopen only from current identity and clear close evidence
 
 **Files:**

@@ -2521,24 +2521,34 @@ async function reconcileManagedCloseAfterReplay(
   // when the original tab itself survived that reconciliation.
   if (!currentState.tabs.tabs.some((tab) => tab.id === tabId)) return
   if (!localCloseMutationApplied && !managedViewDetachmentConfirmed) return
-  const currentLayout = currentState.panes.layouts[tabId]
-  const restoredPaneIds = new Set(paneTargets.flatMap(({ paneId, identity }) => {
-    const content = currentLayout ? findPaneContent(currentLayout, paneId) : null
-    return samePaneCloseTargetIdentity(identity, content) ? [paneId] : []
-  }))
-  reassertKeptPanesOpen(
-    currentLayout,
-    tabId,
-    closeIdentities.filter(({ paneId }) => restoredPaneIds.has(paneId)),
-  )
-
   const initialViewIntentIds = getStillRepresentedViewIds(currentState)
-  if (initialViewIntentIds.length === 0) return
+  const reassertRestoredPaneEvidence = (state: RootState) => {
+    if (!state.tabs.tabs.some((tab) => tab.id === tabId)) return
+    const layout = state.panes.layouts[tabId]
+    const restoredPaneIds = new Set(paneTargets.flatMap(({ paneId, identity }) => {
+      const content = layout ? findPaneContent(layout, paneId) : null
+      return samePaneCloseTargetIdentity(identity, content) ? [paneId] : []
+    }))
+    reassertKeptPanesOpen(
+      layout,
+      tabId,
+      closeIdentities.filter(({ paneId }) => restoredPaneIds.has(paneId)),
+    )
+  }
+  if (initialViewIntentIds.length === 0) {
+    reassertRestoredPaneEvidence(currentState)
+    return
+  }
   try {
     await withManagedVisibilityTransition(async () => {
-      // A queued visibility transition may have allowed the pane to change
-      // again. Re-check its exact identity immediately before restoring it.
-      const currentViewIntentIds = getStillRepresentedViewIds(getState())
+      // The tab can disappear through tombstone hydration while this close
+      // waits behind another visibility transition. Check tab presence and
+      // pane identity after acquiring the queue before sending pane-open
+      // evidence or making any view visible.
+      const stateAfterAcquire = getState()
+      if (!stateAfterAcquire.tabs.tabs.some((tab) => tab.id === tabId)) return
+      reassertRestoredPaneEvidence(stateAfterAcquire)
+      const currentViewIntentIds = getStillRepresentedViewIds(stateAfterAcquire)
       if (currentViewIntentIds.length === 0) return
       await persistManagedViewVisibility(currentViewIntentIds, 'visible', dispatch, getState)
     })
