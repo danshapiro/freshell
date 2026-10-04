@@ -1416,6 +1416,106 @@ fn keeps_a_file_reference_only_under_the_exact_workspace_mount() {
 }
 
 #[test]
+fn selected_session_workspace_mount_binds_only_exact_native_directory() {
+    let fixture = TestDir::new("selected-session-workspace-binding");
+    let database = fixture.path().join("opencode.db");
+    let source = create_synthetic_source(&database);
+    let workspace_mount = fixture.path().join("workspace");
+    fs::create_dir_all(&workspace_mount).unwrap();
+    let file = workspace_mount.join("prompt.txt");
+    fs::write(&file, b"selected session workspace bytes").unwrap();
+    source
+        .execute(
+            "UPDATE session SET directory = ?1 WHERE id = 'ses_root'",
+            [workspace_mount.to_string_lossy().as_ref()],
+        )
+        .unwrap();
+    source
+        .execute(
+            "UPDATE part SET data = ?1 WHERE id = 'part_ses_root'",
+            [serde_json::json!({
+                "type":"file",
+                "mime":"text/plain",
+                "url":format!("file://{}", file.display())
+            })
+            .to_string()],
+        )
+        .unwrap();
+    drop(source);
+
+    let inventory = HostOpenCodeInventory::new(fixture.path().join("unused.db"))
+        .with_channel_database(database)
+        .with_trusted_mount_for_selected_session(workspace_mount.clone());
+    let snapshot = export_exact_session(
+        &inventory,
+        "ses_root",
+        ExportOptions::new(fixture.path().join("extract")),
+    )
+    .expect("exact source directory binds the trusted workspace mount");
+    assert_eq!(snapshot.manifest().assets.len(), 1);
+    assert_eq!(
+        snapshot.manifest().assets[0].target_relative_path,
+        "prompt.txt"
+    );
+}
+
+#[test]
+fn selected_session_workspace_mount_rejects_no_match_and_ambiguous_match() {
+    let fixture = TestDir::new("selected-session-workspace-binding-failures");
+    let workspace_mount = fixture.path().join("workspace");
+    fs::create_dir_all(&workspace_mount).unwrap();
+    let file = workspace_mount.join("prompt.txt");
+    fs::write(&file, b"selected session workspace bytes").unwrap();
+    let database = fixture.path().join("opencode.db");
+    let source = create_synthetic_source(&database);
+    source
+        .execute(
+            "UPDATE part SET data = ?1 WHERE id = 'part_ses_root'",
+            [serde_json::json!({
+                "type":"file",
+                "mime":"text/plain",
+                "url":format!("file://{}", file.display())
+            })
+            .to_string()],
+        )
+        .unwrap();
+    drop(source);
+
+    let no_match = HostOpenCodeInventory::new(fixture.path().join("unused.db"))
+        .with_channel_database(database.clone())
+        .with_trusted_mount_for_selected_session(workspace_mount.clone());
+    assert!(matches!(
+        export_exact_session(
+            &no_match,
+            "ses_root",
+            ExportOptions::new(fixture.path().join("no-match-extract")),
+        ),
+        Err(TransferError::Blocked(_))
+    ));
+
+    let source = Connection::open(&database).unwrap();
+    source
+        .execute(
+            "UPDATE session SET directory = ?1 WHERE id = 'ses_root'",
+            [workspace_mount.to_string_lossy().as_ref()],
+        )
+        .unwrap();
+    drop(source);
+    let ambiguous = HostOpenCodeInventory::new(fixture.path().join("unused.db"))
+        .with_channel_database(database)
+        .with_trusted_mount_for_selected_session(workspace_mount.clone())
+        .with_trusted_mount_for_selected_session(workspace_mount);
+    assert!(matches!(
+        export_exact_session(
+            &ambiguous,
+            "ses_root",
+            ExportOptions::new(fixture.path().join("ambiguous-extract")),
+        ),
+        Err(TransferError::Blocked(reason)) if reason.contains("ambiguous")
+    ));
+}
+
+#[test]
 fn blocks_workspace_file_from_a_different_session_workspace_mapping() {
     let fixture = TestDir::new("workspace-file-mismatch");
     let database = fixture.path().join("opencode.db");

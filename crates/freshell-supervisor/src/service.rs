@@ -3,6 +3,7 @@ use crate::{
     backend::{
         host_actor_state_dir, BackendError, CreateRuntimeSpec, DockerEngineBackend, RuntimeBackend,
     },
+    opencode_transfer::{OpenCodeTransferStaging, StagingLimits},
     registry::{
         stable_provider_volume_name, BackendCreatedRecord, ExecutionGrantRecord,
         InputJournalDisposition, LaunchPreparation, PreparedLaunch, Registry, RegistryError,
@@ -11,9 +12,10 @@ use crate::{
 use freshell_runtime_protocol::{
     host_proof, read_frame, write_frame, AdminCommand, AdminReply, AdminResult, CommandState,
     ControlRole, Envelope, FixtureKind, FreshAgentLaunchSpec, HostBootId, HostCommand, HostReply,
-    HostResult, IncarnationId, LaunchResult, LaunchState, LimitApplication, RequestId, ResumeSpec,
-    RuntimeError, RuntimeErrorCode, RuntimeLimits, RuntimeMetrics, RuntimeOutputBatch, RuntimeView,
-    SoulId, StopOutcome, TerminalLaunchSpec, UpdateLimitsResult, CONTROL_PROTOCOL_VERSION,
+    HostResult, IncarnationId, LaunchResult, LaunchState, LimitApplication, OpenCodeTransferAction,
+    OpenCodeTransferResult, RequestId, ResumeSpec, RuntimeError, RuntimeErrorCode, RuntimeLimits,
+    RuntimeMetrics, RuntimeOutputBatch, RuntimeView, SoulId, StopOutcome, TerminalLaunchSpec,
+    UpdateLimitsResult, CONTROL_PROTOCOL_VERSION,
 };
 use sha2::{Digest, Sha256};
 use std::{
@@ -67,6 +69,7 @@ pub struct Supervisor {
     pub(crate) registry: Registry,
     pub(crate) backend: Arc<dyn RuntimeBackend>,
     pub(crate) config: Arc<SupervisorConfig>,
+    pub(crate) opencode_transfer_staging: Arc<OpenCodeTransferStaging>,
     /// Recovery and input dispatch serialize per soul, while unrelated souls
     /// remain independently recoverable. Stop intentionally does not take this
     /// lock: its durable intent revision must be able to preempt recovery.
@@ -108,6 +111,14 @@ impl Supervisor {
         let mut config = config;
         config.runtime_root = canonical_root;
         config.host_binary_path = canonical_binary;
+        let opencode_transfer_staging =
+            OpenCodeTransferStaging::new(&config.runtime_root, StagingLimits::production())
+                .map_err(|error| {
+                    RuntimeError::new(
+                        RuntimeErrorCode::RegistryFailure,
+                        format!("initialize OpenCode transfer staging: {error}"),
+                    )
+                })?;
         lifecycle_secrets()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -116,6 +127,7 @@ impl Supervisor {
             registry,
             backend,
             config: Arc::new(config),
+            opencode_transfer_staging: Arc::new(opencode_transfer_staging),
             recovery_locks: Arc::new(Mutex::new(HashMap::new())),
         })
     }
@@ -166,6 +178,68 @@ impl Supervisor {
                 control_epoch: self.registry.control_epoch(),
                 installation_id: self.registry.installation_id().clone(),
             }),
+            AdminCommand::OpenCodeTransfer(action) => {
+                let result = match action {
+                    OpenCodeTransferAction::TargetInfo => OpenCodeTransferResult::TargetInfo {
+                        image_ref: self.config.image_ref.clone(),
+                        provider_schema: "opencode-1.18.21".into(),
+                        build_receipt: freshell_runtime_protocol::opencode_target_build_receipt(
+                            &self.config.image_ref,
+                            "opencode-1.18.21",
+                        ),
+                    },
+                    OpenCodeTransferAction::Begin(descriptor) => {
+                        if descriptor.target_image_ref != self.config.image_ref {
+                            return Err(RuntimeError::new(
+                                RuntimeErrorCode::RecoveryWrongIdentity,
+                                "OpenCode transfer target image does not match the supervisor runtime image",
+                            ));
+                        }
+                        let available = self
+                            .opencode_transfer_staging
+                            .available_space_bytes()
+                            .map_err(map_opencode_transfer)?;
+                        match self
+                            .opencode_transfer_staging
+                            .begin(&descriptor, available)
+                            .map_err(map_opencode_transfer)?
+                        {
+                            crate::opencode_transfer::StagingStart::Started {
+                                next_sequence,
+                                file_offsets,
+                            } => OpenCodeTransferResult::Started {
+                                next_sequence,
+                                file_offsets,
+                            },
+                            crate::opencode_transfer::StagingStart::Queued => {
+                                OpenCodeTransferResult::Queued {
+                                    transfer_id: descriptor.transfer_id,
+                                }
+                            }
+                        }
+                    }
+                    OpenCodeTransferAction::Chunk(chunk) => {
+                        let sequence = chunk.sequence;
+                        self.opencode_transfer_staging
+                            .write_chunk(&chunk)
+                            .map_err(map_opencode_transfer)?;
+                        OpenCodeTransferResult::ChunkStored { sequence }
+                    }
+                    OpenCodeTransferAction::Finalize { transfer_id } => {
+                        self.opencode_transfer_staging
+                            .finalize(&transfer_id)
+                            .map_err(map_opencode_transfer)?;
+                        OpenCodeTransferResult::Ready { transfer_id }
+                    }
+                    OpenCodeTransferAction::Abort { transfer_id } => {
+                        self.opencode_transfer_staging
+                            .abort(&transfer_id)
+                            .map_err(map_opencode_transfer)?;
+                        OpenCodeTransferResult::Aborted { transfer_id }
+                    }
+                };
+                Ok(AdminResult::OpenCodeTransfer(result))
+            }
             AdminCommand::Inventory => Ok(AdminResult::Inventory(
                 self.registry.inventory().await.map_err(map_registry)?,
             )),
@@ -625,6 +699,19 @@ impl Supervisor {
             let runtime_dir = self.ensure_incarnation_dir(&prepared).map_err(|error| {
                 self.activation_failure(&prepared, state, "ensure_runtime_directory", error)
             })?;
+            let opencode_transfer_dir = workload
+                .terminal
+                .as_ref()
+                .and_then(|terminal| terminal.opencode_transfer.as_ref())
+                .map(|descriptor| {
+                    self.opencode_transfer_staging
+                        .verify_ready(descriptor)
+                        .map_err(map_opencode_transfer)
+                })
+                .transpose()
+                .map_err(|error| {
+                    self.activation_failure(&prepared, state, "verify_opencode_transfer", error)
+                })?;
             if workload.fresh_agent.is_some() {
                 ensure_host_actor_state_dir(
                     &self.config.runtime_root,
@@ -648,6 +735,7 @@ impl Supervisor {
                     test_run_id: self.config.test_run_id.clone(),
                     terminal: workload.terminal.clone(),
                     fresh_agent: workload.fresh_agent.clone(),
+                    opencode_transfer_dir,
                     provider_volume_name: stable_provider_volume_name(
                         self.registry.installation_id(),
                         &prepared.soul_id,
@@ -2875,6 +2963,19 @@ async fn find_view(
                 incarnation_id.to_string(),
             )
         })
+}
+
+fn map_opencode_transfer(error: crate::opencode_transfer::StagingError) -> RuntimeError {
+    let code = match &error {
+        crate::opencode_transfer::StagingError::InvalidDescriptor(_) => {
+            RuntimeErrorCode::InvalidRequest
+        }
+        crate::opencode_transfer::StagingError::Capacity(_) => RuntimeErrorCode::BlockedResource,
+        crate::opencode_transfer::StagingError::InvalidState(_)
+        | crate::opencode_transfer::StagingError::Io(_)
+        | crate::opencode_transfer::StagingError::Metadata(_) => RuntimeErrorCode::RegistryFailure,
+    };
+    RuntimeError::new(code, error.to_string())
 }
 
 fn map_registry(error: RegistryError) -> RuntimeError {

@@ -2,10 +2,12 @@
 
 use freshell_runtime_client::{ClientError, RuntimeClient};
 use freshell_runtime_protocol::{
-    DesiredState, LaunchRequest, LaunchState, RecoveryBlockReason, RecoveryOutcome, RecoveryProbe,
-    RecoveryResult, RecoveryTrigger, RequestId, RuntimeErrorCode, RuntimeLimits, RuntimeProfile,
-    RuntimeView, SoulId, StopOutcome, TerminalLaunchSpec, ViewIntentKind, ViewIntentRequest,
-    ViewVisibilityIntent,
+    DesiredState, IncarnationId, LaunchRequest, LaunchState, OpenCodeTransferChunk,
+    OpenCodeTransferDescriptor, OpenCodeTransferFile, OpenCodeTransferResult, RecoveryBlockReason,
+    RecoveryOutcome, RecoveryProbe, RecoveryResult, RecoveryTrigger, RequestId, RuntimeErrorCode,
+    RuntimeLimits, RuntimeProfile, RuntimeView, SoulId, StopOutcome, TerminalLaunchSpec,
+    ViewIntentKind, ViewIntentRequest, ViewVisibilityIntent, MAX_OPENCODE_TRANSFER_CHUNK_BYTES,
+    OPENCODE_TRANSFER_DESTINATION_DB,
 };
 use freshell_terminal::registry::{
     ManagedOutputChunk, ManagedOutputRead, ManagedTerminalController, ManagedTerminalDescriptor,
@@ -19,6 +21,10 @@ use std::{
     sync::Arc,
 };
 use tokio::sync::Mutex;
+use tokio::{
+    fs::File as TokioFile,
+    io::{AsyncReadExt, AsyncSeekExt},
+};
 
 #[path = "managed_output_validation.rs"]
 mod managed_output_validation;
@@ -175,6 +181,23 @@ impl ManagedTerminalController for ServerManagedRuntimeController {
             // server's resolved child environment wholesale (which can carry
             // AUTH_TOKEN, provider API keys, cloud credentials, proxy creds, ...).
             let env = managed_provider_env(&request.mode, &request.env);
+            let opencode_transfer = if request.mode == "opencode" {
+                match request.resume_session_id.as_deref() {
+                    Some(native_session_id) => Some(
+                        stage_opencode_resume_bundle(
+                            &self.client,
+                            native_session_id,
+                            &workspace,
+                            &soul_id,
+                            create_key,
+                        )
+                        .await?,
+                    ),
+                    None => None,
+                }
+            } else {
+                None
+            };
             let provider_secret_references = {
                 crate::managed_provider_bootstrap::named_provider_onecli_references(&request.mode)?
             };
@@ -309,6 +332,7 @@ impl ManagedTerminalController for ServerManagedRuntimeController {
                     provider_bootstrap_files: Vec::new(),
                     provider_secret_references,
                     provider_launch_context,
+                    opencode_transfer,
                 }),
                 view_intent: Some(ViewIntentRequest {
                     owner_id: String::new(),
@@ -735,6 +759,162 @@ fn managed_env_allowlist(
         .collect()
 }
 
+async fn stage_opencode_resume_bundle(
+    client: &RuntimeClient,
+    root_session_id: &str,
+    workspace: &Path,
+    destination_store_id: &SoulId,
+    create_key: &str,
+) -> Result<OpenCodeTransferDescriptor, String> {
+    let (target_image_ref, target_schema, target_build_receipt) = client
+        .opencode_transfer_target()
+        .await
+        .map_err(|error| format!("OpenCode transfer target is unavailable: {error}"))?;
+    let workspace_for_export = workspace.to_path_buf();
+    let root_for_export = root_session_id.to_string();
+    let snapshot = tokio::task::spawn_blocking(move || {
+        let inventory =
+            freshell_sessions::opencode_transfer::HostOpenCodeInventory::from_process_environment(
+                Vec::new(),
+            )
+            .with_trusted_mount_for_selected_session(workspace_for_export);
+        freshell_sessions::opencode_transfer::export_exact_session(
+            &inventory,
+            &root_for_export,
+            freshell_sessions::opencode_transfer::ExportOptions::default(),
+        )
+    })
+    .await
+    .map_err(|error| format!("OpenCode exact-session export did not settle: {error}"))?
+    .map_err(|error| error.to_string())?;
+    let manifest = snapshot.manifest();
+    if manifest.provider_schema != target_schema {
+        return Err("OpenCode source schema is incompatible with the pinned runtime image".into());
+    }
+    let transfer_identity = format!(
+        "{create_key}:{}:{}:{}",
+        manifest.generation,
+        manifest.source_store_id,
+        destination_store_id.as_str()
+    );
+    let transfer_id = format!("opencode-transfer-{}", stable_hex(&transfer_identity));
+    let incarnation_id = IncarnationId::parse(format!(
+        "incarnation-opencode-{}",
+        stable_hex(&transfer_identity)
+    ))
+    .map_err(|error| error.to_string())?;
+    let file = OpenCodeTransferFile {
+        index: 0,
+        relative_path: "payload.json".into(),
+        size_bytes: manifest.payload_bytes,
+        sha256: manifest.payload_sha256.clone(),
+    };
+    let mut descriptor = OpenCodeTransferDescriptor {
+        transfer_id,
+        provider: "opencode".into(),
+        source_store_id: manifest.source_store_id.clone(),
+        root_session_id: manifest.root_session_id.clone(),
+        source_generation: manifest.generation.clone(),
+        provider_schema: manifest.provider_schema.clone(),
+        source_schema_fingerprint: manifest.source_schema_fingerprint.clone(),
+        migration_journal_fingerprint: manifest.migration_journal_fingerprint.clone(),
+        destination_store_id: destination_store_id.to_string(),
+        destination_database_path: OPENCODE_TRANSFER_DESTINATION_DB.into(),
+        target_image_ref,
+        target_build_receipt,
+        incarnation_id: incarnation_id.to_string(),
+        manifest_json: serde_json::to_string(manifest)
+            .map_err(|error| format!("encode OpenCode transfer manifest: {error}"))?,
+        files: vec![file],
+        total_bytes: manifest.payload_bytes,
+        bundle_sha256: String::new(),
+    };
+    descriptor.bundle_sha256 = freshell_runtime_protocol::opencode_transfer_bundle_digest(
+        &descriptor.manifest_json,
+        &descriptor.files,
+    );
+    descriptor
+        .validate()
+        .map_err(|error| format!("OpenCode transfer descriptor is invalid: {}", error.message))?;
+
+    let (mut sequence, mut offset) = match client
+        .opencode_transfer_begin(descriptor.clone())
+        .await
+        .map_err(|error| format!("OpenCode transfer staging could not begin: {error}"))?
+    {
+        OpenCodeTransferResult::Started {
+            next_sequence,
+            file_offsets,
+        } => {
+            let [file_offset] = file_offsets.as_slice() else {
+                return Err("OpenCode staging returned unexpected file offsets".into());
+            };
+            if file_offset.file_index != 0 {
+                return Err("OpenCode staging returned an unexpected payload file".into());
+            }
+            (next_sequence, file_offset.next_offset)
+        }
+        OpenCodeTransferResult::Queued { .. } => {
+            return Err("OpenCode history transfer is queued for staging capacity".into());
+        }
+        _ => return Err("OpenCode staging returned an unexpected begin result".into()),
+    };
+    let expected_sequence = offset.div_ceil(MAX_OPENCODE_TRANSFER_CHUNK_BYTES as u64);
+    if offset > descriptor.total_bytes || sequence != expected_sequence {
+        return Err("OpenCode staging resume cursor is inconsistent".into());
+    }
+    if offset != descriptor.total_bytes && offset % MAX_OPENCODE_TRANSFER_CHUNK_BYTES as u64 != 0 {
+        return Err("OpenCode staging resume offset is not chunk aligned".into());
+    }
+
+    let mut payload = TokioFile::from_std(
+        snapshot
+            .open_payload()
+            .map_err(|error| format!("OpenCode exact-session payload is unavailable: {error}"))?,
+    );
+    payload
+        .seek(std::io::SeekFrom::Start(offset))
+        .await
+        .map_err(|error| format!("OpenCode payload seek failed: {error}"))?;
+    while offset < descriptor.total_bytes {
+        let remaining = descriptor.total_bytes - offset;
+        let chunk_size = remaining.min(MAX_OPENCODE_TRANSFER_CHUNK_BYTES as u64) as usize;
+        let mut data = vec![0; chunk_size];
+        payload
+            .read_exact(&mut data)
+            .await
+            .map_err(|error| format!("OpenCode payload read failed: {error}"))?;
+        let chunk = OpenCodeTransferChunk {
+            transfer_id: descriptor.transfer_id.clone(),
+            sequence,
+            file_index: 0,
+            offset,
+            sha256: format!("{:x}", Sha256::digest(&data)),
+            data,
+        };
+        match client
+            .opencode_transfer_chunk(chunk)
+            .await
+            .map_err(|error| format!("OpenCode transfer chunk was rejected: {error}"))?
+        {
+            OpenCodeTransferResult::ChunkStored { sequence: stored } if stored == sequence => {}
+            _ => return Err("OpenCode staging returned an unexpected chunk result".into()),
+        }
+        offset += chunk_size as u64;
+        sequence += 1;
+    }
+    match client
+        .opencode_transfer_finalize(descriptor.transfer_id.clone())
+        .await
+        .map_err(|error| format!("OpenCode transfer could not be finalized: {error}"))?
+    {
+        OpenCodeTransferResult::Ready { transfer_id } if transfer_id == descriptor.transfer_id => {
+            Ok(descriptor)
+        }
+        _ => Err("OpenCode staging did not return the ready transfer".into()),
+    }
+}
+
 fn managed_provider_env(
     mode: &str,
     source: &std::collections::BTreeMap<String, String>,
@@ -773,6 +953,10 @@ fn managed_provider_env(
     );
     if mode == "opencode" {
         env.insert("TMPDIR".into(), "/run/opencode-tmp".into());
+        env.insert(
+            "OPENCODE_DB".into(),
+            "/home/freshell/provider/.local/share/opencode/opencode.db".into(),
+        );
         if let Some(value) = source
             .get("FRESHELL_OPENCODE_REBIND")
             .filter(|value| matches!(value.as_str(), "0" | "false"))
