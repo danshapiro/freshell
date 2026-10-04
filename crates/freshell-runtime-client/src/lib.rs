@@ -196,11 +196,15 @@ impl RuntimeClient {
     pub async fn opencode_transfer_begin(
         &self,
         descriptor: OpenCodeTransferDescriptor,
+        attempt_id: String,
     ) -> Result<OpenCodeTransferResult, ClientError> {
         match self
             .request(
                 RequestId::new(),
-                AdminCommand::OpenCodeTransfer(OpenCodeTransferAction::Begin(Box::new(descriptor))),
+                AdminCommand::OpenCodeTransfer(OpenCodeTransferAction::Begin {
+                    descriptor: Box::new(descriptor),
+                    attempt_id,
+                }),
             )
             .await?
         {
@@ -228,11 +232,15 @@ impl RuntimeClient {
     pub async fn opencode_transfer_finalize(
         &self,
         transfer_id: String,
+        attempt_id: String,
     ) -> Result<OpenCodeTransferResult, ClientError> {
         match self
             .request(
                 RequestId::new(),
-                AdminCommand::OpenCodeTransfer(OpenCodeTransferAction::Finalize { transfer_id }),
+                AdminCommand::OpenCodeTransfer(OpenCodeTransferAction::Finalize {
+                    transfer_id,
+                    attempt_id,
+                }),
             )
             .await?
         {
@@ -244,11 +252,15 @@ impl RuntimeClient {
     pub async fn opencode_transfer_abort(
         &self,
         transfer_id: String,
+        attempt_id: String,
     ) -> Result<OpenCodeTransferResult, ClientError> {
         match self
             .request(
                 RequestId::new(),
-                AdminCommand::OpenCodeTransfer(OpenCodeTransferAction::Abort { transfer_id }),
+                AdminCommand::OpenCodeTransfer(OpenCodeTransferAction::Abort {
+                    transfer_id,
+                    attempt_id,
+                }),
             )
             .await?
         {
