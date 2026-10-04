@@ -1,11 +1,12 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
-import { render, cleanup, screen, fireEvent, act } from '@testing-library/react'
+import { render, cleanup, screen, fireEvent, act, waitFor, within } from '@testing-library/react'
 import { Provider } from 'react-redux'
 import { configureStore } from '@reduxjs/toolkit'
 
 import HistoryView from '@/components/HistoryView'
 import sessionsReducer, { commitSessionWindowVisibleRefresh } from '@/store/sessionsSlice'
 import tabsReducer from '@/store/tabsSlice'
+import { fetchSidebarSessionsSnapshot } from '@/lib/api'
 
 // HistoryView calls into api helpers for refresh/rename/delete; keep tests isolated.
 // Spread the real module so pure named exports (e.g. isApiUnauthorizedError,
@@ -36,6 +37,13 @@ vi.mock('@/lib/api', async () => {
 describe('HistoryView a11y', () => {
   beforeEach(() => {
     vi.restoreAllMocks()
+    vi.mocked(fetchSidebarSessionsSnapshot).mockResolvedValue({
+      projects: [],
+      totalSessions: 0,
+      oldestIncludedTimestamp: 0,
+      oldestIncludedSessionId: '',
+      hasMore: false,
+    })
   })
 
   afterEach(() => {
@@ -137,6 +145,9 @@ describe('HistoryView a11y', () => {
     const alert = screen.getByTestId('history-session-directory-integrity-error')
     expect(alert).toHaveAttribute('role', 'alert')
     expect(alert).toHaveTextContent('Running terminals remain available')
+
+    fireEvent.click(within(alert).getByRole('button', { name: 'Dismiss' }))
+    expect(screen.queryByTestId('history-session-directory-integrity-error')).toBeNull()
   })
 
   it('the integrity-error banner is dismissable with an X; a changed collision count re-shows it', () => {
@@ -178,9 +189,10 @@ describe('HistoryView a11y', () => {
         <HistoryView />
       </Provider>,
     )
-    expect(screen.getByTestId('history-session-directory-integrity-error')).toBeInTheDocument()
+    const alert = screen.getByTestId('history-session-directory-integrity-error')
+    expect(alert).toHaveAttribute('role', 'alert')
 
-    fireEvent.click(screen.getByRole('button', { name: 'Dismiss' }))
+    fireEvent.click(within(alert).getByRole('button', { name: 'Dismiss' }))
     expect(screen.queryByTestId('history-session-directory-integrity-error')).toBeNull()
 
     // A NEW collision count (fresh data problem) re-arms the banner.
@@ -194,5 +206,65 @@ describe('HistoryView a11y', () => {
       }))
     })
     expect(screen.getByTestId('history-session-directory-integrity-error')).toHaveTextContent('3 conflicting saved session')
+  })
+
+  it('loads the History surface when Sidebar already populated top-level projects', async () => {
+    vi.mocked(fetchSidebarSessionsSnapshot).mockResolvedValueOnce({
+      projects: [],
+      totalSessions: 0,
+      oldestIncludedTimestamp: 0,
+      oldestIncludedSessionId: '',
+      hasMore: false,
+      integrityError: {
+        kind: 'identity_collision',
+        collisionCount: 1,
+        duplicateItemCount: 2,
+      },
+    })
+
+    const store = configureStore({
+      reducer: {
+        sessions: sessionsReducer,
+        tabs: tabsReducer,
+      },
+      middleware: (getDefault) =>
+        getDefault({
+          serializableCheck: {
+            ignoredPaths: ['sessions.expandedProjects'],
+          },
+        }),
+      preloadedState: {
+        sessions: {
+          projects: [{
+            projectPath: '/sidebar/already-loaded',
+            sessions: [{
+              provider: 'codex',
+              sessionId: 'already-loaded-from-sidebar',
+              projectPath: '/sidebar/already-loaded',
+              lastActivityAt: Date.now(),
+              title: 'Already loaded session',
+            }],
+          }],
+          expandedProjects: new Set(['/sidebar/already-loaded']),
+        },
+        tabs: { tabs: [], activeTabId: null },
+      } as any,
+    })
+
+    render(
+      <Provider store={store}>
+        <HistoryView />
+      </Provider>,
+    )
+
+    await waitFor(() => {
+      expect(fetchSidebarSessionsSnapshot).toHaveBeenCalledTimes(1)
+      const alert = screen.getByTestId('history-session-directory-integrity-error')
+      expect(alert).toHaveAttribute('role', 'alert')
+    })
+
+    const alert = screen.getByTestId('history-session-directory-integrity-error')
+    fireEvent.click(within(alert).getByRole('button', { name: 'Dismiss' }))
+    expect(screen.queryByTestId('history-session-directory-integrity-error')).toBeNull()
   })
 })

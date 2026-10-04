@@ -437,6 +437,9 @@ describe('Sidebar Component - Session-Centric Display', () => {
     expect(alert).toHaveTextContent('2 conflicting saved session identities are hidden')
     expect(alert).toHaveTextContent('Running terminals remain available')
     expect(screen.getByRole('button', { name: /Healthy session/ })).toBeInTheDocument()
+
+    fireEvent.click(within(alert).getByRole('button', { name: 'Dismiss' }))
+    expect(screen.queryByTestId('session-directory-integrity-error')).toBeNull()
   })
 
   it('the integrity-error banner is dismissable with an X; a changed collision count re-shows it', async () => {
@@ -464,9 +467,10 @@ describe('Sidebar Component - Session-Centric Display', () => {
     await act(async () => {
       vi.advanceTimersByTime(100)
     })
-    expect(screen.getByTestId('session-directory-integrity-error')).toBeInTheDocument()
+    const alert = screen.getByTestId('session-directory-integrity-error')
+    expect(alert).toHaveAttribute('role', 'alert')
 
-    fireEvent.click(screen.getByRole('button', { name: 'Dismiss' }))
+    fireEvent.click(within(alert).getByRole('button', { name: 'Dismiss' }))
     expect(screen.queryByTestId('session-directory-integrity-error')).toBeNull()
 
     // A NEW collision count (fresh data problem) re-arms the banner.
@@ -1836,6 +1840,40 @@ describe('Sidebar Component - Session-Centric Display', () => {
   })
 
   describe('session click handling', () => {
+    it('opens a composed Codex row using its canonical session id and provider', async () => {
+      const canonicalSessionId = 'b7936c10-4935-441c-837c-c1f33cafec2d'
+      const projects: ProjectGroup[] = [{
+        projectPath: '/home/user/project',
+        sessions: [{
+          provider: 'codex',
+          sessionId: canonicalSessionId,
+          projectPath: '/home/user/project',
+          lastActivityAt: Date.now(),
+          createdAt: Date.now() - 10_000,
+          title: 'Composed Codex session',
+          cwd: '/home/user/project',
+          firstUserMessage: 'Older first request',
+        }],
+      }]
+
+      const store = createTestStore({ projects })
+      const { onNavigate } = renderSidebar(store, [])
+
+      await act(async () => {
+        vi.advanceTimersByTime(100)
+      })
+
+      fireEvent.click(screen.getByRole('button', { name: /Composed Codex session/ }))
+
+      expect(onNavigate).toHaveBeenCalledWith('terminal')
+      expect(store.getState().tabs.tabs).toHaveLength(1)
+      expect(store.getState().tabs.tabs[0].sessionRef).toEqual({
+        provider: 'codex',
+        sessionId: canonicalSessionId,
+      })
+      expect(store.getState().tabs.tabs[0].mode).toBe('codex')
+    })
+
     it('resumes non-running session on click', async () => {
       const projects: ProjectGroup[] = [
         {

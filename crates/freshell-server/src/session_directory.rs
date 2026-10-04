@@ -48,6 +48,7 @@ use axum::{
     Json, Router,
 };
 use base64::Engine as _;
+use freshell_sessions::codex_segments::CodexUnresolvedIdentity;
 use freshell_sessions::directory_index::{IndexedSession, SessionIndex};
 // SESSION-07: the `userMessages`/`fullText` tier file-content search
 // (`apply_file_search`, below) -- ports `server/session-directory/file-search.ts`.
@@ -88,6 +89,10 @@ pub struct SessionDirectoryState {
     /// STATUS-STRIP: stamped on every session-directory page (`serverInstance`);
     /// clients order pages by `snapshotSeq` only within one instance.
     pub server_instance: Arc<String>,
+    /// Process-lifetime full collision signatures. Cloned route state shares
+    /// this gate so repeated polls log only once for each complete source set.
+    pub(crate) collision_signatures:
+        Arc<std::sync::Mutex<std::collections::HashSet<CollisionSignature>>>,
     /// Task 20 (read-join): the SESSION-06 metadata store
     /// (`session-metadata.json`, same `.freshell` home dir as the POST route)
     /// whose `sessionType` tags [`apply_session_metadata`] overlays onto
@@ -104,6 +109,12 @@ pub struct SessionDirectoryState {
     /// mid-session. Out-of-scope providers keep the legacy ladder.
     pub legacy_name_migration_completed: bool,
 }
+
+/// Canonical sorted `(provider:sessionId, sorted source paths)` evidence for
+/// one complete identity-collision snapshot. Kept in process memory so a
+/// later distinct full source set is logged even when its bounded sample is
+/// unchanged.
+pub(crate) type CollisionSignature = Vec<(String, Vec<String>)>;
 
 /// One directory item, typed for the sort/filter/cursor derivation. Serialized to
 /// the `SessionDirectoryItem` shape by [`DirItem::to_value`].
@@ -156,12 +167,10 @@ struct DirItem {
     /// response has never carried `titleSource`; exposing it would be a
     /// separate parity decision).
     title_source: Option<String>,
-    /// SESSION-07: the on-disk transcript to scan for the `userMessages`/
-    /// `fullText` tiers (`IndexedSession::source_file`). Internal only --
-    /// never serialized (`to_value` never reads it), mirroring
-    /// `sourceFiles.get(key)` (`session-directory/service.ts:164-173`), which
-    /// is looked up server-side and never sent to the client either.
-    source_file: Option<PathBuf>,
+    /// Private on-disk transcript paths searched for `userMessages` and
+    /// `fullText`. A composed Codex row carries every chronological segment;
+    /// other file-backed rows carry their single transcript. Never serialized.
+    source_files: Vec<PathBuf>,
     /// STATUS-STRIP: live token usage (`SessionDirectoryItem.tokenUsage`,
     /// `shared/read-models.ts`; Node's `CodingCliSession.tokenUsage`,
     /// `coding-cli/types.ts:190`). Powers the fresh-agent strip's context
@@ -559,14 +568,39 @@ async fn session_directory(
     // the query (visibility filters, search, cursor paging) still compose
     // freshly PER REQUEST, same as before -- only the expensive filesystem
     // scan itself is now cached.
-    let items: Vec<DirItem> = match &state.session_index {
-        Some(index) => index
-            .snapshot()
-            .await
-            .iter()
-            .map(dir_item_from_indexed)
-            .collect(),
-        None => Vec::new(),
+    let (items, scan_failures, unresolved_codex_identities): (
+        Vec<DirItem>,
+        Vec<String>,
+        Arc<Vec<CodexUnresolvedIdentity>>,
+    ) = match &state.session_index {
+        Some(index) => {
+            let snapshot = index
+                .snapshot_with_failures_and_unresolved_codex_identities()
+                .await;
+            let items = snapshot
+                .sessions
+                .iter()
+                .map(|indexed| {
+                    let source_files = if indexed.provider == "codex" {
+                        snapshot
+                            .codex_segment_paths
+                            .get(&indexed.session_id)
+                            .filter(|paths| !paths.is_empty())
+                            .cloned()
+                            .unwrap_or_else(|| indexed.source_file.clone().into_iter().collect())
+                    } else {
+                        indexed.source_file.clone().into_iter().collect()
+                    };
+                    dir_item_from_indexed_with_source_files(indexed, source_files)
+                })
+                .collect();
+            (
+                items,
+                snapshot.scan_failures,
+                snapshot.unresolved_codex_identities,
+            )
+        }
+        None => (Vec::new(), Vec::new(), Arc::new(Vec::new())),
     };
     // STATUS-STRIP: assign the monotonic snapshot sequence AFTER the index
     // snapshot is captured — captured order is authoritative, and a seq
@@ -628,20 +662,29 @@ async fn session_directory(
         .max()
         .unwrap_or(0)
         .max(0);
-    let collisions = persisted_identity_collisions(&items);
+    let collisions = merge_unresolved_codex_identity_collisions(
+        persisted_identity_collisions(&items),
+        &unresolved_codex_identities,
+    );
     let identity_collision = if !collisions.is_empty() {
         let log_summary = persisted_identity_collision_log_summary(&collisions);
         let collision_samples_json =
             serde_json::to_string(&log_summary.samples).unwrap_or_else(|_| "[]".to_string());
-        tracing::error!(
-            target: "freshell_server::session_directory",
-            collision_count = log_summary.collision_count,
-            duplicate_item_count = log_summary.duplicate_item_count,
-            collision_sample_count = log_summary.samples.len(),
-            collision_samples_truncated = log_summary.collision_samples_truncated,
-            collision_samples_json = %collision_samples_json,
-            "session_directory_identity_collision"
-        );
+        let signature = persisted_identity_collision_signature(&collisions);
+        let signature_id = persisted_identity_collision_signature_id(&signature);
+        let should_log = state.collision_signatures.lock().unwrap().insert(signature);
+        if should_log {
+            tracing::error!(
+                target: "freshell_server::session_directory",
+                collision_signature_id = %signature_id,
+                collision_count = log_summary.collision_count,
+                duplicate_item_count = log_summary.duplicate_item_count,
+                collision_sample_count = log_summary.samples.len(),
+                collision_samples_truncated = log_summary.collision_samples_truncated,
+                collision_samples_json = %collision_samples_json,
+                "session_directory_identity_collision"
+            );
+        }
         Some((
             collisions
                 .iter()
@@ -687,6 +730,12 @@ async fn session_directory(
             page["snapshotSeq"] = json!(snapshot_seq);
             page["serverInstance"] = json!(state.server_instance.as_str());
             page["bootId"] = json!(directory_boot_id());
+            if !scan_failures.is_empty() {
+                page["partial"] = json!(true);
+                if page.get("partialReason").is_none() {
+                    page["partialReason"] = json!("io_error");
+                }
+            }
             if let Some((_, collision_count, duplicate_item_count)) = identity_collision {
                 // Keep an I/O/budget partial reason if the same request also
                 // encountered one. Collision identity travels only in the
@@ -799,21 +848,87 @@ fn persisted_identity_collisions(items: &[DirItem]) -> Vec<PersistedIdentityColl
             };
             let mut source_files: Vec<String> = indices
                 .into_iter()
-                .map(|index| {
-                    items[index]
-                        .source_file
-                        .as_deref()
-                        .map(|path| path.to_string_lossy().into_owned())
-                        .unwrap_or_else(|| "<unknown>".to_string())
+                .flat_map(|index| {
+                    if items[index].source_files.is_empty() {
+                        vec!["<unknown>".to_string()]
+                    } else {
+                        items[index]
+                            .source_files
+                            .iter()
+                            .map(|path| path.to_string_lossy().into_owned())
+                            .collect()
+                    }
                 })
                 .collect();
             source_files.sort();
+            source_files.dedup();
             Some(PersistedIdentityCollision {
                 key: format!("{provider}:{session_id}"),
                 source_files,
             })
         })
         .collect()
+}
+
+/// Merge route-visible duplicate rows with same-generation Codex identity
+/// evidence. A non-renderable member still contributes its complete path and
+/// quarantines any renderable row with the same canonical Codex id.
+fn merge_unresolved_codex_identity_collisions(
+    collisions: Vec<PersistedIdentityCollision>,
+    unresolved: &[CodexUnresolvedIdentity],
+) -> Vec<PersistedIdentityCollision> {
+    let mut sources_by_key: std::collections::BTreeMap<String, std::collections::BTreeSet<String>> =
+        std::collections::BTreeMap::new();
+    for collision in collisions {
+        sources_by_key
+            .entry(collision.key)
+            .or_default()
+            .extend(collision.source_files);
+    }
+    for group in unresolved {
+        if group.paths.len() < 2 {
+            continue;
+        }
+        let key = format!("codex:{}", group.session_id);
+        sources_by_key.entry(key).or_default().extend(
+            group
+                .paths
+                .iter()
+                .map(|path| path.to_string_lossy().into_owned()),
+        );
+    }
+    sources_by_key
+        .into_iter()
+        .filter_map(|(key, paths)| {
+            (paths.len() >= 2).then(|| PersistedIdentityCollision {
+                key,
+                source_files: paths.into_iter().collect(),
+            })
+        })
+        .collect()
+}
+
+fn persisted_identity_collision_signature(
+    collisions: &[PersistedIdentityCollision],
+) -> CollisionSignature {
+    let mut signature: CollisionSignature = collisions
+        .iter()
+        .map(|collision| (collision.key.clone(), collision.source_files.clone()))
+        .collect();
+    signature.sort();
+    for (_, paths) in &mut signature {
+        paths.sort();
+        paths.dedup();
+    }
+    signature
+}
+
+fn persisted_identity_collision_signature_id(signature: &CollisionSignature) -> String {
+    use sha2::{Digest, Sha256};
+
+    let canonical = serde_json::to_vec(signature)
+        .expect("a collision signature made only of strings always serializes");
+    format!("{:x}", Sha256::digest(canonical))
 }
 
 /// Build a deterministic, bounded diagnostic sample for the collision log.
@@ -952,7 +1067,16 @@ pub(crate) fn codex_home(home: &Path) -> PathBuf {
 /// take their defaults here, exactly as `item_from_meta` did before the
 /// index existed -- `apply_session_overrides` / `apply_title_search` overlay
 /// them afterwards, unchanged.
+#[cfg(test)]
 fn dir_item_from_indexed(idx: &IndexedSession) -> DirItem {
+    let source_files = idx.source_file.clone().into_iter().collect();
+    dir_item_from_indexed_with_source_files(idx, source_files)
+}
+
+fn dir_item_from_indexed_with_source_files(
+    idx: &IndexedSession,
+    source_files: Vec<PathBuf>,
+) -> DirItem {
     DirItem {
         session_id: idx.session_id.clone(),
         legacy_session_id: idx.legacy_session_id.clone(),
@@ -974,7 +1098,7 @@ fn dir_item_from_indexed(idx: &IndexedSession) -> DirItem {
         live_terminal_only: false,
         session_type: None,
         title_source: idx.title_source.clone(),
-        source_file: idx.source_file.clone(),
+        source_files,
         token_usage: idx.token_usage.clone(),
         // Provenance is overlay-derived (`apply_session_overrides`), never
         // parsed from the transcript.
@@ -1140,7 +1264,7 @@ fn item_from_meta(
         live_terminal_only: false,
         session_type: None,
         title_source: meta.title_source.clone(),
-        source_file,
+        source_files: source_file.into_iter().collect(),
         token_usage: None,
         title_overridden: false,
         provider_title: None,
@@ -1516,7 +1640,7 @@ fn build_live_terminal_session_item(
         // parsed title source (Node's `buildLiveTerminalSessionItem` sets no
         // `titleSource` either, `service.ts:110-130`).
         title_source: None,
-        source_file: None,
+        source_files: Vec::new(),
         // PARITY NOTE: Rust's `TerminalIdentity` carries no token usage, so a
         // live-terminal-only row reports none here — unlike Node, whose
         // `TerminalMeta` carries `tokenUsage`. Fresh-agent pane sessions are
@@ -1629,7 +1753,7 @@ mod join_tests {
             live_terminal_only: false,
             session_type: None,
             title_source: None,
-            source_file: None,
+            source_files: Vec::new(),
             token_usage: None,
             title_overridden: false,
             provider_title: None,
@@ -2069,7 +2193,7 @@ struct FileSearchOutcome {
 /// "more exist" without this function ever scanning the entire remaining
 /// list (unlike the title tier, which does).
 ///
-/// An item with no [`DirItem::source_file`] (a live-terminal-only item, or a
+/// An item with no [`DirItem::source_files`] (a live-terminal-only item, or a
 /// provider with no per-file source -- opencode/amplifier) or an unsupported
 /// `provider` is skipped WITHOUT counting against the scan budget, mirroring
 /// `service.ts:191-195`'s `if (!sourceFile) continue` / `if (!provider) continue`
@@ -2086,35 +2210,42 @@ fn apply_file_search(
     let mut partial = false;
     let mut partial_reason: Option<&'static str> = None;
 
-    for item in items {
+    'items: for item in items {
         if results.len() > limit {
             break;
         }
-        if scanned >= max_scan {
-            partial = true;
-            partial_reason = Some("budget");
-            break;
-        }
-        let Some(source_file) = item.source_file.clone() else {
-            continue;
-        };
         if !matches!(item.provider.as_str(), "claude" | "codex") {
             continue;
         }
-        scanned += 1;
+        if item.source_files.is_empty() {
+            continue;
+        }
 
-        match search_session_file(&source_file, &item.provider, query_text, tier) {
-            Ok(Some(m)) => {
-                let mut matched = item;
-                matched.matched_in = Some(m.matched_in.to_string());
-                matched.snippet = Some(m.snippet);
-                results.push(matched);
+        for source_file in &item.source_files {
+            if results.len() > limit {
+                break 'items;
             }
-            Ok(None) => {}
-            Err(_) => {
+            if scanned >= max_scan {
                 partial = true;
-                if partial_reason.is_none() {
-                    partial_reason = Some("io_error");
+                partial_reason = Some("budget");
+                break 'items;
+            }
+            scanned += 1;
+
+            match search_session_file(source_file, &item.provider, query_text, tier) {
+                Ok(Some(m)) => {
+                    let mut matched = item.clone();
+                    matched.matched_in = Some(m.matched_in.to_string());
+                    matched.snippet = Some(m.snippet);
+                    results.push(matched);
+                    break;
+                }
+                Ok(None) => {}
+                Err(_) => {
+                    partial = true;
+                    if partial_reason.is_none() {
+                        partial_reason = Some("io_error");
+                    }
                 }
             }
         }
@@ -2585,7 +2716,7 @@ mod tests {
             live_terminal_only: false,
             session_type: None,
             title_source: None,
-            source_file: None,
+            source_files: Vec::new(),
             token_usage: Some(freshell_sessions::meta::TokenSummary {
                 input_tokens: 10,
                 output_tokens: 5,
@@ -2859,7 +2990,7 @@ mod tests {
             live_terminal_only: false,
             session_type: None,
             title_source: None,
-            source_file: None,
+            source_files: Vec::new(),
             token_usage: None,
             title_overridden: false,
             provider_title: None,
@@ -3078,7 +3209,7 @@ mod tests {
             live_terminal_only: false,
             session_type: None,
             title_source: None,
-            source_file: None,
+            source_files: Vec::new(),
             token_usage: None,
             title_overridden: false,
             provider_title: None,
@@ -3133,7 +3264,7 @@ mod tests {
             live_terminal_only: false,
             session_type: None,
             title_source: None,
-            source_file: None,
+            source_files: Vec::new(),
             token_usage: None,
             title_overridden: false,
             provider_title: None,
@@ -3200,7 +3331,7 @@ mod tests {
             live_terminal_only: false,
             session_type: None,
             title_source: None,
-            source_file: None,
+            source_files: Vec::new(),
             token_usage: None,
             title_overridden: false,
             provider_title: None,
@@ -3276,7 +3407,7 @@ mod tests {
             live_terminal_only: false,
             session_type: None,
             title_source: None,
-            source_file: None,
+            source_files: Vec::new(),
             token_usage: None,
             title_overridden: false,
             provider_title: None,
@@ -3347,7 +3478,7 @@ mod tests {
             live_terminal_only: false,
             session_type: None,
             title_source: None,
-            source_file: None,
+            source_files: Vec::new(),
             token_usage: None,
             title_overridden: false,
             provider_title: None,
@@ -3399,7 +3530,7 @@ mod tests {
             live_terminal_only: false,
             session_type: None,
             title_source: title_source.map(str::to_string),
-            source_file: None,
+            source_files: Vec::new(),
             token_usage: None,
             title_overridden: false,
             provider_title: None,
@@ -3543,7 +3674,7 @@ mod tests {
             live_terminal_only: false,
             session_type: None,
             title_source: None,
-            source_file: None,
+            source_files: Vec::new(),
             token_usage: None,
             title_overridden: false,
             provider_title: None,
@@ -3719,8 +3850,658 @@ mod tests {
             identity,
             metadata: crate::session_metadata::SessionMetadataStore::new(home.join(".freshell")),
             server_instance: std::sync::Arc::new("srv-test".to_string()),
+            collision_signatures: Default::default(),
             legacy_name_migration_completed: false,
         })
+    }
+
+    fn codex_fixtures() -> (String, String) {
+        let fixture_dir =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../test/fixtures/coding-cli/codex");
+        let older = std::fs::read_to_string(
+            fixture_dir.join("multi-file-continuation-older.sanitized.jsonl"),
+        )
+        .unwrap()
+        .replace(
+            r#""type":"event_msg","payload":{"type":"user_message","message":"Older first request"}"#,
+            r#""type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"Older first request"}]}"#,
+        );
+        let newer = std::fs::read_to_string(
+            fixture_dir.join("multi-file-continuation-newer.sanitized.jsonl"),
+        )
+        .unwrap()
+        .replace(
+            r#""type":"event_msg","payload":{"type":"user_message","message":"Continuation title"}"#,
+            r#""type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"Continuation title"}]}"#,
+        );
+        (older, newer)
+    }
+
+    fn write_codex_segments(home: &Path, older: &str, newer: &str) -> (PathBuf, PathBuf) {
+        let sessions = home.join(".codex").join("sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        let older_path = sessions.join("z-older-rollout.jsonl");
+        let newer_path = sessions.join("a-newer-rollout.jsonl");
+        std::fs::write(&older_path, older).unwrap();
+        std::fs::write(&newer_path, newer).unwrap();
+        (older_path, newer_path)
+    }
+
+    fn codex_session_directory_app(
+        home: &Path,
+        cache_path: Option<PathBuf>,
+        identity: freshell_ws::identity::TerminalIdentityRegistry,
+    ) -> (Router, Arc<SessionIndex>) {
+        let source = Arc::new(CodexSource::new(home.join(".codex")));
+        let index = Arc::new(SessionIndex::with_ttl_and_cache_path(
+            vec![source],
+            Duration::from_secs(3600),
+            cache_path,
+        ));
+        let app = router(SessionDirectoryState {
+            auth_token: Arc::new("tok".to_string()),
+            settings: crate::settings_store::SettingsStore::load(Some(home), vec!["codex".into()]),
+            session_index: Some(Arc::clone(&index)),
+            identity,
+            metadata: crate::session_metadata::SessionMetadataStore::new(home.join(".freshell")),
+            server_instance: Arc::new("srv-codex-test".to_string()),
+            collision_signatures: Default::default(),
+            legacy_name_migration_completed: false,
+        });
+        (app, index)
+    }
+
+    #[tokio::test]
+    async fn codex_multi_file_route_searches_each_segment_once() {
+        let home = unique_temp_dir();
+        let (older, newer) = codex_fixtures();
+        write_codex_segments(&home, &older, &newer);
+        let (app, _index) = codex_session_directory_app(
+            &home,
+            None,
+            freshell_ws::identity::TerminalIdentityRegistry::new(),
+        );
+
+        let base = "/api/session-directory?priority=visible&includeNonInteractive=1";
+        let page = get_directory_page(&app, base).await;
+        let session_id = "b7936c10-4935-441c-837c-c1f33cafec2d";
+        let rows = page["items"].as_array().unwrap();
+        assert_eq!(
+            rows.len(),
+            1,
+            "the accepted continuation is one logical row"
+        );
+        assert_eq!(rows[0]["sessionId"], json!(session_id));
+        assert_eq!(
+            rows[0]["createdAt"],
+            json!(
+                chrono::DateTime::parse_from_rfc3339("2026-10-03T00:00:00.000Z")
+                    .unwrap()
+                    .timestamp_millis()
+            )
+        );
+        assert_eq!(
+            rows[0]["lastActivityAt"],
+            json!(
+                chrono::DateTime::parse_from_rfc3339("2026-10-03T00:00:10.009Z")
+                    .unwrap()
+                    .timestamp_millis()
+            )
+        );
+        assert!(page.get("integrityError").is_none());
+
+        for (needle, tier, matched_in) in [
+            ("Older first request", "userMessages", "userMessage"),
+            ("Continuation title", "userMessages", "userMessage"),
+            ("Older assistant summary", "fullText", "assistantMessage"),
+            ("Continuation summary", "fullText", "assistantMessage"),
+        ] {
+            let query = format!("{base}&query={}&tier={tier}", needle.replace(' ', "%20"));
+            let result = get_directory_page(&app, &query).await;
+            let matches = result["items"].as_array().unwrap();
+            assert_eq!(matches.len(), 1, "segment needle {needle:?}: {result}");
+            assert_eq!(matches[0]["sessionId"], json!(session_id));
+            assert_eq!(matches[0]["matchedIn"], json!(matched_in));
+            assert!(matches[0]["snippet"].as_str().unwrap().contains(needle));
+        }
+
+        let overlapping =
+            get_directory_page(&app, &format!("{base}&query=summary&tier=fullText")).await;
+        assert_eq!(
+            overlapping["items"].as_array().unwrap().len(),
+            1,
+            "a term found in multiple continuation segments returns one logical row"
+        );
+
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn codex_multi_file_apply_file_search_keeps_match_after_io_error() {
+        let home = unique_temp_dir();
+        let (older, _) = codex_fixtures();
+        let sessions = home.join("sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        let missing_path = sessions.join("missing.jsonl");
+        let readable_path = sessions.join("readable.jsonl");
+        std::fs::write(&readable_path, older).unwrap();
+        let mut item = dir_item_from_indexed(&static_indexed_session(
+            "codex",
+            "b7936c10-4935-441c-837c-c1f33cafec2d",
+            missing_path.to_str().unwrap(),
+            100,
+        ));
+        item.source_files.push(readable_path);
+
+        let result = apply_file_search(
+            vec![item],
+            "Older first request",
+            FileSearchTier::UserMessages,
+            1,
+        );
+        assert!(result.partial);
+        assert_eq!(result.partial_reason, Some("io_error"));
+        assert_eq!(result.items.len(), 1);
+        assert_eq!(
+            result.items[0].session_id,
+            "b7936c10-4935-441c-837c-c1f33cafec2d"
+        );
+        assert_eq!(result.items[0].matched_in.as_deref(), Some("userMessage"));
+        assert!(result.items[0]
+            .snippet
+            .as_deref()
+            .unwrap()
+            .contains("Older first request"));
+
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn codex_multi_file_apply_file_search_counts_segments_against_shared_budget() {
+        let home = unique_temp_dir();
+        let (older, _) = codex_fixtures();
+        let sessions = home.join("sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        let unmatched = older.replace("Older first request", "unmatched segment text");
+        let first_path = sessions.join("segment-00.jsonl");
+        std::fs::write(&first_path, &unmatched).unwrap();
+        let mut item = dir_item_from_indexed(&static_indexed_session(
+            "codex",
+            "same-logical-session",
+            first_path.to_str().unwrap(),
+            100,
+        ));
+        for index in 1..10 {
+            let path = sessions.join(format!("segment-{index:02}.jsonl"));
+            std::fs::write(&path, &unmatched).unwrap();
+            item.source_files.push(path);
+        }
+        let eleventh_path = sessions.join("segment-10.jsonl");
+        std::fs::write(&eleventh_path, older).unwrap();
+        item.source_files.push(eleventh_path);
+
+        let result = apply_file_search(
+            vec![item],
+            "Older first request",
+            FileSearchTier::UserMessages,
+            1,
+        );
+        assert!(
+            result.items.is_empty(),
+            "the eleventh segment is outside the scan budget"
+        );
+        assert!(result.partial);
+        assert_eq!(result.partial_reason, Some("budget"));
+
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[tokio::test]
+    async fn codex_multi_file_route_preserves_collision_quarantine_for_a_large_copy() {
+        let home = unique_temp_dir();
+        let (older, newer) = codex_fixtures();
+        let large = copied_large_codex_transcript(&older);
+        assert_eq!(large.lines().count(), 2001);
+        let sessions = home.join(".codex").join("sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        for name in ["copy-a.jsonl", "copy-b.jsonl"] {
+            std::fs::write(sessions.join(name), &large).unwrap();
+        }
+        let healthy_id = "11111111-2222-4333-8444-555555555555";
+        std::fs::write(
+            sessions.join("healthy.jsonl"),
+            newer.replace("b7936c10-4935-441c-837c-c1f33cafec2d", healthy_id),
+        )
+        .unwrap();
+
+        let identity = freshell_ws::identity::TerminalIdentityRegistry::new();
+        identity.upsert(
+            "term-conflicted-codex",
+            Some("codex"),
+            Some("b7936c10-4935-441c-837c-c1f33cafec2d"),
+            Some("/live/codex"),
+            2_000,
+        );
+        let (app, _index) = codex_session_directory_app(&home, None, identity);
+        let page = get_directory_page(
+            &app,
+            "/api/session-directory?priority=visible&includeNonInteractive=1",
+        )
+        .await;
+        assert_eq!(
+            page["integrityError"],
+            json!({
+                "kind": "identity_collision",
+                "collisionCount": 1,
+                "duplicateItemCount": 2,
+            })
+        );
+        let rows = page["items"].as_array().unwrap();
+        assert!(rows
+            .iter()
+            .any(|item| { item["provider"] == "codex" && item["sessionId"] == healthy_id }));
+        assert!(rows.iter().any(|item| {
+            item["provider"] == "codex"
+                && item["sessionId"] == "b7936c10-4935-441c-837c-c1f33cafec2d"
+                && item["runningTerminalId"] == "term-conflicted-codex"
+        }));
+        assert!(!serde_json::to_string(&page)
+            .unwrap()
+            .contains(&sessions.to_string_lossy().to_string()));
+
+        let limited = get_directory_page(
+            &app,
+            "/api/session-directory?priority=visible&includeNonInteractive=1&limit=1",
+        )
+        .await;
+        assert_eq!(limited["integrityError"]["collisionCount"], json!(1));
+
+        let filtered = get_directory_page(
+            &app,
+            "/api/session-directory?priority=visible&includeNonInteractive=1&query=absent-needle&limit=1",
+        )
+        .await;
+        assert_eq!(filtered["items"].as_array().unwrap().len(), 0);
+        assert_eq!(filtered["integrityError"]["collisionCount"], json!(1));
+
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn persisted_identity_collision_quarantines_renderable_rows_for_hidden_codex_members() {
+        let home = unique_temp_dir();
+        let (older, newer) = codex_fixtures();
+        let cwdless = newer.replace("\"cwd\":\"/sanitized/project\",", "");
+        let (older_path, hidden_path) = write_codex_segments(&home, &older, &cwdless);
+        let sessions = home.join(".codex").join("sessions");
+        let healthy_id = "11111111-2222-4333-8444-555555555555";
+        std::fs::write(
+            sessions.join("healthy.jsonl"),
+            newer.replace("b7936c10-4935-441c-837c-c1f33cafec2d", healthy_id),
+        )
+        .unwrap();
+        let cache_dir = unique_temp_dir();
+        std::fs::create_dir_all(&cache_dir).unwrap();
+        let cache_path = cache_dir.join("rust-session-cache.json");
+        let events = collision_trace_events();
+        let (app, index) = codex_session_directory_app(
+            &home,
+            Some(cache_path.clone()),
+            freshell_ws::identity::TerminalIdentityRegistry::new(),
+        );
+
+        let first = get_directory_page(
+            &app,
+            "/api/session-directory?priority=visible&includeNonInteractive=1&query=absent-needle&limit=1",
+        )
+        .await;
+        assert_eq!(first["items"].as_array().unwrap().len(), 0);
+        assert_eq!(
+            first["integrityError"],
+            json!({
+                "kind": "identity_collision",
+                "collisionCount": 1,
+                "duplicateItemCount": 2,
+            })
+        );
+        assert!(
+            std::fs::metadata(&cache_path).is_ok(),
+            "the index cache persisted"
+        );
+        let response_text = serde_json::to_string(&first).unwrap();
+        assert!(!response_text.contains(&older_path.to_string_lossy().to_string()));
+        assert!(!response_text.contains(&hidden_path.to_string_lossy().to_string()));
+        assert!(!response_text.contains(healthy_id));
+        let initial_events = collision_events_for_home(&events, &home);
+        assert_eq!(
+            initial_events.len(),
+            1,
+            "the initial collision signature is captured once"
+        );
+        assert_eq!(initial_events[0].level, tracing::Level::ERROR);
+        let initial_sample = &initial_events[0].fields["collision_samples_json"];
+        assert!(initial_sample.contains(&older_path.to_string_lossy().to_string()));
+        assert!(initial_sample.contains(&hidden_path.to_string_lossy().to_string()));
+
+        std::fs::remove_file(&hidden_path).unwrap();
+        index.mark_provider_dirty("codex");
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let refreshed = get_directory_page(
+                &app,
+                "/api/session-directory?priority=visible&includeNonInteractive=1",
+            )
+            .await;
+            if refreshed.get("integrityError").is_none() {
+                assert!(refreshed["items"].as_array().unwrap().iter().any(|item| {
+                    item["provider"] == "codex"
+                        && item["sessionId"] == "b7936c10-4935-441c-837c-c1f33cafec2d"
+                }));
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "removed evidence must clear"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+
+        let moved_hidden_path = sessions.join("zz-moved-hidden.jsonl");
+        std::fs::write(&moved_hidden_path, &cwdless).unwrap();
+        index.mark_provider_dirty("codex");
+        let moved = loop {
+            let page = get_directory_page(
+                &app,
+                "/api/session-directory?priority=visible&includeNonInteractive=1",
+            )
+            .await;
+            if page.get("integrityError").is_some() {
+                break page;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "moved evidence must be seen"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        };
+        assert_eq!(moved["integrityError"]["duplicateItemCount"], json!(2));
+        let moved_events = collision_events_for_home(&events, &home);
+        assert_eq!(
+            moved_events.len(),
+            2,
+            "the moved path changes the full signature"
+        );
+        assert!(moved_events[1].fields["collision_samples_json"]
+            .contains(&moved_hidden_path.to_string_lossy().to_string()));
+
+        drop(app);
+        drop(index);
+        let (reloaded_app, _reloaded_index) = codex_session_directory_app(
+            &home,
+            Some(cache_path),
+            freshell_ws::identity::TerminalIdentityRegistry::new(),
+        );
+        let after_reload = get_directory_page(
+            &reloaded_app,
+            "/api/session-directory?priority=visible&includeNonInteractive=1",
+        )
+        .await;
+        assert_eq!(after_reload["integrityError"]["collisionCount"], json!(1));
+        assert!(!serde_json::to_string(&after_reload)
+            .unwrap()
+            .contains(&moved_hidden_path.to_string_lossy().to_string()));
+
+        std::fs::remove_dir_all(&home).ok();
+        std::fs::remove_dir_all(&cache_dir).ok();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn persisted_identity_collision_logs_once_per_full_source_signature() {
+        let home = unique_temp_dir();
+        let (older, _) = codex_fixtures();
+        let large = copied_large_codex_transcript(&older);
+        let sessions = home.join(".codex").join("sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        for index in 0..6 {
+            std::fs::write(sessions.join(format!("collision-{index:02}.jsonl")), &large).unwrap();
+        }
+        let events = collision_trace_events();
+        let (app, index) = codex_session_directory_app(
+            &home,
+            None,
+            freshell_ws::identity::TerminalIdentityRegistry::new(),
+        );
+        let uri = "/api/session-directory?priority=visible&includeNonInteractive=1";
+
+        let (first, second, third) = tokio::join!(
+            get_directory_page(&app, uri),
+            get_directory_page(&app, uri),
+            get_directory_page(&app, uri),
+        );
+        for page in [&first, &second, &third] {
+            assert_eq!(page["integrityError"]["duplicateItemCount"], json!(6));
+            assert!(!serde_json::to_string(page)
+                .unwrap()
+                .contains(&sessions.to_string_lossy().to_string()));
+        }
+        let first_events = collision_events_for_home(&events, &home);
+        assert_eq!(
+            first_events.len(),
+            1,
+            "concurrent identical requests should emit one collision event"
+        );
+        assert_eq!(first_events[0].level, tracing::Level::ERROR);
+        let initial_id = decoded_trace_field(&first_events[0], "collision_signature_id");
+        assert!(!initial_id.is_empty());
+        let initial_samples = decoded_trace_field(&first_events[0], "collision_samples_json");
+        let parsed_samples: Vec<Value> = serde_json::from_str(&initial_samples).unwrap();
+        assert_eq!(parsed_samples.len(), 1);
+        assert_eq!(
+            parsed_samples[0]["source_files"].as_array().unwrap().len(),
+            4
+        );
+        assert_eq!(parsed_samples[0]["source_files_truncated"], json!(true));
+
+        let mut changes = index.subscribe_changes();
+        index.mark_provider_dirty("codex");
+        tokio::time::timeout(Duration::from_secs(5), changes.changed())
+            .await
+            .expect("unchanged refresh completes")
+            .unwrap();
+        let unchanged = get_directory_page(&app, uri).await;
+        assert_eq!(unchanged["integrityError"]["duplicateItemCount"], json!(6));
+        assert_eq!(
+            collision_events_for_home(&events, &home).len(),
+            1,
+            "unchanged refresh is suppressed"
+        );
+
+        let old_beyond_sample = sessions.join("collision-05.jsonl");
+        let moved_beyond_sample = sessions.join("zz-collision-05-moved.jsonl");
+        std::fs::rename(&old_beyond_sample, &moved_beyond_sample).unwrap();
+        index.mark_provider_dirty("codex");
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let snapshot = index
+                .snapshot_with_failures_and_unresolved_codex_identities()
+                .await;
+            let group = snapshot
+                .unresolved_codex_identities
+                .iter()
+                .find(|group| group.session_id == "b7936c10-4935-441c-837c-c1f33cafec2d");
+            if group.is_some_and(|group| {
+                group.paths.contains(&moved_beyond_sample)
+                    && !group.paths.contains(&old_beyond_sample)
+            }) {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "Codex provider refresh must publish the renamed member path"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let changed = get_directory_page(&app, uri).await;
+        assert_eq!(changed["integrityError"]["duplicateItemCount"], json!(6));
+        let refreshed_group = index
+            .unresolved_codex_identities()
+            .into_iter()
+            .find(|group| group.session_id == "b7936c10-4935-441c-837c-c1f33cafec2d")
+            .expect("the changed unresolved group remains indexed");
+        assert!(refreshed_group.paths.contains(&moved_beyond_sample));
+        assert!(!refreshed_group.paths.contains(&old_beyond_sample));
+
+        let all_events = collision_events_for_home(&events, &home);
+        assert_eq!(
+            all_events.len(),
+            2,
+            "one event is emitted for each new full signature"
+        );
+        let changed_id = decoded_trace_field(&all_events[1], "collision_signature_id");
+        assert_ne!(initial_id, changed_id);
+        assert_eq!(
+            decoded_trace_field(&all_events[1], "collision_samples_json"),
+            initial_samples,
+            "the changed path is beyond the bounded samples, so only the full signature id changes"
+        );
+        assert!(decoded_trace_field(&all_events[1], "collision_samples_json").len() < 2048);
+
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    async fn get_directory_page(app: &Router, uri: &str) -> Value {
+        use axum::http::Request;
+        use tower::ServiceExt;
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri(uri)
+                    .header("x-auth-token", "tok")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        serde_json::from_slice(&body).unwrap()
+    }
+
+    fn copied_large_codex_transcript(content: &str) -> String {
+        let lines: Vec<&str> = content.lines().collect();
+        let mut copied = String::from(lines[0]);
+        copied.push('\n');
+        for index in 0..2000usize {
+            let template =
+                serde_json::from_str::<Value>(lines[1 + index % (lines.len() - 1)]).unwrap();
+            let timestamp_seconds = index + 1;
+            let timestamp = format!(
+                "2026-10-03T{:02}:{:02}:{:02}.000Z",
+                timestamp_seconds / 3600,
+                (timestamp_seconds / 60) % 60,
+                timestamp_seconds % 60,
+            );
+            let mut record = template;
+            record["timestamp"] = Value::String(timestamp);
+            record["ordinal"] = Value::from(index as u64);
+            copied.push_str(&serde_json::to_string(&record).unwrap());
+            copied.push('\n');
+        }
+        copied
+    }
+
+    #[derive(Clone, Default)]
+    struct CapturedTraceEvents(Arc<std::sync::Mutex<Vec<CapturedTraceEvent>>>);
+
+    #[derive(Clone, Debug)]
+    struct CapturedTraceEvent {
+        level: tracing::Level,
+        fields: std::collections::BTreeMap<String, String>,
+    }
+
+    #[derive(Clone)]
+    struct CaptureTraceLayer(CapturedTraceEvents);
+
+    fn collision_trace_events() -> CapturedTraceEvents {
+        use tracing_subscriber::prelude::*;
+
+        static GLOBAL_EVENTS: std::sync::OnceLock<CapturedTraceEvents> = std::sync::OnceLock::new();
+        GLOBAL_EVENTS
+            .get_or_init(|| {
+                let events = CapturedTraceEvents::default();
+                let subscriber =
+                    tracing_subscriber::registry().with(CaptureTraceLayer(events.clone()));
+                let _ = tracing::subscriber::set_global_default(subscriber);
+                events
+            })
+            .clone()
+    }
+
+    fn collision_events_for_home(
+        events: &CapturedTraceEvents,
+        home: &Path,
+    ) -> Vec<CapturedTraceEvent> {
+        let marker = home.to_string_lossy();
+        events
+            .0
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|event| decoded_trace_field(event, "collision_samples_json").contains(&*marker))
+            .cloned()
+            .collect()
+    }
+
+    struct TraceFieldVisitor(std::collections::BTreeMap<String, String>);
+
+    impl tracing::field::Visit for TraceFieldVisitor {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            self.0
+                .insert(field.name().to_string(), format!("{value:?}"));
+        }
+
+        fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+            self.0.insert(field.name().to_string(), value.to_string());
+        }
+    }
+
+    impl<S> tracing_subscriber::Layer<S> for CaptureTraceLayer
+    where
+        S: tracing::Subscriber,
+    {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _context: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            if event.metadata().target() != "freshell_server::session_directory"
+                || *event.metadata().level() != tracing::Level::ERROR
+            {
+                return;
+            }
+            let mut visitor = TraceFieldVisitor(std::collections::BTreeMap::new());
+            event.record(&mut visitor);
+            if visitor
+                .0
+                .get("message")
+                .is_some_and(|message| message.contains("session_directory_identity_collision"))
+            {
+                self.0 .0.lock().unwrap().push(CapturedTraceEvent {
+                    level: *event.metadata().level(),
+                    fields: visitor.0,
+                });
+            }
+        }
+    }
+
+    fn decoded_trace_field(event: &CapturedTraceEvent, name: &str) -> String {
+        let encoded = event.fields.get(name).unwrap();
+        serde_json::from_str::<String>(encoded).unwrap_or_else(|_| encoded.clone())
     }
 
     /// Comparable projection of either `DirItem` or `IndexedSession`, keyed
@@ -3829,6 +4610,7 @@ mod tests {
             identity: freshell_ws::identity::TerminalIdentityRegistry::new(),
             metadata: crate::session_metadata::SessionMetadataStore::new(home.join(".freshell")),
             server_instance: std::sync::Arc::new("srv-test".to_string()),
+            collision_signatures: Default::default(),
             legacy_name_migration_completed: false,
         };
         let app = router(state);
@@ -3949,6 +4731,7 @@ mod tests {
             identity: freshell_ws::identity::TerminalIdentityRegistry::new(),
             metadata: crate::session_metadata::SessionMetadataStore::new(home.join(".freshell")),
             server_instance: std::sync::Arc::new("srv-test".to_string()),
+            collision_signatures: Default::default(),
             legacy_name_migration_completed: names.migration_completed(),
         });
         let resp = app
@@ -4050,6 +4833,7 @@ mod tests {
             identity,
             metadata,
             server_instance: Arc::new("srv-test".to_string()),
+            collision_signatures: Default::default(),
             legacy_name_migration_completed: true,
         });
         let resp = app
@@ -4146,6 +4930,7 @@ mod tests {
             identity,
             metadata,
             server_instance: Arc::new("srv-test".to_string()),
+            collision_signatures: Default::default(),
             legacy_name_migration_completed: true,
         });
         let resp = app
@@ -4560,6 +5345,7 @@ mod tests {
             // proves the join reads the persisted file, not shared memory.
             metadata: crate::session_metadata::SessionMetadataStore::new(home.join(".freshell")),
             server_instance: std::sync::Arc::new("srv-test".to_string()),
+            collision_signatures: Default::default(),
             legacy_name_migration_completed: false,
         };
         let app = router(state);
@@ -4638,6 +5424,7 @@ mod tests {
             identity: freshell_ws::identity::TerminalIdentityRegistry::new(),
             metadata: crate::session_metadata::SessionMetadataStore::new(home.join(".freshell")),
             server_instance: std::sync::Arc::new("srv-test".to_string()),
+            collision_signatures: Default::default(),
             legacy_name_migration_completed: false,
         };
         let app = router(state);
@@ -4698,6 +5485,7 @@ mod tests {
             identity: freshell_ws::identity::TerminalIdentityRegistry::new(),
             metadata: crate::session_metadata::SessionMetadataStore::new(home.join(".freshell")),
             server_instance: std::sync::Arc::new("srv-test".to_string()),
+            collision_signatures: Default::default(),
             legacy_name_migration_completed: false,
         };
         let app = router(state);
@@ -4743,6 +5531,7 @@ mod tests {
             // missing file (empty metadata), matching the no-home page.
             metadata: crate::session_metadata::SessionMetadataStore::new(unique_temp_dir()),
             server_instance: std::sync::Arc::new("srv-test".to_string()),
+            collision_signatures: Default::default(),
             legacy_name_migration_completed: false,
         };
         let app = router(state);
@@ -4827,6 +5616,7 @@ mod tests {
             identity: freshell_ws::identity::TerminalIdentityRegistry::new(),
             metadata: crate::session_metadata::SessionMetadataStore::new(home.join(".freshell")),
             server_instance: std::sync::Arc::new("srv-test".to_string()),
+            collision_signatures: Default::default(),
             legacy_name_migration_completed: false,
         };
         let app = router(state);
@@ -4933,6 +5723,7 @@ mod tests {
             identity: freshell_ws::identity::TerminalIdentityRegistry::new(),
             metadata: crate::session_metadata::SessionMetadataStore::new(home.join(".freshell")),
             server_instance: std::sync::Arc::new("srv-test".to_string()),
+            collision_signatures: Default::default(),
             legacy_name_migration_completed: false,
         };
         let app = router(state);
@@ -5032,6 +5823,7 @@ mod tests {
             identity: freshell_ws::identity::TerminalIdentityRegistry::new(),
             metadata: crate::session_metadata::SessionMetadataStore::new(home.join(".freshell")),
             server_instance: std::sync::Arc::new("srv-test".to_string()),
+            collision_signatures: Default::default(),
             legacy_name_migration_completed: false,
         };
         let app = router(state);
@@ -5128,6 +5920,7 @@ mod tests {
             identity: freshell_ws::identity::TerminalIdentityRegistry::new(),
             metadata: crate::session_metadata::SessionMetadataStore::new(home.join(".freshell")),
             server_instance: std::sync::Arc::new("srv-test".to_string()),
+            collision_signatures: Default::default(),
             legacy_name_migration_completed: false,
         };
         let app = router(state);
@@ -5266,6 +6059,7 @@ mod tests {
             identity: freshell_ws::identity::TerminalIdentityRegistry::new(),
             metadata: crate::session_metadata::SessionMetadataStore::new(home.join(".freshell")),
             server_instance: std::sync::Arc::new("srv-test".to_string()),
+            collision_signatures: Default::default(),
             legacy_name_migration_completed: false,
         };
         let app = router(state);
@@ -5405,7 +6199,7 @@ mod tests {
         let items = list_claude_sessions(&claude_home(&home));
         assert_eq!(items.len(), 1);
         assert!(
-            items[0].source_file.is_some(),
+            !items[0].source_files.is_empty(),
             "a real session file must carry a source_file for tier search"
         );
 
@@ -5654,7 +6448,7 @@ mod tests {
             live_terminal_only: false,
             session_type: None,
             title_source: None,
-            source_file: None,
+            source_files: Vec::new(),
             token_usage: None,
             title_overridden: false,
             provider_title: None,

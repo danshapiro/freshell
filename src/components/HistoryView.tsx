@@ -70,7 +70,6 @@ export default function HistoryView({ onOpenSession }: { onOpenSession?: () => v
   const sessionNames = useAppSelector((s) => s.sessionNames)
   const historyWindow = useAppSelector((s) => s.sessions.windows?.history)
   const projects = useAppSelector((s) => s.sessions.windows?.history?.projects ?? s.sessions.projects)
-  const topLevelSessionCount = useAppSelector((s) => s.sessions.projects?.length ?? 0)
   const [filter, setFilter] = useState('')
   const [loading, setLoading] = useState(false)
   const [mobileSessionSheet, setMobileSessionSheet] = useState<MobileSessionSheetState | null>(null)
@@ -81,13 +80,13 @@ export default function HistoryView({ onOpenSession }: { onOpenSession?: () => v
   const [dismissedIntegrityCount, setDismissedIntegrityCount] = useState<number | null>(null)
 
   useEffect(() => {
-    if (historyWindow || topLevelSessionCount > 0) return
+    if (historyWindow) return
     dispatch(activateSessionSurface('history'))
     void dispatch(fetchSessionWindow({
       surface: 'history',
       priority: 'visible',
     }) as any)
-  }, [dispatch, historyWindow, topLevelSessionCount])
+  }, [dispatch, historyWindow])
 
   const filtered = useMemo(() => {
     const q = filter.trim().toLowerCase()
@@ -287,7 +286,7 @@ export default function HistoryView({ onOpenSession }: { onOpenSession?: () => v
             <AlertCircle className="mt-0.5 h-4 w-4 flex-shrink-0" aria-hidden="true" />
             <span>
               {historyWindow.integrityError.collisionCount} conflicting saved session {historyWindow.integrityError.collisionCount === 1 ? 'identity is' : 'identities are'} hidden.
-              {' '}Running terminals remain available. Check the server log, then remove or rename the duplicate files.
+              {' '}Running terminals remain available. Check the server logs for details.
             </span>
           </div>
           <button
