@@ -8,6 +8,7 @@ publish.workspace = true
 [features]
 default = []
 fresh-agent-fixtures = []
+opencode-docker-contract-tests = []
 
 [dependencies]
 freshell-agent-runtime = { path = "../freshell-agent-runtime" }
@@ -29,3 +30,12 @@ async-trait = "0.1"
 uuid = { version = "1", features = ["v4"] }
 url = "2"
 tempfile = "3"
+
+[dev-dependencies]
+hex = "0.4"
+rusqlite = { version = "0.31", features = ["bundled"] }
+
+[[test]]
+name = "opencode_docker_contract"
+path = "tests/opencode_docker_contract.rs"
+required-features = ["opencode-docker-contract-tests"]

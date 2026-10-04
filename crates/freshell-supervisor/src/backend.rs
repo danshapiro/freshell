@@ -46,6 +46,9 @@ pub struct CreateRuntimeSpec {
     pub test_run_id: String,
     pub terminal: Option<TerminalLaunchSpec>,
     pub fresh_agent: Option<FreshAgentLaunchSpec>,
+    /// Supervisor-verified ready bundle directory, mounted read-only only for
+    /// the session-host importer.
+    pub opencode_transfer_dir: Option<PathBuf>,
     pub provider_volume_name: String,
 }
 
@@ -88,6 +91,26 @@ fn verified_host_actor_state_dir(
         ));
     }
     Ok(canonical)
+}
+
+fn expected_opencode_transfer_dir(
+    runtime_dir: &Path,
+    terminal: Option<&TerminalLaunchSpec>,
+) -> Result<Option<PathBuf>, BackendError> {
+    let Some(descriptor) = terminal.and_then(|terminal| terminal.opencode_transfer.as_ref()) else {
+        return Ok(None);
+    };
+    descriptor
+        .validate()
+        .map_err(|error| BackendError::InvalidConfig(error.message))?;
+    let runtime_root = runtime_dir
+        .parent()
+        .ok_or_else(|| BackendError::InvalidConfig("runtime directory has no parent".into()))?;
+    Ok(Some(
+        runtime_root
+            .join("opencode-transfers")
+            .join(format!("{}.ready", descriptor.transfer_id)),
+    ))
 }
 
 #[derive(Debug, Clone)]
@@ -515,6 +538,17 @@ impl RuntimeBackend for DockerEngineBackend {
         }
         .transpose()
         .map_err(BackendError::InvalidConfig)?;
+        let expected_transfer_dir =
+            expected_opencode_transfer_dir(&runtime_dir, spec.terminal.as_ref())?;
+        let transfer_dir = match (&spec.opencode_transfer_dir, &expected_transfer_dir) {
+            (Some(path), Some(expected)) if path == expected => Some(canonical_dir(path)?),
+            (None, None) => None,
+            _ => {
+                return Err(BackendError::InvalidConfig(
+                    "OpenCode transfer mount does not match the terminal descriptor".into(),
+                ));
+            }
+        };
         let expected = ExpectedConfig::new(spec, &binary, &runtime_dir);
         let immutable_config_digest = digest_expected(&expected)?;
         let (daemon_id, rootless) = self.daemon_info().await?;
@@ -534,6 +568,12 @@ impl RuntimeBackend for DockerEngineBackend {
             binds.push(format!(
                 "{}:{HOST_ACTOR_STATE_MOUNT}:rw",
                 actor_state_dir.display()
+            ));
+        }
+        if let Some(transfer_dir) = &transfer_dir {
+            binds.push(format!(
+                "{}:/run/freshell-opencode-transfer:ro",
+                transfer_dir.display()
             ));
         }
         if let Some(mounts) = &terminal_mounts {
@@ -866,6 +906,7 @@ struct ExpectedConfig {
     runtime_dir: String,
     limits: RuntimeLimits,
     terminal: Option<TerminalLaunchSpec>,
+    opencode_transfer_dir: Option<String>,
     fresh_agent: Option<ImmutableFreshAgentConfig>,
     provider_volume_name: String,
 }
@@ -919,6 +960,10 @@ impl ExpectedConfig {
             runtime_dir: runtime_dir.to_string_lossy().into_owned(),
             limits: spec.limits,
             terminal: spec.terminal.clone(),
+            opencode_transfer_dir: spec
+                .opencode_transfer_dir
+                .as_ref()
+                .map(|path| path.to_string_lossy().into_owned()),
             fresh_agent: spec.fresh_agent.as_ref().map(Into::into),
             provider_volume_name: spec.provider_volume_name.clone(),
         }
@@ -935,6 +980,11 @@ fn immutable_digest_from_handle(handle: &OwnedRuntimeHandle) -> Result<String, B
         runtime_dir: handle.runtime_dir().to_string_lossy().into_owned(),
         limits: handle.requested_limits(),
         terminal: handle.terminal().cloned(),
+        opencode_transfer_dir: expected_opencode_transfer_dir(
+            handle.runtime_dir(),
+            handle.terminal(),
+        )?
+        .map(|path| path.to_string_lossy().into_owned()),
         fresh_agent: handle.fresh_agent().map(Into::into),
         provider_volume_name: handle.provider_volume_name().to_owned(),
     })
@@ -1130,6 +1180,35 @@ fn verify_inspect_config(handle: &OwnedRuntimeHandle, value: &Value) -> Result<(
         return Err(BackendError::OwnershipMismatch(
             "provider home volume changed".into(),
         ));
+    }
+    let expected_transfer_dir =
+        expected_opencode_transfer_dir(handle.runtime_dir(), handle.terminal())?;
+    let transfer_mounts = mounts
+        .iter()
+        .filter(|mount| {
+            mount.get("Destination").and_then(Value::as_str)
+                == Some("/run/freshell-opencode-transfer")
+        })
+        .collect::<Vec<_>>();
+    match expected_transfer_dir {
+        Some(expected) => {
+            if transfer_mounts.len() != 1
+                || transfer_mounts[0].get("Source").and_then(Value::as_str)
+                    != Some(expected.to_string_lossy().as_ref())
+                || transfer_mounts[0].get("RW").and_then(Value::as_bool) != Some(false)
+            {
+                return Err(BackendError::OwnershipMismatch(
+                    "OpenCode transfer mount is missing, writable, or points to another bundle"
+                        .into(),
+                ));
+            }
+        }
+        None if !transfer_mounts.is_empty() => {
+            return Err(BackendError::OwnershipMismatch(
+                "runtime gained an unexpected OpenCode transfer mount".into(),
+            ));
+        }
+        None => {}
     }
     let actor_mounts = mounts
         .iter()
@@ -1582,6 +1661,7 @@ mod tests {
             provider_bootstrap_files: Vec::new(),
             provider_secret_references: Vec::new(),
             provider_launch_context: None,
+            opencode_transfer: None,
         };
         let env = runtime_host_environment(Some(&terminal), None).unwrap();
         assert!(env
@@ -1637,6 +1717,7 @@ mod tests {
                 profile: ProviderSecretProfile::AmplifierOnecliLunarouteGlm53,
             }],
             provider_launch_context: None,
+            opencode_transfer: None,
         };
         let mounts = docker::terminal_mounts(&terminal).unwrap();
         let binds: Vec<String> = mounts
@@ -1666,6 +1747,7 @@ mod tests {
             test_run_id: "reference-only".into(),
             terminal: Some(terminal),
             fresh_agent: None,
+            opencode_transfer_dir: None,
             provider_volume_name: "freshell-provider-test".into(),
         };
         let body = docker_create_body(
@@ -1767,6 +1849,7 @@ mod tests {
                     pids_max: 64,
                 },
                 terminal: None,
+                opencode_transfer_dir: None,
                 fresh_agent: Some((&agent).into()),
                 provider_volume_name: "freshell-provider-one".into(),
             })

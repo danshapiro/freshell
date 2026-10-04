@@ -8,13 +8,15 @@ mod pty;
 use freshell_agent_runtime::prepare_terminal_for_resume;
 use freshell_runtime_protocol::{
     host_proof, read_frame, write_frame, ControlRole, Envelope, FixtureKind, FreshAgentLaunchSpec,
-    GrantId, HostBootId, HostCommand, HostReply, HostResult, IncarnationId, ProviderBootstrapFile,
-    RecoveryPath, RecoveryProbe, ResumeSpec, RuntimeError, RuntimeErrorCode, RuntimeLimits,
-    RuntimeMetrics, SoulId, TerminalLaunchSpec, CONTROL_PROTOCOL_VERSION,
+    GrantId, HostBootId, HostCommand, HostReply, HostResult, IncarnationId,
+    OpenCodeTransferDescriptor, ProviderBootstrapFile, RecoveryPath, RecoveryProbe, ResumeSpec,
+    RuntimeError, RuntimeErrorCode, RuntimeLimits, RuntimeMetrics, SoulId, TerminalLaunchSpec,
+    CONTROL_PROTOCOL_VERSION, MAX_OPENCODE_TRANSFER_MANIFEST_BYTES,
 };
 use pty::HostedPty;
 use serde::{Deserialize, Serialize};
 use std::{
+    io::{self, Read, Write},
     path::{Path, PathBuf},
     process::Stdio,
     sync::Arc,
@@ -56,6 +58,132 @@ struct HostState {
 struct ProviderConfigPaths {
     private_mount: PathBuf,
     provider_home: PathBuf,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OpenCodeTransferPhase {
+    ProviderHomePrepared,
+    StageVerified,
+    ImportCompleted,
+    StructuralVerified,
+    ImportReceiptDurable,
+    ProviderIdentityReaderVerified,
+    ReceiptsDurable,
+    ReceiptsRevalidated,
+    GrantConsumed,
+    PtySpawned,
+}
+
+#[derive(Default)]
+struct OpenCodeTransferGate {
+    phases: Vec<OpenCodeTransferPhase>,
+}
+
+impl OpenCodeTransferGate {
+    fn advance(&mut self, next: OpenCodeTransferPhase) -> Result<(), String> {
+        let expected = self.expected_next();
+        if expected != Some(next) {
+            return Err(format!(
+                "OpenCode transfer phase out of order: expected {expected:?}, received {next:?}"
+            ));
+        }
+        self.phases.push(next);
+        Ok(())
+    }
+
+    fn ensure_next(&self, next: OpenCodeTransferPhase) -> Result<(), String> {
+        let expected = self.expected_next();
+        if expected != Some(next) {
+            return Err(format!(
+                "OpenCode transfer phase out of order: expected {expected:?}, received {next:?}"
+            ));
+        }
+        Ok(())
+    }
+
+    fn run_step<T>(
+        &mut self,
+        phase: OpenCodeTransferPhase,
+        action: impl FnOnce() -> Result<T, String>,
+    ) -> Result<T, String> {
+        self.ensure_next(phase)?;
+        let result = action()?;
+        self.advance(phase)?;
+        Ok(result)
+    }
+
+    fn ensure_pty_spawn_allowed(&self) -> Result<(), String> {
+        if self.phases.last() == Some(&OpenCodeTransferPhase::GrantConsumed) {
+            Ok(())
+        } else {
+            Err(
+                "OpenCode PTY spawn is blocked until transfer receipts and grant are durable"
+                    .into(),
+            )
+        }
+    }
+
+    #[cfg(test)]
+    fn phases(&self) -> &[OpenCodeTransferPhase] {
+        &self.phases
+    }
+
+    fn expected_next(&self) -> Option<OpenCodeTransferPhase> {
+        use OpenCodeTransferPhase::*;
+        match self.phases.last() {
+            None => Some(ProviderHomePrepared),
+            Some(ProviderHomePrepared) => Some(StageVerified),
+            Some(StageVerified) => Some(ImportCompleted),
+            Some(ImportCompleted) => Some(StructuralVerified),
+            Some(StructuralVerified) => Some(ImportReceiptDurable),
+            Some(ImportReceiptDurable) => Some(ProviderIdentityReaderVerified),
+            Some(ProviderIdentityReaderVerified) => Some(ReceiptsDurable),
+            Some(ReceiptsDurable) => Some(ReceiptsRevalidated),
+            Some(ReceiptsRevalidated) => Some(GrantConsumed),
+            Some(GrantConsumed) => Some(PtySpawned),
+            Some(PtySpawned) => None,
+        }
+    }
+}
+
+const OPENCODE_TRANSFER_READINESS_PHASES: [OpenCodeTransferPhase; 8] = [
+    OpenCodeTransferPhase::ProviderHomePrepared,
+    OpenCodeTransferPhase::StageVerified,
+    OpenCodeTransferPhase::ImportCompleted,
+    OpenCodeTransferPhase::StructuralVerified,
+    OpenCodeTransferPhase::ImportReceiptDurable,
+    OpenCodeTransferPhase::ProviderIdentityReaderVerified,
+    OpenCodeTransferPhase::ReceiptsDurable,
+    OpenCodeTransferPhase::ReceiptsRevalidated,
+];
+
+fn run_opencode_transfer_readiness_sequence(
+    gate: &mut OpenCodeTransferGate,
+    mut perform: impl FnMut(OpenCodeTransferPhase) -> Result<(), String>,
+) -> Result<(), String> {
+    for phase in OPENCODE_TRANSFER_READINESS_PHASES {
+        gate.run_step(phase, || perform(phase))?;
+    }
+    Ok(())
+}
+
+async fn run_opencode_transfer_pty_spawn<T, Fut>(
+    gate: &mut OpenCodeTransferGate,
+    spawn: impl FnOnce() -> Fut,
+) -> Result<T, RuntimeError>
+where
+    Fut: std::future::Future<Output = Result<T, RuntimeError>>,
+{
+    gate.ensure_pty_spawn_allowed()
+        .map_err(opencode_transfer_phase_error)?;
+    let spawned = spawn().await?;
+    gate.advance(OpenCodeTransferPhase::PtySpawned)
+        .map_err(opencode_transfer_phase_error)?;
+    Ok(spawned)
+}
+
+fn opencode_transfer_phase_error(error: String) -> RuntimeError {
+    RuntimeError::new(RuntimeErrorCode::HostUnreachable, error)
 }
 
 impl Default for ProviderConfigPaths {
@@ -124,8 +252,10 @@ async fn run() -> Result<(), String> {
         Some("opencode-identity-worker") => pty::run_opencode_identity_worker(&args[2..]),
         Some("provider-probe-worker") => providers::run_probe_worker(&args[2..]),
         Some("refresh-provider-config") => refresh_provider_config_worker(&args[2..]),
+        Some("opencode-import-worker") => run_opencode_import_worker(&args[2..]),
+        Some("opencode-reader-probe") => run_opencode_reader_probe(&args[2..]),
         Some("prepare-provider-features") => providers::run_provider_features_worker(&args[2..]),
-        _ => Err("usage: freshell-session-host <serve|worker|fixture-child|fresh-agent-fixture-worker|opencode-identity-worker|provider-probe-worker|refresh-provider-config> ...".into()),
+        _ => Err("usage: freshell-session-host <serve|worker|fixture-child|fresh-agent-fixture-worker|opencode-identity-worker|provider-probe-worker|refresh-provider-config|opencode-import-worker|opencode-reader-probe> ...".into()),
     }
 }
 
@@ -140,6 +270,7 @@ async fn serve(args: &[String]) -> Result<(), String> {
             .map_err(|e| format!("invalid requested limits: {e}"))?;
 
     std::fs::create_dir_all(&state_dir).map_err(|e| e.to_string())?;
+    set_mode(&state_dir, 0o700)?;
     let secret = std::fs::read(&secret_file).map_err(|e| format!("read secret: {e}"))?;
     if secret.len() < 16 {
         return Err("incarnation secret is too short".into());
@@ -727,6 +858,8 @@ async fn grant_execution(
         resume_spec,
     } = request;
     let mut persisted = state.persisted.lock().await;
+    let mut transfer_prepared_terminal = None;
+    let mut transfer_phase_gate = None;
     if control_epoch < persisted.max_control_epoch
         || execution_generation < persisted.max_execution_generation
     {
@@ -762,11 +895,66 @@ async fn grant_execution(
         ));
     }
 
+    if terminal
+        .as_ref()
+        .is_some_and(|terminal| terminal.opencode_transfer.is_some())
+    {
+        drop(persisted);
+        let mut preflight_terminal = match (terminal.as_ref(), resume_spec.as_ref()) {
+            (Some(terminal), Some(resume)) => prepare_terminal_for_resume(terminal, resume)
+                .map_err(|error| error.runtime_error())?,
+            (Some(terminal), None) => terminal.clone(),
+            (None, _) => unreachable!("transfer was checked on a terminal"),
+        };
+        let mut phase_gate = OpenCodeTransferGate::default();
+        run_opencode_transfer_readiness(state, &soul_id, &mut preflight_terminal, &mut phase_gate)?;
+        transfer_prepared_terminal = Some(preflight_terminal.clone());
+        transfer_phase_gate = Some(phase_gate);
+        persisted = state.persisted.lock().await;
+        if control_epoch < persisted.max_control_epoch
+            || execution_generation < persisted.max_execution_generation
+        {
+            return Err(RuntimeError::new(
+                RuntimeErrorCode::StaleExecutionGrant,
+                "stale execution grant",
+            ));
+        }
+        if let Some(existing) = persisted.grant_id.as_ref() {
+            if existing == &grant_id {
+                if let Some(pid) = persisted.worker_pid {
+                    return Ok(HostResult::GrantAccepted {
+                        host_boot_id: state.host_boot_id.clone(),
+                        worker_pid: pid,
+                        worker_launch_count: persisted.worker_launch_count,
+                        fixture_evidence: persisted.fixture_evidence.clone(),
+                        native_session_id: None,
+                    });
+                }
+                return Err(RuntimeError::new(
+                    RuntimeErrorCode::StaleExecutionGrant,
+                    "grant was durably consumed but worker launch did not complete",
+                ));
+            }
+            return Err(RuntimeError::new(
+                RuntimeErrorCode::StaleExecutionGrant,
+                "host boot already consumed a different grant",
+            ));
+        }
+    }
+
+    if let Some(gate) = transfer_phase_gate.as_ref() {
+        gate.ensure_next(OpenCodeTransferPhase::GrantConsumed)
+            .map_err(opencode_transfer_phase_error)?;
+    }
     persisted.max_control_epoch = control_epoch;
     persisted.max_execution_generation = execution_generation;
     persisted.grant_id = Some(grant_id.clone());
     persisted.worker_pid = None;
     write_state(&state.state_dir, &persisted).map_err(registry_like_error)?;
+    if let Some(gate) = transfer_phase_gate.as_mut() {
+        gate.advance(OpenCodeTransferPhase::GrantConsumed)
+            .expect("OpenCode transfer grant phase was prevalidated");
+    }
 
     let (pid, evidence, native_session_id) = match (fixture, terminal, fresh_agent) {
         (Some(fixture), None, None) => {
@@ -823,19 +1011,22 @@ async fn grant_execution(
         }
         (None, Some(terminal), None) => {
             let exact_resume = resume_spec.is_some();
-            let mut terminal = match resume_spec.as_ref() {
-                Some(resume) => prepare_terminal_for_resume(&terminal, resume)
-                    .map_err(|error| error.runtime_error())?,
-                None => terminal,
+            let mut terminal = match transfer_prepared_terminal.take() {
+                Some(prepared) => prepared,
+                None => match resume_spec.as_ref() {
+                    Some(resume) => prepare_terminal_for_resume(&terminal, resume)
+                        .map_err(|error| error.runtime_error())?,
+                    None => terminal,
+                },
             };
             // First boot transfers the durable provider-home inode to the
             // unprivileged provider. An exact-resume host lacks FOWNER and
             // DAC_OVERRIDE, so it stages current approved config and asks a
             // provider-owned helper to refresh only that projection. Docker's
             // ownership proof pins the same soul-scoped volume on replacement.
-            if !exact_resume {
+            if !exact_resume && terminal.opencode_transfer.is_none() {
                 prepare_provider_state_for_fresh_launch(&mut terminal)?;
-            } else {
+            } else if exact_resume {
                 refresh_provider_context(
                     terminal.provider_launch_context.as_ref(),
                     &terminal.mode,
@@ -878,21 +1069,38 @@ async fn grant_execution(
                     )
                 })?;
             let terminal = prepared.terminal;
-            let hosted = HostedPty::spawn(
-                &state.state_dir,
-                state.incarnation_id.clone(),
-                &terminal,
-                prepared.child_env,
-                prepared.codex,
-            )
-            .await
-            .map_err(|e| {
-                RuntimeError::new(
-                    RuntimeErrorCode::HostUnreachable,
-                    format!("spawn managed terminal: {e}"),
+            let spawn = || async {
+                HostedPty::spawn(
+                    &state.state_dir,
+                    state.incarnation_id.clone(),
+                    &terminal,
+                    prepared.child_env,
+                    prepared.codex,
                 )
-            })?;
+                .await
+                .map_err(|e| {
+                    RuntimeError::new(
+                        RuntimeErrorCode::HostUnreachable,
+                        format!("spawn managed terminal: {e}"),
+                    )
+                })
+            };
+            let hosted = match transfer_phase_gate.as_mut() {
+                Some(gate) => run_opencode_transfer_pty_spawn(gate, spawn).await?,
+                None => spawn().await?,
+            };
             let pid = hosted.pid();
+            if let Some(transfer) = terminal.opencode_transfer.as_ref() {
+                let _ = append_event_with_secret(
+                    &state.state_dir,
+                    &state.secret,
+                    "host.opencode_transfer.pty_spawned",
+                    serde_json::json!({
+                        "transferId": transfer.transfer_id,
+                        "workerPid": pid,
+                    }),
+                );
+            }
             let evidence = serde_json::json!({
                 "workload":"terminal",
                 "terminalId": hosted.terminal_id(),
@@ -1036,21 +1244,857 @@ async fn grant_execution(
     })
 }
 
+const OPENCODE_TRANSFER_MOUNT: &str = "/run/freshell-opencode-transfer";
+const OPENCODE_PROVIDER_HOME: &str = "/home/freshell/provider";
+const OPENCODE_PROVIDER_DB: &str = "/home/freshell/provider/.local/share/opencode/opencode.db";
+const MAX_OPENCODE_RECEIPT_BYTES: usize = 64 * 1024;
+
+struct OpencodeReaderPaths {
+    home: PathBuf,
+    xdg_data_home: PathBuf,
+    xdg_config_home: PathBuf,
+    database: PathBuf,
+    workspace: PathBuf,
+    cwd: PathBuf,
+}
+
+fn validate_opencode_reader_paths(
+    env: &std::collections::BTreeMap<String, String>,
+    workspace_root: &Path,
+    expected_cwd: &Path,
+) -> Result<OpencodeReaderPaths, String> {
+    let expected = [
+        ("HOME", OPENCODE_PROVIDER_HOME),
+        ("XDG_DATA_HOME", "/home/freshell/provider/.local/share"),
+        ("XDG_CONFIG_HOME", "/home/freshell/provider/.config"),
+        ("OPENCODE_DB", OPENCODE_PROVIDER_DB),
+    ];
+    for (name, value) in expected {
+        if env.get(name).map(String::as_str) != Some(value) {
+            return Err(format!(
+                "OpenCode provider environment has an unexpected {name}"
+            ));
+        }
+    }
+    let workspace = std::fs::canonicalize(workspace_root)
+        .map_err(|error| format!("OpenCode workspace is unavailable: {error}"))?;
+    let cwd = std::fs::canonicalize(expected_cwd)
+        .map_err(|error| format!("OpenCode working directory is unavailable: {error}"))?;
+    if !workspace.is_dir() || !cwd.is_dir() || !cwd.starts_with(&workspace) {
+        return Err("OpenCode working directory is outside its workspace".into());
+    }
+    Ok(OpencodeReaderPaths {
+        home: PathBuf::from(OPENCODE_PROVIDER_HOME),
+        xdg_data_home: PathBuf::from("/home/freshell/provider/.local/share"),
+        xdg_config_home: PathBuf::from("/home/freshell/provider/.config"),
+        database: PathBuf::from(OPENCODE_PROVIDER_DB),
+        workspace,
+        cwd,
+    })
+}
+
+fn validate_opencode_helper_identity(uid: u32, gid: u32) -> Result<(), String> {
+    #[cfg(unix)]
+    if unsafe { libc::geteuid() } != uid || unsafe { libc::getegid() } != gid {
+        return Err("OpenCode history helper did not run as the provider identity".into());
+    }
+    #[cfg(not(unix))]
+    return Err("OpenCode history helper requires Unix provider identity support".into());
+    Ok(())
+}
+
+fn run_opencode_import_worker(args: &[String]) -> Result<(), String> {
+    let (workspace_root, expected_cwd, uid, gid) = opencode_helper_args(args)?;
+    validate_opencode_helper_identity(uid, gid)?;
+    let env = std::env::vars().collect::<std::collections::BTreeMap<_, _>>();
+    let paths = validate_opencode_reader_paths(&env, &workspace_root, &expected_cwd)?;
+    if std::env::current_dir().map_err(|error| error.to_string())? != paths.cwd {
+        return Err("OpenCode importer cwd differs from the requested provider cwd".into());
+    }
+
+    let mut stdin = io::stdin().lock();
+    let descriptor = read_opencode_descriptor_frame(&mut stdin)?;
+    if descriptor.destination_database_path != ".local/share/opencode/opencode.db" {
+        return Err("OpenCode import destination path is unsupported".into());
+    }
+    let mut payload = (&mut stdin).take(descriptor.files[0].size_bytes);
+    let receipt = freshell_agent_runtime::opencode_transfer::import_bundle_payload(
+        &descriptor,
+        &mut payload,
+        &paths.database,
+        &paths.workspace,
+    )
+    .map_err(|_| "provider-identity OpenCode import failed".to_string())?;
+    drop(payload);
+    let mut trailing = [0_u8; 1];
+    if stdin
+        .read(&mut trailing)
+        .map_err(|error| error.to_string())?
+        != 0
+    {
+        return Err("OpenCode import stream contains trailing bytes".into());
+    }
+    write_opencode_helper_result(&receipt)
+}
+
+fn run_opencode_reader_probe(args: &[String]) -> Result<(), String> {
+    let (workspace_root, expected_cwd, uid, gid) = opencode_helper_args(args)?;
+    validate_opencode_helper_identity(uid, gid)?;
+    let env = std::env::vars().collect::<std::collections::BTreeMap<_, _>>();
+    let paths = validate_opencode_reader_paths(&env, &workspace_root, &expected_cwd)?;
+    if std::env::current_dir().map_err(|error| error.to_string())? != paths.cwd {
+        return Err("OpenCode reader cwd differs from the requested provider cwd".into());
+    }
+
+    let mut stdin = io::stdin().lock();
+    let descriptor = read_opencode_descriptor_frame(&mut stdin)?;
+    let mut trailing = [0_u8; 1];
+    if stdin
+        .read(&mut trailing)
+        .map_err(|error| error.to_string())?
+        != 0
+    {
+        return Err("OpenCode reader probe received trailing bytes".into());
+    }
+    let receipt = freshell_agent_runtime::opencode_transfer::verify_installed_store(
+        &descriptor,
+        &paths.database,
+        &paths.workspace,
+        uid,
+        gid,
+        &paths.home,
+        &paths.xdg_data_home,
+        &paths.xdg_config_home,
+        &paths.cwd,
+    )
+    .map_err(|_| {
+        "provider-identity OpenCode reader could not read the installed history".to_string()
+    })?;
+    write_opencode_helper_result(&receipt)
+}
+
+fn opencode_helper_args(args: &[String]) -> Result<(PathBuf, PathBuf, u32, u32), String> {
+    if args.len() != 8 {
+        return Err(
+            "OpenCode helper requires workspace, cwd, provider uid, and provider gid".into(),
+        );
+    }
+    if args[0] != "--workspace-root"
+        || args[2] != "--expected-cwd"
+        || args[4] != "--provider-uid"
+        || args[6] != "--provider-gid"
+    {
+        return Err("OpenCode helper arguments are invalid".into());
+    }
+    let uid = args[5]
+        .parse::<u32>()
+        .map_err(|_| "OpenCode provider uid is invalid")?;
+    let gid = args[7]
+        .parse::<u32>()
+        .map_err(|_| "OpenCode provider gid is invalid")?;
+    if uid == 0 {
+        return Err("OpenCode provider uid cannot be root".into());
+    }
+    Ok((PathBuf::from(&args[1]), PathBuf::from(&args[3]), uid, gid))
+}
+
+fn read_opencode_descriptor_frame(
+    reader: &mut impl Read,
+) -> Result<OpenCodeTransferDescriptor, String> {
+    let mut length = [0; 4];
+    reader
+        .read_exact(&mut length)
+        .map_err(|_| "OpenCode transfer descriptor frame is truncated".to_string())?;
+    let length = u32::from_be_bytes(length) as usize;
+    let max_length = MAX_OPENCODE_TRANSFER_MANIFEST_BYTES + 16 * 1024;
+    if length == 0 || length > max_length {
+        return Err("OpenCode transfer descriptor frame exceeds its bound".into());
+    }
+    let mut bytes = vec![0; length];
+    reader
+        .read_exact(&mut bytes)
+        .map_err(|_| "OpenCode transfer descriptor frame is truncated".to_string())?;
+    let descriptor: OpenCodeTransferDescriptor =
+        serde_json::from_slice(&bytes).map_err(|_| "OpenCode transfer descriptor is invalid")?;
+    descriptor
+        .validate()
+        .map_err(|_| "OpenCode transfer descriptor is invalid")?;
+    Ok(descriptor)
+}
+
+fn write_opencode_descriptor_frame(
+    writer: &mut impl Write,
+    descriptor: &OpenCodeTransferDescriptor,
+) -> Result<(), String> {
+    let bytes = serde_json::to_vec(descriptor).map_err(|_| "encode OpenCode transfer metadata")?;
+    let max_length = MAX_OPENCODE_TRANSFER_MANIFEST_BYTES + 16 * 1024;
+    if bytes.is_empty() || bytes.len() > max_length {
+        return Err("OpenCode transfer metadata exceeds its bound".into());
+    }
+    let length =
+        u32::try_from(bytes.len()).map_err(|_| "OpenCode transfer metadata is too large")?;
+    writer
+        .write_all(&length.to_be_bytes())
+        .and_then(|_| writer.write_all(&bytes))
+        .map_err(|_| "write OpenCode transfer metadata to provider helper".to_string())
+}
+
+fn write_opencode_helper_result(value: &impl Serialize) -> Result<(), String> {
+    let bytes = serde_json::to_vec(value).map_err(|_| "encode OpenCode helper receipt")?;
+    if bytes.len() > MAX_OPENCODE_RECEIPT_BYTES {
+        return Err("OpenCode helper receipt exceeds its bound".into());
+    }
+    let mut stdout = io::stdout().lock();
+    stdout
+        .write_all(&bytes)
+        .and_then(|_| stdout.write_all(b"\n"))
+        .and_then(|_| stdout.flush())
+        .map_err(|_| "write OpenCode helper receipt".to_string())
+}
+
+#[derive(Default)]
+struct OpenCodeTransferProgress {
+    paths: Option<OpencodeReaderPaths>,
+    payload_path: Option<PathBuf>,
+    import_receipt: Option<freshell_agent_runtime::opencode_transfer::ImportReceipt>,
+    reader_receipt: Option<freshell_agent_runtime::opencode_transfer::InstalledStoreReadable>,
+}
+
+fn run_opencode_transfer_readiness(
+    state: &HostState,
+    soul_id: &SoulId,
+    terminal: &mut TerminalLaunchSpec,
+    phase_gate: &mut OpenCodeTransferGate,
+) -> Result<(), RuntimeError> {
+    if terminal.opencode_transfer.is_none() {
+        return Ok(());
+    }
+    let mut progress = OpenCodeTransferProgress::default();
+    run_opencode_transfer_readiness_sequence(phase_gate, |phase| {
+        perform_opencode_transfer_phase(state, soul_id, terminal, &mut progress, phase)
+    })
+    .map_err(|error| {
+        RuntimeError::new(
+            RuntimeErrorCode::HostUnreachable,
+            format!("OpenCode history import/readability preflight failed: {error}"),
+        )
+    })
+}
+
+fn perform_opencode_transfer_phase(
+    state: &HostState,
+    soul_id: &SoulId,
+    terminal: &mut TerminalLaunchSpec,
+    progress: &mut OpenCodeTransferProgress,
+    phase: OpenCodeTransferPhase,
+) -> Result<(), String> {
+    if phase == OpenCodeTransferPhase::ProviderHomePrepared {
+        let transfer_id = terminal
+            .opencode_transfer
+            .as_ref()
+            .ok_or("OpenCode transfer descriptor is unavailable")?
+            .transfer_id
+            .clone();
+        prepare_provider_state_for_opencode_transfer(terminal).map_err(|error| error.message)?;
+        append_event_with_secret(
+            &state.state_dir,
+            &state.secret,
+            "host.opencode_transfer.provider_home_prepared",
+            serde_json::json!({
+                "transferId": transfer_id,
+                "providerUid": terminal.run_as_uid,
+                "providerGid": terminal.run_as_gid,
+            }),
+        )
+        .map_err(|_| "OpenCode provider state preparation could not be recorded")?;
+        return Ok(());
+    }
+    let descriptor = terminal
+        .opencode_transfer
+        .as_ref()
+        .ok_or("OpenCode transfer descriptor is unavailable")?;
+    match phase {
+        OpenCodeTransferPhase::ProviderHomePrepared => unreachable!("handled above"),
+        OpenCodeTransferPhase::StageVerified => {
+            descriptor
+                .validate()
+                .map_err(|_| "OpenCode transfer descriptor is invalid")?;
+            if terminal.mode != "opencode"
+                || descriptor.destination_store_id != soul_id.as_str()
+                || descriptor.incarnation_id != state.incarnation_id.as_str()
+                || terminal.resume_session_id.as_deref()
+                    != Some(descriptor.root_session_id.as_str())
+            {
+                return Err("OpenCode transfer identity does not match this launch".into());
+            }
+            let paths = validate_opencode_reader_paths(
+                &terminal.env,
+                Path::new(&terminal.workspace_path),
+                Path::new(&terminal.cwd),
+            )?;
+            if descriptor.destination_database_path != ".local/share/opencode/opencode.db" {
+                return Err("OpenCode transfer database binding is unsupported".into());
+            }
+            let staged_directory = Path::new(OPENCODE_TRANSFER_MOUNT);
+            let metadata = std::fs::symlink_metadata(staged_directory)
+                .map_err(|error| format!("OpenCode transfer mount is unavailable: {error}"))?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::{MetadataExt, PermissionsExt};
+                if metadata.file_type().is_symlink()
+                    || !metadata.is_dir()
+                    || metadata.uid() != unsafe { libc::geteuid() }
+                    || metadata.permissions().mode() & 0o222 != 0
+                {
+                    return Err(
+                        "OpenCode transfer mount is not a root-owned read-only directory".into(),
+                    );
+                }
+            }
+            progress.payload_path = Some(
+                freshell_agent_runtime::opencode_transfer::verify_staged_bundle(
+                    descriptor,
+                    staged_directory,
+                )
+                .map_err(|_| "OpenCode transfer stage does not match its descriptor")?,
+            );
+            progress.paths = Some(paths);
+            append_event_with_secret(
+                &state.state_dir,
+                &state.secret,
+                "host.opencode_transfer.stage_verified",
+                serde_json::json!({
+                    "transferId": descriptor.transfer_id,
+                    "sourceGeneration": descriptor.source_generation,
+                }),
+            )
+            .map_err(|_| "OpenCode transfer stage verification could not be recorded")?;
+        }
+        OpenCodeTransferPhase::ImportCompleted => {
+            let paths = progress
+                .paths
+                .as_ref()
+                .ok_or("OpenCode transfer paths are unavailable")?;
+            let payload_path = progress
+                .payload_path
+                .as_ref()
+                .ok_or("OpenCode transfer payload is unavailable")?;
+            let import_output = run_opencode_provider_helper(
+                terminal,
+                descriptor,
+                &paths.workspace,
+                &paths.cwd,
+                "opencode-import-worker",
+                Some(payload_path),
+            )?;
+            progress.import_receipt = Some(
+                serde_json::from_slice(&import_output)
+                    .map_err(|_| "provider importer returned an invalid receipt")?,
+            );
+        }
+        OpenCodeTransferPhase::StructuralVerified => {
+            let paths = progress
+                .paths
+                .as_ref()
+                .ok_or("OpenCode transfer paths are unavailable")?;
+            let import_receipt = progress
+                .import_receipt
+                .as_ref()
+                .ok_or("OpenCode import receipt is unavailable")?;
+            validate_import_receipt_binding(import_receipt, descriptor, &paths.database)?;
+        }
+        OpenCodeTransferPhase::ImportReceiptDurable => {
+            let import_receipt = progress
+                .import_receipt
+                .as_ref()
+                .ok_or("OpenCode import receipt is unavailable")?;
+            persist_opencode_receipt(
+                &state.state_dir,
+                &format!("opencode-{}-import.json", descriptor.transfer_id),
+                import_receipt,
+            )?;
+            append_event_with_secret(
+                &state.state_dir,
+                &state.secret,
+                "host.opencode_transfer.import_receipt_durable",
+                serde_json::json!({
+                    "transferId": descriptor.transfer_id,
+                    "rowCount": import_receipt.row_count,
+                    "assetCount": import_receipt.asset_count,
+                    "structuralSha256": import_receipt.structural_sha256,
+                }),
+            )
+            .map_err(|_| "OpenCode import receipt could not be recorded")?;
+        }
+        OpenCodeTransferPhase::ProviderIdentityReaderVerified => {
+            let paths = progress
+                .paths
+                .as_ref()
+                .ok_or("OpenCode transfer paths are unavailable")?;
+            let import_receipt = progress
+                .import_receipt
+                .as_ref()
+                .ok_or("OpenCode import receipt is unavailable")?;
+            let reader_output = run_opencode_provider_helper(
+                terminal,
+                descriptor,
+                &paths.workspace,
+                &paths.cwd,
+                "opencode-reader-probe",
+                None,
+            )?;
+            let reader_receipt: freshell_agent_runtime::opencode_transfer::InstalledStoreReadable =
+                serde_json::from_slice(&reader_output)
+                    .map_err(|_| "provider reader returned an invalid receipt")?;
+            validate_reader_receipt_binding(
+                &reader_receipt,
+                descriptor,
+                paths,
+                terminal.run_as_uid,
+                terminal.run_as_gid,
+                import_receipt,
+            )?;
+            append_event_with_secret(
+                &state.state_dir,
+                &state.secret,
+                "host.opencode_transfer.provider_identity_reader_verified",
+                serde_json::json!({
+                    "transferId": descriptor.transfer_id,
+                    "providerUid": reader_receipt.provider_uid,
+                    "providerGid": reader_receipt.provider_gid,
+                    "structuralSha256": reader_receipt.structural_sha256,
+                }),
+            )
+            .map_err(|_| "OpenCode provider-reader verification could not be recorded")?;
+            progress.reader_receipt = Some(reader_receipt);
+        }
+        OpenCodeTransferPhase::ReceiptsDurable => {
+            let reader_receipt = progress
+                .reader_receipt
+                .as_ref()
+                .ok_or("OpenCode provider-reader receipt is unavailable")?;
+            persist_opencode_receipt(
+                &state.state_dir,
+                &format!("opencode-{}-readable.json", descriptor.transfer_id),
+                reader_receipt,
+            )?;
+            append_event_with_secret(
+                &state.state_dir,
+                &state.secret,
+                "host.opencode_transfer.receipts_durable",
+                serde_json::json!({
+                    "transferId": descriptor.transfer_id,
+                    "providerUid": terminal.run_as_uid,
+                    "providerGid": terminal.run_as_gid,
+                    "structuralSha256": reader_receipt.structural_sha256,
+                }),
+            )
+            .map_err(|_| "OpenCode transfer receipts could not be recorded")?;
+        }
+        OpenCodeTransferPhase::ReceiptsRevalidated => {
+            revalidate_opencode_transfer_receipts(state, terminal)?;
+        }
+        OpenCodeTransferPhase::GrantConsumed | OpenCodeTransferPhase::PtySpawned => {
+            return Err("launch phase is outside OpenCode transfer readiness".into());
+        }
+    }
+    Ok(())
+}
+
+/// Reopens the durable receipts and repeats the body-free reader probe before
+/// the grant is consumed. A failed recheck therefore leaves no worker/PTY and
+/// allows the supervisor to retry the same prepared incarnation.
+fn revalidate_opencode_transfer_receipts(
+    state: &HostState,
+    terminal: &TerminalLaunchSpec,
+) -> Result<(), String> {
+    let descriptor = terminal
+        .opencode_transfer
+        .as_ref()
+        .ok_or("OpenCode transfer descriptor is unavailable")?;
+    descriptor
+        .validate()
+        .map_err(|_| "OpenCode transfer descriptor is invalid")?;
+    if terminal.mode != "opencode"
+        || descriptor.incarnation_id != state.incarnation_id.as_str()
+        || terminal.resume_session_id.as_deref() != Some(descriptor.root_session_id.as_str())
+    {
+        return Err("OpenCode transfer identity does not match this launch".into());
+    }
+    let paths = validate_opencode_reader_paths(
+        &terminal.env,
+        Path::new(&terminal.workspace_path),
+        Path::new(&terminal.cwd),
+    )?;
+    let import_receipt: freshell_agent_runtime::opencode_transfer::ImportReceipt =
+        read_opencode_receipt(
+            &state.state_dir,
+            &format!("opencode-{}-import.json", descriptor.transfer_id),
+        )?;
+    validate_import_receipt_binding(&import_receipt, descriptor, &paths.database)?;
+    let readable_receipt: freshell_agent_runtime::opencode_transfer::InstalledStoreReadable =
+        read_opencode_receipt(
+            &state.state_dir,
+            &format!("opencode-{}-readable.json", descriptor.transfer_id),
+        )?;
+    validate_reader_receipt_binding(
+        &readable_receipt,
+        descriptor,
+        &paths,
+        terminal.run_as_uid,
+        terminal.run_as_gid,
+        &import_receipt,
+    )?;
+
+    let reader_output = run_opencode_provider_helper(
+        terminal,
+        descriptor,
+        &paths.workspace,
+        &paths.cwd,
+        "opencode-reader-probe",
+        None,
+    )?;
+    let current_receipt: freshell_agent_runtime::opencode_transfer::InstalledStoreReadable =
+        serde_json::from_slice(&reader_output)
+            .map_err(|_| "provider reader returned an invalid revalidation receipt")?;
+    if current_receipt != readable_receipt {
+        return Err("installed OpenCode store changed after its durable receipt".into());
+    }
+    append_event_with_secret(
+        &state.state_dir,
+        &state.secret,
+        "host.opencode_transfer.receipts_revalidated",
+        serde_json::json!({
+            "transferId": descriptor.transfer_id,
+            "providerUid": terminal.run_as_uid,
+            "providerGid": terminal.run_as_gid,
+            "structuralSha256": current_receipt.structural_sha256,
+        }),
+    )
+    .map_err(|_| "OpenCode durable receipts could not be revalidated")?;
+    Ok(())
+}
+
+fn run_opencode_provider_helper(
+    terminal: &TerminalLaunchSpec,
+    descriptor: &OpenCodeTransferDescriptor,
+    workspace_root: &Path,
+    cwd: &Path,
+    worker: &str,
+    payload_path: Option<&Path>,
+) -> Result<Vec<u8>, String> {
+    let executable = std::env::current_exe().map_err(|error| error.to_string())?;
+    let mut command = std::process::Command::new("/usr/bin/setpriv");
+    command
+        .args(provider_identity_args(
+            terminal.run_as_uid,
+            terminal.run_as_gid,
+        ))
+        .arg(executable)
+        .arg(worker)
+        .arg("--workspace-root")
+        .arg(workspace_root)
+        .arg("--expected-cwd")
+        .arg(cwd)
+        .arg("--provider-uid")
+        .arg(terminal.run_as_uid.to_string())
+        .arg("--provider-gid")
+        .arg(terminal.run_as_gid.to_string())
+        .current_dir(cwd)
+        .env_clear()
+        .envs(&terminal.env)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    let mut child = command
+        .spawn()
+        .map_err(|_| "could not start the provider-identity OpenCode helper".to_string())?;
+    let write_result = (|| -> Result<(), String> {
+        let mut stdin = child
+            .stdin
+            .take()
+            .ok_or("provider helper stdin is unavailable")?;
+        write_opencode_descriptor_frame(&mut stdin, descriptor)?;
+        if let Some(payload_path) = payload_path {
+            let mut payload = std::fs::File::open(payload_path)
+                .map_err(|_| "verified OpenCode stage payload could not be opened")?;
+            let copied = io::copy(&mut payload, &mut stdin)
+                .map_err(|_| "OpenCode payload could not be streamed to the provider helper")?;
+            if copied != descriptor.files[0].size_bytes {
+                return Err("OpenCode staged payload size changed during handoff".into());
+            }
+        }
+        stdin
+            .flush()
+            .map_err(|_| "OpenCode provider helper input could not be flushed")?;
+        Ok(())
+    })();
+    let output = child
+        .wait_with_output()
+        .map_err(|_| "OpenCode provider helper did not settle")?;
+    write_result?;
+    if !output.status.success() {
+        return Err(format!(
+            "provider-identity OpenCode helper exited with status {}",
+            output.status
+        ));
+    }
+    if output.stdout.len() > MAX_OPENCODE_RECEIPT_BYTES {
+        return Err("provider-identity OpenCode helper receipt exceeds its bound".into());
+    }
+    Ok(output.stdout)
+}
+
+fn validate_import_receipt_binding(
+    receipt: &freshell_agent_runtime::opencode_transfer::ImportReceipt,
+    descriptor: &OpenCodeTransferDescriptor,
+    database: &Path,
+) -> Result<(), String> {
+    let manifest: freshell_sessions::opencode_transfer::OpenCodeTransferManifest =
+        serde_json::from_str(&descriptor.manifest_json)
+            .map_err(|_| "OpenCode manifest cannot be revalidated")?;
+    if receipt.version != 1
+        || receipt.transfer_id != descriptor.transfer_id
+        || receipt.destination_store_id != descriptor.destination_store_id
+        || receipt.destination_database_path != database.to_string_lossy()
+        || receipt.root_session_id != descriptor.root_session_id
+        || receipt.source_store_id != descriptor.source_store_id
+        || receipt.source_generation != descriptor.source_generation
+        || receipt.source_schema_fingerprint != descriptor.source_schema_fingerprint
+        || receipt.migration_journal_fingerprint != descriptor.migration_journal_fingerprint
+        || receipt.target_image_ref != descriptor.target_image_ref
+        || receipt.target_build_receipt != descriptor.target_build_receipt
+        || receipt.bundle_sha256 != descriptor.bundle_sha256
+        || receipt.row_count != manifest.row_count as u64
+        || receipt.asset_count != manifest.assets.len() as u64
+        || !is_lower_hex_64(&receipt.structural_sha256)
+    {
+        return Err("provider importer receipt does not bind to the transfer".into());
+    }
+    Ok(())
+}
+
+fn validate_reader_receipt_binding(
+    receipt: &freshell_agent_runtime::opencode_transfer::InstalledStoreReadable,
+    descriptor: &OpenCodeTransferDescriptor,
+    paths: &OpencodeReaderPaths,
+    uid: u32,
+    gid: u32,
+    import: &freshell_agent_runtime::opencode_transfer::ImportReceipt,
+) -> Result<(), String> {
+    if receipt.version != 1
+        || receipt.transfer_id != descriptor.transfer_id
+        || receipt.destination_store_id != descriptor.destination_store_id
+        || receipt.root_session_id != descriptor.root_session_id
+        || receipt.source_generation != descriptor.source_generation
+        || receipt.target_image_ref != descriptor.target_image_ref
+        || receipt.target_build_receipt != descriptor.target_build_receipt
+        || receipt.provider_uid != uid
+        || receipt.provider_gid != gid
+        || receipt.home != paths.home.to_string_lossy()
+        || receipt.xdg_data_home != paths.xdg_data_home.to_string_lossy()
+        || receipt.xdg_config_home != paths.xdg_config_home.to_string_lossy()
+        || receipt.opencode_db != paths.database.to_string_lossy()
+        || receipt.cwd != paths.cwd.to_string_lossy()
+        || receipt.row_count != import.row_count
+        || receipt.asset_count != import.asset_count
+        || receipt.structural_sha256 != import.structural_sha256
+    {
+        return Err("provider reader receipt does not match the imported baseline".into());
+    }
+    Ok(())
+}
+
+fn is_lower_hex_64(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn persist_opencode_receipt<T>(state_dir: &Path, name: &str, receipt: &T) -> Result<(), String>
+where
+    T: Serialize + serde::de::DeserializeOwned + PartialEq,
+{
+    let metadata = std::fs::symlink_metadata(state_dir).map_err(|error| error.to_string())?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err("OpenCode receipt directory is not a real directory".into());
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        if metadata.uid() != unsafe { libc::geteuid() } {
+            return Err("OpenCode receipt directory is not owned by the session host".into());
+        }
+        std::fs::set_permissions(state_dir, std::fs::Permissions::from_mode(0o700))
+            .map_err(|error| error.to_string())?;
+    }
+    let target = state_dir.join(name);
+    match std::fs::symlink_metadata(&target) {
+        Ok(existing_meta) => {
+            if existing_meta.file_type().is_symlink() || !existing_meta.is_file() {
+                return Err("OpenCode durable receipt is not a regular file".into());
+            }
+            let existing = serde_json::from_slice::<T>(
+                &std::fs::read(&target).map_err(|error| error.to_string())?,
+            )
+            .map_err(|_| "OpenCode durable receipt is invalid")?;
+            return if &existing == receipt {
+                Ok(())
+            } else {
+                Err("OpenCode durable receipt conflicts with revalidated state".into())
+            };
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.to_string()),
+    }
+    let bytes = serde_json::to_vec(receipt).map_err(|_| "encode OpenCode durable receipt")?;
+    if bytes.len() > MAX_OPENCODE_RECEIPT_BYTES {
+        return Err("OpenCode durable receipt exceeds its bound".into());
+    }
+    let temporary = state_dir.join(format!(
+        ".{name}.tmp-{}-{}",
+        std::process::id(),
+        uuid::Uuid::new_v4()
+    ));
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let write_result = (|| -> Result<(), String> {
+        let mut file = options
+            .open(&temporary)
+            .map_err(|error| error.to_string())?;
+        file.write_all(&bytes).map_err(|error| error.to_string())?;
+        file.sync_all().map_err(|error| error.to_string())?;
+        set_mode(&temporary, 0o400)?;
+        match std::fs::hard_link(&temporary, &target) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                let metadata =
+                    std::fs::symlink_metadata(&target).map_err(|read| read.to_string())?;
+                if metadata.file_type().is_symlink() || !metadata.is_file() {
+                    return Err("OpenCode durable receipt is not a regular file".into());
+                }
+                let existing = serde_json::from_slice::<T>(
+                    &std::fs::read(&target).map_err(|read| read.to_string())?,
+                )
+                .map_err(|_| "OpenCode durable receipt is invalid")?;
+                if &existing != receipt {
+                    return Err("OpenCode durable receipt conflicts with revalidated state".into());
+                }
+            }
+            Err(error) => return Err(error.to_string()),
+        }
+        std::fs::remove_file(&temporary).map_err(|error| error.to_string())?;
+        std::fs::File::open(state_dir)
+            .and_then(|directory| directory.sync_all())
+            .map_err(|error| error.to_string())?;
+        Ok(())
+    })();
+    if write_result.is_err() {
+        let _ = std::fs::remove_file(&temporary);
+    }
+    write_result
+}
+
+fn read_opencode_receipt<T>(state_dir: &Path, name: &str) -> Result<T, String>
+where
+    T: serde::de::DeserializeOwned,
+{
+    let path = state_dir.join(name);
+    let metadata = std::fs::symlink_metadata(&path).map_err(|error| error.to_string())?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err("OpenCode durable receipt is not a regular file".into());
+    }
+    if metadata.len() > MAX_OPENCODE_RECEIPT_BYTES as u64 {
+        return Err("OpenCode durable receipt exceeds its bound".into());
+    }
+    let bytes = std::fs::read(path).map_err(|error| error.to_string())?;
+    serde_json::from_slice(&bytes).map_err(|_| "OpenCode durable receipt is invalid".into())
+}
+
 fn prepare_provider_state_for_fresh_launch(
     terminal: &mut TerminalLaunchSpec,
+) -> Result<(), RuntimeError> {
+    prepare_provider_state_for_fresh_launch_at(
+        terminal,
+        &ProviderConfigPaths::default(),
+        Path::new("/run/freshell-bootstrap"),
+    )
+}
+
+fn prepare_provider_state_for_opencode_transfer(
+    terminal: &mut TerminalLaunchSpec,
+) -> Result<(), RuntimeError> {
+    prepare_provider_state_for_opencode_transfer_at(
+        terminal,
+        &ProviderConfigPaths::default(),
+        Path::new("/run/freshell-bootstrap"),
+    )
+    .map(|_| ())
+}
+
+fn prepare_provider_state_for_opencode_transfer_at(
+    terminal: &mut TerminalLaunchSpec,
+    paths: &ProviderConfigPaths,
+    bootstrap_root: &Path,
+) -> Result<bool, RuntimeError> {
+    if terminal.mode != "opencode" || terminal.opencode_transfer.is_none() {
+        return Err(RuntimeError::new(
+            RuntimeErrorCode::InvalidRequest,
+            "provider-home history preparation requires an OpenCode transfer",
+        ));
+    }
+    let metadata = std::fs::symlink_metadata(&paths.provider_home).map_err(|error| {
+        RuntimeError::new(
+            RuntimeErrorCode::HostUnreachable,
+            format!("OpenCode provider HOME is unavailable: {error}"),
+        )
+    })?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(RuntimeError::new(
+            RuntimeErrorCode::HostUnreachable,
+            "OpenCode provider HOME is not a real directory",
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        if metadata.uid() == terminal.run_as_uid
+            && metadata.gid() == terminal.run_as_gid
+            && metadata.permissions().mode() & 0o777 == 0o700
+        {
+            // A prior attempt completed the provider-state handoff. The owner
+            // is assigned last by preparation, so this is also the retry marker.
+            return Ok(false);
+        }
+    }
+
+    prepare_provider_state_for_fresh_launch_at(terminal, paths, bootstrap_root)?;
+    Ok(true)
+}
+
+fn prepare_provider_state_for_fresh_launch_at(
+    terminal: &mut TerminalLaunchSpec,
+    paths: &ProviderConfigPaths,
+    bootstrap_root: &Path,
 ) -> Result<(), RuntimeError> {
     prepare_provider_state_before_bootstrap_with(
         terminal,
         providers::prepare_provider_state_before_bootstrap,
         transfer_host_created_provider_state,
-        |terminal| {
-            prepare_provider_context_for_fresh_launch(terminal, &ProviderConfigPaths::default())
-        },
+        |terminal| prepare_provider_context_for_fresh_launch(terminal, paths),
     )?;
-    prepare_provider_bootstrap_files(
+    prepare_provider_bootstrap_files_at(
         &terminal.provider_bootstrap_files,
         terminal.run_as_uid,
         terminal.run_as_gid,
+        &paths.provider_home,
+        bootstrap_root,
     )
     .map_err(|error| {
         RuntimeError::new(
@@ -1146,10 +2190,22 @@ fn prepare_provider_bootstrap_files(
     run_as_uid: u32,
     run_as_gid: u32,
 ) -> Result<(), String> {
-    let home = PathBuf::from("/home/freshell/provider");
-    if home != Path::new("/home/freshell/provider") {
-        return Err("managed provider HOME must be /home/freshell/provider".into());
-    }
+    prepare_provider_bootstrap_files_at(
+        files,
+        run_as_uid,
+        run_as_gid,
+        Path::new("/home/freshell/provider"),
+        Path::new("/run/freshell-bootstrap"),
+    )
+}
+
+fn prepare_provider_bootstrap_files_at(
+    files: &[ProviderBootstrapFile],
+    run_as_uid: u32,
+    run_as_gid: u32,
+    home: &Path,
+    bootstrap_root: &Path,
+) -> Result<(), String> {
     if !home.is_dir() {
         return Err("managed provider HOME volume is not mounted".into());
     }
@@ -1159,10 +2215,10 @@ fn prepare_provider_bootstrap_files(
     // parent early would lock the host out before later files are copied.
     set_mode(&home, 0o700)?;
     let mut provider_dirs = std::collections::BTreeSet::new();
-    provider_dirs.insert(home.clone());
+    provider_dirs.insert(home.to_path_buf());
 
     for (index, file) in files.iter().enumerate() {
-        let source = PathBuf::from(format!("/run/freshell-bootstrap/provider-{index}"));
+        let source = bootstrap_root.join(format!("provider-{index}"));
         let relative = PathBuf::from(&file.provider_relative_path);
         if file.provider_relative_path.is_empty()
             || relative.is_absolute()
@@ -1177,7 +2233,7 @@ fn prepare_provider_bootstrap_files(
             return Err("provider bootstrap destination escaped HOME".into());
         }
         if let Some(relative_parent) = relative.parent() {
-            let mut current = home.clone();
+            let mut current = home.to_path_buf();
             for component in relative_parent.components() {
                 if let std::path::Component::Normal(component) = component {
                     current.push(component);
@@ -3291,6 +4347,7 @@ mod tests {
             provider_bootstrap_files: Vec::new(),
             provider_secret_references: Vec::new(),
             provider_launch_context: Some(context),
+            opencode_transfer: None,
         };
         let resume_spec = ResumeSpec {
             schema_version: freshell_runtime_protocol::RESUME_SPEC_SCHEMA_VERSION,
@@ -3404,6 +4461,301 @@ mod tests {
             fresh_agent: Mutex::new(None),
             provider_config_paths: ProviderConfigPaths::default(),
         })
+    }
+
+    #[test]
+    fn opencode_reader_environment_must_select_the_exact_database_and_workspace_cwd() {
+        let root = tempfile::tempdir().unwrap();
+        let workspace = root.path().join("workspace");
+        let cwd = workspace.join("project");
+        let outside = root.path().join("outside");
+        std::fs::create_dir_all(&cwd).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        let workspace = std::fs::canonicalize(workspace).unwrap();
+        let cwd = std::fs::canonicalize(cwd).unwrap();
+        let mut env = std::collections::BTreeMap::from([
+            ("HOME".into(), "/home/freshell/provider".into()),
+            (
+                "XDG_DATA_HOME".into(),
+                "/home/freshell/provider/.local/share".into(),
+            ),
+            (
+                "XDG_CONFIG_HOME".into(),
+                "/home/freshell/provider/.config".into(),
+            ),
+            (
+                "OPENCODE_DB".into(),
+                "/home/freshell/provider/.local/share/opencode/opencode.db".into(),
+            ),
+        ]);
+        assert!(validate_opencode_reader_paths(&env, &workspace, &cwd).is_ok());
+
+        env.insert("OPENCODE_DB".into(), "/tmp/other.db".into());
+        assert!(validate_opencode_reader_paths(&env, &workspace, &cwd).is_err());
+
+        env.insert(
+            "OPENCODE_DB".into(),
+            "/home/freshell/provider/.local/share/opencode/opencode.db".into(),
+        );
+        assert!(validate_opencode_reader_paths(&env, &workspace, &outside).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn durable_opencode_receipts_are_idempotent_bounded_and_conflict_rejecting() {
+        use std::os::unix::fs::symlink;
+
+        #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+        struct Receipt {
+            transfer_id: String,
+            row_count: u64,
+        }
+
+        let state_dir = tempfile::tempdir().unwrap();
+        let receipt = Receipt {
+            transfer_id: "synthetic-transfer".into(),
+            row_count: 12,
+        };
+        persist_opencode_receipt(state_dir.path(), "import.json", &receipt).unwrap();
+        persist_opencode_receipt(state_dir.path(), "import.json", &receipt).unwrap();
+        assert_eq!(
+            read_opencode_receipt::<Receipt>(state_dir.path(), "import.json").unwrap(),
+            receipt
+        );
+
+        let conflict = Receipt {
+            row_count: 13,
+            ..receipt.clone()
+        };
+        assert!(persist_opencode_receipt(state_dir.path(), "import.json", &conflict).is_err());
+
+        let outside = state_dir.path().join("outside.json");
+        std::fs::write(
+            &outside,
+            br#"{"transfer_id":"synthetic-transfer","row_count":12}"#,
+        )
+        .unwrap();
+        symlink(&outside, state_dir.path().join("linked.json")).unwrap();
+        assert!(read_opencode_receipt::<Receipt>(state_dir.path(), "linked.json").is_err());
+        assert!(persist_opencode_receipt(state_dir.path(), "linked.json", &receipt).is_err());
+    }
+
+    #[test]
+    fn opencode_transfer_phase_order_blocks_grant_and_pty_until_receipts_revalidate() {
+        let mut gate = OpenCodeTransferGate::default();
+        assert!(gate
+            .run_step(OpenCodeTransferPhase::GrantConsumed, || Ok(()))
+            .is_err());
+        assert!(gate.ensure_pty_spawn_allowed().is_err());
+
+        let mut performed = Vec::new();
+        run_opencode_transfer_readiness_sequence(&mut gate, |phase| {
+            performed.push(phase);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(performed, OPENCODE_TRANSFER_READINESS_PHASES);
+        assert_eq!(gate.phases(), OPENCODE_TRANSFER_READINESS_PHASES);
+        assert!(gate.ensure_pty_spawn_allowed().is_err());
+        gate.advance(OpenCodeTransferPhase::GrantConsumed).unwrap();
+        gate.ensure_pty_spawn_allowed().unwrap();
+        gate.advance(OpenCodeTransferPhase::PtySpawned).unwrap();
+        assert_eq!(
+            gate.phases(),
+            &[
+                OpenCodeTransferPhase::ProviderHomePrepared,
+                OpenCodeTransferPhase::StageVerified,
+                OpenCodeTransferPhase::ImportCompleted,
+                OpenCodeTransferPhase::StructuralVerified,
+                OpenCodeTransferPhase::ImportReceiptDurable,
+                OpenCodeTransferPhase::ProviderIdentityReaderVerified,
+                OpenCodeTransferPhase::ReceiptsDurable,
+                OpenCodeTransferPhase::ReceiptsRevalidated,
+                OpenCodeTransferPhase::GrantConsumed,
+                OpenCodeTransferPhase::PtySpawned,
+            ]
+        );
+
+        let mut blocked = OpenCodeTransferGate::default();
+        let mut blocked_performed = Vec::new();
+        assert!(
+            run_opencode_transfer_readiness_sequence(&mut blocked, |phase| {
+                blocked_performed.push(phase);
+                if phase == OpenCodeTransferPhase::ProviderIdentityReaderVerified {
+                    return Err("synthetic provider reader failure".into());
+                }
+                Ok(())
+            })
+            .is_err()
+        );
+        assert_eq!(blocked_performed, OPENCODE_TRANSFER_READINESS_PHASES[..6]);
+        assert!(blocked
+            .advance(OpenCodeTransferPhase::GrantConsumed)
+            .is_err());
+        assert!(blocked.ensure_pty_spawn_allowed().is_err());
+    }
+
+    #[tokio::test]
+    async fn opencode_transfer_production_runner_orders_readiness_before_pty_callback() {
+        let mut gate = OpenCodeTransferGate::default();
+        let mut phases = Vec::new();
+        run_opencode_transfer_readiness_sequence(&mut gate, |phase| {
+            phases.push(phase);
+            Ok(())
+        })
+        .unwrap();
+        gate.run_step(OpenCodeTransferPhase::GrantConsumed, || Ok(()))
+            .unwrap();
+        let mut pty_spawned = false;
+        let result = run_opencode_transfer_pty_spawn(&mut gate, || async {
+            pty_spawned = true;
+            Ok::<_, RuntimeError>("synthetic-pty")
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(result, "synthetic-pty");
+        assert!(pty_spawned);
+        assert_eq!(phases, OPENCODE_TRANSFER_READINESS_PHASES);
+        assert_eq!(
+            gate.phases().last(),
+            Some(&OpenCodeTransferPhase::PtySpawned)
+        );
+
+        let mut blocked_gate = OpenCodeTransferGate::default();
+        let mut blocked_phases = Vec::new();
+        assert!(
+            run_opencode_transfer_readiness_sequence(&mut blocked_gate, |phase| {
+                blocked_phases.push(phase);
+                if phase == OpenCodeTransferPhase::ProviderIdentityReaderVerified {
+                    return Err("synthetic provider reader failure".into());
+                }
+                Ok(())
+            })
+            .is_err()
+        );
+        let mut forbidden_pty_spawned = false;
+        assert!(
+            run_opencode_transfer_pty_spawn(&mut blocked_gate, || async {
+                forbidden_pty_spawned = true;
+                Ok::<_, RuntimeError>(())
+            })
+            .await
+            .is_err()
+        );
+        assert!(!forbidden_pty_spawned);
+        assert_eq!(blocked_phases, OPENCODE_TRANSFER_READINESS_PHASES[..6]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn opencode_transfer_provider_preparation_is_retryable_and_does_not_run_provider_or_open_db() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let root = tempfile::tempdir().unwrap();
+        let workspace = root.path().join("workspace");
+        let provider_home = root.path().join("provider-home");
+        let bootstrap_root = root.path().join("bootstrap");
+        let side_effect = root.path().join("provider-was-run");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(&provider_home).unwrap();
+        std::fs::set_permissions(&provider_home, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::create_dir(&bootstrap_root).unwrap();
+        std::fs::write(
+            bootstrap_root.join("provider-0"),
+            b"synthetic approved bootstrap config",
+        )
+        .unwrap();
+        let launcher = root.path().join("provider-launcher");
+        std::fs::write(
+            &launcher,
+            format!("#!/bin/sh\ntouch '{}'\n", side_effect.display()),
+        )
+        .unwrap();
+        std::fs::set_permissions(&launcher, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let uid = unsafe { libc::geteuid() };
+        let gid = unsafe { libc::getegid() };
+        let mut terminal: TerminalLaunchSpec = serde_json::from_value(serde_json::json!({
+            "terminalId":"opencode-transfer-prep",
+            "streamId":"opencode-transfer-prep-stream",
+            "mode":"opencode",
+            "program":launcher,
+            "args":["--continue"],
+            "cwd":workspace,
+            "runAsUid":uid,
+            "runAsGid":gid,
+            "cols":80,
+            "rows":24,
+            "projectKey":"synthetic-project",
+            "workspacePath":workspace,
+            "resumeSessionId":"ses_synthetic",
+            "providerBootstrapFiles":[{
+                "sourcePath":"synthetic-only",
+                "providerRelativePath":".config/opencode/opencode.json"
+            }]
+        }))
+        .unwrap();
+        terminal.opencode_transfer = Some(OpenCodeTransferDescriptor {
+            transfer_id: "synthetic-transfer".into(),
+            provider: "opencode".into(),
+            source_store_id: "synthetic-source".into(),
+            root_session_id: "ses_synthetic".into(),
+            source_generation: "synthetic-generation".into(),
+            provider_schema: "opencode-1.18.21".into(),
+            source_schema_fingerprint: "synthetic-schema".into(),
+            migration_journal_fingerprint: "synthetic-migrations".into(),
+            destination_store_id: "synthetic-soul".into(),
+            destination_database_path: ".local/share/opencode/opencode.db".into(),
+            target_image_ref: format!("sha256:{}", "a".repeat(64)),
+            target_build_receipt: "synthetic-build".into(),
+            incarnation_id: "incarnation-synthetic".into(),
+            manifest_json: "{}".into(),
+            files: Vec::new(),
+            total_bytes: 0,
+            bundle_sha256: "synthetic-bundle".into(),
+        });
+        let paths = ProviderConfigPaths {
+            private_mount: root.path().join("private-mount"),
+            provider_home: provider_home.clone(),
+        };
+
+        let prepared =
+            prepare_provider_state_for_opencode_transfer_at(&mut terminal, &paths, &bootstrap_root)
+                .expect("first transfer attempt should prepare the empty provider home");
+        assert!(prepared);
+        assert_eq!(
+            std::fs::metadata(&provider_home).unwrap().uid(),
+            uid,
+            "preparation must finish by handing the provider HOME to the provider UID"
+        );
+        assert_eq!(
+            std::fs::read(provider_home.join(".config/opencode/opencode.json")).unwrap(),
+            b"synthetic approved bootstrap config"
+        );
+        assert!(
+            !provider_home
+                .join(".local/share/opencode/opencode.db")
+                .exists(),
+            "provider preparation must not open or create OPENCODE_DB"
+        );
+        assert!(
+            !side_effect.exists(),
+            "preparation must not run the provider launcher"
+        );
+
+        let retry =
+            prepare_provider_state_for_opencode_transfer_at(&mut terminal, &paths, &bootstrap_root)
+                .expect("a retry after durable home ownership must be a no-op");
+        assert!(!retry);
+        assert_eq!(
+            std::fs::metadata(&provider_home)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+        assert!(!side_effect.exists());
     }
 
     fn authenticated_host_envelope(state: &HostState, body: HostCommand) -> Envelope<HostCommand> {
