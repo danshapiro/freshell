@@ -5776,6 +5776,25 @@ impl FreshCodexState {
             .is_some_and(|s| !s.exited.load(Ordering::SeqCst))
     }
 
+    pub(crate) async fn local_snapshot_owner(
+        &self,
+        native_id: &str,
+    ) -> Option<freshell_ownership::OwnershipSnapshot> {
+        let sessions = self.sessions.lock().await;
+        let session = sessions.get(native_id)?;
+        if session.exited.load(Ordering::SeqCst) {
+            return None;
+        }
+        crate::ownership_lane::current_local_snapshot_owner(
+            &self.ownership,
+            &self.ownership_stamps,
+            PROVIDER,
+            native_id,
+            native_id,
+            session.sidecar_pid,
+        )
+    }
+
     /// Handle a `freshAgent.attach` for codex (reload-rehydrate). Decision table:
     ///
     /// | State | Action |
@@ -7853,30 +7872,29 @@ impl FreshCodexState {
         thread_id: &str,
         ownership: &freshell_ownership::OwnershipSnapshot,
     ) -> Result<Value, CodexSnapshotError> {
-        let sessions_root =
-            codex_home_from_env().map(|home| std::path::PathBuf::from(home).join("sessions"));
-        let id = thread_id.to_string();
-        let saved = tokio::task::spawn_blocking(move || {
-            let Some(path) = sessions_root.and_then(|root| locate_thread_rollout(&root, &id)) else {
-                return Ok(None);
-            };
-            native_history::read_rollout(&path, &id)
-                .and_then(|snapshot| crate::native_history::readonly_snapshot("codex", snapshot))
-                .map(Some)
-        })
-        .await
-        .map_err(|error| error.to_string())
-        .and_then(|result| result)
-        .map_err(|error| {
-            tracing::warn!(event = "freshagent.codex.saved_history.read_failed", thread_id, error = %error);
-            CodexSnapshotError::Protocol(error)
-        })?;
-        let Some(mut snapshot) = saved else {
+        let Some(mut snapshot) = self.exact_saved_snapshot(thread_id).await? else {
             return Ok(self.empty_readonly_snapshot(thread_id, ownership));
         };
         snapshot["extensions"]["codex"]["ownerEpoch"] = json!(ownership.epoch);
         snapshot["extensions"]["codex"]["ownerGeneration"] = json!(ownership.generation);
         Ok(snapshot)
+    }
+
+    pub(crate) async fn exact_saved_snapshot(
+        &self,
+        thread_id: &str,
+    ) -> Result<Option<Value>, CodexSnapshotError> {
+        let sessions_root =
+            codex_home_from_env().map(|home| std::path::PathBuf::from(home).join("sessions"));
+        let id = thread_id.to_string();
+        tokio::task::spawn_blocking(move || {
+            let Some(path) = sessions_root.and_then(|root| locate_thread_rollout(&root, &id)) else { return Ok(None); };
+            native_history::read_rollout(&path, &id)
+                .and_then(|snapshot| crate::native_history::readonly_snapshot("codex", snapshot)).map(Some)
+        }).await.map_err(|error| error.to_string()).and_then(|result| result).map_err(|error| {
+            tracing::warn!(event = "freshagent.codex.saved_history.read_failed", thread_id, error = %error);
+            CodexSnapshotError::Protocol(error)
+        })
     }
 
     /// kata b8ke Task 5: the side-effect-free EMPTY snapshot for an absent

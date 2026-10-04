@@ -5117,6 +5117,24 @@ impl FreshClaudeState {
         self.sessions.lock().await.contains_key(&key)
     }
 
+    pub(crate) async fn local_snapshot_owner(
+        &self,
+        native_id: &str,
+    ) -> Option<freshell_ownership::OwnershipSnapshot> {
+        let key = self.resolve_session_key(native_id).await?;
+        let sessions = self.sessions.lock().await;
+        let session = sessions.get(&key)?;
+        let canonical = session.cli_session_id.as_deref().unwrap_or(native_id);
+        crate::ownership_lane::current_local_snapshot_owner(
+            &self.ownership,
+            &self.ownership_stamps,
+            PROVIDER,
+            canonical,
+            &key,
+            session.child.id(),
+        )
+    }
+
     // ── freshAgent.undo / freshAgent.redo (kata 1wxv Task 4; fork-at-point) ────
 
     /// Decision 6: pending cards inside undone turns are CANCELLED, never silently
@@ -12029,6 +12047,50 @@ rl.on('line', (line) => {
             plugins: None,
             tab_id: None,
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn local_snapshot_owner_requires_current_native_and_presentation_registration() {
+        let _guard = CLAUDE_ENV_LOCK.lock().await;
+        let env = FakeClaudeSidecarEnv::install();
+        for kind in [SessionType::Freshclaude, SessionType::Kilroy] {
+            let (mut state, mut rx) = state_with_bus();
+            let registry = Arc::new(freshell_ownership::RuntimeOwnershipRegistry::new());
+            state.set_ownership(registry.clone());
+            let mut create = dedup_create_msg("local-snapshot-owner");
+            create.session_type = kind;
+            state.handle_create(create, None).await;
+            let created =
+                await_claude_created_and_session_init(&mut rx, "local-snapshot-owner").await;
+            let presentation = created["sessionId"].as_str().unwrap();
+            let native = FRESH_CREATE_DURABLE_ID;
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+            while state.local_snapshot_owner(native).await.is_none() {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "native owner never published"
+                );
+                tokio::task::yield_now().await;
+            }
+            let expected = registry.observe("claude", native);
+            let native_owner = state.local_snapshot_owner(native).await;
+            let presentation_owner = state.local_snapshot_owner(presentation).await;
+            let unknown_owner = state.local_snapshot_owner("different-native-thread").await;
+            // Map presence alone cannot override a missing retained ownership stamp.
+            let stamp = crate::ownership_lane::take_retained_stamp(&state.ownership_stamps, native)
+                .unwrap();
+            let unstamped = state.local_snapshot_owner(native).await;
+            crate::ownership_lane::restore_retained_stamp(&state.ownership_stamps, native, stamp);
+            let mut kill = kill_msg(presentation);
+            kill.session_type = kind;
+            state.handle_kill(kill).await;
+            assert_eq!(native_owner, Some(expected.clone()));
+            assert_eq!(presentation_owner, Some(expected));
+            assert!(unknown_owner.is_none());
+            assert!(unstamped.is_none());
+            assert!(state.local_snapshot_owner(native).await.is_none());
+        }
+        assert_eq!(env.spawn_count(), 2);
     }
 
     /// Drain `rx` until the `freshAgent.created` (or `.create.failed`) frame for

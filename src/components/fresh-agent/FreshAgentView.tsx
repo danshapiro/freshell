@@ -281,6 +281,12 @@ function shouldClearStaleLocalEcho(
   return !localEchoLanded(snapshot.turns, echo, pending)
 }
 
+function isNativeHistoryOnlySnapshot(snapshot: FreshAgentSnapshot | null): boolean {
+  const state = snapshot?.extensions?.[snapshot.provider]
+  return state?.ownerKind === 'vacant'
+    || (state?.nativeHistoryAvailable === true && state.statusFromLiveState !== true)
+}
+
 function mergeSnapshotForDisplay(
   previous: FreshAgentSnapshot | null,
   next: FreshAgentSnapshot,
@@ -295,7 +301,7 @@ function mergeSnapshotForDisplay(
   // live actor resumes. An authoritative empty result may still replace it.
   const providerState = next.extensions?.[next.provider]
   if (
-    (managedRecoveryPending || previous.extensions?.[previous.provider]?.nativeHistoryAvailable === true)
+    (managedRecoveryPending || isNativeHistoryOnlySnapshot(previous))
     && previous.turns.length > 0
     && next.turns.length === 0
     && next.status === 'idle'
@@ -305,8 +311,7 @@ function mergeSnapshotForDisplay(
   ) return previous
   // Native reads and live actors have different revision bases. Requests fence
   // source transitions; the revision comparison applies within one source.
-  const sameRevisionSource = (previous.extensions?.[previous.provider]?.nativeHistoryAvailable === true)
-    === (providerState?.nativeHistoryAvailable === true)
+  const sameRevisionSource = isNativeHistoryOnlySnapshot(previous) === isNativeHistoryOnlySnapshot(next)
   if (
     sameRevisionSource
     && typeof previous.revision === 'number'
@@ -2775,7 +2780,8 @@ export function FreshAgentView({
     const trigger = snapshotRefreshTriggerRef.current
     const refreshSerial = snapshotRefreshSerialRef.current
     const applySnapshot = (next: FreshAgentSnapshot) => {
-      if (requestPaneSoulId && next.extensions?.[provider]?.statusFromLiveState === true
+      const historyOnly = isNativeHistoryOnlySnapshot(next)
+      if ((historyOnly || (requestPaneSoulId && next.extensions?.[provider]?.statusFromLiveState === true))
         && (next.provider !== provider || next.sessionType !== requestSessionType || next.threadId !== sessionId)) return
       const snapshotIdentity = currentAutoTitleIdentityRef.current
       const resolved = next as FreshAgentSnapshot
@@ -2795,7 +2801,7 @@ export function FreshAgentView({
       )
       const snapshotAccepted = displaySnapshot !== previousSnapshot
       if (snapshotAccepted) snapshotRequestAuthorityRef.current.applied = requestSerial
-      const snapshotStatusAuthoritative = !requestReadOnly && (provider === 'codex'
+      const snapshotStatusAuthoritative = !requestReadOnly && !historyOnly && (provider === 'codex'
         || resolved.extensions?.[provider]?.statusFromLiveState === true)
       const outgoing = outgoingTurnRef.current
       if (
@@ -2853,16 +2859,13 @@ export function FreshAgentView({
       }
       // This read has no live actor authority, even if Retry cleared the intervention while it ran.
       const liveProviderState = resolved.extensions?.[provider]
-      if (requestReadOnly || (requestPaneSoulId && (
-        liveProviderState?.nativeHistoryAvailable === true || liveProviderState?.ownerKind === 'vacant'
-      ))) return
+      if (requestReadOnly || historyOnly) return
       if (
         snapshotAccepted && paneContentRef.current.soulId && requestSessionWasLost && agentSessionLostRef.current
         && agentSessionStatusVersionRef.current === requestAgentSessionStatusVersion
         && resolved.provider === provider && resolved.sessionType === requestSessionType
         && resolved.threadId === sessionId
         && liveProviderState?.statusFromLiveState === true
-        && liveProviderState.nativeHistoryAvailable !== true
         && liveProviderState.ownerKind !== 'vacant'
       ) {
         dispatch(clearSessionLost({ sessionId: paneContentRef.current.sessionId!, sessionType: requestSessionType, provider }))
@@ -3404,7 +3407,8 @@ export function FreshAgentView({
     : (agentSession as { lastError?: string } | undefined)?.lastError ?? null
   // sessionEnded gates everything: a stale snapshot can still claim
   // capabilities.send after the provider process died.
-  const canSend = !managedRecoveryActive && !sessionEnded && (snapshot?.capabilities?.send === true || (
+  const snapshotHistoryOnly = isNativeHistoryOnlySnapshot(snapshot)
+  const canSend = !snapshotHistoryOnly && !managedRecoveryActive && !sessionEnded && (snapshot?.capabilities?.send === true || (
     paneContent.provider === 'claude'
     && Boolean(paneContent.sessionId)
     && !isRestoring
@@ -3420,7 +3424,7 @@ export function FreshAgentView({
   // disabled so a user cannot submit text, get a local echo, and issue an
   // old-kind send the server's generation fence would refuse with a
   // misleading failure instead of the pane's recoverable attach action.
-  const composerDisabled = managedRecoveryActive || !paneContent.sessionId || sessionEnded || (!canSend && !isBusy) || Boolean(ownerDivergence)
+  const composerDisabled = snapshotHistoryOnly || managedRecoveryActive || !paneContent.sessionId || sessionEnded || (!canSend && !isBusy) || Boolean(ownerDivergence)
 
   useEffect(() => {
     const outgoing = outgoingTurnRef.current
@@ -3685,7 +3689,7 @@ export function FreshAgentView({
     // owns the session; an old-kind interrupt would at best fail the
     // server's generation fence and at worst tear at a writer the
     // diverged pane no longer owns).
-    const canInterrupt = !managedRecoveryActive && !ownerDivergence && isBusy && (snapshot?.capabilities?.interrupt === true || (
+    const canInterrupt = !snapshotHistoryOnly && !managedRecoveryActive && !ownerDivergence && isBusy && (snapshot?.capabilities?.interrupt === true || (
       paneContent.provider === 'claude'
       && Boolean(paneContent.sessionId)
       && ['connected', 'running', 'compacting'].includes(effectiveStatus)

@@ -94,6 +94,92 @@ impl SnapshotState {
             claude,
         }
     }
+    async fn local_owner(
+        &self,
+        session_type: &str,
+        provider: &str,
+        native_id: &str,
+    ) -> Option<freshell_ownership::OwnershipSnapshot> {
+        match (session_type, provider) {
+            ("freshcodex", "codex") => self.codex.local_snapshot_owner(native_id).await,
+            ("freshclaude" | "kilroy", "claude") => {
+                self.claude.local_snapshot_owner(native_id).await
+            }
+            ("freshopencode", "opencode") => self.opencode.local_snapshot_owner(native_id).await,
+            _ => None,
+        }
+    }
+
+    async fn exact_saved_history(
+        &self,
+        session_type: &str,
+        provider: &str,
+        native_id: &str,
+    ) -> Option<serde_json::Value> {
+        let snapshot = match (session_type, provider) {
+            ("freshcodex", "codex") => self
+                .codex
+                .exact_saved_snapshot(native_id)
+                .await
+                .ok()
+                .flatten()?,
+            ("freshclaude" | "kilroy", "claude") => {
+                let rollback = self.claude.load_rollback_record(native_id).await;
+                let saved = crate::claude_snapshot::get_claude_snapshot(
+                    session_type,
+                    native_id,
+                    rollback.as_ref(),
+                )
+                .await
+                .ok()?;
+                crate::native_history::readonly_snapshot(provider, saved).ok()?
+            }
+            ("freshopencode", "opencode") => {
+                let id = native_id.to_owned();
+                let path =
+                    freshell_sessions::parse::default_opencode_data_home().join("opencode.db");
+                tokio::task::spawn_blocking(move || {
+                    crate::native_history::read_opencode_path(&path, &id).and_then(|snapshot| {
+                        crate::native_history::readonly_snapshot("opencode", snapshot)
+                    })
+                })
+                .await
+                .ok()?
+                .ok()?
+            }
+            _ => return None,
+        };
+        (snapshot["threadId"].as_str() == Some(native_id)
+            && snapshot["provider"].as_str() == Some(provider)
+            && snapshot["sessionType"].as_str() == Some(session_type))
+        .then_some(snapshot)
+    }
+
+    async fn saved_history_or_unavailable(
+        &self,
+        session_type: &str,
+        provider: &str,
+        native_id: &str,
+    ) -> Response {
+        let saved = self
+            .exact_saved_history(session_type, provider, native_id)
+            .await;
+        tracing::debug!(
+            event = "fresh_agent.snapshot.saved_history_fallback",
+            session_type,
+            provider,
+            native_id,
+            available = saved.is_some(),
+            "Live snapshot unavailable; read exact saved history"
+        );
+        match saved {
+            Some(snapshot) => Json(snapshot).into_response(),
+            None => fail(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Managed conversation snapshot unavailable".into(),
+            ),
+        }
+    }
 }
 
 /// The pre-bound snapshot sub-router.
@@ -117,7 +203,11 @@ async fn get_snapshot(
     }
     let cwd = query.get("cwd").cloned();
 
-    if VALID_SESSION_TYPES.contains(&session_type.as_str())
+    let local_owner = state
+        .local_owner(&session_type, &provider, &thread_id)
+        .await;
+    if local_owner.is_none()
+        && VALID_SESSION_TYPES.contains(&session_type.as_str())
         && VALID_PROVIDERS.contains(&provider.as_str())
     {
         if let Some(gateway) = state.opencode.hosted_rest_gateway() {
@@ -132,16 +222,15 @@ async fn get_snapshot(
                 Ok(Some(snapshot)) => return Json(snapshot).into_response(),
                 Ok(None) => {}
                 Err(()) => {
-                    return fail(
-                        StatusCode::SERVICE_UNAVAILABLE,
-                        "Managed conversation snapshot unavailable".into(),
-                    )
+                    return state
+                        .saved_history_or_unavailable(&session_type, &provider, &thread_id)
+                        .await
                 }
             }
         }
     }
 
-    match (session_type.as_str(), provider.as_str()) {
+    let response = match (session_type.as_str(), provider.as_str()) {
         ("freshcodex", "codex") => match state.codex.get_snapshot(&thread_id, cwd.as_deref()).await
         {
             Ok(snapshot) => Json(snapshot).into_response(),
@@ -280,7 +369,21 @@ async fn get_snapshot(
                 "FRESH_AGENT_RUNTIME_UNAVAILABLE",
             )
         }
+    };
+    // A local read never publishes the authority of an owner that changed while it awaited the provider.
+    if let Some(before) = local_owner {
+        if state
+            .local_owner(&session_type, &provider, &thread_id)
+            .await
+            .as_ref()
+            != Some(&before)
+        {
+            return state
+                .saved_history_or_unavailable(&session_type, &provider, &thread_id)
+                .await;
+        }
     }
+    response
 }
 
 fn fail(status: StatusCode, message: String) -> Response {
