@@ -429,8 +429,24 @@ test('fresh-agent: automatic recovery reads actual saved Codex history without c
   expect(response.request().method()).toBe('GET')
   expect(response.status()).toBe(200)
   expect((await response.json()).extensions.codex.nativeHistoryAvailable).toBe(true)
-  await expect(page.getByTestId('terminal-work-area').getByText('Sanitized prompt', { exact: true })).toBeVisible()
-  await expect(page.getByTestId('terminal-work-area').getByText(SAVED_HISTORY_TEXT, { exact: true })).toBeVisible()
+  const workArea = page.getByTestId('terminal-work-area')
+  const userBody = workArea.getByLabel('You transcript turn', { exact: true })
+    .getByText('Sanitized prompt', { exact: true })
+  const assistantBody = workArea.getByLabel('Freshcodex transcript turn', { exact: true })
+    .getByText(SAVED_HISTORY_TEXT, { exact: true })
+  await expect(userBody).toBeVisible()
+  await expect(assistantBody).toBeVisible()
+  // Session naming hydrates independently of history. Deliver its automatic
+  // projection explicitly so the real header duplicate is deterministic.
+  await page.evaluate((sessionId) => {
+    const ref = { kind: 'session', provider: 'codex', sessionId }
+    window.__FRESHELL_TEST_HARNESS__!.dispatch({ type: 'sessionNames/receiveSessionNameProjections', payload: [{
+      ref, record: { ref, name: 'Sanitized prompt', source: 'first_message', revision: 1 },
+    }] })
+  }, SESSION_ID)
+  await expect(workArea.getByTitle('Sanitized prompt', { exact: true })).toBeVisible()
+  await expect(userBody).toBeVisible()
+  await expect(assistantBody).toBeVisible()
   const content = await paneContent(page)
   expect(content).toMatchObject({ sessionId: SESSION_ID, sessionRef: { provider: 'codex', sessionId: SESSION_ID },
     resumeSessionId: SESSION_ID, createRequestId: CREATE_REQUEST_ID, recoverySummary: { recoveryState: 'recovering' } })
