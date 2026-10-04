@@ -68,7 +68,7 @@ as proof of the original red state.
 - Consumes: `parse_codex_session_content(&str) -> ParsedSessionMeta`; path-keyed `FileEntry` cache; `IndexedSession` snapshot rows.
 - Produces: serde-serialized per-file Codex identity/segment evidence in `FileEntry`, independent of `item: Option<IndexedSession>`, plus a same-generation unresolved-identity sidecar from `SessionIndex`. A snapshot composition helper keeps one `IndexedSession` for a structurally accepted continuation group. Retain the existing `source_file` as the deterministic latest-segment representative for compatibility, and retain all per-segment evidence and paths in chronological order for downstream consumers.
 
-- [ ] **Step 1: Write the failing behavioral tests and sanitized fixtures**
+- [x] **Step 1: Write the failing behavioral tests and sanitized fixtures**
 
 Add `codex_source_composes_the_reported_same_id_rollout_shape` using sanitized
 fixture files that model the issue-listed pair without copying private
@@ -107,7 +107,7 @@ valid continuation, reload from the persisted cache, then delete one segment.
 After every refresh assert one correctly ordered row and no stale source path.
 Assert that a cache written with the old schema is discarded and reparsed.
 
-- [ ] **Step 2: Run the tests and verify the intended failure**
+- [x] **Step 2: Run the tests and verify the intended failure**
 
 Run:
 
@@ -119,7 +119,7 @@ Expected: the new continuation test fails because two same-ID file rows are
 published instead of one; ambiguous cases and existing single-file tests
 continue to demonstrate their current behavior.
 
-- [ ] **Step 3: Add the minimal evidence and composition implementation**
+- [x] **Step 3: Add the minimal evidence and composition implementation**
 
 In the new `codex_segments` module define serde-compatible per-file identity
 and interval evidence. Store that evidence on the path-keyed `FileEntry`
@@ -179,7 +179,7 @@ Preserve existing single-file results. Bump `CACHE_SCHEMA_VERSION` so cached
 rows lacking evidence cannot remain unmerged indefinitely. Compose after each
 full or scoped cache reconciliation and sort the final rows once as before.
 
-- [ ] **Step 4: Run the focused tests**
+- [x] **Step 4: Run the focused tests**
 
 Run:
 
@@ -189,14 +189,14 @@ pnpm run test:integration -p freshell-sessions directory_index::tests::codex
 
 Expected: all new grouping, refusal, chronology, and metadata assertions pass.
 
-- [ ] **Step 5: Refactor while green**
+- [x] **Step 5: Refactor while green**
 
 Keep the grouping decision in one Codex-specific helper used by both
 `CodexSource::scan()` and `SessionIndex` publication. Keep evidence parsing
 separate from provider-agnostic `ParsedSessionMeta` behavior, and verify that
 single-file Codex and non-Codex `IndexedSession` projections remain unchanged.
 
-- [ ] **Step 6: Run impacted-test verification**
+- [x] **Step 6: Run impacted-test verification**
 
 Run:
 
@@ -209,7 +209,7 @@ pnpm run test:integration -p freshell-sessions --test codex_fixture_parity
 Expected: all Codex indexing, cache, malformed-input quarantine, and parser
 parity tests pass.
 
-- [ ] **Step 7: Commit the task**
+- [x] **Step 7: Commit the task**
 
 ```bash
 git add crates/freshell-sessions/src/codex_segments.rs crates/freshell-sessions/src/lib.rs crates/freshell-sessions/src/parse/codex.rs crates/freshell-sessions/src/directory_index.rs test/fixtures/coding-cli/codex/multi-file-continuation-older.sanitized.jsonl test/fixtures/coding-cli/codex/multi-file-continuation-newer.sanitized.jsonl
@@ -230,7 +230,7 @@ git commit -m "fix(sessions): merge verified Codex continuations"
 - Consumes: one coherent `SessionIndex` snapshot of rendered `IndexedSession` rows and unresolved same-ID groups; existing `search_session_file` user/full-text tiers; existing `SessionDirectoryState` and `integrityError` response shape.
 - Produces: private `DirItem` source-path collection; a bounded multi-file search that returns at most one logical row; route quarantine/logging that unions rendered row paths with unresolved index evidence; a process-shared collision-signature gate that emits one structured event per newly observed full collision signature.
 
-- [ ] **Step 1: Write failing route, logging, and UI behavior tests**
+- [x] **Step 1: Write failing route, logging, and UI behavior tests**
 
 Add a real route test that seeds the sequential fixture through
 `CodexSource`/`SessionIndex`, requests the session-directory endpoint, and
@@ -287,7 +287,7 @@ passes its canonical `sessionId` and provider into the existing session-open
 flow. Use the existing command-construction unit test to cover
 `codex resume <sessionId>`; do not launch Codex from the browser test.
 
-- [ ] **Step 2: Run the tests and verify the intended failure**
+- [x] **Step 2: Run the tests and verify the intended failure**
 
 Run:
 
@@ -304,7 +304,7 @@ repeated requests still emit repeated collision events without a
 full-signature identifier. The copied-file route should continue to
 quarantine both rows.
 
-- [ ] **Step 3: Add multi-source search and collision-state logging**
+- [x] **Step 3: Add multi-source search and collision-state logging**
 
 Transfer all Codex segment paths to `DirItem`; keep the representative path
 private and never serialize any path. Search sources in chronological order
@@ -334,7 +334,7 @@ the sample. Update Sidebar and History View alert copy to direct users to
 server logs without suggesting edits to Codex-owned files. Keep the wire
 shape unchanged.
 
-- [ ] **Step 4: Run the focused tests**
+- [x] **Step 4: Run the focused tests**
 
 Run:
 
@@ -349,14 +349,14 @@ Expected: multi-source search, copied-file quarantine, distinct full-signature
 logging, alert behavior, canonical-ID row opening, and existing tier/collision
 tests pass.
 
-- [ ] **Step 5: Refactor while green**
+- [x] **Step 5: Refactor while green**
 
 Keep collision-signature construction separate from response sampling and
 ensure the mutex protects the full-signature insert as one atomic operation.
 Remove any obsolete singular-path search branch once all persisted rows use
 the source-path collection.
 
-- [ ] **Step 6: Run impacted-test verification**
+- [x] **Step 6: Run impacted-test verification**
 
 Run:
 
@@ -368,7 +368,7 @@ pnpm run test:vitest run test/unit/client/components/Sidebar.test.tsx test/unit/
 Expected: the complete session-directory Rust module and both alert
 components plus the unchanged wire-schema contract pass.
 
-- [ ] **Step 7: Commit the task**
+- [x] **Step 7: Commit the task**
 
 ```bash
 git add crates/freshell-server/src/session_directory.rs src/components/Sidebar.tsx src/components/HistoryView.tsx test/unit/client/components/Sidebar.test.tsx test/unit/client/components/HistoryView.a11y.test.tsx
@@ -385,7 +385,7 @@ git commit -m "fix(session-directory): search Codex continuation segments"
 - Consumes: the production index, directory route/search behavior, integrity alert, and canonical-ID row-opening action from Tasks 1–2.
 - Produces: cloud-legal browser coverage using isolated test homes and the real session-directory route; no route response mocking or provider launch.
 
-- [ ] **Step 1: Write the failing browser regression**
+- [x] **Step 1: Write the failing browser regression**
 
 Add a Codex corpus helper that writes both continuation files into an
 isolated test home. Write separate positive and collision browser cases. The
@@ -405,7 +405,7 @@ the focused Sidebar test in Task 2; do not launch Codex in the browser suite.
 Seed both cases through `createE2eServerHandle`'s isolated home before the
 server starts; do not mock the session-directory route.
 
-- [ ] **Step 2: Run the test and verify the intended failure**
+- [x] **Step 2: Run the test and verify the intended failure**
 
 Run:
 
@@ -419,7 +419,7 @@ continuation row. The collision-only case should continue to show the
 quarantine. The selected backend must execute the named spec with a nonzero
 test count.
 
-- [ ] **Step 3: Run the focused browser test**
+- [x] **Step 3: Run the focused browser test**
 
 Run:
 
@@ -432,12 +432,12 @@ with one positive continuation row, no positive-case alert, successful
 Sidebar transcript search across both source files, and a separate copied
 file case with a visible alert and intact healthy row.
 
-- [ ] **Step 4: Refactor while green**
+- [x] **Step 4: Refactor while green**
 
 Keep the existing single-file Codex corpus helper behavior intact; share only
 small fixture-writing helpers that make session IDs and event ranges explicit.
 
-- [ ] **Step 5: Run impacted-test verification**
+- [x] **Step 5: Run impacted-test verification**
 
 Run:
 
@@ -449,7 +449,7 @@ Expected: the entire named matrix spec passes with this regression included;
 the test runner reports executed tests rather than a skipped cloud spec or
 empty filter.
 
-- [ ] **Step 6: Commit the task**
+- [x] **Step 6: Commit the task**
 
 ```bash
 git add test/e2e-browser/helpers/session-corpus/codex.ts test/e2e-browser/specs/session-directory-matrix.spec.ts
