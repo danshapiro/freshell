@@ -121,6 +121,12 @@ Rebuild after any change to `docker/sandbox/Dockerfile` or `docker/sandbox/entry
 image is tagged `freshell-sandbox:latest` and Docker layer caching keeps rebuilds fast unless a
 step earlier in the Dockerfile changed.
 
+The canonical image includes the native development libraries for the whole Rust workspace:
+DBus and the Tauri desktop shell's GTK3, WebKit2GTK 4.1 (with libsoup3), and Ayatana
+AppIndicator tray dependencies. Rebuild an existing image before running full-workspace tests
+after these prerequisites change; an already-present image is not rebuilt automatically.
+Tests use these libraries as the unprivileged sandbox user without installing packages at run time.
+
 ## When you MUST use it vs may skip it
 
 **Must use the sandbox:**
