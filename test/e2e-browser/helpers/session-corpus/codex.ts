@@ -43,6 +43,8 @@ export interface CodexRolloutFixtureSpec {
   assistantAt: number
   userText: string
   assistantText: string
+  /** A later user turn that is absent from first-message title metadata. */
+  laterUserMessage?: { at: number; text: string }
 }
 
 export interface CodexContinuationFixtureSpec {
@@ -114,6 +116,16 @@ export async function writeCodexRolloutFixture(
         content: [{ type: 'output_text', text: spec.assistantText }],
       },
     },
+    ...(spec.laterUserMessage ? [{
+      timestamp: iso(spec.laterUserMessage.at),
+      ordinal: 3,
+      type: 'response_item',
+      payload: {
+        type: 'message',
+        role: 'user',
+        content: [{ type: 'input_text', text: spec.laterUserMessage.text }],
+      },
+    }] : []),
   ]
   await fsp.writeFile(file, `${records.map((record) => JSON.stringify(record)).join('\n')}\n`)
   return file
