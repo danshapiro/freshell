@@ -452,6 +452,44 @@ fn exports_exact_recursive_native_closure_and_omits_account_and_derived_rows() {
 }
 
 #[test]
+fn blocks_reachable_session_descendant_with_null_primary_key() {
+    let fixture = TestDir::new("null-id-session-descendant");
+    let database = fixture.path().join("opencode.db");
+    let source = create_synthetic_source(&database);
+    source
+        .execute(
+            "INSERT INTO session
+             (id, project_id, workspace_id, parent_id, slug, directory, title, version,
+              time_created, time_updated, metadata, revert, permission)
+             VALUES (NULL, 'prj_kept', 'wrk_kept', 'ses_root', 'null-id',
+                     '/synthetic/worktree', 'NULL_ID_DESCENDANT', '1.18.21',
+                     5, 5, '{}', NULL, NULL)",
+            [],
+        )
+        .expect("the pinned SQLite schema permits a NULL text primary key");
+    drop(source);
+
+    let inventory = HostOpenCodeInventory::new(fixture.path().join("unused.db"))
+        .with_channel_database(database);
+    let extraction_root = fixture.path().join("extract");
+    let result = export_exact_session(
+        &inventory,
+        "ses_root",
+        ExportOptions::new(extraction_root.clone()),
+    );
+
+    assert!(
+        matches!(result, Err(TransferError::Blocked(_))),
+        "a reachable malformed session row must block exact export instead of disappearing"
+    );
+    assert_eq!(
+        fs::read_dir(extraction_root).unwrap().count(),
+        0,
+        "a blocked NULL-ID descendant must not publish a bundle"
+    );
+}
+
+#[test]
 fn exports_distinct_manifest_keys_for_each_selected_context_epoch() {
     let fixture = TestDir::new("context-epoch-keys");
     let database = fixture.path().join("opencode.db");
@@ -2297,6 +2335,133 @@ fn verifies_snapshot_trees_through_an_accessible_alternate_store_and_blocks_miss
         ),
         Err(TransferError::Blocked(_))
     ));
+}
+
+#[test]
+fn blocks_commit_oid_used_as_revert_snapshot_tree() {
+    let fixture = TestDir::new("commit-as-snapshot-tree");
+    let workspace_mount = fixture.path().join("workspace");
+    fs::create_dir_all(&workspace_mount).unwrap();
+    run_git_command(&workspace_mount, &["init", "-q"], None);
+    fs::write(workspace_mount.join("snapshot.txt"), "synthetic snapshot\n").unwrap();
+    run_git_command(&workspace_mount, &["add", "snapshot.txt"], None);
+    run_git_command(
+        &workspace_mount,
+        &[
+            "-c",
+            "user.name=Fixture",
+            "-c",
+            "user.email=fixture@example.test",
+            "commit",
+            "-qm",
+            "synthetic snapshot",
+        ],
+        None,
+    );
+    let commit = run_git_command(&workspace_mount, &["rev-parse", "HEAD"], None);
+    assert_eq!(
+        run_git_command(&workspace_mount, &["cat-file", "-t", commit.trim()], None).trim(),
+        "commit",
+        "fixture reference must be a commit object, not a tree"
+    );
+
+    let database = fixture.path().join("opencode.db");
+    let source = create_synthetic_source(&database);
+    source
+        .execute(
+            "UPDATE session SET revert = ?1 WHERE id = 'ses_root'",
+            [serde_json::json!({"snapshot":commit.trim()}).to_string()],
+        )
+        .unwrap();
+    drop(source);
+
+    let inventory = with_selected_workspace_mount(
+        HostOpenCodeInventory::new(fixture.path().join("unused.db"))
+            .with_channel_database(database),
+        workspace_mount,
+    );
+    let extraction_root = fixture.path().join("extract");
+    let result = export_exact_session(
+        &inventory,
+        "ses_root",
+        ExportOptions::new(extraction_root.clone()),
+    );
+
+    assert!(
+        matches!(result, Err(TransferError::Blocked(_))),
+        "a commit object must not be accepted as a snapshot tree"
+    );
+    assert_eq!(
+        fs::read_dir(extraction_root).unwrap().count(),
+        0,
+        "a non-tree snapshot reference must not publish a bundle"
+    );
+}
+
+#[test]
+fn exports_snapshot_from_ordinary_primary_loose_git_objects() {
+    let fixture = TestDir::new("git-primary-loose-snapshot");
+    let workspace_mount = fixture.path().join("workspace");
+    fs::create_dir_all(&workspace_mount).unwrap();
+    run_git_command(&workspace_mount, &["init", "-q"], None);
+    let blob = run_git_command(
+        &workspace_mount,
+        &["hash-object", "-w", "--stdin"],
+        Some(b"ordinary primary loose snapshot blob"),
+    );
+    let nested_tree = run_git_command(
+        &workspace_mount,
+        &["mktree"],
+        Some(format!("100644 blob {}\tsnapshot.txt\n", blob.trim()).as_bytes()),
+    );
+    let root_tree = run_git_command(
+        &workspace_mount,
+        &["mktree"],
+        Some(format!("040000 tree {}\tnested\n", nested_tree.trim()).as_bytes()),
+    );
+    let blob_oid = blob.trim();
+    let nested_tree_oid = nested_tree.trim();
+    let root_tree_oid = root_tree.trim();
+    for oid in [blob_oid, nested_tree_oid, root_tree_oid] {
+        let object_path = workspace_mount
+            .join(".git/objects")
+            .join(&oid[..2])
+            .join(&oid[2..]);
+        assert!(
+            object_path.is_file(),
+            "fixture object {oid} must be a primary loose object"
+        );
+    }
+
+    let database = fixture.path().join("opencode.db");
+    let source = create_synthetic_source(&database);
+    source
+        .execute(
+            "UPDATE part SET data = ?1 WHERE id = 'part_ses_root'",
+            [serde_json::json!({"type":"snapshot", "snapshot":root_tree_oid}).to_string()],
+        )
+        .unwrap();
+    drop(source);
+
+    let inventory = with_selected_workspace_mount(
+        HostOpenCodeInventory::new(fixture.path().join("unused.db"))
+            .with_channel_database(database),
+        workspace_mount,
+    );
+    let snapshot = export_exact_session(
+        &inventory,
+        "ses_root",
+        ExportOptions::new(fixture.path().join("extract")),
+    )
+    .expect("ordinary primary loose objects form a complete snapshot closure");
+    let [asset] = snapshot.manifest().assets.as_slice() else {
+        panic!("the primary loose snapshot closure is represented by one Git asset");
+    };
+    assert_eq!(asset.kind, "git_tree_reference");
+    assert!(asset.source_relative_path.ends_with(root_tree_oid));
+    assert_eq!(asset.target_relative_path, asset.source_relative_path);
+    assert!(asset.size_bytes > 0);
+    assert_eq!(asset.sha256.len(), 64);
 }
 
 fn run_git_command(cwd: &Path, args: &[&str], stdin: Option<&[u8]>) -> String {
