@@ -1077,10 +1077,11 @@ fn inspect_git_tree(mount: &Path, tree: &str) -> Result<GitTreeInspection, Trans
             "snapshot object ID does not match the workspace Git format".into(),
         ));
     }
-    let objects_dir = common_dir.join("objects");
-    let alternates = objects_dir.join("info").join("alternates");
+    let objects_dir =
+        checked_git_store_directory(&mount, &common_dir.join("objects"), "Git object directory")?;
+    let mut object_stores = vec![objects_dir.clone()];
     let mut alternate_identity = Vec::new();
-    if let Some(contents) = read_alternates_file(&alternates)? {
+    if let Some(contents) = read_alternates_file_in_store(&mount, &objects_dir)? {
         for line in contents.lines().filter(|line| !line.trim().is_empty()) {
             let candidate = PathBuf::from(line);
             let candidate = if candidate.is_absolute() {
@@ -1088,19 +1089,9 @@ fn inspect_git_tree(mount: &Path, tree: &str) -> Result<GitTreeInspection, Trans
             } else {
                 objects_dir.join(candidate)
             };
-            let candidate = fs::canonicalize(candidate).map_err(|error| {
-                TransferError::Blocked(format!(
-                    "alternate Git object store is unavailable: {error}"
-                ))
-            })?;
-            if !candidate.starts_with(&mount) {
-                return Err(TransferError::Blocked(
-                    "alternate Git object store is outside the exact managed workspace mount"
-                        .into(),
-                ));
-            }
-            let nested_alternates = candidate.join("info").join("alternates");
-            if read_alternates_file(&nested_alternates)?
+            let candidate =
+                checked_git_store_directory(&mount, &candidate, "alternate Git object store")?;
+            if read_alternates_file_in_store(&mount, &candidate)?
                 .is_some_and(|nested| nested.lines().any(|line| !line.trim().is_empty()))
             {
                 return Err(TransferError::Blocked(
@@ -1114,36 +1105,57 @@ fn inspect_git_tree(mount: &Path, tree: &str) -> Result<GitTreeInspection, Trans
                 )
             })?;
             alternate_identity.push(relative.to_string_lossy().replace('\\', "/"));
+            object_stores.push(candidate);
         }
     }
-    let object_type = git_text_in_repository(&repository, &["cat-file", "-t", tree])?;
-    if object_type.trim() != "tree" {
-        return Err(TransferError::Blocked(
-            "snapshot reference does not name a Git tree object".into(),
-        ));
+    // Git may consult any index in a store's pack directory, so check its
+    // immediate entries once. Loose-object checks below stay limited to IDs
+    // in this snapshot closure instead of walking a potentially large store.
+    for object_store in &object_stores {
+        inspect_git_pack_directory(&mount, object_store)?;
     }
-    let entries = git_output_in_repository(&repository, &["ls-tree", "-r", "-t", "-z", tree])?;
+
     let mut objects = BTreeSet::new();
-    objects.insert(tree.to_string());
-    for entry in entries
-        .stdout
-        .split(|byte| *byte == 0)
-        .filter(|entry| !entry.is_empty())
-    {
-        let header_end = entry
-            .iter()
-            .position(|byte| *byte == b'\t')
-            .ok_or_else(|| TransferError::Blocked("Git tree contains an invalid entry".into()))?;
-        let header = std::str::from_utf8(&entry[..header_end])
-            .map_err(|_| TransferError::Blocked("Git tree entry metadata is not UTF-8".into()))?;
-        let fields: Vec<_> = header.split_whitespace().collect();
-        if fields.len() != 3 || fields[1] == "commit" {
-            return Err(TransferError::Blocked(
-                "snapshot tree contains an unsupported submodule entry".into(),
-            ));
+    let mut pending_trees = vec![tree.to_string()];
+    let mut inspected_trees = BTreeSet::new();
+    // Visit each tree separately so its storage paths are checked before Git
+    // reads it; recursive `ls-tree` could open unchecked descendant trees.
+    while let Some(current_tree) = pending_trees.pop() {
+        if !inspected_trees.insert(current_tree.clone()) {
+            continue;
         }
-        objects.insert(fields[2].to_string());
+        verify_git_loose_object_paths(&mount, &object_stores, std::slice::from_ref(&current_tree))?;
+        objects.insert(current_tree.clone());
+        let entries = git_output_in_repository(&repository, &["ls-tree", "-z", &current_tree])?;
+        for entry in entries
+            .stdout
+            .split(|byte| *byte == 0)
+            .filter(|entry| !entry.is_empty())
+        {
+            let header_end = entry
+                .iter()
+                .position(|byte| *byte == b'\t')
+                .ok_or_else(|| {
+                    TransferError::Blocked("Git tree contains an invalid entry".into())
+                })?;
+            let header = std::str::from_utf8(&entry[..header_end]).map_err(|_| {
+                TransferError::Blocked("Git tree entry metadata is not UTF-8".into())
+            })?;
+            let fields: Vec<_> = header.split_whitespace().collect();
+            if fields.len() != 3 || fields[1] == "commit" {
+                return Err(TransferError::Blocked(
+                    "snapshot tree contains an unsupported submodule entry".into(),
+                ));
+            }
+            let object = fields[2].to_string();
+            if fields[1] == "tree" {
+                pending_trees.push(object.clone());
+            }
+            objects.insert(object);
+        }
     }
+    let referenced_objects = objects.iter().cloned().collect::<Vec<_>>();
+    verify_git_loose_object_paths(&mount, &object_stores, &referenced_objects)?;
     let mut object_records = Vec::with_capacity(objects.len());
     let mut closure_bytes = 0_u64;
     for object in objects {
@@ -1191,6 +1203,132 @@ fn read_alternates_file(path: &Path) -> Result<Option<String>, TransferError> {
     fs::read_to_string(path).map(Some).map_err(|error| {
         TransferError::Blocked(format!("Git alternate metadata cannot be read: {error}"))
     })
+}
+
+fn checked_git_store_directory(
+    mount: &Path,
+    path: &Path,
+    label: &str,
+) -> Result<PathBuf, TransferError> {
+    checked_git_storage_path(mount, path, label, true)?
+        .ok_or_else(|| TransferError::Blocked(format!("{label} is unavailable")))
+}
+
+fn checked_git_storage_path(
+    mount: &Path,
+    path: &Path,
+    label: &str,
+    expect_directory: bool,
+) -> Result<Option<PathBuf>, TransferError> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(TransferError::Blocked(format!(
+                "{label} is unavailable: {error}"
+            )))
+        }
+    };
+    if metadata.file_type().is_symlink() {
+        return Err(TransferError::Blocked(format!(
+            "{label} is a symbolic link"
+        )));
+    }
+    let canonical = fs::canonicalize(path)
+        .map_err(|error| TransferError::Blocked(format!("{label} cannot be resolved: {error}")))?;
+    if !canonical.starts_with(mount) {
+        return Err(TransferError::Blocked(format!(
+            "{label} is outside the exact managed workspace mount"
+        )));
+    }
+    let resolved_metadata = fs::metadata(&canonical)
+        .map_err(|error| TransferError::Blocked(format!("{label} is unavailable: {error}")))?;
+    let expected_type_matches = if expect_directory {
+        resolved_metadata.is_dir()
+    } else {
+        resolved_metadata.is_file()
+    };
+    if !expected_type_matches {
+        return Err(TransferError::Blocked(format!(
+            "{label} is not a {}",
+            if expect_directory {
+                "directory"
+            } else {
+                "regular file"
+            }
+        )));
+    }
+    Ok(Some(canonical))
+}
+
+fn read_alternates_file_in_store(
+    mount: &Path,
+    objects_dir: &Path,
+) -> Result<Option<String>, TransferError> {
+    let Some(info_dir) = checked_git_storage_path(
+        mount,
+        &objects_dir.join("info"),
+        "Git object info directory",
+        true,
+    )?
+    else {
+        return Ok(None);
+    };
+    read_alternates_file(&info_dir.join("alternates"))
+}
+
+fn inspect_git_pack_directory(mount: &Path, objects_dir: &Path) -> Result<(), TransferError> {
+    let Some(pack_dir) =
+        checked_git_storage_path(mount, &objects_dir.join("pack"), "Git pack directory", true)?
+    else {
+        return Ok(());
+    };
+    let entries = fs::read_dir(&pack_dir).map_err(|error| {
+        TransferError::Blocked(format!("Git pack directory cannot be read: {error}"))
+    })?;
+    for entry in entries {
+        let entry = entry.map_err(|error| {
+            TransferError::Blocked(format!("Git pack directory cannot be read: {error}"))
+        })?;
+        checked_git_storage_path(mount, &entry.path(), "Git pack file", false)?;
+    }
+    Ok(())
+}
+
+fn verify_git_loose_object_paths(
+    mount: &Path,
+    object_stores: &[PathBuf],
+    object_ids: &[String],
+) -> Result<(), TransferError> {
+    for objects_dir in object_stores {
+        for object_id in object_ids {
+            if !(object_id.len() == 40 || object_id.len() == 64)
+                || !object_id.bytes().all(|byte| byte.is_ascii_hexdigit())
+            {
+                return Err(TransferError::Blocked(
+                    "Git returned an invalid object ID".into(),
+                ));
+            }
+            let object_id = object_id.to_ascii_lowercase();
+            let fanout = objects_dir.join(&object_id[..2]);
+            let Some(fanout_dir) = checked_git_storage_path(
+                mount,
+                &fanout,
+                "Git loose-object fanout directory",
+                true,
+            )?
+            else {
+                continue;
+            };
+            checked_git_storage_path(
+                mount,
+                &fanout_dir.join(&object_id[2..]),
+                "Git loose object file",
+                false,
+            )?;
+        }
+    }
+    Ok(())
 }
 
 fn git_path_in_mount(mount: &Path, argument: &str) -> Result<PathBuf, TransferError> {

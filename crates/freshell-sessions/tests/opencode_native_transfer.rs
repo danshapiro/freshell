@@ -1512,6 +1512,441 @@ fn blocks_git_objects_available_only_through_process_environment() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn blocks_git_object_directory_symlinked_outside_the_workspace_mount() {
+    use std::os::unix::fs::symlink;
+
+    let fixture = TestDir::new("git-object-directory-symlink");
+    let workspace_mount = fixture.path().join("workspace");
+    let external_store = fixture.path().join("external-objects.git");
+    fs::create_dir_all(&workspace_mount).unwrap();
+    run_git_command(&workspace_mount, &["init", "-q"], None);
+    run_git_command(
+        &workspace_mount,
+        &["init", "--bare", "-q", external_store.to_str().unwrap()],
+        None,
+    );
+    let blob = run_git_command(
+        &workspace_mount,
+        &[
+            "--git-dir",
+            external_store.to_str().unwrap(),
+            "hash-object",
+            "-w",
+            "--stdin",
+        ],
+        Some(b"outside object-directory blob"),
+    );
+    let tree = run_git_command(
+        &workspace_mount,
+        &["--git-dir", external_store.to_str().unwrap(), "mktree"],
+        Some(format!("100644 blob {}\tsnapshot.txt\n", blob.trim()).as_bytes()),
+    );
+    let local_objects = workspace_mount.join(".git/objects");
+    fs::remove_dir_all(&local_objects).unwrap();
+    symlink(external_store.join("objects"), &local_objects).unwrap();
+    assert_eq!(
+        run_git_command(&workspace_mount, &["cat-file", "-t", tree.trim()], None).trim(),
+        "tree",
+        "the fixture must expose the tree only through the external object-directory symlink"
+    );
+
+    let database = fixture.path().join("opencode.db");
+    let source = create_synthetic_source(&database);
+    source
+        .execute(
+            "UPDATE part SET data = ?1 WHERE id = 'part_ses_root'",
+            [serde_json::json!({"type":"snapshot", "snapshot":tree.trim()}).to_string()],
+        )
+        .unwrap();
+    drop(source);
+    let inventory = with_selected_workspace_mount(
+        HostOpenCodeInventory::new(fixture.path().join("unused.db"))
+            .with_channel_database(database),
+        workspace_mount,
+    );
+    let extraction_root = fixture.path().join("object-directory-symlink-extract");
+    let result = export_exact_session(
+        &inventory,
+        "ses_root",
+        ExportOptions::new(extraction_root.clone()),
+    );
+
+    assert!(
+        matches!(result, Err(TransferError::Blocked(_))),
+        "Git object storage redirected outside the mount must block transfer"
+    );
+    assert_eq!(
+        fs::read_dir(extraction_root).unwrap().count(),
+        0,
+        "a blocked object-directory symlink must not publish a bundle"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn blocks_git_packed_objects_symlinked_outside_the_workspace_mount() {
+    use std::os::unix::fs::symlink;
+
+    let fixture = TestDir::new("git-pack-directory-symlink");
+    let workspace_mount = fixture.path().join("workspace");
+    let external_pack = fixture.path().join("external-pack");
+    fs::create_dir_all(&workspace_mount).unwrap();
+    run_git_command(&workspace_mount, &["init", "-q"], None);
+    fs::write(workspace_mount.join("snapshot.txt"), "packed snapshot\n").unwrap();
+    run_git_command(&workspace_mount, &["add", "snapshot.txt"], None);
+    run_git_command(
+        &workspace_mount,
+        &[
+            "-c",
+            "user.name=Fixture",
+            "-c",
+            "user.email=fixture@example.test",
+            "commit",
+            "-qm",
+            "snapshot",
+        ],
+        None,
+    );
+    let tree = run_git_command(&workspace_mount, &["rev-parse", "HEAD^{tree}"], None);
+    run_git_command(&workspace_mount, &["repack", "-a", "-d"], None);
+    let local_pack = workspace_mount.join(".git/objects/pack");
+    assert!(
+        fs::read_dir(&local_pack).unwrap().next().is_some(),
+        "the fixture needs a real pack and index"
+    );
+
+    let database = fixture.path().join("opencode.db");
+    let source = create_synthetic_source(&database);
+    source
+        .execute(
+            "UPDATE part SET data = ?1 WHERE id = 'part_ses_root'",
+            [serde_json::json!({"type":"snapshot", "snapshot":tree.trim()}).to_string()],
+        )
+        .unwrap();
+    drop(source);
+    let inventory = with_selected_workspace_mount(
+        HostOpenCodeInventory::new(fixture.path().join("unused.db"))
+            .with_channel_database(database),
+        workspace_mount.clone(),
+    );
+    export_exact_session(
+        &inventory,
+        "ses_root",
+        ExportOptions::new(fixture.path().join("regular-packed-store-extract")),
+    )
+    .expect("ordinary in-mount packed objects remain supported");
+
+    fs::rename(&local_pack, &external_pack).unwrap();
+    fs::create_dir_all(&local_pack).unwrap();
+    for entry in fs::read_dir(&external_pack).unwrap() {
+        let entry = entry.unwrap();
+        symlink(entry.path(), local_pack.join(entry.file_name())).unwrap();
+    }
+    assert_eq!(
+        run_git_command(&workspace_mount, &["cat-file", "-t", tree.trim()], None).trim(),
+        "tree",
+        "the fixture must expose packed objects through external pack/index file symlinks"
+    );
+    let extraction_root = fixture.path().join("pack-file-symlink-extract");
+    let result = export_exact_session(
+        &inventory,
+        "ses_root",
+        ExportOptions::new(extraction_root.clone()),
+    );
+    assert!(
+        matches!(result, Err(TransferError::Blocked(_))),
+        "Git pack and index files redirected outside the mount must block transfer"
+    );
+    assert_eq!(
+        fs::read_dir(extraction_root).unwrap().count(),
+        0,
+        "a blocked pack-file symlink must not publish a bundle"
+    );
+
+    fs::remove_dir_all(&local_pack).unwrap();
+    symlink(&external_pack, &local_pack).unwrap();
+    assert_eq!(
+        run_git_command(&workspace_mount, &["cat-file", "-t", tree.trim()], None).trim(),
+        "tree",
+        "the fixture must expose the tree only through the external pack-directory symlink"
+    );
+    let extraction_root = fixture.path().join("pack-directory-symlink-extract");
+    let result = export_exact_session(
+        &inventory,
+        "ses_root",
+        ExportOptions::new(extraction_root.clone()),
+    );
+
+    assert!(
+        matches!(result, Err(TransferError::Blocked(_))),
+        "Git packed objects redirected outside the mount must block transfer"
+    );
+    assert_eq!(
+        fs::read_dir(extraction_root).unwrap().count(),
+        0,
+        "a blocked pack-directory symlink must not publish a bundle"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn blocks_git_loose_object_fanout_symlinked_outside_the_workspace_mount() {
+    use std::os::unix::fs::symlink;
+
+    let fixture = TestDir::new("git-loose-fanout-symlink");
+    let workspace_mount = fixture.path().join("workspace");
+    let external_store = fixture.path().join("external-objects.git");
+    fs::create_dir_all(&workspace_mount).unwrap();
+    run_git_command(&workspace_mount, &["init", "-q"], None);
+    run_git_command(
+        &workspace_mount,
+        &["init", "--bare", "-q", external_store.to_str().unwrap()],
+        None,
+    );
+    let blob = run_git_command(
+        &workspace_mount,
+        &["hash-object", "-w", "--stdin"],
+        Some(b"local loose blob for external tree"),
+    );
+    let external_blob = run_git_command(
+        &workspace_mount,
+        &[
+            "--git-dir",
+            external_store.to_str().unwrap(),
+            "hash-object",
+            "-w",
+            "--stdin",
+        ],
+        Some(b"local loose blob for external tree"),
+    );
+    assert_eq!(blob.trim(), external_blob.trim());
+    let tree = run_git_command(
+        &workspace_mount,
+        &["--git-dir", external_store.to_str().unwrap(), "mktree"],
+        Some(format!("100644 blob {}\tsnapshot.txt\n", blob.trim()).as_bytes()),
+    );
+    let tree_oid = tree.trim();
+    let local_fanout = workspace_mount.join(".git/objects").join(&tree_oid[..2]);
+    let external_fanout = external_store.join("objects").join(&tree_oid[..2]);
+    assert!(local_fanout != external_fanout);
+    symlink(&external_fanout, &local_fanout).unwrap();
+    assert_eq!(
+        run_git_command(&workspace_mount, &["cat-file", "-t", tree_oid], None).trim(),
+        "tree",
+        "the fixture must expose the tree through the external loose-object fanout symlink"
+    );
+
+    let database = fixture.path().join("opencode.db");
+    let source = create_synthetic_source(&database);
+    source
+        .execute(
+            "UPDATE part SET data = ?1 WHERE id = 'part_ses_root'",
+            [serde_json::json!({"type":"snapshot", "snapshot":tree_oid}).to_string()],
+        )
+        .unwrap();
+    drop(source);
+    let inventory = with_selected_workspace_mount(
+        HostOpenCodeInventory::new(fixture.path().join("unused.db"))
+            .with_channel_database(database),
+        workspace_mount,
+    );
+    let extraction_root = fixture.path().join("loose-fanout-symlink-extract");
+    let result = export_exact_session(
+        &inventory,
+        "ses_root",
+        ExportOptions::new(extraction_root.clone()),
+    );
+
+    assert!(
+        matches!(result, Err(TransferError::Blocked(_))),
+        "Git loose objects redirected outside the mount must block transfer"
+    );
+    assert_eq!(
+        fs::read_dir(extraction_root).unwrap().count(),
+        0,
+        "a blocked loose fanout symlink must not publish a bundle"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn blocks_git_loose_object_file_symlinked_outside_the_workspace_mount() {
+    use std::os::unix::fs::symlink;
+
+    let fixture = TestDir::new("git-loose-file-symlink");
+    let workspace_mount = fixture.path().join("workspace");
+    let external_store = fixture.path().join("external-objects.git");
+    fs::create_dir_all(&workspace_mount).unwrap();
+    run_git_command(&workspace_mount, &["init", "-q"], None);
+    run_git_command(
+        &workspace_mount,
+        &["init", "--bare", "-q", external_store.to_str().unwrap()],
+        None,
+    );
+    let blob = run_git_command(
+        &workspace_mount,
+        &["hash-object", "-w", "--stdin"],
+        Some(b"local loose blob for external tree"),
+    );
+    let external_blob = run_git_command(
+        &workspace_mount,
+        &[
+            "--git-dir",
+            external_store.to_str().unwrap(),
+            "hash-object",
+            "-w",
+            "--stdin",
+        ],
+        Some(b"local loose blob for external tree"),
+    );
+    assert_eq!(blob.trim(), external_blob.trim());
+    let tree = run_git_command(
+        &workspace_mount,
+        &["--git-dir", external_store.to_str().unwrap(), "mktree"],
+        Some(format!("100644 blob {}\tsnapshot.txt\n", blob.trim()).as_bytes()),
+    );
+    let tree_oid = tree.trim();
+    let local_object = workspace_mount
+        .join(".git/objects")
+        .join(&tree_oid[..2])
+        .join(&tree_oid[2..]);
+    let external_object = external_store
+        .join("objects")
+        .join(&tree_oid[..2])
+        .join(&tree_oid[2..]);
+    fs::create_dir_all(local_object.parent().unwrap()).unwrap();
+    symlink(&external_object, &local_object).unwrap();
+    assert_eq!(
+        run_git_command(&workspace_mount, &["cat-file", "-t", tree_oid], None).trim(),
+        "tree",
+        "the fixture must expose the tree through the external loose-object file symlink"
+    );
+
+    let database = fixture.path().join("opencode.db");
+    let source = create_synthetic_source(&database);
+    source
+        .execute(
+            "UPDATE part SET data = ?1 WHERE id = 'part_ses_root'",
+            [serde_json::json!({"type":"snapshot", "snapshot":tree_oid}).to_string()],
+        )
+        .unwrap();
+    drop(source);
+    let inventory = with_selected_workspace_mount(
+        HostOpenCodeInventory::new(fixture.path().join("unused.db"))
+            .with_channel_database(database),
+        workspace_mount,
+    );
+    let extraction_root = fixture.path().join("loose-file-symlink-extract");
+    let result = export_exact_session(
+        &inventory,
+        "ses_root",
+        ExportOptions::new(extraction_root.clone()),
+    );
+
+    assert!(
+        matches!(result, Err(TransferError::Blocked(_))),
+        "Git loose object files redirected outside the mount must block transfer"
+    );
+    assert_eq!(
+        fs::read_dir(extraction_root).unwrap().count(),
+        0,
+        "a blocked loose object symlink must not publish a bundle"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn blocks_nested_git_tree_symlinked_outside_the_workspace_mount() {
+    use std::os::unix::fs::symlink;
+
+    let fixture = TestDir::new("git-nested-tree-symlink");
+    let workspace_mount = fixture.path().join("workspace");
+    let external_objects = fixture.path().join("external-objects");
+    fs::create_dir_all(workspace_mount.join("nested")).unwrap();
+    run_git_command(&workspace_mount, &["init", "-q"], None);
+    fs::write(
+        workspace_mount.join("nested/snapshot.txt"),
+        "nested snapshot\n",
+    )
+    .unwrap();
+    run_git_command(&workspace_mount, &["add", "nested/snapshot.txt"], None);
+    run_git_command(
+        &workspace_mount,
+        &[
+            "-c",
+            "user.name=Fixture",
+            "-c",
+            "user.email=fixture@example.test",
+            "commit",
+            "-qm",
+            "snapshot",
+        ],
+        None,
+    );
+    let root_tree = run_git_command(&workspace_mount, &["rev-parse", "HEAD^{tree}"], None);
+    let nested_tree = run_git_command(&workspace_mount, &["rev-parse", "HEAD:nested"], None);
+    let nested_oid = nested_tree.trim();
+    let local_object = workspace_mount
+        .join(".git/objects")
+        .join(&nested_oid[..2])
+        .join(&nested_oid[2..]);
+    let external_object = external_objects
+        .join(&nested_oid[..2])
+        .join(&nested_oid[2..]);
+    fs::create_dir_all(external_object.parent().unwrap()).unwrap();
+    fs::copy(&local_object, &external_object).unwrap();
+    fs::remove_file(&local_object).unwrap();
+    symlink(&external_object, &local_object).unwrap();
+    assert_eq!(
+        run_git_command(
+            &workspace_mount,
+            &["cat-file", "-t", root_tree.trim()],
+            None
+        )
+        .trim(),
+        "tree",
+        "the root tree remains local in this fixture"
+    );
+    assert_eq!(
+        run_git_command(&workspace_mount, &["cat-file", "-t", nested_oid], None).trim(),
+        "tree",
+        "the nested tree must be readable through the external loose-object symlink"
+    );
+
+    let database = fixture.path().join("opencode.db");
+    let source = create_synthetic_source(&database);
+    source
+        .execute(
+            "UPDATE part SET data = ?1 WHERE id = 'part_ses_root'",
+            [serde_json::json!({"type":"snapshot", "snapshot":root_tree.trim()}).to_string()],
+        )
+        .unwrap();
+    drop(source);
+    let inventory = with_selected_workspace_mount(
+        HostOpenCodeInventory::new(fixture.path().join("unused.db"))
+            .with_channel_database(database),
+        workspace_mount,
+    );
+    let extraction_root = fixture.path().join("nested-tree-symlink-extract");
+    let result = export_exact_session(
+        &inventory,
+        "ses_root",
+        ExportOptions::new(extraction_root.clone()),
+    );
+
+    assert!(
+        matches!(result, Err(TransferError::Blocked(_))),
+        "a nested tree object redirected outside the mount must block transfer"
+    );
+    assert_eq!(
+        fs::read_dir(extraction_root).unwrap().count(),
+        0,
+        "a blocked nested-tree symlink must not publish a bundle"
+    );
+}
+
 #[test]
 fn malformed_json_blocks_every_reference_traversal_field() {
     let cases = [
