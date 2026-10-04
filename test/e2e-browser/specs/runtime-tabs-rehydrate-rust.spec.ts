@@ -202,11 +202,21 @@ test.describe.serial('Phase 4 managed-runtime tab rehydration', () => {
       expect(view.containerId).toBeTruthy()
       expect(view.nativeSessionId).toBeTruthy()
       const rolloutPath = `/home/freshell/provider/.codex/sessions/2026/03/01/rollout-${view.nativeSessionId}.jsonl`
-      const transcript = (await fs.readFile('test/fixtures/coding-cli/codex/task-events.sanitized.jsonl', 'utf8'))
-        .replace('session-activity', view.nativeSessionId!).replace('Sanitized completion', 'Managed fixture saved answer')
+      const makeTranscript = (nativeId: string) => [
+        JSON.stringify({ type: 'session_meta', payload: { id: nativeId, cwd: '/workspace', model_provider: 'openai' } }),
+        ...Array.from({ length: 80 }, (_, index) => [
+          JSON.stringify({ type: 'event_msg', payload: { type: 'task_started', turn_id: `retained-${index}` } }),
+          JSON.stringify({ type: 'event_msg', payload: { type: 'user_message', message: `Managed prompt ${index}` } }),
+          JSON.stringify({ type: 'event_msg', payload: { type: 'task_complete', turn_id: `retained-${index}`,
+            last_agent_message: `${index === 79 ? 'Managed fixture saved answer' : `Managed retained answer ${index}`}\n${'x'.repeat(20_000)}` } }),
+        ]).flat(),
+      ].join('\n') + '\n'
+      const transcript = makeTranscript(view.nativeSessionId!)
+      expect(Buffer.byteLength(transcript)).toBeGreaterThan(1024 * 1024)
+      // Generate in the owned provider process, avoiding a multi-MiB argv value.
       rig.ownedProviderExec(view.containerId!, ['node', '--input-type=module', '-e',
-        'import fs from "node:fs"; import path from "node:path"; fs.mkdirSync(path.dirname(process.argv[1]), {recursive:true}); fs.writeFileSync(process.argv[1], process.argv[2]);',
-        rolloutPath, transcript])
+        `import fs from "node:fs"; import path from "node:path"; const makeTranscript = ${makeTranscript.toString()}; fs.mkdirSync(path.dirname(process.argv[1]), {recursive:true}); fs.writeFileSync(process.argv[1], makeTranscript(process.argv[2]));`,
+        rolloutPath, view.nativeSessionId!])
       const fixtureState = () => JSON.parse(rig.ownedProviderExec(view.containerId!, [
         'cat', '/home/freshell/provider/.freshell-fixture/provider-native-state.json',
       ]))
@@ -215,21 +225,35 @@ test.describe.serial('Phase 4 managed-runtime tab rehydration', () => {
         method: 'fresh_agent_read_snapshot', params: { soulId: view.soulId, expectedControlEpoch: await rig.controlEpoch() },
       })
       expect(ownedSnapshot.data.threadId).toBe(view.nativeSessionId)
+      const expectLargeRetainedHistory = (snapshot: any) => {
+        expect(Buffer.byteLength(JSON.stringify(snapshot))).toBeGreaterThan(1024 * 1024)
+        // The native projection preserves each user/assistant row independently.
+        expect(snapshot.turns).toHaveLength(160)
+        expect(snapshot.turns[0].turnId).toBe('retained-0:row-0')
+        expect(snapshot.turns[159].turnId).toBe('retained-79:row-1')
+        const first = snapshot.turns[1].items.find((item: any) => item.text?.startsWith('Managed retained answer 0'))
+        const last = snapshot.turns[159].items.find((item: any) => item.text?.startsWith('Managed fixture saved answer'))
+        expect(first.text).toBe(`Managed retained answer 0\n${'x'.repeat(20_000)}`)
+        expect(last.text).toBe(`Managed fixture saved answer\n${'x'.repeat(20_000)}`)
+        expect(snapshot.extensions.codex.nativeHistoryRetention).toBeUndefined()
+      }
+      expectLargeRetainedHistory(ownedSnapshot.data)
       const initialSnapshot = await fetch(`${info.baseUrl}/api/fresh-agent/threads/freshcodex/codex/${view.nativeSessionId}`, {
         headers: { 'x-auth-token': info.token },
       })
-      expect(initialSnapshot.ok, await initialSnapshot.text()).toBe(true)
+      expect(initialSnapshot.ok).toBe(true)
+      expectLargeRetainedHistory(await initialSnapshot.json())
       await page.reload()
       await harness.waitForHarness()
       await harness.waitForConnection()
       const pane = page.locator(`[data-pane-id="${created.paneId}"]`)
-      await expect(pane.getByText('Managed fixture saved answer', { exact: true })).toBeVisible({ timeout: 60_000 })
+      await expect(pane.getByText('Managed fixture saved answer', { exact: false })).toBeVisible({ timeout: 60_000 })
       const composer = pane.getByRole('textbox', { name: 'Chat message input' })
       await expect(composer).toBeEnabled()
       await expect.poll(async () => {
         const state = await harness.getState()
-        return state.panes.layouts[created.tabId].content.sessionId
-      }).toBe(view.freshAgentSessionId)
+        return [view.freshAgentSessionId, view.nativeSessionId].includes(state.panes.layouts[created.tabId].content.sessionId)
+      }).toBe(true)
       await composer.fill('Draft stays in this managed conversation')
       const original = await page.evaluate(({ tabId, paneId }) => {
         const root = window.__FRESHELL_TEST_HARNESS__!.getState().panes.layouts[tabId]
@@ -270,11 +294,12 @@ test.describe.serial('Phase 4 managed-runtime tab rehydration', () => {
       await expect.poll(() => liveResponse?.extensions?.codex?.statusFromLiveState).toBe(true)
       expect(liveResponse.threadId).toBe(view.nativeSessionId)
       expect(liveResponse.capabilities.send).toBe(true)
+      expectLargeRetainedHistory(liveResponse)
       const afterLoss = sent.slice(baseline)
       expect(afterLoss.filter((frame) => frame.type === 'freshAgent.create' || frame.type === 'pane.reconcile.request')).toHaveLength(0)
       expect(received.filter((frame) => frame.type === 'freshAgent.event' && frame.sessionId === original.sessionId
         && frame.event?.type === 'freshAgent.session.snapshot')).toHaveLength(0)
-      await expect(pane.getByText('Managed fixture saved answer', { exact: true })).toBeVisible()
+      await expect(pane.getByText('Managed fixture saved answer', { exact: false })).toBeVisible()
       await expect(page.getByTestId('managed-runtime-recovery-card')).toHaveCount(0)
       await expect(pane.getByRole('button', { name: 'Start new session' })).toHaveCount(0)
       await expectOriginalConversation()
