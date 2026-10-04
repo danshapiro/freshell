@@ -19,6 +19,7 @@ import { getWsClient, RECONCILE_VERDICT_WAIT_MS } from '@/lib/ws-client'
 import { sendSuppressedAwareFreshAgentFrame } from '@/lib/fresh-agent-configure'
 import { KILL_ACK_TIMEOUT_MESSAGE, KILL_FAILED_MESSAGE, sendFreshAgentKillAndAwait, sendFreshAgentRecoveryStopAndAwait } from '@/lib/kill-ack'
 import { createLogger } from '@/lib/client-logger'
+import { getInstalledPerfAuditBridge } from '@/lib/perf-audit-bridge'
 import { api, getFreshAgentModelCapabilities, getFreshAgentThreadSnapshot, setSessionMetadata } from '@/lib/api'
 import { clearPaneCloseError, clearReconcilePendingPane, consumePaneRefreshRequest, mergePaneContent, startNewManagedRuntimeConversation, updatePaneContent } from '@/store/panesSlice'
 import { retryManagedConversation } from '@/lib/managed-runtime-retry'
@@ -167,6 +168,10 @@ export const TRANSCRIPT_INVALIDATING_FRESH_AGENT_EVENTS = new Set([
 ])
 const REVEAL_REFRESH_MAX_WAIT_MS = 15_000
 const log = createLogger('FreshAgentView')
+let nextSnapshotAuditView = 0
+type SnapshotAuditStage = 'refresh_requested' | 'effect_skipped' | 'request_captured' | 'request_queued'
+  | 'run_started' | 'native_started' | 'native_completed' | 'native_failed' | 'soul_started'
+  | 'outcome_received' | 'currentness_checked' | 'identity_rejected' | 'display_committed'
 
 /** Supervisor ownership survives its recovering-to-live projection change. */
 function isSupervisorRecoveryOwned(content: FreshAgentPaneContent): boolean {
@@ -866,6 +871,16 @@ export function FreshAgentView({
   const [snapshotRefreshNonce, setSnapshotRefreshNonce] = useState(0)
   const snapshotRefreshTriggerRef = useRef<SnapshotTrigger>('identity')
   const snapshotRequestAuthorityRef = useRef({ next: 0, applied: 0, generation: 0, readOnlySource: false })
+  const snapshotAuditViewRef = useRef<number | null>(null)
+  const snapshotAuditInputsRef = useRef<Record<string, unknown> | null>(null)
+  // Independent of log levels. Construct diagnostic data only while the opt-in bridge exists.
+  const recordSnapshotAudit = useCallback((stage: SnapshotAuditStage, data: () => Record<string, unknown>) => {
+    const bridge = getInstalledPerfAuditBridge()
+    if (!bridge) return
+    snapshotAuditViewRef.current ??= ++nextSnapshotAuditView
+    bridge.addPerfEvent({ event: 'fresh_agent.snapshot_request', stage, timestamp: performance.now(),
+      view: snapshotAuditViewRef.current, ...data() })
+  }, [])
   // A hidden pane keeps its last good transcript until a transcript-changing
   // event says that it is no longer current. On reveal, the old DOM remains
   // mounted but is concealed behind a refresh state so the user never reads a
@@ -1299,6 +1314,7 @@ export function FreshAgentView({
   const requestSnapshotRefresh = useCallback((trigger: SnapshotTrigger) => {
     snapshotRefreshTriggerRef.current = trigger
     snapshotRefreshSerialRef.current += 1
+    recordSnapshotAudit('refresh_requested', () => ({ trigger, refreshSerial: snapshotRefreshSerialRef.current }))
     setSnapshotRefreshNonce((value) => value + 1)
   }, [])
 
@@ -2719,16 +2735,25 @@ export function FreshAgentView({
   }, [agentSession?.cwd, appStore, captureFreshAgentAttachmentAttempt, clearReserveRedrive, commitSnapshot, descriptor?.label, dispatch, markSnapshotDirty, migratePendingAutoTitle, paneContent, paneContent.createRequestId, paneId, recordPendingSendMetadata, redriveAfterSessionReserved, releasePendingRebind, requestRevealRefresh, requestSnapshotRefresh, resendPendingMessage, sendFencedFreshAgentAttach, sendFreshAgentMessage, setLocalEcho, tabId, ws])
 
   useEffect(() => {
-    if (!snapshotThreadId) return
+    if (!snapshotThreadId) {
+      recordSnapshotAudit('effect_skipped', () => ({ reason: 'no_thread' }))
+      return
+    }
     // kata b8ke: a divergent pane (the canonical session's runtime owner is
     // the other kind) stops ALL old-kind snapshot traffic — polling, event
     // refreshes, and this identity fetch alike. Read via the ref so the
     // identity-deps discipline below is not disturbed.
-    if (ownerDivergenceRef.current) return
+    if (ownerDivergenceRef.current) {
+      recordSnapshotAudit('effect_skipped', () => ({ reason: 'divergence' }))
+      return
+    }
     // Unmanaged lost threads use lifecycle recovery below. Managed
     // recovery retains durable identity: read-only GETs show saved history
     // while the supervisor resumes automatically or awaits a decision.
-    if (!supervisorRecoveryOwned && (paneContent.provider === 'claude' || paneContent.provider === 'codex') && agentSession?.lost) return
+    if (!supervisorRecoveryOwned && (paneContent.provider === 'claude' || paneContent.provider === 'codex') && agentSession?.lost) {
+      recordSnapshotAudit('effect_skipped', () => ({ reason: 'unmanaged_lost' }))
+      return
+    }
     setLoadError(null)
     const sessionId = snapshotThreadId
     const provider = paneContent.provider
@@ -2748,27 +2773,34 @@ export function FreshAgentView({
       snapshotRequestAuthorityRef.current.generation += 1
     }
     const requestReadGeneration = snapshotRequestAuthorityRef.current.generation
-    const isStaleSnapshotRequest = () => (
-      paneContentRef.current.createRequestId !== requestCreateRequestId
-      || paneContentRef.current.soulId !== requestPaneSoulId
-      || paneContentRef.current.soulIntentRevision !== requestPaneSoulRevision
-      || appStore.getState().connection.bootId !== requestBootId
-      || JSON.stringify(selectPaneOwnerFence(appStore.getState(), paneContentRef.current)) !== JSON.stringify(requestOwnerFence)
-      || requestSerial < snapshotRequestAuthorityRef.current.applied
+    const auditRequest = (stage: SnapshotAuditStage, data: () => Record<string, unknown> = () => ({})) =>
+      recordSnapshotAudit(stage, () => ({ requestSerial, readGeneration: requestReadGeneration,
+        requestReadOnly, hasSoul: Boolean(requestPaneSoulId), trigger, refreshSerial, appliedSerial: snapshotRequestAuthorityRef.current.applied,
+        currentGeneration: snapshotRequestAuthorityRef.current.generation, ...data() }))
+    const isStaleSnapshotRequest = (check: 'native-error' | 'before-soul' | 'outcome' | 'error-fold') => {
+      const rejected = (fence: string) => {
+        auditRequest('currentness_checked', () => ({ check, stale: true, fence }))
+        return true
+      }
+      // Keep the original order and short circuit: later fences are unobserved after rejection.
+      if (paneContentRef.current.createRequestId !== requestCreateRequestId) return rejected('create')
+      if (paneContentRef.current.soulId !== requestPaneSoulId) return rejected('soul')
+      if (paneContentRef.current.soulIntentRevision !== requestPaneSoulRevision) return rejected('revision')
+      if (appStore.getState().connection.bootId !== requestBootId) return rejected('boot')
+      if (JSON.stringify(selectPaneOwnerFence(appStore.getState(), paneContentRef.current)) !== JSON.stringify(requestOwnerFence)) return rejected('owner')
+      if (requestSerial < snapshotRequestAuthorityRef.current.applied) return rejected('applied_serial')
       // Ordinary reads predating managed recovery never regain authority after Retry.
       // The initial history read can still supply history while a resumed live read waits.
-      || (requestReadGeneration !== snapshotRequestAuthorityRef.current.generation
-        && (!requestReadOnly || snapshotRequestAuthorityRef.current.readOnlySource))
-      || (!requestReadOnly && isManagedRuntimeRecoveryPending(paneContentRef.current.recoverySummary))
-      || paneContentRef.current.provider !== provider
-      || paneContentRef.current.sessionType !== requestSessionType
-      || snapshotThreadIdRef.current !== sessionId
-      // kata b8ke: a divergence flip (the session's runtime owner became the
-      // other kind while this request was in flight) makes the result stale —
-      // result-application fencing, never an AbortSignal (the run-closure
-      // contract).
-      || ownerDivergenceRef.current !== null
-    )
+      if (requestReadGeneration !== snapshotRequestAuthorityRef.current.generation
+        && (!requestReadOnly || snapshotRequestAuthorityRef.current.readOnlySource)) return rejected('read_generation')
+      if (!requestReadOnly && isManagedRuntimeRecoveryPending(paneContentRef.current.recoverySummary)) return rejected('recovery')
+      if (paneContentRef.current.provider !== provider) return rejected('provider')
+      if (paneContentRef.current.sessionType !== requestSessionType) return rejected('session_type')
+      if (snapshotThreadIdRef.current !== sessionId) return rejected('thread')
+      if (ownerDivergenceRef.current !== null) return rejected('divergence')
+      auditRequest('currentness_checked', () => ({ check, stale: false }))
+      return false
+    }
     // A1: resolve the cwd ONCE (route cwd falls through initialCwd -> session
     // cwd) and use the SAME value for both the scheduler key and the request,
     // so sibling panes whose raw initialCwd diverges ('' vs '/w') still share
@@ -2779,10 +2811,29 @@ export function FreshAgentView({
     const requestOutgoingTurnId = outgoingTurnRef.current?.requestId
     const trigger = snapshotRefreshTriggerRef.current
     const refreshSerial = snapshotRefreshSerialRef.current
+    const snapshotAuditData = (value: FreshAgentSnapshot) => ({ historyOnly: isNativeHistoryOnlySnapshot(value),
+      live: value.extensions?.[provider]?.statusFromLiveState === true,
+      vacant: value.extensions?.[provider]?.ownerKind === 'vacant', rows: value.turns.length })
+    auditRequest('request_captured', () => {
+      const inputs = { createChanged: requestCreateRequestId, soulChanged: requestPaneSoulId,
+        revisionChanged: requestPaneSoulRevision, bootChanged: requestBootId,
+        ownerChanged: JSON.stringify(requestOwnerFence), providerChanged: provider, typeChanged: requestSessionType,
+        threadChanged: sessionId, paneSessionChanged: paneContent.sessionId,
+        recoveryChanged: paneContent.recoverySummary?.recoveryState, lostChanged: agentSession?.lost,
+        supervisorChanged: supervisorRecoveryOwned, refreshChanged: snapshotRefreshNonce }
+      const previous = snapshotAuditInputsRef.current
+      snapshotAuditInputsRef.current = inputs
+      return { initialCapture: previous === null, ...Object.fromEntries(Object.entries(inputs)
+        .map(([name, value]) => [name, previous !== null && previous[name] !== value])) }
+    })
     const applySnapshot = (next: FreshAgentSnapshot) => {
       const historyOnly = isNativeHistoryOnlySnapshot(next)
       if ((historyOnly || (requestPaneSoulId && next.extensions?.[provider]?.statusFromLiveState === true))
-        && (next.provider !== provider || next.sessionType !== requestSessionType || next.threadId !== sessionId)) return
+        && (next.provider !== provider || next.sessionType !== requestSessionType || next.threadId !== sessionId)) {
+        auditRequest('identity_rejected', () => ({ providerMatches: next.provider === provider,
+          typeMatches: next.sessionType === requestSessionType, threadMatches: next.threadId === sessionId, historyOnly }))
+        return
+      }
       const snapshotIdentity = currentAutoTitleIdentityRef.current
       const resolved = next as FreshAgentSnapshot
       const resolvedHasUserTurns = freshAgentSnapshotHasUserTurn(resolved)
@@ -2821,6 +2872,9 @@ export function FreshAgentView({
         refreshOutgoingTurn()
       }
       commitSnapshot(displaySnapshot)
+      auditRequest('display_committed', () => ({ ...snapshotAuditData(resolved), accepted: snapshotAccepted,
+        previousRows: previousSnapshot?.turns.length ?? 0, rows: displaySnapshot.turns.length,
+        ...(typeof resolved.revision === 'number' && Number.isFinite(resolved.revision) ? { revision: resolved.revision } : {}) }))
       setSnapshotAutoTitleIdentity(snapshotIdentity)
       const revealRefreshIsCurrent = (
         trigger === 'reveal'
@@ -3011,7 +3065,7 @@ export function FreshAgentView({
       // AbortError swallow kept as harmless dead armor: scheduler-path
       // fetches carry no signal (A2), so this can no longer fire.
       if (error instanceof Error && error.name === 'AbortError') return
-      if (isStaleSnapshotRequest()) return
+      if (isStaleSnapshotRequest('error-fold')) return
       // A history refusal must not initiate an attach/resume or clear the
       // saved identity while the supervisor owns recovery.
       if (requestReadOnly || isManagedRuntimeRecoveryPending(paneContentRef.current.recoverySummary)) {
@@ -3146,27 +3200,37 @@ export function FreshAgentView({
     const key = makeSnapshotKey({ sessionType: requestSessionType, provider, threadId: sessionId, cwd: requestCwd,
       soulId: requestPaneSoulId, soulIntentRevision: requestPaneSoulRevision })
       + `:read-generation:${requestReadGeneration}:boot:${requestBootId ?? ''}:owner:${requestOwnerFence?.epoch ?? ''}:${requestOwnerFence?.generation ?? ''}`
+    let ran = false
+    auditRequest('request_queued')
     void getSnapshotScheduler().schedule(key, trigger, async () => {
+      ran = true
+      auditRequest('run_started')
       // NO signal: the run may execute on behalf of other panes sharing the
       // key, or after this effect cleaned up (A2). Staleness is handled by
       // isStaleSnapshotRequest() when the outcome is applied, not by aborting.
       const options = { ...(requestCwd ? { cwd: requestCwd } : {}), trigger }
       if (requestSoulId) {
+        auditRequest('soul_started', () => ({ source: 'direct' }))
         return getFreshAgentThreadSnapshot(requestSessionType, provider, sessionId, { ...options, soulId: requestSoulId })
       }
       try {
+        auditRequest('native_started')
         const snapshot = await getFreshAgentThreadSnapshot(requestSessionType, provider, sessionId, options)
+        auditRequest('native_completed', () => snapshotAuditData(snapshot))
         if (!requestPaneSoulId || !isNativeHistoryOnlySnapshot(snapshot)) return snapshot
       } catch (error) {
-        if (!requestPaneSoulId || isStaleSnapshotRequest()) throw error
+        auditRequest('native_failed', () => ({ errorKind: error instanceof Error && error.name === 'AbortError' ? 'abort' : 'error' }))
+        if (!requestPaneSoulId || isStaleSnapshotRequest('native-error')) throw error
       }
       // A matching native ID in the web store does not prove the managed provider source.
       // Capture the soul with the request and retain the existing application fences.
-      if (isStaleSnapshotRequest()) throw new Error('Conversation source changed during snapshot read')
+      if (isStaleSnapshotRequest('before-soul')) throw new Error('Conversation source changed during snapshot read')
+      auditRequest('soul_started', () => ({ source: 'fallback' }))
       return getFreshAgentThreadSnapshot(requestSessionType, provider, sessionId, { ...options, soulId: requestPaneSoulId })
     },
     ).then((outcome) => {
-      if (isStaleSnapshotRequest()) return
+      auditRequest('outcome_received', () => ({ outcome: outcome.status, ran }))
+      if (isStaleSnapshotRequest('outcome')) return
       if (outcome.status === 'ok') {
         applySnapshot(outcome.value as FreshAgentSnapshot)
         return

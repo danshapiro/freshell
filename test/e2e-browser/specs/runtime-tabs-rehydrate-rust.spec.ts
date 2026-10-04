@@ -497,6 +497,7 @@ test.describe.serial('Phase 4 managed-runtime tab rehydration', () => {
         observerWindow: { intervalMs: observerIntervalMs, controllerReattachment, startupFinished, firstObservationNotBefore,
           holdRequestedAt, heldAt, releasedAt, resumedAt, targetSoulRecoveries } })
     } finally {
+      measurement.finallyEnteredAt = Date.now()
       try {
         if (heldHost) rig.signalOwnedSessionHostExact(heldHost.containerId, heldHost.incarnationId, 'SIGCONT', heldHost.pid)
       } finally {
@@ -556,7 +557,7 @@ test.describe.serial('Phase 4 managed-runtime tab rehydration', () => {
             }
             try {
               // Sanitize inside the owned page before returning audit data to Node.
-              measurement.audit = await page.evaluate(() => {
+              measurement.audit = await page.evaluate((cutoffWallMs) => {
                 const snapshot = window.__FRESHELL_TEST_HARNESS__?.getPerfAuditSnapshot()
                 const routeClass = (raw: unknown) => {
                   if (typeof raw !== 'string') return undefined
@@ -567,7 +568,31 @@ test.describe.serial('Phase 4 managed-runtime tab rehydration', () => {
                   if (pathname.startsWith('/assets/')) return `asset:${pathname.split('/').at(-1)}`
                   return pathname.startsWith('/api/') ? 'other-api' : 'document-or-resource'
                 }
+                const requestRecords = (snapshot?.perfEvents ?? []).filter((entry) => entry.event === 'fresh_agent.snapshot_request')
+                const stages = ['refresh_requested', 'effect_skipped', 'request_captured', 'request_queued', 'run_started',
+                  'native_started', 'native_completed', 'native_failed', 'soul_started', 'outcome_received',
+                  'currentness_checked', 'identity_rejected', 'display_committed']
+                const triggers = ['identity', 'event', 'send-accepted', 'materialized', 'manual', 'poll', 'reconnect', 'reveal', 'idle-incomplete']
+                const allowed = { stage: stages, trigger: triggers, reason: ['no_thread', 'divergence', 'unmanaged_lost'],
+                  check: ['native-error', 'before-soul', 'outcome', 'error-fold'], source: ['direct', 'fallback'],
+                  fence: ['create', 'soul', 'revision', 'boot', 'owner', 'applied_serial', 'read_generation', 'recovery',
+                    'provider', 'session_type', 'thread', 'divergence'], errorKind: ['abort', 'error'],
+                  outcome: ['ok', 'error', 'coalesced', 'rate-limited', 'backoff'] }
+                const numericFields = ['timestamp', 'view', 'requestSerial', 'readGeneration', 'refreshSerial', 'appliedSerial',
+                  'currentGeneration', 'previousRows', 'rows', 'revision']
+                const booleanFields = ['requestReadOnly', 'hasSoul', 'ran', 'stale', 'historyOnly', 'live', 'vacant', 'accepted',
+                  'providerMatches', 'typeMatches', 'threadMatches', 'initialCapture', 'createChanged', 'soulChanged',
+                  'revisionChanged', 'bootChanged', 'ownerChanged', 'providerChanged', 'typeChanged', 'threadChanged',
+                  'paneSessionChanged', 'recoveryChanged', 'lostChanged', 'supervisorChanged', 'refreshChanged']
                 return { timeOrigin: performance.timeOrigin, extractedAtMs: performance.now(), available: Boolean(snapshot),
+                  cutoffWallMs, requestRecordCount: requestRecords.length, requestRecordsReturned: Math.min(2000, requestRecords.length),
+                  requestRecordsDropped: Math.max(0, requestRecords.length - 2000),
+                  requestRecords: requestRecords.slice(0, 2000).map((entry, sequence) => ({ sequence,
+                    ...Object.fromEntries(Object.entries(allowed).filter(([key, values]) => values.includes(String(entry[key])))
+                      .map(([key]) => [key, entry[key]])),
+                    ...Object.fromEntries(numericFields.filter((key) => typeof entry[key] === 'number' && Number.isFinite(entry[key]))
+                      .map((key) => [key, entry[key]])),
+                    ...Object.fromEntries(booleanFields.filter((key) => typeof entry[key] === 'boolean').map((key) => [key, entry[key]])) })),
                   // The existing sink has no event timestamp: retain sequence and measured durations only.
                   events: (snapshot?.perfEvents ?? []).flatMap((entry, sequence) => {
                     if (!['perf.api_slow', 'perf.api_parse_slow', 'perf.longtask', 'perf.resource_slow'].includes(String(entry.event))) return []
@@ -576,7 +601,7 @@ test.describe.serial('Phase 4 managed-runtime tab rehydration', () => {
                       .filter((key) => typeof entry[key] === 'number').map((key) => [key, entry[key]]))
                     return [{ sequence, event: entry.event, route: routeClass(entry.path ?? entry.name), ...numeric }]
                   }) }
-              })
+              }, Number(measurement.finallyEnteredAt))
             } catch { measurementErrors.push('owned perf audit extraction failed') }
             rig.runtime.writeBrowserArtifact('saved-history-render-measurement', measurement)
             rig.runtime.recordLifecycle('browser.saved_history_measurement.finished', {
