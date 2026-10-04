@@ -131,7 +131,8 @@ pub(crate) fn store_in(dir: &tempfile::TempDir) -> Arc<CodexSidecarStore> {
 
 /// The committed fake app-server fixture (repo-owned test harness).
 pub(crate) fn fake_app_server_fixture() -> std::path::PathBuf {
-    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+    std::env::current_dir()
+        .expect("Rust test should run from the package directory")
         .join("../../test/fixtures/coding-cli/codex-app-server/fake-app-server.mjs")
 }
 

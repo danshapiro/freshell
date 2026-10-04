@@ -1073,7 +1073,8 @@ async fn restore_class_queue_overflow_fails_loud_as_queue_full() {
 // ── the spawn integration leg: real child + real proxy + fake TUI ─────────────────
 
 fn fake_app_server_command() -> String {
-    let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+    let fixture = std::env::current_dir()
+        .expect("Rust test should run from the package directory")
         .join("../../test/fixtures/coding-cli/codex-app-server/fake-app-server.mjs");
     format!("node {}", fixture.display())
 }
@@ -1441,7 +1442,8 @@ async fn plan_retry_spawns_fresh_after_claimed_reattach_ensure_ready_fails() {
     // `sidecar_reconcile_tests::spawn_own_fake_app_server`; test binaries
     // cannot share code — the repo's copy-with-attribution convention).
     let survivor_ownership = "codex-sidecar-a7000003-cccc-4ccc-8ccc-cccccccccccc";
-    let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+    let fixture = std::env::current_dir()
+        .expect("Rust test should run from the package directory")
         .join("../../test/fixtures/coding-cli/codex-app-server/fake-app-server.mjs");
     let bind_unused_ws_url = || {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
