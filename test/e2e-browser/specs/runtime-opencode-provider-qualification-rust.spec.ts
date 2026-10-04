@@ -429,9 +429,12 @@ test.describe.serial('OpenCode provider qualification', () => {
       // Proof comes from NEW provider-native assistant rows, never echoed input
       // or a redraw of old terminal history. The project name has 128 bits.
       const nonce = `p-${randomBytes(16).toString('base64url')}`
+      // Keep this unambiguously conversational: asking for a project name can
+      // make a coding model search the workspace instead of answering from its
+      // current turn, leaving native history open until the qualification times out.
       await executeInPane(
         page, first.paneId,
-        `For the project we are discussing, the name is ${nonce}. What is the project name?`,
+        `Remember this exact string for our conversation: ${nonce}. Reply with only the string. Do not search files or call tools.`,
       )
       const nativeSessionId = await waitForValue('first exact OpenCode session id', async () => (
         await paneSessionId(harness, tabId, first.paneId)
@@ -465,7 +468,8 @@ test.describe.serial('OpenCode provider qualification', () => {
       ), 120_000)
       await waitForReplacementPrompt(page, harness, rig, tabId, first.paneId, afterHostCrash)
       const beforeRecall = new Set(nativeAssistantTurns(rig, afterHostCrash, nativeSessionId).map((turn) => turn.messageId))
-      await executeInPane(page, first.paneId, 'What is the name of the project we chose earlier?')
+      await executeInPane(page, first.paneId,
+        'What exact string did I ask you to remember? Reply with only the string. Do not search files or call tools.')
       const recalledAnswer = await nextNativeAssistantTurn(page, first.terminalId, rig, afterHostCrash, nativeSessionId, beforeRecall, nonce)
       verifyMemoryAnswer(recalledAnswer, nonce)
       expect(recalledAnswer.messageId).not.toBe(firstAnswer.messageId)
@@ -499,7 +503,8 @@ test.describe.serial('OpenCode provider qualification', () => {
       )
       await waitForReplacementPrompt(page, harness, rig, tabId, first.paneId, afterProviderCrash)
       const beforeProviderFollowup = new Set(nativeAssistantTurns(rig, afterProviderCrash, nativeSessionId).map((turn) => turn.messageId))
-      await executeInPane(page, first.paneId, 'Please remind me of the project name we selected.')
+      await executeInPane(page, first.paneId,
+        'What exact string did I ask you to remember? Reply with only the string. Do not search files or call tools.')
       const providerAnswer = await nextNativeAssistantTurn(page, first.terminalId, rig, afterProviderCrash, nativeSessionId, beforeProviderFollowup, nonce)
       verifyMemoryAnswer(providerAnswer, nonce)
       expect(providerAnswer.messageId).not.toBe(recalledAnswer.messageId)
@@ -513,7 +518,7 @@ test.describe.serial('OpenCode provider qualification', () => {
       if (!second.view.containerId) throw new Error('second OpenCode view lacks container')
       const secondNonce = `p-${randomBytes(16).toString('base64url')}`
       await executeInPane(page, second.paneId,
-        `For the project we are discussing, the name is ${secondNonce}. What is the project name?`)
+        `Remember this exact string for our conversation: ${secondNonce}. Reply with only the string. Do not search files or call tools.`)
       const secondSessionId = await waitForValue('second exact OpenCode session id', async () => (
         await paneSessionId(harness, tabId, second.paneId)
       ), 120_000)
