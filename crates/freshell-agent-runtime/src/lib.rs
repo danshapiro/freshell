@@ -1174,6 +1174,7 @@ mod tests {
             provider_secret_references: Vec::new(),
             provider_launch_context: None,
             opencode_transfer: None,
+            opencode_transfer_attempt_id: None,
         }
     }
 

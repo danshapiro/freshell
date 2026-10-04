@@ -1,4 +1,4 @@
-use super::{OpenCodeTransferStaging, StagingLimits, StagingStart};
+use super::{OpenCodeTransferStaging, StagingLimits, StagingStart, ABANDONED_READY_AGE};
 use freshell_runtime_protocol::{
     opencode_target_build_receipt, opencode_transfer_bundle_digest, OpenCodeTransferChunk,
     OpenCodeTransferDescriptor, OpenCodeTransferFile, OpenCodeTransferReadinessReceipt,
@@ -204,6 +204,9 @@ fn delayed_abort_from_superseded_attempt_keeps_resumed_partial_stage() {
         .unwrap();
     let ready = staging
         .finalize(&descriptor.transfer_id, RETRY_ATTEMPT)
+        .unwrap();
+    staging
+        .mark_launch_claimed(&descriptor, RETRY_ATTEMPT)
         .unwrap();
     assert_eq!(
         std::fs::read(ready.join("entry-0000.bin")).unwrap(),
@@ -466,6 +469,275 @@ fn staged_transfer_enforces_bundle_quota_aggregate_queue_and_free_space() {
 }
 
 #[test]
+fn staging_queue_is_bounded_and_rejects_only_entries_beyond_the_limit() {
+    let dir = tempfile::tempdir().unwrap();
+    let staging = OpenCodeTransferStaging::new(dir.path(), StagingLimits::for_test(8, 8)).unwrap();
+    let full = descriptor(b"12345678", "transfer-queue-bound-full");
+    assert!(matches!(
+        staging.begin(&full, TEST_ATTEMPT, 8).unwrap(),
+        StagingStart::Started { .. }
+    ));
+
+    for index in 0..super::MAX_QUEUED_TRANSFERS {
+        let queued = descriptor(b"abcdefgh", &format!("transfer-queue-bound-{index}"));
+        assert_eq!(
+            staging.begin(&queued, TEST_ATTEMPT, 8).unwrap(),
+            StagingStart::Queued
+        );
+    }
+    assert_eq!(
+        staging.queued_count_unlocked().unwrap(),
+        super::MAX_QUEUED_TRANSFERS
+    );
+
+    let overflow = descriptor(b"ABCDEFGH", "transfer-queue-bound-overflow");
+    assert!(matches!(
+        staging.begin(&overflow, TEST_ATTEMPT, 8),
+        Err(super::StagingError::Capacity(_))
+    ));
+    assert!(!staging.queued_path(&overflow.transfer_id).exists());
+}
+
+#[test]
+fn finalized_unclaimed_ready_stage_is_released_on_abort_or_expiry_after_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let limits = StagingLimits::for_test(8, 8);
+    let staging = OpenCodeTransferStaging::new(dir.path(), limits).unwrap();
+
+    let cancelled = descriptor(b"12345678", "transfer-finalized-cancelled");
+    staging.begin(&cancelled, TEST_ATTEMPT, 8).unwrap();
+    staging
+        .write_chunk(&chunk(&cancelled, b"12345678", 0))
+        .unwrap();
+    let cancelled_ready = staging
+        .finalize(&cancelled.transfer_id, TEST_ATTEMPT)
+        .unwrap();
+    staging.abort(&cancelled.transfer_id, TEST_ATTEMPT).unwrap();
+    assert!(
+        !cancelled_ready.exists(),
+        "a matching pre-registration cancellation promptly releases the ready reservation"
+    );
+
+    let crashed = descriptor(b"abcdefgh", "transfer-finalized-crashed");
+    staging.begin(&crashed, TEST_ATTEMPT, 8).unwrap();
+    staging
+        .write_chunk(&chunk(&crashed, b"abcdefgh", 0))
+        .unwrap();
+    let crashed_ready = staging
+        .finalize(&crashed.transfer_id, TEST_ATTEMPT)
+        .unwrap();
+    drop(staging);
+
+    let restarted = OpenCodeTransferStaging::new(dir.path(), limits).unwrap();
+    let expired_at = SystemTime::now() + ABANDONED_READY_AGE + Duration::from_secs(1);
+    assert_eq!(
+        restarted
+            .reclaim_abandoned_ready_at(&HashSet::new(), expired_at)
+            .unwrap(),
+        1
+    );
+    assert!(!crashed_ready.exists());
+    let replacement = descriptor(b"87654321", "transfer-after-ready-expiry");
+    assert!(matches!(
+        restarted.begin(&replacement, TEST_ATTEMPT, 8).unwrap(),
+        StagingStart::Started { .. }
+    ));
+}
+
+#[test]
+fn claimed_or_registry_referenced_ready_stages_survive_abort_and_expiry_cleanup() {
+    let dir = tempfile::tempdir().unwrap();
+    let limits = StagingLimits::for_test(8, 8);
+    let staging = OpenCodeTransferStaging::new(dir.path(), limits).unwrap();
+    let registered = descriptor(b"12345678", "transfer-registered-ready");
+    staging.begin(&registered, TEST_ATTEMPT, 8).unwrap();
+    staging
+        .write_chunk(&chunk(&registered, b"12345678", 0))
+        .unwrap();
+    let ready = staging
+        .finalize(&registered.transfer_id, TEST_ATTEMPT)
+        .unwrap();
+
+    // A stale registry snapshot must retain the stage while it is referenced.
+    let expired_at = SystemTime::now() + ABANDONED_READY_AGE + Duration::from_secs(1);
+    assert_eq!(
+        staging
+            .reclaim_abandoned_ready_at(
+                &HashSet::from([registered.transfer_id.clone()]),
+                expired_at,
+            )
+            .unwrap(),
+        0
+    );
+
+    // Claim and cancellation serialize under the staging lock. Once claimed,
+    // retryable registry state remains protected even when a later snapshot
+    // temporarily contains no reference.
+    staging
+        .mark_launch_claimed(&registered, TEST_ATTEMPT)
+        .unwrap();
+    staging
+        .abort(&registered.transfer_id, TEST_ATTEMPT)
+        .unwrap();
+    assert!(ready.is_dir());
+    assert_eq!(
+        staging
+            .reclaim_abandoned_ready_at(&HashSet::new(), expired_at)
+            .unwrap(),
+        0
+    );
+    assert!(ready.is_dir());
+}
+
+#[test]
+fn registration_claim_racing_abort_and_expiry_keeps_registry_owned_ready_stage() {
+    let dir = tempfile::tempdir().unwrap();
+    let limits = StagingLimits::for_test(8, 8);
+    let staging = std::sync::Arc::new(OpenCodeTransferStaging::new(dir.path(), limits).unwrap());
+    let registered = descriptor(b"12345678", "transfer-register-abort-race");
+    staging.begin(&registered, TEST_ATTEMPT, 8).unwrap();
+    staging
+        .write_chunk(&chunk(&registered, b"12345678", 0))
+        .unwrap();
+    let ready = staging
+        .finalize(&registered.transfer_id, TEST_ATTEMPT)
+        .unwrap();
+    staging
+        .mark_launch_registering(&registered, TEST_ATTEMPT, false)
+        .unwrap();
+
+    let superseding_begin = staging.begin(&registered, RETRY_ATTEMPT, 8);
+    assert!(
+        superseding_begin.is_err(),
+        "a new attempt cannot replace ownership while registry preparation is in flight"
+    );
+
+    let references = HashSet::from([registered.transfer_id.clone()]);
+    let claim_staging = std::sync::Arc::clone(&staging);
+    let abort_staging = std::sync::Arc::clone(&staging);
+    let cleanup_staging = std::sync::Arc::clone(&staging);
+    std::thread::scope(|scope| {
+        let claim = scope.spawn(|| claim_staging.mark_launch_claimed(&registered, TEST_ATTEMPT));
+        let abort = scope.spawn(|| {
+            abort_staging.abort_with_references(&registered.transfer_id, TEST_ATTEMPT, &references)
+        });
+        let cleanup = scope.spawn(|| {
+            cleanup_staging.reclaim_abandoned_ready_at(
+                &references,
+                SystemTime::now() + ABANDONED_READY_AGE + Duration::from_secs(1),
+            )
+        });
+        claim.join().unwrap().unwrap();
+        abort.join().unwrap().unwrap();
+        assert_eq!(cleanup.join().unwrap().unwrap(), 0);
+    });
+
+    assert!(ready.is_dir());
+    assert_eq!(
+        staging
+            .reclaim_abandoned_ready_at(
+                &HashSet::new(),
+                SystemTime::now() + ABANDONED_READY_AGE + Duration::from_secs(1),
+            )
+            .unwrap(),
+        0,
+        "a claimed retry stage stays intact even without a stale reference snapshot"
+    );
+}
+
+#[tokio::test]
+async fn queued_transfers_progress_fifo_after_receipt_release_and_cancel_by_attempt() {
+    let dir = tempfile::tempdir().unwrap();
+    let limits = StagingLimits::for_test(8, 8);
+    let staging = std::sync::Arc::new(OpenCodeTransferStaging::new(dir.path(), limits).unwrap());
+    let full = descriptor(b"12345678", "transfer-full-ready");
+    staging.begin(&full, TEST_ATTEMPT, 8).unwrap();
+    staging.write_chunk(&chunk(&full, b"12345678", 0)).unwrap();
+    staging.finalize(&full.transfer_id, TEST_ATTEMPT).unwrap();
+    staging.mark_launch_claimed(&full, TEST_ATTEMPT).unwrap();
+
+    let first = descriptor(b"abcdefgh", "transfer-queue-first");
+    let cancelled = descriptor(b"ABCDEFGH", "transfer-queue-cancelled");
+    let last = descriptor(b"87654321", "transfer-queue-last");
+    for item in [&first, &cancelled, &last] {
+        assert_eq!(
+            staging.begin(item, TEST_ATTEMPT, 8).unwrap(),
+            StagingStart::Queued
+        );
+    }
+
+    let first_wait = {
+        let staging = std::sync::Arc::clone(&staging);
+        let transfer_id = first.transfer_id.clone();
+        tokio::spawn(async move { staging.wait_for_capacity(&transfer_id, TEST_ATTEMPT).await })
+    };
+    let cancelled_wait = {
+        let staging = std::sync::Arc::clone(&staging);
+        let transfer_id = cancelled.transfer_id.clone();
+        tokio::spawn(async move { staging.wait_for_capacity(&transfer_id, TEST_ATTEMPT).await })
+    };
+    let last_wait = {
+        let staging = std::sync::Arc::clone(&staging);
+        let transfer_id = last.transfer_id.clone();
+        tokio::spawn(async move { staging.wait_for_capacity(&transfer_id, TEST_ATTEMPT).await })
+    };
+
+    staging
+        .mark_release_eligible(&full, &readiness_receipt(&full))
+        .unwrap();
+    assert_eq!(
+        staging.reclaim_release_eligible(&HashSet::new()).unwrap(),
+        1
+    );
+    assert!(matches!(
+        first_wait.await.unwrap().unwrap(),
+        StagingStart::Started { .. }
+    ));
+    assert!(staging.partial_path(&first.transfer_id).is_dir());
+    assert!(staging.queued_path(&cancelled.transfer_id).is_dir());
+    assert!(staging.queued_path(&last.transfer_id).is_dir());
+
+    // Cancelling a queued waiter removes only its own FIFO entry. It cannot
+    // delete the next transfer's reservation or queue position.
+    staging.abort(&cancelled.transfer_id, TEST_ATTEMPT).unwrap();
+    assert!(cancelled_wait.await.unwrap().is_err());
+    staging.abort(&first.transfer_id, TEST_ATTEMPT).unwrap();
+    assert!(matches!(
+        last_wait.await.unwrap().unwrap(),
+        StagingStart::Started { .. }
+    ));
+    assert!(staging.partial_path(&last.transfer_id).is_dir());
+}
+
+#[test]
+fn queued_transfer_order_and_retry_survive_supervisor_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let limits = StagingLimits::for_test(8, 8);
+    let full = descriptor(b"12345678", "transfer-restart-full");
+    let queued = descriptor(b"abcdefgh", "transfer-restart-queued");
+    let staging = OpenCodeTransferStaging::new(dir.path(), limits).unwrap();
+    staging.begin(&full, TEST_ATTEMPT, 8).unwrap();
+    assert_eq!(
+        staging.begin(&queued, TEST_ATTEMPT, 8).unwrap(),
+        StagingStart::Queued
+    );
+    drop(staging);
+
+    let restarted = OpenCodeTransferStaging::new(dir.path(), limits).unwrap();
+    assert_eq!(
+        restarted.begin(&queued, RETRY_ATTEMPT, 8).unwrap(),
+        StagingStart::Queued
+    );
+    restarted.abort(&queued.transfer_id, TEST_ATTEMPT).unwrap();
+    assert!(restarted.queued_path(&queued.transfer_id).is_dir());
+    restarted.abort(&full.transfer_id, TEST_ATTEMPT).unwrap();
+    assert!(matches!(
+        restarted.begin(&queued, RETRY_ATTEMPT, 8).unwrap(),
+        StagingStart::Started { .. }
+    ));
+}
+
+#[test]
 fn changed_source_generation_reclaims_stale_partial_and_finishes_within_quota_after_restart() {
     let dir = tempfile::tempdir().unwrap();
     let limits = StagingLimits::for_test(8, 8);
@@ -544,6 +816,7 @@ fn stale_partial_cleanup_after_restart_is_idempotent_and_keeps_ready_release_gua
     begin_test_attempt(&staging, &ready, u64::MAX).unwrap();
     staging.write_chunk(&chunk(&ready, b"12345678", 0)).unwrap();
     let ready_path = finalize_test_attempt(&staging, &ready.transfer_id).unwrap();
+    staging.mark_launch_claimed(&ready, TEST_ATTEMPT).unwrap();
     let stale_path = staging.partial_path(&partial.transfer_id);
     drop(staging);
 
