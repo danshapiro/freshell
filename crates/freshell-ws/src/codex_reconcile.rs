@@ -73,6 +73,10 @@ impl RolloutTailer {
         let Ok(len) = file.metadata().map(|m| m.len()) else {
             return Vec::new();
         };
+        self.read_file_extent(&mut file, len)
+    }
+
+    fn read_file_extent(&mut self, file: &mut std::fs::File, len: u64) -> Vec<String> {
         if len < self.offset {
             // Truncated/replaced file: restart from the top.
             self.offset = 0;
@@ -89,7 +93,9 @@ impl RolloutTailer {
         if file.read_to_end(&mut buf).is_err() {
             return Vec::new();
         }
-        self.offset = len;
+        // Appends can land after metadata(): commit the bytes read, not the
+        // earlier length, so a partial JSON record is never read twice.
+        self.offset += buf.len() as u64;
         self.partial.extend_from_slice(&buf);
 
         let mut lines = Vec::new();
@@ -320,6 +326,42 @@ mod tests {
 
         writeln!(f, "ial4").unwrap();
         assert_eq!(tailer.read_new_lines(), vec!["partial4"]);
+    }
+
+    #[test]
+    fn tailer_keeps_a_start_appended_after_the_length_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("growing.jsonl");
+        let metadata = r#"{"type":"session_meta","payload":{"id":"selected-thread"}}"#;
+        std::fs::write(&path, format!("{metadata}\n")).unwrap();
+        let mut tailer = RolloutTailer::new(&path);
+        tailer.attach().unwrap();
+        let mut reader = std::fs::File::open(&path).unwrap();
+        let captured_len = reader.metadata().unwrap().len();
+        let start = event_line("task_started", "2026-07-25T08:00:00.000Z");
+        let mut writer = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        writer.write_all(start.as_bytes()).unwrap();
+        assert_eq!(
+            tailer.read_file_extent(&mut reader, captured_len),
+            vec![metadata]
+        );
+        writer.write_all(b"\n").unwrap();
+        let lines = tailer.read_new_lines();
+        assert_eq!(lines, vec![start]);
+        assert!(tailer.read_new_lines().is_empty());
+        let events = fold_task_events(&lines);
+        assert_eq!(events.latest_task_started_at, Some(1_784_966_400_000));
+        let mut tracker = freshell_activity::codex::CodexActivityTracker::new();
+        tracker.track_terminal(
+            "selected-terminal",
+            Some("selected-thread"),
+            1_784_966_400_000,
+        );
+        tracker.reconcile_rollout("selected-terminal", &events, 1_784_966_400_001);
+        assert_eq!(tracker.list()[0].phase, freshell_protocol::CodexPhase::Busy);
     }
 
     #[test]
