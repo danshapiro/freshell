@@ -246,6 +246,249 @@ fn current_attempt_abort_releases_partial_quota_after_stale_abort_is_inert() {
 }
 
 #[test]
+fn physical_space_reservation_keeps_second_transfer_queued_until_capacity_is_freed() {
+    let dir = tempfile::tempdir().unwrap();
+    let staging = OpenCodeTransferStaging::new(dir.path(), StagingLimits::for_test(8, 16)).unwrap();
+    let first = descriptor(b"12345678", "transfer-physical-reservation-first");
+    let second = descriptor(b"abcdefgh", "transfer-physical-reservation-second");
+
+    assert!(matches!(
+        staging.begin(&first, TEST_ATTEMPT, 8).unwrap(),
+        StagingStart::Started { .. }
+    ));
+    assert_eq!(
+        staging.begin(&second, TEST_ATTEMPT, 8).unwrap(),
+        StagingStart::Queued,
+        "the first partial owns all eight bytes of the measured physical capacity"
+    );
+    assert_eq!(staging.advance_queue_unlocked(8).unwrap(), 0);
+    assert!(staging.queued_path(&second.transfer_id).is_dir());
+
+    staging.abort(&first.transfer_id, TEST_ATTEMPT).unwrap();
+    assert!(
+        staging.partial_path(&second.transfer_id).is_dir(),
+        "releasing the first reservation lets the FIFO head promote"
+    );
+    assert!(!staging.queued_path(&second.transfer_id).exists());
+}
+
+#[test]
+fn queue_promotion_reserves_capacity_for_each_fifo_entry_in_one_pass() {
+    let dir = tempfile::tempdir().unwrap();
+    let staging = OpenCodeTransferStaging::new(dir.path(), StagingLimits::for_test(8, 32)).unwrap();
+    let active = descriptor(b"12345678", "transfer-physical-promotion-active");
+    let first = descriptor(b"abcdefgh", "transfer-physical-promotion-first");
+    let second = descriptor(b"ABCDEFGH", "transfer-physical-promotion-second");
+
+    assert!(matches!(
+        staging.begin(&active, TEST_ATTEMPT, 8).unwrap(),
+        StagingStart::Started { .. }
+    ));
+    assert_eq!(
+        staging.begin(&first, TEST_ATTEMPT, 8).unwrap(),
+        StagingStart::Queued
+    );
+    assert_eq!(
+        staging.begin(&second, TEST_ATTEMPT, 8).unwrap(),
+        StagingStart::Queued
+    );
+
+    assert_eq!(
+        staging.advance_queue_unlocked(16).unwrap(),
+        1,
+        "one 8-byte active reservation leaves room for exactly one 8-byte promotion"
+    );
+    assert!(staging.partial_path(&first.transfer_id).is_dir());
+    assert!(staging.queued_path(&second.transfer_id).is_dir());
+}
+
+#[test]
+fn physical_reservation_drops_as_chunks_materialize_without_double_counting_bytes() {
+    let dir = tempfile::tempdir().unwrap();
+    let payload = vec![0x41; MAX_OPENCODE_TRANSFER_CHUNK_BYTES + 8];
+    let limits = StagingLimits::for_test(payload.len() as u64, payload.len() as u64 + 4);
+    let staging = OpenCodeTransferStaging::new(dir.path(), limits).unwrap();
+    let partial = descriptor(&payload, "transfer-physical-materialized");
+    let next = descriptor(b"wxyz", "transfer-physical-after-materialized");
+
+    staging
+        .begin(&partial, TEST_ATTEMPT, payload.len() as u64)
+        .unwrap();
+    staging.write_chunk(&chunk(&partial, &payload, 0)).unwrap();
+
+    assert!(
+        staging.has_physical_capacity(0, 8).unwrap(),
+        "the materialized first chunk is already reflected in free space; only the final eight bytes remain reserved"
+    );
+    assert!(matches!(
+        staging.begin(&next, TEST_ATTEMPT, 12).unwrap(),
+        StagingStart::Started { .. }
+    ));
+}
+
+#[test]
+fn physical_space_read_failure_fails_begin_closed_before_publishing_a_stage() {
+    let dir = tempfile::tempdir().unwrap();
+    let staging = OpenCodeTransferStaging::new(dir.path(), StagingLimits::for_test(8, 16)).unwrap();
+    let transfer = descriptor(b"12345678", "transfer-physical-read-error");
+
+    let error = staging
+        .begin_with_space_probe(&transfer, TEST_ATTEMPT, || {
+            Err(super::StagingError::Io(std::io::Error::other(
+                "injected statvfs failure",
+            )))
+        })
+        .expect_err("capacity-read errors must reject admission");
+    assert!(matches!(error, super::StagingError::Io(_)));
+    assert!(!staging.partial_path(&transfer.transfer_id).exists());
+    assert!(!staging.queued_path(&transfer.transfer_id).exists());
+}
+
+#[test]
+fn begin_samples_filesystem_capacity_after_acquiring_the_staging_lock() {
+    use std::sync::{mpsc, Arc};
+
+    let dir = tempfile::tempdir().unwrap();
+    let staging =
+        Arc::new(OpenCodeTransferStaging::new(dir.path(), StagingLimits::for_test(8, 16)).unwrap());
+    let first = descriptor(b"12345678", "transfer-serialized-space-first");
+    let second = descriptor(b"abcdefgh", "transfer-serialized-space-second");
+    let (first_probe_tx, first_probe_rx) = mpsc::channel();
+    let (release_first_tx, release_first_rx) = mpsc::channel();
+    let first_staging = Arc::clone(&staging);
+    let first_result = std::thread::spawn(move || {
+        first_staging.begin_with_space_probe(&first, TEST_ATTEMPT, || {
+            first_probe_tx.send(()).unwrap();
+            release_first_rx.recv().unwrap();
+            Ok(8)
+        })
+    });
+    first_probe_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("first begin reached its locked capacity observation");
+
+    let (second_started_tx, second_started_rx) = mpsc::channel();
+    let (second_probe_tx, second_probe_rx) = mpsc::channel();
+    let second_staging = Arc::clone(&staging);
+    let second_result = std::thread::spawn(move || {
+        second_started_tx.send(()).unwrap();
+        second_staging.begin_with_space_probe(&second, TEST_ATTEMPT, || {
+            second_probe_tx.send(()).unwrap();
+            Ok(8)
+        })
+    });
+    second_started_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("second Begin started while the first owns the staging lock");
+    assert!(
+        second_probe_rx
+            .recv_timeout(Duration::from_millis(50))
+            .is_err(),
+        "a second Begin cannot sample the same capacity while the first owns the staging lock"
+    );
+
+    release_first_tx.send(()).unwrap();
+    assert!(matches!(
+        first_result.join().unwrap().unwrap(),
+        StagingStart::Started { .. }
+    ));
+    second_probe_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("second begin samples capacity after the first publishes its reservation");
+    assert_eq!(second_result.join().unwrap().unwrap(), StagingStart::Queued);
+}
+
+#[test]
+#[ignore = "process-kill recovery test; run only through scripts/sandbox-test.sh"]
+fn opencode_transfer_queue_recovers_after_supervisor_process_crash() {
+    use std::{os::unix::process::ExitStatusExt, process::Command};
+
+    const ROOT_ENV: &str = "FRESHELL_OPENCODE_TRANSFER_CRASH_TEST_ROOT";
+    const MARKER: &str = "crash-child-reached-queued-state";
+
+    let dir = tempfile::tempdir().unwrap();
+    let executable = std::env::current_exe().expect("resolve this test executable");
+    let child = Command::new(executable)
+        .args([
+            "--exact",
+            "opencode_transfer::tests::opencode_transfer_process_crash_child",
+            "--ignored",
+            "--nocapture",
+        ])
+        .env(ROOT_ENV, dir.path())
+        .status()
+        .expect("spawn the isolated crash fixture child");
+    assert_eq!(
+        child.signal(),
+        Some(libc::SIGKILL),
+        "the fixture process must be killed after publishing the FIFO entry"
+    );
+    assert!(dir.path().join(MARKER).is_file());
+
+    let staging = OpenCodeTransferStaging::new(dir.path(), StagingLimits::for_test(8, 16))
+        .expect("restart staging from the child's durable files");
+    let active = descriptor(b"12345678", "transfer-process-crash-active");
+    let queued = descriptor(b"abcdefgh", "transfer-process-crash-queued");
+    let queued_path = staging.queued_path(&queued.transfer_id);
+    let original_order = staging
+        .read_queue_order_unlocked(&queued_path)
+        .expect("the queue position survived the process crash");
+
+    assert_eq!(
+        staging.begin(&queued, RETRY_ATTEMPT, 8).unwrap(),
+        StagingStart::Queued,
+        "restart retry keeps the queue entry behind the active physical reservation"
+    );
+    assert_eq!(
+        staging.read_queue_order_unlocked(&queued_path).unwrap(),
+        original_order,
+        "taking retry ownership does not rewrite the FIFO position"
+    );
+    assert_eq!(
+        super::read_attempt_owner(&queued_path).unwrap(),
+        RETRY_ATTEMPT
+    );
+
+    staging.abort(&active.transfer_id, TEST_ATTEMPT).unwrap();
+    let promoted = staging.partial_path(&queued.transfer_id);
+    assert!(promoted.is_dir(), "the queued head promotes after release");
+    assert_eq!(
+        super::read_attempt_owner(&promoted).unwrap(),
+        RETRY_ATTEMPT,
+        "promotion preserves current attempt ownership"
+    );
+}
+
+#[test]
+#[ignore = "child fixture for opencode_transfer_queue_recovers_after_supervisor_process_crash"]
+fn opencode_transfer_process_crash_child() {
+    const ROOT_ENV: &str = "FRESHELL_OPENCODE_TRANSFER_CRASH_TEST_ROOT";
+    let Some(root) = std::env::var_os(ROOT_ENV) else {
+        return;
+    };
+    let root = std::path::PathBuf::from(root);
+    let staging = OpenCodeTransferStaging::new(&root, StagingLimits::for_test(8, 16)).unwrap();
+    let active = descriptor(b"12345678", "transfer-process-crash-active");
+    let queued = descriptor(b"abcdefgh", "transfer-process-crash-queued");
+    assert!(matches!(
+        staging.begin(&active, TEST_ATTEMPT, 8).unwrap(),
+        StagingStart::Started { .. }
+    ));
+    assert_eq!(
+        staging.begin(&queued, TEST_ATTEMPT, 8).unwrap(),
+        StagingStart::Queued
+    );
+    std::fs::write(root.join("crash-child-reached-queued-state"), b"ready").unwrap();
+
+    // Kill only this fixture process. The parent verifies its exact signal
+    // before reconstructing staging from the persistent synthetic root.
+    unsafe {
+        libc::kill(libc::getpid(), libc::SIGKILL);
+    }
+    unreachable!("SIGKILL should terminate the crash fixture child");
+}
+
+#[test]
 fn staged_transfer_resumes_after_restart_and_refuses_tampered_ready_data() {
     let dir = tempfile::tempdir().unwrap();
     let payload = vec![0x31; MAX_OPENCODE_TRANSFER_CHUNK_BYTES + 2];
