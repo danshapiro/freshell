@@ -275,11 +275,20 @@ pub fn import_bundle_payload_with_capacity<R: Read>(
             "workspace or Git assets do not match the imported session references".into(),
         )
     })?;
+    #[cfg(test)]
+    crash_checkpoint("import.before_transaction_commit");
     transaction.commit()?;
+    #[cfg(test)]
+    crash_checkpoint("import.after_transaction_commit");
     drop(connection);
     sync_file_and_parent(destination_database)?;
+    #[cfg(test)]
+    crash_checkpoint("import.after_database_sync");
     let structural_sha256 = structural_digest(&manifest);
-    Ok(receipt_for(descriptor, &manifest, structural_sha256))
+    let receipt = receipt_for(descriptor, &manifest, structural_sha256);
+    #[cfg(test)]
+    crash_checkpoint("import.after_receipt_constructed");
+    Ok(receipt)
 }
 
 fn nearest_existing_directory(path: &Path) -> Result<PathBuf, OpenCodeImportError> {
@@ -932,6 +941,22 @@ fn sync_file_and_parent(path: &Path) -> Result<(), OpenCodeImportError> {
 
 fn sha256(bytes: &[u8]) -> String {
     hex::encode(Sha256::digest(bytes))
+}
+
+#[cfg(test)]
+fn crash_checkpoint(point: &str) {
+    if std::env::var("FRESHELL_OPENCODE_IMPORT_CRASH_POINT")
+        .ok()
+        .as_deref()
+        == Some(point)
+    {
+        // The self-reexec test verifies SIGKILL and runs only through the
+        // disposable Docker sandbox.
+        unsafe {
+            libc::kill(libc::getpid(), libc::SIGKILL);
+        }
+        unreachable!("SIGKILL should terminate the importer crash fixture");
+    }
 }
 
 struct HashingReader<R> {
