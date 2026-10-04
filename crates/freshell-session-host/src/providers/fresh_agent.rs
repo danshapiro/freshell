@@ -893,6 +893,13 @@ impl FreshAgentTransport for HostedTransport {
             return delegate.snapshot().await;
         }
         let mut snapshot = self.snapshot_value().await?;
+        // The native getter's vacant fallback means its captured HTTP read
+        // failed; tracking the session does not make that empty result live.
+        if self.provider == FreshProvider::Opencode
+            && snapshot["extensions"]["opencode"]["ownerKind"] == "vacant"
+        {
+            return Err("opencode snapshot unavailable".into());
+        }
         let provider = if self.provider == FreshProvider::Kilroy {
             "claude"
         } else {
@@ -1432,6 +1439,213 @@ mod tests {
                 .filter(|row| row["event"] == "prompt_async" && row["sessionId"] == native)
                 .count(),
             2
+        );
+    }
+
+    #[tokio::test]
+    async fn actual_opencode_snapshot_read_failure_preserves_owned_native_identity() {
+        let _lock = OPENCODE_SNAPSHOT_ENV_LOCK.lock().await;
+        let dir = tempfile::tempdir().unwrap();
+        let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../test/e2e-browser/fixtures/fake-opencode.cjs")
+            .canonicalize()
+            .unwrap();
+        let audit = dir.path().join("native-audit.jsonl");
+        let marker = dir.path().join("snapshot-read-failure");
+        let keys = [
+            "OPENCODE_CMD",
+            "HOME",
+            "XDG_DATA_HOME",
+            "OPENCODE_DB",
+            "FAKE_OPENCODE_AUDIT_LOG",
+            "FAKE_OPENCODE_SNAPSHOT_READ_FAILURE_MARKER",
+            "FAKE_OPENCODE_SELF_EXIT_MARKER",
+            "FAKE_OPENCODE_HANG_SESSION_CREATE",
+            "FAKE_OPENCODE_PROMPT_ERROR",
+            "FAKE_OPENCODE_TOOL_ERROR",
+            "FAKE_OPENCODE_TUI_PARITY",
+            "FAKE_OPENCODE_BUSY_AT_LAUNCH",
+            "FAKE_OPENCODE_REQUIRE_DIRECTORY_ROUTE",
+            "FAKE_OPENCODE_PROJECT_CWD",
+        ];
+        let _env = SnapshotProviderEnv(
+            keys.iter()
+                .map(|key| (*key, std::env::var_os(key)))
+                .collect(),
+        );
+        for key in keys {
+            std::env::remove_var(key);
+        }
+        std::env::set_var("OPENCODE_CMD", fixture);
+        std::env::set_var("HOME", dir.path());
+        std::env::set_var("XDG_DATA_HOME", dir.path().join(".local/share"));
+        std::env::set_var("FAKE_OPENCODE_AUDIT_LOG", &audit);
+        std::env::set_var("FAKE_OPENCODE_SNAPSHOT_READ_FAILURE_MARKER", &marker);
+        std::env::set_var("FAKE_OPENCODE_REQUIRE_DIRECTORY_ROUTE", "1");
+        std::env::set_var("FAKE_OPENCODE_PROJECT_CWD", dir.path());
+        let transport = HostedTransport::new_with_context(FreshProvider::Opencode, None).await;
+        let read_audit = || -> Result<Vec<Value>, String> {
+            std::fs::read_to_string(&audit)
+                .map_err(|error| error.to_string())?
+                .lines()
+                .map(serde_json::from_str)
+                .collect::<Result<_, _>>()
+                .map_err(|error| error.to_string())
+        };
+        // Capture every outcome, then join the owned fixture before asserting,
+        // including the product RED and setup-error paths.
+        let observed: Result<Value, String> = async {
+            let profile = FreshAgentProfile {
+                provider: FreshProvider::Opencode, runtime_variant: "freshopencode".into(),
+                cwd: dir.path().to_string_lossy().into(), model: None, effort: None,
+                permission_mode: None, sandbox: None, provider_store_id: "owned-store".into(),
+                native_session_id: None, plugins: None, model_selection: None, session_ref: None,
+                provider_launch_context: None, provider_secret_references: vec![],
+            };
+            let actor = FreshAgentHostActor::open(dir.path().join("actor"), profile, transport.clone())
+                .await.map_err(|error| error.to_string())?;
+            let registered = transport.session_id.lock().await.clone().ok_or("missing registration")?;
+            let pre = actor.snapshot().await.map_err(|error| error.to_string())?;
+            let spawned_before_send = audit.exists();
+            actor.dispatch(RequestId::parse("read-failure-owned-send").unwrap(),
+                "Owned conversation before unavailable read".into(), None)
+                .await.map_err(|error| error.to_string())?;
+            let live = tokio::time::timeout(Duration::from_secs(10), async {
+                loop {
+                    if let Ok(snapshot) = actor.snapshot().await {
+                        if snapshot["turns"].as_array().is_some_and(|turns| !turns.is_empty())
+                            && serde_json::to_string(&snapshot).unwrap().contains("Fake OpenCode response:") {
+                            break snapshot;
+                        }
+                    }
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            }).await.map_err(|_| "native prompt did not complete".to_string())?;
+            let native = actor.profile().await.native_session_id.ok_or("missing native identity")?;
+            tokio::time::timeout(Duration::from_secs(10), async {
+                loop {
+                    if actor.read_events(0, 256).await.events.iter().any(|entry|
+                        matches!(&entry.event, AgentEvent::Provider { payload }
+                            if payload["sessionId"] == native && payload["event"]["type"] == "freshAgent.turn.complete")) {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            }).await.map_err(|_| "actor did not journal native turn completion".to_string())?;
+            let journal_path = dir.path().join("actor/fresh-agent-state.json");
+            let journal_before = std::fs::read(&journal_path).map_err(|error| error.to_string())?;
+            let profile_before = actor.profile().await;
+            let db_path = dir.path().join(".local/share/opencode/opencode.db");
+            let source_before = std::fs::read(&db_path).map_err(|error| error.to_string())?;
+            let ProviderState::Opencode { owner, runtime } = &transport.state else { unreachable!() };
+            let launched = read_audit()?;
+            let empty_native = launched.iter().find(|row| row["event"] == "launch")
+                .and_then(|row| row["rootSessionId"].as_str()).ok_or("missing seeded native empty session")?;
+            let healthy_empty = owner.get_opencode_snapshot(empty_native, Some(&profile_before.cwd))
+                .await.map_err(|error| error.to_string())?;
+            let history_before = freshell_freshagent::native_history::read("opencode", dir.path(), &native)?;
+            std::fs::write(&marker, b"fail native snapshot reads").map_err(|error| error.to_string())?;
+            let fallback = owner.get_opencode_snapshot(&native, Some(&profile_before.cwd))
+                .await.map_err(|error| error.to_string())?;
+            let tracked = runtime.has_live_session(&native).await;
+            let unavailable = actor.snapshot().await;
+            let failures = read_audit()?;
+            std::fs::remove_file(&marker).map_err(|error| error.to_string())?;
+            let recovered = actor.snapshot().await.map_err(|error| error.to_string())?;
+            let history_after = freshell_freshagent::native_history::read("opencode", dir.path(), &native)?;
+            let journal_unchanged = std::fs::read(&journal_path).map_err(|error| error.to_string())? == journal_before;
+            let source_unchanged = std::fs::read(&db_path).map_err(|error| error.to_string())? == source_before;
+            let profile_unchanged = actor.profile().await == profile_before;
+            let rows = read_audit()?;
+            Ok(json!({ "pre":pre, "registered":registered, "spawnedBeforeSend":spawned_before_send,
+                "native":native, "live":live, "healthyEmpty":healthy_empty, "fallback":fallback, "tracked":tracked,
+                "unavailable":unavailable.is_err(), "unavailableResult":format!("{unavailable:?}"),
+                "recovered":recovered, "historyBefore":history_before, "historyAfter":history_after,
+                "journalUnchanged":journal_unchanged, "sourceUnchanged":source_unchanged,
+                "profileUnchanged":profile_unchanged, "rows":rows, "failureRows":failures }))
+        }.await;
+        // Also clear a marker left by any preparation failure before teardown.
+        let _ = std::fs::remove_file(&marker);
+        let stopped = transport.stop().await;
+        stopped.expect("join exact owned OpenCode fixture shutdown");
+        let observed =
+            observed.expect("establish actual native HTTP read failure and healthy recovery");
+        assert_eq!(observed["pre"]["threadId"], observed["registered"]);
+        assert_eq!(observed["pre"]["capabilities"]["send"], true);
+        assert_eq!(observed["spawnedBeforeSend"], false);
+        assert_eq!(observed["live"]["threadId"], observed["native"]);
+        assert!(observed["healthyEmpty"]["turns"]
+            .as_array()
+            .unwrap()
+            .is_empty());
+        assert_eq!(observed["healthyEmpty"]["capabilities"]["send"], true);
+        assert!(observed["healthyEmpty"]["extensions"]["opencode"]["ownerKind"].is_null());
+        assert_eq!(observed["tracked"], true);
+        assert_eq!(observed["fallback"]["threadId"], observed["native"]);
+        assert_eq!(
+            observed["fallback"]["extensions"]["opencode"]["ownerKind"],
+            "vacant"
+        );
+        assert!(observed["fallback"]["turns"].as_array().unwrap().is_empty());
+        assert!(observed["fallback"]["extensions"]["opencode"]["nativeHistoryAvailable"].is_null());
+        let rows = observed["rows"].as_array().unwrap();
+        let serving = rows
+            .iter()
+            .find(|row| row["event"] == "listen")
+            .expect("native server listening");
+        let failed: Vec<_> = observed["failureRows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|row| row["event"] == "snapshot_read_failed")
+            .collect();
+        assert!(
+            failed.len() >= 2,
+            "getter and actor must both execute the failed native HTTP read"
+        );
+        for row in failed {
+            assert_eq!(row["sessionId"], observed["native"]);
+            assert_eq!(row["routeDirectory"], dir.path().to_string_lossy().as_ref());
+            assert_eq!(row["pid"], serving["pid"]);
+        }
+        assert_eq!(
+            rows.iter().filter(|row| row["event"] == "listen").count(),
+            1
+        );
+        assert_eq!(
+            rows.iter()
+                .filter(|row| row["event"] == "session_created")
+                .count(),
+            1
+        );
+        assert_eq!(
+            rows.iter()
+                .filter(|row| row["event"] == "prompt_async")
+                .count(),
+            1
+        );
+        assert!(!rows
+            .iter()
+            .any(|row| row["event"] == "self_exit" || row["event"] == "shutdown"));
+        assert_eq!(observed["recovered"]["threadId"], observed["native"]);
+        assert_eq!(
+            observed["recovered"]["extensions"]["opencode"]["statusFromLiveState"],
+            true
+        );
+        assert_eq!(observed["historyBefore"], observed["historyAfter"]);
+        assert_eq!(observed["historyAfter"]["threadId"], observed["native"]);
+        assert_eq!(observed["historyAfter"]["capabilities"]["send"], false);
+        assert_eq!(
+            observed["historyAfter"]["extensions"]["opencode"]["nativeHistoryAvailable"],
+            true
+        );
+        assert_eq!(observed["journalUnchanged"], true);
+        assert_eq!(observed["sourceUnchanged"], true);
+        assert_eq!(observed["profileUnchanged"], true);
+        assert_eq!(
+            observed["unavailable"], true,
+            "vacant native fallback must not certify live truth: {}",
+            observed["unavailableResult"]
         );
     }
 

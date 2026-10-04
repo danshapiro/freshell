@@ -836,8 +836,24 @@ async fn real_gateway_managed_snapshot_failure_reads_owned_history_and_refuses_w
         include_str!("../../../test/fixtures/coding-cli/codex/task-events.sanitized.jsonl"),
     )
     .unwrap();
-    for history_available in [true, false] {
-        let socket = dir.path().join(format!("owned-{history_available}.sock"));
+    let local_opencode_path = dir.path().join("configured-xdg/opencode/opencode.db");
+    std::fs::create_dir_all(local_opencode_path.parent().unwrap()).unwrap();
+    let db = rusqlite::Connection::open(&local_opencode_path).unwrap();
+    db.execute_batch("CREATE TABLE session(id TEXT PRIMARY KEY,title TEXT,time_updated INTEGER); CREATE TABLE message(id TEXT PRIMARY KEY,session_id TEXT,time_created INTEGER,data TEXT); CREATE TABLE part(id TEXT PRIMARY KEY,session_id TEXT,message_id TEXT,time_created INTEGER,data TEXT); INSERT INTO session VALUES('ses_owned','Wrong local',2);").unwrap();
+    db.execute("INSERT INTO message VALUES('wrong-message','ses_owned',1,?1)", [serde_json::json!({"id":"wrong-message","role":"assistant","time":{"created":1,"completed":2}}).to_string()]).unwrap();
+    db.execute("INSERT INTO part VALUES('wrong-part','ses_owned','wrong-message',1,?1)", [serde_json::json!({"id":"wrong-part","type":"text","text":"Wrong local OpenCode source"}).to_string()]).unwrap();
+    drop(db);
+    let local_before = std::fs::read(&local_path).unwrap();
+    let opencode_before = std::fs::read(&local_opencode_path).unwrap();
+    for (provider, session_type, native, history_available) in [
+        ("codex", "freshcodex", "session-activity", true),
+        ("codex", "freshcodex", "session-activity", false),
+        ("opencode", "freshopencode", "ses_owned", true),
+        ("opencode", "freshopencode", "ses_owned", false),
+    ] {
+        let socket = dir
+            .path()
+            .join(format!("owned-{provider}-{history_available}.sock"));
         let listener = UnixListener::bind(&socket).unwrap();
         let mut server = tokio::spawn(async move {
             let mut read_history = false;
@@ -856,15 +872,15 @@ async fn real_gateway_managed_snapshot_failure_reads_owned_history_and_refuses_w
                         "soulId":"owned-soul", "incarnationId":"owned-incarnation", "launchState":"running", "cleanupState":"none",
                         "intentRevision":1, "executionGeneration":1, "desiredState":"running", "recoveryState":"live",
                         "durabilityState":"unknown", "allocationState":"allocated", "evidenceRevision":0, "successfulRecoveriesInWindow":0,
-                        "provider":"codex", "nativeSessionId":"session-activity", "freshAgentSessionId":"managed-public",
-                        "freshAgentSessionType":"freshcodex"
+                        "provider":provider, "nativeSessionId":native, "freshAgentSessionId":"managed-public",
+                        "freshAgentSessionType":session_type
                     })).unwrap()]))
                     }
                     AdminCommand::FreshAgentReadSnapshot(read) => {
                         assert_eq!(read.soul_id.as_str(), "owned-soul");
                         Err(freshell_runtime_protocol::RuntimeError::new(
                             RuntimeErrorCode::HostUnreachable,
-                            "owned host unavailable",
+                            "hosted fresh-agent command failed",
                         ))
                     }
                     AdminCommand::FreshAgentReadHistory(read) => {
@@ -873,9 +889,9 @@ async fn real_gateway_managed_snapshot_failure_reads_owned_history_and_refuses_w
                         done = !history_available;
                         if history_available {
                             Ok(AdminResult::FreshAgentHistory(serde_json::json!({
-                                "threadId":"session-activity", "provider":"codex", "sessionType":"freshcodex", "status":"idle",
+                                "threadId":native, "provider":provider, "sessionType":session_type, "status":"idle",
                                 "turns":[{"turnId":"owned-volume-answer"}], "capabilities":{"send":false},
-                                "extensions":{"codex":{"ownerKind":"vacant", "nativeHistoryAvailable":true}}
+                                "extensions":{(provider):{"ownerKind":"vacant", "nativeHistoryAvailable":true}}
                             })))
                         } else {
                             Err(freshell_runtime_protocol::RuntimeError::new(
@@ -919,14 +935,16 @@ async fn real_gateway_managed_snapshot_failure_reads_owned_history_and_refuses_w
                 freshell_freshagent::FreshClaudeState::new(broadcast),
             ),
         );
-        let (status, value) =
-            snapshot_route_value(&app, "freshcodex", "codex", "session-activity").await;
+        let (status, value) = snapshot_route_value(&app, session_type, provider, native).await;
         // Join only the owned fixture; old behavior never requests history.
         let joined = tokio::time::timeout(Duration::from_millis(500), &mut server).await;
         if joined.is_err() {
             server.abort();
             let _ = server.await;
         }
+        joined
+            .expect("gateway must request history from the same owned soul")
+            .expect("owned history fixture protocol must succeed");
         assert_eq!(
             status,
             if history_available {
@@ -937,11 +955,24 @@ async fn real_gateway_managed_snapshot_failure_reads_owned_history_and_refuses_w
         );
         if history_available {
             assert_eq!(value["turns"][0]["turnId"], "owned-volume-answer");
+            assert_eq!(value["threadId"], native);
+            assert_eq!(value["provider"], provider);
+            assert_eq!(value["sessionType"], session_type);
+            assert_eq!(value["extensions"][provider]["ownerKind"], "vacant");
+            assert_eq!(
+                value["extensions"][provider]["nativeHistoryAvailable"],
+                true
+            );
+            assert_eq!(value["extensions"][provider]["statusFromLiveState"], false);
+            assert_eq!(value["capabilities"]["send"], false);
+            assert!(!value.to_string().contains("Wrong local OpenCode source"));
         }
-        joined
-            .expect("gateway must request history from the same owned soul")
-            .expect("owned history fixture protocol must succeed");
     }
+    assert_eq!(std::fs::read(&local_path).unwrap(), local_before);
+    assert_eq!(
+        std::fs::read(&local_opencode_path).unwrap(),
+        opencode_before
+    );
     let proxy = snapshot_outage_proxy(&dir.path().join("absent-supervisor.sock"));
     proxy.aliases.lock().await.insert(
         ("codex".into(), "session-activity".into()),
