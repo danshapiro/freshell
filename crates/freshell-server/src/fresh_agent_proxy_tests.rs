@@ -1304,11 +1304,27 @@ async fn real_gateway_outage_keeps_a_registered_local_provider_snapshot_live() {
             .any(|item| item["text"] == "Fixture turn"),
         "{value}"
     );
-    for (status, value) in [(held_status, held_value), (stale_status, stale_value)] {
-        assert_eq!(status, axum::http::StatusCode::OK, "{value}");
-        assert_eq!(value["threadId"], native);
-        assert_eq!(value["extensions"]["codex"]["nativeHistoryAvailable"], true);
-        assert_ne!(value["extensions"]["codex"]["statusFromLiveState"], true);
-        assert_eq!(value["capabilities"]["send"], false);
-    }
+    // A provider's typed handoff refusal stays authoritative even when saved history exists.
+    assert_eq!(
+        held_status,
+        axum::http::StatusCode::CONFLICT,
+        "{held_value}"
+    );
+    assert_eq!(held_value["code"], "RESTORE_UNAVAILABLE");
+    assert_eq!(held_value["ownerGeneration"], generation);
+    assert!(held_value.get("ownerKind").is_none());
+    assert!(held_value.get("turns").is_none());
+    assert!(held_value.get("capabilities").is_none());
+    // An unconfirmed runtime without a provider refusal still reads only saved history.
+    assert_eq!(stale_status, axum::http::StatusCode::OK, "{stale_value}");
+    assert_eq!(stale_value["threadId"], native);
+    assert_eq!(
+        stale_value["extensions"]["codex"]["nativeHistoryAvailable"],
+        true
+    );
+    assert_ne!(
+        stale_value["extensions"]["codex"]["statusFromLiveState"],
+        true
+    );
+    assert_eq!(stale_value["capabilities"]["send"], false);
 }

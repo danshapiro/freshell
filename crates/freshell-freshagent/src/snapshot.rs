@@ -268,7 +268,9 @@ async fn get_snapshot(
                     CodexSnapshotError::HandoffInProgress { generation } => (None, *generation),
                     _ => unreachable!("the match above names only the typed refusals"),
                 };
-                snapshot_error_response(&thread_id, owner_kind, generation)
+                // The provider already refused this read using the current ownership fence.
+                // Preserve that refusal rather than replacing it with saved history below.
+                return snapshot_error_response(&thread_id, owner_kind, generation);
             }
             // Defensive depth: `get_snapshot` already folds this into its
             // `Ok` (the empty snapshot), so this arm is unreachable today —
@@ -310,7 +312,7 @@ async fn get_snapshot(
                         }
                         _ => unreachable!("the match above names only the typed refusals"),
                     };
-                    snapshot_error_response(&thread_id, owner_kind, generation)
+                    return snapshot_error_response(&thread_id, owner_kind, generation);
                 }
             }
         }
