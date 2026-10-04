@@ -686,12 +686,17 @@ async fn restored_web_reads_large_retained_codex_history_without_source_or_regis
             writeln!(file, "{row}").unwrap();
         }
     }
+    let recent_parts = |kind: &str, tail: &str| {
+        let mut parts: Vec<serde_json::Value> = (0..24).map(|index| json!({"type":kind,"text":format!("Earlier array part {index} {}", "saved ".repeat(32_000))})).collect();
+        parts.push(json!({"type":kind,"text":tail}));
+        parts
+    };
     for row in [
         json!({"type":"turn_context","payload":{"turn_id":"latest-turn"}}),
         json!({"type":"response_item","payload":{"type":"message","id":"latest-prompt","role":"user","content":[{"type":"input_text","text":"Latest actual saved prompt"}]}}),
         json!({"type":"response_item","payload":{"type":"function_call","call_id":"latest-tool","name":"exec_command","arguments":"{\"cmd\":\"pwd\"}"}}),
-        json!({"type":"response_item","payload":{"type":"function_call_output","call_id":"latest-tool","output":"/actual-workspace"}}),
-        json!({"type":"response_item","payload":{"type":"message","id":"latest-answer","role":"assistant","content":[{"type":"output_text","text":"Latest actual saved answer"}]}}),
+        json!({"type":"response_item","payload":{"type":"function_call_output","call_id":"latest-tool","output":recent_parts("input_text", "/actual-workspace")}}),
+        json!({"type":"response_item","payload":{"type":"message","id":"latest-answer","role":"assistant","content":recent_parts("output_text", "Latest actual saved answer FRESHELL_NATIVE_HISTORY_OMITTED_SHA256:body")}}),
     ] {
         writeln!(file, "{row}").unwrap();
     }
@@ -727,7 +732,7 @@ async fn restored_web_reads_large_retained_codex_history_without_source_or_regis
     assert_eq!(body["capabilities"]["send"], false);
     let text = body["turns"].to_string();
     assert!(text.contains("Latest actual saved prompt"));
-    assert!(text.contains("Latest actual saved answer"));
+    assert!(text.contains("Latest actual saved answer FRESHELL_NATIVE_HISTORY_OMITTED_SHA256:body"));
     assert!(text.contains("latest-tool"));
     assert!(text.contains("/actual-workspace"));
     assert_eq!(std::fs::read(&path).unwrap(), source_before);

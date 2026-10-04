@@ -11,10 +11,14 @@ pub(crate) fn read(home: &Path, id: &str) -> Result<Value, String> {
     read_rollout(&path, id)
 }
 
+const MESSAGE_DIGEST: &str = "nativeHistoryMessageDigest";
+
 pub(super) fn read_rollout(path: &Path, id: &str) -> Result<Value, String> {
+    let retention = crate::native_history::Retention::new();
     let file = std::fs::File::open(path).map_err(|e| e.to_string())?;
     let extent = file.metadata().map_err(|e| e.to_string())?.len();
-    let source = crate::native_history::Records::new(std::io::BufReader::new(file.take(extent)));
+    let source =
+        crate::native_history::Records::new(std::io::BufReader::new(file.take(extent)), &retention);
     let mut omitted_turns = 0;
     let mut omitted_items = 0;
     let mut omitted_rows = 0;
@@ -29,6 +33,7 @@ pub(super) fn read_rollout(path: &Path, id: &str) -> Result<Value, String> {
             &mut omitted_items,
             &mut omitted_rows,
             &mut retired,
+            &retention,
         );
         let Some((row, omitted)) = row.map_err(|e| e.to_string())? else {
             continue;
@@ -78,6 +83,7 @@ pub(super) fn read_rollout(path: &Path, id: &str) -> Result<Value, String> {
                     continue;
                 }
                 if let Some(mut item) = normalize_item(payload) {
+                    stamp_message_digest(&mut item, payload, &retention);
                     omitted_items += omitted;
                     item["id"] = payload
                         .get("call_id")
@@ -107,12 +113,15 @@ pub(super) fn read_rollout(path: &Path, id: &str) -> Result<Value, String> {
                     activate_turn(&mut turns, &mut turn, payload["turn_id"].as_str(), true);
                     continue;
                 }
-                let item = if payload["type"] == "item_completed" {
+                let mut item = if payload["type"] == "item_completed" {
                     normalize_completed(&payload["item"])
                 } else {
                     normalize_message_event(payload, line)
                         .or_else(|| normalize_legacy_event(payload))
                 };
+                if let Some(item) = item.as_mut() {
+                    stamp_message_digest(item, payload, &retention);
+                }
                 let finished = matches!(
                     payload["type"].as_str(),
                     Some("task_complete" | "turn_aborted")
@@ -162,6 +171,7 @@ pub(super) fn read_rollout(path: &Path, id: &str) -> Result<Value, String> {
         &mut omitted_items,
         &mut omitted_rows,
         &mut retired,
+        &retention,
     );
     if turn.has_items() {
         turns.push(turn);
@@ -180,6 +190,35 @@ pub(super) fn read_rollout(path: &Path, id: &str) -> Result<Value, String> {
             );
             ordinal += rows + turn.skipped_rows;
             offset
+        })
+        .collect();
+    let part_indices: Vec<_> = turns
+        .iter()
+        .flat_map(|turn| {
+            let native = turn.value["id"].as_str().unwrap().to_owned();
+            let index_key = &retention.index_key;
+            turn.value["items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|item| item["type"] == "userMessage")
+                .filter_map(move |item| {
+                    Some((
+                        native.clone(),
+                        item["id"].as_str()?.to_owned(),
+                        item["content"]
+                            .as_array()?
+                            .iter()
+                            .enumerate()
+                            .map(|(index, part)| {
+                                part.get(index_key)
+                                    .and_then(Value::as_u64)
+                                    .map(|index| index as usize)
+                                    .unwrap_or(index)
+                            })
+                            .collect::<Vec<_>>(),
+                    ))
+                })
         })
         .collect();
     let turns: Vec<_> = turns.into_iter().map(|turn| turn.value).collect();
@@ -211,7 +250,35 @@ pub(super) fn read_rollout(path: &Path, id: &str) -> Result<Value, String> {
             }
         }
     }
-    crate::native_history::finish_retention("codex", &mut snapshot, omitted_turns, omitted_items)?;
+    for turn in snapshot["turns"].as_array_mut().unwrap() {
+        let turn_id = turn["turnId"].as_str().unwrap().to_owned();
+        for item in turn["items"].as_array_mut().unwrap() {
+            if let Some((item_id, index)) =
+                item["id"].as_str().and_then(|id| id.rsplit_once(":part:"))
+            {
+                if let Some(original) = part_indices
+                    .iter()
+                    .find(|(native, id, _)| {
+                        id == item_id
+                            && (turn_id == *native
+                                || turn_id
+                                    .strip_prefix(native)
+                                    .is_some_and(|suffix| suffix.starts_with(":row-")))
+                    })
+                    .and_then(|(_, _, indices)| indices.get(index.parse::<usize>().ok()?))
+                {
+                    item["id"] = json!(format!("{item_id}:part:{original}"));
+                }
+            }
+        }
+    }
+    crate::native_history::finish_retention(
+        "codex",
+        &mut snapshot,
+        omitted_turns,
+        omitted_items,
+        Some(&retention),
+    )?;
     Ok(snapshot)
 }
 
@@ -222,7 +289,14 @@ fn retain_native_turns(
     omitted_items: &mut usize,
     omitted_rows: &mut usize,
     retired: &mut RetiredTurns,
+    retention: &crate::native_history::Retention,
 ) {
+    // The original message digest still identifies mirrors after their display
+    // bodies leave the window. Bound the saved copy used to restore a later
+    // durable source as well as the visible items.
+    if let Some(mirror) = current.mirror.as_mut() {
+        crate::native_history::omit_large_bodies(&mut mirror.item, retention);
+    }
     let items = current.value["items"].as_array_mut().unwrap();
     let mut bytes: usize = items
         .iter()
@@ -230,7 +304,7 @@ fn retain_native_turns(
         .sum();
     if bytes > crate::native_history::RETAINED_TURN_BYTES {
         for item in items.iter_mut() {
-            crate::native_history::omit_large_bodies(item);
+            crate::native_history::omit_large_bodies(item, retention);
         }
         bytes = items
             .iter()
@@ -248,7 +322,11 @@ fn retain_native_turns(
         .iter_mut()
         .map(|turn| {
             if turn.bytes == 0 {
-                turn.bytes = serde_json::to_vec(&turn.value).unwrap().len();
+                turn.bytes = serde_json::to_vec(&turn.value).unwrap().len()
+                    + turn
+                        .mirror
+                        .as_ref()
+                        .map_or(0, |mirror| serde_json::to_vec(&mirror.item).unwrap().len());
             }
             turn.bytes
         })
@@ -395,6 +473,18 @@ enum MessageSource {
     Completion,
 }
 
+fn stamp_message_digest(
+    item: &mut Value,
+    payload: &Value,
+    retention: &crate::native_history::Retention,
+) {
+    if matches!(item["type"].as_str(), Some("userMessage" | "agentMessage")) {
+        if let Some(digest) = payload.get(&retention.fingerprint_key) {
+            item[MESSAGE_DIGEST] = digest.clone();
+        }
+    }
+}
+
 fn normalize_message_event(payload: &Value, line: usize) -> Option<Value> {
     let (kind, field) = match payload["type"].as_str()? {
         "user_message" => ("userMessage", "message"),
@@ -413,6 +503,11 @@ fn normalize_message_event(payload: &Value, line: usize) -> Option<Value> {
 }
 
 fn message_text(item: &Value) -> Option<String> {
+    if matches!(item["type"].as_str(), Some("userMessage" | "agentMessage")) {
+        if let Some(digest) = item[MESSAGE_DIGEST].as_str() {
+            return Some(digest.to_owned());
+        }
+    }
     match item["type"].as_str()? {
         "userMessage" => Some(text_parts(&item["content"])),
         "agentMessage" => Some(item["text"].as_str().unwrap_or("").to_owned()),
@@ -431,16 +526,23 @@ fn upsert_transcript_item(turn: &mut NativeTurn, item: Value, source: MessageSou
             // completion. Each source mirrors this occurrence once; repeated
             // messages from the same source start a new occurrence.
             previous.sources.push(source);
+            let old_id = previous.item["id"].clone();
             if source == MessageSource::Response {
-                if let Some(existing) = turn.value["items"]
-                    .as_array_mut()
-                    .unwrap()
-                    .iter_mut()
-                    .find(|old| old["id"] == previous.item["id"])
-                {
-                    *existing = item.clone();
-                }
                 previous.item = item;
+            }
+            if let Some(existing) = turn.value["items"]
+                .as_array_mut()
+                .unwrap()
+                .iter_mut()
+                .find(|old| old["id"] == old_id)
+            {
+                if source == MessageSource::Response {
+                    *existing = previous.item.clone();
+                }
+            } else {
+                // A newer durable copy must remain visible when retention has
+                // already removed the earlier copy of this occurrence.
+                upsert_item(&mut turn.value, previous.item.clone());
             }
             return;
         }

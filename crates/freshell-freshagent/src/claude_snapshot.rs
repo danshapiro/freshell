@@ -443,6 +443,15 @@ fn parse_transcript_turns(thread_id: &str, transcript: &str) -> Vec<Value> {
 }
 
 pub(crate) fn parse_transcript_turn(obj: &Value, thread_id: &str, ordinal: usize) -> Option<Value> {
+    parse_transcript_turn_indexed(obj, thread_id, ordinal, None)
+}
+
+pub(crate) fn parse_transcript_turn_indexed(
+    obj: &Value,
+    thread_id: &str,
+    ordinal: usize,
+    index_key: Option<&str>,
+) -> Option<Value> {
     let role = match obj.get("type").and_then(Value::as_str) {
         Some("user") => "user",
         Some("assistant") => "assistant",
@@ -482,6 +491,11 @@ pub(crate) fn parse_transcript_turn(obj: &Value, thread_id: &str, ordinal: usize
         .unwrap_or_else(|| format!("{thread_id}:{ordinal}"));
     let mut items: Vec<Value> = Vec::new();
     for (j, block) in blocks.iter().enumerate() {
+        let j = index_key
+            .and_then(|key| block.get(key))
+            .and_then(Value::as_u64)
+            .map(|index| index as usize)
+            .unwrap_or(j);
         let item_id = format!("{turn_id}-i{j}");
         match block.get("type").and_then(Value::as_str) {
             Some("text") => {
