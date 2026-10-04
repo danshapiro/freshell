@@ -29,6 +29,7 @@ import {
 import { useAppSelector } from '@/store/hooks'
 import { updateTab } from '@/store/tabsSlice'
 import { handleFreshAgentMessage } from '@/lib/fresh-agent-ws'
+import { setFreshAgentReconcileActive } from '@/lib/pane-reconcile'
 import { ApiError } from '@/lib/api'
 import { resetSnapshotSchedulerForTests, SNAPSHOT_DEBOUNCE_MS } from '@/lib/fresh-agent-snapshot-scheduler'
 import { SESSION_HANDOFF_RETRY_BACKOFF_MS } from '@/lib/session-handoff'
@@ -282,6 +283,7 @@ function freshopencodeSnapshot(text: string, revision: number) {
 }
 
 beforeEach(() => {
+  setFreshAgentReconcileActive(false)
   resetSnapshotSchedulerForTests()
   wsMock.send.mockReset()
   wsMock.onMessage.mockReset()
@@ -6220,6 +6222,225 @@ describe('FreshAgentView', () => {
     } finally { cleanup(); vi.useRealTimers() }
   })
 
+  it.each(([
+    ['freshclaude', 'claude', savedClaudeNativeHistory],
+    ['freshcodex', 'codex', savedCodexNativeHistory],
+    ['freshopencode', 'opencode', savedOpenCodeNativeHistory],
+  ] as const).flatMap(([sessionType, provider, history]) => [false, true].flatMap((reconcile) => (
+    [false, true].map((hydrated) => ({ sessionType, provider, history, reconcile, hydrated }))
+  ))))('preserves managed $provider lost recovery until attachment truth (reconcile=$reconcile, hydrated=$hydrated)', async ({ sessionType, provider, history, reconcile, hydrated }) => {
+    vi.useFakeTimers()
+    setFreshAgentReconcileActive(reconcile)
+    try {
+      const store = createStore()
+      const native = FreshAgentSnapshotSchema.parse(history)
+      const liveSnapshot = { ...native, capabilities: { ...native.capabilities, send: true }, extensions: {} }
+      const locator = { sessionId: native.threadId, sessionType, provider }
+      store.dispatch(sessionInit(locator))
+      if (hydrated) {
+        store.dispatch(sessionSnapshotReceived({ ...locator, latestTurnId: 'retained-turn', status: 'idle' }))
+        store.dispatch(historyPageReceived({ ...locator, turns: [] }))
+      }
+      apiMock.getFreshAgentThreadSnapshot.mockResolvedValue(liveSnapshot)
+      const content = { kind: 'fresh-agent' as const, ...locator, sessionRef: { provider, sessionId: native.threadId },
+        resumeSessionId: native.threadId, createRequestId: 'managed-live-lost-request', status: 'idle' as const,
+        soulId: 'managed-live-lost-soul', soulIntentRevision: 7,
+        recoverySummary: { desiredState: 'running' as const, recoveryState: 'live' as const,
+          durabilityState: 'resume_captured' as const, allocationState: 'verified_durable' as const } }
+      store.dispatch(initLayout({ tabId: 'tab-1', paneId: 'pane-1', content }))
+      await act(async () => {
+        render(<Provider store={store}><StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" /></Provider>)
+        await vi.advanceTimersByTimeAsync(0)
+      })
+      const retainedText = provider === 'claude' ? 'Saved native Claude answer'
+        : provider === 'codex' ? 'Saved native Codex answer' : 'Saved native OpenCode answer'
+      expect(screen.getByText(retainedText)).toBeInTheDocument()
+      fireEvent.change(screen.getByRole('textbox', { name: 'Chat message input' }), { target: { value: 'Draft retained across recovery' } })
+      apiMock.getFreshAgentThreadSnapshot.mockResolvedValue(native)
+      await act(async () => {
+        store.dispatch(updatePaneContent({ tabId: 'tab-1', paneId: 'pane-1', content: {
+          ...getFreshAgentPaneContent(store), recoverySummary: { ...content.recoverySummary, recoveryState: 'recovering' },
+        } }))
+        store.dispatch(setSessionStatus({ ...locator, status: hydrated ? 'stuck' : 'exited' }))
+        store.dispatch(markSessionLost(locator))
+        await vi.advanceTimersByTimeAsync(SNAPSHOT_DEBOUNCE_MS)
+      })
+      const recoveringContent = getFreshAgentPaneContent(store)
+      wsMock.send.mockClear()
+      // No response is delivered until after the pending-frame assertions.
+      await act(async () => {
+        store.dispatch(updatePaneContent({ tabId: 'tab-1', paneId: 'pane-1', content: {
+          ...recoveringContent, recoverySummary: { ...content.recoverySummary, recoveryState: 'live' },
+        } }))
+        await vi.advanceTimersByTimeAsync(0)
+      })
+      expect(getFreshAgentPaneContent(store)).toEqual({ ...recoveringContent, recoverySummary: content.recoverySummary })
+      expect(Object.values(store.getState().freshAgent.sessions).find((session) => session.sessionId === locator.sessionId)?.lost).toBe(true)
+      expect(sentFreshAgentMessages('freshAgent.attach')).toHaveLength(1)
+      expect(sentFreshAgentMessages('freshAgent.attach')[0]).toMatchObject(locator)
+      expect(sentFreshAgentMessages('freshAgent.create')).toHaveLength(0)
+      expect(sentFreshAgentMessages('pane.reconcile.request')).toHaveLength(0)
+      expect(screen.getByText(retainedText)).toBeInTheDocument()
+      expect(screen.getByRole('textbox', { name: 'Chat message input' })).toHaveValue('Draft retained across recovery')
+      expect(screen.getByRole('textbox', { name: 'Chat message input' })).toBeDisabled()
+      expect(screen.queryByTestId('managed-runtime-recovery-card')).not.toBeInTheDocument()
+      expect(screen.queryByText('Restoring session...')).not.toBeInTheDocument()
+      expect(screen.queryByRole('button', { name: 'Resume session' })).not.toBeInTheDocument()
+      expect(screen.queryByRole('button', { name: 'Start new session' })).not.toBeInTheDocument()
+      expect(screen.queryByRole('button', { name: 'Restart sidecar and resume session' })).not.toBeInTheDocument()
+      apiMock.getFreshAgentThreadSnapshot.mockResolvedValue(liveSnapshot)
+      await act(async () => {
+        handleFreshAgentMessage(store.dispatch, { type: 'freshAgent.event', ...locator,
+          event: { type: 'freshAgent.session.snapshot', latestTurnId: 'retained-turn', status: 'idle', timelineSessionId: native.threadId, revision: 1 } })
+        await vi.advanceTimersByTimeAsync(SNAPSHOT_DEBOUNCE_MS)
+      })
+      expect(Object.values(store.getState().freshAgent.sessions).find((session) => session.sessionId === locator.sessionId)?.lost).toBe(false)
+      expect(getFreshAgentPaneContent(store)).toMatchObject({ ...locator, createRequestId: content.createRequestId,
+        sessionRef: content.sessionRef, resumeSessionId: content.resumeSessionId, soulId: content.soulId })
+      expect(screen.getByText(retainedText)).toBeInTheDocument()
+      expect(screen.getByRole('textbox', { name: 'Chat message input' })).toHaveValue('Draft retained across recovery')
+      expect(screen.getByRole('textbox', { name: 'Chat message input' })).not.toBeDisabled()
+      expect(sentFreshAgentMessages('freshAgent.create')).toHaveLength(0)
+      expect(sentFreshAgentMessages('pane.reconcile.request')).toHaveLength(0)
+    } finally { cleanup(); setFreshAgentReconcileActive(false); vi.useRealTimers() }
+  })
+
+  it.each(['attach', 'respawn'] as const)('rejects an owned legacy %s verdict after supervisor recovery becomes live', async (verdict) => {
+    const store = createStore()
+    setFreshAgentReconcileActive(true)
+    const listeners = new Set<(message: Record<string, unknown>) => void>()
+    wsMock.onMessage.mockImplementation((listener) => { listeners.add(listener); return () => listeners.delete(listener) })
+    const locator = { sessionId: 'late-legacy-reconcile-thread', sessionType: 'freshcodex' as const, provider: 'codex' as const }
+    store.dispatch(sessionInit(locator))
+    store.dispatch(initLayout({ tabId: 'tab-1', paneId: 'pane-1', content: {
+      kind: 'fresh-agent', ...locator, sessionRef: { provider: 'codex', sessionId: locator.sessionId },
+      resumeSessionId: locator.sessionId, createRequestId: 'late-legacy-reconcile-request', status: 'idle',
+    } }))
+    render(<Provider store={store}><StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" /></Provider>)
+    act(() => store.dispatch(markSessionLost(locator)))
+    const request = sentFreshAgentMessages('pane.reconcile.request')[0]
+    expect(request).toBeDefined()
+    const recovering = { ...getFreshAgentPaneContent(store), soulId: 'late-legacy-reconcile-soul',
+      recoverySummary: { desiredState: 'running' as const, recoveryState: 'recovering' as const,
+        durabilityState: 'resume_captured' as const, allocationState: 'verified_durable' as const } }
+    act(() => store.dispatch(updatePaneContent({ tabId: 'tab-1', paneId: 'pane-1', content: recovering })))
+    const live = { ...recovering, recoverySummary: { ...recovering.recoverySummary, recoveryState: 'live' as const } }
+    act(() => store.dispatch(updatePaneContent({ tabId: 'tab-1', paneId: 'pane-1', content: live })))
+    expect(sentFreshAgentMessages('pane.reconcile.request')).toHaveLength(1)
+    wsMock.send.mockClear()
+    act(() => listeners.forEach((listener) => listener({ type: 'pane.reconcile.result', reconcileId: request.reconcileId,
+      serverInstanceId: 'late-legacy-server', verdicts: [{ paneKey: 'tab-1:pane-1', verdict,
+        sessionRef: { provider: 'codex', sessionId: locator.sessionId } }] })))
+    expect(getFreshAgentPaneContent(store)).toEqual(live)
+    expect(Object.values(store.getState().freshAgent.sessions).find((session) => session.sessionId === locator.sessionId)?.lost).toBe(true)
+    expect(sentFreshAgentMessages('freshAgent.create')).toHaveLength(0)
+    expect(sentFreshAgentMessages('pane.reconcile.request')).toHaveLength(0)
+    setFreshAgentReconcileActive(false)
+  })
+
+  it('preserves unmanaged legacy lost reconciliation and accepts its owned attach verdict', async () => {
+    const store = createStore()
+    setFreshAgentReconcileActive(true)
+    const listeners = new Set<(message: Record<string, unknown>) => void>()
+    wsMock.onMessage.mockImplementation((listener) => { listeners.add(listener); return () => listeners.delete(listener) })
+    const locator = { sessionId: 'unmanaged-reconcile-thread', sessionType: 'freshcodex' as const, provider: 'codex' as const }
+    store.dispatch(sessionInit(locator))
+    store.dispatch(initLayout({ tabId: 'tab-1', paneId: 'pane-1', content: { kind: 'fresh-agent', ...locator,
+      sessionRef: { provider: 'codex', sessionId: locator.sessionId }, createRequestId: 'unmanaged-reconcile-request', status: 'idle' } }))
+    render(<Provider store={store}><StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" /></Provider>)
+    act(() => store.dispatch(markSessionLost(locator)))
+    const request = sentFreshAgentMessages('pane.reconcile.request')[0]
+    expect(request).toBeDefined()
+    act(() => listeners.forEach((listener) => listener({ type: 'pane.reconcile.result', reconcileId: request.reconcileId,
+      serverInstanceId: 'unmanaged-server', verdicts: [{ paneKey: 'tab-1:pane-1', verdict: 'attach',
+        sessionRef: { provider: 'codex', sessionId: locator.sessionId } }] })))
+    expect(Object.values(store.getState().freshAgent.sessions).find((session) => session.sessionId === locator.sessionId)?.lost).toBe(false)
+    expect(getFreshAgentPaneContent(store)).toMatchObject({ sessionId: locator.sessionId,
+      createRequestId: 'unmanaged-reconcile-request', serverInstanceId: 'unmanaged-server' })
+    expect(sentFreshAgentMessages('freshAgent.create')).toHaveLength(0)
+    setFreshAgentReconcileActive(false)
+  })
+
+  it('ignores a queued legacy lost callback after same-session attachment truth arrives', async () => {
+    vi.useFakeTimers()
+    const clearTimeoutSpy = vi.spyOn(globalThis, 'clearTimeout').mockImplementation(() => {})
+    try {
+      const store = createStore()
+      const locator = { sessionId: 'queued-legacy-truth-thread', sessionType: 'freshcodex' as const, provider: 'codex' as const }
+      store.dispatch(sessionInit(locator))
+      store.dispatch(sessionSnapshotReceived({ ...locator, latestTurnId: 'retained-turn', status: 'idle' }))
+      store.dispatch(historyPageReceived({ ...locator, turns: [] }))
+      apiMock.getFreshAgentThreadSnapshot.mockReturnValue(new Promise(() => {}))
+      store.dispatch(initLayout({ tabId: 'tab-1', paneId: 'pane-1', content: { kind: 'fresh-agent', ...locator,
+        sessionRef: { provider: 'codex', sessionId: locator.sessionId }, createRequestId: 'queued-legacy-truth-request', status: 'idle' } }))
+      render(<Provider store={store}><StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" /></Provider>)
+      act(() => store.dispatch(markSessionLost(locator)))
+      const before = getFreshAgentPaneContent(store)
+      wsMock.send.mockClear()
+      act(() => handleFreshAgentMessage(store.dispatch, { type: 'freshAgent.event', ...locator,
+        event: { type: 'freshAgent.session.snapshot', latestTurnId: 'retained-turn', status: 'idle' } }))
+      await act(async () => { await vi.advanceTimersByTimeAsync(0) })
+      expect(getFreshAgentPaneContent(store)).toEqual(before)
+      expect(sentFreshAgentMessages('freshAgent.create')).toHaveLength(0)
+      expect(sentFreshAgentMessages('pane.reconcile.request')).toHaveLength(0)
+    } finally { clearTimeoutSpy.mockRestore(); cleanup(); vi.useRealTimers() }
+  })
+
+  it('preserves explicit resume for a managed live session after genuine exit without a lost flag', async () => {
+    const store = createStore()
+    const locator = { sessionId: 'managed-live-manual-resume', sessionType: 'freshcodex' as const, provider: 'codex' as const }
+    store.dispatch(sessionInit(locator))
+    store.dispatch(initLayout({ tabId: 'tab-1', paneId: 'pane-1', content: {
+      kind: 'fresh-agent', ...locator, createRequestId: 'managed-live-manual-request', status: 'idle',
+      sessionRef: { provider: 'codex', sessionId: locator.sessionId }, resumeSessionId: locator.sessionId,
+      soulId: 'managed-live-manual-soul', recoverySummary: { desiredState: 'running', recoveryState: 'live',
+        durabilityState: 'resume_captured', allocationState: 'verified_durable' },
+    } }))
+    render(<Provider store={store}><StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" /></Provider>)
+    await waitFor(() => expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalled())
+    act(() => handleFreshAgentMessage(store.dispatch, { type: 'freshAgent.event', ...locator,
+      event: { type: 'freshAgent.exit', code: 0 } }))
+    fireEvent.click(screen.getByRole('button', { name: 'Resume session', exact: true }))
+    await waitFor(() => expect(getFreshAgentPaneContent(store).createRequestId).not.toBe('managed-live-manual-request'))
+    expect(getFreshAgentPaneContent(store).sessionId).toBeUndefined()
+    expect(getFreshAgentPaneContent(store).sessionRef).toEqual({ provider: 'codex', sessionId: locator.sessionId })
+    expect(getFreshAgentPaneContent(store).resumeSessionId).toBe(locator.sessionId)
+    expect(sentFreshAgentMessages('freshAgent.kill')).toHaveLength(0)
+  })
+
+  it('reattaches the same managed lost conversation with the recovered owner generation', async () => {
+    const store = createStore()
+    const locator = { sessionId: 'managed-recovered-owner-thread', sessionType: 'freshcodex' as const, provider: 'codex' as const }
+    store.dispatch(sessionInit(locator))
+    const owner = { type: 'session.runtimeOwner' as const, provider: 'codex' as const, sessionId: locator.sessionId,
+      epoch: 1, generation: 1, ownerKind: 'fresh-agent' as const, operationId: 'initial-owner', transition: 'handoff-committed' as const }
+    store.dispatch(applyRuntimeOwner(owner))
+    const summary = { desiredState: 'running' as const, recoveryState: 'live' as const,
+      durabilityState: 'resume_captured' as const, allocationState: 'verified_durable' as const }
+    store.dispatch(initLayout({ tabId: 'tab-1', paneId: 'pane-1', content: { kind: 'fresh-agent', ...locator,
+      createRequestId: 'managed-owner-request', sessionRef: { provider: 'codex', sessionId: locator.sessionId },
+      resumeSessionId: locator.sessionId, status: 'idle', soulId: 'managed-owner-soul', recoverySummary: summary } }))
+    render(<Provider store={store}><StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" /></Provider>)
+    await waitFor(() => expect(sentFreshAgentMessages('freshAgent.attach')[0]).toMatchObject({ observedEpoch: 1, observedGeneration: 1 }))
+    act(() => {
+      store.dispatch(updatePaneContent({ tabId: 'tab-1', paneId: 'pane-1', content: {
+        ...getFreshAgentPaneContent(store), recoverySummary: { ...summary, recoveryState: 'recovering' },
+      } }))
+      store.dispatch(markSessionLost(locator))
+    })
+    act(() => store.dispatch(applyRuntimeOwner({ ...owner, generation: 2, operationId: 'recovered-owner' })))
+    const recovering = getFreshAgentPaneContent(store)
+    wsMock.send.mockClear()
+    act(() => store.dispatch(updatePaneContent({ tabId: 'tab-1', paneId: 'pane-1', content: {
+      ...recovering, recoverySummary: summary,
+    } })))
+    expect(sentFreshAgentMessages('freshAgent.attach')).toHaveLength(1)
+    expect(sentFreshAgentMessages('freshAgent.attach')[0]).toMatchObject({ ...locator, observedEpoch: 1, observedGeneration: 2 })
+    expect(getFreshAgentPaneContent(store)).toEqual({ ...recovering, recoverySummary: summary })
+    expect(sentFreshAgentMessages('freshAgent.create')).toHaveLength(0)
+    expect(sentFreshAgentMessages('pane.reconcile.request')).toHaveLength(0)
+  })
+
   it('stops active busy polling on managed intervention and resumes it after recovery', async () => {
     vi.useFakeTimers()
     try {
@@ -6807,7 +7028,7 @@ describe('FreshAgentView', () => {
     },
   )
 
-  it('does not re-drive a deferred .lost callback after a managed projection arrives', async () => {
+  it.each(['lost', 'live'] as const)('does not re-drive a deferred .lost callback after a managed %s projection arrives', async (recoveryState) => {
     vi.useFakeTimers()
     // Keep the callback alive through the projection update so this test
     // exercises the callback's own managed-runtime guard, not only the effect
@@ -6859,7 +7080,7 @@ describe('FreshAgentView', () => {
           soulIntentRevision: 13,
           recoverySummary: {
             desiredState: 'running',
-            recoveryState: 'lost',
+            recoveryState,
             reason: 'provider_unavailable',
             durabilityState: 'resume_captured',
             allocationState: 'verified_durable',
@@ -6871,9 +7092,9 @@ describe('FreshAgentView', () => {
         await vi.advanceTimersByTimeAsync(0)
       })
 
-      expect(sentFreshAgentMessages('freshAgent.create').filter((message) => (
-        !message.sessionRef && !message.resumeSessionId
-      ))).toHaveLength(0)
+      expect(getFreshAgentPaneContent(store)).toMatchObject({ sessionId: locator.sessionId,
+        createRequestId: current.createRequestId, soulId: 'managed-deferred-soul' })
+      expect(sentFreshAgentMessages('freshAgent.create')).toHaveLength(0)
       expect(wsMock.send.mock.calls.some(([message]) => (
         message?.type === 'pane.reconcile.request'
       ))).toBe(false)
