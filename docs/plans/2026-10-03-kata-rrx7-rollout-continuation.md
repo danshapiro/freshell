@@ -7,12 +7,15 @@
 ## User Request
 
 ### Requested result
-Identify the root cause of KataTracker item `rrx7` and repair the Codex multi-file session behavior so a valid same-ID continuation appears as one complete session while genuinely ambiguous duplicates remain quarantined.
+Identify the root cause of KataTracker item `rrx7` and repair the Codex multi-file session behavior so a valid same-ID continuation appears as one complete session while genuinely ambiguous duplicates remain quarantined. Correct The Usual Claude review launch so Fresh Eyes can use the Claude Code CLI successfully.
 
 ### Explicit constraints
 - Track and fix KataTracker item `rrx7`.
 - Use a `gpt-6-sol` subagent with xhigh reasoning for root-cause investigation.
 - Follow the “the-usual” workflow.
+- Launch Claude reviews through the Claude Code CLI from the command line; diagnose inherited authentication routing and do not call the Anthropic API directly.
+- Deliberately update the installed The Usual copy along with its canonical repository.
+- Do not add a recurring behavioral test for the The Usual auth fix; validate it with a test call.
 - Create and use a dedicated `.worktrees/` worktree from `origin/main`; the user authorized bypassing the earlier base-test gate to create it.
 - Use red-green-refactor testing and do not weaken or skip tests.
 - Do not create a PR without explicit approval or deploy/restart production.
