@@ -7,7 +7,7 @@
 ## User Request
 
 ### Requested result
-Implement the revised durable-runtime UI so automatic recovery stays invisible; use existing yellow error popups only when a user decision or intervention is needed; keep System Status focused on system load; remove the persistent managed-runtime dashboard, routine notices, and per-agent resource controls; preserve existing agent panes and session history/actions.
+Implement the revised durable-runtime UI so automatic recovery stays invisible; use existing yellow error popups only when a user decision or intervention is needed; keep System Status focused on system load; remove the persistent managed-runtime dashboard, routine notices, and per-agent resource controls; preserve existing agent panes and session history/actions. Make the canonical test sandbox include the system libraries needed by the full workspace so test runs do not rely on ad hoc package installation.
 
 ### Explicit constraints
 - Use the existing pane/agent error surfaces and yellow error popups for failures or decisions.
@@ -18,6 +18,7 @@ Implement the revised durable-runtime UI so automatic recovery stays invisible; 
 - Rebase onto current main, resolve overlaps, fix checks to green, verify affected browser coverage, review the updated candidate, and land via PR.
 - Continue whole-branch review beyond the-usual's five-round limit until it passes, then finish the authorized PR landing.
 - Run independent checks and fixes in parallel; use separate worktrees when they would otherwise share mutable source or build artifacts.
+- Fix missing test libraries in the canonical sandbox and verify the full workspace on a clean rebuilt image.
 
 ### Accepted tradeoffs and residuals
 - Runtime recovery internals and diagnostics may remain available to the implementation and existing panes; only unnecessary always-visible user-facing surfaces should be removed.
