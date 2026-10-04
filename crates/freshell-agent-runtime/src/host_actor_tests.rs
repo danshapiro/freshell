@@ -49,6 +49,7 @@ impl FreshAgentTransport for SnapshotTransport {
 async fn snapshot_read_preserves_actor_state_and_rejects_wrong_identity_size_or_liveness() {
     for scenario in [
         "live",
+        "large",
         "wrong-thread",
         "wrong-provider",
         "oversized",
@@ -61,7 +62,7 @@ async fn snapshot_read_preserves_actor_state_and_rejects_wrong_identity_size_or_
                 "threadId":if scenario == "wrong-thread" { "different-thread" } else { "snapshot-native" },
                 "provider":if scenario == "wrong-provider" { "codex" } else { "claude" },
                 "sessionType":"freshclaude", "status":"idle",
-                "turns":if scenario == "oversized" { "x".repeat(freshell_runtime_protocol::MAX_CONTROL_FRAME_BYTES) } else { "retained".into() },
+                "turns":match scenario { "oversized" => "x".repeat(freshell_runtime_protocol::MAX_NATIVE_HISTORY_FRAME_BYTES), "large" => "x".repeat(2 * freshell_runtime_protocol::MAX_CONTROL_FRAME_BYTES), _ => "retained".into() },
             }),
             live: std::sync::atomic::AtomicBool::new(scenario != "not-live"),
             exit_during_read: scenario == "exit-during-read",
@@ -75,9 +76,19 @@ async fn snapshot_read_preserves_actor_state_and_rejects_wrong_identity_size_or_
         .unwrap();
         let before = fs::read(dir.path().join("fresh-agent-state.json")).unwrap();
         let result = actor.snapshot().await;
-        assert_eq!(result.is_ok(), scenario == "live", "{scenario}");
+        assert_eq!(
+            result.is_ok(),
+            matches!(scenario, "live" | "large"),
+            "{scenario}"
+        );
         if let Ok(snapshot) = result {
             assert_eq!(snapshot["threadId"], "snapshot-native");
+            if scenario == "large" {
+                assert_eq!(
+                    snapshot["turns"].as_str().unwrap().len(),
+                    2 * freshell_runtime_protocol::MAX_CONTROL_FRAME_BYTES
+                );
+            }
         }
         assert_eq!(
             fs::read(dir.path().join("fresh-agent-state.json")).unwrap(),

@@ -1008,7 +1008,10 @@ impl RuntimeClient {
         body: AdminCommand,
     ) -> Result<AdminResult, ClientError> {
         let mut stream = UnixStream::connect(self.socket_path.as_ref()).await?;
-        let reply_limit = if matches!(body, AdminCommand::FreshAgentReadHistory(_)) {
+        let reply_limit = if matches!(
+            body,
+            AdminCommand::FreshAgentReadHistory(_) | AdminCommand::FreshAgentReadSnapshot(_)
+        ) {
             freshell_runtime_protocol::MAX_NATIVE_HISTORY_FRAME_BYTES
         } else {
             freshell_runtime_protocol::MAX_CONTROL_FRAME_BYTES
@@ -1042,6 +1045,39 @@ mod tests {
         read_frame, write_frame, AdminReply, AdminResult, InstallationId,
     };
     use tokio::net::UnixListener;
+
+    #[tokio::test]
+    async fn snapshot_reply_preserves_large_history_over_the_control_socket() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("control.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let expected = serde_json::json!({"threadId":"native-large", "turns":[{"text":"x".repeat(2 * freshell_runtime_protocol::MAX_CONTROL_FRAME_BYTES)}]});
+        let sent = expected.clone();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let envelope: Envelope<AdminCommand> = read_frame(&mut stream).await.unwrap();
+            assert!(matches!(
+                envelope.body,
+                AdminCommand::FreshAgentReadSnapshot(_)
+            ));
+            freshell_runtime_protocol::write_frame_with_limit(
+                &mut stream,
+                &AdminReply {
+                    request_id: envelope.request_id,
+                    result: Ok(AdminResult::FreshAgentSnapshot(sent)),
+                },
+                freshell_runtime_protocol::MAX_NATIVE_HISTORY_FRAME_BYTES,
+            )
+            .await
+        });
+        let client = RuntimeClient::new(&socket, "0123456789abcdef");
+        *client.control_epoch.write().await = Some(1);
+        let actual = client
+            .fresh_agent_snapshot(SoulId::parse("large-soul").unwrap())
+            .await;
+        let _ = server.await.unwrap();
+        assert_eq!(actual.unwrap(), expected);
+    }
 
     #[tokio::test]
     async fn health_authenticates_and_caches_epoch() {

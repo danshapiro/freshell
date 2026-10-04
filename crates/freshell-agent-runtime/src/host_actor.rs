@@ -900,14 +900,14 @@ impl FreshAgentHostActor {
         {
             return Err(ActorError::NativeIdentityMismatch);
         }
-        // Preserve the control frame budget, including envelope overhead.
+        // Snapshots use the existing native-history reply allowance, including envelope overhead.
         if serde_json::to_vec(&snapshot)
             .map_err(|error| ActorError::Transport(error.to_string()))?
             .len()
-            > freshell_runtime_protocol::MAX_CONTROL_FRAME_BYTES - 4096
+            > freshell_runtime_protocol::MAX_NATIVE_HISTORY_FRAME_BYTES - 4096
         {
             return Err(ActorError::Transport(
-                "provider snapshot exceeds control frame limit".into(),
+                "provider snapshot exceeds history reply frame limit".into(),
             ));
         }
         Ok(snapshot)

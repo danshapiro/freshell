@@ -215,9 +215,18 @@ async fn handle_connection(mut stream: UnixStream, state: Arc<HostState>) -> Res
             serde_json::json!({"errorCode":error.code,"message":error.message}),
         );
     }
-    write_frame(&mut stream, &HostReply { request_id, result })
-        .await
-        .map_err(|e| e.to_string())
+    let limit = if matches!(result, Ok(HostResult::FreshAgentSnapshot(_))) {
+        freshell_runtime_protocol::MAX_NATIVE_HISTORY_FRAME_BYTES
+    } else {
+        freshell_runtime_protocol::MAX_CONTROL_FRAME_BYTES
+    };
+    freshell_runtime_protocol::write_frame_with_limit(
+        &mut stream,
+        &HostReply { request_id, result },
+        limit,
+    )
+    .await
+    .map_err(|e| e.to_string())
 }
 
 async fn dispatch(
@@ -2880,7 +2889,7 @@ mod tests {
         async fn snapshot(&self) -> Result<serde_json::Value, String> {
             Ok(
                 serde_json::json!({"threadId":"fixture-native-thread","provider":"claude",
-                "sessionType":"freshclaude","status":"idle","turns":[{"turnId":"retained-rpc-turn"}]}),
+                "sessionType":"freshclaude","status":"idle","turns":[{"turnId":"retained-rpc-turn","text":"x".repeat(2 * freshell_runtime_protocol::MAX_CONTROL_FRAME_BYTES)}]}),
             )
         }
 
@@ -3044,19 +3053,31 @@ mod tests {
         .unwrap();
         assert!(matches!(rollback, HostResult::FreshAgentCommand { .. }));
         let before_snapshot = transport.dispatches.load(Ordering::SeqCst);
-        let snapshot = dispatch(
-            authenticated_host_envelope(
+        let (mut client_stream, server_stream) = UnixStream::pair().unwrap();
+        let serving = tokio::spawn(handle_connection(server_stream, state.clone()));
+        write_frame(
+            &mut client_stream,
+            &authenticated_host_envelope(
                 &state,
                 HostCommand::FreshAgentReadSnapshot {
                     incarnation_id: state.incarnation_id.clone(),
                 },
             ),
-            &state,
         )
         .await
         .unwrap();
-        assert!(matches!(snapshot, HostResult::FreshAgentSnapshot(value)
-            if value["threadId"] == "fixture-native-thread" && value["turns"][0]["turnId"] == "retained-rpc-turn"));
+        let snapshot: HostReply = freshell_runtime_protocol::read_frame_with_limit(
+            &mut client_stream,
+            freshell_runtime_protocol::MAX_NATIVE_HISTORY_FRAME_BYTES,
+        )
+        .await
+        .unwrap();
+        serving.await.unwrap().unwrap();
+        assert!(
+            matches!(snapshot.result.unwrap(), HostResult::FreshAgentSnapshot(value)
+            if value["threadId"] == "fixture-native-thread" && value["turns"][0]["turnId"] == "retained-rpc-turn"
+            && value["turns"][0]["text"].as_str().unwrap().len() == 2 * freshell_runtime_protocol::MAX_CONTROL_FRAME_BYTES)
+        );
         assert_eq!(transport.dispatches.load(Ordering::SeqCst), before_snapshot);
         assert_eq!(transport.stops.load(Ordering::SeqCst), 0);
         let capture = dispatch(

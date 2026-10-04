@@ -2304,7 +2304,10 @@ pub async fn serve_control(supervisor: Supervisor, socket_path: &Path) -> Result
                     )),
                 },
             };
-            let limit = if matches!(reply.result, Ok(AdminResult::FreshAgentHistory(_))) {
+            let limit = if matches!(
+                reply.result,
+                Ok(AdminResult::FreshAgentHistory(_) | AdminResult::FreshAgentSnapshot(_))
+            ) {
                 freshell_runtime_protocol::MAX_NATIVE_HISTORY_FRAME_BYTES
             } else {
                 freshell_runtime_protocol::MAX_CONTROL_FRAME_BYTES
@@ -2373,9 +2376,15 @@ pub(crate) async fn request_host_reply(
         write_frame(&mut stream, envelope)
             .await
             .map_err(|error| unreachable(error.to_string()))?;
-        let reply: HostReply = read_frame(&mut stream)
-            .await
-            .map_err(|error| unreachable(error.to_string()))?;
+        let reply_limit = if matches!(envelope.body, HostCommand::FreshAgentReadSnapshot { .. }) {
+            freshell_runtime_protocol::MAX_NATIVE_HISTORY_FRAME_BYTES
+        } else {
+            freshell_runtime_protocol::MAX_CONTROL_FRAME_BYTES
+        };
+        let reply: HostReply =
+            freshell_runtime_protocol::read_frame_with_limit(&mut stream, reply_limit)
+                .await
+                .map_err(|error| unreachable(error.to_string()))?;
         Ok(reply)
     })
     .await
@@ -2550,6 +2559,55 @@ mod host_ipc_timeout_tests {
     };
     use std::time::{Duration, Instant};
     use tokio::net::UnixListener;
+
+    #[tokio::test]
+    async fn snapshot_host_reply_preserves_large_history_and_controls_stay_bounded() {
+        for snapshot_read in [true, false] {
+            let dir = tempfile::tempdir().unwrap();
+            let socket = dir.path().join("host.sock");
+            let listener = UnixListener::bind(&socket).unwrap();
+            let expected = serde_json::json!({"threadId":"native-large", "turns":[{"text":"x".repeat(2 * freshell_runtime_protocol::MAX_CONTROL_FRAME_BYTES)}]});
+            let sent = expected.clone();
+            let server = tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let envelope: Envelope<HostCommand> =
+                    freshell_runtime_protocol::read_frame(&mut stream)
+                        .await
+                        .unwrap();
+                freshell_runtime_protocol::write_frame_with_limit(
+                    &mut stream,
+                    &freshell_runtime_protocol::HostReply {
+                        request_id: envelope.request_id,
+                        result: Ok(freshell_runtime_protocol::HostResult::FreshAgentSnapshot(
+                            sent,
+                        )),
+                    },
+                    freshell_runtime_protocol::MAX_NATIVE_HISTORY_FRAME_BYTES,
+                )
+                .await
+            });
+            let id = IncarnationId::parse("large-incarnation").unwrap();
+            let command = if snapshot_read {
+                HostCommand::FreshAgentReadSnapshot { incarnation_id: id }
+            } else {
+                HostCommand::Status { incarnation_id: id }
+            };
+            let reply = request_host_reply(
+                &socket,
+                &Envelope::new(RequestId::new(), ControlRole::Supervisor, command),
+                Duration::from_secs(10),
+            )
+            .await;
+            let _ = server.await.unwrap();
+            if snapshot_read {
+                assert!(
+                    matches!(reply.unwrap().result.unwrap(), freshell_runtime_protocol::HostResult::FreshAgentSnapshot(value) if value == expected)
+                );
+            } else {
+                assert_eq!(reply.unwrap_err().code, RuntimeErrorCode::HostUnreachable);
+            }
+        }
+    }
 
     /// A session host that accepts the connection and then never answers must
     /// NOT be able to hold the supervisor's authoritative stop hostage. The
