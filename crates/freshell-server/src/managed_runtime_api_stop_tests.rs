@@ -644,6 +644,104 @@ async fn restored_web_reads_exact_persisted_lost_native_history_without_starting
 }
 
 #[tokio::test]
+async fn restored_web_reads_large_retained_codex_history_without_source_or_registry_writes() {
+    use std::io::Write;
+    let temp = tempfile::tempdir().unwrap();
+    let (registry, before) = fixture_fresh_soul(
+        temp.path(),
+        false,
+        "codex",
+        "freshcodex",
+        "large-native-thread",
+    )
+    .await;
+    registry
+        .mark_recovery_blocked(
+            before.soul_id.clone(),
+            None,
+            RecoveryBlockReason::ProviderUnavailable,
+            vec!["fixture://provider-unavailable".into()],
+        )
+        .await
+        .unwrap();
+    let before = registry.inventory().await.unwrap().pop().unwrap();
+    let home = temp.path().join("owned-provider-store");
+    let directory = home.join(".codex/sessions/2026/10/03");
+    std::fs::create_dir_all(&directory).unwrap();
+    let path = directory.join("rollout-large-native-thread.jsonl");
+    let mut file = std::fs::File::create(&path).unwrap();
+    writeln!(
+        file,
+        "{}",
+        json!({"type":"session_meta","payload":{"id":"large-native-thread"}})
+    )
+    .unwrap();
+    let answer = "Actual saved answer\n".repeat(8000);
+    for index in 0..140 {
+        for row in [
+            json!({"type":"turn_context","payload":{"turn_id":format!("turn-{index}")}}),
+            json!({"type":"event_msg","payload":{"type":"user_message","message":"Repeated actual prompt"}}),
+            json!({"type":"event_msg","payload":{"type":"task_complete","last_agent_message":answer}}),
+        ] {
+            writeln!(file, "{row}").unwrap();
+        }
+    }
+    for row in [
+        json!({"type":"turn_context","payload":{"turn_id":"latest-turn"}}),
+        json!({"type":"response_item","payload":{"type":"message","id":"latest-prompt","role":"user","content":[{"type":"input_text","text":"Latest actual saved prompt"}]}}),
+        json!({"type":"response_item","payload":{"type":"function_call","call_id":"latest-tool","name":"exec_command","arguments":"{\"cmd\":\"pwd\"}"}}),
+        json!({"type":"response_item","payload":{"type":"function_call_output","call_id":"latest-tool","output":"/actual-workspace"}}),
+        json!({"type":"response_item","payload":{"type":"message","id":"latest-answer","role":"assistant","content":[{"type":"output_text","text":"Latest actual saved answer"}]}}),
+    ] {
+        writeln!(file, "{row}").unwrap();
+    }
+    drop(file);
+    let source_before = std::fs::read(&path).unwrap();
+    assert!(source_before.len() as u64 > freshell_freshagent::native_history::MAX_HISTORY_BYTES);
+    let modified = std::fs::metadata(&path).unwrap().modified().unwrap();
+    let backend = Arc::new(StopBackend {
+        history_home: Some(home),
+        ..Default::default()
+    });
+    let (socket, control) = start_control(temp.path(), registry.clone(), backend.clone()).await;
+    let router = web_router(&socket, temp.path()).await;
+    let response = router
+        .oneshot(
+            Request::builder()
+                .uri(format!("/api/runtime/souls/{}/history", before.soul_id))
+                .header("x-auth-token", "web-token")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    assert!((bytes.len() as u64) < freshell_freshagent::native_history::MAX_HISTORY_BYTES);
+    let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(body["threadId"], "large-native-thread");
+    assert_eq!(
+        body["extensions"]["codex"]["nativeHistoryRetention"]["partial"],
+        true
+    );
+    assert_eq!(body["capabilities"]["send"], false);
+    let text = body["turns"].to_string();
+    assert!(text.contains("Latest actual saved prompt"));
+    assert!(text.contains("Latest actual saved answer"));
+    assert!(text.contains("latest-tool"));
+    assert!(text.contains("/actual-workspace"));
+    assert_eq!(std::fs::read(&path).unwrap(), source_before);
+    assert_eq!(
+        std::fs::metadata(&path).unwrap().modified().unwrap(),
+        modified
+    );
+    assert_eq!(registry.inventory().await.unwrap().pop().unwrap(), before);
+    assert!(backend.stopped.lock().unwrap().is_empty());
+    control.abort();
+    let _ = control.await;
+}
+
+#[tokio::test]
 async fn unavailable_runtime_and_invalid_mutation_keep_their_http_error_contracts() {
     let root = tempfile::tempdir().unwrap();
     let (tx, _) = tokio::sync::broadcast::channel(16);

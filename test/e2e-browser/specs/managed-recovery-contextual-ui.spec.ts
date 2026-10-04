@@ -178,8 +178,11 @@ test('fresh-agent: cold lost pane without a soul retains saved history and a clo
   const tools = await fs.readFile('test/fixtures/managed-native-history/codex-tools.jsonl', 'utf8')
   const transcript = events.replace('session-activity', SESSION_ID)
     .replace('Sanitized completion', SAVED_HISTORY_TEXT) + tools.split('\n').slice(1).join('\n')
+    + '\n' + JSON.stringify({ type: 'response_item', payload: { type: 'function_call', call_id: 'large-history-tool', name: 'exec_command', arguments: '{"cmd":"pwd"}' } })
+    + '\n' + JSON.stringify({ type: 'response_item', payload: { type: 'function_call_output', call_id: 'large-history-tool', output: 'Saved large tool output '.repeat(800_000) } })
   const rollout = path.join(sessions, `rollout-${SESSION_ID}.jsonl`)
   await fs.writeFile(rollout, transcript)
+  expect(Buffer.byteLength(transcript)).toBeGreaterThan(16 * 1024 * 1024)
   const modified = (await fs.stat(rollout)).mtimeMs
   let stopRequests = 0
   await page.route('**/api/runtime/souls/*/stop', async (route) => {
@@ -195,6 +198,9 @@ test('fresh-agent: cold lost pane without a soul retains saved history and a clo
   await expect(page.getByText('Sanitized prompt', { exact: true })).toBeVisible()
   await expect(page.getByText(SAVED_HISTORY_TEXT, { exact: true })).toBeVisible()
   expect(snapshot.extensions.codex.nativeHistoryAvailable).toBe(true)
+  expect(snapshot.extensions.codex.nativeHistoryRetention.partial).toBe(true)
+  expect(snapshot.turns.flatMap((turn: { items: Array<{ id: string }> }) => turn.items).some((item: { id: string }) => item.id === 'large-history-tool')).toBe(true)
+  await expect(page.getByRole('note', { name: 'Retained conversation history' })).toContainText('The saved conversation has not been changed.')
   const closeWarning = page.getByText('Close failed: Previous close was not confirmed', { exact: true })
   await expect(closeWarning).toBeVisible()
   const before = await paneContent(page)

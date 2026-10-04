@@ -6892,6 +6892,28 @@ describe('FreshAgentView', () => {
     { id: 'retained-turn', role: 'assistant', items: [{ id: 'retained-text', kind: 'text', text: 'Conversation retained before starting new' }] },
   ] }
 
+  it.each([['freshclaude', 'claude'], ['kilroy', 'claude'], ['freshcodex', 'codex'], ['freshopencode', 'opencode']] as const)('explains retained %s history without permitting writes or replacing the conversation', async (sessionType, provider) => {
+    const store = createStore()
+    apiMock.getFreshAgentThreadSnapshot.mockResolvedValue({ ...retainedBeforeStartNewSnapshot, provider, sessionType,
+      threadId: CLAUDE_RESTORE_THREAD_ID, sessionId: CLAUDE_RESTORE_THREAD_ID, revision: 1,
+      extensions: { [provider]: { nativeHistoryAvailable: true, nativeHistoryRetention: { partial: true,
+        omittedNativeTurns: 12, omittedItems: 0, omittedBodies: 1, firstTurnId: 'retained-turn', lastTurnId: 'retained-turn' } } },
+      capabilities: { send: false, interrupt: false, fork: false },
+    })
+    const content = { kind: 'fresh-agent' as const, sessionType, provider, createRequestId: 'retained-history-create',
+      sessionRef: { provider, sessionId: CLAUDE_RESTORE_THREAD_ID }, status: 'error' as const,
+      recoverySummary: { desiredState: 'stopped' as const, recoveryState: 'lost' as const,
+        durabilityState: 'resume_captured' as const, allocationState: 'verified_durable' as const } }
+    store.dispatch(initLayout({ tabId: 'tab-1', paneId: 'pane-1', content }))
+    render(<Provider store={store}><StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" /></Provider>)
+    expect(await screen.findByText('Conversation retained before starting new')).toBeInTheDocument()
+    expect(screen.getByRole('note', { name: 'Retained conversation history' })).toHaveTextContent(
+      'Showing retained conversation history. Older turns or large content were omitted from this view. The saved conversation has not been changed.')
+    expect(screen.getByRole('textbox', { name: 'Chat message input' })).toBeDisabled()
+    expect(getFreshAgentPaneContent(store)).toEqual(content)
+    expect(wsMock.send).not.toHaveBeenCalledWith(expect.objectContaining({ type: expect.stringMatching(/^freshAgent\.|^pane\.reconcile/) }))
+  })
+
   it('reads a cold lost conversation without a soul as history without adopting live status or starting a runtime', async () => {
     const store = createStore()
     apiMock.getFreshAgentThreadSnapshot.mockResolvedValue({ ...retainedBeforeStartNewSnapshot,

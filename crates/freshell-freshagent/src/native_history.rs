@@ -1,7 +1,12 @@
 //! Read a selected native transcript without creating a provider runtime.
 use rusqlite::{Connection, OpenFlags, OptionalExtension};
 use serde_json::{json, Value};
-use std::{io::Read, path::Path};
+use std::{collections::VecDeque, io::Read, path::Path};
+
+#[path = "native_history_source.rs"]
+mod source;
+pub(crate) use source::Records;
+pub(crate) const RETAINED_TURN_BYTES: usize = MAX_HISTORY_BYTES as usize / 4;
 
 pub const MAX_HISTORY_BYTES: u64 = 16 * 1024 * 1024;
 
@@ -34,14 +39,199 @@ pub(crate) fn readonly_snapshot(provider: &str, mut snapshot: Value) -> Result<V
     };
     snapshot["extensions"][wire_provider]["ownerKind"] = json!("vacant");
     snapshot["extensions"][wire_provider]["nativeHistoryAvailable"] = json!(true);
-    if serde_json::to_vec(&snapshot)
-        .map_err(|e| e.to_string())?
-        .len() as u64
-        > MAX_HISTORY_BYTES
-    {
-        return Err("native transcript exceeds history read limit".into());
-    }
+    finish_retention(provider, &mut snapshot, 0, 0)?;
     Ok(snapshot)
+}
+
+/// A display window, measured in serialized bytes, preserving original ordinals.
+pub(crate) struct RetainedTurns {
+    values: VecDeque<(Value, usize)>,
+    bytes: usize,
+    pub(crate) omitted: usize,
+}
+
+impl RetainedTurns {
+    pub(crate) fn new() -> Self {
+        Self {
+            values: VecDeque::new(),
+            bytes: 0,
+            omitted: 0,
+        }
+    }
+    pub(crate) fn push(&mut self, mut value: Value) {
+        if serde_json::to_vec(&value).unwrap().len() > RETAINED_TURN_BYTES {
+            omit_large_bodies(&mut value);
+        }
+        let size = serde_json::to_vec(&value)
+            .expect("JSON value serializes")
+            .len();
+        self.bytes += size;
+        self.values.push_back((value, size));
+        while self.bytes > RETAINED_TURN_BYTES && self.values.len() > 1 {
+            self.bytes -= self.values.pop_front().unwrap().1;
+            self.omitted += 1;
+        }
+    }
+    pub(crate) fn values(self) -> Vec<Value> {
+        self.values.into_iter().map(|(value, _)| value).collect()
+    }
+}
+
+/// Preserve the item and native control metadata while omitting a display body.
+/// Used when a single task/message is larger than the retained window.
+pub(crate) fn omit_large_bodies(value: &mut Value) {
+    match value {
+        Value::Object(object) => {
+            for (key, value) in object {
+                if matches!(
+                    key.as_str(),
+                    "text"
+                        | "thinking"
+                        | "content"
+                        | "input"
+                        | "output"
+                        | "arguments"
+                        | "result"
+                        | "aggregatedOutput"
+                        | "contentItems"
+                ) && serde_json::to_vec(value).unwrap().len() > RETAINED_TURN_BYTES / 1024
+                {
+                    let marker = format!("{}body", source::OMITTED_BODY);
+                    *value = match value {
+                        Value::Array(array) => {
+                            let mut first = array.first().cloned().unwrap_or(Value::Null);
+                            if let Some(object) = first.as_object_mut() {
+                                for key in ["text", "content", "thinking"] {
+                                    if object.contains_key(key) {
+                                        object.insert(key.into(), json!(marker));
+                                    }
+                                }
+                                json!([first])
+                            } else {
+                                json!([marker])
+                            }
+                        }
+                        Value::Object(_) => json!({"Retained history":marker}),
+                        _ => json!(marker),
+                    };
+                } else {
+                    omit_large_bodies(value);
+                }
+            }
+        }
+        Value::Array(array) => {
+            for value in array {
+                omit_large_bodies(value);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn replace_omitted_bodies(value: &mut Value) -> usize {
+    match value {
+        Value::String(text)
+            if text.split(source::OMITTED_BODY).skip(1).any(|suffix| {
+                suffix.starts_with("body")
+                    || suffix.starts_with("collection")
+                    || suffix
+                        .get(..64)
+                        .is_some_and(|digest| digest.bytes().all(|byte| byte.is_ascii_hexdigit()))
+            }) =>
+        {
+            *text = "[Content omitted from retained history]".into();
+            1
+        }
+        Value::Array(values) => values.iter_mut().map(replace_omitted_bodies).sum(),
+        Value::Object(values) => values
+            .iter_mut()
+            .map(|(key, value)| {
+                let count = replace_omitted_bodies(value);
+                if key == "summary" {
+                    0
+                } else {
+                    count
+                }
+            })
+            .sum(),
+        _ => 0,
+    }
+}
+
+pub(crate) fn finish_retention(
+    provider: &str,
+    snapshot: &mut Value,
+    omitted_turns: usize,
+    omitted_items: usize,
+) -> Result<(), String> {
+    let provider = if provider == "kilroy" {
+        "claude"
+    } else {
+        provider
+    };
+    let old = &snapshot["extensions"][provider]["nativeHistoryRetention"];
+    let mut omitted_turns =
+        omitted_turns + old["omittedNativeTurns"].as_u64().unwrap_or(0) as usize;
+    let omitted_items = omitted_items + old["omittedItems"].as_u64().unwrap_or(0) as usize;
+    let omitted_bodies =
+        old["omittedBodies"].as_u64().unwrap_or(0) as usize + replace_omitted_bodies(snapshot);
+    // Reserve framing and retention metadata before the helper's stdout boundary.
+    while serde_json::to_vec(snapshot)
+        .map_err(|e| e.to_string())?
+        .len()
+        > MAX_HISTORY_BYTES as usize - 4096
+    {
+        let key = if snapshot["rolledBackTurns"]
+            .as_array()
+            .is_some_and(|turns| turns.len() > 1)
+        {
+            "rolledBackTurns"
+        } else {
+            "turns"
+        };
+        let turns = snapshot[key]
+            .as_array_mut()
+            .ok_or("native history has no retained display turns")?;
+        if turns.len() <= 1 {
+            return Err("native history metadata exceeds display budget".into());
+        }
+        let ordinal = turns[0]["ordinal"].clone();
+        let native_id = turns[0]["turnId"].as_str().unwrap_or("").to_owned();
+        let native_id = native_id
+            .rsplit_once(":row-")
+            .filter(|(_, row)| row.parse::<usize>().is_ok())
+            .map(|(id, _)| id.to_owned())
+            .unwrap_or(native_id);
+        let before = turns.len();
+        if provider == "codex" {
+            turns.retain(|turn| {
+                let id = turn["turnId"].as_str().unwrap_or("");
+                id != native_id
+                    && !id
+                        .strip_prefix(&native_id)
+                        .is_some_and(|suffix| suffix.starts_with(":row-"))
+            });
+        } else {
+            turns.retain(|turn| turn["ordinal"] != ordinal);
+        }
+        omitted_turns += usize::from(turns.len() != before);
+    }
+    if omitted_turns + omitted_items + omitted_bodies > 0 {
+        snapshot["extensions"][provider]["nativeHistoryRetention"] = json!({
+            "partial":true, "omittedNativeTurns":omitted_turns, "omittedItems":omitted_items,
+            "omittedBodies":omitted_bodies,
+            "firstTurnId":snapshot["turns"].as_array().and_then(|turns| turns.first()).map(|turn| turn["turnId"].clone()),
+            "lastTurnId":snapshot["turns"].as_array().and_then(|turns| turns.last()).map(|turn| turn["turnId"].clone()),
+        });
+        tracing::info!(
+            provider,
+            omitted_turns,
+            omitted_items,
+            omitted_bodies,
+            "freshagent.native_history.retained_window"
+        );
+    }
+    Ok(())
 }
 
 fn read_opencode(home: &Path, id: &str) -> Result<Value, String> {
@@ -109,40 +299,47 @@ fn read_opencode(home: &Path, id: &str) -> Result<Value, String> {
     if info["revert"].is_null() {
         info.as_object_mut().unwrap().remove("revert");
     }
-    let mut messages = Vec::new();
-    let mut bytes = 0u64;
+    let mut active = RetainedTurns::new();
+    let mut rolled_back = RetainedTurns::new();
+    let mut omitted_parts = 0;
+    let pointer = info.pointer("/revert/messageID").and_then(Value::as_str);
+    let mut after_revert = false;
     let mut statement = connection
-        .prepare("SELECT id, data FROM message WHERE session_id = ?1 ORDER BY time_created, id")
+        .prepare("SELECT id FROM message WHERE session_id = ?1 ORDER BY time_created, id")
         .map_err(|e| e.to_string())?;
     let rows = statement
-        .query_map([id], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-        })
+        .query_map([id], |row| row.get::<_, String>(0))
         .map_err(|e| e.to_string())?;
-    for row in rows {
-        let (message_id, text) = row.map_err(|e| e.to_string())?;
-        bytes += text.len() as u64;
-        let mut message: Value = serde_json::from_str(&text).map_err(|e| e.to_string())?;
+    for (ordinal, row) in rows.enumerate() {
+        let message_id = row.map_err(|e| e.to_string())?;
+        after_revert |= pointer == Some(message_id.as_str());
+        let (mut message, mut source_omissions) =
+            read_sql_json(&connection, "message", &message_id)?;
         message["id"] = json!(message_id);
-        let mut parts = Vec::new();
-        let mut statement = connection.prepare("SELECT id, data FROM part WHERE session_id = ?1 AND message_id = ?2 ORDER BY time_created, id")
-            .map_err(|e| e.to_string())?;
+        let mut parts = RetainedTurns::new();
+        let mut statement = connection.prepare("SELECT id FROM part WHERE session_id = ?1 AND message_id = ?2 ORDER BY time_created, id").map_err(|e| e.to_string())?;
         let rows = statement
-            .query_map([id, &message_id], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-            })
+            .query_map([id, &message_id], |row| row.get::<_, String>(0))
             .map_err(|e| e.to_string())?;
         for row in rows {
-            let (part_id, text) = row.map_err(|e| e.to_string())?;
-            bytes += text.len() as u64;
-            if bytes > MAX_HISTORY_BYTES {
-                return Err("native transcript exceeds history read limit".into());
-            }
-            let mut part: Value = serde_json::from_str(&text).map_err(|e| e.to_string())?;
+            let part_id = row.map_err(|e| e.to_string())?;
+            let (mut part, omitted) = read_sql_json(&connection, "part", &part_id)?;
+            source_omissions += omitted;
             part["id"] = json!(part_id);
             parts.push(part);
         }
-        messages.push(json!({"info":message,"parts":parts}));
+        omitted_parts += parts.omitted;
+        let message = json!({"info":message,"parts":parts.values()});
+        if let Some(mut turn) = crate::opencode_message_turn_json(&message, ordinal) {
+            omitted_parts += source_omissions;
+            if after_revert {
+                turn["rolledBack"] = json!(true);
+                turn["restorable"] = json!(false);
+                rolled_back.push(turn);
+            } else {
+                active.push(turn);
+            }
+        }
     }
     if immutable {
         let current = std::fs::metadata(&path).map_err(|e| e.to_string())?;
@@ -157,12 +354,38 @@ fn read_opencode(home: &Path, id: &str) -> Result<Value, String> {
             );
         }
     }
-    Ok(crate::build_opencode_snapshot_json(
-        id,
-        &info,
-        &json!(messages),
-        None,
-    ))
+    let omitted = active.omitted + rolled_back.omitted;
+    let active = active.values();
+    let rolled_back = rolled_back.values();
+    let mut snapshot = crate::build_opencode_snapshot_json(id, &info, &json!([]), None);
+    snapshot["latestTurnId"] = active
+        .last()
+        .map(|turn| turn["turnId"].clone())
+        .unwrap_or(Value::Null);
+    snapshot["turns"] = json!(active);
+    if !rolled_back.is_empty() {
+        snapshot["rolledBackTurns"] = json!(rolled_back);
+    }
+    finish_retention("opencode", &mut snapshot, omitted, omitted_parts)?;
+    Ok(snapshot)
+}
+
+/// SQLite TEXT can itself be huge; read exact UTF-8 bytes in chunks inside the
+/// same read transaction instead of allocating an entire row before clipping.
+fn read_sql_json(connection: &Connection, table: &str, id: &str) -> Result<(Value, usize), String> {
+    let query = if table == "message" {
+        "SELECT rowid FROM message WHERE id=?1"
+    } else {
+        "SELECT rowid FROM part WHERE id=?1"
+    };
+    let rowid = connection
+        .query_row(query, [id], |row| row.get::<_, i64>(0))
+        .map_err(|e| e.to_string())?;
+    let blob = connection
+        .blob_open(rusqlite::DatabaseName::Main, table, "data", rowid, true)
+        .map_err(|e| e.to_string())?;
+    source::bounded_value(std::io::BufReader::with_capacity(64 * 1024, blob))
+        .map_err(|e| e.to_string())
 }
 
 fn read_claude(home: &Path, id: &str, provider: &str) -> Result<Value, String> {
@@ -170,31 +393,45 @@ fn read_claude(home: &Path, id: &str, provider: &str) -> Result<Value, String> {
         .ok_or("saved native session not found")?;
     let file = std::fs::File::open(path).map_err(|e| e.to_string())?;
     let metadata = file.metadata().map_err(|e| e.to_string())?;
-    if metadata.len() > MAX_HISTORY_BYTES {
-        return Err("native transcript exceeds history read limit".into());
+    let extent = metadata.len();
+    let source = Records::new(std::io::BufReader::new(file.take(extent)));
+    let mut turns = RetainedTurns::new();
+    let mut ordinal = 0;
+    let mut omitted_items = 0;
+    for record in source {
+        let Some((record, omitted)) = record.map_err(|e| e.to_string())? else {
+            continue;
+        };
+        if let Some(turn) = crate::claude_snapshot::parse_transcript_turn(&record, id, ordinal) {
+            omitted_items += omitted;
+            turns.push(turn);
+            ordinal += 1;
+        }
     }
-    let mut transcript = String::new();
-    file.take(MAX_HISTORY_BYTES + 1)
-        .read_to_string(&mut transcript)
-        .map_err(|e| e.to_string())?;
-    if transcript.len() as u64 > MAX_HISTORY_BYTES {
-        return Err("native transcript exceeds history read limit".into());
-    }
+    let omitted = turns.omitted;
+    let turns = turns.values();
     let revision = metadata
         .modified()
         .ok()
         .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
         .map(|duration| duration.as_millis().min(i64::MAX as u128) as i64)
         .unwrap_or(0);
-    Ok(crate::claude_snapshot::build_claude_snapshot_json(
+    let mut snapshot = crate::claude_snapshot::build_claude_snapshot_json(
         if provider == "kilroy" {
             "kilroy"
         } else {
             "freshclaude"
         },
         id,
-        &transcript,
+        "",
         revision,
         None,
-    ))
+    );
+    snapshot["latestTurnId"] = turns
+        .last()
+        .map(|turn| turn["turnId"].clone())
+        .unwrap_or(Value::Null);
+    snapshot["turns"] = json!(turns);
+    finish_retention(provider, &mut snapshot, omitted, omitted_items)?;
+    Ok(snapshot)
 }
