@@ -32,6 +32,25 @@ export interface CodexSessionSpec {
   archivedByProvider?: boolean
 }
 
+export interface CodexRolloutFixtureSpec {
+  sessionId: string
+  cwd: string
+  /** Explicit name lets tests make filename order disagree with event order. */
+  fileName: string
+  /** session_meta timestamp (also the wire createdAt). */
+  createdAt: number
+  userAt: number
+  assistantAt: number
+  userText: string
+  assistantText: string
+}
+
+export interface CodexContinuationFixtureSpec {
+  sessionId: string
+  cwd: string
+  segments: Array<Omit<CodexRolloutFixtureSpec, 'sessionId' | 'cwd'>>
+}
+
 const iso = (ms: number): string => new Date(ms).toISOString()
 
 /** 'YYYY/MM/DD' for the rollout date-dir layout. */
@@ -44,6 +63,76 @@ export function codexDatePath(ms: number): string {
 /** rollout-<iso with dashes instead of colons>-<id>.jsonl, real codex shape. */
 export function codexRolloutFileName(ms: number, sessionId: string): string {
   return `rollout-${iso(ms).replace(/:/g, '-').slice(0, 19)}-${sessionId}.jsonl`
+}
+
+/**
+ * Write one realistic VS Code Codex rollout file into an isolated test home.
+ * The fields intentionally match the 0.156 continuation evidence inspected
+ * for rrx7; text is synthetic and contains no provider transcript content.
+ */
+export async function writeCodexRolloutFixture(
+  homeDir: string,
+  spec: CodexRolloutFixtureSpec,
+): Promise<string> {
+  const dir = path.join(homeDir, '.codex', 'sessions', ...codexDatePath(spec.createdAt).split('/'))
+  await fsp.mkdir(dir, { recursive: true })
+  const file = path.join(dir, spec.fileName)
+  const records = [
+    {
+      timestamp: iso(spec.createdAt),
+      ordinal: 0,
+      type: 'session_meta',
+      payload: {
+        id: spec.sessionId,
+        session_id: spec.sessionId,
+        timestamp: iso(spec.createdAt),
+        cwd: spec.cwd,
+        source: 'vscode',
+        thread_source: 'user',
+        cli_version: '0.156.0',
+        originator: 'codex-vscode',
+        history_mode: 'paginated',
+      },
+    },
+    {
+      timestamp: iso(spec.userAt),
+      ordinal: 1,
+      type: 'response_item',
+      payload: {
+        type: 'message',
+        role: 'user',
+        content: [{ type: 'input_text', text: spec.userText }],
+      },
+    },
+    {
+      timestamp: iso(spec.assistantAt),
+      ordinal: 2,
+      type: 'response_item',
+      payload: {
+        type: 'message',
+        role: 'assistant',
+        content: [{ type: 'output_text', text: spec.assistantText }],
+      },
+    },
+  ]
+  await fsp.writeFile(file, `${records.map((record) => JSON.stringify(record)).join('\n')}\n`)
+  return file
+}
+
+/** Write a session's rollout segments into an isolated home in listed order. */
+export async function writeCodexContinuationFixtures(
+  homeDir: string,
+  spec: CodexContinuationFixtureSpec,
+): Promise<string[]> {
+  const files: string[] = []
+  for (const segment of spec.segments) {
+    files.push(await writeCodexRolloutFixture(homeDir, {
+      ...segment,
+      sessionId: spec.sessionId,
+      cwd: spec.cwd,
+    }))
+  }
+  return files
 }
 
 export async function writeCodexSession(
