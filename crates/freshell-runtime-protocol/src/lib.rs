@@ -13,6 +13,11 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 pub const CONTROL_PROTOCOL_VERSION: u32 = 1;
 pub const MAX_CONTROL_FRAME_BYTES: usize = 1024 * 1024;
 pub const MAX_NATIVE_HISTORY_FRAME_BYTES: usize = 32 * 1024 * 1024;
+pub const MAX_OPENCODE_TRANSFER_CHUNK_BYTES: usize = 256 * 1024;
+pub const MAX_OPENCODE_TRANSFER_BUNDLE_BYTES: u64 = 8 * 1024 * 1024 * 1024;
+pub const MAX_OPENCODE_TRANSFER_FILES: usize = 4096;
+pub const MAX_OPENCODE_TRANSFER_MANIFEST_BYTES: usize = 512 * 1024;
+pub const OPENCODE_TRANSFER_DESTINATION_DB: &str = ".local/share/opencode/opencode.db";
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -22,6 +27,10 @@ pub use fresh_agent_ops::*;
 #[cfg(test)]
 #[path = "fresh_agent_ops_tests.rs"]
 mod fresh_agent_ops_tests;
+
+#[cfg(test)]
+#[path = "opencode_transfer_tests.rs"]
+mod opencode_transfer_tests;
 
 macro_rules! string_id {
     ($name:ident, $prefix:literal) => {
@@ -1858,6 +1867,10 @@ pub struct TerminalLaunchSpec {
     pub provider_secret_references: Vec<ProviderSecretReference>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider_launch_context: Option<ProviderLaunchContext>,
+    /// Bounded metadata binding one exact native-history transfer to this
+    /// OpenCode terminal. The bundle bytes are never embedded here.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub opencode_transfer: Option<OpenCodeTransferDescriptor>,
 }
 
 impl TerminalLaunchSpec {
@@ -1877,6 +1890,17 @@ impl TerminalLaunchSpec {
                 RuntimeErrorCode::InvalidRequest,
                 "managed terminal launch has an empty/root-uid required field",
             ));
+        }
+        if let Some(transfer) = &self.opencode_transfer {
+            transfer.validate()?;
+            if self.mode != "opencode"
+                || self.resume_session_id.as_deref() != Some(transfer.root_session_id.as_str())
+            {
+                return Err(RuntimeError::new(
+                    RuntimeErrorCode::RecoveryWrongIdentity,
+                    "OpenCode transfer must match the resumed native session",
+                ));
+            }
         }
         if self.env.len() > 512
             || self.args.len() > 512
@@ -2398,6 +2422,363 @@ impl<T> Envelope<T> {
     }
 }
 
+/// Immutable source and destination binding for one OpenCode history import.
+/// It contains bounded metadata only; payload and asset bytes use the dedicated
+/// chunk commands below.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OpenCodeTransferDescriptor {
+    pub transfer_id: String,
+    pub provider: String,
+    pub source_store_id: String,
+    pub root_session_id: String,
+    pub source_generation: String,
+    pub provider_schema: String,
+    pub source_schema_fingerprint: String,
+    pub migration_journal_fingerprint: String,
+    pub destination_store_id: String,
+    pub destination_database_path: String,
+    pub target_image_ref: String,
+    pub target_build_receipt: String,
+    pub incarnation_id: String,
+    /// Serialized Task 1 manifest. It contains per-row digests and asset
+    /// metadata, never message or prompt bodies.
+    pub manifest_json: String,
+    pub files: Vec<OpenCodeTransferFile>,
+    pub total_bytes: u64,
+    /// SHA-256 over the manifest and ordered file metadata. Per-file SHA-256
+    /// values bind every transmitted byte.
+    pub bundle_sha256: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OpenCodeTransferFile {
+    pub index: u32,
+    pub relative_path: String,
+    pub size_bytes: u64,
+    pub sha256: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OpenCodeTransferChunk {
+    pub transfer_id: String,
+    pub sequence: u64,
+    pub file_index: u32,
+    pub offset: u64,
+    #[serde(with = "base64_bytes")]
+    pub data: Vec<u8>,
+    pub sha256: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "action", content = "data", rename_all = "snake_case")]
+pub enum OpenCodeTransferAction {
+    TargetInfo,
+    Begin(OpenCodeTransferDescriptor),
+    Chunk(OpenCodeTransferChunk),
+    Finalize { transfer_id: String },
+    Abort { transfer_id: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", content = "data", rename_all = "snake_case")]
+pub enum OpenCodeTransferResult {
+    TargetInfo {
+        image_ref: String,
+        provider_schema: String,
+        build_receipt: String,
+    },
+    Started {
+        next_sequence: u64,
+        file_offsets: Vec<OpenCodeTransferFileOffset>,
+    },
+    ChunkStored {
+        sequence: u64,
+    },
+    Queued {
+        transfer_id: String,
+    },
+    Ready {
+        transfer_id: String,
+    },
+    Aborted {
+        transfer_id: String,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OpenCodeTransferFileOffset {
+    pub file_index: u32,
+    pub next_offset: u64,
+}
+
+impl OpenCodeTransferDescriptor {
+    pub fn validate(&self) -> Result<(), RuntimeError> {
+        let invalid = || {
+            RuntimeError::new(
+                RuntimeErrorCode::InvalidRequest,
+                "OpenCode transfer descriptor is invalid or exceeds its bounds",
+            )
+        };
+        if self.transfer_id.is_empty()
+            || self.transfer_id.len() > 128
+            || !self
+                .transfer_id
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+            || self.provider != "opencode"
+            || !is_lower_hex_64(&self.source_store_id)
+            || self.root_session_id.is_empty()
+            || self.root_session_id.len() > 256
+            || self.source_generation.len() != 64
+            || self.provider_schema != "opencode-1.18.21"
+            || self.source_schema_fingerprint.len() != 64
+            || self.migration_journal_fingerprint.len() != 64
+            || self.destination_store_id.is_empty()
+            || self.destination_database_path != OPENCODE_TRANSFER_DESTINATION_DB
+            || !self.target_image_ref.starts_with("sha256:")
+            || self.target_image_ref.len() != "sha256:".len() + 64
+            || self.target_build_receipt.len() != 64
+            || self.incarnation_id.is_empty()
+            || self.manifest_json.len() > MAX_OPENCODE_TRANSFER_MANIFEST_BYTES
+            || self.files.is_empty()
+            || self.files.len() > MAX_OPENCODE_TRANSFER_FILES
+            || self.total_bytes == 0
+            || self.total_bytes > MAX_OPENCODE_TRANSFER_BUNDLE_BYTES
+            || !is_lower_hex_64(&self.source_generation)
+            || !is_lower_hex_64(&self.source_schema_fingerprint)
+            || !is_lower_hex_64(&self.migration_journal_fingerprint)
+            || !is_lower_hex_64(&self.target_build_receipt)
+            || !is_lower_hex_64(&self.bundle_sha256)
+            || !is_lower_hex_64(&self.target_image_ref["sha256:".len()..])
+            || self.target_build_receipt
+                != opencode_target_build_receipt(&self.target_image_ref, &self.provider_schema)
+        {
+            return Err(invalid());
+        }
+        IncarnationId::parse(self.incarnation_id.clone()).map_err(|_| invalid())?;
+
+        let manifest: serde_json::Value =
+            serde_json::from_str(&self.manifest_json).map_err(|_| invalid())?;
+        if manifest
+            .get("root_session_id")
+            .and_then(serde_json::Value::as_str)
+            != Some(self.root_session_id.as_str())
+            || manifest
+                .get("source_store_id")
+                .and_then(serde_json::Value::as_str)
+                != Some(self.source_store_id.as_str())
+            || manifest
+                .get("generation")
+                .and_then(serde_json::Value::as_str)
+                != Some(self.source_generation.as_str())
+            || manifest
+                .get("provider_schema")
+                .and_then(serde_json::Value::as_str)
+                != Some(self.provider_schema.as_str())
+            || manifest
+                .get("source_schema_fingerprint")
+                .and_then(serde_json::Value::as_str)
+                != Some(self.source_schema_fingerprint.as_str())
+            || manifest
+                .get("migration_journal_fingerprint")
+                .and_then(serde_json::Value::as_str)
+                != Some(self.migration_journal_fingerprint.as_str())
+            || manifest.get("version").and_then(serde_json::Value::as_u64) != Some(1)
+            || manifest
+                .get("payload_bytes")
+                .and_then(serde_json::Value::as_u64)
+                != self.files.first().map(|file| file.size_bytes)
+            || manifest
+                .get("payload_sha256")
+                .and_then(serde_json::Value::as_str)
+                != self.files.first().map(|file| file.sha256.as_str())
+        {
+            return Err(invalid());
+        }
+
+        let assets = manifest
+            .get("assets")
+            .and_then(serde_json::Value::as_array)
+            .ok_or_else(invalid)?;
+        let mut seen_indices = std::collections::BTreeSet::new();
+        let mut seen_paths = std::collections::BTreeSet::new();
+        let mut asset_metadata = std::collections::BTreeSet::new();
+        let mut total = 0_u64;
+        for (position, file) in self.files.iter().enumerate() {
+            let path = std::path::Path::new(&file.relative_path);
+            if file.index as usize != position
+                || !seen_indices.insert(file.index)
+                || !seen_paths.insert(file.relative_path.as_str())
+                || file.relative_path.is_empty()
+                || path.is_absolute()
+                || path
+                    .components()
+                    .any(|component| !matches!(component, std::path::Component::Normal(_)))
+                || file.size_bytes == 0
+                || !is_lower_hex_64(&file.sha256)
+            {
+                return Err(invalid());
+            }
+            total = total.checked_add(file.size_bytes).ok_or_else(invalid)?;
+        }
+        for asset in assets {
+            let kind = asset
+                .get("kind")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(invalid)?;
+            let path = asset
+                .get("target_relative_path")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(invalid)?;
+            let size = asset
+                .get("size_bytes")
+                .and_then(serde_json::Value::as_u64)
+                .ok_or_else(invalid)?;
+            let sha256 = asset
+                .get("sha256")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(invalid)?;
+            let relative = std::path::Path::new(path);
+            if kind.is_empty()
+                || path.is_empty()
+                || relative.is_absolute()
+                || relative
+                    .components()
+                    .any(|component| !matches!(component, std::path::Component::Normal(_)))
+                || size == 0
+                || !is_lower_hex_64(sha256)
+                || !asset_metadata.insert((path.to_string(), size, sha256.to_string()))
+            {
+                return Err(invalid());
+            }
+        }
+        if self.files.iter().skip(1).any(|file| {
+            !asset_metadata.contains(&(
+                file.relative_path.clone(),
+                file.size_bytes,
+                file.sha256.clone(),
+            ))
+        }) {
+            return Err(invalid());
+        }
+        if self.files[0].index != 0
+            || self.files[0].relative_path != "payload.json"
+            || total != self.total_bytes
+            || self.bundle_sha256
+                != opencode_transfer_bundle_digest(&self.manifest_json, &self.files)
+        {
+            return Err(invalid());
+        }
+        Ok(())
+    }
+
+    pub fn validate_launch_binding(
+        &self,
+        provider: &str,
+        root_session_id: &str,
+        destination_store_id: &str,
+        incarnation_id: &str,
+        image_ref: &str,
+    ) -> Result<(), RuntimeError> {
+        self.validate()?;
+        if provider != self.provider
+            || root_session_id != self.root_session_id
+            || destination_store_id != self.destination_store_id
+            || incarnation_id != self.incarnation_id
+            || image_ref != self.target_image_ref
+        {
+            return Err(RuntimeError::new(
+                RuntimeErrorCode::RecoveryWrongIdentity,
+                "OpenCode transfer does not match the launch identity or target image",
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl OpenCodeTransferChunk {
+    pub fn validate(&self) -> Result<(), RuntimeError> {
+        if self.transfer_id.is_empty()
+            || self.transfer_id.len() > 128
+            || self.data.is_empty()
+            || self.data.len() > MAX_OPENCODE_TRANSFER_CHUNK_BYTES
+            || !is_lower_hex_64(&self.sha256)
+            || self.sha256 != sha256_hex(&self.data)
+        {
+            return Err(RuntimeError::new(
+                RuntimeErrorCode::InvalidRequest,
+                "OpenCode transfer chunk is invalid or exceeds 256 KiB",
+            ));
+        }
+        Ok(())
+    }
+}
+
+pub fn opencode_transfer_bundle_digest(
+    manifest_json: &str,
+    files: &[OpenCodeTransferFile],
+) -> String {
+    let mut files = files.to_vec();
+    files.sort_by_key(|file| file.index);
+    let mut hasher = Sha256::new();
+    hasher.update(b"freshell-opencode-transfer-v1\0");
+    hasher.update(manifest_json.as_bytes());
+    hasher.update([0]);
+    for file in files {
+        hasher.update(file.index.to_be_bytes());
+        hasher.update(file.relative_path.as_bytes());
+        hasher.update([0]);
+        hasher.update(file.size_bytes.to_be_bytes());
+        hasher.update(file.sha256.as_bytes());
+        hasher.update([0]);
+    }
+    hex::encode(hasher.finalize())
+}
+
+pub fn opencode_target_build_receipt(image_ref: &str, provider_schema: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"freshell-opencode-import-build-v1\0");
+    hasher.update(image_ref.as_bytes());
+    hasher.update([0]);
+    hasher.update(provider_schema.as_bytes());
+    hex::encode(hasher.finalize())
+}
+
+fn is_lower_hex_64(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    hex::encode(Sha256::digest(bytes))
+}
+
+mod base64_bytes {
+    use base64::{engine::general_purpose::STANDARD, Engine};
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S>(bytes: &[u8], serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(&STANDARD.encode(bytes))
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<Vec<u8>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        STANDARD.decode(value).map_err(serde::de::Error::custom)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LaunchRequest {
@@ -2432,7 +2813,22 @@ impl LaunchRequest {
     pub fn validate_workload(&self) -> Result<(), RuntimeError> {
         match (&self.fixture, &self.terminal, &self.fresh_agent) {
             (Some(_), None, None) => Ok(()),
-            (None, Some(terminal), None) => terminal.validate(),
+            (None, Some(terminal), None) => {
+                terminal.validate()?;
+                if let Some(transfer) = &terminal.opencode_transfer {
+                    if self.provider != "opencode"
+                        || self.provider_store_id != transfer.destination_store_id
+                        || self.native_session_id.as_deref()
+                            != Some(transfer.root_session_id.as_str())
+                    {
+                        return Err(RuntimeError::new(
+                            RuntimeErrorCode::RecoveryWrongIdentity,
+                            "OpenCode transfer does not match the launch provider store or native session",
+                        ));
+                    }
+                }
+                Ok(())
+            }
             (None, None, Some(agent)) => {
                 agent.validate()?;
                 if self.provider != agent.provider.as_str()
@@ -2582,6 +2978,10 @@ pub struct QualificationWriterClaimEvidence {
 pub enum AdminCommand {
     Health,
     Launch(Box<LaunchRequest>),
+    /// Dedicated authenticated, bounded OpenCode-history transfer channel.
+    /// These chunk commands are never embedded in launch or host-control
+    /// frames; launch carries only the immutable descriptor.
+    OpenCodeTransfer(OpenCodeTransferAction),
     Stop(StopRequest),
     Inventory,
     InventorySnapshot,
@@ -2734,6 +3134,7 @@ pub enum AdminResult {
         installation_id: InstallationId,
     },
     Launch(LaunchResult),
+    OpenCodeTransfer(OpenCodeTransferResult),
     Stop {
         outcome: StopOutcome,
         view: RuntimeView,
@@ -3308,6 +3709,7 @@ mod tests {
             provider_bootstrap_files: Vec::new(),
             provider_secret_references: Vec::new(),
             provider_launch_context: None,
+            opencode_transfer: None,
         };
         assert!(spec.validate().is_ok());
         spec.provider_model = Some("bad\0model".into());

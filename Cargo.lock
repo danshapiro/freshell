@@ -1284,6 +1284,7 @@ dependencies = [
  "async-trait",
  "freshell-runtime-protocol",
  "freshell-sessions",
+ "hex",
  "libc",
  "rusqlite",
  "serde",
@@ -1422,6 +1423,8 @@ dependencies = [
 name = "freshell-runtime-protocol"
 version = "0.1.0"
 dependencies = [
+ "base64 0.22.1",
+ "hex",
  "hmac",
  "serde",
  "serde_json",
@@ -1491,6 +1494,7 @@ dependencies = [
  "freshell-runtime-protocol",
  "freshell-sessions",
  "freshell-terminal",
+ "hex",
  "libc",
  "rusqlite",
  "serde",
@@ -1535,6 +1539,7 @@ dependencies = [
  "freshell-agent-runtime",
  "freshell-runtime-observability",
  "freshell-runtime-protocol",
+ "hex",
  "libc",
  "rusqlite",
  "serde",
