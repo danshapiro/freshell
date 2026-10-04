@@ -38,6 +38,32 @@ vi.mock('@/lib/api', async () => {
 
 function renderHistoryView() {
   const projectPath = '/test/project'
+  const session = {
+    provider: 'claude' as const,
+    sessionId: 'session-123',
+    projectPath,
+    lastActivityAt: Date.now(),
+    title: 'Test Session',
+    summary: 'summary',
+  }
+  const projects = [
+    {
+      projectPath,
+      color: '#6b7280',
+      sessions: [session],
+    },
+  ]
+
+  // HistoryView loads its own window on mount. Keep that server response
+  // consistent with the session already present in this test's initial store.
+  apiMocks.fetchSidebarSessionsSnapshot.mockResolvedValueOnce({
+    projects,
+    totalSessions: 1,
+    oldestIncludedTimestamp: session.lastActivityAt,
+    oldestIncludedSessionId: session.sessionId,
+    hasMore: false,
+  })
+
   const store = configureStore({
     reducer: {
       sessions: sessionsReducer,
@@ -52,22 +78,7 @@ function renderHistoryView() {
       }),
     preloadedState: {
       sessions: {
-        projects: [
-          {
-            projectPath,
-            color: '#6b7280',
-            sessions: [
-              {
-                provider: 'claude',
-                sessionId: 'session-123',
-                projectPath,
-                lastActivityAt: Date.now(),
-                title: 'Test Session',
-                summary: 'summary',
-              },
-            ],
-          },
-        ],
+        projects,
         expandedProjects: new Set([projectPath]),
       },
       tabs: { tabs: [], activeTabId: null },
