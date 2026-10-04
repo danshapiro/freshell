@@ -960,7 +960,7 @@ impl ProviderSecretProfile {
     /// Provider-home path for a OneCLI file grant, including non-auth files
     /// such as the gateway CA certificate.
     pub fn provider_file_relative_path(self) -> Option<&'static str> {
-        self.auth_relative_path().or_else(|| match self {
+        self.auth_relative_path().or(match self {
             Self::OpencodeOnecliCaFile => Some(".config/onecli/gateway-ca.pem"),
             _ => None,
         })
