@@ -773,10 +773,8 @@ async fn stage_opencode_resume_bundle(
     let workspace_for_export = workspace.to_path_buf();
     let root_for_export = root_session_id.to_string();
     let snapshot = tokio::task::spawn_blocking(move || {
-        let inventory =
-            freshell_sessions::opencode_transfer::HostOpenCodeInventory::from_process_environment(
-                Vec::new(),
-            )
+        let inventory = freshell_sessions::opencode_transfer::HostOpenCodeInventory::from_process_environment_discovering_channels()
+            .map_err(|error| freshell_sessions::opencode_transfer::TransferError::Blocked(error.to_string()))?
             .with_trusted_mount_for_selected_session(workspace_for_export);
         freshell_sessions::opencode_transfer::export_exact_session(
             &inventory,

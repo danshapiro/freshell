@@ -21,6 +21,8 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tempfile::{Builder, TempDir};
 
+use crate::provider_layout::ProviderLayout;
+
 const EXPORT_VERSION: u32 = 1;
 const OPENCODE_SCHEMA_VERSION: &str = "opencode-1.18.21";
 const PINNED_SCHEMA_SQL: &str = include_str!("opencode_schema_v1_18_21.sql");
@@ -206,6 +208,53 @@ impl HostOpenCodeInventory {
             std::env::var_os("OPENCODE_DB").filter(|value| !value.is_empty());
         inventory.channel_databases = channel_databases;
         inventory
+    }
+
+    /// Build the production inventory from the trusted OpenCode data home.
+    /// OpenCode names non-default installation stores `opencode-<channel>.db`;
+    /// every such database and the default store must be considered together
+    /// so exact-root resolution can reject duplicate ownership.
+    pub fn discover_in_data_home(data_home: &Path) -> Result<Self, TransferError> {
+        let default_database = crate::provider_layout::OpencodeLayout.session_root(data_home);
+        let mut inventory = Self::new(default_database);
+        let entries = match fs::read_dir(data_home) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(inventory),
+            Err(error) => return Err(error.into()),
+        };
+        let mut databases = Vec::new();
+        for entry in entries {
+            let entry = entry?;
+            let path = entry.path();
+            let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+                continue;
+            };
+            if name == "opencode.db"
+                || name.strip_prefix("opencode-").is_some_and(|channel_name| {
+                    !channel_name.is_empty() && channel_name.ends_with(".db")
+                })
+            {
+                databases.push(path);
+            }
+        }
+        databases.sort();
+        databases.dedup();
+        inventory.channel_databases = databases;
+        Ok(inventory)
+    }
+
+    /// Production constructor: an explicit provider override selects exactly
+    /// that store; otherwise discover the default and installation-channel
+    /// databases from OpenCode's trusted data-home layout.
+    pub fn from_process_environment_discovering_channels() -> Result<Self, TransferError> {
+        if let Some(value) = std::env::var_os("OPENCODE_DB").filter(|value| !value.is_empty()) {
+            let mut inventory =
+                Self::new(crate::parse::default_opencode_data_home().join("opencode.db"));
+            inventory.effective_database_override = Some(value);
+            inventory.working_directory = std::env::current_dir()?;
+            return Ok(inventory);
+        }
+        Self::discover_in_data_home(&crate::parse::default_opencode_data_home())
     }
 
     pub fn with_channel_database(mut self, path: PathBuf) -> Self {
