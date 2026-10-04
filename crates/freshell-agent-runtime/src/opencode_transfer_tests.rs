@@ -204,6 +204,29 @@ fn streamed_provider_import_hashes_the_pipe_and_rolls_back_a_truncated_payload()
 }
 
 #[test]
+fn destination_capacity_is_checked_before_parent_or_database_creation() {
+    struct NoCapacity;
+    impl DestinationCapacityProvider for NoCapacity {
+        fn available_bytes(&self, _existing_directory: &Path) -> io::Result<u64> {
+            Ok(0)
+        }
+    }
+
+    let fixture = fixture();
+    let payload = fs::read(fixture.staged_directory.join("entry-0000.bin")).unwrap();
+    assert!(import_bundle_payload_with_capacity(
+        &fixture.descriptor,
+        payload.as_slice(),
+        &fixture.destination_database,
+        &fixture.workspace,
+        &NoCapacity,
+    )
+    .is_err());
+    assert!(!fixture.destination_database.exists());
+    assert!(!fixture.destination_database.parent().unwrap().exists());
+}
+
+#[test]
 fn conflicting_primary_key_rolls_back_without_overwriting_destination_data() {
     let fixture = fixture();
     import_bundle(
@@ -256,18 +279,17 @@ fn installed_store_probe_reopens_exact_database_read_only_and_returns_no_body() 
     fs::create_dir_all(&xdg_config_home).unwrap();
     let uid = unsafe { libc::geteuid() };
     let gid = unsafe { libc::getegid() };
-    let receipt = verify_installed_store(
-        &fixture.descriptor,
-        &fixture.destination_database,
-        &fixture.workspace,
-        uid,
-        gid,
-        &home,
-        &xdg_data_home,
-        &xdg_config_home,
-        &fixture.workspace,
-    )
-    .unwrap();
+    let reader = super::InstalledStoreReaderContext {
+        database_path: &fixture.destination_database,
+        workspace_root: &fixture.workspace,
+        provider_uid: uid,
+        provider_gid: gid,
+        home,
+        xdg_data_home: &xdg_data_home,
+        xdg_config_home: &xdg_config_home,
+        cwd: &fixture.workspace,
+    };
+    let receipt = verify_installed_store(&fixture.descriptor, &reader).unwrap();
     assert_eq!(receipt.provider_uid, uid);
     assert_eq!(
         receipt.opencode_db,

@@ -34,6 +34,7 @@ tempfile = "3"
 [dev-dependencies]
 hex = "0.4"
 rusqlite = { version = "0.31", features = ["bundled"] }
+freshell-supervisor = { path = "../freshell-supervisor" }
 
 [[test]]
 name = "opencode_docker_contract"
