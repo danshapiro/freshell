@@ -133,37 +133,37 @@ git commit -m "feat(sessions): export exact OpenCode history snapshots"
 - Produces: an idempotent `ImportReceipt` proving the source snapshot's exact imported baseline is present in the destination, followed by a distinct `InstalledStoreReadable` receipt. The latter comes from a body-free, read-only native-reader probe qualified against the pinned OpenCode build and run against the exact installed generation under the actual provider UID, HOME/XDG, `OPENCODE_DB`, cwd, and relevant mounts. It must open the provider-selected destination DB and traverse the imported graph and required assets without returning message bodies or launching an agent. If that exact read check is unavailable or fails, the import remains blocked/retryable and cannot launch. Neither receipt claims that OpenCode has adopted the root.
 - Mount/lifetime: enforce an 8 GiB per-bundle ceiling, aggregate staging quota, and free-space check before install. The supervisor verifies the bundle and mounts only its exact directory read-only into the session-host container. In the actual managed Docker namespace mode, prove root session-host access and provider-UID denial. Do not use the 16 MiB private tmpfs, the writable runtime directory, the host-wide provider store, or a control frame for bundle bytes. Keep staged bytes until the durable import receipt is independently revalidated; on startup, revalidate or resume every referenced transfer before removing it.
 
-- [ ] **Step 1: Write failing protocol, import, and launch-order tests**
+- [x] **Step 1: Write failing protocol, import, and launch-order tests**
 
-Add protocol tests for an OpenCode-only transfer descriptor with exact provider/source/destination/root/incarnation binding, source schema fingerprint, target artifact receipt, and bounded metadata. Add streaming tests for chunk ordering, backpressure, digest mismatch, interruption/retry, queueing at the 16 GiB spool limit, free-space rejection, 8 GiB per-bundle bound, and no chunk larger than 256 KiB. Add mount-plan and disposable Docker tests in the managed runtime's actual namespace mode proving the exact staged directory is read-only, readable by the session-host UID, unavailable to the provider UID, and unrelated provider data is not mounted. Add destination tests for atomic DB rollback, idempotent identical transfer, conflict rejection, exact native graph/asset mapping, and destination path agreement with the managed `OPENCODE_DB`/XDG configuration. Exercise the `InstalledStoreReadable` probe with the actual provider UID and environment: root-level structural verification must not be sufficient when that identity cannot read the installed DB or any required asset. Assert the probe returns no bodies and launches no provider. Inject process crashes after each staged file write/sync/rename, asset publication, native DB transaction, each receipt publication, registry readiness commit, and before PTY spawn; every restart must reconstruct or reject state without Ready or overwrite. Against a disposable target image whose digest is bound to a build receipt, exercise provider-owned append, in-flight completion, metadata/context/todo/input updates, compaction, and revert with synthetic data and no model/network call; reopen after each transition and assert the typed evolution comparator, including a revert boundary that never removes pre-boundary rows. Never run the provider on the host source. The grant-handler event log must show `stage -> verify stage -> install assets -> import transaction -> structural verify -> provider-identity reader verify -> durable receipts -> PTY spawn`; no spawn for partial, unsupported, missing, unstable, incompatible, unreadable, or conflicting input.
+- Add protocol tests for an OpenCode-only transfer descriptor with exact provider/source/destination/root/incarnation binding, source schema fingerprint, target artifact receipt, and bounded metadata. Add streaming tests for chunk ordering, backpressure, digest mismatch, interruption/retry, queueing at the 16 GiB spool limit, free-space rejection, 8 GiB per-bundle bound, and no chunk larger than 256 KiB. Add mount-plan and disposable Docker tests in the managed runtime's actual namespace mode proving the exact staged directory is read-only, readable by the session-host UID, unavailable to the provider UID, and unrelated provider data is not mounted. Add destination tests for atomic DB rollback, idempotent identical transfer, conflict rejection, exact native graph/asset mapping, and destination path agreement with the managed `OPENCODE_DB`/XDG configuration. Exercise the `InstalledStoreReadable` probe with the actual provider UID and environment: root-level structural verification must not be sufficient when that identity cannot read the installed DB or any required asset. Assert the probe returns no bodies and launches no provider. Inject process crashes after each applicable staged file write/sync/rename, native DB transaction, host receipt/state publication, registry readiness commit, and immediately before PTY spawn; every restart must reconstruct or reject state without Ready or overwrite. The supported bundle stores workspace-file and Git-tree assets as references that are rehashed in place; it has no separate asset-publication operation, so test the actual referenced asset through import and provider-identity reads instead. Task 3 owns later typed history evolution tests (append, completion, metadata/context/todo/input updates, compaction, and revert boundaries). Never run the provider on the host source. The grant-handler event log must show `stage -> verify stage -> import transaction -> structural verify -> provider-identity reader verify -> durable receipts -> PTY spawn`; no spawn for partial, unsupported, missing, unstable, incompatible, unreadable, or conflicting input.
 
-- [ ] **Step 2: Run the focused tests and verify the intended failure**
+- [x] **Step 2: Run the focused tests and verify the intended failure**
 
 Run: `cargo test -p freshell-runtime-protocol opencode_session_transfer && cargo test -p freshell-session-host opencode_transfer`
 
 Expected: FAIL because the typed transfer reference, atomic importer, and pre-spawn ordering do not exist.
 
-- [ ] **Step 3: Add typed handoff, importer, and pre-spawn integration**
+- [x] **Step 3: Add typed handoff, importer, and pre-spawn integration**
 
-Add optional serde-compatible transfer metadata to the launch spec and persist only its descriptor. Stream chunks into a dedicated supervisor-owned persistent staging path with the 256 KiB chunk and 8 GiB bundle bounds, quota/free-space checks, and content digest; bind it to transfer ID, unique source-store identity/schema, root, destination, target image receipt, and incarnation. Expose exactly that staged bundle read-only to the trusted session host and verify the actual UID/mount behavior. Install validated immutable assets first using write-once/no-replace publication with file and directory sync; then insert native rows in one destination transaction without overwriting conflicting IDs. Independently compare every row and asset from a read-only connection, durably publish a local receipt, and only then permit PTY spawn and registry readiness. If a crash follows the DB commit but precedes the receipt, reconstruct a receipt only after a full rehash and structural compare; if any state differs, remain blocked. On every retry or restart, rehash staging and installed data before trusting the receipt. A same-generation retry is a verified no-op; a changed or conflicting generation blocks. Never use `ProviderBootstrapFile`, `ProviderConfigReference`, transcript projections, or a control frame for history bytes.
+Add optional serde-compatible transfer metadata to the launch spec and persist only its descriptor. Stream chunks into a dedicated supervisor-owned persistent staging path with the 256 KiB chunk and 8 GiB bundle bounds, quota/free-space checks, and content digest; bind it to transfer ID, unique source-store identity/schema, root, destination, target image receipt, and incarnation. Expose exactly that staged bundle read-only to the trusted session host and verify the actual UID/mount behavior. Validate supported workspace/Git asset references and their digests in place; no separate asset file is published. Then insert native rows in one destination transaction without overwriting conflicting IDs. Independently compare every row and referenced asset from a read-only connection, durably publish a local receipt, and only then permit PTY spawn and registry readiness. If a crash follows the DB commit but precedes the receipt, reconstruct a receipt only after a full rehash and structural compare; if any state differs, remain blocked. On every retry or restart, rehash staging and installed data before trusting the receipt. A same-generation retry is a verified no-op; a changed or conflicting generation blocks. Never use `ProviderBootstrapFile`, `ProviderConfigReference`, transcript projections, or a control frame for history bytes.
 
-- [ ] **Step 4: Run the focused tests**
+- [x] **Step 4: Run the focused tests**
 
 Run: `cargo test -p freshell-runtime-protocol opencode_session_transfer && cargo test -p freshell-agent-runtime opencode_transfer && cargo test -p freshell-session-host opencode_transfer`
 
 Expected: PASS for backward-compatible protocol round trips, atomic import, exact graph verification, idempotency/conflict handling, provider-identity native-reader access, and pre-spawn gating.
 
-- [ ] **Step 5: Refactor while green**
+- [x] **Step 5: Refactor while green**
 
 Consolidate manifest verification so the importer and recovery probe share one structural contract while each opens its own read-only DB connection. Make staged-bundle retention/restart cleanup refer to the durable transfer and import generations. Remove the staged copy only after the installed receipt has been durably reverified and no prepared retry references it. Re-run all focused tests.
 
-- [ ] **Step 6: Run impacted-test verification**
+- [x] **Step 6: Run impacted-test verification**
 
 Run: `cargo test -p freshell-runtime-protocol && cargo test -p freshell-agent-runtime && cargo test -p freshell-session-host && cargo test -p freshell-server`
 
 Expected: PASS for launch protocol compatibility, provider preparation, exact resume argument behavior, and server launch construction.
 
-- [ ] **Step 7: Commit the task**
+- [x] **Step 7: Commit the task**
 
 ```bash
 git add crates/freshell-runtime-protocol crates/freshell-server/src/managed_runtime.rs crates/freshell-supervisor/src/backend.rs crates/freshell-session-host crates/freshell-agent-runtime
@@ -173,8 +173,10 @@ git commit -m "feat(runtime): import OpenCode history before managed launch"
 ### Task 3: Separate Verified Import from Provider Adoption
 
 **Files:**
-- Modify: `crates/freshell-agent-runtime/src/lib.rs`
-- Modify: `crates/freshell-session-host/src/pty.rs`
+- Modify: `crates/freshell-agent-runtime/src/lib.rs` and `opencode_transfer.rs`
+- Modify: `crates/freshell-runtime-protocol/src/lib.rs` for launch and observation evidence
+- Modify: `crates/freshell-session-host/src/main.rs` and `pty.rs` for receipt handling and input gating
+- Modify: `crates/freshell-supervisor/src/recovery.rs` and `resume_catalog.rs` for current-generation verification and adoption gating
 - Modify: `extensions/opencode/freshell-rebind-plugin.ts`
 - Modify: `docs/development/runtime-provider-capabilities.json`
 - Modify: `test/unit/extensions/opencode-rebind-plugin.test.ts`
@@ -231,7 +233,7 @@ git commit -m "fix(runtime): require verified OpenCode history for readiness"
 - Modify: supervisor registry/recovery tests
 
 **Interfaces:**
-- Consumes: a captured durable tuple of control epoch, intent revision, identity revision, evidence/import revision, active incarnation, recovery attempt, exact native identity, and source/import generation, as applicable.
+- Consumes: a captured durable tuple of control epoch, persisted user-intent/correction revision, soul intent revision, identity revision, evidence/import revision, active incarnation, recovery attempt, exact native identity, and source/import generation, as applicable.
 - Produces: every participating write rejects stale observations by a SQLite compare-and-set in the same transaction that writes the result. A loss certificate is possible only for a previously verified materialized identity when the complete declared source inventory is authoritatively absent and the commit still matches the captured tuple. Pending first import, available, unresolved, unreadable, unsupported, expired stage, partial import, or legacy-unknown source state remains retryable/blocked.
 - Source ownership is keyed by `(provider, stable source-store identity, native root)` in a durable origin-owner table, separate from per-incarnation writer claims. Only one soul may prepare or commit adoption for an origin. Schema migration must not guess a winner: backfill claims only for unambiguous existing origins, leave duplicate roots explicitly unclaimed/ambiguous, and preserve both soul rows until the exact repair resolves them from permitted metadata. Do not use age, lexical IDs, or row order. Ambiguous metadata blocks restoration and preserves both rows.
 
@@ -247,7 +249,7 @@ Expected: FAIL because loss currently ignores allocation/durability state and it
 
 - [ ] **Step 3: Add a durable materialization/loss fence**
 
-Add a shared per-soul coordinator for mutating identity/import/dispatch/recovery operations, while the durable CAS remains the correctness boundary. Capture the expected generation tuple before asynchronous work and compare it in every commit that writes identity, resume evidence, import, loss, or restore state. Stop commits its intent revision before waiting for the coordinator so it can invalidate in-flight work; destructive cleanup then revalidates the same exact incarnation. Split locked and already-locked probe helpers to avoid nested non-reentrant mutex deadlocks. Writers must check affected-row counts. Add an origin-owner table and unique transaction claim; backfill only unique legacy origins and leave duplicate roots unclaimed for the explicit repair. Persist source/import verdicts and refresh authority; a missing path/error is `Unresolved`, not `Absent`. Add OpenCode `NativeImport`; require complete authoritative source absence before loss, and a full verified baseline before durable resume readiness. Requested identity or zero dispatch alone never enables a seed.
+Add a shared per-soul coordinator for mutating identity/import/dispatch/recovery operations, while the durable CAS remains the correctness boundary. Capture the expected generation tuple before asynchronous work and compare it in every commit that writes identity, resume evidence, import, loss, or restore state. Stop commits its intent revision before waiting for the coordinator so it can invalidate in-flight work; destructive cleanup then revalidates the same exact incarnation. A Stop or repair choice made while a soul is already Lost and stopped must still advance a persisted user-intent/correction revision; never infer the user's latest choice from a loss-generated tombstone. Split locked and already-locked probe helpers to avoid nested non-reentrant mutex deadlocks. Writers must check affected-row counts. Add an origin-owner table and unique transaction claim; backfill only unique legacy origins and leave duplicate roots unclaimed for the explicit repair. Persist source/import verdicts and refresh authority; a missing path/error is `Unresolved`, not `Absent`. Add OpenCode `NativeImport`; require complete authoritative source absence before loss, and a full verified baseline before durable resume readiness. Requested identity or zero dispatch alone never enables a seed.
 
 - [ ] **Step 4: Run focused tests**
 
@@ -280,6 +282,7 @@ git commit -m "fix(supervisor): fence managed OpenCode loss decisions"
 - Modify: `crates/freshell-supervisor/src/notice_outbox.rs`
 - Modify: `crates/freshell-supervisor/src/recovery.rs`
 - Modify: `crates/freshell-server/src/managed_runtime_api.rs`
+- Modify: `crates/freshell-runtime-protocol/src/lib.rs` and `crates/freshell-runtime-client/src/lib.rs` for the exact batch repair request/reply
 - Modify: supervisor and managed-runtime API tests
 
 **Interfaces:**
@@ -288,6 +291,7 @@ git commit -m "fix(supervisor): fence managed OpenCode loss decisions"
 - Withdrawal runs under one registry-owned export/retraction coordinator held from fresh authorization through every filesystem effect. Every exporter rechecks the exact current outbox/incident generation under that coordinator before writing. A durable progress record contains target IDs/generation/status/artifact names only, never a certificate or payload; startup resumes it before normal export draining. Delete the progress record after every target file/log update is synced and verified.
 - For each notice with false IDs, calculate the new deterministic notice identity from its surviving incident-ID set. Remove false-only notices; rebuild mixed notices without false IDs; redirect supersession edges and outbox projections. If several sanitized notices collapse to one ID, merge profile receipts by `dismissed > acknowledged > rendered > absent`, retaining terminal suppression and the latest timestamp for the chosen state. Do not retain old false-bearing notice IDs or weaken a terminal receipt.
 - Request boundary: add one authenticated batch operation such as `POST /api/runtime/soul-loss-repairs` that accepts only the exact eight `(soul_id, incident_id, expected_intent_revision)` targets and an operation idempotency key. Resolve source roots/stores server-side, reject any target-set mismatch or ambiguous owner, and return per-root import status plus final correction status. The route accepts no native filesystem path or transcript data.
+- Stopped repair path: the seven Lost souls need an explicit transfer/import/readability operation that does not use the normal launch/grant path, create a PTY, or start OpenCode. It must install the exact imported baseline into the canonical provider volume, run the body-free native-reader probe under that provider's actual UID/HOME/XDG/`OPENCODE_DB`/cwd/mounts, and persist receipts bound to the exact installed generation before the batch correction CAS. Root-side structural verification alone is insufficient. This path is required to produce the `ImportReceipt` and `InstalledStoreReadable` inputs described above.
 
 - [ ] **Step 1: Write failing restore and withdrawal tests**
 
@@ -339,6 +343,7 @@ git commit -m "feat(supervisor): restore souls and retract false loss incidents"
 **Interfaces:**
 - Consumes: production launch and restore behavior from tasks 1–5 and isolated synthetic OpenCode source DBs.
 - Produces: automated proof that a fresh soul imports and verifies a complete synthetic conversation and provider-identity native readability before spawn, receives the generation-bound current TUI-tail observation before accepting input, appends a synthetic turn under the same ID, and reopens without losing its full imported baseline; a body-free production correction runbook that imports seven distinct roots, verifies each installed store under its actual provider identity, retires the duplicate soul, leaves canonical souls stopped/resume-ready, and withdraws false incidents after PR merge and the separately approved restart.
+- Backend constraint: the current resurrection spec is local-only, its managed-runtime rig requires Docker and shared host paths, and the configured Cloud Run test image has no Docker socket or remote broker. Do not remove that exclusion or silently substitute a local run. Before the E2E gate, either add a cloud-capable broker/harness with safe shared-path handling or use the user's explicit approval for a one-time local-only run of this synthetic Docker test; keep other configured test lanes on cloud.
 
 - [ ] **Step 1: Write the failing managed-runtime continuity scenario**
 
@@ -346,7 +351,7 @@ Extend the existing managed OpenCode resurrection spec with an isolated host sou
 
 - [ ] **Step 2: Run the focused test and verify the intended failure**
 
-Run: `FRESHELL_TEST_SUMMARY='managed OpenCode source-to-soul resume' GCLOUD_ROBOT_REQUIRE=1 pnpm run test:e2e:cloud --project=rust-chromium --grep='managed OpenCode source-to-soul resume' test/e2e-browser/specs/runtime-provider-resurrection-rust.spec.ts`
+Run: `FRESHELL_TEST_SUMMARY='managed OpenCode source-to-soul resume' GCLOUD_ROBOT_REQUIRE=1 pnpm run test:e2e:cloud --project=chromium --grep='managed OpenCode source-to-soul resume' test/e2e-browser/specs/runtime-provider-resurrection-rust.spec.ts`
 
 Expected: FAIL because the current launch does not transfer host-side native history or independently observe provider adoption.
 
@@ -356,9 +361,9 @@ Implement only synthetic harness integration needed to drive production interfac
 
 - [ ] **Step 4: Run the synthetic E2E verification**
 
-Run: `FRESHELL_TEST_SUMMARY='managed OpenCode source-to-soul resume cloud' GCLOUD_ROBOT_REQUIRE=1 pnpm run test:e2e:cloud --project=rust-chromium --grep='managed OpenCode source-to-soul resume' test/e2e-browser/specs/runtime-provider-resurrection-rust.spec.ts`
+Run: `FRESHELL_TEST_SUMMARY='managed OpenCode source-to-soul resume cloud' GCLOUD_ROBOT_REQUIRE=1 pnpm run test:e2e:cloud --project=chromium --grep='managed OpenCode source-to-soul resume' test/e2e-browser/specs/runtime-provider-resurrection-rust.spec.ts`
 
-Expected: PASS for synthetic exact-session payload boundaries, complete import and provider-reader verification, generation-bound current-tail observation, gated input, append/reopen after history-window shift and supported revert, fail-closed partial transfer, stale cleanup/export fencing, stopped/resume-ready correction, and false-loss prevention. The runbook contains no real session contents or incident exports.
+Expected: PASS for synthetic exact-session payload boundaries, complete import and provider-reader verification, generation-bound current-tail observation, gated input, append/reopen after history-window shift and supported revert, fail-closed partial transfer, stale cleanup/export fencing, stopped/resume-ready correction, and false-loss prevention. The runbook contains no real session contents or incident exports. Run through cloud only if the synthetic managed-runtime path is made cloud-capable; otherwise require the user's explicit one-time local-only approval as described above.
 
 - [ ] **Step 5: Refactor while green**
 
