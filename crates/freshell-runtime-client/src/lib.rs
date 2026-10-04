@@ -118,7 +118,7 @@ impl RuntimeClient {
         match self
             .request(
                 RequestId::new(),
-                AdminCommand::OpenCodeTransfer(OpenCodeTransferAction::Begin(descriptor)),
+                AdminCommand::OpenCodeTransfer(OpenCodeTransferAction::Begin(Box::new(descriptor))),
             )
             .await?
         {

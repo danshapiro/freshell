@@ -11,14 +11,14 @@ use std::{
 };
 
 use freshell_runtime_protocol::{
-    opencode_target_build_receipt, opencode_transfer_bundle_digest, OpenCodeTransferDescriptor,
-    OpenCodeTransferFile,
+    opencode_target_build_receipt, opencode_transfer_bundle_digest, OpenCodeTransferChunk,
+    OpenCodeTransferDescriptor, OpenCodeTransferFile, MAX_OPENCODE_TRANSFER_CHUNK_BYTES,
 };
 use freshell_sessions::opencode_transfer::{
     export_exact_session, ExportOptions, HostOpenCodeInventory,
 };
+use freshell_supervisor::opencode_transfer::{OpenCodeTransferStaging, StagingLimits};
 use rusqlite::{params, Connection};
-use serde::Serialize;
 use sha2::{Digest, Sha256};
 
 const PROVIDER_UID: u32 = 65_534;
@@ -27,11 +27,6 @@ const PROVIDER_HOME: &str = "/home/freshell/provider";
 const OPENCODE_DB: &str = "/home/freshell/provider/.local/share/opencode/opencode.db";
 const MAX_TEST_PAYLOAD_BYTES: u64 = 4 * 1024 * 1024;
 const BODY_SENTINEL: &str = "SYNTHETIC_ONLY_OPENCODE_CONVERSATION_BODY";
-
-#[derive(Serialize)]
-struct StageDescriptor<'a> {
-    descriptor: &'a OpenCodeTransferDescriptor,
-}
 
 #[test]
 fn managed_image_mounts_exact_stage_read_only_and_provider_uid_imports_and_reads() {
@@ -44,12 +39,11 @@ fn managed_image_mounts_exact_stage_read_only_and_provider_uid_imports_and_reads
         .expect("create isolated Docker contract directory");
     let workspace = root.path().join("workspace");
     let provider_home = root.path().join("provider-home");
-    let stage = root.path().join("stage");
+    let stage_root = root.path().join("stage-root");
     let source_database = root.path().join("source.sqlite");
     let extraction = root.path().join("extraction");
     fs::create_dir(&workspace).unwrap();
     fs::create_dir(&provider_home).unwrap();
-    fs::create_dir(&stage).unwrap();
     fs::set_permissions(&workspace, fs::Permissions::from_mode(0o755)).unwrap();
     fs::set_permissions(&provider_home, fs::Permissions::from_mode(0o777)).unwrap();
 
@@ -57,9 +51,12 @@ fn managed_image_mounts_exact_stage_read_only_and_provider_uid_imports_and_reads
         &source_database,
         &workspace,
         &extraction,
-        &stage,
+        &stage_root,
         &image_ref,
     );
+    let stage = stage_root
+        .join("opencode-transfers")
+        .join(format!("{}.ready", descriptor.transfer_id));
     assert!(descriptor.total_bytes <= MAX_TEST_PAYLOAD_BYTES);
     fs::set_permissions(&stage, fs::Permissions::from_mode(0o500)).unwrap();
 
@@ -124,7 +121,7 @@ fn create_synthetic_bundle(
     source_database: &Path,
     workspace: &Path,
     extraction: &Path,
-    stage: &Path,
+    staging_root: &Path,
     target_image_ref: &str,
 ) -> OpenCodeTransferDescriptor {
     let source = Connection::open(source_database).unwrap();
@@ -211,27 +208,30 @@ fn create_synthetic_bundle(
         opencode_transfer_bundle_digest(&descriptor.manifest_json, &descriptor.files);
     descriptor.validate().unwrap();
 
-    fs::write(stage.join("entry-0000.bin"), payload_bytes).unwrap();
-    fs::write(
-        stage.join("descriptor.json"),
-        serde_json::to_vec(&StageDescriptor {
-            descriptor: &descriptor,
-        })
-        .unwrap(),
-    )
-    .unwrap();
-    fs::write(stage.join("READY"), descriptor.bundle_sha256.as_bytes()).unwrap();
-    fs::set_permissions(
-        stage.join("entry-0000.bin"),
-        fs::Permissions::from_mode(0o400),
-    )
-    .unwrap();
-    fs::set_permissions(
-        stage.join("descriptor.json"),
-        fs::Permissions::from_mode(0o400),
-    )
-    .unwrap();
-    fs::set_permissions(stage.join("READY"), fs::Permissions::from_mode(0o400)).unwrap();
+    let staging = OpenCodeTransferStaging::new(staging_root, StagingLimits::production()).unwrap();
+    staging.begin(&descriptor, u64::MAX).unwrap();
+    for (sequence, bytes) in payload_bytes
+        .chunks(MAX_OPENCODE_TRANSFER_CHUNK_BYTES)
+        .enumerate()
+    {
+        let offset = sequence * MAX_OPENCODE_TRANSFER_CHUNK_BYTES;
+        staging
+            .write_chunk(&OpenCodeTransferChunk {
+                transfer_id: descriptor.transfer_id.clone(),
+                sequence: sequence as u64,
+                file_index: 0,
+                offset: offset as u64,
+                data: bytes.to_vec(),
+                sha256: hex::encode(Sha256::digest(bytes)),
+            })
+            .unwrap();
+    }
+    let ready = staging.finalize(&descriptor.transfer_id).unwrap();
+    assert_eq!(
+        freshell_agent_runtime::opencode_transfer::verify_staged_bundle(&descriptor, &ready)
+            .unwrap(),
+        ready.join("entry-0000.bin")
+    );
     descriptor
 }
 

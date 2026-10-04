@@ -10,6 +10,7 @@ use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
+    collections::HashSet,
     fs::OpenOptions,
     os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
@@ -1731,6 +1732,74 @@ impl Registry {
         self.run_blocking(move |conn| load_inventory(&conn)).await
     }
 
+    /// Transfer stages remain pinned while a prepared or retryable launch can
+    /// still consume them. Running, stopped, and failed incarnations no
+    /// longer need the stage after the host has acknowledged its durable
+    /// OpenCode receipt.
+    pub async fn opencode_transfer_stage_references(
+        &self,
+    ) -> Result<HashSet<String>, RegistryError> {
+        self.run_blocking(move |conn| {
+            let mut statement = conn.prepare(
+                "SELECT terminal_spec FROM incarnations \
+                 WHERE launch_state IN ('prepared','created','starting') \
+                   AND terminal_spec IS NOT NULL",
+            )?;
+            let rows = statement
+                .query_map([], |row| row.get::<_, String>(0))?
+                .collect::<Result<Vec<_>, _>>()?;
+            let mut references = HashSet::new();
+            for encoded in rows {
+                let terminal: serde_json::Value = serde_json::from_str(&encoded)?;
+                if let Some(transfer) = terminal.get("opencodeTransfer") {
+                    let transfer_id = transfer
+                        .get("transferId")
+                        .and_then(serde_json::Value::as_str)
+                        .filter(|value| !value.is_empty())
+                        .ok_or_else(|| {
+                            RegistryError::Integrity(
+                                "prepared OpenCode transfer has no transfer id".into(),
+                            )
+                        })?;
+                    references.insert(transfer_id.to_string());
+                }
+            }
+            Ok(references)
+        })
+        .await
+    }
+
+    /// Incarnations that may have a persisted host receipt after a crash in
+    /// the grant-acknowledgement/release-marker gap. The service authenticates
+    /// their hosts and validates the typed receipt against the terminal
+    /// descriptor before making any stage release-eligible.
+    pub async fn opencode_transfer_receipt_candidates(
+        &self,
+    ) -> Result<Vec<IncarnationId>, RegistryError> {
+        self.run_blocking(move |conn| {
+            let mut statement = conn.prepare(
+                "SELECT incarnation_id,terminal_spec FROM incarnations \
+                 WHERE launch_state IN ('starting','running') AND terminal_spec IS NOT NULL",
+            )?;
+            let rows = statement
+                .query_map([], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+            let mut candidates = Vec::new();
+            for (incarnation, encoded) in rows {
+                let terminal: serde_json::Value = serde_json::from_str(&encoded)?;
+                if terminal.get("opencodeTransfer").is_some() {
+                    candidates.push(IncarnationId::parse(incarnation).map_err(|_| {
+                        RegistryError::Integrity("invalid OpenCode transfer incarnation id".into())
+                    })?);
+                }
+            }
+            Ok(candidates)
+        })
+        .await
+    }
+
     pub async fn debug_snapshot(&self) -> Result<RegistryDebugSnapshot, RegistryError> {
         Ok(RegistryDebugSnapshot {
             installation_id: self.installation_id().clone(),
@@ -2871,6 +2940,72 @@ mod tests {
             view_intent: None,
             admission: AdmissionPolicy::default(),
         }
+    }
+
+    #[tokio::test]
+    async fn stage_reference_query_pins_only_prepared_retryable_transfer_launches() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry = Registry::open(dir.path(), None).unwrap();
+        let prepared = registry
+            .prepare_launch(prep(SoulId::new(), RequestId::new(), "transfer-ref"))
+            .await
+            .unwrap();
+        let conn = open_connection(&registry.inner.db_path).unwrap();
+        conn.execute(
+            "UPDATE incarnations SET terminal_spec=?1 WHERE incarnation_id=?2",
+            params![
+                serde_json::json!({
+                    "opencodeTransfer": {"transferId": "transfer-ref"}
+                })
+                .to_string(),
+                prepared.incarnation_id.as_str()
+            ],
+        )
+        .unwrap();
+        drop(conn);
+
+        assert!(registry
+            .opencode_transfer_stage_references()
+            .await
+            .unwrap()
+            .contains("transfer-ref"));
+        assert!(
+            registry
+                .opencode_transfer_receipt_candidates()
+                .await
+                .unwrap()
+                .is_empty(),
+            "prepared launches must not query a host that has not accepted a grant"
+        );
+
+        let conn = open_connection(&registry.inner.db_path).unwrap();
+        conn.execute(
+            "UPDATE incarnations SET launch_state='starting' WHERE incarnation_id=?1",
+            params![prepared.incarnation_id.as_str()],
+        )
+        .unwrap();
+        drop(conn);
+        assert_eq!(
+            registry
+                .opencode_transfer_receipt_candidates()
+                .await
+                .unwrap(),
+            vec![prepared.incarnation_id.clone()],
+            "starting launches may have a host-persisted ack whose supervisor marker was lost",
+        );
+
+        let conn = open_connection(&registry.inner.db_path).unwrap();
+        conn.execute(
+            "UPDATE incarnations SET launch_state='failed' WHERE incarnation_id=?1",
+            params![prepared.incarnation_id.as_str()],
+        )
+        .unwrap();
+        drop(conn);
+        assert!(!registry
+            .opencode_transfer_stage_references()
+            .await
+            .unwrap()
+            .contains("transfer-ref"));
     }
 
     async fn materialize_test_runtime(registry: &Registry, soul_id: SoulId) -> PreparedLaunch {

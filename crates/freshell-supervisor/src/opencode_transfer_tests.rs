@@ -1,9 +1,11 @@
 use super::{OpenCodeTransferStaging, StagingLimits, StagingStart};
 use freshell_runtime_protocol::{
     opencode_target_build_receipt, opencode_transfer_bundle_digest, OpenCodeTransferChunk,
-    OpenCodeTransferDescriptor, OpenCodeTransferFile, MAX_OPENCODE_TRANSFER_CHUNK_BYTES,
+    OpenCodeTransferDescriptor, OpenCodeTransferFile, OpenCodeTransferReadinessReceipt,
+    MAX_OPENCODE_TRANSFER_CHUNK_BYTES,
 };
 use sha2::{Digest, Sha256};
+use std::collections::HashSet;
 use std::os::unix::fs::PermissionsExt;
 
 fn descriptor(payload: &[u8], transfer_id: &str) -> OpenCodeTransferDescriptor {
@@ -140,6 +142,158 @@ fn staged_transfer_resumes_after_restart_and_refuses_tampered_ready_data() {
     .unwrap();
     std::fs::write(ready.join("entry-0000.bin"), b"tampered").unwrap();
     assert!(restarted.verify_ready(&descriptor).is_err());
+}
+
+#[test]
+fn staged_transfer_repairs_crash_between_partial_creation_and_descriptor_payload() {
+    let dir = tempfile::tempdir().unwrap();
+    let descriptor = descriptor(b"synthetic", "transfer-init-crash");
+    let staging = OpenCodeTransferStaging::new(dir.path(), StagingLimits::production()).unwrap();
+    let partial = staging.root.join("transfer-init-crash.partial");
+    std::fs::create_dir(&partial).unwrap();
+    std::fs::set_permissions(&partial, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+    assert!(matches!(
+        staging.begin(&descriptor, u64::MAX).unwrap(),
+        StagingStart::Started {
+            next_sequence: 0,
+            ..
+        }
+    ));
+    assert!(partial.join("descriptor.json").is_file());
+    assert!(partial.join("entry-0000.part").is_file());
+}
+
+#[test]
+fn staged_transfer_recovers_after_payload_rename_before_ready_marker() {
+    let dir = tempfile::tempdir().unwrap();
+    let payload = b"synthetic payload";
+    let descriptor = descriptor(payload, "transfer-finalize-crash");
+    let staging = OpenCodeTransferStaging::new(dir.path(), StagingLimits::production()).unwrap();
+    staging.begin(&descriptor, u64::MAX).unwrap();
+    staging
+        .write_chunk(&chunk(&descriptor, payload, 0))
+        .unwrap();
+    let partial = staging.root.join("transfer-finalize-crash.partial");
+    std::fs::rename(
+        partial.join("entry-0000.part"),
+        partial.join("entry-0000.bin"),
+    )
+    .unwrap();
+    drop(staging);
+
+    let restarted = OpenCodeTransferStaging::new(dir.path(), StagingLimits::production()).unwrap();
+    assert!(matches!(
+        restarted.begin(&descriptor, u64::MAX).unwrap(),
+        StagingStart::Started {
+            next_sequence: 1,
+            ref file_offsets,
+        } if file_offsets[0].next_offset == payload.len() as u64
+    ));
+    let ready = restarted.finalize(&descriptor.transfer_id).unwrap();
+    assert_eq!(
+        std::fs::read(ready.join("entry-0000.bin")).unwrap(),
+        payload
+    );
+}
+
+#[test]
+fn staged_transfer_resumes_and_reuses_ready_bundle_below_full_bundle_free_space() {
+    let dir = tempfile::tempdir().unwrap();
+    let payload = vec![0x52; MAX_OPENCODE_TRANSFER_CHUNK_BYTES + 1];
+    let descriptor = descriptor(&payload, "transfer-low-space-resume");
+    let staging = OpenCodeTransferStaging::new(dir.path(), StagingLimits::production()).unwrap();
+    staging.begin(&descriptor, u64::MAX).unwrap();
+    staging
+        .write_chunk(&chunk(&descriptor, &payload, 0))
+        .unwrap();
+
+    assert!(matches!(
+        staging.begin(&descriptor, 1).unwrap(),
+        StagingStart::Started {
+            next_sequence: 1,
+            ref file_offsets,
+        } if file_offsets[0].next_offset == MAX_OPENCODE_TRANSFER_CHUNK_BYTES as u64
+    ));
+    staging
+        .write_chunk(&chunk(&descriptor, &payload, 1))
+        .unwrap();
+    staging.finalize(&descriptor.transfer_id).unwrap();
+    assert!(matches!(
+        staging.begin(&descriptor, 0).unwrap(),
+        StagingStart::Started {
+            next_sequence: 2,
+            ..
+        }
+    ));
+}
+
+#[test]
+fn release_cleanup_waits_for_receipts_and_retries_after_restart_without_references() {
+    let dir = tempfile::tempdir().unwrap();
+    let payload = b"synthetic payload";
+    let descriptor = descriptor(payload, "transfer-release-retry");
+    let staging = OpenCodeTransferStaging::new(dir.path(), StagingLimits::production()).unwrap();
+    staging.begin(&descriptor, u64::MAX).unwrap();
+    staging
+        .write_chunk(&chunk(&descriptor, payload, 0))
+        .unwrap();
+    let ready = staging.finalize(&descriptor.transfer_id).unwrap();
+    let receipt = readiness_receipt(&descriptor);
+    staging
+        .mark_release_eligible(&descriptor, &receipt)
+        .unwrap();
+
+    assert_eq!(
+        staging
+            .reclaim_release_eligible(&HashSet::from([descriptor.transfer_id.clone()]))
+            .unwrap(),
+        0
+    );
+    assert!(ready.is_dir());
+
+    drop(staging);
+    let restarted = OpenCodeTransferStaging::new(dir.path(), StagingLimits::production()).unwrap();
+    assert_eq!(
+        restarted.reclaim_release_eligible(&HashSet::new()).unwrap(),
+        1
+    );
+    assert!(!ready.exists());
+    assert_eq!(
+        restarted.reclaim_release_eligible(&HashSet::new()).unwrap(),
+        0
+    );
+}
+
+#[test]
+fn release_cleanup_rejects_receipts_bound_to_another_transfer() {
+    let dir = tempfile::tempdir().unwrap();
+    let descriptor = descriptor(b"payload", "transfer-release-binding");
+    let staging = OpenCodeTransferStaging::new(dir.path(), StagingLimits::production()).unwrap();
+    staging.begin(&descriptor, u64::MAX).unwrap();
+    staging
+        .write_chunk(&chunk(&descriptor, b"payload", 0))
+        .unwrap();
+    let ready = staging.finalize(&descriptor.transfer_id).unwrap();
+    let mut receipt = readiness_receipt(&descriptor);
+    receipt.transfer_id = "different-transfer".into();
+    assert!(staging
+        .mark_release_eligible(&descriptor, &receipt)
+        .is_err());
+    assert!(ready.is_dir());
+}
+
+fn readiness_receipt(descriptor: &OpenCodeTransferDescriptor) -> OpenCodeTransferReadinessReceipt {
+    OpenCodeTransferReadinessReceipt {
+        transfer_id: descriptor.transfer_id.clone(),
+        destination_store_id: descriptor.destination_store_id.clone(),
+        root_session_id: descriptor.root_session_id.clone(),
+        source_generation: descriptor.source_generation.clone(),
+        provider_uid: unsafe { libc::geteuid() },
+        provider_gid: unsafe { libc::getegid() },
+        structural_sha256: "a".repeat(64),
+        reader_receipt_sha256: "b".repeat(64),
+    }
 }
 
 #[test]

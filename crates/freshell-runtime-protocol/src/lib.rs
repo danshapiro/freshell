@@ -2446,7 +2446,7 @@ pub struct OpenCodeTransferChunk {
 #[serde(tag = "action", content = "data", rename_all = "snake_case")]
 pub enum OpenCodeTransferAction {
     TargetInfo,
-    Begin(OpenCodeTransferDescriptor),
+    Begin(Box<OpenCodeTransferDescriptor>),
     Chunk(OpenCodeTransferChunk),
     Finalize { transfer_id: String },
     Abort { transfer_id: String },
@@ -2483,6 +2483,33 @@ pub enum OpenCodeTransferResult {
 pub struct OpenCodeTransferFileOffset {
     pub file_index: u32,
     pub next_offset: u64,
+}
+
+/// Body-free acknowledgement that the session host revalidated the durable
+/// structural import and provider-identity reader receipts before consuming
+/// an execution grant.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OpenCodeTransferReadinessReceipt {
+    pub transfer_id: String,
+    pub destination_store_id: String,
+    pub root_session_id: String,
+    pub source_generation: String,
+    pub provider_uid: u32,
+    pub provider_gid: u32,
+    pub structural_sha256: String,
+    pub reader_receipt_sha256: String,
+}
+
+impl OpenCodeTransferReadinessReceipt {
+    pub fn matches_descriptor(&self, descriptor: &OpenCodeTransferDescriptor) -> bool {
+        self.transfer_id == descriptor.transfer_id
+            && self.destination_store_id == descriptor.destination_store_id
+            && self.root_session_id == descriptor.root_session_id
+            && self.source_generation == descriptor.source_generation
+            && is_lower_hex_64(&self.structural_sha256)
+            && is_lower_hex_64(&self.reader_receipt_sha256)
+    }
 }
 
 impl OpenCodeTransferDescriptor {
@@ -3271,6 +3298,10 @@ pub enum HostResult {
         fixture_evidence: serde_json::Value,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         native_session_id: Option<String>,
+        /// Present only when an OpenCode transfer's durable provider-reader
+        /// receipt was revalidated before this grant was consumed.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        opencode_transfer_receipt: Option<OpenCodeTransferReadinessReceipt>,
     },
     Stopped,
     SecurityProbe(serde_json::Value),
@@ -3303,6 +3334,11 @@ pub enum HostResult {
         exited: bool,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         native_session_id: Option<String>,
+        /// Persisted post-import and provider-reader receipt. Recovery uses it
+        /// to finish the supervisor's release marker after a crash between
+        /// grant acknowledgement and marker persistence.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        opencode_transfer_receipt: Option<OpenCodeTransferReadinessReceipt>,
     },
     RecoveryProbe(RecoveryProbe),
 }
