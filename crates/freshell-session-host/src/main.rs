@@ -1063,6 +1063,8 @@ async fn grant_execution(
     persisted.worker_pid = None;
     persisted.opencode_transfer_receipt = transfer_readiness_receipt;
     write_state(&state.state_dir, &persisted).map_err(registry_like_error)?;
+    #[cfg(test)]
+    opencode_host_crash_checkpoint("grant.after_state_persist_before_pty");
     if let Some(gate) = transfer_phase_gate.as_mut() {
         gate.advance(OpenCodeTransferPhase::GrantConsumed)
             .expect("OpenCode transfer grant phase was prevalidated");
@@ -2213,10 +2215,20 @@ where
             .open(&temporary)
             .map_err(|error| error.to_string())?;
         file.write_all(&bytes).map_err(|error| error.to_string())?;
+        #[cfg(test)]
+        opencode_host_crash_checkpoint(&format!("receipt.{}.after_temp_write", receipt_kind(name)));
         file.sync_all().map_err(|error| error.to_string())?;
+        #[cfg(test)]
+        opencode_host_crash_checkpoint(&format!("receipt.{}.after_temp_sync", receipt_kind(name)));
         set_mode(&temporary, 0o400)?;
         match std::fs::hard_link(&temporary, &target) {
-            Ok(()) => {}
+            Ok(()) => {
+                #[cfg(test)]
+                opencode_host_crash_checkpoint(&format!(
+                    "receipt.{}.after_link",
+                    receipt_kind(name)
+                ));
+            }
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
                 let metadata =
                     std::fs::symlink_metadata(&target).map_err(|read| read.to_string())?;
@@ -2234,15 +2246,46 @@ where
             Err(error) => return Err(error.to_string()),
         }
         std::fs::remove_file(&temporary).map_err(|error| error.to_string())?;
+        #[cfg(test)]
+        opencode_host_crash_checkpoint(&format!(
+            "receipt.{}.after_temp_remove",
+            receipt_kind(name)
+        ));
         std::fs::File::open(state_dir)
             .and_then(|directory| directory.sync_all())
             .map_err(|error| error.to_string())?;
+        #[cfg(test)]
+        opencode_host_crash_checkpoint(&format!(
+            "receipt.{}.after_directory_sync",
+            receipt_kind(name)
+        ));
         Ok(())
     })();
     if write_result.is_err() {
         let _ = std::fs::remove_file(&temporary);
     }
     write_result
+}
+
+#[cfg(test)]
+fn receipt_kind(name: &str) -> &'static str {
+    if name.ends_with("-import.json") {
+        "import"
+    } else if name.ends_with("-readable.json") {
+        "readable"
+    } else {
+        "other"
+    }
+}
+
+#[cfg(test)]
+fn opencode_host_crash_checkpoint(point: &str) {
+    if std::env::var("FRESHELL_OPENCODE_HOST_CRASH_POINT").as_deref() == Ok(point) {
+        unsafe {
+            libc::kill(libc::getpid(), libc::SIGKILL);
+        }
+        std::process::abort();
+    }
 }
 
 fn read_opencode_receipt<T>(state_dir: &Path, name: &str) -> Result<T, String>
@@ -3750,13 +3793,41 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), String> {
         let mut file = options.open(&tmp).map_err(|e| e.to_string())?;
         use std::io::Write;
         file.write_all(bytes).map_err(|e| e.to_string())?;
+        #[cfg(test)]
+        if path
+            .file_name()
+            .is_some_and(|name| name == "host-state.json")
+        {
+            opencode_host_crash_checkpoint("state.after_temp_write");
+        }
         file.sync_all().map_err(|e| e.to_string())?;
+        #[cfg(test)]
+        if path
+            .file_name()
+            .is_some_and(|name| name == "host-state.json")
+        {
+            opencode_host_crash_checkpoint("state.after_temp_sync");
+        }
     }
     std::fs::rename(&tmp, path).map_err(|e| e.to_string())?;
+    #[cfg(test)]
+    if path
+        .file_name()
+        .is_some_and(|name| name == "host-state.json")
+    {
+        opencode_host_crash_checkpoint("state.after_rename");
+    }
     if let Some(parent) = path.parent() {
         std::fs::File::open(parent)
             .and_then(|f| f.sync_all())
             .map_err(|e| e.to_string())?;
+        #[cfg(test)]
+        if path
+            .file_name()
+            .is_some_and(|name| name == "host-state.json")
+        {
+            opencode_host_crash_checkpoint("state.after_directory_sync");
+        }
     }
     Ok(())
 }
@@ -4949,6 +5020,7 @@ mod tests {
         expected_grant_id: GrantId,
         events: Arc<std::sync::Mutex<Vec<&'static str>>>,
         pty_callback_invoked: Arc<std::sync::atomic::AtomicBool>,
+        pty_marker: Option<PathBuf>,
     }
 
     #[async_trait::async_trait]
@@ -5119,6 +5191,11 @@ mod tests {
                 ));
             }
             self.events.lock().unwrap().push("pty");
+            if let Some(marker) = &self.pty_marker {
+                std::fs::write(marker, b"synthetic PTY callback invoked").map_err(|error| {
+                    RuntimeError::new(RuntimeErrorCode::RegistryFailure, error.to_string())
+                })?;
+            }
             self.pty_callback_invoked
                 .store(true, std::sync::atomic::Ordering::SeqCst);
             Ok(SpawnedTerminalPty {
@@ -5128,6 +5205,89 @@ mod tests {
                 hosted: None,
             })
         }
+    }
+
+    async fn dispatch_synthetic_fixture_from_root(
+        root: &Path,
+        execution_generation: u64,
+        pty_marker: PathBuf,
+    ) -> Result<
+        (
+            Result<HostResult, RuntimeError>,
+            Arc<std::sync::Mutex<Vec<&'static str>>>,
+            Arc<std::sync::atomic::AtomicBool>,
+        ),
+        String,
+    > {
+        let descriptor: OpenCodeTransferDescriptor = serde_json::from_slice(
+            &std::fs::read(root.join("opencode-transfer-descriptor.json"))
+                .map_err(|error| error.to_string())?,
+        )
+        .map_err(|error| error.to_string())?;
+        let terminal: TerminalLaunchSpec = serde_json::from_slice(
+            &std::fs::read(root.join("opencode-terminal.json"))
+                .map_err(|error| error.to_string())?,
+        )
+        .map_err(|error| error.to_string())?;
+        let incarnation_id =
+            IncarnationId::parse("synthetic-incarnation").map_err(|error| error.to_string())?;
+        let soul_id = SoulId::parse("synthetic-soul").map_err(|error| error.to_string())?;
+        let host_boot_id = HostBootId::new();
+        let home = PathBuf::from(&terminal.env["HOME"]);
+        let state = Arc::new(HostState {
+            incarnation_id: incarnation_id.clone(),
+            host_boot_id: host_boot_id.clone(),
+            state_dir: root.join("host-state"),
+            secret: b"synthetic-host-secret-0123456789abcdef".to_vec(),
+            requested_limits: RuntimeLimits {
+                cpu_milli: 500,
+                memory_bytes: 128 * 1024 * 1024,
+                swap_bytes: 0,
+                pids_max: 64,
+            },
+            persisted: Mutex::new(PersistedHostState {
+                host_boot_id: Some(host_boot_id.clone()),
+                ..PersistedHostState::default()
+            }),
+            child: Mutex::new(None),
+            pty: Mutex::new(None),
+            fresh_agent: Mutex::new(None),
+            provider_config_paths: ProviderConfigPaths {
+                private_mount: root.join("private"),
+                provider_home: home,
+            },
+            opencode_transfer_mount: root
+                .join("opencode-transfers")
+                .join(format!("{}.ready", descriptor.transfer_id)),
+            bootstrap_root: root.join("bootstrap"),
+        });
+        let grant_id = GrantId::new();
+        let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let pty_callback_invoked = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let effects = SyntheticGrantExecutionEffects {
+            failure: None,
+            expected_grant_id: grant_id.clone(),
+            events: events.clone(),
+            pty_callback_invoked: pty_callback_invoked.clone(),
+            pty_marker: Some(pty_marker),
+        };
+        let envelope = authenticated_host_envelope(
+            &state,
+            HostCommand::GrantExecution {
+                incarnation_id,
+                soul_id,
+                host_boot_id,
+                control_epoch: 1,
+                execution_generation,
+                grant_id,
+                fixture: None,
+                terminal: Some(Box::new(terminal)),
+                fresh_agent: None,
+                resume_spec: None,
+            },
+        );
+        let result = dispatch_with_effects(envelope, &state, &effects).await;
+        Ok((result, events, pty_callback_invoked))
     }
 
     async fn run_joined_synthetic_transfer(
@@ -5356,6 +5516,16 @@ mod tests {
             opencode_transfer: Some(descriptor.clone()),
             opencode_transfer_attempt_id: Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into()),
         };
+        std::fs::write(
+            root.path().join("opencode-transfer-descriptor.json"),
+            serde_json::to_vec(&descriptor).map_err(|error| error.to_string())?,
+        )
+        .map_err(|error| error.to_string())?;
+        std::fs::write(
+            root.path().join("opencode-terminal.json"),
+            serde_json::to_vec(&terminal).map_err(|error| error.to_string())?,
+        )
+        .map_err(|error| error.to_string())?;
         let runtime_dir = root.path().join("runtime");
         std::fs::create_dir(&runtime_dir).map_err(|error| error.to_string())?;
         let image_ref = descriptor.target_image_ref.clone();
@@ -5403,6 +5573,7 @@ mod tests {
             expected_grant_id: grant_id.clone(),
             events: events.clone(),
             pty_callback_invoked: pty_callback_invoked.clone(),
+            pty_marker: None,
         };
         let envelope = authenticated_host_envelope(
             &state,
@@ -5429,6 +5600,220 @@ mod tests {
             mount_plan,
             mount_inspection,
         })
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[ignore = "process-kill recovery test; run only through scripts/sandbox-test.sh"]
+    async fn opencode_host_restarts_at_receipt_and_pre_pty_durable_boundaries() {
+        use std::{
+            os::unix::{fs::PermissionsExt, process::ExitStatusExt},
+            process::Command,
+        };
+
+        const ROOT_ENV: &str = "FRESHELL_OPENCODE_HOST_CRASH_ROOT";
+        const POINT_ENV: &str = "FRESHELL_OPENCODE_HOST_CRASH_POINT";
+        let points = [
+            "receipt.import.after_temp_write",
+            "receipt.import.after_temp_sync",
+            "receipt.import.after_link",
+            "receipt.import.after_temp_remove",
+            "receipt.import.after_directory_sync",
+            "receipt.readable.after_temp_write",
+            "receipt.readable.after_temp_sync",
+            "receipt.readable.after_link",
+            "receipt.readable.after_temp_remove",
+            "receipt.readable.after_directory_sync",
+            "state.after_temp_write",
+            "state.after_temp_sync",
+            "state.after_rename",
+            "state.after_directory_sync",
+            "grant.after_state_persist_before_pty",
+        ];
+        let executable = std::env::current_exe().expect("resolve this test executable");
+
+        for point in points {
+            let attempt = run_joined_synthetic_transfer(Some(SyntheticTransferFailure::Reader))
+                .await
+                .expect("prepare exact synthetic source, stage, and committed import");
+            assert!(
+                attempt.result.is_err(),
+                "initial reader failure blocks: {point}"
+            );
+            assert!(!attempt
+                .pty_callback_invoked
+                .load(std::sync::atomic::Ordering::SeqCst));
+            let root = attempt.root.path().to_path_buf();
+            let state_dir = root.join("host-state");
+            let import_name = "opencode-synthetic-transfer-import.json";
+            if point.starts_with("receipt.import.") {
+                std::fs::remove_file(state_dir.join(import_name))
+                    .expect("start with no durable import receipt for publication crash");
+            }
+
+            let child = Command::new(&executable)
+                .args([
+                    "--exact",
+                    "tests::opencode_host_transfer_crash_child",
+                    "--ignored",
+                    "--nocapture",
+                ])
+                .env(ROOT_ENV, &root)
+                .env(POINT_ENV, point)
+                .status()
+                .expect("spawn synthetic host crash child");
+            assert_eq!(
+                child.signal(),
+                Some(libc::SIGKILL),
+                "child must be killed at {point}; exit={child:?}"
+            );
+            assert!(
+                !root.join("synthetic-pty-invoked").exists(),
+                "a crash before the PTY callback must not invoke the provider"
+            );
+
+            let state_path = state_dir.join("host-state.json");
+            let state_should_be_published = matches!(
+                point,
+                "state.after_rename"
+                    | "state.after_directory_sync"
+                    | "grant.after_state_persist_before_pty"
+            );
+            assert_eq!(
+                state_path.is_file(),
+                state_should_be_published,
+                "host grant/readiness state is either absent or atomically complete at {point}"
+            );
+            if state_should_be_published {
+                let persisted: PersistedHostState =
+                    serde_json::from_slice(&std::fs::read(&state_path).unwrap())
+                        .expect("published host state must parse completely");
+                assert!(persisted.grant_id.is_some());
+                assert!(persisted.worker_pid.is_none());
+                let receipt = persisted
+                    .opencode_transfer_receipt
+                    .expect("registry readiness receipt is part of the same durable state");
+                assert_eq!(receipt.transfer_id, "synthetic-transfer");
+                assert_eq!(receipt.root_session_id, "synthetic-transfer-session");
+            }
+
+            let marker = root.join("synthetic-pty-invoked");
+            let (result, events, pty_called) =
+                dispatch_synthetic_fixture_from_root(&root, 2, marker.clone())
+                    .await
+                    .unwrap();
+            assert!(matches!(
+                result,
+                Ok(HostResult::GrantAccepted {
+                    worker_launch_count: 1,
+                    ..
+                })
+            ));
+            assert_eq!(
+                *events.lock().unwrap(),
+                ["import", "reader", "reader", "pty"]
+            );
+            assert!(pty_called.load(std::sync::atomic::Ordering::SeqCst));
+            assert!(
+                marker.is_file(),
+                "retry reaches PTY only after revalidation"
+            );
+        }
+
+        for (crash_point, receipt_name, field, stale_value, expected_events) in [
+            (
+                "receipt.import.after_directory_sync",
+                "opencode-synthetic-transfer-import.json",
+                "sourceGeneration",
+                "f".repeat(64),
+                vec!["import"],
+            ),
+            (
+                "receipt.readable.after_directory_sync",
+                "opencode-synthetic-transfer-readable.json",
+                "providerUid",
+                u32::MAX.to_string(),
+                vec!["import", "reader"],
+            ),
+        ] {
+            let attempt = run_joined_synthetic_transfer(Some(SyntheticTransferFailure::Reader))
+                .await
+                .expect("prepare another exact synthetic transfer");
+            let root = attempt.root.path().to_path_buf();
+            if crash_point.starts_with("receipt.import.") {
+                std::fs::remove_file(
+                    root.join("host-state/opencode-synthetic-transfer-import.json"),
+                )
+                .expect("make this a receipt-publication crash rather than an idempotent replay");
+            }
+            let child = Command::new(&executable)
+                .args([
+                    "--exact",
+                    "tests::opencode_host_transfer_crash_child",
+                    "--ignored",
+                    "--nocapture",
+                ])
+                .env(ROOT_ENV, &root)
+                .env(POINT_ENV, crash_point)
+                .status()
+                .expect("spawn receipt publication crash child");
+            assert_eq!(
+                child.signal(),
+                Some(libc::SIGKILL),
+                "child must be killed at {crash_point}; exit={child:?}"
+            );
+
+            let receipt_path = root.join("host-state").join(receipt_name);
+            let mut receipt: serde_json::Value = serde_json::from_slice(
+                &std::fs::read(&receipt_path).expect("receipt publication is durable"),
+            )
+            .expect("durable receipt parses before synthetic tampering");
+            #[cfg(unix)]
+            std::fs::set_permissions(&receipt_path, std::fs::Permissions::from_mode(0o600))
+                .expect("allow the synthetic test to write a conflicting receipt");
+            receipt[field] = serde_json::Value::String(stale_value);
+            std::fs::write(
+                &receipt_path,
+                serde_json::to_vec(&receipt).expect("encode synthetic stale receipt"),
+            )
+            .expect("write the conflicting synthetic receipt");
+            #[cfg(unix)]
+            std::fs::set_permissions(&receipt_path, std::fs::Permissions::from_mode(0o400))
+                .expect("restore receipt read-only mode");
+
+            let marker = root.join("synthetic-pty-invoked");
+            let (result, events, pty_called) =
+                dispatch_synthetic_fixture_from_root(&root, 2, marker.clone())
+                    .await
+                    .unwrap();
+            assert!(
+                result.is_err(),
+                "a stale/conflicting {field} cannot authorize readiness"
+            );
+            assert_eq!(*events.lock().unwrap(), expected_events);
+            assert!(!pty_called.load(std::sync::atomic::Ordering::SeqCst));
+            assert!(!marker.exists(), "stale receipt must not reach PTY");
+            assert!(
+                !root.join("host-state/host-state.json").exists(),
+                "a failed stale-receipt retry must not consume a grant or persist readiness"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[ignore = "child fixture for opencode_host_restarts_at_receipt_and_pre_pty_durable_boundaries"]
+    async fn opencode_host_transfer_crash_child() {
+        const ROOT_ENV: &str = "FRESHELL_OPENCODE_HOST_CRASH_ROOT";
+        let Some(root) = std::env::var_os(ROOT_ENV).map(PathBuf::from) else {
+            return;
+        };
+        let marker = root.join("synthetic-pty-invoked");
+        let (result, _, _) = dispatch_synthetic_fixture_from_root(&root, 1, marker)
+            .await
+            .unwrap();
+        assert!(matches!(result, Ok(HostResult::GrantAccepted { .. })));
+        unreachable!("the selected readiness or pre-PTY checkpoint must kill this child process");
     }
 
     #[cfg(unix)]
