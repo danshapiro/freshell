@@ -429,8 +429,8 @@ test('fresh-agent: automatic recovery reads actual saved Codex history without c
   expect(response.request().method()).toBe('GET')
   expect(response.status()).toBe(200)
   expect((await response.json()).extensions.codex.nativeHistoryAvailable).toBe(true)
-  await expect(page.getByText('Sanitized prompt', { exact: true })).toBeVisible()
-  await expect(page.getByText(SAVED_HISTORY_TEXT, { exact: true })).toBeVisible()
+  await expect(page.getByTestId('terminal-work-area').getByText('Sanitized prompt', { exact: true })).toBeVisible()
+  await expect(page.getByTestId('terminal-work-area').getByText(SAVED_HISTORY_TEXT, { exact: true })).toBeVisible()
   const content = await paneContent(page)
   expect(content).toMatchObject({ sessionId: SESSION_ID, sessionRef: { provider: 'codex', sessionId: SESSION_ID },
     resumeSessionId: SESSION_ID, createRequestId: CREATE_REQUEST_ID, recoverySummary: { recoveryState: 'recovering' } })
