@@ -44,8 +44,219 @@ import { getFreshAgentPaneActions } from '@/lib/pane-action-registry'
 import type { PaneNode } from '@/store/paneTypes'
 import { resetManagedRuntimeRefreshForTest } from '@/lib/recovery/managed-runtime-recovery'
 import { FreshAgentSnapshotSchema } from '@shared/fresh-agent-contract'
+import { createPerfAuditBridge, installPerfAuditBridge } from '@/lib/perf-audit-bridge'
+import { isClientPerfLoggingEnabled, setClientPerfEnabled } from '@/lib/perf-logger'
 
 const CLAUDE_THREAD_ID = '550e8400-e29b-41d4-a716-446655440000'
+
+describe('snapshot request audit', () => {
+  const native = FreshAgentSnapshotSchema.parse(savedCodexNativeHistory)
+  const locator = { sessionType: 'freshcodex' as const, provider: 'codex' as const, sessionId: native.threadId }
+  const content = { kind: 'fresh-agent' as const, ...locator, status: 'running' as const,
+    createRequestId: 'private-audit-create', soulId: 'private-audit-soul', soulIntentRevision: 1,
+    initialCwd: '/private-audit-path', recoverySummary: { desiredState: 'running' as const, recoveryState: 'live' as const,
+      durabilityState: 'resume_captured' as const, allocationState: 'verified_durable' as const } }
+  const owner = { type: 'session.runtimeOwner' as const, ...locator, epoch: 1, generation: 1,
+    ownerKind: 'fresh-agent' as const, operationId: 'private-audit-owner', transition: 'handoff-committed' as const }
+  const history = { ...native, extensions: { codex: { nativeHistoryAvailable: true, ownerKind: 'vacant' } } }
+  const records = (bridge: ReturnType<typeof createPerfAuditBridge>) =>
+    bridge.snapshot().perfEvents.filter((entry) => entry.event === 'fresh_agent.snapshot_request')
+  function mount() {
+    const store = createStore()
+    store.dispatch(applyRuntimeOwner(owner))
+    store.dispatch(sessionInit(locator))
+    store.dispatch(initLayout({ tabId: 'tab-1', paneId: 'pane-1', content }))
+    render(<Provider store={store}><StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" /></Provider>)
+    return store
+  }
+  afterEach(() => {
+    cleanup()
+    resetSnapshotSchedulerForTests()
+    installPerfAuditBridge(null)
+  })
+
+  it.each(['native-only', 'native-error'] as const)('records the actual %s to owned-history closure with logging disabled', async (source) => {
+    const enabled = isClientPerfLoggingEnabled()
+    setClientPerfEnabled(false)
+    const bridge = createPerfAuditBridge()
+    installPerfAuditBridge(bridge)
+    const interactive = createDeferred<unknown>()
+    const owned = createDeferred<unknown>()
+    apiMock.getFreshAgentThreadSnapshot.mockImplementation((_type, _provider, _id, options) => options?.soulId ? owned.promise : interactive.promise)
+    try {
+      const store = mount()
+      const composer = screen.getByRole('textbox', { name: 'Chat message input' })
+      fireEvent.change(composer, { target: { value: 'private-audit-draft' } })
+      await waitFor(() => expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledTimes(1))
+      await act(async () => source === 'native-only' ? interactive.resolve(history) : interactive.reject(new Error('private-audit-error')))
+      await waitFor(() => expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledTimes(2))
+      expect(apiMock.getFreshAgentThreadSnapshot.mock.calls[1][3]).toMatchObject({ soulId: content.soulId })
+      await act(async () => owned.resolve(history))
+      expect(await screen.findByText('Saved native Codex answer')).toBeInTheDocument()
+      expect(composer).toHaveValue('private-audit-draft')
+      expect(composer).toBeDisabled()
+      expect(getFreshAgentPaneContent(store)).toMatchObject(content)
+      expect(sentFreshAgentMessages('freshAgent.create')).toHaveLength(0)
+      expect(sentFreshAgentMessages('pane.reconcile.request')).toHaveLength(0)
+      const events = records(bridge)
+      const stages = events.map((entry) => entry.stage)
+      for (const stage of ['request_captured', 'request_queued', 'run_started', 'native_started',
+        source === 'native-only' ? 'native_completed' : 'native_failed', 'soul_started', 'outcome_received', 'display_committed']) {
+        expect(stages).toContain(stage)
+      }
+      expect(stages.indexOf('native_started')).toBeLessThan(stages.indexOf('soul_started'))
+      expect(stages.indexOf('soul_started')).toBeLessThan(stages.indexOf('display_committed'))
+      expect(events.every((entry, index) => typeof entry.timestamp === 'number'
+        && (index === 0 || Number(entry.timestamp) >= Number(events[index - 1].timestamp)))).toBe(true)
+      expect(events.find((entry) => entry.stage === 'outcome_received')).toMatchObject({ ran: true, outcome: 'ok' })
+      const serialized = JSON.stringify(events)
+      for (const secret of [content.soulId, content.createRequestId, content.initialCwd, native.threadId,
+        'private-audit-draft', 'private-audit-error', 'Saved native Codex answer']) expect(serialized).not.toContain(secret)
+    } finally {
+      await act(async () => { interactive.resolve(history); owned.resolve(history) })
+      setClientPerfEnabled(enabled)
+    }
+  })
+
+  it.each(['owner', 'boot', 'soul', 'revision'] as const)('records only the first actual %s rejection and preserves the current pane', async (change) => {
+    const bridge = createPerfAuditBridge()
+    installPerfAuditBridge(bridge)
+    const held = createDeferred<unknown>()
+    const currentRead = createDeferred<unknown>()
+    apiMock.getFreshAgentThreadSnapshot.mockImplementation((_type, _provider, _id, options) => options?.soulId
+      ? held.promise : Promise.reject(new Error('host unavailable')))
+    const store = mount()
+    try {
+      await waitFor(() => expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledTimes(2))
+      apiMock.getFreshAgentThreadSnapshot.mockReturnValue(currentRead.promise)
+      act(() => {
+        if (change === 'owner') store.dispatch(applyRuntimeOwner({ ...owner, generation: 2, operationId: 'next-owner' }))
+        if (change === 'boot') store.dispatch(setBootId('private-audit-next-boot'))
+        if (change === 'soul' || change === 'revision') store.dispatch(updatePaneContent({ tabId: 'tab-1', paneId: 'pane-1',
+          content: { ...content, soulId: change === 'soul' ? 'next-soul' : content.soulId, soulIntentRevision: change === 'revision' ? 2 : 1 } }))
+        if (change === 'revision') {
+          store.dispatch(setBootId('later-private-boot-fence'))
+          store.dispatch(applyRuntimeOwner({ ...owner, generation: 2, operationId: 'later-private-owner-fence' }))
+        }
+      })
+      const current = getFreshAgentPaneContent(store)
+      await act(async () => held.resolve(history))
+      expect(screen.queryByText('Saved native Codex answer')).not.toBeInTheDocument()
+      expect(getFreshAgentPaneContent(store)).toEqual(current)
+      expect(sentFreshAgentMessages('freshAgent.create')).toHaveLength(0)
+      expect(sentFreshAgentMessages('pane.reconcile.request')).toHaveLength(0)
+      const rejected = records(bridge).find((entry) => entry.stage === 'currentness_checked' && entry.stale === true)
+      expect(rejected).toMatchObject({ check: 'outcome', fence: change, stale: true, requestSerial: 1 })
+      expect(records(bridge).some((entry) => entry.stage === 'display_committed' && entry.requestSerial === 1)).toBe(false)
+    } finally { installPerfAuditBridge(null); await act(async () => currentRead.resolve(history)) }
+  })
+
+  it.each([false, true])('preserves inactive behavior and stops recording after bridge removal (installed: %s)', async (installed) => {
+    const bridge = createPerfAuditBridge()
+    installPerfAuditBridge(installed ? bridge : null)
+    const held = createDeferred<unknown>()
+    apiMock.getFreshAgentThreadSnapshot.mockReturnValue(held.promise)
+    mount()
+    await waitFor(() => expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledTimes(1))
+    const started = records(bridge).map((entry) => entry.stage)
+    installPerfAuditBridge(null)
+    const before = bridge.snapshot()
+    await act(async () => held.resolve({ ...native, capabilities: { ...native.capabilities, send: true },
+      extensions: { codex: { statusFromLiveState: true } } }))
+    expect(await screen.findByText('Saved native Codex answer')).toBeInTheDocument()
+    expect(bridge.snapshot()).toEqual(before)
+    expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledTimes(1)
+    expect(sentFreshAgentMessages('freshAgent.create')).toHaveLength(0)
+    if (installed) expect(started).toContain('native_started')
+  })
+
+  it.each([false, true])('preserves the compound read-generation exception (initial read-only: %s)', async (readOnly) => {
+    const bridge = createPerfAuditBridge()
+    installPerfAuditBridge(bridge)
+    const held = createDeferred<unknown>()
+    const liveRead = createDeferred<unknown>()
+    apiMock.getFreshAgentThreadSnapshot.mockReturnValueOnce(held.promise).mockReturnValue(liveRead.promise)
+    const store = createStore()
+    store.dispatch(sessionInit(locator))
+    const initial = { ...content, recoverySummary: { ...content.recoverySummary,
+      recoveryState: readOnly ? 'blocked' as const : 'live' as const } }
+    store.dispatch(initLayout({ tabId: 'tab-1', paneId: 'pane-1', content: initial }))
+    render(<Provider store={store}><StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" /></Provider>)
+    try {
+      await waitFor(() => expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledTimes(1))
+      act(() => store.dispatch(updatePaneContent({ tabId: 'tab-1', paneId: 'pane-1', content: { ...initial,
+        recoverySummary: { ...initial.recoverySummary, recoveryState: readOnly ? 'live' : 'recovering' } } })))
+      await waitFor(() => expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledTimes(2))
+      await act(async () => held.resolve(history))
+      if (readOnly) {
+        expect(await screen.findByText('Saved native Codex answer')).toBeInTheDocument()
+        expect(screen.getByRole('textbox', { name: 'Chat message input' })).toBeDisabled()
+        expect(records(bridge).find((entry) => entry.stage === 'display_committed' && entry.requestSerial === 1))
+          .toMatchObject({ requestReadOnly: true })
+      } else {
+        expect(screen.queryByText('Saved native Codex answer')).not.toBeInTheDocument()
+        expect(records(bridge).find((entry) => entry.stage === 'currentness_checked' && entry.stale === true))
+          .toMatchObject({ fence: 'read_generation', requestSerial: 1 })
+      }
+    } finally { installPerfAuditBridge(null); await act(async () => liveRead.resolve(history)) }
+  })
+
+  it('distinguishes shared scheduler consumers from the actual trailing run', async () => {
+    vi.useFakeTimers()
+    const bridge = createPerfAuditBridge()
+    installPerfAuditBridge(bridge)
+    try {
+      const store = createStore()
+      const handlers = new Set<(message: unknown) => void>()
+      wsMock.onMessage.mockImplementation((handler) => { handlers.add(handler); return () => { handlers.delete(handler) } })
+      const broadcast = (message: unknown) => { for (const handler of handlers) handler(message) }
+      const pane = { kind: 'fresh-agent' as const, sessionType: 'freshopencode' as const, provider: 'opencode' as const,
+        sessionId: 'ses_late_change', sessionRef: { provider: 'opencode', sessionId: 'ses_late_change' },
+        resumeSessionId: 'ses_late_change', createRequestId: 'shared-audit-a', status: 'idle' as const }
+      apiMock.getFreshAgentThreadSnapshot.mockResolvedValue(freshopencodeSnapshot('audit shared answer', 10))
+      store.dispatch(initLayout({ tabId: 'tab-1', paneId: 'pane-1', content: pane }))
+      store.dispatch(initLayout({ tabId: 'tab-2', paneId: 'pane-2', content: { ...pane, createRequestId: 'shared-audit-b' } }))
+      render(<Provider store={store}><StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
+        <StoreBackedFreshAgentView tabId="tab-2" paneId="pane-2" /></Provider>)
+      await act(async () => { await vi.advanceTimersByTimeAsync(0); await vi.advanceTimersByTimeAsync(SNAPSHOT_DEBOUNCE_MS) })
+      expect(screen.getAllByText('audit shared answer').length).toBeGreaterThan(0)
+      const baseline = records(bridge).length
+      apiMock.getFreshAgentThreadSnapshot.mockClear()
+      for (let index = 0; index < 10; index += 1) act(() => broadcast({ type: 'freshAgent.event', sessionType: 'freshopencode',
+        provider: 'opencode', sessionId: 'ses_late_change', event: { type: 'freshAgent.session.changed',
+          sessionId: 'ses_late_change', reason: 'opencode-message' } }))
+      await act(async () => { await vi.advanceTimersByTimeAsync(SNAPSHOT_DEBOUNCE_MS) })
+      const events = records(bridge).slice(baseline)
+      expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledTimes(1)
+      expect(events.filter((entry) => entry.stage === 'run_started')).toHaveLength(1)
+      expect(events.filter((entry) => entry.stage === 'outcome_received' && entry.ran === false).length).toBeGreaterThan(0)
+      expect(events.filter((entry) => entry.stage === 'request_queued').length).toBeGreaterThan(1)
+      act(() => broadcast({ type: 'freshAgent.event', sessionType: 'freshopencode', provider: 'opencode',
+        sessionId: 'ses_late_change', event: { type: 'freshAgent.session.changed', sessionId: 'ses_late_change', reason: 'opencode-message' } }))
+      await act(async () => resetSnapshotSchedulerForTests())
+      expect(records(bridge).find((entry) => entry.stage === 'outcome_received' && entry.outcome === 'coalesced'))
+        .toMatchObject({ ran: false })
+      expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledTimes(1)
+    } finally { cleanup(); resetSnapshotSchedulerForTests(); installPerfAuditBridge(null); vi.useRealTimers() }
+  })
+
+  it('records owned-history error completion without certifying live state or replacing identity', async () => {
+    const bridge = createPerfAuditBridge()
+    installPerfAuditBridge(bridge)
+    apiMock.getFreshAgentThreadSnapshot.mockRejectedValue(new Error('private-source-unavailable'))
+    const store = mount()
+    await waitFor(() => expect(screen.getByText('private-source-unavailable')).toBeInTheDocument())
+    expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledTimes(2)
+    expect(getFreshAgentPaneContent(store)).toMatchObject(content)
+    expect(records(bridge).find((entry) => entry.stage === 'outcome_received')).toMatchObject({ outcome: 'error', ran: true })
+    expect(records(bridge).find((entry) => entry.stage === 'currentness_checked' && entry.check === 'error-fold'))
+      .toMatchObject({ stale: false })
+    expect(records(bridge).some((entry) => entry.stage === 'display_committed')).toBe(false)
+    expect(JSON.stringify(records(bridge))).not.toContain('private-source-unavailable')
+    expect(sentFreshAgentMessages('freshAgent.create')).toHaveLength(0)
+    expect(sentFreshAgentMessages('pane.reconcile.request')).toHaveLength(0)
+  })
+})
 
 // STATUS-STRIP meter seeding helper: usage lands in the unified store map
 // (sessions.contextUsageByKey) exactly as a committed refresh would stamp it
