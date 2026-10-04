@@ -238,9 +238,11 @@ mod tests {
     use super::*;
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
-    fn free_port() -> u16 {
-        let l = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
-        l.local_addr().unwrap().port()
+    // Keep this listener until the controller's initial bind succeeds, then
+    // drop it before sending traffic so only the controller accepts requests.
+    fn reusable_loopback_listener() -> StdTcpListener {
+        bind_reusable(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), true)
+            .expect("own an OS-assigned reusable listener")
     }
 
     #[test]
@@ -255,18 +257,17 @@ mod tests {
 
     #[test]
     fn two_reuseport_binds_on_same_addr_both_succeed() {
-        let port = free_port();
-        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port);
-        let a = bind_reusable(addr, true).expect("first reuseport bind");
+        let a = reusable_loopback_listener();
+        let addr = a.local_addr().expect("first listener address");
         let b = bind_reusable(addr, true).expect("second reuseport bind must also succeed");
         drop((a, b));
     }
 
     #[test]
     fn foreign_squatter_blocks_our_bind() {
-        let port = free_port();
-        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), port);
-        let squatter = std::net::TcpListener::bind(addr).expect("squatter binds");
+        let squatter =
+            std::net::TcpListener::bind((Ipv4Addr::UNSPECIFIED, 0)).expect("squatter binds");
+        let addr = squatter.local_addr().expect("squatter address");
         let result = bind_reusable(addr, true);
         assert!(
             result.is_err(),
@@ -278,13 +279,23 @@ mod tests {
     #[tokio::test]
     async fn serve_on_proves_bind_before_swapping_and_serves_traffic() {
         use axum::{routing::get, Router};
-        let port = free_port();
+        let port_owner = reusable_loopback_listener();
+        let port = port_owner
+            .local_addr()
+            .expect("initial listener address")
+            .port();
         let app = Router::new().route("/ping", get(|| async { "pong" }));
         let ctl = RebindController::new(port, true);
         ctl.set_app(app);
+        let competing_bind = StdTcpListener::bind((Ipv4Addr::LOCALHOST, port));
+        assert!(
+            matches!(&competing_bind, Err(err) if err.kind() == std::io::ErrorKind::AddrInUse),
+            "the fixture must own its chosen port until the controller starts serving"
+        );
         ctl.serve_on(IpAddr::V4(Ipv4Addr::LOCALHOST))
             .await
             .expect("initial serve");
+        drop(port_owner);
         let body = reqwest::get(format!("http://127.0.0.1:{port}/ping"))
             .await
             .unwrap()
@@ -311,13 +322,18 @@ mod tests {
         // reports/V1.md): with notify_waiters and no barrier, 42-99/100 of
         // these iterations fail. Do NOT weaken this test.
         use axum::{routing::get, Router};
-        let port = free_port();
+        let port_owner = reusable_loopback_listener();
+        let port = port_owner
+            .local_addr()
+            .expect("initial listener address")
+            .port();
         let app = Router::new().route("/ping", get(|| async { "pong" }));
         let ctl = RebindController::new(port, true);
         ctl.set_app(app);
         let localhost = IpAddr::V4(Ipv4Addr::LOCALHOST);
         let wildcard = IpAddr::V4(Ipv4Addr::UNSPECIFIED);
         ctl.serve_on(localhost).await.expect("initial serve");
+        drop(port_owner);
         for i in 0..100 {
             let target = if i % 2 == 0 { wildcard } else { localhost };
             ctl.serve_on(target).await.expect("swap");
@@ -344,13 +360,18 @@ mod tests {
         use std::io::Write;
         use tokio::io::AsyncReadExt;
 
-        let port = free_port();
+        let port_owner = reusable_loopback_listener();
+        let port = port_owner
+            .local_addr()
+            .expect("initial listener address")
+            .port();
         let app = Router::new().route("/ping", get(|| async { "pong" }));
         let ctl = RebindController::new(port, true);
         ctl.set_app(app);
         ctl.serve_on(IpAddr::V4(Ipv4Addr::LOCALHOST))
             .await
             .expect("initial serve");
+        drop(port_owner);
 
         // A current-thread runtime has not polled the accept loop yet. The
         // handshake and request reach the old socket before its shutdown.
@@ -394,7 +415,11 @@ mod tests {
         use tokio::sync::{mpsc, watch};
         use tokio::time::timeout;
 
-        let port = free_port();
+        let port_owner = reusable_loopback_listener();
+        let port = port_owner
+            .local_addr()
+            .expect("initial listener address")
+            .port();
         let (arrived_tx, mut arrived_rx) = mpsc::unbounded_channel::<()>();
         let (release_tx, release_rx) = watch::channel(false);
         let slow = {
@@ -421,6 +446,7 @@ mod tests {
         ctl.set_app(app);
         let localhost = IpAddr::V4(Ipv4Addr::LOCALHOST);
         ctl.serve_on(localhost).await.expect("initial serve");
+        drop(port_owner);
 
         // Start a request that will still be in flight when we swap. Only the
         // OLD listener exists at this point, so it owns the connection.
