@@ -1125,6 +1125,12 @@ fn inspect_git_tree(mount: &Path, tree: &str) -> Result<GitTreeInspection, Trans
             continue;
         }
         verify_git_loose_object_paths(&mount, &object_stores, std::slice::from_ref(&current_tree))?;
+        let object_kind = git_text_in_repository(&repository, &["cat-file", "-t", &current_tree])?;
+        if object_kind.trim() != "tree" {
+            return Err(TransferError::Blocked(
+                "snapshot reference does not identify a Git tree object".into(),
+            ));
+        }
         objects.insert(current_tree.clone());
         let entries = git_output_in_repository(&repository, &["ls-tree", "-z", &current_tree])?;
         for entry in entries
@@ -2382,14 +2388,14 @@ fn read_recursive_sessions(
     root_session_id: &str,
 ) -> Result<Vec<SerializedRow>, TransferError> {
     let mut statement = connection.prepare(
-        "WITH RECURSIVE descendants(id) AS (
-           SELECT id FROM session WHERE id = ?1 AND parent_id IS NULL
+        "WITH RECURSIVE descendants(row_id, id) AS (
+           SELECT rowid, id FROM session WHERE id = ?1 AND parent_id IS NULL
            UNION
-           SELECT child.id FROM session child
+           SELECT child.rowid, child.id FROM session child
            JOIN descendants parent ON child.parent_id = parent.id
          )
          SELECT session.* FROM session
-         JOIN descendants USING (id)
+         JOIN descendants ON session.rowid = descendants.row_id
          ORDER BY session.time_created, session.id",
     )?;
     let names = statement
@@ -2402,6 +2408,9 @@ fn read_recursive_sessions(
             serialize_row(row, "session", &names)
         })?
         .collect::<Result<Vec<_>, _>>()?;
+    for row in &rows {
+        validate_primary_key(row)?;
+    }
     Ok(rows)
 }
 
