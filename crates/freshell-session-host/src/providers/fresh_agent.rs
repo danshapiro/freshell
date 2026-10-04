@@ -887,6 +887,21 @@ impl FreshAgentTransport for HostedTransport {
         })
     }
 
+    async fn snapshot(&self) -> Result<Value, String> {
+        #[cfg(test)]
+        if let Some(delegate) = self.test_delegate.as_ref() {
+            return delegate.snapshot().await;
+        }
+        let mut snapshot = self.snapshot_value().await?;
+        let provider = if self.provider == FreshProvider::Kilroy {
+            "claude"
+        } else {
+            self.provider.as_str()
+        };
+        snapshot["extensions"][provider]["statusFromLiveState"] = serde_json::json!(true);
+        Ok(snapshot)
+    }
+
     async fn is_live(&self) -> bool {
         #[cfg(test)]
         if let Some(delegate) = self.test_delegate.as_ref() {

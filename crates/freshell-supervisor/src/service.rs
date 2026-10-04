@@ -413,6 +413,14 @@ impl Supervisor {
                         .await?,
                 ))
             }
+            AdminCommand::FreshAgentReadSnapshot(request) => {
+                self.registry
+                    .assert_epoch(request.expected_control_epoch)
+                    .map_err(map_registry)?;
+                Ok(AdminResult::FreshAgentSnapshot(
+                    self.fresh_agent_snapshot(request.soul_id).await?,
+                ))
+            }
             AdminCommand::FreshAgentResolve(request) => {
                 self.registry
                     .assert_epoch(request.expected_control_epoch)
@@ -1358,6 +1366,67 @@ impl Supervisor {
                 "unexpected fresh-agent capture reply",
             )),
         }
+    }
+
+    async fn fresh_agent_snapshot(
+        &self,
+        soul_id: SoulId,
+    ) -> Result<serde_json::Value, RuntimeError> {
+        let lifecycle_lock = self.lifecycle_lock(&soul_id).await;
+        let _guard = lifecycle_lock.lock().await;
+        let handle = self
+            .registry
+            .active_handle_for_soul(soul_id.clone())
+            .await
+            .map_err(map_registry)?;
+        let agent = handle.fresh_agent().ok_or_else(|| {
+            RuntimeError::new(
+                RuntimeErrorCode::UnsupportedWorkload,
+                "soul is not a hosted fresh-agent",
+            )
+        })?;
+        let provider = if agent.provider == freshell_runtime_protocol::FreshProvider::Kilroy {
+            "claude"
+        } else {
+            agent.provider.as_str()
+        };
+        let host = self
+            .authenticate_host(handle.incarnation_id(), handle.runtime_dir())
+            .await?;
+        let result = self
+            .send_authenticated_host_command(
+                handle.incarnation_id().clone(),
+                handle.runtime_dir(),
+                &host,
+                HostCommand::FreshAgentReadSnapshot {
+                    incarnation_id: handle.incarnation_id().clone(),
+                },
+            )
+            .await?;
+        let HostResult::FreshAgentSnapshot(snapshot) = result else {
+            return Err(RuntimeError::new(
+                RuntimeErrorCode::HostAuthenticationFailed,
+                "unexpected fresh-agent snapshot reply",
+            ));
+        };
+        let current = self
+            .registry
+            .active_handle_for_soul(soul_id)
+            .await
+            .map_err(map_registry)?;
+        if current.incarnation_id() != handle.incarnation_id() {
+            return Err(RuntimeError::new(
+                RuntimeErrorCode::OwnershipMismatch,
+                "fresh-agent snapshot owner changed",
+            ));
+        }
+        if snapshot["provider"].as_str() != Some(provider) {
+            return Err(RuntimeError::new(
+                RuntimeErrorCode::OwnershipMismatch,
+                "fresh-agent snapshot provider mismatch",
+            ));
+        }
+        Ok(snapshot)
     }
 
     async fn fresh_agent_resolve(

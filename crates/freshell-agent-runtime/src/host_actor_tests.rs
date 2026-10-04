@@ -1,6 +1,92 @@
 use super::*;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+struct SnapshotTransport {
+    value: Value,
+    live: std::sync::atomic::AtomicBool,
+    exit_during_read: bool,
+}
+
+#[async_trait]
+impl FreshAgentTransport for SnapshotTransport {
+    async fn start(&self, _: &FreshAgentProfile) -> Result<TransportStart, String> {
+        Ok(TransportStart {
+            native_session_id: Some("snapshot-native".into()),
+        })
+    }
+    async fn dispatch(
+        &self,
+        _: &RequestId,
+        _: &str,
+        _: &FreshAgentProfile,
+    ) -> Result<DispatchAck, DispatchFailure> {
+        panic!("snapshot must not dispatch")
+    }
+    async fn resolve_permission(&self, _: &str, _: Value) -> Result<(), DispatchFailure> {
+        panic!("snapshot must not resolve")
+    }
+    async fn interrupt(&self) -> Result<(), String> {
+        panic!("snapshot must not interrupt")
+    }
+    async fn stop(self: Arc<Self>) -> Result<(), String> {
+        Ok(())
+    }
+    fn take_event_stream(&self) -> Option<tokio::sync::mpsc::Receiver<AgentEvent>> {
+        None
+    }
+    async fn is_live(&self) -> bool {
+        self.live.load(Ordering::SeqCst)
+    }
+    async fn snapshot(&self) -> Result<Value, String> {
+        if self.exit_during_read {
+            self.live.store(false, Ordering::SeqCst);
+        }
+        Ok(self.value.clone())
+    }
+}
+
+#[tokio::test]
+async fn snapshot_read_preserves_actor_state_and_rejects_wrong_identity_size_or_liveness() {
+    for scenario in [
+        "live",
+        "wrong-thread",
+        "wrong-provider",
+        "oversized",
+        "not-live",
+        "exit-during-read",
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let transport = Arc::new(SnapshotTransport {
+            value: serde_json::json!({
+                "threadId":if scenario == "wrong-thread" { "different-thread" } else { "snapshot-native" },
+                "provider":if scenario == "wrong-provider" { "codex" } else { "claude" },
+                "sessionType":"freshclaude", "status":"idle",
+                "turns":if scenario == "oversized" { "x".repeat(freshell_runtime_protocol::MAX_CONTROL_FRAME_BYTES) } else { "retained".into() },
+            }),
+            live: std::sync::atomic::AtomicBool::new(scenario != "not-live"),
+            exit_during_read: scenario == "exit-during-read",
+        });
+        let actor = FreshAgentHostActor::open(
+            dir.path(),
+            profile(FreshProvider::Claude, "snapshot-store", None),
+            transport,
+        )
+        .await
+        .unwrap();
+        let before = fs::read(dir.path().join("fresh-agent-state.json")).unwrap();
+        let result = actor.snapshot().await;
+        assert_eq!(result.is_ok(), scenario == "live", "{scenario}");
+        if let Ok(snapshot) = result {
+            assert_eq!(snapshot["threadId"], "snapshot-native");
+        }
+        assert_eq!(
+            fs::read(dir.path().join("fresh-agent-state.json")).unwrap(),
+            before,
+            "{scenario}"
+        );
+    }
+}
+
 struct OperationTransport {
     operations: std::sync::Mutex<Vec<(String, FreshAgentOperation)>>,
     supported: bool,

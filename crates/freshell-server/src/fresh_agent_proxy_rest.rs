@@ -4,6 +4,40 @@ use super::*;
 
 #[async_trait::async_trait]
 impl HostedFreshAgentRestGateway for HostedFreshAgentProxy {
+    async fn snapshot(
+        &self,
+        request: freshell_freshagent::hosted_rest::HostedRestSnapshot,
+    ) -> Result<Option<serde_json::Value>, ()> {
+        let (provider, session_type) =
+            rest_agent_identity(&request.provider, &request.session_type)?;
+        let runtime_provider = fresh_provider(&Some(provider), session_type).ok_or(())?;
+        // Read current inventory instead of the cached aliases: stopped and
+        // recovering hosted conversations must not fall back to a local slice.
+        let inventory = self.client.inventory().await.map_err(|_| ())?;
+        let view = inventory.iter().rev().find(|view| {
+            view.provider.as_deref() == Some(runtime_provider.as_str())
+                && (view.fresh_agent_session_id.as_deref() == Some(&request.session_id)
+                    || view.native_session_id.as_deref() == Some(&request.session_id))
+        });
+        let Some(view) = view else {
+            return Ok(None);
+        };
+        let mut snapshot = self.client.fresh_agent_snapshot(view.soul_id.clone()).await.map_err(|error| {
+            tracing::warn!(soul_id = %view.soul_id, code = ?error.runtime_code(), "fresh_agent.hosted_snapshot_unavailable");
+        })?;
+        if snapshot["sessionType"].as_str() != Some(request.session_type.as_str())
+            || snapshot["provider"].as_str() != Some(request.provider.as_str())
+            || snapshot["threadId"].as_str() != view.native_session_id.as_deref()
+        {
+            return Err(());
+        }
+        freshell_agent_runtime::snapshot_projection::project_hosted_rest_snapshot(
+            &mut snapshot,
+            &request.provider,
+            &request.session_type,
+        );
+        Ok(Some(snapshot))
+    }
     async fn create_agent(
         self: Arc<Self>,
         request: HostedRestCreate,

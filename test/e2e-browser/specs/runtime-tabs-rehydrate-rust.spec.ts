@@ -10,6 +10,7 @@
  */
 import { expect, type Page } from '@playwright/test'
 import WebSocket from 'ws'
+import fs from 'node:fs/promises'
 
 import { test } from '../helpers/fixtures.js'
 import { ManagedRuntimeBrowserRig } from '../helpers/managed-runtime.js'
@@ -162,6 +163,141 @@ class RawWsClient {
 }
 
 test.describe.serial('Phase 4 managed-runtime tab rehydration', () => {
+  test('managed fresh-agent: already-live attach restores stale loss through real hosted HTTP truth', async ({ page }) => {
+    test.setTimeout(900_000)
+    const rig = new ManagedRuntimeBrowserRig(process.cwd(), 3, {}, {}, 'test', {
+      enabledProviders: [], freshAgentModes: ['freshcodex'], fixtureFreshAgentModes: ['freshcodex'],
+      providerSettings: { freshcodex: {} },
+    })
+    const sent: any[] = []
+    const received: any[] = []
+    try {
+      const info = await rig.start()
+      const settings = await fetch(`${info.baseUrl}/api/settings`, {
+        method: 'PATCH', headers: { 'content-type': 'application/json', 'x-auth-token': info.token },
+        body: JSON.stringify({ codingCli: { enabledProviders: ['codex'] } }),
+      })
+      expect(settings.ok).toBe(true)
+      await page.routeWebSocket('**/ws', (socket) => {
+        const upstream = socket.connectToServer()
+        socket.onMessage((data) => { sent.push(JSON.parse(String(data))); upstream.send(data) })
+        upstream.onMessage((data) => { received.push(JSON.parse(String(data))); socket.send(data) })
+      })
+      await page.goto(`${info.baseUrl}/?token=${info.token}&e2e=1`)
+      const harness = new TestHarness(page)
+      await harness.waitForHarness()
+      await harness.waitForConnection()
+      await page.getByRole('button', { name: 'Freshcodex', exact: true }).click()
+      await page.getByRole('option', { name: rig.repoRoot, exact: true }).click()
+      const created = await waitForValue('browser-created fresh pane', async () => {
+        const state = await harness.getState()
+        const tabId = state.tabs.activeTabId!
+        const leaf = state.panes.layouts[tabId]
+        return leaf?.type === 'leaf' && leaf.content.kind === 'fresh-agent' && leaf.content.sessionId
+          ? { tabId, paneId: leaf.id, sessionId: leaf.content.sessionId } : null
+      }, 60_000)
+      const view = await waitForValue('real managed fresh Codex session', async () => (
+        (await rig.inventory()).find((row) => row.freshAgentSessionType === 'freshcodex' && row.launchState === 'running') ?? null
+      ), 90_000)
+      expect(view.containerId).toBeTruthy()
+      expect(view.nativeSessionId).toBeTruthy()
+      const rolloutPath = `/home/freshell/provider/.codex/sessions/2026/03/01/rollout-${view.nativeSessionId}.jsonl`
+      const transcript = (await fs.readFile('test/fixtures/coding-cli/codex/task-events.sanitized.jsonl', 'utf8'))
+        .replace('session-activity', view.nativeSessionId!).replace('Sanitized completion', 'Managed fixture saved answer')
+      rig.ownedProviderExec(view.containerId!, ['node', '--input-type=module', '-e',
+        'import fs from "node:fs"; import path from "node:path"; fs.mkdirSync(path.dirname(process.argv[1]), {recursive:true}); fs.writeFileSync(process.argv[1], process.argv[2]);',
+        rolloutPath, transcript])
+      const fixtureState = () => JSON.parse(rig.ownedProviderExec(view.containerId!, [
+        'cat', '/home/freshell/provider/.freshell-fixture/provider-native-state.json',
+      ]))
+      const before = fixtureState()
+      const ownedSnapshot = await rig.runtime.adminOk(rig.supervisor, {
+        method: 'fresh_agent_read_snapshot', params: { soulId: view.soulId, expectedControlEpoch: await rig.controlEpoch() },
+      })
+      expect(ownedSnapshot.data.threadId).toBe(view.nativeSessionId)
+      const initialSnapshot = await fetch(`${info.baseUrl}/api/fresh-agent/threads/freshcodex/codex/${view.nativeSessionId}`, {
+        headers: { 'x-auth-token': info.token },
+      })
+      expect(initialSnapshot.ok, await initialSnapshot.text()).toBe(true)
+      await page.reload()
+      await harness.waitForHarness()
+      await harness.waitForConnection()
+      const pane = page.locator(`[data-pane-id="${created.paneId}"]`)
+      await expect(pane.getByText('Managed fixture saved answer', { exact: true })).toBeVisible({ timeout: 60_000 })
+      const composer = pane.getByRole('textbox', { name: 'Chat message input' })
+      await expect(composer).toBeEnabled()
+      await expect.poll(async () => {
+        const state = await harness.getState()
+        return state.panes.layouts[created.tabId].content.sessionId
+      }).toBe(view.freshAgentSessionId)
+      await composer.fill('Draft stays in this managed conversation')
+      const original = await page.evaluate(({ tabId, paneId }) => {
+        const root = window.__FRESHELL_TEST_HARNESS__!.getState().panes.layouts[tabId]
+        const find = (node: any): any => node.type === 'leaf' ? node.id === paneId ? node.content : undefined
+          : node.children.map(find).find(Boolean)
+        return find(root)
+      }, { tabId: created.tabId, paneId: created.paneId })
+      expect(original.soulId).toBe(view.soulId)
+      expect(original.sessionRef.sessionId).toBe(view.nativeSessionId)
+      const canonicalIdentity = { sessionRef: original.sessionRef, resumeSessionId: original.resumeSessionId,
+        createRequestId: original.createRequestId, soulId: original.soulId }
+      const expectOriginalConversation = async () => {
+        const state = await harness.getState()
+        const content = state.panes.layouts[created.tabId].content
+        expect(content).toMatchObject(canonicalIdentity)
+        // The managed gateway and native materialization use these two
+        // existing presentation aliases for the same canonical conversation.
+        expect([view.freshAgentSessionId, view.nativeSessionId]).toContain(content.sessionId)
+        const current = (await rig.inventory()).find((row) => row.soulId === view.soulId)
+        expect(current).toMatchObject({ soulId: view.soulId, containerId: view.containerId,
+          incarnationId: view.incarnationId, nativeSessionId: view.nativeSessionId })
+      }
+      expect(sent.some((frame) => frame.type === 'freshAgent.attach' && frame.sessionId === original.sessionId)).toBe(true)
+      let release!: () => void
+      const held = new Promise<void>((resolve) => { release = resolve })
+      let liveResponse: any
+      await page.route('**/api/fresh-agent/threads/**', async (route) => {
+        const actual = await route.fetch()
+        liveResponse = await actual.json()
+        await held
+        await route.fulfill({ response: actual })
+      })
+      const baseline = sent.length
+      await harness.receiveWsMessage({ type: 'freshAgent.event', provider: 'codex', sessionType: 'freshcodex',
+        sessionId: original.sessionId, event: { type: 'freshAgent.error', code: 'INVALID_SESSION_ID', message: 'Stale managed lookup' } })
+      await expect(composer).toBeDisabled()
+      await expect(composer).toHaveValue('Draft stays in this managed conversation')
+      await expect.poll(() => liveResponse?.extensions?.codex?.statusFromLiveState).toBe(true)
+      expect(liveResponse.threadId).toBe(view.nativeSessionId)
+      expect(liveResponse.capabilities.send).toBe(true)
+      const afterLoss = sent.slice(baseline)
+      expect(afterLoss.filter((frame) => frame.type === 'freshAgent.create' || frame.type === 'pane.reconcile.request')).toHaveLength(0)
+      expect(received.filter((frame) => frame.type === 'freshAgent.event' && frame.sessionId === original.sessionId
+        && frame.event?.type === 'freshAgent.session.snapshot')).toHaveLength(0)
+      await expect(pane.getByText('Managed fixture saved answer', { exact: true })).toBeVisible()
+      await expect(page.getByTestId('managed-runtime-recovery-card')).toHaveCount(0)
+      await expect(pane.getByRole('button', { name: 'Start new session' })).toHaveCount(0)
+      await expectOriginalConversation()
+      expect(fixtureState().dispatchCount).toBe(before.dispatchCount)
+      release()
+      await expect(composer).toBeEnabled()
+      await expect(composer).toHaveValue('Draft stays in this managed conversation')
+      await composer.press('Enter')
+      await expect.poll(() => fixtureState().completionCount, { timeout: 30_000 }).toBe(before.completionCount + 1)
+      expect(fixtureState().dispatchCount).toBe(before.dispatchCount + 1)
+      expect(fixtureState().nativeSessionId).toBe(view.nativeSessionId)
+      const current = (await rig.inventory()).find((row) => row.soulId === view.soulId)
+      expect(current).toMatchObject({ soulId: view.soulId, containerId: view.containerId,
+        incarnationId: view.incarnationId, nativeSessionId: view.nativeSessionId })
+      await expectOriginalConversation()
+      expect(sent.slice(baseline).filter((frame) => frame.type === 'freshAgent.create' || frame.type === 'pane.reconcile.request')).toHaveLength(0)
+      expect(rig.ownedProviderExec(view.containerId!, ['cat', rolloutPath])).toBe(transcript)
+    } finally {
+      const cleanup = await rig.stop()
+      expect(cleanup.ok, cleanup.errors.join('\n')).toBe(true)
+    }
+  })
+
   test('P4-G08: controller inventory reconstructs views without duplicating souls', async ({ page }) => {
     test.setTimeout(900_000)
 

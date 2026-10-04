@@ -2723,7 +2723,7 @@ export function FreshAgentView({
     // Unmanaged lost threads use lifecycle recovery below. Managed
     // recovery retains durable identity: read-only GETs show saved history
     // while the supervisor resumes automatically or awaits a decision.
-    if (!managedRecoveryPending && (paneContent.provider === 'claude' || paneContent.provider === 'codex') && agentSession?.lost) return
+    if (!supervisorRecoveryOwned && (paneContent.provider === 'claude' || paneContent.provider === 'codex') && agentSession?.lost) return
     setLoadError(null)
     const sessionId = snapshotThreadId
     const provider = paneContent.provider
@@ -2731,6 +2731,8 @@ export function FreshAgentView({
     const requestCreateRequestId = paneContent.createRequestId
     const requestPaneSoulId = paneContent.soulId
     const requestPaneSoulRevision = paneContent.soulIntentRevision
+    const requestOwnerFence = selectPaneOwnerFence(appStore.getState(), paneContent)
+    const requestBootId = appStore.getState().connection.bootId
     // A missing soul uses the owned snapshot route, but remains a history-only
     // read: its status and errors cannot authorize runtime recovery.
     const requestReadOnly = managedRecoveryPending
@@ -2745,6 +2747,8 @@ export function FreshAgentView({
       paneContentRef.current.createRequestId !== requestCreateRequestId
       || paneContentRef.current.soulId !== requestPaneSoulId
       || paneContentRef.current.soulIntentRevision !== requestPaneSoulRevision
+      || appStore.getState().connection.bootId !== requestBootId
+      || JSON.stringify(selectPaneOwnerFence(appStore.getState(), paneContentRef.current)) !== JSON.stringify(requestOwnerFence)
       || requestSerial < snapshotRequestAuthorityRef.current.applied
       // Ordinary reads predating managed recovery never regain authority after Retry.
       // The initial history read can still supply history while a resumed live read waits.
@@ -2766,10 +2770,13 @@ export function FreshAgentView({
     // one key -- keying on raw initialCwd would let the N-pane fan-out survive.
     const requestCwd = freshOpenCodeRouteCwdRef.current ?? paneContentRef.current.initialCwd
     const requestAgentSessionStatusVersion = agentSessionStatusVersionRef.current
+    const requestSessionWasLost = agentSessionLostRef.current
     const requestOutgoingTurnId = outgoingTurnRef.current?.requestId
     const trigger = snapshotRefreshTriggerRef.current
     const refreshSerial = snapshotRefreshSerialRef.current
     const applySnapshot = (next: FreshAgentSnapshot) => {
+      if (requestPaneSoulId && next.extensions?.[provider]?.statusFromLiveState === true
+        && (next.provider !== provider || next.sessionType !== requestSessionType || next.threadId !== sessionId)) return
       const snapshotIdentity = currentAutoTitleIdentityRef.current
       const resolved = next as FreshAgentSnapshot
       const resolvedHasUserTurns = freshAgentSnapshotHasUserTurn(resolved)
@@ -2845,7 +2852,22 @@ export function FreshAgentView({
         }
       }
       // This read has no live actor authority, even if Retry cleared the intervention while it ran.
-      if (requestReadOnly) return
+      const liveProviderState = resolved.extensions?.[provider]
+      if (requestReadOnly || (requestPaneSoulId && (
+        liveProviderState?.nativeHistoryAvailable === true || liveProviderState?.ownerKind === 'vacant'
+      ))) return
+      if (
+        snapshotAccepted && paneContentRef.current.soulId && requestSessionWasLost && agentSessionLostRef.current
+        && agentSessionStatusVersionRef.current === requestAgentSessionStatusVersion
+        && resolved.provider === provider && resolved.sessionType === requestSessionType
+        && resolved.threadId === sessionId
+        && liveProviderState?.statusFromLiveState === true
+        && liveProviderState.nativeHistoryAvailable !== true
+        && liveProviderState.ownerKind !== 'vacant'
+      ) {
+        dispatch(clearSessionLost({ sessionId: paneContentRef.current.sessionId!, sessionType: requestSessionType, provider }))
+        dispatch(clearSessionError({ sessionId: paneContentRef.current.sessionId!, sessionType: requestSessionType, provider }))
+      }
       const echo = localEchoRef.current
       const echoPendingMetadata = echo ? pendingSendMetadataRef.current.get(echo.requestId) : undefined
       const landedEcho = echo
@@ -2918,6 +2940,7 @@ export function FreshAgentView({
           && (snapshotIsBusy || snapshotStatusAuthoritative))
       if (
         sessionStatus
+        && (agentSessionStatusRef.current === undefined || currentSessionStatus !== sessionStatus)
         && nextSessionId
         && canAdoptSnapshotStatus
         && !wouldRegressStatus
@@ -3118,7 +3141,8 @@ export function FreshAgentView({
     }
     // Keep interactive reads and recovery history reads distinct, with pane authority in both keys.
     const key = makeSnapshotKey({ sessionType: requestSessionType, provider, threadId: sessionId, cwd: requestCwd,
-      soulId: requestPaneSoulId, soulIntentRevision: requestPaneSoulRevision }) + `:read-generation:${requestReadGeneration}`
+      soulId: requestPaneSoulId, soulIntentRevision: requestPaneSoulRevision })
+      + `:read-generation:${requestReadGeneration}:boot:${requestBootId ?? ''}:owner:${requestOwnerFence?.epoch ?? ''}:${requestOwnerFence?.generation ?? ''}`
     void getSnapshotScheduler().schedule(key, trigger, () =>
       // NO signal: the run may execute on behalf of other panes sharing the
       // key, or after this effect cleaned up (A2). Staleness is handled by
@@ -3183,6 +3207,11 @@ export function FreshAgentView({
     paneContent.soulIntentRevision,
     paneContent.createRequestId,
     managedRecoveryPending,
+    supervisorRecoveryOwned,
+    connectionBootId,
+    runtimeOwner?.epoch,
+    runtimeOwner?.generation,
+    runtimeOwner?.transition,
     paneContent.recoverySummary?.recoveryState,
     paneContent.sessionId,
     paneContent.sessionType,

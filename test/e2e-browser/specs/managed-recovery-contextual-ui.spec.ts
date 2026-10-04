@@ -337,7 +337,7 @@ test('fresh-agent: automatic recovery reads actual saved Codex history without c
   expect(await fs.readFile(rollout, 'utf8')).toBe(transcript)
 })
 
-test('fresh-agent: lost recovery preserves the conversation while a real same-session attach awaits its snapshot', async ({ page }) => {
+test('legacy provider fixture: injected managed projection preserves the conversation while real cold resume awaits its snapshot', async ({ page }) => {
   test.setTimeout(120_000)
   let rollout = ''
   let operations = ''
