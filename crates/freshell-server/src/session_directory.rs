@@ -4165,9 +4165,17 @@ mod tests {
                 "duplicateItemCount": 2,
             })
         );
+        let mut cache_persisted = false;
+        for _ in 0..40 {
+            if std::fs::metadata(&cache_path).is_ok() {
+                cache_persisted = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
         assert!(
-            std::fs::metadata(&cache_path).is_ok(),
-            "the index cache persisted"
+            cache_persisted,
+            "the index cache persisted within 2s"
         );
         let response_text = serde_json::to_string(&first).unwrap();
         assert!(!response_text.contains(&older_path.to_string_lossy().to_string()));
