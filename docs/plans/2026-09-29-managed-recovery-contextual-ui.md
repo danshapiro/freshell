@@ -17,6 +17,7 @@ Implement the revised durable-runtime UI so automatic recovery stays invisible; 
 - Work in a dedicated worktree and complete the-usual workflow with tests and independent review.
 - Rebase onto current main, resolve overlaps, fix checks to green, verify affected browser coverage, review the updated candidate, and land via PR.
 - Continue whole-branch review beyond the-usual's five-round limit until it passes, then finish the authorized PR landing.
+- Run independent checks and fixes in parallel; use separate worktrees when they would otherwise share mutable source or build artifacts.
 
 ### Accepted tradeoffs and residuals
 - Runtime recovery internals and diagnostics may remain available to the implementation and existing panes; only unnecessary always-visible user-facing surfaces should be removed.
