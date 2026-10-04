@@ -585,7 +585,9 @@ async fn session_directory(
                         snapshot
                             .codex_segment_paths
                             .get(&indexed.session_id)
-                            .filter(|paths| !paths.is_empty())
+                            .filter(|paths| {
+                                !paths.is_empty() && paths.last() == indexed.source_file.as_ref()
+                            })
                             .cloned()
                             .unwrap_or_else(|| indexed.source_file.clone().into_iter().collect())
                     } else {
@@ -3953,7 +3955,7 @@ mod tests {
         assert_eq!(
             rows[0]["lastActivityAt"],
             json!(
-                chrono::DateTime::parse_from_rfc3339("2026-10-03T00:00:10.009Z")
+                chrono::DateTime::parse_from_rfc3339("2026-10-03T00:00:10.004Z")
                     .unwrap()
                     .timestamp_millis()
             )
@@ -3981,6 +3983,62 @@ mod tests {
             overlapping["items"].as_array().unwrap().len(),
             1,
             "a term found in multiple continuation segments returns one logical row"
+        );
+
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn composed_codex_collision_keeps_a_same_id_filename_fallback_path() {
+        let home = unique_temp_dir();
+        let (older, newer) = codex_fixtures();
+        let (older_path, newer_path) = write_codex_segments(&home, &older, &newer);
+        let session_id = "b7936c10-4935-441c-837c-c1f33cafec2d";
+        let sessions = home.join(".codex").join("sessions");
+        let fallback_path =
+            sessions.join(format!("rollout-2026-10-03T00-00-11-{session_id}.jsonl"));
+        std::fs::write(
+            &fallback_path,
+            concat!(
+                "{\"timestamp\":\"2026-10-03T00:00:11.000Z\",\"type\":\"session_meta\",\"payload\":{\"cwd\":\"/sanitized/project\"}}\n",
+                "{\"timestamp\":\"2026-10-03T00:00:12.000Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"user_message\",\"message\":\"Filename fallback duplicate\"}}\n",
+            ),
+        )
+        .unwrap();
+
+        let events = collision_trace_events();
+        let (app, _index) = codex_session_directory_app(
+            &home,
+            None,
+            freshell_ws::identity::TerminalIdentityRegistry::new(),
+        );
+        let page = get_directory_page(
+            &app,
+            "/api/session-directory?priority=visible&includeNonInteractive=1",
+        )
+        .await;
+
+        assert_eq!(page["integrityError"]["collisionCount"], json!(1));
+        assert_eq!(page["integrityError"]["duplicateItemCount"], json!(2));
+        assert!(page["items"].as_array().unwrap().is_empty());
+        assert!(!serde_json::to_string(&page)
+            .unwrap()
+            .contains(&sessions.to_string_lossy().to_string()));
+
+        let captured = collision_events_for_home(&events, &home);
+        assert_eq!(captured.len(), 1);
+        let samples: Vec<Value> =
+            serde_json::from_str(&decoded_trace_field(&captured[0], "collision_samples_json"))
+                .unwrap();
+        let mut expected_paths = vec![older_path, newer_path, fallback_path];
+        expected_paths.sort();
+        assert_eq!(samples[0]["source_file_count"], json!(3));
+        assert_eq!(
+            samples[0]["source_files"],
+            json!(expected_paths
+                .iter()
+                .map(|path| path.to_string_lossy().into_owned())
+                .collect::<Vec<_>>())
         );
 
         std::fs::remove_dir_all(&home).ok();
