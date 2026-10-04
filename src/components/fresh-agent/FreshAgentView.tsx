@@ -94,6 +94,7 @@ import { isDurableProviderSessionId } from '@shared/session-flavor'
 import {
   getCanonicalPaneResumeSessionId,
   getFreshAgentSnapshotThreadId,
+  getManagedBootstrapHistoryThreadId,
 } from '@/lib/fresh-agent-snapshot-thread'
 import { DEFAULT_FRESH_AGENT_STYLE, normalizeFreshAgentStyle } from '@shared/settings'
 import {
@@ -1196,7 +1197,9 @@ export function FreshAgentView({
   const pendingAutoTitleBySessionIdRef = useRef<Map<string, string>>(new Map())
   const handledRefreshRequestIdRef = useRef<string | null>(null)
   const preferredResumeSessionId = getPreferredResumeSessionId(claudeSession) ?? paneContent.resumeSessionId
-  const snapshotThreadId = getFreshAgentSnapshotThreadId(paneContent, claudeSession)
+  const bootstrapHistoryThreadId = getManagedBootstrapHistoryThreadId(paneContent)
+  const snapshotReadOnly = managedRecoveryPending || Boolean(bootstrapHistoryThreadId)
+  const snapshotThreadId = bootstrapHistoryThreadId ?? getFreshAgentSnapshotThreadId(paneContent, claudeSession)
   const snapshotThreadIdRef = useRef(snapshotThreadId)
   snapshotThreadIdRef.current = snapshotThreadId
   const snapshotHydrationIdentity = `${paneContent.createRequestId}:${paneContent.sessionType}:${paneContent.provider}:${snapshotThreadId ?? ''}`
@@ -2765,7 +2768,7 @@ export function FreshAgentView({
     const requestBootId = appStore.getState().connection.bootId
     // A missing soul uses the owned snapshot route, but remains a history-only
     // read: its status and errors cannot authorize runtime recovery.
-    const requestReadOnly = managedRecoveryPending
+    const requestReadOnly = snapshotReadOnly
     const requestSoulId = requestReadOnly ? requestPaneSoulId : undefined
     const requestSerial = ++snapshotRequestAuthorityRef.current.next
     if (snapshotRequestAuthorityRef.current.readOnlySource !== requestReadOnly) {
@@ -3301,6 +3304,7 @@ export function FreshAgentView({
     setLocalEcho,
     snapshotThreadId,
     snapshotRefreshNonce,
+    snapshotReadOnly,
     tabId,
   ])
 

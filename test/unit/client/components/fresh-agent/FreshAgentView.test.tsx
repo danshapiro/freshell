@@ -21,6 +21,7 @@ import {
   applyFreshAgentReconcileAttach,
   requestPaneRefresh,
   resetFreshAgentPaneForReconcileCreate,
+  startNewManagedRuntimeConversation,
   setActivePane,
   setPaneHandoffError,
   updatePaneContent,
@@ -29,7 +30,10 @@ import {
 import { useAppSelector } from '@/store/hooks'
 import { updateTab } from '@/store/tabsSlice'
 import { handleFreshAgentMessage } from '@/lib/fresh-agent-ws'
-import { setFreshAgentReconcileActive } from '@/lib/pane-reconcile'
+import { buildReconcileRequest, foldVerdicts, setFreshAgentReconcileActive } from '@/lib/pane-reconcile'
+import type { AppDispatch, RootState } from '@/store/store'
+import { getFreshAgentSnapshotThreadId, getManagedBootstrapHistoryThreadId } from '@/lib/fresh-agent-snapshot-thread'
+import type { FreshAgentPaneContent } from '@/store/paneTypes'
 import { ApiError } from '@/lib/api'
 import { resetSnapshotSchedulerForTests, SNAPSHOT_DEBOUNCE_MS } from '@/lib/fresh-agent-snapshot-scheduler'
 import { SESSION_HANDOFF_RETRY_BACKOFF_MS } from '@/lib/session-handoff'
@@ -599,6 +603,357 @@ beforeEach(() => {
 
 afterEach(() => {
   cleanup()
+})
+
+describe('managed bootstrap history', () => {
+  const cases = [
+    { sessionType: 'freshclaude', provider: 'claude', history: savedClaudeNativeHistory, text: 'Saved native Claude answer' },
+    { sessionType: 'kilroy', provider: 'claude', history: { ...savedClaudeNativeHistory, sessionType: 'kilroy' }, text: 'Saved native Claude answer' },
+    { sessionType: 'freshcodex', provider: 'codex', history: savedCodexNativeHistory, text: 'Saved native Codex answer' },
+    { sessionType: 'freshopencode', provider: 'opencode', history: savedOpenCodeNativeHistory, text: 'Saved native OpenCode answer' },
+  ] as const
+
+  function foldFresh(store: ReturnType<typeof createStore>) {
+    const request = buildReconcileRequest(store.getState() as RootState, { includeFreshAgent: true })!
+    return foldVerdicts(store.dispatch as AppDispatch, request, { type: 'pane.reconcile.result',
+      reconcileId: request.reconcileId, bootId: 'bootstrap-new-boot', serverInstanceId: 'bootstrap-server',
+      verdicts: [{ paneKey: request.panes[0].paneKey, verdict: 'fresh', reason: 'identity_never_observed' }] })
+  }
+
+  function mountPending(historyRead: ReturnType<typeof createDeferred<unknown>>, nativeRead = historyRead) {
+    const native = FreshAgentSnapshotSchema.parse(savedCodexNativeHistory)
+    const locator = { sessionType: 'freshcodex' as const, provider: 'codex' as const, sessionId: native.threadId }
+    const store = createStore()
+    const handlers = new Set<(message: any) => void>()
+    wsMock.onMessage.mockImplementation((handler) => { handlers.add(handler); return () => { handlers.delete(handler) } })
+    apiMock.getFreshAgentThreadSnapshot.mockImplementation((_type, _provider, _thread, options) => options?.soulId ? historyRead.promise : nativeRead.promise)
+    store.dispatch(sessionInit(locator))
+    store.dispatch(initLayout({ tabId: 'tab-1', paneId: 'pane-1', content: { kind: 'fresh-agent', ...locator,
+      sessionRef: { provider: 'codex', sessionId: native.threadId }, resumeSessionId: native.threadId,
+      createRequestId: 'pending-original-request', status: 'connected', soulId: 'pending-owned-soul', soulIntentRevision: 7 } }))
+    foldFresh(store)
+    const mount = () => render(<Provider store={store}><StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" /></Provider>)
+    const emit = (message: unknown) => handlers.forEach((handler) => handler(message))
+    return { store, native, locator, mount, emit }
+  }
+
+  afterEach(() => { cleanup(); resetSnapshotSchedulerForTests(); installPerfAuditBridge(null); vi.useRealTimers() })
+
+  it.each(cases.flatMap((entry) => [false, true].map((hydrated) => ({ ...entry, hydrated }))))(
+    'reads current owned $sessionType history before recovery projection (hydrated=$hydrated)', async ({ sessionType, provider, history, text, hydrated }) => {
+      vi.useFakeTimers()
+      const oldRead = createDeferred<unknown>()
+      const ownedRead = createDeferred<unknown>()
+      const native = FreshAgentSnapshotSchema.parse(history)
+      const live = { ...native, capabilities: { ...native.capabilities, send: true },
+        extensions: { [provider]: { statusFromLiveState: true, ownerKind: 'fresh-agent', nativeHistoryAvailable: true } } }
+      const handlers = new Set<(message: any) => void>()
+      wsMock.onMessage.mockImplementation((handler) => { handlers.add(handler); return () => { handlers.delete(handler) } })
+      const bridge = createPerfAuditBridge()
+      installPerfAuditBridge(bridge)
+      let initialLive = hydrated
+      apiMock.getFreshAgentThreadSnapshot.mockImplementation((_type, _provider, _thread, options) => {
+        if (options?.soulId) return ownedRead.promise
+        if (initialLive) { initialLive = false; return Promise.resolve(live) }
+        return oldRead.promise
+      })
+      const store = createStore()
+      const sessionRef = { provider, sessionId: native.threadId }
+      const locator = { sessionId: native.threadId, provider, sessionType }
+      store.dispatch(setBootId('bootstrap-old-boot'))
+      store.dispatch(sessionInit(locator))
+      store.dispatch(applyRuntimeOwner({ type: 'session.runtimeOwner', ...locator, epoch: 2, generation: 3,
+        ownerKind: 'fresh-agent', transition: 'handoff-committed', operationId: 'bootstrap-owner' }))
+      store.dispatch(initLayout({ tabId: 'tab-1', paneId: 'pane-1', content: { kind: 'fresh-agent', ...locator,
+        sessionRef, resumeSessionId: native.threadId, createRequestId: 'bootstrap-original-request', status: 'connected',
+        soulId: 'bootstrap-owned-soul', soulIntentRevision: 7,
+        recoverySummary: { desiredState: 'running', recoveryState: 'live', durabilityState: 'resume_captured', allocationState: 'verified_durable' } } }))
+      try {
+        await act(async () => {
+          render(<Provider store={store}><StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" /></Provider>)
+          await vi.advanceTimersByTimeAsync(0)
+        })
+        if (hydrated) {
+          expect(screen.getByText(text)).toBeInTheDocument()
+          await act(async () => { store.dispatch(requestPaneRefresh({ tabId: 'tab-1', paneId: 'pane-1' })); await vi.advanceTimersByTimeAsync(SNAPSHOT_DEBOUNCE_MS) })
+        }
+        const beforeResetCalls = apiMock.getFreshAgentThreadSnapshot.mock.calls.length
+        expect(beforeResetCalls).toBe(hydrated ? 2 : 1)
+        const composer = screen.getByRole('textbox', { name: 'Chat message input' })
+        fireEvent.change(composer, { target: { value: 'Draft survives original bootstrap' } })
+        wsMock.send.mockClear()
+        await act(async () => {
+          store.dispatch(setBootId('bootstrap-new-boot'))
+          store.dispatch(markSessionLost(locator))
+          expect(foldFresh(store).fresh).toBe(1)
+          await vi.advanceTimersByTimeAsync(0)
+        })
+        expect(apiMock.getFreshAgentThreadSnapshot.mock.calls.slice(beforeResetCalls)).toHaveLength(1)
+        expect(apiMock.getFreshAgentThreadSnapshot.mock.calls.at(-1)).toEqual([
+          sessionType, provider, native.threadId, expect.objectContaining({ soulId: 'bootstrap-owned-soul' }),
+        ])
+        expect(getFreshAgentPaneContent(store)).toMatchObject({ sessionRef, resumeSessionId: native.threadId,
+          createRequestId: 'bootstrap-original-request', soulId: 'bootstrap-owned-soul', pendingReconcile: 'fresh', reconcileEpoch: 1 })
+        expect(getFreshAgentPaneContent(store).sessionId).toBeUndefined()
+        expect(sentFreshAgentMessages('freshAgent.create')).toEqual([expect.objectContaining({
+          requestId: 'bootstrap-original-request', sessionRef, tabId: 'tab-1', observedEpoch: 2, observedGeneration: 3,
+        })])
+        await act(async () => {
+          for (const handler of handlers) handler({ type: 'freshAgent.create.failed', requestId: 'bootstrap-original-request',
+            code: 'FRESH_AGENT_CREATE_FAILED', message: 'Owned host is temporarily unavailable', retryable: true })
+        })
+        expect(getFreshAgentPaneContent(store).status).toBe('create-failed')
+        await act(async () => { await vi.advanceTimersByTimeAsync(5_001) })
+        expect(getFreshAgentPaneContent(store).reconcileNotice).toBeUndefined()
+        await act(async () => { oldRead.resolve(live); ownedRead.resolve(native); await vi.advanceTimersByTimeAsync(0) })
+        expect(screen.getByText(text)).toBeInTheDocument()
+        expect(composer).toHaveValue('Draft survives original bootstrap')
+        expect(composer).toBeDisabled()
+        expect(screen.queryByRole('button', { name: 'Stop' })).not.toBeInTheDocument()
+        expect(getFreshAgentPaneContent(store)).toMatchObject({ sessionRef, resumeSessionId: native.threadId,
+          soulId: 'bootstrap-owned-soul', soulIntentRevision: 7, status: 'create-failed', pendingReconcile: 'fresh',
+          recoverySummary: { recoveryState: 'live' } })
+        expect(sentFreshAgentMessages('freshAgent.create')).toHaveLength(1)
+        expect(sentFreshAgentMessages('pane.reconcile.request')).toHaveLength(0)
+        expect(sentFreshAgentMessages('freshAgent.attach')).toHaveLength(0)
+        const audit = bridge.snapshot().perfEvents.filter((entry) => entry.event === 'fresh_agent.snapshot_request')
+        expect(audit.some((entry) => entry.stage === 'currentness_checked' && entry.stale === true && entry.fence === 'boot')).toBe(true)
+        expect(audit.some((entry) => entry.stage === 'soul_started' && entry.source === 'direct' && entry.requestReadOnly === true)).toBe(true)
+        expect(audit.some((entry) => entry.stage === 'display_committed' && entry.historyOnly === true && entry.requestReadOnly === true)).toBe(true)
+        expect(apiMock.getManagedRuntimeInventory).not.toHaveBeenCalled()
+        expect(store.getState().freshAgent.sessions[`${sessionType}:${provider}:${native.threadId}`].lost).toBe(true)
+      } finally {
+        cleanup()
+        await act(async () => { oldRead.resolve(live); ownedRead.resolve(native); await vi.advanceTimersByTimeAsync(0) })
+        resetSnapshotSchedulerForTests()
+        installPerfAuditBridge(null)
+        vi.useRealTimers()
+      }
+    })
+
+  it('reads a failed in-memory bootstrap after notice dismissal and remount with the same identity', async () => {
+    vi.useFakeTimers()
+    const firstRead = createDeferred<unknown>()
+    const secondRead = createDeferred<unknown>()
+    const fixture = mountPending(firstRead)
+    try {
+      let mounted = fixture.mount()
+      await act(async () => { await vi.advanceTimersByTimeAsync(0) })
+      expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledTimes(1)
+      await act(async () => fixture.emit({ type: 'freshAgent.create.failed', requestId: 'pending-original-request',
+        code: 'FRESH_AGENT_CREATE_FAILED', message: 'Host unavailable', retryable: true }))
+      await act(async () => { await vi.advanceTimersByTimeAsync(5_001); firstRead.resolve(fixture.native) })
+      expect(screen.getByText('Saved native Codex answer')).toBeInTheDocument()
+      expect(getFreshAgentPaneContent(fixture.store).reconcileNotice).toBeUndefined()
+      expect(getFreshAgentPaneContent(fixture.store).status).toBe('create-failed')
+      const current = getFreshAgentPaneContent(fixture.store)
+      mounted.unmount()
+      resetSnapshotSchedulerForTests()
+      apiMock.getFreshAgentThreadSnapshot.mockReturnValue(secondRead.promise)
+      mounted = fixture.mount()
+      await act(async () => { await vi.advanceTimersByTimeAsync(0) })
+      expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledTimes(2)
+      expect(apiMock.getFreshAgentThreadSnapshot.mock.calls.at(-1)).toEqual([
+        'freshcodex', 'codex', fixture.native.threadId, expect.objectContaining({ soulId: 'pending-owned-soul' }),
+      ])
+      await act(async () => secondRead.resolve(fixture.native))
+      expect(screen.getByText('Saved native Codex answer')).toBeInTheDocument()
+      expect(screen.getByRole('textbox', { name: 'Chat message input' })).toBeDisabled()
+      expect(getFreshAgentPaneContent(fixture.store)).toEqual(current)
+      // Existing create-on-mount semantics may retry once on each mount; both
+      // bootstraps must name the same original request and saved conversation.
+      expect(sentFreshAgentMessages('freshAgent.create')).toHaveLength(2)
+      expect(sentFreshAgentMessages('freshAgent.create').every((message) => message.requestId === 'pending-original-request'
+        && (message.sessionRef as { sessionId: string }).sessionId === fixture.native.threadId)).toBe(true)
+      expect(sentFreshAgentMessages('pane.reconcile.request')).toHaveLength(0)
+      expect(apiMock.getManagedRuntimeInventory).not.toHaveBeenCalled()
+    } finally { cleanup(); await act(async () => { firstRead.resolve(fixture.native); secondRead.resolve(fixture.native); await vi.advanceTimersByTimeAsync(0) }) }
+  })
+
+  it.each(['success', 'failure'] as const)('retains loaded transcript and draft when pending owned history returns %s', async (outcome) => {
+    vi.useFakeTimers()
+    const firstRead = createDeferred<unknown>()
+    const nextRead = createDeferred<unknown>()
+    const fixture = mountPending(firstRead)
+    try {
+      fixture.mount()
+      await act(async () => { firstRead.resolve(fixture.native); await vi.advanceTimersByTimeAsync(0) })
+      expect(screen.getByText('Saved native Codex answer')).toBeInTheDocument()
+      const composer = screen.getByRole('textbox', { name: 'Chat message input' })
+      fireEvent.change(composer, { target: { value: 'Retained failed-read draft' } })
+      apiMock.getFreshAgentThreadSnapshot.mockReturnValue(nextRead.promise)
+      await act(async () => { fixture.store.dispatch(setBootId('failed-history-next-boot')); await vi.advanceTimersByTimeAsync(0) })
+      expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledTimes(2)
+      const current = getFreshAgentPaneContent(fixture.store)
+      await act(async () => outcome === 'success' ? nextRead.resolve(fixture.native) : nextRead.reject(new ApiError(404, 'Owned history unavailable')))
+      expect(screen.getByText('Saved native Codex answer')).toBeInTheDocument()
+      expect(composer).toHaveValue('Retained failed-read draft')
+      expect(composer).toBeDisabled()
+      expect(getFreshAgentPaneContent(fixture.store)).toEqual(current)
+      if (outcome === 'failure') expect(screen.getByText('Owned history unavailable')).toBeInTheDocument()
+      expect(sentFreshAgentMessages('freshAgent.create')).toHaveLength(1)
+      expect(sentFreshAgentMessages('freshAgent.attach')).toHaveLength(0)
+      expect(sentFreshAgentMessages('pane.reconcile.request')).toHaveLength(0)
+    } finally { cleanup(); await act(async () => { firstRead.resolve(fixture.native); nextRead.resolve(fixture.native); await vi.advanceTimersByTimeAsync(0) }) }
+  })
+
+  it.each([false, true])('keeps late bootstrap history read-only and newer live truth authoritative (live first=%s)', async (liveFirst) => {
+    vi.useFakeTimers()
+    const historyRead = createDeferred<unknown>()
+    const liveRead = createDeferred<unknown>()
+    const fixture = mountPending(historyRead, liveRead)
+    try {
+      fixture.mount()
+      await act(async () => { await vi.advanceTimersByTimeAsync(0) })
+      const composer = screen.getByRole('textbox', { name: 'Chat message input' })
+      fireEvent.change(composer, { target: { value: 'Same native Send after bootstrap' } })
+      await act(async () => fixture.emit({ type: 'freshAgent.created', requestId: 'pending-original-request',
+        ...fixture.locator, sessionRef: { provider: 'codex', sessionId: fixture.native.threadId } }))
+      expect(getFreshAgentPaneContent(fixture.store).pendingReconcile).toBeUndefined()
+      expect(apiMock.getFreshAgentThreadSnapshot.mock.calls.at(-1)?.[3]?.soulId).toBeUndefined()
+      const live = { ...fixture.native, capabilities: { ...fixture.native.capabilities, send: true },
+        extensions: { codex: { statusFromLiveState: true, nativeHistoryAvailable: true, ownerKind: 'fresh-agent' } } }
+      if (!liveFirst) {
+        await act(async () => historyRead.resolve(fixture.native))
+        expect(screen.getByText('Saved native Codex answer')).toBeInTheDocument()
+        expect(composer).toBeDisabled()
+        expect(composer).toHaveValue('Same native Send after bootstrap')
+      }
+      await act(async () => liveRead.resolve(live))
+      if (liveFirst) await act(async () => historyRead.resolve(fixture.native))
+      expect(composer).not.toBeDisabled()
+      fireEvent.click(screen.getByRole('button', { name: 'Send' }))
+      expect(sentFreshAgentMessages('freshAgent.send')).toEqual([expect.objectContaining({ sessionId: fixture.native.threadId })])
+      expect(sentFreshAgentMessages('freshAgent.create')).toHaveLength(1)
+      expect(getFreshAgentPaneContent(fixture.store)).toMatchObject({ createRequestId: 'pending-original-request',
+        sessionId: fixture.native.threadId, sessionRef: { provider: 'codex', sessionId: fixture.native.threadId }, soulId: 'pending-owned-soul' })
+    } finally { cleanup(); await act(async () => { historyRead.resolve(fixture.native); liveRead.resolve(fixture.native); await vi.advanceTimersByTimeAsync(0) }) }
+  })
+
+  it.each(['provider', 'type', 'thread'] as const)('rejects wrong %s in a bootstrap owned-history response', async (change) => {
+    const held = createDeferred<unknown>()
+    const fixture = mountPending(held)
+    fixture.mount()
+    try {
+      await waitFor(() => expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledTimes(1))
+      const current = getFreshAgentPaneContent(fixture.store)
+      await act(async () => held.resolve({ ...fixture.native,
+        ...(change === 'provider' ? { provider: 'opencode', extensions: { opencode: { ownerKind: 'vacant', nativeHistoryAvailable: true } } } : {}),
+        ...(change === 'type' ? { sessionType: 'kilroy' } : {}),
+        ...(change === 'thread' ? { threadId: 'wrong-native-source' } : {}),
+      }))
+      expect(screen.queryByText('Saved native Codex answer')).not.toBeInTheDocument()
+      expect(getFreshAgentPaneContent(fixture.store)).toEqual(current)
+      expect(sentFreshAgentMessages('freshAgent.create')).toHaveLength(1)
+      expect(sentFreshAgentMessages('freshAgent.attach')).toHaveLength(0)
+    } finally { cleanup(); await act(async () => held.resolve(fixture.native)) }
+  })
+
+  it.each(['boot', 'owner', 'soul', 'revision', 'request', 'thread', 'provider', 'type'] as const)(
+    'rejects a held bootstrap history response after current %s changes', async (change) => {
+      const held = createDeferred<unknown>()
+      const currentRead = createDeferred<unknown>()
+      const fixture = mountPending(held)
+      fixture.mount()
+      try {
+        await waitFor(() => expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledTimes(1))
+        apiMock.getFreshAgentThreadSnapshot.mockReturnValue(currentRead.promise)
+        act(() => {
+          if (change === 'boot') fixture.store.dispatch(setBootId('next-bootstrap-boot'))
+          else if (change === 'owner') fixture.store.dispatch(applyRuntimeOwner({ type: 'session.runtimeOwner', ...fixture.locator,
+            epoch: 3, generation: 4, ownerKind: 'fresh-agent', transition: 'handoff-committed', operationId: 'next-bootstrap-owner' }))
+          else fixture.store.dispatch(updatePaneContent({ tabId: 'tab-1', paneId: 'pane-1', content: {
+            ...getFreshAgentPaneContent(fixture.store),
+            ...(change === 'soul' ? { soulId: 'next-owned-soul' } : {}),
+            ...(change === 'revision' ? { soulIntentRevision: 8 } : {}),
+            ...(change === 'request' ? { createRequestId: 'explicit-next-request' } : {}),
+            ...(change === 'thread' ? { sessionRef: { provider: 'codex', sessionId: 'next-native-thread' }, resumeSessionId: 'next-native-thread' } : {}),
+            ...(change === 'provider' ? { provider: 'opencode' } : {}),
+            ...(change === 'type' ? { sessionType: 'kilroy' } : {}),
+          } }))
+        })
+        const current = getFreshAgentPaneContent(fixture.store)
+        await act(async () => held.resolve(fixture.native))
+        expect(screen.queryByText('Saved native Codex answer')).not.toBeInTheDocument()
+        expect(getFreshAgentPaneContent(fixture.store)).toEqual(current)
+      } finally { cleanup(); await act(async () => { held.resolve(fixture.native); currentRead.resolve(fixture.native) }) }
+    })
+
+  it('allows a legitimate current historical ref restored after a fresh reset initially cleared it', async () => {
+    const held = createDeferred<unknown>()
+    const fixture = mountPending(held)
+    fixture.store.dispatch(resetFreshAgentPaneForReconcileCreate({ tabId: 'tab-1', paneId: 'pane-1', intent: 'fresh', reason: 'duplicate_session_claim' }))
+    expect(getFreshAgentPaneContent(fixture.store).sessionRef).toBeUndefined()
+    fixture.store.dispatch(updatePaneContent({ tabId: 'tab-1', paneId: 'pane-1', content: { ...getFreshAgentPaneContent(fixture.store),
+      sessionRef: { provider: 'codex', sessionId: fixture.native.threadId }, resumeSessionId: fixture.native.threadId } }))
+    fixture.mount()
+    try {
+      await waitFor(() => expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledTimes(1))
+      expect(apiMock.getFreshAgentThreadSnapshot.mock.calls[0][3]).toMatchObject({ soulId: 'pending-owned-soul' })
+      await act(async () => held.resolve(fixture.native))
+      expect(screen.getByText('Saved native Codex answer')).toBeInTheDocument()
+      expect(screen.getByRole('textbox', { name: 'Chat message input' })).toBeDisabled()
+      expect(sentFreshAgentMessages('freshAgent.create')).toHaveLength(1)
+      expect(sentFreshAgentMessages('freshAgent.create')[0]).toMatchObject({ requestId: 'pending-original-request',
+        sessionRef: { provider: 'codex', sessionId: fixture.native.threadId } })
+      expect(sentFreshAgentMessages('freshAgent.attach')).toHaveLength(0)
+    } finally { cleanup(); await act(async () => held.resolve(fixture.native)) }
+  })
+
+  it.each(['fresh', 'respawn'] as const)('resolves only existing managed canonical history during pending %s', (pendingReconcile) => {
+    const pane: FreshAgentPaneContent = { kind: 'fresh-agent', sessionType: 'freshopencode', provider: 'opencode',
+      status: 'creating', createRequestId: 'original-request', soulId: 'owned-soul', pendingReconcile,
+      sessionRef: { provider: 'opencode', sessionId: 'ses_original' } }
+    expect(getManagedBootstrapHistoryThreadId(pane)).toBe('ses_original')
+    expect(getManagedBootstrapHistoryThreadId({ ...pane, status: 'create-failed', reconcileNotice: undefined })).toBe('ses_original')
+    expect(getFreshAgentSnapshotThreadId(pane, undefined)).toBeUndefined()
+    for (const updates of [{ soulId: undefined }, { createRequestId: '' }, { pendingReconcile: undefined },
+      { sessionId: 'live-handle' }, { sessionRef: undefined },
+      { sessionRef: { provider: 'claude' as const, sessionId: CLAUDE_THREAD_ID } },
+      { sessionRef: { provider: 'opencode' as const, sessionId: 'freshopencode-placeholder' } }]) {
+      expect(getManagedBootstrapHistoryThreadId({ ...pane, ...updates })).toBeUndefined()
+    }
+  })
+
+  it('uses only the authoritative server-named canonical ref after a valid managed respawn fold', async () => {
+    const held = createDeferred<unknown>()
+    const fixture = mountPending(held)
+    fixture.store.dispatch(updatePaneContent({ tabId: 'tab-1', paneId: 'pane-1', content: {
+      ...getFreshAgentPaneContent(fixture.store), sessionRef: { provider: 'codex', sessionId: 'superseded-native' }, resumeSessionId: 'superseded-native',
+    } }))
+    const request = buildReconcileRequest(fixture.store.getState() as RootState, { includeFreshAgent: true })!
+    const sessionRef = { provider: 'codex', sessionId: fixture.native.threadId }
+    const result = foldVerdicts(fixture.store.dispatch as AppDispatch, request, { type: 'pane.reconcile.result',
+      reconcileId: request.reconcileId, bootId: 'bootstrap-boot', serverInstanceId: 'bootstrap-server',
+      verdicts: [{ paneKey: request.panes[0].paneKey, verdict: 'respawn', sessionRef }] })
+    expect(result.respawned).toBe(1)
+    fixture.mount()
+    try {
+      await waitFor(() => expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledTimes(1))
+      expect(apiMock.getFreshAgentThreadSnapshot.mock.calls[0]).toEqual(['freshcodex', 'codex', fixture.native.threadId,
+        expect.objectContaining({ soulId: 'pending-owned-soul' })])
+      await act(async () => held.resolve(fixture.native))
+      expect(screen.getByText('Saved native Codex answer')).toBeInTheDocument()
+      expect(getFreshAgentPaneContent(fixture.store)).toMatchObject({ sessionRef, resumeSessionId: fixture.native.threadId,
+        pendingReconcile: 'respawn', createRequestId: 'pending-original-request' })
+      expect(sentFreshAgentMessages('freshAgent.create')).toEqual([expect.objectContaining({ sessionRef, requestId: 'pending-original-request' })])
+      expect(screen.getByRole('textbox', { name: 'Chat message input' })).toBeDisabled()
+    } finally { cleanup(); await act(async () => held.resolve(fixture.native)) }
+  })
+
+  it('clears the bootstrap historical source at the actual explicit new-conversation boundary', () => {
+    const held = createDeferred<unknown>()
+    const fixture = mountPending(held)
+    expect(getManagedBootstrapHistoryThreadId(getFreshAgentPaneContent(fixture.store))).toBe(fixture.native.threadId)
+    fixture.store.dispatch(startNewManagedRuntimeConversation({ tabId: 'tab-1', paneId: 'pane-1' }))
+    const fresh = getFreshAgentPaneContent(fixture.store)
+    expect(getManagedBootstrapHistoryThreadId(fresh)).toBeUndefined()
+    expect(fresh.sessionRef).toBeUndefined()
+    expect(fresh.soulId).toBeUndefined()
+    expect(fresh.pendingReconcile).toBeUndefined()
+    expect(fresh.createRequestId).not.toBe('pending-original-request')
+    held.resolve(fixture.native)
+  })
 })
 
 describe('FreshAgentView', () => {
