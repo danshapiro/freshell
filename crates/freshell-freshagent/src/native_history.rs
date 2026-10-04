@@ -223,7 +223,10 @@ pub(crate) fn finish_retention(
 }
 
 fn read_opencode(home: &Path, id: &str) -> Result<Value, String> {
-    let path = home.join(".local/share/opencode/opencode.db");
+    read_opencode_path(&home.join(".local/share/opencode/opencode.db"), id)
+}
+
+pub(crate) fn read_opencode_path(path: &Path, id: &str) -> Result<Value, String> {
     let companions_absent =
         || !path.with_extension("db-wal").exists() && !path.with_extension("db-shm").exists();
     // A clean WAL close removes its companions. SQLite otherwise needs a writable

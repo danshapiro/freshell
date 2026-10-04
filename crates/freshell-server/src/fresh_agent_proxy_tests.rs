@@ -661,3 +661,396 @@ async fn rollback_commands_keep_direction_target_and_request_fences() {
         server.await.unwrap();
     }
 }
+
+static SNAPSHOT_OUTAGE_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+struct SnapshotTestEnv(Vec<(&'static str, Option<std::ffi::OsString>)>);
+impl SnapshotTestEnv {
+    fn isolate(root: &Path) -> Self {
+        let keys = [
+            "HOME",
+            "CODEX_HOME",
+            "CLAUDE_CONFIG_DIR",
+            "CLAUDE_HOME",
+            "XDG_DATA_HOME",
+            "CODEX_CMD",
+            "FAKE_CODEX_APP_SERVER_BEHAVIOR",
+            "FAKE_CODEX_APP_SERVER_ALLOW_DURABLE_WRITES",
+        ];
+        let saved = Self(
+            keys.iter()
+                .map(|key| (*key, std::env::var_os(key)))
+                .collect(),
+        );
+        std::env::set_var("HOME", root.join("empty-home"));
+        std::env::set_var("CODEX_HOME", root.join("configured-codex"));
+        std::env::set_var("CLAUDE_CONFIG_DIR", root.join("configured-claude"));
+        std::env::remove_var("CLAUDE_HOME");
+        std::env::set_var("XDG_DATA_HOME", root.join("configured-xdg"));
+        std::env::set_var("CODEX_CMD", "/never-start-a-provider-for-saved-history");
+        saved
+    }
+}
+impl Drop for SnapshotTestEnv {
+    fn drop(&mut self) {
+        for (key, value) in &self.0 {
+            match value {
+                Some(value) => std::env::set_var(key, value),
+                None => std::env::remove_var(key),
+            }
+        }
+    }
+}
+
+fn snapshot_outage_proxy(socket: &Path) -> Arc<HostedFreshAgentProxy> {
+    Arc::new(HostedFreshAgentProxy {
+        client: RuntimeClient::new(socket, "0123456789abcdef"),
+        broadcast: Arc::new(broadcast::channel(16).0),
+        aliases: Mutex::new(HashMap::from([(
+            ("codex".into(), "session-activity".into()),
+            SoulId::parse("known-hosted-soul").unwrap(),
+        )])),
+        presentation_ids: Mutex::new(HashMap::new()),
+        pollers: Mutex::new(HashSet::new()),
+        fixture_modes: HashSet::new(),
+        naming: OnceLock::new(),
+    })
+}
+
+async fn snapshot_route_value(
+    app: &axum::Router,
+    session_type: &str,
+    provider: &str,
+    native: &str,
+) -> (axum::http::StatusCode, serde_json::Value) {
+    use tower::ServiceExt;
+    let reply = app
+        .clone()
+        .oneshot(
+            axum::http::Request::builder()
+                .uri(format!(
+                    "/api/fresh-agent/threads/{session_type}/{provider}/{native}"
+                ))
+                .header("x-auth-token", "tok")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = reply.status();
+    let bytes = axum::body::to_bytes(reply.into_body(), 32 * 1024 * 1024)
+        .await
+        .unwrap();
+    (status, serde_json::from_slice(&bytes).unwrap())
+}
+
+#[tokio::test]
+async fn real_gateway_outage_preserves_exact_cold_native_history_without_live_authority() {
+    let _lock = SNAPSHOT_OUTAGE_ENV_LOCK.lock().await;
+    let dir = tempfile::tempdir().unwrap();
+    let _env = SnapshotTestEnv::isolate(dir.path());
+    let socket = dir.path().join("owned-supervisor.sock");
+    let listener = UnixListener::bind(&socket).unwrap();
+    drop(listener);
+    std::fs::remove_file(&socket).unwrap(); // Only this fixture's socket becomes unavailable.
+    let codex_path = dir
+        .path()
+        .join("configured-codex/sessions/rollout-session-activity.jsonl");
+    let claude_path = dir
+        .path()
+        .join("configured-claude/projects/fixture/44444444-4444-4444-8444-444444444444.jsonl");
+    let db_path = dir.path().join("configured-xdg/opencode/opencode.db");
+    for path in [&codex_path, &claude_path, &db_path] {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    }
+    std::fs::write(
+        &codex_path,
+        include_str!("../../../test/fixtures/coding-cli/codex/task-events.sanitized.jsonl"),
+    )
+    .unwrap();
+    std::fs::write(
+        &claude_path,
+        include_str!("../../../test/fixtures/managed-native-history/claude.jsonl"),
+    )
+    .unwrap();
+    let db = rusqlite::Connection::open(&db_path).unwrap();
+    db.execute_batch("CREATE TABLE session(id TEXT PRIMARY KEY,title TEXT,time_updated INTEGER); CREATE TABLE message(id TEXT PRIMARY KEY,session_id TEXT,time_created INTEGER,data TEXT); CREATE TABLE part(id TEXT PRIMARY KEY,session_id TEXT,message_id TEXT,time_created INTEGER,data TEXT); INSERT INTO session VALUES('ses_saved','Saved',2);").unwrap();
+    db.execute("INSERT INTO message VALUES('message-one','ses_saved',1,?1)", [serde_json::json!({"id":"message-one","role":"assistant","time":{"created":1,"completed":2}}).to_string()]).unwrap();
+    db.execute("INSERT INTO part VALUES('part-one','ses_saved','message-one',1,?1)", [serde_json::json!({"id":"part-one","type":"text","text":"Saved native OpenCode answer"}).to_string()]).unwrap();
+    drop(db);
+    let paths = [&codex_path, &claude_path, &db_path];
+    let before: Vec<_> = paths
+        .iter()
+        .map(|path| {
+            (
+                std::fs::read(path).unwrap(),
+                std::fs::metadata(path).unwrap().modified().unwrap(),
+            )
+        })
+        .collect();
+    let broadcast = Arc::new(broadcast::channel(64).0);
+    let codex = freshell_freshagent::FreshCodexState::new(
+        Arc::new("tok".into()),
+        broadcast.clone(),
+        serde_json::json!({}),
+    );
+    let claude = freshell_freshagent::FreshClaudeState::new(broadcast.clone());
+    let opencode = freshell_freshagent::FreshAgentState::new(Arc::new("tok".into()), broadcast);
+    let proxy = snapshot_outage_proxy(&socket);
+    opencode.set_hosted_rest_gateway(proxy.clone()).unwrap();
+    let app =
+        freshell_freshagent::snapshot::router(freshell_freshagent::snapshot::SnapshotState::new(
+            Arc::new("tok".into()),
+            codex.clone(),
+            opencode,
+            claude.clone(),
+        ));
+    for (kind, provider, native, text) in [
+        (
+            "freshcodex",
+            "codex",
+            "session-activity",
+            "Sanitized completion",
+        ),
+        (
+            "freshclaude",
+            "claude",
+            "44444444-4444-4444-8444-444444444444",
+            "Saved native Claude answer",
+        ),
+        (
+            "kilroy",
+            "claude",
+            "44444444-4444-4444-8444-444444444444",
+            "Saved native Claude answer",
+        ),
+        (
+            "freshopencode",
+            "opencode",
+            "ses_saved",
+            "Saved native OpenCode answer",
+        ),
+    ] {
+        let (status, value) = snapshot_route_value(&app, kind, provider, native).await;
+        assert_eq!(status, axum::http::StatusCode::OK, "{kind}: {value}");
+        assert_eq!(value["threadId"], native);
+        assert_eq!(value["sessionType"], kind);
+        assert_eq!(value["provider"], provider);
+        assert!(
+            value["turns"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .flat_map(|turn| turn["items"].as_array().unwrap())
+                .any(|item| item["text"] == text),
+            "{kind}: {value}"
+        );
+        assert_eq!(
+            value["extensions"][provider]["nativeHistoryAvailable"],
+            true
+        );
+        assert_ne!(value["extensions"][provider]["statusFromLiveState"], true);
+        assert!(value["capabilities"]
+            .as_object()
+            .unwrap()
+            .values()
+            .filter(|v| v.is_boolean())
+            .all(|v| v == false));
+    }
+    for (kind, provider, id) in [
+        ("freshcodex", "codex", "managed-freshcodex-unresolved"),
+        ("freshcodex", "codex", "foreign-session"),
+        ("freshclaude", "claude", "missing-native"),
+        ("freshopencode", "opencode", "ses_missing"),
+    ] {
+        assert_eq!(
+            snapshot_route_value(&app, kind, provider, id).await.0,
+            axum::http::StatusCode::SERVICE_UNAVAILABLE
+        );
+    }
+    // Exact-looking names cannot substitute for a readable, matching native source.
+    let wrong_codex = codex_path.with_file_name("rollout-wrong-native.jsonl");
+    std::fs::write(&wrong_codex, std::fs::read(&codex_path).unwrap()).unwrap();
+    let unreadable_claude =
+        claude_path.with_file_name("55555555-5555-4555-8555-555555555555.jsonl");
+    std::fs::write(&unreadable_claude, [0xff, 0xfe]).unwrap();
+    for (kind, provider, id) in [
+        ("freshcodex", "codex", "wrong-native"),
+        (
+            "freshclaude",
+            "claude",
+            "55555555-5555-4555-8555-555555555555",
+        ),
+    ] {
+        assert_eq!(
+            snapshot_route_value(&app, kind, provider, id).await.0,
+            axum::http::StatusCode::SERVICE_UNAVAILABLE
+        );
+    }
+    for (path, (bytes, modified)) in paths.iter().zip(before) {
+        assert_eq!(std::fs::read(path).unwrap(), bytes);
+        assert_eq!(
+            std::fs::metadata(path).unwrap().modified().unwrap(),
+            modified
+        );
+    }
+    std::fs::write(&db_path, b"not a SQLite database").unwrap();
+    assert_eq!(
+        snapshot_route_value(&app, "freshopencode", "opencode", "ses_saved")
+            .await
+            .0,
+        axum::http::StatusCode::SERVICE_UNAVAILABLE
+    );
+    assert_eq!(std::fs::read(&db_path).unwrap(), b"not a SQLite database");
+    assert!(!codex.has_live_session("session-activity").await);
+    assert!(
+        !claude
+            .has_live_session("44444444-4444-4444-8444-444444444444")
+            .await
+    );
+    assert!(proxy.pollers.lock().await.is_empty());
+}
+
+#[tokio::test]
+async fn real_gateway_outage_keeps_a_registered_local_provider_snapshot_live() {
+    let _lock = SNAPSHOT_OUTAGE_ENV_LOCK.lock().await;
+    let dir = tempfile::tempdir().unwrap();
+    let _env = SnapshotTestEnv::isolate(dir.path());
+    std::env::set_var(
+        "CODEX_CMD",
+        format!(
+            "node {}/../../test/fixtures/coding-cli/codex-app-server/fake-app-server.mjs",
+            env!("CARGO_MANIFEST_DIR")
+        ),
+    );
+    std::env::set_var(
+        "FAKE_CODEX_APP_SERVER_BEHAVIOR",
+        r#"{"threadStartThreadId":"local-owned-thread"}"#,
+    );
+    std::env::set_var("FAKE_CODEX_APP_SERVER_ALLOW_DURABLE_WRITES", "1");
+    let (tx, mut rx) = broadcast::channel(64);
+    let broadcast = Arc::new(tx);
+    let ownership = Arc::new(freshell_ownership::RuntimeOwnershipRegistry::new());
+    let mut codex = freshell_freshagent::FreshCodexState::new(
+        Arc::new("tok".into()),
+        broadcast.clone(),
+        serde_json::json!({"freshAgent":{"enabled":true}}),
+    );
+    codex.set_ownership(ownership.clone());
+    codex.handle_create(serde_json::from_value(serde_json::json!({"requestId":"local-provider-start","sessionType":"freshcodex","provider":"codex"})).unwrap(), None).await;
+    let created: serde_json::Value = tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            let frame: serde_json::Value = serde_json::from_str(&rx.recv().await.unwrap()).unwrap();
+            if frame["type"] == "freshAgent.created" || frame["type"] == "freshAgent.create.failed"
+            {
+                break frame;
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(created["type"], "freshAgent.created", "{created}");
+    let native = created["sessionId"].as_str().unwrap();
+    let saved_path = dir
+        .path()
+        .join("configured-codex/sessions")
+        .join(format!("rollout-{native}.jsonl"));
+    std::fs::create_dir_all(saved_path.parent().unwrap()).unwrap();
+    let saved = include_str!("../../../test/fixtures/coding-cli/codex/task-events.sanitized.jsonl")
+        .replace("session-activity", native);
+    std::fs::write(&saved_path, &saved).unwrap();
+    let before = ownership.observe("codex", native);
+    let socket = dir.path().join("owned-supervisor.sock");
+    let listener = UnixListener::bind(&socket).unwrap();
+    drop(listener);
+    std::fs::remove_file(&socket).unwrap();
+    let opencode =
+        freshell_freshagent::FreshAgentState::new(Arc::new("tok".into()), broadcast.clone());
+    opencode
+        .set_hosted_rest_gateway(snapshot_outage_proxy(&socket))
+        .unwrap();
+    let app =
+        freshell_freshagent::snapshot::router(freshell_freshagent::snapshot::SnapshotState::new(
+            Arc::new("tok".into()),
+            codex.clone(),
+            opencode,
+            freshell_freshagent::FreshClaudeState::new(broadcast),
+        ));
+    let (status, value) = snapshot_route_value(&app, "freshcodex", "codex", native).await;
+    let after = ownership.observe("codex", native);
+    // Park the real read after its local runtime capture, then change ownership.
+    let reached = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    codex.set_snapshot_pause_after_capture_for_tests(Arc::new({
+        let reached = reached.clone();
+        let release = release.clone();
+        move |_| {
+            let reached = reached.clone();
+            let release = release.clone();
+            Box::pin(async move {
+                reached.notify_one();
+                release.notified().await;
+            })
+        }
+    }));
+    let held = tokio::spawn({
+        let app = app.clone();
+        let native = native.to_owned();
+        async move { snapshot_route_value(&app, "freshcodex", "codex", &native).await }
+    });
+    tokio::time::timeout(Duration::from_secs(10), reached.notified())
+        .await
+        .unwrap();
+    let freshell_ownership::BeginOutcome::Granted { generation } = ownership.begin_handoff(
+        "codex",
+        native,
+        freshell_ownership::RuntimeOwnerKind::Terminal,
+        "snapshot-outage-handoff",
+        None,
+        "test",
+        freshell_ownership::now_epoch_ms(),
+    ) else {
+        panic!("expected owned handoff")
+    };
+    release.notify_one();
+    let (held_status, held_value) = tokio::time::timeout(Duration::from_secs(10), held)
+        .await
+        .unwrap()
+        .unwrap();
+    codex.clear_snapshot_pause_after_capture_for_tests();
+    // The captured runtime is still registered but its retained generation is stale.
+    ownership.fail(
+        "codex",
+        native,
+        "snapshot-outage-handoff",
+        generation,
+        false,
+    );
+    let (stale_status, stale_value) =
+        snapshot_route_value(&app, "freshcodex", "codex", native).await;
+    // Always join teardown of the one provider this fixture created, including RED.
+    codex.handle_kill(serde_json::from_value(serde_json::json!({"sessionId":native,"sessionType":"freshcodex","provider":"codex"})).unwrap()).await;
+    assert!(!codex.has_live_session(native).await);
+    assert_eq!(std::fs::read_to_string(&saved_path).unwrap(), saved);
+    assert_eq!(status, axum::http::StatusCode::OK, "{value}");
+    assert_eq!(before, after);
+    assert_eq!(value["threadId"], native);
+    assert_eq!(value["capabilities"]["send"], true);
+    assert_ne!(value["extensions"]["codex"]["nativeHistoryAvailable"], true);
+    assert!(
+        value["turns"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|turn| turn["items"].as_array().unwrap())
+            .any(|item| item["text"] == "Fixture turn"),
+        "{value}"
+    );
+    for (status, value) in [(held_status, held_value), (stale_status, stale_value)] {
+        assert_eq!(status, axum::http::StatusCode::OK, "{value}");
+        assert_eq!(value["threadId"], native);
+        assert_eq!(value["extensions"]["codex"]["nativeHistoryAvailable"], true);
+        assert_ne!(value["extensions"]["codex"]["statusFromLiveState"], true);
+        assert_eq!(value["capabilities"]["send"], false);
+    }
+}

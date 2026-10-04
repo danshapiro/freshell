@@ -1212,6 +1212,36 @@ pub mod ownership_lane {
             .cloned()
     }
 
+    pub(crate) fn current_local_snapshot_owner(
+        registry: &Option<Arc<RuntimeOwnershipRegistry>>,
+        stamps: &OwnershipStamps,
+        provider: &str,
+        native_id: &str,
+        runtime_key: &str,
+        pid: Option<u32>,
+    ) -> Option<freshell_ownership::OwnershipSnapshot> {
+        let Some(registry) = registry else {
+            return Some(freshell_ownership::OwnershipSnapshot {
+                epoch: 0,
+                generation: 0,
+                state: freshell_ownership::OwnershipState::Vacant,
+            });
+        };
+        let stamp = peek_retained_stamp(stamps, native_id)?;
+        let current = registry.observe(provider, native_id);
+        if current.epoch != stamp.epoch
+            || current.generation != stamp.generation
+            || stamp.owner.kind != RuntimeOwnerKind::FreshAgent
+            || stamp.owner.live_session_key.as_deref() != Some(runtime_key)
+            || stamp.owner.pid != pid
+            || pid.is_some_and(partial_pid_confirmed_dead)
+            || !matches!(&current.state, freshell_ownership::OwnershipState::Live { owner, .. } if owner == &stamp.owner)
+        {
+            return None;
+        }
+        Some(current)
+    }
+
     /// The fenced stop claim for an explicit kill: the lane's believed
     /// runtime identity plus the `(epoch, generation)` its `commit_live`
     /// stamped — with the wire pair a delayed client carried taking
@@ -3019,6 +3049,24 @@ impl FreshAgentState {
     }
 
     // ── GET /api/fresh-agent/threads/freshopencode/opencode/:threadId (Batch D PR-5) ──
+
+    pub(crate) async fn local_snapshot_owner(
+        &self,
+        native_id: &str,
+    ) -> Option<freshell_ownership::OwnershipSnapshot> {
+        // A shared daemon alone does not prove this conversation belongs to the local lane.
+        self.ownership.as_ref()?;
+        let manager = self.opencode.lock().await.clone()?;
+        manager.base_url().await?;
+        ownership_lane::current_local_snapshot_owner(
+            &self.ownership,
+            &self.ownership_stamps,
+            PROVIDER,
+            native_id,
+            native_id,
+            None,
+        )
+    }
 
     /// Build a `FreshAgentSnapshotSchema`-shaped JSON snapshot for an opencode session
     /// (`adapter.ts getSnapshot`, `adapter.ts:574-592` + `normalizeOpencodeSnapshot`,
@@ -8438,6 +8486,85 @@ mod tests {
         assert_eq!(turns[1]["summary"], json!("hello from opencode"));
         assert_eq!(turns[1]["summaryKind"], json!("echo"));
         assert_eq!(snapshot["latestTurnId"], turns[1]["turnId"]);
+    }
+
+    #[tokio::test]
+    async fn local_snapshot_owner_requires_opencode_session_claim_not_shared_daemon() {
+        let state = state_with_fixed_session_http(
+            json!({"id":"ses_local","time":{"updated":2}}),
+            json!([{ "info":{"id":"answer","role":"assistant"}, "parts":[{"type":"text","text":"Owned local answer"}] }]),
+        ).await;
+        let registry = Arc::new(freshell_ownership::RuntimeOwnershipRegistry::new());
+        let state = state.with_ownership(registry.clone());
+        assert!(state.local_snapshot_owner("ses_local").await.is_none());
+        let mut ticket = match ownership_lane::begin_lane_claim(
+            &state.ownership,
+            "opencode",
+            "ses_local",
+            "owned-snapshot",
+            None,
+            "test",
+            0,
+        ) {
+            ownership_lane::LaneClaim::Granted(ticket) => Some(ticket),
+            _ => panic!("expected local claim"),
+        };
+        ownership_lane::commit_lane_claim(
+            &state.ownership,
+            &state.ownership_stamps,
+            None,
+            "opencode",
+            "ses_local",
+            &mut ticket,
+            "ses_local",
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            state.local_snapshot_owner("ses_local").await,
+            Some(registry.observe("opencode", "ses_local"))
+        );
+        let snapshot = state
+            .get_opencode_snapshot("ses_local", None)
+            .await
+            .unwrap();
+        assert_eq!(
+            snapshot["turns"][0]["items"][0]["text"],
+            "Owned local answer"
+        );
+        assert!(state
+            .local_snapshot_owner("ses_unregistered")
+            .await
+            .is_none());
+        let freshell_ownership::BeginOutcome::Granted { generation } = registry.begin_handoff(
+            "opencode",
+            "ses_local",
+            freshell_ownership::RuntimeOwnerKind::Terminal,
+            "snapshot-handoff",
+            None,
+            "test",
+            freshell_ownership::now_epoch_ms(),
+        ) else {
+            panic!("expected handoff")
+        };
+        assert!(state.local_snapshot_owner("ses_local").await.is_none());
+        assert_eq!(
+            registry.commit_live(
+                "opencode",
+                "ses_local",
+                "snapshot-handoff",
+                generation,
+                freshell_ownership::OwnerIdentity {
+                    kind: freshell_ownership::RuntimeOwnerKind::Terminal,
+                    terminal_id: Some("foreign-terminal".into()),
+                    live_session_key: None,
+                    pid: None,
+                    ownership_id: None
+                }
+            ),
+            freshell_ownership::CommitOutcome::Committed
+        );
+        assert!(state.local_snapshot_owner("ses_local").await.is_none());
     }
 
     /// Fix Task #3: a session id this process never created/attached to via any WS/REST
