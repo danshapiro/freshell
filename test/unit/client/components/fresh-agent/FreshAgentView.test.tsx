@@ -11,13 +11,14 @@ import settingsReducer, { previewServerSettingsPatch, updateSettingsLocal } from
 import sessionsReducer, { applySessionsPatch, applyContextUsageExtras } from '@/store/sessionsSlice'
 import freshAgentReducer, { applyRuntimeOwner, historyPageReceived, sessionError, sessionExited, sessionInit, sessionMetadataReceived, sessionSnapshotReceived, setSessionStatus, markSessionLost } from '@/store/freshAgentSlice'
 import { selectPaneOwnerFence } from '@/store/selectors/runtimeOwner'
-import tabsReducer, { closeTab } from '@/store/tabsSlice'
+import tabsReducer, { closeTab, closePaneWithCleanup } from '@/store/tabsSlice'
 import connectionReducer, { setBootId } from '@/store/connectionSlice'
 import managedRuntimeReducer from '@/store/managedRuntimeSlice'
 import { FreshAgentView, IDLE_INCOMPLETE_MAX_RETRIES, locatorMatchesPane } from '@/components/fresh-agent/FreshAgentView'
 import { FreshAgentSettingsButton } from '@/components/fresh-agent/FreshAgentSettingsButton'
 import {
   initLayout,
+  splitPane,
   applyFreshAgentReconcileAttach,
   requestPaneRefresh,
   resetFreshAgentPaneForReconcileCreate,
@@ -46,6 +47,7 @@ import {
 } from '@/lib/fresh-agent-rollback'
 import { getFreshAgentPaneActions } from '@/lib/pane-action-registry'
 import type { PaneNode } from '@/store/paneTypes'
+import { findPaneContent } from '@/lib/pane-utils'
 import { resetManagedRuntimeRefreshForTest } from '@/lib/recovery/managed-runtime-recovery'
 import { FreshAgentSnapshotSchema } from '@shared/fresh-agent-contract'
 import { createPerfAuditBridge, installPerfAuditBridge } from '@/lib/perf-audit-bridge'
@@ -953,6 +955,277 @@ describe('managed bootstrap history', () => {
     expect(fresh.pendingReconcile).toBeUndefined()
     expect(fresh.createRequestId).not.toBe('pending-original-request')
     held.resolve(fixture.native)
+  })
+})
+
+describe('new conversation close acceptance', () => {
+  const surfaces = [
+    ['freshclaude', 'claude', savedClaudeNativeHistory],
+    ['kilroy', 'claude', { ...savedClaudeNativeHistory, sessionType: 'kilroy' }],
+    ['freshcodex', 'codex', savedCodexNativeHistory],
+    ['freshopencode', 'opencode', savedOpenCodeNativeHistory],
+  ] as const
+  const historyText = 'Retained history during the close race'
+  const draftText = 'Retained unsent close-race draft'
+  const stopped = { outcome: 'verified_empty', soul: { soulId: 'close-race-soul', intentRevision: 17 } }
+
+  function CurrentPane() {
+    const content = useAppSelector((state) => findPaneContent(state.panes.layouts['tab-1'], 'pane-1'))
+    if (content?.kind !== 'fresh-agent') throw new Error('Missing close-race fresh pane')
+    return <FreshAgentView tabId="tab-1" paneId="pane-1" paneContent={content} />
+  }
+
+  function prepare(surface: typeof surfaces[number], scope: 'pane' | 'tab', mode: 'lost' | 'busy' | 'unmanaged' = 'lost') {
+    const [sessionType, provider, saved] = surface
+    const native = FreshAgentSnapshotSchema.parse(saved)
+    const snapshot = { ...native, ...(mode === 'busy' ? { status: 'running',
+      capabilities: { send: true, interrupt: true, fork: false },
+      extensions: { [provider]: { ownerKind: 'fresh-agent', statusFromLiveState: true } } }
+      : mode === 'unmanaged' ? { status: 'exited' } : {}), turns: [{ id: 'close-race-turn', role: 'assistant' as const,
+      items: [{ id: 'close-race-text', kind: 'text' as const, text: historyText }] }] }
+    apiMock.getFreshAgentThreadSnapshot.mockResolvedValue(snapshot)
+    const stop = createDeferred<unknown>()
+    apiMock.stopManagedRuntimeSoul.mockReturnValue(stop.promise)
+    const store = createStore()
+    const content: FreshAgentPaneContent = {
+      kind: 'fresh-agent', sessionType, provider, createRequestId: 'close-race-create',
+      sessionRef: { provider, sessionId: native.threadId }, resumeSessionId: native.threadId,
+      status: mode === 'unmanaged' ? 'exited' : 'error', settingsDismissed: true,
+      ...(mode === 'unmanaged' ? {} : { soulId: 'close-race-soul', soulIntentRevision: 17,
+        recoverySummary: { desiredState: mode === 'busy' ? 'running' : 'stopped', recoveryState: mode === 'busy' ? 'live' : 'lost',
+          durabilityState: 'resume_captured', allocationState: 'verified_durable' } }),
+      ...(mode === 'unmanaged' ? { sessionId: native.threadId } : {}),
+      ...(mode === 'busy' ? { sessionId: native.threadId, status: 'running',
+        pendingLocalEcho: { requestId: 'prior-close-race-send', text: 'Retained submitted optimistic message' } } : {}),
+    }
+    if (mode === 'busy') {
+      store.dispatch(sessionInit({ sessionType, provider, sessionId: native.threadId }))
+      store.dispatch(setSessionStatus({ sessionType, provider, sessionId: native.threadId, status: 'running' }))
+    }
+    store.dispatch(initLayout({ tabId: 'tab-1', paneId: 'pane-1', content }))
+    if (scope === 'pane') store.dispatch(splitPane({ tabId: 'tab-1', paneId: 'pane-1', direction: 'horizontal',
+      newPaneId: 'pane-2', newContent: { kind: 'picker' }, activate: false }))
+    const draftKey = `fresh-agent-draft:${sessionType}:${content.sessionId ?? content.createRequestId}`
+    sessionStorage.setItem(draftKey, draftText)
+    const handlers = new Set<(message: any) => void>()
+    wsMock.onMessage.mockImplementation((handler) => { handlers.add(handler); return () => { handlers.delete(handler) } })
+    let closeMessage: Record<string, any> | undefined
+    wsMock.send.mockImplementation((message) => {
+      if (message.type === 'pane.closed' || message.type === 'panes.closed') closeMessage = message
+    })
+    const getContent = () => {
+      const current = findPaneContent(store.getState().panes.layouts['tab-1'], 'pane-1')
+      if (current?.kind !== 'fresh-agent') throw new Error('Missing close-race pane')
+      return current
+    }
+    const failClose = () => {
+      if (!closeMessage) return
+      const message = closeMessage
+      closeMessage = undefined
+      for (const handler of [...handlers]) handler({ type: `${message.type}.result`, requestId: message.requestId,
+        createRequestId: message.createRequestId, success: false })
+    }
+    const startClose = () => store.dispatch(scope === 'tab'
+      ? closeTab('tab-1') : closePaneWithCleanup({ tabId: 'tab-1', paneId: 'pane-1' }))
+    const isClosing = () => scope === 'tab' ? store.getState().panes.closingTabs?.['tab-1']
+      : store.getState().panes.closingPanes?.['tab-1:pane-1']
+    const rendered = render(<Provider store={store}><CurrentPane /></Provider>)
+    const emit = (message: unknown) => { for (const handler of [...handlers]) handler(message) }
+    return { store, content, stop, getContent, failClose, startClose, isClosing, rendered, draftKey, emit, snapshot }
+  }
+
+  const cases = surfaces.flatMap((surface) => (['pane', 'tab'] as const).flatMap((scope) =>
+    (['already pending', 'starts during cleanup'] as const).map((timing) => ({ surface, scope, timing }))))
+
+  it.each(cases)('preserves $surface.0 when $scope close $timing', async ({ surface, scope, timing }) => {
+    const fixture = prepare(surface, scope)
+    let closing: ReturnType<typeof fixture.startClose> | undefined
+    try {
+      expect(await screen.findByText(historyText)).toBeInTheDocument()
+      const reads = apiMock.getFreshAgentThreadSnapshot.mock.calls.length
+      const startNew = () => fireEvent.click(screen.getByRole('button', { name: 'Start new conversation' }))
+      if (timing === 'already pending') act(() => { closing = fixture.startClose() })
+      startNew()
+      await waitFor(() => expect(apiMock.stopManagedRuntimeSoul).toHaveBeenCalledWith('close-race-soul', 17))
+      if (timing === 'starts during cleanup') act(() => { closing = fixture.startClose() })
+      expect(fixture.isClosing()).toBe(true)
+      await act(async () => fixture.stop.resolve(stopped))
+      await waitFor(() => expect(screen.getByRole('button', { name: 'Start new conversation' })).toBeEnabled())
+      const assertRetained = () => {
+        expect(screen.getByText(historyText)).toBeInTheDocument()
+        expect(screen.getByRole('textbox', { name: 'Chat message input' })).toHaveValue(draftText)
+        expect(sessionStorage.getItem(fixture.draftKey)).toBe(draftText)
+        expect(fixture.getContent()).toMatchObject(fixture.content)
+        expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledTimes(reads)
+        for (const type of ['freshAgent.create', 'freshAgent.attach', 'freshAgent.send', 'pane.reconcile.request']) {
+          expect(sentFreshAgentMessages(type)).toHaveLength(0)
+        }
+      }
+      assertRetained()
+      await act(async () => { fixture.failClose(); await closing })
+      expect(fixture.isClosing()).toBeFalsy()
+      expect(await screen.findByText(/Close failed:/)).toBeInTheDocument()
+      assertRetained()
+    } finally {
+      await act(async () => { fixture.stop.resolve(stopped); fixture.failClose(); await closing })
+      fixture.rendered.unmount()
+    }
+  })
+
+  it('accepts one new identity only after a failed close is lifted and the user retries', async () => {
+    const fixture = prepare(surfaces[2], 'tab')
+    let closing: ReturnType<typeof fixture.startClose> | undefined
+    try {
+      expect(await screen.findByText(historyText)).toBeInTheDocument()
+      act(() => { closing = fixture.startClose() })
+      fireEvent.click(screen.getByRole('button', { name: 'Start new conversation' }))
+      await act(async () => fixture.stop.resolve(stopped))
+      expect(fixture.getContent().createRequestId).toBe(fixture.content.createRequestId)
+      await act(async () => { fixture.failClose(); await closing })
+      expect(screen.getByText(historyText)).toBeInTheDocument()
+      fireEvent.click(screen.getByRole('button', { name: 'Start new conversation' }))
+      await waitFor(() => expect(fixture.getContent().createRequestId).not.toBe(fixture.content.createRequestId))
+      const newId = fixture.getContent().createRequestId
+      expect(fixture.getContent().soulId).toBeUndefined()
+      expect(fixture.getContent().sessionRef).toBeUndefined()
+      expect(fixture.getContent().resumeSessionId).toBeUndefined()
+      expect(screen.queryByText(historyText)).toBeNull()
+      await waitFor(() => expect(sentFreshAgentMessages('freshAgent.create')).toHaveLength(1))
+      expect(sentFreshAgentMessages('freshAgent.create')[0]).toMatchObject({ requestId: newId })
+      await act(async () => {})
+      expect(fixture.getContent().createRequestId).toBe(newId)
+      expect(sentFreshAgentMessages('freshAgent.create')).toHaveLength(1)
+    } finally {
+      await act(async () => { fixture.stop.resolve(stopped); fixture.failClose(); await closing })
+      fixture.rendered.unmount()
+    }
+  })
+
+  it.each(['refused', 'accepted'] as const)('%s new keeps or clears real queued work and persisted optimistic echo at the acceptance boundary', async (outcome) => {
+    const fixture = prepare(surfaces[2], 'tab', 'busy')
+    let closing: ReturnType<typeof fixture.startClose> | undefined
+    try {
+      await waitFor(() => expect(screen.getByText(historyText)).toBeInTheDocument())
+      expect(screen.getByText('Retained submitted optimistic message')).toBeInTheDocument()
+      const composer = screen.getByRole('textbox', { name: 'Chat message input' })
+      expect(composer).toBeEnabled()
+      fireEvent.change(composer, { target: { value: 'Retained queued work' } })
+      fireEvent.click(screen.getByRole('button', { name: 'Send' }))
+      expect(screen.getByRole('status', { name: 'Queued messages' })).toHaveTextContent('1 queued')
+      expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(0)
+      fireEvent.change(composer, { target: { value: draftText } })
+      await act(async () => fixture.store.dispatch(updatePaneContent({ tabId: 'tab-1', paneId: 'pane-1', content: {
+        ...fixture.getContent(), status: 'error', recoverySummary: { desiredState: 'stopped', recoveryState: 'lost',
+          durabilityState: 'resume_captured', allocationState: 'verified_durable' },
+      } })))
+      expect(screen.getByRole('textbox', { name: 'Chat message input' })).toBeDisabled()
+      const reads = apiMock.getFreshAgentThreadSnapshot.mock.calls.length
+      if (outcome === 'refused') act(() => { closing = fixture.startClose() })
+      fireEvent.click(screen.getByRole('button', { name: 'Start new conversation' }))
+      await act(async () => fixture.stop.resolve(stopped))
+      if (outcome === 'refused') {
+        expect(screen.getByText(historyText)).toBeInTheDocument()
+        expect(screen.getByText('Retained submitted optimistic message')).toBeInTheDocument()
+        expect(screen.getByRole('status', { name: 'Queued messages' })).toHaveTextContent('1 queued')
+        expect(fixture.getContent().pendingLocalEcho).toEqual(fixture.content.pendingLocalEcho)
+        expect(composer).toHaveValue(draftText)
+        expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledTimes(reads)
+        expect(sentFreshAgentMessages('freshAgent.create')).toHaveLength(0)
+        await act(async () => { fixture.failClose(); await closing })
+        expect(screen.getByText(historyText)).toBeInTheDocument()
+        expect(screen.getByText('Retained submitted optimistic message')).toBeInTheDocument()
+        expect(screen.getByRole('status', { name: 'Queued messages' })).toHaveTextContent('1 queued')
+      } else {
+        await waitFor(() => expect(fixture.getContent().createRequestId).not.toBe(fixture.content.createRequestId))
+        expect(screen.queryByText(historyText)).toBeNull()
+        expect(screen.queryByText('Retained submitted optimistic message')).toBeNull()
+        expect(screen.queryByRole('status', { name: 'Queued messages' })).toBeNull()
+        expect(fixture.getContent().pendingLocalEcho).toBeUndefined()
+        await waitFor(() => expect(sentFreshAgentMessages('freshAgent.create')).toHaveLength(1))
+      }
+      expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(0)
+    } finally {
+      await act(async () => { fixture.stop.resolve(stopped); fixture.failClose(); await closing })
+      fixture.rendered.unmount()
+    }
+  })
+
+  it.each(['refused', 'accepted'] as const)('preserves unmanaged history on a late refused close and permits ordinary %s new after awaited kill', async (outcome) => {
+    const fixture = prepare(surfaces[2], 'tab', 'unmanaged')
+    let closing: ReturnType<typeof fixture.startClose> | undefined
+    const acknowledgeKill = () => fixture.emit({ type: 'freshAgent.killed', sessionId: fixture.content.sessionRef!.sessionId,
+      sessionType: 'freshcodex', provider: 'codex', success: true })
+    try {
+      expect(await screen.findByText(historyText)).toBeInTheDocument()
+      fireEvent.click(screen.getByRole('button', { name: 'Start new session', exact: true }))
+      expect(sentFreshAgentMessages('freshAgent.kill')).toHaveLength(1)
+      expect(fixture.getContent().createRequestId).toBe(fixture.content.createRequestId)
+      if (outcome === 'refused') act(() => { closing = fixture.startClose() })
+      await act(async () => acknowledgeKill())
+      if (outcome === 'refused') {
+        expect(fixture.isClosing()).toBe(true)
+        expect(screen.getByText(historyText)).toBeInTheDocument()
+        expect(fixture.getContent()).toMatchObject(fixture.content)
+        expect(screen.getByRole('textbox', { name: 'Chat message input' })).toHaveValue(draftText)
+        expect(sentFreshAgentMessages('freshAgent.create')).toHaveLength(0)
+        await act(async () => { fixture.failClose(); await closing })
+        expect(screen.getByText(historyText)).toBeInTheDocument()
+      } else {
+        await waitFor(() => expect(fixture.getContent().createRequestId).not.toBe(fixture.content.createRequestId))
+        expect(screen.queryByText(historyText)).toBeNull()
+        await waitFor(() => expect(sentFreshAgentMessages('freshAgent.create')).toHaveLength(1))
+      }
+      expect(apiMock.stopManagedRuntimeSoul).not.toHaveBeenCalled()
+    } finally {
+      await act(async () => { acknowledgeKill(); fixture.failClose(); await closing })
+      fixture.rendered.unmount()
+    }
+  })
+
+  it('refuses a late managed cleanup after the displayed conversation source changes', async () => {
+    const fixture = prepare(surfaces[2], 'tab')
+    try {
+      expect(await screen.findByText(historyText)).toBeInTheDocument()
+      fireEvent.click(screen.getByRole('button', { name: 'Start new conversation' }))
+      const replacement = { ...fixture.content, createRequestId: 'replacement-close-race-create',
+        soulId: 'replacement-close-race-soul', soulIntentRevision: 18 }
+      await act(async () => fixture.store.dispatch(updatePaneContent({ tabId: 'tab-1', paneId: 'pane-1', content: replacement })))
+      expect(await screen.findByText(historyText)).toBeInTheDocument()
+      await act(async () => fixture.stop.resolve(stopped))
+      expect(fixture.getContent()).toMatchObject(replacement)
+      expect(screen.getByText(historyText)).toBeInTheDocument()
+      expect(sentFreshAgentMessages('freshAgent.create')).toHaveLength(0)
+    } finally {
+      await act(async () => fixture.stop.resolve(stopped))
+      fixture.rendered.unmount()
+    }
+  })
+
+  it('refuses an old deferred history result after an accepted new conversation', async () => {
+    const fixture = prepare(surfaces[2], 'tab', 'unmanaged')
+    const history = createDeferred<unknown>()
+    try {
+      expect(await screen.findByText(historyText)).toBeInTheDocument()
+      const reads = apiMock.getFreshAgentThreadSnapshot.mock.calls.length
+      apiMock.getFreshAgentThreadSnapshot.mockReturnValue(history.promise)
+      act(() => fixture.store.dispatch(requestPaneRefresh({ tabId: 'tab-1', paneId: 'pane-1' })))
+      await waitFor(() => expect(apiMock.getFreshAgentThreadSnapshot.mock.calls.length).toBeGreaterThan(reads))
+      fireEvent.click(screen.getByRole('button', { name: 'Start new session', exact: true }))
+      await act(async () => fixture.emit({ type: 'freshAgent.killed', sessionId: fixture.content.sessionId,
+        sessionType: 'freshcodex', provider: 'codex', success: true }))
+      const replacement = fixture.getContent().createRequestId
+      expect(replacement).not.toBe(fixture.content.createRequestId)
+      expect(screen.queryByText(historyText)).toBeNull()
+      await act(async () => history.resolve(fixture.snapshot))
+      expect(screen.queryByText(historyText)).toBeNull()
+      expect(fixture.getContent().createRequestId).toBe(replacement)
+      expect(fixture.getContent().sessionRef).toBeUndefined()
+      await waitFor(() => expect(sentFreshAgentMessages('freshAgent.create')).toHaveLength(1))
+      expect(sentFreshAgentMessages('freshAgent.create')[0]).toMatchObject({ requestId: replacement })
+    } finally {
+      await act(async () => history.resolve(fixture.snapshot))
+      fixture.rendered.unmount()
+    }
   })
 })
 

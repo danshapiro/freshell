@@ -110,6 +110,111 @@ async function installPane(page: Page, kind: PaneKind, recoveryState: RecoverySt
   })
 }
 
+test('fresh-agent: a close started during verified start-new cleanup preserves the displayed conversation when close fails', async ({ page, serverInfo, harness, terminal }) => {
+  let targetTabId: string | undefined
+  let closeRequestId: string | undefined
+  let closeStarted = false
+  let failClose = () => {}
+  let releaseStop!: () => void
+  const heldStop = new Promise<void>((resolve) => { releaseStop = resolve })
+  let finishStop!: () => void
+  const stopFinished = new Promise<void>((resolve) => { finishStop = resolve })
+  let stopRequests = 0
+  let historyReads = 0
+  const draft = 'Retained draft during refused Start new'
+  const draftKey = `fresh-agent-draft:freshcodex:${CREATE_REQUEST_ID}`
+  // A controlled refusal executes the real tab-close thunk without writing
+  // a successful close record on the server for the still-displayed fixture.
+  await page.routeWebSocket('**/ws', (socket) => {
+    const upstream = socket.connectToServer()
+    socket.onMessage((data) => {
+      const message = JSON.parse(String(data)) as { type?: string; tabId?: string; requestId?: string }
+      if (message.type === 'panes.closed' && message.tabId === targetTabId) {
+        closeStarted = true
+        closeRequestId = message.requestId
+        return
+      }
+      upstream.send(data)
+    })
+    upstream.onMessage((data) => socket.send(data))
+    failClose = () => {
+      if (!closeRequestId) return
+      socket.send(JSON.stringify({ type: 'panes.closed.result', requestId: closeRequestId, success: false }))
+      closeRequestId = undefined
+    }
+  })
+  page.on('request', (request) => {
+    if (request.url().includes(`/api/runtime/souls/${SOUL_ID}/history`)) historyReads += 1
+  })
+  await page.route(`**/api/runtime/souls/${SOUL_ID}/stop`, async (route) => {
+    stopRequests += 1
+    try {
+      expect(route.request().postDataJSON()).toEqual({ expectedIntentRevision: INTENT_REVISION, requestId: expect.any(String) })
+      await heldStop
+      await route.fulfill({ json: { outcome: 'verified_empty', soul: { soulId: SOUL_ID, intentRevision: INTENT_REVISION } } })
+    } finally {
+      finishStop()
+    }
+  })
+  try {
+    await page.goto(`${serverInfo.baseUrl}/?token=${serverInfo.token}&e2e=1`, { timeout: 60_000 })
+    await harness.waitForHarness(60_000)
+    await harness.waitForConnection()
+    await selectShellFromPicker(page)
+    await terminal.waitForTerminal()
+    targetTabId = (await harness.getState()).tabs.activeTabId!
+    await page.locator('[data-context="tab-add"]').click()
+    await harness.waitForTabCount(2)
+    const originalTab = page.locator('[data-context="tab"]').first()
+    await originalTab.click()
+    await page.evaluate(({ key, text }) => sessionStorage.setItem(key, text), { key: draftKey, text: draft })
+    await installPane(page, 'fresh-agent', 'lost')
+    await expect(page.getByText(SAVED_HISTORY_TEXT, { exact: true })).toBeVisible()
+    const composer = page.getByRole('textbox', { name: 'Chat message input' })
+    await expect(composer).toHaveValue(draft)
+    const before = await paneContent(page)
+    const settledReads = historyReads
+    expect(settledReads).toBe(1)
+    const card = page.getByTestId('managed-runtime-recovery-card')
+    await card.getByRole('button', { name: 'Start new conversation', exact: true }).click()
+    await expect.poll(() => stopRequests).toBe(1)
+    await expect(card.getByRole('button', { name: 'Starting…', exact: true })).toBeDisabled()
+    await originalTab.getByRole('button', { name: /close/i }).click()
+    await expect.poll(() => closeRequestId).toBeTruthy()
+    await expect.poll(async () => (await harness.getState()).panes.closingTabs?.[targetTabId!]).toBe(true)
+    releaseStop()
+    await stopFinished
+    await expect(card.getByRole('button', { name: 'Start new conversation', exact: true })).toBeEnabled()
+    const assertRetained = async () => {
+      await expect(page.getByText(SAVED_HISTORY_TEXT, { exact: true })).toBeVisible()
+      await expect(composer).toHaveValue(draft)
+      expect(await page.evaluate((key) => sessionStorage.getItem(key), draftKey)).toBe(draft)
+      expect(await paneContent(page)).toMatchObject(before)
+      expect(historyReads).toBe(settledReads)
+      const messages = await harness.getSentWsMessages() as Array<{ type?: string }>
+      expect(messages.filter((message) => ['freshAgent.create', 'freshAgent.attach', 'freshAgent.send', 'pane.reconcile.request'].includes(message.type ?? ''))).toEqual([])
+    }
+    // Prove retention BEFORE the close result; no refresh can rescue a clear.
+    await assertRetained()
+    expect(closeRequestId).toBeTruthy()
+    failClose()
+    await expect.poll(async () => (await harness.getState()).panes.closingTabs?.[targetTabId!]).toBeUndefined()
+    await expect(page.getByText(/Close failed:/)).toBeVisible()
+    await harness.waitForTabCount(2)
+    await assertRetained()
+    expect(stopRequests).toBe(1)
+  } finally {
+    releaseStop()
+    if (stopRequests) await stopFinished
+    failClose()
+    try {
+      if (closeStarted) await expect.poll(async () => (await harness.getState()).panes.closingTabs?.[targetTabId!]).toBeUndefined()
+    } finally {
+      await harness.killAllTerminals(serverInfo)
+    }
+  }
+})
+
 for (const recoveryState of ['blocked', 'lost'] as const) {
   for (const status of ['running', 'starting'] as const) {
     test(`fresh-agent: ${recoveryState} stale ${status} reads history once while awaiting intervention`, async ({ freshellPage, page, terminal, harness }) => {

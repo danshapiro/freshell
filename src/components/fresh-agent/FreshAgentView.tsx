@@ -1639,15 +1639,16 @@ export function FreshAgentView({
 
   const startNewConversation = useCallback(async () => {
     const current = paneContentRef.current
+    const getCurrent = () => {
+      const root = appStore.getState().panes.layouts[tabId]
+      const latest = root ? findPaneContent(root, paneId) : null
+      return latest?.kind === 'fresh-agent' ? latest : null
+    }
     // A managed loss may already be stopped and absent from the web alias cache.
     // Its persisted soul is the cleanup authority before replacing identity.
     if (current.soulId || isManagedRuntimeRecoveryPending(current.recoverySummary)) {
       const confirmed = await confirmManagedRuntimeStopped(current, {
-        getCurrent: () => {
-          const root = appStore.getState().panes.layouts[tabId]
-          const latest = root ? findPaneContent(root, paneId) : null
-          return latest?.kind === 'fresh-agent' ? latest : null
-        },
+        getCurrent,
         applyIntentRevision: (soulIntentRevision) => {
           paneContentRef.current = { ...paneContentRef.current, soulIntentRevision }
           dispatch(mergePaneContent({ tabId, paneId, updates: { soulIntentRevision } }))
@@ -1690,13 +1691,19 @@ export function FreshAgentView({
         }
       }
     }
+    const before = getCurrent()
+    if (!before) return
+    dispatch(startNewManagedRuntimeConversation({ tabId, paneId }))
+    const after = getCurrent()
+    // A close can start while cleanup is awaited. Keep local conversation
+    // state when the reducer refuses to replace that still-displayed pane.
+    if (!after || after.createRequestId === before.createRequestId) return
     commitSnapshot(null)
     setLoadError(null)
     setQueuedMessages([])
     setLocalEcho(null)
     alwaysAllowToolsRef.current.clear()
     pendingAutoTitleBySessionIdRef.current.clear()
-    dispatch(startNewManagedRuntimeConversation({ tabId, paneId }))
   }, [appStore, commitSnapshot, dispatch, paneId, sendFreshAgentMessage, setLocalEcho, tabId])
 
   const handleStartNewConversation = useCallback(() => {
