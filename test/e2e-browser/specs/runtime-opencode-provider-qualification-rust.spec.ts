@@ -22,7 +22,7 @@ import {
   P2_OPENCODE_VERSION,
   type ManagedRuntimeView,
 } from '../helpers/managed-runtime.js'
-import { requireOpenCodeAuthFile } from '../helpers/opencode-auth-file.js'
+import { requireOpenCodeOnecliBootstrap } from '../helpers/opencode-auth-file.js'
 import { openPanePicker } from '../helpers/pane-picker.js'
 import { TerminalHelper } from '../helpers/terminal-helpers.js'
 import { TestHarness } from '../helpers/test-harness.js'
@@ -137,6 +137,27 @@ async function waitForPaneOutput(
   timeoutMs: number,
   excludedTerminalIds: ReadonlySet<string> = new Set(),
 ): Promise<string> {
+  const failOnProviderCrash = async (): Promise<Error | null> => {
+    const leaf = leavesByMode(await harness.getPaneLayout(tabId), 'opencode')
+      .find((candidate) => candidate.id === paneId)
+    const currentId = typeof leaf?.content?.terminalId === 'string'
+      ? leaf.content.terminalId
+      : undefined
+    const registered = await harness.getRegisteredTerminalIds()
+    const candidates = [currentId, ...registered]
+      .filter((id): id is string => Boolean(id) && !excludedTerminalIds.has(id as string))
+      .filter((id, index, all) => all.indexOf(id) === index)
+    for (const terminalId of candidates) {
+      const buffer = await page.evaluate((id) => (
+        window.__FRESHELL_TEST_HARNESS__?.getTerminalBuffer?.(id)
+      ), terminalId)
+      if (typeof buffer === 'string' && /Bun has crashed|Segmentation fault at address/i.test(buffer)) {
+        return new Error(`OpenCode provider process crashed during startup in terminal ${terminalId}`)
+      }
+    }
+    return null
+  }
+
   return waitForValue(`pane ${paneId} output ${text}`, async () => {
     const leaf = leavesByMode(await harness.getPaneLayout(tabId), 'opencode')
       .find((candidate) => candidate.id === paneId)
@@ -155,7 +176,7 @@ async function waitForPaneOutput(
       if (contains) return terminalId
     }
     return null
-  }, timeoutMs)
+  }, timeoutMs, failOnProviderCrash)
 }
 
 async function createOpencodePane(
@@ -212,6 +233,16 @@ async function waitForPaneIncarnation(
   }, timeoutMs)
 }
 
+async function paneStreamId(harness: TestHarness, tabId: string, paneId: string): Promise<string> {
+  return waitForValue(`pane ${paneId} stream ID`, async () => {
+    const leaf = leavesByMode(await harness.getPaneLayout(tabId), 'opencode')
+      .find((candidate) => candidate.id === paneId)
+    return typeof leaf?.content?.streamId === 'string' && leaf.content.streamId.length > 0
+      ? leaf.content.streamId
+      : null
+  }, 30_000)
+}
+
 async function waitForReplacementPrompt(
   page: Page,
   harness: TestHarness,
@@ -219,58 +250,103 @@ async function waitForReplacementPrompt(
   tabId: string,
   paneId: string,
   view: ManagedRuntimeView,
+  previousStreamId: string,
+  observedStreamChanges: Array<{ terminalId: string; streamId: string; reason: string; attachRequestId: string | null }>,
+  observedWebSocketFrameTypes: Set<string>,
+  observedWebSocketCount: { value: number },
 ): Promise<void> {
   const terminalId = view.terminalId
   if (!terminalId) throw new Error('replacement provider has no terminal identity')
+  if (!view.terminalStreamId) throw new Error('replacement provider has no stable launch stream identity')
   const modelTexts = ['GPT-5.6 Luna', P2_OPENCODE_MODEL]
-  let diagnostic: Record<string, unknown> = { soulId: view.soulId, incarnationId: view.incarnationId, terminalId }
-  let sourceEpoch = ''
-  let cursor = 0
-  let sourceText = ''
+  let diagnostic: Record<string, unknown> = {
+    soulId: view.soulId,
+    incarnationId: view.incarnationId,
+    terminalId,
+    stableLaunchStreamId: view.terminalStreamId,
+  }
   try {
-    await waitForValue('replacement provider input readiness in its actual source epoch and browser', async () => {
-    // Inventory RUNNING means the process exists, not that its TUI has begun
-    // reading input. Observe the NEW host's own output before typing: otherwise
-    // a pre-raw-mode PTY echo can swallow the recall request at startup.
+    // Wait on the real browser attachment first. Polling the supervisor's
+    // output endpoint every 200 ms races the server's own output reader and
+    // can starve the stream-change notification this check needs to observe.
+    const browserReady = await waitForValue('replacement provider input readiness in its current browser stream', async () => {
+      const leaf = leavesByMode(await harness.getPaneLayout(tabId), 'opencode')
+        .find((row) => row.id === paneId)
+      const paneStreamId = leaf?.content?.streamId
+      diagnostic = {
+        ...diagnostic,
+        paneStreamId,
+        paneIncarnationId: leaf?.content?.incarnationId,
+      }
+      if (
+        leaf?.content?.incarnationId !== view.incarnationId
+        || typeof paneStreamId !== 'string'
+        || paneStreamId.length === 0
+        || paneStreamId === view.terminalStreamId
+        || paneStreamId === previousStreamId
+      ) return null
+
+      const rendered = await page.evaluate((id) => {
+        const h = window.__FRESHELL_TEST_HARNESS__
+        return { text: h?.getTerminalBuffer(id), modes: h?.getTerminalModes?.(id) }
+      }, terminalId)
+      const browserModelBanner = hasOpenCodePromptModelText(rendered.text ?? '', modelTexts)
+      diagnostic = {
+        ...diagnostic,
+        browserInputReady: rendered.modes?.bracketedPasteMode,
+        browserModelBanner,
+      }
+      if (!browserModelBanner || !rendered.modes?.bracketedPasteMode) return null
+      return { streamId: paneStreamId }
+    }, 120_000)
+
+    // The host epoch is distinct from the supervisor's stable launch ID. Read
+    // it once after the browser reports the changed stream, so the QA probe
+    // does not compete with the server's live output poll.
     const output = dataOf(await rig.runtime.adminOk(
       rig.supervisor,
-      rig.runtime.terminalReadOutputBody(view.soulId, cursor, 256 * 1024, await rig.controlEpoch()),
+      rig.runtime.terminalReadOutputBody(view.soulId, 0, 256 * 1024, await rig.controlEpoch()),
     ), 'terminal_output')
-    diagnostic = { ...diagnostic, sourceIncarnationId: output.incarnationId, sourceStreamEpoch: output.streamEpoch, sourceTerminalId: output.terminalId, sourceExited: output.exited }
-    if (output.incarnationId !== view.incarnationId || output.terminalId !== terminalId || !output.streamEpoch || output.exited) return null
-    if (output.streamEpoch !== sourceEpoch || output.resetRequired) {
-      sourceEpoch = output.streamEpoch
-      sourceText = ''
-      cursor = 0
-    }
-    for (const frame of output.frames ?? []) {
-      if (frame.streamEpoch !== sourceEpoch || frame.terminalId !== terminalId) {
+    const sourceText = (output.frames ?? []).map((frame) => {
+      if (frame.streamEpoch !== output.streamEpoch || frame.terminalId !== terminalId) {
         throw new Error('replacement prompt frame has mismatched ownership')
       }
-      sourceText = (sourceText + frame.data).slice(-512 * 1024)
-      cursor = Math.max(cursor, frame.seqEnd)
-    }
+      return frame.data
+    }).join('').slice(-512 * 1024)
     const sourceReady = openCodeTerminalReady(sourceText, modelTexts)
-    diagnostic = { ...diagnostic, sourceReady, cursor }
-    if (!sourceReady) return null
-    const leaf = leavesByMode(await harness.getPaneLayout(tabId), 'opencode').find((row) => row.id === paneId)
-    diagnostic = { ...diagnostic, paneStreamId: leaf?.content?.streamId, paneIncarnationId: leaf?.content?.incarnationId }
-    if (leaf?.content?.streamId !== sourceEpoch || leaf?.content?.incarnationId !== view.incarnationId) return null
-    const rendered = await page.evaluate((terminalId) => {
-      const h = window.__FRESHELL_TEST_HARNESS__
-      return { text: h?.getTerminalBuffer(terminalId), modes: h?.getTerminalModes?.(terminalId) }
-    }, terminalId)
-    const browserModelBanner = hasOpenCodePromptModelText(rendered.text ?? '', modelTexts)
-    diagnostic = { ...diagnostic, browserInputReady: rendered.modes?.bracketedPasteMode, browserModelBanner }
-    if (!browserModelBanner || !rendered.modes?.bracketedPasteMode) return null
+    diagnostic = {
+      ...diagnostic,
+      sourceIncarnationId: output.incarnationId,
+      sourceStreamEpoch: output.streamEpoch,
+      sourceTerminalId: output.terminalId,
+      sourceExited: output.exited,
+      sourceReady,
+      sourceCursor: output.headSeq,
+    }
+    if (
+      output.incarnationId !== view.incarnationId
+      || output.terminalId !== terminalId
+      || output.streamEpoch !== browserReady.streamId
+      || output.exited
+      || !sourceReady
+    ) {
+      throw new Error('replacement provider source and browser stream identities did not agree')
+    }
     rig.runtime.assert('PC-OPENCODE', true, 'replacement TUI prompt is source-observed and rendered before input', {
-      soulId: view.soulId, incarnationId: view.incarnationId, terminalId: view.terminalId, streamEpoch: sourceEpoch, cursor,
+      soulId: view.soulId,
+      incarnationId: view.incarnationId,
+      terminalId,
+      streamEpoch: output.streamEpoch,
+      cursor: output.headSeq,
     })
-    return true
-    }, 120_000)
   } catch (error) {
     // Keep identity/readiness facts, never conversation text, in failure receipts.
-    rig.runtime.writeBrowserArtifact('opencode-replacement-readiness', diagnostic)
+    rig.runtime.writeBrowserArtifact('opencode-replacement-readiness', {
+      ...diagnostic,
+      observedStreamChanges: observedStreamChanges.slice(-10),
+      observedWebSocketFrameTypes: [...observedWebSocketFrameTypes].sort(),
+      observedWebSocketCount: observedWebSocketCount.value,
+    })
     throw error
   }
 }
@@ -363,14 +439,16 @@ test.describe.serial('OpenCode provider qualification', () => {
     )
     test.setTimeout(1_800_000)
 
-    const authFile = requireOpenCodeAuthFile(process.env, 'OpenCode provider qualification')
+    const onecli = requireOpenCodeOnecliBootstrap(process.env, 'OpenCode provider qualification')
     const blockerEvidence = runBlockerMatrixTests(process.cwd())
     const rig = new ManagedRuntimeBrowserRig(
       process.cwd(),
       5,
       {
         FRESHELL_BIND_HOST: '0.0.0.0',
-        FRESHELL_MANAGED_OPENCODE_ONECLI_AUTH_FILE: authFile,
+        FRESHELL_MANAGED_OPENCODE_ONECLI_AUTH_FILE: onecli.authFile,
+        FRESHELL_MANAGED_OPENCODE_ONECLI_ENV_FILE: onecli.environmentFile,
+        FRESHELL_MANAGED_OPENCODE_ONECLI_CA_FILE: onecli.caFile,
       },
       { FRESHELL_RUNTIME_OBSERVER_INTERVAL_MS: '750' },
       'release',
@@ -388,6 +466,40 @@ test.describe.serial('OpenCode provider qualification', () => {
       ), 'migration_plan')
       expect(rollout.currentMode).toBe('managed-opt-in')
 
+      let qualifiedTerminalId: string | undefined
+      const observedStreamChanges: Array<{
+        terminalId: string
+        streamId: string
+        reason: string
+        attachRequestId: string | null
+      }> = []
+      const observedWebSocketFrameTypes = new Set<string>()
+      const observedWebSocketCount = { value: 0 }
+      page.on('websocket', (socket) => {
+        if (new URL(socket.url()).pathname !== '/ws') return
+        observedWebSocketCount.value += 1
+        socket.on('framereceived', ({ payload }) => {
+          try {
+            const message = JSON.parse(String(payload)) as Record<string, unknown>
+            if (typeof message.type === 'string') observedWebSocketFrameTypes.add(message.type)
+            if (
+              message.type === 'terminal.stream.changed'
+              && message.terminalId === qualifiedTerminalId
+              && typeof message.streamId === 'string'
+              && typeof message.reason === 'string'
+            ) {
+              observedStreamChanges.push({
+                terminalId: message.terminalId,
+                streamId: message.streamId,
+                reason: message.reason,
+                attachRequestId: typeof message.attachRequestId === 'string' ? message.attachRequestId : null,
+              })
+            }
+          } catch {
+            // Ignore unrelated or non-JSON WebSocket frames.
+          }
+        })
+      })
       await page.goto(`${info.baseUrl}/?token=${info.token}&e2e=1`)
       const harness = new TestHarness(page)
       const terminal = new TerminalHelper(page)
@@ -406,6 +518,7 @@ test.describe.serial('OpenCode provider qualification', () => {
         tabId,
         new Set(leavesByMode(await harness.getPaneLayout(tabId), 'opencode').map((leaf) => leaf.id)),
       )
+      qualifiedTerminalId = first.terminalId
       if (!first.view.containerId || !first.view.hostBootId) {
         throw new Error('first OpenCode view lacks exact runtime identity')
       }
@@ -415,9 +528,9 @@ test.describe.serial('OpenCode provider qualification', () => {
       expect(processArgs).toContain(P2_OPENCODE_MODEL)
       const authProbe = rig.ownedProviderExec(first.view.containerId, [
         'node', '--no-warnings', '-e',
-        "const fs=require('node:fs');const auth=JSON.parse(fs.readFileSync('/home/freshell/provider/.local/share/opencode/auth.json','utf8'));const openai=auth.openai;if(!openai||typeof openai.access!=='string'||typeof openai.refresh!=='string')process.exit(2);process.stdout.write('OpenAI credential present')",
+        "const fs=require('node:fs');const auth=JSON.parse(fs.readFileSync('/home/freshell/provider/.local/share/opencode/auth.json','utf8'));const openai=auth.openai;if(!openai||openai.type!=='oauth'||openai.access!=='onecli-managed'||openai.refresh!=='onecli-managed'||openai.expires<Date.now()+3600000)process.exit(2);fs.accessSync('/home/freshell/provider/.config/onecli/gateway-ca.pem',fs.constants.R_OK);process.stdout.write('OneCLI OpenAI stub and CA present')",
       ])
-      expect(authProbe.trim()).toBe('OpenAI credential present')
+      expect(authProbe.trim()).toBe('OneCLI OpenAI stub and CA present')
       const availableModels = rig.ownedProviderExec(first.view.containerId, ['opencode', 'models', 'openai'])
       expect(availableModels).toContain(P2_OPENCODE_MODEL.split('/')[1])
       const exactLimits = cgroupLimitEvidence(rig, first.view)
@@ -427,9 +540,12 @@ test.describe.serial('OpenCode provider qualification', () => {
       // Proof comes from NEW provider-native assistant rows, never echoed input
       // or a redraw of old terminal history. The project name has 128 bits.
       const nonce = `p-${randomBytes(16).toString('base64url')}`
+      // Keep this unambiguously conversational: asking for a project name can
+      // make a coding model search the workspace instead of answering from its
+      // current turn, leaving native history open until the qualification times out.
       await executeInPane(
         page, first.paneId,
-        `For the project we are discussing, the name is ${nonce}. What is the project name?`,
+        `Remember this exact string for our conversation: ${nonce}. Reply with only the string. Do not search files or call tools.`,
       )
       const nativeSessionId = await waitForValue('first exact OpenCode session id', async () => (
         await paneSessionId(harness, tabId, first.paneId)
@@ -441,6 +557,7 @@ test.describe.serial('OpenCode provider qualification', () => {
 
       // Session-host/container loss: exact old enclosure must be empty before
       // the new incarnation becomes the sole writer.
+      const beforeHostCrashStreamId = await paneStreamId(harness, tabId, first.paneId)
       rig.runtime.killOwnedRuntimeExact(first.view.containerId)
       const afterHostCrash = await waitForRunningView(
         rig,
@@ -461,9 +578,13 @@ test.describe.serial('OpenCode provider qualification', () => {
       await waitForValue('pane retains the exact native identity after host loss', async () => (
         (await paneSessionId(harness, tabId, first.paneId)) === nativeSessionId ? true : null
       ), 120_000)
-      await waitForReplacementPrompt(page, harness, rig, tabId, first.paneId, afterHostCrash)
+      await waitForReplacementPrompt(
+        page, harness, rig, tabId, first.paneId, afterHostCrash, beforeHostCrashStreamId,
+        observedStreamChanges, observedWebSocketFrameTypes, observedWebSocketCount,
+      )
       const beforeRecall = new Set(nativeAssistantTurns(rig, afterHostCrash, nativeSessionId).map((turn) => turn.messageId))
-      await executeInPane(page, first.paneId, 'What is the name of the project we chose earlier?')
+      await executeInPane(page, first.paneId,
+        'What exact string did I ask you to remember? Reply with only the string. Do not search files or call tools.')
       const recalledAnswer = await nextNativeAssistantTurn(page, first.terminalId, rig, afterHostCrash, nativeSessionId, beforeRecall, nonce)
       verifyMemoryAnswer(recalledAnswer, nonce)
       expect(recalledAnswer.messageId).not.toBe(firstAnswer.messageId)
@@ -472,6 +593,7 @@ test.describe.serial('OpenCode provider qualification', () => {
 
       // Provider-process loss: kill only the exact host-recorded worker PID,
       // then require another exact native resume and usable follow-up.
+      const beforeProviderCrashStreamId = await paneStreamId(harness, tabId, first.paneId)
       const hostStatePath = path.join(
         rig.runtime.runtimeDir(rig.supervisor, afterHostCrash.incarnationId),
         'host-state.json',
@@ -495,9 +617,13 @@ test.describe.serial('OpenCode provider qualification', () => {
         first.paneId,
         afterProviderCrash.incarnationId,
       )
-      await waitForReplacementPrompt(page, harness, rig, tabId, first.paneId, afterProviderCrash)
+      await waitForReplacementPrompt(
+        page, harness, rig, tabId, first.paneId, afterProviderCrash, beforeProviderCrashStreamId,
+        observedStreamChanges, observedWebSocketFrameTypes, observedWebSocketCount,
+      )
       const beforeProviderFollowup = new Set(nativeAssistantTurns(rig, afterProviderCrash, nativeSessionId).map((turn) => turn.messageId))
-      await executeInPane(page, first.paneId, 'Please remind me of the project name we selected.')
+      await executeInPane(page, first.paneId,
+        'What exact string did I ask you to remember? Reply with only the string. Do not search files or call tools.')
       const providerAnswer = await nextNativeAssistantTurn(page, first.terminalId, rig, afterProviderCrash, nativeSessionId, beforeProviderFollowup, nonce)
       verifyMemoryAnswer(providerAnswer, nonce)
       expect(providerAnswer.messageId).not.toBe(recalledAnswer.messageId)
@@ -511,7 +637,7 @@ test.describe.serial('OpenCode provider qualification', () => {
       if (!second.view.containerId) throw new Error('second OpenCode view lacks container')
       const secondNonce = `p-${randomBytes(16).toString('base64url')}`
       await executeInPane(page, second.paneId,
-        `For the project we are discussing, the name is ${secondNonce}. What is the project name?`)
+        `Remember this exact string for our conversation: ${secondNonce}. Reply with only the string. Do not search files or call tools.`)
       const secondSessionId = await waitForValue('second exact OpenCode session id', async () => (
         await paneSessionId(harness, tabId, second.paneId)
       ), 120_000)

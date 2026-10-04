@@ -59,6 +59,13 @@ describe('live Amplifier OneCLI qualification grants', () => {
     })).toEqual([onecliGrant])
   })
 
+  it('admits the OpenCode OneCLI gateway CA grant to the sandbox broker', () => {
+    const caGrant = privateGrant('gateway-ca.pem')
+    expect(phase2BootstrapFiles({
+      FRESHELL_MANAGED_OPENCODE_ONECLI_CA_FILE: caGrant,
+    })).toEqual([caGrant])
+  })
+
   it('rejects a missing grant even when the old keys-file input is set', () => {
     const legacyKeys = privateGrant('keys.env')
     const env = { FRESHELL_MANAGED_AMPLIFIER_ONECLI_KEYS_FILE: legacyKeys }

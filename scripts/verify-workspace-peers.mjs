@@ -83,11 +83,13 @@ const assertImporterDep = (path, name, expected) => {
 };
 
 assertImporterDep('.', 'zod', '4.3.6');
+assertImporterDep('.', 'undici', '7.30.0');
 assertImporterDep('crates/freshell-claude-sidecar', '@anthropic-ai/claude-agent-sdk', '0.3.237');
 assertImporterDep('crates/freshell-claude-sidecar', '@anthropic-ai/sdk', '0.120.0');
 assertImporterDep('crates/freshell-claude-sidecar', '@modelcontextprotocol/sdk', '1.30.0');
 assertImporterDep('crates/freshell-claude-sidecar', 'zod', '4.4.3');
 assertImporterDep('packages/freshell-mcp-runtime', '@modelcontextprotocol/sdk', '1.30.0');
+assertImporterDep('packages/freshell-mcp-runtime', 'undici', '7.30.0');
 assertImporterDep('packages/freshell-mcp-runtime', 'zod', '4.3.6');
 
 const packageKeys = new Set();

@@ -245,6 +245,49 @@ describe('managed runtime recovery merge', () => {
     expect(content.initialCwd).toBe('/workspace/real')
   })
 
+  it('preserves the live host stream epoch when a same-terminal inventory refresh arrives', () => {
+    const state = baseState()
+    state.panes.layouts['user-tab'].content = {
+      kind: 'terminal',
+      createRequestId: 'create-one',
+      terminalId: 'terminal-one',
+      streamId: 'stream-one-hostboot-replacement',
+      status: 'running',
+      mode: 'opencode',
+      shell: 'system',
+      soulId: 'soul-one',
+      viewIntentId: 'view-one',
+      incarnationId: 'incarnation-replacement',
+    }
+    const staleLaunchIdentity = soul({ incarnationId: 'incarnation-replacement' })
+
+    const plan = buildManagedRuntimeMergePlan(snapshot([staleLaunchIdentity]), state)
+
+    expect(plan.updates).toHaveLength(1)
+    expect((plan.updates[0].content as any).streamId).toBe('stream-one-hostboot-replacement')
+  })
+
+  it('takes the projected stream ID when the pane is rebound to a different terminal', () => {
+    const state = baseState()
+    state.panes.layouts['user-tab'].content = {
+      kind: 'terminal',
+      createRequestId: 'create-one',
+      terminalId: 'terminal-old',
+      streamId: 'stream-old-hostboot',
+      status: 'running',
+      mode: 'opencode',
+      shell: 'system',
+      soulId: 'soul-one',
+      viewIntentId: 'view-one',
+    }
+
+    const plan = buildManagedRuntimeMergePlan(snapshot(), state)
+
+    expect(plan.updates).toHaveLength(1)
+    expect((plan.updates[0].content as any).terminalId).toBe('terminal-one')
+    expect((plan.updates[0].content as any).streamId).toBe('stream-one')
+  })
+
   it('rekeys an offline fresh-agent view to the supervisor current native branch after provider fork', () => {
     const state = baseState()
     state.tabs.tabs[0].mode = 'freshcodex'

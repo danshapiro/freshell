@@ -2887,8 +2887,14 @@ mod tests {
     }
 
     fn uuid_like() -> String {
-        format!("{}-{:?}", std::process::id(), std::time::SystemTime::now())
-            .replace([':', '.', ' '], "-")
+        static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let sequence = NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        format!(
+            "{}-{:?}-{sequence}",
+            std::process::id(),
+            std::time::SystemTime::now()
+        )
+        .replace([':', '.', ' '], "-")
     }
 
     // ── CFG-04: legacyLocalSettingsSeed ─────────────────────────────────────

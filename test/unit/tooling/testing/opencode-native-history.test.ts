@@ -5,7 +5,7 @@ import os from 'node:os'
 import path from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
-import { hasOpenCodePromptModelText, nativeTurnProof, openCodeCredentialFailureMessage, openCodeTerminalReady, selectNativeAssistantTurn } from '../../../e2e-browser/helpers/opencode-native-history.js'
+import { hasOpenCodePromptModelText, nativeTurnProof, openCodeCredentialFailureMessage, openCodeTerminalReady, selectNativeAssistantTurn, waitForOpenCodeTerminalCondition } from '../../../e2e-browser/helpers/opencode-native-history.js'
 import { readOpenCodeNativeHistory } from '../../../e2e-browser/helpers/provider-native-history/opencode.js'
 
 let root: string
@@ -39,8 +39,29 @@ describe('live recovery proves new native assistant responses, never TUI echo or
   it('surfaces an OpenAI token refresh rejection instead of waiting for the native response timeout', () => {
     expect(openCodeCredentialFailureMessage('\u001b[31mToken refresh failed: 401\u001b[0m'))
       .toMatch(/credential refresh was rejected.*401/i)
+    expect(openCodeCredentialFailureMessage(
+      'Could not parse your authentication token. Please try signing in again.',
+    )).toMatch(/credential was rejected/i)
+    expect(openCodeCredentialFailureMessage('HTTP 401 Unauthorized')).toMatch(/credential was rejected/i)
+    expect(openCodeCredentialFailureMessage('401 tokens remain in this request')).toBeNull()
     expect(openCodeCredentialFailureMessage('Token refresh failed: 403')).toBeNull()
     expect(openCodeCredentialFailureMessage('GPT-5.6 Luna')).toBeNull()
+  })
+
+  it('detects authentication errors when OpenCode redraws a shorter terminal screen', async () => {
+    const snapshots = [
+      'OpenCode prompt and status text '.repeat(20),
+      'Could not parse your authentication token. Please try signing in again.',
+    ]
+    let reads = 0
+    await expect(waitForOpenCodeTerminalCondition({
+      readTerminalText: async () => snapshots[Math.min(reads++, snapshots.length - 1)],
+      wait: async () => {},
+      description: 'an OpenCode tool result',
+      succeeds: (text) => text.includes('P2_OPENCODE_FIRST_TURN_DONE'),
+      timeoutMs: 1_000,
+    })).rejects.toThrow(/credential was rejected/i)
+    expect(reads).toBe(2)
   })
 
   it('reads only completed assistant messages for the exact native session', () => {

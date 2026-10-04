@@ -44,7 +44,9 @@ The image includes the same Freshell MCP tool as an ordinary terminal at
 the frozen workspace lock, so a managed provider can launch it without a web
 server worktree mount. Check the image with
 `pnpm exec tsx scripts/testing/probe-managed-mcp-image.ts --image <image>`;
-the probe calls `tools/list` and `tools/call` through a fake local endpoint.
+the probe calls `tools/list` and `tools/call` through a fake local endpoint
+while Node's environment proxy is enabled, then verifies Freshell's API request
+did not reach the proxy.
 The controller supplies each incarnation's scoped MCP grant in the
 provider environment. Provider MCP configuration, including user entries,
 keeps its ordinary semantics.
@@ -57,12 +59,26 @@ separate legacy credential bootstrap.
 
 ## Real-provider acceptance order
 
-OpenCode is the first real-provider Phase 2 acceptance lane. The live gate pins OpenCode 1.18.21 and uses `openai/gpt-5.6-luna` with the configured OpenAI OAuth credential. The receipt reads the actual provider and model from OpenCode's native session database and fails if they differ; it does not silently fall back. Managed OpenCode is one provider runtime per soul rather than the legacy shared serve process. Its ordinary JSON, JSONC, plugin, and TUI rebind configuration is retained.
+OpenCode is the first real-provider Phase 2 acceptance lane. The live gate pins OpenCode 1.18.21 and uses `openai/gpt-5.6-luna` through the dedicated OneCLI OpenAI OAuth grant. The receipt reads the actual provider and model from OpenCode's native session database and fails if they differ; it does not silently fall back. Managed OpenCode is one provider runtime per soul rather than the legacy shared serve process. Its ordinary JSON, JSONC, plugin, and TUI rebind configuration is retained.
 
-P2-G04 runs its web server with an isolated home directory. Configure a private
-OneCLI grant through `FRESHELL_MANAGED_OPENCODE_ONECLI_ENV_FILE` or
-`FRESHELL_MANAGED_OPENCODE_ONECLI_AUTH_FILE` before the browser gate. The
-session host resolves the grant only for the provider child.
+P2-G04 runs its web server with an isolated home directory. Before the browser
+gate, set all three private grant references:
+
+```bash
+export FRESHELL_MANAGED_OPENCODE_ONECLI_AUTH_FILE=/path/to/private/opencode-auth.json
+export FRESHELL_MANAGED_OPENCODE_ONECLI_ENV_FILE=/path/to/private/opencode-onecli.env
+export FRESHELL_MANAGED_OPENCODE_ONECLI_CA_FILE=/path/to/private/gateway-ca.pem
+```
+
+The auth file is an OpenCode-native OAuth placeholder with `onecli-managed`
+access and refresh values and a future expiry; it must not contain a provider
+token. The environment grant carries the dedicated authenticated proxy aliases,
+`OPENAI_BASE_URL`, `NODE_USE_ENV_PROXY=1`, `NODE_EXTRA_CA_CERTS` pointing to
+`/home/freshell/provider/.config/onecli/gateway-ca.pem`, and
+`NO_PROXY=localhost,127.0.0.1`. Only those loopback hosts may bypass the proxy,
+because OpenCode's TUI must reach its own local server directly. The CA grant
+is staged at that provider-home path before OpenCode starts. Freshell resolves
+the grants only for the provider child.
 
 Amplifier launches the ordinary configured CLI and bundle. The image carries
 the generic Amplifier app and a pinned vLLM module for existing profiles; it

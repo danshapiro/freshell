@@ -5,6 +5,7 @@
  * Freshell into every spawned terminal). Does NOT read config files -- the
  * MCP server always runs in a terminal that already has env vars set.
  */
+import { Agent } from 'undici'
 
 export type ApiClientConfig = {
   url: string
@@ -24,6 +25,10 @@ export type ApiClient = {
   patch: <T = any>(path: string, body?: unknown) => Promise<T>
   delete: <T = any>(path: string) => Promise<T>
 }
+
+// Node's environment proxy can route global fetch through a model gateway.
+// Freshell's own control API must keep using the direct transport.
+const directFreshellApiDispatcher = new Agent()
 
 function joinUrl(base: string, path: string): string {
   const trimmed = base.endsWith('/') ? base.slice(0, -1) : base
@@ -66,11 +71,13 @@ export function createApiClient(config?: ApiClientConfig): ApiClient {
     if (body !== undefined) headers['Content-Type'] = 'application/json'
     if (token) headers['x-auth-token'] = token
 
-    const res = await fetch(joinUrl(baseUrl, path), {
+    const init = {
       method,
       headers,
       body: body !== undefined ? JSON.stringify(body) : undefined,
-    })
+      dispatcher: directFreshellApiDispatcher,
+    }
+    const res = await fetch(joinUrl(baseUrl, path), init)
 
     const data = await parseResponse(res)
     if (!res.ok) {

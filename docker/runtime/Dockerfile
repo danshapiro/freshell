@@ -24,11 +24,14 @@ COPY package.json pnpm-lock.yaml pnpm-workspace.yaml ./
 COPY packages/freshell-mcp-runtime/package.json packages/freshell-mcp-runtime/
 COPY tools/freshell-mcp/*.ts tools/freshell-mcp/
 COPY tools/node-client-runtime/*.ts tools/node-client-runtime/
+# pnpm deploy only carries the package's generated/ allowlist, so copy this
+# image build's root entry point into the deployed runtime explicitly.
 RUN npm install --global pnpm@10.34.5 \
  && pnpm --filter freshell-mcp-runtime install --frozen-lockfile --ignore-scripts \
  && pnpm --filter freshell-mcp-runtime exec esbuild ../../tools/freshell-mcp/server.ts \
       --bundle --platform=node --format=esm --packages=external --outfile=server.js \
- && pnpm --filter freshell-mcp-runtime --prod --frozen-lockfile --config.node-linker=hoisted deploy /opt/freshell-mcp
+ && pnpm --filter freshell-mcp-runtime --prod --frozen-lockfile --config.node-linker=hoisted deploy /opt/freshell-mcp \
+ && cp packages/freshell-mcp-runtime/server.js /opt/freshell-mcp/server.js
 
 FROM ubuntu@sha256:33ceb71981b602c1a7443a53469e4dba065f7503eab3078a2d7a57a2ab987517
 ARG CLAUDE_CODE_VERSION=2.1.263

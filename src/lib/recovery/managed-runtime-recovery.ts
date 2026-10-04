@@ -148,9 +148,20 @@ function updateExistingContent(
 ): PaneContent {
   const fields = managedProjectionFields(soul, view)
   if (existing.kind === 'terminal') {
+    const managedContent = managedTerminalContent(soul, view)
+    // Inventory retains the stable launch stream ID. A live terminal can
+    // advance to a host-specific stream epoch after recovery, so only the
+    // terminal transport (terminal.stream.changed / attach.ready) may replace
+    // an existing pane's stream ID while it still represents the same PTY.
+    const preserveLiveStreamId = Boolean(
+      existing.terminalId
+      && existing.terminalId === soul.terminalId
+      && existing.streamId,
+    )
     return {
       ...existing,
-      ...definedOnly(managedTerminalContent(soul, view)),
+      ...definedOnly(managedContent),
+      ...(preserveLiveStreamId ? { streamId: existing.streamId } : {}),
       // Preserve a user pane's stable create key when the supervisor record
       // predates that field. Otherwise use the authoritative managed key.
       createRequestId: soul.terminalCreateRequestId || existing.createRequestId,

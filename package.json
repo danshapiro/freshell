@@ -132,6 +132,7 @@
     "react-syntax-highlighter": "^16.1.1",
     "react-window": "^2.2.6",
     "remark-gfm": "^4.0.0",
+    "undici": "7.30.0",
     "ws": "^8.18.0",
     "zod": "^4.0.0"
   },
