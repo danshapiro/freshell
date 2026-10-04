@@ -562,6 +562,12 @@
       "listener": "assertion-only"
     },
     {
+      "id": "assertion-test-mcp-http-client",
+      "path": "test/unit/mcp/http-client.test.ts",
+      "role": "test-listener-assertion",
+      "listener": "assertion-only"
+    },
+    {
       "id": "assertion-test-cli-action-capabilities",
       "path": "test/unit/cli/action-capabilities.test.ts",
       "role": "test-listener-assertion",
