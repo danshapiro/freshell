@@ -6,6 +6,8 @@ import type { ManagedRuntimeNotice, ManagedRuntimeRecoverySummary } from '@share
 import { FRESHCODEX_DEFAULT_MODEL } from '@shared/fresh-agent-models.js'
 import { test, expect } from '../helpers/fixtures.js'
 import { RawWsClient } from '../helpers/raw-clients.js'
+import { RustServer } from '../helpers/rust-server.js'
+import { TestHarness, selectShellFromPicker } from '../helpers/test-harness.js'
 
 type PaneKind = 'terminal' | 'fresh-agent'
 type RecoveryState = ManagedRuntimeRecoverySummary['recoveryState']
@@ -333,6 +335,158 @@ test('fresh-agent: automatic recovery reads actual saved Codex history without c
   const messages = await harness.getSentWsMessages() as Array<{ type?: string }>
   expect(messages.filter((frame) => ['freshAgent.create', 'freshAgent.attach', 'pane.reconcile.request'].includes(frame.type ?? ''))).toEqual([])
   expect(await fs.readFile(rollout, 'utf8')).toBe(transcript)
+})
+
+test('fresh-agent: lost recovery preserves the conversation while a real same-session attach awaits its snapshot', async ({ page }) => {
+  test.setTimeout(120_000)
+  let rollout = ''
+  let operations = ''
+  let transcript = ''
+  const fixtureEnv: Record<string, string> = {
+    CODEX_CMD: `${process.execPath} ${path.resolve('test/fixtures/coding-cli/codex-app-server/fake-app-server.mjs')}`,
+  }
+  const server = new RustServer({
+    env: fixtureEnv,
+    setupHome: async (homeDir) => {
+      const freshellDir = path.join(homeDir, '.freshell')
+      await fs.mkdir(freshellDir, { recursive: true })
+      await fs.writeFile(path.join(freshellDir, 'config.json'), JSON.stringify({ version: 1,
+        settings: { codingCli: { enabledProviders: ['codex'] }, freshAgent: { enabled: true } } }))
+      const sessions = path.join(homeDir, '.codex', 'sessions', '2026', '03', '01')
+      await fs.mkdir(sessions, { recursive: true })
+      rollout = path.join(sessions, `rollout-${SESSION_ID}.jsonl`)
+      transcript = (await fs.readFile('test/fixtures/coding-cli/codex/task-events.sanitized.jsonl', 'utf8'))
+        .replace('session-activity', SESSION_ID).replace('Sanitized completion', 'Fixture turn')
+      await fs.writeFile(rollout, transcript)
+      operations = path.join(homeDir, 'codex-operations.jsonl')
+      // This is the existing provider protocol fixture, reached through the real Rust backend.
+      fixtureEnv.FAKE_CODEX_APP_SERVER_BEHAVIOR = JSON.stringify({ threadStartThreadId: SESSION_ID,
+        appendThreadOperationLogPath: operations })
+    },
+  })
+  let client: RawWsClient | undefined
+  try {
+    const info = await server.start()
+    client = await RawWsClient.connect(info.wsUrl)
+    client.hello(info.token)
+    await client.nextJsonMessage('ready', 10_000)
+    client.sendJson({ type: 'freshAgent.create', requestId: CREATE_REQUEST_ID,
+      sessionType: 'freshcodex', provider: 'codex', cwd: info.homeDir })
+    const created = await client.nextJsonMessage<{ sessionId: string; sessionRef?: { provider: string; sessionId: string } }>('freshAgent.created', 20_000)
+    const sent: Array<Record<string, any>> = []
+    const received: Array<Record<string, any>> = []
+    const held: Array<string | Buffer> = []
+    let hold = false
+    let release = () => {}
+    await page.routeWebSocket('**/ws', (socket) => {
+      const upstream = socket.connectToServer()
+      socket.onMessage((data) => {
+        sent.push(JSON.parse(String(data)))
+        upstream.send(data)
+      })
+      upstream.onMessage((data) => {
+        const frame = JSON.parse(String(data))
+        received.push(frame)
+        if (hold && frame.type === 'freshAgent.event' && frame.sessionId === created.sessionId) held.push(data)
+        else socket.send(data)
+      })
+      release = () => { hold = false; for (const data of held.splice(0)) socket.send(data) }
+    })
+    await page.goto(`${info.baseUrl}/?token=${info.token}&e2e=1`)
+    const harness = new TestHarness(page)
+    await harness.waitForHarness()
+    await harness.waitForConnection()
+    await selectShellFromPicker(page)
+    await page.evaluate(({ sessionId, sessionRef, requestId, soulId, summary, cwd }) => {
+      const harness = window.__FRESHELL_TEST_HARNESS__!
+      const state = harness.getState()
+      const tabId = state.tabs.activeTabId!
+      const paneId = state.panes.activePane[tabId]
+      harness.dispatch({ type: 'panes/updatePaneContent', payload: { tabId, paneId, content: {
+        kind: 'fresh-agent', sessionType: 'freshcodex', provider: 'codex', sessionId,
+        sessionRef, resumeSessionId: sessionRef?.sessionId ?? sessionId, createRequestId: requestId,
+        soulId, soulIntentRevision: 7, recoverySummary: summary, initialCwd: cwd, status: 'idle', settingsDismissed: true,
+      } } })
+    }, { sessionId: created.sessionId, sessionRef: created.sessionRef ?? { provider: 'codex', sessionId: SESSION_ID },
+      requestId: CREATE_REQUEST_ID, soulId: SOUL_ID, summary: recoverySummary('live'), cwd: info.homeDir })
+    await expect(page.getByText('Fixture turn', { exact: true })).toBeVisible()
+    const composer = page.getByRole('textbox', { name: 'Chat message input' })
+    await expect(composer).toBeEnabled()
+    await composer.fill('Draft retained while reattaching')
+    hold = true
+    await changeRecoveryState(page, 'recovering')
+    const previousAttach = sent.findLast((frame) => frame.type === 'freshAgent.attach' && frame.sessionId === created.sessionId)
+    expect(previousAttach).toBeDefined()
+    // Stop only this fixture's provider using the supported conversation-preserving stop.
+    // Its next attach must actually resume, so it produces new attachment truth.
+    client.sendJson({ type: 'freshAgent.recovery.stop', requestId: 'contextual-test-provider-stop',
+      sessionId: created.sessionId, sessionType: 'freshcodex', provider: 'codex',
+      observedEpoch: previousAttach!.observedEpoch, observedGeneration: previousAttach!.observedGeneration })
+    const stopped = await client.nextJsonMessage<{ requestId: string; success: boolean }>('freshAgent.recovery.stopped', 20_000)
+    expect(stopped).toMatchObject({ requestId: 'contextual-test-provider-stop', success: true })
+    await expect.poll(async () => (await harness.getReceivedWsMessages() as Array<{ type?: string; requestId?: string }>).some(
+      (frame) => frame.type === 'freshAgent.recovery.stopped' && frame.requestId === 'contextual-test-provider-stop',
+    )).toBe(true)
+    await expect.poll(() => page.evaluate((sessionId) => {
+      const owners = Object.values(window.__FRESHELL_TEST_HARNESS__!.getState().freshAgent.runtimeOwners) as Array<{ sessionId: string; ownerKind: string }>
+      return owners.find((owner) => owner.sessionId === sessionId)?.ownerKind
+    }, created.sessionId)).toBe('vacant')
+    // The explicit stop clears the client's entry; seed the retained entry
+    // that a supervisor loss leaves behind before delivering stale loss evidence.
+    await page.evaluate((sessionId) => window.__FRESHELL_TEST_HARNESS__!.dispatch({ type: 'freshAgent/sessionInit',
+      payload: { sessionId, sessionType: 'freshcodex', provider: 'codex' } }), created.sessionId)
+    await harness.receiveWsMessage({ type: 'freshAgent.event', sessionId: created.sessionId,
+      sessionType: 'freshcodex', provider: 'codex', event: { type: 'freshAgent.exit', code: 137 } })
+    await harness.receiveWsMessage({ type: 'freshAgent.event', sessionId: created.sessionId,
+      sessionType: 'freshcodex', provider: 'codex', event: { type: 'freshAgent.error', code: 'INVALID_SESSION_ID' } })
+    const recovering = await paneContent(page)
+    const firstSend = sent.length
+    await changeRecoveryState(page, 'live')
+    await expect.poll(() => sent.slice(firstSend).filter((frame) => frame.type === 'freshAgent.attach').length).toBe(1)
+    await expect.poll(() => ({
+      truth: held.map((data) => JSON.parse(String(data))).some((frame) => (
+        frame.type === 'freshAgent.event' && frame.sessionId === created.sessionId && frame.event?.type === 'freshAgent.session.snapshot'
+      )),
+      sent: sent.slice(firstSend),
+      received: received.slice(-6),
+    })).toMatchObject({ truth: true })
+    // The received truth frame is held at the actual socket boundary, not injected or fabricated.
+    const attachments = sent.slice(firstSend).filter((frame) => frame.type === 'freshAgent.attach')
+    expect(attachments).toHaveLength(1)
+    expect(attachments[0]).toMatchObject({ sessionId: created.sessionId,
+      sessionRef: recovering.sessionRef, sessionType: 'freshcodex', provider: 'codex' })
+    expect(sent.slice(firstSend).filter((frame) => ['freshAgent.create', 'pane.reconcile.request'].includes(frame.type))).toEqual([])
+    const beforeTruth = await paneContent(page)
+    expect(beforeTruth).toEqual({ ...recovering, recoverySummary: recoverySummary('live') })
+    await expect(composer).toBeDisabled()
+    await expect(composer).toHaveValue('Draft retained while reattaching')
+    await expect(page.getByText('Fixture turn', { exact: true })).toBeVisible()
+    await expect(page.getByTestId('managed-runtime-recovery-card')).toBeHidden()
+    await expect(page.getByRole('button', { name: 'Resume session', exact: true })).toBeHidden()
+    await expect(page.getByRole('button', { name: 'Start new session', exact: true })).toBeHidden()
+    const lost = () => page.evaluate((sessionId) => {
+      const sessions = Object.values(window.__FRESHELL_TEST_HARNESS__!.getState().freshAgent.sessions) as Array<{ sessionId: string; lost?: boolean }>
+      return sessions.find((session) => session.sessionId === sessionId)?.lost
+    }, created.sessionId)
+    expect(await lost()).toBe(true)
+    release()
+    await expect.poll(lost).toBe(false)
+    await expect(composer).toBeEnabled()
+    await expect(composer).toHaveValue('Draft retained while reattaching')
+    await expect(page.getByText('Fixture turn', { exact: true })).toBeVisible()
+    expect(await paneContent(page)).toMatchObject({ sessionId: created.sessionId, createRequestId: CREATE_REQUEST_ID,
+      sessionRef: recovering.sessionRef, resumeSessionId: recovering.resumeSessionId, soulId: SOUL_ID })
+    expect(sent.slice(firstSend).filter((frame) => ['freshAgent.create', 'pane.reconcile.request'].includes(frame.type))).toEqual([])
+    const providerOperations = (await fs.readFile(operations, 'utf8')).trim().split('\n').map((row) => JSON.parse(row))
+    expect(providerOperations.filter((operation) => operation.method === 'thread/start')).toHaveLength(1)
+    const resumed = providerOperations.filter((operation) => operation.method === 'thread/resume')
+    expect(resumed).toHaveLength(1)
+    expect(resumed[0].params.threadId).toBe(recovering.resumeSessionId)
+    expect(await fs.readFile(rollout, 'utf8')).toBe(transcript)
+  } finally {
+    await client?.dispose()
+    await server.stop()
+  }
 })
 
 test('managed terminal status and replacement events keep automatic recovery invisible', async ({ freshellPage, page, terminal, harness, serverInfo }) => {
