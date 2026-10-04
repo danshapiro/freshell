@@ -178,6 +178,19 @@ test.describe.serial('Phase 4 managed-runtime tab rehydration', () => {
     const sent: any[] = []
     const received: any[] = []
     let heldHost: {containerId: string, incarnationId: string, pid: number} | undefined
+    let cpuSession: Awaited<ReturnType<ReturnType<Page['context']>['newCDPSession']>> | undefined
+    let profilingStarted = false
+    const measurement: Record<string, unknown> = { kind: 'owned-page saved-history diagnostic', errors: [] }
+    const measurementErrors = measurement.errors as string[]
+    // Keep only asset names and route classes, never auth queries or native text.
+    const scriptLabel = (url: string) => {
+      if (!url) return 'native-or-anonymous'
+      try {
+        const parsed = new URL(url)
+        return ['http:', 'https:'].includes(parsed.protocol) && parsed.pathname.startsWith('/assets/')
+          ? parsed.pathname.split('/').at(-1) : 'document-or-other-script'
+      } catch { return 'anonymous-script' }
+    }
     try {
       const info = await rig.start()
       const settings = await fetch(`${info.baseUrl}/api/settings`, {
@@ -190,7 +203,7 @@ test.describe.serial('Phase 4 managed-runtime tab rehydration', () => {
         socket.onMessage((data) => { sent.push(JSON.parse(String(data))); upstream.send(data) })
         upstream.onMessage((data) => { received.push(JSON.parse(String(data))); socket.send(data) })
       })
-      await page.goto(`${info.baseUrl}/?token=${info.token}&e2e=1`)
+      await page.goto(`${info.baseUrl}/?token=${info.token}&e2e=1&perfAudit=1`)
       const harness = new TestHarness(page)
       await harness.waitForHarness()
       await harness.waitForConnection()
@@ -399,6 +412,14 @@ test.describe.serial('Phase 4 managed-runtime tab rehydration', () => {
         dispatchCount: stableProviderState.dispatchCount, completionCount: stableProviderState.completionCount })
       const reloadSentBaseline = sent.length
       const reloadReceivedBaseline = received.length
+      cpuSession = await page.context().newCDPSession(page)
+      await cpuSession.send('Profiler.enable')
+      measurement.browserBeforeReload = await page.evaluate(() => ({ timeOrigin: performance.timeOrigin, now: performance.now() }))
+      measurement.cpuStartRequestedAt = Date.now()
+      await cpuSession.send('Profiler.start')
+      profilingStarted = true
+      measurement.cpuStartedAt = Date.now()
+      rig.runtime.recordLifecycle('browser.saved_history_measurement.started', measurement)
       await page.reload()
       await harness.waitForHarness()
       await harness.waitForConnection()
@@ -479,8 +500,95 @@ test.describe.serial('Phase 4 managed-runtime tab rehydration', () => {
       try {
         if (heldHost) rig.signalOwnedSessionHostExact(heldHost.containerId, heldHost.incarnationId, 'SIGCONT', heldHost.pid)
       } finally {
-        const cleanup = await rig.stop()
-        expect(cleanup.ok, cleanup.errors.join('\n')).toBe(true)
+        try {
+          // Resume the exact owned host before diagnostic extraction on failure.
+          if (cpuSession) {
+            try {
+              if (profilingStarted) {
+                measurement.cpuStopRequestedAt = Date.now()
+                const { profile } = await cpuSession.send('Profiler.stop')
+                measurement.cpuStoppedAt = Date.now()
+                const nodes = new Map<number, any>(profile.nodes.map((node: any) => [node.id, node]))
+                const parents = new Map<number, number>()
+                for (const node of profile.nodes) for (const child of node.children ?? []) parents.set(child, node.id)
+                const describeFrame = (id: number) => {
+                  const frame = nodes.get(id)?.callFrame
+                  return { functionName: String(frame?.functionName ?? '').replace(/[^\w .()<>:$-]/g, '').slice(0, 120),
+                    script: scriptLabel(frame?.url ?? ''), line: frame?.lineNumber, column: frame?.columnNumber }
+                }
+                const totals = new Map<number, { samples: number, durationMs: number }>()
+                const seconds = new Map<number, { durationMs: number, samples: number, idleMs: number }>()
+                let elapsedUs = 0
+                for (let index = 0; index < (profile.samples?.length ?? 0); index += 1) {
+                  const id = profile.samples[index]
+                  const durationMs = (profile.timeDeltas?.[index] ?? 0) / 1000
+                  const total = totals.get(id) ?? { samples: 0, durationMs: 0 }
+                  total.samples += 1
+                  total.durationMs += durationMs
+                  totals.set(id, total)
+                  const second = Math.floor(elapsedUs / 1_000_000)
+                  const bucket = seconds.get(second) ?? { durationMs: 0, samples: 0, idleMs: 0 }
+                  bucket.durationMs += durationMs
+                  bucket.samples += 1
+                  if (nodes.get(id)?.callFrame.functionName === '(idle)') bucket.idleMs += durationMs
+                  seconds.set(second, bucket)
+                  elapsedUs += durationMs * 1000
+                }
+                measurement.cpu = { startTimeUs: profile.startTime, endTimeUs: profile.endTime,
+                  sampledDurationMs: elapsedUs / 1000, sampleCount: profile.samples?.length ?? 0,
+                  // Sampling attributes each delta to its leaf, not exact function wall time.
+                  topLeaves: [...totals.entries()].sort((a, b) => b[1].durationMs - a[1].durationMs).slice(0, 80)
+                    .map(([id, total]) => {
+                      const stack = []
+                      let parent = parents.get(id)
+                      while (parent !== undefined && stack.length < 20) {
+                        stack.push(describeFrame(parent))
+                        parent = parents.get(parent)
+                      }
+                      return { ...total, ...describeFrame(id), stack }
+                    }),
+                  seconds: [...seconds.entries()].map(([second, bucket]) => ({ second, ...bucket })) }
+              }
+            } catch { measurementErrors.push('owned CPU profile stop/extraction failed') }
+            finally {
+              try { await cpuSession.send('Profiler.disable') } catch { measurementErrors.push('owned CPU profiler disable failed') }
+              try { await cpuSession.detach() } catch { measurementErrors.push('owned CDP detach failed') }
+            }
+            try {
+              // Sanitize inside the owned page before returning audit data to Node.
+              measurement.audit = await page.evaluate(() => {
+                const snapshot = window.__FRESHELL_TEST_HARNESS__?.getPerfAuditSnapshot()
+                const routeClass = (raw: unknown) => {
+                  if (typeof raw !== 'string') return undefined
+                  let pathname: string
+                  try { pathname = new URL(raw, location.origin).pathname } catch { return 'unknown-route' }
+                  if (pathname.startsWith('/api/fresh-agent/threads/')) return 'native-thread-snapshot'
+                  if (/^\/api\/runtime\/souls\/[^/]+\/history$/.test(pathname)) return 'owned-soul-history'
+                  if (pathname.startsWith('/assets/')) return `asset:${pathname.split('/').at(-1)}`
+                  return pathname.startsWith('/api/') ? 'other-api' : 'document-or-resource'
+                }
+                return { timeOrigin: performance.timeOrigin, extractedAtMs: performance.now(), available: Boolean(snapshot),
+                  // The existing sink has no event timestamp: retain sequence and measured durations only.
+                  events: (snapshot?.perfEvents ?? []).flatMap((entry, sequence) => {
+                    if (!['perf.api_slow', 'perf.api_parse_slow', 'perf.longtask', 'perf.resource_slow'].includes(String(entry.event))) return []
+                    const numeric = Object.fromEntries(['status', 'durationMs', 'ttfbMs', 'bodyMs', 'parseMs', 'payloadChars',
+                      'startTime', 'transferSize', 'encodedBodySize', 'decodedBodySize']
+                      .filter((key) => typeof entry[key] === 'number').map((key) => [key, entry[key]]))
+                    return [{ sequence, event: entry.event, route: routeClass(entry.path ?? entry.name), ...numeric }]
+                  }) }
+              })
+            } catch { measurementErrors.push('owned perf audit extraction failed') }
+            rig.runtime.writeBrowserArtifact('saved-history-render-measurement', measurement)
+            rig.runtime.recordLifecycle('browser.saved_history_measurement.finished', {
+              cpuStartRequestedAt: measurement.cpuStartRequestedAt, cpuStartedAt: measurement.cpuStartedAt,
+              cpuStopRequestedAt: measurement.cpuStopRequestedAt, cpuStoppedAt: measurement.cpuStoppedAt,
+              errors: measurementErrors,
+            })
+          }
+        } finally {
+          const cleanup = await rig.stop()
+          expect(cleanup.ok, cleanup.errors.join('\n')).toBe(true)
+        }
       }
     }
   })
