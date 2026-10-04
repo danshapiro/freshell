@@ -60,7 +60,8 @@ impl tracing::field::Visit for TraceFieldVisitor {
         if field.name() == "message" {
             self.message = value.to_string();
         }
-        self.fields.insert(field.name().to_string(), value.to_string());
+        self.fields
+            .insert(field.name().to_string(), value.to_string());
     }
 }
 

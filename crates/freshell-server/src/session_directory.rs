@@ -4478,10 +4478,7 @@ mod tests {
             }
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
-        assert!(
-            cache_persisted,
-            "the index cache persisted within 2s"
-        );
+        assert!(cache_persisted, "the index cache persisted within 2s");
         let response_text = serde_json::to_string(&first).unwrap();
         assert!(!response_text.contains(&older_path.to_string_lossy().to_string()));
         assert!(!response_text.contains(&hidden_path.to_string_lossy().to_string()));
