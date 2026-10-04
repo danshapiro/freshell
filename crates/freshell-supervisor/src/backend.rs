@@ -62,6 +62,80 @@ pub struct CreateRuntimeSpec {
     pub provider_volume_name: String,
 }
 
+/// Exact read-only bind mount used to expose one verified OpenCode transfer
+/// bundle to the session host.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OpenCodeTransferMountPlan {
+    pub source: PathBuf,
+}
+
+impl OpenCodeTransferMountPlan {
+    pub const DESTINATION: &'static str = "/run/freshell-opencode-transfer";
+
+    pub fn docker_bind(&self) -> String {
+        format!("{}:{}:ro", self.source.display(), Self::DESTINATION)
+    }
+}
+
+/// Resolve and validate the transfer mount that `create_stopped` will pass to
+/// Docker. Keeping this derivation in one place also lets synthetic launch
+/// tests use the exact production mount plan without opening a Docker socket.
+pub fn opencode_transfer_mount_plan(
+    spec: &CreateRuntimeSpec,
+) -> Result<Option<OpenCodeTransferMountPlan>, BackendError> {
+    let runtime_dir = canonical_dir(&spec.runtime_dir)?;
+    opencode_transfer_mount_plan_for_runtime_dir(spec, &runtime_dir)
+}
+
+fn opencode_transfer_mount_plan_for_runtime_dir(
+    spec: &CreateRuntimeSpec,
+    runtime_dir: &Path,
+) -> Result<Option<OpenCodeTransferMountPlan>, BackendError> {
+    let expected = expected_opencode_transfer_dir(runtime_dir, spec.terminal.as_ref())?;
+    match (&spec.opencode_transfer_dir, expected) {
+        (Some(path), Some(expected)) if path == &expected => Ok(Some(OpenCodeTransferMountPlan {
+            source: canonical_dir(path)?,
+        })),
+        (None, None) => Ok(None),
+        _ => Err(BackendError::InvalidConfig(
+            "OpenCode transfer mount does not match the terminal descriptor".into(),
+        )),
+    }
+}
+
+/// Check Docker's inspected mount projection against the same plan used to
+/// create the container. The target must occur exactly once and remain
+/// read-only.
+pub fn verify_opencode_transfer_mount_inspection(
+    mounts: &[Value],
+    expected: Option<&OpenCodeTransferMountPlan>,
+) -> Result<(), BackendError> {
+    let transfer_mounts = mounts
+        .iter()
+        .filter(|mount| {
+            mount.get("Destination").and_then(Value::as_str)
+                == Some(OpenCodeTransferMountPlan::DESTINATION)
+        })
+        .collect::<Vec<_>>();
+    match expected {
+        Some(expected)
+            if transfer_mounts.len() == 1
+                && transfer_mounts[0].get("Source").and_then(Value::as_str)
+                    == Some(expected.source.to_string_lossy().as_ref())
+                && transfer_mounts[0].get("RW").and_then(Value::as_bool) == Some(false) =>
+        {
+            Ok(())
+        }
+        Some(_) => Err(BackendError::OwnershipMismatch(
+            "OpenCode transfer mount is missing, writable, or points to another bundle".into(),
+        )),
+        None if transfer_mounts.is_empty() => Ok(()),
+        None => Err(BackendError::OwnershipMismatch(
+            "runtime gained an unexpected OpenCode transfer mount".into(),
+        )),
+    }
+}
+
 const HOST_ACTOR_STATE_MOUNT: &str = "/run/freshell-host-actor";
 
 pub(crate) fn host_actor_state_dir(
@@ -889,17 +963,7 @@ impl RuntimeBackend for DockerEngineBackend {
         let operator_home = terminal_mounts
             .as_ref()
             .and_then(|mounts| mounts.operator_home.as_ref());
-        let expected_transfer_dir =
-            expected_opencode_transfer_dir(&runtime_dir, spec.terminal.as_ref())?;
-        let transfer_dir = match (&spec.opencode_transfer_dir, &expected_transfer_dir) {
-            (Some(path), Some(expected)) if path == expected => Some(canonical_dir(path)?),
-            (None, None) => None,
-            _ => {
-                return Err(BackendError::InvalidConfig(
-                    "OpenCode transfer mount does not match the terminal descriptor".into(),
-                ));
-            }
-        };
+        let transfer_mount = opencode_transfer_mount_plan_for_runtime_dir(spec, &runtime_dir)?;
         let expected = ExpectedConfig::new(spec, &binary, &runtime_dir);
         let immutable_config_digest = digest_expected(&expected)?;
         let (daemon_id, rootless) = self.daemon_info().await?;
@@ -929,8 +993,8 @@ impl RuntimeBackend for DockerEngineBackend {
             spec.fresh_agent.as_ref(),
             operator_home.map(|mount| mount.home.as_path()),
         )?;
-        if let Some(transfer_dir) = &transfer_dir {
-            binds.push(format!("{}:/run/freshell-opencode-transfer:ro", transfer_dir.display()));
+        if let Some(transfer_mount) = &transfer_mount {
+            binds.push(transfer_mount.docker_bind());
         }
         let runtime_mode = spec
             .terminal
@@ -1621,35 +1685,10 @@ fn verify_inspect_config(handle: &OwnedRuntimeHandle, value: &Value) -> Result<(
             "provider home volume changed".into(),
         ));
     }
-    let expected_transfer_dir =
-        expected_opencode_transfer_dir(handle.runtime_dir(), handle.terminal())?;
-    let transfer_mounts = mounts
-        .iter()
-        .filter(|mount| {
-            mount.get("Destination").and_then(Value::as_str)
-                == Some("/run/freshell-opencode-transfer")
-        })
-        .collect::<Vec<_>>();
-    match expected_transfer_dir {
-        Some(expected) => {
-            if transfer_mounts.len() != 1
-                || transfer_mounts[0].get("Source").and_then(Value::as_str)
-                    != Some(expected.to_string_lossy().as_ref())
-                || transfer_mounts[0].get("RW").and_then(Value::as_bool) != Some(false)
-            {
-                return Err(BackendError::OwnershipMismatch(
-                    "OpenCode transfer mount is missing, writable, or points to another bundle"
-                        .into(),
-                ));
-            }
-        }
-        None if !transfer_mounts.is_empty() => {
-            return Err(BackendError::OwnershipMismatch(
-                "runtime gained an unexpected OpenCode transfer mount".into(),
-            ));
-        }
-        None => {}
-    }
+    let expected_transfer_mount =
+        expected_opencode_transfer_dir(handle.runtime_dir(), handle.terminal())?
+            .map(|source| OpenCodeTransferMountPlan { source });
+    verify_opencode_transfer_mount_inspection(mounts, expected_transfer_mount.as_ref())?;
     let actor_mounts = mounts
         .iter()
         .filter(|mount| {
