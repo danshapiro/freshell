@@ -92,18 +92,27 @@ fn opencode_session_transfer_descriptor_is_bounded_and_identity_bound() {
 }
 
 #[test]
-fn boxed_opencode_begin_action_keeps_the_descriptor_wire_shape() {
+fn opencode_begin_action_round_trips_descriptor_and_attempt_token() {
     let descriptor = descriptor();
     let wire_value = serde_json::json!({
         "action": "begin",
-        "data": descriptor,
+        "data": { "descriptor": descriptor, "attempt_id": "a".repeat(32) },
     });
-    let action = OpenCodeTransferAction::Begin(Box::new(descriptor.clone()));
+    let action = OpenCodeTransferAction::Begin {
+        descriptor: Box::new(descriptor.clone()),
+        attempt_id: "a".repeat(32),
+    };
     assert_eq!(serde_json::to_value(&action).unwrap(), wire_value);
 
     let restored: OpenCodeTransferAction = serde_json::from_value(wire_value).unwrap();
     match restored {
-        OpenCodeTransferAction::Begin(restored) => assert_eq!(*restored, descriptor),
+        OpenCodeTransferAction::Begin {
+            descriptor: restored,
+            attempt_id,
+        } => {
+            assert_eq!(*restored, descriptor);
+            assert_eq!(attempt_id, "a".repeat(32));
+        }
         _ => panic!("begin action must round-trip as begin"),
     }
 }
@@ -139,6 +148,7 @@ fn reference_only_workspace_and_git_assets_do_not_require_transferred_files() {
 fn opencode_session_transfer_chunk_is_bounded_and_fits_authenticated_control_frame() {
     let mut chunk = OpenCodeTransferChunk {
         transfer_id: "transfer-test-1".into(),
+        attempt_id: "a".repeat(32),
         sequence: 0,
         file_index: 0,
         offset: 0,
@@ -155,4 +165,11 @@ fn opencode_session_transfer_chunk_is_bounded_and_fits_authenticated_control_fra
     chunk.data.push(0);
     chunk.sha256 = hex::encode(Sha256::digest(&chunk.data));
     assert!(chunk.validate().is_err());
+}
+
+#[test]
+fn opencode_attempt_id_requires_canonical_lowercase_uuid_bytes() {
+    assert!(super::valid_opencode_transfer_attempt_id(&"0a".repeat(16)));
+    assert!(!super::valid_opencode_transfer_attempt_id(&"A".repeat(32)));
+    assert!(!super::valid_opencode_transfer_attempt_id(&"a".repeat(31)));
 }

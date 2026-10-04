@@ -10,7 +10,8 @@ use sha2::{Digest, Sha256};
 use std::fmt;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
-pub const CONTROL_PROTOCOL_VERSION: u32 = 1;
+// v2 adds mandatory per-attempt ownership tokens to OpenCode transfer actions.
+pub const CONTROL_PROTOCOL_VERSION: u32 = 2;
 pub const MAX_CONTROL_FRAME_BYTES: usize = 1024 * 1024;
 pub const MAX_NATIVE_HISTORY_FRAME_BYTES: usize = 32 * 1024 * 1024;
 pub const MAX_OPENCODE_TRANSFER_CHUNK_BYTES: usize = 256 * 1024;
@@ -2464,6 +2465,9 @@ pub struct OpenCodeTransferFile {
 #[serde(rename_all = "camelCase")]
 pub struct OpenCodeTransferChunk {
     pub transfer_id: String,
+    /// Opaque fencing token for the Begin/resume attempt that owns this
+    /// partial stage. A later Begin for the stable transfer ID supersedes it.
+    pub attempt_id: String,
     pub sequence: u64,
     pub file_index: u32,
     pub offset: u64,
@@ -2476,10 +2480,29 @@ pub struct OpenCodeTransferChunk {
 #[serde(tag = "action", content = "data", rename_all = "snake_case")]
 pub enum OpenCodeTransferAction {
     TargetInfo,
-    Begin(Box<OpenCodeTransferDescriptor>),
+    Begin {
+        descriptor: Box<OpenCodeTransferDescriptor>,
+        attempt_id: String,
+    },
     Chunk(OpenCodeTransferChunk),
-    Finalize { transfer_id: String },
-    Abort { transfer_id: String },
+    Finalize {
+        transfer_id: String,
+        attempt_id: String,
+    },
+    Abort {
+        transfer_id: String,
+        attempt_id: String,
+    },
+}
+
+/// Attempt tokens use UUID's simple 32-character lowercase hexadecimal form.
+/// Keeping the wire form opaque avoids making attempt identity part of the
+/// durable transfer descriptor or its readiness receipt.
+pub fn valid_opencode_transfer_attempt_id(value: &str) -> bool {
+    value.len() == 32
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -2731,6 +2754,7 @@ impl OpenCodeTransferChunk {
     pub fn validate(&self) -> Result<(), RuntimeError> {
         if self.transfer_id.is_empty()
             || self.transfer_id.len() > 128
+            || !valid_opencode_transfer_attempt_id(&self.attempt_id)
             || self.data.is_empty()
             || self.data.len() > MAX_OPENCODE_TRANSFER_CHUNK_BYTES
             || !is_lower_hex_64(&self.sha256)
