@@ -4351,6 +4351,61 @@ pub(crate) mod tests {
         std::fs::remove_dir_all(&home).ok();
     }
 
+    async fn assert_equal_unknown_codex_classification_stays_unresolved(
+        field: &str,
+        known_value: &str,
+    ) {
+        let home = unique_temp_dir(&format!("codex-unknown-{field}"));
+        let (older, newer) = codex_continuation_fixtures();
+        let known = format!(r#""{field}":"{known_value}""#);
+        let unknown = format!(r#""{field}":"unsupported-{field}""#);
+        let (older_path, newer_path) = write_codex_pair(
+            &home,
+            &older.replace(&known, &unknown),
+            &newer.replace(&known, &unknown),
+        );
+        let source = Arc::new(CodexSource::new(home.join(".codex")));
+
+        let single_file = source.parse(&newer_path).unwrap();
+        assert_eq!(single_file.title.as_deref(), Some("Continuation title"));
+        assert_eq!(single_file.summary.as_deref(), Some("Continuation summary"));
+        assert_uncomposed_same_id_rows(&source, field);
+
+        let index =
+            SessionIndex::with_ttl_and_cache_path(vec![source], Duration::from_secs(60), None);
+        let snapshot = index
+            .snapshot_with_failures_and_unresolved_codex_identities()
+            .await;
+        assert_eq!(
+            snapshot.sessions.len(),
+            2,
+            "{field}: do not compose unknown evidence"
+        );
+        assert!(snapshot.scan_failures.is_empty());
+        let session_id = "b7936c10-4935-441c-837c-c1f33cafec2d";
+        assert_eq!(
+            snapshot.unresolved_codex_identities.as_ref(),
+            &vec![CodexUnresolvedIdentity {
+                session_id: session_id.to_string(),
+                paths: vec![newer_path, older_path],
+            }],
+            "{field}: preserve the whole unresolved identity for quarantine"
+        );
+        assert!(snapshot.codex_segment_paths.get(session_id).is_none());
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[tokio::test]
+    async fn codex_source_keeps_equal_unknown_history_modes_unresolved() {
+        assert_equal_unknown_codex_classification_stays_unresolved("history_mode", "paginated")
+            .await;
+    }
+
+    #[tokio::test]
+    async fn codex_source_keeps_equal_unknown_thread_sources_unresolved() {
+        assert_equal_unknown_codex_classification_stays_unresolved("thread_source", "user").await;
+    }
+
     #[test]
     fn codex_source_keeps_ambiguous_same_id_files_separate() {
         let (older, valid_newer) = codex_continuation_fixtures();

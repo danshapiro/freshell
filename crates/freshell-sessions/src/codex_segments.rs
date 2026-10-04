@@ -453,21 +453,17 @@ fn can_compose_group(session_id: &str, members: &[CodexSegmentEntry]) -> bool {
                 .required_metadata
                 .get(*key)
                 .is_some_and(|value| match *key {
-                    "cwd" | "thread_source" | "cli_version" | "originator" | "history_mode" => {
+                    "cwd" | "cli_version" | "originator" => {
                         value.as_str().is_some_and(|text| !text.trim().is_empty())
                     }
                     "source" => supported_root_session_source(value),
+                    // Only the reported user thread with paginated history
+                    // certifies continuation; other classifications remain displayable.
+                    "thread_source" => value.as_str() == Some("user"),
+                    "history_mode" => value.as_str() == Some("paginated"),
                     _ => false,
                 })
         }) {
-            return false;
-        }
-        if evidence
-            .required_metadata
-            .get("thread_source")
-            .and_then(Value::as_str)
-            == Some("subagent")
-        {
             return false;
         }
         let Some(interval) = evidence.interval else {
