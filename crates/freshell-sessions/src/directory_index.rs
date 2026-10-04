@@ -1461,6 +1461,15 @@ impl SessionIndex {
         self.change_rx.clone()
     }
 
+    /// Test seam for proving that an explicitly requested refresh completed
+    /// even when it publishes identical contents and leaves the generation
+    /// unchanged. This waits for the current sweep to release its lock; it
+    /// does not start a refresh.
+    #[doc(hidden)]
+    pub async fn wait_for_refresh_idle_for_test(&self) {
+        drop(self.refresh_lock.lock().await);
+    }
+
     /// Whether any dirty paths or providers are pending.
     pub fn has_dirty(&self) -> bool {
         has_dirty_parts(&self.dirty_paths, &self.dirty_providers)

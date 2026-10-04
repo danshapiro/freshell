@@ -4617,11 +4617,22 @@ mod tests {
         assert_eq!(parsed_samples[0]["source_files_truncated"], json!(true));
 
         let mut changes = index.subscribe_changes();
+        let generation_before_unchanged_refresh = *changes.borrow_and_update();
         index.mark_provider_dirty("codex");
-        tokio::time::timeout(Duration::from_secs(5), changes.changed())
-            .await
-            .expect("unchanged refresh completes")
-            .unwrap();
+        // A generation watch cannot signal completion when an unchanged
+        // refresh publishes nothing, so wait on the index's refresh barrier.
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            index.wait_for_refresh_idle_for_test(),
+        )
+        .await
+        .expect("marked unchanged refresh completes");
+        assert!(!index.has_dirty(), "the marked Codex refresh was consumed");
+        let generation_after_unchanged_refresh = *changes.borrow_and_update();
+        assert_eq!(
+            generation_after_unchanged_refresh, generation_before_unchanged_refresh,
+            "an unchanged refresh must not advance the session generation"
+        );
         let unchanged = get_directory_page(&app, uri).await;
         assert_eq!(unchanged["integrityError"]["duplicateItemCount"], json!(6));
         assert_eq!(
