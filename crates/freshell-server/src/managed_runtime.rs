@@ -182,7 +182,7 @@ impl ManagedTerminalController for ServerManagedRuntimeController {
             // server's resolved child environment wholesale (which can carry
             // AUTH_TOKEN, provider API keys, cloud credentials, proxy creds, ...).
             let env = managed_provider_env(&request.mode, &request.env);
-            let opencode_transfer = if request.mode == "opencode" {
+            let mut pending_opencode_transfer = if request.mode == "opencode" {
                 match request.resume_session_id.as_deref() {
                     Some(native_session_id) => Some(
                         stage_opencode_resume_bundle(
@@ -199,6 +199,12 @@ impl ManagedTerminalController for ServerManagedRuntimeController {
             } else {
                 None
             };
+            let opencode_transfer = pending_opencode_transfer
+                .as_ref()
+                .map(|pending| pending.descriptor.clone());
+            let opencode_transfer_attempt_id = pending_opencode_transfer
+                .as_ref()
+                .map(|pending| pending.attempt_id().to_owned());
             let provider_secret_references = {
                 crate::managed_provider_bootstrap::named_provider_onecli_references(&request.mode)?
             };
@@ -334,6 +340,7 @@ impl ManagedTerminalController for ServerManagedRuntimeController {
                     provider_secret_references,
                     provider_launch_context,
                     opencode_transfer,
+                    opencode_transfer_attempt_id,
                 }),
                 view_intent: Some(ViewIntentRequest {
                     owner_id: String::new(),
@@ -348,7 +355,12 @@ impl ManagedTerminalController for ServerManagedRuntimeController {
                 expected_control_epoch: None,
             };
             let result = match self.client.launch(request_id, launch).await {
-                Ok(result) => result,
+                Ok(result) => {
+                    if let Some(pending) = pending_opencode_transfer.as_mut() {
+                        pending.disarm();
+                    }
+                    result
+                }
                 Err(error) => {
                     if let Some(capability) = &mcp_capability {
                         let _ = crate::managed_mcp_capability::revoke_mcp_capability(
@@ -766,7 +778,7 @@ async fn stage_opencode_resume_bundle(
     workspace: &Path,
     destination_store_id: &SoulId,
     create_key: &str,
-) -> Result<OpenCodeTransferDescriptor, String> {
+) -> Result<PendingOpenCodeTransfer, String> {
     let (target_image_ref, target_schema, target_build_receipt) = client
         .opencode_transfer_target()
         .await
@@ -848,7 +860,7 @@ async fn stage_opencode_transfer_payload(
     client: &RuntimeClient,
     descriptor: OpenCodeTransferDescriptor,
     mut payload: TokioFile,
-) -> Result<OpenCodeTransferDescriptor, String> {
+) -> Result<PendingOpenCodeTransfer, String> {
     let attempt_id = Uuid::new_v4().simple().to_string();
     let mut abort_on_drop = OpenCodeTransferAbortOnDrop::new(
         client.clone(),
@@ -856,11 +868,11 @@ async fn stage_opencode_transfer_payload(
         attempt_id.clone(),
     );
     let result = async {
-        let (mut sequence, mut offset) = match client
+        let begin_result = client
             .opencode_transfer_begin(descriptor.clone(), attempt_id.clone())
             .await
-            .map_err(|error| format!("OpenCode transfer staging could not begin: {error}"))?
-        {
+            .map_err(|error| format!("OpenCode transfer staging could not begin: {error}"))?;
+        let (mut sequence, mut offset) = match begin_result {
             OpenCodeTransferResult::Started {
                 next_sequence,
                 file_offsets,
@@ -873,8 +885,32 @@ async fn stage_opencode_transfer_payload(
                 }
                 (next_sequence, file_offset.next_offset)
             }
-            OpenCodeTransferResult::Queued { .. } => {
-                return Err("OpenCode history transfer is queued for staging capacity".into());
+            OpenCodeTransferResult::Queued { transfer_id } => {
+                if transfer_id != descriptor.transfer_id {
+                    return Err("OpenCode staging queued a different transfer".into());
+                }
+                match client
+                    .opencode_transfer_wait_for_capacity(transfer_id, attempt_id.clone())
+                    .await
+                    .map_err(|error| {
+                        format!("OpenCode transfer capacity wait did not settle: {error}")
+                    })? {
+                    OpenCodeTransferResult::Started {
+                        next_sequence,
+                        file_offsets,
+                    } => {
+                        let [file_offset] = file_offsets.as_slice() else {
+                            return Err("OpenCode staging returned unexpected file offsets".into());
+                        };
+                        if file_offset.file_index != 0 {
+                            return Err(
+                                "OpenCode staging returned an unexpected payload file".into()
+                            );
+                        }
+                        (next_sequence, file_offset.next_offset)
+                    }
+                    _ => return Err("OpenCode capacity wait returned an unexpected result".into()),
+                }
             }
             _ => return Err("OpenCode staging returned an unexpected begin result".into()),
         };
@@ -936,14 +972,29 @@ async fn stage_opencode_transfer_payload(
     .await;
 
     match result {
-        Ok(descriptor) => {
-            abort_on_drop.disarm();
-            Ok(descriptor)
-        }
+        Ok(descriptor) => Ok(PendingOpenCodeTransfer {
+            descriptor,
+            abort_on_drop,
+        }),
         Err(error) => {
             abort_on_drop.abort().await;
             Err(error)
         }
+    }
+}
+
+struct PendingOpenCodeTransfer {
+    descriptor: OpenCodeTransferDescriptor,
+    abort_on_drop: OpenCodeTransferAbortOnDrop,
+}
+
+impl PendingOpenCodeTransfer {
+    fn attempt_id(&self) -> &str {
+        &self.abort_on_drop.attempt_id
+    }
+
+    fn disarm(&mut self) {
+        self.abort_on_drop.disarm();
     }
 }
 
@@ -1537,6 +1588,149 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn finalized_transfer_drop_before_launch_registration_sends_abort() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("control.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let client = RuntimeClient::new(&socket, "0123456789abcdef");
+        let payload_bytes = b"synthetic-finalized-payload";
+        let payload_path = dir.path().join("payload.json");
+        std::fs::write(&payload_path, payload_bytes).unwrap();
+        let descriptor = transfer_test_descriptor(payload_bytes, "transfer-finalized-drop");
+        let expected_id = descriptor.transfer_id.clone();
+        let supervisor_expected_id = expected_id.clone();
+
+        let supervisor = tokio::spawn(async move {
+            let mut current_attempt = None;
+            let mut ready = false;
+            for expected in ["begin", "wait", "chunk", "finalize", "abort"] {
+                let (mut stream, request) = accept_control_request(&listener).await;
+                let (actual, result) = match request.body {
+                    freshell_runtime_protocol::AdminCommand::OpenCodeTransfer(
+                        OpenCodeTransferAction::Begin {
+                            descriptor,
+                            attempt_id,
+                        },
+                    ) => {
+                        assert_eq!(expected, "begin");
+                        assert_eq!(descriptor.transfer_id, supervisor_expected_id);
+                        current_attempt = Some(attempt_id);
+                        (
+                            "begin",
+                            Ok(AdminResult::OpenCodeTransfer(
+                                OpenCodeTransferResult::Queued {
+                                    transfer_id: descriptor.transfer_id,
+                                },
+                            )),
+                        )
+                    }
+                    freshell_runtime_protocol::AdminCommand::OpenCodeTransfer(
+                        OpenCodeTransferAction::WaitForCapacity {
+                            transfer_id,
+                            attempt_id,
+                        },
+                    ) => {
+                        assert_eq!(expected, "wait");
+                        assert_eq!(transfer_id, supervisor_expected_id);
+                        assert_eq!(current_attempt.as_ref(), Some(&attempt_id));
+                        (
+                            "wait",
+                            Ok(AdminResult::OpenCodeTransfer(
+                                OpenCodeTransferResult::Started {
+                                    next_sequence: 0,
+                                    file_offsets: vec![OpenCodeTransferFileOffset {
+                                        file_index: 0,
+                                        next_offset: 0,
+                                    }],
+                                },
+                            )),
+                        )
+                    }
+                    freshell_runtime_protocol::AdminCommand::OpenCodeTransfer(
+                        OpenCodeTransferAction::Chunk(chunk),
+                    ) => {
+                        assert_eq!(expected, "chunk");
+                        assert_eq!(chunk.transfer_id, supervisor_expected_id);
+                        assert_eq!(current_attempt.as_ref(), Some(&chunk.attempt_id));
+                        (
+                            "chunk",
+                            Ok(AdminResult::OpenCodeTransfer(
+                                OpenCodeTransferResult::ChunkStored {
+                                    sequence: chunk.sequence,
+                                },
+                            )),
+                        )
+                    }
+                    freshell_runtime_protocol::AdminCommand::OpenCodeTransfer(
+                        OpenCodeTransferAction::Finalize {
+                            transfer_id,
+                            attempt_id,
+                        },
+                    ) => {
+                        assert_eq!(expected, "finalize");
+                        assert_eq!(transfer_id, supervisor_expected_id);
+                        assert_eq!(current_attempt.as_ref(), Some(&attempt_id));
+                        ready = true;
+                        (
+                            "finalize",
+                            Ok(AdminResult::OpenCodeTransfer(
+                                OpenCodeTransferResult::Ready { transfer_id },
+                            )),
+                        )
+                    }
+                    freshell_runtime_protocol::AdminCommand::OpenCodeTransfer(
+                        OpenCodeTransferAction::Abort {
+                            transfer_id,
+                            attempt_id,
+                        },
+                    ) => {
+                        assert_eq!(expected, "abort");
+                        assert!(
+                            ready,
+                            "the pending launch owner must remain armed after finalize"
+                        );
+                        assert_eq!(transfer_id, supervisor_expected_id);
+                        assert_eq!(current_attempt.as_ref(), Some(&attempt_id));
+                        ready = false;
+                        (
+                            "abort",
+                            Ok(AdminResult::OpenCodeTransfer(
+                                OpenCodeTransferResult::Aborted { transfer_id },
+                            )),
+                        )
+                    }
+                    other => panic!("unexpected transfer action: {other:?}"),
+                };
+                assert_eq!(actual, expected);
+                write_frame(
+                    &mut stream,
+                    &AdminReply {
+                        request_id: request.request_id,
+                        result,
+                    },
+                )
+                .await
+                .unwrap();
+            }
+            assert!(
+                !ready,
+                "pre-registration abort should release the ready stage"
+            );
+        });
+
+        let payload = TokioFile::open(payload_path).await.unwrap();
+        let pending = stage_opencode_transfer_payload(&client, descriptor, payload)
+            .await
+            .unwrap();
+        assert_eq!(pending.descriptor.transfer_id, expected_id);
+        drop(pending); // Models a local launch preparation failure before registration.
+        tokio::time::timeout(std::time::Duration::from_secs(5), supervisor)
+            .await
+            .expect("dropping the pending owner should send a matching abort")
+            .unwrap();
+    }
+
+    #[tokio::test]
     async fn cancelling_connected_transfer_sends_supervisor_abort() {
         let dir = tempfile::tempdir().unwrap();
         let socket = dir.path().join("control.sock");
@@ -1626,7 +1820,10 @@ mod tests {
         });
         chunk_seen_rx.await.unwrap();
         transfer.abort();
-        assert!(transfer.await.unwrap_err().is_cancelled());
+        assert!(transfer
+            .await
+            .err()
+            .is_some_and(|error| error.is_cancelled()));
         tokio::time::timeout(std::time::Duration::from_secs(5), supervisor)
             .await
             .expect("supervisor should receive the cancellation abort")
