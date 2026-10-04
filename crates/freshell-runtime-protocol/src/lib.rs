@@ -2020,6 +2020,10 @@ pub struct TerminalLaunchSpec {
     /// OpenCode terminal. The bundle bytes are never embedded here.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub opencode_transfer: Option<OpenCodeTransferDescriptor>,
+    /// Attempt token for the finalized stage's pending ownership claim. The
+    /// supervisor consumes it atomically with durable launch preparation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub opencode_transfer_attempt_id: Option<String>,
 }
 
 impl TerminalLaunchSpec {
@@ -2044,12 +2048,21 @@ impl TerminalLaunchSpec {
             transfer.validate()?;
             if self.mode != "opencode"
                 || self.resume_session_id.as_deref() != Some(transfer.root_session_id.as_str())
+                || !self
+                    .opencode_transfer_attempt_id
+                    .as_deref()
+                    .is_some_and(valid_opencode_transfer_attempt_id)
             {
                 return Err(RuntimeError::new(
                     RuntimeErrorCode::RecoveryWrongIdentity,
-                    "OpenCode transfer must match the resumed native session",
+                    "OpenCode transfer must match the resumed native session and a valid staging attempt",
                 ));
             }
+        } else if self.opencode_transfer_attempt_id.is_some() {
+            return Err(RuntimeError::new(
+                RuntimeErrorCode::InvalidRequest,
+                "OpenCode staging attempt has no transfer descriptor",
+            ));
         }
         if self.env.len() > 512
             || self.args.len() > 512
@@ -2738,6 +2751,10 @@ pub enum OpenCodeTransferAction {
     TargetInfo,
     Begin {
         descriptor: Box<OpenCodeTransferDescriptor>,
+        attempt_id: String,
+    },
+    WaitForCapacity {
+        transfer_id: String,
         attempt_id: String,
     },
     Chunk(OpenCodeTransferChunk),
@@ -4724,6 +4741,7 @@ mod tests {
             provider_secret_references: Vec::new(),
             provider_launch_context: None,
             opencode_transfer: None,
+            opencode_transfer_attempt_id: None,
         };
         assert!(spec.validate().is_ok());
         spec.provider_model = Some("bad\0model".into());

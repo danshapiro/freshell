@@ -213,6 +213,26 @@ impl RuntimeClient {
         }
     }
 
+    pub async fn opencode_transfer_wait_for_capacity(
+        &self,
+        transfer_id: String,
+        attempt_id: String,
+    ) -> Result<OpenCodeTransferResult, ClientError> {
+        match self
+            .request(
+                RequestId::new(),
+                AdminCommand::OpenCodeTransfer(OpenCodeTransferAction::WaitForCapacity {
+                    transfer_id,
+                    attempt_id,
+                }),
+            )
+            .await?
+        {
+            AdminResult::OpenCodeTransfer(result) => Ok(result),
+            _ => Err(ClientError::UnexpectedResult),
+        }
+    }
+
     pub async fn opencode_transfer_chunk(
         &self,
         chunk: freshell_runtime_protocol::OpenCodeTransferChunk,

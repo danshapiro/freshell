@@ -11801,6 +11801,7 @@ mod tests {
             provider_secret_references: Vec::new(),
             provider_launch_context: Some(context),
             opencode_transfer: None,
+            opencode_transfer_attempt_id: None,
         };
         let resume_spec = ResumeSpec {
             schema_version: freshell_runtime_protocol::RESUME_SPEC_SCHEMA_VERSION,
@@ -12577,6 +12578,7 @@ mod tests {
             provider_secret_references: Vec::new(),
             provider_launch_context: None,
             opencode_transfer: Some(descriptor.clone()),
+            opencode_transfer_attempt_id: Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into()),
         };
         let runtime_dir = root.path().join("runtime");
         std::fs::create_dir(&runtime_dir).map_err(|error| error.to_string())?;

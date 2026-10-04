@@ -112,6 +112,9 @@ pub struct Supervisor {
     pub(crate) backend: Arc<dyn RuntimeBackend>,
     pub(crate) config: Arc<SupervisorConfig>,
     pub(crate) opencode_transfer_staging: Arc<OpenCodeTransferStaging>,
+    /// Serializes a ready-stage launch claim plus registry preparation with
+    /// cleanup's registry snapshot and filesystem reclamation.
+    pub(crate) opencode_transfer_lifecycle_lock: Arc<Mutex<()>>,
     /// Recovery and input dispatch serialize per soul, while unrelated souls
     /// remain independently recoverable. Stop intentionally does not take this
     /// lock: its durable intent revision must be able to preempt recovery.
@@ -174,6 +177,7 @@ impl Supervisor {
             backend,
             config: Arc::new(config),
             opencode_transfer_staging: Arc::new(opencode_transfer_staging),
+            opencode_transfer_lifecycle_lock: Arc::new(Mutex::new(())),
             recovery_locks: Arc::new(Mutex::new(HashMap::new())),
             live_resume_evidence_attempts: Arc::new(Mutex::new(HashMap::new())),
             auth_lookup_authorities: Arc::new(StdMutex::new(HashMap::new())),
@@ -205,6 +209,7 @@ impl Supervisor {
     /// descriptor reusing the transfer ID cannot consume the existing ready
     /// bundle, and begin/reclaim serialize under the staging lock.
     pub async fn cleanup_opencode_transfer_staging(&self) -> Result<usize, RuntimeError> {
+        let _lifecycle_guard = self.opencode_transfer_lifecycle_lock.lock().await;
         self.recover_opencode_transfer_receipts().await;
         let references = self
             .registry
@@ -214,8 +219,9 @@ impl Supervisor {
         let staging = Arc::clone(&self.opencode_transfer_staging);
         tokio::task::spawn_blocking(move || {
             let abandoned = staging.reclaim_abandoned_partials()?;
+            let expired_ready = staging.reclaim_abandoned_ready(&references)?;
             let receipt_released = staging.reclaim_release_eligible(&references)?;
-            Ok(abandoned + receipt_released)
+            Ok(abandoned + expired_ready + receipt_released)
         })
         .await
         .map_err(|error| {
@@ -477,6 +483,29 @@ impl Supervisor {
                             }
                         }
                     }
+                    OpenCodeTransferAction::WaitForCapacity {
+                        transfer_id,
+                        attempt_id,
+                    } => match self
+                        .opencode_transfer_staging
+                        .wait_for_capacity(&transfer_id, &attempt_id)
+                        .await
+                        .map_err(map_opencode_transfer)?
+                    {
+                        crate::opencode_transfer::StagingStart::Started {
+                            next_sequence,
+                            file_offsets,
+                        } => OpenCodeTransferResult::Started {
+                            next_sequence,
+                            file_offsets,
+                        },
+                        crate::opencode_transfer::StagingStart::Queued => {
+                            return Err(RuntimeError::new(
+                                RuntimeErrorCode::RegistryFailure,
+                                "capacity wait returned before a queue entry was promoted",
+                            ));
+                        }
+                    },
                     OpenCodeTransferAction::Chunk(chunk) => {
                         let sequence = chunk.sequence;
                         self.opencode_transfer_staging
@@ -497,8 +526,14 @@ impl Supervisor {
                         transfer_id,
                         attempt_id,
                     } => {
+                        let _lifecycle_guard = self.opencode_transfer_lifecycle_lock.lock().await;
+                        let references = self
+                            .registry
+                            .opencode_transfer_stage_references()
+                            .await
+                            .map_err(map_registry)?;
                         self.opencode_transfer_staging
-                            .abort(&transfer_id, &attempt_id)
+                            .abort_with_references(&transfer_id, &attempt_id, &references)
                             .map_err(map_opencode_transfer)?;
                         OpenCodeTransferResult::Aborted { transfer_id }
                     }
@@ -1092,27 +1127,115 @@ impl Supervisor {
             RuntimeError::new(RuntimeErrorCode::InvalidRuntimeLimits, message)
         })?;
         let payload_digest = semantic_launch_digest(&request)?;
-        let prepared = self
-            .registry
-            .prepare_launch(LaunchPreparation {
-                soul_id: request.soul_id.clone(),
-                provider: request.provider.clone(),
-                provider_store_id: request.provider_store_id.clone(),
-                native_session_id: request.native_session_id.clone(),
-                creation_seed_ref: request.creation_seed_ref.clone(),
-                request_id: request_id.clone(),
-                payload_digest,
-                requested_limits: limits,
-                profile: request.profile,
-                project_key: request.project_key.clone(),
-                fixture: request.fixture,
-                terminal: request.terminal.clone(),
-                fresh_agent: request.fresh_agent.clone(),
-                view_intent: request.view_intent.clone(),
-                admission: self.config.admission,
+        let transfer_claim = request.terminal.as_ref().and_then(|terminal| {
+            terminal.opencode_transfer.as_ref().map(|descriptor| {
+                (
+                    descriptor.clone(),
+                    terminal.opencode_transfer_attempt_id.clone(),
+                )
+            })
+        });
+        let transfer_claim_guard = if transfer_claim.is_some() {
+            Some(self.opencode_transfer_lifecycle_lock.lock().await)
+        } else {
+            None
+        };
+        if let Some((descriptor, attempt_id)) = &transfer_claim {
+            let attempt_id = attempt_id.as_deref().ok_or_else(|| {
+                RuntimeError::new(
+                    RuntimeErrorCode::InvalidRequest,
+                    "OpenCode transfer launch has no staging attempt",
+                )
+            })?;
+            let references = self
+                .registry
+                .opencode_transfer_stage_references()
+                .await
+                .map_err(map_registry)?;
+            let already_referenced = references.contains(&descriptor.transfer_id);
+            let staging = Arc::clone(&self.opencode_transfer_staging);
+            let descriptor = descriptor.clone();
+            let attempt_id = attempt_id.to_owned();
+            tokio::task::spawn_blocking(move || {
+                staging.mark_launch_registering(&descriptor, &attempt_id, already_referenced)
             })
             .await
-            .map_err(map_registry)?;
+            .map_err(|error| {
+                RuntimeError::new(
+                    RuntimeErrorCode::RegistryFailure,
+                    format!("OpenCode launch-claim worker did not settle: {error}"),
+                )
+            })?
+            .map_err(map_opencode_transfer)?;
+        }
+
+        let preparation = LaunchPreparation {
+            soul_id: request.soul_id.clone(),
+            provider: request.provider.clone(),
+            provider_store_id: request.provider_store_id.clone(),
+            native_session_id: request.native_session_id.clone(),
+            creation_seed_ref: request.creation_seed_ref.clone(),
+            request_id: request_id.clone(),
+            payload_digest,
+            requested_limits: limits,
+            profile: request.profile,
+            project_key: request.project_key.clone(),
+            fixture: request.fixture,
+            terminal: request.terminal.clone(),
+            fresh_agent: request.fresh_agent.clone(),
+            view_intent: request.view_intent.clone(),
+            admission: self.config.admission,
+        };
+        let prepared = match self.registry.prepare_launch(preparation).await {
+            Ok(prepared) => {
+                if let Some((descriptor, attempt_id)) = &transfer_claim {
+                    let attempt_id = attempt_id
+                        .as_deref()
+                        .expect("validated OpenCode transfer has a staging attempt");
+                    let staging = Arc::clone(&self.opencode_transfer_staging);
+                    let descriptor = descriptor.clone();
+                    let attempt_id = attempt_id.to_owned();
+                    tokio::task::spawn_blocking(move || {
+                        staging.mark_launch_claimed(&descriptor, &attempt_id)
+                    })
+                    .await
+                    .map_err(|error| {
+                        RuntimeError::new(
+                            RuntimeErrorCode::RegistryFailure,
+                            format!("OpenCode registered-claim worker did not settle: {error}"),
+                        )
+                    })?
+                    .map_err(map_opencode_transfer)?;
+                }
+                prepared
+            }
+            Err(error) => {
+                if let Some((descriptor, attempt_id)) = &transfer_claim {
+                    if let Some(attempt_id) = attempt_id.as_deref() {
+                        if let Ok(references) =
+                            self.registry.opencode_transfer_stage_references().await
+                        {
+                            let staging = Arc::clone(&self.opencode_transfer_staging);
+                            let descriptor = descriptor.clone();
+                            let attempt_id = attempt_id.to_owned();
+                            if references.contains(&descriptor.transfer_id) {
+                                let _ = tokio::task::spawn_blocking(move || {
+                                    staging.mark_launch_claimed(&descriptor, &attempt_id)
+                                })
+                                .await;
+                            } else {
+                                let _ = tokio::task::spawn_blocking(move || {
+                                    staging.restore_unregistered_pending(&descriptor, &attempt_id)
+                                })
+                                .await;
+                            }
+                        }
+                    }
+                }
+                return Err(map_registry(error));
+            }
+        };
+        drop(transfer_claim_guard);
         append_event(
             &self.config.lifecycle_log,
             "supervisor.launch_prepared",
@@ -3341,24 +3464,18 @@ pub async fn serve_control(supervisor: Supervisor, socket_path: &Path) -> Result
             );
         }
     });
-    let partial_cleanup_supervisor = supervisor.clone();
+    let staging_cleanup_supervisor = supervisor.clone();
     tokio::spawn(async move {
         loop {
             sleep(Duration::from_secs(5 * 60)).await;
-            let staging = Arc::clone(&partial_cleanup_supervisor.opencode_transfer_staging);
-            let cleanup_error =
-                match tokio::task::spawn_blocking(move || staging.reclaim_abandoned_partials())
-                    .await
-                {
-                    Ok(Ok(_)) => None,
-                    Ok(Err(error)) => Some(error.to_string()),
-                    Err(error) => Some(error.to_string()),
-                };
-            if let Some(error) = cleanup_error {
+            if let Err(error) = staging_cleanup_supervisor
+                .cleanup_opencode_transfer_staging()
+                .await
+            {
                 append_event(
-                    &partial_cleanup_supervisor.config.lifecycle_log,
-                    "supervisor.opencode_transfer_partial_cleanup_deferred",
-                    serde_json::json!({"error":error}),
+                    &staging_cleanup_supervisor.config.lifecycle_log,
+                    "supervisor.opencode_transfer_cleanup_deferred",
+                    serde_json::json!({"error":error.message}),
                 );
             }
         }
@@ -4058,6 +4175,12 @@ mod release_scope_tests {
 fn semantic_launch_digest(
     request: &freshell_runtime_protocol::LaunchRequest,
 ) -> Result<String, RuntimeError> {
+    let mut terminal = request.terminal.clone();
+    if let Some(terminal) = &mut terminal {
+        // A fresh staging attempt is transport ownership, not a different
+        // launch. Retries for the same stable request retain idempotency.
+        terminal.opencode_transfer_attempt_id = None;
+    }
     let value = serde_json::json!({
         "soulId": request.soul_id,
         "provider": request.provider,
@@ -4068,12 +4191,96 @@ fn semantic_launch_digest(
         "projectKey": request.project_key,
         "nativeSessionId": request.native_session_id,
         "fixture": request.fixture,
-        "terminal": request.terminal,
+        "terminal": terminal,
         "freshAgent": request.fresh_agent,
     });
     let bytes = serde_json::to_vec(&value)
         .map_err(|e| RuntimeError::new(RuntimeErrorCode::InvalidRequest, e.to_string()))?;
     Ok(format!("sha256:{:x}", Sha256::digest(bytes)))
+}
+
+#[cfg(test)]
+mod opencode_launch_digest_tests {
+    use super::semantic_launch_digest;
+    use freshell_runtime_protocol::LaunchRequest;
+
+    fn request() -> LaunchRequest {
+        serde_json::from_value(serde_json::json!({
+            "soulId": "soul-transfer-retry",
+            "provider": "opencode",
+            "providerStoreId": "soul-transfer-retry",
+            "creationSeedRef": "stable-create-key",
+            "limits": {
+                "cpuMilli": 2000,
+                "memoryBytes": 4096,
+                "swapBytes": 0,
+                "pidsMax": 512
+            },
+            "nativeSessionId": "native-session",
+            "terminal": {
+                "terminalId": "terminal-one",
+                "streamId": "stream-one",
+                "mode": "opencode",
+                "program": "/usr/bin/opencode",
+                "cwd": "/workspace",
+                "runAsUid": 65534,
+                "runAsGid": 0,
+                "cols": 80,
+                "rows": 24,
+                "projectKey": "project-one",
+                "workspacePath": "/workspace",
+                "resumeSessionId": "native-session",
+                "opencodeTransfer": {
+                    "transferId": "transfer-one",
+                    "provider": "opencode",
+                    "sourceStoreId": "a".repeat(64),
+                    "rootSessionId": "native-session",
+                    "sourceGeneration": "b".repeat(64),
+                    "providerSchema": "opencode-1.18.21",
+                    "sourceSchemaFingerprint": "c".repeat(64),
+                    "migrationJournalFingerprint": "d".repeat(64),
+                    "destinationStoreId": "soul-transfer-retry",
+                    "destinationDatabasePath": ".local/share/opencode/opencode.db",
+                    "targetImageRef": format!("sha256:{}", "e".repeat(64)),
+                    "targetBuildReceipt": "f".repeat(64),
+                    "incarnationId": "incarnation-one",
+                    "manifestJson": "{}",
+                    "files": [{
+                        "index": 0,
+                        "relativePath": "payload.json",
+                        "sizeBytes": 0,
+                        "sha256": "0".repeat(64)
+                    }],
+                    "totalBytes": 0,
+                    "bundleSha256": "1".repeat(64)
+                },
+                "opencodeTransferAttemptId": "a".repeat(32)
+            }
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn a_new_staging_attempt_keeps_the_same_launch_idempotency_digest() {
+        let first = request();
+        let mut retry = first.clone();
+        retry
+            .terminal
+            .as_mut()
+            .unwrap()
+            .opencode_transfer_attempt_id = Some("b".repeat(32));
+
+        assert_eq!(
+            semantic_launch_digest(&first).unwrap(),
+            semantic_launch_digest(&retry).unwrap()
+        );
+        retry.terminal.as_mut().unwrap().resume_session_id = Some("other-session".into());
+        assert_ne!(
+            semantic_launch_digest(&first).unwrap(),
+            semantic_launch_digest(&retry).unwrap(),
+            "stable launch intent must remain part of the digest"
+        );
+    }
 }
 
 async fn find_view(
