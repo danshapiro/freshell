@@ -42,6 +42,16 @@ const RRX7_CONTINUATION_CWD = '/tmp/freshell-rrx7/codex-continuation'
 const RRX7_COLLISION_ID = 'codex-rrx7-collision-0001'
 const RRX7_HEALTHY_ID = 'codex-rrx7-healthy-0001'
 const RRX7_HEALTHY_CWD = '/tmp/freshell-rrx7/healthy'
+const RRX7_TRANSCRIPT_SEARCHES = [
+  {
+    query: 'rrx7-older-later-transcript-needle',
+    text: 'Please continue rrx7-older-later-transcript-needle from the earlier rollout.',
+  },
+  {
+    query: 'rrx7-newer-later-transcript-needle',
+    text: 'Please continue rrx7-newer-later-transcript-needle from the newer rollout.',
+  },
+] as const
 
 function rrx7ContinuationSegments() {
   const olderCreatedAt = Date.parse('2026-09-28T14:00:00.000Z')
@@ -54,6 +64,7 @@ function rrx7ContinuationSegments() {
       assistantAt: olderCreatedAt + 2000,
       userText: 'rrx7-older-user-needle',
       assistantText: 'rrx7-older-assistant-reply',
+      laterUserMessage: { at: olderCreatedAt + 3000, text: RRX7_TRANSCRIPT_SEARCHES[0].text },
     },
     {
       fileName: `rollout-a-newer-${RRX7_CONTINUATION_ID}.jsonl`,
@@ -62,6 +73,7 @@ function rrx7ContinuationSegments() {
       assistantAt: newerCreatedAt + 2000,
       userText: 'rrx7-newer-user-needle',
       assistantText: 'rrx7-newer-assistant-reply',
+      laterUserMessage: { at: newerCreatedAt + 3000, text: RRX7_TRANSCRIPT_SEARCHES[1].text },
     },
   ]
 }
@@ -387,6 +399,11 @@ test.describe('Kata rrx7 Codex rollout continuations', () => {
             provider: string
             createdAt?: number
             lastActivityAt: number
+            title?: string
+            summary?: string
+            projectPath: string
+            cwd?: string
+            firstUserMessage?: string
           }>
           integrityError?: { kind: string }
         }
@@ -397,13 +414,25 @@ test.describe('Kata rrx7 Codex rollout continuations', () => {
         expect(payload.integrityError).toBeUndefined()
         expect(continuationRows).toHaveLength(1)
         expect(continuationRows[0]?.createdAt).toBe(Date.parse('2026-09-28T14:00:00.000Z'))
-        expect(continuationRows[0]?.lastActivityAt).toBe(Date.parse('2026-09-28T14:01:02.000Z'))
+        expect(continuationRows[0]?.lastActivityAt).toBe(Date.parse('2026-09-28T14:01:03.000Z'))
+        const continuation = continuationRows[0]!
+        for (const { query } of RRX7_TRANSCRIPT_SEARCHES) {
+          for (const metadata of [
+            continuation.title,
+            continuation.summary,
+            continuation.projectPath,
+            continuation.cwd,
+            continuation.firstUserMessage,
+          ]) {
+            expect((metadata ?? '').toLowerCase()).not.toContain(query)
+          }
+        }
         await expect(sidebarRow).toHaveCount(1)
       })
 
       await test.step('search both rollout segments from the Sidebar', async () => {
-        // Both turns must remain searchable through the existing user-message
-        // tier, including the older rollout after the session is composed.
+        // Later turns prove transcript search; title results are unioned with
+        // deep results, so first-message/title needles could pass without it.
         const harness = new TestHarness(page)
         const waitForAppliedSearch = async (query: string, searchTier = 'userMessages') => {
           // The previous rows remain visible during the debounce and request.
@@ -426,17 +455,43 @@ test.describe('Kata rrx7 Codex rollout continuations', () => {
         }
         const search = page.getByPlaceholder('Search...', { exact: true })
         await expect(search).toBeVisible()
-        await search.fill('rrx7-older-user-needle')
         const searchTier = page.getByRole('combobox', { name: 'Search tier' })
-        await expect(searchTier).toBeVisible()
-        await searchTier.selectOption('userMessages')
-        await waitForAppliedSearch('rrx7-older-user-needle')
-        await expect(sidebarRow).toHaveCount(1)
-        await expect(sidebarRow).toBeVisible({ timeout: 15_000 })
-        await search.fill('rrx7-newer-user-needle')
-        await waitForAppliedSearch('rrx7-newer-user-needle')
-        await expect(sidebarRow).toHaveCount(1)
-        await expect(sidebarRow).toBeVisible({ timeout: 15_000 })
+        const waitForSearchResponse = (query: string, tier: string) => page.waitForResponse((response) => {
+          const url = new URL(response.url())
+          return url.pathname === '/api/session-directory'
+            && url.searchParams.get('query') === query
+            && (url.searchParams.get('tier') ?? 'title') === tier
+            && response.request().method() === 'GET'
+        }, { timeout: 15_000 })
+
+        for (const { query, text } of RRX7_TRANSCRIPT_SEARCHES) {
+          const titleResponsePromise = waitForSearchResponse(query, 'title')
+          await search.fill(query)
+          await expect(searchTier).toBeVisible()
+          await searchTier.selectOption('title')
+          const titleResponse = await titleResponsePromise
+          expect(titleResponse.ok()).toBe(true)
+          expect((await titleResponse.json()).items).toEqual([])
+          await waitForAppliedSearch(query, 'title')
+          await expect(sidebarRow).toHaveCount(0)
+
+          // Observe the real Sidebar request; Redux rows omit match/snippet.
+          const deepResponsePromise = waitForSearchResponse(query, 'userMessages')
+          await searchTier.selectOption('userMessages')
+          const deepResponse = await deepResponsePromise
+          expect(deepResponse.ok()).toBe(true)
+          const deepPayload = await deepResponse.json()
+          expect(deepPayload.items).toHaveLength(1)
+          expect(deepPayload.items[0]).toMatchObject({
+            sessionId: RRX7_CONTINUATION_ID,
+            provider: 'codex',
+            matchedIn: 'userMessage',
+            snippet: text,
+          })
+          await waitForAppliedSearch(query)
+          await expect(sidebarRow).toHaveCount(1)
+          await expect(sidebarRow).toBeVisible({ timeout: 15_000 })
+        }
 
         await search.fill('rrx7-absent-user-needle')
         await waitForAppliedSearch('rrx7-absent-user-needle')
