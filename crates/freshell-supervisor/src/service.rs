@@ -298,7 +298,10 @@ impl Supervisor {
                             "opencode-1.18.21",
                         ),
                     },
-                    OpenCodeTransferAction::Begin(descriptor) => {
+                    OpenCodeTransferAction::Begin {
+                        descriptor,
+                        attempt_id,
+                    } => {
                         if descriptor.target_image_ref != self.config.image_ref {
                             return Err(RuntimeError::new(
                                 RuntimeErrorCode::RecoveryWrongIdentity,
@@ -311,7 +314,7 @@ impl Supervisor {
                             .map_err(map_opencode_transfer)?;
                         match self
                             .opencode_transfer_staging
-                            .begin(&descriptor, available)
+                            .begin(&descriptor, &attempt_id, available)
                             .map_err(map_opencode_transfer)?
                         {
                             crate::opencode_transfer::StagingStart::Started {
@@ -335,15 +338,21 @@ impl Supervisor {
                             .map_err(map_opencode_transfer)?;
                         OpenCodeTransferResult::ChunkStored { sequence }
                     }
-                    OpenCodeTransferAction::Finalize { transfer_id } => {
+                    OpenCodeTransferAction::Finalize {
+                        transfer_id,
+                        attempt_id,
+                    } => {
                         self.opencode_transfer_staging
-                            .finalize(&transfer_id)
+                            .finalize(&transfer_id, &attempt_id)
                             .map_err(map_opencode_transfer)?;
                         OpenCodeTransferResult::Ready { transfer_id }
                     }
-                    OpenCodeTransferAction::Abort { transfer_id } => {
+                    OpenCodeTransferAction::Abort {
+                        transfer_id,
+                        attempt_id,
+                    } => {
                         self.opencode_transfer_staging
-                            .abort(&transfer_id)
+                            .abort(&transfer_id, &attempt_id)
                             .map_err(map_opencode_transfer)?;
                         OpenCodeTransferResult::Aborted { transfer_id }
                     }

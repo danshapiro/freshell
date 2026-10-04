@@ -25,6 +25,7 @@ use tokio::{
     fs::File as TokioFile,
     io::{AsyncReadExt, AsyncSeekExt},
 };
+use uuid::Uuid;
 
 #[path = "managed_output_validation.rs"]
 mod managed_output_validation;
@@ -848,11 +849,15 @@ async fn stage_opencode_transfer_payload(
     descriptor: OpenCodeTransferDescriptor,
     mut payload: TokioFile,
 ) -> Result<OpenCodeTransferDescriptor, String> {
-    let mut abort_on_drop =
-        OpenCodeTransferAbortOnDrop::new(client.clone(), descriptor.transfer_id.clone());
+    let attempt_id = Uuid::new_v4().simple().to_string();
+    let mut abort_on_drop = OpenCodeTransferAbortOnDrop::new(
+        client.clone(),
+        descriptor.transfer_id.clone(),
+        attempt_id.clone(),
+    );
     let result = async {
         let (mut sequence, mut offset) = match client
-            .opencode_transfer_begin(descriptor.clone())
+            .opencode_transfer_begin(descriptor.clone(), attempt_id.clone())
             .await
             .map_err(|error| format!("OpenCode transfer staging could not begin: {error}"))?
         {
@@ -897,6 +902,7 @@ async fn stage_opencode_transfer_payload(
                 .map_err(|error| format!("OpenCode payload read failed: {error}"))?;
             let chunk = OpenCodeTransferChunk {
                 transfer_id: descriptor.transfer_id.clone(),
+                attempt_id: attempt_id.clone(),
                 sequence,
                 file_index: 0,
                 offset,
@@ -915,7 +921,7 @@ async fn stage_opencode_transfer_payload(
             sequence += 1;
         }
         match client
-            .opencode_transfer_finalize(descriptor.transfer_id.clone())
+            .opencode_transfer_finalize(descriptor.transfer_id.clone(), attempt_id.clone())
             .await
             .map_err(|error| format!("OpenCode transfer could not be finalized: {error}"))?
         {
@@ -944,14 +950,16 @@ async fn stage_opencode_transfer_payload(
 struct OpenCodeTransferAbortOnDrop {
     client: RuntimeClient,
     transfer_id: String,
+    attempt_id: String,
     armed: bool,
 }
 
 impl OpenCodeTransferAbortOnDrop {
-    fn new(client: RuntimeClient, transfer_id: String) -> Self {
+    fn new(client: RuntimeClient, transfer_id: String, attempt_id: String) -> Self {
         Self {
             client,
             transfer_id,
+            attempt_id,
             armed: true,
         }
     }
@@ -964,7 +972,7 @@ impl OpenCodeTransferAbortOnDrop {
         if self.armed {
             let _ = self
                 .client
-                .opencode_transfer_abort(self.transfer_id.clone())
+                .opencode_transfer_abort(self.transfer_id.clone(), self.attempt_id.clone())
                 .await;
             self.armed = false;
         }
@@ -976,15 +984,18 @@ impl Drop for OpenCodeTransferAbortOnDrop {
         if !self.armed {
             return;
         }
-        let (Ok(handle), client, transfer_id) = (
+        let (Ok(handle), client, transfer_id, attempt_id) = (
             tokio::runtime::Handle::try_current(),
             self.client.clone(),
             self.transfer_id.clone(),
+            self.attempt_id.clone(),
         ) else {
             return;
         };
         handle.spawn(async move {
-            let _ = client.opencode_transfer_abort(transfer_id).await;
+            let _ = client
+                .opencode_transfer_abort(transfer_id, attempt_id)
+                .await;
         });
     }
 }
@@ -1445,15 +1456,20 @@ mod tests {
 
         let supervisor = tokio::spawn(async move {
             let mut reserved = HashSet::new();
+            let mut current_attempt = None;
             for expected in ["begin", "chunk", "abort"] {
                 let (mut stream, request) = accept_control_request(&listener).await;
                 assert_eq!(request.role, ControlRole::Web);
                 let (actual, result) = match request.body {
                     freshell_runtime_protocol::AdminCommand::OpenCodeTransfer(
-                        OpenCodeTransferAction::Begin(descriptor),
+                        OpenCodeTransferAction::Begin {
+                            descriptor,
+                            attempt_id,
+                        },
                     ) => {
                         assert_eq!(expected, "begin");
                         reserved.insert(descriptor.transfer_id.clone());
+                        current_attempt = Some(attempt_id);
                         (
                             "begin",
                             Ok(AdminResult::OpenCodeTransfer(
@@ -1472,6 +1488,7 @@ mod tests {
                     ) => {
                         assert_eq!(expected, "chunk");
                         assert!(reserved.contains(&chunk.transfer_id));
+                        assert_eq!(current_attempt.as_ref(), Some(&chunk.attempt_id));
                         (
                             "chunk",
                             Err(RuntimeError::new(
@@ -1481,10 +1498,14 @@ mod tests {
                         )
                     }
                     freshell_runtime_protocol::AdminCommand::OpenCodeTransfer(
-                        OpenCodeTransferAction::Abort { transfer_id },
+                        OpenCodeTransferAction::Abort {
+                            transfer_id,
+                            attempt_id,
+                        },
                     ) => {
                         assert_eq!(expected, "abort");
                         assert_eq!(transfer_id, expected_id);
+                        assert_eq!(current_attempt.as_ref(), Some(&attempt_id));
                         assert!(reserved.remove(&transfer_id));
                         (
                             "abort",
@@ -1532,12 +1553,16 @@ mod tests {
             let mut reserved = HashSet::new();
             let (mut stream, begin) = accept_control_request(&listener).await;
             let freshell_runtime_protocol::AdminCommand::OpenCodeTransfer(
-                OpenCodeTransferAction::Begin(descriptor),
+                OpenCodeTransferAction::Begin {
+                    descriptor,
+                    attempt_id,
+                },
             ) = begin.body
             else {
                 panic!("expected transfer begin");
             };
             reserved.insert(descriptor.transfer_id.clone());
+            let current_attempt = attempt_id;
             write_frame(
                 &mut stream,
                 &AdminReply {
@@ -1564,16 +1589,21 @@ mod tests {
                 panic!("expected transfer chunk");
             };
             assert!(reserved.contains(&chunk.transfer_id));
+            assert_eq!(current_attempt, chunk.attempt_id);
             chunk_seen_tx.send(()).unwrap();
 
             let (mut stream, abort) = accept_control_request(&listener).await;
             let freshell_runtime_protocol::AdminCommand::OpenCodeTransfer(
-                OpenCodeTransferAction::Abort { transfer_id },
+                OpenCodeTransferAction::Abort {
+                    transfer_id,
+                    attempt_id,
+                },
             ) = abort.body
             else {
                 panic!("expected transfer abort after cancellation");
             };
             assert_eq!(transfer_id, expected_id);
+            assert_eq!(current_attempt, attempt_id);
             assert!(reserved.remove(&transfer_id));
             write_frame(
                 &mut stream,
