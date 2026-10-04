@@ -404,16 +404,48 @@ test.describe('Kata rrx7 Codex rollout continuations', () => {
       await test.step('search both rollout segments from the Sidebar', async () => {
         // Both turns must remain searchable through the existing user-message
         // tier, including the older rollout after the session is composed.
+        const harness = new TestHarness(page)
+        const waitForAppliedSearch = async (query: string, searchTier = 'userMessages') => {
+          // The previous rows remain visible during the debounce and request.
+          // Wait for this exact query to finish before checking its rows.
+          await expect.poll(async () => {
+            const state = await harness.getState()
+            const window = state.sessions?.windows?.sidebar
+            return {
+              appliedQuery: window?.appliedQuery,
+              appliedSearchTier: window?.appliedSearchTier,
+              loading: window?.loading,
+              deepSearchPending: window?.deepSearchPending,
+            }
+          }, { timeout: 15_000 }).toEqual({
+            appliedQuery: query,
+            appliedSearchTier: searchTier,
+            loading: false,
+            deepSearchPending: false,
+          })
+        }
         const search = page.getByPlaceholder('Search...', { exact: true })
         await expect(search).toBeVisible()
         await search.fill('rrx7-older-user-needle')
         const searchTier = page.getByRole('combobox', { name: 'Search tier' })
         await expect(searchTier).toBeVisible()
         await searchTier.selectOption('userMessages')
+        await waitForAppliedSearch('rrx7-older-user-needle')
+        await expect(sidebarRow).toHaveCount(1)
         await expect(sidebarRow).toBeVisible({ timeout: 15_000 })
         await search.fill('rrx7-newer-user-needle')
+        await waitForAppliedSearch('rrx7-newer-user-needle')
+        await expect(sidebarRow).toHaveCount(1)
         await expect(sidebarRow).toBeVisible({ timeout: 15_000 })
+
+        await search.fill('rrx7-absent-user-needle')
+        await waitForAppliedSearch('rrx7-absent-user-needle')
+        await expect(sidebarRow).toHaveCount(0)
+
         await search.fill('')
+        await waitForAppliedSearch('', 'title')
+        await expect(sidebarRow).toHaveCount(1)
+        await expect(sidebarRow).toBeVisible({ timeout: 15_000 })
       })
 
       await test.step('open History and assert one continuation row', async () => {
