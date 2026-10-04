@@ -1501,3 +1501,117 @@ fn set_tree_modified(path: &std::path::Path, modified: SystemTime) {
         .set_times(std::fs::FileTimes::new().set_modified(modified))
         .unwrap();
 }
+
+#[cfg(unix)]
+#[test]
+#[ignore = "process-kill recovery test; run only through scripts/sandbox-test.sh"]
+fn opencode_transfer_import_stage_recovers_each_durable_file_boundary_after_process_crash() {
+    use std::{os::unix::process::ExitStatusExt, process::Command};
+
+    const ROOT_ENV: &str = "FRESHELL_OPENCODE_STAGE_CRASH_ROOT";
+    const POINT_ENV: &str = "FRESHELL_OPENCODE_STAGE_CRASH_POINT";
+    let executable = std::env::current_exe().expect("resolve this test executable");
+    let payload = vec![0x53; MAX_OPENCODE_TRANSFER_CHUNK_BYTES + 31];
+    let points = [
+        "begin.after_descriptor",
+        "begin.after_placeholder.0",
+        "chunk.after_write.0",
+        "chunk.after_file_sync.0",
+        "chunk.after_parent_sync.0",
+        "chunk.after_write.1",
+        "chunk.after_file_sync.1",
+        "chunk.after_parent_sync.1",
+        "finalize.after_file_rename.0",
+        "finalize.after_file_sync.0",
+        "finalize.after_ready_marker",
+        "finalize.after_ready_rename",
+        "finalize.after_ready_parent_sync",
+    ];
+
+    for (index, point) in points.iter().enumerate() {
+        let dir = tempfile::tempdir().unwrap();
+        let child = Command::new(&executable)
+            .args([
+                "--exact",
+                "opencode_transfer::tests::opencode_transfer_stage_process_crash_child",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env(ROOT_ENV, dir.path())
+            .env(POINT_ENV, point)
+            .status()
+            .expect("spawn synthetic stage-crash child");
+        assert_eq!(
+            child.signal(),
+            Some(libc::SIGKILL),
+            "child must be killed at durable stage boundary {point}; exit={child:?}"
+        );
+
+        let restarted = OpenCodeTransferStaging::new(
+            dir.path(),
+            StagingLimits::for_test(1024 * 1024, 2 * 1024 * 1024),
+        )
+        .expect("restart production staging from durable files");
+        let descriptor = descriptor(&payload, "transfer-import-stage-crash");
+        let ready = restarted.ready_path(&descriptor.transfer_id);
+        if !ready.is_dir() {
+            let start = restarted
+                .begin(&descriptor, TEST_ATTEMPT, u64::MAX)
+                .expect("identical retry must recover or resume the exact staged transfer");
+            assert!(matches!(start, StagingStart::Started { .. }));
+            for sequence in 0..payload.len().div_ceil(MAX_OPENCODE_TRANSFER_CHUNK_BYTES) {
+                restarted
+                    .write_chunk(&chunk(&descriptor, &payload, sequence as u64))
+                    .expect("identical durable chunks are idempotent and later chunks resume");
+            }
+            restarted
+                .finalize(&descriptor.transfer_id, TEST_ATTEMPT)
+                .expect("complete exact staged bytes should publish a ready bundle");
+        }
+
+        let ready = restarted
+            .verify_ready(&descriptor)
+            .expect("restart only accepts a fully rehashed exact bundle");
+        assert_eq!(
+            std::fs::read(ready.join("entry-0000.bin")).unwrap(),
+            payload,
+            "boundary #{index} must converge without truncating or inventing bytes"
+        );
+        assert_eq!(
+            descriptor.files.len(),
+            1,
+            "Task 1 publishes one payload file"
+        );
+        let stale = descriptor_for_generation(&payload, &descriptor.transfer_id, &"f".repeat(64));
+        assert!(
+            restarted.begin(&stale, RETRY_ATTEMPT, u64::MAX).is_err(),
+            "a conflicting source generation cannot claim the recovered ready stage"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+#[ignore = "child fixture for opencode_transfer_import_stage_recovers_each_durable_file_boundary_after_process_crash"]
+fn opencode_transfer_stage_process_crash_child() {
+    const ROOT_ENV: &str = "FRESHELL_OPENCODE_STAGE_CRASH_ROOT";
+    let Some(root) = std::env::var_os(ROOT_ENV) else {
+        return;
+    };
+    let root = std::path::PathBuf::from(root);
+    let payload = vec![0x53; MAX_OPENCODE_TRANSFER_CHUNK_BYTES + 31];
+    let descriptor = descriptor(&payload, "transfer-import-stage-crash");
+    let staging =
+        OpenCodeTransferStaging::new(&root, StagingLimits::for_test(1024 * 1024, 2 * 1024 * 1024))
+            .unwrap();
+    staging.begin(&descriptor, TEST_ATTEMPT, u64::MAX).unwrap();
+    for sequence in 0..payload.len().div_ceil(MAX_OPENCODE_TRANSFER_CHUNK_BYTES) {
+        staging
+            .write_chunk(&chunk(&descriptor, &payload, sequence as u64))
+            .unwrap();
+    }
+    staging
+        .finalize(&descriptor.transfer_id, TEST_ATTEMPT)
+        .unwrap();
+    unreachable!("the selected staging failpoint must kill this child process");
+}
