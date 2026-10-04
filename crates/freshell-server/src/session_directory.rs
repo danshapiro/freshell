@@ -3986,6 +3986,81 @@ mod tests {
         std::fs::remove_dir_all(&home).ok();
     }
 
+    async fn assert_equal_unknown_codex_classification_is_quarantined(
+        field: &str,
+        known_value: &str,
+    ) {
+        let home = unique_temp_dir();
+        let (older, newer) = codex_fixtures();
+        let known = format!(r#""{field}":"{known_value}""#);
+        let unknown = format!(r#""{field}":"unsupported-{field}""#);
+        let older = older.replace(&known, &unknown);
+        let newer = newer.replace(&known, &unknown);
+        write_codex_segments(&home, &older, &newer);
+        let session_id = "b7936c10-4935-441c-837c-c1f33cafec2d";
+        let healthy_id = "11111111-2222-4333-8444-555555555555";
+        std::fs::write(
+            home.join(".codex").join("sessions").join("healthy.jsonl"),
+            newer.replace(session_id, healthy_id),
+        )
+        .unwrap();
+        let (app, index) = codex_session_directory_app(
+            &home,
+            None,
+            freshell_ws::identity::TerminalIdentityRegistry::new(),
+        );
+        let snapshot = index
+            .snapshot_with_failures_and_unresolved_codex_identities()
+            .await;
+        assert_eq!(
+            snapshot.sessions.len(),
+            3,
+            "{field}: keep tolerant display rows"
+        );
+        assert_eq!(snapshot.unresolved_codex_identities.len(), 1);
+        assert_eq!(
+            snapshot.unresolved_codex_identities[0].session_id,
+            session_id
+        );
+        assert_eq!(snapshot.unresolved_codex_identities[0].paths.len(), 2);
+
+        let base = "/api/session-directory?priority=visible&includeNonInteractive=1";
+        let page = get_directory_page(&app, base).await;
+        assert_eq!(
+            page["integrityError"],
+            json!({
+                "kind": "identity_collision",
+                "collisionCount": 1,
+                "duplicateItemCount": 2,
+            }),
+            "{field}: unknown classifications cannot certify a continuation"
+        );
+        assert_eq!(page["partial"], json!(true));
+        let rows = page["items"].as_array().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["sessionId"], json!(healthy_id));
+        assert_eq!(rows[0]["title"], json!("Continuation title"));
+
+        let filtered = get_directory_page(
+            &app,
+            &format!("{base}&query=Older%20first%20request&tier=userMessages&limit=1"),
+        )
+        .await;
+        assert!(filtered["items"].as_array().unwrap().is_empty());
+        assert_eq!(filtered["integrityError"], page["integrityError"]);
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[tokio::test]
+    async fn codex_multi_file_route_quarantines_equal_unknown_history_modes() {
+        assert_equal_unknown_codex_classification_is_quarantined("history_mode", "paginated").await;
+    }
+
+    #[tokio::test]
+    async fn codex_multi_file_route_quarantines_equal_unknown_thread_sources() {
+        assert_equal_unknown_codex_classification_is_quarantined("thread_source", "user").await;
+    }
+
     #[test]
     fn codex_multi_file_apply_file_search_keeps_match_after_io_error() {
         let home = unique_temp_dir();
