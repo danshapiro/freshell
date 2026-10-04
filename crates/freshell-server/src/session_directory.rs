@@ -897,13 +897,13 @@ fn merge_unresolved_codex_identity_collisions(
         }
         let key = format!("codex:{}", group.session_id);
         let (paths, count) = by_key.entry(key).or_default();
-        paths.extend(
-            group
-                .paths
-                .iter()
-                .map(|path| path.to_string_lossy().into_owned()),
-        );
-        *count = (*count).max(group.paths.len());
+        // Preserve proven row multiplicity and add only evidence members
+        // whose paths are not already represented by those rows.
+        for path in &group.paths {
+            if paths.insert(path.to_string_lossy().into_owned()) {
+                *count += 1;
+            }
+        }
     }
     by_key
         .into_iter()
@@ -4200,6 +4200,102 @@ mod tests {
         let filtered = get_directory_page(&app, &format!("{base}&query=missing&limit=1")).await;
         assert!(filtered["items"].as_array().unwrap().is_empty());
         assert_eq!(filtered["integrityError"], page["integrityError"]);
+
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn persisted_identity_collision_counts_partially_overlapping_codex_members() {
+        let home = unique_temp_dir();
+        let sessions = home.join(".codex").join("sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        let session_id = "b7936c10-4935-441c-837c-c1f33cafec2d";
+        let visible_path = sessions.join("a.jsonl");
+        let hidden_path = sessions.join("b.jsonl");
+        let fallback_path =
+            sessions.join(format!("rollout-2026-10-03T00-00-00-{session_id}.jsonl"));
+        for (path, payload) in [
+            (
+                &visible_path,
+                json!({ "id": session_id, "session_id": session_id, "cwd": "/p" }),
+            ),
+            (
+                &hidden_path,
+                json!({ "id": session_id, "session_id": session_id }),
+            ),
+            (&fallback_path, json!({ "cwd": "/p" })),
+        ] {
+            std::fs::write(
+                path,
+                format!(
+                    "{}\n",
+                    json!({
+                        "timestamp": "2026-10-03T00:00:00.000Z",
+                        "type": "session_meta",
+                        "payload": payload,
+                    })
+                ),
+            )
+            .unwrap();
+        }
+        let events = collision_trace_events();
+        let (app, index) = codex_session_directory_app(
+            &home,
+            None,
+            freshell_ws::identity::TerminalIdentityRegistry::new(),
+        );
+        let snapshot = index
+            .snapshot_with_failures_and_unresolved_codex_identities()
+            .await;
+        assert_eq!(snapshot.sessions.len(), 2);
+        assert!(snapshot
+            .sessions
+            .iter()
+            .all(|item| item.session_id == session_id));
+        assert_eq!(
+            snapshot
+                .sessions
+                .iter()
+                .filter_map(|item| item.source_file.clone())
+                .collect::<std::collections::BTreeSet<_>>(),
+            [visible_path.clone(), fallback_path.clone()]
+                .into_iter()
+                .collect()
+        );
+        assert_eq!(snapshot.unresolved_codex_identities.len(), 1);
+        assert_eq!(
+            snapshot.unresolved_codex_identities[0].session_id,
+            session_id
+        );
+        assert_eq!(
+            snapshot.unresolved_codex_identities[0].paths,
+            vec![visible_path.clone(), hidden_path.clone()]
+        );
+
+        let page = get_directory_page(
+            &app,
+            "/api/session-directory?priority=visible&includeNonInteractive=1",
+        )
+        .await;
+        assert_eq!(page["integrityError"]["duplicateItemCount"], json!(3));
+        assert_eq!(page["integrityError"]["collisionCount"], json!(1));
+        assert_eq!(page["partial"], json!(true));
+        assert!(page["items"].as_array().unwrap().is_empty());
+        let captured = collision_events_for_home(&events, &home);
+        assert_eq!(captured.len(), 1);
+        assert_eq!(captured[0].level, tracing::Level::ERROR);
+        assert_eq!(
+            decoded_trace_field(&captured[0], "duplicate_item_count"),
+            "3"
+        );
+        let samples: Vec<Value> =
+            serde_json::from_str(&decoded_trace_field(&captured[0], "collision_samples_json"))
+                .unwrap();
+        assert_eq!(samples[0]["source_file_count"], json!(3));
+        assert_eq!(
+            samples[0]["source_files"],
+            json!([visible_path, hidden_path, fallback_path])
+        );
 
         std::fs::remove_dir_all(&home).ok();
     }
