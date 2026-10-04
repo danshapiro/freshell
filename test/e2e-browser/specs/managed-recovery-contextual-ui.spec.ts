@@ -185,23 +185,23 @@ test('fresh-agent: a close started during verified start-new cleanup preserves t
     releaseStop()
     await stopFinished
     await expect(card.getByRole('button', { name: 'Start new conversation', exact: true })).toBeEnabled()
-    const assertRetained = async () => {
+    const assertRetained = async (closeError: string | undefined) => {
       await expect(page.getByText(SAVED_HISTORY_TEXT, { exact: true })).toBeVisible()
       await expect(composer).toHaveValue(draft)
       expect(await page.evaluate((key) => sessionStorage.getItem(key), draftKey)).toBe(draft)
-      expect(await paneContent(page)).toMatchObject(before)
+      expect(await paneContent(page)).toMatchObject({ ...before, closeError })
       expect(historyReads).toBe(settledReads)
       const messages = await harness.getSentWsMessages() as Array<{ type?: string }>
       expect(messages.filter((message) => ['freshAgent.create', 'freshAgent.attach', 'freshAgent.send', 'pane.reconcile.request'].includes(message.type ?? ''))).toEqual([])
     }
     // Prove retention BEFORE the close result; no refresh can rescue a clear.
-    await assertRetained()
+    await assertRetained(undefined)
     expect(closeRequestId).toBeTruthy()
     failClose()
     await expect.poll(async () => (await harness.getState()).panes.closingTabs?.[targetTabId!]).toBeUndefined()
     await expect(page.getByText(/Close failed:/)).toBeVisible()
     await harness.waitForTabCount(2)
-    await assertRetained()
+    await assertRetained('the pane close could not be recorded durably; the pane was left open')
     expect(stopRequests).toBe(1)
   } finally {
     releaseStop()
