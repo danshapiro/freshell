@@ -5308,8 +5308,9 @@ mod tests {
 
         let staging = OpenCodeTransferStaging::new(root.path(), StagingLimits::production())
             .map_err(|error| error.to_string())?;
+        let attempt_id = "cccccccccccccccccccccccccccccccc";
         staging
-            .begin(&descriptor, u64::MAX)
+            .begin(&descriptor, attempt_id, u64::MAX)
             .map_err(|error| error.to_string())?;
         for (sequence, bytes) in payload
             .chunks(MAX_OPENCODE_TRANSFER_CHUNK_BYTES)
@@ -5318,6 +5319,7 @@ mod tests {
             let offset = sequence * MAX_OPENCODE_TRANSFER_CHUNK_BYTES;
             let chunk = OpenCodeTransferChunk {
                 transfer_id: descriptor.transfer_id.clone(),
+                attempt_id: attempt_id.into(),
                 sequence: sequence as u64,
                 file_index: 0,
                 offset: offset as u64,
@@ -5329,7 +5331,7 @@ mod tests {
                 .map_err(|error| error.to_string())?;
         }
         let ready = staging
-            .finalize(&descriptor.transfer_id)
+            .finalize(&descriptor.transfer_id, attempt_id)
             .map_err(|error| error.to_string())?;
 
         let home = root.path().join("provider-home");

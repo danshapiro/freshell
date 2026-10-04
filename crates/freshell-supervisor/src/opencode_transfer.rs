@@ -5,8 +5,8 @@
 //! until every file and the bundle digest have been revalidated.
 
 use freshell_runtime_protocol::{
-    opencode_transfer_bundle_digest, OpenCodeTransferChunk, OpenCodeTransferDescriptor,
-    OpenCodeTransferFile, MAX_OPENCODE_TRANSFER_CHUNK_BYTES,
+    opencode_transfer_bundle_digest, valid_opencode_transfer_attempt_id, OpenCodeTransferChunk,
+    OpenCodeTransferDescriptor, OpenCodeTransferFile, MAX_OPENCODE_TRANSFER_CHUNK_BYTES,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -25,6 +25,7 @@ const PRIVATE_FILE_MODE: u32 = 0o600;
 const READY_FILE_MODE: u32 = 0o400;
 const READY_DIR_MODE: u32 = 0o500;
 const PARTIAL_ACTIVITY_FILE: &str = ".activity";
+const PARTIAL_ATTEMPT_FILE: &str = ".attempt";
 /// A partial transfer with no durable progress for an hour is abandoned.
 /// Normal retries resume it before this lease expires; failed live requests
 /// also send Abort, leaving this as the process-crash fallback.
@@ -139,9 +140,11 @@ impl OpenCodeTransferStaging {
     pub fn begin(
         &self,
         descriptor: &OpenCodeTransferDescriptor,
+        attempt_id: &str,
         available_bytes: u64,
     ) -> Result<StagingStart, StagingError> {
         let _guard = self.lock.lock().expect("transfer staging lock poisoned");
+        validate_attempt_id(attempt_id)?;
         descriptor
             .validate()
             .map_err(|error| StagingError::InvalidDescriptor(error.message))?;
@@ -171,6 +174,11 @@ impl OpenCodeTransferStaging {
                 self.read_descriptor(existing_dir)?
             };
             ensure_same_descriptor(&existing, descriptor)?;
+            // Claim this resume attempt before changing the queued/partial
+            // state. Its failure path can then clean up with this same token,
+            // and every superseded request is fenced as soon as Begin holds
+            // the staging mutex.
+            write_attempt_owner(existing_dir, attempt_id)?;
             if queued.exists() {
                 if !self.has_capacity(descriptor.total_bytes)? {
                     return Ok(StagingStart::Queued);
@@ -208,6 +216,7 @@ impl OpenCodeTransferStaging {
             fs::create_dir(&queued)?;
             fs::set_permissions(&queued, fs::Permissions::from_mode(TRANSFER_ROOT_MODE))?;
             self.write_descriptor(&queued, descriptor)?;
+            write_attempt_owner(&queued, attempt_id)?;
             sync_parent(&queued)?;
             return Ok(StagingStart::Queued);
         }
@@ -227,6 +236,7 @@ impl OpenCodeTransferStaging {
         }
         File::open(&partial)?.sync_all()?;
         sync_parent(&partial)?;
+        write_attempt_owner(&partial, attempt_id)?;
         record_partial_activity(&partial, SystemTime::now())?;
         Ok(StagingStart::Started {
             next_sequence: 0,
@@ -254,6 +264,7 @@ impl OpenCodeTransferStaging {
                 "transfer is not in a writable staging state".into(),
             ));
         }
+        require_attempt_owner(&partial, &chunk.attempt_id)?;
         let descriptor = self.read_descriptor(&partial)?;
         let coordinates = chunk_coordinates(&descriptor.files);
         let (file, offset, size) = coordinates
@@ -299,8 +310,9 @@ impl OpenCodeTransferStaging {
         Ok(())
     }
 
-    pub fn finalize(&self, transfer_id: &str) -> Result<PathBuf, StagingError> {
+    pub fn finalize(&self, transfer_id: &str, attempt_id: &str) -> Result<PathBuf, StagingError> {
         let _guard = self.lock.lock().expect("transfer staging lock poisoned");
+        validate_attempt_id(attempt_id)?;
         let partial = self.partial_path(transfer_id);
         let ready = self.ready_path(transfer_id);
         if ready.exists() {
@@ -313,6 +325,7 @@ impl OpenCodeTransferStaging {
                 "transfer is not in a writable staging state".into(),
             ));
         }
+        require_attempt_owner(&partial, attempt_id)?;
         let descriptor = self.read_descriptor(&partial)?;
         self.recover_next_sequence(&descriptor, &partial)?;
         for file in &descriptor.files {
@@ -365,6 +378,11 @@ impl OpenCodeTransferStaging {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => return Err(error.into()),
         }
+        match fs::remove_file(partial.join(PARTIAL_ATTEMPT_FILE)) {
+            Ok(()) => File::open(&partial)?.sync_all()?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
         File::open(&partial)?.sync_all()?;
         fs::set_permissions(&partial, fs::Permissions::from_mode(READY_DIR_MODE))?;
         File::open(&partial)?.sync_all()?;
@@ -383,24 +401,35 @@ impl OpenCodeTransferStaging {
         self.verify_ready_unlocked(descriptor)
     }
 
-    pub fn abort(&self, transfer_id: &str) -> Result<(), StagingError> {
+    pub fn abort(&self, transfer_id: &str, attempt_id: &str) -> Result<(), StagingError> {
         let _guard = self.lock.lock().expect("transfer staging lock poisoned");
-        for path in [
+        validate_attempt_id(attempt_id)?;
+        let paths = [
             self.partial_path(transfer_id),
             self.queued_path(transfer_id),
-        ] {
-            match fs::symlink_metadata(&path) {
+        ];
+        // Preflight ownership for every directory before deleting either one.
+        // A stale abort must not partially clean up a newer attempt.
+        for path in &paths {
+            match fs::symlink_metadata(path) {
                 Ok(metadata) => {
                     if metadata.file_type().is_symlink() || !metadata.is_dir() {
                         return Err(StagingError::InvalidState(
                             "aborted transfer is not a real directory".into(),
                         ));
                     }
-                    fs::set_permissions(&path, fs::Permissions::from_mode(TRANSFER_ROOT_MODE))?;
-                    fs::remove_dir_all(path)?;
+                    if !attempt_owner_matches(path, attempt_id)? {
+                        return Ok(());
+                    }
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
                 Err(error) => return Err(error.into()),
+            }
+        }
+        for path in paths {
+            if path.exists() {
+                fs::set_permissions(&path, fs::Permissions::from_mode(TRANSFER_ROOT_MODE))?;
+                fs::remove_dir_all(path)?;
             }
         }
         File::open(&self.root)?.sync_all()?;
@@ -708,6 +737,7 @@ impl OpenCodeTransferStaging {
                 let name = name.to_string_lossy();
                 if name != "descriptor.json"
                     && name != PARTIAL_ACTIVITY_FILE
+                    && name != PARTIAL_ATTEMPT_FILE
                     && !name.ends_with(".part")
                     && !name.ends_with(".bin")
                 {
@@ -716,7 +746,14 @@ impl OpenCodeTransferStaging {
                     ));
                 }
                 let metadata = fs::symlink_metadata(entry.path())?;
-                if metadata.file_type().is_symlink() || !metadata.is_file() || metadata.len() != 0 {
+                if metadata.file_type().is_symlink() || !metadata.is_file() {
+                    return Err(StagingError::InvalidState(
+                        "descriptor-less staging directory contains payload data".into(),
+                    ));
+                }
+                if name == PARTIAL_ATTEMPT_FILE {
+                    read_attempt_owner(path)?;
+                } else if metadata.len() != 0 {
                     return Err(StagingError::InvalidState(
                         "descriptor-less staging directory contains payload data".into(),
                     ));
@@ -829,6 +866,62 @@ fn record_partial_activity(path: &Path, at: SystemTime) -> Result<(), StagingErr
         sync_parent(&activity)?;
     }
     Ok(())
+}
+
+fn validate_attempt_id(attempt_id: &str) -> Result<(), StagingError> {
+    if !valid_opencode_transfer_attempt_id(attempt_id) {
+        return Err(StagingError::InvalidState(
+            "transfer attempt ID must be 32 lowercase hexadecimal characters".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn read_attempt_owner(path: &Path) -> Result<String, StagingError> {
+    let owner_path = path.join(PARTIAL_ATTEMPT_FILE);
+    let metadata = fs::symlink_metadata(&owner_path)?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() || metadata.len() != 32 {
+        return Err(StagingError::InvalidState(
+            "transfer attempt owner marker is not a regular file".into(),
+        ));
+    }
+    let attempt_id = fs::read_to_string(owner_path)?;
+    validate_attempt_id(&attempt_id)?;
+    Ok(attempt_id)
+}
+
+fn write_attempt_owner(path: &Path, attempt_id: &str) -> Result<(), StagingError> {
+    validate_attempt_id(attempt_id)?;
+    match fs::symlink_metadata(path.join(PARTIAL_ATTEMPT_FILE)) {
+        Ok(_) => {
+            // Fail closed on malformed or redirected ownership metadata before
+            // replacing it with a new resume attempt.
+            let _ = read_attempt_owner(path)?;
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    write_atomic(
+        &path.join(PARTIAL_ATTEMPT_FILE),
+        attempt_id.as_bytes(),
+        PRIVATE_FILE_MODE,
+    )?;
+    Ok(())
+}
+
+fn require_attempt_owner(path: &Path, attempt_id: &str) -> Result<(), StagingError> {
+    validate_attempt_id(attempt_id)?;
+    if !attempt_owner_matches(path, attempt_id)? {
+        return Err(StagingError::InvalidState(
+            "transfer attempt has been superseded".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn attempt_owner_matches(path: &Path, attempt_id: &str) -> Result<bool, StagingError> {
+    validate_attempt_id(attempt_id)?;
+    Ok(read_attempt_owner(path)? == attempt_id)
 }
 
 fn partial_last_activity(path: &Path) -> Result<SystemTime, StagingError> {
