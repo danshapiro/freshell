@@ -272,6 +272,58 @@ describe('applyFreshAgentReconcileAttach', () => {
 })
 
 describe('resetFreshAgentPaneForReconcileCreate', () => {
+  it.each([
+    ['freshclaude', 'claude', DURABLE],
+    ['kilroy', 'claude', DURABLE],
+    ['freshcodex', 'codex', 'native-managed-codex'],
+    ['freshopencode', 'opencode', 'ses_managed_opencode'],
+  ])('retains managed bootstrap history for %s while clearing its live handle', (sessionType, provider, nativeId) => {
+    const sessionRef = { provider, sessionId: nativeId }
+    const state = stateWithFreshAgentPane({ sessionType, provider, sessionRef, resumeSessionId: nativeId,
+      sessionId: 'presentation-live', serverInstanceId: 'server-old', status: 'connected',
+      soulId: 'owned-soul', soulIntentRevision: 7, incarnationId: 'original-incarnation' })
+    const next = panesReducer(state, resetFreshAgentPaneForReconcileCreate({
+      tabId, paneId, intent: 'fresh', reason: 'identity_never_observed',
+    }))
+    expect(leafContent(next, tabId)).toMatchObject({ sessionRef, resumeSessionId: nativeId,
+      createRequestId: ORIGINAL_CREATE_REQUEST_ID, soulId: 'owned-soul', soulIntentRevision: 7,
+      incarnationId: 'original-incarnation', status: 'creating', pendingReconcile: 'fresh', reconcileEpoch: 1 })
+    expect(leafContent(next, tabId).sessionId).toBeUndefined()
+    expect(leafContent(next, tabId).serverInstanceId).toBeUndefined()
+  })
+
+  it.each(['duplicate_session_claim', 'no_recoverable_identity'])('clears managed durable identity for genuine fresh %s', (reason) => {
+    const state = stateWithFreshAgentPane({ soulId: 'owned-soul', sessionRef: { provider: 'claude', sessionId: DURABLE }, resumeSessionId: DURABLE })
+    const next = panesReducer(state, resetFreshAgentPaneForReconcileCreate({ tabId, paneId, intent: 'fresh', reason }))
+    expect(leafContent(next, tabId).sessionRef).toBeUndefined()
+    expect(leafContent(next, tabId).resumeSessionId).toBeUndefined()
+    expect(leafContent(next, tabId).createRequestId).toBe(ORIGINAL_CREATE_REQUEST_ID)
+  })
+
+  it.each([
+    undefined,
+    { provider: 'codex', sessionId: 'foreign-native' },
+    { provider: 'claude', sessionId: 'freshclaude-placeholder' },
+  ])('does not reconstruct a managed bootstrap locator from %j', (sessionRef) => {
+    const state = stateWithFreshAgentPane({ soulId: 'owned-soul', sessionRef, resumeSessionId: sessionRef ? DURABLE : undefined })
+    const next = panesReducer(state, resetFreshAgentPaneForReconcileCreate({ tabId, paneId, intent: 'fresh', reason: 'identity_never_observed' }))
+    expect(leafContent(next, tabId).sessionRef).toBeUndefined()
+    expect(leafContent(next, tabId).resumeSessionId).toBeUndefined()
+  })
+
+  it('does not retain managed identity after invalid respawn degrades to fresh', () => {
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
+    try {
+      const state = stateWithFreshAgentPane({ soulId: 'owned-soul', sessionRef: { provider: 'claude', sessionId: DURABLE }, resumeSessionId: DURABLE })
+      const next = panesReducer(state, resetFreshAgentPaneForReconcileCreate({ tabId, paneId, intent: 'respawn',
+        reason: 'identity_never_observed', sessionRef: { provider: 'codex', sessionId: 'wrong-native' } }))
+      expect(leafContent(next, tabId).sessionRef).toBeUndefined()
+      expect(leafContent(next, tabId).resumeSessionId).toBeUndefined()
+      expect(leafContent(next, tabId).pendingReconcile).toBe('fresh')
+      expect(errorSpy).toHaveBeenCalled()
+    } finally { errorSpy.mockRestore() }
+  })
+
   it('respawn adopts the server-named sessionRef and arms pendingReconcile', () => {
     const state = stateWithFreshAgentPane({ sessionId: 'live-old', serverInstanceId: 'srv-old', status: 'connected' })
     const next = panesReducer(state, resetFreshAgentPaneForReconcileCreate({

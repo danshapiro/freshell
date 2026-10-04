@@ -35,6 +35,7 @@ import { sanitizeRestoreError, sanitizeCrashTrace, sanitizeSessionRef, type Rest
 import { sanitizeCodexDurabilityRef } from '@shared/codex-durability'
 import { migrateLegacyFreshAgentContent, migrateLegacyFreshAgentDurableState, preservedDurableFreshAgentIdentity } from '@shared/fresh-agent'
 import { normalizeFreshAgentStyleOverride } from '@shared/settings'
+import { isDurableProviderSessionId } from '@shared/session-flavor'
 import { parsePaneNamingIdentityInput } from '@/lib/tab-name-source'
 import { ManagedRuntimeProjectionFieldsSchema, type ManagedRuntimeProjectionFields } from '@shared/managed-runtime'
 
@@ -2726,6 +2727,16 @@ export const panesSlice = createSlice({
       let { intent } = action.payload
       const content = findReconcilePaneContent(state, tabId, paneId)
       if (!content || content.kind !== 'fresh-agent') return
+      // A missing web-runtime observation does not erase an owned conversation.
+      // Preserve only its saved locator; the live handle must still clear so
+      // the original-request bootstrap runs. Invalid respawn is never this case.
+      const savedRef = action.payload.intent === 'fresh'
+        && reason === 'identity_never_observed'
+        && content.soulId && content.createRequestId
+        ? sanitizeSessionRef(content.sessionRef) : undefined
+      const retainedManagedRef = savedRef?.provider === content.provider
+        && isDurableProviderSessionId(content.provider, savedRef.sessionId)
+        ? savedRef : undefined
       if (intent === 'respawn' && (!sessionRef?.sessionId || sessionRef.provider !== content.provider)) {
         log.error('fresh-agent respawn verdict without a usable sessionRef — degrading to fresh', {
           tabId,
@@ -2742,6 +2753,9 @@ export const panesSlice = createSlice({
       if (intent === 'respawn' && sessionRef) {
         content.sessionRef = { provider: sessionRef.provider, sessionId: sessionRef.sessionId }
         content.resumeSessionId = sessionRef.sessionId
+      } else if (retainedManagedRef) {
+        content.sessionRef = retainedManagedRef
+        content.resumeSessionId = retainedManagedRef.sessionId
       } else {
         content.sessionRef = undefined
         content.resumeSessionId = undefined

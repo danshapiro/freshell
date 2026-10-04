@@ -1,11 +1,23 @@
 import type { FreshAgentPaneContent } from '@/store/paneTypes'
 import { getCanonicalDurableSessionId, type SessionIdentityState } from '@/store/persistControl'
 import { isValidClaudeSessionId } from '@/lib/claude-session-id'
+import { isDurableProviderSessionId } from '@shared/session-flavor'
 
 // Same create/start gate the FreshAgentView/panesSlice early-state sets apply:
 // while a new session is still being created, the pane must not read an older
 // durable ref.
 const EARLY_STATES = new Set(['creating', 'starting'])
+
+/** A known managed conversation remains readable while its same-request
+ * bootstrap has no live handle. This is exclusively an owned history source;
+ * it cannot supply the settings probe or certify a live runtime. */
+export function getManagedBootstrapHistoryThreadId(pane: FreshAgentPaneContent): string | undefined {
+  if (!pane.soulId || !pane.createRequestId || pane.sessionId
+    || (pane.pendingReconcile !== 'fresh' && pane.pendingReconcile !== 'respawn')) return undefined
+  const ref = pane.sessionRef
+  if (ref?.provider !== pane.provider || !isDurableProviderSessionId(pane.provider, ref.sessionId)) return undefined
+  return ref.sessionId
+}
 
 function getCanonicalPaneResumeSessionId(pane: FreshAgentPaneContent): string | undefined {
   if (pane.sessionRef?.provider === 'claude' && isValidClaudeSessionId(pane.sessionRef.sessionId)) {
