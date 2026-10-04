@@ -1,6 +1,7 @@
 use serde_json::{json, Value};
 use std::{
-    io::{BufRead, Read},
+    collections::{HashSet, VecDeque},
+    io::Read,
     path::Path,
 };
 
@@ -12,20 +13,24 @@ pub(crate) fn read(home: &Path, id: &str) -> Result<Value, String> {
 
 pub(super) fn read_rollout(path: &Path, id: &str) -> Result<Value, String> {
     let file = std::fs::File::open(path).map_err(|e| e.to_string())?;
-    if file.metadata().map_err(|e| e.to_string())?.len() > crate::native_history::MAX_HISTORY_BYTES
-    {
-        return Err("native transcript exceeds history read limit".into());
-    }
+    let extent = file.metadata().map_err(|e| e.to_string())?.len();
+    let source = crate::native_history::Records::new(std::io::BufReader::new(file.take(extent)));
+    let mut omitted_turns = 0;
+    let mut omitted_items = 0;
+    let mut omitted_rows = 0;
+    let mut retired = RetiredTurns::default();
     let mut turns = Vec::new();
     let mut turn = NativeTurn::new(0);
-    for (line, row) in std::io::BufReader::new(file)
-        .take(crate::native_history::MAX_HISTORY_BYTES + 1)
-        .lines()
-        .enumerate()
-    {
-        let row = row.map_err(|e| e.to_string())?;
-        // A crash can leave an incomplete final JSONL record; earlier durable records remain readable.
-        let Ok(row) = serde_json::from_str::<Value>(&row) else {
+    for (line, row) in source.enumerate() {
+        retain_native_turns(
+            &mut turns,
+            &mut turn,
+            &mut omitted_turns,
+            &mut omitted_items,
+            &mut omitted_rows,
+            &mut retired,
+        );
+        let Some((row, omitted)) = row.map_err(|e| e.to_string())? else {
             continue;
         };
         let payload = &row["payload"];
@@ -41,6 +46,7 @@ pub(super) fn read_rollout(path: &Path, id: &str) -> Result<Value, String> {
                     item_type,
                     "function_call_output" | "custom_tool_call_output" | "tool_search_output"
                 ) {
+                    omitted_items += omitted;
                     let call_id = payload["call_id"].as_str();
                     let items = turn.value["items"].as_array_mut().unwrap();
                     if let Some(call) = items
@@ -72,6 +78,7 @@ pub(super) fn read_rollout(path: &Path, id: &str) -> Result<Value, String> {
                     continue;
                 }
                 if let Some(mut item) = normalize_item(payload) {
+                    omitted_items += omitted;
                     item["id"] = payload
                         .get("call_id")
                         .filter(|id| id.is_string())
@@ -87,6 +94,15 @@ pub(super) fn read_rollout(path: &Path, id: &str) -> Result<Value, String> {
                 }
             }
             Some("event_msg") => {
+                if payload["type"] != "task_started"
+                    && payload["turn_id"]
+                        .as_str()
+                        .is_some_and(|id| !turn.has_id(id) && retired.ids.contains(id))
+                {
+                    // A delayed mirror/completion of an omitted task must not
+                    // hijack the current native task or become its latest answer.
+                    continue;
+                }
                 if payload["type"] == "task_started" {
                     activate_turn(&mut turns, &mut turn, payload["turn_id"].as_str(), true);
                     continue;
@@ -122,6 +138,7 @@ pub(super) fn read_rollout(path: &Path, id: &str) -> Result<Value, String> {
                     &mut turn
                 };
                 if let Some(item) = item {
+                    omitted_items += omitted;
                     upsert_transcript_item(
                         target,
                         item,
@@ -132,26 +149,151 @@ pub(super) fn read_rollout(path: &Path, id: &str) -> Result<Value, String> {
                         },
                     );
                 }
+                target.bytes = 0;
                 target.finished |= finished;
             }
             _ => {}
         }
     }
+    retain_native_turns(
+        &mut turns,
+        &mut turn,
+        &mut omitted_turns,
+        &mut omitted_items,
+        &mut omitted_rows,
+        &mut retired,
+    );
     if turn.has_items() {
         turns.push(turn);
     }
+    let mut ordinal = omitted_rows;
+    let offsets: Vec<_> = turns
+        .iter()
+        .map(|turn| {
+            let rows = super::build_codex_turn_json(&turn.value, 0)
+                .expect("native turn projects")
+                .len();
+            let offset = (
+                turn.value["id"].as_str().unwrap().to_owned(),
+                ordinal,
+                turn.skipped_rows,
+            );
+            ordinal += rows + turn.skipped_rows;
+            offset
+        })
+        .collect();
     let turns: Vec<_> = turns.into_iter().map(|turn| turn.value).collect();
-    super::build_codex_snapshot_json(
+    let mut snapshot = super::build_codex_snapshot_json(
         id,
         &json!({"thread":{"id":id,"status":"idle","turns":turns}}),
         false,
         None,
         None,
         false,
-    )
+    )?;
+    for turn in snapshot["turns"].as_array_mut().unwrap() {
+        let id = turn["turnId"].as_str().unwrap();
+        if let Some((native, ordinal, skipped)) = offsets.iter().find(|(native, _, _)| {
+            id == native
+                || id
+                    .strip_prefix(native)
+                    .is_some_and(|suffix| suffix.starts_with(":row-"))
+        }) {
+            let row = id
+                .strip_prefix(native)
+                .and_then(|suffix| suffix.strip_prefix(":row-"))
+                .and_then(|row| row.parse::<usize>().ok())
+                .unwrap_or(0);
+            turn["ordinal"] = json!(ordinal + skipped + row);
+            if *skipped > 0 {
+                turn["id"] = json!(format!("{native}:row-{}", skipped + row));
+                turn["turnId"] = turn["id"].clone();
+            }
+        }
+    }
+    crate::native_history::finish_retention("codex", &mut snapshot, omitted_turns, omitted_items)?;
+    Ok(snapshot)
+}
+
+fn retain_native_turns(
+    turns: &mut Vec<NativeTurn>,
+    current: &mut NativeTurn,
+    omitted_turns: &mut usize,
+    omitted_items: &mut usize,
+    omitted_rows: &mut usize,
+    retired: &mut RetiredTurns,
+) {
+    let items = current.value["items"].as_array_mut().unwrap();
+    let mut bytes: usize = items
+        .iter()
+        .map(|item| serde_json::to_vec(item).unwrap().len())
+        .sum();
+    if bytes > crate::native_history::RETAINED_TURN_BYTES {
+        for item in items.iter_mut() {
+            crate::native_history::omit_large_bodies(item);
+        }
+        bytes = items
+            .iter()
+            .map(|item| serde_json::to_vec(item).unwrap().len())
+            .sum();
+    }
+    while bytes > crate::native_history::RETAINED_TURN_BYTES && items.len() > 1 {
+        let role = super::classify_codex_item_role(items[0]["type"].as_str().unwrap_or(""));
+        let next_role = super::classify_codex_item_role(items[1]["type"].as_str().unwrap_or(""));
+        current.skipped_rows += usize::from(role != next_role);
+        bytes -= serde_json::to_vec(&items.remove(0)).unwrap().len();
+        *omitted_items += 1;
+    }
+    let mut bytes: usize = turns
+        .iter_mut()
+        .map(|turn| {
+            if turn.bytes == 0 {
+                turn.bytes = serde_json::to_vec(&turn.value).unwrap().len();
+            }
+            turn.bytes
+        })
+        .sum();
+    while bytes > crate::native_history::RETAINED_TURN_BYTES && !turns.is_empty() {
+        let removed = turns.remove(0);
+        if removed.named {
+            retired.insert(removed.value["id"].as_str().unwrap());
+        }
+        bytes -= removed.bytes;
+        *omitted_rows += super::build_codex_turn_json(&removed.value, 0)
+            .expect("retained native turn projects")
+            .len()
+            + removed.skipped_rows;
+        *omitted_turns += 1;
+    }
+}
+
+/// Keep exact recent task identities after their bodies leave the display
+/// window. The identity window is bounded by the same retained byte budget.
+#[derive(Default)]
+struct RetiredTurns {
+    ids: HashSet<String>,
+    order: VecDeque<String>,
+    bytes: usize,
+}
+impl RetiredTurns {
+    fn insert(&mut self, id: &str) {
+        if !self.ids.insert(id.to_owned()) {
+            return;
+        }
+        self.bytes += id.len();
+        self.order.push_back(id.to_owned());
+        while self.bytes > crate::native_history::RETAINED_TURN_BYTES {
+            let id = self.order.pop_front().unwrap();
+            self.bytes -= id.len();
+            self.ids.remove(&id);
+        }
+    }
 }
 
 struct NativeTurn {
+    index: usize,
+    skipped_rows: usize,
+    bytes: usize,
     value: Value,
     mirror: Option<MessageMirror>,
     named: bool,
@@ -162,6 +304,9 @@ struct NativeTurn {
 impl NativeTurn {
     fn new(index: usize) -> Self {
         Self {
+            index,
+            skipped_rows: 0,
+            bytes: 0,
             value: json!({"id":format!("native-history-{index}"),"items":[]}),
             mirror: None,
             named: false,
@@ -224,7 +369,7 @@ fn activate_turn(
 
 fn advance_turn(turns: &mut Vec<NativeTurn>, turn: &mut NativeTurn) {
     let has_items = turn.has_items();
-    let previous = std::mem::replace(turn, NativeTurn::new(turns.len() + usize::from(has_items)));
+    let previous = std::mem::replace(turn, NativeTurn::new(turn.index + usize::from(has_items)));
     if has_items {
         turns.push(previous);
     }

@@ -97,6 +97,25 @@ fn history_binary_reads_exact_saved_codex_rollout_without_a_runtime() {
 }
 
 #[test]
+fn history_binary_preserves_normal_text_that_quotes_the_retention_marker() {
+    let home = tempfile::tempdir().unwrap();
+    let text = "Source code defines OMITTED_BODY as FRESHELL_NATIVE_HISTORY_OMITTED_SHA256:; this is saved text.";
+    rollout(home.path(), "quoted-marker", text);
+    let result = history(home.path(), "codex", "quoted-marker");
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let body: Value = serde_json::from_slice(&result.stdout).unwrap();
+    assert_eq!(body["turns"][1]["items"][0]["text"], text);
+    assert_ne!(
+        body["extensions"]["codex"]["nativeHistoryRetention"]["partial"],
+        true
+    );
+}
+
+#[test]
 fn history_binary_reads_supported_codex_task_event_transcript() {
     let home = tempfile::tempdir().unwrap();
     let root = home.path().join(".codex/sessions/2026/10/03");
@@ -842,23 +861,363 @@ fn history_binary_deduplicates_codex_message_mirrors_in_either_record_order() {
 }
 
 #[test]
-fn history_binary_reports_oversize_instead_of_truncating_the_transcript() {
+fn history_binary_reads_large_sources_with_small_retained_conversations() {
+    use std::io::Write;
+    for provider in ["codex", "claude"] {
+        let home = tempfile::tempdir().unwrap();
+        let path = if provider == "codex" {
+            rollout(home.path(), "large-thread", "Early saved answer");
+            home.path()
+                .join(".codex/sessions/2026/10/03/rollout-2026-10-03-large-thread.jsonl")
+        } else {
+            let directory = home.path().join(".claude/projects/workspace");
+            std::fs::create_dir_all(&directory).unwrap();
+            let path = directory.join("large-thread.jsonl");
+            std::fs::write(&path, format!("{}\n", json!({"type":"assistant","uuid":"early-answer","message":{"content":"Early saved answer"}}))).unwrap();
+            path
+        };
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        writeln!(file).unwrap();
+        let progress =
+            json!({"type":"progress","data":"ignored progress".repeat(2048)}).to_string();
+        for _ in 0..600 {
+            writeln!(file, "{progress}").unwrap();
+        }
+        if provider == "codex" {
+            writeln!(file,"{}",json!({"type":"event_msg","payload":{"type":"task_complete","turn_id":"native-turn","last_agent_message":"Early saved answer"}})).unwrap();
+            for row in [
+                json!({"type":"turn_context","payload":{"turn_id":"latest-turn"}}),
+                codex_response_message("user", 2, "Latest saved prompt"),
+                codex_response_message("assistant", 2, "Latest saved answer"),
+            ] {
+                writeln!(file, "{row}").unwrap();
+            }
+        } else {
+            writeln!(file,"{}",json!({"type":"user","uuid":"latest-prompt","message":{"content":"Latest saved prompt"}})).unwrap();
+            writeln!(file,"{}",json!({"type":"assistant","uuid":"latest-answer","message":{"content":"Latest saved answer"}})).unwrap();
+        }
+        drop(file);
+        let original = std::fs::read(&path).unwrap();
+        assert!(original.len() as u64 > freshell_freshagent::native_history::MAX_HISTORY_BYTES);
+        let result = history(home.path(), provider, "large-thread");
+        assert!(
+            result.status.success(),
+            "{provider}: {}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        let body: Value = serde_json::from_slice(&result.stdout).unwrap();
+        let text = body["turns"].to_string();
+        assert!(text.contains("Early saved answer"));
+        assert!(text.contains("Latest saved prompt"));
+        assert!(text.contains("Latest saved answer"));
+        assert_ne!(
+            body["extensions"][provider]["nativeHistoryRetention"]["partial"],
+            true
+        );
+        assert_eq!(body["capabilities"]["send"], false);
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+    }
+}
+
+#[test]
+fn history_binary_bounds_large_codex_display_without_losing_recent_turns_or_tools() {
     let home = tempfile::tempdir().unwrap();
-    rollout(home.path(), "large-thread", "Saved answer");
-    let path = home
-        .path()
-        .join(".codex/sessions/2026/10/03/rollout-2026-10-03-large-thread.jsonl");
-    std::fs::OpenOptions::new()
-        .write(true)
-        .open(path)
-        .unwrap()
-        .set_len(freshell_freshagent::native_history::MAX_HISTORY_BYTES + 1)
+    let mut rows = vec![json!({"type":"session_meta","payload":{"id":"large-display"}})];
+    let answer = "Large saved answer \n".repeat(8000);
+    for index in 0..160 {
+        rows.extend([json!({"type":"event_msg","payload":{"type":"task_started","turn_id":format!("turn-{index}")}}),
+            codex_response_message("user", index, "Repeated saved prompt"),
+            codex_response_message("assistant", index, &answer),
+            json!({"type":"event_msg","payload":{"type":"task_complete","turn_id":format!("turn-{index}"),"last_agent_message":answer}})]);
+    }
+    rows.extend([json!({"type":"turn_context","payload":{"turn_id":"latest-tool-turn"}}),
+        codex_response_message("user", 160, "Latest saved prompt"),
+        json!({"type":"response_item","payload":{"type":"function_call","call_id":"latest-tool","name":"exec_command","arguments":"{\"cmd\":\"pwd\"}"}}),
+        json!({"type":"response_item","payload":{"type":"function_call_output","call_id":"latest-tool","output":"/workspace"}}),
+        codex_response_message("assistant", 160, "Latest saved answer")]);
+    rows.push(json!({"type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-0","last_agent_message":"Older delayed answer"}}));
+    write_codex_rows(home.path(), "large-display", &rows);
+    let result = history(home.path(), "codex", "large-display");
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert!((result.stdout.len() as u64) < freshell_freshagent::native_history::MAX_HISTORY_BYTES);
+    let body: Value = serde_json::from_slice(&result.stdout).unwrap();
+    let retention = &body["extensions"]["codex"]["nativeHistoryRetention"];
+    assert_eq!(retention["partial"], true);
+    assert!(retention["omittedNativeTurns"].as_u64().unwrap() > 0);
+    let turns = body["turns"].as_array().unwrap();
+    assert!(turns.len() > 4);
+    assert!(turns
+        .to_vec()
+        .iter()
+        .any(|turn| turn["items"][0]["id"] == "latest-tool"
+            && turn["items"][0]["kind"] == "dynamic_tool"));
+    assert!(body["turns"].to_string().contains("/workspace"));
+    assert_eq!(
+        turns.last().unwrap()["items"][0]["text"],
+        "Latest saved answer"
+    );
+    assert!(turns
+        .iter()
+        .any(|turn| turn["items"][0]["id"] == "user-159:part:0"));
+    assert!(turns
+        .iter()
+        .any(|turn| turn["items"][0]["id"] == "assistant-159"));
+}
+
+#[test]
+fn history_binary_preserves_oversized_codex_task_mirrors_and_subsequent_identical_input() {
+    let home = tempfile::tempdir().unwrap();
+    let huge = "Repeated saved answer é 🚀\n".repeat(650_000);
+    let rows = vec![
+        json!({"type":"session_meta","payload":{"id":"oversized-task"}}),
+        json!({"type":"event_msg","payload":{"type":"user_message","message":"Repeated saved prompt"}}),
+        json!({"type":"event_msg","payload":{"type":"task_started","turn_id":"huge-turn"}}),
+        codex_response_message("user", 0, "Repeated saved prompt"),
+        json!({"type":"response_item","payload":{"type":"function_call","call_id":"huge-tool","name":"exec_command","arguments":"{\"cmd\":\"pwd\"}"}}),
+        json!({"type":"response_item","payload":{"type":"function_call_output","call_id":"huge-tool","output":huge}}),
+        json!({"type":"event_msg","payload":{"type":"agent_message","message":huge}}),
+        codex_response_message("assistant", 0, &huge),
+        json!({"type":"event_msg","payload":{"type":"task_complete","turn_id":"huge-turn","last_agent_message":huge}}),
+        json!({"type":"event_msg","payload":{"type":"user_message","message":"Repeated saved prompt"}}),
+        json!({"type":"event_msg","payload":{"type":"task_started","turn_id":"next-turn"}}),
+        codex_response_message("user", 1, "Repeated saved prompt"),
+        codex_response_message("assistant", 1, "Latest saved answer"),
+    ];
+    let directory = home.path().join(".codex/sessions/2026/10/03");
+    std::fs::create_dir_all(&directory).unwrap();
+    let mut file = std::fs::File::create(directory.join("rollout-oversized-task.jsonl")).unwrap();
+    use std::io::Write;
+    for row in &rows {
+        let text = if row["type"] == "response_item" && row["payload"]["role"] == "assistant" {
+            row.to_string()
+                .replace('é', "\\u00e9")
+                .replace('🚀', "\\ud83d\\ude80")
+        } else {
+            row.to_string()
+        };
+        writeln!(file, "{text}").unwrap();
+    }
+    drop(file);
+    let result = history(home.path(), "codex", "oversized-task");
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let body: Value = serde_json::from_slice(&result.stdout).unwrap();
+    let turns = body["turns"].as_array().unwrap();
+    assert_eq!(
+        turns.iter().filter(|turn| turn["role"] == "user").count(),
+        2
+    );
+    assert_eq!(
+        turns
+            .iter()
+            .filter(|turn| turn["items"][0]["id"] == "assistant-0")
+            .count(),
+        1
+    );
+    assert_eq!(
+        turns
+            .iter()
+            .filter(|turn| turn["role"] == "assistant")
+            .count(),
+        2
+    );
+    assert!(body["turns"].to_string().contains("huge-tool"));
+    assert_eq!(
+        turns.last().unwrap()["items"][0]["text"],
+        "Latest saved answer"
+    );
+    assert_eq!(
+        body["extensions"]["codex"]["nativeHistoryRetention"]["partial"],
+        true
+    );
+    assert!(
+        body["extensions"]["codex"]["nativeHistoryRetention"]["omittedBodies"]
+            .as_u64()
+            .unwrap()
+            > 0
+    );
+    assert!((result.stdout.len() as u64) < freshell_freshagent::native_history::MAX_HISTORY_BYTES);
+}
+
+#[test]
+fn history_binary_retains_large_claude_and_kilroy_tools_with_original_ordinals() {
+    use std::io::Write;
+    for provider in ["claude", "kilroy"] {
+        let home = tempfile::tempdir().unwrap();
+        let directory = home.path().join(".claude/projects/workspace");
+        std::fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("large-claude.jsonl");
+        let mut file = std::fs::File::create(&path).unwrap();
+        for _ in 0..100 {
+            writeln!(
+                file,
+                "{}",
+                json!({"type":"assistant","message":{"content":"Saved answer ".repeat(16_000)}})
+            )
+            .unwrap();
+        }
+        for row in [
+            json!({"type":"user","uuid":"latest-prompt","message":{"content":"Latest saved prompt"}}),
+            json!({"type":"assistant","uuid":"latest-invocation","message":{"content":[{"type":"tool_use","id":"huge-tool","name":"Read","input":{"file_path":"/workspace/saved.txt"}}]}}),
+            json!({"type":"user","uuid":"latest-result","message":{"content":[{"type":"tool_result","tool_use_id":"huge-tool","content":"Saved output ".repeat(1_500_000)}]}}),
+            json!({"type":"assistant","uuid":"latest-answer","message":{"content":"Latest saved answer"}}),
+        ] {
+            writeln!(file, "{row}").unwrap();
+        }
+        drop(file);
+        let before = std::fs::read(&path).unwrap();
+        let modified = std::fs::metadata(&path).unwrap().modified().unwrap();
+        let result = history(home.path(), provider, "large-claude");
+        assert!(
+            result.status.success(),
+            "{provider}: {}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        let body: Value = serde_json::from_slice(&result.stdout).unwrap();
+        let turns = body["turns"].as_array().unwrap();
+        assert!(turns[0]["ordinal"].as_u64().unwrap() > 0);
+        assert_eq!(
+            turns[0]["id"],
+            format!("large-claude:{}", turns[0]["ordinal"])
+        );
+        let items: Vec<_> = turns
+            .iter()
+            .flat_map(|turn| turn["items"].as_array().unwrap())
+            .collect();
+        assert!(items
+            .iter()
+            .any(|item| item["kind"] == "tool_use" && item["toolUseId"] == "huge-tool"));
+        assert!(items.iter().any(|item| item["kind"] == "tool_result"
+            && item["toolUseId"] == "huge-tool"
+            && item["content"] == "[Content omitted from retained history]"));
+        assert_eq!(body["latestTurnId"], "latest-answer");
+        assert_eq!(turns.last().unwrap()["ordinal"], 103);
+        assert_eq!(
+            body["extensions"]["claude"]["nativeHistoryRetention"]["partial"],
+            true
+        );
+        assert_eq!(body["capabilities"]["send"], false);
+        assert!(
+            (result.stdout.len() as u64) < freshell_freshagent::native_history::MAX_HISTORY_BYTES
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().modified().unwrap(),
+            modified
+        );
+    }
+}
+
+#[test]
+fn history_binary_bounds_large_opencode_active_and_reverted_history_including_wal() {
+    for (journal, keep_open) in [("DELETE", false), ("WAL", false), ("WAL", true)] {
+        let home = tempfile::tempdir().unwrap();
+        let directory = home.path().join(".local/share/opencode");
+        std::fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("opencode.db");
+        let db = Connection::open(&path).unwrap();
+        db.pragma_update(None, "journal_mode", journal).unwrap();
+        db.execute_batch("CREATE TABLE session (id TEXT PRIMARY KEY,title TEXT,time_updated INTEGER,revert TEXT);
+          CREATE TABLE message (id TEXT PRIMARY KEY,session_id TEXT,time_created INTEGER,data TEXT);
+          CREATE TABLE part (id TEXT PRIMARY KEY,session_id TEXT,message_id TEXT,time_created INTEGER,data TEXT);
+          INSERT INTO session VALUES ('large-opencode','Saved title',2,'{\"messageID\":\"message-100\"}');
+          INSERT INTO session VALUES ('foreign','Foreign',2,NULL);").unwrap();
+        for ordinal in 0..200 {
+            let id = format!("message-{ordinal}");
+            db.execute(
+                "INSERT INTO message VALUES (?1,'large-opencode',?2,?3)",
+                rusqlite::params![
+                    id,
+                    ordinal,
+                    json!({"role":if ordinal % 2 == 0 {"user"} else {"assistant"}}).to_string()
+                ],
+            )
+            .unwrap();
+            db.execute(
+                "INSERT INTO part VALUES (?1,'large-opencode',?2,0,?3)",
+                rusqlite::params![
+                    format!("part-{ordinal}"),
+                    id,
+                    json!({"type":"text","text":"Saved conversation ".repeat(10_000)}).to_string()
+                ],
+            )
+            .unwrap();
+        }
+        db.execute("INSERT INTO part VALUES ('huge-tool-part','large-opencode','message-199',1,?1)", [json!({"type":"tool","callID":"huge-call","tool":"bash","state":{"status":"completed","input":{"command":"pwd"},"output":"Saved output ".repeat(1_500_000)}}).to_string()]).unwrap();
+        db.execute(
+            "INSERT INTO message VALUES ('foreign-message','foreign',0,'{\"role\":\"assistant\"}')",
+            [],
+        )
         .unwrap();
-    let result = history(home.path(), "codex", "large-thread");
-    assert!(!result.status.success());
-    assert!(result.stdout.is_empty());
-    assert!(String::from_utf8_lossy(&result.stderr)
-        .contains("native transcript exceeds history read limit"));
+        db.execute("INSERT INTO part VALUES ('foreign-part','foreign','foreign-message',0,'{\"type\":\"text\",\"text\":\"Foreign history\"}')", []).unwrap();
+        let writer = if keep_open {
+            Some(db)
+        } else {
+            drop(db);
+            None
+        };
+        let before = std::fs::read(&path).unwrap();
+        let wal_before = keep_open.then(|| std::fs::read(path.with_extension("db-wal")).unwrap());
+        let result = history(home.path(), "opencode", "large-opencode");
+        assert!(
+            result.status.success(),
+            "{journal} open {keep_open}: {}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        let body: Value = serde_json::from_slice(&result.stdout).unwrap();
+        let active = body["turns"].as_array().unwrap();
+        let reverted = body["rolledBackTurns"].as_array().unwrap();
+        assert_eq!(body["latestTurnId"], "message-99");
+        assert_eq!(active.last().unwrap()["ordinal"], 99);
+        assert!(active[0]["ordinal"].as_u64().unwrap() > 0);
+        assert!(
+            reverted[0]["ordinal"].as_u64().unwrap() > 100,
+            "eviction must not forget the revert pointer"
+        );
+        assert!(reverted
+            .iter()
+            .all(|turn| turn["rolledBack"] == true && turn["restorable"] == false));
+        let tool_items = reverted.last().unwrap()["items"].as_array().unwrap();
+        let tool = tool_items
+            .iter()
+            .find(|item| item["id"] == "huge-tool-part")
+            .unwrap();
+        assert_eq!(tool["kind"], "dynamic_tool");
+        assert_eq!(tool["tool"], "bash");
+        assert_eq!(tool["status"], "completed");
+        assert_eq!(tool["arguments"]["command"], "pwd");
+        assert_eq!(
+            tool["contentItems"][0],
+            "[Content omitted from retained history]"
+        );
+        assert_eq!(tool["success"], true);
+        assert!(!body.to_string().contains("Foreign history"));
+        assert_eq!(
+            body["extensions"]["opencode"]["nativeHistoryRetention"]["partial"],
+            true
+        );
+        assert_eq!(body["capabilities"]["send"], false);
+        assert!(
+            (result.stdout.len() as u64) < freshell_freshagent::native_history::MAX_HISTORY_BYTES
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert_eq!(path.with_extension("db-wal").exists(), keep_open);
+        assert_eq!(path.with_extension("db-shm").exists(), keep_open);
+        if let Some(wal) = wal_before {
+            assert_eq!(std::fs::read(path.with_extension("db-wal")).unwrap(), wal);
+        }
+        drop(writer);
+    }
 }
 
 #[test]

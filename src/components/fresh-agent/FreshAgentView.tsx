@@ -3595,6 +3595,8 @@ export function FreshAgentView({
   }, [dispatch, freshOpenCodeRouteCwd])
 
   const content = useMemo(() => {
+    const retainedHistory = snapshot?.extensions?.[snapshot.provider]?.nativeHistoryRetention
+    const partialHistory = isRecord(retainedHistory) && retainedHistory.partial === true
     const turns = snapshot?.turns ?? []
     const pendingApprovals = snapshot?.pendingApprovals ?? []
     const pendingQuestions = snapshot?.pendingQuestions ?? []
@@ -3985,6 +3987,11 @@ export function FreshAgentView({
                     ? { 'aria-hidden': true, 'data-testid': 'fresh-agent-stale-transcript' }
                     : {})}
                 >
+                  {partialHistory ? (
+                    <div role="note" aria-label="Retained conversation history" className="px-4 py-2 text-xs text-muted-foreground">
+                      Showing retained conversation history. Older turns or large content were omitted from this view. The saved conversation has not been changed.
+                    </div>
+                  ) : null}
                   <FreshAgentTranscript
                     ref={transcriptRef}
                     presentationPaused={revealRefreshBlocking}
