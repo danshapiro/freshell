@@ -3225,6 +3225,7 @@ mod tests {
                 config: Vec::new(),
             }),
             opencode_transfer: None,
+            opencode_transfer_attempt_id: None,
         });
         for raw in [
             vec!["--api-key".into(), secret.into()],
@@ -3336,6 +3337,7 @@ mod tests {
                 config: Vec::new(),
             }),
             opencode_transfer: None,
+            opencode_transfer_attempt_id: None,
         });
         let digest_input = serde_json::to_vec(launch.terminal.as_ref().unwrap()).unwrap();
         assert!(!String::from_utf8_lossy(&digest_input).contains(secret));
@@ -3707,6 +3709,7 @@ mod tests {
             provider_secret_references: Vec::new(),
             provider_launch_context: None,
             opencode_transfer: None,
+            opencode_transfer_attempt_id: None,
         });
         let prepared = registry.prepare_launch(launch).await.unwrap();
         registry
@@ -3920,6 +3923,7 @@ mod tests {
             provider_secret_references: Vec::new(),
             provider_launch_context: None,
             opencode_transfer: None,
+            opencode_transfer_attempt_id: None,
         };
         let mut launch = prep(soul.clone(), RequestId::new(), "exact-resume");
         launch.provider = "opencode".into();

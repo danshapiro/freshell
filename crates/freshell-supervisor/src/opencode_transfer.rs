@@ -26,10 +26,17 @@ const READY_FILE_MODE: u32 = 0o400;
 const READY_DIR_MODE: u32 = 0o500;
 const PARTIAL_ACTIVITY_FILE: &str = ".activity";
 const PARTIAL_ATTEMPT_FILE: &str = ".attempt";
+const QUEUE_ORDER_FILE: &str = ".queue-order";
+const QUEUE_SEQUENCE_FILE: &str = ".queue-sequence";
+const MAX_QUEUED_TRANSFERS: usize = 128;
 /// A partial transfer with no durable progress for an hour is abandoned.
 /// Normal retries resume it before this lease expires; failed live requests
 /// also send Abort, leaving this as the process-crash fallback.
 const ABANDONED_PARTIAL_AGE: Duration = Duration::from_secs(60 * 60);
+/// A finalized stage is kept while its attempt prepares and registers a
+/// launch. After a supervisor crash, cleanup checks the registry and reclaims
+/// only after this durable lease has expired.
+pub(super) const ABANDONED_READY_AGE: Duration = Duration::from_secs(60 * 60);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StagingLimits {
@@ -83,11 +90,40 @@ struct StagingMetadata {
     descriptor: OpenCodeTransferDescriptor,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct QueueMetadata {
+    order: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct QueueSequence {
+    next_order: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum ReadyOwnershipState {
+    Pending,
+    Registering,
+    Claimed,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ReadyOwnership {
+    attempt_id: String,
+    state: ReadyOwnershipState,
+    updated_at_unix_ms: u64,
+}
+
 /// Owns a persistent private spool rooted beneath the supervisor runtime root.
 pub struct OpenCodeTransferStaging {
     root: PathBuf,
     limits: StagingLimits,
     lock: Mutex<()>,
+    capacity_changed: tokio::sync::watch::Sender<u64>,
 }
 
 impl OpenCodeTransferStaging {
@@ -116,10 +152,12 @@ impl OpenCodeTransferStaging {
             fs::set_permissions(&root, fs::Permissions::from_mode(TRANSFER_ROOT_MODE))?;
             sync_parent(&root)?;
         }
+        let (capacity_changed, _) = tokio::sync::watch::channel(0);
         Ok(Self {
             root,
             limits,
             lock: Mutex::new(()),
+            capacity_changed,
         })
     }
 
@@ -154,13 +192,22 @@ impl OpenCodeTransferStaging {
             ));
         }
         self.reclaim_stale_partials_unlocked(SystemTime::now())?;
+        if self.advance_queue_unlocked(available_bytes)? > 0 {
+            self.notify_capacity_change();
+        }
         let partial = self.partial_path(&descriptor.transfer_id);
         let queued = self.queued_path(&descriptor.transfer_id);
         let ready = self.ready_path(&descriptor.transfer_id);
+        if partial.exists() && queued.exists() {
+            return Err(StagingError::InvalidState(
+                "transfer has both queued and partial staging entries".into(),
+            ));
+        }
         if ready.exists() {
             let existing = self.read_descriptor(&ready)?;
             ensure_same_descriptor(&existing, descriptor)?;
             self.verify_ready_unlocked(descriptor)?;
+            self.adopt_unclaimed_ready_unlocked(&descriptor.transfer_id, attempt_id)?;
             return Ok(StagingStart::Started {
                 next_sequence: total_chunks(&descriptor.files),
                 file_offsets: complete_offsets(&descriptor.files),
@@ -179,19 +226,18 @@ impl OpenCodeTransferStaging {
             // and every superseded request is fenced as soon as Begin holds
             // the staging mutex.
             write_attempt_owner(existing_dir, attempt_id)?;
+            self.notify_capacity_change();
             if queued.exists() {
-                if !self.has_capacity(descriptor.total_bytes)? {
+                self.ensure_queue_order_unlocked(&queued)?;
+                if self.advance_queue_unlocked(available_bytes)? > 0 {
+                    self.notify_capacity_change();
+                }
+                if !partial.exists() {
                     return Ok(StagingStart::Queued);
                 }
-                if available_bytes < descriptor.total_bytes {
-                    return Err(StagingError::Capacity(
-                        "filesystem free space is below the remaining bundle size".into(),
-                    ));
-                }
-                fs::rename(&queued, &partial)?;
-                fs::set_permissions(&partial, fs::Permissions::from_mode(TRANSFER_ROOT_MODE))?;
-                self.create_partial_files(&partial, descriptor)?;
-                sync_parent(&partial)?;
+                let resumed = self.resume_offsets(descriptor, &partial)?;
+                record_partial_activity(&partial, SystemTime::now())?;
+                return Ok(resumed);
             } else {
                 self.create_partial_files(&partial, descriptor)?;
                 let required = self.remaining_bytes(descriptor, &partial)?;
@@ -212,12 +258,26 @@ impl OpenCodeTransferStaging {
             ));
         }
 
-        if !self.has_capacity(descriptor.total_bytes)? {
+        if self.queued_count_unlocked()? >= MAX_QUEUED_TRANSFERS {
+            return Err(StagingError::Capacity(
+                "transfer staging queue is full".into(),
+            ));
+        }
+        if self.has_queued_transfers_unlocked()? || !self.has_capacity(descriptor.total_bytes)? {
             fs::create_dir(&queued)?;
             fs::set_permissions(&queued, fs::Permissions::from_mode(TRANSFER_ROOT_MODE))?;
             self.write_descriptor(&queued, descriptor)?;
             write_attempt_owner(&queued, attempt_id)?;
+            let order = self.allocate_queue_order_unlocked()?;
+            self.write_queue_order(&queued, order)?;
+            File::open(&queued)?.sync_all()?;
             sync_parent(&queued)?;
+            self.advance_queue_unlocked(available_bytes)?;
+            if partial.exists() {
+                self.notify_capacity_change();
+                return self.resume_offsets(descriptor, &partial);
+            }
+            self.notify_capacity_change();
             return Ok(StagingStart::Queued);
         }
 
@@ -238,6 +298,7 @@ impl OpenCodeTransferStaging {
         sync_parent(&partial)?;
         write_attempt_owner(&partial, attempt_id)?;
         record_partial_activity(&partial, SystemTime::now())?;
+        self.notify_capacity_change();
         Ok(StagingStart::Started {
             next_sequence: 0,
             file_offsets: descriptor
@@ -373,6 +434,12 @@ impl OpenCodeTransferStaging {
                 READY_FILE_MODE,
             )?;
         }
+        self.write_ready_ownership_unlocked(
+            transfer_id,
+            attempt_id,
+            ReadyOwnershipState::Pending,
+            SystemTime::now(),
+        )?;
         match fs::remove_file(partial.join(PARTIAL_ACTIVITY_FILE)) {
             Ok(()) => File::open(&partial)?.sync_all()?,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -402,8 +469,47 @@ impl OpenCodeTransferStaging {
     }
 
     pub fn abort(&self, transfer_id: &str, attempt_id: &str) -> Result<(), StagingError> {
+        self.abort_with_references(transfer_id, attempt_id, &HashSet::new())
+    }
+
+    pub fn abort_with_references(
+        &self,
+        transfer_id: &str,
+        attempt_id: &str,
+        referenced_transfer_ids: &HashSet<String>,
+    ) -> Result<(), StagingError> {
         let _guard = self.lock.lock().expect("transfer staging lock poisoned");
         validate_attempt_id(attempt_id)?;
+        let ready = self.ready_path(transfer_id);
+        if ready.exists() {
+            // A finalized stage remains attempt-owned until the supervisor
+            // claims it together with registry preparation. Once claimed, or
+            // once a receipt marker exists, cancellation cannot remove it.
+            if self.release_marker_exists(transfer_id)?
+                || referenced_transfer_ids.contains(transfer_id)
+            {
+                return Ok(());
+            }
+            let Some(owner) = self.read_ready_ownership(transfer_id)? else {
+                return Ok(());
+            };
+            if owner.state == ReadyOwnershipState::Claimed || owner.attempt_id != attempt_id {
+                return Ok(());
+            }
+            let metadata = fs::symlink_metadata(&ready)?;
+            if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                return Err(StagingError::InvalidState(
+                    "aborted ready transfer is not a real directory".into(),
+                ));
+            }
+            make_writable_for_owner(&ready)?;
+            fs::remove_dir_all(&ready)?;
+            self.remove_ready_ownership(transfer_id)?;
+            File::open(&self.root)?.sync_all()?;
+            self.advance_queue_unlocked(self.available_space_bytes()?)?;
+            self.notify_capacity_change();
+            return Ok(());
+        }
         let paths = [
             self.partial_path(transfer_id),
             self.queued_path(transfer_id),
@@ -433,6 +539,8 @@ impl OpenCodeTransferStaging {
             }
         }
         File::open(&self.root)?.sync_all()?;
+        self.advance_queue_unlocked(self.available_space_bytes()?)?;
+        self.notify_capacity_change();
         Ok(())
     }
 
@@ -441,7 +549,12 @@ impl OpenCodeTransferStaging {
     /// receipt-bound release marker and registry reference checks below.
     pub fn reclaim_abandoned_partials(&self) -> Result<usize, StagingError> {
         let _guard = self.lock.lock().expect("transfer staging lock poisoned");
-        self.reclaim_stale_partials_unlocked(SystemTime::now())
+        let reclaimed = self.reclaim_stale_partials_unlocked(SystemTime::now())?;
+        if reclaimed > 0 {
+            self.advance_queue_unlocked(self.available_space_bytes()?)?;
+            self.notify_capacity_change();
+        }
+        Ok(reclaimed)
     }
 
     fn reclaim_stale_partials_unlocked(&self, now: SystemTime) -> Result<usize, StagingError> {
@@ -480,6 +593,204 @@ impl OpenCodeTransferStaging {
             }
             fs::set_permissions(&partial, fs::Permissions::from_mode(TRANSFER_ROOT_MODE))?;
             fs::remove_dir_all(&partial)?;
+            self.remove_orphan_ready_ownership_unlocked(&transfer_id)?;
+            reclaimed += 1;
+        }
+        if reclaimed > 0 {
+            File::open(&self.root)?.sync_all()?;
+        }
+        Ok(reclaimed)
+    }
+
+    /// Claim a finalized stage in the same supervisor critical section as
+    /// durable registry preparation. Matching pre-registration aborts and
+    /// expiry cleanup use this same staging lock.
+    pub fn mark_launch_registering(
+        &self,
+        descriptor: &OpenCodeTransferDescriptor,
+        attempt_id: &str,
+        already_referenced: bool,
+    ) -> Result<(), StagingError> {
+        let _guard = self.lock.lock().expect("transfer staging lock poisoned");
+        validate_attempt_id(attempt_id)?;
+        self.verify_ready_metadata_unlocked(descriptor)?;
+        match self.read_ready_ownership(&descriptor.transfer_id)? {
+            Some(mut owner)
+                if owner.state == ReadyOwnershipState::Pending
+                    || owner.state == ReadyOwnershipState::Registering =>
+            {
+                if !already_referenced && owner.attempt_id != attempt_id {
+                    return Err(StagingError::InvalidState(
+                        "ready stage is owned by a superseded transfer attempt".into(),
+                    ));
+                }
+                owner.state = if already_referenced {
+                    ReadyOwnershipState::Claimed
+                } else {
+                    ReadyOwnershipState::Registering
+                };
+                if already_referenced {
+                    owner.attempt_id = attempt_id.to_owned();
+                }
+                owner.updated_at_unix_ms = unix_millis(SystemTime::now());
+                self.write_ready_ownership(&descriptor.transfer_id, &owner)?;
+            }
+            Some(owner) if owner.state == ReadyOwnershipState::Claimed => {}
+            Some(_) => unreachable!("ready owner state is exhaustive"),
+            None => {
+                // A ready stage from an older supervisor build has no pending
+                // owner. Preserve it as claimed; only receipt cleanup may
+                // release it after this compatibility adoption.
+                self.write_ready_ownership(
+                    &descriptor.transfer_id,
+                    &ReadyOwnership {
+                        attempt_id: attempt_id.to_owned(),
+                        state: if already_referenced {
+                            ReadyOwnershipState::Claimed
+                        } else {
+                            ReadyOwnershipState::Registering
+                        },
+                        updated_at_unix_ms: unix_millis(SystemTime::now()),
+                    },
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    pub fn mark_launch_claimed(
+        &self,
+        descriptor: &OpenCodeTransferDescriptor,
+        attempt_id: &str,
+    ) -> Result<(), StagingError> {
+        let _guard = self.lock.lock().expect("transfer staging lock poisoned");
+        validate_attempt_id(attempt_id)?;
+        self.verify_ready_metadata_unlocked(descriptor)?;
+        match self.read_ready_ownership(&descriptor.transfer_id)? {
+            Some(owner) if owner.state == ReadyOwnershipState::Claimed => Ok(()),
+            Some(mut owner) => {
+                if owner.attempt_id != attempt_id {
+                    return Err(StagingError::InvalidState(
+                        "ready stage is owned by a superseded transfer attempt".into(),
+                    ));
+                }
+                owner.state = ReadyOwnershipState::Claimed;
+                owner.updated_at_unix_ms = unix_millis(SystemTime::now());
+                self.write_ready_ownership(&descriptor.transfer_id, &owner)
+            }
+            None => self.write_ready_ownership_unlocked(
+                &descriptor.transfer_id,
+                attempt_id,
+                ReadyOwnershipState::Claimed,
+                SystemTime::now(),
+            ),
+        }
+    }
+
+    /// Restore a failed registry preparation to its attempt-owned pending
+    /// state. The server holds the lifecycle lock and has confirmed no
+    /// registry reference exists before calling this method.
+    pub fn restore_unregistered_pending(
+        &self,
+        descriptor: &OpenCodeTransferDescriptor,
+        attempt_id: &str,
+    ) -> Result<(), StagingError> {
+        let _guard = self.lock.lock().expect("transfer staging lock poisoned");
+        validate_attempt_id(attempt_id)?;
+        let Some(mut owner) = self.read_ready_ownership(&descriptor.transfer_id)? else {
+            return Err(StagingError::InvalidState(
+                "ready stage lost its ownership marker during registry preparation".into(),
+            ));
+        };
+        if owner.state != ReadyOwnershipState::Registering || owner.attempt_id != attempt_id {
+            return Err(StagingError::InvalidState(
+                "ready stage registration claim was superseded".into(),
+            ));
+        }
+        owner.state = ReadyOwnershipState::Pending;
+        owner.updated_at_unix_ms = unix_millis(SystemTime::now());
+        self.write_ready_ownership(&descriptor.transfer_id, &owner)
+    }
+
+    /// Reclaim only stale pending ready bundles that are absent from the
+    /// synchronized registry snapshot and have no receipt-backed consumer.
+    /// Claimed/retryable bundles remain under the existing receipt/refcount
+    /// release protocol.
+    pub fn reclaim_abandoned_ready(
+        &self,
+        referenced_transfer_ids: &HashSet<String>,
+    ) -> Result<usize, StagingError> {
+        self.reclaim_abandoned_ready_at(referenced_transfer_ids, SystemTime::now())
+    }
+
+    fn reclaim_abandoned_ready_at(
+        &self,
+        referenced_transfer_ids: &HashSet<String>,
+        now: SystemTime,
+    ) -> Result<usize, StagingError> {
+        let _guard = self.lock.lock().expect("transfer staging lock poisoned");
+        let reclaimed = self.reclaim_abandoned_ready_unlocked(referenced_transfer_ids, now)?;
+        if reclaimed > 0 {
+            self.advance_queue_unlocked(self.available_space_bytes()?)?;
+            self.notify_capacity_change();
+        }
+        Ok(reclaimed)
+    }
+
+    fn reclaim_abandoned_ready_unlocked(
+        &self,
+        referenced_transfer_ids: &HashSet<String>,
+        now: SystemTime,
+    ) -> Result<usize, StagingError> {
+        let mut reclaimed = 0;
+        for entry in fs::read_dir(&self.root)? {
+            let entry = entry?;
+            let Some(transfer_id) = entry
+                .file_name()
+                .to_str()
+                .and_then(|name| name.strip_suffix(".ready"))
+                .map(str::to_owned)
+            else {
+                continue;
+            };
+            let ready = entry.path();
+            let metadata = fs::symlink_metadata(&ready)?;
+            if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                return Err(StagingError::InvalidState(
+                    "ready transfer is not a real directory".into(),
+                ));
+            }
+            if self.release_marker_exists(&transfer_id)?
+                || referenced_transfer_ids.contains(&transfer_id)
+            {
+                continue;
+            }
+            let Some(owner) = self.read_ready_ownership(&transfer_id)? else {
+                // Legacy ready stages without typed ownership fail closed.
+                continue;
+            };
+            if owner.state == ReadyOwnershipState::Claimed {
+                continue;
+            }
+            let Some(updated_at) =
+                SystemTime::UNIX_EPOCH.checked_add(Duration::from_millis(owner.updated_at_unix_ms))
+            else {
+                return Err(StagingError::Metadata(
+                    "ready ownership timestamp is outside the supported range".into(),
+                ));
+            };
+            if !now
+                .duration_since(updated_at)
+                .is_ok_and(|age| age >= ABANDONED_READY_AGE)
+            {
+                continue;
+            }
+
+            let descriptor = self.read_descriptor(&ready)?;
+            self.verify_ready_unlocked(&descriptor)?;
+            make_writable_for_owner(&ready)?;
+            fs::remove_dir_all(&ready)?;
+            self.remove_ready_ownership(&transfer_id)?;
             reclaimed += 1;
         }
         if reclaimed > 0 {
@@ -580,23 +891,104 @@ impl OpenCodeTransferStaging {
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
                 Err(error) => return Err(error.into()),
             }
+            self.remove_ready_ownership(transfer_id)?;
             fs::remove_file(marker)?;
             reclaimed += 1;
         }
         if reclaimed > 0 {
             File::open(&self.root)?.sync_all()?;
+            self.advance_queue_unlocked(self.available_space_bytes()?)?;
+            self.notify_capacity_change();
         }
         Ok(reclaimed)
+    }
+
+    pub(crate) async fn wait_for_capacity(
+        &self,
+        transfer_id: &str,
+        attempt_id: &str,
+    ) -> Result<StagingStart, StagingError> {
+        validate_attempt_id(attempt_id)?;
+        let mut changes = self.capacity_changed.subscribe();
+        loop {
+            let observed_generation = *changes.borrow();
+            if let Some(start) = self.poll_queued_transfer(transfer_id, attempt_id)? {
+                return Ok(start);
+            }
+            if *changes.borrow() == observed_generation {
+                changes.changed().await.map_err(|_| {
+                    StagingError::InvalidState(
+                        "staging capacity notifications are unavailable".into(),
+                    )
+                })?;
+            }
+        }
+    }
+
+    fn poll_queued_transfer(
+        &self,
+        transfer_id: &str,
+        attempt_id: &str,
+    ) -> Result<Option<StagingStart>, StagingError> {
+        let _guard = self.lock.lock().expect("transfer staging lock poisoned");
+        let available = self.available_space_bytes()?;
+        if self.advance_queue_unlocked(available)? > 0 {
+            self.notify_capacity_change();
+        }
+        let partial = self.partial_path(transfer_id);
+        if partial.is_dir() {
+            require_attempt_owner(&partial, attempt_id)?;
+            let descriptor = self.read_descriptor(&partial)?;
+            return self.resume_offsets(&descriptor, &partial).map(Some);
+        }
+        let queued = self.queued_path(transfer_id);
+        if queued.is_dir() {
+            require_attempt_owner(&queued, attempt_id)?;
+            return Ok(None);
+        }
+        let ready = self.ready_path(transfer_id);
+        if ready.is_dir() {
+            let Some(owner) = self.read_ready_ownership(transfer_id)? else {
+                return Err(StagingError::InvalidState(
+                    "queued transfer became ready without attempt ownership".into(),
+                ));
+            };
+            if owner.state == ReadyOwnershipState::Pending && owner.attempt_id != attempt_id {
+                return Err(StagingError::InvalidState(
+                    "queued transfer was superseded by another attempt".into(),
+                ));
+            }
+            let descriptor = self.read_descriptor(&ready)?;
+            return Ok(Some(StagingStart::Started {
+                next_sequence: total_chunks(&descriptor.files),
+                file_offsets: complete_offsets(&descriptor.files),
+            }));
+        }
+        Err(StagingError::InvalidState(
+            "queued transfer was cancelled or superseded".into(),
+        ))
     }
 
     fn verify_ready_unlocked(
         &self,
         descriptor: &OpenCodeTransferDescriptor,
     ) -> Result<PathBuf, StagingError> {
+        let path = self.verify_ready_metadata_unlocked(descriptor)?;
+        for file in &descriptor.files {
+            verify_file(&ready_file(&path, file.index), file)?;
+        }
+        Ok(path)
+    }
+
+    fn verify_ready_metadata_unlocked(
+        &self,
+        descriptor: &OpenCodeTransferDescriptor,
+    ) -> Result<PathBuf, StagingError> {
         let path = self.ready_path(&descriptor.transfer_id);
-        if !path.is_dir() {
+        let metadata = fs::symlink_metadata(&path)?;
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
             return Err(StagingError::InvalidState(
-                "transfer has not been finalized".into(),
+                "transfer has not been finalized into a real directory".into(),
             ));
         }
         ensure_same_descriptor(&self.read_descriptor(&path)?, descriptor)?;
@@ -605,9 +997,6 @@ impl OpenCodeTransferStaging {
             return Err(StagingError::InvalidState(
                 "ready marker does not match transfer digest".into(),
             ));
-        }
-        for file in &descriptor.files {
-            verify_file(&ready_file(&path, file.index), file)?;
         }
         Ok(path)
     }
@@ -681,6 +1070,329 @@ impl OpenCodeTransferStaging {
         Ok(next)
     }
 
+    fn has_queued_transfers_unlocked(&self) -> Result<bool, StagingError> {
+        Ok(self.queued_count_unlocked()? > 0)
+    }
+
+    fn queued_count_unlocked(&self) -> Result<usize, StagingError> {
+        let mut count = 0;
+        for entry in fs::read_dir(&self.root)? {
+            let entry = entry?;
+            if entry
+                .file_name()
+                .to_str()
+                .is_some_and(|name| name.ends_with(".queued"))
+            {
+                let metadata = fs::symlink_metadata(entry.path())?;
+                if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                    return Err(StagingError::InvalidState(
+                        "queued transfer is not a real directory".into(),
+                    ));
+                }
+                count += 1;
+            }
+        }
+        if count > MAX_QUEUED_TRANSFERS {
+            return Err(StagingError::InvalidState(
+                "transfer staging queue exceeds its configured bound".into(),
+            ));
+        }
+        Ok(count)
+    }
+
+    fn advance_queue_unlocked(&self, available_bytes: u64) -> Result<usize, StagingError> {
+        let mut queued = Vec::new();
+        for entry in fs::read_dir(&self.root)? {
+            let entry = entry?;
+            let Some(transfer_id) = entry
+                .file_name()
+                .to_str()
+                .and_then(|name| name.strip_suffix(".queued"))
+                .map(str::to_owned)
+            else {
+                continue;
+            };
+            let path = entry.path();
+            let metadata = fs::symlink_metadata(&path)?;
+            if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                return Err(StagingError::InvalidState(
+                    "queued transfer is not a real directory".into(),
+                ));
+            }
+            queued.push((self.read_queue_order_unlocked(&path)?, transfer_id, path));
+        }
+        queued.sort_by(|(left_order, left_id, _), (right_order, right_id, _)| {
+            left_order
+                .cmp(right_order)
+                .then_with(|| left_id.cmp(right_id))
+        });
+
+        let mut promoted = 0;
+        for (_, transfer_id, queued_path) in queued {
+            let descriptor = self.read_descriptor(&queued_path)?;
+            let _attempt_id = read_attempt_owner(&queued_path)?;
+            if descriptor.total_bytes > self.limits.max_bundle_bytes {
+                return Err(StagingError::Capacity(
+                    "queued bundle exceeds the configured per-bundle limit".into(),
+                ));
+            }
+            if available_bytes < descriptor.total_bytes
+                || !self.has_capacity(descriptor.total_bytes)?
+            {
+                // Strict FIFO avoids starvation: a smaller new transfer may
+                // not repeatedly jump ahead of this queued descriptor.
+                break;
+            }
+
+            let partial = self.partial_path(&transfer_id);
+            if partial.exists() {
+                return Err(StagingError::InvalidState(
+                    "queued transfer already has a partial stage".into(),
+                ));
+            }
+            fs::rename(&queued_path, &partial)?;
+            fs::set_permissions(&partial, fs::Permissions::from_mode(TRANSFER_ROOT_MODE))?;
+            let queue_order = partial.join(QUEUE_ORDER_FILE);
+            if queue_order.exists() {
+                let _ = self.read_queue_order_unlocked(&partial)?;
+                fs::remove_file(&queue_order)?;
+            }
+            self.create_partial_files(&partial, &descriptor)?;
+            record_partial_activity(&partial, SystemTime::now())?;
+            File::open(&partial)?.sync_all()?;
+            sync_parent(&partial)?;
+            promoted += 1;
+        }
+        Ok(promoted)
+    }
+
+    fn read_queue_order_unlocked(&self, path: &Path) -> Result<u64, StagingError> {
+        let order_path = path.join(QUEUE_ORDER_FILE);
+        match fs::symlink_metadata(&order_path) {
+            Ok(metadata) => {
+                if metadata.file_type().is_symlink() || !metadata.is_file() || metadata.len() > 64 {
+                    return Err(StagingError::InvalidState(
+                        "queue order marker is not a bounded regular file".into(),
+                    ));
+                }
+                let metadata: QueueMetadata = serde_json::from_slice(&fs::read(order_path)?)
+                    .map_err(|error| StagingError::Metadata(error.to_string()))?;
+                Ok(metadata.order)
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                // A crash during queue creation can leave the fully validated
+                // descriptor and owner without an order marker. Assign a
+                // durable tail position before the supervisor acknowledges or
+                // promotes that entry.
+                let order = self.allocate_queue_order_unlocked()?;
+                self.write_queue_order(path, order)?;
+                Ok(order)
+            }
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    fn ensure_queue_order_unlocked(&self, path: &Path) -> Result<(), StagingError> {
+        self.read_queue_order_unlocked(path).map(|_| ())
+    }
+
+    fn write_queue_order(&self, path: &Path, order: u64) -> Result<(), StagingError> {
+        let bytes = serde_json::to_vec(&QueueMetadata { order })
+            .map_err(|error| StagingError::Metadata(error.to_string()))?;
+        write_atomic(&path.join(QUEUE_ORDER_FILE), &bytes, PRIVATE_FILE_MODE)?;
+        Ok(())
+    }
+
+    fn allocate_queue_order_unlocked(&self) -> Result<u64, StagingError> {
+        let path = self.root.join(QUEUE_SEQUENCE_FILE);
+        let next_order = match fs::symlink_metadata(&path) {
+            Ok(metadata) => {
+                if metadata.file_type().is_symlink() || !metadata.is_file() || metadata.len() > 64 {
+                    return Err(StagingError::InvalidState(
+                        "queue sequence is not a bounded regular file".into(),
+                    ));
+                }
+                let sequence: QueueSequence = serde_json::from_slice(&fs::read(&path)?)
+                    .map_err(|error| StagingError::Metadata(error.to_string()))?;
+                sequence.next_order
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let mut highest = 0_u64;
+                for entry in fs::read_dir(&self.root)? {
+                    let entry = entry?;
+                    let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+                        continue;
+                    };
+                    if !name.ends_with(".queued") {
+                        continue;
+                    }
+                    let queued = entry.path();
+                    let order_path = queued.join(QUEUE_ORDER_FILE);
+                    match fs::symlink_metadata(&order_path) {
+                        Ok(metadata)
+                            if !metadata.file_type().is_symlink()
+                                && metadata.is_file()
+                                && metadata.len() <= 64 =>
+                        {
+                            let metadata: QueueMetadata =
+                                serde_json::from_slice(&fs::read(order_path)?)
+                                    .map_err(|error| StagingError::Metadata(error.to_string()))?;
+                            highest = highest.max(metadata.order.saturating_add(1));
+                        }
+                        Ok(_) => {
+                            return Err(StagingError::InvalidState(
+                                "queue order marker is not a bounded regular file".into(),
+                            ));
+                        }
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                        Err(error) => return Err(error.into()),
+                    }
+                }
+                highest.max(1)
+            }
+            Err(error) => return Err(error.into()),
+        };
+        let next = next_order.checked_add(1).ok_or_else(|| {
+            StagingError::Capacity("transfer queue order space is exhausted".into())
+        })?;
+        let bytes = serde_json::to_vec(&QueueSequence { next_order: next })
+            .map_err(|error| StagingError::Metadata(error.to_string()))?;
+        write_atomic(&path, &bytes, PRIVATE_FILE_MODE)?;
+        Ok(next_order)
+    }
+
+    fn write_ready_ownership_unlocked(
+        &self,
+        transfer_id: &str,
+        attempt_id: &str,
+        state: ReadyOwnershipState,
+        updated_at: SystemTime,
+    ) -> Result<(), StagingError> {
+        validate_attempt_id(attempt_id)?;
+        self.write_ready_ownership(
+            transfer_id,
+            &ReadyOwnership {
+                attempt_id: attempt_id.to_owned(),
+                state,
+                updated_at_unix_ms: unix_millis(updated_at),
+            },
+        )
+    }
+
+    fn write_ready_ownership(
+        &self,
+        transfer_id: &str,
+        owner: &ReadyOwnership,
+    ) -> Result<(), StagingError> {
+        let bytes =
+            serde_json::to_vec(owner).map_err(|error| StagingError::Metadata(error.to_string()))?;
+        write_atomic(
+            &self.ready_ownership_path(transfer_id),
+            &bytes,
+            PRIVATE_FILE_MODE,
+        )?;
+        Ok(())
+    }
+
+    fn read_ready_ownership(
+        &self,
+        transfer_id: &str,
+    ) -> Result<Option<ReadyOwnership>, StagingError> {
+        let path = self.ready_ownership_path(transfer_id);
+        match fs::symlink_metadata(&path) {
+            Ok(metadata) => {
+                if metadata.file_type().is_symlink() || !metadata.is_file() || metadata.len() > 256
+                {
+                    return Err(StagingError::InvalidState(
+                        "ready ownership marker is not a bounded regular file".into(),
+                    ));
+                }
+                let owner: ReadyOwnership = serde_json::from_slice(&fs::read(path)?)
+                    .map_err(|error| StagingError::Metadata(error.to_string()))?;
+                validate_attempt_id(&owner.attempt_id)?;
+                Ok(Some(owner))
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    fn adopt_unclaimed_ready_unlocked(
+        &self,
+        transfer_id: &str,
+        attempt_id: &str,
+    ) -> Result<(), StagingError> {
+        match self.read_ready_ownership(transfer_id)? {
+            Some(mut owner) if owner.state == ReadyOwnershipState::Pending => {
+                owner.attempt_id = attempt_id.to_owned();
+                owner.updated_at_unix_ms = unix_millis(SystemTime::now());
+                self.write_ready_ownership(transfer_id, &owner)
+            }
+            Some(owner)
+                if owner.state == ReadyOwnershipState::Registering
+                    && owner.attempt_id != attempt_id =>
+            {
+                Err(StagingError::InvalidState(
+                    "ready stage registration is owned by another transfer attempt".into(),
+                ))
+            }
+            Some(mut owner) if owner.state == ReadyOwnershipState::Registering => {
+                owner.updated_at_unix_ms = unix_millis(SystemTime::now());
+                self.write_ready_ownership(transfer_id, &owner)
+            }
+            Some(_) => Ok(()),
+            None => self.write_ready_ownership_unlocked(
+                transfer_id,
+                attempt_id,
+                ReadyOwnershipState::Pending,
+                SystemTime::now(),
+            ),
+        }
+    }
+
+    fn remove_ready_ownership(&self, transfer_id: &str) -> Result<(), StagingError> {
+        let path = self.ready_ownership_path(transfer_id);
+        match fs::symlink_metadata(&path) {
+            Ok(metadata) => {
+                if metadata.file_type().is_symlink() || !metadata.is_file() {
+                    return Err(StagingError::InvalidState(
+                        "ready ownership marker is not a regular file".into(),
+                    ));
+                }
+                fs::remove_file(path)?;
+                Ok(())
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    fn remove_orphan_ready_ownership_unlocked(
+        &self,
+        transfer_id: &str,
+    ) -> Result<(), StagingError> {
+        if self.ready_path(transfer_id).exists() || self.partial_path(transfer_id).exists() {
+            return Ok(());
+        }
+        self.remove_ready_ownership(transfer_id)
+    }
+
+    fn release_marker_exists(&self, transfer_id: &str) -> Result<bool, StagingError> {
+        match fs::symlink_metadata(self.release_marker_path(transfer_id)) {
+            Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => Err(
+                StagingError::InvalidState("transfer release marker is not a regular file".into()),
+            ),
+            Ok(_) => Ok(true),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    fn notify_capacity_change(&self) {
+        self.capacity_changed
+            .send_modify(|generation| *generation = generation.saturating_add(1));
+    }
+
     fn has_capacity(&self, incoming: u64) -> Result<bool, StagingError> {
         let mut reserved = 0_u64;
         for entry in fs::read_dir(&self.root)? {
@@ -713,6 +1425,11 @@ impl OpenCodeTransferStaging {
         requested: &OpenCodeTransferDescriptor,
     ) -> Result<OpenCodeTransferDescriptor, StagingError> {
         fs::set_permissions(path, fs::Permissions::from_mode(TRANSFER_ROOT_MODE))?;
+        let queue_order_path = path.join(QUEUE_ORDER_FILE);
+        if queue_order_path.exists() {
+            let _ = self.read_queue_order_unlocked(path)?;
+            fs::remove_file(queue_order_path)?;
+        }
         for entry in fs::read_dir(path)? {
             let entry = entry?;
             let name = entry.file_name();
@@ -834,6 +1551,10 @@ impl OpenCodeTransferStaging {
         self.root.join(format!("{transfer_id}.ready"))
     }
 
+    fn ready_ownership_path(&self, transfer_id: &str) -> PathBuf {
+        self.root.join(format!("{transfer_id}.owner"))
+    }
+
     fn release_marker_path(&self, transfer_id: &str) -> PathBuf {
         self.root.join(format!("{transfer_id}.releasable"))
     }
@@ -875,6 +1596,13 @@ fn validate_attempt_id(attempt_id: &str) -> Result<(), StagingError> {
         ));
     }
     Ok(())
+}
+
+fn unix_millis(time: SystemTime) -> u64 {
+    time.duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .min(u64::MAX as u128) as u64
 }
 
 fn read_attempt_owner(path: &Path) -> Result<String, StagingError> {
