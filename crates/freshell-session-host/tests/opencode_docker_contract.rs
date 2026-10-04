@@ -209,7 +209,8 @@ fn create_synthetic_bundle(
     descriptor.validate().unwrap();
 
     let staging = OpenCodeTransferStaging::new(staging_root, StagingLimits::production()).unwrap();
-    staging.begin(&descriptor, u64::MAX).unwrap();
+    let attempt_id = "dddddddddddddddddddddddddddddddd";
+    staging.begin(&descriptor, attempt_id, u64::MAX).unwrap();
     for (sequence, bytes) in payload_bytes
         .chunks(MAX_OPENCODE_TRANSFER_CHUNK_BYTES)
         .enumerate()
@@ -218,6 +219,7 @@ fn create_synthetic_bundle(
         staging
             .write_chunk(&OpenCodeTransferChunk {
                 transfer_id: descriptor.transfer_id.clone(),
+                attempt_id: attempt_id.into(),
                 sequence: sequence as u64,
                 file_index: 0,
                 offset: offset as u64,
@@ -226,7 +228,9 @@ fn create_synthetic_bundle(
             })
             .unwrap();
     }
-    let ready = staging.finalize(&descriptor.transfer_id).unwrap();
+    let ready = staging
+        .finalize(&descriptor.transfer_id, attempt_id)
+        .unwrap();
     assert_eq!(
         freshell_agent_runtime::opencode_transfer::verify_staged_bundle(&descriptor, &ready)
             .unwrap(),
