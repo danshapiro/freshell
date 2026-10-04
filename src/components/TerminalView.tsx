@@ -36,6 +36,7 @@ import {
 import { retryManagedConversation } from '@/lib/managed-runtime-retry'
 import { confirmManagedRuntimeStopped } from '@/lib/managed-runtime-stop'
 import { isManagedRuntimeRecoveryDecision, ManagedRuntimeRecoveryCard } from '@/components/ManagedRuntimeRecoveryCard'
+import { isManagedRuntimeRecoveryPending } from '@/lib/managed-runtime-recovery-message'
 import { buildReconcileRequestForPanes, foldVerdicts } from '@/lib/pane-reconcile'
 import type { PaneReconcileRequest, SessionRuntimeOwnerMessage } from '@shared/ws-protocol'
 import {
@@ -4161,7 +4162,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
     }
 
     const sendCreate = (requestId: string) => {
-      if (isManagedRuntimeRecoveryDecision(contentRef.current?.recoverySummary)) return
+      if (isManagedRuntimeRecoveryPending(contentRef.current?.recoverySummary)) return
       // Reconcile verdict precedence (Task 12): a folded respawn verdict's
       // server-named sessionRef WINS over any other inference (restore flag,
       // fresh-recovery intent); a folded fresh verdict omits resume identity
@@ -4292,6 +4293,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
     }
 
     const scheduleCreateRetry = (requestId: string, kind: 'rate-limit' | 'launch') => {
+      if (isManagedRuntimeRecoveryPending(contentRef.current?.recoverySummary)) return true
       const retryState = rateLimitRetryRef.current
       if (retryState.count >= RATE_LIMIT_RETRY_MAX_ATTEMPTS) return false
       retryState.count += 1
@@ -4440,7 +4442,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
         restore: boolean,
         deadTerminalId: string | undefined,
       ): boolean => {
-        if (isManagedRuntimeRecoveryDecision(contentRef.current?.recoverySummary)) return true
+        if (isManagedRuntimeRecoveryPending(contentRef.current?.recoverySummary)) return true
         const reqId = requestIdRef.current
         if (!reqId) return false
         if (restore) addTerminalRestoreRequestId(reqId)
@@ -4478,7 +4480,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
       // error card for a standoff, never a silent wedge, never a duplicate
       // (the reconcile verdict is folded, not blindly re-created).
       const resolveReserveExhaustionViaReconcile = () => {
-        if (isManagedRuntimeRecoveryDecision(contentRef.current?.recoverySummary)) return
+        if (isManagedRuntimeRecoveryPending(contentRef.current?.recoverySummary)) return
         resetReconcileRedrive()
         const request = buildReconcileRequestForPanes(appStore.getState(), [
           { tabId, paneId: paneIdRef.current },
@@ -4494,7 +4496,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
       }
 
       const redriveAfterSessionReserved = (requestId: string, retryAfterMs?: number) => {
-        if (isManagedRuntimeRecoveryDecision(contentRef.current?.recoverySummary)) return
+        if (isManagedRuntimeRecoveryPending(contentRef.current?.recoverySummary)) return
         const redriveState = reconcileRedriveRef.current
         const now = Date.now()
         if (redriveState.reserveWindowStart === null) {
@@ -4513,7 +4515,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
           redriveState.timer = null
           if (requestIdRef.current !== requestId) return
           if (terminalIdRef.current) return // anchored meanwhile
-          if (isManagedRuntimeRecoveryDecision(contentRef.current?.recoverySummary)) return
+          if (isManagedRuntimeRecoveryPending(contentRef.current?.recoverySummary)) return
           // Re-send the SAME terminal.create — createRequestId is NEVER
           // re-minted (council rule 2).
           sendCreate(requestId)
@@ -4527,6 +4529,19 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
         foldRefusalFencePair(dispatch, appStore.getState(), contentRef.current ?? {}, refusal)
       }
 
+      const clearRejectedAttach = () => {
+        clearQuarantineRepair()
+        currentAttachRef.current = null
+        pacedReplayRef.current = null
+        deferredAttachStateRef.current = {
+          mode: 'none',
+          pendingIntent: null,
+          pendingSinceSeq: 0,
+          pendingReason: 'initial_hydrate',
+        }
+        setIsAttaching(false)
+      }
+
       // b8ke fence-heal (Task 7 follow-up): the recovery-create lane shared
       // by the INVALID_TERMINAL_ID reconnect recovery (focused review 1
       // removed the pane-terminal-scoped refused-arm routing — a refused
@@ -4537,7 +4552,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
       // let the lifecycle effect's createRequestId dependency re-fire the
       // resume create.
       const resumeRecoveryCreate = (deadTerminalId?: string) => {
-        if (isManagedRuntimeRecoveryDecision(contentRef.current?.recoverySummary)) return
+        if (isManagedRuntimeRecoveryPending(contentRef.current?.recoverySummary)) return
         writeLocalXtermNotice(term, '\r\n[Reconnecting...]\r\n')
         const newRequestId = nanoid()
         if (debugRef.current) log.debug('[TRACE resumeSessionId] recovery-create', {
@@ -4583,7 +4598,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
       // points at. Pump bounded same-requestId re-creates instead of minting a
       // fresh recovery identity for a pane that never finished launching.
       const redriveAfterLaunchInvalidTerminal = (deadTerminalId: string | undefined): boolean => {
-        if (isManagedRuntimeRecoveryDecision(contentRef.current?.recoverySummary)) return true
+        if (isManagedRuntimeRecoveryPending(contentRef.current?.recoverySummary)) return true
         const requestId = requestIdRef.current
         if (!requestId) return false
         const redriveState = reconcileRedriveRef.current
@@ -4616,7 +4631,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
         const attempt = () => {
           if (requestIdRef.current !== requestId) return
           if (terminalIdRef.current) return // anchored — stop the pump
-          if (isManagedRuntimeRecoveryDecision(contentRef.current?.recoverySummary)) return
+          if (isManagedRuntimeRecoveryPending(contentRef.current?.recoverySummary)) return
           if (redriveState.invalidAttempts >= INVALID_TERMINAL_LAUNCH_RETRY_MAX_ATTEMPTS) {
             failLaunch('The server no longer knows this terminal and recreating it kept failing.', true)
             return
@@ -6501,6 +6516,17 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
             }
             return
           }
+          // The supervisor owns managed recovery. A rejected old attach is
+          // transport evidence, never permission to replace the conversation.
+          if (isManagedRuntimeRecoveryPending(current?.recoverySummary)) {
+            log.debug('Managed runtime retains a rejected terminal target during recovery', {
+              event: 'terminal.managed_recovery_attach_rejected', terminalId: currentTerminalId,
+              paneId: paneIdRef.current, requestId: msg.requestId, recoveryState: current?.recoverySummary?.recoveryState,
+            })
+            clearRateLimitRetry()
+            clearRejectedAttach()
+            return
+          }
           const failedDuringLaunch = Boolean(
             launchAttempt
             && currentTerminalId
@@ -6568,16 +6594,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
                 // reconcile result may confirm the same persisted identity,
                 // so the pending-window close must retry the attach instead
                 // of treating this rejected generation as still in flight.
-                clearQuarantineRepair()
-                currentAttachRef.current = null
-                pacedReplayRef.current = null
-                deferredAttachStateRef.current = {
-                  mode: 'none',
-                  pendingIntent: null,
-                  pendingSinceSeq: 0,
-                  pendingReason: 'initial_hydrate',
-                }
-                setIsAttaching(false)
+                clearRejectedAttach()
               }
               return
             }
@@ -7195,7 +7212,9 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
   // Keep recovery diagnostics in state, but show only actionable failures.
   const visibleNotice = managedTerminal ? null : activeNotice
   const visibleCrashTrace = managedTerminal ? null : terminalContent.crashTrace
-  const showBlockingSpinner = terminalContent.status === 'creating' && !hasFatalConnectionError
+  const showBlockingSpinner = terminalContent.status === 'creating'
+    && !isManagedRuntimeRecoveryPending(terminalContent.recoverySummary)
+    && !hasFatalConnectionError
   const showInlineOfflineStatus = connectionStatus !== 'ready' && !hasFatalConnectionError
   const showInlineRecoveringStatus = !managedTerminal && connectionStatus === 'ready' && isAttaching && terminalContent.status !== 'creating' && !wasCreatedFreshRef.current
   const inlineStatusMessage = showInlineOfflineStatus

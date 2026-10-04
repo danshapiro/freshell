@@ -75,7 +75,7 @@ async function installPane(page: Page, kind: PaneKind, recoveryState: RecoverySt
     // Terminal decision tests leave the real lifecycle effect enabled: its
     // production managed-recovery guard must stop creates and attaches.
     harness.setFreshAgentNetworkEffectsSuppressed(paneId, true)
-    harness.setTerminalNetworkEffectsSuppressed(paneId, summary.recoveryState === 'live' || summary.recoveryState === 'recovering')
+    harness.setTerminalNetworkEffectsSuppressed(paneId, summary.recoveryState === 'live')
     if (kind === 'fresh-agent' && staleStatus) {
       const locator = { sessionType: 'freshcodex', provider: 'codex', sessionId }
       harness.dispatch({ type: 'freshAgent/sessionInit', payload: locator })
@@ -244,6 +244,96 @@ async function changeRecoveryState(page: Page, recoveryState: RecoveryState) {
     } })
   }, recoverySummary(recoveryState))
 }
+
+for (const savedIdentity of [false, true]) {
+  for (const status of ['running', 'creating'] as const) {
+    test(`terminal: real rejected attach during automatic recovery retains identity (saved reference ${savedIdentity}, stale ${status})`, async ({ freshellPage, page, terminal, harness }) => {
+      await terminal.waitForTerminal()
+      const original = await paneContent(page)
+      if (original.kind !== 'terminal' || !original.terminalId) throw new Error('Expected a live fixture terminal')
+      const invalidTerminalId = `missing-automatic-${original.terminalId}`
+      await page.evaluate(({ invalidTerminalId, savedIdentity, status, summary, sessionId, soulId }) => {
+        const rig = window.__FRESHELL_TEST_HARNESS__!
+        const state = rig.getState()
+        const tabId = state.tabs.activeTabId!
+        const root = state.panes.layouts[tabId]
+        if (root.type !== 'leaf' || root.content.kind !== 'terminal') throw new Error('Expected a terminal')
+        rig.setTerminalNetworkEffectsSuppressed(root.id, false)
+        rig.clearSentWsMessages?.()
+        rig.dispatch({ type: 'panes/updatePaneContent', payload: { tabId, paneId: root.id, content: {
+          ...root.content, terminalId: invalidTerminalId, mode: 'codex', status,
+          soulId, soulIntentRevision: 19, recoverySummary: summary,
+          sessionRef: savedIdentity ? { provider: 'codex', sessionId } : undefined,
+          resumeSessionId: savedIdentity ? sessionId : undefined,
+        } } })
+      }, { invalidTerminalId, savedIdentity, status, summary: recoverySummary('recovering'), sessionId: SESSION_ID, soulId: SOUL_ID })
+      await expect.poll(async () => (await harness.getReceivedWsMessages() as Array<{ code?: string; terminalId?: string }>).some(
+        (frame) => frame.code === 'INVALID_TERMINAL_ID' && frame.terminalId === invalidTerminalId,
+      )).toBe(true)
+      const sent = await harness.getSentWsMessages() as Array<{ type?: string; terminalId?: string; attachRequestId?: string }>
+      const rejected = sent.find((frame) => frame.type === 'terminal.attach' && frame.terminalId === invalidTerminalId)
+      expect(rejected?.attachRequestId).toEqual(expect.any(String))
+      const received = await harness.getReceivedWsMessages() as Array<{ code?: string; requestId?: string; terminalId?: string }>
+      expect(received).toContainEqual(expect.objectContaining({ code: 'INVALID_TERMINAL_ID', terminalId: invalidTerminalId,
+        requestId: rejected!.attachRequestId }))
+      expect(sent.filter((frame) => frame.type === 'terminal.create')).toEqual([])
+      expect(await paneContent(page)).toMatchObject({ terminalId: invalidTerminalId,
+        createRequestId: original.createRequestId, soulId: SOUL_ID })
+      expect((await paneContent(page)).sessionRef).toEqual(savedIdentity ? { provider: 'codex', sessionId: SESSION_ID } : undefined)
+      expect(await terminal.getVisibleText()).not.toMatch(/Reconnecting|Starting a new terminal/)
+      await expect(page.getByTestId('managed-runtime-recovery-card')).toBeHidden()
+      await expect(page.getByText('Starting terminal...', { exact: true })).toBeHidden()
+      // The managed replacement frame rebinds to an owned live terminal, whose attach/stream is real.
+      await harness.receiveWsMessage({ type: 'terminal.replaced', oldTerminalId: invalidTerminalId,
+        newTerminalId: original.terminalId, exitCode: 137, attempt: 1, maxAttempts: 3 })
+      await changeRecoveryState(page, 'live')
+      await expect.poll(() => paneContent(page)).toMatchObject({ terminalId: original.terminalId,
+        createRequestId: original.createRequestId, soulId: SOUL_ID })
+      let replacementAttach: { attachRequestId?: string } | undefined
+      await expect.poll(async () => {
+        replacementAttach = (await harness.getSentWsMessages() as Array<{ type?: string; terminalId?: string; attachRequestId?: string }>).find(
+          (frame) => frame.type === 'terminal.attach' && frame.terminalId === original.terminalId,
+        )
+        return replacementAttach?.attachRequestId
+      }).toEqual(expect.any(String))
+      await expect.poll(async () => (await harness.getReceivedWsMessages() as Array<{ type?: string; terminalId?: string; attachRequestId?: string }>).some(
+        (frame) => frame.type === 'terminal.attach.ready' && frame.terminalId === original.terminalId
+          && frame.attachRequestId === replacementAttach!.attachRequestId,
+      )).toBe(true)
+      await terminal.executeCommandInserted("printf 'AUTOMATIC_%s\\n' 'RECOVERY_RETAINED_OUTPUT'")
+      await terminal.waitForOutput('AUTOMATIC_RECOVERY_RETAINED_OUTPUT', { terminalId: original.terminalId })
+      expect((await paneContent(page)).sessionRef).toEqual(savedIdentity ? { provider: 'codex', sessionId: SESSION_ID } : undefined)
+      expect(await terminal.getVisibleText(original.terminalId)).not.toMatch(/Reconnecting|Starting a new terminal/)
+    })
+  }
+}
+
+test('fresh-agent: automatic recovery reads actual saved Codex history without changing the conversation', async ({ freshellPage, page, terminal, harness, serverInfo }) => {
+  await terminal.waitForTerminal()
+  const sessions = path.join(serverInfo.homeDir, '.codex', 'sessions', '2026', '03', '01')
+  await fs.mkdir(sessions, { recursive: true })
+  const events = await fs.readFile('test/fixtures/coding-cli/codex/task-events.sanitized.jsonl', 'utf8')
+  const transcript = events.replace('session-activity', SESSION_ID).replace('Sanitized completion', SAVED_HISTORY_TEXT)
+  const rollout = path.join(sessions, `rollout-${SESSION_ID}.jsonl`)
+  await fs.writeFile(rollout, transcript)
+  const historyRead = page.waitForResponse('**/api/fresh-agent/threads/**')
+  await installPane(page, 'fresh-agent', 'recovering', true)
+  const response = await historyRead
+  expect(response.request().method()).toBe('GET')
+  expect(response.status()).toBe(200)
+  expect((await response.json()).extensions.codex.nativeHistoryAvailable).toBe(true)
+  await expect(page.getByText('Sanitized prompt', { exact: true })).toBeVisible()
+  await expect(page.getByText(SAVED_HISTORY_TEXT, { exact: true })).toBeVisible()
+  const content = await paneContent(page)
+  expect(content).toMatchObject({ sessionId: SESSION_ID, sessionRef: { provider: 'codex', sessionId: SESSION_ID },
+    resumeSessionId: SESSION_ID, createRequestId: CREATE_REQUEST_ID, recoverySummary: { recoveryState: 'recovering' } })
+  await expect(page.getByTestId('managed-runtime-recovery-card')).toBeHidden()
+  await expect(page.getByText('Restoring session...', { exact: true })).toBeHidden()
+  await expect(page.getByText('Close failed: Previous close was not confirmed', { exact: true })).toBeVisible()
+  const messages = await harness.getSentWsMessages() as Array<{ type?: string }>
+  expect(messages.filter((frame) => ['freshAgent.create', 'freshAgent.attach', 'pane.reconcile.request'].includes(frame.type ?? ''))).toEqual([])
+  expect(await fs.readFile(rollout, 'utf8')).toBe(transcript)
+})
 
 test('managed terminal status and replacement events keep automatic recovery invisible', async ({ freshellPage, page, terminal, harness, serverInfo }) => {
   await terminal.waitForTerminal()
