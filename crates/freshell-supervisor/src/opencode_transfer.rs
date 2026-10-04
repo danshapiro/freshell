@@ -17,12 +17,18 @@ use std::{
     os::unix::fs::{OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
     sync::Mutex,
+    time::{Duration, SystemTime},
 };
 
 const TRANSFER_ROOT_MODE: u32 = 0o700;
 const PRIVATE_FILE_MODE: u32 = 0o600;
 const READY_FILE_MODE: u32 = 0o400;
 const READY_DIR_MODE: u32 = 0o500;
+const PARTIAL_ACTIVITY_FILE: &str = ".activity";
+/// A partial transfer with no durable progress for an hour is abandoned.
+/// Normal retries resume it before this lease expires; failed live requests
+/// also send Abort, leaving this as the process-crash fallback.
+const ABANDONED_PARTIAL_AGE: Duration = Duration::from_secs(60 * 60);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StagingLimits {
@@ -144,6 +150,7 @@ impl OpenCodeTransferStaging {
                 "bundle exceeds the configured per-bundle limit".into(),
             ));
         }
+        self.reclaim_stale_partials_unlocked(SystemTime::now())?;
         let partial = self.partial_path(&descriptor.transfer_id);
         let queued = self.queued_path(&descriptor.transfer_id);
         let ready = self.ready_path(&descriptor.transfer_id);
@@ -186,7 +193,9 @@ impl OpenCodeTransferStaging {
                     ));
                 }
             }
-            return self.resume_offsets(descriptor, &partial);
+            let resumed = self.resume_offsets(descriptor, &partial)?;
+            record_partial_activity(&partial, SystemTime::now())?;
+            return Ok(resumed);
         }
 
         if available_bytes < descriptor.total_bytes {
@@ -218,6 +227,7 @@ impl OpenCodeTransferStaging {
         }
         File::open(&partial)?.sync_all()?;
         sync_parent(&partial)?;
+        record_partial_activity(&partial, SystemTime::now())?;
         Ok(StagingStart::Started {
             next_sequence: 0,
             file_offsets: descriptor
@@ -268,6 +278,7 @@ impl OpenCodeTransferStaging {
                     "retried chunk conflicts with durable staged bytes".into(),
                 ));
             }
+            record_partial_activity(&partial, SystemTime::now())?;
             return Ok(());
         }
         if chunk.sequence != next_sequence {
@@ -284,6 +295,7 @@ impl OpenCodeTransferStaging {
         output.write_all(&chunk.data)?;
         output.sync_all()?;
         sync_parent(&path)?;
+        record_partial_activity(&partial, SystemTime::now())?;
         Ok(())
     }
 
@@ -348,6 +360,11 @@ impl OpenCodeTransferStaging {
                 READY_FILE_MODE,
             )?;
         }
+        match fs::remove_file(partial.join(PARTIAL_ACTIVITY_FILE)) {
+            Ok(()) => File::open(&partial)?.sync_all()?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
         File::open(&partial)?.sync_all()?;
         fs::set_permissions(&partial, fs::Permissions::from_mode(READY_DIR_MODE))?;
         File::open(&partial)?.sync_all()?;
@@ -371,15 +388,75 @@ impl OpenCodeTransferStaging {
         for path in [
             self.partial_path(transfer_id),
             self.queued_path(transfer_id),
-            self.ready_path(transfer_id),
         ] {
-            if path.exists() {
-                make_writable_for_owner(&path)?;
-                fs::remove_dir_all(path)?;
+            match fs::symlink_metadata(&path) {
+                Ok(metadata) => {
+                    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                        return Err(StagingError::InvalidState(
+                            "aborted transfer is not a real directory".into(),
+                        ));
+                    }
+                    fs::set_permissions(&path, fs::Permissions::from_mode(TRANSFER_ROOT_MODE))?;
+                    fs::remove_dir_all(path)?;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
             }
         }
-        sync_parent(&self.root)?;
+        File::open(&self.root)?.sync_all()?;
         Ok(())
+    }
+
+    /// Reclaim only partial transfers whose durable activity lease expired.
+    /// Ready bundles are intentionally excluded: they remain governed by the
+    /// receipt-bound release marker and registry reference checks below.
+    pub fn reclaim_abandoned_partials(&self) -> Result<usize, StagingError> {
+        let _guard = self.lock.lock().expect("transfer staging lock poisoned");
+        self.reclaim_stale_partials_unlocked(SystemTime::now())
+    }
+
+    fn reclaim_stale_partials_unlocked(&self, now: SystemTime) -> Result<usize, StagingError> {
+        let mut reclaimed = 0;
+        for entry in fs::read_dir(&self.root)? {
+            let entry = entry?;
+            let Some(transfer_id) = entry
+                .file_name()
+                .to_str()
+                .and_then(|name| name.strip_suffix(".partial"))
+                .map(str::to_owned)
+            else {
+                continue;
+            };
+            let partial = entry.path();
+            let metadata = fs::symlink_metadata(&partial)?;
+            if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                return Err(StagingError::InvalidState(
+                    "partial transfer is not a real directory".into(),
+                ));
+            }
+            // A receipt marker is never expected for a partial, but if the
+            // finalization/release boundary is interrupted, fail closed and
+            // leave that transfer to the receipt-aware cleanup path.
+            match fs::symlink_metadata(self.release_marker_path(&transfer_id)) {
+                Ok(_) => continue,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
+            let last_activity = partial_last_activity(&partial)?;
+            let stale = now
+                .duration_since(last_activity)
+                .is_ok_and(|age| age >= ABANDONED_PARTIAL_AGE);
+            if !stale {
+                continue;
+            }
+            fs::set_permissions(&partial, fs::Permissions::from_mode(TRANSFER_ROOT_MODE))?;
+            fs::remove_dir_all(&partial)?;
+            reclaimed += 1;
+        }
+        if reclaimed > 0 {
+            File::open(&self.root)?.sync_all()?;
+        }
+        Ok(reclaimed)
     }
 
     /// Persist a supervisor-owned release marker after the session host has
@@ -629,7 +706,10 @@ impl OpenCodeTransferStaging {
                 let entry = entry?;
                 let name = entry.file_name();
                 let name = name.to_string_lossy();
-                if name != "descriptor.json" && !name.ends_with(".part") && !name.ends_with(".bin")
+                if name != "descriptor.json"
+                    && name != PARTIAL_ACTIVITY_FILE
+                    && !name.ends_with(".part")
+                    && !name.ends_with(".bin")
                 {
                     return Err(StagingError::InvalidState(
                         "incomplete staging directory contains an unknown entry".into(),
@@ -720,6 +800,62 @@ impl OpenCodeTransferStaging {
     fn release_marker_path(&self, transfer_id: &str) -> PathBuf {
         self.root.join(format!("{transfer_id}.releasable"))
     }
+}
+
+fn record_partial_activity(path: &Path, at: SystemTime) -> Result<(), StagingError> {
+    let activity = path.join(PARTIAL_ACTIVITY_FILE);
+    let existing = match fs::symlink_metadata(&activity) {
+        Ok(metadata) => {
+            if metadata.file_type().is_symlink() || !metadata.is_file() {
+                return Err(StagingError::InvalidState(
+                    "partial activity marker is not a regular file".into(),
+                ));
+            }
+            true
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        Err(error) => return Err(error.into()),
+    };
+    let mut options = OpenOptions::new();
+    options.write(true);
+    if !existing {
+        options.create_new(true).mode(PRIVATE_FILE_MODE);
+    }
+    let file = options.open(&activity)?;
+    file.set_len(0)?;
+    file.set_times(fs::FileTimes::new().set_modified(at))?;
+    file.sync_all()?;
+    if !existing {
+        sync_parent(&activity)?;
+    }
+    Ok(())
+}
+
+fn partial_last_activity(path: &Path) -> Result<SystemTime, StagingError> {
+    let activity = path.join(PARTIAL_ACTIVITY_FILE);
+    match fs::symlink_metadata(&activity) {
+        Ok(metadata) => {
+            if metadata.file_type().is_symlink() || !metadata.is_file() {
+                return Err(StagingError::InvalidState(
+                    "partial activity marker is not a regular file".into(),
+                ));
+            }
+            return metadata.modified().map_err(StagingError::Io);
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+
+    // Older partials predate the explicit lease marker. Use their newest
+    // direct child timestamp so a recently written payload remains resumable
+    // across upgrade; malformed or future-dated state is never guessed stale.
+    let mut newest = fs::symlink_metadata(path)?.modified()?;
+    for entry in fs::read_dir(path)? {
+        let entry = entry?;
+        let modified = fs::symlink_metadata(entry.path())?.modified()?;
+        newest = newest.max(modified);
+    }
+    Ok(newest)
 }
 
 // libc exposes statvfs counters at the target's native unsigned-long width;

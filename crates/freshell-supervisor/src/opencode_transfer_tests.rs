@@ -5,12 +5,24 @@ use freshell_runtime_protocol::{
     MAX_OPENCODE_TRANSFER_CHUNK_BYTES,
 };
 use sha2::{Digest, Sha256};
-use std::collections::HashSet;
-use std::os::unix::fs::PermissionsExt;
+use std::{
+    collections::HashSet,
+    fs::File,
+    os::unix::fs::PermissionsExt,
+    time::{Duration, SystemTime},
+};
 
 fn descriptor(payload: &[u8], transfer_id: &str) -> OpenCodeTransferDescriptor {
+    descriptor_for_generation(payload, transfer_id, &"e".repeat(64))
+}
+
+fn descriptor_for_generation(
+    payload: &[u8],
+    transfer_id: &str,
+    generation: &str,
+) -> OpenCodeTransferDescriptor {
     let source_store_id = "b".repeat(64);
-    let source_generation = "e".repeat(64);
+    let source_generation = generation.to_string();
     let source_schema_fingerprint = "c".repeat(64);
     let migration_journal_fingerprint = "d".repeat(64);
     let target_image_ref = format!("sha256:{}", "a".repeat(64));
@@ -320,4 +332,130 @@ fn staged_transfer_enforces_bundle_quota_aggregate_queue_and_free_space() {
         staging.begin(&queued, 8).unwrap(),
         StagingStart::Started { .. }
     ));
+}
+
+#[test]
+fn changed_source_generation_reclaims_stale_partial_and_finishes_within_quota_after_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let limits = StagingLimits::for_test(8, 8);
+    let payload = b"12345678";
+    let old = descriptor_for_generation(payload, "transfer-old-generation", &"e".repeat(64));
+    let old_partial = dir
+        .path()
+        .join("opencode-transfers/transfer-old-generation.partial");
+    let staging = OpenCodeTransferStaging::new(dir.path(), limits).unwrap();
+    staging.begin(&old, u64::MAX).unwrap();
+    staging.write_chunk(&chunk(&old, payload, 0)).unwrap();
+    drop(staging);
+
+    // Simulate a partial created by the previous release, before its activity
+    // marker existed. Legacy entries age from their newest payload/metadata.
+    std::fs::remove_file(old_partial.join(".activity")).unwrap();
+    set_tree_modified(
+        &old_partial,
+        SystemTime::now() - Duration::from_secs(2 * 60 * 60),
+    );
+    let restarted = OpenCodeTransferStaging::new(dir.path(), limits).unwrap();
+    let changed = descriptor_for_generation(payload, "transfer-new-generation", &"f".repeat(64));
+    assert_ne!(old.source_generation, changed.source_generation);
+    assert_ne!(old.transfer_id, changed.transfer_id);
+    assert!(matches!(
+        restarted.begin(&changed, u64::MAX).unwrap(),
+        StagingStart::Started {
+            next_sequence: 0,
+            ..
+        }
+    ));
+    assert!(
+        !old_partial.exists(),
+        "stale generation must release its quota"
+    );
+
+    restarted.write_chunk(&chunk(&changed, payload, 0)).unwrap();
+    let ready = restarted.finalize(&changed.transfer_id).unwrap();
+    assert_eq!(
+        std::fs::read(ready.join("entry-0000.bin")).unwrap(),
+        payload
+    );
+}
+
+#[test]
+fn stale_stage_cleanup_preserves_a_transfer_with_recent_durable_activity() {
+    let dir = tempfile::tempdir().unwrap();
+    let limits = StagingLimits::for_test(8, 8);
+    let staging = OpenCodeTransferStaging::new(dir.path(), limits).unwrap();
+    let active = descriptor(b"12345678", "transfer-active");
+    staging.begin(&active, u64::MAX).unwrap();
+    staging
+        .write_chunk(&chunk(&active, b"12345678", 0))
+        .unwrap();
+
+    let other = descriptor(b"x", "transfer-waits-for-active");
+    assert_eq!(
+        staging.begin(&other, u64::MAX).unwrap(),
+        StagingStart::Queued
+    );
+    assert!(staging.partial_path(&active.transfer_id).is_dir());
+    assert!(staging.queued_path(&other.transfer_id).is_dir());
+}
+
+#[test]
+fn stale_partial_cleanup_after_restart_is_idempotent_and_keeps_ready_release_guards() {
+    let dir = tempfile::tempdir().unwrap();
+    let limits = StagingLimits::for_test(8, 16);
+    let partial = descriptor(b"12345678", "transfer-crashed-partial");
+    let ready = descriptor(b"12345678", "transfer-ready-is-not-garbage");
+    let staging = OpenCodeTransferStaging::new(dir.path(), limits).unwrap();
+    staging.begin(&partial, u64::MAX).unwrap();
+    staging
+        .write_chunk(&chunk(&partial, b"12345678", 0))
+        .unwrap();
+    staging.begin(&ready, u64::MAX).unwrap();
+    staging.write_chunk(&chunk(&ready, b"12345678", 0)).unwrap();
+    let ready_path = staging.finalize(&ready.transfer_id).unwrap();
+    let stale_path = staging.partial_path(&partial.transfer_id);
+    drop(staging);
+
+    set_tree_modified(
+        &stale_path,
+        SystemTime::now() - Duration::from_secs(2 * 60 * 60),
+    );
+    let restarted = OpenCodeTransferStaging::new(dir.path(), limits).unwrap();
+    assert_eq!(restarted.reclaim_abandoned_partials().unwrap(), 1);
+    assert_eq!(restarted.reclaim_abandoned_partials().unwrap(), 0);
+    let next = descriptor(b"z", "transfer-after-restart");
+    assert!(matches!(
+        restarted.begin(&next, u64::MAX).unwrap(),
+        StagingStart::Started { .. }
+    ));
+    assert!(!stale_path.exists());
+    assert!(ready_path.is_dir(), "ready bundles remain receipt-gated");
+    restarted.abort(&ready.transfer_id).unwrap();
+    assert!(ready_path.is_dir(), "Abort must not bypass receipt release");
+
+    let final_id = descriptor(b"q", "transfer-idempotent-retry");
+    assert!(matches!(
+        restarted.begin(&final_id, u64::MAX).unwrap(),
+        StagingStart::Started { .. }
+    ));
+    assert!(matches!(
+        restarted.begin(&final_id, u64::MAX).unwrap(),
+        StagingStart::Started {
+            next_sequence: 0,
+            ..
+        }
+    ));
+}
+
+fn set_tree_modified(path: &std::path::Path, modified: SystemTime) {
+    for entry in std::fs::read_dir(path).unwrap() {
+        let entry = entry.unwrap();
+        let file = File::open(entry.path()).unwrap();
+        file.set_times(std::fs::FileTimes::new().set_modified(modified))
+            .unwrap();
+    }
+    File::open(path)
+        .unwrap()
+        .set_times(std::fs::FileTimes::new().set_modified(modified))
+        .unwrap();
 }
