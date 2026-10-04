@@ -660,6 +660,7 @@ const sessionArg = argValue('--session')
 const sessionEventGatePath = process.env.FAKE_OPENCODE_SESSION_EVENT_GATE_PATH
 const holdSummarizeGatePath = process.env.FAKE_OPENCODE_HOLD_SUMMARIZE_GATE_PATH
 const requireDirectoryRoute = process.env.FAKE_OPENCODE_REQUIRE_DIRECTORY_ROUTE === '1'
+const snapshotReadFailureMarkerPath = process.env.FAKE_OPENCODE_SNAPSHOT_READ_FAILURE_MARKER
 
 if (!Number.isInteger(port) || port <= 0 || port > 65535) {
   process.stdout.write('fake opencode: no server port requested\n')
@@ -1236,6 +1237,17 @@ const server = http.createServer(async (req, res) => {
       routeDirectory: directory,
       expectedDirectory: session.directory,
     })) {
+      return
+    }
+
+    // Fail only this valid native snapshot request; the daemon, SSE, and saved
+    // conversation stay intact. Cargo tests can exercise unavailable reads
+    // without a process-death fault or a destructive host fallback.
+    if (req.method === 'GET' && (action === '' || action === 'message')
+      && snapshotReadFailureMarkerPath && fs.existsSync(snapshotReadFailureMarkerPath)) {
+      appendAudit({ event: 'snapshot_read_failed', sessionId, method: req.method,
+        pathname: url.pathname, routeDirectory: directory })
+      req.socket.destroy()
       return
     }
 

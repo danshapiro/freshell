@@ -6344,6 +6344,80 @@ describe('FreshAgentView', () => {
     } finally { cleanup(); setFreshAgentReconcileActive(false); vi.useRealTimers() }
   })
 
+  it.each([true, false])('preserves loaded OpenCode conversation across unavailable native reads (owned history: %s)', async (historyAvailable) => {
+    const store = createStore()
+    const native = FreshAgentSnapshotSchema.parse(savedOpenCodeNativeHistory)
+    const locator = { sessionType: 'freshopencode' as const, provider: 'opencode' as const, sessionId: native.threadId }
+    const content = { kind: 'fresh-agent' as const, ...locator, soulId: 'read-failure-owned-soul', soulIntentRevision: 1,
+      createRequestId: 'read-failure-original-create', sessionRef: { provider: 'opencode', sessionId: native.threadId },
+      resumeSessionId: native.threadId, status: 'idle' as const,
+      recoverySummary: { desiredState: 'running' as const, recoveryState: 'live' as const,
+        durabilityState: 'resume_captured' as const, allocationState: 'verified_durable' as const } }
+    const live = { ...native, revision: 1, capabilities: { ...native.capabilities, send: true },
+      extensions: { opencode: { statusFromLiveState: true } } }
+    store.dispatch(sessionInit(locator))
+    store.dispatch(initLayout({ tabId: 'tab-1', paneId: 'pane-1', content }))
+    apiMock.getFreshAgentThreadSnapshot.mockResolvedValue(live)
+    render(<Provider store={store}><StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" /></Provider>)
+    const composer = screen.getByRole('textbox', { name: 'Chat message input' })
+    await waitFor(() => expect(composer).not.toBeDisabled())
+    const retained = native.turns.flatMap((turn) => turn.items).find((item) => item.kind === 'text') as { text: string }
+    expect(screen.getByText(retained.text)).toBeInTheDocument()
+    fireEvent.change(composer, { target: { value: 'Draft in original OpenCode conversation' } })
+    const identity = getFreshAgentPaneContent(store)
+    const interactive = createDeferred<unknown>()
+    const owned = createDeferred<unknown>()
+    apiMock.getFreshAgentThreadSnapshot.mockImplementation((_type, _provider, _id, options) =>
+      options?.soulId ? owned.promise : interactive.promise)
+    apiMock.getFreshAgentThreadSnapshot.mockClear()
+    wsMock.send.mockClear()
+    act(() => handleFreshAgentMessage(store.dispatch, { type: 'freshAgent.event', ...locator,
+      event: { type: 'freshAgent.error', code: 'INVALID_SESSION_ID', message: 'Unavailable native read' } }))
+    await waitFor(() => expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalled())
+    expect(composer).toBeDisabled()
+    expect(screen.getByText(retained.text)).toBeInTheDocument()
+    expect(composer).toHaveValue('Draft in original OpenCode conversation')
+    expect(getFreshAgentPaneContent(store)).toEqual(identity)
+    expect(sentFreshAgentMessages('freshAgent.create')).toHaveLength(0)
+    expect(sentFreshAgentMessages('pane.reconcile.request')).toHaveLength(0)
+    await act(async () => interactive.reject(new Error('opencode snapshot unavailable')))
+    await waitFor(() => expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledWith('freshopencode', 'opencode',
+      native.threadId, expect.objectContaining({ soulId: content.soulId })))
+    expect(screen.getByText(retained.text)).toBeInTheDocument()
+    expect(composer).toBeDisabled()
+    await act(async () => {
+      if (historyAvailable) owned.resolve({ ...native, status: 'idle', capabilities: { ...native.capabilities, send: false, interrupt: false },
+        extensions: { opencode: { ownerKind: 'vacant', nativeHistoryAvailable: true, statusFromLiveState: false } } })
+      else owned.reject(new Error('Owned provider history unavailable'))
+    })
+    expect(screen.getByText(retained.text)).toBeInTheDocument()
+    expect(composer).toBeDisabled()
+    expect(composer).toHaveValue('Draft in original OpenCode conversation')
+    expect(getFreshAgentPaneContent(store)).toEqual(identity)
+    expect(Object.values(store.getState().freshAgent.sessions).find((row) => row.sessionId === native.threadId)?.lost).toBe(true)
+    expect(screen.queryByRole('button', { name: 'Stop' })).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'Start new session' })).not.toBeInTheDocument()
+    expect(screen.queryByTestId('managed-runtime-recovery-card')).not.toBeInTheDocument()
+    expect(screen.queryByText('Restoring session...')).not.toBeInTheDocument()
+    expect(sentFreshAgentMessages('freshAgent.create')).toHaveLength(0)
+    expect(sentFreshAgentMessages('pane.reconcile.request')).toHaveLength(0)
+    apiMock.getFreshAgentThreadSnapshot.mockResolvedValue({ ...live, revision: 2,
+      extensions: { opencode: { ownerKind: 'fresh-agent', statusFromLiveState: true, nativeHistoryAvailable: true } } })
+    act(() => handleFreshAgentMessage(store.dispatch, { type: 'freshAgent.event', ...locator,
+      event: { type: 'freshAgent.session.snapshot', status: 'idle', revision: 2,
+        latestTurnId: native.latestTurnId, timelineSessionId: native.threadId } }))
+    await waitFor(() => expect(composer).not.toBeDisabled())
+    expect(composer).toHaveValue('Draft in original OpenCode conversation')
+    expect(screen.getByText(retained.text)).toBeInTheDocument()
+    expect(getFreshAgentPaneContent(store)).toEqual(identity)
+    expect(Object.values(store.getState().freshAgent.sessions).find((row) => row.sessionId === native.threadId)?.lost).toBe(false)
+    fireEvent.click(screen.getByRole('button', { name: 'Send' }))
+    expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(1)
+    expect(sentFreshAgentMessages('freshAgent.send')[0]).toMatchObject(locator)
+    expect(sentFreshAgentMessages('freshAgent.create')).toHaveLength(0)
+    expect(sentFreshAgentMessages('pane.reconcile.request')).toHaveLength(0)
+  })
+
   it.each([
     ['freshclaude', 'claude', savedClaudeNativeHistory],
     ['kilroy', 'claude', { ...savedClaudeNativeHistory, sessionType: 'kilroy' }],
