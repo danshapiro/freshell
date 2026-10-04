@@ -2284,6 +2284,7 @@ fn apply_title_search(mut item: DirItem, query_text: &str) -> Option<DirItem> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_trace_capture::{CapturedTraceEvent, CapturedTraceEvents};
     use std::time::Duration;
 
     fn fixtures_dir() -> PathBuf {
@@ -4415,31 +4416,8 @@ mod tests {
         copied
     }
 
-    #[derive(Clone, Default)]
-    struct CapturedTraceEvents(Arc<std::sync::Mutex<Vec<CapturedTraceEvent>>>);
-
-    #[derive(Clone, Debug)]
-    struct CapturedTraceEvent {
-        level: tracing::Level,
-        fields: std::collections::BTreeMap<String, String>,
-    }
-
-    #[derive(Clone)]
-    struct CaptureTraceLayer(CapturedTraceEvents);
-
     fn collision_trace_events() -> CapturedTraceEvents {
-        use tracing_subscriber::prelude::*;
-
-        static GLOBAL_EVENTS: std::sync::OnceLock<CapturedTraceEvents> = std::sync::OnceLock::new();
-        GLOBAL_EVENTS
-            .get_or_init(|| {
-                let events = CapturedTraceEvents::default();
-                let subscriber =
-                    tracing_subscriber::registry().with(CaptureTraceLayer(events.clone()));
-                let _ = tracing::subscriber::set_global_default(subscriber);
-                events
-            })
-            .clone()
+        crate::test_trace_capture::captured_trace_events()
     }
 
     fn collision_events_for_home(
@@ -4448,55 +4426,11 @@ mod tests {
     ) -> Vec<CapturedTraceEvent> {
         let marker = home.to_string_lossy();
         events
-            .0
-            .lock()
-            .unwrap()
-            .iter()
+            .snapshot()
+            .into_iter()
+            .filter(|event| event.fields.contains_key("collision_samples_json"))
             .filter(|event| decoded_trace_field(event, "collision_samples_json").contains(&*marker))
-            .cloned()
             .collect()
-    }
-
-    struct TraceFieldVisitor(std::collections::BTreeMap<String, String>);
-
-    impl tracing::field::Visit for TraceFieldVisitor {
-        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
-            self.0
-                .insert(field.name().to_string(), format!("{value:?}"));
-        }
-
-        fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
-            self.0.insert(field.name().to_string(), value.to_string());
-        }
-    }
-
-    impl<S> tracing_subscriber::Layer<S> for CaptureTraceLayer
-    where
-        S: tracing::Subscriber,
-    {
-        fn on_event(
-            &self,
-            event: &tracing::Event<'_>,
-            _context: tracing_subscriber::layer::Context<'_, S>,
-        ) {
-            if event.metadata().target() != "freshell_server::session_directory"
-                || *event.metadata().level() != tracing::Level::ERROR
-            {
-                return;
-            }
-            let mut visitor = TraceFieldVisitor(std::collections::BTreeMap::new());
-            event.record(&mut visitor);
-            if visitor
-                .0
-                .get("message")
-                .is_some_and(|message| message.contains("session_directory_identity_collision"))
-            {
-                self.0 .0.lock().unwrap().push(CapturedTraceEvent {
-                    level: *event.metadata().level(),
-                    fields: visitor.0,
-                });
-            }
-        }
     }
 
     fn decoded_trace_field(event: &CapturedTraceEvent, name: &str) -> String {

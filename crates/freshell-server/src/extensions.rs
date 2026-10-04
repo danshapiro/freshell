@@ -608,74 +608,11 @@ mod tests {
         // actually fire (absence from the registry alone was also true of the
         // old lenient port).
         //
-        // Capture strategy (matching freshell-freshagent's documented
-        // investigation): a set_global_default subscriber installed EXACTLY
-        // ONCE per test binary via OnceLock. Thread-local set_default proved
-        // nondeterministic under parallel `cargo test` (callsite interest
-        // caching); the global layer observes every event, and this test
-        // filters by its unique temp manifest_path.
-        use std::collections::BTreeMap;
-        use std::sync::{Arc, Mutex, OnceLock};
-        use tracing::field::{Field, Visit};
-        use tracing::{Event, Level, Subscriber};
-        use tracing_subscriber::layer::{Context, Layer, SubscriberExt};
-
-        struct Captured {
-            message: String,
-            fields: BTreeMap<String, String>,
-        }
-        #[derive(Default)]
-        struct V {
-            message: String,
-            fields: BTreeMap<String, String>,
-        }
-        impl Visit for V {
-            fn record_debug(&mut self, f: &Field, v: &dyn std::fmt::Debug) {
-                let r = format!("{v:?}");
-                if f.name() == "message" {
-                    self.message = r;
-                } else {
-                    self.fields.insert(f.name().into(), r);
-                }
-            }
-            fn record_str(&mut self, f: &Field, v: &str) {
-                if f.name() == "message" {
-                    self.message = v.into();
-                } else {
-                    self.fields.insert(f.name().into(), v.into());
-                }
-            }
-        }
-        struct CaptureLayer {
-            events: Arc<Mutex<Vec<Captured>>>,
-        }
-        impl<S: Subscriber> Layer<S> for CaptureLayer {
-            fn on_event(&self, event: &Event<'_>, _ctx: Context<'_, S>) {
-                if *event.metadata().level() != Level::WARN {
-                    return;
-                }
-                let mut v = V::default();
-                event.record(&mut v);
-                self.events.lock().expect("capture lock").push(Captured {
-                    message: v.message,
-                    fields: v.fields,
-                });
-            }
-        }
-
-        static GLOBAL_EVENTS: OnceLock<Arc<Mutex<Vec<Captured>>>> = OnceLock::new();
-        let events = GLOBAL_EVENTS.get_or_init(|| {
-            let events = Arc::new(Mutex::new(Vec::new()));
-            let layer = CaptureLayer {
-                events: Arc::clone(&events),
-            };
-            // Ignore the error case: some OTHER test installed a global
-            // subscriber first — then this assertion would fail noisily
-            // below, but no freshell-server test does that today.
-            let _ =
-                tracing::subscriber::set_global_default(tracing_subscriber::registry().with(layer));
-            events
-        });
+        // A shared process-global collector avoids competing test modules
+        // installing subscribers with disconnected event buffers. Thread-local
+        // set_default proved nondeterministic under parallel cargo test because
+        // of callsite interest caching; this test filters by its unique path.
+        let events = crate::test_trace_capture::captured_trace_events();
 
         let root = tmp();
         let bad_json = root.join("bad-json");
@@ -693,15 +630,14 @@ mod tests {
 
         let root_marker = root.display().to_string();
         let mine: Vec<String> = events
-            .lock()
-            .expect("capture lock")
-            .iter()
+            .snapshot()
+            .into_iter()
             .filter(|e| {
                 e.fields
                     .get("manifest_path")
                     .is_some_and(|p| p.contains(&root_marker))
             })
-            .map(|e| e.message.clone())
+            .map(|e| e.message)
             .collect();
         assert_eq!(
             mine.len(),
