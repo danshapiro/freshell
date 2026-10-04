@@ -7,11 +7,15 @@ use freshell_sessions::opencode_transfer::{
     export_exact_session, ExportOptions, HostOpenCodeInventory,
 };
 use rusqlite::params;
-use std::{fs, path::PathBuf};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+};
 use tempfile::TempDir;
 
 struct Fixture {
-    _directory: TempDir,
+    _directory: Option<TempDir>,
+    root: PathBuf,
     descriptor: OpenCodeTransferDescriptor,
     staged_directory: PathBuf,
     destination_database: PathBuf,
@@ -20,8 +24,15 @@ struct Fixture {
 
 fn fixture() -> Fixture {
     let directory = tempfile::tempdir().unwrap();
-    let source = directory.path().join("source.sqlite");
-    let workspace = directory.path().join("workspace");
+    let mut fixture = fixture_in(directory.path());
+    fixture._directory = Some(directory);
+    fixture
+}
+
+fn fixture_in(root: &Path) -> Fixture {
+    fs::create_dir_all(root).unwrap();
+    let source = root.join("source.sqlite");
+    let workspace = root.join("workspace");
     fs::create_dir(&workspace).unwrap();
     let workspace = fs::canonicalize(workspace).unwrap();
     let connection = Connection::open(&source).unwrap();
@@ -61,17 +72,35 @@ fn fixture() -> Fixture {
             params!["msg_one", "ses_root", r#"{"text":"UNIQUE_SYNTHETIC_CONVERSATION_BODY"}"#],
         )
         .unwrap();
+    let referenced_file = workspace.join("prompt.txt");
+    fs::write(&referenced_file, b"synthetic referenced workspace asset").unwrap();
+    connection
+        .execute(
+            "INSERT INTO part (id,message_id,session_id,time_created,time_updated,data) VALUES (?1,?2,?3,1,1,?4)",
+            params![
+                "part_one",
+                "msg_one",
+                "ses_root",
+                serde_json::json!({
+                    "type": "file",
+                    "mime": "text/plain",
+                    "url": format!("file://{}", referenced_file.display())
+                })
+                .to_string()
+            ],
+        )
+        .unwrap();
     drop(connection);
 
     let snapshot = export_exact_session(
         &HostOpenCodeInventory::new(source.clone())
             .with_trusted_mount_for_selected_session(workspace.clone()),
         "ses_root",
-        ExportOptions::new(directory.path().join("extraction")),
+        ExportOptions::new(root.join("extraction")),
     )
     .unwrap();
     let mut payload = snapshot.open_payload().unwrap();
-    let payload_path = directory.path().join("payload.json");
+    let payload_path = root.join("payload.json");
     let mut output = File::create(&payload_path).unwrap();
     io::copy(&mut payload, &mut output).unwrap();
     output.sync_all().unwrap();
@@ -107,7 +136,7 @@ fn fixture() -> Fixture {
     let mut descriptor = descriptor;
     descriptor.bundle_sha256 =
         opencode_transfer_bundle_digest(&descriptor.manifest_json, &descriptor.files);
-    let staged_directory = directory.path().join("ready");
+    let staged_directory = root.join("ready");
     fs::create_dir(&staged_directory).unwrap();
     fs::copy(payload_path, staged_directory.join("entry-0000.bin")).unwrap();
     fs::write(
@@ -123,15 +152,18 @@ fn fixture() -> Fixture {
         descriptor.bundle_sha256.as_bytes(),
     )
     .unwrap();
+    fs::write(
+        root.join("transfer-descriptor.json"),
+        serde_json::to_vec(&descriptor).unwrap(),
+    )
+    .unwrap();
 
     Fixture {
-        _directory: directory,
+        _directory: None,
+        root: root.to_path_buf(),
         descriptor,
         staged_directory,
-        destination_database: workspace
-            .parent()
-            .unwrap()
-            .join("provider/.local/share/opencode/opencode.db"),
+        destination_database: root.join("provider/.local/share/opencode/opencode.db"),
         workspace,
     }
 }
@@ -154,7 +186,13 @@ fn imports_exact_rows_idempotently_and_returns_a_body_free_receipt() {
     )
     .unwrap();
     assert_eq!(receipt, second);
-    assert_eq!(receipt.row_count, 3);
+    assert_eq!(receipt.row_count, 4);
+    assert_eq!(receipt.asset_count, 1);
+    assert_eq!(fixture.descriptor.files.len(), 1);
+    let manifest: OpenCodeTransferManifest =
+        serde_json::from_str(&fixture.descriptor.manifest_json).unwrap();
+    assert_eq!(manifest.assets.len(), 1);
+    assert_eq!(manifest.assets[0].kind, "workspace_path_reference");
     assert!(!serde_json::to_string(&receipt)
         .unwrap()
         .contains("UNIQUE_SYNTHETIC_CONVERSATION_BODY"));
@@ -200,7 +238,8 @@ fn streamed_provider_import_hashes_the_pipe_and_rolls_back_a_truncated_payload()
         &fixture.workspace,
     )
     .unwrap();
-    assert_eq!(receipt.row_count, 3);
+    assert_eq!(receipt.row_count, 4);
+    assert_eq!(receipt.asset_count, 1);
 }
 
 #[test]
@@ -261,6 +300,156 @@ fn conflicting_primary_key_rolls_back_without_overwriting_destination_data() {
             .unwrap(),
         "different"
     );
+}
+
+#[cfg(unix)]
+#[test]
+#[ignore = "process-kill recovery test; run only through scripts/sandbox-test.sh"]
+fn opencode_importer_restarts_after_native_transaction_boundaries() {
+    use std::{os::unix::process::ExitStatusExt, process::Command};
+
+    const ROOT_ENV: &str = "FRESHELL_OPENCODE_IMPORT_CRASH_ROOT";
+    const POINT_ENV: &str = "FRESHELL_OPENCODE_IMPORT_CRASH_POINT";
+    let executable = std::env::current_exe().expect("resolve this test executable");
+
+    for point in [
+        "import.before_transaction_commit",
+        "import.after_transaction_commit",
+        "import.after_database_sync",
+        "import.after_receipt_constructed",
+    ] {
+        let directory = tempfile::tempdir().unwrap();
+        let fixture = fixture_in(directory.path());
+        assert_eq!(fixture.descriptor.files.len(), 1);
+        let child = Command::new(&executable)
+            .args([
+                "--exact",
+                "opencode_transfer::tests::opencode_importer_process_crash_child",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env(ROOT_ENV, &fixture.root)
+            .env(POINT_ENV, point)
+            .status()
+            .expect("spawn synthetic importer crash child");
+        assert_eq!(
+            child.signal(),
+            Some(libc::SIGKILL),
+            "child must be killed at native DB boundary {point}; exit={child:?}"
+        );
+
+        let descriptor: OpenCodeTransferDescriptor = serde_json::from_slice(
+            &fs::read(fixture.root.join("transfer-descriptor.json")).unwrap(),
+        )
+        .unwrap();
+        let destination = fixture
+            .root
+            .join("provider/.local/share/opencode/opencode.db");
+        let workspace = fixture.root.join("workspace");
+        if point == "import.before_transaction_commit" && destination.exists() {
+            let connection = Connection::open(&destination).unwrap();
+            let session_tables: i64 = connection
+                .query_row(
+                    "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='session'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(
+                session_tables, 0,
+                "an interrupted uncommitted schema and graph must not be visible after SQLite recovery"
+            );
+        }
+
+        let receipt = import_bundle(
+            &descriptor,
+            &fixture.root.join("ready"),
+            &destination,
+            &workspace,
+        )
+        .expect("identical retry must reconstruct only the complete exact imported baseline");
+        assert_eq!(receipt.row_count, 4);
+        assert_eq!(receipt.asset_count, 1);
+        assert!(!serde_json::to_string(&receipt)
+            .unwrap()
+            .contains("UNIQUE_SYNTHETIC_CONVERSATION_BODY"));
+
+        let retry = import_bundle(
+            &descriptor,
+            &fixture.root.join("ready"),
+            &destination,
+            &workspace,
+        )
+        .expect("a complete same-generation retry is an identical no-op");
+        assert_eq!(retry, receipt);
+
+        let home = fixture.root.join("provider");
+        let xdg_data_home = home.join(".local/share");
+        let readable = verify_installed_store(
+            &descriptor,
+            &InstalledStoreReaderContext {
+                database_path: &destination,
+                workspace_root: &workspace,
+                provider_uid: unsafe { libc::geteuid() },
+                provider_gid: unsafe { libc::getegid() },
+                home: &home,
+                xdg_data_home: &xdg_data_home,
+                xdg_config_home: &home.join(".config"),
+                cwd: &workspace,
+            },
+        )
+        .expect("restart must independently read the DB and referenced asset");
+        assert_eq!(readable.asset_count, 1);
+        assert_eq!(readable.structural_sha256, receipt.structural_sha256);
+
+        let mut conflicting = descriptor.clone();
+        conflicting.destination_store_id = "other-synthetic-soul".into();
+        assert!(import_bundle(
+            &conflicting,
+            &fixture.root.join("ready"),
+            &destination,
+            &workspace,
+        )
+        .is_err());
+        assert_eq!(
+            verify_installed_store(
+                &descriptor,
+                &InstalledStoreReaderContext {
+                    database_path: &destination,
+                    workspace_root: &workspace,
+                    provider_uid: unsafe { libc::geteuid() },
+                    provider_gid: unsafe { libc::getegid() },
+                    home: &home,
+                    xdg_data_home: &xdg_data_home,
+                    xdg_config_home: &home.join(".config"),
+                    cwd: &workspace,
+                },
+            )
+            .unwrap(),
+            readable,
+            "a stale/conflicting descriptor cannot overwrite or authorize the installed generation"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+#[ignore = "child fixture for opencode_importer_restarts_after_native_transaction_boundaries"]
+fn opencode_importer_process_crash_child() {
+    const ROOT_ENV: &str = "FRESHELL_OPENCODE_IMPORT_CRASH_ROOT";
+    let Some(root) = std::env::var_os(ROOT_ENV).map(PathBuf::from) else {
+        return;
+    };
+    let descriptor: OpenCodeTransferDescriptor =
+        serde_json::from_slice(&fs::read(root.join("transfer-descriptor.json")).unwrap()).unwrap();
+    import_bundle(
+        &descriptor,
+        &root.join("ready"),
+        &root.join("provider/.local/share/opencode/opencode.db"),
+        &root.join("workspace"),
+    )
+    .unwrap();
+    unreachable!("the selected importer failpoint must kill this child process");
 }
 
 #[test]

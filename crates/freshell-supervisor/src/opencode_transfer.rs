@@ -151,6 +151,22 @@ enum QueueInitializationPhase {
 }
 
 impl OpenCodeTransferStaging {
+    #[cfg(test)]
+    fn crash_checkpoint(&self, point: &str) {
+        if std::env::var("FRESHELL_OPENCODE_STAGE_CRASH_POINT")
+            .ok()
+            .as_deref()
+            == Some(point)
+        {
+            // The isolated parent verifies this signal and runs only inside
+            // scripts/sandbox-test.sh's disposable Docker container.
+            unsafe {
+                libc::kill(libc::getpid(), libc::SIGKILL);
+            }
+            unreachable!("SIGKILL should terminate the staging crash fixture");
+        }
+    }
+
     pub fn new(root: impl AsRef<Path>, limits: StagingLimits) -> Result<Self, StagingError> {
         let root = root.as_ref().join("opencode-transfers");
         if root.exists() {
@@ -342,6 +358,8 @@ impl OpenCodeTransferStaging {
         fs::set_permissions(&partial, fs::Permissions::from_mode(TRANSFER_ROOT_MODE))?;
         sync_parent(&partial)?;
         self.write_descriptor(&partial, descriptor)?;
+        #[cfg(test)]
+        self.crash_checkpoint("begin.after_descriptor");
         for file in &descriptor.files {
             let path = part_file(&partial, file.index);
             OpenOptions::new()
@@ -350,6 +368,8 @@ impl OpenCodeTransferStaging {
                 .mode(PRIVATE_FILE_MODE)
                 .open(path)?
                 .sync_all()?;
+            #[cfg(test)]
+            self.crash_checkpoint(&format!("begin.after_placeholder.{}", file.index));
         }
         File::open(&partial)?.sync_all()?;
         sync_parent(&partial)?;
@@ -486,8 +506,14 @@ impl OpenCodeTransferStaging {
             ));
         }
         output.write_all(&chunk.data)?;
+        #[cfg(test)]
+        self.crash_checkpoint(&format!("chunk.after_write.{}", chunk.sequence));
         output.sync_all()?;
+        #[cfg(test)]
+        self.crash_checkpoint(&format!("chunk.after_file_sync.{}", chunk.sequence));
         sync_parent(&path)?;
+        #[cfg(test)]
+        self.crash_checkpoint(&format!("chunk.after_parent_sync.{}", chunk.sequence));
         record_partial_activity(&partial, SystemTime::now())?;
         Ok(())
     }
@@ -527,6 +553,8 @@ impl OpenCodeTransferStaging {
             let target = ready_file(&partial, file.index);
             if source.exists() {
                 fs::rename(&source, &target)?;
+                #[cfg(test)]
+                self.crash_checkpoint(&format!("finalize.after_file_rename.{}", file.index));
             } else {
                 let metadata = fs::symlink_metadata(&target)?;
                 if metadata.file_type().is_symlink()
@@ -540,6 +568,8 @@ impl OpenCodeTransferStaging {
             }
             fs::set_permissions(&target, fs::Permissions::from_mode(READY_FILE_MODE))?;
             File::open(&target)?.sync_all()?;
+            #[cfg(test)]
+            self.crash_checkpoint(&format!("finalize.after_file_sync.{}", file.index));
         }
         File::open(&partial)?.sync_all()?;
         if partial.join("READY").exists() {
@@ -554,6 +584,8 @@ impl OpenCodeTransferStaging {
                 descriptor.bundle_sha256.as_bytes(),
                 READY_FILE_MODE,
             )?;
+            #[cfg(test)]
+            self.crash_checkpoint("finalize.after_ready_marker");
         }
         self.write_ready_ownership_unlocked(
             transfer_id,
@@ -575,7 +607,11 @@ impl OpenCodeTransferStaging {
         fs::set_permissions(&partial, fs::Permissions::from_mode(READY_DIR_MODE))?;
         File::open(&partial)?.sync_all()?;
         fs::rename(&partial, &ready)?;
+        #[cfg(test)]
+        self.crash_checkpoint("finalize.after_ready_rename");
         sync_parent(&ready)?;
+        #[cfg(test)]
+        self.crash_checkpoint("finalize.after_ready_parent_sync");
         self.verify_ready_unlocked(&descriptor)?;
         Ok(ready)
     }
