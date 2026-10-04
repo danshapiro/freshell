@@ -16,7 +16,7 @@ function listenOnEphemeral(): Promise<{ port: number; close: () => Promise<void>
 }
 
 describe('createPortAvailabilityCheck', () => {
-  it('reports a port held by another listener as unavailable, and free once released', async () => {
+  it('reports a port held by another listener as unavailable', async () => {
     const isPortAvailable = createPortAvailabilityCheck()
     const { port, close } = await listenOnEphemeral()
     try {
@@ -24,6 +24,11 @@ describe('createPortAvailabilityCheck', () => {
     } finally {
       await close()
     }
-    expect(await isPortAvailable(port)).toBe(true)
+  })
+
+  it('reports an OS-selected port as available', async () => {
+    // Avoid racing another local listener to claim the released ephemeral port.
+    const isPortAvailable = createPortAvailabilityCheck()
+    expect(await isPortAvailable(0)).toBe(true)
   })
 })
