@@ -13,9 +13,9 @@ use freshell_runtime_protocol::{
     host_proof, read_frame, write_frame, AdminCommand, AdminReply, AdminResult, CommandState,
     ControlRole, Envelope, FixtureKind, FreshAgentLaunchSpec, HostBootId, HostCommand, HostReply,
     HostResult, IncarnationId, LaunchResult, LaunchState, LimitApplication, OpenCodeTransferAction,
-    OpenCodeTransferResult, RequestId, ResumeSpec, RuntimeError, RuntimeErrorCode, RuntimeLimits,
-    RuntimeMetrics, RuntimeOutputBatch, RuntimeView, SoulId, StopOutcome, TerminalLaunchSpec,
-    UpdateLimitsResult, CONTROL_PROTOCOL_VERSION,
+    OpenCodeTransferReadinessReceipt, OpenCodeTransferResult, RequestId, ResumeSpec, RuntimeError,
+    RuntimeErrorCode, RuntimeLimits, RuntimeMetrics, RuntimeOutputBatch, RuntimeView, SoulId,
+    StopOutcome, TerminalLaunchSpec, UpdateLimitsResult, CONTROL_PROTOCOL_VERSION,
 };
 use sha2::{Digest, Sha256};
 use std::{
@@ -143,6 +143,112 @@ impl Supervisor {
                 .entry(soul_id.as_str().to_string())
                 .or_insert_with(|| Arc::new(Mutex::new(()))),
         )
+    }
+
+    /// Retry cleanup for receipt-confirmed stages after startup or a prior
+    /// cleanup interruption. The registry is the authority for active
+    /// prepared/retry references.
+    ///
+    /// The registry snapshot and filesystem removal are separate operations.
+    /// A concurrent launch cannot add a valid reference to the same ready
+    /// stage in between: its descriptor pins the transfer to a unique
+    /// incarnation, which the registry will not prepare twice. A different
+    /// descriptor reusing the transfer ID cannot consume the existing ready
+    /// bundle, and begin/reclaim serialize under the staging lock.
+    pub async fn cleanup_opencode_transfer_staging(&self) -> Result<usize, RuntimeError> {
+        self.recover_opencode_transfer_receipts().await;
+        let references = self
+            .registry
+            .opencode_transfer_stage_references()
+            .await
+            .map_err(map_registry)?;
+        let staging = Arc::clone(&self.opencode_transfer_staging);
+        tokio::task::spawn_blocking(move || staging.reclaim_release_eligible(&references))
+            .await
+            .map_err(|error| {
+                RuntimeError::new(
+                    RuntimeErrorCode::RegistryFailure,
+                    format!("OpenCode stage cleanup worker did not settle: {error}"),
+                )
+            })?
+            .map_err(map_opencode_transfer)
+    }
+
+    /// Recover the narrow crash window where the host persisted a receipt and
+    /// accepted the grant, but the supervisor stopped before writing its
+    /// release marker. Host status is authenticated with the same per-runtime
+    /// secret as grant delivery, and the marker remains pinned while the
+    /// registry still says the launch is starting.
+    async fn recover_opencode_transfer_receipts(&self) {
+        let candidates = match self.registry.opencode_transfer_receipt_candidates().await {
+            Ok(candidates) => candidates,
+            Err(error) => {
+                append_event(
+                    &self.config.lifecycle_log,
+                    "supervisor.opencode_transfer_receipt_recovery_failed",
+                    serde_json::json!({"stage":"load_candidates","error":error.to_string()}),
+                );
+                return;
+            }
+        };
+        for incarnation_id in candidates {
+            let result = self
+                .recover_opencode_transfer_receipt(&incarnation_id)
+                .await;
+            if let Err(error) = result {
+                append_event(
+                    &self.config.lifecycle_log,
+                    "supervisor.opencode_transfer_receipt_recovery_deferred",
+                    serde_json::json!({"incarnationId":incarnation_id,"error":error.message}),
+                );
+            }
+        }
+    }
+
+    async fn recover_opencode_transfer_receipt(
+        &self,
+        incarnation_id: &IncarnationId,
+    ) -> Result<(), RuntimeError> {
+        let handle = self
+            .registry
+            .owned_handle(incarnation_id.clone())
+            .await
+            .map_err(map_registry)?;
+        let Some(terminal) = handle.terminal() else {
+            return Ok(());
+        };
+        let Some(descriptor) = terminal.opencode_transfer.as_ref() else {
+            return Ok(());
+        };
+        let host = self
+            .authenticate_host(handle.incarnation_id(), handle.runtime_dir())
+            .await?;
+        let status = self
+            .host_status(handle.incarnation_id().clone(), handle.runtime_dir(), &host)
+            .await?;
+        let Some(receipt) = status.opencode_transfer_receipt else {
+            return Ok(());
+        };
+        let Some(receipt) = validate_opencode_transfer_receipt(
+            Some(descriptor),
+            Some((terminal.run_as_uid, terminal.run_as_gid)),
+            Some(receipt),
+        )?
+        else {
+            return Ok(());
+        };
+        let staging = Arc::clone(&self.opencode_transfer_staging);
+        let descriptor = descriptor.clone();
+        tokio::task::spawn_blocking(move || staging.mark_release_eligible(&descriptor, &receipt))
+            .await
+            .map_err(|error| {
+                RuntimeError::new(
+                    RuntimeErrorCode::RegistryFailure,
+                    format!("OpenCode receipt recovery worker did not settle: {error}"),
+                )
+            })?
+            .map_err(map_opencode_transfer)?;
+        Ok(())
     }
 
     pub async fn dispatch(&self, envelope: Envelope<AdminCommand>) -> AdminReply {
@@ -877,6 +983,35 @@ impl Supervisor {
             .map_err(|error| {
                 self.activation_failure(&prepared, state, "deliver_execution_grant", error)
             })?;
+        if let (Some(terminal), Some(receipt)) = (
+            workload.terminal.as_ref(),
+            accepted.opencode_transfer_receipt.as_ref(),
+        ) {
+            if let Some(descriptor) = terminal.opencode_transfer.as_ref() {
+                let staging = Arc::clone(&self.opencode_transfer_staging);
+                let descriptor = descriptor.clone();
+                let transfer_id = descriptor.transfer_id.clone();
+                let receipt = receipt.clone();
+                if let Err(error) = tokio::task::spawn_blocking(move || {
+                    staging.mark_release_eligible(&descriptor, &receipt)
+                })
+                .await
+                .map_err(|error| {
+                    RuntimeError::new(
+                        RuntimeErrorCode::RegistryFailure,
+                        format!("OpenCode stage marker worker did not settle: {error}"),
+                    )
+                })
+                .and_then(|result| result.map_err(map_opencode_transfer))
+                {
+                    append_event(
+                        &self.config.lifecycle_log,
+                        "supervisor.opencode_transfer_release_marker_deferred",
+                        serde_json::json!({"incarnationId":handle.incarnation_id(),"transferId":transfer_id,"error":error.message}),
+                    );
+                }
+            }
+        }
         crash_if("after_grant_delivery");
         self.registry
             .mark_running(handle.incarnation_id().clone())
@@ -885,6 +1020,13 @@ impl Supervisor {
             .map_err(|error| {
                 self.activation_failure(&prepared, state, "commit_running_state", error)
             })?;
+        if let Err(error) = self.cleanup_opencode_transfer_staging().await {
+            append_event(
+                &self.config.lifecycle_log,
+                "supervisor.opencode_transfer_cleanup_deferred",
+                serde_json::json!({"incarnationId":handle.incarnation_id(),"error":error.message}),
+            );
+        }
         if let Some(native_session_id) = accepted.native_session_id.as_ref() {
             self.registry
                 .record_native_session(
@@ -2133,12 +2275,26 @@ impl Supervisor {
                 worker_launch_count,
                 fixture_evidence,
                 native_session_id,
+                opencode_transfer_receipt,
             } => Ok(AcceptedGrant {
                 host_boot_id,
                 worker_pid,
                 worker_launch_count,
                 fixture_evidence,
                 native_session_id,
+                opencode_transfer_receipt: validate_opencode_transfer_receipt(
+                    workload
+                        .terminal
+                        .as_ref()
+                        .and_then(|terminal| terminal.opencode_transfer.as_ref()),
+                    workload.terminal.as_ref().and_then(|terminal| {
+                        terminal
+                            .opencode_transfer
+                            .as_ref()
+                            .map(|_| (terminal.run_as_uid, terminal.run_as_gid))
+                    }),
+                    opencode_transfer_receipt,
+                )?,
             }),
             _ => Err(RuntimeError::new(
                 RuntimeErrorCode::HostAuthenticationFailed,
@@ -2169,6 +2325,7 @@ impl Supervisor {
                 fixture_evidence,
                 exited,
                 native_session_id,
+                opencode_transfer_receipt,
                 ..
             } => Ok(HostStatus {
                 host_boot_id,
@@ -2177,6 +2334,7 @@ impl Supervisor {
                 fixture_evidence,
                 exited,
                 native_session_id,
+                opencode_transfer_receipt,
             }),
             _ => Err(RuntimeError::new(
                 RuntimeErrorCode::HostAuthenticationFailed,
@@ -2349,6 +2507,7 @@ pub(crate) struct AcceptedGrant {
     worker_launch_count: u64,
     fixture_evidence: serde_json::Value,
     native_session_id: Option<String>,
+    opencode_transfer_receipt: Option<OpenCodeTransferReadinessReceipt>,
 }
 pub(crate) struct HostStatus {
     pub(crate) host_boot_id: HostBootId,
@@ -2357,6 +2516,7 @@ pub(crate) struct HostStatus {
     pub(crate) fixture_evidence: serde_json::Value,
     pub(crate) exited: bool,
     pub(crate) native_session_id: Option<String>,
+    pub(crate) opencode_transfer_receipt: Option<OpenCodeTransferReadinessReceipt>,
 }
 
 pub async fn serve_control(supervisor: Supervisor, socket_path: &Path) -> Result<(), String> {
@@ -2373,6 +2533,16 @@ pub async fn serve_control(supervisor: Supervisor, socket_path: &Path) -> Result
         "supervisor.ready",
         serde_json::json!({"installationId":supervisor.registry.installation_id(),"controlEpoch":supervisor.registry.control_epoch(),"socket":socket_path}),
     );
+    let cleanup_supervisor = supervisor.clone();
+    tokio::spawn(async move {
+        if let Err(error) = cleanup_supervisor.cleanup_opencode_transfer_staging().await {
+            append_event(
+                &cleanup_supervisor.config.lifecycle_log,
+                "supervisor.opencode_transfer_startup_cleanup_deferred",
+                serde_json::json!({"error":error.message}),
+            );
+        }
+    });
     loop {
         let (mut stream, _) = listener.accept().await.map_err(|e| e.to_string())?;
         let supervisor = supervisor.clone();
@@ -2580,6 +2750,27 @@ fn release_qualified_workload(
         || (has_terminal && freshell_agent_runtime::managed_provider_enabled(provider))
 }
 
+fn validate_opencode_transfer_receipt(
+    descriptor: Option<&freshell_runtime_protocol::OpenCodeTransferDescriptor>,
+    provider_identity: Option<(u32, u32)>,
+    receipt: Option<OpenCodeTransferReadinessReceipt>,
+) -> Result<Option<OpenCodeTransferReadinessReceipt>, RuntimeError> {
+    match (descriptor, provider_identity, receipt) {
+        (None, None, None) => Ok(None),
+        (Some(descriptor), Some((uid, gid)), Some(receipt))
+            if receipt.matches_descriptor(descriptor)
+                && receipt.provider_uid == uid
+                && receipt.provider_gid == gid =>
+        {
+            Ok(Some(receipt))
+        }
+        _ => Err(RuntimeError::new(
+            RuntimeErrorCode::HostAuthenticationFailed,
+            "host grant acknowledgement has no matching OpenCode readiness receipt",
+        )),
+    }
+}
+
 #[cfg(test)]
 mod host_actor_storage_tests {
     use super::ensure_host_actor_state_dir;
@@ -2633,6 +2824,98 @@ mod host_actor_storage_tests {
         std::os::unix::fs::symlink(&first_dir, &second_dir).unwrap();
 
         assert!(ensure_host_actor_state_dir(root.path(), &installation, &second).is_err());
+    }
+}
+
+#[cfg(test)]
+mod opencode_transfer_receipt_tests {
+    use super::validate_opencode_transfer_receipt;
+    use freshell_runtime_protocol::{
+        OpenCodeTransferDescriptor, OpenCodeTransferFile, OpenCodeTransferReadinessReceipt,
+        RuntimeErrorCode,
+    };
+
+    fn descriptor() -> OpenCodeTransferDescriptor {
+        OpenCodeTransferDescriptor {
+            transfer_id: "transfer-one".into(),
+            provider: "opencode".into(),
+            source_store_id: "a".repeat(64),
+            root_session_id: "root-session".into(),
+            source_generation: "b".repeat(64),
+            provider_schema: "opencode-1.18.21".into(),
+            source_schema_fingerprint: "c".repeat(64),
+            migration_journal_fingerprint: "d".repeat(64),
+            destination_store_id: "soul-one".into(),
+            destination_database_path: ".local/share/opencode/opencode.db".into(),
+            target_image_ref: "sha256:test".into(),
+            target_build_receipt: "e".repeat(64),
+            incarnation_id: "incarnation-one".into(),
+            manifest_json: "{}".into(),
+            files: vec![OpenCodeTransferFile {
+                index: 0,
+                relative_path: "manifest.json".into(),
+                size_bytes: 2,
+                sha256: "f".repeat(64),
+            }],
+            total_bytes: 2,
+            bundle_sha256: "0".repeat(64),
+        }
+    }
+
+    fn receipt() -> OpenCodeTransferReadinessReceipt {
+        OpenCodeTransferReadinessReceipt {
+            transfer_id: "transfer-one".into(),
+            destination_store_id: "soul-one".into(),
+            root_session_id: "root-session".into(),
+            source_generation: "b".repeat(64),
+            provider_uid: 1000,
+            provider_gid: 1000,
+            structural_sha256: "1".repeat(64),
+            reader_receipt_sha256: "2".repeat(64),
+        }
+    }
+
+    #[test]
+    fn grant_requires_exact_receipt_and_provider_identity_for_transfers() {
+        let descriptor = descriptor();
+        let accepted = validate_opencode_transfer_receipt(
+            Some(&descriptor),
+            Some((1000, 1000)),
+            Some(receipt()),
+        )
+        .expect("matching post-revalidation receipt should authorize release eligibility");
+        assert!(accepted.is_some());
+
+        for invalid in [
+            None,
+            Some(OpenCodeTransferReadinessReceipt {
+                transfer_id: "other-transfer".into(),
+                ..receipt()
+            }),
+            Some(OpenCodeTransferReadinessReceipt {
+                provider_uid: 1001,
+                ..receipt()
+            }),
+            Some(OpenCodeTransferReadinessReceipt {
+                provider_gid: 1001,
+                ..receipt()
+            }),
+        ] {
+            let error =
+                validate_opencode_transfer_receipt(Some(&descriptor), Some((1000, 1000)), invalid)
+                    .expect_err("missing or misbound receipt must reject grant acceptance");
+            assert_eq!(error.code, RuntimeErrorCode::HostAuthenticationFailed);
+        }
+    }
+
+    #[test]
+    fn receipt_without_a_transfer_descriptor_is_rejected() {
+        let error = validate_opencode_transfer_receipt(None, None, Some(receipt()))
+            .expect_err("unexpected transfer receipt must be rejected");
+        assert_eq!(error.code, RuntimeErrorCode::HostAuthenticationFailed);
+        assert!(validate_opencode_transfer_receipt(None, None, None)
+            .unwrap()
+            .is_none());
     }
 }
 

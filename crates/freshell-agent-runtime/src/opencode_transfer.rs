@@ -31,6 +31,49 @@ use serde::{
 use sha2::{Digest, Sha256};
 
 const DESTINATION_SCHEMA: &str = "opencode-1.18.21";
+const DESTINATION_IMPORT_OVERHEAD_BYTES: u64 = 1024 * 1024;
+
+/// Test seam and production contract for checking the provider volume before
+/// creating any destination directories or opening SQLite.
+pub trait DestinationCapacityProvider {
+    fn available_bytes(&self, existing_directory: &Path) -> io::Result<u64>;
+}
+
+struct FilesystemCapacityProvider;
+
+impl DestinationCapacityProvider for FilesystemCapacityProvider {
+    fn available_bytes(&self, existing_directory: &Path) -> io::Result<u64> {
+        #[cfg(unix)]
+        {
+            let path = std::ffi::CString::new(existing_directory.as_os_str().as_encoded_bytes())
+                .map_err(|_| {
+                    io::Error::new(io::ErrorKind::InvalidInput, "invalid capacity path")
+                })?;
+            let mut stats = std::mem::MaybeUninit::<libc::statvfs>::zeroed();
+            let result = unsafe { libc::statvfs(path.as_ptr(), stats.as_mut_ptr()) };
+            if result != 0 {
+                return Err(io::Error::last_os_error());
+            }
+            let stats = unsafe { stats.assume_init() };
+            Ok(statvfs_available_bytes(&stats))
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = existing_directory;
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "provider-volume capacity check is unavailable on this platform",
+            ))
+        }
+    }
+}
+
+// libc exposes statvfs counters at the target's native unsigned-long width;
+// widen both before multiplying so 32-bit Unix builds keep the same byte math.
+#[allow(clippy::unnecessary_cast)]
+fn statvfs_available_bytes(stats: &libc::statvfs) -> u64 {
+    (stats.f_bavail as u64).saturating_mul(stats.f_frsize as u64)
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum OpenCodeImportError {
@@ -86,6 +129,18 @@ pub struct InstalledStoreReadable {
     pub structural_sha256: String,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct InstalledStoreReaderContext<'a> {
+    pub database_path: &'a Path,
+    pub workspace_root: &'a Path,
+    pub provider_uid: u32,
+    pub provider_gid: u32,
+    pub home: &'a Path,
+    pub xdg_data_home: &'a Path,
+    pub xdg_config_home: &'a Path,
+    pub cwd: &'a Path,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct StageMetadata {
@@ -131,6 +186,22 @@ pub fn import_bundle_payload<R: Read>(
     destination_database: &Path,
     workspace_root: &Path,
 ) -> Result<ImportReceipt, OpenCodeImportError> {
+    import_bundle_payload_with_capacity(
+        descriptor,
+        payload,
+        destination_database,
+        workspace_root,
+        &FilesystemCapacityProvider,
+    )
+}
+
+pub fn import_bundle_payload_with_capacity<R: Read>(
+    descriptor: &OpenCodeTransferDescriptor,
+    payload: R,
+    destination_database: &Path,
+    workspace_root: &Path,
+    capacity: &impl DestinationCapacityProvider,
+) -> Result<ImportReceipt, OpenCodeImportError> {
     validate_descriptor(descriptor)?;
     let manifest = parse_manifest(descriptor)?;
     if manifest.payload_bytes != descriptor.files[0].size_bytes
@@ -144,8 +215,21 @@ pub fn import_bundle_payload<R: Read>(
     let parent = destination_database.parent().ok_or_else(|| {
         OpenCodeImportError::Blocked("destination database has no parent directory".into())
     })?;
-    fs::create_dir_all(parent)?;
     reject_symlink_components(destination_database)?;
+    let capacity_root = nearest_existing_directory(parent)?;
+    let available = capacity.available_bytes(&capacity_root)?;
+    let required = descriptor
+        .total_bytes
+        .checked_add(DESTINATION_IMPORT_OVERHEAD_BYTES)
+        .ok_or_else(|| {
+            OpenCodeImportError::Blocked("destination size estimate overflowed".into())
+        })?;
+    if available < required {
+        return Err(OpenCodeImportError::Blocked(
+            "provider volume has insufficient free space for the OpenCode history import".into(),
+        ));
+    }
+    fs::create_dir_all(parent)?;
 
     let mut connection = Connection::open(destination_database)?;
     connection.busy_timeout(std::time::Duration::from_secs(5))?;
@@ -198,20 +282,43 @@ pub fn import_bundle_payload<R: Read>(
     Ok(receipt_for(descriptor, &manifest, structural_sha256))
 }
 
+fn nearest_existing_directory(path: &Path) -> Result<PathBuf, OpenCodeImportError> {
+    for candidate in path.ancestors() {
+        match fs::symlink_metadata(candidate) {
+            Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {
+                return Ok(candidate.to_path_buf());
+            }
+            Ok(_) => {
+                return Err(OpenCodeImportError::Blocked(
+                    "provider destination ancestor is not a real directory".into(),
+                ));
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Err(OpenCodeImportError::Blocked(
+        "provider destination has no existing filesystem ancestor".into(),
+    ))
+}
+
 /// Verify an installed baseline with a read-only connection. Session-host runs
 /// this from a setpriv child under the provider UID with the provider's exact
 /// HOME/XDG/OPENCODE_DB and working directory.
 pub fn verify_installed_store(
     descriptor: &OpenCodeTransferDescriptor,
-    database_path: &Path,
-    workspace_root: &Path,
-    provider_uid: u32,
-    provider_gid: u32,
-    home: &Path,
-    xdg_data_home: &Path,
-    xdg_config_home: &Path,
-    cwd: &Path,
+    reader: &InstalledStoreReaderContext<'_>,
 ) -> Result<InstalledStoreReadable, OpenCodeImportError> {
+    let InstalledStoreReaderContext {
+        database_path,
+        workspace_root,
+        provider_uid,
+        provider_gid,
+        home,
+        xdg_data_home,
+        xdg_config_home,
+        cwd,
+    } = *reader;
     validate_descriptor(descriptor)?;
     if descriptor.target_build_receipt
         != opencode_target_build_receipt(&descriptor.target_image_ref, DESTINATION_SCHEMA)

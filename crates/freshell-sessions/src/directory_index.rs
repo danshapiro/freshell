@@ -2637,6 +2637,14 @@ pub(crate) mod tests {
         }
     }
 
+    /// Wait for the current index sweep to finish publishing. The dirty maps
+    /// are drained at the start of a sweep, so `!has_dirty()` alone does not
+    /// mean that its refreshed snapshot is available yet.
+    async fn wait_for_refresh_to_settle(index: &SessionIndex) {
+        let guard = index.refresh_lock.lock().await;
+        drop(guard);
+    }
+
     fn unique_temp_dir(label: &str) -> std::path::PathBuf {
         static COUNTER: AtomicUsize = AtomicUsize::new(0);
         std::env::temp_dir().join(format!(
@@ -6856,7 +6864,7 @@ pub(crate) mod tests {
         )
         .unwrap();
         index.mark_dirty(&[(metadata.clone(), "amplifier".to_string())]);
-        assert!(wait_until(Duration::from_secs(2), || !index.has_dirty()).await);
+        wait_for_refresh_to_settle(&index).await;
 
         let snap2 = index.snapshot().await;
         let row2 = snap2.iter().find(|s| s.provider == "amplifier").unwrap();
@@ -6879,7 +6887,7 @@ pub(crate) mod tests {
         // A steady second scoped mark (no file movement) re-parses nothing,
         // proving the folded-vs-folded cache keys match (no raw-fold thrash).
         index.mark_dirty(&[(metadata.clone(), "amplifier".to_string())]);
-        assert!(wait_until(Duration::from_secs(2), || !index.has_dirty()).await);
+        wait_for_refresh_to_settle(&index).await;
         assert_eq!(
             parse_calls.load(Ordering::SeqCst),
             2,
@@ -6897,7 +6905,7 @@ pub(crate) mod tests {
         )
         .unwrap();
         index.mark_dirty(&[(metadata.clone(), "amplifier".to_string())]);
-        assert!(wait_until(Duration::from_secs(2), || !index.has_dirty()).await);
+        wait_for_refresh_to_settle(&index).await;
 
         let snap3 = index.snapshot().await;
         let row3 = snap3.iter().find(|s| s.provider == "amplifier").unwrap();

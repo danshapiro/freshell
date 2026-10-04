@@ -11,6 +11,7 @@ use freshell_runtime_protocol::{
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
+    collections::HashSet,
     fs::{self, File, OpenOptions},
     io::{Read, Seek, SeekFrom, Write},
     os::unix::fs::{OpenOptionsExt, PermissionsExt},
@@ -124,7 +125,7 @@ impl OpenCodeTransferStaging {
             return Err(StagingError::Io(std::io::Error::last_os_error()));
         }
         let stats = unsafe { stats.assume_init() };
-        Ok((stats.f_bavail as u64).saturating_mul(stats.f_frsize as u64))
+        Ok(statvfs_available_bytes(&stats))
     }
 
     /// Begin or resume staging. `available_bytes` is measured by the
@@ -143,12 +144,6 @@ impl OpenCodeTransferStaging {
                 "bundle exceeds the configured per-bundle limit".into(),
             ));
         }
-        if available_bytes < descriptor.total_bytes {
-            return Err(StagingError::Capacity(
-                "filesystem free space is below the bundle size".into(),
-            ));
-        }
-
         let partial = self.partial_path(&descriptor.transfer_id);
         let queued = self.queued_path(&descriptor.transfer_id);
         let ready = self.ready_path(&descriptor.transfer_id);
@@ -163,17 +158,41 @@ impl OpenCodeTransferStaging {
         }
         if partial.exists() || queued.exists() {
             let existing_dir = if partial.exists() { &partial } else { &queued };
-            let existing = self.read_descriptor(existing_dir)?;
+            let existing = if partial.exists() {
+                self.recover_partial_initialization(existing_dir, descriptor)?
+            } else {
+                self.read_descriptor(existing_dir)?
+            };
             ensure_same_descriptor(&existing, descriptor)?;
             if queued.exists() {
                 if !self.has_capacity(descriptor.total_bytes)? {
                     return Ok(StagingStart::Queued);
                 }
+                if available_bytes < descriptor.total_bytes {
+                    return Err(StagingError::Capacity(
+                        "filesystem free space is below the remaining bundle size".into(),
+                    ));
+                }
                 fs::rename(&queued, &partial)?;
+                fs::set_permissions(&partial, fs::Permissions::from_mode(TRANSFER_ROOT_MODE))?;
                 self.create_partial_files(&partial, descriptor)?;
                 sync_parent(&partial)?;
+            } else {
+                self.create_partial_files(&partial, descriptor)?;
+                let required = self.remaining_bytes(descriptor, &partial)?;
+                if available_bytes < required {
+                    return Err(StagingError::Capacity(
+                        "filesystem free space is below the remaining bundle size".into(),
+                    ));
+                }
             }
             return self.resume_offsets(descriptor, &partial);
+        }
+
+        if available_bytes < descriptor.total_bytes {
+            return Err(StagingError::Capacity(
+                "filesystem free space is below the bundle size".into(),
+            ));
         }
 
         if !self.has_capacity(descriptor.total_bytes)? {
@@ -186,6 +205,7 @@ impl OpenCodeTransferStaging {
 
         fs::create_dir(&partial)?;
         fs::set_permissions(&partial, fs::Permissions::from_mode(TRANSFER_ROOT_MODE))?;
+        sync_parent(&partial)?;
         self.write_descriptor(&partial, descriptor)?;
         for file in &descriptor.files {
             let path = part_file(&partial, file.index);
@@ -196,6 +216,7 @@ impl OpenCodeTransferStaging {
                 .open(path)?
                 .sync_all()?;
         }
+        File::open(&partial)?.sync_all()?;
         sync_parent(&partial)?;
         Ok(StagingStart::Started {
             next_sequence: 0,
@@ -237,7 +258,7 @@ impl OpenCodeTransferStaging {
 
         let next_sequence = self.recover_next_sequence(&descriptor, &partial)?;
         if chunk.sequence < next_sequence {
-            let path = part_file(&partial, chunk.file_index);
+            let path = staged_file(&partial, chunk.file_index)?;
             let mut existing = File::open(path)?;
             existing.seek(SeekFrom::Start(chunk.offset))?;
             let mut previous = vec![0; chunk.data.len()];
@@ -283,7 +304,7 @@ impl OpenCodeTransferStaging {
         let descriptor = self.read_descriptor(&partial)?;
         self.recover_next_sequence(&descriptor, &partial)?;
         for file in &descriptor.files {
-            let source = part_file(&partial, file.index);
+            let source = staged_file(&partial, file.index)?;
             verify_file(&source, file)?;
         }
         if descriptor.bundle_sha256
@@ -297,19 +318,39 @@ impl OpenCodeTransferStaging {
         for file in &descriptor.files {
             let source = part_file(&partial, file.index);
             let target = ready_file(&partial, file.index);
-            fs::rename(source, target)?;
-            fs::set_permissions(
-                ready_file(&partial, file.index),
-                fs::Permissions::from_mode(READY_FILE_MODE),
+            if source.exists() {
+                fs::rename(&source, &target)?;
+            } else {
+                let metadata = fs::symlink_metadata(&target)?;
+                if metadata.file_type().is_symlink()
+                    || !metadata.is_file()
+                    || metadata.len() != file.size_bytes
+                {
+                    return Err(StagingError::InvalidState(
+                        "finalized transfer file is incomplete or invalid".into(),
+                    ));
+                }
+            }
+            fs::set_permissions(&target, fs::Permissions::from_mode(READY_FILE_MODE))?;
+            File::open(&target)?.sync_all()?;
+        }
+        File::open(&partial)?.sync_all()?;
+        if partial.join("READY").exists() {
+            if fs::read(partial.join("READY"))? != descriptor.bundle_sha256.as_bytes() {
+                return Err(StagingError::InvalidState(
+                    "ready marker does not match transfer digest".into(),
+                ));
+            }
+        } else {
+            write_atomic(
+                &partial.join("READY"),
+                descriptor.bundle_sha256.as_bytes(),
+                READY_FILE_MODE,
             )?;
         }
-        write_atomic(
-            &partial.join("READY"),
-            descriptor.bundle_sha256.as_bytes(),
-            READY_FILE_MODE,
-        )?;
         File::open(&partial)?.sync_all()?;
         fs::set_permissions(&partial, fs::Permissions::from_mode(READY_DIR_MODE))?;
+        File::open(&partial)?.sync_all()?;
         fs::rename(&partial, &ready)?;
         sync_parent(&ready)?;
         self.verify_ready_unlocked(&descriptor)?;
@@ -339,6 +380,107 @@ impl OpenCodeTransferStaging {
         }
         sync_parent(&self.root)?;
         Ok(())
+    }
+
+    /// Persist a supervisor-owned release marker after the session host has
+    /// returned its receipt-confirmed grant acknowledgement. The marker lives
+    /// outside the mounted ready directory and contains no transcript data.
+    pub fn mark_release_eligible(
+        &self,
+        descriptor: &OpenCodeTransferDescriptor,
+        receipt: &freshell_runtime_protocol::OpenCodeTransferReadinessReceipt,
+    ) -> Result<(), StagingError> {
+        let _guard = self.lock.lock().expect("transfer staging lock poisoned");
+        if !receipt.matches_descriptor(descriptor) {
+            return Err(StagingError::InvalidState(
+                "readiness receipt does not match the staged transfer".into(),
+            ));
+        }
+        let ready = self.ready_path(&descriptor.transfer_id);
+        let metadata = fs::symlink_metadata(&ready)?;
+        if metadata.file_type().is_symlink()
+            || !metadata.is_dir()
+            || metadata.permissions().mode() & 0o777 != READY_DIR_MODE
+        {
+            return Err(StagingError::InvalidState(
+                "receipt-confirmed stage is not a private read-only directory".into(),
+            ));
+        }
+        let staged_descriptor = self.read_descriptor(&ready)?;
+        ensure_same_descriptor(&staged_descriptor, descriptor)?;
+        let bytes = serde_json::to_vec(receipt)
+            .map_err(|error| StagingError::Metadata(error.to_string()))?;
+        write_atomic(
+            &self.release_marker_path(&descriptor.transfer_id),
+            &bytes,
+            PRIVATE_FILE_MODE,
+        )?;
+        Ok(())
+    }
+
+    /// Delete only receipt-confirmed ready bundles that no prepared/retry
+    /// launch still references. The durable marker makes startup retries
+    /// idempotent across a crash between stage removal and marker removal.
+    pub fn reclaim_release_eligible(
+        &self,
+        referenced_transfer_ids: &HashSet<String>,
+    ) -> Result<usize, StagingError> {
+        let _guard = self.lock.lock().expect("transfer staging lock poisoned");
+        let mut reclaimed = 0;
+        for entry in fs::read_dir(&self.root)? {
+            let entry = entry?;
+            let name = entry.file_name();
+            let Some(transfer_id) = name
+                .to_str()
+                .and_then(|name| name.strip_suffix(".releasable"))
+            else {
+                continue;
+            };
+            if referenced_transfer_ids.contains(transfer_id) {
+                continue;
+            }
+            let marker = entry.path();
+            let marker_metadata = fs::symlink_metadata(&marker)?;
+            if marker_metadata.file_type().is_symlink() || !marker_metadata.is_file() {
+                return Err(StagingError::InvalidState(
+                    "transfer release marker is not a regular file".into(),
+                ));
+            }
+            let receipt: freshell_runtime_protocol::OpenCodeTransferReadinessReceipt =
+                serde_json::from_slice(&fs::read(&marker)?)
+                    .map_err(|error| StagingError::Metadata(error.to_string()))?;
+            if receipt.transfer_id != transfer_id {
+                return Err(StagingError::InvalidState(
+                    "transfer release marker has a mismatched identity".into(),
+                ));
+            }
+            let ready = self.ready_path(transfer_id);
+            match fs::symlink_metadata(&ready) {
+                Ok(metadata) => {
+                    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                        return Err(StagingError::InvalidState(
+                            "release-eligible stage is not a real directory".into(),
+                        ));
+                    }
+                    let descriptor = self.read_descriptor(&ready)?;
+                    if !receipt.matches_descriptor(&descriptor) {
+                        return Err(StagingError::InvalidState(
+                            "release receipt no longer matches its staged bundle".into(),
+                        ));
+                    }
+                    make_writable_for_owner(&ready)?;
+                    fs::remove_dir_all(&ready)?;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
+            fs::remove_file(marker)?;
+            reclaimed += 1;
+        }
+        if reclaimed > 0 {
+            File::open(&self.root)?.sync_all()?;
+        }
+        Ok(reclaimed)
     }
 
     fn verify_ready_unlocked(
@@ -372,9 +514,10 @@ impl OpenCodeTransferStaging {
         let next_sequence = self.recover_next_sequence(descriptor, path)?;
         let mut offsets = Vec::with_capacity(descriptor.files.len());
         for file in &descriptor.files {
+            let file_path = staged_file(path, file.index)?;
             offsets.push(freshell_runtime_protocol::OpenCodeTransferFileOffset {
                 file_index: file.index,
-                next_offset: fs::metadata(part_file(path, file.index))?.len(),
+                next_offset: fs::metadata(file_path)?.len(),
             });
         }
         Ok(StagingStart::Started {
@@ -391,8 +534,13 @@ impl OpenCodeTransferStaging {
         let mut next = 0;
         let mut previous_incomplete = false;
         for file in &descriptor.files {
-            let file_path = part_file(path, file.index);
-            let mut metadata = fs::metadata(&file_path)?;
+            let file_path = staged_file(path, file.index)?;
+            let metadata = fs::symlink_metadata(&file_path)?;
+            if metadata.file_type().is_symlink() || !metadata.is_file() {
+                return Err(StagingError::InvalidState(
+                    "staged payload entry is not a regular file".into(),
+                ));
+            }
             let mut len = metadata.len();
             if previous_incomplete && len != 0 {
                 return Err(StagingError::InvalidState(
@@ -404,6 +552,15 @@ impl OpenCodeTransferStaging {
                     "staged file exceeds declared size".into(),
                 ));
             }
+            if file_path
+                .extension()
+                .is_some_and(|extension| extension == "bin")
+                && len != file.size_bytes
+            {
+                return Err(StagingError::InvalidState(
+                    "finalized staged file is not complete".into(),
+                ));
+            }
             if len < file.size_bytes && len % MAX_OPENCODE_TRANSFER_CHUNK_BYTES as u64 != 0 {
                 len -= len % MAX_OPENCODE_TRANSFER_CHUNK_BYTES as u64;
                 OpenOptions::new()
@@ -411,9 +568,7 @@ impl OpenCodeTransferStaging {
                     .open(&file_path)?
                     .set_len(len)?;
                 File::open(&file_path)?.sync_all()?;
-                metadata = fs::metadata(&file_path)?;
             }
-            let len = metadata.len();
             next += chunks_for_prefix(file.size_bytes, len);
             previous_incomplete = len < file.size_bytes;
         }
@@ -446,6 +601,71 @@ impl OpenCodeTransferStaging {
         Ok(metadata.descriptor)
     }
 
+    fn recover_partial_initialization(
+        &self,
+        path: &Path,
+        requested: &OpenCodeTransferDescriptor,
+    ) -> Result<OpenCodeTransferDescriptor, StagingError> {
+        fs::set_permissions(path, fs::Permissions::from_mode(TRANSFER_ROOT_MODE))?;
+        for entry in fs::read_dir(path)? {
+            let entry = entry?;
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if name.starts_with(".tmp-") {
+                let metadata = fs::symlink_metadata(entry.path())?;
+                if metadata.file_type().is_symlink() || !metadata.is_file() {
+                    return Err(StagingError::InvalidState(
+                        "staging initialization contains an unexpected temporary entry".into(),
+                    ));
+                }
+                fs::remove_file(entry.path())?;
+            }
+        }
+        let descriptor_path = path.join("descriptor.json");
+        let existing = if descriptor_path.exists() {
+            self.read_descriptor(path)?
+        } else {
+            for entry in fs::read_dir(path)? {
+                let entry = entry?;
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                if name != "descriptor.json" && !name.ends_with(".part") && !name.ends_with(".bin")
+                {
+                    return Err(StagingError::InvalidState(
+                        "incomplete staging directory contains an unknown entry".into(),
+                    ));
+                }
+                let metadata = fs::symlink_metadata(entry.path())?;
+                if metadata.file_type().is_symlink() || !metadata.is_file() || metadata.len() != 0 {
+                    return Err(StagingError::InvalidState(
+                        "descriptor-less staging directory contains payload data".into(),
+                    ));
+                }
+            }
+            self.write_descriptor(path, requested)?;
+            requested.clone()
+        };
+        ensure_same_descriptor(&existing, requested)?;
+        Ok(existing)
+    }
+
+    fn remaining_bytes(
+        &self,
+        descriptor: &OpenCodeTransferDescriptor,
+        path: &Path,
+    ) -> Result<u64, StagingError> {
+        descriptor.files.iter().try_fold(0_u64, |remaining, file| {
+            let staged = staged_file(path, file.index)?;
+            let length = fs::metadata(staged)?.len();
+            if length > file.size_bytes {
+                return Err(StagingError::InvalidState(
+                    "staged file exceeds declared size".into(),
+                ));
+            }
+            Ok(remaining.saturating_add(file.size_bytes - length))
+        })
+    }
+
     fn write_descriptor(
         &self,
         path: &Path,
@@ -465,15 +685,21 @@ impl OpenCodeTransferStaging {
         descriptor: &OpenCodeTransferDescriptor,
     ) -> Result<(), StagingError> {
         for file in &descriptor.files {
-            let path = part_file(path, file.index);
-            if path.exists() {
+            let part = part_file(path, file.index);
+            let ready = ready_file(path, file.index);
+            if part.exists() && ready.exists() {
+                return Err(StagingError::InvalidState(
+                    "staged file has both partial and finalized entries".into(),
+                ));
+            }
+            if part.exists() || ready.exists() {
                 continue;
             }
             OpenOptions::new()
                 .write(true)
                 .create_new(true)
                 .mode(PRIVATE_FILE_MODE)
-                .open(path)?
+                .open(part)?
                 .sync_all()?;
         }
         Ok(())
@@ -490,6 +716,17 @@ impl OpenCodeTransferStaging {
     fn ready_path(&self, transfer_id: &str) -> PathBuf {
         self.root.join(format!("{transfer_id}.ready"))
     }
+
+    fn release_marker_path(&self, transfer_id: &str) -> PathBuf {
+        self.root.join(format!("{transfer_id}.releasable"))
+    }
+}
+
+// libc exposes statvfs counters at the target's native unsigned-long width;
+// widen both before multiplying so 32-bit Unix builds keep the same byte math.
+#[allow(clippy::unnecessary_cast)]
+fn statvfs_available_bytes(stats: &libc::statvfs) -> u64 {
+    (stats.f_bavail as u64).saturating_mul(stats.f_frsize as u64)
 }
 
 fn ensure_same_descriptor(
@@ -506,6 +743,21 @@ fn ensure_same_descriptor(
 
 fn part_file(root: &Path, index: u32) -> PathBuf {
     root.join(format!("entry-{index:04}.part"))
+}
+
+fn staged_file(root: &Path, index: u32) -> Result<PathBuf, StagingError> {
+    let partial = part_file(root, index);
+    let finalized = ready_file(root, index);
+    match (partial.exists(), finalized.exists()) {
+        (true, false) => Ok(partial),
+        (false, true) => Ok(finalized),
+        (false, false) => Err(StagingError::InvalidState(
+            "staged payload entry is missing".into(),
+        )),
+        (true, true) => Err(StagingError::InvalidState(
+            "staged file has both partial and finalized entries".into(),
+        )),
+    }
 }
 
 fn ready_file(root: &Path, index: u32) -> PathBuf {
@@ -602,12 +854,7 @@ fn write_atomic(path: &Path, bytes: &[u8], mode: u32) -> Result<(), std::io::Err
 }
 
 fn sync_parent(path: &Path) -> Result<(), std::io::Error> {
-    let parent = if path.is_dir() {
-        path.parent()
-    } else {
-        path.parent()
-    };
-    if let Some(parent) = parent {
+    if let Some(parent) = path.parent() {
         File::open(parent)?.sync_all()?;
     }
     Ok(())
