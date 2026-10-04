@@ -781,6 +781,7 @@ async fn session_directory(
 struct PersistedIdentityCollision {
     key: String,
     source_files: Vec<String>,
+    duplicate_item_count: usize,
 }
 
 const IDENTITY_COLLISION_KEY_SAMPLE_LIMIT: usize = 20;
@@ -846,6 +847,9 @@ fn persisted_identity_collisions(items: &[DirItem]) -> Vec<PersistedIdentityColl
             let Occurrences::Duplicate(indices) = occurrences else {
                 return None;
             };
+            // Row multiplicity proves the collision even when every source
+            // path is missing or repeats the same diagnostic value.
+            let duplicate_item_count = indices.len();
             let mut source_files: Vec<String> = indices
                 .into_iter()
                 .flat_map(|index| {
@@ -865,6 +869,7 @@ fn persisted_identity_collisions(items: &[DirItem]) -> Vec<PersistedIdentityColl
             Some(PersistedIdentityCollision {
                 key: format!("{provider}:{session_id}"),
                 source_files,
+                duplicate_item_count,
             })
         })
         .collect()
@@ -877,34 +882,38 @@ fn merge_unresolved_codex_identity_collisions(
     collisions: Vec<PersistedIdentityCollision>,
     unresolved: &[CodexUnresolvedIdentity],
 ) -> Vec<PersistedIdentityCollision> {
-    let mut sources_by_key: std::collections::BTreeMap<String, std::collections::BTreeSet<String>> =
-        std::collections::BTreeMap::new();
+    let mut by_key: std::collections::BTreeMap<
+        String,
+        (std::collections::BTreeSet<String>, usize),
+    > = std::collections::BTreeMap::new();
     for collision in collisions {
-        sources_by_key
-            .entry(collision.key)
-            .or_default()
-            .extend(collision.source_files);
+        let (paths, count) = by_key.entry(collision.key).or_default();
+        paths.extend(collision.source_files);
+        *count = (*count).max(collision.duplicate_item_count);
     }
     for group in unresolved {
         if group.paths.len() < 2 {
             continue;
         }
         let key = format!("codex:{}", group.session_id);
-        sources_by_key.entry(key).or_default().extend(
+        let (paths, count) = by_key.entry(key).or_default();
+        paths.extend(
             group
                 .paths
                 .iter()
                 .map(|path| path.to_string_lossy().into_owned()),
         );
+        *count = (*count).max(group.paths.len());
     }
-    sources_by_key
+    by_key
         .into_iter()
-        .filter_map(|(key, paths)| {
-            (paths.len() >= 2).then(|| PersistedIdentityCollision {
+        .map(
+            |(key, (paths, duplicate_item_count))| PersistedIdentityCollision {
                 key,
                 source_files: paths.into_iter().collect(),
-            })
-        })
+                duplicate_item_count,
+            },
+        )
         .collect()
 }
 
@@ -957,7 +966,7 @@ fn persisted_identity_collision_log_summary(
         collision_count: collisions.len(),
         duplicate_item_count: collisions
             .iter()
-            .map(|collision| collision.source_files.len())
+            .map(|collision| collision.duplicate_item_count)
             .sum(),
         samples,
         collision_samples_truncated: collisions.len() > IDENTITY_COLLISION_KEY_SAMPLE_LIMIT,
@@ -4124,6 +4133,73 @@ mod tests {
         .await;
         assert_eq!(filtered["items"].as_array().unwrap().len(), 0);
         assert_eq!(filtered["integrityError"]["collisionCount"], json!(1));
+
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[tokio::test]
+    async fn amplifier_rows_without_source_files_keep_identity_collision_quarantined() {
+        let home = unique_temp_dir();
+        let amplifier_home = home.join(".amplifier");
+        let sessions = amplifier_home
+            .join("projects")
+            .join("project")
+            .join("sessions");
+        for (directory, session_id) in [
+            ("copy-a", "shared-amplifier-id"),
+            ("copy-b", "shared-amplifier-id"),
+            ("healthy", "healthy-amplifier-id"),
+        ] {
+            let session_dir = sessions.join(directory);
+            std::fs::create_dir_all(&session_dir).unwrap();
+            std::fs::write(
+                session_dir.join("metadata.json"),
+                json!({
+                    "session_id": session_id,
+                    "working_dir": "/project",
+                    "created": "2026-10-03T00:00:00.000Z",
+                    "name": directory,
+                })
+                .to_string(),
+            )
+            .unwrap();
+        }
+        let source = freshell_sessions::amplifier::AmplifierSource::new(amplifier_home);
+        let discovered = source.scan();
+        assert_eq!(discovered.len(), 3);
+        assert!(discovered.iter().all(|item| item.source_file.is_none()));
+        let app = router(SessionDirectoryState {
+            auth_token: Arc::new("tok".to_string()),
+            settings: crate::settings_store::SettingsStore::load(
+                Some(&home),
+                vec!["amplifier".into()],
+            ),
+            session_index: Some(Arc::new(test_session_index(vec![Arc::new(source)]))),
+            identity: freshell_ws::identity::TerminalIdentityRegistry::new(),
+            metadata: crate::session_metadata::SessionMetadataStore::new(home.join(".freshell")),
+            server_instance: Arc::new("srv-amplifier-test".to_string()),
+            collision_signatures: Default::default(),
+            legacy_name_migration_completed: false,
+        });
+
+        let base = "/api/session-directory?priority=visible&includeNonInteractive=1";
+        let page = get_directory_page(&app, base).await;
+        assert_eq!(
+            page["integrityError"],
+            json!({
+                "kind": "identity_collision",
+                "collisionCount": 1,
+                "duplicateItemCount": 2,
+            })
+        );
+        assert_eq!(page["partial"], json!(true));
+        let rows = page["items"].as_array().unwrap();
+        assert_eq!(rows.len(), 1, "only the healthy row remains visible");
+        assert_eq!(rows[0]["sessionId"], json!("healthy-amplifier-id"));
+
+        let filtered = get_directory_page(&app, &format!("{base}&query=missing&limit=1")).await;
+        assert!(filtered["items"].as_array().unwrap().is_empty());
+        assert_eq!(filtered["integrityError"], page["integrityError"]);
 
         std::fs::remove_dir_all(&home).ok();
     }
