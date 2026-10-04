@@ -12,12 +12,14 @@ use freshell_agent_runtime::prepare_terminal_for_resume;
 use freshell_runtime_protocol::{
     host_proof, read_frame, write_frame, ControlRole, Envelope, FixtureKind, FreshAgentLaunchSpec,
     GrantId, HostBootId, HostCommand, HostReply, HostResult, IncarnationId,
-    OpenCodeTransferDescriptor, ProviderBootstrapFile, RecoveryPath, RecoveryProbe, ResumeSpec,
-    RuntimeError, RuntimeErrorCode, RuntimeLimits, RuntimeMetrics, SoulId, TerminalLaunchSpec,
-    CONTROL_PROTOCOL_VERSION, MAX_OPENCODE_TRANSFER_MANIFEST_BYTES,
+    OpenCodeTransferDescriptor, OpenCodeTransferReadinessReceipt, ProviderBootstrapFile,
+    RecoveryPath, RecoveryProbe, ResumeSpec, RuntimeError, RuntimeErrorCode, RuntimeLimits,
+    RuntimeMetrics, SoulId, TerminalLaunchSpec, CONTROL_PROTOCOL_VERSION,
+    MAX_OPENCODE_TRANSFER_MANIFEST_BYTES,
 };
 use pty::HostedPty;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::{
     io::{self, Read, Write},
     path::{Path, PathBuf},
@@ -44,6 +46,8 @@ struct PersistedHostState {
     worker_pid: Option<u32>,
     worker_launch_count: u64,
     fixture_evidence: serde_json::Value,
+    #[serde(default)]
+    opencode_transfer_receipt: Option<OpenCodeTransferReadinessReceipt>,
 }
 
 struct HostState {
@@ -637,6 +641,7 @@ async fn dispatch(
                         fixture_evidence: evidence,
                         exited,
                         native_session_id,
+                        opencode_transfer_receipt: persisted.opencode_transfer_receipt.clone(),
                     })
                 }
                 HostCommand::TerminalInput {
@@ -1058,6 +1063,7 @@ async fn grant_execution(
     let mut persisted = state.persisted.lock().await;
     let mut transfer_prepared_terminal = None;
     let mut transfer_phase_gate = None;
+    let mut transfer_readiness_receipt = None;
     if control_epoch < persisted.max_control_epoch
         || execution_generation < persisted.max_execution_generation
     {
@@ -1080,6 +1086,7 @@ async fn grant_execution(
                     worker_launch_count: persisted.worker_launch_count,
                     fixture_evidence: persisted.fixture_evidence.clone(),
                     native_session_id,
+                    opencode_transfer_receipt: persisted.opencode_transfer_receipt.clone(),
                 });
             }
             return Err(RuntimeError::new(
@@ -1105,7 +1112,12 @@ async fn grant_execution(
             (None, _) => unreachable!("transfer was checked on a terminal"),
         };
         let mut phase_gate = OpenCodeTransferGate::default();
-        run_opencode_transfer_readiness(state, &soul_id, &mut preflight_terminal, &mut phase_gate)?;
+        transfer_readiness_receipt = run_opencode_transfer_readiness(
+            state,
+            &soul_id,
+            &mut preflight_terminal,
+            &mut phase_gate,
+        )?;
         transfer_prepared_terminal = Some(preflight_terminal.clone());
         transfer_phase_gate = Some(phase_gate);
         persisted = state.persisted.lock().await;
@@ -1126,6 +1138,7 @@ async fn grant_execution(
                         worker_launch_count: persisted.worker_launch_count,
                         fixture_evidence: persisted.fixture_evidence.clone(),
                         native_session_id: None,
+                        opencode_transfer_receipt: persisted.opencode_transfer_receipt.clone(),
                     });
                 }
                 return Err(RuntimeError::new(
@@ -1224,6 +1237,7 @@ async fn grant_execution(
         persisted.grant_id = Some(grant_id.clone());
         persisted.provider = provider.clone();
         persisted.worker_pid = None;
+        persisted.opencode_transfer_receipt = transfer_readiness_receipt.clone();
         write_state(&state.state_dir, persisted).map_err(registry_like_error)
     };
 
@@ -1572,6 +1586,7 @@ async fn grant_execution(
         worker_launch_count: persisted.worker_launch_count,
         fixture_evidence: persisted.fixture_evidence.clone(),
         native_session_id,
+        opencode_transfer_receipt: persisted.opencode_transfer_receipt.clone(),
     })
 }
 
@@ -1580,6 +1595,7 @@ const OPENCODE_PROVIDER_HOME: &str = "/home/freshell/provider";
 const OPENCODE_PROVIDER_DB: &str = "/home/freshell/provider/.local/share/opencode/opencode.db";
 const MAX_OPENCODE_RECEIPT_BYTES: usize = 64 * 1024;
 
+#[derive(Clone)]
 struct OpencodeReaderPaths {
     home: PathBuf,
     xdg_data_home: PathBuf,
@@ -1587,6 +1603,23 @@ struct OpencodeReaderPaths {
     database: PathBuf,
     workspace: PathBuf,
     cwd: PathBuf,
+}
+
+fn installed_store_reader_context(
+    paths: &OpencodeReaderPaths,
+    provider_uid: u32,
+    provider_gid: u32,
+) -> freshell_agent_runtime::opencode_transfer::InstalledStoreReaderContext<'_> {
+    freshell_agent_runtime::opencode_transfer::InstalledStoreReaderContext {
+        database_path: &paths.database,
+        workspace_root: &paths.workspace,
+        provider_uid,
+        provider_gid,
+        home: &paths.home,
+        xdg_data_home: &paths.xdg_data_home,
+        xdg_config_home: &paths.xdg_config_home,
+        cwd: &paths.cwd,
+    }
 }
 
 fn validate_opencode_reader_paths(
@@ -1614,14 +1647,52 @@ fn validate_opencode_reader_paths(
     if !workspace.is_dir() || !cwd.is_dir() || !cwd.starts_with(&workspace) {
         return Err("OpenCode working directory is outside its workspace".into());
     }
-    Ok(OpencodeReaderPaths {
+    let paths = OpencodeReaderPaths {
         home: PathBuf::from(OPENCODE_PROVIDER_HOME),
         xdg_data_home: PathBuf::from("/home/freshell/provider/.local/share"),
         xdg_config_home: PathBuf::from("/home/freshell/provider/.config"),
         database: PathBuf::from(OPENCODE_PROVIDER_DB),
         workspace,
         cwd,
-    })
+    };
+    for path in [
+        &paths.home,
+        &paths.xdg_data_home,
+        &paths.xdg_config_home,
+        &paths.database,
+    ] {
+        reject_symlink_components(path)?;
+    }
+    Ok(paths)
+}
+
+fn reject_symlink_components(path: &Path) -> Result<(), String> {
+    if !path.is_absolute() {
+        return Err("OpenCode provider path must be absolute".into());
+    }
+    let components = path.components().collect::<Vec<_>>();
+    let mut current = PathBuf::new();
+    for (index, component) in components.iter().enumerate() {
+        if matches!(
+            component,
+            std::path::Component::ParentDir | std::path::Component::CurDir
+        ) {
+            return Err("OpenCode provider path contains a relative component".into());
+        }
+        current.push(component.as_os_str());
+        match std::fs::symlink_metadata(&current) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err("OpenCode provider path contains a symbolic link".into());
+            }
+            Ok(metadata) if index + 1 < components.len() && !metadata.is_dir() => {
+                return Err("OpenCode provider path crosses a non-directory".into());
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(format!("OpenCode provider path cannot be checked: {error}")),
+        }
+    }
+    Ok(())
 }
 
 fn validate_opencode_helper_identity(uid: u32, gid: u32) -> Result<(), String> {
@@ -1648,15 +1719,16 @@ fn run_opencode_import_worker(args: &[String]) -> Result<(), String> {
     if descriptor.destination_database_path != ".local/share/opencode/opencode.db" {
         return Err("OpenCode import destination path is unsupported".into());
     }
-    let mut payload = (&mut stdin).take(descriptor.files[0].size_bytes);
-    let receipt = freshell_agent_runtime::opencode_transfer::import_bundle_payload(
-        &descriptor,
-        &mut payload,
-        &paths.database,
-        &paths.workspace,
-    )
-    .map_err(|_| "provider-identity OpenCode import failed".to_string())?;
-    drop(payload);
+    let receipt = {
+        let mut payload = (&mut stdin).take(descriptor.files[0].size_bytes);
+        freshell_agent_runtime::opencode_transfer::import_bundle_payload(
+            &descriptor,
+            &mut payload,
+            &paths.database,
+            &paths.workspace,
+        )
+        .map_err(|_| "provider-identity OpenCode import failed".to_string())?
+    };
     let mut trailing = [0_u8; 1];
     if stdin
         .read(&mut trailing)
@@ -1687,16 +1759,10 @@ fn run_opencode_reader_probe(args: &[String]) -> Result<(), String> {
     {
         return Err("OpenCode reader probe received trailing bytes".into());
     }
+    let reader_context = installed_store_reader_context(&paths, uid, gid);
     let receipt = freshell_agent_runtime::opencode_transfer::verify_installed_store(
         &descriptor,
-        &paths.database,
-        &paths.workspace,
-        uid,
-        gid,
-        &paths.home,
-        &paths.xdg_data_home,
-        &paths.xdg_config_home,
-        &paths.cwd,
+        &reader_context,
     )
     .map_err(|_| {
         "provider-identity OpenCode reader could not read the installed history".to_string()
@@ -1789,6 +1855,7 @@ struct OpenCodeTransferProgress {
     payload_path: Option<PathBuf>,
     import_receipt: Option<freshell_agent_runtime::opencode_transfer::ImportReceipt>,
     reader_receipt: Option<freshell_agent_runtime::opencode_transfer::InstalledStoreReadable>,
+    readiness_receipt: Option<OpenCodeTransferReadinessReceipt>,
 }
 
 fn run_opencode_transfer_readiness(
@@ -1796,9 +1863,9 @@ fn run_opencode_transfer_readiness(
     soul_id: &SoulId,
     terminal: &mut TerminalLaunchSpec,
     phase_gate: &mut OpenCodeTransferGate,
-) -> Result<(), RuntimeError> {
+) -> Result<Option<OpenCodeTransferReadinessReceipt>, RuntimeError> {
     if terminal.opencode_transfer.is_none() {
-        return Ok(());
+        return Ok(None);
     }
     let mut progress = OpenCodeTransferProgress::default();
     run_opencode_transfer_readiness_sequence(phase_gate, |phase| {
@@ -1810,6 +1877,7 @@ fn run_opencode_transfer_readiness(
             format!("OpenCode history import/readability preflight failed: {error}"),
         )
     })
+    .map(|()| progress.readiness_receipt)
 }
 
 fn perform_opencode_transfer_phase(
@@ -1932,7 +2000,7 @@ fn perform_opencode_transfer_phase(
                 .import_receipt
                 .as_ref()
                 .ok_or("OpenCode import receipt is unavailable")?;
-            validate_import_receipt_binding(import_receipt, descriptor, &paths.database)?;
+            validate_import_receipt_binding(import_receipt, descriptor, paths)?;
         }
         OpenCodeTransferPhase::ImportReceiptDurable => {
             let import_receipt = progress
@@ -2023,7 +2091,8 @@ fn perform_opencode_transfer_phase(
             .map_err(|_| "OpenCode transfer receipts could not be recorded")?;
         }
         OpenCodeTransferPhase::ReceiptsRevalidated => {
-            revalidate_opencode_transfer_receipts(state, terminal)?;
+            progress.readiness_receipt =
+                Some(revalidate_opencode_transfer_receipts(state, terminal)?);
         }
         OpenCodeTransferPhase::GrantConsumed | OpenCodeTransferPhase::PtySpawned => {
             return Err("launch phase is outside OpenCode transfer readiness".into());
@@ -2038,7 +2107,7 @@ fn perform_opencode_transfer_phase(
 fn revalidate_opencode_transfer_receipts(
     state: &HostState,
     terminal: &TerminalLaunchSpec,
-) -> Result<(), String> {
+) -> Result<OpenCodeTransferReadinessReceipt, String> {
     let descriptor = terminal
         .opencode_transfer
         .as_ref()
@@ -2057,40 +2126,25 @@ fn revalidate_opencode_transfer_receipts(
         Path::new(&terminal.workspace_path),
         Path::new(&terminal.cwd),
     )?;
-    let import_receipt: freshell_agent_runtime::opencode_transfer::ImportReceipt =
-        read_opencode_receipt(
-            &state.state_dir,
-            &format!("opencode-{}-import.json", descriptor.transfer_id),
-        )?;
-    validate_import_receipt_binding(&import_receipt, descriptor, &paths.database)?;
-    let readable_receipt: freshell_agent_runtime::opencode_transfer::InstalledStoreReadable =
-        read_opencode_receipt(
-            &state.state_dir,
-            &format!("opencode-{}-readable.json", descriptor.transfer_id),
-        )?;
-    validate_reader_receipt_binding(
-        &readable_receipt,
+    let receipt = revalidate_opencode_transfer_receipts_with_reader(
+        &state.state_dir,
         descriptor,
         &paths,
         terminal.run_as_uid,
         terminal.run_as_gid,
-        &import_receipt,
+        || {
+            let reader_output = run_opencode_provider_helper(
+                terminal,
+                descriptor,
+                &paths.workspace,
+                &paths.cwd,
+                "opencode-reader-probe",
+                None,
+            )?;
+            serde_json::from_slice(&reader_output)
+                .map_err(|_| "provider reader returned an invalid revalidation receipt".to_string())
+        },
     )?;
-
-    let reader_output = run_opencode_provider_helper(
-        terminal,
-        descriptor,
-        &paths.workspace,
-        &paths.cwd,
-        "opencode-reader-probe",
-        None,
-    )?;
-    let current_receipt: freshell_agent_runtime::opencode_transfer::InstalledStoreReadable =
-        serde_json::from_slice(&reader_output)
-            .map_err(|_| "provider reader returned an invalid revalidation receipt")?;
-    if current_receipt != readable_receipt {
-        return Err("installed OpenCode store changed after its durable receipt".into());
-    }
     append_event_with_secret(
         &state.state_dir,
         &state.secret,
@@ -2099,11 +2153,68 @@ fn revalidate_opencode_transfer_receipts(
             "transferId": descriptor.transfer_id,
             "providerUid": terminal.run_as_uid,
             "providerGid": terminal.run_as_gid,
-            "structuralSha256": current_receipt.structural_sha256,
+            "structuralSha256": receipt.structural_sha256,
         }),
     )
     .map_err(|_| "OpenCode durable receipts could not be revalidated")?;
-    Ok(())
+    Ok(receipt)
+}
+
+fn revalidate_opencode_transfer_receipts_with_reader(
+    state_dir: &Path,
+    descriptor: &OpenCodeTransferDescriptor,
+    paths: &OpencodeReaderPaths,
+    uid: u32,
+    gid: u32,
+    read_current: impl FnOnce() -> Result<
+        freshell_agent_runtime::opencode_transfer::InstalledStoreReadable,
+        String,
+    >,
+) -> Result<OpenCodeTransferReadinessReceipt, String> {
+    let import_receipt: freshell_agent_runtime::opencode_transfer::ImportReceipt =
+        read_opencode_receipt(
+            state_dir,
+            &format!("opencode-{}-import.json", descriptor.transfer_id),
+        )?;
+    validate_import_receipt_binding(&import_receipt, descriptor, paths)?;
+    let readable_receipt: freshell_agent_runtime::opencode_transfer::InstalledStoreReadable =
+        read_opencode_receipt(
+            state_dir,
+            &format!("opencode-{}-readable.json", descriptor.transfer_id),
+        )?;
+    validate_reader_receipt_binding(
+        &readable_receipt,
+        descriptor,
+        paths,
+        uid,
+        gid,
+        &import_receipt,
+    )?;
+    let current_receipt = read_current()?;
+    if current_receipt != readable_receipt {
+        return Err("installed OpenCode store changed after its durable receipt".into());
+    }
+    let reader_receipt_sha256 = sha256_hex(
+        &serde_json::to_vec(&current_receipt)
+            .map_err(|_| "provider-reader receipt could not be fingerprinted")?,
+    );
+    Ok(OpenCodeTransferReadinessReceipt {
+        transfer_id: descriptor.transfer_id.clone(),
+        destination_store_id: descriptor.destination_store_id.clone(),
+        root_session_id: descriptor.root_session_id.clone(),
+        source_generation: descriptor.source_generation.clone(),
+        provider_uid: current_receipt.provider_uid,
+        provider_gid: current_receipt.provider_gid,
+        structural_sha256: current_receipt.structural_sha256.clone(),
+        reader_receipt_sha256,
+    })
+}
+
+fn sha256_hex(value: &[u8]) -> String {
+    Sha256::digest(value)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 
 fn run_opencode_provider_helper(
@@ -2179,15 +2290,28 @@ fn run_opencode_provider_helper(
 fn validate_import_receipt_binding(
     receipt: &freshell_agent_runtime::opencode_transfer::ImportReceipt,
     descriptor: &OpenCodeTransferDescriptor,
-    database: &Path,
+    paths: &OpencodeReaderPaths,
 ) -> Result<(), String> {
     let manifest: freshell_sessions::opencode_transfer::OpenCodeTransferManifest =
         serde_json::from_str(&descriptor.manifest_json)
             .map_err(|_| "OpenCode manifest cannot be revalidated")?;
+    let logical_database = Path::new(&descriptor.destination_database_path);
+    if descriptor.destination_database_path != ".local/share/opencode/opencode.db"
+        || logical_database.is_absolute()
+        || logical_database
+            .components()
+            .any(|component| !matches!(component, std::path::Component::Normal(_)))
+        || paths.xdg_data_home != paths.home.join(".local/share")
+        || paths.xdg_config_home != paths.home.join(".config")
+        || paths.database != paths.home.join(logical_database)
+        || paths.database != paths.xdg_data_home.join("opencode/opencode.db")
+    {
+        return Err("provider database path does not match the exact transfer destination".into());
+    }
     if receipt.version != 1
         || receipt.transfer_id != descriptor.transfer_id
         || receipt.destination_store_id != descriptor.destination_store_id
-        || receipt.destination_database_path != database.to_string_lossy()
+        || receipt.destination_database_path != descriptor.destination_database_path
         || receipt.root_session_id != descriptor.root_session_id
         || receipt.source_store_id != descriptor.source_store_id
         || receipt.source_generation != descriptor.source_generation
@@ -11869,6 +11993,391 @@ mod tests {
         );
         assert!(!forbidden_pty_spawned);
         assert_eq!(blocked_phases, OPENCODE_TRANSFER_READINESS_PHASES[..6]);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn supervisor_staging_and_real_receipts_gate_grant_and_pty_for_synthetic_history() {
+        let success = run_joined_synthetic_transfer(None).await.unwrap();
+        assert_eq!(
+            success.failed_phase, None,
+            "success path failed: {:?}",
+            success.readiness_error
+        );
+        let receipt = success
+            .readiness_receipt
+            .expect("the exact staged import and reader receipts must reach the grant gate");
+        assert_eq!(receipt.transfer_id, "synthetic-transfer");
+        assert_eq!(receipt.provider_uid, unsafe { libc::geteuid() });
+        assert_eq!(receipt.provider_gid, unsafe { libc::getegid() });
+        assert_eq!(receipt.structural_sha256.len(), 64);
+        assert_eq!(receipt.reader_receipt_sha256.len(), 64);
+        assert_eq!(success.failed_phase, None);
+        assert!(success.grant_consumed);
+        assert!(success.pty_callback_invoked);
+
+        for injected_failure in [
+            SyntheticTransferFailure::Mount,
+            SyntheticTransferFailure::Import,
+            SyntheticTransferFailure::Reader,
+            SyntheticTransferFailure::DatabasePath,
+        ] {
+            let attempt = run_joined_synthetic_transfer(Some(injected_failure))
+                .await
+                .unwrap();
+            assert!(attempt.readiness_receipt.is_none());
+            let expected_phase = match injected_failure {
+                SyntheticTransferFailure::Mount => OpenCodeTransferPhase::StageVerified,
+                SyntheticTransferFailure::Import => OpenCodeTransferPhase::ImportCompleted,
+                SyntheticTransferFailure::Reader => {
+                    OpenCodeTransferPhase::ProviderIdentityReaderVerified
+                }
+                SyntheticTransferFailure::DatabasePath => OpenCodeTransferPhase::StructuralVerified,
+            };
+            assert_eq!(attempt.failed_phase, Some(expected_phase));
+            assert!(attempt.readiness_error.is_some());
+            assert!(!attempt.grant_consumed);
+            assert!(
+                !attempt.pty_callback_invoked,
+                "a transfer failure must not reach the PTY callback"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn opencode_provider_paths_reject_symlink_components() {
+        let root = tempfile::tempdir().unwrap();
+        let real = root.path().join("provider-real");
+        std::fs::create_dir_all(&real).unwrap();
+        let linked = root.path().join("provider-link");
+        std::os::unix::fs::symlink(&real, &linked).unwrap();
+        assert!(
+            reject_symlink_components(&linked.join(".local/share/opencode/opencode.db")).is_err()
+        );
+        assert!(reject_symlink_components(&real.join(".local/share/opencode/opencode.db")).is_ok());
+    }
+
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum SyntheticTransferFailure {
+        Mount,
+        Import,
+        Reader,
+        DatabasePath,
+    }
+
+    struct SyntheticGateAttempt {
+        readiness_receipt: Option<OpenCodeTransferReadinessReceipt>,
+        failed_phase: Option<OpenCodeTransferPhase>,
+        readiness_error: Option<String>,
+        grant_consumed: bool,
+        pty_callback_invoked: bool,
+    }
+
+    struct SyntheticCapacity(u64);
+
+    impl freshell_agent_runtime::opencode_transfer::DestinationCapacityProvider for SyntheticCapacity {
+        fn available_bytes(&self, _existing_directory: &Path) -> io::Result<u64> {
+            Ok(self.0)
+        }
+    }
+
+    async fn run_joined_synthetic_transfer(
+        failure: Option<SyntheticTransferFailure>,
+    ) -> Result<SyntheticGateAttempt, String> {
+        use freshell_runtime_protocol::{
+            opencode_target_build_receipt, opencode_transfer_bundle_digest, OpenCodeTransferChunk,
+            OpenCodeTransferFile, MAX_OPENCODE_TRANSFER_CHUNK_BYTES,
+        };
+        use freshell_sessions::opencode_transfer::{
+            export_exact_session, ExportOptions, HostOpenCodeInventory,
+        };
+        use freshell_supervisor::opencode_transfer::{OpenCodeTransferStaging, StagingLimits};
+        use sha2::{Digest, Sha256};
+
+        let root = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let workspace = root.path().join("workspace");
+        std::fs::create_dir_all(&workspace).map_err(|error| error.to_string())?;
+        let source_database = root.path().join("source.sqlite");
+        let source =
+            rusqlite::Connection::open(&source_database).map_err(|error| error.to_string())?;
+        source
+            .execute_batch(freshell_sessions::opencode_transfer::pinned_destination_schema_sql())
+            .map_err(|error| error.to_string())?;
+        for migration in freshell_sessions::opencode_transfer::pinned_destination_migration_ids() {
+            source
+                .execute(
+                    "INSERT INTO migration (id,time_completed) VALUES (?1,0)",
+                    [migration],
+                )
+                .map_err(|error| error.to_string())?;
+        }
+        source
+            .execute(
+                "INSERT INTO project (id,worktree,time_created,time_updated,sandboxes) VALUES (?1,?2,1,1,'{}')",
+                rusqlite::params!["synthetic-project", workspace.to_string_lossy()],
+            )
+            .map_err(|error| error.to_string())?;
+        source
+            .execute(
+                "INSERT INTO session (id,project_id,slug,directory,title,version,time_created,time_updated) VALUES (?1,?2,?3,?4,?5,?6,1,1)",
+                rusqlite::params![
+                    "synthetic-transfer-session",
+                    "synthetic-project",
+                    "synthetic-slug",
+                    workspace.to_string_lossy(),
+                    "synthetic history",
+                    "1.18.21"
+                ],
+            )
+            .map_err(|error| error.to_string())?;
+        source
+            .execute(
+                "INSERT INTO message (id,session_id,time_created,time_updated,data) VALUES (?1,?2,1,1,?3)",
+                rusqlite::params![
+                    "synthetic-message",
+                    "synthetic-transfer-session",
+                    r#"{"text":"synthetic message body is test-only"}"#
+                ],
+            )
+            .map_err(|error| error.to_string())?;
+        drop(source);
+
+        let snapshot = export_exact_session(
+            &HostOpenCodeInventory::new(source_database)
+                .with_trusted_mount_for_selected_session(workspace.clone()),
+            "synthetic-transfer-session",
+            ExportOptions::new(root.path().join("extraction")),
+        )
+        .map_err(|error| error.to_string())?;
+        let mut payload = Vec::new();
+        std::io::copy(
+            &mut snapshot.open_payload().map_err(|error| error.to_string())?,
+            &mut payload,
+        )
+        .map_err(|error| error.to_string())?;
+        let manifest_json =
+            serde_json::to_string(snapshot.manifest()).map_err(|error| error.to_string())?;
+        let target_image_ref = format!("sha256:{}", "a".repeat(64));
+        let files = vec![OpenCodeTransferFile {
+            index: 0,
+            relative_path: "payload.json".into(),
+            size_bytes: payload.len() as u64,
+            sha256: hex::encode(Sha256::digest(&payload)),
+        }];
+        let mut descriptor = OpenCodeTransferDescriptor {
+            transfer_id: "synthetic-transfer".into(),
+            provider: "opencode".into(),
+            source_store_id: snapshot.manifest().source_store_id.clone(),
+            root_session_id: "synthetic-transfer-session".into(),
+            source_generation: snapshot.manifest().generation.clone(),
+            provider_schema: snapshot.manifest().provider_schema.clone(),
+            source_schema_fingerprint: snapshot.manifest().source_schema_fingerprint.clone(),
+            migration_journal_fingerprint: snapshot
+                .manifest()
+                .migration_journal_fingerprint
+                .clone(),
+            destination_store_id: "synthetic-soul".into(),
+            destination_database_path: ".local/share/opencode/opencode.db".into(),
+            target_image_ref: target_image_ref.clone(),
+            target_build_receipt: opencode_target_build_receipt(
+                &target_image_ref,
+                "opencode-1.18.21",
+            ),
+            incarnation_id: "synthetic-incarnation".into(),
+            manifest_json,
+            files,
+            total_bytes: payload.len() as u64,
+            bundle_sha256: String::new(),
+        };
+        descriptor.bundle_sha256 =
+            opencode_transfer_bundle_digest(&descriptor.manifest_json, &descriptor.files);
+        descriptor.validate().map_err(|error| error.message)?;
+
+        let staging = OpenCodeTransferStaging::new(root.path(), StagingLimits::production())
+            .map_err(|error| error.to_string())?;
+        staging
+            .begin(&descriptor, u64::MAX)
+            .map_err(|error| error.to_string())?;
+        for (sequence, bytes) in payload
+            .chunks(MAX_OPENCODE_TRANSFER_CHUNK_BYTES)
+            .enumerate()
+        {
+            let offset = sequence * MAX_OPENCODE_TRANSFER_CHUNK_BYTES;
+            let chunk = OpenCodeTransferChunk {
+                transfer_id: descriptor.transfer_id.clone(),
+                sequence: sequence as u64,
+                file_index: 0,
+                offset: offset as u64,
+                data: bytes.to_vec(),
+                sha256: hex::encode(Sha256::digest(bytes)),
+            };
+            staging
+                .write_chunk(&chunk)
+                .map_err(|error| error.to_string())?;
+        }
+        let ready = staging
+            .finalize(&descriptor.transfer_id)
+            .map_err(|error| error.to_string())?;
+
+        let home = root.path().join("provider-home");
+        let xdg_data_home = home.join(".local/share");
+        let xdg_config_home = home.join(".config");
+        std::fs::create_dir_all(&home).map_err(|error| error.to_string())?;
+        std::fs::create_dir_all(&xdg_config_home).map_err(|error| error.to_string())?;
+        let paths = OpencodeReaderPaths {
+            home: home.clone(),
+            xdg_data_home: xdg_data_home.clone(),
+            xdg_config_home: xdg_config_home.clone(),
+            database: xdg_data_home.join("opencode/opencode.db"),
+            workspace: workspace.clone(),
+            cwd: workspace,
+        };
+        let state_dir = root.path().join("host-state");
+        std::fs::create_dir(&state_dir).map_err(|error| error.to_string())?;
+        let provider_uid = unsafe { libc::geteuid() };
+        let provider_gid = unsafe { libc::getegid() };
+        let mut payload_path = None;
+        let mut import_receipt = None;
+        let mut reader_receipt = None;
+        let mut readiness_receipt = None;
+        let mut failed_phase = None;
+        let mut current_phase = None;
+        let mut gate = OpenCodeTransferGate::default();
+        let readiness = run_opencode_transfer_readiness_sequence(&mut gate, |phase| {
+            current_phase = Some(phase);
+            let result = match phase {
+                OpenCodeTransferPhase::ProviderHomePrepared => Ok(()),
+                OpenCodeTransferPhase::StageVerified => {
+                    let selected_stage = if failure == Some(SyntheticTransferFailure::Mount) {
+                        root.path().join("missing-stage")
+                    } else {
+                        ready.clone()
+                    };
+                    freshell_agent_runtime::opencode_transfer::verify_staged_bundle(
+                        &descriptor,
+                        &selected_stage,
+                    )
+                    .map(|path| payload_path = Some(path))
+                    .map_err(|error| error.to_string())
+                }
+                OpenCodeTransferPhase::ImportCompleted => {
+                    let source = std::fs::File::open(
+                        payload_path
+                            .as_ref()
+                            .ok_or("verified stage payload is absent")?,
+                    )
+                    .map_err(|error| error.to_string())?;
+                    let capacity = if failure == Some(SyntheticTransferFailure::Import) {
+                        SyntheticCapacity(0)
+                    } else {
+                        SyntheticCapacity(u64::MAX)
+                    };
+                    freshell_agent_runtime::opencode_transfer::import_bundle_payload_with_capacity(
+                        &descriptor,
+                        source,
+                        &paths.database,
+                        &paths.workspace,
+                        &capacity,
+                    )
+                    .map(|receipt| import_receipt = Some(receipt))
+                    .map_err(|error| error.to_string())
+                }
+                OpenCodeTransferPhase::StructuralVerified => {
+                    let mut verified_paths = paths.clone();
+                    if failure == Some(SyntheticTransferFailure::DatabasePath) {
+                        verified_paths.database = root
+                            .path()
+                            .join("provider-home-sibling/.local/share/opencode/opencode.db");
+                    }
+                    validate_import_receipt_binding(
+                        import_receipt.as_ref().ok_or("import receipt is absent")?,
+                        &descriptor,
+                        &verified_paths,
+                    )
+                }
+                OpenCodeTransferPhase::ImportReceiptDurable => persist_opencode_receipt(
+                    &state_dir,
+                    &format!("opencode-{}-import.json", descriptor.transfer_id),
+                    import_receipt.as_ref().ok_or("import receipt is absent")?,
+                ),
+                OpenCodeTransferPhase::ProviderIdentityReaderVerified => {
+                    let uid = if failure == Some(SyntheticTransferFailure::Reader) {
+                        provider_uid.wrapping_add(1)
+                    } else {
+                        provider_uid
+                    };
+                    let reader_context = installed_store_reader_context(&paths, uid, provider_gid);
+                    freshell_agent_runtime::opencode_transfer::verify_installed_store(
+                        &descriptor,
+                        &reader_context,
+                    )
+                    .map(|receipt| reader_receipt = Some(receipt))
+                    .map_err(|error| error.to_string())
+                }
+                OpenCodeTransferPhase::ReceiptsDurable => persist_opencode_receipt(
+                    &state_dir,
+                    &format!("opencode-{}-readable.json", descriptor.transfer_id),
+                    reader_receipt.as_ref().ok_or("reader receipt is absent")?,
+                ),
+                OpenCodeTransferPhase::ReceiptsRevalidated => {
+                    let receipt = revalidate_opencode_transfer_receipts_with_reader(
+                        &state_dir,
+                        &descriptor,
+                        &paths,
+                        provider_uid,
+                        provider_gid,
+                        || {
+                            let reader_context =
+                                installed_store_reader_context(&paths, provider_uid, provider_gid);
+                            freshell_agent_runtime::opencode_transfer::verify_installed_store(
+                                &descriptor,
+                                &reader_context,
+                            )
+                            .map_err(|error| error.to_string())
+                        },
+                    )?;
+                    readiness_receipt = Some(receipt);
+                    Ok(())
+                }
+                OpenCodeTransferPhase::GrantConsumed | OpenCodeTransferPhase::PtySpawned => Err(
+                    "grant and PTY phases must be reached through their production gates".into(),
+                ),
+            };
+            if result.is_err() {
+                failed_phase = Some(phase);
+            }
+            result
+        });
+        let readiness_error = readiness.err();
+        if readiness_error.is_some() && failed_phase.is_none() {
+            failed_phase = current_phase;
+        }
+        let mut grant_consumed = false;
+        let mut pty_callback_invoked = false;
+        if readiness_error.is_none() {
+            gate.run_step(OpenCodeTransferPhase::GrantConsumed, || {
+                if readiness_receipt.is_none() {
+                    return Err("exact transfer receipts were not revalidated".into());
+                }
+                grant_consumed = true;
+                Ok(())
+            })
+            .map_err(|error| error.to_string())?;
+            run_opencode_transfer_pty_spawn(&mut gate, || async {
+                pty_callback_invoked = true;
+                Ok::<_, RuntimeError>(())
+            })
+            .await
+            .map_err(|error| error.message)?;
+        }
+        Ok(SyntheticGateAttempt {
+            readiness_receipt,
+            failed_phase,
+            readiness_error,
+            grant_consumed,
+            pty_callback_invoked,
+        })
     }
 
     #[cfg(unix)]

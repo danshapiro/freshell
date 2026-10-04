@@ -1150,6 +1150,36 @@ fn resolves_effective_override_and_blocks_duplicate_source_ownership() {
 }
 
 #[test]
+fn trusted_process_inventory_discovers_installation_channel_databases() {
+    let fixture = TestDir::new("channel-inventory");
+    let channel_data_home = fixture.path().join("data").join("opencode");
+    fs::create_dir_all(&channel_data_home).unwrap();
+    let channel_database = channel_data_home.join("opencode-beta.db");
+    let _channel_source = create_synthetic_source(&channel_database);
+
+    let inventory = HostOpenCodeInventory::discover_in_data_home(&channel_data_home).unwrap();
+    let snapshot = export_exact_session(
+        &inventory,
+        "ses_root",
+        ExportOptions::new(fixture.path().join("channel-extract")),
+    )
+    .expect("trusted installation-channel database is in the production inventory");
+    assert!(snapshot.manifest().source_store_id.len() == 64);
+
+    let default_database = channel_data_home.join("opencode.db");
+    let _default_source = create_synthetic_source(&default_database);
+    assert!(matches!(
+        export_exact_session(
+            &HostOpenCodeInventory::discover_in_data_home(&channel_data_home).unwrap(),
+            "ses_root",
+            ExportOptions::new(fixture.path().join("ambiguous-extract")),
+        ),
+        Err(TransferError::Blocked(message))
+            if message.contains("multiple trusted source stores")
+    ));
+}
+
+#[test]
 fn removes_private_backup_intermediates_and_recovers_only_abandoned_exports() {
     let fixture = TestDir::new("extraction-cleanup");
     let database = fixture.path().join("opencode.db");

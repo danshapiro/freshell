@@ -1,7 +1,7 @@
 use super::{
-    opencode_target_build_receipt, opencode_transfer_bundle_digest, OpenCodeTransferChunk,
-    OpenCodeTransferDescriptor, OpenCodeTransferFile, MAX_CONTROL_FRAME_BYTES,
-    MAX_OPENCODE_TRANSFER_CHUNK_BYTES,
+    opencode_target_build_receipt, opencode_transfer_bundle_digest, OpenCodeTransferAction,
+    OpenCodeTransferChunk, OpenCodeTransferDescriptor, OpenCodeTransferFile,
+    MAX_CONTROL_FRAME_BYTES, MAX_OPENCODE_TRANSFER_CHUNK_BYTES,
 };
 use sha2::{Digest, Sha256};
 
@@ -89,6 +89,23 @@ fn opencode_session_transfer_descriptor_is_bounded_and_identity_bound() {
     let mut oversized = descriptor;
     oversized.total_bytes = 8 * 1024 * 1024 * 1024 + 1;
     assert!(oversized.validate().is_err());
+}
+
+#[test]
+fn boxed_opencode_begin_action_keeps_the_descriptor_wire_shape() {
+    let descriptor = descriptor();
+    let wire_value = serde_json::json!({
+        "action": "begin",
+        "data": descriptor,
+    });
+    let action = OpenCodeTransferAction::Begin(Box::new(descriptor.clone()));
+    assert_eq!(serde_json::to_value(&action).unwrap(), wire_value);
+
+    let restored: OpenCodeTransferAction = serde_json::from_value(wire_value).unwrap();
+    match restored {
+        OpenCodeTransferAction::Begin(restored) => assert_eq!(*restored, descriptor),
+        _ => panic!("begin action must round-trip as begin"),
+    }
 }
 
 #[test]
