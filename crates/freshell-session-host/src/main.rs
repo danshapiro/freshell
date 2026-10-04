@@ -584,6 +584,18 @@ async fn dispatch(
                             .map_err(map_actor_error)?,
                     ))
                 }
+                HostCommand::FreshAgentReadSnapshot { incarnation_id } => {
+                    ensure_incarnation(&incarnation_id, state)?;
+                    let actor = state
+                        .fresh_agent
+                        .lock()
+                        .await
+                        .clone()
+                        .ok_or_else(unsupported_fresh_agent)?;
+                    Ok(HostResult::FreshAgentSnapshot(
+                        actor.snapshot().await.map_err(map_actor_error)?,
+                    ))
+                }
                 HostCommand::FreshAgentResolve {
                     incarnation_id,
                     decision_id,
@@ -2865,6 +2877,13 @@ mod tests {
             })
         }
 
+        async fn snapshot(&self) -> Result<serde_json::Value, String> {
+            Ok(
+                serde_json::json!({"threadId":"fixture-native-thread","provider":"claude",
+                "sessionType":"freshclaude","status":"idle","turns":[{"turnId":"retained-rpc-turn"}]}),
+            )
+        }
+
         async fn stop(self: Arc<Self>) -> Result<(), String> {
             self.stops.fetch_add(1, Ordering::SeqCst);
             Ok(())
@@ -3024,6 +3043,22 @@ mod tests {
         .await
         .unwrap();
         assert!(matches!(rollback, HostResult::FreshAgentCommand { .. }));
+        let before_snapshot = transport.dispatches.load(Ordering::SeqCst);
+        let snapshot = dispatch(
+            authenticated_host_envelope(
+                &state,
+                HostCommand::FreshAgentReadSnapshot {
+                    incarnation_id: state.incarnation_id.clone(),
+                },
+            ),
+            &state,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(snapshot, HostResult::FreshAgentSnapshot(value)
+            if value["threadId"] == "fixture-native-thread" && value["turns"][0]["turnId"] == "retained-rpc-turn"));
+        assert_eq!(transport.dispatches.load(Ordering::SeqCst), before_snapshot);
+        assert_eq!(transport.stops.load(Ordering::SeqCst), 0);
         let capture = dispatch(
             authenticated_host_envelope(
                 &state,

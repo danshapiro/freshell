@@ -117,6 +117,30 @@ async fn get_snapshot(
     }
     let cwd = query.get("cwd").cloned();
 
+    if VALID_SESSION_TYPES.contains(&session_type.as_str())
+        && VALID_PROVIDERS.contains(&provider.as_str())
+    {
+        if let Some(gateway) = state.opencode.hosted_rest_gateway() {
+            match gateway
+                .snapshot(crate::hosted_rest::HostedRestSnapshot {
+                    session_id: thread_id.clone(),
+                    provider: provider.clone(),
+                    session_type: session_type.clone(),
+                })
+                .await
+            {
+                Ok(Some(snapshot)) => return Json(snapshot).into_response(),
+                Ok(None) => {}
+                Err(()) => {
+                    return fail(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "Managed conversation snapshot unavailable".into(),
+                    )
+                }
+            }
+        }
+    }
+
     match (session_type.as_str(), provider.as_str()) {
         ("freshcodex", "codex") => match state.codex.get_snapshot(&thread_id, cwd.as_deref()).await
         {
@@ -369,6 +393,67 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert("x-auth-token", token.parse().unwrap());
         headers
+    }
+
+    struct SnapshotGateway;
+
+    #[async_trait::async_trait]
+    impl crate::hosted_rest::HostedFreshAgentRestGateway for SnapshotGateway {
+        async fn create_agent(
+            self: Arc<Self>,
+            _: crate::hosted_rest::HostedRestCreate,
+        ) -> Result<crate::hosted_rest::HostedRestCreated, ()> {
+            panic!("GET must not create")
+        }
+        async fn send_agent(
+            &self,
+            _: crate::hosted_rest::HostedRestSend,
+        ) -> Result<crate::hosted_rest::HostedRestSendResult, ()> {
+            panic!("GET must not send")
+        }
+        async fn snapshot(
+            &self,
+            request: crate::hosted_rest::HostedRestSnapshot,
+        ) -> Result<Option<serde_json::Value>, ()> {
+            if request.session_id == "unavailable-host" {
+                return Err(());
+            }
+            Ok(Some(
+                json!({"threadId":request.session_id,"status":"running",
+                "provider":request.provider,"sessionType":request.session_type,
+                "turns":[{"turnId":"owned-live-turn"}]}),
+            ))
+        }
+    }
+
+    #[tokio::test]
+    async fn existing_snapshot_get_reads_hosted_truth_and_never_falls_back_on_host_failure() {
+        for (id, expected) in [
+            ("owned-host", StatusCode::OK),
+            ("unavailable-host", StatusCode::SERVICE_UNAVAILABLE),
+        ] {
+            let state = snapshot_state();
+            state
+                .opencode
+                .set_hosted_rest_gateway(Arc::new(SnapshotGateway))
+                .unwrap();
+            let response = get_snapshot(
+                State(state),
+                Path(("freshcodex".into(), "codex".into(), id.into())),
+                Query(HashMap::new()),
+                headers_with_token("tok"),
+            )
+            .await;
+            assert_eq!(response.status(), expected);
+            if expected == StatusCode::OK {
+                let body = axum::body::to_bytes(response.into_body(), 4096)
+                    .await
+                    .unwrap();
+                let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                assert_eq!(value["status"], "running");
+                assert_eq!(value["turns"][0]["turnId"], "owned-live-turn");
+            }
+        }
     }
 
     #[tokio::test]

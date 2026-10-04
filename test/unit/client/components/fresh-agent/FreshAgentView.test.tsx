@@ -12,7 +12,7 @@ import sessionsReducer, { applySessionsPatch, applyContextUsageExtras } from '@/
 import freshAgentReducer, { applyRuntimeOwner, historyPageReceived, sessionError, sessionExited, sessionInit, sessionMetadataReceived, sessionSnapshotReceived, setSessionStatus, markSessionLost } from '@/store/freshAgentSlice'
 import { selectPaneOwnerFence } from '@/store/selectors/runtimeOwner'
 import tabsReducer, { closeTab } from '@/store/tabsSlice'
-import connectionReducer from '@/store/connectionSlice'
+import connectionReducer, { setBootId } from '@/store/connectionSlice'
 import managedRuntimeReducer from '@/store/managedRuntimeSlice'
 import { FreshAgentView, IDLE_INCOMPLETE_MAX_RETRIES, locatorMatchesPane } from '@/components/fresh-agent/FreshAgentView'
 import { FreshAgentSettingsButton } from '@/components/fresh-agent/FreshAgentSettingsButton'
@@ -6304,6 +6304,107 @@ describe('FreshAgentView', () => {
       expect(sentFreshAgentMessages('pane.reconcile.request')).toHaveLength(0)
     } finally { cleanup(); setFreshAgentReconcileActive(false); vi.useRealTimers() }
   })
+
+  it.each([
+    ['freshclaude', 'claude', savedClaudeNativeHistory],
+    ['kilroy', 'claude', { ...savedClaudeNativeHistory, sessionType: 'kilroy' }],
+    ['freshcodex', 'codex', savedCodexNativeHistory],
+    ['freshopencode', 'opencode', savedOpenCodeNativeHistory],
+  ] as const)('restores managed $1 usability from current HTTP truth without an attach snapshot', async (sessionType, provider, captured) => {
+    const store = createStore()
+    const native = FreshAgentSnapshotSchema.parse(captured)
+    const live = { ...native, extensions: { [provider]: { statusFromLiveState: true } },
+      capabilities: { ...native.capabilities, send: true } }
+    const locator = { sessionType, provider, sessionId: native.threadId }
+    store.dispatch(sessionInit(locator))
+    const content = { kind: 'fresh-agent' as const, ...locator,
+      sessionRef: { provider, sessionId: native.threadId }, resumeSessionId: native.threadId,
+      createRequestId: 'http-live-truth', status: 'idle' as const, soulId: 'http-live-soul', soulIntentRevision: 7,
+      recoverySummary: { desiredState: 'running' as const, recoveryState: 'live' as const,
+        durabilityState: 'resume_captured' as const, allocationState: 'verified_durable' as const } }
+    store.dispatch(initLayout({ tabId: 'tab-1', paneId: 'pane-1', content }))
+    apiMock.getFreshAgentThreadSnapshot.mockResolvedValue({ ...live, extensions: {} })
+    render(<Provider store={store}><StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" /></Provider>)
+    const composer = screen.getByRole('textbox', { name: 'Chat message input' })
+    await waitFor(() => expect(composer).not.toBeDisabled())
+    fireEvent.change(composer, { target: { value: 'Same conversation draft' } })
+    const pending = createDeferred<unknown>()
+    apiMock.getFreshAgentThreadSnapshot.mockReturnValue(pending.promise)
+    apiMock.getFreshAgentThreadSnapshot.mockClear()
+    wsMock.send.mockClear()
+    act(() => handleFreshAgentMessage(store.dispatch, { type: 'freshAgent.event', ...locator,
+      event: { type: 'freshAgent.error', code: 'INVALID_SESSION_ID', message: 'Stale session lookup' } }))
+    expect(composer).toBeDisabled()
+    expect(composer).toHaveValue('Same conversation draft')
+    expect(sentFreshAgentMessages('freshAgent.create')).toHaveLength(0)
+    expect(sentFreshAgentMessages('pane.reconcile.request')).toHaveLength(0)
+    await waitFor(() => expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalled())
+    await act(async () => pending.resolve(live))
+    await waitFor(() => expect(composer).not.toBeDisabled())
+    expect(Object.values(store.getState().freshAgent.sessions).find((session) => session.sessionId === locator.sessionId)?.lost).toBe(false)
+    expect(getFreshAgentPaneContent(store)).toMatchObject(content)
+    expect(composer).toHaveValue('Same conversation draft')
+    expect(sentFreshAgentMessages('freshAgent.create')).toHaveLength(0)
+    expect(sentFreshAgentMessages('pane.reconcile.request')).toHaveLength(0)
+    expect(screen.queryByRole('button', { name: 'Start new session' })).not.toBeInTheDocument()
+  })
+
+  it.each(['native', 'vacant', 'wrong-thread', 'wrong-provider', 'wrong-type', 'owner-change', 'boot-change', 'recovering', 'revision-change'] as const)(
+    'retains managed loss when HTTP truth is %s', async (scenario) => {
+      const store = createStore()
+      const native = FreshAgentSnapshotSchema.parse(savedCodexNativeHistory)
+      const locator = { sessionType: 'freshcodex' as const, provider: 'codex' as const, sessionId: native.threadId }
+      const owner = { type: 'session.runtimeOwner' as const, provider: 'codex' as const, sessionId: native.threadId,
+        epoch: 1, generation: 1, ownerKind: 'fresh-agent' as const, operationId: 'http-owner', transition: 'handoff-committed' as const }
+      store.dispatch(applyRuntimeOwner(owner))
+      store.dispatch(sessionInit(locator))
+      const content = { kind: 'fresh-agent' as const, ...locator, createRequestId: 'negative-http-truth', status: 'idle' as const,
+        sessionRef: { provider: 'codex' as const, sessionId: native.threadId }, resumeSessionId: native.threadId,
+        soulId: 'negative-http-soul', soulIntentRevision: 1,
+        recoverySummary: { desiredState: 'running' as const, recoveryState: 'live' as const,
+          durabilityState: 'resume_captured' as const, allocationState: 'verified_durable' as const } }
+      store.dispatch(initLayout({ tabId: 'tab-1', paneId: 'pane-1', content }))
+      apiMock.getFreshAgentThreadSnapshot.mockResolvedValue({ ...native, capabilities: { ...native.capabilities, send: true }, extensions: {} })
+      render(<Provider store={store}><StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" /></Provider>)
+      expect(await screen.findByText('Saved native Codex answer')).toBeInTheDocument()
+      const pending = createDeferred<unknown>()
+      apiMock.getFreshAgentThreadSnapshot.mockReturnValue(pending.promise)
+      apiMock.getFreshAgentThreadSnapshot.mockClear()
+      act(() => store.dispatch(markSessionLost(locator)))
+      await waitFor(() => expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalled())
+      if (scenario === 'owner-change') {
+        apiMock.getFreshAgentThreadSnapshot.mockReturnValue(new Promise(() => {}))
+        act(() => store.dispatch(applyRuntimeOwner({ ...owner, generation: 2, operationId: 'new-owner' })))
+      }
+      if (scenario === 'boot-change') {
+        apiMock.getFreshAgentThreadSnapshot.mockReturnValue(new Promise(() => {}))
+        act(() => store.dispatch(setBootId('new-snapshot-server-boot')))
+      }
+      if (scenario === 'recovering' || scenario === 'revision-change') {
+        apiMock.getFreshAgentThreadSnapshot.mockReturnValue(new Promise(() => {}))
+        act(() => store.dispatch(updatePaneContent({ tabId: 'tab-1', paneId: 'pane-1', content: {
+          ...content, soulIntentRevision: scenario === 'revision-change' ? 2 : 1,
+          recoverySummary: { ...content.recoverySummary, recoveryState: scenario === 'recovering' ? 'recovering' : 'live' },
+        } })))
+      }
+      const current = getFreshAgentPaneContent(store)
+      const result = { ...native, capabilities: { ...native.capabilities, send: true },
+        sessionType: scenario === 'wrong-type' ? 'freshopencode' : native.sessionType,
+        threadId: scenario === 'wrong-thread' ? 'different-conversation' : native.threadId,
+        provider: scenario === 'wrong-provider' ? 'opencode' : 'codex',
+        extensions: { codex: { statusFromLiveState: true,
+          ...(scenario === 'native' ? { nativeHistoryAvailable: true } : {}),
+          ...(scenario === 'vacant' ? { ownerKind: 'vacant' } : {}),
+        } } }
+      await act(async () => pending.resolve(result))
+      expect(Object.values(store.getState().freshAgent.sessions).find((session) => session.sessionId === locator.sessionId)?.lost).toBe(true)
+      expect(screen.getByRole('textbox', { name: 'Chat message input' })).toBeDisabled()
+      expect(getFreshAgentPaneContent(store)).toEqual(current)
+      expect(screen.getByText('Saved native Codex answer')).toBeInTheDocument()
+      expect(sentFreshAgentMessages('freshAgent.create')).toHaveLength(0)
+      expect(sentFreshAgentMessages('pane.reconcile.request')).toHaveLength(0)
+    },
+  )
 
   it.each(['attach', 'respawn'] as const)('rejects an owned legacy %s verdict after supervisor recovery becomes live', async (verdict) => {
     const store = createStore()

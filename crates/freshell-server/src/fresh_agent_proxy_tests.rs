@@ -445,12 +445,14 @@ fn hosted_snapshot_capabilities_are_intersected_for_every_provider_and_envelope_
             ("freshAgent.session.snapshot", true),
             ("freshAgent.snapshot", false),
             ("freshAgent.snapshot", true),
+            ("rest", false),
         ] {
             let snapshot = serde_json::json!({
                 "type": snapshot_type,
                 "provider": provider,
                 "sessionType": session_type,
                 "sessionId": "native-session",
+                "threadId": "native-session",
                 "capabilities": advertised_capabilities(),
                 "rollback": {
                     "canRedo": true,
@@ -471,11 +473,20 @@ fn hosted_snapshot_capabilities_are_intersected_for_every_provider_and_envelope_
             };
 
             rewrite_presentation_id(&mut payload, "public-session");
-            freshell_agent_runtime::snapshot_projection::project_hosted_snapshot(
-                &mut payload,
-                provider,
-                session_type,
-            );
+            if snapshot_type == "rest" {
+                payload.as_object_mut().unwrap().remove("type");
+                freshell_agent_runtime::snapshot_projection::project_hosted_rest_snapshot(
+                    &mut payload,
+                    provider,
+                    session_type,
+                );
+            } else {
+                freshell_agent_runtime::snapshot_projection::project_hosted_snapshot(
+                    &mut payload,
+                    provider,
+                    session_type,
+                );
+            }
             let projected = if nested { &payload["event"] } else { &payload };
             let capabilities = &projected["capabilities"];
 
@@ -516,7 +527,15 @@ fn hosted_snapshot_capabilities_are_intersected_for_every_provider_and_envelope_
                     "redo targets must disappear when redo cannot dispatch"
                 );
             }
-            assert_eq!(projected["sessionId"], "public-session");
+            assert_eq!(projected["threadId"], "native-session");
+            assert_eq!(
+                projected["sessionId"],
+                if snapshot_type == "rest" {
+                    "native-session"
+                } else {
+                    "public-session"
+                }
+            );
         }
     }
 }

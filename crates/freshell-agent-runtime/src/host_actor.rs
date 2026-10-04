@@ -237,6 +237,9 @@ pub trait FreshAgentTransport: Send + Sync {
     async fn capture(&self, _max_bytes: usize) -> Result<FreshAgentCapture, String> {
         Err("provider does not expose a hosted snapshot".into())
     }
+    async fn snapshot(&self) -> Result<Value, String> {
+        Err("provider does not expose a hosted snapshot".into())
+    }
     /// Whether this actor still owns a usable provider enclosure. Provider
     /// adapters may self-heal a child internally; they should report false
     /// only when no live owned session remains.
@@ -869,6 +872,45 @@ impl FreshAgentHostActor {
             .capture(max_bytes)
             .await
             .map_err(ActorError::Transport)
+    }
+
+    pub async fn snapshot(&self) -> Result<Value, ActorError> {
+        if !self.transport.is_live().await {
+            return Err(ActorError::Transport("provider is not live".into()));
+        }
+        let snapshot = self
+            .transport
+            .snapshot()
+            .await
+            .map_err(ActorError::Transport)?;
+        if !self.transport.is_live().await {
+            return Err(ActorError::Transport(
+                "provider exited during snapshot read".into(),
+            ));
+        }
+        let profile = self.profile().await;
+        let provider = if profile.provider == freshell_runtime_protocol::FreshProvider::Kilroy {
+            "claude"
+        } else {
+            profile.provider.as_str()
+        };
+        if profile.native_session_id.is_none()
+            || snapshot["threadId"].as_str() != profile.native_session_id.as_deref()
+            || snapshot["provider"].as_str() != Some(provider)
+        {
+            return Err(ActorError::NativeIdentityMismatch);
+        }
+        // Preserve the control frame budget, including envelope overhead.
+        if serde_json::to_vec(&snapshot)
+            .map_err(|error| ActorError::Transport(error.to_string()))?
+            .len()
+            > freshell_runtime_protocol::MAX_CONTROL_FRAME_BYTES - 4096
+        {
+            return Err(ActorError::Transport(
+                "provider snapshot exceeds control frame limit".into(),
+            ));
+        }
+        Ok(snapshot)
     }
 
     pub async fn record_event(&self, event: AgentEvent) -> Result<u64, ActorError> {

@@ -2300,6 +2300,14 @@ pub struct FreshAgentReadHistoryRequest {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct FreshAgentReadSnapshotRequest {
+    pub soul_id: SoulId,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expected_control_epoch: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct TerminalResizeRequest {
     pub soul_id: SoulId,
     pub cols: u16,
@@ -2588,6 +2596,7 @@ pub enum AdminCommand {
     FreshAgentInterrupt(FreshAgentInterruptRequest),
     FreshAgentReadEvents(FreshAgentReadEventsRequest),
     FreshAgentReadHistory(FreshAgentReadHistoryRequest),
+    FreshAgentReadSnapshot(FreshAgentReadSnapshotRequest),
     RuntimeMetrics(RuntimeMetricsRequest),
     ProbeRecovery(RecoveryProbeRequest),
     Recover(RecoverRequest),
@@ -2742,6 +2751,7 @@ pub enum AdminResult {
     FreshAgentInterrupted,
     FreshAgentEvents(AgentEventBatch),
     FreshAgentHistory(serde_json::Value),
+    FreshAgentSnapshot(serde_json::Value),
     RuntimeMetrics(RuntimeMetrics),
     RecoveryProbe(RecoveryProbe),
     Recovery(RecoveryResult),
@@ -2841,6 +2851,9 @@ pub enum HostCommand {
         incarnation_id: IncarnationId,
         max_bytes: u32,
     },
+    FreshAgentReadSnapshot {
+        incarnation_id: IncarnationId,
+    },
     FreshAgentResolve {
         incarnation_id: IncarnationId,
         decision_id: String,
@@ -2904,6 +2917,7 @@ pub enum HostResult {
     FreshAgentCapture(FreshAgentCapture),
     FreshAgentEvents(AgentEventBatch),
     RuntimeMetrics(RuntimeMetrics),
+    FreshAgentSnapshot(serde_json::Value),
     Status {
         host_boot_id: HostBootId,
         worker_pid: Option<u32>,

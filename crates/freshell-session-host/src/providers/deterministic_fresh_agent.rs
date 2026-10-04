@@ -283,6 +283,42 @@ impl FreshAgentTransport for DeterministicFreshAgentTransport {
         Ok(())
     }
 
+    async fn snapshot(&self) -> Result<Value, String> {
+        let state = self.state.lock().await.clone();
+        // Fixture transcript setup lives in the same owned native store that
+        // the history route reads. Current fixture state supplies live gates.
+        let mut snapshot = read_provider_snapshot(
+            &self.state_dir,
+            self.provider.as_str(),
+            &state.native_session_id,
+            self.run_as_uid,
+            self.run_as_gid,
+        )
+        .await?;
+        let provider = if self.provider == FreshProvider::Kilroy {
+            "claude"
+        } else {
+            self.provider.as_str()
+        };
+        snapshot["extensions"][provider]
+            .as_object_mut()
+            .ok_or("fixture provider metadata unavailable")?
+            .remove("nativeHistoryAvailable");
+        snapshot["extensions"][provider]["ownerKind"] = json!("fresh-agent");
+        snapshot["extensions"][provider]["statusFromLiveState"] = json!(true);
+        snapshot["status"] = json!(if state.pending_decision_id.is_some() {
+            "permission"
+        } else if state.dispatch_count > state.completion_count {
+            "running"
+        } else {
+            "idle"
+        });
+        snapshot["capabilities"]["send"] = json!(state.pending_decision_id.is_none());
+        snapshot["capabilities"]["interrupt"] =
+            json!(state.dispatch_count > state.completion_count);
+        Ok(snapshot)
+    }
+
     async fn is_live(&self) -> bool {
         let mut slot = self.child.lock().await;
         match slot.as_mut() {
@@ -445,6 +481,38 @@ async fn read_provider_state(
         .map_err(|error| format!("decode provider-state worker reply: {error}"))
 }
 
+#[cfg(test)]
+async fn read_provider_snapshot(
+    state_dir: &Path,
+    provider: &str,
+    native_id: &str,
+    _: u32,
+    _: u32,
+) -> Result<Value, String> {
+    freshell_freshagent::native_history::read(
+        provider,
+        state_dir
+            .parent()
+            .ok_or("fixture provider home unavailable")?,
+        native_id,
+    )
+}
+
+#[cfg(not(test))]
+async fn read_provider_snapshot(
+    state_dir: &Path,
+    provider: &str,
+    native_id: &str,
+    run_as_uid: u32,
+    run_as_gid: u32,
+) -> Result<Value, String> {
+    let input = serde_json::to_vec(&json!({"provider":provider,"nativeId":native_id}))
+        .map_err(|error| error.to_string())?;
+    let output =
+        provider_state_worker(state_dir, run_as_uid, run_as_gid, "snapshot", Some(&input)).await?;
+    serde_json::from_slice(&output).map_err(|error| format!("decode provider snapshot: {error}"))
+}
+
 #[cfg(not(test))]
 async fn write_provider_state(
     state_dir: &Path,
@@ -532,7 +600,23 @@ pub(crate) fn run_state_worker(args: &[String]) -> Result<(), String> {
                 .map_err(|error| format!("decode provider-state write: {error}"))?;
             write_state(state_dir, &state)
         }
-        _ => Err("fixture state worker requires read or write".into()),
+        [operation] if operation == "snapshot" => {
+            let input: Value =
+                serde_json::from_reader(std::io::stdin()).map_err(|error| error.to_string())?;
+            let snapshot = freshell_freshagent::native_history::read(
+                input["provider"]
+                    .as_str()
+                    .ok_or("fixture snapshot provider missing")?,
+                state_dir
+                    .parent()
+                    .ok_or("fixture provider home unavailable")?,
+                input["nativeId"]
+                    .as_str()
+                    .ok_or("fixture snapshot identity missing")?,
+            )?;
+            serde_json::to_writer(std::io::stdout(), &snapshot).map_err(|error| error.to_string())
+        }
+        _ => Err("fixture state worker requires read, write or snapshot".into()),
     }
 }
 
