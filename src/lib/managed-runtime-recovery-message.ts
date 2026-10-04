@@ -1,3 +1,12 @@
+import type { ManagedRuntimeRecoverySummary } from '@shared/managed-runtime'
+
+/** Pending supervisor recovery owns lifecycle changes, including quiet automatic recovery. */
+export function isManagedRuntimeRecoveryPending(summary?: ManagedRuntimeRecoverySummary): boolean {
+  return summary?.recoveryState === 'recovering'
+    || summary?.recoveryState === 'blocked'
+    || summary?.recoveryState === 'lost'
+}
+
 const BLOCKED_REASONS: Record<string, string> = {
   CAPABILITY_PENDING: 'The provider is still preparing its recovery support. Wait, then retry recovery.',
   CREDENTIALS_EXPIRED: 'Refresh the provider sign-in, then retry recovery.',
