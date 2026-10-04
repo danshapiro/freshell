@@ -1361,7 +1361,7 @@ mod tests {
             .unwrap();
         let registered = transport.session_id.lock().await.clone().unwrap();
         let pre = actor.snapshot().await;
-        assert!(!audit.exists(), "snapshot must not spawn the native daemon");
+        let spawned_before_send = audit.exists();
         let first = actor
             .dispatch(
                 RequestId::parse("first-owned-send").unwrap(),
@@ -1410,6 +1410,10 @@ mod tests {
             .lines()
             .map(|line| serde_json::from_str(line).unwrap())
             .collect();
+        assert!(
+            !spawned_before_send,
+            "snapshot must not spawn the native daemon"
+        );
         assert_eq!(pre.unwrap()["threadId"], registered);
         first.unwrap();
         second.unwrap();
@@ -1464,6 +1468,8 @@ mod tests {
         assert_eq!(snapshot["threadId"], registered);
         assert_eq!(snapshot["sessionType"], "freshopencode");
         assert_eq!(snapshot["provider"], "opencode");
+        assert_eq!(snapshot["capabilities"]["send"], true);
+        assert!(snapshot["turns"].as_array().unwrap().is_empty());
         assert_eq!(
             snapshot["extensions"]["opencode"]["statusFromLiveState"],
             true

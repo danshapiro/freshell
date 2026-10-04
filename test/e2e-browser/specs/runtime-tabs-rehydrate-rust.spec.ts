@@ -11,6 +11,7 @@
 import { expect, type Page } from '@playwright/test'
 import WebSocket from 'ws'
 import fs from 'node:fs/promises'
+import path from 'node:path'
 
 import { test } from '../helpers/fixtures.js'
 import { ManagedRuntimeBrowserRig } from '../helpers/managed-runtime.js'
@@ -165,12 +166,15 @@ class RawWsClient {
 test.describe.serial('Phase 4 managed-runtime tab rehydration', () => {
   test('managed fresh-agent: already-live attach restores stale loss through real hosted HTTP truth', async ({ page }) => {
     test.setTimeout(900_000)
-    const rig = new ManagedRuntimeBrowserRig(process.cwd(), 3, {}, {}, 'test', {
+    const rig = new ManagedRuntimeBrowserRig(process.cwd(), 3, {}, {
+      FRESHELL_RUNTIME_HOST_COMMAND_TIMEOUT_MS: '5000', FRESHELL_RUNTIME_FRESH_AGENT_COMMAND_TIMEOUT_MS: '10000',
+    }, 'test', {
       enabledProviders: [], freshAgentModes: ['freshcodex'], fixtureFreshAgentModes: ['freshcodex'],
       providerSettings: { freshcodex: {} },
     })
     const sent: any[] = []
     const received: any[] = []
+    let heldHost: {containerId: string, incarnationId: string, pid: number} | undefined
     try {
       const info = await rig.start()
       const settings = await fetch(`${info.baseUrl}/api/settings`, {
@@ -317,9 +321,112 @@ test.describe.serial('Phase 4 managed-runtime tab rehydration', () => {
       await expectOriginalConversation()
       expect(sent.slice(baseline).filter((frame) => frame.type === 'freshAgent.create' || frame.type === 'pane.reconcile.request')).toHaveLength(0)
       expect(rig.ownedProviderExec(view.containerId!, ['cat', rolloutPath])).toBe(transcript)
+      const stableProviderState = fixtureState()
+      // A tracked host can stop answering while its managed projection still says live.
+      // Its saved source is the owned provider volume, never a coincident web-local file.
+      await page.unroute('**/api/fresh-agent/threads/**')
+      const wrongPath = `${info.homeDir}/.codex/sessions/rollout-${view.nativeSessionId}.jsonl`
+      await fs.mkdir(`${info.homeDir}/.codex/sessions`, { recursive: true })
+      const wrongTranscript = transcript.replaceAll('Managed fixture saved answer', 'Wrong web-local answer')
+      await fs.writeFile(wrongPath, wrongTranscript)
+      const pid = rig.runtime.ownedContainerHostPidExact(view.containerId!)
+      heldHost = { containerId: view.containerId!, incarnationId: view.incarnationId, pid }
+      rig.signalOwnedSessionHostExact(heldHost.containerId, heldHost.incarnationId, 'SIGSTOP', pid)
+      await expect.poll(async () => /State:\s+T/.test(await fs.readFile(`/proc/${pid}/status`, 'utf8'))).toBe(true)
+      rig.runtime.recordLifecycle('browser.owned_host_hold', { ...heldHost, state: 'T' })
+      const unavailableBaseline = sent.length
+      const unavailable = await fetch(`${info.baseUrl}/api/fresh-agent/threads/freshcodex/codex/${view.nativeSessionId}`, {
+        headers: { 'x-auth-token': info.token },
+      })
+      expect(unavailable.status).toBe(200)
+      const history = await unavailable.json()
+      expect(history.threadId).toBe(view.nativeSessionId)
+      expect(history.extensions.codex.nativeHistoryAvailable).toBe(true)
+      expect(history.extensions.codex.ownerKind).toBe('vacant')
+      expect(history.extensions.codex.statusFromLiveState).not.toBe(true)
+      expect(history.capabilities.send).toBe(false)
+      expectLargeRetainedHistory(history)
+      expect(JSON.stringify(history)).not.toContain('Wrong web-local answer')
+      expect(sent.slice(unavailableBaseline).filter((frame) => frame.type === 'freshAgent.create' || frame.type === 'pane.reconcile.request')).toHaveLength(0)
+      expect(fixtureState()).toMatchObject({ nativeSessionId: stableProviderState.nativeSessionId,
+        dispatchCount: stableProviderState.dispatchCount, completionCount: stableProviderState.completionCount })
+      const reloadSentBaseline = sent.length
+      const reloadReceivedBaseline = received.length
+      await page.reload()
+      await harness.waitForHarness()
+      await harness.waitForConnection()
+      const bootstrap = await waitForValue('canonical reload reconciliation acknowledgement', () => {
+        const request = sent.slice(reloadSentBaseline).find((frame) => frame.type === 'pane.reconcile.request')
+        const result = received.slice(reloadReceivedBaseline).find((frame) => frame.type === 'pane.reconcile.result'
+          && frame.reconcileId === request?.reconcileId)
+        return request && result ? { request, result } : null
+      }, 30_000)
+      expect(bootstrap.request.panes).toEqual([expect.objectContaining({
+        paneKey: `${created.tabId}:${created.paneId}`, createRequestId: original.createRequestId,
+        sessionRef: original.sessionRef, kind: 'fresh-agent', mode: 'codex',
+      })])
+      if (bootstrap.result.verdicts.some((verdict: any) => ['fresh', 'respawn'].includes(verdict.verdict))) {
+        await waitForValue('same-request bootstrap create acknowledgement', () => received.slice(reloadReceivedBaseline)
+          .find((frame) => ['freshAgent.created', 'freshAgent.create.failed'].includes(frame.type)
+            && frame.requestId === original.createRequestId), 30_000)
+      }
+      const bootstrapLifecycle = () => sent.slice(reloadSentBaseline)
+        .filter((frame) => frame.type === 'freshAgent.create' || frame.type === 'pane.reconcile.request')
+      const expectOnlyCanonicalBootstrap = () => {
+        const frames = bootstrapLifecycle()
+        expect(frames.filter((frame) => frame.type === 'pane.reconcile.request')).toEqual([bootstrap.request])
+        const creates = frames.filter((frame) => frame.type === 'freshAgent.create')
+        expect(creates.length).toBeLessThanOrEqual(1)
+        for (const frame of creates) {
+          expect(frame).toMatchObject({ requestId: original.createRequestId, tabId: created.tabId,
+            provider: 'codex', sessionType: 'freshcodex' })
+          if (frame.sessionRef) expect(frame.sessionRef).toEqual(original.sessionRef)
+        }
+      }
+      expectOnlyCanonicalBootstrap()
+      const settledLifecycleCount = bootstrapLifecycle().length
+      await expect(pane.getByText('Managed fixture saved answer', { exact: false })).toBeVisible({ timeout: 60_000 })
+      await expect(composer).toBeDisabled()
+      await expect(pane.getByRole('button', { name: 'Stop', exact: true })).toHaveCount(0)
+      await expect(pane.getByText('Wrong web-local answer', { exact: false })).toHaveCount(0)
+      await expectOriginalConversation()
+      expect(fixtureState()).toMatchObject({ nativeSessionId: stableProviderState.nativeSessionId,
+        dispatchCount: stableProviderState.dispatchCount, completionCount: stableProviderState.completionCount })
+      expect(rig.ownedProviderExec(view.containerId!, ['cat', rolloutPath])).toBe(transcript)
+      expect(await fs.readFile(wrongPath, 'utf8')).toBe(wrongTranscript)
+      const managedReceipts = rig.runtime.broker.receipts().filter((receipt) => receipt.soulId === view.soulId)
+      expect(managedReceipts).toHaveLength(1)
+      expect(managedReceipts[0].containerId).toBe(view.containerId)
+      expect(rig.runtime.broker.eventsSnapshot().filter((event) => event.containerId === view.containerId
+        && event.method === 'POST' && event.url === `/v1.47/containers/${view.containerId}/start`)).toHaveLength(1)
+      const lifecycle = (await fs.readFile(path.join(path.dirname(rig.supervisor.runtimeRoot), 'evidence', 'lifecycle.jsonl'), 'utf8'))
+        .split('\n').filter(Boolean).map((line) => JSON.parse(line))
+      const launches = lifecycle.filter((event) => event.event === 'supervisor.launch_running' && event.data.soulId === view.soulId)
+      expect(launches).toHaveLength(1)
+      expect(launches[0].data).toMatchObject({ incarnationId: view.incarnationId, containerId: view.containerId, workerLaunchCount: 1 })
+      expectOnlyCanonicalBootstrap()
+      expect(bootstrapLifecycle()).toHaveLength(settledLifecycleCount)
+      rig.runtime.writeBrowserArtifact('owned-host-history-preservation', { source: 'owned provider-volume native history',
+        wrongSource: 'coincident web-local native history', heldHost, bootstrap: bootstrap.request,
+        bootstrapCreates: bootstrapLifecycle().filter((frame) => frame.type === 'freshAgent.create'),
+        nativeSessionId: view.nativeSessionId, beforeHistory: stableProviderState, afterReload: fixtureState(),
+        originalIdentity: canonicalIdentity, managedLaunch: launches[0], bothSourcesUnchanged: true })
+      rig.signalOwnedSessionHostExact(heldHost.containerId, heldHost.incarnationId, 'SIGCONT', pid)
+      rig.runtime.recordLifecycle('browser.owned_host_release', heldHost)
+      heldHost = undefined
+      await expect.poll(async () => /State:\s+T/.test(await fs.readFile(`/proc/${pid}/status`, 'utf8'))).toBe(false)
+      await expectOriginalConversation()
+      expect(fixtureState()).toMatchObject({ nativeSessionId: stableProviderState.nativeSessionId,
+        dispatchCount: stableProviderState.dispatchCount, completionCount: stableProviderState.completionCount })
+      expectOnlyCanonicalBootstrap()
+      expect(bootstrapLifecycle()).toHaveLength(settledLifecycleCount)
     } finally {
-      const cleanup = await rig.stop()
-      expect(cleanup.ok, cleanup.errors.join('\n')).toBe(true)
+      try {
+        if (heldHost) rig.signalOwnedSessionHostExact(heldHost.containerId, heldHost.incarnationId, 'SIGCONT', heldHost.pid)
+      } finally {
+        const cleanup = await rig.stop()
+        expect(cleanup.ok, cleanup.errors.join('\n')).toBe(true)
+      }
     }
   })
 

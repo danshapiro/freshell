@@ -1713,6 +1713,8 @@ describe('FreshAgentView', () => {
 
   it('enables the managed pre-native OpenCode composer and sends without replacing its soul', async () => {
     const store = createStore()
+    let onMessage: ((message: Record<string, unknown>) => void) | undefined
+    wsMock.onMessage.mockImplementation((handler) => { onMessage = handler; return () => {} })
     const sessionId = 'managed-opencode-zero-turn'
     const locator = { sessionType: 'freshopencode' as const, provider: 'opencode' as const, sessionId }
     const content = {kind: 'fresh-agent' as const, ...locator, createRequestId: 'owned-zero-turn-create', soulId: 'owned-zero-turn-soul', soulIntentRevision: 1,
@@ -1736,6 +1738,16 @@ describe('FreshAgentView', () => {
     expect(sentFreshAgentMessages('freshAgent.create')).toHaveLength(0)
     expect(sentFreshAgentMessages('pane.reconcile.request')).toHaveLength(0)
     expect(getFreshAgentPaneContent(store)).toMatchObject({soulId:content.soulId,createRequestId:content.createRequestId,sessionId})
+    apiMock.getFreshAgentThreadSnapshot.mockReturnValue(new Promise(() => {}))
+    await waitFor(() => expect(onMessage).toBeTypeOf('function'))
+    act(() => onMessage?.({type:'freshAgent.session.materialized', previousSessionId:sessionId,
+      sessionId:'ses_owned_first_materialized',sessionType:'freshopencode',provider:'opencode',
+      sessionRef:{provider:'opencode',sessionId:'ses_owned_first_materialized'}}))
+    await waitFor(() => expect(getFreshAgentPaneContent(store)).toMatchObject({soulId:content.soulId,
+      createRequestId:content.createRequestId,sessionId:'ses_owned_first_materialized',
+      sessionRef:{provider:'opencode',sessionId:'ses_owned_first_materialized'},resumeSessionId:'ses_owned_first_materialized'}))
+    expect(sentFreshAgentMessages('freshAgent.create')).toHaveLength(0)
+    expect(sentFreshAgentMessages('pane.reconcile.request')).toHaveLength(0)
   })
 
   it('promotes Freshopencode panes when freshAgent.session.materialized arrives', async () => {

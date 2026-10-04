@@ -811,7 +811,9 @@ async fn real_gateway_pre_native_opencode_projects_only_current_empty_owned_regi
             server.abort();
             let _ = server.await;
         }
-        assert!(joined.is_ok());
+        joined
+            .expect("owned socket fixture must finish")
+            .expect("owned socket fixture protocol must succeed");
         assert_eq!(result.is_ok(), scenario == "empty", "{scenario}");
         if let Ok(Some(snapshot)) = result {
             assert_eq!(snapshot["threadId"], "managed-opencode-public");
@@ -936,10 +938,9 @@ async fn real_gateway_managed_snapshot_failure_reads_owned_history_and_refuses_w
         if history_available {
             assert_eq!(value["turns"][0]["turnId"], "owned-volume-answer");
         }
-        assert!(
-            joined.is_ok(),
-            "gateway must request history from the same owned soul"
-        );
+        joined
+            .expect("gateway must request history from the same owned soul")
+            .expect("owned history fixture protocol must succeed");
     }
     let proxy = snapshot_outage_proxy(&dir.path().join("absent-supervisor.sock"));
     proxy.aliases.lock().await.insert(

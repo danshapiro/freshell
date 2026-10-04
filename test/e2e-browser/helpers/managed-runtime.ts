@@ -308,6 +308,21 @@ export class ManagedRuntimeBrowserRig {
     )) ?? null
   }
 
+  signalOwnedSessionHostExact(containerId: string, incarnationId: string, signal: 'SIGSTOP' | 'SIGCONT', expectedPid?: number): number {
+    const pid = this.runtime.ownedContainerHostPidExact(containerId)
+    if (expectedPid !== undefined && pid !== expectedPid) throw new Error('owned session-host PID changed')
+    const rows = this.runtime.topOwnedContainerExact(containerId, ['-eo', 'pid,args']).split('\n')
+    const row = rows.find((line) => Number(line.trim().split(/\s+/)[0]) === pid)
+    if (!row || !/(?:^|\s)\/[^ ]*freshell-session-host\s+serve\s+--control-socket\s/.test(row)
+      || !row.includes(`--incarnation-id ${incarnationId}`)) {
+      throw new Error('owned container PID is not the requested session host')
+    }
+    // The session host is namespace PID1. SIGSTOP from inside that namespace
+    // is ignored; signal only its receipt-proven PID from the ancestor namespace.
+    process.kill(pid, signal)
+    return pid
+  }
+
   ownedContainerExec(containerId: string, args: string[]): string {
     return this.runtime.execOwnedContainerExact(containerId, args)
   }
