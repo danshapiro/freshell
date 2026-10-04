@@ -75,7 +75,7 @@ freshell-runtime-protocol = { path = "../freshell-runtime-protocol", optional = 
 # reaping); `time` = the bounded wait for the `ui.screenshot.result` round-trip;
 # `process` = `fresh_agent_extras.rs` spawns `tokio::process::Command` directly
 # (this crate declares what it uses rather than relying on feature unification).
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "process", "signal", "sync", "time"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "process", "signal", "sync", "time", "fs", "io-util"] }
 axum = "0.8"
 async-trait = "0.1"
 serde_json = { workspace = true }

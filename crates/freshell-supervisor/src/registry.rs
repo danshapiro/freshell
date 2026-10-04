@@ -432,6 +432,15 @@ impl Registry {
             terminal
                 .validate()
                 .map_err(|error| RegistryError::InvalidState(error.message))?;
+            if terminal
+                .opencode_transfer
+                .as_ref()
+                .is_some_and(|transfer| transfer.destination_store_id != input.provider_store_id)
+            {
+                return Err(RegistryError::InvalidState(
+                    "OpenCode transfer destination does not match the provider store".into(),
+                ));
+            }
         }
         let installation_id = self.installation_id().clone();
         self.run_blocking(move |mut conn| {
@@ -556,7 +565,26 @@ impl Registry {
                 return Err(RegistryError::BlockedResource { scope: "project" });
             }
 
-            let incarnation_id = IncarnationId::new();
+            let incarnation_id = input
+                .terminal
+                .as_ref()
+                .and_then(|terminal| terminal.opencode_transfer.as_ref())
+                .map(|transfer| {
+                    IncarnationId::parse(transfer.incarnation_id.clone())
+                        .map_err(|_| RegistryError::Integrity("invalid proposed transfer incarnation".into()))
+                })
+                .transpose()?
+                .unwrap_or_else(IncarnationId::new);
+            let incarnation_in_use: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM incarnations WHERE incarnation_id=?1)",
+                params![incarnation_id.as_str()],
+                |row| row.get(0),
+            )?;
+            if incarnation_in_use {
+                return Err(RegistryError::InvalidState(
+                    "proposed OpenCode transfer incarnation is already in use".into(),
+                ));
+            }
             input_reservation::bind_in_transaction(&tx, &input, &incarnation_id)?;
             let launch_nonce = LaunchNonce::new();
             let limits_json = serde_json::to_string(&input.requested_limits)?;
@@ -3925,6 +3953,7 @@ mod tests {
                 }),
                 config: Vec::new(),
             }),
+            opencode_transfer: None,
         });
         for raw in [
             vec!["--api-key".into(), secret.into()],
@@ -4036,6 +4065,7 @@ mod tests {
                 }),
                 config: Vec::new(),
             }),
+            opencode_transfer: None,
         });
         let digest_input = serde_json::to_vec(launch.terminal.as_ref().unwrap()).unwrap();
         assert!(!String::from_utf8_lossy(&digest_input).contains(secret));
@@ -4406,6 +4436,7 @@ mod tests {
             provider_bootstrap_files: Vec::new(),
             provider_secret_references: Vec::new(),
             provider_launch_context: None,
+            opencode_transfer: None,
         });
         let prepared = registry.prepare_launch(launch).await.unwrap();
         registry
@@ -4745,6 +4776,7 @@ mod tests {
             provider_bootstrap_files: Vec::new(),
             provider_secret_references: Vec::new(),
             provider_launch_context: None,
+            opencode_transfer: None,
         };
         let mut launch = prep(soul.clone(), RequestId::new(), "exact-resume");
         launch.provider = "opencode".into();

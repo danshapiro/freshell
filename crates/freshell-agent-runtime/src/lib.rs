@@ -27,6 +27,7 @@ pub use qualification_policy::{
     qualification_policy_from_value, QualificationPolicy, QUALIFICATION_PROVIDER_ENV,
 };
 pub mod host_actor;
+pub mod opencode_transfer;
 pub mod snapshot_projection;
 
 #[cfg(test)]
@@ -1512,6 +1513,7 @@ mod tests {
             provider_bootstrap_files: Vec::<ProviderBootstrapFile>::new(),
             provider_secret_references: Vec::new(),
             provider_launch_context: None,
+            opencode_transfer: None,
         }
     }
 

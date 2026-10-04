@@ -5,15 +5,16 @@
 //! supervisor's registry-backed `OwnedRuntimeHandle` boundary.
 
 use freshell_runtime_protocol::{
-    write_frame, AcknowledgeViewProjectionRequest, AdminCommand, AdminReply, AdminResult,
-    ControlRole, Envelope, FreshAgentCapture, FreshAgentCaptureRequest, FreshAgentCompactRequest,
-    FreshAgentForkRequest, FreshAgentInterruptRequest, FreshAgentReadEventsRequest,
-    FreshAgentResolveRequest, FreshAgentRollbackDirection, FreshAgentRollbackMode,
-    FreshAgentRollbackRequest, FreshAgentSendRequest, IncidentId, IncidentSummaryRequest,
-    LaunchRequest, LossIncidentSummary, ManagedRolloutMode, MigrationPlan, MigrationPlanRequest,
-    NoticeDeliveryState, NoticeId, NoticeReceiptRequest, PendingNoticesRequest,
-    PendingViewProjectionsRequest, RecoverRequest, RecoveryProbeRequest, RecoveryTrigger,
-    RepairAudit, RepairRequest, RequestId, RuntimeError, RuntimeErrorCode,
+    read_frame, write_frame, AcknowledgeViewProjectionRequest, AdminCommand, AdminReply,
+    AdminResult, ControlRole, Envelope, FreshAgentCapture, FreshAgentCaptureRequest,
+    FreshAgentCompactRequest, FreshAgentForkRequest, FreshAgentInterruptRequest,
+    FreshAgentReadEventsRequest, FreshAgentResolveRequest, FreshAgentRollbackDirection,
+    FreshAgentRollbackMode, FreshAgentRollbackRequest, FreshAgentSendRequest, IncidentId,
+    IncidentSummaryRequest, LaunchRequest, LossIncidentSummary, ManagedRolloutMode, MigrationPlan,
+    MigrationPlanRequest, NoticeDeliveryState, NoticeId, NoticeReceiptRequest,
+    OpenCodeTransferAction, OpenCodeTransferDescriptor, OpenCodeTransferResult,
+    PendingNoticesRequest, PendingViewProjectionsRequest, RecoverRequest, RecoveryProbeRequest,
+    RecoveryTrigger, RepairAudit, RepairRequest, RequestId, RuntimeError, RuntimeErrorCode,
     RuntimeInventorySnapshot, RuntimeMetricsRequest, RuntimeMetricsSnapshot, RuntimeNotice,
     RuntimeView, SoulId, StopOutcome, StopRequest, TerminalInputRequest, TerminalReadOutputRequest,
     TerminalResizeRequest, UpdateLimitsRequest, UpdateLimitsResult, UpdateViewVisibilityRequest,
@@ -173,6 +174,87 @@ impl RuntimeClient {
             return Ok(epoch);
         }
         self.health().await.map(|(epoch, _)| epoch)
+    }
+
+    pub async fn opencode_transfer_target(&self) -> Result<(String, String, String), ClientError> {
+        match self
+            .request(
+                RequestId::new(),
+                AdminCommand::OpenCodeTransfer(OpenCodeTransferAction::TargetInfo),
+            )
+            .await?
+        {
+            AdminResult::OpenCodeTransfer(OpenCodeTransferResult::TargetInfo {
+                image_ref,
+                provider_schema,
+                build_receipt,
+            }) => Ok((image_ref, provider_schema, build_receipt)),
+            _ => Err(ClientError::UnexpectedResult),
+        }
+    }
+
+    pub async fn opencode_transfer_begin(
+        &self,
+        descriptor: OpenCodeTransferDescriptor,
+    ) -> Result<OpenCodeTransferResult, ClientError> {
+        match self
+            .request(
+                RequestId::new(),
+                AdminCommand::OpenCodeTransfer(OpenCodeTransferAction::Begin(descriptor)),
+            )
+            .await?
+        {
+            AdminResult::OpenCodeTransfer(result) => Ok(result),
+            _ => Err(ClientError::UnexpectedResult),
+        }
+    }
+
+    pub async fn opencode_transfer_chunk(
+        &self,
+        chunk: freshell_runtime_protocol::OpenCodeTransferChunk,
+    ) -> Result<OpenCodeTransferResult, ClientError> {
+        match self
+            .request(
+                RequestId::new(),
+                AdminCommand::OpenCodeTransfer(OpenCodeTransferAction::Chunk(chunk)),
+            )
+            .await?
+        {
+            AdminResult::OpenCodeTransfer(result) => Ok(result),
+            _ => Err(ClientError::UnexpectedResult),
+        }
+    }
+
+    pub async fn opencode_transfer_finalize(
+        &self,
+        transfer_id: String,
+    ) -> Result<OpenCodeTransferResult, ClientError> {
+        match self
+            .request(
+                RequestId::new(),
+                AdminCommand::OpenCodeTransfer(OpenCodeTransferAction::Finalize { transfer_id }),
+            )
+            .await?
+        {
+            AdminResult::OpenCodeTransfer(result) => Ok(result),
+            _ => Err(ClientError::UnexpectedResult),
+        }
+    }
+
+    pub async fn opencode_transfer_abort(
+        &self,
+        transfer_id: String,
+    ) -> Result<OpenCodeTransferResult, ClientError> {
+        match self
+            .request(
+                RequestId::new(),
+                AdminCommand::OpenCodeTransfer(OpenCodeTransferAction::Abort { transfer_id }),
+            )
+            .await?
+        {
+            AdminResult::OpenCodeTransfer(result) => Ok(result),
+            _ => Err(ClientError::UnexpectedResult),
+        }
     }
 
     pub async fn inventory(

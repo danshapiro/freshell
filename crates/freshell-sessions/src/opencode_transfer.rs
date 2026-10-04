@@ -17,7 +17,7 @@ use std::time::Duration;
 use rusqlite::backup::Backup;
 use rusqlite::types::ValueRef;
 use rusqlite::{params_from_iter, Connection, OpenFlags, Row};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tempfile::{Builder, TempDir};
 
@@ -160,6 +160,7 @@ pub struct HostOpenCodeInventory {
     default_database: PathBuf,
     channel_databases: Vec<PathBuf>,
     workspace_mounts: Vec<WorkspaceMountMapping>,
+    trusted_directory_mounts: Vec<PathBuf>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -192,6 +193,7 @@ impl HostOpenCodeInventory {
             default_database,
             channel_databases: Vec::new(),
             workspace_mounts: Vec::new(),
+            trusted_directory_mounts: Vec::new(),
         }
     }
 
@@ -232,6 +234,15 @@ impl HostOpenCodeInventory {
             },
             managed_mount,
         });
+        self
+    }
+
+    /// Bind a trusted managed workspace mount to the selected source session
+    /// only when its stored directory exactly matches that canonical mount.
+    /// Native project/workspace IDs are read from the immutable source
+    /// snapshot inside the exporter; callers never supply source identity.
+    pub fn with_trusted_mount_for_selected_session(mut self, managed_mount: PathBuf) -> Self {
+        self.trusted_directory_mounts.push(managed_mount);
         self
     }
 
@@ -314,7 +325,7 @@ impl Default for ExportOptions {
     }
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum SerializedSqlValue {
     Null,
@@ -324,21 +335,21 @@ pub enum SerializedSqlValue {
     Blob { hex: String },
 }
 
-#[derive(Debug, Clone, Serialize)]
-struct SerializedRow {
-    table: String,
-    key: Vec<SerializedSqlValue>,
-    values: BTreeMap<String, SerializedSqlValue>,
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SerializedRow {
+    pub table: String,
+    pub key: Vec<SerializedSqlValue>,
+    pub values: BTreeMap<String, SerializedSqlValue>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RowDigest {
     pub table: String,
     pub key: Vec<SerializedSqlValue>,
     pub sha256: String,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OpenCodeTransferManifest {
     pub version: u32,
     pub provider_schema: String,
@@ -348,11 +359,127 @@ pub struct OpenCodeTransferManifest {
     pub migration_journal_fingerprint: String,
     pub sqlite_version: String,
     pub row_count: usize,
-    rows: Vec<RowDigest>,
+    pub rows: Vec<RowDigest>,
     pub assets: Vec<SerializedAssetMetadata>,
     pub payload_bytes: u64,
     pub payload_sha256: String,
     pub generation: String,
+}
+
+/// The exact DDL and migration IDs qualified for the supported OpenCode
+/// destination. Consumers must not infer a target schema from arbitrary
+/// source journal rows.
+pub fn pinned_destination_schema_sql() -> &'static str {
+    PINNED_SCHEMA_SQL
+}
+
+pub fn pinned_destination_migration_ids() -> &'static [&'static str] {
+    PINNED_MIGRATIONS
+}
+
+pub fn pinned_destination_data_migration_ids() -> &'static [&'static str] {
+    PINNED_DATA_MIGRATIONS
+}
+
+pub fn pinned_destination_schema_fingerprint() -> Result<String, TransferError> {
+    let connection = Connection::open_in_memory()?;
+    connection.execute_batch(PINNED_SCHEMA_SQL)?;
+    schema_fingerprint(&connection)
+}
+
+/// Recheck the non-payload references described by an exported manifest in
+/// the exact managed workspace mount. This is used by the installed-store
+/// reader after import, independently of the source-side export check.
+pub fn verify_asset_references(
+    assets: &[SerializedAssetMetadata],
+    rows: &[SerializedRow],
+    workspace_root: &Path,
+) -> Result<(), TransferError> {
+    let workspace_mounts = resolve_workspace_mounts(rows, &[], &[workspace_root.to_path_buf()])?;
+    for asset in assets {
+        match asset.kind.as_str() {
+            "workspace_path_reference" => {
+                let mut matched = false;
+                for session in rows.iter().filter(|row| row.table == "session") {
+                    let session_id = required_text(session, "id")?;
+                    let Some(mount) = workspace_mounts.get(&session_id) else {
+                        continue;
+                    };
+                    let relative = checked_relative_path(&asset.source_relative_path)?;
+                    let source = mount.canonical_root.join(relative);
+                    let actual = AssetResolver::new(PathBuf::new(), &workspace_mounts)
+                        .verify_workspace_file(&source, &session_id)?;
+                    if &actual == asset {
+                        matched = true;
+                        break;
+                    }
+                }
+                if !matched {
+                    return Err(TransferError::Blocked(
+                        "workspace asset does not match the installed workspace contents".into(),
+                    ));
+                }
+            }
+            "git_tree_reference" => {
+                let tree = asset
+                    .target_relative_path
+                    .rsplit(':')
+                    .next()
+                    .filter(|tree| tree.len() == 40 || tree.len() == 64)
+                    .ok_or_else(|| {
+                        TransferError::Blocked("Git asset does not identify a tree".into())
+                    })?;
+                let mut matched = false;
+                for mount in workspace_mounts.values() {
+                    let identity_bytes = serde_json::to_vec(&mount.identity)
+                        .map_err(|error| TransferError::Serialization(error.to_string()))?;
+                    let source_identity = format!(
+                        "workspace:{}:{}",
+                        digest(&identity_bytes),
+                        inspect_git_tree(&mount.canonical_root, tree)?.identity
+                    );
+                    let inspection = inspect_git_tree(&mount.canonical_root, tree)?;
+                    let actual = SerializedAssetMetadata {
+                        kind: "git_tree_reference".into(),
+                        source_relative_path: source_identity.clone(),
+                        target_relative_path: source_identity,
+                        size_bytes: inspection.closure_bytes,
+                        sha256: inspection.closure_sha256,
+                    };
+                    if &actual == asset {
+                        matched = true;
+                        break;
+                    }
+                }
+                if !matched {
+                    return Err(TransferError::Blocked(
+                        "Git asset does not match the installed workspace object store".into(),
+                    ));
+                }
+            }
+            _ => {
+                return Err(TransferError::Blocked(
+                    "manifest contains an unsupported asset reference".into(),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn checked_relative_path(path: &str) -> Result<&Path, TransferError> {
+    let relative = Path::new(path);
+    if path.is_empty()
+        || relative.is_absolute()
+        || relative
+            .components()
+            .any(|component| !matches!(component, std::path::Component::Normal(_)))
+    {
+        return Err(TransferError::Blocked(
+            "asset path is not a safe workspace-relative path".into(),
+        ));
+    }
+    Ok(relative)
 }
 
 impl OpenCodeTransferManifest {
@@ -365,7 +492,7 @@ impl OpenCodeTransferManifest {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SerializedAssetMetadata {
     pub kind: String,
     pub source_relative_path: String,
@@ -451,7 +578,11 @@ pub fn export_exact_session(
         let migration_journal_fingerprint = migration_fingerprint(&snapshot)?;
         let sqlite_version = snapshot.query_row("SELECT sqlite_version()", [], |row| row.get(0))?;
         let mut rows = collect_exact_closure(&snapshot, root_session_id)?;
-        let workspace_mounts = resolve_workspace_mounts(&rows, &inventory.workspace_mounts)?;
+        let workspace_mounts = resolve_workspace_mounts(
+            &rows,
+            &inventory.workspace_mounts,
+            &inventory.trusted_directory_mounts,
+        )?;
         let mut asset_resolver = AssetResolver::new(
             inventory.tool_output_directory(&source_path),
             &workspace_mounts,
@@ -577,6 +708,7 @@ impl<W: Write> Write for HashingWriter<'_, W> {
 fn resolve_workspace_mounts(
     rows: &[SerializedRow],
     mappings: &[WorkspaceMountMapping],
+    trusted_directory_mounts: &[PathBuf],
 ) -> Result<HashMap<String, ResolvedWorkspaceMount>, TransferError> {
     let mut resolved = HashMap::new();
     for session in rows.iter().filter(|row| row.table == "session") {
@@ -586,18 +718,33 @@ fn resolve_workspace_mounts(
             workspace_id: value_text(session, "workspace_id")?,
             directory: required_text(session, "directory")?,
         };
-        let mut matches = mappings
+        let matches = mappings
             .iter()
             .filter(|mapping| mapping.identity == identity);
-        let Some(mapping) = matches.next() else {
-            continue;
-        };
-        if matches.next().is_some() {
+        let explicit_matches = matches.collect::<Vec<_>>();
+        let mut matched_mounts = explicit_matches
+            .iter()
+            .map(|mapping| mapping.managed_mount.clone())
+            .collect::<Vec<_>>();
+        for managed_mount in trusted_directory_mounts {
+            let canonical = fs::canonicalize(managed_mount).map_err(|error| {
+                TransferError::Blocked(format!(
+                    "trusted managed workspace mount is unavailable for session {session_id}: {error}"
+                ))
+            })?;
+            if identity.directory == canonical.to_string_lossy() {
+                matched_mounts.push(canonical);
+            }
+        }
+        if matched_mounts.len() > 1 {
             return Err(TransferError::Blocked(format!(
                 "trusted workspace mapping is ambiguous for session {session_id}"
             )));
         }
-        let canonical_root = fs::canonicalize(&mapping.managed_mount).map_err(|error| {
+        let Some(matched_mount) = matched_mounts.into_iter().next() else {
+            continue;
+        };
+        let canonical_root = fs::canonicalize(&matched_mount).map_err(|error| {
             TransferError::Blocked(format!(
                 "trusted managed workspace mount is unavailable for session {session_id}: {error}"
             ))
