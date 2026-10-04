@@ -5,8 +5,15 @@ export { nativeTurnProof } from './provider-native-history/proof.js'
 import type { NativeAssistantTurn } from './provider-native-history/types.js'
 
 export function openCodeCredentialFailureMessage(output: string): string | null {
-  if (/\bToken refresh failed:\s*401\b/i.test(stripVTControlCharacters(output))) {
+  const terminalText = stripVTControlCharacters(output)
+  if (/\bToken refresh failed:\s*401\b/i.test(terminalText)) {
     return 'OpenCode credential refresh was rejected with HTTP 401; provide a currently valid OpenAI auth grant'
+  }
+  if (
+    /could not parse your authentication token|\b(?:http\s*)?401(?:\s+unauthorized)?\b|\binvalid (?:openai )?(?:api )?key\b/i
+      .test(terminalText)
+  ) {
+    return 'OpenCode credential was rejected by OpenAI; provide a currently valid OneCLI OAuth grant'
   }
   return null
 }

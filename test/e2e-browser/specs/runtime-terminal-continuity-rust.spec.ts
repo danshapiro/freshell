@@ -14,7 +14,7 @@ import path from 'node:path'
 
 import { ManagedRuntimeBrowserRig, P2_OPENCODE_MODEL, P2_OPENCODE_VERSION, type ManagedRuntimeView } from '../helpers/managed-runtime.js'
 import { requireOpenCodeOnecliBootstrap } from '../helpers/opencode-auth-file.js'
-import { OPENCODE_NATIVE_HISTORY_SCRIPT, type NativeHistory } from '../helpers/opencode-native-history.js'
+import { OPENCODE_NATIVE_HISTORY_SCRIPT, openCodeCredentialFailureMessage, type NativeHistory } from '../helpers/opencode-native-history.js'
 import { TestHarness } from '../helpers/test-harness.js'
 import { TerminalHelper } from '../helpers/terminal-helpers.js'
 import { openPanePicker } from '../helpers/pane-picker.js'
@@ -63,6 +63,28 @@ async function waitForValue<T>(
   }
   const suffix = lastError instanceof Error ? `; last error: ${lastError.message}` : ''
   throw new Error(`timed out waiting for ${description}${suffix}`)
+}
+
+async function waitForOpenCodeTerminalCondition(params: {
+  page: import('@playwright/test').Page
+  terminal: TerminalHelper
+  terminalId: string
+  outputStart?: number
+  description: string
+  succeeds: (terminalText: string) => boolean | Promise<boolean>
+  timeoutMs: number
+}): Promise<void> {
+  const deadline = Date.now() + params.timeoutMs
+  while (Date.now() < deadline) {
+    const terminalText = await params.terminal.getVisibleText(params.terminalId)
+    if (await params.succeeds(terminalText)) return
+    const outputStart = Math.min(params.outputStart ?? 0, terminalText.length)
+    const failure = openCodeCredentialFailureMessage(terminalText.slice(outputStart))
+    if (failure) throw new Error(failure)
+
+    await params.page.waitForTimeout(250)
+  }
+  throw new Error(`timed out waiting for ${params.description}`)
 }
 
 async function readTerminalIdentity(harness: TestHarness): Promise<TerminalIdentity | null> {
@@ -382,14 +404,31 @@ test.describe.serial('Phase 2 managed runtime continuity', () => {
       expect(processArgs).toContain('--port 4096')
 
       const opencodeIndex = Math.max(0, (await page.locator('.xterm').count()) - 1)
-      await terminal.waitForOutput('Ask anything...', { timeout: 90_000, terminalId })
+      await waitForOpenCodeTerminalCondition({
+        page,
+        terminal,
+        terminalId,
+        description: 'the OpenCode prompt',
+        succeeds: (text) => text.includes('Ask anything...'),
+        timeoutMs: 90_000,
+      })
+      const firstTurnMarker = 'P2_OPENCODE_FIRST_TURN_DONE'
+      const firstTurnOutputStart = (await terminal.getVisibleText(terminalId)).length
       await terminal.executeCommandInserted(
         'Use the bash tool to run exactly: echo P2_OPENCODE_FIRST_TURN_DONE > "$HOME/p2-opencode-first-turn". Reply with exactly READY when the command completes.',
         opencodeIndex,
       )
-      await expect.poll(() => {
-        return rig.ownedProviderExec(view.containerId!, ['sh', '-lc', 'cat /home/freshell/provider/p2-opencode-first-turn 2>/dev/null || true']).trim()
-      }, { timeout: 90_000 }).toBe('P2_OPENCODE_FIRST_TURN_DONE')
+      await waitForOpenCodeTerminalCondition({
+        page,
+        terminal,
+        terminalId,
+        outputStart: firstTurnOutputStart,
+        description: `OpenCode tool marker ${firstTurnMarker}`,
+        succeeds: () => rig.ownedProviderExec(view.containerId!, [
+            'sh', '-lc', 'cat /home/freshell/provider/p2-opencode-first-turn 2>/dev/null || true',
+          ]).trim() === firstTurnMarker,
+        timeoutMs: 90_000,
+      })
 
       const sessionId = await waitForSessionId(content, 90_000)
       expect(sessionId).toMatch(/^ses_/)

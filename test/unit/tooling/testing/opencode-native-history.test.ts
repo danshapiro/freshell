@@ -39,6 +39,10 @@ describe('live recovery proves new native assistant responses, never TUI echo or
   it('surfaces an OpenAI token refresh rejection instead of waiting for the native response timeout', () => {
     expect(openCodeCredentialFailureMessage('\u001b[31mToken refresh failed: 401\u001b[0m'))
       .toMatch(/credential refresh was rejected.*401/i)
+    expect(openCodeCredentialFailureMessage(
+      'Could not parse your authentication token. Please try signing in again.',
+    )).toMatch(/credential was rejected/i)
+    expect(openCodeCredentialFailureMessage('HTTP 401 Unauthorized')).toMatch(/credential was rejected/i)
     expect(openCodeCredentialFailureMessage('Token refresh failed: 403')).toBeNull()
     expect(openCodeCredentialFailureMessage('GPT-5.6 Luna')).toBeNull()
   })
