@@ -17,6 +17,7 @@ export type BrokerReceipt = {
   runtimeDir: string
   providerVolumeName?: string
   workspacePath?: string
+  hostBinaryPath?: string
 }
 
 export type BrokerEvent = {
@@ -26,6 +27,10 @@ export type BrokerEvent = {
   decision: 'forward' | 'block' | 'inject_failure'
   reason?: string
   containerId?: string
+  ownerContainerId?: string
+  helperName?: string
+  requestDigest?: string
+  providerVolumeName?: string
   destructive: boolean
   unsafeAttempt: boolean
 }
@@ -53,6 +58,7 @@ type DockerResponse = {
 export class RestrictedDockerBroker {
   private readonly knownContainerIds = new Set<string>()
   private readonly receiptsById = new Map<string, BrokerReceipt>()
+  private readonly historyHelpers = new Map<string, { owner: BrokerReceipt; containerId?: string }>()
   private readonly events: BrokerEvent[] = []
   private server?: http.Server
   private stopFailuresRemaining = 0
@@ -68,7 +74,7 @@ export class RestrictedDockerBroker {
   }
 
   receiptIds(): Set<string> {
-    return new Set(this.knownContainerIds)
+    return new Set([...this.knownContainerIds, ...[...this.historyHelpers.values()].flatMap((helper) => helper.containerId ? [helper.containerId] : [])])
   }
 
   eventsSnapshot(): BrokerEvent[] {
@@ -132,7 +138,64 @@ export class RestrictedDockerBroker {
       return
     }
 
+    const volume = url.match(/^\/v1\.47\/volumes\/(freshell-provider-[a-f0-9]{24})$/)?.[1]
+    if (method === 'GET' && volume && this.receipts().some((receipt) => receipt.providerVolumeName === volume)) {
+      await this.forwardAndReply(request, response, body, { destructive: false })
+      return
+    }
+
+    const helperTarget = url.match(/^\/v1\.47\/containers\/([^/?]+)(?:\/(start|wait|logs))?(?:\?.*)?$/)
+    const helperEntry = helperTarget && [...this.historyHelpers].find(([name, helper]) => (
+      helperTarget[1] === name || helperTarget[1] === helper.containerId
+    ))
+    if (helperEntry) {
+      const [name, helper] = helperEntry
+      const exactId = helperTarget![1] === helper.containerId
+      const allowed = (method === 'POST' && exactId && url === `${DOCKER_API_PREFIX}/containers/${helper.containerId}/start`)
+        || (method === 'POST' && exactId && url === `${DOCKER_API_PREFIX}/containers/${helper.containerId}/wait?condition=not-running`)
+        || (method === 'GET' && exactId && [0, 1].some((stderr) => url === `${DOCKER_API_PREFIX}/containers/${helper.containerId}/logs?stdout=1&stderr=${stderr}`))
+        || (method === 'DELETE' && url === `${DOCKER_API_PREFIX}/containers/${helperTarget![1]}?force=1`)
+      if (allowed) {
+        const forwarded = await this.forward(request, body)
+        this.record({ method, url, decision: 'forward', destructive: method === 'DELETE' || method === 'POST', unsafeAttempt: false,
+          containerId: helper.containerId, helperName: name, ownerContainerId: helper.owner.containerId, providerVolumeName: helper.owner.providerVolumeName })
+        replyDocker(response, forwarded)
+        return
+      }
+    }
+
     if (method === 'POST' && url.startsWith(`${DOCKER_API_PREFIX}/containers/create?`)) {
+      const name = new URL(url, 'http://docker').searchParams.get('name') ?? ''
+      if (name.startsWith('freshell-history-')) {
+        const owner = this.validateHistoryHelper(name, body)
+        if (!owner || this.historyHelpers.has(name)) {
+          this.block(response, method, url, 403, 'history helper does not match an owned read-only source', false)
+          return
+        }
+        // Reserve the exact validated name before forwarding: Docker may create it but lose its acknowledgement.
+        const helper: { owner: BrokerReceipt; containerId?: string } = { owner }
+        this.historyHelpers.set(name, helper)
+        try {
+          const forwarded = await this.forward(request, body)
+          if (forwarded.statusCode === 201) {
+            const parsed = JSON.parse(forwarded.body.toString('utf8')) as { Id?: unknown }
+            if (typeof parsed.Id !== 'string' || !/^[0-9a-f]{64}$/.test(parsed.Id) || this.receiptIds().has(parsed.Id)) {
+              throw new Error('Docker returned an invalid or already owned history helper id')
+            }
+            helper.containerId = parsed.Id
+          }
+          this.record({ method, url, decision: 'forward', destructive: false, unsafeAttempt: false,
+            containerId: helper.containerId, helperName: name, requestDigest: sha256(body), ownerContainerId: owner.containerId, providerVolumeName: owner.providerVolumeName })
+          replyDocker(response, forwarded)
+        } catch (error) {
+          this.record({ method, url, decision: 'forward', reason: `history helper create acknowledgement unavailable: ${String(error)}`,
+            destructive: false, unsafeAttempt: false, helperName: name, requestDigest: sha256(body), ownerContainerId: owner.containerId, providerVolumeName: owner.providerVolumeName })
+          response.statusCode = 503
+          response.end(JSON.stringify({ message: 'history helper create acknowledgement unavailable' }))
+        }
+        return
+      }
+
       const validation = this.validateCreate(body)
       if (!validation.ok) {
         this.block(response, method, url, 403, validation.reason, true, undefined)
@@ -155,6 +218,7 @@ export class RestrictedDockerBroker {
           soulId: validation.soulId,
           imageRef: validation.imageRef,
           runtimeDir: validation.runtimeDir,
+          hostBinaryPath: validation.hostBinaryPath,
           ...(validation.providerVolumeName ? { providerVolumeName: validation.providerVolumeName } : {}),
           ...(validation.workspacePath ? { workspacePath: validation.workspacePath } : {}),
         })
@@ -196,7 +260,7 @@ export class RestrictedDockerBroker {
   }
 
   private validateCreate(body: Buffer):
-    | { ok: true; incarnationId: string; soulId: string; imageRef: string; runtimeDir: string; providerVolumeName?: string; workspacePath?: string }
+    | { ok: true; incarnationId: string; soulId: string; imageRef: string; runtimeDir: string; hostBinaryPath: string; providerVolumeName?: string; workspacePath?: string }
     | { ok: false; reason: string } {
     let parsed: Record<string, any>
     try {
@@ -265,7 +329,7 @@ export class RestrictedDockerBroker {
 
     const binds = Array.isArray(host.Binds) ? host.Binds as string[] : []
     if (!terminalWorkload && binds.length !== 3) return { ok: false, reason: `expected binary, runtime, and soul provider-volume fixture binds, found ${binds.length}` }
-    let binaryBind = false
+    let hostBinaryPath = ''
     let runtimeDir = ''
     let providerVolumeName = ''
     let workspacePath = ''
@@ -276,7 +340,7 @@ export class RestrictedDockerBroker {
       const destination = parts.pop() ?? ''
       const source = parts.join(':')
       if (destination === '/runtime/freshell-session-host' && mode === 'ro' && this.policy.allowedHostBinaryPaths.has(source)) {
-        binaryBind = true
+        hostBinaryPath = source
         continue
       }
       if (destination === '/run/freshell' && mode === 'rw' && isStrictDescendant(source, this.policy.runtimeRootPrefix)) {
@@ -314,7 +378,7 @@ export class RestrictedDockerBroker {
       }
       return { ok: false, reason: `unapproved bind ${bind}` }
     }
-    if (!binaryBind || !runtimeDir || !providerVolumeName) return { ok: false, reason: 'required binary/runtime/provider-volume bind topology missing' }
+    if (!hostBinaryPath || !runtimeDir || !providerVolumeName) return { ok: false, reason: 'required binary/runtime/provider-volume bind topology missing' }
     if (terminalWorkload && !workspacePath) return { ok: false, reason: 'terminal workload missing approved workspace bind' }
     const actorKey = createHash('sha256').update(`${installationId}\0${soulId}`).digest('hex')
     const expectedActorStateDir = path.join(path.dirname(runtimeDir), 'souls', actorKey, 'actor')
@@ -327,7 +391,37 @@ export class RestrictedDockerBroker {
     if (binds.some((bind) => bind.includes('docker.sock') || bind.includes('/var/lib/freshell-supervisor') || bind.includes('/run/freshell-supervisor'))) {
       return { ok: false, reason: 'management-state mount is forbidden' }
     }
-    return { ok: true, incarnationId, soulId, imageRef, runtimeDir, ...(providerVolumeName ? { providerVolumeName } : {}), ...(workspacePath ? { workspacePath } : {}) }
+    return { ok: true, incarnationId, soulId, imageRef, runtimeDir, hostBinaryPath, ...(providerVolumeName ? { providerVolumeName } : {}), ...(workspacePath ? { workspacePath } : {}) }
+  }
+
+  private validateHistoryHelper(name: string, body: Buffer): BrokerReceipt | undefined {
+    if (!/^freshell-history-[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(name)) return
+    let parsed: Record<string, any>
+    try { parsed = JSON.parse(body.toString('utf8')) } catch { return }
+    const host = parsed.HostConfig ?? {}
+    if (Object.keys(parsed.Labels ?? {}).length !== 0) return
+    const same = (actual: unknown, expected: unknown) => JSON.stringify(actual) === JSON.stringify(expected)
+    if (parsed.User !== '65534:0' || parsed.Tty !== true
+      || !same(parsed.Entrypoint, ['/runtime/freshell-session-host'])
+      || !same(parsed.Env, ['HOME=/home/freshell/provider'])) return
+    const cmd = parsed.Cmd
+    if (!Array.isArray(cmd) || cmd.length !== 7 || cmd[0] !== 'native-history-only'
+      || cmd[1] !== '--provider' || !['claude', 'kilroy', 'codex', 'opencode'].includes(cmd[2])
+      || cmd[3] !== '--session-id' || typeof cmd[4] !== 'string' || !cmd[4]
+      || cmd[5] !== '--provider-home' || cmd[6] !== '/home/freshell/provider') return
+    if (host.NetworkMode !== 'none' || host.ReadonlyRootfs !== true || host.Privileged === true
+      || (host.PidMode ?? '') !== '' || (host.Binds?.length ?? 0) !== 0 || (host.CapAdd?.length ?? 0) !== 0
+      || !same(host.CapDrop, ['ALL']) || !same(host.SecurityOpt, ['no-new-privileges'])
+      || host.Memory !== 256 * 1024 * 1024 || host.MemorySwap !== 256 * 1024 * 1024
+      || host.NanoCpus !== 500_000_000 || host.PidsLimit !== 32
+      || !same(host.Tmpfs, { '/tmp': 'rw,noexec,nosuid,nodev,size=16m' })) return
+    const mounts = host.Mounts
+    if (!Array.isArray(mounts) || mounts.length !== 2) return
+    const binary = mounts.find((mount) => mount.Type === 'bind' && mount.Target === '/runtime/freshell-session-host' && mount.ReadOnly === true)
+    const volume = mounts.find((mount) => mount.Type === 'volume' && mount.Target === '/home/freshell/provider' && mount.ReadOnly === true)
+    if (!binary || !volume || !this.policy.allowedHostBinaryPaths.has(binary.Source) || !this.policy.allowedImageRefs.has(parsed.Image)) return
+    return this.receipts().find((receipt) => receipt.providerVolumeName === volume.Source
+      && receipt.imageRef === parsed.Image && receipt.hostBinaryPath === binary.Source)
   }
 
   private isAllowedWorkspacePath(candidate: string): boolean {
