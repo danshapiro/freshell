@@ -127,6 +127,17 @@ pub struct OpenCodeTransferStaging {
     capacity_changed: tokio::sync::watch::Sender<u64>,
     #[cfg(test)]
     queue_initialization_failpoint: Mutex<Option<QueueInitializationPhase>>,
+    #[cfg(test)]
+    queue_promotion_crash_after_order_removal: Mutex<bool>,
+    #[cfg(test)]
+    begin_lock_contention_observer: Mutex<Option<std::sync::mpsc::Sender<BeginLockTestEvent>>>,
+}
+
+#[cfg(test)]
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum BeginLockTestEvent {
+    Contended,
+    Probe(u8),
 }
 
 pub type OpenCodeTransferStageReferences = HashMap<String, Vec<OpenCodeTransferDescriptor>>;
@@ -173,10 +184,15 @@ impl OpenCodeTransferStaging {
             capacity_changed,
             #[cfg(test)]
             queue_initialization_failpoint: Mutex::new(None),
+            #[cfg(test)]
+            queue_promotion_crash_after_order_removal: Mutex::new(false),
+            #[cfg(test)]
+            begin_lock_contention_observer: Mutex::new(None),
         };
         {
             let _guard = staging.lock.lock().expect("transfer staging lock poisoned");
             staging.recover_interrupted_queue_initializations_unlocked()?;
+            staging.recover_incomplete_partial_payloads_unlocked()?;
         }
         Ok(staging)
     }
@@ -222,7 +238,7 @@ impl OpenCodeTransferStaging {
     where
         F: FnMut() -> Result<u64, StagingError>,
     {
-        let _guard = self.lock.lock().expect("transfer staging lock poisoned");
+        let _guard = self.lock_for_begin();
         validate_attempt_id(attempt_id)?;
         descriptor
             .validate()
@@ -353,6 +369,70 @@ impl OpenCodeTransferStaging {
                 )
                 .collect(),
         })
+    }
+
+    fn lock_for_begin(&self) -> std::sync::MutexGuard<'_, ()> {
+        #[cfg(test)]
+        {
+            match self.lock.try_lock() {
+                Ok(guard) => guard,
+                Err(std::sync::TryLockError::WouldBlock) => {
+                    let observer = self
+                        .begin_lock_contention_observer
+                        .lock()
+                        .expect("begin lock observer mutex poisoned")
+                        .take();
+                    if let Some(observer) = observer {
+                        let _ = observer.send(BeginLockTestEvent::Contended);
+                    }
+                    self.lock.lock().expect("transfer staging lock poisoned")
+                }
+                Err(std::sync::TryLockError::Poisoned(_)) => {
+                    panic!("transfer staging lock poisoned")
+                }
+            }
+        }
+        #[cfg(not(test))]
+        {
+            self.lock.lock().expect("transfer staging lock poisoned")
+        }
+    }
+
+    #[cfg(test)]
+    fn observe_next_begin_lock_contention_for_test(
+        &self,
+        observer: std::sync::mpsc::Sender<BeginLockTestEvent>,
+    ) {
+        *self
+            .begin_lock_contention_observer
+            .lock()
+            .expect("begin lock observer mutex poisoned") = Some(observer);
+    }
+
+    #[cfg(test)]
+    fn crash_after_queue_promotion_order_removal_for_test(&self) {
+        *self
+            .queue_promotion_crash_after_order_removal
+            .lock()
+            .expect("queue promotion crash failpoint mutex poisoned") = true;
+    }
+
+    #[cfg(test)]
+    fn queue_promotion_checkpoint_after_order_removal(&self) {
+        let should_crash = std::mem::take(
+            &mut *self
+                .queue_promotion_crash_after_order_removal
+                .lock()
+                .expect("queue promotion crash failpoint mutex poisoned"),
+        );
+        if should_crash {
+            // This is called only in the isolated crash-fixture child. The
+            // sandboxed parent verifies the exact signal before restart.
+            unsafe {
+                libc::kill(libc::getpid(), libc::SIGKILL);
+            }
+            unreachable!("SIGKILL should terminate the crash fixture child");
+        }
     }
 
     pub fn write_chunk(&self, chunk: &OpenCodeTransferChunk) -> Result<(), StagingError> {
@@ -1404,6 +1484,12 @@ impl OpenCodeTransferStaging {
     }
 
     fn advance_queue_unlocked(&self, available_bytes: u64) -> Result<usize, StagingError> {
+        // A prior promotion or partial initialization may have been
+        // interrupted after its directory became visible. Repair those
+        // payload placeholders before physical reservation accounting reads
+        // the partial stages.
+        self.recover_incomplete_partial_payloads_unlocked()?;
+
         let mut queued = Vec::new();
         for entry in fs::read_dir(&self.root)? {
             let entry = entry?;
@@ -1454,13 +1540,23 @@ impl OpenCodeTransferStaging {
                     "queued transfer already has a partial stage".into(),
                 ));
             }
+            // Prepare all required (still-empty) payload files while the FIFO
+            // entry is still queued. The directory rename must never publish
+            // a partial stage whose required payload paths do not exist.
+            self.create_partial_files(&queued_path, &descriptor)?;
+            record_partial_activity(&queued_path, SystemTime::now())?;
+            File::open(&queued_path)?.sync_all()?;
             fs::rename(&queued_path, &partial)?;
+            File::open(&self.root)?.sync_all()?;
             fs::set_permissions(&partial, fs::Permissions::from_mode(TRANSFER_ROOT_MODE))?;
             let queue_order = partial.join(QUEUE_ORDER_FILE);
             if queue_order.exists() {
                 let _ = self.read_queue_order_unlocked(&partial)?;
                 fs::remove_file(&queue_order)?;
             }
+            File::open(&partial)?.sync_all()?;
+            #[cfg(test)]
+            self.queue_promotion_checkpoint_after_order_removal();
             self.create_partial_files(&partial, &descriptor)?;
             record_partial_activity(&partial, SystemTime::now())?;
             File::open(&partial)?.sync_all()?;
@@ -1468,6 +1564,77 @@ impl OpenCodeTransferStaging {
             promoted += 1;
         }
         Ok(promoted)
+    }
+
+    fn recover_incomplete_partial_payloads_unlocked(&self) -> Result<usize, StagingError> {
+        let mut recovered = 0;
+        for entry in fs::read_dir(&self.root)? {
+            let entry = entry?;
+            if !entry
+                .file_name()
+                .to_str()
+                .is_some_and(|name| name.ends_with(".partial"))
+            {
+                continue;
+            }
+            let path = entry.path();
+            let metadata = fs::symlink_metadata(&path)?;
+            if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                return Err(StagingError::InvalidState(
+                    "partial transfer is not a real directory".into(),
+                ));
+            }
+            let descriptor_path = path.join("descriptor.json");
+            match fs::symlink_metadata(&descriptor_path) {
+                Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
+                    return Err(StagingError::InvalidState(
+                        "partial transfer descriptor is not a regular file".into(),
+                    ));
+                }
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    // A direct Begin can crash before writing the descriptor;
+                    // its caller can still recover it from the exact retry
+                    // descriptor. This state cannot come from a published
+                    // queue promotion, whose descriptor is durable first.
+                    continue;
+                }
+                Err(error) => return Err(error.into()),
+            }
+            let descriptor = self.read_descriptor(&path)?;
+            let attempt_path = path.join(PARTIAL_ATTEMPT_FILE);
+            match fs::symlink_metadata(&attempt_path) {
+                Ok(_) => {
+                    read_attempt_owner(&path)?;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
+
+            let queue_order_path = path.join(QUEUE_ORDER_FILE);
+            let had_queue_order = match fs::symlink_metadata(&queue_order_path) {
+                Ok(_) => {
+                    read_queue_order_marker(&path)?;
+                    true
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+                Err(error) => return Err(error.into()),
+            };
+
+            let created = self.create_partial_files(&path, &descriptor)?;
+            if had_queue_order {
+                // The marker is retained across the directory rename. Its
+                // removal is the durable end of the promotion transition.
+                fs::remove_file(queue_order_path)?;
+            }
+            if created > 0 || had_queue_order {
+                record_partial_activity(&path, SystemTime::now())?;
+                File::open(&path)?.sync_all()?;
+                sync_parent(&path)?;
+                recovered += 1;
+            }
+        }
+        Ok(recovered)
     }
 
     fn read_queue_order_unlocked(&self, path: &Path) -> Result<u64, StagingError> {
@@ -1847,16 +2014,19 @@ impl OpenCodeTransferStaging {
         &self,
         path: &Path,
         descriptor: &OpenCodeTransferDescriptor,
-    ) -> Result<(), StagingError> {
+    ) -> Result<usize, StagingError> {
+        let mut created = 0;
         for file in &descriptor.files {
             let part = part_file(path, file.index);
             let ready = ready_file(path, file.index);
-            if part.exists() && ready.exists() {
+            let part_exists = regular_staged_file_exists(&part)?;
+            let ready_exists = regular_staged_file_exists(&ready)?;
+            if part_exists && ready_exists {
                 return Err(StagingError::InvalidState(
                     "staged file has both partial and finalized entries".into(),
                 ));
             }
-            if part.exists() || ready.exists() {
+            if part_exists || ready_exists {
                 continue;
             }
             OpenOptions::new()
@@ -1865,8 +2035,9 @@ impl OpenCodeTransferStaging {
                 .mode(PRIVATE_FILE_MODE)
                 .open(part)?
                 .sync_all()?;
+            created += 1;
         }
-        Ok(())
+        Ok(created)
     }
 
     fn partial_path(&self, transfer_id: &str) -> PathBuf {
@@ -2002,6 +2173,21 @@ fn read_queue_order_marker(path: &Path) -> Result<u64, StagingError> {
     let metadata: QueueMetadata = serde_json::from_slice(&fs::read(order_path)?)
         .map_err(|error| StagingError::Metadata(error.to_string()))?;
     Ok(metadata.order)
+}
+
+fn regular_staged_file_exists(path: &Path) -> Result<bool, StagingError> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            if metadata.file_type().is_symlink() || !metadata.is_file() {
+                return Err(StagingError::InvalidState(
+                    "staged payload entry is not a regular file".into(),
+                ));
+            }
+            Ok(true)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error.into()),
+    }
 }
 
 fn write_attempt_owner(path: &Path, attempt_id: &str) -> Result<(), StagingError> {
