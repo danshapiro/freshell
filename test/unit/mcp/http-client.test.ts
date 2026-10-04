@@ -1,4 +1,6 @@
 // @vitest-environment node
+import { spawn } from 'node:child_process'
+import { createServer, type AddressInfo, type Server } from 'node:http'
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 
 describe('resolveConfig', () => {
@@ -236,5 +238,89 @@ describe('createApiClient', () => {
     const result = await client.get('/api/some-action')
     expect(result).not.toBeNull()
     expect(result).not.toBeUndefined()
+  })
+
+  it('sends owned Freshell API traffic directly when Node environment proxies are enabled', async () => {
+    let targetRequests = 0
+    let proxyRequests = 0
+    const targetServer = createServer((_request, response) => {
+      targetRequests += 1
+      response.writeHead(200, { 'content-type': 'application/json' })
+      response.end(JSON.stringify({ status: 'ok' }))
+    })
+    const proxyServer = createServer((_request, response) => {
+      proxyRequests += 1
+      const body = 'the model proxy must not receive Freshell API traffic'
+      response.writeHead(502, { connection: 'close', 'content-length': String(body.length) })
+      response.end(body)
+    })
+    proxyServer.on('connect', (_request, socket) => {
+      proxyRequests += 1
+      socket.end('HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\nContent-Length: 0\r\n\r\n')
+    })
+    const listen = (server: Server) => new Promise<void>((resolve, reject) => {
+      server.once('error', reject)
+      server.listen(0, '127.0.0.1', resolve)
+    })
+    const close = (server: Server) => new Promise<void>((resolve, reject) => {
+      server.close((error) => error ? reject(error) : resolve())
+      server.closeAllConnections()
+    })
+    await Promise.all([listen(targetServer), listen(proxyServer)])
+
+    try {
+      const targetPort = (targetServer.address() as AddressInfo).port
+      const proxyPort = (proxyServer.address() as AddressInfo).port
+      const targetUrl = `http://127.0.0.1:${targetPort}`
+      const proxyUrl = `http://127.0.0.1:${proxyPort}`
+      const moduleUrl = new URL('../../../tools/freshell-mcp/http-client.ts', import.meta.url).href
+      const source = [
+        'import { createApiClient } from ' + JSON.stringify(moduleUrl),
+        '(async () => {',
+        `const baseUrl = ${JSON.stringify(targetUrl)}`,
+        'await createApiClient({ url: baseUrl, token: "" }).get("/api/health")',
+        '})().then(() => process.exit(0), () => process.exit(1))',
+      ].join('\n')
+      const child = spawn(process.execPath, ['--import', 'tsx/esm', '--input-type=module', '--eval', source], {
+        cwd: process.cwd(),
+        env: {
+          ...process.env,
+          NODE_USE_ENV_PROXY: '1',
+          NODE_OPTIONS: '',
+          HTTP_PROXY: proxyUrl,
+          http_proxy: proxyUrl,
+          HTTPS_PROXY: proxyUrl,
+          https_proxy: proxyUrl,
+          NO_PROXY: '',
+          no_proxy: '',
+          ALL_PROXY: '',
+          all_proxy: '',
+        },
+        stdio: ['ignore', 'ignore', 'pipe'],
+      })
+      let stderr = ''
+      child.stderr.setEncoding('utf8')
+      child.stderr.on('data', (chunk: string) => { stderr += chunk })
+      const result = await new Promise<{ code: number | null; stderr: string }>((resolve, reject) => {
+        const timeout = setTimeout(() => child.kill('SIGKILL'), 5_000)
+        child.once('error', (error) => {
+          clearTimeout(timeout)
+          reject(error)
+        })
+        child.once('exit', (code) => {
+          clearTimeout(timeout)
+          child.stderr.destroy()
+          resolve({ code, stderr })
+        })
+      })
+
+      expect({ targetRequests, proxyRequests, exitCode: result.code }, result.stderr).toEqual({
+        targetRequests: 1,
+        proxyRequests: 0,
+        exitCode: 0,
+      })
+    } finally {
+      await Promise.all([close(targetServer), close(proxyServer)])
+    }
   })
 })

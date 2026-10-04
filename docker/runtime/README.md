@@ -44,7 +44,9 @@ The image includes the same Freshell MCP tool as an ordinary terminal at
 the frozen workspace lock, so a managed provider can launch it without a web
 server worktree mount. Check the image with
 `pnpm exec tsx scripts/testing/probe-managed-mcp-image.ts --image <image>`;
-the probe calls `tools/list` and `tools/call` through a fake local endpoint.
+the probe calls `tools/list` and `tools/call` through a fake local endpoint
+while Node's environment proxy is enabled, then verifies Freshell's API request
+did not reach the proxy.
 The controller supplies each incarnation's scoped MCP grant in the
 provider environment. Provider MCP configuration, including user entries,
 keeps its ordinary semantics.

@@ -193,7 +193,7 @@ fn resolve_profile(
 fn resolve_provider_environment(
     parsed: &BTreeMap<String, String>,
     provider_names: &[&str],
-    allow_loopback_no_proxy: bool,
+    allow_opencode_proxy_settings: bool,
 ) -> Result<BTreeMap<String, String>, String> {
     let mut child = BTreeMap::new();
     for (name, value) in parsed {
@@ -201,20 +201,25 @@ fn resolve_provider_environment(
             || CERTIFICATE_CHILD_NAMES.contains(&name.as_str())
         {
             child.insert(name.clone(), value.clone());
-        } else if matches!(
-            name.as_str(),
-            "HTTPS_PROXY" | "https_proxy" | "HTTP_PROXY" | "http_proxy"
-        ) {
+        } else if matches!(name.as_str(), "HTTPS_PROXY" | "https_proxy") {
             reject_proxy_placeholder(value)?;
             validate_container_proxy(value)?;
             child.insert(name.clone(), value.clone());
-        } else if name == "NODE_USE_ENV_PROXY" {
-            if value != "1" {
-                return Err("NODE_USE_ENV_PROXY must be set to 1".into());
+        } else if matches!(name.as_str(), "HTTP_PROXY" | "http_proxy") {
+            if allow_opencode_proxy_settings {
+                reject_proxy_placeholder(value)?;
+                validate_container_proxy(value)?;
+                child.insert(name.clone(), value.clone());
             }
-            child.insert(name.clone(), value.clone());
+        } else if name == "NODE_USE_ENV_PROXY" {
+            if allow_opencode_proxy_settings {
+                if value != "1" {
+                    return Err("NODE_USE_ENV_PROXY must be set to 1".into());
+                }
+                child.insert(name.clone(), value.clone());
+            }
         } else if matches!(name.as_str(), "NO_PROXY" | "no_proxy") {
-            if allow_loopback_no_proxy {
+            if allow_opencode_proxy_settings {
                 validate_loopback_no_proxy(value)?;
                 child.insert(name.clone(), value.clone());
             }
@@ -546,6 +551,65 @@ mod tests {
             resolved.environment.get("NO_PROXY").unwrap(),
             "localhost,127.0.0.1"
         );
+    }
+
+    #[test]
+    fn non_opencode_onecli_profiles_do_not_enable_http_or_node_environment_proxies() {
+        let cases = [
+            (
+                "claude",
+                ProviderSecretProfile::ClaudeOnecliEnvironment,
+                "ANTHROPIC_API_KEY=claude-fixture",
+            ),
+            (
+                "codex",
+                ProviderSecretProfile::CodexOnecliEnvironment,
+                "OPENAI_API_KEY=codex-fixture",
+            ),
+            (
+                "amplifier",
+                ProviderSecretProfile::AmplifierOnecliEnvironment,
+                "OPENAI_API_KEY=amplifier-fixture",
+            ),
+        ];
+
+        for (provider, profile, provider_value) in cases {
+            let root = tempfile::tempdir().unwrap();
+            let mount = root.path().join("provider-0");
+            fs::write(
+                &mount,
+                format!(
+                    concat!(
+                        "{provider_value}\n",
+                        "HTTPS_PROXY=http://proxy.example:10255\n",
+                        "https_proxy=http://proxy.example:10255\n",
+                        "HTTP_PROXY=http://proxy.example:10255\n",
+                        "http_proxy=http://proxy.example:10255\n",
+                        "NODE_USE_ENV_PROXY=1\n"
+                    ),
+                    provider_value = provider_value
+                ),
+            )
+            .unwrap();
+            let reference = ProviderSecretReference {
+                source_path: mount.to_string_lossy().into_owned(),
+                profile,
+            };
+
+            let resolved = resolve_child_secrets(provider, &[reference], root.path()).unwrap();
+
+            assert_eq!(
+                resolved.environment.get("HTTPS_PROXY").map(String::as_str),
+                Some("http://proxy.example:10255")
+            );
+            assert_eq!(
+                resolved.environment.get("https_proxy").map(String::as_str),
+                Some("http://proxy.example:10255")
+            );
+            assert!(!resolved.environment.contains_key("HTTP_PROXY"));
+            assert!(!resolved.environment.contains_key("http_proxy"));
+            assert!(!resolved.environment.contains_key("NODE_USE_ENV_PROXY"));
+        }
     }
 
     #[test]
