@@ -92,16 +92,50 @@ fn resolve_profile(
     let parsed = parse_keys_env(raw)?;
     match profile {
         ProviderSecretProfile::ClaudeOnecliEnvironment => {
-            resolve_provider_environment(&parsed, &["ANTHROPIC_API_KEY", "ANTHROPIC_BASE_URL", "CLAUDE_CODE_OAUTH_TOKEN"])
+            resolve_provider_environment(
+                &parsed,
+                &["ANTHROPIC_API_KEY", "ANTHROPIC_BASE_URL", "CLAUDE_CODE_OAUTH_TOKEN"],
+                false,
+            )
         }
         ProviderSecretProfile::CodexOnecliEnvironment => {
-            resolve_provider_environment(&parsed, &["OPENAI_API_KEY", "OPENAI_BASE_URL"])
+            resolve_provider_environment(&parsed, &["OPENAI_API_KEY", "OPENAI_BASE_URL"], false)
         }
         ProviderSecretProfile::OpencodeOnecliEnvironment => {
-            resolve_provider_environment(&parsed, &["ANTHROPIC_API_KEY", "ANTHROPIC_BASE_URL", "OPENAI_API_KEY", "OPENAI_BASE_URL", "GOOGLE_GENERATIVE_AI_API_KEY", "GOOGLE_API_KEY", "GEMINI_API_KEY", "OPENROUTER_API_KEY", "OPENCODE_API_KEY"])
+            resolve_provider_environment(
+                &parsed,
+                &[
+                    "ANTHROPIC_API_KEY",
+                    "ANTHROPIC_BASE_URL",
+                    "OPENAI_API_KEY",
+                    "OPENAI_BASE_URL",
+                    "GOOGLE_GENERATIVE_AI_API_KEY",
+                    "GOOGLE_API_KEY",
+                    "GEMINI_API_KEY",
+                    "OPENROUTER_API_KEY",
+                    "OPENCODE_API_KEY",
+                ],
+                true,
+            )
         }
         ProviderSecretProfile::AmplifierOnecliEnvironment => {
-            resolve_provider_environment(&parsed, &["ANTHROPIC_API_KEY", "ANTHROPIC_BASE_URL", "OPENAI_API_KEY", "OPENAI_BASE_URL", "LUNAROUTE_API_KEY", "LUNAROUTE_BASE_URL", "GLM_RUNPOD_API_KEY", "GLM_RUNPOD_BASE_URL", "GOOGLE_API_KEY", "GEMINI_API_KEY", "OPENROUTER_API_KEY"])
+            resolve_provider_environment(
+                &parsed,
+                &[
+                    "ANTHROPIC_API_KEY",
+                    "ANTHROPIC_BASE_URL",
+                    "OPENAI_API_KEY",
+                    "OPENAI_BASE_URL",
+                    "LUNAROUTE_API_KEY",
+                    "LUNAROUTE_BASE_URL",
+                    "GLM_RUNPOD_API_KEY",
+                    "GLM_RUNPOD_BASE_URL",
+                    "GOOGLE_API_KEY",
+                    "GEMINI_API_KEY",
+                    "OPENROUTER_API_KEY",
+                ],
+                false,
+            )
         }
         ProviderSecretProfile::ClaudeOnecliAuthFile
         | ProviderSecretProfile::CodexOnecliAuthFile
@@ -159,6 +193,7 @@ fn resolve_profile(
 fn resolve_provider_environment(
     parsed: &BTreeMap<String, String>,
     provider_names: &[&str],
+    allow_loopback_no_proxy: bool,
 ) -> Result<BTreeMap<String, String>, String> {
     let mut child = BTreeMap::new();
     for (name, value) in parsed {
@@ -178,10 +213,12 @@ fn resolve_provider_environment(
                 return Err("NODE_USE_ENV_PROXY must be set to 1".into());
             }
             child.insert(name.clone(), value.clone());
-        } else if !matches!(
-            name.as_str(),
-            "ONECLI_URL" | "ONECLI_GATEWAY" | "NO_PROXY" | "no_proxy"
-        ) {
+        } else if matches!(name.as_str(), "NO_PROXY" | "no_proxy") {
+            if allow_loopback_no_proxy {
+                validate_loopback_no_proxy(value)?;
+                child.insert(name.clone(), value.clone());
+            }
+        } else if !matches!(name.as_str(), "ONECLI_URL" | "ONECLI_GATEWAY") {
             return Err(format!("OneCLI environment profile does not allow {name}"));
         }
     }
@@ -195,6 +232,7 @@ fn resolve_provider_environment(
     for (upper_name, lower_name, display_name) in [
         ("HTTPS_PROXY", "https_proxy", "HTTPS_PROXY"),
         ("HTTP_PROXY", "http_proxy", "HTTP_PROXY"),
+        ("NO_PROXY", "no_proxy", "NO_PROXY"),
     ] {
         if let (Some(upper), Some(lower)) = (child.get(upper_name), child.get(lower_name)) {
             if upper != lower {
@@ -203,6 +241,21 @@ fn resolve_provider_environment(
         }
     }
     Ok(child)
+}
+
+fn validate_loopback_no_proxy(value: &str) -> Result<(), String> {
+    let entries = value
+        .split(',')
+        .map(|entry| entry.trim().to_ascii_lowercase())
+        .collect::<Vec<_>>();
+    if entries.is_empty()
+        || entries
+            .iter()
+            .any(|entry| !matches!(entry.as_str(), "localhost" | "127.0.0.1" | "::1" | "[::1]"))
+    {
+        return Err("OneCLI NO_PROXY may bypass only loopback hosts".into());
+    }
+    Ok(())
 }
 
 fn validate_https_upstream(value: &str) -> Result<(), String> {
@@ -419,13 +472,20 @@ mod tests {
                 profile,
             }];
             let resolved = resolve_child_secrets(provider, &references, root.path()).unwrap();
-            assert_eq!(resolved.environment.len(), 1);
+            let allows_loopback_bypass = provider == "opencode";
+            assert_eq!(
+                resolved.environment.len(),
+                if allows_loopback_bypass { 2 } else { 1 }
+            );
             assert!(resolved
                 .environment
                 .values()
                 .any(|value| value.ends_with("-fixture")));
             assert!(!resolved.environment.contains_key("ONECLI_URL"));
-            assert!(!resolved.environment.contains_key("NO_PROXY"));
+            assert_eq!(
+                resolved.environment.get("NO_PROXY").map(String::as_str),
+                allows_loopback_bypass.then_some("localhost")
+            );
             assert!(resolve_child_secrets("wrong-provider", &references, root.path()).is_err());
         }
     }
@@ -445,7 +505,7 @@ mod tests {
                 "NODE_EXTRA_CA_CERTS=/home/freshell/provider/.config/onecli/gateway-ca.pem\n",
                 "NODE_USE_ENV_PROXY=1\n",
                 "ONECLI_URL=http://127.0.0.1:10254\n",
-                "NO_PROXY=localhost\n",
+                "NO_PROXY=localhost,127.0.0.1\n",
             ),
         )
         .unwrap();
@@ -482,7 +542,10 @@ mod tests {
         );
         assert_eq!(resolved.environment.get("NODE_USE_ENV_PROXY").unwrap(), "1");
         assert!(!resolved.environment.contains_key("ONECLI_URL"));
-        assert!(!resolved.environment.contains_key("NO_PROXY"));
+        assert_eq!(
+            resolved.environment.get("NO_PROXY").unwrap(),
+            "localhost,127.0.0.1"
+        );
     }
 
     #[test]
@@ -533,11 +596,15 @@ mod tests {
     }
 
     #[test]
-    fn opencode_onecli_environment_rejects_conflicting_proxy_aliases_and_invalid_node_proxy_switch()
-    {
+    fn opencode_onecli_environment_rejects_proxy_aliases_invalid_node_switch_and_non_loopback_bypass(
+    ) {
         for invalid in [
             "HTTP_PROXY=http://onecli.example:10255\nhttp_proxy=http://different.example:10255\n",
             "NODE_USE_ENV_PROXY=true\n",
+            "NO_PROXY=*\n",
+            "NO_PROXY=api.openai.com\n",
+            "NO_PROXY=localhost,127.0.0.1,api.openai.com\n",
+            "NO_PROXY=localhost,127.0.0.1\nno_proxy=localhost\n",
         ] {
             let root = tempfile::tempdir().unwrap();
             let mount = root.path().join("provider-0");

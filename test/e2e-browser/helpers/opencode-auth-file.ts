@@ -123,6 +123,9 @@ export function requireOpenCodeOnecliBootstrap(
 
   const environment = readEnvironmentGrant(environmentFile, qualification)
   const proxy = environment.get('HTTPS_PROXY')
+  const noProxy = environment.get('NO_PROXY')
+  const noProxyHosts = noProxy?.split(',').map((host) => host.trim().toLowerCase()).sort()
+  const lowerNoProxy = environment.get('no_proxy')
   if (
     !proxy
     || environment.get('https_proxy') !== proxy
@@ -131,8 +134,12 @@ export function requireOpenCodeOnecliBootstrap(
     || environment.get('OPENAI_BASE_URL') !== 'https://api.openai.com/v1'
     || environment.get('NODE_EXTRA_CA_CERTS') !== ONECLI_PROVIDER_CA_PATH
     || environment.get('NODE_USE_ENV_PROXY') !== '1'
+    || noProxyHosts?.join(',') !== '127.0.0.1,localhost'
+    || (lowerNoProxy !== undefined && lowerNoProxy !== noProxy)
   ) {
-    throw new Error(`${qualification} OpenCode OneCLI environment grant is missing required proxy or CA settings`)
+    throw new Error(
+      `${qualification} OpenCode OneCLI environment grant is missing required proxy, CA, or loopback-only NO_PROXY settings`,
+    )
   }
 
   return { authFile, environmentFile, caFile }

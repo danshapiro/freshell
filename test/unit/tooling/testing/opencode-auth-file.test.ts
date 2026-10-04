@@ -90,6 +90,7 @@ describe('OpenCode OneCLI qualification bootstrap', () => {
       'http_proxy=http://agent:secret@192.168.3.150:10255',
       'NODE_EXTRA_CA_CERTS=/home/freshell/provider/.config/onecli/gateway-ca.pem',
       'NODE_USE_ENV_PROXY=1',
+      'NO_PROXY=localhost,127.0.0.1',
       '',
     ].join('\n'))
     const caFile = writeGrant('gateway-ca.pem', 'OneCLI gateway CA fixture')
@@ -119,6 +120,24 @@ describe('OpenCode OneCLI qualification bootstrap', () => {
       environmentFile: fs.realpathSync(environmentFile),
       caFile: fs.realpathSync(caFile),
     })
+  })
+
+  it('requires a loopback-only proxy bypass for the OpenCode local server', () => {
+    const { env, environmentFile } = makeBootstrap()
+    const original = fs.readFileSync(environmentFile, 'utf8')
+    for (const noProxy of [
+      undefined,
+      'localhost',
+      'localhost,127.0.0.1,api.openai.com',
+      '*',
+    ]) {
+      const environment = original.replace('NO_PROXY=localhost,127.0.0.1\n', '')
+      fs.writeFileSync(environmentFile, `${environment}${noProxy ? `NO_PROXY=${noProxy}\n` : ''}`, { mode: 0o600 })
+      expect(() => requireOpenCodeOnecliBootstrap(env)).toThrow(/NO_PROXY/)
+    }
+
+    fs.writeFileSync(environmentFile, `${original}no_proxy=localhost\n`, { mode: 0o600 })
+    expect(() => requireOpenCodeOnecliBootstrap(env)).toThrow(/NO_PROXY/)
   })
 
   it('rejects expired, real-token, and Codex-shaped OpenCode auth files', () => {

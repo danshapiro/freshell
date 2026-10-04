@@ -104,9 +104,11 @@ settings, and `FRESHELL_MANAGED_OPENCODE_ONECLI_CA_FILE` to its gateway CA
 certificate. The stub must contain only the `onecli-managed` access/refresh
 placeholders and a future expiry; it must not contain a provider token. The
 proxy environment supplies `OPENAI_BASE_URL=https://api.openai.com/v1`, both
-HTTP and HTTPS proxy aliases, `NODE_USE_ENV_PROXY=1`, and `NODE_EXTRA_CA_CERTS`
-pointing to `/home/freshell/provider/.config/onecli/gateway-ca.pem`. The session
-host stages the CA at that provider-home path before OpenCode starts.
+HTTP and HTTPS proxy aliases, `NODE_USE_ENV_PROXY=1`,
+`NO_PROXY=localhost,127.0.0.1` for OpenCode's local server, and
+`NODE_EXTRA_CA_CERTS` pointing to
+`/home/freshell/provider/.config/onecli/gateway-ca.pem`. The session host stages
+the CA at that provider-home path before OpenCode starts.
 
 Provider qualification receipts use schema v2. A v2 receipt names its exact
 `receiptRunId`, candidate-bound `evidenceRun`, pinned `runtimeImage`, and the

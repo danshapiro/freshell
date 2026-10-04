@@ -283,7 +283,7 @@
         {
           "id": "P2-G04",
           "required": true,
-          "procedure": "Start OpenCode 1.18.21 with openai/gpt-5.6-luna using private FRESHELL_MANAGED_OPENCODE_ONECLI_AUTH_FILE, ENV_FILE, and CA_FILE references: a native OpenCode OAuth stub with onecli-managed placeholders, the dedicated agent proxy settings, and its trusted gateway CA; verify the provider home contains only the placeholder OAuth stub and staged CA and that the requested model is available; complete a first Bash-tool turn, begin a controlled long Bash tool, SIGKILL/restart web while the tool is running, then run a provider-side tool in a follow-up.",
+          "procedure": "Start OpenCode 1.18.21 with openai/gpt-5.6-luna using private FRESHELL_MANAGED_OPENCODE_ONECLI_AUTH_FILE, ENV_FILE, and CA_FILE references: a native OpenCode OAuth stub with onecli-managed placeholders, the dedicated agent proxy settings, its trusted gateway CA, and loopback-only NO_PROXY entries for localhost and 127.0.0.1; verify the provider home contains only the placeholder OAuth stub and staged CA and that the requested model is available; complete a first Bash-tool turn, begin a controlled long Bash tool, SIGKILL/restart web while the tool is running, then run a provider-side tool in a follow-up.",
           "pass_assertion": "Same native ses_* session, soul, OS incarnation, container and host boot; tool effects occur exactly once; provider launch count stays one; no paid-model fallback or CLI auto-update.",
           "status": "NOT_RUN"
         },
