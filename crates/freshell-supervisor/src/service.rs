@@ -163,15 +163,19 @@ impl Supervisor {
             .await
             .map_err(map_registry)?;
         let staging = Arc::clone(&self.opencode_transfer_staging);
-        tokio::task::spawn_blocking(move || staging.reclaim_release_eligible(&references))
-            .await
-            .map_err(|error| {
-                RuntimeError::new(
-                    RuntimeErrorCode::RegistryFailure,
-                    format!("OpenCode stage cleanup worker did not settle: {error}"),
-                )
-            })?
-            .map_err(map_opencode_transfer)
+        tokio::task::spawn_blocking(move || {
+            let abandoned = staging.reclaim_abandoned_partials()?;
+            let receipt_released = staging.reclaim_release_eligible(&references)?;
+            Ok(abandoned + receipt_released)
+        })
+        .await
+        .map_err(|error| {
+            RuntimeError::new(
+                RuntimeErrorCode::RegistryFailure,
+                format!("OpenCode stage cleanup worker did not settle: {error}"),
+            )
+        })?
+        .map_err(map_opencode_transfer)
     }
 
     /// Recover the narrow crash window where the host persisted a receipt and
@@ -2423,6 +2427,28 @@ pub async fn serve_control(supervisor: Supervisor, socket_path: &Path) -> Result
                 "supervisor.opencode_transfer_startup_cleanup_deferred",
                 serde_json::json!({"error":error.message}),
             );
+        }
+    });
+    let partial_cleanup_supervisor = supervisor.clone();
+    tokio::spawn(async move {
+        loop {
+            sleep(Duration::from_secs(5 * 60)).await;
+            let staging = Arc::clone(&partial_cleanup_supervisor.opencode_transfer_staging);
+            let cleanup_error =
+                match tokio::task::spawn_blocking(move || staging.reclaim_abandoned_partials())
+                    .await
+                {
+                    Ok(Ok(_)) => None,
+                    Ok(Err(error)) => Some(error.to_string()),
+                    Err(error) => Some(error.to_string()),
+                };
+            if let Some(error) = cleanup_error {
+                append_event(
+                    &partial_cleanup_supervisor.config.lifecycle_log,
+                    "supervisor.opencode_transfer_partial_cleanup_deferred",
+                    serde_json::json!({"error":error}),
+                );
+            }
         }
     });
     loop {
