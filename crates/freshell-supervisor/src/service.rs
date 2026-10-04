@@ -19,7 +19,7 @@ use freshell_runtime_protocol::{
 };
 use sha2::{Digest, Sha256};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicU64, Ordering},
@@ -216,11 +216,13 @@ impl Supervisor {
             .opencode_transfer_stage_references()
             .await
             .map_err(map_registry)?;
+        let referenced_transfer_ids = references.keys().cloned().collect::<HashSet<_>>();
         let staging = Arc::clone(&self.opencode_transfer_staging);
         tokio::task::spawn_blocking(move || {
+            staging.reconcile_registering_ready(&references)?;
             let abandoned = staging.reclaim_abandoned_partials()?;
-            let expired_ready = staging.reclaim_abandoned_ready(&references)?;
-            let receipt_released = staging.reclaim_release_eligible(&references)?;
+            let expired_ready = staging.reclaim_abandoned_ready(&referenced_transfer_ids)?;
+            let receipt_released = staging.reclaim_release_eligible(&referenced_transfer_ids)?;
             Ok(abandoned + expired_ready + receipt_released)
         })
         .await
@@ -454,11 +456,26 @@ impl Supervisor {
                         descriptor,
                         attempt_id,
                     } => {
+                        let _lifecycle_guard = self.opencode_transfer_lifecycle_lock.lock().await;
                         if descriptor.target_image_ref != self.config.image_ref {
                             return Err(RuntimeError::new(
                                 RuntimeErrorCode::RecoveryWrongIdentity,
                                 "OpenCode transfer target image does not match the supervisor runtime image",
                             ));
+                        }
+                        if self
+                            .opencode_transfer_staging
+                            .ready_registration_needs_reconciliation(&descriptor.transfer_id)
+                            .map_err(map_opencode_transfer)?
+                        {
+                            let references = self
+                                .registry
+                                .opencode_transfer_stage_references()
+                                .await
+                                .map_err(map_registry)?;
+                            self.opencode_transfer_staging
+                                .reconcile_registering_ready(&references)
+                                .map_err(map_opencode_transfer)?;
                         }
                         let available = self
                             .opencode_transfer_staging
@@ -532,8 +549,14 @@ impl Supervisor {
                             .opencode_transfer_stage_references()
                             .await
                             .map_err(map_registry)?;
+                        let referenced_transfer_ids =
+                            references.keys().cloned().collect::<HashSet<_>>();
                         self.opencode_transfer_staging
-                            .abort_with_references(&transfer_id, &attempt_id, &references)
+                            .abort_with_references(
+                                &transfer_id,
+                                &attempt_id,
+                                &referenced_transfer_ids,
+                            )
                             .map_err(map_opencode_transfer)?;
                         OpenCodeTransferResult::Aborted { transfer_id }
                     }
@@ -1152,7 +1175,10 @@ impl Supervisor {
                 .opencode_transfer_stage_references()
                 .await
                 .map_err(map_registry)?;
-            let already_referenced = references.contains(&descriptor.transfer_id);
+            let already_referenced = self
+                .opencode_transfer_staging
+                .has_exact_registry_reference(&references, descriptor)
+                .map_err(map_opencode_transfer)?;
             let staging = Arc::clone(&self.opencode_transfer_staging);
             let descriptor = descriptor.clone();
             let attempt_id = attempt_id.to_owned();
@@ -1218,12 +1244,15 @@ impl Supervisor {
                             let staging = Arc::clone(&self.opencode_transfer_staging);
                             let descriptor = descriptor.clone();
                             let attempt_id = attempt_id.to_owned();
-                            if references.contains(&descriptor.transfer_id) {
+                            if staging
+                                .has_exact_registry_reference(&references, &descriptor)
+                                .unwrap_or(false)
+                            {
                                 let _ = tokio::task::spawn_blocking(move || {
                                     staging.mark_launch_claimed(&descriptor, &attempt_id)
                                 })
                                 .await;
-                            } else {
+                            } else if !references.contains_key(&descriptor.transfer_id) {
                                 let _ = tokio::task::spawn_blocking(move || {
                                     staging.restore_unregistered_pending(&descriptor, &attempt_id)
                                 })
@@ -4280,6 +4309,214 @@ mod opencode_launch_digest_tests {
             semantic_launch_digest(&retry).unwrap(),
             "stable launch intent must remain part of the digest"
         );
+    }
+}
+
+#[cfg(test)]
+mod opencode_transfer_restart_tests {
+    use super::*;
+    use freshell_runtime_protocol::{
+        opencode_target_build_receipt, opencode_transfer_bundle_digest, OpenCodeTransferChunk,
+        OpenCodeTransferDescriptor, OpenCodeTransferFile,
+    };
+    use rusqlite::{params, Connection};
+
+    const ATTEMPT_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const ATTEMPT_B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+    fn descriptor() -> OpenCodeTransferDescriptor {
+        let payload = b"12345678";
+        let source_store_id = "b".repeat(64);
+        let source_schema_fingerprint = "c".repeat(64);
+        let migration_journal_fingerprint = "d".repeat(64);
+        let source_generation = "e".repeat(64);
+        let target_image_ref = format!("sha256:{}", "a".repeat(64));
+        let payload_sha256 = format!("{:x}", Sha256::digest(payload));
+        let manifest_json = serde_json::json!({
+            "version": 1,
+            "provider_schema": "opencode-1.18.21",
+            "root_session_id": "ses_exact",
+            "source_store_id": source_store_id,
+            "source_schema_fingerprint": source_schema_fingerprint,
+            "migration_journal_fingerprint": migration_journal_fingerprint,
+            "generation": source_generation,
+            "assets": [],
+            "payload_bytes": payload.len(),
+            "payload_sha256": payload_sha256,
+            "rows": []
+        })
+        .to_string();
+        let files = vec![OpenCodeTransferFile {
+            index: 0,
+            relative_path: "payload.json".into(),
+            size_bytes: payload.len() as u64,
+            sha256: payload_sha256,
+        }];
+        OpenCodeTransferDescriptor {
+            transfer_id: "transfer-read-error-fence".into(),
+            provider: "opencode".into(),
+            source_store_id,
+            root_session_id: "ses_exact".into(),
+            source_generation,
+            provider_schema: "opencode-1.18.21".into(),
+            source_schema_fingerprint,
+            migration_journal_fingerprint,
+            destination_store_id: "soul-exact".into(),
+            destination_database_path: ".local/share/opencode/opencode.db".into(),
+            target_build_receipt: opencode_target_build_receipt(
+                &target_image_ref,
+                "opencode-1.18.21",
+            ),
+            target_image_ref,
+            incarnation_id: "incarnation-test".into(),
+            bundle_sha256: opencode_transfer_bundle_digest(&manifest_json, &files),
+            manifest_json,
+            files,
+            total_bytes: payload.len() as u64,
+        }
+    }
+
+    fn chunk(descriptor: &OpenCodeTransferDescriptor) -> OpenCodeTransferChunk {
+        let data = b"12345678".to_vec();
+        OpenCodeTransferChunk {
+            transfer_id: descriptor.transfer_id.clone(),
+            attempt_id: ATTEMPT_A.into(),
+            sequence: 0,
+            file_index: 0,
+            offset: 0,
+            sha256: format!("{:x}", Sha256::digest(&data)),
+            data,
+        }
+    }
+
+    fn supervisor(dir: &tempfile::TempDir, registry: Registry) -> Supervisor {
+        Supervisor::new(
+            registry,
+            Arc::new(DockerEngineBackend::new(
+                dir.path().join("unused-docker.sock"),
+            )),
+            SupervisorConfig {
+                runtime_root: dir.path().join("runtime"),
+                control_socket_path: dir.path().join("control.sock"),
+                host_binary_path: std::env::current_exe().unwrap(),
+                image_ref: format!("sha256:{}", "a".repeat(64)),
+                test_run_id: "restart-reconcile-test".into(),
+                control_secret: "synthetic-test-secret".into(),
+                lifecycle_log: dir.path().join("lifecycle.jsonl"),
+                admission: AdmissionPolicy::default(),
+            },
+        )
+        .unwrap()
+    }
+
+    async fn begin_as_retry(
+        supervisor: &Supervisor,
+        descriptor: OpenCodeTransferDescriptor,
+    ) -> Result<AdminResult, RuntimeError> {
+        let mut envelope = Envelope::new(
+            RequestId::new(),
+            ControlRole::Web,
+            AdminCommand::OpenCodeTransfer(OpenCodeTransferAction::Begin {
+                descriptor: Box::new(descriptor),
+                attempt_id: ATTEMPT_B.into(),
+            }),
+        );
+        envelope.auth = Some("synthetic-test-secret".into());
+        supervisor.dispatch(envelope).await.result
+    }
+
+    #[tokio::test]
+    async fn registry_reference_read_error_does_not_release_registering_stage() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry = Registry::open(dir.path().join("registry"), None).unwrap();
+        let prepared = registry
+            .prepare_launch(LaunchPreparation {
+                soul_id: SoulId::new(),
+                provider: "fixture".into(),
+                provider_store_id: "store".into(),
+                native_session_id: None,
+                creation_seed_ref: "seed".into(),
+                request_id: RequestId::new(),
+                payload_digest: "test-read-error".into(),
+                requested_limits: RuntimeLimits {
+                    cpu_milli: 500,
+                    memory_bytes: 64 * 1024 * 1024,
+                    swap_bytes: 0,
+                    pids_max: 32,
+                },
+                profile: freshell_runtime_protocol::RuntimeProfile::Custom,
+                project_key: "test-project".into(),
+                fixture: None,
+                terminal: None,
+                fresh_agent: None,
+                view_intent: None,
+                admission: AdmissionPolicy::default(),
+            })
+            .await
+            .unwrap();
+        let connection = Connection::open(registry.database_path()).unwrap();
+        connection
+            .execute(
+                "UPDATE incarnations SET terminal_spec=?1 WHERE incarnation_id=?2",
+                params![
+                    serde_json::json!({
+                        "opencodeTransfer": {"transferId": "transfer-read-error-fence"}
+                    })
+                    .to_string(),
+                    prepared.incarnation_id.as_str()
+                ],
+            )
+            .unwrap();
+        drop(connection);
+
+        let supervisor = supervisor(&dir, registry);
+        let descriptor = descriptor();
+        let staging = &supervisor.opencode_transfer_staging;
+        staging.begin(&descriptor, ATTEMPT_A, 8).unwrap();
+        staging.write_chunk(&chunk(&descriptor)).unwrap();
+        staging
+            .finalize(&descriptor.transfer_id, ATTEMPT_A)
+            .unwrap();
+        staging
+            .mark_launch_registering(&descriptor, ATTEMPT_A, false)
+            .unwrap();
+
+        let error = begin_as_retry(&supervisor, descriptor.clone())
+            .await
+            .expect_err("an unreadable reference snapshot must fail Begin closed");
+        assert_eq!(error.code, RuntimeErrorCode::RegistryFailure);
+        assert!(
+            staging.begin(&descriptor, ATTEMPT_B, 8).is_err(),
+            "without a complete registry snapshot the previous registering attempt stays fenced"
+        );
+    }
+
+    #[tokio::test]
+    async fn begin_recovers_an_unreferenced_registering_stage_before_the_first_retry() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry = Registry::open(dir.path().join("registry"), None).unwrap();
+        let supervisor = supervisor(&dir, registry);
+        let descriptor = descriptor();
+        let staging = &supervisor.opencode_transfer_staging;
+        staging.begin(&descriptor, ATTEMPT_A, 8).unwrap();
+        staging.write_chunk(&chunk(&descriptor)).unwrap();
+        staging
+            .finalize(&descriptor.transfer_id, ATTEMPT_A)
+            .unwrap();
+        staging
+            .mark_launch_registering(&descriptor, ATTEMPT_A, false)
+            .unwrap();
+
+        let result = begin_as_retry(&supervisor, descriptor)
+            .await
+            .expect("an empty, readable registry snapshot permits a fresh attempt");
+        assert!(matches!(
+            result,
+            AdminResult::OpenCodeTransfer(OpenCodeTransferResult::Started {
+                next_sequence: 1,
+                ..
+            })
+        ));
     }
 }
 

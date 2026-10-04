@@ -1,16 +1,17 @@
 use crate::admission::{AdmissionPolicy, ReservationTotals};
+use crate::opencode_transfer::OpenCodeTransferStageReferences;
 use freshell_runtime_protocol::{
     AllocationState, CleanupState, DesiredState, DockerDaemonId, DurabilityState, FixtureKind,
     FreshAgentLaunchSpec, FreshAgentTurnSettings, GrantId, HostBootId, IncarnationId, IncidentId,
-    InstallationId, LaunchNonce, LaunchState, NoticeId, RecoveryAttemptId, RecoveryBlockReason,
-    RecoveryPath, RecoveryState, RecoveryTrigger, RequestId, ResumeSpec, RuntimeLimits,
-    RuntimeProfile, RuntimeView, SoulId, StopOutcome, TerminalLaunchSpec, ViewIntentRequest,
+    InstallationId, LaunchNonce, LaunchState, NoticeId, OpenCodeTransferDescriptor,
+    RecoveryAttemptId, RecoveryBlockReason, RecoveryPath, RecoveryState, RecoveryTrigger,
+    RequestId, ResumeSpec, RuntimeLimits, RuntimeProfile, RuntimeView, SoulId, StopOutcome,
+    TerminalLaunchSpec, ViewIntentRequest,
 };
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
-    collections::HashSet,
     fs::OpenOptions,
     os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
@@ -1912,30 +1913,43 @@ impl Registry {
     /// OpenCode receipt.
     pub async fn opencode_transfer_stage_references(
         &self,
-    ) -> Result<HashSet<String>, RegistryError> {
+    ) -> Result<OpenCodeTransferStageReferences, RegistryError> {
         self.run_blocking(move |conn| {
+            failpoint("opencode_transfer_stage_references")?;
             let mut statement = conn.prepare(
-                "SELECT terminal_spec FROM incarnations \
+                "SELECT incarnation_id,terminal_spec FROM incarnations \
                  WHERE launch_state IN ('prepared','created','starting') \
                    AND terminal_spec IS NOT NULL",
             )?;
             let rows = statement
-                .query_map([], |row| row.get::<_, String>(0))?
+                .query_map([], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })?
                 .collect::<Result<Vec<_>, _>>()?;
-            let mut references = HashSet::new();
-            for encoded in rows {
+            let mut references = OpenCodeTransferStageReferences::new();
+            for (incarnation_id, encoded) in rows {
                 let terminal: serde_json::Value = serde_json::from_str(&encoded)?;
                 if let Some(transfer) = terminal.get("opencodeTransfer") {
-                    let transfer_id = transfer
-                        .get("transferId")
-                        .and_then(serde_json::Value::as_str)
-                        .filter(|value| !value.is_empty())
-                        .ok_or_else(|| {
+                    let descriptor: OpenCodeTransferDescriptor =
+                        serde_json::from_value(transfer.clone()).map_err(|_| {
                             RegistryError::Integrity(
-                                "prepared OpenCode transfer has no transfer id".into(),
+                                "prepared OpenCode transfer descriptor is invalid".into(),
                             )
                         })?;
-                    references.insert(transfer_id.to_string());
+                    descriptor.validate().map_err(|_| {
+                        RegistryError::Integrity(
+                            "prepared OpenCode transfer descriptor failed validation".into(),
+                        )
+                    })?;
+                    if descriptor.incarnation_id != incarnation_id {
+                        return Err(RegistryError::Integrity(
+                            "prepared OpenCode transfer does not match its incarnation".into(),
+                        ));
+                    }
+                    references
+                        .entry(descriptor.transfer_id.clone())
+                        .or_default()
+                        .push(descriptor);
                 }
             }
             Ok(references)
@@ -3376,6 +3390,125 @@ mod tests {
         }
     }
 
+    fn opencode_transfer_descriptor(transfer_id: &str) -> OpenCodeTransferDescriptor {
+        let payload = b"12345678";
+        let source_store_id = "b".repeat(64);
+        let source_schema_fingerprint = "c".repeat(64);
+        let migration_journal_fingerprint = "d".repeat(64);
+        let generation = "e".repeat(64);
+        let target_image_ref = format!("sha256:{}", "a".repeat(64));
+        let payload_sha256 = format!("{:x}", Sha256::digest(payload));
+        let manifest_json = serde_json::json!({
+            "version": 1,
+            "provider_schema": "opencode-1.18.21",
+            "root_session_id": "ses_exact",
+            "source_store_id": source_store_id,
+            "source_schema_fingerprint": source_schema_fingerprint,
+            "migration_journal_fingerprint": migration_journal_fingerprint,
+            "generation": generation,
+            "assets": [],
+            "payload_bytes": payload.len(),
+            "payload_sha256": payload_sha256,
+            "rows": []
+        })
+        .to_string();
+        let files = vec![freshell_runtime_protocol::OpenCodeTransferFile {
+            index: 0,
+            relative_path: "payload.json".into(),
+            size_bytes: payload.len() as u64,
+            sha256: payload_sha256,
+        }];
+        let target_build_receipt = freshell_runtime_protocol::opencode_target_build_receipt(
+            &target_image_ref,
+            "opencode-1.18.21",
+        );
+        let bundle_sha256 =
+            freshell_runtime_protocol::opencode_transfer_bundle_digest(&manifest_json, &files);
+        OpenCodeTransferDescriptor {
+            transfer_id: transfer_id.into(),
+            provider: "opencode".into(),
+            source_store_id,
+            root_session_id: "ses_exact".into(),
+            source_generation: generation,
+            provider_schema: "opencode-1.18.21".into(),
+            source_schema_fingerprint,
+            migration_journal_fingerprint,
+            destination_store_id: "soul-exact".into(),
+            destination_database_path: ".local/share/opencode/opencode.db".into(),
+            target_image_ref,
+            target_build_receipt,
+            incarnation_id: "incarnation-test".into(),
+            manifest_json,
+            files: files.clone(),
+            total_bytes: payload.len() as u64,
+            bundle_sha256,
+        }
+    }
+
+    fn opencode_terminal(
+        descriptor: &OpenCodeTransferDescriptor,
+        attempt_id: &str,
+    ) -> TerminalLaunchSpec {
+        serde_json::from_value(serde_json::json!({
+            "terminalId": "terminal-transfer-restart",
+            "streamId": "stream-transfer-restart",
+            "mode": "opencode",
+            "program": "opencode",
+            "cwd": "/workspace",
+            "runAsUid": 65534,
+            "runAsGid": 0,
+            "cols": 80,
+            "rows": 24,
+            "projectKey": "test-project",
+            "workspacePath": "/workspace",
+            "resumeSessionId": descriptor.root_session_id,
+            "opencodeTransfer": descriptor,
+            "opencodeTransferAttemptId": attempt_id,
+        }))
+        .unwrap()
+    }
+
+    fn opencode_prep(
+        soul_id: SoulId,
+        request_id: RequestId,
+        descriptor: &OpenCodeTransferDescriptor,
+        attempt_id: &str,
+    ) -> LaunchPreparation {
+        LaunchPreparation {
+            soul_id,
+            provider: "opencode".into(),
+            provider_store_id: descriptor.destination_store_id.clone(),
+            native_session_id: Some(descriptor.root_session_id.clone()),
+            creation_seed_ref: "seed".into(),
+            request_id,
+            payload_digest: "stable-opencode-transfer-request".into(),
+            requested_limits: limits(),
+            profile: RuntimeProfile::Custom,
+            project_key: "test-project".into(),
+            fixture: None,
+            terminal: Some(opencode_terminal(descriptor, attempt_id)),
+            fresh_agent: None,
+            view_intent: None,
+            admission: AdmissionPolicy::default(),
+        }
+    }
+
+    fn opencode_chunk(
+        descriptor: &OpenCodeTransferDescriptor,
+        attempt_id: &str,
+    ) -> freshell_runtime_protocol::OpenCodeTransferChunk {
+        let data = b"12345678".to_vec();
+        freshell_runtime_protocol::OpenCodeTransferChunk {
+            transfer_id: descriptor.transfer_id.clone(),
+            attempt_id: attempt_id.into(),
+            sequence: 0,
+            file_index: 0,
+            offset: 0,
+            sha256: format!("{:x}", Sha256::digest(&data)),
+            data,
+        }
+    }
+
     #[tokio::test]
     async fn provider_preparation_migration_preserves_unproved_running_and_accepted_pending_state()
     {
@@ -3818,11 +3951,13 @@ mod tests {
             .await
             .unwrap();
         let conn = open_connection(&registry.inner.db_path).unwrap();
+        let mut descriptor = opencode_transfer_descriptor("transfer-ref");
+        descriptor.incarnation_id = prepared.incarnation_id.as_str().to_owned();
         conn.execute(
             "UPDATE incarnations SET terminal_spec=?1 WHERE incarnation_id=?2",
             params![
                 serde_json::json!({
-                    "opencodeTransfer": {"transferId": "transfer-ref"}
+                    "opencodeTransfer": descriptor
                 })
                 .to_string(),
                 prepared.incarnation_id.as_str()
@@ -3831,11 +3966,14 @@ mod tests {
         .unwrap();
         drop(conn);
 
-        assert!(registry
-            .opencode_transfer_stage_references()
-            .await
-            .unwrap()
-            .contains("transfer-ref"));
+        assert_eq!(
+            registry
+                .opencode_transfer_stage_references()
+                .await
+                .unwrap()
+                .get("transfer-ref"),
+            Some(&vec![descriptor.clone()])
+        );
         assert!(
             registry
                 .opencode_transfer_receipt_candidates()
@@ -3872,7 +4010,110 @@ mod tests {
             .opencode_transfer_stage_references()
             .await
             .unwrap()
-            .contains("transfer-ref"));
+            .contains_key("transfer-ref"));
+    }
+
+    #[tokio::test]
+    async fn committed_prepared_reference_recovers_registration_and_same_request_after_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry = Registry::open(dir.path().join("registry"), None).unwrap();
+        let staging_root = dir.path().join("runtime");
+        let descriptor = opencode_transfer_descriptor("transfer-prepared-restart");
+        let soul_id = SoulId::new();
+        let request_id = RequestId::new();
+        let limits = crate::opencode_transfer::StagingLimits::for_test(8, 8);
+
+        let staging =
+            crate::opencode_transfer::OpenCodeTransferStaging::new(&staging_root, limits).unwrap();
+        staging
+            .begin(&descriptor, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", 8)
+            .unwrap();
+        staging
+            .write_chunk(&opencode_chunk(
+                &descriptor,
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            ))
+            .unwrap();
+        staging
+            .finalize(&descriptor.transfer_id, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+            .unwrap();
+        staging
+            .mark_launch_registering(&descriptor, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", false)
+            .unwrap();
+
+        let prepared = registry
+            .prepare_launch(opencode_prep(
+                soul_id.clone(),
+                request_id.clone(),
+                &descriptor,
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            ))
+            .await
+            .unwrap();
+        assert!(!prepared.existing_request);
+        assert_eq!(prepared.incarnation_id.as_str(), descriptor.incarnation_id);
+        drop(staging);
+
+        let references = registry.opencode_transfer_stage_references().await.unwrap();
+        assert_eq!(
+            references.get(&descriptor.transfer_id),
+            Some(&vec![descriptor.clone()])
+        );
+        let restarted =
+            crate::opencode_transfer::OpenCodeTransferStaging::new(&staging_root, limits).unwrap();
+        restarted.reconcile_registering_ready(&references).unwrap();
+        assert!(matches!(
+            restarted
+                .begin(&descriptor, "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", 8,)
+                .unwrap(),
+            crate::opencode_transfer::StagingStart::Started {
+                next_sequence: 1,
+                ..
+            }
+        ));
+
+        let retried = registry
+            .prepare_launch(opencode_prep(
+                soul_id,
+                request_id,
+                &descriptor,
+                "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            ))
+            .await
+            .unwrap();
+        assert!(retried.existing_request);
+        assert_eq!(retried.incarnation_id, prepared.incarnation_id);
+        restarted
+            .mark_launch_registering(&descriptor, "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", true)
+            .unwrap();
+        restarted
+            .mark_launch_claimed(&descriptor, "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn stage_reference_query_rejects_an_unreadable_transfer_descriptor() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry = Registry::open(dir.path(), None).unwrap();
+        let prepared = registry
+            .prepare_launch(prep(SoulId::new(), RequestId::new(), "transfer-ref-bad"))
+            .await
+            .unwrap();
+        let conn = open_connection(&registry.inner.db_path).unwrap();
+        conn.execute(
+            "UPDATE incarnations SET terminal_spec=?1 WHERE incarnation_id=?2",
+            params![
+                serde_json::json!({
+                    "opencodeTransfer": {"transferId": "transfer-ref-bad"}
+                })
+                .to_string(),
+                prepared.incarnation_id.as_str()
+            ],
+        )
+        .unwrap();
+        drop(conn);
+
+        assert!(registry.opencode_transfer_stage_references().await.is_err());
     }
 
     async fn materialize_test_runtime(registry: &Registry, soul_id: SoulId) -> PreparedLaunch {

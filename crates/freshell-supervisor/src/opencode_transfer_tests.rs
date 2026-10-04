@@ -645,6 +645,173 @@ fn registration_claim_racing_abort_and_expiry_keeps_registry_owned_ready_stage()
     );
 }
 
+#[test]
+fn registering_ready_stage_recovers_from_exact_registry_reference_after_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let limits = StagingLimits::for_test(8, 8);
+    let registered = descriptor(b"12345678", "transfer-restart-registering-exact");
+    let staging = OpenCodeTransferStaging::new(dir.path(), limits).unwrap();
+    staging.begin(&registered, TEST_ATTEMPT, 8).unwrap();
+    staging
+        .write_chunk(&chunk(&registered, b"12345678", 0))
+        .unwrap();
+    staging
+        .finalize(&registered.transfer_id, TEST_ATTEMPT)
+        .unwrap();
+    staging
+        .mark_launch_registering(&registered, TEST_ATTEMPT, false)
+        .unwrap();
+    drop(staging);
+
+    let references = std::collections::HashMap::from([(
+        registered.transfer_id.clone(),
+        vec![registered.clone()],
+    )]);
+    let restarted = OpenCodeTransferStaging::new(dir.path(), limits).unwrap();
+    restarted
+        .reconcile_registering_ready(&references)
+        .expect("the exact prepared registry descriptor should recover the stage as claimed");
+    assert!(matches!(
+        restarted.begin(&registered, RETRY_ATTEMPT, 8).unwrap(),
+        StagingStart::Started {
+            next_sequence: 1,
+            ..
+        }
+    ));
+    restarted
+        .mark_launch_registering(&registered, RETRY_ATTEMPT, true)
+        .unwrap();
+    restarted
+        .mark_launch_claimed(&registered, RETRY_ATTEMPT)
+        .unwrap();
+    assert!(restarted.ready_path(&registered.transfer_id).is_dir());
+}
+
+#[test]
+fn registering_ready_stage_without_registry_reference_can_be_taken_over_after_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let limits = StagingLimits::for_test(8, 8);
+    let unregistered = descriptor(b"12345678", "transfer-restart-registering-unreferenced");
+    let staging = OpenCodeTransferStaging::new(dir.path(), limits).unwrap();
+    staging.begin(&unregistered, TEST_ATTEMPT, 8).unwrap();
+    staging
+        .write_chunk(&chunk(&unregistered, b"12345678", 0))
+        .unwrap();
+    staging
+        .finalize(&unregistered.transfer_id, TEST_ATTEMPT)
+        .unwrap();
+    staging
+        .mark_launch_registering(&unregistered, TEST_ATTEMPT, false)
+        .unwrap();
+    drop(staging);
+
+    let restarted = OpenCodeTransferStaging::new(dir.path(), limits).unwrap();
+    restarted
+        .reconcile_registering_ready(&std::collections::HashMap::new())
+        .unwrap();
+    assert!(matches!(
+        restarted.begin(&unregistered, RETRY_ATTEMPT, 8).unwrap(),
+        StagingStart::Started {
+            next_sequence: 1,
+            ..
+        }
+    ));
+}
+
+#[test]
+fn registering_ready_stage_rejects_mismatched_registry_reference_after_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let limits = StagingLimits::for_test(8, 8);
+    let registered = descriptor(b"12345678", "transfer-restart-registering-mismatch");
+    let staging = OpenCodeTransferStaging::new(dir.path(), limits).unwrap();
+    staging.begin(&registered, TEST_ATTEMPT, 8).unwrap();
+    staging
+        .write_chunk(&chunk(&registered, b"12345678", 0))
+        .unwrap();
+    staging
+        .finalize(&registered.transfer_id, TEST_ATTEMPT)
+        .unwrap();
+    staging
+        .mark_launch_registering(&registered, TEST_ATTEMPT, false)
+        .unwrap();
+    drop(staging);
+
+    let mut mismatched = registered.clone();
+    mismatched.source_generation = "f".repeat(64);
+    let references =
+        std::collections::HashMap::from([(registered.transfer_id.clone(), vec![mismatched])]);
+    let restarted = OpenCodeTransferStaging::new(dir.path(), limits).unwrap();
+    assert!(restarted.reconcile_registering_ready(&references).is_err());
+    assert!(
+        restarted.begin(&registered, RETRY_ATTEMPT, 8).is_err(),
+        "a mismatched durable reference must keep the old registering owner fenced"
+    );
+}
+
+#[test]
+fn interrupted_queue_metadata_is_private_until_atomic_publish_and_recovers_fifo() {
+    let dir = tempfile::tempdir().unwrap();
+    let limits = StagingLimits::for_test(8, 8);
+    let full = descriptor(b"12345678", "transfer-atomic-queue-full");
+    let first = descriptor(b"abcdefgh", "transfer-atomic-queue-first");
+    let interrupted = descriptor(b"ABCDEFGH", "transfer-atomic-queue-interrupted");
+    let legacy_interrupted = descriptor(b"legacy!!", "transfer-legacy-partial-queue-init");
+    let staging = OpenCodeTransferStaging::new(dir.path(), limits).unwrap();
+    staging.begin(&full, TEST_ATTEMPT, 8).unwrap();
+    assert_eq!(
+        staging.begin(&first, TEST_ATTEMPT, 8).unwrap(),
+        StagingStart::Queued
+    );
+
+    staging.fail_next_queue_initialization_after_order_for_test();
+    assert!(staging.begin(&interrupted, TEST_ATTEMPT, 8).is_err());
+    assert!(
+        !staging.queued_path(&interrupted.transfer_id).exists(),
+        "metadata must not be visible at the final FIFO path before publication"
+    );
+    let legacy_path = staging.queued_path(&legacy_interrupted.transfer_id);
+    std::fs::create_dir(&legacy_path).unwrap();
+    std::fs::set_permissions(&legacy_path, std::fs::Permissions::from_mode(0o700)).unwrap();
+    staging
+        .write_descriptor(&legacy_path, &legacy_interrupted)
+        .unwrap();
+    drop(staging);
+
+    let restarted = OpenCodeTransferStaging::new(dir.path(), limits).unwrap();
+    assert!(restarted.queued_path(&first.transfer_id).is_dir());
+    assert!(!restarted.queued_path(&interrupted.transfer_id).exists());
+    assert!(
+        !restarted
+            .queued_path(&legacy_interrupted.transfer_id)
+            .exists(),
+        "an exact pre-upgrade partial queue directory is reclaimed on restart"
+    );
+    assert_eq!(restarted.queued_count_unlocked().unwrap(), 1);
+    assert_eq!(
+        restarted.begin(&interrupted, RETRY_ATTEMPT, 8).unwrap(),
+        StagingStart::Queued
+    );
+    assert!(std::fs::read_dir(&restarted.root)
+        .unwrap()
+        .all(|entry| !entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with(super::QUEUE_INITIALIZATION_PREFIX)));
+    let first_order = restarted
+        .read_queue_order_unlocked(&restarted.queued_path(&first.transfer_id))
+        .unwrap();
+    let interrupted_order = restarted
+        .read_queue_order_unlocked(&restarted.queued_path(&interrupted.transfer_id))
+        .unwrap();
+    assert!(first_order < interrupted_order);
+
+    restarted.abort(&full.transfer_id, TEST_ATTEMPT).unwrap();
+    assert!(restarted.partial_path(&first.transfer_id).is_dir());
+    restarted.abort(&first.transfer_id, TEST_ATTEMPT).unwrap();
+    assert!(restarted.partial_path(&interrupted.transfer_id).is_dir());
+}
+
 #[tokio::test]
 async fn queued_transfers_progress_fifo_after_receipt_release_and_cancel_by_attempt() {
     let dir = tempfile::tempdir().unwrap();
@@ -721,12 +888,27 @@ fn queued_transfer_order_and_retry_survive_supervisor_restart() {
         staging.begin(&queued, TEST_ATTEMPT, 8).unwrap(),
         StagingStart::Queued
     );
+    let original_order = staging
+        .read_queue_order_unlocked(&staging.queued_path(&queued.transfer_id))
+        .unwrap();
     drop(staging);
 
     let restarted = OpenCodeTransferStaging::new(dir.path(), limits).unwrap();
     assert_eq!(
         restarted.begin(&queued, RETRY_ATTEMPT, 8).unwrap(),
         StagingStart::Queued
+    );
+    assert_eq!(
+        restarted
+            .read_queue_order_unlocked(&restarted.queued_path(&queued.transfer_id))
+            .unwrap(),
+        original_order,
+        "a fully published queue position keeps its FIFO order across restart"
+    );
+    assert_eq!(
+        super::read_attempt_owner(&restarted.queued_path(&queued.transfer_id)).unwrap(),
+        RETRY_ATTEMPT,
+        "the resumed attempt takes ownership without changing the queue position"
     );
     restarted.abort(&queued.transfer_id, TEST_ATTEMPT).unwrap();
     assert!(restarted.queued_path(&queued.transfer_id).is_dir());
