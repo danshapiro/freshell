@@ -11,7 +11,7 @@ use freshell_runtime_protocol::{
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     fs::{self, File, OpenOptions},
     io::{Read, Seek, SeekFrom, Write},
     os::unix::fs::{OpenOptionsExt, PermissionsExt},
@@ -29,6 +29,7 @@ const PARTIAL_ATTEMPT_FILE: &str = ".attempt";
 const QUEUE_ORDER_FILE: &str = ".queue-order";
 const QUEUE_SEQUENCE_FILE: &str = ".queue-sequence";
 const MAX_QUEUED_TRANSFERS: usize = 128;
+const QUEUE_INITIALIZATION_PREFIX: &str = ".queue-init-";
 /// A partial transfer with no durable progress for an hour is abandoned.
 /// Normal retries resume it before this lease expires; failed live requests
 /// also send Abort, leaving this as the process-crash fallback.
@@ -124,6 +125,18 @@ pub struct OpenCodeTransferStaging {
     limits: StagingLimits,
     lock: Mutex<()>,
     capacity_changed: tokio::sync::watch::Sender<u64>,
+    #[cfg(test)]
+    queue_initialization_failpoint: Mutex<Option<QueueInitializationPhase>>,
+}
+
+pub type OpenCodeTransferStageReferences = HashMap<String, Vec<OpenCodeTransferDescriptor>>;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum QueueInitializationPhase {
+    DirectoryCreated,
+    DescriptorDurable,
+    AttemptDurable,
+    OrderDurable,
 }
 
 impl OpenCodeTransferStaging {
@@ -153,12 +166,19 @@ impl OpenCodeTransferStaging {
             sync_parent(&root)?;
         }
         let (capacity_changed, _) = tokio::sync::watch::channel(0);
-        Ok(Self {
+        let staging = Self {
             root,
             limits,
             lock: Mutex::new(()),
             capacity_changed,
-        })
+            #[cfg(test)]
+            queue_initialization_failpoint: Mutex::new(None),
+        };
+        {
+            let _guard = staging.lock.lock().expect("transfer staging lock poisoned");
+            staging.recover_interrupted_queue_initializations_unlocked()?;
+        }
+        Ok(staging)
     }
 
     pub fn available_space_bytes(&self) -> Result<u64, StagingError> {
@@ -264,14 +284,7 @@ impl OpenCodeTransferStaging {
             ));
         }
         if self.has_queued_transfers_unlocked()? || !self.has_capacity(descriptor.total_bytes)? {
-            fs::create_dir(&queued)?;
-            fs::set_permissions(&queued, fs::Permissions::from_mode(TRANSFER_ROOT_MODE))?;
-            self.write_descriptor(&queued, descriptor)?;
-            write_attempt_owner(&queued, attempt_id)?;
-            let order = self.allocate_queue_order_unlocked()?;
-            self.write_queue_order(&queued, order)?;
-            File::open(&queued)?.sync_all()?;
-            sync_parent(&queued)?;
+            self.publish_queue_entry_unlocked(&queued, descriptor, attempt_id)?;
             self.advance_queue_unlocked(available_bytes)?;
             if partial.exists() {
                 self.notify_capacity_change();
@@ -656,6 +669,94 @@ impl OpenCodeTransferStaging {
             }
         }
         Ok(())
+    }
+
+    /// Reconcile durable registration owners after the supervisor has
+    /// restarted and loaded a complete registry reference snapshot. A
+    /// matching reference makes the stage claimed; no reference releases
+    /// only the stale registering fence back to pending. Any same-ID
+    /// descriptor mismatch is treated as corruption and left fenced.
+    pub fn reconcile_registering_ready(
+        &self,
+        references: &OpenCodeTransferStageReferences,
+    ) -> Result<usize, StagingError> {
+        let _guard = self.lock.lock().expect("transfer staging lock poisoned");
+        let mut reconciliations = Vec::new();
+        for entry in fs::read_dir(&self.root)? {
+            let entry = entry?;
+            let Some(transfer_id) = entry
+                .file_name()
+                .to_str()
+                .and_then(|name| name.strip_suffix(".ready"))
+                .map(str::to_owned)
+            else {
+                continue;
+            };
+            let ready = entry.path();
+            let metadata = fs::symlink_metadata(&ready)?;
+            if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                return Err(StagingError::InvalidState(
+                    "ready transfer is not a real directory".into(),
+                ));
+            }
+            let descriptor = self.read_descriptor(&ready)?;
+            if descriptor.transfer_id != transfer_id {
+                return Err(StagingError::InvalidState(
+                    "ready transfer directory does not match its descriptor".into(),
+                ));
+            }
+            let Some(mut owner) = self.read_ready_ownership(&transfer_id)? else {
+                continue;
+            };
+            if owner.state != ReadyOwnershipState::Registering {
+                continue;
+            }
+
+            owner.state = if registry_reference_matches(references, &descriptor)? {
+                ReadyOwnershipState::Claimed
+            } else {
+                ReadyOwnershipState::Pending
+            };
+            owner.updated_at_unix_ms = unix_millis(SystemTime::now());
+            reconciliations.push((transfer_id, owner));
+        }
+        // Validate the complete snapshot and every affected stage before
+        // writing any ownership transition. A mismatch later in the scan
+        // must not release an earlier stage to a fresh attempt.
+        for (transfer_id, owner) in &reconciliations {
+            self.write_ready_ownership(transfer_id, owner)?;
+        }
+        Ok(reconciliations.len())
+    }
+
+    pub fn has_exact_registry_reference(
+        &self,
+        references: &OpenCodeTransferStageReferences,
+        descriptor: &OpenCodeTransferDescriptor,
+    ) -> Result<bool, StagingError> {
+        registry_reference_matches(references, descriptor)
+    }
+
+    pub fn ready_registration_needs_reconciliation(
+        &self,
+        transfer_id: &str,
+    ) -> Result<bool, StagingError> {
+        let _guard = self.lock.lock().expect("transfer staging lock poisoned");
+        let ready = self.ready_path(transfer_id);
+        match fs::symlink_metadata(&ready) {
+            Ok(metadata) => {
+                if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                    return Err(StagingError::InvalidState(
+                        "ready transfer is not a real directory".into(),
+                    ));
+                }
+                Ok(self
+                    .read_ready_ownership(transfer_id)?
+                    .is_some_and(|owner| owner.state == ReadyOwnershipState::Registering))
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(error.into()),
+        }
     }
 
     pub fn mark_launch_claimed(
@@ -1074,6 +1175,180 @@ impl OpenCodeTransferStaging {
         Ok(self.queued_count_unlocked()? > 0)
     }
 
+    fn publish_queue_entry_unlocked(
+        &self,
+        queued: &Path,
+        descriptor: &OpenCodeTransferDescriptor,
+        attempt_id: &str,
+    ) -> Result<(), StagingError> {
+        let temporary = self.root.join(format!(
+            "{QUEUE_INITIALIZATION_PREFIX}{}",
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir(&temporary)?;
+        fs::set_permissions(&temporary, fs::Permissions::from_mode(TRANSFER_ROOT_MODE))?;
+        self.queue_initialization_checkpoint(QueueInitializationPhase::DirectoryCreated)?;
+
+        self.write_descriptor(&temporary, descriptor)?;
+        self.queue_initialization_checkpoint(QueueInitializationPhase::DescriptorDurable)?;
+
+        write_attempt_owner(&temporary, attempt_id)?;
+        self.queue_initialization_checkpoint(QueueInitializationPhase::AttemptDurable)?;
+
+        let order = self.allocate_queue_order_unlocked()?;
+        self.write_queue_order(&temporary, order)?;
+        File::open(&temporary)?.sync_all()?;
+        self.queue_initialization_checkpoint(QueueInitializationPhase::OrderDurable)?;
+
+        // All entry metadata is durable before the atomic rename makes the
+        // FIFO position visible to queue enumeration.
+        fs::rename(&temporary, queued)?;
+        File::open(&self.root)?.sync_all()?;
+        Ok(())
+    }
+
+    fn recover_interrupted_queue_initializations_unlocked(&self) -> Result<usize, StagingError> {
+        let mut removed = 0;
+        for entry in fs::read_dir(&self.root)? {
+            let entry = entry?;
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else {
+                continue;
+            };
+            let Some(id) = name.strip_prefix(QUEUE_INITIALIZATION_PREFIX) else {
+                continue;
+            };
+            if uuid::Uuid::parse_str(id).is_err() {
+                continue;
+            }
+
+            let path = entry.path();
+            let metadata = fs::symlink_metadata(&path)?;
+            if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                return Err(StagingError::InvalidState(
+                    "queue initialization entry is not a real directory".into(),
+                ));
+            }
+            if !is_exact_interrupted_queue_initialization(&path)? {
+                // It is not one of our exact temporary shapes. Leave it
+                // untouched; importantly, its name cannot enter the .queued
+                // FIFO or count against queue capacity.
+                continue;
+            }
+            fs::set_permissions(&path, fs::Permissions::from_mode(TRANSFER_ROOT_MODE))?;
+            fs::remove_dir_all(path)?;
+            removed += 1;
+        }
+        for entry in fs::read_dir(&self.root)? {
+            let entry = entry?;
+            let Some(transfer_id) = entry
+                .file_name()
+                .to_str()
+                .and_then(|name| name.strip_suffix(".queued"))
+                .map(str::to_owned)
+            else {
+                continue;
+            };
+            let path = entry.path();
+            let metadata = fs::symlink_metadata(&path)?;
+            if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                return Err(StagingError::InvalidState(
+                    "queued transfer is not a real directory".into(),
+                ));
+            }
+            if !self.is_incomplete_legacy_queue_entry_unlocked(&path, &transfer_id)? {
+                continue;
+            }
+            fs::set_permissions(&path, fs::Permissions::from_mode(TRANSFER_ROOT_MODE))?;
+            fs::remove_dir_all(path)?;
+            removed += 1;
+        }
+        if removed > 0 {
+            File::open(&self.root)?.sync_all()?;
+        }
+        Ok(removed)
+    }
+
+    fn is_incomplete_legacy_queue_entry_unlocked(
+        &self,
+        path: &Path,
+        transfer_id: &str,
+    ) -> Result<bool, StagingError> {
+        let mut has_descriptor = false;
+        let mut has_attempt = false;
+        for entry in fs::read_dir(path)? {
+            let entry = entry?;
+            let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+                return Ok(false);
+            };
+            let metadata = fs::symlink_metadata(entry.path())?;
+            if metadata.file_type().is_symlink() || !metadata.is_file() {
+                return Ok(false);
+            }
+            match name.as_str() {
+                "descriptor.json" => {
+                    if self.read_descriptor(path)?.transfer_id != transfer_id {
+                        return Err(StagingError::InvalidState(
+                            "queued directory does not match its descriptor".into(),
+                        ));
+                    }
+                    has_descriptor = true;
+                }
+                PARTIAL_ATTEMPT_FILE => {
+                    read_attempt_owner(path)?;
+                    has_attempt = true;
+                }
+                QUEUE_ORDER_FILE => {
+                    read_queue_order_marker(path)?;
+                }
+                _ if name
+                    .strip_prefix(".tmp-")
+                    .is_some_and(|id| uuid::Uuid::parse_str(id).is_ok()) => {}
+                _ => return Ok(false),
+            }
+        }
+        // Previous builds published the final directory before these files
+        // existed. Such an entry has no accepted queue position or payload;
+        // a producer retry can safely create it again. Fully owned entries,
+        // including the recoverable missing-order case, remain untouched.
+        Ok(!has_descriptor || !has_attempt)
+    }
+
+    #[cfg(test)]
+    fn queue_initialization_checkpoint(
+        &self,
+        phase: QueueInitializationPhase,
+    ) -> Result<(), StagingError> {
+        let mut failpoint = self
+            .queue_initialization_failpoint
+            .lock()
+            .expect("queue initialization failpoint lock poisoned");
+        if *failpoint == Some(phase) {
+            *failpoint = None;
+            return Err(StagingError::Io(std::io::Error::other(
+                "injected queue initialization filesystem failure",
+            )));
+        }
+        Ok(())
+    }
+
+    #[cfg(not(test))]
+    fn queue_initialization_checkpoint(
+        &self,
+        _phase: QueueInitializationPhase,
+    ) -> Result<(), StagingError> {
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn fail_next_queue_initialization_after_order_for_test(&self) {
+        *self
+            .queue_initialization_failpoint
+            .lock()
+            .expect("queue initialization failpoint lock poisoned") =
+            Some(QueueInitializationPhase::OrderDurable);
+    }
+
     fn queued_count_unlocked(&self) -> Result<usize, StagingError> {
         let mut count = 0;
         for entry in fs::read_dir(&self.root)? {
@@ -1169,16 +1444,7 @@ impl OpenCodeTransferStaging {
     fn read_queue_order_unlocked(&self, path: &Path) -> Result<u64, StagingError> {
         let order_path = path.join(QUEUE_ORDER_FILE);
         match fs::symlink_metadata(&order_path) {
-            Ok(metadata) => {
-                if metadata.file_type().is_symlink() || !metadata.is_file() || metadata.len() > 64 {
-                    return Err(StagingError::InvalidState(
-                        "queue order marker is not a bounded regular file".into(),
-                    ));
-                }
-                let metadata: QueueMetadata = serde_json::from_slice(&fs::read(order_path)?)
-                    .map_err(|error| StagingError::Metadata(error.to_string()))?;
-                Ok(metadata.order)
-            }
+            Ok(_) => read_queue_order_marker(path),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 // A crash during queue creation can leave the fully validated
                 // descriptor and owner without an order marker. Assign a
@@ -1598,6 +1864,49 @@ fn validate_attempt_id(attempt_id: &str) -> Result<(), StagingError> {
     Ok(())
 }
 
+fn registry_reference_matches(
+    references: &OpenCodeTransferStageReferences,
+    descriptor: &OpenCodeTransferDescriptor,
+) -> Result<bool, StagingError> {
+    let Some(candidates) = references.get(&descriptor.transfer_id) else {
+        return Ok(false);
+    };
+    if candidates.is_empty()
+        || candidates.iter().any(|candidate| {
+            candidate.transfer_id != descriptor.transfer_id || candidate != descriptor
+        })
+    {
+        return Err(StagingError::InvalidState(
+            "registry transfer reference does not match the ready-stage descriptor".into(),
+        ));
+    }
+    Ok(true)
+}
+
+fn is_exact_interrupted_queue_initialization(path: &Path) -> Result<bool, StagingError> {
+    for entry in fs::read_dir(path)? {
+        let entry = entry?;
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            return Ok(false);
+        };
+        let known_metadata = matches!(
+            name.as_str(),
+            "descriptor.json" | PARTIAL_ATTEMPT_FILE | QUEUE_ORDER_FILE
+        );
+        let atomic_temporary = name
+            .strip_prefix(".tmp-")
+            .is_some_and(|id| uuid::Uuid::parse_str(id).is_ok());
+        if !known_metadata && !atomic_temporary {
+            return Ok(false);
+        }
+        let metadata = fs::symlink_metadata(entry.path())?;
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
 fn unix_millis(time: SystemTime) -> u64 {
     time.duration_since(SystemTime::UNIX_EPOCH)
         .unwrap_or_default()
@@ -1616,6 +1925,19 @@ fn read_attempt_owner(path: &Path) -> Result<String, StagingError> {
     let attempt_id = fs::read_to_string(owner_path)?;
     validate_attempt_id(&attempt_id)?;
     Ok(attempt_id)
+}
+
+fn read_queue_order_marker(path: &Path) -> Result<u64, StagingError> {
+    let order_path = path.join(QUEUE_ORDER_FILE);
+    let metadata = fs::symlink_metadata(&order_path)?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() || metadata.len() > 64 {
+        return Err(StagingError::InvalidState(
+            "queue order marker is not a bounded regular file".into(),
+        ));
+    }
+    let metadata: QueueMetadata = serde_json::from_slice(&fs::read(order_path)?)
+        .map_err(|error| StagingError::Metadata(error.to_string()))?;
+    Ok(metadata.order)
 }
 
 fn write_attempt_owner(path: &Path, attempt_id: &str) -> Result<(), StagingError> {
