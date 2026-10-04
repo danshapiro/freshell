@@ -193,14 +193,35 @@ impl OpenCodeTransferStaging {
         Ok(statvfs_available_bytes(&stats))
     }
 
-    /// Begin or resume staging. `available_bytes` is measured by the
-    /// supervisor from the filesystem that owns this spool; tests inject it.
+    /// Begin or resume staging. Tests inject the physical free-space snapshot;
+    /// production uses `begin_from_filesystem` so the snapshot is taken while
+    /// the staging lock serializes admission with writes and other begins.
     pub fn begin(
         &self,
         descriptor: &OpenCodeTransferDescriptor,
         attempt_id: &str,
         available_bytes: u64,
     ) -> Result<StagingStart, StagingError> {
+        self.begin_with_space_probe(descriptor, attempt_id, || Ok(available_bytes))
+    }
+
+    pub fn begin_from_filesystem(
+        &self,
+        descriptor: &OpenCodeTransferDescriptor,
+        attempt_id: &str,
+    ) -> Result<StagingStart, StagingError> {
+        self.begin_with_space_probe(descriptor, attempt_id, || self.available_space_bytes())
+    }
+
+    fn begin_with_space_probe<F>(
+        &self,
+        descriptor: &OpenCodeTransferDescriptor,
+        attempt_id: &str,
+        mut space_probe: F,
+    ) -> Result<StagingStart, StagingError>
+    where
+        F: FnMut() -> Result<u64, StagingError>,
+    {
         let _guard = self.lock.lock().expect("transfer staging lock poisoned");
         validate_attempt_id(attempt_id)?;
         descriptor
@@ -212,6 +233,11 @@ impl OpenCodeTransferStaging {
             ));
         }
         self.reclaim_stale_partials_unlocked(SystemTime::now())?;
+        // Keep capacity observation inside the same lock as the reservation
+        // scan and state transition. This prevents parallel Begins from using
+        // the same unreserved free-space snapshot. Measure after stale stages
+        // are reclaimed so the snapshot includes the space they release.
+        let available_bytes = space_probe()?;
         if self.advance_queue_unlocked(available_bytes)? > 0 {
             self.notify_capacity_change();
         }
@@ -260,10 +286,9 @@ impl OpenCodeTransferStaging {
                 return Ok(resumed);
             } else {
                 self.create_partial_files(&partial, descriptor)?;
-                let required = self.remaining_bytes(descriptor, &partial)?;
-                if available_bytes < required {
+                if !self.has_physical_capacity(0, available_bytes)? {
                     return Err(StagingError::Capacity(
-                        "filesystem free space is below the remaining bundle size".into(),
+                        "filesystem free space is below outstanding staging reservations".into(),
                     ));
                 }
             }
@@ -283,7 +308,10 @@ impl OpenCodeTransferStaging {
                 "transfer staging queue is full".into(),
             ));
         }
-        if self.has_queued_transfers_unlocked()? || !self.has_capacity(descriptor.total_bytes)? {
+        if self.has_queued_transfers_unlocked()?
+            || !self.has_capacity(descriptor.total_bytes)?
+            || !self.has_physical_capacity(descriptor.total_bytes, available_bytes)?
+        {
             self.publish_queue_entry_unlocked(&queued, descriptor, attempt_id)?;
             self.advance_queue_unlocked(available_bytes)?;
             if partial.exists() {
@@ -1413,6 +1441,7 @@ impl OpenCodeTransferStaging {
             }
             if available_bytes < descriptor.total_bytes
                 || !self.has_capacity(descriptor.total_bytes)?
+                || !self.has_physical_capacity(descriptor.total_bytes, available_bytes)?
             {
                 // Strict FIFO avoids starvation: a smaller new transfer may
                 // not repeatedly jump ahead of this queued descriptor.
@@ -1672,6 +1701,41 @@ impl OpenCodeTransferStaging {
             reserved = reserved.saturating_add(descriptor.total_bytes);
         }
         Ok(reserved.saturating_add(incoming) <= self.limits.max_total_bytes)
+    }
+
+    fn has_physical_capacity(
+        &self,
+        incoming: u64,
+        available_bytes: u64,
+    ) -> Result<bool, StagingError> {
+        let mut outstanding = 0_u64;
+        for entry in fs::read_dir(&self.root)? {
+            let entry = entry?;
+            if !entry
+                .file_name()
+                .to_str()
+                .is_some_and(|name| name.ends_with(".partial"))
+            {
+                continue;
+            }
+            let path = entry.path();
+            let metadata = fs::symlink_metadata(&path)?;
+            if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                return Err(StagingError::InvalidState(
+                    "partial transfer is not a real directory".into(),
+                ));
+            }
+            let descriptor = self.read_descriptor(&path)?;
+            let remaining = self.remaining_bytes(&descriptor, &path)?;
+            let Some(next_outstanding) = outstanding.checked_add(remaining) else {
+                return Ok(false);
+            };
+            outstanding = next_outstanding;
+        }
+        let Some(required) = outstanding.checked_add(incoming) else {
+            return Ok(false);
+        };
+        Ok(required <= available_bytes)
     }
 
     fn read_descriptor(&self, path: &Path) -> Result<OpenCodeTransferDescriptor, StagingError> {
