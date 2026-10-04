@@ -84,6 +84,7 @@ use crate::{FreshAgentCreateDedup, FreshAgentCreateOutcome, SharedPaneIdentitySi
 
 mod controls;
 mod metadata;
+pub(crate) mod native_history;
 
 /// Unified agent names (Task 2): the ambient `CODEX_HOME` fallback for the
 /// durability-driven pending bind when the app-server's own initialize
@@ -5775,6 +5776,25 @@ impl FreshCodexState {
             .is_some_and(|s| !s.exited.load(Ordering::SeqCst))
     }
 
+    pub(crate) async fn local_snapshot_owner(
+        &self,
+        native_id: &str,
+    ) -> Option<freshell_ownership::OwnershipSnapshot> {
+        let sessions = self.sessions.lock().await;
+        let session = sessions.get(native_id)?;
+        if session.exited.load(Ordering::SeqCst) {
+            return None;
+        }
+        crate::ownership_lane::current_local_snapshot_owner(
+            &self.ownership,
+            &self.ownership_stamps,
+            PROVIDER,
+            native_id,
+            native_id,
+            session.sidecar_pid,
+        )
+    }
+
     /// Handle a `freshAgent.attach` for codex (reload-rehydrate). Decision table:
     ///
     /// | State | Action |
@@ -7561,7 +7581,8 @@ impl FreshCodexState {
     /// `ensureRuntime` cold-starts a sidecar for a never-seen thread
     /// (`adapter.ts:762-799,1083-1086`); this GET is FULLY side-effect-free —
     /// a tracked thread serves from its live runtime, and an untracked one
-    /// answers the EMPTY snapshot (or the typed ownership refusals) with no
+    /// reads its verified saved rollout (or serves an empty snapshot when absent,
+    /// or the typed ownership refusals) with no
     /// spawn, no `thread/resume`, and no coordinator claim. Cold resume flows
     /// only through the explicit lifecycle commands (`freshAgent.create`/
     /// `attach` with `sessionRef`, generation-fenced). See
@@ -7576,15 +7597,15 @@ impl FreshCodexState {
     ) -> Result<Value, CodexSnapshotError> {
         let (client, active_turn_present) = match self.snapshot_runtime_for(thread_id).await {
             Ok(resolved) => resolved,
-            // kata b8ke Task 5: an untracked session serves the EMPTY
-            // snapshot read-only — never a cold-start spawn.
+            // An untracked read may use the selected durable rollout, never a
+            // cold-start spawn. Ownership refusal remains authoritative above it.
             Err(CodexSnapshotError::UntrackedReadonly { ownership }) => {
                 // b8ke ext r17 F3: the response derives from the ONE
                 // observation captured at the decision — no second look
                 // (pre-r17 a start/handoff beginning between the two
                 // observations returned 200 "vacant" paired to the active
                 // transition's generation, the impossible half-state).
-                return Ok(self.empty_readonly_snapshot(thread_id, &ownership));
+                return self.saved_readonly_snapshot(thread_id, &ownership).await;
             }
             Err(other) => return Err(other),
         };
@@ -7808,7 +7829,7 @@ impl FreshCodexState {
         // Untracked: SIDE-EFFECT-FREE contract (kata b8ke; round-2 review —
         // the vacant-session cold-start is REMOVED). `ownership_snapshot`'s
         // Vacant default (unwired coordinator) makes the untracked arm the
-        // empty-snapshot path with no special case.
+        // saved-history/empty-snapshot path with no special case.
         let ownership = self.ownership_snapshot(PROVIDER, thread_id);
         match ownership.state {
             freshell_ownership::OwnershipState::Vacant => {
@@ -7843,7 +7864,40 @@ impl FreshCodexState {
         }
     }
 
-    /// kata b8ke Task 5: the side-effect-free EMPTY snapshot for an untracked
+    /// Read disk only after the ownership lookup permits an untracked read.
+    /// The captured ownership observation also supplies the response fence;
+    /// reading the rollout never claims, resumes, or registers a runtime.
+    async fn saved_readonly_snapshot(
+        &self,
+        thread_id: &str,
+        ownership: &freshell_ownership::OwnershipSnapshot,
+    ) -> Result<Value, CodexSnapshotError> {
+        let Some(mut snapshot) = self.exact_saved_snapshot(thread_id).await? else {
+            return Ok(self.empty_readonly_snapshot(thread_id, ownership));
+        };
+        snapshot["extensions"]["codex"]["ownerEpoch"] = json!(ownership.epoch);
+        snapshot["extensions"]["codex"]["ownerGeneration"] = json!(ownership.generation);
+        Ok(snapshot)
+    }
+
+    pub(crate) async fn exact_saved_snapshot(
+        &self,
+        thread_id: &str,
+    ) -> Result<Option<Value>, CodexSnapshotError> {
+        let sessions_root =
+            codex_home_from_env().map(|home| std::path::PathBuf::from(home).join("sessions"));
+        let id = thread_id.to_string();
+        tokio::task::spawn_blocking(move || {
+            let Some(path) = sessions_root.and_then(|root| locate_thread_rollout(&root, &id)) else { return Ok(None); };
+            native_history::read_rollout(&path, &id)
+                .and_then(|snapshot| crate::native_history::readonly_snapshot("codex", snapshot)).map(Some)
+        }).await.map_err(|error| error.to_string()).and_then(|result| result).map_err(|error| {
+            tracing::warn!(event = "freshagent.codex.saved_history.read_failed", thread_id, error = %error);
+            CodexSnapshotError::Protocol(error)
+        })
+    }
+
+    /// kata b8ke Task 5: the side-effect-free EMPTY snapshot for an absent
     /// session — the same JSON shape a never-started historical session
     /// serves (empty rows + `status`/`sessionType` facts,
     /// [`build_codex_snapshot_json`] over an empty raw payload) plus the
@@ -8735,14 +8789,15 @@ pub enum CodexSnapshotError {
     Protocol(String),
     /// kata b8ke Task 5 (round-2 review): the GET is side-effect-free, so an
     /// UNTRACKED session with a Vacant coordinator key is served read-only —
-    /// the caller answers the EMPTY snapshot (with owner state); no spawn, no
+    /// the caller reads the saved rollout or answers an empty snapshot (with
+    /// owner state); no spawn, no
     /// `thread/resume`, no `ensure_session_resumable` call, no claim. Cold
     /// resume belongs ONLY to the explicit lifecycle commands
     /// (`freshAgent.create`/`freshAgent.attach` with `sessionRef`,
     /// generation-fenced).
     UntrackedReadonly {
         /// b8ke ext r17 F3: the ONE coordinator observation that chose the
-        /// untracked-vacant answer — the caller's empty snapshot derives
+        /// untracked-vacant answer — the caller's read-only snapshot derives
         /// from THIS observation (opencode parity), never a second look
         /// that could pair a mid-transition generation with "vacant".
         ownership: freshell_ownership::OwnershipSnapshot,

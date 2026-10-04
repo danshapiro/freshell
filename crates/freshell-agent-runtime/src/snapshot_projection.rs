@@ -23,14 +23,35 @@ const BOOLEAN_CAPABILITIES: &[&str] = &[
 /// Rewrites every recognized snapshot in `payload`, including snapshots nested
 /// in a `freshAgent.event` envelope. Non-snapshot provider events are untouched.
 pub fn project_hosted_snapshot(payload: &mut Value, provider: &str, session_type: &str) {
-    let known_pair = matches!(
+    visit(
+        payload,
+        provider,
+        session_type,
+        known_pair(provider, session_type),
+    );
+}
+
+fn known_pair(provider: &str, session_type: &str) -> bool {
+    matches!(
         (provider, session_type),
         ("claude", "freshclaude")
             | ("claude", "kilroy")
             | ("codex", "freshcodex")
             | ("opencode", "freshopencode")
-    );
-    visit(payload, provider, session_type, known_pair);
+    )
+}
+
+/// The existing REST snapshot has no event `type` field.
+pub fn project_hosted_rest_snapshot(snapshot: &mut Value, provider: &str, session_type: &str) {
+    if let Some(object) = snapshot.as_object_mut() {
+        let identity_matches = object.get("provider").and_then(Value::as_str) == Some(provider)
+            && object.get("sessionType").and_then(Value::as_str) == Some(session_type);
+        project_capabilities(
+            object,
+            provider,
+            known_pair(provider, session_type) && identity_matches,
+        );
+    }
 }
 
 fn visit(value: &mut Value, provider: &str, session_type: &str, known_pair: bool) {

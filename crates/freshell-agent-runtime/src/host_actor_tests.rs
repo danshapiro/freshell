@@ -1,6 +1,192 @@
 use super::*;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+struct SnapshotTransport {
+    value: Value,
+    live: std::sync::atomic::AtomicBool,
+    exit_during_read: bool,
+    initial_native: Option<String>,
+    registered: Option<String>,
+    pause: Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>,
+}
+
+#[async_trait]
+impl FreshAgentTransport for SnapshotTransport {
+    async fn start(&self, _: &FreshAgentProfile) -> Result<TransportStart, String> {
+        Ok(TransportStart {
+            native_session_id: self.initial_native.clone(),
+        })
+    }
+    async fn dispatch(
+        &self,
+        _: &RequestId,
+        _: &str,
+        _: &FreshAgentProfile,
+    ) -> Result<DispatchAck, DispatchFailure> {
+        panic!("snapshot must not dispatch")
+    }
+    async fn resolve_permission(&self, _: &str, _: Value) -> Result<(), DispatchFailure> {
+        panic!("snapshot must not resolve")
+    }
+    async fn interrupt(&self) -> Result<(), String> {
+        panic!("snapshot must not interrupt")
+    }
+    async fn stop(self: Arc<Self>) -> Result<(), String> {
+        Ok(())
+    }
+    fn take_event_stream(&self) -> Option<tokio::sync::mpsc::Receiver<AgentEvent>> {
+        None
+    }
+    async fn is_live(&self) -> bool {
+        self.live.load(Ordering::SeqCst)
+    }
+    async fn registered_snapshot_identity(&self) -> Option<String> {
+        self.registered.clone()
+    }
+    async fn snapshot(&self) -> Result<Value, String> {
+        if let Some((entered, release)) = &self.pause {
+            entered.notify_one();
+            release.notified().await;
+        }
+        if self.exit_during_read {
+            self.live.store(false, Ordering::SeqCst);
+        }
+        Ok(self.value.clone())
+    }
+}
+
+#[tokio::test]
+async fn snapshot_read_preserves_actor_state_and_rejects_wrong_identity_size_or_liveness() {
+    for scenario in [
+        "live",
+        "large",
+        "wrong-thread",
+        "wrong-provider",
+        "wrong-type",
+        "oversized",
+        "not-live",
+        "exit-during-read",
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let transport = Arc::new(SnapshotTransport {
+            value: serde_json::json!({
+                "threadId":if scenario == "wrong-thread" { "different-thread" } else { "snapshot-native" },
+                "provider":if scenario == "wrong-provider" { "codex" } else { "claude" },
+                "sessionType":if scenario == "wrong-type" { "freshopencode" } else { "freshclaude" }, "status":"idle",
+                "turns":match scenario { "oversized" => "x".repeat(freshell_runtime_protocol::MAX_NATIVE_HISTORY_FRAME_BYTES), "large" => "x".repeat(2 * freshell_runtime_protocol::MAX_CONTROL_FRAME_BYTES), _ => "retained".into() },
+            }),
+            live: std::sync::atomic::AtomicBool::new(scenario != "not-live"),
+            exit_during_read: scenario == "exit-during-read",
+            initial_native: Some("snapshot-native".into()),
+            registered: None,
+            pause: None,
+        });
+        let actor = FreshAgentHostActor::open(
+            dir.path(),
+            profile(FreshProvider::Claude, "snapshot-store", None),
+            transport,
+        )
+        .await
+        .unwrap();
+        let before = fs::read(dir.path().join("fresh-agent-state.json")).unwrap();
+        let result = actor.snapshot().await;
+        assert_eq!(
+            result.is_ok(),
+            matches!(scenario, "live" | "large"),
+            "{scenario}"
+        );
+        if let Ok(snapshot) = result {
+            assert_eq!(snapshot["threadId"], "snapshot-native");
+            if scenario == "large" {
+                assert_eq!(
+                    snapshot["turns"].as_str().unwrap().len(),
+                    2 * freshell_runtime_protocol::MAX_CONTROL_FRAME_BYTES
+                );
+            }
+        }
+        assert_eq!(
+            fs::read(dir.path().join("fresh-agent-state.json")).unwrap(),
+            before,
+            "{scenario}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn registered_pre_native_snapshot_requires_exact_opencode_proof_and_current_materialization()
+{
+    for scenario in [
+        "exact",
+        "default-deny",
+        "foreign-placeholder",
+        "other-provider",
+        "materialized-during-read",
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let transport = Arc::new(SnapshotTransport {
+            value: serde_json::json!({"threadId":"freshopencode-owned", "provider":"opencode", "sessionType":"freshopencode", "turns":[]}),
+            live: std::sync::atomic::AtomicBool::new(true),
+            exit_during_read: false,
+            initial_native: None,
+            registered: if scenario == "default-deny" {
+                None
+            } else {
+                Some(
+                    if scenario == "foreign-placeholder" {
+                        "freshopencode-foreign"
+                    } else {
+                        "freshopencode-owned"
+                    }
+                    .into(),
+                )
+            },
+            pause: (scenario == "materialized-during-read")
+                .then(|| (entered.clone(), release.clone())),
+        });
+        let actor = FreshAgentHostActor::open(
+            dir.path(),
+            profile(
+                if scenario == "other-provider" {
+                    FreshProvider::Claude
+                } else {
+                    FreshProvider::Opencode
+                },
+                "owned",
+                None,
+            ),
+            transport,
+        )
+        .await
+        .unwrap();
+        let before = fs::read(dir.path().join("fresh-agent-state.json")).unwrap();
+        let read = tokio::spawn({
+            let actor = actor.clone();
+            async move { actor.snapshot().await }
+        });
+        if scenario == "materialized-during-read" {
+            entered.notified().await;
+            actor
+                .observe_native_identity("ses_materialized".into())
+                .await
+                .unwrap();
+            release.notify_one();
+        }
+        assert_eq!(
+            read.await.unwrap().is_ok(),
+            scenario == "exact",
+            "{scenario}"
+        );
+        if scenario != "materialized-during-read" {
+            assert_eq!(
+                fs::read(dir.path().join("fresh-agent-state.json")).unwrap(),
+                before
+            );
+        }
+    }
+}
+
 struct OperationTransport {
     operations: std::sync::Mutex<Vec<(String, FreshAgentOperation)>>,
     supported: bool,

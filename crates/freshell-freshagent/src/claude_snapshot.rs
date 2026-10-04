@@ -435,133 +435,152 @@ fn parse_transcript_turns(thread_id: &str, transcript: &str) -> Vec<Value> {
         let Ok(obj) = serde_json::from_str::<Value>(line) else {
             continue;
         };
-        let role = match obj.get("type").and_then(Value::as_str) {
-            Some("user") => "user",
-            Some("assistant") => "assistant",
-            _ => continue,
-        };
-        // Real transcripts flag synthetic/subagent lines (ledger A5): skip them.
-        if [
-            "isMeta",
-            "isSidechain",
-            "isCompactSummary",
-            "isVisibleInTranscriptOnly",
-        ]
-        .iter()
-        .any(|k| obj.get(*k).and_then(Value::as_bool) == Some(true))
-        {
-            continue;
+        if let Some(turn) = parse_transcript_turn(&obj, thread_id, turns.len()) {
+            turns.push(turn);
         }
-        let msg = obj.get("message");
-        let blocks: Vec<Value> = match msg {
-            Some(Value::String(text)) => vec![json!({ "type": "text", "text": text })],
-            Some(Value::Object(m)) => match m.get("content") {
-                Some(Value::Array(arr)) => arr.clone(),
-                Some(Value::String(text)) => vec![json!({ "type": "text", "text": text })],
-                _ => continue,
-            },
-            _ => continue,
-        };
-
-        let ordinal = turns.len();
-        let line_uuid = obj
-            .get("uuid")
-            .and_then(Value::as_str)
-            .filter(|s| !s.is_empty());
-        // kata 1wxv: real message uuids are the rollback-addressable turn identity;
-        // the synthetic {thread}:{ordinal} stays as the fallback for uuid-less lines.
-        let turn_id = line_uuid
-            .map(str::to_string)
-            .unwrap_or_else(|| format!("{thread_id}:{ordinal}"));
-        let mut items: Vec<Value> = Vec::new();
-        for (j, block) in blocks.iter().enumerate() {
-            let item_id = format!("{turn_id}-i{j}");
-            match block.get("type").and_then(Value::as_str) {
-                Some("text") => {
-                    if let Some(text) = block.get("text").and_then(Value::as_str) {
-                        items.push(json!({ "id": item_id, "kind": "text", "text": text }));
-                    }
-                }
-                Some("thinking") => {
-                    let text = block
-                        .get("thinking")
-                        .or_else(|| block.get("text"))
-                        .and_then(Value::as_str)
-                        .unwrap_or("");
-                    items.push(json!({ "id": item_id, "kind": "thinking", "text": text }));
-                }
-                Some("tool_use") => {
-                    let tool_use_id = block
-                        .get("id")
-                        .and_then(Value::as_str)
-                        .unwrap_or(item_id.as_str())
-                        .to_string();
-                    let name = block.get("name").and_then(Value::as_str).unwrap_or("tool");
-                    let mut item = Map::new();
-                    item.insert("id".into(), json!(item_id));
-                    item.insert("kind".into(), json!("tool_use"));
-                    item.insert("toolUseId".into(), json!(tool_use_id));
-                    item.insert("name".into(), json!(name));
-                    if let Some(input) = block.get("input") {
-                        item.insert("input".into(), input.clone());
-                    }
-                    items.push(Value::Object(item));
-                }
-                Some("tool_result") => {
-                    let tool_use_id = block
-                        .get("tool_use_id")
-                        .and_then(Value::as_str)
-                        .unwrap_or(item_id.as_str())
-                        .to_string();
-                    let is_error = block
-                        .get("is_error")
-                        .and_then(Value::as_bool)
-                        .unwrap_or(false);
-                    items.push(json!({
-                        "id": item_id,
-                        "kind": "tool_result",
-                        "toolUseId": tool_use_id,
-                        "content": tool_result_text(block),
-                        "isError": is_error,
-                    }));
-                }
-                _ => {}
-            }
-        }
-        if items.is_empty() {
-            continue;
-        }
-
-        let summary = summarize(&items);
-        let mut turn = Map::new();
-        turn.insert("id".into(), json!(turn_id));
-        turn.insert("turnId".into(), json!(turn_id));
-        if let Some(message_id) = msg
-            .and_then(|m| m.get("id"))
-            .and_then(Value::as_str)
-            .filter(|s| !s.is_empty())
-        {
-            turn.insert("messageId".into(), json!(message_id));
-        }
-        turn.insert("ordinal".into(), json!(ordinal));
-        turn.insert("source".into(), json!("durable"));
-        turn.insert("role".into(), json!(role));
-        if let Some(ts) = obj.get("timestamp").and_then(Value::as_str) {
-            turn.insert("timestamp".into(), json!(ts));
-        }
-        if let Some(model) = msg
-            .and_then(|m| m.get("model"))
-            .and_then(Value::as_str)
-            .filter(|s| !s.is_empty())
-        {
-            turn.insert("model".into(), json!(model));
-        }
-        turn.insert("summary".into(), json!(summary));
-        turn.insert("summaryKind".into(), json!(SUMMARY_KIND_ECHO));
-        turn.insert("items".into(), json!(items));
-        turns.push(Value::Object(turn));
     }
     turns
+}
+
+pub(crate) fn parse_transcript_turn(obj: &Value, thread_id: &str, ordinal: usize) -> Option<Value> {
+    parse_transcript_turn_indexed(obj, thread_id, ordinal, None)
+}
+
+pub(crate) fn parse_transcript_turn_indexed(
+    obj: &Value,
+    thread_id: &str,
+    ordinal: usize,
+    index_key: Option<&str>,
+) -> Option<Value> {
+    let role = match obj.get("type").and_then(Value::as_str) {
+        Some("user") => "user",
+        Some("assistant") => "assistant",
+        _ => return None,
+    };
+    // Real transcripts flag synthetic/subagent lines (ledger A5): skip them.
+    if [
+        "isMeta",
+        "isSidechain",
+        "isCompactSummary",
+        "isVisibleInTranscriptOnly",
+    ]
+    .iter()
+    .any(|k| obj.get(*k).and_then(Value::as_bool) == Some(true))
+    {
+        return None;
+    }
+    let msg = obj.get("message");
+    let blocks: Vec<Value> = match msg {
+        Some(Value::String(text)) => vec![json!({ "type": "text", "text": text })],
+        Some(Value::Object(m)) => match m.get("content") {
+            Some(Value::Array(arr)) => arr.clone(),
+            Some(Value::String(text)) => vec![json!({ "type": "text", "text": text })],
+            _ => return None,
+        },
+        _ => return None,
+    };
+
+    let line_uuid = obj
+        .get("uuid")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty());
+    // kata 1wxv: real message uuids are the rollback-addressable turn identity;
+    // the synthetic {thread}:{ordinal} stays as the fallback for uuid-less lines.
+    let turn_id = line_uuid
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("{thread_id}:{ordinal}"));
+    let mut items: Vec<Value> = Vec::new();
+    for (j, block) in blocks.iter().enumerate() {
+        let j = index_key
+            .and_then(|key| block.get(key))
+            .and_then(Value::as_u64)
+            .map(|index| index as usize)
+            .unwrap_or(j);
+        let item_id = format!("{turn_id}-i{j}");
+        match block.get("type").and_then(Value::as_str) {
+            Some("text") => {
+                if let Some(text) = block.get("text").and_then(Value::as_str) {
+                    items.push(json!({ "id": item_id, "kind": "text", "text": text }));
+                }
+            }
+            Some("thinking") => {
+                let text = block
+                    .get("thinking")
+                    .or_else(|| block.get("text"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                items.push(json!({ "id": item_id, "kind": "thinking", "text": text }));
+            }
+            Some("tool_use") => {
+                let tool_use_id = block
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .unwrap_or(item_id.as_str())
+                    .to_string();
+                let name = block.get("name").and_then(Value::as_str).unwrap_or("tool");
+                let mut item = Map::new();
+                item.insert("id".into(), json!(item_id));
+                item.insert("kind".into(), json!("tool_use"));
+                item.insert("toolUseId".into(), json!(tool_use_id));
+                item.insert("name".into(), json!(name));
+                if let Some(input) = block.get("input") {
+                    item.insert("input".into(), input.clone());
+                }
+                items.push(Value::Object(item));
+            }
+            Some("tool_result") => {
+                let tool_use_id = block
+                    .get("tool_use_id")
+                    .and_then(Value::as_str)
+                    .unwrap_or(item_id.as_str())
+                    .to_string();
+                let is_error = block
+                    .get("is_error")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                items.push(json!({
+                    "id": item_id,
+                    "kind": "tool_result",
+                    "toolUseId": tool_use_id,
+                    "content": tool_result_text(block),
+                    "isError": is_error,
+                }));
+            }
+            _ => {}
+        }
+    }
+    if items.is_empty() {
+        return None;
+    }
+
+    let summary = summarize(&items);
+    let mut turn = Map::new();
+    turn.insert("id".into(), json!(turn_id));
+    turn.insert("turnId".into(), json!(turn_id));
+    if let Some(message_id) = msg
+        .and_then(|m| m.get("id"))
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+    {
+        turn.insert("messageId".into(), json!(message_id));
+    }
+    turn.insert("ordinal".into(), json!(ordinal));
+    turn.insert("source".into(), json!("durable"));
+    turn.insert("role".into(), json!(role));
+    if let Some(ts) = obj.get("timestamp").and_then(Value::as_str) {
+        turn.insert("timestamp".into(), json!(ts));
+    }
+    if let Some(model) = msg
+        .and_then(|m| m.get("model"))
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+    {
+        turn.insert("model".into(), json!(model));
+    }
+    turn.insert("summary".into(), json!(summary));
+    turn.insert("summaryKind".into(), json!(SUMMARY_KIND_ECHO));
+    turn.insert("items".into(), json!(items));
+    Some(Value::Object(turn))
 }
 
 /// Flatten a tool_result block's content (string, or array of text blocks) to a string.

@@ -1,0 +1,142 @@
+{
+  "sessionType": "freshcodex",
+  "provider": "codex",
+  "threadId": "rich-tools",
+  "revision": 0,
+  "status": "idle",
+  "summary": "",
+  "capabilities": {
+    "send": false,
+    "interrupt": false,
+    "approvals": false,
+    "questions": false,
+    "fork": false,
+    "worktrees": false,
+    "diffs": false,
+    "childThreads": false,
+    "undo": false,
+    "redo": false,
+    "settingScopes": {
+      "model": "per-send",
+      "effort": "per-send",
+      "sandbox": "per-send",
+      "permissionMode": "per-send"
+    }
+  },
+  "tokenUsage": {
+    "inputTokens": 0,
+    "outputTokens": 0,
+    "cachedTokens": 0,
+    "totalTokens": 0
+  },
+  "pendingApprovals": [],
+  "pendingQuestions": [],
+  "worktrees": [],
+  "diffs": [],
+  "childThreads": [],
+  "turns": [
+    {
+      "id": "native-turn:row-0",
+      "turnId": "native-turn:row-0",
+      "ordinal": 0,
+      "source": "durable",
+      "role": "user",
+      "summary": "Saved coding request",
+      "summaryKind": "echo",
+      "items": [
+        {
+          "id": "user-native:part:0",
+          "kind": "text",
+          "text": "Saved coding request"
+        }
+      ]
+    },
+    {
+      "id": "native-turn:row-1",
+      "turnId": "native-turn:row-1",
+      "ordinal": 1,
+      "source": "durable",
+      "role": "tool",
+      "summary": "apply_patch",
+      "summaryKind": "echo",
+      "items": [
+        {
+          "id": "custom-1",
+          "kind": "dynamic_tool",
+          "namespace": null,
+          "tool": "apply_patch",
+          "status": "completed",
+          "arguments": "*** Begin Patch\n*** End Patch",
+          "contentItems": [
+            {
+              "type": "inputText",
+              "text": "Patch saved"
+            }
+          ],
+          "success": true
+        },
+        {
+          "id": "search-1",
+          "kind": "web_search",
+          "query": "SQLite WAL",
+          "action": {
+            "type": "search",
+            "query": "SQLite WAL"
+          }
+        },
+        {
+          "id": "image-1",
+          "kind": "image_generation",
+          "status": "completed",
+          "revisedPrompt": "diagram",
+          "result": "saved-image"
+        },
+        {
+          "id": "command-1",
+          "kind": "command",
+          "command": "pwd",
+          "status": "completed",
+          "output": "/workspace",
+          "exitCode": 0,
+          "extensions": {
+            "codex": {
+              "type": "commandExecution",
+              "id": "command-1",
+              "command": "pwd",
+              "cwd": "/workspace",
+              "status": "completed",
+              "aggregatedOutput": "/workspace",
+              "exitCode": 0
+            }
+          },
+          "cwd": "/workspace"
+        },
+        {
+          "id": "mcp-1",
+          "kind": "mcp_tool",
+          "server": "fixture",
+          "tool": "lookup",
+          "status": "completed",
+          "arguments": {
+            "query": "saved"
+          },
+          "result": {
+            "content": [
+              {
+                "type": "text",
+                "text": "MCP saved result"
+              }
+            ]
+          },
+          "error": null
+        }
+      ]
+    }
+  ],
+  "extensions": {
+    "codex": {
+      "ownerKind": "vacant",
+      "nativeHistoryAvailable": true
+    }
+  }
+}

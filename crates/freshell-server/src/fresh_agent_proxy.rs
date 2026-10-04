@@ -50,6 +50,17 @@ pub(crate) struct HostedFreshAgentProxy {
     naming: OnceLock<Arc<dyn SessionNaming>>,
 }
 
+struct RollbackInvocation {
+    provider: AgentProvider,
+    session_id: String,
+    session_type: SessionType,
+    request_id: String,
+    direction: FreshAgentRollbackDirection,
+    mode: Option<freshell_protocol::RollbackMode>,
+    turn_id: Option<String>,
+    cwd: Option<String>,
+}
+
 impl HostedFreshAgentProxy {
     pub(crate) fn from_opt_in(
         client: Option<RuntimeClient>,
@@ -125,7 +136,7 @@ impl HostedFreshAgentProxy {
                 }
             }
             HostedFreshAgentCommand::Send(message) => {
-                let provider = message.provider.clone();
+                let provider = message.provider;
                 let session_id = message.session_id.clone();
                 let session_type = message.session_type;
                 let request_id = message
@@ -258,7 +269,7 @@ impl HostedFreshAgentProxy {
                 }
             }
             HostedFreshAgentCommand::Fork(message) => {
-                let provider = message.provider.clone();
+                let provider = message.provider;
                 let session_id = message.session_id.clone();
                 let session_type = message.session_type;
                 let request_id = message
@@ -322,29 +333,29 @@ impl HostedFreshAgentProxy {
                 }
             }
             HostedFreshAgentCommand::Undo(message) => {
-                self.rollback(
-                    message.provider,
-                    message.session_id,
-                    message.session_type,
-                    message.request_id,
-                    FreshAgentRollbackDirection::Undo,
-                    message.mode,
-                    message.turn_id,
-                    message.cwd,
-                )
+                self.rollback(RollbackInvocation {
+                    provider: message.provider,
+                    session_id: message.session_id,
+                    session_type: message.session_type,
+                    request_id: message.request_id,
+                    direction: FreshAgentRollbackDirection::Undo,
+                    mode: message.mode,
+                    turn_id: message.turn_id,
+                    cwd: message.cwd,
+                })
                 .await;
             }
             HostedFreshAgentCommand::Redo(message) => {
-                self.rollback(
-                    message.provider,
-                    message.session_id,
-                    message.session_type,
-                    message.request_id,
-                    FreshAgentRollbackDirection::Redo,
-                    message.mode,
-                    message.turn_id,
-                    message.cwd,
-                )
+                self.rollback(RollbackInvocation {
+                    provider: message.provider,
+                    session_id: message.session_id,
+                    session_type: message.session_type,
+                    request_id: message.request_id,
+                    direction: FreshAgentRollbackDirection::Redo,
+                    mode: message.mode,
+                    turn_id: message.turn_id,
+                    cwd: message.cwd,
+                })
                 .await;
             }
         }
@@ -633,17 +644,17 @@ impl HostedFreshAgentProxy {
         }
     }
 
-    async fn rollback(
-        &self,
-        provider: AgentProvider,
-        session_id: String,
-        session_type: SessionType,
-        request_id: String,
-        direction: FreshAgentRollbackDirection,
-        mode: Option<freshell_protocol::RollbackMode>,
-        turn_id: Option<String>,
-        cwd: Option<String>,
-    ) {
+    async fn rollback(&self, invocation: RollbackInvocation) {
+        let RollbackInvocation {
+            provider,
+            session_id,
+            session_type,
+            request_id,
+            direction,
+            mode,
+            turn_id,
+            cwd,
+        } = invocation;
         let parsed_request_id = RequestId::parse(request_id);
         let result = match (
             parsed_request_id,
@@ -689,7 +700,7 @@ impl HostedFreshAgentProxy {
         session_id: &str,
     ) -> Option<SoulId> {
         let public_provider = provider_wire(provider);
-        let runtime_provider = fresh_provider(&Some(provider.clone()), session_type)?;
+        let runtime_provider = fresh_provider(&Some(*provider), session_type)?;
         if let Some(soul) = self
             .aliases
             .lock()
@@ -1018,6 +1029,7 @@ fn fresh_provider_wire(provider: &FreshProvider) -> &'static str {
     }
 }
 
+#[cfg(any(test, feature = "managed-fresh-agent-fixtures"))]
 fn parse_fixture_modes(raw: &str) -> Result<HashSet<String>, String> {
     const MODES: [&str; 4] = ["freshclaude", "kilroy", "freshcodex", "freshopencode"];
     if raw.is_empty() {

@@ -1,0 +1,51 @@
+{
+  "revision": 9,
+  "readiness": {
+    "inventoryRevision": 9,
+    "initialScanState": "pending",
+    "blockedSubsystems": [],
+    "startupRecoveryConcurrencyLimit": 4,
+    "startupRecoveryPeak": 0
+  },
+  "souls": [
+    {
+      "soulId": "soul-3be9a784-7aab-4d00-8007-796d9779c5bc",
+      "incarnationId": "incarnation-52d15ab6-78cc-4117-9e1a-36afb13a4a4c",
+      "launchState": "stopping",
+      "cleanupState": "termination_unconfirmed",
+      "intentRevision": 2,
+      "containerId": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "hostBootId": "hostboot-252cb8b4-081c-4c44-b6b4-347e8a729897",
+      "executionGeneration": 1,
+      "effectiveLimits": {
+        "cpuMilli": 500,
+        "memoryBytes": 67108864,
+        "swapBytes": 0,
+        "pidsMax": 32
+      },
+      "configuredLimits": {
+        "cpuMilli": 500,
+        "memoryBytes": 67108864,
+        "swapBytes": 0,
+        "pidsMax": 32
+      },
+      "freshAgentSessionId": "fresh-retained-thread",
+      "freshAgentSessionType": "freshopencode",
+      "freshAgentRuntimeVariant": "opencode",
+      "projectKey": "workspace",
+      "profile": "custom",
+      "desiredState": "stopped",
+      "recoveryState": "lost",
+      "durabilityState": "unknown",
+      "allocationState": "allocated",
+      "provider": "opencode",
+      "nativeSessionId": "retained-thread",
+      "recoveryReason": "LOSS_CERTIFIED:incident-69063dbc-7e17-4417-9029-d4d6ec93b1c8",
+      "incidentId": "incident-69063dbc-7e17-4417-9029-d4d6ec93b1c8",
+      "evidenceRevision": 0,
+      "successfulRecoveriesInWindow": 0
+    }
+  ],
+  "viewIntents": [],
+  "pendingProjectionCount": 0
+}

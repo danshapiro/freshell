@@ -106,8 +106,29 @@ pub enum HostedRestCaptureError {
     Unavailable,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HostedRestSnapshot {
+    pub session_id: String,
+    pub provider: String,
+    pub session_type: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HostedRestSnapshotError {
+    OwnershipUnavailable,
+    ManagedUnavailable,
+}
+
 #[async_trait]
 pub trait HostedFreshAgentRestGateway: Send + Sync {
+    /// None leaves genuinely unmanaged threads on their existing read path.
+    /// A hosted read failure must never fall back to saved history as live truth.
+    async fn snapshot(
+        &self,
+        _request: HostedRestSnapshot,
+    ) -> Result<Option<Value>, HostedRestSnapshotError> {
+        Err(HostedRestSnapshotError::OwnershipUnavailable)
+    }
     async fn create_agent(
         self: std::sync::Arc<Self>,
         request: HostedRestCreate,

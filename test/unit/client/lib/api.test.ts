@@ -18,6 +18,8 @@ import {
   requestSessionHandoff,
   SessionHandoffErrorCodeSchema,
   SessionHandoffResultSchema,
+  stopManagedRuntimeSoul,
+  getManagedRuntimeInventory,
 } from '@/lib/api'
 import {
   RestoreStaleRevisionResponseSchema,
@@ -27,9 +29,56 @@ import {
 import {
   codexContractSnapshot,
 } from '../../../fixtures/fresh-agent/codex/contract-fixtures.js'
+import lostFreshAgentInventory from '../../../fixtures/managed-runtime/lost-fresh-agent-inventory.json'
 
 const mockFetch = vi.fn()
 global.fetch = mockFetch
+
+describe('managed runtime stop outcome', () => {
+  beforeEach(() => mockFetch.mockReset())
+
+  it.each(['verified_empty', 'termination_unconfirmed', 'blocked_ownership', 'backend_unavailable'])(
+    'returns the authoritative %s outcome while allowing additive soul fields', async (outcome) => {
+      mockFetch.mockResolvedValueOnce(mockJson({ outcome, soul: { soulId: 'persisted/soul', intentRevision: 9, freshAgentSessionId: 'retained-thread' } }))
+      expect(await stopManagedRuntimeSoul('persisted/soul', 8, 'stop-request')).toEqual({ outcome, soul: { soulId: 'persisted/soul', intentRevision: 9 } })
+      expect(mockFetch).toHaveBeenCalledWith('/api/runtime/souls/persisted%2Fsoul/stop', expect.objectContaining({
+        method: 'POST', body: JSON.stringify({ requestId: 'stop-request', expectedIntentRevision: 8 }),
+      }))
+    },
+  )
+
+  it.each([{}, { outcome: 'stopped' }, { outcome: null }])('rejects a successful HTTP response without a known cleanup outcome: %j', async (body) => {
+    mockFetch.mockResolvedValueOnce(mockJson(body))
+    await expect(stopManagedRuntimeSoul('soul', 8)).rejects.toThrow()
+  })
+
+  it.each([
+    { outcome: 'verified_empty' }, { outcome: 'verified_empty', soul: {} },
+    { outcome: 'verified_empty', soul: { soulId: 'soul', intentRevision: -1 } },
+  ])('rejects a stop response without valid returned revision authority: %j', async (body) => {
+    mockFetch.mockResolvedValueOnce(mockJson(body))
+    await expect(stopManagedRuntimeSoul('soul', 8)).rejects.toThrow()
+  })
+
+  it('retains the authoritative Fresh launch correlation when reading inventory', async () => {
+    const inventory = structuredClone(lostFreshAgentInventory)
+    Object.assign(inventory.souls[0], { freshAgentCreateRequestId: 'original-fresh-create' })
+    mockFetch.mockResolvedValueOnce(mockJson(inventory))
+    const parsed = await getManagedRuntimeInventory()
+    expect(parsed.souls[0]).toMatchObject({ freshAgentCreateRequestId: 'original-fresh-create', freshAgentSessionType: 'freshopencode' })
+  })
+
+  it('accepts the persisted lost Fresh Agent inventory serialized by the real Rust route', async () => {
+    // Captured by restored_web_stops_persisted_lost_soul_only_after_verified_cleanup.
+    mockFetch.mockResolvedValueOnce(mockJson(lostFreshAgentInventory))
+    const inventory = await getManagedRuntimeInventory()
+    expect(inventory.souls[0]).toMatchObject({
+      freshAgentSessionId: 'fresh-retained-thread', freshAgentSessionType: 'freshopencode',
+      freshAgentRuntimeVariant: 'opencode', nativeSessionId: 'retained-thread',
+      desiredState: 'stopped', recoveryState: 'lost', cleanupState: 'termination_unconfirmed',
+    })
+  })
+})
 
 function mockJson(value: unknown) {
   return {
@@ -284,6 +333,12 @@ describe('visible-first read-model helpers', () => {
       '/api/fresh-agent/threads/freshcodex/codex/thread-1?revision=7&cwd=%2Frepo%2Fworktree',
       expect.objectContaining({ signal, headers: expect.any(Headers) }),
     )
+  })
+
+  it('reads managed history from the exact soul after web restart without an alias lookup', async () => {
+    mockFetch.mockResolvedValueOnce(mockJson(codexContractSnapshot))
+    await getFreshAgentThreadSnapshot('freshcodex', 'codex', 'presentation-alias', { soulId: 'retained-soul' })
+    expect(mockFetch).toHaveBeenCalledWith('/api/runtime/souls/retained-soul/history', expect.any(Object))
   })
 
   it('appends the snapshot trigger to the fresh-agent snapshot query when provided', async () => {

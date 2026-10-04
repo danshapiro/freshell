@@ -1,4 +1,5 @@
 import { describe, it, expect, vi, afterEach } from 'vitest'
+import { configureStore } from '@reduxjs/toolkit'
 
 // Mock localStorage BEFORE importing slices (persistMiddleware reads it at import time)
 const localStorageMock = (() => {
@@ -166,6 +167,35 @@ function resultFor(req: PaneReconcileRequest, verdicts: PaneVerdict[]): PaneReco
 afterEach(() => {
   vi.restoreAllMocks()
   setFreshAgentReconcileActive(false)
+})
+
+describe('managed bootstrap history fold', () => {
+  it.each([
+    ['freshclaude', 'claude', DURABLE],
+    ['kilroy', 'claude', DURABLE],
+    ['freshcodex', 'codex', 'native-managed-codex'],
+    ['freshopencode', 'opencode', 'ses_managed_opencode'],
+  ] as const)('preserves the %s canonical source through an actual fresh fold', (sessionType, provider, nativeId) => {
+    const store = configureStore({ reducer: { panes: panesReducer } })
+    const sessionRef = { provider, sessionId: nativeId }
+    store.dispatch(initLayout({ tabId: 'owned-tab', paneId: 'owned-pane', content: {
+      kind: 'fresh-agent', sessionType, provider, createRequestId: FA_CREATE_REQUEST_ID,
+      sessionId: 'old-live-handle', sessionRef, resumeSessionId: nativeId, status: 'connected',
+      soulId: 'owned-soul', soulIntentRevision: 7,
+    } }))
+    const request = buildReconcileRequest(store.getState() as RootState, { includeFreshAgent: true })!
+    const result = resultFor(request, [{ paneKey: request.panes[0].paneKey, verdict: 'fresh', reason: 'identity_never_observed' }])
+    const outcome = foldVerdicts(store.dispatch as AppDispatch, request, result)
+    expect(outcome.fresh).toBe(1)
+    const root = store.getState().panes.layouts['owned-tab']
+    expect(root.type).toBe('leaf')
+    if (root.type !== 'leaf') throw new Error('expected owned pane')
+    expect(root.content).toMatchObject({ sessionRef, resumeSessionId: nativeId, soulId: 'owned-soul',
+      soulIntentRevision: 7, createRequestId: FA_CREATE_REQUEST_ID, pendingReconcile: 'fresh', reconcileEpoch: 1, status: 'creating' })
+    expect((root.content as FreshAgentPaneContent).sessionId).toBeUndefined()
+    expect(buildReconcileRequest(store.getState() as RootState, { includeFreshAgent: true })!.panes[0])
+      .toMatchObject({ createRequestId: FA_CREATE_REQUEST_ID, sessionRef })
+  })
 })
 
 describe('fresh-agent reconcile capability latch', () => {

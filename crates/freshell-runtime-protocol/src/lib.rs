@@ -12,6 +12,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 pub const CONTROL_PROTOCOL_VERSION: u32 = 1;
 pub const MAX_CONTROL_FRAME_BYTES: usize = 1024 * 1024;
+pub const MAX_NATIVE_HISTORY_FRAME_BYTES: usize = 32 * 1024 * 1024;
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -2304,6 +2305,22 @@ pub struct FreshAgentReadEventsRequest {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct FreshAgentReadHistoryRequest {
+    pub soul_id: SoulId,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expected_control_epoch: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FreshAgentReadSnapshotRequest {
+    pub soul_id: SoulId,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expected_control_epoch: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct TerminalResizeRequest {
     pub soul_id: SoulId,
     pub cols: u16,
@@ -2591,6 +2608,8 @@ pub enum AdminCommand {
     FreshAgentResolve(FreshAgentResolveRequest),
     FreshAgentInterrupt(FreshAgentInterruptRequest),
     FreshAgentReadEvents(FreshAgentReadEventsRequest),
+    FreshAgentReadHistory(FreshAgentReadHistoryRequest),
+    FreshAgentReadSnapshot(FreshAgentReadSnapshotRequest),
     RuntimeMetrics(RuntimeMetricsRequest),
     ProbeRecovery(RecoveryProbeRequest),
     Recover(RecoverRequest),
@@ -2629,6 +2648,9 @@ pub struct RuntimeView {
     pub terminal_resume_session_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fresh_agent_session_id: Option<String>,
+    /// Original Fresh create request, persisted as the soul creation seed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fresh_agent_create_request_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fresh_agent_session_type: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2741,6 +2763,8 @@ pub enum AdminResult {
     FreshAgentCapture(FreshAgentCapture),
     FreshAgentInterrupted,
     FreshAgentEvents(AgentEventBatch),
+    FreshAgentHistory(serde_json::Value),
+    FreshAgentSnapshot(serde_json::Value),
     RuntimeMetrics(RuntimeMetrics),
     RecoveryProbe(RecoveryProbe),
     Recovery(RecoveryResult),
@@ -2840,6 +2864,9 @@ pub enum HostCommand {
         incarnation_id: IncarnationId,
         max_bytes: u32,
     },
+    FreshAgentReadSnapshot {
+        incarnation_id: IncarnationId,
+    },
     FreshAgentResolve {
         incarnation_id: IncarnationId,
         decision_id: String,
@@ -2903,6 +2930,7 @@ pub enum HostResult {
     FreshAgentCapture(FreshAgentCapture),
     FreshAgentEvents(AgentEventBatch),
     RuntimeMetrics(RuntimeMetrics),
+    FreshAgentSnapshot(serde_json::Value),
     Status {
         host_boot_id: HostBootId,
         worker_pid: Option<u32>,
@@ -2953,7 +2981,7 @@ fn hex_lower(bytes: &[u8]) -> String {
 
 #[derive(Debug, thiserror::Error)]
 pub enum FrameError {
-    #[error("control frame exceeds {MAX_CONTROL_FRAME_BYTES} bytes")]
+    #[error("control frame exceeds its byte budget")]
     TooLarge,
     #[error("control frame I/O failed: {0}")]
     Io(#[from] std::io::Error),
@@ -2966,8 +2994,20 @@ where
     W: AsyncWrite + Unpin,
     T: Serialize,
 {
+    write_frame_with_limit(writer, value, MAX_CONTROL_FRAME_BYTES).await
+}
+
+pub async fn write_frame_with_limit<W, T>(
+    writer: &mut W,
+    value: &T,
+    limit: usize,
+) -> Result<(), FrameError>
+where
+    W: AsyncWrite + Unpin,
+    T: Serialize,
+{
     let bytes = serde_json::to_vec(value)?;
-    if bytes.len() > MAX_CONTROL_FRAME_BYTES {
+    if bytes.len() > limit {
         return Err(FrameError::TooLarge);
     }
     writer
@@ -2983,10 +3023,18 @@ where
     R: AsyncRead + Unpin,
     T: DeserializeOwned,
 {
+    read_frame_with_limit(reader, MAX_CONTROL_FRAME_BYTES).await
+}
+
+pub async fn read_frame_with_limit<R, T>(reader: &mut R, limit: usize) -> Result<T, FrameError>
+where
+    R: AsyncRead + Unpin,
+    T: DeserializeOwned,
+{
     let mut len = [0u8; 4];
     reader.read_exact(&mut len).await?;
     let len = u32::from_be_bytes(len) as usize;
-    if len > MAX_CONTROL_FRAME_BYTES {
+    if len > limit {
         return Err(FrameError::TooLarge);
     }
     let mut bytes = vec![0; len];

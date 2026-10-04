@@ -35,6 +35,7 @@ import { sanitizeRestoreError, sanitizeCrashTrace, sanitizeSessionRef, type Rest
 import { sanitizeCodexDurabilityRef } from '@shared/codex-durability'
 import { migrateLegacyFreshAgentContent, migrateLegacyFreshAgentDurableState, preservedDurableFreshAgentIdentity } from '@shared/fresh-agent'
 import { normalizeFreshAgentStyleOverride } from '@shared/settings'
+import { isDurableProviderSessionId } from '@shared/session-flavor'
 import { parsePaneNamingIdentityInput } from '@/lib/tab-name-source'
 import { ManagedRuntimeProjectionFieldsSchema, type ManagedRuntimeProjectionFields } from '@shared/managed-runtime'
 
@@ -174,6 +175,7 @@ function normalizePaneContent(
     const pendingLocalEcho = normalizeFreshAgentPendingLocalEcho(rawFreshAgent.pendingLocalEcho)
     const modelEffortLevels = normalizeFreshAgentModelEffortLevels(rawFreshAgent.modelEffortLevels)
     const freshHandoffError = normalizeHandoffError(rawFreshAgent.handoffError)
+    const closeError = typeof input.closeError === 'string' ? input.closeError : undefined
     const rawModelLabel = rawFreshAgent.modelLabel
     const modelLabel =
       rawModelLabel && typeof rawModelLabel === 'object'
@@ -227,6 +229,7 @@ function normalizePaneContent(
           restoreError: existingRestoreError,
           initialCwd: input.initialCwd,
           createError: input.createError,
+          closeError,
           modelSelection: normalizeFreshAgentModelSelection(
             (input as { modelSelection?: unknown }).modelSelection,
             (input as { model?: unknown }).model,
@@ -298,6 +301,7 @@ function normalizePaneContent(
     return {
       kind: 'fresh-agent',
       ...normalizeManagedRuntimeProjection(rawFreshAgent),
+      closeError,
       sessionType: input.sessionType,
       provider: input.provider,
       sessionId: input.sessionId,
@@ -672,6 +676,25 @@ function findReconcilePaneContent(
   const content = leaf?.content
   if (content?.kind === 'terminal' || content?.kind === 'fresh-agent') return content
   return undefined
+}
+
+/** Clear supervisor-owned identity/projection fields for a user-chosen new
+ * conversation. Reconcile folds deliberately do not use this helper: those
+ * folds preserve the existing create key and managed identity until the
+ * supervisor supplies the next authoritative projection. */
+function clearManagedRuntimeProjection(
+  content: TerminalPaneContent | FreshAgentPaneContent,
+): void {
+  content.soulId = undefined
+  content.incarnationId = undefined
+  content.runtimeState = undefined
+  content.viewIntentId = undefined
+  content.viewIntentRevision = undefined
+  content.soulIntentRevision = undefined
+  content.incidentId = undefined
+  content.placementGroup = undefined
+  content.resourceSummary = undefined
+  content.recoverySummary = undefined
 }
 
 function freshAgentPaneMatchesMaterializedSession(
@@ -1868,6 +1891,67 @@ export const panesSlice = createSlice({
       reconcileRefreshRequestsForTab(state, tabId)
     },
 
+    /**
+     * Start a genuinely new user-chosen conversation after the old one has
+     * been closed or certified lost. This is intentionally separate from
+     * reconcile folds: a deliberate new conversation mints a new lifecycle
+     * key and drops every managed-runtime projection so an old inventory
+     * snapshot cannot reattach the retired soul.
+     */
+    startNewManagedRuntimeConversation: (
+      state,
+      action: PayloadAction<{ tabId: string; paneId: string }>,
+    ) => {
+      const { tabId, paneId } = action.payload
+      const root = state.layouts[tabId]
+      if (!root) return
+      if (refuseRekeyWhileClosing(state, tabId, paneId, 'startNewManagedRuntimeConversation')) return
+
+      const leaf = findLeaf(root, paneId)
+      if (!leaf || (leaf.content.kind !== 'terminal' && leaf.content.kind !== 'fresh-agent')) return
+
+      const content = leaf.content
+      if (content.kind === 'terminal') {
+        content.terminalId = undefined
+        content.serverInstanceId = undefined
+        content.streamId = undefined
+        content.status = 'creating'
+        content.createRequestId = nanoid()
+        content.sessionRef = undefined
+        content.resumeSessionId = undefined
+        content.codexDurability = undefined
+        content.restoreError = undefined
+        content.reconcileNotice = undefined
+        content.pendingReconcile = undefined
+        content.reconcileEpoch = undefined
+        content.crashTrace = undefined
+        content.launchFailure = undefined
+        content.handoffError = undefined
+        content.namingHandle = undefined
+        content.nameRef = undefined
+        clearManagedRuntimeProjection(content)
+      } else {
+        content.sessionId = undefined
+        content.serverInstanceId = undefined
+        content.status = 'creating'
+        content.createRequestId = nanoid()
+        content.sessionRef = undefined
+        content.resumeSessionId = undefined
+        content.restoreError = undefined
+        content.createError = undefined
+        content.closeError = undefined
+        content.reconcileNotice = undefined
+        content.pendingReconcile = undefined
+        content.reconcileEpoch = undefined
+        content.pendingLocalEcho = undefined
+        content.handoffError = undefined
+        content.namingHandle = undefined
+        content.nameRef = undefined
+        clearManagedRuntimeProjection(content)
+      }
+      reconcileRefreshRequestsForTab(state, tabId)
+    },
+
     requestPaneRefresh: (
       state,
       action: PayloadAction<{ tabId: string; paneId: string }>
@@ -2643,6 +2727,16 @@ export const panesSlice = createSlice({
       let { intent } = action.payload
       const content = findReconcilePaneContent(state, tabId, paneId)
       if (!content || content.kind !== 'fresh-agent') return
+      // A missing web-runtime observation does not erase an owned conversation.
+      // Preserve only its saved locator; the live handle must still clear so
+      // the original-request bootstrap runs. Invalid respawn is never this case.
+      const savedRef = action.payload.intent === 'fresh'
+        && reason === 'identity_never_observed'
+        && content.soulId && content.createRequestId
+        ? sanitizeSessionRef(content.sessionRef) : undefined
+      const retainedManagedRef = savedRef?.provider === content.provider
+        && isDurableProviderSessionId(content.provider, savedRef.sessionId)
+        ? savedRef : undefined
       if (intent === 'respawn' && (!sessionRef?.sessionId || sessionRef.provider !== content.provider)) {
         log.error('fresh-agent respawn verdict without a usable sessionRef — degrading to fresh', {
           tabId,
@@ -2659,6 +2753,9 @@ export const panesSlice = createSlice({
       if (intent === 'respawn' && sessionRef) {
         content.sessionRef = { provider: sessionRef.provider, sessionId: sessionRef.sessionId }
         content.resumeSessionId = sessionRef.sessionId
+      } else if (retainedManagedRef) {
+        content.sessionRef = retainedManagedRef
+        content.resumeSessionId = retainedManagedRef.sessionId
       } else {
         content.sessionRef = undefined
         content.resumeSessionId = undefined
@@ -2682,13 +2779,13 @@ export const panesSlice = createSlice({
     // Delta-r7-r3 (focused-episode-7 round 2 Finding F2): the close gate's
     // failure surface — the unconfirmed-close reason carried on the pane
     // itself (TerminalView renders it as the xterm "[Close failed]" notice
-    // and clears it). Terminal panes only: the fresh-agent lane has its own
-    // session-error banner.
+    // and clears it). Fresh Agent panes show it through their existing
+    // yellow error banner, independently of any preceding kill's result.
     setPaneCloseError: (
       state,
       action: PayloadAction<{ tabId: string; paneId: string; error: string }>
     ) => {
-      const content = findReconcileTerminalContent(state, action.payload.tabId, action.payload.paneId)
+      const content = findReconcilePaneContent(state, action.payload.tabId, action.payload.paneId)
       if (!content) return
       content.closeError = action.payload.error
     },
@@ -2697,7 +2794,7 @@ export const panesSlice = createSlice({
       state,
       action: PayloadAction<{ tabId: string; paneId: string }>
     ) => {
-      const content = findReconcileTerminalContent(state, action.payload.tabId, action.payload.paneId)
+      const content = findReconcilePaneContent(state, action.payload.tabId, action.payload.paneId)
       if (!content) return
       content.closeError = undefined
     },
@@ -2884,6 +2981,7 @@ export const {
   resetPaneForReconcileCreate,
   applyFreshAgentReconcileAttach,
   resetFreshAgentPaneForReconcileCreate,
+  startNewManagedRuntimeConversation,
   setPaneReconcileNotice,
   clearPaneReconcileNotice,
   setPaneCloseError,

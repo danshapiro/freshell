@@ -23,6 +23,7 @@ import {
   ManagedRuntimeRepairAuditSchema,
   ManagedRuntimeSoulDetailSchema,
   ManagedRuntimeUpdateLimitsResultSchema,
+  ManagedRuntimeViewIntentSchema,
   type ManagedRuntimeIncidentSummary,
   type ManagedRuntimeInventorySnapshot,
   type ManagedRuntimeLimits,
@@ -34,6 +35,7 @@ import {
   type ManagedRuntimeRolloutMode,
   type ManagedRuntimeSoulDetail,
   type ManagedRuntimeUpdateLimitsResult,
+  type ManagedRuntimeViewIntent,
   type ManagedRuntimeViewVisibility,
 } from '@shared/managed-runtime'
 import { parseFreshAgentModelCapabilitiesResponse } from '@/lib/fresh-agent-model-capabilities'
@@ -458,15 +460,25 @@ export async function retryManagedRuntimeSoul(
   })
 }
 
+const ManagedRuntimeStopResultSchema = z.object({
+  outcome: z.enum(['verified_empty', 'blocked_ownership', 'backend_unavailable', 'termination_unconfirmed']),
+  soul: z.object({
+    soulId: z.string().min(1),
+    intentRevision: z.number().int().nonnegative(),
+  }),
+})
+
+export type ManagedRuntimeStopResult = z.infer<typeof ManagedRuntimeStopResultSchema>
+
 export async function stopManagedRuntimeSoul(
   soulId: string,
   expectedIntentRevision: number,
   requestId = createManagedRuntimeRequestId(),
-): Promise<unknown> {
-  return api.post(`/api/runtime/souls/${encodeURIComponent(soulId)}/stop`, {
+): Promise<ManagedRuntimeStopResult> {
+  return ManagedRuntimeStopResultSchema.parse(await api.post(`/api/runtime/souls/${encodeURIComponent(soulId)}/stop`, {
     requestId,
     expectedIntentRevision,
-  })
+  }))
 }
 
 export async function updateManagedRuntimeLimits(
@@ -490,13 +502,16 @@ export async function updateManagedRuntimeViewVisibility(
   expectedRevision: number,
   expectedSoulIntentRevision: number,
   requestId = createManagedRuntimeRequestId(),
-): Promise<unknown> {
-  return api.patch(`/api/runtime/views/${encodeURIComponent(viewId)}`, {
-    requestId,
-    visibility,
-    expectedRevision,
-    expectedSoulIntentRevision,
-  })
+  options: ApiRequestOptions = {},
+): Promise<ManagedRuntimeViewIntent> {
+  return ManagedRuntimeViewIntentSchema.parse(
+    await api.patch(`/api/runtime/views/${encodeURIComponent(viewId)}`, {
+      requestId,
+      visibility,
+      expectedRevision,
+      expectedSoulIntentRevision,
+    }, options),
+  )
 }
 
 export async function getManagedRuntimeIncidentSummary(
@@ -668,11 +683,12 @@ export async function getFreshAgentThreadSnapshot(
   sessionType: string,
   provider: string,
   threadId: string,
-  query: { revision?: number; cwd?: string; trigger?: string; signal?: AbortSignal } = {},
+  query: { revision?: number; cwd?: string; trigger?: string; signal?: AbortSignal; soulId?: string } = {},
   options: ApiRequestOptions = {},
 ): Promise<any> {
   const signal = query.signal ?? options.signal
   const data = await api.get(
+    query.soulId ? `/api/runtime/souls/${encodeURIComponent(query.soulId)}/history` :
     `/api/fresh-agent/threads/${encodeURIComponent(sessionType)}/${encodeURIComponent(provider)}/${encodeURIComponent(threadId)}${buildQueryString([
       ['revision', query.revision],
       ['cwd', query.cwd],

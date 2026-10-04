@@ -5,6 +5,7 @@ import { configureStore } from '@reduxjs/toolkit'
 import { Provider } from 'react-redux'
 import tabsReducer, { setActiveTab } from '@/store/tabsSlice'
 import panesReducer, {
+  updatePaneContent,
   removeLayout,
   requestPaneRefresh,
   setPaneCloseError,
@@ -4293,9 +4294,9 @@ describe('TerminalView lifecycle updates', () => {
       await waitFor(() => {
         expect(createCalls()).toHaveLength(2)
       })
-      expect(createCalls()[1]).toMatchObject({
-        requestId: 'req-b8ke',
-      })
+      const retiredRequestId = createCalls()[0].requestId
+      expect(createCalls()[1].requestId).toEqual(expect.any(String))
+      expect(createCalls()[1].requestId).not.toBe(retiredRequestId)
       expect(createCalls()[1].sessionRef).toBeUndefined()
       const leaf = store.getState().panes.layouts['tab-b8ke']
       expect(
@@ -5932,6 +5933,21 @@ describe('TerminalView lifecycle updates', () => {
       expect(queryByText('Recovering terminal output...')).not.toBeNull()
     })
 
+    it('keeps managed output attachment invisible while actually requesting retained output', async () => {
+      const { tabId, paneId, paneContent, store } = setupNonBlockingTerminal('ready')
+      const managedContent: TerminalPaneContent = { ...paneContent, soulId: 'managed-soul', recoverySummary: {
+        desiredState: 'running', recoveryState: 'recovering', reason: 'provider_unavailable',
+        durabilityState: 'resume_captured', allocationState: 'verified_durable',
+      } }
+      store.dispatch(updatePaneContent({ tabId, paneId, content: managedContent }))
+      render(<Provider store={store}><TerminalView tabId={tabId} paneId={paneId} paneContent={managedContent} /></Provider>)
+      await waitFor(() => expect(wsMocks.send).toHaveBeenCalledWith(expect.objectContaining({
+        type: 'terminal.attach', terminalId: 'term-non-blocking', sinceSeq: 0,
+      })))
+      expect(screen.queryByText('Recovering terminal output...')).toBeNull()
+      expect(screen.queryByTestId('loader')).toBeNull()
+    })
+
     it('does not show recovering banner on fresh terminal creation', async () => {
       const tabId = 'tab-fresh'
       const paneId = 'pane-fresh'
@@ -6040,6 +6056,8 @@ describe('TerminalView lifecycle updates', () => {
       status?: 'creating' | 'running'
       terminalId?: string
       mode?: TerminalPaneContent['mode']
+      recoverySummary?: TerminalPaneContent['recoverySummary']
+      soulId?: string
       hidden?: boolean
       clearSends?: boolean
       requestId?: string
@@ -6078,6 +6096,8 @@ describe('TerminalView lifecycle updates', () => {
         ...(terminalId ? { terminalId } : {}),
         ...(opts?.sessionRef ? { sessionRef: opts.sessionRef } : {}),
         ...(opts?.streamId ? { streamId: opts.streamId } : {}),
+        ...(opts?.recoverySummary ? { recoverySummary: opts.recoverySummary } : {}),
+        ...(opts?.soulId ? { soulId: opts.soulId } : {}),
         ...(opts?.contentServerInstanceId ? { serverInstanceId: opts.contentServerInstanceId } : {}),
       }
 
@@ -6181,6 +6201,70 @@ describe('TerminalView lifecycle updates', () => {
         terminalId: terminalId || 'term-v2-stream',
       }
     }
+
+    it.each([false, true].flatMap((savedIdentity) => (['running', 'creating'] as const).map((status) => ({ savedIdentity, status }))))('preserves a recovering managed terminal on a rejected attach (saved identity $savedIdentity, stale $status)', async ({ savedIdentity, status }) => {
+      const recoverySummary = { desiredState: 'running' as const, recoveryState: 'recovering' as const,
+        durabilityState: 'resume_captured' as const, allocationState: 'verified_durable' as const }
+      const { store, term, tabId, paneId, terminalId } = await renderTerminalHarness({
+        mode: 'codex', status, terminalId: 'automatic-invalid-terminal', clearSends: false, ackInitialAttach: false, fromStore: true,
+        soulId: 'automatic-terminal-soul', recoverySummary,
+        ...(savedIdentity ? { sessionRef: { provider: 'codex', sessionId: 'saved-automatic-thread' } } : {}),
+      })
+      const root = store.getState().panes.layouts[tabId]
+      if (root.type !== 'leaf') throw new Error('Expected one pane')
+      const before = root.content
+      const attach = sentMessages().find((frame) => frame.type === 'terminal.attach' && frame.terminalId === terminalId)
+      expect(attach).toMatchObject({ attachRequestId: expect.any(String) })
+      act(() => messageHandler!({ type: 'error', code: 'INVALID_TERMINAL_ID', terminalId,
+        requestId: attach.attachRequestId, message: 'Terminal not running' }))
+      await act(async () => {})
+      expect(store.getState().panes.layouts[tabId].content).toEqual(before)
+      expect(sentMessages().filter((frame) => frame.type === 'terminal.create')).toEqual([])
+      expect(term.write.mock.calls.map(([data]: [string]) => data).join('')).not.toMatch(/Reconnecting|Starting a new terminal/)
+      expect(screen.queryByTestId('managed-runtime-recovery-card')).not.toBeInTheDocument()
+      expect(screen.queryByText('Starting terminal...')).not.toBeInTheDocument()
+      // The managed replacement still folds and its real mounted attachment renders output.
+      act(() => messageHandler!({ type: 'terminal.replaced', oldTerminalId: terminalId,
+        newTerminalId: 'automatic-replacement-terminal', exitCode: 137, attempt: 1, maxAttempts: 3 }))
+      const replacementAttach = sentMessages().filter((frame) => frame.type === 'terminal.attach'
+        && frame.terminalId === 'automatic-replacement-terminal').at(-1)
+      expect(replacementAttach).toMatchObject({ attachRequestId: expect.any(String) })
+      act(() => {
+        messageHandler!({ type: 'terminal.attach.ready', terminalId: 'automatic-replacement-terminal',
+          attachRequestId: replacementAttach.attachRequestId, headSeq: 1, replayFromSeq: 1, replayToSeq: 1 })
+        messageHandler!({ type: 'terminal.output', terminalId: 'automatic-replacement-terminal',
+          attachRequestId: replacementAttach.attachRequestId, seqStart: 1, seqEnd: 1, data: 'Recovered conversation output' })
+      })
+      expect(term.write).toHaveBeenCalledWith('Recovered conversation output', expect.any(Function))
+      expect(store.getState().panes.layouts[tabId].content).toMatchObject({
+        terminalId: 'automatic-replacement-terminal', createRequestId: before.createRequestId, soulId: 'automatic-terminal-soul',
+      })
+      expect(store.getState().panes.layouts[tabId].content.sessionRef).toEqual(before.sessionRef)
+    })
+
+    it('retains an attach target rejected after live to recovering and reattaches after live authority returns', async () => {
+      const { store, term, tabId, paneId, terminalId } = await renderTerminalHarness({
+        mode: 'codex', terminalId: 'automatic-transition-terminal', clearSends: false, ackInitialAttach: false, fromStore: true,
+        soulId: 'automatic-transition-soul', sessionRef: { provider: 'codex', sessionId: 'transition-saved-thread' },
+      })
+      const attach = sentMessages().filter((frame) => frame.type === 'terminal.attach').at(-1)
+      const root = store.getState().panes.layouts[tabId]
+      if (root.type !== 'leaf') throw new Error('Expected one pane')
+      const recovering = { ...root.content, recoverySummary: { desiredState: 'running' as const, recoveryState: 'recovering' as const,
+        durabilityState: 'resume_captured' as const, allocationState: 'verified_durable' as const } }
+      act(() => store.dispatch(updatePaneContent({ tabId, paneId, content: recovering })))
+      const currentAttach = sentMessages().filter((frame) => frame.type === 'terminal.attach').at(-1) ?? attach
+      act(() => messageHandler!({ type: 'error', code: 'INVALID_TERMINAL_ID', terminalId,
+        requestId: currentAttach.attachRequestId, message: 'Terminal not running' }))
+      expect(store.getState().panes.layouts[tabId].content).toEqual(recovering)
+      expect(sentMessages().filter((frame) => frame.type === 'terminal.create')).toEqual([])
+      expect(term.write.mock.calls.map(([data]: [string]) => data).join('')).not.toMatch(/Reconnecting|Starting a new terminal/)
+      const beforeLive = sentMessages().filter((frame) => frame.type === 'terminal.attach').length
+      act(() => store.dispatch(updatePaneContent({ tabId, paneId, content: { ...recovering,
+        recoverySummary: { ...recovering.recoverySummary, recoveryState: 'live' } } })))
+      expect(sentMessages().filter((frame) => frame.type === 'terminal.attach')).toHaveLength(beforeLive + 1)
+      expect(sentMessages().filter((frame) => frame.type === 'terminal.attach').at(-1).terminalId).toBe(terminalId)
+    })
 
     function replayReconstructedSurface(terminalId: string, probeAttachId: string, headSeq: number, data: string) {
       const attach = sentMessages().filter(msg => msg?.type === 'terminal.attach' && msg.terminalId === terminalId).at(-1)!

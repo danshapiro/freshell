@@ -413,6 +413,14 @@ impl Supervisor {
                         .await?,
                 ))
             }
+            AdminCommand::FreshAgentReadSnapshot(request) => {
+                self.registry
+                    .assert_epoch(request.expected_control_epoch)
+                    .map_err(map_registry)?;
+                Ok(AdminResult::FreshAgentSnapshot(
+                    self.fresh_agent_snapshot(request.soul_id).await?,
+                ))
+            }
             AdminCommand::FreshAgentResolve(request) => {
                 self.registry
                     .assert_epoch(request.expected_control_epoch)
@@ -428,6 +436,55 @@ impl Supervisor {
                     .map_err(map_registry)?;
                 self.fresh_agent_interrupt(request.soul_id).await?;
                 Ok(AdminResult::FreshAgentInterrupted)
+            }
+            AdminCommand::FreshAgentReadHistory(request) => {
+                self.registry
+                    .assert_epoch(request.expected_control_epoch)
+                    .map_err(map_registry)?;
+                let context = self
+                    .registry
+                    .recovery_context(request.soul_id)
+                    .await
+                    .map_err(map_registry)?;
+                let handle = &context.prior_handle;
+                let agent = handle.fresh_agent().ok_or_else(|| {
+                    RuntimeError::new(
+                        RuntimeErrorCode::InvalidRequest,
+                        "soul is not a fresh agent",
+                    )
+                })?;
+                let native_id = context.native_session_id.as_deref().ok_or_else(|| {
+                    RuntimeError::new(
+                        RuntimeErrorCode::InvalidRequest,
+                        "saved native session identity unavailable",
+                    )
+                })?;
+                let snapshot = self
+                    .backend
+                    .read_native_history(
+                        handle,
+                        agent.provider.as_str(),
+                        native_id,
+                        &self.config.host_binary_path,
+                    )
+                    .await
+                    .map_err(map_backend)?;
+                // Kilroy uses the Claude transcript contract, with its own session type.
+                let wire_provider =
+                    if agent.provider == freshell_runtime_protocol::FreshProvider::Kilroy {
+                        "claude"
+                    } else {
+                        agent.provider.as_str()
+                    };
+                if snapshot["threadId"].as_str() != Some(native_id)
+                    || snapshot["provider"].as_str() != Some(wire_provider)
+                {
+                    return Err(RuntimeError::new(
+                        RuntimeErrorCode::OwnershipMismatch,
+                        "native history identity mismatch",
+                    ));
+                }
+                Ok(AdminResult::FreshAgentHistory(snapshot))
             }
             AdminCommand::FreshAgentReadEvents(request) => {
                 self.registry
@@ -1311,6 +1368,67 @@ impl Supervisor {
         }
     }
 
+    async fn fresh_agent_snapshot(
+        &self,
+        soul_id: SoulId,
+    ) -> Result<serde_json::Value, RuntimeError> {
+        let lifecycle_lock = self.lifecycle_lock(&soul_id).await;
+        let _guard = lifecycle_lock.lock().await;
+        let handle = self
+            .registry
+            .active_handle_for_soul(soul_id.clone())
+            .await
+            .map_err(map_registry)?;
+        let agent = handle.fresh_agent().ok_or_else(|| {
+            RuntimeError::new(
+                RuntimeErrorCode::UnsupportedWorkload,
+                "soul is not a hosted fresh-agent",
+            )
+        })?;
+        let provider = if agent.provider == freshell_runtime_protocol::FreshProvider::Kilroy {
+            "claude"
+        } else {
+            agent.provider.as_str()
+        };
+        let host = self
+            .authenticate_host(handle.incarnation_id(), handle.runtime_dir())
+            .await?;
+        let result = self
+            .send_authenticated_host_command(
+                handle.incarnation_id().clone(),
+                handle.runtime_dir(),
+                &host,
+                HostCommand::FreshAgentReadSnapshot {
+                    incarnation_id: handle.incarnation_id().clone(),
+                },
+            )
+            .await?;
+        let HostResult::FreshAgentSnapshot(snapshot) = result else {
+            return Err(RuntimeError::new(
+                RuntimeErrorCode::HostAuthenticationFailed,
+                "unexpected fresh-agent snapshot reply",
+            ));
+        };
+        let current = self
+            .registry
+            .active_handle_for_soul(soul_id)
+            .await
+            .map_err(map_registry)?;
+        if current.incarnation_id() != handle.incarnation_id() {
+            return Err(RuntimeError::new(
+                RuntimeErrorCode::OwnershipMismatch,
+                "fresh-agent snapshot owner changed",
+            ));
+        }
+        if snapshot["provider"].as_str() != Some(provider) {
+            return Err(RuntimeError::new(
+                RuntimeErrorCode::OwnershipMismatch,
+                "fresh-agent snapshot provider mismatch",
+            ));
+        }
+        Ok(snapshot)
+    }
+
     async fn fresh_agent_resolve(
         &self,
         soul_id: SoulId,
@@ -2186,7 +2304,16 @@ pub async fn serve_control(supervisor: Supervisor, socket_path: &Path) -> Result
                     )),
                 },
             };
-            let _ = write_frame(&mut stream, &reply).await;
+            let limit = if matches!(
+                reply.result,
+                Ok(AdminResult::FreshAgentHistory(_) | AdminResult::FreshAgentSnapshot(_))
+            ) {
+                freshell_runtime_protocol::MAX_NATIVE_HISTORY_FRAME_BYTES
+            } else {
+                freshell_runtime_protocol::MAX_CONTROL_FRAME_BYTES
+            };
+            let _ =
+                freshell_runtime_protocol::write_frame_with_limit(&mut stream, &reply, limit).await;
         });
     }
 }
@@ -2249,9 +2376,15 @@ pub(crate) async fn request_host_reply(
         write_frame(&mut stream, envelope)
             .await
             .map_err(|error| unreachable(error.to_string()))?;
-        let reply: HostReply = read_frame(&mut stream)
-            .await
-            .map_err(|error| unreachable(error.to_string()))?;
+        let reply_limit = if matches!(envelope.body, HostCommand::FreshAgentReadSnapshot { .. }) {
+            freshell_runtime_protocol::MAX_NATIVE_HISTORY_FRAME_BYTES
+        } else {
+            freshell_runtime_protocol::MAX_CONTROL_FRAME_BYTES
+        };
+        let reply: HostReply =
+            freshell_runtime_protocol::read_frame_with_limit(&mut stream, reply_limit)
+                .await
+                .map_err(|error| unreachable(error.to_string()))?;
         Ok(reply)
     })
     .await
@@ -2426,6 +2559,55 @@ mod host_ipc_timeout_tests {
     };
     use std::time::{Duration, Instant};
     use tokio::net::UnixListener;
+
+    #[tokio::test]
+    async fn snapshot_host_reply_preserves_large_history_and_controls_stay_bounded() {
+        for snapshot_read in [true, false] {
+            let dir = tempfile::tempdir().unwrap();
+            let socket = dir.path().join("host.sock");
+            let listener = UnixListener::bind(&socket).unwrap();
+            let expected = serde_json::json!({"threadId":"native-large", "turns":[{"text":"x".repeat(2 * freshell_runtime_protocol::MAX_CONTROL_FRAME_BYTES)}]});
+            let sent = expected.clone();
+            let server = tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let envelope: Envelope<HostCommand> =
+                    freshell_runtime_protocol::read_frame(&mut stream)
+                        .await
+                        .unwrap();
+                freshell_runtime_protocol::write_frame_with_limit(
+                    &mut stream,
+                    &freshell_runtime_protocol::HostReply {
+                        request_id: envelope.request_id,
+                        result: Ok(freshell_runtime_protocol::HostResult::FreshAgentSnapshot(
+                            sent,
+                        )),
+                    },
+                    freshell_runtime_protocol::MAX_NATIVE_HISTORY_FRAME_BYTES,
+                )
+                .await
+            });
+            let id = IncarnationId::parse("large-incarnation").unwrap();
+            let command = if snapshot_read {
+                HostCommand::FreshAgentReadSnapshot { incarnation_id: id }
+            } else {
+                HostCommand::Status { incarnation_id: id }
+            };
+            let reply = request_host_reply(
+                &socket,
+                &Envelope::new(RequestId::new(), ControlRole::Supervisor, command),
+                Duration::from_secs(10),
+            )
+            .await;
+            let _ = server.await.unwrap();
+            if snapshot_read {
+                assert!(
+                    matches!(reply.unwrap().result.unwrap(), freshell_runtime_protocol::HostResult::FreshAgentSnapshot(value) if value == expected)
+                );
+            } else {
+                assert_eq!(reply.unwrap_err().code, RuntimeErrorCode::HostUnreachable);
+            }
+        }
+    }
 
     /// A session host that accepts the connection and then never answers must
     /// NOT be able to hold the supervisor's authoritative stop hostage. The

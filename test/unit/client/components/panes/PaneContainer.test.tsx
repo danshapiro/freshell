@@ -46,6 +46,8 @@ const {
   mockApiGet,
   mockApiPost,
   mockApiPatch,
+  mockManagedVisibility,
+  mockManagedSoul,
   saveServerSettingsPatchSpy,
   cancelCreateSpy,
   cancelWsCreateSpy,
@@ -64,6 +66,8 @@ const {
   mockApiGet: vi.fn(),
   mockApiPost: vi.fn(),
   mockApiPatch: vi.fn(),
+  mockManagedVisibility: vi.fn(),
+  mockManagedSoul: vi.fn(),
   saveServerSettingsPatchSpy: vi.fn((patch: unknown) => ({
     type: 'settings/saveServerSettingsPatch',
     payload: patch,
@@ -141,6 +145,8 @@ vi.mock('@/lib/ws-client', () => ({
 }))
 
 vi.mock('@/lib/api', () => ({
+  updateManagedRuntimeViewVisibility: mockManagedVisibility,
+  getManagedRuntimeSoul: mockManagedSoul,
   api: {
     get: (path: string, options?: unknown) => options === undefined ? mockApiGet(path) : mockApiGet(path, options),
     post: (path: string, body: unknown) => mockApiPost(path, body),
@@ -469,6 +475,8 @@ describe('PaneContainer', () => {
     mockApiGet.mockReset()
     mockApiPost.mockReset()
     mockApiPatch.mockReset()
+    mockManagedVisibility.mockReset()
+    mockManagedSoul.mockReset()
     saveServerSettingsPatchSpy.mockClear()
     cancelCreateSpy.mockClear()
     cancelWsCreateSpy.mockClear()
@@ -489,6 +497,40 @@ describe('PaneContainer', () => {
   })
 
   describe('terminal cleanup on pane close', () => {
+    it('closes a managed Fresh Agent after kill hides its view before inventory reaches the browser', async () => {
+      const node: PaneNode = {
+        type: 'leaf', id: 'pane-managed-close',
+        content: {
+          kind: 'fresh-agent', provider: 'codex', sessionType: 'freshcodex',
+          createRequestId: 'managed-close-create', sessionId: 'managed-close-thread', status: 'connected',
+          soulId: 'managed-close-soul', viewIntentId: 'managed-close-view',
+          viewIntentRevision: 2, soulIntentRevision: 7,
+        },
+      }
+      const store = createStore({ layouts: { 'tab-1': node }, activePane: { 'tab-1': node.id } })
+      let stopped = false
+      mockManagedVisibility.mockImplementation(async (viewId, visibility, revision, soulRevision) => {
+        expect(stopped).toBe(true)
+        expect([viewId, visibility, revision, soulRevision]).toEqual(['managed-close-view', 'detached', 2, 7])
+        // The real supervisor contract verifies that the hidden, verified
+        // stopped view satisfies this stale detach without a new mutation.
+        return { viewId, soulId: 'managed-close-soul', visibility: 'hidden', revision: 3, soulIntentRevision: 8 }
+      })
+      renderWithStore(<PaneContainer tabId="tab-1" node={node} />, store)
+      fireEvent.click(screen.getByRole('button', { name: /close pane/i }))
+      expect(mockSend).toHaveBeenCalledWith(expect.objectContaining({ type: 'freshAgent.kill', sessionId: 'managed-close-thread' }))
+      expect(mockManagedVisibility).not.toHaveBeenCalled()
+      stopped = true
+      await act(async () => ackFreshAgentKillsMocked())
+      await waitFor(() => expect(mockSend).toHaveBeenCalledWith(expect.objectContaining({ type: 'panes.closed' })))
+      expect(store.getState().panes.layouts['tab-1']).toEqual(node)
+      await act(async () => ackPanesClosedBatchesMocked())
+      await waitFor(() => expect(store.getState().tabs.tabs).toEqual([]))
+      expect(store.getState().panes.layouts['tab-1']).toBeUndefined()
+      expect(mockManagedVisibility).toHaveBeenCalledTimes(1)
+      expect(mockSend.mock.calls.some(([msg]) => msg.type === 'freshAgent.create')).toBe(false)
+    })
+
     it('closing a pane sends the plain identity-driven detach AND the pane-close evidence keyed by the pane\'s createRequestId (delta-round-7 F2 / delta-r7-r2 F2)', async () => {
       const pane1Id = 'pane-1'
       const pane2Id = 'pane-2'

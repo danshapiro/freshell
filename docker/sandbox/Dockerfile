@@ -28,6 +28,9 @@ ENV DEBIAN_FRONTEND=noninteractive \
 # plus git/curl for rustup and cargo's own network operations. gosu drops
 # root privileges cleanly (true exec, unlike su) once the entrypoint has
 # fixed up ownership of freshly-created named volumes (see entrypoint.sh).
+# DBus supports desktop integration; freshell-tauri's Linux webview and
+# default tray feature need GTK3, WebKit2GTK 4.1 (including libsoup3), and
+# Ayatana AppIndicator headers/link libraries for full-workspace tests.
 RUN apt-get update && apt-get install -y --no-install-recommends \
       build-essential \
       cmake \
@@ -35,6 +38,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       libclang-dev \
       pkg-config \
       libssl-dev \
+      libdbus-1-dev \
+      libgtk-3-dev \
+      libwebkit2gtk-4.1-dev \
+      libayatana-appindicator3-dev \
       perl \
       git \
       curl \

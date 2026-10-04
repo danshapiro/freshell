@@ -2,7 +2,7 @@ import { configureStore } from '@reduxjs/toolkit'
 import { describe, expect, it } from 'vitest'
 import tabsReducer, { addTab, setActiveTab, updateTab } from '@/store/tabsSlice'
 import { handleUiCommand } from '@/lib/ui-commands'
-import panesReducer from '@/store/panesSlice'
+import panesReducer, { startNewManagedRuntimeConversation, updatePaneContent } from '@/store/panesSlice'
 import managedRuntimeReducer from '@/store/managedRuntimeSlice'
 import {
   applyManagedRuntimeMergePlan,
@@ -331,6 +331,191 @@ describe('managed runtime recovery merge', () => {
     })
   })
 
+  it('binds the newly launched Fresh Agent after start-new before native identity arrives', () => {
+    const state = baseState()
+    state.tabs.tabs[0].mode = 'freshcodex'
+    state.panes.layouts['user-tab'].content = {
+      kind: 'fresh-agent', createRequestId: 'old-create', status: 'error',
+      sessionType: 'freshcodex', provider: 'codex', sessionId: 'old-native',
+      sessionRef: { provider: 'codex', sessionId: 'old-native' },
+      soulId: 'old-soul', viewIntentId: 'old-view',
+    }
+    const store = storeWithState(state)
+    store.dispatch(startNewManagedRuntimeConversation({ tabId: 'user-tab', paneId: 'user-pane' }))
+    const restarted = store.getState().panes.layouts['user-tab'].content
+    store.dispatch(updatePaneContent({ tabId: 'user-tab', paneId: 'user-pane', content: {
+      ...restarted, sessionId: 'fresh-runtime-id', status: 'connected',
+    } }))
+    const inventory = snapshot([soul({
+      provider: 'codex', nativeSessionId: undefined, freshAgentSessionId: 'fresh-runtime-id',
+      freshAgentSessionType: 'freshcodex', terminalId: undefined,
+      terminalCreateRequestId: undefined, terminalMode: undefined,
+    })])
+    const plan = buildManagedRuntimeMergePlan(inventory, store.getState() as any)
+    expect(plan.creates).toHaveLength(0)
+    expect(plan.updates).toHaveLength(1)
+    applyManagedRuntimeMergePlan(store as any, plan)
+    expect(store.getState().tabs.tabs).toHaveLength(1)
+    expect(store.getState().panes.layouts['user-tab'].content).toMatchObject({
+      kind: 'fresh-agent', createRequestId: restarted.createRequestId,
+      sessionId: 'fresh-runtime-id', soulId: 'soul-one', viewIntentId: 'view-one',
+    })
+    expect(store.getState().panes.layouts['user-tab'].content.sessionRef).toBeUndefined()
+  })
+
+  it.each(['freshclaude', 'kilroy', 'freshcodex', 'freshopencode'] as const)('adopts native-free %s through its runtime session identity', (sessionType) => {
+    const provider = sessionType === 'freshcodex' ? 'codex' : sessionType === 'freshopencode' ? 'opencode' : 'claude'
+    const state = baseState()
+    state.panes.layouts['user-tab'].content = {
+      kind: 'fresh-agent', createRequestId: 'pending-create', status: 'connected',
+      sessionType, provider, sessionId: 'runtime-pending',
+    }
+    const plan = buildManagedRuntimeMergePlan(snapshot([soul({
+      provider: sessionType === 'kilroy' ? 'kilroy' : provider,
+      nativeSessionId: undefined, terminalId: undefined, terminalCreateRequestId: undefined,
+      freshAgentSessionId: 'runtime-pending', freshAgentSessionType: sessionType,
+    })]), state)
+    expect(plan.creates).toHaveLength(0)
+    expect(plan.updates[0].content).toMatchObject({ kind: 'fresh-agent', provider, sessionType, sessionId: 'runtime-pending', soulId: 'soul-one' })
+    expect(plan.updates[0].content.sessionRef).toBeUndefined()
+  })
+
+  it('preserves the public Claude identity when a Kilroy native session becomes available', () => {
+    const state = baseState()
+    const nativeSessionId = 'd4430000-0000-4444-8444-000000000093'
+    state.panes.layouts['user-tab'].content = { kind: 'fresh-agent', createRequestId: 'kilroy-create', status: 'connected',
+      sessionType: 'kilroy', provider: 'claude', sessionId: 'kilroy-runtime',
+    }
+    const plan = buildManagedRuntimeMergePlan(snapshot([soul({
+      provider: 'kilroy', nativeSessionId, terminalId: undefined, terminalCreateRequestId: undefined,
+      freshAgentSessionId: 'kilroy-runtime', freshAgentSessionType: 'kilroy',
+    })]), state)
+    expect(plan.creates).toHaveLength(0)
+    expect(plan.updates[0].content).toMatchObject({ kind: 'fresh-agent', provider: 'claude', sessionType: 'kilroy',
+      sessionId: nativeSessionId, sessionRef: { provider: 'claude', sessionId: nativeSessionId },
+    })
+    applyManagedRuntimeMergePlan(storeWithState(state) as any, plan)
+  })
+
+  it.each(['provider', 'sessionType', 'createRequestId'] as const)('never binds a pending Fresh launch with mismatched %s', (mismatch) => {
+    const state = baseState()
+    state.panes.layouts['user-tab'].content = { kind: 'fresh-agent', createRequestId: 'pending-create', status: 'creating',
+      sessionType: 'freshcodex', provider: 'codex',
+    }
+    const plan = buildManagedRuntimeMergePlan(snapshot([soul({
+      provider: mismatch === 'provider' ? 'opencode' : 'codex', nativeSessionId: undefined,
+      terminalId: undefined, terminalCreateRequestId: undefined, freshAgentSessionId: 'runtime-pending',
+      freshAgentSessionType: mismatch === 'sessionType' ? 'freshopencode' : 'freshcodex',
+      freshAgentCreateRequestId: mismatch === 'createRequestId' ? 'different-create' : 'pending-create',
+    })]), state)
+    expect(plan.updates).toHaveLength(0)
+    expect(plan.creates).toHaveLength(1)
+  })
+
+  it.each(['create', 'view'] as const)('prefers the originating Fresh %s identity over an earlier pane sharing its session', (identity) => {
+    const state = baseState()
+    const content = { kind: 'fresh-agent', status: 'connected', sessionType: 'freshcodex', provider: 'codex', sessionId: 'shared-runtime' }
+    state.panes.layouts['user-tab'] = { type: 'split', id: 'split-root', direction: 'horizontal', sizes: [50, 50], children: [
+      { type: 'leaf', id: 'other-pane', content: { ...content, createRequestId: 'other-create' } },
+      { type: 'leaf', id: 'origin-pane', content: { ...content, createRequestId: 'origin-create',
+        ...(identity === 'view' ? { viewIntentId: 'view-one' } : {}) } },
+    ] }
+    const inventory = snapshot([soul({ provider: 'codex', nativeSessionId: undefined, terminalId: undefined,
+      terminalCreateRequestId: undefined, freshAgentSessionId: 'shared-runtime', freshAgentSessionType: 'freshcodex',
+      freshAgentCreateRequestId: identity === 'create' ? 'origin-create' : 'other-create',
+      recoveryState: 'lost', desiredState: 'stopped', recoveryReason: 'provider_state_missing',
+    })])
+    const store = storeWithState(state)
+    const plan = buildManagedRuntimeMergePlan(inventory, store.getState() as any)
+    expect(plan.creates).toHaveLength(0)
+    expect(plan.updates.map((update) => update.paneId)).toEqual(['origin-pane'])
+    applyManagedRuntimeMergePlan(store as any, plan)
+    const panes = store.getState().panes.layouts['user-tab'].children
+    expect(panes[0].content.recoverySummary).toBeUndefined()
+    expect(panes[1].content).toMatchObject({ createRequestId: 'origin-create', viewIntentId: 'view-one',
+      recoverySummary: { recoveryState: 'lost', desiredState: 'stopped' } })
+  })
+
+  it.each([true, false])('preserves an explicit Fresh view sharing the automatic view creation seed (origin present: %s)', (originPresent) => {
+    const state = baseState()
+    const content = { kind: 'fresh-agent', createRequestId: 'source-create', status: 'connected',
+      sessionType: 'freshcodex', provider: 'codex', sessionId: 'shared-runtime', soulId: 'soul-one' }
+    const explicitPane = { type: 'leaf', id: 'explicit-pane', content: { ...content, viewIntentId: 'z-explicit' } }
+    state.panes.layouts['user-tab'] = originPresent
+      ? { type: 'split', id: 'split-root', direction: 'horizontal', sizes: [50, 50], children: [explicitPane,
+        { type: 'leaf', id: 'origin-pane', content: { ...content, createRequestId: 'reminted-create', viewIntentId: 'a-automatic' } }] }
+      : explicitPane
+    const inventory = snapshot([soul({ provider: 'codex', nativeSessionId: undefined, terminalId: undefined,
+      terminalCreateRequestId: undefined, freshAgentSessionId: 'shared-runtime', freshAgentSessionType: 'freshcodex',
+      freshAgentCreateRequestId: 'source-create',
+    })], [view({ viewId: 'a-automatic' }), view({ viewId: 'z-explicit', kind: 'explicit' })])
+    const plan = buildManagedRuntimeMergePlan(inventory, state)
+    expect(plan.updates.find((update) => update.content.viewIntentId === 'z-explicit')?.paneId).toBe('explicit-pane')
+    if (originPresent) {
+      expect(plan.creates).toHaveLength(0)
+      expect(plan.updates.find((update) => update.content.viewIntentId === 'a-automatic')?.paneId).toBe('origin-pane')
+    } else {
+      expect(plan.updates).toHaveLength(1)
+      expect(plan.creates.map((create) => create.content.viewIntentId)).toEqual(['a-automatic'])
+    }
+    const store = storeWithState(state)
+    applyManagedRuntimeMergePlan(store as any, plan)
+    expect(buildManagedRuntimeMergePlan(inventory, store.getState() as any).creates).toHaveLength(0)
+  })
+
+  it('adopts a restored Fresh pane through native identity when its local create key was reminted', () => {
+    const state = baseState()
+    state.panes.layouts['user-tab'].content = { kind: 'fresh-agent', createRequestId: 'restored-local-create',
+      status: 'connected', sessionType: 'freshcodex', provider: 'codex', sessionId: 'native-one',
+      sessionRef: { provider: 'codex', sessionId: 'native-one' } }
+    const plan = buildManagedRuntimeMergePlan(snapshot([soul({ provider: 'codex', nativeSessionId: 'native-one',
+      terminalId: undefined, terminalCreateRequestId: undefined, freshAgentSessionId: 'runtime-one',
+      freshAgentSessionType: 'freshcodex', freshAgentCreateRequestId: 'original-server-create',
+    })]), state)
+    expect(plan.creates).toHaveLength(0)
+    expect(plan.updates[0]).toMatchObject({ paneId: 'user-pane', content: { kind: 'fresh-agent',
+      createRequestId: 'restored-local-create', viewIntentId: 'view-one' } })
+  })
+
+  it.each(['ack-first', 'inventory-first'] as const)('correlates concurrent Fresh launches with %s delivery and still restores unrelated cold views', (order) => {
+    const state = baseState()
+    state.panes.layouts['user-tab'] = { type: 'split', id: 'split-root', direction: 'horizontal', sizes: [50, 50], children: [
+      { type: 'leaf', id: 'first-pane', content: { kind: 'fresh-agent', createRequestId: 'first-create', status: 'creating', sessionType: 'freshcodex', provider: 'codex' } },
+      { type: 'leaf', id: 'second-pane', content: { kind: 'fresh-agent', createRequestId: 'second-create', status: 'creating', sessionType: 'freshcodex', provider: 'codex' } },
+    ] }
+    const store = storeWithState(state)
+    const inventory = snapshot(['second', 'first', 'cold'].map((key) => soul({
+      soulId: `${key}-soul`, provider: 'codex', nativeSessionId: undefined,
+      terminalId: undefined, terminalCreateRequestId: undefined,
+      freshAgentCreateRequestId: `${key}-create`, freshAgentSessionId: `${key}-runtime`, freshAgentSessionType: 'freshcodex',
+    })), ['second', 'first', 'cold'].map((key) => view({
+      viewId: `${key}-view`, soulId: `${key}-soul`, preferredTabId: 'user-tab', preferredPaneId: `${key}-preferred-pane`,
+    })))
+    const acknowledge = () => {
+      for (const key of ['first', 'second']) {
+        const root = store.getState().panes.layouts['user-tab']
+        const leaf = root.children.find((node: any) => node.id === `${key}-pane`)
+        store.dispatch(updatePaneContent({ tabId: 'user-tab', paneId: `${key}-pane`, content: {
+          ...leaf.content, sessionId: `${key}-runtime`, status: 'connected',
+        } }))
+      }
+    }
+    if (order === 'ack-first') acknowledge()
+    const plan = buildManagedRuntimeMergePlan(inventory, store.getState() as any)
+    expect(plan.updates.map((update) => update.paneId).sort()).toEqual(['first-pane', 'second-pane'])
+    expect(plan.creates).toHaveLength(1)
+    expect(plan.creates[0].content.soulId).toBe('cold-soul')
+    applyManagedRuntimeMergePlan(store as any, plan)
+    if (order === 'inventory-first') acknowledge()
+    const root = store.getState().panes.layouts['user-tab']
+    for (const key of ['first', 'second']) expect(root.children.find((node: any) => node.id === `${key}-pane`).content).toMatchObject({
+      kind: 'fresh-agent', createRequestId: `${key}-create`, sessionId: `${key}-runtime`, soulId: `${key}-soul`, viewIntentId: `${key}-view`,
+    })
+    expect(store.getState().tabs.tabs).toHaveLength(2)
+    const replay = buildManagedRuntimeMergePlan(inventory, store.getState() as any)
+    expect(replay.creates).toHaveLength(0)
+  })
+
   it('does not adopt an unrelated pane that merely lacks a terminal id', () => {
     const state = baseState()
     state.panes.layouts['user-tab'].content = {
@@ -438,5 +623,169 @@ describe('managed runtime recovery merge', () => {
         reason: 'CREDENTIALS_EXPIRED',
       },
     })
+  })
+
+  it('updates an already represented stopped/lost terminal in place without creating a replacement', () => {
+    const state = baseState()
+    state.tabs.tabs[0].mode = 'opencode'
+    state.panes.layouts['user-tab'].content = {
+      kind: 'terminal',
+      createRequestId: 'create-one',
+      terminalId: 'terminal-one',
+      streamId: 'stream-one',
+      status: 'exited',
+      mode: 'opencode',
+      shell: 'system',
+      sessionRef: { provider: 'opencode', sessionId: 'ses_one' },
+      soulId: 'soul-one',
+      viewIntentId: 'view-one',
+    }
+    const lost = soul({
+      launchState: 'stopped',
+      desiredState: 'stopped',
+      recoveryState: 'lost',
+      recoveryReason: 'provider_state_missing',
+      terminalId: undefined,
+      terminalStreamId: undefined,
+      terminalCreateRequestId: undefined,
+    })
+
+    const plan = buildManagedRuntimeMergePlan(snapshot([lost]), state)
+
+    expect(plan.creates).toHaveLength(0)
+    expect(plan.updates).toHaveLength(1)
+    expect(plan.updates[0]).toMatchObject({ tabId: 'user-tab', paneId: 'user-pane' })
+    expect(plan.updates[0].content).toMatchObject({
+      kind: 'terminal',
+      soulId: 'soul-one',
+      viewIntentId: 'view-one',
+      recoverySummary: { desiredState: 'stopped', recoveryState: 'lost' },
+    })
+  })
+
+  it('updates an already represented stopped/lost Fresh Agent in place', () => {
+    const state = baseState()
+    state.tabs.tabs[0].mode = 'freshopencode'
+    state.panes.layouts['user-tab'].content = {
+      kind: 'fresh-agent',
+      createRequestId: 'fresh-create-one',
+      status: 'exited',
+      sessionType: 'freshopencode',
+      provider: 'opencode',
+      sessionId: 'ses_one',
+      resumeSessionId: 'ses_one',
+      sessionRef: { provider: 'opencode', sessionId: 'ses_one' },
+      soulId: 'soul-one',
+      viewIntentId: 'view-one',
+      incarnationId: 'incarnation-one',
+    }
+    const lost = soul({
+      launchState: 'stopped',
+      desiredState: 'stopped',
+      recoveryState: 'lost',
+      terminalId: undefined,
+      terminalStreamId: undefined,
+      terminalMode: undefined,
+      terminalCwd: undefined,
+      terminalCreateRequestId: undefined,
+    })
+
+    const plan = buildManagedRuntimeMergePlan(snapshot([lost]), state)
+
+    expect(plan.creates).toHaveLength(0)
+    expect(plan.updates).toHaveLength(1)
+    expect(plan.updates[0].content).toMatchObject({
+      kind: 'fresh-agent',
+      soulId: 'soul-one',
+      viewIntentId: 'view-one',
+      sessionRef: { provider: 'opencode', sessionId: 'ses_one' },
+      recoverySummary: { desiredState: 'stopped', recoveryState: 'lost' },
+    })
+  })
+
+  it('never creates a pane for an absent stopped/lost view', () => {
+    const lost = soul({
+      launchState: 'stopped',
+      desiredState: 'stopped',
+      recoveryState: 'lost',
+      terminalId: undefined,
+      terminalStreamId: undefined,
+      terminalCreateRequestId: undefined,
+    })
+    const plan = buildManagedRuntimeMergePlan(snapshot([lost]), baseState())
+
+    expect(plan.creates).toHaveLength(0)
+    expect(plan.updates).toHaveLength(0)
+  })
+
+  it('clears a lost managed terminal before an old inventory snapshot can reattach it', () => {
+    const state = baseState()
+    state.tabs.tabs[0].mode = 'opencode'
+    state.panes.layouts['user-tab'].content = {
+      kind: 'terminal',
+      createRequestId: 'old-create',
+      terminalId: 'terminal-one',
+      streamId: 'stream-one',
+      status: 'error',
+      mode: 'opencode',
+      shell: 'system',
+      namingHandle: 'old-managed-name-handle',
+      nameRef: { kind: 'pending', id: 'old-managed-name-handle' },
+      soulId: 'soul-one',
+      incarnationId: 'incarnation-one',
+      viewIntentId: 'view-one',
+      viewIntentRevision: 2,
+      soulIntentRevision: 3,
+      incidentId: 'incident-one',
+      placementGroup: 'Recovered agents',
+      resourceSummary: {
+        configured: soul().configuredLimits,
+        effective: soul().effectiveLimits,
+      },
+      recoverySummary: {
+        desiredState: 'stopped',
+        recoveryState: 'lost',
+        reason: 'provider_state_missing',
+        durabilityState: 'resume_captured',
+        allocationState: 'verified_durable',
+      },
+    }
+    const store = storeWithState(state)
+    const oldCreateRequestId = store.getState().panes.layouts['user-tab'].type === 'leaf'
+      ? store.getState().panes.layouts['user-tab'].content.createRequestId
+      : undefined
+
+    store.dispatch(startNewManagedRuntimeConversation({ tabId: 'user-tab', paneId: 'user-pane' }))
+
+    const content = store.getState().panes.layouts['user-tab']
+    if (content.type !== 'leaf' || content.content.kind !== 'terminal') {
+      throw new Error('expected a terminal pane after starting a new conversation')
+    }
+    expect(content.content.createRequestId).not.toBe(oldCreateRequestId)
+    expect(content.content.status).toBe('creating')
+    expect(content.content.terminalId).toBeUndefined()
+    expect(content.content.namingHandle).toBeUndefined()
+    expect(content.content.nameRef).toBeUndefined()
+    expect(content.content.soulId).toBeUndefined()
+    expect(content.content.incarnationId).toBeUndefined()
+    expect(content.content.viewIntentId).toBeUndefined()
+    expect(content.content.viewIntentRevision).toBeUndefined()
+    expect(content.content.soulIntentRevision).toBeUndefined()
+    expect(content.content.incidentId).toBeUndefined()
+    expect(content.content.placementGroup).toBeUndefined()
+    expect(content.content.resourceSummary).toBeUndefined()
+    expect(content.content.recoverySummary).toBeUndefined()
+
+    const oldInventoryPlan = buildManagedRuntimeMergePlan(
+      snapshot([soul({
+        desiredState: 'stopped',
+        launchState: 'stopped',
+        recoveryState: 'lost',
+        recoveryReason: 'provider_state_missing',
+      })]),
+      store.getState() as any,
+    )
+    expect(oldInventoryPlan.creates).toHaveLength(0)
+    expect(oldInventoryPlan.updates).toHaveLength(0)
   })
 })

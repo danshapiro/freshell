@@ -28,8 +28,9 @@
 //!
 //! All three providers are served: **freshcodex/codex** asks its live runtime
 //! slice — SIDE-EFFECT-FREE (kata b8ke Task 5): a thread this process tracks
-//! serves from the live runtime, an untracked one answers the EMPTY snapshot
-//! (with the additive owner-state fields), and a session another runtime owns
+//! serves from the live runtime, an untracked one reads its exact saved rollout
+//! (or an empty snapshot when absent, with the additive owner-state fields), and
+//! a session another runtime owns
 //! or a transition holds answers the typed 409 envelope — never a spawn or a
 //! resume; **freshopencode/opencode** (b8ke delta review F4) is the same
 //! side-effect-free contract against the shared `opencode serve` daemon: the
@@ -93,6 +94,92 @@ impl SnapshotState {
             claude,
         }
     }
+    async fn local_owner(
+        &self,
+        session_type: &str,
+        provider: &str,
+        native_id: &str,
+    ) -> Option<freshell_ownership::OwnershipSnapshot> {
+        match (session_type, provider) {
+            ("freshcodex", "codex") => self.codex.local_snapshot_owner(native_id).await,
+            ("freshclaude" | "kilroy", "claude") => {
+                self.claude.local_snapshot_owner(native_id).await
+            }
+            ("freshopencode", "opencode") => self.opencode.local_snapshot_owner(native_id).await,
+            _ => None,
+        }
+    }
+
+    async fn exact_saved_history(
+        &self,
+        session_type: &str,
+        provider: &str,
+        native_id: &str,
+    ) -> Option<serde_json::Value> {
+        let snapshot = match (session_type, provider) {
+            ("freshcodex", "codex") => self
+                .codex
+                .exact_saved_snapshot(native_id)
+                .await
+                .ok()
+                .flatten()?,
+            ("freshclaude" | "kilroy", "claude") => {
+                let rollback = self.claude.load_rollback_record(native_id).await;
+                let saved = crate::claude_snapshot::get_claude_snapshot(
+                    session_type,
+                    native_id,
+                    rollback.as_ref(),
+                )
+                .await
+                .ok()?;
+                crate::native_history::readonly_snapshot(provider, saved).ok()?
+            }
+            ("freshopencode", "opencode") => {
+                let id = native_id.to_owned();
+                let path =
+                    freshell_sessions::parse::default_opencode_data_home().join("opencode.db");
+                tokio::task::spawn_blocking(move || {
+                    crate::native_history::read_opencode_path(&path, &id).and_then(|snapshot| {
+                        crate::native_history::readonly_snapshot("opencode", snapshot)
+                    })
+                })
+                .await
+                .ok()?
+                .ok()?
+            }
+            _ => return None,
+        };
+        (snapshot["threadId"].as_str() == Some(native_id)
+            && snapshot["provider"].as_str() == Some(provider)
+            && snapshot["sessionType"].as_str() == Some(session_type))
+        .then_some(snapshot)
+    }
+
+    async fn saved_history_or_unavailable(
+        &self,
+        session_type: &str,
+        provider: &str,
+        native_id: &str,
+    ) -> Response {
+        let saved = self
+            .exact_saved_history(session_type, provider, native_id)
+            .await;
+        tracing::debug!(
+            event = "fresh_agent.snapshot.saved_history_fallback",
+            session_type,
+            provider,
+            native_id,
+            available = saved.is_some(),
+            "Live snapshot unavailable; read exact saved history"
+        );
+        match saved {
+            Some(snapshot) => Json(snapshot).into_response(),
+            None => fail(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Managed conversation snapshot unavailable".into(),
+            ),
+        }
+    }
 }
 
 /// The pre-bound snapshot sub-router.
@@ -116,7 +203,40 @@ async fn get_snapshot(
     }
     let cwd = query.get("cwd").cloned();
 
-    match (session_type.as_str(), provider.as_str()) {
+    let local_owner = state
+        .local_owner(&session_type, &provider, &thread_id)
+        .await;
+    if local_owner.is_none()
+        && VALID_SESSION_TYPES.contains(&session_type.as_str())
+        && VALID_PROVIDERS.contains(&provider.as_str())
+    {
+        if let Some(gateway) = state.opencode.hosted_rest_gateway() {
+            match gateway
+                .snapshot(crate::hosted_rest::HostedRestSnapshot {
+                    session_id: thread_id.clone(),
+                    provider: provider.clone(),
+                    session_type: session_type.clone(),
+                })
+                .await
+            {
+                Ok(Some(snapshot)) => return Json(snapshot).into_response(),
+                Ok(None) => {}
+                Err(crate::hosted_rest::HostedRestSnapshotError::ManagedUnavailable) => {
+                    return fail(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "Managed conversation snapshot unavailable".into(),
+                    );
+                }
+                Err(crate::hosted_rest::HostedRestSnapshotError::OwnershipUnavailable) => {
+                    return state
+                        .saved_history_or_unavailable(&session_type, &provider, &thread_id)
+                        .await
+                }
+            }
+        }
+    }
+
+    let response = match (session_type.as_str(), provider.as_str()) {
         ("freshcodex", "codex") => match state.codex.get_snapshot(&thread_id, cwd.as_deref()).await
         {
             Ok(snapshot) => Json(snapshot).into_response(),
@@ -148,7 +268,9 @@ async fn get_snapshot(
                     CodexSnapshotError::HandoffInProgress { generation } => (None, *generation),
                     _ => unreachable!("the match above names only the typed refusals"),
                 };
-                snapshot_error_response(&thread_id, owner_kind, generation)
+                // The provider already refused this read using the current ownership fence.
+                // Preserve that refusal rather than replacing it with saved history below.
+                return snapshot_error_response(&thread_id, owner_kind, generation);
             }
             // Defensive depth: `get_snapshot` already folds this into its
             // `Ok` (the empty snapshot), so this arm is unreachable today —
@@ -190,7 +312,7 @@ async fn get_snapshot(
                         }
                         _ => unreachable!("the match above names only the typed refusals"),
                     };
-                    snapshot_error_response(&thread_id, owner_kind, generation)
+                    return snapshot_error_response(&thread_id, owner_kind, generation);
                 }
             }
         }
@@ -255,7 +377,21 @@ async fn get_snapshot(
                 "FRESH_AGENT_RUNTIME_UNAVAILABLE",
             )
         }
+    };
+    // A local read never publishes the authority of an owner that changed while it awaited the provider.
+    if let Some(before) = local_owner {
+        if state
+            .local_owner(&session_type, &provider, &thread_id)
+            .await
+            .as_ref()
+            != Some(&before)
+        {
+            return state
+                .saved_history_or_unavailable(&session_type, &provider, &thread_id)
+                .await;
+        }
     }
+    response
 }
 
 fn fail(status: StatusCode, message: String) -> Response {
@@ -368,6 +504,68 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert("x-auth-token", token.parse().unwrap());
         headers
+    }
+
+    struct SnapshotGateway;
+
+    #[async_trait::async_trait]
+    impl crate::hosted_rest::HostedFreshAgentRestGateway for SnapshotGateway {
+        async fn create_agent(
+            self: Arc<Self>,
+            _: crate::hosted_rest::HostedRestCreate,
+        ) -> Result<crate::hosted_rest::HostedRestCreated, ()> {
+            panic!("GET must not create")
+        }
+        async fn send_agent(
+            &self,
+            _: crate::hosted_rest::HostedRestSend,
+        ) -> Result<crate::hosted_rest::HostedRestSendResult, ()> {
+            panic!("GET must not send")
+        }
+        async fn snapshot(
+            &self,
+            request: crate::hosted_rest::HostedRestSnapshot,
+        ) -> Result<Option<serde_json::Value>, crate::hosted_rest::HostedRestSnapshotError>
+        {
+            if request.session_id == "unavailable-host" {
+                return Err(crate::hosted_rest::HostedRestSnapshotError::ManagedUnavailable);
+            }
+            Ok(Some(
+                json!({"threadId":request.session_id,"status":"running",
+                "provider":request.provider,"sessionType":request.session_type,
+                "turns":[{"turnId":"owned-live-turn"}]}),
+            ))
+        }
+    }
+
+    #[tokio::test]
+    async fn existing_snapshot_get_reads_hosted_truth_and_never_falls_back_on_host_failure() {
+        for (id, expected) in [
+            ("owned-host", StatusCode::OK),
+            ("unavailable-host", StatusCode::SERVICE_UNAVAILABLE),
+        ] {
+            let state = snapshot_state();
+            state
+                .opencode
+                .set_hosted_rest_gateway(Arc::new(SnapshotGateway))
+                .unwrap();
+            let response = get_snapshot(
+                State(state),
+                Path(("freshcodex".into(), "codex".into(), id.into())),
+                Query(HashMap::new()),
+                headers_with_token("tok"),
+            )
+            .await;
+            assert_eq!(response.status(), expected);
+            if expected == StatusCode::OK {
+                let body = axum::body::to_bytes(response.into_body(), 4096)
+                    .await
+                    .unwrap();
+                let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                assert_eq!(value["status"], "running");
+                assert_eq!(value["turns"][0]["turnId"], "owned-live-turn");
+            }
+        }
     }
 
     #[tokio::test]
@@ -879,6 +1077,175 @@ mod tests {
             body.get("code").is_none(),
             "a 200 snapshot body carries no error code: {body}"
         );
+    }
+
+    async fn codex_route_json(app: &Router, id: &str) -> (StatusCode, serde_json::Value) {
+        use axum::{body::Body, http::Request};
+        use tower::ServiceExt;
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/fresh-agent/threads/freshcodex/codex/{id}"))
+                    .header("x-auth-token", "tok")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (status, serde_json::from_slice(&bytes).unwrap())
+    }
+
+    #[tokio::test]
+    async fn untracked_codex_route_reads_exact_saved_rollout_without_starting_or_writing() {
+        let _guard = crate::codex::tests::ENV_LOCK.lock().await;
+        let home = tempfile::tempdir().unwrap();
+        let sessions = home.path().join("sessions/2026/03/01");
+        std::fs::create_dir_all(&sessions).unwrap();
+        let transcript = format!(
+            "{}{}\n",
+            include_str!("../../../test/fixtures/coding-cli/codex/task-events.sanitized.jsonl"),
+            include_str!("../../../test/fixtures/managed-native-history/codex-tools.jsonl")
+                .lines()
+                .skip(1)
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+        let rollout = sessions.join("rollout-session-activity.jsonl");
+        std::fs::write(&rollout, &transcript).unwrap();
+        // A filename containing a requested identity does not prove ownership.
+        std::fs::write(sessions.join("rollout-foreign-session.jsonl"), &transcript).unwrap();
+        let modified = std::fs::metadata(&rollout).unwrap().modified().unwrap();
+        let old_home = std::env::var_os("CODEX_HOME");
+        let old_cmd = std::env::var_os("CODEX_CMD");
+        std::env::set_var("CODEX_HOME", home.path());
+        std::env::set_var("CODEX_CMD", "/definitely/not/a/codex-binary");
+        let probe = tempfile::tempdir().unwrap();
+        let marker = probe.path().join("spawned");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let script = probe.path().join("codex-probe");
+            std::fs::write(
+                &script,
+                format!("#!/bin/sh\ntouch '{}'\nexit 0\n", marker.display()),
+            )
+            .unwrap();
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+            std::env::set_var("CODEX_CMD", script);
+        }
+        let ownership = Arc::new(freshell_ownership::RuntimeOwnershipRegistry::new());
+        let mut codex = codex_state();
+        codex.set_ownership(ownership.clone());
+        let app = router(SnapshotState::new(
+            Arc::new("tok".into()),
+            codex,
+            opencode_state(),
+            claude_state(),
+        ));
+        let mut results = Vec::new();
+        for id in ["session-activity", "foreign-session", "genuinely-absent"] {
+            results.push(codex_route_json(&app, id).await);
+        }
+        assert_eq!(
+            ownership.observe("codex", "session-activity").state,
+            freshell_ownership::OwnershipState::Vacant
+        );
+        let freshell_ownership::BeginOutcome::Granted { generation } = ownership.begin_start(
+            "codex",
+            "session-activity",
+            freshell_ownership::RuntimeOwnerKind::Terminal,
+            "read-test",
+            None,
+            "test",
+            1_000,
+        ) else {
+            panic!("test grants starting ownership")
+        };
+        let starting = codex_route_json(&app, "session-activity").await;
+        assert_eq!(
+            ownership.commit_live(
+                "codex",
+                "session-activity",
+                "read-test",
+                generation,
+                freshell_ownership::OwnerIdentity {
+                    kind: freshell_ownership::RuntimeOwnerKind::Terminal,
+                    terminal_id: Some("terminal-reader-test".into()),
+                    live_session_key: None,
+                    pid: None,
+                    ownership_id: None,
+                }
+            ),
+            freshell_ownership::CommitOutcome::Committed
+        );
+        let terminal_owned = codex_route_json(&app, "session-activity").await;
+        for (key, old) in [("CODEX_HOME", old_home), ("CODEX_CMD", old_cmd)] {
+            match old {
+                Some(value) => std::env::set_var(key, value),
+                None => std::env::remove_var(key),
+            }
+        }
+        let (status, snapshot) = &results[0];
+        assert_eq!(*status, StatusCode::OK, "{snapshot}");
+        let items: Vec<_> = snapshot["turns"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|turn| turn["items"].as_array().unwrap())
+            .collect();
+        assert!(
+            items.iter().any(|item| item["text"] == "Sanitized prompt"),
+            "{snapshot}"
+        );
+        assert!(items
+            .iter()
+            .any(|item| item["text"] == "Sanitized completion"));
+        assert!(items.iter().any(|item| item["kind"] == "dynamic_tool"
+            && item["contentItems"][0]["text"] == "Patch saved"));
+        assert!(items
+            .iter()
+            .any(|item| item["kind"] == "command" && item["output"] == "/workspace"));
+        assert!(items.iter().any(|item| item["kind"] == "mcp_tool"));
+        assert_eq!(
+            snapshot["extensions"]["codex"]["nativeHistoryAvailable"],
+            true
+        );
+        assert_eq!(snapshot["extensions"]["codex"]["ownerKind"], "vacant");
+        assert!(snapshot["extensions"]["codex"]["ownerEpoch"].is_number());
+        assert!(snapshot["capabilities"]
+            .as_object()
+            .unwrap()
+            .values()
+            .filter(|value| value.is_boolean())
+            .all(|value| value == false));
+        for (status, absent) in &results[1..] {
+            assert_eq!(*status, StatusCode::OK);
+            assert_eq!(
+                absent["turns"],
+                json!([]),
+                "must not select a foreign rollout"
+            );
+        }
+        assert_eq!(std::fs::read_to_string(&rollout).unwrap(), transcript);
+        assert_eq!(
+            std::fs::metadata(&rollout).unwrap().modified().unwrap(),
+            modified
+        );
+        assert_eq!(std::fs::read_dir(home.path()).unwrap().count(), 1);
+        assert!(!marker.exists(), "snapshot GET must not start the provider");
+        for (status, refusal) in [starting, terminal_owned] {
+            assert_eq!(status, StatusCode::CONFLICT);
+            assert_eq!(refusal["code"], "RESTORE_UNAVAILABLE");
+            assert!(
+                refusal.get("turns").is_none(),
+                "saved data cannot bypass ownership"
+            );
+        }
     }
 
     #[tokio::test]

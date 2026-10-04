@@ -237,6 +237,15 @@ pub trait FreshAgentTransport: Send + Sync {
     async fn capture(&self, _max_bytes: usize) -> Result<FreshAgentCapture, String> {
         Err("provider does not expose a hosted snapshot".into())
     }
+    async fn snapshot(&self) -> Result<Value, String> {
+        Err("provider does not expose a hosted snapshot".into())
+    }
+
+    /// A registered zero-turn identity is transport-owned, not a durable native identity.
+    /// Only transports that can prove their current local registration opt in.
+    async fn registered_snapshot_identity(&self) -> Option<String> {
+        None
+    }
     /// Whether this actor still owns a usable provider enclosure. Provider
     /// adapters may self-heal a child internally; they should report false
     /// only when no live owned session remains.
@@ -869,6 +878,64 @@ impl FreshAgentHostActor {
             .capture(max_bytes)
             .await
             .map_err(ActorError::Transport)
+    }
+
+    pub async fn snapshot(&self) -> Result<Value, ActorError> {
+        if !self.transport.is_live().await {
+            return Err(ActorError::Transport("provider is not live".into()));
+        }
+        let snapshot = self
+            .transport
+            .snapshot()
+            .await
+            .map_err(ActorError::Transport)?;
+        if !self.transport.is_live().await {
+            return Err(ActorError::Transport(
+                "provider exited during snapshot read".into(),
+            ));
+        }
+        let profile = self.profile().await;
+        let provider = if profile.provider == freshell_runtime_protocol::FreshProvider::Kilroy {
+            "claude"
+        } else {
+            profile.provider.as_str()
+        };
+        let session_type = match profile.provider {
+            FreshProvider::Claude => "freshclaude",
+            FreshProvider::Codex => "freshcodex",
+            FreshProvider::Opencode => "freshopencode",
+            FreshProvider::Kilroy => "kilroy",
+        };
+        let registered =
+            if profile.native_session_id.is_none() && profile.provider == FreshProvider::Opencode {
+                self.transport.registered_snapshot_identity().await
+            } else {
+                None
+            };
+        // Recheck after the registration read: materialization must win over a placeholder.
+        let profile = self.profile().await;
+        let expected = profile
+            .native_session_id
+            .as_deref()
+            .or(registered.as_deref());
+        if expected.is_none()
+            || snapshot["threadId"].as_str() != expected
+            || snapshot["provider"].as_str() != Some(provider)
+            || snapshot["sessionType"].as_str() != Some(session_type)
+        {
+            return Err(ActorError::NativeIdentityMismatch);
+        }
+        // Snapshots use the existing native-history reply allowance, including envelope overhead.
+        if serde_json::to_vec(&snapshot)
+            .map_err(|error| ActorError::Transport(error.to_string()))?
+            .len()
+            > freshell_runtime_protocol::MAX_NATIVE_HISTORY_FRAME_BYTES - 4096
+        {
+            return Err(ActorError::Transport(
+                "provider snapshot exceeds history reply frame limit".into(),
+            ));
+        }
+        Ok(snapshot)
     }
 
     pub async fn record_event(&self, event: AgentEvent) -> Result<u64, ActorError> {
