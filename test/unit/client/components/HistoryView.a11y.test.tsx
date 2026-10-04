@@ -5,6 +5,7 @@ import { configureStore } from '@reduxjs/toolkit'
 
 import HistoryView from '@/components/HistoryView'
 import sessionsReducer, { commitSessionWindowVisibleRefresh } from '@/store/sessionsSlice'
+import { queueActiveSessionWindowRefresh, _resetSessionWindowThunkState } from '@/store/sessionsThunks'
 import tabsReducer from '@/store/tabsSlice'
 import { fetchSidebarSessionsSnapshot } from '@/lib/api'
 
@@ -78,6 +79,9 @@ function createSidebarLoadedStore() {
 describe('HistoryView a11y', () => {
   beforeEach(() => {
     vi.restoreAllMocks()
+    vi.clearAllMocks()
+    _resetSessionWindowThunkState()
+    vi.mocked(fetchSidebarSessionsSnapshot).mockReset()
     vi.mocked(fetchSidebarSessionsSnapshot).mockResolvedValue({
       projects: [],
       totalSessions: 0,
@@ -88,6 +92,7 @@ describe('HistoryView a11y', () => {
   })
 
   afterEach(() => {
+    _resetSessionWindowThunkState()
     cleanup()
   })
 
@@ -338,5 +343,137 @@ describe('HistoryView a11y', () => {
 
     expect(screen.getByRole('button', { name: 'Open session Already loaded session' })).toBeInTheDocument()
     expect(fetchSidebarSessionsSnapshot).toHaveBeenCalledTimes(1)
+  })
+
+  it('refreshes Sidebar and History after invalidation when both windows are loaded', async () => {
+    const { project: staleProject, store } = createSidebarLoadedStore()
+    const freshProjects = [{
+      projectPath: '/sidebar/refreshed',
+      sessions: [{
+        provider: 'codex',
+        sessionId: 'refreshed-session',
+        projectPath: '/sidebar/refreshed',
+        lastActivityAt: 9_000,
+        title: 'Refreshed session',
+      }],
+    }]
+    vi.mocked(fetchSidebarSessionsSnapshot)
+      .mockResolvedValueOnce({
+        projects: [staleProject],
+        totalSessions: 1,
+        oldestIncludedTimestamp: staleProject.sessions[0].lastActivityAt,
+        oldestIncludedSessionId: 'codex:already-loaded-from-sidebar',
+        hasMore: false,
+      })
+      .mockResolvedValue({
+        projects: freshProjects,
+        totalSessions: 1,
+        oldestIncludedTimestamp: 9_000,
+        oldestIncludedSessionId: 'codex:refreshed-session',
+        hasMore: false,
+      })
+
+    render(
+      <Provider store={store}>
+        <HistoryView />
+      </Provider>,
+    )
+
+    await waitFor(() => {
+      expect(store.getState().sessions.activeSurface).toBe('history')
+      expect(store.getState().sessions.windows.history.lastLoadedAt).toEqual(expect.any(Number))
+    })
+
+    await act(async () => {
+      await store.dispatch(queueActiveSessionWindowRefresh() as any)
+    })
+
+    expect(store.getState().sessions.windows.sidebar.projects).toMatchObject(freshProjects)
+    expect(store.getState().sessions.windows.history.projects).toMatchObject(freshProjects)
+  })
+
+  it('retries the failed initial History load on the next session invalidation', async () => {
+    const freshProjects = [{
+      projectPath: '/history/recovered',
+      sessions: [{
+        provider: 'codex',
+        sessionId: 'recovered-session',
+        projectPath: '/history/recovered',
+        lastActivityAt: 10_000,
+        title: 'Recovered session',
+      }],
+    }]
+    vi.mocked(fetchSidebarSessionsSnapshot)
+      .mockRejectedValueOnce(new Error('History request failed'))
+      .mockResolvedValue({
+        projects: freshProjects,
+        totalSessions: 1,
+        oldestIncludedTimestamp: 10_000,
+        oldestIncludedSessionId: 'codex:recovered-session',
+        hasMore: false,
+      })
+    const { store } = createSidebarLoadedStore()
+
+    render(
+      <Provider store={store}>
+        <HistoryView />
+      </Provider>,
+    )
+
+    await waitFor(() => {
+      expect(store.getState().sessions.windows.history.error).toBe('History request failed')
+    })
+
+    await act(async () => {
+      await store.dispatch(queueActiveSessionWindowRefresh() as any)
+    })
+
+    expect(store.getState().sessions.windows.history.projects).toMatchObject(freshProjects)
+    expect(store.getState().sessions.windows.history.lastLoadedAt).toEqual(expect.any(Number))
+  })
+
+  it('retries a failed initial History load when the view is mounted again', async () => {
+    const freshProjects = [{
+      projectPath: '/history/retried',
+      sessions: [{
+        provider: 'codex',
+        sessionId: 'retried-session',
+        projectPath: '/history/retried',
+        lastActivityAt: 11_000,
+        title: 'Retried session',
+      }],
+    }]
+    vi.mocked(fetchSidebarSessionsSnapshot)
+      .mockRejectedValueOnce(new Error('History request failed'))
+      .mockResolvedValueOnce({
+        projects: freshProjects,
+        totalSessions: 1,
+        oldestIncludedTimestamp: 11_000,
+        oldestIncludedSessionId: 'codex:retried-session',
+        hasMore: false,
+      })
+    const { store } = createSidebarLoadedStore()
+
+    const firstRender = render(
+      <Provider store={store}>
+        <HistoryView />
+      </Provider>,
+    )
+
+    await waitFor(() => {
+      expect(store.getState().sessions.windows.history.error).toBe('History request failed')
+    })
+
+    firstRender.unmount()
+    render(
+      <Provider store={store}>
+        <HistoryView />
+      </Provider>,
+    )
+
+    await waitFor(() => {
+      expect(store.getState().sessions.windows.history.projects).toMatchObject(freshProjects)
+    })
+    expect(fetchSidebarSessionsSnapshot).toHaveBeenCalledTimes(2)
   })
 })

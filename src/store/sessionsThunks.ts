@@ -912,8 +912,23 @@ export function queueActiveSessionWindowRefresh() {
     const activeSurface = getState().sessions.activeSurface
     // Default to 'sidebar' if activeSurface hasn't been initialized yet —
     // sessions.changed can arrive before bootstrap sets the active surface.
-    const surface: SessionSurface = isSessionSurface(activeSurface) ? activeSurface : 'sidebar'
+    const active: SessionSurface = isSessionSurface(activeSurface) ? activeSurface : 'sidebar'
+    const windows = getState().sessions.windows
+    const surfaces = new Set<SessionSurface>([active])
+    // Sidebar remains visible alongside History. Keep every instantiated
+    // window current so changing surfaces never strands either one, and so an
+    // invalidation can retry a failed initial load that has no committed data.
+    if (windows?.sidebar) surfaces.add('sidebar')
+    if (windows?.history) surfaces.add('history')
 
+    await Promise.all(Array.from(surfaces, (surface) =>
+      dispatch(queueSessionWindowRefresh(surface) as any),
+    ))
+  }
+}
+
+function queueSessionWindowRefresh(surface: SessionSurface) {
+  return async (dispatch: AppDispatch, getState: () => RootState) => {
     const existing = invalidationRefreshState.get(surface)
     if (existing?.inFlight) {
       existing.queued = true
