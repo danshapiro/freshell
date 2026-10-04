@@ -240,6 +240,12 @@ pub trait FreshAgentTransport: Send + Sync {
     async fn snapshot(&self) -> Result<Value, String> {
         Err("provider does not expose a hosted snapshot".into())
     }
+
+    /// A registered zero-turn identity is transport-owned, not a durable native identity.
+    /// Only transports that can prove their current local registration opt in.
+    async fn registered_snapshot_identity(&self) -> Option<String> {
+        None
+    }
     /// Whether this actor still owns a usable provider enclosure. Provider
     /// adapters may self-heal a child internally; they should report false
     /// only when no live owned session remains.
@@ -894,9 +900,28 @@ impl FreshAgentHostActor {
         } else {
             profile.provider.as_str()
         };
-        if profile.native_session_id.is_none()
-            || snapshot["threadId"].as_str() != profile.native_session_id.as_deref()
+        let session_type = match profile.provider {
+            FreshProvider::Claude => "freshclaude",
+            FreshProvider::Codex => "freshcodex",
+            FreshProvider::Opencode => "freshopencode",
+            FreshProvider::Kilroy => "kilroy",
+        };
+        let registered =
+            if profile.native_session_id.is_none() && profile.provider == FreshProvider::Opencode {
+                self.transport.registered_snapshot_identity().await
+            } else {
+                None
+            };
+        // Recheck after the registration read: materialization must win over a placeholder.
+        let profile = self.profile().await;
+        let expected = profile
+            .native_session_id
+            .as_deref()
+            .or(registered.as_deref());
+        if expected.is_none()
+            || snapshot["threadId"].as_str() != expected
             || snapshot["provider"].as_str() != Some(provider)
+            || snapshot["sessionType"].as_str() != Some(session_type)
         {
             return Err(ActorError::NativeIdentityMismatch);
         }

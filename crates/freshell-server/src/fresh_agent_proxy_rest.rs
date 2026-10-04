@@ -7,13 +7,27 @@ impl HostedFreshAgentRestGateway for HostedFreshAgentProxy {
     async fn snapshot(
         &self,
         request: freshell_freshagent::hosted_rest::HostedRestSnapshot,
-    ) -> Result<Option<serde_json::Value>, ()> {
+    ) -> Result<Option<serde_json::Value>, freshell_freshagent::hosted_rest::HostedRestSnapshotError>
+    {
+        use freshell_freshagent::hosted_rest::HostedRestSnapshotError::{
+            ManagedUnavailable, OwnershipUnavailable,
+        };
         let (provider, session_type) =
-            rest_agent_identity(&request.provider, &request.session_type)?;
-        let runtime_provider = fresh_provider(&Some(provider), session_type).ok_or(())?;
-        // Read current inventory instead of the cached aliases: stopped and
-        // recovering hosted conversations must not fall back to a local slice.
-        let inventory = self.client.inventory().await.map_err(|_| ())?;
+            rest_agent_identity(&request.provider, &request.session_type)
+                .map_err(|_| OwnershipUnavailable)?;
+        let runtime_provider =
+            fresh_provider(&Some(provider), session_type).ok_or(OwnershipUnavailable)?;
+        let alias_key = (request.provider.clone(), request.session_id.clone());
+        let inventory = match self.client.inventory().await {
+            Ok(inventory) => inventory,
+            Err(_) => {
+                return Err(if self.aliases.lock().await.contains_key(&alias_key) {
+                    ManagedUnavailable
+                } else {
+                    OwnershipUnavailable
+                })
+            }
+        };
         let view = inventory.iter().rev().find(|view| {
             view.provider.as_deref() == Some(runtime_provider.as_str())
                 && (view.fresh_agent_session_id.as_deref() == Some(&request.session_id)
@@ -22,14 +36,83 @@ impl HostedFreshAgentRestGateway for HostedFreshAgentProxy {
         let Some(view) = view else {
             return Ok(None);
         };
-        let mut snapshot = self.client.fresh_agent_snapshot(view.soul_id.clone()).await.map_err(|error| {
-            tracing::warn!(soul_id = %view.soul_id, code = ?error.runtime_code(), "fresh_agent.hosted_snapshot_unavailable");
-        })?;
-        if snapshot["sessionType"].as_str() != Some(request.session_type.as_str())
-            || snapshot["provider"].as_str() != Some(request.provider.as_str())
-            || snapshot["threadId"].as_str() != view.native_session_id.as_deref()
+        self.aliases
+            .lock()
+            .await
+            .insert(alias_key, view.soul_id.clone());
+        let (mut snapshot, history_only) = match self
+            .client
+            .fresh_agent_snapshot(view.soul_id.clone())
+            .await
         {
-            return Err(());
+            Ok(snapshot) => (snapshot, false),
+            Err(error) => {
+                tracing::warn!(soul_id = %view.soul_id, code = ?error.runtime_code(), "fresh_agent.hosted_snapshot_unavailable");
+                (
+                    self.client
+                        .fresh_agent_history(view.soul_id.clone())
+                        .await
+                        .map_err(|_| ManagedUnavailable)?,
+                    true,
+                )
+            }
+        };
+        // A reply cannot cross a native identity, owner incarnation or source change.
+        let current = self
+            .client
+            .inventory()
+            .await
+            .map_err(|_| ManagedUnavailable)?;
+        let latest = current
+            .iter()
+            .rev()
+            .find(|row| row.soul_id == view.soul_id)
+            .ok_or(ManagedUnavailable)?;
+        if !same_snapshot_source(view, latest)
+            || snapshot["sessionType"].as_str() != Some(request.session_type.as_str())
+            || snapshot["provider"].as_str() != Some(request.provider.as_str())
+        {
+            return Err(ManagedUnavailable);
+        }
+        if let Some(native) = view.native_session_id.as_deref() {
+            if snapshot["threadId"].as_str() != Some(native) {
+                return Err(ManagedUnavailable);
+            }
+        } else {
+            // The actor has proven its exact local registration. Expose the existing
+            // gateway alias only while OpenCode still has an empty, live zero-turn session.
+            if history_only
+                || runtime_provider != FreshProvider::Opencode
+                || snapshot["turns"]
+                    .as_array()
+                    .is_none_or(|turns| !turns.is_empty())
+                || snapshot["extensions"]["opencode"]["statusFromLiveState"] != true
+                || snapshot["threadId"].as_str().is_none_or(str::is_empty)
+            {
+                return Err(ManagedUnavailable);
+            }
+            let public = view
+                .fresh_agent_session_id
+                .as_deref()
+                .ok_or(ManagedUnavailable)?;
+            snapshot["threadId"] = serde_json::json!(public);
+            snapshot["sessionId"] = serde_json::json!(public);
+        }
+        if history_only {
+            // Owned native history is display-only, regardless of adapter defaults.
+            snapshot["status"] = serde_json::json!("idle");
+            if let Some(capabilities) = snapshot["capabilities"].as_object_mut() {
+                for value in capabilities.values_mut() {
+                    if value.is_boolean() {
+                        *value = serde_json::json!(false);
+                    }
+                }
+            }
+            snapshot["extensions"][&request.provider]["ownerKind"] = serde_json::json!("vacant");
+            snapshot["extensions"][&request.provider]["nativeHistoryAvailable"] =
+                serde_json::json!(true);
+            snapshot["extensions"][&request.provider]["statusFromLiveState"] =
+                serde_json::json!(false);
         }
         freshell_agent_runtime::snapshot_projection::project_hosted_rest_snapshot(
             &mut snapshot,
@@ -135,6 +218,22 @@ impl HostedFreshAgentRestGateway for HostedFreshAgentProxy {
             truncated: capture.truncated,
         })
     }
+}
+
+fn same_snapshot_source(
+    before: &freshell_runtime_protocol::RuntimeView,
+    after: &freshell_runtime_protocol::RuntimeView,
+) -> bool {
+    before.incarnation_id == after.incarnation_id
+        && before.native_session_id == after.native_session_id
+        && before.provider == after.provider
+        && before.intent_revision == after.intent_revision
+        && before.host_boot_id == after.host_boot_id
+        && before.execution_generation == after.execution_generation
+        && before.fresh_agent_session_id == after.fresh_agent_session_id
+        && before.fresh_agent_session_type == after.fresh_agent_session_type
+        && before.recovery_state == after.recovery_state
+        && before.desired_state == after.desired_state
 }
 
 async fn wait_for_completion(

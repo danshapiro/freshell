@@ -902,6 +902,31 @@ impl FreshAgentTransport for HostedTransport {
         Ok(snapshot)
     }
 
+    async fn registered_snapshot_identity(&self) -> Option<String> {
+        if self.provider != FreshProvider::Opencode
+            || self.native_rx.lock().await.borrow().is_some()
+            || self
+                .profile
+                .lock()
+                .unwrap()
+                .as_ref()?
+                .native_session_id
+                .is_some()
+        {
+            return None;
+        }
+        let session_id = self.session_id.lock().await.clone()?;
+        let ProviderState::Opencode { runtime, .. } = &self.state else {
+            return None;
+        };
+        if !runtime.has_live_session(&session_id).await
+            || self.native_rx.lock().await.borrow().is_some()
+        {
+            return None;
+        }
+        Some(session_id)
+    }
+
     async fn is_live(&self) -> bool {
         #[cfg(test)]
         if let Some(delegate) = self.test_delegate.as_ref() {
@@ -1275,6 +1300,177 @@ fn parse_send_outcome(value: &Value) -> Option<(String, bool)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    static OPENCODE_SNAPSHOT_ENV_LOCK: Mutex<()> = Mutex::const_new(());
+
+    struct SnapshotProviderEnv(Vec<(&'static str, Option<std::ffi::OsString>)>);
+    impl Drop for SnapshotProviderEnv {
+        fn drop(&mut self) {
+            for (key, value) in &self.0 {
+                match value {
+                    Some(value) => std::env::set_var(key, value),
+                    None => std::env::remove_var(key),
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn actual_opencode_first_send_materializes_once_and_reuses_owned_native_http_session() {
+        let _lock = OPENCODE_SNAPSHOT_ENV_LOCK.lock().await;
+        let dir = tempfile::tempdir().unwrap();
+        let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../test/e2e-browser/fixtures/fake-opencode.cjs")
+            .canonicalize()
+            .unwrap();
+        let audit = dir.path().join("native-audit.jsonl");
+        let keys = [
+            "OPENCODE_CMD",
+            "HOME",
+            "XDG_DATA_HOME",
+            "FAKE_OPENCODE_AUDIT_LOG",
+        ];
+        let _env = SnapshotProviderEnv(
+            keys.iter()
+                .map(|key| (*key, std::env::var_os(key)))
+                .collect(),
+        );
+        std::env::set_var("OPENCODE_CMD", fixture);
+        std::env::set_var("HOME", dir.path());
+        std::env::set_var("XDG_DATA_HOME", dir.path().join("data"));
+        std::env::set_var("FAKE_OPENCODE_AUDIT_LOG", &audit);
+        let transport = HostedTransport::new_with_context(FreshProvider::Opencode, None).await;
+        let profile = FreshAgentProfile {
+            provider: FreshProvider::Opencode,
+            runtime_variant: "freshopencode".into(),
+            cwd: dir.path().to_string_lossy().into(),
+            model: None,
+            effort: None,
+            permission_mode: None,
+            sandbox: None,
+            provider_store_id: "owned-store".into(),
+            native_session_id: None,
+            plugins: None,
+            model_selection: None,
+            session_ref: None,
+            provider_launch_context: None,
+            provider_secret_references: vec![],
+        };
+        let actor = FreshAgentHostActor::open(dir.path().join("actor"), profile, transport.clone())
+            .await
+            .unwrap();
+        let registered = transport.session_id.lock().await.clone().unwrap();
+        let pre = actor.snapshot().await;
+        assert!(!audit.exists(), "snapshot must not spawn the native daemon");
+        let first = actor
+            .dispatch(
+                RequestId::parse("first-owned-send").unwrap(),
+                "First owned prompt".into(),
+                None,
+            )
+            .await;
+        let identity = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if let Some(native) = actor.profile().await.native_session_id {
+                    break native;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        let live = actor.snapshot().await;
+        let second = actor
+            .dispatch(
+                RequestId::parse("second-owned-send").unwrap(),
+                "Second owned prompt".into(),
+                None,
+            )
+            .await;
+        let observed_prompts = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let count = std::fs::read_to_string(&audit)
+                    .unwrap_or_default()
+                    .lines()
+                    .filter(|line| {
+                        serde_json::from_str::<Value>(line)
+                            .is_ok_and(|row| row["event"] == "prompt_async")
+                    })
+                    .count();
+                if count == 2 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await;
+        let final_native = actor.profile().await.native_session_id;
+        transport.stop().await.unwrap();
+        let rows: Vec<Value> = std::fs::read_to_string(&audit)
+            .unwrap_or_default()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(pre.unwrap()["threadId"], registered);
+        first.unwrap();
+        second.unwrap();
+        observed_prompts.unwrap();
+        let native = identity.unwrap();
+        assert_eq!(live.unwrap()["threadId"], native);
+        assert_eq!(final_native.as_deref(), Some(native.as_str()));
+        assert_eq!(
+            rows.iter()
+                .filter(|row| row["event"] == "session_created")
+                .count(),
+            1
+        );
+        assert_eq!(
+            rows.iter()
+                .filter(|row| row["event"] == "prompt_async" && row["sessionId"] == native)
+                .count(),
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn actual_opencode_zero_turn_snapshot_keeps_registered_identity_without_materializing() {
+        let dir = tempfile::tempdir().unwrap();
+        let transport = HostedTransport::new_with_context(FreshProvider::Opencode, None).await;
+        let profile = FreshAgentProfile {
+            provider: FreshProvider::Opencode,
+            runtime_variant: "freshopencode".into(),
+            cwd: dir.path().to_string_lossy().into(),
+            model: None,
+            effort: None,
+            permission_mode: None,
+            sandbox: None,
+            provider_store_id: "owned-store".into(),
+            native_session_id: None,
+            plugins: None,
+            model_selection: None,
+            session_ref: None,
+            provider_launch_context: None,
+            provider_secret_references: vec![],
+        };
+        let actor = FreshAgentHostActor::open(dir.path(), profile, transport.clone())
+            .await
+            .unwrap();
+        let registered = transport.session_id.lock().await.clone().unwrap();
+        let before = std::fs::read(dir.path().join("fresh-agent-state.json")).unwrap();
+        let result = actor.snapshot().await;
+        let after = std::fs::read(dir.path().join("fresh-agent-state.json")).unwrap();
+        let native = actor.profile().await.native_session_id;
+        transport.stop().await.unwrap();
+        let snapshot = result.expect("registered zero-turn OpenCode is live snapshot truth");
+        assert_eq!(snapshot["threadId"], registered);
+        assert_eq!(snapshot["sessionType"], "freshopencode");
+        assert_eq!(snapshot["provider"], "opencode");
+        assert_eq!(
+            snapshot["extensions"]["opencode"]["statusFromLiveState"],
+            true
+        );
+        assert!(native.is_none());
+        assert_eq!(after, before);
+    }
 
     #[derive(Debug, Clone, PartialEq, Eq)]
     struct TransportObservation {

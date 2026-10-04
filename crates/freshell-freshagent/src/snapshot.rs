@@ -221,7 +221,13 @@ async fn get_snapshot(
             {
                 Ok(Some(snapshot)) => return Json(snapshot).into_response(),
                 Ok(None) => {}
-                Err(()) => {
+                Err(crate::hosted_rest::HostedRestSnapshotError::ManagedUnavailable) => {
+                    return fail(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "Managed conversation snapshot unavailable".into(),
+                    );
+                }
+                Err(crate::hosted_rest::HostedRestSnapshotError::OwnershipUnavailable) => {
                     return state
                         .saved_history_or_unavailable(&session_type, &provider, &thread_id)
                         .await
@@ -517,9 +523,10 @@ mod tests {
         async fn snapshot(
             &self,
             request: crate::hosted_rest::HostedRestSnapshot,
-        ) -> Result<Option<serde_json::Value>, ()> {
+        ) -> Result<Option<serde_json::Value>, crate::hosted_rest::HostedRestSnapshotError>
+        {
             if request.session_id == "unavailable-host" {
-                return Err(());
+                return Err(crate::hosted_rest::HostedRestSnapshotError::ManagedUnavailable);
             }
             Ok(Some(
                 json!({"threadId":request.session_id,"status":"running",
