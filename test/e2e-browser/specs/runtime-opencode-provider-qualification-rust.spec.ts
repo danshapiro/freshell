@@ -233,6 +233,16 @@ async function waitForPaneIncarnation(
   }, timeoutMs)
 }
 
+async function paneStreamId(harness: TestHarness, tabId: string, paneId: string): Promise<string> {
+  return waitForValue(`pane ${paneId} stream ID`, async () => {
+    const leaf = leavesByMode(await harness.getPaneLayout(tabId), 'opencode')
+      .find((candidate) => candidate.id === paneId)
+    return typeof leaf?.content?.streamId === 'string' && leaf.content.streamId.length > 0
+      ? leaf.content.streamId
+      : null
+  }, 30_000)
+}
+
 async function waitForReplacementPrompt(
   page: Page,
   harness: TestHarness,
@@ -240,6 +250,7 @@ async function waitForReplacementPrompt(
   tabId: string,
   paneId: string,
   view: ManagedRuntimeView,
+  previousStreamId: string,
   observedStreamChanges: Array<{ terminalId: string; streamId: string; reason: string; attachRequestId: string | null }>,
   observedWebSocketFrameTypes: Set<string>,
   observedWebSocketCount: { value: number },
@@ -272,6 +283,7 @@ async function waitForReplacementPrompt(
         || typeof paneStreamId !== 'string'
         || paneStreamId.length === 0
         || paneStreamId === view.terminalStreamId
+        || paneStreamId === previousStreamId
       ) return null
 
       const rendered = await page.evaluate((id) => {
@@ -466,7 +478,7 @@ test.describe.serial('OpenCode provider qualification', () => {
       page.on('websocket', (socket) => {
         if (new URL(socket.url()).pathname !== '/ws') return
         observedWebSocketCount.value += 1
-        socket.on('framereceived', (payload) => {
+        socket.on('framereceived', ({ payload }) => {
           try {
             const message = JSON.parse(String(payload)) as Record<string, unknown>
             if (typeof message.type === 'string') observedWebSocketFrameTypes.add(message.type)
@@ -545,6 +557,7 @@ test.describe.serial('OpenCode provider qualification', () => {
 
       // Session-host/container loss: exact old enclosure must be empty before
       // the new incarnation becomes the sole writer.
+      const beforeHostCrashStreamId = await paneStreamId(harness, tabId, first.paneId)
       rig.runtime.killOwnedRuntimeExact(first.view.containerId)
       const afterHostCrash = await waitForRunningView(
         rig,
@@ -566,7 +579,7 @@ test.describe.serial('OpenCode provider qualification', () => {
         (await paneSessionId(harness, tabId, first.paneId)) === nativeSessionId ? true : null
       ), 120_000)
       await waitForReplacementPrompt(
-        page, harness, rig, tabId, first.paneId, afterHostCrash,
+        page, harness, rig, tabId, first.paneId, afterHostCrash, beforeHostCrashStreamId,
         observedStreamChanges, observedWebSocketFrameTypes, observedWebSocketCount,
       )
       const beforeRecall = new Set(nativeAssistantTurns(rig, afterHostCrash, nativeSessionId).map((turn) => turn.messageId))
@@ -580,6 +593,7 @@ test.describe.serial('OpenCode provider qualification', () => {
 
       // Provider-process loss: kill only the exact host-recorded worker PID,
       // then require another exact native resume and usable follow-up.
+      const beforeProviderCrashStreamId = await paneStreamId(harness, tabId, first.paneId)
       const hostStatePath = path.join(
         rig.runtime.runtimeDir(rig.supervisor, afterHostCrash.incarnationId),
         'host-state.json',
@@ -604,7 +618,7 @@ test.describe.serial('OpenCode provider qualification', () => {
         afterProviderCrash.incarnationId,
       )
       await waitForReplacementPrompt(
-        page, harness, rig, tabId, first.paneId, afterProviderCrash,
+        page, harness, rig, tabId, first.paneId, afterProviderCrash, beforeProviderCrashStreamId,
         observedStreamChanges, observedWebSocketFrameTypes, observedWebSocketCount,
       )
       const beforeProviderFollowup = new Set(nativeAssistantTurns(rig, afterProviderCrash, nativeSessionId).map((turn) => turn.messageId))
