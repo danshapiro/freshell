@@ -114,6 +114,7 @@ function createSourceFixture(root: string): {
     type: 'module',
     dependencies: {
       '@modelcontextprotocol/sdk': '1.30.0',
+      undici: '7.30.0',
       zod: '4.3.6',
     },
     files: ['generated'],
@@ -195,6 +196,7 @@ function mcpDeployFixture(destination: string, generatedSource: string): void {
     dependencies: {
       // pnpm's deploy annotates peer resolutions in the exported manifest.
       '@modelcontextprotocol/sdk': '1.30.0(zod@4.3.6)',
+      undici: '7.30.0',
       zod: '4.3.6',
     },
     files: ['generated'],
@@ -217,6 +219,10 @@ function mcpDeployFixture(destination: string, generatedSource: string): void {
   const zodDir = path.join(destination, 'node_modules', 'zod')
   mkdirSync(zodDir, { recursive: true })
   writeFileSync(path.join(zodDir, 'package.json'), JSON.stringify({ name: 'zod', version: '4.3.6' }))
+  const undiciLlhttpDir = path.join(destination, 'node_modules', 'undici', 'lib', 'llhttp')
+  mkdirSync(undiciLlhttpDir, { recursive: true })
+  writeFileSync(path.join(undiciLlhttpDir, '.gitkeep'), '')
+  writeFileSync(path.join(undiciLlhttpDir, 'llhttp-wasm.js'), 'export const llhttp = true\n')
   writeBinShim(destination, 'which', 'node-which', 'bin/node-which')
   mkdirSync(path.join(destination, 'node_modules', '.pnpm'), { recursive: true })
   writeFileSync(path.join(destination, 'node_modules', '.pnpm', 'lock.yaml'), 'inert pnpm install state\n')
@@ -430,9 +436,12 @@ describe('prepare-electron-runtime staging', () => {
       type: 'module',
       dependencies: {
         '@modelcontextprotocol/sdk': '1.30.0',
+        undici: '7.30.0',
         zod: '4.3.6',
       },
     })
+    expect(receipt.files).not.toContain('mcp/node_modules/undici/lib/llhttp/.gitkeep')
+    expect(receipt.files).toContain('mcp/node_modules/undici/lib/llhttp/llhttp-wasm.js')
 
     const stagedFiles = collectFiles(outputRoot)
     expect(stagedFiles.filter((file) =>

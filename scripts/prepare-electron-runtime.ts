@@ -55,6 +55,11 @@ export type ElectronRuntimePlatform = 'darwin' | 'linux' | 'win32'
 export type ElectronRuntimeArch = 'x64' | 'arm64'
 export type DeployableRuntimePackage = 'freshell-claude-sidecar' | 'freshell-mcp-runtime'
 
+// electron-builder always omits these dependency-tree placeholders, even when
+// extraResources filters include them. They carry no runtime code and should
+// not be recorded as required staged files.
+const ELECTRON_BUILDER_OMITTED_PACKAGE_FILES = new Set(['.gitkeep'])
+
 export interface RuntimePaths {
   root: string
   serverBinary: string
@@ -466,10 +471,18 @@ function materializeTree(
   destination: string,
   deployRoot: string,
   packageName: DeployableRuntimePackage,
+  omittedNames?: ReadonlySet<string>,
 ): void {
   mkdirSync(destination, { recursive: true })
   for (const entry of readdirSync(source, { withFileTypes: true })) {
-    materializeEntry(path.join(source, entry.name), path.join(destination, entry.name), deployRoot, packageName)
+    if (omittedNames?.has(entry.name)) continue
+    materializeEntry(
+      path.join(source, entry.name),
+      path.join(destination, entry.name),
+      deployRoot,
+      packageName,
+      omittedNames,
+    )
   }
 }
 
@@ -478,7 +491,9 @@ function materializeEntry(
   destination: string,
   deployRoot: string,
   packageName: DeployableRuntimePackage,
+  omittedNames?: ReadonlySet<string>,
 ): void {
+  if (omittedNames?.has(path.basename(source))) return
   const stats = lstatSync(source)
   if (stats.isSymbolicLink()) {
     let resolved: string
@@ -494,7 +509,7 @@ function materializeEntry(
     if (target.isFile()) {
       copyRequiredFile(resolved, destination)
     } else if (target.isDirectory()) {
-      materializeTree(resolved, destination, deployRoot, packageName)
+      materializeTree(resolved, destination, deployRoot, packageName, omittedNames)
     } else {
       throw structuredLinkError(packageName, `the link target has an unsupported type (${resolved})`, source)
     }
@@ -505,7 +520,7 @@ function materializeEntry(
     return
   }
   if (stats.isDirectory()) {
-    materializeTree(source, destination, deployRoot, packageName)
+    materializeTree(source, destination, deployRoot, packageName, omittedNames)
     return
   }
   throw new Error(`Electron runtime staging cannot copy the unsupported filesystem entry: ${source}`)
@@ -558,7 +573,13 @@ function stageDeployNodeModules(
 ): void {
   for (const entry of readdirSync(source, { withFileTypes: true })) {
     if (entry.name === '.pnpm') continue
-    materializeEntry(path.join(source, entry.name), path.join(destination, entry.name), deployRoot, packageName)
+    materializeEntry(
+      path.join(source, entry.name),
+      path.join(destination, entry.name),
+      deployRoot,
+      packageName,
+      ELECTRON_BUILDER_OMITTED_PACKAGE_FILES,
+    )
   }
 }
 
