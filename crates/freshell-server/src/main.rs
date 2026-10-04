@@ -80,6 +80,8 @@ pub(crate) mod test_clock_gate;
 mod test_clock_router;
 #[cfg(test)]
 pub(crate) mod test_env_lock;
+#[cfg(test)]
+mod test_trace_capture;
 mod updater;
 
 use std::net::IpAddr;
