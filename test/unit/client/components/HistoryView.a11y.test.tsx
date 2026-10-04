@@ -34,6 +34,47 @@ vi.mock('@/lib/api', async () => {
   }
 })
 
+function createSidebarLoadedStore() {
+  const project = {
+    projectPath: '/sidebar/already-loaded',
+    sessions: [{
+      provider: 'codex',
+      sessionId: 'already-loaded-from-sidebar',
+      projectPath: '/sidebar/already-loaded',
+      lastActivityAt: Date.now(),
+      title: 'Already loaded session',
+    }],
+  }
+  const store = configureStore({
+    reducer: {
+      sessions: sessionsReducer,
+      tabs: tabsReducer,
+    },
+    middleware: (getDefault) =>
+      getDefault({
+        serializableCheck: {
+          ignoredPaths: ['sessions.expandedProjects'],
+        },
+      }),
+    preloadedState: {
+      sessions: {
+        projects: [project],
+        expandedProjects: new Set([project.projectPath]),
+        activeSurface: 'sidebar',
+        windows: {
+          sidebar: {
+            projects: [project],
+            lastLoadedAt: Date.now(),
+          },
+        },
+      },
+      tabs: { tabs: [], activeTabId: null },
+    } as any,
+  })
+
+  return { project, store }
+}
+
 describe('HistoryView a11y', () => {
   beforeEach(() => {
     vi.restoreAllMocks()
@@ -222,34 +263,7 @@ describe('HistoryView a11y', () => {
       },
     })
 
-    const store = configureStore({
-      reducer: {
-        sessions: sessionsReducer,
-        tabs: tabsReducer,
-      },
-      middleware: (getDefault) =>
-        getDefault({
-          serializableCheck: {
-            ignoredPaths: ['sessions.expandedProjects'],
-          },
-        }),
-      preloadedState: {
-        sessions: {
-          projects: [{
-            projectPath: '/sidebar/already-loaded',
-            sessions: [{
-              provider: 'codex',
-              sessionId: 'already-loaded-from-sidebar',
-              projectPath: '/sidebar/already-loaded',
-              lastActivityAt: Date.now(),
-              title: 'Already loaded session',
-            }],
-          }],
-          expandedProjects: new Set(['/sidebar/already-loaded']),
-        },
-        tabs: { tabs: [], activeTabId: null },
-      } as any,
-    })
+    const { store } = createSidebarLoadedStore()
 
     render(
       <Provider store={store}>
@@ -262,9 +276,67 @@ describe('HistoryView a11y', () => {
       const alert = screen.getByTestId('history-session-directory-integrity-error')
       expect(alert).toHaveAttribute('role', 'alert')
     })
+    expect(screen.queryByRole('button', { name: 'Open session Already loaded session' })).toBeNull()
 
     const alert = screen.getByTestId('history-session-directory-integrity-error')
     fireEvent.click(within(alert).getByRole('button', { name: 'Dismiss' }))
     expect(screen.queryByTestId('history-session-directory-integrity-error')).toBeNull()
+  })
+
+  it('keeps Sidebar sessions visible while the History request is pending', async () => {
+    let resolveHistoryRequest!: (value: any) => void
+    const historyRequest = new Promise<any>((resolve) => {
+      resolveHistoryRequest = resolve
+    })
+    vi.mocked(fetchSidebarSessionsSnapshot).mockReturnValueOnce(historyRequest)
+    const { project: sidebarProject, store } = createSidebarLoadedStore()
+
+    render(
+      <Provider store={store}>
+        <HistoryView />
+      </Provider>,
+    )
+
+    await waitFor(() => expect(fetchSidebarSessionsSnapshot).toHaveBeenCalledTimes(1))
+    expect(screen.getByRole('button', { name: 'Open session Already loaded session' })).toBeInTheDocument()
+
+    await act(async () => {
+      resolveHistoryRequest({
+        projects: [sidebarProject],
+        totalSessions: 1,
+        oldestIncludedTimestamp: Date.now(),
+        oldestIncludedSessionId: 'codex:already-loaded-from-sidebar',
+        hasMore: false,
+      })
+      await historyRequest
+    })
+    expect(fetchSidebarSessionsSnapshot).toHaveBeenCalledTimes(1)
+  })
+
+  it('keeps Sidebar sessions visible when the History request fails', async () => {
+    let rejectHistoryRequest!: (reason?: unknown) => void
+    const historyRequest = new Promise<any>((_resolve, reject) => {
+      rejectHistoryRequest = reject
+    })
+    vi.mocked(fetchSidebarSessionsSnapshot).mockReturnValueOnce(historyRequest)
+    const { store } = createSidebarLoadedStore()
+
+    render(
+      <Provider store={store}>
+        <HistoryView />
+      </Provider>,
+    )
+
+    await waitFor(() => expect(fetchSidebarSessionsSnapshot).toHaveBeenCalledTimes(1))
+    await act(async () => {
+      rejectHistoryRequest(new Error('History request failed'))
+      await historyRequest.catch(() => {})
+    })
+    await waitFor(() => {
+      expect(store.getState().sessions.windows.history.error).toBe('History request failed')
+    })
+
+    expect(screen.getByRole('button', { name: 'Open session Already loaded session' })).toBeInTheDocument()
+    expect(fetchSidebarSessionsSnapshot).toHaveBeenCalledTimes(1)
   })
 })
