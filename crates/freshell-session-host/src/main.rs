@@ -857,16 +857,16 @@ async fn grant_execution(
                     format!("resolve managed provider credentials: {error}"),
                 )
             })?;
-            prepare_provider_auth_files(
+            prepare_provider_files(
                 &terminal.mode,
-                &resolved_secrets.auth_files,
+                &resolved_secrets.provider_files,
                 terminal.run_as_uid,
                 terminal.run_as_gid,
             )
             .map_err(|error| {
                 RuntimeError::new(
                     RuntimeErrorCode::HostUnreachable,
-                    format!("prepare OneCLI auth files: {error}"),
+                    format!("prepare OneCLI provider files: {error}"),
                 )
             })?;
             let prepared = providers::prepare_terminal(terminal, &resolved_secrets.environment)
@@ -974,16 +974,16 @@ async fn grant_execution(
                     format!("resolve hosted OneCLI grant: {error}"),
                 )
             })?;
-            prepare_provider_auth_files(
+            prepare_provider_files(
                 launch.provider.as_str(),
-                &resolved_secrets.auth_files,
+                &resolved_secrets.provider_files,
                 launch.run_as_uid,
                 launch.run_as_gid,
             )
             .map_err(|error| {
                 RuntimeError::new(
                     RuntimeErrorCode::HostUnreachable,
-                    format!("prepare hosted OneCLI auth files: {error}"),
+                    format!("prepare hosted OneCLI provider files: {error}"),
                 )
             })?;
             providers::prepare_fresh_agent_child_environment(
@@ -1671,9 +1671,9 @@ fn prepare_provider_context_at(
     Ok(())
 }
 
-fn prepare_provider_auth_files(
+fn prepare_provider_files(
     provider: &str,
-    auth_files: &[(&str, Vec<u8>)],
+    provider_files: &[(&str, Vec<u8>)],
     run_as_uid: u32,
     run_as_gid: u32,
 ) -> Result<(), String> {
@@ -1681,7 +1681,7 @@ fn prepare_provider_auth_files(
     std::fs::create_dir_all(auth_dir).map_err(|error| error.to_string())?;
     set_mode(auth_dir, 0o711)?;
     let home = Path::new("/home/freshell/provider");
-    if !home.exists() && auth_files.is_empty() {
+    if !home.exists() && provider_files.is_empty() {
         return Ok(());
     }
     let legacy_relative = match provider {
@@ -1705,7 +1705,7 @@ fn prepare_provider_auth_files(
             ],
         )?;
     }
-    for (index, (relative, contents)) in auth_files.iter().enumerate() {
+    for (index, (relative, contents)) in provider_files.iter().enumerate() {
         let destination = home.join(relative);
         let target = auth_dir.join(format!("provider-{index}"));
         let temporary = auth_dir.join(format!("provider-{index}-tmp-{}", std::process::id()));

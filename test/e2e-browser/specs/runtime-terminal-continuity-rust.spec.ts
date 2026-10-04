@@ -13,7 +13,7 @@ import fs from 'node:fs'
 import path from 'node:path'
 
 import { ManagedRuntimeBrowserRig, P2_OPENCODE_MODEL, P2_OPENCODE_VERSION, type ManagedRuntimeView } from '../helpers/managed-runtime.js'
-import { requireOpenCodeAuthFile } from '../helpers/opencode-auth-file.js'
+import { requireOpenCodeOnecliBootstrap } from '../helpers/opencode-auth-file.js'
 import { OPENCODE_NATIVE_HISTORY_SCRIPT, type NativeHistory } from '../helpers/opencode-native-history.js'
 import { TestHarness } from '../helpers/test-harness.js'
 import { TerminalHelper } from '../helpers/terminal-helpers.js'
@@ -323,13 +323,15 @@ test.describe.serial('Phase 2 managed runtime continuity', () => {
   test('P2-G04: OpenAI-authenticated OpenCode tool turn survives web replacement in one native session', async ({ page }) => {
     test.setTimeout(900_000)
 
-    // The rig runs the web server with an isolated HOME. Pass the existing
-    // private auth file as a typed OneCLI grant; otherwise OpenCode silently
-    // uses its default model in the managed provider volume.
-    const authFile = requireOpenCodeAuthFile()
+    // The rig runs the web server with an isolated HOME. Pass the native
+    // OpenCode OAuth stub, OneCLI proxy settings, and gateway CA as typed
+    // grants so the provider uses the dedicated OneCLI gateway.
+    const onecli = requireOpenCodeOnecliBootstrap()
     const rig = new ManagedRuntimeBrowserRig(process.cwd(), 2, {
       FRESHELL_BIND_HOST: '0.0.0.0',
-      FRESHELL_MANAGED_OPENCODE_ONECLI_AUTH_FILE: authFile,
+      FRESHELL_MANAGED_OPENCODE_ONECLI_AUTH_FILE: onecli.authFile,
+      FRESHELL_MANAGED_OPENCODE_ONECLI_ENV_FILE: onecli.environmentFile,
+      FRESHELL_MANAGED_OPENCODE_ONECLI_CA_FILE: onecli.caFile,
     })
     try {
       const info = await rig.start()
@@ -369,9 +371,9 @@ test.describe.serial('Phase 2 managed runtime continuity', () => {
       expect(rig.ownedContainerExec(view.containerId, ['opencode', '--version']).trim()).toBe(P2_OPENCODE_VERSION)
       const authProbe = rig.ownedProviderExec(view.containerId, [
         'node', '--no-warnings', '-e',
-        "const fs=require('node:fs');const auth=JSON.parse(fs.readFileSync('/home/freshell/provider/.local/share/opencode/auth.json','utf8'));const openai=auth.openai;if(!openai||typeof openai.access!=='string'||typeof openai.refresh!=='string')process.exit(2);process.stdout.write('openai credential present')",
+        "const fs=require('node:fs');const auth=JSON.parse(fs.readFileSync('/home/freshell/provider/.local/share/opencode/auth.json','utf8'));const openai=auth.openai;if(!openai||openai.type!=='oauth'||openai.access!=='onecli-managed'||openai.refresh!=='onecli-managed'||openai.expires<Date.now()+3600000)process.exit(2);fs.accessSync('/home/freshell/provider/.config/onecli/gateway-ca.pem',fs.constants.R_OK);process.stdout.write('onecli managed OpenAI stub and CA present')",
       ])
-      expect(authProbe.trim()).toBe('openai credential present')
+      expect(authProbe.trim()).toBe('onecli managed OpenAI stub and CA present')
       const availableModels = rig.ownedProviderExec(view.containerId, ['opencode', 'models', 'openai'])
       expect(availableModels).toContain(P2_OPENCODE_MODEL.split('/')[1])
       const processArgs = rig.ownedContainerExec(view.containerId, ['sh', '-lc', "pgrep -af '[o]pencode' || true"])

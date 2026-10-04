@@ -90,6 +90,7 @@ export function phase2BootstrapFiles(
       addRegularFile(env[`FRESHELL_MANAGED_${provider}_ONECLI_${suffix}`]?.trim())
     }
   }
+  addRegularFile(env.FRESHELL_MANAGED_OPENCODE_ONECLI_CA_FILE?.trim())
   for (const grant of configuredAmplifierOnecliGrantFiles(env)) files.add(grant)
   return [...files]
 }

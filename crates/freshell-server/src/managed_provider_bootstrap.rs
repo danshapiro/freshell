@@ -301,31 +301,39 @@ pub fn named_provider_onecli_references(
     provider: &str,
 ) -> Result<Vec<ProviderSecretReference>, String> {
     use freshell_runtime_protocol::ProviderSecretProfile;
-    let (prefix, environment, auth_file) = match provider {
+    let (prefix, environment, auth_file, ca_file) = match provider {
         "claude" => (
             "CLAUDE",
             ProviderSecretProfile::ClaudeOnecliEnvironment,
             ProviderSecretProfile::ClaudeOnecliAuthFile,
+            None,
         ),
         "codex" => (
             "CODEX",
             ProviderSecretProfile::CodexOnecliEnvironment,
             ProviderSecretProfile::CodexOnecliAuthFile,
+            None,
         ),
         "opencode" => (
             "OPENCODE",
             ProviderSecretProfile::OpencodeOnecliEnvironment,
             ProviderSecretProfile::OpencodeOnecliAuthFile,
+            Some(ProviderSecretProfile::OpencodeOnecliCaFile),
         ),
         "amplifier" => (
             "AMPLIFIER",
             ProviderSecretProfile::AmplifierOnecliEnvironment,
             ProviderSecretProfile::AmplifierOnecliKeysFile,
+            None,
         ),
         _ => return Ok(Vec::new()),
     };
     let mut references = Vec::new();
-    for (suffix, profile) in [("ENV_FILE", environment), ("AUTH_FILE", auth_file)] {
+    let mut profiles = vec![("ENV_FILE", environment), ("AUTH_FILE", auth_file)];
+    if let Some(profile) = ca_file {
+        profiles.push(("CA_FILE", profile));
+    }
+    for (suffix, profile) in profiles {
         let key = format!("FRESHELL_MANAGED_{prefix}_ONECLI_{suffix}");
         if let Some(path) = std::env::var_os(&key).filter(|value| !value.is_empty()) {
             let path = std::path::PathBuf::from(path);
@@ -355,6 +363,67 @@ pub fn named_provider_onecli_references(
 mod tests {
     use super::*;
     use std::fs;
+
+    struct RestoreOnecliEnv(Vec<(&'static str, Option<std::ffi::OsString>)>);
+
+    impl Drop for RestoreOnecliEnv {
+        fn drop(&mut self) {
+            for (name, value) in self.0.drain(..) {
+                match value {
+                    Some(value) => std::env::set_var(name, value),
+                    None => std::env::remove_var(name),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn named_opencode_onecli_references_include_private_environment_auth_and_ca_files() {
+        let _env_lock = crate::test_env_lock::CLAUDE_ENV_TEST_LOCK.blocking_lock();
+        let workspace = tempfile::tempdir().unwrap();
+        let environment = workspace.path().join("opencode.env");
+        let auth = workspace.path().join("opencode-auth.json");
+        let ca = workspace.path().join("gateway-ca.pem");
+        for file in [&environment, &auth, &ca] {
+            fs::write(file, "fixture").unwrap();
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(file, fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        let keys = [
+            "FRESHELL_MANAGED_OPENCODE_ONECLI_ENV_FILE",
+            "FRESHELL_MANAGED_OPENCODE_ONECLI_AUTH_FILE",
+            "FRESHELL_MANAGED_OPENCODE_ONECLI_CA_FILE",
+        ];
+        let _restore = RestoreOnecliEnv(keys.map(|key| (key, std::env::var_os(key))).into());
+        for (key, file) in keys.into_iter().zip([&environment, &auth, &ca]) {
+            std::env::set_var(key, file);
+        }
+
+        let references = named_provider_onecli_references("opencode").unwrap();
+
+        assert_eq!(
+            references
+                .iter()
+                .map(|reference| reference.profile)
+                .collect::<Vec<_>>(),
+            vec![
+                freshell_runtime_protocol::ProviderSecretProfile::OpencodeOnecliEnvironment,
+                freshell_runtime_protocol::ProviderSecretProfile::OpencodeOnecliAuthFile,
+                freshell_runtime_protocol::ProviderSecretProfile::OpencodeOnecliCaFile,
+            ],
+        );
+        let actual_paths = references
+            .iter()
+            .map(|reference| reference.source_path.clone())
+            .collect::<Vec<_>>();
+        let expected_paths = [environment, auth, ca].map(|file| {
+            fs::canonicalize(file)
+                .unwrap()
+                .to_string_lossy()
+                .into_owned()
+        });
+        assert_eq!(actual_paths, expected_paths.to_vec());
+    }
 
     #[test]
     fn managed_claude_provider_context_renders_scoped_mcp_recipe() {

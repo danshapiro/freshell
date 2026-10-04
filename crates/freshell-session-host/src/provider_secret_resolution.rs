@@ -15,10 +15,12 @@ const ALLOWED_NAMES: &[&str] = &[
     "GEMINI_API_KEY",
     "GOOGLE_API_KEY",
     "GOOGLE_GENERATIVE_AI_API_KEY",
+    "HTTP_PROXY",
     "HTTPS_PROXY",
     "LUNAROUTE_API_KEY",
     "LUNAROUTE_BASE_URL",
     "NODE_EXTRA_CA_CERTS",
+    "NODE_USE_ENV_PROXY",
     "NO_PROXY",
     "ONECLI_GATEWAY",
     "ONECLI_URL",
@@ -28,6 +30,7 @@ const ALLOWED_NAMES: &[&str] = &[
     "OPENROUTER_API_KEY",
     "REQUESTS_CA_BUNDLE",
     "SSL_CERT_FILE",
+    "http_proxy",
     "https_proxy",
     "no_proxy",
 ];
@@ -41,7 +44,7 @@ const CERTIFICATE_CHILD_NAMES: &[&str] = &[
 #[derive(Default)]
 pub struct ResolvedProviderSecrets {
     pub environment: BTreeMap<String, String>,
-    pub auth_files: Vec<(&'static str, Vec<u8>)>,
+    pub provider_files: Vec<(&'static str, Vec<u8>)>,
 }
 
 pub fn resolve_child_secrets(
@@ -64,11 +67,11 @@ pub fn resolve_child_secrets(
             return Err("OneCLI grant must be a bounded regular file".into());
         }
         let raw = fs::read(&mount).map_err(|error| format!("read OneCLI grant: {error}"))?;
-        if let Some(relative) = reference.profile.auth_relative_path() {
+        if let Some(relative) = reference.profile.provider_file_relative_path() {
             if raw.is_empty() {
-                return Err("OneCLI auth-file grant is empty".into());
+                return Err("OneCLI provider-file grant is empty".into());
             }
-            resolved.auth_files.push((relative, raw));
+            resolved.provider_files.push((relative, raw));
         } else {
             let text =
                 std::str::from_utf8(&raw).map_err(|_| "OneCLI environment grant is not UTF-8")?;
@@ -103,6 +106,7 @@ fn resolve_profile(
         ProviderSecretProfile::ClaudeOnecliAuthFile
         | ProviderSecretProfile::CodexOnecliAuthFile
         | ProviderSecretProfile::OpencodeOnecliAuthFile
+        | ProviderSecretProfile::OpencodeOnecliCaFile
         | ProviderSecretProfile::AmplifierOnecliKeysFile => Err("OneCLI auth-file grant cannot be parsed as an environment profile".into()),
         ProviderSecretProfile::AmplifierOnecliLunarouteGlm53 => {
             // The approved proxy may replace a provider placeholder key, so
@@ -162,9 +166,17 @@ fn resolve_provider_environment(
             || CERTIFICATE_CHILD_NAMES.contains(&name.as_str())
         {
             child.insert(name.clone(), value.clone());
-        } else if matches!(name.as_str(), "HTTPS_PROXY" | "https_proxy") {
+        } else if matches!(
+            name.as_str(),
+            "HTTPS_PROXY" | "https_proxy" | "HTTP_PROXY" | "http_proxy"
+        ) {
             reject_proxy_placeholder(value)?;
             validate_container_proxy(value)?;
+            child.insert(name.clone(), value.clone());
+        } else if name == "NODE_USE_ENV_PROXY" {
+            if value != "1" {
+                return Err("NODE_USE_ENV_PROXY must be set to 1".into());
+            }
             child.insert(name.clone(), value.clone());
         } else if !matches!(
             name.as_str(),
@@ -180,9 +192,14 @@ fn resolve_provider_environment(
     {
         return Err("OneCLI environment profile has no provider values".into());
     }
-    if let (Some(upper), Some(lower)) = (child.get("HTTPS_PROXY"), child.get("https_proxy")) {
-        if upper != lower {
-            return Err("OneCLI HTTPS proxy values conflict".into());
+    for (upper_name, lower_name, display_name) in [
+        ("HTTPS_PROXY", "https_proxy", "HTTPS_PROXY"),
+        ("HTTP_PROXY", "http_proxy", "HTTP_PROXY"),
+    ] {
+        if let (Some(upper), Some(lower)) = (child.get(upper_name), child.get(lower_name)) {
+            if upper != lower {
+                return Err(format!("OneCLI {display_name} values conflict"));
+            }
         }
     }
     Ok(child)
@@ -205,19 +222,19 @@ fn validate_https_upstream(value: &str) -> Result<(), String> {
 
 fn validate_container_proxy(value: &str) -> Result<(), String> {
     let url = url::Url::parse(value)
-        .map_err(|_| "HTTPS_PROXY must be a valid HTTP(S) URL".to_string())?;
+        .map_err(|_| "OneCLI proxy value must be a valid HTTP(S) URL".to_string())?;
     if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
         return Err("HTTPS_PROXY must be a valid HTTP(S) URL".into());
     }
     let host = url.host_str().unwrap_or_default().to_ascii_lowercase();
     if host == "localhost" || host == "::1" || host.starts_with("127.") {
         return Err(
-            "HTTPS_PROXY cannot use container loopback; use the approved OneCLI proxy address reachable from the managed bridge"
+            "OneCLI proxy cannot use container loopback; use the approved proxy address reachable from the managed bridge"
                 .into(),
         );
     }
     if url.query().is_some() || url.fragment().is_some() {
-        return Err("HTTPS_PROXY cannot contain query or fragment data".into());
+        return Err("OneCLI proxy cannot contain query or fragment data".into());
     }
     Ok(())
 }
@@ -414,7 +431,62 @@ mod tests {
     }
 
     #[test]
-    fn provider_secret_file_grants_return_only_provider_relative_auth_files() {
+    fn opencode_onecli_environment_forwards_the_authenticated_proxy_and_node_ca_settings() {
+        let root = tempfile::tempdir().unwrap();
+        let mount = root.path().join("provider-0");
+        fs::write(
+            &mount,
+            concat!(
+                "OPENAI_BASE_URL=https://api.openai.com/v1\n",
+                "HTTPS_PROXY=http://agent:fixture@192.168.3.150:10255\n",
+                "https_proxy=http://agent:fixture@192.168.3.150:10255\n",
+                "HTTP_PROXY=http://agent:fixture@192.168.3.150:10255\n",
+                "http_proxy=http://agent:fixture@192.168.3.150:10255\n",
+                "NODE_EXTRA_CA_CERTS=/home/freshell/provider/.config/onecli/gateway-ca.pem\n",
+                "NODE_USE_ENV_PROXY=1\n",
+                "ONECLI_URL=http://127.0.0.1:10254\n",
+                "NO_PROXY=localhost\n",
+            ),
+        )
+        .unwrap();
+        let reference = ProviderSecretReference {
+            source_path: mount.to_string_lossy().into_owned(),
+            profile: ProviderSecretProfile::OpencodeOnecliEnvironment,
+        };
+
+        let resolved = resolve_child_secrets("opencode", &[reference], root.path()).unwrap();
+
+        assert_eq!(
+            resolved.environment.get("OPENAI_BASE_URL").unwrap(),
+            "https://api.openai.com/v1"
+        );
+        assert_eq!(
+            resolved.environment.get("HTTPS_PROXY").unwrap(),
+            "http://agent:fixture@192.168.3.150:10255"
+        );
+        assert_eq!(
+            resolved.environment.get("https_proxy").unwrap(),
+            "http://agent:fixture@192.168.3.150:10255"
+        );
+        assert_eq!(
+            resolved.environment.get("HTTP_PROXY").unwrap(),
+            "http://agent:fixture@192.168.3.150:10255"
+        );
+        assert_eq!(
+            resolved.environment.get("http_proxy").unwrap(),
+            "http://agent:fixture@192.168.3.150:10255"
+        );
+        assert_eq!(
+            resolved.environment.get("NODE_EXTRA_CA_CERTS").unwrap(),
+            "/home/freshell/provider/.config/onecli/gateway-ca.pem"
+        );
+        assert_eq!(resolved.environment.get("NODE_USE_ENV_PROXY").unwrap(), "1");
+        assert!(!resolved.environment.contains_key("ONECLI_URL"));
+        assert!(!resolved.environment.contains_key("NO_PROXY"));
+    }
+
+    #[test]
+    fn provider_secret_file_grants_return_only_provider_relative_files() {
         let cases = [
             (
                 "claude",
@@ -430,6 +502,11 @@ mod tests {
                 "opencode",
                 ProviderSecretProfile::OpencodeOnecliAuthFile,
                 ".local/share/opencode/auth.json",
+            ),
+            (
+                "opencode",
+                ProviderSecretProfile::OpencodeOnecliCaFile,
+                ".config/onecli/gateway-ca.pem",
             ),
             (
                 "amplifier",
@@ -448,10 +525,34 @@ mod tests {
             let resolved = resolve_child_secrets(provider, &references, root.path()).unwrap();
             assert!(resolved.environment.is_empty());
             assert_eq!(
-                resolved.auth_files,
+                resolved.provider_files,
                 vec![(expected, b"fake-OneCLI-auth-file".to_vec())]
             );
             assert!(resolve_child_secrets("wrong-provider", &references, root.path()).is_err());
+        }
+    }
+
+    #[test]
+    fn opencode_onecli_environment_rejects_conflicting_proxy_aliases_and_invalid_node_proxy_switch()
+    {
+        for invalid in [
+            "HTTP_PROXY=http://onecli.example:10255\nhttp_proxy=http://different.example:10255\n",
+            "NODE_USE_ENV_PROXY=true\n",
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            let mount = root.path().join("provider-0");
+            fs::write(
+                &mount,
+                format!(
+                    "OPENAI_BASE_URL=https://api.openai.com/v1\nHTTPS_PROXY=http://192.168.3.150:10255\nhttps_proxy=http://192.168.3.150:10255\n{invalid}"
+                ),
+            )
+            .unwrap();
+            let reference = ProviderSecretReference {
+                source_path: mount.to_string_lossy().into_owned(),
+                profile: ProviderSecretProfile::OpencodeOnecliEnvironment,
+            };
+            assert!(resolve_child_secrets("opencode", &[reference], root.path()).is_err());
         }
     }
 

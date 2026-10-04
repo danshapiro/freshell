@@ -22,7 +22,7 @@ import {
   P2_OPENCODE_VERSION,
   type ManagedRuntimeView,
 } from '../helpers/managed-runtime.js'
-import { requireOpenCodeAuthFile } from '../helpers/opencode-auth-file.js'
+import { requireOpenCodeOnecliBootstrap } from '../helpers/opencode-auth-file.js'
 import { openPanePicker } from '../helpers/pane-picker.js'
 import { TerminalHelper } from '../helpers/terminal-helpers.js'
 import { TestHarness } from '../helpers/test-harness.js'
@@ -363,14 +363,16 @@ test.describe.serial('OpenCode provider qualification', () => {
     )
     test.setTimeout(1_800_000)
 
-    const authFile = requireOpenCodeAuthFile(process.env, 'OpenCode provider qualification')
+    const onecli = requireOpenCodeOnecliBootstrap(process.env, 'OpenCode provider qualification')
     const blockerEvidence = runBlockerMatrixTests(process.cwd())
     const rig = new ManagedRuntimeBrowserRig(
       process.cwd(),
       5,
       {
         FRESHELL_BIND_HOST: '0.0.0.0',
-        FRESHELL_MANAGED_OPENCODE_ONECLI_AUTH_FILE: authFile,
+        FRESHELL_MANAGED_OPENCODE_ONECLI_AUTH_FILE: onecli.authFile,
+        FRESHELL_MANAGED_OPENCODE_ONECLI_ENV_FILE: onecli.environmentFile,
+        FRESHELL_MANAGED_OPENCODE_ONECLI_CA_FILE: onecli.caFile,
       },
       { FRESHELL_RUNTIME_OBSERVER_INTERVAL_MS: '750' },
       'release',
@@ -415,9 +417,9 @@ test.describe.serial('OpenCode provider qualification', () => {
       expect(processArgs).toContain(P2_OPENCODE_MODEL)
       const authProbe = rig.ownedProviderExec(first.view.containerId, [
         'node', '--no-warnings', '-e',
-        "const fs=require('node:fs');const auth=JSON.parse(fs.readFileSync('/home/freshell/provider/.local/share/opencode/auth.json','utf8'));const openai=auth.openai;if(!openai||typeof openai.access!=='string'||typeof openai.refresh!=='string')process.exit(2);process.stdout.write('OpenAI credential present')",
+        "const fs=require('node:fs');const auth=JSON.parse(fs.readFileSync('/home/freshell/provider/.local/share/opencode/auth.json','utf8'));const openai=auth.openai;if(!openai||openai.type!=='oauth'||openai.access!=='onecli-managed'||openai.refresh!=='onecli-managed'||openai.expires<Date.now()+3600000)process.exit(2);fs.accessSync('/home/freshell/provider/.config/onecli/gateway-ca.pem',fs.constants.R_OK);process.stdout.write('OneCLI OpenAI stub and CA present')",
       ])
-      expect(authProbe.trim()).toBe('OpenAI credential present')
+      expect(authProbe.trim()).toBe('OneCLI OpenAI stub and CA present')
       const availableModels = rig.ownedProviderExec(first.view.containerId, ['opencode', 'models', 'openai'])
       expect(availableModels).toContain(P2_OPENCODE_MODEL.split('/')[1])
       const exactLimits = cgroupLimitEvidence(rig, first.view)

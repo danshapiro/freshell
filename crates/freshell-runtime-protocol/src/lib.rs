@@ -918,6 +918,7 @@ pub enum ProviderSecretProfile {
     CodexOnecliAuthFile,
     OpencodeOnecliEnvironment,
     OpencodeOnecliAuthFile,
+    OpencodeOnecliCaFile,
     AmplifierOnecliEnvironment,
     AmplifierOnecliKeysFile,
     /// The approved OneCLI deployment: Amplifier's VLLM module talks to the
@@ -936,7 +937,9 @@ impl ProviderSecretProfile {
         match self {
             Self::ClaudeOnecliEnvironment | Self::ClaudeOnecliAuthFile => "claude",
             Self::CodexOnecliEnvironment | Self::CodexOnecliAuthFile => "codex",
-            Self::OpencodeOnecliEnvironment | Self::OpencodeOnecliAuthFile => "opencode",
+            Self::OpencodeOnecliEnvironment
+            | Self::OpencodeOnecliAuthFile
+            | Self::OpencodeOnecliCaFile => "opencode",
             Self::AmplifierOnecliEnvironment
             | Self::AmplifierOnecliKeysFile
             | Self::AmplifierOnecliLunarouteGlm53
@@ -952,6 +955,15 @@ impl ProviderSecretProfile {
             Self::AmplifierOnecliKeysFile => Some(".amplifier/keys.env"),
             _ => None,
         }
+    }
+
+    /// Provider-home path for a OneCLI file grant, including non-auth files
+    /// such as the gateway CA certificate.
+    pub fn provider_file_relative_path(self) -> Option<&'static str> {
+        self.auth_relative_path().or_else(|| match self {
+            Self::OpencodeOnecliCaFile => Some(".config/onecli/gateway-ca.pem"),
+            _ => None,
+        })
     }
 }
 
@@ -1473,28 +1485,29 @@ mod provider_launch_context_tests {
         for (provider, profiles) in [
             (
                 "claude",
-                [
+                vec![
                     ProviderSecretProfile::ClaudeOnecliEnvironment,
                     ProviderSecretProfile::ClaudeOnecliAuthFile,
                 ],
             ),
             (
                 "codex",
-                [
+                vec![
                     ProviderSecretProfile::CodexOnecliEnvironment,
                     ProviderSecretProfile::CodexOnecliAuthFile,
                 ],
             ),
             (
                 "opencode",
-                [
+                vec![
                     ProviderSecretProfile::OpencodeOnecliEnvironment,
                     ProviderSecretProfile::OpencodeOnecliAuthFile,
+                    ProviderSecretProfile::OpencodeOnecliCaFile,
                 ],
             ),
             (
                 "amplifier",
-                [
+                vec![
                     ProviderSecretProfile::AmplifierOnecliEnvironment,
                     ProviderSecretProfile::AmplifierOnecliKeysFile,
                 ],
