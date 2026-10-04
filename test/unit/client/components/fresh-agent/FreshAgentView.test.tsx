@@ -1711,6 +1711,33 @@ describe('FreshAgentView', () => {
     }
   })
 
+  it('enables the managed pre-native OpenCode composer and sends without replacing its soul', async () => {
+    const store = createStore()
+    const sessionId = 'managed-opencode-zero-turn'
+    const locator = { sessionType: 'freshopencode' as const, provider: 'opencode' as const, sessionId }
+    const content = {kind: 'fresh-agent' as const, ...locator, createRequestId: 'owned-zero-turn-create', soulId: 'owned-zero-turn-soul', soulIntentRevision: 1,
+      status: 'idle' as const, recoverySummary: {desiredState: 'running' as const, recoveryState: 'live' as const, durabilityState: 'resume_captured' as const, allocationState: 'verified_durable' as const}}
+    store.dispatch(sessionInit(locator))
+    store.dispatch(initLayout({tabId:'tab-1',paneId:'pane-1',content}))
+    const pending = createDeferred<unknown>()
+    apiMock.getFreshAgentThreadSnapshot.mockReturnValue(pending.promise)
+    render(<Provider store={store}><StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" /></Provider>)
+    const composer = screen.getByRole('textbox', {name:'Chat message input'})
+    await waitFor(() => expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalled())
+    await act(async () => pending.resolve({...FreshAgentSnapshotSchema.parse(savedOpenCodeNativeHistory), threadId:sessionId, sessionId,
+      turns:[], latestTurnId: null, status:'idle', capabilities:{...savedOpenCodeNativeHistory.capabilities,send:true},
+      extensions:{opencode:{statusFromLiveState:true,ownerKind:'fresh-agent'}}}))
+    await waitFor(() => expect(composer).toBeEnabled())
+    wsMock.send.mockClear()
+    fireEvent.change(composer,{target:{value:'First prompt in the owned conversation'}})
+    fireEvent.click(screen.getByRole('button',{name:'Send'}))
+    expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(1)
+    expect(sentFreshAgentMessages('freshAgent.send')[0]).toMatchObject(locator)
+    expect(sentFreshAgentMessages('freshAgent.create')).toHaveLength(0)
+    expect(sentFreshAgentMessages('pane.reconcile.request')).toHaveLength(0)
+    expect(getFreshAgentPaneContent(store)).toMatchObject({soulId:content.soulId,createRequestId:content.createRequestId,sessionId})
+  })
+
   it('promotes Freshopencode panes when freshAgent.session.materialized arrives', async () => {
     const store = createStore()
     let onMessage: ((message: Record<string, unknown>) => void) | undefined
@@ -6310,6 +6337,51 @@ describe('FreshAgentView', () => {
     ['kilroy', 'claude', { ...savedClaudeNativeHistory, sessionType: 'kilroy' }],
     ['freshcodex', 'codex', savedCodexNativeHistory],
     ['freshopencode', 'opencode', savedOpenCodeNativeHistory],
+  ] as const)('reads managed $1 unavailable/native-only results from the captured soul source', async (sessionType, provider, captured) => {
+    for (const failure of [false, true]) {
+      const store = createStore()
+      const native = FreshAgentSnapshotSchema.parse(captured)
+      const locator = { sessionType, provider, sessionId: native.threadId }
+      const content = { kind: 'fresh-agent' as const, ...locator, soulId: 'owned-history-soul', soulIntentRevision: 1,
+        createRequestId: 'owned-history-source', sessionRef: { provider, sessionId: native.threadId },
+        resumeSessionId: native.threadId, status: 'running' as const,
+        recoverySummary: { desiredState: 'running' as const, recoveryState: 'live' as const,
+          durabilityState: 'resume_captured' as const, allocationState: 'verified_durable' as const } }
+      store.dispatch(sessionInit(locator))
+      store.dispatch(setSessionStatus({ ...locator, status: 'running' }))
+      store.dispatch(initLayout({ tabId: 'tab-1', paneId: 'pane-1', content }))
+      const interactive = createDeferred<unknown>()
+      const owned = createDeferred<unknown>()
+      apiMock.getFreshAgentThreadSnapshot.mockImplementation((_type, _provider, _id, options) =>
+        options?.soulId ? owned.promise : interactive.promise)
+      render(<Provider store={store}><StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" /></Provider>)
+      await waitFor(() => expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalled())
+      const composer = screen.getByRole('textbox', { name: 'Chat message input' })
+      fireEvent.change(composer, { target: { value: 'Owned outage draft' } })
+      const before = getFreshAgentPaneContent(store)
+      wsMock.send.mockClear()
+      await act(async () => { if (failure) interactive.reject(new Error('Owned host unavailable'))
+        else interactive.resolve({ ...native, extensions: { [provider]: { nativeHistoryAvailable: true, ownerKind: 'vacant' } } }) })
+      await waitFor(() => expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledWith(sessionType, provider,
+        native.threadId, expect.objectContaining({ soulId: 'owned-history-soul' })))
+      const text = native.turns.flatMap((turn) => turn.items).find((item) => item.kind === 'text') as {text: string}
+      expect(screen.queryByText(text.text)).not.toBeInTheDocument()
+      await act(async () => owned.resolve({ ...native, extensions: { [provider]: { nativeHistoryAvailable: true, ownerKind: 'vacant' } } }))
+      expect(await screen.findByText(text.text)).toBeInTheDocument()
+      expect(composer).toBeDisabled()
+      expect(composer).toHaveValue('Owned outage draft')
+      expect(getFreshAgentPaneContent(store)).toEqual(before)
+      expect(sentFreshAgentMessages('freshAgent.create')).toHaveLength(0)
+      expect(sentFreshAgentMessages('pane.reconcile.request')).toHaveLength(0)
+      cleanup(); apiMock.getFreshAgentThreadSnapshot.mockClear()
+    }
+  })
+
+  it.each([
+    ['freshclaude', 'claude', savedClaudeNativeHistory],
+    ['kilroy', 'claude', { ...savedClaudeNativeHistory, sessionType: 'kilroy' }],
+    ['freshcodex', 'codex', savedCodexNativeHistory],
+    ['freshopencode', 'opencode', savedOpenCodeNativeHistory],
   ] as const)('restores managed $1 usability from current HTTP truth without an attach snapshot', async (sessionType, provider, captured) => {
     const store = createStore()
     const native = FreshAgentSnapshotSchema.parse(captured)
@@ -6400,6 +6472,34 @@ describe('FreshAgentView', () => {
       cleanup()
       apiMock.getFreshAgentThreadSnapshot.mockClear()
     }
+  })
+
+  it.each(['owner', 'boot', 'soul', 'revision'] as const)('discards owned history held across a %s change', async (change) => {
+    const store = createStore()
+    const native = FreshAgentSnapshotSchema.parse(savedCodexNativeHistory)
+    const locator = {sessionType:'freshcodex' as const,provider:'codex' as const,sessionId:native.threadId}
+    const owner = {type:'session.runtimeOwner' as const,...locator,epoch:1,generation:1,ownerKind:'fresh-agent' as const,operationId:'owned-history',transition:'handoff-committed' as const}
+    store.dispatch(applyRuntimeOwner(owner)); store.dispatch(sessionInit(locator))
+    const content = {kind:'fresh-agent' as const,...locator,status:'running' as const,createRequestId:'held-history-create',soulId:'held-history-soul',soulIntentRevision:1,
+      recoverySummary:{desiredState:'running' as const,recoveryState:'live' as const,durabilityState:'resume_captured' as const,allocationState:'verified_durable' as const}}
+    store.dispatch(initLayout({tabId:'tab-1',paneId:'pane-1',content}))
+    const held = createDeferred<unknown>()
+    apiMock.getFreshAgentThreadSnapshot.mockImplementation((_type,_provider,_id,options) => options?.soulId ? held.promise : Promise.reject(new Error('host unavailable')))
+    render(<Provider store={store}><StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" /></Provider>)
+    await waitFor(() => expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledWith('freshcodex','codex',native.threadId,expect.objectContaining({soulId:content.soulId})))
+    apiMock.getFreshAgentThreadSnapshot.mockReturnValue(new Promise(() => {}))
+    act(() => {
+      if (change === 'owner') store.dispatch(applyRuntimeOwner({...owner,generation:2,operationId:'next-owner'}))
+      if (change === 'boot') store.dispatch(setBootId('new-owned-history-boot'))
+      if (change === 'soul' || change === 'revision') store.dispatch(updatePaneContent({tabId:'tab-1',paneId:'pane-1',content:{...content,
+        soulId:change === 'soul' ? 'another-soul' : content.soulId,soulIntentRevision:change === 'revision' ? 2 : 1}}))
+    })
+    const current = getFreshAgentPaneContent(store)
+    await act(async () => held.resolve({...native,extensions:{codex:{nativeHistoryAvailable:true,ownerKind:'vacant'}}}))
+    expect(screen.queryByText('Saved native Codex answer')).not.toBeInTheDocument()
+    expect(getFreshAgentPaneContent(store)).toEqual(current)
+    expect(sentFreshAgentMessages('freshAgent.create')).toHaveLength(0)
+    expect(sentFreshAgentMessages('pane.reconcile.request')).toHaveLength(0)
   })
 
   it.each(['native', 'vacant', 'wrong-thread', 'wrong-provider', 'wrong-type', 'owner-change', 'boot-change', 'recovering', 'revision-change'] as const)(

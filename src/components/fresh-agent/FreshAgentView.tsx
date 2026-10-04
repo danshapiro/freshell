@@ -3146,15 +3146,25 @@ export function FreshAgentView({
     const key = makeSnapshotKey({ sessionType: requestSessionType, provider, threadId: sessionId, cwd: requestCwd,
       soulId: requestPaneSoulId, soulIntentRevision: requestPaneSoulRevision })
       + `:read-generation:${requestReadGeneration}:boot:${requestBootId ?? ''}:owner:${requestOwnerFence?.epoch ?? ''}:${requestOwnerFence?.generation ?? ''}`
-    void getSnapshotScheduler().schedule(key, trigger, () =>
+    void getSnapshotScheduler().schedule(key, trigger, async () => {
       // NO signal: the run may execute on behalf of other panes sharing the
       // key, or after this effect cleaned up (A2). Staleness is handled by
       // isStaleSnapshotRequest() when the outcome is applied, not by aborting.
-      getFreshAgentThreadSnapshot(requestSessionType, provider, sessionId, {
-        ...(requestSoulId ? { soulId: requestSoulId } : {}),
-        ...(requestCwd ? { cwd: requestCwd } : {}),
-        trigger,
-      }),
+      const options = { ...(requestCwd ? { cwd: requestCwd } : {}), trigger }
+      if (requestSoulId) {
+        return getFreshAgentThreadSnapshot(requestSessionType, provider, sessionId, { ...options, soulId: requestSoulId })
+      }
+      try {
+        const snapshot = await getFreshAgentThreadSnapshot(requestSessionType, provider, sessionId, options)
+        if (!requestPaneSoulId || !isNativeHistoryOnlySnapshot(snapshot)) return snapshot
+      } catch (error) {
+        if (!requestPaneSoulId || isStaleSnapshotRequest()) throw error
+      }
+      // A matching native ID in the web store does not prove the managed provider source.
+      // Capture the soul with the request and retain the existing application fences.
+      if (isStaleSnapshotRequest()) throw new Error('Conversation source changed during snapshot read')
+      return getFreshAgentThreadSnapshot(requestSessionType, provider, sessionId, { ...options, soulId: requestPaneSoulId })
+    },
     ).then((outcome) => {
       if (isStaleSnapshotRequest()) return
       if (outcome.status === 'ok') {

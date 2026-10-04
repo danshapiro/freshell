@@ -706,10 +706,7 @@ fn snapshot_outage_proxy(socket: &Path) -> Arc<HostedFreshAgentProxy> {
     Arc::new(HostedFreshAgentProxy {
         client: RuntimeClient::new(socket, "0123456789abcdef"),
         broadcast: Arc::new(broadcast::channel(16).0),
-        aliases: Mutex::new(HashMap::from([(
-            ("codex".into(), "session-activity".into()),
-            SoulId::parse("known-hosted-soul").unwrap(),
-        )])),
+        aliases: Mutex::new(HashMap::new()),
         presentation_ids: Mutex::new(HashMap::new()),
         pollers: Mutex::new(HashSet::new()),
         fixture_modes: HashSet::new(),
@@ -742,6 +739,235 @@ async fn snapshot_route_value(
         .await
         .unwrap();
     (status, serde_json::from_slice(&bytes).unwrap())
+}
+
+#[tokio::test]
+async fn real_gateway_pre_native_opencode_projects_only_current_empty_owned_registration() {
+    use freshell_freshagent::hosted_rest::HostedRestSnapshot;
+    for scenario in [
+        "empty",
+        "nonempty",
+        "wrong-provider",
+        "materialized",
+        "owner-changed",
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("owned.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let mut server = tokio::spawn(async move {
+            let mut inventories = 0;
+            loop {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let request: Envelope<AdminCommand> = read_frame(&mut stream).await.unwrap();
+                let result = match request.body {
+                    AdminCommand::Health => AdminResult::Health {
+                        control_epoch: 7,
+                        installation_id: InstallationId::new(),
+                    },
+                    AdminCommand::Inventory => {
+                        inventories += 1;
+                        AdminResult::Inventory(vec![serde_json::from_value(serde_json::json!({
+                            "soulId":"owned-soul", "incarnationId":if scenario == "owner-changed" && inventories == 2 {"new-owner"} else {"owned-owner"},
+                            "launchState":"running", "cleanupState":"none", "intentRevision":1, "executionGeneration":1,
+                            "desiredState":"running", "recoveryState":"live", "durabilityState":"unknown", "allocationState":"allocated",
+                            "evidenceRevision":0, "successfulRecoveriesInWindow":0, "provider":"opencode", "freshAgentSessionId":"managed-opencode-public",
+                            "nativeSessionId":if scenario == "materialized" && inventories == 2 {Some("ses_new")} else {None}
+                        })).unwrap()])
+                    }
+                    AdminCommand::FreshAgentReadSnapshot(read) => {
+                        assert_eq!(read.soul_id.as_str(), "owned-soul");
+                        AdminResult::FreshAgentSnapshot(
+                            serde_json::json!({"threadId":"freshopencode-host-registered", "provider":if scenario == "wrong-provider" {"codex"} else {"opencode"},
+                            "sessionType":"freshopencode", "status":"idle", "turns":if scenario == "nonempty" {serde_json::json!([{"turnId":"native"}])} else {serde_json::json!([])},
+                            "capabilities":{"send":true,"interrupt":false,"approvals":false,"questions":false,"fork":false}, "extensions":{"opencode":{"statusFromLiveState":true}}}),
+                        )
+                    }
+                    other => panic!("unexpected zero-turn read {other:?}"),
+                };
+                write_frame(
+                    &mut stream,
+                    &AdminReply {
+                        request_id: request.request_id,
+                        result: Ok(result),
+                    },
+                )
+                .await
+                .unwrap();
+                if inventories == 2 {
+                    break;
+                }
+            }
+        });
+        let proxy = snapshot_outage_proxy(&socket);
+        let result = proxy
+            .snapshot(HostedRestSnapshot {
+                session_id: "managed-opencode-public".into(),
+                provider: "opencode".into(),
+                session_type: "freshopencode".into(),
+            })
+            .await;
+        let joined = tokio::time::timeout(Duration::from_secs(1), &mut server).await;
+        if joined.is_err() {
+            server.abort();
+            let _ = server.await;
+        }
+        assert!(joined.is_ok());
+        assert_eq!(result.is_ok(), scenario == "empty", "{scenario}");
+        if let Ok(Some(snapshot)) = result {
+            assert_eq!(snapshot["threadId"], "managed-opencode-public");
+            assert_eq!(snapshot["capabilities"]["send"], true);
+        }
+    }
+}
+
+#[tokio::test]
+async fn real_gateway_managed_snapshot_failure_reads_owned_history_and_refuses_wrong_local_store() {
+    let _lock = SNAPSHOT_OUTAGE_ENV_LOCK.lock().await;
+    let dir = tempfile::tempdir().unwrap();
+    let _env = SnapshotTestEnv::isolate(dir.path());
+    let local_path = dir
+        .path()
+        .join("configured-codex/sessions/rollout-session-activity.jsonl");
+    std::fs::create_dir_all(local_path.parent().unwrap()).unwrap();
+    std::fs::write(
+        &local_path,
+        include_str!("../../../test/fixtures/coding-cli/codex/task-events.sanitized.jsonl"),
+    )
+    .unwrap();
+    for history_available in [true, false] {
+        let socket = dir.path().join(format!("owned-{history_available}.sock"));
+        let listener = UnixListener::bind(&socket).unwrap();
+        let mut server = tokio::spawn(async move {
+            let mut read_history = false;
+            loop {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let request: Envelope<AdminCommand> = read_frame(&mut stream).await.unwrap();
+                let mut done = false;
+                let result = match request.body {
+                    AdminCommand::Health => Ok(AdminResult::Health {
+                        control_epoch: 7,
+                        installation_id: InstallationId::new(),
+                    }),
+                    AdminCommand::Inventory => {
+                        done = read_history;
+                        Ok(AdminResult::Inventory(vec![serde_json::from_value(serde_json::json!({
+                        "soulId":"owned-soul", "incarnationId":"owned-incarnation", "launchState":"running", "cleanupState":"none",
+                        "intentRevision":1, "executionGeneration":1, "desiredState":"running", "recoveryState":"live",
+                        "durabilityState":"unknown", "allocationState":"allocated", "evidenceRevision":0, "successfulRecoveriesInWindow":0,
+                        "provider":"codex", "nativeSessionId":"session-activity", "freshAgentSessionId":"managed-public",
+                        "freshAgentSessionType":"freshcodex"
+                    })).unwrap()]))
+                    }
+                    AdminCommand::FreshAgentReadSnapshot(read) => {
+                        assert_eq!(read.soul_id.as_str(), "owned-soul");
+                        Err(freshell_runtime_protocol::RuntimeError::new(
+                            RuntimeErrorCode::HostUnreachable,
+                            "owned host unavailable",
+                        ))
+                    }
+                    AdminCommand::FreshAgentReadHistory(read) => {
+                        assert_eq!(read.soul_id.as_str(), "owned-soul");
+                        read_history = true;
+                        done = !history_available;
+                        if history_available {
+                            Ok(AdminResult::FreshAgentHistory(serde_json::json!({
+                                "threadId":"session-activity", "provider":"codex", "sessionType":"freshcodex", "status":"idle",
+                                "turns":[{"turnId":"owned-volume-answer"}], "capabilities":{"send":false},
+                                "extensions":{"codex":{"ownerKind":"vacant", "nativeHistoryAvailable":true}}
+                            })))
+                        } else {
+                            Err(freshell_runtime_protocol::RuntimeError::new(
+                                RuntimeErrorCode::HostUnreachable,
+                                "owned history unavailable",
+                            ))
+                        }
+                    }
+                    other => panic!("unexpected read {other:?}"),
+                };
+                write_frame(
+                    &mut stream,
+                    &AdminReply {
+                        request_id: request.request_id,
+                        result,
+                    },
+                )
+                .await
+                .unwrap();
+                if done {
+                    break;
+                }
+            }
+        });
+        let (broadcast, _) = broadcast::channel(16);
+        let broadcast = Arc::new(broadcast);
+        let owner =
+            freshell_freshagent::FreshAgentState::new(Arc::new("tok".into()), broadcast.clone());
+        owner
+            .set_hosted_rest_gateway(snapshot_outage_proxy(&socket))
+            .unwrap();
+        let app = freshell_freshagent::snapshot::router(
+            freshell_freshagent::snapshot::SnapshotState::new(
+                Arc::new("tok".into()),
+                freshell_freshagent::FreshCodexState::new(
+                    Arc::new("tok".into()),
+                    broadcast.clone(),
+                    serde_json::json!({}),
+                ),
+                owner,
+                freshell_freshagent::FreshClaudeState::new(broadcast),
+            ),
+        );
+        let (status, value) =
+            snapshot_route_value(&app, "freshcodex", "codex", "session-activity").await;
+        // Join only the owned fixture; old behavior never requests history.
+        let joined = tokio::time::timeout(Duration::from_millis(500), &mut server).await;
+        if joined.is_err() {
+            server.abort();
+            let _ = server.await;
+        }
+        assert_eq!(
+            status,
+            if history_available {
+                axum::http::StatusCode::OK
+            } else {
+                axum::http::StatusCode::SERVICE_UNAVAILABLE
+            }
+        );
+        if history_available {
+            assert_eq!(value["turns"][0]["turnId"], "owned-volume-answer");
+        }
+        assert!(
+            joined.is_ok(),
+            "gateway must request history from the same owned soul"
+        );
+    }
+    let proxy = snapshot_outage_proxy(&dir.path().join("absent-supervisor.sock"));
+    proxy.aliases.lock().await.insert(
+        ("codex".into(), "session-activity".into()),
+        SoulId::parse("owned-soul").unwrap(),
+    );
+    let (broadcast, _) = broadcast::channel(16);
+    let broadcast = Arc::new(broadcast);
+    let owner =
+        freshell_freshagent::FreshAgentState::new(Arc::new("tok".into()), broadcast.clone());
+    owner.set_hosted_rest_gateway(proxy).unwrap();
+    let app =
+        freshell_freshagent::snapshot::router(freshell_freshagent::snapshot::SnapshotState::new(
+            Arc::new("tok".into()),
+            freshell_freshagent::FreshCodexState::new(
+                Arc::new("tok".into()),
+                broadcast.clone(),
+                serde_json::json!({}),
+            ),
+            owner,
+            freshell_freshagent::FreshClaudeState::new(broadcast),
+        ));
+    assert_eq!(
+        snapshot_route_value(&app, "freshcodex", "codex", "session-activity")
+            .await
+            .0,
+        axum::http::StatusCode::SERVICE_UNAVAILABLE
+    );
 }
 
 #[tokio::test]
