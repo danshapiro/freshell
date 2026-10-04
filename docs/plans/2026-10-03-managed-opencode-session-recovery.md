@@ -81,37 +81,37 @@ The transfer interface is bounded metadata plus authenticated begin/chunk/finali
 - Produces: a versioned exact-session bundle and manifest for the root and descendants. Include `session`, referenced `project`/`workspace`/`project_directory`/`permission`, `message`, `part`, `event_sequence`, `event`, `session_message`, `session_input`, `session_context_epoch`, and `todo` rows, plus validated referenced assets. Preserve IDs, opaque data, ordering, relationships, and sequence values. Reject an invalid root parent, dangling reference, unrecognized source DDL/table, unsupported plugin data, or external reference that cannot be captured and mapped.
 - Read the source through SQLite Online Backup from one committed snapshot including visible WAL state; the host DB is never opened by a mutating provider or migrated. Use that full backup only in a private host-local temporary location to extract the selected native closure into a new exact-session representation. Never prune and transmit the full backup or its WAL. Record source schema, migration-journal and SQLite-version fingerprints as bounded metadata. Include only allowlisted session-graph rows and required assets; exclude unrelated roots and account/credential/provider-configuration tables. If a required dependency is outside the supported closure, block. Assets enter the bundle only under pinned-provider write-once/content-addressed semantics; copy and hash them into a content-addressed immutable bundle. Snapshot trees must resolve against the exact Git object store identity; require that store at the same managed path or stage its complete reachable closure. Typed tool-output path fields may be remapped only through an explicit reversible manifest mapping; arbitrary opaque fields remain unchanged. Mutable or unclassified files are unresolved even if pre/post-copy metadata happens to match. Remove the exact local backup and SQLite sidecars after extraction and on recovery from an interrupted extraction.
 
-- [ ] **Step 1: Write failing synthetic behavior tests**
+- [x] **Step 1: Write failing synthetic behavior tests**
 
 Create a synthetic pinned-schema DB with a root, child, grandchild, unrelated root, v1 and v2 message/event rows, pending input, context epoch, todo, project/workspace/directory/permission dependencies, a `message_seq` table matching the host-census mention, and sentinel opaque values. Resolve the `message_seq` discrepancy against the pinned source DDL before accepting the compatibility matrix: classify it explicitly as a supported dependency or a known unrelated/derived table with a test proving safe omission. Add separate unrelated account/credential/configuration tables with unique sentinel values. Assert exact closure/order, no unrelated session or account/credential/configuration value in the decoded serialized bundle or any begin/chunk/finalize payload, preserved IDs/edges/opaque values, committed WAL visibility, uncommitted-write exclusion, and no logical source changes. Test trusted store resolution through discovered `OPENCODE_DB` and channel paths; duplicate IDs across stores are ambiguous, while permission errors, broken links, and malformed paths are unresolved rather than absent. Add inline data, write-once tool-output files, content-addressed snapshot trees with and without an accessible alternate object store, unsupported URI/plugin/schema cases, missing assets, and a mutable/unclassified file; unresolved cases must return Blocked without publishing a bundle. Assert the full SQLite backup and its WAL/SHM sidecars are not copied into supervisor staging and are removed after successful and interrupted extraction recovery. Keep all fixtures synthetic.
 
-- [ ] **Step 2: Run the new tests and verify the intended failure**
+- [x] **Step 2: Run the new tests and verify the intended failure**
 
 Run: `cargo test -p freshell-sessions --test opencode_native_transfer`
 
 Expected: FAIL because no lossless exact-session snapshot/manifest API exists yet.
 
-- [ ] **Step 3: Add the snapshot exporter and manifest**
+- [x] **Step 3: Add the snapshot exporter and manifest**
 
 Resolve one unique trusted source store, verify its effective path and source schema fingerprint against the supported version matrix, and take a SQLite Online Backup snapshot in a private host-local extraction directory. Traverse the root and recursive descendants and validate the complete v1/v2/project dependency closure. Reconcile the reported `message_seq` table with the exact source DDL and encode its explicit classification in the supported schema matrix; do not waive unknown-table blocking based on the name alone. Serialize only those allowlisted rows and validated required assets into a new exact-session bundle; never copy/prune the full backup into the payload. Exclude unrelated session and account/credential/configuration data, and keep schema/migration fingerprints as metadata. Enumerate typed file and snapshot references; accept only write-once or content-addressed assets and verify the required Git object store or stage its complete reachable closure. Preserve native IDs and opaque payload fields; record reversible mappings only for recognized typed paths. Produce deterministic per-row/per-asset digests and a bundle generation, then remove the local extraction intermediate and its sidecars. Return `Blocked` for ambiguous source selection, unsafe links, unknown migration state, unsupported schema/reference, missing asset/object, mutable/unclassified external bytes, quota/free-space limit, or any incomplete edge; never reinterpret those states as source absence.
 
-- [ ] **Step 4: Run the focused tests**
+- [x] **Step 4: Run the focused tests**
 
 Run: `cargo test -p freshell-sessions --test opencode_native_transfer`
 
 Expected: PASS, including WAL snapshot semantics, full native closure, asset mapping, source logical immutability, unrelated-session exclusion, opaque-data preservation, and blocked incomplete/unstable sources.
 
-- [ ] **Step 5: Refactor while green**
+- [x] **Step 5: Refactor while green**
 
 Extract reusable SQLite snapshot/manifest helpers only where they reduce duplication with existing provider-history readers. Keep the native transfer payload independent from the bounded transcript projection helper. Re-run the focused test after refactoring.
 
-- [ ] **Step 6: Run impacted-test verification**
+- [x] **Step 6: Run impacted-test verification**
 
 Run: `cargo test -p freshell-sessions`
 
 Expected: PASS for OpenCode discovery, exact session tree relationships, and the new export contract.
 
-- [ ] **Step 7: Commit the task**
+- [x] **Step 7: Commit the task**
 
 ```bash
 git add crates/freshell-sessions test/unit/tooling/testing/provider-native-history.test.ts test/e2e-browser/fixtures/fake-opencode.cjs
