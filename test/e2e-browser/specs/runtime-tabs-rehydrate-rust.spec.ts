@@ -166,8 +166,11 @@ class RawWsClient {
 test.describe.serial('Phase 4 managed-runtime tab rehydration', () => {
   test('managed fresh-agent: already-live attach restores stale loss through real hosted HTTP truth', async ({ page }) => {
     test.setTimeout(900_000)
+    const observerIntervalMs = 60_000
     const rig = new ManagedRuntimeBrowserRig(process.cwd(), 3, {}, {
       FRESHELL_RUNTIME_HOST_COMMAND_TIMEOUT_MS: '5000', FRESHELL_RUNTIME_FRESH_AGENT_COMMAND_TIMEOUT_MS: '10000',
+      // Exercise owned history before the supervisor's normal periodic recovery.
+      FRESHELL_RUNTIME_OBSERVER_INTERVAL_MS: String(observerIntervalMs),
     }, 'test', {
       enabledProviders: [], freshAgentModes: ['freshcodex'], fixtureFreshAgentModes: ['freshcodex'],
       providerSettings: { freshcodex: {} },
@@ -329,10 +332,21 @@ test.describe.serial('Phase 4 managed-runtime tab rehydration', () => {
       await fs.mkdir(`${info.homeDir}/.codex/sessions`, { recursive: true })
       const wrongTranscript = transcript.replaceAll('Managed fixture saved answer', 'Wrong web-local answer')
       await fs.writeFile(wrongPath, wrongTranscript)
+      const lifecyclePath = path.join(path.dirname(rig.supervisor.runtimeRoot), 'evidence', 'lifecycle.jsonl')
+      const readLifecycle = async () => (await fs.readFile(lifecyclePath, 'utf8'))
+        .split('\n').filter(Boolean).map((line) => JSON.parse(line))
+      const startupFinished = (await readLifecycle()).find((event) => event.event === 'supervisor.startup_scan.finished')
+      expect(Number.isFinite(startupFinished?.at)).toBe(true)
+      // The observer sleeps first, after startup reconciliation finishes.
+      const firstObservationNotBefore = startupFinished.at + observerIntervalMs
+      const holdRequestedAt = Date.now()
+      expect(firstObservationNotBefore - holdRequestedAt,
+        'owned history/read/reload must have a measured window before STOP').toBeGreaterThanOrEqual(25_000)
       const pid = rig.runtime.ownedContainerHostPidExact(view.containerId!)
       heldHost = { containerId: view.containerId!, incarnationId: view.incarnationId, pid }
       rig.signalOwnedSessionHostExact(heldHost.containerId, heldHost.incarnationId, 'SIGSTOP', pid)
       await expect.poll(async () => /State:\s+T/.test(await fs.readFile(`/proc/${pid}/status`, 'utf8'))).toBe(true)
+      const heldAt = Date.now()
       rig.runtime.recordLifecycle('browser.owned_host_hold', { ...heldHost, state: 'T' })
       const unavailableBaseline = sent.length
       const unavailable = await fetch(`${info.baseUrl}/api/fresh-agent/threads/freshcodex/codex/${view.nativeSessionId}`, {
@@ -399,27 +413,35 @@ test.describe.serial('Phase 4 managed-runtime tab rehydration', () => {
       expect(managedReceipts[0].containerId).toBe(view.containerId)
       expect(rig.runtime.broker.eventsSnapshot().filter((event) => event.containerId === view.containerId
         && event.method === 'POST' && event.url === `/v1.47/containers/${view.containerId}/start`)).toHaveLength(1)
-      const lifecycle = (await fs.readFile(path.join(path.dirname(rig.supervisor.runtimeRoot), 'evidence', 'lifecycle.jsonl'), 'utf8'))
-        .split('\n').filter(Boolean).map((line) => JSON.parse(line))
+      const lifecycle = await readLifecycle()
       const launches = lifecycle.filter((event) => event.event === 'supervisor.launch_running' && event.data.soulId === view.soulId)
       expect(launches).toHaveLength(1)
       expect(launches[0].data).toMatchObject({ incarnationId: view.incarnationId, containerId: view.containerId, workerLaunchCount: 1 })
       expectOnlyCanonicalBootstrap()
       expect(bootstrapLifecycle()).toHaveLength(settledLifecycleCount)
-      rig.runtime.writeBrowserArtifact('owned-host-history-preservation', { source: 'owned provider-volume native history',
+      const historyEvidence = { source: 'owned provider-volume native history',
         wrongSource: 'coincident web-local native history', heldHost, bootstrap: bootstrap.request,
         bootstrapCreates: bootstrapLifecycle().filter((frame) => frame.type === 'freshAgent.create'),
         nativeSessionId: view.nativeSessionId, beforeHistory: stableProviderState, afterReload: fixtureState(),
-        originalIdentity: canonicalIdentity, managedLaunch: launches[0], bothSourcesUnchanged: true })
+        originalIdentity: canonicalIdentity, managedLaunch: launches[0], bothSourcesUnchanged: true }
       rig.signalOwnedSessionHostExact(heldHost.containerId, heldHost.incarnationId, 'SIGCONT', pid)
+      const releasedAt = Date.now()
       rig.runtime.recordLifecycle('browser.owned_host_release', heldHost)
       heldHost = undefined
       await expect.poll(async () => /State:\s+T/.test(await fs.readFile(`/proc/${pid}/status`, 'utf8'))).toBe(false)
+      const resumedAt = Date.now()
+      expect(resumedAt, 'exact owned host must resume before the first observer pass').toBeLessThan(firstObservationNotBefore)
       await expectOriginalConversation()
       expect(fixtureState()).toMatchObject({ nativeSessionId: stableProviderState.nativeSessionId,
         dispatchCount: stableProviderState.dispatchCount, completionCount: stableProviderState.completionCount })
       expectOnlyCanonicalBootstrap()
       expect(bootstrapLifecycle()).toHaveLength(settledLifecycleCount)
+      const targetSoulRecoveries = (await readLifecycle()).filter((event) => event.event === 'supervisor.runtime_observer.recovery_scheduled'
+        && event.data.soulId === view.soulId)
+      expect(targetSoulRecoveries).toHaveLength(0)
+      rig.runtime.writeBrowserArtifact('owned-host-history-preservation', { ...historyEvidence,
+        observerWindow: { intervalMs: observerIntervalMs, startupFinished, firstObservationNotBefore,
+          holdRequestedAt, heldAt, releasedAt, resumedAt, targetSoulRecoveries } })
     } finally {
       try {
         if (heldHost) rig.signalOwnedSessionHostExact(heldHost.containerId, heldHost.incarnationId, 'SIGCONT', heldHost.pid)
