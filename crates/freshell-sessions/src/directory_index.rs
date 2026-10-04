@@ -146,6 +146,24 @@ impl IndexedSession {
     }
 }
 
+/// Related values from one published [`SessionIndex`] generation. The row
+/// collection and potentially large Codex sidecars are shared through `Arc`s.
+/// Consumers that need rows alongside scan status, unresolved Codex
+/// identities, or accepted source paths should use the coherent accessor so
+/// they do not mix values from separate refreshes.
+#[derive(Debug, Clone)]
+pub struct SessionIndexSnapshot {
+    /// Provider rows captured from this generation.
+    pub sessions: Arc<Vec<IndexedSession>>,
+    /// Providers whose listing attempt failed during this generation.
+    pub scan_failures: Vec<String>,
+    /// Same-id Codex file groups that could not safely be composed.
+    pub unresolved_codex_identities: Arc<Vec<CodexUnresolvedIdentity>>,
+    /// Chronological source paths for accepted multi-file Codex rows, keyed
+    /// by their canonical embedded session id.
+    pub codex_segment_paths: Arc<HashMap<String, Vec<PathBuf>>>,
+}
+
 /// One discovered file: its absolute path plus the stat facts (`mtime`/`size`)
 /// [`SessionIndex`]'s incremental cache uses to decide whether it needs
 /// re-parsing. Stat-only — no file content is read to produce this.
@@ -1170,13 +1188,15 @@ struct CachedSnapshot {
 }
 
 /// Fields copied together from one published generation. The identity list
-/// stays behind an `Arc` here so consumers that only need rows and failures
-/// do not clone the full quarantine sidecar.
-type SnapshotRead = (
-    Arc<Vec<IndexedSession>>,
-    Vec<String>,
-    Arc<Vec<CodexUnresolvedIdentity>>,
-);
+/// and Codex path map stay behind `Arc`s here so consumers that only need
+/// rows and failures do not clone either sidecar.
+#[derive(Default)]
+struct SnapshotRead {
+    items: Arc<Vec<IndexedSession>>,
+    scan_failures: Vec<String>,
+    unresolved_codex_identities: Arc<Vec<CodexUnresolvedIdentity>>,
+    codex_segment_paths: Arc<HashMap<String, Vec<PathBuf>>>,
+}
 
 /// Bookkeeping for the persistent parse-cache's opportunistic-save gating
 /// (module doc comment's "Persistent parse cache" section).
@@ -1469,27 +1489,28 @@ impl SessionIndex {
     /// stale failures. Same stale-while-revalidate semantics as
     /// [`Self::snapshot`].
     pub async fn snapshot_with_failures(&self) -> (Arc<Vec<IndexedSession>>, Vec<String>) {
-        let (items, failures, _) = self.snapshot_read().await;
-        (items, failures)
+        let snapshot = self.snapshot_read().await;
+        (snapshot.items, snapshot.scan_failures)
     }
 
     /// [`Self::snapshot_with_failures`] plus unresolved Codex identity
-    /// evidence from the SAME published generation, copied under ONE lock
-    /// acquisition. Session-directory consumers that combine rows with
-    /// quarantine evidence must use this accessor rather than pairing
-    /// `snapshot_with_failures()` with `unresolved_codex_identities()`.
+    /// evidence and accepted Codex source paths from the SAME published
+    /// generation, read under ONE lock acquisition. Session-directory
+    /// consumers that combine rows with quarantine evidence or source paths
+    /// must use this accessor rather than pairing separate snapshot lookups.
     /// Stale-while-revalidate timing is unchanged: a stale snapshot is
     /// returned immediately while refresh runs in the background, and only
     /// a cold cache waits for its first refresh.
     pub async fn snapshot_with_failures_and_unresolved_codex_identities(
         &self,
-    ) -> (
-        Arc<Vec<IndexedSession>>,
-        Vec<String>,
-        Vec<CodexUnresolvedIdentity>,
-    ) {
-        let (items, failures, unresolved) = self.snapshot_read().await;
-        (items, failures, unresolved.as_ref().clone())
+    ) -> SessionIndexSnapshot {
+        let snapshot = self.snapshot_read().await;
+        SessionIndexSnapshot {
+            sessions: snapshot.items,
+            scan_failures: snapshot.scan_failures,
+            unresolved_codex_identities: snapshot.unresolved_codex_identities,
+            codex_segment_paths: snapshot.codex_segment_paths,
+        }
     }
 
     /// Return one coherent published generation, refreshing according to the
@@ -1599,13 +1620,13 @@ impl SessionIndex {
     /// stale-while-revalidate read.
     fn cached_pair(&self, require_fresh: bool) -> Option<(Arc<Vec<IndexedSession>>, Vec<String>)> {
         self.cached_snapshot_read(require_fresh)
-            .map(|(items, failures, _)| (items, failures))
+            .map(|snapshot| (snapshot.items, snapshot.scan_failures))
     }
 
-    /// The cached rows, scan failures, and unresolved Codex identities from
-    /// the SAME generation, read under ONE lock acquisition. The identity
-    /// `Arc` is cloned while the snapshot lock is held; the published vector
-    /// itself is immutable thereafter.
+    /// The cached rows, scan failures, unresolved Codex identities, and
+    /// accepted Codex source paths from the SAME generation, read under ONE
+    /// lock acquisition. Sidecar `Arc`s are cloned while the snapshot lock
+    /// is held; the published values are immutable thereafter.
     fn cached_snapshot_read(&self, require_fresh: bool) -> Option<SnapshotRead> {
         let guard = self.snapshot.lock().unwrap();
         match guard.as_ref() {
@@ -1623,11 +1644,12 @@ impl SessionIndex {
                         return None;
                     }
                 }
-                Some((
-                    Arc::clone(&c.items),
-                    sorted_names(&c.scan_failures),
-                    Arc::clone(&c.unresolved_codex_identities),
-                ))
+                Some(SnapshotRead {
+                    items: Arc::clone(&c.items),
+                    scan_failures: sorted_names(&c.scan_failures),
+                    unresolved_codex_identities: Arc::clone(&c.unresolved_codex_identities),
+                    codex_segment_paths: Arc::clone(&c.codex_segment_paths),
+                })
             }
             _ => None,
         }
@@ -4587,14 +4609,15 @@ pub(crate) mod tests {
         let index =
             SessionIndex::with_ttl_and_cache_path(vec![source], Duration::from_secs(60), None);
 
-        let (rows, failures, unresolved) = index
+        let snapshot = index
             .snapshot_with_failures_and_unresolved_codex_identities()
             .await;
+        let rows = &snapshot.sessions;
         assert_eq!(rows.len(), 1, "the cwd-less segment is evidence-only");
-        assert!(failures.is_empty());
+        assert!(snapshot.scan_failures.is_empty());
         assert_eq!(rows[0].source_file.as_deref(), Some(older_path.as_path()));
         assert_eq!(
-            unresolved,
+            snapshot.unresolved_codex_identities.as_ref().clone(),
             vec![CodexUnresolvedIdentity {
                 session_id: "b7936c10-4935-441c-837c-c1f33cafec2d".to_string(),
                 paths: vec![newer_path.clone(), older_path.clone()],
@@ -4606,24 +4629,98 @@ pub(crate) mod tests {
         index.mark_provider_dirty("codex");
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
         loop {
-            let (rows, failures, unresolved) = index
+            let snapshot = index
                 .snapshot_with_failures_and_unresolved_codex_identities()
                 .await;
-            if unresolved.is_empty() {
-                assert!(failures.is_empty());
-                assert_eq!(rows.len(), 1);
-                assert_eq!(rows[0].source_file.as_deref(), Some(older_path.as_path()));
+            if snapshot.unresolved_codex_identities.is_empty() {
+                assert!(snapshot.scan_failures.is_empty());
+                assert_eq!(snapshot.sessions.len(), 1);
+                assert_eq!(
+                    snapshot.sessions[0].source_file.as_deref(),
+                    Some(older_path.as_path())
+                );
                 break;
             }
-            assert_eq!(rows.len(), 1, "stale reads must stay on the old generation");
-            assert!(failures.is_empty());
             assert_eq!(
-                unresolved[0].paths,
+                snapshot.sessions.len(),
+                1,
+                "stale reads must stay on the old generation"
+            );
+            assert!(snapshot.scan_failures.is_empty());
+            assert_eq!(
+                snapshot.unresolved_codex_identities[0].paths,
                 vec![newer_path.clone(), older_path.clone()]
             );
             assert!(
                 std::time::Instant::now() < deadline,
                 "the recovery generation must be published after the dirty refresh"
+            );
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[tokio::test]
+    async fn snapshot_with_codex_paths_keeps_rows_and_paths_in_one_generation() {
+        let home = unique_temp_dir("codex-continuation-path-generation");
+        let (older, newer) = codex_continuation_fixtures();
+        let (older_path, newer_path) = write_codex_pair(&home, &older, &newer);
+        let moved_path = newer_path.with_file_name("moved-newer-rollout.jsonl");
+        let source = Arc::new(CodexSource::new(home.join(".codex")));
+        let index =
+            SessionIndex::with_ttl_and_cache_path(vec![source], Duration::from_secs(60), None);
+        let session_id = "b7936c10-4935-441c-837c-c1f33cafec2d";
+
+        let snapshot = index
+            .snapshot_with_failures_and_unresolved_codex_identities()
+            .await;
+        assert!(snapshot.scan_failures.is_empty());
+        assert!(snapshot.unresolved_codex_identities.is_empty());
+        assert_eq!(snapshot.sessions.len(), 1);
+        assert_eq!(
+            snapshot.sessions[0].source_file.as_deref(),
+            Some(newer_path.as_path())
+        );
+        assert_eq!(
+            snapshot.codex_segment_paths.get(session_id),
+            Some(&vec![older_path.clone(), newer_path.clone()]),
+            "the accepted source paths must belong to the same published generation as the composed row"
+        );
+
+        std::fs::rename(&newer_path, &moved_path).unwrap();
+        index.mark_provider_dirty("codex");
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let snapshot = index
+                .snapshot_with_failures_and_unresolved_codex_identities()
+                .await;
+            assert!(snapshot.scan_failures.is_empty());
+            assert!(snapshot.unresolved_codex_identities.is_empty());
+            assert_eq!(snapshot.sessions.len(), 1);
+            let paths = snapshot
+                .codex_segment_paths
+                .get(session_id)
+                .expect("the accepted continuation keeps its source path list");
+            assert_eq!(paths[0], older_path);
+            if paths[1] == newer_path {
+                assert_eq!(
+                    snapshot.sessions[0].source_file.as_deref(),
+                    Some(newer_path.as_path())
+                );
+            } else if paths[1] == moved_path {
+                assert_eq!(
+                    snapshot.sessions[0].source_file.as_deref(),
+                    Some(moved_path.as_path())
+                );
+                break;
+            } else {
+                panic!("unexpected source paths in published generation: {paths:?}");
+            }
+
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the renamed path must eventually be published with its matching composed row"
             );
             tokio::time::sleep(Duration::from_millis(2)).await;
         }

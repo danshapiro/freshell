@@ -2745,6 +2745,7 @@ async fn main() -> ExitCode {
         metadata: session_metadata_store.clone(),
         // STATUS-STRIP: sessions.cloned pages are client-ordered per instance.
         server_instance: Arc::clone(&server_instance_id),
+        collision_signatures: Arc::default(),
         // Unified agent names (Task 7 review M1): captured AFTER the boot
         // consolidation above ran — once the receipt committed, a scoped
         // coding-agent row's displayed title never consults the migrated
