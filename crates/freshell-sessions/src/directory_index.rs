@@ -4332,8 +4332,8 @@ pub(crate) mod tests {
             row.first_user_message.as_deref(),
             Some("Older first request")
         );
-        assert_eq!(row.title.as_deref(), Some("Continuation title"));
-        assert_eq!(row.summary.as_deref(), Some("Continuation summary"));
+        assert_eq!(row.title.as_deref(), Some("Older first request"));
+        assert_eq!(row.summary.as_deref(), Some("Older assistant summary"));
         assert_eq!(
             row.token_usage.as_ref().map(|usage| usage.total_tokens),
             Some(780)
@@ -4344,7 +4344,7 @@ pub(crate) mod tests {
         );
         assert_eq!(
             row.last_activity_at,
-            crate::time::parse_timestamp_ms(&serde_json::json!("2026-10-03T00:00:10.009Z"))
+            crate::time::parse_timestamp_ms(&serde_json::json!("2026-10-03T00:00:10.004Z"))
                 .unwrap()
         );
 
@@ -4896,13 +4896,10 @@ pub(crate) mod tests {
             after_third[0].source_file.as_deref(),
             Some(newest_path.as_path())
         );
-        assert_eq!(
-            after_third[0].title.as_deref(),
-            Some("Latest continuation request")
-        );
+        assert_eq!(after_third[0].title.as_deref(), Some("Older first request"));
         assert_eq!(
             after_third[0].summary.as_deref(),
-            Some("Latest continuation summary")
+            Some("Older assistant summary")
         );
         assert_eq!(
             after_third[0]

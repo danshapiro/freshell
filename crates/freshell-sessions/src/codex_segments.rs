@@ -502,16 +502,9 @@ fn merge_ordered_items(
         .expect("a composable group has one renderable row per member")
         .clone();
     merged.created_at = items.iter().filter_map(|item| item.created_at).min();
-    merged.last_activity_at = members
+    merged.last_activity_at = items
         .iter()
-        .filter_map(|member| {
-            member
-                .evidence
-                .as_ref()?
-                .interval
-                .map(|interval| nanos_to_millis(interval.end_nanos))
-        })
-        .chain(items.iter().map(|item| item.last_activity_at))
+        .map(|item| item.last_activity_at)
         .max()
         .unwrap_or(0);
     merged.first_user_message = items
@@ -519,11 +512,9 @@ fn merge_ordered_items(
         .find_map(|item| nonempty(item.first_user_message.as_ref()).cloned());
     merged.title = items
         .iter()
-        .rev()
         .find_map(|item| nonempty(item.title.as_ref()).cloned());
     merged.summary = items
         .iter()
-        .rev()
         .find_map(|item| nonempty(item.summary.as_ref()).cloned());
     merged.token_usage = items.iter().rev().find_map(|item| item.token_usage.clone());
     merged.source_file = members.last().map(|member| member.path.clone());
@@ -595,10 +586,6 @@ fn parse_rfc3339_nanos(value: &str) -> Option<i64> {
     DateTime::parse_from_rfc3339(value)
         .ok()?
         .timestamp_nanos_opt()
-}
-
-fn nanos_to_millis(nanos: i64) -> i64 {
-    nanos.div_euclid(1_000_000)
 }
 
 fn push_error(errors: &mut Vec<CodexSegmentScanError>, error: CodexSegmentScanError) {
