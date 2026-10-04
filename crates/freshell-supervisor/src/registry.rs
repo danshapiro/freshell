@@ -3229,6 +3229,164 @@ mod tests {
             .unwrap();
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    #[ignore = "process-kill recovery test; run only through scripts/sandbox-test.sh"]
+    async fn opencode_registry_readiness_commit_survives_process_crash_and_reopen() {
+        use std::{os::unix::process::ExitStatusExt, process::Command};
+
+        const ROOT_ENV: &str = "FRESHELL_OPENCODE_REGISTRY_CRASH_ROOT";
+        const POINT_ENV: &str = "FRESHELL_OPENCODE_REGISTRY_CRASH_POINT";
+        let executable = std::env::current_exe().expect("resolve this test executable");
+
+        for point in ["before_mark_running", "after_mark_running"] {
+            let dir = tempfile::tempdir().expect("create synthetic registry root");
+            let child = Command::new(&executable)
+                .args([
+                    "--exact",
+                    "registry::tests::opencode_registry_readiness_commit_crash_child",
+                    "--ignored",
+                    "--nocapture",
+                ])
+                .env(ROOT_ENV, dir.path())
+                .env(POINT_ENV, point)
+                .status()
+                .expect("spawn synthetic registry crash child");
+            assert_eq!(
+                child.signal(),
+                Some(libc::SIGKILL),
+                "child must die at {point}; exit={child:?}"
+            );
+
+            let registry = Registry::open(dir.path(), None).expect("reopen production registry");
+            let mut descriptor = opencode_transfer_descriptor("transfer-registry-crash");
+            descriptor.incarnation_id = "incarnation-opencode-registry-crash".into();
+            let soul_id = SoulId::parse("soul-opencode-registry-crash").unwrap();
+            let request_id = RequestId::parse("request-opencode-registry-crash").unwrap();
+            let replay = registry
+                .prepare_launch(opencode_prep(
+                    soul_id.clone(),
+                    request_id,
+                    &descriptor,
+                    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                ))
+                .await
+                .expect("same synthetic launch must be recoverable after process death");
+            assert!(replay.existing_request);
+            assert_eq!(replay.incarnation_id.as_str(), descriptor.incarnation_id);
+
+            if point == "before_mark_running" {
+                assert_eq!(replay.state, LaunchState::Starting);
+                assert_eq!(
+                    registry
+                        .opencode_transfer_receipt_candidates()
+                        .await
+                        .unwrap(),
+                    vec![replay.incarnation_id.clone()],
+                    "the interrupted readiness commit remains a recovery candidate"
+                );
+                registry
+                    .mark_running(replay.incarnation_id.clone())
+                    .await
+                    .expect("registry readiness commit is retryable after host revalidation");
+            } else {
+                assert_eq!(
+                    replay.state,
+                    LaunchState::Running,
+                    "a committed readiness state survives process death"
+                );
+                assert_eq!(
+                    registry
+                        .opencode_transfer_receipt_candidates()
+                        .await
+                        .unwrap(),
+                    vec![replay.incarnation_id.clone()],
+                    "running transfers remain candidates until the host receipt is revalidated"
+                );
+            }
+            drop(registry);
+
+            let reopened = Registry::open(dir.path(), None).expect("reopen after readiness retry");
+            let committed = reopened
+                .prepare_launch(opencode_prep(
+                    soul_id,
+                    RequestId::parse("request-opencode-registry-crash").unwrap(),
+                    &descriptor,
+                    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                ))
+                .await
+                .unwrap();
+            assert_eq!(committed.state, LaunchState::Running);
+            let connection = open_connection(&reopened.inner.db_path).unwrap();
+            let command_state: String = connection
+                .query_row(
+                    "SELECT state FROM commands WHERE request_id=?1",
+                    params!["request-opencode-registry-crash"],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(command_state, "running");
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[ignore = "child fixture for opencode_registry_readiness_commit_survives_process_crash_and_reopen"]
+    async fn opencode_registry_readiness_commit_crash_child() {
+        const ROOT_ENV: &str = "FRESHELL_OPENCODE_REGISTRY_CRASH_ROOT";
+        const POINT_ENV: &str = "FRESHELL_OPENCODE_REGISTRY_CRASH_POINT";
+        let Some(root) = std::env::var_os(ROOT_ENV).map(PathBuf::from) else {
+            return;
+        };
+        let point = std::env::var(POINT_ENV).expect("crash checkpoint");
+        let registry = Registry::open(&root, None).expect("create synthetic production registry");
+        let mut descriptor = opencode_transfer_descriptor("transfer-registry-crash");
+        descriptor.incarnation_id = "incarnation-opencode-registry-crash".into();
+        let soul_id = SoulId::parse("soul-opencode-registry-crash").unwrap();
+        let prepared = registry
+            .prepare_launch(opencode_prep(
+                soul_id,
+                RequestId::parse("request-opencode-registry-crash").unwrap(),
+                &descriptor,
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            ))
+            .await
+            .unwrap();
+        registry
+            .commit_created(
+                prepared.incarnation_id.clone(),
+                BackendCreatedRecord {
+                    daemon_id: DockerDaemonId::new(),
+                    container_id: "synthetic-opencode-container".into(),
+                    image_ref: descriptor.target_image_ref.clone(),
+                    runtime_dir: root.join("runtime"),
+                    host_binary_path: root.join("freshell-session-host"),
+                    immutable_config_digest: "synthetic-config-digest".into(),
+                },
+            )
+            .await
+            .unwrap();
+        registry
+            .commit_execution_grant(prepared.incarnation_id.clone(), HostBootId::new(), limits())
+            .await
+            .unwrap();
+        if point == "before_mark_running" {
+            unsafe {
+                libc::kill(libc::getpid(), libc::SIGKILL);
+            }
+            std::process::abort();
+        }
+        registry
+            .mark_running(prepared.incarnation_id)
+            .await
+            .unwrap();
+        assert_eq!(point, "after_mark_running");
+        unsafe {
+            libc::kill(libc::getpid(), libc::SIGKILL);
+        }
+        std::process::abort();
+    }
+
     #[tokio::test]
     async fn stage_reference_query_rejects_an_unreadable_transfer_descriptor() {
         let dir = tempfile::tempdir().unwrap();
