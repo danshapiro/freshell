@@ -83,7 +83,7 @@ export default function HistoryView({ onOpenSession }: { onOpenSession?: () => v
   const [dismissedIntegrityCount, setDismissedIntegrityCount] = useState<number | null>(null)
 
   useEffect(() => {
-    if (store.getState().sessions.windows?.history) return
+    if (typeof store.getState().sessions.windows?.history?.lastLoadedAt === 'number') return
 
     let mounted = true
     const request = dispatch(fetchSessionWindow({
