@@ -353,48 +353,65 @@ fn begin_samples_filesystem_capacity_after_acquiring_the_staging_lock() {
         Arc::new(OpenCodeTransferStaging::new(dir.path(), StagingLimits::for_test(8, 16)).unwrap());
     let first = descriptor(b"12345678", "transfer-serialized-space-first");
     let second = descriptor(b"abcdefgh", "transfer-serialized-space-second");
-    let (first_probe_tx, first_probe_rx) = mpsc::channel();
+    let (events_tx, events_rx) = mpsc::channel();
     let (release_first_tx, release_first_rx) = mpsc::channel();
     let first_staging = Arc::clone(&staging);
+    let first_events = events_tx.clone();
     let first_result = std::thread::spawn(move || {
         first_staging.begin_with_space_probe(&first, TEST_ATTEMPT, || {
-            first_probe_tx.send(()).unwrap();
+            first_events
+                .send(super::BeginLockTestEvent::Probe(1))
+                .unwrap();
             release_first_rx.recv().unwrap();
             Ok(8)
         })
     });
-    first_probe_rx
-        .recv_timeout(Duration::from_secs(1))
-        .expect("first begin reached its locked capacity observation");
+    assert_eq!(
+        events_rx.recv().unwrap(),
+        super::BeginLockTestEvent::Probe(1),
+        "first Begin reached its locked capacity observation"
+    );
 
-    let (second_started_tx, second_started_rx) = mpsc::channel();
-    let (second_probe_tx, second_probe_rx) = mpsc::channel();
+    staging.observe_next_begin_lock_contention_for_test(events_tx.clone());
     let second_staging = Arc::clone(&staging);
+    let second_events = events_tx;
     let second_result = std::thread::spawn(move || {
-        second_started_tx.send(()).unwrap();
         second_staging.begin_with_space_probe(&second, TEST_ATTEMPT, || {
-            second_probe_tx.send(()).unwrap();
+            second_events
+                .send(super::BeginLockTestEvent::Probe(2))
+                .unwrap();
             Ok(8)
         })
     });
-    second_started_rx
-        .recv_timeout(Duration::from_secs(1))
-        .expect("second Begin started while the first owns the staging lock");
-    assert!(
-        second_probe_rx
-            .recv_timeout(Duration::from_millis(50))
-            .is_err(),
-        "a second Begin cannot sample the same capacity while the first owns the staging lock"
-    );
+
+    let observed = events_rx.recv().unwrap();
+    if observed != super::BeginLockTestEvent::Contended {
+        release_first_tx.send(()).unwrap();
+        let _ = first_result.join();
+        let _ = second_result.join();
+        panic!(
+            "second Begin must encounter the held staging mutex before probing capacity; got {observed:?}"
+        );
+    }
+    if let Ok(unexpected) = events_rx.try_recv() {
+        release_first_tx.send(()).unwrap();
+        let _ = first_result.join();
+        let _ = second_result.join();
+        panic!(
+            "second capacity probe ran before the first reservation was released: {unexpected:?}"
+        );
+    }
 
     release_first_tx.send(()).unwrap();
     assert!(matches!(
         first_result.join().unwrap().unwrap(),
         StagingStart::Started { .. }
     ));
-    second_probe_rx
-        .recv_timeout(Duration::from_secs(1))
-        .expect("second begin samples capacity after the first publishes its reservation");
+    assert_eq!(
+        events_rx.recv().unwrap(),
+        super::BeginLockTestEvent::Probe(2),
+        "second Begin probes capacity after the first releases the staging lock"
+    );
     assert_eq!(second_result.join().unwrap().unwrap(), StagingStart::Queued);
 }
 
@@ -486,6 +503,202 @@ fn opencode_transfer_process_crash_child() {
         libc::kill(libc::getpid(), libc::SIGKILL);
     }
     unreachable!("SIGKILL should terminate the crash fixture child");
+}
+
+#[test]
+#[ignore = "process-kill recovery test; run only through scripts/sandbox-test.sh"]
+fn opencode_transfer_promoted_queue_recovers_after_supervisor_process_crash() {
+    use std::{os::unix::process::ExitStatusExt, process::Command};
+
+    const ROOT_ENV: &str = "FRESHELL_OPENCODE_PROMOTION_CRASH_TEST_ROOT";
+    const EXPECTED_ORDERS: &str = "promotion-crash-expected-orders";
+
+    let dir = tempfile::tempdir().unwrap();
+    let executable = std::env::current_exe().expect("resolve this test executable");
+    let child = Command::new(executable)
+        .args([
+            "--exact",
+            "opencode_transfer::tests::opencode_transfer_promotion_process_crash_child",
+            "--ignored",
+            "--nocapture",
+        ])
+        .env(ROOT_ENV, dir.path())
+        .status()
+        .expect("spawn the isolated promotion crash fixture child");
+    assert_eq!(
+        child.signal(),
+        Some(libc::SIGKILL),
+        "the fixture process must be killed after promoting the FIFO head"
+    );
+
+    let expected_orders = std::fs::read_to_string(dir.path().join(EXPECTED_ORDERS))
+        .expect("child records both FIFO positions before the crash");
+    let mut expected_orders = expected_orders.split_whitespace();
+    let head_order = expected_orders
+        .next()
+        .expect("head order is present")
+        .parse::<u64>()
+        .unwrap();
+    let behind_order = expected_orders
+        .next()
+        .expect("later order is present")
+        .parse::<u64>()
+        .unwrap();
+    assert!(expected_orders.next().is_none());
+    assert!(head_order < behind_order);
+
+    let staging = OpenCodeTransferStaging::new(dir.path(), StagingLimits::for_test(8, 32))
+        .expect("restart staging from the child's durable files");
+    let active = descriptor(b"12345678", "transfer-promotion-crash-active");
+    let head = descriptor(b"abcdefgh", "transfer-promotion-crash-head");
+    let behind = descriptor(b"ABCDEFGH", "transfer-promotion-crash-behind");
+    let promoted = staging.partial_path(&head.transfer_id);
+    let waiting = staging.queued_path(&behind.transfer_id);
+
+    assert_eq!(
+        staging
+            .advance_queue_unlocked(16)
+            .expect("the interrupted promoted partial must be repaired before reservation scans"),
+        0,
+        "the later entry remains behind the active and promoted reservations"
+    );
+    assert_eq!(staging.read_descriptor(&promoted).unwrap(), head);
+    assert_eq!(super::read_attempt_owner(&promoted).unwrap(), TEST_ATTEMPT);
+    assert!(promoted.join("entry-0000.part").is_file());
+    assert_eq!(
+        std::fs::metadata(promoted.join("entry-0000.part"))
+            .unwrap()
+            .len(),
+        0,
+        "the promoted payload placeholder is recovered without inventing data"
+    );
+    assert_eq!(
+        staging.read_queue_order_unlocked(&waiting).unwrap(),
+        behind_order,
+        "the later entry retains its durable FIFO position"
+    );
+
+    staging.abort(&active.transfer_id, TEST_ATTEMPT).unwrap();
+    let later_partial = staging.partial_path(&behind.transfer_id);
+    assert!(
+        later_partial.is_dir(),
+        "releasing capacity advances the FIFO"
+    );
+    assert_eq!(staging.read_descriptor(&later_partial).unwrap(), behind);
+    assert_eq!(
+        super::read_attempt_owner(&later_partial).unwrap(),
+        TEST_ATTEMPT,
+        "promotion preserves the later entry's attempt owner"
+    );
+}
+
+#[test]
+#[ignore = "child fixture for opencode_transfer_promoted_queue_recovers_after_supervisor_process_crash"]
+fn opencode_transfer_promotion_process_crash_child() {
+    const ROOT_ENV: &str = "FRESHELL_OPENCODE_PROMOTION_CRASH_TEST_ROOT";
+    const EXPECTED_ORDERS: &str = "promotion-crash-expected-orders";
+    let Some(root) = std::env::var_os(ROOT_ENV) else {
+        return;
+    };
+    let root = std::path::PathBuf::from(root);
+    let staging = OpenCodeTransferStaging::new(&root, StagingLimits::for_test(8, 32)).unwrap();
+    let active = descriptor(b"12345678", "transfer-promotion-crash-active");
+    let head = descriptor(b"abcdefgh", "transfer-promotion-crash-head");
+    let behind = descriptor(b"ABCDEFGH", "transfer-promotion-crash-behind");
+    assert!(matches!(
+        staging.begin(&active, TEST_ATTEMPT, 8).unwrap(),
+        StagingStart::Started { .. }
+    ));
+    assert_eq!(
+        staging.begin(&head, TEST_ATTEMPT, 8).unwrap(),
+        StagingStart::Queued
+    );
+    assert_eq!(
+        staging.begin(&behind, TEST_ATTEMPT, 8).unwrap(),
+        StagingStart::Queued
+    );
+    let head_order = staging
+        .read_queue_order_unlocked(&staging.queued_path(&head.transfer_id))
+        .unwrap();
+    let behind_order = staging
+        .read_queue_order_unlocked(&staging.queued_path(&behind.transfer_id))
+        .unwrap();
+    assert!(head_order < behind_order);
+    std::fs::write(
+        root.join(EXPECTED_ORDERS),
+        format!("{head_order} {behind_order}"),
+    )
+    .unwrap();
+
+    staging.crash_after_queue_promotion_order_removal_for_test();
+    let promoted = staging.advance_queue_unlocked(16).unwrap();
+    assert_eq!(promoted, 1);
+    unreachable!("the promotion crash failpoint should terminate the fixture child");
+}
+
+#[test]
+fn restart_repairs_interrupted_queue_promotion_before_reservation_scan() {
+    let dir = tempfile::tempdir().unwrap();
+    let staging = OpenCodeTransferStaging::new(dir.path(), StagingLimits::for_test(8, 32)).unwrap();
+    let active = descriptor(b"12345678", "transfer-promotion-repair-active");
+    let head = descriptor(b"abcdefgh", "transfer-promotion-repair-head");
+    let behind = descriptor(b"ABCDEFGH", "transfer-promotion-repair-behind");
+    staging.begin(&active, TEST_ATTEMPT, 8).unwrap();
+    assert_eq!(
+        staging.begin(&head, TEST_ATTEMPT, 8).unwrap(),
+        StagingStart::Queued
+    );
+    assert_eq!(
+        staging.begin(&behind, TEST_ATTEMPT, 8).unwrap(),
+        StagingStart::Queued
+    );
+    let head_order = staging
+        .read_queue_order_unlocked(&staging.queued_path(&head.transfer_id))
+        .unwrap();
+    let behind_order = staging
+        .read_queue_order_unlocked(&staging.queued_path(&behind.transfer_id))
+        .unwrap();
+    assert!(head_order < behind_order);
+
+    // Recreate the durable shape left by the old promotion sequence: the
+    // queue head has become .partial and lost its order marker, but required
+    // payload placeholders were not created before the process stopped.
+    let queued_head = staging.queued_path(&head.transfer_id);
+    let partial_head = staging.partial_path(&head.transfer_id);
+    std::fs::rename(&queued_head, &partial_head).unwrap();
+    std::fs::remove_file(partial_head.join(".queue-order")).unwrap();
+    drop(staging);
+
+    let restarted =
+        OpenCodeTransferStaging::new(dir.path(), StagingLimits::for_test(8, 32)).unwrap();
+    assert_eq!(restarted.read_descriptor(&partial_head).unwrap(), head);
+    assert_eq!(
+        super::read_attempt_owner(&partial_head).unwrap(),
+        TEST_ATTEMPT
+    );
+    assert!(partial_head.join("entry-0000.part").is_file());
+    assert_eq!(
+        restarted
+            .advance_queue_unlocked(16)
+            .expect("restart repairs the promoted payload before checking physical reservations"),
+        0,
+        "the later FIFO entry remains queued behind both current reservations"
+    );
+    assert_eq!(
+        restarted
+            .read_queue_order_unlocked(&restarted.queued_path(&behind.transfer_id))
+            .unwrap(),
+        behind_order
+    );
+
+    restarted.abort(&active.transfer_id, TEST_ATTEMPT).unwrap();
+    let promoted_behind = restarted.partial_path(&behind.transfer_id);
+    assert!(promoted_behind.is_dir());
+    assert_eq!(restarted.read_descriptor(&promoted_behind).unwrap(), behind);
+    assert_eq!(
+        super::read_attempt_owner(&promoted_behind).unwrap(),
+        TEST_ATTEMPT
+    );
 }
 
 #[test]
