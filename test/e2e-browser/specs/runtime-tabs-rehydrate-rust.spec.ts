@@ -335,13 +335,46 @@ test.describe.serial('Phase 4 managed-runtime tab rehydration', () => {
       const lifecyclePath = path.join(path.dirname(rig.supervisor.runtimeRoot), 'evidence', 'lifecycle.jsonl')
       const readLifecycle = async () => (await fs.readFile(lifecyclePath, 'utf8'))
         .split('\n').filter(Boolean).map((line) => JSON.parse(line))
-      const startupFinished = (await readLifecycle()).find((event) => event.event === 'supervisor.startup_scan.finished')
+      // Finish healthy preparation before starting this owned controller's
+      // first observation window. Its startup must reattach the original host.
+      const oldControllerId = rig.supervisor.containerId
+      const oldControlEpoch = await rig.controlEpoch()
+      const controllerSentBaseline = sent.length
+      const controllerRestartStartedAt = Date.now()
+      await rig.restartSupervisor()
+      const controllerHealth = (await rig.runtime.adminOk(rig.supervisor, { method: 'health' })).data
+      const reattached = (await rig.inventory()).find((row) => row.soulId === view.soulId)
+      expect(reattached).toMatchObject({ soulId: view.soulId, containerId: view.containerId,
+        incarnationId: view.incarnationId, nativeSessionId: view.nativeSessionId,
+        desiredState: 'running', launchState: 'running', recoveryState: 'live' })
+      expect(fixtureState()).toMatchObject({ nativeSessionId: stableProviderState.nativeSessionId,
+        dispatchCount: stableProviderState.dispatchCount, completionCount: stableProviderState.completionCount })
+      expect(rig.ownedProviderExec(view.containerId!, ['cat', rolloutPath])).toBe(transcript)
+      expect(await fs.readFile(wrongPath, 'utf8')).toBe(wrongTranscript)
+      await expectOriginalConversation()
+      expect(sent.slice(controllerSentBaseline).filter((frame) => frame.type === 'freshAgent.create'
+        || frame.type === 'pane.reconcile.request')).toHaveLength(0)
+      const restartedLifecycle = await readLifecycle()
+      const startupFinished = restartedLifecycle.filter((event) => event.event === 'supervisor.startup_scan.finished').at(-1)
+      const controllerReady = restartedLifecycle.filter((event) => event.event === 'supervisor.ready').at(-1)
       expect(Number.isFinite(startupFinished?.at)).toBe(true)
+      expect(Number.isFinite(controllerReady?.at)).toBe(true)
+      expect(startupFinished.at).toBeGreaterThanOrEqual(controllerRestartStartedAt)
+      expect(controllerReady.at).toBeGreaterThanOrEqual(startupFinished.at)
+      expect(startupFinished.data).toMatchObject({ scanned: 1, blockedSubsystems: [] })
+      expect(controllerReady.data).toMatchObject({ controlEpoch: controllerHealth.control_epoch,
+        installationId: controllerHealth.installation_id })
+      expect(controllerReady.data.controlEpoch).toBeGreaterThan(oldControlEpoch)
+      expect(rig.supervisor.containerId).not.toBe(oldControllerId)
+      const controllerReattachment = { oldControllerId, currentControllerId: rig.supervisor.containerId,
+        oldControlEpoch, currentControlEpoch: controllerReady.data.controlEpoch, controllerRestartStartedAt,
+        controllerReady, startupFinished, reattached, completedAt: Date.now() }
+      rig.runtime.recordLifecycle('browser.owned_controller_reattached', controllerReattachment)
       // The observer sleeps first, after startup reconciliation finishes.
       const firstObservationNotBefore = startupFinished.at + observerIntervalMs
       const holdRequestedAt = Date.now()
       expect(firstObservationNotBefore - holdRequestedAt,
-        'owned history/read/reload must have a measured window before STOP').toBeGreaterThanOrEqual(25_000)
+        'owned history/read/reload must have a measured window before STOP').toBeGreaterThanOrEqual(55_000)
       const pid = rig.runtime.ownedContainerHostPidExact(view.containerId!)
       heldHost = { containerId: view.containerId!, incarnationId: view.incarnationId, pid }
       rig.signalOwnedSessionHostExact(heldHost.containerId, heldHost.incarnationId, 'SIGSTOP', pid)
@@ -440,7 +473,7 @@ test.describe.serial('Phase 4 managed-runtime tab rehydration', () => {
         && event.data.soulId === view.soulId)
       expect(targetSoulRecoveries).toHaveLength(0)
       rig.runtime.writeBrowserArtifact('owned-host-history-preservation', { ...historyEvidence,
-        observerWindow: { intervalMs: observerIntervalMs, startupFinished, firstObservationNotBefore,
+        observerWindow: { intervalMs: observerIntervalMs, controllerReattachment, startupFinished, firstObservationNotBefore,
           holdRequestedAt, heldAt, releasedAt, resumedAt, targetSoulRecoveries } })
     } finally {
       try {
