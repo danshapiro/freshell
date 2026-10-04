@@ -232,7 +232,7 @@ pub(crate) fn read_opencode_path(path: &Path, id: &str) -> Result<Value, String>
     // A clean WAL close removes its companions. SQLite otherwise needs a writable
     // directory even for READ_ONLY. Only the companion-free snapshot is immutable;
     // existing WAL uses SQLite's normal transaction so committed rows remain visible.
-    let metadata = std::fs::metadata(&path).map_err(|e| e.to_string())?;
+    let metadata = std::fs::metadata(path).map_err(|e| e.to_string())?;
     let fingerprint = (
         metadata.len(),
         metadata.modified().map_err(|e| e.to_string())?,
@@ -254,7 +254,7 @@ pub(crate) fn read_opencode_path(path: &Path, id: &str) -> Result<Value, String>
         )
     } else {
         Connection::open_with_flags(
-            &path,
+            path,
             OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
         )
     }
@@ -334,7 +334,7 @@ pub(crate) fn read_opencode_path(path: &Path, id: &str) -> Result<Value, String>
         }
     }
     if immutable {
-        let current = std::fs::metadata(&path).map_err(|e| e.to_string())?;
+        let current = std::fs::metadata(path).map_err(|e| e.to_string())?;
         if !companions_absent()
             || (
                 current.len(),
