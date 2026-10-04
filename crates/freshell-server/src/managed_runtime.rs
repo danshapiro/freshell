@@ -1346,81 +1346,157 @@ async fn stage_opencode_resume_bundle(
         .validate()
         .map_err(|error| format!("OpenCode transfer descriptor is invalid: {}", error.message))?;
 
-    let (mut sequence, mut offset) = match client
-        .opencode_transfer_begin(descriptor.clone())
-        .await
-        .map_err(|error| format!("OpenCode transfer staging could not begin: {error}"))?
-    {
-        OpenCodeTransferResult::Started {
-            next_sequence,
-            file_offsets,
-        } => {
-            let [file_offset] = file_offsets.as_slice() else {
-                return Err("OpenCode staging returned unexpected file offsets".into());
-            };
-            if file_offset.file_index != 0 {
-                return Err("OpenCode staging returned an unexpected payload file".into());
-            }
-            (next_sequence, file_offset.next_offset)
-        }
-        OpenCodeTransferResult::Queued { .. } => {
-            return Err("OpenCode history transfer is queued for staging capacity".into());
-        }
-        _ => return Err("OpenCode staging returned an unexpected begin result".into()),
-    };
-    let expected_sequence = offset.div_ceil(MAX_OPENCODE_TRANSFER_CHUNK_BYTES as u64);
-    if offset > descriptor.total_bytes || sequence != expected_sequence {
-        return Err("OpenCode staging resume cursor is inconsistent".into());
-    }
-    if offset != descriptor.total_bytes && offset % MAX_OPENCODE_TRANSFER_CHUNK_BYTES as u64 != 0 {
-        return Err("OpenCode staging resume offset is not chunk aligned".into());
-    }
-
-    let mut payload = TokioFile::from_std(
+    let payload = TokioFile::from_std(
         snapshot
             .open_payload()
             .map_err(|error| format!("OpenCode exact-session payload is unavailable: {error}"))?,
     );
-    payload
-        .seek(std::io::SeekFrom::Start(offset))
-        .await
-        .map_err(|error| format!("OpenCode payload seek failed: {error}"))?;
-    while offset < descriptor.total_bytes {
-        let remaining = descriptor.total_bytes - offset;
-        let chunk_size = remaining.min(MAX_OPENCODE_TRANSFER_CHUNK_BYTES as u64) as usize;
-        let mut data = vec![0; chunk_size];
-        payload
-            .read_exact(&mut data)
+    stage_opencode_transfer_payload(client, descriptor, payload).await
+}
+
+async fn stage_opencode_transfer_payload(
+    client: &RuntimeClient,
+    descriptor: OpenCodeTransferDescriptor,
+    mut payload: TokioFile,
+) -> Result<OpenCodeTransferDescriptor, String> {
+    let mut abort_on_drop =
+        OpenCodeTransferAbortOnDrop::new(client.clone(), descriptor.transfer_id.clone());
+    let result = async {
+        let (mut sequence, mut offset) = match client
+            .opencode_transfer_begin(descriptor.clone())
             .await
-            .map_err(|error| format!("OpenCode payload read failed: {error}"))?;
-        let chunk = OpenCodeTransferChunk {
-            transfer_id: descriptor.transfer_id.clone(),
-            sequence,
-            file_index: 0,
-            offset,
-            sha256: format!("{:x}", Sha256::digest(&data)),
-            data,
-        };
-        match client
-            .opencode_transfer_chunk(chunk)
-            .await
-            .map_err(|error| format!("OpenCode transfer chunk was rejected: {error}"))?
+            .map_err(|error| format!("OpenCode transfer staging could not begin: {error}"))?
         {
-            OpenCodeTransferResult::ChunkStored { sequence: stored } if stored == sequence => {}
-            _ => return Err("OpenCode staging returned an unexpected chunk result".into()),
+            OpenCodeTransferResult::Started {
+                next_sequence,
+                file_offsets,
+            } => {
+                let [file_offset] = file_offsets.as_slice() else {
+                    return Err("OpenCode staging returned unexpected file offsets".into());
+                };
+                if file_offset.file_index != 0 {
+                    return Err("OpenCode staging returned an unexpected payload file".into());
+                }
+                (next_sequence, file_offset.next_offset)
+            }
+            OpenCodeTransferResult::Queued { .. } => {
+                return Err("OpenCode history transfer is queued for staging capacity".into());
+            }
+            _ => return Err("OpenCode staging returned an unexpected begin result".into()),
+        };
+        let expected_sequence = offset.div_ceil(MAX_OPENCODE_TRANSFER_CHUNK_BYTES as u64);
+        if offset > descriptor.total_bytes || sequence != expected_sequence {
+            return Err("OpenCode staging resume cursor is inconsistent".into());
         }
-        offset += chunk_size as u64;
-        sequence += 1;
+        if offset != descriptor.total_bytes
+            && offset % MAX_OPENCODE_TRANSFER_CHUNK_BYTES as u64 != 0
+        {
+            return Err("OpenCode staging resume offset is not chunk aligned".into());
+        }
+
+        payload
+            .seek(std::io::SeekFrom::Start(offset))
+            .await
+            .map_err(|error| format!("OpenCode payload seek failed: {error}"))?;
+        while offset < descriptor.total_bytes {
+            let remaining = descriptor.total_bytes - offset;
+            let chunk_size = remaining.min(MAX_OPENCODE_TRANSFER_CHUNK_BYTES as u64) as usize;
+            let mut data = vec![0; chunk_size];
+            payload
+                .read_exact(&mut data)
+                .await
+                .map_err(|error| format!("OpenCode payload read failed: {error}"))?;
+            let chunk = OpenCodeTransferChunk {
+                transfer_id: descriptor.transfer_id.clone(),
+                sequence,
+                file_index: 0,
+                offset,
+                sha256: format!("{:x}", Sha256::digest(&data)),
+                data,
+            };
+            match client
+                .opencode_transfer_chunk(chunk)
+                .await
+                .map_err(|error| format!("OpenCode transfer chunk was rejected: {error}"))?
+            {
+                OpenCodeTransferResult::ChunkStored { sequence: stored } if stored == sequence => {}
+                _ => return Err("OpenCode staging returned an unexpected chunk result".into()),
+            }
+            offset += chunk_size as u64;
+            sequence += 1;
+        }
+        match client
+            .opencode_transfer_finalize(descriptor.transfer_id.clone())
+            .await
+            .map_err(|error| format!("OpenCode transfer could not be finalized: {error}"))?
+        {
+            OpenCodeTransferResult::Ready { transfer_id }
+                if transfer_id == descriptor.transfer_id =>
+            {
+                Ok(descriptor.clone())
+            }
+            _ => Err("OpenCode staging did not return the ready transfer".into()),
+        }
     }
-    match client
-        .opencode_transfer_finalize(descriptor.transfer_id.clone())
-        .await
-        .map_err(|error| format!("OpenCode transfer could not be finalized: {error}"))?
-    {
-        OpenCodeTransferResult::Ready { transfer_id } if transfer_id == descriptor.transfer_id => {
+    .await;
+
+    match result {
+        Ok(descriptor) => {
+            abort_on_drop.disarm();
             Ok(descriptor)
         }
-        _ => Err("OpenCode staging did not return the ready transfer".into()),
+        Err(error) => {
+            abort_on_drop.abort().await;
+            Err(error)
+        }
+    }
+}
+
+struct OpenCodeTransferAbortOnDrop {
+    client: RuntimeClient,
+    transfer_id: String,
+    armed: bool,
+}
+
+impl OpenCodeTransferAbortOnDrop {
+    fn new(client: RuntimeClient, transfer_id: String) -> Self {
+        Self {
+            client,
+            transfer_id,
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+
+    async fn abort(&mut self) {
+        if self.armed {
+            let _ = self
+                .client
+                .opencode_transfer_abort(self.transfer_id.clone())
+                .await;
+            self.armed = false;
+        }
+    }
+}
+
+impl Drop for OpenCodeTransferAbortOnDrop {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let (Ok(handle), client, transfer_id) = (
+            tokio::runtime::Handle::try_current(),
+            self.client.clone(),
+            self.transfer_id.clone(),
+        ) else {
+            return;
+        };
+        handle.spawn(async move {
+            let _ = client.opencode_transfer_abort(transfer_id).await;
+        });
     }
 }
 
@@ -1594,6 +1670,13 @@ fn git_stdout(cwd: &Path, args: &[&str]) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use freshell_runtime_protocol::{
+        read_frame, write_frame, AdminReply, AdminResult, ControlRole, Envelope,
+        OpenCodeTransferAction, OpenCodeTransferFile, OpenCodeTransferFileOffset, RuntimeError,
+        RuntimeErrorCode,
+    };
+    use std::collections::HashSet;
+    use tokio::net::{UnixListener, UnixStream};
     #[cfg(unix)]
     mod lifecycle_directory {
         include!("tests/managed_runtime_lifecycle_tests.rs");
@@ -1984,6 +2067,246 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[tokio::test]
+    async fn failed_connected_transfer_sends_abort_before_returning() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("control.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let client = RuntimeClient::new(&socket, "0123456789abcdef");
+        let payload_bytes = b"synthetic-payload";
+        let payload_path = dir.path().join("payload.json");
+        std::fs::write(&payload_path, payload_bytes).unwrap();
+        let descriptor = transfer_test_descriptor(payload_bytes, "transfer-client-error");
+        let expected_id = descriptor.transfer_id.clone();
+
+        let supervisor = tokio::spawn(async move {
+            let mut reserved = HashSet::new();
+            for expected in ["begin", "chunk", "abort"] {
+                let (mut stream, request) = accept_control_request(&listener).await;
+                assert_eq!(request.role, ControlRole::Web);
+                let (actual, result) = match request.body {
+                    freshell_runtime_protocol::AdminCommand::OpenCodeTransfer(
+                        OpenCodeTransferAction::Begin(descriptor),
+                    ) => {
+                        assert_eq!(expected, "begin");
+                        reserved.insert(descriptor.transfer_id.clone());
+                        (
+                            "begin",
+                            Ok(AdminResult::OpenCodeTransfer(
+                                OpenCodeTransferResult::Started {
+                                    next_sequence: 0,
+                                    file_offsets: vec![OpenCodeTransferFileOffset {
+                                        file_index: 0,
+                                        next_offset: 0,
+                                    }],
+                                },
+                            )),
+                        )
+                    }
+                    freshell_runtime_protocol::AdminCommand::OpenCodeTransfer(
+                        OpenCodeTransferAction::Chunk(chunk),
+                    ) => {
+                        assert_eq!(expected, "chunk");
+                        assert!(reserved.contains(&chunk.transfer_id));
+                        (
+                            "chunk",
+                            Err(RuntimeError::new(
+                                RuntimeErrorCode::InvalidRequest,
+                                "synthetic chunk rejection",
+                            )),
+                        )
+                    }
+                    freshell_runtime_protocol::AdminCommand::OpenCodeTransfer(
+                        OpenCodeTransferAction::Abort { transfer_id },
+                    ) => {
+                        assert_eq!(expected, "abort");
+                        assert_eq!(transfer_id, expected_id);
+                        assert!(reserved.remove(&transfer_id));
+                        (
+                            "abort",
+                            Ok(AdminResult::OpenCodeTransfer(
+                                OpenCodeTransferResult::Aborted { transfer_id },
+                            )),
+                        )
+                    }
+                    other => panic!("unexpected transfer action: {other:?}"),
+                };
+                assert_eq!(actual, expected);
+                write_frame(
+                    &mut stream,
+                    &AdminReply {
+                        request_id: request.request_id,
+                        result,
+                    },
+                )
+                .await
+                .unwrap();
+            }
+            assert!(reserved.is_empty(), "abort should release staged quota");
+        });
+
+        let payload = TokioFile::open(payload_path).await.unwrap();
+        let result = stage_opencode_transfer_payload(&client, descriptor, payload).await;
+        assert!(result.is_err());
+        supervisor.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancelling_connected_transfer_sends_supervisor_abort() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("control.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let client = RuntimeClient::new(&socket, "0123456789abcdef");
+        let payload_bytes = b"synthetic-payload";
+        let payload_path = dir.path().join("payload.json");
+        std::fs::write(&payload_path, payload_bytes).unwrap();
+        let descriptor = transfer_test_descriptor(payload_bytes, "transfer-client-cancel");
+        let expected_id = descriptor.transfer_id.clone();
+        let (chunk_seen_tx, chunk_seen_rx) = tokio::sync::oneshot::channel();
+
+        let supervisor = tokio::spawn(async move {
+            let mut reserved = HashSet::new();
+            let (mut stream, begin) = accept_control_request(&listener).await;
+            let freshell_runtime_protocol::AdminCommand::OpenCodeTransfer(
+                OpenCodeTransferAction::Begin(descriptor),
+            ) = begin.body
+            else {
+                panic!("expected transfer begin");
+            };
+            reserved.insert(descriptor.transfer_id.clone());
+            write_frame(
+                &mut stream,
+                &AdminReply {
+                    request_id: begin.request_id,
+                    result: Ok(AdminResult::OpenCodeTransfer(
+                        OpenCodeTransferResult::Started {
+                            next_sequence: 0,
+                            file_offsets: vec![OpenCodeTransferFileOffset {
+                                file_index: 0,
+                                next_offset: 0,
+                            }],
+                        },
+                    )),
+                },
+            )
+            .await
+            .unwrap();
+
+            let (_chunk_stream, chunk) = accept_control_request(&listener).await;
+            let freshell_runtime_protocol::AdminCommand::OpenCodeTransfer(
+                OpenCodeTransferAction::Chunk(chunk),
+            ) = chunk.body
+            else {
+                panic!("expected transfer chunk");
+            };
+            assert!(reserved.contains(&chunk.transfer_id));
+            chunk_seen_tx.send(()).unwrap();
+
+            let (mut stream, abort) = accept_control_request(&listener).await;
+            let freshell_runtime_protocol::AdminCommand::OpenCodeTransfer(
+                OpenCodeTransferAction::Abort { transfer_id },
+            ) = abort.body
+            else {
+                panic!("expected transfer abort after cancellation");
+            };
+            assert_eq!(transfer_id, expected_id);
+            assert!(reserved.remove(&transfer_id));
+            write_frame(
+                &mut stream,
+                &AdminReply {
+                    request_id: abort.request_id,
+                    result: Ok(AdminResult::OpenCodeTransfer(
+                        OpenCodeTransferResult::Aborted { transfer_id },
+                    )),
+                },
+            )
+            .await
+            .unwrap();
+            assert!(reserved.is_empty(), "abort should release staged quota");
+        });
+
+        let payload = TokioFile::open(payload_path).await.unwrap();
+        let transfer_client = client.clone();
+        let transfer = tokio::spawn(async move {
+            stage_opencode_transfer_payload(&transfer_client, descriptor, payload).await
+        });
+        chunk_seen_rx.await.unwrap();
+        transfer.abort();
+        assert!(transfer.await.unwrap_err().is_cancelled());
+        tokio::time::timeout(std::time::Duration::from_secs(5), supervisor)
+            .await
+            .expect("supervisor should receive the cancellation abort")
+            .unwrap();
+    }
+
+    async fn accept_control_request(
+        listener: &UnixListener,
+    ) -> (
+        UnixStream,
+        Envelope<freshell_runtime_protocol::AdminCommand>,
+    ) {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let request = read_frame(&mut stream).await.unwrap();
+        (stream, request)
+    }
+
+    fn transfer_test_descriptor(payload: &[u8], transfer_id: &str) -> OpenCodeTransferDescriptor {
+        let source_store_id = "b".repeat(64);
+        let source_generation = "e".repeat(64);
+        let source_schema_fingerprint = "c".repeat(64);
+        let migration_journal_fingerprint = "d".repeat(64);
+        let target_image_ref = format!("sha256:{}", "a".repeat(64));
+        let payload_sha256 = format!("{:x}", Sha256::digest(payload));
+        let files = vec![OpenCodeTransferFile {
+            index: 0,
+            relative_path: "payload.json".into(),
+            size_bytes: payload.len() as u64,
+            sha256: payload_sha256.clone(),
+        }];
+        let manifest_json = serde_json::json!({
+            "version": 1,
+            "provider_schema": "opencode-1.18.21",
+            "root_session_id": "ses_exact",
+            "source_store_id": source_store_id,
+            "source_schema_fingerprint": source_schema_fingerprint,
+            "migration_journal_fingerprint": migration_journal_fingerprint,
+            "generation": source_generation,
+            "assets": [],
+            "payload_bytes": payload.len(),
+            "payload_sha256": payload_sha256,
+            "rows": []
+        })
+        .to_string();
+        let descriptor = OpenCodeTransferDescriptor {
+            transfer_id: transfer_id.into(),
+            provider: "opencode".into(),
+            source_store_id,
+            root_session_id: "ses_exact".into(),
+            source_generation,
+            provider_schema: "opencode-1.18.21".into(),
+            source_schema_fingerprint,
+            migration_journal_fingerprint,
+            destination_store_id: "soul-test".into(),
+            destination_database_path: freshell_runtime_protocol::OPENCODE_TRANSFER_DESTINATION_DB
+                .into(),
+            target_build_receipt: freshell_runtime_protocol::opencode_target_build_receipt(
+                &target_image_ref,
+                "opencode-1.18.21",
+            ),
+            target_image_ref,
+            incarnation_id: "incarnation-test-transfer".into(),
+            bundle_sha256: freshell_runtime_protocol::opencode_transfer_bundle_digest(
+                &manifest_json,
+                &files,
+            ),
+            manifest_json,
+            files,
+            total_bytes: payload.len() as u64,
+        };
+        descriptor.validate().unwrap();
+        descriptor
     }
 }
 
