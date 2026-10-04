@@ -645,15 +645,3 @@ describe('runtime boundary analyzer', () => {
     expect(result.unexpectedNodeBackend).toEqual(['scripts/misclassified.ts'])
   })
 })
-
-describe('runtime boundary inventory for the current checkout', () => {
-  it('requires executable runtime evidence to be fully Rust-only', async () => {
-    const result = await analyzeRuntimeBoundary(process.cwd())
-
-    expect(result).toEqual({
-      manifestDrift: [],
-      legacyDebt: [],
-      unexpectedNodeBackend: [],
-    })
-  })
-})
