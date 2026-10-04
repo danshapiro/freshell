@@ -116,6 +116,458 @@ fn history_binary_preserves_normal_text_that_quotes_the_retention_marker() {
 }
 
 #[test]
+fn history_binary_preserves_full_literal_retention_markers() {
+    for provider in ["claude", "kilroy", "codex", "opencode"] {
+        let home = tempfile::tempdir().unwrap();
+        let literal = format!("Saved FRESHELL_NATIVE_HISTORY_OMITTED_SHA256:body; collection FRESHELL_NATIVE_HISTORY_OMITTED_SHA256:collection; digest FRESHELL_NATIVE_HISTORY_OMITTED_SHA256:{} remains literal", "a".repeat(64));
+        if provider == "codex" {
+            write_codex_rows(
+                home.path(),
+                "literal-markers",
+                &[
+                    json!({"type":"session_meta","payload":{"id":"literal-markers"}}),
+                    codex_response_message("user", 0, &literal),
+                    json!({"type":"event_msg","payload":{"type":"user_message","message":literal}}),
+                    json!({"type":"response_item","payload":{"type":"function_call","call_id":"literal-tool","name":"echo","arguments":json!({"saved":literal}).to_string()}}),
+                    json!({"type":"response_item","payload":{"type":"function_call_output","call_id":"literal-tool","output":[{"type":"input_text","text":literal}]}}),
+                    codex_response_message("assistant", 0, &literal),
+                ],
+            );
+        } else if provider == "opencode" {
+            let directory = home.path().join(".local/share/opencode");
+            std::fs::create_dir_all(&directory).unwrap();
+            let db = Connection::open(directory.join("opencode.db")).unwrap();
+            db.execute_batch("CREATE TABLE session (id TEXT PRIMARY KEY, title TEXT, time_updated INTEGER); CREATE TABLE message (id TEXT PRIMARY KEY, session_id TEXT, time_created INTEGER, data TEXT); CREATE TABLE part (id TEXT PRIMARY KEY, session_id TEXT, message_id TEXT, time_created INTEGER, data TEXT); INSERT INTO session VALUES ('literal-markers','Saved',1);").unwrap();
+            for (index, role) in ["user", "assistant"].iter().enumerate() {
+                let id = format!("literal-{role}");
+                db.execute(
+                    "INSERT INTO message VALUES (?1,'literal-markers',?2,?3)",
+                    rusqlite::params![id, index, json!({"role":role}).to_string()],
+                )
+                .unwrap();
+                db.execute(
+                    "INSERT INTO part VALUES (?1,'literal-markers',?2,0,?3)",
+                    rusqlite::params![
+                        format!("{id}-text"),
+                        id,
+                        json!({"type":"text","text":literal}).to_string()
+                    ],
+                )
+                .unwrap();
+            }
+            db.execute("INSERT INTO part VALUES ('literal-tool','literal-markers','literal-assistant',1,?1)", [json!({"type":"tool","callID":"literal-call","tool":"echo","state":{"status":"completed","input":{"saved":literal},"output":literal}}).to_string()]).unwrap();
+        } else {
+            let dir = home.path().join(".claude/projects/saved");
+            std::fs::create_dir_all(&dir).unwrap();
+            let rows = [
+                json!({"type":"user","uuid":"literal-user","message":{"content":[{"type":"text","text":literal}]}}),
+                json!({"type":"assistant","uuid":"literal-answer","message":{"content":[{"type":"text","text":literal},{"type":"tool_use","id":"literal-tool","name":"echo","input":{"saved":literal}}]}}),
+                json!({"type":"user","uuid":"literal-result","message":{"content":[{"type":"tool_result","tool_use_id":"literal-tool","content":literal}]}}),
+            ];
+            std::fs::write(
+                dir.join("literal-markers.jsonl"),
+                rows.iter()
+                    .map(Value::to_string)
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            )
+            .unwrap();
+        }
+        let result = history(home.path(), provider, "literal-markers");
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        let body: Value = serde_json::from_slice(&result.stdout).unwrap();
+        let items: Vec<_> = body["turns"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|turn| turn["items"].as_array().unwrap())
+            .collect();
+        assert_eq!(
+            items
+                .iter()
+                .filter(|item| item["kind"] == "text" && item["text"] == literal)
+                .count(),
+            2,
+            "{provider}: user/answer literals changed"
+        );
+        if provider == "claude" || provider == "kilroy" {
+            assert!(items
+                .iter()
+                .any(|item| item["kind"] == "tool_use" && item["input"]["saved"] == literal));
+            assert!(items
+                .iter()
+                .any(|item| item["kind"] == "tool_result" && item["content"] == literal));
+        } else {
+            let tool = items
+                .iter()
+                .find(|item| item["id"] == "literal-tool")
+                .unwrap();
+            let arguments = if provider == "codex" {
+                serde_json::from_str::<Value>(tool["arguments"].as_str().unwrap()).unwrap()
+            } else {
+                tool["arguments"].clone()
+            };
+            assert_eq!(arguments["saved"], literal);
+            assert_eq!(
+                if provider == "codex" {
+                    &tool["contentItems"][0]["text"]
+                } else {
+                    &tool["contentItems"][0]
+                },
+                &literal
+            );
+        }
+        let wire_provider = if provider == "kilroy" {
+            "claude"
+        } else {
+            provider
+        };
+        assert_ne!(
+            body["extensions"][wire_provider]["nativeHistoryRetention"]["partial"],
+            true
+        );
+    }
+}
+
+#[test]
+fn history_binary_retains_late_claude_array_blocks_and_original_indices() {
+    let home = tempfile::tempdir().unwrap();
+    let dir = home.path().join(".claude/projects/saved");
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut blocks: Vec<Value> = (0..32)
+        .map(
+            |i| json!({"type":"text","text":format!("Earlier block {i} {}", "é🚀".repeat(35_000))}),
+        )
+        .collect();
+    blocks.extend([
+        json!({"type":"tool_use","id":"late-tool-a","name":"echo","input":{"value":"late input"}}),
+        json!({"type":"tool_use","id":"late-tool-b","name":"pwd","input":{}}),
+        json!({"type":"text","text":"Final saved array answer"}),
+    ]);
+    let row = json!({"type":"assistant","uuid":"array-answer","message":{"content":blocks}});
+    std::fs::write(dir.join("array-claude.jsonl"), row.to_string()).unwrap();
+    let result = history(home.path(), "claude", "array-claude");
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let body: Value = serde_json::from_slice(&result.stdout).unwrap();
+    let items = body["turns"][0]["items"].as_array().unwrap();
+    assert!(
+        items.last().unwrap()["text"] == "Final saved array answer",
+        "latest saved answer is missing"
+    );
+    assert_eq!(items.last().unwrap()["id"], "array-answer-i34");
+    for (index, tool) in [(32, "late-tool-a"), (33, "late-tool-b")] {
+        assert!(items.iter().any(
+            |item| item["id"] == format!("array-answer-i{index}") && item["toolUseId"] == tool
+        ));
+    }
+    assert_eq!(
+        body["extensions"]["claude"]["nativeHistoryRetention"]["partial"],
+        true
+    );
+    assert!((result.stdout.len() as u64) < freshell_freshagent::native_history::MAX_HISTORY_BYTES);
+}
+
+#[test]
+fn history_binary_compacts_one_large_structured_claude_block_before_array_eviction() {
+    let home = tempfile::tempdir().unwrap();
+    let directory = home.path().join(".claude/projects/saved");
+    std::fs::create_dir_all(&directory).unwrap();
+    let input: serde_json::Map<String, Value> = (0..16_000)
+        .map(|index| {
+            (
+                format!("field-{index:05}"),
+                json!("saved value ".repeat(110)),
+            )
+        })
+        .collect();
+    let row = json!({"type":"assistant","uuid":"structured-answer","message":{"content":[
+        {"type":"tool_use","id":"structured-tool","name":"Write","input":input},
+        {"type":"tool_use","id":"recent-tool","name":"pwd","input":{}},
+        {"type":"text","text":"Latest answer after structured input"}
+    ]}});
+    let path = directory.join("structured-claude.jsonl");
+    let source = row.to_string();
+    assert!(source.len() as u64 > freshell_freshagent::native_history::MAX_HISTORY_BYTES);
+    std::fs::write(&path, &source).unwrap();
+    let result = history(home.path(), "claude", "structured-claude");
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let body: Value = serde_json::from_slice(&result.stdout).unwrap();
+    let items = body["turns"][0]["items"].as_array().unwrap();
+    for (index, tool) in [(0, "structured-tool"), (1, "recent-tool")] {
+        assert!(
+            items
+                .iter()
+                .any(|item| item["id"] == format!("structured-answer-i{index}")
+                    && item["toolUseId"] == tool),
+            "selected native call {tool} was displaced by its body"
+        );
+    }
+    assert_eq!(
+        items.last().unwrap()["text"],
+        "Latest answer after structured input"
+    );
+    assert_eq!(items.last().unwrap()["id"], "structured-answer-i2");
+    assert_eq!(
+        body["extensions"]["claude"]["nativeHistoryRetention"]["partial"],
+        true
+    );
+    assert!(
+        (result.stdout.len() as u64)
+            < freshell_freshagent::native_history::MAX_HISTORY_BYTES / 4 + 4096
+    );
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), source);
+}
+
+#[test]
+fn history_binary_retains_late_codex_array_prompt_answer_and_tool_outputs() {
+    let home = tempfile::tempdir().unwrap();
+    let parts = |kind: &str, tail: &str| {
+        let mut parts: Vec<Value> = (0..32).map(|i| json!({"type":kind,"text":format!("Earlier part {i} {}", "é🚀".repeat(35_000))})).collect();
+        parts.push(json!({"type":kind,"text":tail}));
+        parts
+    };
+    let rows = vec![
+        json!({"type":"session_meta","payload":{"id":"array-codex"}}),
+        json!({"type":"event_msg","payload":{"type":"task_started","turn_id":"array-task"}}),
+        json!({"type":"response_item","payload":{"type":"message","id":"array-user","role":"user","content":parts("input_text","Final saved array prompt")}}),
+        json!({"type":"response_item","payload":{"type":"function_call","call_id":"array-tool-a","name":"echo","arguments":"{}"}}),
+        json!({"type":"response_item","payload":{"type":"function_call_output","call_id":"array-tool-a","output":parts("input_text","Final saved array output")}}),
+        json!({"type":"response_item","payload":{"type":"custom_tool_call","call_id":"array-tool-b","name":"pwd","input":"pwd"}}),
+        json!({"type":"response_item","payload":{"type":"custom_tool_call_output","call_id":"array-tool-b","output":"/saved/workspace"}}),
+        json!({"type":"response_item","payload":{"type":"message","id":"array-assistant","role":"assistant","content":parts("output_text","Final saved array answer")}}),
+    ];
+    write_codex_rows(home.path(), "array-codex", &rows);
+    let result = history(home.path(), "codex", "array-codex");
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let body: Value = serde_json::from_slice(&result.stdout).unwrap();
+    let turns = body["turns"].as_array().unwrap();
+    let items: Vec<_> = turns
+        .iter()
+        .flat_map(|turn| turn["items"].as_array().unwrap())
+        .collect();
+    assert!(items.iter().any(
+        |item| item["id"] == "array-user:part:32" && item["text"] == "Final saved array prompt"
+    ));
+    assert!(items.iter().any(|item| item["id"] == "array-assistant"
+        && item["text"]
+            .as_str()
+            .is_some_and(|text| text.ends_with("Final saved array answer"))));
+    assert!(body["turns"]
+        .to_string()
+        .contains("Final saved array output"));
+    for tool in ["array-tool-a", "array-tool-b"] {
+        assert!(items.iter().any(|item| item["id"] == tool));
+    }
+    assert_eq!(
+        body["extensions"]["codex"]["nativeHistoryRetention"]["partial"],
+        true
+    );
+    assert!((result.stdout.len() as u64) < freshell_freshagent::native_history::MAX_HISTORY_BYTES);
+}
+
+#[test]
+fn history_binary_deduplicates_array_mirrors_across_repeated_native_tasks() {
+    use std::io::Write;
+    for response_first in [false, true] {
+        let home = tempfile::tempdir().unwrap();
+        let parts = |kind: &str, last: &str| {
+            let mut parts: Vec<Value> = (0..24)
+                .map(|i| json!({"type":kind,"text":format!("Part {i} {}", "é🚀".repeat(30_000))}))
+                .collect();
+            parts.push(json!({"type":kind,"text":last}));
+            parts
+        };
+        let user = parts("input_text", "Repeated latest array prompt");
+        let assistant = parts("output_text", "Repeated latest array answer");
+        let joined = |parts: &[Value]| {
+            parts
+                .iter()
+                .map(|part| part["text"].as_str().unwrap())
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        let mut rows = vec![json!({"type":"session_meta","payload":{"id":"array-mirrors"}})];
+        for index in 0..2 {
+            rows.push(json!({"type":"event_msg","payload":{"type":"task_started","turn_id":format!("array-task-{index}")}}));
+            for (role, content, event_type) in [
+                ("user", &user, "user_message"),
+                ("assistant", &assistant, "agent_message"),
+            ] {
+                let response = json!({"type":"response_item","payload":{"type":"message","id":format!("array-{role}-{index}"),"role":role,"content":content}});
+                let event = json!({"type":"event_msg","payload":{"type":event_type,"message":joined(content)}});
+                if response_first {
+                    rows.extend([response, event]);
+                } else {
+                    rows.extend([event, response]);
+                }
+            }
+            rows.push(json!({"type":"event_msg","payload":{"type":"task_complete","turn_id":format!("array-task-{index}"),"last_agent_message":joined(&assistant)}}));
+        }
+        let directory = home.path().join(".codex/sessions/2026/10/03");
+        std::fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("rollout-array-mirrors.jsonl");
+        let mut file = std::fs::File::create(&path).unwrap();
+        for row in &rows {
+            let text = if row["type"] == "response_item" {
+                row.to_string()
+                    .replace('é', "\\u00e9")
+                    .replace('🚀', "\\ud83d\\ude80")
+            } else {
+                row.to_string()
+            };
+            writeln!(file, "{text}").unwrap();
+        }
+        drop(file);
+        let source = std::fs::read(&path).unwrap();
+        let result = history(home.path(), "codex", "array-mirrors");
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        let body: Value = serde_json::from_slice(&result.stdout).unwrap();
+        let turns = body["turns"].as_array().unwrap();
+        assert_eq!(turns.len(), 4, "response first {response_first}");
+        for index in 0..2 {
+            let user = &turns[index * 2];
+            let assistant = &turns[index * 2 + 1];
+            assert_eq!(user["turnId"], format!("array-task-{index}:row-0"));
+            assert_eq!(assistant["turnId"], format!("array-task-{index}:row-1"));
+            assert_eq!(
+                user["items"].as_array().unwrap().last().unwrap()["id"],
+                format!("array-user-{index}:part:24")
+            );
+            assert_eq!(
+                user["items"].as_array().unwrap().last().unwrap()["text"],
+                "Repeated latest array prompt"
+            );
+            assert_eq!(assistant["items"].as_array().unwrap().len(), 1);
+            assert_eq!(
+                assistant["items"][0]["id"],
+                format!("array-assistant-{index}")
+            );
+            assert!(assistant["items"][0]["text"]
+                .as_str()
+                .unwrap()
+                .ends_with("Repeated latest array answer"));
+        }
+        assert_eq!(
+            body["extensions"]["codex"]["nativeHistoryRetention"]["partial"],
+            true
+        );
+        assert!(
+            (result.stdout.len() as u64) < freshell_freshagent::native_history::MAX_HISTORY_BYTES
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), source);
+    }
+}
+
+#[test]
+fn history_binary_matches_empty_and_nontext_parts_to_event_copies() {
+    let home = tempfile::tempdir().unwrap();
+    write_codex_rows(
+        home.path(),
+        "mixed-parts",
+        &[
+            json!({"type":"session_meta","payload":{"id":"mixed-parts"}}),
+            json!({"type":"turn_context","payload":{"turn_id":"mixed-task"}}),
+            json!({"type":"response_item","payload":{"type":"message","id":"mixed-user","role":"user","content":[{"type":"input_text","text":""},{"type":"input_image","image_url":"saved://image"},{"type":"input_text","text":null},{"type":"input_text","text":"Saved mixed prompt"}]}}),
+            json!({"type":"event_msg","payload":{"type":"user_message","message":"\nSaved mixed prompt"}}),
+            json!({"type":"response_item","payload":{"type":"message","id":"mixed-assistant","role":"assistant","content":[{"type":"output_text","text":null},{"type":"output_text","text":""},{"type":"output_text","text":"Saved mixed answer"}]}}),
+            json!({"type":"event_msg","payload":{"type":"agent_message","message":"\nSaved mixed answer"}}),
+            json!({"type":"event_msg","payload":{"type":"task_complete","turn_id":"mixed-task","last_agent_message":"\nSaved mixed answer"}}),
+        ],
+    );
+    let result = history(home.path(), "codex", "mixed-parts");
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let body: Value = serde_json::from_slice(&result.stdout).unwrap();
+    let turns = body["turns"].as_array().unwrap();
+    assert_eq!(turns.len(), 2);
+    assert_eq!(turns[0]["items"].as_array().unwrap().len(), 4);
+    assert_eq!(turns[0]["items"][3]["id"], "mixed-user:part:3");
+    assert_eq!(turns[0]["items"][3]["text"], "Saved mixed prompt");
+    assert_eq!(turns[1]["items"].as_array().unwrap().len(), 1);
+    assert_eq!(turns[1]["items"][0]["id"], "mixed-assistant");
+    assert_eq!(turns[1]["items"][0]["text"], "\nSaved mixed answer");
+}
+
+#[test]
+fn history_binary_restores_a_message_mirror_after_large_patch_retention() {
+    for response_first in [false, true] {
+        let home = tempfile::tempdir().unwrap();
+        let answer = format!(
+            "{}Saved answer after a large patch",
+            "Earlier saved answer ".repeat(15_000)
+        );
+        let response = codex_response_message("assistant", 0, &answer);
+        let event = json!({"type":"event_msg","payload":{"type":"agent_message","message":answer}});
+        // PatchApplyEnd uses this map shape in the existing legacy-event regression.
+        let changes: serde_json::Map<String,Value> = (0..1280).map(|index| (format!("/workspace/file-{index:04}.rs"), json!({"type":"update","unified_diff":"+saved change\n".repeat(300),"move_path":null}))).collect();
+        let rows = vec![
+            json!({"type":"session_meta","payload":{"id":"retained-mirrors"}}),
+            json!({"type":"turn_context","payload":{"turn_id":"patch-task"}}),
+            codex_response_message("user", 0, "Saved patch request"),
+            if response_first {
+                response.clone()
+            } else {
+                event.clone()
+            },
+            json!({"type":"event_msg","payload":{"type":"patch_apply_end","call_id":"large-patch","success":true,"status":"completed","stdout":"Saved patch","stderr":"","changes":changes}}),
+            if response_first { event } else { response },
+            json!({"type":"event_msg","payload":{"type":"task_complete","turn_id":"patch-task","last_agent_message":answer}}),
+        ];
+        write_codex_rows(home.path(), "retained-mirrors", &rows);
+        let result = history(home.path(), "codex", "retained-mirrors");
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        let body: Value = serde_json::from_slice(&result.stdout).unwrap();
+        let turns = body["turns"].as_array().unwrap();
+        let answers: Vec<_> = turns
+            .iter()
+            .flat_map(|turn| turn["items"].as_array().unwrap())
+            .filter(|item| item["id"] == "assistant-0")
+            .collect();
+        assert_eq!(answers.len(), 1, "later canonical answer was lost after earlier copy eviction; response first {response_first}");
+        assert!(answers[0]["text"]
+            .as_str()
+            .unwrap()
+            .ends_with("Saved answer after a large patch"));
+        assert_eq!(turns.last().unwrap()["turnId"], "patch-task:row-3");
+        assert_eq!(body["threadId"], "retained-mirrors");
+        assert_eq!(
+            body["extensions"]["codex"]["nativeHistoryRetention"]["partial"],
+            true
+        );
+        assert!(
+            (result.stdout.len() as u64) < freshell_freshagent::native_history::MAX_HISTORY_BYTES
+        );
+    }
+}
+
+#[test]
 fn history_binary_reads_supported_codex_task_event_transcript() {
     let home = tempfile::tempdir().unwrap();
     let root = home.path().join(".codex/sessions/2026/10/03");
@@ -1099,7 +1551,9 @@ fn history_binary_retains_large_claude_and_kilroy_tools_with_original_ordinals()
             .any(|item| item["kind"] == "tool_use" && item["toolUseId"] == "huge-tool"));
         assert!(items.iter().any(|item| item["kind"] == "tool_result"
             && item["toolUseId"] == "huge-tool"
-            && item["content"] == "[Content omitted from retained history]"));
+            && item["content"].as_str().is_some_and(|text| text
+                .starts_with("[Content omitted from retained history]")
+                && text.ends_with("Saved output "))));
         assert_eq!(body["latestTurnId"], "latest-answer");
         assert_eq!(turns.last().unwrap()["ordinal"], 103);
         assert_eq!(
@@ -1196,10 +1650,9 @@ fn history_binary_bounds_large_opencode_active_and_reverted_history_including_wa
         assert_eq!(tool["tool"], "bash");
         assert_eq!(tool["status"], "completed");
         assert_eq!(tool["arguments"]["command"], "pwd");
-        assert_eq!(
-            tool["contentItems"][0],
-            "[Content omitted from retained history]"
-        );
+        let output = tool["contentItems"][0].as_str().unwrap();
+        assert!(output.starts_with("[Content omitted from retained history]"));
+        assert!(output.ends_with("Saved output "));
         assert_eq!(tool["success"], true);
         assert!(!body.to_string().contains("Foreign history"));
         assert_eq!(

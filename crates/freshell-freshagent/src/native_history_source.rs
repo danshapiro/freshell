@@ -7,25 +7,127 @@ use serde::de::{DeserializeSeed, IgnoredAny, MapAccess, SeqAccess, Visitor};
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 use std::io::{self, BufRead, Read};
-use std::{cell::Cell, rc::Rc};
+use std::{
+    cell::{Cell, RefCell},
+    collections::VecDeque,
+    rc::Rc,
+};
 
-pub(crate) const OMITTED_BODY: &str = "FRESHELL_NATIVE_HISTORY_OMITTED_SHA256:";
 const STRING_BYTES: usize = super::RETAINED_TURN_BYTES;
+
+/// Only tokens created by this read are interpreted as omissions. Source text
+/// cannot accidentally acquire the meaning of an internal display marker.
+#[derive(Clone)]
+pub(crate) struct Retention {
+    prefix: String,
+    pub(crate) index_key: String,
+    pub(crate) fingerprint_key: String,
+}
+impl Retention {
+    pub(crate) fn new() -> Self {
+        let prefix = format!("FRESHELL_NATIVE_HISTORY_{}:", uuid::Uuid::new_v4());
+        Self {
+            index_key: format!("{prefix}index"),
+            fingerprint_key: format!("{prefix}fingerprint"),
+            prefix,
+        }
+    }
+    pub(crate) fn marker(&self, reason: &str) -> String {
+        format!("{}{};", self.prefix, reason)
+    }
+    pub(crate) fn finish(&self, value: &mut Value) -> usize {
+        match value {
+            Value::String(text) => {
+                if !text.contains(&self.prefix) {
+                    return 0;
+                }
+                let mut output = String::with_capacity(text.len());
+                let mut count = 0;
+                let mut start = 0;
+                while let Some(relative) = text[start..].find(&self.prefix) {
+                    let begin = start + relative;
+                    let Some(end) = text[begin..].find(';').map(|end| begin + end + 1) else {
+                        break;
+                    };
+                    output.push_str(&text[start..begin]);
+                    let reason = &text[begin + self.prefix.len()..end - 1];
+                    if reason == "body"
+                        || reason == "collection"
+                        || reason.len() == 64 && reason.bytes().all(|byte| byte.is_ascii_hexdigit())
+                    {
+                        output.push_str("[Content omitted from retained history]");
+                        count += 1;
+                    } else {
+                        output.push_str(&text[begin..end]);
+                    }
+                    start = end;
+                }
+                output.push_str(&text[start..]);
+                *text = output;
+                count
+            }
+            Value::Array(values) => values.iter_mut().map(|value| self.finish(value)).sum(),
+            Value::Object(values) => {
+                values.remove(&self.index_key);
+                values.remove(&self.fingerprint_key);
+                values
+                    .iter_mut()
+                    .map(|(key, value)| {
+                        let count = self.finish(value);
+                        if key == "summary" {
+                            0
+                        } else {
+                            count
+                        }
+                    })
+                    .sum()
+            }
+            _ => 0,
+        }
+    }
+}
+
+// Hash original decoded Codex message text as it streams, before array or
+// body retention. Event copies join the same text into one string; display
+// previews alone cannot establish whether those records mirror one message.
+#[derive(Default)]
+struct MessageCapture {
+    hash: RefCell<Sha256>,
+    active: Cell<bool>,
+    part: Cell<bool>,
+    started: Cell<bool>,
+    parts: Cell<usize>,
+}
+impl MessageCapture {
+    fn append(&self, bytes: &[u8]) {
+        if !self.started.replace(true) {
+            if self.part.get() && self.parts.get() > 0 {
+                self.hash.borrow_mut().update(b"\n");
+            }
+            self.parts.set(self.parts.get() + 1);
+        }
+        self.hash.borrow_mut().update(bytes);
+    }
+}
 
 pub(crate) struct DisplaySource<R> {
     input: R,
     pending: Vec<u8>,
     offset: usize,
     key: String,
+    retention: Retention,
+    capture: Rc<MessageCapture>,
 }
 
 impl<R: BufRead> DisplaySource<R> {
-    pub(crate) fn new(input: R) -> Self {
+    fn new(input: R, retention: Retention, capture: Rc<MessageCapture>) -> Self {
         Self {
             input,
             pending: Vec::new(),
             offset: 0,
             key: String::new(),
+            retention,
+            capture,
         }
     }
 
@@ -49,7 +151,7 @@ impl<R: BufRead> DisplaySource<R> {
         }
         let mut escaped = false;
         let mut large = false;
-        let mut hash = StringDigest::new();
+        let mut hash = StringDigest::new(self.capture.clone());
         loop {
             let Some(byte) = self.byte()? else {
                 // A partial final JSONL record remains malformed for the parser.
@@ -99,10 +201,17 @@ impl<R: BufRead> DisplaySource<R> {
                     "native history identity is oversized",
                 ));
             }
-            self.pending = serde_json::to_vec(&format!("{OMITTED_BODY}{}", hash.finish()?))
-                .map_err(io::Error::other)?;
+            let (digest, tail) = hash.finish()?;
+            self.pending =
+                serde_json::to_vec(&format!("{}\n{tail}", self.retention.marker(&digest)))
+                    .map_err(io::Error::other)?;
         } else {
             self.pending.push(b'"');
+            if !is_key && self.capture.active.get() {
+                let text: String =
+                    serde_json::from_slice(&self.pending).map_err(io::Error::other)?;
+                self.capture.append(text.as_bytes());
+            }
             if is_key {
                 self.key = serde_json::from_slice(&self.pending).map_err(io::Error::other)?;
             }
@@ -117,14 +226,18 @@ struct StringDigest {
     bytes: Vec<u8>,
     escape: Vec<u8>,
     high_surrogate: Option<u32>,
+    tail: Vec<u8>,
+    capture: Rc<MessageCapture>,
 }
 impl StringDigest {
-    fn new() -> Self {
+    fn new(capture: Rc<MessageCapture>) -> Self {
         Self {
             hash: Sha256::new(),
             bytes: Vec::with_capacity(8192),
             escape: Vec::new(),
             high_surrogate: None,
+            tail: Vec::new(),
+            capture,
         }
     }
     fn byte(&mut self, byte: u8) -> io::Result<()> {
@@ -185,20 +298,37 @@ impl StringDigest {
             }
         }
         if self.bytes.len() >= 8192 {
-            self.hash.update(&self.bytes);
-            self.bytes.clear();
+            self.flush();
         }
         Ok(())
     }
-    fn finish(mut self) -> io::Result<String> {
+    fn flush(&mut self) {
+        self.hash.update(&self.bytes);
+        if self.capture.active.get() {
+            self.capture.append(&self.bytes);
+        }
+        self.tail.extend_from_slice(&self.bytes);
+        if self.tail.len() > super::RETAINED_TURN_BYTES / 1024 {
+            self.tail
+                .drain(..self.tail.len() - super::RETAINED_TURN_BYTES / 1024);
+        }
+        self.bytes.clear();
+    }
+    fn finish(mut self) -> io::Result<(String, String)> {
         if !self.escape.is_empty() || self.high_surrogate.is_some() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "incomplete native JSON escape",
             ));
         }
-        self.hash.update(&self.bytes);
-        Ok(format!("{:x}", self.hash.finalize()))
+        self.flush();
+        while self.tail.first().is_some_and(|byte| byte & 0xc0 == 0x80) {
+            self.tail.remove(0);
+        }
+        Ok((
+            format!("{:x}", self.hash.finalize()),
+            String::from_utf8(self.tail).map_err(io::Error::other)?,
+        ))
     }
 }
 
@@ -229,10 +359,14 @@ impl<R: BufRead> Read for DisplaySource<R> {
 /// prevent earlier or subsequent complete durable records from being displayed.
 pub(crate) struct Records<R> {
     input: R,
+    retention: Retention,
 }
 impl<R: BufRead> Records<R> {
-    pub(crate) fn new(input: R) -> Self {
-        Self { input }
+    pub(crate) fn new(input: R, retention: &Retention) -> Self {
+        Self {
+            input,
+            retention: retention.clone(),
+        }
     }
 }
 struct Line<'a, R> {
@@ -272,7 +406,7 @@ impl<R: BufRead> Iterator for Records<R> {
             input: &mut self.input,
             complete: &complete,
         };
-        let result = bounded_value(std::io::BufReader::new(line));
+        let result = bounded_value(std::io::BufReader::new(line), &self.retention);
         if !complete.get() {
             if let Err(error) = self.input.skip_until(b'\n') {
                 return Some(Err(error));
@@ -290,14 +424,33 @@ impl<R: BufRead> Iterator for Records<R> {
     }
 }
 
-pub(crate) fn bounded_value(reader: impl BufRead) -> Result<(Value, usize), serde_json::Error> {
+pub(crate) fn bounded_value(
+    reader: impl BufRead,
+    retention: &Retention,
+) -> Result<(Value, usize), serde_json::Error> {
     let omitted = Rc::new(Cell::new(0));
-    let mut deserializer = serde_json::Deserializer::from_reader(DisplaySource::new(reader));
-    let value = BoundedValue {
+    let capture = Rc::new(MessageCapture::default());
+    let mut deserializer = serde_json::Deserializer::from_reader(DisplaySource::new(
+        reader,
+        retention.clone(),
+        capture.clone(),
+    ));
+    let mut value = BoundedValue {
         omitted: omitted.clone(),
+        retention: retention.clone(),
+        capture: capture.clone(),
+        path: Vec::new(),
     }
     .deserialize(&mut deserializer)?;
     deserializer.end()?;
+    if capture.parts.get() > 0 {
+        if let Some(payload) = value.get_mut("payload").and_then(Value::as_object_mut) {
+            payload.insert(
+                retention.fingerprint_key.clone(),
+                Value::String(format!("{:x}", capture.hash.borrow().clone().finalize())),
+            );
+        }
+    }
     Ok((value, omitted.get()))
 }
 
@@ -305,11 +458,39 @@ pub(crate) fn bounded_value(reader: impl BufRead) -> Result<(Value, usize), serd
 /// array or arbitrary tool result can allocate the complete source tree.
 struct BoundedValue {
     omitted: Rc<Cell<usize>>,
+    retention: Retention,
+    capture: Rc<MessageCapture>,
+    path: Vec<String>,
+}
+impl BoundedValue {
+    fn child(&self, key: String) -> Self {
+        let mut path = self.path.clone();
+        path.push(key);
+        Self {
+            omitted: self.omitted.clone(),
+            retention: self.retention.clone(),
+            capture: self.capture.clone(),
+            path,
+        }
+    }
 }
 impl<'de> DeserializeSeed<'de> for BoundedValue {
     type Value = Value;
     fn deserialize<D: serde::Deserializer<'de>>(self, deserializer: D) -> Result<Value, D::Error> {
-        deserializer.deserialize_any(self)
+        let message = self.path.len() == 2
+            && self.path[0] == "payload"
+            && matches!(self.path[1].as_str(), "message" | "last_agent_message");
+        let part = self.path.len() == 4
+            && self.path[0] == "payload"
+            && self.path[1] == "content"
+            && self.path[3] == "text";
+        self.capture.active.set(message || part);
+        self.capture.part.set(part);
+        self.capture.started.set(false);
+        let capture = self.capture.clone();
+        let result = deserializer.deserialize_any(self);
+        capture.active.set(false);
+        result
     }
 }
 impl<'de> Visitor<'de> for BoundedValue {
@@ -336,34 +517,39 @@ impl<'de> Visitor<'de> for BoundedValue {
         Ok(Value::String(value.into()))
     }
     fn visit_seq<A: SeqAccess<'de>>(self, mut sequence: A) -> Result<Value, A::Error> {
-        let mut values = Vec::new();
+        let mut values = VecDeque::new();
         let mut bytes = 0;
-        let mut full = false;
+        let mut index = 0;
         loop {
-            if full {
-                if sequence.next_element::<IgnoredAny>()?.is_none() {
-                    break;
-                }
-                self.omitted.set(self.omitted.get() + 1);
-                continue;
-            }
-            let Some(value) = sequence.next_element_seed(BoundedValue {
-                omitted: self.omitted.clone(),
-            })?
-            else {
+            let Some(mut value) = sequence.next_element_seed(self.child(index.to_string()))? else {
                 break;
             };
-            bytes += serde_json::to_vec(&value)
+            if self.path == ["message", "content"] || self.path == ["payload", "content"] {
+                if let Some(object) = value.as_object_mut() {
+                    object.insert(self.retention.index_key.clone(), Value::from(index));
+                }
+            }
+            index += 1;
+            if serde_json::to_vec(&value)
+                .map_err(serde::de::Error::custom)?
+                .len()
+                > super::RETAINED_TURN_BYTES
+            {
+                super::omit_large_bodies(&mut value, &self.retention);
+            }
+            let size = serde_json::to_vec(&value)
                 .map_err(serde::de::Error::custom)?
                 .len();
-            if bytes > super::RETAINED_TURN_BYTES && !values.is_empty() {
+            bytes += size;
+            values.push_back((value, size));
+            while bytes > super::RETAINED_TURN_BYTES && values.len() > 1 {
+                bytes -= values.pop_front().unwrap().1;
                 self.omitted.set(self.omitted.get() + 1);
-                full = true;
-            } else {
-                values.push(value);
             }
         }
-        Ok(Value::Array(values))
+        Ok(Value::Array(
+            values.into_iter().map(|(value, _)| value).collect(),
+        ))
     }
     fn visit_map<A: MapAccess<'de>>(self, mut object: A) -> Result<Value, A::Error> {
         let mut values = Map::new();
@@ -374,6 +560,9 @@ impl<'de> Visitor<'de> for BoundedValue {
             let control = matches!(
                 key.as_str(),
                 "payload"
+                    | "content"
+                    | "text"
+                    | "last_agent_message"
                     | "message"
                     | "item"
                     | "info"
@@ -397,11 +586,9 @@ impl<'de> Visitor<'de> for BoundedValue {
             if bytes > super::RETAINED_TURN_BYTES * 2 && !control {
                 object.next_value::<IgnoredAny>()?;
                 self.omitted.set(self.omitted.get() + 1);
-                values.insert(key, Value::String(format!("{OMITTED_BODY}collection")));
+                values.insert(key, Value::String(self.retention.marker("collection")));
             } else {
-                let value = object.next_value_seed(BoundedValue {
-                    omitted: self.omitted.clone(),
-                })?;
+                let value = object.next_value_seed(self.child(key.clone()))?;
                 bytes += key.len()
                     + serde_json::to_vec(&value)
                         .map_err(serde::de::Error::custom)?

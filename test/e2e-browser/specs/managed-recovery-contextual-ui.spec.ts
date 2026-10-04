@@ -176,10 +176,18 @@ test('fresh-agent: cold lost pane without a soul retains saved history and a clo
   await fs.mkdir(sessions, { recursive: true })
   const events = await fs.readFile('test/fixtures/coding-cli/codex/task-events.sanitized.jsonl', 'utf8')
   const tools = await fs.readFile('test/fixtures/managed-native-history/codex-tools.jsonl', 'utf8')
+  const arrayAnswer = 'Latest saved array answer FRESHELL_NATIVE_HISTORY_OMITTED_SHA256:body'
+  const recentParts = (kind: string, tail: string) => [
+    ...Array.from({ length: 24 }, (_, index) => ({ type: kind, text: `Earlier array part ${index} ${'saved '.repeat(32_000)}` })),
+    { type: kind, text: tail },
+  ]
   const transcript = events.replace('session-activity', SESSION_ID)
     .replace('Sanitized completion', SAVED_HISTORY_TEXT) + tools.split('\n').slice(1).join('\n')
     + '\n' + JSON.stringify({ type: 'response_item', payload: { type: 'function_call', call_id: 'large-history-tool', name: 'exec_command', arguments: '{"cmd":"pwd"}' } })
     + '\n' + JSON.stringify({ type: 'response_item', payload: { type: 'function_call_output', call_id: 'large-history-tool', output: 'Saved large tool output '.repeat(800_000) } })
+    + '\n' + JSON.stringify({ type: 'response_item', payload: { type: 'function_call', call_id: 'array-history-tool', name: 'echo', arguments: '{}' } })
+    + '\n' + JSON.stringify({ type: 'response_item', payload: { type: 'function_call_output', call_id: 'array-history-tool', output: recentParts('input_text', 'Latest saved array tool output') } })
+    + '\n' + JSON.stringify({ type: 'response_item', payload: { type: 'message', id: 'array-history-answer', role: 'assistant', content: recentParts('output_text', arrayAnswer) } })
   const rollout = path.join(sessions, `rollout-${SESSION_ID}.jsonl`)
   await fs.writeFile(rollout, transcript)
   expect(Buffer.byteLength(transcript)).toBeGreaterThan(16 * 1024 * 1024)
@@ -197,6 +205,8 @@ test('fresh-agent: cold lost pane without a soul retains saved history and a clo
   const snapshot = await response.json()
   await expect(page.getByText('Sanitized prompt', { exact: true })).toBeVisible()
   await expect(page.getByText(SAVED_HISTORY_TEXT, { exact: true })).toBeVisible()
+  await expect(page.getByText(arrayAnswer, { exact: false })).toBeVisible()
+  expect(JSON.stringify(snapshot.turns)).toContain('Latest saved array tool output')
   expect(snapshot.extensions.codex.nativeHistoryAvailable).toBe(true)
   expect(snapshot.extensions.codex.nativeHistoryRetention.partial).toBe(true)
   expect(snapshot.turns.flatMap((turn: { items: Array<{ id: string }> }) => turn.items).some((item: { id: string }) => item.id === 'large-history-tool')).toBe(true)
@@ -213,6 +223,7 @@ test('fresh-agent: cold lost pane without a soul retains saved history and a clo
   await expect(card.getByRole('status')).toContainText('Your conversation has been kept')
   await expect(page.getByText(SAVED_HISTORY_TEXT, { exact: true })).toBeVisible()
   await expect(closeWarning).toBeVisible()
+  await expect(page.getByText(arrayAnswer, { exact: false })).toBeVisible()
   expect(await paneContent(page)).toEqual(before)
   expect(stopRequests).toBe(0)
   expect(await fs.readFile(rollout, 'utf8')).toBe(transcript)

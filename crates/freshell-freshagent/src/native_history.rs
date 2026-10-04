@@ -5,7 +5,7 @@ use std::{collections::VecDeque, io::Read, path::Path};
 
 #[path = "native_history_source.rs"]
 mod source;
-pub(crate) use source::Records;
+pub(crate) use source::{Records, Retention};
 pub(crate) const RETAINED_TURN_BYTES: usize = MAX_HISTORY_BYTES as usize / 4;
 
 pub const MAX_HISTORY_BYTES: u64 = 16 * 1024 * 1024;
@@ -39,7 +39,7 @@ pub(crate) fn readonly_snapshot(provider: &str, mut snapshot: Value) -> Result<V
     };
     snapshot["extensions"][wire_provider]["ownerKind"] = json!("vacant");
     snapshot["extensions"][wire_provider]["nativeHistoryAvailable"] = json!(true);
-    finish_retention(provider, &mut snapshot, 0, 0)?;
+    finish_retention(provider, &mut snapshot, 0, 0, None)?;
     Ok(snapshot)
 }
 
@@ -48,19 +48,21 @@ pub(crate) struct RetainedTurns {
     values: VecDeque<(Value, usize)>,
     bytes: usize,
     pub(crate) omitted: usize,
+    retention: Retention,
 }
 
 impl RetainedTurns {
-    pub(crate) fn new() -> Self {
+    pub(crate) fn new(retention: &Retention) -> Self {
         Self {
             values: VecDeque::new(),
             bytes: 0,
             omitted: 0,
+            retention: retention.clone(),
         }
     }
     pub(crate) fn push(&mut self, mut value: Value) {
         if serde_json::to_vec(&value).unwrap().len() > RETAINED_TURN_BYTES {
-            omit_large_bodies(&mut value);
+            omit_large_bodies(&mut value, &self.retention);
         }
         let size = serde_json::to_vec(&value)
             .expect("JSON value serializes")
@@ -79,7 +81,7 @@ impl RetainedTurns {
 
 /// Preserve the item and native control metadata while omitting a display body.
 /// Used when a single task/message is larger than the retained window.
-pub(crate) fn omit_large_bodies(value: &mut Value) {
+pub(crate) fn omit_large_bodies(value: &mut Value, retention: &Retention) {
     match value {
         Value::Object(object) => {
             for (key, value) in object {
@@ -94,67 +96,50 @@ pub(crate) fn omit_large_bodies(value: &mut Value) {
                         | "result"
                         | "aggregatedOutput"
                         | "contentItems"
-                ) && serde_json::to_vec(value).unwrap().len() > RETAINED_TURN_BYTES / 1024
-                {
-                    let marker = format!("{}body", source::OMITTED_BODY);
-                    *value = match value {
-                        Value::Array(array) => {
-                            let mut first = array.first().cloned().unwrap_or(Value::Null);
-                            if let Some(object) = first.as_object_mut() {
-                                for key in ["text", "content", "thinking"] {
-                                    if object.contains_key(key) {
-                                        object.insert(key.into(), json!(marker));
-                                    }
-                                }
-                                json!([first])
-                            } else {
-                                json!([marker])
-                            }
-                        }
-                        Value::Object(_) => json!({"Retained history":marker}),
-                        _ => json!(marker),
-                    };
+                ) {
+                    compact_body(value, retention);
                 } else {
-                    omit_large_bodies(value);
+                    omit_large_bodies(value, retention);
                 }
             }
         }
         Value::Array(array) => {
             for value in array {
-                omit_large_bodies(value);
+                omit_large_bodies(value, retention);
             }
         }
         _ => {}
     }
 }
 
-fn replace_omitted_bodies(value: &mut Value) -> usize {
+fn compact_body(value: &mut Value, retention: &Retention) {
+    let limit = RETAINED_TURN_BYTES / 1024;
     match value {
-        Value::String(text)
-            if text.split(source::OMITTED_BODY).skip(1).any(|suffix| {
-                suffix.starts_with("body")
-                    || suffix.starts_with("collection")
-                    || suffix
-                        .get(..64)
-                        .is_some_and(|digest| digest.bytes().all(|byte| byte.is_ascii_hexdigit()))
-            }) =>
-        {
-            *text = "[Content omitted from retained history]".into();
-            1
+        Value::String(text) if text.len() > limit => {
+            let mut start = text.len() - limit;
+            while !text.is_char_boundary(start) {
+                start += 1;
+            }
+            *text = format!("{}\n{}", retention.marker("body"), &text[start..]);
         }
-        Value::Array(values) => values.iter_mut().map(replace_omitted_bodies).sum(),
-        Value::Object(values) => values
-            .iter_mut()
-            .map(|(key, value)| {
-                let count = replace_omitted_bodies(value);
-                if key == "summary" {
-                    0
+        Value::Array(array) => {
+            for value in array {
+                if value.is_object() {
+                    // A content block owns native type/link metadata. Compact
+                    // its display fields without replacing the block itself.
+                    omit_large_bodies(value, retention);
                 } else {
-                    count
+                    compact_body(value, retention);
                 }
-            })
-            .sum(),
-        _ => 0,
+            }
+        }
+        // Structured tool input/result bodies can contain many small fields.
+        // Keep the established omission policy for these bodies; the containing
+        // call and its native identity remain available.
+        Value::Object(_) if serde_json::to_vec(value).unwrap().len() > limit => {
+            *value = json!({"Retained history":retention.marker("body")});
+        }
+        _ => {}
     }
 }
 
@@ -163,6 +148,7 @@ pub(crate) fn finish_retention(
     snapshot: &mut Value,
     omitted_turns: usize,
     omitted_items: usize,
+    retention: Option<&Retention>,
 ) -> Result<(), String> {
     let provider = if provider == "kilroy" {
         "claude"
@@ -173,8 +159,10 @@ pub(crate) fn finish_retention(
     let mut omitted_turns =
         omitted_turns + old["omittedNativeTurns"].as_u64().unwrap_or(0) as usize;
     let omitted_items = omitted_items + old["omittedItems"].as_u64().unwrap_or(0) as usize;
-    let omitted_bodies =
-        old["omittedBodies"].as_u64().unwrap_or(0) as usize + replace_omitted_bodies(snapshot);
+    let omitted_bodies = old["omittedBodies"].as_u64().unwrap_or(0) as usize
+        + retention
+            .map(|retention| retention.finish(snapshot))
+            .unwrap_or(0);
     // Reserve framing and retention metadata before the helper's stdout boundary.
     while serde_json::to_vec(snapshot)
         .map_err(|e| e.to_string())?
@@ -299,8 +287,9 @@ fn read_opencode(home: &Path, id: &str) -> Result<Value, String> {
     if info["revert"].is_null() {
         info.as_object_mut().unwrap().remove("revert");
     }
-    let mut active = RetainedTurns::new();
-    let mut rolled_back = RetainedTurns::new();
+    let retention = Retention::new();
+    let mut active = RetainedTurns::new(&retention);
+    let mut rolled_back = RetainedTurns::new(&retention);
     let mut omitted_parts = 0;
     let pointer = info.pointer("/revert/messageID").and_then(Value::as_str);
     let mut after_revert = false;
@@ -314,16 +303,16 @@ fn read_opencode(home: &Path, id: &str) -> Result<Value, String> {
         let message_id = row.map_err(|e| e.to_string())?;
         after_revert |= pointer == Some(message_id.as_str());
         let (mut message, mut source_omissions) =
-            read_sql_json(&connection, "message", &message_id)?;
+            read_sql_json(&connection, "message", &message_id, &retention)?;
         message["id"] = json!(message_id);
-        let mut parts = RetainedTurns::new();
+        let mut parts = RetainedTurns::new(&retention);
         let mut statement = connection.prepare("SELECT id FROM part WHERE session_id = ?1 AND message_id = ?2 ORDER BY time_created, id").map_err(|e| e.to_string())?;
         let rows = statement
             .query_map([id, &message_id], |row| row.get::<_, String>(0))
             .map_err(|e| e.to_string())?;
         for row in rows {
             let part_id = row.map_err(|e| e.to_string())?;
-            let (mut part, omitted) = read_sql_json(&connection, "part", &part_id)?;
+            let (mut part, omitted) = read_sql_json(&connection, "part", &part_id, &retention)?;
             source_omissions += omitted;
             part["id"] = json!(part_id);
             parts.push(part);
@@ -366,13 +355,24 @@ fn read_opencode(home: &Path, id: &str) -> Result<Value, String> {
     if !rolled_back.is_empty() {
         snapshot["rolledBackTurns"] = json!(rolled_back);
     }
-    finish_retention("opencode", &mut snapshot, omitted, omitted_parts)?;
+    finish_retention(
+        "opencode",
+        &mut snapshot,
+        omitted,
+        omitted_parts,
+        Some(&retention),
+    )?;
     Ok(snapshot)
 }
 
 /// SQLite TEXT can itself be huge; read exact UTF-8 bytes in chunks inside the
 /// same read transaction instead of allocating an entire row before clipping.
-fn read_sql_json(connection: &Connection, table: &str, id: &str) -> Result<(Value, usize), String> {
+fn read_sql_json(
+    connection: &Connection,
+    table: &str,
+    id: &str,
+    retention: &Retention,
+) -> Result<(Value, usize), String> {
     let query = if table == "message" {
         "SELECT rowid FROM message WHERE id=?1"
     } else {
@@ -384,8 +384,11 @@ fn read_sql_json(connection: &Connection, table: &str, id: &str) -> Result<(Valu
     let blob = connection
         .blob_open(rusqlite::DatabaseName::Main, table, "data", rowid, true)
         .map_err(|e| e.to_string())?;
-    source::bounded_value(std::io::BufReader::with_capacity(64 * 1024, blob))
-        .map_err(|e| e.to_string())
+    source::bounded_value(
+        std::io::BufReader::with_capacity(64 * 1024, blob),
+        retention,
+    )
+    .map_err(|e| e.to_string())
 }
 
 fn read_claude(home: &Path, id: &str, provider: &str) -> Result<Value, String> {
@@ -394,15 +397,21 @@ fn read_claude(home: &Path, id: &str, provider: &str) -> Result<Value, String> {
     let file = std::fs::File::open(path).map_err(|e| e.to_string())?;
     let metadata = file.metadata().map_err(|e| e.to_string())?;
     let extent = metadata.len();
-    let source = Records::new(std::io::BufReader::new(file.take(extent)));
-    let mut turns = RetainedTurns::new();
+    let retention = Retention::new();
+    let source = Records::new(std::io::BufReader::new(file.take(extent)), &retention);
+    let mut turns = RetainedTurns::new(&retention);
     let mut ordinal = 0;
     let mut omitted_items = 0;
     for record in source {
         let Some((record, omitted)) = record.map_err(|e| e.to_string())? else {
             continue;
         };
-        if let Some(turn) = crate::claude_snapshot::parse_transcript_turn(&record, id, ordinal) {
+        if let Some(turn) = crate::claude_snapshot::parse_transcript_turn_indexed(
+            &record,
+            id,
+            ordinal,
+            Some(&retention.index_key),
+        ) {
             omitted_items += omitted;
             turns.push(turn);
             ordinal += 1;
@@ -432,6 +441,12 @@ fn read_claude(home: &Path, id: &str, provider: &str) -> Result<Value, String> {
         .map(|turn| turn["turnId"].clone())
         .unwrap_or(Value::Null);
     snapshot["turns"] = json!(turns);
-    finish_retention(provider, &mut snapshot, omitted, omitted_items)?;
+    finish_retention(
+        provider,
+        &mut snapshot,
+        omitted,
+        omitted_items,
+        Some(&retention),
+    )?;
     Ok(snapshot)
 }
