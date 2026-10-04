@@ -477,13 +477,9 @@ impl Supervisor {
                                 .reconcile_registering_ready(&references)
                                 .map_err(map_opencode_transfer)?;
                         }
-                        let available = self
-                            .opencode_transfer_staging
-                            .available_space_bytes()
-                            .map_err(map_opencode_transfer)?;
                         match self
                             .opencode_transfer_staging
-                            .begin(&descriptor, &attempt_id, available)
+                            .begin_from_filesystem(&descriptor, &attempt_id)
                             .map_err(map_opencode_transfer)?
                         {
                             crate::opencode_transfer::StagingStart::Started {
