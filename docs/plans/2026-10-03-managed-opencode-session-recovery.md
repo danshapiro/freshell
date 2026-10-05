@@ -299,7 +299,7 @@ Add a registry/filesystem fixture with Lost souls, exact loss rows/tombstones, p
 
 - [ ] **Step 2: Run tests and verify the intended failure**
 
-Run: `cargo test -p freshell-supervisor restore_lost_souls && cargo test -p freshell-supervisor withdraw_false_incident`
+Run: `cargo test -p freshell-supervisor restore_lost_souls && cargo test -p freshell-supervisor withdraw_false_incident && cargo test -p freshell-server --features managed-runtime-v1 restore_lost_souls`
 
 Expected: FAIL because Lost souls have no restore transition and incident exports/notices have no correction lifecycle.
 
@@ -311,7 +311,7 @@ Rebuild only notices whose incident sets intersect the false IDs, redirect super
 
 - [ ] **Step 4: Run focused tests**
 
-Run: `cargo test -p freshell-supervisor restore_lost_souls && cargo test -p freshell-supervisor withdraw_false_incident`
+Run: `cargo test -p freshell-supervisor restore_lost_souls && cargo test -p freshell-supervisor withdraw_false_incident && cargo test -p freshell-server --features managed-runtime-v1 restore_lost_souls`
 
 Expected: PASS for stopped/resume-ready `DataRepairComplete`, provider-identity read failures preserving all false artifacts, one-owner safety, duplicate view/soul cleanup, stale-cleanup fencing, crash-retryable exact withdrawal, safe receipt collision handling, serialized exporter/lifecycle-log updates, and absence of false artifacts without touching unrelated incidents or concurrent user intent.
 
@@ -321,7 +321,7 @@ Consolidate exact-ID selection, receipt merge, progress recovery, and serialized
 
 - [ ] **Step 6: Run impacted-test verification**
 
-Run: `cargo test -p freshell-supervisor && cargo test -p freshell-server`
+Run: `cargo test -p freshell-supervisor && cargo test -p freshell-server --features managed-runtime-v1`
 
 Expected: PASS, including true-loss notices, summary APIs, cleanup retry, batch route auth/idempotency, duplicate-view migration, and stopped-ready projections.
 
