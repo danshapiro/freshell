@@ -163,6 +163,7 @@ pub struct HostOpenCodeInventory {
     channel_databases: Vec<PathBuf>,
     workspace_mounts: Vec<WorkspaceMountMapping>,
     trusted_directory_mounts: Vec<PathBuf>,
+    discovery_root: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -196,6 +197,7 @@ impl HostOpenCodeInventory {
             channel_databases: Vec::new(),
             workspace_mounts: Vec::new(),
             trusted_directory_mounts: Vec::new(),
+            discovery_root: None,
         }
     }
 
@@ -217,6 +219,7 @@ impl HostOpenCodeInventory {
     pub fn discover_in_data_home(data_home: &Path) -> Result<Self, TransferError> {
         let default_database = crate::provider_layout::OpencodeLayout.session_root(data_home);
         let mut inventory = Self::new(default_database);
+        inventory.discovery_root = Some(data_home.to_path_buf());
         let entries = match fs::read_dir(data_home) {
             Ok(entries) => entries,
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(inventory),
@@ -355,6 +358,128 @@ impl HostOpenCodeInventory {
             .unwrap_or_else(|| Path::new("."))
             .join("tool-output")
     }
+}
+
+/// Body-free census produced only by reading the complete declared host inventory.
+#[derive(Debug, Clone)]
+pub struct NativeSourceInventory {
+    source_store_id: String,
+    root_session_id: String,
+    schema_fingerprint: String,
+    migration_fingerprint: String,
+    inventory_fingerprint: String,
+    available: bool,
+}
+
+impl NativeSourceInventory {
+    pub fn source_store_id(&self) -> &str {
+        &self.source_store_id
+    }
+    pub fn root_session_id(&self) -> &str {
+        &self.root_session_id
+    }
+    pub fn schema_fingerprint(&self) -> &str {
+        &self.schema_fingerprint
+    }
+    pub fn migration_fingerprint(&self) -> &str {
+        &self.migration_fingerprint
+    }
+    pub fn inventory_fingerprint(&self) -> &str {
+        &self.inventory_fingerprint
+    }
+    pub fn available(&self) -> bool {
+        self.available
+    }
+}
+
+impl HostOpenCodeInventory {
+    pub fn inspect_exact_origin(
+        &self,
+        source_store_id: &str,
+        root_session_id: &str,
+    ) -> Result<NativeSourceInventory, TransferError> {
+        let candidates = self.candidates()?;
+        let mut census = Vec::new();
+        let mut origin = None;
+        let mut available = false;
+        // Keep every read transaction open until the census is complete. No
+        // message/part bodies, assets, or configuration are read here.
+        let mut sources = Vec::new();
+        for path in &candidates {
+            let canonical = path.canonicalize()?;
+            let store = digest(canonical.to_string_lossy().as_bytes());
+            let db = open_source_read_only(&canonical)?;
+            db.execute_batch("BEGIN DEFERRED")?;
+            validate_known_schema(&db)?;
+            let schema = schema_fingerprint(&db)?;
+            let migration = migration_fingerprint(&db)?;
+            let found: bool = db.query_row(
+                "SELECT EXISTS(SELECT 1 FROM session WHERE id=?1)",
+                [root_session_id],
+                |row| row.get(0),
+            )?;
+            if !found && native_history_references_root(&db, root_session_id)? {
+                return Err(TransferError::Blocked(
+                    "native history remains without its session root".into(),
+                ));
+            }
+            available |= found;
+            if store == source_store_id {
+                origin = Some((schema.clone(), migration.clone()));
+            }
+            census.push((store, schema, migration, found));
+            sources.push(db);
+        }
+        if let Some(root) = &self.discovery_root {
+            if Self::discover_in_data_home(root)?.candidates()? != candidates {
+                return Err(TransferError::Blocked(
+                    "source inventory changed during inspection".into(),
+                ));
+            }
+        }
+        // A disappeared origin must not be silently omitted by discovery.
+        let (schema_fingerprint, migration_fingerprint) = origin.ok_or_else(|| {
+            TransferError::Blocked("original source store is not in the readable inventory".into())
+        })?;
+        let inventory_fingerprint = digest(
+            &serde_json::to_vec(&(root_session_id, census))
+                .map_err(|e| TransferError::Serialization(e.to_string()))?,
+        );
+        Ok(NativeSourceInventory {
+            source_store_id: source_store_id.into(),
+            root_session_id: root_session_id.into(),
+            schema_fingerprint,
+            migration_fingerprint,
+            inventory_fingerprint,
+            available,
+        })
+    }
+}
+
+fn native_history_references_root(db: &Connection, root: &str) -> Result<bool, TransferError> {
+    // Only inspect identity columns. A partial store is unresolved even when
+    // the root row itself has disappeared; retained events may still recover it.
+    for (table, column) in [
+        ("session", "parent_id"),
+        ("event_sequence", "aggregate_id"),
+        ("event", "aggregate_id"),
+        ("message", "session_id"),
+        ("part", "session_id"),
+        ("session_context_epoch", "session_id"),
+        ("session_input", "session_id"),
+        ("session_message", "session_id"),
+        ("todo", "session_id"),
+        ("session_share", "session_id"),
+    ] {
+        if db.query_row(
+            &format!("SELECT EXISTS(SELECT 1 FROM {table} WHERE {column}=?1)"),
+            [root],
+            |row| row.get::<_, bool>(0),
+        )? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 #[derive(Debug, Clone)]
@@ -2936,5 +3061,97 @@ mod windows_extraction_acl_tests {
             &windows_acl::read_acl_evidence(&path).unwrap()
         ));
         assert_eq!(prepare_extraction_root(&path).unwrap(), path);
+    }
+}
+
+#[cfg(test)]
+mod native_source_inventory_tests {
+    use super::*;
+
+    fn source(path: &Path) -> Connection {
+        let db = Connection::open(path).unwrap();
+        db.execute_batch(PINNED_SCHEMA_SQL).unwrap();
+        for (index, migration) in PINNED_MIGRATIONS.iter().enumerate() {
+            db.execute(
+                "INSERT INTO migration(id,time_completed) VALUES (?1,?2)",
+                rusqlite::params![migration, index as i64],
+            )
+            .unwrap();
+        }
+        db
+    }
+
+    #[test]
+    fn native_inventory_proves_complete_absence_and_detects_available_history() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("opencode.db");
+        let db = source(&path);
+        let store = digest(path.canonicalize().unwrap().to_string_lossy().as_bytes());
+        let inventory = HostOpenCodeInventory::new(path);
+        let absent = inventory.inspect_exact_origin(&store, "ses_exact").unwrap();
+        assert!(!absent.available());
+        db.execute("INSERT INTO project(id,worktree,time_created,time_updated,sandboxes) VALUES ('prj','/synthetic',1,1,'[]')", []).unwrap();
+        db.execute("INSERT INTO session(id,slug,project_id,directory,title,version,time_created,time_updated) VALUES ('ses_exact','slug','prj','/synthetic','synthetic','1',1,1)", []).unwrap();
+        assert!(inventory
+            .inspect_exact_origin(&store, "ses_exact")
+            .unwrap()
+            .available());
+    }
+
+    #[test]
+    fn native_inventory_does_not_certify_remaining_history_without_its_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("opencode.db");
+        let db = source(&path);
+        let store = digest(path.canonicalize().unwrap().to_string_lossy().as_bytes());
+        db.execute(
+            "INSERT INTO event_sequence(aggregate_id,seq) VALUES ('ses_exact',1)",
+            [],
+        )
+        .unwrap();
+        assert!(
+            HostOpenCodeInventory::new(path)
+                .inspect_exact_origin(&store, "ses_exact")
+                .is_err(),
+            "remaining native history must keep absence unresolved"
+        );
+    }
+
+    #[test]
+    fn native_inventory_never_certifies_missing_broken_or_partial_inventory() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("opencode.db");
+        let _db = source(&path);
+        let store = digest(path.canonicalize().unwrap().to_string_lossy().as_bytes());
+        let missing = dir.path().join("missing.db");
+        assert!(HostOpenCodeInventory::new(missing.clone())
+            .inspect_exact_origin(&store, "ses_exact")
+            .is_err());
+        assert!(HostOpenCodeInventory::new(path.clone())
+            .with_channel_database(path.clone())
+            .with_channel_database(missing.clone())
+            .inspect_exact_origin(&store, "ses_exact")
+            .is_err());
+        let other = dir.path().join("opencode-channel.db");
+        let _other = source(&other);
+        assert!(HostOpenCodeInventory::new(path.clone())
+            .with_channel_database(other)
+            .inspect_exact_origin(&store, "ses_exact")
+            .is_err());
+        #[cfg(unix)]
+        {
+            let broken = dir.path().join("broken.db");
+            std::os::unix::fs::symlink(missing, &broken).unwrap();
+            assert!(HostOpenCodeInventory::new(broken)
+                .inspect_exact_origin(&store, "ses_exact")
+                .is_err());
+        }
+        let corrupt = dir.path().join("corrupt.db");
+        fs::write(&corrupt, b"not sqlite").unwrap();
+        assert!(HostOpenCodeInventory::new(path.clone())
+            .with_channel_database(path)
+            .with_channel_database(corrupt)
+            .inspect_exact_origin(&store, "ses_exact")
+            .is_err());
     }
 }
