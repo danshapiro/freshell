@@ -448,6 +448,150 @@ fn current_store_verification_accepts_fractional_v1_message_and_part_timestamps(
 }
 
 #[test]
+fn current_store_verification_rejects_adjacent_large_integer_message_timestamps() {
+    let fixture = fixture_with_baseline_event();
+    import_bundle(
+        &fixture.descriptor,
+        &fixture.staged_directory,
+        &fixture.destination_database,
+        &fixture.workspace,
+    )
+    .unwrap();
+
+    let connection = Connection::open(&fixture.destination_database).unwrap();
+    append_v1_user_message(
+        &connection,
+        1,
+        "evt_large_timestamp",
+        "msg_large_timestamp",
+        serde_json::json!(9007199254740992i64),
+        9007199254740993i64,
+        9007199254740994i64,
+    );
+    drop(connection);
+
+    assert!(
+        verify_current_store(
+            &fixture.descriptor,
+            &fixture.destination_database,
+            &fixture.workspace,
+        )
+        .is_err(),
+        "distinct INTEGER timestamps above 2^53 must not compare equal"
+    );
+}
+
+#[test]
+fn current_store_verification_rejects_adjacent_large_integer_part_timestamps() {
+    let fixture = fixture_with_baseline_event();
+    import_bundle(
+        &fixture.descriptor,
+        &fixture.staged_directory,
+        &fixture.destination_database,
+        &fixture.workspace,
+    )
+    .unwrap();
+
+    let connection = Connection::open(&fixture.destination_database).unwrap();
+    append_v1_user_message(
+        &connection,
+        1,
+        "evt_large_parent_message",
+        "msg_large_parent",
+        serde_json::json!(9007199254740992i64),
+        9007199254740992i64,
+        9007199254740993i64,
+    );
+    let part = serde_json::json!({
+        "id":"prt_large_timestamp",
+        "sessionID":"ses_root",
+        "messageID":"msg_large_parent",
+        "type":"text",
+        "text":"large integer timestamp"
+    });
+    let mut part_data = part.as_object().unwrap().clone();
+    part_data.remove("id");
+    part_data.remove("sessionID");
+    part_data.remove("messageID");
+    append_durable_event(
+        &connection,
+        2,
+        "evt_large_part_timestamp",
+        "message.part.updated.1",
+        serde_json::json!({
+            "sessionID":"ses_root",
+            "part":part,
+            "time":9007199254740992i64
+        }),
+    );
+    connection
+        .execute(
+            "INSERT INTO part(id,message_id,session_id,time_created,time_updated,data)
+             VALUES('prt_large_timestamp','msg_large_parent','ses_root',?1,?2,?3)",
+            params![
+                9007199254740993i64,
+                9007199254740994i64,
+                serde_json::Value::Object(part_data).to_string()
+            ],
+        )
+        .unwrap();
+    drop(connection);
+
+    assert!(verify_current_store(
+        &fixture.descriptor,
+        &fixture.destination_database,
+        &fixture.workspace,
+    )
+    .is_err());
+}
+
+#[test]
+fn current_store_verification_orders_large_integer_v1_timestamps_exactly() {
+    let fixture = fixture_with_baseline_event();
+    import_bundle(
+        &fixture.descriptor,
+        &fixture.staged_directory,
+        &fixture.destination_database,
+        &fixture.workspace,
+    )
+    .unwrap();
+
+    let connection = Connection::open(&fixture.destination_database).unwrap();
+    append_v1_user_message(
+        &connection,
+        1,
+        "evt_large_early",
+        "msg_z_early",
+        serde_json::json!(9007199254740992i64),
+        9007199254740992i64,
+        9007199254740992i64,
+    );
+    append_v1_user_message(
+        &connection,
+        2,
+        "evt_large_late",
+        "msg_a_late",
+        serde_json::json!(9007199254740993i64),
+        9007199254740993i64,
+        9007199254740993i64,
+    );
+    drop(connection);
+
+    let evidence = verify_current_store(
+        &fixture.descriptor,
+        &fixture.destination_database,
+        &fixture.workspace,
+    )
+    .expect("both exact integer message timestamps are witnessed");
+    assert_eq!(
+        evidence.root_tail,
+        VerifiedRootTail::Message {
+            message_id: "msg_a_late".into()
+        }
+    );
+}
+
+#[test]
 fn current_store_verification_canonicalizes_fractional_v2_datetime_timestamps() {
     let fixture = fixture_with_baseline_event();
     import_bundle(
@@ -542,7 +686,7 @@ fn current_store_verification_checks_v2_location_workspace_id_prefix() {
 
         let moved = serde_json::json!({
             "sessionID":"ses_root",
-            "timestamp":10,
+            "timestamp":10.5,
             "location":{
                 "directory":fixture.workspace.to_string_lossy(),
                 "workspaceID":workspace_id
@@ -1120,7 +1264,7 @@ fn current_store_verification_accepts_exact_admitted_and_promoted_input_projecti
         serde_json::json!({
             "sessionID":"ses_root",
             "messageID":"msg_pending",
-            "timestamp":20,
+            "timestamp":20.5,
             "prompt":prompt,
             "delivery":"queue"
         }),
@@ -1141,7 +1285,7 @@ fn current_store_verification_accepts_exact_admitted_and_promoted_input_projecti
         serde_json::json!({
             "sessionID":"ses_root",
             "messageID":"msg_pending",
-            "timestamp":20,
+            "timestamp":20.5,
             "prompt":prompt,
             "delivery":"queue"
         }),
@@ -1198,7 +1342,7 @@ fn current_store_verification_accepts_todowrite_projection_only_when_payload_mat
         "session.next.tool.called.1",
         serde_json::json!({
             "sessionID":"ses_root",
-            "timestamp":20,
+            "timestamp":20.5,
             "assistantMessageID":"msg_assistant",
             "callID":"call_todo",
             "tool":"todowrite",
@@ -1213,7 +1357,7 @@ fn current_store_verification_accepts_todowrite_projection_only_when_payload_mat
         "session.next.tool.success.1",
         serde_json::json!({
             "sessionID":"ses_root",
-            "timestamp":30,
+            "timestamp":30.5,
             "assistantMessageID":"msg_assistant",
             "callID":"call_todo",
             "structured":{"todos":todos},
@@ -1407,6 +1551,47 @@ fn append_durable_event(
         .execute(
             "INSERT INTO event(id,aggregate_id,seq,type,data) VALUES(?1,'ses_root',?2,?3,?4)",
             params![event_id, sequence, event_type, data.to_string()],
+        )
+        .unwrap();
+}
+
+fn append_v1_user_message(
+    connection: &Connection,
+    sequence: i64,
+    event_id: &str,
+    message_id: &str,
+    event_timestamp: serde_json::Value,
+    row_time_created: i64,
+    row_time_updated: i64,
+) {
+    let info = serde_json::json!({
+        "id":message_id,
+        "sessionID":"ses_root",
+        "role":"user",
+        "time":{"created":event_timestamp},
+        "agent":"build",
+        "model":{"providerID":"provider-one","modelID":"model-one"}
+    });
+    let mut message_data = info.as_object().unwrap().clone();
+    message_data.remove("id");
+    message_data.remove("sessionID");
+    append_durable_event(
+        connection,
+        sequence,
+        event_id,
+        "message.updated.1",
+        serde_json::json!({"sessionID":"ses_root","info":info}),
+    );
+    connection
+        .execute(
+            "INSERT INTO message(id,session_id,time_created,time_updated,data)
+             VALUES(?1,'ses_root',?2,?3,?4)",
+            params![
+                message_id,
+                row_time_created,
+                row_time_updated,
+                serde_json::Value::Object(message_data).to_string()
+            ],
         )
         .unwrap();
 }
@@ -2016,6 +2201,26 @@ fn immutable_baseline_events_are_schema_checked_and_unknown_types_block() {
             verify_current_event_chains(&manifest, &current, &[invalid]).is_err(),
             "baseline event type {invalid_type} must not bypass durable schema validation"
         );
+    }
+}
+
+#[test]
+fn v2_datetime_timestamp_uses_timeclip_for_negative_fractions_and_range_boundaries() {
+    for (input, expected) in [
+        (serde_json::json!(20.5), Some(20)),
+        (serde_json::json!(-20.5), Some(-20)),
+        (
+            serde_json::json!(8640000000000000i64),
+            Some(8640000000000000i64),
+        ),
+        (
+            serde_json::json!(-8640000000000000i64),
+            Some(-8640000000000000i64),
+        ),
+        (serde_json::json!(8640000000000001i64), None),
+        (serde_json::json!(-8640000000000001i64), None),
+    ] {
+        assert_eq!(canonical_v2_timestamp_millis(&input), expected, "{input}");
     }
 }
 
