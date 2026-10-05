@@ -156,6 +156,7 @@ pub const PROVIDER_CAPABILITIES: &[ProviderCapability] = &[
             RecoveryPath::NativeResume,
             RecoveryPath::CheckpointRestore,
             RecoveryPath::PristineSeed,
+            RecoveryPath::NativeImport,
         ],
         managed_modes: &["opencode"],
         execution_boundary: "session-host-pty",
@@ -1568,6 +1569,17 @@ mod tests {
             assert_eq!(
                 entry["qualificationReady"], capability.qualification_ready,
                 "manifest qualification readiness drifted for {}",
+                capability.provider
+            );
+            let runtime_paths = capability
+                .recovery_paths
+                .iter()
+                .map(|path| serde_json::to_value(path).unwrap())
+                .collect::<Vec<_>>();
+            assert_eq!(
+                entry["recoveryPaths"],
+                serde_json::Value::Array(runtime_paths),
+                "manifest recovery path inventory drifted for {}",
                 capability.provider
             );
         }
