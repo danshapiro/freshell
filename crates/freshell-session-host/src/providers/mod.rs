@@ -162,11 +162,27 @@ fn prepare_amplifier_package_target() -> Result<(), String> {
 }
 
 pub async fn prepare_terminal(
-    mut terminal: freshell_runtime_protocol::TerminalLaunchSpec,
+    terminal: freshell_runtime_protocol::TerminalLaunchSpec,
     child_secret_env: &std::collections::BTreeMap<String, String>,
     prepared_opencode_plan: Option<&freshell_platform::opencode_config::OpencodeConfigPlan>,
     selected_claude_settings: Option<&str>,
 ) -> Result<PreparedTerminal, String> {
+    prepare_terminal_with_provider_feature_runner(
+        terminal,
+        child_secret_env,
+        prepare_provider_features_for_identity,
+    )
+    .await
+}
+
+async fn prepare_terminal_with_provider_feature_runner<F>(
+    mut terminal: freshell_runtime_protocol::TerminalLaunchSpec,
+    child_secret_env: &std::collections::BTreeMap<String, String>,
+    prepare_features: F,
+) -> Result<PreparedTerminal, String>
+where
+    F: Fn(u32, u32, &[&str]) -> Result<Option<String>, String>,
+{
     let mut child_env = child_secret_env.clone();
     prepare_scoped_mcp_environment(terminal.provider_launch_context.as_ref(), &mut child_env)
         .await?;
@@ -179,7 +195,7 @@ pub async fn prepare_terminal(
             .as_ref()
             .is_some_and(|context| context.mcp_capability.is_some())
     {
-        prepare_provider_features(&terminal, "claude-mcp")?;
+        prepare_features(terminal.run_as_uid, terminal.run_as_gid, &["claude-mcp"])?;
     }
     if terminal.mode == "opencode" {
         if let Some(context) = terminal.provider_launch_context.as_ref() {
@@ -225,15 +241,16 @@ pub async fn prepare_terminal(
                 .get("OPENCODE_TUI_CONFIG")
                 .or_else(|| child_env.get("OPENCODE_TUI_CONFIG"))
                 .cloned();
-            if let Some(selector) = prepare_opencode_rebind(
+            if prepared_tui {
+                prepare_features(terminal.run_as_uid, terminal.run_as_gid, &["opencode-rebind-source"])?;
+            } else {
+            prepare_opencode_rebind_tui_config(
+                &mut terminal.env,
                 terminal.run_as_uid,
                 terminal.run_as_gid,
-                prepared_tui,
                 source.as_deref(),
-            )? {
-                terminal
-                    .env
-                    .insert("OPENCODE_TUI_CONFIG".into(), selector.into());
+                &prepare_features,
+            )?;
             }
         }
         let permission = terminal
@@ -358,30 +375,64 @@ async fn probe_managed_endpoint(endpoint: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn prepare_provider_features(
-    terminal: &freshell_runtime_protocol::TerminalLaunchSpec,
-    operation: &str,
-) -> Result<(), String> {
-    prepare_provider_features_for_identity(terminal.run_as_uid, terminal.run_as_gid, &[operation])
-}
-
-fn prepare_provider_features_for_identity(uid: u32, gid: u32, args: &[&str]) -> Result<(), String> {
+fn prepare_provider_features_for_identity(
+    uid: u32,
+    gid: u32,
+    args: &[&str],
+) -> Result<Option<String>, String> {
     let exe = std::env::current_exe().map_err(|error| error.to_string())?;
-    let status = std::process::Command::new("/usr/bin/setpriv")
+    let output = std::process::Command::new("/usr/bin/setpriv")
         .args(crate::provider_identity_args(uid, gid))
         .arg(exe)
         .arg("prepare-provider-features")
         .args(args)
-        .status()
+        .output()
         .map_err(|error| format!("prepare provider features: {error}"))?;
-    if status.success() {
-        Ok(())
-    } else {
-        Err(format!(
+    if !output.status.success() {
+        let _ = std::io::Write::write_all(&mut std::io::stderr(), &output.stderr);
+        return Err(format!(
             "prepare provider features failed: {}",
             args.first().unwrap_or(&"unknown")
-        ))
+        ));
     }
+    parse_provider_feature_worker_output(args.first().copied().unwrap_or("unknown"), &output.stdout)
+}
+
+fn parse_provider_feature_worker_output(
+    operation: &str,
+    stdout: &[u8],
+) -> Result<Option<String>, String> {
+    if operation != "opencode-rebind" {
+        return Ok(None);
+    }
+    let output = std::str::from_utf8(stdout)
+        .map_err(|_| "OpenCode rebind worker returned an invalid selector path".to_string())?;
+    let path = output.trim_end_matches(['\r', '\n']);
+    if path.is_empty() || path.contains(['\r', '\n']) || !std::path::Path::new(path).is_absolute() {
+        return Err("OpenCode rebind worker did not return one absolute selector path".into());
+    }
+    Ok(Some(path.to_owned()))
+}
+
+fn prepare_opencode_rebind_tui_config<F>(
+    env: &mut std::collections::BTreeMap<String, String>,
+    uid: u32,
+    gid: u32,
+    source: Option<&str>,
+    prepare_features: &F,
+) -> Result<(), String>
+where
+    F: Fn(u32, u32, &[&str]) -> Result<Option<String>, String>,
+{
+    let mut args = vec!["opencode-rebind"];
+    if let Some(source) = source {
+        args.push(source);
+    }
+    let selector = prepare_features(uid, gid, &args)?
+        .filter(|path| !path.is_empty())
+        .ok_or_else(|| "OpenCode rebind worker returned no selector path".to_string())?;
+    env.insert("OPENCODE_TUI_CONFIG".into(), selector);
+    Ok(())
 }
 
 pub async fn prepare_fresh_agent_child_environment(
@@ -389,6 +440,21 @@ pub async fn prepare_fresh_agent_child_environment(
     child_env: &mut std::collections::BTreeMap<String, String>,
     prepared_opencode_plan: Option<&freshell_platform::opencode_config::OpencodeConfigPlan>,
 ) -> Result<(), String> {
+    prepare_fresh_agent_child_environment_with_provider_feature_runner(
+        launch,
+        child_env,
+        prepare_provider_features_for_identity,
+    )
+}
+
+fn prepare_fresh_agent_child_environment_with_provider_feature_runner<F>(
+    launch: &freshell_runtime_protocol::FreshAgentLaunchSpec,
+    child_env: &mut std::collections::BTreeMap<String, String>,
+    prepare_features: F,
+) -> Result<(), String>
+where
+    F: Fn(u32, u32, &[&str]) -> Result<Option<String>, String>,
+{
     use freshell_runtime_protocol::{FreshProvider, ProviderPreparation};
     prepare_scoped_mcp_environment(launch.provider_launch_context.as_ref(), child_env).await?;
     if launch.provider != FreshProvider::Opencode {
@@ -454,35 +520,19 @@ pub async fn prepare_fresh_agent_child_environment(
             .is_some_and(|context| context.prepared_inputs.is_some())
             && child_env.contains_key("OPENCODE_TUI_CONFIG");
         let source = child_env.get("OPENCODE_TUI_CONFIG").cloned();
-        if let Some(selector) = prepare_opencode_rebind(
+        if prepared_tui {
+            prepare_features(launch.run_as_uid, launch.run_as_gid, &["opencode-rebind-source"])?;
+        } else {
+        prepare_opencode_rebind_tui_config(
+            child_env,
             launch.run_as_uid,
             launch.run_as_gid,
-            prepared_tui,
             source.as_deref(),
-        )? {
-            child_env.insert("OPENCODE_TUI_CONFIG".into(), selector.into());
+            &prepare_features,
+        )?;
         }
     }
     Ok(())
-}
-
-fn prepare_opencode_rebind(
-    uid: u32,
-    gid: u32,
-    prepared_source: bool,
-    selected: Option<&str>,
-) -> Result<Option<&'static str>, String> {
-    if prepared_source {
-        prepare_provider_features_for_identity(uid, gid, &["opencode-rebind-source"])?;
-        Ok(None)
-    } else {
-        let mut args = vec!["opencode-rebind"];
-        if let Some(selected) = selected {
-            args.push(selected);
-        }
-        prepare_provider_features_for_identity(uid, gid, &args)?;
-        Ok(Some("/home/freshell/provider/.freshell/opencode/tui.json"))
-    }
 }
 
 fn opencode_plan(
@@ -502,10 +552,18 @@ fn opencode_plan(
     .map_err(|error| error.to_string())
 }
 
-pub(crate) fn run_provider_features_worker(args: &[String]) -> Result<(), String> {
-    let provider_home = std::path::Path::new("/home/freshell/provider");
+pub(crate) fn run_provider_features_worker(
+    args: &[String],
+) -> Result<Option<std::path::PathBuf>, String> {
+    run_provider_features_worker_at(args, std::path::Path::new("/home/freshell/provider"))
+}
+
+fn run_provider_features_worker_at(
+    args: &[String],
+    provider_home: &std::path::Path,
+) -> Result<Option<std::path::PathBuf>, String> {
     match args {
-        [operation] if operation == "amplifier-packages" => prepare_amplifier_package_target(),
+        [operation] if operation == "amplifier-packages" => prepare_amplifier_package_target().map(|()| None),
         [operation] if operation == "claude-mcp" => {
             use std::os::unix::fs::OpenOptionsExt;
             let destination = provider_home.join(".claude/freshell-mcp.json");
@@ -523,9 +581,11 @@ pub(crate) fn run_provider_features_worker(args: &[String]) -> Result<(), String
                 .open(destination)
                 .and_then(|mut file| std::io::Write::write_all(&mut file, &bytes))
                 .map_err(|error| error.to_string())
+                .map(|()| None)
         }
         [operation] if operation == "opencode-rebind-source" => {
             freshell_platform::opencode_plugin::ensure_rebind_plugin_source(provider_home)
+                .map(|_| None)
                 .map_err(|_| "managed OpenCode rebind plugin installation failed".into())
         }
         [operation] | [operation, _] if operation == "opencode-rebind" => {
@@ -541,7 +601,7 @@ pub(crate) fn run_provider_features_worker(args: &[String]) -> Result<(), String
                 provider_home,
                 selected,
             )
-            .map(|_| ())
+            .map(Some)
             .map_err(|error| error.to_string())
         }
         _ => Err("unknown provider feature preparation".into()),
@@ -856,5 +916,132 @@ mod provider_secret_context_tests {
                 "native-one"
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn managed_terminal_uses_worker_returned_opencode_tui_selector_path() {
+        let workspace = tempfile::tempdir().unwrap();
+        let source = "/home/freshell/provider/.config/opencode/user-tui.jsonc";
+        let generated = "/home/freshell/provider/.freshell/opencode/tui-abc123.json";
+        let mut terminal: freshell_runtime_protocol::TerminalLaunchSpec =
+            serde_json::from_value(serde_json::json!({
+                "terminalId":"terminal-selected-tui", "streamId":"stream-selected-tui",
+                "mode":"opencode", "program":"opencode", "args":[],
+                "env":{"OPENCODE_TUI_CONFIG":source}, "cwd":workspace.path(),
+                "runAsUid":65534,"runAsGid":0,"cols":80,"rows":24,
+                "projectKey":"selected-tui", "workspacePath":workspace.path()
+            }))
+            .unwrap();
+        terminal
+            .env
+            .insert("OPENCODE_TUI_CONFIG".into(), source.into());
+
+        let prepared = prepare_terminal_with_provider_feature_runner(
+            terminal,
+            &std::collections::BTreeMap::new(),
+            |uid, gid, args| {
+                assert_eq!((uid, gid), (65534, 0));
+                assert_eq!(args, ["opencode-rebind", source]);
+                Ok(Some(generated.into()))
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            prepared.terminal.env.get("OPENCODE_TUI_CONFIG"),
+            Some(&generated.to_string())
+        );
+    }
+
+    #[test]
+    fn managed_fresh_opencode_uses_worker_returned_tui_selector_path() {
+        let workspace = tempfile::tempdir().unwrap();
+        let source = "/home/freshell/provider/.config/opencode/user-tui.jsonc";
+        let generated = "/home/freshell/provider/.freshell/opencode/tui-def456.json";
+        let launch: freshell_runtime_protocol::FreshAgentLaunchSpec =
+            serde_json::from_value(serde_json::json!({
+                "sessionId":"fresh-selected-tui", "provider":"opencode",
+                "sessionType":"freshopencode", "runtimeVariant":"default",
+                "providerStoreId":"fresh-selected-tui-store", "cwd":workspace.path(),
+                "workspacePath":workspace.path(), "runAsUid":65534,"runAsGid":0
+            }))
+            .unwrap();
+        let mut child_env = std::collections::BTreeMap::from([(
+            "OPENCODE_TUI_CONFIG".to_string(),
+            source.to_string(),
+        )]);
+
+        prepare_fresh_agent_child_environment_with_provider_feature_runner(
+            &launch,
+            &mut child_env,
+            |uid, gid, args| {
+                assert_eq!((uid, gid), (65534, 0));
+                assert_eq!(args, ["opencode-rebind", source]);
+                Ok(Some(generated.into()))
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            child_env.get("OPENCODE_TUI_CONFIG").map(String::as_str),
+            Some(generated)
+        );
+    }
+
+    #[test]
+    fn opencode_feature_worker_returns_the_materialized_selected_selector() {
+        let provider_home = tempfile::tempdir().unwrap();
+        let source = provider_home.path().join("user-tui.jsonc");
+        std::fs::write(&source, r#"{"theme":"dark","plugin":["file:///user.ts"]}"#).unwrap();
+        let args = vec!["opencode-rebind".to_string(), source.display().to_string()];
+
+        let generated = run_provider_features_worker_at(&args, provider_home.path())
+            .unwrap()
+            .unwrap();
+        assert!(generated.starts_with(provider_home.path().join(".freshell/opencode")));
+        let config: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&generated).unwrap()).unwrap();
+        assert_eq!(config["theme"], "dark");
+        assert_eq!(config["plugin"][0], "file:///user.ts");
+        assert_eq!(config["plugin"].as_array().unwrap().len(), 2);
+
+        let stdout = format!("{}\n", generated.display());
+        assert_eq!(
+            parse_provider_feature_worker_output("opencode-rebind", stdout.as_bytes()).unwrap(),
+            Some(generated.display().to_string())
+        );
+        assert_eq!(
+            parse_provider_feature_worker_output("claude-mcp", b"").unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn opencode_feature_worker_returns_default_selector_path_without_selection() {
+        let provider_home = tempfile::tempdir().unwrap();
+        let args = vec!["opencode-rebind".to_string()];
+
+        let generated = run_provider_features_worker_at(&args, provider_home.path())
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(
+            generated,
+            freshell_platform::opencode_plugin::tui_config_path(provider_home.path())
+        );
+        assert_eq!(
+            std::fs::read_to_string(generated).unwrap(),
+            freshell_platform::opencode_plugin::tui_config_content(
+                &freshell_platform::opencode_plugin::rebind_plugin_path(provider_home.path())
+            )
+        );
+    }
+
+    #[test]
+    fn opencode_feature_worker_output_rejects_missing_or_ambiguous_selector_paths() {
+        for stdout in [b"".as_slice(), b"relative/path\n", b"/one\n/two\n"] {
+            assert!(parse_provider_feature_worker_output("opencode-rebind", stdout).is_err());
+        }
     }
 }

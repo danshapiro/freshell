@@ -446,7 +446,12 @@ async fn run() -> Result<(), String> {
         Some("opencode-current-evidence-worker") => {
             run_opencode_current_evidence_worker(&args[2..])
         }
-        Some("prepare-provider-features") => providers::run_provider_features_worker(&args[2..]),
+        Some("prepare-provider-features") => {
+            if let Some(selector) = providers::run_provider_features_worker(&args[2..])? {
+                println!("{}", selector.display());
+            }
+            Ok(())
+        }
         Some("prepare-amplifier-state") => providers::run_amplifier_state_worker(&args[2..]),
         _ => Err("usage: freshell-session-host <serve|worker|fixture-child|fresh-agent-fixture-worker|opencode-identity-worker|provider-probe-worker|refresh-provider-config|opencode-import-worker|opencode-reader-probe|opencode-current-evidence-worker> ...".into()),
     }
@@ -12124,6 +12129,10 @@ mod tests {
         let environment = std::collections::BTreeMap::from([
             ("HOME".into(), "/home/freshell/provider".into()),
             ("PATH".into(), "/usr/bin:/bin".into()),
+            // This test covers exact-resume grant and provider-home reuse. The
+            // separate provider tests exercise rebind preparation; the test
+            // harness binary cannot act as the session-host feature worker.
+            ("FRESHELL_OPENCODE_REBIND".into(), "0".into()),
             (
                 "TEST_CONFIG_PATH".into(),
                 provider_home
