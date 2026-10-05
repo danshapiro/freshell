@@ -6,6 +6,7 @@
 //! body-free receipt.
 
 use std::{
+    cmp::Ordering,
     collections::{BTreeMap, BTreeSet},
     fs::{self, File},
     io::{self, Read},
@@ -2724,9 +2725,11 @@ fn row_has_supporting_transition(
                         id.as_deref().unwrap_or_default(),
                     )?
                     && part_creation_event_matches(row, events)?
-                    && value_number(row, "time_created")
-                        .zip(value_number(row, "time_updated"))
-                        .is_some_and(|(created, updated)| updated >= created)
+                    && sql_number(row, "time_created")
+                        .zip(sql_number(row, "time_updated"))
+                        .is_some_and(|(created, updated)| {
+                            compare_sql_numbers(updated, created) != Ordering::Less
+                        })
             }
             "session" => match event_type {
                 "session.created" | "session.updated" => {
@@ -2929,23 +2932,104 @@ fn value_integer(row: &SerializedRow, key: &str) -> Option<i64> {
     }
 }
 
-fn value_number(row: &SerializedRow, key: &str) -> Option<f64> {
+#[derive(Clone, Copy)]
+enum SqlNumber {
+    Integer(i64),
+    Real(f64),
+}
+
+fn sql_number(row: &SerializedRow, key: &str) -> Option<SqlNumber> {
     match row.values.get(key) {
-        Some(SerializedSqlValue::Integer { value }) => Some(*value as f64),
+        Some(SerializedSqlValue::Integer { value }) => Some(SqlNumber::Integer(*value)),
         Some(SerializedSqlValue::Real { bits }) => {
             let bits = u64::from_str_radix(bits, 16).ok()?;
             let value = f64::from_bits(bits);
-            value.is_finite().then_some(value)
+            value.is_finite().then_some(SqlNumber::Real(value))
         }
         _ => None,
     }
 }
 
 fn sql_number_matches_json(row: &SerializedRow, key: &str, value: &serde_json::Value) -> bool {
-    let Some(expected) = value.as_f64().filter(|value| value.is_finite()) else {
+    let (Some(actual), Some(expected)) = (sql_number(row, key), value.as_number()) else {
         return false;
     };
-    value_number(row, key) == Some(expected)
+    match actual {
+        SqlNumber::Integer(actual) => json_number_matches_integer(expected, actual),
+        SqlNumber::Real(actual) => json_number_as_exact_f64(expected) == Some(actual),
+    }
+}
+
+fn json_number_matches_integer(number: &serde_json::Number, integer: i64) -> bool {
+    if let Some(expected) = number.as_i64() {
+        return integer == expected;
+    }
+    if let Some(expected) = number.as_u64() {
+        return integer >= 0 && integer as u64 == expected;
+    }
+    number.as_f64().and_then(exact_f64_as_i64) == Some(integer)
+}
+
+fn json_number_as_exact_f64(number: &serde_json::Number) -> Option<f64> {
+    if let Some(integer) = number.as_i64() {
+        let value = integer as f64;
+        return (exact_f64_as_i64(value) == Some(integer)).then_some(value);
+    }
+    if let Some(integer) = number.as_u64() {
+        let value = integer as f64;
+        return (exact_f64_as_u64(value) == Some(integer)).then_some(value);
+    }
+    number.as_f64().filter(|value| value.is_finite())
+}
+
+fn exact_f64_as_i64(value: f64) -> Option<i64> {
+    const I64_UPPER_EXCLUSIVE: f64 = 9_223_372_036_854_775_808.0;
+    if !value.is_finite()
+        || value.fract() != 0.0
+        || value < i64::MIN as f64
+        || value >= I64_UPPER_EXCLUSIVE
+    {
+        return None;
+    }
+    let integer = value as i64;
+    (integer as f64 == value).then_some(integer)
+}
+
+fn exact_f64_as_u64(value: f64) -> Option<u64> {
+    const U64_UPPER_EXCLUSIVE: f64 = 18_446_744_073_709_551_616.0;
+    if !value.is_finite() || value.fract() != 0.0 || !(0.0..U64_UPPER_EXCLUSIVE).contains(&value) {
+        return None;
+    }
+    let integer = value as u64;
+    (integer as f64 == value).then_some(integer)
+}
+
+fn compare_sql_numbers(left: SqlNumber, right: SqlNumber) -> Ordering {
+    match (left, right) {
+        (SqlNumber::Integer(left), SqlNumber::Integer(right)) => left.cmp(&right),
+        (SqlNumber::Real(left), SqlNumber::Real(right)) => {
+            left.partial_cmp(&right).unwrap_or(Ordering::Equal)
+        }
+        (SqlNumber::Integer(left), SqlNumber::Real(right)) => compare_i64_to_f64(left, right),
+        (SqlNumber::Real(left), SqlNumber::Integer(right)) => {
+            compare_i64_to_f64(right, left).reverse()
+        }
+    }
+}
+
+fn compare_i64_to_f64(integer: i64, real: f64) -> Ordering {
+    const I64_UPPER_EXCLUSIVE: f64 = 9_223_372_036_854_775_808.0;
+    if real < i64::MIN as f64 {
+        return Ordering::Greater;
+    }
+    if real >= I64_UPPER_EXCLUSIVE {
+        return Ordering::Less;
+    }
+    match integer.cmp(&(real.trunc() as i64)) {
+        Ordering::Equal if real.fract() > 0.0 => Ordering::Less,
+        Ordering::Equal if real.fract() < 0.0 => Ordering::Greater,
+        ordering => ordering,
+    }
 }
 
 fn value_text(row: &SerializedRow, key: &str) -> Result<Option<String>, OpenCodeImportError> {
@@ -3018,7 +3102,7 @@ fn part_creation_event_matches(
     let Some(session_id) = value_text(row, "session_id")? else {
         return Ok(false);
     };
-    let mut first: Option<(i64, f64)> = None;
+    let mut first: Option<(i64, serde_json::Value)> = None;
     for event in events {
         let event_type = value_text(event, "type")?.unwrap_or_default();
         if pinned_event_kind(&event_type) != Some("message.part.updated") {
@@ -3037,8 +3121,8 @@ fn part_creation_event_matches(
         let seq = value_integer_required(event, "seq")?;
         let time = data
             .get("time")
-            .and_then(serde_json::Value::as_f64)
-            .filter(|value| value.is_finite())
+            .filter(|value| value.as_f64().is_some_and(f64::is_finite))
+            .cloned()
             .ok_or_else(|| {
                 OpenCodeImportError::Blocked("durable part update has no finite timestamp".into())
             })?;
@@ -3046,7 +3130,7 @@ fn part_creation_event_matches(
             first = Some((seq, time));
         }
     }
-    Ok(first.is_some_and(|(_, time)| value_number(row, "time_created") == Some(time)))
+    Ok(first.is_some_and(|(_, time)| sql_number_matches_json(row, "time_created", &time)))
 }
 
 fn session_row_matches_info(row: &SerializedRow, info: &serde_json::Value) -> bool {
@@ -4064,7 +4148,7 @@ fn derive_root_tail(
             })
             .map(|row| {
                 Ok((
-                    value_number(row, "time_created").ok_or_else(|| {
+                    sql_number(row, "time_created").ok_or_else(|| {
                         OpenCodeImportError::Blocked(
                             "root message has no finite creation timestamp".into(),
                         )
@@ -4076,9 +4160,7 @@ fn derive_root_tail(
             })
             .collect::<Result<Vec<_>, OpenCodeImportError>>()?;
         rows.sort_by(|left, right| {
-            left.0
-                .total_cmp(&right.0)
-                .then_with(|| left.1.cmp(&right.1))
+            compare_sql_numbers(left.0, right.0).then_with(|| left.1.cmp(&right.1))
         });
         rows.into_iter().map(|(_, id)| id).collect::<Vec<_>>()
     };
