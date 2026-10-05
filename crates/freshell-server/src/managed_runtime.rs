@@ -341,6 +341,7 @@ impl ManagedTerminalController for ServerManagedRuntimeController {
                     provider_launch_context,
                     opencode_transfer,
                     opencode_transfer_attempt_id,
+                    opencode_adoption: None,
                 }),
                 view_intent: Some(ViewIntentRequest {
                     owner_id: String::new(),
