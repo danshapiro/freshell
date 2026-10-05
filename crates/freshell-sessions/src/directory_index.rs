@@ -714,7 +714,7 @@ fn parse_codex_file_with_evidence(
 }
 
 fn parse_codex_content(content: &str, path: &Path) -> Option<IndexedSession> {
-    let meta = parse_codex_session_content(&content);
+    let meta = parse_codex_session_content(content);
     meta.cwd.as_ref()?;
     let fallback = extract_codex_session_id_from_filename(path);
     let session_id = meta.session_id.clone().unwrap_or(fallback);

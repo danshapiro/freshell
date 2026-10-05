@@ -441,7 +441,7 @@ fn can_compose_group(session_id: &str, members: &[CodexSegmentEntry]) -> bool {
                 .as_ref()
                 .and_then(Value::as_str)
                 != Some(session_id)
-            || evidence.lineage_markers.len() > 0
+            || !evidence.lineage_markers.is_empty()
             || item.provider != "codex"
             || item.session_id != session_id
             || item.is_subagent

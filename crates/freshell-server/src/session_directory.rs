@@ -3896,6 +3896,24 @@ mod tests {
         (older, newer)
     }
 
+    fn shift_codex_fixture_timestamps(content: &str, offset_seconds: i64) -> String {
+        let records = content
+            .lines()
+            .map(|line| {
+                let mut record: Value = serde_json::from_str(line).unwrap();
+                let timestamp =
+                    chrono::DateTime::parse_from_rfc3339(record["timestamp"].as_str().unwrap())
+                        .unwrap()
+                        + chrono::Duration::seconds(offset_seconds);
+                record["timestamp"] =
+                    json!(timestamp.to_rfc3339_opts(chrono::SecondsFormat::Micros, true,));
+                serde_json::to_string(&record).unwrap()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        format!("{records}\n")
+    }
+
     fn write_codex_segments(home: &Path, older: &str, newer: &str) -> (PathBuf, PathBuf) {
         let sessions = home.join(".codex").join("sessions");
         std::fs::create_dir_all(&sessions).unwrap();
@@ -3996,6 +4014,86 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn codex_multi_file_route_keeps_match_and_reports_io_error() {
+        let home = unique_temp_dir();
+        let (older, newer) = codex_fixtures();
+        let (older_path, _newer_path) = write_codex_segments(&home, &older, &newer);
+        let (app, _index) = codex_session_directory_app(
+            &home,
+            None,
+            freshell_ws::identity::TerminalIdentityRegistry::new(),
+        );
+        let base = "/api/session-directory?priority=visible&includeNonInteractive=1";
+        let warm = get_directory_page(&app, base).await;
+        assert_eq!(warm["items"].as_array().unwrap().len(), 1);
+
+        std::fs::remove_file(older_path).unwrap();
+        let page = get_directory_page(
+            &app,
+            &format!("{base}&query=Continuation%20title&tier=userMessages&limit=1"),
+        )
+        .await;
+
+        let rows = page["items"].as_array().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0]["sessionId"],
+            json!("b7936c10-4935-441c-837c-c1f33cafec2d")
+        );
+        assert_eq!(rows[0]["matchedIn"], json!("userMessage"));
+        assert_eq!(page["partial"], json!(true));
+        assert_eq!(page["partialReason"], json!("io_error"));
+
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn codex_multi_file_route_reports_budget_when_match_falls_after_scan_limit() {
+        let home = unique_temp_dir();
+        let (older, _) = codex_fixtures();
+        let sessions = home.join(".codex").join("sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        for index in 0..11 {
+            let user_message = if index == 10 {
+                "rrx7-budget-target".to_string()
+            } else {
+                format!("rrx7-unmatched-segment-{index}")
+            };
+            let content = older.replace("Older first request", &user_message);
+            let content = shift_codex_fixture_timestamps(&content, index * 60);
+            std::fs::write(sessions.join(format!("rollout-{index:02}.jsonl")), content).unwrap();
+        }
+        let (app, _index) = codex_session_directory_app(
+            &home,
+            None,
+            freshell_ws::identity::TerminalIdentityRegistry::new(),
+        );
+        let base = "/api/session-directory?priority=visible&includeNonInteractive=1";
+        let warm = get_directory_page(&app, base).await;
+        assert_eq!(warm["items"].as_array().unwrap().len(), 1);
+
+        let target_match = get_directory_page(
+            &app,
+            &format!("{base}&query=rrx7-budget-target&tier=userMessages&limit=2"),
+        )
+        .await;
+        assert_eq!(target_match["items"].as_array().unwrap().len(), 1);
+        assert_eq!(target_match["items"][0]["matchedIn"], json!("userMessage"));
+        assert!(target_match.get("partialReason").is_none());
+
+        let budget_limited = get_directory_page(
+            &app,
+            &format!("{base}&query=rrx7-budget-target&tier=userMessages&limit=1"),
+        )
+        .await;
+        assert!(budget_limited["items"].as_array().unwrap().is_empty());
+        assert_eq!(budget_limited["partial"], json!(true));
+        assert_eq!(budget_limited["partialReason"], json!("budget"));
+
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn composed_codex_collision_keeps_a_same_id_filename_fallback_path() {
         let home = unique_temp_dir();
         let (older, newer) = codex_fixtures();
@@ -4037,7 +4135,7 @@ mod tests {
         let samples: Vec<Value> =
             serde_json::from_str(&decoded_trace_field(&captured[0], "collision_samples_json"))
                 .unwrap();
-        let mut expected_paths = vec![older_path, newer_path, fallback_path];
+        let mut expected_paths = [older_path, newer_path, fallback_path];
         expected_paths.sort();
         assert_eq!(samples[0]["source_file_count"], json!(3));
         assert_eq!(
