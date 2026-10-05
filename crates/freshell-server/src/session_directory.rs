@@ -568,42 +568,38 @@ async fn session_directory(
     // the query (visibility filters, search, cursor paging) still compose
     // freshly PER REQUEST, same as before -- only the expensive filesystem
     // scan itself is now cached.
-    let (items, scan_failures, unresolved_codex_identities): (
-        Vec<DirItem>,
-        Vec<String>,
-        Arc<Vec<CodexUnresolvedIdentity>>,
-    ) = match &state.session_index {
-        Some(index) => {
-            let snapshot = index
-                .snapshot_with_failures_and_unresolved_codex_identities()
-                .await;
-            let items = snapshot
-                .sessions
-                .iter()
-                .map(|indexed| {
-                    let source_files = if indexed.provider == "codex" {
-                        snapshot
-                            .codex_segment_paths
-                            .get(&indexed.session_id)
-                            .filter(|paths| {
-                                !paths.is_empty() && paths.last() == indexed.source_file.as_ref()
-                            })
-                            .cloned()
-                            .unwrap_or_else(|| indexed.source_file.clone().into_iter().collect())
-                    } else {
-                        indexed.source_file.clone().into_iter().collect()
-                    };
-                    dir_item_from_indexed_with_source_files(indexed, source_files)
-                })
-                .collect();
-            (
-                items,
-                snapshot.scan_failures,
-                snapshot.unresolved_codex_identities,
-            )
-        }
-        None => (Vec::new(), Vec::new(), Arc::new(Vec::new())),
-    };
+    let (items, unresolved_codex_identities): (Vec<DirItem>, Arc<Vec<CodexUnresolvedIdentity>>) =
+        match &state.session_index {
+            Some(index) => {
+                let snapshot = index
+                    .snapshot_with_failures_and_unresolved_codex_identities()
+                    .await;
+                let items = snapshot
+                    .sessions
+                    .iter()
+                    .map(|indexed| {
+                        let source_files = if indexed.provider == "codex" {
+                            snapshot
+                                .codex_segment_paths
+                                .get(&indexed.session_id)
+                                .filter(|paths| {
+                                    !paths.is_empty()
+                                        && paths.last() == indexed.source_file.as_ref()
+                                })
+                                .cloned()
+                                .unwrap_or_else(|| {
+                                    indexed.source_file.clone().into_iter().collect()
+                                })
+                        } else {
+                            indexed.source_file.clone().into_iter().collect()
+                        };
+                        dir_item_from_indexed_with_source_files(indexed, source_files)
+                    })
+                    .collect();
+                (items, snapshot.unresolved_codex_identities)
+            }
+            None => (Vec::new(), Arc::new(Vec::new())),
+        };
     // STATUS-STRIP: assign the monotonic snapshot sequence AFTER the index
     // snapshot is captured — captured order is authoritative, and a seq
     // assigned pre-await would interleave with concurrent requests.
@@ -638,9 +634,10 @@ async fn session_directory(
         )
         .await
     };
+    let session_overrides = state.settings.session_overrides();
     let items = apply_session_overrides(
         items,
-        &state.settings.session_overrides(),
+        &session_overrides,
         state.legacy_name_migration_completed,
         &kilroy_only_lanes,
     );
@@ -667,6 +664,7 @@ async fn session_directory(
     let collisions = merge_unresolved_codex_identity_collisions(
         persisted_identity_collisions(&items),
         &unresolved_codex_identities,
+        &session_overrides,
     );
     let identity_collision = if !collisions.is_empty() {
         let log_summary = persisted_identity_collision_log_summary(&collisions);
@@ -732,12 +730,6 @@ async fn session_directory(
             page["snapshotSeq"] = json!(snapshot_seq);
             page["serverInstance"] = json!(state.server_instance.as_str());
             page["bootId"] = json!(directory_boot_id());
-            if !scan_failures.is_empty() {
-                page["partial"] = json!(true);
-                if page.get("partialReason").is_none() {
-                    page["partialReason"] = json!("io_error");
-                }
-            }
             if let Some((_, collision_count, duplicate_item_count)) = identity_collision {
                 // Keep an I/O/budget partial reason if the same request also
                 // encountered one. Collision identity travels only in the
@@ -883,6 +875,7 @@ fn persisted_identity_collisions(items: &[DirItem]) -> Vec<PersistedIdentityColl
 fn merge_unresolved_codex_identity_collisions(
     collisions: Vec<PersistedIdentityCollision>,
     unresolved: &[CodexUnresolvedIdentity],
+    overrides: &Map<String, Value>,
 ) -> Vec<PersistedIdentityCollision> {
     let mut by_key: std::collections::BTreeMap<
         String,
@@ -894,7 +887,9 @@ fn merge_unresolved_codex_identity_collisions(
         *count = (*count).max(collision.duplicate_item_count);
     }
     for group in unresolved {
-        if group.paths.len() < 2 {
+        if group.paths.len() < 2
+            || codex_identity_is_canonically_soft_deleted(&group.session_id, overrides)
+        {
             continue;
         }
         let key = format!("codex:{}", group.session_id);
@@ -917,6 +912,18 @@ fn merge_unresolved_codex_identity_collisions(
             },
         )
         .collect()
+}
+
+fn codex_identity_is_canonically_soft_deleted(
+    session_id: &str,
+    overrides: &Map<String, Value>,
+) -> bool {
+    overrides
+        .get(&format!("codex:{session_id}"))
+        .and_then(Value::as_object)
+        .and_then(|override_row| override_row.get("deleted"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
 }
 
 fn persisted_identity_collision_signature(
@@ -4564,6 +4571,124 @@ mod tests {
 
         std::fs::remove_dir_all(&home).ok();
         std::fs::remove_dir_all(&cache_dir).ok();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn soft_deleted_codex_identity_suppresses_unresolved_collision_until_restored() {
+        let home = unique_temp_dir();
+        let (older, newer) = codex_fixtures();
+        let cwdless = newer.replace("\"cwd\":\"/sanitized/project\",", "");
+        let (_older_path, _hidden_path) = write_codex_segments(&home, &older, &cwdless);
+        let session_id = "b7936c10-4935-441c-837c-c1f33cafec2d";
+        let events = collision_trace_events();
+        let settings =
+            crate::settings_store::SettingsStore::load(Some(&home), vec!["codex".into()]);
+        settings
+            .patch_session_override(
+                &format!("codex:{session_id}"),
+                &[("deleted", Some(json!(true)))],
+            )
+            .await;
+        let index = Arc::new(SessionIndex::with_ttl_and_cache_path(
+            vec![Arc::new(CodexSource::new(home.join(".codex")))],
+            Duration::from_secs(3600),
+            None,
+        ));
+        let app = router(SessionDirectoryState {
+            auth_token: Arc::new("tok".to_string()),
+            settings: settings.clone(),
+            session_index: Some(Arc::clone(&index)),
+            identity: freshell_ws::identity::TerminalIdentityRegistry::new(),
+            metadata: crate::session_metadata::SessionMetadataStore::new(home.join(".freshell")),
+            server_instance: Arc::new("srv-soft-delete-test".to_string()),
+            collision_signatures: Default::default(),
+            legacy_name_migration_completed: false,
+        });
+        let uri = "/api/session-directory?priority=visible&includeNonInteractive=1";
+
+        let deleted = get_directory_page(&app, uri).await;
+        assert!(deleted["items"].as_array().unwrap().is_empty());
+        assert!(deleted.get("integrityError").is_none());
+        assert!(collision_events_for_home(&events, &home).is_empty());
+        let snapshot = index
+            .snapshot_with_failures_and_unresolved_codex_identities()
+            .await;
+        assert_eq!(snapshot.unresolved_codex_identities.len(), 1);
+        assert_eq!(
+            snapshot.unresolved_codex_identities[0].session_id,
+            session_id
+        );
+
+        settings
+            .patch_session_override(&format!("codex:{session_id}"), &[("deleted", None)])
+            .await;
+        let restored = get_directory_page(&app, uri).await;
+        assert!(restored["items"].as_array().unwrap().is_empty());
+        assert_eq!(
+            restored["integrityError"],
+            json!({
+                "kind": "identity_collision",
+                "collisionCount": 1,
+                "duplicateItemCount": 2,
+            })
+        );
+        let restored_events = collision_events_for_home(&events, &home);
+        assert_eq!(restored_events.len(), 1);
+        assert_eq!(restored_events[0].level, tracing::Level::ERROR);
+
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn query_free_directory_page_ignores_provider_scan_failure_overlay() {
+        let home = unique_temp_dir();
+        let (older, newer) = codex_fixtures();
+        write_codex_segments(&home, &older, &newer);
+        let opencode_home = home.join("opencode-data");
+        std::fs::create_dir_all(&opencode_home).unwrap();
+        std::fs::write(opencode_home.join("opencode.db"), b"not a sqlite database").unwrap();
+
+        let settings = crate::settings_store::SettingsStore::load(
+            Some(&home),
+            vec!["codex".into(), "opencode".into()],
+        );
+        let index = Arc::new(test_session_index(vec![
+            Arc::new(CodexSource::new(home.join(".codex"))) as Arc<dyn SessionSource>,
+            Arc::new(OpencodeSource::new(opencode_home)) as Arc<dyn SessionSource>,
+        ]));
+        let app = router(SessionDirectoryState {
+            auth_token: Arc::new("tok".to_string()),
+            settings,
+            session_index: Some(Arc::clone(&index)),
+            identity: freshell_ws::identity::TerminalIdentityRegistry::new(),
+            metadata: crate::session_metadata::SessionMetadataStore::new(home.join(".freshell")),
+            server_instance: Arc::new("srv-scan-failure-test".to_string()),
+            collision_signatures: Default::default(),
+            legacy_name_migration_completed: false,
+        });
+
+        let page = get_directory_page(
+            &app,
+            "/api/session-directory?priority=visible&includeNonInteractive=1",
+        )
+        .await;
+        let snapshot = index
+            .snapshot_with_failures_and_unresolved_codex_identities()
+            .await;
+        assert!(snapshot
+            .scan_failures
+            .iter()
+            .any(|provider| provider == "opencode"));
+        assert!(page.get("partial").is_none());
+        assert!(page.get("partialReason").is_none());
+        let rows = page["items"].as_array().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0]["sessionId"],
+            json!("b7936c10-4935-441c-837c-c1f33cafec2d")
+        );
+
+        std::fs::remove_dir_all(&home).ok();
     }
 
     #[tokio::test(flavor = "current_thread")]

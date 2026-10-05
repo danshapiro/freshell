@@ -89,8 +89,9 @@ snapshots. Include the observed within-file timestamp ties and a strict gap
 between the complete persisted-record write intervals. Build a `SessionIndex`
 over those files and assert one row, the stable canonical ID, earliest
 `created_at`, latest `last_activity_at`, earliest nonempty
-`first_user_message`, latest nonempty title/summary and token snapshot, and
-both source paths ordered by persisted-record time. Assert `CodexSource::scan()`
+`first_user_message`, title and summary from their earliest segments with
+substantive data, latest token snapshot, and both source paths ordered by
+persisted-record time. Assert `CodexSource::scan()`
 uses the same composition policy.
 
 Add `codex_source_keeps_ambiguous_same_id_files_separate` for byte-identical
@@ -179,8 +180,9 @@ order never establish chronology.
 
 For an accepted group set `created_at` to the earliest segment, activity to
 the latest segment, `first_user_message` to the earliest nonempty segment,
-title/summary to the latest segment with substantive data, and token usage
-to the newest snapshot without summing cumulative counters.
+title and summary from their respective earliest segments with substantive
+data, and token usage from the newest snapshot without summing cumulative
+counters.
 Preserve existing single-file results. Bump `CACHE_SCHEMA_VERSION` so cached
 rows lacking evidence cannot remain unmerged indefinitely. Compose after each
 full or scoped cache reconciliation and sort the final rows once as before.
@@ -408,8 +410,11 @@ existing integrity alert is visible and dismissible in Sidebar and History,
 and the healthy row remains visible. Do not use an expected-failure marker
 or a `CLOUD_SKIP_SPECS` exemption. The resume action boundary is covered by
 the focused Sidebar test in Task 2; do not launch Codex in the browser suite.
-Seed both cases through `createE2eServerHandle`'s isolated home before the
-server starts; do not mock the session-directory route.
+The existing `createE2eServerHandle` fixture still owns the original matrix
+cases. For the new RRX7 cases, use `bootCodexBrowserPage` to start an owned
+`RustServer`; its pre-start `setupHome` callback must seed that server's
+isolated home before provider discovery begins. Do not mock the
+session-directory route.
 
 - [x] **Step 2: Run the test and verify the intended failure**
 
