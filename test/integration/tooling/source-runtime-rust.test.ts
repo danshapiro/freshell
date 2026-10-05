@@ -1,6 +1,7 @@
 // @vitest-environment node
 
 import { spawn, type ChildProcess } from 'node:child_process'
+import { once } from 'node:events'
 import { mkdtemp, rm, writeFile } from 'node:fs/promises'
 import net from 'node:net'
 import os from 'node:os'
@@ -69,14 +70,22 @@ async function waitForRustChild(parentPid: number, timeoutMs = 10_000): Promise<
 }
 
 async function waitForExit(processToWait: ChildProcess, timeoutMs = 10_000): Promise<void> {
-  if (processToWait.exitCode !== null) return
+  if (hasExited(processToWait)) return
   await new Promise<void>((resolve, reject) => {
-    const timer = setTimeout(() => reject(new Error('owned child did not exit')), timeoutMs)
-    processToWait.once('exit', () => {
+    const onExit = () => {
       clearTimeout(timer)
       resolve()
-    })
+    }
+    const timer = setTimeout(() => {
+      processToWait.off('exit', onExit)
+      reject(new Error(`owned child did not exit (pid ${processToWait.pid ?? 'unknown'})`))
+    }, timeoutMs)
+    processToWait.once('exit', onExit)
   })
+}
+
+function hasExited(processToCheck: ChildProcess): boolean {
+  return processToCheck.exitCode !== null || processToCheck.signalCode !== null
 }
 
 afterEach(async () => {
@@ -87,7 +96,7 @@ afterEach(async () => {
       // The exact owned child may already have exited.
     }
   }
-  if (child && child.exitCode === null) {
+  if (child && !hasExited(child)) {
     child.kill('SIGTERM')
     await waitForExit(child).catch(() => undefined)
   }
@@ -98,6 +107,16 @@ afterEach(async () => {
 })
 
 describe('source runtime', () => {
+  it('recognizes an owned child that exited by signal before the wait began', async () => {
+    const signaledChild = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: 'ignore' })
+    await once(signaledChild, 'spawn')
+    signaledChild.kill('SIGTERM')
+    await once(signaledChild, 'exit')
+    expect(signaledChild.signalCode).toBe('SIGTERM')
+
+    await waitForExit(signaledChild, 100)
+  })
+
   it.each([
     'AUTH_TOKEN=\n',
     'AUTH_TOKEN=""\n',
@@ -130,8 +149,9 @@ describe('source runtime', () => {
       })
       expect(response.ok).toBe(true)
 
-      child.kill('SIGTERM')
+      expect(child.kill('SIGTERM')).toBe(true)
       await waitForExit(child)
+      expect(child.exitCode).toBe(0)
       child = undefined
       ownedRustPid = undefined
     }
