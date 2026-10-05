@@ -111,7 +111,8 @@ else
 fi
 
 DOCKER_ARGS=(
-  run --rm
+  # Reap orphaned test children so zombies cannot exhaust the PID limit.
+  run --rm --init
   "${NETWORK_ARGS[@]}"
   --pids-limit 512
   --memory 8g

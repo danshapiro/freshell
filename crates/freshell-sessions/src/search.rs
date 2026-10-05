@@ -115,7 +115,27 @@ pub fn search_session_file(
     tier: FileSearchTier,
 ) -> std::io::Result<Option<FileSearchMatch>> {
     let bytes = std::fs::read(path)?;
-    let content = String::from_utf8_lossy(&bytes).into_owned();
+    Ok(search_session_content(&bytes, provider, query, tier))
+}
+
+/// Search only the effective bytes of a selected Codex history segment.
+/// Ancestor tails beyond its recorded boundary are never considered.
+pub fn search_codex_history_segment(
+    segment: &crate::codex_history::CodexHistorySegment,
+    query: &str,
+    tier: FileSearchTier,
+) -> std::io::Result<Option<FileSearchMatch>> {
+    let bytes = segment.read()?;
+    Ok(search_session_content(&bytes, "codex", query, tier))
+}
+
+fn search_session_content(
+    bytes: &[u8],
+    provider: &str,
+    query: &str,
+    tier: FileSearchTier,
+) -> Option<FileSearchMatch> {
+    let content = String::from_utf8_lossy(bytes);
     let needle = query.to_lowercase();
 
     for raw_line in content.split('\n') {
@@ -136,17 +156,17 @@ pub fn search_session_file(
             continue;
         }
         if text.to_lowercase().contains(&needle) {
-            return Ok(Some(FileSearchMatch {
+            return Some(FileSearchMatch {
                 matched_in: if role == "user" {
                     "userMessage"
                 } else {
                     "assistantMessage"
                 },
                 snippet: extract_snippet(&text, query, 50),
-            }));
+            });
         }
     }
-    Ok(None)
+    None
 }
 
 /// Per-provider one-line-of-transcript -> `(role, text)` dispatch. `None`
@@ -445,5 +465,95 @@ mod tests {
         .unwrap()
         .is_some());
         std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn codex_bounded_search_excludes_superseded_messages_in_both_search_tiers() {
+        use crate::codex_history::{CodexHistoryBoundary, CodexHistorySegment};
+        let header = serde_json::json!({
+            "timestamp": "2026-10-03T00:00:00Z", "ordinal": 0, "type": "session_meta",
+            "payload": {"id": "b7936c10-4935-441c-837c-c1f33cafec2d",
+                "session_id": "b7936c10-4935-441c-837c-c1f33cafec2d", "cwd": "/project",
+                "source": "cli", "thread_source": "user", "cli_version": "0.160.0",
+                "originator": "codex-tui", "history_mode": "paginated"}
+        });
+        let message = |ordinal: u64, role: &str, text: &str| {
+            serde_json::json!({
+                "timestamp": format!("2026-10-03T00:00:{:02}Z", ordinal + 1),
+                "ordinal": ordinal, "type": "response_item",
+                "payload": {"type": "message", "role": role,
+                    "content": [{"type": "input_text", "text": text}]}
+            })
+        };
+        let prefix = format!(
+            "{header}\n{}\n{}\n",
+            message(1, "user", "Retained user request"),
+            message(2, "assistant", "Retained assistant answer")
+        );
+        let complete = format!(
+            "{prefix}{}\n{}\n",
+            message(3, "user", "Superseded user request"),
+            message(4, "assistant", "Superseded assistant answer")
+        );
+        let path = write_temp("bounded-codex.jsonl", &complete);
+        let segment = CodexHistorySegment {
+            path: path.clone(),
+            end: Some(CodexHistoryBoundary {
+                end_byte_offset: prefix.len() as u64,
+                end_ordinal_exclusive: 3,
+            }),
+        };
+        assert!(search_codex_history_segment(
+            &segment,
+            "Retained user",
+            FileSearchTier::UserMessages
+        )
+        .unwrap()
+        .is_some());
+        assert!(search_codex_history_segment(
+            &segment,
+            "Retained assistant",
+            FileSearchTier::FullText
+        )
+        .unwrap()
+        .is_some());
+        assert!(search_codex_history_segment(
+            &segment,
+            "Retained assistant",
+            FileSearchTier::UserMessages
+        )
+        .unwrap()
+        .is_none());
+        assert!(
+            search_codex_history_segment(&segment, "Superseded", FileSearchTier::UserMessages)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            search_codex_history_segment(&segment, "Superseded", FileSearchTier::FullText)
+                .unwrap()
+                .is_none()
+        );
+        // The absence is caused by the effective bound, not a fixture extraction failure.
+        assert!(
+            search_session_file(&path, "codex", "Superseded", FileSearchTier::FullText)
+                .unwrap()
+                .is_some()
+        );
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn codex_bounded_search_reports_missing_dependency_as_io_error() {
+        use crate::codex_history::CodexHistorySegment;
+        let path = write_temp("missing-codex.jsonl", "");
+        std::fs::remove_file(&path).unwrap();
+        let segment = CodexHistorySegment { path, end: None };
+        assert_eq!(
+            search_codex_history_segment(&segment, "missing", FileSearchTier::FullText)
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::NotFound
+        );
     }
 }

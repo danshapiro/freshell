@@ -41,6 +41,7 @@ use std::time::{Duration, Instant};
 
 use tokio::sync::Mutex as AsyncMutex;
 
+use crate::codex_history::{CodexHistoryResolver, CodexHistorySegment};
 use crate::codex_segments::{
     compose_codex_segments, scan_codex_file_bytes_evidence, CodexComposition, CodexFileEvidence,
     CodexSegmentEntry, CodexUnresolvedIdentity,
@@ -162,6 +163,10 @@ pub struct SessionIndexSnapshot {
     /// Chronological source paths for accepted multi-file Codex rows, keyed
     /// by their canonical embedded session id.
     pub codex_segment_paths: Arc<HashMap<String, Vec<PathBuf>>>,
+    /// Effective bounded source segments, from this same published generation.
+    pub codex_history_segments: Arc<HashMap<String, Vec<CodexHistorySegment>>>,
+    /// Process-local content revisions for change notification.
+    pub codex_history_revisions: Arc<HashMap<String, u64>>,
 }
 
 /// One discovered file: its absolute path plus the stat facts (`mtime`/`size`)
@@ -232,6 +237,12 @@ pub trait SessionSource: Send + Sync {
         path: &Path,
     ) -> (Option<IndexedSession>, Option<CodexFileEvidence>) {
         (self.parse(path), None)
+    }
+
+    /// Compose parsed Codex files using this provider's selected history.
+    /// Test sources and other providers retain the conservative file composer.
+    fn compose_codex_segments(&self, entries: Vec<CodexSegmentEntry>) -> CodexComposition {
+        compose_codex_segments(entries)
     }
 
     /// Batch C: direct-listed sources (opencode's single sqlite db, which
@@ -578,11 +589,15 @@ fn item_from_meta(
 /// `ClaudeSource` joining `projects`.
 pub struct CodexSource {
     codex_home: PathBuf,
+    history: StdMutex<CodexHistoryResolver>,
 }
 
 impl CodexSource {
     pub fn new(codex_home: PathBuf) -> Self {
-        Self { codex_home }
+        Self {
+            history: StdMutex::new(CodexHistoryResolver::new(codex_home.clone())),
+            codex_home,
+        }
     }
 
     /// Convenience: discover + parse every currently-visible file in one
@@ -601,11 +616,15 @@ impl CodexSource {
                 }
             })
             .collect();
-        compose_codex_segments(entries).items
+        self.compose_codex_segments(entries).items
     }
 }
 
 impl SessionSource for CodexSource {
+    fn compose_codex_segments(&self, entries: Vec<CodexSegmentEntry>) -> CodexComposition {
+        self.history.lock().unwrap().compose(entries)
+    }
+
     fn discover(&self) -> Vec<FileStat> {
         discover_codex_sessions(&self.codex_home).unwrap_or_default()
     }
@@ -713,7 +732,7 @@ fn parse_codex_file_with_evidence(
     )
 }
 
-fn parse_codex_content(content: &str, path: &Path) -> Option<IndexedSession> {
+pub(crate) fn parse_codex_content(content: &str, path: &Path) -> Option<IndexedSession> {
     let meta = parse_codex_session_content(content);
     meta.cwd.as_ref()?;
     let fallback = extract_codex_session_id_from_filename(path);
@@ -1185,6 +1204,8 @@ struct CachedSnapshot {
     /// Chronological source paths for accepted multi-file rows, keyed by
     /// canonical embedded id. This remains internal to Rust consumers.
     codex_segment_paths: Arc<HashMap<String, Vec<PathBuf>>>,
+    codex_history_segments: Arc<HashMap<String, Vec<CodexHistorySegment>>>,
+    codex_history_revisions: Arc<HashMap<String, u64>>,
 }
 
 /// Fields copied together from one published generation. The identity list
@@ -1196,6 +1217,8 @@ struct SnapshotRead {
     scan_failures: Vec<String>,
     unresolved_codex_identities: Arc<Vec<CodexUnresolvedIdentity>>,
     codex_segment_paths: Arc<HashMap<String, Vec<PathBuf>>>,
+    codex_history_segments: Arc<HashMap<String, Vec<CodexHistorySegment>>>,
+    codex_history_revisions: Arc<HashMap<String, u64>>,
 }
 
 /// Bookkeeping for the persistent parse-cache's opportunistic-save gating
@@ -1519,6 +1542,8 @@ impl SessionIndex {
             scan_failures: snapshot.scan_failures,
             unresolved_codex_identities: snapshot.unresolved_codex_identities,
             codex_segment_paths: snapshot.codex_segment_paths,
+            codex_history_segments: snapshot.codex_history_segments,
+            codex_history_revisions: snapshot.codex_history_revisions,
         }
     }
 
@@ -1658,6 +1683,8 @@ impl SessionIndex {
                     scan_failures: sorted_names(&c.scan_failures),
                     unresolved_codex_identities: Arc::clone(&c.unresolved_codex_identities),
                     codex_segment_paths: Arc::clone(&c.codex_segment_paths),
+                    codex_history_segments: Arc::clone(&c.codex_history_segments),
+                    codex_history_revisions: Arc::clone(&c.codex_history_revisions),
                 })
             }
             _ => None,
@@ -1966,6 +1993,8 @@ impl SessionIndex {
                     refreshed.amplifier_root_dirs,
                     refreshed.unresolved_codex_identities,
                     refreshed.codex_segment_paths,
+                    refreshed.codex_history_segments,
+                    refreshed.codex_history_revisions,
                 )
             }
         })
@@ -1977,6 +2006,8 @@ impl SessionIndex {
             amplifier_root_dirs,
             unresolved_codex_identities,
             codex_segment_paths,
+            codex_history_segments,
+            codex_history_revisions,
         ) = match sweep_result {
             Ok(result) => result,
             Err(join_err) => {
@@ -2006,19 +2037,33 @@ impl SessionIndex {
         let items = Arc::new(items);
         let unresolved_codex_identities = Arc::new(unresolved_codex_identities);
         let codex_segment_paths = Arc::new(codex_segment_paths);
+        let codex_history_segments = Arc::new(codex_history_segments);
+        let codex_history_revisions = Arc::new(codex_history_revisions);
         let failure_names = sorted_names(&failures);
+        let codex_history_changed;
         {
             // ONE lock write publishes the snapshot AND its scan failures as
             // a single generation — a reader (`cached_pair`) can never
             // observe a failed-scan snapshot paired with a cleared failure
             // set, nor a recovered snapshot paired with stale failures.
             let mut guard = snapshot.lock().unwrap();
+            // SQLite selection or archived dependencies can change effective
+            // history without mutating a parsed-file cache entry. Keep their
+            // notification signal separate from persistence save accounting.
+            codex_history_changed = guard.as_ref().is_some_and(|previous| {
+                previous.codex_history_revisions != codex_history_revisions
+                    || previous.codex_history_segments != codex_history_segments
+                    || previous.codex_segment_paths != codex_segment_paths
+                    || previous.unresolved_codex_identities != unresolved_codex_identities
+            });
             *guard = Some(CachedSnapshot {
                 items: Arc::clone(&items),
                 fetched_at: Instant::now(),
                 scan_failures: failures,
                 unresolved_codex_identities,
                 codex_segment_paths,
+                codex_history_segments,
+                codex_history_revisions,
             });
         } // guard dropped here — never held across an .await.
           // Self-correction report (amplifier watch-reduction design
@@ -2034,7 +2079,7 @@ impl SessionIndex {
         if force_full {
             *last_full_at.lock().unwrap() = Some(Instant::now());
         }
-        if changed > 0 {
+        if changed > 0 || codex_history_changed {
             change_tx.send_modify(|gen| *gen += 1);
         }
         // Opportunistic persistence: gated (threshold/debounce) and, when
@@ -2250,6 +2295,8 @@ struct RefreshedSnapshot {
     amplifier_root_dirs: Option<Vec<PathBuf>>,
     unresolved_codex_identities: Vec<CodexUnresolvedIdentity>,
     codex_segment_paths: HashMap<String, Vec<PathBuf>>,
+    codex_history_segments: HashMap<String, Vec<CodexHistorySegment>>,
+    codex_history_revisions: HashMap<String, u64>,
 }
 
 fn refresh_snapshot(
@@ -2570,7 +2617,13 @@ fn refresh_snapshot(
             evidence: entry.codex_evidence.clone(),
         })
         .collect();
-    let codex_composition: CodexComposition = compose_codex_segments(codex_entries);
+    let codex_composition: CodexComposition = match sources
+        .iter()
+        .find(|source| source.provider_name() == Some("codex"))
+    {
+        Some(source) => source.compose_codex_segments(codex_entries),
+        None => compose_codex_segments(codex_entries),
+    };
     let mut items: Vec<IndexedSession> = cache
         .values()
         .filter(|entry| entry.source_name.as_deref() != Some("codex"))
@@ -2591,6 +2644,8 @@ fn refresh_snapshot(
         amplifier_root_dirs,
         unresolved_codex_identities: codex_composition.unresolved_identities,
         codex_segment_paths: codex_composition.segment_paths,
+        codex_history_segments: codex_composition.history_segments,
+        codex_history_revisions: codex_composition.history_revisions,
     }
 }
 
@@ -3811,6 +3866,8 @@ pub(crate) mod tests {
             scan_failures: HashSet::new(),
             unresolved_codex_identities: Arc::new(Vec::new()),
             codex_segment_paths: Arc::new(HashMap::new()),
+            codex_history_segments: Arc::new(HashMap::new()),
+            codex_history_revisions: Arc::new(HashMap::new()),
         })));
         let file_cache = Arc::new(StdMutex::new(HashMap::new()));
         let direct_cache = Arc::new(StdMutex::new(HashMap::new()));
@@ -4538,9 +4595,9 @@ pub(crate) mod tests {
                     .replace("\"thread_source\":\"user\"", "\"thread_source\":\"subagent\""),
             ),
             (
-                "conflicting CLI version",
+                "empty CLI version",
                 older.clone(),
-                valid_newer.replace("\"cli_version\":\"0.156.0\"", "\"cli_version\":\"0.155.0\""),
+                valid_newer.replace("\"cli_version\":\"0.156.0\"", "\"cli_version\":\"\""),
             ),
             (
                 "conflicting originator",
@@ -8111,5 +8168,166 @@ pub(crate) mod tests {
             "scoped-only sweeps produce no report"
         );
         std::fs::remove_dir_all(&home).ok();
+    }
+
+    struct MutableCodexCompositionSource {
+        composition: StdMutex<CodexComposition>,
+    }
+
+    impl SessionSource for MutableCodexCompositionSource {
+        fn discover(&self) -> Vec<FileStat> {
+            Vec::new()
+        }
+
+        fn parse(&self, _path: &Path) -> Option<IndexedSession> {
+            None
+        }
+
+        fn provider_name(&self) -> Option<&'static str> {
+            Some("codex")
+        }
+
+        fn compose_codex_segments(&self, _entries: Vec<CodexSegmentEntry>) -> CodexComposition {
+            let composition = self.composition.lock().unwrap();
+            CodexComposition {
+                items: composition.items.clone(),
+                unresolved_identities: composition.unresolved_identities.clone(),
+                segment_paths: composition.segment_paths.clone(),
+                history_segments: composition.history_segments.clone(),
+                history_revisions: composition.history_revisions.clone(),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn codex_composition_sidecars_publish_and_notify_without_parse_cache_changes() {
+        use crate::codex_history::{CodexHistoryBoundary, CodexHistorySegment};
+
+        let home = unique_temp_dir("codex-sidecar-generation");
+        let (older, _) = codex_continuation_fixtures();
+        let path = home.join("rollout.jsonl");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::write(&path, &older).unwrap();
+        let row = parse_codex_file(&path).unwrap();
+        let session_id = row.session_id.clone();
+        let segment = CodexHistorySegment {
+            path: path.clone(),
+            end: None,
+        };
+        let source = Arc::new(MutableCodexCompositionSource {
+            composition: StdMutex::new(CodexComposition {
+                items: vec![row.clone()],
+                segment_paths: HashMap::from([(session_id.clone(), vec![path.clone()])]),
+                history_segments: HashMap::from([(session_id.clone(), vec![segment])]),
+                history_revisions: HashMap::from([(session_id.clone(), 1)]),
+                ..Default::default()
+            }),
+        });
+        let index = SessionIndex::with_ttl_and_cache_path(
+            vec![source.clone()],
+            Duration::from_secs(3600),
+            None,
+        );
+        let initial = index
+            .snapshot_with_failures_and_unresolved_codex_identities()
+            .await;
+        assert_eq!(initial.sessions.as_ref(), &vec![row]);
+        assert_eq!(initial.codex_history_revisions.get(&session_id), Some(&1));
+        let mut changes = index.subscribe_changes();
+        changes.borrow_and_update();
+
+        // An archive's selected contents changed, but its projected row and bounds did not.
+        source
+            .composition
+            .lock()
+            .unwrap()
+            .history_revisions
+            .insert(session_id.clone(), 2);
+        index.mark_provider_dirty("codex");
+        index.wait_for_refresh_idle_for_test().await;
+        assert!(changes.has_changed().unwrap());
+        changes.borrow_and_update();
+        let changed = index
+            .snapshot_with_failures_and_unresolved_codex_identities()
+            .await;
+        assert_eq!(changed.sessions, initial.sessions);
+        assert_eq!(changed.codex_history_revisions.get(&session_id), Some(&2));
+        assert_eq!(initial.codex_history_revisions.get(&session_id), Some(&1));
+
+        // A DB pointer selected a shorter history whose display metadata is unchanged.
+        let boundary = CodexHistoryBoundary {
+            end_byte_offset: 123,
+            end_ordinal_exclusive: 1,
+        };
+        source
+            .composition
+            .lock()
+            .unwrap()
+            .history_segments
+            .get_mut(&session_id)
+            .unwrap()[0]
+            .end = Some(boundary);
+        index.mark_provider_dirty("codex");
+        index.wait_for_refresh_idle_for_test().await;
+        assert!(changes.has_changed().unwrap());
+        changes.borrow_and_update();
+        let bounded = index
+            .snapshot_with_failures_and_unresolved_codex_identities()
+            .await;
+        assert_eq!(bounded.sessions, initial.sessions);
+        assert_eq!(
+            bounded.codex_history_segments[&session_id][0].end,
+            Some(boundary)
+        );
+        assert!(initial.codex_history_segments[&session_id][0].end.is_none());
+
+        source
+            .composition
+            .lock()
+            .unwrap()
+            .unresolved_identities
+            .push(CodexUnresolvedIdentity {
+                session_id: session_id.clone(),
+                paths: vec![path],
+            });
+        index.mark_provider_dirty("codex");
+        index.wait_for_refresh_idle_for_test().await;
+        assert!(changes.has_changed().unwrap());
+        changes.borrow_and_update();
+
+        // A repeated DB notification with unchanged effective history must not wake clients.
+        index.mark_provider_dirty("codex");
+        index.wait_for_refresh_idle_for_test().await;
+        assert!(!changes.has_changed().unwrap());
+        assert!(index.file_cache.lock().unwrap().is_empty());
+        std::fs::remove_dir_all(&home).unwrap();
+    }
+
+    #[tokio::test]
+    async fn codex_source_composes_continuations_across_cli_version_updates() {
+        let home = unique_temp_dir("codex-cli-update-continuation");
+        let (older, newer) = codex_continuation_fixtures();
+        let newer = newer.replace("\"cli_version\":\"0.156.0\"", "\"cli_version\":\"0.159.3\"");
+        let (older_path, newer_path) = write_codex_pair(&home, &older, &newer);
+        let source = Arc::new(CodexSource::new(home.join(".codex")));
+        let direct = source.scan();
+        assert_eq!(direct.len(), 1);
+        assert_eq!(direct[0].source_file.as_ref(), Some(&newer_path));
+        assert_eq!(
+            direct[0].first_user_message.as_deref(),
+            Some("Older first request")
+        );
+        let index =
+            SessionIndex::with_ttl_and_cache_path(vec![source], Duration::from_secs(60), None);
+        let snapshot = index
+            .snapshot_with_failures_and_unresolved_codex_identities()
+            .await;
+        assert_eq!(snapshot.sessions.len(), 1);
+        assert!(snapshot.unresolved_codex_identities.is_empty());
+        assert_eq!(
+            snapshot.codex_segment_paths[&direct[0].session_id],
+            vec![older_path, newer_path]
+        );
+        std::fs::remove_dir_all(&home).unwrap();
     }
 }

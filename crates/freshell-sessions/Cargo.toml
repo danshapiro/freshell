@@ -28,6 +28,8 @@ notify = "6"
 # compiles the SQLite amalgamation so the parser is not coupled to the host's
 # libsqlite3 version (deterministic across dev/CI/Windows).
 rusqlite = { version = "0.31", features = ["bundled"] }
+# Canonical logical thread and physical rollout identifiers in Codex history.
+uuid = "1"
 # SYNC-06 resume-resolve parity: the `shared/resume-input-parser.ts` port's
 # candidate-extraction regexes + hint tables (`resume_input.rs`). `(?-u:\b)`
 # keeps JS's ASCII \b word-boundary semantics. Same major already a direct

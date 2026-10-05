@@ -3580,3 +3580,420 @@ async fn moved_in_populated_project_is_cascaded_immediately_and_events_flow() {
     let _ = tokio::time::timeout(Duration::from_secs(1), handle).await;
     std::fs::remove_dir_all(&home).ok();
 }
+
+const REFERENCED_THREAD: &str = "b7936c10-4935-441c-837c-c1f33cafec2d";
+
+fn referenced_history_fixture(home: &Path) -> (PathBuf, PathBuf, PathBuf) {
+    let fixtures =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../test/fixtures/coding-cli/codex");
+    let older =
+        std::fs::read_to_string(fixtures.join("multi-file-continuation-older.sanitized.jsonl"))
+            .unwrap();
+    let mut older_records: Vec<serde_json::Value> = older
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    older_records[0]["ordinal"] = serde_json::json!(0);
+    for record in &mut older_records[1..] {
+        record["ordinal"] = serde_json::json!(record["ordinal"].as_u64().unwrap() + 1);
+    }
+    older_records[3]["type"] = serde_json::json!("response_item");
+    older_records[3]["payload"] = serde_json::json!({
+        "type": "message", "role": "assistant",
+        "content": [{"type": "output_text", "text": "Archive mutable detail A"}]
+    });
+    let encode = |records: &[serde_json::Value]| {
+        records
+            .iter()
+            .map(|record| format!("{record}\n"))
+            .collect::<String>()
+    };
+    let prefix_length = encode(&older_records[..4]).len() as u64;
+    let older = encode(&older_records);
+    let newer =
+        std::fs::read_to_string(fixtures.join("multi-file-continuation-newer.sanitized.jsonl"))
+            .unwrap();
+    let mut newer_records: Vec<serde_json::Value> = newer
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    newer_records[0]["payload"]["history_base"] = serde_json::json!({
+        "thread_id": REFERENCED_THREAD,
+        "end_byte_offset": prefix_length, "end_ordinal_exclusive": 4,
+    });
+    newer_records[0]["ordinal"] = serde_json::json!(4);
+    newer_records[0]["payload"]["cli_version"] = serde_json::json!("0.160.0");
+    for record in &mut newer_records[1..] {
+        record["ordinal"] = serde_json::json!(record["ordinal"].as_u64().unwrap() + 5);
+    }
+    let sessions = home.join("sessions");
+    std::fs::create_dir_all(&sessions).unwrap();
+    let root = sessions.join(format!(
+        "rollout-2026-10-03T00-00-00-{REFERENCED_THREAD}.jsonl"
+    ));
+    let left = sessions.join(format!("rollout-2026-10-03T00-00-10-{REFERENCED_THREAD}_00000000-0000-4000-8000-000000000001.jsonl"));
+    let right = sessions.join(format!("rollout-2026-10-03T00-00-11-{REFERENCED_THREAD}_00000000-0000-4000-8000-000000000002.jsonl"));
+    std::fs::write(&root, older).unwrap();
+    std::fs::write(
+        &left,
+        encode(&newer_records).replace("Continuation title", "Left continuation title"),
+    )
+    .unwrap();
+    std::fs::write(
+        &right,
+        encode(&newer_records).replace("Continuation title", "Right continuation title"),
+    )
+    .unwrap();
+    (root, left, right)
+}
+
+fn active_history_db(home: &Path, selected: &Path) -> rusqlite::Connection {
+    let connection = rusqlite::Connection::open(home.join("state_5.sqlite")).unwrap();
+    connection.execute_batch("PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0;
+        CREATE TABLE threads (id TEXT PRIMARY KEY, rollout_path TEXT, history_mode TEXT, archived INTEGER DEFAULT 0);").unwrap();
+    connection
+        .execute(
+            "INSERT INTO threads VALUES (?1, ?2, 'paginated', 0)",
+            rusqlite::params![REFERENCED_THREAD, selected.to_str().unwrap()],
+        )
+        .unwrap();
+    connection
+}
+
+async fn start_codex_history_watcher(
+    home: &Path,
+) -> (
+    Arc<SessionIndex>,
+    SessionWatcher,
+    tokio::task::JoinHandle<()>,
+) {
+    let source = Arc::new(crate::directory_index::CodexSource::new(home.to_path_buf()));
+    let index = Arc::new(SessionIndex::with_ttl_and_cache_path(
+        vec![source],
+        Duration::from_secs(3600),
+        None,
+    ));
+    let mut watcher = SessionWatcher::new(
+        Arc::clone(&index),
+        vec![WatchedProvider {
+            layout: Box::new(crate::provider_layout::CodexLayout),
+            home: home.to_path_buf(),
+        }],
+    );
+    let mut ready = watcher.startup_ready();
+    index.set_startup_gate(ready.clone());
+    let handle = watcher.start();
+    tokio::time::timeout(Duration::from_secs(5), ready.wait_for(|ready| *ready))
+        .await
+        .unwrap()
+        .unwrap();
+    index.snapshot().await;
+    (index, watcher, handle)
+}
+
+#[tokio::test]
+async fn codex_history_watcher_refreshes_a_wal_only_selected_pointer_change() {
+    let home = unique_temp_dir("codex-history-wal");
+    let (_, left, right) = referenced_history_fixture(&home);
+    let connection = active_history_db(&home, &left);
+    let (index, mut watcher, handle) = start_codex_history_watcher(&home).await;
+    let initial = index.snapshot().await;
+    assert_eq!(initial.len(), 1);
+    assert_eq!(initial[0].source_file.as_ref(), Some(&left));
+    let unchanged_db = std::fs::read(home.join("state_5.sqlite")).unwrap();
+    let mut changes = index.subscribe_changes();
+    changes.borrow_and_update();
+
+    connection
+        .execute(
+            "UPDATE threads SET rollout_path=?1 WHERE id=?2",
+            rusqlite::params![right.to_str().unwrap(), REFERENCED_THREAD],
+        )
+        .unwrap();
+    assert_eq!(
+        std::fs::read(home.join("state_5.sqlite")).unwrap(),
+        unchanged_db
+    );
+    tokio::time::timeout(Duration::from_secs(5), changes.changed())
+        .await
+        .unwrap()
+        .unwrap();
+    let selected = index
+        .snapshot_with_failures_and_unresolved_codex_identities()
+        .await;
+    assert_eq!(selected.sessions.len(), 1);
+    assert_eq!(selected.sessions[0].source_file.as_ref(), Some(&right));
+    assert_eq!(selected.sessions[0].title, initial[0].title);
+    assert_eq!(
+        selected.sessions[0].last_activity_at,
+        initial[0].last_activity_at
+    );
+    assert_eq!(
+        selected.codex_history_segments[REFERENCED_THREAD]
+            .last()
+            .unwrap()
+            .path,
+        right
+    );
+    assert!(selected.unresolved_codex_identities.is_empty());
+
+    watcher.stop();
+    handle.await.unwrap();
+    drop(connection);
+    std::fs::remove_dir_all(&home).unwrap();
+}
+
+#[tokio::test]
+async fn codex_history_watcher_relocates_and_refreshes_archived_prefix_without_metadata_changes() {
+    let home = unique_temp_dir("codex-history-archive");
+    let (root, left, _) = referenced_history_fixture(&home);
+    let connection = active_history_db(&home, &left);
+    let (index, mut watcher, handle) = start_codex_history_watcher(&home).await;
+    let initial = index
+        .snapshot_with_failures_and_unresolved_codex_identities()
+        .await;
+    assert_eq!(initial.sessions.len(), 1);
+    let mut changes = index.subscribe_changes();
+    changes.borrow_and_update();
+    let archive = home.join("archived_sessions");
+    std::fs::create_dir_all(&archive).unwrap();
+    let archived = archive.join(root.file_name().unwrap());
+    std::fs::rename(&root, &archived).unwrap();
+    tokio::time::timeout(Duration::from_secs(5), changes.changed())
+        .await
+        .unwrap()
+        .unwrap();
+    let relocated = index
+        .snapshot_with_failures_and_unresolved_codex_identities()
+        .await;
+    assert_eq!(relocated.sessions, initial.sessions);
+    assert_eq!(
+        relocated.codex_history_segments[REFERENCED_THREAD][0].path,
+        archived
+    );
+
+    changes.borrow_and_update();
+    let before_revision = relocated.codex_history_revisions[REFERENCED_THREAD];
+    let content = std::fs::read_to_string(&archived).unwrap();
+    std::fs::write(
+        &archived,
+        content.replace("Archive mutable detail A", "Archive mutable detail B"),
+    )
+    .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), changes.changed())
+        .await
+        .unwrap()
+        .unwrap();
+    let changed = index
+        .snapshot_with_failures_and_unresolved_codex_identities()
+        .await;
+    assert_eq!(changed.sessions, relocated.sessions);
+    assert_eq!(
+        changed.codex_history_segments,
+        relocated.codex_history_segments
+    );
+    assert_ne!(
+        changed.codex_history_revisions[REFERENCED_THREAD],
+        before_revision
+    );
+    // Archived dependencies are references, never ordinary discovery rows.
+    assert!(index
+        .peek()
+        .unwrap()
+        .iter()
+        .all(|item| item.source_file.as_ref() == Some(&left)));
+
+    watcher.stop();
+    handle.await.unwrap();
+    drop(connection);
+    std::fs::remove_dir_all(&home).unwrap();
+}
+
+fn write_ordinary_codex_history(home: &Path, id: &str) {
+    let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../test/fixtures/coding-cli/codex/multi-file-continuation-older.sanitized.jsonl");
+    let content = std::fs::read_to_string(fixture)
+        .unwrap()
+        .replace(REFERENCED_THREAD, id);
+    let directory = home.join("sessions/2026/10/03");
+    std::fs::create_dir_all(&directory).unwrap();
+    std::fs::write(
+        directory.join(format!("rollout-2026-10-03T00-00-00-{id}.jsonl")),
+        content,
+    )
+    .unwrap();
+}
+
+async fn wait_for_codex_history_rows(index: &SessionIndex, ids: &[&str]) {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let mut found = index
+                .snapshot()
+                .await
+                .iter()
+                .map(|row| row.session_id.clone())
+                .collect::<Vec<_>>();
+            let mut expected = ids.iter().map(|id| (*id).to_owned()).collect::<Vec<_>>();
+            found.sort();
+            expected.sort();
+            if found == expected {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("native Codex watch must update the index before its hour-long TTL");
+}
+
+#[tokio::test]
+async fn codex_history_watcher_observes_a_late_home_and_keeps_the_home_watch() {
+    let base = unique_temp_dir("codex-late-home");
+    std::fs::create_dir_all(&base).unwrap();
+    let home = base.join(".codex");
+    let (index, mut watcher, handle) = start_codex_history_watcher(&home).await;
+    assert!(index.snapshot().await.is_empty());
+    let first = "00000000-0000-4000-8000-000000000011";
+    write_ordinary_codex_history(&home, first);
+    wait_for_codex_history_rows(&index, &[first]).await;
+
+    // Removing and replacing a child root must not retire the permanent
+    // nonrecursive home watch as though it were a temporary ancestor arm.
+    std::fs::rename(home.join("sessions"), base.join("retired-sessions")).unwrap();
+    wait_for_codex_history_rows(&index, &[]).await;
+    let second = "00000000-0000-4000-8000-000000000012";
+    write_ordinary_codex_history(&home, second);
+    wait_for_codex_history_rows(&index, &[second]).await;
+    let third = "00000000-0000-4000-8000-000000000013";
+    write_ordinary_codex_history(&home, third);
+    wait_for_codex_history_rows(&index, &[second, third]).await;
+
+    watcher.stop();
+    handle.await.unwrap();
+    std::fs::remove_dir_all(base).unwrap();
+}
+
+#[tokio::test]
+async fn codex_history_watcher_rearms_a_session_root_replaced_between_probes() {
+    let base = unique_temp_dir("codex-replaced-root");
+    let home = base.join(".codex");
+    let first = "00000000-0000-4000-8000-000000000021";
+    write_ordinary_codex_history(&home, first);
+    let (index, mut watcher, handle) = start_codex_history_watcher(&home).await;
+    wait_for_codex_history_rows(&index, &[first]).await;
+    // Both operations happen before the normal periodic re-arm stat sees
+    // a missing path. The replacement has a different inode at the same path.
+    std::fs::rename(home.join("sessions"), base.join("retired-sessions")).unwrap();
+    let second = "00000000-0000-4000-8000-000000000022";
+    write_ordinary_codex_history(&home, second);
+    wait_for_codex_history_rows(&index, &[second]).await;
+    // The home watch only observes its immediate children. Seeing this
+    // later deep file proves the new recursive root arm actually survived.
+    let third = "00000000-0000-4000-8000-000000000023";
+    write_ordinary_codex_history(&home, third);
+    wait_for_codex_history_rows(&index, &[second, third]).await;
+
+    watcher.stop();
+    handle.await.unwrap();
+    std::fs::remove_dir_all(base).unwrap();
+}
+
+struct CountingCodexDiscovery {
+    inner: crate::directory_index::CodexSource,
+    discoveries: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl SessionSource for CountingCodexDiscovery {
+    fn discover(&self) -> Vec<crate::directory_index::FileStat> {
+        self.discoveries
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.inner.discover()
+    }
+    fn discover_checked(&self) -> std::io::Result<Vec<crate::directory_index::FileStat>> {
+        self.discoveries
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.inner.discover_checked()
+    }
+    fn parse(&self, path: &Path) -> Option<crate::directory_index::IndexedSession> {
+        self.inner.parse(path)
+    }
+    fn parse_with_codex_evidence(
+        &self,
+        path: &Path,
+    ) -> (
+        Option<crate::directory_index::IndexedSession>,
+        Option<crate::codex_segments::CodexFileEvidence>,
+    ) {
+        self.inner.parse_with_codex_evidence(path)
+    }
+    fn compose_codex_segments(
+        &self,
+        entries: Vec<crate::codex_segments::CodexSegmentEntry>,
+    ) -> crate::codex_segments::CodexComposition {
+        self.inner.compose_codex_segments(entries)
+    }
+    fn provider_name(&self) -> Option<&'static str> {
+        Some("codex")
+    }
+}
+
+#[tokio::test]
+async fn codex_history_watcher_ignores_unrelated_home_writes_but_observes_database_replacement() {
+    let home = unique_temp_dir("codex-narrow-home-watch");
+    write_ordinary_codex_history(&home, "00000000-0000-4000-8000-000000000031");
+    let discoveries = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let source = CountingCodexDiscovery {
+        inner: crate::directory_index::CodexSource::new(home.clone()),
+        discoveries: Arc::clone(&discoveries),
+    };
+    let index = Arc::new(SessionIndex::with_ttl_and_cache_path(
+        vec![Arc::new(source)],
+        Duration::from_secs(3600),
+        None,
+    ));
+    let mut watcher = SessionWatcher::new(
+        Arc::clone(&index),
+        vec![WatchedProvider {
+            layout: Box::new(crate::provider_layout::CodexLayout),
+            home: home.clone(),
+        }],
+    );
+    let mut ready = watcher.startup_ready();
+    index.set_startup_gate(ready.clone());
+    let handle = watcher.start();
+    tokio::time::timeout(Duration::from_secs(5), ready.wait_for(|ready| *ready))
+        .await
+        .unwrap()
+        .unwrap();
+    index.snapshot().await;
+    index.wait_for_refresh_idle_for_test().await;
+    let initial = discoveries.load(std::sync::atomic::Ordering::SeqCst);
+    std::fs::write(home.join("config.toml"), "model = 'test'\n").unwrap();
+    std::fs::write(home.join("history.jsonl"), "{}\n").unwrap();
+    std::fs::create_dir_all(home.join("log")).unwrap();
+    std::fs::write(home.join("log/codex-tui.log"), "ordinary activity\n").unwrap();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    index.wait_for_refresh_idle_for_test().await;
+    assert_eq!(
+        discoveries.load(std::sync::atomic::Ordering::SeqCst),
+        initial,
+        "unrelated home writes must not trigger provider discovery"
+    );
+
+    // A newly renamed SQLite inode must still invalidate selected history.
+    // This ordinary legacy row needs no usable DB, so corrupt content here
+    // isolates watcher invalidation from resolver selection behavior.
+    std::fs::write(home.join("replacement.tmp"), "not a database").unwrap();
+    std::fs::rename(home.join("replacement.tmp"), home.join("state_5.sqlite")).unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while discoveries.load(std::sync::atomic::Ordering::SeqCst) == initial {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("matching database rename must trigger provider discovery");
+    assert_eq!(index.snapshot().await.len(), 1);
+    watcher.stop();
+    handle.await.unwrap();
+    std::fs::remove_dir_all(home).unwrap();
+}

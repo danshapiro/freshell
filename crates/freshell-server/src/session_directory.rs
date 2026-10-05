@@ -48,8 +48,10 @@ use axum::{
     Json, Router,
 };
 use base64::Engine as _;
+use freshell_sessions::codex_history::CodexHistorySegment;
 use freshell_sessions::codex_segments::CodexUnresolvedIdentity;
 use freshell_sessions::directory_index::{IndexedSession, SessionIndex};
+use freshell_sessions::search::search_codex_history_segment;
 // SESSION-07: the `userMessages`/`fullText` tier file-content search
 // (`apply_file_search`, below) -- ports `server/session-directory/file-search.ts`.
 use freshell_sessions::{search_session_file, FileSearchTier};
@@ -171,6 +173,9 @@ struct DirItem {
     /// `fullText`. A composed Codex row carries every chronological segment;
     /// other file-backed rows carry their single transcript. Never serialized.
     source_files: Vec<PathBuf>,
+    /// Selected Codex history bounds; absent for ordinary whole-file rows.
+    /// Captured with the row from one index generation and never serialized.
+    codex_history_segments: Option<Vec<CodexHistorySegment>>,
     /// STATUS-STRIP: live token usage (`SessionDirectoryItem.tokenUsage`,
     /// `shared/read-models.ts`; Node's `CodingCliSession.tokenUsage`,
     /// `coding-cli/types.ts:190`). Powers the fresh-agent strip's context
@@ -593,7 +598,20 @@ async fn session_directory(
                         } else {
                             indexed.source_file.clone().into_iter().collect()
                         };
-                        dir_item_from_indexed_with_source_files(indexed, source_files)
+                        let mut item =
+                            dir_item_from_indexed_with_source_files(indexed, source_files);
+                        if indexed.provider == "codex" {
+                            item.codex_history_segments = snapshot
+                                .codex_history_segments
+                                .get(&indexed.session_id)
+                                .filter(|segments| {
+                                    !segments.is_empty()
+                                        && segments.last().map(|segment| &segment.path)
+                                            == indexed.source_file.as_ref()
+                                })
+                                .cloned();
+                        }
+                        item
                     })
                     .collect();
                 (items, snapshot.unresolved_codex_identities)
@@ -887,7 +905,7 @@ fn merge_unresolved_codex_identity_collisions(
         *count = (*count).max(collision.duplicate_item_count);
     }
     for group in unresolved {
-        if group.paths.len() < 2
+        if group.paths.is_empty()
             || codex_identity_is_canonically_soft_deleted(&group.session_id, overrides)
         {
             continue;
@@ -1117,6 +1135,7 @@ fn dir_item_from_indexed_with_source_files(
         session_type: None,
         title_source: idx.title_source.clone(),
         source_files,
+        codex_history_segments: None,
         token_usage: idx.token_usage.clone(),
         // Provenance is overlay-derived (`apply_session_overrides`), never
         // parsed from the transcript.
@@ -1283,6 +1302,7 @@ fn item_from_meta(
         session_type: None,
         title_source: meta.title_source.clone(),
         source_files: source_file.into_iter().collect(),
+        codex_history_segments: None,
         token_usage: None,
         title_overridden: false,
         provider_title: None,
@@ -1659,6 +1679,7 @@ fn build_live_terminal_session_item(
         // `titleSource` either, `service.ts:110-130`).
         title_source: None,
         source_files: Vec::new(),
+        codex_history_segments: None,
         // PARITY NOTE: Rust's `TerminalIdentity` carries no token usage, so a
         // live-terminal-only row reports none here — unlike Node, whose
         // `TerminalMeta` carries `tokenUsage`. Fresh-agent pane sessions are
@@ -1772,6 +1793,7 @@ mod join_tests {
             session_type: None,
             title_source: None,
             source_files: Vec::new(),
+            codex_history_segments: None,
             token_usage: None,
             title_overridden: false,
             provider_title: None,
@@ -2235,11 +2257,11 @@ fn apply_file_search(
         if !matches!(item.provider.as_str(), "claude" | "codex") {
             continue;
         }
-        if item.source_files.is_empty() {
-            continue;
-        }
-
-        for source_file in &item.source_files {
+        let source_count = item
+            .codex_history_segments
+            .as_ref()
+            .map_or(item.source_files.len(), Vec::len);
+        for source_index in 0..source_count {
             if results.len() > limit {
                 break 'items;
             }
@@ -2250,7 +2272,18 @@ fn apply_file_search(
             }
             scanned += 1;
 
-            match search_session_file(source_file, &item.provider, query_text, tier) {
+            let searched = match &item.codex_history_segments {
+                Some(segments) => {
+                    search_codex_history_segment(&segments[source_index], query_text, tier)
+                }
+                None => search_session_file(
+                    &item.source_files[source_index],
+                    &item.provider,
+                    query_text,
+                    tier,
+                ),
+            };
+            match searched {
                 Ok(Some(m)) => {
                     let mut matched = item.clone();
                     matched.matched_in = Some(m.matched_in.to_string());
@@ -2736,6 +2769,7 @@ mod tests {
             session_type: None,
             title_source: None,
             source_files: Vec::new(),
+            codex_history_segments: None,
             token_usage: Some(freshell_sessions::meta::TokenSummary {
                 input_tokens: 10,
                 output_tokens: 5,
@@ -3010,6 +3044,7 @@ mod tests {
             session_type: None,
             title_source: None,
             source_files: Vec::new(),
+            codex_history_segments: None,
             token_usage: None,
             title_overridden: false,
             provider_title: None,
@@ -3229,6 +3264,7 @@ mod tests {
             session_type: None,
             title_source: None,
             source_files: Vec::new(),
+            codex_history_segments: None,
             token_usage: None,
             title_overridden: false,
             provider_title: None,
@@ -3284,6 +3320,7 @@ mod tests {
             session_type: None,
             title_source: None,
             source_files: Vec::new(),
+            codex_history_segments: None,
             token_usage: None,
             title_overridden: false,
             provider_title: None,
@@ -3351,6 +3388,7 @@ mod tests {
             session_type: None,
             title_source: None,
             source_files: Vec::new(),
+            codex_history_segments: None,
             token_usage: None,
             title_overridden: false,
             provider_title: None,
@@ -3427,6 +3465,7 @@ mod tests {
             session_type: None,
             title_source: None,
             source_files: Vec::new(),
+            codex_history_segments: None,
             token_usage: None,
             title_overridden: false,
             provider_title: None,
@@ -3498,6 +3537,7 @@ mod tests {
             session_type: None,
             title_source: None,
             source_files: Vec::new(),
+            codex_history_segments: None,
             token_usage: None,
             title_overridden: false,
             provider_title: None,
@@ -3550,6 +3590,7 @@ mod tests {
             session_type: None,
             title_source: title_source.map(str::to_string),
             source_files: Vec::new(),
+            codex_history_segments: None,
             token_usage: None,
             title_overridden: false,
             provider_title: None,
@@ -3694,6 +3735,7 @@ mod tests {
             session_type: None,
             title_source: None,
             source_files: Vec::new(),
+            codex_history_segments: None,
             token_usage: None,
             title_overridden: false,
             provider_title: None,
@@ -6927,6 +6969,7 @@ mod tests {
             session_type: None,
             title_source: None,
             source_files: Vec::new(),
+            codex_history_segments: None,
             token_usage: None,
             title_overridden: false,
             provider_title: None,
@@ -6953,5 +6996,277 @@ mod tests {
         assert_eq!(arr.len(), 1, "search must match the OVERRIDE title");
         assert_eq!(arr[0]["title"], json!("My Renamed Special Project"));
         assert_eq!(arr[0]["matchedIn"], json!("title"));
+    }
+
+    fn write_codex_referenced_route_history(home: &Path) -> (PathBuf, PathBuf) {
+        let session_id = "b7936c10-4935-441c-837c-c1f33cafec2d";
+        let (older, newer) = codex_fixtures();
+        let mut older_records = older
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        older_records[0]["ordinal"] = json!(0);
+        for record in &mut older_records[1..] {
+            record["ordinal"] = json!(record["ordinal"].as_u64().unwrap() + 1);
+        }
+        let encode = |records: &[Value]| {
+            records
+                .iter()
+                .map(|record| format!("{record}\n"))
+                .collect::<String>()
+        };
+        let end_byte_offset = encode(&older_records[..3]).len() as u64;
+        older_records[3]["type"] = json!("response_item");
+        older_records[3]["payload"] = json!({"type":"message", "role":"user", "content":[{"type":"input_text", "text":"Superseded user request"}]});
+        older_records[4]["type"] = json!("response_item");
+        older_records[4]["payload"] = json!({"type":"message", "role":"assistant", "content":[{"type":"output_text", "text":"Superseded assistant answer"}]});
+        let mut newer_records = newer
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        newer_records[0]["payload"]["history_base"] = json!({
+            "thread_id":session_id, "end_byte_offset":end_byte_offset, "end_ordinal_exclusive":3,
+        });
+        newer_records[0]["ordinal"] = json!(3);
+        newer_records[0]["payload"]["cli_version"] = json!("0.160.0");
+        for record in &mut newer_records[1..] {
+            record["ordinal"] = json!(record["ordinal"].as_u64().unwrap() + 4);
+        }
+        let codex_home = home.join(".codex");
+        let archive = codex_home.join("archived_sessions");
+        let sessions = codex_home.join("sessions");
+        std::fs::create_dir_all(&archive).unwrap();
+        std::fs::create_dir_all(&sessions).unwrap();
+        let root = archive.join(format!("rollout-2026-10-03T00-00-00-{session_id}.jsonl"));
+        let head = sessions.join(format!(
+            "rollout-2026-10-03T00-00-10-{session_id}_00000000-0000-4000-8000-000000000001.jsonl"
+        ));
+        std::fs::write(&root, encode(&older_records)).unwrap();
+        std::fs::write(&head, encode(&newer_records)).unwrap();
+        let db = rusqlite::Connection::open(codex_home.join("state_5.sqlite")).unwrap();
+        db.execute_batch("CREATE TABLE threads (id TEXT PRIMARY KEY, rollout_path TEXT, history_mode TEXT, archived INTEGER DEFAULT 0);").unwrap();
+        db.execute(
+            "INSERT INTO threads VALUES (?1, ?2, 'paginated', 0)",
+            rusqlite::params![session_id, head.to_str().unwrap()],
+        )
+        .unwrap();
+        (root, head)
+    }
+
+    #[tokio::test]
+    async fn codex_referenced_route_searches_archived_prefix_and_selected_head_with_boundaries() {
+        let home = unique_temp_dir();
+        let (root, head) = write_codex_referenced_route_history(&home);
+        let (app, index) = codex_session_directory_app(
+            &home,
+            None,
+            freshell_ws::identity::TerminalIdentityRegistry::new(),
+        );
+        let base = "/api/session-directory?priority=visible&includeNonInteractive=1";
+        let page = get_directory_page(&app, base).await;
+        assert_eq!(
+            page["items"].as_array().unwrap().len(),
+            1,
+            "selected referenced history is one saved session: {page}"
+        );
+        assert!(
+            page.get("integrityError").is_none(),
+            "referenced history must not become a collision warning: {page}"
+        );
+        let snapshot = index
+            .snapshot_with_failures_and_unresolved_codex_identities()
+            .await;
+        let session_id = "b7936c10-4935-441c-837c-c1f33cafec2d";
+        assert_eq!(snapshot.sessions[0].source_file.as_ref(), Some(&head));
+        assert_eq!(snapshot.codex_history_segments[session_id][0].path, root);
+        assert!(snapshot.codex_history_segments[session_id][0].end.is_some());
+        for (needle, tier, matched_in) in [
+            ("Older first request", "userMessages", "userMessage"),
+            ("Older assistant summary", "fullText", "assistantMessage"),
+            ("Continuation title", "userMessages", "userMessage"),
+            ("Continuation summary", "fullText", "assistantMessage"),
+        ] {
+            let result = get_directory_page(
+                &app,
+                &format!("{base}&query={}&tier={tier}", needle.replace(' ', "%20")),
+            )
+            .await;
+            assert_eq!(
+                result["items"].as_array().unwrap().len(),
+                1,
+                "effective-history needle {needle:?}: {result}"
+            );
+            assert_eq!(result["items"][0]["matchedIn"], json!(matched_in));
+            assert!(result["items"][0]["snippet"]
+                .as_str()
+                .unwrap()
+                .contains(needle));
+        }
+        for tier in ["userMessages", "fullText"] {
+            let result =
+                get_directory_page(&app, &format!("{base}&query=Superseded&tier={tier}")).await;
+            assert!(
+                result["items"].as_array().unwrap().is_empty(),
+                "superseded tail must not leak through {tier}: {result}"
+            );
+        }
+        std::fs::remove_dir_all(home).unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn codex_referenced_route_keeps_head_match_when_archived_prefix_disappears() {
+        let home = unique_temp_dir();
+        let (root, _) = write_codex_referenced_route_history(&home);
+        let (app, _) = codex_session_directory_app(
+            &home,
+            None,
+            freshell_ws::identity::TerminalIdentityRegistry::new(),
+        );
+        let base = "/api/session-directory?priority=visible&includeNonInteractive=1";
+        let warm = get_directory_page(&app, base).await;
+        assert_eq!(warm["items"].as_array().unwrap().len(), 1);
+        std::fs::remove_file(root).unwrap();
+        let result = get_directory_page(
+            &app,
+            &format!("{base}&query=Continuation%20title&tier=userMessages"),
+        )
+        .await;
+        assert_eq!(
+            result["items"].as_array().unwrap().len(),
+            1,
+            "a later selected segment still matches: {result}"
+        );
+        assert_eq!(result["items"][0]["matchedIn"], json!("userMessage"));
+        assert_eq!(result["partial"], json!(true));
+        assert_eq!(result["partialReason"], json!("io_error"));
+        std::fs::remove_dir_all(home).unwrap();
+    }
+
+    #[tokio::test]
+    async fn codex_referenced_route_warns_for_a_single_unresolved_head_and_preserves_its_running_terminal(
+    ) {
+        let home = unique_temp_dir();
+        let (root, head) = write_codex_referenced_route_history(&home);
+        std::fs::remove_file(root).unwrap();
+        let session_id = "b7936c10-4935-441c-837c-c1f33cafec2d";
+        let identity = freshell_ws::identity::TerminalIdentityRegistry::new();
+        let (app, index) = codex_session_directory_app(&home, None, identity.clone());
+        let snapshot = index
+            .snapshot_with_failures_and_unresolved_codex_identities()
+            .await;
+        assert_eq!(snapshot.unresolved_codex_identities.len(), 1);
+        assert_eq!(snapshot.unresolved_codex_identities[0].paths, vec![head]);
+        let base = "/api/session-directory?priority=visible&includeNonInteractive=1";
+        let hidden = get_directory_page(&app, base).await;
+        assert_eq!(
+            hidden["integrityError"]["collisionCount"],
+            json!(1),
+            "an unresolved referenced head must warn even with one physical file: {hidden}"
+        );
+        assert_eq!(hidden["partial"], json!(true));
+        assert!(
+            hidden["items"].as_array().unwrap().is_empty(),
+            "incomplete saved history stays quarantined: {hidden}"
+        );
+
+        identity.upsert(
+            "term-unresolved",
+            Some("codex"),
+            Some(session_id),
+            Some("/live-terminal"),
+            400,
+        );
+        let running = get_directory_page(&app, base).await;
+        assert_eq!(running["integrityError"], hidden["integrityError"]);
+        let rows = running["items"].as_array().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["provider"], json!("codex"));
+        assert_eq!(rows[0]["sessionId"], json!(session_id));
+        assert_eq!(rows[0]["title"], json!("Codex CLI"));
+        assert_eq!(rows[0]["isRunning"], json!(true));
+        assert_eq!(rows[0]["runningTerminalId"], json!("term-unresolved"));
+        assert_eq!(rows[0]["projectPath"], json!("/live-terminal"));
+        assert_ne!(rows[0]["liveTerminalOnly"], json!(true));
+        std::fs::remove_dir_all(home).unwrap();
+    }
+
+    #[tokio::test]
+    async fn codex_referenced_route_quarantines_a_noncanonical_copy_and_recovers_after_removal() {
+        let home = unique_temp_dir();
+        let (_, head) = write_codex_referenced_route_history(&home);
+        let session_id = "b7936c10-4935-441c-837c-c1f33cafec2d";
+        let identity = freshell_ws::identity::TerminalIdentityRegistry::new();
+        let (app, index) = codex_session_directory_app(&home, None, identity.clone());
+        let base = "/api/session-directory?priority=visible&includeNonInteractive=1";
+        let initial = get_directory_page(&app, base).await;
+        let initial_rows = initial["items"].as_array().unwrap();
+        assert_eq!(initial_rows.len(), 1);
+        assert_eq!(
+            initial_rows[0]["firstUserMessage"],
+            json!("Older first request")
+        );
+        assert!(initial.get("integrityError").is_none());
+
+        // Discovery sees the same embedded identity even though this copied
+        // filename cannot identify a physical referenced-history segment.
+        let copy = head.parent().unwrap().join("copy.jsonl");
+        std::fs::copy(&head, &copy).unwrap();
+        index.mark_provider_dirty("codex");
+        index.wait_for_refresh_idle_for_test().await;
+        let conflicted = get_directory_page(&app, base).await;
+        assert_eq!(
+            conflicted["integrityError"]["kind"],
+            json!("identity_collision"),
+            "a noncanonical copy must not disappear from accepted history: {conflicted}"
+        );
+        assert_eq!(conflicted["integrityError"]["collisionCount"], json!(1));
+        assert_eq!(conflicted["partial"], json!(true));
+        assert!(
+            conflicted["items"].as_array().unwrap().is_empty(),
+            "saved history must remain quarantined while the copy exists: {conflicted}"
+        );
+
+        identity.upsert(
+            "term-copy-conflict",
+            Some("codex"),
+            Some(session_id),
+            Some("/live-terminal"),
+            400,
+        );
+        let live = get_directory_page(&app, base).await;
+        assert_eq!(live["integrityError"], conflicted["integrityError"]);
+        let live_rows = live["items"].as_array().unwrap();
+        assert_eq!(live_rows.len(), 1);
+        assert_eq!(live_rows[0]["sessionId"], json!(session_id));
+        assert_eq!(live_rows[0]["title"], json!("Codex CLI"));
+        assert_eq!(live_rows[0]["isRunning"], json!(true));
+        assert_eq!(
+            live_rows[0]["runningTerminalId"],
+            json!("term-copy-conflict")
+        );
+        assert_eq!(live_rows[0]["projectPath"], json!("/live-terminal"));
+
+        std::fs::remove_file(copy).unwrap();
+        index.mark_provider_dirty("codex");
+        index.wait_for_refresh_idle_for_test().await;
+        let recovered = get_directory_page(&app, base).await;
+        assert!(
+            recovered.get("integrityError").is_none(),
+            "copy removal must clear the warning: {recovered}"
+        );
+        let recovered_rows = recovered["items"].as_array().unwrap();
+        assert_eq!(recovered_rows.len(), 1);
+        assert_eq!(recovered_rows[0]["sessionId"], json!(session_id));
+        assert_eq!(
+            recovered_rows[0]["firstUserMessage"],
+            initial_rows[0]["firstUserMessage"]
+        );
+        assert_eq!(recovered_rows[0]["summary"], initial_rows[0]["summary"]);
+        assert_eq!(recovered_rows[0]["isRunning"], json!(true));
+        assert_eq!(
+            recovered_rows[0]["runningTerminalId"],
+            json!("term-copy-conflict")
+        );
+        std::fs::remove_dir_all(home).unwrap();
     }
 }

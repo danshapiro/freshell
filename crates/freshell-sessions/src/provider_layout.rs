@@ -22,6 +22,14 @@ pub enum WatchMode {
     NonRecursive,
 }
 
+/// Whether a relevant change reparses one discovered file or recomposes
+/// the provider, including dependencies outside its discovery tree.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WatchChangeScope {
+    File,
+    Provider,
+}
+
 /// A provider's on-disk session layout. One trait, one source of truth.
 pub trait ProviderLayout: Send + Sync {
     /// Short provider name: "claude", "codex", "opencode", "amplifier".
@@ -39,6 +47,21 @@ pub trait ProviderLayout: Send + Sync {
 
     /// Whether watcher targets should be watched recursively or not.
     fn watch_mode(&self) -> WatchMode;
+
+    /// Override the mode for providers with both metadata and history roots.
+    fn watch_mode_for_base(&self, _home: &Path, _base: &Path) -> WatchMode {
+        self.watch_mode()
+    }
+
+    /// Ignore unrelated provider state, or select the refresh scope.
+    /// Existing providers retain their file-versus-directory behavior.
+    fn watch_change_scope(&self, _home: &Path, path: &Path) -> Option<WatchChangeScope> {
+        Some(if self.qualifies(path) {
+            WatchChangeScope::File
+        } else {
+            WatchChangeScope::Provider
+        })
+    }
 
     /// Does `path` look like a session file for this provider? Used by the
     /// session watcher to filter raw inotify events down to relevant changes.
@@ -120,11 +143,56 @@ impl ProviderLayout for CodexLayout {
     }
 
     fn watch_bases(&self, home: &Path) -> Vec<PathBuf> {
-        vec![self.session_root(home)]
+        // Keep the home watch permanently: it catches SQLite inode replacement
+        // and late history roots without recursive config/log churn.
+        vec![
+            home.to_path_buf(),
+            self.session_root(home),
+            home.join("archived_sessions"),
+        ]
     }
 
     fn watch_mode(&self) -> WatchMode {
         WatchMode::Recursive
+    }
+
+    fn watch_mode_for_base(&self, home: &Path, base: &Path) -> WatchMode {
+        if base == home {
+            WatchMode::NonRecursive
+        } else {
+            WatchMode::Recursive
+        }
+    }
+
+    fn watch_change_scope(&self, home: &Path, path: &Path) -> Option<WatchChangeScope> {
+        let active = self.session_root(home);
+        let archived = home.join("archived_sessions");
+        if path == home || path == active || path == archived {
+            return Some(WatchChangeScope::Provider);
+        }
+        if path.starts_with(&active) {
+            return if self.qualifies(path) {
+                Some(WatchChangeScope::File)
+            } else if path.extension().is_none() {
+                Some(WatchChangeScope::Provider)
+            } else {
+                None
+            };
+        }
+        if path.starts_with(&archived) {
+            // These files are bounded ancestors, not independently listed rows.
+            return (self.qualifies(path) || path.extension().is_none())
+                .then_some(WatchChangeScope::Provider);
+        }
+        if path.parent() == Some(home)
+            && matches!(
+                path.file_name().and_then(|name| name.to_str()),
+                Some("state_5.sqlite" | "state_5.sqlite-wal")
+            )
+        {
+            return Some(WatchChangeScope::Provider);
+        }
+        None
     }
 
     fn qualifies(&self, path: &Path) -> bool {
@@ -377,5 +445,91 @@ mod tests {
         let layout_root = AmplifierLayout.session_root(home);
         let hardcoded_root = home.join("projects");
         assert_eq!(layout_root, hardcoded_root);
+    }
+
+    #[test]
+    fn codex_watch_modes_and_change_scopes_keep_active_rows_separate_from_references() {
+        let layout = CodexLayout;
+        let home = Path::new("/home/user/.codex");
+        let bases = layout.watch_bases(home);
+        assert_eq!(
+            bases,
+            vec![
+                home.to_path_buf(),
+                home.join("sessions"),
+                home.join("archived_sessions")
+            ]
+        );
+        assert_eq!(
+            layout.watch_mode_for_base(home, &bases[0]),
+            WatchMode::NonRecursive
+        );
+        assert_eq!(
+            layout.watch_mode_for_base(home, &bases[1]),
+            WatchMode::Recursive
+        );
+        assert_eq!(
+            layout.watch_mode_for_base(home, &bases[2]),
+            WatchMode::Recursive
+        );
+        for path in [
+            home.to_path_buf(),
+            home.join("sessions"),
+            home.join("sessions/2026/10"),
+            home.join("archived_sessions"),
+            home.join("archived_sessions/rollout.jsonl"),
+            home.join("state_5.sqlite"),
+            home.join("state_5.sqlite-wal"),
+        ] {
+            assert_eq!(
+                layout.watch_change_scope(home, &path),
+                Some(WatchChangeScope::Provider),
+                "provider dependency {path:?}"
+            );
+        }
+        assert_eq!(
+            layout.watch_change_scope(home, &home.join("sessions/2026/10/rollout.jsonl")),
+            Some(WatchChangeScope::File)
+        );
+        for path in [
+            home.join("config.toml"),
+            home.join("log/codex-tui.log"),
+            home.join("history.jsonl"),
+            home.join("auth.json"),
+            home.join("unrelated.sqlite"),
+        ] {
+            assert_eq!(
+                layout.watch_change_scope(home, &path),
+                None,
+                "unrelated Codex state {path:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn provider_watch_scope_defaults_preserve_existing_providers() {
+        let home = Path::new("/home/user/.claude");
+        let claude = ClaudeLayout;
+        assert_eq!(
+            claude.watch_mode_for_base(home, &home.join("projects")),
+            claude.watch_mode()
+        );
+        assert_eq!(
+            claude.watch_change_scope(home, &home.join("projects/project/session.jsonl")),
+            Some(WatchChangeScope::File)
+        );
+        assert_eq!(
+            claude.watch_change_scope(home, &home.join("projects/project")),
+            Some(WatchChangeScope::Provider)
+        );
+        let opencode = OpencodeLayout;
+        assert_eq!(
+            opencode.watch_mode_for_base(home, home),
+            opencode.watch_mode()
+        );
+        assert_eq!(
+            opencode.watch_change_scope(home, &home.join("opencode.db-wal")),
+            Some(WatchChangeScope::File)
+        );
     }
 }

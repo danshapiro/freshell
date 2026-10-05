@@ -3,6 +3,7 @@ import savedClaudeNativeHistory from '../../../../fixtures/managed-native-histor
 import savedCodexNativeHistory from '../../../../fixtures/managed-native-history/codex.json'
 import savedOpenCodeNativeHistory from '../../../../fixtures/managed-native-history/opencode.json'
 import { describe, expect, it, vi, beforeEach, afterEach } from 'vitest'
+import { lazy, Suspense } from 'react'
 import { render, screen, waitFor, fireEvent, createEvent, cleanup, act, within } from '@testing-library/react'
 import { Provider } from 'react-redux'
 import { configureStore, type Middleware } from '@reduxjs/toolkit'
@@ -98,7 +99,7 @@ describe('snapshot request audit', () => {
       await waitFor(() => expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledTimes(2))
       expect(apiMock.getFreshAgentThreadSnapshot.mock.calls[1][3]).toMatchObject({ soulId: content.soulId })
       await act(async () => owned.resolve(history))
-      expect(await screen.findByText('Saved native Codex answer')).toBeInTheDocument()
+      await expectRenderedText('Saved native Codex answer')
       expect(composer).toHaveValue('private-audit-draft')
       expect(composer).toBeDisabled()
       expect(getFreshAgentPaneContent(store)).toMatchObject(content)
@@ -169,7 +170,7 @@ describe('snapshot request audit', () => {
     const before = bridge.snapshot()
     await act(async () => held.resolve({ ...native, capabilities: { ...native.capabilities, send: true },
       extensions: { codex: { statusFromLiveState: true } } }))
-    expect(await screen.findByText('Saved native Codex answer')).toBeInTheDocument()
+    await expectRenderedText('Saved native Codex answer')
     expect(bridge.snapshot()).toEqual(before)
     expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledTimes(1)
     expect(sentFreshAgentMessages('freshAgent.create')).toHaveLength(0)
@@ -195,7 +196,7 @@ describe('snapshot request audit', () => {
       await waitFor(() => expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledTimes(2))
       await act(async () => held.resolve(history))
       if (readOnly) {
-        expect(await screen.findByText('Saved native Codex answer')).toBeInTheDocument()
+        await expectRenderedText('Saved native Codex answer')
         expect(screen.getByRole('textbox', { name: 'Chat message input' })).toBeDisabled()
         expect(records(bridge).find((entry) => entry.stage === 'display_committed' && entry.requestSerial === 1))
           .toMatchObject({ requestReadOnly: true })
@@ -476,6 +477,47 @@ function createDeferred<T>() {
   })
   return { promise, resolve, reject }
 }
+
+async function expectRenderedText(text: string | RegExp) {
+  // Markdown can replace its readable loading fallback while findByText's
+  // promise settles. Assert against the current element inside waitFor.
+  await waitFor(() => expect(screen.getByText(text)).toBeInTheDocument())
+}
+
+describe('retained history text observation', () => {
+  it('rejects an observation when the requested retained text is absent', async () => {
+    render(<p>A different retained conversation</p>)
+    vi.useFakeTimers()
+    try {
+      const observation = expect(expectRenderedText('The requested retained conversation'))
+        .rejects.toThrow('Unable to find an element')
+      await vi.advanceTimersByTimeAsync(1_000)
+      await observation
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('observes retained text across replacement of the Markdown loading fallback', async () => {
+    const { MarkdownRenderer } = await import('@/components/markdown/MarkdownRenderer')
+    const renderer = createDeferred<{ default: typeof MarkdownRenderer }>()
+    const DeferredMarkdown = lazy(() => renderer.promise)
+    const text = 'Conversation retained while Markdown loads'
+    render(
+      <Suspense fallback={<p>{text}</p>}>
+        <DeferredMarkdown content={text} />
+      </Suspense>,
+    )
+    const fallback = screen.getByText(text)
+    const observation = expectRenderedText(text).catch((error: unknown) => error)
+
+    await act(async () => renderer.resolve({ default: MarkdownRenderer }))
+
+    expect(fallback).not.toBeInTheDocument()
+    expect(screen.getByText(text)).toBeInTheDocument()
+    expect(await observation).toBeUndefined()
+  })
+})
 
 function freshopencodeSnapshot(text: string, revision: number) {
   return {
@@ -1041,7 +1083,7 @@ describe('new conversation close acceptance', () => {
     const fixture = prepare(surface, scope)
     let closing: ReturnType<typeof fixture.startClose> | undefined
     try {
-      expect(await screen.findByText(historyText)).toBeInTheDocument()
+      await expectRenderedText(historyText)
       const reads = apiMock.getFreshAgentThreadSnapshot.mock.calls.length
       const startNew = () => fireEvent.click(screen.getByRole('button', { name: 'Start new conversation' }))
       if (timing === 'already pending') act(() => { closing = fixture.startClose() })
@@ -1076,7 +1118,7 @@ describe('new conversation close acceptance', () => {
     const fixture = prepare(surfaces[2], 'tab')
     let closing: ReturnType<typeof fixture.startClose> | undefined
     try {
-      expect(await screen.findByText(historyText)).toBeInTheDocument()
+      await expectRenderedText(historyText)
       act(() => { closing = fixture.startClose() })
       fireEvent.click(screen.getByRole('button', { name: 'Start new conversation' }))
       await act(async () => fixture.stop.resolve(stopped))
@@ -1156,7 +1198,7 @@ describe('new conversation close acceptance', () => {
     const acknowledgeKill = () => fixture.emit({ type: 'freshAgent.killed', sessionId: fixture.content.sessionRef!.sessionId,
       sessionType: 'freshcodex', provider: 'codex', success: true })
     try {
-      expect(await screen.findByText(historyText)).toBeInTheDocument()
+      await expectRenderedText(historyText)
       fireEvent.click(screen.getByRole('button', { name: 'Start new session', exact: true }))
       expect(sentFreshAgentMessages('freshAgent.kill')).toHaveLength(1)
       expect(fixture.getContent().createRequestId).toBe(fixture.content.createRequestId)
@@ -1185,12 +1227,12 @@ describe('new conversation close acceptance', () => {
   it('refuses a late managed cleanup after the displayed conversation source changes', async () => {
     const fixture = prepare(surfaces[2], 'tab')
     try {
-      expect(await screen.findByText(historyText)).toBeInTheDocument()
+      await expectRenderedText(historyText)
       fireEvent.click(screen.getByRole('button', { name: 'Start new conversation' }))
       const replacement = { ...fixture.content, createRequestId: 'replacement-close-race-create',
         soulId: 'replacement-close-race-soul', soulIntentRevision: 18 }
       await act(async () => fixture.store.dispatch(updatePaneContent({ tabId: 'tab-1', paneId: 'pane-1', content: replacement })))
-      expect(await screen.findByText(historyText)).toBeInTheDocument()
+      await expectRenderedText(historyText)
       await act(async () => fixture.stop.resolve(stopped))
       expect(fixture.getContent()).toMatchObject(replacement)
       expect(screen.getByText(historyText)).toBeInTheDocument()
@@ -1205,7 +1247,7 @@ describe('new conversation close acceptance', () => {
     const fixture = prepare(surfaces[2], 'tab', 'unmanaged')
     const history = createDeferred<unknown>()
     try {
-      expect(await screen.findByText(historyText)).toBeInTheDocument()
+      await expectRenderedText(historyText)
       const reads = apiMock.getFreshAgentThreadSnapshot.mock.calls.length
       apiMock.getFreshAgentThreadSnapshot.mockReturnValue(history.promise)
       act(() => fixture.store.dispatch(requestPaneRefresh({ tabId: 'tab-1', paneId: 'pane-1' })))
@@ -1269,7 +1311,7 @@ describe('FreshAgentView', () => {
       sessionType: 'freshcodex', provider: 'codex', sessionId: 'close-retained-thread',
     }))
     render(<Provider store={store}><StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" /></Provider>)
-    expect(await screen.findByText('Saved conversation remains here')).toBeInTheDocument()
+    await expectRenderedText('Saved conversation remains here')
     expect(screen.queryByText(/Close failed/)).toBeNull()
     await act(async () => { await store.dispatch(closeTab('tab-1')) })
     const notice = await screen.findByText('Close failed: The pane could not be closed, so it was left open. Try again.')
@@ -1969,7 +2011,7 @@ describe('FreshAgentView', () => {
       </Provider>,
     )
 
-    expect(await screen.findByText('Visible transcript answer')).toBeInTheDocument()
+    await expectRenderedText('Visible transcript answer')
     expect(screen.queryByText('Do not pin this session summary')).not.toBeInTheDocument()
   })
 
@@ -2295,7 +2337,7 @@ describe('FreshAgentView', () => {
         expect.objectContaining({ cwd: '/repo/from-ref' }),
       )
     })
-    expect(await screen.findByText('Codex turn')).toBeInTheDocument()
+    await expectRenderedText('Codex turn')
   })
 
   it('restores a fresh-agent split pane remount without creating a replacement session', async () => {
@@ -7058,7 +7100,7 @@ describe('FreshAgentView', () => {
     store.dispatch(initLayout({ tabId: 'tab-1', paneId: 'pane-1', content }))
     render(<Provider store={store}><StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" /></Provider>)
     const answer = `Saved native ${provider === 'codex' ? 'Codex' : 'OpenCode'} answer`
-    expect(await screen.findByText(answer)).toBeInTheDocument()
+    await expectRenderedText(answer)
     apiMock.getFreshAgentThreadSnapshot.mockRejectedValue(new ApiError(404, message, { code: 'FRESH_AGENT_LOST_SESSION' }))
     const recovering = { ...content, recoverySummary: { ...content.recoverySummary, recoveryState: 'recovering' as const } }
     wsMock.send.mockClear()
@@ -7292,7 +7334,7 @@ describe('FreshAgentView', () => {
       const text = native.turns.flatMap((turn) => turn.items).find((item) => item.kind === 'text') as {text: string}
       expect(screen.queryByText(text.text)).not.toBeInTheDocument()
       await act(async () => owned.resolve({ ...native, extensions: { [provider]: { nativeHistoryAvailable: true, ownerKind: 'vacant' } } }))
-      expect(await screen.findByText(text.text)).toBeInTheDocument()
+      await expectRenderedText(text.text)
       expect(composer).toBeDisabled()
       expect(composer).toHaveValue('Owned outage draft')
       expect(getFreshAgentPaneContent(store)).toEqual(before)
@@ -7444,7 +7486,7 @@ describe('FreshAgentView', () => {
       store.dispatch(initLayout({ tabId: 'tab-1', paneId: 'pane-1', content }))
       apiMock.getFreshAgentThreadSnapshot.mockResolvedValue({ ...native, capabilities: { ...native.capabilities, send: true }, extensions: {} })
       render(<Provider store={store}><StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" /></Provider>)
-      expect(await screen.findByText('Saved native Codex answer')).toBeInTheDocument()
+      await expectRenderedText('Saved native Codex answer')
       const pending = createDeferred<unknown>()
       apiMock.getFreshAgentThreadSnapshot.mockReturnValue(pending.promise)
       apiMock.getFreshAgentThreadSnapshot.mockClear()
@@ -7706,7 +7748,7 @@ describe('FreshAgentView', () => {
     }
     store.dispatch(initLayout({ tabId: 'tab-1', paneId: 'pane-1', content }))
     render(<Provider store={store}><StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" /></Provider>)
-    expect(await screen.findByText('Saved conversation before recovery')).toBeInTheDocument()
+    await expectRenderedText('Saved conversation before recovery')
     expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledWith(sessionType, provider, sessionId, expect.objectContaining({ soulId: 'saved-history-soul' }))
     if (recoveryState === 'recovering') {
       expect(screen.queryByTestId('managed-runtime-recovery-card')).not.toBeInTheDocument()
@@ -7736,7 +7778,7 @@ describe('FreshAgentView', () => {
           durabilityState: 'resume_captured' as const, allocationState: 'verified_durable' as const } }
       store.dispatch(initLayout({ tabId: 'tab-1', paneId: 'pane-1', content }))
       render(<Provider store={store}><StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" /></Provider>)
-      expect(await screen.findByText(`Saved native ${provider === 'claude' ? 'Claude' : provider === 'codex' ? 'Codex' : 'OpenCode'} answer`)).toBeInTheDocument()
+      await expectRenderedText(`Saved native ${provider === 'claude' ? 'Claude' : provider === 'codex' ? 'Codex' : 'OpenCode'} answer`)
       expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledWith(sessionType, provider, history.threadId, expect.objectContaining({ soulId: content.soulId }))
       expect(getFreshAgentPaneContent(store)).toEqual(content)
       expect(sentFreshAgentMessages('freshAgent.create')).toHaveLength(0)
@@ -7759,7 +7801,7 @@ describe('FreshAgentView', () => {
     const tool = await screen.findByRole('button', { name: 'apply_patch tool call' })
     expect(screen.getAllByRole('button', { name: 'apply_patch tool call' })).toHaveLength(1)
     fireEvent.click(tool)
-    expect(await screen.findByText(/Patch saved/)).toBeInTheDocument()
+    await expectRenderedText(/Patch saved/)
     expect(screen.getByText(/\*\*\* Begin Patch/, { selector: 'pre' })).toBeInTheDocument()
     expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledWith('freshcodex', 'codex', history.threadId, expect.objectContaining({ soulId: content.soulId }))
     expect(getFreshAgentPaneContent(store)).toEqual(content)
@@ -7782,13 +7824,13 @@ describe('FreshAgentView', () => {
       createRequestId: 'revision-source-request', status: 'idle' as const, soulId: 'revision-source-soul', soulIntentRevision: 5 }
     store.dispatch(initLayout({ tabId: 'tab-1', paneId: 'pane-1', content }))
     render(<Provider store={store}><StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" /></Provider>)
-    expect(await screen.findByText('Previously loaded live answer')).toBeInTheDocument()
+    await expectRenderedText('Previously loaded live answer')
     const loaded = getFreshAgentPaneContent(store)
     apiMock.getFreshAgentThreadSnapshot.mockResolvedValue(native)
     wsMock.send.mockClear()
     act(() => store.dispatch(updatePaneContent({ tabId: 'tab-1', paneId: 'pane-1', content: { ...loaded,
       recoverySummary: { desiredState: 'running', recoveryState: 'blocked', durabilityState: 'resume_captured', allocationState: 'verified_durable' } } })))
-    expect(await screen.findByText(`Saved native ${provider === 'codex' ? 'Codex' : 'OpenCode'} answer`)).toBeInTheDocument()
+    await expectRenderedText(`Saved native ${provider === 'codex' ? 'Codex' : 'OpenCode'} answer`)
     expect(screen.queryByText('Previously loaded live answer')).not.toBeInTheDocument()
     expect(getFreshAgentPaneContent(store).sessionId).toBe(native.threadId)
     expect(wsMock.send).not.toHaveBeenCalledWith(expect.objectContaining({ type: expect.stringMatching(/^freshAgent\.|^pane\.reconcile/) }))
@@ -7797,7 +7839,7 @@ describe('FreshAgentView', () => {
       turns: [{ ...live.turns[0], items: [{ id: 'resumed-text', kind: 'text', text: 'Resumed live answer' }] }] })
     act(() => store.dispatch(updatePaneContent({ tabId: 'tab-1', paneId: 'pane-1', content: { ...loaded,
       recoverySummary: { desiredState: 'running', recoveryState: 'healthy', durabilityState: 'resume_captured', allocationState: 'verified_durable' } } })))
-    expect(await screen.findByText('Resumed live answer')).toBeInTheDocument()
+    await expectRenderedText('Resumed live answer')
   })
 
   it.each(([
@@ -7822,7 +7864,7 @@ describe('FreshAgentView', () => {
       recoverySummary: { desiredState: 'running' as const, recoveryState,
         durabilityState: 'resume_captured' as const, allocationState: 'verified_durable' as const } }
     act(() => store.dispatch(updatePaneContent({ tabId: 'tab-1', paneId: 'pane-1', content: blocked })))
-    expect(await screen.findByText('Saved native Codex answer')).toBeInTheDocument()
+    await expectRenderedText('Saved native Codex answer')
     const identity = getFreshAgentPaneContent(store)
     wsMock.send.mockClear()
     await act(async () => {
@@ -7881,7 +7923,7 @@ describe('FreshAgentView', () => {
     expect(wsMock.send).not.toHaveBeenCalledWith(expect.objectContaining({ type: expect.stringMatching(/^freshAgent\.|^pane\.reconcile/) }))
     // The initial saved-history read is still useful and has no live actor authority.
     await act(async () => resolveNative(native))
-    expect(await screen.findByText('Saved native Codex answer')).toBeInTheDocument()
+    await expectRenderedText('Saved native Codex answer')
     expect(getFreshAgentPaneContent(store)).toEqual(current)
   })
 
@@ -7897,7 +7939,7 @@ describe('FreshAgentView', () => {
         durabilityState: 'resume_captured' as const, allocationState: 'verified_durable' as const } }
     store.dispatch(initLayout({ tabId: 'tab-1', paneId: 'pane-1', content }))
     render(<Provider store={store}><StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" /></Provider>)
-    expect(await screen.findByText('Saved native OpenCode answer')).toBeInTheDocument()
+    await expectRenderedText('Saved native OpenCode answer')
     const empty = { ...native, revision: 0, latestTurnId: null, turns: [],
       extensions: { opencode: { ownerKind: 'vacant', ownerEpoch: 1, ownerGeneration: 2 } } }
     apiMock.getFreshAgentThreadSnapshot.mockResolvedValue(empty)
@@ -7932,7 +7974,7 @@ describe('FreshAgentView', () => {
       turns: [{ id: 'new-live', turnId: 'new-live', role: 'assistant', summary: '', items: [{ id: 'new-live-text', kind: 'text', text: 'New resumed live answer' }] }] })
     act(() => store.dispatch(updatePaneContent({ tabId: 'tab-1', paneId: 'pane-1', content: { ...content,
       recoverySummary: { ...content.recoverySummary, recoveryState: 'healthy' } } })))
-    expect(await screen.findByText('New resumed live answer')).toBeInTheDocument()
+    await expectRenderedText('New resumed live answer')
     await act(async () => resolveNative(native))
     expect(screen.getByText('New resumed live answer')).toBeInTheDocument()
     expect(screen.queryByText('Saved native Codex answer')).not.toBeInTheDocument()
@@ -7959,7 +8001,7 @@ describe('FreshAgentView', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Retry recovery' }))
     await waitFor(() => expect(getFreshAgentPaneContent(store).status).toBe('starting'))
     await act(async () => resolveHistory(savedCodexNativeHistory))
-    expect(await screen.findByText('Saved native Codex answer')).toBeInTheDocument()
+    await expectRenderedText('Saved native Codex answer')
     expect(getFreshAgentPaneContent(store).status).toBe('starting')
     expect(getFreshAgentPaneContent(store).resumeSessionId).toBeUndefined()
   })
@@ -7980,7 +8022,7 @@ describe('FreshAgentView', () => {
     next.turns[1].items[0] = { id: 'revision-answer', kind: 'text', text: 'Current revision history' }
     apiMock.getFreshAgentThreadSnapshot.mockResolvedValue(next)
     act(() => store.dispatch(updatePaneContent({ tabId: 'tab-1', paneId: 'pane-1', content: { ...content, soulIntentRevision: 2 } })))
-    expect(await screen.findByText('Current revision history')).toBeInTheDocument()
+    await expectRenderedText('Current revision history')
     await act(async () => resolveOld(savedCodexNativeHistory))
     expect(screen.getByText('Current revision history')).toBeInTheDocument()
     expect(screen.queryByText('Saved native Codex answer')).not.toBeInTheDocument()
@@ -8002,7 +8044,7 @@ describe('FreshAgentView', () => {
     next.turns[1].items[0] = { id: 'next-answer', kind: 'text', text: 'Current soul answer' }
     apiMock.getFreshAgentThreadSnapshot.mockResolvedValue(next)
     act(() => store.dispatch(updatePaneContent({ tabId: 'tab-1', paneId: 'pane-1', content: { ...content, soulId: 'new-soul' } })))
-    expect(await screen.findByText('Current soul answer')).toBeInTheDocument()
+    await expectRenderedText('Current soul answer')
     await act(async () => resolveOld(savedCodexNativeHistory))
     expect(screen.getByText('Current soul answer')).toBeInTheDocument()
     expect(screen.queryByText('Saved native Codex answer')).not.toBeInTheDocument()
@@ -8065,7 +8107,7 @@ describe('FreshAgentView', () => {
     }
     store.dispatch(initLayout({ tabId: 'tab-1', paneId: 'pane-1', content }))
     render(<Provider store={store}><StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" /></Provider>)
-    expect(await screen.findByText('Already loaded durable conversation')).toBeInTheDocument()
+    await expectRenderedText('Already loaded durable conversation')
     let resolveCold!: (snapshot: typeof cold) => void
     apiMock.getFreshAgentThreadSnapshot.mockReturnValue(new Promise((resolve) => { resolveCold = resolve }))
     wsMock.send.mockClear()
@@ -8387,7 +8429,7 @@ describe('FreshAgentView', () => {
         durabilityState: 'resume_captured' as const, allocationState: 'verified_durable' as const } }
     store.dispatch(initLayout({ tabId: 'tab-1', paneId: 'pane-1', content }))
     render(<Provider store={store}><StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" /></Provider>)
-    expect(await screen.findByText('Conversation retained before starting new')).toBeInTheDocument()
+    await expectRenderedText('Conversation retained before starting new')
     expect(screen.getByRole('note', { name: 'Retained conversation history' })).toHaveTextContent(
       'Showing retained conversation history. Older turns or large content were omitted from this view. The saved conversation has not been changed.')
     expect(screen.getByRole('textbox', { name: 'Chat message input' })).toBeDisabled()
@@ -8410,7 +8452,7 @@ describe('FreshAgentView', () => {
     }
     store.dispatch(initLayout({ tabId: 'tab-1', paneId: 'pane-1', content }))
     render(<Provider store={store}><StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" /></Provider>)
-    expect(await screen.findByText('Conversation retained before starting new')).toBeInTheDocument()
+    await expectRenderedText('Conversation retained before starting new')
     expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledWith('freshcodex', 'codex', 'cold-lost-thread', expect.not.objectContaining({ soulId: expect.anything() }))
     expect(getFreshAgentPaneContent(store)).toEqual(content)
     expect(screen.getByRole('textbox', { name: 'Chat message input' })).toBeDisabled()
@@ -8441,7 +8483,7 @@ describe('FreshAgentView', () => {
     }
     store.dispatch(initLayout({ tabId: 'tab-1', paneId: 'pane-1', content }))
     render(<Provider store={store}><StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" /></Provider>)
-    expect(await screen.findByText('Conversation retained before starting new')).toBeInTheDocument()
+    await expectRenderedText('Conversation retained before starting new')
     expect(screen.getByText('Close failed: Previous close was not confirmed')).toBeInTheDocument()
     wsMock.send.mockClear()
 
@@ -8478,7 +8520,7 @@ describe('FreshAgentView', () => {
       }
       store.dispatch(initLayout({ tabId: 'tab-1', paneId: 'pane-1', content }))
       render(<Provider store={store}><StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" /></Provider>)
-      expect(await screen.findByText('Conversation retained before starting new')).toBeInTheDocument()
+      await expectRenderedText('Conversation retained before starting new')
       expect(screen.getByText('Close failed: Previous close was not confirmed')).toBeInTheDocument()
       const retained = getFreshAgentPaneContent(store)
       wsMock.send.mockClear()
