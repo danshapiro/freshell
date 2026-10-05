@@ -867,23 +867,14 @@ async fn eviction_and_supersede_without_sends_still_close() {
     // moment the monitor fires, and an event emitted before the subscriber
     // exists is lost for good (tracing dispatch is not replayed).
     let events = global_capture();
-    // Same deliberately-inverted injection as the progressing-client test:
-    // the queue may hold bytes over the threshold, making the monitor's
-    // window observable. The 30 s harness ping interval keeps the per-send
-    // write timeout at 60 s — far beyond this test's bounds — so a closure
-    // observed here is the monitor's, not the send timeout's.
+    let captured_from = events.lock().expect("capture lock").len();
+    // The queue may hold bytes over the threshold, making the monitor's
+    // window observable. A small cap makes the first eviction an observable
+    // synchronization point even when the PTY producer is heavily contended.
+    // The 30 s harness ping interval keeps the per-send write timeout at
+    // 60 s — far beyond the monitor window.
     let term09 = Term09Config {
-        queue_max_bytes: 8 * 1024 * 1024,
-        // 32 KiB, not the earlier 1 MiB: premise-neutral (the eviction floor
-        // stays at the 8 MiB queue cap, far above this, so "bytes shrink via
-        // eviction while over threshold" is preserved) but it shrinks the
-        // load-sensitive step — the post-supersede-discard refill — 32x.
-        // Under concurrent full-suite gates the flood shell's production
-        // rate collapses, and a 1 MiB refill (≈10k flood lines) can take
-        // many minutes-to-forever: the monitor honestly has not seen
-        // over-threshold yet. 32 KiB (≈350 lines) keeps the window
-        // observable on a contended box; the observation loop below is
-        // production-progress-driven, so the two together are load-immune.
+        queue_max_bytes: 256 * 1024,
         catastrophic_buffered_bytes: 32 * 1024,
         catastrophic_stall_ms: 2_000,
     };
@@ -901,8 +892,7 @@ async fn eviction_and_supersede_without_sends_still_close() {
     tokio::time::sleep(Duration::from_millis(200)).await;
 
     let marker = "FLOOD-DONE-MARKER";
-    // ~60 MB keeps production alive for several seconds past the mid-stall
-    // supersede below (the queue must refill after the discard).
+    // ~60 MB leaves ample output to refill the queue after supersede.
     let flood = flood_command(600_000, marker);
 
     creator
@@ -917,22 +907,57 @@ async fn eviction_and_supersede_without_sends_still_close() {
         .await
         .expect("send flood input");
 
-    // Do NOT read from the stuck socket at all while the stall window runs —
-    // reading would drain the kernel buffers and count as send progress.
-    // First the queue fills and the in-flight frame wedges (eviction keeps
-    // shrinking queue bytes with zero completed sends).
-    tokio::time::sleep(Duration::from_millis(1_000)).await;
+    // Wait for an actual eviction before superseding. A fixed sleep can run
+    // before the contended PTY has produced any output, so it cannot prove
+    // that this scenario exercised queue overflow.
+    let spill_deadline = tokio::time::Instant::now() + Duration::from_secs(300);
+    loop {
+        if events
+            .lock()
+            .expect("capture lock")
+            .iter()
+            .skip(captured_from)
+            .any(|e| e.message == "ws.terminal_stream.queue_overflow_spill")
+        {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < spill_deadline,
+            "the stuck client's queue did not evict within 300 s; the PTY \
+             flood may not be producing or the writer may not be receiving it"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
 
-    // Mid-stall, re-attach the stuck client: the superseding attach DISCARDS
+    // Re-attach the stuck client: the superseding attach DISCARDS
     // its entire queued output (a byte reduction that is NOT a send). The
     // monitor may honestly reset on the below-threshold fall, but the still-
     // producing flood refills the queue and the window must close the
     // connection — eviction/supersede alone must never keep it alive.
     attach(&mut stuck, &terminal_id, "attach-stuck-supersede").await;
 
-    // Keep not reading through the refill + a full stall window (+margin):
-    // zero successful sends the whole time.
-    tokio::time::sleep(Duration::from_millis(4_000)).await;
+    // Keep the socket unread until the monitor decides. Reading after a
+    // fixed four-second sleep, before a contended producer refills the queue,
+    // lets socket sends complete and resets the very no-send window this
+    // test intends to prove.
+    let decision_deadline = tokio::time::Instant::now() + Duration::from_secs(300);
+    loop {
+        if events
+            .lock()
+            .expect("capture lock")
+            .iter()
+            .skip(captured_from)
+            .any(|e| e.message == "ws.terminal_stream.catastrophic_close")
+        {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < decision_deadline,
+            "the monitor made no decision within 300 s after eviction and \
+             supersede while the stuck socket remained unread"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
 
     // NOW resume reading: the connection should already be terminated (the
     // catastrophic monitor fired while we were silent). Attribution does
@@ -943,61 +968,19 @@ async fn eviction_and_supersede_without_sends_still_close() {
     // (exactly one ws.terminal_stream.catastrophic_close event); a write-
     // timeout or keepalive close would produce none.
     //
-    // The observation is PROGRESS-BASED (standing test discipline: a
-    // wall-clock budget must never fail working code). This test's waits
-    // starved out three times under concurrent full-suite gates before the
-    // design converged: a fixed 60 s window (twice), then a 300 s
-    // decision cap whose real victim was the FLOOD — under extreme
-    // starvation the shell's production rate collapses and the
-    // post-discard refill (which must re-cross the injected threshold)
-    // had not happened yet, so the monitor was honestly still waiting
-    // (not dead). The threshold injection is therefore sized for the
-    // contended-box reality (32 KiB re-crosses at even ~1% of focused
-    // production rate), and the wait below tracks the monitor's own
-    // decision record in the capture. The only fixed bound before the
-    // decision is a true-stall cap: 300 s with no decision event at all —
-    // a dead monitor or a flood starved below ~100 B/s of production, at
-    // which point no gate finishes anyway. A slow-but-producing box can
-    // never trip it. After the decision, a 120 s delivery cap catches a
-    // wedged teardown.
-    let decision_deadline = tokio::time::Instant::now() + Duration::from_secs(300);
-    let mut decided_at: Option<tokio::time::Instant> = None;
+    // After the decision, a 120 s delivery cap catches a wedged teardown.
+    let close_deadline = tokio::time::Instant::now() + Duration::from_secs(120);
     loop {
-        let now = tokio::time::Instant::now();
-        if decided_at.is_none()
-            && events
-                .lock()
-                .expect("capture lock")
-                .iter()
-                .any(|e| e.message == "ws.terminal_stream.catastrophic_close")
-        {
-            decided_at = Some(now);
-        }
-        if let Some(at) = decided_at {
-            assert!(
-                at.elapsed() < Duration::from_secs(120),
-                "the monitor decided but its close was never delivered to the \
-                 now-reading client within 120 s — a wedged teardown, not a \
-                 slow box"
-            );
-        } else {
-            assert!(
-                now < decision_deadline,
-                "no monitor decision in the capture within 300 s — a dead \
-                 monitor or a flood starved below ~100 B/s of production (a \
-                 slow-but-producing box can never trip this)"
-            );
-        }
-        let tick = if decided_at.is_some() {
-            Duration::from_millis(50)
-        } else {
-            Duration::from_millis(250)
-        };
+        assert!(
+            tokio::time::Instant::now() < close_deadline,
+            "the monitor decided but the now-reading client did not see \
+             stream termination within 120 s"
+        );
         // The loop's only non-panic exit is the close observation itself:
         // every other path is a stall-cap panic carrying the failure's
         // exact context, so the connection-must-close requirement is
         // enforced structurally.
-        match tokio::time::timeout(tick, stuck.next()).await {
+        match tokio::time::timeout(Duration::from_millis(50), stuck.next()).await {
             Ok(Some(Ok(WsMessage::Close(_)))) | Ok(None) | Ok(Some(Err(_))) => break,
             Ok(Some(Ok(_))) => {}
             Err(_) => continue, // tick elapsed with no frame: re-check progress
@@ -1016,6 +999,7 @@ async fn eviction_and_supersede_without_sends_still_close() {
         .lock()
         .expect("capture lock")
         .iter()
+        .skip(captured_from)
         .filter(|e| e.message == "ws.terminal_stream.catastrophic_close")
         .cloned()
         .collect();
