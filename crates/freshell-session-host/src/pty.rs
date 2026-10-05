@@ -7,11 +7,14 @@ use freshell_codex::{launch_lifecycle::CodexLaunchSidecar, remote_proxy::RemoteP
 use freshell_platform::SpawnSpec;
 use freshell_protocol::ServerMessage;
 use freshell_runtime_protocol::{
-    CommandState, IncarnationId, RequestId, RuntimeError, RuntimeErrorCode, RuntimeOutputBatch,
+    CommandState, IncarnationId, OpenCodeAdoptionBaseline, OpenCodeAdoptionExpectation,
+    OpenCodeAdoptionObservation, OpenCodeAdoptionStatus, OpenCodeMessagesRead,
+    OpenCodeVerifiedRootTail, RequestId, RuntimeError, RuntimeErrorCode, RuntimeOutputBatch,
     TerminalLaunchSpec,
 };
 use freshell_sessions::parse::opencode::{OpencodeProvider, OpencodeSessionRow};
 use freshell_terminal::PtyTerminal;
+use serde::Deserialize;
 use std::{
     collections::BTreeMap,
     path::{Path, PathBuf},
@@ -23,6 +26,18 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use tokio::{sync::mpsc, task::JoinHandle};
+
+const OPENCODE_ADOPTION_SIGNAL_ROOT: &str =
+    "/home/freshell/provider/.freshell/session-signals/opencode-adoption";
+
+pub(crate) type OpenCodeAdoptionRevalidator = Arc<
+    dyn Fn(
+            &OpenCodeAdoptionBaseline,
+        )
+            -> Result<freshell_agent_runtime::opencode_transfer::CurrentOpenCodeEvidence, String>
+        + Send
+        + Sync,
+>;
 
 struct CodexLifecycle {
     sidecar: Arc<CodexLaunchSidecar>,
@@ -38,6 +53,7 @@ pub struct HostedPty {
     terminal_id: String,
     stream_epoch: String,
     native_session_id: Arc<Mutex<Option<String>>>,
+    opencode_adoption: Option<Arc<Mutex<OpenCodeAdoptionGate>>>,
     codex: Option<CodexLifecycle>,
 }
 
@@ -48,8 +64,27 @@ impl HostedPty {
         launch: &TerminalLaunchSpec,
         child_secret_env: BTreeMap<String, String>,
         prepared_codex: Option<PreparedCodexLaunch>,
+        opencode_adoption_revalidator: Option<OpenCodeAdoptionRevalidator>,
     ) -> Result<Self, String> {
         launch.validate().map_err(|e| e.message)?;
+        let opencode_adoption = launch
+            .opencode_adoption
+            .as_ref()
+            .map(|expectation| {
+                OpenCodeAdoptionGate::new(
+                    launch.terminal_id.clone(),
+                    incarnation_id.clone(),
+                    expectation.clone(),
+                    opencode_adoption_revalidator
+                        .clone()
+                        .ok_or("OpenCode adoption verifier is unavailable for a gated launch")?,
+                    PathBuf::from(OPENCODE_ADOPTION_SIGNAL_ROOT),
+                    launch.run_as_uid,
+                    launch.run_as_gid,
+                )
+                .map(|gate| Arc::new(Mutex::new(gate)))
+            })
+            .transpose()?;
         let launch_floor_ms = epoch_ms().saturating_sub(500);
         let stream_epoch = format!(
             "{}-{}",
@@ -103,6 +138,10 @@ impl HostedPty {
         };
         let mut provider_env = launch.env.clone();
         provider_env.extend(child_secret_env);
+        if let Some(expectation) = launch.opencode_adoption.as_ref() {
+            set_opencode_adoption_environment(&mut provider_env, expectation);
+            provider_env.insert("FRESHELL_TERMINAL_ID".into(), launch.terminal_id.clone());
+        }
         // Rootless Docker maps the host user's bind-mounted workspace to
         // container uid 0, while the provider intentionally runs as uid
         // 65534. Tell Git that this one already-approved workspace is safe
@@ -130,7 +169,7 @@ impl HostedPty {
         let commands = CommandJournal::open(state_dir)?;
         // Codex must report the thread identity through its app-server proxy;
         // do not treat the requested resume id as provider-observed evidence.
-        let initial_native_id = (launch.mode != "codex")
+        let initial_native_id = (launch.mode != "codex" && opencode_adoption.is_none())
             .then(|| launch.resume_session_id.clone())
             .flatten();
         let native_session_id = Arc::new(Mutex::new(initial_native_id));
@@ -143,13 +182,27 @@ impl HostedPty {
             );
         }
         if launch.mode == "opencode" {
-            spawn_opencode_signal_relay(
-                &launch.terminal_id,
-                launch.run_as_uid,
-                launch.run_as_gid,
-                Arc::clone(&native_session_id),
-                Arc::clone(&exited),
-            );
+            if let Some(adoption_gate) = opencode_adoption.as_ref() {
+                if let Err(error) = spawn_opencode_adoption_signal_relay(
+                    &launch.terminal_id,
+                    launch.run_as_uid,
+                    launch.run_as_gid,
+                    adoption_gate.clone(),
+                    Arc::clone(&native_session_id),
+                    Arc::clone(&exited),
+                ) {
+                    pty.kill();
+                    return Err(error);
+                }
+            } else {
+                spawn_opencode_signal_relay(
+                    &launch.terminal_id,
+                    launch.run_as_uid,
+                    launch.run_as_gid,
+                    Arc::clone(&native_session_id),
+                    Arc::clone(&exited),
+                );
+            }
         }
         let codex = if let Some(prepared) = prepared_codex {
             if let Err(error) = prepared.sidecar.adopt(&launch.terminal_id, 0).await {
@@ -181,6 +234,7 @@ impl HostedPty {
             terminal_id: launch.terminal_id.clone(),
             stream_epoch,
             native_session_id,
+            opencode_adoption,
             codex,
         })
     }
@@ -190,7 +244,21 @@ impl HostedPty {
         request_id: &RequestId,
         data: &str,
     ) -> Result<CommandState, RuntimeError> {
-        match self.commands.begin(request_id, data.as_bytes())? {
+        let adoption_gate = self.opencode_adoption.clone();
+        let disposition =
+            begin_input_after_gate(&mut self.commands, request_id, data.as_bytes(), || {
+                let Some(gate) = adoption_gate.as_ref() else {
+                    return Ok(true);
+                };
+                let mut gate = gate.lock().map_err(|_| {
+                    RuntimeError::new(
+                        RuntimeErrorCode::HostUnreachable,
+                        "OpenCode adoption gate lock is unavailable",
+                    )
+                })?;
+                Ok(gate.release_input())
+            })?;
+        match disposition {
             BeginDisposition::Completed => return Ok(CommandState::Completed),
             BeginDisposition::Ambiguous => {
                 return Err(RuntimeError::new(
@@ -288,6 +356,500 @@ impl HostedPty {
             .ok()
             .and_then(|session| session.clone())
     }
+
+    pub fn opencode_adoption_status(&self) -> OpenCodeAdoptionStatus {
+        self.opencode_adoption
+            .as_ref()
+            .and_then(|gate| gate.lock().ok().map(|gate| gate.status()))
+            .unwrap_or(OpenCodeAdoptionStatus::NotRequired)
+    }
+}
+
+fn begin_input_after_gate(
+    commands: &mut CommandJournal,
+    request_id: &RequestId,
+    data: &[u8],
+    release_gate: impl FnOnce() -> Result<bool, RuntimeError>,
+) -> Result<BeginDisposition, RuntimeError> {
+    match commands.existing_disposition(request_id, data)? {
+        Some(BeginDisposition::Completed) => return Ok(BeginDisposition::Completed),
+        Some(BeginDisposition::Ambiguous) => return Ok(BeginDisposition::Ambiguous),
+        Some(BeginDisposition::Dispatch) | None => {}
+    }
+    if !release_gate()? {
+        return Err(RuntimeError::new(
+            RuntimeErrorCode::RecoveryBlocked,
+            "OpenCode is waiting for a fresh provider session observation",
+        ));
+    }
+    commands.begin(request_id, data)
+}
+
+struct OpenCodeAdoptionGate {
+    terminal_id: String,
+    incarnation_id: IncarnationId,
+    expectation: OpenCodeAdoptionExpectation,
+    observation: Option<OpenCodeAdoptionObservation>,
+    released: bool,
+    verifier: OpenCodeAdoptionRevalidator,
+    expectation_path: PathBuf,
+    provider_uid: u32,
+    provider_gid: u32,
+    verification_failed: bool,
+}
+
+impl OpenCodeAdoptionGate {
+    fn new(
+        terminal_id: String,
+        incarnation_id: IncarnationId,
+        expectation: OpenCodeAdoptionExpectation,
+        verifier: OpenCodeAdoptionRevalidator,
+        signal_root: PathBuf,
+        provider_uid: u32,
+        provider_gid: u32,
+    ) -> Result<Self, String> {
+        expectation.validate().map_err(|error| error.message)?;
+        if terminal_id.is_empty()
+            || expectation.incarnation_id != incarnation_id
+            || provider_uid == 0
+        {
+            return Err(
+                "OpenCode adoption expectation belongs to another terminal incarnation".into(),
+            );
+        }
+        let expectation_path = signal_root.join(format!("{terminal_id}.expected.json"));
+        let gate = Self {
+            terminal_id,
+            incarnation_id,
+            expectation,
+            observation: None,
+            released: false,
+            verifier,
+            expectation_path,
+            provider_uid,
+            provider_gid,
+            verification_failed: false,
+        };
+        gate.publish_expectation()?;
+        Ok(gate)
+    }
+
+    #[cfg(test)]
+    fn input_allowed(&self) -> bool {
+        self.released
+    }
+
+    fn observe(&mut self, observation: OpenCodeAdoptionObservation) -> bool {
+        if self.released || !self.matches(&observation) {
+            return false;
+        }
+        if !self.revalidate_current().unwrap_or(false) || !self.matches(&observation) {
+            return false;
+        }
+        self.observation = Some(observation);
+        true
+    }
+
+    fn release_input(&mut self) -> bool {
+        if self.released {
+            return true;
+        }
+        let Some(observation) = self.observation.clone() else {
+            return false;
+        };
+        if !self.revalidate_current().unwrap_or(false) || !self.matches(&observation) {
+            self.observation = None;
+            return false;
+        }
+        self.released = true;
+        true
+    }
+
+    fn matches(&self, observation: &OpenCodeAdoptionObservation) -> bool {
+        if observation.terminal_id != self.terminal_id
+            || observation.incarnation_id != self.incarnation_id
+            || observation.incarnation_id != self.expectation.incarnation_id
+            || observation.launch_nonce != self.expectation.launch_nonce
+            || observation.root_session_id != self.expectation.root_session_id
+            || observation.evidence_generation != self.expectation.evidence_generation
+            || !observation.hydrated
+        {
+            return false;
+        }
+        match (&self.expectation.root_tail, observation.messages_read) {
+            (OpenCodeVerifiedRootTail::Message { message_id }, OpenCodeMessagesRead::Success) => {
+                observation.tail_message_id.as_deref() == Some(message_id.as_str())
+            }
+            (OpenCodeVerifiedRootTail::QualifiedEmpty, OpenCodeMessagesRead::EmptyConfirmed) => {
+                observation.tail_message_id.is_none()
+            }
+            _ => false,
+        }
+    }
+
+    fn status(&self) -> OpenCodeAdoptionStatus {
+        self.observation
+            .as_ref()
+            .map(|observation| OpenCodeAdoptionStatus::Observed {
+                observation: observation.clone(),
+            })
+            .unwrap_or(OpenCodeAdoptionStatus::AwaitingObservation)
+    }
+
+    fn revalidate_current(&mut self) -> Result<bool, String> {
+        let current = match (self.verifier)(&self.expectation.baseline) {
+            Ok(current) => {
+                self.verification_failed = false;
+                current
+            }
+            Err(error) => {
+                self.observation = None;
+                self.released = false;
+                if !self.verification_failed {
+                    self.rotate_nonce();
+                    self.publish_expectation()?;
+                }
+                self.verification_failed = true;
+                return Err(error);
+            }
+        };
+        let baseline = &self.expectation.baseline.descriptor;
+        if current.version != 1
+            || current.transfer_id != baseline.transfer_id
+            || current.destination_store_id != baseline.destination_store_id
+            || current.import_generation != baseline.source_generation
+            || current.root_session_id != self.expectation.root_session_id
+            || current.evidence_generation.len() != 64
+            || !current
+                .evidence_generation
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            self.observation = None;
+            self.released = false;
+            if !self.verification_failed {
+                self.rotate_nonce();
+                self.publish_expectation()?;
+            }
+            self.verification_failed = true;
+            return Err("verified OpenCode store identity does not match its baseline".into());
+        }
+        let current_tail = match current.root_tail {
+            freshell_agent_runtime::opencode_transfer::VerifiedRootTail::Message { message_id } => {
+                OpenCodeVerifiedRootTail::Message { message_id }
+            }
+            freshell_agent_runtime::opencode_transfer::VerifiedRootTail::QualifiedEmpty => {
+                OpenCodeVerifiedRootTail::QualifiedEmpty
+            }
+        };
+        if current.evidence_generation != self.expectation.evidence_generation
+            || current_tail != self.expectation.root_tail
+        {
+            self.expectation.evidence_generation = current.evidence_generation;
+            self.expectation.root_tail = current_tail;
+            self.rotate_nonce();
+            self.observation = None;
+            self.released = false;
+            self.publish_expectation()?;
+            return Ok(false);
+        }
+        Ok(true)
+    }
+
+    fn rotate_nonce(&mut self) {
+        self.expectation.launch_nonce = uuid::Uuid::new_v4().simple().to_string();
+    }
+
+    fn publish_expectation(&self) -> Result<(), String> {
+        publish_opencode_adoption_expectation(
+            &self.expectation_path,
+            &self.terminal_id,
+            &self.expectation,
+            self.provider_uid,
+            self.provider_gid,
+        )
+    }
+}
+
+impl Drop for OpenCodeAdoptionGate {
+    fn drop(&mut self) {
+        remove_opencode_adoption_expectation(&self.expectation_path, &self.incarnation_id);
+    }
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+struct OpenCodeAdoptionExpectationFile<'a> {
+    terminal_id: &'a str,
+    root_session_id: &'a str,
+    root_tail: &'a OpenCodeVerifiedRootTail,
+    evidence_generation: &'a str,
+    incarnation_id: &'a IncarnationId,
+    launch_nonce: &'a str,
+}
+
+fn publish_opencode_adoption_expectation(
+    path: &Path,
+    terminal_id: &str,
+    expectation: &OpenCodeAdoptionExpectation,
+    provider_uid: u32,
+    provider_gid: u32,
+) -> Result<(), String> {
+    let parent = path
+        .parent()
+        .ok_or("OpenCode adoption expectation has no parent directory")?;
+    std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+    #[cfg(unix)]
+    {
+        crate::set_owner(parent, provider_uid, provider_gid)?;
+        crate::set_mode(parent, 0o700)?;
+    }
+    let bytes = serde_json::to_vec(&OpenCodeAdoptionExpectationFile {
+        terminal_id,
+        root_session_id: &expectation.root_session_id,
+        root_tail: &expectation.root_tail,
+        evidence_generation: &expectation.evidence_generation,
+        incarnation_id: &expectation.incarnation_id,
+        launch_nonce: &expectation.launch_nonce,
+    })
+    .map_err(|error| error.to_string())?;
+    let temporary = path.with_extension(format!("tmp-{}", std::process::id()));
+    match std::fs::symlink_metadata(&temporary) {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
+            return Err("OpenCode adoption expectation staging path is not a file".into());
+        }
+        Ok(_) => std::fs::remove_file(&temporary).map_err(|error| error.to_string())?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.to_string()),
+    }
+    std::fs::write(&temporary, bytes).map_err(|error| error.to_string())?;
+    #[cfg(unix)]
+    crate::set_mode(&temporary, 0o644)?;
+    std::fs::rename(&temporary, path).map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+fn set_opencode_adoption_environment(
+    environment: &mut BTreeMap<String, String>,
+    expectation: &OpenCodeAdoptionExpectation,
+) {
+    environment.insert(
+        "FRESHELL_OPENCODE_ADOPTION_ROOT_SESSION_ID".into(),
+        expectation.root_session_id.clone(),
+    );
+    environment.insert(
+        "FRESHELL_OPENCODE_ADOPTION_EVIDENCE_GENERATION".into(),
+        expectation.evidence_generation.clone(),
+    );
+    environment.insert(
+        "FRESHELL_OPENCODE_ADOPTION_INCARNATION_ID".into(),
+        expectation.incarnation_id.to_string(),
+    );
+    environment.insert(
+        "FRESHELL_OPENCODE_ADOPTION_LAUNCH_NONCE".into(),
+        expectation.launch_nonce.clone(),
+    );
+    match &expectation.root_tail {
+        OpenCodeVerifiedRootTail::Message { message_id } => {
+            environment.insert(
+                "FRESHELL_OPENCODE_ADOPTION_TAIL_MESSAGE_ID".into(),
+                message_id.clone(),
+            );
+            environment.insert(
+                "FRESHELL_OPENCODE_ADOPTION_EXPECTED_EMPTY".into(),
+                "false".into(),
+            );
+        }
+        OpenCodeVerifiedRootTail::QualifiedEmpty => {
+            environment.remove("FRESHELL_OPENCODE_ADOPTION_TAIL_MESSAGE_ID");
+            environment.insert(
+                "FRESHELL_OPENCODE_ADOPTION_EXPECTED_EMPTY".into(),
+                "true".into(),
+            );
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct OpenCodeAdoptionSignalFile {
+    #[serde(alias = "session_id")]
+    session_id: Option<String>,
+    #[serde(alias = "adoption_observation")]
+    adoption_observation: Option<OpenCodeAdoptionObservation>,
+}
+
+fn spawn_opencode_adoption_signal_relay(
+    terminal_id: &str,
+    provider_uid: u32,
+    provider_gid: u32,
+    adoption_gate: Arc<Mutex<OpenCodeAdoptionGate>>,
+    native_session_id: Arc<Mutex<Option<String>>>,
+    exited: Arc<AtomicBool>,
+) -> Result<(), String> {
+    let signal_root = PathBuf::from(OPENCODE_ADOPTION_SIGNAL_ROOT);
+    let terminal_id = terminal_id.to_string();
+    thread::Builder::new()
+        .name(format!(
+            "opencode-adopt-{}",
+            terminal_id.chars().take(12).collect::<String>()
+        ))
+        .spawn(move || {
+            #[cfg(target_os = "linux")]
+            unsafe {
+                libc::setfsgid(provider_gid);
+                libc::setfsuid(provider_uid);
+                if libc::setfsuid(u32::MAX) != provider_uid as libc::c_int {
+                    tracing::warn!(terminal_id = %terminal_id, provider_uid,
+                        "managed_opencode.adoption_relay_identity_unavailable");
+                    return;
+                }
+            }
+            while !exited.load(Ordering::SeqCst) {
+                process_opencode_adoption_signals(
+                    &signal_root,
+                    &terminal_id,
+                    &adoption_gate,
+                    &native_session_id,
+                );
+                reap_stale_opencode_adoption_files(&signal_root, &terminal_id);
+                thread::sleep(Duration::from_millis(250));
+            }
+            remove_opencode_adoption_expectation_if_owned(
+                &signal_root,
+                &terminal_id,
+                &adoption_gate,
+            );
+        })
+        .map(|_| ())
+        .map_err(|error| format!("start OpenCode adoption observation relay: {error}"))
+}
+
+fn process_opencode_adoption_signals(
+    root: &Path,
+    terminal_id: &str,
+    adoption_gate: &Arc<Mutex<OpenCodeAdoptionGate>>,
+    native_session_id: &Arc<Mutex<Option<String>>>,
+) -> usize {
+    let mut accepted_count = 0;
+    for (path, observation) in opencode_adoption_signals(root, terminal_id) {
+        let accepted = adoption_gate
+            .lock()
+            .map(|mut gate| gate.observe(observation.clone()))
+            .unwrap_or(false);
+        if accepted {
+            accepted_count += 1;
+            if let Ok(mut slot) = native_session_id.lock() {
+                *slot = Some(observation.root_session_id.clone());
+            }
+            tracing::info!(terminal_id = %terminal_id,
+                root_session_id = %observation.root_session_id,
+                "managed_opencode.provider_observed");
+        } else {
+            tracing::debug!(terminal_id = %terminal_id,
+                "managed_opencode.adoption_observation_rejected");
+        }
+        let _ = std::fs::remove_file(path);
+    }
+    accepted_count
+}
+
+fn opencode_adoption_signals(
+    root: &Path,
+    terminal_id: &str,
+) -> Vec<(PathBuf, OpenCodeAdoptionObservation)> {
+    let prefix = format!("{terminal_id}__");
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return Vec::new();
+    };
+    let mut paths = entries
+        .flatten()
+        .filter_map(|entry| {
+            let name = entry.file_name().into_string().ok()?;
+            if !name.starts_with(&prefix) || !name.ends_with(".json") {
+                return None;
+            }
+            Some((name, entry.path()))
+        })
+        .collect::<Vec<_>>();
+    paths.sort_by(|left, right| left.0.cmp(&right.0));
+    let mut observations = Vec::new();
+    for (_, path) in paths {
+        if path_is_stale(&path, Duration::from_secs(600)) {
+            let _ = std::fs::remove_file(&path);
+            continue;
+        }
+        let Ok(raw) = std::fs::read(&path) else {
+            continue;
+        };
+        let Ok(signal) = serde_json::from_slice::<OpenCodeAdoptionSignalFile>(&raw) else {
+            let _ = std::fs::remove_file(&path);
+            continue;
+        };
+        let (Some(session_id), Some(observation)) =
+            (signal.session_id, signal.adoption_observation)
+        else {
+            let _ = std::fs::remove_file(&path);
+            continue;
+        };
+        if session_id == observation.root_session_id {
+            observations.push((path, observation));
+        } else {
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+    observations
+}
+
+fn reap_stale_opencode_adoption_files(root: &Path, terminal_id: &str) {
+    let prefix = format!("{terminal_id}__");
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name.starts_with(&prefix) && path_is_stale(&entry.path(), Duration::from_secs(600)) {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+}
+
+fn path_is_stale(path: &Path, max_age: Duration) -> bool {
+    std::fs::metadata(path)
+        .and_then(|metadata| metadata.modified())
+        .ok()
+        .and_then(|modified| modified.elapsed().ok())
+        .is_some_and(|age| age > max_age)
+}
+
+fn remove_opencode_adoption_expectation_if_owned(
+    root: &Path,
+    terminal_id: &str,
+    gate: &Arc<Mutex<OpenCodeAdoptionGate>>,
+) {
+    let Ok(gate) = gate.lock() else {
+        return;
+    };
+    let path = root.join(format!("{terminal_id}.expected.json"));
+    remove_opencode_adoption_expectation(&path, &gate.incarnation_id);
+}
+
+fn remove_opencode_adoption_expectation(path: &Path, incarnation_id: &IncarnationId) {
+    let Ok(raw) = std::fs::read(path) else {
+        return;
+    };
+    let Ok(file) = serde_json::from_slice::<OpenCodeAdoptionExpectationFileOwned>(&raw) else {
+        return;
+    };
+    if &file.incarnation_id == incarnation_id {
+        let _ = std::fs::remove_file(path);
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "snake_case")]
+struct OpenCodeAdoptionExpectationFileOwned {
+    incarnation_id: IncarnationId,
 }
 
 async fn run_codex_identity_events(
@@ -691,6 +1253,433 @@ mod managed_opencode_identity_tests {
 
         let ambiguous = vec![row("ses_a", "/repo", 1_100), row("ses_b", "/repo", 1_200)];
         assert_eq!(select_opencode_session(&ambiguous, "/repo", 1_000), None);
+    }
+}
+
+#[cfg(test)]
+mod managed_opencode_adoption_tests {
+    use super::{
+        begin_input_after_gate, process_opencode_adoption_signals, OpenCodeAdoptionGate,
+        OpenCodeAdoptionRevalidator,
+    };
+    use crate::command_journal::CommandJournal;
+    use freshell_agent_runtime::opencode_transfer::{CurrentOpenCodeEvidence, VerifiedRootTail};
+    use freshell_runtime_protocol::{
+        opencode_target_build_receipt, opencode_transfer_bundle_digest, IncarnationId,
+        OpenCodeAdoptionBaseline, OpenCodeAdoptionExpectation, OpenCodeAdoptionObservation,
+        OpenCodeMessagesRead, OpenCodeTransferDescriptor, OpenCodeTransferFile,
+        OpenCodeVerifiedRootTail, RequestId, RuntimeErrorCode,
+    };
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc, Mutex,
+    };
+
+    fn descriptor() -> OpenCodeTransferDescriptor {
+        use sha2::{Digest, Sha256};
+
+        let root_session_id = "ses_exactroot";
+        let source_store_id = "c".repeat(64);
+        let source_generation = "d".repeat(64);
+        let source_schema_fingerprint = "e".repeat(64);
+        let migration_journal_fingerprint = "f".repeat(64);
+        let payload = b"x";
+        let payload_sha256 = hex::encode(Sha256::digest(payload));
+        let manifest_json = serde_json::json!({
+            "version": 1,
+            "provider_schema": "opencode-1.18.21",
+            "root_session_id": root_session_id,
+            "source_store_id": source_store_id,
+            "source_schema_fingerprint": source_schema_fingerprint,
+            "migration_journal_fingerprint": migration_journal_fingerprint,
+            "sqlite_version": "test",
+            "row_count": 0,
+            "rows": [],
+            "assets": [],
+            "payload_bytes": payload.len(),
+            "payload_sha256": payload_sha256,
+            "generation": source_generation,
+        })
+        .to_string();
+        let files = vec![OpenCodeTransferFile {
+            index: 0,
+            relative_path: "payload.json".into(),
+            size_bytes: payload.len() as u64,
+            sha256: payload_sha256,
+        }];
+        let target_image_ref = format!("sha256:{}", "a".repeat(64));
+        let mut descriptor = OpenCodeTransferDescriptor {
+            transfer_id: "transfer-adoption-test".into(),
+            provider: "opencode".into(),
+            source_store_id,
+            root_session_id: root_session_id.into(),
+            source_generation,
+            provider_schema: "opencode-1.18.21".into(),
+            source_schema_fingerprint,
+            migration_journal_fingerprint,
+            destination_store_id: "store-adoption-test".into(),
+            destination_database_path: ".local/share/opencode/opencode.db".into(),
+            target_image_ref: target_image_ref.clone(),
+            target_build_receipt: opencode_target_build_receipt(
+                &target_image_ref,
+                "opencode-1.18.21",
+            ),
+            incarnation_id: "incarnation-import".into(),
+            manifest_json,
+            files,
+            total_bytes: payload.len() as u64,
+            bundle_sha256: String::new(),
+        };
+        descriptor.bundle_sha256 =
+            opencode_transfer_bundle_digest(&descriptor.manifest_json, &descriptor.files);
+        descriptor.validate().unwrap();
+        descriptor
+    }
+
+    fn expectation(root_tail: OpenCodeVerifiedRootTail) -> OpenCodeAdoptionExpectation {
+        let baseline_descriptor = descriptor();
+        let manifest_sha256 = {
+            use sha2::{Digest, Sha256};
+            hex::encode(Sha256::digest(baseline_descriptor.manifest_json.as_bytes()))
+        };
+        OpenCodeAdoptionExpectation {
+            baseline: OpenCodeAdoptionBaseline {
+                descriptor: baseline_descriptor,
+                manifest_sha256,
+            },
+            root_session_id: "ses_exactroot".into(),
+            root_tail,
+            evidence_generation: "a".repeat(64),
+            incarnation_id: IncarnationId::parse("incarnation-opencode-adoption").unwrap(),
+            launch_nonce: "b".repeat(32),
+        }
+    }
+
+    fn observation(expectation: &OpenCodeAdoptionExpectation) -> OpenCodeAdoptionObservation {
+        let (tail_message_id, messages_read) = match &expectation.root_tail {
+            OpenCodeVerifiedRootTail::Message { message_id } => {
+                (Some(message_id.clone()), OpenCodeMessagesRead::Success)
+            }
+            OpenCodeVerifiedRootTail::QualifiedEmpty => {
+                (None, OpenCodeMessagesRead::EmptyConfirmed)
+            }
+        };
+        OpenCodeAdoptionObservation {
+            terminal_id: "terminal-opencode-adoption".into(),
+            root_session_id: expectation.root_session_id.clone(),
+            tail_message_id,
+            evidence_generation: expectation.evidence_generation.clone(),
+            incarnation_id: expectation.incarnation_id.clone(),
+            launch_nonce: expectation.launch_nonce.clone(),
+            hydrated: true,
+            messages_read,
+        }
+    }
+
+    fn evidence(
+        expectation: &OpenCodeAdoptionExpectation,
+        generation: &str,
+        tail: OpenCodeVerifiedRootTail,
+    ) -> CurrentOpenCodeEvidence {
+        CurrentOpenCodeEvidence {
+            version: 1,
+            transfer_id: expectation.baseline.descriptor.transfer_id.clone(),
+            destination_store_id: expectation.baseline.descriptor.destination_store_id.clone(),
+            root_session_id: expectation.root_session_id.clone(),
+            import_generation: expectation.baseline.descriptor.source_generation.clone(),
+            evidence_generation: generation.to_owned(),
+            root_tail: match tail {
+                OpenCodeVerifiedRootTail::Message { message_id } => {
+                    VerifiedRootTail::Message { message_id }
+                }
+                OpenCodeVerifiedRootTail::QualifiedEmpty => VerifiedRootTail::QualifiedEmpty,
+            },
+            row_count: 0,
+            asset_count: 0,
+        }
+    }
+
+    fn gate_with_evidence(
+        expectation: OpenCodeAdoptionExpectation,
+        initial: CurrentOpenCodeEvidence,
+    ) -> (
+        OpenCodeAdoptionGate,
+        Arc<Mutex<CurrentOpenCodeEvidence>>,
+        Arc<AtomicUsize>,
+        tempfile::TempDir,
+    ) {
+        let current = Arc::new(Mutex::new(initial));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let verifier_current = Arc::clone(&current);
+        let verifier_calls = Arc::clone(&calls);
+        let verifier: OpenCodeAdoptionRevalidator = Arc::new(move |baseline| {
+            verifier_calls.fetch_add(1, Ordering::SeqCst);
+            baseline.validate().map_err(|error| error.message)?;
+            Ok(verifier_current.lock().unwrap().clone())
+        });
+        let signal_root = tempfile::tempdir().unwrap();
+        let uid = unsafe { libc::geteuid() };
+        let gid = unsafe { libc::getegid() };
+        let gate = OpenCodeAdoptionGate::new(
+            "terminal-opencode-adoption".into(),
+            expectation.incarnation_id.clone(),
+            expectation,
+            verifier,
+            signal_root.path().to_path_buf(),
+            uid,
+            gid,
+        )
+        .unwrap();
+        (gate, current, calls, signal_root)
+    }
+
+    #[test]
+    fn requested_resume_and_route_only_signal_do_not_release_input() {
+        let expected = expectation(OpenCodeVerifiedRootTail::Message {
+            message_id: "msg_current_tail".into(),
+        });
+        let initial = evidence(
+            &expected,
+            &expected.evidence_generation,
+            expected.root_tail.clone(),
+        );
+        let (mut gate, _, calls, _) = gate_with_evidence(expected.clone(), initial);
+
+        // The requested id is already known to the launcher, but no TUI
+        // observation has established that this process loaded that session.
+        assert!(!gate.input_allowed());
+
+        let mut route_only = observation(&expected);
+        route_only.hydrated = false;
+        assert!(!gate.observe(route_only));
+        assert!(!gate.input_allowed());
+        assert!(gate.observe(observation(&expected)));
+        assert!(!gate.input_allowed());
+        assert!(gate.release_input());
+        assert!(gate.input_allowed());
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert!(gate.release_input());
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn every_adoption_binding_and_fresh_hydrated_tail_must_match() {
+        let expected = expectation(OpenCodeVerifiedRootTail::Message {
+            message_id: "msg_current_tail".into(),
+        });
+        let initial = evidence(
+            &expected,
+            &expected.evidence_generation,
+            expected.root_tail.clone(),
+        );
+        let (mut gate, _, _, _) = gate_with_evidence(expected.clone(), initial);
+
+        let mut stale_or_mismatched = Vec::new();
+        let mut candidate = observation(&expected);
+        candidate.terminal_id = "another-terminal".into();
+        stale_or_mismatched.push(candidate);
+        let mut candidate = observation(&expected);
+        candidate.incarnation_id = IncarnationId::parse("incarnation-older-launch").unwrap();
+        stale_or_mismatched.push(candidate);
+        let mut candidate = observation(&expected);
+        candidate.launch_nonce = "c".repeat(32);
+        stale_or_mismatched.push(candidate);
+        let mut candidate = observation(&expected);
+        candidate.evidence_generation = "d".repeat(64);
+        stale_or_mismatched.push(candidate);
+        let mut candidate = observation(&expected);
+        candidate.root_session_id = "ses_wrong_root".into();
+        stale_or_mismatched.push(candidate);
+        let mut candidate = observation(&expected);
+        candidate.tail_message_id = Some("msg_old_tail".into());
+        stale_or_mismatched.push(candidate);
+        let mut candidate = observation(&expected);
+        candidate.hydrated = false;
+        stale_or_mismatched.push(candidate);
+        let mut candidate = observation(&expected);
+        candidate.messages_read = OpenCodeMessagesRead::Failed;
+        stale_or_mismatched.push(candidate);
+
+        for candidate in stale_or_mismatched {
+            assert!(!gate.observe(candidate));
+            assert!(!gate.input_allowed());
+        }
+
+        assert!(gate.observe(observation(&expected)));
+        assert!(!gate.input_allowed());
+        assert!(gate.release_input());
+        assert!(gate.input_allowed());
+    }
+
+    #[test]
+    fn empty_root_requires_explicit_successful_empty_read() {
+        let expected = expectation(OpenCodeVerifiedRootTail::QualifiedEmpty);
+        let initial = evidence(
+            &expected,
+            &expected.evidence_generation,
+            expected.root_tail.clone(),
+        );
+        let (mut gate, _, _, _) = gate_with_evidence(expected.clone(), initial);
+
+        let mut failed_read = observation(&expected);
+        failed_read.tail_message_id = None;
+        failed_read.messages_read = OpenCodeMessagesRead::Failed;
+        assert!(!gate.observe(failed_read));
+        assert!(!gate.input_allowed());
+
+        let mut false_empty = observation(&expected);
+        false_empty.tail_message_id = None;
+        false_empty.messages_read = OpenCodeMessagesRead::Success;
+        assert!(!gate.observe(false_empty));
+        assert!(!gate.input_allowed());
+
+        let mut positive_empty = observation(&expected);
+        positive_empty.tail_message_id = None;
+        positive_empty.messages_read = OpenCodeMessagesRead::EmptyConfirmed;
+        assert!(gate.observe(positive_empty));
+        assert!(!gate.input_allowed());
+        assert!(gate.release_input());
+        assert!(gate.input_allowed());
+    }
+
+    #[test]
+    fn changed_generation_rotates_expectation_and_requires_a_fresh_observation() {
+        let expected = expectation(OpenCodeVerifiedRootTail::Message {
+            message_id: "msg_current_tail".into(),
+        });
+        let initial = evidence(
+            &expected,
+            &expected.evidence_generation,
+            expected.root_tail.clone(),
+        );
+        let (mut gate, current, calls, signal_root) = gate_with_evidence(expected.clone(), initial);
+        let old_observation = observation(&expected);
+        assert!(gate.observe(old_observation.clone()));
+
+        let new_tail = OpenCodeVerifiedRootTail::Message {
+            message_id: "msg_new_tail".into(),
+        };
+        let new_generation = "c".repeat(64);
+        *current.lock().unwrap() = evidence(&expected, &new_generation, new_tail.clone());
+        assert!(!gate.release_input());
+        assert!(!gate.input_allowed());
+        assert!(gate.observation.is_none());
+        assert_eq!(gate.expectation.evidence_generation, new_generation);
+        assert_eq!(gate.expectation.root_tail, new_tail);
+        assert_ne!(gate.expectation.launch_nonce, expected.launch_nonce);
+
+        let published: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(
+                signal_root
+                    .path()
+                    .join("terminal-opencode-adoption.expected.json"),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(published["evidence_generation"], new_generation);
+        assert_eq!(published["launch_nonce"], gate.expectation.launch_nonce);
+        assert!(!gate.observe(old_observation));
+
+        let fresh_observation = observation(&gate.expectation);
+        assert!(gate.observe(fresh_observation));
+        assert!(gate.release_input());
+        assert_eq!(calls.load(Ordering::SeqCst), 4);
+    }
+
+    #[test]
+    fn blocked_input_does_not_claim_request_and_same_request_retries_after_observation() {
+        let expected = expectation(OpenCodeVerifiedRootTail::Message {
+            message_id: "msg_current_tail".into(),
+        });
+        let initial = evidence(
+            &expected,
+            &expected.evidence_generation,
+            expected.root_tail.clone(),
+        );
+        let (mut gate, _, _, _) = gate_with_evidence(expected.clone(), initial);
+        let state_dir = tempfile::tempdir().unwrap();
+        let mut journal = CommandJournal::open(state_dir.path()).unwrap();
+        let request_id = RequestId::new();
+
+        let error = begin_input_after_gate(&mut journal, &request_id, b"resume input", || {
+            Ok(gate.release_input())
+        })
+        .unwrap_err();
+        assert_eq!(error.code, RuntimeErrorCode::RecoveryBlocked);
+        assert!(!state_dir.path().join("command-journal.json").exists());
+
+        assert!(gate.observe(observation(&expected)));
+        assert_eq!(
+            begin_input_after_gate(&mut journal, &request_id, b"resume input", || {
+                Ok(gate.release_input())
+            })
+            .unwrap(),
+            super::BeginDisposition::Dispatch
+        );
+        assert_eq!(
+            journal
+                .existing_disposition(&request_id, b"resume input")
+                .unwrap(),
+            Some(super::BeginDisposition::Dispatch)
+        );
+    }
+
+    #[test]
+    fn stale_later_filename_does_not_mask_current_nonce_observation() {
+        let expected = expectation(OpenCodeVerifiedRootTail::Message {
+            message_id: "msg_current_tail".into(),
+        });
+        let initial = evidence(
+            &expected,
+            &expected.evidence_generation,
+            expected.root_tail.clone(),
+        );
+        let (gate, _, _, _) = gate_with_evidence(expected.clone(), initial);
+        let gate = Arc::new(Mutex::new(gate));
+        let native_session_id = Arc::new(Mutex::new(None));
+        let current = observation(&expected);
+        let mut stale = current.clone();
+        stale.launch_nonce = "c".repeat(32);
+        let root = tempfile::tempdir().unwrap();
+        for (filename, observation) in [
+            (
+                format!("terminal-opencode-adoption__{}.json", expected.launch_nonce),
+                current,
+            ),
+            (
+                format!("terminal-opencode-adoption__{}.json", stale.launch_nonce),
+                stale,
+            ),
+        ] {
+            std::fs::write(
+                root.path().join(filename),
+                serde_json::to_vec(&serde_json::json!({
+                    "session_id": observation.root_session_id.clone(),
+                    "adoption_observation": observation,
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+        }
+        assert_eq!(
+            process_opencode_adoption_signals(
+                root.path(),
+                "terminal-opencode-adoption",
+                &gate,
+                &native_session_id,
+            ),
+            1
+        );
+        assert_eq!(
+            native_session_id.lock().unwrap().as_deref(),
+            Some("ses_exactroot")
+        );
+        assert_eq!(
+            gate.lock().unwrap().observation.as_ref().unwrap(),
+            &observation(&expected)
+        );
+        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0);
     }
 }
 
