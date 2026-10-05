@@ -397,6 +397,12 @@ pub struct CompleteNativeImportInventory {
     inventory_fingerprint: String,
 }
 
+impl CompleteNativeImportInventory {
+    fn authority(&self) -> String {
+        format!("complete_source_inventory:{}", self.inventory_fingerprint)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NativeImportObservation {
     pub state: NativeImportState,
@@ -408,7 +414,22 @@ pub struct NativeImportObservation {
     pub complete_source_inventory: Option<CompleteNativeImportInventory>,
 }
 
+impl RecoveryWriteFence {
+    pub(crate) fn for_incarnation(mut self, incarnation_id: IncarnationId) -> Self {
+        self.active_incarnation_id = incarnation_id;
+        self
+    }
+}
+
 impl RecoveryContext {
+    pub(crate) fn permits_pristine_seed(&self) -> bool {
+        self.never_dispatched
+            && self.native_session_id.is_none()
+            && self
+                .native_import_state
+                .permits_pristine_seed(self.native_import_absence_is_authoritative())
+    }
+
     pub fn write_fence(&self) -> RecoveryWriteFence {
         RecoveryWriteFence {
             control_epoch: self.control_epoch,
@@ -430,7 +451,10 @@ impl RecoveryContext {
     pub fn native_import_absence_is_authoritative(&self) -> bool {
         self.native_import_state == NativeImportState::Absent
             && self.native_import_complete_inventory
-            && self.native_import_authority == "complete_source_inventory"
+            && self
+                .native_import_authority
+                .strip_prefix("complete_source_inventory:")
+                .is_some_and(is_lower_hex_sha256)
             && self
                 .native_import_source_store_id
                 .as_deref()
@@ -929,8 +953,34 @@ impl Registry {
     }
 
     pub async fn mark_running(&self, incarnation_id: IncarnationId) -> Result<(), RegistryError> {
+        let id = incarnation_id.clone();
+        let soul: String = self
+            .run_blocking(move |conn| {
+                Ok(conn.query_row(
+                    "SELECT soul_id FROM incarnations WHERE incarnation_id=?1",
+                    params![id.as_str()],
+                    |row| row.get(0),
+                )?)
+            })
+            .await?;
+        let soul =
+            SoulId::parse(soul).map_err(|_| RegistryError::Integrity("invalid soul id".into()))?;
+        let fence = self.recovery_write_fence(soul.clone()).await?;
+        self.mark_running_observed(soul, incarnation_id, fence)
+            .await
+            .map(|_| ())
+    }
+
+    pub(crate) async fn mark_running_observed(
+        &self,
+        soul: SoulId,
+        incarnation_id: IncarnationId,
+        fence: RecoveryWriteFence,
+    ) -> Result<RecoveryWriteFence, RegistryError> {
         self.run_blocking(move |mut conn| {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            validate_recovery_write_fence(&tx, &soul, &fence)?;
+            if incarnation_id != fence.active_incarnation_id { return Err(RegistryError::NativeIdentityConflict); }
             let now = now_millis();
             let changed = tx.execute(
                 "UPDATE incarnations SET launch_state='running',updated_at=?1 WHERE incarnation_id=?2 AND launch_state='starting' AND EXISTS (SELECT 1 FROM souls WHERE soul_id=incarnations.soul_id AND desired_state='running')",
@@ -978,8 +1028,9 @@ impl Registry {
                     }
                 }
             }
+            let successor = load_recovery_write_fence(&tx, &soul)?;
             tx.commit()?;
-            Ok(())
+            Ok(successor)
         }).await
     }
 
@@ -1395,6 +1446,7 @@ impl Registry {
         let fence = self.recovery_write_fence(soul_id.clone()).await?;
         self.record_native_session_fenced(soul_id, incarnation_id, native_session_id, fence)
             .await
+            .map(|_| ())
     }
 
     pub async fn record_native_session_fenced(
@@ -1403,13 +1455,16 @@ impl Registry {
         incarnation_id: IncarnationId,
         native_session_id: String,
         fence: RecoveryWriteFence,
-    ) -> Result<(), RegistryError> {
+    ) -> Result<RecoveryWriteFence, RegistryError> {
         if native_session_id.is_empty() || native_session_id.chars().any(char::is_control) {
             return Err(RegistryError::NativeIdentityConflict);
         }
         self.run_blocking(move |mut conn| {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
             validate_recovery_write_fence(&tx, &soul_id, &fence)?;
+            if incarnation_id != fence.active_incarnation_id {
+                return Err(RegistryError::NativeIdentityConflict);
+            }
             let (provider, store, existing, intent): (String, String, Option<String>, u64) = tx
                 .query_row(
                     "SELECT provider,provider_store_id,native_session_id,intent_revision FROM souls WHERE soul_id=?1",
@@ -1478,8 +1533,9 @@ impl Registry {
                     )?;
                 }
             }
+            let successor = load_recovery_write_fence(&tx, &soul_id)?;
             tx.commit()?;
-            Ok(())
+            Ok(successor)
         })
         .await
     }
@@ -1500,6 +1556,7 @@ impl Registry {
             fence,
         )
         .await
+        .map(|_| ())
     }
 
     pub async fn transition_native_session_fenced(
@@ -1509,7 +1566,7 @@ impl Registry {
         expected_parent: &str,
         child_session_id: &str,
         fence: RecoveryWriteFence,
-    ) -> Result<(), RegistryError> {
+    ) -> Result<RecoveryWriteFence, RegistryError> {
         let expected_parent = expected_parent.to_string();
         let child_session_id = child_session_id.to_string();
         if expected_parent.is_empty()
@@ -1523,6 +1580,9 @@ impl Registry {
         self.run_blocking(move |mut conn| {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
             validate_recovery_write_fence(&tx, &soul_id, &fence)?;
+            if incarnation_id != fence.active_incarnation_id {
+                return Err(RegistryError::NativeIdentityConflict);
+            }
             let (provider, store, existing, intent): (String, String, Option<String>, u64) = tx
                 .query_row(
                     "SELECT provider,provider_store_id,native_session_id,intent_revision FROM souls WHERE soul_id=?1",
@@ -1548,8 +1608,9 @@ impl Registry {
                 if claim.as_deref() != Some(incarnation_id.as_str()) {
                     return Err(RegistryError::NativeIdentityConflict);
                 }
+                let successor = load_recovery_write_fence(&tx, &soul_id)?;
                 tx.commit()?;
-                return Ok(());
+                return Ok(successor);
             }
             if existing.as_deref() != Some(expected_parent.as_str()) {
                 return Err(RegistryError::NativeIdentityConflict);
@@ -1613,8 +1674,9 @@ impl Registry {
             if updated != 1 {
                 return Err(RegistryError::NativeIdentityConflict);
             }
+            let successor = load_recovery_write_fence(&tx, &soul_id)?;
             tx.commit()?;
-            Ok(())
+            Ok(successor)
         }).await
     }
 
@@ -1733,6 +1795,101 @@ impl Registry {
             .await
     }
 
+    /// Refresh a known exact origin using trusted host inventory. The caller
+    /// captures context before discovery/I/O; completion never adopts a newer
+    /// identity, import generation, or user intent.
+    pub(crate) async fn refresh_native_import_inventory(
+        &self,
+        context: &RecoveryContext,
+        inventory: Result<
+            freshell_sessions::opencode_transfer::HostOpenCodeInventory,
+            freshell_sessions::opencode_transfer::TransferError,
+        >,
+    ) -> Result<RecoveryContext, RegistryError> {
+        if context.provider != "opencode"
+            || matches!(
+                context.native_import_state,
+                NativeImportState::NotApplicable
+                    | NativeImportState::LegacyUnknown
+                    | NativeImportState::Pending
+                    | NativeImportState::Partial
+            )
+        {
+            return Ok(context.clone());
+        }
+        let (Some(store), Some(root), Some(generation), Some(schema), Some(migration)) = (
+            context.native_import_source_store_id.clone(),
+            context.native_import_root_session_id.clone(),
+            context.native_import_source_generation.clone(),
+            context.native_import_schema_fingerprint.clone(),
+            context.native_import_migration_fingerprint.clone(),
+        ) else {
+            return Ok(context.clone());
+        };
+        let capture = context.clone();
+        let observation = tokio::task::spawn_blocking(move || {
+            let inspected =
+                inventory.and_then(|inventory| inventory.inspect_exact_origin(&store, &root));
+            let mut observation = NativeImportObservation {
+                state: NativeImportState::Unresolved,
+                source_store_id: Some(store.clone()),
+                root_session_id: Some(root.clone()),
+                source_generation: Some(generation.clone()),
+                schema_fingerprint: Some(schema.clone()),
+                migration_fingerprint: Some(migration.clone()),
+                complete_source_inventory: None,
+            };
+            match inspected {
+                Ok(found) if found.available() => observation.state = NativeImportState::Available,
+                Ok(found)
+                    if found.source_store_id() == store
+                        && found.root_session_id() == root
+                        && found.schema_fingerprint() == schema
+                        && found.migration_fingerprint() == migration =>
+                {
+                    observation.state = NativeImportState::Absent;
+                    observation.complete_source_inventory = Some(CompleteNativeImportInventory {
+                        source_store_id: store,
+                        root_session_id: root,
+                        source_generation: generation,
+                        schema_fingerprint: schema,
+                        migration_fingerprint: migration,
+                        inventory_fingerprint: found.inventory_fingerprint().into(),
+                    });
+                }
+                _ => {}
+            }
+            observation
+        })
+        .await
+        .map_err(|error| {
+            RegistryError::Integrity(format!("native source inventory worker failed: {error}"))
+        })?;
+        let state = observation.state;
+        let complete = observation.complete_source_inventory.is_some();
+        let authority = observation
+            .complete_source_inventory
+            .as_ref()
+            .map(CompleteNativeImportInventory::authority)
+            .unwrap_or_else(|| "provider_import_probe".into());
+        let revision = self
+            .record_native_import_observation(
+                capture.soul_id.clone(),
+                capture.write_fence(),
+                observation,
+            )
+            .await?;
+        let mut successor = capture;
+        if revision != successor.native_import_revision {
+            successor.evidence_revision += 1;
+        }
+        successor.native_import_revision = revision;
+        successor.native_import_state = state;
+        successor.native_import_complete_inventory = complete;
+        successor.native_import_authority = authority;
+        Ok(successor)
+    }
+
     pub async fn record_native_import_observation(
         &self,
         soul_id: SoulId,
@@ -1748,7 +1905,7 @@ impl Registry {
         let complete_inventory = complete_source_inventory.is_some();
         self.run_blocking(move |mut conn| {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            validate_recovery_write_fence(&tx, &soul_id, &fence)?;
+            validate_recovery_context_fence(&tx, &soul_id, &fence)?;
             let (
                 provider,
                 existing_state,
@@ -1757,8 +1914,8 @@ impl Registry {
                 existing_generation,
                 existing_schema,
                 existing_migration,
-                existing_complete,
-                existing_authority,
+                _existing_complete,
+                _existing_authority,
                 current_revision,
             ): NativeImportObservationRow = tx.query_row(
                 "SELECT provider,native_import_state,native_import_source_store_id,native_import_root_session_id,native_import_source_generation,native_import_schema_fingerprint,native_import_migration_fingerprint,native_import_complete_inventory,native_import_authority,native_import_revision FROM souls WHERE soul_id=?1",
@@ -1778,7 +1935,7 @@ impl Registry {
                             "not-applicable native import observation must not name a source".into(),
                         ));
                     }
-                    "no_import_configured"
+                    "no_import_configured".to_string()
                 }
                 NativeImportState::Absent => {
                     let exact_proof = complete_source_inventory.as_ref().is_some_and(|proof| {
@@ -1801,7 +1958,7 @@ impl Registry {
                             "absent native import requires a complete inventory for an exact source generation".into(),
                         ));
                     }
-                    "complete_source_inventory"
+                    complete_source_inventory.as_ref().expect("validated complete inventory").authority()
                 }
                 NativeImportState::LegacyUnknown => {
                     return Err(RegistryError::InvalidState(
@@ -1824,7 +1981,7 @@ impl Registry {
                             "completed native import requires an exact source generation".into(),
                         ));
                     }
-                    "provider_import_probe"
+                    "provider_import_probe".to_string()
                 }
             };
             if observation.state == NativeImportState::NotApplicable
@@ -1863,18 +2020,8 @@ impl Registry {
                     source_generation.as_deref(),
                 )?;
             }
-            let same_observation = existing_state == observation.state.as_str()
-                && existing_store == source_store_id
-                && existing_root == root_session_id
-                && existing_generation == source_generation
-                && existing_schema == schema_fingerprint
-                && existing_migration == migration_fingerprint
-                && existing_complete == complete_inventory
-                && existing_authority == authority;
-            if same_observation {
-                tx.commit()?;
-                return Ok(current_revision);
-            }
+            // Every completed census advances the fence, even if its verdict
+            // is unchanged; otherwise an older in-flight negative can still win.
             let next_revision = current_revision
                 .checked_add(1)
                 .ok_or_else(|| RegistryError::Integrity("native import revision overflow".into()))?;
@@ -1953,20 +2100,43 @@ impl Registry {
         .await
     }
 
+    #[cfg(test)]
     pub async fn begin_recovery(
         &self,
         soul_id: SoulId,
         trigger: RecoveryTrigger,
         path: RecoveryPath,
     ) -> Result<RecoveryStart, RegistryError> {
+        let fence = self.recovery_context(soul_id.clone()).await?.write_fence();
+        self.begin_recovery_fenced(soul_id, trigger, path, fence)
+            .await
+    }
+
+    pub async fn begin_recovery_fenced(
+        &self,
+        soul_id: SoulId,
+        trigger: RecoveryTrigger,
+        path: RecoveryPath,
+        fence: RecoveryWriteFence,
+    ) -> Result<RecoveryStart, RegistryError> {
         let installation = self.installation_id().clone();
         self.run_blocking(move |mut conn| {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            validate_recovery_revision_fence(&tx, &soul_id, &fence)?;
             let context = load_recovery_context(&tx, installation, &soul_id)?;
+            if context.write_fence() != fence {
+                return Err(RegistryError::InvalidState("recovery probe is stale".into()));
+            }
             if context.desired_state == DesiredState::Stopped {
                 return Err(RegistryError::RecoveryBlocked {
                     soul_id,
                     reason: "STOP_INTENT".into(),
+                });
+            }
+            if path == RecoveryPath::PristineSeed && !context.permits_pristine_seed() {
+                return Err(RegistryError::RecoveryBlocked {
+                    soul_id,
+                    reason: "PRISTINE_SEED_NO_LONGER_SAFE".into(),
                 });
             }
             if context.recovery_state == RecoveryState::Recovering {
@@ -2063,6 +2233,18 @@ impl Registry {
                     }),
                     other => Err(other),
                 };
+            }
+            if path == RecoveryPath::PristineSeed {
+                let never_dispatched: bool = tx.query_row(
+                    "SELECT native_session_id IS NULL AND NOT EXISTS(SELECT 1 FROM input_commands WHERE soul_id=?1 AND state IN ('dispatching','completed','ambiguous')) FROM souls WHERE soul_id=?1",
+                    params![start.context.soul_id.as_str()], |row| row.get(0),
+                )?;
+                if !never_dispatched || !start.context.permits_pristine_seed() {
+                    return Err(RegistryError::RecoveryBlocked {
+                        soul_id: start.context.soul_id,
+                        reason: "PRISTINE_SEED_NO_LONGER_SAFE".into(),
+                    });
+                }
             }
             let (old_state, old_cleanup): (String, String) = tx.query_row(
                 "SELECT launch_state,cleanup_state FROM incarnations WHERE incarnation_id=?1",
@@ -2268,12 +2450,14 @@ impl Registry {
         attempt_id: Option<RecoveryAttemptId>,
         reason: RecoveryBlockReason,
         evidence: Vec<String>,
+        fence: RecoveryWriteFence,
     ) -> Result<(), RegistryError> {
         self.finish_recovery_blocked(
             soul_id,
             attempt_id,
             recovery_block_reason_name(reason),
             evidence,
+            fence,
         )
         .await
     }
@@ -2284,9 +2468,14 @@ impl Registry {
         attempt_id: Option<RecoveryAttemptId>,
         reason: String,
         evidence: Vec<String>,
+        fence: RecoveryWriteFence,
     ) -> Result<(), RegistryError> {
         self.run_blocking(move |mut conn| {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            validate_recovery_context_fence(&tx, &soul_id, &fence)?;
+            if fence.recovery_attempt_id != attempt_id {
+                return Err(RegistryError::InvalidState("blocked recovery attempt changed".into()));
+            }
             let now = now_millis();
             let attempt_id_param = attempt_id.as_ref().map(RecoveryAttemptId::as_str);
             let updated = tx.execute(
@@ -3422,6 +3611,24 @@ fn load_recovery_write_fence(
     })
 }
 
+fn validate_recovery_context_fence(
+    tx: &rusqlite::Transaction<'_>,
+    soul_id: &SoulId,
+    fence: &RecoveryWriteFence,
+) -> Result<(), RegistryError> {
+    validate_recovery_revision_fence(tx, soul_id, fence)?;
+    let latest: String = tx.query_row(
+        "SELECT incarnation_id FROM incarnations WHERE soul_id=?1 ORDER BY CASE WHEN launch_state IN ('prepared','created','starting','running','stopping') THEN 0 ELSE 1 END,created_at DESC,rowid DESC LIMIT 1",
+        params![soul_id.as_str()], |row| row.get(0),
+    )?;
+    if latest != fence.active_incarnation_id.as_str() {
+        return Err(RegistryError::InvalidState(
+            "recovery observation incarnation changed".into(),
+        ));
+    }
+    Ok(())
+}
+
 fn validate_recovery_write_fence(
     tx: &rusqlite::Transaction<'_>,
     soul_id: &SoulId,
@@ -3974,7 +4181,7 @@ pub(crate) fn failpoint(_name: &'static str) -> Result<(), RegistryError> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     fn limits() -> RuntimeLimits {
@@ -4579,7 +4786,10 @@ mod tests {
         assert!(registry.opencode_transfer_stage_references().await.is_err());
     }
 
-    async fn materialize_test_runtime(registry: &Registry, soul_id: SoulId) -> PreparedLaunch {
+    pub(crate) async fn materialize_test_runtime(
+        registry: &Registry,
+        soul_id: SoulId,
+    ) -> PreparedLaunch {
         let prepared = registry
             .prepare_launch(prep(soul_id, RequestId::new(), "materialized"))
             .await
@@ -5432,6 +5642,443 @@ mod tests {
         assert_eq!(native, None);
     }
 
+    pub(crate) fn native_inventory_fixture(path: &std::path::Path) -> rusqlite::Connection {
+        const TEST_MIGRATIONS: &[&str] = &[
+            "20260127222353_familiar_lady_ursula",
+            "20260211171708_add_project_commands",
+            "20260213144116_wakeful_the_professor",
+            "20260225215848_workspace",
+            "20260227213759_add_session_workspace_id",
+            "20260228203230_blue_harpoon",
+            "20260303231226_add_workspace_fields",
+            "20260309230000_move_org_to_state",
+            "20260312043431_session_message_cursor",
+            "20260323234822_events",
+            "20260410174513_workspace-name",
+            "20260413175956_chief_energizer",
+            "20260423070820_add_icon_url_override",
+            "20260427172553_slow_nightmare",
+            "20260428004200_add_session_path",
+            "20260501142318_next_venus",
+            "20260504145000_add_sync_owner",
+            "20260507164347_add_workspace_time",
+            "20260510033149_session_usage",
+            "20260511000411_data_migration_state",
+            "20260511173437_session-metadata",
+            "20260601010001_normalize_storage_paths",
+            "20260601202201_amazing_prowler",
+            "20260602002951_lowly_union_jack",
+            "20260602182828_add_project_directories",
+            "20260603001617_session_message_projection_indexes",
+            "20260603040000_session_message_projection_order",
+            "20260603141458_session_input_inbox",
+            "20260603160727_jittery_ezekiel_stane",
+            "20260604172448_event_sourced_session_input",
+            "20260605003541_add_session_context_snapshot",
+            "20260605042240_add_context_epoch_agent",
+            "20260611035744_credential",
+            "20260611192811_lush_chimera",
+            "20260612174303_project_dir_strategy",
+            "20260622142730_simplify_session_context_epoch",
+            "20260622170816_reset_v2_session_state",
+            "20260622202450_simplify_session_input",
+        ];
+
+        let db = rusqlite::Connection::open(path).unwrap();
+        db.execute_batch(include_str!(
+            "../../freshell-sessions/src/opencode_schema_v1_18_21.sql"
+        ))
+        .unwrap();
+        for (index, migration) in TEST_MIGRATIONS.iter().enumerate() {
+            db.execute(
+                "INSERT INTO migration(id,time_completed) VALUES (?1,?2)",
+                params![migration, index as i64],
+            )
+            .unwrap();
+        }
+        db
+    }
+
+    #[tokio::test]
+    async fn production_native_inventory_refresh_preserves_authority_and_rejects_reordering() {
+        use freshell_sessions::opencode_transfer::HostOpenCodeInventory;
+        let dir = tempfile::tempdir().unwrap();
+        let source_path = dir.path().join("opencode.db");
+        let db = native_inventory_fixture(&source_path);
+        let store = format!(
+            "{:x}",
+            Sha256::digest(
+                source_path
+                    .canonicalize()
+                    .unwrap()
+                    .to_string_lossy()
+                    .as_bytes()
+            )
+        );
+        let inventory = HostOpenCodeInventory::new(source_path.clone());
+        let census = inventory.inspect_exact_origin(&store, "ses_exact").unwrap();
+        let registry = Registry::open(dir.path().join("registry"), None).unwrap();
+        let soul = SoulId::new();
+        materialize_test_runtime(&registry, soul.clone()).await;
+        open_connection(&registry.inner.db_path).unwrap().execute(
+            "UPDATE souls SET provider='opencode',native_session_id='ses_exact',native_import_state='completed',native_import_source_store_id=?1,native_import_root_session_id='ses_exact',native_import_source_generation=?2,native_import_schema_fingerprint=?3,native_import_migration_fingerprint=?4 WHERE soul_id=?5",
+            params![store, "e".repeat(64), census.schema_fingerprint(), census.migration_fingerprint(), soul.as_str()],
+        ).unwrap();
+        let captured = registry.recovery_context(soul.clone()).await.unwrap();
+        let absent = registry
+            .refresh_native_import_inventory(&captured, Ok(inventory.clone()))
+            .await
+            .unwrap();
+        assert_eq!(
+            absent.native_import_state,
+            NativeImportState::Absent,
+            "qualified complete absence must be produced through the refresh path"
+        );
+        assert!(absent.native_import_absence_is_authoritative());
+        assert!(
+            registry
+                .recovery_context(soul.clone())
+                .await
+                .unwrap()
+                .native_import_authority
+                .ends_with(census.inventory_fingerprint()),
+            "accepted source census binding must survive reloading the registry"
+        );
+
+        let supervisor = crate::recovery::tests::missing_supervisor(&dir, registry.clone());
+        let negative = crate::recovery::tests::absent_native_probe();
+        let paths = supervisor
+            .collect_loss_path_evidence(&absent, &negative)
+            .await
+            .unwrap();
+        assert!(paths
+            .iter()
+            .any(|row| row.path == RecoveryPath::NativeImport
+                && row.verdict
+                    == freshell_runtime_protocol::RecoveryEvidenceVerdict::DefinitiveNegative));
+
+        db.execute("INSERT INTO project(id,worktree,time_created,time_updated,sandboxes) VALUES ('prj','/synthetic',1,1,'[]')", []).unwrap();
+        db.execute("INSERT INTO session(id,slug,project_id,directory,title,version,time_created,time_updated) VALUES ('ses_exact','slug','prj','/synthetic','synthetic','1',1,1)", []).unwrap();
+        let available = registry
+            .refresh_native_import_inventory(&absent, Ok(inventory.clone()))
+            .await
+            .unwrap();
+        assert_eq!(available.native_import_state, NativeImportState::Available);
+        assert!(!available.native_import_absence_is_authoritative());
+        assert!(matches!(
+            supervisor
+                .collect_loss_path_evidence(&available, &negative)
+                .await,
+            Err(freshell_runtime_protocol::RecoveryProbe::Blocked {
+                path: RecoveryPath::NativeImport,
+                ..
+            })
+        ));
+
+        assert!(
+            registry
+                .refresh_native_import_inventory(&captured, Ok(inventory.clone()))
+                .await
+                .is_err(),
+            "reordered refresh must not supersede accepted evidence"
+        );
+        let partial = inventory
+            .with_channel_database(source_path)
+            .with_channel_database(dir.path().join("missing.db"));
+        let unresolved = registry
+            .refresh_native_import_inventory(&available, Ok(partial))
+            .await
+            .unwrap();
+        assert_eq!(
+            unresolved.native_import_state,
+            NativeImportState::Unresolved
+        );
+        assert!(!unresolved.native_import_absence_is_authoritative());
+        let discovery_error = freshell_sessions::opencode_transfer::TransferError::Io(
+            "synthetic discovery denied".into(),
+        );
+        let unresolved_again = registry
+            .refresh_native_import_inventory(&unresolved, Err(discovery_error))
+            .await
+            .unwrap();
+        assert_eq!(
+            unresolved_again.native_import_state,
+            NativeImportState::Unresolved
+        );
+        assert!(
+            unresolved_again.native_import_revision > unresolved.native_import_revision,
+            "even repeated same-state refreshes must invalidate older in-flight observations"
+        );
+    }
+
+    #[tokio::test]
+    async fn recovery_begin_rejects_probe_to_begin_revision_races() {
+        for column in [
+            "identity_revision",
+            "evidence_revision",
+            "native_import_revision",
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let registry = Registry::open(dir.path(), None).unwrap();
+            let soul = SoulId::new();
+            materialize_test_runtime(&registry, soul.clone()).await;
+            let context = registry.recovery_context(soul.clone()).await.unwrap();
+            open_connection(&registry.inner.db_path)
+                .unwrap()
+                .execute(
+                    &format!("UPDATE souls SET {column}={column}+1 WHERE soul_id=?1"),
+                    params![soul.as_str()],
+                )
+                .unwrap();
+            assert!(
+                registry
+                    .begin_recovery_fenced(
+                        soul.clone(),
+                        RecoveryTrigger::ProviderExit,
+                        RecoveryPath::PristineSeed,
+                        context.write_fence()
+                    )
+                    .await
+                    .is_err(),
+                "{column} changed since probe"
+            );
+            assert_eq!(
+                registry
+                    .recovery_context(soul)
+                    .await
+                    .unwrap()
+                    .recovery_state,
+                RecoveryState::Live
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn seed_replacement_rechecks_input_journal_before_preparation() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry = Registry::open(dir.path(), None).unwrap();
+        let soul = SoulId::new();
+        let launch = materialize_test_runtime(&registry, soul.clone()).await;
+        let request = RequestId::new();
+        registry
+            .begin_input(soul.clone(), request.clone(), b"synthetic input", None)
+            .await
+            .unwrap();
+        let start = registry
+            .begin_recovery(
+                soul.clone(),
+                RecoveryTrigger::ProviderExit,
+                RecoveryPath::PristineSeed,
+            )
+            .await
+            .unwrap();
+        registry
+            .mark_input_ambiguous(soul.clone(), request)
+            .await
+            .unwrap();
+        registry
+            .mark_stop_outcome(launch.incarnation_id, StopOutcome::VerifiedEmpty)
+            .await
+            .unwrap();
+        assert!(
+            registry
+                .prepare_replacement(start, None, None, None, RecoveryPath::PristineSeed)
+                .await
+                .is_err(),
+            "seed eligibility must be checked in the replacement transaction"
+        );
+    }
+
+    #[tokio::test]
+    async fn delayed_reattach_rejects_source_import_and_identity_changes() {
+        for column in [
+            "identity_revision",
+            "evidence_revision",
+            "native_import_revision",
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let registry = Registry::open(dir.path(), None).unwrap();
+            let soul = SoulId::new();
+            let launch = materialize_test_runtime(&registry, soul.clone()).await;
+            let context = registry.recovery_context(soul.clone()).await.unwrap();
+            open_connection(&registry.inner.db_path).unwrap().execute(&format!("UPDATE souls SET {column}={column}+1,recovery_state='blocked' WHERE soul_id=?1"), params![soul.as_str()]).unwrap();
+            assert!(registry
+                .mark_recovery_live(soul.clone(), launch.incarnation_id, context.write_fence())
+                .await
+                .is_err());
+            assert_eq!(
+                registry
+                    .recovery_context(soul)
+                    .await
+                    .unwrap()
+                    .recovery_state,
+                RecoveryState::Blocked
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn recovery_seed_rejects_identity_observed_after_probe() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry = Registry::open(dir.path(), None).unwrap();
+        let soul = SoulId::new();
+        let original = materialize_test_runtime(&registry, soul.clone()).await;
+        let snapshot = registry.recovery_context(soul.clone()).await.unwrap();
+        assert!(snapshot.never_dispatched);
+        registry
+            .record_native_session(
+                soul.clone(),
+                original.incarnation_id.clone(),
+                "ses_materialized".into(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            registry
+                .begin_recovery(
+                    soul.clone(),
+                    RecoveryTrigger::ProviderExit,
+                    RecoveryPath::PristineSeed
+                )
+                .await
+                .is_err(),
+            "an observed identity must never be retired for a seed"
+        );
+        assert_eq!(
+            registry.inventory().await.unwrap()[0].launch_state,
+            LaunchState::Running
+        );
+    }
+
+    #[tokio::test]
+    async fn terminal_response_cannot_reverse_a_newer_native_transition() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry = Registry::open(dir.path(), None).unwrap();
+        let soul = SoulId::new();
+        let original = materialize_test_runtime(&registry, soul.clone()).await;
+        let mut terminal = opencode_terminal(&opencode_transfer_descriptor("test"), "attempt");
+        terminal.opencode_transfer = None;
+        terminal.resume_session_id = None;
+        let conn = open_connection(&registry.inner.db_path).unwrap();
+        conn.execute(
+            "UPDATE souls SET provider='opencode' WHERE soul_id=?1",
+            params![soul.as_str()],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE incarnations SET terminal_spec=?1 WHERE incarnation_id=?2",
+            params![
+                serde_json::to_string(&terminal).unwrap(),
+                original.incarnation_id.as_str()
+            ],
+        )
+        .unwrap();
+        registry
+            .record_native_session(soul.clone(), original.incarnation_id, "ses_A".into())
+            .await
+            .unwrap();
+        let pending_read = registry.recovery_context(soul.clone()).await.unwrap();
+        crate::service::record_terminal_identity_observation(&registry, &pending_read, "ses_B")
+            .await
+            .unwrap();
+        assert!(
+            crate::service::record_terminal_identity_observation(&registry, &pending_read, "ses_A")
+                .await
+                .is_err(),
+            "late A output must not undo the accepted A-to-B transition"
+        );
+        assert_eq!(
+            registry
+                .recovery_context(soul)
+                .await
+                .unwrap()
+                .native_session_id
+                .as_deref(),
+            Some("ses_B")
+        );
+    }
+
+    #[tokio::test]
+    async fn identity_fence_rejects_supplied_old_incarnation() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry = Registry::open(dir.path(), None).unwrap();
+        let soul = SoulId::new();
+        let old = materialize_test_runtime(&registry, soul.clone()).await;
+        registry
+            .mark_stop_outcome(old.incarnation_id.clone(), StopOutcome::VerifiedEmpty)
+            .await
+            .unwrap();
+        let current = materialize_test_runtime(&registry, soul.clone()).await;
+        let fence = registry.recovery_write_fence(soul.clone()).await.unwrap();
+        assert_ne!(old.incarnation_id, current.incarnation_id);
+        assert!(
+            registry
+                .record_native_session_fenced(
+                    soul.clone(),
+                    old.incarnation_id,
+                    "ses_stale".into(),
+                    fence
+                )
+                .await
+                .is_err(),
+            "the supplied incarnation must equal the captured active incarnation"
+        );
+        assert_eq!(
+            registry
+                .recovery_context(soul)
+                .await
+                .unwrap()
+                .native_session_id,
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn blocked_verdict_rejects_same_attempt_newer_import_evidence() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry = Registry::open(dir.path(), None).unwrap();
+        let soul = SoulId::new();
+        materialize_test_runtime(&registry, soul.clone()).await;
+        let start = registry
+            .begin_recovery(
+                soul.clone(),
+                RecoveryTrigger::ProviderExit,
+                RecoveryPath::PristineSeed,
+            )
+            .await
+            .unwrap();
+        open_connection(&registry.inner.db_path)
+            .unwrap()
+            .execute(
+                "UPDATE souls SET native_import_revision=native_import_revision+1 WHERE soul_id=?1",
+                params![soul.as_str()],
+            )
+            .unwrap();
+        assert!(
+            registry
+                .mark_recovery_blocked(
+                    soul.clone(),
+                    Some(start.attempt_id.clone()),
+                    RecoveryBlockReason::ProviderUnavailable,
+                    vec!["delayed negative".into()],
+                    start
+                        .context
+                        .write_fence_for_attempt(start.attempt_id.clone())
+                )
+                .await
+                .is_err(),
+            "same attempt does not authorize stale evidence"
+        );
+        assert_eq!(
+            registry
+                .recovery_context(soul)
+                .await
+                .unwrap()
+                .recovery_state,
+            RecoveryState::Recovering
+        );
+    }
+
     #[tokio::test]
     async fn stop_intent_fences_a_recovery_attempt_before_replacement() {
         let dir = tempfile::tempdir().unwrap();
@@ -5770,6 +6417,9 @@ mod tests {
                 Some(start.attempt_id.clone()),
                 RecoveryBlockReason::ProviderUnavailable,
                 vec!["late result".into()],
+                start
+                    .context
+                    .write_fence_for_attempt(start.attempt_id.clone()),
             )
             .await
             .is_err());
