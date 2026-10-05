@@ -1,5 +1,7 @@
 import fs from 'fs/promises'
 import path from 'path'
+import os from 'node:os'
+import { fileURLToPath } from 'node:url'
 import type { Browser, BrowserContext } from '@playwright/test'
 import { createFreshE2ePage, test as base, expect } from '../helpers/fixtures.js'
 import { createE2eServerHandle } from '../helpers/external-target.js'
@@ -10,7 +12,8 @@ import {
   isCloudLaneWindowConfigured,
   TestHarness,
 } from '../helpers/test-harness.js'
-import { writeCodexContinuationFixtures, writeCodexRolloutFixture } from '../helpers/session-corpus/codex.js'
+import { installDualRoleCodexCli } from '../fixtures/codex-dual-role.js'
+import { writeCodexContinuationFixtures, writeCodexReferencedHistoryFixture, writeCodexRolloutFixture } from '../helpers/session-corpus/codex.js'
 
 /**
  *
@@ -81,6 +84,7 @@ function rrx7ContinuationSegments() {
 async function bootCodexBrowserPage(
   browser: Browser,
   setupHome: (homeDir: string) => Promise<void>,
+  env?: Record<string, string>,
 ): Promise<{
   server: RustServer
   context: BrowserContext
@@ -89,6 +93,7 @@ async function bootCodexBrowserPage(
 }> {
   const server = new RustServer({
     setupHome,
+    env,
     verbose: process.env.FRESHELL_E2E_SERVER_VERBOSE === '1',
   })
   let context: BrowserContext | undefined
@@ -363,6 +368,176 @@ const test = base.extend({
     await use(server)
     await server.stop()
   }, { scope: 'worker' }],
+})
+
+test.describe('Codex referenced rollout history', () => {
+  test.setTimeout(180_000)
+
+  test('referenced Codex history uses selected prefixes for search and resumes the logical session', async ({ browser }) => {
+    const sessionId = '11111111-1111-7111-8111-111111111111'
+    const selectedRolloutId = '22222222-2222-7222-8222-222222222222'
+    const unselectedRolloutId = '33333333-3333-7333-8333-333333333333'
+    const createdAt = Date.parse('2026-09-28T14:00:00.000Z')
+    const retained = { query: 'referenced-retained-prefix-needle', text: 'Continue referenced-retained-prefix-needle with café notes.' }
+    const selected = { query: 'referenced-selected-head-needle', text: 'Continue referenced-selected-head-needle in the selected branch.' }
+    const discarded = { query: 'referenced-discarded-tail-needle', text: 'Discard referenced-discarded-tail-needle from the original tail.' }
+    const unselected = { query: 'referenced-unselected-branch-needle', text: 'Ignore referenced-unselected-branch-needle from the newer unselected branch.' }
+    const sharedRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'freshell-referenced-codex-'))
+    const cwd = path.join(sharedRoot, 'project')
+    const argvLog = path.join(sharedRoot, 'codex-argv.jsonl')
+    let owned: Awaited<ReturnType<typeof bootCodexBrowserPage>> | undefined
+
+    try {
+      await fs.mkdir(cwd, { recursive: true })
+      const fakeCodex = await installDualRoleCodexCli(
+        path.join(sharedRoot, 'bin'),
+        fileURLToPath(new URL('../fixtures/fake-codex-cli.mjs', import.meta.url)),
+        { FAKE_CODEX_ARGV_LOG: argvLog },
+      )
+      const serverEnv: Record<string, string> = { CODEX_CMD: fakeCodex }
+      owned = await bootCodexBrowserPage(browser, async (homeDir) => {
+        const fixture = await writeCodexReferencedHistoryFixture(homeDir, {
+          sessionId,
+          selectedRolloutId,
+          unselectedRolloutId,
+          cwd,
+          createdAt,
+          retainedUserText: retained.text,
+          selectedUserText: selected.text,
+          discardedUserText: discarded.text,
+          unselectedUserText: unselected.text,
+        })
+        serverEnv.FAKE_CODEX_APP_SERVER_BEHAVIOR = JSON.stringify({
+          threadResumeRolloutPath: fixture.selectedFile,
+        })
+      }, serverEnv)
+      const { page, info } = owned
+      const harness = new TestHarness(page)
+      const sidebarRow = page.locator(
+        `[data-context="sidebar-session"][data-provider="codex"][data-session-id="${sessionId}"]`,
+      )
+
+      await test.step('show one session from the authoritative selected rollout', async () => {
+        await expect(page.getByTestId('sidebar-session-list')).toBeVisible()
+        const response = await page.request.get(
+          `${info.baseUrl}/api/session-directory?priority=visible&limit=50`,
+          { headers: { 'x-auth-token': info.token }, timeout: 30_000 },
+        )
+        expect(response.ok()).toBe(true)
+        const payload = await response.json()
+        expect(payload.integrityError).toBeUndefined()
+        const sessions = payload.items.filter((item: { provider: string; sessionId: string }) =>
+          item.provider === 'codex' && item.sessionId === sessionId)
+        expect(sessions).toHaveLength(1)
+        expect(sessions[0]).toMatchObject({
+          createdAt,
+          lastActivityAt: createdAt + 63_000,
+          cwd,
+          firstUserMessage: 'Referenced history opening request',
+        })
+        for (const { query } of [retained, selected, discarded, unselected]) {
+          for (const value of [sessions[0].title, sessions[0].summary, sessions[0].firstUserMessage, sessions[0].projectPath, sessions[0].cwd]) {
+            expect((value ?? '').toLowerCase()).not.toContain(query)
+          }
+        }
+        await expect(sidebarRow).toHaveCount(1)
+        await expect(sidebarRow).toBeVisible()
+        await expect(page.getByText(/conflicting saved session/)).toHaveCount(0)
+      })
+
+      await test.step('search only retained prefix and selected head messages', async () => {
+        const search = page.getByPlaceholder('Search...', { exact: true })
+        const searchTier = page.getByRole('combobox', { name: 'Search tier' })
+        const waitForApplied = async (query: string, tier: string) => {
+          await expect.poll(async () => {
+            const window = (await harness.getState()).sessions?.windows?.sidebar
+            return {
+              query: window?.appliedQuery,
+              tier: window?.appliedSearchTier,
+              loading: window?.loading,
+              pending: window?.deepSearchPending,
+            }
+          }, { timeout: 15_000 }).toEqual({ query, tier, loading: false, pending: false })
+        }
+        const runSearch = async (query: string, tier: string) => {
+          const responsePromise = page.waitForResponse((response) => {
+            const url = new URL(response.url())
+            return url.pathname === '/api/session-directory'
+              && url.searchParams.get('query') === query
+              && url.searchParams.get('tier') === tier
+              && response.request().method() === 'GET'
+          }, { timeout: 15_000 })
+          await search.fill(query)
+          await expect(searchTier).toBeVisible()
+          await searchTier.selectOption(tier)
+          const response = await responsePromise
+          expect(response.ok()).toBe(true)
+          const payload = await response.json()
+          await waitForApplied(query, tier)
+          return payload
+        }
+        for (const tier of ['userMessages', 'fullText']) {
+          for (const { query, text } of [retained, selected]) {
+            const payload = await runSearch(query, tier)
+            expect(payload.items).toHaveLength(1)
+            expect(payload.items[0]).toMatchObject({
+              provider: 'codex', sessionId, matchedIn: 'userMessage', snippet: text,
+            })
+            await expect(sidebarRow).toHaveCount(1)
+            await expect(sidebarRow).toBeVisible()
+          }
+          for (const { query } of [discarded, unselected]) {
+            const payload = await runSearch(query, tier)
+            expect(payload.items).toEqual([])
+            await expect(sidebarRow).toHaveCount(0)
+          }
+        }
+        await search.fill('')
+        await waitForApplied('', 'title')
+        await expect(sidebarRow).toHaveCount(1)
+      })
+
+      await test.step('show one History row and resume its logical session through the server', async () => {
+        await page.getByTitle('Projects (Ctrl+B P)').click()
+        const projectHeader = page.locator(`[data-project-path="${cwd}"]`)
+        await expect(projectHeader).toBeVisible()
+        await projectHeader.click()
+        const historyRow = page.locator(
+          `[data-context="history-session"][data-provider="codex"][data-session-id="${sessionId}"]`,
+        )
+        await expect(historyRow).toHaveCount(1)
+        await expect(historyRow).toBeVisible()
+        const priorTabs = await harness.getTabCount()
+        await historyRow.getByRole('button', { name: /^Open session / }).click()
+        await expect.poll(() => harness.getTabCount(), { timeout: 15_000 }).toBe(priorTabs + 1)
+        const tabId = await harness.getActiveTabId()
+        expect(tabId).toBeTruthy()
+        await expect.poll(async () => (await harness.getPaneLayout(tabId!))?.content?.terminalId ?? null,
+          { timeout: 30_000 }).not.toBeNull()
+        const content = (await harness.getPaneLayout(tabId!))?.content
+        expect(content?.sessionRef).toMatchObject({ provider: 'codex', sessionId })
+        const terminalId = content!.terminalId as string
+        await expect.poll(async () => {
+          const buffer = await harness.getTerminalBuffer(terminalId)
+          return typeof buffer === 'string'
+            && buffer.replace(/\n/g, '').includes(`codex: resumed session ${sessionId}`)
+        }, { timeout: 30_000 }).toBe(true)
+        const argvEntries = (await fs.readFile(argvLog, 'utf8')).trim().split('\n')
+          .map((line) => JSON.parse(line) as { argv: string[] })
+        const resumed = argvEntries.filter(({ argv }) => argv.includes('resume'))
+        expect(resumed.length).toBeGreaterThan(0)
+        for (const { argv } of resumed) {
+          expect(argv[argv.indexOf('resume') + 1]).toBe(sessionId)
+          expect(argv).not.toContain(selectedRolloutId)
+          expect(argv).not.toContain(unselectedRolloutId)
+        }
+      })
+    } finally {
+      await owned?.context.close().catch(() => {})
+      await owned?.server.stop().catch(() => {})
+      await fs.rm(sharedRoot, { recursive: true, force: true })
+    }
+  })
 })
 
 test.describe('Kata rrx7 Codex rollout continuations', () => {

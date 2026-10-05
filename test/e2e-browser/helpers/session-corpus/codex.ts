@@ -147,6 +147,116 @@ export async function writeCodexContinuationFixtures(
   return files
 }
 
+export interface CodexReferencedHistoryFixtureSpec {
+  sessionId: string
+  selectedRolloutId: string
+  unselectedRolloutId: string
+  cwd: string
+  createdAt: number
+  retainedUserText: string
+  selectedUserText: string
+  discardedUserText: string
+  unselectedUserText: string
+}
+
+/**
+ * A same-thread revert preserves an exact original prefix and replaces its
+ * tail. SQLite selects the current rollout even when another branch's filename
+ * is newer. Byte offsets address encoded JSONL bytes, including newlines.
+ */
+export async function writeCodexReferencedHistoryFixture(
+  homeDir: string,
+  spec: CodexReferencedHistoryFixtureSpec,
+): Promise<{ rootFile: string; selectedFile: string; unselectedFile: string; lastActivityAt: number }> {
+  const codexHome = path.join(homeDir, '.codex')
+  const selectedAt = spec.createdAt + 60_000
+  const unselectedAt = spec.createdAt + 120_000
+  const header = (at: number, ordinal: number, version: string, historyBase?: {
+    thread_id: string
+    end_byte_offset: number
+    end_ordinal_exclusive: number
+  }) => ({
+    timestamp: iso(at),
+    ordinal,
+    type: 'session_meta',
+    payload: {
+      id: spec.sessionId,
+      session_id: spec.sessionId,
+      timestamp: iso(at),
+      cwd: spec.cwd,
+      source: 'vscode',
+      thread_source: 'user',
+      cli_version: version,
+      originator: 'codex-vscode',
+      history_mode: 'paginated',
+      ...(historyBase ? { history_base: historyBase } : {}),
+    },
+  })
+  const message = (at: number, ordinal: number, role: 'user' | 'assistant', text: string) => ({
+    timestamp: iso(at),
+    ordinal,
+    type: 'response_item',
+    payload: {
+      type: 'message',
+      role,
+      content: [{ type: role === 'user' ? 'input_text' : 'output_text', text }],
+    },
+  })
+  const encode = (records: unknown[]) => `${records.map((record) => JSON.stringify(record)).join('\n')}\n`
+  const write = async (at: number, physicalId: string, records: unknown[]) => {
+    const directory = path.join(codexHome, 'sessions', ...codexDatePath(at).split('/'))
+    await fsp.mkdir(directory, { recursive: true })
+    const ids = physicalId === spec.sessionId ? spec.sessionId : `${spec.sessionId}_${physicalId}`
+    const filename = path.join(directory, codexRolloutFileName(at, ids))
+    await fsp.writeFile(filename, encode(records))
+    return filename
+  }
+
+  const retainedPrefix = [
+    header(spec.createdAt, 0, '0.159.2'),
+    message(spec.createdAt + 1000, 1, 'user', 'Referenced history opening request'),
+    message(spec.createdAt + 2000, 2, 'assistant', 'Referenced history opening reply'),
+    message(spec.createdAt + 3000, 3, 'user', spec.retainedUserText),
+    message(spec.createdAt + 4000, 4, 'assistant', 'Retained prefix reply'),
+  ]
+  const historyBase = {
+    thread_id: spec.sessionId,
+    end_byte_offset: Buffer.byteLength(encode(retainedPrefix), 'utf8'),
+    end_ordinal_exclusive: retainedPrefix.length,
+  }
+  const rootFile = await write(spec.createdAt, spec.sessionId, [
+    ...retainedPrefix,
+    message(spec.createdAt + 5000, 5, 'user', spec.discardedUserText),
+    message(spec.createdAt + 6000, 6, 'assistant', 'Discarded original tail reply'),
+  ])
+  const selectedFile = await write(selectedAt, spec.selectedRolloutId, [
+    header(selectedAt, 5, '0.160.0', historyBase),
+    message(selectedAt + 1000, 6, 'user', 'Selected replacement opening request'),
+    message(selectedAt + 2000, 7, 'assistant', 'Selected replacement reply'),
+    message(selectedAt + 3000, 8, 'user', spec.selectedUserText),
+  ])
+  const unselectedFile = await write(unselectedAt, spec.unselectedRolloutId, [
+    header(unselectedAt, 5, '0.160.0', historyBase),
+    message(unselectedAt + 1000, 6, 'user', 'Unselected replacement opening request'),
+    message(unselectedAt + 2000, 7, 'assistant', 'Unselected replacement reply'),
+    message(unselectedAt + 3000, 8, 'user', spec.unselectedUserText),
+  ])
+
+  const { DatabaseSync } = await import('node:sqlite')
+  const database = new DatabaseSync(path.join(codexHome, 'state_5.sqlite'))
+  try {
+    database.exec(`CREATE TABLE threads (
+      id TEXT PRIMARY KEY, rollout_path TEXT NOT NULL,
+      history_mode TEXT NOT NULL, archived INTEGER NOT NULL DEFAULT 0
+    )`)
+    database.prepare('INSERT INTO threads (id, rollout_path, history_mode) VALUES (?, ?, ?)')
+      .run(spec.sessionId, selectedFile, 'paginated')
+  } finally {
+    database.close()
+  }
+  return { rootFile, selectedFile, unselectedFile, lastActivityAt: selectedAt + 3000 }
+}
+
 export async function writeCodexSession(
   ctx: CorpusContext,
   spec: CodexSessionSpec,
