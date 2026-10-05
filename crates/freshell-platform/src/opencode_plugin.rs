@@ -393,6 +393,88 @@ mod tests {
     }
 
     #[test]
+    fn concurrent_selected_tui_configs_keep_their_own_payloads() {
+        use std::sync::{Arc, Barrier};
+
+        let home = tempfile::tempdir().unwrap();
+        let selected_a = home.path().join("project-a-tui.jsonc");
+        let selected_b = home.path().join("project-b-tui.jsonc");
+        let rebind_plugin = plugin_file_spec(&rebind_plugin_path(home.path()));
+
+        // Give every round new content so both workers materialize fresh output
+        // files while racing through the same install helper.
+        for round in 0..16 {
+            let setting_a = format!("project-a-round-{round}");
+            let setting_b = format!("project-b-round-{round}");
+            let user_plugin_a = format!("file:///project-a-round-{round}.ts");
+            let user_plugin_b = format!("file:///project-b-round-{round}.ts");
+            std::fs::write(
+                &selected_a,
+                serde_json::json!({
+                    "theme": setting_a,
+                    "plugin": [user_plugin_a],
+                })
+                .to_string(),
+            )
+            .unwrap();
+            std::fs::write(
+                &selected_b,
+                serde_json::json!({
+                    "theme": setting_b,
+                    "plugin": [user_plugin_b],
+                })
+                .to_string(),
+            )
+            .unwrap();
+
+            let barrier = Arc::new(Barrier::new(2));
+            let (generated_a, generated_b) = std::thread::scope(|scope| {
+                let barrier_a = barrier.clone();
+                let home_a = home.path();
+                let selected_a = &selected_a;
+                let worker_a = scope.spawn(move || {
+                    barrier_a.wait();
+                    ensure_rebind_plugin_with_user_config(home_a, Some(selected_a))
+                });
+
+                let barrier_b = barrier.clone();
+                let home_b = home.path();
+                let selected_b = &selected_b;
+                let worker_b = scope.spawn(move || {
+                    barrier_b.wait();
+                    ensure_rebind_plugin_with_user_config(home_b, Some(selected_b))
+                });
+
+                (
+                    worker_a.join().expect("project A worker must not panic"),
+                    worker_b.join().expect("project B worker must not panic"),
+                )
+            });
+            let generated_a = generated_a.expect("project A install must succeed");
+            let generated_b = generated_b.expect("project B install must succeed");
+
+            assert_ne!(generated_a, generated_b);
+            let config_a: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&generated_a).unwrap()).unwrap();
+            let config_b: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&generated_b).unwrap()).unwrap();
+
+            assert_eq!(config_a["theme"], setting_a);
+            assert_eq!(config_b["theme"], setting_b);
+            let plugins_a = config_a["plugin"].as_array().unwrap();
+            let plugins_b = config_b["plugin"].as_array().unwrap();
+            assert_eq!(plugins_a.len(), 2);
+            assert_eq!(plugins_b.len(), 2);
+            assert!(plugins_a.iter().any(|plugin| plugin == &user_plugin_a));
+            assert!(plugins_a.iter().any(|plugin| plugin == &rebind_plugin));
+            assert!(!plugins_a.iter().any(|plugin| plugin == &user_plugin_b));
+            assert!(plugins_b.iter().any(|plugin| plugin == &user_plugin_b));
+            assert!(plugins_b.iter().any(|plugin| plugin == &rebind_plugin));
+            assert!(!plugins_b.iter().any(|plugin| plugin == &user_plugin_a));
+        }
+    }
+
+    #[test]
     fn malformed_selected_tui_config_is_refused_without_editing_source() {
         let home = tempfile::tempdir().unwrap();
         let selected = home.path().join("selected-tui.jsonc");
