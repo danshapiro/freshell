@@ -1,10 +1,12 @@
 //! Freshell's opencode TUI rebind plugin: embedded source and idempotent
-//! install of TWO freshell-owned files into ~/.freshell/opencode/ — the
-//! plugin itself and a generated tui.json pointing at it. When the user has
-//! selected a TUI config, its settings and plugins are copied into that
-//! generated file before the rebind plugin is appended.
+//! install of Freshell-owned files into ~/.freshell/opencode/ — the plugin
+//! itself and generated TUI configs pointing at it. When the user has selected
+//! a TUI config, its settings and plugins are copied into a content-addressed
+//! config before the rebind plugin is appended. That keeps concurrent launches
+//! with different selections isolated.
 
 use percent_encoding::{utf8_percent_encode, AsciiSet, CONTROLS};
+use sha2::{Digest, Sha256};
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -24,11 +26,23 @@ pub fn rebind_plugin_path(home: &Path) -> PathBuf {
         .join("freshell-rebind-plugin.ts")
 }
 
-/// The freshell-owned TUI config injected per-pane via OPENCODE_TUI_CONFIG.
-/// Lives under ~/.freshell/opencode/ — deliberately NOT an ancestor of any
-/// pane cwd (opencode's project tui.json discovery walks up to `/`).
+/// Default Freshell-owned TUI config injected via OPENCODE_TUI_CONFIG when the
+/// user has not selected a TUI config. Lives under ~/.freshell/opencode/ —
+/// deliberately NOT an ancestor of any pane cwd (opencode's project tui.json
+/// discovery walks up to `/`).
 pub fn tui_config_path(home: &Path) -> PathBuf {
     home.join(".freshell").join("opencode").join("tui.json")
+}
+
+/// Stable per-content path for a generated selector that includes the user's
+/// selected TUI config. Different launch settings cannot overwrite each other,
+/// and a config edited while a previous OpenCode process is running gets a new
+/// path instead of changing underneath it.
+fn selected_tui_config_path(home: &Path, content: &str) -> PathBuf {
+    let digest = Sha256::digest(content.as_bytes());
+    home.join(".freshell")
+        .join("opencode")
+        .join(format!("tui-{:x}.json", digest))
 }
 
 /// File-URL *path* percent-encode set: byte-parity with `pathToFileURL` as
@@ -118,11 +132,12 @@ fn write_atomic_if_changed(path: &Path, content: &str) -> std::io::Result<()> {
     rename_result
 }
 
-/// Idempotently materialize BOTH freshell-owned files into
-/// `~/.freshell/opencode/`: the plugin source and generated tui.json.
-/// Atomic (tmp + rename); rewrites only when content
-/// differs, so a running opencode never observes a torn file. Returns the
-/// tui.json path — the value cli_launch.rs injects as OPENCODE_TUI_CONFIG.
+/// Idempotently materialize the plugin source and generated TUI config into
+/// `~/.freshell/opencode/`. Without a selected user config, the generated path
+/// is `tui.json`; selected configs use a stable content-addressed path so
+/// launches with different settings stay isolated. Atomic (tmp + rename);
+/// rewrites only when content differs, so OpenCode never observes a torn file.
+/// Returns the path cli_launch.rs injects as OPENCODE_TUI_CONFIG.
 /// Bun caches failed imports for the process lifetime, so this MUST run
 /// (and succeed) before the TUI launches.
 pub fn ensure_rebind_plugin_installed(home: &Path) -> std::io::Result<PathBuf> {
@@ -131,14 +146,13 @@ pub fn ensure_rebind_plugin_installed(home: &Path) -> std::io::Result<PathBuf> {
 
 /// Materialize a TUI selector that includes Freshell's plugin and every key
 /// from the user's selected TUI config. The user file remains byte-for-byte
-/// unchanged; only the file under `.freshell/opencode` is regenerated.
+/// unchanged; generated selectors live under `.freshell/opencode`.
 pub fn ensure_rebind_plugin_with_user_config(
     home: &Path,
     selected: Option<&Path>,
 ) -> std::io::Result<PathBuf> {
     let plugin = rebind_plugin_path(home);
     write_atomic_if_changed(&plugin, REBIND_PLUGIN_SOURCE)?;
-    let tui_json = tui_config_path(home);
     let content = if let Some(selected) = selected {
         let raw = std::fs::read_to_string(selected)?;
         let mut config = crate::opencode_config::parse_jsonc_object(&raw).ok_or_else(|| {
@@ -168,6 +182,11 @@ pub fn ensure_rebind_plugin_with_user_config(
         config.to_string()
     } else {
         tui_config_content(&plugin)
+    };
+    let tui_json = if selected.is_some() {
+        selected_tui_config_path(home, &content)
+    } else {
+        tui_config_path(home)
     };
     write_atomic_if_changed(&tui_json, &content)?;
     Ok(tui_json)
@@ -331,6 +350,46 @@ mod tests {
         assert_eq!(effective["plugin"].as_array().unwrap().len(), 2);
         assert_eq!(effective["plugin"][0], "file:///user.ts");
         assert_eq!(std::fs::read_to_string(selected).unwrap(), raw);
+    }
+
+    #[test]
+    fn different_selected_tui_configs_get_isolated_stable_paths() {
+        let home = tempfile::tempdir().unwrap();
+        let selected_a = home.path().join("project-a-tui.jsonc");
+        let selected_b = home.path().join("project-b-tui.jsonc");
+        std::fs::write(&selected_a, r#"{"theme":"dark","plugin":["file:///a.ts"]}"#).unwrap();
+        std::fs::write(
+            &selected_b,
+            r#"{"theme":"light","plugin":["file:///b.ts"]}"#,
+        )
+        .unwrap();
+
+        let generated_a =
+            ensure_rebind_plugin_with_user_config(home.path(), Some(&selected_a)).unwrap();
+        let content_a = std::fs::read_to_string(&generated_a).unwrap();
+        let generated_b =
+            ensure_rebind_plugin_with_user_config(home.path(), Some(&selected_b)).unwrap();
+
+        assert_ne!(generated_a, generated_b);
+        assert_eq!(std::fs::read_to_string(&generated_a).unwrap(), content_a);
+        let config_a: serde_json::Value = serde_json::from_str(&content_a).unwrap();
+        let config_b: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&generated_b).unwrap()).unwrap();
+        assert_eq!(config_a["theme"], "dark");
+        assert_eq!(config_a["plugin"][0], "file:///a.ts");
+        assert_eq!(config_b["theme"], "light");
+        assert_eq!(config_b["plugin"][0], "file:///b.ts");
+        assert_eq!(config_a["plugin"].as_array().unwrap().len(), 2);
+        assert_eq!(config_b["plugin"].as_array().unwrap().len(), 2);
+
+        let generated_a_again =
+            ensure_rebind_plugin_with_user_config(home.path(), Some(&selected_a)).unwrap();
+        assert_eq!(generated_a_again, generated_a);
+        assert_eq!(std::fs::read_to_string(&generated_a).unwrap(), content_a);
+        assert_eq!(
+            std::fs::read_to_string(&generated_b).unwrap(),
+            serde_json::to_string(&config_b).unwrap()
+        );
     }
 
     #[test]
