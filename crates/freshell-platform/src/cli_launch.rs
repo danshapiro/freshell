@@ -125,8 +125,8 @@ pub struct CliLaunchInputs<'a> {
     pub opencode_server: Option<(&'a str, i64)>,
     pub mcp_injection: McpInjection,
     /// Precomputed by the IO layer (like `mcp_injection` — this resolver never
-    /// does fs I/O): `Some(<abs path to the freshell-owned tui.json>)` when the
-    /// opencode rebind-plugin install succeeded at the call site, `None`
+    /// does fs I/O): `Some(<abs path to the Freshell-owned TUI selector JSON>)`
+    /// when the opencode rebind-plugin install succeeded at the call site, `None`
     /// otherwise (non-opencode pane, unresolvable home, or install failure —
     /// skip injection, degrading to today's no-rebind behavior).
     pub opencode_rebind_tui_config: Option<String>,
@@ -434,8 +434,8 @@ pub fn resolve_coding_cli_command(
             command_env.insert(k, v);
         }
         // Freshell TUI rebind plugin (docs/plans/2026-07-28-opencode-tui-rebind.md):
-        // the IO layer installed the plugin and generated tui.json into
-        // ~/.freshell/opencode/ and passed the tui.json path via
+        // the IO layer installed the plugin and generated a TUI selector into
+        // ~/.freshell/opencode/ and passed its path via
         // inputs.opencode_rebind_tui_config (the mcp_injection precedent — this
         // resolver stays pure). Point this pane's TUI at it via OPENCODE_TUI_CONFIG.
         // Main-config plugins (opencode.json / OPENCODE_CONFIG_CONTENT) load as
