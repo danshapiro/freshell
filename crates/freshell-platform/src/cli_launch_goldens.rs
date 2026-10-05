@@ -5,15 +5,6 @@ use super::*;
 use crate::detect::HostOs;
 use crate::spawn::{build_windows_cli_spawn_spec, quote_powershell_literal, ShellType};
 
-/// `CLAUDE_SETTINGS_UNIX` (§4 conventions) — exact compact-JSON bytes:
-/// `SessionStart` (session-id signal file hook, P4) then `Stop` (bell).
-const CLAUDE_SETTINGS_UNIX: &str = r#"{"hooks":{"SessionStart":[{"hooks":[{"type":"command","command":"sh -lc 'd=\"$HOME/.freshell/session-signals/claude\"; n=$(date +%s%N 2>/dev/null); case \"$n\" in *[!0-9]*|\"\") n=\"$(date +%s)000000000\";; esac; f=\"$d/${FRESHELL_TERMINAL_ID:-unknown}__$n-$$\"; mkdir -p \"$d\" && cat > \"$f.tmp\" && mv \"$f.tmp\" \"$f.json\"' 2>/dev/null || true"}]}],"Stop":[{"hooks":[{"type":"command","command":"sh -lc \"printf '\\a' > /dev/tty 2>/dev/null || true\""}]}]}}"#;
-
-/// `CLAUDE_SETTINGS_WIN` — compact JSON: `SessionStart` (signal file hook,
-/// `\` appears in JSON as `\\`) then `Stop` (the windows bell string;
-/// `'\\.\CONOUT$'` appears in JSON as `'\\\\.\\CONOUT$'`).
-const CLAUDE_SETTINGS_WIN: &str = r#"{"hooks":{"SessionStart":[{"hooks":[{"type":"command","command":"powershell.exe -NoLogo -NoProfile -NonInteractive -Command \"try { $tid = if ($env:FRESHELL_TERMINAL_ID) { $env:FRESHELL_TERMINAL_ID } else { 'unknown' }; $d = Join-Path $env:USERPROFILE '.freshell\\session-signals\\claude'; New-Item -ItemType Directory -Force -Path $d | Out-Null; $f = Join-Path $d ($tid + '__' + [DateTime]::UtcNow.Ticks); [System.IO.File]::WriteAllText($f + '.tmp', [Console]::In.ReadToEnd()); Move-Item -Force ($f + '.tmp') ($f + '.json') } catch {}\""}]}],"Stop":[{"hooks":[{"type":"command","command":"powershell.exe -NoLogo -NoProfile -NonInteractive -Command \"$bell=[char]7; $ok=$false; try {[System.IO.File]::AppendAllText('\\\\.\\CONOUT$', [string]$bell); $ok=$true} catch {}; if (-not $ok) { try {[Console]::Out.Write($bell); $ok=$true} catch {} }; if (-not $ok) { try {[Console]::Error.Write($bell)} catch {} }\""}]}]}}"#;
-
 /// Dev-mode MCP server args (`MCP_UNIX`, §4 conventions).
 const MCP_UNIX: &[&str] = &[
     "--import",
@@ -141,17 +132,253 @@ fn codex_mcp_unix() -> McpInjection {
     }
 }
 
-/// Pins the exact byte-level notification constants (U3 executed proof).
+fn claude_settings_arg(launch: &CliLaunch) -> &str {
+    launch
+        .args
+        .windows(2)
+        .find(|pair| pair[0] == "--settings")
+        .map(|pair| pair[1].as_str())
+        .expect("Claude launch should include --settings")
+}
+
+fn claude_hook_command<'a>(settings: &'a serde_json::Value, event: &str) -> &'a str {
+    settings["hooks"][event][0]["hooks"][0]["command"]
+        .as_str()
+        .expect("Claude hook should have a command")
+}
+
+/// The generated Unix Stop hook must return the BEL as Claude hook JSON so
+/// the terminal output tracker can observe it.
+#[cfg(unix)]
 #[test]
-fn claude_settings_json_bytes_are_pinned() {
-    assert_eq!(
-        claude_settings_json(ProviderTarget::Unix),
-        CLAUDE_SETTINGS_UNIX
+fn claude_stop_hook_returns_one_bell_in_hook_json() {
+    use std::fs;
+    use std::process::{Command, Stdio};
+
+    let launch =
+        resolve_coding_cli_command(&specs(), &claude_inputs(claude_mcp_unix()), &env_of(&[]))
+            .unwrap()
+            .unwrap();
+    let settings: serde_json::Value = serde_json::from_str(claude_settings_arg(&launch)).unwrap();
+    let command = claude_hook_command(&settings, "Stop");
+    let profile = tempfile::tempdir().unwrap();
+    fs::write(
+        profile.path().join(".profile"),
+        "printf 'unexpected login profile output\\n'\n",
+    )
+    .unwrap();
+    let child = Command::new("sh")
+        .args(["-c", command])
+        .env("HOME", profile.path())
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("start generated Claude Stop hook");
+    let output = child.wait_with_output().unwrap();
+    assert!(
+        output.status.success(),
+        "Stop hook failed: {}",
+        String::from_utf8_lossy(&output.stderr)
     );
-    assert_eq!(
-        claude_settings_json(ProviderTarget::Windows),
-        CLAUDE_SETTINGS_WIN
-    );
+    let response: serde_json::Value =
+        serde_json::from_slice(&output.stdout).unwrap_or_else(|error| {
+            panic!(
+                "Stop hook stdout must be JSON ({error}); got {:?}",
+                String::from_utf8_lossy(&output.stdout)
+            )
+        });
+    let sequence = response["terminalSequence"]
+        .as_str()
+        .expect("Stop hook response should contain terminalSequence");
+    assert_eq!(sequence.chars().filter(|ch| *ch == '\u{0007}').count(), 1);
+    assert_eq!(sequence, "\u{0007}");
+}
+
+#[cfg(windows)]
+#[derive(Clone)]
+enum NativeWindowsShell {
+    PowerShell,
+    GitBash(std::path::PathBuf),
+}
+
+#[cfg(windows)]
+impl NativeWindowsShell {
+    fn label(&self) -> &'static str {
+        match self {
+            Self::PowerShell => "PowerShell",
+            Self::GitBash(_) => "Git Bash",
+        }
+    }
+}
+
+#[cfg(windows)]
+fn find_git_bash() -> Option<std::path::PathBuf> {
+    use std::path::PathBuf;
+    use std::process::Command;
+
+    let mut candidates = Vec::new();
+    if let Some(git_bash) = std::env::var_os("CLAUDE_CODE_GIT_BASH_PATH") {
+        candidates.push(PathBuf::from(git_bash));
+    }
+    for variable in ["ProgramFiles", "ProgramFiles(x86)"] {
+        if let Some(program_files) = std::env::var_os(variable) {
+            candidates.push(
+                PathBuf::from(program_files)
+                    .join("Git")
+                    .join("bin")
+                    .join("bash.exe"),
+            );
+        }
+    }
+    if let Ok(output) = Command::new("where.exe").arg("bash.exe").output() {
+        candidates.extend(
+            String::from_utf8_lossy(&output.stdout)
+                .lines()
+                .map(PathBuf::from)
+                .filter(|path| {
+                    path.to_string_lossy()
+                        .to_ascii_lowercase()
+                        .contains(r"\git\")
+                }),
+        );
+    }
+    candidates.into_iter().find(|path| path.is_file())
+}
+
+#[cfg(windows)]
+fn run_windows_hook(
+    shell: &NativeWindowsShell,
+    hook_command: &str,
+    stdin: &[u8],
+    cwd: &std::path::Path,
+    user_profile: &std::path::Path,
+) -> std::process::Output {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+
+    let mut command = match shell {
+        NativeWindowsShell::PowerShell => {
+            let mut command = Command::new("powershell.exe");
+            command.args(["-NoLogo", "-NoProfile", "-NonInteractive", "-Command"]);
+            command.arg(hook_command);
+            command
+        }
+        NativeWindowsShell::GitBash(path) => {
+            let mut command = Command::new(path);
+            command.args(["--noprofile", "--norc", "-c", hook_command]);
+            command
+        }
+    };
+    let mut child = command
+        .current_dir(cwd)
+        .env("USERPROFILE", user_profile)
+        .env("FRESHELL_TERMINAL_ID", "hook-smoke-terminal")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap_or_else(|error| panic!("start generated hook through {}: {error}", shell.label()));
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(stdin)
+        .unwrap_or_else(|error| panic!("write hook stdin through {}: {error}", shell.label()));
+    child.wait_with_output().unwrap()
+}
+
+/// Native Windows smoke for both generated shell-form hook commands. It never
+/// starts Claude and confines SessionStart output to a scratch USERPROFILE.
+#[cfg(windows)]
+#[test]
+fn native_windows_generated_claude_hooks_work_in_shells() {
+    use std::fs;
+    use std::path::PathBuf;
+
+    let mut inputs = claude_inputs(McpInjection::default());
+    inputs.target = ProviderTarget::Windows;
+    let launch = resolve_coding_cli_command(&specs(), &inputs, &env_of(&[]))
+        .unwrap()
+        .unwrap();
+    let settings: serde_json::Value = serde_json::from_str(claude_settings_arg(&launch)).unwrap();
+    let session_start = claude_hook_command(&settings, "SessionStart");
+    let stop = claude_hook_command(&settings, "Stop");
+    let fixture = br#"{"session_id":"hook-smoke"}"#;
+    let mut shells = vec![NativeWindowsShell::PowerShell];
+    if let Some(git_bash) = find_git_bash() {
+        shells.push(NativeWindowsShell::GitBash(git_bash));
+    }
+
+    for shell in shells {
+        let scratch = tempfile::tempdir().unwrap();
+        let profile = scratch.path().join("temporary-profile");
+        fs::create_dir(&profile).unwrap();
+
+        let session_output =
+            run_windows_hook(&shell, session_start, fixture, scratch.path(), &profile);
+        assert!(
+            session_output.status.success(),
+            "SessionStart failed through {}: {}",
+            shell.label(),
+            String::from_utf8_lossy(&session_output.stderr)
+        );
+        let scratch_entries = fs::read_dir(scratch.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect::<Vec<PathBuf>>();
+        assert_eq!(
+            scratch_entries,
+            vec![profile.clone()],
+            "SessionStart wrote outside its temporary USERPROFILE through {}",
+            shell.label()
+        );
+        let signal_dir = profile
+            .join(".freshell")
+            .join("session-signals")
+            .join("claude");
+        let signal_files = fs::read_dir(&signal_dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect::<Vec<PathBuf>>();
+        assert_eq!(
+            signal_files.len(),
+            1,
+            "expected one signal file through {}",
+            shell.label()
+        );
+        assert!(
+            signal_files[0]
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("hook-smoke-terminal__"),
+            "signal file should use the configured terminal id through {}",
+            shell.label()
+        );
+        assert_eq!(fs::read(&signal_files[0]).unwrap(), fixture);
+
+        let stop_output = run_windows_hook(&shell, stop, fixture, scratch.path(), &profile);
+        assert!(
+            stop_output.status.success(),
+            "Stop failed through {}: {}",
+            shell.label(),
+            String::from_utf8_lossy(&stop_output.stderr)
+        );
+        let response: serde_json::Value = serde_json::from_slice(&stop_output.stdout)
+            .unwrap_or_else(|error| {
+                panic!(
+                    "Stop stdout through {} must be JSON ({error}); got {:?}",
+                    shell.label(),
+                    String::from_utf8_lossy(&stop_output.stdout)
+                )
+            });
+        let sequence = response["terminalSequence"]
+            .as_str()
+            .expect("Stop response should contain terminalSequence");
+        assert_eq!(sequence.chars().filter(|ch| *ch == '\u{0007}').count(), 1);
+        assert_eq!(sequence, "\u{0007}");
+    }
 }
 
 /// G-C1 — claude, linux, fresh, defaults — RESOLVER-LEVEL ONLY (the live path
@@ -167,7 +394,7 @@ fn g_c1_claude_linux_fresh_defaults_resolver_level() {
         launch.args,
         vec![
             "--settings".to_string(),
-            CLAUDE_SETTINGS_UNIX.to_string(),
+            claude_settings_json(ProviderTarget::Unix),
             "--mcp-config".to_string(),
             "/tmp/freshell-mcp/term1.json".to_string(),
         ]
@@ -188,7 +415,7 @@ fn g_c2_claude_resume_permission_mode_plan() {
         launch.args,
         vec![
             "--settings".to_string(),
-            CLAUDE_SETTINGS_UNIX.to_string(),
+            claude_settings_json(ProviderTarget::Unix),
             "--mcp-config".to_string(),
             "/tmp/freshell-mcp/term1.json".to_string(),
             "--permission-mode".to_string(),
@@ -212,7 +439,7 @@ fn g_c3_claude_start_intent_session_id() {
         launch.args,
         vec![
             "--settings".to_string(),
-            CLAUDE_SETTINGS_UNIX.to_string(),
+            claude_settings_json(ProviderTarget::Unix),
             "--mcp-config".to_string(),
             "/tmp/freshell-mcp/term1.json".to_string(),
             "--session-id".to_string(),
@@ -240,7 +467,7 @@ fn g_c4_claude_native_windows_target() {
         launch.args,
         vec![
             "--settings".to_string(),
-            CLAUDE_SETTINGS_WIN.to_string(),
+            claude_settings_json(ProviderTarget::Windows),
             "--mcp-config".to_string(),
             "C:\\Users\\u\\AppData\\Local\\Temp\\freshell-mcp\\term1.json".to_string(),
         ]
@@ -261,7 +488,7 @@ fn g_c4_claude_native_windows_target() {
     assert_eq!(spec.program, "powershell.exe");
     let expected_invocation = format!(
         "Set-Location -LiteralPath 'C:\\ws'; & 'claude' '--settings' {} '--mcp-config' 'C:\\Users\\u\\AppData\\Local\\Temp\\freshell-mcp\\term1.json'",
-        quote_powershell_literal(CLAUDE_SETTINGS_WIN)
+        quote_powershell_literal(&claude_settings_json(ProviderTarget::Windows))
     );
     assert_eq!(
         spec.args,
@@ -272,9 +499,6 @@ fn g_c4_claude_native_windows_target() {
             expected_invocation,
         ]
     );
-    // quotePowerShellLiteral doubled the settings' single quotes around the
-    // JSON-escaped CONOUT$ device path.
-    assert!(spec.args[3].contains(r"''\\\\.\\CONOUT$''"));
 }
 
 fn codex_inputs<'a>(injection: McpInjection) -> CliLaunchInputs<'a> {

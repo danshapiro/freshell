@@ -90,6 +90,16 @@ jobs:
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
+      # Exercise the native Windows Claude profile lookup and the generated
+      # terminal hook behavior. Keep this scoped to the two owning Rust crates.
+      - name: Test Windows Claude profile lookup
+        if: matrix.os == 'windows-2022'
+        run: cargo test --locked -p freshell-ws --lib claude_truth::tests::windows_from_env_uses_userprofile_default_and_ignores_home
+
+      - name: Test generated Windows Claude hooks
+        if: matrix.os == 'windows-2022'
+        run: cargo test --locked -p freshell-platform --lib cli_launch::cli_argv_goldens_file::native_windows_generated_claude_hooks_work_in_shells
+
       - name: Run Electron unit tests
         run: pnpm run test:electron
 
