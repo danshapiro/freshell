@@ -233,40 +233,64 @@ describe('stopOwnedServerAndVerify', () => {
   })
 
   it('bounds an unresolved ownership proof, aborts it, and leaves no cleanup continuation behind', async () => {
-    let aborts = 0
-    const process = {
-      pid: 4242,
-      isAlive: vi.fn(() => true),
-      signal: vi.fn(() => true),
-    }
-    const proveOwnership = vi.fn(async (_receipt, context?: { signal: AbortSignal }) => {
-      await new Promise<void>((_resolve) => {
-        context?.signal.addEventListener('abort', () => { aborts += 1 }, { once: true })
+    vi.useFakeTimers()
+    try {
+      let aborts = 0
+      const ownershipSignals: AbortSignal[] = []
+      const process = {
+        pid: 4242,
+        isAlive: vi.fn(() => true),
+        signal: vi.fn(() => true),
+      }
+      const proveOwnership = vi.fn(async (_receipt, context?: { signal: AbortSignal }) => {
+        if (context) ownershipSignals.push(context.signal)
+        await new Promise<void>((_resolve) => {
+          context?.signal.addEventListener('abort', () => { aborts += 1 }, { once: true })
+        })
       })
-    })
-    const operation = forceStopExactOwnedServerAndVerify(
-      process,
-      { pid: 4242, port: 4243 },
-      {
-        proveOwnership,
-        waitForPidGone: vi.fn().mockResolvedValue(false),
-        isPortFree: vi.fn().mockResolvedValue(false),
-        sleep: async () => {},
-        ownershipProofTimeoutMs: 5,
-      },
-      5,
-    )
-    const result = await Promise.race([
-      operation.then(() => 'resolved', () => 'rejected'),
-      new Promise<'deadline'>((resolve) => setTimeout(() => resolve('deadline'), 100)),
-    ])
+      let result: 'pending' | 'resolved' | 'rejected' = 'pending'
+      void forceStopExactOwnedServerAndVerify(
+        process,
+        { pid: 4242, port: 4243 },
+        {
+          proveOwnership,
+          waitForPidGone: vi.fn().mockResolvedValue(false),
+          isPortFree: vi.fn().mockResolvedValue(false),
+          sleep: async () => {},
+          ownershipProofTimeoutMs: 5,
+        },
+        5,
+      ).then(
+        () => { result = 'resolved' },
+        () => { result = 'rejected' },
+      )
 
-    expect(result).toBe('rejected')
-    expect(process.signal).not.toHaveBeenCalled()
-    expect(aborts).toBeGreaterThan(0)
-    const callsAtReturn = process.isAlive.mock.calls.length
-    await new Promise((resolve) => setTimeout(resolve, 20))
-    expect(process.isAlive).toHaveBeenCalledTimes(callsAtReturn)
+      // Initial observation and final verification each bound their own proof.
+      // Advance the initial deadline synchronously so its proof is checked
+      // before the rejected observation starts final verification.
+      await Promise.resolve()
+      vi.advanceTimersToNextTimer()
+      expect(proveOwnership).toHaveBeenCalledTimes(1)
+      expect(aborts).toBe(1)
+      expect(ownershipSignals).toHaveLength(1)
+      expect(ownershipSignals[0]?.aborted).toBe(true)
+
+      // Let final verification start its separate ownership proof, then
+      // advance that deadline without racing the busy worker's wall clock.
+      await Promise.resolve()
+      await vi.advanceTimersToNextTimerAsync()
+      expect(proveOwnership).toHaveBeenCalledTimes(2)
+      expect(aborts).toBe(2)
+      expect(ownershipSignals).toHaveLength(2)
+      expect(ownershipSignals.every((signal) => signal.aborted)).toBe(true)
+      expect(result).toBe('rejected')
+      expect(process.signal).not.toHaveBeenCalled()
+      const callsAtReturn = process.isAlive.mock.calls.length
+      await vi.advanceTimersByTimeAsync(20)
+      expect(process.isAlive).toHaveBeenCalledTimes(callsAtReturn)
+    } finally {
+      vi.useRealTimers()
+    }
   })
 
   it('aggregates a false TERM rejection while the exact child remains alive', async () => {

@@ -753,10 +753,11 @@ async fn manager_exit_for_unknown_terminal_is_a_noop() {
 // ── D-C-R sidecar planning budget (S5.e precondition) ─────────────────────────────
 
 /// A [`FakeRuntime`]-shaped runtime whose `ensure_ready` blocks on a shared
-/// [`tokio::sync::Notify`] so plans stay in flight until the test releases
-/// them — the knob that keeps budget permits occupied.
+/// zero-permit semaphore so plans stay in flight until the test releases
+/// them. Release permits survive the handoff to a plan that has not entered
+/// `ensure_ready` yet.
 struct BlockingRuntime {
-    release: Arc<tokio::sync::Notify>,
+    release: Arc<tokio::sync::Semaphore>,
 }
 
 impl CodexLaunchRuntime for BlockingRuntime {
@@ -765,7 +766,11 @@ impl CodexLaunchRuntime for BlockingRuntime {
         cwd: Option<String>,
     ) -> BoxFuture<'_, Result<CodexRuntimeReady, String>> {
         Box::pin(async move {
-            self.release.notified().await;
+            self.release
+                .acquire()
+                .await
+                .expect("test release gate remains open")
+                .forget();
             // Released: stand up the file's real loopback echo upstream so
             // the plan completes against a real socket.
             let inner = FakeRuntime::start().await;
@@ -788,9 +793,9 @@ impl CodexLaunchRuntime for BlockingRuntime {
 
 fn blocking_test_runtime_factory() -> (
     freshell_codex::launch_lifecycle::CodexRuntimeFactory,
-    Arc<tokio::sync::Notify>,
+    Arc<tokio::sync::Semaphore>,
 ) {
-    let release = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Semaphore::new(0));
     let factory_release = release.clone();
     let factory: freshell_codex::launch_lifecycle::CodexRuntimeFactory = Box::new(move |_plan| {
         let rt = Arc::new(BlockingRuntime {
@@ -840,9 +845,11 @@ async fn third_concurrent_plan_fails_fast_on_the_sidecar_budget() {
         err.to_string().contains("planning budget exhausted"),
         "{err}"
     );
-    release.notify_waiters();
-    let _ = a.await;
-    let _ = b.await;
+    release.add_permits(2);
+    let launch_a = a.await.expect("join").expect("first plan completes");
+    let launch_b = b.await.expect("join").expect("second plan completes");
+    manager.discard(launch_a).await;
+    manager.discard(launch_b).await;
 }
 
 // ── graceful restore/resume S1 (P2): restore-class plans queue, never die ─────────
@@ -1060,20 +1067,20 @@ async fn restore_class_queue_overflow_fails_loud_as_queue_full() {
         ),
         "{err}"
     );
-    // Drain: release the parked plans (BlockingRuntime parks on a Notify;
-    // the queued waiter parks again after the holder finishes, so notify twice).
-    release.notify_waiters();
+    // Release both plans before either join. The queued waiter enters the
+    // runtime only after the holder gives up the planning permit.
+    release.add_permits(2);
     let launch = holder.await.expect("join").expect("holder plan completes");
     manager.discard(launch).await;
-    release.notify_waiters();
     let launch2 = queued.await.expect("join").expect("queued plan completes");
     manager.discard(launch2).await;
+    assert_eq!(manager.plan_queue_depth(), 0, "plan queue drained");
 }
 
 // ── the spawn integration leg: real child + real proxy + fake TUI ─────────────────
 
 fn fake_app_server_command() -> String {
-    let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+    let fixture = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../../test/fixtures/coding-cli/codex-app-server/fake-app-server.mjs");
     format!("node {}", fixture.display())
 }
@@ -1441,7 +1448,7 @@ async fn plan_retry_spawns_fresh_after_claimed_reattach_ensure_ready_fails() {
     // `sidecar_reconcile_tests::spawn_own_fake_app_server`; test binaries
     // cannot share code — the repo's copy-with-attribution convention).
     let survivor_ownership = "codex-sidecar-a7000003-cccc-4ccc-8ccc-cccccccccccc";
-    let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+    let fixture = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../../test/fixtures/coding-cli/codex-app-server/fake-app-server.mjs");
     let bind_unused_ws_url = || {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");

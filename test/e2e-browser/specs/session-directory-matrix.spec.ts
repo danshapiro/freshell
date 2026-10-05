@@ -1,7 +1,16 @@
 import fs from 'fs/promises'
 import path from 'path'
-import { test as base, expect } from '../helpers/fixtures.js'
+import type { Browser, BrowserContext } from '@playwright/test'
+import { createFreshE2ePage, test as base, expect } from '../helpers/fixtures.js'
 import { createE2eServerHandle } from '../helpers/external-target.js'
+import { RustServer } from '../helpers/rust-server.js'
+import {
+  CLOUD_LANE_GOTO_BOUND_MS,
+  CLOUD_LANE_HARNESS_WAIT_BOUND_MS,
+  isCloudLaneWindowConfigured,
+  TestHarness,
+} from '../helpers/test-harness.js'
+import { writeCodexContinuationFixtures, writeCodexRolloutFixture } from '../helpers/session-corpus/codex.js'
 
 /**
  *
@@ -28,6 +37,82 @@ const OPENCODE_SESSION_ID = 'oc-matrix-delta-0001'
 const AMPLIFIER_SESSION_ID = 'amp-matrix-epsilon-0001'
 const AMPLIFIER_CREATED_AT = '2026-07-19T08:00:00.000Z'
 const AMPLIFIER_LAST_ACTIVITY_AT_ISO = '2026-07-19T08:00:02.000Z'
+const RRX7_CONTINUATION_ID = 'codex-rrx7-continuation-0001'
+const RRX7_CONTINUATION_CWD = '/tmp/freshell-rrx7/codex-continuation'
+const RRX7_COLLISION_ID = 'codex-rrx7-collision-0001'
+const RRX7_HEALTHY_ID = 'codex-rrx7-healthy-0001'
+const RRX7_HEALTHY_CWD = '/tmp/freshell-rrx7/healthy'
+const RRX7_TRANSCRIPT_SEARCHES = [
+  {
+    query: 'rrx7-older-later-transcript-needle',
+    text: 'Please continue rrx7-older-later-transcript-needle from the earlier rollout.',
+  },
+  {
+    query: 'rrx7-newer-later-transcript-needle',
+    text: 'Please continue rrx7-newer-later-transcript-needle from the newer rollout.',
+  },
+] as const
+
+function rrx7ContinuationSegments() {
+  const olderCreatedAt = Date.parse('2026-09-28T14:00:00.000Z')
+  const newerCreatedAt = Date.parse('2026-09-28T14:01:00.000Z')
+  return [
+    {
+      fileName: `rollout-z-older-${RRX7_CONTINUATION_ID}.jsonl`,
+      createdAt: olderCreatedAt,
+      userAt: olderCreatedAt + 1000,
+      assistantAt: olderCreatedAt + 2000,
+      userText: 'rrx7-older-user-needle',
+      assistantText: 'rrx7-older-assistant-reply',
+      laterUserMessage: { at: olderCreatedAt + 3000, text: RRX7_TRANSCRIPT_SEARCHES[0].text },
+    },
+    {
+      fileName: `rollout-a-newer-${RRX7_CONTINUATION_ID}.jsonl`,
+      createdAt: newerCreatedAt,
+      userAt: newerCreatedAt + 1000,
+      assistantAt: newerCreatedAt + 2000,
+      userText: 'rrx7-newer-user-needle',
+      assistantText: 'rrx7-newer-assistant-reply',
+      laterUserMessage: { at: newerCreatedAt + 3000, text: RRX7_TRANSCRIPT_SEARCHES[1].text },
+    },
+  ]
+}
+
+async function bootCodexBrowserPage(
+  browser: Browser,
+  setupHome: (homeDir: string) => Promise<void>,
+): Promise<{
+  server: RustServer
+  context: BrowserContext
+  page: Awaited<ReturnType<typeof createFreshE2ePage>>['page']
+  info: RustServer['info']
+}> {
+  const server = new RustServer({
+    setupHome,
+    verbose: process.env.FRESHELL_E2E_SERVER_VERBOSE === '1',
+  })
+  let context: BrowserContext | undefined
+  try {
+    const info = await server.start()
+    const owned = await createFreshE2ePage(browser, info)
+    context = owned.context
+    const { page } = owned
+    await page.goto(`${info.baseUrl}/?token=${info.token}&e2e=1`, {
+      timeout: CLOUD_LANE_GOTO_BOUND_MS,
+    })
+    const harness = new TestHarness(page)
+    await harness.waitForHarness(CLOUD_LANE_HARNESS_WAIT_BOUND_MS)
+    await harness.waitForConnection(undefined, {
+      selfHealReload: isCloudLaneWindowConfigured(),
+    })
+    page.setDefaultTimeout(15_000)
+    return { server, context: owned.context, page, info }
+  } catch (error) {
+    await context?.close().catch(() => {})
+    await server.stop().catch(() => {})
+    throw error
+  }
+}
 
 function buildSessionJsonl(input: {
   sessionId: string
@@ -278,6 +363,253 @@ const test = base.extend({
     await use(server)
     await server.stop()
   }, { scope: 'worker' }],
+})
+
+test.describe('Kata rrx7 Codex rollout continuations', () => {
+  test.setTimeout(180_000)
+
+  test('shows one complete sidebar and History session for sequential rollout files', async ({ browser }) => {
+    const owned = await test.step('boot the isolated Codex continuation fixture', () =>
+      bootCodexBrowserPage(browser, async (homeDir) => {
+        await writeCodexContinuationFixtures(homeDir, {
+          sessionId: RRX7_CONTINUATION_ID,
+          cwd: RRX7_CONTINUATION_CWD,
+          segments: rrx7ContinuationSegments(),
+        })
+      }))
+
+    try {
+      const { page, info } = owned
+      const sidebarList = page.getByTestId('sidebar-session-list')
+      const sidebarRow = page.locator(
+        `[data-context="sidebar-session"][data-session-id="${RRX7_CONTINUATION_ID}"]`,
+      )
+
+      await test.step('assert the composed continuation API projection', async () => {
+        await expect(sidebarList).toBeVisible({ timeout: 15_000 })
+
+        const response = await page.request.get(
+          `${info.baseUrl}/api/session-directory?priority=visible&limit=50`,
+          { headers: { 'x-auth-token': info.token }, timeout: 30_000 },
+        )
+        expect(response.ok()).toBe(true)
+        const payload = await response.json() as {
+          items: Array<{
+            sessionId: string
+            provider: string
+            createdAt?: number
+            lastActivityAt: number
+            title?: string
+            summary?: string
+            projectPath: string
+            cwd?: string
+            firstUserMessage?: string
+          }>
+          integrityError?: { kind: string }
+        }
+        const continuationRows = payload.items.filter(
+          (item) => item.provider === 'codex' && item.sessionId === RRX7_CONTINUATION_ID,
+        )
+
+        expect(payload.integrityError).toBeUndefined()
+        expect(continuationRows).toHaveLength(1)
+        expect(continuationRows[0]?.createdAt).toBe(Date.parse('2026-09-28T14:00:00.000Z'))
+        expect(continuationRows[0]?.lastActivityAt).toBe(Date.parse('2026-09-28T14:01:03.000Z'))
+        const continuation = continuationRows[0]!
+        for (const { query } of RRX7_TRANSCRIPT_SEARCHES) {
+          for (const metadata of [
+            continuation.title,
+            continuation.summary,
+            continuation.projectPath,
+            continuation.cwd,
+            continuation.firstUserMessage,
+          ]) {
+            expect((metadata ?? '').toLowerCase()).not.toContain(query)
+          }
+        }
+        await expect(sidebarRow).toHaveCount(1)
+      })
+
+      await test.step('search both rollout segments from the Sidebar', async () => {
+        // Later turns prove transcript search; title results are unioned with
+        // deep results, so first-message/title needles could pass without it.
+        const harness = new TestHarness(page)
+        const waitForAppliedSearch = async (query: string, searchTier = 'userMessages') => {
+          // The previous rows remain visible during the debounce and request.
+          // Wait for this exact query to finish before checking its rows.
+          await expect.poll(async () => {
+            const state = await harness.getState()
+            const window = state.sessions?.windows?.sidebar
+            return {
+              appliedQuery: window?.appliedQuery,
+              appliedSearchTier: window?.appliedSearchTier,
+              loading: window?.loading,
+              deepSearchPending: window?.deepSearchPending,
+            }
+          }, { timeout: 15_000 }).toEqual({
+            appliedQuery: query,
+            appliedSearchTier: searchTier,
+            loading: false,
+            deepSearchPending: false,
+          })
+        }
+        const search = page.getByPlaceholder('Search...', { exact: true })
+        await expect(search).toBeVisible()
+        const searchTier = page.getByRole('combobox', { name: 'Search tier' })
+        const waitForSearchResponse = (query: string, tier: string) => page.waitForResponse((response) => {
+          const url = new URL(response.url())
+          return url.pathname === '/api/session-directory'
+            && url.searchParams.get('query') === query
+            && (url.searchParams.get('tier') ?? 'title') === tier
+            && response.request().method() === 'GET'
+        }, { timeout: 15_000 })
+
+        for (const { query, text } of RRX7_TRANSCRIPT_SEARCHES) {
+          const titleResponsePromise = waitForSearchResponse(query, 'title')
+          await search.fill(query)
+          await expect(searchTier).toBeVisible()
+          await searchTier.selectOption('title')
+          const titleResponse = await titleResponsePromise
+          expect(titleResponse.ok()).toBe(true)
+          expect((await titleResponse.json()).items).toEqual([])
+          await waitForAppliedSearch(query, 'title')
+          await expect(sidebarRow).toHaveCount(0)
+
+          // Observe the real Sidebar request; Redux rows omit match/snippet.
+          const deepResponsePromise = waitForSearchResponse(query, 'userMessages')
+          await searchTier.selectOption('userMessages')
+          const deepResponse = await deepResponsePromise
+          expect(deepResponse.ok()).toBe(true)
+          const deepPayload = await deepResponse.json()
+          expect(deepPayload.items).toHaveLength(1)
+          expect(deepPayload.items[0]).toMatchObject({
+            sessionId: RRX7_CONTINUATION_ID,
+            provider: 'codex',
+            matchedIn: 'userMessage',
+            snippet: text,
+          })
+          await waitForAppliedSearch(query)
+          await expect(sidebarRow).toHaveCount(1)
+          await expect(sidebarRow).toBeVisible({ timeout: 15_000 })
+        }
+
+        await search.fill('rrx7-absent-user-needle')
+        await waitForAppliedSearch('rrx7-absent-user-needle')
+        await expect(sidebarRow).toHaveCount(0)
+
+        await search.fill('')
+        await waitForAppliedSearch('', 'title')
+        await expect(sidebarRow).toHaveCount(1)
+        await expect(sidebarRow).toBeVisible({ timeout: 15_000 })
+      })
+
+      await test.step('open History and assert one continuation row', async () => {
+        await page.getByTitle('Projects (Ctrl+B P)').click()
+        const projectHeader = page.locator(`[data-project-path="${RRX7_CONTINUATION_CWD}"]`)
+        await expect(projectHeader).toBeVisible({ timeout: 15_000 })
+        await projectHeader.click()
+        const historyRow = page.locator(
+          `[data-context="history-session"][data-provider="codex"][data-session-id="${RRX7_CONTINUATION_ID}"]`,
+        )
+        await expect(historyRow).toBeVisible({ timeout: 15_000 })
+        await expect(historyRow).toHaveCount(1)
+      })
+    } finally {
+      await owned.context.close().catch(() => {})
+      await owned.server.stop().catch(() => {})
+    }
+  })
+
+  test('quarantines copied same-ID rollouts while keeping a healthy session and dismissible alerts', async ({ browser }) => {
+    const owned = await test.step('boot the isolated copied-rollout fixture', () =>
+      bootCodexBrowserPage(browser, async (homeDir) => {
+        const sourceFiles = await writeCodexContinuationFixtures(homeDir, {
+          sessionId: RRX7_COLLISION_ID,
+          cwd: '/tmp/freshell-rrx7/copied-session',
+          segments: [{
+            fileName: `rollout-original-${RRX7_COLLISION_ID}.jsonl`,
+            createdAt: Date.parse('2026-09-27T09:00:00.000Z'),
+            userAt: Date.parse('2026-09-27T09:00:01.000Z'),
+            assistantAt: Date.parse('2026-09-27T09:00:02.000Z'),
+            userText: 'rrx7 copied rollout user text',
+            assistantText: 'rrx7 copied rollout assistant text',
+          }],
+        })
+        const duplicatePath = path.join(path.dirname(sourceFiles[0]!), `rollout-copy-${RRX7_COLLISION_ID}.jsonl`)
+        await fs.copyFile(sourceFiles[0]!, duplicatePath)
+        await writeCodexRolloutFixture(homeDir, {
+          sessionId: RRX7_HEALTHY_ID,
+          cwd: RRX7_HEALTHY_CWD,
+          fileName: `rollout-healthy-${RRX7_HEALTHY_ID}.jsonl`,
+          createdAt: Date.parse('2026-09-26T09:00:00.000Z'),
+          userAt: Date.parse('2026-09-26T09:00:01.000Z'),
+          assistantAt: Date.parse('2026-09-26T09:00:02.000Z'),
+          userText: 'rrx7 healthy session request',
+          assistantText: 'rrx7 healthy session reply',
+        })
+      }))
+
+    try {
+      const { page, info } = owned
+      const sidebarList = page.getByTestId('sidebar-session-list')
+      const sidebarAlert = page.getByTestId('session-directory-integrity-error')
+
+      await test.step('assert the API quarantines the copied identity', async () => {
+        const response = await page.request.get(
+          `${info.baseUrl}/api/session-directory?priority=visible&limit=50`,
+          { headers: { 'x-auth-token': info.token }, timeout: 30_000 },
+        )
+        expect(response.ok()).toBe(true)
+        const payload = await response.json() as {
+          items: Array<{ sessionId: string; provider: string }>
+          integrityError?: { kind: string; collisionCount: number; duplicateItemCount: number }
+        }
+        expect(payload.integrityError).toMatchObject({
+          kind: 'identity_collision',
+          collisionCount: 1,
+          duplicateItemCount: 2,
+        })
+        expect(payload.items.some((item) => item.sessionId === RRX7_COLLISION_ID)).toBe(false)
+        expect(payload.items.some((item) => item.sessionId === RRX7_HEALTHY_ID)).toBe(true)
+        expect(JSON.stringify(payload)).not.toContain('/.codex/sessions/')
+      })
+
+      await test.step('assert sidebar quarantine and dismiss its alert', async () => {
+        await expect(sidebarList).toBeVisible({ timeout: 15_000 })
+        await expect(sidebarAlert).toBeVisible({ timeout: 15_000 })
+        await expect(page.locator(
+          `[data-context="sidebar-session"][data-session-id="${RRX7_HEALTHY_ID}"]`,
+        )).toBeVisible()
+        await expect(page.locator(
+          `[data-context="sidebar-session"][data-session-id="${RRX7_COLLISION_ID}"]`,
+        )).toHaveCount(0)
+        await sidebarAlert.getByRole('button', { name: 'Dismiss' }).click()
+        await expect(sidebarAlert).toHaveCount(0)
+      })
+
+      await test.step('assert History quarantine and dismiss its alert', async () => {
+        await page.getByTitle('Projects (Ctrl+B P)').click()
+        const historyAlert = page.getByTestId('history-session-directory-integrity-error')
+        await expect(historyAlert).toBeVisible({ timeout: 15_000 })
+        const healthyProject = page.locator(`[data-project-path="${RRX7_HEALTHY_CWD}"]`)
+        await expect(healthyProject).toBeVisible({ timeout: 15_000 })
+        await healthyProject.click()
+        const healthyHistoryRow = page.locator(
+          `[data-context="history-session"][data-provider="codex"][data-session-id="${RRX7_HEALTHY_ID}"]`,
+        )
+        await expect(healthyHistoryRow).toBeVisible({ timeout: 15_000 })
+        const collisionHistoryRow = page.locator(
+          `[data-context="history-session"][data-provider="codex"][data-session-id="${RRX7_COLLISION_ID}"]`,
+        )
+        await expect(collisionHistoryRow).toHaveCount(0)
+        await historyAlert.getByRole('button', { name: 'Dismiss' }).click()
+        await expect(historyAlert).toHaveCount(0)
+      })
+    } finally {
+      await owned.context.close().catch(() => {})
+      await owned.server.stop().catch(() => {})
+    }
+  })
 })
 
 test.describe('Session Directory Matrix', () => {

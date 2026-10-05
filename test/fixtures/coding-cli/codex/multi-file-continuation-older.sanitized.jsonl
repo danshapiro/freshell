@@ -1,0 +1,9 @@
+{"timestamp":"2026-10-03T00:00:00.000Z","type":"session_meta","payload":{"id":"b7936c10-4935-441c-837c-c1f33cafec2d","session_id":"b7936c10-4935-441c-837c-c1f33cafec2d","cwd":"/sanitized/project","source":"vscode","thread_source":"user","cli_version":"0.156.0","originator":"codex-vscode","history_mode":"paginated"}}
+{"timestamp":"2026-10-03T00:00:01.123456Z","ordinal":0,"type":"event_msg","payload":{"type":"user_message","message":"Older first request"}}
+{"timestamp":"2026-10-03T00:00:02.000000Z","ordinal":1,"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Older assistant summary"}]}}
+{"timestamp":"2026-10-03T00:00:02.000000Z","ordinal":2,"type":"response_item","payload":{"type":"reasoning","summary":[{"type":"summary_text","text":"Sanitized reasoning record"}]}}
+{"timestamp":"2026-10-03T00:00:03.000000Z","ordinal":3,"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":100,"cached_input_tokens":20,"output_tokens":10,"total_tokens":110},"last_token_usage":{"input_tokens":100,"cached_input_tokens":20,"output_tokens":10,"total_tokens":110},"model_context_window":258400}}}
+{"timestamp":"2026-10-03T00:00:03.500000Z","ordinal":4,"type":"turn_context","payload":{"cwd":"/sanitized/project","model":"sanitized-model"}}
+{"timestamp":"2026-10-03T00:00:03.750000Z","ordinal":5,"type":"token_usage_record","payload":{"total_token_usage":{"input_tokens":100,"cached_input_tokens":20,"output_tokens":10,"total_tokens":110}}}
+{"timestamp":"2026-10-03T00:00:04.000000Z","ordinal":6,"type":"inter_agent_communication_metadata","payload":{"agent_id":"sanitized-agent","nickname":"sanitized"}}
+{"timestamp":"2026-10-03T00:00:05.000000Z","ordinal":7,"type":"world_state","payload":{"state":"sanitized"}}

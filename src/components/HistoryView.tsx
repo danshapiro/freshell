@@ -4,7 +4,7 @@ import type { CodingCliProviderName, CodingCliSession, ProjectGroup } from '@/st
 import type { RootState } from '@/store/store'
 import { removeSessionFromProjects, toggleProjectExpanded } from '@/store/sessionsSlice'
 import { api } from '@/lib/api'
-import { activateSessionSurface, fetchSessionWindow } from '@/store/sessionsThunks'
+import { activateSessionSurface, fetchSessionWindow, type FetchSessionWindowResult } from '@/store/sessionsThunks'
 import { openSessionTab } from '@/store/tabsSlice'
 import { applySessionRenameCascade } from '@/store/titleSync'
 import { receiveSessionNameProjections, receiveSessionNames } from '@/store/sessionNamesSlice'
@@ -69,8 +69,10 @@ export default function HistoryView({ onOpenSession }: { onOpenSession?: () => v
   const expandedProjects = useAppSelector((s) => s.sessions.expandedProjects)
   const sessionNames = useAppSelector((s) => s.sessionNames)
   const historyWindow = useAppSelector((s) => s.sessions.windows?.history)
-  const projects = useAppSelector((s) => s.sessions.windows?.history?.projects ?? s.sessions.projects)
-  const topLevelSessionCount = useAppSelector((s) => s.sessions.projects?.length ?? 0)
+  const projects = useAppSelector((s) => {
+    const window = s.sessions.windows?.history
+    return typeof window?.lastLoadedAt === 'number' ? window.projects : s.sessions.projects
+  })
   const [filter, setFilter] = useState('')
   const [loading, setLoading] = useState(false)
   const [mobileSessionSheet, setMobileSessionSheet] = useState<MobileSessionSheetState | null>(null)
@@ -81,13 +83,24 @@ export default function HistoryView({ onOpenSession }: { onOpenSession?: () => v
   const [dismissedIntegrityCount, setDismissedIntegrityCount] = useState<number | null>(null)
 
   useEffect(() => {
-    if (historyWindow || topLevelSessionCount > 0) return
-    dispatch(activateSessionSurface('history'))
-    void dispatch(fetchSessionWindow({
+    if (typeof store.getState().sessions.windows?.history?.lastLoadedAt === 'number') return
+
+    let mounted = true
+    const request = dispatch(fetchSessionWindow({
       surface: 'history',
       priority: 'visible',
-    }) as any)
-  }, [dispatch, historyWindow, topLevelSessionCount])
+    }) as any) as Promise<FetchSessionWindowResult>
+    void request.then((result) => {
+      const hasCommittedHistory = typeof store.getState().sessions.windows?.history?.lastLoadedAt === 'number'
+      if (mounted && result.ok && hasCommittedHistory && store.getState().sessions.activeSurface !== 'history') {
+        dispatch(activateSessionSurface('history'))
+      }
+    })
+
+    return () => {
+      mounted = false
+    }
+  }, [dispatch, store])
 
   const filtered = useMemo(() => {
     const q = filter.trim().toLowerCase()
@@ -287,7 +300,7 @@ export default function HistoryView({ onOpenSession }: { onOpenSession?: () => v
             <AlertCircle className="mt-0.5 h-4 w-4 flex-shrink-0" aria-hidden="true" />
             <span>
               {historyWindow.integrityError.collisionCount} conflicting saved session {historyWindow.integrityError.collisionCount === 1 ? 'identity is' : 'identities are'} hidden.
-              {' '}Running terminals remain available. Check the server log, then remove or rename the duplicate files.
+              {' '}Running terminals remain available. Check the server logs for details.
             </span>
           </div>
           <button

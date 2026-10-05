@@ -762,6 +762,7 @@ async fn patch_override_is_visible_through_session_directory_overlay() {
             identity: dir_identity,
             metadata: crate::session_metadata::SessionMetadataStore::new(home.join(".freshell")),
             server_instance: std::sync::Arc::new("srv-test".to_string()),
+            collision_signatures: Default::default(),
             legacy_name_migration_completed: false,
         });
     let dir_resp = dir_app
@@ -1036,6 +1037,7 @@ async fn deleted_session_disappears_from_session_directory_overlay() {
             identity: freshell_ws::identity::TerminalIdentityRegistry::new(),
             metadata: crate::session_metadata::SessionMetadataStore::new(home.join(".freshell")),
             server_instance: std::sync::Arc::new("srv-test".to_string()),
+            collision_signatures: Default::default(),
             legacy_name_migration_completed: false,
         });
 
