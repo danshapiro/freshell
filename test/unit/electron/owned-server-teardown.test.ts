@@ -236,12 +236,14 @@ describe('stopOwnedServerAndVerify', () => {
     vi.useFakeTimers()
     try {
       let aborts = 0
+      const ownershipSignals: AbortSignal[] = []
       const process = {
         pid: 4242,
         isAlive: vi.fn(() => true),
         signal: vi.fn(() => true),
       }
       const proveOwnership = vi.fn(async (_receipt, context?: { signal: AbortSignal }) => {
+        if (context) ownershipSignals.push(context.signal)
         await new Promise<void>((_resolve) => {
           context?.signal.addEventListener('abort', () => { aborts += 1 }, { once: true })
         })
@@ -264,12 +266,25 @@ describe('stopOwnedServerAndVerify', () => {
       )
 
       // Initial observation and final verification each bound their own proof.
-      // Advance both deadlines without racing the busy worker's wall clock.
+      // Advance the initial deadline synchronously so its proof is checked
+      // before the rejected observation starts final verification.
+      await Promise.resolve()
+      vi.advanceTimersToNextTimer()
+      expect(proveOwnership).toHaveBeenCalledTimes(1)
+      expect(aborts).toBe(1)
+      expect(ownershipSignals).toHaveLength(1)
+      expect(ownershipSignals[0]?.aborted).toBe(true)
+
+      // Let final verification start its separate ownership proof, then
+      // advance that deadline without racing the busy worker's wall clock.
+      await Promise.resolve()
       await vi.advanceTimersToNextTimerAsync()
-      await vi.advanceTimersToNextTimerAsync()
+      expect(proveOwnership).toHaveBeenCalledTimes(2)
+      expect(aborts).toBe(2)
+      expect(ownershipSignals).toHaveLength(2)
+      expect(ownershipSignals.every((signal) => signal.aborted)).toBe(true)
       expect(result).toBe('rejected')
       expect(process.signal).not.toHaveBeenCalled()
-      expect(aborts).toBeGreaterThan(0)
       const callsAtReturn = process.isAlive.mock.calls.length
       await vi.advanceTimersByTimeAsync(20)
       expect(process.isAlive).toHaveBeenCalledTimes(callsAtReturn)
