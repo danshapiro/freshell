@@ -397,6 +397,9 @@ async fn run() -> Result<(), String> {
         Some("refresh-provider-config") => refresh_provider_config_worker(&args[2..]),
         Some("opencode-import-worker") => run_opencode_import_worker(&args[2..]),
         Some("opencode-reader-probe") => run_opencode_reader_probe(&args[2..]),
+        Some("opencode-stopped-repair-worker") => {
+            run_opencode_stopped_repair_worker(&args[2..])
+        }
         Some("opencode-current-evidence-worker") => {
             run_opencode_current_evidence_worker(&args[2..])
         }
@@ -406,7 +409,7 @@ async fn run() -> Result<(), String> {
             }
             Ok(())
         }
-        _ => Err("usage: freshell-session-host <serve|worker|fixture-child|fresh-agent-fixture-worker|opencode-identity-worker|provider-probe-worker|refresh-provider-config|opencode-import-worker|opencode-reader-probe|opencode-current-evidence-worker> ...".into()),
+        _ => Err("usage: freshell-session-host <serve|worker|fixture-child|fresh-agent-fixture-worker|opencode-identity-worker|provider-probe-worker|refresh-provider-config|opencode-import-worker|opencode-reader-probe|opencode-stopped-repair-worker|opencode-current-evidence-worker> ...".into()),
     }
 }
 
@@ -2341,13 +2344,32 @@ fn run_opencode_provider_helper(
     worker: &str,
     payload_path: Option<&Path>,
 ) -> Result<Vec<u8>, String> {
+    run_opencode_provider_helper_with_env(
+        &terminal.env,
+        terminal.run_as_uid,
+        terminal.run_as_gid,
+        descriptor,
+        workspace_root,
+        cwd,
+        worker,
+        payload_path,
+    )
+}
+
+fn run_opencode_provider_helper_with_env(
+    provider_env: &std::collections::BTreeMap<String, String>,
+    provider_uid: u32,
+    provider_gid: u32,
+    descriptor: &OpenCodeTransferDescriptor,
+    workspace_root: &Path,
+    cwd: &Path,
+    worker: &str,
+    payload_path: Option<&Path>,
+) -> Result<Vec<u8>, String> {
     let executable = std::env::current_exe().map_err(|error| error.to_string())?;
     let mut command = std::process::Command::new("/usr/bin/setpriv");
     command
-        .args(provider_identity_args(
-            terminal.run_as_uid,
-            terminal.run_as_gid,
-        ))
+        .args(provider_identity_args(provider_uid, provider_gid))
         .arg(executable)
         .arg(worker)
         .arg("--workspace-root")
@@ -2355,12 +2377,12 @@ fn run_opencode_provider_helper(
         .arg("--expected-cwd")
         .arg(cwd)
         .arg("--provider-uid")
-        .arg(terminal.run_as_uid.to_string())
+        .arg(provider_uid.to_string())
         .arg("--provider-gid")
-        .arg(terminal.run_as_gid.to_string())
+        .arg(provider_gid.to_string())
         .current_dir(cwd)
         .env_clear()
-        .envs(&terminal.env)
+        .envs(provider_env)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
@@ -2401,6 +2423,109 @@ fn run_opencode_provider_helper(
         return Err("provider-identity OpenCode helper receipt exceeds its bound".into());
     }
     Ok(output.stdout)
+}
+
+fn run_opencode_stopped_repair_worker(args: &[String]) -> Result<(), String> {
+    if args.len() != 10
+        || args[0] != "--stage-dir"
+        || args[2] != "--workspace-root"
+        || args[4] != "--expected-cwd"
+        || args[6] != "--provider-uid"
+        || args[8] != "--provider-gid"
+    {
+        return Err("stopped OpenCode repair helper arguments are invalid".into());
+    }
+    let stage_dir = PathBuf::from(&args[1]);
+    let workspace = PathBuf::from(&args[3]);
+    let cwd = PathBuf::from(&args[5]);
+    let uid = args[7]
+        .parse::<u32>()
+        .map_err(|_| "OpenCode provider uid is invalid")?;
+    let gid = args[9]
+        .parse::<u32>()
+        .map_err(|_| "OpenCode provider gid is invalid")?;
+    if uid == 0 {
+        return Err("OpenCode provider uid cannot be root".into());
+    }
+    let stage_metadata = std::fs::symlink_metadata(&stage_dir)
+        .map_err(|_| "OpenCode repair stage is unavailable")?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        if stage_metadata.file_type().is_symlink()
+            || !stage_metadata.is_dir()
+            || stage_metadata.uid() != 0
+            || stage_metadata.permissions().mode() & 0o222 != 0
+        {
+            return Err("OpenCode repair stage is not a root-owned read-only directory".into());
+        }
+    }
+    let descriptor_path = stage_dir.join("descriptor.json");
+    let descriptor_metadata = std::fs::symlink_metadata(&descriptor_path)
+        .map_err(|_| "OpenCode repair descriptor is unavailable")?;
+    if descriptor_metadata.file_type().is_symlink() || !descriptor_metadata.is_file() {
+        return Err("OpenCode repair descriptor is not a regular file".into());
+    }
+    let descriptor: OpenCodeTransferDescriptor = serde_json::from_slice(
+        &std::fs::read(&descriptor_path)
+            .map_err(|_| "OpenCode repair descriptor cannot be read")?,
+    )
+    .map_err(|_| "OpenCode repair descriptor is invalid")?;
+    descriptor
+        .validate()
+        .map_err(|_| "OpenCode repair descriptor is invalid")?;
+    let payload_path =
+        freshell_agent_runtime::opencode_transfer::verify_staged_bundle(&descriptor, &stage_dir)
+            .map_err(|_| "OpenCode repair stage does not match its descriptor")?;
+    let provider_env = std::env::vars().collect::<std::collections::BTreeMap<_, _>>();
+    let paths = validate_opencode_reader_paths(&provider_env, &workspace, &cwd)?;
+    if std::env::current_dir().map_err(|_| "repair helper working directory is unavailable")?
+        != paths.cwd
+    {
+        return Err("OpenCode repair helper cwd differs from the requested provider cwd".into());
+    }
+
+    let import_output = run_opencode_provider_helper_with_env(
+        &provider_env,
+        uid,
+        gid,
+        &descriptor,
+        &paths.workspace,
+        &paths.cwd,
+        "opencode-import-worker",
+        Some(&payload_path),
+    )?;
+    let imported: freshell_agent_runtime::opencode_transfer::ImportReceipt =
+        serde_json::from_slice(&import_output)
+            .map_err(|_| "provider importer returned an invalid repair receipt")?;
+    validate_import_receipt_binding(&imported, &descriptor, &paths)?;
+
+    let reader_output = run_opencode_provider_helper_with_env(
+        &provider_env,
+        uid,
+        gid,
+        &descriptor,
+        &paths.workspace,
+        &paths.cwd,
+        "opencode-reader-probe",
+        None,
+    )?;
+    let readable: freshell_agent_runtime::opencode_transfer::InstalledStoreReadable =
+        serde_json::from_slice(&reader_output)
+            .map_err(|_| "provider reader returned an invalid repair receipt")?;
+    validate_reader_receipt_binding(&readable, &descriptor, &paths, uid, gid, &imported)?;
+
+    let receipt = serde_json::json!({
+        "imported": imported,
+        "readable": readable,
+    });
+    let bytes = serde_json::to_vec(&receipt)
+        .map_err(|_| "stopped OpenCode repair receipts could not be encoded")?;
+    if bytes.len() > MAX_OPENCODE_RECEIPT_BYTES {
+        return Err("stopped OpenCode repair receipts exceed their bound".into());
+    }
+    println!("{}", String::from_utf8(bytes).expect("JSON is UTF-8"));
+    Ok(())
 }
 
 fn validate_import_receipt_binding(
