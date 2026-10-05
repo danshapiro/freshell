@@ -1615,3 +1615,48 @@ fn opencode_transfer_stage_process_crash_child() {
         .unwrap();
     unreachable!("the selected staging failpoint must kill this child process");
 }
+
+#[test]
+fn native_inventory_keeps_retained_transfer_artifacts_out_of_absence() {
+    let dir = tempfile::tempdir().unwrap();
+    let staging =
+        OpenCodeTransferStaging::new(dir.path(), StagingLimits::for_test(64, 128)).unwrap();
+    let payload = b"synthetic";
+    let descriptor = descriptor(payload, "source-inventory");
+    assert!(!staging
+        .has_origin_artifact(&descriptor.source_store_id, &descriptor.root_session_id)
+        .unwrap());
+    begin_test_attempt(&staging, &descriptor, 128).unwrap();
+    assert!(
+        staging
+            .has_origin_artifact(&descriptor.source_store_id, &descriptor.root_session_id)
+            .unwrap(),
+        "partial native source still blocks authoritative absence"
+    );
+    staging
+        .write_chunk(&chunk(&descriptor, payload, 0))
+        .unwrap();
+    staging
+        .finalize(&descriptor.transfer_id, TEST_ATTEMPT)
+        .unwrap();
+    assert!(staging
+        .has_origin_artifact(&descriptor.source_store_id, &descriptor.root_session_id)
+        .unwrap());
+    assert!(!staging
+        .has_origin_artifact("different-store", &descriptor.root_session_id)
+        .unwrap());
+    std::fs::set_permissions(
+        staging.ready_path(&descriptor.transfer_id),
+        std::fs::Permissions::from_mode(0o700),
+    )
+    .unwrap();
+    std::fs::remove_file(
+        staging
+            .ready_path(&descriptor.transfer_id)
+            .join("descriptor.json"),
+    )
+    .unwrap();
+    assert!(staging
+        .has_origin_artifact(&descriptor.source_store_id, &descriptor.root_session_id)
+        .is_err());
+}

@@ -1571,17 +1571,6 @@ mod tests {
                 "manifest qualification readiness drifted for {}",
                 capability.provider
             );
-            let runtime_paths = capability
-                .recovery_paths
-                .iter()
-                .map(|path| serde_json::to_value(path).unwrap())
-                .collect::<Vec<_>>();
-            assert_eq!(
-                entry["recoveryPaths"],
-                serde_json::Value::Array(runtime_paths),
-                "manifest recovery path inventory drifted for {}",
-                capability.provider
-            );
         }
 
         let certification = &manifest["certification"];

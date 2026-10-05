@@ -11,6 +11,7 @@ runtime-test-faults = []
 provider-qualification = ["freshell-agent-runtime/provider-qualification"]
 
 [dependencies]
+freshell-sessions = { path = "../freshell-sessions" }
 freshell-agent-runtime = { path = "../freshell-agent-runtime" }
 freshell-runtime-protocol = { path = "../freshell-runtime-protocol" }
 freshell-runtime-observability = { path = "../freshell-runtime-observability" }
