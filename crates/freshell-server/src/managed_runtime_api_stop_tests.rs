@@ -655,12 +655,17 @@ async fn restored_web_reads_large_retained_codex_history_without_source_or_regis
         "large-native-thread",
     )
     .await;
+    let fence = registry
+        .recovery_write_fence(before.soul_id.clone())
+        .await
+        .unwrap();
     registry
         .mark_recovery_blocked(
             before.soul_id.clone(),
             None,
             RecoveryBlockReason::ProviderUnavailable,
             vec!["fixture://provider-unavailable".into()],
+            fence,
         )
         .await
         .unwrap();
@@ -821,12 +826,17 @@ async fn restored_api_reads_managed_claude_and_kilroy_native_history_without_an_
         let id = "44444444-4444-4444-8444-444444444444";
         let (registry, before) =
             fixture_fresh_soul(temp.path(), false, provider, session_type, id).await;
+        let fence = registry
+            .recovery_write_fence(before.soul_id.clone())
+            .await
+            .unwrap();
         registry
             .mark_recovery_blocked(
                 before.soul_id.clone(),
                 None,
                 RecoveryBlockReason::StoreUnreadable,
                 vec!["fixture native store temporarily unavailable".into()],
+                fence,
             )
             .await
             .unwrap();
@@ -879,4 +889,62 @@ async fn restored_api_reads_managed_claude_and_kilroy_native_history_without_an_
         control.abort();
         let _ = control.await;
     }
+}
+
+#[tokio::test]
+async fn restore_lost_souls_route_requires_auth_and_runtime_connection() {
+    let temp = tempfile::tempdir().unwrap();
+    let (tx, _) = tokio::sync::broadcast::channel(16);
+    let state = ManagedRuntimeApiState::new(
+        Arc::new("web-token".into()),
+        None,
+        Some(temp.path().join("projections.json")),
+        Arc::new(PaneLedger::new(Some(temp.path().join("ledger")))),
+        Arc::new(tx),
+    )
+    .await
+    .unwrap();
+    let app = router(state);
+    let targets = (0..8)
+        .map(|_| {
+            json!({
+                "soulId": SoulId::new(),
+                "incidentId": IncidentId::new(),
+                "expectedIntentRevision": 1
+            })
+        })
+        .collect::<Vec<_>>();
+    let body = json!({
+        "idempotencyKey": RequestId::new(),
+        "targets": targets
+    })
+    .to_string();
+
+    let unauthorized = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/runtime/soul-loss-repairs")
+                .header("content-type", "application/json")
+                .body(Body::from(body.clone()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+
+    let unavailable = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/runtime/soul-loss-repairs")
+                .header("x-auth-token", "web-token")
+                .header("content-type", "application/json")
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(unavailable.status(), StatusCode::SERVICE_UNAVAILABLE);
 }
