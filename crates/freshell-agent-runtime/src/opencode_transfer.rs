@@ -33,6 +33,7 @@ use sha2::{Digest, Sha256};
 
 const DESTINATION_SCHEMA: &str = "opencode-1.18.21";
 const DESTINATION_IMPORT_OVERHEAD_BYTES: u64 = 1024 * 1024;
+const JS_DATE_MAX_EPOCH_MILLISECONDS: f64 = 8_640_000_000_000_000.0;
 
 type SerializedFieldDigests = BTreeMap<String, String>;
 type CurrentRowFieldDigests = (SerializedFieldDigests, SerializedFieldDigests);
@@ -1129,7 +1130,9 @@ fn validate_v2_event_payload(
     let base = ["sessionID", "timestamp"];
     if data.get("sessionID").and_then(serde_json::Value::as_str) != Some(session_id)
         || !valid_session_id(session_id)
-        || !data.get("timestamp").is_some_and(is_finite_number)
+        || data
+            .get("timestamp")
+            .is_none_or(|value| canonical_v2_timestamp_millis(value).is_none())
         || required.iter().any(|key| !object.contains_key(*key))
         || object.keys().any(|key| {
             !base.contains(&key.as_str())
@@ -1149,6 +1152,21 @@ fn is_finite_number(value: &serde_json::Value) -> bool {
     value.as_f64().is_some_and(f64::is_finite)
 }
 
+fn canonical_v2_timestamp_millis(value: &serde_json::Value) -> Option<i64> {
+    let milliseconds = value.as_f64()?;
+    if !milliseconds.is_finite() || milliseconds.abs() > JS_DATE_MAX_EPOCH_MILLISECONDS {
+        return None;
+    }
+    // The pinned OpenCode DateTimeUtcFromMillis codec uses JavaScript Date
+    // TimeClip when decoding and serializes DateTime.toEpochMillis afterward.
+    Some(milliseconds.trunc() as i64)
+}
+
+fn v2_event_timestamp_millis(data: &serde_json::Value) -> Option<i64> {
+    data.get("timestamp")
+        .and_then(canonical_v2_timestamp_millis)
+}
+
 fn is_nonnegative_finite_number(value: &serde_json::Value) -> bool {
     value
         .as_f64()
@@ -1161,6 +1179,10 @@ fn is_nonnegative_integer(value: &serde_json::Value) -> bool {
 
 fn is_string(value: &serde_json::Value) -> bool {
     value.as_str().is_some()
+}
+
+fn is_workspace_id(value: &serde_json::Value) -> bool {
+    value.as_str().is_some_and(|value| value.starts_with("wrk"))
 }
 
 fn valid_session_id(value: &str) -> bool {
@@ -1270,7 +1292,7 @@ fn is_model_ref(value: &serde_json::Value) -> bool {
 fn is_v2_location_ref(value: &serde_json::Value) -> bool {
     has_object_shape(value, &["directory"], &["workspaceID"])
         && field_is(value, "directory", is_string)
-        && optional_field_is(value, "workspaceID", is_string)
+        && optional_field_is(value, "workspaceID", is_workspace_id)
 }
 
 fn is_provider_metadata(value: &serde_json::Value) -> bool {
@@ -1537,9 +1559,7 @@ fn apply_v2_projection_event(
     messages: &mut BTreeMap<(String, String), ProjectedSessionMessage>,
     inputs: &mut BTreeMap<(String, String), ProjectedSessionInput>,
 ) -> Result<(), OpenCodeImportError> {
-    let timestamp = data
-        .get("timestamp")
-        .and_then(serde_json::Value::as_i64)
+    let timestamp = v2_event_timestamp_millis(data)
         .ok_or_else(|| OpenCodeImportError::Blocked("V2 event timestamp is invalid".into()))?;
     match event_type {
         "session.next.agent.switched" => {
@@ -2375,12 +2395,9 @@ fn latest_successful_todowrite(
             continue;
         };
         let seq = value_integer_required(event, "seq")?;
-        let timestamp = data
-            .get("timestamp")
-            .and_then(serde_json::Value::as_i64)
-            .ok_or_else(|| {
-                OpenCodeImportError::Blocked("todowrite event has no integer timestamp".into())
-            })?;
+        let timestamp = v2_event_timestamp_millis(&data).ok_or_else(|| {
+            OpenCodeImportError::Blocked("todowrite event has no valid DateTime timestamp".into())
+        })?;
         if kind == "session.next.tool.called" {
             if data.get("tool").and_then(serde_json::Value::as_str) == Some("todowrite") {
                 let todos = data
@@ -2602,6 +2619,9 @@ fn allowed_scalar_column(table: &str, column: &str) -> bool {
                 | "agent"
                 | "model"
                 | "revert"
+                | "directory"
+                | "path"
+                | "workspace_id"
         ),
         "message" => column == "data",
         "part" => column == "data",
@@ -2704,8 +2724,8 @@ fn row_has_supporting_transition(
                         id.as_deref().unwrap_or_default(),
                     )?
                     && part_creation_event_matches(row, events)?
-                    && value_integer(row, "time_created")
-                        .zip(value_integer(row, "time_updated"))
+                    && value_number(row, "time_created")
+                        .zip(value_number(row, "time_updated"))
                         .is_some_and(|(created, updated)| updated >= created)
             }
             "session" => match event_type {
@@ -2720,27 +2740,23 @@ fn row_has_supporting_transition(
                 "session.next.revert.staged" => id.as_deref().is_some_and(|id| {
                     value_text(row, "id").ok().flatten().as_deref() == Some(id)
                         && json_column(row, "revert").as_ref() == data.get("revert")
-                        && data.get("timestamp").and_then(serde_json::Value::as_i64)
-                            == value_integer(row, "time_updated")
+                        && v2_event_timestamp_millis(&data) == value_integer(row, "time_updated")
                 }),
                 "session.next.revert.cleared" => id.as_deref().is_some_and(|id| {
                     value_text(row, "id").ok().flatten().as_deref() == Some(id)
                         && json_column(row, "revert") == Some(serde_json::Value::Null)
-                        && data.get("timestamp").and_then(serde_json::Value::as_i64)
-                            == value_integer(row, "time_updated")
+                        && v2_event_timestamp_millis(&data) == value_integer(row, "time_updated")
                 }),
                 "session.next.agent.switched" => {
                     id.as_deref() == Some(session_id.as_str())
                         && value_text(row, "agent")?.as_deref()
                             == data.get("agent").and_then(serde_json::Value::as_str)
-                        && data.get("timestamp").and_then(serde_json::Value::as_i64)
-                            == value_integer(row, "time_updated")
+                        && v2_event_timestamp_millis(&data) == value_integer(row, "time_updated")
                 }
                 "session.next.model.switched" => {
                     id.as_deref() == Some(session_id.as_str())
                         && json_column(row, "model") == data.get("model").cloned()
-                        && data.get("timestamp").and_then(serde_json::Value::as_i64)
-                            == value_integer(row, "time_updated")
+                        && v2_event_timestamp_millis(&data) == value_integer(row, "time_updated")
                 }
                 "session.next.moved" => {
                     let location = data.get("location");
@@ -2755,8 +2771,7 @@ fn row_has_supporting_transition(
                             == location
                                 .and_then(|value| value.get("workspaceID"))
                                 .and_then(serde_json::Value::as_str)
-                        && data.get("timestamp").and_then(serde_json::Value::as_i64)
-                            == value_integer(row, "time_updated")
+                        && v2_event_timestamp_millis(&data) == value_integer(row, "time_updated")
                 }
                 _ => false,
             },
@@ -2914,6 +2929,25 @@ fn value_integer(row: &SerializedRow, key: &str) -> Option<i64> {
     }
 }
 
+fn value_number(row: &SerializedRow, key: &str) -> Option<f64> {
+    match row.values.get(key) {
+        Some(SerializedSqlValue::Integer { value }) => Some(*value as f64),
+        Some(SerializedSqlValue::Real { bits }) => {
+            let bits = u64::from_str_radix(bits, 16).ok()?;
+            let value = f64::from_bits(bits);
+            value.is_finite().then_some(value)
+        }
+        _ => None,
+    }
+}
+
+fn sql_number_matches_json(row: &SerializedRow, key: &str, value: &serde_json::Value) -> bool {
+    let Some(expected) = value.as_f64().filter(|value| value.is_finite()) else {
+        return false;
+    };
+    value_number(row, key) == Some(expected)
+}
+
 fn value_text(row: &SerializedRow, key: &str) -> Result<Option<String>, OpenCodeImportError> {
     match row.values.get(key) {
         Some(SerializedSqlValue::Null) | None => Ok(None),
@@ -2948,15 +2982,11 @@ fn message_event_matches_row(data: &serde_json::Value, row: &SerializedRow, id: 
     let Some(actual) = json_column(row, "data") else {
         return false;
     };
-    let Some(created) = info
-        .get("time")
-        .and_then(|time| time.get("created"))
-        .and_then(serde_json::Value::as_i64)
-    else {
+    let Some(created) = info.get("time").and_then(|time| time.get("created")) else {
         return false;
     };
     actual == serde_json::Value::Object(expected)
-        && value_integer(row, "time_created") == Some(created)
+        && sql_number_matches_json(row, "time_created", created)
 }
 
 fn part_event_matches_row(data: &serde_json::Value, row: &SerializedRow, id: &str) -> bool {
@@ -2988,7 +3018,7 @@ fn part_creation_event_matches(
     let Some(session_id) = value_text(row, "session_id")? else {
         return Ok(false);
     };
-    let mut first: Option<(i64, i64, String)> = None;
+    let mut first: Option<(i64, f64)> = None;
     for event in events {
         let event_type = value_text(event, "type")?.unwrap_or_default();
         if pinned_event_kind(&event_type) != Some("message.part.updated") {
@@ -3007,18 +3037,16 @@ fn part_creation_event_matches(
         let seq = value_integer_required(event, "seq")?;
         let time = data
             .get("time")
-            .and_then(serde_json::Value::as_i64)
+            .and_then(serde_json::Value::as_f64)
+            .filter(|value| value.is_finite())
             .ok_or_else(|| {
-                OpenCodeImportError::Blocked("durable part update has no integer timestamp".into())
+                OpenCodeImportError::Blocked("durable part update has no finite timestamp".into())
             })?;
-        if first
-            .as_ref()
-            .is_none_or(|(first_seq, _, _)| seq < *first_seq)
-        {
-            first = Some((seq, time, part_id.clone()));
+        if first.as_ref().is_none_or(|(first_seq, _)| seq < *first_seq) {
+            first = Some((seq, time));
         }
     }
-    Ok(first.is_some_and(|(_, time, _)| value_integer(row, "time_created") == Some(time)))
+    Ok(first.is_some_and(|(_, time)| value_number(row, "time_created") == Some(time)))
 }
 
 fn session_row_matches_info(row: &SerializedRow, info: &serde_json::Value) -> bool {
@@ -3155,7 +3183,7 @@ fn session_input_event_matches_row(
     let Some(seq) = value_integer(event, "seq") else {
         return false;
     };
-    let Some(timestamp) = data.get("timestamp").and_then(serde_json::Value::as_i64) else {
+    let Some(timestamp) = v2_event_timestamp_millis(data) else {
         return false;
     };
     match event_type {
@@ -3416,7 +3444,7 @@ fn is_v1_session_info(value: &serde_json::Value, session_id: &serde_json::Value)
         && ["slug", "projectID", "directory", "title", "version"]
             .iter()
             .all(|key| field_is(value, key, is_string))
-        && optional_field_is(value, "workspaceID", is_string)
+        && optional_field_is(value, "workspaceID", is_workspace_id)
         && optional_field_is(value, "path", is_string)
         && optional_field_is(value, "parentID", |value| {
             value.as_str().is_some_and(valid_session_id)
@@ -4012,7 +4040,7 @@ fn derive_root_tail(
         value_text(row, "session_id").ok().flatten().as_deref() == Some(root_session_id)
     });
     let ordered = if has_v2_history {
-        let mut ordered = session_messages
+        let mut rows = session_messages
             .iter()
             .filter(|row| {
                 value_text(row, "session_id").ok().flatten().as_deref() == Some(root_session_id)
@@ -4026,25 +4054,33 @@ fn derive_root_tail(
                 ))
             })
             .collect::<Result<Vec<_>, OpenCodeImportError>>()?;
-        ordered.sort();
-        ordered
+        rows.sort();
+        rows.into_iter().map(|(_, id)| id).collect::<Vec<_>>()
     } else {
-        let mut ordered = messages
+        let mut rows = messages
             .iter()
             .filter(|row| {
                 value_text(row, "session_id").ok().flatten().as_deref() == Some(root_session_id)
             })
             .map(|row| {
                 Ok((
-                    value_integer_required(row, "time_created")?,
+                    value_number(row, "time_created").ok_or_else(|| {
+                        OpenCodeImportError::Blocked(
+                            "root message has no finite creation timestamp".into(),
+                        )
+                    })?,
                     value_text(row, "id")?.ok_or_else(|| {
                         OpenCodeImportError::Blocked("root message has no exact ID".into())
                     })?,
                 ))
             })
             .collect::<Result<Vec<_>, OpenCodeImportError>>()?;
-        ordered.sort();
-        ordered
+        rows.sort_by(|left, right| {
+            left.0
+                .total_cmp(&right.0)
+                .then_with(|| left.1.cmp(&right.1))
+        });
+        rows.into_iter().map(|(_, id)| id).collect::<Vec<_>>()
     };
     if let Some(revert) = value_text(root, "revert")? {
         let revert: serde_json::Value = serde_json::from_str(&revert).map_err(|_| {
@@ -4058,7 +4094,7 @@ fn derive_root_tail(
             })?;
         let index = ordered
             .iter()
-            .position(|(_, id)| id == boundary)
+            .position(|id| id == boundary)
             .ok_or_else(|| {
                 OpenCodeImportError::Blocked("the active revert boundary is not in the root".into())
             })?;
@@ -4075,11 +4111,11 @@ fn derive_root_tail(
             return Ok(VerifiedRootTail::QualifiedEmpty);
         }
         return Ok(VerifiedRootTail::Message {
-            message_id: ordered[index - 1].1.clone(),
+            message_id: ordered[index - 1].clone(),
         });
     }
     Ok(match ordered.last() {
-        Some((_, message_id)) => VerifiedRootTail::Message {
+        Some(message_id) => VerifiedRootTail::Message {
             message_id: message_id.clone(),
         },
         None => VerifiedRootTail::QualifiedEmpty,

@@ -40,6 +40,32 @@ fn fixture_with_baseline_event() -> Fixture {
     fixture
 }
 
+fn fixture_with_baseline_event_workspace_id(workspace_id: &str) -> Fixture {
+    let directory = tempfile::tempdir().unwrap();
+    let mut fixture = fixture_with_event_and_v2_context_and_workspace(
+        directory.path(),
+        true,
+        false,
+        Some(workspace_id),
+        Some(workspace_id),
+    );
+    fixture._directory = Some(directory);
+    fixture
+}
+
+fn fixture_with_baseline_workspace_id_without_event_field(workspace_id: &str) -> Fixture {
+    let directory = tempfile::tempdir().unwrap();
+    let mut fixture = fixture_with_event_and_v2_context_and_workspace(
+        directory.path(),
+        true,
+        false,
+        Some(workspace_id),
+        None,
+    );
+    fixture._directory = Some(directory);
+    fixture
+}
+
 fn fixture_in_with_baseline_event(root: &Path, baseline_event: bool) -> Fixture {
     fixture_with_event_and_v2_context(root, baseline_event, false)
 }
@@ -55,6 +81,22 @@ fn fixture_with_event_and_v2_context(
     root: &Path,
     baseline_event: bool,
     baseline_v2_context: bool,
+) -> Fixture {
+    fixture_with_event_and_v2_context_and_workspace(
+        root,
+        baseline_event,
+        baseline_v2_context,
+        None,
+        None,
+    )
+}
+
+fn fixture_with_event_and_v2_context_and_workspace(
+    root: &Path,
+    baseline_event: bool,
+    baseline_v2_context: bool,
+    baseline_database_workspace_id: Option<&str>,
+    baseline_event_workspace_id: Option<&str>,
 ) -> Fixture {
     fs::create_dir_all(root).unwrap();
     let source = root.join("source.sqlite");
@@ -79,12 +121,21 @@ fn fixture_with_event_and_v2_context(
             params!["project-one", workspace.to_string_lossy()],
         )
         .unwrap();
+    if let Some(workspace_id) = baseline_database_workspace_id {
+        connection
+            .execute(
+                "INSERT INTO workspace (id,type,name,project_id,time_used) VALUES (?1,'directory','workspace','project-one',1)",
+                [workspace_id],
+            )
+            .unwrap();
+    }
     connection
         .execute(
-            "INSERT INTO session (id,project_id,slug,directory,title,version,time_created,time_updated) VALUES (?1,?2,?3,?4,?5,?6,1,1)",
+            "INSERT INTO session (id,project_id,workspace_id,slug,directory,title,version,time_created,time_updated) VALUES (?1,?2,?3,?4,?5,?6,?7,1,1)",
             params![
                 "ses_root",
                 "project-one",
+                baseline_database_workspace_id,
                 "synthetic-slug",
                 workspace.to_string_lossy(),
                 "synthetic title",
@@ -123,21 +174,22 @@ fn fixture_with_event_and_v2_context(
                 [],
             )
             .unwrap();
+        let mut info = serde_json::json!({
+            "id":"ses_root",
+            "slug":"synthetic-slug",
+            "projectID":"project-one",
+            "directory":workspace.to_string_lossy(),
+            "title":"synthetic title",
+            "version":"1.18.21",
+            "time":{"created":1,"updated":1}
+        });
+        if let Some(workspace_id) = baseline_event_workspace_id {
+            info["workspaceID"] = serde_json::json!(workspace_id);
+        }
         connection
             .execute(
                 "INSERT INTO event (id,aggregate_id,seq,type,data) VALUES ('evt_base','ses_root',0,'session.created.1',?1)",
-                [serde_json::json!({
-                    "sessionID":"ses_root",
-                    "info":{
-                        "id":"ses_root",
-                        "slug":"synthetic-slug",
-                        "projectID":"project-one",
-                        "directory":workspace.to_string_lossy(),
-                        "title":"synthetic title",
-                        "version":"1.18.21",
-                        "time":{"created":1,"updated":1}
-                    }
-                }).to_string()],
+                [serde_json::json!({"sessionID":"ses_root","info":info}).to_string()],
         )
         .unwrap();
     }
@@ -314,6 +366,216 @@ fn current_store_verification_accepts_complete_import_and_derives_current_tail()
     );
     assert_eq!(evidence.evidence_generation.len(), 64);
     assert!(!format!("{evidence:?}").contains("UNIQUE_SYNTHETIC_CONVERSATION_BODY"));
+}
+
+#[test]
+fn current_store_verification_accepts_fractional_v1_message_and_part_timestamps() {
+    let fixture = fixture_with_baseline_event();
+    import_bundle(
+        &fixture.descriptor,
+        &fixture.staged_directory,
+        &fixture.destination_database,
+        &fixture.workspace,
+    )
+    .unwrap();
+
+    let connection = Connection::open(&fixture.destination_database).unwrap();
+    let info = serde_json::json!({
+        "id":"msg_fractional",
+        "sessionID":"ses_root",
+        "role":"user",
+        "time":{"created":10.5},
+        "agent":"build",
+        "model":{"providerID":"provider-one","modelID":"model-one"}
+    });
+    let mut message_data = info.as_object().unwrap().clone();
+    message_data.remove("id");
+    message_data.remove("sessionID");
+    append_durable_event(
+        &connection,
+        1,
+        "evt_fractional_message",
+        "message.updated.1",
+        serde_json::json!({"sessionID":"ses_root","info":info}),
+    );
+    connection
+        .execute(
+            "INSERT INTO message(id,session_id,time_created,time_updated,data)
+             VALUES('msg_fractional','ses_root',10.5,12,?1)",
+            [serde_json::Value::Object(message_data).to_string()],
+        )
+        .unwrap();
+
+    let part = serde_json::json!({
+        "id":"prt_fractional",
+        "sessionID":"ses_root",
+        "messageID":"msg_fractional",
+        "type":"text",
+        "text":"fractional event time"
+    });
+    let mut part_data = part.as_object().unwrap().clone();
+    part_data.remove("id");
+    part_data.remove("sessionID");
+    part_data.remove("messageID");
+    append_durable_event(
+        &connection,
+        2,
+        "evt_fractional_part",
+        "message.part.updated.1",
+        serde_json::json!({"sessionID":"ses_root","part":part,"time":11.5}),
+    );
+    connection
+        .execute(
+            "INSERT INTO part(id,message_id,session_id,time_created,time_updated,data)
+             VALUES('prt_fractional','msg_fractional','ses_root',11.5,12,?1)",
+            [serde_json::Value::Object(part_data).to_string()],
+        )
+        .unwrap();
+    drop(connection);
+
+    let evidence = verify_current_store(
+        &fixture.descriptor,
+        &fixture.destination_database,
+        &fixture.workspace,
+    )
+    .expect("the V1 finite timestamp fields project without integer coercion");
+    assert_eq!(
+        evidence.root_tail,
+        VerifiedRootTail::Message {
+            message_id: "msg_fractional".into()
+        }
+    );
+}
+
+#[test]
+fn current_store_verification_canonicalizes_fractional_v2_datetime_timestamps() {
+    let fixture = fixture_with_baseline_event();
+    import_bundle(
+        &fixture.descriptor,
+        &fixture.staged_directory,
+        &fixture.destination_database,
+        &fixture.workspace,
+    )
+    .unwrap();
+
+    let event_data = serde_json::json!({
+        "sessionID":"ses_root",
+        "messageID":"msg_fractional_context",
+        "timestamp":20.5,
+        "text":"canonical millisecond projection"
+    });
+    validate_v2_event_payload("session.next.context.updated", &event_data, "ses_root")
+        .expect("the pinned codec accepts finite fractional milliseconds");
+
+    let connection = Connection::open(&fixture.destination_database).unwrap();
+    append_durable_event(
+        &connection,
+        1,
+        "evt_fractional_context",
+        "session.next.context.updated.1",
+        event_data,
+    );
+    connection
+        .execute(
+            "INSERT INTO session_message
+             (id,session_id,type,seq,time_created,time_updated,data)
+             VALUES('msg_fractional_context','ses_root','system',1,20,20,?1)",
+            [serde_json::json!({
+                "text":"canonical millisecond projection",
+                "time":{"created":20}
+            })
+            .to_string()],
+        )
+        .unwrap();
+    drop(connection);
+
+    let evidence = verify_current_store(
+        &fixture.descriptor,
+        &fixture.destination_database,
+        &fixture.workspace,
+    )
+    .expect("DateTime.makeUnsafe(20.5) encodes as epoch millisecond 20");
+    assert_eq!(
+        evidence.root_tail,
+        VerifiedRootTail::Message {
+            message_id: "msg_fractional_context".into()
+        }
+    );
+}
+
+#[test]
+fn current_store_verification_checks_v1_session_workspace_id_prefix() {
+    for (workspace_id, should_verify) in [("wrk_valid", true), ("ws_invalid", false)] {
+        let fixture = fixture_with_baseline_event_workspace_id(workspace_id);
+        import_bundle(
+            &fixture.descriptor,
+            &fixture.staged_directory,
+            &fixture.destination_database,
+            &fixture.workspace,
+        )
+        .unwrap();
+
+        let result = verify_current_store(
+            &fixture.descriptor,
+            &fixture.destination_database,
+            &fixture.workspace,
+        );
+        assert_eq!(
+            result.is_ok(),
+            should_verify,
+            "workspace ID {workspace_id}: {result:?}"
+        );
+    }
+}
+
+#[test]
+fn current_store_verification_checks_v2_location_workspace_id_prefix() {
+    for (workspace_id, should_verify) in [("wrk_valid", true), ("ws_invalid", false)] {
+        let fixture = fixture_with_baseline_workspace_id_without_event_field(workspace_id);
+        import_bundle(
+            &fixture.descriptor,
+            &fixture.staged_directory,
+            &fixture.destination_database,
+            &fixture.workspace,
+        )
+        .unwrap();
+
+        let moved = serde_json::json!({
+            "sessionID":"ses_root",
+            "timestamp":10,
+            "location":{
+                "directory":fixture.workspace.to_string_lossy(),
+                "workspaceID":workspace_id
+            },
+            "subdirectory":"src"
+        });
+        let connection = Connection::open(&fixture.destination_database).unwrap();
+        connection
+            .execute(
+                "UPDATE session SET path='src',workspace_id=?1,time_updated=10 WHERE id='ses_root'",
+                [workspace_id],
+            )
+            .unwrap();
+        append_durable_event(
+            &connection,
+            1,
+            "evt_moved_workspace",
+            "session.next.moved.1",
+            moved,
+        );
+        drop(connection);
+
+        let result = verify_current_store(
+            &fixture.descriptor,
+            &fixture.destination_database,
+            &fixture.workspace,
+        );
+        assert_eq!(
+            result.is_ok(),
+            should_verify,
+            "workspace ID {workspace_id}: {result:?}"
+        );
+    }
 }
 
 #[test]
@@ -1759,6 +2021,19 @@ fn immutable_baseline_events_are_schema_checked_and_unknown_types_block() {
 
 #[test]
 fn durable_v2_event_payloads_reject_invalid_nested_pinned_schema_values() {
+    let timestamp_outside_javascript_date_range = serde_json::json!({
+        "sessionID":"ses_root",
+        "timestamp":8640000000000001i64,
+        "messageID":"msg_new",
+        "text":"invalid timestamp"
+    });
+    assert!(validate_v2_event_payload(
+        "session.next.context.updated",
+        &timestamp_outside_javascript_date_range,
+        "ses_root"
+    )
+    .is_err());
+
     let invalid_prompt = serde_json::json!({
         "sessionID":"ses_root",
         "timestamp":10,
@@ -1836,7 +2111,7 @@ fn durable_v2_event_schema_accepts_each_pinned_kind_and_schema_authorized_json()
         ),
         (
             "session.next.moved",
-            serde_json::json!({"location":{"directory":"/workspace","workspaceID":"ws_one"},"subdirectory":"src"}),
+            serde_json::json!({"location":{"directory":"/workspace","workspaceID":"wrk_one"},"subdirectory":"src"}),
         ),
         (
             "session.next.prompt.admitted",
