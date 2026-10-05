@@ -188,14 +188,16 @@ pub const CODEX_TUI_NOTIFICATION_ARGS: &[&str] = &[
     "tui.notifications=['agent-turn-complete']",
 ];
 
-/// The claude unix bell command (`terminal-registry.ts:219`, runtime bytes —
-/// the source's `printf '\\a'` template-unescapes to a literal backslash-`a`).
-/// U3 (spec §5): pinned by executing the reference's own source lines.
-pub const CLAUDE_BELL_COMMAND_UNIX: &str = "sh -lc \"printf '\\a' > /dev/tty 2>/dev/null || true\"";
+/// The Claude Unix Stop hook returns the BEL through Claude's hook response.
+/// Claude runs shell-form hooks in its shell, so keep this to a direct printf:
+/// a nested login shell could print profile text ahead of the required JSON.
+pub const CLAUDE_BELL_COMMAND_UNIX: &str = "printf '%s\\n' '{\"terminalSequence\":\"\\u0007\"}'";
 
-/// The claude windows bell command (`terminal-registry.ts:218`, runtime bytes —
-/// `'\\\\.\\CONOUT$'` unescapes to `\\.\CONOUT$`, the Win32 console device path).
-pub const CLAUDE_BELL_COMMAND_WINDOWS: &str = "powershell.exe -NoLogo -NoProfile -NonInteractive -Command \"$bell=[char]7; $ok=$false; try {[System.IO.File]::AppendAllText('\\\\.\\CONOUT$', [string]$bell); $ok=$true} catch {}; if (-not $ok) { try {[Console]::Out.Write($bell); $ok=$true} catch {} }; if (-not $ok) { try {[Console]::Error.Write($bell)} catch {} }\"";
+/// The Claude Windows Stop hook emits the same hook response via PowerShell.
+/// `-EncodedCommand` takes UTF-16LE Base64, so the shell-form command consists
+/// only of safe ASCII tokens and works when Claude launches it through either
+/// Git Bash or PowerShell.
+pub const CLAUDE_BELL_COMMAND_WINDOWS: &str = "powershell.exe -NoLogo -NoProfile -NonInteractive -EncodedCommand WwBDAG8AbgBzAG8AbABlAF0AOgA6AE8AdQB0AC4AVwByAGkAdABlAEwAaQBuAGUAKAAnAHsAIgB0AGUAcgBtAGkAbgBhAGwAUwBlAHEAdQBlAG4AYwBlACIAOgAiAFwAdQAwADAAMAA3ACIAfQAnACkA";
 
 /// SessionStart fires with the CURRENT session id on startup/resume/clear --
 /// the deterministic signal for claude's in-TUI session switches. On claude
@@ -225,20 +227,19 @@ pub const CLAUDE_BELL_COMMAND_WINDOWS: &str = "powershell.exe -NoLogo -NoProfile
 pub const CLAUDE_SESSION_START_COMMAND_UNIX: &str = "sh -lc 'd=\"$HOME/.freshell/session-signals/claude\"; n=$(date +%s%N 2>/dev/null); case \"$n\" in *[!0-9]*|\"\") n=\"$(date +%s)000000000\";; esac; f=\"$d/${FRESHELL_TERMINAL_ID:-unknown}__$n-$$\"; mkdir -p \"$d\" && cat > \"$f.tmp\" && mv \"$f.tmp\" \"$f.json\"' 2>/dev/null || true";
 
 /// Windows twin of [`CLAUDE_SESSION_START_COMMAND_UNIX`] (see its doc for the
-/// semantics + A7 degradation notes): reads the hook's stdin JSON via
-/// `[Console]::In.ReadToEnd()` and writes it atomically (tmp + `Move-Item`)
-/// to `%USERPROFILE%\.freshell\session-signals\claude\<FRESHELL_TERMINAL_ID>__<ticks>.json`,
-/// mirroring the [`CLAUDE_BELL_COMMAND_WINDOWS`] powershell one-liner style —
-/// the whole body is a `try {..} catch {}` so it never blocks or fails the CLI.
-pub const CLAUDE_SESSION_START_COMMAND_WINDOWS: &str = "powershell.exe -NoLogo -NoProfile -NonInteractive -Command \"try { $tid = if ($env:FRESHELL_TERMINAL_ID) { $env:FRESHELL_TERMINAL_ID } else { 'unknown' }; $d = Join-Path $env:USERPROFILE '.freshell\\session-signals\\claude'; New-Item -ItemType Directory -Force -Path $d | Out-Null; $f = Join-Path $d ($tid + '__' + [DateTime]::UtcNow.Ticks); [System.IO.File]::WriteAllText($f + '.tmp', [Console]::In.ReadToEnd()); Move-Item -Force ($f + '.tmp') ($f + '.json') } catch {}\"";
+/// semantics + A7 degradation notes): reads hook stdin and atomically writes
+/// it below `%USERPROFILE%\\.freshell\\session-signals\\claude`. Its encoded
+/// UTF-16LE PowerShell command is safe as shell-form text in Git Bash and
+/// PowerShell. The body remains a `try/catch` so signal-file failures do not
+/// fail the CLI.
+pub const CLAUDE_SESSION_START_COMMAND_WINDOWS: &str = "powershell.exe -NoLogo -NoProfile -NonInteractive -EncodedCommand dAByAHkAewAkAGkAPQAkAGUAbgB2ADoARgBSAEUAUwBIAEUATABMAF8AVABFAFIATQBJAE4AQQBMAF8ASQBEADsAaQBmACgAIQAkAGkAKQB7ACQAaQA9ACcAdQBuAGsAbgBvAHcAbgAnAH0AOwAkAGQAPQBKAG8AaQBuAC0AUABhAHQAaAAgACQAZQBuAHYAOgBVAFMARQBSAFAAUgBPAEYASQBMAEUAIAAnAC4AZgByAGUAcwBoAGUAbABsAFwAcwBlAHMAcwBpAG8AbgAtAHMAaQBnAG4AYQBsAHMAXABjAGwAYQB1AGQAZQAnADsATgBlAHcALQBJAHQAZQBtACAALQBGAG8AcgBjAGUAIAAtAEkAdABlAG0AVAB5AHAAZQAgAEQAaQByAGUAYwB0AG8AcgB5ACAAJABkAHwATwB1AHQALQBOAHUAbABsADsAJABmAD0ASgBvAGkAbgAtAFAAYQB0AGgAIAAkAGQAIAAoACQAaQArACcAXwBfACcAKwBbAEQAYQB0AGUAVABpAG0AZQBdADoAOgBVAHQAYwBOAG8AdwAuAFQAaQBjAGsAcwApADsAWwBJAE8ALgBGAGkAbABlAF0AOgA6AFcAcgBpAHQAZQBBAGwAbABUAGUAeAB0ACgAJABmACsAJwAuAHQAbQBwACcALABbAEMAbwBuAHMAbwBsAGUAXQA6ADoASQBuAC4AUgBlAGEAZABUAG8ARQBuAGQAKAApACkAOwBNAG8AdgBlAC0ASQB0AGUAbQAgAC0ARgBvAHIAYwBlACAAKAAkAGYAKwAnAC4AdABtAHAAJwApACAAKAAkAGYAKwAnAC4AagBzAG8AbgAnACkAfQBjAGEAdABjAGgAewB9AA==";
 
 /// The claude `--settings` payload: compact JSON of the hook settings object
 /// (`terminal-registry.ts:216-238` origin, P4 extends it) —
 /// `{"hooks":{"SessionStart":[...],"Stop":[...]}}` with the session-id signal
-/// hook first and the bell Stop hook unchanged. Built via `serde_json` (the
-/// workspace enables `preserve_order`, so key order is insertion order:
-/// `SessionStart` before `Stop`). Exact bytes pinned by the §4 goldens
-/// (`CLAUDE_SETTINGS_UNIX`/`_WIN`).
+/// hook first and a `Stop` hook which returns the BEL in Claude hook JSON.
+/// Built via `serde_json` (the workspace enables `preserve_order`, so key
+/// order is insertion order: `SessionStart` before `Stop`).
 pub fn claude_settings_json(target: ProviderTarget) -> String {
     let (session_start, bell) = match target {
         ProviderTarget::Windows => (

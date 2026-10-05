@@ -51,6 +51,57 @@ const TAIL_PROBE_MAX_BYTES: u64 = 8 * 1024 * 1024;
 /// Read by GET /api/server-info as "claudeTruthAnomalies" (Task 10).
 pub static CLAUDE_TRUTH_ANOMALIES: AtomicU64 = AtomicU64::new(0);
 
+#[cfg(windows)]
+fn same_windows_path(left: &Path, right: &Path) -> bool {
+    use std::os::windows::ffi::OsStrExt;
+    use std::path::Component;
+
+    const CSTR_EQUAL: i32 = 2;
+    const TRUE: i32 = 1;
+
+    let components_match = |left: Component<'_>, right: Component<'_>| {
+        let left = left.as_os_str().encode_wide().collect::<Vec<_>>();
+        let right = right.as_os_str().encode_wide().collect::<Vec<_>>();
+        let (Ok(left_len), Ok(right_len)) = (i32::try_from(left.len()), i32::try_from(right.len()))
+        else {
+            return false;
+        };
+        if left_len == 0 || right_len == 0 {
+            return false;
+        }
+
+        // SAFETY: both buffers remain alive for the call, and each explicit
+        // length is the number of valid UTF-16 code units in that buffer.
+        unsafe {
+            compare_string_ordinal(left.as_ptr(), left_len, right.as_ptr(), right_len, TRUE)
+                == CSTR_EQUAL
+        }
+    };
+
+    let mut left = left.components();
+    let mut right = right.components();
+    loop {
+        match (left.next(), right.next()) {
+            (Some(left), Some(right)) if components_match(left, right) => {}
+            (None, None) => return true,
+            _ => return false,
+        }
+    }
+}
+
+#[cfg(windows)]
+#[link(name = "kernel32")]
+unsafe extern "system" {
+    #[link_name = "CompareStringOrdinal"]
+    fn compare_string_ordinal(
+        string1: *const u16,
+        count1: i32,
+        string2: *const u16,
+        count2: i32,
+        ignore_case: i32,
+    ) -> i32;
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TurnProbe {
     /// Non-sidechain user/assistant activity after the last end-boundary
@@ -115,7 +166,8 @@ fn note_format_anomaly(session_id: &str, records: &[serde_json::Value], reason: 
 
 impl FsClaudeTruth {
     /// Candidate roots, priority order — the same ladder as
-    /// `claude_snapshot.rs`: CLAUDE_CONFIG_DIR > CLAUDE_HOME > ~/.claude.
+    /// `claude_snapshot.rs`: CLAUDE_CONFIG_DIR > CLAUDE_HOME > platform
+    /// default `~/.claude`.
     /// Empty-string values are SKIPPED (claude_snapshot.rs precedent —
     /// an empty env var must not produce a bogus relative root).
     pub fn from_env() -> Self {
@@ -130,6 +182,17 @@ impl FsClaudeTruth {
                 roots.push(PathBuf::from(dir));
             }
         }
+        #[cfg(windows)]
+        if let Some(home) = std::env::home_dir() {
+            let default_root = home.join(".claude");
+            if !roots
+                .iter()
+                .any(|root| same_windows_path(root, &default_root))
+            {
+                roots.push(default_root);
+            }
+        }
+        #[cfg(not(windows))]
         if let Some(home) = std::env::var_os("HOME") {
             if !home.is_empty() {
                 roots.push(PathBuf::from(home).join(".claude"));
@@ -480,6 +543,112 @@ mod tests {
         // Sidechain records are invisible to classification.
         write_transcript(dir.path(), "S", &[TURN_START, TURN_END, SIDECHAIN]);
         assert!(matches!(truth.probe_turn_state("S"), TurnProbe::Ended));
+    }
+
+    /// Run the real env lookup in a fresh process so environment values from
+    /// parallel Rust tests cannot affect the Windows home-directory contract.
+    /// Both roots are scratch directories; this never reads a real Claude
+    /// profile.
+    #[cfg(windows)]
+    #[test]
+    fn windows_from_env_uses_userprofile_default_and_ignores_home() {
+        const CHILD_FLAG: &str = "FRESHELL_CLAUDE_TRUTH_WINDOWS_TEST_CHILD";
+
+        if let Some(mode) = std::env::var_os(CHILD_FLAG) {
+            let truth = FsClaudeTruth::from_env();
+            match mode.to_string_lossy().as_ref() {
+                "classify" => {
+                    assert_eq!(
+                        truth.probe_turn_state("windows-profile-in-flight"),
+                        TurnProbe::InFlight
+                    );
+                    assert_eq!(
+                        truth.probe_turn_state("windows-profile-ended"),
+                        TurnProbe::Ended
+                    );
+                }
+                "dedupe" => {
+                    let configured = PathBuf::from(std::env::var_os("CLAUDE_CONFIG_DIR").unwrap());
+                    assert_eq!(truth.roots, vec![configured]);
+                }
+                other => panic!("unexpected child mode: {other}"),
+            }
+            return;
+        }
+
+        let scratch = tempfile::tempdir().unwrap();
+        let profile_root = scratch.path().join("user-profile");
+        let home_root = scratch.path().join("conflicting-home");
+        let profile_claude = profile_root.join(".claude");
+        let home_claude = home_root.join(".claude");
+
+        write_transcript(
+            &profile_claude,
+            "windows-profile-in-flight",
+            &[TURN_START, ASSISTANT],
+        );
+        write_transcript(
+            &profile_claude,
+            "windows-profile-ended",
+            &[TURN_START, ASSISTANT, TURN_END],
+        );
+        // If HOME is treated as a second Windows home candidate, these
+        // opposite classifications expose it even though the session ids
+        // also exist below USERPROFILE.
+        write_transcript(
+            &home_claude,
+            "windows-profile-in-flight",
+            &[TURN_START, ASSISTANT, TURN_END],
+        );
+        write_transcript(
+            &home_claude,
+            "windows-profile-ended",
+            &[TURN_START, ASSISTANT],
+        );
+
+        let run_child = |mode: &str, config_dir: Option<&std::path::Path>| {
+            let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+            command
+                .args([
+                    "--exact",
+                    "claude_truth::tests::windows_from_env_uses_userprofile_default_and_ignores_home",
+                    "--nocapture",
+                ])
+                .env(CHILD_FLAG, mode)
+                .env("USERPROFILE", &profile_root)
+                .env("HOME", &home_root)
+                .env_remove("CLAUDE_HOME");
+            if let Some(config_dir) = config_dir {
+                command.env("CLAUDE_CONFIG_DIR", config_dir);
+            } else {
+                command.env_remove("CLAUDE_CONFIG_DIR");
+            }
+            command
+                .status()
+                .expect("launch isolated Windows transcript test process")
+        };
+
+        // The classification case leaves both explicit roots unset and gives
+        // HOME conflicting transcripts for the same session ids.
+        let status = run_child("classify", None);
+        assert!(status.success(), "isolated Windows transcript test failed");
+
+        // A differently cased spelling of the Windows default is the same
+        // directory and must not cause a duplicate transcript scan.
+        let equivalent_spelling = profile_claude
+            .to_string_lossy()
+            .chars()
+            .map(|ch| match ch {
+                'a'..='z' => ch.to_ascii_uppercase(),
+                'A'..='Z' => ch.to_ascii_lowercase(),
+                _ => ch,
+            })
+            .collect::<String>()
+            .replace('\\', "/");
+        let equivalent_spelling = PathBuf::from(format!("{equivalent_spelling}/"));
+        assert!(equivalent_spelling.exists());
+        let status = run_child("dedupe", Some(&equivalent_spelling));
+        assert!(status.success(), "Windows default-root dedupe test failed");
     }
 
     #[test]

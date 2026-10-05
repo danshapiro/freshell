@@ -13143,10 +13143,15 @@ rl.on('line', (line) => {
         let created = await_claude_created(&mut rx, "req-e3r2-f2").await;
         let placeholder = created["sessionId"].as_str().unwrap().to_string();
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
-        while !sink.was_recorded("claude", FRESH_CREATE_DURABLE_ID) {
+        while crate::ownership_lane::peek_retained_stamp(
+            &st.ownership_stamps,
+            FRESH_CREATE_DURABLE_ID,
+        )
+        .is_none()
+        {
             assert!(
                 tokio::time::Instant::now() < deadline,
-                "the create's adoption never recorded the binding"
+                "the create's adoption never retained the ownership stamp"
             );
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
