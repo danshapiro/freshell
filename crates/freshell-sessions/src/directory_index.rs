@@ -7909,7 +7909,10 @@ pub(crate) mod tests {
         )
         .unwrap();
         index.mark_dirty(&[(metadata.clone(), "amplifier".to_string())]);
-        assert!(wait_until(Duration::from_secs(2), || !index.has_dirty()).await);
+        // A cleared dirty map means the sweep took the mark, but the parsed
+        // row may not have been published yet.
+        index.wait_for_refresh_idle_for_test().await;
+        assert!(!index.has_dirty());
 
         let snap2 = index.snapshot().await;
         let row2 = snap2.iter().find(|s| s.provider == "amplifier").unwrap();
@@ -7932,7 +7935,8 @@ pub(crate) mod tests {
         // A steady second scoped mark (no file movement) re-parses nothing,
         // proving the folded-vs-folded cache keys match (no raw-fold thrash).
         index.mark_dirty(&[(metadata.clone(), "amplifier".to_string())]);
-        assert!(wait_until(Duration::from_secs(2), || !index.has_dirty()).await);
+        index.wait_for_refresh_idle_for_test().await;
+        assert!(!index.has_dirty());
         assert_eq!(
             parse_calls.load(Ordering::SeqCst),
             2,
@@ -7950,7 +7954,8 @@ pub(crate) mod tests {
         )
         .unwrap();
         index.mark_dirty(&[(metadata.clone(), "amplifier".to_string())]);
-        assert!(wait_until(Duration::from_secs(2), || !index.has_dirty()).await);
+        index.wait_for_refresh_idle_for_test().await;
+        assert!(!index.has_dirty());
 
         let snap3 = index.snapshot().await;
         let row3 = snap3.iter().find(|s| s.provider == "amplifier").unwrap();
