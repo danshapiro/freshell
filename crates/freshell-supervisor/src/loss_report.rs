@@ -9,7 +9,10 @@
 
 use crate::{
     notice_outbox::{enqueue_notice_in_tx, increment_counter_in_tx, millis_to_timestamp},
-    registry::{load_owned_handle, OwnedRuntimeHandle, RecoveryContext, Registry, RegistryError},
+    registry::{
+        load_owned_handle, NativeImportState, OwnedRuntimeHandle, RecoveryContext, Registry,
+        RegistryError,
+    },
     view_intents::{enqueue_projection, load_view_intent},
 };
 use freshell_agent_runtime::{managed_recovery_enabled, recovery_paths};
@@ -44,12 +47,16 @@ pub enum LossDecisionError {
     StopIntent,
     #[error("loss certification cannot run for an already terminal soul")]
     AlreadyTerminal,
+    #[error("loss certification requires a previously verified materialized identity")]
+    UnverifiedMaterialization,
     #[error("pristine-seed recovery is still available because no input was dispatched")]
     PristineSeedAvailable,
     #[error("a verified native resume specification is still available")]
     NativeResumeAvailable,
     #[error("a checkpoint revision is retained and its restoration state is unresolved")]
     CheckpointAvailableOrUnknown,
+    #[error("native import source state is incomplete or unresolved")]
+    NativeImportAvailableOrUnknown,
     #[error("provider {0} has no managed recovery capability inventory")]
     MissingCapability(String),
     #[error("provider {0} is not enabled for managed runtime ownership")]
@@ -83,7 +90,85 @@ pub struct LossDecisionInput<'a> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LostDecision {
     certificate: LostDecisionCertificate,
+    capture: LossDecisionCapture,
 }
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LossDecisionCapture {
+    allocation_state: freshell_runtime_protocol::AllocationState,
+    control_epoch: u64,
+    identity_revision: u64,
+    evidence_revision: u64,
+    native_import_revision: u64,
+    native_import_state: NativeImportState,
+    native_import_source_store_id: Option<String>,
+    native_import_root_session_id: Option<String>,
+    native_import_source_generation: Option<String>,
+    native_import_schema_fingerprint: Option<String>,
+    native_import_migration_fingerprint: Option<String>,
+    native_import_complete_inventory: bool,
+    native_import_authority: String,
+    recovery_attempt_id: Option<String>,
+}
+
+type LossCaptureValidationRow = (
+    String,
+    String,
+    Option<String>,
+    String,
+    u64,
+    u64,
+    u64,
+    String,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    bool,
+    String,
+    Option<String>,
+    u64,
+    String,
+    Option<String>,
+);
+
+type LossIncidentCleanupRow = (
+    String,
+    String,
+    String,
+    String,
+    String,
+    Option<u64>,
+    Option<u64>,
+    Option<u64>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<bool>,
+    Option<String>,
+);
+
+type LossSoulCleanupRow = (
+    String,
+    u64,
+    String,
+    Option<String>,
+    u64,
+    u64,
+    u64,
+    String,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    bool,
+    String,
+);
 
 impl LostDecision {
     pub fn try_new(input: LossDecisionInput<'_>) -> Result<Self, LossDecisionError> {
@@ -96,6 +181,12 @@ impl LostDecision {
             RecoveryState::Lost | RecoveryState::Stopped
         ) {
             return Err(LossDecisionError::AlreadyTerminal);
+        }
+        if context.allocation_state != freshell_runtime_protocol::AllocationState::VerifiedDurable {
+            return Err(LossDecisionError::UnverifiedMaterialization);
+        }
+        if !context.native_import_is_definitively_negative() {
+            return Err(LossDecisionError::NativeImportAvailableOrUnknown);
         }
         if context.never_dispatched {
             return Err(LossDecisionError::PristineSeedAvailable);
@@ -177,7 +268,30 @@ impl LostDecision {
             analysis: input.analysis,
             created_at,
         };
-        Ok(Self { certificate })
+        Ok(Self {
+            certificate,
+            capture: LossDecisionCapture {
+                allocation_state: context.allocation_state,
+                control_epoch: context.control_epoch,
+                identity_revision: context.identity_revision,
+                evidence_revision: context.evidence_revision,
+                native_import_revision: context.native_import_revision,
+                native_import_state: context.native_import_state,
+                native_import_source_store_id: context.native_import_source_store_id.clone(),
+                native_import_root_session_id: context.native_import_root_session_id.clone(),
+                native_import_source_generation: context.native_import_source_generation.clone(),
+                native_import_schema_fingerprint: context.native_import_schema_fingerprint.clone(),
+                native_import_migration_fingerprint: context
+                    .native_import_migration_fingerprint
+                    .clone(),
+                native_import_complete_inventory: context.native_import_complete_inventory,
+                native_import_authority: context.native_import_authority.clone(),
+                recovery_attempt_id: context
+                    .recovery_attempt_id
+                    .as_ref()
+                    .map(ToString::to_string),
+            },
+        })
     }
 
     pub fn certificate(&self) -> &LostDecisionCertificate {
@@ -187,6 +301,95 @@ impl LostDecision {
     pub fn into_certificate(self) -> LostDecisionCertificate {
         self.certificate
     }
+}
+
+fn validate_loss_capture(
+    tx: &rusqlite::Transaction<'_>,
+    certificate: &LostDecisionCertificate,
+    capture: &LossDecisionCapture,
+) -> Result<(), RegistryError> {
+    let (
+        provider,
+        store,
+        native_session_id,
+        allocation_state,
+        identity_revision,
+        evidence_revision,
+        native_import_revision,
+        native_import_state,
+        native_import_source_store_id,
+        native_import_root_session_id,
+        native_import_source_generation,
+        native_import_schema_fingerprint,
+        native_import_migration_fingerprint,
+        native_import_complete_inventory,
+        native_import_authority,
+        recovery_attempt_id,
+        control_epoch,
+        recovery_state,
+        current_incident,
+    ): LossCaptureValidationRow = tx
+        .query_row(
+            "SELECT provider,provider_store_id,native_session_id,allocation_state,identity_revision,evidence_revision,native_import_revision,native_import_state,native_import_source_store_id,native_import_root_session_id,native_import_source_generation,native_import_schema_fingerprint,native_import_migration_fingerprint,native_import_complete_inventory,native_import_authority,recovery_attempt_id,installation.control_epoch,recovery_state,loss_incident_id \
+             FROM souls JOIN installation ON installation.singleton=1 WHERE soul_id=?1",
+            params![certificate.soul_id.as_str()],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                    row.get(7)?,
+                    row.get(8)?,
+                    row.get(9)?,
+                    row.get(10)?,
+                    row.get(11)?,
+                    row.get(12)?,
+                    row.get(13)?,
+                    row.get(14)?,
+                    row.get(15)?,
+                    row.get(16)?,
+                    row.get(17)?,
+                    row.get(18)?,
+                ))
+            },
+        )
+        .optional()?
+        .ok_or_else(|| RegistryError::UnknownSoul(certificate.soul_id.clone()))?;
+    let native_session_hash =
+        hash_native_session_reference(&provider, &store, native_session_id.as_deref());
+    let import_capture_matches = native_import_state == capture.native_import_state.as_str()
+        && native_import_source_store_id == capture.native_import_source_store_id
+        && native_import_root_session_id == capture.native_import_root_session_id
+        && native_import_source_generation == capture.native_import_source_generation
+        && native_import_schema_fingerprint == capture.native_import_schema_fingerprint
+        && native_import_migration_fingerprint == capture.native_import_migration_fingerprint
+        && native_import_complete_inventory == capture.native_import_complete_inventory
+        && native_import_authority == capture.native_import_authority;
+    let attempt_matches = recovery_attempt_id.as_deref() == capture.recovery_attempt_id.as_deref()
+        || (recovery_state == "lost"
+            && current_incident.as_deref() == Some(certificate.incident_id.as_str())
+            && recovery_attempt_id.is_none());
+    if capture.allocation_state != freshell_runtime_protocol::AllocationState::VerifiedDurable
+        || allocation_state != "verified_durable"
+        || control_epoch != capture.control_epoch
+        || identity_revision != capture.identity_revision
+        || evidence_revision != capture.evidence_revision
+        || native_import_revision != capture.native_import_revision
+        || !import_capture_matches
+        || !attempt_matches
+        || provider != certificate.provider
+        || store != certificate.provider_store_id
+        || native_session_hash != certificate.native_session_ref_hash
+    {
+        return Err(RegistryError::LossCertificationBlocked(
+            "materialization or provider identity changed during loss certification".into(),
+        ));
+    }
+    Ok(())
 }
 
 fn validate_path_inventory(
@@ -396,9 +599,13 @@ impl Registry {
         decision: LostDecision,
     ) -> Result<PreparedLoss, RegistryError> {
         let installation = self.installation_id().clone();
-        let certificate = decision.into_certificate();
+        let LostDecision {
+            certificate,
+            capture,
+        } = decision;
         self.run_blocking(move |mut conn| {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            validate_loss_capture(&tx, &certificate, &capture)?;
             if let Some((existing_json, incarnation_raw, committed_revision, desired, recovery, current_incident)) = tx
                 .query_row(
                     "SELECT certificate_json,incarnation_id, \
@@ -509,8 +716,12 @@ impl Registry {
                  (incident_id,correlation_id,soul_id,incarnation_id,provider,provider_store_id, \
                   native_session_ref_hash,intent_revision,decision_state,reason_code,certificate_json, \
                   cleanup_state,cleanup_json,observed_cause,missing_invariant,hypotheses_json, \
-                  preventive_action,regression_case,created_at,updated_at,closed_at) \
-                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,'cleanup_pending',?12,?13,?14,?15,?16,?17,?18,?18,NULL)",
+                  preventive_action,regression_case,captured_control_epoch,captured_identity_revision, \
+                  captured_evidence_revision,captured_native_import_revision,captured_native_import_state, \
+                  captured_source_store_id,captured_root_session_id,captured_source_generation, \
+                  captured_source_schema_fingerprint,captured_migration_fingerprint, \
+                  captured_native_import_complete,captured_native_import_authority,created_at,updated_at,closed_at) \
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,'cleanup_pending',?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,?25,?26,?27,?28,?29,?30,?30,NULL)",
                 params![
                     certificate.incident_id.as_str(),
                     certificate.correlation_id.as_str(),
@@ -529,13 +740,25 @@ impl Registry {
                     serde_json::to_string(&certificate.analysis.hypotheses)?,
                     certificate.analysis.preventive_action,
                     certificate.analysis.regression_case,
+                    capture.control_epoch,
+                    capture.identity_revision,
+                    capture.evidence_revision,
+                    capture.native_import_revision,
+                    capture.native_import_state.as_str(),
+                    capture.native_import_source_store_id,
+                    capture.native_import_root_session_id,
+                    capture.native_import_source_generation,
+                    capture.native_import_schema_fingerprint,
+                    capture.native_import_migration_fingerprint,
+                    capture.native_import_complete_inventory,
+                    capture.native_import_authority,
                     now,
                 ],
             )?;
-            tx.execute(
+            let soul_changed = tx.execute(
                 "UPDATE souls SET desired_state='stopped',intent_revision=?1,recovery_state='lost', \
                  recovery_reason=?2,recovery_attempt_id=NULL,loss_incident_id=?3,updated_at=?4 \
-                 WHERE soul_id=?5 AND intent_revision=?6 AND desired_state='running'",
+                 WHERE soul_id=?5 AND intent_revision=?6 AND desired_state='running' AND identity_revision=?7 AND evidence_revision=?8 AND native_import_revision=?9",
                 params![
                     next_revision,
                     format!("LOSS_CERTIFIED:{}", certificate.incident_id),
@@ -543,13 +766,26 @@ impl Registry {
                     now,
                     certificate.soul_id.as_str(),
                     current_revision,
+                    capture.identity_revision,
+                    capture.evidence_revision,
+                    capture.native_import_revision,
                 ],
             )?;
-            tx.execute(
+            if soul_changed != 1 {
+                return Err(RegistryError::LossCertificationBlocked(
+                    "soul revision changed while committing loss".into(),
+                ));
+            }
+            let incarnation_changed = tx.execute(
                 "UPDATE incarnations SET launch_state='stopping',cleanup_state='requested',updated_at=?1 \
                  WHERE incarnation_id=?2",
                 params![now, incarnation_id.as_str()],
             )?;
+            if incarnation_changed != 1 {
+                return Err(RegistryError::InvalidState(
+                    "loss cleanup incarnation changed while committing loss".into(),
+                ));
+            }
             tx.execute(
                 "INSERT INTO stop_tombstones (soul_id,intent_revision,actor,reason,committed_at) \
                  VALUES (?1,?2,'loss-certificate',?3,?4)",
@@ -632,17 +868,28 @@ impl Registry {
     ) -> Result<RuntimeNotice, RegistryError> {
         self.run_blocking(move |mut conn| {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            let (soul_id, incarnation_id, current_state, certificate_json, persisted_cleanup_json): (
-                String,
-                String,
-                String,
-                String,
-                String,
-            ) = tx
+            let (
+                soul_id,
+                incarnation_id,
+                current_state,
+                certificate_json,
+                persisted_cleanup_json,
+                captured_identity_revision,
+                captured_evidence_revision,
+                captured_native_import_revision,
+                captured_native_import_state,
+                captured_source_store_id,
+                captured_root_session_id,
+                captured_source_generation,
+                captured_source_schema_fingerprint,
+                captured_migration_fingerprint,
+                captured_native_import_complete,
+                captured_native_import_authority,
+            ): LossIncidentCleanupRow = tx
                 .query_row(
-                    "SELECT soul_id,incarnation_id,cleanup_state,certificate_json,cleanup_json FROM loss_incidents WHERE incident_id=?1",
+                    "SELECT soul_id,incarnation_id,cleanup_state,certificate_json,cleanup_json,captured_identity_revision,captured_evidence_revision,captured_native_import_revision,captured_native_import_state,captured_source_store_id,captured_root_session_id,captured_source_generation,captured_source_schema_fingerprint,captured_migration_fingerprint,captured_native_import_complete,captured_native_import_authority FROM loss_incidents WHERE incident_id=?1",
                     params![incident_id.as_str()],
-                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?, row.get(6)?, row.get(7)?, row.get(8)?, row.get(9)?, row.get(10)?, row.get(11)?, row.get(12)?, row.get(13)?, row.get(14)?, row.get(15)?)),
                 )
                 .optional()?
                 .ok_or_else(|| {
@@ -677,15 +924,26 @@ impl Registry {
                 .intent_revision
                 .checked_add(1)
                 .ok_or_else(|| RegistryError::Integrity("intent revision overflow".into()))?;
-            let (desired_state, current_revision, recovery_state, current_incident): (
-                String,
-                u64,
-                String,
-                Option<String>,
-            ) = tx.query_row(
-                "SELECT desired_state,intent_revision,recovery_state,loss_incident_id FROM souls WHERE soul_id=?1",
+            let (
+                desired_state,
+                current_revision,
+                recovery_state,
+                current_incident,
+                identity_revision,
+                evidence_revision,
+                native_import_revision,
+                native_import_state,
+                native_import_source_store_id,
+                native_import_root_session_id,
+                native_import_source_generation,
+                native_import_schema_fingerprint,
+                native_import_migration_fingerprint,
+                native_import_complete_inventory,
+                native_import_authority,
+            ): LossSoulCleanupRow = tx.query_row(
+                "SELECT desired_state,intent_revision,recovery_state,loss_incident_id,identity_revision,evidence_revision,native_import_revision,native_import_state,native_import_source_store_id,native_import_root_session_id,native_import_source_generation,native_import_schema_fingerprint,native_import_migration_fingerprint,native_import_complete_inventory,native_import_authority FROM souls WHERE soul_id=?1",
                 params![soul_id],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?, row.get(6)?, row.get(7)?, row.get(8)?, row.get(9)?, row.get(10)?, row.get(11)?, row.get(12)?, row.get(13)?, row.get(14)?)),
             )?;
             if desired_state != "stopped"
                 || current_revision != expected_revision
@@ -696,6 +954,22 @@ impl Registry {
                     expected: expected_revision,
                     current: current_revision,
                 });
+            }
+            let capture_matches = captured_identity_revision == Some(identity_revision)
+                && captured_evidence_revision == Some(evidence_revision)
+                && captured_native_import_revision == Some(native_import_revision)
+                && captured_native_import_state.as_deref() == Some(native_import_state.as_str())
+                && captured_source_store_id == native_import_source_store_id
+                && captured_root_session_id == native_import_root_session_id
+                && captured_source_generation == native_import_source_generation
+                && captured_source_schema_fingerprint == native_import_schema_fingerprint
+                && captured_migration_fingerprint == native_import_migration_fingerprint
+                && captured_native_import_complete == Some(native_import_complete_inventory)
+                && captured_native_import_authority.as_deref() == Some(native_import_authority.as_str());
+            if !capture_matches {
+                return Err(RegistryError::LossCertificationBlocked(
+                    "identity or native import evidence changed after loss was committed".into(),
+                ));
             }
             let now = crate::registry::now_millis();
             let verified = outcome == StopOutcome::VerifiedEmpty && cleanup.verified_empty;

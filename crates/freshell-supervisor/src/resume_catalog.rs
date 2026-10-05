@@ -282,7 +282,7 @@ fn blocked(reason: RecoveryBlockReason, message: String) -> RecoveryProbe {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::registry::OwnedRuntimeHandle;
+    use crate::registry::{NativeImportState, OwnedRuntimeHandle};
     use freshell_runtime_protocol::{
         DesiredState, DockerDaemonId, DurabilityState, FreshAgentLaunchSpec, FreshProvider,
         IncarnationId, InstallationId, LaunchNonce, RecoveryState, RuntimeLimits, RuntimeProfile,
@@ -324,11 +324,23 @@ mod tests {
             creation_seed_ref: "seed".into(),
             desired_state: DesiredState::Running,
             intent_revision: 1,
+            identity_revision: 0,
             recovery_state: RecoveryState::Live,
             durability_state: DurabilityState::Unknown,
             allocation_state: AllocationState::Allocated,
             checkpoint_revision: 0,
             evidence_revision: 0,
+            native_import_revision: 0,
+            native_import_state: NativeImportState::NotApplicable,
+            native_import_source_store_id: None,
+            native_import_root_session_id: None,
+            native_import_source_generation: None,
+            native_import_schema_fingerprint: None,
+            native_import_migration_fingerprint: None,
+            native_import_complete_inventory: false,
+            native_import_authority: "no_import_configured".into(),
+            recovery_attempt_id: None,
+            control_epoch: 1,
             resume_spec: None,
             project_key: "test".into(),
             profile: RuntimeProfile::TestFixture,
