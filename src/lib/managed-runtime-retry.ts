@@ -34,12 +34,14 @@ export async function retryManagedConversation(
   if (!content.soulId || typeof content.soulIntentRevision !== 'number') {
     throw new Error('Managed recovery is missing its current revision.')
   }
+  const actionableRecoveryState = content.recoverySummary?.recoveryState
   const isCurrent = (revision = content.soulIntentRevision) => {
     const latest = getCurrent()
     return Boolean(latest && latest.soulId === content.soulId
       && latest.createRequestId === content.createRequestId
       && latest.soulIntentRevision === revision
-      && latest.recoverySummary?.recoveryState === 'blocked')
+      && latest.recoverySummary?.recoveryState === actionableRecoveryState
+      && (actionableRecoveryState === 'blocked' || actionableRecoveryState === 'data_repair_complete'))
   }
   let response: unknown
   try {
@@ -58,6 +60,9 @@ export async function retryManagedConversation(
   // A completed HTTP request is not evidence that recovery succeeded. If the
   // refreshed pane still needs a decision, retain the supervisor's guidance.
   const repair = result?.outcome === 'blocked' ? result.probe?.data.retry_hint?.repair?.trim() : undefined
+  if (actionableRecoveryState === 'data_repair_complete') {
+    throw new Error(repair || 'The restored conversation has not resumed yet. Try again.')
+  }
   const reason = result?.probe?.data.reason ?? result?.view.recoveryReason ?? getCurrent()?.recoverySummary?.reason
   throw new Error(repair || managedRecoveryBlockedMessage(reason))
 }
