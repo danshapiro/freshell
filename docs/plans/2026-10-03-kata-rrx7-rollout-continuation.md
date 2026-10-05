@@ -7,7 +7,7 @@
 ## User Request
 
 ### Requested result
-Fix KataTracker `rrx7` so verified Codex continuations across rollout files appear as one complete session while ambiguous duplicates remain quarantined. Correct the Claude Code CLI review launch, disposition and resolve the substantive findings preserved in rejected RRX7 delta reports, then restart the delta Fresh Eyes loop.
+Fix KataTracker `rrx7` so verified Codex continuations across rollout files appear as one complete session while ambiguous duplicates remain quarantined. Correct the Claude Code CLI review launch, assess every readable finding preserved in rejected RRX7 delta reports and every finding from the restarted delta reviews, repair all substantiated in-scope findings, and continue the bounded delta Fresh Eyes loop.
 
 ### Explicit constraints
 - Track and fix KataTracker item `rrx7`.
@@ -18,6 +18,7 @@ Fix KataTracker `rrx7` so verified Codex continuations across rollout files appe
 - Do not add a recurring behavioral test for the The Usual auth fix; validate it with a test call.
 - Create and use a dedicated `.worktrees/` worktree from `origin/main`; the user authorized bypassing the earlier base-test gate to create it.
 - Assess every readable finding in the prior rejected delta-review reports; do not discard substantive feedback solely because of report formatting.
+- Assess every finding from each restarted delta review and resolve all substantiated in-scope findings before the next review round.
 - Do not broaden this work into redesigning `bundle-the-usual`.
 - Use red-green-refactor testing and do not weaken or skip tests.
 - Do not create a PR without explicit approval or deploy/restart production.
