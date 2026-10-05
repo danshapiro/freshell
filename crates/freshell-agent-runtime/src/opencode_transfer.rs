@@ -10,6 +10,7 @@ use std::{
     fs::{self, File},
     io::{self, Read},
     path::{Path, PathBuf},
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 use freshell_runtime_protocol::{
@@ -32,6 +33,9 @@ use sha2::{Digest, Sha256};
 
 const DESTINATION_SCHEMA: &str = "opencode-1.18.21";
 const DESTINATION_IMPORT_OVERHEAD_BYTES: u64 = 1024 * 1024;
+
+type SerializedFieldDigests = BTreeMap<String, String>;
+type CurrentRowFieldDigests = (SerializedFieldDigests, SerializedFieldDigests);
 
 /// Test seam and production contract for checking the provider volume before
 /// creating any destination directories or opening SQLite.
@@ -127,6 +131,33 @@ pub struct InstalledStoreReadable {
     pub row_count: u64,
     pub asset_count: u64,
     pub structural_sha256: String,
+}
+
+/// The current root tail verified against the immutable import manifest and
+/// its typed provider transitions. Empty means the exact native messages read
+/// succeeded and found no active root messages; the TUI must still confirm it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", content = "data", rename_all = "snake_case")]
+pub enum VerifiedRootTail {
+    Message { message_id: String },
+    QualifiedEmpty,
+}
+
+/// Body-free generation and display-tail evidence for one verified store
+/// snapshot. The hash commits to exact current rows and referenced assets;
+/// message bodies are hashed but never returned or logged.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CurrentOpenCodeEvidence {
+    pub version: u32,
+    pub transfer_id: String,
+    pub destination_store_id: String,
+    pub root_session_id: String,
+    pub import_generation: String,
+    pub evidence_generation: String,
+    pub root_tail: VerifiedRootTail,
+    pub row_count: u64,
+    pub asset_count: u64,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -393,6 +424,3696 @@ pub fn verify_installed_store(
         asset_count: manifest.assets.len() as u64,
         structural_sha256,
     })
+}
+
+/// Verify the installed session for a later managed OpenCode launch. Unlike
+/// the stopped repair receipt above, this accepts only provider evolution that
+/// is represented by supported, contiguous native events. It never replaces
+/// the import-time baseline with a new whole-store digest.
+pub fn verify_current_store(
+    descriptor: &OpenCodeTransferDescriptor,
+    database_path: &Path,
+    workspace_root: &Path,
+) -> Result<CurrentOpenCodeEvidence, OpenCodeImportError> {
+    validate_descriptor(descriptor)?;
+    let manifest = parse_manifest(descriptor)?;
+    let mut connection = Connection::open_with_flags(
+        database_path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )?;
+    connection.busy_timeout(std::time::Duration::from_secs(5))?;
+    connection.pragma_update(None, "query_only", "ON")?;
+    // Hold one SQLite read snapshot across graph selection, row checks, event
+    // chain validation, and evidence hashing. Without this, an append between
+    // table reads could produce a generation that never existed as a commit.
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Deferred)?;
+    verify_destination_schema(&transaction)?;
+    validate_foreign_keys(&transaction)?;
+
+    let current_session_ids = read_descendant_session_ids(&transaction, &manifest.root_session_id)?;
+    let baseline_session_ids = manifest
+        .rows
+        .iter()
+        .filter(|row| row.table == "session")
+        .map(|row| key_text(&row.key))
+        .collect::<Result<BTreeSet<_>, _>>()?;
+    if !baseline_session_ids.is_subset(&current_session_ids) {
+        return Err(OpenCodeImportError::Blocked(
+            "an imported session or descendant was deleted".into(),
+        ));
+    }
+
+    let mut current_rows = read_current_session_rows(&transaction, &current_session_ids)?;
+    for baseline in &manifest.rows {
+        let key = (baseline.table.clone(), baseline.key.clone());
+        if current_rows.contains_key(&key) {
+            continue;
+        }
+        let row = read_row_by_key(&transaction, &baseline.table, &baseline.key)?;
+        current_rows.insert(key, row);
+    }
+    verify_typed_current_rows(&manifest, &current_rows)?;
+    let current_event_rows = current_rows
+        .values()
+        .filter(|row| row.table == "event")
+        .cloned()
+        .collect::<Vec<_>>();
+    verify_current_event_chains(&manifest, &current_rows, &current_event_rows)?;
+    let current_session_rows = current_rows
+        .values()
+        .filter(|row| row.table == "session")
+        .cloned()
+        .collect::<Vec<_>>();
+    let message_rows = current_rows
+        .values()
+        .filter(|row| row.table == "message")
+        .cloned()
+        .collect::<Vec<_>>();
+    let session_message_rows = current_rows
+        .values()
+        .filter(|row| row.table == "session_message")
+        .cloned()
+        .collect::<Vec<_>>();
+    verify_current_references(&manifest, &current_rows, workspace_root)?;
+    let root_tail = derive_root_tail(
+        &manifest.root_session_id,
+        &current_session_rows,
+        &message_rows,
+        &session_message_rows,
+    )?;
+    let evidence_generation = current_evidence_generation(descriptor, &current_rows, &manifest)?;
+    transaction.commit()?;
+    Ok(CurrentOpenCodeEvidence {
+        version: 1,
+        transfer_id: descriptor.transfer_id.clone(),
+        destination_store_id: descriptor.destination_store_id.clone(),
+        root_session_id: manifest.root_session_id,
+        import_generation: manifest.generation,
+        evidence_generation,
+        root_tail,
+        row_count: current_rows.len() as u64,
+        asset_count: manifest.assets.len() as u64,
+    })
+}
+
+fn key_text(key: &[SerializedSqlValue]) -> Result<String, OpenCodeImportError> {
+    match key {
+        [SerializedSqlValue::Text { value }] if !value.is_empty() => Ok(value.clone()),
+        _ => Err(OpenCodeImportError::Blocked(
+            "an imported native identity key is malformed".into(),
+        )),
+    }
+}
+
+fn read_descendant_session_ids(
+    connection: &Connection,
+    root_session_id: &str,
+) -> Result<BTreeSet<String>, OpenCodeImportError> {
+    let mut statement = connection.prepare(
+        "WITH RECURSIVE selected(id) AS (
+             SELECT id FROM session WHERE id=?1
+             UNION
+             SELECT child.id FROM session child JOIN selected parent
+               ON child.parent_id=parent.id
+         )
+         SELECT id FROM selected ORDER BY id",
+    )?;
+    let ids = statement
+        .query_map([root_session_id], |row| row.get::<_, String>(0))?
+        .collect::<Result<BTreeSet<_>, _>>()?;
+    if ids.len() > 50_000 || !ids.contains(root_session_id) {
+        return Err(OpenCodeImportError::Blocked(
+            "the exact OpenCode root or descendant graph is unavailable".into(),
+        ));
+    }
+    Ok(ids)
+}
+
+fn read_rows_where_values(
+    connection: &Connection,
+    table: &str,
+    column: &str,
+    values: &BTreeSet<String>,
+) -> Result<Vec<SerializedRow>, OpenCodeImportError> {
+    if values.is_empty() {
+        return Ok(Vec::new());
+    }
+    let columns = table_columns(connection, table)?;
+    let selected = columns
+        .iter()
+        .map(|name| format!("\"{name}\""))
+        .collect::<Vec<_>>()
+        .join(",");
+    let primary_keys = primary_key_columns(table).ok_or_else(|| {
+        OpenCodeImportError::Blocked("current store contains an unsupported native table".into())
+    })?;
+    let order = primary_keys
+        .iter()
+        .map(|name| format!("\"{name}\""))
+        .collect::<Vec<_>>()
+        .join(",");
+    let placeholders = (1..=values.len())
+        .map(|index| format!("?{index}"))
+        .collect::<Vec<_>>()
+        .join(",");
+    let sql = format!(
+        "SELECT {selected} FROM \"{table}\" WHERE \"{column}\" IN ({placeholders}) ORDER BY {order}"
+    );
+    let values = values.iter().cloned().map(Value::Text).collect::<Vec<_>>();
+    let mut statement = connection.prepare(&sql)?;
+    let rows = statement
+        .query_map(params_from_iter(values.iter()), |row| {
+            sqlite_row_to_serialized(row, table, &columns, primary_keys)
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+fn read_rows_for_directory(
+    connection: &Connection,
+    project_id: &str,
+    directory: &str,
+) -> Result<Vec<SerializedRow>, OpenCodeImportError> {
+    let table = "project_directory";
+    let columns = table_columns(connection, table)?;
+    let selected = columns
+        .iter()
+        .map(|name| format!("\"{name}\""))
+        .collect::<Vec<_>>()
+        .join(",");
+    let mut statement = connection.prepare(&format!(
+        "SELECT {selected} FROM project_directory WHERE project_id=?1 AND directory=?2"
+    ))?;
+    let primary_keys = primary_key_columns(table).ok_or_else(|| {
+        OpenCodeImportError::Blocked("current store contains an unsupported native table".into())
+    })?;
+    let rows = statement
+        .query_map([project_id, directory], |row| {
+            sqlite_row_to_serialized(row, table, &columns, primary_keys)
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+fn read_current_session_rows(
+    connection: &Connection,
+    session_ids: &BTreeSet<String>,
+) -> Result<BTreeMap<(String, Vec<SerializedSqlValue>), SerializedRow>, OpenCodeImportError> {
+    let mut rows = BTreeMap::new();
+    for (table, column) in [
+        ("session", "id"),
+        ("message", "session_id"),
+        ("part", "session_id"),
+        ("event_sequence", "aggregate_id"),
+        ("event", "aggregate_id"),
+        ("session_message", "session_id"),
+        ("session_input", "session_id"),
+        ("session_context_epoch", "session_id"),
+        ("todo", "session_id"),
+    ] {
+        for row in read_rows_where_values(connection, table, column, session_ids)? {
+            rows.insert((row.table.clone(), row.key.clone()), row);
+        }
+    }
+    let session_rows = rows
+        .values()
+        .filter(|row| row.table == "session")
+        .cloned()
+        .collect::<Vec<_>>();
+    let project_ids = session_rows
+        .iter()
+        .map(|row| value_text(row, "project_id"))
+        .collect::<Result<BTreeSet<_>, _>>()?
+        .into_iter()
+        .flatten()
+        .collect::<BTreeSet<_>>();
+    for (table, key_column) in [("permission", "project_id"), ("project", "id")] {
+        for row in read_rows_where_values(connection, table, key_column, &project_ids)? {
+            rows.insert((row.table.clone(), row.key.clone()), row);
+        }
+    }
+    let workspace_ids = session_rows
+        .iter()
+        .map(|row| value_text(row, "workspace_id"))
+        .collect::<Result<BTreeSet<_>, _>>()?
+        .into_iter()
+        .flatten()
+        .collect::<BTreeSet<_>>();
+    for row in read_rows_where_values(connection, "workspace", "id", &workspace_ids)? {
+        rows.insert((row.table.clone(), row.key.clone()), row);
+    }
+    let mut directories = BTreeSet::new();
+    for session in &session_rows {
+        if let (Some(project_id), Some(directory)) = (
+            value_text(session, "project_id")?,
+            value_text(session, "directory")?,
+        ) {
+            directories.insert((project_id, directory));
+        }
+    }
+    for (project_id, directory) in directories {
+        for row in read_rows_for_directory(connection, &project_id, &directory)? {
+            rows.insert((row.table.clone(), row.key.clone()), row);
+        }
+    }
+    Ok(rows)
+}
+
+fn verify_typed_current_rows(
+    manifest: &OpenCodeTransferManifest,
+    current_rows: &BTreeMap<(String, Vec<SerializedSqlValue>), SerializedRow>,
+) -> Result<(), OpenCodeImportError> {
+    let events = current_rows
+        .values()
+        .filter(|row| row.table == "event")
+        .cloned()
+        .collect::<Vec<_>>();
+    let baseline = manifest
+        .rows
+        .iter()
+        .map(|row| ((row.table.clone(), row.key.clone()), row))
+        .collect::<BTreeMap<_, _>>();
+    verify_v2_session_projections(manifest, current_rows, &events)?;
+    verify_context_epoch_projection(manifest, current_rows, &events)?;
+    let mut changed_rows = Vec::new();
+    for (key, digest) in &baseline {
+        let Some(current) = current_rows.get(key) else {
+            return Err(OpenCodeImportError::Blocked(
+                "an imported native row or edge was deleted".into(),
+            ));
+        };
+        if matches!(
+            digest.table.as_str(),
+            "session_message" | "session_input" | "session_context_epoch"
+        ) {
+            // These projections are replayed/checked as complete typed shapes
+            // below. Per-row event-ID matching is insufficient for them.
+            continue;
+        }
+        if digest_serialized_row(current)? == digest.sha256 {
+            continue;
+        }
+        if !baseline_row_change_is_typed(digest, current)? {
+            return Err(OpenCodeImportError::Blocked(
+                "an imported native row changed outside a supported transition".into(),
+            ));
+        }
+        changed_rows.push(current.clone());
+    }
+
+    verify_todowrite_projection(manifest, current_rows, &events)?;
+
+    for (key, current) in current_rows {
+        if baseline.contains_key(key) {
+            continue;
+        }
+        if !matches!(
+            current.table.as_str(),
+            "session"
+                | "message"
+                | "part"
+                | "event_sequence"
+                | "event"
+                | "session_message"
+                | "session_input"
+                | "session_context_epoch"
+                | "todo"
+        ) {
+            return Err(OpenCodeImportError::Blocked(
+                "an unsupported native row was added to the imported closure".into(),
+            ));
+        }
+        if matches!(
+            current.table.as_str(),
+            "session_message" | "session_input" | "session_context_epoch"
+        ) {
+            continue;
+        }
+        changed_rows.push(current.clone());
+    }
+    for row in &changed_rows {
+        if matches!(
+            row.table.as_str(),
+            "event"
+                | "event_sequence"
+                | "todo"
+                | "session_message"
+                | "session_input"
+                | "session_context_epoch"
+        ) {
+            continue;
+        }
+        if !row_has_supporting_transition(row, &events)? {
+            return Err(OpenCodeImportError::Blocked(
+                "a native row transition has no matching provider event".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn verify_todowrite_projection(
+    manifest: &OpenCodeTransferManifest,
+    current_rows: &BTreeMap<(String, Vec<SerializedSqlValue>), SerializedRow>,
+    events: &[SerializedRow],
+) -> Result<(), OpenCodeImportError> {
+    let baseline = manifest
+        .rows
+        .iter()
+        .filter(|row| row.table == "todo")
+        .map(|row| ((row.table.clone(), row.key.clone()), row.sha256.as_str()))
+        .collect::<BTreeMap<_, _>>();
+    let current = current_rows
+        .iter()
+        .filter(|((table, _), _)| table == "todo")
+        .collect::<BTreeMap<_, _>>();
+    let mut changed_sessions = BTreeSet::new();
+    for (key, old_digest) in &baseline {
+        let Some(row) = current.get(key) else {
+            changed_sessions.insert(key_text(&key.1)?);
+            continue;
+        };
+        if digest_serialized_row(row)? != **old_digest {
+            changed_sessions.insert(value_text(row, "session_id")?.ok_or_else(|| {
+                OpenCodeImportError::Blocked("todo row has no owning session".into())
+            })?);
+        }
+    }
+    for (key, row) in &current {
+        if !baseline.contains_key(key) {
+            changed_sessions.insert(value_text(row, "session_id")?.ok_or_else(|| {
+                OpenCodeImportError::Blocked("todo row has no owning session".into())
+            })?);
+        }
+    }
+    for session_id in changed_sessions {
+        let projection = latest_successful_todowrite(events, &session_id)?;
+        let actual = current
+            .values()
+            .filter(|row| {
+                value_text(row, "session_id").ok().flatten().as_deref() == Some(&session_id)
+            })
+            .copied()
+            .collect::<Vec<_>>();
+        let expected = projection.todos.as_array().ok_or_else(|| {
+            OpenCodeImportError::Blocked("durable todowrite input is not an array".into())
+        })?;
+        if actual.len() != expected.len() {
+            return Err(OpenCodeImportError::Blocked(
+                "current todo rows do not match the last successful durable todowrite".into(),
+            ));
+        }
+        for (position, (row, todo)) in actual.iter().zip(expected).enumerate() {
+            if value_integer(row, "position") != Some(position as i64)
+                || value_text(row, "content")?.as_deref()
+                    != todo.get("content").and_then(serde_json::Value::as_str)
+                || value_text(row, "status")?.as_deref()
+                    != todo.get("status").and_then(serde_json::Value::as_str)
+                || value_text(row, "priority")?.as_deref()
+                    != todo.get("priority").and_then(serde_json::Value::as_str)
+                || !todo_timestamps_match_call(row, projection.called_at, projection.succeeded_at)
+            {
+                return Err(OpenCodeImportError::Blocked(
+                    "current todo row values are not the durable successful todowrite projection"
+                        .into(),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn verify_context_epoch_projection(
+    manifest: &OpenCodeTransferManifest,
+    current_rows: &BTreeMap<(String, Vec<SerializedSqlValue>), SerializedRow>,
+    _events: &[SerializedRow],
+) -> Result<(), OpenCodeImportError> {
+    let baseline = manifest
+        .rows
+        .iter()
+        .filter(|row| row.table == "session_context_epoch")
+        .map(|row| ((row.table.clone(), row.key.clone()), row))
+        .collect::<BTreeMap<_, _>>();
+    let mut checked = BTreeSet::new();
+    for (key, row) in current_rows
+        .iter()
+        .filter(|((table, _), _)| table == "session_context_epoch")
+    {
+        let old = baseline.get(key).ok_or_else(|| {
+            OpenCodeImportError::Blocked(
+                "a new context epoch has no durable baseline event witness".into(),
+            )
+        })?;
+        checked.insert(key.clone());
+        if digest_serialized_row(row)? == old.sha256 {
+            continue;
+        }
+        return Err(OpenCodeImportError::Blocked(
+            "the pinned context.updated event does not contain the exact snapshot value".into(),
+        ));
+    }
+    if baseline.keys().any(|key| !checked.contains(key)) {
+        return Err(OpenCodeImportError::Blocked(
+            "an imported context epoch row was deleted".into(),
+        ));
+    }
+    Ok(())
+}
+
+#[derive(Clone)]
+struct ProjectedSessionMessage {
+    message_type: String,
+    seq: i64,
+    time_created: i64,
+    data: serde_json::Value,
+}
+
+#[derive(Clone)]
+struct ProjectedSessionInput {
+    session_id: String,
+    admitted_seq: i64,
+    promoted_seq: Option<i64>,
+    time_created: i64,
+    delivery: String,
+    prompt: serde_json::Value,
+}
+
+/// Rebuild the pinned V2 projections from the full durable event history.
+/// `session_message` assistant and shell rows are mutable projections: a
+/// single event can never attest their complete current value.
+fn verify_v2_session_projections(
+    manifest: &OpenCodeTransferManifest,
+    current_rows: &BTreeMap<(String, Vec<SerializedSqlValue>), SerializedRow>,
+    events: &[SerializedRow],
+) -> Result<(), OpenCodeImportError> {
+    let mut session_messages = BTreeMap::<(String, String), ProjectedSessionMessage>::new();
+    let mut session_inputs = BTreeMap::<(String, String), ProjectedSessionInput>::new();
+    let mut ordered_events = events
+        .iter()
+        .filter_map(|event| {
+            Some((
+                value_text(event, "aggregate_id").ok().flatten()?,
+                value_integer(event, "seq")?,
+                event,
+            ))
+        })
+        .collect::<Vec<_>>();
+    ordered_events.sort_by(|left, right| (&left.0, left.1).cmp(&(&right.0, right.1)));
+
+    for (session_id, seq, event) in ordered_events {
+        let raw_type = value_text(event, "type")?.unwrap_or_default();
+        let Some(event_type) = pinned_event_kind(&raw_type) else {
+            return Err(OpenCodeImportError::Blocked(
+                "provider event type is not in the pinned durable manifest".into(),
+            ));
+        };
+        if !event_type.starts_with("session.next.") {
+            continue;
+        }
+        let data = parse_event_data(event)?;
+        validate_v2_event_payload(event_type, &data, &session_id)?;
+        apply_v2_projection_event(
+            event_type,
+            seq,
+            &session_id,
+            &data,
+            &mut session_messages,
+            &mut session_inputs,
+        )?;
+    }
+
+    let current_messages = current_rows
+        .values()
+        .filter(|row| row.table == "session_message")
+        .map(|row| {
+            let session_id = value_text(row, "session_id")?.ok_or_else(|| {
+                OpenCodeImportError::Blocked("session_message row has no session ID".into())
+            })?;
+            let id = value_text(row, "id")?.ok_or_else(|| {
+                OpenCodeImportError::Blocked("session_message row has no message ID".into())
+            })?;
+            Ok(((session_id, id), row))
+        })
+        .collect::<Result<BTreeMap<_, _>, OpenCodeImportError>>()?;
+    if current_messages.len() != session_messages.len() {
+        return Err(OpenCodeImportError::Blocked(
+            "session_message rows do not equal the durable V2 event projection".into(),
+        ));
+    }
+    for (key, expected) in &session_messages {
+        let row = current_messages.get(key).ok_or_else(|| {
+            OpenCodeImportError::Blocked(
+                "a durable V2 session message is missing from its projection".into(),
+            )
+        })?;
+        if value_text(row, "type")?.as_deref() != Some(expected.message_type.as_str())
+            || value_integer_required(row, "seq")? != expected.seq
+            || value_integer_required(row, "time_created")? != expected.time_created
+            || json_column(row, "data") != Some(expected.data.clone())
+        {
+            return Err(OpenCodeImportError::Blocked(
+                "session_message values do not match replayed durable V2 events".into(),
+            ));
+        }
+        let baseline_row = manifest
+            .rows
+            .iter()
+            .find(|baseline| baseline.table == "session_message" && baseline.key == row.key);
+        if !projection_timestamp_matches(row, "time_updated", expected.time_created, baseline_row)?
+        {
+            return Err(OpenCodeImportError::Blocked(
+                "session_message timestamp is not its immutable baseline value or a valid insert timestamp".into(),
+            ));
+        }
+    }
+
+    let current_inputs = current_rows
+        .values()
+        .filter(|row| row.table == "session_input")
+        .map(|row| {
+            let session_id = value_text(row, "session_id")?.ok_or_else(|| {
+                OpenCodeImportError::Blocked("session_input row has no session ID".into())
+            })?;
+            let id = value_text(row, "id")?.ok_or_else(|| {
+                OpenCodeImportError::Blocked("session_input row has no message ID".into())
+            })?;
+            Ok(((session_id, id), row))
+        })
+        .collect::<Result<BTreeMap<_, _>, OpenCodeImportError>>()?;
+    if current_inputs.len() != session_inputs.len() {
+        return Err(OpenCodeImportError::Blocked(
+            "session_input rows do not equal the durable prompt lifecycle projection".into(),
+        ));
+    }
+    for (key, expected) in &session_inputs {
+        let row = current_inputs.get(key).ok_or_else(|| {
+            OpenCodeImportError::Blocked("a durable prompt lifecycle row is missing".into())
+        })?;
+        let promoted = expected
+            .promoted_seq
+            .map(|seq| SerializedSqlValue::Integer { value: seq })
+            .unwrap_or(SerializedSqlValue::Null);
+        if value_text(row, "session_id")?.as_deref() != Some(expected.session_id.as_str())
+            || value_integer_required(row, "admitted_seq")? != expected.admitted_seq
+            || row.values.get("promoted_seq") != Some(&promoted)
+            || value_integer_required(row, "time_created")? != expected.time_created
+            || value_text(row, "delivery")?.as_deref() != Some(expected.delivery.as_str())
+            || json_column(row, "prompt") != Some(expected.prompt.clone())
+        {
+            return Err(OpenCodeImportError::Blocked(
+                "session_input values do not match their durable prompt events".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn projection_timestamp_matches(
+    row: &SerializedRow,
+    column: &str,
+    minimum: i64,
+    baseline: Option<&freshell_sessions::opencode_transfer::RowDigest>,
+) -> Result<bool, OpenCodeImportError> {
+    let Some(timestamp) = value_integer(row, column) else {
+        return Ok(false);
+    };
+    if let Some(baseline) = baseline {
+        if let Some(expected_digest) = baseline.column_sha256.get(column) {
+            let (columns, _) = current_row_field_digests(row)?;
+            return Ok(columns.get(column) == Some(expected_digest));
+        }
+        // Older manifests do not carry column commitments. They can support
+        // only an exact unchanged row, never an event-driven data update.
+        return Ok(digest_serialized_row(row)? == baseline.sha256);
+    }
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .min(i64::MAX as u128) as i64;
+    Ok(timestamp >= minimum && timestamp <= now_ms.saturating_add(60_000))
+}
+
+fn validate_v2_event_payload(
+    event_type: &str,
+    data: &serde_json::Value,
+    session_id: &str,
+) -> Result<(), OpenCodeImportError> {
+    let (required, optional): (&[&str], &[&str]) = match event_type {
+        "session.next.agent.switched" => (&["messageID", "agent"], &[]),
+        "session.next.model.switched" => (&["messageID", "model"], &[]),
+        "session.next.moved" => (&["location"], &["subdirectory"]),
+        "session.next.prompted" | "session.next.prompt.admitted" => {
+            (&["messageID", "prompt", "delivery"], &[])
+        }
+        "session.next.context.updated" | "session.next.synthetic" => (&["messageID", "text"], &[]),
+        "session.next.shell.started" => (&["messageID", "callID", "command"], &[]),
+        "session.next.shell.ended" => (&["callID", "output"], &[]),
+        "session.next.step.started" => (&["assistantMessageID", "agent", "model"], &["snapshot"]),
+        "session.next.step.ended" => (
+            &["assistantMessageID", "finish", "cost", "tokens"],
+            &["snapshot", "files"],
+        ),
+        "session.next.step.failed" => (&["assistantMessageID", "error"], &[]),
+        "session.next.text.started" => (&["assistantMessageID", "textID"], &[]),
+        "session.next.text.ended" => (&["assistantMessageID", "textID", "text"], &[]),
+        "session.next.tool.input.started" => (&["assistantMessageID", "callID", "name"], &[]),
+        "session.next.tool.input.ended" => (&["assistantMessageID", "callID", "text"], &[]),
+        "session.next.tool.called" => (
+            &["assistantMessageID", "callID", "tool", "input", "provider"],
+            &[],
+        ),
+        "session.next.tool.progress" => (
+            &["assistantMessageID", "callID", "structured", "content"],
+            &[],
+        ),
+        "session.next.tool.success" => (
+            &[
+                "assistantMessageID",
+                "callID",
+                "structured",
+                "content",
+                "provider",
+            ],
+            &["outputPaths", "result"],
+        ),
+        "session.next.tool.failed" => (
+            &["assistantMessageID", "callID", "error", "provider"],
+            &["result"],
+        ),
+        "session.next.reasoning.started" => (
+            &["assistantMessageID", "reasoningID"],
+            &["providerMetadata"],
+        ),
+        "session.next.reasoning.ended" => (
+            &["assistantMessageID", "reasoningID", "text"],
+            &["providerMetadata"],
+        ),
+        "session.next.retried" => (&["attempt", "error"], &[]),
+        "session.next.compaction.started" => (&["messageID", "reason"], &[]),
+        "session.next.compaction.ended" => (&["messageID", "reason", "text", "recent"], &[]),
+        "session.next.revert.staged" => (&["revert"], &[]),
+        "session.next.revert.cleared" => (&[], &[]),
+        "session.next.revert.committed" => (&["messageID"], &[]),
+        _ => {
+            return Err(OpenCodeImportError::Blocked(
+                "durable V2 event has no pinned projection schema".into(),
+            ));
+        }
+    };
+    let Some(object) = data.as_object() else {
+        return Err(OpenCodeImportError::Blocked(
+            "durable V2 event payload is not an object".into(),
+        ));
+    };
+    let base = ["sessionID", "timestamp"];
+    if data.get("sessionID").and_then(serde_json::Value::as_str) != Some(session_id)
+        || !valid_session_id(session_id)
+        || !data.get("timestamp").is_some_and(is_finite_number)
+        || required.iter().any(|key| !object.contains_key(*key))
+        || object.keys().any(|key| {
+            !base.contains(&key.as_str())
+                && !required.contains(&key.as_str())
+                && !optional.contains(&key.as_str())
+        })
+        || !validate_v2_nested_payload(event_type, data)
+    {
+        return Err(OpenCodeImportError::Blocked(
+            "durable V2 event payload does not match its pinned schema".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn is_finite_number(value: &serde_json::Value) -> bool {
+    value.as_f64().is_some_and(f64::is_finite)
+}
+
+fn is_nonnegative_finite_number(value: &serde_json::Value) -> bool {
+    value
+        .as_f64()
+        .is_some_and(|value| value.is_finite() && value >= 0.0)
+}
+
+fn is_nonnegative_integer(value: &serde_json::Value) -> bool {
+    value.as_u64().is_some()
+}
+
+fn is_string(value: &serde_json::Value) -> bool {
+    value.as_str().is_some()
+}
+
+fn valid_session_id(value: &str) -> bool {
+    value.starts_with("ses")
+}
+
+fn valid_message_id(value: &str) -> bool {
+    value.starts_with("msg")
+}
+
+fn valid_v2_message_id(value: &str) -> bool {
+    value.starts_with("msg_")
+}
+
+fn valid_part_id(value: &str) -> bool {
+    value.starts_with("prt")
+}
+
+fn has_object_shape(value: &serde_json::Value, required: &[&str], optional: &[&str]) -> bool {
+    let Some(object) = value.as_object() else {
+        return false;
+    };
+    required.iter().all(|key| object.contains_key(*key))
+        && object
+            .keys()
+            .all(|key| required.contains(&key.as_str()) || optional.contains(&key.as_str()))
+}
+
+fn field_is(
+    value: &serde_json::Value,
+    key: &str,
+    predicate: impl FnOnce(&serde_json::Value) -> bool,
+) -> bool {
+    value.get(key).is_some_and(predicate)
+}
+
+fn optional_field_is(
+    value: &serde_json::Value,
+    key: &str,
+    predicate: impl FnOnce(&serde_json::Value) -> bool,
+) -> bool {
+    value.get(key).is_none_or(predicate)
+}
+
+fn is_string_record(value: &serde_json::Value) -> bool {
+    value
+        .as_object()
+        .is_some_and(|object| object.values().all(is_string))
+}
+
+fn is_unknown_record(value: &serde_json::Value) -> bool {
+    value.is_object()
+}
+
+fn is_string_array(value: &serde_json::Value) -> bool {
+    value
+        .as_array()
+        .is_some_and(|array| array.iter().all(is_string))
+}
+
+fn is_prompt(value: &serde_json::Value) -> bool {
+    if !has_object_shape(value, &["text"], &["files", "agents"])
+        || !field_is(value, "text", is_string)
+    {
+        return false;
+    }
+    optional_field_is(value, "files", |files| {
+        files
+            .as_array()
+            .is_some_and(|files| files.iter().all(is_file_attachment))
+    }) && optional_field_is(value, "agents", |agents| {
+        agents
+            .as_array()
+            .is_some_and(|agents| agents.iter().all(is_agent_attachment))
+    })
+}
+
+fn is_prompt_source(value: &serde_json::Value) -> bool {
+    has_object_shape(value, &["start", "end", "text"], &[])
+        && field_is(value, "start", is_finite_number)
+        && field_is(value, "end", is_finite_number)
+        && field_is(value, "text", is_string)
+}
+
+fn is_file_attachment(value: &serde_json::Value) -> bool {
+    has_object_shape(value, &["uri", "mime"], &["name", "description", "source"])
+        && field_is(value, "uri", is_string)
+        && field_is(value, "mime", is_string)
+        && optional_field_is(value, "name", is_string)
+        && optional_field_is(value, "description", is_string)
+        && optional_field_is(value, "source", is_prompt_source)
+}
+
+fn is_agent_attachment(value: &serde_json::Value) -> bool {
+    has_object_shape(value, &["name"], &["source"])
+        && field_is(value, "name", is_string)
+        && optional_field_is(value, "source", is_prompt_source)
+}
+
+fn is_model_ref(value: &serde_json::Value) -> bool {
+    has_object_shape(value, &["id", "providerID"], &["variant"])
+        && field_is(value, "id", is_string)
+        && field_is(value, "providerID", is_string)
+        && optional_field_is(value, "variant", is_string)
+}
+
+fn is_v2_location_ref(value: &serde_json::Value) -> bool {
+    has_object_shape(value, &["directory"], &["workspaceID"])
+        && field_is(value, "directory", is_string)
+        && optional_field_is(value, "workspaceID", is_string)
+}
+
+fn is_provider_metadata(value: &serde_json::Value) -> bool {
+    value.as_object().is_some_and(|providers| {
+        providers
+            .values()
+            .all(|metadata| metadata.as_object().is_some())
+    })
+}
+
+fn is_v2_tool_content(value: &serde_json::Value) -> bool {
+    let Some(items) = value.as_array() else {
+        return false;
+    };
+    items.iter().all(
+        |item| match item.get("type").and_then(serde_json::Value::as_str) {
+            Some("text") => {
+                has_object_shape(item, &["type", "text"], &[]) && field_is(item, "text", is_string)
+            }
+            Some("file") => {
+                has_object_shape(item, &["type", "uri", "mime"], &["name"])
+                    && field_is(item, "uri", is_string)
+                    && field_is(item, "mime", is_string)
+                    && optional_field_is(item, "name", is_string)
+            }
+            _ => false,
+        },
+    )
+}
+
+fn is_provider_result(value: &serde_json::Value) -> bool {
+    has_object_shape(value, &["executed"], &["metadata"])
+        && field_is(value, "executed", |value| value.as_bool().is_some())
+        && optional_field_is(value, "metadata", is_provider_metadata)
+}
+
+fn is_v2_tokens(value: &serde_json::Value) -> bool {
+    has_object_shape(value, &["input", "output", "reasoning", "cache"], &[])
+        && field_is(value, "input", is_finite_number)
+        && field_is(value, "output", is_finite_number)
+        && field_is(value, "reasoning", is_finite_number)
+        && field_is(value, "cache", |cache| {
+            has_object_shape(cache, &["read", "write"], &[])
+                && field_is(cache, "read", is_finite_number)
+                && field_is(cache, "write", is_finite_number)
+        })
+}
+
+fn is_v2_unknown_error(value: &serde_json::Value) -> bool {
+    has_object_shape(value, &["type", "message"], &[])
+        && value.get("type").and_then(serde_json::Value::as_str) == Some("unknown")
+        && field_is(value, "message", is_string)
+}
+
+fn is_v2_retry_error(value: &serde_json::Value) -> bool {
+    has_object_shape(
+        value,
+        &["message", "isRetryable"],
+        &["statusCode", "responseHeaders", "responseBody", "metadata"],
+    ) && field_is(value, "message", is_string)
+        && field_is(value, "isRetryable", |value| value.as_bool().is_some())
+        && optional_field_is(value, "statusCode", is_finite_number)
+        && optional_field_is(value, "responseHeaders", is_string_record)
+        && optional_field_is(value, "responseBody", is_string)
+        && optional_field_is(value, "metadata", is_string_record)
+}
+
+fn is_revert_file_diff(value: &serde_json::Value) -> bool {
+    has_object_shape(
+        value,
+        &["path", "status", "additions", "deletions", "patch"],
+        &[],
+    ) && field_is(value, "path", is_string)
+        && matches!(
+            value.get("status").and_then(serde_json::Value::as_str),
+            Some("added" | "modified" | "deleted")
+        )
+        && field_is(value, "additions", is_nonnegative_integer)
+        && field_is(value, "deletions", is_nonnegative_integer)
+        && field_is(value, "patch", is_string)
+}
+
+fn is_v2_revert_state(value: &serde_json::Value) -> bool {
+    has_object_shape(
+        value,
+        &["messageID"],
+        &["partID", "snapshot", "diff", "files"],
+    ) && field_is(value, "messageID", |value| {
+        value.as_str().is_some_and(valid_v2_message_id)
+    }) && optional_field_is(value, "partID", is_string)
+        && optional_field_is(value, "snapshot", is_string)
+        && optional_field_is(value, "diff", is_string)
+        && optional_field_is(value, "files", |files| {
+            files
+                .as_array()
+                .is_some_and(|files| files.iter().all(is_revert_file_diff))
+        })
+}
+
+fn validate_v2_nested_payload(event_type: &str, data: &serde_json::Value) -> bool {
+    field_is(data, "sessionID", |value| {
+        value.as_str().is_some_and(valid_session_id)
+    }) && match event_type {
+        "session.next.agent.switched" => {
+            field_is(data, "messageID", |v| {
+                v.as_str().is_some_and(valid_v2_message_id)
+            }) && field_is(data, "agent", is_string)
+        }
+        "session.next.model.switched" => {
+            field_is(data, "messageID", |v| {
+                v.as_str().is_some_and(valid_v2_message_id)
+            }) && field_is(data, "model", is_model_ref)
+        }
+        "session.next.moved" => {
+            field_is(data, "location", is_v2_location_ref)
+                && optional_field_is(data, "subdirectory", is_string)
+        }
+        "session.next.prompted" | "session.next.prompt.admitted" => {
+            field_is(data, "messageID", |v| {
+                v.as_str().is_some_and(valid_v2_message_id)
+            }) && field_is(data, "prompt", is_prompt)
+                && matches!(
+                    data.get("delivery").and_then(serde_json::Value::as_str),
+                    Some("steer" | "queue")
+                )
+        }
+        "session.next.context.updated" | "session.next.synthetic" => {
+            field_is(data, "messageID", |v| {
+                v.as_str().is_some_and(valid_v2_message_id)
+            }) && field_is(data, "text", is_string)
+        }
+        "session.next.shell.started" => {
+            field_is(data, "messageID", |v| {
+                v.as_str().is_some_and(valid_v2_message_id)
+            }) && field_is(data, "callID", is_string)
+                && field_is(data, "command", is_string)
+        }
+        "session.next.shell.ended" => {
+            field_is(data, "callID", is_string) && field_is(data, "output", is_string)
+        }
+        "session.next.step.started" => {
+            field_is(data, "assistantMessageID", |v| {
+                v.as_str().is_some_and(valid_v2_message_id)
+            }) && field_is(data, "agent", is_string)
+                && field_is(data, "model", is_model_ref)
+                && optional_field_is(data, "snapshot", is_string)
+        }
+        "session.next.step.ended" => {
+            field_is(data, "assistantMessageID", |v| {
+                v.as_str().is_some_and(valid_v2_message_id)
+            }) && field_is(data, "finish", is_string)
+                && field_is(data, "cost", is_finite_number)
+                && field_is(data, "tokens", is_v2_tokens)
+                && optional_field_is(data, "snapshot", is_string)
+                && optional_field_is(data, "files", is_string_array)
+        }
+        "session.next.step.failed" => {
+            field_is(data, "assistantMessageID", |v| {
+                v.as_str().is_some_and(valid_v2_message_id)
+            }) && field_is(data, "error", is_v2_unknown_error)
+        }
+        "session.next.text.started" => {
+            field_is(data, "assistantMessageID", |v| {
+                v.as_str().is_some_and(valid_v2_message_id)
+            }) && field_is(data, "textID", is_string)
+        }
+        "session.next.text.ended" => {
+            field_is(data, "assistantMessageID", |v| {
+                v.as_str().is_some_and(valid_v2_message_id)
+            }) && field_is(data, "textID", is_string)
+                && field_is(data, "text", is_string)
+        }
+        "session.next.tool.input.started" => {
+            field_is(data, "assistantMessageID", |v| {
+                v.as_str().is_some_and(valid_v2_message_id)
+            }) && field_is(data, "callID", is_string)
+                && field_is(data, "name", is_string)
+        }
+        "session.next.tool.input.ended" => {
+            field_is(data, "assistantMessageID", |v| {
+                v.as_str().is_some_and(valid_v2_message_id)
+            }) && field_is(data, "callID", is_string)
+                && field_is(data, "text", is_string)
+        }
+        "session.next.tool.called" => {
+            field_is(data, "assistantMessageID", |v| {
+                v.as_str().is_some_and(valid_v2_message_id)
+            }) && field_is(data, "callID", is_string)
+                && field_is(data, "tool", is_string)
+                && field_is(data, "input", is_unknown_record)
+                && field_is(data, "provider", is_provider_result)
+        }
+        "session.next.tool.progress" => {
+            field_is(data, "assistantMessageID", |v| {
+                v.as_str().is_some_and(valid_v2_message_id)
+            }) && field_is(data, "callID", is_string)
+                && field_is(data, "structured", is_unknown_record)
+                && field_is(data, "content", is_v2_tool_content)
+        }
+        "session.next.tool.success" => {
+            field_is(data, "assistantMessageID", |v| {
+                v.as_str().is_some_and(valid_v2_message_id)
+            }) && field_is(data, "callID", is_string)
+                && field_is(data, "structured", is_unknown_record)
+                && field_is(data, "content", is_v2_tool_content)
+                && field_is(data, "provider", is_provider_result)
+                && optional_field_is(data, "outputPaths", is_string_array)
+        }
+        "session.next.tool.failed" => {
+            field_is(data, "assistantMessageID", |v| {
+                v.as_str().is_some_and(valid_v2_message_id)
+            }) && field_is(data, "callID", is_string)
+                && field_is(data, "error", is_v2_unknown_error)
+                && field_is(data, "provider", is_provider_result)
+        }
+        "session.next.reasoning.started" => {
+            field_is(data, "assistantMessageID", |v| {
+                v.as_str().is_some_and(valid_v2_message_id)
+            }) && field_is(data, "reasoningID", is_string)
+                && optional_field_is(data, "providerMetadata", is_provider_metadata)
+        }
+        "session.next.reasoning.ended" => {
+            field_is(data, "assistantMessageID", |v| {
+                v.as_str().is_some_and(valid_v2_message_id)
+            }) && field_is(data, "reasoningID", is_string)
+                && field_is(data, "text", is_string)
+                && optional_field_is(data, "providerMetadata", is_provider_metadata)
+        }
+        "session.next.retried" => {
+            field_is(data, "attempt", is_finite_number)
+                && field_is(data, "error", is_v2_retry_error)
+        }
+        "session.next.compaction.started" => {
+            field_is(data, "messageID", |v| {
+                v.as_str().is_some_and(valid_v2_message_id)
+            }) && matches!(
+                data.get("reason").and_then(serde_json::Value::as_str),
+                Some("auto" | "manual")
+            )
+        }
+        "session.next.compaction.ended" => {
+            field_is(data, "messageID", |v| {
+                v.as_str().is_some_and(valid_v2_message_id)
+            }) && matches!(
+                data.get("reason").and_then(serde_json::Value::as_str),
+                Some("auto" | "manual")
+            ) && field_is(data, "text", is_string)
+                && field_is(data, "recent", is_string)
+        }
+        "session.next.revert.staged" => field_is(data, "revert", is_v2_revert_state),
+        "session.next.revert.cleared" => true,
+        "session.next.revert.committed" => field_is(data, "messageID", |v| {
+            v.as_str().is_some_and(valid_v2_message_id)
+        }),
+        _ => false,
+    }
+}
+
+fn apply_v2_projection_event(
+    event_type: &str,
+    seq: i64,
+    session_id: &str,
+    data: &serde_json::Value,
+    messages: &mut BTreeMap<(String, String), ProjectedSessionMessage>,
+    inputs: &mut BTreeMap<(String, String), ProjectedSessionInput>,
+) -> Result<(), OpenCodeImportError> {
+    let timestamp = data
+        .get("timestamp")
+        .and_then(serde_json::Value::as_i64)
+        .ok_or_else(|| OpenCodeImportError::Blocked("V2 event timestamp is invalid".into()))?;
+    match event_type {
+        "session.next.agent.switched" => {
+            append_event_fields(
+                messages,
+                session_id,
+                seq,
+                timestamp,
+                data,
+                ProjectedEventMessageFields {
+                    id_key: "messageID",
+                    message_type: "agent-switched",
+                    fields: &["agent"],
+                },
+            )?;
+        }
+        "session.next.model.switched" => {
+            append_event_fields(
+                messages,
+                session_id,
+                seq,
+                timestamp,
+                data,
+                ProjectedEventMessageFields {
+                    id_key: "messageID",
+                    message_type: "model-switched",
+                    fields: &["model"],
+                },
+            )?;
+        }
+        "session.next.prompt.admitted" => {
+            let id = json_string(data, "messageID")?;
+            if messages.contains_key(&(session_id.to_owned(), id.clone()))
+                || inputs.contains_key(&(session_id.to_owned(), id.clone()))
+            {
+                return Err(OpenCodeImportError::Blocked(
+                    "a durable prompt admission reused a message ID".into(),
+                ));
+            }
+            inputs.insert(
+                (session_id.to_owned(), id.clone()),
+                ProjectedSessionInput {
+                    session_id: session_id.to_owned(),
+                    admitted_seq: seq,
+                    promoted_seq: None,
+                    time_created: timestamp,
+                    delivery: json_string(data, "delivery")?,
+                    prompt: required_json(data, "prompt")?.clone(),
+                },
+            );
+        }
+        "session.next.prompted" => {
+            let id = json_string(data, "messageID")?;
+            let prompt = required_json(data, "prompt")?.clone();
+            let delivery = json_string(data, "delivery")?;
+            match inputs.get_mut(&(session_id.to_owned(), id.clone())) {
+                Some(input) => {
+                    if input.promoted_seq.is_some()
+                        || input.prompt != prompt
+                        || input.delivery != delivery
+                        || input.time_created != timestamp
+                    {
+                        return Err(OpenCodeImportError::Blocked(
+                            "a prompt promotion does not match its admitted row".into(),
+                        ));
+                    }
+                    input.promoted_seq = Some(seq);
+                }
+                None => {
+                    inputs.insert(
+                        (session_id.to_owned(), id.clone()),
+                        ProjectedSessionInput {
+                            session_id: session_id.to_owned(),
+                            admitted_seq: seq,
+                            promoted_seq: Some(seq),
+                            time_created: timestamp,
+                            delivery: delivery.clone(),
+                            prompt: prompt.clone(),
+                        },
+                    );
+                }
+            }
+            let mut projected = serde_json::Map::new();
+            projected.insert("text".into(), required_json(&prompt, "text")?.clone());
+            for name in ["files", "agents"] {
+                if let Some(value) = prompt.get(name) {
+                    projected.insert(name.into(), value.clone());
+                }
+            }
+            append_projected_message(messages, session_id, seq, timestamp, &id, "user", projected)?;
+        }
+        "session.next.context.updated" => {
+            append_event_fields(
+                messages,
+                session_id,
+                seq,
+                timestamp,
+                data,
+                ProjectedEventMessageFields {
+                    id_key: "messageID",
+                    message_type: "system",
+                    fields: &["text"],
+                },
+            )?;
+        }
+        "session.next.synthetic" => {
+            append_event_fields(
+                messages,
+                session_id,
+                seq,
+                timestamp,
+                data,
+                ProjectedEventMessageFields {
+                    id_key: "messageID",
+                    message_type: "synthetic",
+                    fields: &["sessionID", "text"],
+                },
+            )?;
+        }
+        "session.next.shell.started" => {
+            append_event_fields(
+                messages,
+                session_id,
+                seq,
+                timestamp,
+                data,
+                ProjectedEventMessageFields {
+                    id_key: "messageID",
+                    message_type: "shell",
+                    fields: &["callID", "command"],
+                },
+            )?;
+            let key = (session_id.to_owned(), json_string(data, "messageID")?);
+            let row = messages.get_mut(&key).expect("appended shell is present");
+            let mut value = row.data.as_object().cloned().unwrap_or_default();
+            value.insert("output".into(), "".into());
+            row.data = serde_json::Value::Object(value);
+        }
+        "session.next.shell.ended" => {
+            let call_id = json_string(data, "callID")?;
+            if let Some(row) = latest_shell(messages, session_id, &call_id) {
+                let mut object = row.data.as_object().cloned().unwrap_or_default();
+                object.insert("output".into(), required_json(data, "output")?.clone());
+                let mut time = object
+                    .get("time")
+                    .and_then(serde_json::Value::as_object)
+                    .cloned()
+                    .unwrap_or_default();
+                time.insert("completed".into(), timestamp.into());
+                object.insert("time".into(), serde_json::Value::Object(time));
+                row.data = serde_json::Value::Object(object);
+            }
+        }
+        "session.next.step.started" => {
+            if let Some(row) = latest_incomplete_assistant(messages, session_id) {
+                set_message_completed(row, timestamp);
+            }
+            let id = json_string(data, "assistantMessageID")?;
+            let mut projected = serde_json::Map::new();
+            projected.insert("agent".into(), required_json(data, "agent")?.clone());
+            projected.insert("model".into(), required_json(data, "model")?.clone());
+            projected.insert("content".into(), serde_json::Value::Array(Vec::new()));
+            if let Some(snapshot) = data.get("snapshot") {
+                projected.insert("snapshot".into(), serde_json::json!({"start": snapshot}));
+            }
+            append_projected_message(
+                messages,
+                session_id,
+                seq,
+                timestamp,
+                &id,
+                "assistant",
+                projected,
+            )?;
+        }
+        "session.next.step.ended" => {
+            if let Some(row) = assistant_by_id(
+                messages,
+                session_id,
+                &json_string(data, "assistantMessageID")?,
+            ) {
+                let mut object = row.data.as_object().cloned().unwrap_or_default();
+                let mut time = object
+                    .get("time")
+                    .and_then(serde_json::Value::as_object)
+                    .cloned()
+                    .unwrap_or_default();
+                time.insert("completed".into(), timestamp.into());
+                object.insert("time".into(), serde_json::Value::Object(time));
+                for name in ["finish", "cost", "tokens"] {
+                    object.insert(name.into(), required_json(data, name)?.clone());
+                }
+                if data.get("snapshot").is_some() || data.get("files").is_some() {
+                    let mut snapshot = object
+                        .get("snapshot")
+                        .and_then(serde_json::Value::as_object)
+                        .cloned()
+                        .unwrap_or_default();
+                    if let Some(value) = data.get("snapshot") {
+                        snapshot.insert("end".into(), value.clone());
+                    } else {
+                        snapshot.remove("end");
+                    }
+                    if let Some(value) = data.get("files") {
+                        snapshot.insert("files".into(), value.clone());
+                    } else {
+                        snapshot.remove("files");
+                    }
+                    object.insert("snapshot".into(), serde_json::Value::Object(snapshot));
+                }
+                row.data = serde_json::Value::Object(object);
+            }
+        }
+        "session.next.step.failed" => {
+            if let Some(row) = assistant_by_id(
+                messages,
+                session_id,
+                &json_string(data, "assistantMessageID")?,
+            ) {
+                let mut object = row.data.as_object().cloned().unwrap_or_default();
+                set_completed_fields(&mut object, timestamp);
+                object.insert("finish".into(), "error".into());
+                object.insert("error".into(), required_json(data, "error")?.clone());
+                row.data = serde_json::Value::Object(object);
+            }
+        }
+        "session.next.text.started" => {
+            if let Some(row) = assistant_by_id(
+                messages,
+                session_id,
+                &json_string(data, "assistantMessageID")?,
+            ) {
+                let mut object = row.data.as_object().cloned().unwrap_or_default();
+                let mut content = object
+                    .get("content")
+                    .and_then(serde_json::Value::as_array)
+                    .cloned()
+                    .unwrap_or_default();
+                content.push(
+                    serde_json::json!({"type":"text","id":json_string(data,"textID")?,"text":""}),
+                );
+                object.insert("content".into(), serde_json::Value::Array(content));
+                row.data = serde_json::Value::Object(object);
+            }
+        }
+        "session.next.text.ended" => {
+            update_assistant_content(messages, session_id, data, |item| {
+                if item.get("type").and_then(serde_json::Value::as_str) == Some("text")
+                    && item.get("id").and_then(serde_json::Value::as_str)
+                        == data.get("textID").and_then(serde_json::Value::as_str)
+                {
+                    item.insert("text".into(), required_json(data, "text")?.clone());
+                }
+                Ok(())
+            })?;
+        }
+        "session.next.tool.input.started" => {
+            let call_id = json_string(data, "callID")?;
+            let mut tool = serde_json::Map::new();
+            tool.insert("type".into(), "tool".into());
+            tool.insert("id".into(), call_id.into());
+            tool.insert("name".into(), required_json(data, "name")?.clone());
+            tool.insert("time".into(), serde_json::json!({"created":timestamp}));
+            tool.insert(
+                "state".into(),
+                serde_json::json!({"status":"pending","input":""}),
+            );
+            update_assistant_content(messages, session_id, data, |object| {
+                let mut content = object
+                    .get("content")
+                    .and_then(serde_json::Value::as_array)
+                    .cloned()
+                    .unwrap_or_default();
+                content.push(serde_json::Value::Object(tool.clone()));
+                object.insert("content".into(), serde_json::Value::Array(content));
+                Ok(())
+            })?;
+        }
+        "session.next.tool.input.ended" => {
+            update_tool(messages, session_id, data, |tool| {
+                if tool
+                    .get("state")
+                    .and_then(|state| state.get("status"))
+                    .and_then(serde_json::Value::as_str)
+                    == Some("pending")
+                {
+                    tool.get_mut("state")
+                        .and_then(serde_json::Value::as_object_mut)
+                        .expect("pending state object")
+                        .insert("input".into(), required_json(data, "text")?.clone());
+                }
+                Ok(())
+            })?;
+        }
+        "session.next.tool.called" => {
+            update_tool(messages, session_id, data, |tool| {
+                let mut provider = serde_json::Map::new();
+                provider.insert(
+                    "executed".into(),
+                    required_json(data, "provider")?
+                        .get("executed")
+                        .cloned()
+                        .ok_or_else(|| {
+                            OpenCodeImportError::Blocked(
+                                "tool provider executed flag missing".into(),
+                            )
+                        })?,
+                );
+                if let Some(metadata) = data
+                    .get("provider")
+                    .and_then(|provider| provider.get("metadata"))
+                {
+                    provider.insert("metadata".into(), metadata.clone());
+                }
+                tool.insert("provider".into(), serde_json::Value::Object(provider));
+                let mut time = tool
+                    .get("time")
+                    .and_then(serde_json::Value::as_object)
+                    .cloned()
+                    .unwrap_or_default();
+                time.insert("ran".into(), timestamp.into());
+                tool.insert("time".into(), serde_json::Value::Object(time));
+                tool.insert("state".into(), serde_json::json!({"status":"running","input":required_json(data,"input")?,"structured":{},"content":[]}));
+                Ok(())
+            })?;
+        }
+        "session.next.tool.progress" => {
+            update_tool(messages, session_id, data, |tool| {
+                if tool
+                    .get("state")
+                    .and_then(|state| state.get("status"))
+                    .and_then(serde_json::Value::as_str)
+                    == Some("running")
+                {
+                    let state = tool
+                        .get_mut("state")
+                        .and_then(serde_json::Value::as_object_mut)
+                        .expect("running state object");
+                    state.insert(
+                        "structured".into(),
+                        required_json(data, "structured")?.clone(),
+                    );
+                    state.insert("content".into(), required_json(data, "content")?.clone());
+                }
+                Ok(())
+            })?;
+        }
+        "session.next.tool.success" => {
+            update_tool(messages, session_id, data, |tool| {
+                let state = tool
+                    .get("state")
+                    .and_then(serde_json::Value::as_object)
+                    .cloned();
+                if state
+                    .as_ref()
+                    .and_then(|state| state.get("status"))
+                    .and_then(serde_json::Value::as_str)
+                    != Some("running")
+                {
+                    return Ok(());
+                }
+                let running = state.expect("running state object");
+                let prior_provider = tool
+                    .get("provider")
+                    .and_then(serde_json::Value::as_object)
+                    .cloned()
+                    .unwrap_or_default();
+                let event_provider = required_json(data, "provider")?;
+                let mut provider = serde_json::Map::new();
+                provider.insert(
+                    "executed".into(),
+                    serde_json::Value::Bool(
+                        event_provider
+                            .get("executed")
+                            .and_then(serde_json::Value::as_bool)
+                            .unwrap_or(false)
+                            || prior_provider
+                                .get("executed")
+                                .and_then(serde_json::Value::as_bool)
+                                .unwrap_or(false),
+                    ),
+                );
+                if let Some(value) = prior_provider.get("metadata") {
+                    provider.insert("metadata".into(), value.clone());
+                }
+                if let Some(value) = event_provider.get("metadata") {
+                    provider.insert("resultMetadata".into(), value.clone());
+                }
+                tool.insert("provider".into(), serde_json::Value::Object(provider));
+                let mut time = tool
+                    .get("time")
+                    .and_then(serde_json::Value::as_object)
+                    .cloned()
+                    .unwrap_or_default();
+                time.insert("completed".into(), timestamp.into());
+                tool.insert("time".into(), serde_json::Value::Object(time));
+                let mut completed = serde_json::Map::new();
+                completed.insert("status".into(), "completed".into());
+                completed.insert(
+                    "input".into(),
+                    running.get("input").cloned().ok_or_else(|| {
+                        OpenCodeImportError::Blocked("running tool has no input".into())
+                    })?,
+                );
+                completed.insert(
+                    "structured".into(),
+                    required_json(data, "structured")?.clone(),
+                );
+                completed.insert("content".into(), required_json(data, "content")?.clone());
+                completed.insert(
+                    "outputPaths".into(),
+                    data.get("outputPaths")
+                        .cloned()
+                        .unwrap_or_else(|| serde_json::json!([])),
+                );
+                if let Some(result) = data.get("result") {
+                    completed.insert("result".into(), result.clone());
+                }
+                tool.insert("state".into(), serde_json::Value::Object(completed));
+                Ok(())
+            })?;
+        }
+        "session.next.tool.failed" => {
+            update_tool(messages, session_id, data, |tool| {
+                let prior_state = tool
+                    .get("state")
+                    .and_then(serde_json::Value::as_object)
+                    .cloned();
+                let prior_status = prior_state
+                    .as_ref()
+                    .and_then(|state| state.get("status"))
+                    .and_then(serde_json::Value::as_str);
+                if !matches!(prior_status, Some("pending" | "running")) {
+                    return Ok(());
+                }
+                let prior_provider = tool
+                    .get("provider")
+                    .and_then(serde_json::Value::as_object)
+                    .cloned()
+                    .unwrap_or_default();
+                let event_provider = required_json(data, "provider")?;
+                let mut provider = serde_json::Map::new();
+                provider.insert(
+                    "executed".into(),
+                    serde_json::Value::Bool(
+                        event_provider
+                            .get("executed")
+                            .and_then(serde_json::Value::as_bool)
+                            .unwrap_or(false)
+                            || prior_provider
+                                .get("executed")
+                                .and_then(serde_json::Value::as_bool)
+                                .unwrap_or(false),
+                    ),
+                );
+                if let Some(value) = prior_provider.get("metadata") {
+                    provider.insert("metadata".into(), value.clone());
+                }
+                if let Some(value) = event_provider.get("metadata") {
+                    provider.insert("resultMetadata".into(), value.clone());
+                }
+                tool.insert("provider".into(), serde_json::Value::Object(provider));
+                let mut time = tool
+                    .get("time")
+                    .and_then(serde_json::Value::as_object)
+                    .cloned()
+                    .unwrap_or_default();
+                time.insert("completed".into(), timestamp.into());
+                tool.insert("time".into(), serde_json::Value::Object(time));
+                let running = prior_status == Some("running");
+                let mut failed = serde_json::Map::new();
+                failed.insert("status".into(), "error".into());
+                let input = prior_state
+                    .as_ref()
+                    .and_then(|state| state.get("input"))
+                    .cloned()
+                    .unwrap_or(serde_json::json!({}));
+                failed.insert(
+                    "input".into(),
+                    if running {
+                        input
+                    } else {
+                        serde_json::json!({})
+                    },
+                );
+                failed.insert(
+                    "structured".into(),
+                    if running {
+                        prior_state
+                            .as_ref()
+                            .and_then(|state| state.get("structured"))
+                            .cloned()
+                            .unwrap_or(serde_json::json!({}))
+                    } else {
+                        serde_json::json!({})
+                    },
+                );
+                failed.insert(
+                    "content".into(),
+                    if running {
+                        prior_state
+                            .as_ref()
+                            .and_then(|state| state.get("content"))
+                            .cloned()
+                            .unwrap_or(serde_json::json!([]))
+                    } else {
+                        serde_json::json!([])
+                    },
+                );
+                failed.insert("error".into(), required_json(data, "error")?.clone());
+                if let Some(result) = data.get("result") {
+                    failed.insert("result".into(), result.clone());
+                }
+                tool.insert("state".into(), serde_json::Value::Object(failed));
+                Ok(())
+            })?;
+        }
+        "session.next.reasoning.started" => {
+            let mut item = serde_json::Map::new();
+            item.insert("type".into(), "reasoning".into());
+            item.insert("id".into(), required_json(data, "reasoningID")?.clone());
+            item.insert("text".into(), "".into());
+            if let Some(metadata) = data.get("providerMetadata") {
+                item.insert("providerMetadata".into(), metadata.clone());
+            }
+            item.insert("time".into(), serde_json::json!({"created":timestamp}));
+            update_assistant_content(messages, session_id, data, |object| {
+                let mut content = object
+                    .get("content")
+                    .and_then(serde_json::Value::as_array)
+                    .cloned()
+                    .unwrap_or_default();
+                content.push(serde_json::Value::Object(item.clone()));
+                object.insert("content".into(), serde_json::Value::Array(content));
+                Ok(())
+            })?;
+        }
+        "session.next.reasoning.ended" => {
+            update_assistant_content(messages, session_id, data, |item| {
+                if item.get("type").and_then(serde_json::Value::as_str) == Some("reasoning")
+                    && item.get("id").and_then(serde_json::Value::as_str)
+                        == data.get("reasoningID").and_then(serde_json::Value::as_str)
+                {
+                    item.insert("text".into(), required_json(data, "text")?.clone());
+                    let created = item
+                        .get("time")
+                        .and_then(|time| time.get("created"))
+                        .cloned()
+                        .unwrap_or(timestamp.into());
+                    item.insert(
+                        "time".into(),
+                        serde_json::json!({"created":created,"completed":timestamp}),
+                    );
+                    if let Some(metadata) = data.get("providerMetadata") {
+                        item.insert("providerMetadata".into(), metadata.clone());
+                    }
+                }
+                Ok(())
+            })?;
+        }
+        "session.next.compaction.ended" => {
+            let id = json_string(data, "messageID")?;
+            let mut projected = serde_json::Map::new();
+            projected.insert("reason".into(), required_json(data, "reason")?.clone());
+            projected.insert("summary".into(), required_json(data, "text")?.clone());
+            projected.insert("recent".into(), required_json(data, "recent")?.clone());
+            append_projected_message(
+                messages,
+                session_id,
+                seq,
+                timestamp,
+                &id,
+                "compaction",
+                projected,
+            )?;
+        }
+        "session.next.revert.committed" => {
+            let boundary_id = json_string(data, "messageID")?;
+            let boundary = messages
+                .get(&(session_id.to_owned(), boundary_id.clone()))
+                .map(|message| message.seq)
+                .ok_or_else(|| {
+                    OpenCodeImportError::Blocked("V2 revert boundary message is missing".into())
+                })?;
+            messages.retain(|(owner, _), message| owner != session_id || message.seq <= boundary);
+            inputs.retain(|(owner, _), input| {
+                owner != session_id
+                    || (input.admitted_seq <= boundary
+                        && input
+                            .promoted_seq
+                            .is_none_or(|promoted| promoted <= boundary))
+            });
+        }
+        // These durable events either have no session-message projection or
+        // only carry a stream delta that is intentionally not persisted.
+        "session.next.moved"
+        | "session.next.retried"
+        | "session.next.compaction.started"
+        | "session.next.revert.staged"
+        | "session.next.revert.cleared" => {}
+        _ => {
+            return Err(OpenCodeImportError::Blocked(
+                "durable V2 event is not replayable by the pinned projector".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn required_json<'a>(
+    value: &'a serde_json::Value,
+    key: &str,
+) -> Result<&'a serde_json::Value, OpenCodeImportError> {
+    value.get(key).ok_or_else(|| {
+        OpenCodeImportError::Blocked(format!("durable event is missing required {key}"))
+    })
+}
+
+fn append_event_fields(
+    messages: &mut BTreeMap<(String, String), ProjectedSessionMessage>,
+    session_id: &str,
+    seq: i64,
+    timestamp: i64,
+    event_data: &serde_json::Value,
+    projection: ProjectedEventMessageFields<'_>,
+) -> Result<(), OpenCodeImportError> {
+    let id = json_string(event_data, projection.id_key)?;
+    let mut projected = serde_json::Map::new();
+    for field in projection.fields {
+        if let Some(value) = event_data.get(*field) {
+            projected.insert((*field).to_owned(), value.clone());
+        }
+    }
+    append_projected_message(
+        messages,
+        session_id,
+        seq,
+        timestamp,
+        &id,
+        projection.message_type,
+        projected,
+    )
+}
+
+struct ProjectedEventMessageFields<'a> {
+    id_key: &'a str,
+    message_type: &'a str,
+    fields: &'a [&'a str],
+}
+
+fn append_projected_message(
+    messages: &mut BTreeMap<(String, String), ProjectedSessionMessage>,
+    session_id: &str,
+    seq: i64,
+    timestamp: i64,
+    id: &str,
+    message_type: &str,
+    mut projected: serde_json::Map<String, serde_json::Value>,
+) -> Result<(), OpenCodeImportError> {
+    if messages.contains_key(&(session_id.to_owned(), id.to_owned())) {
+        return Err(OpenCodeImportError::Blocked(
+            "a durable V2 event reused a session message ID".into(),
+        ));
+    }
+    let mut time = serde_json::Map::new();
+    time.insert("created".into(), timestamp.into());
+    projected.insert("time".into(), serde_json::Value::Object(time));
+    messages.insert(
+        (session_id.to_owned(), id.to_owned()),
+        ProjectedSessionMessage {
+            message_type: message_type.to_owned(),
+            seq,
+            time_created: timestamp,
+            data: serde_json::Value::Object(projected),
+        },
+    );
+    Ok(())
+}
+
+fn json_string(value: &serde_json::Value, key: &str) -> Result<String, OpenCodeImportError> {
+    required_json(value, key)?
+        .as_str()
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+        .ok_or_else(|| OpenCodeImportError::Blocked(format!("durable event has invalid {key}")))
+}
+
+fn latest_incomplete_assistant<'a>(
+    messages: &'a mut BTreeMap<(String, String), ProjectedSessionMessage>,
+    session_id: &str,
+) -> Option<&'a mut ProjectedSessionMessage> {
+    let key = messages
+        .iter()
+        .filter(|((owner, _), message)| {
+            owner == session_id
+                && message.message_type == "assistant"
+                && message
+                    .data
+                    .get("time")
+                    .and_then(|time| time.get("completed"))
+                    .is_none()
+        })
+        .max_by_key(|(_, message)| message.seq)
+        .map(|(key, _)| key.clone())?;
+    messages.get_mut(&key)
+}
+
+fn latest_shell<'a>(
+    messages: &'a mut BTreeMap<(String, String), ProjectedSessionMessage>,
+    session_id: &str,
+    call_id: &str,
+) -> Option<&'a mut ProjectedSessionMessage> {
+    let key = messages
+        .iter()
+        .filter(|((owner, _), message)| {
+            owner == session_id
+                && message.message_type == "shell"
+                && message
+                    .data
+                    .get("callID")
+                    .and_then(serde_json::Value::as_str)
+                    == Some(call_id)
+        })
+        .max_by_key(|(_, message)| message.seq)
+        .map(|(key, _)| key.clone())?;
+    messages.get_mut(&key)
+}
+
+fn assistant_by_id<'a>(
+    messages: &'a mut BTreeMap<(String, String), ProjectedSessionMessage>,
+    session_id: &str,
+    id: &str,
+) -> Option<&'a mut ProjectedSessionMessage> {
+    let row = messages.get_mut(&(session_id.to_owned(), id.to_owned()))?;
+    (row.message_type == "assistant").then_some(row)
+}
+
+fn set_message_completed(row: &mut ProjectedSessionMessage, timestamp: i64) {
+    let mut object = row.data.as_object().cloned().unwrap_or_default();
+    set_completed_fields(&mut object, timestamp);
+    row.data = serde_json::Value::Object(object);
+}
+
+fn set_completed_fields(object: &mut serde_json::Map<String, serde_json::Value>, timestamp: i64) {
+    let mut time = object
+        .get("time")
+        .and_then(serde_json::Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    time.insert("completed".into(), timestamp.into());
+    object.insert("time".into(), serde_json::Value::Object(time));
+}
+
+fn update_assistant_content(
+    messages: &mut BTreeMap<(String, String), ProjectedSessionMessage>,
+    session_id: &str,
+    event_data: &serde_json::Value,
+    update: impl FnOnce(
+        &mut serde_json::Map<String, serde_json::Value>,
+    ) -> Result<(), OpenCodeImportError>,
+) -> Result<(), OpenCodeImportError> {
+    let id = json_string(event_data, "assistantMessageID")?;
+    if let Some(row) = assistant_by_id(messages, session_id, &id) {
+        let mut object = row.data.as_object().cloned().unwrap_or_default();
+        update(&mut object)?;
+        row.data = serde_json::Value::Object(object);
+    }
+    Ok(())
+}
+
+fn update_tool(
+    messages: &mut BTreeMap<(String, String), ProjectedSessionMessage>,
+    session_id: &str,
+    event_data: &serde_json::Value,
+    update: impl FnOnce(
+        &mut serde_json::Map<String, serde_json::Value>,
+    ) -> Result<(), OpenCodeImportError>,
+) -> Result<(), OpenCodeImportError> {
+    let call_id = json_string(event_data, "callID")?;
+    update_assistant_content(messages, session_id, event_data, |object| {
+        let mut content = object
+            .get("content")
+            .and_then(serde_json::Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        if let Some(tool) = content.iter_mut().rev().find_map(|item| {
+            (item.get("type").and_then(serde_json::Value::as_str) == Some("tool")
+                && item.get("id").and_then(serde_json::Value::as_str) == Some(call_id.as_str()))
+            .then(|| item.as_object_mut())
+            .flatten()
+        }) {
+            update(tool)?;
+        }
+        object.insert("content".into(), serde_json::Value::Array(content));
+        Ok(())
+    })
+}
+
+struct TodowriteProjection {
+    todos: serde_json::Value,
+    called_at: i64,
+    succeeded_at: i64,
+}
+
+fn latest_successful_todowrite(
+    events: &[SerializedRow],
+    session_id: &str,
+) -> Result<TodowriteProjection, OpenCodeImportError> {
+    let mut calls = BTreeMap::<(String, String), (i64, i64, serde_json::Value)>::new();
+    let mut successes = Vec::<(i64, i64, (i64, i64, serde_json::Value))>::new();
+    for event in events {
+        let event_type = value_text(event, "type")?.unwrap_or_default();
+        let Some(kind) = pinned_event_kind(&event_type) else {
+            continue;
+        };
+        if !matches!(
+            kind,
+            "session.next.tool.called" | "session.next.tool.success"
+        ) {
+            continue;
+        }
+        let data = parse_event_data(event)?;
+        if data.get("sessionID").and_then(serde_json::Value::as_str) != Some(session_id) {
+            continue;
+        }
+        let Some(assistant_id) = data
+            .get("assistantMessageID")
+            .and_then(serde_json::Value::as_str)
+        else {
+            continue;
+        };
+        let Some(call_id) = data.get("callID").and_then(serde_json::Value::as_str) else {
+            continue;
+        };
+        let seq = value_integer_required(event, "seq")?;
+        let timestamp = data
+            .get("timestamp")
+            .and_then(serde_json::Value::as_i64)
+            .ok_or_else(|| {
+                OpenCodeImportError::Blocked("todowrite event has no integer timestamp".into())
+            })?;
+        if kind == "session.next.tool.called" {
+            if data.get("tool").and_then(serde_json::Value::as_str) == Some("todowrite") {
+                let todos = data
+                    .get("input")
+                    .and_then(|input| input.get("todos"))
+                    .cloned()
+                    .ok_or_else(|| {
+                        OpenCodeImportError::Blocked(
+                            "todowrite event has no exact todo input".into(),
+                        )
+                    })?;
+                calls.insert(
+                    (assistant_id.into(), call_id.into()),
+                    (seq, timestamp, todos),
+                );
+            }
+        } else if let Some((called_seq, called_at, todos)) =
+            calls.get(&(assistant_id.into(), call_id.into()))
+        {
+            if seq <= *called_seq {
+                continue;
+            }
+            successes.push((*called_seq, *called_at, (seq, timestamp, todos.clone())));
+        }
+    }
+    let (_, called_at, (succeeded_seq, succeeded_at, todos)) = successes
+        .into_iter()
+        .max_by_key(|(_, _, (seq, _, _))| *seq)
+        .ok_or_else(|| {
+            OpenCodeImportError::Blocked(
+                "changed todo rows have no durable successful todowrite event pair".into(),
+            )
+        })?;
+    let _ = succeeded_seq;
+    Ok(TodowriteProjection {
+        todos,
+        called_at,
+        succeeded_at,
+    })
+}
+
+fn todo_timestamps_match_call(row: &SerializedRow, called_at: i64, succeeded_at: i64) -> bool {
+    let Some(created) = value_integer(row, "time_created") else {
+        return false;
+    };
+    let Some(updated) = value_integer(row, "time_updated") else {
+        return false;
+    };
+    created >= called_at && created <= succeeded_at && updated >= created && updated <= succeeded_at
+}
+
+fn parse_event_data(row: &SerializedRow) -> Result<serde_json::Value, OpenCodeImportError> {
+    let data = value_text(row, "data")?.ok_or_else(|| {
+        OpenCodeImportError::Blocked("provider transition event has no payload".into())
+    })?;
+    serde_json::from_str(&data).map_err(|_| {
+        OpenCodeImportError::Blocked("provider transition event payload is malformed".into())
+    })
+}
+
+fn baseline_row_change_is_typed(
+    baseline: &freshell_sessions::opencode_transfer::RowDigest,
+    current: &SerializedRow,
+) -> Result<bool, OpenCodeImportError> {
+    if baseline.column_sha256.is_empty() {
+        // Legacy manifests can prove exact equality only. Unknown old rows are
+        // never upgraded into transition-capable evidence.
+        return Ok(false);
+    }
+    let (columns, json_nodes) = current_row_field_digests(current)?;
+    if columns.len() != baseline.column_sha256.len() {
+        return Ok(false);
+    }
+    for (column, old_digest) in &baseline.column_sha256 {
+        let Some(new_digest) = columns.get(column) else {
+            return Ok(false);
+        };
+        if old_digest == new_digest {
+            continue;
+        }
+        if current.table == "session" && column == "revert" {
+            if !allowed_scalar_column(current.table.as_str(), column) {
+                return Ok(false);
+            }
+        } else if baseline
+            .json_node_sha256
+            .keys()
+            .any(|path| path.starts_with(&format!("{column}#")))
+            || json_nodes
+                .keys()
+                .any(|path| path.starts_with(&format!("{column}#")))
+        {
+            if !json_column_changes_are_typed(
+                current.table.as_str(),
+                column,
+                &baseline.json_node_sha256,
+                &json_nodes,
+            ) {
+                return Ok(false);
+            }
+        } else if !allowed_scalar_column(current.table.as_str(), column) {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+fn current_row_field_digests(
+    row: &SerializedRow,
+) -> Result<CurrentRowFieldDigests, OpenCodeImportError> {
+    let columns = row
+        .values
+        .iter()
+        .map(|(name, value)| {
+            serde_json::to_vec(value)
+                .map(|bytes| (name.clone(), sha256(&bytes)))
+                .map_err(|_| OpenCodeImportError::Metadata("native row digest failed".into()))
+        })
+        .collect::<Result<BTreeMap<_, _>, _>>()?;
+    let mut json_nodes = BTreeMap::new();
+    for (column, value) in &row.values {
+        let SerializedSqlValue::Text { value } = value else {
+            continue;
+        };
+        let Ok(json) = serde_json::from_str::<serde_json::Value>(value) else {
+            continue;
+        };
+        collect_current_json_nodes(column, &json, "", &mut json_nodes)?;
+    }
+    Ok((columns, json_nodes))
+}
+
+fn collect_current_json_nodes(
+    column: &str,
+    value: &serde_json::Value,
+    pointer: &str,
+    output: &mut BTreeMap<String, String>,
+) -> Result<(), OpenCodeImportError> {
+    let bytes = serde_json::to_vec(value)
+        .map_err(|_| OpenCodeImportError::Metadata("native JSON digest failed".into()))?;
+    output.insert(format!("{column}#{pointer}"), sha256(&bytes));
+    match value {
+        serde_json::Value::Object(object) => {
+            for (key, child) in object {
+                let escaped = key.replace('~', "~0").replace('/', "~1");
+                collect_current_json_nodes(column, child, &format!("{pointer}/{escaped}"), output)?;
+            }
+        }
+        serde_json::Value::Array(array) => {
+            for (index, child) in array.iter().enumerate() {
+                collect_current_json_nodes(column, child, &format!("{pointer}/{index}"), output)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn json_column_changes_are_typed(
+    table: &str,
+    column: &str,
+    baseline: &BTreeMap<String, String>,
+    current: &BTreeMap<String, String>,
+) -> bool {
+    let prefix = format!("{column}#");
+    let old = baseline
+        .iter()
+        .filter(|(path, _)| path.starts_with(&prefix))
+        .collect::<BTreeMap<_, _>>();
+    let new = current
+        .iter()
+        .filter(|(path, _)| path.starts_with(&prefix))
+        .collect::<BTreeMap<_, _>>();
+    if old.is_empty() || new.is_empty() {
+        return false;
+    }
+    let paths = old
+        .keys()
+        .chain(new.keys())
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    paths.into_iter().all(|path| {
+        if old.get(path) == new.get(path) {
+            return true;
+        }
+        let pointer = path.strip_prefix(&prefix).unwrap_or_default();
+        if allowed_json_node(table, column, pointer) {
+            return true;
+        }
+        // A parent node hash changes when an allowed child changes. Inspect
+        // the child path separately; a newly-added/deleted parent is blocked.
+        let allowed_descendant = allowed_json_prefixes(table, column)
+            .iter()
+            .any(|allowed| allowed.starts_with(&format!("{pointer}/")));
+        allowed_descendant && old.contains_key(path) && new.contains_key(path)
+    })
+}
+
+fn allowed_scalar_column(table: &str, column: &str) -> bool {
+    match table {
+        "event_sequence" => column == "seq",
+        "session" => matches!(
+            column,
+            "title"
+                | "summary_additions"
+                | "summary_deletions"
+                | "summary_files"
+                | "summary_diffs"
+                | "cost"
+                | "tokens_input"
+                | "tokens_output"
+                | "tokens_reasoning"
+                | "tokens_cache_read"
+                | "tokens_cache_write"
+                | "time_updated"
+                | "time_compacting"
+                | "time_archived"
+                | "permission"
+                | "agent"
+                | "model"
+                | "revert"
+        ),
+        "message" => column == "data",
+        "part" => column == "data",
+        "session_input" => matches!(column, "delivery" | "promoted_seq"),
+        "todo" => matches!(column, "content" | "status" | "priority" | "time_updated"),
+        _ => false,
+    }
+}
+
+fn allowed_json_prefixes(table: &str, column: &str) -> Vec<String> {
+    let paths: &[&str] = match (table, column) {
+        ("message", "data") => &[
+            "/time/completed",
+            "/cost",
+            "/tokens/input",
+            "/tokens/output",
+            "/tokens/reasoning",
+            "/tokens/cache/read",
+            "/tokens/cache/write",
+            "/status",
+        ],
+        ("part", "data") => &[
+            "/state/status",
+            "/state/time",
+            "/state/output",
+            "/state/error",
+            "/state/title",
+            "/state/metadata",
+        ],
+        _ => &[],
+    };
+    paths.iter().map(|path| (*path).to_string()).collect()
+}
+
+fn allowed_json_node(table: &str, column: &str, pointer: &str) -> bool {
+    allowed_json_prefixes(table, column).iter().any(|allowed| {
+        *allowed == pointer || *allowed == "/" || pointer.starts_with(&format!("{allowed}/"))
+    })
+}
+
+fn row_has_supporting_transition(
+    row: &SerializedRow,
+    events: &[SerializedRow],
+) -> Result<bool, OpenCodeImportError> {
+    let id = value_text(row, "id")?;
+    let session_id = if row.table == "session" {
+        let Some(id) = id.clone() else {
+            return Ok(false);
+        };
+        id
+    } else {
+        match value_text(row, "session_id")? {
+            Some(value) => value,
+            None => match value_text(row, "aggregate_id")? {
+                Some(value) => value,
+                None => return Ok(false),
+            },
+        }
+    };
+    for event in events {
+        let Some(raw_event_type) = value_text(event, "type")? else {
+            continue;
+        };
+        let Some(data) = value_text(event, "data")? else {
+            continue;
+        };
+        let Ok(data) = serde_json::from_str::<serde_json::Value>(&data) else {
+            continue;
+        };
+        let Some(event_type) = pinned_event_kind(&raw_event_type) else {
+            continue;
+        };
+        if data.get("sessionID").and_then(serde_json::Value::as_str) != Some(&session_id) {
+            continue;
+        }
+        let bound = match row.table.as_str() {
+            "message" => {
+                event_type == "message.updated"
+                    && id
+                        .as_deref()
+                        .is_some_and(|id| message_event_matches_row(&data, row, id))
+                    && event_is_latest_for_entity(
+                        event,
+                        events,
+                        event_type,
+                        &session_id,
+                        id.as_deref().unwrap_or_default(),
+                    )?
+            }
+            "part" => {
+                event_type == "message.part.updated"
+                    && id
+                        .as_deref()
+                        .is_some_and(|id| part_event_matches_row(&data, row, id))
+                    && event_is_latest_for_entity(
+                        event,
+                        events,
+                        event_type,
+                        &session_id,
+                        id.as_deref().unwrap_or_default(),
+                    )?
+                    && part_creation_event_matches(row, events)?
+                    && value_integer(row, "time_created")
+                        .zip(value_integer(row, "time_updated"))
+                        .is_some_and(|(created, updated)| updated >= created)
+            }
+            "session" => match event_type {
+                "session.created" | "session.updated" => {
+                    id.as_deref().is_some_and(|id| {
+                        data.get("info").is_some_and(|info| {
+                            info.get("id").and_then(serde_json::Value::as_str) == Some(id)
+                                && session_row_matches_info(row, info)
+                        })
+                    }) && session_snapshot_event_is_current(event, events, &session_id)?
+                }
+                "session.next.revert.staged" => id.as_deref().is_some_and(|id| {
+                    value_text(row, "id").ok().flatten().as_deref() == Some(id)
+                        && json_column(row, "revert").as_ref() == data.get("revert")
+                        && data.get("timestamp").and_then(serde_json::Value::as_i64)
+                            == value_integer(row, "time_updated")
+                }),
+                "session.next.revert.cleared" => id.as_deref().is_some_and(|id| {
+                    value_text(row, "id").ok().flatten().as_deref() == Some(id)
+                        && json_column(row, "revert") == Some(serde_json::Value::Null)
+                        && data.get("timestamp").and_then(serde_json::Value::as_i64)
+                            == value_integer(row, "time_updated")
+                }),
+                "session.next.agent.switched" => {
+                    id.as_deref() == Some(session_id.as_str())
+                        && value_text(row, "agent")?.as_deref()
+                            == data.get("agent").and_then(serde_json::Value::as_str)
+                        && data.get("timestamp").and_then(serde_json::Value::as_i64)
+                            == value_integer(row, "time_updated")
+                }
+                "session.next.model.switched" => {
+                    id.as_deref() == Some(session_id.as_str())
+                        && json_column(row, "model") == data.get("model").cloned()
+                        && data.get("timestamp").and_then(serde_json::Value::as_i64)
+                            == value_integer(row, "time_updated")
+                }
+                "session.next.moved" => {
+                    let location = data.get("location");
+                    id.as_deref() == Some(session_id.as_str())
+                        && value_text(row, "directory")?.as_deref()
+                            == location
+                                .and_then(|value| value.get("directory"))
+                                .and_then(serde_json::Value::as_str)
+                        && value_text(row, "path")?.as_deref()
+                            == data.get("subdirectory").and_then(serde_json::Value::as_str)
+                        && value_text(row, "workspace_id")?.as_deref()
+                            == location
+                                .and_then(|value| value.get("workspaceID"))
+                                .and_then(serde_json::Value::as_str)
+                        && data.get("timestamp").and_then(serde_json::Value::as_i64)
+                            == value_integer(row, "time_updated")
+                }
+                _ => false,
+            },
+            "session_input" => session_input_event_matches_row(&data, event, row, event_type),
+            // These projections have no complete row-value witness in the
+            // pinned durable-event schema, so a generic entity-ID match is
+            // never sufficient evidence for their mutation.
+            "session_message" | "session_context_epoch" | "todo" => false,
+            _ => false,
+        };
+        if bound {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn event_is_latest_for_entity(
+    candidate: &SerializedRow,
+    events: &[SerializedRow],
+    event_type: &str,
+    session_id: &str,
+    entity_id: &str,
+) -> Result<bool, OpenCodeImportError> {
+    let candidate_seq = value_integer_required(candidate, "seq")?;
+    for event in events {
+        if event.table != "event"
+            || value_integer(event, "seq").is_none_or(|seq| seq <= candidate_seq)
+            || pinned_event_kind(&value_text(event, "type")?.unwrap_or_default())
+                != Some(event_type)
+        {
+            continue;
+        }
+        let data = parse_event_data(event)?;
+        if data.get("sessionID").and_then(serde_json::Value::as_str) != Some(session_id) {
+            continue;
+        }
+        let same_entity = match event_type {
+            "message.updated" => {
+                data.get("info")
+                    .and_then(|info| info.get("id"))
+                    .and_then(serde_json::Value::as_str)
+                    == Some(entity_id)
+            }
+            "message.part.updated" => {
+                data.get("part")
+                    .and_then(|part| part.get("id"))
+                    .and_then(serde_json::Value::as_str)
+                    == Some(entity_id)
+            }
+            _ => false,
+        };
+        if same_entity {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+fn session_snapshot_event_is_current(
+    candidate: &SerializedRow,
+    events: &[SerializedRow],
+    session_id: &str,
+) -> Result<bool, OpenCodeImportError> {
+    let candidate_seq = value_integer_required(candidate, "seq")?;
+    for event in events {
+        if event.table != "event"
+            || value_integer(event, "seq").is_none_or(|seq| seq <= candidate_seq)
+        {
+            continue;
+        }
+        let Some(event_session) = value_text(event, "aggregate_id")? else {
+            continue;
+        };
+        if event_session != session_id {
+            continue;
+        }
+        let raw_event_type = value_text(event, "type")?.unwrap_or_default();
+        let event_type = pinned_event_kind(&raw_event_type);
+        if matches!(
+            event_type,
+            Some(
+                "session.updated"
+                    | "session.next.agent.switched"
+                    | "session.next.model.switched"
+                    | "session.next.moved"
+            )
+        ) {
+            return Ok(false);
+        }
+        if event_type == Some("message.part.updated") {
+            let data = parse_event_data(event)?;
+            if data
+                .get("part")
+                .and_then(|part| part.get("type"))
+                .and_then(serde_json::Value::as_str)
+                == Some("step-finish")
+            {
+                return Ok(false);
+            }
+        }
+    }
+    Ok(true)
+}
+
+fn pinned_event_kind(raw_type: &str) -> Option<&str> {
+    const PINNED_DURABLE_EVENT_TYPES: &[&str] = &[
+        "session.created.1",
+        "session.updated.1",
+        "session.deleted.1",
+        "message.updated.1",
+        "message.removed.1",
+        "message.part.updated.1",
+        "message.part.removed.1",
+        "session.next.agent.switched.1",
+        "session.next.model.switched.1",
+        "session.next.moved.1",
+        "session.next.prompted.1",
+        "session.next.prompt.admitted.1",
+        "session.next.context.updated.1",
+        "session.next.synthetic.1",
+        "session.next.shell.started.1",
+        "session.next.shell.ended.1",
+        "session.next.step.started.1",
+        "session.next.step.ended.2",
+        "session.next.step.failed.2",
+        "session.next.text.started.1",
+        "session.next.text.ended.1",
+        "session.next.tool.input.started.1",
+        "session.next.tool.input.ended.1",
+        "session.next.tool.called.1",
+        "session.next.tool.progress.1",
+        "session.next.tool.success.1",
+        "session.next.tool.failed.1",
+        "session.next.reasoning.started.1",
+        "session.next.reasoning.ended.1",
+        "session.next.retried.1",
+        "session.next.compaction.started.1",
+        "session.next.compaction.ended.1",
+        "session.next.revert.staged.1",
+        "session.next.revert.cleared.1",
+        "session.next.revert.committed.1",
+    ];
+    if PINNED_DURABLE_EVENT_TYPES.contains(&raw_type) {
+        raw_type.rsplit_once('.').map(|(kind, _)| kind)
+    } else {
+        None
+    }
+}
+
+fn value_integer(row: &SerializedRow, key: &str) -> Option<i64> {
+    match row.values.get(key) {
+        Some(SerializedSqlValue::Integer { value }) => Some(*value),
+        _ => None,
+    }
+}
+
+fn value_text(row: &SerializedRow, key: &str) -> Result<Option<String>, OpenCodeImportError> {
+    match row.values.get(key) {
+        Some(SerializedSqlValue::Null) | None => Ok(None),
+        Some(SerializedSqlValue::Text { value }) => Ok(Some(value.clone())),
+        _ => Err(OpenCodeImportError::Blocked(format!(
+            "current native row has a non-text {key} value"
+        ))),
+    }
+}
+
+fn json_column(row: &SerializedRow, column: &str) -> Option<serde_json::Value> {
+    match row.values.get(column)? {
+        SerializedSqlValue::Null => Some(serde_json::Value::Null),
+        SerializedSqlValue::Text { value } => serde_json::from_str(value).ok(),
+        _ => None,
+    }
+}
+
+fn message_event_matches_row(data: &serde_json::Value, row: &SerializedRow, id: &str) -> bool {
+    let Some(info) = data.get("info").and_then(serde_json::Value::as_object) else {
+        return false;
+    };
+    if info.get("id").and_then(serde_json::Value::as_str) != Some(id)
+        || info.get("sessionID").and_then(serde_json::Value::as_str)
+            != value_text(row, "session_id").ok().flatten().as_deref()
+    {
+        return false;
+    }
+    let mut expected = info.clone();
+    expected.remove("id");
+    expected.remove("sessionID");
+    let Some(actual) = json_column(row, "data") else {
+        return false;
+    };
+    let Some(created) = info
+        .get("time")
+        .and_then(|time| time.get("created"))
+        .and_then(serde_json::Value::as_i64)
+    else {
+        return false;
+    };
+    actual == serde_json::Value::Object(expected)
+        && value_integer(row, "time_created") == Some(created)
+}
+
+fn part_event_matches_row(data: &serde_json::Value, row: &SerializedRow, id: &str) -> bool {
+    let Some(part) = data.get("part").and_then(serde_json::Value::as_object) else {
+        return false;
+    };
+    if part.get("id").and_then(serde_json::Value::as_str) != Some(id)
+        || part.get("sessionID").and_then(serde_json::Value::as_str)
+            != value_text(row, "session_id").ok().flatten().as_deref()
+        || part.get("messageID").and_then(serde_json::Value::as_str)
+            != value_text(row, "message_id").ok().flatten().as_deref()
+    {
+        return false;
+    }
+    let mut expected = part.clone();
+    expected.remove("id");
+    expected.remove("sessionID");
+    expected.remove("messageID");
+    json_column(row, "data") == Some(serde_json::Value::Object(expected))
+}
+
+fn part_creation_event_matches(
+    row: &SerializedRow,
+    events: &[SerializedRow],
+) -> Result<bool, OpenCodeImportError> {
+    let Some(part_id) = value_text(row, "id")? else {
+        return Ok(false);
+    };
+    let Some(session_id) = value_text(row, "session_id")? else {
+        return Ok(false);
+    };
+    let mut first: Option<(i64, i64, String)> = None;
+    for event in events {
+        let event_type = value_text(event, "type")?.unwrap_or_default();
+        if pinned_event_kind(&event_type) != Some("message.part.updated") {
+            continue;
+        }
+        let data = parse_event_data(event)?;
+        let Some(part) = data.get("part") else {
+            continue;
+        };
+        if part.get("id").and_then(serde_json::Value::as_str) != Some(part_id.as_str())
+            || part.get("sessionID").and_then(serde_json::Value::as_str)
+                != Some(session_id.as_str())
+        {
+            continue;
+        }
+        let seq = value_integer_required(event, "seq")?;
+        let time = data
+            .get("time")
+            .and_then(serde_json::Value::as_i64)
+            .ok_or_else(|| {
+                OpenCodeImportError::Blocked("durable part update has no integer timestamp".into())
+            })?;
+        if first
+            .as_ref()
+            .is_none_or(|(first_seq, _, _)| seq < *first_seq)
+        {
+            first = Some((seq, time, part_id.clone()));
+        }
+    }
+    Ok(first.is_some_and(|(_, time, _)| value_integer(row, "time_created") == Some(time)))
+}
+
+fn session_row_matches_info(row: &SerializedRow, info: &serde_json::Value) -> bool {
+    const COLUMNS: &[&str] = &[
+        "id",
+        "project_id",
+        "workspace_id",
+        "parent_id",
+        "slug",
+        "directory",
+        "path",
+        "title",
+        "version",
+        "share_url",
+        "summary_additions",
+        "summary_deletions",
+        "summary_files",
+        "summary_diffs",
+        "metadata",
+        "cost",
+        "tokens_input",
+        "tokens_output",
+        "tokens_reasoning",
+        "tokens_cache_read",
+        "tokens_cache_write",
+        "revert",
+        "permission",
+        "agent",
+        "model",
+        "time_created",
+        "time_updated",
+        "time_compacting",
+        "time_archived",
+    ];
+    COLUMNS.iter().all(|column| {
+        let Some(actual) = sql_column_as_json(row, column) else {
+            return false;
+        };
+        actual == session_info_column(info, column)
+    })
+}
+
+fn sql_column_as_json(row: &SerializedRow, column: &str) -> Option<serde_json::Value> {
+    match row.values.get(column)? {
+        SerializedSqlValue::Null => Some(serde_json::Value::Null),
+        SerializedSqlValue::Integer { value } => Some((*value).into()),
+        SerializedSqlValue::Real { bits } => {
+            let bits = u64::from_str_radix(bits, 16).ok()?;
+            serde_json::Number::from_f64(f64::from_bits(bits)).map(serde_json::Value::Number)
+        }
+        SerializedSqlValue::Text { value } => {
+            if matches!(
+                column,
+                "summary_diffs" | "metadata" | "revert" | "permission" | "model"
+            ) {
+                serde_json::from_str(value).ok()
+            } else {
+                Some(serde_json::Value::String(value.clone()))
+            }
+        }
+        SerializedSqlValue::Blob { .. } => None,
+    }
+}
+
+fn session_info_column(info: &serde_json::Value, column: &str) -> serde_json::Value {
+    let null = serde_json::Value::Null;
+    let direct = |name: &str| info.get(name).cloned().unwrap_or(serde_json::Value::Null);
+    let nested = |object: &str, name: &str| {
+        info.get(object)
+            .and_then(|value| value.get(name))
+            .cloned()
+            .unwrap_or(serde_json::Value::Null)
+    };
+    let summary = |name: &str| nested("summary", name);
+    let tokens = |name: &str| nested("tokens", name);
+    match column {
+        "id" => direct("id"),
+        "project_id" => direct("projectID"),
+        "workspace_id" => direct("workspaceID"),
+        "parent_id" => direct("parentID"),
+        "slug" => direct("slug"),
+        "directory" => direct("directory"),
+        "path" => direct("path"),
+        "title" => direct("title"),
+        "version" => direct("version"),
+        "share_url" => nested("share", "url"),
+        "summary_additions" => summary("additions"),
+        "summary_deletions" => summary("deletions"),
+        "summary_files" => summary("files"),
+        "summary_diffs" => summary("diffs"),
+        "metadata" => direct("metadata"),
+        "cost" => info.get("cost").cloned().unwrap_or_else(|| 0.into()),
+        "tokens_input" => tokens("input"),
+        "tokens_output" => tokens("output"),
+        "tokens_reasoning" => tokens("reasoning"),
+        "tokens_cache_read" => nested("tokens", "cache")
+            .get("read")
+            .cloned()
+            .unwrap_or(null),
+        "tokens_cache_write" => nested("tokens", "cache")
+            .get("write")
+            .cloned()
+            .unwrap_or(null),
+        "revert" => direct("revert"),
+        "permission" => direct("permission"),
+        "agent" => direct("agent"),
+        "model" => direct("model"),
+        "time_created" => nested("time", "created"),
+        "time_updated" => nested("time", "updated"),
+        "time_compacting" => nested("time", "compacting"),
+        "time_archived" => nested("time", "archived"),
+        _ => null,
+    }
+}
+
+fn session_input_event_matches_row(
+    data: &serde_json::Value,
+    event: &SerializedRow,
+    row: &SerializedRow,
+    event_type: &str,
+) -> bool {
+    let Some(id) = data.get("messageID").and_then(serde_json::Value::as_str) else {
+        return false;
+    };
+    if value_text(row, "id").ok().flatten().as_deref() != Some(id)
+        || value_text(row, "session_id").ok().flatten().as_deref()
+            != data.get("sessionID").and_then(serde_json::Value::as_str)
+        || json_column(row, "prompt") != data.get("prompt").cloned()
+        || value_text(row, "delivery").ok().flatten().as_deref()
+            != data.get("delivery").and_then(serde_json::Value::as_str)
+    {
+        return false;
+    }
+    let Some(seq) = value_integer(event, "seq") else {
+        return false;
+    };
+    let Some(timestamp) = data.get("timestamp").and_then(serde_json::Value::as_i64) else {
+        return false;
+    };
+    match event_type {
+        "session.next.prompt.admitted" => {
+            value_integer(row, "admitted_seq") == Some(seq)
+                && value_integer(row, "time_created") == Some(timestamp)
+                && row.values.get("promoted_seq") == Some(&SerializedSqlValue::Null)
+        }
+        "session.next.prompted" => value_integer(row, "promoted_seq") == Some(seq),
+        _ => false,
+    }
+}
+
+fn verify_current_event_chains(
+    manifest: &OpenCodeTransferManifest,
+    current_rows: &BTreeMap<(String, Vec<SerializedSqlValue>), SerializedRow>,
+    events: &[SerializedRow],
+) -> Result<(), OpenCodeImportError> {
+    let baseline = manifest
+        .rows
+        .iter()
+        .filter(|row| row.table == "event")
+        .map(|row| (row.table.clone(), row.key.clone()))
+        .collect::<BTreeSet<_>>();
+    let mut baseline_cursors = BTreeMap::new();
+    for row in manifest
+        .rows
+        .iter()
+        .filter(|row| row.table == "event_sequence")
+    {
+        let aggregate_id = key_text(&row.key)?;
+        baseline_cursors.insert(aggregate_id, row.transition_cursor.unwrap_or(-1));
+    }
+    let mut events_by_session = BTreeMap::<String, Vec<(i64, &SerializedRow)>>::new();
+    for event in events {
+        let aggregate_id = value_text(event, "aggregate_id")?.ok_or_else(|| {
+            OpenCodeImportError::Blocked("provider event has no exact session aggregate".into())
+        })?;
+        let seq = value_integer_required(event, "seq")?;
+        let raw_event_type = value_text(event, "type")?.unwrap_or_default();
+        let Some(event_type) = pinned_event_kind(&raw_event_type) else {
+            return Err(OpenCodeImportError::Blocked(
+                "provider event type is not in the pinned durable manifest".into(),
+            ));
+        };
+        let parsed = parse_event_data(event)?;
+        if parsed.get("sessionID").and_then(serde_json::Value::as_str)
+            != Some(aggregate_id.as_str())
+        {
+            return Err(OpenCodeImportError::Blocked(
+                "provider event is not bound to its session aggregate".into(),
+            ));
+        }
+        if event_type.starts_with("session.next.") {
+            validate_v2_event_payload(event_type, &parsed, &aggregate_id)?;
+        } else {
+            validate_v1_event_envelope(event_type, &parsed)?;
+        }
+        if baseline.contains(&(event.table.clone(), event.key.clone())) {
+            continue;
+        }
+        if matches!(event_type, "message.removed" | "message.part.removed") {
+            return Err(OpenCodeImportError::Blocked(
+                "provider transcript removals are blocked until an exact revert boundary is proven"
+                    .into(),
+            ));
+        }
+        if event_type == "session.deleted" {
+            return Err(OpenCodeImportError::Blocked(
+                "provider session deletion events are unsupported during current-store adoption"
+                    .into(),
+            ));
+        }
+        events_by_session
+            .entry(aggregate_id)
+            .or_default()
+            .push((seq, event));
+    }
+    for (session_id, (table, key)) in current_rows
+        .keys()
+        .filter(|(table, _)| table == "event_sequence")
+        .map(|(table, key)| (key_text(key).unwrap_or_default(), (table, key)))
+    {
+        let row = current_rows
+            .get(&(table.clone(), key.clone()))
+            .ok_or_else(|| {
+                OpenCodeImportError::Blocked("provider event sequence disappeared".into())
+            })?;
+        let current_cursor = value_integer_required(row, "seq")?;
+        let base_cursor = baseline_cursors.get(&session_id).copied().unwrap_or(-1);
+        if current_cursor < base_cursor {
+            return Err(OpenCodeImportError::Blocked(
+                "provider event sequence moved behind the immutable baseline".into(),
+            ));
+        }
+        let mut session_events = events_by_session.remove(&session_id).unwrap_or_default();
+        session_events.sort_by_key(|(seq, _)| *seq);
+        let expected_count = i128::from(current_cursor) - i128::from(base_cursor);
+        if expected_count < 0 || expected_count as u128 != session_events.len() as u128 {
+            return Err(OpenCodeImportError::Blocked(
+                "provider transition event sequence has a gap or was reused".into(),
+            ));
+        }
+        for (index, (actual_seq, _)) in session_events.iter().enumerate() {
+            let expected_seq = i128::from(base_cursor) + index as i128 + 1;
+            if i128::from(*actual_seq) != expected_seq {
+                return Err(OpenCodeImportError::Blocked(
+                    "provider transition event sequence has a gap or was reused".into(),
+                ));
+            }
+        }
+    }
+    if !events_by_session.is_empty() {
+        return Err(OpenCodeImportError::Blocked(
+            "provider transition events have no matching sequence row".into(),
+        ));
+    }
+    let _ = manifest;
+    Ok(())
+}
+
+fn validate_v1_event_envelope(
+    event_type: &str,
+    data: &serde_json::Value,
+) -> Result<(), OpenCodeImportError> {
+    let (required_keys, optional_keys): (&[&str], &[&str]) = match event_type {
+        "session.created" | "session.updated" | "session.deleted" | "message.updated" => {
+            (&["sessionID", "info"], &[])
+        }
+        "message.removed" => (&["sessionID", "messageID"], &[]),
+        "message.part.removed" => (&["sessionID", "messageID", "partID"], &[]),
+        "message.part.updated" => (&["sessionID", "part", "time"], &[]),
+        _ => {
+            return Err(OpenCodeImportError::Blocked(
+                "durable V1 event has no supported pinned payload schema".into(),
+            ));
+        }
+    };
+    let Some(object) = data.as_object() else {
+        return Err(OpenCodeImportError::Blocked(
+            "durable V1 event payload is not an object".into(),
+        ));
+    };
+    if required_keys.iter().any(|key| !object.contains_key(*key))
+        || object.keys().any(|key| {
+            !required_keys.contains(&key.as_str()) && !optional_keys.contains(&key.as_str())
+        })
+        || data
+            .get("sessionID")
+            .and_then(serde_json::Value::as_str)
+            .is_none_or(|value| !valid_session_id(value))
+    {
+        return Err(OpenCodeImportError::Blocked(
+            "durable V1 event payload does not match its pinned top-level shape".into(),
+        ));
+    }
+    match event_type {
+        "session.created" | "session.updated" | "session.deleted" => {
+            if !data
+                .get("info")
+                .is_some_and(|info| is_v1_session_info(info, data.get("sessionID").unwrap()))
+            {
+                return Err(OpenCodeImportError::Blocked(
+                    "durable V1 session event info does not match the pinned SessionInfo schema"
+                        .into(),
+                ));
+            }
+        }
+        "message.updated" => {
+            if !data
+                .get("info")
+                .is_some_and(|info| is_v1_message_info(info, data.get("sessionID").unwrap()))
+            {
+                return Err(OpenCodeImportError::Blocked(
+                    "durable V1 message event info does not match the pinned Message schema".into(),
+                ));
+            }
+        }
+        "message.part.updated" => {
+            if !data
+                .get("part")
+                .is_some_and(|part| is_v1_part(part, data.get("sessionID").unwrap()))
+                || !field_is(data, "time", is_finite_number)
+            {
+                return Err(OpenCodeImportError::Blocked(
+                    "durable V1 part event does not match the pinned Part schema".into(),
+                ));
+            }
+        }
+        "message.removed" => {
+            if !field_is(data, "messageID", |id| {
+                id.as_str().is_some_and(valid_message_id)
+            }) {
+                return Err(OpenCodeImportError::Blocked(
+                    "durable V1 message removal does not match the pinned schema".into(),
+                ));
+            }
+        }
+        "message.part.removed" => {
+            if !field_is(data, "messageID", |id| {
+                id.as_str().is_some_and(valid_message_id)
+            }) || !field_is(data, "partID", |id| id.as_str().is_some_and(valid_part_id))
+            {
+                return Err(OpenCodeImportError::Blocked(
+                    "durable V1 part removal does not match the pinned schema".into(),
+                ));
+            }
+        }
+        _ => unreachable!("unsupported V1 event rejected above"),
+    }
+    Ok(())
+}
+
+fn is_v1_file_diff(value: &serde_json::Value) -> bool {
+    has_object_shape(
+        value,
+        &["additions", "deletions"],
+        &["file", "patch", "status"],
+    ) && field_is(value, "additions", is_finite_number)
+        && field_is(value, "deletions", is_finite_number)
+        && optional_field_is(value, "file", is_string)
+        && optional_field_is(value, "patch", is_string)
+        && optional_field_is(value, "status", |value| {
+            matches!(value.as_str(), Some("added" | "deleted" | "modified"))
+        })
+}
+
+fn is_v1_session_info(value: &serde_json::Value, session_id: &serde_json::Value) -> bool {
+    has_object_shape(
+        value,
+        &[
+            "id",
+            "slug",
+            "projectID",
+            "directory",
+            "title",
+            "version",
+            "time",
+        ],
+        &[
+            "workspaceID",
+            "path",
+            "parentID",
+            "summary",
+            "cost",
+            "tokens",
+            "share",
+            "agent",
+            "model",
+            "metadata",
+            "permission",
+            "revert",
+        ],
+    ) && value.get("id") == Some(session_id)
+        && field_is(value, "id", |value| {
+            value.as_str().is_some_and(valid_session_id)
+        })
+        && ["slug", "projectID", "directory", "title", "version"]
+            .iter()
+            .all(|key| field_is(value, key, is_string))
+        && optional_field_is(value, "workspaceID", is_string)
+        && optional_field_is(value, "path", is_string)
+        && optional_field_is(value, "parentID", |value| {
+            value.as_str().is_some_and(valid_session_id)
+        })
+        && optional_field_is(value, "summary", is_v1_session_summary)
+        && optional_field_is(value, "cost", is_finite_number)
+        && optional_field_is(value, "tokens", is_v1_session_tokens)
+        && optional_field_is(value, "share", |share| {
+            has_object_shape(share, &["url"], &[]) && field_is(share, "url", is_string)
+        })
+        && optional_field_is(value, "agent", is_string)
+        && optional_field_is(value, "model", |model| {
+            has_object_shape(model, &["id", "providerID"], &["variant"])
+                && field_is(model, "id", is_string)
+                && field_is(model, "providerID", is_string)
+                && optional_field_is(model, "variant", is_string)
+        })
+        && optional_field_is(value, "metadata", is_unknown_record)
+        && optional_field_is(value, "permission", |rules| {
+            rules.as_array().is_some_and(|rules| {
+                rules.iter().all(|rule| {
+                    has_object_shape(rule, &["permission", "pattern", "action"], &[])
+                        && field_is(rule, "permission", is_string)
+                        && field_is(rule, "pattern", is_string)
+                        && field_is(rule, "action", |action| {
+                            matches!(action.as_str(), Some("allow" | "deny" | "ask"))
+                        })
+                })
+            })
+        })
+        && optional_field_is(value, "revert", |revert| {
+            has_object_shape(revert, &["messageID"], &["partID", "snapshot", "diff"])
+                && field_is(revert, "messageID", |value| {
+                    value.as_str().is_some_and(valid_message_id)
+                })
+                && optional_field_is(revert, "partID", |value| {
+                    value.as_str().is_some_and(valid_part_id)
+                })
+                && optional_field_is(revert, "snapshot", is_string)
+                && optional_field_is(revert, "diff", is_string)
+        })
+        && field_is(value, "time", |time| {
+            has_object_shape(time, &["created", "updated"], &["compacting", "archived"])
+                && field_is(time, "created", is_nonnegative_integer)
+                && field_is(time, "updated", is_nonnegative_integer)
+                && optional_field_is(time, "compacting", is_nonnegative_integer)
+                && optional_field_is(time, "archived", is_finite_number)
+        })
+}
+
+fn is_v1_session_summary(value: &serde_json::Value) -> bool {
+    has_object_shape(value, &["additions", "deletions", "files"], &["diffs"])
+        && ["additions", "deletions", "files"]
+            .iter()
+            .all(|key| field_is(value, key, is_finite_number))
+        && optional_field_is(value, "diffs", |diffs| {
+            diffs
+                .as_array()
+                .is_some_and(|diffs| diffs.iter().all(is_v1_file_diff))
+        })
+}
+
+fn is_v1_session_tokens(value: &serde_json::Value) -> bool {
+    has_object_shape(value, &["input", "output", "reasoning", "cache"], &[])
+        && ["input", "output", "reasoning"]
+            .iter()
+            .all(|key| field_is(value, key, is_finite_number))
+        && field_is(value, "cache", |cache| {
+            has_object_shape(cache, &["read", "write"], &[])
+                && field_is(cache, "read", is_finite_number)
+                && field_is(cache, "write", is_finite_number)
+        })
+}
+
+fn is_v1_message_info(value: &serde_json::Value, session_id: &serde_json::Value) -> bool {
+    if value.get("sessionID") != Some(session_id)
+        || !field_is(value, "id", |value| {
+            value.as_str().is_some_and(valid_message_id)
+        })
+    {
+        return false;
+    }
+    match value.get("role").and_then(serde_json::Value::as_str) {
+        Some("user") => {
+            has_object_shape(
+                value,
+                &["id", "sessionID", "role", "time", "agent", "model"],
+                &["format", "summary", "system", "tools"],
+            ) && field_is(value, "time", |time| {
+                has_object_shape(time, &["created"], &[])
+                    && field_is(time, "created", is_nonnegative_finite_number)
+            }) && field_is(value, "agent", is_string)
+                && field_is(value, "model", |model| {
+                    has_object_shape(model, &["providerID", "modelID"], &["variant"])
+                        && field_is(model, "providerID", is_string)
+                        && field_is(model, "modelID", is_string)
+                        && optional_field_is(model, "variant", is_string)
+                })
+                && optional_field_is(value, "format", is_v1_output_format)
+                && optional_field_is(value, "summary", is_v1_message_summary)
+                && optional_field_is(value, "system", is_string)
+                && optional_field_is(value, "tools", |tools| {
+                    tools
+                        .as_object()
+                        .is_some_and(|tools| tools.values().all(|value| value.as_bool().is_some()))
+                })
+        }
+        Some("assistant") => {
+            has_object_shape(
+                value,
+                &[
+                    "id",
+                    "sessionID",
+                    "role",
+                    "time",
+                    "parentID",
+                    "modelID",
+                    "providerID",
+                    "mode",
+                    "agent",
+                    "path",
+                    "cost",
+                    "tokens",
+                ],
+                &["error", "summary", "structured", "variant", "finish"],
+            ) && field_is(value, "time", |time| {
+                has_object_shape(time, &["created"], &["completed"])
+                    && field_is(time, "created", is_nonnegative_integer)
+                    && optional_field_is(time, "completed", is_nonnegative_integer)
+            }) && field_is(value, "parentID", |value| {
+                value.as_str().is_some_and(valid_message_id)
+            }) && ["modelID", "providerID", "mode", "agent"]
+                .iter()
+                .all(|key| field_is(value, key, is_string))
+                && field_is(value, "path", |path| {
+                    has_object_shape(path, &["cwd", "root"], &[])
+                        && field_is(path, "cwd", is_string)
+                        && field_is(path, "root", is_string)
+                })
+                && field_is(value, "cost", is_finite_number)
+                && field_is(value, "tokens", is_v1_message_tokens)
+                && optional_field_is(value, "error", is_v1_assistant_error)
+                && optional_field_is(value, "summary", |value| value.as_bool().is_some())
+                && optional_field_is(value, "structured", |_| true)
+                && optional_field_is(value, "variant", is_string)
+                && optional_field_is(value, "finish", is_string)
+        }
+        _ => false,
+    }
+}
+
+fn is_v1_output_format(value: &serde_json::Value) -> bool {
+    match value.get("type").and_then(serde_json::Value::as_str) {
+        Some("text") => has_object_shape(value, &["type"], &[]),
+        Some("json_schema") => {
+            has_object_shape(value, &["type", "schema"], &["retryCount"])
+                && field_is(value, "schema", is_unknown_record)
+                && optional_field_is(value, "retryCount", is_nonnegative_integer)
+        }
+        _ => false,
+    }
+}
+
+fn is_v1_message_summary(value: &serde_json::Value) -> bool {
+    has_object_shape(value, &["diffs"], &["title", "body"])
+        && optional_field_is(value, "title", is_string)
+        && optional_field_is(value, "body", is_string)
+        && field_is(value, "diffs", |diffs| {
+            diffs
+                .as_array()
+                .is_some_and(|diffs| diffs.iter().all(is_v1_file_diff))
+        })
+}
+
+fn is_v1_message_tokens(value: &serde_json::Value) -> bool {
+    has_object_shape(
+        value,
+        &["input", "output", "reasoning", "cache"],
+        &["total"],
+    ) && optional_field_is(value, "total", is_finite_number)
+        && ["input", "output", "reasoning"]
+            .iter()
+            .all(|key| field_is(value, key, is_finite_number))
+        && field_is(value, "cache", |cache| {
+            has_object_shape(cache, &["read", "write"], &[])
+                && field_is(cache, "read", is_finite_number)
+                && field_is(cache, "write", is_finite_number)
+        })
+}
+
+fn is_v1_assistant_error(value: &serde_json::Value) -> bool {
+    let (Some(name), Some(data)) = (
+        value.get("name").and_then(serde_json::Value::as_str),
+        value.get("data"),
+    ) else {
+        return false;
+    };
+    match name {
+        "ProviderAuthError" => {
+            has_object_shape(data, &["providerID", "message"], &[])
+                && field_is(data, "providerID", is_string)
+                && field_is(data, "message", is_string)
+        }
+        "UnknownError" => {
+            has_object_shape(data, &["message"], &["ref"])
+                && field_is(data, "message", is_string)
+                && optional_field_is(data, "ref", is_string)
+        }
+        "MessageOutputLengthError" => has_object_shape(data, &[], &[]),
+        "MessageAbortedError" | "ContextOverflowError" | "ContentFilterError" => {
+            has_object_shape(
+                data,
+                &["message"],
+                if name == "ContextOverflowError" {
+                    &["responseBody"]
+                } else {
+                    &[]
+                },
+            ) && field_is(data, "message", is_string)
+                && optional_field_is(data, "responseBody", is_string)
+        }
+        "StructuredOutputError" => {
+            has_object_shape(data, &["message", "retries"], &[])
+                && field_is(data, "message", is_string)
+                && field_is(data, "retries", is_nonnegative_integer)
+        }
+        "APIError" => is_v1_api_error(value),
+        _ => false,
+    }
+}
+
+fn is_v1_api_error(value: &serde_json::Value) -> bool {
+    value.get("name").and_then(serde_json::Value::as_str) == Some("APIError")
+        && field_is(value, "data", |data| {
+            has_object_shape(
+                data,
+                &["message", "isRetryable"],
+                &["statusCode", "responseHeaders", "responseBody", "metadata"],
+            ) && field_is(data, "message", is_string)
+                && field_is(data, "isRetryable", |value| value.as_bool().is_some())
+                && optional_field_is(data, "statusCode", is_nonnegative_integer)
+                && optional_field_is(data, "responseHeaders", is_string_record)
+                && optional_field_is(data, "responseBody", is_string)
+                && optional_field_is(data, "metadata", is_string_record)
+        })
+}
+
+fn is_v1_part(value: &serde_json::Value, session_id: &serde_json::Value) -> bool {
+    if !field_is(value, "id", |value| {
+        value.as_str().is_some_and(valid_part_id)
+    }) || value.get("sessionID") != Some(session_id)
+        || !field_is(value, "messageID", |value| {
+            value.as_str().is_some_and(valid_message_id)
+        })
+    {
+        return false;
+    }
+    match value.get("type").and_then(serde_json::Value::as_str) {
+        Some("text") => {
+            has_object_shape(
+                value,
+                &["id", "sessionID", "messageID", "type", "text"],
+                &["synthetic", "ignored", "time", "metadata"],
+            ) && field_is(value, "text", is_string)
+                && optional_field_is(value, "synthetic", |value| value.as_bool().is_some())
+                && optional_field_is(value, "ignored", |value| value.as_bool().is_some())
+                && optional_field_is(value, "time", |time| {
+                    has_object_shape(time, &["start"], &["end"])
+                        && field_is(time, "start", is_nonnegative_integer)
+                        && optional_field_is(time, "end", is_nonnegative_integer)
+                })
+                && optional_field_is(value, "metadata", is_unknown_record)
+        }
+        Some("reasoning") => {
+            has_object_shape(
+                value,
+                &["id", "sessionID", "messageID", "type", "text", "time"],
+                &["metadata"],
+            ) && field_is(value, "text", is_string)
+                && field_is(value, "time", |time| {
+                    has_object_shape(time, &["start"], &["end"])
+                        && field_is(time, "start", is_nonnegative_integer)
+                        && optional_field_is(time, "end", is_nonnegative_integer)
+                })
+                && optional_field_is(value, "metadata", is_unknown_record)
+        }
+        Some("snapshot") => {
+            has_object_shape(
+                value,
+                &["id", "sessionID", "messageID", "type", "snapshot"],
+                &[],
+            ) && field_is(value, "snapshot", is_string)
+        }
+        Some("patch") => {
+            has_object_shape(
+                value,
+                &["id", "sessionID", "messageID", "type", "hash", "files"],
+                &[],
+            ) && field_is(value, "hash", is_string)
+                && field_is(value, "files", is_string_array)
+        }
+        Some("file") => {
+            has_object_shape(
+                value,
+                &["id", "sessionID", "messageID", "type", "mime", "url"],
+                &["filename", "source"],
+            ) && field_is(value, "mime", is_string)
+                && field_is(value, "url", is_string)
+                && optional_field_is(value, "filename", is_string)
+                && optional_field_is(value, "source", is_v1_file_source)
+        }
+        Some("agent") => {
+            has_object_shape(
+                value,
+                &["id", "sessionID", "messageID", "type", "name"],
+                &["source"],
+            ) && field_is(value, "name", is_string)
+                && optional_field_is(value, "source", is_v1_text_source)
+        }
+        Some("compaction") => {
+            has_object_shape(
+                value,
+                &["id", "sessionID", "messageID", "type", "auto"],
+                &["overflow", "tail_start_id"],
+            ) && field_is(value, "auto", |value| value.as_bool().is_some())
+                && optional_field_is(value, "overflow", |value| value.as_bool().is_some())
+                && optional_field_is(value, "tail_start_id", |value| {
+                    value.as_str().is_some_and(valid_message_id)
+                })
+        }
+        Some("subtask") => {
+            has_object_shape(
+                value,
+                &[
+                    "id",
+                    "sessionID",
+                    "messageID",
+                    "type",
+                    "prompt",
+                    "description",
+                    "agent",
+                ],
+                &["model", "command"],
+            ) && ["prompt", "description", "agent"]
+                .iter()
+                .all(|key| field_is(value, key, is_string))
+                && optional_field_is(value, "command", is_string)
+                && optional_field_is(value, "model", |model| {
+                    has_object_shape(model, &["providerID", "modelID"], &[])
+                        && field_is(model, "providerID", is_string)
+                        && field_is(model, "modelID", is_string)
+                })
+        }
+        Some("step-start") => {
+            has_object_shape(
+                value,
+                &["id", "sessionID", "messageID", "type"],
+                &["snapshot"],
+            ) && optional_field_is(value, "snapshot", is_string)
+        }
+        Some("step-finish") => {
+            has_object_shape(
+                value,
+                &[
+                    "id",
+                    "sessionID",
+                    "messageID",
+                    "type",
+                    "reason",
+                    "cost",
+                    "tokens",
+                ],
+                &["snapshot"],
+            ) && field_is(value, "reason", is_string)
+                && field_is(value, "cost", is_finite_number)
+                && optional_field_is(value, "snapshot", is_string)
+                && field_is(value, "tokens", |tokens| {
+                    has_object_shape(
+                        tokens,
+                        &["input", "output", "reasoning", "cache"],
+                        &["total"],
+                    ) && optional_field_is(tokens, "total", is_finite_number)
+                        && ["input", "output", "reasoning"]
+                            .iter()
+                            .all(|key| field_is(tokens, key, is_finite_number))
+                        && field_is(tokens, "cache", |cache| {
+                            has_object_shape(cache, &["read", "write"], &[])
+                                && field_is(cache, "read", is_finite_number)
+                                && field_is(cache, "write", is_finite_number)
+                        })
+                })
+        }
+        Some("retry") => {
+            has_object_shape(
+                value,
+                &[
+                    "id",
+                    "sessionID",
+                    "messageID",
+                    "type",
+                    "attempt",
+                    "error",
+                    "time",
+                ],
+                &[],
+            ) && field_is(value, "attempt", is_nonnegative_integer)
+                && field_is(value, "error", is_v1_api_error)
+                && field_is(value, "time", |time| {
+                    has_object_shape(time, &["created"], &[])
+                        && field_is(time, "created", is_nonnegative_integer)
+                })
+        }
+        Some("tool") => {
+            has_object_shape(
+                value,
+                &[
+                    "id",
+                    "sessionID",
+                    "messageID",
+                    "type",
+                    "callID",
+                    "tool",
+                    "state",
+                ],
+                &["metadata"],
+            ) && field_is(value, "callID", is_string)
+                && field_is(value, "tool", is_string)
+                && optional_field_is(value, "metadata", is_unknown_record)
+                && field_is(value, "state", is_v1_tool_state)
+        }
+        _ => false,
+    }
+}
+
+fn is_v1_text_source(value: &serde_json::Value) -> bool {
+    has_object_shape(value, &["value", "start", "end"], &[])
+        && field_is(value, "value", is_string)
+        && field_is(value, "start", is_nonnegative_integer)
+        && field_is(value, "end", is_nonnegative_integer)
+}
+
+fn is_v1_file_source(value: &serde_json::Value) -> bool {
+    let Some(kind) = value.get("type").and_then(serde_json::Value::as_str) else {
+        return false;
+    };
+    let valid_text = |text: &serde_json::Value| {
+        has_object_shape(text, &["value", "start", "end"], &[])
+            && field_is(text, "value", is_string)
+            && field_is(text, "start", is_finite_number)
+            && field_is(text, "end", is_finite_number)
+    };
+    match kind {
+        "file" => {
+            has_object_shape(value, &["type", "path", "text"], &[])
+                && field_is(value, "path", is_string)
+                && field_is(value, "text", valid_text)
+        }
+        "resource" => {
+            has_object_shape(value, &["type", "clientName", "uri", "text"], &[])
+                && field_is(value, "clientName", is_string)
+                && field_is(value, "uri", is_string)
+                && field_is(value, "text", valid_text)
+        }
+        "symbol" => {
+            has_object_shape(
+                value,
+                &["type", "path", "text", "range", "name", "kind"],
+                &[],
+            ) && field_is(value, "path", is_string)
+                && field_is(value, "name", is_string)
+                && field_is(value, "kind", is_nonnegative_integer)
+                && field_is(value, "text", valid_text)
+                && field_is(value, "range", |range| {
+                    has_object_shape(range, &["start", "end"], &[])
+                        && ["start", "end"].iter().all(|key| {
+                            field_is(range, key, |position| {
+                                has_object_shape(position, &["line", "character"], &[])
+                                    && field_is(position, "line", is_nonnegative_integer)
+                                    && field_is(position, "character", is_nonnegative_integer)
+                            })
+                        })
+                })
+        }
+        _ => false,
+    }
+}
+
+fn is_v1_file_part(value: &serde_json::Value) -> bool {
+    value.get("type").and_then(serde_json::Value::as_str) == Some("file")
+        && value
+            .get("sessionID")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(valid_session_id)
+        && is_v1_part(
+            value,
+            value.get("sessionID").unwrap_or(&serde_json::Value::Null),
+        )
+}
+
+fn is_v1_tool_state(value: &serde_json::Value) -> bool {
+    match value.get("status").and_then(serde_json::Value::as_str) {
+        Some("pending") => {
+            has_object_shape(value, &["status", "input", "raw"], &[])
+                && field_is(value, "input", is_unknown_record)
+                && field_is(value, "raw", is_string)
+        }
+        Some("running") => {
+            has_object_shape(value, &["status", "input", "time"], &["title", "metadata"])
+                && field_is(value, "input", is_unknown_record)
+                && field_is(value, "time", |time| {
+                    has_object_shape(time, &["start"], &[])
+                        && field_is(time, "start", is_nonnegative_integer)
+                })
+                && optional_field_is(value, "title", is_string)
+                && optional_field_is(value, "metadata", is_unknown_record)
+        }
+        Some("completed") => {
+            has_object_shape(
+                value,
+                &["status", "input", "output", "title", "metadata", "time"],
+                &["attachments"],
+            ) && field_is(value, "input", is_unknown_record)
+                && field_is(value, "output", is_string)
+                && field_is(value, "title", is_string)
+                && field_is(value, "metadata", is_unknown_record)
+                && field_is(value, "time", |time| {
+                    has_object_shape(time, &["start", "end"], &["compacted"])
+                        && field_is(time, "start", is_nonnegative_integer)
+                        && field_is(time, "end", is_nonnegative_integer)
+                        && optional_field_is(time, "compacted", is_nonnegative_integer)
+                })
+                && optional_field_is(value, "attachments", |attachments| {
+                    attachments
+                        .as_array()
+                        .is_some_and(|attachments| attachments.iter().all(is_v1_file_part))
+                })
+        }
+        Some("error") => {
+            has_object_shape(value, &["status", "input", "error", "time"], &["metadata"])
+                && field_is(value, "input", is_unknown_record)
+                && field_is(value, "error", is_string)
+                && field_is(value, "time", |time| {
+                    has_object_shape(time, &["start", "end"], &[])
+                        && field_is(time, "start", is_nonnegative_integer)
+                        && field_is(time, "end", is_nonnegative_integer)
+                })
+                && optional_field_is(value, "metadata", is_unknown_record)
+        }
+        _ => false,
+    }
+}
+
+fn value_integer_required(row: &SerializedRow, key: &str) -> Result<i64, OpenCodeImportError> {
+    match row.values.get(key) {
+        Some(SerializedSqlValue::Integer { value }) => Ok(*value),
+        _ => Err(OpenCodeImportError::Blocked(format!(
+            "native row has no valid {key} sequence"
+        ))),
+    }
+}
+
+fn verify_current_references(
+    manifest: &OpenCodeTransferManifest,
+    current_rows: &BTreeMap<(String, Vec<SerializedSqlValue>), SerializedRow>,
+    workspace_root: &Path,
+) -> Result<(), OpenCodeImportError> {
+    let rows = current_rows.values().cloned().collect::<Vec<_>>();
+    freshell_sessions::opencode_transfer::verify_asset_references(
+        &manifest.assets,
+        &rows,
+        workspace_root,
+    )
+    .map_err(|_| {
+        OpenCodeImportError::Blocked(
+            "workspace or Git assets do not match the imported closure".into(),
+        )
+    })
+}
+
+fn derive_root_tail(
+    root_session_id: &str,
+    sessions: &[SerializedRow],
+    messages: &[SerializedRow],
+    session_messages: &[SerializedRow],
+) -> Result<VerifiedRootTail, OpenCodeImportError> {
+    let root = sessions
+        .iter()
+        .find(|row| value_text(row, "id").ok().flatten().as_deref() == Some(root_session_id))
+        .ok_or_else(|| {
+            OpenCodeImportError::Blocked("the imported root session is missing".into())
+        })?;
+    let has_v2_history = session_messages.iter().any(|row| {
+        value_text(row, "session_id").ok().flatten().as_deref() == Some(root_session_id)
+    });
+    let ordered = if has_v2_history {
+        let mut ordered = session_messages
+            .iter()
+            .filter(|row| {
+                value_text(row, "session_id").ok().flatten().as_deref() == Some(root_session_id)
+            })
+            .map(|row| {
+                Ok((
+                    value_integer_required(row, "seq")?,
+                    value_text(row, "id")?.ok_or_else(|| {
+                        OpenCodeImportError::Blocked("root V2 message has no exact ID".into())
+                    })?,
+                ))
+            })
+            .collect::<Result<Vec<_>, OpenCodeImportError>>()?;
+        ordered.sort();
+        ordered
+    } else {
+        let mut ordered = messages
+            .iter()
+            .filter(|row| {
+                value_text(row, "session_id").ok().flatten().as_deref() == Some(root_session_id)
+            })
+            .map(|row| {
+                Ok((
+                    value_integer_required(row, "time_created")?,
+                    value_text(row, "id")?.ok_or_else(|| {
+                        OpenCodeImportError::Blocked("root message has no exact ID".into())
+                    })?,
+                ))
+            })
+            .collect::<Result<Vec<_>, OpenCodeImportError>>()?;
+        ordered.sort();
+        ordered
+    };
+    if let Some(revert) = value_text(root, "revert")? {
+        let revert: serde_json::Value = serde_json::from_str(&revert).map_err(|_| {
+            OpenCodeImportError::Blocked("the active revert boundary is malformed".into())
+        })?;
+        let boundary = revert
+            .get("messageID")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| {
+                OpenCodeImportError::Blocked("the active revert boundary has no message ID".into())
+            })?;
+        let index = ordered
+            .iter()
+            .position(|(_, id)| id == boundary)
+            .ok_or_else(|| {
+                OpenCodeImportError::Blocked("the active revert boundary is not in the root".into())
+            })?;
+        if revert
+            .get("partID")
+            .and_then(serde_json::Value::as_str)
+            .is_some()
+        {
+            return Ok(VerifiedRootTail::Message {
+                message_id: boundary.to_owned(),
+            });
+        }
+        if index == 0 {
+            return Ok(VerifiedRootTail::QualifiedEmpty);
+        }
+        return Ok(VerifiedRootTail::Message {
+            message_id: ordered[index - 1].1.clone(),
+        });
+    }
+    Ok(match ordered.last() {
+        Some((_, message_id)) => VerifiedRootTail::Message {
+            message_id: message_id.clone(),
+        },
+        None => VerifiedRootTail::QualifiedEmpty,
+    })
+}
+
+fn current_evidence_generation(
+    descriptor: &OpenCodeTransferDescriptor,
+    rows: &BTreeMap<(String, Vec<SerializedSqlValue>), SerializedRow>,
+    manifest: &OpenCodeTransferManifest,
+) -> Result<String, OpenCodeImportError> {
+    let mut hasher = Sha256::new();
+    hasher.update(b"freshell-opencode-current-evidence-v1\0");
+    hasher.update(descriptor.destination_store_id.as_bytes());
+    hasher.update([0]);
+    hasher.update(descriptor.root_session_id.as_bytes());
+    hasher.update([0]);
+    hasher.update(manifest.generation.as_bytes());
+    for ((table, key), row) in rows {
+        hasher.update(table.as_bytes());
+        hasher.update([0]);
+        hasher.update(serde_json::to_vec(key).map_err(|_| {
+            OpenCodeImportError::Metadata("native row key cannot be encoded".into())
+        })?);
+        hasher.update([0]);
+        hasher.update(digest_serialized_row(row)?.as_bytes());
+    }
+    for asset in &manifest.assets {
+        hasher.update(serde_json::to_vec(asset).map_err(|_| {
+            OpenCodeImportError::Metadata("asset evidence cannot be encoded".into())
+        })?);
+        hasher.update([0]);
+    }
+    Ok(hex::encode(hasher.finalize()))
 }
 
 fn validate_descriptor(descriptor: &OpenCodeTransferDescriptor) -> Result<(), OpenCodeImportError> {

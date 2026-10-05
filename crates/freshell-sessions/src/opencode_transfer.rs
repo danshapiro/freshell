@@ -396,6 +396,19 @@ pub struct RowDigest {
     pub table: String,
     pub key: Vec<SerializedSqlValue>,
     pub sha256: String,
+    /// Body-free commitments to individual columns let later recovery accept
+    /// a typed provider transition while proving immutable fields remained.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub column_sha256: BTreeMap<String, String>,
+    /// Hashes of JSON nodes in JSON-valued text columns. Values stay in the
+    /// native DB; these paths allow a verifier to permit only typed fields.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub json_node_sha256: BTreeMap<String, String>,
+    /// Provider event cursor captured for sequence-owning baseline rows.
+    /// This is bounded, non-body metadata used to validate contiguous later
+    /// transitions without retaining event payloads.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transition_cursor: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -669,6 +682,12 @@ pub fn export_exact_session(
                 table: row.table.clone(),
                 key: row.key.clone(),
                 sha256: digest_serializable(row)?,
+                column_sha256: serialized_column_digests(row)?,
+                json_node_sha256: serialized_json_node_digests(row)?,
+                transition_cursor: match row.table.as_str() {
+                    "event_sequence" => value_integer(row, "seq")?,
+                    _ => None,
+                },
             });
         }
         let source_store_id = digest(source_path.canonicalize()?.to_string_lossy().as_bytes());
@@ -2715,6 +2734,16 @@ fn required_text(row: &SerializedRow, key: &str) -> Result<String, TransferError
     })
 }
 
+fn value_integer(row: &SerializedRow, key: &str) -> Result<Option<i64>, TransferError> {
+    match row.values.get(key) {
+        Some(SerializedSqlValue::Integer { value }) => Ok(Some(*value)),
+        Some(SerializedSqlValue::Null) | None => Ok(None),
+        _ => Err(TransferError::Blocked(format!(
+            "native row has an invalid {key} sequence"
+        ))),
+    }
+}
+
 fn unique_text_values(rows: &[SerializedRow], key: &str) -> Result<Vec<String>, TransferError> {
     let mut values = BTreeSet::new();
     for row in rows {
@@ -2753,6 +2782,61 @@ fn digest_serializable(value: &impl Serialize) -> Result<String, TransferError> 
         result.map_err(|error| TransferError::Serialization(error.to_string()))?;
     }
     Ok(hex::encode(hasher.finalize()))
+}
+
+fn serialized_column_digests(
+    row: &SerializedRow,
+) -> Result<BTreeMap<String, String>, TransferError> {
+    row.values
+        .iter()
+        .map(|(name, value)| {
+            let bytes = serde_json::to_vec(value)
+                .map_err(|error| TransferError::Serialization(error.to_string()))?;
+            Ok((name.clone(), digest(&bytes)))
+        })
+        .collect()
+}
+
+fn serialized_json_node_digests(
+    row: &SerializedRow,
+) -> Result<BTreeMap<String, String>, TransferError> {
+    let mut digests = BTreeMap::new();
+    for (column, value) in &row.values {
+        let SerializedSqlValue::Text { value } = value else {
+            continue;
+        };
+        let Ok(json) = serde_json::from_str::<serde_json::Value>(value) else {
+            continue;
+        };
+        collect_json_node_digests(column, &json, "", &mut digests)?;
+    }
+    Ok(digests)
+}
+
+fn collect_json_node_digests(
+    column: &str,
+    value: &serde_json::Value,
+    pointer: &str,
+    digests: &mut BTreeMap<String, String>,
+) -> Result<(), TransferError> {
+    let bytes = serde_json::to_vec(value)
+        .map_err(|error| TransferError::Serialization(error.to_string()))?;
+    digests.insert(format!("{column}#{pointer}"), digest(&bytes));
+    match value {
+        serde_json::Value::Object(object) => {
+            for (key, child) in object {
+                let escaped = key.replace('~', "~0").replace('/', "~1");
+                collect_json_node_digests(column, child, &format!("{pointer}/{escaped}"), digests)?;
+            }
+        }
+        serde_json::Value::Array(array) => {
+            for (index, child) in array.iter().enumerate() {
+                collect_json_node_digests(column, child, &format!("{pointer}/{index}"), digests)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
 }
 
 fn digest_reader(reader: &mut impl Read) -> Result<String, TransferError> {

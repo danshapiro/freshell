@@ -3222,6 +3222,7 @@ impl Supervisor {
                 fixture_evidence,
                 native_session_id,
                 opencode_transfer_receipt,
+                ..
             } => Ok(AcceptedGrant {
                 host_boot_id,
                 worker_pid,

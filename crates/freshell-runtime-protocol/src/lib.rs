@@ -1296,6 +1296,67 @@ fn secret_component(value: &str) -> bool {
 mod provider_launch_context_tests {
     use super::*;
 
+    fn valid_adoption_baseline(root_session_id: &str) -> OpenCodeAdoptionBaseline {
+        let source_store_id = "c".repeat(64);
+        let source_generation = "d".repeat(64);
+        let source_schema_fingerprint = "e".repeat(64);
+        let migration_journal_fingerprint = "f".repeat(64);
+        let payload = b"x";
+        let payload_sha256 = sha256_hex(payload);
+        let manifest_json = serde_json::json!({
+            "version": 1,
+            "provider_schema": "opencode-1.18.21",
+            "root_session_id": root_session_id,
+            "source_store_id": source_store_id,
+            "source_schema_fingerprint": source_schema_fingerprint,
+            "migration_journal_fingerprint": migration_journal_fingerprint,
+            "sqlite_version": "test",
+            "row_count": 0,
+            "rows": [],
+            "assets": [],
+            "payload_bytes": payload.len(),
+            "payload_sha256": payload_sha256,
+            "generation": source_generation,
+        })
+        .to_string();
+        let files = vec![OpenCodeTransferFile {
+            index: 0,
+            relative_path: "payload.json".into(),
+            size_bytes: payload.len() as u64,
+            sha256: payload_sha256,
+        }];
+        let target_image_ref = format!("sha256:{}", "a".repeat(64));
+        let mut descriptor = OpenCodeTransferDescriptor {
+            transfer_id: "transfer-adoption-test".into(),
+            provider: "opencode".into(),
+            source_store_id,
+            root_session_id: root_session_id.into(),
+            source_generation,
+            provider_schema: "opencode-1.18.21".into(),
+            source_schema_fingerprint,
+            migration_journal_fingerprint,
+            destination_store_id: "store-adoption-test".into(),
+            destination_database_path: OPENCODE_TRANSFER_DESTINATION_DB.into(),
+            target_image_ref: target_image_ref.clone(),
+            target_build_receipt: opencode_target_build_receipt(
+                &target_image_ref,
+                "opencode-1.18.21",
+            ),
+            incarnation_id: "incarnation-import".into(),
+            manifest_json,
+            files,
+            total_bytes: payload.len() as u64,
+            bundle_sha256: String::new(),
+        };
+        descriptor.bundle_sha256 =
+            opencode_transfer_bundle_digest(&descriptor.manifest_json, &descriptor.files);
+        let manifest_sha256 = sha256_hex(descriptor.manifest_json.as_bytes());
+        OpenCodeAdoptionBaseline {
+            descriptor,
+            manifest_sha256,
+        }
+    }
+
     #[test]
     fn old_terminal_launch_row_deserializes_without_provider_context() {
         let row = serde_json::json!({
@@ -1306,6 +1367,70 @@ mod provider_launch_context_tests {
         });
         let launch: TerminalLaunchSpec = serde_json::from_value(row).unwrap();
         assert!(launch.provider_launch_context.is_none());
+        assert!(launch.opencode_adoption.is_none());
+    }
+
+    #[test]
+    fn old_host_status_row_defaults_to_no_opencode_adoption_gate() {
+        let result: HostResult = serde_json::from_value(serde_json::json!({
+            "kind": "status",
+            "data": {
+                "host_boot_id": "hostboot-legacy-status",
+                "worker_pid": 42,
+                "worker_launch_count": 1,
+                "max_control_epoch": 1,
+                "max_execution_generation": 1,
+                "fixture_evidence": {},
+                "exited": false
+            }
+        }))
+        .unwrap();
+        assert!(matches!(
+            result,
+            HostResult::Status {
+                opencode_adoption: OpenCodeAdoptionStatus::NotRequired,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn adoption_expectation_and_observation_are_typed_and_body_free() {
+        let incarnation_id = IncarnationId::parse("incarnation-adoption-test").unwrap();
+        let expected = OpenCodeAdoptionExpectation {
+            baseline: valid_adoption_baseline("ses_exactroot"),
+            root_session_id: "ses_exactroot".into(),
+            root_tail: OpenCodeVerifiedRootTail::Message {
+                message_id: "msg_exact_tail".into(),
+            },
+            evidence_generation: "a".repeat(64),
+            incarnation_id: incarnation_id.clone(),
+            launch_nonce: "b".repeat(32),
+        };
+        expected.validate().unwrap();
+        let observation = OpenCodeAdoptionObservation {
+            terminal_id: "terminal-adoption-test".into(),
+            root_session_id: expected.root_session_id.clone(),
+            tail_message_id: Some("msg_exact_tail".into()),
+            evidence_generation: expected.evidence_generation.clone(),
+            incarnation_id,
+            launch_nonce: expected.launch_nonce.clone(),
+            hydrated: true,
+            messages_read: OpenCodeMessagesRead::Success,
+        };
+        let json = serde_json::to_value(&observation).unwrap();
+        assert_eq!(json["messagesRead"], "success");
+        assert!(json.get("message").is_none());
+        assert_eq!(
+            serde_json::from_value::<OpenCodeAdoptionObservation>(json).unwrap(),
+            observation
+        );
+
+        let empty: OpenCodeVerifiedRootTail = serde_json::from_value(serde_json::json!({
+            "state": "qualified_empty"
+        }))
+        .unwrap();
+        assert_eq!(empty, OpenCodeVerifiedRootTail::QualifiedEmpty);
     }
 
     #[test]
@@ -2024,6 +2149,11 @@ pub struct TerminalLaunchSpec {
     /// supervisor consumes it atomically with durable launch preparation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub opencode_transfer_attempt_id: Option<String>,
+    /// A verified native root-history snapshot that the fresh OpenCode TUI
+    /// must observe before this terminal accepts input. Absent on legacy and
+    /// unmanaged OpenCode launches.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub opencode_adoption: Option<OpenCodeAdoptionExpectation>,
 }
 
 impl TerminalLaunchSpec {
@@ -2063,6 +2193,17 @@ impl TerminalLaunchSpec {
                 RuntimeErrorCode::InvalidRequest,
                 "OpenCode staging attempt has no transfer descriptor",
             ));
+        }
+        if let Some(adoption) = &self.opencode_adoption {
+            adoption.validate()?;
+            if self.mode != "opencode"
+                || self.resume_session_id.as_deref() != Some(adoption.root_session_id.as_str())
+            {
+                return Err(RuntimeError::new(
+                    RuntimeErrorCode::RecoveryWrongIdentity,
+                    "OpenCode adoption expectation does not match the resumed root session",
+                ));
+            }
         }
         if self.env.len() > 512
             || self.args.len() > 512
@@ -2778,6 +2919,12 @@ pub fn valid_opencode_transfer_attempt_id(value: &str) -> bool {
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
+fn valid_opencode_session_id(value: &str) -> bool {
+    value
+        .strip_prefix("ses_")
+        .is_some_and(|id| !id.is_empty() && id.bytes().all(|byte| byte.is_ascii_alphanumeric()))
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "state", content = "data", rename_all = "snake_case")]
 pub enum OpenCodeTransferResult {
@@ -2825,6 +2972,126 @@ pub struct OpenCodeTransferReadinessReceipt {
     pub provider_gid: u32,
     pub structural_sha256: String,
     pub reader_receipt_sha256: String,
+}
+
+/// Exact verified root-history state that a resumed managed OpenCode TUI must
+/// load before the session host will release user input.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", content = "data", rename_all = "snake_case")]
+pub enum OpenCodeVerifiedRootTail {
+    Message {
+        message_id: String,
+    },
+    /// This variant may be produced only after a successful native read has
+    /// confirmed the root session has no messages.
+    QualifiedEmpty,
+}
+
+/// Passive import metadata used to verify later store evolutions. It carries
+/// no bundle bytes and never authorizes running the importer on resume.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OpenCodeAdoptionBaseline {
+    pub descriptor: OpenCodeTransferDescriptor,
+    pub manifest_sha256: String,
+}
+
+impl OpenCodeAdoptionBaseline {
+    pub fn validate(&self) -> Result<(), RuntimeError> {
+        self.descriptor.validate()?;
+        if !is_lower_hex_64(&self.manifest_sha256)
+            || sha256_hex(self.descriptor.manifest_json.as_bytes()) != self.manifest_sha256
+        {
+            return Err(RuntimeError::new(
+                RuntimeErrorCode::InvalidRequest,
+                "OpenCode adoption baseline manifest digest is invalid",
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Per-launch evidence required to open a managed OpenCode terminal's input
+/// gate. `launch_nonce` makes observations from older launches inert even
+/// when terminal and native session ids are reused.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OpenCodeAdoptionExpectation {
+    pub baseline: OpenCodeAdoptionBaseline,
+    pub root_session_id: String,
+    pub root_tail: OpenCodeVerifiedRootTail,
+    pub evidence_generation: String,
+    pub incarnation_id: IncarnationId,
+    pub launch_nonce: String,
+}
+
+impl OpenCodeAdoptionExpectation {
+    pub fn validate(&self) -> Result<(), RuntimeError> {
+        self.baseline.validate()?;
+        let tail_is_valid = match &self.root_tail {
+            OpenCodeVerifiedRootTail::Message { message_id } => {
+                !message_id.is_empty() && message_id.len() <= 256
+            }
+            OpenCodeVerifiedRootTail::QualifiedEmpty => true,
+        };
+        if !valid_opencode_session_id(&self.root_session_id)
+            || self.baseline.descriptor.root_session_id != self.root_session_id
+            || !tail_is_valid
+            || !is_lower_hex_64(&self.evidence_generation)
+            || !valid_opencode_transfer_attempt_id(&self.launch_nonce)
+        {
+            return Err(RuntimeError::new(
+                RuntimeErrorCode::InvalidRequest,
+                "OpenCode adoption expectation is invalid",
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Result of the plugin's fresh, hydrated TUI read of the active root
+/// session's native messages. A failed read and a successful empty read are
+/// distinct protocol states.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OpenCodeMessagesRead {
+    Success,
+    EmptyConfirmed,
+    Failed,
+}
+
+/// Body-free observation written by the OpenCode TUI plugin for one exact
+/// terminal launch. It is not adoption evidence until the session host checks
+/// every field against its launch expectation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct OpenCodeAdoptionObservation {
+    #[serde(alias = "terminal_id")]
+    pub terminal_id: String,
+    #[serde(alias = "root_session_id")]
+    pub root_session_id: String,
+    #[serde(alias = "tail_message_id")]
+    pub tail_message_id: Option<String>,
+    #[serde(alias = "evidence_generation")]
+    pub evidence_generation: String,
+    #[serde(alias = "incarnation_id")]
+    pub incarnation_id: IncarnationId,
+    #[serde(alias = "launch_nonce")]
+    pub launch_nonce: String,
+    pub hydrated: bool,
+    #[serde(alias = "messages_read")]
+    pub messages_read: OpenCodeMessagesRead,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(tag = "state", content = "data", rename_all = "snake_case")]
+pub enum OpenCodeAdoptionStatus {
+    #[default]
+    NotRequired,
+    AwaitingObservation,
+    Observed {
+        observation: OpenCodeAdoptionObservation,
+    },
 }
 
 impl OpenCodeTransferReadinessReceipt {
@@ -3148,6 +3415,17 @@ impl LaunchRequest {
                         return Err(RuntimeError::new(
                             RuntimeErrorCode::RecoveryWrongIdentity,
                             "OpenCode transfer does not match the launch provider store or native session",
+                        ));
+                    }
+                }
+                if let Some(adoption) = &terminal.opencode_adoption {
+                    if self.provider != "opencode"
+                        || self.native_session_id.as_deref()
+                            != Some(adoption.root_session_id.as_str())
+                    {
+                        return Err(RuntimeError::new(
+                            RuntimeErrorCode::RecoveryWrongIdentity,
+                            "OpenCode adoption expectation does not match the launch provider or native root",
                         ));
                     }
                 }
@@ -4006,6 +4284,8 @@ pub enum HostResult {
         /// receipt was revalidated before this grant was consumed.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         opencode_transfer_receipt: Option<OpenCodeTransferReadinessReceipt>,
+        #[serde(default)]
+        opencode_adoption: OpenCodeAdoptionStatus,
     },
     Stopped,
     SecurityProbe(serde_json::Value),
@@ -4044,6 +4324,8 @@ pub enum HostResult {
         /// grant acknowledgement and marker persistence.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         opencode_transfer_receipt: Option<OpenCodeTransferReadinessReceipt>,
+        #[serde(default)]
+        opencode_adoption: OpenCodeAdoptionStatus,
     },
     RecoveryProbe(RecoveryProbe),
 }
@@ -4742,6 +5024,7 @@ mod tests {
             provider_launch_context: None,
             opencode_transfer: None,
             opencode_transfer_attempt_id: None,
+            opencode_adoption: None,
         };
         assert!(spec.validate().is_ok());
         spec.provider_model = Some("bad\0model".into());
