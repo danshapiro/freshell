@@ -132,6 +132,7 @@ pub enum RecoveryState {
     Blocked,
     Lost,
     Stopped,
+    DataRepairComplete,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -587,6 +588,84 @@ pub struct IncidentSummaryRequest {
     pub incident_id: IncidentId,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub expected_control_epoch: Option<u64>,
+}
+
+/// One exact false-loss row selected for stopped restoration. Native paths,
+/// provider payloads, and session contents are intentionally absent.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct LostSoulRepairTarget {
+    pub soul_id: SoulId,
+    pub incident_id: IncidentId,
+    pub expected_intent_revision: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RestoreLostSoulsRequest {
+    pub targets: Vec<LostSoulRepairTarget>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expected_control_epoch: Option<u64>,
+}
+
+impl RestoreLostSoulsRequest {
+    pub fn validate_exact_batch(&self) -> Result<(), RuntimeError> {
+        let mut souls = std::collections::BTreeSet::new();
+        let mut incidents = std::collections::BTreeSet::new();
+        if self.targets.len() != 8
+            || self.targets.iter().any(|target| {
+                target.expected_intent_revision == 0
+                    || !souls.insert(target.soul_id.as_str())
+                    || !incidents.insert(target.incident_id.as_str())
+            })
+        {
+            return Err(RuntimeError::new(
+                RuntimeErrorCode::InvalidRequest,
+                "stopped restoration requires exactly eight distinct soul and incident targets with positive intent revisions",
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SoulRepairStatus {
+    Pending,
+    Complete,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RootRepairImportStatus {
+    Pending,
+    StructurallyVerified,
+    ProviderReadable,
+    Complete,
+}
+
+/// Body-free progress for one canonical native root in a stopped correction.
+/// It contains identity and revision codes only; source paths and transcript
+/// data never cross the request boundary.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RestoreLostSoulRootResult {
+    pub root_session_id: String,
+    pub canonical_soul_id: Option<SoulId>,
+    pub import_status: RootRepairImportStatus,
+    pub intent_revision: Option<u64>,
+    pub native_import_revision: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RestoreLostSoulsResult {
+    pub operation_id: RequestId,
+    pub status: SoulRepairStatus,
+    pub repaired_target_count: u32,
+    pub total_target_count: u32,
+    #[serde(default)]
+    pub roots: Vec<RestoreLostSoulRootResult>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -3600,6 +3679,7 @@ pub enum AdminCommand {
     PendingNotices(PendingNoticesRequest),
     NoticeReceipt(NoticeReceiptRequest),
     IncidentSummary(IncidentSummaryRequest),
+    RestoreLostSouls(RestoreLostSoulsRequest),
     MetricsSnapshot,
     MigrationPlan(MigrationPlanRequest),
     RepairAudit(RepairRequest),
@@ -4114,6 +4194,7 @@ pub enum AdminResult {
     PendingNotices(Vec<RuntimeNotice>),
     NoticeReceiptRecorded,
     IncidentSummary(LossIncidentSummary),
+    RestoreLostSouls(RestoreLostSoulsResult),
     MetricsSnapshot(RuntimeMetricsSnapshot),
     MigrationPlan(MigrationPlan),
     RepairAudit(RepairAudit),
@@ -4807,6 +4888,43 @@ mod tests {
     fn ids_reject_control_characters_and_are_distinct() {
         assert!(SoulId::parse("bad\nvalue").is_err());
         assert_ne!(SoulId::new(), SoulId::new());
+    }
+
+    #[test]
+    fn stopped_repair_request_requires_eight_distinct_revisioned_targets() {
+        let request = RestoreLostSoulsRequest {
+            targets: (0..8)
+                .map(|_| LostSoulRepairTarget {
+                    soul_id: SoulId::new(),
+                    incident_id: IncidentId::new(),
+                    expected_intent_revision: 1,
+                })
+                .collect(),
+            expected_control_epoch: Some(1),
+        };
+        assert!(request.validate_exact_batch().is_ok());
+
+        let mut duplicate_soul = request.clone();
+        duplicate_soul.targets[7].soul_id = duplicate_soul.targets[0].soul_id.clone();
+        assert!(duplicate_soul.validate_exact_batch().is_err());
+
+        let mut stale_revision = request;
+        stale_revision.targets[0].expected_intent_revision = 0;
+        assert!(stale_revision.validate_exact_batch().is_err());
+    }
+
+    #[test]
+    fn stopped_repair_request_rejects_caller_supplied_paths_and_payloads() {
+        let value = serde_json::json!({
+            "targets": (0..8).map(|_| serde_json::json!({
+                "soulId": SoulId::new(),
+                "incidentId": IncidentId::new(),
+                "expectedIntentRevision": 1,
+                "nativePath": "/must/not/be/accepted"
+            })).collect::<Vec<_>>(),
+            "expectedControlEpoch": 1
+        });
+        assert!(serde_json::from_value::<RestoreLostSoulsRequest>(value).is_err());
     }
 
     #[test]

@@ -298,6 +298,7 @@ mod tests {
             prior_handle: OwnedRuntimeHandle::from_registry(
                 InstallationId::parse("installation-resume-catalog").unwrap(),
                 soul,
+                "store".into(),
                 incarnation,
                 LaunchNonce::parse("launch-resume-catalog").unwrap(),
                 DockerDaemonId::parse("daemon-resume-catalog").unwrap(),

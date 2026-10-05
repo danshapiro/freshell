@@ -3,10 +3,10 @@ use crate::opencode_transfer::OpenCodeTransferStageReferences;
 use freshell_runtime_protocol::{
     AllocationState, CleanupState, DesiredState, DockerDaemonId, DurabilityState, FixtureKind,
     FreshAgentLaunchSpec, FreshAgentTurnSettings, GrantId, HostBootId, IncarnationId, IncidentId,
-    InstallationId, LaunchNonce, LaunchState, NoticeId, OpenCodeTransferDescriptor,
-    RecoveryAttemptId, RecoveryBlockReason, RecoveryPath, RecoveryState, RecoveryTrigger,
-    RequestId, ResumeSpec, RuntimeLimits, RuntimeProfile, RuntimeView, SoulId, StopOutcome,
-    TerminalLaunchSpec, ViewIntentRequest,
+    InstallationId, LaunchNonce, LaunchState, LostSoulRepairTarget, NoticeId,
+    OpenCodeTransferDescriptor, RecoveryAttemptId, RecoveryBlockReason, RecoveryPath,
+    RecoveryState, RecoveryTrigger, RequestId, RestoreLostSoulsRequest, ResumeSpec, RuntimeLimits,
+    RuntimeProfile, RuntimeView, SoulId, StopOutcome, TerminalLaunchSpec, ViewIntentRequest,
 };
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use serde::{Deserialize, Serialize};
@@ -20,7 +20,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-pub const SCHEMA_VERSION: u32 = 11;
+pub const SCHEMA_VERSION: u32 = 13;
 mod input_reservation;
 pub(crate) use input_reservation::binary_digest;
 pub use input_reservation::{BoundInputReservation, OwnedInputReservation};
@@ -153,6 +153,58 @@ pub struct PreparedLaunch {
 }
 
 #[derive(Debug, Clone)]
+pub(crate) struct StoppedRepairOperation {
+    pub status: String,
+    pub result_json: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct StoppedRepairOwnerCandidate {
+    pub soul_id: SoulId,
+    pub source_store_id: Option<String>,
+    pub root_session_id: Option<String>,
+    pub source_generation: Option<String>,
+    pub native_import_state: NativeImportState,
+    pub native_import_authority: String,
+    pub intent_revision: u64,
+    pub identity_revision: u64,
+    pub native_import_revision: u64,
+    pub explicit_view_count: u64,
+}
+
+/// Persisted, body-free evidence for one exact installed source generation.
+/// The helper's environment paths are checked before constructing this value
+/// and represented only by a digest here.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct StoppedRepairRootReceipt {
+    pub root_session_id: String,
+    pub canonical_soul_id: SoulId,
+    pub transfer_id: String,
+    pub destination_store_id: String,
+    pub source_store_id: String,
+    pub source_generation: String,
+    pub bundle_sha256: String,
+    pub source_schema_fingerprint: String,
+    pub migration_journal_fingerprint: String,
+    pub target_image_ref: String,
+    pub target_build_receipt: String,
+    pub row_count: u64,
+    pub asset_count: u64,
+    pub structural_sha256: String,
+    pub provider_uid: u32,
+    pub provider_gid: u32,
+    pub reader_environment_sha256: String,
+    pub captured_identity_revision: u64,
+    pub captured_evidence_revision: u64,
+    pub captured_intent_revision: u64,
+    pub captured_native_import_revision: u64,
+    pub captured_native_import_state: String,
+    pub captured_native_import_authority: String,
+    pub incarnation_id: IncarnationId,
+    pub execution_generation: u64,
+}
+
+#[derive(Debug, Clone)]
 pub struct BackendCreatedRecord {
     pub daemon_id: DockerDaemonId,
     pub container_id: String,
@@ -178,6 +230,7 @@ pub struct ExecutionGrantRecord {
 pub struct OwnedRuntimeHandle {
     installation_id: InstallationId,
     soul_id: SoulId,
+    provider_store_id: String,
     incarnation_id: IncarnationId,
     launch_nonce: LaunchNonce,
     daemon_id: DockerDaemonId,
@@ -207,6 +260,7 @@ impl OwnedRuntimeHandle {
     pub(crate) fn from_registry(
         installation_id: InstallationId,
         soul_id: SoulId,
+        provider_store_id: String,
         incarnation_id: IncarnationId,
         launch_nonce: LaunchNonce,
         daemon_id: DockerDaemonId,
@@ -224,6 +278,7 @@ impl OwnedRuntimeHandle {
         Self {
             installation_id,
             soul_id,
+            provider_store_id,
             incarnation_id,
             launch_nonce,
             daemon_id,
@@ -245,6 +300,9 @@ impl OwnedRuntimeHandle {
     }
     pub fn soul_id(&self) -> &SoulId {
         &self.soul_id
+    }
+    pub fn provider_store_id(&self) -> &str {
+        &self.provider_store_id
     }
     pub fn incarnation_id(&self) -> &IncarnationId {
         &self.incarnation_id
@@ -1954,6 +2012,316 @@ impl Registry {
             .await
     }
 
+    /// Validate and durably register one exact stopped-repair batch before
+    /// source discovery or transfer staging begins. The operation ID is also
+    /// the idempotency key, so an HTTP retry cannot silently select a new set.
+    pub(crate) async fn prepare_stopped_repair_operation(
+        &self,
+        operation_id: RequestId,
+        request: RestoreLostSoulsRequest,
+    ) -> Result<StoppedRepairOperation, RegistryError> {
+        let mut targets = request.targets;
+        targets.sort_by(|left, right| {
+            left.soul_id
+                .as_str()
+                .cmp(right.soul_id.as_str())
+                .then_with(|| left.incident_id.as_str().cmp(right.incident_id.as_str()))
+        });
+        let targets_json = serde_json::to_string(&targets)?;
+        let target_fingerprint = format!("{:x}", Sha256::digest(serde_json::to_vec(&targets)?));
+        let operation_id_text = operation_id.to_string();
+        let expected_epoch = request.expected_control_epoch;
+        self.run_blocking(move |mut conn| {
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let current_epoch: u64 = tx.query_row(
+                "SELECT control_epoch FROM installation WHERE singleton=1",
+                [],
+                |row| row.get(0),
+            )?;
+            if let Some(expected) = expected_epoch {
+                if expected != current_epoch {
+                    return Err(RegistryError::StaleControlEpoch {
+                        expected,
+                        current: current_epoch,
+                    });
+                }
+            }
+
+            let existing: Option<(String, String, Option<String>)> = tx
+                .query_row(
+                    "SELECT target_fingerprint,status,result_json FROM stopped_repair_operations \
+                     WHERE idempotency_key=?1",
+                    params![operation_id_text],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .optional()?;
+            if let Some((existing_fingerprint, status, result_json)) = existing {
+                if existing_fingerprint != target_fingerprint {
+                    return Err(RegistryError::RequestConflict);
+                }
+                // The final database CAS removes the false loss rows before
+                // the coordinated artifact withdrawal finishes. Once that
+                // point is reached, retries must resume the durable
+                // withdrawal record and must not revalidate a LOST-state
+                // target that the successful CAS has already corrected.
+                if matches!(status.as_str(), "withdraw_pending" | "complete") {
+                    tx.commit()?;
+                    return Ok(StoppedRepairOperation {
+                        status,
+                        result_json,
+                    });
+                }
+            }
+
+            for target in &targets {
+                validate_stopped_repair_target_in_tx(&tx, target)?;
+            }
+
+            let now = now_millis();
+            tx.execute(
+                "INSERT INTO stopped_repair_operations \
+                 (operation_id,idempotency_key,target_fingerprint,targets_json,status,result_json,created_at,updated_at) \
+                 VALUES (?1,?1,?2,?3,'importing',NULL,?4,?4) \
+                 ON CONFLICT(idempotency_key) DO UPDATE SET updated_at=excluded.updated_at \
+                 WHERE target_fingerprint=excluded.target_fingerprint",
+                params![operation_id_text, target_fingerprint, targets_json, now],
+            )?;
+            let (status, result_json): (String, Option<String>) = tx.query_row(
+                "SELECT status,result_json FROM stopped_repair_operations WHERE operation_id=?1",
+                params![operation_id_text],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )?;
+            tx.commit()?;
+            Ok(StoppedRepairOperation { status, result_json })
+        })
+        .await
+    }
+
+    pub(crate) async fn stopped_repair_owner_candidates(
+        &self,
+        root_session_id: String,
+    ) -> Result<Vec<StoppedRepairOwnerCandidate>, RegistryError> {
+        self.run_blocking(move |conn| {
+            let mut statement = conn.prepare(
+                "SELECT s.soul_id,s.native_import_source_store_id,COALESCE(s.native_import_root_session_id,s.native_session_id),\
+                        s.native_import_source_generation,s.native_import_state,s.native_import_authority,\
+                        s.intent_revision,s.identity_revision,s.native_import_revision,\
+                        (SELECT COUNT(*) FROM view_intents v WHERE v.soul_id=s.soul_id AND v.kind<>'automatic_primary')\
+                 FROM souls s WHERE s.provider='opencode' AND (s.native_session_id=?1 OR s.native_import_root_session_id=?1)\
+                 ORDER BY s.soul_id",
+            )?;
+            let rows = statement.query_map(params![root_session_id], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, u64>(6)?,
+                    row.get::<_, u64>(7)?,
+                    row.get::<_, u64>(8)?,
+                    row.get::<_, u64>(9)?,
+                ))
+            })?;
+            let mut candidates = Vec::new();
+            for row in rows {
+                let (
+                    soul_id,
+                    source_store_id,
+                    root_session_id,
+                    source_generation,
+                    import_state,
+                    native_import_authority,
+                    intent_revision,
+                    identity_revision,
+                    native_import_revision,
+                    explicit_view_count,
+                ) = row?;
+                candidates.push(StoppedRepairOwnerCandidate {
+                    soul_id: SoulId::parse(soul_id).map_err(|_| {
+                        RegistryError::Integrity("invalid OpenCode owner soul id".into())
+                    })?,
+                    source_store_id,
+                    root_session_id,
+                    source_generation,
+                    native_import_state: NativeImportState::parse(&import_state)?,
+                    native_import_authority,
+                    intent_revision,
+                    identity_revision,
+                    native_import_revision,
+                    explicit_view_count,
+                });
+            }
+            Ok(candidates)
+        })
+        .await
+    }
+
+    pub(crate) async fn persist_stopped_repair_root_receipt(
+        &self,
+        operation_id: RequestId,
+        target: LostSoulRepairTarget,
+        context: RecoveryContext,
+        receipt: StoppedRepairRootReceipt,
+    ) -> Result<(), RegistryError> {
+        self.run_blocking(move |mut conn| {
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let operation_status: String = tx.query_row(
+                "SELECT status FROM stopped_repair_operations WHERE operation_id=?1",
+                params![operation_id.as_str()],
+                |row| row.get(0),
+            )?;
+            if operation_status != "importing"
+                || receipt.canonical_soul_id != target.soul_id
+                || receipt.captured_intent_revision != target.expected_intent_revision
+                || context.soul_id != target.soul_id
+                || context.intent_revision != target.expected_intent_revision
+                || context.provider != "opencode"
+                || context.desired_state != DesiredState::Stopped
+                || context.recovery_state != RecoveryState::Lost
+                || receipt.incarnation_id != *context.prior_handle.incarnation_id()
+                || receipt.destination_store_id != context.provider_store_id
+                || receipt.root_session_id
+                    != context
+                        .native_import_root_session_id
+                        .as_deref()
+                        .or(context.native_session_id.as_deref())
+                        .unwrap_or_default()
+                || receipt.provider_uid
+                    != context
+                        .terminal
+                        .as_ref()
+                        .ok_or_else(|| RegistryError::InvalidState("repair target has no terminal spec".into()))?
+                        .run_as_uid
+                || receipt.provider_gid
+                    != context
+                        .terminal
+                        .as_ref()
+                        .ok_or_else(|| RegistryError::InvalidState("repair target has no terminal spec".into()))?
+                        .run_as_gid
+                || !is_lower_hex_sha256(&receipt.structural_sha256)
+                || !is_lower_hex_sha256(&receipt.reader_environment_sha256)
+                || !is_lower_hex_sha256(&receipt.bundle_sha256)
+                || receipt.transfer_id.is_empty()
+            {
+                return Err(RegistryError::NativeIdentityConflict);
+            }
+            let targets_json: String = tx.query_row(
+                "SELECT targets_json FROM stopped_repair_operations WHERE operation_id=?1",
+                params![operation_id.as_str()],
+                |row| row.get(0),
+            )?;
+            let targets: Vec<LostSoulRepairTarget> = serde_json::from_str(&targets_json)?;
+            if !targets.iter().any(|candidate| {
+                candidate.soul_id == target.soul_id
+                    && candidate.incident_id == target.incident_id
+                    && candidate.expected_intent_revision == target.expected_intent_revision
+            }) {
+                return Err(RegistryError::RequestConflict);
+            }
+            validate_stopped_repair_target_in_tx(&tx, &target)?;
+
+            let current: (String, String, String, Option<String>, u64, u64, u64, String, Option<String>, Option<String>, Option<String>, Option<String>, Option<String>, String, u64, String, String) = tx.query_row(
+                "SELECT s.provider,s.provider_store_id,s.desired_state,s.loss_incident_id,s.identity_revision,s.evidence_revision,s.native_import_revision,s.native_import_state,s.native_import_source_store_id,s.native_import_root_session_id,s.native_import_source_generation,s.native_import_schema_fingerprint,s.native_import_migration_fingerprint,s.native_import_authority,i.execution_generation,i.launch_state,i.cleanup_state \
+                 FROM souls s JOIN incarnations i ON i.soul_id=s.soul_id AND i.incarnation_id=?2 WHERE s.soul_id=?1",
+                params![target.soul_id.as_str(), receipt.incarnation_id.as_str()],
+                |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?,row.get(6)?,row.get(7)?,row.get(8)?,row.get(9)?,row.get(10)?,row.get(11)?,row.get(12)?,row.get(13)?,row.get(14)?,row.get(15)?,row.get(16)?)),
+            )?;
+            if current.0 != "opencode"
+                || current.1 != receipt.destination_store_id
+                || current.2 != "stopped"
+                || current.3.as_deref() != Some(target.incident_id.as_str())
+                || current.4 != receipt.captured_identity_revision
+                || current.5 != receipt.captured_evidence_revision
+                || current.6 != receipt.captured_native_import_revision
+                || current.7 != receipt.captured_native_import_state
+                || current.8 != context.native_import_source_store_id
+                || current.9 != context.native_import_root_session_id
+                || current.10 != context.native_import_source_generation
+                || current.11 != context.native_import_schema_fingerprint
+                || current.12 != context.native_import_migration_fingerprint
+                || current.13 != receipt.captured_native_import_authority
+                || current.14 != receipt.execution_generation
+                || current.15 != "stopped"
+                || current.16 != "verified_empty"
+                || receipt.captured_identity_revision != context.identity_revision
+                || receipt.captured_evidence_revision != context.evidence_revision
+                || receipt.captured_native_import_revision != context.native_import_revision
+                || receipt.captured_native_import_state != context.native_import_state.as_str()
+                || receipt.captured_native_import_authority != context.native_import_authority
+            {
+                return Err(RegistryError::NativeIdentityConflict);
+            }
+
+            let import_summary = serde_json::to_string(&receipt)?;
+            let readable_summary = serde_json::to_string(&serde_json::json!({
+                "providerUid": receipt.provider_uid,
+                "providerGid": receipt.provider_gid,
+                "destinationStoreId": receipt.destination_store_id,
+                "bundleSha256": receipt.bundle_sha256,
+                "readerEnvironmentSha256": receipt.reader_environment_sha256,
+                "structuralSha256": receipt.structural_sha256,
+                "rowCount": receipt.row_count,
+                "assetCount": receipt.asset_count,
+            }))?;
+            let existing: Option<(String, String)> = tx.query_row(
+                "SELECT import_receipt_json,readable_receipt_json FROM stopped_repair_root_receipts WHERE operation_id=?1 AND root_session_id=?2",
+                params![operation_id.as_str(), receipt.root_session_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            ).optional()?;
+            if let Some((old_import, old_readable)) = existing {
+                if old_import != import_summary || old_readable != readable_summary {
+                    return Err(RegistryError::RequestConflict);
+                }
+                tx.commit()?;
+                return Ok(());
+            }
+            tx.execute(
+                "INSERT INTO stopped_repair_root_receipts (operation_id,root_session_id,canonical_soul_id,transfer_id,source_store_id,source_generation,identity_revision,intent_revision,native_import_revision,active_incarnation_id,execution_generation,import_receipt_json,readable_receipt_json,status,updated_at) \
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,'verified',?14)",
+                params![
+                    operation_id.as_str(),
+                    receipt.root_session_id,
+                    receipt.canonical_soul_id.as_str(),
+                    receipt.transfer_id,
+                    receipt.source_store_id,
+                    receipt.source_generation,
+                    receipt.captured_identity_revision,
+                    receipt.captured_intent_revision,
+                    receipt.captured_native_import_revision,
+                    receipt.incarnation_id.as_str(),
+                    receipt.execution_generation,
+                    import_summary,
+                    readable_summary,
+                    now_millis(),
+                ],
+            )?;
+            tx.commit()?;
+            Ok(())
+        })
+        .await
+    }
+
+    pub(crate) async fn stopped_repair_root_receipts(
+        &self,
+        operation_id: RequestId,
+    ) -> Result<Vec<StoppedRepairRootReceipt>, RegistryError> {
+        self.run_blocking(move |conn| {
+            let mut statement = conn.prepare(
+                "SELECT import_receipt_json FROM stopped_repair_root_receipts WHERE operation_id=?1 ORDER BY root_session_id",
+            )?;
+            let rows = statement.query_map(params![operation_id.as_str()], |row| {
+                row.get::<_, String>(0)
+            })?;
+            rows.map(|row| {
+                serde_json::from_str(&row?).map_err(RegistryError::from)
+            })
+            .collect()
+        })
+        .await
+    }
+
     pub async fn recovery_write_fence(
         &self,
         soul_id: SoulId,
@@ -3175,6 +3543,42 @@ fn create_schema(
             audit_json TEXT NOT NULL,
             created_at INTEGER NOT NULL
         );
+        CREATE TABLE stopped_repair_operations (
+            operation_id TEXT PRIMARY KEY,
+            idempotency_key TEXT NOT NULL UNIQUE,
+            target_fingerprint TEXT NOT NULL,
+            targets_json TEXT NOT NULL,
+            status TEXT NOT NULL CHECK (status IN ('importing','withdraw_pending','complete')),
+            result_json TEXT,
+            created_at INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL
+        );
+        CREATE TABLE stopped_repair_root_receipts (
+            operation_id TEXT NOT NULL REFERENCES stopped_repair_operations(operation_id),
+            root_session_id TEXT NOT NULL,
+            canonical_soul_id TEXT NOT NULL REFERENCES souls(soul_id),
+            transfer_id TEXT NOT NULL,
+            source_store_id TEXT NOT NULL,
+            source_generation TEXT NOT NULL,
+            identity_revision INTEGER NOT NULL,
+            intent_revision INTEGER NOT NULL,
+            native_import_revision INTEGER NOT NULL,
+            active_incarnation_id TEXT NOT NULL REFERENCES incarnations(incarnation_id),
+            execution_generation INTEGER NOT NULL,
+            import_receipt_json TEXT NOT NULL,
+            readable_receipt_json TEXT NOT NULL,
+            status TEXT NOT NULL CHECK (status IN ('verified')),
+            updated_at INTEGER NOT NULL,
+            PRIMARY KEY(operation_id,root_session_id)
+        );
+        CREATE TABLE stopped_repair_withdrawals (
+            operation_id TEXT PRIMARY KEY REFERENCES stopped_repair_operations(operation_id),
+            generation TEXT NOT NULL,
+            targets_json TEXT NOT NULL,
+            incident_ids_json TEXT NOT NULL,
+            status TEXT NOT NULL CHECK (status IN ('files_pending','files_complete')),
+            updated_at INTEGER NOT NULL
+        );
         CREATE TABLE stop_tombstones (
             soul_id TEXT NOT NULL REFERENCES souls(soul_id),
             intent_revision INTEGER NOT NULL,
@@ -3588,6 +3992,62 @@ fn migrate_schema(conn: &mut Connection) -> Result<(), RegistryError> {
         )?;
         tx.commit()?;
         schema = 11;
+    }
+    if schema == 11 {
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        tx.execute_batch(
+            r#"
+            CREATE TABLE IF NOT EXISTS stopped_repair_operations (
+                operation_id TEXT PRIMARY KEY,
+                idempotency_key TEXT NOT NULL UNIQUE,
+                target_fingerprint TEXT NOT NULL,
+                status TEXT NOT NULL CHECK (status IN ('importing','withdraw_pending','complete')),
+                result_json TEXT,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS stopped_repair_withdrawals (
+                operation_id TEXT PRIMARY KEY REFERENCES stopped_repair_operations(operation_id),
+                generation TEXT NOT NULL,
+                targets_json TEXT NOT NULL,
+                incident_ids_json TEXT NOT NULL,
+                status TEXT NOT NULL CHECK (status IN ('files_pending','files_complete')),
+                updated_at INTEGER NOT NULL
+            );
+            UPDATE installation SET schema_version=12,inventory_revision=inventory_revision+1 WHERE singleton=1;
+            "#,
+        )?;
+        tx.commit()?;
+        schema = 12;
+    }
+    if schema == 12 {
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        tx.execute_batch(
+            r#"
+            ALTER TABLE stopped_repair_operations ADD COLUMN targets_json TEXT NOT NULL DEFAULT '[]';
+            CREATE TABLE IF NOT EXISTS stopped_repair_root_receipts (
+                operation_id TEXT NOT NULL REFERENCES stopped_repair_operations(operation_id),
+                root_session_id TEXT NOT NULL,
+                canonical_soul_id TEXT NOT NULL REFERENCES souls(soul_id),
+                transfer_id TEXT NOT NULL,
+                source_store_id TEXT NOT NULL,
+                source_generation TEXT NOT NULL,
+                identity_revision INTEGER NOT NULL,
+                intent_revision INTEGER NOT NULL,
+                native_import_revision INTEGER NOT NULL,
+                active_incarnation_id TEXT NOT NULL REFERENCES incarnations(incarnation_id),
+                execution_generation INTEGER NOT NULL,
+                import_receipt_json TEXT NOT NULL,
+                readable_receipt_json TEXT NOT NULL,
+                status TEXT NOT NULL CHECK (status IN ('verified')),
+                updated_at INTEGER NOT NULL,
+                PRIMARY KEY(operation_id,root_session_id)
+            );
+            UPDATE installation SET schema_version=13,inventory_revision=inventory_revision+1 WHERE singleton=1;
+            "#,
+        )?;
+        tx.commit()?;
+        schema = 13;
     }
     if schema != SCHEMA_VERSION {
         return Err(RegistryError::Integrity(format!(
@@ -4052,11 +4512,12 @@ pub(crate) fn load_owned_handle(
         Option<String>,
         Option<String>,
         String,
+        String,
     );
     let raw: OwnedRow = conn.query_row(
-        "SELECT i.soul_id,i.launch_nonce,i.docker_daemon_id,i.container_id,i.image_ref,i.runtime_dir,i.host_binary_path,i.immutable_config_digest,i.requested_limits,i.launch_state,i.fixture_kind,i.terminal_spec,i.fresh_agent_spec,s.provider_volume_name FROM incarnations i JOIN souls s ON s.soul_id=i.soul_id WHERE i.incarnation_id=?1",
+        "SELECT i.soul_id,i.launch_nonce,i.docker_daemon_id,i.container_id,i.image_ref,i.runtime_dir,i.host_binary_path,i.immutable_config_digest,i.requested_limits,i.launch_state,i.fixture_kind,i.terminal_spec,i.fresh_agent_spec,s.provider_volume_name,s.provider_store_id FROM incarnations i JOIN souls s ON s.soul_id=i.soul_id WHERE i.incarnation_id=?1",
         params![incarnation_id.as_str()],
-        |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?,row.get(6)?,row.get(7)?,row.get(8)?,row.get(9)?,row.get(10)?,row.get(11)?,row.get(12)?,row.get(13)?)),
+        |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?,row.get(6)?,row.get(7)?,row.get(8)?,row.get(9)?,row.get(10)?,row.get(11)?,row.get(12)?,row.get(13)?,row.get(14)?)),
     ).optional()?.ok_or_else(|| RegistryError::UnknownIncarnation(incarnation_id.clone()))?;
     if raw.9 == "prepared" {
         return Err(RegistryError::InvalidState(
@@ -4078,6 +4539,7 @@ pub(crate) fn load_owned_handle(
     Ok(OwnedRuntimeHandle::from_registry(
         installation,
         SoulId::parse(raw.0).map_err(|_| RegistryError::Integrity("invalid soul id".into()))?,
+        raw.14,
         incarnation_id.clone(),
         LaunchNonce::parse(raw.1)
             .map_err(|_| RegistryError::Integrity("invalid launch nonce".into()))?,
@@ -4367,10 +4829,196 @@ fn parse_recovery_state(value: &str) -> Result<RecoveryState, RegistryError> {
         "blocked" => Ok(RecoveryState::Blocked),
         "lost" => Ok(RecoveryState::Lost),
         "stopped" => Ok(RecoveryState::Stopped),
+        "data_repair_complete" => Ok(RecoveryState::DataRepairComplete),
         other => Err(RegistryError::Integrity(format!(
             "unknown recovery state {other}"
         ))),
     }
+}
+
+pub(crate) fn validate_stopped_repair_target_in_tx(
+    tx: &rusqlite::Transaction<'_>,
+    target: &LostSoulRepairTarget,
+) -> Result<(), RegistryError> {
+    let current_revision: Option<u64> = tx
+        .query_row(
+            "SELECT intent_revision FROM souls WHERE soul_id=?1",
+            params![target.soul_id.as_str()],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let Some(current_revision) = current_revision else {
+        return Err(RegistryError::UnknownSoul(target.soul_id.clone()));
+    };
+    if current_revision != target.expected_intent_revision {
+        return Err(RegistryError::StaleIntentRevision {
+            expected: target.expected_intent_revision,
+            current: current_revision,
+        });
+    }
+
+    type TargetRow = (
+        String,
+        String,
+        String,
+        String,
+        String,
+        Option<String>,
+        u64,
+        u64,
+        u64,
+        String,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        bool,
+        String,
+        String,
+        String,
+        Option<String>,
+        Option<u64>,
+        Option<u64>,
+        Option<u64>,
+        Option<String>,
+        Option<bool>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+    );
+    let row: TargetRow = tx
+        .query_row(
+            "SELECT l.certificate_json,l.cleanup_json,l.decision_state,l.cleanup_state, \
+                    s.provider,s.native_session_id,s.identity_revision,s.evidence_revision, \
+                    s.native_import_revision,s.native_import_state,s.native_import_source_store_id, \
+                    s.native_import_root_session_id,s.native_import_source_generation, \
+                    s.native_import_schema_fingerprint,s.native_import_complete_inventory, \
+                    s.native_import_authority,s.desired_state,s.recovery_state,s.loss_incident_id, \
+                    l.captured_identity_revision,l.captured_evidence_revision, \
+                    l.captured_native_import_revision,l.captured_native_import_state, \
+                    l.captured_native_import_complete,l.captured_native_import_authority, \
+                    l.captured_source_store_id,l.captured_root_session_id,l.captured_source_generation, \
+                    l.captured_source_schema_fingerprint,l.captured_migration_fingerprint, \
+                    s.native_import_migration_fingerprint \
+             FROM loss_incidents l JOIN souls s ON s.soul_id=l.soul_id \
+             WHERE l.incident_id=?1 AND l.soul_id=?2",
+            params![target.incident_id.as_str(), target.soul_id.as_str()],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                    row.get(7)?,
+                    row.get(8)?,
+                    row.get(9)?,
+                    row.get(10)?,
+                    row.get(11)?,
+                    row.get(12)?,
+                    row.get(13)?,
+                    row.get(14)?,
+                    row.get(15)?,
+                    row.get(16)?,
+                    row.get(17)?,
+                    row.get(18)?,
+                    row.get(19)?,
+                    row.get(20)?,
+                    row.get(21)?,
+                    row.get(22)?,
+                    row.get(23)?,
+                    row.get(24)?,
+                    row.get(25)?,
+                    row.get(26)?,
+                    row.get(27)?,
+                    row.get(28)?,
+                    row.get(29)?,
+                    row.get(30)?,
+                ))
+            },
+        )
+        .optional()?
+        .ok_or_else(|| RegistryError::IncidentNotFound(target.incident_id.clone()))?;
+
+    let certificate: freshell_runtime_protocol::LostDecisionCertificate =
+        serde_json::from_str(&row.0)?;
+    let cleanup: freshell_runtime_protocol::LossCleanupReport = serde_json::from_str(&row.1)?;
+    let current_import_state = NativeImportState::parse(&row.9)?;
+    if row.2 != "lost"
+        || row.3 != "closed"
+        || row.4 != "opencode"
+        || row.16 != "stopped"
+        || row.17 != "lost"
+        || row.18.as_deref() != Some(target.incident_id.as_str())
+        || row.19 != Some(row.6)
+        || row.20 != Some(row.7)
+        || row.21 != Some(row.8)
+        || row.22.as_deref() != Some(current_import_state.as_str())
+        || row.23 != Some(row.14)
+        || row.24.as_deref() != Some(row.15.as_str())
+        || row.25 != row.10
+        || row.26 != row.11
+        || row.27 != row.12
+        || row.28 != row.13
+        || row.29 != row.30
+        || certificate.soul_id != target.soul_id
+        || certificate.incident_id != target.incident_id
+        || certificate.provider != "opencode"
+        || certificate.decision.state != freshell_runtime_protocol::LossDecisionState::Lost
+        || certificate.intent_revision.checked_add(1) != Some(target.expected_intent_revision)
+        || certificate
+            .cleanup_target
+            .incarnation_id
+            .as_str()
+            .is_empty()
+        || cleanup.owned_handle_ref != certificate.cleanup_target.owned_handle_ref
+        || !cleanup.ownership_verified
+        || !cleanup.verified_empty
+        || cleanup.foreign_objects_touched != 0
+        || row.5.is_none() && row.11.is_none()
+    {
+        return Err(RegistryError::RecoveryBlocked {
+            soul_id: target.soul_id.clone(),
+            reason: "target is not the exact closed, verified-empty OpenCode loss captured by this intent".into(),
+        });
+    }
+
+    let incarnation_state: Option<(String, String, String, u64)> = tx
+        .query_row(
+            "SELECT launch_state,cleanup_state,incarnation_id,execution_generation \
+             FROM incarnations WHERE soul_id=?1 AND incarnation_id=?2",
+            params![
+                target.soul_id.as_str(),
+                certificate.cleanup_target.incarnation_id.as_str()
+            ],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .optional()?;
+    if !matches!(incarnation_state, Some((ref launch, ref cleanup, _, _)) if launch == "stopped" && cleanup == "verified_empty")
+    {
+        return Err(RegistryError::RecoveryBlocked {
+            soul_id: target.soul_id.clone(),
+            reason: "the exact old incarnation cleanup is not settled and verified empty".into(),
+        });
+    }
+    let active: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM incarnations WHERE soul_id=?1 AND launch_state IN ('prepared','created','starting','running','stopping'))",
+        params![target.soul_id.as_str()],
+        |row| row.get(0),
+    )?;
+    if active {
+        return Err(RegistryError::RecoveryBlocked {
+            soul_id: target.soul_id.clone(),
+            reason: "an incarnation is still active for this stopped-repair target".into(),
+        });
+    }
+    Ok(())
 }
 
 fn parse_durability_state(value: &str) -> Result<DurabilityState, RegistryError> {
@@ -7986,5 +8634,23 @@ pub(crate) mod tests {
             RegistryError::NewerSchema { found: 999, .. }
         ));
         assert!(db.exists());
+    }
+
+    #[test]
+    fn fresh_schema_has_body_free_stopped_repair_recovery_tables() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry = Registry::open(dir.path(), None).unwrap();
+        let conn = open_connection(&registry.inner.db_path).unwrap();
+        let schema: u32 = conn
+            .query_row(
+                "SELECT schema_version FROM installation WHERE singleton=1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+
+        assert_eq!(schema, SCHEMA_VERSION);
+        assert!(table_exists(&conn, "stopped_repair_operations").unwrap());
+        assert!(table_exists(&conn, "stopped_repair_withdrawals").unwrap());
     }
 }

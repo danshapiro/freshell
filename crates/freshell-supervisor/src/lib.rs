@@ -14,4 +14,5 @@ pub mod repair;
 pub mod resume_catalog;
 mod retained_output;
 pub mod service;
+mod stopped_repair_cas;
 pub mod view_intents;

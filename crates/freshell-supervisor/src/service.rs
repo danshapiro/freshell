@@ -13,10 +13,11 @@ use crate::{
 use freshell_runtime_protocol::{
     host_proof, read_frame, write_frame, AdminCommand, AdminReply, AdminResult, CommandState,
     ControlRole, Envelope, FixtureKind, FreshAgentLaunchSpec, HostBootId, HostCommand, HostReply,
-    HostResult, IncarnationId, LaunchResult, LaunchState, LimitApplication, OpenCodeTransferAction,
-    OpenCodeTransferReadinessReceipt, OpenCodeTransferResult, RequestId, ResumeSpec, RuntimeError,
-    RuntimeErrorCode, RuntimeLimits, RuntimeMetrics, RuntimeOutputBatch, RuntimeView, SoulId,
-    StopOutcome, TerminalLaunchSpec, UpdateLimitsResult, CONTROL_PROTOCOL_VERSION,
+    HostResult, IncarnationId, IncidentId, LaunchResult, LaunchState, LimitApplication,
+    OpenCodeTransferAction, OpenCodeTransferReadinessReceipt, OpenCodeTransferResult, RequestId,
+    ResumeSpec, RuntimeError, RuntimeErrorCode, RuntimeLimits, RuntimeMetrics, RuntimeOutputBatch,
+    RuntimeView, SoulId, StopOutcome, TerminalLaunchSpec, UpdateLimitsResult,
+    CONTROL_PROTOCOL_VERSION,
 };
 use sha2::{Digest, Sha256};
 use std::{
@@ -676,6 +677,15 @@ impl Supervisor {
                         .await
                         .map_err(map_registry)?,
                 ))
+            }
+            AdminCommand::RestoreLostSouls(request) => {
+                self.registry
+                    .assert_epoch(request.expected_control_epoch)
+                    .map_err(map_registry)?;
+                request.validate_exact_batch()?;
+                self.restore_lost_souls(envelope.request_id, request)
+                    .await
+                    .map(AdminResult::RestoreLostSouls)
             }
             AdminCommand::MetricsSnapshot => Ok(AdminResult::MetricsSnapshot(
                 self.registry
@@ -3536,6 +3546,13 @@ pub(crate) struct HostStatus {
 }
 
 pub async fn serve_control(supervisor: Supervisor, socket_path: &Path) -> Result<(), String> {
+    if let Err(error) = supervisor.resume_pending_stopped_repair_withdrawals().await {
+        append_event(
+            &supervisor.config.lifecycle_log,
+            "supervisor.stopped_repair_withdrawal_startup_deferred",
+            serde_json::json!({"error":error.message}),
+        );
+    }
     if let Some(parent) = socket_path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
@@ -4811,9 +4828,57 @@ fn lifecycle_secrets() -> &'static StdMutex<HashMap<PathBuf, String>> {
 }
 
 pub(crate) fn append_event(path: &Path, event: &str, data: serde_json::Value) {
+    let _incident_coordinator = crate::loss_report::incident_file_coordinator();
     let _write_guard = LIFECYCLE_WRITE_LOCK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
+    append_event_locked(path, event, data);
+}
+
+/// Append an incident-bearing lifecycle event only while the exact incident
+/// still exists. The registry read and append share the retraction coordinator,
+/// so a delayed finalizer cannot recreate a withdrawn event after file cleanup.
+pub(crate) async fn append_incident_event_if_current(
+    registry: &Registry,
+    path: &Path,
+    event: &str,
+    data: serde_json::Value,
+    incident_id: IncidentId,
+) -> Result<bool, RegistryError> {
+    let path = path.to_path_buf();
+    let event = event.to_string();
+    registry
+        .run_blocking(move |conn| {
+            use rusqlite::OptionalExtension;
+
+            let _incident_coordinator = crate::loss_report::incident_file_coordinator();
+            let _write_guard = LIFECYCLE_WRITE_LOCK
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let generation: Option<i64> = conn
+                .query_row(
+                    "SELECT updated_at FROM loss_incidents WHERE incident_id=?1",
+                    rusqlite::params![incident_id.as_str()],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            let Some(generation) = generation else {
+                return Ok(false);
+            };
+            let mut data = data;
+            if let Some(object) = data.as_object_mut() {
+                object.insert(
+                    "incidentGeneration".into(),
+                    serde_json::Value::from(generation),
+                );
+            }
+            append_event_locked(&path, &event, data);
+            Ok(true)
+        })
+        .await
+}
+
+fn append_event_locked(path: &Path, event: &str, data: serde_json::Value) {
     let sequence = LIFECYCLE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
     let sampled_nanos = LIFECYCLE_STARTED
         .get_or_init(Instant::now)
