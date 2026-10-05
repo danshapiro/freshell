@@ -1,7 +1,7 @@
 use super::*;
 use crate::{
     admission::AdmissionPolicy,
-    registry::{BackendCreatedRecord, LaunchPreparation},
+    registry::{BackendCreatedRecord, LaunchPreparation, NativeImportState, RecoveryContext},
     service::{Supervisor, SupervisorConfig},
 };
 use freshell_runtime_protocol::{
@@ -10,7 +10,38 @@ use freshell_runtime_protocol::{
 };
 use rusqlite::{params, Connection};
 
-fn evidence() -> Vec<RecoveryPathEvidence> {
+fn evidence(context: Option<&RecoveryContext>) -> Vec<RecoveryPathEvidence> {
+    let (native_import_state, complete_inventory) = context
+        .map(|context| {
+            (
+                context.native_import_state,
+                context.native_import_complete_inventory,
+            )
+        })
+        .unwrap_or((NativeImportState::NotApplicable, false));
+    let native_import_evidence = match native_import_state {
+        NativeImportState::Absent if complete_inventory => RecoveryPathEvidence {
+            path: RecoveryPath::NativeImport,
+            verdict: RecoveryEvidenceVerdict::DefinitiveNegative,
+            reason_code: "source_inventory_complete_absent".into(),
+            evidence_refs: vec!["nativeImport=complete_absent".into()],
+            store_state: EvidenceStoreState::Missing,
+        },
+        NativeImportState::NotApplicable => RecoveryPathEvidence {
+            path: RecoveryPath::NativeImport,
+            verdict: RecoveryEvidenceVerdict::DefinitiveNegative,
+            reason_code: "no_native_import_configured".into(),
+            evidence_refs: vec!["nativeImport=not_applicable".into()],
+            store_state: EvidenceStoreState::NotApplicable,
+        },
+        _ => RecoveryPathEvidence {
+            path: RecoveryPath::NativeImport,
+            verdict: RecoveryEvidenceVerdict::DefinitiveNegative,
+            reason_code: "source_inventory_unresolved".into(),
+            evidence_refs: vec!["nativeImport=unresolved".into()],
+            store_state: EvidenceStoreState::Unknown,
+        },
+    };
     vec![
         RecoveryPathEvidence {
             path: RecoveryPath::Reattach,
@@ -40,6 +71,7 @@ fn evidence() -> Vec<RecoveryPathEvidence> {
             evidence_refs: vec!["commandJournal.dispatched>0".into()],
             store_state: EvidenceStoreState::NotApplicable,
         },
+        native_import_evidence,
     ]
 }
 
@@ -52,7 +84,7 @@ fn limits() -> RuntimeLimits {
     }
 }
 
-async fn prepared_loss(root: &std::path::Path) -> (Registry, PreparedLoss) {
+async fn prepared_context(root: &std::path::Path) -> (Registry, RecoveryContext) {
     let registry = Registry::open(root, None).unwrap();
     let soul_id = SoulId::new();
     let prepared = registry
@@ -97,12 +129,26 @@ async fn prepared_loss(root: &std::path::Path) -> (Registry, PreparedLoss) {
         .mark_running(prepared.incarnation_id.clone())
         .await
         .unwrap();
+    let conn = Connection::open(root.join("runtime.sqlite3")).unwrap();
+    conn.execute(
+        "UPDATE souls SET allocation_state='verified_durable' WHERE soul_id=?1",
+        params![soul_id.as_str()],
+    )
+    .unwrap();
+    drop(conn);
     let context = registry.recovery_context(soul_id).await.unwrap();
-    let decision = LostDecision::try_new(LossDecisionInput {
+    (registry, context)
+}
+
+fn decision_for(
+    registry: &Registry,
+    context: &RecoveryContext,
+) -> Result<LostDecision, LossDecisionError> {
+    LostDecision::try_new(LossDecisionInput {
         installation_id: registry.installation_id(),
-        context: &context,
+        context,
         cleanup_handle: &context.prior_handle,
-        path_evidence: evidence(),
+        path_evidence: evidence(Some(context)),
         builds: LossBuildEvidence {
             web_commit: "d".repeat(40),
             supervisor_commit: "d".repeat(40),
@@ -128,9 +174,20 @@ async fn prepared_loss(root: &std::path::Path) -> (Registry, PreparedLoss) {
         },
         created_at: Some("2026-09-09T00:00:00.000Z".into()),
     })
-    .unwrap();
-    let prepared_loss = registry.prepare_loss(decision).await.unwrap();
+}
+
+async fn prepared_loss(root: &std::path::Path) -> (Registry, PreparedLoss) {
+    let (registry, prepared_loss, _) = prepared_loss_with_decision(root).await;
     (registry, prepared_loss)
+}
+
+async fn prepared_loss_with_decision(
+    root: &std::path::Path,
+) -> (Registry, PreparedLoss, LostDecision) {
+    let (registry, context) = prepared_context(root).await;
+    let decision = decision_for(&registry, &context).unwrap();
+    let prepared_loss = registry.prepare_loss(decision.clone()).await.unwrap();
+    (registry, prepared_loss, decision)
 }
 
 fn cleanup(prepared: &PreparedLoss) -> LossCleanupReport {
@@ -147,7 +204,7 @@ fn cleanup(prepared: &PreparedLoss) -> LossCleanupReport {
 
 #[test]
 fn unknown_or_unreadable_path_can_never_construct_loss() {
-    let mut rows = evidence();
+    let mut rows = evidence(None);
     rows[1].store_state = EvidenceStoreState::PresentUnreadable;
     assert!(matches!(
         validate_path_inventory(
@@ -156,6 +213,7 @@ fn unknown_or_unreadable_path_can_never_construct_loss() {
                 RecoveryPath::NativeResume,
                 RecoveryPath::CheckpointRestore,
                 RecoveryPath::PristineSeed,
+                RecoveryPath::NativeImport,
             ],
             &rows,
         ),
@@ -168,6 +226,7 @@ fn unknown_or_unreadable_path_can_never_construct_loss() {
             RecoveryPath::NativeResume,
             RecoveryPath::CheckpointRestore,
             RecoveryPath::PristineSeed,
+            RecoveryPath::NativeImport,
         ],
         &rows,
     )
@@ -176,7 +235,7 @@ fn unknown_or_unreadable_path_can_never_construct_loss() {
 
 #[test]
 fn missing_or_duplicate_manifest_path_can_never_construct_loss() {
-    let mut rows = evidence();
+    let mut rows = evidence(None);
     rows.pop();
     assert_eq!(
         validate_path_inventory(
@@ -185,6 +244,7 @@ fn missing_or_duplicate_manifest_path_can_never_construct_loss() {
                 RecoveryPath::NativeResume,
                 RecoveryPath::CheckpointRestore,
                 RecoveryPath::PristineSeed,
+                RecoveryPath::NativeImport,
             ],
             &rows,
         ),
@@ -198,6 +258,7 @@ fn missing_or_duplicate_manifest_path_can_never_construct_loss() {
                 RecoveryPath::NativeResume,
                 RecoveryPath::CheckpointRestore,
                 RecoveryPath::PristineSeed,
+                RecoveryPath::NativeImport,
             ],
             &rows,
         ),
@@ -206,9 +267,148 @@ fn missing_or_duplicate_manifest_path_can_never_construct_loss() {
 }
 
 #[tokio::test]
+async fn allocated_or_materializing_souls_cannot_be_certified_lost() {
+    let dir = tempfile::tempdir().unwrap();
+    let (registry, context) = prepared_context(dir.path()).await;
+
+    for allocation_state in [AllocationState::Allocated, AllocationState::Materializing] {
+        let mut candidate = context.clone();
+        candidate.allocation_state = allocation_state;
+        assert!(
+            decision_for(&registry, &candidate).is_err(),
+            "{allocation_state:?} soul must stay retryable instead of becoming Lost"
+        );
+    }
+}
+
+#[tokio::test]
+async fn loss_commit_rejects_newer_materialization_evidence() {
+    let dir = tempfile::tempdir().unwrap();
+    let (registry, context) = prepared_context(dir.path()).await;
+    let decision = decision_for(&registry, &context).unwrap();
+
+    let conn = Connection::open(dir.path().join("runtime.sqlite3")).unwrap();
+    conn.execute(
+        "UPDATE souls SET allocation_state='materializing',evidence_revision=evidence_revision+1 WHERE soul_id=?1",
+        params![context.soul_id.as_str()],
+    )
+    .unwrap();
+    drop(conn);
+
+    assert!(registry.prepare_loss(decision).await.is_err());
+    let conn = Connection::open(dir.path().join("runtime.sqlite3")).unwrap();
+    let incidents: u64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM loss_incidents WHERE soul_id=?1",
+            params![context.soul_id.as_str()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        incidents, 0,
+        "stale loss evidence must not commit a certificate"
+    );
+    let (desired, recovery): (String, String) = conn
+        .query_row(
+            "SELECT desired_state,recovery_state FROM souls WHERE soul_id=?1",
+            params![context.soul_id.as_str()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!((desired.as_str(), recovery.as_str()), ("running", "live"));
+}
+
+#[tokio::test]
+async fn loss_commit_rejects_newer_native_import_evidence() {
+    let dir = tempfile::tempdir().unwrap();
+    let (registry, context) = prepared_context(dir.path()).await;
+    let decision = decision_for(&registry, &context).unwrap();
+
+    let conn = Connection::open(dir.path().join("runtime.sqlite3")).unwrap();
+    conn.execute(
+        "UPDATE souls SET native_import_state='pending',native_import_revision=native_import_revision+1,evidence_revision=evidence_revision+1 WHERE soul_id=?1",
+        params![context.soul_id.as_str()],
+    )
+    .unwrap();
+    drop(conn);
+
+    assert!(registry.prepare_loss(decision).await.is_err());
+    let conn = Connection::open(dir.path().join("runtime.sqlite3")).unwrap();
+    let incidents: u64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM loss_incidents WHERE soul_id=?1",
+            params![context.soul_id.as_str()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(incidents, 0, "stale import evidence cannot certify loss");
+    let (desired, recovery): (String, String) = conn
+        .query_row(
+            "SELECT desired_state,recovery_state FROM souls WHERE soul_id=?1",
+            params![context.soul_id.as_str()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!((desired.as_str(), recovery.as_str()), ("running", "live"));
+}
+
+#[tokio::test]
+async fn incomplete_or_unresolved_native_import_states_cannot_be_certified_lost() {
+    let dir = tempfile::tempdir().unwrap();
+    let (registry, mut context) = prepared_context(dir.path()).await;
+    let conn = Connection::open(dir.path().join("runtime.sqlite3")).unwrap();
+    for state in [
+        NativeImportState::Pending,
+        NativeImportState::Available,
+        NativeImportState::Unresolved,
+        NativeImportState::Unreadable,
+        NativeImportState::Unsupported,
+        NativeImportState::ExpiredStage,
+        NativeImportState::Partial,
+        NativeImportState::Completed,
+        NativeImportState::LegacyUnknown,
+    ] {
+        conn.execute(
+            "UPDATE souls SET native_import_state=?1,native_import_revision=native_import_revision+1 WHERE soul_id=?2",
+            params![state.as_str(), context.soul_id.as_str()],
+        )
+        .unwrap();
+        context = registry
+            .recovery_context(context.soul_id.clone())
+            .await
+            .unwrap();
+        assert!(
+            decision_for(&registry, &context).is_err(),
+            "{state:?} must remain retryable instead of being certified lost"
+        );
+    }
+}
+
+#[tokio::test]
+async fn complete_absence_of_the_exact_native_import_source_can_be_certified_lost() {
+    let dir = tempfile::tempdir().unwrap();
+    let (registry, mut context) = prepared_context(dir.path()).await;
+    let conn = Connection::open(dir.path().join("runtime.sqlite3")).unwrap();
+    conn.execute(
+        "UPDATE souls SET native_import_state='absent',native_import_source_store_id='source-store',native_import_root_session_id='ses_test_exact',native_import_source_generation='source-generation',native_import_schema_fingerprint='schema-fingerprint',native_import_migration_fingerprint='migration-fingerprint',native_import_complete_inventory=1,native_import_authority='complete_source_inventory',native_import_revision=native_import_revision+1,evidence_revision=evidence_revision+1 WHERE soul_id=?1",
+        params![context.soul_id.as_str()],
+    )
+    .unwrap();
+    drop(conn);
+    context = registry
+        .recovery_context(context.soul_id.clone())
+        .await
+        .unwrap();
+    assert_eq!(context.native_import_state, NativeImportState::Absent);
+    assert!(context.native_import_complete_inventory);
+    let decision = decision_for(&registry, &context).unwrap();
+    assert!(registry.prepare_loss(decision).await.is_ok());
+}
+
+#[tokio::test]
 async fn stale_intent_cannot_finalize_or_release_the_certified_writer() {
     let dir = tempfile::tempdir().unwrap();
-    let (registry, prepared) = prepared_loss(dir.path()).await;
+    let (registry, prepared, original_decision) = prepared_loss_with_decision(dir.path()).await;
     let db = dir.path().join("runtime.sqlite3");
     let conn = Connection::open(&db).unwrap();
     conn.execute(
@@ -218,12 +418,7 @@ async fn stale_intent_cannot_finalize_or_release_the_certified_writer() {
     .unwrap();
     drop(conn);
 
-    let replay_error = registry
-        .prepare_loss(LostDecision {
-            certificate: prepared.certificate.clone(),
-        })
-        .await
-        .unwrap_err();
+    let replay_error = registry.prepare_loss(original_decision).await.unwrap_err();
     assert!(matches!(
         replay_error,
         RegistryError::StaleIntentRevision { .. }

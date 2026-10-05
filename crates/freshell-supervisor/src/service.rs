@@ -74,8 +74,8 @@ pub struct Supervisor {
     /// cleanup's registry snapshot and filesystem reclamation.
     pub(crate) opencode_transfer_lifecycle_lock: Arc<Mutex<()>>,
     /// Recovery and input dispatch serialize per soul, while unrelated souls
-    /// remain independently recoverable. Stop intentionally does not take this
-    /// lock: its durable intent revision must be able to preempt recovery.
+    /// remain independently recoverable. Stop commits its durable intent before
+    /// waiting for this lock so it can invalidate an in-flight operation.
     pub(crate) recovery_locks: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
 }
 
@@ -1571,7 +1571,7 @@ impl Supervisor {
         }
         // Re-materialize exact resume evidence for the child immediately. A
         // successful fork never leaves the soul recoverable only as its parent.
-        let _ = self.probe_recovery(soul_id).await;
+        let _ = self.probe_recovery_locked(soul_id).await;
         Ok(freshell_runtime_protocol::FreshAgentForkResult {
             parent_session_id: presentation_parent_session_id,
             child_session_id: transition.child_session_id,
@@ -1705,7 +1705,7 @@ impl Supervisor {
                 if identity_update != FreshAgentNativeIdentityUpdate::Unchanged {
                     // The old resume/checkpoint proof names the pre-operation
                     // branch. Re-materialize exact evidence before replacement.
-                    let _ = self.probe_recovery(soul_id).await;
+                    let _ = self.probe_recovery_locked(soul_id).await;
                 }
                 Ok(state)
             }
@@ -2181,12 +2181,16 @@ impl Supervisor {
         soul_id: SoulId,
         expected_intent_revision: Option<u64>,
     ) -> Result<(StopOutcome, RuntimeView), RuntimeError> {
-        let lifecycle_lock = self.lifecycle_lock(&soul_id).await;
-        let _lifecycle_guard = lifecycle_lock.lock().await;
         // The durable stop intent is committed before any IPC or Docker signal.
         let handle = self
             .registry
             .begin_stop_expected(soul_id.clone(), expected_intent_revision)
+            .await
+            .map_err(map_registry)?;
+        let lifecycle_lock = self.lifecycle_lock(&soul_id).await;
+        let _lifecycle_guard = lifecycle_lock.lock().await;
+        self.registry
+            .validate_stop_cleanup_target(soul_id.clone(), handle.incarnation_id().clone())
             .await
             .map_err(map_registry)?;
         append_event(
@@ -3385,6 +3389,132 @@ mod release_scope_tests {
         assert_eq!(event["data"]["errorClass"], "runtime_activation_failed");
         assert!(event["data"].get("errorMessage").is_none());
         assert!(!contents.contains("prepare provider bootstrap failed"));
+    }
+}
+
+#[cfg(test)]
+mod stop_intent_order_tests {
+    use super::*;
+    use crate::{
+        admission::AdmissionPolicy,
+        registry::{BackendCreatedRecord, LaunchPreparation},
+    };
+    use freshell_runtime_protocol::{
+        DockerDaemonId, HostBootId, RuntimeLimits, RuntimeProfile, SoulId,
+    };
+    use rusqlite::Connection;
+    use std::sync::Arc;
+
+    #[tokio::test]
+    async fn stop_commits_intent_while_waiting_for_the_soul_coordinator() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry = Registry::open(dir.path().join("registry"), None).unwrap();
+        let soul = SoulId::new();
+        let limits = RuntimeLimits {
+            cpu_milli: 500,
+            memory_bytes: 64 * 1024 * 1024,
+            swap_bytes: 0,
+            pids_max: 32,
+        };
+        let prepared = registry
+            .prepare_launch(LaunchPreparation {
+                soul_id: soul.clone(),
+                provider: "fixture".into(),
+                provider_store_id: "store-stop-order".into(),
+                native_session_id: None,
+                creation_seed_ref: "seed".into(),
+                request_id: RequestId::new(),
+                payload_digest: "stop-order-test".into(),
+                requested_limits: limits,
+                profile: RuntimeProfile::Custom,
+                project_key: "stop-order-test".into(),
+                fixture: None,
+                terminal: None,
+                fresh_agent: None,
+                view_intent: None,
+                admission: AdmissionPolicy::default(),
+            })
+            .await
+            .unwrap();
+        registry
+            .commit_created(
+                prepared.incarnation_id.clone(),
+                BackendCreatedRecord {
+                    daemon_id: DockerDaemonId::new(),
+                    container_id: "stop-order-container".into(),
+                    image_ref: "stop-order-image".into(),
+                    runtime_dir: dir.path().join("runtime"),
+                    host_binary_path: dir.path().join("runtime/session-host"),
+                    immutable_config_digest: "stop-order-config".into(),
+                },
+            )
+            .await
+            .unwrap();
+        registry
+            .commit_execution_grant(prepared.incarnation_id.clone(), HostBootId::new(), limits)
+            .await
+            .unwrap();
+        registry
+            .mark_running(prepared.incarnation_id)
+            .await
+            .unwrap();
+        let supervisor = Supervisor::new(
+            registry.clone(),
+            Arc::new(DockerEngineBackend::new(
+                dir.path().join("unused-docker.sock"),
+            )),
+            SupervisorConfig {
+                runtime_root: dir.path().join("runtime"),
+                control_socket_path: dir.path().join("control.sock"),
+                host_binary_path: std::env::current_exe().unwrap(),
+                image_ref: format!("sha256:{}", "a".repeat(64)),
+                test_run_id: "stop-order-test".into(),
+                control_secret: "synthetic-test-secret".into(),
+                lifecycle_log: dir.path().join("lifecycle.jsonl"),
+                admission: AdmissionPolicy::default(),
+            },
+        )
+        .unwrap();
+
+        let lifecycle_lock = supervisor.lifecycle_lock(&soul).await;
+        let held = lifecycle_lock.lock().await;
+        let stopping = {
+            let supervisor = supervisor.clone();
+            let soul = soul.clone();
+            tokio::spawn(async move { supervisor.stop(soul, None).await })
+        };
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if registry
+                    .recovery_context(soul.clone())
+                    .await
+                    .unwrap()
+                    .desired_state
+                    == freshell_runtime_protocol::DesiredState::Stopped
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("Stop intent should not wait behind provider/recovery work");
+        assert!(
+            !stopping.is_finished(),
+            "cleanup must still wait until the in-flight operation releases the coordinator"
+        );
+        stopping.abort();
+        drop(held);
+
+        let conn = Connection::open(registry.database_path()).unwrap();
+        let (desired, state): (String, String) = conn
+            .query_row(
+                "SELECT desired_state,recovery_state FROM souls WHERE soul_id=?1",
+                rusqlite::params![soul.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((desired.as_str(), state.as_str()), ("stopped", "stopped"));
     }
 }
 
