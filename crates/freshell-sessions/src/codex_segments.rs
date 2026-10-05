@@ -119,6 +119,11 @@ pub struct CodexComposition {
     /// embedded id. This sidecar feeds bounded downstream search without
     /// changing `source_file`'s existing meaning.
     pub segment_paths: HashMap<String, Vec<PathBuf>>,
+    /// Selected byte/ordinal ranges for referenced rollout histories. Ordinary
+    /// single-file and verified chronological histories retain whole-file paths.
+    pub history_segments: HashMap<String, Vec<crate::codex_history::CodexHistorySegment>>,
+    /// Digest of only selected history bytes, excluding superseded tails.
+    pub history_revisions: HashMap<String, u64>,
 }
 
 /// One per-file input to [`compose_codex_segments`].
@@ -475,7 +480,13 @@ fn can_compose_group(session_id: &str, members: &[CodexSegmentEntry]) -> bool {
         previous_end = Some(interval.end_nanos);
 
         if let Some(previous) = matching_metadata {
-            if previous != &evidence.required_metadata {
+            // A CLI update changes the recorder version, not the thread's
+            // identity. Still require a nonempty version in each header.
+            if REQUIRED_METADATA
+                .iter()
+                .filter(|key| **key != "cli_version")
+                .any(|key| previous.get(*key) != evidence.required_metadata.get(*key))
+            {
                 return false;
             }
         } else {
@@ -529,7 +540,7 @@ fn nonempty(value: Option<&String>) -> Option<&String> {
 /// Codex sessions. Unknown and internal/subagent sources do not certify a
 /// user-visible continuation; custom sources are supported only in their
 /// serialized enum form and are compared exactly across members.
-fn supported_root_session_source(value: &Value) -> bool {
+pub(crate) fn supported_root_session_source(value: &Value) -> bool {
     match value {
         Value::String(source) => matches!(source.as_str(), "cli" | "vscode" | "exec" | "mcp"),
         Value::Object(fields) => {

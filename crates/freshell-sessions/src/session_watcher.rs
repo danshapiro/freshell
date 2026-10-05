@@ -71,7 +71,7 @@ use notify::Watcher;
 use tokio::sync::mpsc;
 
 use crate::directory_index::SessionIndex;
-use crate::provider_layout::{ProviderLayout, WatchMode};
+use crate::provider_layout::{ProviderLayout, WatchChangeScope, WatchMode};
 use crate::watch_plan::{
     classify_arm_error, classify_basename, diff_armed, is_watch_target, plan_amplifier_targets,
     ArmErr, ArmKind, BasenameClass, PlanTargets,
@@ -205,6 +205,36 @@ pub struct SessionWatcher {
     /// once the value is set, whenever it subscribed.
     startup_ready_tx: Option<tokio::sync::watch::Sender<bool>>,
     startup_ready_rx: tokio::sync::watch::Receiver<bool>,
+}
+
+/// Retire inode-bound Codex watches when a root changes. The permanent
+/// home watch is distinct from child roots, so retiring a child never
+/// accidentally removes the home arm that observes its replacement.
+fn retire_codex_root_targets(
+    watched: &mut ProviderWatch,
+    absent: &mut Vec<(usize, PathBuf)>,
+    provider_index: usize,
+    root: &Path,
+) {
+    let ProviderWatch { watcher, targets } = watched;
+    targets.retain(|target| {
+        if !target.requested_base.starts_with(root) {
+            return true;
+        }
+        tracing::info!(
+            provider = "codex",
+            path = %target.requested_base.display(),
+            "session-watcher: root changed, tracking for re-arm",
+        );
+        unwatch_tolerated(watcher, "codex", &target.actual_target);
+        if !absent
+            .iter()
+            .any(|(index, base)| *index == provider_index && base == &target.requested_base)
+        {
+            absent.push((provider_index, target.requested_base.clone()));
+        }
+        false
+    });
 }
 
 /// Event filter: same logic as `activity.rs::fs_event_is_relevant` —
@@ -2203,12 +2233,11 @@ async fn run_watcher_loop(
 
         let watch_bases = provider.layout.watch_bases(&provider.home);
         let is_direct = provider.layout.is_direct_listed();
-        let mode = match provider.layout.watch_mode() {
-            WatchMode::Recursive => notify::RecursiveMode::Recursive,
-            WatchMode::NonRecursive => notify::RecursiveMode::NonRecursive,
-        };
-
         for base in &watch_bases {
+            let mode = match provider.layout.watch_mode_for_base(&provider.home, base) {
+                WatchMode::Recursive => notify::RecursiveMode::Recursive,
+                WatchMode::NonRecursive => notify::RecursiveMode::NonRecursive,
+            };
             let watch_target = if base.exists() {
                 base.clone()
             } else {
@@ -2251,6 +2280,21 @@ async fn run_watcher_loop(
                     }
                 },
             };
+
+            // Codex keeps a nonrecursive home arm independently of its
+            // child roots. Do not create a duplicate ancestor stand-in:
+            // retiring it later would also unwatch the permanent home arm.
+            if name == "codex"
+                && watch_target != *base
+                && pw
+                    .targets
+                    .iter()
+                    .any(|target| target.actual_target == watch_target)
+            {
+                absent.push((prov_idx, base.clone()));
+                index.mark_provider_dirty(&name);
+                continue;
+            }
 
             match watch_path(&mut pw.watcher, &name, &watch_target, mode) {
                 Ok(()) => {
@@ -2547,7 +2591,26 @@ async fn run_watcher_loop(
                                 drain_arm_outcome(&index, &mut pending, "amplifier", outcome);
                             }
                             None => {
+                                let configured = providers.iter().enumerate()
+                                    .find(|(_, configured)| configured.layout.name() == provider);
                                 for path in paths {
+                                    let Some((prov_idx, configured)) = configured else { continue };
+                                    if configured.layout.watch_change_scope(&configured.home, &path).is_none() {
+                                        continue;
+                                    }
+                                    // A root can be removed and recreated between
+                                    // periodic stats. Inotify follows its old inode;
+                                    // explicitly retire and re-arm on root events.
+                                    if provider == "codex" && matches!(kind, WatchKind::Create | WatchKind::CreateFolder
+                                        | WatchKind::Remove | WatchKind::NameFrom
+                                        | WatchKind::NameTo | WatchKind::NameBoth)
+                                        && configured.layout.watch_bases(&configured.home).contains(&path)
+                                    {
+                                        if let Some(pw) = watches.get_mut(&prov_idx) {
+                                            retire_codex_root_targets(pw, &mut absent, prov_idx, &path);
+                                        }
+                                        rearm_interval.reset_immediately();
+                                    }
                                     pending.insert((path, provider.clone()), Instant::now());
                                 }
                             }
@@ -2673,13 +2736,10 @@ async fn run_watcher_loop(
                         let prov = providers
                             .iter()
                             .find(|p| p.layout.name() == provider_name);
-                        let qualifies = prov
-                            .map(|p| p.layout.qualifies(&path))
-                            .unwrap_or(false);
-                        if qualifies {
-                            qualified.push((path, provider_name));
-                        } else {
-                            dirty_provider_names.insert(provider_name);
+                        match prov.and_then(|provider| provider.layout.watch_change_scope(&provider.home, &path)) {
+                            Some(WatchChangeScope::File) => qualified.push((path, provider_name)),
+                            Some(WatchChangeScope::Provider) => { dirty_provider_names.insert(provider_name); }
+                            None => {}
                         }
                     }
                     if !qualified.is_empty() {
@@ -2738,7 +2798,7 @@ async fn run_watcher_loop(
                     }
                     let prov = &providers[*prov_idx];
                     let is_direct = prov.layout.is_direct_listed();
-                    let mode = match prov.layout.watch_mode() {
+                    let mode = match prov.layout.watch_mode_for_base(&prov.home, base) {
                         WatchMode::Recursive => notify::RecursiveMode::Recursive,
                         WatchMode::NonRecursive => notify::RecursiveMode::NonRecursive,
                     };
