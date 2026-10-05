@@ -5,8 +5,12 @@
 //! generated file before the rebind plugin is appended.
 
 use percent_encoding::{utf8_percent_encode, AsciiSet, CONTROLS};
+use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+
+static NEXT_TEMP_FILE_ID: AtomicU64 = AtomicU64::new(0);
 
 /// The TUI plugin shipped with freshell (single source of truth lives in the
 /// repo at extensions/opencode/freshell-rebind-plugin.ts; embedded at compile
@@ -96,13 +100,28 @@ fn write_atomic_if_changed(path: &Path, content: &str) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let tmp = path.with_extension("tmp");
-    {
-        let mut f = std::fs::File::create(&tmp)?;
-        f.write_all(content.as_bytes())?;
-        f.sync_all()?;
+    let (tmp, mut file) = loop {
+        let id = NEXT_TEMP_FILE_ID.fetch_add(1, Ordering::Relaxed);
+        let tmp = path.with_extension(format!("tmp.{}.{}", std::process::id(), id));
+        match OpenOptions::new().write(true).create_new(true).open(&tmp) {
+            Ok(file) => break (tmp, file),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error),
+        }
+    };
+    let write_result = file
+        .write_all(content.as_bytes())
+        .and_then(|()| file.sync_all());
+    drop(file);
+    if let Err(error) = write_result {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(error);
     }
-    std::fs::rename(&tmp, path)
+    let rename_result = std::fs::rename(&tmp, path);
+    if rename_result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    rename_result
 }
 
 /// Idempotently materialize BOTH freshell-owned files into
@@ -335,6 +354,54 @@ mod tests {
             std::fs::read_to_string(&tui_json).unwrap(),
             tui_config_content(&plugin)
         );
+    }
+
+    #[test]
+    fn concurrent_install_calls_do_not_fail_or_leave_incomplete_files() {
+        use std::sync::{Arc, Barrier};
+
+        let home = tempfile::tempdir().unwrap();
+        let plugin = rebind_plugin_path(home.path());
+        let tui_json = tui_config_path(home.path());
+        let worker_count = 16;
+
+        for round in 0..12 {
+            if let Some(parent) = plugin.parent() {
+                std::fs::create_dir_all(parent).unwrap();
+            }
+            std::fs::write(&plugin, format!("stale plugin {round}")).unwrap();
+            std::fs::write(&tui_json, format!("stale tui config {round}")).unwrap();
+
+            let barrier = Arc::new(Barrier::new(worker_count));
+            let home_path = home.path();
+            std::thread::scope(|scope| {
+                let workers = (0..worker_count)
+                    .map(|_| {
+                        let barrier = barrier.clone();
+                        scope.spawn(move || {
+                            barrier.wait();
+                            ensure_rebind_plugin_installed(home_path)
+                        })
+                    })
+                    .collect::<Vec<_>>();
+
+                for worker in workers {
+                    worker
+                        .join()
+                        .expect("install worker must not panic")
+                        .expect("concurrent install must not fail");
+                }
+            });
+
+            assert_eq!(
+                std::fs::read_to_string(&plugin).unwrap(),
+                REBIND_PLUGIN_SOURCE
+            );
+            assert_eq!(
+                std::fs::read_to_string(&tui_json).unwrap(),
+                tui_config_content(&plugin)
+            );
+        }
     }
 
     #[test]
