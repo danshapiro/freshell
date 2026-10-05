@@ -448,6 +448,40 @@ fn current_store_verification_accepts_fractional_v1_message_and_part_timestamps(
 }
 
 #[test]
+fn current_store_verification_rejects_fractional_event_timestamp_matching_integer_row() {
+    let fixture = fixture_with_baseline_event();
+    import_bundle(
+        &fixture.descriptor,
+        &fixture.staged_directory,
+        &fixture.destination_database,
+        &fixture.workspace,
+    )
+    .unwrap();
+
+    let connection = Connection::open(&fixture.destination_database).unwrap();
+    append_v1_user_message(
+        &connection,
+        1,
+        "evt_fractional_integer_mismatch",
+        "msg_fractional_integer_mismatch",
+        serde_json::json!(10.5),
+        10,
+        11,
+    );
+    drop(connection);
+
+    assert!(
+        verify_current_store(
+            &fixture.descriptor,
+            &fixture.destination_database,
+            &fixture.workspace,
+        )
+        .is_err(),
+        "a fractional event timestamp must not match a truncated INTEGER row timestamp"
+    );
+}
+
+#[test]
 fn current_store_verification_rejects_adjacent_large_integer_message_timestamps() {
     let fixture = fixture_with_baseline_event();
     import_bundle(
