@@ -1743,6 +1743,7 @@ mod tests {
             provider_launch_context: None,
             opencode_transfer: None,
             opencode_transfer_attempt_id: None,
+            opencode_adoption: None,
         };
         let env = runtime_host_environment(Some(&terminal), None).unwrap();
         assert!(env
@@ -1800,6 +1801,7 @@ mod tests {
             provider_launch_context: None,
             opencode_transfer: None,
             opencode_transfer_attempt_id: None,
+            opencode_adoption: None,
         };
         let mounts = docker::terminal_mounts(&terminal).unwrap();
         let binds: Vec<String> = mounts

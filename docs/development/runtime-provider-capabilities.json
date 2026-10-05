@@ -74,8 +74,32 @@
         "reattach",
         "native_resume",
         "checkpoint_restore",
-        "pristine_seed"
+        "pristine_seed",
+        "native_import"
       ],
+      "nativeImport": {
+        "transitionVerifier": "immutable-baseline-plus-ordered-pinned-durable-events",
+        "unsupportedTransitionShapes": [
+          "session_context_epoch snapshot or baseline changes have no exact durable value witness and block resume",
+          "V1 message/part removal events and baseline transcript deletions block until the exact revert-removal projection is qualified"
+        ],
+        "sourceStatuses": [
+          "pending",
+          "failed",
+          "available",
+          "absent",
+          "unresolved",
+          "expired_stage",
+          "completed"
+        ],
+        "importStatuses": [
+          "pending",
+          "failed",
+          "completed"
+        ],
+        "legacyUnknownStatus": "blocked",
+        "refreshAuthority": "complete_source_inventory_revalidation"
+      },
       "qualificationStatus": "live-qualified-release-enabled"
     },
     {
