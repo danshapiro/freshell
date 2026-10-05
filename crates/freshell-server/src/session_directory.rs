@@ -7189,4 +7189,84 @@ mod tests {
         assert_ne!(rows[0]["liveTerminalOnly"], json!(true));
         std::fs::remove_dir_all(home).unwrap();
     }
+
+    #[tokio::test]
+    async fn codex_referenced_route_quarantines_a_noncanonical_copy_and_recovers_after_removal() {
+        let home = unique_temp_dir();
+        let (_, head) = write_codex_referenced_route_history(&home);
+        let session_id = "b7936c10-4935-441c-837c-c1f33cafec2d";
+        let identity = freshell_ws::identity::TerminalIdentityRegistry::new();
+        let (app, index) = codex_session_directory_app(&home, None, identity.clone());
+        let base = "/api/session-directory?priority=visible&includeNonInteractive=1";
+        let initial = get_directory_page(&app, base).await;
+        let initial_rows = initial["items"].as_array().unwrap();
+        assert_eq!(initial_rows.len(), 1);
+        assert_eq!(
+            initial_rows[0]["firstUserMessage"],
+            json!("Older first request")
+        );
+        assert!(initial.get("integrityError").is_none());
+
+        // Discovery sees the same embedded identity even though this copied
+        // filename cannot identify a physical referenced-history segment.
+        let copy = head.parent().unwrap().join("copy.jsonl");
+        std::fs::copy(&head, &copy).unwrap();
+        index.mark_provider_dirty("codex");
+        index.wait_for_refresh_idle_for_test().await;
+        let conflicted = get_directory_page(&app, base).await;
+        assert_eq!(
+            conflicted["integrityError"]["kind"],
+            json!("identity_collision"),
+            "a noncanonical copy must not disappear from accepted history: {conflicted}"
+        );
+        assert_eq!(conflicted["integrityError"]["collisionCount"], json!(1));
+        assert_eq!(conflicted["partial"], json!(true));
+        assert!(
+            conflicted["items"].as_array().unwrap().is_empty(),
+            "saved history must remain quarantined while the copy exists: {conflicted}"
+        );
+
+        identity.upsert(
+            "term-copy-conflict",
+            Some("codex"),
+            Some(session_id),
+            Some("/live-terminal"),
+            400,
+        );
+        let live = get_directory_page(&app, base).await;
+        assert_eq!(live["integrityError"], conflicted["integrityError"]);
+        let live_rows = live["items"].as_array().unwrap();
+        assert_eq!(live_rows.len(), 1);
+        assert_eq!(live_rows[0]["sessionId"], json!(session_id));
+        assert_eq!(live_rows[0]["title"], json!("Codex CLI"));
+        assert_eq!(live_rows[0]["isRunning"], json!(true));
+        assert_eq!(
+            live_rows[0]["runningTerminalId"],
+            json!("term-copy-conflict")
+        );
+        assert_eq!(live_rows[0]["projectPath"], json!("/live-terminal"));
+
+        std::fs::remove_file(copy).unwrap();
+        index.mark_provider_dirty("codex");
+        index.wait_for_refresh_idle_for_test().await;
+        let recovered = get_directory_page(&app, base).await;
+        assert!(
+            recovered.get("integrityError").is_none(),
+            "copy removal must clear the warning: {recovered}"
+        );
+        let recovered_rows = recovered["items"].as_array().unwrap();
+        assert_eq!(recovered_rows.len(), 1);
+        assert_eq!(recovered_rows[0]["sessionId"], json!(session_id));
+        assert_eq!(
+            recovered_rows[0]["firstUserMessage"],
+            initial_rows[0]["firstUserMessage"]
+        );
+        assert_eq!(recovered_rows[0]["summary"], initial_rows[0]["summary"]);
+        assert_eq!(recovered_rows[0]["isRunning"], json!(true));
+        assert_eq!(
+            recovered_rows[0]["runningTerminalId"],
+            json!("term-copy-conflict")
+        );
+        std::fs::remove_dir_all(home).unwrap();
+    }
 }

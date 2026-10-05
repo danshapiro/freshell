@@ -540,6 +540,94 @@ test.describe('Codex referenced rollout history', () => {
   })
 })
 
+test.describe('Codex referenced history with copied artifacts', () => {
+  test.setTimeout(180_000)
+
+  test('quarantines a noncanonical rollout copy and restores referenced history after its removal', async ({ browser }) => {
+    const sessionId = '44444444-4444-7444-8444-444444444444'
+    const createdAt = Date.parse('2026-09-28T15:00:00.000Z')
+    const sharedRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'freshell-referenced-copy-'))
+    const cwd = path.join(sharedRoot, 'project')
+    let copyFile = ''
+    let owned: Awaited<ReturnType<typeof bootCodexBrowserPage>> | undefined
+
+    try {
+      await fs.mkdir(cwd, { recursive: true })
+      owned = await bootCodexBrowserPage(browser, async (homeDir) => {
+        const fixture = await writeCodexReferencedHistoryFixture(homeDir, {
+          sessionId,
+          selectedRolloutId: '55555555-5555-7555-8555-555555555555',
+          unselectedRolloutId: '66666666-6666-7666-8666-666666666666',
+          cwd,
+          createdAt,
+          retainedUserText: 'Retained copy-recovery prefix request',
+          selectedUserText: 'Selected copy-recovery head request',
+          discardedUserText: 'Discarded copy-recovery tail request',
+          unselectedUserText: 'Unselected copy-recovery branch request',
+        })
+        copyFile = path.join(path.dirname(fixture.rootFile), 'copy.jsonl')
+        await fs.copyFile(fixture.rootFile, copyFile)
+      })
+      const { page, info } = owned
+      const sidebarRow = page.locator(
+        `[data-context="sidebar-session"][data-provider="codex"][data-session-id="${sessionId}"]`,
+      )
+      const readDirectory = async () => {
+        const response = await page.request.get(
+          `${info.baseUrl}/api/session-directory?priority=visible&limit=50`,
+          { headers: { 'x-auth-token': info.token }, timeout: 30_000 },
+        )
+        expect(response.ok()).toBe(true)
+        return response.json()
+      }
+      const sessionRows = (payload: { items: Array<{ provider: string; sessionId: string }> }) =>
+        payload.items.filter((item) => item.provider === 'codex' && item.sessionId === sessionId)
+
+      await test.step('quarantine the saved identity while its arbitrary-named copy exists', async () => {
+        await expect(page.getByTestId('sidebar-session-list')).toBeVisible()
+        await expect(page.getByText(/conflicting saved session/)).toBeVisible()
+        const payload = await readDirectory()
+        expect(payload.integrityError).toMatchObject({ kind: 'identity_collision', collisionCount: 1 })
+        expect(sessionRows(payload)).toEqual([])
+        await expect(sidebarRow).toHaveCount(0)
+      })
+
+      await test.step('remove the copy and recover the selected history without reloading', async () => {
+        await page.evaluate(() => {
+          ;(window as Window & { __referencedCopyRecovery?: string }).__referencedCopyRecovery = 'ready'
+        })
+        await fs.unlink(copyFile)
+        await expect(sidebarRow).toHaveCount(1, { timeout: 15_000 })
+        await expect(sidebarRow).toBeVisible()
+        await expect(page.getByText(/conflicting saved session/)).toHaveCount(0)
+        const payload = await readDirectory()
+        expect(payload.integrityError).toBeUndefined()
+        expect(sessionRows(payload)).toHaveLength(1)
+        expect(sessionRows(payload)[0]).toMatchObject({
+          createdAt,
+          lastActivityAt: createdAt + 63_000,
+          cwd,
+          firstUserMessage: 'Referenced history opening request',
+        })
+        expect(await page.evaluate(() =>
+          (window as Window & { __referencedCopyRecovery?: string }).__referencedCopyRecovery)).toBe('ready')
+
+        await page.getByTitle('Projects (Ctrl+B P)').click()
+        const projectHeader = page.locator(`[data-project-path="${cwd}"]`)
+        await expect(projectHeader).toBeVisible()
+        await projectHeader.click()
+        await expect(page.locator(
+          `[data-context="history-session"][data-provider="codex"][data-session-id="${sessionId}"]`,
+        )).toHaveCount(1)
+      })
+    } finally {
+      await owned?.context.close().catch(() => {})
+      await owned?.server.stop().catch(() => {})
+      await fs.rm(sharedRoot, { recursive: true, force: true })
+    }
+  })
+})
+
 test.describe('Kata rrx7 Codex rollout continuations', () => {
   test.setTimeout(180_000)
 

@@ -283,6 +283,29 @@ fn archived_database_selection_keeps_same_thread_files_hidden() {
 }
 
 #[test]
+fn archived_selection_keeps_noncanonical_copies_hidden_without_warnings() {
+    for warm_cache in [false, true] {
+        let fixture = Fixture::new();
+        let (root, head, _) = fixture.pair();
+        let mut resolver = fixture.resolver();
+        if warm_cache {
+            let result = resolver.compose(fixture.entries(&[root.clone(), head.clone()]));
+            assert_eq!(result.items.len(), 1);
+        }
+        let copy = head.parent().unwrap().join("copy.jsonl");
+        fs::copy(&head, &copy).unwrap();
+        fixture.select(&head, true);
+        let result = resolver.compose(fixture.entries(&[root, head, copy]));
+        assert!(result.items.is_empty());
+        assert!(result.unresolved_identities.is_empty());
+        assert!(result.history_segments.is_empty());
+        assert!(result.history_revisions.is_empty());
+        assert!(resolver.warnings.is_empty());
+        assert!(resolver.cache.is_empty());
+    }
+}
+
+#[test]
 fn stale_database_selection_never_falls_back_to_an_older_file() {
     let fixture = Fixture::new();
     let (root, head, _) = fixture.pair();
@@ -974,4 +997,56 @@ fn superseded_child_header_does_not_poison_retained_root_prefix() {
         Some("Current question")
     );
     assert!(result.history_segments.contains_key(THREAD));
+}
+
+#[test]
+fn noncanonical_root_or_head_copy_quarantines_fresh_and_cached_reference_groups() {
+    assert_copy_quarantine_recovery("copy.jsonl", "invalid_filename");
+}
+
+#[test]
+fn foreign_logical_filename_copy_quarantines_fresh_and_cached_reference_groups() {
+    assert_copy_quarantine_recovery(
+        &format!("rollout-2026-10-01T00-03-00-{MIDDLE}.jsonl"),
+        "identity_mismatch",
+    );
+}
+
+fn assert_copy_quarantine_recovery(copy_name: &str, expected_reason: &str) {
+    for copy_head in [false, true] {
+        for warm_cache in [false, true] {
+            let fixture = Fixture::new();
+            let (root, head, _) = fixture.pair();
+            let originals = [root.clone(), head.clone()];
+            let mut resolver = fixture.resolver();
+            if warm_cache {
+                let accepted = resolver.compose(fixture.entries(&originals));
+                assert!(accepted.unresolved_identities.is_empty());
+                assert_eq!(accepted.items.len(), 1);
+            }
+            let copy = head.parent().unwrap().join(copy_name);
+            fs::copy(if copy_head { &head } else { &root }, &copy).unwrap();
+            let candidates = [root.clone(), head.clone(), copy.clone()];
+            let rejected = resolver.compose(fixture.entries(&candidates));
+            assert_unresolved(&rejected);
+            let mut expected_paths = candidates.to_vec();
+            expected_paths.sort();
+            assert_eq!(
+                rejected.unresolved_identities[0].paths, expected_paths,
+                "do not lose copied paths from quarantine diagnostics"
+            );
+            assert_eq!(resolver.warnings[THREAD].0, expected_reason);
+            assert!(resolver.warnings[THREAD].1.contains(copy_name));
+            fs::remove_file(copy).unwrap();
+            let recovered = resolver.compose(fixture.entries(&originals));
+            assert!(recovered.unresolved_identities.is_empty());
+            assert_eq!(recovered.items.len(), 1);
+            assert_eq!(recovered.items[0].source_file.as_ref(), Some(&head));
+            assert_eq!(
+                recovered.items[0].first_user_message.as_deref(),
+                Some("Current question")
+            );
+            assert!(!resolver.warnings.contains_key(THREAD));
+        }
+    }
 }

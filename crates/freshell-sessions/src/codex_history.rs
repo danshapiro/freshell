@@ -278,9 +278,8 @@ impl CodexHistoryResolver {
                 self.selected_head(&id, &members, &db)
                     .and_then(|selected| match selected {
                         SelectedHead::Archived => Ok(None),
-                        SelectedHead::Path(path) => archive_result
-                            .as_ref()
-                            .map_err(Clone::clone)
+                        SelectedHead::Path(path) => validate_group_members(&id, &members)
+                            .and_then(|_| archive_result.as_ref().map_err(Clone::clone))
                             .and_then(|_| self.resolve(&id, &path, &catalog).map(Some)),
                     });
             match resolved {
@@ -566,6 +565,33 @@ impl CodexHistoryResolver {
             bindings,
         })
     }
+}
+
+// Validate every candidate before consulting the selected-history cache: an
+// unclassified same-id copy must remain visible in quarantine diagnostics.
+// Canonical same-logical physical branches remain provider-selectable.
+fn validate_group_members(id: &str, members: &[CodexSegmentEntry]) -> Result<(), HistoryError> {
+    let logical = Uuid::parse_str(id)
+        .map_err(|_| HistoryError::new("invalid_identity", "logical thread id is not a UUID"))?;
+    let mut paths: Vec<_> = members.iter().map(|member| &member.path).collect();
+    paths.sort();
+    for path in paths {
+        let name = rollout_name(path).ok_or_else(|| {
+            HistoryError::at(
+                "invalid_filename",
+                path,
+                "same-id member does not have a canonical rollout filename",
+            )
+        })?;
+        if name.logical != logical {
+            return Err(HistoryError::at(
+                "identity_mismatch",
+                path,
+                "filename logical UUID does not match the embedded thread identity",
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn explicit_child_lineage(evidence: &CodexFileEvidence) -> bool {
