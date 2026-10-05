@@ -10,15 +10,16 @@ use freshell_runtime_protocol::{
     FreshAgentForkRequest, FreshAgentInterruptRequest, FreshAgentReadEventsRequest,
     FreshAgentResolveRequest, FreshAgentRollbackDirection, FreshAgentRollbackMode,
     FreshAgentRollbackRequest, FreshAgentSendRequest, IncidentId, IncidentSummaryRequest,
-    LaunchRequest, LossIncidentSummary, ManagedRolloutMode, MigrationPlan, MigrationPlanRequest,
-    NoticeDeliveryState, NoticeId, NoticeReceiptRequest, OpenCodeTransferAction,
-    OpenCodeTransferDescriptor, OpenCodeTransferResult, PendingNoticesRequest,
-    PendingViewProjectionsRequest, RecoverRequest, RecoveryProbeRequest, RecoveryTrigger,
-    RepairAudit, RepairRequest, RequestId, RuntimeError, RuntimeErrorCode,
-    RuntimeInventorySnapshot, RuntimeMetricsRequest, RuntimeMetricsSnapshot, RuntimeNotice,
-    RuntimeView, SoulId, StopOutcome, StopRequest, TerminalInputRequest, TerminalReadOutputRequest,
-    TerminalResizeRequest, UpdateLimitsRequest, UpdateLimitsResult, UpdateViewVisibilityRequest,
-    UpsertViewIntentRequest, ViewIntent, ViewProjectionEvent, CONTROL_PROTOCOL_VERSION,
+    LaunchRequest, LossIncidentSummary, LostSoulRepairTarget, ManagedRolloutMode, MigrationPlan,
+    MigrationPlanRequest, NoticeDeliveryState, NoticeId, NoticeReceiptRequest,
+    OpenCodeTransferAction, OpenCodeTransferDescriptor, OpenCodeTransferResult,
+    PendingNoticesRequest, PendingViewProjectionsRequest, RecoverRequest, RecoveryProbeRequest,
+    RecoveryTrigger, RepairAudit, RepairRequest, RequestId, RestoreLostSoulsRequest,
+    RestoreLostSoulsResult, RuntimeError, RuntimeErrorCode, RuntimeInventorySnapshot,
+    RuntimeMetricsRequest, RuntimeMetricsSnapshot, RuntimeNotice, RuntimeView, SoulId, StopOutcome,
+    StopRequest, TerminalInputRequest, TerminalReadOutputRequest, TerminalResizeRequest,
+    UpdateLimitsRequest, UpdateLimitsResult, UpdateViewVisibilityRequest, UpsertViewIntentRequest,
+    ViewIntent, ViewProjectionEvent, CONTROL_PROTOCOL_VERSION,
 };
 use std::{path::PathBuf, sync::Arc};
 use tokio::{net::UnixStream, sync::RwLock};
@@ -523,6 +524,40 @@ impl RuntimeClient {
                     .await?
                 {
                     AdminResult::IncidentSummary(summary) => Ok(summary),
+                    _ => Err(ClientError::UnexpectedResult),
+                }
+            }
+            Ok(_) => Err(ClientError::UnexpectedResult),
+            Err(error) => Err(error),
+        }
+    }
+
+    pub async fn restore_lost_souls(
+        &self,
+        request_id: RequestId,
+        targets: Vec<LostSoulRepairTarget>,
+    ) -> Result<RestoreLostSoulsResult, ClientError> {
+        let mut request = RestoreLostSoulsRequest {
+            targets,
+            expected_control_epoch: Some(self.current_epoch().await?),
+        };
+        request.validate_exact_batch().map_err(|error| {
+            ClientError::Runtime(RuntimeErrorCode::InvalidRequest, error.message)
+        })?;
+        let original = request.clone();
+        match self
+            .request(request_id.clone(), AdminCommand::RestoreLostSouls(request))
+            .await
+        {
+            Ok(AdminResult::RestoreLostSouls(result)) => Ok(result),
+            Err(error) if error.runtime_code() == Some(RuntimeErrorCode::StaleControlEpoch) => {
+                request = original;
+                request.expected_control_epoch = Some(self.health().await?.0);
+                match self
+                    .request(request_id, AdminCommand::RestoreLostSouls(request))
+                    .await?
+                {
+                    AdminResult::RestoreLostSouls(result) => Ok(result),
                     _ => Err(ClientError::UnexpectedResult),
                 }
             }
