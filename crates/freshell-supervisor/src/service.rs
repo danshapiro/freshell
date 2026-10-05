@@ -6,7 +6,8 @@ use crate::{
     opencode_transfer::{OpenCodeTransferStaging, StagingLimits},
     registry::{
         stable_provider_volume_name, BackendCreatedRecord, ExecutionGrantRecord,
-        InputJournalDisposition, LaunchPreparation, PreparedLaunch, Registry, RegistryError,
+        InputJournalDisposition, LaunchPreparation, PreparedLaunch, RecoveryWriteFence, Registry,
+        RegistryError,
     },
 };
 use freshell_runtime_protocol::{
@@ -1124,8 +1125,8 @@ impl Supervisor {
         request_id: RequestId,
         request: freshell_runtime_protocol::LaunchRequest,
     ) -> Result<LaunchResult, RuntimeError> {
-        let lock = self.lifecycle_lock(&request.soul_id).await;
-        let _guard = lock.lock().await;
+        let lifecycle_lock = self.lifecycle_lock(&request.soul_id).await;
+        let _guard = lifecycle_lock.lock().await;
         let limits = request.limits.validate()?;
         request.validate_workload()?;
         if !release_qualified_workload(
@@ -1288,6 +1289,23 @@ impl Supervisor {
         workload: LaunchWorkload,
         limits: RuntimeLimits,
     ) -> Result<LaunchResult, RuntimeError> {
+        let fence = self
+            .registry
+            .recovery_write_fence(workload.soul_id.clone())
+            .await
+            .map_err(map_registry)?;
+        self.activate_prepared_observed(prepared, workload, limits, fence)
+            .await
+            .map(|(result, _)| result)
+    }
+
+    pub(crate) async fn activate_prepared_observed(
+        &self,
+        prepared: PreparedLaunch,
+        workload: LaunchWorkload,
+        limits: RuntimeLimits,
+        mut fence: RecoveryWriteFence,
+    ) -> Result<(LaunchResult, RecoveryWriteFence), RuntimeError> {
         let mut state = prepared.state;
         if let Some(capability) = workload
             .terminal
@@ -1442,6 +1460,7 @@ impl Supervisor {
                     workload.soul_id.clone(),
                     authenticated,
                     status,
+                    fence,
                 )
                 .await
                 .map_err(|error| {
@@ -1567,19 +1586,14 @@ impl Supervisor {
             }
         }
         crash_if("after_grant_delivery");
-        if let Err(error) = self.cleanup_opencode_transfer_staging().await {
-            append_event(
-                &self.config.lifecycle_log,
-                "supervisor.opencode_transfer_cleanup_deferred",
-                serde_json::json!({"incarnationId":handle.incarnation_id(),"error":error.message}),
-            );
-        }
         if let Some(native_session_id) = accepted.native_session_id.as_ref() {
-            self.registry
-                .record_native_session(
+            fence = self
+                .registry
+                .record_native_session_fenced(
                     workload.soul_id.clone(),
                     handle.incarnation_id().clone(),
                     native_session_id.clone(),
+                    fence,
                 )
                 .await
                 .map_err(map_registry)
@@ -1587,9 +1601,12 @@ impl Supervisor {
                     self.activation_failure(&prepared, state, "record_native_identity", error)
                 })?;
         }
-        self.registry
-            .mark_running_with_provider_preparation(
+        fence = self
+            .registry
+            .mark_running_observed_with_provider_preparation(
+                workload.soul_id.clone(),
                 handle.incarnation_id().clone(),
+                fence,
                 workload.resume_spec.is_none(),
             )
             .await
@@ -1597,6 +1614,13 @@ impl Supervisor {
             .map_err(|error| {
                 self.activation_failure(&prepared, state, "commit_running_state", error)
             })?;
+        if let Err(error) = self.cleanup_opencode_transfer_staging().await {
+            append_event(
+                &self.config.lifecycle_log,
+                "supervisor.opencode_transfer_cleanup_deferred",
+                serde_json::json!({"incarnationId":handle.incarnation_id(),"error":error.message}),
+            );
+        }
         if workload.resume_spec.is_none() {
             self.complete_pending_provider_preparation(&handle)
                 .await
@@ -1614,14 +1638,17 @@ impl Supervisor {
             .map_err(|error| {
                 self.activation_failure(&prepared, state, "load_running_view", error)
             })?;
-        Ok(LaunchResult {
-            view,
-            worker_pid: accepted.worker_pid,
-            worker_launch_count: accepted.worker_launch_count,
-            host_boot_id: accepted.host_boot_id,
-            effective_limits: authenticated.effective_limits,
-            fixture_evidence: accepted.fixture_evidence,
-        })
+        Ok((
+            LaunchResult {
+                view,
+                worker_pid: accepted.worker_pid,
+                worker_launch_count: accepted.worker_launch_count,
+                host_boot_id: accepted.host_boot_id,
+                effective_limits: authenticated.effective_limits,
+                fixture_evidence: accepted.fixture_evidence,
+            },
+            fence,
+        ))
     }
 
     async fn settle_rejected_initial_inputs(
@@ -1923,6 +1950,11 @@ impl Supervisor {
                 return Err(error);
             }
         };
+        let fence = self
+            .registry
+            .recovery_write_fence(soul_id.clone())
+            .await
+            .map_err(map_registry)?;
         let response = self
             .send_authenticated_host_command(
                 handle.incarnation_id().clone(),
@@ -1944,10 +1976,11 @@ impl Supervisor {
             }) => {
                 if let Some(native_session_id) = native_session_id {
                     self.registry
-                        .record_native_session(
+                        .record_native_session_fenced(
                             soul_id.clone(),
                             handle.incarnation_id().clone(),
                             native_session_id,
+                            fence,
                         )
                         .await
                         .map_err(map_registry)?;
@@ -2005,6 +2038,7 @@ impl Supervisor {
                 "fresh-agent native identity is not materialized",
             )
         })?;
+        let fence = context.write_fence();
         let handle = context.prior_handle;
         if handle.fresh_agent().is_none() {
             return Err(RuntimeError::new(
@@ -2040,11 +2074,12 @@ impl Supervisor {
         let already_applied = classify_fresh_agent_fork_transition(&parent_native, &transition)?;
         if !already_applied {
             self.registry
-                .transition_native_session(
+                .transition_native_session_fenced(
                     soul_id.clone(),
                     handle.incarnation_id().clone(),
                     &parent_native,
                     &transition.child_session_id,
+                    fence,
                 )
                 .await
                 .map_err(map_registry)?;
@@ -2118,6 +2153,7 @@ impl Supervisor {
             .await
             .map_err(map_registry)?;
         let prior_native = context.native_session_id.clone();
+        let fence = context.write_fence();
         let handle = context.prior_handle;
         if handle.fresh_agent().is_none() {
             return Err(RuntimeError::new(
@@ -2156,19 +2192,20 @@ impl Supervisor {
                     FreshAgentNativeIdentityUpdate::Unchanged => {}
                     FreshAgentNativeIdentityUpdate::Record => {
                         self.registry
-                            .record_native_session(
+                            .record_native_session_fenced(
                                 soul_id.clone(),
                                 handle.incarnation_id().clone(),
                                 native_session_id
                                     .clone()
                                     .expect("record classification requires identity"),
+                                fence,
                             )
                             .await
                             .map_err(map_registry)?;
                     }
                     FreshAgentNativeIdentityUpdate::Transition => {
                         self.registry
-                            .transition_native_session(
+                            .transition_native_session_fenced(
                                 soul_id.clone(),
                                 handle.incarnation_id().clone(),
                                 prior_native
@@ -2177,6 +2214,7 @@ impl Supervisor {
                                 native_session_id
                                     .as_deref()
                                     .expect("transition classification requires child"),
+                                fence,
                             )
                             .await
                             .map_err(map_registry)?;
@@ -2373,11 +2411,15 @@ impl Supervisor {
         after_sequence: u64,
         max_events: u32,
     ) -> Result<freshell_runtime_protocol::AgentEventBatch, RuntimeError> {
-        let handle = self
+        let lifecycle_lock = self.lifecycle_lock(&soul_id).await;
+        let _guard = lifecycle_lock.lock().await;
+        let context = self
             .registry
-            .active_handle_for_soul(soul_id.clone())
+            .recovery_context(soul_id.clone())
             .await
             .map_err(map_registry)?;
+        let handle = context.prior_handle.clone();
+        let mut fence = context.write_fence();
         let host = self
             .authenticate_host(handle.incarnation_id(), handle.runtime_dir())
             .await?;
@@ -2399,11 +2441,13 @@ impl Supervisor {
                     if let freshell_runtime_protocol::AgentEvent::Started { native_session_id } =
                         &event.event
                     {
-                        self.registry
-                            .record_native_session(
+                        fence = self
+                            .registry
+                            .record_native_session_fenced(
                                 soul_id.clone(),
                                 handle.incarnation_id().clone(),
                                 native_session_id.clone(),
+                                fence,
                             )
                             .await
                             .map_err(map_registry)?;
@@ -2411,8 +2455,15 @@ impl Supervisor {
                         // fresh agents. Materialize recovery evidence at the
                         // same boundary instead of waiting for a terminal
                         // output read that these workloads never perform.
-                        let _ = self.probe_recovery(soul_id.clone()).await;
                     }
+                }
+                if events.events.iter().any(|event| {
+                    matches!(
+                        event.event,
+                        freshell_runtime_protocol::AgentEvent::Started { .. }
+                    )
+                }) {
+                    let _ = self.probe_recovery_locked(soul_id.clone()).await;
                 }
                 Ok(events)
             }
@@ -2430,6 +2481,8 @@ impl Supervisor {
         max_bytes: u64,
         expected_stream_epoch: Option<String>,
     ) -> Result<RuntimeOutputBatch, RuntimeError> {
+        let lifecycle_lock = self.lifecycle_lock(&soul_id).await;
+        let _guard = lifecycle_lock.lock().await;
         let source = self
             .registry
             .retained_output_source(soul_id.clone())
@@ -2489,52 +2542,15 @@ impl Supervisor {
         match reply {
             HostResult::TerminalOutput(output) => {
                 if let Some(native_session_id) = output.native_session_id.as_ref() {
-                    match self
-                        .registry
-                        .record_native_session(
-                            soul_id.clone(),
-                            handle.incarnation_id().clone(),
-                            native_session_id.clone(),
-                        )
-                        .await
-                    {
-                        Ok(()) => {}
-                        Err(RegistryError::NativeIdentityConflict) => {
-                            let view = self
-                                .registry
-                                .inventory()
-                                .await
-                                .map_err(map_registry)?
-                                .into_iter()
-                                .find(|view| view.soul_id == soul_id)
-                                .ok_or_else(|| {
-                                    RuntimeError::new(
-                                        RuntimeErrorCode::InvalidRequest,
-                                        "terminal soul disappeared",
-                                    )
-                                })?;
-                            let prior = view
-                                .native_session_id
-                                .as_deref()
-                                .filter(|_| view.terminal_mode.as_deref() == Some("opencode"))
-                                .ok_or_else(|| {
-                                    map_registry(RegistryError::NativeIdentityConflict)
-                                })?;
-                            self.registry
-                                .transition_native_session(
-                                    soul_id.clone(),
-                                    handle.incarnation_id().clone(),
-                                    prior,
-                                    native_session_id,
-                                )
-                                .await
-                                .map_err(map_registry)?;
-                        }
-                        Err(error) => return Err(map_registry(error)),
-                    }
+                    record_terminal_identity_observation(
+                        &self.registry,
+                        &context,
+                        native_session_id,
+                    )
+                    .await?;
                     // Materialize durable resume evidence while the soul-local
                     // store is still reachable. Repeated probes are idempotent.
-                    let _ = self.probe_recovery(soul_id.clone()).await;
+                    let _ = self.probe_recovery_locked(soul_id.clone()).await;
                 }
                 Ok(output)
             }
@@ -3365,7 +3381,8 @@ impl Supervisor {
         soul_id: SoulId,
         host: AuthenticatedHost,
         status: HostStatus,
-    ) -> Result<LaunchResult, RuntimeError> {
+        mut fence: RecoveryWriteFence,
+    ) -> Result<(LaunchResult, RecoveryWriteFence), RuntimeError> {
         if status.host_boot_id != host.host_boot_id {
             return Err(RuntimeError::new(
                 RuntimeErrorCode::HostAuthenticationFailed,
@@ -3379,21 +3396,69 @@ impl Supervisor {
             )
         })?;
         if let Some(native_session_id) = status.native_session_id.as_ref() {
-            self.registry
-                .record_native_session(soul_id, incarnation_id.clone(), native_session_id.clone())
+            fence = self
+                .registry
+                .record_native_session_fenced(
+                    soul_id,
+                    incarnation_id.clone(),
+                    native_session_id.clone(),
+                    fence,
+                )
                 .await
                 .map_err(map_registry)?;
         }
         let view = find_view(&self.registry, &incarnation_id).await?;
-        Ok(LaunchResult {
-            view,
-            worker_pid,
-            worker_launch_count: status.worker_launch_count,
-            host_boot_id: host.host_boot_id,
-            effective_limits: host.effective_limits,
-            fixture_evidence: status.fixture_evidence,
-        })
+        Ok((
+            LaunchResult {
+                view,
+                worker_pid,
+                worker_launch_count: status.worker_launch_count,
+                host_boot_id: host.host_boot_id,
+                effective_limits: host.effective_limits,
+                fixture_evidence: status.fixture_evidence,
+            },
+            fence,
+        ))
     }
+}
+
+pub(crate) async fn record_terminal_identity_observation(
+    registry: &Registry,
+    context: &crate::registry::RecoveryContext,
+    native_session_id: &str,
+) -> Result<(), RuntimeError> {
+    let incarnation = context.prior_handle.incarnation_id().clone();
+    let fence = context.write_fence();
+    if let Some(prior) = context
+        .native_session_id
+        .as_deref()
+        .filter(|prior| *prior != native_session_id)
+    {
+        if context.provider != "opencode" {
+            return Err(map_registry(RegistryError::NativeIdentityConflict));
+        }
+        registry
+            .transition_native_session_fenced(
+                context.soul_id.clone(),
+                incarnation,
+                prior,
+                native_session_id,
+                fence,
+            )
+            .await
+            .map_err(map_registry)?;
+    } else {
+        registry
+            .record_native_session_fenced(
+                context.soul_id.clone(),
+                incarnation,
+                native_session_id.into(),
+                fence,
+            )
+            .await
+            .map_err(map_registry)?;
+    }
+    Ok(())
 }
 
 fn ensure_host_actor_state_dir(
@@ -4834,3 +4899,298 @@ pub(crate) fn crash_if(point: &'static str) {
 }
 #[cfg(not(feature = "runtime-test-faults"))]
 pub(crate) fn crash_if(_point: &'static str) {}
+
+#[cfg(test)]
+mod native_observation_ipc_tests {
+    use super::*;
+    use rusqlite::{params, Connection};
+
+    #[tokio::test]
+    async fn delayed_terminal_ipc_cannot_reverse_identity_or_bind_an_old_incarnation() {
+        for replace_incarnation in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let registry = Registry::open(dir.path().join("registry"), None).unwrap();
+            let soul = SoulId::new();
+            let prepared =
+                crate::registry::tests::materialize_test_runtime(&registry, soul.clone()).await;
+            let runtime = dir.path().join("host");
+            std::fs::create_dir(&runtime).unwrap();
+            std::fs::write(runtime.join("secret"), b"synthetic-secret").unwrap();
+            let conn = Connection::open(dir.path().join("registry/runtime.sqlite3")).unwrap();
+            conn.execute(
+                "UPDATE incarnations SET runtime_dir=?1 WHERE incarnation_id=?2",
+                params![runtime.to_string_lossy(), prepared.incarnation_id.as_str()],
+            )
+            .unwrap();
+            if !replace_incarnation {
+                let terminal: TerminalLaunchSpec = serde_json::from_value(serde_json::json!({
+                    "terminalId":"terminal", "streamId":"stream", "mode":"opencode", "program":"opencode",
+                    "cwd":"/synthetic", "runAsUid":65534, "runAsGid":0, "cols":80, "rows":24,
+                    "projectKey":"synthetic", "workspacePath":"/synthetic"
+                })).unwrap();
+                conn.execute(
+                    "UPDATE souls SET provider='opencode' WHERE soul_id=?1",
+                    params![soul.as_str()],
+                )
+                .unwrap();
+                conn.execute(
+                    "UPDATE incarnations SET terminal_spec=?1 WHERE incarnation_id=?2",
+                    params![
+                        serde_json::to_string(&terminal).unwrap(),
+                        prepared.incarnation_id.as_str()
+                    ],
+                )
+                .unwrap();
+                registry
+                    .record_native_session(
+                        soul.clone(),
+                        prepared.incarnation_id.clone(),
+                        "ses_A".into(),
+                    )
+                    .await
+                    .unwrap();
+            }
+            let supervisor = crate::recovery::tests::missing_supervisor(&dir, registry.clone());
+            let listener = UnixListener::bind(runtime.join("host.sock")).unwrap();
+            let source = registry.recovery_context(soul.clone()).await.unwrap();
+            let responder = {
+                let registry = registry.clone();
+                let soul = soul.clone();
+                tokio::spawn(async move {
+                    let (mut hello, _) = listener.accept().await.unwrap();
+                    let request: Envelope<HostCommand> = read_frame(&mut hello).await.unwrap();
+                    let HostCommand::Hello {
+                        incarnation_id,
+                        challenge,
+                    } = request.body
+                    else {
+                        panic!("expected handshake")
+                    };
+                    let boot = HostBootId::new();
+                    write_frame(
+                        &mut hello,
+                        &HostReply {
+                            request_id: request.request_id,
+                            result: Ok(HostResult::Hello {
+                                proof: host_proof(
+                                    b"synthetic-secret",
+                                    &challenge,
+                                    &boot,
+                                    &incarnation_id,
+                                ),
+                                host_boot_id: boot,
+                                capabilities: vec![],
+                                effective_limits: source.requested_limits,
+                            }),
+                        },
+                    )
+                    .await
+                    .unwrap();
+                    let (mut output, _) = listener.accept().await.unwrap();
+                    let request: Envelope<HostCommand> = read_frame(&mut output).await.unwrap();
+                    assert!(matches!(
+                        request.body,
+                        HostCommand::TerminalReadOutput { .. }
+                    ));
+                    if replace_incarnation {
+                        registry
+                            .mark_stop_outcome(incarnation_id.clone(), StopOutcome::VerifiedEmpty)
+                            .await
+                            .unwrap();
+                        crate::registry::tests::materialize_test_runtime(&registry, soul.clone())
+                            .await;
+                    } else {
+                        registry
+                            .transition_native_session_fenced(
+                                soul,
+                                incarnation_id.clone(),
+                                "ses_A",
+                                "ses_B",
+                                source.write_fence(),
+                            )
+                            .await
+                            .unwrap();
+                    }
+                    write_frame(
+                        &mut output,
+                        &HostReply {
+                            request_id: request.request_id,
+                            result: Ok(HostResult::TerminalOutput(RuntimeOutputBatch {
+                                incarnation_id,
+                                terminal_id: "terminal".into(),
+                                stream_epoch: "epoch".into(),
+                                retained_from_seq: 0,
+                                head_seq: 0,
+                                reset_required: false,
+                                truncated: false,
+                                exited: false,
+                                exit_code: None,
+                                native_session_id: Some("ses_A".into()),
+                                frames: vec![],
+                            })),
+                        },
+                    )
+                    .await
+                    .unwrap();
+                })
+            };
+            let result = tokio::time::timeout(
+                Duration::from_secs(5),
+                supervisor.terminal_read_output(soul.clone(), 0, 4096, None),
+            )
+            .await
+            .unwrap();
+            responder.await.unwrap();
+            assert!(
+                result.is_err(),
+                "a late response must retain its pre-IPC fence"
+            );
+            let current = registry.recovery_context(soul).await.unwrap();
+            if replace_incarnation {
+                assert_ne!(
+                    current.prior_handle.incarnation_id(),
+                    &prepared.incarnation_id
+                );
+                assert_eq!(current.native_session_id, None);
+            } else {
+                assert_eq!(current.native_session_id.as_deref(), Some("ses_B"));
+            }
+        }
+    }
+    #[tokio::test]
+    async fn status_id_prevents_seed_and_late_probe_cannot_authorize_reattach() {
+        use freshell_runtime_protocol::{
+            RecoverRequest, RecoveryPath, RecoveryProbe, RecoveryTrigger,
+        };
+        for delayed_reattach in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let registry = Registry::open(dir.path().join("registry"), None).unwrap();
+            let soul = SoulId::new();
+            let launch =
+                crate::registry::tests::materialize_test_runtime(&registry, soul.clone()).await;
+            let runtime = dir.path().join("host");
+            std::fs::create_dir(&runtime).unwrap();
+            std::fs::write(runtime.join("secret"), b"synthetic-secret").unwrap();
+            let db_path = dir.path().join("registry/runtime.sqlite3");
+            let conn = Connection::open(&db_path).unwrap();
+            conn.execute(
+                "UPDATE souls SET provider='native-session-fixture' WHERE soul_id=?1",
+                params![soul.as_str()],
+            )
+            .unwrap();
+            conn.execute("UPDATE incarnations SET runtime_dir=?1,fixture_kind='native_session' WHERE incarnation_id=?2", params![runtime.to_string_lossy(), launch.incarnation_id.as_str()]).unwrap();
+            let supervisor = crate::recovery::tests::supervisor_with_runtime_state(
+                &dir,
+                registry.clone(),
+                crate::backend::BackendRuntimeState::Running,
+            );
+            let listener = UnixListener::bind(runtime.join("host.sock")).unwrap();
+            let captured = registry.recovery_context(soul.clone()).await.unwrap();
+            assert!(captured.never_dispatched);
+            let responder = tokio::spawn(async move {
+                let boot = HostBootId::new();
+                for step in 0..3 {
+                    let (mut socket, _) = listener.accept().await.unwrap();
+                    let request: Envelope<HostCommand> = read_frame(&mut socket).await.unwrap();
+                    let result = match request.body {
+                        HostCommand::Hello {
+                            incarnation_id,
+                            challenge,
+                        } if step == 0 => HostResult::Hello {
+                            proof: host_proof(
+                                b"synthetic-secret",
+                                &challenge,
+                                &boot,
+                                &incarnation_id,
+                            ),
+                            host_boot_id: boot.clone(),
+                            capabilities: vec![],
+                            effective_limits: captured.requested_limits,
+                        },
+                        HostCommand::Status { .. } if step == 1 => HostResult::Status {
+                            host_boot_id: boot.clone(),
+                            worker_pid: Some(123),
+                            worker_launch_count: 1,
+                            max_control_epoch: 1,
+                            max_execution_generation: 1,
+                            fixture_evidence: serde_json::json!({}),
+                            exited: !delayed_reattach,
+                            native_session_id: Some("ses_from_status".into()),
+                            opencode_transfer_receipt: None,
+                            opencode_adoption: Default::default(),
+                        },
+                        HostCommand::ProbeRecovery { .. } if step == 2 => {
+                            if delayed_reattach {
+                                Connection::open(&db_path).unwrap().execute("UPDATE souls SET native_import_revision=native_import_revision+1,recovery_state='blocked' WHERE soul_id=?1", params![captured.soul_id.as_str()]).unwrap();
+                            }
+                            HostResult::RecoveryProbe(crate::recovery::tests::absent_native_probe())
+                        }
+                        _ => panic!("unexpected recovery protocol step"),
+                    };
+                    write_frame(
+                        &mut socket,
+                        &HostReply {
+                            request_id: request.request_id,
+                            result: Ok(result),
+                        },
+                    )
+                    .await
+                    .unwrap();
+                }
+            });
+            if delayed_reattach {
+                let result = tokio::time::timeout(
+                    Duration::from_secs(5),
+                    supervisor.recover(RecoverRequest {
+                        soul_id: soul.clone(),
+                        trigger: RecoveryTrigger::ProviderExit,
+                        expected_intent_revision: None,
+                        expected_control_epoch: None,
+                    }),
+                )
+                .await
+                .unwrap();
+                assert!(
+                    result.is_err(),
+                    "late probe cannot reattach using newer registry revisions"
+                );
+                assert_eq!(
+                    registry
+                        .recovery_context(soul.clone())
+                        .await
+                        .unwrap()
+                        .recovery_state,
+                    freshell_runtime_protocol::RecoveryState::Blocked
+                );
+            } else {
+                let result = tokio::time::timeout(
+                    Duration::from_secs(5),
+                    supervisor.probe_recovery(soul.clone()),
+                )
+                .await
+                .unwrap()
+                .unwrap();
+                assert!(
+                    matches!(
+                        result,
+                        RecoveryProbe::DefinitivelyUnavailable {
+                            path: RecoveryPath::NativeResume,
+                            ..
+                        }
+                    ),
+                    "status materialization must defeat stale seed readiness: {result:?}"
+                );
+            }
+            responder.await.unwrap();
+            assert_eq!(
+                registry
+                    .recovery_context(soul)
+                    .await
+                    .unwrap()
+                    .native_session_id
+                    .as_deref(),
+                Some("ses_from_status")
+            );
+        }
+    }
+}

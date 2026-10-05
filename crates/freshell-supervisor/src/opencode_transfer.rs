@@ -213,6 +213,38 @@ impl OpenCodeTransferStaging {
         Ok(staging)
     }
 
+    /// Enumerate retained recovery artifacts without opening payload bodies.
+    /// Partial and queued transfers also block a complete-absence verdict.
+    pub(crate) fn has_origin_artifact(
+        &self,
+        source_store_id: &str,
+        root_session_id: &str,
+    ) -> Result<bool, StagingError> {
+        let _guard = self.lock.lock().expect("transfer staging lock poisoned");
+        let mut found = false;
+        for entry in fs::read_dir(&self.root)? {
+            let entry = entry?;
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if ![".ready", ".partial", ".queued"]
+                .iter()
+                .any(|suffix| name.ends_with(suffix))
+            {
+                continue;
+            }
+            let metadata = fs::symlink_metadata(entry.path())?;
+            if !metadata.is_dir() || metadata.file_type().is_symlink() {
+                return Err(StagingError::InvalidState(
+                    "source artifact is not a real directory".into(),
+                ));
+            }
+            let descriptor = self.read_descriptor(&entry.path())?;
+            found |= descriptor.source_store_id == source_store_id
+                && descriptor.root_session_id == root_session_id;
+        }
+        Ok(found)
+    }
+
     pub fn available_space_bytes(&self) -> Result<u64, StagingError> {
         let mut stats = std::mem::MaybeUninit::<libc::statvfs>::zeroed();
         let path = std::ffi::CString::new(self.root.as_os_str().as_encoded_bytes())

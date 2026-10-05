@@ -12,7 +12,9 @@ use crate::{
     loss_report::{
         hash_loss_certificate, path_name, IncidentExporter, LossDecisionInput, LostDecision,
     },
-    registry::{NativeImportState, OwnedRuntimeHandle, RecoveryContext, RegistryError},
+    registry::{
+        NativeImportState, OwnedRuntimeHandle, RecoveryContext, RecoveryWriteFence, RegistryError,
+    },
     resume_catalog,
     service::{LaunchWorkload, Supervisor},
 };
@@ -25,6 +27,7 @@ use freshell_runtime_protocol::{
     RecoveryResult, RecoveryTrigger, RetryHint, RuntimeError, RuntimeErrorCode, RuntimeView,
     SoulId, StopOutcome, TerminalLaunchSpec, CONTROL_PROTOCOL_VERSION,
 };
+use freshell_sessions::opencode_transfer::HostOpenCodeInventory;
 use sha2::{Digest, Sha256};
 use tokio::time::{sleep, Duration, Instant};
 
@@ -52,11 +55,63 @@ impl Supervisor {
     }
 
     async fn probe_recovery_inner(&self, soul_id: SoulId) -> Result<RecoveryProbe, RuntimeError> {
-        let context = self
+        Ok(self.probe_recovery_observed(soul_id).await?.0)
+    }
+
+    async fn probe_recovery_observed(
+        &self,
+        soul_id: SoulId,
+    ) -> Result<(RecoveryProbe, RecoveryContext), RuntimeError> {
+        let mut context = self
             .registry
             .recovery_context(soul_id)
             .await
             .map_err(map_registry)?;
+        let probe = self.probe_recovery_context(&mut context).await?;
+        if !matches!(
+            probe,
+            RecoveryProbe::ReattachReady { .. } | RecoveryProbe::ResumeReady { .. }
+        ) && context.desired_state == DesiredState::Running
+            && context.provider == "opencode"
+            && !matches!(
+                context.native_import_state,
+                NativeImportState::NotApplicable
+                    | NativeImportState::LegacyUnknown
+                    | NativeImportState::Pending
+                    | NativeImportState::Partial
+            )
+        {
+            let inventory = tokio::task::spawn_blocking(
+                HostOpenCodeInventory::from_process_environment_discovering_channels,
+            )
+            .await
+            .map_err(|error| {
+                RuntimeError::new(
+                    RuntimeErrorCode::RegistryFailure,
+                    format!("source inventory discovery worker failed: {error}"),
+                )
+            })?;
+            context = self
+                .registry
+                .refresh_native_import_inventory(&context, inventory)
+                .await
+                .map_err(map_registry)?;
+            crate::service::append_event(
+                &self.config.lifecycle_log,
+                "supervisor.recovery.native_import_inventory",
+                serde_json::json!({
+                    "soulId": context.soul_id, "state": context.native_import_state.as_str(), "revision": context.native_import_revision,
+                    "complete": context.native_import_complete_inventory,
+                }),
+            );
+        }
+        Ok((after_native_probe(&context, probe), context))
+    }
+
+    async fn probe_recovery_context(
+        &self,
+        context: &mut RecoveryContext,
+    ) -> Result<RecoveryProbe, RuntimeError> {
         if context.desired_state == DesiredState::Stopped {
             return Ok(blocked(
                 RecoveryPath::Reattach,
@@ -104,7 +159,7 @@ impl Supervisor {
                         .await
                     {
                         Ok(status) => status,
-                        Err(_) if context.resume_spec.is_some() => return offline_probe(&context),
+                        Err(_) if context.resume_spec.is_some() => return offline_probe(context),
                         Err(error) => {
                             return Ok(blocked(
                                 RecoveryPath::Reattach,
@@ -114,7 +169,6 @@ impl Supervisor {
                             ));
                         }
                     };
-                    let mut current_context = context.clone();
                     if let Some(native_session_id) = status.native_session_id.as_ref() {
                         self.registry
                             .record_native_session_fenced(
@@ -125,11 +179,11 @@ impl Supervisor {
                             )
                             .await
                             .map_err(map_registry)?;
-                        current_context = self
-                            .registry
-                            .recovery_context(context.soul_id.clone())
-                            .await
-                            .map_err(map_registry)?;
+                        if context.native_session_id.is_none() {
+                            context.native_session_id = Some(native_session_id.clone());
+                            context.identity_revision += 1;
+                            context.evidence_revision += 1;
+                        }
                     }
                     if !status.exited {
                         if context.provider != "shell" && context.resume_spec.is_none() {
@@ -142,16 +196,14 @@ impl Supervisor {
                         return Ok(shell_terminal_end_probe(&context));
                     }
                     let candidate = match resume_catalog::exact_resume_candidate(
-                        &current_context,
+                        &*context,
                         status.native_session_id.as_deref(),
                     ) {
                         Ok(candidate) => candidate,
                         Err(probe) => return Ok(probe),
                     };
-                    let store_fence = current_context.write_fence();
-                    let store_probe = self
-                        .probe_host_store(&current_context, &host, candidate)
-                        .await?;
+                    let store_fence = context.write_fence();
+                    let store_probe = self.probe_host_store(&*context, &host, candidate).await?;
                     crate::service::append_event(
                         &self.config.lifecycle_log,
                         "supervisor.recovery.store_probe",
@@ -166,9 +218,9 @@ impl Supervisor {
                             let stored = self
                                 .registry
                                 .store_verified_resume_spec_for_live_incarnation_fenced(
-                                    current_context.soul_id.clone(),
-                                    current_context.prior_handle.incarnation_id().clone(),
-                                    current_context.evidence_revision,
+                                    context.soul_id.clone(),
+                                    context.prior_handle.incarnation_id().clone(),
+                                    context.evidence_revision,
                                     *resume_spec,
                                     store_fence,
                                 )
@@ -182,6 +234,10 @@ impl Supervisor {
                                     Some(2_000),
                                 ));
                             };
+                            context.evidence_revision =
+                                context.evidence_revision.max(stored.evidence_revision);
+                            context.resume_spec = Some(stored.clone());
+                            context.allocation_state = stored.allocation_state;
                             RecoveryProbe::ResumeReady {
                                 evidence_revision: stored.evidence_revision,
                                 resume_spec: Box::new(stored),
@@ -190,9 +246,9 @@ impl Supervisor {
                         other => other,
                     };
 
-                    return Ok(after_native_probe(&context, captured));
+                    return Ok(after_native_probe(context, captured));
                 }
-                Err(_) if context.resume_spec.is_some() => return offline_probe(&context),
+                Err(_) if context.resume_spec.is_some() => return offline_probe(context),
                 Err(error) => {
                     return Ok(blocked(
                         RecoveryPath::Reattach,
@@ -208,7 +264,7 @@ impl Supervisor {
             inspection.state,
             BackendRuntimeState::Exited | BackendRuntimeState::Dead | BackendRuntimeState::Missing
         ) {
-            return offline_probe(&context);
+            return offline_probe(context);
         }
 
         Ok(blocked(
@@ -443,6 +499,11 @@ impl Supervisor {
             );
         }
         if request.trigger == RecoveryTrigger::RetryExhausted {
+            let initial_context = self
+                .registry
+                .recovery_context(request.soul_id.clone())
+                .await
+                .map_err(map_registry)?;
             let evidence =
                 vec!["bounded automatic retry schedule exhausted (initial, 2s, 10s)".into()];
             let probe = RecoveryProbe::Blocked {
@@ -461,6 +522,7 @@ impl Supervisor {
                     None,
                     RecoveryBlockReason::RetryBudget,
                     evidence,
+                    initial_context.write_fence(),
                 )
                 .await
                 .map_err(map_registry)?;
@@ -480,19 +542,16 @@ impl Supervisor {
                 incident_id: None,
             });
         }
-        let probe = self.probe_recovery_inner(request.soul_id.clone()).await?;
+        let (probe, observed_context) = self
+            .probe_recovery_observed(request.soul_id.clone())
+            .await?;
         match probe.clone() {
             RecoveryProbe::ReattachReady { handle, .. } => {
-                let context = self
-                    .registry
-                    .recovery_context(request.soul_id.clone())
-                    .await
-                    .map_err(map_registry)?;
                 self.registry
                     .mark_recovery_live(
                         request.soul_id.clone(),
                         handle.incarnation_id.clone(),
-                        context.write_fence(),
+                        observed_context.write_fence(),
                     )
                     .await
                     .map_err(map_registry)?;
@@ -534,7 +593,13 @@ impl Supervisor {
                     });
                 }
                 self.registry
-                    .mark_recovery_blocked(request.soul_id.clone(), None, reason, evidence)
+                    .mark_recovery_blocked(
+                        request.soul_id.clone(),
+                        None,
+                        reason,
+                        evidence,
+                        observed_context.write_fence(),
+                    )
                     .await
                     .map_err(map_registry)?;
                 let context = self
@@ -562,25 +627,26 @@ impl Supervisor {
                     == ManagedRolloutMode::Legacy
                 {
                     return self
-                        .preserve_definitive_as_blocked(request.soul_id, probe)
+                        .preserve_definitive_as_blocked(
+                            request.soul_id,
+                            probe,
+                            observed_context.write_fence(),
+                        )
                         .await;
                 }
                 // Loss authority requires a fresh second probe after every
                 // recovery path has already reported a negative. A late host,
                 // store, checkpoint, or stop-intent transition cancels loss.
-                let rechecked = self.probe_recovery_inner(request.soul_id.clone()).await?;
+                let (rechecked, rechecked_context) = self
+                    .probe_recovery_observed(request.soul_id.clone())
+                    .await?;
                 match rechecked.clone() {
                     RecoveryProbe::ReattachReady { handle, .. } => {
-                        let context = self
-                            .registry
-                            .recovery_context(request.soul_id.clone())
-                            .await
-                            .map_err(map_registry)?;
                         self.registry
                             .mark_recovery_live(
                                 request.soul_id.clone(),
                                 handle.incarnation_id.clone(),
-                                context.write_fence(),
+                                rechecked_context.write_fence(),
                             )
                             .await
                             .map_err(map_registry)?;
@@ -613,6 +679,7 @@ impl Supervisor {
                             path,
                             Some(*resume_spec),
                             rechecked,
+                            rechecked_context.write_fence(),
                         )
                         .await
                     }
@@ -623,6 +690,7 @@ impl Supervisor {
                             RecoveryPath::PristineSeed,
                             None,
                             rechecked,
+                            rechecked_context.write_fence(),
                         )
                         .await
                     }
@@ -630,7 +698,13 @@ impl Supervisor {
                         reason, evidence, ..
                     } => {
                         self.registry
-                            .mark_recovery_blocked(request.soul_id.clone(), None, reason, evidence)
+                            .mark_recovery_blocked(
+                                request.soul_id.clone(),
+                                None,
+                                reason,
+                                evidence,
+                                rechecked_context.write_fence(),
+                            )
                             .await
                             .map_err(map_registry)?;
                         let context = self
@@ -671,6 +745,7 @@ impl Supervisor {
                     path,
                     Some(*resume_spec),
                     probe,
+                    observed_context.write_fence(),
                 )
                 .await
             }
@@ -681,6 +756,7 @@ impl Supervisor {
                     RecoveryPath::PristineSeed,
                     None,
                     probe,
+                    observed_context.write_fence(),
                 )
                 .await
             }
@@ -694,11 +770,12 @@ impl Supervisor {
         path: RecoveryPath,
         resume_spec: Option<freshell_runtime_protocol::ResumeSpec>,
         probe: RecoveryProbe,
+        probe_fence: RecoveryWriteFence,
     ) -> Result<RecoveryResult, RuntimeError> {
         let recovery_started = Instant::now();
         let start = match self
             .registry
-            .begin_recovery(soul_id.clone(), trigger, path)
+            .begin_recovery_fenced(soul_id.clone(), trigger, path, probe_fence)
             .await
         {
             Ok(start) => start,
@@ -730,6 +807,7 @@ impl Supervisor {
         };
         let prior_incarnation_id = start.context.prior_handle.incarnation_id().clone();
         let attempt_id = start.attempt_id.clone();
+        let mut verdict_fence = start.context.write_fence_for_attempt(attempt_id.clone());
 
         let stop_outcome = self
             .terminate_owned_for_recovery(&start.context.prior_handle)
@@ -742,6 +820,7 @@ impl Supervisor {
                     Some(attempt_id.clone()),
                     reason,
                     vec![format!("stopOutcome={stop_outcome:?}")],
+                    verdict_fence.clone(),
                 )
                 .await
                 .map_err(map_registry)?;
@@ -788,6 +867,7 @@ impl Supervisor {
                     Some(attempt_id.clone()),
                     reason,
                     vec!["managed MCP capability must be reissued before replacement".into()],
+                    verdict_fence.clone(),
                 )
                 .await
                 .map_err(map_registry)?;
@@ -857,6 +937,7 @@ impl Supervisor {
                                 Some(attempt_id.clone()),
                                 reason,
                                 vec![error.message.clone()],
+                                verdict_fence.clone(),
                             )
                             .await
                             .map_err(map_registry)?;
@@ -917,8 +998,9 @@ impl Supervisor {
             Err(error) => return Err(map_registry(error)),
         };
 
+        verdict_fence = verdict_fence.for_incarnation(prepared.prepared.incarnation_id.clone());
         let launch = self
-            .activate_prepared(
+            .activate_prepared_observed(
                 prepared.prepared.clone(),
                 LaunchWorkload {
                     soul_id: soul_id.clone(),
@@ -928,10 +1010,13 @@ impl Supervisor {
                     resume_spec: prepared.resume_spec.clone(),
                 },
                 start.context.requested_limits,
+                verdict_fence.clone(),
             )
             .await;
         match launch {
-            Ok(_) => {}
+            Ok((_, successor)) => {
+                verdict_fence = successor;
+            }
             Err(error) => {
                 let reason = if error.message.starts_with("capability_pending:") {
                     RecoveryBlockReason::CapabilityPending
@@ -959,6 +1044,7 @@ impl Supervisor {
                         Some(attempt_id.clone()),
                         reason,
                         vec![error.message.clone()],
+                        verdict_fence.clone(),
                     )
                     .await
                     .map_err(map_registry)?;
@@ -997,6 +1083,7 @@ impl Supervisor {
                         Some(attempt_id.clone()),
                         RecoveryBlockReason::WrongNativeIdentity,
                         vec![error.to_string()],
+                        verdict_fence.clone(),
                     )
                     .await
                     .map_err(map_registry)?;
@@ -1033,6 +1120,7 @@ impl Supervisor {
                     Some(attempt_id.clone()),
                     RecoveryBlockReason::CommandAmbiguous,
                     vec![message.clone()],
+                    verdict_fence.clone(),
                 )
                 .await
                 .map_err(map_registry)?;
@@ -1054,17 +1142,12 @@ impl Supervisor {
         }
 
         let provider = start.context.provider.clone();
-        let success_context = self
-            .registry
-            .recovery_context(soul_id.clone())
-            .await
-            .map_err(map_registry)?;
         self.registry
             .mark_recovery_success(
                 soul_id.clone(),
                 prepared.prepared.incarnation_id.clone(),
                 attempt_id.clone(),
-                success_context.write_fence_for_attempt(attempt_id.clone()),
+                verdict_fence,
             )
             .await
             .map_err(map_registry)?;
@@ -1125,6 +1208,7 @@ impl Supervisor {
         &self,
         soul_id: SoulId,
         probe: RecoveryProbe,
+        fence: RecoveryWriteFence,
     ) -> Result<RecoveryResult, RuntimeError> {
         let (path, store_state, message, evidence) = match &probe {
             RecoveryProbe::DefinitivelyUnavailable {
@@ -1154,6 +1238,7 @@ impl Supervisor {
                 None,
                 RecoveryBlockReason::ImplementationUnavailable,
                 preserved_evidence.clone(),
+                fence,
             )
             .await
             .map_err(map_registry)?;
@@ -1197,39 +1282,10 @@ impl Supervisor {
         // and rebuild every path row from the refreshed intent immediately
         // before constructing the certificate. Any late positive, unreadable
         // state, or stop/new-intent fence cancels loss.
-        let mut baseline_context = self
-            .registry
-            .recovery_context(soul_id.clone())
-            .await
-            .map_err(map_registry)?;
-        let mut stable_result = None;
-        for _ in 0..3 {
-            let final_probe = self.probe_recovery_inner(soul_id.clone()).await?;
-            let observed_context = self
-                .registry
-                .recovery_context(soul_id.clone())
-                .await
-                .map_err(map_registry)?;
-            if baseline_context.write_fence() == observed_context.write_fence() {
-                stable_result = Some((final_probe, observed_context));
-                break;
-            }
-            baseline_context = observed_context;
-        }
-        let Some((final_probe, context)) = stable_result else {
-            let unstable = blocked(
-                RecoveryPath::NativeResume,
-                RecoveryBlockReason::ProviderUnavailable,
-                "identity, import, or recovery revisions changed during the final loss probe",
-                Some(2_000),
-            );
-            return self
-                .preserve_nonloss_probe(soul_id, trigger, unstable)
-                .await;
-        };
+        let (final_probe, context) = self.probe_recovery_observed(soul_id.clone()).await?;
         if !final_probe_still_allows_loss(&final_probe) {
             return self
-                .preserve_nonloss_probe(soul_id, trigger, final_probe)
+                .preserve_nonloss_probe(soul_id, trigger, final_probe, context.write_fence())
                 .await;
         }
         let path_evidence = match self
@@ -1238,7 +1294,9 @@ impl Supervisor {
         {
             Ok(evidence) => evidence,
             Err(probe) => {
-                return self.preserve_nonloss_probe(soul_id, trigger, probe).await;
+                return self
+                    .preserve_nonloss_probe(soul_id, trigger, probe, context.write_fence())
+                    .await;
             }
         };
         let provider_version = context
@@ -1312,6 +1370,7 @@ impl Supervisor {
                         None,
                         RecoveryBlockReason::ImplementationUnavailable,
                         vec![message.clone()],
+                        context.write_fence(),
                     )
                     .await
                     .map_err(map_registry)?;
@@ -1338,6 +1397,16 @@ impl Supervisor {
             }
         };
 
+        // Freeze stage publication through the loss commit. Existing partial
+        // or queued entries were already considered; a newly begun transfer
+        // must not slip between that census and certification.
+        let staging_guard = self.opencode_transfer_lifecycle_lock.lock().await;
+        if let Err(probe) = self.require_no_staged_native_source(&context).await {
+            drop(staging_guard);
+            return self
+                .preserve_nonloss_probe(soul_id, trigger, probe, context.write_fence())
+                .await;
+        }
         // The SQLite transaction below is the destructive-action gate. If it
         // cannot durably commit the incident and export intent, no stop signal
         // is sent and the caller receives an explicit persistence failure.
@@ -1356,6 +1425,7 @@ impl Supervisor {
                     format!("incident-before-cleanup commit failed: {error}"),
                 )
             })?;
+        drop(staging_guard);
         crate::service::append_event(
             &self.config.lifecycle_log,
             "supervisor.loss.incident_committed",
@@ -1433,20 +1503,12 @@ impl Supervisor {
         soul_id: SoulId,
         trigger: RecoveryTrigger,
         probe: RecoveryProbe,
+        fence: RecoveryWriteFence,
     ) -> Result<RecoveryResult, RuntimeError> {
         match probe.clone() {
             RecoveryProbe::ReattachReady { handle, .. } => {
-                let context = self
-                    .registry
-                    .recovery_context(soul_id.clone())
-                    .await
-                    .map_err(map_registry)?;
                 self.registry
-                    .mark_recovery_live(
-                        soul_id,
-                        handle.incarnation_id.clone(),
-                        context.write_fence(),
-                    )
+                    .mark_recovery_live(soul_id, handle.incarnation_id.clone(), fence)
                     .await
                     .map_err(map_registry)?;
                 let owned = self
@@ -1472,18 +1534,25 @@ impl Supervisor {
                 } else {
                     RecoveryPath::NativeResume
                 };
-                self.replace(soul_id, trigger, path, Some(*resume_spec), probe)
+                self.replace(soul_id, trigger, path, Some(*resume_spec), probe, fence)
                     .await
             }
             RecoveryProbe::PristineSeedReady { .. } => {
-                self.replace(soul_id, trigger, RecoveryPath::PristineSeed, None, probe)
-                    .await
+                self.replace(
+                    soul_id,
+                    trigger,
+                    RecoveryPath::PristineSeed,
+                    None,
+                    probe,
+                    fence,
+                )
+                .await
             }
             RecoveryProbe::Blocked {
                 reason, evidence, ..
             } => {
                 self.registry
-                    .mark_recovery_blocked(soul_id.clone(), None, reason, evidence)
+                    .mark_recovery_blocked(soul_id.clone(), None, reason, evidence, fence)
                     .await
                     .map_err(map_registry)?;
                 let context = self
@@ -1513,7 +1582,7 @@ impl Supervisor {
         }
     }
 
-    async fn collect_loss_path_evidence(
+    pub(crate) async fn collect_loss_path_evidence(
         &self,
         context: &RecoveryContext,
         native_probe: &RecoveryProbe,
@@ -1576,36 +1645,38 @@ impl Supervisor {
                         store_state: EvidenceStoreState::NotApplicable,
                     }
                 }
-                RecoveryPath::NativeImport => match context.native_import_state {
-                    NativeImportState::NotApplicable => RecoveryPathEvidence {
-                        path: RecoveryPath::NativeImport,
-                        verdict: RecoveryEvidenceVerdict::DefinitiveNegative,
-                        reason_code: "no_native_import_configured".into(),
-                        evidence_refs: vec!["nativeImport=not_applicable".into()],
-                        store_state: EvidenceStoreState::NotApplicable,
-                    },
-                    NativeImportState::Absent
-                        if context.native_import_absence_is_authoritative() =>
-                    {
-                        let source_evidence = format!(
-                            "{}\0{}\0{}",
-                            context.native_import_source_store_id.as_deref().unwrap(),
-                            context.native_import_root_session_id.as_deref().unwrap(),
-                            context.native_import_source_generation.as_deref().unwrap(),
-                        );
-                        RecoveryPathEvidence {
+                RecoveryPath::NativeImport => {
+                    self.require_no_staged_native_source(context).await?;
+                    match context.native_import_state {
+                        NativeImportState::NotApplicable => RecoveryPathEvidence {
                             path: RecoveryPath::NativeImport,
                             verdict: RecoveryEvidenceVerdict::DefinitiveNegative,
-                            reason_code: "complete_source_inventory_absent".into(),
-                            evidence_refs: vec![format!(
-                                "nativeImportSourceDigest=sha256:{:x}",
-                                Sha256::digest(source_evidence.as_bytes())
-                            )],
-                            store_state: EvidenceStoreState::Missing,
+                            reason_code: "no_native_import_configured".into(),
+                            evidence_refs: vec!["nativeImport=not_applicable".into()],
+                            store_state: EvidenceStoreState::NotApplicable,
+                        },
+                        NativeImportState::Absent
+                            if context.native_import_absence_is_authoritative() =>
+                        {
+                            let source_evidence = format!(
+                                "{}\0{}\0{}",
+                                context.native_import_source_store_id.as_deref().unwrap(),
+                                context.native_import_root_session_id.as_deref().unwrap(),
+                                context.native_import_source_generation.as_deref().unwrap(),
+                            );
+                            RecoveryPathEvidence {
+                                path: RecoveryPath::NativeImport,
+                                verdict: RecoveryEvidenceVerdict::DefinitiveNegative,
+                                reason_code: "complete_source_inventory_absent".into(),
+                                evidence_refs: vec![format!(
+                                    "nativeImportSourceDigest=sha256:{:x}",
+                                    Sha256::digest(source_evidence.as_bytes())
+                                )],
+                                store_state: EvidenceStoreState::Missing,
+                            }
                         }
-                    }
-                    state => {
-                        return Err(blocked(
+                        state => {
+                            return Err(blocked(
                                 RecoveryPath::NativeImport,
                                 RecoveryBlockReason::StoreUnreadable,
                                 &format!(
@@ -1614,8 +1685,9 @@ impl Supervisor {
                                 ),
                                 None,
                             ));
+                        }
                     }
-                },
+                }
             };
             let mut row = row;
             let (reason_code, evidence_refs) =
@@ -1625,6 +1697,32 @@ impl Supervisor {
             evidence.push(row);
         }
         Ok(evidence)
+    }
+
+    async fn require_no_staged_native_source(
+        &self,
+        context: &RecoveryContext,
+    ) -> Result<(), RecoveryProbe> {
+        let (Some(store), Some(root)) = (
+            &context.native_import_source_store_id,
+            &context.native_import_root_session_id,
+        ) else {
+            return Ok(());
+        };
+        let staging = std::sync::Arc::clone(&self.opencode_transfer_staging);
+        let store = store.clone();
+        let root = root.clone();
+        let result =
+            tokio::task::spawn_blocking(move || staging.has_origin_artifact(&store, &root)).await;
+        match result {
+            Ok(Ok(false)) => Ok(()),
+            _ => Err(blocked(
+                RecoveryPath::NativeImport,
+                RecoveryBlockReason::StoreUnreadable,
+                "native transfer staging contains available or unresolved recovery artifacts",
+                None,
+            )),
+        }
     }
 
     async fn prove_reattach_unavailable(
@@ -2135,7 +2233,10 @@ fn fresh_agent_replay_settings(
     }
 }
 
-fn after_native_probe(context: &RecoveryContext, probe: RecoveryProbe) -> RecoveryProbe {
+pub(crate) fn after_native_probe(context: &RecoveryContext, probe: RecoveryProbe) -> RecoveryProbe {
+    if matches!(probe, RecoveryProbe::PristineSeedReady { .. }) && !context.permits_pristine_seed() {
+        return blocked(RecoveryPath::PristineSeed, RecoveryBlockReason::StoreUnreadable, "native identity or import prevents pristine seed", None);
+    }
     if !matches!(probe, RecoveryProbe::DefinitivelyUnavailable { .. }) {
         return probe;
     }
@@ -2556,11 +2657,134 @@ fn map_registry(error: RegistryError) -> RuntimeError {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     include!("shell_recovery_tests.rs");
     include!("retained_output_tests.rs");
     use super::*;
     use freshell_runtime_protocol::{FreshAgentLaunchSpec, FreshProvider, IncarnationId};
+
+    struct ObservedRuntime(BackendRuntimeState);
+
+    #[async_trait::async_trait]
+    impl crate::backend::RuntimeBackend for ObservedRuntime {
+        async fn inspect(
+            &self,
+            handle: &OwnedRuntimeHandle,
+        ) -> Result<crate::backend::BackendInspection, BackendError> {
+            Ok(crate::backend::BackendInspection {
+                state: self.0,
+                configured_limits: handle.requested_limits(),
+            })
+        }
+        async fn create_stopped(
+            &self,
+            _: &crate::backend::CreateRuntimeSpec,
+        ) -> Result<crate::backend::BackendCreated, BackendError> {
+            panic!("unexpected launch")
+        }
+        async fn start_host(&self, _: &OwnedRuntimeHandle) -> Result<(), BackendError> {
+            panic!("unexpected launch")
+        }
+        async fn request_stop(&self, _: &OwnedRuntimeHandle, _: u64) -> Result<(), BackendError> {
+            panic!("unexpected stop")
+        }
+        async fn force_stop(&self, _: &OwnedRuntimeHandle) -> Result<(), BackendError> {
+            panic!("unexpected stop")
+        }
+        async fn verify_empty(&self, _: &OwnedRuntimeHandle) -> Result<bool, BackendError> {
+            Ok(true)
+        }
+        async fn list_known(
+            &self,
+            _: &[OwnedRuntimeHandle],
+        ) -> Result<Vec<(IncarnationId, crate::backend::BackendInspection)>, BackendError> {
+            panic!("unexpected list")
+        }
+        async fn read_limits(
+            &self,
+            handle: &OwnedRuntimeHandle,
+        ) -> Result<freshell_runtime_protocol::RuntimeLimits, BackendError> {
+            Ok(handle.requested_limits())
+        }
+        async fn enable_long_lived(&self, _: &OwnedRuntimeHandle) -> Result<(), BackendError> {
+            panic!("unexpected launch")
+        }
+    }
+
+    pub(crate) fn missing_supervisor(
+        dir: &tempfile::TempDir,
+        registry: crate::registry::Registry,
+    ) -> Supervisor {
+        supervisor_with_runtime_state(dir, registry, BackendRuntimeState::Missing)
+    }
+
+    pub(crate) fn supervisor_with_runtime_state(
+        dir: &tempfile::TempDir,
+        registry: crate::registry::Registry,
+        state: BackendRuntimeState,
+    ) -> Supervisor {
+        Supervisor::new(
+            registry,
+            std::sync::Arc::new(ObservedRuntime(state)),
+            crate::service::SupervisorConfig {
+                runtime_root: dir.path().join("runtime"),
+                control_socket_path: dir.path().join("control.sock"),
+                host_binary_path: std::env::current_exe().unwrap(),
+                image_ref: format!("sha256:{}", "a".repeat(64)),
+                test_run_id: "native-inventory".into(),
+                control_secret: "synthetic-secret".into(),
+                lifecycle_log: dir.path().join("lifecycle.jsonl"),
+                admission: crate::admission::AdmissionPolicy::default(),
+            },
+        )
+        .unwrap()
+    }
+
+    pub(crate) fn absent_native_probe() -> RecoveryProbe {
+        RecoveryProbe::DefinitivelyUnavailable {
+            path: RecoveryPath::NativeResume,
+            reason: "synthetic native store absent".into(),
+            evidence: vec![],
+            store_state: EvidenceStoreState::Missing,
+        }
+    }
+
+    #[tokio::test]
+    async fn status_materialization_prevents_provider_seed_readiness() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry = crate::registry::Registry::open(dir.path(), None).unwrap();
+        let soul = SoulId::new();
+        let launch =
+            crate::registry::tests::materialize_test_runtime(&registry, soul.clone()).await;
+        let before = registry.recovery_context(soul.clone()).await.unwrap();
+        registry
+            .record_native_session_fenced(
+                soul.clone(),
+                launch.incarnation_id,
+                "ses_observed_status".into(),
+                before.write_fence(),
+            )
+            .await
+            .unwrap();
+        let observed = registry.recovery_context(soul).await.unwrap();
+        assert!(!matches!(
+            after_native_probe(&observed, absent_native_probe()),
+            RecoveryProbe::PristineSeedReady { .. }
+        ));
+        assert!(matches!(
+            after_native_probe(
+                &observed,
+                RecoveryProbe::PristineSeedReady {
+                    seed: before.creation_seed_ref,
+                    never_dispatched_proof: "old host snapshot".into()
+                }
+            ),
+            RecoveryProbe::Blocked {
+                path: RecoveryPath::PristineSeed,
+                ..
+            }
+        ));
+    }
 
     #[test]
     fn queued_fresh_prompt_replays_with_the_exact_persisted_turn_profile() {

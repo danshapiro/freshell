@@ -1554,6 +1554,7 @@ dependencies = [
  "freshell-platform",
  "freshell-runtime-observability",
  "freshell-runtime-protocol",
+ "freshell-sessions",
  "hex",
  "libc",
  "rusqlite",

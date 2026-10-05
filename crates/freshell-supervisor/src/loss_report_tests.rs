@@ -389,14 +389,32 @@ async fn complete_absence_of_the_exact_native_import_source_can_be_certified_los
     let dir = tempfile::tempdir().unwrap();
     let (registry, mut context) = prepared_context(dir.path()).await;
     let conn = Connection::open(dir.path().join("runtime.sqlite3")).unwrap();
+    let source_path = dir.path().join("opencode.db");
+    let _source = crate::registry::tests::native_inventory_fixture(&source_path);
+    let store = format!(
+        "{:x}",
+        Sha256::digest(
+            source_path
+                .canonicalize()
+                .unwrap()
+                .to_string_lossy()
+                .as_bytes()
+        )
+    );
+    let inventory = freshell_sessions::opencode_transfer::HostOpenCodeInventory::new(source_path);
+    let census = inventory
+        .inspect_exact_origin(&store, "ses_test_exact")
+        .unwrap();
     conn.execute(
-        "UPDATE souls SET native_import_state='absent',native_import_source_store_id='source-store',native_import_root_session_id='ses_test_exact',native_import_source_generation='source-generation',native_import_schema_fingerprint='schema-fingerprint',native_import_migration_fingerprint='migration-fingerprint',native_import_complete_inventory=1,native_import_authority='complete_source_inventory',native_import_revision=native_import_revision+1,evidence_revision=evidence_revision+1 WHERE soul_id=?1",
-        params![context.soul_id.as_str()],
-    )
-    .unwrap();
-    drop(conn);
+        "UPDATE souls SET native_import_state='completed',native_import_source_store_id=?1,native_import_root_session_id='ses_test_exact',native_import_source_generation=?2,native_import_schema_fingerprint=?3,native_import_migration_fingerprint=?4 WHERE soul_id=?5",
+        params![store, "e".repeat(64), census.schema_fingerprint(), census.migration_fingerprint(), context.soul_id.as_str()],
+    ).unwrap();
     context = registry
         .recovery_context(context.soul_id.clone())
+        .await
+        .unwrap();
+    context = registry
+        .refresh_native_import_inventory(&context, Ok(inventory))
         .await
         .unwrap();
     assert_eq!(context.native_import_state, NativeImportState::Absent);
