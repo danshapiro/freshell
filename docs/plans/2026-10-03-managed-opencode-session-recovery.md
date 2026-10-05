@@ -33,7 +33,7 @@ Fix managed OpenCode resume for pre-existing host sessions by transferring and v
 
 ## Global Constraints
 
-- Work only in `/home/dan/code/freshell/.worktrees/managed-opencode-session-recovery` on `the-usual/managed-opencode-session-recovery`, based on `origin/main` `922a9241533d409cedfd323f1585eddf908848bd`; keep the primary checkout untouched.
+- Work only in `/home/dan/code/freshell/.worktrees/managed-opencode-session-recovery` on `the-usual/managed-opencode-session-recovery`, based on the latest fetched `origin/main`; the last confirmed base was `560838623e26b1781c506ac7f033b250af0b35b8`, so fetch and rebase again before PR preparation. Keep the primary checkout untouched.
 - Use pnpm 10.34.5 with the committed lockfile. Follow `scripts/base-gate.sh`, the test coordinator, cloud backend configuration, and repo test-sandbox rules for the relevant test levels.
 - Run process-kill, crash/restart, and config-corruption fault injection only through `scripts/sandbox-test.sh` in disposable Docker storage; never target the host provider store or live Freshell service.
 - Use red-green-refactor for each behavior change. Add tests that fail for the missing behavior, preserve existing coverage, run impacted tests and the full supported gate, and commit each accepted task.
@@ -237,37 +237,37 @@ git commit -m "fix(runtime): require verified OpenCode history for readiness"
 - Produces: every participating write rejects stale observations by a SQLite compare-and-set in the same transaction that writes the result. A loss certificate is possible only for a previously verified materialized identity when the complete declared source inventory is authoritatively absent and the commit still matches the captured tuple. Pending first import, available, unresolved, unreadable, unsupported, expired stage, partial import, or legacy-unknown source state remains retryable/blocked.
 - Source ownership is keyed by `(provider, stable source-store identity, native root)` in a durable origin-owner table, separate from per-incarnation writer claims. Only one soul may prepare or commit adoption for an origin. Schema migration must not guess a winner: backfill claims only for unambiguous existing origins, leave duplicate roots explicitly unclaimed/ambiguous, and preserve both soul rows until the exact repair resolves them from permitted metadata. Do not use age, lexical IDs, or row order. Ambiguous metadata blocks restoration and preserves both rows.
 
-- [ ] **Step 1: Write failing loss-fence and ownership tests**
+- [x] **Step 1: Write failing loss-fence and ownership tests**
 
 Add tests proving `Allocated`/`Materializing` souls cannot be Lost; every pending/available/unresolved `NativeImport` state blocks loss; `Path::exists`-style I/O errors cannot become absence; a late source/import/identity write invalidates an old loss certificate; only a complete absent source inventory can certify loss; and an observed/requested ID can never become a pristine seed from a stale `never_dispatched` snapshot. Race two destination stores for one origin key and assert one durable owner; retire the other incarnation without deleting the winner's origin claim. Test explicit legacy-unknown state and repeated/reordered refreshes.
 
-- [ ] **Step 2: Run tests and verify the intended failure**
+- [x] **Step 2: Run tests and verify the intended failure**
 
 Run: `cargo test -p freshell-supervisor materializing_cannot_be_lost && cargo test -p freshell-supervisor loss_commit_rejects_newer_materialization && cargo test -p freshell-supervisor native_id_has_one_writer`
 
 Expected: FAIL because loss currently ignores allocation/durability state and its final commit does not compare captured native identity/evidence generation.
 
-- [ ] **Step 3: Add a durable materialization/loss fence**
+- [x] **Step 3: Add a durable materialization/loss fence**
 
 Add a shared per-soul coordinator for mutating identity/import/dispatch/recovery operations, while the durable CAS remains the correctness boundary. Capture the expected generation tuple before asynchronous work and compare it in every commit that writes identity, resume evidence, import, loss, or restore state. Stop commits its intent revision before waiting for the coordinator so it can invalidate in-flight work; destructive cleanup then revalidates the same exact incarnation. A Stop or repair choice made while a soul is already Lost and stopped must still advance a persisted user-intent/correction revision; never infer the user's latest choice from a loss-generated tombstone. Split locked and already-locked probe helpers to avoid nested non-reentrant mutex deadlocks. Writers must check affected-row counts. Add an origin-owner table and unique transaction claim; backfill only unique legacy origins and leave duplicate roots unclaimed for the explicit repair. Persist source/import verdicts and refresh authority; a missing path/error is `Unresolved`, not `Absent`. Add OpenCode `NativeImport`; require complete authoritative source absence before loss, and a full verified baseline before durable resume readiness. Requested identity or zero dispatch alone never enables a seed.
 
-- [ ] **Step 4: Run focused tests**
+- [x] **Step 4: Run focused tests**
 
 Run: `cargo test -p freshell-supervisor materializing_cannot_be_lost && cargo test -p freshell-supervisor loss_commit_rejects_newer_materialization && cargo test -p freshell-supervisor native_id_has_one_writer`
 
 Expected: PASS for stale-writer rejection after Stop/import, deadlock-free nested probes, one source-root owner across distinct stores, blocked unknown/unresolved sources and safe pristine-seed gating, and a preserved genuine-loss path.
 
-- [ ] **Step 5: Refactor while green**
+- [x] **Step 5: Refactor while green**
 
 Keep lock ordering consistent: commit Stop intent first, then acquire the per-soul coordinator for cleanup; never hold a SQLite transaction during provider I/O. Keep DB CAS as the durable fence even where the in-process coordinator applies. Ensure loss finalization, import, and cleanup compare source/identity/evidence generations. Re-run race and ownership tests repeatedly.
 
-- [ ] **Step 6: Run impacted-test verification**
+- [x] **Step 6: Run impacted-test verification**
 
-Run: `cargo test -p freshell-supervisor && cargo test -p freshell-agent-runtime`
+Run: `cargo test -p freshell-supervisor && cargo test -p freshell-agent-runtime && cargo test -p freshell-sessions`
 
 Expected: PASS for existing loss certificates, retries, stop semantics, provider inventories, and import readiness.
 
-- [ ] **Step 7: Commit the task**
+- [x] **Step 7: Commit the task**
 
 ```bash
 git add crates/freshell-supervisor crates/freshell-agent-runtime/src/lib.rs docs/development/runtime-provider-capabilities.json
@@ -373,7 +373,7 @@ Remove temporary test-only hooks and duplicated fixture setup. Confirm false inc
 
 Run: `FRESHELL_TEST_SUMMARY='managed OpenCode session recovery full gate' GCLOUD_ROBOT_REQUIRE=1 pnpm run test`
 
-Expected: PASS for coordinated client, Rust, and Electron coverage. Then run the affected Playwright spec on the configured cloud backend as required by the repo PR gate: `FRESHELL_TEST_SUMMARY='managed OpenCode source-to-soul resume cloud' GCLOUD_ROBOT_REQUIRE=1 pnpm run test:e2e:cloud --project=rust-chromium --grep='managed OpenCode source-to-soul resume' test/e2e-browser/specs/runtime-provider-resurrection-rust.spec.ts`.
+Expected: PASS for coordinated client, Rust, and Electron coverage. The affected managed-runtime Playwright spec is excluded from Cloud Run and uses a local Docker-backed rig; do not use the invalid `rust-chromium` Cloud project or silently substitute a local run. Once the user approves the one-time local synthetic run, use `FRESHELL_TEST_SUMMARY='managed OpenCode source-to-soul resume local' pnpm run test:e2e:local --project=chromium --grep='managed OpenCode source-to-soul resume' test/e2e-browser/specs/runtime-provider-resurrection-rust.spec.ts` and preserve the configured cloud backend for all other lanes.
 
 - [ ] **Step 7: Commit the task**
 
