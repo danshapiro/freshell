@@ -7,31 +7,820 @@
 //! for a failed native resume.
 
 use crate::{
-    backend::{BackendError, BackendRuntimeState},
+    backend::{BackendError, BackendRuntimeState, StoppedOpenCodeRepairReceipts},
     checkpoints,
     loss_report::{
         hash_loss_certificate, path_name, IncidentExporter, LossDecisionInput, LostDecision,
     },
     registry::{
         NativeImportState, OwnedRuntimeHandle, RecoveryContext, RecoveryWriteFence, RegistryError,
+        StoppedRepairOwnerCandidate, StoppedRepairRootReceipt,
     },
     resume_catalog,
     service::{LaunchWorkload, Supervisor},
 };
 use freshell_agent_runtime::{classify_provider_failure, recovery_paths, verify_native_identity};
 use freshell_runtime_protocol::{
-    CommandState, DesiredState, EvidenceStoreState, HostCommand, HostResult, IncidentAnalysis,
-    IncidentTimelineEvent, LossBuildEvidence, LossCleanupReport, ManagedRolloutMode,
-    ReattachHandle, RecoverRequest, RecoveryAttemptId, RecoveryBlockReason,
-    RecoveryEvidenceVerdict, RecoveryOutcome, RecoveryPath, RecoveryPathEvidence, RecoveryProbe,
-    RecoveryResult, RecoveryTrigger, RetryHint, RuntimeError, RuntimeErrorCode, RuntimeView,
-    SoulId, StopOutcome, TerminalLaunchSpec, CONTROL_PROTOCOL_VERSION,
+    opencode_target_build_receipt, opencode_transfer_bundle_digest, CleanupState, CommandState,
+    DesiredState, EvidenceStoreState, HostCommand, HostResult, IncidentAnalysis,
+    IncidentTimelineEvent, LaunchState, LossBuildEvidence, LossCleanupReport, ManagedRolloutMode,
+    OpenCodeTransferChunk, OpenCodeTransferDescriptor, OpenCodeTransferFile, ReattachHandle,
+    RecoverRequest, RecoveryAttemptId, RecoveryBlockReason, RecoveryEvidenceVerdict,
+    RecoveryOutcome, RecoveryPath, RecoveryPathEvidence, RecoveryProbe, RecoveryResult,
+    RecoveryTrigger, RestoreLostSoulRootResult, RestoreLostSoulsRequest, RestoreLostSoulsResult,
+    RetryHint, RootRepairImportStatus, RuntimeError, RuntimeErrorCode, RuntimeView, SoulId,
+    SoulRepairStatus, StopOutcome, TerminalLaunchSpec, CONTROL_PROTOCOL_VERSION,
+    MAX_OPENCODE_TRANSFER_BUNDLE_BYTES, MAX_OPENCODE_TRANSFER_CHUNK_BYTES,
+    OPENCODE_TRANSFER_DESTINATION_DB,
 };
-use freshell_sessions::opencode_transfer::HostOpenCodeInventory;
+use freshell_sessions::opencode_transfer::{
+    export_exact_session, ExportOptions, HostOpenCodeInventory, OpenCodeNativeSnapshot,
+};
 use sha2::{Digest, Sha256};
+use std::{
+    collections::BTreeMap,
+    io::Read,
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 use tokio::time::{sleep, Duration, Instant};
 
+fn choose_canonical_root_owner<'a>(
+    candidates: &'a [StoppedRepairOwnerCandidate],
+    source_store_id: &str,
+    root_session_id: &str,
+    source_generation: &str,
+) -> Result<&'a StoppedRepairOwnerCandidate, String> {
+    let candidates = candidates
+        .iter()
+        .filter(|candidate| candidate.native_import_authority != "retired_duplicate")
+        .collect::<Vec<_>>();
+    if candidates.is_empty() {
+        return Err("native root has no managed owner candidate".into());
+    }
+    let incompatible_receipt = candidates.iter().any(|candidate| {
+        candidate.native_import_state == NativeImportState::Completed
+            && candidate.native_import_authority == "verified_import_receipt"
+            && candidate.root_session_id.as_deref() == Some(root_session_id)
+            && (candidate.source_store_id.as_deref() != Some(source_store_id)
+                || candidate.source_generation.as_deref() != Some(source_generation))
+    });
+    if incompatible_receipt {
+        return Err("native root has a conflicting import receipt generation".into());
+    }
+    let receipts = candidates
+        .iter()
+        .filter(|candidate| {
+            candidate.native_import_state == NativeImportState::Completed
+                && candidate.native_import_authority == "verified_import_receipt"
+                && candidate.source_store_id.as_deref() == Some(source_store_id)
+                && candidate.root_session_id.as_deref() == Some(root_session_id)
+                && candidate.source_generation.as_deref() == Some(source_generation)
+        })
+        .collect::<Vec<_>>();
+    if let [owner] = receipts.as_slice() {
+        return Ok(*owner);
+    }
+    if receipts.len() > 1 {
+        return Err("multiple souls have the exact native import receipt".into());
+    }
+
+    let explicit = candidates
+        .iter()
+        .filter(|candidate| candidate.explicit_view_count > 0)
+        .collect::<Vec<_>>();
+    if let [owner] = explicit.as_slice() {
+        return Ok(*owner);
+    }
+    if explicit.len() > 1 {
+        return Err("native root has explicit views under multiple souls".into());
+    }
+
+    let max_revision = candidates
+        .iter()
+        .map(|candidate| {
+            (
+                candidate.identity_revision,
+                candidate.native_import_revision,
+                candidate.intent_revision,
+            )
+        })
+        .max()
+        .expect("non-empty candidates");
+    let owners = candidates
+        .iter()
+        .filter(|candidate| {
+            (
+                candidate.identity_revision,
+                candidate.native_import_revision,
+                candidate.intent_revision,
+            ) == max_revision
+        })
+        .collect::<Vec<_>>();
+    if let [owner] = owners.as_slice() {
+        return Ok(*owner);
+    }
+    Err("native root owner is ambiguous from exact durable metadata".into())
+}
+
+fn is_lower_hex_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn stopped_repair_blocked(reason_code: &'static str) -> RuntimeError {
+    RuntimeError::new(
+        RuntimeErrorCode::RecoveryBlocked,
+        format!("stopped OpenCode repair is pending ({reason_code})"),
+    )
+}
+
+fn pending_stopped_repair_result(
+    operation_id: freshell_runtime_protocol::RequestId,
+    target_count: usize,
+    progress: BTreeMap<String, RestoreLostSoulRootResult>,
+) -> RestoreLostSoulsResult {
+    RestoreLostSoulsResult {
+        operation_id,
+        status: SoulRepairStatus::Pending,
+        repaired_target_count: 0,
+        total_target_count: target_count as u32,
+        roots: progress.into_values().collect(),
+    }
+}
+
+fn stopped_repair_transfer_id(
+    operation_id: &freshell_runtime_protocol::RequestId,
+    root_session_id: &str,
+    source_generation: &str,
+    canonical_soul_id: &SoulId,
+) -> String {
+    let input = format!(
+        "{}\0{}\0{}\0{}",
+        operation_id, root_session_id, source_generation, canonical_soul_id
+    );
+    let digest = format!("{:x}", Sha256::digest(input.as_bytes()));
+    format!("stopped-repair-{}", &digest[..48])
+}
+
+fn same_stopped_repair_context(captured: &RecoveryContext, current: &RecoveryContext) -> bool {
+    captured.soul_id == current.soul_id
+        && captured.provider == current.provider
+        && captured.provider_store_id == current.provider_store_id
+        && captured.native_session_id == current.native_session_id
+        && captured.native_import_revision == current.native_import_revision
+        && captured.native_import_state == current.native_import_state
+        && captured.native_import_source_store_id == current.native_import_source_store_id
+        && captured.native_import_root_session_id == current.native_import_root_session_id
+        && captured.native_import_source_generation == current.native_import_source_generation
+        && captured.native_import_schema_fingerprint == current.native_import_schema_fingerprint
+        && captured.native_import_migration_fingerprint
+            == current.native_import_migration_fingerprint
+        && captured.native_import_complete_inventory == current.native_import_complete_inventory
+        && captured.native_import_authority == current.native_import_authority
+        && captured.identity_revision == current.identity_revision
+        && captured.evidence_revision == current.evidence_revision
+        && captured.intent_revision == current.intent_revision
+        && captured.desired_state == current.desired_state
+        && captured.recovery_state == current.recovery_state
+        && captured.control_epoch == current.control_epoch
+        && captured.terminal == current.terminal
+        && captured.prior_handle.incarnation_id() == current.prior_handle.incarnation_id()
+        && captured.prior_handle.soul_id() == current.prior_handle.soul_id()
+        && captured.prior_handle.provider_store_id() == current.prior_handle.provider_store_id()
+        && captured.prior_handle.daemon_id() == current.prior_handle.daemon_id()
+        && captured.prior_handle.container_id() == current.prior_handle.container_id()
+        && captured.prior_handle.image_ref() == current.prior_handle.image_ref()
+}
+
+fn stopped_repair_execution_generation(
+    views: &[RuntimeView],
+    context: &RecoveryContext,
+) -> Result<u64, ()> {
+    let incarnation_id = context.prior_handle.incarnation_id();
+    let old = views
+        .iter()
+        .find(|view| view.soul_id == context.soul_id && &view.incarnation_id == incarnation_id)
+        .ok_or(())?;
+    if old.launch_state != LaunchState::Stopped || old.cleanup_state != CleanupState::VerifiedEmpty
+    {
+        return Err(());
+    }
+    if views.iter().any(|view| {
+        view.soul_id == context.soul_id
+            && view.incarnation_id != *incarnation_id
+            && view.launch_state.is_potentially_active()
+    }) {
+        return Err(());
+    }
+    Ok(old.execution_generation)
+}
+
+fn stage_snapshot_payload(
+    snapshot: &OpenCodeNativeSnapshot,
+    descriptor: &OpenCodeTransferDescriptor,
+    attempt_id: &str,
+    staging: &crate::opencode_transfer::OpenCodeTransferStaging,
+) -> Result<(), String> {
+    let file = descriptor
+        .files
+        .first()
+        .ok_or_else(|| "stopped repair has no payload file".to_string())?;
+    let mut payload = snapshot
+        .open_payload()
+        .map_err(|_| "source payload cannot be reopened".to_string())?;
+    let mut offset = 0_u64;
+    let mut sequence = 0_u64;
+    while offset < file.size_bytes {
+        let chunk_size =
+            (file.size_bytes - offset).min(MAX_OPENCODE_TRANSFER_CHUNK_BYTES as u64) as usize;
+        let mut data = vec![0; chunk_size];
+        payload
+            .read_exact(&mut data)
+            .map_err(|_| "source payload ended before its manifest size".to_string())?;
+        let sha256 = format!("{:x}", Sha256::digest(&data));
+        let chunk = OpenCodeTransferChunk {
+            transfer_id: descriptor.transfer_id.clone(),
+            attempt_id: attempt_id.into(),
+            sequence,
+            file_index: file.index,
+            offset,
+            sha256,
+            data,
+        };
+        staging
+            .write_chunk(&chunk)
+            .map_err(|_| "stopped repair staging rejected a payload chunk".to_string())?;
+        offset += chunk_size as u64;
+        sequence += 1;
+    }
+    let mut trailing = [0];
+    if payload
+        .read(&mut trailing)
+        .map_err(|_| "source payload trailing check failed".to_string())?
+        != 0
+    {
+        return Err("source payload exceeds its manifest size".into());
+    }
+    Ok(())
+}
+
+fn verified_stopped_repair_receipt(
+    context: &RecoveryContext,
+    descriptor: &OpenCodeTransferDescriptor,
+    manifest: &freshell_sessions::opencode_transfer::OpenCodeTransferManifest,
+    receipts: &StoppedOpenCodeRepairReceipts,
+    execution_generation: u64,
+) -> Result<StoppedRepairRootReceipt, ()> {
+    let imported = &receipts.imported;
+    let readable = &receipts.readable;
+    let terminal = context.terminal.as_ref().ok_or(())?;
+    let cwd = Path::new(&terminal.cwd).canonicalize().map_err(|_| ())?;
+    let workspace = Path::new(&terminal.workspace_path)
+        .canonicalize()
+        .map_err(|_| ())?;
+    if !cwd.starts_with(&workspace)
+        || imported.version != 1
+        || imported.transfer_id != descriptor.transfer_id
+        || imported.destination_store_id != descriptor.destination_store_id
+        || imported.destination_database_path != descriptor.destination_database_path
+        || imported.root_session_id != descriptor.root_session_id
+        || imported.source_store_id != descriptor.source_store_id
+        || imported.source_generation != descriptor.source_generation
+        || imported.source_schema_fingerprint != descriptor.source_schema_fingerprint
+        || imported.migration_journal_fingerprint != descriptor.migration_journal_fingerprint
+        || imported.target_image_ref != descriptor.target_image_ref
+        || imported.target_build_receipt != descriptor.target_build_receipt
+        || imported.bundle_sha256 != descriptor.bundle_sha256
+        || imported.row_count != manifest.row_count as u64
+        || imported.asset_count != manifest.assets.len() as u64
+        || imported.structural_sha256.is_empty()
+        || readable.version != 1
+        || readable.transfer_id != descriptor.transfer_id
+        || readable.destination_store_id != descriptor.destination_store_id
+        || readable.root_session_id != descriptor.root_session_id
+        || readable.source_generation != descriptor.source_generation
+        || readable.target_image_ref != descriptor.target_image_ref
+        || readable.target_build_receipt != descriptor.target_build_receipt
+        || readable.provider_uid != terminal.run_as_uid
+        || readable.provider_gid != terminal.run_as_gid
+        || readable.home != "/home/freshell/provider"
+        || readable.xdg_data_home != "/home/freshell/provider/.local/share"
+        || readable.xdg_config_home != "/home/freshell/provider/.config"
+        || readable.opencode_db != "/home/freshell/provider/.local/share/opencode/opencode.db"
+        || readable.cwd != cwd.to_string_lossy()
+        || readable.row_count != imported.row_count
+        || readable.asset_count != imported.asset_count
+        || readable.structural_sha256 != imported.structural_sha256
+        || !is_lower_hex_sha256(&imported.structural_sha256)
+    {
+        return Err(());
+    }
+    let environment_receipt = serde_json::to_vec(&serde_json::json!({
+        "providerUid": readable.provider_uid,
+        "providerGid": readable.provider_gid,
+        "home": readable.home,
+        "xdgDataHome": readable.xdg_data_home,
+        "xdgConfigHome": readable.xdg_config_home,
+        "opencodeDb": readable.opencode_db,
+        "cwd": readable.cwd,
+    }))
+    .map_err(|_| ())?;
+    let reader_environment_sha256 = format!("{:x}", Sha256::digest(environment_receipt));
+    Ok(StoppedRepairRootReceipt {
+        root_session_id: descriptor.root_session_id.clone(),
+        canonical_soul_id: context.soul_id.clone(),
+        transfer_id: descriptor.transfer_id.clone(),
+        destination_store_id: descriptor.destination_store_id.clone(),
+        source_store_id: descriptor.source_store_id.clone(),
+        source_generation: descriptor.source_generation.clone(),
+        bundle_sha256: descriptor.bundle_sha256.clone(),
+        source_schema_fingerprint: descriptor.source_schema_fingerprint.clone(),
+        migration_journal_fingerprint: descriptor.migration_journal_fingerprint.clone(),
+        target_image_ref: descriptor.target_image_ref.clone(),
+        target_build_receipt: descriptor.target_build_receipt.clone(),
+        row_count: imported.row_count,
+        asset_count: imported.asset_count,
+        structural_sha256: imported.structural_sha256.clone(),
+        provider_uid: readable.provider_uid,
+        provider_gid: readable.provider_gid,
+        reader_environment_sha256,
+        captured_identity_revision: context.identity_revision,
+        captured_evidence_revision: context.evidence_revision,
+        captured_intent_revision: context.intent_revision,
+        captured_native_import_revision: context.native_import_revision,
+        captured_native_import_state: context.native_import_state.as_str().into(),
+        captured_native_import_authority: context.native_import_authority.clone(),
+        incarnation_id: context.prior_handle.incarnation_id().clone(),
+        execution_generation,
+    })
+}
+
 impl Supervisor {
+    pub(crate) async fn restore_lost_souls(
+        &self,
+        operation_id: freshell_runtime_protocol::RequestId,
+        request: RestoreLostSoulsRequest,
+    ) -> Result<RestoreLostSoulsResult, RuntimeError> {
+        request.validate_exact_batch()?;
+        let targets = request.targets.clone();
+        let operation = self
+            .registry
+            .prepare_stopped_repair_operation(operation_id.clone(), request)
+            .await
+            .map_err(map_registry)?;
+        if operation.status == "complete" {
+            return operation
+                .result_json
+                .as_deref()
+                .ok_or_else(|| {
+                    RuntimeError::new(
+                        RuntimeErrorCode::RegistryFailure,
+                        "completed stopped-repair operation has no persisted result",
+                    )
+                })
+                .and_then(|encoded| {
+                    serde_json::from_str(encoded).map_err(|error| {
+                        RuntimeError::new(
+                            RuntimeErrorCode::RegistryFailure,
+                            format!("completed stopped-repair result is invalid: {error}"),
+                        )
+                    })
+                });
+        }
+
+        if operation.status == "withdraw_pending" {
+            let roots = self
+                .registry
+                .stopped_repair_root_receipts(operation_id.clone())
+                .await
+                .map_err(map_registry)?;
+            return self
+                .finalize_stopped_repair_batch(
+                    operation_id,
+                    targets,
+                    roots,
+                    self.registry.registry_root().join("incidents"),
+                    self.config.lifecycle_log.clone(),
+                )
+                .await
+                .map_err(map_registry);
+        }
+
+        let mut soul_ids = targets
+            .iter()
+            .map(|target| target.soul_id.clone())
+            .collect::<Vec<_>>();
+        soul_ids.sort_by(|left, right| left.as_str().cmp(right.as_str()));
+        soul_ids.dedup();
+        let mut lifecycle_locks = Vec::with_capacity(soul_ids.len());
+        for soul_id in &soul_ids {
+            lifecycle_locks.push(self.lifecycle_lock(soul_id).await);
+        }
+        let mut _repair_guards = Vec::with_capacity(lifecycle_locks.len());
+        for lifecycle_lock in lifecycle_locks {
+            _repair_guards.push(lifecycle_lock.lock_owned().await);
+        }
+
+        let mut groups = BTreeMap::<
+            String,
+            Vec<(
+                freshell_runtime_protocol::LostSoulRepairTarget,
+                RecoveryContext,
+            )>,
+        >::new();
+        for target in &targets {
+            let context = self
+                .registry
+                .recovery_context(target.soul_id.clone())
+                .await
+                .map_err(map_registry)?;
+            if context.intent_revision != target.expected_intent_revision {
+                return Err(map_registry(RegistryError::StaleIntentRevision {
+                    expected: target.expected_intent_revision,
+                    current: context.intent_revision,
+                }));
+            }
+            let root = context
+                .native_import_root_session_id
+                .as_deref()
+                .or(context.native_session_id.as_deref())
+                .filter(|root| !root.is_empty())
+                .ok_or_else(|| {
+                    RuntimeError::new(
+                        RuntimeErrorCode::RecoveryBlocked,
+                        "stopped OpenCode repair target has no exact native root identifier",
+                    )
+                })?
+                .to_string();
+            groups
+                .entry(root)
+                .or_default()
+                .push((target.clone(), context));
+        }
+
+        let mut progress = groups
+            .iter()
+            .map(|(root, _)| {
+                (
+                    root.clone(),
+                    RestoreLostSoulRootResult {
+                        root_session_id: root.clone(),
+                        canonical_soul_id: None,
+                        import_status: RootRepairImportStatus::Pending,
+                        intent_revision: None,
+                        native_import_revision: None,
+                    },
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        if groups.len() != 7 {
+            return Ok(pending_stopped_repair_result(
+                operation_id,
+                targets.len(),
+                progress,
+            ));
+        }
+
+        let inventory = match tokio::task::spawn_blocking(
+            HostOpenCodeInventory::from_process_environment_discovering_channels,
+        )
+        .await
+        {
+            Ok(Ok(inventory)) => inventory,
+            _ => {
+                return Ok(pending_stopped_repair_result(
+                    operation_id,
+                    targets.len(),
+                    progress,
+                ))
+            }
+        };
+
+        let mut verified_roots = Vec::with_capacity(groups.len());
+        for (root, target_contexts) in &groups {
+            match self
+                .repair_stopped_opencode_root(
+                    &operation_id,
+                    root,
+                    target_contexts,
+                    &inventory,
+                    &targets,
+                )
+                .await
+            {
+                Ok((target, receipt)) => {
+                    progress.insert(
+                        root.clone(),
+                        RestoreLostSoulRootResult {
+                            root_session_id: root.clone(),
+                            canonical_soul_id: Some(target.soul_id.clone()),
+                            import_status: RootRepairImportStatus::ProviderReadable,
+                            intent_revision: Some(target.expected_intent_revision),
+                            native_import_revision: Some(receipt.captured_native_import_revision),
+                        },
+                    );
+                    verified_roots.push(receipt);
+                }
+                Err(error) if error.code == RuntimeErrorCode::StaleIntentRevision => {
+                    return Err(error);
+                }
+                Err(_) => {
+                    return Ok(pending_stopped_repair_result(
+                        operation_id,
+                        targets.len(),
+                        progress,
+                    ));
+                }
+            }
+        }
+        let receipts = self
+            .registry
+            .stopped_repair_root_receipts(operation_id.clone())
+            .await
+            .map_err(map_registry)?;
+        if receipts.len() != 7
+            || receipts
+                .iter()
+                .any(|receipt| !verified_roots.iter().any(|current| current == receipt))
+        {
+            return Ok(pending_stopped_repair_result(
+                operation_id,
+                targets.len(),
+                progress,
+            ));
+        }
+        self.finalize_stopped_repair_batch(
+            operation_id,
+            targets,
+            receipts,
+            self.registry.registry_root().join("incidents"),
+            self.config.lifecycle_log.clone(),
+        )
+        .await
+        .map_err(map_registry)
+    }
+
+    async fn repair_stopped_opencode_root(
+        &self,
+        operation_id: &freshell_runtime_protocol::RequestId,
+        root_session_id: &str,
+        target_contexts: &[(
+            freshell_runtime_protocol::LostSoulRepairTarget,
+            RecoveryContext,
+        )],
+        inventory: &HostOpenCodeInventory,
+        all_targets: &[freshell_runtime_protocol::LostSoulRepairTarget],
+    ) -> Result<
+        (
+            freshell_runtime_protocol::LostSoulRepairTarget,
+            StoppedRepairRootReceipt,
+        ),
+        RuntimeError,
+    > {
+        let mut trusted_workspaces = Vec::<PathBuf>::new();
+        for (_, context) in target_contexts {
+            let workspace = context
+                .terminal
+                .as_ref()
+                .map(|terminal| PathBuf::from(&terminal.workspace_path))
+                .ok_or_else(|| stopped_repair_blocked("terminal_workspace_missing"))?
+                .canonicalize()
+                .map_err(|_| stopped_repair_blocked("terminal_workspace_missing"))?;
+            if !trusted_workspaces.contains(&workspace) {
+                trusted_workspaces.push(workspace);
+            }
+        }
+        let extraction_root = self
+            .config
+            .runtime_root
+            .join("stopped-opencode-repair-extractions");
+        let source_inventory = trusted_workspaces
+            .into_iter()
+            .fold(inventory.clone(), |inventory, workspace| {
+                inventory.with_trusted_mount_for_selected_session(workspace)
+            });
+        let root = root_session_id.to_string();
+        let snapshot = tokio::task::spawn_blocking(move || {
+            export_exact_session(
+                &source_inventory,
+                &root,
+                ExportOptions::new(extraction_root),
+            )
+        })
+        .await
+        .map_err(|_| stopped_repair_blocked("source_export_worker_failed"))?
+        .map_err(|_| stopped_repair_blocked("source_not_exactly_resolvable"))?;
+        let manifest = snapshot.manifest().clone();
+        if manifest.root_session_id != root_session_id
+            || manifest.provider_schema != "opencode-1.18.21"
+            || manifest.payload_bytes == 0
+            || manifest.payload_bytes > MAX_OPENCODE_TRANSFER_BUNDLE_BYTES
+            || manifest.row_count == 0
+        {
+            return Err(stopped_repair_blocked("source_bundle_preflight_failed"));
+        }
+        let owner_candidates = self
+            .registry
+            .stopped_repair_owner_candidates(root_session_id.to_string())
+            .await
+            .map_err(map_registry)?;
+        let canonical = choose_canonical_root_owner(
+            &owner_candidates,
+            &manifest.source_store_id,
+            root_session_id,
+            &manifest.generation,
+        )
+        .map_err(|_| stopped_repair_blocked("canonical_owner_ambiguous"))?;
+        if !all_targets
+            .iter()
+            .any(|target| target.soul_id == canonical.soul_id)
+        {
+            return Err(stopped_repair_blocked(
+                "canonical_owner_outside_exact_batch",
+            ));
+        }
+        let (target, captured) = target_contexts
+            .iter()
+            .find(|(target, _)| target.soul_id == canonical.soul_id)
+            .ok_or_else(|| stopped_repair_blocked("canonical_owner_has_no_loss_target"))?;
+        let fresh = self
+            .registry
+            .recovery_context(canonical.soul_id.clone())
+            .await
+            .map_err(map_registry)?;
+        if !same_stopped_repair_context(captured, &fresh) {
+            return Err(stopped_repair_blocked(
+                "target_generation_changed_before_import",
+            ));
+        }
+        if captured.terminal.is_none() {
+            return Err(stopped_repair_blocked("terminal_workspace_missing"));
+        }
+        let transfer_id = stopped_repair_transfer_id(
+            operation_id,
+            root_session_id,
+            &manifest.generation,
+            &canonical.soul_id,
+        );
+        let files = vec![OpenCodeTransferFile {
+            index: 0,
+            relative_path: "payload.json".into(),
+            size_bytes: manifest.payload_bytes,
+            sha256: manifest.payload_sha256.clone(),
+        }];
+        let manifest_json = serde_json::to_string(&manifest)
+            .map_err(|_| stopped_repair_blocked("source_manifest_invalid"))?;
+        let target_image_ref = captured.prior_handle.image_ref().to_string();
+        let mut descriptor = OpenCodeTransferDescriptor {
+            transfer_id: transfer_id.clone(),
+            provider: "opencode".into(),
+            source_store_id: manifest.source_store_id.clone(),
+            root_session_id: root_session_id.into(),
+            source_generation: manifest.generation.clone(),
+            provider_schema: manifest.provider_schema.clone(),
+            source_schema_fingerprint: manifest.source_schema_fingerprint.clone(),
+            migration_journal_fingerprint: manifest.migration_journal_fingerprint.clone(),
+            destination_store_id: captured.provider_store_id.clone(),
+            destination_database_path: OPENCODE_TRANSFER_DESTINATION_DB.into(),
+            target_build_receipt: opencode_target_build_receipt(
+                &target_image_ref,
+                &manifest.provider_schema,
+            ),
+            target_image_ref,
+            incarnation_id: captured.prior_handle.incarnation_id().to_string(),
+            manifest_json,
+            files,
+            total_bytes: manifest.payload_bytes,
+            bundle_sha256: String::new(),
+        };
+        descriptor.bundle_sha256 =
+            opencode_transfer_bundle_digest(&descriptor.manifest_json, &descriptor.files);
+        descriptor
+            .validate()
+            .map_err(|_| stopped_repair_blocked("source_bundle_descriptor_invalid"))?;
+
+        let attempt_id = uuid::Uuid::new_v4().simple().to_string();
+        let staging = &self.opencode_transfer_staging;
+        let mut lifecycle_guard = Some(
+            Arc::clone(&self.opencode_transfer_lifecycle_lock)
+                .lock_owned()
+                .await,
+        );
+        let begin = staging
+            .begin_from_filesystem(&descriptor, &attempt_id)
+            .map_err(|_| stopped_repair_blocked("staging_capacity_or_state"))?;
+        if matches!(begin, crate::opencode_transfer::StagingStart::Queued) {
+            drop(lifecycle_guard.take());
+            match staging
+                .wait_for_capacity(&transfer_id, &attempt_id)
+                .await
+                .map_err(|_| stopped_repair_blocked("staging_capacity_or_state"))?
+            {
+                crate::opencode_transfer::StagingStart::Started { .. } => {
+                    lifecycle_guard = Some(
+                        Arc::clone(&self.opencode_transfer_lifecycle_lock)
+                            .lock_owned()
+                            .await,
+                    );
+                }
+                crate::opencode_transfer::StagingStart::Queued => {
+                    return Err(stopped_repair_blocked("staging_capacity_or_state"));
+                }
+            }
+        }
+        if let Err(_) = stage_snapshot_payload(&snapshot, &descriptor, &attempt_id, staging) {
+            if let Some(_guard) = lifecycle_guard.take() {
+                let _ = staging.abort(&transfer_id, &attempt_id);
+            }
+            return Err(stopped_repair_blocked("staging_write_failed"));
+        }
+        let ready_dir = match staging
+            .finalize(&transfer_id, &attempt_id)
+            .and_then(|_| staging.verify_ready(&descriptor))
+        {
+            Ok(path) => path,
+            Err(_) => {
+                if let Some(_guard) = lifecycle_guard.take() {
+                    let _ = staging.abort(&transfer_id, &attempt_id);
+                }
+                return Err(stopped_repair_blocked("staging_finalize_failed"));
+            }
+        };
+        let fresh_before_helper = self
+            .registry
+            .recovery_context(canonical.soul_id.clone())
+            .await
+            .map_err(map_registry)?;
+        if !same_stopped_repair_context(captured, &fresh_before_helper) {
+            let _ = staging.abort(&transfer_id, &attempt_id);
+            return Err(stopped_repair_blocked(
+                "target_generation_changed_before_import",
+            ));
+        }
+        let before_helper_views = self.registry.inventory().await.map_err(map_registry)?;
+        let execution_generation =
+            stopped_repair_execution_generation(&before_helper_views, captured)
+                .map_err(|_| stopped_repair_blocked("old_cleanup_not_settled"))?;
+        let receipts = match self
+            .backend
+            .repair_stopped_opencode(&captured.prior_handle, &descriptor, &ready_dir)
+            .await
+        {
+            Ok(receipts) => receipts,
+            Err(_) => {
+                let _ = staging.abort(&transfer_id, &attempt_id);
+                return Err(stopped_repair_blocked("provider_reader_or_import_failed"));
+            }
+        };
+        let after_helper_views = self.registry.inventory().await.map_err(map_registry)?;
+        if stopped_repair_execution_generation(&after_helper_views, captured)
+            .map_err(|_| stopped_repair_blocked("old_cleanup_generation_changed"))?
+            != execution_generation
+        {
+            let _ = staging.abort(&transfer_id, &attempt_id);
+            return Err(stopped_repair_blocked("old_cleanup_generation_changed"));
+        }
+        let summary = match verified_stopped_repair_receipt(
+            captured,
+            &descriptor,
+            &manifest,
+            &receipts,
+            execution_generation,
+        ) {
+            Ok(summary) => summary,
+            Err(_) => {
+                let _ = staging.abort(&transfer_id, &attempt_id);
+                return Err(stopped_repair_blocked("provider_reader_receipt_mismatch"));
+            }
+        };
+        self.registry
+            .persist_stopped_repair_root_receipt(
+                operation_id.clone(),
+                target.clone(),
+                captured.clone(),
+                summary.clone(),
+            )
+            .await
+            .map_err(map_registry)?;
+        let _references = self
+            .registry
+            .opencode_transfer_stage_references()
+            .await
+            .map_err(map_registry)?;
+        let referenced = _references
+            .keys()
+            .cloned()
+            .collect::<std::collections::HashSet<_>>();
+        staging
+            .abort_with_references(&transfer_id, &attempt_id, &referenced)
+            .map_err(|_| stopped_repair_blocked("verified_stage_cleanup_pending"))?;
+        drop(lifecycle_guard.take());
+        Ok((target.clone(), summary))
+    }
+
     pub(crate) async fn probe_recovery(
         &self,
         soul_id: SoulId,
@@ -1253,7 +2042,8 @@ impl Supervisor {
                 )
             })?;
         drop(staging_guard);
-        crate::service::append_event(
+        if let Err(error) = crate::service::append_incident_event_if_current(
+            &self.registry,
             &self.config.lifecycle_log,
             "supervisor.loss.incident_committed",
             serde_json::json!({
@@ -1263,7 +2053,12 @@ impl Supervisor {
                 "cleanupTarget": prepared.certificate.cleanup_target.owned_handle_ref,
                 "foreignObjectsTouched": 0,
             }),
-        );
+            prepared.certificate.incident_id.clone(),
+        )
+        .await
+        {
+            tracing::warn!(incident_id=%prepared.certificate.incident_id, error=%error, "supervisor.loss.incident_committed_event_failed");
+        }
         crate::service::crash_if("after_loss_incident_commit");
         self.export_pending_incidents().await?;
 
@@ -1302,7 +2097,8 @@ impl Supervisor {
             .map_err(map_registry)?;
         crate::service::crash_if("after_loss_finalize_before_export");
         self.export_pending_incidents().await?;
-        crate::service::append_event(
+        if let Err(error) = crate::service::append_incident_event_if_current(
+            &self.registry,
             &self.config.lifecycle_log,
             "supervisor.loss.finalized",
             serde_json::json!({
@@ -1312,7 +2108,12 @@ impl Supervisor {
                 "cleanupOutcome": outcome,
                 "foreignObjectsTouched": 0,
             }),
-        );
+            incident_id.clone(),
+        )
+        .await
+        {
+            tracing::warn!(incident_id=%incident_id, error=%error, "supervisor.loss.finalized_event_failed");
+        }
         Ok(RecoveryResult {
             outcome: RecoveryOutcome::Lost,
             view: self.view_for(prepared.handle.incarnation_id()).await?,
@@ -1726,7 +2527,8 @@ impl Supervisor {
                 .finalize_loss_cleanup(incident_id.clone(), outcome, cleanup)
                 .await
                 .map_err(map_registry)?;
-            crate::service::append_event(
+            if let Err(error) = crate::service::append_incident_event_if_current(
+                &self.registry,
                 &self.config.lifecycle_log,
                 "supervisor.loss.startup_cleanup_resumed",
                 serde_json::json!({
@@ -1734,13 +2536,19 @@ impl Supervisor {
                     "soulId": certificate.soul_id,
                     "cleanupOutcome": outcome,
                 }),
-            );
+                incident_id.clone(),
+            )
+            .await
+            {
+                tracing::warn!(incident_id=%incident_id, error=%error, "supervisor.loss.startup_cleanup_event_failed");
+            }
         }
         self.export_pending_incidents().await?;
         Ok(())
     }
 
     pub(crate) async fn export_pending_incidents(&self) -> Result<(), RuntimeError> {
+        self.resume_pending_stopped_repair_withdrawals().await?;
         let exports = match self.registry.pending_incident_exports(100).await {
             Ok(exports) => exports,
             Err(error) => {
@@ -1768,42 +2576,16 @@ impl Supervisor {
             #[cfg(not(feature = "runtime-test-faults"))]
             let injected_export_failure = false;
             let result = if injected_export_failure {
-                Err(std::io::Error::other("injected incident export failure"))
-            } else if event.event_kind == "loss_incident.open" {
-                serde_json::from_value(event.payload.clone())
-                    .map_err(std::io::Error::other)
-                    .and_then(|certificate| exporter.export_certificate(&certificate))
-            } else if event.event_kind == "loss_incident.final" {
-                let closed = event
-                    .payload
-                    .get("cleanupState")
-                    .and_then(serde_json::Value::as_str)
-                    == Some("closed");
-                exporter.export_summary(&event.incident_id, closed, &event.payload)
+                Err("injected incident export failure".to_string())
             } else {
-                Err(std::io::Error::other(format!(
-                    "unsupported incident export kind {}",
-                    event.event_kind
-                )))
+                self.registry
+                    .export_and_ack_incident(event.clone(), exporter.clone())
+                    .await
+                    .map(|_| ())
+                    .map_err(|error| error.to_string())
             };
             match result {
-                Ok(path) => {
-                    if let Err(error) = self
-                        .registry
-                        .acknowledge_incident_export(event.event_id.clone())
-                        .await
-                    {
-                        crate::service::append_event(
-                            &self.config.lifecycle_log,
-                            "supervisor.loss.export_ack_failed",
-                            serde_json::json!({
-                                "incidentId": event.incident_id,
-                                "path": path,
-                                "error": error.to_string(),
-                            }),
-                        );
-                    }
-                }
+                Ok(()) => {}
                 Err(error) => {
                     // The SQLite incident/export intent is already durable,
                     // but destructive cleanup remains blocked until the
@@ -1813,7 +2595,8 @@ impl Supervisor {
                         "Freshell loss incident export pending for {}: {}",
                         event.incident_id, error
                     );
-                    crate::service::append_event(
+                    if let Err(logging_error) = crate::service::append_incident_event_if_current(
+                        &self.registry,
                         &self.config.lifecycle_log,
                         "supervisor.loss.export_failed",
                         serde_json::json!({
@@ -1821,7 +2604,12 @@ impl Supervisor {
                             "error": error.to_string(),
                             "retryPending": true,
                         }),
-                    );
+                        event.incident_id.clone(),
+                    )
+                    .await
+                    {
+                        tracing::warn!(incident_id=%event.incident_id, error=%logging_error, "supervisor.loss.export_failure_event_failed");
+                    }
                     return Err(RuntimeError::new(
                         RuntimeErrorCode::IncidentPersistenceFailed,
                         "durable incident artifact could not be persisted before cleanup",
@@ -1830,6 +2618,18 @@ impl Supervisor {
             }
         }
         Ok(())
+    }
+
+    pub(crate) async fn resume_pending_stopped_repair_withdrawals(
+        &self,
+    ) -> Result<(), RuntimeError> {
+        self.registry
+            .resume_pending_stopped_repair_withdrawals(
+                self.registry.registry_root().join("incidents"),
+                self.config.lifecycle_log.clone(),
+            )
+            .await
+            .map_err(map_registry)
     }
 
     async fn replay_queued_inputs(
@@ -2495,6 +3295,117 @@ fn map_registry(error: RegistryError) -> RuntimeError {
 pub(crate) mod tests {
     use super::*;
     use freshell_runtime_protocol::{FreshAgentLaunchSpec, FreshProvider, IncarnationId};
+
+    fn owner_candidate(id: &str) -> StoppedRepairOwnerCandidate {
+        StoppedRepairOwnerCandidate {
+            soul_id: SoulId::parse(id).unwrap(),
+            source_store_id: Some("source-store".into()),
+            root_session_id: Some("ses_exact".into()),
+            source_generation: Some("generation-exact".into()),
+            native_import_state: NativeImportState::Pending,
+            native_import_authority: "exact_source_snapshot".into(),
+            intent_revision: 2,
+            identity_revision: 1,
+            native_import_revision: 3,
+            explicit_view_count: 0,
+        }
+    }
+
+    #[test]
+    fn duplicate_root_owner_selection_uses_receipts_views_then_revision_and_blocks_ties() {
+        let mut candidates = vec![owner_candidate("soul-one"), owner_candidate("soul-two")];
+        candidates[0].native_import_state = NativeImportState::Completed;
+        candidates[0].native_import_authority = "verified_import_receipt".into();
+        assert_eq!(
+            choose_canonical_root_owner(
+                &candidates,
+                "source-store",
+                "ses_exact",
+                "generation-exact"
+            )
+            .unwrap()
+            .soul_id,
+            candidates[0].soul_id
+        );
+
+        candidates[0].native_import_state = NativeImportState::Pending;
+        candidates[0].native_import_authority = "exact_source_snapshot".into();
+        candidates[1].explicit_view_count = 1;
+        assert_eq!(
+            choose_canonical_root_owner(
+                &candidates,
+                "source-store",
+                "ses_exact",
+                "generation-exact"
+            )
+            .unwrap()
+            .soul_id,
+            candidates[1].soul_id
+        );
+
+        candidates[1].explicit_view_count = 0;
+        candidates[1].native_import_revision = 2;
+        assert_eq!(
+            choose_canonical_root_owner(
+                &candidates,
+                "source-store",
+                "ses_exact",
+                "generation-exact"
+            )
+            .unwrap()
+            .soul_id,
+            candidates[0].soul_id
+        );
+
+        candidates[1].native_import_revision = 3;
+        assert!(choose_canonical_root_owner(
+            &candidates,
+            "source-store",
+            "ses_exact",
+            "generation-exact"
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn duplicate_root_owner_selection_blocks_conflicting_receipt_generations() {
+        let mut candidates = vec![owner_candidate("soul-one"), owner_candidate("soul-two")];
+        candidates[0].native_import_state = NativeImportState::Completed;
+        candidates[0].native_import_authority = "verified_import_receipt".into();
+        candidates[0].source_generation = Some("generation-stale".into());
+        candidates[1].explicit_view_count = 1;
+        assert!(choose_canonical_root_owner(
+            &candidates,
+            "source-store",
+            "ses_exact",
+            "generation-exact"
+        )
+        .unwrap_err()
+        .contains("conflicting import receipt"));
+    }
+
+    #[test]
+    fn duplicate_root_owner_selection_ignores_retired_duplicate_authority() {
+        let mut candidates = vec![owner_candidate("canonical"), owner_candidate("retired")];
+        candidates[0].native_import_revision = 3;
+        candidates[1].native_import_state = NativeImportState::Completed;
+        candidates[1].native_import_authority = "retired_duplicate".into();
+        candidates[1].explicit_view_count = 9;
+        candidates[1].identity_revision = 99;
+        candidates[1].native_import_revision = 99;
+        candidates[1].intent_revision = 99;
+        assert_eq!(
+            choose_canonical_root_owner(
+                &candidates,
+                "source-store",
+                "ses_exact",
+                "generation-exact"
+            )
+            .unwrap()
+            .soul_id,
+            candidates[0].soul_id
+        );
+    }
 
     struct ObservedRuntime(BackendRuntimeState);
 

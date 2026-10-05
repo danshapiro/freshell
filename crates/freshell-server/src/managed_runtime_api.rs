@@ -18,10 +18,10 @@ use axum::{
 };
 use freshell_runtime_client::{ClientError, RuntimeClient};
 use freshell_runtime_protocol::{
-    DesiredState, IncidentId, ManagedRolloutMode, MigrationPlanRequest, NoticeDeliveryState,
-    NoticeId, RecoveryTrigger, RequestId, RuntimeInventorySnapshot, RuntimeLimits, RuntimeView,
-    SoulId, UpdateViewVisibilityRequest, UpsertViewIntentRequest, ViewIntent, ViewIntentId,
-    ViewIntentRequest, ViewProjectionEvent, ViewVisibilityIntent,
+    DesiredState, IncidentId, LostSoulRepairTarget, ManagedRolloutMode, MigrationPlanRequest,
+    NoticeDeliveryState, NoticeId, RecoveryTrigger, RequestId, RuntimeInventorySnapshot,
+    RuntimeLimits, RuntimeView, SoulId, UpdateViewVisibilityRequest, UpsertViewIntentRequest,
+    ViewIntent, ViewIntentId, ViewIntentRequest, ViewProjectionEvent, ViewVisibilityIntent,
 };
 use freshell_ws::pane_ledger::{BindingWrite, PaneLedger, ProvenancePolicy};
 use serde::{Deserialize, Serialize};
@@ -339,6 +339,7 @@ pub fn router(state: ManagedRuntimeApiState) -> Router {
         )
         .route("/api/runtime/souls/{soul_id}/retry", post(retry_soul))
         .route("/api/runtime/souls/{soul_id}/stop", post(stop_soul))
+        .route("/api/runtime/soul-loss-repairs", post(restore_lost_souls))
         .route("/api/runtime/souls/{soul_id}/limits", patch(update_limits))
         .route(
             "/api/runtime/incidents/{incident_id}/summary",
@@ -561,6 +562,42 @@ async fn stop_soul(
         .await
     {
         Ok((outcome, view)) => Json(json!({"outcome": outcome, "soul": view})).into_response(),
+        Err(error) => client_error(error),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct RestoreLostSoulsBody {
+    idempotency_key: String,
+    targets: Vec<LostSoulRepairTarget>,
+}
+
+async fn restore_lost_souls(
+    State(state): State<ManagedRuntimeApiState>,
+    headers: HeaderMap,
+    Json(body): Json<RestoreLostSoulsBody>,
+) -> Response {
+    if !is_authed(&headers, &state.auth_token) {
+        return unauthorized();
+    }
+    let request_id = match RequestId::parse(body.idempotency_key) {
+        Ok(request_id) => request_id,
+        Err(error) => return bad_request(error.to_string()),
+    };
+    let request = freshell_runtime_protocol::RestoreLostSoulsRequest {
+        targets: body.targets.clone(),
+        expected_control_epoch: None,
+    };
+    if let Err(error) = request.validate_exact_batch() {
+        return bad_request(error.message);
+    }
+    let client = match runtime_client(&state) {
+        Ok(client) => client,
+        Err(rejection) => return rejection.into_response(),
+    };
+    match client.restore_lost_souls(request_id, body.targets).await {
+        Ok(result) => Json(result).into_response(),
         Err(error) => client_error(error),
     }
 }

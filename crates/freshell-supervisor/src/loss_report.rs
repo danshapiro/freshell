@@ -29,9 +29,10 @@ use freshell_runtime_protocol::{
 use rusqlite::{params, OptionalExtension, TransactionBehavior};
 use sha2::{Digest, Sha256};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     fs,
     path::PathBuf,
+    sync::{Mutex, MutexGuard},
     time::{Duration, SystemTime},
 };
 
@@ -40,6 +41,102 @@ pub const INCIDENT_RETENTION_COUNT: usize = 1_000;
 pub const INCIDENT_RETENTION_BYTES: u64 = 100 * 1024 * 1024;
 pub const INCIDENT_LOG_MAX_BYTES: u64 = 10 * 1024 * 1024;
 pub const INCIDENT_LOG_BACKUPS: u32 = 4;
+
+static INCIDENT_FILE_COORDINATOR: Mutex<()> = Mutex::new(());
+
+pub(crate) fn incident_file_coordinator() -> MutexGuard<'static, ()> {
+    INCIDENT_FILE_COORDINATOR
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Remove only JSONL records that carry one of the exact incident IDs.
+///
+/// A malformed record cannot be classified without risking unrelated data,
+/// so it fails closed and leaves the caller's artifact untouched.
+pub(crate) fn filter_incident_jsonl(
+    bytes: &[u8],
+    incident_ids: &std::collections::BTreeSet<String>,
+) -> std::io::Result<Vec<u8>> {
+    use std::io::{Error, ErrorKind};
+
+    fn names_target_incident(value: &serde_json::Value, targets: &BTreeSet<String>) -> bool {
+        match value {
+            serde_json::Value::Object(object) => object.iter().any(|(key, value)| {
+                let is_singular = matches!(key.as_str(), "incidentId" | "incident_id");
+                let is_plural = matches!(key.as_str(), "incidentIds" | "incident_ids");
+                let direct_match = if is_singular {
+                    value.as_str().is_some_and(|value| targets.contains(value))
+                } else if is_plural {
+                    value.as_array().is_some_and(|values| {
+                        values
+                            .iter()
+                            .any(|value| value.as_str().is_some_and(|id| targets.contains(id)))
+                    })
+                } else {
+                    false
+                };
+                direct_match || names_target_incident(value, targets)
+            }),
+            serde_json::Value::Array(values) => values
+                .iter()
+                .any(|value| names_target_incident(value, targets)),
+            _ => false,
+        }
+    }
+
+    fn validate_incident_fields(value: &serde_json::Value) -> bool {
+        match value {
+            serde_json::Value::Object(object) => object.iter().all(|(key, value)| {
+                let valid_field = match key.as_str() {
+                    "incidentId" | "incident_id" => value.is_string(),
+                    "incidentIds" | "incident_ids" => value
+                        .as_array()
+                        .is_some_and(|values| values.iter().all(serde_json::Value::is_string)),
+                    _ => true,
+                };
+                valid_field && validate_incident_fields(value)
+            }),
+            serde_json::Value::Array(values) => values.iter().all(validate_incident_fields),
+            _ => true,
+        }
+    }
+
+    let mut filtered = Vec::with_capacity(bytes.len());
+    for (index, raw_line) in bytes.split_inclusive(|byte| *byte == b'\n').enumerate() {
+        let line = raw_line
+            .strip_suffix(b"\n")
+            .unwrap_or(raw_line)
+            .strip_suffix(b"\r")
+            .unwrap_or_else(|| raw_line.strip_suffix(b"\n").unwrap_or(raw_line));
+        if line.iter().all(u8::is_ascii_whitespace) {
+            filtered.extend_from_slice(raw_line);
+            continue;
+        }
+        let value: serde_json::Value = serde_json::from_slice(line).map_err(|error| {
+            Error::new(
+                ErrorKind::InvalidData,
+                format!(
+                    "incident JSONL record {} is unclassifiable: {error}",
+                    index + 1
+                ),
+            )
+        })?;
+        if !validate_incident_fields(&value) {
+            return Err(Error::new(
+                ErrorKind::InvalidData,
+                format!(
+                    "incident JSONL record {} has an invalid incident reference",
+                    index + 1
+                ),
+            ));
+        }
+        if !names_target_incident(&value, incident_ids) {
+            filtered.extend_from_slice(raw_line);
+        }
+    }
+    Ok(filtered)
+}
 
 #[derive(Debug, thiserror::Error, Clone, PartialEq, Eq)]
 pub enum LossDecisionError {
@@ -494,6 +591,14 @@ impl IncidentExporter {
         &self,
         certificate: &LostDecisionCertificate,
     ) -> std::io::Result<PathBuf> {
+        let _coordinator = incident_file_coordinator();
+        self.export_certificate_coordinated(certificate)
+    }
+
+    pub(crate) fn export_certificate_coordinated(
+        &self,
+        certificate: &LostDecisionCertificate,
+    ) -> std::io::Result<PathBuf> {
         fs::create_dir_all(&self.root)?;
         fs::set_permissions(&self.root, std::fs::Permissions::from_mode(0o700))?;
         let path = self
@@ -517,6 +622,16 @@ impl IncidentExporter {
         closed: bool,
         value: &T,
     ) -> std::io::Result<PathBuf> {
+        let _coordinator = incident_file_coordinator();
+        self.export_summary_coordinated(incident_id, closed, value)
+    }
+
+    pub(crate) fn export_summary_coordinated<T: serde::Serialize>(
+        &self,
+        incident_id: &IncidentId,
+        closed: bool,
+        value: &T,
+    ) -> std::io::Result<PathBuf> {
         fs::create_dir_all(&self.root)?;
         let suffix = if closed { "closed" } else { "open" };
         let target = self.root.join(format!("{incident_id}.{suffix}.json"));
@@ -529,13 +644,18 @@ impl IncidentExporter {
                 Err(error) => return Err(error),
             }
         }
-        self.enforce_retention()?;
+        self.enforce_retention_coordinated()?;
         Ok(target)
     }
 
     /// Enforce the closed-incident age/count/byte bounds. Open incidents have
     /// an `.open.json` suffix and are deliberately never considered here.
     pub fn enforce_retention(&self) -> std::io::Result<Vec<PathBuf>> {
+        let _coordinator = incident_file_coordinator();
+        self.enforce_retention_coordinated()
+    }
+
+    fn enforce_retention_coordinated(&self) -> std::io::Result<Vec<PathBuf>> {
         fs::create_dir_all(&self.root)?;
         let mut closed = fs::read_dir(&self.root)?
             .filter_map(Result::ok)
@@ -571,6 +691,231 @@ impl IncidentExporter {
         }
         Ok(removed)
     }
+
+    #[cfg(test)]
+    pub(crate) fn retract_false_incidents_coordinated(
+        &self,
+        incident_ids: &BTreeSet<String>,
+        lifecycle_log: &std::path::Path,
+    ) -> std::io::Result<()> {
+        self.retract_false_incidents_coordinated_checked(incident_ids, lifecycle_log, || Ok(()))
+    }
+
+    pub(crate) fn retract_false_incidents_coordinated_checked<F>(
+        &self,
+        incident_ids: &BTreeSet<String>,
+        lifecycle_log: &std::path::Path,
+        mut check_generation: F,
+    ) -> std::io::Result<()>
+    where
+        F: FnMut() -> std::io::Result<()>,
+    {
+        retract_incident_files(
+            &self.root,
+            lifecycle_log,
+            incident_ids,
+            &mut check_generation,
+        )
+    }
+}
+
+enum IncidentFileEffect {
+    Remove(PathBuf),
+    Rewrite(PathBuf, Vec<u8>),
+}
+
+fn retract_incident_files(
+    incident_root: &std::path::Path,
+    lifecycle_log: &std::path::Path,
+    incident_ids: &BTreeSet<String>,
+    check_generation: &mut impl FnMut() -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    let mut effects = Vec::new();
+    for base in [
+        incident_root.join("incidents.jsonl"),
+        lifecycle_log.to_path_buf(),
+    ] {
+        for path in rotated_jsonl_paths(&base)? {
+            let bytes = fs::read(&path)?;
+            let filtered = filter_incident_jsonl(&bytes, incident_ids)?;
+            if filtered == bytes {
+                continue;
+            }
+            if filtered.is_empty() {
+                effects.push(IncidentFileEffect::Remove(path));
+            } else {
+                effects.push(IncidentFileEffect::Rewrite(path, filtered));
+            }
+        }
+    }
+
+    let mut exact_exports = BTreeSet::new();
+    for incident_id in incident_ids {
+        exact_exports.insert(incident_root.join(format!("{incident_id}.open.json")));
+        exact_exports.insert(incident_root.join(format!("{incident_id}.closed.json")));
+    }
+    for path in exact_exports {
+        if regular_file_exists(&path)? {
+            effects.push(IncidentFileEffect::Remove(path));
+        }
+    }
+    for path in [
+        incident_root,
+        lifecycle_log.parent().unwrap_or(incident_root),
+    ] {
+        if !path.is_dir() {
+            continue;
+        }
+        for entry in fs::read_dir(path)? {
+            let entry = entry?;
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if incident_ids.iter().any(|incident_id| {
+                ["open", "closed"]
+                    .iter()
+                    .any(|state| name.starts_with(&format!("{incident_id}.{state}.tmp-")))
+            }) && regular_file_exists(&entry.path())?
+            {
+                effects.push(IncidentFileEffect::Remove(entry.path()));
+            }
+        }
+    }
+
+    // Classify every JSONL file before the first mutation. A malformed later
+    // rotation therefore cannot leave an earlier file rewritten.
+    for effect in effects {
+        check_generation()?;
+        match effect {
+            IncidentFileEffect::Remove(path) => remove_synced(&path)?,
+            IncidentFileEffect::Rewrite(path, bytes) => atomic_replace_synced(&path, &bytes)?,
+        }
+    }
+
+    for base in [
+        incident_root.join("incidents.jsonl"),
+        lifecycle_log.to_path_buf(),
+    ] {
+        for path in rotated_jsonl_paths(&base)? {
+            let bytes = fs::read(path)?;
+            if filter_incident_jsonl(&bytes, incident_ids)? != bytes {
+                return Err(std::io::Error::other(
+                    "false incident remains in a serialized JSONL artifact",
+                ));
+            }
+        }
+    }
+    for incident_id in incident_ids {
+        for path in [
+            incident_root.join(format!("{incident_id}.open.json")),
+            incident_root.join(format!("{incident_id}.closed.json")),
+        ] {
+            if regular_file_exists(&path)? {
+                return Err(std::io::Error::other(
+                    "false incident export remains after withdrawal",
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn rotated_jsonl_paths(base: &std::path::Path) -> std::io::Result<Vec<PathBuf>> {
+    let mut paths = Vec::new();
+    if regular_file_exists(base)? {
+        paths.push(base.to_path_buf());
+    }
+    let Some(parent) = base.parent() else {
+        return Ok(paths);
+    };
+    if !parent.is_dir() {
+        return Ok(paths);
+    }
+    let file_name = base.file_name().unwrap_or_default().to_string_lossy();
+    for entry in fs::read_dir(parent)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if name
+            .strip_prefix(&format!("{file_name}."))
+            .is_some_and(|suffix| {
+                !suffix.is_empty() && suffix.bytes().all(|byte| byte.is_ascii_digit())
+            })
+            && regular_file_exists(&entry.path())?
+        {
+            paths.push(entry.path());
+        }
+    }
+    paths.sort();
+    paths.dedup();
+    Ok(paths)
+}
+
+fn regular_file_exists(path: &std::path::Path) -> std::io::Result<bool> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => Err(
+            std::io::Error::other("incident artifact is not a regular file"),
+        ),
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
+fn remove_synced(path: &std::path::Path) -> std::io::Result<()> {
+    if !regular_file_exists(path)? {
+        return Ok(());
+    }
+    fs::remove_file(path)?;
+    sync_parent(path)
+}
+
+fn atomic_replace_synced(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| std::io::Error::other("incident log has no parent directory"))?;
+    if !regular_file_exists(path)? {
+        return Err(std::io::Error::other(
+            "incident log disappeared during rewrite",
+        ));
+    }
+    let name = path.file_name().unwrap_or_default().to_string_lossy();
+    let temp = parent.join(format!(".{name}.freshell-retraction-tmp"));
+    match fs::symlink_metadata(&temp) {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
+            return Err(std::io::Error::other(
+                "incident retraction temporary is not a regular file",
+            ));
+        }
+        Ok(_) => fs::remove_file(&temp)?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+    let mut options = fs::OpenOptions::new();
+    options.create_new(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(&temp)?;
+    let result = (|| {
+        use std::io::Write;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        fs::rename(&temp, path)?;
+        sync_parent(path)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temp);
+    }
+    result
+}
+
+fn sync_parent(path: &std::path::Path) -> std::io::Result<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| std::io::Error::other("incident artifact has no parent directory"))?;
+    fs::File::open(parent)?.sync_all()
 }
 
 use std::os::unix::fs::PermissionsExt;
@@ -867,6 +1212,7 @@ impl Registry {
         cleanup: LossCleanupReport,
     ) -> Result<RuntimeNotice, RegistryError> {
         self.run_blocking(move |mut conn| {
+            let _incident_coordinator = incident_file_coordinator();
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
             let (
                 soul_id,
@@ -1125,6 +1471,69 @@ impl Registry {
             )?;
             tx.commit()?;
             Ok(notice)
+        })
+        .await
+    }
+
+    pub(crate) async fn export_and_ack_incident(
+        &self,
+        event: PendingIncidentExport,
+        exporter: IncidentExporter,
+    ) -> Result<Option<PathBuf>, RegistryError> {
+        self.run_blocking(move |mut conn| {
+            let _coordinator = incident_file_coordinator();
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let pending: Option<(String, String)> = tx
+                .query_row(
+                    "SELECT event_kind,payload FROM outbox WHERE event_id=?1 AND delivered_at IS NULL",
+                    params![event.event_id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()?;
+            let Some((event_kind, encoded_payload)) = pending else {
+                return Ok(None);
+            };
+            let payload: serde_json::Value = serde_json::from_str(&encoded_payload)?;
+            if event_kind != event.event_kind
+                || payload != event.payload
+                || payload.get("incidentId").and_then(serde_json::Value::as_str)
+                    != Some(event.incident_id.as_str())
+            {
+                return Err(RegistryError::Integrity(
+                    "incident export changed after it was queued".into(),
+                ));
+            }
+            let path = if event.event_kind == "loss_incident.open" {
+                let certificate = serde_json::from_value(event.payload.clone())?;
+                exporter.export_certificate_coordinated(&certificate)?
+            } else if event.event_kind == "loss_incident.final" {
+                let closed = event
+                    .payload
+                    .get("cleanupState")
+                    .and_then(serde_json::Value::as_str)
+                    == Some("closed");
+                exporter.export_summary_coordinated(
+                    &event.incident_id,
+                    closed,
+                    &event.payload,
+                )?
+            } else {
+                return Err(RegistryError::Integrity(
+                    "unsupported incident export event kind".into(),
+                ));
+            };
+            let changed = tx.execute(
+                "UPDATE outbox SET delivered_at=COALESCE(delivered_at,?1) \
+                 WHERE event_id=?2 AND delivered_at IS NULL",
+                params![crate::registry::now_millis(), event.event_id],
+            )?;
+            if changed != 1 {
+                return Err(RegistryError::InvalidState(
+                    "incident export acknowledgement lost its pending row".into(),
+                ));
+            }
+            tx.commit()?;
+            Ok(Some(path))
         })
         .await
     }

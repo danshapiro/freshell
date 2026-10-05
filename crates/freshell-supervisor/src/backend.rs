@@ -5,7 +5,8 @@ use crate::registry::OwnedRuntimeHandle;
 use async_trait::async_trait;
 use freshell_runtime_protocol::{
     DockerDaemonId, FreshAgentFixtureTransport, FreshAgentLaunchSpec, FreshProvider, IncarnationId,
-    InstallationId, ProviderBootstrapFile, RuntimeLimits, SoulId, TerminalLaunchSpec,
+    InstallationId, OpenCodeTransferDescriptor, ProviderBootstrapFile, RuntimeLimits, SoulId,
+    TerminalLaunchSpec,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -212,8 +213,27 @@ pub struct BackendInspection {
     pub configured_limits: RuntimeLimits,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct StoppedOpenCodeRepairReceipts {
+    pub imported: freshell_agent_runtime::opencode_transfer::ImportReceipt,
+    pub readable: freshell_agent_runtime::opencode_transfer::InstalledStoreReadable,
+}
+
 #[async_trait]
 pub trait RuntimeBackend: Send + Sync {
+    /// Import and independently read one exact OpenCode generation from a
+    /// stopped soul's provider volume. Implementations must not start the
+    /// provider, create a PTY, or consume a launch grant.
+    async fn repair_stopped_opencode(
+        &self,
+        _handle: &OwnedRuntimeHandle,
+        _descriptor: &OpenCodeTransferDescriptor,
+        _verified_stage_dir: &Path,
+    ) -> Result<StoppedOpenCodeRepairReceipts, BackendError> {
+        Err(BackendError::Unavailable(
+            "stopped OpenCode repair helper is unavailable".into(),
+        ))
+    }
     async fn read_native_history(
         &self,
         _handle: &OwnedRuntimeHandle,
@@ -595,6 +615,21 @@ fn runtime_host_environment(
 
 #[async_trait]
 impl RuntimeBackend for DockerEngineBackend {
+    async fn repair_stopped_opencode(
+        &self,
+        handle: &OwnedRuntimeHandle,
+        descriptor: &OpenCodeTransferDescriptor,
+        verified_stage_dir: &Path,
+    ) -> Result<StoppedOpenCodeRepairReceipts, BackendError> {
+        self.repair_stopped_opencode_helper(
+            handle,
+            descriptor,
+            verified_stage_dir,
+            std::time::Duration::from_secs(120),
+        )
+        .await
+    }
+
     async fn read_native_history(
         &self,
         handle: &OwnedRuntimeHandle,
@@ -1589,6 +1624,7 @@ mod tests {
         let handle = OwnedRuntimeHandle::from_registry(
             installation_id.clone(),
             soul_id.clone(),
+            soul_id.to_string(),
             incarnation_id.clone(),
             LaunchNonce::new(),
             DockerDaemonId::new(),
