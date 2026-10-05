@@ -1175,6 +1175,7 @@ mod tests {
             provider_launch_context: None,
             opencode_transfer: None,
             opencode_transfer_attempt_id: None,
+            opencode_adoption: None,
         }
     }
 

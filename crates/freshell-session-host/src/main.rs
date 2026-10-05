@@ -9,9 +9,10 @@ use freshell_agent_runtime::prepare_terminal_for_resume;
 use freshell_runtime_protocol::{
     host_proof, read_frame, write_frame, ControlRole, Envelope, FixtureKind, FreshAgentLaunchSpec,
     GrantId, HostBootId, HostCommand, HostReply, HostResult, IncarnationId,
-    OpenCodeTransferDescriptor, OpenCodeTransferReadinessReceipt, ProviderBootstrapFile,
-    RecoveryPath, RecoveryProbe, ResumeSpec, RuntimeError, RuntimeErrorCode, RuntimeLimits,
-    RuntimeMetrics, SoulId, TerminalLaunchSpec, CONTROL_PROTOCOL_VERSION,
+    OpenCodeAdoptionBaseline, OpenCodeAdoptionExpectation, OpenCodeAdoptionStatus,
+    OpenCodeTransferDescriptor, OpenCodeTransferReadinessReceipt, OpenCodeVerifiedRootTail,
+    ProviderBootstrapFile, RecoveryPath, RecoveryProbe, ResumeSpec, RuntimeError, RuntimeErrorCode,
+    RuntimeLimits, RuntimeMetrics, SoulId, TerminalLaunchSpec, CONTROL_PROTOCOL_VERSION,
     MAX_OPENCODE_TRANSFER_MANIFEST_BYTES,
 };
 use pty::HostedPty;
@@ -120,12 +121,14 @@ impl GrantExecutionEffects for SystemGrantExecutionEffects {
         child_env: std::collections::BTreeMap<String, String>,
         codex: Option<providers::PreparedCodexLaunch>,
     ) -> Result<SpawnedTerminalPty, RuntimeError> {
+        let opencode_adoption_revalidator = opencode_adoption_revalidator(terminal);
         let hosted = HostedPty::spawn(
             state_dir,
             incarnation_id.clone(),
             terminal,
             child_env,
             codex,
+            opencode_adoption_revalidator,
         )
         .await
         .map_err(|error| {
@@ -141,6 +144,48 @@ impl GrantExecutionEffects for SystemGrantExecutionEffects {
             hosted: Some(hosted),
         })
     }
+}
+
+fn opencode_adoption_revalidator(
+    terminal: &TerminalLaunchSpec,
+) -> Option<pty::OpenCodeAdoptionRevalidator> {
+    terminal.opencode_adoption.as_ref()?;
+    let terminal = terminal.clone();
+    Some(Arc::new(move |baseline: &OpenCodeAdoptionBaseline| {
+        baseline.validate().map_err(|error| error.message)?;
+        let launch_expectation = terminal
+            .opencode_adoption
+            .as_ref()
+            .ok_or("OpenCode adoption expectation disappeared")?;
+        if terminal.mode != "opencode"
+            || baseline != &launch_expectation.baseline
+            || baseline.descriptor.provider != "opencode"
+            || baseline.descriptor.destination_database_path != ".local/share/opencode/opencode.db"
+        {
+            return Err("OpenCode adoption baseline does not match its launch".into());
+        }
+        let provider_home = terminal
+            .env
+            .get("HOME")
+            .map(PathBuf::from)
+            .ok_or("OpenCode provider home is unavailable")?;
+        let paths = validate_opencode_reader_paths_at(
+            &terminal.env,
+            Path::new(&terminal.workspace_path),
+            Path::new(&terminal.cwd),
+            &provider_home,
+        )?;
+        let output = run_opencode_provider_helper(
+            &terminal,
+            &baseline.descriptor,
+            &paths.workspace,
+            &paths.cwd,
+            "opencode-current-evidence-worker",
+            None,
+        )?;
+        serde_json::from_slice(&output)
+            .map_err(|_| "provider evidence worker returned invalid OpenCode evidence".into())
+    }))
 }
 
 #[derive(Clone)]
@@ -352,8 +397,11 @@ async fn run() -> Result<(), String> {
         Some("refresh-provider-config") => refresh_provider_config_worker(&args[2..]),
         Some("opencode-import-worker") => run_opencode_import_worker(&args[2..]),
         Some("opencode-reader-probe") => run_opencode_reader_probe(&args[2..]),
+        Some("opencode-current-evidence-worker") => {
+            run_opencode_current_evidence_worker(&args[2..])
+        }
         Some("prepare-provider-features") => providers::run_provider_features_worker(&args[2..]),
-        _ => Err("usage: freshell-session-host <serve|worker|fixture-child|fresh-agent-fixture-worker|opencode-identity-worker|provider-probe-worker|refresh-provider-config|opencode-import-worker|opencode-reader-probe> ...".into()),
+        _ => Err("usage: freshell-session-host <serve|worker|fixture-child|fresh-agent-fixture-worker|opencode-identity-worker|provider-probe-worker|refresh-provider-config|opencode-import-worker|opencode-reader-probe|opencode-current-evidence-worker> ...".into()),
     }
 }
 
@@ -583,9 +631,11 @@ async fn dispatch_with_effects(
                     let mut evidence = persisted.fixture_evidence;
                     let mut exited = false;
                     let mut native_session_id = None;
+                    let mut opencode_adoption = OpenCodeAdoptionStatus::NotRequired;
                     if let Some(pty) = state.pty.lock().await.as_ref() {
                         exited = pty.exited();
                         native_session_id = pty.native_session_id();
+                        opencode_adoption = pty.opencode_adoption_status();
                         evidence = serde_json::json!({
                             "workload":"terminal",
                             "terminalId":pty.terminal_id(),
@@ -640,6 +690,7 @@ async fn dispatch_with_effects(
                         exited,
                         native_session_id,
                         opencode_transfer_receipt: persisted.opencode_transfer_receipt.clone(),
+                        opencode_adoption,
                     })
                 }
                 HostCommand::TerminalInput {
@@ -1016,6 +1067,19 @@ async fn grant_execution(
                     fixture_evidence: persisted.fixture_evidence.clone(),
                     native_session_id,
                     opencode_transfer_receipt: persisted.opencode_transfer_receipt.clone(),
+                    opencode_adoption: state
+                        .pty
+                        .lock()
+                        .await
+                        .as_ref()
+                        .map(HostedPty::opencode_adoption_status)
+                        .unwrap_or_else(|| {
+                            adoption_status_for_required(
+                                terminal
+                                    .as_ref()
+                                    .is_some_and(|terminal| terminal.opencode_adoption.is_some()),
+                            )
+                        }),
                 });
             }
             return Err(RuntimeError::new(
@@ -1033,6 +1097,7 @@ async fn grant_execution(
         .as_ref()
         .is_some_and(|terminal| terminal.opencode_transfer.is_some())
     {
+        let durable_readiness_receipt = persisted.opencode_transfer_receipt.clone();
         drop(persisted);
         let mut preflight_terminal = match (terminal.as_ref(), resume_spec.as_ref()) {
             (Some(terminal), Some(resume)) => prepare_terminal_for_resume(terminal, resume)
@@ -1040,16 +1105,28 @@ async fn grant_execution(
             (Some(terminal), None) => terminal.clone(),
             (None, _) => unreachable!("transfer was checked on a terminal"),
         };
-        let mut phase_gate = OpenCodeTransferGate::default();
-        transfer_readiness_receipt = run_opencode_transfer_readiness(
+        if resume_spec.is_none() {
+            let mut phase_gate = OpenCodeTransferGate::default();
+            transfer_readiness_receipt = run_opencode_transfer_readiness(
+                state,
+                &soul_id,
+                &mut preflight_terminal,
+                &mut phase_gate,
+                effects,
+            )?;
+            transfer_phase_gate = Some(phase_gate);
+        }
+        prepare_opencode_adoption_expectation(
             state,
             &soul_id,
             &mut preflight_terminal,
-            &mut phase_gate,
+            resume_spec.as_ref(),
+            transfer_readiness_receipt
+                .as_ref()
+                .or(durable_readiness_receipt.as_ref()),
             effects,
         )?;
         transfer_prepared_terminal = Some(preflight_terminal.clone());
-        transfer_phase_gate = Some(phase_gate);
         persisted = state.persisted.lock().await;
         if control_epoch < persisted.max_control_epoch
             || execution_generation < persisted.max_execution_generation
@@ -1069,6 +1146,19 @@ async fn grant_execution(
                         fixture_evidence: persisted.fixture_evidence.clone(),
                         native_session_id: None,
                         opencode_transfer_receipt: persisted.opencode_transfer_receipt.clone(),
+                        opencode_adoption: state
+                            .pty
+                            .lock()
+                            .await
+                            .as_ref()
+                            .map(HostedPty::opencode_adoption_status)
+                            .unwrap_or_else(|| {
+                                adoption_status_for_required(
+                                    terminal.as_ref().is_some_and(|terminal| {
+                                        terminal.opencode_adoption.is_some()
+                                    }),
+                                )
+                            }),
                     });
                 }
                 return Err(RuntimeError::new(
@@ -1091,7 +1181,9 @@ async fn grant_execution(
     persisted.max_execution_generation = execution_generation;
     persisted.grant_id = Some(grant_id.clone());
     persisted.worker_pid = None;
-    persisted.opencode_transfer_receipt = transfer_readiness_receipt;
+    if let Some(receipt) = transfer_readiness_receipt {
+        persisted.opencode_transfer_receipt = Some(receipt);
+    }
     write_state(&state.state_dir, &persisted).map_err(registry_like_error)?;
     #[cfg(test)]
     opencode_host_crash_checkpoint("grant.after_state_persist_before_pty");
@@ -1100,6 +1192,9 @@ async fn grant_execution(
             .expect("OpenCode transfer grant phase was prevalidated");
     }
 
+    let opencode_adoption_required = terminal
+        .as_ref()
+        .is_some_and(|terminal| terminal.opencode_adoption.is_some());
     let (pid, evidence, native_session_id) = match (fixture, terminal, fresh_agent) {
         (Some(fixture), None, None) => {
             let exe = std::env::current_exe()
@@ -1374,6 +1469,13 @@ async fn grant_execution(
     write_state(&state.state_dir, &persisted).map_err(registry_like_error)?;
     append_event_with_secret(&state.state_dir, &state.secret, "host.grant_consumed", serde_json::json!({"grantId":grant_id,"workerPid":pid,"workerLaunchCount":persisted.worker_launch_count,"controlEpoch":control_epoch,"executionGeneration":execution_generation})).ok();
 
+    let opencode_adoption = state
+        .pty
+        .lock()
+        .await
+        .as_ref()
+        .map(HostedPty::opencode_adoption_status)
+        .unwrap_or_else(|| adoption_status_for_required(opencode_adoption_required));
     Ok(HostResult::GrantAccepted {
         host_boot_id: state.host_boot_id.clone(),
         worker_pid: pid,
@@ -1381,7 +1483,16 @@ async fn grant_execution(
         fixture_evidence: persisted.fixture_evidence.clone(),
         native_session_id,
         opencode_transfer_receipt: persisted.opencode_transfer_receipt.clone(),
+        opencode_adoption,
     })
+}
+
+fn adoption_status_for_required(required: bool) -> OpenCodeAdoptionStatus {
+    if required {
+        OpenCodeAdoptionStatus::AwaitingObservation
+    } else {
+        OpenCodeAdoptionStatus::NotRequired
+    }
 }
 
 const OPENCODE_TRANSFER_MOUNT: &str = "/run/freshell-opencode-transfer";
@@ -1580,6 +1691,40 @@ fn run_opencode_reader_probe(args: &[String]) -> Result<(), String> {
     write_opencode_helper_result(&receipt)
 }
 
+/// Revalidate an already-imported OpenCode store from the provider identity.
+/// This is read-only and is deliberately separate from the import worker so
+/// a resume can never turn stale evidence into another import.
+fn run_opencode_current_evidence_worker(args: &[String]) -> Result<(), String> {
+    let (workspace_root, expected_cwd, uid, gid) = opencode_helper_args(args)?;
+    validate_opencode_helper_identity(uid, gid)?;
+    let env = std::env::vars().collect::<std::collections::BTreeMap<_, _>>();
+    let paths = validate_opencode_reader_paths(&env, &workspace_root, &expected_cwd)?;
+    if std::env::current_dir().map_err(|error| error.to_string())? != paths.cwd {
+        return Err("OpenCode evidence cwd differs from the requested provider cwd".into());
+    }
+
+    let mut stdin = io::stdin().lock();
+    let descriptor = read_opencode_descriptor_frame(&mut stdin)?;
+    if descriptor.destination_database_path != ".local/share/opencode/opencode.db" {
+        return Err("OpenCode evidence database path is unsupported".into());
+    }
+    let mut trailing = [0_u8; 1];
+    if stdin
+        .read(&mut trailing)
+        .map_err(|error| error.to_string())?
+        != 0
+    {
+        return Err("OpenCode evidence worker received trailing bytes".into());
+    }
+    let evidence = freshell_agent_runtime::opencode_transfer::verify_current_store(
+        &descriptor,
+        &paths.database,
+        &paths.workspace,
+    )
+    .map_err(|_| "provider-identity OpenCode evidence verification failed".to_string())?;
+    write_opencode_helper_result(&evidence)
+}
+
 fn opencode_helper_args(args: &[String]) -> Result<(PathBuf, PathBuf, u32, u32), String> {
     if args.len() != 8 {
         return Err(
@@ -1689,6 +1834,151 @@ fn run_opencode_transfer_readiness(
         )
     })
     .map(|()| progress.readiness_receipt)
+}
+
+/// Build the launch-scoped adoption gate from a fresh read of the installed
+/// provider store. This deliberately runs after import receipts on a first
+/// transfer and independently on every exact resume; it never stages or
+/// imports data itself.
+fn prepare_opencode_adoption_expectation(
+    state: &HostState,
+    soul_id: &SoulId,
+    terminal: &mut TerminalLaunchSpec,
+    resume_spec: Option<&ResumeSpec>,
+    readiness_receipt: Option<&OpenCodeTransferReadinessReceipt>,
+    effects: &dyn GrantExecutionEffects,
+) -> Result<(), RuntimeError> {
+    let descriptor = terminal.opencode_transfer.as_ref().ok_or_else(|| {
+        RuntimeError::new(
+            RuntimeErrorCode::InvalidRequest,
+            "OpenCode adoption has no transfer baseline",
+        )
+    })?;
+    descriptor.validate()?;
+    if terminal.mode != "opencode"
+        || descriptor.provider != "opencode"
+        || descriptor.destination_store_id != soul_id.as_str()
+        || descriptor.destination_database_path != ".local/share/opencode/opencode.db"
+        || terminal.resume_session_id.as_deref() != Some(descriptor.root_session_id.as_str())
+    {
+        return Err(RuntimeError::new(
+            RuntimeErrorCode::OwnershipMismatch,
+            "OpenCode adoption baseline does not match this provider launch",
+        ));
+    }
+    if let Some(resume) = resume_spec {
+        if resume.provider_session.provider != "opencode"
+            || resume.provider_session.provider_store_id != descriptor.destination_store_id
+            || resume.provider_session.native_session_id != descriptor.root_session_id
+        {
+            return Err(RuntimeError::new(
+                RuntimeErrorCode::OwnershipMismatch,
+                "OpenCode exact resume does not match the imported store and root session",
+            ));
+        }
+    }
+    if readiness_receipt.is_some_and(|receipt| {
+        receipt.transfer_id != descriptor.transfer_id
+            || receipt.destination_store_id != descriptor.destination_store_id
+            || receipt.root_session_id != descriptor.root_session_id
+            || receipt.source_generation != descriptor.source_generation
+            || receipt.provider_uid != terminal.run_as_uid
+            || receipt.provider_gid != terminal.run_as_gid
+    }) {
+        return Err(RuntimeError::new(
+            RuntimeErrorCode::OwnershipMismatch,
+            "OpenCode readiness receipt does not match the exact provider identity and baseline",
+        ));
+    }
+
+    let paths = validate_opencode_reader_paths_at(
+        &terminal.env,
+        Path::new(&terminal.workspace_path),
+        Path::new(&terminal.cwd),
+        &state.provider_config_paths.provider_home,
+    )
+    .map_err(|error| {
+        RuntimeError::new(
+            RuntimeErrorCode::HostUnreachable,
+            format!("OpenCode current-store adoption preflight failed: {error}"),
+        )
+    })?;
+    let output = effects
+        .run_opencode_provider_helper(
+            terminal,
+            descriptor,
+            &paths.workspace,
+            &paths.cwd,
+            "opencode-current-evidence-worker",
+            None,
+        )
+        .map_err(|error| {
+            RuntimeError::new(
+                RuntimeErrorCode::HostUnreachable,
+                format!("OpenCode current-store adoption preflight failed: {error}"),
+            )
+        })?;
+    let evidence: freshell_agent_runtime::opencode_transfer::CurrentOpenCodeEvidence =
+        serde_json::from_slice(&output).map_err(|_| {
+            RuntimeError::new(
+                RuntimeErrorCode::HostUnreachable,
+                "OpenCode current-store adoption evidence is malformed",
+            )
+        })?;
+    if evidence.version != 1
+        || evidence.transfer_id != descriptor.transfer_id
+        || evidence.destination_store_id != descriptor.destination_store_id
+        || evidence.root_session_id != descriptor.root_session_id
+        || evidence.import_generation != descriptor.source_generation
+        || evidence.row_count == 0
+    {
+        return Err(RuntimeError::new(
+            RuntimeErrorCode::HostUnreachable,
+            "OpenCode current-store evidence does not match the imported baseline",
+        ));
+    }
+
+    let root_tail = match evidence.root_tail {
+        freshell_agent_runtime::opencode_transfer::VerifiedRootTail::Message { message_id } => {
+            OpenCodeVerifiedRootTail::Message { message_id }
+        }
+        freshell_agent_runtime::opencode_transfer::VerifiedRootTail::QualifiedEmpty => {
+            OpenCodeVerifiedRootTail::QualifiedEmpty
+        }
+    };
+    let baseline = OpenCodeAdoptionBaseline {
+        descriptor: descriptor.clone(),
+        manifest_sha256: sha256_hex(descriptor.manifest_json.as_bytes()),
+    };
+    let expectation = OpenCodeAdoptionExpectation {
+        baseline,
+        root_session_id: evidence.root_session_id,
+        root_tail,
+        evidence_generation: evidence.evidence_generation,
+        incarnation_id: state.incarnation_id.clone(),
+        launch_nonce: uuid::Uuid::new_v4().simple().to_string(),
+    };
+    expectation.validate()?;
+    append_event_with_secret(
+        &state.state_dir,
+        &state.secret,
+        "host.opencode_adoption.expectation_prepared",
+        serde_json::json!({
+            "transferId": descriptor.transfer_id,
+            "evidenceGeneration": expectation.evidence_generation,
+            "incarnationId": expectation.incarnation_id,
+            "providerUid": terminal.run_as_uid,
+            "providerGid": terminal.run_as_gid,
+        }),
+    )
+    .map_err(|_| {
+        RuntimeError::new(
+            RuntimeErrorCode::RegistryFailure,
+            "OpenCode adoption expectation could not be recorded",
+        )
+    })?;
+    terminal.opencode_adoption = Some(expectation);
+    Ok(())
 }
 
 fn perform_opencode_transfer_phase(
@@ -4718,6 +5008,7 @@ mod tests {
             provider_launch_context: Some(context),
             opencode_transfer: None,
             opencode_transfer_attempt_id: None,
+            opencode_adoption: None,
         };
         let resume_spec = ResumeSpec {
             schema_version: freshell_runtime_protocol::RESUME_SPEC_SCHEMA_VERSION,
@@ -4972,13 +5263,17 @@ mod tests {
     async fn production_grant_joins_staging_backend_mount_readiness_and_pty_for_synthetic_history()
     {
         let success = run_joined_synthetic_transfer(None).await.unwrap();
-        assert!(matches!(
-            &success.result,
-            Ok(HostResult::GrantAccepted {
-                worker_launch_count: 1,
-                ..
-            })
-        ));
+        assert!(
+            matches!(
+                &success.result,
+                Ok(HostResult::GrantAccepted {
+                    worker_launch_count: 1,
+                    ..
+                })
+            ),
+            "first imported grant result: {:?}",
+            success.result
+        );
         let receipt = success
             .state
             .persisted
@@ -4992,12 +5287,27 @@ mod tests {
         assert_eq!(receipt.provider_gid, unsafe { libc::getegid() });
         assert_eq!(receipt.structural_sha256.len(), 64);
         assert_eq!(receipt.reader_receipt_sha256.len(), 64);
+        let adoption = success
+            .adoption_expectation
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("the first imported launch must get an adoption gate");
+        assert_eq!(adoption.incarnation_id, success.state.incarnation_id);
+        assert_eq!(adoption.root_session_id, "ses_synthetictransfersession");
+        assert_eq!(adoption.evidence_generation.len(), 64);
+        assert_eq!(
+            adoption.baseline.descriptor.transfer_id,
+            "synthetic-transfer"
+        );
+        assert_eq!(adoption.baseline.manifest_sha256.len(), 64);
+        adoption.validate().unwrap();
         assert!(success
             .pty_callback_invoked
             .load(std::sync::atomic::Ordering::SeqCst));
         assert_eq!(
             *success.events.lock().unwrap(),
-            ["import", "reader", "reader", "pty"]
+            ["import", "reader", "reader", "current", "pty"]
         );
         assert!(success
             .root
@@ -5009,6 +5319,9 @@ mod tests {
             SyntheticTransferFailure::Mount,
             SyntheticTransferFailure::Import,
             SyntheticTransferFailure::Reader,
+            SyntheticTransferFailure::CurrentEvidenceRead,
+            SyntheticTransferFailure::CurrentEvidenceMismatch,
+            SyntheticTransferFailure::CurrentEvidenceGenerationMismatch,
         ] {
             let attempt = run_joined_synthetic_transfer(Some(injected_failure))
                 .await
@@ -5039,6 +5352,69 @@ mod tests {
             )
             .is_err()
         );
+
+        let resumed = run_synthetic_exact_resume(&success, None).await.unwrap();
+        assert!(matches!(
+            &resumed.result,
+            Ok(HostResult::GrantAccepted {
+                worker_launch_count: 1,
+                ..
+            })
+        ));
+        assert_eq!(*resumed.events.lock().unwrap(), ["current", "pty"]);
+        assert!(resumed
+            .pty_callback_invoked
+            .load(std::sync::atomic::Ordering::SeqCst));
+        let resume_adoption = resumed
+            .adoption_expectation
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("exact resume must get a new adoption gate");
+        assert_eq!(resume_adoption.incarnation_id, resumed.state.incarnation_id);
+        assert_ne!(resume_adoption.incarnation_id, adoption.incarnation_id);
+        assert_ne!(resume_adoption.launch_nonce, adoption.launch_nonce);
+        assert_eq!(resume_adoption.root_tail, adoption.root_tail);
+        assert_eq!(
+            resume_adoption.evidence_generation,
+            adoption.evidence_generation
+        );
+        let preserved = resumed
+            .state
+            .persisted
+            .try_lock()
+            .expect("resumed grant handler released persisted state")
+            .opencode_transfer_receipt
+            .clone()
+            .expect("exact resume must preserve the original import readiness receipt");
+        assert_eq!(preserved, receipt);
+
+        for failure in [
+            SyntheticTransferFailure::CurrentEvidenceRead,
+            SyntheticTransferFailure::CurrentEvidenceMismatch,
+            SyntheticTransferFailure::CurrentEvidenceGenerationMismatch,
+            SyntheticTransferFailure::ReadinessIdentityMismatch,
+        ] {
+            let blocked = run_synthetic_exact_resume(&success, Some(failure))
+                .await
+                .unwrap();
+            assert!(blocked.result.is_err());
+            assert!(blocked
+                .state
+                .persisted
+                .try_lock()
+                .expect("blocked exact resume released persisted state")
+                .grant_id
+                .is_none());
+            assert!(!blocked
+                .pty_callback_invoked
+                .load(std::sync::atomic::Ordering::SeqCst));
+            if failure == SyntheticTransferFailure::ReadinessIdentityMismatch {
+                assert!(blocked.events.lock().unwrap().is_empty());
+            } else {
+                assert_eq!(*blocked.events.lock().unwrap(), ["current"]);
+            }
+        }
     }
 
     #[cfg(unix)]
@@ -5060,6 +5436,10 @@ mod tests {
         Mount,
         Import,
         Reader,
+        CurrentEvidenceRead,
+        CurrentEvidenceMismatch,
+        CurrentEvidenceGenerationMismatch,
+        ReadinessIdentityMismatch,
     }
 
     struct SyntheticGateAttempt {
@@ -5068,8 +5448,17 @@ mod tests {
         result: Result<HostResult, RuntimeError>,
         events: Arc<std::sync::Mutex<Vec<&'static str>>>,
         pty_callback_invoked: Arc<std::sync::atomic::AtomicBool>,
+        adoption_expectation: Arc<std::sync::Mutex<Option<OpenCodeAdoptionExpectation>>>,
         mount_plan: freshell_supervisor::backend::OpenCodeTransferMountPlan,
         mount_inspection: Vec<serde_json::Value>,
+    }
+
+    struct SyntheticResumeAttempt {
+        state: Arc<HostState>,
+        result: Result<HostResult, RuntimeError>,
+        events: Arc<std::sync::Mutex<Vec<&'static str>>>,
+        pty_callback_invoked: Arc<std::sync::atomic::AtomicBool>,
+        adoption_expectation: Arc<std::sync::Mutex<Option<OpenCodeAdoptionExpectation>>>,
     }
 
     struct SyntheticCapacity(u64);
@@ -5085,6 +5474,7 @@ mod tests {
         expected_grant_id: GrantId,
         events: Arc<std::sync::Mutex<Vec<&'static str>>>,
         pty_callback_invoked: Arc<std::sync::atomic::AtomicBool>,
+        adoption_expectation: Arc<std::sync::Mutex<Option<OpenCodeAdoptionExpectation>>>,
         pty_marker: Option<PathBuf>,
     }
 
@@ -5146,6 +5536,28 @@ mod tests {
                     .map_err(|error| error.to_string())?;
                     serde_json::to_vec(&receipt).map_err(|error| error.to_string())
                 }
+                "opencode-current-evidence-worker" => {
+                    self.events.lock().unwrap().push("current");
+                    if self.failure == Some(SyntheticTransferFailure::CurrentEvidenceRead) {
+                        return Err("synthetic provider current-evidence read failure".into());
+                    }
+                    let mut evidence =
+                        freshell_agent_runtime::opencode_transfer::verify_current_store(
+                            descriptor,
+                            Path::new(&terminal.env["OPENCODE_DB"]),
+                            workspace_root,
+                        )
+                        .map_err(|error| error.to_string())?;
+                    if self.failure == Some(SyntheticTransferFailure::CurrentEvidenceMismatch) {
+                        evidence.root_session_id = "ses_mismatched-root".into();
+                    }
+                    if self.failure
+                        == Some(SyntheticTransferFailure::CurrentEvidenceGenerationMismatch)
+                    {
+                        evidence.import_generation = "stale-source-generation".into();
+                    }
+                    serde_json::to_vec(&evidence).map_err(|error| error.to_string())
+                }
                 _ => Err("unexpected synthetic OpenCode helper worker".into()),
             }
         }
@@ -5153,18 +5565,35 @@ mod tests {
         async fn spawn_terminal_pty(
             &self,
             state_dir: &Path,
-            _incarnation_id: &IncarnationId,
+            incarnation_id: &IncarnationId,
             terminal: &TerminalLaunchSpec,
             _child_env: std::collections::BTreeMap<String, String>,
             _codex: Option<providers::PreparedCodexLaunch>,
         ) -> Result<SpawnedTerminalPty, RuntimeError> {
             let call_order = self.events.lock().unwrap().clone();
-            if call_order != ["import", "reader", "reader"] {
+            if !matches!(
+                call_order.as_slice(),
+                ["import", "reader", "reader", "current"] | ["current"]
+            ) {
                 return Err(RuntimeError::new(
                     RuntimeErrorCode::HostUnreachable,
-                    "PTY callback ran before both current provider-reader checks",
+                    "PTY callback ran before provider current-evidence verification",
                 ));
             }
+            let adoption = terminal.opencode_adoption.as_ref().ok_or_else(|| {
+                RuntimeError::new(
+                    RuntimeErrorCode::HostUnreachable,
+                    "PTY callback ran without a verified OpenCode adoption expectation",
+                )
+            })?;
+            adoption.validate()?;
+            if &adoption.incarnation_id != incarnation_id {
+                return Err(RuntimeError::new(
+                    RuntimeErrorCode::HostUnreachable,
+                    "PTY callback received an adoption expectation for another incarnation",
+                ));
+            }
+            *self.adoption_expectation.lock().unwrap() = Some(adoption.clone());
             let persisted: PersistedHostState =
                 serde_json::from_slice(&std::fs::read(state_dir.join("host-state.json")).map_err(
                     |error| RuntimeError::new(RuntimeErrorCode::RegistryFailure, error.to_string()),
@@ -5329,11 +5758,13 @@ mod tests {
         let grant_id = GrantId::new();
         let events = Arc::new(std::sync::Mutex::new(Vec::new()));
         let pty_callback_invoked = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let adoption_expectation = Arc::new(std::sync::Mutex::new(None));
         let effects = SyntheticGrantExecutionEffects {
             failure: None,
             expected_grant_id: grant_id.clone(),
             events: events.clone(),
             pty_callback_invoked: pty_callback_invoked.clone(),
+            adoption_expectation: adoption_expectation.clone(),
             pty_marker: Some(pty_marker),
         };
         let envelope = authenticated_host_envelope(
@@ -5395,7 +5826,7 @@ mod tests {
             .execute(
                 "INSERT INTO session (id,project_id,slug,directory,title,version,time_created,time_updated) VALUES (?1,?2,?3,?4,?5,?6,1,1)",
                 rusqlite::params![
-                    "synthetic-transfer-session",
+                    "ses_synthetictransfersession",
                     "synthetic-project",
                     "synthetic-slug",
                     workspace.to_string_lossy(),
@@ -5409,7 +5840,7 @@ mod tests {
                 "INSERT INTO message (id,session_id,time_created,time_updated,data) VALUES (?1,?2,1,1,?3)",
                 rusqlite::params![
                     "synthetic-message",
-                    "synthetic-transfer-session",
+                    "ses_synthetictransfersession",
                     r#"{"text":"synthetic message body is test-only"}"#
                 ],
             )
@@ -5419,7 +5850,7 @@ mod tests {
         let snapshot = export_exact_session(
             &HostOpenCodeInventory::new(source_database)
                 .with_trusted_mount_for_selected_session(workspace.clone()),
-            "synthetic-transfer-session",
+            "ses_synthetictransfersession",
             ExportOptions::new(root.path().join("extraction")),
         )
         .map_err(|error| error.to_string())?;
@@ -5442,7 +5873,7 @@ mod tests {
             transfer_id: "synthetic-transfer".into(),
             provider: "opencode".into(),
             source_store_id: snapshot.manifest().source_store_id.clone(),
-            root_session_id: "synthetic-transfer-session".into(),
+            root_session_id: "ses_synthetictransfersession".into(),
             source_generation: snapshot.manifest().generation.clone(),
             provider_schema: snapshot.manifest().provider_schema.clone(),
             source_schema_fingerprint: snapshot.manifest().source_schema_fingerprint.clone(),
@@ -5580,6 +6011,7 @@ mod tests {
             provider_launch_context: None,
             opencode_transfer: Some(descriptor.clone()),
             opencode_transfer_attempt_id: Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into()),
+            opencode_adoption: None,
         };
         std::fs::write(
             root.path().join("opencode-transfer-descriptor.json"),
@@ -5633,11 +6065,13 @@ mod tests {
         let grant_id = GrantId::new();
         let events = Arc::new(std::sync::Mutex::new(Vec::new()));
         let pty_callback_invoked = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let adoption_expectation = Arc::new(std::sync::Mutex::new(None));
         let effects = SyntheticGrantExecutionEffects {
             failure,
             expected_grant_id: grant_id.clone(),
             events: events.clone(),
             pty_callback_invoked: pty_callback_invoked.clone(),
+            adoption_expectation: adoption_expectation.clone(),
             pty_marker: None,
         };
         let envelope = authenticated_host_envelope(
@@ -5662,8 +6096,145 @@ mod tests {
             result,
             events,
             pty_callback_invoked,
+            adoption_expectation,
             mount_plan,
             mount_inspection,
+        })
+    }
+
+    async fn run_synthetic_exact_resume(
+        imported: &SyntheticGateAttempt,
+        failure: Option<SyntheticTransferFailure>,
+    ) -> Result<SyntheticResumeAttempt, String> {
+        let root = imported.root.path();
+        let descriptor: OpenCodeTransferDescriptor = serde_json::from_slice(
+            &std::fs::read(root.join("opencode-transfer-descriptor.json"))
+                .map_err(|error| error.to_string())?,
+        )
+        .map_err(|error| error.to_string())?;
+        let terminal: TerminalLaunchSpec = serde_json::from_slice(
+            &std::fs::read(root.join("opencode-terminal.json"))
+                .map_err(|error| error.to_string())?,
+        )
+        .map_err(|error| error.to_string())?;
+        let mut preserved_receipt = imported
+            .state
+            .persisted
+            .try_lock()
+            .map_err(|_| "prior synthetic grant state is still locked")?
+            .opencode_transfer_receipt
+            .clone();
+        if failure == Some(SyntheticTransferFailure::ReadinessIdentityMismatch) {
+            if let Some(receipt) = preserved_receipt.as_mut() {
+                receipt.provider_uid = receipt.provider_uid.wrapping_add(1);
+            }
+        }
+        let incarnation_id = IncarnationId::parse("synthetic-resume-incarnation")
+            .map_err(|error| error.to_string())?;
+        let soul_id = SoulId::parse("synthetic-soul").map_err(|error| error.to_string())?;
+        let host_boot_id = HostBootId::new();
+        let state_dir = root.join("host-state");
+        let persisted_state_path = state_dir.join("host-state.json");
+        if persisted_state_path.exists() {
+            std::fs::remove_file(persisted_state_path).map_err(|error| error.to_string())?;
+        }
+        let home = PathBuf::from(&terminal.env["HOME"]);
+        let state = Arc::new(HostState {
+            incarnation_id: incarnation_id.clone(),
+            host_boot_id: host_boot_id.clone(),
+            state_dir,
+            secret: b"synthetic-host-secret-0123456789abcdef".to_vec(),
+            requested_limits: RuntimeLimits {
+                cpu_milli: 500,
+                memory_bytes: 128 * 1024 * 1024,
+                swap_bytes: 0,
+                pids_max: 64,
+            },
+            persisted: Mutex::new(PersistedHostState {
+                host_boot_id: Some(host_boot_id.clone()),
+                opencode_transfer_receipt: preserved_receipt,
+                ..PersistedHostState::default()
+            }),
+            child: Mutex::new(None),
+            pty: Mutex::new(None),
+            fresh_agent: Mutex::new(None),
+            provider_config_paths: ProviderConfigPaths {
+                private_mount: root.join("private"),
+                provider_home: home,
+            },
+            // A resume must not inspect or consume the staging mount.
+            opencode_transfer_mount: root.join("missing-transfer-mount"),
+            bootstrap_root: root.join("bootstrap"),
+        });
+
+        let resume_spec = ResumeSpec {
+            schema_version: freshell_runtime_protocol::RESUME_SPEC_SCHEMA_VERSION,
+            provider_session: freshell_runtime_protocol::ProviderSessionRef {
+                provider: "opencode".into(),
+                provider_store_id: descriptor.destination_store_id.clone(),
+                native_session_id: descriptor.root_session_id.clone(),
+            },
+            mode: "opencode".into(),
+            runtime_variant: "managed_terminal_pty".into(),
+            fixture_transport: None,
+            program: terminal.program.clone(),
+            resume_argv: Vec::new(),
+            provider_home: terminal.env["HOME"].clone(),
+            provider_volume: None,
+            cwd: terminal.cwd.clone(),
+            workspace_path: terminal.workspace_path.clone(),
+            project_key: Some(terminal.project_key.clone()),
+            runtime_profile: None,
+            environment: terminal.env.clone(),
+            model: None,
+            reasoning_effort: None,
+            permission_mode: None,
+            image_ref: Some(descriptor.target_image_ref.clone()),
+            provider_version: Some("opencode-1.18.21".into()),
+            credential_references: Vec::new(),
+            identity_provenance: freshell_runtime_protocol::IdentityProvenance::Imported,
+            durable_position: freshell_runtime_protocol::DurablePosition::default(),
+            checkpoint_references: Vec::new(),
+            creation_seed_ref: "synthetic-seed".into(),
+            checkpoint_revision: 0,
+            allocation_state: freshell_runtime_protocol::AllocationState::VerifiedDurable,
+            evidence_revision: 1,
+            never_dispatched: false,
+        };
+        let grant_id = GrantId::new();
+        let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let pty_callback_invoked = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let adoption_expectation = Arc::new(std::sync::Mutex::new(None));
+        let effects = SyntheticGrantExecutionEffects {
+            failure,
+            expected_grant_id: grant_id.clone(),
+            events: events.clone(),
+            pty_callback_invoked: pty_callback_invoked.clone(),
+            adoption_expectation: adoption_expectation.clone(),
+            pty_marker: None,
+        };
+        let envelope = authenticated_host_envelope(
+            &state,
+            HostCommand::GrantExecution {
+                incarnation_id,
+                soul_id,
+                host_boot_id,
+                control_epoch: 2,
+                execution_generation: 2,
+                grant_id,
+                fixture: None,
+                terminal: Some(Box::new(terminal)),
+                fresh_agent: None,
+                resume_spec: Some(Box::new(resume_spec)),
+            },
+        );
+        let result = dispatch_with_effects(envelope, &state, &effects).await;
+        Ok(SyntheticResumeAttempt {
+            state,
+            result,
+            events,
+            pty_callback_invoked,
+            adoption_expectation,
         })
     }
 
@@ -5759,7 +6330,7 @@ mod tests {
                     .opencode_transfer_receipt
                     .expect("registry readiness receipt is part of the same durable state");
                 assert_eq!(receipt.transfer_id, "synthetic-transfer");
-                assert_eq!(receipt.root_session_id, "synthetic-transfer-session");
+                assert_eq!(receipt.root_session_id, "ses_synthetictransfersession");
             }
 
             let marker = root.join("synthetic-pty-invoked");
