@@ -58,7 +58,7 @@ type DockerResponse = {
 export class RestrictedDockerBroker {
   private readonly knownContainerIds = new Set<string>()
   private readonly receiptsById = new Map<string, BrokerReceipt>()
-  private readonly historyHelpers = new Map<string, { owner: BrokerReceipt; containerId?: string }>()
+  private readonly historyHelpers = new Map<string, { owner: BrokerReceipt; containerId?: string; kind: 'history' | 'auth' }>()
   private readonly events: BrokerEvent[] = []
   private server?: http.Server
   private stopFailuresRemaining = 0
@@ -144,7 +144,7 @@ export class RestrictedDockerBroker {
       return
     }
 
-    const helperTarget = url.match(/^\/v1\.47\/containers\/([^/?]+)(?:\/(start|wait|logs))?(?:\?.*)?$/)
+    const helperTarget = url.match(/^\/v1\.47\/containers\/([^/?]+)(?:\/(start|wait|logs|json))?(?:\?.*)?$/)
     const helperEntry = helperTarget && [...this.historyHelpers].find(([name, helper]) => (
       helperTarget[1] === name || helperTarget[1] === helper.containerId
     ))
@@ -153,7 +153,8 @@ export class RestrictedDockerBroker {
       const exactId = helperTarget![1] === helper.containerId
       const allowed = (method === 'POST' && exactId && url === `${DOCKER_API_PREFIX}/containers/${helper.containerId}/start`)
         || (method === 'POST' && exactId && url === `${DOCKER_API_PREFIX}/containers/${helper.containerId}/wait?condition=not-running`)
-        || (method === 'GET' && exactId && [0, 1].some((stderr) => url === `${DOCKER_API_PREFIX}/containers/${helper.containerId}/logs?stdout=1&stderr=${stderr}`))
+        || (method === 'GET' && helper.kind === 'history' && exactId && [0, 1].some((stderr) => url === `${DOCKER_API_PREFIX}/containers/${helper.containerId}/logs?stdout=1&stderr=${stderr}`))
+        || (method === 'GET' && helper.kind === 'auth' && url === `${DOCKER_API_PREFIX}/containers/${helperTarget![1]}/json`)
         || (method === 'DELETE' && url === `${DOCKER_API_PREFIX}/containers/${helperTarget![1]}?force=1`)
       if (allowed) {
         const forwarded = await this.forward(request, body)
@@ -166,14 +167,15 @@ export class RestrictedDockerBroker {
 
     if (method === 'POST' && url.startsWith(`${DOCKER_API_PREFIX}/containers/create?`)) {
       const name = new URL(url, 'http://docker').searchParams.get('name') ?? ''
-      if (name.startsWith('freshell-history-')) {
-        const owner = this.validateHistoryHelper(name, body)
+      if (name.startsWith('freshell-history-') || name.startsWith('freshell-auth-')) {
+        const kind = name.startsWith('freshell-auth-') ? 'auth' : 'history'
+        const owner = kind === 'auth' ? this.validateAuthHelper(name, body) : this.validateHistoryHelper(name, body)
         if (!owner || this.historyHelpers.has(name)) {
           this.block(response, method, url, 403, 'history helper does not match an owned read-only source', false)
           return
         }
         // Reserve the exact validated name before forwarding: Docker may create it but lose its acknowledgement.
-        const helper: { owner: BrokerReceipt; containerId?: string } = { owner }
+        const helper: { owner: BrokerReceipt; containerId?: string; kind: 'history' | 'auth' } = { owner, kind }
         this.historyHelpers.set(name, helper)
         try {
           const forwarded = await this.forward(request, body)
@@ -420,6 +422,34 @@ export class RestrictedDockerBroker {
     const binary = mounts.find((mount) => mount.Type === 'bind' && mount.Target === '/runtime/freshell-session-host' && mount.ReadOnly === true)
     const volume = mounts.find((mount) => mount.Type === 'volume' && mount.Target === '/home/freshell/provider' && mount.ReadOnly === true)
     if (!binary || !volume || !this.policy.allowedHostBinaryPaths.has(binary.Source) || !this.policy.allowedImageRefs.has(parsed.Image)) return
+    return this.receipts().find((receipt) => receipt.providerVolumeName === volume.Source
+      && receipt.imageRef === parsed.Image && receipt.hostBinaryPath === binary.Source)
+  }
+
+  private validateAuthHelper(name: string, body: Buffer): BrokerReceipt | undefined {
+    const uuid = '[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}'
+    if (!new RegExp(`^freshell-auth-${uuid}$`).test(name)) return
+    let parsed: Record<string, any>
+    try { parsed = JSON.parse(body.toString('utf8')) } catch { return }
+    const host = parsed.HostConfig ?? {}
+    const same = (actual: unknown, expected: unknown) => JSON.stringify(actual) === JSON.stringify(expected)
+    if (Object.keys(parsed.Labels ?? {}).length !== 0 || parsed.User !== '65534:0' || parsed.Tty !== false
+      || !same(parsed.Entrypoint, ['/runtime/freshell-session-host']) || !same(parsed.Cmd, ['native-auth-only'])
+      || !same(parsed.Env, ['HOME=/home/freshell/provider'])) return
+    if (host.NetworkMode !== 'none' || host.ReadonlyRootfs !== true || host.Privileged === true
+      || (host.PidMode ?? '') !== '' || (host.Binds?.length ?? 0) !== 0 || (host.CapAdd?.length ?? 0) !== 0
+      || !same(host.CapDrop, ['ALL']) || !same(host.SecurityOpt, ['no-new-privileges'])
+      || host.Memory !== 256 * 1024 * 1024 || host.MemorySwap !== 256 * 1024 * 1024
+      || host.NanoCpus !== 500_000_000 || host.PidsLimit !== 32 || Object.keys(host.Tmpfs ?? {}).length !== 0
+      || !same(host.LogConfig, { Type: 'none', Config: {} })) return
+    const mounts = host.Mounts
+    if (!Array.isArray(mounts) || mounts.length !== 3) return
+    const binary = mounts.find((mount) => mount.Type === 'bind' && mount.Target === '/runtime/freshell-session-host' && mount.ReadOnly === true)
+    const volume = mounts.find((mount) => mount.Type === 'volume' && mount.Target === '/home/freshell/provider' && mount.ReadOnly === true && same(mount.VolumeOptions, { NoCopy: true }))
+    const exchange = mounts.find((mount) => mount.Type === 'bind' && mount.Target === '/run/freshell-auth-exchange' && mount.ReadOnly === true)
+    if (!binary || !volume || !exchange || typeof exchange.Source !== 'string'
+      || !new RegExp(`^freshell-auth-${uuid}$`).test(path.basename(exchange.Source)) || path.dirname(exchange.Source) !== os.tmpdir()
+      || !this.policy.allowedHostBinaryPaths.has(binary.Source) || !this.policy.allowedImageRefs.has(parsed.Image)) return
     return this.receipts().find((receipt) => receipt.providerVolumeName === volume.Source
       && receipt.imageRef === parsed.Image && receipt.hostBinaryPath === binary.Source)
   }

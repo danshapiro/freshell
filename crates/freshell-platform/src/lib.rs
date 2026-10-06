@@ -58,6 +58,7 @@ pub mod git_meta;
 pub mod host_stats_readers;
 pub mod managed_child_secrets;
 pub mod mcp_inject;
+pub mod native_auth_exchange;
 pub mod opencode_config;
 pub mod opencode_plugin;
 pub mod path;

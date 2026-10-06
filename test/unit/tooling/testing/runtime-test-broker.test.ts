@@ -183,6 +183,53 @@ function historyHelperBody() {
   }
 }
 
+const authName = 'freshell-auth-11111111-1111-4111-8111-111111111111'
+function authHelperBody(): any {
+  const body: any = historyHelperBody()
+  body.Tty = false
+  body.Cmd = ['native-auth-only']
+  delete body.HostConfig.Tmpfs
+  body.HostConfig.LogConfig = { Type: 'none', Config: {} }
+  body.HostConfig.Mounts[1].VolumeOptions = { NoCopy: true }
+  body.HostConfig.Mounts.push({ Type: 'bind', Source: `/tmp/${authName}`, Target: '/run/freshell-auth-exchange', ReadOnly: true })
+  return body
+}
+
+describe('receipt-owned auth exchange HTTP routes', () => {
+  it('allows only the fixed private helper, lifecycle and ownership inspection with Docker logs disabled', async () => {
+    await withHttpBroker(async ({ request, forwarded }) => {
+      await request('POST', '/v1.47/containers/create?name=owned-runtime', createBody([...ordinaryBinds, actorBind]))
+      const mutations = [
+        (body: any) => { body.Cmd.push('PRIVATE_SENTINEL') },
+        (body: any) => { body.HostConfig.LogConfig.Type = 'json-file' },
+        (body: any) => { body.HostConfig.Mounts[1].ReadOnly = false },
+        (body: any) => { body.HostConfig.Mounts[2].Source = '/tmp/unapproved' },
+        (body: any) => { body.HostConfig.Mounts[2].ReadOnly = false },
+        (body: any) => { body.Env.push('SECRET=PRIVATE_SENTINEL') },
+      ]
+      for (const mutate of mutations) {
+        const body = authHelperBody()
+        mutate(body)
+        const before = forwarded.length
+        expect((await request('POST', `/v1.47/containers/create?name=${authName}`, body)).status).toBe(403)
+        expect(forwarded).toHaveLength(before)
+      }
+      expect((await request('POST', `/v1.47/containers/create?name=${authName}`, authHelperBody())).status).toBe(201)
+      expect((await request('POST', `/v1.47/containers/${helperId}/start`)).status).toBe(204)
+      expect((await request('POST', `/v1.47/containers/${helperId}/wait?condition=not-running`)).status).toBe(200)
+      expect((await request('GET', `/v1.47/containers/${authName}/json`)).status).toBe(200)
+      const before = forwarded.length
+      expect((await request('GET', `/v1.47/containers/${helperId}/logs?stdout=1&stderr=1`)).status).toBe(403)
+      expect((await request('POST', `/v1.47/containers/${helperId}/stop`)).status).toBe(403)
+      expect(forwarded).toHaveLength(before)
+      expect((await request('DELETE', `/v1.47/containers/${authName}?force=1`)).status).toBe(204)
+      expect(forwarded.filter((operation) => operation.method === 'DELETE')).toEqual([
+        { method: 'DELETE', url: `/v1.47/containers/${authName}?force=1`, body: undefined },
+      ])
+    })
+  })
+})
+
 type ForwardedRequest = { method: string; url: string; body: any }
 type BrokerHttpFixture = {
   request(method: string, url: string, body?: unknown): Promise<{ status: number; body: string }>

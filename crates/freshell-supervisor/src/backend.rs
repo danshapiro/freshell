@@ -1,4 +1,5 @@
 pub mod docker;
+mod native_auth;
 mod native_history;
 
 use crate::registry::OwnedRuntimeHandle;
@@ -117,6 +118,16 @@ pub struct BackendInspection {
 
 #[async_trait]
 pub trait RuntimeBackend: Send + Sync {
+    async fn read_native_auth(
+        &self,
+        _handle: &OwnedRuntimeHandle,
+        _keys: &[String],
+        _reader_binary: &Path,
+    ) -> Result<BTreeMap<String, String>, BackendError> {
+        Err(BackendError::Unavailable(
+            "native auth reader unavailable".into(),
+        ))
+    }
     async fn read_native_history(
         &self,
         _handle: &OwnedRuntimeHandle,
@@ -498,6 +509,20 @@ fn runtime_host_environment(
 
 #[async_trait]
 impl RuntimeBackend for DockerEngineBackend {
+    async fn read_native_auth(
+        &self,
+        handle: &OwnedRuntimeHandle,
+        keys: &[String],
+        reader_binary: &Path,
+    ) -> Result<BTreeMap<String, String>, BackendError> {
+        self.read_auth_helper(
+            handle,
+            keys,
+            reader_binary,
+            std::time::Duration::from_secs(20),
+        )
+        .await
+    }
     async fn read_native_history(
         &self,
         handle: &OwnedRuntimeHandle,

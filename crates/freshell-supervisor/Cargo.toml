@@ -13,6 +13,7 @@ provider-qualification = ["freshell-agent-runtime/provider-qualification"]
 [dependencies]
 freshell-agent-runtime = { path = "../freshell-agent-runtime" }
 freshell-runtime-protocol = { path = "../freshell-runtime-protocol" }
+freshell-platform = { path = "../freshell-platform" }
 freshell-runtime-observability = { path = "../freshell-runtime-observability" }
 serde = { workspace = true }
 serde_json = { workspace = true }

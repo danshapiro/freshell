@@ -116,6 +116,12 @@ async fn run() -> Result<(), String> {
     match args.get(1).map(String::as_str) {
         Some("serve") => serve(&args[2..]).await,
         Some("worker") => worker(&args[2..]).await,
+        Some("native-auth-only") if args.len() == 2 => {
+            freshell_platform::native_auth_exchange::serve(
+                Path::new("/home/freshell/provider"),
+                Path::new("/run/freshell-auth-exchange/reply.sock"),
+            ).map_err(str::to_owned)
+        }
         Some("native-history-only") => {
             let snapshot = freshell_freshagent::native_history::read(
                 &required_arg(&args[2..], "--provider")?,
