@@ -1950,34 +1950,33 @@ fn prepare_provider_files(
     run_as_uid: u32,
     run_as_gid: u32,
 ) -> Result<(), String> {
-    let auth_dir = Path::new("/tmp/freshell-provider-auth");
-    std::fs::create_dir_all(auth_dir).map_err(|error| error.to_string())?;
-    set_mode(auth_dir, 0o711)?;
-    let home = Path::new("/home/freshell/provider");
-    if !home.exists() && provider_files.is_empty() && configuration_files.is_empty() {
+    prepare_provider_files_at(
+        Path::new("/home/freshell/provider"),
+        Path::new("/tmp/freshell-provider-auth"),
+        provider,
+        provider_files,
+        configuration_files,
+        run_as_uid,
+        run_as_gid,
+    )
+}
+
+fn prepare_provider_files_at(
+    home: &Path,
+    auth_dir: &Path,
+    _provider: &str,
+    provider_files: &[(&str, Vec<u8>)],
+    configuration_files: &[(String, PathBuf)],
+    run_as_uid: u32,
+    run_as_gid: u32,
+) -> Result<(), String> {
+    if provider_files.is_empty() && configuration_files.is_empty() {
         return Ok(());
     }
-    let legacy_relative = match provider {
-        "claude" => Some(".claude/.credentials.json"),
-        "codex" => Some(".codex/auth.json"),
-        "opencode" => Some(".local/share/opencode/auth.json"),
-        _ => None,
-    };
-    if let Some(relative) = legacy_relative {
-        let destination = home.join(relative);
-        // A pre-OneCLI soul can contain a raw bootstrap copy. The provider
-        // uid owns the durable HOME and removes that copy before any child runs.
-        run_provider_path_command(
-            run_as_uid,
-            run_as_gid,
-            "/usr/bin/rm",
-            &[
-                "-f",
-                "--",
-                destination.to_str().ok_or("auth path is not UTF-8")?,
-            ],
-        )?;
-    }
+    std::fs::create_dir_all(auth_dir).map_err(|error| error.to_string())?;
+    set_mode(auth_dir, 0o711)?;
+    // Retain native auth until a matching typed grant has been written and
+    // owned. The final destination replacement occurs only for that grant.
     for (index, (relative, contents)) in provider_files.iter().enumerate() {
         let destination = home.join(relative);
         let target = auth_dir.join(format!("provider-{index}"));
@@ -2101,16 +2100,8 @@ fn run_provider_path_command(
     args: &[&str],
 ) -> Result<(), String> {
     let status = std::process::Command::new("/usr/bin/setpriv")
-        .args([
-            "--reuid",
-            &uid.to_string(),
-            "--regid",
-            &gid.to_string(),
-            "--clear-groups",
-            "--no-new-privs",
-            "--",
-            program,
-        ])
+        .args(provider_identity_args(uid, gid))
+        .arg(program)
         .args(args)
         .status()
         .map_err(|error| format!("provider-owned auth path operation failed to start: {error}"))?;
@@ -2803,6 +2794,56 @@ fn now_millis() -> i64 {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn provider_native_auth_survives_without_matching_typed_replacement() {
+        use super::*;
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("home");
+        let auth = home.join(".local/share/opencode/auth.json");
+        std::fs::create_dir_all(auth.parent().unwrap()).unwrap();
+        let native = r#"{"native":{"type":"api","key":"durable-nonce"}}"#;
+        std::fs::write(&auth, native).unwrap();
+        let uid = unsafe { libc::geteuid() };
+        let gid = unsafe { libc::getegid() };
+        prepare_provider_files_at(
+            &home,
+            &root.path().join("empty-auth"),
+            "opencode",
+            &[],
+            &[],
+            uid,
+            gid,
+        )
+        .unwrap();
+        assert_eq!(std::fs::read_to_string(&auth).unwrap(), native);
+        prepare_provider_files_at(
+            &home,
+            &root.path().join("ca-only"),
+            "opencode",
+            &[(".freshell/opencode/ca.pem", b"synthetic-ca".to_vec())],
+            &[],
+            uid,
+            gid,
+        )
+        .unwrap();
+        assert_eq!(std::fs::read_to_string(&auth).unwrap(), native);
+        let replacement = b"{\"typed\":true}";
+        prepare_provider_files_at(
+            &home,
+            &root.path().join("typed-auth"),
+            "opencode",
+            &[(".local/share/opencode/auth.json", replacement.to_vec())],
+            &[],
+            uid,
+            gid,
+        )
+        .unwrap();
+        assert_eq!(std::fs::read(&auth).unwrap(), replacement);
+        assert!(std::fs::symlink_metadata(&auth)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+    }
     use super::*;
 
     #[cfg(unix)]
@@ -3802,7 +3843,13 @@ mod tests {
         };
         use std::os::unix::fs::PermissionsExt;
 
-        let workspace = tempfile::tempdir().unwrap();
+        // runtime-suite /tmp is deliberately non-executable. Its existing
+        // cargo target volume is the owned executable-fixture filesystem.
+        let workspace = match std::env::var_os("FRESHELL_TEST_EXECUTABLE_TMP_DIR") {
+            Some(directory) => tempfile::tempdir_in(directory),
+            None => tempfile::tempdir(),
+        }
+        .unwrap();
         std::fs::set_permissions(workspace.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
         let provider_home = workspace.path().join("provider-home");
         let source_config = workspace.path().join("opencode.json");
@@ -3849,7 +3896,7 @@ mod tests {
         let launcher = workspace.path().join("exact-resume-provider");
         std::fs::write(
             &launcher,
-            "#!/bin/sh\ncat \"$TEST_CONFIG_PATH\" > \"$TEST_OUTPUT_PATH\"\nexec sleep 60\n",
+            "#!/bin/sh\nset -e\ncat \"$TEST_CONFIG_PATH\" > \"$TEST_OUTPUT_PATH.tmp\"\nmv \"$TEST_OUTPUT_PATH.tmp\" \"$TEST_OUTPUT_PATH\"\nexec sleep 60\n",
         )
         .unwrap();
         std::fs::set_permissions(&launcher, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -3971,14 +4018,17 @@ mod tests {
             }
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
-        assert_eq!(
-            observed.as_deref(),
-            Some(br#"{"model":"second"}"#.as_slice())
-        );
         let mut launched_pty = state.pty.lock().await.take();
+        let mut diagnostics = None;
         if let Some(mut pty) = launched_pty.take() {
+            diagnostics = Some(pty.read_output(state.incarnation_id.clone(), 0, 64 * 1024, None));
             pty.stop().await;
         }
+        assert_eq!(
+            observed.as_deref(),
+            Some(br#"{"model":"second"}"#.as_slice()),
+            "synthetic provider fixture output: {diagnostics:?}",
+        );
     }
 
     #[test]
