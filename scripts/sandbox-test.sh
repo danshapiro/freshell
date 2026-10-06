@@ -37,6 +37,11 @@ if [ "${1:-}" = "--provider-inputs" ]; then
   exec python3 "${REPO_ROOT}/scripts/testing/probe-provider-config-readonly-home.py" --indexed-inputs "$@"
 fi
 
+if [ "${1:-}" = "--provider-sources" ]; then
+  shift
+  exec python3 "${REPO_ROOT}/scripts/testing/managed-provider-source-sandbox.py" "$@"
+fi
+
 if [ "${1:-}" = "--native-tools" ]; then
   NATIVE_MANIFEST="${2:-}"
   if [ -z "${NATIVE_MANIFEST}" ]; then

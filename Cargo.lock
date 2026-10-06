@@ -1467,6 +1467,8 @@ dependencies = [
  "regex",
  "reqwest",
  "rusqlite",
+ "saphyr",
+ "saphyr-parser",
  "serde",
  "serde_json",
  "sha1",

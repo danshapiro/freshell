@@ -27,6 +27,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 const CAPABILITY_PATH: &str = ".freshell/mcp-capability.json";
 const GRANT_LIFETIME_SECS: u64 = 30 * 24 * 60 * 60;
 const RENEWAL_WINDOW_SECS: u64 = 7 * 24 * 60 * 60;
+mod amplifier_resources;
 mod source_stage;
 
 #[derive(Clone, Copy, Default)]
@@ -774,6 +775,50 @@ fn stage_provider_root(
             source: resource_root,
             destination_relative: ".freshell/resources".into(),
         }];
+        let mut excluded = provider_credential_sources(&source);
+        for path in [
+            ".claude/.credentials.json",
+            ".codex/auth.json",
+            ".local/share/opencode/auth.json",
+            ".config/opencode/auth.json",
+            ".amplifier/keys.env",
+            ".amplifier/.env",
+            // Native conversations/history/logs remain in their own stores;
+            // an alias cannot turn them into selected package resources.
+            ".claude/projects",
+            ".claude/history.jsonl",
+            ".claude/debug",
+            ".codex/sessions",
+            ".codex/archived_sessions",
+            ".codex/history.jsonl",
+            ".codex/log",
+            ".amplifier/projects",
+            ".local/share/opencode/storage",
+            ".local/share/opencode/opencode.db",
+            ".local/share/opencode/opencode.db-wal",
+            ".local/share/opencode/opencode.db-shm",
+        ] {
+            if let Ok(canonical) = std::fs::canonicalize(home.join(path)) {
+                excluded.push(canonical);
+            }
+        }
+        excluded.extend(
+            crate::managed_provider_bootstrap::named_provider_onecli_references(provider)?
+                .into_iter()
+                .map(|reference| PathBuf::from(reference.source_path)),
+        );
+        let amplifier_resources = if provider == "amplifier" {
+            Some(amplifier_resources::prepare(
+                home,
+                opencode_input.cwd.unwrap_or(home),
+                &excluded,
+            )?)
+        } else {
+            None
+        };
+        if let Some(resources) = &amplifier_resources {
+            selections.extend(resources.selections.iter().cloned());
+        }
         for reference in references {
             if reference.root != ProviderConfigRoot::UserProvider {
                 return Err("managed provider selector is unsafe".into());
@@ -876,38 +921,6 @@ fn stage_provider_root(
             provider,
             selections = selections.len()
         );
-        let mut excluded = provider_credential_sources(&source);
-        for path in [
-            ".claude/.credentials.json",
-            ".codex/auth.json",
-            ".local/share/opencode/auth.json",
-            ".config/opencode/auth.json",
-            ".amplifier/keys.env",
-            ".amplifier/.env",
-            // Native conversations/history/logs remain in their own stores;
-            // an alias cannot turn them into selected package resources.
-            ".claude/projects",
-            ".claude/history.jsonl",
-            ".claude/debug",
-            ".codex/sessions",
-            ".codex/archived_sessions",
-            ".codex/history.jsonl",
-            ".codex/log",
-            ".amplifier/projects",
-            ".local/share/opencode/storage",
-            ".local/share/opencode/opencode.db",
-            ".local/share/opencode/opencode.db-wal",
-            ".local/share/opencode/opencode.db-shm",
-        ] {
-            if let Ok(canonical) = std::fs::canonicalize(home.join(path)) {
-                excluded.push(canonical);
-            }
-        }
-        excluded.extend(
-            crate::managed_provider_bootstrap::named_provider_onecli_references(provider)?
-                .into_iter()
-                .map(|reference| PathBuf::from(reference.source_path)),
-        );
         let report=copy_environment(&selections,&temporary,&excluded,CopyLimits::default()).map_err(|error| {
             tracing::error!(event="provider.environment.copy.failed",stage="controller",provider,operation=error.operation,relative_path=%error.relative_path.display(),limit_kind=error.limit_kind,observed=error.observed,permitted=error.permitted,elapsed_ms=started.elapsed().as_millis() as u64,corrective_message=%error.corrective_message);
             error.to_string()
@@ -920,6 +933,17 @@ fn stage_provider_root(
             bytes = report.bytes,
             elapsed_ms = started.elapsed().as_millis() as u64
         );
+        if let Some(resources) = amplifier_resources {
+            if let Some(settings) = resources.rewritten_settings {
+                replace_staged_private_bytes(
+                    &temporary.join("settings.yaml"),
+                    settings.as_bytes(),
+                )?;
+            }
+            for (relative, template) in resources.rewritten_resources {
+                replace_staged_private_bytes(&temporary.join(relative), template.as_bytes())?;
+            }
+        }
         if let Some(plan) = opencode_input.source_plan {
             source_stage::stage(
                 &temporary,
@@ -936,6 +960,24 @@ fn stage_provider_root(
         let _ = std::fs::remove_dir_all(&temporary);
     }
     result
+}
+
+fn replace_staged_private_bytes(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    let metadata = std::fs::symlink_metadata(path)
+        .map_err(|_| "selected source was not copied into its owned stage")?;
+    if !(metadata.is_file() || metadata.file_type().is_symlink()) {
+        return Err("selected source stage destination is not a file".into());
+    }
+    let parent = path
+        .parent()
+        .ok_or("selected source stage parent unavailable")?;
+    let temporary = parent.join(format!(".source-template-{}", uuid::Uuid::new_v4()));
+    write_private_bytes(&temporary, bytes)?;
+    if let Err(error) = std::fs::rename(&temporary, path) {
+        let _ = std::fs::remove_file(&temporary);
+        return Err(error.to_string());
+    }
+    Ok(())
 }
 
 fn stage_tui_source(
@@ -1559,6 +1601,186 @@ pub(crate) async fn scoped_auth_middleware(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(all(unix, feature = "managed-provider-qualification"))]
+    #[test]
+    fn managed_provider_amplifier_native_local_bundle_survives_transport() {
+        use freshell_platform::provider_environment::{
+            copy_environment, CopyLimits, CopySelection,
+        };
+        use sha2::{Digest, Sha256};
+        for case in [
+            "collection-alias",
+            "merge-key",
+            "relative-context",
+            "absolute-context",
+            "parent-context",
+            "unicode-source",
+            "scalar-alias",
+            "home-document",
+            "directory-source",
+        ] {
+            let root = executable_fixture_directory();
+            let home = root.path().join("source-home");
+            let bundle = if case == "home-document" {
+                home.clone()
+            } else {
+                root.path().join(if case == "unicode-source" {
+                    "资源 with spaces"
+                } else {
+                    "outside-bundle"
+                })
+            };
+            std::fs::create_dir_all(home.join(".amplifier")).unwrap();
+            std::fs::create_dir_all(&bundle).unwrap();
+            let payload = b"synthetic-amplifier-context-nonce";
+            let context = if case == "parent-context" {
+                root.path().join("context.txt")
+            } else {
+                bundle.join("context.txt")
+            };
+            std::fs::write(&context, payload).unwrap();
+            let context_reference = if case == "absolute-context" {
+                context.to_string_lossy().into_owned()
+            } else if case == "parent-context" {
+                "../context.txt".into()
+            } else {
+                "./context.txt".into()
+            };
+            std::fs::write(
+                bundle.join("bundle.yaml"),
+                format!(
+                    "bundle:\n  name: source-probe\n  version: 1.0.0\ncontext:\n  probe: {}\n",
+                    serde_json::to_string(&context_reference).unwrap()
+                ),
+            )
+            .unwrap();
+            let selected = if case == "directory-source" {
+                bundle.clone()
+            } else {
+                bundle.join("bundle.yaml")
+            };
+            let quoted = serde_json::to_string(&format!("file://{}", selected.display())).unwrap();
+            let settings = if case == "scalar-alias" {
+                format!("selected: &bundle_source {quoted}\nbundle:\n  active: *bundle_source\n")
+            } else if case == "collection-alias" {
+                format!("defaults: &bundle_map\n  active: {quoted}\nbundle: *bundle_map\nadjacent: *bundle_map\n")
+            } else if case == "merge-key" {
+                format!("defaults: &bundle_map\n  active: {quoted}\nbundle:\n  <<: *bundle_map\nadjacent: *bundle_map\n")
+            } else {
+                format!("# unchanged α comment\nbundle:\n  active: {quoted}\n")
+            };
+            std::fs::write(home.join(".amplifier/settings.yaml"), settings).unwrap();
+            std::fs::write(bundle.join("private-unselected"), b"UNSELECTED_HOME_NONCE").unwrap();
+            let references = provider_source_references("amplifier", &home).unwrap();
+            let capabilities = root.path().join("capabilities");
+            std::fs::create_dir(&capabilities).unwrap();
+            let staged = stage_provider_root(
+                &capabilities,
+                "grant-native-amplifier",
+                "amplifier",
+                &home,
+                &references,
+                OpencodeEphemeralInput::default(),
+                None,
+            )
+            .unwrap();
+            let selections = references
+                .iter()
+                .map(|reference| CopySelection {
+                    source: staged.join(&reference.relative_path),
+                    destination_relative: reference.provider_relative_path.clone().into(),
+                })
+                .collect::<Vec<_>>();
+            let runtime_home = Path::new("/home/freshell/provider");
+            copy_environment(&selections, runtime_home, &[], CopyLimits::default()).unwrap();
+            if case == "home-document" {
+                assert!(!runtime_home.join(".freshell/resources/amplifier-local-0/private-unselected").exists(),
+            "selecting a standalone document in HOME must not transport unrelated home files");
+            }
+            std::fs::remove_dir_all(&bundle).unwrap();
+            if case == "parent-context" {
+                std::fs::remove_file(context).unwrap();
+            }
+            let consumer = root.path().join("native-amplifier-consumer.py");
+            std::fs::write(&consumer,r#"import asyncio, hashlib, json, os, sys
+from pathlib import Path
+phase = 'native_settings_shape'
+async def consume():
+    global phase
+    from amplifier_app_cli.lib.settings import AppSettings, SettingsPaths
+    home = Path(os.environ['HOME'])
+    settings = AppSettings(SettingsPaths(global_settings=home/'.amplifier/settings.yaml', project_settings=home/'absent-project.yaml', local_settings=home/'absent-local.yaml', session_settings=None))
+    phase = 'native_settings_load'
+    selected = settings.get_active_bundle()
+    if not isinstance(selected, str) or not selected.startswith('file://'):
+        raise TypeError('fixture requires one local bundle source')
+    from amplifier_foundation import BundleRegistry, load_bundle
+    phase = 'native_bundle_load'
+    bundle = await load_bundle(selected, registry=BundleRegistry(strict=True))
+    phase = 'native_context_resolution'
+    bundle.resolve_pending_context()
+    resource = Path(bundle.context['probe'])
+    phase = 'native_context_read'
+    data = resource.read_bytes()
+    adjacent = settings.get_merged_settings().get('adjacent', {}).get('active')
+    print(json.dumps({'ok':True,'digest':hashlib.sha256(data).hexdigest(), 'adjacentDigest':hashlib.sha256(adjacent.encode()).hexdigest() if isinstance(adjacent,str) else None}))
+try:
+    asyncio.run(consume())
+except Exception as error:
+    print(json.dumps({'ok':False,'phase':phase,'errorClass':type(error).__name__}))
+    sys.exit(73)
+"#).unwrap();
+            let output = std::process::Command::new("/opt/amplifier-src/.venv/bin/python")
+                .arg("-B")
+                .arg(&consumer)
+                .env_clear()
+                .env("HOME", runtime_home)
+                .env("AMPLIFIER_HOME", runtime_home.join(".amplifier"))
+                .env("PATH", "/usr/local/bin:/usr/bin:/bin")
+                .env("LANG", "C.UTF-8")
+                .current_dir(root.path())
+                .output()
+                .expect("closed pinned native fixture must provide its image interpreter");
+            let line = std::str::from_utf8(&output.stdout)
+                .unwrap()
+                .lines()
+                .last()
+                .unwrap_or("");
+            let receipt: serde_json::Value = serde_json::from_str(line)
+                .expect("native fixture emits only bounded classified receipt");
+            assert!(
+                output.status.success(),
+                "transported native consumer failed: phase={} errorClass={}",
+                receipt["phase"],
+                receipt["errorClass"]
+            );
+            assert_eq!(receipt["digest"], format!("{:x}", Sha256::digest(payload)));
+            if matches!(case, "collection-alias" | "merge-key") {
+                assert_eq!(receipt["adjacentDigest"],format!("{:x}",Sha256::digest(format!("file://{}",selected.display()).as_bytes())),
+                "rewriting a recognized bundle source must retain the neighboring native alias value");
+            }
+            println!(
+                "provider_source_consumer {}",
+                serde_json::json!({"provider":"amplifier","case":case,"digest":receipt["digest"]})
+            );
+            // Each case consumes one physical synthetic HOME; remove only its
+            // fixture projection before the next independent native consumer.
+            for relative in [
+                ".amplifier",
+                ".freshell",
+                "absent-project.yaml",
+                "absent-local.yaml",
+            ] {
+                let path = runtime_home.join(relative);
+                if path.is_dir() {
+                    std::fs::remove_dir_all(path).unwrap();
+                } else if path.exists() {
+                    std::fs::remove_file(path).unwrap();
+                }
+            }
+        }
+    }
 
     #[cfg(unix)]
     #[test]
