@@ -12,6 +12,7 @@ use freshell_supervisor::{
     registry::{BackendCreatedRecord, LaunchPreparation, OwnedRuntimeHandle, Registry},
     service::{serve_control, Supervisor, SupervisorConfig},
 };
+use sha2::Digest;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Mutex,
@@ -114,6 +115,18 @@ async fn fixture_fresh_soul(
     session_type: &str,
     native_id: &str,
 ) -> (Registry, RuntimeView) {
+    fixture_fresh_soul_with_cleanup(root, certify_loss, provider, session_type, native_id, false)
+        .await
+}
+
+async fn fixture_fresh_soul_with_cleanup(
+    root: &std::path::Path,
+    certify_loss: bool,
+    provider: &str,
+    session_type: &str,
+    native_id: &str,
+    verified_empty: bool,
+) -> (Registry, RuntimeView) {
     let registry = Registry::open(root, None).unwrap();
     let soul_id = SoulId::new();
     let fresh_agent: FreshAgentLaunchSpec = serde_json::from_value(json!({
@@ -175,7 +188,13 @@ async fn fixture_fresh_soul(
         )
         .unwrap();
     if !certify_loss {
-        let view = registry.inventory().await.unwrap().pop().unwrap();
+        let view = registry
+            .inventory()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|view| view.soul_id == soul_id)
+            .unwrap();
         assert_eq!(view.desired_state, DesiredState::Running);
         return (registry, view);
     }
@@ -251,23 +270,40 @@ async fn fixture_fresh_soul(
     registry
         .finalize_loss_cleanup(
             loss.certificate.incident_id,
-            StopOutcome::TerminationUnconfirmed,
+            if verified_empty {
+                StopOutcome::VerifiedEmpty
+            } else {
+                StopOutcome::TerminationUnconfirmed
+            },
             LossCleanupReport {
                 owned_handle_ref: loss.certificate.cleanup_target.owned_handle_ref,
                 ownership_verified: true,
                 graceful_attempt: "failed".into(),
                 forced_attempt: "not_attempted".into(),
-                verified_empty: false,
+                verified_empty,
                 verified_at: None,
                 foreign_objects_touched: 0,
             },
         )
         .await
         .unwrap();
-    let view = registry.inventory().await.unwrap().pop().unwrap();
+    let view = registry
+        .inventory()
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|view| view.soul_id == soul_id)
+        .unwrap();
     assert_eq!(view.desired_state, DesiredState::Stopped);
     assert_eq!(view.recovery_state, RecoveryState::Lost);
-    assert_eq!(view.cleanup_state, CleanupState::TerminationUnconfirmed);
+    assert_eq!(
+        view.cleanup_state,
+        if verified_empty {
+            CleanupState::VerifiedEmpty
+        } else {
+            CleanupState::TerminationUnconfirmed
+        }
+    );
     (registry, view)
 }
 
@@ -1022,4 +1058,288 @@ async fn durable_souls_routes_refuse_actual_stale_preview_and_unknown_members_wi
     );
     control.abort();
     let _ = control.await;
+}
+
+// Keep production source discovery in a child with an empty environment so
+// neither parallel tests nor any real provider store can influence admission.
+#[tokio::test]
+async fn durable_souls_routes_refuse_substituted_member_and_stale_existing_target() {
+    const CHILD: &str = "FRESHELL_TEST_SCOPED_REPAIR_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let home = tempfile::tempdir().unwrap();
+        let mut child = tokio::process::Command::new(std::env::current_exe().unwrap());
+        child
+            .args([
+                "managed_runtime_api::stop_contract_tests::durable_souls_routes_refuse_substituted_member_and_stale_existing_target",
+                "--exact",
+                "--nocapture",
+            ])
+            .env_clear()
+            .env(CHILD, "1")
+            .env("HOME", home.path())
+            .env("XDG_DATA_HOME", home.path().join("data"))
+            .kill_on_drop(true);
+        let output = tokio::time::timeout(std::time::Duration::from_secs(60), child.output())
+            .await
+            .expect("isolated scoped-route fixture completes within one minute")
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success(), "{stdout}\n{stderr}");
+        assert!(
+            stdout.contains("1 passed"),
+            "the child must execute the route case: {stdout}"
+        );
+        return;
+    }
+
+    let temp = tempfile::tempdir().unwrap();
+    let data_home = freshell_sessions::parse::default_opencode_data_home();
+    std::fs::create_dir_all(&data_home).unwrap();
+    let source_path = data_home.join("opencode.db");
+    let roots = (0..7)
+        .map(|index| format!("ses_route_root_{index}"))
+        .collect::<Vec<_>>();
+    scoped_repair_source(&source_path, temp.path(), &roots);
+    let source_before = std::fs::read(&source_path).unwrap();
+    let source = RepairBatchSourceSelection {
+        source_store_id: format!(
+            "{:x}",
+            sha2::Sha256::digest(
+                source_path
+                    .canonicalize()
+                    .unwrap()
+                    .to_string_lossy()
+                    .as_bytes()
+            )
+        ),
+        root_session_ids: roots.clone(),
+    };
+    let registry_root = temp.path().join("registry");
+    for index in 0..9 {
+        fixture_fresh_soul_with_cleanup(
+            &registry_root,
+            true,
+            "opencode",
+            "freshopencode",
+            &roots[index % 7],
+            true,
+        )
+        .await;
+    }
+    let registry = Registry::open(&registry_root, None).unwrap();
+    let connection = rusqlite::Connection::open(registry_root.join("runtime.sqlite3")).unwrap();
+    // Represent migrated, unbound legacy false-loss metadata. This records no
+    // source absence or import proof; the real preflight must inspect SQLite.
+    connection.execute_batch(
+        "UPDATE souls SET native_import_state='legacy_unknown',native_import_authority='legacy_unknown';
+         UPDATE loss_incidents SET captured_native_import_state='legacy_unknown',captured_native_import_authority='legacy_unknown';",
+    ).unwrap();
+    let terminal = json!({"terminalId":"terminal-scoped-route","streamId":"stream-scoped-route","mode":"opencode","program":"opencode","env":{},"runAsUid":65534,"runAsGid":0,"cols":80,"rows":24,"projectKey":"workspace","workspacePath":temp.path(),"cwd":temp.path()});
+    connection
+        .execute(
+            "UPDATE incarnations SET terminal_spec=?1,fresh_agent_spec=NULL",
+            [terminal.to_string()],
+        )
+        .unwrap();
+    let backend = Arc::new(StopBackend::default());
+    let (socket, control) = start_control(&registry_root, registry.clone(), backend.clone()).await;
+    let app = web_router(&socket, &registry_root).await;
+    let before = scoped_repair_registry_state(&connection);
+    let inventory_before = registry.inventory().await.unwrap();
+    assert_eq!(inventory_before.len(), 9);
+    assert!(inventory_before
+        .iter()
+        .all(|view| view.desired_state == DesiredState::Stopped
+            && view.recovery_state == RecoveryState::Lost
+            && view.intent_revision == 2));
+    let (status, body) = repair_post(
+        &app,
+        "/api/runtime/soul-loss-repairs/preflight",
+        serde_json::to_value(&source).unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let scope: RepairBatchScope = serde_json::from_value(body).unwrap();
+    assert_eq!(scope.targets.len(), 9);
+    assert_eq!(scope.roots.len(), 7);
+    assert_eq!(
+        scope
+            .roots
+            .iter()
+            .filter(|root| root.eligible_owners.len() == 2 && root.canonical_soul_id.is_none())
+            .count(),
+        2
+    );
+    let request = RestoreLostSoulsRequest {
+        scope_id: scope.scope_id.clone(),
+        source,
+        targets: scope
+            .targets
+            .iter()
+            .map(|member| member.target.clone())
+            .collect(),
+        canonical_owners: scope
+            .roots
+            .iter()
+            .map(|root| {
+                let owner = root.eligible_owners.first().unwrap();
+                CanonicalOwnerChoice {
+                    root_session_id: root.root_session_id.clone(),
+                    soul_id: owner.clone(),
+                    expected_intent_revision: scope
+                        .targets
+                        .iter()
+                        .find(|member| member.target.soul_id == *owner)
+                        .unwrap()
+                        .target
+                        .expected_intent_revision,
+                }
+            })
+            .collect(),
+        expected_control_epoch: None,
+    };
+    // Validity comes from the independently resolved production scope, not a
+    // caller-built descriptor. No import or conversation is started here.
+    request.validate_exact_batch(&scope).unwrap();
+    assert_eq!(scoped_repair_registry_state(&connection), before);
+
+    let mut substituted = request.clone();
+    substituted.targets[0].incident_id = IncidentId::new();
+    let mut stale = request.clone();
+    stale.targets[0].expected_intent_revision = 1;
+    for (invalid, expected_status, expected_error) in [
+        (substituted, StatusCode::BAD_REQUEST, "runtime supervisor rejected request: InvalidRequest: stopped restoration differs from the independently resolved exact scope"),
+        (stale, StatusCode::CONFLICT, "runtime supervisor rejected request: StaleIntentRevision: stale soul intent revision: expected 1, current 2"),
+    ] {
+        invalid.validate_payload().unwrap();
+        let mut body = serde_json::to_value(&invalid).unwrap();
+        body.as_object_mut().unwrap().remove("expectedControlEpoch");
+        body["idempotencyKey"] = json!(RequestId::new());
+        let (status, reply) = repair_post(&app, "/api/runtime/soul-loss-repairs", body).await;
+        assert_eq!(status, expected_status, "{reply}");
+        assert_eq!(reply, json!({"error": expected_error}));
+        assert_eq!(scoped_repair_registry_state(&connection), before);
+        assert_eq!(registry.inventory().await.unwrap(), inventory_before);
+        assert_eq!(std::fs::read(&source_path).unwrap(), source_before);
+        assert!(backend.stopped.lock().unwrap().is_empty());
+    }
+    control.abort();
+    let _ = control.await;
+}
+
+async fn repair_post(
+    app: &Router,
+    route: &str,
+    body: serde_json::Value,
+) -> (StatusCode, serde_json::Value) {
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(route)
+                .header("x-auth-token", "web-token")
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = response.status();
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    (status, serde_json::from_slice(&body).unwrap())
+}
+
+fn scoped_repair_registry_state(
+    connection: &rusqlite::Connection,
+) -> Vec<Vec<Vec<rusqlite::types::Value>>> {
+    [
+        "souls",
+        "incarnations",
+        "loss_incidents",
+        "stopped_repair_operations",
+        "stopped_repair_root_receipts",
+        "stopped_repair_withdrawals",
+        "native_origin_owners",
+        "view_intents",
+        "outbox",
+        "runtime_notices",
+        "notice_receipts",
+    ]
+    .into_iter()
+    .map(|table| {
+        let mut statement = connection
+            .prepare(&format!("SELECT * FROM {table} ORDER BY rowid"))
+            .unwrap();
+        let columns = statement.column_count();
+        statement
+            .query_map([], |row| (0..columns).map(|index| row.get(index)).collect())
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+    })
+    .collect()
+}
+
+fn scoped_repair_source(path: &std::path::Path, workspace: &std::path::Path, roots: &[String]) {
+    let connection = rusqlite::Connection::open(path).unwrap();
+    connection
+        .execute_batch(include_str!(
+            "../../freshell-sessions/src/opencode_schema_v1_18_21.sql"
+        ))
+        .unwrap();
+    const MIGRATIONS: &[&str] = &[
+        "20260127222353_familiar_lady_ursula",
+        "20260211171708_add_project_commands",
+        "20260213144116_wakeful_the_professor",
+        "20260225215848_workspace",
+        "20260227213759_add_session_workspace_id",
+        "20260228203230_blue_harpoon",
+        "20260303231226_add_workspace_fields",
+        "20260309230000_move_org_to_state",
+        "20260312043431_session_message_cursor",
+        "20260323234822_events",
+        "20260410174513_workspace-name",
+        "20260413175956_chief_energizer",
+        "20260423070820_add_icon_url_override",
+        "20260427172553_slow_nightmare",
+        "20260428004200_add_session_path",
+        "20260501142318_next_venus",
+        "20260504145000_add_sync_owner",
+        "20260507164347_add_workspace_time",
+        "20260510033149_session_usage",
+        "20260511000411_data_migration_state",
+        "20260511173437_session-metadata",
+        "20260601010001_normalize_storage_paths",
+        "20260601202201_amazing_prowler",
+        "20260602002951_lowly_union_jack",
+        "20260602182828_add_project_directories",
+        "20260603001617_session_message_projection_indexes",
+        "20260603040000_session_message_projection_order",
+        "20260603141458_session_input_inbox",
+        "20260603160727_jittery_ezekiel_stane",
+        "20260604172448_event_sourced_session_input",
+        "20260605003541_add_session_context_snapshot",
+        "20260605042240_add_context_epoch_agent",
+        "20260611035744_credential",
+        "20260611192811_lush_chimera",
+        "20260612174303_project_dir_strategy",
+        "20260622142730_simplify_session_context_epoch",
+        "20260622170816_reset_v2_session_state",
+        "20260622202450_simplify_session_input",
+    ];
+    for (index, migration) in MIGRATIONS.iter().enumerate() {
+        connection
+            .execute(
+                "INSERT INTO migration VALUES (?1,?2)",
+                rusqlite::params![migration, index],
+            )
+            .unwrap();
+    }
+    connection.execute("INSERT INTO project(id,worktree,time_created,time_updated,sandboxes) VALUES ('route-project',?1,1,1,'[]')", [workspace.to_string_lossy().as_ref()]).unwrap();
+    for root in roots {
+        connection.execute("INSERT INTO session(id,project_id,slug,directory,title,version,time_created,time_updated) VALUES (?1,'route-project',?1,?2,'route fixture','1.18.21',1,1)", rusqlite::params![root,workspace.to_string_lossy().as_ref()]).unwrap();
+        connection.execute("INSERT INTO message(id,session_id,time_created,time_updated,data) VALUES (?1,?2,1,1,?3)", rusqlite::params![format!("msg_{root}"),root,json!({"role":"user","content":"synthetic retained history"}).to_string()]).unwrap();
+    }
 }
