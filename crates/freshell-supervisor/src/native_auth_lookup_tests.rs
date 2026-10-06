@@ -11,8 +11,93 @@ use std::{
 };
 
 struct AuthBackend(AtomicUsize);
+
+#[tokio::test]
+async fn provider_initial_auth_requires_creation_reservation_before_absence_receipt() {
+    let temp = tempfile::tempdir().unwrap();
+    let binary = temp.path().join("synthetic-host");
+    std::fs::write(&binary, "synthetic helper artifact").unwrap();
+    let registry = Registry::open(temp.path().join("registry"), None).unwrap();
+    let backend = Arc::new(AuthBackend(AtomicUsize::new(0)));
+    let secret = "synthetic-control-secret";
+    let supervisor = Supervisor::new(
+        registry,
+        backend.clone(),
+        SupervisorConfig {
+            runtime_root: temp.path().join("runtime"),
+            control_socket_path: temp.path().join("control.sock"),
+            host_binary_path: binary,
+            image_ref: format!("sha256:{}", "a".repeat(64)),
+            test_run_id: "initial-input-reservation".into(),
+            control_secret: secret.into(),
+            lifecycle_log: temp.path().join("lifecycle.jsonl"),
+            admission: crate::admission::AdmissionPolicy::default(),
+        },
+    )
+    .unwrap();
+    let soul = SoulId::new();
+    let command:AdminCommand=serde_json::from_value(serde_json::json!({
+        "method":"reserve_provider_inputs","params":{
+            "expectedControlEpoch":supervisor.registry.control_epoch(),"soulId":soul,
+            "provider":"opencode","creationSeedRef":"synthetic-creation-seed"
+        }
+    })).expect("initial source selection needs a real reservation operation, not missing native identity as auth absence");
+    let mut envelope = Envelope::new(RequestId::new(), ControlRole::Web, command);
+    envelope.auth = Some(secret.into());
+    let reply = supervisor.dispatch(envelope).await.result.unwrap();
+    let receipt = serde_json::to_value(reply).unwrap();
+    assert_eq!(receipt["kind"], "provider_input_reservation");
+    assert_eq!(receipt["data"]["soulId"], soul.as_str());
+    assert_eq!(receipt["data"]["intentRevision"], 1);
+    assert_eq!(receipt["data"]["observation"]["kind"], "absent");
+    assert_eq!(
+        backend.0.load(Ordering::SeqCst),
+        1,
+        "daemon observation happens only after the registry reserves this creation"
+    );
+    assert!(
+        supervisor.registry.inventory().await.unwrap().is_empty(),
+        "input reservation must not invent a workload/container or native session identity"
+    );
+    let mut lookup = Envelope::new(
+        RequestId::new(),
+        ControlRole::Web,
+        AdminCommand::NativeAuthLookup(NativeAuthLookupRequest {
+            expected_control_epoch: Some(supervisor.registry.control_epoch()),
+            soul_id: soul,
+            attempt_authority: receipt["data"]["reservationId"].as_str().unwrap().into(),
+            keys: vec!["PATH_INPUT".into()],
+        }),
+    );
+    lookup.auth = Some(secret.into());
+    match supervisor.dispatch(lookup).await.result.expect(
+        "recorded initial absence must be available only through its current reserved source",
+    ) {
+        AdminResult::NativeAuthLookup(values) => assert!(values.0.is_empty()),
+        _ => panic!("unexpected initial source reply"),
+    }
+    assert_eq!(
+        backend.0.load(Ordering::SeqCst),
+        2,
+        "absence is reobserved rather than inferred from native identity"
+    );
+}
 #[async_trait]
 impl RuntimeBackend for AuthBackend {
+    async fn observe_initial_auth_volume(
+        &self,
+        reservation: &OwnedInputReservation,
+    ) -> Result<InitialAuthVolumeObservation, BackendError> {
+        assert_eq!(
+            reservation.provider_volume_name,
+            stable_provider_volume_name(&reservation.installation_id, &reservation.soul_id)
+        );
+        self.0.fetch_add(1, Ordering::SeqCst);
+        static DAEMON: std::sync::OnceLock<DockerDaemonId> = std::sync::OnceLock::new();
+        Ok(InitialAuthVolumeObservation::Absent {
+            daemon_id: DAEMON.get_or_init(DockerDaemonId::new).clone(),
+        })
+    }
     async fn read_native_auth(
         &self,
         handle: &OwnedRuntimeHandle,

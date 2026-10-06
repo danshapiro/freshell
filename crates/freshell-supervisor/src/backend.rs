@@ -40,6 +40,7 @@ pub enum BackendError {
 
 #[derive(Debug, Clone)]
 pub struct CreateRuntimeSpec {
+    pub initial_input_reservation: Option<crate::registry::BoundInputReservation>,
     pub installation_id: InstallationId,
     pub soul_id: SoulId,
     pub incarnation_id: IncarnationId,
@@ -120,6 +121,14 @@ pub struct BackendInspection {
 
 #[async_trait]
 pub trait RuntimeBackend: Send + Sync {
+    async fn observe_initial_auth_volume(
+        &self,
+        _reservation: &crate::registry::OwnedInputReservation,
+    ) -> Result<freshell_runtime_protocol::InitialAuthVolumeObservation, BackendError> {
+        Err(BackendError::Unavailable(
+            "initial auth source observation unavailable".into(),
+        ))
+    }
     async fn commit_prepared_inputs(
         &self,
         _handle: &OwnedRuntimeHandle,
@@ -561,6 +570,12 @@ fn runtime_host_environment(
 
 #[async_trait]
 impl RuntimeBackend for DockerEngineBackend {
+    async fn observe_initial_auth_volume(
+        &self,
+        reservation: &crate::registry::OwnedInputReservation,
+    ) -> Result<freshell_runtime_protocol::InitialAuthVolumeObservation, BackendError> {
+        self.observe_initial_volume(reservation).await
+    }
     async fn commit_prepared_inputs(
         &self,
         handle: &OwnedRuntimeHandle,
@@ -626,6 +641,26 @@ impl RuntimeBackend for DockerEngineBackend {
             ));
         }
         let binary = canonical_regular_file(&spec.host_binary_path)?;
+        let initial_reference = spec
+            .terminal
+            .as_ref()
+            .and_then(|workload| workload.provider_launch_context.as_ref())
+            .or_else(|| {
+                spec.fresh_agent
+                    .as_ref()
+                    .and_then(|workload| workload.provider_launch_context.as_ref())
+            })
+            .and_then(|context| context.prepared_inputs.as_ref())
+            .and_then(|inputs| inputs.initial_auth_reservation.as_deref());
+        if initial_reference.is_some_and(|id| {
+            spec.initial_input_reservation
+                .as_ref()
+                .is_none_or(|bound| bound.reservation.id != id)
+        }) {
+            return Err(BackendError::InvalidConfig(
+                "initial provider source lost its current prepared reservation".into(),
+            ));
+        }
         let runtime_dir = canonical_dir(&spec.runtime_dir)?;
         let actor_state_dir = if spec.fresh_agent.is_some() {
             let runtime_root = runtime_dir.parent().ok_or_else(|| {
@@ -661,6 +696,8 @@ impl RuntimeBackend for DockerEngineBackend {
         let expected = ExpectedConfig::new(spec, &binary, &runtime_dir);
         let immutable_config_digest = digest_expected(&expected)?;
         let (daemon_id, rootless) = self.daemon_info().await?;
+        self.ensure_reserved_initial_volume(spec, &daemon_id, rootless)
+            .await?;
         let memory_swap = spec
             .limits
             .memory_bytes
@@ -1847,6 +1884,7 @@ mod tests {
             })
             .collect();
         let spec = CreateRuntimeSpec {
+            initial_input_reservation: None,
             installation_id: InstallationId::parse("installation-test").unwrap(),
             soul_id: SoulId::parse("soul-test").unwrap(),
             incarnation_id: IncarnationId::parse("incarnation-test").unwrap(),
@@ -1991,6 +2029,7 @@ mod tests {
         };
         let inputs = PreparedProviderInputs {
             generation_id: "grant-digest".into(),
+            initial_auth_reservation: None,
             manifest: ProviderInputManifestReference {
                 relative_path: ".freshell/input-manifest.json".into(),
                 sha256: "a".repeat(64),

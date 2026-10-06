@@ -187,6 +187,44 @@ impl Supervisor {
             ));
         }
         match envelope.body {
+            AdminCommand::ReserveProviderInputs(request) => {
+                self.registry
+                    .assert_epoch(request.expected_control_epoch)
+                    .map_err(map_registry)?;
+                let lock = self.lifecycle_lock(&request.soul_id).await;
+                let _held = lock.lock().await;
+                let reservation = self
+                    .registry
+                    .reserve_initial_inputs(
+                        request,
+                        self.config.image_ref.clone(),
+                        self.config.host_binary_path.clone(),
+                    )
+                    .await
+                    .map_err(map_registry)?;
+                let observation = tokio::time::timeout(
+                    Duration::from_secs(10),
+                    self.backend.observe_initial_auth_volume(&reservation),
+                )
+                .await
+                .map_err(|_| {
+                    RuntimeError::new(
+                        RuntimeErrorCode::HostUnreachable,
+                        "initial auth source observation timed out",
+                    )
+                })?
+                .map_err(|_| {
+                    RuntimeError::new(
+                        RuntimeErrorCode::HostUnreachable,
+                        "initial auth source observation failed; retry preparation",
+                    )
+                })?;
+                self.registry
+                    .record_initial_observation(reservation, observation)
+                    .await
+                    .map(AdminResult::ProviderInputReservation)
+                    .map_err(map_registry)
+            }
             AdminCommand::NativeAuthLookup(request) => {
                 self.registry
                     .assert_epoch(request.expected_control_epoch)
@@ -591,6 +629,51 @@ impl Supervisor {
         if request.attempt_authority.len() != 36 {
             return Err(denied());
         }
+        if let Some((reservation, expected)) = self
+            .registry
+            .initial_input_reservation(request.soul_id.clone(), request.attempt_authority.clone())
+            .await
+            .map_err(map_registry)?
+        {
+            if reservation.image_ref != self.config.image_ref
+                || reservation.binary != self.config.host_binary_path
+            {
+                return Err(denied());
+            }
+            let observed = tokio::time::timeout(
+                Duration::from_secs(10),
+                self.backend.observe_initial_auth_volume(&reservation),
+            )
+            .await
+            .map_err(|_| {
+                RuntimeError::new(
+                    RuntimeErrorCode::HostUnreachable,
+                    "initial auth revalidation timed out",
+                )
+            })?
+            .map_err(|_| {
+                RuntimeError::new(
+                    RuntimeErrorCode::HostUnreachable,
+                    "initial auth source changed; reprepare before dispatch",
+                )
+            })?;
+            if observed != expected
+                || self
+                    .registry
+                    .initial_input_reservation(
+                        request.soul_id.clone(),
+                        request.attempt_authority.clone(),
+                    )
+                    .await
+                    .map_err(map_registry)?
+                    .is_none()
+            {
+                return Err(denied());
+            }
+            return Ok(freshell_runtime_protocol::NativeAuthValues(
+                std::collections::BTreeMap::new(),
+            ));
+        }
         let authority = {
             let authorities = self
                 .auth_lookup_authorities
@@ -653,6 +736,8 @@ impl Supervisor {
         request_id: RequestId,
         request: freshell_runtime_protocol::LaunchRequest,
     ) -> Result<LaunchResult, RuntimeError> {
+        let lock = self.lifecycle_lock(&request.soul_id).await;
+        let _guard = lock.lock().await;
         let limits = request.limits.validate()?;
         request.validate_workload()?;
         if !release_qualified_workload(
@@ -763,6 +848,19 @@ impl Supervisor {
             let created = self
                 .backend
                 .create_stopped(&CreateRuntimeSpec {
+                    initial_input_reservation: self
+                        .registry
+                        .bound_input_reservation(prepared.incarnation_id.clone())
+                        .await
+                        .map_err(map_registry)
+                        .map_err(|error| {
+                            self.activation_failure(
+                                &prepared,
+                                state,
+                                "revalidate_initial_provider_source",
+                                error,
+                            )
+                        })?,
                     installation_id: self.registry.installation_id().clone(),
                     soul_id: prepared.soul_id.clone(),
                     incarnation_id: prepared.incarnation_id.clone(),
@@ -2882,6 +2980,31 @@ mod release_scope_tests {
     };
 
     #[test]
+    fn provider_fresh_launch_digest_rejects_changed_prepared_workload() {
+        let mut request: freshell_runtime_protocol::LaunchRequest = serde_json::from_value(
+            serde_json::json!({
+                "soulId": SoulId::new(), "provider":"claude", "providerStoreId":"synthetic-store",
+                "creationSeedRef":"synthetic-seed", "limits": {"cpuMilli":1000,"memoryBytes":1073741824,"swapBytes":0,"pidsMax":128},
+                "freshAgent": {
+                    "sessionId":"synthetic-session", "provider":"claude", "sessionType":"freshclaude",
+                    "runtimeVariant":"claude-sdk-sidecar", "providerStoreId":"synthetic-store",
+                    "cwd":"/synthetic/workspace", "workspacePath":"/synthetic/workspace",
+                    "runAsUid":65534, "runAsGid":0, "model":"synthetic-model"
+                }
+            })
+        ).unwrap();
+        let original = super::semantic_launch_digest(&request).unwrap();
+        request.fresh_agent.as_mut().unwrap().model = Some("changed-model".into());
+        assert_ne!(
+            original,
+            super::semantic_launch_digest(&request).unwrap(),
+            "changed fresh workload must not coalesce with the previous immutable launch"
+        );
+        request.fresh_agent.as_mut().unwrap().model = Some("synthetic-model".into());
+        assert_eq!(original, super::semantic_launch_digest(&request).unwrap());
+    }
+
+    #[test]
     fn semantic_operation_identity_classifies_record_transition_and_replay() {
         assert_eq!(
             classify_fresh_agent_operation_identity(None, None).unwrap(),
@@ -3042,6 +3165,7 @@ fn semantic_launch_digest(
         "nativeSessionId": request.native_session_id,
         "fixture": request.fixture,
         "terminal": request.terminal,
+        "freshAgent": request.fresh_agent,
     });
     let bytes = serde_json::to_vec(&value)
         .map_err(|e| RuntimeError::new(RuntimeErrorCode::InvalidRequest, e.to_string()))?;

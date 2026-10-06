@@ -2724,6 +2724,7 @@ pub struct QualificationWriterClaimEvidence {
 #[serde(tag = "method", content = "params", rename_all = "snake_case")]
 pub enum AdminCommand {
     Health,
+    ReserveProviderInputs(ReserveProviderInputsRequest),
     NativeAuthLookup(NativeAuthLookupRequest),
     Launch(Box<LaunchRequest>),
     Stop(StopRequest),
@@ -2757,6 +2758,41 @@ pub enum AdminCommand {
     RuntimeMetrics(RuntimeMetricsRequest),
     ProbeRecovery(RecoveryProbeRequest),
     Recover(RecoverRequest),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ReserveProviderInputsRequest {
+    pub expected_control_epoch: Option<u64>,
+    pub soul_id: SoulId,
+    pub provider: String,
+    pub creation_seed_ref: String,
+}
+
+/// Exact registry-backed creation identity. The observation is recorded only
+/// after the selected daemon confirms the reserved volume is absent.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ProviderInputReservation {
+    pub reservation_id: String,
+    pub installation_id: InstallationId,
+    pub soul_id: SoulId,
+    pub provider: String,
+    pub creation_seed_ref: String,
+    pub intent_revision: u64,
+    pub provider_volume_name: String,
+    pub image_ref: String,
+    pub host_binary_path: String,
+    pub host_binary_sha256: String,
+    pub observation: InitialAuthVolumeObservation,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum InitialAuthVolumeObservation {
+    Absent {
+        #[serde(rename = "daemonId")]
+        daemon_id: DockerDaemonId,
+    },
 }
 
 /// Transient nested callback request; the authority is scoped by the supervisor
@@ -2895,6 +2931,7 @@ pub struct LaunchResult {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "data", rename_all = "snake_case")]
 pub enum AdminResult {
+    ProviderInputReservation(ProviderInputReservation),
     NativeAuthLookup(NativeAuthValues),
     Health {
         control_epoch: u64,

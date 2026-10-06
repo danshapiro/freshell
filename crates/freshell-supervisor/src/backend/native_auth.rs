@@ -95,6 +95,152 @@ async fn exchange(
 }
 
 impl DockerEngineBackend {
+    pub(super) async fn ensure_reserved_initial_volume(
+        &self,
+        spec: &CreateRuntimeSpec,
+        daemon: &DockerDaemonId,
+        rootless: bool,
+    ) -> Result<(), BackendError> {
+        let Some(bound) = &spec.initial_input_reservation else {
+            return Ok(());
+        };
+        let reservation = &bound.reservation;
+        let freshell_runtime_protocol::InitialAuthVolumeObservation::Absent {
+            daemon_id: observed,
+        } = &bound.observation;
+        if !rootless
+            || observed != daemon
+            || reservation.installation_id != spec.installation_id
+            || reservation.soul_id != spec.soul_id
+            || bound.incarnation_id != spec.incarnation_id
+            || reservation.image_ref != spec.image_ref
+            || reservation.binary != spec.host_binary_path
+            || reservation.provider_volume_name != spec.provider_volume_name
+            || spec.provider_volume_name
+                != crate::registry::stable_provider_volume_name(
+                    &spec.installation_id,
+                    &spec.soul_id,
+                )
+        {
+            return Err(fail(
+                "initial auth reservation does not match the prepared runtime",
+            ));
+        }
+        bound
+            .verify_artifact()
+            .map_err(|_| fail("initial auth reserved runtime artifact changed or unreadable"))?;
+        let labels = json!({
+            "com.freshell.installation-id":spec.installation_id.as_str(),
+            "com.freshell.soul-id":spec.soul_id.as_str(),
+            "freshell.input.reservation":reservation.id,
+            "freshell.input.incarnation":spec.incarnation_id.as_str(),
+            "freshell.input.intent":"1",
+            "freshell.input.daemon":daemon.as_str(),
+            "freshell.input.image":reservation.image_ref,
+            "freshell.input.binary-sha256":reservation.binary_sha256
+        });
+        let path = format!("{DOCKER_API}/volumes/{}", spec.provider_volume_name);
+        let response = self
+            .request_bounded("GET", &path, None, 64 * 1024)
+            .await
+            .map_err(|_| fail("reserved initial volume observation failed"))?;
+        if response.status == 404 {
+            if self
+                .daemon_id()
+                .await
+                .map_err(|_| fail("initial auth daemon revalidation failed"))?
+                != *daemon
+            {
+                return Err(fail(
+                    "initial auth source daemon changed before volume creation",
+                ));
+            }
+            let created=self.request_bounded("POST",&format!("{DOCKER_API}/volumes/create"),Some(&json!({
+                "Name":spec.provider_volume_name,"Driver":"local","Labels":labels
+            })),64*1024).await.map_err(|_|fail("reserved initial volume create acknowledgement uncertain; retry the same bound launch"))?;
+            if created.status != 201 {
+                return Err(fail(
+                    "reserved initial volume creation failed; retry the same bound launch",
+                ));
+            }
+        } else if response.status != 200 {
+            return Err(fail(
+                "reserved initial volume observation did not prove absence or ownership",
+            ));
+        }
+        // Docker volume-create is idempotent by name; its acknowledgement alone
+        // cannot establish that a pre-existing object belongs to this receipt.
+        let readback = self
+            .request_bounded("GET", &path, None, 64 * 1024)
+            .await
+            .map_err(|_| fail("reserved initial volume ownership readback failed"))?;
+        let value: Value = serde_json::from_slice(&readback.body)
+            .map_err(|_| fail("reserved initial volume ownership response invalid"))?;
+        if readback.status != 200
+            || value["Name"] != spec.provider_volume_name
+            || value["Driver"] != "local"
+            || value["Labels"] != labels
+            || !(value["Options"].is_null() || value["Options"] == json!({}))
+        {
+            return Err(fail(
+                "reserved initial volume belongs to a different preparation",
+            ));
+        }
+        if self
+            .daemon_id()
+            .await
+            .map_err(|_| fail("initial auth daemon final observation failed"))?
+            != *daemon
+        {
+            return Err(fail(
+                "initial auth source daemon changed after volume creation",
+            ));
+        }
+        Ok(())
+    }
+    pub(super) async fn observe_initial_volume(
+        &self,
+        reservation: &crate::registry::OwnedInputReservation,
+    ) -> Result<freshell_runtime_protocol::InitialAuthVolumeObservation, BackendError> {
+        let (daemon_id, rootless) = self
+            .daemon_info()
+            .await
+            .map_err(|_| fail("initial auth daemon observation failed"))?;
+        if !rootless {
+            return Err(fail(
+                "initial auth source requires the qualified rootless daemon",
+            ));
+        }
+        if reservation.provider_volume_name
+            != crate::registry::stable_provider_volume_name(
+                &reservation.installation_id,
+                &reservation.soul_id,
+            )
+        {
+            return Err(fail("initial auth reservation volume identity changed"));
+        }
+        let response = self
+            .request_bounded(
+                "GET",
+                &format!("{DOCKER_API}/volumes/{}", reservation.provider_volume_name),
+                None,
+                64 * 1024,
+            )
+            .await
+            .map_err(|_| fail("initial auth reserved volume observation failed"))?;
+        if response.status != 404 {
+            return Err(fail("initial auth absence requires an actual reserved-volume 404; use an owned existing source"));
+        }
+        if self
+            .daemon_id()
+            .await
+            .map_err(|_| fail("initial auth daemon revalidation failed"))?
+            != daemon_id
+        {
+            return Err(fail("initial auth source daemon changed"));
+        }
+        Ok(freshell_runtime_protocol::InitialAuthVolumeObservation::Absent { daemon_id })
+    }
     pub(super) async fn read_auth_helper(
         &self,
         handle: &OwnedRuntimeHandle,
@@ -282,6 +428,259 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     #[tokio::test]
+    async fn provider_initial_absence_requires_rootless_same_daemon_exact_volume_404() {
+        for mode in [
+            "absent",
+            "existing",
+            "denied",
+            "server_error",
+            "nonrootless",
+            "daemon_changed",
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let binary = temp.path().join("synthetic-host");
+            std::fs::write(&binary, b"synthetic artifact").unwrap();
+            let registry =
+                crate::registry::Registry::open(temp.path().join("registry"), None).unwrap();
+            let reserved = registry
+                .reserve_initial_inputs(
+                    freshell_runtime_protocol::ReserveProviderInputsRequest {
+                        expected_control_epoch: Some(registry.control_epoch()),
+                        soul_id: SoulId::new(),
+                        provider: "opencode".into(),
+                        creation_seed_ref: "seed".into(),
+                    },
+                    format!("sha256:{}", "a".repeat(64)),
+                    binary,
+                )
+                .await
+                .unwrap();
+            let daemon = DockerDaemonId::new();
+            let changed = DockerDaemonId::new();
+            let listener = UnixListener::bind(temp.path().join("docker.sock")).unwrap();
+            let requests = Arc::new(Mutex::new(Vec::<String>::new()));
+            let seen = requests.clone();
+            let server = tokio::spawn(async move {
+                let mut observations = 0;
+                loop {
+                    let (mut stream, _) = listener.accept().await.unwrap();
+                    let mut raw = Vec::new();
+                    let mut byte = [0];
+                    while !raw.ends_with(b"\r\n\r\n") {
+                        stream.read_exact(&mut byte).await.unwrap();
+                        raw.push(byte[0]);
+                    }
+                    let head = String::from_utf8(raw).unwrap();
+                    let request = head.lines().next().unwrap().to_owned();
+                    seen.lock().unwrap().push(request.clone());
+                    let (status, body) = if request.contains("/info ") {
+                        observations += 1;
+                        (
+                            200,
+                            json!({"ID":if mode=="daemon_changed" && observations>1 {&changed} else {&daemon},
+                            "SecurityOptions":if mode=="nonrootless" {vec![]} else {vec!["name=rootless"]}}),
+                        )
+                    } else if request.starts_with("GET") && request.contains("/volumes/") {
+                        (
+                            match mode {
+                                "existing" => 200,
+                                "denied" => 403,
+                                "server_error" => 500,
+                                _ => 404,
+                            },
+                            json!({}),
+                        )
+                    } else {
+                        (500, json!({}))
+                    };
+                    let body = body.to_string();
+                    stream.write_all(format!("HTTP/1.1 {status} fixture\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len()).as_bytes()).await.unwrap();
+                }
+            });
+            let result = DockerEngineBackend::new(temp.path().join("docker.sock"))
+                .observe_initial_volume(&reserved)
+                .await;
+            assert_eq!(result.is_ok(), mode == "absent", "{mode}");
+            let seen = requests.lock().unwrap().clone();
+            assert!(
+                seen.iter().all(|r| r.starts_with("GET ")),
+                "absence observation must not create a helper, volume or workload"
+            );
+            assert!(seen
+                .iter()
+                .filter(|r| r.contains("/volumes/"))
+                .all(|r| r.contains(&format!("/volumes/{} ", reserved.provider_volume_name))));
+            drop(seen);
+            server.abort();
+            let _ = server.await;
+        }
+    }
+
+    #[tokio::test]
+    async fn provider_initial_volume_is_labelled_once_and_reused_only_by_bound_launch() {
+        let temp = tempfile::tempdir().unwrap();
+        let binary = temp.path().join("synthetic-host");
+        std::fs::write(&binary, b"synthetic executable artifact").unwrap();
+        let runtime = temp.path().join("runtime");
+        std::fs::create_dir(&runtime).unwrap();
+        let registry = crate::registry::Registry::open(temp.path().join("registry"), None).unwrap();
+        let soul = SoulId::new();
+        let image = format!("sha256:{}", "a".repeat(64));
+        let reserved = registry
+            .reserve_initial_inputs(
+                freshell_runtime_protocol::ReserveProviderInputsRequest {
+                    expected_control_epoch: Some(registry.control_epoch()),
+                    soul_id: soul.clone(),
+                    provider: "opencode".into(),
+                    creation_seed_ref: "seed".into(),
+                },
+                image.clone(),
+                binary.clone(),
+            )
+            .await
+            .unwrap();
+        let daemon = DockerDaemonId::new();
+        let binding = crate::registry::BoundInputReservation {
+            reservation: reserved,
+            incarnation_id: IncarnationId::new(),
+            observation: freshell_runtime_protocol::InitialAuthVolumeObservation::Absent {
+                daemon_id: daemon.clone(),
+            },
+        };
+        let volume = Arc::new(Mutex::new(None::<Value>));
+        let lose_create_ack = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let requests = Arc::new(Mutex::new(Vec::<String>::new()));
+        let listener = UnixListener::bind(temp.path().join("docker.sock")).unwrap();
+        let captured = volume.clone();
+        let seen = requests.clone();
+        let lose_ack = lose_create_ack.clone();
+        let server = tokio::spawn(async move {
+            loop {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut raw = Vec::new();
+                let mut byte = [0];
+                while !raw.ends_with(b"\r\n\r\n") {
+                    stream.read_exact(&mut byte).await.unwrap();
+                    raw.push(byte[0]);
+                }
+                let head = String::from_utf8(raw).unwrap();
+                let length = head
+                    .lines()
+                    .find_map(|line| line.strip_prefix("Content-Length: "))
+                    .unwrap()
+                    .trim()
+                    .parse::<usize>()
+                    .unwrap();
+                let mut body = vec![0; length];
+                stream.read_exact(&mut body).await.unwrap();
+                let request = head.lines().next().unwrap().to_string();
+                seen.lock().unwrap().push(request.clone());
+                let (status, reply) = if request.contains("/info ") {
+                    (
+                        200,
+                        json!({"ID":daemon,"SecurityOptions":["name=rootless"]}),
+                    )
+                } else if request.starts_with("POST") && request.contains("/volumes/create ") {
+                    let mut created: Value = serde_json::from_slice(&body).unwrap();
+                    created["Driver"] = json!("local");
+                    created["Options"] = json!({});
+                    *captured.lock().unwrap() = Some(created.clone());
+                    (
+                        if lose_ack.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                            503
+                        } else {
+                            201
+                        },
+                        created,
+                    )
+                } else if request.starts_with("GET") && request.contains("/volumes/") {
+                    match captured.lock().unwrap().clone() {
+                        Some(value) => (200, value),
+                        None => (404, json!({"message":"synthetic missing volume"})),
+                    }
+                } else if request.starts_with("POST") && request.contains("/containers/create?") {
+                    (201, json!({"Id":"b".repeat(64)}))
+                } else {
+                    (500, json!({"message":"unexpected synthetic operation"}))
+                };
+                let reply = reply.to_string();
+                stream.write_all(format!("HTTP/1.1 {status} fixture\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{reply}",reply.len()).as_bytes()).await.unwrap();
+            }
+        });
+        let backend = DockerEngineBackend::new(temp.path().join("docker.sock"));
+        let spec = CreateRuntimeSpec {
+            initial_input_reservation: Some(binding.clone()),
+            installation_id: registry.installation_id().clone(),
+            soul_id: soul,
+            incarnation_id: binding.incarnation_id.clone(),
+            image_ref: image,
+            host_binary_path: binary,
+            runtime_dir: runtime,
+            limits: RuntimeLimits {
+                cpu_milli: 500,
+                memory_bytes: 64 * 1024 * 1024,
+                swap_bytes: 0,
+                pids_max: 32,
+            },
+            test_run_id: "initial-volume".into(),
+            terminal: None,
+            fresh_agent: None,
+            provider_volume_name: binding.reservation.provider_volume_name.clone(),
+        };
+        assert!(backend.create_stopped(&spec).await.is_err(),"uncertain volume-create acknowledgement keeps the exact reservation available for retry");
+        assert!(!requests
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|r| r.contains("/containers/create?")));
+        backend.create_stopped(&spec).await.unwrap();
+        assert_eq!(
+            requests
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|r| r.starts_with("POST") && r.contains("/volumes/create "))
+                .count(),
+            1,
+            "physical provider volume must be explicitly owned before stopped workload creation"
+        );
+        backend.create_stopped(&spec).await.unwrap();
+        assert_eq!(requests.lock().unwrap().iter().filter(|r|r.starts_with("POST") && r.contains("/volumes/create ")).count(),1,
+            "lost workload-create acknowledgement must reuse the same exact labelled reservation volume");
+        volume.lock().unwrap().as_mut().unwrap()["Labels"]["freshell.input.reservation"] =
+            json!("foreign-reservation");
+        assert!(
+            backend.create_stopped(&spec).await.is_err(),
+            "existing differently owned volume must not authorize initial absence"
+        );
+        assert_eq!(
+            requests
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|r| r.contains("/containers/create?"))
+                .count(),
+            2
+        );
+        std::fs::write(&spec.host_binary_path, b"changed synthetic artifact").unwrap();
+        assert!(
+            backend.create_stopped(&spec).await.is_err(),
+            "changed helper artifact cannot consume the old reservation"
+        );
+        assert_eq!(
+            requests
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|r| r.contains("/containers/create?"))
+                .count(),
+            2
+        );
+        server.abort();
+        let _ = server.await;
+    }
+
+    #[tokio::test]
     async fn native_auth_uses_private_ipc_and_cleans_only_verified_owned_helper() {
         for mode in [
             "success",
@@ -448,7 +847,7 @@ mod tests {
                     "/synthetic/PRIVATE_AUTH_SENTINEL"
                 );
             }
-            let records = seen.lock().unwrap();
+            let records = seen.lock().unwrap().clone();
             let create = records
                 .iter()
                 .find(|(request, _)| request.contains("/create?"))
@@ -464,9 +863,11 @@ mod tests {
                 .contains(&json!("INHERITED_TOKEN=")));
             assert!(!String::from_utf8_lossy(&create.1).contains("PRIVATE_IMAGE_SENTINEL"));
             assert_eq!(body["HostConfig"]["Mounts"].as_array().unwrap().len(), 3);
-            assert!(records.iter().all(|(request, _)| !request.contains("/logs")
-                && !(request.starts_with("DELETE") && request.contains(handle.container_id()))
-                && !request.contains("/stop")));
+            assert!(records
+                .iter()
+                .all(|(request, _)| !(request.contains("/logs")
+                    || request.contains("/stop")
+                    || request.starts_with("DELETE") && request.contains(handle.container_id()))));
             let deletes: Vec<_> = records
                 .iter()
                 .filter(|(request, _)| request.starts_with("DELETE "))

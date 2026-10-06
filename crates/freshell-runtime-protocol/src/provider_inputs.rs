@@ -8,6 +8,8 @@ use sha2::{Digest, Sha256};
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct PreparedProviderInputs {
     pub generation_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub initial_auth_reservation: Option<String>,
     pub manifest: ProviderInputManifestReference,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub config_binds: Vec<ProviderConfigBind>,
@@ -107,6 +109,13 @@ impl PreparedProviderInputs {
         };
         crate::bounded_json_bytes(self, crate::MAX_CONTROL_FRAME_BYTES)
             .map_err(|_| invalid("control byte limit"))?;
+        if self
+            .initial_auth_reservation
+            .as_ref()
+            .is_some_and(|id| uuid::Uuid::parse_str(id).is_err())
+        {
+            return Err(invalid("initial auth reservation"));
+        }
         if capability.map(|value| value.grant_id.as_str()) != Some(self.generation_id.as_str())
             || !self.generation_id.starts_with("grant-")
             || !identifier(&self.generation_id)
@@ -288,6 +297,7 @@ mod tests {
     fn prepared() -> PreparedProviderInputs {
         PreparedProviderInputs {
             generation_id: "grant-synthetic".into(),
+            initial_auth_reservation: None,
             manifest: ProviderInputManifestReference {
                 relative_path: ".freshell/input-manifest.json".into(),
                 sha256: "a".repeat(64),

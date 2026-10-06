@@ -17,7 +17,9 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-pub const SCHEMA_VERSION: u32 = 7;
+pub const SCHEMA_VERSION: u32 = 8;
+mod input_reservation;
+pub use input_reservation::{BoundInputReservation, OwnedInputReservation};
 const ACTIVE_STATES: &str = "'prepared','created','starting','running','stopping'";
 
 #[derive(Debug, thiserror::Error)]
@@ -438,6 +440,7 @@ impl Registry {
                 }
                 let incarnation_id = IncarnationId::parse(incarnation_raw)
                     .map_err(|_| RegistryError::Integrity("invalid incarnation id".into()))?;
+                input_reservation::check_bound_reference(&tx, &input, &incarnation_id)?;
                 let row = load_prepared_row(&tx, &incarnation_id)?;
                 tx.commit()?;
                 return Ok(PreparedLaunch { existing_request: true, ..row });
@@ -520,6 +523,7 @@ impl Registry {
                 }
                 let incarnation_id = IncarnationId::parse(incarnation_raw)
                     .map_err(|_| RegistryError::Integrity("invalid incarnation id".into()))?;
+                input_reservation::check_bound_reference(&tx, &input, &incarnation_id)?;
                 tx.execute(
                     "INSERT INTO commands (soul_id,request_id,payload_digest,protected_payload_ref,state,provider_ack_id,incarnation_id,event_cursor,created_at,updated_at) VALUES (?1,?2,?3,NULL,'running',NULL,?4,0,?5,?5)",
                     params![input.soul_id.as_str(), input.request_id.as_str(), input.payload_digest, incarnation_id.as_str(), now],
@@ -542,6 +546,7 @@ impl Registry {
             }
 
             let incarnation_id = IncarnationId::new();
+            input_reservation::bind_in_transaction(&tx, &input, &incarnation_id)?;
             let launch_nonce = LaunchNonce::new();
             let limits_json = serde_json::to_string(&input.requested_limits)?;
             let terminal_json = input.terminal.as_ref().map(serde_json::to_string).transpose()?;
@@ -2117,6 +2122,7 @@ fn create_schema(
         CREATE TRIGGER view_intents_inventory_update AFTER UPDATE ON view_intents BEGIN UPDATE installation SET inventory_revision=inventory_revision+1 WHERE singleton=1; END;
         CREATE TRIGGER view_intents_inventory_delete AFTER DELETE ON view_intents BEGIN UPDATE installation SET inventory_revision=inventory_revision+1 WHERE singleton=1; END;
     "#))?;
+    input_reservation::create_table(&tx)?;
     tx.execute("INSERT INTO installation (singleton,installation_id,schema_version,control_epoch,inventory_revision,initial_scan_state) VALUES (1,?1,?2,0,0,'pending')", params![installation_id.as_str(), SCHEMA_VERSION])?;
     tx.execute(
         "INSERT INTO rollout_state (singleton,mode,updated_at) VALUES (1,'legacy',?1)",
@@ -2378,6 +2384,13 @@ fn migrate_schema(conn: &mut Connection) -> Result<(), RegistryError> {
         )?;
         tx.commit()?;
         schema = 7;
+    }
+    if schema == 7 {
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        input_reservation::create_table(&tx)?;
+        tx.execute_batch("UPDATE installation SET schema_version=8 WHERE singleton=1;")?;
+        tx.commit()?;
+        schema = 8;
     }
     if schema != SCHEMA_VERSION {
         return Err(RegistryError::Integrity(format!(
@@ -2862,6 +2875,118 @@ mod tests {
             view_intent: None,
             admission: AdmissionPolicy::default(),
         }
+    }
+
+    #[tokio::test]
+    async fn provider_initial_input_reservation_binds_to_first_prepared_incarnation() {
+        let dir = tempfile::tempdir().unwrap();
+        let binary = dir.path().join("synthetic-host");
+        std::fs::write(&binary, "synthetic artifact").unwrap();
+        let registry = Registry::open(dir.path().join("registry"), None).unwrap();
+        let soul = SoulId::new();
+        let reserved = registry
+            .reserve_initial_inputs(
+                freshell_runtime_protocol::ReserveProviderInputsRequest {
+                    expected_control_epoch: Some(registry.control_epoch()),
+                    soul_id: soul.clone(),
+                    provider: "opencode".into(),
+                    creation_seed_ref: "seed".into(),
+                },
+                format!("sha256:{}", "a".repeat(64)),
+                binary,
+            )
+            .await
+            .unwrap();
+        let observation = freshell_runtime_protocol::InitialAuthVolumeObservation::Absent {
+            daemon_id: DockerDaemonId::new(),
+        };
+        let receipt = registry
+            .record_initial_observation(reserved.clone(), observation.clone())
+            .await
+            .unwrap();
+        assert_eq!(
+            registry
+                .record_initial_observation(reserved.clone(), observation)
+                .await
+                .unwrap(),
+            receipt
+        );
+        assert!(
+            registry
+                .record_initial_observation(
+                    reserved,
+                    freshell_runtime_protocol::InitialAuthVolumeObservation::Absent {
+                        daemon_id: DockerDaemonId::new()
+                    }
+                )
+                .await
+                .is_err(),
+            "a repeated reserve cannot overwrite the original daemon observation"
+        );
+        let mut launch = prep(soul.clone(), RequestId::new(), "reserved-inputs");
+        launch.provider = "opencode".into();
+        launch.fresh_agent = Some(serde_json::from_value(serde_json::json!({
+            "sessionId":"synthetic-session", "provider":"opencode", "sessionType":"freshopencode",
+            "runtimeVariant":"opencode", "providerStoreId":"store", "cwd":"/synthetic/workspace",
+            "workspacePath":"/synthetic/workspace", "runAsUid":65534, "runAsGid":0,
+            "providerLaunchContext": {
+                "preparation":{"opencode":{"project_config":[],"tui_config":null}},
+                "mcpCapability":{"grantId":"grant-reservation", "endpoint":"http://host.docker.internal:3001/api/mcp",
+                    "providerRelativePath":".config/opencode/freshell-mcp.json"},
+                "preparedInputs":{"generationId":"grant-reservation", "initialAuthReservation":receipt.reservation_id,
+                    "manifest":{"relativePath":".freshell/input-manifest.json","sha256":"a".repeat(64),
+                        "sourceCount":0,"aliasCount":0,"recipeCount":0}}
+            }
+        })).expect("the complete prepared context must carry its initial auth reservation"));
+        let first = registry.prepare_launch(launch.clone()).await.unwrap();
+        let replay = registry.prepare_launch(launch.clone()).await.unwrap();
+        assert_eq!(first.incarnation_id, replay.incarnation_id);
+        assert!(
+            registry
+                .bound_input_reservation(first.incarnation_id.clone())
+                .await
+                .unwrap()
+                .is_some(),
+            "creation authority remains available after the soul row is created"
+        );
+        assert!(registry
+            .bound_input_reservation(IncarnationId::new())
+            .await
+            .unwrap()
+            .is_none());
+        assert!(
+            registry
+                .initial_input_reservation(soul.clone(), receipt.reservation_id.clone())
+                .await
+                .unwrap()
+                .is_none(),
+            "bound authority must no longer be reusable for a pre-soul absence lookup"
+        );
+        launch
+            .fresh_agent
+            .as_mut()
+            .unwrap()
+            .provider_launch_context
+            .as_mut()
+            .unwrap()
+            .prepared_inputs
+            .as_mut()
+            .unwrap()
+            .initial_auth_reservation = None;
+        assert!(matches!(registry.prepare_launch(launch).await,Err(RegistryError::RequestConflict)),
+            "a pending retry cannot remove or swap creation authority even with the same semantic digest");
+        let conn = open_connection(&registry.inner.db_path).unwrap();
+        let consumed: i64 = conn
+            .query_row(
+                "SELECT consumed FROM provider_input_preparations WHERE soul_id=?1",
+                params![soul.as_str()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            consumed, 1,
+            "preparing the workload must atomically bind, not leave reusable pre-soul authority"
+        );
     }
 
     async fn materialize_test_runtime(registry: &Registry, soul_id: SoulId) -> PreparedLaunch {

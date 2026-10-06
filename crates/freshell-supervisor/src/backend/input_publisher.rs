@@ -700,6 +700,7 @@ mod tests {
         })).unwrap();
         terminal.validate().unwrap();
         let spec = CreateRuntimeSpec {
+            initial_input_reservation: None,
             installation_id: InstallationId::parse("installation-input").unwrap(),
             soul_id: soul,
             incarnation_id: IncarnationId::parse("incarnation-input").unwrap(),

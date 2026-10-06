@@ -51,6 +51,29 @@ pub struct RuntimeClient {
 }
 
 impl RuntimeClient {
+    pub async fn reserve_provider_inputs(
+        &self,
+        soul_id: SoulId,
+        provider: String,
+        creation_seed_ref: String,
+    ) -> Result<freshell_runtime_protocol::ProviderInputReservation, ClientError> {
+        let request = freshell_runtime_protocol::ReserveProviderInputsRequest {
+            expected_control_epoch: Some(self.current_epoch().await?),
+            soul_id,
+            provider,
+            creation_seed_ref,
+        };
+        match self
+            .request(
+                RequestId::new(),
+                AdminCommand::ReserveProviderInputs(request),
+            )
+            .await?
+        {
+            AdminResult::ProviderInputReservation(receipt) => Ok(receipt),
+            _ => Err(ClientError::UnexpectedResult),
+        }
+    }
     pub async fn native_auth_lookup(
         &self,
         soul_id: SoulId,

@@ -260,7 +260,7 @@ fn prepared_input_mounts(
             let source = canonical_stage_file(root, &reference.source_relative_path)?;
             verify_template_limit(&source)?;
             verify_workspace_destination(
-                &workspace,
+                workspace,
                 &reference.logical_destination,
                 &reference.effective_destination,
                 false,
@@ -289,7 +289,7 @@ fn prepared_input_mounts(
                 return Err("prepared resource is not a physical staged unit".into());
             }
             verify_workspace_destination(
-                &workspace,
+                workspace,
                 &reference.logical_destination,
                 &reference.effective_destination,
                 directory,
@@ -299,7 +299,7 @@ fn prepared_input_mounts(
         if let Some(files) = &inputs.indexed_files {
             for alias in &files.aliases {
                 verify_workspace_destination(
-                    &workspace,
+                    workspace,
                     &alias.logical_destination,
                     &alias.effective_destination,
                     false,
@@ -423,6 +423,7 @@ mod prepared_stage_tests {
         std::fs::write(&target, b"{\"model\":\"original\"}").unwrap();
         let inputs = PreparedProviderInputs {
             generation_id: "grant-prepared-stage".into(),
+            initial_auth_reservation: None,
             manifest: ProviderInputManifestReference {
                 relative_path: ".freshell/input-manifest.json".into(),
                 sha256: format!("{:x}", Sha256::digest(manifest)),
