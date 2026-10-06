@@ -173,6 +173,7 @@ impl HostedTransport {
                         json!({"freshAgent":{"enabled":true}}),
                     )
                     .with_sidecar_launch_context(CodexSidecarLaunchContext {
+                        provider_exec_profile: true,
                         config_args: sidecar_args,
                         env: Default::default(),
                     }),

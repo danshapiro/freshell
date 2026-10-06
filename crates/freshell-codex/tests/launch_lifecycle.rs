@@ -78,6 +78,7 @@ fn context_config_args() -> Vec<String> {
 
 fn sidecar_context(arg_log: &std::path::Path) -> CodexSidecarLaunchContext {
     CodexSidecarLaunchContext {
+        provider_exec_profile: false,
         config_args: context_config_args(),
         env: BTreeMap::from([
             (

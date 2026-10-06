@@ -1,5 +1,6 @@
 import { realpathSync } from 'node:fs'
 import { fileURLToPath, pathToFileURL } from 'node:url'
+import { managedSdkSpawn } from './exec-profile.mjs'
 
 const log = (message, details = {}) => process.stderr.write(`${JSON.stringify({ severity: 'warn', component: 'claude-model-catalog', message, ...details })}\n`)
 
@@ -7,6 +8,9 @@ const log = (message, details = {}) => process.stderr.write(`${JSON.stringify({ 
 export async function probeModelCatalog(query, { env = process.env, timeoutMs = 10_000 } = {}) {
   const { CLAUDECODE: _claudeCode, ANTHROPIC_API_KEY: _apiKey, ...cleanEnv } = env
   const abortController = new AbortController()
+  const stderr = env.FRESHELL_HOSTED_FRESH_AGENT === 'claude'
+    ? data => log('Claude capability probe stderr', { bytes: Buffer.byteLength(String(data)) })
+    : data => log('Claude capability probe stderr', { data: String(data).trimEnd() })
   const session = query({
     prompt: (async function* () {})(),
     options: {
@@ -14,7 +18,8 @@ export async function probeModelCatalog(query, { env = process.env, timeoutMs = 
       env: cleanEnv,
       pathToClaudeCodeExecutable: env.CLAUDE_CMD || undefined,
       settingSources: ['user', 'project', 'local'],
-      stderr: (data) => log('Claude capability probe stderr', { data: String(data).trimEnd() }),
+      spawnClaudeCodeProcess: managedSdkSpawn(stderr, env),
+      stderr,
     },
   })
   let timer

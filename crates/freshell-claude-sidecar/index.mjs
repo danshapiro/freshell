@@ -78,6 +78,7 @@ import { randomBytes } from 'node:crypto'
 import { configureSession, userMessageContent, resultErrorMessage } from './session-settings.mjs'
 import { createTurnCompleteGate } from './turn-complete-gate.mjs'
 import { nextMonotonic } from './monotonic-clock.mjs'
+import { managedSdkSpawn } from './exec-profile.mjs'
 import {
   canUseTool as routeCanUseTool,
   cancelPending,
@@ -395,6 +396,9 @@ function handleCreate(req) {
     // events (macrotasks) cannot interleave inside that finally.
     sessions.set(sessionId, state)
 
+    const sdkStderr = process.env.FRESHELL_HOSTED_FRESH_AGENT === 'claude'
+      ? data => process.stderr.write(`${JSON.stringify({ severity: 'warn', component: 'claude-sidecar', event: 'provider.stderr', bytes: Buffer.byteLength(String(data)) })}\n`)
+      : data => logerr(`sdk stderr: ${String(data).trimEnd()}`)
     const sdkQuery = query({
       prompt: iterable,
       options: {
@@ -420,7 +424,8 @@ function handleCreate(req) {
         abortController: abort,
         env: createClaudeSdkCleanEnv(process.env),
         settingSources: ['user', 'project', 'local'],
-        stderr: (data) => logerr(`sdk stderr: ${String(data).trimEnd()}`),
+        spawnClaudeCodeProcess: managedSdkSpawn(sdkStderr),
+        stderr: sdkStderr,
         canUseTool: async (toolName, input, options) => {
           const s = sessions.get(sessionId)
           if (!s) return { behavior: 'allow', updatedInput: input }

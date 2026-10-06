@@ -7164,6 +7164,16 @@ impl FreshCodexState {
             .stderr(Stdio::piped());
         cmd.kill_on_drop(true);
 
+        #[cfg(target_os = "linux")]
+        if self.sidecar_launch_context.provider_exec_profile {
+            let additional = if codex_program == "/usr/bin/setpriv" {
+                &["codex"][..]
+            } else {
+                &[]
+            };
+            freshell_platform::provider_exec::check_command(cmd.as_std(), true, additional)
+                .map_err(|error| error.to_string())?;
+        }
         let mut child = cmd
             .spawn()
             .map_err(|e| format!("codex app-server spawn failed ({codex_cmd}): {e}"))?;
@@ -28763,5 +28773,64 @@ pub(crate) mod tests {
             ),
             "the live session's owner record is untouched"
         );
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod provider_exec_tests {
+    use super::*;
+    #[tokio::test]
+    async fn provider_exec_profile_rejects_actual_managed_fresh_codex_spawn() {
+        const CASE: &str = "FRESHELL_CODEX_EXEC_PROFILE_CHILD";
+        if let Ok(case) = std::env::var(CASE) {
+            let count = if case == "large" { 17 } else { 1 };
+            let (tx, _rx) = tokio::sync::broadcast::channel(16);
+            let state = FreshCodexState::new(
+                Arc::new("synthetic-token".into()),
+                Arc::new(tx),
+                serde_json::json!({"freshAgent":{"enabled":false}}),
+            )
+            .with_sidecar_launch_context(
+                freshell_codex::launch_plan::CodexSidecarLaunchContext {
+                    provider_exec_profile: true,
+                    config_args: vec![],
+                    env: (0..count)
+                        .map(|i| (format!("FRESHELL_EXEC_FIXTURE_{i}"), "x".repeat(64 * 1024)))
+                        .collect(),
+                },
+            );
+            std::env::set_var(
+                "CODEX_CMD",
+                format!(
+                    "node {}/../../test/fixtures/coding-cli/codex-app-server/fake-app-server.mjs",
+                    env!("CARGO_MANIFEST_DIR")
+                ),
+            );
+            let mut result = state.spawn_sidecar_notifying(None, None).await;
+            if let Ok((_, _, _, child)) = &mut result {
+                child.kill().await.unwrap();
+                child.wait().await.unwrap();
+            }
+            if case == "large" {
+                assert!(
+                    matches!(result,Err(ref cause) if cause.contains("provider exec profile")),
+                    "managed fresh Codex must reject its actual full argv+env before spawn"
+                );
+            } else {
+                assert!(result.is_ok(),"valid selected fresh Codex inputs must execute the actual app-server handshake");
+            }
+            return;
+        }
+        for case in ["large", "small"] {
+            let output=std::process::Command::new(std::env::current_exe().unwrap()).env_clear()
+            .env("PATH","/usr/local/bin:/usr/bin:/bin").env(CASE,case)
+            .args(["--exact","codex::provider_exec_tests::provider_exec_profile_rejects_actual_managed_fresh_codex_spawn","--nocapture"])
+            .output().unwrap();
+            assert!(
+                output.status.success(),
+                "actual fresh Codex exec fixture failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
     }
 }

@@ -2857,6 +2857,7 @@ fn build_codex_managed_launch_setup(
         tui_mcp_injection: tui,
         terminal_env,
         sidecar_context: freshell_codex::launch_plan::CodexSidecarLaunchContext {
+            provider_exec_profile: false,
             config_args: sidecar.args,
             env: sidecar_env,
         },
