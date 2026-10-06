@@ -10,7 +10,7 @@ import { RestrictedDockerBroker, type BrokerEvent, type BrokerReceipt } from './
 
 export const PHASE1_RUNTIME_IMAGE_TAG = 'ubuntu:24.04'
 export const PHASE2_RUNTIME_IMAGE_TAG = 'freshell-managed-runtime:phase2'
-export const CONTROL_PROTOCOL_VERSION = 1
+export const CONTROL_PROTOCOL_VERSION = 2
 
 export type RuntimeLimits = {
   cpuMilli: number

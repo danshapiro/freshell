@@ -438,6 +438,18 @@
                 "minimum": 0,
                 "type": "integer"
               },
+              "freshAgentCreateRequestId": {
+                "type": "string"
+              },
+              "freshAgentRuntimeVariant": {
+                "type": "string"
+              },
+              "freshAgentSessionId": {
+                "type": "string"
+              },
+              "freshAgentSessionType": {
+                "type": "string"
+              },
               "hostBootId": {
                 "type": "string"
               },
@@ -500,7 +512,8 @@
                   "recovering",
                   "blocked",
                   "lost",
-                  "stopped"
+                  "stopped",
+                  "data_repair_complete"
                 ],
                 "type": "string"
               },
@@ -1208,7 +1221,8 @@
                 "recovering",
                 "blocked",
                 "lost",
-                "stopped"
+                "stopped",
+                "data_repair_complete"
               ],
               "type": "string"
             }
@@ -1461,7 +1475,8 @@
         "recovering",
         "blocked",
         "lost",
-        "stopped"
+        "stopped",
+        "data_repair_complete"
       ],
       "type": "string"
     },
@@ -1512,7 +1527,8 @@
             "recovering",
             "blocked",
             "lost",
-            "stopped"
+            "stopped",
+            "data_repair_complete"
           ],
           "type": "string"
         }
@@ -1989,6 +2005,18 @@
               "minimum": 0,
               "type": "integer"
             },
+            "freshAgentCreateRequestId": {
+              "type": "string"
+            },
+            "freshAgentRuntimeVariant": {
+              "type": "string"
+            },
+            "freshAgentSessionId": {
+              "type": "string"
+            },
+            "freshAgentSessionType": {
+              "type": "string"
+            },
             "hostBootId": {
               "type": "string"
             },
@@ -2051,7 +2079,8 @@
                 "recovering",
                 "blocked",
                 "lost",
-                "stopped"
+                "stopped",
+                "data_repair_complete"
               ],
               "type": "string"
             },
@@ -2324,6 +2353,18 @@
           "minimum": 0,
           "type": "integer"
         },
+        "freshAgentCreateRequestId": {
+          "type": "string"
+        },
+        "freshAgentRuntimeVariant": {
+          "type": "string"
+        },
+        "freshAgentSessionId": {
+          "type": "string"
+        },
+        "freshAgentSessionType": {
+          "type": "string"
+        },
         "hostBootId": {
           "type": "string"
         },
@@ -2386,7 +2427,8 @@
             "recovering",
             "blocked",
             "lost",
-            "stopped"
+            "stopped",
+            "data_repair_complete"
           ],
           "type": "string"
         },
@@ -2631,6 +2673,18 @@
               "minimum": 0,
               "type": "integer"
             },
+            "freshAgentCreateRequestId": {
+              "type": "string"
+            },
+            "freshAgentRuntimeVariant": {
+              "type": "string"
+            },
+            "freshAgentSessionId": {
+              "type": "string"
+            },
+            "freshAgentSessionType": {
+              "type": "string"
+            },
             "hostBootId": {
               "type": "string"
             },
@@ -2693,7 +2747,8 @@
                 "recovering",
                 "blocked",
                 "lost",
-                "stopped"
+                "stopped",
+                "data_repair_complete"
               ],
               "type": "string"
             },

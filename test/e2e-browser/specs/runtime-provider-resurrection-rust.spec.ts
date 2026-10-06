@@ -5,6 +5,9 @@
  * turn, drives the provider's native permission prompt, kills the owned
  * runtime, and writes a candidate-bound receipt only after every assertion.
  */
+import { randomBytes } from 'node:crypto'
+import fs from 'node:fs'
+import path from 'node:path'
 import { expect, type Page } from '@playwright/test'
 
 import { test } from '../helpers/fixtures.js'
@@ -17,6 +20,12 @@ import {
 import { openPanePicker } from '../helpers/pane-picker.js'
 import { TerminalHelper } from '../helpers/terminal-helpers.js'
 import { TestHarness } from '../helpers/test-harness.js'
+import { OPENCODE_NATIVE_HISTORY_SCRIPT } from '../helpers/opencode-native-history.js'
+import {
+  EXCLUDED_SOURCE_SENTINELS,
+  seedManagedOpenCodeSource,
+  type SyntheticSource,
+} from '../fixtures/managed-opencode-source.js'
 
 function leavesByMode(node: any, mode: string): any[] {
   if (!node) return []
@@ -92,6 +101,78 @@ function markerLineCount(rig: ManagedRuntimeBrowserRig, containerId: string): nu
     'if test -f "$HOME/p3-tool-effect-count"; then wc -l < "$HOME/p3-tool-effect-count"; else printf 0; fi',
   ]).trim()
   return /^\d+$/.test(raw) ? Number(raw) : -1
+}
+
+const PROVIDER_HISTORY_DIGESTS = String.raw`
+const { DatabaseSync } = require('node:sqlite');
+const { createHash } = require('node:crypto');
+const db = new DatabaseSync(process.argv[1], { readOnly: true });
+const root = process.argv[2];
+const hash = (value) => createHash('sha256').update(value).digest('hex');
+try {
+  db.exec('PRAGMA query_only = ON; BEGIN;');
+  const descendants = db.prepare('WITH RECURSIVE ids(id) AS (SELECT id FROM session WHERE id = ? UNION ALL SELECT child.id FROM session child JOIN ids ON child.parent_id = ids.id) SELECT id FROM ids ORDER BY id').all(root).map((row) => row.id);
+  const messages = db.prepare('SELECT id, data FROM message WHERE session_id = ? ORDER BY time_created, id');
+  const parts = db.prepare('SELECT id, data FROM part WHERE session_id = ? ORDER BY time_created, id');
+  const output = { sessions: descendants, messages: {}, parts: {} };
+  for (const id of descendants) {
+    for (const row of messages.all(id)) output.messages[row.id] = hash(row.data);
+    for (const row of parts.all(id)) output.parts[row.id] = hash(row.data);
+  }
+  db.exec('COMMIT;');
+  process.stdout.write(JSON.stringify(output));
+} finally { db.close(); }
+`
+
+const PROVIDER_SENTINEL_SCAN = String.raw`
+const { DatabaseSync } = require('node:sqlite');
+const sentinels = JSON.parse(process.argv[2]);
+const quote = (value) => '"' + value.replaceAll('"', '""') + '"';
+const db = new DatabaseSync(process.argv[1], { readOnly: true });
+const matches = new Set();
+try {
+  db.exec('PRAGMA query_only = ON; BEGIN;');
+  const tables = db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'").all();
+  for (const { name } of tables) {
+    const columns = db.prepare('PRAGMA table_info(' + quote(name) + ')').all();
+    const rows = db.prepare('SELECT * FROM ' + quote(name)).all();
+    for (const row of rows) {
+      for (const value of Object.values(row)) {
+        if (typeof value !== 'string') continue;
+        for (const sentinel of sentinels) if (value.includes(sentinel)) matches.add(sentinel);
+      }
+    }
+  }
+  db.exec('COMMIT;');
+  process.stdout.write(JSON.stringify([...matches].sort()));
+} finally { db.close(); }
+`
+
+type NativeDigests = {
+  sessions: string[]
+  messages: Record<string, string>
+  parts: Record<string, string>
+}
+
+function providerHistoryDigests(rig: ManagedRuntimeBrowserRig, containerId: string, rootId: string): NativeDigests {
+  return JSON.parse(rig.ownedProviderExec(containerId, [
+    'node', '--no-warnings', '-e', PROVIDER_HISTORY_DIGESTS,
+    '/home/freshell/provider/.local/share/opencode/opencode.db', rootId,
+  ])) as NativeDigests
+}
+
+function assertExcludedSentinelsAbsent(rig: ManagedRuntimeBrowserRig, containerId: string): void {
+  const matches = JSON.parse(rig.ownedProviderExec(containerId, [
+    'node', '--no-warnings', '-e', PROVIDER_SENTINEL_SCAN,
+    '/home/freshell/provider/.local/share/opencode/opencode.db', JSON.stringify(EXCLUDED_SOURCE_SENTINELS),
+  ])) as string[]
+  expect(matches).toEqual([])
+}
+
+function assertBaselinePreserved(source: SyntheticSource, installed: NativeDigests): void {
+  expect(installed.sessions).toEqual([source.childId, source.grandchildId, source.rootId].sort())
+  for (const [id, digest] of source.baselineMessages) expect(installed.messages[id], id).toBe(digest)
+  for (const [id, digest] of source.baselineParts) expect(installed.parts[id], id).toBe(digest)
 }
 
 test.describe.serial('Phase 3 provider resurrection', () => {
@@ -258,10 +339,11 @@ test.describe.serial('Phase 3 provider resurrection', () => {
       expect(toolEffectCount).toBe(1)
 
       await terminal.executeCommandInserted('Reply with exactly P3_FOLLOWUP_OK and use no tools.', 1)
-      const followUpText = await terminal.waitForOutput('P3_FOLLOWUP_OK', {
+      await terminal.waitForOutput('P3_FOLLOWUP_OK', {
         terminalId,
         timeout: 180_000,
       })
+      const followUpText = await terminal.getVisibleText(terminalId)
       expect(markerLineCount(rig, after.containerId)).toBe(1)
 
       const receipt = {
@@ -298,6 +380,166 @@ test.describe.serial('Phase 3 provider resurrection', () => {
       console.log(`[P3-G10] provider resurrection receipt: ${receiptPath}`)
     } finally {
       const cleanup = await rig.stop()
+      expect(cleanup.ok, cleanup.errors.join('\n')).toBe(true)
+    }
+  })
+})
+
+test.describe('managed OpenCode source-to-soul resume', () => {
+  test('imports only the selected synthetic conversation and reopens under its native ID', async ({ page }) => {
+    // The local Docker rig launches the pinned real TUI. Keep this explicit
+    // opt-in so a broad local run cannot access Docker by accident. The
+    // recovery proof below does not submit a prompt. Set the separate
+    // FOLLOWUP opt-in only when a synthetic provider turn is specifically
+    // needed.
+    test.skip(process.env.FRESHELL_RUNTIME_SYNTHETIC_RESUME !== '1', 'requires approved local Docker synthetic-resume run')
+    test.setTimeout(900_000)
+
+    // The runtime supervisor is containerized and can inspect only mounted
+    // workspace roots. Keep this synthetic source under the mounted checkout.
+    const tempRoot = fs.mkdtempSync(path.join(process.cwd(), '.freshell-opencode-resume-'))
+    const webHome = path.join(tempRoot, 'web-home')
+    const databasePath = path.join(webHome, '.local/share/opencode/opencode.db')
+    const nonce = randomBytes(8).toString('hex')
+    const source = seedManagedOpenCodeSource({
+      repoRoot: process.cwd(),
+      databasePath,
+      workspace: fs.realpathSync(process.cwd()),
+      nonce,
+    })
+    const rig = new ManagedRuntimeBrowserRig(
+      process.cwd(), 3, { OPENCODE_DB: databasePath }, { OPENCODE_DB: databasePath }, 'test',
+      { enabledProviders: ['opencode'] }, webHome,
+    )
+    try {
+      const info = await rig.start()
+      await page.goto(`${info.baseUrl}/?token=${info.token}&e2e=1`)
+      const harness = new TestHarness(page)
+      const terminal = new TerminalHelper(page)
+      await harness.waitForHarness()
+      await harness.waitForConnection()
+      await ensureShell(page, terminal)
+
+      const row = page.locator(`[data-session-id="${source.rootId}"][data-provider="opencode"]`)
+      await expect(row, 'the isolated source is discoverable as an OpenCode session').toBeVisible({ timeout: 30_000 })
+      const priorTabId = await harness.getActiveTabId()
+      await row.click()
+      const tabId = await waitForValue('selected session tab', async () => {
+        const current = await harness.getActiveTabId()
+        return current && current !== priorTabId ? current : null
+      }, 30_000)
+      const leaf = await waitForModeLeaf(harness, tabId, 'opencode',
+        (candidate) => candidate.content?.sessionRef?.sessionId === source.rootId, 60_000)
+      const terminalId: string = leaf.content.terminalId
+      const paneId: string = leaf.id
+      const before = await waitForValue('imported managed runtime view', async () => {
+        const view = await rig.runningViewForTerminal(terminalId)
+        return view?.nativeSessionId === source.rootId && view.containerId && view.hostBootId ? view : null
+      }, 180_000)
+      expect(before.soulId).toBeTruthy()
+      expect(before.containerId).toBeTruthy()
+
+      // The stage is removed once import receipts are durable. Verify the
+      // actual provider database after the managed launch instead of requiring
+      // transient staging bytes to outlive their documented cleanup point.
+      const imported = providerHistoryDigests(rig, before.containerId!, source.rootId)
+      assertBaselinePreserved(source, imported)
+      expect(Object.keys(imported.messages)).toHaveLength(source.baselineMessages.size)
+      expect(Object.keys(imported.parts)).toHaveLength(source.baselineParts.size)
+      assertExcludedSentinelsAbsent(rig, before.containerId!)
+
+      // Wait for the session host to accept the TUI's exact-session/current-tail
+      // observation. A live runtime alone can still reject input at this gate.
+      const adoption = await waitForValue('provider-observed managed pane', () => {
+        const status = rig.ownedOpenCodeAdoptionStatus(before)
+        return status.state === 'observed' ? status.data.observation : null
+      }, 180_000)
+      expect(adoption).toMatchObject({
+        terminalId,
+        incarnationId: before.incarnationId,
+        rootSessionId: source.rootId,
+        tailMessageId: source.lastMessageId,
+        hydrated: true,
+        messagesRead: 'success',
+      })
+      expect(adoption.evidenceGeneration).toMatch(/^[0-9a-f]{64}$/)
+      expect(adoption.launchNonce).toBeTruthy()
+      await expect(page.getByText('Offline: input will queue until reconnected.')).toHaveCount(0)
+      expect(await terminal.getVisibleText(terminalId)).not.toContain('Workspace Unavailable')
+      let expectedTailMessageId = source.lastMessageId
+      let appended: NativeDigests | null = null
+      if (process.env.FRESHELL_RUNTIME_SYNTHETIC_RESUME_FOLLOWUP === '1') {
+        await page.locator(`[data-pane-id="${paneId}"] .xterm:visible`).last().waitFor({ state: 'visible' })
+        await page.locator(`[data-pane-id="${paneId}"] .xterm:visible`).last().click()
+        await page.keyboard.insertText(`Reply with exactly SYNTHETIC_FOLLOWUP_${nonce} and use no tools.`)
+        await page.keyboard.press('Enter')
+        const nativeFollowup = await waitForValue('completed synthetic follow-up in native history', () => {
+          const raw = rig.ownedProviderExec(before.containerId!, [
+            'node', '--no-warnings', '-e', OPENCODE_NATIVE_HISTORY_SCRIPT,
+            '/home/freshell/provider/.local/share/opencode/opencode.db', source.rootId,
+          ])
+          const history = JSON.parse(raw) as { turns: Array<{ messageId: string; text: string; toolCalls: unknown[] }> }
+          return history.turns.find((turn) =>
+            !source.baselineMessages.has(turn.messageId)
+              && turn.toolCalls.length === 0
+              && turn.text.includes(`SYNTHETIC_FOLLOWUP_${nonce}`)) ?? null
+        }, 180_000)
+        expect(nativeFollowup.messageId).toBeTruthy()
+        expectedTailMessageId = nativeFollowup.messageId
+        appended = await waitForValue('native follow-up append', () => {
+          const snapshot = providerHistoryDigests(rig, before.containerId!, source.rootId)
+          return snapshot.messages[nativeFollowup.messageId] ? snapshot : null
+        }, 180_000)
+        assertBaselinePreserved(source, appended)
+      }
+
+      rig.runtime.killOwnedRuntimeExact(before.containerId!)
+      const reopened = await waitForValue('same soul reopened after provider loss', async () => {
+        const view = await rig.runningViewForTerminal(terminalId)
+        return view?.containerId && view.hostBootId && view.incarnationId !== before.incarnationId ? view : null
+      }, 180_000)
+      expect(reopened.soulId).toBe(before.soulId)
+      expect(reopened.nativeSessionId).toBe(source.rootId)
+      expect(reopened.hostBootId).not.toBe(before.hostBootId)
+      const reopenedAdoption = await waitForValue('replacement provider-observed managed pane', () => {
+        // The probe authenticates this exact host boot against the reopened
+        // inventory row before reading its input gate.
+        const status = rig.ownedOpenCodeAdoptionStatus(reopened)
+        return status.state === 'observed' ? status.data.observation : null
+      }, 180_000)
+      expect(reopenedAdoption).toMatchObject({
+        terminalId,
+        incarnationId: reopened.incarnationId,
+        rootSessionId: source.rootId,
+        tailMessageId: expectedTailMessageId,
+        hydrated: true,
+        messagesRead: 'success',
+      })
+      expect(reopenedAdoption.evidenceGeneration).toMatch(/^[0-9a-f]{64}$/)
+      expect(reopenedAdoption.launchNonce).toBeTruthy()
+      expect(reopenedAdoption.launchNonce).not.toBe(adoption.launchNonce)
+      const reopenedHistory = providerHistoryDigests(rig, reopened.containerId!, source.rootId)
+      assertBaselinePreserved(source, reopenedHistory)
+      if (appended) {
+        for (const [id, digest] of Object.entries(appended.messages)) expect(reopenedHistory.messages[id], id).toBe(digest)
+      } else {
+        expect(Object.keys(reopenedHistory.messages)).toHaveLength(source.baselineMessages.size)
+        expect(Object.keys(reopenedHistory.parts)).toHaveLength(source.baselineParts.size)
+      }
+
+      // The host copy remains the original source; managed turns are never
+      // written back into that store.
+      const sourceDb = new (await import('node:sqlite')).DatabaseSync(databasePath, { readOnly: true })
+      try {
+        const sourceCount = sourceDb.prepare('SELECT COUNT(*) AS count FROM message WHERE session_id = ?').get(source.rootId) as { count: number }
+        expect(sourceCount.count).toBe(106)
+      } finally {
+        sourceDb.close()
+      }
+      expect(rig.runtime.broker.unsafeAttempts()).toHaveLength(0)
+    } finally {
+      const cleanup = await rig.stop()
+      fs.rmSync(tempRoot, { recursive: true, force: true })
       expect(cleanup.ok, cleanup.errors.join('\n')).toBe(true)
     }
   })

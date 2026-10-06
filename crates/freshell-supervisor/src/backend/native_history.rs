@@ -4,6 +4,27 @@ use std::time::Duration;
 // Keep the helper output bounded below the history-specific control reply budget.
 const MAX_SNAPSHOT_BYTES: usize = 16 * 1024 * 1024;
 const MAX_REPAIR_RECEIPT_BYTES: usize = 64 * 1024;
+const OPENCODE_PROVIDER_HOME: &str = "/home/freshell/provider";
+
+fn stopped_repair_provider_env(terminal: &TerminalLaunchSpec) -> Vec<String> {
+    let mut env = terminal.env.clone();
+    env.insert("HOME".into(), OPENCODE_PROVIDER_HOME.into());
+    env.insert(
+        "XDG_DATA_HOME".into(),
+        format!("{OPENCODE_PROVIDER_HOME}/.local/share"),
+    );
+    env.insert(
+        "XDG_CONFIG_HOME".into(),
+        format!("{OPENCODE_PROVIDER_HOME}/.config"),
+    );
+    env.insert(
+        "OPENCODE_DB".into(),
+        format!("{OPENCODE_PROVIDER_HOME}/.local/share/opencode/opencode.db"),
+    );
+    env.into_iter()
+        .map(|(key, value)| format!("{key}={value}"))
+        .collect()
+}
 
 fn decode_docker_stdout_frames(
     bytes: &[u8],
@@ -108,11 +129,7 @@ impl DockerEngineBackend {
                         .push(json!({"Type":"bind", "Source":git, "Target":git, "ReadOnly":true}));
                 }
             }
-            let env = terminal
-                .env
-                .iter()
-                .map(|(key, value)| format!("{key}={value}"))
-                .collect::<Vec<_>>();
+            let env = stopped_repair_provider_env(terminal);
             let body = json!({
                 "Image": handle.image_ref(),
                 "User": "0:0",
@@ -645,8 +662,7 @@ mod tests {
             "env":{
                 "HOME":"/home/freshell/provider",
                 "XDG_DATA_HOME":"/home/freshell/provider/.local/share",
-                "XDG_CONFIG_HOME":"/home/freshell/provider/.config",
-                "OPENCODE_DB":"/home/freshell/provider/.local/share/opencode/opencode.db"
+                "XDG_CONFIG_HOME":"/home/freshell/provider/.config"
             }
         }))
         .unwrap();
@@ -830,6 +846,9 @@ mod tests {
             assert_eq!(create["HostConfig"]["CapDrop"], json!(["ALL"]));
             assert_eq!(create["HostConfig"]["CapAdd"], json!(["SETUID", "SETGID"]));
             assert_eq!(create["Cmd"][0], "opencode-stopped-repair-worker");
+            assert!(create["Env"].as_array().unwrap().iter().any(|entry| {
+                entry == "OPENCODE_DB=/home/freshell/provider/.local/share/opencode/opencode.db"
+            }));
             assert!(create.get("Labels").is_none());
             let mounts = create["HostConfig"]["Mounts"].as_array().unwrap();
             let provider = mounts

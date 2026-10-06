@@ -783,6 +783,7 @@ mod tests {
             fixture_transport: Some(
                 freshell_runtime_protocol::FreshAgentFixtureTransport::Deterministic,
             ),
+            opencode_adoption_baseline: None,
             program: "freshell-session-host fresh-agent".into(),
             resume_argv: Vec::new(),
             provider_home: "/home/freshell/provider".into(),
