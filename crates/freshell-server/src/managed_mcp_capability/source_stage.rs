@@ -10,6 +10,7 @@ pub(super) fn stage(
     cwd: &Path,
     plan: &[PlannedSourceOccurrence],
     frozen_inputs: &[String],
+    native_source_flags: &[freshell_platform::opencode_recipe::NativeSourceFlag],
 ) -> Result<(), String> {
     let mut manifest = SourceManifest {
         version: 1,
@@ -19,6 +20,7 @@ pub(super) fn stage(
         files: Vec::new(),
         frozen_inputs: frozen_inputs.to_vec(),
         user_owns_freshell_mcp: false,
+        native_source_flags: native_source_flags.to_vec(),
     };
     private_directory(&root.join(".freshell/source-views"))?;
     private_directory(&root.join(".freshell/templates"))?;
@@ -131,14 +133,9 @@ pub(super) fn describe(
             );
         }
         let logical = &occurrence.source.logical_path;
-        let destination = if let Ok(relative) = logical.strip_prefix(global) {
-            runtime_home.join(".config/opencode").join(relative)
-        } else {
-            logical
-                .strip_prefix(home)
-                .map(|relative| runtime_home.join(relative))
-                .unwrap_or_else(|_| logical.clone())
-        };
+        let destination = crate::managed_provider_references::sources::runtime_config_destination(
+            home, global, logical,
+        );
         let effective = if let Ok(relative) = logical.strip_prefix(&global) {
             let physical = std::fs::canonicalize(root.join(relative))
                 .map_err(|_| "selected global config is unavailable in its private stage")?;

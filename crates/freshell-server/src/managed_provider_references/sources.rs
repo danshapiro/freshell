@@ -95,6 +95,18 @@ pub fn discover_opencode(
     Ok(sources)
 }
 
+pub fn runtime_config_destination(home: &Path, global: &Path, logical: &Path) -> PathBuf {
+    let runtime_home = Path::new("/home/freshell/provider");
+    if let Ok(relative) = logical.strip_prefix(global) {
+        runtime_home.join(".config/opencode").join(relative)
+    } else {
+        logical
+            .strip_prefix(home)
+            .map(|relative| runtime_home.join(relative))
+            .unwrap_or_else(|_| logical.into())
+    }
+}
+
 fn absolute_from_cwd(path: &str, cwd: &Path) -> PathBuf {
     let path = Path::new(path);
     if path.is_absolute() {

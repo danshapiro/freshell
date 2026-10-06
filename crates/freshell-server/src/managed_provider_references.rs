@@ -714,6 +714,7 @@ pub(crate) struct OpencodePreparation<'a> {
     pub references: Vec<freshell_runtime_protocol::ProviderSecretReference>,
     pub auth_authority: Option<&'a str>,
     pub selected_sources: Option<Vec<sources::SourceOccurrence>>,
+    pub native_source_flags: Option<Vec<freshell_platform::opencode_recipe::NativeSourceFlag>>,
 }
 
 pub(crate) async fn prepare_managed_opencode(
@@ -746,6 +747,7 @@ pub(crate) async fn prepare_managed_opencode_with_publisher(
         mut references,
         auth_authority,
         selected_sources,
+        native_source_flags,
     } = request;
     use sources::*;
     if original("OPENCODE_CONFIG_CONTENT").is_some_and(|value| !value.is_empty())
@@ -787,6 +789,44 @@ pub(crate) async fn prepare_managed_opencode_with_publisher(
         .map_err(str::to_string)?
     };
     let loaded = read_opencode_sources(selected).map_err(|error| error.to_string())?;
+    let native_source_flags = if let Some(flags) = native_source_flags {
+        flags
+    } else {
+        let mut flags = Vec::new();
+        for (name, kind) in [
+            (
+                "OPENCODE_CONFIG",
+                freshell_platform::opencode_recipe::NativeSourceFlagKind::Main,
+            ),
+            (
+                "OPENCODE_TUI_CONFIG",
+                freshell_platform::opencode_recipe::NativeSourceFlagKind::Tui,
+            ),
+        ] {
+            if let Some(path) = original(name).filter(|path| !path.is_empty()) {
+                let path = if Path::new(&path).is_absolute() {
+                    PathBuf::from(path)
+                } else {
+                    cwd.join(path)
+                };
+                if !loaded
+                    .iter()
+                    .any(|source| source.source.logical_path == path)
+                {
+                    return Err(format!("selected {name} source is missing or unavailable; repair it before dispatch"));
+                }
+                let destination = sources::runtime_config_destination(home, &config_root, &path);
+                flags.push(freshell_platform::opencode_recipe::NativeSourceFlag {
+                    kind,
+                    runtime_destination: destination
+                        .to_str()
+                        .ok_or("selected native source destination is not UTF-8")?
+                        .into(),
+                });
+            }
+        }
+        flags
+    };
     if loaded
         .iter()
         .any(|source| source.source.lane == SourceLane::Tui)
@@ -870,6 +910,7 @@ pub(crate) async fn prepare_managed_opencode_with_publisher(
             initial_auth_reservation: reservation.as_deref(),
             secret_references: Some(&references),
             frozen_inputs: Some(&frozen_names),
+            native_source_flags: Some(&native_source_flags),
             ..Default::default()
         },
     )?;

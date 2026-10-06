@@ -104,6 +104,22 @@ pub fn prepare(
         user_owns_freshell_mcp: manifest.user_owns_freshell_mcp,
     };
     let mut generated = BTreeMap::new();
+    if manifest.native_source_flags.len() > 2 {
+        return Err("prepared native source selector profile exceeded".into());
+    }
+    for flag in &manifest.native_source_flags {
+        let name = flag.kind.variable();
+        if !inputs
+            .config_binds
+            .iter()
+            .any(|bind| bind.logical_destination == flag.runtime_destination)
+            || generated.contains_key(name)
+            || secrets.environment.contains_key(name)
+        {
+            return Err("prepared native source selector has no approved config bind or collides with child input".into());
+        }
+        generated.insert(name.into(), flag.runtime_destination.clone());
+    }
     let mut views = 0usize;
     let mut budget = frozen.clone();
     for source in manifest.sources {
@@ -213,6 +229,10 @@ mod tests {
             }],
             frozen_inputs: vec!["INSERT".into()],
             user_owns_freshell_mcp: true,
+            native_source_flags: vec![NativeSourceFlag {
+                kind: NativeSourceFlagKind::Main,
+                runtime_destination: "/original-unavailable/project/opencode.json".into(),
+            }],
             files: vec![SelectedSourceFile {
                 source_id: 0,
                 canonical_source: "/original-unavailable/payload/rules".into(),
@@ -237,7 +257,11 @@ mod tests {
                     alias_count: 0,
                     recipe_count: 1,
                 },
-                config_binds: vec![],
+                config_binds: vec![ProviderConfigBind {
+                    source_relative_path: ".freshell/templates/source-0".into(),
+                    logical_destination: "/original-unavailable/project/opencode.json".into(),
+                    effective_destination: "/original-unavailable/project/opencode.json".into(),
+                }],
                 resource_mounts: vec![],
                 indexed_files: Some(IndexedProviderFiles {
                     volume_name: indexed_provider_volume_name(&SoulId::new(), &capability.grant_id),
@@ -271,6 +295,9 @@ mod tests {
         let value=generated.get("FRESHELL_CONFIG_REFERENCE_0").expect("host must generate the selected native child source from private path inputs before dispatch");
         let expected = r#"{"instructions":["PRIVATE_PREFIX{file:/home/freshell/provider/.freshell/references/0}PRIVATE_SUFFIX"]}"#;
         assert_eq!(value, expected);
+        assert_eq!(generated.get("OPENCODE_CONFIG").map(String::as_str),
+            Some("/original-unavailable/project/opencode.json"),
+            "an explicitly selected native source must be delivered to the actual child environment");
         assert!(!generated.contains_key("INSERT"),"independent generated recipes do not forward an original ambient variable into the native child");
         let changed = ProviderPathInputs::new(BTreeMap::from([(
             "INSERT".into(),
@@ -293,7 +320,8 @@ mod tests {
             format!("{:x}", Sha256::digest(&bytes));
         let generated = prepare(Some(&context), &mut secrets, &frozen, &stage, &home)
             .expect("direct source must use the 16 MiB document profile");
-        assert!(generated.is_empty());
+        assert_eq!(generated.len(), 1);
+        assert!(generated.contains_key("OPENCODE_CONFIG"));
         assert_eq!(
             std::fs::read(stage.join(".freshell/source-views/source-0")).unwrap(),
             large_raw.as_bytes()
@@ -330,5 +358,14 @@ mod tests {
                 .contains("64 KiB"),
             "generated child values retain the declared stricter limit"
         );
+        manifest.native_source_flags[0].runtime_destination =
+            "/unapproved/native/config.json".into();
+        let bytes = serde_json::to_vec(&manifest).unwrap();
+        std::fs::write(stage.join(".freshell/input-manifest.json"), &bytes).unwrap();
+        context.prepared_inputs.as_mut().unwrap().manifest.sha256 =
+            format!("{:x}", Sha256::digest(&bytes));
+        let error = prepare(Some(&context), &mut secrets, &frozen, &stage, &home).unwrap_err();
+        assert!(error.contains("approved config bind"));
+        assert!(!error.contains("/unapproved/native/config.json"));
     }
 }

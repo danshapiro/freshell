@@ -242,6 +242,7 @@ impl ManagedTerminalController for ServerManagedRuntimeController {
                         references: provider_secret_references,
                         auth_authority: None,
                         selected_sources: None,
+                        native_source_flags: None,
                     },
                 )
                 .await?;

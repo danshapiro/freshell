@@ -36,6 +36,29 @@ pub struct SourceManifest {
     pub frozen_inputs: Vec<String>,
     #[serde(default)]
     pub user_owns_freshell_mcp: bool,
+    #[serde(default)]
+    pub native_source_flags: Vec<NativeSourceFlag>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct NativeSourceFlag {
+    pub kind: NativeSourceFlagKind,
+    pub runtime_destination: String,
+}
+#[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NativeSourceFlagKind {
+    Main,
+    Tui,
+}
+impl NativeSourceFlagKind {
+    pub fn variable(self) -> &'static str {
+        match self {
+            Self::Main => "OPENCODE_CONFIG",
+            Self::Tui => "OPENCODE_TUI_CONFIG",
+        }
+    }
 }
 #[derive(Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
