@@ -64,6 +64,7 @@ struct McpCapabilityRequest<'a> {
     cwd: Option<&'a str>,
     prior_context: Option<&'a freshell_runtime_protocol::ProviderLaunchContext>,
     provider_secret_references: Option<&'a [freshell_runtime_protocol::ProviderSecretReference]>,
+    provider_path_inputs: Option<&'a freshell_runtime_protocol::ProviderPathInputs>,
 }
 
 #[derive(Clone)]
@@ -88,8 +89,13 @@ impl Drop for AuthLookupScope {
     }
 }
 
-type ProviderPathInputBindings =
-    HashMap<(SoulId, String), (freshell_runtime_protocol::ProviderPathInputs, Instant)>;
+type ProviderPathInputBindings = HashMap<
+    (SoulId, String),
+    (
+        freshell_runtime_protocol::ProviderPathInputs,
+        Option<Instant>,
+    ),
+>;
 
 #[derive(Clone)]
 pub struct Supervisor {
@@ -249,7 +255,9 @@ impl Supervisor {
                     .provider_path_inputs
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
-                bindings.retain(|_, (_, expires)| *expires > Instant::now());
+                bindings.retain(|_, (_, expires)| {
+                    expires.is_none_or(|expires| expires > Instant::now())
+                });
                 let key = (request.soul_id, request.generation_id);
                 if request.inputs.is_empty() {
                     bindings.remove(&key);
@@ -258,9 +266,18 @@ impl Supervisor {
                         return Err(invalid());
                     }
                 } else {
+                    if bindings
+                        .iter()
+                        .any(|((soul, _), (_, expires))| *soul == key.0 && expires.is_some())
+                    {
+                        return Err(invalid());
+                    }
                     bindings.insert(
                         key,
-                        (request.inputs, Instant::now() + Duration::from_secs(600)),
+                        (
+                            request.inputs,
+                            Some(Instant::now() + Duration::from_secs(600)),
+                        ),
                     );
                 }
                 Ok(AdminResult::ProviderPathInputsBound)
@@ -1980,6 +1997,7 @@ impl Supervisor {
                 cwd: None,
                 prior_context: None,
                 provider_secret_references: None,
+                provider_path_inputs: None,
             })
             .await?;
         if response != b"ok" {
@@ -2037,12 +2055,41 @@ impl Supervisor {
                 .map_err(map_backend)?;
         }
         if let Some(inputs) = context.and_then(|context| context.prepared_inputs.as_ref()) {
-            self.provider_path_inputs
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .remove(&(workload.soul_id.clone(), inputs.generation_id.clone()));
+            self.commit_provider_path_inputs(&workload.soul_id, &inputs.generation_id);
         }
         Ok(())
+    }
+
+    fn bound_provider_path_inputs(
+        &self,
+        soul_id: &SoulId,
+        generation_id: Option<&str>,
+    ) -> freshell_runtime_protocol::ProviderPathInputs {
+        generation_id
+            .and_then(|generation| {
+                self.provider_path_inputs
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .get(&(soul_id.clone(), generation.into()))
+                    .filter(|(_, expires)| expires.is_none_or(|expires| expires > Instant::now()))
+                    .map(|(inputs, _)| inputs.clone())
+            })
+            .unwrap_or_default()
+    }
+
+    fn commit_provider_path_inputs(&self, soul_id: &SoulId, generation_id: &str) {
+        let mut bindings = self
+            .provider_path_inputs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let current = (soul_id.clone(), generation_id.to_string());
+        // The controller has retired the prior generation only after acceptance.
+        // Keep the current selection process-local for replacement, with no
+        // preparation timeout once it belongs to the accepted running context.
+        bindings.retain(|key, _| key.0 != *soul_id || *key == current);
+        if let Some((_, expires)) = bindings.get_mut(&current) {
+            *expires = None;
+        }
     }
 
     pub(crate) async fn issue_replacement_mcp_capability(
@@ -2061,6 +2108,13 @@ impl Supervisor {
             _ => None,
         };
         let scope = self.auth_lookup_scope(start);
+        let path_inputs = self.bound_provider_path_inputs(
+            &start.context.soul_id,
+            context
+                .prepared_inputs
+                .as_ref()
+                .map(|inputs| inputs.generation_id.as_str()),
+        );
         let response = self
             .mcp_capability_callback(McpCapabilityRequest {
                 action: "issue",
@@ -2074,6 +2128,7 @@ impl Supervisor {
                 cwd: Some(cwd),
                 prior_context: Some(context),
                 provider_secret_references: Some(references),
+                provider_path_inputs: Some(&path_inputs),
             })
             .await?;
         let prepared: freshell_runtime_protocol::PreparedProviderContext =
@@ -2111,6 +2166,7 @@ impl Supervisor {
                 "cwd":request.cwd,
                 "priorContext":request.prior_context,
                 "providerSecretReferences":request.provider_secret_references,
+                "providerPathInputs":request.provider_path_inputs,
             }),
             freshell_runtime_protocol::MAX_CONTROL_FRAME_BYTES,
         )
@@ -2398,16 +2454,10 @@ impl Supervisor {
                     .and_then(|launch| launch.provider_launch_context.as_ref())
             })
             .and_then(|context| context.prepared_inputs.as_ref());
-        let provider_path_inputs = preparation
-            .and_then(|inputs| {
-                self.provider_path_inputs
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .get(&(workload.soul_id.clone(), inputs.generation_id.clone()))
-                    .filter(|(_, expires)| *expires > Instant::now())
-                    .map(|(values, _)| values.clone())
-            })
-            .unwrap_or_default();
+        let provider_path_inputs = self.bound_provider_path_inputs(
+            &workload.soul_id,
+            preparation.map(|inputs| inputs.generation_id.as_str()),
+        );
         let command = HostCommand::GrantExecution {
             incarnation_id: incarnation_id.clone(),
             soul_id: workload.soul_id.clone(),

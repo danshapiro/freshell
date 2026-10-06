@@ -136,6 +136,28 @@ async fn provider_frozen_path_binding_is_idempotent_private_and_generation_scope
         Some(sentinel)
     );
     assert!(supervisor.registry.inventory().await.unwrap().is_empty());
+    supervisor.commit_provider_path_inputs(&soul, &generation);
+    assert!(
+        supervisor
+            .provider_path_inputs
+            .lock()
+            .unwrap()
+            .contains_key(&(soul.clone(), generation.clone())),
+        "an accepted generation must retain process-only request path selections for replacement"
+    );
+    assert_eq!(
+        supervisor
+            .bound_provider_path_inputs(&soul, Some(&generation))
+            .get("RULE_ROOT"),
+        Some(sentinel)
+    );
+    assert!(
+        supervisor
+            .bound_provider_path_inputs(&SoulId::new(), Some(&generation))
+            .is_empty(),
+        "generation names never authorize another soul's selection"
+    );
+
     for file in std::fs::read_dir(&registry_root).unwrap() {
         let file = file.unwrap().path();
         if file.is_file() {
@@ -148,13 +170,87 @@ async fn provider_frozen_path_binding_is_idempotent_private_and_generation_scope
             );
         }
     }
+    let pending = format!("grant-{}", uuid::Uuid::new_v4());
+    let excess = format!("grant-{}", uuid::Uuid::new_v4());
+    for (candidate, success) in [(&pending, true), (&excess, false), (&pending, true)] {
+        let mut envelope = Envelope::new(
+            RequestId::new(),
+            ControlRole::Web,
+            AdminCommand::BindProviderPathInputs(BindProviderPathInputsRequest {
+                expected_control_epoch: Some(supervisor.registry.control_epoch()),
+                soul_id: soul.clone(),
+                generation_id: candidate.clone(),
+                inputs: ProviderPathInputs::new(BTreeMap::from([(
+                    "RULE_ROOT".into(),
+                    sentinel.into(),
+                )]))
+                .unwrap(),
+            }),
+        );
+        envelope.auth = Some(secret.into());
+        assert_eq!(
+            supervisor.dispatch(envelope).await.result.is_ok(),
+            success,
+            "a soul may retain only its active and one pending input generation"
+        );
+    }
+    supervisor
+        .provider_path_inputs
+        .lock()
+        .unwrap()
+        .get_mut(&(soul.clone(), pending.clone()))
+        .unwrap()
+        .1 = Some(tokio::time::Instant::now() - std::time::Duration::from_secs(1));
+    assert!(
+        supervisor
+            .bound_provider_path_inputs(&soul, Some(&pending))
+            .is_empty(),
+        "an expired unaccepted preparation cannot provide path inputs"
+    );
+    assert_eq!(
+        supervisor
+            .bound_provider_path_inputs(&soul, Some(&generation))
+            .get("RULE_ROOT"),
+        Some(sentinel),
+        "the pending timeout must not remove the accepted selection"
+    );
+    let mut renewal = Envelope::new(
+        RequestId::new(),
+        ControlRole::Web,
+        AdminCommand::BindProviderPathInputs(BindProviderPathInputsRequest {
+            expected_control_epoch: Some(supervisor.registry.control_epoch()),
+            soul_id: soul.clone(),
+            generation_id: pending.clone(),
+            inputs: ProviderPathInputs::new(BTreeMap::from([(
+                "RULE_ROOT".into(),
+                sentinel.into(),
+            )]))
+            .unwrap(),
+        }),
+    );
+    renewal.auth = Some(secret.into());
+    supervisor.dispatch(renewal).await.result.unwrap();
+    supervisor.commit_provider_path_inputs(&soul, &pending);
+    assert!(
+        !supervisor
+            .provider_path_inputs
+            .lock()
+            .unwrap()
+            .contains_key(&(soul.clone(), generation.clone())),
+        "accepting replacement must retire the previous process-only selection"
+    );
+    assert!(supervisor
+        .provider_path_inputs
+        .lock()
+        .unwrap()
+        .contains_key(&(soul.clone(), pending.clone())));
     let mut envelope = Envelope::new(
         RequestId::new(),
         ControlRole::Web,
         AdminCommand::BindProviderPathInputs(BindProviderPathInputsRequest {
             expected_control_epoch: Some(supervisor.registry.control_epoch()),
             soul_id: soul.clone(),
-            generation_id: generation.clone(),
+            generation_id: pending.clone(),
             inputs: ProviderPathInputs::default(),
         }),
     );
@@ -164,7 +260,7 @@ async fn provider_frozen_path_binding_is_idempotent_private_and_generation_scope
         .provider_path_inputs
         .lock()
         .unwrap()
-        .contains_key(&(soul, generation)));
+        .contains_key(&(soul, pending)));
 }
 
 #[async_trait]

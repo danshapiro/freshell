@@ -254,6 +254,8 @@ struct CapabilityCallback {
     cwd: Option<PathBuf>,
     provider_secret_references: Option<Vec<freshell_runtime_protocol::ProviderSecretReference>>,
     prior_context: Option<freshell_runtime_protocol::ProviderLaunchContext>,
+    #[serde(default)]
+    provider_path_inputs: Option<freshell_runtime_protocol::ProviderPathInputs>,
 }
 
 async fn apply_prepared_callback(
@@ -351,7 +353,26 @@ async fn apply_prepared_callback(
         .into_iter()
         .filter(|reference| !reference.profile.is_configuration_file())
         .collect();
-    let original = |name: &str| std::env::var(name).ok();
+    let path_inputs = callback.provider_path_inputs.unwrap_or_default();
+    let frozen_names = accepted_manifest
+        .as_ref()
+        .map(|manifest| manifest.frozen_inputs.as_slice())
+        .unwrap_or(&[]);
+    if path_inputs
+        .iter()
+        .any(|(name, _)| !frozen_names.iter().any(|approved| approved == name))
+        || frozen_names
+            .iter()
+            .any(|name| path_inputs.get(name).is_none())
+    {
+        return Err("accepted request-only source inputs are unavailable or differ from their generation; reprepare before dispatch".into());
+    }
+    let original = |name: &str| {
+        path_inputs
+            .get(name)
+            .map(str::to_owned)
+            .or_else(|| std::env::var(name).ok())
+    };
     let selected_sources=accepted_manifest.as_ref().map(|manifest|{
         manifest.sources.iter().enumerate().map(|(ordinal,source)|{
             let canonical=std::fs::canonicalize(&source.logical_path)
@@ -3459,6 +3480,159 @@ except Exception as error:
                 .count(),
             2
         );
+    }
+
+    #[tokio::test]
+    async fn managed_provider_replacement_preserves_request_only_path_inputs() {
+        use crate::managed_provider_references::sources::*;
+        use freshell_runtime_protocol::*;
+        use std::os::unix::fs::PermissionsExt;
+        let owned = tempfile::tempdir().unwrap();
+        let home = owned.path().join("home");
+        let workspace = owned.path().join("workspace");
+        let root = home.join(".config/opencode");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir(&workspace).unwrap();
+        let config = root.join("opencode.json");
+        let raw = r#"{"agent":{"probe":{"prompt":"{file:{env:REQUEST_RULE_ROOT}/rules}"}}}"#;
+        std::fs::write(&config, raw).unwrap();
+        let rules = root.join("rules");
+        let nonce = "PRIVATE_REQUEST_REISSUE_NONCE";
+        std::fs::write(&rules, nonce).unwrap();
+        let auth = owned.path().join("auth.json");
+        std::fs::write(&auth, "{}").unwrap();
+        std::fs::set_permissions(&auth, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let plan = plan_opencode_sources(
+            vec![SourceOccurrence {
+                logical_path: config.clone(),
+                canonical_source: config.clone(),
+                lane: SourceLane::Main,
+            }],
+            &workspace,
+            &home,
+            &|_, _, name| (name == "REQUEST_RULE_ROOT").then(|| root.to_str().unwrap().into()),
+        )
+        .unwrap();
+        let references = vec![
+            ProviderSecretReference {
+                source_path: auth.to_str().unwrap().into(),
+                profile: ProviderSecretProfile::OpencodeOnecliAuthFile,
+                provider_relative_path: None,
+            },
+            ProviderSecretReference {
+                source_path: rules.to_str().unwrap().into(),
+                profile: ProviderSecretProfile::OpencodeConfigurationFile,
+                provider_relative_path: Some(".freshell/references/0".into()),
+            },
+        ];
+        let base = crate::managed_provider_bootstrap::provider_launch_context_from_home(
+            "opencode", &workspace, &home, None,
+        )
+        .unwrap()
+        .unwrap();
+        let directory = owned.path().join("control/mcp-capabilities");
+        std::fs::create_dir_all(&directory).unwrap();
+        let store = CapabilityStore::default();
+        let soul = SoulId::new();
+        let frozen_names = vec!["REQUEST_RULE_ROOT".into()];
+        let prior = store
+            .issue(
+                soul.clone(),
+                &directory,
+                "http://host.docker.internal:4000".into(),
+                Some(("opencode", &home, &base.config)),
+                OpencodeEphemeralInput {
+                    cwd: Some(&workspace),
+                    workspace: Some(&workspace),
+                    source_plan: Some(&plan),
+                    launch_context: Some(&base),
+                    secret_references: Some(&references),
+                    frozen_inputs: Some(&frozen_names),
+                    ..Default::default()
+                },
+                None,
+            )
+            .unwrap();
+        let accepted = read_prepared_context(&directory, &prior).unwrap();
+        let inputs = ProviderPathInputs::new(std::collections::BTreeMap::from([(
+            "REQUEST_RULE_ROOT".into(),
+            root.to_str().unwrap().into(),
+        )]))
+        .unwrap();
+        let callback = serde_json::to_vec(&serde_json::json!({"action":"issue", "controlSecret":"fixture-control", "soulId":soul,
+            "provider":"opencode", "workspace":workspace, "cwd":workspace, "priorContext":accepted,
+            "providerSecretReferences":references, "authLookupAuthority":"fixture-owned-attempt", "providerPathInputs":inputs})).unwrap();
+        let control = owned.path().join("control.sock");
+        let listener = tokio::net::UnixListener::bind(&control).unwrap();
+        let expected_root = root.clone();
+        let bound = tokio::spawn(async move {
+            tokio::time::timeout(std::time::Duration::from_secs(5), async move {
+                for operation in 0..2 {
+                    let (mut socket, _) = listener.accept().await.unwrap();
+                    let request: Envelope<AdminCommand> = read_frame(&mut socket).await.unwrap();
+                    assert_eq!(request.auth.as_deref(), Some("fixture-control"));
+                    let result = match (operation, request.body) {
+                        (0, AdminCommand::Health) => AdminResult::Health {
+                            control_epoch: 1,
+                            installation_id: InstallationId::parse("installation-fixture").unwrap(),
+                        },
+                        (1, AdminCommand::BindProviderPathInputs(request)) => {
+                            assert_eq!(
+                                request.inputs.get("REQUEST_RULE_ROOT"),
+                                expected_root.to_str()
+                            );
+                            AdminResult::ProviderPathInputsBound
+                        }
+                        _ => panic!("unexpected private replacement operation"),
+                    };
+                    write_frame(
+                        &mut socket,
+                        &AdminReply {
+                            request_id: request.request_id,
+                            result: Ok(result),
+                        },
+                    )
+                    .await
+                    .unwrap();
+                }
+            })
+            .await
+            .unwrap();
+        });
+        let client = freshell_runtime_client::RuntimeClient::new(control, "fixture-control");
+        let reply = apply_prepared_callback(
+            &callback,
+            "fixture-control",
+            &store,
+            &directory,
+            "http://host.docker.internal:4000",
+            &home,
+            &client,
+        )
+        .await;
+        if reply.is_err() {
+            bound.abort();
+        }
+        let reply = reply.expect("replacement must resolve the accepted request-only selection without current controller env");
+        bound.await.unwrap();
+        let reply: PreparedProviderContext = serde_json::from_slice(&reply).unwrap();
+        let selected = reply
+            .provider_secret_references
+            .iter()
+            .find(|reference| reference.profile.is_configuration_file())
+            .unwrap();
+        assert_eq!(
+            std::fs::read(&selected.source_path).unwrap(),
+            nonce.as_bytes()
+        );
+        assert_eq!(std::fs::read_to_string(&config).unwrap(), raw);
+        let durable = bounded_json_bytes(&reply, MAX_CONTROL_FRAME_BYTES).unwrap();
+        assert!(!durable
+            .windows(nonce.len())
+            .any(|bytes| bytes == nonce.as_bytes()));
+        assert!(staged_provider_root_path(&directory, &prior.grant_id)
+            .unwrap()
+            .is_dir());
     }
 
     #[tokio::test]
