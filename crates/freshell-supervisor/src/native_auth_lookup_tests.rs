@@ -82,6 +82,91 @@ async fn provider_initial_auth_requires_creation_reservation_before_absence_rece
         "absence is reobserved rather than inferred from native identity"
     );
 }
+#[tokio::test]
+async fn provider_frozen_path_binding_is_idempotent_private_and_generation_scoped() {
+    let temp = tempfile::tempdir().unwrap();
+    let binary = temp.path().join("synthetic-host");
+    std::fs::write(&binary, "synthetic helper artifact").unwrap();
+    let registry_root = temp.path().join("registry");
+    let registry = Registry::open(&registry_root, None).unwrap();
+    let secret = "synthetic-control-secret";
+    let supervisor = Supervisor::new(
+        registry,
+        Arc::new(AuthBackend(AtomicUsize::new(0))),
+        SupervisorConfig {
+            runtime_root: temp.path().join("runtime"),
+            control_socket_path: temp.path().join("control.sock"),
+            host_binary_path: binary,
+            image_ref: format!("sha256:{}", "a".repeat(64)),
+            test_run_id: "private-path-binding".into(),
+            control_secret: secret.into(),
+            lifecycle_log: temp.path().join("lifecycle.jsonl"),
+            admission: crate::admission::AdmissionPolicy::default(),
+        },
+    )
+    .unwrap();
+    let soul = SoulId::new();
+    let generation = format!("grant-{}", uuid::Uuid::new_v4());
+    let sentinel = "PRIVATE_FROZEN_INPUT_SENTINEL";
+    for (value, success) in [(sentinel, true), (sentinel, true), ("changed-input", false)] {
+        let request = BindProviderPathInputsRequest {
+            expected_control_epoch: Some(supervisor.registry.control_epoch()),
+            soul_id: soul.clone(),
+            generation_id: generation.clone(),
+            inputs: ProviderPathInputs::new(BTreeMap::from([("RULE_ROOT".into(), value.into())]))
+                .unwrap(),
+        };
+        let mut envelope = Envelope::new(
+            RequestId::new(),
+            ControlRole::Web,
+            AdminCommand::BindProviderPathInputs(request),
+        );
+        envelope.auth = Some(secret.into());
+        assert_eq!(supervisor.dispatch(envelope).await.result.is_ok(), success);
+    }
+    assert_eq!(
+        supervisor
+            .provider_path_inputs
+            .lock()
+            .unwrap()
+            .get(&(soul.clone(), generation.clone()))
+            .unwrap()
+            .0
+            .get("RULE_ROOT"),
+        Some(sentinel)
+    );
+    assert!(supervisor.registry.inventory().await.unwrap().is_empty());
+    for file in std::fs::read_dir(&registry_root).unwrap() {
+        let file = file.unwrap().path();
+        if file.is_file() {
+            assert!(
+                !std::fs::read(file)
+                    .unwrap()
+                    .windows(sentinel.len())
+                    .any(|bytes| bytes == sentinel.as_bytes()),
+                "private binding must not write an input snapshot to registry or its WAL"
+            );
+        }
+    }
+    let mut envelope = Envelope::new(
+        RequestId::new(),
+        ControlRole::Web,
+        AdminCommand::BindProviderPathInputs(BindProviderPathInputsRequest {
+            expected_control_epoch: Some(supervisor.registry.control_epoch()),
+            soul_id: soul.clone(),
+            generation_id: generation.clone(),
+            inputs: ProviderPathInputs::default(),
+        }),
+    );
+    envelope.auth = Some(secret.into());
+    supervisor.dispatch(envelope).await.result.unwrap();
+    assert!(!supervisor
+        .provider_path_inputs
+        .lock()
+        .unwrap()
+        .contains_key(&(soul, generation)));
+}
+
 #[async_trait]
 impl RuntimeBackend for AuthBackend {
     async fn observe_initial_auth_volume(

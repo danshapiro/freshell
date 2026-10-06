@@ -2726,6 +2726,7 @@ pub enum AdminCommand {
     Health,
     ReserveProviderInputs(ReserveProviderInputsRequest),
     NativeAuthLookup(NativeAuthLookupRequest),
+    BindProviderPathInputs(BindProviderPathInputsRequest),
     Launch(Box<LaunchRequest>),
     Stop(StopRequest),
     Inventory,
@@ -2933,6 +2934,7 @@ pub struct LaunchResult {
 pub enum AdminResult {
     ProviderInputReservation(ProviderInputReservation),
     NativeAuthLookup(NativeAuthValues),
+    ProviderPathInputsBound,
     Health {
         control_epoch: u64,
         installation_id: InstallationId,
@@ -2997,6 +2999,8 @@ pub enum HostCommand {
         grant_id: GrantId,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         fixture: Option<FixtureKind>,
+        #[serde(default, skip_serializing_if = "ProviderPathInputs::is_empty")]
+        provider_path_inputs: ProviderPathInputs,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         terminal: Option<Box<TerminalLaunchSpec>>,
         #[serde(default, skip_serializing_if = "Option::is_none")]

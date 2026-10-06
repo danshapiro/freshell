@@ -95,6 +95,11 @@ pub struct Supervisor {
     /// lock: its durable intent revision must be able to preempt recovery.
     pub(crate) recovery_locks: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
     auth_lookup_authorities: Arc<StdMutex<HashMap<String, AuthLookupAuthority>>>,
+    provider_path_inputs: Arc<
+        StdMutex<
+            HashMap<(SoulId, String), (freshell_runtime_protocol::ProviderPathInputs, Instant)>,
+        >,
+    >,
 }
 
 impl Supervisor {
@@ -142,6 +147,7 @@ impl Supervisor {
             config: Arc::new(config),
             recovery_locks: Arc::new(Mutex::new(HashMap::new())),
             auth_lookup_authorities: Arc::new(StdMutex::new(HashMap::new())),
+            provider_path_inputs: Arc::new(StdMutex::new(HashMap::new())),
         })
     }
 
@@ -224,6 +230,38 @@ impl Supervisor {
                     .await
                     .map(AdminResult::ProviderInputReservation)
                     .map_err(map_registry)
+            }
+            AdminCommand::BindProviderPathInputs(request) => {
+                self.registry
+                    .assert_epoch(request.expected_control_epoch)
+                    .map_err(map_registry)?;
+                let invalid = || {
+                    RuntimeError::new(RuntimeErrorCode::InvalidRequest,"provider path input binding has invalid or changed generation; reprepare before dispatch")
+                };
+                let id = request
+                    .generation_id
+                    .strip_prefix("grant-")
+                    .ok_or_else(invalid)?;
+                uuid::Uuid::parse_str(id).map_err(|_| invalid())?;
+                let mut bindings = self
+                    .provider_path_inputs
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                bindings.retain(|_, (_, expires)| *expires > Instant::now());
+                let key = (request.soul_id, request.generation_id);
+                if request.inputs.is_empty() {
+                    bindings.remove(&key);
+                } else if let Some((prior, _)) = bindings.get(&key) {
+                    if prior != &request.inputs {
+                        return Err(invalid());
+                    }
+                } else {
+                    bindings.insert(
+                        key,
+                        (request.inputs, Instant::now() + Duration::from_secs(600)),
+                    );
+                }
+                Ok(AdminResult::ProviderPathInputsBound)
             }
             AdminCommand::NativeAuthLookup(request) => {
                 self.registry
@@ -1940,6 +1978,12 @@ impl Supervisor {
                 "capability_pending: server rejected scoped grant",
             ));
         }
+        if matches!(action, "abort" | "revoke") {
+            self.provider_path_inputs
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .remove(&(soul_id.clone(), grant_id.into()));
+        }
         Ok(())
     }
 
@@ -1981,6 +2025,12 @@ impl Supervisor {
                 .commit_prepared_inputs(&handle)
                 .await
                 .map_err(map_backend)?;
+        }
+        if let Some(inputs) = context.and_then(|context| context.prepared_inputs.as_ref()) {
+            self.provider_path_inputs
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .remove(&(workload.soul_id.clone(), inputs.generation_id.clone()));
         }
         Ok(())
     }
@@ -2310,6 +2360,27 @@ impl Supervisor {
         grant: &ExecutionGrantRecord,
     ) -> Result<AcceptedGrant, RuntimeError> {
         let incarnation_id = handle.incarnation_id().clone();
+        let preparation = workload
+            .terminal
+            .as_ref()
+            .and_then(|launch| launch.provider_launch_context.as_ref())
+            .or_else(|| {
+                workload
+                    .fresh_agent
+                    .as_ref()
+                    .and_then(|launch| launch.provider_launch_context.as_ref())
+            })
+            .and_then(|context| context.prepared_inputs.as_ref());
+        let provider_path_inputs = preparation
+            .and_then(|inputs| {
+                self.provider_path_inputs
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .get(&(workload.soul_id.clone(), inputs.generation_id.clone()))
+                    .filter(|(_, expires)| *expires > Instant::now())
+                    .map(|(values, _)| values.clone())
+            })
+            .unwrap_or_default();
         let command = HostCommand::GrantExecution {
             incarnation_id: incarnation_id.clone(),
             soul_id: workload.soul_id.clone(),
@@ -2318,6 +2389,7 @@ impl Supervisor {
             execution_generation: grant.execution_generation,
             grant_id: grant.grant_id.clone(),
             fixture: workload.fixture,
+            provider_path_inputs,
             terminal: workload.terminal.clone().map(Box::new),
             fresh_agent: workload.fresh_agent.clone().map(Box::new),
             resume_spec: workload.resume_spec.clone().map(Box::new),

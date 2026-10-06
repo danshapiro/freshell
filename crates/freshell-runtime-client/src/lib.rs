@@ -51,6 +51,29 @@ pub struct RuntimeClient {
 }
 
 impl RuntimeClient {
+    pub async fn bind_provider_path_inputs(
+        &self,
+        soul_id: SoulId,
+        generation_id: String,
+        inputs: freshell_runtime_protocol::ProviderPathInputs,
+    ) -> Result<(), ClientError> {
+        let request = freshell_runtime_protocol::BindProviderPathInputsRequest {
+            expected_control_epoch: Some(self.current_epoch().await?),
+            soul_id,
+            generation_id,
+            inputs,
+        };
+        match self
+            .request(
+                RequestId::new(),
+                AdminCommand::BindProviderPathInputs(request),
+            )
+            .await?
+        {
+            AdminResult::ProviderPathInputsBound => Ok(()),
+            _ => Err(ClientError::UnexpectedResult),
+        }
+    }
     pub async fn reserve_provider_inputs(
         &self,
         soul_id: SoulId,

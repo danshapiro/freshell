@@ -4,6 +4,109 @@ use crate::{McpCapabilityReference, RuntimeError, RuntimeErrorCode, SoulId};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+/// Transient frozen path inputs travel only through authenticated process IPC.
+/// This type must never be embedded in a durable launch specification.
+#[derive(Clone, Default, PartialEq, Eq, Serialize)]
+#[serde(transparent)]
+pub struct ProviderPathInputs(std::collections::BTreeMap<String, String>);
+impl std::fmt::Debug for ProviderPathInputs {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ProviderPathInputs")
+            .field("selected_count", &self.0.len())
+            .finish()
+    }
+}
+impl ProviderPathInputs {
+    pub fn new(values: std::collections::BTreeMap<String, String>) -> Result<Self, RuntimeError> {
+        let mut result = Self::default();
+        for (name, value) in values {
+            result.insert(name, value)?;
+        }
+        Ok(result)
+    }
+    pub fn insert(&mut self, name: String, value: String) -> Result<(), RuntimeError> {
+        let invalid = || {
+            RuntimeError::new(RuntimeErrorCode::InvalidRequest,"selected provider path inputs have invalid names, controls, collisions or exceeded profile")
+        };
+        if name.is_empty()
+            || name.len() > 128
+            || name.contains('=')
+            || name.chars().any(char::is_control)
+            || value.len() > 64 * 1024
+            || value.contains('\0')
+            || self.0.contains_key(&name)
+            || self.0.len() >= 128
+        {
+            return Err(invalid());
+        }
+        let used = self
+            .0
+            .iter()
+            .fold(
+                name.len().checked_add(value.len()),
+                |size, (name, value)| {
+                    size.and_then(|size| size.checked_add(name.len()))
+                        .and_then(|size| size.checked_add(value.len()))
+                },
+            )
+            .ok_or_else(invalid)?;
+        if used > 256 * 1024 {
+            return Err(invalid());
+        }
+        self.0.insert(name, value);
+        Ok(())
+    }
+    pub fn get(&self, name: &str) -> Option<&str> {
+        self.0.get(name).map(String::as_str)
+    }
+    pub fn iter(&self) -> impl Iterator<Item = (&str, &str)> {
+        self.0
+            .iter()
+            .map(|(name, value)| (name.as_str(), value.as_str()))
+    }
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+impl<'de> Deserialize<'de> for ProviderPathInputs {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct Visitor;
+        impl<'de> serde::de::Visitor<'de> for Visitor {
+            type Value = ProviderPathInputs;
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("bounded transient provider path inputs")
+            }
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut inputs = ProviderPathInputs::default();
+                while let Some(name) = map.next_key::<String>()? {
+                    if inputs.0.len() >= 128 || name.len() > 128 {
+                        return Err(serde::de::Error::custom(
+                            "selected input name profile exceeded",
+                        ));
+                    }
+                    let value = map.next_value::<String>()?;
+                    inputs
+                        .insert(name, value)
+                        .map_err(|_| serde::de::Error::custom("selected input profile exceeded"))?;
+                }
+                Ok(inputs)
+            }
+        }
+        deserializer.deserialize_map(Visitor)
+    }
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct BindProviderPathInputsRequest {
+    pub expected_control_epoch: Option<u64>,
+    pub soul_id: SoulId,
+    pub generation_id: String,
+    pub inputs: ProviderPathInputs,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct PreparedProviderInputs {
@@ -294,6 +397,54 @@ fn mount_destination(value: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn provider_frozen_path_inputs_use_private_binding_rpc() {
+        let request = serde_json::json!({"method":"bind_provider_path_inputs","params":{
+            "expectedControlEpoch":1,"soulId":crate::SoulId::new(),
+            "generationId":"grant-synthetic-input-generation",
+            "inputs":{"PUBLIC_RULE_ROOT":"/synthetic/original/rules"}
+        }});
+        assert!(serde_json::from_value::<crate::AdminCommand>(request).is_ok(),
+            "frozen path inputs need a private process-only delivery separate from durable LaunchRequest");
+    }
+
+    #[test]
+    fn provider_frozen_path_inputs_enforce_shared_profile_and_redact_diagnostics() {
+        let mut inputs = ProviderPathInputs::default();
+        for name in ["A", "B", "C", "D"] {
+            inputs
+                .insert(name.into(), "x".repeat(64 * 1024 - 1))
+                .unwrap();
+        }
+        assert!(inputs.insert("E".into(), "x".into()).is_err());
+        assert!(ProviderPathInputs::new(std::collections::BTreeMap::from([(
+            "A".into(),
+            "x".repeat(64 * 1024 + 1)
+        )]))
+        .is_err());
+        let mut inputs = ProviderPathInputs::default();
+        for id in 0..128 {
+            inputs
+                .insert(format!("PATH_{id}"), "/synthetic".into())
+                .unwrap();
+        }
+        assert!(inputs
+            .insert("PATH_128".into(), "/synthetic".into())
+            .is_err());
+        for raw in [
+            r#"{"PATH":"/first","PATH":"/second"}"#,
+            r#"{"PATH":"bad\u0000value"}"#,
+        ] {
+            assert!(serde_json::from_str::<ProviderPathInputs>(raw).is_err());
+        }
+        let inputs: ProviderPathInputs =
+            serde_json::from_str(r#"{"PATH":"PRIVATE_PATH_INPUT_SENTINEL"}"#).unwrap();
+        let wire = serde_json::to_vec(&inputs).unwrap();
+        let received: ProviderPathInputs = serde_json::from_slice(&wire).unwrap();
+        assert_eq!(received.get("PATH"), Some("PRIVATE_PATH_INPUT_SENTINEL"));
+        assert!(!format!("{received:?}").contains("PRIVATE_PATH_INPUT_SENTINEL"));
+    }
+
     fn prepared() -> PreparedProviderInputs {
         PreparedProviderInputs {
             generation_id: "grant-synthetic".into(),
