@@ -106,7 +106,7 @@ pub async fn prepare_terminal(
                         "/run/freshell-private/user-provider/ephemeral/inline-config.json",
                     )
                     .map_err(|_| "managed OpenCode inline config is unavailable")?;
-                    terminal.env.insert("OPENCODE_CONFIG_CONTENT".into(), raw);
+                    child_env.insert("OPENCODE_CONFIG_CONTENT".into(), raw);
                 }
             }
         }
@@ -151,11 +151,11 @@ pub async fn prepare_terminal(
         .map_err(|error| error.to_string())?;
         let inherited = terminal
             .env
-            .get("OPENCODE_CONFIG_CONTENT")
-            .or_else(|| child_env.get("OPENCODE_CONFIG_CONTENT"));
+            .remove("OPENCODE_CONFIG_CONTENT")
+            .or_else(|| child_env.get("OPENCODE_CONFIG_CONTENT").cloned());
         if inherited.is_some() || permission.is_some() || has_mcp {
             let config = freshell_platform::opencode_config::merge_owned_entries(
-                inherited.map(String::as_str),
+                inherited.as_deref(),
                 &plan,
                 &freshell_platform::opencode_config::OwnedConfigEdits {
                     disable_snapshots: false,
@@ -165,9 +165,6 @@ pub async fn prepare_terminal(
                 },
             )
             .map_err(|error| error.to_string())?;
-            terminal
-                .env
-                .insert("OPENCODE_CONFIG_CONTENT".into(), config.clone());
             child_env.insert("OPENCODE_CONFIG_CONTENT".into(), config);
         }
     }
@@ -550,6 +547,37 @@ mod provider_secret_context_tests {
     use freshell_runtime_protocol::{
         McpCapabilityReference, ProviderLaunchContext, ProviderPreparation,
     };
+
+    #[tokio::test]
+    async fn provider_secret_inline_configuration_stays_only_in_actual_child_environment() {
+        let owned = tempfile::tempdir().unwrap();
+        let terminal=serde_json::from_value(serde_json::json!({
+            "terminalId":"terminal-inline", "streamId":"stream-inline", "mode":"opencode", "program":"opencode",
+            "cwd":owned.path(),"workspacePath":owned.path(),"runAsUid":65534,"runAsGid":0,"cols":80,"rows":24,"projectKey":"project-inline",
+            "env":{"FRESHELL_OPENCODE_REBIND":"0"}
+        })).unwrap();
+        let secrets = std::collections::BTreeMap::from([(
+            "OPENCODE_CONFIG_CONTENT".into(),
+            "{\"model\":\"sentinel-private-inline\"}".into(),
+        )]);
+        let prepared = prepare_terminal(terminal, &secrets).await.unwrap();
+        let metadata = serde_json::to_string(&prepared.terminal).unwrap();
+        assert!(
+            !metadata.contains("sentinel-private-inline"),
+            "private normalized config cannot enter terminal launch serialization"
+        );
+        assert!(!prepared
+            .terminal
+            .env
+            .contains_key("OPENCODE_CONFIG_CONTENT"));
+        let receipt=std::process::Command::new("node").args(["-e","const c=JSON.parse(process.env.OPENCODE_CONFIG_CONTENT);process.stdout.write(require('crypto').createHash('sha256').update(c.model).digest('hex'));"]).envs(&prepared.child_env).output().unwrap();
+        assert!(receipt.status.success());
+        use sha2::{Digest, Sha256};
+        assert_eq!(
+            String::from_utf8(receipt.stdout).unwrap(),
+            format!("{:x}", Sha256::digest(b"sentinel-private-inline"))
+        );
+    }
 
     #[test]
     fn scoped_mcp_grant_becomes_provider_process_environment() {
