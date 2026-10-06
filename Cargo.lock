@@ -1473,6 +1473,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "tokio-tungstenite 0.24.0",
+ "toml 0.9.12+spec-1.1.0",
  "tower",
  "tracing",
  "tracing-subscriber",

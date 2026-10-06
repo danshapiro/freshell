@@ -22,6 +22,7 @@ managed-runtime-v1 = [
   "dep:freshell-agent-runtime",
   "dep:freshell-runtime-client",
   "dep:freshell-runtime-protocol",
+  "dep:toml",
 ]
 managed-provider-qualification = [
   "managed-runtime-v1",
@@ -73,6 +74,7 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "proces
 axum = "0.8"
 async-trait = "0.1"
 serde_json = { workspace = true }
+toml = { version = "=0.9.12", optional = true }
 # Boot-scoped identifiers: `srv-<uuidv4>` / `boot-<uuidv4>`.
 uuid = { version = "1", features = ["v4"] }
 # The browser-pane HTTP reverse proxy (`/api/proxy/http/{port}/*`) forwards to a

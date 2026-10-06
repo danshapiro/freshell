@@ -1688,13 +1688,25 @@ mod tests {
     }
 
     #[cfg(unix)]
+    fn executable_fixture_directory() -> tempfile::TempDir {
+        match std::env::var_os("FRESHELL_TEST_EXECUTABLE_TMP_DIR") {
+            Some(directory) => tempfile::tempdir_in(directory),
+            None => tempfile::tempdir(),
+        }
+        .unwrap()
+    }
+
+    #[cfg(unix)]
     #[test]
     fn managed_provider_resource_script_and_dependency_execute() {
         use std::{os::unix::fs::PermissionsExt, process::Command};
-        let root = tempfile::tempdir().unwrap();
+        let root = executable_fixture_directory();
         let source = root.path().join("source");
         std::fs::create_dir_all(source.join("scripts")).unwrap();
         std::fs::create_dir_all(source.join("node_modules/fixture-dependency")).unwrap();
+        // Keep this transported package's module kind explicit when its
+        // disposable fixture lives below the repository's ESM package.
+        std::fs::write(source.join("package.json"), r#"{"type":"commonjs"}"#).unwrap();
         std::fs::write(source.join("data"), "resource-nonce\n").unwrap();
         std::fs::write(
             source.join("scripts/run"),
@@ -1747,7 +1759,7 @@ mod tests {
     #[test]
     fn managed_provider_two_stage_script_retains_execute_permission() {
         use std::{os::unix::fs::PermissionsExt, process::Command};
-        let root = tempfile::tempdir().unwrap();
+        let root = executable_fixture_directory();
         let source = root.path().join("source");
         std::fs::create_dir(&source).unwrap();
         std::fs::write(source.join("run"), "#!/bin/sh\nprintf resource-nonce\n").unwrap();
