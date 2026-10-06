@@ -61,6 +61,7 @@ pub mod mcp_inject;
 pub mod native_auth_exchange;
 pub mod opencode_config;
 pub mod opencode_plugin;
+pub mod opencode_recipe;
 pub mod path;
 pub mod provider_environment;
 pub mod provider_environment_grants;
