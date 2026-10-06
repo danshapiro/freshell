@@ -1594,6 +1594,7 @@ mod managed_opencode_adoption_tests {
         tail: OpenCodeVerifiedRootTail,
     ) -> CurrentOpenCodeEvidence {
         CurrentOpenCodeEvidence {
+            saved_snapshot_summary: Default::default(),
             version: 1,
             transfer_id: expectation.baseline.descriptor.transfer_id.clone(),
             destination_store_id: expectation.baseline.descriptor.destination_store_id.clone(),

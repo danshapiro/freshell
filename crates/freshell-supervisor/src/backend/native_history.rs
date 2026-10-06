@@ -711,6 +711,7 @@ mod tests {
         };
         let receipts = StoppedOpenCodeRepairReceipts {
             imported: freshell_agent_runtime::opencode_transfer::ImportReceipt {
+                saved_snapshot_summary: Default::default(),
                 version: 1,
                 transfer_id: descriptor.transfer_id.clone(),
                 destination_store_id: descriptor.destination_store_id.clone(),
@@ -728,6 +729,7 @@ mod tests {
                 structural_sha256: "2".repeat(64),
             },
             readable: freshell_agent_runtime::opencode_transfer::InstalledStoreReadable {
+                saved_snapshot_summary: Default::default(),
                 version: 1,
                 transfer_id: descriptor.transfer_id.clone(),
                 destination_store_id: descriptor.destination_store_id.clone(),

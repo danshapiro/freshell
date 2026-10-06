@@ -31,6 +31,8 @@ rusqlite = { version = "0.31", features = ["backup", "bundled"] }
 # Canonical logical thread and physical rollout identifiers in Codex history.
 uuid = "1"
 sha2 = "0.10"
+sha1 = "0.10"
+flate2 = "1"
 hex = "0.4"
 tempfile = "3"
 # SYNC-06 resume-resolve parity: the `shared/resume-input-parser.ts` port's

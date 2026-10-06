@@ -12672,6 +12672,54 @@ mod tests {
         assert!(blocked.ensure_pty_spawn_allowed().is_err());
     }
 
+    #[tokio::test]
+    async fn durable_souls_rehearsal_host_cannot_spawn_before_native_readiness() {
+        let mut gate = OpenCodeTransferGate::default();
+        let mut callbacks = 0;
+        for phase in OPENCODE_TRANSFER_READINESS_PHASES {
+            assert!(run_opencode_transfer_pty_spawn(&mut gate, || {
+                callbacks += 1;
+                async { Ok(()) }
+            })
+            .await
+            .is_err());
+            assert_eq!(
+                callbacks, 0,
+                "a missing native readiness phase must not call the PTY boundary"
+            );
+            gate.advance(phase).unwrap();
+        }
+        assert!(run_opencode_transfer_pty_spawn(&mut gate, || {
+            callbacks += 1;
+            async { Ok(()) }
+        })
+        .await
+        .is_err());
+        assert_eq!(
+            callbacks, 0,
+            "verified native data still needs the exact execution grant"
+        );
+        gate.advance(OpenCodeTransferPhase::GrantConsumed).unwrap();
+        run_opencode_transfer_pty_spawn(&mut gate, || {
+            callbacks += 1;
+            async { Ok(()) }
+        })
+        .await
+        .unwrap();
+        assert_eq!(callbacks, 1);
+        assert_eq!(
+            gate.phases().last(),
+            Some(&OpenCodeTransferPhase::PtySpawned)
+        );
+        assert!(run_opencode_transfer_pty_spawn(&mut gate, || {
+            callbacks += 1;
+            async { Ok(()) }
+        })
+        .await
+        .is_err());
+        assert_eq!(callbacks, 1);
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn production_grant_joins_staging_backend_mount_readiness_and_pty_for_synthetic_history()
@@ -13874,7 +13922,7 @@ mod tests {
             ));
             assert_eq!(
                 *events.lock().unwrap(),
-                ["import", "reader", "reader", "pty"]
+                ["import", "reader", "reader", "current", "pty"]
             );
             assert!(pty_called.load(std::sync::atomic::Ordering::SeqCst));
             assert!(

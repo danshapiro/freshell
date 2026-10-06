@@ -12,8 +12,9 @@ use crate::{
     view_intents::{enqueue_projection, load_view_intent},
 };
 use freshell_runtime_protocol::{
-    LostSoulRepairTarget, RequestId, RestoreLostSoulRootResult, RestoreLostSoulsResult,
-    RootRepairImportStatus, SoulId, SoulRepairStatus,
+    LostSoulRepairTarget, RepairBatchScope, RepairBatchSourceSelection, RepairBatchTarget,
+    RequestId, RestoreLostSoulRootResult, RestoreLostSoulsResult, RootRepairImportStatus, SoulId,
+    SoulRepairStatus,
 };
 use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
 use serde_json::Value;
@@ -31,6 +32,45 @@ struct WithdrawalFileContext {
 }
 
 impl Registry {
+    pub(crate) async fn repair_scope_members(
+        &self,
+        source: RepairBatchSourceSelection,
+    ) -> Result<Vec<RepairBatchTarget>, RegistryError> {
+        self.run_blocking(move |mut conn| {
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Deferred)?;
+            let members = resolve_scope_members(&tx, &source)?;
+            for member in &members {
+                validate_stopped_repair_target_in_tx(&tx, &member.target)?;
+            }
+            tx.rollback()?;
+            Ok(members)
+        })
+        .await
+    }
+
+    pub(crate) async fn stopped_repair_operation_scope(
+        &self,
+        operation_id: RequestId,
+    ) -> Result<Option<RepairBatchScope>, RegistryError> {
+        self.run_blocking(move |conn| {
+            let encoded: Option<Option<String>> = conn
+                .query_row(
+                    "SELECT scope_json FROM stopped_repair_operations WHERE operation_id=?1",
+                    params![operation_id.as_str()],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            match encoded {
+                None => Ok(None),
+                Some(Some(encoded)) => Ok(Some(serde_json::from_str(&encoded)?)),
+                Some(None) => Err(RegistryError::Integrity(
+                    "legacy stopped-repair operation has no qualified original scope".into(),
+                )),
+            }
+        })
+        .await
+    }
+
     pub(crate) async fn finalize_stopped_repair_batch(
         &self,
         operation_id: RequestId,
@@ -44,7 +84,7 @@ impl Registry {
         let mut roots = roots;
         roots.sort_by(|left, right| left.root_session_id.cmp(&right.root_session_id));
         if !valid_exact_targets(&targets)
-            || roots.len() != 7
+            || roots.is_empty()
             || roots
                 .windows(2)
                 .any(|pair| pair[0].root_session_id == pair[1].root_session_id)
@@ -141,7 +181,7 @@ impl Registry {
                 let marker = load_withdrawal(&conn, &operation_id)?;
                 validate_withdrawal(&operation, &marker, &targets)?;
                 let roots = load_root_receipts(&conn, &operation_id)?;
-                if roots.len() != 7 {
+                if roots.len() != operation.scope.roots.len() {
                     return Err(RegistryError::Integrity(
                         "pending stopped-repair withdrawal does not have seven verified roots".into(),
                     ));
@@ -165,12 +205,96 @@ impl Registry {
     }
 }
 
+fn resolve_scope_members(
+    conn: &Connection,
+    source: &RepairBatchSourceSelection,
+) -> Result<Vec<RepairBatchTarget>, RegistryError> {
+    let mut members = Vec::new();
+    let roots = source.root_session_ids.iter().collect::<BTreeSet<_>>();
+    if roots.is_empty()
+        || roots.len() != source.root_session_ids.len()
+        || !is_lower_hex_sha256(&source.source_store_id)
+    {
+        return Err(RegistryError::RequestConflict);
+    }
+    for root in roots {
+        let mut statement = conn.prepare(
+            "SELECT s.soul_id,s.loss_incident_id,s.intent_revision,l.intent_revision,s.identity_revision,s.native_import_revision,s.evidence_revision,s.provider_store_id \
+             FROM souls s JOIN loss_incidents l ON l.incident_id=s.loss_incident_id AND l.soul_id=s.soul_id \
+             WHERE s.provider='opencode' AND s.desired_state='stopped' AND s.recovery_state='lost' \
+             AND COALESCE(s.native_import_root_session_id,s.native_session_id)=?1 \
+             AND (s.native_import_source_store_id=?2 OR (s.native_import_source_store_id IS NULL AND s.native_import_authority='legacy_unknown')) \
+             ORDER BY s.soul_id",
+        )?;
+        let rows = statement.query_map(params![root, source.source_store_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, u64>(2)?,
+                row.get::<_, u64>(3)?,
+                row.get::<_, u64>(4)?,
+                row.get::<_, u64>(5)?,
+                row.get::<_, u64>(6)?,
+                row.get::<_, String>(7)?,
+            ))
+        })?;
+        let start = members.len();
+        for row in rows {
+            let (
+                soul,
+                incident,
+                intent,
+                incident_revision,
+                identity_revision,
+                native_import_revision,
+                evidence_revision,
+                provider_store_id,
+            ) = row?;
+            members.push(RepairBatchTarget {
+                target: LostSoulRepairTarget {
+                    soul_id: SoulId::parse(soul).map_err(|_| RegistryError::RequestConflict)?,
+                    incident_id: freshell_runtime_protocol::IncidentId::parse(incident)
+                        .map_err(|_| RegistryError::RequestConflict)?,
+                    expected_intent_revision: intent,
+                },
+                provider_store_id,
+                root_session_id: root.clone(),
+                incident_revision,
+                identity_revision,
+                native_import_revision,
+                evidence_revision,
+            });
+        }
+        if members.len() == start {
+            return Err(RegistryError::RequestConflict);
+        }
+    }
+    members.sort_by(|left, right| target_order(&left.target, &right.target));
+    Ok(members)
+}
+
+pub(crate) fn validate_scope_members(
+    conn: &Connection,
+    scope: &RepairBatchScope,
+) -> Result<(), RegistryError> {
+    let mut frozen = scope.targets.clone();
+    frozen.sort_by(|left, right| target_order(&left.target, &right.target));
+    if scope.scope_id != scope.descriptor_digest()
+        || resolve_scope_members(conn, &scope.source_selection())? != frozen
+    {
+        return Err(RegistryError::RequestConflict);
+    }
+    Ok(())
+}
+
 #[derive(Debug)]
 struct StoredOperation {
     status: String,
     target_fingerprint: String,
     targets_json: String,
     result_json: Option<String>,
+    scope: RepairBatchScope,
+    owner_choices: Vec<freshell_runtime_protocol::CanonicalOwnerChoice>,
 }
 
 #[derive(Debug)]
@@ -211,13 +335,14 @@ fn target_order(left: &LostSoulRepairTarget, right: &LostSoulRepairTarget) -> st
 }
 
 fn valid_exact_targets(targets: &[LostSoulRepairTarget]) -> bool {
-    freshell_runtime_protocol::RestoreLostSoulsRequest {
-        targets: targets.to_vec(),
-        canonical_owners: Vec::new(),
-        expected_control_epoch: None,
-    }
-    .validate_exact_batch()
-    .is_ok()
+    let mut souls = BTreeSet::new();
+    let mut incidents = BTreeSet::new();
+    !targets.is_empty()
+        && targets.iter().all(|target| {
+            target.expected_intent_revision > 0
+                && souls.insert(target.soul_id.as_str())
+                && incidents.insert(target.incident_id.as_str())
+        })
 }
 
 fn load_operation(
@@ -225,7 +350,7 @@ fn load_operation(
     operation_id: &RequestId,
 ) -> Result<StoredOperation, RegistryError> {
     conn.query_row(
-        "SELECT status,target_fingerprint,targets_json,result_json FROM stopped_repair_operations WHERE operation_id=?1",
+        "SELECT status,target_fingerprint,targets_json,result_json,scope_json,owner_choices_json FROM stopped_repair_operations WHERE operation_id=?1",
         params![operation_id.as_str()],
         |row| {
             Ok(StoredOperation {
@@ -233,6 +358,8 @@ fn load_operation(
                 target_fingerprint: row.get(1)?,
                 targets_json: row.get(2)?,
                 result_json: row.get(3)?,
+                scope: serde_json::from_str(&row.get::<_, String>(4)?).map_err(|error| rusqlite::Error::FromSqlConversionFailure(4, rusqlite::types::Type::Text, Box::new(error)))?,
+                owner_choices: serde_json::from_str(&row.get::<_, String>(5)?).map_err(|error| rusqlite::Error::FromSqlConversionFailure(5, rusqlite::types::Type::Text, Box::new(error)))?,
             })
         },
     )
@@ -248,9 +375,91 @@ fn validate_operation_targets(
     persisted.sort_by(target_order);
     let mut requested = targets.to_vec();
     requested.sort_by(target_order);
+    let mut scoped = operation
+        .scope
+        .targets
+        .iter()
+        .map(|member| member.target.clone())
+        .collect::<Vec<_>>();
+    scoped.sort_by(target_order);
     if persisted != requested
+        || scoped != requested
+        || operation.scope.scope_id != operation.scope.descriptor_digest()
         || operation.targets_json != serde_json::to_string(&persisted)?
         || operation.target_fingerprint != target_fingerprint(&requested)?
+    {
+        return Err(RegistryError::RequestConflict);
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_scope_owner_evidence(
+    conn: &Connection,
+    scope: &RepairBatchScope,
+    owner_choices: &[freshell_runtime_protocol::CanonicalOwnerChoice],
+) -> Result<(), RegistryError> {
+    for root in &scope.roots {
+        let candidates = crate::registry::stopped_repair_owner_candidates_in_connection(
+            conn,
+            &root.root_session_id,
+        )?;
+        let selection = crate::recovery::choose_canonical_root_owner(
+            &candidates,
+            &scope.source_store_id,
+            &root.root_session_id,
+            &root.graph_digest,
+            None,
+        )
+        .map_err(|_| RegistryError::RequestConflict)?;
+        let (mut eligible, canonical) = match selection {
+            crate::recovery::CanonicalRootOwnerSelection::Chosen(owner) => {
+                (vec![owner.soul_id.clone()], Some(owner.soul_id.clone()))
+            }
+            crate::recovery::CanonicalRootOwnerSelection::ChoiceRequired(owners) => (owners, None),
+        };
+        eligible.sort();
+        let mut frozen = root.eligible_owners.clone();
+        frozen.sort();
+        if eligible != frozen || canonical != root.canonical_soul_id {
+            return Err(RegistryError::RequestConflict);
+        }
+        if let Some(choice) = owner_choices
+            .iter()
+            .find(|choice| choice.root_session_id == root.root_session_id)
+        {
+            if !matches!(crate::recovery::choose_canonical_root_owner(&candidates,&scope.source_store_id,&root.root_session_id,&root.graph_digest,Some(&choice.soul_id)),Ok(crate::recovery::CanonicalRootOwnerSelection::Chosen(owner)) if owner.soul_id==choice.soul_id)
+            {
+                return Err(RegistryError::RequestConflict);
+            }
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_scope_receipts(
+    scope: &RepairBatchScope,
+    owner_choices: &[freshell_runtime_protocol::CanonicalOwnerChoice],
+    receipts: &[StoppedRepairRootReceipt],
+) -> Result<(), RegistryError> {
+    if scope.roots.len() != receipts.len()
+        || scope.roots.iter().any(|root| {
+            receipts
+                .iter()
+                .filter(|receipt| {
+                    receipt.root_session_id == root.root_session_id
+                        && receipt.source_store_id == scope.source_store_id
+                        && receipt.source_generation == root.graph_digest
+                        && root.eligible_owners.contains(&receipt.canonical_soul_id)
+                        && root.canonical_soul_id.as_ref().or_else(|| {
+                            owner_choices
+                                .iter()
+                                .find(|choice| choice.root_session_id == root.root_session_id)
+                                .map(|choice| &choice.soul_id)
+                        }) == Some(&receipt.canonical_soul_id)
+                })
+                .count()
+                != 1
+        })
     {
         return Err(RegistryError::RequestConflict);
     }
@@ -409,7 +618,7 @@ fn validate_exact_receipts(
     let mut submitted = submitted.to_vec();
     persisted.sort_by(|left, right| left.root_session_id.cmp(&right.root_session_id));
     submitted.sort_by(|left, right| left.root_session_id.cmp(&right.root_session_id));
-    if persisted.len() != 7 || persisted != submitted {
+    if persisted.is_empty() || persisted != submitted {
         return Err(RegistryError::RequestConflict);
     }
     Ok(())
@@ -462,6 +671,9 @@ fn commit_stopped_repair_cas(
     if operation.status != "importing" {
         return Err(RegistryError::RequestConflict);
     }
+    validate_scope_members(&tx, &operation.scope)?;
+    validate_scope_owner_evidence(&tx, &operation.scope, &operation.owner_choices)?;
+    validate_scope_receipts(&operation.scope, &operation.owner_choices, roots)?;
     validate_targets_and_receipts(&tx, targets, roots)?;
 
     let now = now_millis();
@@ -572,7 +784,7 @@ fn validate_targets_and_receipts(
     targets: &[LostSoulRepairTarget],
     roots: &[StoppedRepairRootReceipt],
 ) -> Result<(), RegistryError> {
-    if !valid_exact_targets(targets) || roots.len() != 7 {
+    if !valid_exact_targets(targets) || roots.is_empty() {
         return Err(RegistryError::RequestConflict);
     }
     let mut root_names = BTreeSet::new();
@@ -602,13 +814,12 @@ fn validate_targets_and_receipts(
         by_root.entry(root).or_default().push(target);
         target_fences.insert(target.soul_id.as_str().to_owned(), fence);
     }
-    if root_names.len() != 7
-        || roots
-            .iter()
-            .map(|root| root.root_session_id.as_str())
-            .collect::<BTreeSet<_>>()
-            .len()
-            != 7
+    if roots
+        .iter()
+        .map(|root| root.root_session_id.as_str())
+        .collect::<BTreeSet<_>>()
+        .len()
+        != roots.len()
         || root_names
             != roots
                 .iter()
@@ -1095,7 +1306,14 @@ fn finish_pending_withdrawal(
     )?;
     check_generation()?;
 
-    let result = complete_result(operation_id.clone(), roots)?;
+    let original = load_operation(conn, operation_id)?;
+    validate_scope_receipts(&original.scope, &original.owner_choices, roots)?;
+    let result = complete_result(
+        operation_id.clone(),
+        original.scope.scope_id,
+        targets.len(),
+        roots,
+    )?;
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let current = load_operation(&tx, operation_id)?;
     let current_marker = load_withdrawal(&tx, operation_id)?;
@@ -1125,9 +1343,11 @@ fn finish_pending_withdrawal(
 
 fn complete_result(
     operation_id: RequestId,
+    scope_id: String,
+    target_count: usize,
     roots: &[StoppedRepairRootReceipt],
 ) -> Result<RestoreLostSoulsResult, RegistryError> {
-    if roots.len() != 7 {
+    if roots.is_empty() {
         return Err(RegistryError::Integrity(
             "completed repair requires seven exact root receipts".into(),
         ));
@@ -1156,9 +1376,14 @@ fn complete_result(
     results.sort_by(|left, right| left.root_session_id.cmp(&right.root_session_id));
     Ok(RestoreLostSoulsResult {
         operation_id,
+        scope_id,
         status: SoulRepairStatus::Complete,
-        repaired_target_count: 8,
-        total_target_count: 8,
+        repaired_target_count: target_count
+            .try_into()
+            .map_err(|_| RegistryError::RequestConflict)?,
+        total_target_count: target_count
+            .try_into()
+            .map_err(|_| RegistryError::RequestConflict)?,
         roots: results,
     })
 }
@@ -1206,7 +1431,7 @@ mod tests {
     use std::collections::BTreeSet;
 
     fn test_targets() -> Vec<LostSoulRepairTarget> {
-        (0..8)
+        (0..9)
             .map(|index| LostSoulRepairTarget {
                 soul_id: SoulId::parse(format!("soul-target-{index}")).unwrap(),
                 incident_id: IncidentId::parse(format!("incident-false-{index}")).unwrap(),
@@ -1220,8 +1445,7 @@ mod tests {
             .map(|index| {
                 let root_session_id = format!("ses_root_{index}");
                 let transfer_id = format!("transfer-{index}");
-                let source_store_id =
-                    format!("{:x}", Sha256::digest(format!("store-{index}").as_bytes()));
+                let source_store_id = "a".repeat(64);
                 let source_generation = format!(
                     "{:x}",
                     Sha256::digest(format!("generation-{index}").as_bytes())
@@ -1332,6 +1556,41 @@ mod tests {
                 .then_with(|| left.incident_id.as_str().cmp(right.incident_id.as_str()))
         });
         let targets_json = serde_json::to_string(&sorted_targets).unwrap();
+        let mut scope = RepairBatchScope {
+            scope_id: String::new(),
+            source_store_id: "a".repeat(64),
+            source_fingerprint: "b".repeat(64),
+            targets: sorted_targets
+                .iter()
+                .map(|target| {
+                    let index = targets
+                        .iter()
+                        .position(|original| original.soul_id == target.soul_id)
+                        .unwrap();
+                    let root_index = if index == 8 { 0 } else { index.min(6) };
+                    RepairBatchTarget {
+                        provider_store_id: format!("store-fixture-{index}"),
+                        target: target.clone(),
+                        root_session_id: roots[root_index].root_session_id.clone(),
+                        incident_revision: 1,
+                        identity_revision: 4,
+                        native_import_revision: 3,
+                        evidence_revision: 9,
+                    }
+                })
+                .collect(),
+            roots: roots
+                .iter()
+                .map(|receipt| freshell_runtime_protocol::RepairBatchRoot {
+                    root_session_id: receipt.root_session_id.clone(),
+                    graph_digest: receipt.source_generation.clone(),
+                    eligible_owners: vec![receipt.canonical_soul_id.clone()],
+                    canonical_soul_id: Some(receipt.canonical_soul_id.clone()),
+                })
+                .collect(),
+        };
+        scope.source_fingerprint = scope.source_descriptor_digest();
+        scope.scope_id = scope.descriptor_digest();
         let fingerprint = format!(
             "{:x}",
             Sha256::digest(serde_json::to_vec(&sorted_targets).unwrap())
@@ -1345,8 +1604,8 @@ mod tests {
         conn.pragma_update(None, "foreign_keys", "OFF").unwrap();
         let now = 1_800_000_000_000_i64;
         conn.execute(
-            "INSERT INTO stopped_repair_operations(operation_id,idempotency_key,target_fingerprint,targets_json,status,result_json,created_at,updated_at) VALUES (?1,?1,?2,?3,'withdraw_pending',NULL,?4,?4)",
-            params![operation_id.as_str(), fingerprint, targets_json, now],
+            "INSERT INTO stopped_repair_operations(operation_id,idempotency_key,target_fingerprint,targets_json,scope_json,status,result_json,created_at,updated_at) VALUES (?1,?1,?2,?3,?5,'withdraw_pending',NULL,?4,?4)",
+            params![operation_id.as_str(), fingerprint, targets_json, now, serde_json::to_string(&scope).unwrap()],
         )
         .unwrap();
         conn.execute(
@@ -1447,7 +1706,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn pending_withdrawal_retry_is_exact_idempotent_and_preserves_unrelated_records() {
+    async fn restore_lost_souls_nine() {
         let dir = tempfile::tempdir().unwrap();
         let registry = Registry::open(dir.path().join("registry"), None).unwrap();
         let operation_id = RequestId::new();
@@ -1581,8 +1840,8 @@ mod tests {
         let result: RestoreLostSoulsResult =
             serde_json::from_str(result_json.as_deref().unwrap()).unwrap();
         assert_eq!(result.status, SoulRepairStatus::Complete);
-        assert_eq!(result.repaired_target_count, 8);
-        assert_eq!(result.total_target_count, 8);
+        assert_eq!(result.repaired_target_count, 9);
+        assert_eq!(result.total_target_count, 9);
         assert_eq!(result.roots.len(), 7);
         assert!(result.roots.iter().all(|root| {
             root.import_status == RootRepairImportStatus::Complete
@@ -1616,7 +1875,7 @@ mod tests {
             .iter()
             .map(|target| target.incident_id.to_string())
             .collect::<BTreeSet<_>>();
-        assert_eq!(distinct_incidents.len(), 8);
+        assert_eq!(distinct_incidents.len(), 9);
         let schema: u32 = Connection::open(registry.database_path())
             .unwrap()
             .query_row(

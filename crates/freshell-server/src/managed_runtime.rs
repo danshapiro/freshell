@@ -2094,7 +2094,7 @@ mod tests {
             "--mcp-config".into(),
             "/tmp/freshell-mcp/t1.json".into(),
             "--session-id".into(),
-            "s1".into(),
+            "4a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d".into(),
         ];
         assert_eq!(
             managed_provider_args("claude", args).unwrap(),
@@ -2104,7 +2104,7 @@ mod tests {
                     freshell_platform::cli_launch::ProviderTarget::Unix,
                 ),
                 "--session-id".to_string(),
-                "s1".to_string(),
+                "4a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d".to_string(),
             ]
         );
     }

@@ -21,7 +21,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-pub const SCHEMA_VERSION: u32 = 13;
+pub const SCHEMA_VERSION: u32 = 14;
 mod input_reservation;
 pub(crate) use input_reservation::binary_digest;
 pub use input_reservation::{BoundInputReservation, OwnedInputReservation};
@@ -2154,7 +2154,15 @@ impl Registry {
         &self,
         operation_id: RequestId,
         request: RestoreLostSoulsRequest,
+        scope: freshell_runtime_protocol::RepairBatchScope,
     ) -> Result<StoppedRepairOperation, RegistryError> {
+        request
+            .validate_exact_batch(&scope)
+            .map_err(|_| RegistryError::RequestConflict)?;
+        let scope_json = serde_json::to_string(&scope)?;
+        let mut owner_choices = request.canonical_owners;
+        owner_choices.sort_by(|left, right| left.root_session_id.cmp(&right.root_session_id));
+        let owner_choices_json = serde_json::to_string(&owner_choices)?;
         let mut targets = request.targets;
         targets.sort_by(|left, right| {
             left.soul_id
@@ -2182,17 +2190,24 @@ impl Registry {
                 }
             }
 
-            let existing: Option<(String, String, Option<String>)> = tx
+            type ExistingStoppedRepairOperationRow=(String,String,Option<String>,Option<String>,String);
+            let existing: Option<ExistingStoppedRepairOperationRow> = tx
                 .query_row(
-                    "SELECT target_fingerprint,status,result_json FROM stopped_repair_operations \
+                    "SELECT target_fingerprint,status,result_json,scope_json,owner_choices_json FROM stopped_repair_operations \
                      WHERE idempotency_key=?1",
                     params![operation_id_text],
-                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
                 )
                 .optional()?;
-            if let Some((existing_fingerprint, status, result_json)) = existing {
-                if existing_fingerprint != target_fingerprint {
+            if let Some((existing_fingerprint, status, result_json, existing_scope, existing_choices)) = existing {
+                if existing_fingerprint != target_fingerprint || existing_scope.as_deref() != Some(&scope_json) {
                     return Err(RegistryError::RequestConflict);
+                }
+                let existing_choices:Vec<freshell_runtime_protocol::CanonicalOwnerChoice>=serde_json::from_str(&existing_choices)?;
+                if existing_choices.iter().any(|old|!owner_choices.contains(old)) {return Err(RegistryError::RequestConflict);}
+                for choice in owner_choices.iter().filter(|choice|!existing_choices.contains(choice)) {
+                    let root_has_receipt:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM stopped_repair_root_receipts WHERE operation_id=?1 AND root_session_id=?2)",params![operation_id_text,choice.root_session_id],|row|row.get(0))?;
+                    if status!="importing" || root_has_receipt {return Err(RegistryError::RequestConflict);}
                 }
                 // The final database CAS removes the false loss rows before
                 // the coordinated artifact withdrawal finishes. Once that
@@ -2211,15 +2226,17 @@ impl Registry {
             for target in &targets {
                 validate_stopped_repair_target_in_tx(&tx, target)?;
             }
+            crate::stopped_repair_cas::validate_scope_members(&tx, &scope)?;
+            crate::stopped_repair_cas::validate_scope_owner_evidence(&tx,&scope,&owner_choices)?;
 
             let now = now_millis();
             tx.execute(
                 "INSERT INTO stopped_repair_operations \
-                 (operation_id,idempotency_key,target_fingerprint,targets_json,status,result_json,created_at,updated_at) \
-                 VALUES (?1,?1,?2,?3,'importing',NULL,?4,?4) \
-                 ON CONFLICT(idempotency_key) DO UPDATE SET updated_at=excluded.updated_at \
+                 (operation_id,idempotency_key,target_fingerprint,targets_json,scope_json,owner_choices_json,status,result_json,created_at,updated_at) \
+                 VALUES (?1,?1,?2,?3,?5,?6,'importing',NULL,?4,?4) \
+                 ON CONFLICT(idempotency_key) DO UPDATE SET updated_at=excluded.updated_at,owner_choices_json=excluded.owner_choices_json \
                  WHERE target_fingerprint=excluded.target_fingerprint",
-                params![operation_id_text, target_fingerprint, targets_json, now],
+                params![operation_id_text, target_fingerprint, targets_json, now, scope_json,owner_choices_json],
             )?;
             let (status, result_json): (String, Option<String>) = tx.query_row(
                 "SELECT status,result_json FROM stopped_repair_operations WHERE operation_id=?1",
@@ -2237,48 +2254,7 @@ impl Registry {
         root_session_id: String,
     ) -> Result<Vec<StoppedRepairOwnerCandidate>, RegistryError> {
         self.run_blocking(move |conn| {
-            let mut statement = conn.prepare(
-                "SELECT s.soul_id,s.native_import_source_store_id,COALESCE(s.native_import_root_session_id,s.native_session_id),\
-                        s.native_import_source_generation,s.native_import_state,s.native_import_authority,\
-                        (SELECT COUNT(*) FROM view_intents v WHERE v.soul_id=s.soul_id AND v.kind<>'automatic_primary')\
-                 FROM souls s WHERE s.provider='opencode' AND (s.native_session_id=?1 OR s.native_import_root_session_id=?1)\
-                 ORDER BY s.soul_id",
-            )?;
-            let rows = statement.query_map(params![root_session_id], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, Option<String>>(1)?,
-                    row.get::<_, Option<String>>(2)?,
-                    row.get::<_, Option<String>>(3)?,
-                    row.get::<_, String>(4)?,
-                    row.get::<_, String>(5)?,
-                    row.get::<_, u64>(6)?,
-                ))
-            })?;
-            let mut candidates = Vec::new();
-            for row in rows {
-                let (
-                    soul_id,
-                    source_store_id,
-                    root_session_id,
-                    source_generation,
-                    import_state,
-                    native_import_authority,
-                    explicit_view_count,
-                ) = row?;
-                candidates.push(StoppedRepairOwnerCandidate {
-                    soul_id: SoulId::parse(soul_id).map_err(|_| {
-                        RegistryError::Integrity("invalid OpenCode owner soul id".into())
-                    })?,
-                    source_store_id,
-                    root_session_id,
-                    source_generation,
-                    native_import_state: NativeImportState::parse(&import_state)?,
-                    native_import_authority,
-                    explicit_view_count,
-                });
-            }
-            Ok(candidates)
+            stopped_repair_owner_candidates_in_connection(&conn, &root_session_id)
         })
         .await
     }
@@ -2333,6 +2309,14 @@ impl Registry {
             {
                 return Err(RegistryError::NativeIdentityConflict);
             }
+            let (scope_json,choices_json):(String,String)=tx.query_row("SELECT scope_json,owner_choices_json FROM stopped_repair_operations WHERE operation_id=?1",params![operation_id.as_str()],|row|Ok((row.get(0)?,row.get(1)?)))?;
+            let scope:freshell_runtime_protocol::RepairBatchScope=serde_json::from_str(&scope_json)?;
+            let choices:Vec<freshell_runtime_protocol::CanonicalOwnerChoice>=serde_json::from_str(&choices_json)?;
+            crate::stopped_repair_cas::validate_scope_members(&tx,&scope)?;
+            crate::stopped_repair_cas::validate_scope_owner_evidence(&tx,&scope,&choices)?;
+            let root=scope.roots.iter().find(|root|root.root_session_id==receipt.root_session_id).ok_or(RegistryError::RequestConflict)?;
+            if receipt.source_store_id!=scope.source_store_id || receipt.source_generation!=root.graph_digest
+                || root.canonical_soul_id.as_ref().or_else(||choices.iter().find(|choice|choice.root_session_id==root.root_session_id).map(|choice|&choice.soul_id))!=Some(&receipt.canonical_soul_id) {return Err(RegistryError::RequestConflict);}
             let targets_json: String = tx.query_row(
                 "SELECT targets_json FROM stopped_repair_operations WHERE operation_id=?1",
                 params![operation_id.as_str()],
@@ -3674,6 +3658,8 @@ fn create_schema(
             idempotency_key TEXT NOT NULL UNIQUE,
             target_fingerprint TEXT NOT NULL,
             targets_json TEXT NOT NULL,
+            scope_json TEXT,
+            owner_choices_json TEXT NOT NULL DEFAULT '[]',
             status TEXT NOT NULL CHECK (status IN ('importing','withdraw_pending','complete')),
             result_json TEXT,
             created_at INTEGER NOT NULL,
@@ -4178,6 +4164,18 @@ fn migrate_schema(conn: &mut Connection) -> Result<(), RegistryError> {
         )?;
         tx.commit()?;
         schema = 13;
+    }
+    if schema == 13 {
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if !column_exists(&tx, "stopped_repair_operations", "scope_json")? {
+            tx.execute_batch("ALTER TABLE stopped_repair_operations ADD COLUMN scope_json TEXT;")?;
+        }
+        if !column_exists(&tx, "stopped_repair_operations", "owner_choices_json")? {
+            tx.execute_batch("ALTER TABLE stopped_repair_operations ADD COLUMN owner_choices_json TEXT NOT NULL DEFAULT '[]';")?;
+        }
+        tx.execute_batch("UPDATE installation SET schema_version=14,inventory_revision=inventory_revision+1 WHERE singleton=1;")?;
+        tx.commit()?;
+        schema = 14;
     }
     if schema != SCHEMA_VERSION {
         return Err(RegistryError::Integrity(format!(
@@ -5351,6 +5349,47 @@ pub(crate) fn failpoint(name: &'static str) -> Result<(), RegistryError> {
 #[cfg(not(feature = "runtime-test-faults"))]
 pub(crate) fn failpoint(_name: &'static str) -> Result<(), RegistryError> {
     Ok(())
+}
+
+pub(crate) fn stopped_repair_owner_candidates_in_connection(
+    conn: &Connection,
+    root_session_id: &str,
+) -> Result<Vec<StoppedRepairOwnerCandidate>, RegistryError> {
+    let mut statement=conn.prepare("SELECT s.soul_id,s.native_import_source_store_id,COALESCE(s.native_import_root_session_id,s.native_session_id),s.native_import_source_generation,s.native_import_state,s.native_import_authority,(SELECT COUNT(*) FROM view_intents v WHERE v.soul_id=s.soul_id AND v.kind<>'automatic_primary') FROM souls s WHERE s.provider='opencode' AND (s.native_session_id=?1 OR s.native_import_root_session_id=?1) ORDER BY s.soul_id")?;
+    let rows = statement.query_map(params![root_session_id], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, Option<String>>(1)?,
+            row.get::<_, Option<String>>(2)?,
+            row.get::<_, Option<String>>(3)?,
+            row.get::<_, String>(4)?,
+            row.get::<_, String>(5)?,
+            row.get::<_, u64>(6)?,
+        ))
+    })?;
+    let mut candidates = Vec::new();
+    for row in rows {
+        let (
+            soul_id,
+            source_store_id,
+            root_session_id,
+            source_generation,
+            import_state,
+            native_import_authority,
+            explicit_view_count,
+        ) = row?;
+        candidates.push(StoppedRepairOwnerCandidate {
+            soul_id: SoulId::parse(soul_id)
+                .map_err(|_| RegistryError::Integrity("invalid OpenCode owner soul id".into()))?,
+            source_store_id,
+            root_session_id,
+            source_generation,
+            native_import_state: NativeImportState::parse(&import_state)?,
+            native_import_authority,
+            explicit_view_count,
+        });
+    }
+    Ok(candidates)
 }
 
 #[cfg(test)]

@@ -12,7 +12,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use freshell_sessions::opencode_transfer::{
     export_exact_session, recover_interrupted_extractions, ExportOptions, HostOpenCodeInventory,
-    TransferError,
+    SavedSnapshotAvailability, TransferError,
 };
 use rusqlite::{params, Connection};
 use serde_json::Value;
@@ -984,6 +984,129 @@ fn message_seq_is_omitted_only_for_its_pinned_derived_shape() {
 }
 
 #[test]
+fn durable_souls_semantic_schema_admits_equivalent_message_seq_types_and_whitespace() {
+    let fixture = TestDir::new("durable-semantic-schema");
+    let database = fixture.path().join("opencode.db");
+    let source = create_synthetic_source(&database);
+    source.execute_batch("DROP TABLE message_seq; CREATE TABLE message_seq (\n session_id text PRIMARY KEY,\n next integer NOT NULL\n);").unwrap();
+    let snapshot = export_exact_session(
+        &HostOpenCodeInventory::new(database),
+        "ses_root",
+        ExportOptions::new(fixture.path().join("extract")),
+    )
+    .unwrap();
+    assert!(snapshot.manifest().row_count > 0);
+    let mut payload = String::new();
+    snapshot
+        .open_payload()
+        .unwrap()
+        .read_to_string(&mut payload)
+        .unwrap();
+    assert!(payload.contains("ses_root"));
+    assert!(!payload.contains("message_seq"));
+}
+
+#[test]
+fn durable_souls_semantic_schema_refuses_changed_relationships_and_migrations() {
+    for (label, sql) in [
+        ("column-type", "DROP TABLE message_seq; CREATE TABLE message_seq (session_id TEXT PRIMARY KEY,next TEXT NOT NULL);"),
+        ("key", "DROP TABLE message_seq; CREATE TABLE message_seq (session_id TEXT,next INTEGER NOT NULL);"),
+        ("nullability", "DROP TABLE message_seq; CREATE TABLE message_seq (session_id TEXT PRIMARY KEY,next INTEGER);"),
+        ("foreign-key", "DROP TABLE message_seq; CREATE TABLE message_seq (session_id TEXT PRIMARY KEY REFERENCES session(id),next INTEGER NOT NULL);"),
+        ("index", "CREATE INDEX unsupported_projection ON message(data);"),
+        ("trigger", "CREATE TRIGGER unsupported_projection AFTER INSERT ON message BEGIN SELECT 1; END;"),
+        ("migration", "DELETE FROM migration WHERE id=(SELECT id FROM migration LIMIT 1);"),
+        ("check", "DROP TABLE message_seq; CREATE TABLE message_seq (session_id TEXT PRIMARY KEY,next INTEGER NOT NULL CHECK(next>0));"),
+    ] {
+        let fixture = TestDir::new(label);
+        let database = fixture.path().join("opencode.db");
+        let source = create_synthetic_source(&database);
+        source.execute_batch(sql).unwrap();
+        let before = fs::read(&database).unwrap();
+        let extraction = fixture.path().join("extract");
+        assert!(matches!(export_exact_session(&HostOpenCodeInventory::new(database.clone()), "ses_root", ExportOptions::new(extraction)), Err(TransferError::Blocked(_))), "{label}");
+        assert_eq!(fs::read(database).unwrap(), before, "{label}: source bytes unchanged");
+    }
+}
+
+#[test]
+fn durable_souls_attachment_authority_preserves_metadata_and_file_source() {
+    let fixture = TestDir::new("durable-attachment-authority");
+    let database = fixture.path().join("opencode.db");
+    let source = create_synthetic_source(&database);
+    let file = serde_json::json!({"type":"file","mime":"text/plain","url":"data:text/plain;base64,YXNzZXQ=","source":{"type":"file","path":"fictional/source.txt","text":{"value":"asset","start":0,"end":5}}});
+    let tool = serde_json::json!({"type":"tool","tool":"read","callID":"call_fixture","state":{"status":"completed","input":{},"output":"fixture output","title":"Fixture","time":{"start":1,"end":2},"metadata":{"arbitrary":{"type":"file","noUrl":true}},"attachments":[file.clone()]}});
+    for (id, data) in [
+        ("part_file_authority", &file),
+        ("part_tool_metadata", &tool),
+    ] {
+        source.execute("INSERT INTO part(id,message_id,session_id,time_created,time_updated,data) VALUES (?1,'msg_ses_root','ses_root',1,1,?2)",params![id,data.to_string()]).unwrap();
+    }
+    source.execute("INSERT INTO event(id,aggregate_id,seq,type,data) VALUES ('evt_fixture_part','ses_root',2,'message.part.updated.1',?1)", [serde_json::json!({"sessionID":"ses_root","part":tool.clone(),"time":2}).to_string()]).unwrap();
+    source
+        .execute(
+            "UPDATE event_sequence SET seq=2 WHERE aggregate_id='ses_root'",
+            [],
+        )
+        .unwrap();
+    let snapshot = export_exact_session(
+        &HostOpenCodeInventory::new(database),
+        "ses_root",
+        ExportOptions::new(fixture.path().join("extract")),
+    )
+    .unwrap();
+    let payload: Value = serde_json::from_reader(snapshot.open_payload().unwrap()).unwrap();
+    for expected in [file.to_string(), tool.to_string()] {
+        assert!(payload["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|row| row["table"] == "part" && row["values"]["data"]["value"] == expected));
+    }
+    assert!(payload["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|row| row["table"] == "event"
+            && row["values"]["data"]["value"]
+                .as_str()
+                .unwrap()
+                .contains("noUrl")));
+}
+
+#[test]
+fn durable_souls_attachment_authority_rejects_missing_authoritative_urls() {
+    for (label, data) in [
+        (
+            "file",
+            serde_json::json!({"type":"file","mime":"text/plain"}),
+        ),
+        (
+            "tool",
+            serde_json::json!({"type":"tool","state":{"status":"completed","attachments":[{"type":"file","mime":"text/plain"}]}}),
+        ),
+    ] {
+        let fixture = TestDir::new(label);
+        let database = fixture.path().join("opencode.db");
+        let source = create_synthetic_source(&database);
+        source
+            .execute(
+                "UPDATE part SET data=?1 WHERE id='part_ses_root'",
+                [data.to_string()],
+            )
+            .unwrap();
+        assert!(matches!(
+            export_exact_session(
+                &HostOpenCodeInventory::new(database),
+                "ses_root",
+                ExportOptions::new(fixture.path().join("extract"))
+            ),
+            Err(TransferError::Blocked(_))
+        ));
+    }
+}
+
+#[test]
 fn source_paths_are_unresolved_for_broken_links_and_malformed_sqlite() {
     let fixture = TestDir::new("bad-sources");
     let valid_database = fixture.path().join("valid.db");
@@ -1531,10 +1654,35 @@ fn selected_session_workspace_mount_rejects_no_match_and_ambiguous_match() {
         )
         .unwrap();
     drop(source);
+    let repeated = HostOpenCodeInventory::new(fixture.path().join("unused.db"))
+        .with_channel_database(database.clone())
+        .with_trusted_mount_for_selected_session(workspace_mount.clone())
+        .with_trusted_mount_for_selected_session(workspace_mount.clone());
+    assert!(
+        export_exact_session(
+            &repeated,
+            "ses_root",
+            ExportOptions::new(fixture.path().join("repeated-extract"))
+        )
+        .is_ok(),
+        "duplicate owners can share one exact workspace without inventing a second mapping"
+    );
+    let second_mount = fixture.path().join("second-workspace");
+    fs::create_dir(&second_mount).unwrap();
     let ambiguous = HostOpenCodeInventory::new(fixture.path().join("unused.db"))
         .with_channel_database(database)
-        .with_trusted_mount_for_selected_session(workspace_mount.clone())
-        .with_trusted_mount_for_selected_session(workspace_mount);
+        .with_trusted_workspace_mount(
+            "prj_kept",
+            Some("wrk_kept".into()),
+            workspace_mount.to_string_lossy(),
+            workspace_mount.clone(),
+        )
+        .with_trusted_workspace_mount(
+            "prj_kept",
+            Some("wrk_kept".into()),
+            workspace_mount.to_string_lossy(),
+            second_mount,
+        );
     assert!(matches!(
         export_exact_session(
             &ambiguous,
@@ -2238,11 +2386,31 @@ fn verifies_a_repeated_git_tree_in_each_selected_session_workspace() {
         ExportOptions::new(extraction_root.clone()),
     );
 
-    assert!(
-        matches!(result, Err(TransferError::Blocked(_))),
-        "the child workspace must resolve the repeated tree in its own Git store"
+    let exported = result.expect("a missing saved undo reference does not block preserved history");
+    let root = exported
+        .manifest()
+        .saved_snapshots
+        .iter()
+        .find(|reference| reference.session_id == "ses_root")
+        .unwrap();
+    let child = exported
+        .manifest()
+        .saved_snapshots
+        .iter()
+        .find(|reference| reference.session_id == "ses_child")
+        .unwrap();
+    assert_eq!(
+        root.availability,
+        SavedSnapshotAvailability::RetainedClosure
     );
-    assert_eq!(fs::read_dir(extraction_root).unwrap().count(), 0);
+    assert_eq!(
+        child.availability,
+        SavedSnapshotAvailability::UnavailableInQualifiedLocations,
+        "the child's own qualified store cannot borrow the root workspace's authority"
+    );
+    assert_eq!(root.tree, child.tree);
+    assert!(!root.objects.is_empty());
+    assert!(child.objects.is_empty());
 }
 
 #[test]
@@ -2625,4 +2793,58 @@ fn run_git_command(cwd: &Path, args: &[&str], stdin: Option<&[u8]>) -> String {
         String::from_utf8_lossy(&output.stderr)
     );
     String::from_utf8(output.stdout).unwrap()
+}
+
+#[test]
+fn durable_souls_saved_unavailable_tree_preserves_reference_and_history() {
+    let fixture = TestDir::new("saved-unavailable-tree");
+    let workspace = fixture.path().join("workspace");
+    fs::create_dir_all(&workspace).unwrap();
+    let database = fixture.path().join("opencode.db");
+    let source = create_synthetic_source(&database);
+    let reference = serde_json::json!({"messageID":"msg_root","snapshot":"1234567890abcdef1234567890abcdef12345678"});
+    source
+        .execute(
+            "UPDATE session SET revert=?1 WHERE id='ses_root'",
+            [reference.to_string()],
+        )
+        .unwrap();
+    drop(source);
+    let before = fs::read(&database).unwrap();
+    let inventory =
+        with_selected_workspace_mount(HostOpenCodeInventory::new(database.clone()), workspace);
+    let exported = export_exact_session(
+        &inventory,
+        "ses_root",
+        ExportOptions::new(fixture.path().join("extract")),
+    )
+    .expect("unavailable saved undo tree does not erase or block preserved native history");
+    let mut payload = String::new();
+    exported
+        .open_payload()
+        .unwrap()
+        .read_to_string(&mut payload)
+        .unwrap();
+    let payload: Value = serde_json::from_str(&payload).unwrap();
+    let session = payload["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["table"] == "session" && row["values"]["id"]["value"] == "ses_root")
+        .unwrap();
+    assert_eq!(
+        serde_json::from_str::<Value>(session["values"]["revert"]["value"].as_str().unwrap())
+            .unwrap(),
+        reference
+    );
+    assert!(exported
+        .manifest()
+        .assets
+        .iter()
+        .all(|asset| asset.kind != "git_tree_reference"));
+    let references = &exported.manifest().saved_snapshots;
+    assert_eq!(references.len(), 1);
+    assert_eq!(references[0].availability,freshell_sessions::opencode_transfer::SavedSnapshotAvailability::UnavailableInQualifiedLocations);
+    assert!(references[0].objects.is_empty());
+    assert_eq!(fs::read(database).unwrap(), before);
 }
