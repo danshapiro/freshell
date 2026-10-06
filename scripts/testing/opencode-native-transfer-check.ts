@@ -127,6 +127,14 @@ async function run(){
  command('git',['-C',workspace,'-c','user.name=Fixture','-c','user.email=fixture@example.invalid','commit','-qm','fixture']);
  const projectId=command('git',['-C',workspace,'rev-parse','HEAD']).trim();
  if(caseId==='saved-revert-cleanup'){command('git',['-C',workspace,'gc','--prune=now']);assert('packed-native-source-store',fs.readdirSync(workspace+'/.git/objects/pack').some(file=>file.endsWith('.pack')));}
+ let nativePartTree, nativePartBlob, nativePartBucket;
+ if(caseId==='saved-revert-cleanup'){
+  nativePartBucket=base+'/snapshot/'+projectId+'/'+crypto.createHash('sha1').update(workspace).digest('hex');
+  command('git',['init','--bare','-q',nativePartBucket]);
+  nativePartBlob=cp.execFileSync('git',['--git-dir',nativePartBucket,'hash-object','-w','--stdin'],{input:'synthetic bucket-only snapshot',encoding:'utf8',timeout:45000}).trim();
+  nativePartTree=cp.execFileSync('git',['--git-dir',nativePartBucket,'mktree'],{input:'100644 blob '+nativePartBlob+'\tbucket-only.txt\n',encoding:'utf8',timeout:45000}).trim();
+  assert('ordinary-git-workspace-with-bucket-only-tree',fs.statSync(workspace+'/.git').isDirectory()&&cp.spawnSync('git',['-C',workspace,'cat-file','-e',nativePartTree],{timeout:45000}).status!==0);
+ }
  const db=new DatabaseSync(source);
  db.exec(fs.readFileSync('/opt/transfer-schema.sql','utf8'));
  const migrations=JSON.parse(fs.readFileSync('/opt/transfer-migrations.json','utf8'));
@@ -159,6 +167,7 @@ async function run(){
  }
  if(caseId==='saved-revert-cleanup'){
   const tree=command('git',['-C',workspace,'rev-parse','HEAD^{tree}']).trim();
+  db.prepare('INSERT INTO part (id,message_id,session_id,time_created,time_updated,data) VALUES (?,?,?,?,?,?)').run(id('prt',71),id('msg',1),roots[0],now,now,JSON.stringify({type:'step-start',snapshot:nativePartTree}));
   db.prepare('UPDATE session SET revert=? WHERE id=?').run(JSON.stringify({messageID:id('msg',2),snapshot:tree}),roots[0]);
   db.prepare('UPDATE session SET revert=? WHERE id=?').run(JSON.stringify({messageID:id('msg',10),snapshot:'1234567890abcdef1234567890abcdef12345678'}),roots[1]);
   db.prepare('INSERT INTO part (id,message_id,session_id,time_created,time_updated,data) VALUES (?,?,?,?,?,?)').run(id('prt',70),id('msg',20),roots[2],now,now,JSON.stringify({type:'text',text:'synthetic part boundary'}));
@@ -244,6 +253,19 @@ async function run(){
   assert('truncated-payload-refused',result.status!==0&&!fs.existsSync(base+'/truncate-receipt.json'));fs.writeFileSync(base+'/payload.json',payload);
  }
  if(caseId==='saved-revert-cleanup'){
+  const bucketOnlyMessages=await request('GET','/session/'+roots[0]+'/message');
+  assert('native-bucket-only-snapshot-part-preserved',bucketOnlyMessages.flatMap(message=>message.parts).some(part=>part.type==='step-start'&&part.snapshot===nativePartTree));
+  const nativePartDestination=home+'/.local/share/opencode/snapshot/'+projectId+'/'+crypto.createHash('sha1').update(workspace).digest('hex');
+  assert('bucket-only-tree-installed-native-readable',command('git',['--git-dir',nativePartDestination,'cat-file','-p',nativePartTree]).includes(nativePartBlob));
+  const blobPath=nativePartBucket+'/objects/'+nativePartBlob.slice(0,2)+'/'+nativePartBlob.slice(2), blobBytes=fs.readFileSync(blobPath);
+  deniedExport('missing-snapshot-descendant',()=>fs.unlinkSync(blobPath));fs.writeFileSync(blobPath,blobBytes);
+  const installedBlob=nativePartDestination+'/objects/'+nativePartBlob.slice(0,2)+'/'+nativePartBlob.slice(2), installedBytes=fs.readFileSync(installedBlob);
+  fs.writeFileSync(installedBlob,'synthetic conflicting object');
+  const conflictRequest=base+'/snapshot-conflict-request.json',conflictReceipt=base+'/snapshot-conflict-receipt.json';
+  write(conflictRequest,{candidateSha,imageDigest,sourceDatabase:source,rootSessionId:roots[0],extractionRoot:base+'/extractions',workspacePath:workspace,descriptorFile:base+'/descriptor.json',payloadFile:base+'/payload.json',destinationStoreId:'fixture-native-owner',destinationDatabase:destination,providerHome:home,providerUid:65534,providerGid:0,receiptFile:conflictReceipt});
+  const conflictRead=cp.spawnSync('/opt/transfer-stage',['--stage','read','--request-file',conflictRequest],{timeout:45000});
+  assert('conflicting-installed-snapshot-refused',conflictRead.status!==0&&!fs.existsSync(conflictReceipt));
+  assert('conflicting-installed-snapshot-not-overwritten',fs.readFileSync(installedBlob,'utf8')==='synthetic conflicting object');fs.writeFileSync(installedBlob,installedBytes);
   const before=await request('GET','/session/'+roots[0]);assert('saved-reference-loaded',typeof before.revert.snapshot==='string'&&before.revert.messageID===id('msg',2));
   const unavailable=await request('GET','/session/'+roots[1]);
   assert('unavailable-saved-reference-preserved',unavailable.revert.snapshot==='1234567890abcdef1234567890abcdef12345678');
