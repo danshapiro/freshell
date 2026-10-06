@@ -37,6 +37,21 @@ pub(crate) struct OpencodeEphemeralInput<'a> {
     pub workspace: Option<&'a Path>,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum InputPreparationPhase {
+    Pending,
+    Bound,
+    Committed,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct InputPreparation {
+    phase: InputPreparationPhase,
+    prior_grant_ids: Vec<String>,
+}
+
 #[derive(Clone)]
 struct Grant {
     soul_id: SoulId,
@@ -45,6 +60,7 @@ struct Grant {
     expires_at: u64,
     endpoint: String,
     path: PathBuf,
+    preparation: Option<InputPreparation>,
 }
 
 #[derive(Default)]
@@ -224,8 +240,8 @@ fn apply_callback(
     endpoint: &str,
     home: &Path,
 ) -> Result<Vec<u8>, String> {
-    let callback: CapabilityCallback =
-        serde_json::from_slice(bytes).map_err(|error| error.to_string())?;
+    let callback: CapabilityCallback = serde_json::from_slice(bytes)
+        .map_err(|_| "managed provider callback metadata is invalid")?;
     if !freshell_api::check_auth(Some(&callback.control_secret), expected_control_secret) {
         return Err("managed runtime callback unauthorized".into());
     }
@@ -255,6 +271,23 @@ fn apply_callback(
                 directory,
                 endpoint,
             )?;
+            Ok(b"ok".to_vec())
+        }
+        "commit" => {
+            let grant_id = callback
+                .grant_id
+                .ok_or("missing provider input preparation id")?;
+            let incarnation = callback
+                .incarnation_id
+                .ok_or("missing provider input preparation incarnation")?;
+            store.commit_preparation(&grant_id, &callback.soul_id, &incarnation, directory)?;
+            Ok(b"ok".to_vec())
+        }
+        "abort" => {
+            let grant_id = callback
+                .grant_id
+                .ok_or("missing provider input preparation id")?;
+            store.abort_preparation(&grant_id, &callback.soul_id, directory)?;
             Ok(b"ok".to_vec())
         }
         "revoke" => {
@@ -613,6 +646,51 @@ fn cleanup_unrecoverable_inputs(
     Ok(())
 }
 
+fn protected_preparation_ids(directory: &Path) -> Result<HashSet<String>, String> {
+    use std::io::Read;
+    let mut protected = HashSet::new();
+    for entry in
+        std::fs::read_dir(directory).map_err(|_| "provider preparation inventory unavailable")?
+    {
+        let path = entry
+            .map_err(|_| "provider preparation entry unavailable")?
+            .path();
+        let Some(id) = path.file_stem().and_then(|id| id.to_str()) else {
+            continue;
+        };
+        if path.extension().and_then(|extension| extension.to_str()) != Some("json")
+            || grant_path(directory, id).is_err()
+        {
+            continue;
+        }
+        let mut bytes = Vec::new();
+        let Ok(file) = std::fs::File::open(&path) else {
+            continue;
+        };
+        file.take(128 * 1024 + 1)
+            .read_to_end(&mut bytes)
+            .map_err(|_| "provider preparation metadata read failed")?;
+        if bytes.len() > 128 * 1024 {
+            return Err("provider preparation metadata profile limit exceeded".into());
+        }
+        let Ok(stored) = serde_json::from_slice::<StoredCapabilityFile>(&bytes) else {
+            continue;
+        };
+        if let Some(preparation) = stored.preparation {
+            if preparation.phase != InputPreparationPhase::Committed
+                || !preparation.prior_grant_ids.is_empty()
+            {
+                protected.insert(id.to_string());
+                for prior in preparation.prior_grant_ids {
+                    grant_path(directory, &prior)?;
+                    protected.insert(prior);
+                }
+            }
+        }
+    }
+    Ok(protected)
+}
+
 fn cleanup_orphaned_provider_roots(directory: &Path) -> Result<(), String> {
     let staged_parent = directory
         .parent()
@@ -621,6 +699,7 @@ fn cleanup_orphaned_provider_roots(directory: &Path) -> Result<(), String> {
     if !staged_parent.is_dir() {
         return Ok(());
     }
+    let protected = protected_preparation_ids(directory)?;
     for entry in std::fs::read_dir(&staged_parent).map_err(|error| error.to_string())? {
         let entry = entry.map_err(|error| error.to_string())?;
         let Some(grant_id) = entry.file_name().to_str().map(str::to_owned) else {
@@ -629,7 +708,7 @@ fn cleanup_orphaned_provider_roots(directory: &Path) -> Result<(), String> {
         let Ok(grant_file) = grant_path(directory, &grant_id) else {
             continue;
         };
-        if !grant_file.exists() && entry.path().is_dir() {
+        if !grant_file.exists() && !protected.contains(&grant_id) && entry.path().is_dir() {
             std::fs::remove_dir_all(entry.path()).map_err(|error| error.to_string())?;
         }
     }
@@ -936,6 +1015,8 @@ struct CapabilityFile<'a> {
     soul_id: &'a SoulId,
     incarnation_id: Option<&'a IncarnationId>,
     expires_at: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    preparation: Option<&'a InputPreparation>,
 }
 
 #[derive(Deserialize)]
@@ -946,6 +1027,8 @@ struct StoredCapabilityFile {
     soul_id: SoulId,
     incarnation_id: Option<IncarnationId>,
     expires_at: u64,
+    #[serde(default)]
+    preparation: Option<InputPreparation>,
 }
 
 fn restored_grant_at(
@@ -957,6 +1040,7 @@ fn restored_grant_at(
 ) -> Grant {
     let current = stored.endpoint == current_endpoint && !stored.scope.is_empty();
     Grant {
+        preparation: stored.preparation,
         soul_id: stored.soul_id,
         incarnation_id: Some(incarnation_id),
         token: if current { stored.scope } else { String::new() },
@@ -988,6 +1072,7 @@ fn write_capability(path: &Path, grant: &Grant) -> Result<(), String> {
         soul_id: &grant.soul_id,
         incarnation_id: grant.incarnation_id.as_ref(),
         expires_at: grant.expires_at,
+        preparation: grant.preparation.as_ref(),
     })
     .map_err(|error| error.to_string())?;
     let mut options = OpenOptions::new();
@@ -1046,6 +1131,10 @@ impl CapabilityStore {
             })
             .transpose()?;
         let grant = Grant {
+            preparation: Some(InputPreparation {
+                phase: InputPreparationPhase::Pending,
+                prior_grant_ids: Vec::new(),
+            }),
             soul_id,
             incarnation_id: None,
             token: new_secret(),
@@ -1077,6 +1166,22 @@ impl CapabilityStore {
         tui_source: Option<&ProviderConfigReference>,
         workspace: Option<&Path>,
     ) -> Result<McpCapabilityReference, String> {
+        if let Some((grant_id, grant)) = self.grants.lock().unwrap().iter().find(|(_, grant)| {
+            grant.soul_id == soul_id
+                && grant.preparation.as_ref().is_some_and(|p| {
+                    p.phase != InputPreparationPhase::Committed && !p.prior_grant_ids.is_empty()
+                })
+        }) {
+            if grant.endpoint != endpoint {
+                return Err("pending provider input preparation requires reconciliation".into());
+            }
+            return Ok(McpCapabilityReference {
+                grant_id: grant_id.clone(),
+                endpoint,
+                provider_relative_path: CAPABILITY_PATH.into(),
+                host_gateway_address: routed_host_ipv4(),
+            });
+        }
         let retained = recoverable_input_path(directory, &soul_id)?;
         let prior_stage = self
             .grants
@@ -1109,10 +1214,94 @@ impl CapabilityStore {
             })
             .map(|(grant_id, _)| grant_id.clone())
             .collect::<Vec<_>>();
-        for grant_id in prior {
-            self.revoke(&grant_id, directory)?;
+        let result = (|| {
+            let mut grants = self.grants.lock().unwrap();
+            let pending = grants
+                .get_mut(&replacement.grant_id)
+                .ok_or("provider input preparation disappeared")?;
+            pending.preparation = Some(InputPreparation {
+                phase: InputPreparationPhase::Pending,
+                prior_grant_ids: prior,
+            });
+            write_capability(&pending.path, pending)
+        })();
+        if let Err(error) = result {
+            let _ = self.revoke(&replacement.grant_id, directory);
+            return Err(error);
         }
         Ok(replacement)
+    }
+
+    fn commit_preparation(
+        &self,
+        grant_id: &str,
+        soul_id: &SoulId,
+        incarnation_id: &IncarnationId,
+        directory: &Path,
+    ) -> Result<(), String> {
+        let (prior, changed) = {
+            let mut grants = self.grants.lock().unwrap();
+            let grant = grants
+                .get_mut(grant_id)
+                .ok_or("provider input preparation is unknown; reconcile delivery")?;
+            if &grant.soul_id != soul_id || grant.incarnation_id.as_ref() != Some(incarnation_id) {
+                return Err(
+                    "provider input preparation commit has no matching accepted incarnation".into(),
+                );
+            }
+            let Some(preparation) = grant.preparation.as_mut() else {
+                return Ok(());
+            };
+            if preparation.phase == InputPreparationPhase::Pending {
+                return Err("provider input preparation is not activated".into());
+            }
+            let changed = preparation.phase != InputPreparationPhase::Committed;
+            preparation.phase = InputPreparationPhase::Committed;
+            let prior = preparation.prior_grant_ids.clone();
+            write_capability(&grant.path, grant)?;
+            (prior, changed)
+        };
+        for prior_id in prior {
+            self.revoke(&prior_id, directory)?;
+        }
+        let mut grants = self.grants.lock().unwrap();
+        let grant = grants
+            .get_mut(grant_id)
+            .ok_or("committed provider preparation disappeared")?;
+        if let Some(preparation) = grant.preparation.as_mut() {
+            preparation.prior_grant_ids.clear();
+        }
+        write_capability(&grant.path, grant)?;
+        if changed {
+            tracing::info!(event="provider.inputs.preparation.committed",grant_id,
+            soul_id=%soul_id,incarnation_id=%incarnation_id);
+        }
+        Ok(())
+    }
+
+    fn abort_preparation(
+        &self,
+        grant_id: &str,
+        soul_id: &SoulId,
+        directory: &Path,
+    ) -> Result<(), String> {
+        if let Some(grant) = self.grants.lock().unwrap().get(grant_id) {
+            if &grant.soul_id != soul_id {
+                return Err("provider input preparation belongs to another soul".into());
+            }
+            if grant
+                .preparation
+                .as_ref()
+                .is_some_and(|p| p.phase == InputPreparationPhase::Committed)
+            {
+                return Err(
+                    "provider input preparation is committed; reconcile before cleanup".into(),
+                );
+            }
+        }
+        self.revoke(grant_id, directory)?;
+        tracing::info!(event="provider.inputs.preparation.aborted",grant_id,soul_id=%soul_id);
+        Ok(())
     }
 
     fn activate(
@@ -1133,7 +1322,16 @@ impl CapabilityStore {
                 return Ok(());
             }
         }
+        let mut preparation = grants
+            .get(grant_id)
+            .and_then(|grant| grant.preparation.clone());
+        if let Some(preparation) = preparation.as_mut() {
+            if preparation.phase != InputPreparationPhase::Committed {
+                preparation.phase = InputPreparationPhase::Bound;
+            }
+        }
         let grant = Grant {
+            preparation,
             soul_id,
             incarnation_id: Some(incarnation_id),
             token: new_secret(),
@@ -1207,6 +1405,7 @@ pub(crate) async fn rehydrate_running_capabilities(
         .await
         .map_err(|error| error.to_string())?;
     let directory = capability_dir()?;
+    let protected = protected_preparation_ids(&directory)?;
     for entry in std::fs::read_dir(&directory).map_err(|error| error.to_string())? {
         let entry = entry.map_err(|error| error.to_string())?;
         let path = entry.path();
@@ -1241,6 +1440,27 @@ pub(crate) async fn rehydrate_running_capabilities(
         let Ok(stored) = serde_json::from_slice::<StoredCapabilityFile>(&file) else {
             continue;
         };
+        if protected.contains(&grant_id) {
+            let current = stored.endpoint == endpoint()? && !stored.scope.is_empty();
+            store().grants.lock().unwrap().insert(
+                grant_id.clone(),
+                Grant {
+                    soul_id: stored.soul_id,
+                    incarnation_id: stored.incarnation_id,
+                    token: if current { stored.scope } else { String::new() },
+                    expires_at: if current { stored.expires_at } else { 0 },
+                    endpoint: stored.endpoint,
+                    path,
+                    preparation: stored.preparation,
+                },
+            );
+            tracing::info!(
+                event = "managed_mcp.preparation.retained",
+                grant_id,
+                "Retained uncertain provider input generation for supervisor reconciliation"
+            );
+            continue;
+        }
         let Some(incarnation_id) = stored.incarnation_id.clone() else {
             if soul_wants_recovery(&views, &stored.soul_id) {
                 retain_recoverable_inputs(&directory, &stored.soul_id, &grant_id)?;
@@ -1767,6 +1987,7 @@ mod tests {
         let grant_file = grant_path(&capabilities, "grant-old").unwrap();
         std::fs::write(&grant_file, "old grant file").unwrap();
         let stored = StoredCapabilityFile {
+            preparation: None,
             endpoint: "http://host.docker.internal:3001".into(),
             scope: "old-scope".into(),
             soul_id: SoulId::new(),
@@ -1849,6 +2070,7 @@ mod tests {
         ));
         let after_idle = restored_grant_at(
             StoredCapabilityFile {
+                preparation: None,
                 expires_at: initial.expires_at - 1,
                 ..renewed
             },
@@ -1886,6 +2108,185 @@ mod tests {
         store.revoke(&reference.grant_id, dir.path()).unwrap();
         reopened.grants.lock().unwrap().remove(&reference.grant_id);
         assert!(!reopened.authenticates(&initial.scope));
+    }
+
+    #[test]
+    fn managed_mcp_lost_issue_response_reuses_one_pending_generation_and_keeps_prior() {
+        let control = tempfile::tempdir().unwrap();
+        let directory = control.path().join("mcp-capabilities");
+        std::fs::create_dir(&directory).unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let store = CapabilityStore::default();
+        let soul = SoulId::new();
+        let first = store
+            .issue(
+                soul.clone(),
+                &directory,
+                "http://host.docker.internal:4000".into(),
+                Some(("codex", home.path(), &[])),
+                Default::default(),
+                None,
+            )
+            .unwrap();
+        let callback = serde_json::to_vec(
+            &serde_json::json!({"action":"issue","controlSecret":"fixture-control",
+            "soulId":soul,"provider":"codex","workspace":home.path()}),
+        )
+        .unwrap();
+        let lost = apply_callback(
+            &callback,
+            "fixture-control",
+            &store,
+            &directory,
+            "http://host.docker.internal:4000",
+            home.path(),
+        )
+        .unwrap();
+        let repeated = apply_callback(
+            &callback,
+            "fixture-control",
+            &store,
+            &directory,
+            "http://host.docker.internal:4000",
+            home.path(),
+        )
+        .unwrap();
+        let pending: McpCapabilityReference = serde_json::from_slice(&lost).unwrap();
+        let retry: McpCapabilityReference = serde_json::from_slice(&repeated).unwrap();
+        assert_eq!(pending.grant_id, retry.grant_id);
+        assert!(staged_provider_root_path(&directory, &first.grant_id)
+            .unwrap()
+            .is_dir());
+        assert_eq!(
+            std::fs::read_dir(control.path().join("provider-roots"))
+                .unwrap()
+                .count(),
+            2
+        );
+        assert!(store
+            .abort_preparation(&pending.grant_id, &SoulId::new(), &directory)
+            .is_err());
+        assert!(staged_provider_root_path(&directory, &pending.grant_id)
+            .unwrap()
+            .is_dir());
+    }
+
+    #[test]
+    fn managed_mcp_startup_orphan_cleanup_protects_uncertain_prior_and_pending_inputs() {
+        let control = tempfile::tempdir().unwrap();
+        let directory = control.path().join("mcp-capabilities");
+        std::fs::create_dir(&directory).unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let store = CapabilityStore::default();
+        let pending = store
+            .issue(
+                SoulId::new(),
+                &directory,
+                "http://host.docker.internal:4000".into(),
+                Some(("codex", home.path(), &[])),
+                Default::default(),
+                None,
+            )
+            .unwrap();
+        let prior = staged_provider_root_path(&directory, "grant-prior-uncertain").unwrap();
+        let orphan = staged_provider_root_path(&directory, "grant-confirmed-orphan").unwrap();
+        std::fs::create_dir(&prior).unwrap();
+        std::fs::create_dir(&orphan).unwrap();
+        std::fs::write(prior.join("usable-resource"), "previous-projection-nonce").unwrap();
+        {
+            let mut grants = store.grants.lock().unwrap();
+            let grant = grants.get_mut(&pending.grant_id).unwrap();
+            grant.preparation.as_mut().unwrap().prior_grant_ids =
+                vec!["grant-prior-uncertain".into()];
+            write_capability(&grant.path, grant).unwrap();
+        }
+        cleanup_orphaned_provider_roots(&directory).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(prior.join("usable-resource")).unwrap(),
+            "previous-projection-nonce"
+        );
+        assert!(staged_provider_root_path(&directory, &pending.grant_id)
+            .unwrap()
+            .is_dir());
+        assert!(!orphan.exists());
+    }
+
+    #[test]
+    fn managed_mcp_generation_commit_and_abort_preserve_prior_until_accepted() {
+        let control = tempfile::tempdir().unwrap();
+        let dir = control.path().join("mcp-capabilities");
+        std::fs::create_dir(&dir).unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let store = CapabilityStore::default();
+        let soul = SoulId::new();
+        let first = store
+            .issue(
+                soul.clone(),
+                &dir,
+                "http://host.docker.internal:4000".into(),
+                Some(("codex", home.path(), &[])),
+                Default::default(),
+                None,
+            )
+            .unwrap();
+        let second = store
+            .issue_replacement(
+                soul.clone(),
+                &dir,
+                "http://host.docker.internal:4000".into(),
+                Some(("codex", home.path(), &[])),
+                None,
+                Some(home.path()),
+            )
+            .unwrap();
+        let prior = staged_provider_root_path(&dir, &first.grant_id).unwrap();
+        let pending = staged_provider_root_path(&dir, &second.grant_id).unwrap();
+        assert!(prior.exists(), "prepare cannot retire prior inputs");
+        let incarnation = IncarnationId::new();
+        assert!(store
+            .commit_preparation(&second.grant_id, &soul, &incarnation, &dir)
+            .is_err());
+        store
+            .abort_preparation(&second.grant_id, &soul, &dir)
+            .unwrap();
+        store
+            .abort_preparation(&second.grant_id, &soul, &dir)
+            .unwrap();
+        assert!(prior.exists());
+        assert!(!pending.exists());
+        let replacement = store
+            .issue_replacement(
+                soul.clone(),
+                &dir,
+                "http://host.docker.internal:4000".into(),
+                Some(("codex", home.path(), &[])),
+                None,
+                Some(home.path()),
+            )
+            .unwrap();
+        store
+            .activate(
+                &replacement.grant_id,
+                soul.clone(),
+                incarnation.clone(),
+                &dir,
+                &replacement.endpoint,
+            )
+            .unwrap();
+        assert!(
+            prior.exists(),
+            "MCP activation is earlier than Host GrantAccepted"
+        );
+        store
+            .commit_preparation(&replacement.grant_id, &soul, &incarnation, &dir)
+            .unwrap();
+        store
+            .commit_preparation(&replacement.grant_id, &soul, &incarnation, &dir)
+            .unwrap();
+        assert!(!prior.exists());
+        assert!(store
+            .abort_preparation(&replacement.grant_id, &soul, &dir)
+            .is_err());
     }
 
     #[test]
@@ -1943,7 +2344,10 @@ mod tests {
             )
             .unwrap();
         let second_stage = staged_provider_root_path(&capabilities, &second.grant_id).unwrap();
-        assert!(!first_stage.exists());
+        assert!(
+            first_stage.exists(),
+            "replacement preparation must retain prior usable inputs"
+        );
         assert_eq!(
             std::fs::read_to_string(second_stage.join("ephemeral/inline-config.json")).unwrap(),
             raw
@@ -2426,8 +2830,11 @@ mod tests {
         .unwrap();
         assert_ne!(replacement.grant_id, reference.grant_id);
         assert_eq!(replacement.endpoint, "http://host.docker.internal:4001");
-        assert!(!path.exists());
-        assert!(!store.authenticates(active["scope"].as_str().unwrap()));
+        assert!(
+            path.exists(),
+            "lost issue response must not retire prior grant"
+        );
+        assert!(store.authenticates(active["scope"].as_str().unwrap()));
     }
 
     #[tokio::test]

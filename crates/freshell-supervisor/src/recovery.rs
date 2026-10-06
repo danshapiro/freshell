@@ -852,12 +852,23 @@ impl Supervisor {
         let provider = start.context.provider.clone();
         self.registry
             .mark_recovery_success(
-                soul_id,
+                soul_id.clone(),
                 prepared.prepared.incarnation_id.clone(),
                 attempt_id.clone(),
             )
             .await
             .map_err(map_registry)?;
+        self.commit_provider_preparation(
+            &LaunchWorkload {
+                soul_id: soul_id.clone(),
+                fixture: prepared.fixture,
+                terminal: prepared.terminal.clone(),
+                fresh_agent: prepared.fresh_agent.clone(),
+                resume_spec: prepared.resume_spec.clone(),
+            },
+            &prepared.prepared.incarnation_id,
+        )
+        .await?;
         let elapsed_ms = recovery_started
             .elapsed()
             .as_millis()

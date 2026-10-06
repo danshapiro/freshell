@@ -810,6 +810,13 @@ impl Supervisor {
                     self.activation_failure(&prepared, state, "record_native_identity", error)
                 })?;
         }
+        if workload.resume_spec.is_none() {
+            self.commit_provider_preparation(&workload, handle.incarnation_id())
+                .await
+                .map_err(|error| {
+                    self.activation_failure(&prepared, state, "commit_provider_inputs", error)
+                })?;
+        }
         append_event(
             &self.config.lifecycle_log,
             "supervisor.launch_running",
@@ -1686,7 +1693,7 @@ impl Supervisor {
                 "invalid managed MCP endpoint",
             ));
         }
-        if !matches!(action, "activate" | "revoke") {
+        if !matches!(action, "activate" | "revoke" | "commit" | "abort") {
             return Err(RuntimeError::new(
                 RuntimeErrorCode::InvalidRequest,
                 "invalid managed MCP action",
@@ -1708,6 +1715,34 @@ impl Supervisor {
                 RuntimeErrorCode::HostUnreachable,
                 "capability_pending: server rejected scoped grant",
             ));
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn commit_provider_preparation(
+        &self,
+        workload: &LaunchWorkload,
+        incarnation: &IncarnationId,
+    ) -> Result<(), RuntimeError> {
+        let context = workload
+            .terminal
+            .as_ref()
+            .and_then(|terminal| terminal.provider_launch_context.as_ref())
+            .or_else(|| {
+                workload
+                    .fresh_agent
+                    .as_ref()
+                    .and_then(|agent| agent.provider_launch_context.as_ref())
+            });
+        if let Some(capability) = context.and_then(|context| context.mcp_capability.as_ref()) {
+            self.notify_mcp_capability(
+                "commit",
+                &capability.endpoint,
+                &workload.soul_id,
+                incarnation,
+                &capability.grant_id,
+            )
+            .await?;
         }
         Ok(())
     }
