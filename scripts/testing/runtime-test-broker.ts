@@ -349,6 +349,8 @@ export class RestrictedDockerBroker {
       }
       if ((method==='GET' && url===`${DOCKER_API_PREFIX}/containers/${helperTarget![1]}/json`)
         || (method==='POST' && exactId && url===`${DOCKER_API_PREFIX}/containers/${owned.containerId}/start`)
+        || (method==='POST' && exactId && owned.expected.Cmd?.[0]==='prepare-provider-mountpoints'
+          && url===`${DOCKER_API_PREFIX}/containers/${owned.containerId}/wait?condition=not-running`)
         || (method==='DELETE' && url===`${DOCKER_API_PREFIX}/containers/${helperTarget![1]}?force=1`)) {
         await this.forwardAndReply(request,response,body,{destructive:method!=='GET',containerId:owned.containerId,helperName:name})
         return
@@ -376,8 +378,9 @@ export class RestrictedDockerBroker {
 
     if (method === 'POST' && url.startsWith(`${DOCKER_API_PREFIX}/containers/create?`)) {
       const name = new URL(url, 'http://docker').searchParams.get('name') ?? ''
-      if (/^freshell-inputs-[a-f0-9]{24}-publisher$/.test(name)) {
-        const input=this.validateInputPublisher(name,body)
+      const mountpointHelper=/^freshell-mountpoints-[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/.test(name)
+      if (/^freshell-inputs-[a-f0-9]{24}-publisher$/.test(name) || mountpointHelper) {
+        const input=mountpointHelper ? this.validateMountpointHelper(body) : this.validateInputPublisher(name,body)
         if (!input || this.inputPublishers.has(name)) {
           this.block(response,method,url,403,'indexed publisher must match an owned fixed preparation',false)
           return
@@ -391,7 +394,7 @@ export class RestrictedDockerBroker {
             if (typeof parsed.Id!=='string' || !/^[a-f0-9]{64}$/.test(parsed.Id) || this.receiptIds().has(parsed.Id)) throw new Error('invalid indexed publisher identity')
             publisher.containerId=parsed.Id
           }
-          this.record({method,url,decision:'forward',destructive:false,unsafeAttempt:false,helperName:name,containerId:publisher.containerId,providerVolumeName:input.indexedFiles!.volumeName})
+          this.record({method,url,decision:'forward',destructive:false,unsafeAttempt:false,helperName:name,containerId:publisher.containerId,providerVolumeName:mountpointHelper ? input.providerVolumeName : input.indexedFiles!.volumeName})
           replyDocker(response,forwarded)
         } catch {
           response.statusCode=503
@@ -655,6 +658,41 @@ export class RestrictedDockerBroker {
     if (!Array.isArray(mounts) || mounts.length!==3) return
     const binary=mounts.find((mount)=>mount.Type==='bind' && mount.Source===input.hostBinaryPath && mount.Target==='/runtime/freshell-session-host' && mount.ReadOnly===true)
     const volume=mounts.find((mount)=>mount.Type==='volume' && mount.Source===input.indexedFiles!.volumeName && mount.Target==='/run/freshell-input-files' && mount.ReadOnly===false && equalRecord(mount.VolumeOptions,{NoCopy:true}))
+    const exchange=mounts.find((mount)=>mount.Type==='bind' && mount.Target==='/run/freshell-input-exchange' && mount.ReadOnly===true
+      && typeof mount.Source==='string' && path.dirname(mount.Source)===os.tmpdir()
+      && /^freshell-inputs-[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/.test(path.basename(mount.Source)))
+    if (!binary || !volume || !exchange || [binary,volume,exchange].some((mount)=>Object.keys(mount).some((key)=>!['Type','Source','Target','ReadOnly','VolumeOptions'].includes(key)))
+      || binary.VolumeOptions!==undefined || exchange.VolumeOptions!==undefined) return
+    return input
+  }
+
+  private validateMountpointHelper(body:Buffer):PreparedInputAuthorization | undefined {
+    let parsed:Record<string,any>
+    try {parsed=JSON.parse(body.toString())} catch {return}
+    const input=[...this.preparedInputs.values()].find((input)=>parsed.Image===input.imageRef
+      && equalRecord(parsed.Labels,{'com.freshell.installation-id':input.installationId,
+        'com.freshell.soul-id':input.soulId,'com.freshell.incarnation-id':input.incarnationId}))
+    if (!input || parsed.User!=='0:0' || parsed.Tty!==false
+      || JSON.stringify(parsed.Entrypoint)!==JSON.stringify(['/runtime/freshell-session-host'])
+      || JSON.stringify(parsed.Cmd)!==JSON.stringify(['prepare-provider-mountpoints'])
+      || !privateHelperEnvironment(parsed.Env,false)) return
+    const host=parsed.HostConfig ?? {}
+    if (Object.keys(parsed).some((key)=>!['Image','User','Tty','Labels','Entrypoint','Cmd','Env','HostConfig'].includes(key))
+      || Object.keys(host).some((key)=>!['NetworkMode','ReadonlyRootfs','CapDrop','CapAdd','SecurityOpt','Memory','MemorySwap','NanoCpus','PidsLimit','LogConfig','Mounts'].includes(key))) return
+    if (host.NetworkMode!=='none' || host.ReadonlyRootfs!==true
+      || JSON.stringify(host.CapDrop)!==JSON.stringify(['ALL'])
+      || JSON.stringify(host.CapAdd)!==JSON.stringify(['CHOWN','SETGID','SETUID'])
+      || JSON.stringify(host.SecurityOpt)!==JSON.stringify(['no-new-privileges'])
+      || host.Memory!==128*1024*1024 || host.MemorySwap!==128*1024*1024
+      || host.NanoCpus!==500_000_000 || host.PidsLimit!==32
+      || !equalRecord(host.LogConfig,{Type:'none',Config:host.LogConfig?.Config})
+      || Object.keys(host.LogConfig?.Config ?? {}).length) return
+    const mounts=host.Mounts
+    if (!Array.isArray(mounts) || mounts.length!==3) return
+    const binary=mounts.find((mount)=>mount.Type==='bind' && mount.Source===input.hostBinaryPath
+      && mount.Target==='/runtime/freshell-session-host' && mount.ReadOnly===true)
+    const volume=mounts.find((mount)=>mount.Type==='volume' && mount.Source===input.providerVolumeName
+      && mount.Target==='/home/freshell/provider' && mount.ReadOnly===false && equalRecord(mount.VolumeOptions,{NoCopy:true}))
     const exchange=mounts.find((mount)=>mount.Type==='bind' && mount.Target==='/run/freshell-input-exchange' && mount.ReadOnly===true
       && typeof mount.Source==='string' && path.dirname(mount.Source)===os.tmpdir()
       && /^freshell-inputs-[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/.test(path.basename(mount.Source)))

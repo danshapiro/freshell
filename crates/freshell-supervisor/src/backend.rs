@@ -3,6 +3,7 @@ mod input_publisher;
 mod native_auth;
 mod native_history;
 mod prepared_inputs;
+mod provider_mountpoints;
 
 use crate::registry::OwnedRuntimeHandle;
 use async_trait::async_trait;
@@ -41,6 +42,7 @@ pub enum BackendError {
 #[derive(Debug, Clone)]
 pub struct CreateRuntimeSpec {
     pub initial_input_reservation: Option<crate::registry::BoundInputReservation>,
+    pub prior_provider_owner: Option<OwnedRuntimeHandle>,
     pub installation_id: InstallationId,
     pub soul_id: SoulId,
     pub incarnation_id: IncarnationId,
@@ -698,6 +700,10 @@ impl RuntimeBackend for DockerEngineBackend {
         let (daemon_id, rootless) = self.daemon_info().await?;
         self.ensure_reserved_initial_volume(spec, &daemon_id, rootless)
             .await?;
+        if let Some(mounts) = &terminal_mounts {
+            self.prepare_provider_mountpoints(spec, mounts, &binary, &daemon_id)
+                .await?;
+        }
         let memory_swap = spec
             .limits
             .memory_bytes
@@ -1884,6 +1890,7 @@ mod tests {
             })
             .collect();
         let spec = CreateRuntimeSpec {
+            prior_provider_owner: None,
             initial_input_reservation: None,
             installation_id: InstallationId::parse("installation-test").unwrap(),
             soul_id: SoulId::parse("soul-test").unwrap(),

@@ -332,6 +332,34 @@ function publisherBody(input:PreparedInputAuthorization):any {
 }
 
 describe('fixed indexed publisher broker',()=>{
+  it('allows the fixed owned mountpoint helper before workload creation and refuses extra authority',async()=>{
+    await withHttpBroker(async ({request,forwarded,broker:instance})=>{
+      const input=publisherAuthorization();instance.authorizePreparedInputs(input);
+      const name='freshell-mountpoints-11111111-1111-4111-8111-111111111111';
+      const body=publisherBody(input);
+      body.User='0:0';body.Cmd=['prepare-provider-mountpoints'];
+      body.Labels={'com.freshell.installation-id':input.installationId,'com.freshell.soul-id':input.soulId,'com.freshell.incarnation-id':input.incarnationId};
+      body.HostConfig.CapAdd=['CHOWN','SETGID','SETUID'];
+      body.HostConfig.Mounts[1]={Type:'volume',Source:input.providerVolumeName,Target:'/home/freshell/provider',ReadOnly:false,VolumeOptions:{NoCopy:true}};
+      expect((await request('POST',`/v1.47/containers/create?name=${name}`,body)).status).toBe(201);
+      const before=forwarded.length;
+      for (const mutate of [
+        (value:any)=>value.HostConfig.CapAdd.push('DAC_OVERRIDE'),
+        (value:any)=>value.Cmd.push('/outside'),
+        (value:any)=>value.HostConfig.Mounts[1].Source='freshell-provider-ffffffffffffffffffffffff',
+        (value:any)=>value.HostConfig.Mounts[1].VolumeOptions.NoCopy=false,
+        (value:any)=>value.HostConfig.Mounts.push({Type:'bind',Source:'/operator-home',Target:'/outside',ReadOnly:false}),
+        (value:any)=>value.Labels['com.freshell.soul-id']='foreign',
+      ]) {
+        const changed=structuredClone(body);mutate(changed);
+        expect((await request('POST',`/v1.47/containers/create?name=${name.replace('111111111111','222222222222')}`,changed)).status).toBe(403);
+        expect(forwarded).toHaveLength(before);
+      }
+      expect((await request('POST',`/v1.47/containers/${helperId}/start`)).status).toBe(204);
+      expect((await request('POST',`/v1.47/containers/${helperId}/wait?condition=not-running`)).status).toBe(200);
+      expect((await request('DELETE',`/v1.47/containers/${helperId}?force=1`)).status).toBe(204);
+    });
+  });
   it('preserves exact name ownership on lost publisher acknowledgement and refuses replacement-helper cleanup',async()=>{
     await withHttpBroker(async({request,forwarded,broker:instance,loseHelperAck,replaceHelperInspection})=>{
       const input=publisherAuthorization();instance.authorizePreparedInputs(input);

@@ -18,12 +18,22 @@ pub(super) fn stage(
         sources: Vec::new(),
         files: Vec::new(),
         frozen_inputs: frozen_inputs.to_vec(),
+        user_owns_freshell_mcp: false,
     };
     private_directory(&root.join(".freshell/source-views"))?;
     private_directory(&root.join(".freshell/templates"))?;
     let mut files = BTreeMap::new();
     let mut view_bytes = 0usize;
     for (ordinal, source) in plan.iter().enumerate() {
+        if source.source.lane == SourceLane::Main {
+            manifest.user_owns_freshell_mcp |=
+                freshell_platform::opencode_config::source_owns_freshell_mcp(
+                    source.references.unexpanded_source(),
+                    &source.source.logical_path,
+                    cwd,
+                )
+                .map_err(|error| error.to_string())?;
+        }
         view_bytes = view_bytes
             .checked_add(source.references.unexpanded_source().len())
             .and_then(|value| value.checked_add(source.references.template.len()))

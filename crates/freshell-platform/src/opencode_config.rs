@@ -166,6 +166,25 @@ fn validate_mcp_field(value: &Value, path: &Path) -> Result<(), ConfigError> {
     Ok(())
 }
 
+/// Inspect the retained, accepted raw view without reading its source again.
+pub fn source_owns_freshell_mcp(
+    raw: &str,
+    path: &Path,
+    project_dir: &Path,
+) -> Result<bool, ConfigError> {
+    let value =
+        parse_jsonc_object(raw).ok_or_else(|| ConfigError::Malformed { path: path.into() })?;
+    validate_mcp_field(&value, path)?;
+    let entry = value
+        .get("mcp")
+        .and_then(|mcp| mcp.get("freshell"))
+        .filter(|entry| !entry.is_null());
+    Ok(entry.is_some_and(|entry| {
+        path != project_dir.join(".opencode/opencode.json")
+            || !is_direct_owned_mcp_entry(project_dir, entry)
+    }))
+}
+
 /// Merge only Freshell-owned keys into the inline lane. The returned document
 /// is process-local and must never be serialized into a durable launch plan.
 pub fn merge_owned_entries(

@@ -34,6 +34,8 @@ pub struct SourceManifest {
     pub files: Vec<SelectedSourceFile>,
     #[serde(default)]
     pub frozen_inputs: Vec<String>,
+    #[serde(default)]
+    pub user_owns_freshell_mcp: bool,
 }
 #[derive(Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]

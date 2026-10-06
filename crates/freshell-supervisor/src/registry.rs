@@ -683,6 +683,29 @@ impl Registry {
             .await
     }
 
+    pub(crate) async fn prior_provider_owner(
+        &self,
+        incarnation: IncarnationId,
+    ) -> Result<Option<OwnedRuntimeHandle>, RegistryError> {
+        let installation = self.installation_id().clone();
+        self.run_blocking(move |conn| {
+            let prior: Option<String> = conn.query_row(
+                "SELECT prior_incarnation_id FROM incarnations WHERE incarnation_id=?1",
+                params![incarnation.as_str()],
+                |row| row.get(0),
+            )?;
+            prior
+                .map(|raw| {
+                    let prior = IncarnationId::parse(raw).map_err(|_| {
+                        RegistryError::Integrity("invalid prior provider owner".into())
+                    })?;
+                    load_owned_handle(&conn, installation, &prior)
+                })
+                .transpose()
+        })
+        .await
+    }
+
     pub async fn active_handle_for_soul(
         &self,
         soul_id: SoulId,

@@ -757,17 +757,26 @@ pub(crate) async fn prepare_managed_opencode(
     }
     let names = source_environment_names(&loaded).map_err(|error| error.to_string())?;
     let mut environment = environment::SourceEnvironment::read(names, &references, original)?;
-    let mut reservation = None;
+    // Even a typed auth grant needs explicit ownership of a newly absent soul
+    // volume before its descriptor-owned mountpoints can be constructed.
+    let reservation = if auth_authority.is_none() {
+        Some(
+            client
+                .reserve_provider_inputs(soul.clone(), "opencode".into(), creation_seed.into())
+                .await
+                .map_err(|error| error.to_string())?
+                .reservation_id,
+        )
+    } else {
+        None
+    };
     if environment.needs_native_auth() {
         let authority = if let Some(authority) = auth_authority {
             authority.to_owned()
         } else {
-            let receipt = client
-                .reserve_provider_inputs(soul.clone(), "opencode".into(), creation_seed.into())
-                .await
-                .map_err(|error| error.to_string())?;
-            reservation = Some(receipt.reservation_id.clone());
-            receipt.reservation_id
+            reservation
+                .clone()
+                .ok_or("initial provider input reservation unavailable")?
         };
         let values = client
             .native_auth_lookup(soul.clone(), authority, environment.names().to_vec())

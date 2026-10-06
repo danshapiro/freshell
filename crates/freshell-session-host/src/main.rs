@@ -137,6 +137,15 @@ async fn run() -> Result<(), String> {
                 Path::new("/run/freshell-input-exchange/reply.sock"),
             ).map_err(str::to_owned)
         }
+        Some("prepare-provider-mountpoints") if args.len() == 2 => {
+            if unsafe { libc::geteuid() } != 0 || unsafe { libc::getegid() } != 0 {
+                return Err("provider mountpoint helper requires the fixed host identity".into());
+            }
+            freshell_platform::provider_mountpoints::serve(
+                Path::new("/home/freshell/provider"),
+                Path::new("/run/freshell-input-exchange/reply.sock"),
+            ).map_err(str::to_owned)
+        }
         Some("native-history-only") => {
             let snapshot = freshell_freshagent::native_history::read(
                 &required_arg(&args[2..], "--provider")?,
@@ -1024,14 +1033,18 @@ async fn grant_execution(
                     format!("prepare OneCLI provider files: {error}"),
                 )
             })?;
-            let prepared = providers::prepare_terminal(terminal, &resolved_secrets.environment)
-                .await
-                .map_err(|error| {
-                    RuntimeError::new(
-                        RuntimeErrorCode::HostUnreachable,
-                        format!("prepare managed provider: {error}"),
-                    )
-                })?;
+            let prepared = providers::prepare_terminal(
+                terminal,
+                &resolved_secrets.environment,
+                resolved_secrets.opencode_plan.as_ref(),
+            )
+            .await
+            .map_err(|error| {
+                RuntimeError::new(
+                    RuntimeErrorCode::HostUnreachable,
+                    format!("prepare managed provider: {error}"),
+                )
+            })?;
             let terminal = prepared.terminal;
             let hosted = HostedPty::spawn(
                 &state.state_dir,
@@ -1146,6 +1159,7 @@ async fn grant_execution(
             providers::prepare_fresh_agent_child_environment(
                 &launch,
                 &mut resolved_secrets.environment,
+                resolved_secrets.opencode_plan.as_ref(),
             )
             .map_err(|error| RuntimeError::new(RuntimeErrorCode::HostUnreachable, error))?;
             freshell_platform::managed_child_secrets::install(resolved_secrets.environment)
@@ -1649,7 +1663,17 @@ fn copy_provider_config_references_with_ownership(
             }
         })
         .collect::<Vec<_>>();
-    let excluded = provider_credential_sources(user_provider_root);
+    let protected = private_bound_destinations(context);
+    let mut excluded = provider_credential_sources(user_provider_root);
+    for selection in &selections {
+        for relative in &protected {
+            if let Ok(suffix) = Path::new(relative).strip_prefix(&selection.destination_relative) {
+                if let Ok(source) = std::fs::canonicalize(selection.source.join(suffix)) {
+                    excluded.push(source);
+                }
+            }
+        }
+    }
     let report = copy_environment_with_events(
         "session_host",
         provider,
@@ -1689,6 +1713,35 @@ fn provider_credential_sources(root: &Path) -> Vec<PathBuf> {
     .into_iter()
     .filter_map(|name| std::fs::canonicalize(root.join(name)).ok())
     .collect()
+}
+
+fn private_bound_destinations(
+    context: &freshell_runtime_protocol::ProviderLaunchContext,
+) -> std::collections::BTreeSet<String> {
+    let home = Path::new("/home/freshell/provider");
+    context
+        .prepared_inputs
+        .iter()
+        .flat_map(|inputs| {
+            inputs
+                .config_binds
+                .iter()
+                .map(|bind| bind.effective_destination.as_str())
+                .chain(inputs.indexed_files.iter().flat_map(|files| {
+                    files
+                        .aliases
+                        .iter()
+                        .map(|alias| alias.effective_destination.as_str())
+                }))
+        })
+        .filter_map(|destination| {
+            Path::new(destination)
+                .strip_prefix(home)
+                .ok()
+                .and_then(Path::to_str)
+                .map(str::to_owned)
+        })
+        .collect()
 }
 
 const PROVIDER_PROJECTION_MANIFEST: &str = ".freshell-config-projection.json";
@@ -1804,6 +1857,12 @@ fn refresh_provider_config_references(
         serde_json::to_vec(provider).map_err(|error| error.to_string())?,
     )
     .map_err(|error| error.to_string())?;
+    std::fs::write(
+        stage.path().join("private-mountpoints.json"),
+        serde_json::to_vec(&private_bound_destinations(context))
+            .map_err(|_| "private mountpoint metadata invalid")?,
+    )
+    .map_err(|_| "private mountpoint metadata write failed")?;
     allow_provider_read_stage(stage.path(), run_as_gid)?;
     if run_as_uid == unsafe { libc::geteuid() } && run_as_gid == unsafe { libc::getegid() } {
         return apply_staged_provider_config(stage.path(), provider_home);
@@ -1886,6 +1945,22 @@ fn apply_staged_provider_config(stage: &Path, provider_home: &Path) -> Result<()
     let projection = stage.join("projection");
     let previous = read_projection_manifest(provider_home)?;
     let current = read_projection_manifest(&projection)?;
+    let protected: std::collections::BTreeSet<String> =
+        match std::fs::read(stage.join("private-mountpoints.json")) {
+            Ok(bytes) => {
+                serde_json::from_slice(&bytes).map_err(|_| "private mountpoint metadata invalid")?
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Default::default(),
+            Err(_) => return Err("private mountpoint metadata unavailable".into()),
+        };
+    if protected.iter().any(|relative| {
+        Path::new(relative).as_os_str().is_empty()
+            || Path::new(relative)
+                .components()
+                .any(|part| !matches!(part, std::path::Component::Normal(_)))
+    }) {
+        return Err("private mountpoint metadata has an invalid relative path".into());
+    }
     let mut paths = Vec::with_capacity(destinations.len());
     for relative in destinations
         .iter()
@@ -1959,6 +2034,9 @@ fn apply_staged_provider_config(stage: &Path, provider_home: &Path) -> Result<()
     let mut stale = previous.difference(&current).collect::<Vec<_>>();
     stale.sort_by_key(|path| std::cmp::Reverse(Path::new(path).components().count()));
     for relative in stale {
+        if protected.contains(relative) {
+            continue;
+        }
         let destination = provider_home.join(relative);
         if let Ok(metadata) = std::fs::symlink_metadata(&destination) {
             if metadata.is_dir() {
@@ -2949,6 +3027,13 @@ fn now_millis() -> i64 {
 
 #[cfg(test)]
 mod tests {
+    fn executable_fixture() -> tempfile::TempDir {
+        match std::env::var_os("FRESHELL_TEST_EXECUTABLE_TMP_DIR") {
+            Some(directory) => tempfile::tempdir_in(directory),
+            None => tempfile::tempdir(),
+        }
+        .expect("owned executable fixture directory")
+    }
     #[test]
     fn provider_native_auth_survives_without_matching_typed_replacement() {
         use super::*;
@@ -3056,7 +3141,7 @@ mod tests {
     #[test]
     fn provider_config_two_stage_script_is_runnable() {
         use std::{os::unix::fs::PermissionsExt, process::Command};
-        let root = tempfile::tempdir().unwrap();
+        let root = executable_fixture();
         let source = root.path().join("source");
         std::fs::create_dir(&source).unwrap();
         std::fs::write(source.join("run"), "#!/bin/sh\nprintf resource-nonce\n").unwrap();
@@ -3071,6 +3156,113 @@ mod tests {
             .expect("two-stage executable spawn");
         assert!(output.status.success());
         assert_eq!(output.stdout, b"resource-nonce");
+    }
+
+    #[test]
+    fn provider_config_directory_copy_and_refresh_leave_private_bound_leaf_untouched() {
+        use freshell_runtime_protocol::*;
+        use std::os::unix::fs::MetadataExt;
+        let owned = tempfile::tempdir().unwrap();
+        let source = owned.path().join("stage");
+        let home = owned.path().join("home");
+        std::fs::create_dir_all(source.join("nested")).unwrap();
+        std::fs::create_dir_all(home.join(".config/opencode/nested")).unwrap();
+        std::fs::write(
+            source.join("nested/opencode.json"),
+            "ordinary-copy-must-exclude-this",
+        )
+        .unwrap();
+        std::fs::write(source.join("nested/resource"), "ordinary-resource").unwrap();
+        let leaf = home.join(".config/opencode/nested/opencode.json");
+        std::fs::write(&leaf, "private-bound-leaf").unwrap();
+        let inode = std::fs::metadata(&leaf).unwrap().ino();
+        let capability = McpCapabilityReference {
+            grant_id: format!("grant-{}", uuid::Uuid::new_v4()),
+            endpoint: "http://host.docker.internal:1234".into(),
+            provider_relative_path: ".freshell/mcp-capability.json".into(),
+            host_gateway_address: None,
+        };
+        let context = ProviderLaunchContext {
+            prepared_inputs: Some(PreparedProviderInputs {
+                generation_id: capability.grant_id.clone(),
+                initial_auth_reservation: None,
+                manifest: ProviderInputManifestReference {
+                    relative_path: ".freshell/input-manifest.json".into(),
+                    sha256: "a".repeat(64),
+                    source_count: 0,
+                    alias_count: 0,
+                    recipe_count: 0,
+                },
+                config_binds: vec![ProviderConfigBind {
+                    source_relative_path: ".freshell/templates/source-0".into(),
+                    logical_destination:
+                        "/home/freshell/provider/.config/opencode/nested/opencode.json".into(),
+                    effective_destination:
+                        "/home/freshell/provider/.config/opencode/nested/opencode.json".into(),
+                }],
+                resource_mounts: vec![],
+                indexed_files: None,
+            }),
+            mcp_capability: Some(capability),
+            preparation: ProviderPreparation::Opencode {
+                project_config: vec![],
+                tui_config: None,
+                tui_source: None,
+                inline_config: false,
+            },
+            config: vec![ProviderConfigReference {
+                root: ProviderConfigRoot::UserProvider,
+                relative_path: "nested".into(),
+                provider_relative_path: ".config/opencode/nested".into(),
+                format: "directory".into(),
+            }],
+        };
+        let (uid, gid) = unsafe { (libc::geteuid(), libc::getegid()) };
+        copy_provider_config_references(
+            &context,
+            "opencode",
+            owned.path(),
+            &source,
+            &home,
+            uid,
+            gid,
+        )
+        .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&leaf).unwrap(),
+            "private-bound-leaf",
+            "ordinary directory copy must exclude private bound files"
+        );
+        assert_eq!(std::fs::metadata(&leaf).unwrap().ino(), inode);
+        assert_eq!(
+            std::fs::read_to_string(home.join(".config/opencode/nested/resource")).unwrap(),
+            "ordinary-resource"
+        );
+        let protected = ".config/opencode/nested/opencode.json";
+        let mut previous = read_projection_manifest(&home).unwrap();
+        previous.insert(protected.into());
+        write_projection_manifest(&home, &previous).unwrap();
+        std::fs::write(source.join("nested/resource"), "new-resource").unwrap();
+        refresh_provider_config_references(
+            &context,
+            "opencode",
+            owned.path(),
+            &source,
+            &home,
+            uid,
+            gid,
+        )
+        .unwrap();
+        assert_eq!(std::fs::metadata(&leaf).unwrap().ino(), inode);
+        assert_eq!(
+            std::fs::read_to_string(&leaf).unwrap(),
+            "private-bound-leaf"
+        );
+        assert!(!read_projection_manifest(&home).unwrap().contains(protected));
+        assert_eq!(
+            std::fs::read_to_string(home.join(".config/opencode/nested/resource")).unwrap(),
+            "new-resource"
+        );
     }
 
     #[test]
@@ -3392,7 +3584,7 @@ mod tests {
             ProviderConfigReference, ProviderConfigRoot, ProviderLaunchContext, ProviderPreparation,
         };
         use std::os::unix::fs::{symlink, MetadataExt, PermissionsExt};
-        let root = tempfile::tempdir().unwrap();
+        let root = executable_fixture();
         let original = root.path().join("original");
         let external = root.path().join("external-skills");
         let discovered = original.join(".agents/skills");
@@ -4088,11 +4280,7 @@ mod tests {
 
         // runtime-suite /tmp is deliberately non-executable. Its existing
         // cargo target volume is the owned executable-fixture filesystem.
-        let workspace = match std::env::var_os("FRESHELL_TEST_EXECUTABLE_TMP_DIR") {
-            Some(directory) => tempfile::tempdir_in(directory),
-            None => tempfile::tempdir(),
-        }
-        .unwrap();
+        let workspace = executable_fixture();
         std::fs::set_permissions(workspace.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
         let provider_home = workspace.path().join("provider-home");
         let source_config = workspace.path().join("opencode.json");
@@ -4715,7 +4903,7 @@ mod tests {
             ProviderConfigReference, ProviderConfigRoot, ProviderLaunchContext, ProviderPreparation,
         };
         use std::{cell::Cell, process::Command};
-        let root = tempfile::tempdir().unwrap();
+        let root = executable_fixture();
         let home = root.path().join("provider");
         let private = root.path().join("private");
         let source = private.join("user-provider");

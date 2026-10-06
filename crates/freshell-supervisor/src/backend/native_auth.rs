@@ -609,6 +609,7 @@ mod tests {
         });
         let backend = DockerEngineBackend::new(temp.path().join("docker.sock"));
         let spec = CreateRuntimeSpec {
+            prior_provider_owner: None,
             initial_input_reservation: Some(binding.clone()),
             installation_id: registry.installation_id().clone(),
             soul_id: soul,

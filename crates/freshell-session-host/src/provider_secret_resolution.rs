@@ -6,6 +6,7 @@ use std::path::Path;
 const MAX_KEYS_BYTES: u64 = 128 * 1024;
 #[derive(Default)]
 pub struct ResolvedProviderSecrets {
+    pub opencode_plan: Option<freshell_platform::opencode_config::OpencodeConfigPlan>,
     pub environment: BTreeMap<String, String>,
     pub provider_files: Vec<(&'static str, Vec<u8>)>,
     pub configuration_files: Vec<(String, std::path::PathBuf)>,

@@ -99,6 +99,10 @@ pub fn prepare(
         freshell_platform::native_auth_exchange::read_selected_native_auth(home, &names)
             .map_err(str::to_string)?
     };
+    let plan = freshell_platform::opencode_config::OpencodeConfigPlan {
+        sources: vec![],
+        user_owns_freshell_mcp: manifest.user_owns_freshell_mcp,
+    };
     let mut generated = BTreeMap::new();
     let mut views = 0usize;
     let mut budget = frozen.clone();
@@ -165,6 +169,7 @@ pub fn prepare(
             }
         }
     }
+    secrets.opencode_plan = Some(plan);
     Ok(generated)
 }
 
@@ -203,6 +208,7 @@ mod tests {
                 original_form: false,
             }],
             frozen_inputs: vec!["INSERT".into()],
+            user_owns_freshell_mcp: true,
             files: vec![SelectedSourceFile {
                 source_id: 0,
                 canonical_source: "/original-unavailable/payload/rules".into(),
@@ -250,6 +256,14 @@ mod tests {
         .unwrap();
         let mut secrets = ResolvedProviderSecrets::default();
         let generated = prepare(Some(&context), &mut secrets, &frozen, &stage, &home).unwrap();
+        assert!(secrets.opencode_plan.is_some(), "the accepted source plan must reach provider preparation without rescanning mounted templates");
+        assert!(
+            secrets
+                .opencode_plan
+                .as_ref()
+                .unwrap()
+                .user_owns_freshell_mcp
+        );
         let value=generated.get("FRESHELL_CONFIG_REFERENCE_0").expect("host must generate the selected native child source from private path inputs before dispatch");
         let expected = r#"{"instructions":["PRIVATE_PREFIX{file:/home/freshell/provider/.freshell/references/0}PRIVATE_SUFFIX"]}"#;
         assert_eq!(value, expected);

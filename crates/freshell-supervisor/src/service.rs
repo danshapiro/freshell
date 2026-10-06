@@ -886,6 +886,11 @@ impl Supervisor {
             let created = self
                 .backend
                 .create_stopped(&CreateRuntimeSpec {
+                    prior_provider_owner: self
+                        .registry
+                        .prior_provider_owner(prepared.incarnation_id.clone())
+                        .await
+                        .map_err(map_registry)?,
                     initial_input_reservation: self
                         .registry
                         .bound_input_reservation(prepared.incarnation_id.clone())

@@ -61,6 +61,7 @@ pub fn prepare_provider_state_before_bootstrap(
 pub async fn prepare_terminal(
     mut terminal: freshell_runtime_protocol::TerminalLaunchSpec,
     child_secret_env: &std::collections::BTreeMap<String, String>,
+    prepared_opencode_plan: Option<&freshell_platform::opencode_config::OpencodeConfigPlan>,
 ) -> Result<PreparedTerminal, String> {
     let mut child_env = child_secret_env.clone();
     if let Some(context) = terminal.provider_launch_context.as_ref() {
@@ -144,11 +145,11 @@ pub async fn prepare_terminal(
             .provider_launch_context
             .as_ref()
             .is_some_and(|context| context.mcp_capability.is_some());
-        let plan = freshell_platform::opencode_config::prepare_opencode_config(
-            std::path::Path::new(&terminal.cwd),
-            std::path::Path::new("/home/freshell/provider/.config/opencode"),
-        )
-        .map_err(|error| error.to_string())?;
+        let plan = opencode_plan(
+            &terminal.cwd,
+            terminal.provider_launch_context.as_ref(),
+            prepared_opencode_plan,
+        )?;
         let inherited = terminal
             .env
             .remove("OPENCODE_CONFIG_CONTENT")
@@ -266,6 +267,7 @@ fn prepare_provider_features_for_identity(uid: u32, gid: u32, args: &[&str]) -> 
 pub fn prepare_fresh_agent_child_environment(
     launch: &freshell_runtime_protocol::FreshAgentLaunchSpec,
     child_env: &mut std::collections::BTreeMap<String, String>,
+    prepared_opencode_plan: Option<&freshell_platform::opencode_config::OpencodeConfigPlan>,
 ) -> Result<(), String> {
     use freshell_runtime_protocol::{FreshProvider, ProviderPreparation};
     if launch.provider != FreshProvider::Opencode {
@@ -296,16 +298,24 @@ pub fn prepare_fresh_agent_child_environment(
             }
         }
     }
-    let plan = freshell_platform::opencode_config::prepare_opencode_config(
-        std::path::Path::new(&launch.cwd),
-        std::path::Path::new("/home/freshell/provider/.config/opencode"),
-    )
-    .map_err(|error| error.to_string())?;
-    if let Some(inherited) = child_env.get("OPENCODE_CONFIG_CONTENT") {
+    let plan = opencode_plan(
+        &launch.cwd,
+        launch.provider_launch_context.as_ref(),
+        prepared_opencode_plan,
+    )?;
+    let has_mcp = launch
+        .provider_launch_context
+        .as_ref()
+        .is_some_and(|context| context.mcp_capability.is_some());
+    if child_env.contains_key("OPENCODE_CONFIG_CONTENT") || has_mcp {
         let normalized = freshell_platform::opencode_config::merge_owned_entries(
-            Some(inherited),
+            child_env.get("OPENCODE_CONFIG_CONTENT").map(String::as_str),
             &plan,
-            &freshell_platform::opencode_config::OwnedConfigEdits::default(),
+            &freshell_platform::opencode_config::OwnedConfigEdits {
+                freshell_command: has_mcp
+                    .then(|| vec!["node".into(), "/opt/freshell-mcp/server.js".into()]),
+                ..Default::default()
+            },
         )
         .map_err(|error| error.to_string())?;
         child_env.insert("OPENCODE_CONFIG_CONTENT".into(), normalized);
@@ -328,6 +338,23 @@ pub fn prepare_fresh_agent_child_environment(
         );
     }
     Ok(())
+}
+
+fn opencode_plan(
+    cwd: &str,
+    context: Option<&freshell_runtime_protocol::ProviderLaunchContext>,
+    prepared: Option<&freshell_platform::opencode_config::OpencodeConfigPlan>,
+) -> Result<freshell_platform::opencode_config::OpencodeConfigPlan, String> {
+    if context.is_some_and(|context| context.prepared_inputs.is_some()) {
+        return prepared
+            .cloned()
+            .ok_or_else(|| "accepted OpenCode source ownership plan is unavailable".into());
+    }
+    freshell_platform::opencode_config::prepare_opencode_config(
+        std::path::Path::new(cwd),
+        std::path::Path::new("/home/freshell/provider/.config/opencode"),
+    )
+    .map_err(|error| error.to_string())
 }
 
 pub(crate) fn run_provider_features_worker(args: &[String]) -> Result<(), String> {
@@ -560,7 +587,7 @@ mod provider_secret_context_tests {
             "OPENCODE_CONFIG_CONTENT".into(),
             "{\"model\":\"sentinel-private-inline\"}".into(),
         )]);
-        let prepared = prepare_terminal(terminal, &secrets).await.unwrap();
+        let prepared = prepare_terminal(terminal, &secrets, None).await.unwrap();
         let metadata = serde_json::to_string(&prepared.terminal).unwrap();
         assert!(
             !metadata.contains("sentinel-private-inline"),
