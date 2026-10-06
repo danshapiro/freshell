@@ -1,4 +1,5 @@
 pub mod docker;
+mod input_publisher;
 mod native_auth;
 mod native_history;
 mod prepared_inputs;
@@ -119,6 +120,12 @@ pub struct BackendInspection {
 
 #[async_trait]
 pub trait RuntimeBackend: Send + Sync {
+    async fn commit_prepared_inputs(
+        &self,
+        _handle: &OwnedRuntimeHandle,
+    ) -> Result<(), BackendError> {
+        Ok(())
+    }
     async fn read_native_auth(
         &self,
         _handle: &OwnedRuntimeHandle,
@@ -168,12 +175,17 @@ pub trait RuntimeBackend: Send + Sync {
 #[derive(Clone)]
 pub struct DockerEngineBackend {
     socket_path: PathBuf,
+    input_publishers:
+        std::sync::Arc<std::sync::Mutex<BTreeMap<String, input_publisher::HeldPublisher>>>,
+    input_publication_claims: std::sync::Arc<std::sync::Mutex<std::collections::BTreeSet<String>>>,
 }
 
 impl DockerEngineBackend {
     pub fn new(socket_path: impl Into<PathBuf>) -> Self {
         Self {
             socket_path: socket_path.into(),
+            input_publishers: Default::default(),
+            input_publication_claims: Default::default(),
         }
     }
 
@@ -549,6 +561,28 @@ fn runtime_host_environment(
 
 #[async_trait]
 impl RuntimeBackend for DockerEngineBackend {
+    async fn commit_prepared_inputs(
+        &self,
+        handle: &OwnedRuntimeHandle,
+    ) -> Result<(), BackendError> {
+        let context = handle
+            .terminal()
+            .and_then(|spec| spec.provider_launch_context.as_ref())
+            .or_else(|| {
+                handle
+                    .fresh_agent()
+                    .and_then(|spec| spec.provider_launch_context.as_ref())
+            });
+        if let Some(inputs) = context.and_then(|context| context.prepared_inputs.as_ref()) {
+            self.release_indexed_publication(
+                handle.soul_id(),
+                handle.incarnation_id(),
+                &inputs.generation_id,
+            )
+            .await?;
+        }
+        Ok(())
+    }
     async fn read_native_auth(
         &self,
         handle: &OwnedRuntimeHandle,
@@ -740,6 +774,14 @@ impl RuntimeBackend for DockerEngineBackend {
             .map_err(|_| {
                 BackendError::InvalidConfig("prepared mount metadata cannot be encoded".into())
             })?;
+            if mounts.indexed_files.is_some() && !rootless {
+                return Err(BackendError::Unavailable(
+                    "indexed provider input publication requires the configured rootless backend"
+                        .into(),
+                ));
+            }
+            self.begin_indexed_publication(spec, mounts, &binary)
+                .await?;
         }
         // The name is diagnostic only and is deliberately unique per create attempt.
         // A crash after Docker create but before the container-id commit can leave a
@@ -759,6 +801,12 @@ impl RuntimeBackend for DockerEngineBackend {
             )
             .await?;
         if response.status != 201 {
+            // Transport failures and server errors can hide a successful create.
+            // Only a definitive request rejection proves that no workload has
+            // acquired this generation's mounts.
+            if matches!(response.status, 400 | 401 | 403 | 404 | 409 | 422) {
+                self.abort_indexed_publication(spec).await?;
+            }
             return Err(response.as_error());
         }
         let value: Value = serde_json::from_slice(&response.body)

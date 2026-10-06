@@ -65,6 +65,7 @@ pub mod opencode_recipe;
 pub mod path;
 pub mod provider_environment;
 pub mod provider_environment_grants;
+pub mod provider_input_exchange;
 pub mod resume_gate;
 pub mod spawn;
 

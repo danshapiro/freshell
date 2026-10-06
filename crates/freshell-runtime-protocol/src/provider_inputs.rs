@@ -74,6 +74,29 @@ pub fn indexed_provider_volume_name(soul: &SoulId, generation: &str) -> String {
 }
 
 impl PreparedProviderInputs {
+    pub fn validate_references(
+        &self,
+        references: &[crate::ProviderSecretReference],
+    ) -> Result<(), RuntimeError> {
+        let invalid = || {
+            RuntimeError::new(crate::RuntimeErrorCode::InvalidRequest,"prepared provider file indexes do not match approved configuration grants; reprepare before launch")
+        };
+        let configurations = references
+            .iter()
+            .filter(|reference| reference.profile.is_configuration_file())
+            .collect::<Vec<_>>();
+        if configurations.len() != self.manifest.source_count as usize {
+            return Err(invalid());
+        }
+        for (source_id, reference) in configurations.into_iter().enumerate() {
+            if reference.provider_relative_path.as_deref()
+                != Some(format!(".freshell/references/{source_id}").as_str())
+            {
+                return Err(invalid());
+            }
+        }
+        Ok(())
+    }
     pub fn validate(
         &self,
         capability: Option<&McpCapabilityReference>,
@@ -349,5 +372,51 @@ mod tests {
         let bytes = crate::bounded_json_bytes(&value, crate::MAX_CONTROL_FRAME_BYTES).unwrap();
         let restored: PreparedProviderInputs = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(restored, value);
+    }
+
+    #[test]
+    fn provider_prepared_file_indexes_must_name_real_configuration_grants_in_both_routes() {
+        let context = crate::ProviderLaunchContext {
+            prepared_inputs: Some(prepared()),
+            preparation: crate::ProviderPreparation::Codex {
+                tui_args: vec![],
+                sidecar_args: vec![],
+            },
+            mcp_capability: Some(capability()),
+            config: vec![],
+        };
+        let mut terminal:crate::TerminalLaunchSpec=serde_json::from_value(serde_json::json!({
+            "terminalId":"terminal-index","streamId":"stream-index","mode":"codex","program":"codex",
+            "cwd":"/fixture/workspace","workspacePath":"/fixture/workspace","runAsUid":65534,"runAsGid":0,
+            "cols":80,"rows":24,"projectKey":"project-index","providerLaunchContext":context
+        })).unwrap();
+        let mut fresh:crate::FreshAgentLaunchSpec=serde_json::from_value(serde_json::json!({
+            "sessionId":"session-index","provider":"codex","sessionType":"freshcodex","runtimeVariant":"codex-app-server",
+            "providerStoreId":"store-index","cwd":"/fixture/workspace","workspacePath":"/fixture/workspace","runAsUid":65534,"runAsGid":0,
+            "providerLaunchContext":context
+        })).unwrap();
+        assert!(
+            terminal.validate().is_err(),
+            "file subpaths without approved input grants must fail before Docker"
+        );
+        assert!(
+            fresh.validate().is_err(),
+            "fresh route requires the same source identity proof"
+        );
+        let references = (0..2)
+            .map(|source_id| crate::ProviderSecretReference {
+                source_path: format!("/private/source-{source_id}"),
+                profile: crate::ProviderSecretProfile::CodexConfigurationFile,
+                provider_relative_path: Some(format!(".freshell/references/{source_id}")),
+            })
+            .collect::<Vec<_>>();
+        terminal.provider_secret_references = references.clone();
+        fresh.provider_secret_references = references;
+        terminal.validate().unwrap();
+        fresh.validate().unwrap();
+        terminal.provider_secret_references.swap(0, 1);
+        fresh.provider_secret_references.swap(0, 1);
+        assert!(terminal.validate().is_err());
+        assert!(fresh.validate().is_err());
     }
 }

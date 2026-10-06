@@ -1870,6 +1870,20 @@ impl Supervisor {
             )
             .await?;
         }
+        if context
+            .and_then(|context| context.prepared_inputs.as_ref())
+            .is_some()
+        {
+            let handle = self
+                .registry
+                .owned_handle(incarnation.clone())
+                .await
+                .map_err(map_registry)?;
+            self.backend
+                .commit_prepared_inputs(&handle)
+                .await
+                .map_err(map_backend)?;
+        }
         Ok(())
     }
 

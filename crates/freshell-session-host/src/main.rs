@@ -117,9 +117,23 @@ async fn run() -> Result<(), String> {
         Some("serve") => serve(&args[2..]).await,
         Some("worker") => worker(&args[2..]).await,
         Some("native-auth-only") if args.len() == 2 => {
+            verify_private_helper_namespace(
+                Path::new("/home/freshell/provider"),
+                Path::new("/run/freshell-auth-exchange/reply.sock"),
+            )?;
             freshell_platform::native_auth_exchange::serve(
                 Path::new("/home/freshell/provider"),
                 Path::new("/run/freshell-auth-exchange/reply.sock"),
+            ).map_err(str::to_owned)
+        }
+        Some("publish-provider-inputs") if args.len() == 2 => {
+            verify_private_helper_namespace(
+                Path::new("/run/freshell-input-files"),
+                Path::new("/run/freshell-input-exchange/reply.sock"),
+            )?;
+            freshell_platform::provider_input_exchange::serve(
+                Path::new("/run/freshell-input-files"),
+                Path::new("/run/freshell-input-exchange/reply.sock"),
             ).map_err(str::to_owned)
         }
         Some("native-history-only") => {
@@ -142,6 +156,34 @@ async fn run() -> Result<(), String> {
         Some("prepare-provider-features") => providers::run_provider_features_worker(&args[2..]),
         _ => Err("usage: freshell-session-host <serve|worker|fixture-child|fresh-agent-fixture-worker|opencode-identity-worker|provider-probe-worker|refresh-provider-config> ...".into()),
     }
+}
+
+fn verify_private_helper_namespace(root: &Path, socket: &Path) -> Result<(), String> {
+    use std::os::unix::fs::{FileTypeExt, MetadataExt};
+    let invalid = || "private provider helper namespace mapping is unavailable".to_string();
+    if unsafe { libc::geteuid() } != 65534 || unsafe { libc::getegid() } != 0 {
+        return Err(invalid());
+    }
+    let root_meta = std::fs::symlink_metadata(root).map_err(|_| invalid())?;
+    let directory =
+        std::fs::symlink_metadata(socket.parent().ok_or_else(invalid)?).map_err(|_| invalid())?;
+    let endpoint = std::fs::symlink_metadata(socket).map_err(|_| invalid())?;
+    if !root_meta.is_dir()
+        || root_meta.uid() != 65534
+        || root_meta.gid() != 0
+        || root_meta.mode() & 0o777 != 0o700
+        || !directory.is_dir()
+        || directory.uid() != 0
+        || directory.gid() != 0
+        || directory.mode() & 0o777 != 0o710
+        || !endpoint.file_type().is_socket()
+        || endpoint.uid() != 0
+        || endpoint.gid() != 0
+        || endpoint.mode() & 0o777 != 0o660
+    {
+        return Err(invalid());
+    }
+    Ok(())
 }
 
 async fn serve(args: &[String]) -> Result<(), String> {

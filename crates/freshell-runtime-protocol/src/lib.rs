@@ -1852,6 +1852,13 @@ impl FreshAgentLaunchSpec {
             context.validate(self.provider.as_str())?;
         }
         validate_provider_secrets(self.provider.as_str(), &self.provider_secret_references)?;
+        if let Some(inputs) = self
+            .provider_launch_context
+            .as_ref()
+            .and_then(|context| context.prepared_inputs.as_ref())
+        {
+            inputs.validate_references(&self.provider_secret_references)?;
+        }
         if self.provider != FreshProvider::Kilroy && !self.provider_bootstrap_files.is_empty() {
             return Err(RuntimeError::new(
                 RuntimeErrorCode::InvalidRequest,
@@ -2049,6 +2056,13 @@ impl TerminalLaunchSpec {
             }
         }
         validate_provider_secrets(&self.mode, &self.provider_secret_references)?;
+        if let Some(inputs) = self
+            .provider_launch_context
+            .as_ref()
+            .and_then(|context| context.prepared_inputs.as_ref())
+        {
+            inputs.validate_references(&self.provider_secret_references)?;
+        }
         if let Some(context) = &self.provider_launch_context {
             context.validate(&self.mode)?;
         }

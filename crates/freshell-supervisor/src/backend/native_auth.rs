@@ -7,12 +7,18 @@ fn fail(cause: &'static str) -> BackendError {
     BackendError::Unavailable(cause.into())
 }
 
-struct ExchangeDirectory(PathBuf);
+pub(super) struct ExchangeDirectory(pub(super) PathBuf);
 impl ExchangeDirectory {
     fn create() -> Result<Self, BackendError> {
+        Self::create_owned("freshell-auth")
+    }
+    pub(super) fn create_input() -> Result<Self, BackendError> {
+        Self::create_owned("freshell-inputs")
+    }
+    fn create_owned(prefix: &str) -> Result<Self, BackendError> {
         use std::os::unix::ffi::OsStrExt;
         // Deliberately short regardless of runtime_root length (Linux sun_path).
-        let path = std::env::temp_dir().join(format!("freshell-auth-{}", uuid::Uuid::new_v4()));
+        let path = std::env::temp_dir().join(format!("{prefix}-{}", uuid::Uuid::new_v4()));
         if path.join("reply.sock").as_os_str().as_bytes().len() > 107 {
             return Err(fail("native auth exchange path exceeds limit"));
         }
@@ -21,7 +27,7 @@ impl ExchangeDirectory {
         owned.mode(&owned.0, 0o710)?;
         Ok(owned)
     }
-    fn mode(&self, path: &Path, mode: u32) -> Result<(), BackendError> {
+    pub(super) fn mode(&self, path: &Path, mode: u32) -> Result<(), BackendError> {
         use std::os::unix::{
             ffi::OsStrExt,
             fs::{MetadataExt, PermissionsExt},
@@ -154,9 +160,12 @@ impl DockerEngineBackend {
             let listener = UnixListener::bind(&socket)
                 .map_err(|_| fail("native auth exchange bind failed"))?;
             directory.mode(&socket, 0o660)?;
+            let helper_env = self
+                .private_helper_environment(handle.image_ref(), &["HOME=/home/freshell/provider"])
+                .await?;
             let body = json!({
                 "Image":handle.image_ref(),"User":"65534:0","Tty":false,
-                "Entrypoint":["/runtime/freshell-session-host"],"Cmd":["native-auth-only"],"Env":["HOME=/home/freshell/provider"],
+                "Entrypoint":["/runtime/freshell-session-host"],"Cmd":["native-auth-only"],"Env":helper_env,
                 "HostConfig":{"NetworkMode":"none","ReadonlyRootfs":true,"CapDrop":["ALL"],"SecurityOpt":["no-new-privileges"],
                     "Memory":256*1024*1024,"MemorySwap":256*1024*1024,"NanoCpus":500_000_000,"PidsLimit":32,
                     "LogConfig":{"Type":"none","Config":{}},
@@ -241,15 +250,7 @@ impl DockerEngineBackend {
                 let expected = expected
                     .as_ref()
                     .ok_or_else(|| fail("native auth cleanup authority unavailable"))?;
-                if ["Image", "User", "Tty", "Entrypoint", "Cmd", "Env"]
-                    .iter()
-                    .any(|key| actual["Config"][key] != expected[key])
-                    || actual["Config"]["Labels"]
-                        .as_object()
-                        .is_some_and(|labels| !labels.is_empty())
-                    || actual["HostConfig"]["Mounts"] != expected["HostConfig"]["Mounts"]
-                    || actual["HostConfig"]["LogConfig"]["Type"] != "none"
-                {
+                if !input_publisher::owned_helper(&actual, expected) {
                     return Err(fail("native auth cleanup ownership changed"));
                 }
                 let deleted = self
@@ -364,6 +365,8 @@ mod tests {
                             )
                         } else if request.contains("provider-container-must-not-stop/json") {
                             (404, String::new())
+                        } else if request.contains("/images/") {
+                            (200,json!({"Config":{"Env":["PATH=/image/path","INHERITED_TOKEN=PRIVATE_IMAGE_SENTINEL"]}}).to_string())
                         } else if request.contains("/volumes/") {
                             (200, json!({"Name":"owned-native-volume"}).to_string())
                         } else if request.contains("/create?") {
@@ -455,6 +458,11 @@ mod tests {
             assert_eq!(body["Cmd"], json!(["native-auth-only"]));
             assert_eq!(body["HostConfig"]["LogConfig"]["Type"], "none");
             assert_eq!(body["User"], "65534:0");
+            assert!(body["Env"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("INHERITED_TOKEN=")));
+            assert!(!String::from_utf8_lossy(&create.1).contains("PRIVATE_IMAGE_SENTINEL"));
             assert_eq!(body["HostConfig"]["Mounts"].as_array().unwrap().len(), 3);
             assert!(records.iter().all(|(request, _)| !request.contains("/logs")
                 && !(request.starts_with("DELETE") && request.contains(handle.container_id()))

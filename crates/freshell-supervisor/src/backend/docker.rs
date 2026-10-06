@@ -89,6 +89,11 @@ fn workload_mounts(
     }
     freshell_runtime_protocol::validate_provider_secrets(provider, secret_references)
         .map_err(|error| error.message)?;
+    if let Some(inputs) = context.and_then(|context| context.prepared_inputs.as_ref()) {
+        inputs
+            .validate_references(secret_references)
+            .map_err(|error| error.message)?;
+    }
     let workspace = canonical_dir(Path::new(workspace_path), "workspace")?;
     if workspace != Path::new(workspace_path) {
         return Err("workspace path must already be canonical".into());
