@@ -30,6 +30,9 @@ pub fn exact_resume_candidate(
         return Ok(None);
     };
 
+    // The saved launch/receipt stays immutable. A new read belongs to the
+    // current registry evidence generation, including after import refresh.
+    spec.evidence_revision = context.evidence_revision;
     let baseline = match context.opencode_adoption_baseline.clone() {
         Some(baseline) => Some(baseline),
         None => match spec.opencode_adoption_baseline.clone() {
@@ -152,6 +155,9 @@ fn exact_resume_candidate_base(
         .or(context.native_session_id.as_deref())
         .map(str::to_string);
     let Some(native_session_id) = native_session_id else {
+        if context.provider != "shell" && !context.never_dispatched {
+            return Err(freshell_agent_runtime::unverified_native_probe());
+        }
         return Ok(None);
     };
 
@@ -683,6 +689,51 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn dispatched_missing_identity_has_no_exact_candidate() {
+        let mut context = fixture_context(None);
+        context.never_dispatched = false;
+        assert!(matches!(
+            exact_resume_candidate(&context, None),
+            Err(RecoveryProbe::Blocked {
+                reason: RecoveryBlockReason::StoreUnreadable,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn offline_saved_spec_must_still_match_current_identity() {
+        let mut context = fixture_context(Some("expected"));
+        let mut spec = exact_resume_candidate(&context, None).unwrap().unwrap();
+        spec.provider_session.native_session_id = "conflicting".into();
+        context.resume_spec = Some(spec);
+        assert!(matches!(
+            crate::recovery::offline_probe(&context).unwrap(),
+            RecoveryProbe::Blocked {
+                reason: RecoveryBlockReason::WrongNativeIdentity,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn saved_candidate_is_inspected_at_the_current_evidence_revision() {
+        let mut context = fixture_context(Some("expected"));
+        let saved = exact_resume_candidate(&context, None).unwrap().unwrap();
+        context.resume_spec = Some(saved.clone());
+        context.evidence_revision += 1;
+        let candidate = exact_resume_candidate(&context, None).unwrap().unwrap();
+        assert_eq!(candidate.evidence_revision, context.evidence_revision);
+        assert_eq!(candidate.provider_session, saved.provider_session);
+        assert_eq!(candidate.resume_argv, saved.resume_argv);
+        assert_eq!(
+            candidate.opencode_adoption_baseline,
+            saved.opencode_adoption_baseline
+        );
+        assert_eq!(context.resume_spec, Some(saved));
     }
 
     #[test]

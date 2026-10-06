@@ -12,6 +12,58 @@ use rusqlite::{params, Connection};
 use std::collections::BTreeSet;
 
 fn evidence(context: Option<&RecoveryContext>) -> Vec<RecoveryPathEvidence> {
+    let native_evidence = context
+        .and_then(|context| context.native_session_id.as_deref().map(|id| (context, id)))
+        .map(|(context, native_id)| {
+            let directory = tempfile::tempdir().unwrap();
+            let database = directory.path().join(".local/share/opencode/opencode.db");
+            fs::create_dir_all(database.parent().unwrap()).unwrap();
+            let connection = crate::registry::tests::native_inventory_fixture(&database);
+            connection.execute("INSERT INTO project(id,worktree,time_created,time_updated,sandboxes) VALUES ('prj','/synthetic',1,1,'[]')", []).unwrap();
+            connection.execute("INSERT INTO session(id,slug,project_id,directory,title,version,time_created,time_updated) VALUES ('unrelated-exact-root','slug','prj','/synthetic','synthetic','1.18.21',1,1)", []).unwrap();
+            let terminal = serde_json::from_value(serde_json::json!({
+                "terminalId":"absent-store", "streamId":"absent-store", "mode":context.provider,
+                "program":context.provider, "cwd":"/workspace", "workspacePath":"/workspace",
+                "env":{"HOME":"/home/freshell/provider"},
+                "runAsUid":65534, "runAsGid":0, "cols":80, "rows":24, "projectKey":"test"
+            }))
+            .unwrap();
+            let spec = freshell_agent_runtime::build_resume_spec(
+                freshell_agent_runtime::ResumeSpecInput {
+                    provider: &context.provider,
+                    provider_store_id: &context.provider_store_id,
+                    native_session_id: native_id,
+                    terminal: &terminal,
+                    provider_version: None,
+                    creation_seed_ref: context.creation_seed_ref.clone(),
+                    checkpoint_revision: 0,
+                    evidence_revision: context.evidence_revision,
+                    never_dispatched: false,
+                },
+            )
+            .unwrap();
+            match freshell_agent_runtime::probe_provider_store(directory.path(), &spec) {
+                freshell_agent_runtime::ProviderStoreProbe::DefinitivelyUnavailable {
+                    reason,
+                    evidence,
+                    store_state,
+                } => RecoveryPathEvidence {
+                    path: RecoveryPath::NativeResume,
+                    verdict: RecoveryEvidenceVerdict::DefinitiveNegative,
+                    reason_code: reason,
+                    evidence_refs: evidence,
+                    store_state,
+                },
+                other => panic!("expected complete exact-row absent census: {other:?}"),
+            }
+        })
+        .unwrap_or_else(|| RecoveryPathEvidence {
+            path: RecoveryPath::NativeResume,
+            verdict: RecoveryEvidenceVerdict::DefinitiveNegative,
+            reason_code: "uninspected_fixture_negative".into(),
+            evidence_refs: vec!["provider://missing".into()],
+            store_state: EvidenceStoreState::Missing,
+        });
     let (native_import_state, complete_inventory) = context
         .map(|context| {
             (
@@ -51,13 +103,7 @@ fn evidence(context: Option<&RecoveryContext>) -> Vec<RecoveryPathEvidence> {
             evidence_refs: vec!["backend://missing".into()],
             store_state: EvidenceStoreState::NotApplicable,
         },
-        RecoveryPathEvidence {
-            path: RecoveryPath::NativeResume,
-            verdict: RecoveryEvidenceVerdict::DefinitiveNegative,
-            reason_code: "provider_store_missing".into(),
-            evidence_refs: vec!["provider://missing".into()],
-            store_state: EvidenceStoreState::Missing,
-        },
+        native_evidence,
         RecoveryPathEvidence {
             path: RecoveryPath::CheckpointRestore,
             verdict: RecoveryEvidenceVerdict::DefinitiveNegative,
@@ -209,6 +255,245 @@ fn cleanup(prepared: &PreparedLoss) -> LossCleanupReport {
         verified_at: Some("2026-09-09T00:00:01.000Z".into()),
         foreign_objects_touched: 0,
     }
+}
+
+#[tokio::test]
+async fn dispatched_missing_identity_cannot_certify_loss() {
+    for (provider, mode) in [
+        ("claude", "claude"),
+        ("codex", "codex"),
+        ("opencode", "opencode"),
+        ("amplifier", "amplifier"),
+        ("claude", "freshclaude"),
+        ("claude", "kilroy"),
+        ("codex", "freshcodex"),
+        ("opencode", "freshopencode"),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let (registry, original) = prepared_context(dir.path()).await;
+        let conn = Connection::open(registry.database_path()).unwrap();
+        conn.execute(
+            "UPDATE souls SET provider=?1,native_session_id=NULL WHERE soul_id=?2",
+            params![provider, original.soul_id.as_str()],
+        )
+        .unwrap();
+        let launch = if mode.starts_with("fresh") || mode == "kilroy" {
+            serde_json::json!({"sessionId":"presentation", "provider":provider,
+                "sessionType":mode, "runtimeVariant":mode, "providerStoreId":original.provider_store_id,
+                "cwd":"/workspace", "workspacePath":"/workspace", "runAsUid":65534, "runAsGid":0})
+        } else {
+            serde_json::json!({"terminalId":"retained", "streamId":"retained", "mode":mode,
+                "program":mode, "cwd":"/workspace", "workspacePath":"/workspace",
+                "env":{"HOME":"/home/freshell/provider"}, "runAsUid":65534, "runAsGid":0,
+                "cols":80, "rows":24, "projectKey":"test"})
+        };
+        let column = if mode.starts_with("fresh") || mode == "kilroy" {
+            "fresh_agent_spec"
+        } else {
+            "terminal_spec"
+        };
+        conn.execute(
+            &format!("UPDATE incarnations SET {column}=?1 WHERE incarnation_id=?2"),
+            params![
+                launch.to_string(),
+                original.prior_handle.incarnation_id().as_str()
+            ],
+        )
+        .unwrap();
+        conn.execute("INSERT INTO input_commands (soul_id,request_id,payload_digest,protected_payload,incarnation_id,state,created_at,updated_at) VALUES (?1,'dispatched','test',X'00',?2,'completed',1,1)", params![original.soul_id.as_str(),original.prior_handle.incarnation_id().as_str()]).unwrap();
+        let context = registry
+            .recovery_context(original.soul_id.clone())
+            .await
+            .unwrap();
+        assert!(!context.never_dispatched);
+        let volume = context.prior_handle.provider_volume_name().to_string();
+        let output = dir.path().join("retained-output");
+        fs::write(&output, "existing output").unwrap();
+        let supervisor = crate::recovery::tests::missing_supervisor(&dir, registry.clone());
+        for _ in 0..3 {
+            let offline = crate::recovery::offline_probe(&context).unwrap();
+            assert!(
+                matches!(
+                    offline,
+                    freshell_runtime_protocol::RecoveryProbe::Blocked {
+                        reason: RecoveryBlockReason::StoreUnreadable,
+                        ..
+                    }
+                ),
+                "{mode}: {offline:?}"
+            );
+            let online = supervisor
+                .probe_recovery(context.soul_id.clone())
+                .await
+                .unwrap();
+            assert!(
+                matches!(
+                    online,
+                    freshell_runtime_protocol::RecoveryProbe::Blocked { .. }
+                ),
+                "{mode}: {online:?}"
+            );
+            assert!(supervisor
+                .collect_loss_path_evidence(&context, &offline)
+                .await
+                .is_err());
+        }
+        assert!(
+            decision_for(&registry, &context).is_err(),
+            "{mode}: final certificate must independently refuse missing identity"
+        );
+        let result = supervisor
+            .recover(freshell_runtime_protocol::RecoverRequest {
+                soul_id: context.soul_id.clone(),
+                trigger: freshell_runtime_protocol::RecoveryTrigger::StartupReconcile,
+                expected_intent_revision: Some(context.intent_revision),
+                expected_control_epoch: None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            result.outcome,
+            freshell_runtime_protocol::RecoveryOutcome::Blocked
+        );
+        assert!(result.incident_id.is_none());
+        let final_result = crate::recovery::tests::revalidate_previously_negative_loss(
+            &supervisor,
+            context.soul_id.clone(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            final_result.outcome,
+            freshell_runtime_protocol::RecoveryOutcome::Blocked
+        );
+        assert!(final_result.incident_id.is_none());
+        let launch_state: String = conn
+            .query_row(
+                "SELECT launch_state FROM incarnations WHERE incarnation_id=?1",
+                [context.prior_handle.incarnation_id().as_str()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            launch_state, "running",
+            "no loss tombstone or process cleanup"
+        );
+        for table in ["loss_incidents", "recovery_attempts"] {
+            let count: i64 = conn
+                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            assert_eq!(count, 0, "{mode}: {table}");
+        }
+        let loss_exports: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM outbox WHERE event_kind LIKE 'loss_incident.%'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(loss_exports, 0);
+        assert_eq!(fs::read_to_string(output).unwrap(), "existing output");
+        assert_eq!(
+            registry
+                .recovery_context(context.soul_id)
+                .await
+                .unwrap()
+                .prior_handle
+                .provider_volume_name(),
+            volume
+        );
+    }
+}
+
+#[tokio::test]
+async fn loss_report_rejects_uninspected_native_negative_even_with_identity() {
+    let dir = tempfile::tempdir().unwrap();
+    let (registry, context) = prepared_context(dir.path()).await;
+    let mut rows = evidence(Some(&context));
+    rows.iter_mut()
+        .find(|row| row.path == RecoveryPath::NativeResume)
+        .unwrap()
+        .evidence_refs = vec!["nativeResume=definitively_unavailable".into()];
+    let mut input = LossDecisionInput {
+        installation_id: registry.installation_id(),
+        context: &context,
+        cleanup_handle: &context.prior_handle,
+        path_evidence: rows,
+        builds: decision_for(&registry, &context)
+            .unwrap()
+            .certificate
+            .builds,
+        timeline: Vec::new(),
+        analysis: IncidentAnalysis {
+            observed_cause: "uninspected".into(),
+            missing_invariant: "inspection".into(),
+            hypotheses: Vec::new(),
+            preventive_action: "inspect".into(),
+            regression_case: "uninspected".into(),
+        },
+        created_at: None,
+    };
+    assert!(LostDecision::try_new(input.clone()).is_err());
+    input.path_evidence = evidence(Some(&context));
+    assert!(
+        LostDecision::try_new(input).is_ok(),
+        "qualified exact absence must remain certifiable"
+    );
+}
+
+#[tokio::test]
+async fn historical_uninspected_loss_cannot_resume_cleanup() {
+    let dir = tempfile::tempdir().unwrap();
+    let (registry, prepared, _) = prepared_loss_with_decision(dir.path()).await;
+    let mut certificate = prepared.certificate.clone();
+    certificate
+        .recovery_paths
+        .iter_mut()
+        .find(|row| row.path == RecoveryPath::NativeResume)
+        .unwrap()
+        .evidence_refs = vec!["nativeResume=definitively_unavailable".into()];
+    let encoded = serde_json::to_string(&certificate).unwrap();
+    let conn = Connection::open(registry.database_path()).unwrap();
+    conn.execute(
+        "UPDATE loss_incidents SET certificate_json=?1 WHERE incident_id=?2",
+        params![encoded, certificate.incident_id.as_str()],
+    )
+    .unwrap();
+    let retained = dir.path().join("retained-output");
+    fs::write(&retained, "existing output").unwrap();
+    let supervisor = crate::recovery::tests::missing_supervisor(&dir, registry.clone());
+    supervisor.reconcile_pending_loss_cleanup().await.unwrap();
+    let (actual, state): (String, String) = conn
+        .query_row(
+            "SELECT certificate_json,cleanup_state FROM loss_incidents WHERE incident_id=?1",
+            [certificate.incident_id.as_str()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(actual, encoded, "historical evidence remains immutable");
+    assert_eq!(
+        state, "cleanup_pending",
+        "unsupported loss cannot continue destructive cleanup"
+    );
+    assert!(
+        registry
+            .finalize_loss_cleanup(
+                certificate.incident_id.clone(),
+                StopOutcome::VerifiedEmpty,
+                cleanup(&prepared)
+            )
+            .await
+            .is_err(),
+        "final cleanup CAS must also refuse historical unsupported certification"
+    );
+    assert_eq!(fs::read_to_string(retained).unwrap(), "existing output");
+    let events = fs::read_to_string(dir.path().join("lifecycle.jsonl")).unwrap();
+    assert!(events
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .any(|event| event["event"] == "supervisor.loss.historical_certification_blocked"));
 }
 
 #[test]

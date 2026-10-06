@@ -6763,7 +6763,44 @@ pub(crate) mod tests {
         );
 
         let supervisor = crate::recovery::tests::missing_supervisor(&dir, registry.clone());
-        let negative = crate::recovery::tests::absent_native_probe();
+        let negative_for = |context: &RecoveryContext| {
+            let provider_home = tempfile::tempdir().unwrap();
+            let terminal = serde_json::from_value(serde_json::json!({
+                "terminalId":"native-census", "streamId":"native-census", "mode":"opencode",
+                "program":"opencode", "cwd":"/workspace", "workspacePath":"/workspace",
+                "env":{"HOME":"/home/freshell/provider"}, "runAsUid":65534, "runAsGid":0,
+                "cols":80, "rows":24, "projectKey":"test"
+            }))
+            .unwrap();
+            let spec = freshell_agent_runtime::build_resume_spec(
+                freshell_agent_runtime::ResumeSpecInput {
+                    provider: &context.provider,
+                    provider_store_id: &context.provider_store_id,
+                    native_session_id: context.native_session_id.as_deref().unwrap(),
+                    terminal: &terminal,
+                    provider_version: None,
+                    creation_seed_ref: context.creation_seed_ref.clone(),
+                    checkpoint_revision: 0,
+                    evidence_revision: context.evidence_revision,
+                    never_dispatched: false,
+                },
+            )
+            .unwrap();
+            match freshell_agent_runtime::probe_provider_store(provider_home.path(), &spec) {
+                freshell_agent_runtime::ProviderStoreProbe::DefinitivelyUnavailable {
+                    reason,
+                    evidence,
+                    store_state,
+                } => freshell_runtime_protocol::RecoveryProbe::DefinitivelyUnavailable {
+                    path: RecoveryPath::NativeResume,
+                    reason,
+                    evidence,
+                    store_state,
+                },
+                other => panic!("expected actual complete absent store census: {other:?}"),
+            }
+        };
+        let negative = negative_for(&absent);
         let paths = supervisor
             .collect_loss_path_evidence(&absent, &negative)
             .await
@@ -6784,7 +6821,7 @@ pub(crate) mod tests {
         assert!(!available.native_import_absence_is_authoritative());
         assert!(matches!(
             supervisor
-                .collect_loss_path_evidence(&available, &negative)
+                .collect_loss_path_evidence(&available, &negative_for(&available))
                 .await,
             Err(freshell_runtime_protocol::RecoveryProbe::Blocked {
                 path: RecoveryPath::NativeImport,

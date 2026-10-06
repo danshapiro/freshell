@@ -12,7 +12,7 @@ use freshell_runtime_protocol::{
     GrantId, HostBootId, HostCommand, HostReply, HostResult, IncarnationId,
     OpenCodeAdoptionBaseline, OpenCodeAdoptionExpectation, OpenCodeAdoptionStatus,
     OpenCodeTransferDescriptor, OpenCodeTransferReadinessReceipt, OpenCodeVerifiedRootTail,
-    ProviderBootstrapFile, RecoveryPath, RecoveryProbe, ResumeSpec, RuntimeError, RuntimeErrorCode,
+    ProviderBootstrapFile, RecoveryProbe, ResumeSpec, RuntimeError, RuntimeErrorCode,
     RuntimeLimits, RuntimeMetrics, SoulId, TerminalLaunchSpec, CONTROL_PROTOCOL_VERSION,
     MAX_OPENCODE_TRANSFER_MANIFEST_BYTES,
 };
@@ -988,12 +988,7 @@ async fn dispatch_with_effects(
                                 state.incarnation_id
                             ),
                         },
-                        None => RecoveryProbe::DefinitivelyUnavailable {
-                            path: RecoveryPath::NativeResume,
-                            reason: "no durable native identity or checkpoint is recorded".into(),
-                            evidence: vec![state.state_dir.display().to_string()],
-                            store_state: freshell_runtime_protocol::EvidenceStoreState::Missing,
-                        },
+                        None => freshell_agent_runtime::unverified_native_probe(),
                     };
                     Ok(HostResult::RecoveryProbe(probe))
                 }
@@ -6044,6 +6039,45 @@ mod tests {
         std::fs::write(dir.join("host.sock"), b"").unwrap();
         let value = security_probe(&dir);
         assert_eq!(value["ownSocketVisible"], true);
+    }
+
+    #[tokio::test]
+    async fn dispatched_missing_identity_probe_preserves_host_state() {
+        let state = test_host_state();
+        let retained = state.state_dir.join("retained-output");
+        std::fs::write(&retained, "existing output").unwrap();
+        let result = dispatch(
+            authenticated_host_envelope(
+                &state,
+                HostCommand::ProbeRecovery {
+                    incarnation_id: state.incarnation_id.clone(),
+                    resume_spec: None,
+                    creation_seed_ref: "retained-seed".into(),
+                    never_dispatched: false,
+                    run_as_uid: 65534,
+                    run_as_gid: 0,
+                },
+            ),
+            &state,
+        )
+        .await
+        .unwrap();
+        assert!(
+            matches!(
+                result,
+                HostResult::RecoveryProbe(RecoveryProbe::Blocked {
+                    reason: freshell_runtime_protocol::RecoveryBlockReason::StoreUnreadable,
+                    ..
+                })
+            ),
+            "{result:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(retained).unwrap(),
+            "existing output"
+        );
+        assert!(state.pty.lock().await.is_none());
+        assert!(state.fresh_agent.lock().await.is_none());
     }
 
     fn test_host_state() -> Arc<HostState> {
