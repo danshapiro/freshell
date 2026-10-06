@@ -512,7 +512,8 @@
                   "recovering",
                   "blocked",
                   "lost",
-                  "stopped"
+                  "stopped",
+                  "data_repair_complete"
                 ],
                 "type": "string"
               },
@@ -1220,7 +1221,8 @@
                 "recovering",
                 "blocked",
                 "lost",
-                "stopped"
+                "stopped",
+                "data_repair_complete"
               ],
               "type": "string"
             }
@@ -1482,7 +1484,8 @@
         "recovering",
         "blocked",
         "lost",
-        "stopped"
+        "stopped",
+        "data_repair_complete"
       ],
       "type": "string"
     },
@@ -1533,7 +1536,8 @@
             "recovering",
             "blocked",
             "lost",
-            "stopped"
+            "stopped",
+            "data_repair_complete"
           ],
           "type": "string"
         }
@@ -2084,7 +2088,8 @@
                 "recovering",
                 "blocked",
                 "lost",
-                "stopped"
+                "stopped",
+                "data_repair_complete"
               ],
               "type": "string"
             },
@@ -2431,7 +2436,8 @@
             "recovering",
             "blocked",
             "lost",
-            "stopped"
+            "stopped",
+            "data_repair_complete"
           ],
           "type": "string"
         },
@@ -2750,7 +2756,8 @@
                 "recovering",
                 "blocked",
                 "lost",
-                "stopped"
+                "stopped",
+                "data_repair_complete"
               ],
               "type": "string"
             },

@@ -26,6 +26,7 @@ export const ManagedRuntimeRecoveryStateSchema = z.enum([
   'blocked',
   'lost',
   'stopped',
+  'data_repair_complete',
 ])
 export const ManagedRuntimeDurabilityStateSchema = z.enum([
   'unknown',

@@ -174,7 +174,7 @@ fn opencode_adoption_revalidator(
             .get("HOME")
             .map(PathBuf::from)
             .ok_or("OpenCode provider home is unavailable")?;
-        let paths = validate_opencode_reader_paths_at(
+        let paths = plan_opencode_reader_paths_at(
             &terminal.env,
             Path::new(&terminal.workspace_path),
             Path::new(&terminal.cwd),
@@ -1269,10 +1269,13 @@ async fn grant_execution(
         ));
     }
 
-    if terminal
+    let needs_opencode_adoption = terminal
         .as_ref()
         .is_some_and(|terminal| terminal.opencode_transfer.is_some())
-    {
+        || resume_spec
+            .as_ref()
+            .is_some_and(|resume| resume.opencode_adoption_baseline.is_some());
+    if needs_opencode_adoption {
         let durable_readiness_receipt = persisted.opencode_transfer_receipt.clone();
         drop(persisted);
         let mut preflight_terminal = match (terminal.as_ref(), resume_spec.as_ref()) {
@@ -1853,6 +1856,36 @@ fn validate_opencode_reader_paths_at(
     expected_cwd: &Path,
     provider_home: &Path,
 ) -> Result<OpencodeReaderPaths, String> {
+    let paths = plan_opencode_reader_paths_at(env, workspace_root, expected_cwd, provider_home)?;
+    for path in [
+        &paths.home,
+        &paths.xdg_data_home,
+        &paths.xdg_config_home,
+        &paths.database,
+    ] {
+        reject_symlink_components(path)?;
+    }
+    Ok(paths)
+}
+
+/// Construct the provider paths needed by the host to invoke an identity
+/// helper. This deliberately does not traverse the provider home: after
+/// ownership handoff it is mode 0700 for the provider UID, while the host has
+/// no DAC override capability. The helper calls
+/// `validate_opencode_reader_paths_at` as that UID before accessing any path.
+fn plan_opencode_reader_paths_at(
+    env: &std::collections::BTreeMap<String, String>,
+    workspace_root: &Path,
+    expected_cwd: &Path,
+    provider_home: &Path,
+) -> Result<OpencodeReaderPaths, String> {
+    if !provider_home.is_absolute()
+        || provider_home
+            .components()
+            .any(|component| matches!(component, std::path::Component::ParentDir))
+    {
+        return Err("OpenCode provider HOME must be an absolute normalized path".into());
+    }
     let xdg_data_home = provider_home.join(".local/share");
     let xdg_config_home = provider_home.join(".config");
     let database = xdg_data_home.join("opencode/opencode.db");
@@ -1884,14 +1917,6 @@ fn validate_opencode_reader_paths_at(
         workspace,
         cwd,
     };
-    for path in [
-        &paths.home,
-        &paths.xdg_data_home,
-        &paths.xdg_config_home,
-        &paths.database,
-    ] {
-        reject_symlink_components(path)?;
-    }
     Ok(paths)
 }
 
@@ -2029,7 +2054,7 @@ fn run_opencode_current_evidence_worker(args: &[String]) -> Result<(), String> {
         &paths.database,
         &paths.workspace,
     )
-    .map_err(|_| "provider-identity OpenCode evidence verification failed".to_string())?;
+    .map_err(|error| format!("provider-identity OpenCode evidence verification failed: {error}"))?;
     write_opencode_helper_result(&evidence)
 }
 
@@ -2156,12 +2181,35 @@ fn prepare_opencode_adoption_expectation(
     readiness_receipt: Option<&OpenCodeTransferReadinessReceipt>,
     effects: &dyn GrantExecutionEffects,
 ) -> Result<(), RuntimeError> {
-    let descriptor = terminal.opencode_transfer.as_ref().ok_or_else(|| {
-        RuntimeError::new(
-            RuntimeErrorCode::InvalidRequest,
-            "OpenCode adoption has no transfer baseline",
-        )
-    })?;
+    let baseline = match resume_spec.and_then(|resume| resume.opencode_adoption_baseline.as_ref()) {
+        Some(baseline) => {
+            baseline.validate()?;
+            if terminal
+                .opencode_transfer
+                .as_ref()
+                .is_some_and(|descriptor| descriptor != &baseline.descriptor)
+            {
+                return Err(RuntimeError::new(
+                    RuntimeErrorCode::OwnershipMismatch,
+                    "OpenCode terminal and resume baselines disagree",
+                ));
+            }
+            baseline.clone()
+        }
+        None => {
+            let descriptor = terminal.opencode_transfer.as_ref().ok_or_else(|| {
+                RuntimeError::new(
+                    RuntimeErrorCode::InvalidRequest,
+                    "OpenCode adoption has no transfer baseline",
+                )
+            })?;
+            freshell_runtime_protocol::OpenCodeAdoptionBaseline {
+                descriptor: descriptor.clone(),
+                manifest_sha256: sha256_hex(descriptor.manifest_json.as_bytes()),
+            }
+        }
+    };
+    let descriptor = &baseline.descriptor;
     descriptor.validate()?;
     if terminal.mode != "opencode"
         || descriptor.provider != "opencode"
@@ -2199,7 +2247,7 @@ fn prepare_opencode_adoption_expectation(
         ));
     }
 
-    let paths = validate_opencode_reader_paths_at(
+    let paths = plan_opencode_reader_paths_at(
         &terminal.env,
         Path::new(&terminal.workspace_path),
         Path::new(&terminal.cwd),
@@ -2254,12 +2302,8 @@ fn prepare_opencode_adoption_expectation(
             OpenCodeVerifiedRootTail::QualifiedEmpty
         }
     };
-    let baseline = OpenCodeAdoptionBaseline {
-        descriptor: descriptor.clone(),
-        manifest_sha256: sha256_hex(descriptor.manifest_json.as_bytes()),
-    };
     let expectation = OpenCodeAdoptionExpectation {
-        baseline,
+        baseline: baseline.clone(),
         root_session_id: evidence.root_session_id,
         root_tail,
         evidence_generation: evidence.evidence_generation,
@@ -2341,7 +2385,7 @@ fn perform_opencode_transfer_phase(
             {
                 return Err("OpenCode transfer identity does not match this launch".into());
             }
-            let paths = validate_opencode_reader_paths_at(
+            let paths = plan_opencode_reader_paths_at(
                 &terminal.env,
                 Path::new(&terminal.workspace_path),
                 Path::new(&terminal.cwd),
@@ -2539,7 +2583,7 @@ fn revalidate_opencode_transfer_receipts(
     {
         return Err("OpenCode transfer identity does not match this launch".into());
     }
-    let paths = validate_opencode_reader_paths_at(
+    let paths = plan_opencode_reader_paths_at(
         &terminal.env,
         Path::new(&terminal.workspace_path),
         Path::new(&terminal.cwd),
@@ -2644,10 +2688,13 @@ fn run_opencode_provider_helper(
     worker: &str,
     payload_path: Option<&Path>,
 ) -> Result<Vec<u8>, String> {
+    let process_context = ProviderProcessContext {
+        environment: &terminal.env,
+        uid: terminal.run_as_uid,
+        gid: terminal.run_as_gid,
+    };
     run_opencode_provider_helper_with_env(
-        &terminal.env,
-        terminal.run_as_uid,
-        terminal.run_as_gid,
+        &process_context,
         descriptor,
         workspace_root,
         cwd,
@@ -2656,10 +2703,14 @@ fn run_opencode_provider_helper(
     )
 }
 
+struct ProviderProcessContext<'a> {
+    environment: &'a std::collections::BTreeMap<String, String>,
+    uid: u32,
+    gid: u32,
+}
+
 fn run_opencode_provider_helper_with_env(
-    provider_env: &std::collections::BTreeMap<String, String>,
-    provider_uid: u32,
-    provider_gid: u32,
+    process_context: &ProviderProcessContext<'_>,
     descriptor: &OpenCodeTransferDescriptor,
     workspace_root: &Path,
     cwd: &Path,
@@ -2669,7 +2720,10 @@ fn run_opencode_provider_helper_with_env(
     let executable = std::env::current_exe().map_err(|error| error.to_string())?;
     let mut command = std::process::Command::new("/usr/bin/setpriv");
     command
-        .args(provider_identity_args(provider_uid, provider_gid))
+        .args(provider_identity_args(
+            process_context.uid,
+            process_context.gid,
+        ))
         .arg(executable)
         .arg(worker)
         .arg("--workspace-root")
@@ -2677,15 +2731,15 @@ fn run_opencode_provider_helper_with_env(
         .arg("--expected-cwd")
         .arg(cwd)
         .arg("--provider-uid")
-        .arg(provider_uid.to_string())
+        .arg(process_context.uid.to_string())
         .arg("--provider-gid")
-        .arg(provider_gid.to_string())
+        .arg(process_context.gid.to_string())
         .current_dir(cwd)
         .env_clear()
-        .envs(provider_env)
+        .envs(process_context.environment)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null());
+        .stderr(Stdio::piped());
     let mut child = command
         .spawn()
         .map_err(|_| "could not start the provider-identity OpenCode helper".to_string())?;
@@ -2714,9 +2768,19 @@ fn run_opencode_provider_helper_with_env(
         .map_err(|_| "OpenCode provider helper did not settle")?;
     write_result?;
     if !output.status.success() {
+        let detail = String::from_utf8_lossy(&output.stderr)
+            .trim()
+            .chars()
+            .take(512)
+            .collect::<String>();
         return Err(format!(
-            "provider-identity OpenCode helper exited with status {}",
-            output.status
+            "provider-identity OpenCode helper exited with status {}{}",
+            output.status,
+            if detail.is_empty() {
+                String::new()
+            } else {
+                format!(": {detail}")
+            }
         ));
     }
     if output.stdout.len() > MAX_OPENCODE_RECEIPT_BYTES {
@@ -2778,7 +2842,12 @@ fn run_opencode_stopped_repair_worker(args: &[String]) -> Result<(), String> {
         freshell_agent_runtime::opencode_transfer::verify_staged_bundle(&descriptor, &stage_dir)
             .map_err(|_| "OpenCode repair stage does not match its descriptor")?;
     let provider_env = std::env::vars().collect::<std::collections::BTreeMap<_, _>>();
-    let paths = validate_opencode_reader_paths(&provider_env, &workspace, &cwd)?;
+    let paths = plan_opencode_reader_paths_at(
+        &provider_env,
+        &workspace,
+        &cwd,
+        Path::new(OPENCODE_PROVIDER_HOME),
+    )?;
     if std::env::current_dir().map_err(|_| "repair helper working directory is unavailable")?
         != paths.cwd
     {
@@ -2786,9 +2855,11 @@ fn run_opencode_stopped_repair_worker(args: &[String]) -> Result<(), String> {
     }
 
     let import_output = run_opencode_provider_helper_with_env(
-        &provider_env,
-        uid,
-        gid,
+        &ProviderProcessContext {
+            environment: &provider_env,
+            uid,
+            gid,
+        },
         &descriptor,
         &paths.workspace,
         &paths.cwd,
@@ -2801,9 +2872,11 @@ fn run_opencode_stopped_repair_worker(args: &[String]) -> Result<(), String> {
     validate_import_receipt_binding(&imported, &descriptor, &paths)?;
 
     let reader_output = run_opencode_provider_helper_with_env(
-        &provider_env,
-        uid,
-        gid,
+        &ProviderProcessContext {
+            environment: &provider_env,
+            uid,
+            gid,
+        },
         &descriptor,
         &paths.workspace,
         &paths.cwd,
@@ -12308,6 +12381,7 @@ mod tests {
             mode: "opencode".into(),
             runtime_variant: "managed_terminal_pty".into(),
             fixture_transport: None,
+            opencode_adoption_baseline: None,
             program: launcher.to_string_lossy().into_owned(),
             resume_argv: vec!["--continue".into(), "--model".into(), "free-model".into()],
             provider_home: "/home/freshell/provider".into(),
@@ -12453,6 +12527,54 @@ mod tests {
             "/home/freshell/provider/.local/share/opencode/opencode.db".into(),
         );
         assert!(validate_opencode_reader_paths(&env, &workspace, &outside).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn host_can_plan_provider_paths_without_traversing_the_private_provider_home() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempfile::tempdir().unwrap();
+        let workspace = root.path().join("workspace");
+        let private_home = root.path().join("provider-home");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir(&private_home).unwrap();
+        std::fs::set_permissions(&private_home, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let env = std::collections::BTreeMap::from([
+            ("HOME".into(), private_home.to_string_lossy().into_owned()),
+            (
+                "XDG_DATA_HOME".into(),
+                private_home
+                    .join(".local/share")
+                    .to_string_lossy()
+                    .into_owned(),
+            ),
+            (
+                "XDG_CONFIG_HOME".into(),
+                private_home.join(".config").to_string_lossy().into_owned(),
+            ),
+            (
+                "OPENCODE_DB".into(),
+                private_home
+                    .join(".local/share/opencode/opencode.db")
+                    .to_string_lossy()
+                    .into_owned(),
+            ),
+        ]);
+
+        let planned = plan_opencode_reader_paths_at(&env, &workspace, &workspace, &private_home);
+        let strict_check =
+            validate_opencode_reader_paths_at(&env, &workspace, &workspace, &private_home);
+        std::fs::set_permissions(&private_home, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        assert!(
+            planned.is_ok(),
+            "host path planning must not inspect provider-owned paths"
+        );
+        assert!(
+            strict_check.is_err(),
+            "the provider-identity helper performs the strict check"
+        );
     }
 
     #[cfg(unix)]
@@ -12645,7 +12767,9 @@ mod tests {
             .is_err()
         );
 
-        let resumed = run_synthetic_exact_resume(&success, None).await.unwrap();
+        let resumed = run_synthetic_exact_resume(&success, None, false)
+            .await
+            .unwrap();
         assert!(matches!(
             &resumed.result,
             Ok(HostResult::GrantAccepted {
@@ -12681,13 +12805,86 @@ mod tests {
             .expect("exact resume must preserve the original import readiness receipt");
         assert_eq!(preserved, receipt);
 
+        let resumed_from_repaired_legacy = run_synthetic_exact_resume(&success, None, true)
+            .await
+            .unwrap();
+        assert!(
+            matches!(
+                &resumed_from_repaired_legacy.result,
+                Ok(HostResult::GrantAccepted {
+                    worker_launch_count: 1,
+                    ..
+                })
+            ),
+            "baseline-only repaired resume failed: {:#?}",
+            resumed_from_repaired_legacy.result
+        );
+        assert_eq!(
+            *resumed_from_repaired_legacy.events.lock().unwrap(),
+            ["current", "pty"],
+            "repaired legacy resume verifies the installed store without import or staging"
+        );
+        assert!(resumed_from_repaired_legacy
+            .pty_callback_invoked
+            .load(std::sync::atomic::Ordering::SeqCst));
+        let repaired_adoption = resumed_from_repaired_legacy
+            .adoption_expectation
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("repaired legacy resume must receive a fresh TUI adoption gate");
+        assert_eq!(
+            repaired_adoption.incarnation_id,
+            resumed_from_repaired_legacy.state.incarnation_id
+        );
+        assert_ne!(repaired_adoption.launch_nonce, adoption.launch_nonce);
+
+        for failure in [
+            SyntheticTransferFailure::CurrentEvidenceRead,
+            SyntheticTransferFailure::CurrentEvidenceMismatch,
+            SyntheticTransferFailure::CurrentEvidenceGenerationMismatch,
+            SyntheticTransferFailure::ReadinessIdentityMismatch,
+            SyntheticTransferFailure::SavedBaselineMismatch,
+        ] {
+            let blocked = run_synthetic_exact_resume(&success, Some(failure), true)
+                .await
+                .unwrap();
+            assert!(
+                blocked.result.is_err(),
+                "baseline-only {failure:?} must block"
+            );
+            assert!(blocked
+                .state
+                .persisted
+                .try_lock()
+                .expect("blocked baseline-only resume released persisted state")
+                .grant_id
+                .is_none());
+            assert!(
+                !blocked
+                    .pty_callback_invoked
+                    .load(std::sync::atomic::Ordering::SeqCst),
+                "baseline-only failures must stop before PTY spawn"
+            );
+            assert!(!blocked.events.lock().unwrap().contains(&"pty"));
+            if matches!(
+                failure,
+                SyntheticTransferFailure::ReadinessIdentityMismatch
+                    | SyntheticTransferFailure::SavedBaselineMismatch
+            ) {
+                assert!(blocked.events.lock().unwrap().is_empty());
+            } else {
+                assert!(blocked.events.lock().unwrap().contains(&"current"));
+            }
+        }
+
         for failure in [
             SyntheticTransferFailure::CurrentEvidenceRead,
             SyntheticTransferFailure::CurrentEvidenceMismatch,
             SyntheticTransferFailure::CurrentEvidenceGenerationMismatch,
             SyntheticTransferFailure::ReadinessIdentityMismatch,
         ] {
-            let blocked = run_synthetic_exact_resume(&success, Some(failure))
+            let blocked = run_synthetic_exact_resume(&success, Some(failure), false)
                 .await
                 .unwrap();
             assert!(blocked.result.is_err());
@@ -12723,7 +12920,7 @@ mod tests {
         assert!(reject_symlink_components(&real.join(".local/share/opencode/opencode.db")).is_ok());
     }
 
-    #[derive(Clone, Copy, PartialEq, Eq)]
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     enum SyntheticTransferFailure {
         Mount,
         Import,
@@ -12732,6 +12929,7 @@ mod tests {
         CurrentEvidenceMismatch,
         CurrentEvidenceGenerationMismatch,
         ReadinessIdentityMismatch,
+        SavedBaselineMismatch,
     }
 
     struct SyntheticGateAttempt {
@@ -12899,12 +13097,10 @@ mod tests {
                     "PTY callback ran before durable grant consumption",
                 ));
             }
-            let descriptor = terminal.opencode_transfer.as_ref().ok_or_else(|| {
-                RuntimeError::new(
-                    RuntimeErrorCode::InvalidRequest,
-                    "synthetic PTY launch has no transfer descriptor",
-                )
-            })?;
+            let descriptor = terminal
+                .opencode_transfer
+                .as_ref()
+                .unwrap_or(&adoption.baseline.descriptor);
             let receipt = persisted
                 .opencode_transfer_receipt
                 .as_ref()
@@ -13397,6 +13593,7 @@ mod tests {
     async fn run_synthetic_exact_resume(
         imported: &SyntheticGateAttempt,
         failure: Option<SyntheticTransferFailure>,
+        stopped_repair_baseline: bool,
     ) -> Result<SyntheticResumeAttempt, String> {
         let root = imported.root.path();
         let descriptor: OpenCodeTransferDescriptor = serde_json::from_slice(
@@ -13404,7 +13601,7 @@ mod tests {
                 .map_err(|error| error.to_string())?,
         )
         .map_err(|error| error.to_string())?;
-        let terminal: TerminalLaunchSpec = serde_json::from_slice(
+        let mut terminal: TerminalLaunchSpec = serde_json::from_slice(
             &std::fs::read(root.join("opencode-terminal.json"))
                 .map_err(|error| error.to_string())?,
         )
@@ -13459,7 +13656,7 @@ mod tests {
             bootstrap_root: root.join("bootstrap"),
         });
 
-        let resume_spec = ResumeSpec {
+        let mut resume_spec = ResumeSpec {
             schema_version: freshell_runtime_protocol::RESUME_SPEC_SCHEMA_VERSION,
             provider_session: freshell_runtime_protocol::ProviderSessionRef {
                 provider: "opencode".into(),
@@ -13469,6 +13666,7 @@ mod tests {
             mode: "opencode".into(),
             runtime_variant: "managed_terminal_pty".into(),
             fixture_transport: None,
+            opencode_adoption_baseline: None,
             program: terminal.program.clone(),
             resume_argv: Vec::new(),
             provider_home: terminal.env["HOME"].clone(),
@@ -13493,6 +13691,43 @@ mod tests {
             evidence_revision: 1,
             never_dispatched: false,
         };
+        if stopped_repair_baseline {
+            let baseline = freshell_runtime_protocol::OpenCodeAdoptionBaseline {
+                manifest_sha256: sha256_hex(descriptor.manifest_json.as_bytes()),
+                descriptor: descriptor.clone(),
+            };
+            baseline.validate().map_err(|error| error.message)?;
+            // Model a schema-7 terminal and resume row: neither had the later
+            // transfer fields or the pinned OpenCode database override.
+            terminal.opencode_transfer = None;
+            terminal.opencode_transfer_attempt_id = None;
+            terminal.opencode_adoption = None;
+            terminal.resume_session_id = None;
+            terminal.env.remove("OPENCODE_DB");
+            resume_spec.opencode_adoption_baseline = Some(baseline);
+            let provider_home = terminal.env["HOME"].clone();
+            resume_spec
+                .environment
+                .insert("HOME".into(), provider_home.clone());
+            resume_spec.environment.insert(
+                "XDG_DATA_HOME".into(),
+                format!("{provider_home}/.local/share"),
+            );
+            resume_spec
+                .environment
+                .insert("XDG_CONFIG_HOME".into(), format!("{provider_home}/.config"));
+            resume_spec.environment.insert(
+                "OPENCODE_DB".into(),
+                format!("{provider_home}/.local/share/opencode/opencode.db"),
+            );
+            if failure == Some(SyntheticTransferFailure::SavedBaselineMismatch) {
+                resume_spec
+                    .opencode_adoption_baseline
+                    .as_mut()
+                    .expect("stopped repair test includes an adoption baseline")
+                    .manifest_sha256 = "0".repeat(64);
+            }
+        }
         let grant_id = GrantId::new();
         let events = Arc::new(std::sync::Mutex::new(Vec::new()));
         let pty_callback_invoked = Arc::new(std::sync::atomic::AtomicBool::new(false));

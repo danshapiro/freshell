@@ -281,6 +281,11 @@ pub struct ResumeSpec {
     /// the resumed host never silently crosses into a paid provider adapter.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fixture_transport: Option<FreshAgentFixtureTransport>,
+    /// Passive evidence for the already installed OpenCode history baseline.
+    /// This never requests staging or import; it only permits a fresh
+    /// provider-reader check and incarnation-bound TUI adoption gate.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub opencode_adoption_baseline: Option<OpenCodeAdoptionBaseline>,
     pub program: String,
     #[serde(default)]
     pub resume_argv: Vec<String>,
@@ -600,10 +605,22 @@ pub struct LostSoulRepairTarget {
     pub expected_intent_revision: u64,
 }
 
+/// A user-selected canonical owner for an otherwise ambiguous native root.
+/// This is sent only after the server has returned its exact candidate soul
+/// IDs; it contains no provider paths or session content.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CanonicalOwnerChoice {
+    pub root_session_id: String,
+    pub soul_id: SoulId,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct RestoreLostSoulsRequest {
     pub targets: Vec<LostSoulRepairTarget>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub canonical_owners: Vec<CanonicalOwnerChoice>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub expected_control_epoch: Option<u64>,
 }
@@ -624,6 +641,21 @@ impl RestoreLostSoulsRequest {
                 "stopped restoration requires exactly eight distinct soul and incident targets with positive intent revisions",
             ));
         }
+        let mut roots = std::collections::BTreeSet::new();
+        if self.canonical_owners.iter().any(|choice| {
+            choice.root_session_id.trim().is_empty()
+                || choice.root_session_id.len() > 160
+                || choice
+                    .root_session_id
+                    .bytes()
+                    .any(|byte| byte.is_ascii_control())
+                || !roots.insert(choice.root_session_id.as_str())
+        }) {
+            return Err(RuntimeError::new(
+                RuntimeErrorCode::InvalidRequest,
+                "canonical owner choices require distinct, valid native root identifiers",
+            ));
+        }
         Ok(())
     }
 }
@@ -632,6 +664,7 @@ impl RestoreLostSoulsRequest {
 #[serde(rename_all = "snake_case")]
 pub enum SoulRepairStatus {
     Pending,
+    OwnerDecisionRequired,
     Complete,
 }
 
@@ -639,6 +672,7 @@ pub enum SoulRepairStatus {
 #[serde(rename_all = "snake_case")]
 pub enum RootRepairImportStatus {
     Pending,
+    OwnerDecisionRequired,
     StructurallyVerified,
     ProviderReadable,
     Complete,
@@ -655,6 +689,10 @@ pub struct RestoreLostSoulRootResult {
     pub import_status: RootRepairImportStatus,
     pub intent_revision: Option<u64>,
     pub native_import_revision: Option<u64>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub owner_candidates: Vec<SoulId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason_code: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -3076,6 +3114,15 @@ pub struct OpenCodeAdoptionBaseline {
 }
 
 impl OpenCodeAdoptionBaseline {
+    pub fn from_descriptor(descriptor: OpenCodeTransferDescriptor) -> Result<Self, RuntimeError> {
+        let baseline = Self {
+            manifest_sha256: sha256_hex(descriptor.manifest_json.as_bytes()),
+            descriptor,
+        };
+        baseline.validate()?;
+        Ok(baseline)
+    }
+
     pub fn validate(&self) -> Result<(), RuntimeError> {
         self.descriptor.validate()?;
         if !is_lower_hex_64(&self.manifest_sha256)
@@ -4900,6 +4947,7 @@ mod tests {
                     expected_intent_revision: 1,
                 })
                 .collect(),
+            canonical_owners: Vec::new(),
             expected_control_epoch: Some(1),
         };
         assert!(request.validate_exact_batch().is_ok());
@@ -5001,6 +5049,7 @@ mod tests {
             mode: "claude".into(),
             runtime_variant: "managed_terminal_pty".into(),
             fixture_transport: None,
+            opencode_adoption_baseline: None,
             program: "claude".into(),
             resume_argv: vec!["--resume".into(), "session-one".into()],
             provider_home: "/home/freshell/provider".into(),

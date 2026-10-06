@@ -4,18 +4,121 @@
 //! provider-native identity recorded for one soul to either its original
 //! terminal launch or the deterministic native-session fixture.
 
-use crate::registry::RecoveryContext;
+use crate::registry::{NativeImportState, RecoveryContext};
 use freshell_agent_runtime::{
     build_resume_spec, pinned_provider_version, ResumeSpecInput, PROVIDER_HOME,
 };
 use freshell_runtime_protocol::{
     AllocationState, CheckpointReference, CredentialReference, DurablePosition, IdentityProvenance,
-    ProviderSessionRef, ProviderVolumeRef, RecoveryBlockReason, RecoveryPath, RecoveryProbe,
-    ResumeSpec, RetryHint, RESUME_SPEC_SCHEMA_VERSION,
+    OpenCodeAdoptionBaseline, ProviderSessionRef, ProviderVolumeRef, RecoveryBlockReason,
+    RecoveryPath, RecoveryProbe, ResumeSpec, RetryHint, RESUME_SPEC_SCHEMA_VERSION,
 };
 use std::collections::BTreeMap;
 
 pub fn exact_resume_candidate(
+    context: &RecoveryContext,
+    observed_native_session_id: Option<&str>,
+) -> Result<Option<ResumeSpec>, RecoveryProbe> {
+    let Some(mut spec) = exact_resume_candidate_base(context, observed_native_session_id)? else {
+        if context.opencode_adoption_baseline.is_some() {
+            return Err(blocked(
+                RecoveryBlockReason::StoreUnreadable,
+                "the repaired soul has an adoption baseline but no exact resumable launch specification"
+                    .into(),
+            ));
+        }
+        return Ok(None);
+    };
+
+    let baseline = match context.opencode_adoption_baseline.clone() {
+        Some(baseline) => Some(baseline),
+        None => match spec.opencode_adoption_baseline.clone() {
+            Some(baseline) => Some(baseline),
+            None => derive_completed_import_baseline(context)?,
+        },
+    };
+    let Some(baseline) = baseline else {
+        return Ok(Some(spec));
+    };
+    let descriptor = &baseline.descriptor;
+    if context.provider != "opencode"
+        || context.native_import_state != NativeImportState::Completed
+        || context.native_import_authority != "verified_import_receipt"
+        || context.native_import_source_store_id.as_deref()
+            != Some(descriptor.source_store_id.as_str())
+        || context.native_import_root_session_id.as_deref()
+            != Some(descriptor.root_session_id.as_str())
+        || context.native_import_source_generation.as_deref()
+            != Some(descriptor.source_generation.as_str())
+        || context.native_session_id.as_deref() != Some(descriptor.root_session_id.as_str())
+        || descriptor.destination_store_id != context.provider_store_id
+        || spec.provider_session.provider != context.provider
+        || spec.provider_session.provider_store_id != context.provider_store_id
+        || spec.provider_session.native_session_id != descriptor.root_session_id
+    {
+        return Err(blocked(
+            RecoveryBlockReason::StoreUnreadable,
+            "the completed OpenCode adoption baseline does not match the soul's exact import identity"
+                .into(),
+        ));
+    }
+    if spec
+        .opencode_adoption_baseline
+        .as_ref()
+        .is_some_and(|saved| saved != &baseline)
+    {
+        return Err(blocked(
+            RecoveryBlockReason::WrongNativeIdentity,
+            "the saved OpenCode resume baseline differs from the completed repair receipt".into(),
+        ));
+    }
+
+    spec.opencode_adoption_baseline = Some(baseline);
+    let data_home = format!("{PROVIDER_HOME}/.local/share");
+    spec.environment.insert("HOME".into(), PROVIDER_HOME.into());
+    spec.environment
+        .insert("XDG_DATA_HOME".into(), data_home.clone());
+    spec.environment
+        .insert("XDG_CONFIG_HOME".into(), format!("{PROVIDER_HOME}/.config"));
+    spec.environment.insert(
+        "OPENCODE_DB".into(),
+        format!("{data_home}/opencode/opencode.db"),
+    );
+    Ok(Some(spec))
+}
+
+fn derive_completed_import_baseline(
+    context: &RecoveryContext,
+) -> Result<Option<OpenCodeAdoptionBaseline>, RecoveryProbe> {
+    if context.provider != "opencode"
+        || context.native_import_state != NativeImportState::Completed
+        || context.native_import_authority != "verified_import_receipt"
+    {
+        return Ok(None);
+    }
+    let descriptor = context
+        .terminal
+        .as_ref()
+        .and_then(|terminal| terminal.opencode_transfer.as_ref())
+        .ok_or_else(|| {
+            blocked(
+                RecoveryBlockReason::StoreUnreadable,
+                "completed OpenCode import has no verified transfer descriptor for exact recovery"
+                    .into(),
+            )
+        })?;
+    OpenCodeAdoptionBaseline::from_descriptor(descriptor.clone())
+        .map(Some)
+        .map_err(|_| {
+            blocked(
+                RecoveryBlockReason::StoreUnreadable,
+                "completed OpenCode import transfer descriptor is not valid recovery evidence"
+                    .into(),
+            )
+        })
+}
+
+fn exact_resume_candidate_base(
     context: &RecoveryContext,
     observed_native_session_id: Option<&str>,
 ) -> Result<Option<ResumeSpec>, RecoveryProbe> {
@@ -63,6 +166,7 @@ pub fn exact_resume_candidate(
             mode: agent.session_type.clone(),
             runtime_variant: agent.runtime_variant.clone(),
             fixture_transport: agent.fixture_transport,
+            opencode_adoption_baseline: None,
             program: "freshell-session-host fresh-agent".into(),
             resume_argv: Vec::new(),
             provider_home: PROVIDER_HOME.into(),
@@ -154,6 +258,7 @@ pub fn exact_resume_candidate(
             mode: "native_session_fixture".into(),
             runtime_variant: "native_session_fixture".into(),
             fixture_transport: None,
+            opencode_adoption_baseline: None,
             program: "freshell-session-host fixture native_session".into(),
             resume_argv: Vec::new(),
             provider_home: PROVIDER_HOME.into(),
@@ -285,9 +390,11 @@ mod tests {
     use crate::registry::{NativeImportState, OwnedRuntimeHandle};
     use freshell_runtime_protocol::{
         DesiredState, DockerDaemonId, DurabilityState, FreshAgentLaunchSpec, FreshProvider,
-        IncarnationId, InstallationId, LaunchNonce, RecoveryState, RuntimeLimits, RuntimeProfile,
-        SoulId,
+        IncarnationId, InstallationId, LaunchNonce, OpenCodeTransferDescriptor,
+        OpenCodeTransferFile, RecoveryState, RuntimeLimits, RuntimeProfile, SoulId,
+        TerminalLaunchSpec,
     };
+    use sha2::Digest;
     use std::path::PathBuf;
 
     fn fixture_context(native: Option<&str>) -> RecoveryContext {
@@ -343,6 +450,7 @@ mod tests {
             recovery_attempt_id: None,
             control_epoch: 1,
             resume_spec: None,
+            opencode_adoption_baseline: None,
             project_key: "test".into(),
             profile: RuntimeProfile::TestFixture,
             fixture: Some(freshell_runtime_protocol::FixtureKind::NativeSession),
@@ -360,6 +468,113 @@ mod tests {
             recovery_window_started_at: None,
             successful_recoveries_in_window: 0,
         }
+    }
+
+    fn imported_opencode_descriptor() -> OpenCodeTransferDescriptor {
+        let root_session_id = "ses_recovery_exact";
+        let source_store_id = "b".repeat(64);
+        let source_generation = "c".repeat(64);
+        let source_schema_fingerprint = "d".repeat(64);
+        let migration_journal_fingerprint = "e".repeat(64);
+        let payload_sha256 = hex::encode(sha2::Sha256::digest(b"x"));
+        let manifest_json = serde_json::json!({
+            "version": 1,
+            "provider_schema": "opencode-1.18.21",
+            "root_session_id": root_session_id,
+            "source_store_id": source_store_id,
+            "source_schema_fingerprint": source_schema_fingerprint,
+            "migration_journal_fingerprint": migration_journal_fingerprint,
+            "sqlite_version": "test",
+            "row_count": 0,
+            "rows": [],
+            "assets": [],
+            "payload_bytes": 1,
+            "payload_sha256": payload_sha256,
+            "generation": source_generation,
+        })
+        .to_string();
+        let files = vec![OpenCodeTransferFile {
+            index: 0,
+            relative_path: "payload.json".into(),
+            size_bytes: 1,
+            sha256: payload_sha256,
+        }];
+        let target_image_ref = format!("sha256:{}", "a".repeat(64));
+        let mut descriptor = OpenCodeTransferDescriptor {
+            transfer_id: "transfer-resume-catalog".into(),
+            provider: "opencode".into(),
+            source_store_id,
+            root_session_id: root_session_id.into(),
+            source_generation,
+            provider_schema: "opencode-1.18.21".into(),
+            source_schema_fingerprint,
+            migration_journal_fingerprint,
+            destination_store_id: "destination-store".into(),
+            destination_database_path: freshell_runtime_protocol::OPENCODE_TRANSFER_DESTINATION_DB
+                .into(),
+            target_build_receipt: freshell_runtime_protocol::opencode_target_build_receipt(
+                &target_image_ref,
+                "opencode-1.18.21",
+            ),
+            target_image_ref,
+            incarnation_id: "incarnation-resume-catalog".into(),
+            manifest_json,
+            files,
+            total_bytes: 1,
+            bundle_sha256: String::new(),
+        };
+        descriptor.bundle_sha256 = freshell_runtime_protocol::opencode_transfer_bundle_digest(
+            &descriptor.manifest_json,
+            &descriptor.files,
+        );
+        descriptor.validate().unwrap();
+        descriptor
+    }
+
+    fn completed_import_context() -> RecoveryContext {
+        let descriptor = imported_opencode_descriptor();
+        let mut context = fixture_context(Some(&descriptor.root_session_id));
+        context.provider = "opencode".into();
+        context.provider_store_id = descriptor.destination_store_id.clone();
+        context.fixture = None;
+        context.native_import_state = NativeImportState::Completed;
+        context.native_import_authority = "verified_import_receipt".into();
+        context.native_import_source_store_id = Some(descriptor.source_store_id.clone());
+        context.native_import_root_session_id = Some(descriptor.root_session_id.clone());
+        context.native_import_source_generation = Some(descriptor.source_generation.clone());
+        context.native_import_schema_fingerprint =
+            Some(descriptor.source_schema_fingerprint.clone());
+        context.native_import_migration_fingerprint =
+            Some(descriptor.migration_journal_fingerprint.clone());
+        context.terminal = Some(TerminalLaunchSpec {
+            terminal_id: "terminal-resume-catalog".into(),
+            stream_id: "stream-resume-catalog".into(),
+            mode: "opencode".into(),
+            program: "opencode".into(),
+            args: vec!["--session".into(), descriptor.root_session_id.clone()],
+            env: BTreeMap::from([("HOME".into(), PROVIDER_HOME.into())]),
+            cwd: "/workspace/project".into(),
+            run_as_uid: 65_534,
+            run_as_gid: 0,
+            cols: 80,
+            rows: 24,
+            project_key: "project-resume-catalog".into(),
+            workspace_path: "/workspace".into(),
+            git_common_dir: None,
+            create_request_id: Some("create-resume-catalog".into()),
+            resume_session_id: Some(descriptor.root_session_id.clone()),
+            provider_model: None,
+            provider_reasoning_effort: None,
+            provider_sandbox: None,
+            provider_permission_mode: None,
+            provider_bootstrap_files: Vec::new(),
+            provider_secret_references: Vec::new(),
+            provider_launch_context: None,
+            opencode_transfer: Some(descriptor),
+            opencode_transfer_attempt_id: None,
+            opencode_adoption: None,
+        });
+        context
     }
 
     #[test]
@@ -468,6 +683,80 @@ mod tests {
                 reason: RecoveryBlockReason::WrongNativeIdentity,
                 ..
             })
+        ));
+    }
+
+    #[test]
+    fn offline_recovery_derives_the_adoption_baseline_from_a_completed_import() {
+        let context = completed_import_context();
+        let descriptor = context
+            .terminal
+            .as_ref()
+            .unwrap()
+            .opencode_transfer
+            .clone()
+            .unwrap();
+        let expected_baseline = freshell_runtime_protocol::OpenCodeAdoptionBaseline {
+            manifest_sha256: format!(
+                "{:x}",
+                sha2::Sha256::digest(descriptor.manifest_json.as_bytes())
+            ),
+            descriptor,
+        };
+
+        let probe = crate::recovery::offline_probe(&context).unwrap();
+        let RecoveryProbe::ResumeReady { resume_spec, .. } = probe else {
+            panic!("completed OpenCode imports must recover without a live old host: {probe:?}");
+        };
+        assert_eq!(
+            resume_spec.provider_session.native_session_id,
+            "ses_recovery_exact"
+        );
+        assert_eq!(
+            resume_spec.opencode_adoption_baseline,
+            Some(expected_baseline)
+        );
+        assert_eq!(
+            resume_spec
+                .environment
+                .get("OPENCODE_DB")
+                .map(String::as_str),
+            Some("/home/freshell/provider/.local/share/opencode/opencode.db")
+        );
+    }
+
+    #[test]
+    fn blocked_retry_reuses_persisted_resume_baseline_after_transfer_descriptor_cleanup() {
+        let mut context = completed_import_context();
+        let first_resume = exact_resume_candidate(&context, None).unwrap().unwrap();
+        let baseline = first_resume.opencode_adoption_baseline.clone().unwrap();
+        context.resume_spec = Some(first_resume);
+        context.recovery_state = freshell_runtime_protocol::RecoveryState::Blocked;
+        context.opencode_adoption_baseline = None;
+        context.terminal.as_mut().unwrap().opencode_transfer = None;
+
+        let probe = crate::recovery::offline_probe(&context).unwrap();
+        let RecoveryProbe::ResumeReady { resume_spec, .. } = probe else {
+            panic!("a blocked retry must retain the exact repair baseline: {probe:?}");
+        };
+        assert_eq!(resume_spec.opencode_adoption_baseline, Some(baseline));
+        assert_eq!(
+            resume_spec.provider_session.native_session_id,
+            "ses_recovery_exact"
+        );
+    }
+
+    #[test]
+    fn completed_import_without_its_verified_transfer_descriptor_stays_blocked() {
+        let mut context = completed_import_context();
+        context.terminal.as_mut().unwrap().opencode_transfer = None;
+
+        assert!(matches!(
+            crate::recovery::offline_probe(&context).unwrap(),
+            RecoveryProbe::Blocked {
+                reason: RecoveryBlockReason::StoreUnreadable,
+                ..
+            }
         ));
     }
 

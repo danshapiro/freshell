@@ -64,6 +64,19 @@ export type ManagedRuntimeView = {
   successfulRecoveriesInWindow?: number
 }
 
+export type ManagedOpenCodeAdoptionStatus =
+  | { state: 'not_required' | 'awaiting_observation' }
+  | { state: 'observed'; data: { observation: {
+      terminalId: string
+      rootSessionId: string
+      tailMessageId: string | null
+      evidenceGeneration: string
+      incarnationId: string
+      launchNonce: string
+      hydrated: boolean
+      messagesRead: 'success' | 'empty_confirmed' | 'failed'
+    } } }
+
 /**
  * Owned managed-runtime browser rig: restricted Docker broker + supervisor +
  * a feature-enabled Rust web server. Web restart methods touch only the web
@@ -370,6 +383,26 @@ export class ManagedRuntimeBrowserRig {
       'HOME=/home/freshell/provider',
       ...args,
     ])
+  }
+
+  /** Read the actual session-host adoption gate for this exact owned incarnation. */
+  ownedOpenCodeAdoptionStatus(view: ManagedRuntimeView): ManagedOpenCodeAdoptionStatus {
+    if (!view.containerId || !view.terminalId || !view.hostBootId) {
+      throw new Error('managed OpenCode adoption probe requires an exact container, host boot, and terminal')
+    }
+    const status = JSON.parse(this.ownedContainerExec(this.supervisor.containerId, [
+      'node', '--no-warnings',
+      path.join(this.repoRoot, 'test/e2e-browser/fixtures/managed-opencode-host-status.cjs'),
+      this.runtime.runtimeDir(this.supervisor, view.incarnationId),
+      view.incarnationId,
+      view.hostBootId,
+    ])) as ManagedOpenCodeAdoptionStatus
+    if (status.state === 'observed'
+      && (status.data?.observation?.incarnationId !== view.incarnationId
+        || status.data.observation.terminalId !== view.terminalId)) {
+      throw new Error('managed OpenCode adoption status belongs to another incarnation or terminal')
+    }
+    return status
   }
 
   ownedContainerHasPid(containerId: string, pid: number): boolean {

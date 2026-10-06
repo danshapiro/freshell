@@ -612,7 +612,10 @@ impl OpenCodeAdoptionGate {
 
 impl Drop for OpenCodeAdoptionGate {
     fn drop(&mut self) {
-        remove_opencode_adoption_expectation(&self.expectation_path, &self.incarnation_id);
+        let _ = with_provider_filesystem_identity(self.provider_uid, self.provider_gid, || {
+            remove_opencode_adoption_expectation(&self.expectation_path, &self.incarnation_id);
+            Ok(())
+        });
     }
 }
 
@@ -634,38 +637,78 @@ fn publish_opencode_adoption_expectation(
     provider_uid: u32,
     provider_gid: u32,
 ) -> Result<(), String> {
-    let parent = path
-        .parent()
-        .ok_or("OpenCode adoption expectation has no parent directory")?;
-    std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
-    #[cfg(unix)]
-    {
-        crate::set_owner(parent, provider_uid, provider_gid)?;
+    with_provider_filesystem_identity(provider_uid, provider_gid, || {
+        let parent = path
+            .parent()
+            .ok_or("OpenCode adoption expectation has no parent directory")?;
+        std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+        #[cfg(unix)]
         crate::set_mode(parent, 0o700)?;
-    }
-    let bytes = serde_json::to_vec(&OpenCodeAdoptionExpectationFile {
-        terminal_id,
-        root_session_id: &expectation.root_session_id,
-        root_tail: &expectation.root_tail,
-        evidence_generation: &expectation.evidence_generation,
-        incarnation_id: &expectation.incarnation_id,
-        launch_nonce: &expectation.launch_nonce,
-    })
-    .map_err(|error| error.to_string())?;
-    let temporary = path.with_extension(format!("tmp-{}", std::process::id()));
-    match std::fs::symlink_metadata(&temporary) {
-        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
-            return Err("OpenCode adoption expectation staging path is not a file".into());
+        let bytes = serde_json::to_vec(&OpenCodeAdoptionExpectationFile {
+            terminal_id,
+            root_session_id: &expectation.root_session_id,
+            root_tail: &expectation.root_tail,
+            evidence_generation: &expectation.evidence_generation,
+            incarnation_id: &expectation.incarnation_id,
+            launch_nonce: &expectation.launch_nonce,
+        })
+        .map_err(|error| error.to_string())?;
+        let temporary = path.with_extension(format!("tmp-{}", std::process::id()));
+        match std::fs::symlink_metadata(&temporary) {
+            Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
+                return Err("OpenCode adoption expectation staging path is not a file".into());
+            }
+            Ok(_) => std::fs::remove_file(&temporary).map_err(|error| error.to_string())?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.to_string()),
         }
-        Ok(_) => std::fs::remove_file(&temporary).map_err(|error| error.to_string())?,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => return Err(error.to_string()),
+        std::fs::write(&temporary, bytes).map_err(|error| error.to_string())?;
+        #[cfg(unix)]
+        crate::set_mode(&temporary, 0o600)?;
+        std::fs::rename(&temporary, path).map_err(|error| error.to_string())?;
+        Ok(())
+    })
+}
+
+fn with_provider_filesystem_identity<T>(
+    provider_uid: u32,
+    provider_gid: u32,
+    action: impl FnOnce() -> Result<T, String>,
+) -> Result<T, String> {
+    #[cfg(target_os = "linux")]
+    unsafe {
+        // libc exposes these return values as signed ints even though Linux
+        // filesystem IDs are uid_t/gid_t bit patterns.
+        let original_uid = libc::setfsuid(u32::MAX) as u32;
+        let original_gid = libc::setfsgid(u32::MAX) as u32;
+        libc::setfsgid(provider_gid);
+        libc::setfsuid(provider_uid);
+        let active_uid = libc::setfsuid(u32::MAX) as u32;
+        let active_gid = libc::setfsgid(u32::MAX) as u32;
+        if active_uid != provider_uid || active_gid != provider_gid {
+            libc::setfsgid(original_gid);
+            libc::setfsuid(original_uid);
+            return Err("provider filesystem identity is unavailable".into());
+        }
+
+        let result = action();
+        libc::setfsgid(original_gid);
+        libc::setfsuid(original_uid);
+        let restored_uid = libc::setfsuid(u32::MAX) as u32;
+        let restored_gid = libc::setfsgid(u32::MAX) as u32;
+        if restored_uid != original_uid || restored_gid != original_gid {
+            return Err("host filesystem identity could not be restored".into());
+        }
+        result
     }
-    std::fs::write(&temporary, bytes).map_err(|error| error.to_string())?;
-    #[cfg(unix)]
-    crate::set_mode(&temporary, 0o644)?;
-    std::fs::rename(&temporary, path).map_err(|error| error.to_string())?;
-    Ok(())
+    #[cfg(not(target_os = "linux"))]
+    {
+        if unsafe { libc::geteuid() } != provider_uid || unsafe { libc::getegid() } != provider_gid
+        {
+            return Err("provider filesystem identity is unavailable".into());
+        }
+        action()
+    }
 }
 
 fn set_opencode_adoption_environment(
@@ -1600,6 +1643,33 @@ mod managed_opencode_adoption_tests {
         )
         .unwrap();
         (gate, current, calls, signal_root)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn adoption_expectation_is_provider_owned_private_and_removed_with_gate() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let expected = expectation(OpenCodeVerifiedRootTail::QualifiedEmpty);
+        let initial = evidence(
+            &expected,
+            &expected.evidence_generation,
+            expected.root_tail.clone(),
+        );
+        let (gate, _, _, signal_root) = gate_with_evidence(expected, initial);
+        let path = signal_root
+            .path()
+            .join("terminal-opencode-adoption.expected.json");
+        let metadata = std::fs::metadata(&path).unwrap();
+        assert_eq!(metadata.uid(), unsafe { libc::geteuid() });
+        assert_eq!(metadata.gid(), unsafe { libc::getegid() });
+        assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
+
+        drop(gate);
+        assert!(
+            !path.exists(),
+            "dropping the gate removes its owned expectation"
+        );
     }
 
     #[test]

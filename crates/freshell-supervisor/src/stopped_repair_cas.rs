@@ -20,9 +20,15 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, BTreeSet},
-    io::{Error as IoError, ErrorKind as IoErrorKind},
+    io::Error as IoError,
     path::PathBuf,
 };
+
+struct WithdrawalFileContext {
+    db_path: PathBuf,
+    incident_root: PathBuf,
+    lifecycle_log: PathBuf,
+}
 
 impl Registry {
     pub(crate) async fn finalize_stopped_repair_batch(
@@ -67,13 +73,15 @@ impl Registry {
                     validate_exact_receipts(&persisted_roots, &roots)?;
                     return finish_pending_withdrawal(
                         &mut conn,
-                        &db_path,
                         &operation_id,
                         &marker,
                         &expected_targets,
                         &persisted_roots,
-                        incident_root,
-                        lifecycle_log,
+                        WithdrawalFileContext {
+                            db_path: db_path.clone(),
+                            incident_root,
+                            lifecycle_log,
+                        },
                     );
                 }
                 "importing" => {}
@@ -94,13 +102,15 @@ impl Registry {
             )?;
             finish_pending_withdrawal(
                 &mut conn,
-                &db_path,
                 &operation_id,
                 &marker,
                 &expected_targets,
                 &persisted_roots,
-                incident_root,
-                lifecycle_log,
+                WithdrawalFileContext {
+                    db_path: db_path.clone(),
+                    incident_root,
+                    lifecycle_log,
+                },
             )
         })
         .await
@@ -138,13 +148,15 @@ impl Registry {
                 }
                 finish_pending_withdrawal(
                     &mut conn,
-                    &db_path,
                     &operation_id,
                     &marker,
                     &targets,
                     &roots,
-                    incident_root.clone(),
-                    lifecycle_log.clone(),
+                    WithdrawalFileContext {
+                        db_path: db_path.clone(),
+                        incident_root: incident_root.clone(),
+                        lifecycle_log: lifecycle_log.clone(),
+                    },
                 )?;
             }
             Ok(())
@@ -201,6 +213,7 @@ fn target_order(left: &LostSoulRepairTarget, right: &LostSoulRepairTarget) -> st
 fn valid_exact_targets(targets: &[LostSoulRepairTarget]) -> bool {
     freshell_runtime_protocol::RestoreLostSoulsRequest {
         targets: targets.to_vec(),
+        canonical_owners: Vec::new(),
         expected_control_epoch: None,
     }
     .validate_exact_batch()
@@ -628,6 +641,7 @@ fn validate_targets_and_receipts(
             || receipt.destination_store_id.is_empty()
             || receipt.source_store_id.is_empty()
             || receipt.source_generation.is_empty()
+            || !receipt.adoption_baseline_matches_receipt()
         {
             return Err(RegistryError::NativeIdentityConflict);
         }
@@ -636,14 +650,7 @@ fn validate_targets_and_receipts(
             .get(target.soul_id.as_str())
             .ok_or(RegistryError::NativeIdentityConflict)?;
         if fence.provider_store_id != receipt.destination_store_id
-            || fence.native_import_source_store_id.as_deref()
-                != Some(receipt.source_store_id.as_str())
-            || fence.native_import_source_generation.as_deref()
-                != Some(receipt.source_generation.as_str())
-            || fence.native_import_schema_fingerprint.as_deref()
-                != Some(receipt.source_schema_fingerprint.as_str())
-            || fence.native_import_migration_fingerprint.as_deref()
-                != Some(receipt.migration_journal_fingerprint.as_str())
+            || !source_descriptor_matches_or_is_unbound_legacy(fence, receipt)
             || fence.native_import_state != receipt.captured_native_import_state
             || fence.native_import_authority != receipt.captured_native_import_authority
             || fence.identity_revision != receipt.captured_identity_revision
@@ -683,17 +690,7 @@ fn validate_targets_and_receipts(
             let candidate_fence = target_fences
                 .get(candidate.soul_id.as_str())
                 .ok_or(RegistryError::NativeIdentityConflict)?;
-            if candidate_fence.native_import_source_store_id.as_deref()
-                != Some(receipt.source_store_id.as_str())
-                || candidate_fence.native_import_source_generation.as_deref()
-                    != Some(receipt.source_generation.as_str())
-                || candidate_fence.native_import_schema_fingerprint.as_deref()
-                    != Some(receipt.source_schema_fingerprint.as_str())
-                || candidate_fence
-                    .native_import_migration_fingerprint
-                    .as_deref()
-                    != Some(receipt.migration_journal_fingerprint.as_str())
-            {
+            if !source_descriptor_matches_or_is_unbound_legacy(candidate_fence, receipt) {
                 return Err(RegistryError::NativeIdentityConflict);
             }
         }
@@ -713,6 +710,29 @@ fn validate_targets_and_receipts(
         }
     }
     Ok(())
+}
+
+fn source_descriptor_matches_or_is_unbound_legacy(
+    fence: &TargetFence,
+    receipt: &StoppedRepairRootReceipt,
+) -> bool {
+    let exact_match = fence.native_import_source_store_id.as_deref()
+        == Some(receipt.source_store_id.as_str())
+        && fence.native_import_root_session_id.as_deref() == Some(receipt.root_session_id.as_str())
+        && fence.native_import_source_generation.as_deref()
+            == Some(receipt.source_generation.as_str())
+        && fence.native_import_schema_fingerprint.as_deref()
+            == Some(receipt.source_schema_fingerprint.as_str())
+        && fence.native_import_migration_fingerprint.as_deref()
+            == Some(receipt.migration_journal_fingerprint.as_str());
+    let unbound_legacy = fence.native_import_state == "legacy_unknown"
+        && fence.native_import_authority == "legacy_unknown"
+        && fence.native_import_source_store_id.is_none()
+        && fence.native_import_root_session_id.is_none()
+        && fence.native_import_source_generation.is_none()
+        && fence.native_import_schema_fingerprint.is_none()
+        && fence.native_import_migration_fingerprint.is_none();
+    exact_match || unbound_legacy
 }
 
 fn upsert_native_origin_owner(
@@ -893,11 +913,26 @@ fn delete_view_projection_rows(
     tx: &Transaction<'_>,
     view_id: &freshell_runtime_protocol::ViewIntentId,
 ) -> Result<(), RegistryError> {
-    let prefix = format!("projection-{}-%", view_id.as_str());
-    tx.execute(
-        "DELETE FROM outbox WHERE event_kind='view_intent.changed' AND event_id LIKE ?1",
-        params![prefix],
-    )?;
+    let prefix = format!("projection-{}-", view_id.as_str());
+    let event_ids = {
+        let mut statement =
+            tx.prepare("SELECT event_id FROM outbox WHERE event_kind='view_intent.changed'")?;
+        let rows = statement
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        rows
+    };
+    for event_id in event_ids {
+        let is_exact_projection = event_id
+            .strip_prefix(&prefix)
+            .is_some_and(|revision| revision.parse::<u64>().is_ok());
+        if is_exact_projection {
+            tx.execute(
+                "DELETE FROM outbox WHERE event_id=?1 AND event_kind='view_intent.changed'",
+                params![event_id],
+            )?;
+        }
+    }
     Ok(())
 }
 
@@ -997,13 +1032,11 @@ fn withdrawal_generation(
 
 fn finish_pending_withdrawal(
     conn: &mut Connection,
-    db_path: &std::path::Path,
     operation_id: &RequestId,
     marker: &WithdrawalMarker,
     targets: &[LostSoulRepairTarget],
     roots: &[StoppedRepairRootReceipt],
-    incident_root: PathBuf,
-    lifecycle_log: PathBuf,
+    file_context: WithdrawalFileContext,
 ) -> Result<RestoreLostSoulsResult, RegistryError> {
     let operation = load_operation(conn, operation_id)?;
     validate_withdrawal(&operation, marker, targets)?;
@@ -1015,15 +1048,15 @@ fn finish_pending_withdrawal(
     let incident_ids = serde_json::from_str::<Vec<String>>(&marker.incident_ids_json)?
         .into_iter()
         .collect::<BTreeSet<_>>();
-    let exporter = IncidentExporter::new(incident_root, String::new());
+    let exporter = IncidentExporter::new(file_context.incident_root, String::new());
     let expected_generation = marker.generation.clone();
     let expected_targets_json = marker.targets_json.clone();
     let expected_incident_ids_json = marker.incident_ids_json.clone();
     let expected_operation_id = operation_id.clone();
-    let check_path = db_path.to_path_buf();
+    let check_path = file_context.db_path;
     let mut check_generation = || {
-        let check_conn = open_connection(&check_path)
-            .map_err(|error| IoError::new(IoErrorKind::Other, error.to_string()))?;
+        let check_conn =
+            open_connection(&check_path).map_err(|error| IoError::other(error.to_string()))?;
         let current: Option<(String, String, String, String, String)> = check_conn
             .query_row(
                 "SELECT o.status,w.generation,w.targets_json,w.incident_ids_json,w.status \
@@ -1033,7 +1066,7 @@ fn finish_pending_withdrawal(
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
             )
             .optional()
-            .map_err(|error| IoError::new(IoErrorKind::Other, error.to_string()))?;
+            .map_err(|error| IoError::other(error.to_string()))?;
         match current {
             Some((
                 operation_status,
@@ -1057,7 +1090,7 @@ fn finish_pending_withdrawal(
     check_generation()?;
     exporter.retract_false_incidents_coordinated_checked(
         &incident_ids,
-        &lifecycle_log,
+        &file_context.lifecycle_log,
         &mut check_generation,
     )?;
     check_generation()?;
@@ -1115,6 +1148,8 @@ fn complete_result(
                             RegistryError::Integrity("native import revision overflow".into())
                         })?,
                 ),
+                owner_candidates: Vec::new(),
+                reason_code: None,
             })
         })
         .collect::<Result<Vec<_>, RegistryError>>()?;
@@ -1160,7 +1195,11 @@ impl Supervisor {
 mod tests {
     use super::*;
     use crate::registry::SCHEMA_VERSION;
-    use freshell_runtime_protocol::{IncidentId, RootRepairImportStatus, SoulId, SoulRepairStatus};
+    use freshell_runtime_protocol::{
+        opencode_target_build_receipt, opencode_transfer_bundle_digest, IncidentId,
+        OpenCodeAdoptionBaseline, OpenCodeTransferDescriptor, OpenCodeTransferFile,
+        RootRepairImportStatus, SoulId, SoulRepairStatus, OPENCODE_TRANSFER_DESTINATION_DB,
+    };
     use rusqlite::{params, Connection};
     use serde_json::json;
     use sha2::{Digest, Sha256};
@@ -1178,35 +1217,103 @@ mod tests {
 
     fn test_roots(targets: &[LostSoulRepairTarget]) -> Vec<StoppedRepairRootReceipt> {
         (0..7)
-            .map(|index| StoppedRepairRootReceipt {
-                root_session_id: format!("ses_root_{index}"),
-                canonical_soul_id: targets[index].soul_id.clone(),
-                transfer_id: format!("transfer-{index}"),
-                destination_store_id: format!("destination-{index}"),
-                source_store_id: format!("store-{index}"),
-                source_generation: format!("generation-{index}"),
-                bundle_sha256: "e".repeat(64),
-                source_schema_fingerprint: "a".repeat(64),
-                migration_journal_fingerprint: "b".repeat(64),
-                target_image_ref: format!("image-{index}"),
-                target_build_receipt: format!("build-{index}"),
-                row_count: 12,
-                asset_count: 2,
-                structural_sha256: "c".repeat(64),
-                provider_uid: 65534,
-                provider_gid: 65534,
-                reader_environment_sha256: "d".repeat(64),
-                captured_identity_revision: 4,
-                captured_evidence_revision: 9,
-                captured_intent_revision: targets[index].expected_intent_revision,
-                captured_native_import_revision: 3,
-                captured_native_import_state: "pending".into(),
-                captured_native_import_authority: "exact_source_snapshot".into(),
-                incarnation_id: freshell_runtime_protocol::IncarnationId::parse(format!(
-                    "incarnation-{index}"
-                ))
-                .unwrap(),
-                execution_generation: 5,
+            .map(|index| {
+                let root_session_id = format!("ses_root_{index}");
+                let transfer_id = format!("transfer-{index}");
+                let source_store_id =
+                    format!("{:x}", Sha256::digest(format!("store-{index}").as_bytes()));
+                let source_generation = format!(
+                    "{:x}",
+                    Sha256::digest(format!("generation-{index}").as_bytes())
+                );
+                let source_schema_fingerprint = "a".repeat(64);
+                let migration_journal_fingerprint = "b".repeat(64);
+                let target_image_ref = format!("sha256:{}", "c".repeat(64));
+                let target_build_receipt =
+                    opencode_target_build_receipt(&target_image_ref, "opencode-1.18.21");
+                let payload_sha256 = format!("{:x}", Sha256::digest(b"x"));
+                let manifest_json = json!({
+                    "version": 1,
+                    "provider_schema": "opencode-1.18.21",
+                    "root_session_id": root_session_id,
+                    "source_store_id": source_store_id,
+                    "source_schema_fingerprint": source_schema_fingerprint,
+                    "migration_journal_fingerprint": migration_journal_fingerprint,
+                    "sqlite_version": "test",
+                    "row_count": 0,
+                    "rows": [],
+                    "assets": [],
+                    "payload_bytes": 1,
+                    "payload_sha256": payload_sha256,
+                    "generation": source_generation,
+                })
+                .to_string();
+                let files = vec![OpenCodeTransferFile {
+                    index: 0,
+                    relative_path: "payload.json".into(),
+                    size_bytes: 1,
+                    sha256: payload_sha256,
+                }];
+                let mut descriptor = OpenCodeTransferDescriptor {
+                    transfer_id: transfer_id.clone(),
+                    provider: "opencode".into(),
+                    source_store_id: source_store_id.clone(),
+                    root_session_id: root_session_id.clone(),
+                    source_generation: source_generation.clone(),
+                    provider_schema: "opencode-1.18.21".into(),
+                    source_schema_fingerprint: source_schema_fingerprint.clone(),
+                    migration_journal_fingerprint: migration_journal_fingerprint.clone(),
+                    destination_store_id: format!("destination-{index}"),
+                    destination_database_path: OPENCODE_TRANSFER_DESTINATION_DB.into(),
+                    target_image_ref: target_image_ref.clone(),
+                    target_build_receipt: target_build_receipt.clone(),
+                    incarnation_id: format!("incarnation-{index}"),
+                    manifest_json,
+                    files,
+                    total_bytes: 1,
+                    bundle_sha256: String::new(),
+                };
+                descriptor.bundle_sha256 =
+                    opencode_transfer_bundle_digest(&descriptor.manifest_json, &descriptor.files);
+                let adoption_baseline = OpenCodeAdoptionBaseline {
+                    manifest_sha256: format!(
+                        "{:x}",
+                        Sha256::digest(descriptor.manifest_json.as_bytes())
+                    ),
+                    descriptor: descriptor.clone(),
+                };
+                assert!(adoption_baseline.validate().is_ok());
+                StoppedRepairRootReceipt {
+                    root_session_id,
+                    canonical_soul_id: targets[index].soul_id.clone(),
+                    transfer_id,
+                    adoption_baseline,
+                    destination_store_id: descriptor.destination_store_id,
+                    source_store_id,
+                    source_generation,
+                    bundle_sha256: descriptor.bundle_sha256,
+                    source_schema_fingerprint,
+                    migration_journal_fingerprint,
+                    target_image_ref,
+                    target_build_receipt,
+                    row_count: 0,
+                    asset_count: 0,
+                    structural_sha256: "c".repeat(64),
+                    provider_uid: 65534,
+                    provider_gid: 65534,
+                    reader_environment_sha256: "d".repeat(64),
+                    captured_identity_revision: 4,
+                    captured_evidence_revision: 9,
+                    captured_intent_revision: targets[index].expected_intent_revision,
+                    captured_native_import_revision: 3,
+                    captured_native_import_state: "pending".into(),
+                    captured_native_import_authority: "exact_source_snapshot".into(),
+                    incarnation_id: freshell_runtime_protocol::IncarnationId::parse(format!(
+                        "incarnation-{index}"
+                    ))
+                    .unwrap(),
+                    execution_generation: 5,
+                }
             })
             .collect()
     }
@@ -1289,6 +1396,54 @@ mod tests {
 
     fn incident_line(id: &str) -> String {
         json!({"incidentId": id, "event": "soul.loss.finalized"}).to_string()
+    }
+
+    #[test]
+    fn view_projection_retraction_requires_exact_view_and_revision_suffix() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE outbox(event_id TEXT PRIMARY KEY,event_kind TEXT NOT NULL,payload TEXT NOT NULL,created_at INTEGER NOT NULL,delivered_at INTEGER);",
+        )
+        .unwrap();
+        for event_id in [
+            "projection-view-a-1",
+            "projection-view-a-2",
+            "projection-view-a-b-1",
+            "projection-view-aardvark-1",
+            "projection-viewXa-1",
+            "projection-view-a-2-not-a-revision",
+        ] {
+            conn.execute(
+                "INSERT INTO outbox(event_id,event_kind,payload,created_at) VALUES (?1,'view_intent.changed','{}',1)",
+                params![event_id],
+            )
+            .unwrap();
+        }
+        let tx = conn.transaction().unwrap();
+        delete_view_projection_rows(
+            &tx,
+            &freshell_runtime_protocol::ViewIntentId::parse("view-a").unwrap(),
+        )
+        .unwrap();
+        tx.commit().unwrap();
+
+        let mut statement = conn
+            .prepare("SELECT event_id FROM outbox ORDER BY event_id")
+            .unwrap();
+        let remaining = statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(
+            remaining,
+            [
+                "projection-view-a-2-not-a-revision".to_string(),
+                "projection-view-a-b-1".to_string(),
+                "projection-view-aardvark-1".to_string(),
+                "projection-viewXa-1".to_string(),
+            ]
+        );
     }
 
     #[tokio::test]

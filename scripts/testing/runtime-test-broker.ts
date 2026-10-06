@@ -934,6 +934,7 @@ export class RestrictedDockerBroker {
     let providerVolumeName = ''
     let workspacePath = ''
     let actorStateDir = ''
+    let opencodeTransferStagePath: string | undefined
     for (const bind of binds) {
       const parts = bind.split(':')
       const mode = parts.pop() ?? ''
@@ -949,6 +950,22 @@ export class RestrictedDockerBroker {
       }
       if (destination === '/home/freshell/provider' && mode === 'rw' && /^freshell-provider-[a-f0-9]{24}$/.test(source)) {
         providerVolumeName = source
+        continue
+      }
+      if (terminalWorkload && destination === '/run/freshell-opencode-transfer') {
+        const relative = path.relative(this.policy.runtimeRootPrefix, source)
+        const parts = relative.split(path.sep)
+        if (mode !== 'ro'
+          || !isStrictDescendant(source, this.policy.runtimeRootPrefix)
+          || parts.length !== 4
+          || !/^[a-zA-Z0-9-]+$/.test(parts[0])
+          || parts[1] !== 'x'
+          || parts[2] !== 'opencode-transfers'
+          || !/^opencode-transfer-[a-zA-Z0-9-]+\.ready$/.test(parts[3])
+          || opencodeTransferStagePath) {
+          return { ok: false, reason: `unapproved OpenCode transfer stage bind ${bind}` }
+        }
+        opencodeTransferStagePath = source
         continue
       }
       if (destination === '/run/freshell-host-actor' && mode === 'rw') {
@@ -982,6 +999,10 @@ export class RestrictedDockerBroker {
       return { ok: false, reason: `unapproved bind ${bind}` }
     }
     if (!hostBinaryPath || !runtimeDir || !providerVolumeName) return { ok: false, reason: 'required binary/runtime/provider-volume bind topology missing' }
+    if (opencodeTransferStagePath
+      && path.dirname(opencodeTransferStagePath) !== path.join(path.dirname(runtimeDir), 'opencode-transfers')) {
+      return { ok: false, reason: 'OpenCode transfer stage is not owned by the active runtime root' }
+    }
     if (terminalWorkload && !workspacePath) return { ok: false, reason: 'terminal workload missing approved workspace bind' }
     const actorKey = createHash('sha256').update(`${installationId}\0${soulId}`).digest('hex')
     const expectedActorStateDir = path.join(path.dirname(runtimeDir), 'souls', actorKey, 'actor')

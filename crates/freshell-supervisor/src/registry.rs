@@ -4,9 +4,10 @@ use freshell_runtime_protocol::{
     AllocationState, CleanupState, DesiredState, DockerDaemonId, DurabilityState, FixtureKind,
     FreshAgentLaunchSpec, FreshAgentTurnSettings, GrantId, HostBootId, IncarnationId, IncidentId,
     InstallationId, LaunchNonce, LaunchState, LostSoulRepairTarget, NoticeId,
-    OpenCodeTransferDescriptor, RecoveryAttemptId, RecoveryBlockReason, RecoveryPath,
-    RecoveryState, RecoveryTrigger, RequestId, RestoreLostSoulsRequest, ResumeSpec, RuntimeLimits,
-    RuntimeProfile, RuntimeView, SoulId, StopOutcome, TerminalLaunchSpec, ViewIntentRequest,
+    OpenCodeAdoptionBaseline, OpenCodeTransferDescriptor, RecoveryAttemptId, RecoveryBlockReason,
+    RecoveryPath, RecoveryState, RecoveryTrigger, RequestId, RestoreLostSoulsRequest, ResumeSpec,
+    RuntimeLimits, RuntimeProfile, RuntimeView, SoulId, StopOutcome, TerminalLaunchSpec,
+    ViewIntentRequest,
 };
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use serde::{Deserialize, Serialize};
@@ -51,6 +52,36 @@ type NativeImportObservationRow = (
     u64,
 );
 type RecoveryRevisionFenceRow = (u64, u64, u64, u64, u64, Option<String>, String);
+type StoppedRepairStartStateRow = (
+    String,
+    String,
+    String,
+    u64,
+    String,
+    String,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+);
+type StoppedRepairTargetReceiptFenceRow = (
+    String,
+    String,
+    String,
+    Option<String>,
+    u64,
+    u64,
+    u64,
+    String,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    String,
+    u64,
+    String,
+    String,
+);
 
 #[derive(Debug, thiserror::Error)]
 pub enum RegistryError {
@@ -166,9 +197,6 @@ pub(crate) struct StoppedRepairOwnerCandidate {
     pub source_generation: Option<String>,
     pub native_import_state: NativeImportState,
     pub native_import_authority: String,
-    pub intent_revision: u64,
-    pub identity_revision: u64,
-    pub native_import_revision: u64,
     pub explicit_view_count: u64,
 }
 
@@ -180,6 +208,9 @@ pub(crate) struct StoppedRepairRootReceipt {
     pub root_session_id: String,
     pub canonical_soul_id: SoulId,
     pub transfer_id: String,
+    /// Passive, body-free evidence needed to revalidate this exact imported
+    /// baseline on an explicit resume. Payload bytes are never persisted.
+    pub adoption_baseline: OpenCodeAdoptionBaseline,
     pub destination_store_id: String,
     pub source_store_id: String,
     pub source_generation: String,
@@ -202,6 +233,26 @@ pub(crate) struct StoppedRepairRootReceipt {
     pub captured_native_import_authority: String,
     pub incarnation_id: IncarnationId,
     pub execution_generation: u64,
+}
+
+impl StoppedRepairRootReceipt {
+    pub(crate) fn adoption_baseline_matches_receipt(&self) -> bool {
+        let descriptor = &self.adoption_baseline.descriptor;
+        self.adoption_baseline.validate().is_ok()
+            && descriptor.transfer_id == self.transfer_id
+            && descriptor.provider == "opencode"
+            && descriptor.source_store_id == self.source_store_id
+            && descriptor.root_session_id == self.root_session_id
+            && descriptor.source_generation == self.source_generation
+            && descriptor.source_schema_fingerprint == self.source_schema_fingerprint
+            && descriptor.migration_journal_fingerprint == self.migration_journal_fingerprint
+            && descriptor.destination_store_id == self.destination_store_id
+            && descriptor.destination_database_path == ".local/share/opencode/opencode.db"
+            && descriptor.target_image_ref == self.target_image_ref
+            && descriptor.target_build_receipt == self.target_build_receipt
+            && descriptor.incarnation_id == self.incarnation_id.as_str()
+            && descriptor.bundle_sha256 == self.bundle_sha256
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -373,6 +424,7 @@ pub struct RecoveryContext {
     pub recovery_attempt_id: Option<RecoveryAttemptId>,
     pub control_epoch: u64,
     pub resume_spec: Option<ResumeSpec>,
+    pub opencode_adoption_baseline: Option<OpenCodeAdoptionBaseline>,
     pub project_key: String,
     pub profile: RuntimeProfile,
     pub fixture: Option<FixtureKind>,
@@ -1307,6 +1359,86 @@ impl Registry {
         .await
     }
 
+    /// Explicitly resumes a soul whose stopped OpenCode store was repaired.
+    /// The repair receipt and canonical origin owner must still be present;
+    /// this transition never creates a new soul or imports host data again.
+    pub async fn start_stopped_data_repair(
+        &self,
+        soul_id: SoulId,
+        expected_intent_revision: u64,
+    ) -> Result<u64, RegistryError> {
+        self.run_blocking(move |mut conn| {
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let current: StoppedRepairStartStateRow = tx.query_row(
+                "SELECT provider,desired_state,recovery_state,intent_revision,native_import_state,native_import_authority,native_import_source_store_id,native_import_root_session_id,native_import_source_generation FROM souls WHERE soul_id=?1",
+                params![soul_id.as_str()],
+                |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?,row.get(6)?,row.get(7)?,row.get(8)?)),
+            )?;
+            if current.3 != expected_intent_revision {
+                return Err(RegistryError::StaleIntentRevision {
+                    expected: expected_intent_revision,
+                    current: current.3,
+                });
+            }
+            let (Some(source_store_id), Some(root_session_id), Some(source_generation)) =
+                (current.6.as_deref(), current.7.as_deref(), current.8.as_deref())
+            else {
+                return Err(RegistryError::RecoveryBlocked {
+                    soul_id,
+                    reason: "DATA_REPAIR_RECEIPT_MISSING".into(),
+                });
+            };
+            if current.0 != "opencode"
+                || current.1 != "stopped"
+                || current.2 != "data_repair_complete"
+                || current.4 != NativeImportState::Completed.as_str()
+                || current.5 != "verified_import_receipt"
+            {
+                return Err(RegistryError::RecoveryBlocked {
+                    soul_id,
+                    reason: "DATA_REPAIR_NOT_RESUMABLE".into(),
+                });
+            }
+            let canonical_owner: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM native_origin_owners WHERE provider='opencode' AND source_store_id=?1 AND native_root_session_id=?2 AND source_generation=?3 AND owner_soul_id=?4 AND ownership_state='owned')",
+                params![source_store_id, root_session_id, source_generation, soul_id.as_str()],
+                |row| row.get(0),
+            )?;
+            let completed_repair: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM stopped_repair_root_receipts r JOIN stopped_repair_operations o ON o.operation_id=r.operation_id WHERE o.status='complete' AND r.canonical_soul_id=?1 AND r.root_session_id=?2)",
+                params![soul_id.as_str(), root_session_id],
+                |row| row.get(0),
+            )?;
+            if !canonical_owner || !completed_repair {
+                return Err(RegistryError::RecoveryBlocked {
+                    soul_id,
+                    reason: "DATA_REPAIR_RECEIPT_MISSING".into(),
+                });
+            }
+            let next_revision = expected_intent_revision
+                .checked_add(1)
+                .ok_or_else(|| RegistryError::Integrity("intent revision overflow".into()))?;
+            let now = now_millis();
+            let changed = tx.execute(
+                "UPDATE souls SET desired_state='running',intent_revision=?1,recovery_reason=NULL,recovery_attempt_id=NULL,updated_at=?2 WHERE soul_id=?3 AND desired_state='stopped' AND recovery_state='data_repair_complete' AND intent_revision=?4",
+                params![next_revision, now, soul_id.as_str(), expected_intent_revision],
+            )?;
+            if changed != 1 {
+                return Err(RegistryError::StaleIntentRevision {
+                    expected: expected_intent_revision,
+                    current: current.3,
+                });
+            }
+            tx.execute(
+                "UPDATE view_intents SET soul_intent_revision=?1,updated_at=?2 WHERE soul_id=?3",
+                params![next_revision, now, soul_id.as_str()],
+            )?;
+            tx.commit()?;
+            Ok(next_revision)
+        })
+        .await
+    }
+
     pub async fn validate_stop_cleanup_target(
         &self,
         soul_id: SoulId,
@@ -1958,6 +2090,9 @@ impl Registry {
                     && existing.program == resume_spec.program
                     && existing.cwd == resume_spec.cwd
                     && existing.workspace_path == resume_spec.workspace_path
+                    && existing.environment == resume_spec.environment
+                    && existing.opencode_adoption_baseline
+                        == resume_spec.opencode_adoption_baseline
                     && existing.checkpoint_revision == resume_spec.checkpoint_revision
                     && existing.checkpoint_references == resume_spec.checkpoint_references
                     && existing.durable_position == resume_spec.durable_position
@@ -2105,7 +2240,6 @@ impl Registry {
             let mut statement = conn.prepare(
                 "SELECT s.soul_id,s.native_import_source_store_id,COALESCE(s.native_import_root_session_id,s.native_session_id),\
                         s.native_import_source_generation,s.native_import_state,s.native_import_authority,\
-                        s.intent_revision,s.identity_revision,s.native_import_revision,\
                         (SELECT COUNT(*) FROM view_intents v WHERE v.soul_id=s.soul_id AND v.kind<>'automatic_primary')\
                  FROM souls s WHERE s.provider='opencode' AND (s.native_session_id=?1 OR s.native_import_root_session_id=?1)\
                  ORDER BY s.soul_id",
@@ -2119,9 +2253,6 @@ impl Registry {
                     row.get::<_, String>(4)?,
                     row.get::<_, String>(5)?,
                     row.get::<_, u64>(6)?,
-                    row.get::<_, u64>(7)?,
-                    row.get::<_, u64>(8)?,
-                    row.get::<_, u64>(9)?,
                 ))
             })?;
             let mut candidates = Vec::new();
@@ -2133,9 +2264,6 @@ impl Registry {
                     source_generation,
                     import_state,
                     native_import_authority,
-                    intent_revision,
-                    identity_revision,
-                    native_import_revision,
                     explicit_view_count,
                 ) = row?;
                 candidates.push(StoppedRepairOwnerCandidate {
@@ -2147,9 +2275,6 @@ impl Registry {
                     source_generation,
                     native_import_state: NativeImportState::parse(&import_state)?,
                     native_import_authority,
-                    intent_revision,
-                    identity_revision,
-                    native_import_revision,
                     explicit_view_count,
                 });
             }
@@ -2204,6 +2329,7 @@ impl Registry {
                 || !is_lower_hex_sha256(&receipt.reader_environment_sha256)
                 || !is_lower_hex_sha256(&receipt.bundle_sha256)
                 || receipt.transfer_id.is_empty()
+                || !receipt.adoption_baseline_matches_receipt()
             {
                 return Err(RegistryError::NativeIdentityConflict);
             }
@@ -2222,7 +2348,7 @@ impl Registry {
             }
             validate_stopped_repair_target_in_tx(&tx, &target)?;
 
-            let current: (String, String, String, Option<String>, u64, u64, u64, String, Option<String>, Option<String>, Option<String>, Option<String>, Option<String>, String, u64, String, String) = tx.query_row(
+            let current: StoppedRepairTargetReceiptFenceRow = tx.query_row(
                 "SELECT s.provider,s.provider_store_id,s.desired_state,s.loss_incident_id,s.identity_revision,s.evidence_revision,s.native_import_revision,s.native_import_state,s.native_import_source_store_id,s.native_import_root_session_id,s.native_import_source_generation,s.native_import_schema_fingerprint,s.native_import_migration_fingerprint,s.native_import_authority,i.execution_generation,i.launch_state,i.cleanup_state \
                  FROM souls s JOIN incarnations i ON i.soul_id=s.soul_id AND i.incarnation_id=?2 WHERE s.soul_id=?1",
                 params![target.soul_id.as_str(), receipt.incarnation_id.as_str()],
@@ -4022,9 +4148,13 @@ fn migrate_schema(conn: &mut Connection) -> Result<(), RegistryError> {
     }
     if schema == 12 {
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if !column_exists(&tx, "stopped_repair_operations", "targets_json")? {
+            tx.execute_batch(
+                "ALTER TABLE stopped_repair_operations ADD COLUMN targets_json TEXT NOT NULL DEFAULT '[]';",
+            )?;
+        }
         tx.execute_batch(
             r#"
-            ALTER TABLE stopped_repair_operations ADD COLUMN targets_json TEXT NOT NULL DEFAULT '[]';
             CREATE TABLE IF NOT EXISTS stopped_repair_root_receipts (
                 operation_id TEXT NOT NULL REFERENCES stopped_repair_operations(operation_id),
                 root_session_id TEXT NOT NULL,
@@ -4558,6 +4688,84 @@ pub(crate) fn load_owned_handle(
     ))
 }
 
+struct StoppedRepairAdoptionBaselineLookup<'a> {
+    soul_id: &'a SoulId,
+    provider: &'a str,
+    provider_store_id: &'a str,
+    native_session_id: Option<&'a str>,
+    native_import_state: &'a str,
+    native_import_authority: &'a str,
+    source_store_id: Option<&'a str>,
+    root_session_id: Option<&'a str>,
+    source_generation: Option<&'a str>,
+}
+
+fn load_stopped_repair_adoption_baseline(
+    conn: &Connection,
+    lookup: &StoppedRepairAdoptionBaselineLookup<'_>,
+) -> Result<Option<OpenCodeAdoptionBaseline>, RegistryError> {
+    if lookup.provider != "opencode"
+        || lookup.native_import_state != NativeImportState::Completed.as_str()
+        || lookup.native_import_authority != "verified_import_receipt"
+    {
+        return Ok(None);
+    }
+    let Some(root_session_id) = lookup.root_session_id.or(lookup.native_session_id) else {
+        return Ok(None);
+    };
+    let mut statement = conn.prepare(
+        "SELECT r.import_receipt_json FROM stopped_repair_root_receipts r \
+         JOIN stopped_repair_operations o ON o.operation_id=r.operation_id \
+         JOIN native_origin_owners n ON n.provider='opencode' \
+          AND n.source_store_id=r.source_store_id \
+          AND n.native_root_session_id=r.root_session_id \
+          AND n.owner_soul_id=r.canonical_soul_id \
+          AND n.source_generation=r.source_generation AND n.ownership_state='owned' \
+         WHERE r.canonical_soul_id=?1 AND r.root_session_id=?2 \
+          AND o.status IN ('withdraw_pending','complete') \
+         ORDER BY r.updated_at DESC LIMIT 2",
+    )?;
+    let rows = statement
+        .query_map(params![lookup.soul_id.as_str(), root_session_id], |row| {
+            row.get::<_, String>(0)
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    if rows.is_empty() {
+        return Ok(None);
+    }
+    if rows.len() != 1 {
+        return Err(RegistryError::Integrity(
+            "repaired OpenCode soul has multiple exact adoption baselines".into(),
+        ));
+    }
+    let receipt: StoppedRepairRootReceipt = serde_json::from_str(&rows[0])?;
+    if !receipt.adoption_baseline_matches_receipt() {
+        return Err(RegistryError::Integrity(
+            "repaired OpenCode adoption baseline disagrees with its repair receipt".into(),
+        ));
+    }
+    let baseline = receipt.adoption_baseline;
+    let descriptor = &baseline.descriptor;
+    if receipt.canonical_soul_id != *lookup.soul_id
+        || receipt.root_session_id != root_session_id
+        || receipt.destination_store_id != lookup.provider_store_id
+        || Some(receipt.source_store_id.as_str()) != lookup.source_store_id
+        || Some(receipt.source_generation.as_str()) != lookup.source_generation
+        || descriptor.provider != lookup.provider
+        || descriptor.destination_store_id != lookup.provider_store_id
+        || descriptor.root_session_id != root_session_id
+        || descriptor.source_store_id != receipt.source_store_id
+        || descriptor.source_generation != receipt.source_generation
+        || descriptor.bundle_sha256 != receipt.bundle_sha256
+    {
+        return Err(RegistryError::Integrity(
+            "repaired OpenCode adoption baseline disagrees with the soul's verified import state"
+                .into(),
+        ));
+    }
+    Ok(Some(baseline))
+}
+
 fn load_recovery_context(
     conn: &Connection,
     installation: InstallationId,
@@ -4657,6 +4865,20 @@ fn load_recovery_context(
         .22
         .map(|value| serde_json::from_str(&value))
         .transpose()?;
+    let opencode_adoption_baseline = load_stopped_repair_adoption_baseline(
+        conn,
+        &StoppedRepairAdoptionBaselineLookup {
+            soul_id,
+            provider: &row.0,
+            provider_store_id: &row.1,
+            native_session_id: row.2.as_deref(),
+            native_import_state: &row.13,
+            native_import_authority: &row.20,
+            source_store_id: row.14.as_deref(),
+            root_session_id: row.15.as_deref(),
+            source_generation: row.16.as_deref(),
+        },
+    )?;
     // Coding providers may create a conversation while handling the initial
     // execution grant, before an input row or native-ID acknowledgement exists.
     // Only the existing settled rejection transaction proves an issued grant
@@ -4699,6 +4921,7 @@ fn load_recovery_context(
             .map_err(|_| RegistryError::Integrity("invalid recovery attempt id".into()))?,
         control_epoch: row.28,
         resume_spec,
+        opencode_adoption_baseline,
         project_key: row.23.clone(),
         profile: parse_runtime_profile(&row.24)?,
         fixture: prior_handle.fixture(),
@@ -7869,6 +8092,27 @@ pub(crate) mod tests {
             .store_verified_resume_spec(soul.clone(), resume_spec)
             .await
             .unwrap();
+        let descriptor = opencode_transfer_descriptor("baseline-upgrade");
+        let upgraded_baseline = freshell_runtime_protocol::OpenCodeAdoptionBaseline {
+            manifest_sha256: format!("{:x}", Sha256::digest(descriptor.manifest_json.as_bytes())),
+            descriptor,
+        };
+        let mut upgraded = resume_spec.clone();
+        upgraded.opencode_adoption_baseline = Some(upgraded_baseline.clone());
+        upgraded.environment.insert(
+            "OPENCODE_DB".into(),
+            "/home/freshell/provider/.local/share/opencode/opencode.db".into(),
+        );
+        let upgraded = registry
+            .store_verified_resume_spec(soul.clone(), upgraded)
+            .await
+            .unwrap();
+        assert_eq!(upgraded.opencode_adoption_baseline, Some(upgraded_baseline));
+        assert_eq!(
+            upgraded.environment.get("OPENCODE_DB").map(String::as_str),
+            Some("/home/freshell/provider/.local/share/opencode/opencode.db")
+        );
+        let resume_spec = upgraded;
         let start = registry
             .begin_recovery(
                 soul.clone(),
