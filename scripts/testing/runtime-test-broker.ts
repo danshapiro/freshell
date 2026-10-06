@@ -6,6 +6,76 @@ import path from 'node:path'
 
 const DOCKER_API_PREFIX = '/v1.47'
 const MAX_REQUEST_BYTES = 2 * 1024 * 1024
+const INDEXED_TMPFS_OPTIONS = 'size=64m,mode=0700,uid=65534,gid=0,nr_inodes=1024,nosuid,nodev,noexec'
+
+function indexedLabels(input: PreparedInputAuthorization): Record<string, string> {
+  return {
+    'com.freshell.managed-inputs': 'true',
+    'com.freshell.installation-id': input.installationId,
+    'com.freshell.soul-id': input.soulId,
+    'com.freshell.incarnation-id': input.incarnationId,
+    'com.freshell.input-generation': input.generationId,
+  }
+}
+
+function equalRecord(actual: unknown, expected: Record<string, unknown>): boolean {
+  if (!actual || typeof actual !== 'object' || Array.isArray(actual)) return false
+  const record = actual as Record<string, unknown>
+  return Object.keys(record).length === Object.keys(expected).length
+    && Object.entries(expected).every(([key, value]) => record[key] === value)
+}
+
+function privateHelperEnvironment(value: unknown, home: boolean): boolean {
+  if (!Array.isArray(value) || value.length > 128) return false
+  const names = new Set<string>()
+  for (const entry of value) {
+    if (typeof entry !== 'string') return false
+    const separator = entry.indexOf('=')
+    const name = entry.slice(0, separator)
+    const contents = entry.slice(separator + 1)
+    const expected = name === 'HOME' && home ? '/home/freshell/provider' : ''
+    if (separator < 1 || !/^[a-zA-Z0-9_]{1,128}$/.test(name)
+      || names.has(name) || contents !== expected) return false
+    names.add(name)
+  }
+  return !home || names.has('HOME')
+}
+
+function preparedMountsMatch(actual: unknown[], input: PreparedInputAuthorization): boolean {
+  const expected: Record<string, unknown>[] = input.configurationBinds.map((bind) => ({
+    Type: 'bind', Source: path.join(input.stageRoot, bind.sourceRelativePath), Target: bind.effectiveDestination, ReadOnly: true,
+  }))
+  expected.push(...input.resourceMounts.map((mount) => ({
+    Type: 'volume', Source: input.providerVolumeName, Target: mount.effectiveDestination, ReadOnly: mount.kind === 'file',
+    VolumeOptions: { NoCopy: true, Subpath: mount.providerRelativePath },
+  })))
+  if (input.indexedFiles) {
+    expected.push(...input.indexedFiles.aliases.map((alias) => ({
+      Type: 'volume', Source: input.indexedFiles!.volumeName, Target: alias.effectiveDestination, ReadOnly: true,
+      VolumeOptions: { NoCopy: true, Subpath: `files/source-${alias.sourceId}` },
+    })))
+    expected.push(...input.indexedSecretSources.map((source) => ({
+      Type: 'volume', Source: input.indexedFiles!.volumeName, Target: `/run/freshell-secrets/provider-${source.grantIndex}`, ReadOnly: true,
+      VolumeOptions: { NoCopy: true, Subpath: `files/source-${source.sourceId}` },
+    })))
+  }
+  if (actual.length !== expected.length) return false
+  const remaining = new Map(expected.map((mount) => [mount.Target, mount]))
+  for (const value of actual) {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) return false
+    const mount = value as Record<string, any>
+    const wanted = remaining.get(mount.Target)
+    if (!wanted || Object.keys(mount).some((key) => !['Type','Source','Target','ReadOnly','VolumeOptions'].includes(key))
+      || ['Type','Source','Target','ReadOnly'].some((key) => mount[key] !== wanted[key])) return false
+    if (wanted.Type === 'volume') {
+      const options = mount.VolumeOptions
+      const wantedOptions = wanted.VolumeOptions as Record<string, unknown>
+      if (!options || Object.keys(options).length !== 2 || options.NoCopy !== true || options.Subpath !== wantedOptions.Subpath) return false
+    } else if (mount.VolumeOptions !== undefined) return false
+    remaining.delete(mount.Target)
+  }
+  return remaining.size === 0
+}
 
 export type BrokerReceipt = {
   containerId: string
@@ -49,6 +119,21 @@ export type RestrictedDockerBrokerPolicy = {
   logPath: string
 }
 
+export type PreparedInputAuthorization = {
+  installationId: string
+  soulId: string
+  incarnationId: string
+  imageRef: string
+  hostBinaryPath: string
+  providerVolumeName: string
+  stageRoot: string
+  generationId: string
+  configurationBinds: { sourceRelativePath: string; effectiveDestination: string }[]
+  resourceMounts: { providerRelativePath: string; effectiveDestination: string; kind: 'file' | 'directory' }[]
+  indexedFiles?: { volumeName: string; aliases: { sourceId: number; effectiveDestination: string }[] }
+  indexedSecretSources: { grantIndex: number; sourceId: number }[]
+}
+
 type DockerResponse = {
   statusCode: number
   headers: http.IncomingHttpHeaders
@@ -56,6 +141,13 @@ type DockerResponse = {
 }
 
 export class RestrictedDockerBroker {
+  private readonly preparedInputs = new Map<string, PreparedInputAuthorization>()
+  private readonly inputVolumes = new Set<string>()
+  private readonly inputPublishers = new Map<string, {
+    input: PreparedInputAuthorization
+    expected: Record<string, any>
+    containerId?: string
+  }>()
   private readonly knownContainerIds = new Set<string>()
   private readonly receiptsById = new Map<string, BrokerReceipt>()
   private readonly historyHelpers = new Map<string, { owner: BrokerReceipt; containerId?: string; kind: 'history' | 'auth' }>()
@@ -64,6 +156,58 @@ export class RestrictedDockerBroker {
   private stopFailuresRemaining = 0
 
   constructor(private readonly policy: RestrictedDockerBrokerPolicy) {}
+
+  authorizePreparedInputs(input: PreparedInputAuthorization): void {
+    const safeId = (value: string) => /^[a-zA-Z0-9_-]{1,128}$/.test(value)
+    const relative = path.relative(path.dirname(this.policy.runtimeRootPrefix), input.stageRoot)
+    if (!safeId(input.installationId) || !safeId(input.soulId) || !safeId(input.incarnationId)
+      || !/^grant-[a-zA-Z0-9-]{1,122}$/.test(input.generationId)
+      || !new RegExp(`^scenarios/[^/]+/control/provider-roots/${input.generationId}$`).test(relative)
+      || !this.policy.allowedHostBinaryPaths.has(input.hostBinaryPath)
+      || !this.policy.allowedImageRefs.has(input.imageRef)
+      || !/^freshell-provider-[a-f0-9]{24}$/.test(input.providerVolumeName)) {
+      throw new Error('prepared input owner/stage is outside this fixture run')
+    }
+    if (Buffer.byteLength(JSON.stringify(input)) >= 1024 * 1024) throw new Error('prepared input metadata exceeds control profile')
+    const unit = (value: string, prefix: string) => value.startsWith(prefix)
+      && /^[a-zA-Z0-9_-]{1,128}$/.test(value.slice(prefix.length))
+    const destination = (value: string) => path.isAbsolute(value) && path.normalize(value) === value
+      && !/[\x00-\x1f\x7f]/.test(value)
+      && (this.isAllowedWorkspacePath(value)
+        || [...this.policy.allowedProviderUserRoots ?? []].some((root) => value === root || isStrictDescendant(value, root)))
+    const targets = new Set<string>()
+    const claim = (value: string) => {
+      if (!destination(value) || targets.has(value)) throw new Error('prepared input target is outside selected fixture roots or duplicated')
+      targets.add(value)
+    }
+    for (const bind of input.configurationBinds) {
+      if (!unit(bind.sourceRelativePath, '.freshell/templates/')) throw new Error('prepared template source is invalid')
+      claim(bind.effectiveDestination)
+    }
+    for (const mount of input.resourceMounts) {
+      const relative=mount.kind==='file' && mount.providerRelativePath.endsWith('/source') ? mount.providerRelativePath.slice(0,-'/source'.length) : mount.providerRelativePath;
+      if (!unit(relative, '.freshell/provider-roots/') || (mount.kind==='file' && !mount.providerRelativePath.endsWith('/source')) || !['file', 'directory'].includes(mount.kind)) throw new Error('prepared resource source is invalid')
+      claim(mount.effectiveDestination)
+    }
+    if (input.indexedFiles) {
+      const expected = `freshell-inputs-${createHash('sha256').update(`${input.soulId}\0${input.generationId}`).digest('hex').slice(0,24)}`
+      if (input.indexedFiles.volumeName !== expected || input.indexedFiles.aliases.length > 256 || input.indexedSecretSources.length > 128) throw new Error('prepared indexed volume identity/profile is invalid')
+      for (const alias of input.indexedFiles.aliases) {
+        if (!Number.isInteger(alias.sourceId) || alias.sourceId < 0 || alias.sourceId >= 128) throw new Error('prepared indexed source id is invalid')
+        claim(alias.effectiveDestination)
+      }
+    } else if (input.indexedSecretSources.length) throw new Error('prepared private source has no indexed volume')
+    const indexes = new Set<number>()
+    for (const index of input.indexedSecretSources) {
+      if (!Number.isInteger(index.grantIndex) || index.grantIndex < 0 || index.grantIndex >= 132
+        || !Number.isInteger(index.sourceId) || index.sourceId < 0 || index.sourceId >= 128 || indexes.has(index.grantIndex)) throw new Error('prepared private input index is invalid')
+      indexes.add(index.grantIndex)
+    }
+    const key = `${input.installationId}\0${input.soulId}\0${input.incarnationId}\0${input.generationId}`
+    const previous = this.preparedInputs.get(key)
+    if (previous && JSON.stringify(previous) !== JSON.stringify(input)) throw new Error('prepared input generation changed; reconcile before replacement')
+    this.preparedInputs.set(key, structuredClone(input))
+  }
 
   get proxySocketPath(): string {
     return this.policy.proxySocketPath
@@ -74,7 +218,7 @@ export class RestrictedDockerBroker {
   }
 
   receiptIds(): Set<string> {
-    return new Set([...this.knownContainerIds, ...[...this.historyHelpers.values()].flatMap((helper) => helper.containerId ? [helper.containerId] : [])])
+    return new Set([...this.knownContainerIds, ...[...this.historyHelpers.values(),...this.inputPublishers.values()].flatMap((helper) => helper.containerId ? [helper.containerId] : [])])
   }
 
   eventsSnapshot(): BrokerEvent[] {
@@ -137,14 +281,79 @@ export class RestrictedDockerBroker {
       await this.forwardAndReply(request, response, body, { destructive: false })
       return
     }
+    if (method==='GET' && [...this.policy.allowedImageRefs].some((image)=>url===`${DOCKER_API_PREFIX}/images/${image}/json`)) {
+      await this.forwardAndReply(request,response,body,{destructive:false})
+      return
+    }
 
     const volume = url.match(/^\/v1\.47\/volumes\/(freshell-provider-[a-f0-9]{24})$/)?.[1]
     if (method === 'GET' && volume && this.receipts().some((receipt) => receipt.providerVolumeName === volume)) {
       await this.forwardAndReply(request, response, body, { destructive: false })
       return
     }
+    const indexedVolume=url.match(/^\/v1\.47\/volumes\/(freshell-inputs-[a-f0-9]{24})$/)?.[1]
+    const input=indexedVolume && [...this.preparedInputs.values()].find((candidate)=>candidate.indexedFiles?.volumeName===indexedVolume)
+    if (method==='GET' && input) {
+      await this.forwardAndReply(request,response,body,{destructive:false})
+      return
+    }
+    if (method==='DELETE' && input && this.inputVolumes.has(indexedVolume!)) {
+      const inspected=await this.forward({method:'GET',url:`${DOCKER_API_PREFIX}/volumes/${indexedVolume}`,headers:{}} as IncomingMessage,Buffer.alloc(0))
+      let metadata:Record<string,unknown>={}
+      try {metadata=JSON.parse(inspected.body.toString())} catch {}
+      if (inspected.statusCode!==404 && (metadata.Name!==indexedVolume || metadata.Driver!=='local'
+        || !equalRecord(metadata.Labels,indexedLabels(input)) || !equalRecord(metadata.Options,{type:'tmpfs',device:'tmpfs',o:INDEXED_TMPFS_OPTIONS}))) {
+        this.block(response,method,url,403,'indexed volume ownership changed',true)
+        return
+      }
+      await this.forwardAndReply(request,response,body,{destructive:true})
+      return
+    }
+    if (method==='POST' && url===`${DOCKER_API_PREFIX}/volumes/create`) {
+      let parsed:Record<string,any>={}
+      try {parsed=JSON.parse(body.toString())} catch {}
+      const input=[...this.preparedInputs.values()].find((candidate)=>candidate.indexedFiles?.volumeName===parsed.Name)
+      if (!input || Object.keys(parsed).length!==4 || parsed.Driver!=='local'
+        || !equalRecord(parsed.DriverOpts,{type:'tmpfs',device:'tmpfs',o:INDEXED_TMPFS_OPTIONS}) || !equalRecord(parsed.Labels,indexedLabels(input))) {
+        this.block(response,method,url,403,'indexed volume must match an owned bounded preparation',true)
+        return
+      }
+      this.inputVolumes.add(parsed.Name)
+      await this.forwardAndReply(request,response,body,{destructive:false})
+      return
+    }
 
     const helperTarget = url.match(/^\/v1\.47\/containers\/([^/?]+)(?:\/(start|wait|logs|json))?(?:\?.*)?$/)
+    const publisher=helperTarget && [...this.inputPublishers].find(([name,publisher])=>helperTarget[1]===name || helperTarget[1]===publisher.containerId)
+    if (publisher) {
+      const [name,owned]=publisher
+      const exactId=helperTarget![1]===owned.containerId
+      if (method==='DELETE' && !exactId) {
+        const inspected=await this.forward({method:'GET',url:`${DOCKER_API_PREFIX}/containers/${name}/json`,headers:{}} as IncomingMessage,Buffer.alloc(0))
+        let actual:Record<string,any>={}
+        try {actual=JSON.parse(inspected.body.toString())} catch {}
+        const environment=(entries:unknown)=>Array.isArray(entries)?JSON.stringify([...entries].sort()):undefined
+        const ownedConfig=inspected.statusCode===404 || (inspected.statusCode===200 && ['Image','User','Tty'].every((key)=>actual.Config?.[key]===owned.expected[key])
+          && ['Entrypoint','Cmd'].every((key)=>JSON.stringify(actual.Config?.[key])===JSON.stringify(owned.expected[key]))
+          && equalRecord(actual.Config?.Labels,owned.expected.Labels)
+          && environment(actual.Config?.Env)===environment(owned.expected.Env)
+          && Array.isArray(actual.HostConfig?.Mounts) && actual.HostConfig.Mounts.length===3
+          && owned.expected.HostConfig.Mounts.every((expected:Record<string,any>)=>actual.HostConfig.Mounts.some((mount:Record<string,any>)=>
+            ['Type','Source','Target','ReadOnly'].every((key)=>mount[key]===expected[key])
+            && (expected.Type!=='volume' || (mount.VolumeOptions?.NoCopy===true && (mount.VolumeOptions.Subpath ?? '')==='' && !mount.VolumeOptions.DriverConfig))))
+          && actual.HostConfig?.LogConfig?.Type==='none')
+        if (!ownedConfig) {
+          this.block(response,method,url,403,'indexed publisher named cleanup ownership changed',true)
+          return
+        }
+      }
+      if ((method==='GET' && url===`${DOCKER_API_PREFIX}/containers/${helperTarget![1]}/json`)
+        || (method==='POST' && exactId && url===`${DOCKER_API_PREFIX}/containers/${owned.containerId}/start`)
+        || (method==='DELETE' && url===`${DOCKER_API_PREFIX}/containers/${helperTarget![1]}?force=1`)) {
+        await this.forwardAndReply(request,response,body,{destructive:method!=='GET',containerId:owned.containerId,helperName:name})
+        return
+      }
+    }
     const helperEntry = helperTarget && [...this.historyHelpers].find(([name, helper]) => (
       helperTarget[1] === name || helperTarget[1] === helper.containerId
     ))
@@ -167,6 +376,29 @@ export class RestrictedDockerBroker {
 
     if (method === 'POST' && url.startsWith(`${DOCKER_API_PREFIX}/containers/create?`)) {
       const name = new URL(url, 'http://docker').searchParams.get('name') ?? ''
+      if (/^freshell-inputs-[a-f0-9]{24}-publisher$/.test(name)) {
+        const input=this.validateInputPublisher(name,body)
+        if (!input || this.inputPublishers.has(name)) {
+          this.block(response,method,url,403,'indexed publisher must match an owned fixed preparation',false)
+          return
+        }
+        const publisher:{input:PreparedInputAuthorization;expected:Record<string,any>;containerId?:string}={input,expected:JSON.parse(body.toString())}
+        this.inputPublishers.set(name,publisher)
+        try {
+          const forwarded=await this.forward(request,body)
+          if (forwarded.statusCode===201) {
+            const parsed=JSON.parse(forwarded.body.toString())
+            if (typeof parsed.Id!=='string' || !/^[a-f0-9]{64}$/.test(parsed.Id) || this.receiptIds().has(parsed.Id)) throw new Error('invalid indexed publisher identity')
+            publisher.containerId=parsed.Id
+          }
+          this.record({method,url,decision:'forward',destructive:false,unsafeAttempt:false,helperName:name,containerId:publisher.containerId,providerVolumeName:input.indexedFiles!.volumeName})
+          replyDocker(response,forwarded)
+        } catch {
+          response.statusCode=503
+          response.end(JSON.stringify({message:'indexed publisher acknowledgement unavailable; exact ownership inspection required'}))
+        }
+        return
+      }
       if (name.startsWith('freshell-history-') || name.startsWith('freshell-auth-')) {
         const kind = name.startsWith('freshell-auth-') ? 'auth' : 'history'
         const owner = kind === 'auth' ? this.validateAuthHelper(name, body) : this.validateHistoryHelper(name, body)
@@ -283,6 +515,9 @@ export class RestrictedDockerBroker {
     if (!incarnationId || !soulId || !installationId) return { ok: false, reason: 'missing installation/incarnation/soul labels' }
 
     const host = parsed.HostConfig ?? {}
+    if (host.Mounts !== undefined && !Array.isArray(host.Mounts)) {
+      return { ok: false, reason: 'typed mounts require an exact owned provider preparation authorization' }
+    }
     const terminalWorkload = host.NetworkMode === 'bridge'
     const freshAgentWorkload = Array.isArray(parsed.Env) && parsed.Env.some((value: unknown) => (
       typeof value === 'string' && value.startsWith('FRESHELL_HOSTED_FRESH_AGENT=')
@@ -393,7 +628,39 @@ export class RestrictedDockerBroker {
     if (binds.some((bind) => bind.includes('docker.sock') || bind.includes('/var/lib/freshell-supervisor') || bind.includes('/run/freshell-supervisor'))) {
       return { ok: false, reason: 'management-state mount is forbidden' }
     }
+    const prepared=[...this.preparedInputs.values()].filter((input) => input.installationId === installationId
+      && input.soulId === soulId && input.incarnationId === incarnationId && input.imageRef === imageRef
+      && input.hostBinaryPath === hostBinaryPath && input.providerVolumeName === providerVolumeName);
+    if ((host.Mounts?.length || prepared.length) && !prepared.some((input)=>preparedMountsMatch(host.Mounts ?? [],input))) return { ok: false, reason: 'typed mounts differ from this attempt owned prepared input set' }
     return { ok: true, incarnationId, soulId, imageRef, runtimeDir, hostBinaryPath, ...(providerVolumeName ? { providerVolumeName } : {}), ...(workspacePath ? { workspacePath } : {}) }
+  }
+
+  private validateInputPublisher(name:string,body:Buffer):PreparedInputAuthorization | undefined {
+    let parsed:Record<string,any>
+    try {parsed=JSON.parse(body.toString())} catch {return}
+    const input=[...this.preparedInputs.values()].find((input)=>`${input.indexedFiles?.volumeName}-publisher`===name)
+    if (!input || !this.inputVolumes.has(input.indexedFiles!.volumeName) || parsed.Image!==input.imageRef
+      || parsed.User!=='65534:0' || parsed.Tty!==false || !equalRecord(parsed.Labels,indexedLabels(input))
+      || JSON.stringify(parsed.Entrypoint)!==JSON.stringify(['/runtime/freshell-session-host'])
+      || JSON.stringify(parsed.Cmd)!==JSON.stringify(['publish-provider-inputs']) || !privateHelperEnvironment(parsed.Env,false)) return
+    const host=parsed.HostConfig ?? {}
+    if (Object.keys(parsed).some((key)=>!['Image','User','Tty','Labels','Entrypoint','Cmd','Env','HostConfig'].includes(key))
+      || Object.keys(host).some((key)=>!['NetworkMode','ReadonlyRootfs','CapDrop','SecurityOpt','Memory','MemorySwap','NanoCpus','PidsLimit','LogConfig','Mounts'].includes(key))) return
+    if (host.NetworkMode!=='none' || host.ReadonlyRootfs!==true || host.Privileged===true || (host.PidMode ?? '')!==''
+      || (host.Binds?.length ?? 0)!==0 || (host.CapAdd?.length ?? 0)!==0 || Object.keys(host.Tmpfs ?? {}).length
+      || JSON.stringify(host.CapDrop)!==JSON.stringify(['ALL']) || JSON.stringify(host.SecurityOpt)!==JSON.stringify(['no-new-privileges'])
+      || host.Memory!==128*1024*1024 || host.MemorySwap!==128*1024*1024 || host.NanoCpus!==500_000_000 || host.PidsLimit!==32
+      || !equalRecord(host.LogConfig,{Type:'none',Config:host.LogConfig?.Config}) || Object.keys(host.LogConfig?.Config ?? {}).length) return
+    const mounts=host.Mounts
+    if (!Array.isArray(mounts) || mounts.length!==3) return
+    const binary=mounts.find((mount)=>mount.Type==='bind' && mount.Source===input.hostBinaryPath && mount.Target==='/runtime/freshell-session-host' && mount.ReadOnly===true)
+    const volume=mounts.find((mount)=>mount.Type==='volume' && mount.Source===input.indexedFiles!.volumeName && mount.Target==='/run/freshell-input-files' && mount.ReadOnly===false && equalRecord(mount.VolumeOptions,{NoCopy:true}))
+    const exchange=mounts.find((mount)=>mount.Type==='bind' && mount.Target==='/run/freshell-input-exchange' && mount.ReadOnly===true
+      && typeof mount.Source==='string' && path.dirname(mount.Source)===os.tmpdir()
+      && /^freshell-inputs-[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/.test(path.basename(mount.Source)))
+    if (!binary || !volume || !exchange || [binary,volume,exchange].some((mount)=>Object.keys(mount).some((key)=>!['Type','Source','Target','ReadOnly','VolumeOptions'].includes(key)))
+      || binary.VolumeOptions!==undefined || exchange.VolumeOptions!==undefined) return
+    return input
   }
 
   private validateHistoryHelper(name: string, body: Buffer): BrokerReceipt | undefined {
@@ -435,7 +702,7 @@ export class RestrictedDockerBroker {
     const same = (actual: unknown, expected: unknown) => JSON.stringify(actual) === JSON.stringify(expected)
     if (Object.keys(parsed.Labels ?? {}).length !== 0 || parsed.User !== '65534:0' || parsed.Tty !== false
       || !same(parsed.Entrypoint, ['/runtime/freshell-session-host']) || !same(parsed.Cmd, ['native-auth-only'])
-      || !same(parsed.Env, ['HOME=/home/freshell/provider'])) return
+      || !privateHelperEnvironment(parsed.Env,true)) return
     if (host.NetworkMode !== 'none' || host.ReadonlyRootfs !== true || host.Privileged === true
       || (host.PidMode ?? '') !== '' || (host.Binds?.length ?? 0) !== 0 || (host.CapAdd?.length ?? 0) !== 0
       || !same(host.CapDrop, ['ALL']) || !same(host.SecurityOpt, ['no-new-privileges'])
@@ -462,9 +729,9 @@ export class RestrictedDockerBroker {
     return false
   }
 
-  private async forwardAndReply(request: IncomingMessage, response: ServerResponse, body: Buffer, event: { destructive: boolean; containerId?: string }): Promise<void> {
+  private async forwardAndReply(request: IncomingMessage, response: ServerResponse, body: Buffer, event: { destructive: boolean; containerId?: string; helperName?:string }): Promise<void> {
     const forwarded = await this.forward(request, body)
-    this.record({ method: request.method ?? 'GET', url: request.url ?? '/', decision: 'forward', destructive: event.destructive, unsafeAttempt: false, containerId: event.containerId })
+    this.record({ method: request.method ?? 'GET', url: request.url ?? '/', decision: 'forward', destructive: event.destructive, unsafeAttempt: false, containerId: event.containerId,helperName:event.helperName })
     replyDocker(response, forwarded)
   }
 
