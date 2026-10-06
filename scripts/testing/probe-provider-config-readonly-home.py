@@ -40,6 +40,7 @@ def main():
         (skills / "new.sh").chmod(0o750)
         (skills / "resource").write_text("resource-nonce\n")
         (stage / "manifest.json").write_text('["skills"]')
+        (stage / "provider.json").write_text('"codex"')
         (stage / "projection/.freshell-config-projection.json").write_text(
             '["skills","skills/new.sh","skills/resource"]'
         )
@@ -47,9 +48,27 @@ def main():
         broken.mkdir(parents=True)
         (broken / "bad").symlink_to("missing-resource")
         (stage / "broken/manifest.json").write_text('["skills"]')
+        (stage / "broken/provider.json").write_text('"codex"')
         (stage / "broken/projection/.freshell-config-projection.json").write_text(
             '["skills","skills/bad"]'
         )
+        aliases = stage / "aliases/projection"
+        for name in ["skill-root", "discovered-root"]:
+            resource = aliases / ".freshell/resources" / name
+            resource.mkdir(parents=True)
+            (resource / "resource").write_text(name + "-nonce\n")
+            (resource / "run").write_text('#!/bin/sh\ncat "$(dirname "$0")/resource"\n')
+            (resource / "run").chmod(0o750)
+        (aliases / ".codex").mkdir()
+        (aliases / ".codex/skills").symlink_to("../.freshell/resources/skill-root")
+        (aliases / ".freshell/resources/skill-root/freshell-discovered-agents").symlink_to("../discovered-root")
+        (stage / "aliases/provider.json").write_text('"codex"')
+        (stage / "aliases/manifest.json").write_text(json.dumps([
+            ".codex/skills", ".codex/skills/freshell-discovered-agents", ".freshell/resources"
+        ]))
+        (aliases / ".freshell-config-projection.json").write_text(json.dumps([
+            path.relative_to(aliases).as_posix() for path in aliases.rglob("*")
+        ]))
         for path in stage.rglob("*"):
             if path.is_symlink():
                 continue
@@ -106,8 +125,20 @@ test "$("$home/skills/new.sh")" = resource-nonce
 test "$before_home" = "$(stat -c "%i:%u:%g:%a" "$home")"
 test "$before_sibling" = "$(stat -c "%i:%u:%g:%a" "$home/skills/provider-sibling")"
 test -z "$(find "$home" -maxdepth 1 -name ".freshell-copy-*" -print)"
+/runtime/freshell-session-host refresh-provider-config /probe-stage/aliases "$home"
+printf alias-sibling-nonce > "$home/.codex/skills/provider-sibling"
+before_alias_sibling=$(stat -c "%i:%u:%g:%a" "$home/.codex/skills/provider-sibling")
+for attempt in 1 2 3; do
+  /runtime/freshell-session-host refresh-provider-config /probe-stage/aliases "$home"
+  test "$("$home/.codex/skills/run")" = skill-root-nonce
+  test "$("$home/.codex/skills/freshell-discovered-agents/run")" = discovered-root-nonce
+  test "$before_alias_sibling" = "$(stat -c "%i:%u:%g:%a" "$home/.codex/skills/provider-sibling")"
+  test "$(cat "$home/.codex/skills/provider-sibling")" = alias-sibling-nonce
+  test "$before_home" = "$(stat -c "%i:%u:%g:%a" "$home")"
+done
+test -z "$(find "$home" -maxdepth 1 -name ".freshell-copy-*" -print)"
 '
-printf 'readonly-home-provider-helper PASS uid=65534 gid=0 caps=0 stable-home retained-sibling executable-resource stale-removed failed-refresh-preserved retry\n'
+printf 'readonly-home-provider-helper PASS uid=65534 gid=0 caps=0 stable-home retained-sibling executable-resource stale-removed failed-refresh-preserved retry nested-codex-alias-three-resumes\n'
 '''
             )
             inspection = json.loads(docker("inspect", owned_name).stdout)[0]

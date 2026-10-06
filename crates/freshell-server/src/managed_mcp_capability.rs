@@ -1324,6 +1324,144 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn managed_codex_linked_skills_and_discovery_form_a_resumable_graph() {
+        use freshell_platform::provider_environment::{copy_environment, CopySelection};
+        use std::{
+            fs,
+            os::unix::fs::{symlink, MetadataExt, PermissionsExt},
+            process::Command,
+        };
+        let root = tempfile::tempdir().unwrap();
+        let original = root.path().join("original");
+        let external = root.path().join("external-skills");
+        let discovered = original.join(".agents/skills");
+        for directory in [&external, &discovered] {
+            fs::create_dir_all(directory.join("fixture/scripts")).unwrap();
+            fs::write(directory.join("fixture/SKILL.md"), "fixture").unwrap();
+            fs::write(directory.join("fixture/resource"), "resource-nonce\n").unwrap();
+            let script = directory.join("fixture/scripts/run");
+            fs::write(
+                &script,
+                "#!/bin/sh\ncat \"$(dirname \"$0\")/../resource\"\n",
+            )
+            .unwrap();
+            fs::set_permissions(script, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        fs::create_dir_all(original.join(".codex")).unwrap();
+        symlink(&external, original.join(".codex/skills")).unwrap();
+        let context = crate::managed_provider_bootstrap::provider_launch_context_from_home(
+            "codex",
+            root.path(),
+            &original,
+            None,
+        )
+        .unwrap()
+        .unwrap();
+        let controller = stage_provider_root(
+            &root.path().join("control/capabilities"),
+            "grant-codex-roundtrip",
+            "codex",
+            &original,
+            &context.config,
+            OpencodeEphemeralInput::default(),
+            None,
+        )
+        .unwrap();
+        let stage = root.path().join("host-stage");
+        fs::create_dir(&stage).unwrap();
+        let projection = stage.join("projection");
+        let selections = context
+            .config
+            .iter()
+            .map(|reference| CopySelection {
+                source: controller.join(&reference.relative_path),
+                destination_relative: reference.provider_relative_path.clone().into(),
+            })
+            .collect::<Vec<_>>();
+        let report = copy_environment(&selections, &projection, &[], Default::default()).unwrap();
+        assert!(fs::symlink_metadata(projection.join(".codex/skills"))
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        let resources = [
+            ".codex/skills/fixture/scripts/run",
+            ".codex/skills/freshell-discovered-agents/fixture/scripts/run",
+        ];
+        for relative in resources {
+            let output = Command::new(projection.join(relative)).output().unwrap();
+            assert!(output.status.success(), "{output:?}");
+            assert_eq!(output.stdout, b"resource-nonce\n");
+        }
+        // The ordinary controller test always exercises discovery, transport,
+        // and resource execution. A focused integration invocation can also
+        // supply the separately built production host to exercise publication.
+        if let Some(binary) = std::env::var_os("FRESHELL_TEST_SESSION_HOST_BINARY") {
+            let binary = PathBuf::from(binary);
+            assert!(binary.is_absolute() && binary.is_file());
+            fs::write(stage.join("provider.json"), r#""codex""#).unwrap();
+            fs::write(
+                stage.join("manifest.json"),
+                serde_json::to_vec(
+                    &context
+                        .config
+                        .iter()
+                        .map(|reference| &reference.provider_relative_path)
+                        .collect::<Vec<_>>(),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+            fs::write(
+                projection.join(".freshell-config-projection.json"),
+                serde_json::to_vec(
+                    &report
+                        .projected_paths
+                        .iter()
+                        .map(|path| path.to_str().unwrap())
+                        .collect::<Vec<_>>(),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+            let home = root.path().join("provider-home");
+            fs::create_dir(&home).unwrap();
+            fs::set_permissions(&home, fs::Permissions::from_mode(0o700)).unwrap();
+            let run = || {
+                let output = Command::new(&binary)
+                    .arg("refresh-provider-config")
+                    .arg(&stage)
+                    .arg(&home)
+                    .output()
+                    .unwrap();
+                assert!(output.status.success(), "{output:?}");
+                assert!(output.stdout.is_empty());
+                for line in std::str::from_utf8(&output.stderr).unwrap().lines() {
+                    let event: serde_json::Value = serde_json::from_str(line).unwrap();
+                    assert_eq!(event["provider"], "codex");
+                    assert_eq!(event["stage"], "provider_publication");
+                    eprintln!("{line}");
+                }
+            };
+            run();
+            let sibling = home.join(".codex/skills/provider-sibling");
+            fs::write(&sibling, "sibling-nonce").unwrap();
+            let inode = fs::metadata(&sibling).unwrap().ino();
+            for _ in 0..3 {
+                run();
+                for relative in resources {
+                    let output = Command::new(home.join(relative)).output().unwrap();
+                    assert!(output.status.success(), "{output:?}");
+                    assert_eq!(output.stdout, b"resource-nonce\n");
+                }
+                assert_eq!(fs::metadata(&sibling).unwrap().ino(), inode);
+                assert_eq!(fs::read(&sibling).unwrap(), b"sibling-nonce");
+            }
+            eprintln!("controller-host-codex-alias-roundtrip PASS initial-and-three-resumes executable-discovery preserved-sibling");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn managed_provider_resource_script_and_dependency_execute() {
         use std::{os::unix::fs::PermissionsExt, process::Command};
         let root = tempfile::tempdir().unwrap();

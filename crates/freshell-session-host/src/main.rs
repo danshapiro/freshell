@@ -959,6 +959,7 @@ async fn grant_execution(
             }
             if !exact_resume {
                 prepare_provider_bootstrap_files(
+                    launch.provider.as_str(),
                     &launch.provider_bootstrap_files,
                     launch.run_as_uid,
                     launch.run_as_gid,
@@ -1074,6 +1075,7 @@ fn prepare_provider_state_for_fresh_launch(
         |terminal| {
             let mut created = providers::prepare_provider_state_before_bootstrap(terminal)?;
             match write_provider_bootstrap_files(
+                &terminal.mode,
                 &terminal.provider_bootstrap_files,
                 Path::new("/home/freshell/provider"),
                 Path::new("/run/freshell-bootstrap"),
@@ -1088,6 +1090,7 @@ fn prepare_provider_state_for_fresh_launch(
         },
         |terminal, created| {
             transfer_created_paths(
+                &terminal.mode,
                 Path::new("/home/freshell/provider"),
                 created,
                 terminal.run_as_uid,
@@ -1127,6 +1130,7 @@ fn prepare_provider_state_before_bootstrap_with(
 }
 
 fn transfer_created_paths(
+    provider: &str,
     home: &Path,
     created: &[PathBuf],
     uid: u32,
@@ -1172,34 +1176,47 @@ fn transfer_created_paths(
         }
     }
     let started = std::time::Instant::now();
-    tracing::info!(
-        event = "provider.environment.ownership.started",
-        stage = "session_host",
-        entries = paths.len()
-    );
+    let entries = paths.len();
+    emit_environment_event(serde_json::json!({
+        "severity": "info", "event": "provider.environment.ownership.started",
+        "stage": "session_host", "provider": provider, "entries": entries
+    }));
     let mut ordered = std::mem::take(&mut paths).into_iter().collect::<Vec<_>>();
     ordered.sort_by_key(|path| std::cmp::Reverse(path.components().count()));
     for path in ordered {
-        set_owner(&path,uid,gid).inspect_err(|error| {tracing::error!(event="provider.environment.ownership.failed",stage="session_host",relative_path=%path.strip_prefix(home).unwrap_or(Path::new("")).display(),elapsed_ms=started.elapsed().as_millis() as u64,operation="lchown",target_uid=uid,target_gid=gid,%error);})?;
+        set_owner(&path, uid, gid).inspect_err(|error| {
+            emit_environment_event(serde_json::json!({
+                "severity": "error", "event": "provider.environment.ownership.failed",
+                "stage": "session_host", "provider": provider,
+                "relative_path": path.strip_prefix(home).unwrap_or(Path::new("")),
+                "elapsed_ms": started.elapsed().as_millis() as u64,
+                "operation": "lchown", "target_uid": uid, "target_gid": gid,
+                "error": error
+            }));
+        })?;
     }
-    tracing::info!(
-        event = "provider.environment.ownership.completed",
-        stage = "session_host",
-        entries = created.len(),
-        elapsed_ms = started.elapsed().as_millis() as u64
-    );
+    emit_environment_event(serde_json::json!({
+        "severity": "info", "event": "provider.environment.ownership.completed",
+        "stage": "session_host", "provider": provider, "entries": entries,
+        "elapsed_ms": started.elapsed().as_millis() as u64
+    }));
     Ok(())
 }
 
 fn prepare_provider_bootstrap_files(
+    provider: &str,
     files: &[ProviderBootstrapFile],
     run_as_uid: u32,
     run_as_gid: u32,
 ) -> Result<(), String> {
     let home = Path::new("/home/freshell/provider");
-    let created =
-        write_provider_bootstrap_files(files, home, Path::new("/run/freshell-bootstrap"))?;
-    transfer_created_paths(home, &created, run_as_uid, run_as_gid)
+    let created = write_provider_bootstrap_files(
+        provider,
+        files,
+        home,
+        Path::new("/run/freshell-bootstrap"),
+    )?;
+    transfer_created_paths(provider, home, &created, run_as_uid, run_as_gid)
 }
 
 fn rollback_created_provider_paths(paths: &[PathBuf]) {
@@ -1216,6 +1233,8 @@ fn rollback_created_provider_paths(paths: &[PathBuf]) {
     }
 }
 struct BootstrapPublication {
+    provider: String,
+    home: PathBuf,
     // Every newly published inode needs ownership handoff, including replacements.
     owned_paths: std::collections::BTreeSet<PathBuf>,
     // Only newly created pathnames grant removal authority on failure.
@@ -1241,34 +1260,49 @@ impl Drop for BootstrapPublication {
         rollback_created_provider_paths(&self.new_paths);
         for (destination, backup) in self.replacements.iter().rev() {
             if let Err(error) = std::fs::rename(backup, destination) {
-                tracing::error!(event = "provider.bootstrap.rollback.failed", stage = "session_host", operation = "restore_replacement", path = %destination.display(), %error);
+                emit_environment_event(serde_json::json!({
+                    "severity": "error", "event": "provider.bootstrap.rollback.failed",
+                    "stage": "session_host", "provider": self.provider,
+                    "operation": "restore_replacement",
+                    "relative_path": destination.strip_prefix(&self.home).unwrap_or(Path::new("")),
+                    "error_kind": format!("{:?}", error.kind()), "os_error": error.raw_os_error()
+                }));
             }
         }
     }
 }
 
 fn write_provider_bootstrap_files(
+    provider: &str,
     files: &[ProviderBootstrapFile],
     home: &Path,
     source_root: &Path,
 ) -> Result<Vec<PathBuf>, String> {
-    write_provider_bootstrap_files_with_publish(files, home, source_root, |source, destination| {
-        std::fs::rename(source, destination)
-    })
+    write_provider_bootstrap_files_with_publish(
+        provider,
+        files,
+        home,
+        source_root,
+        |source, destination| std::fs::rename(source, destination),
+    )
 }
 
 fn write_provider_bootstrap_files_with_publish(
+    provider: &str,
     files: &[ProviderBootstrapFile],
     home: &Path,
     source_root: &Path,
     mut publish: impl FnMut(&Path, &Path) -> std::io::Result<()>,
 ) -> Result<Vec<PathBuf>, String> {
-    use freshell_platform::provider_environment::{copy_environment, CopyLimits, CopySelection};
+    use freshell_platform::provider_environment::CopySelection;
     if !std::fs::symlink_metadata(home)
         .is_ok_and(|metadata| metadata.is_dir() && !metadata.file_type().is_symlink())
     {
         return Err("managed provider HOME volume is not mounted as a physical directory".into());
     }
+    // This writer runs only during trusted initial preparation, before HOME
+    // ownership is handed to the provider. Refresh preserves the initialized root.
+    set_mode(home, 0o700)?;
     let mut destinations = Vec::with_capacity(files.len());
     for file in files {
         let relative = Path::new(&file.provider_relative_path);
@@ -1328,14 +1362,17 @@ fn write_provider_bootstrap_files_with_publish(
             })
         })
         .collect::<Result<Vec<_>, String>>()?;
-    copy_environment(
+    copy_environment_with_events(
+        "bootstrap_inputs",
+        provider,
         &selections,
         &stage.path().join("inputs"),
         &[],
-        CopyLimits::default(),
     )
     .map_err(|error| error.to_string())?;
     let mut created = BootstrapPublication {
+        provider: provider.into(),
+        home: home.into(),
         owned_paths: std::collections::BTreeSet::new(),
         new_paths: Vec::new(),
         replacements: Vec::new(),
@@ -1395,6 +1432,53 @@ fn write_provider_bootstrap_files_with_publish(
     Ok(paths.into_iter().collect())
 }
 
+// Preparation produces at most start/completion (or failure) records per copy,
+// never per-file events. Keep protocol stdout exclusively for its existing uses.
+fn emit_environment_event(event: serde_json::Value) {
+    use std::io::Write;
+    let line = freshell_runtime_observability::scrub(&event.to_string(), "");
+    let _ = writeln!(std::io::stderr().lock(), "{line}");
+}
+
+fn copy_environment_with_events(
+    stage: &str,
+    provider: &str,
+    selections: &[freshell_platform::provider_environment::CopySelection],
+    destination: &Path,
+    excluded: &[PathBuf],
+) -> Result<
+    freshell_platform::provider_environment::CopyReport,
+    freshell_platform::provider_environment::CopyError,
+> {
+    let started = std::time::Instant::now();
+    emit_environment_event(serde_json::json!({
+        "severity": "info", "event": "provider.environment.copy.started",
+        "stage": stage, "provider": provider, "selections": selections.len()
+    }));
+    let report = freshell_platform::provider_environment::copy_environment(
+        selections,
+        destination,
+        excluded,
+        Default::default(),
+    )
+    .inspect_err(|error| {
+        emit_environment_event(serde_json::json!({
+            "severity": "error", "event": "provider.environment.copy.failed",
+            "stage": stage, "provider": provider,
+            "relative_path": error.relative_path, "operation": error.operation,
+            "limit_kind": error.limit_kind, "observed": error.observed,
+            "permitted": error.permitted, "corrective_message": error.corrective_message,
+            "elapsed_ms": started.elapsed().as_millis() as u64
+        }));
+    })?;
+    emit_environment_event(serde_json::json!({
+        "severity": "info", "event": "provider.environment.copy.completed",
+        "stage": stage, "provider": provider, "entries": report.entries,
+        "bytes": report.bytes, "elapsed_ms": started.elapsed().as_millis() as u64
+    }));
+    Ok(report)
+}
+
 fn copy_provider_config_references(
     context: &freshell_runtime_protocol::ProviderLaunchContext,
     provider: &str,
@@ -1422,7 +1506,7 @@ fn copy_provider_config_references_with_ownership(
     provider_home: &Path,
     run_as: (u32, u32),
 ) -> Result<(), String> {
-    use freshell_platform::provider_environment::{copy_environment, CopyLimits, CopySelection};
+    use freshell_platform::provider_environment::CopySelection;
     use freshell_runtime_protocol::ProviderConfigRoot;
     context.validate(provider).map_err(|error| error.message)?;
     let selections = provider_config_references(context)
@@ -1439,26 +1523,15 @@ fn copy_provider_config_references_with_ownership(
             }
         })
         .collect::<Vec<_>>();
-    let started = std::time::Instant::now();
-    tracing::info!(
-        event = "provider.environment.copy.started",
-        stage = "session_host",
-        provider,
-        selections = selections.len()
-    );
     let excluded = provider_credential_sources(user_provider_root);
-    let report=copy_environment(&selections,provider_home,&excluded,CopyLimits::default()).map_err(|error| {
-        tracing::error!(event="provider.environment.copy.failed",stage="session_host",provider,relative_path=%error.relative_path.display(),operation=error.operation,limit_kind=error.limit_kind,observed=error.observed,permitted=error.permitted,corrective_message=%error.corrective_message,elapsed_ms=started.elapsed().as_millis() as u64);
-        error.to_string()
-    })?;
-    tracing::info!(
-        event = "provider.environment.copy.completed",
-        stage = "session_host",
+    let report = copy_environment_with_events(
+        "session_host",
         provider,
-        entries = report.entries,
-        bytes = report.bytes,
-        elapsed_ms = started.elapsed().as_millis() as u64
-    );
+        &selections,
+        provider_home,
+        &excluded,
+    )
+    .map_err(|error| error.to_string())?;
     let projected = report
         .projected_paths
         .iter()
@@ -1600,6 +1673,11 @@ fn refresh_provider_config_references(
         serde_json::to_vec(&destinations).map_err(|error| error.to_string())?,
     )
     .map_err(|error| error.to_string())?;
+    std::fs::write(
+        stage.path().join("provider.json"),
+        serde_json::to_vec(provider).map_err(|error| error.to_string())?,
+    )
+    .map_err(|error| error.to_string())?;
     allow_provider_read_stage(stage.path(), run_as_gid)?;
     if run_as_uid == unsafe { libc::geteuid() } && run_as_gid == unsafe { libc::getegid() } {
         return apply_staged_provider_config(stage.path(), provider_home);
@@ -1697,13 +1775,21 @@ fn apply_staged_provider_config(stage: &Path, provider_home: &Path) -> Result<()
         {
             return Err("provider config refresh destination is unsafe".into());
         }
-        let mut parent = provider_home.to_path_buf();
-        for part in path.parent().into_iter().flat_map(Path::components) {
-            parent.push(part.as_os_str());
-            if std::fs::symlink_metadata(&parent)
-                .is_ok_and(|metadata| metadata.file_type().is_symlink())
-            {
-                return Err("provider config refresh parent cannot be a symlink".into());
+        // Destination selections are logical graph routes, and may traverse a
+        // selected skills alias. The common copier resolves those routes from
+        // the staged graph, then validates every physical publication parent.
+        // Manifest entries instead name physical inodes used for stale removal.
+        if previous.contains(relative) || current.contains(relative) {
+            let mut parent = provider_home.to_path_buf();
+            for part in path.parent().into_iter().flat_map(Path::components) {
+                parent.push(part.as_os_str());
+                if std::fs::symlink_metadata(&parent)
+                    .is_ok_and(|metadata| metadata.file_type().is_symlink())
+                {
+                    return Err(
+                        "provider config refresh physical parent cannot be a symlink".into(),
+                    );
+                }
             }
         }
         if destinations
@@ -1725,11 +1811,23 @@ fn apply_staged_provider_config(stage: &Path, provider_home: &Path) -> Result<()
             },
         )
         .collect::<Vec<_>>();
-    freshell_platform::provider_environment::copy_environment(
+    let provider = match std::fs::read(stage.join("provider.json")) {
+        Ok(bytes) => serde_json::from_slice::<String>(&bytes).map_err(|error| error.to_string())?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => "unknown".into(),
+        Err(error) => return Err(error.to_string()),
+    };
+    if !matches!(
+        provider.as_str(),
+        "claude" | "codex" | "opencode" | "amplifier" | "unknown"
+    ) {
+        return Err("provider config refresh provider is unsupported".into());
+    }
+    copy_environment_with_events(
+        "provider_publication",
+        &provider,
         &selections,
         provider_home,
         &[],
-        Default::default(),
     )
     .map_err(|error| error.to_string())?;
     let mut stale = previous.difference(&current).collect::<Vec<_>>();
@@ -2954,6 +3052,204 @@ mod tests {
         assert!(!destination.join(".claude/settings.json").exists());
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn provider_config_codex_linked_skills_and_discovery_survive_repeated_resume() {
+        use freshell_platform::provider_environment::{copy_environment, CopySelection};
+        use freshell_runtime_protocol::{
+            ProviderConfigReference, ProviderConfigRoot, ProviderLaunchContext, ProviderPreparation,
+        };
+        use std::os::unix::fs::{symlink, MetadataExt, PermissionsExt};
+        let root = tempfile::tempdir().unwrap();
+        let original = root.path().join("original");
+        let external = root.path().join("external-skills");
+        let discovered = original.join(".agents/skills");
+        for directory in [&external, &discovered] {
+            std::fs::create_dir_all(directory.join("fixture/scripts")).unwrap();
+            std::fs::write(directory.join("fixture/SKILL.md"), "fixture").unwrap();
+            std::fs::write(directory.join("fixture/resource"), "resource-nonce\n").unwrap();
+            let script = directory.join("fixture/scripts/run");
+            std::fs::write(
+                &script,
+                "#!/bin/sh\ncat \"$(dirname \"$0\")/../resource\"\n",
+            )
+            .unwrap();
+            std::fs::set_permissions(script, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        std::fs::create_dir_all(original.join(".codex")).unwrap();
+        symlink(&external, original.join(".codex/skills")).unwrap();
+        let controller = root.path().join("controller");
+        copy_environment(
+            &[
+                CopySelection {
+                    source: original.join(".codex/skills"),
+                    destination_relative: "skills".into(),
+                },
+                CopySelection {
+                    source: discovered,
+                    destination_relative: "freshell-discovered-agents".into(),
+                },
+            ],
+            &controller,
+            &[],
+            Default::default(),
+        )
+        .unwrap();
+        let context = ProviderLaunchContext {
+            preparation: ProviderPreparation::Codex {
+                tui_args: vec![],
+                sidecar_args: vec![],
+            },
+            mcp_capability: None,
+            config: [
+                ("skills", ".codex/skills"),
+                (
+                    "freshell-discovered-agents",
+                    ".codex/skills/freshell-discovered-agents",
+                ),
+                (".freshell/resources", ".freshell/resources"),
+            ]
+            .into_iter()
+            .map(|(source, destination)| ProviderConfigReference {
+                root: ProviderConfigRoot::UserProvider,
+                relative_path: source.into(),
+                provider_relative_path: destination.into(),
+                format: "directory".into(),
+            })
+            .collect(),
+        };
+        let home = root.path().join("provider");
+        std::fs::create_dir(&home).unwrap();
+        let uid = unsafe { libc::geteuid() };
+        let gid = unsafe { libc::getegid() };
+        copy_provider_config_references(
+            &context,
+            "codex",
+            root.path(),
+            &controller,
+            &home,
+            uid,
+            gid,
+        )
+        .unwrap();
+        assert!(std::fs::symlink_metadata(home.join(".codex/skills"))
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        let sibling = home.join(".codex/skills/provider-sibling");
+        std::fs::write(&sibling, "durable-nonce").unwrap();
+        let inode = std::fs::metadata(&sibling).unwrap().ino();
+        for _ in 0..3 {
+            refresh_provider_config_references(
+                &context,
+                "codex",
+                root.path(),
+                &controller,
+                &home,
+                uid,
+                gid,
+            )
+            .unwrap();
+            for relative in [
+                ".codex/skills/fixture/scripts/run",
+                ".codex/skills/freshell-discovered-agents/fixture/scripts/run",
+            ] {
+                let output = std::process::Command::new(home.join(relative))
+                    .output()
+                    .unwrap();
+                assert!(output.status.success(), "{output:?}");
+                assert_eq!(output.stdout, b"resource-nonce\n");
+            }
+            assert_eq!(std::fs::metadata(&sibling).unwrap().ino(), inode);
+            assert_eq!(std::fs::read(&sibling).unwrap(), b"durable-nonce");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn provider_config_unplanned_parent_alias_does_not_modify_outside_target() {
+        use std::os::unix::fs::{symlink, MetadataExt};
+        let root = tempfile::tempdir().unwrap();
+        let outside = root.path().join("outside");
+        let home = root.path().join("home");
+        let stage = root.path().join("stage");
+        std::fs::create_dir(&outside).unwrap();
+        std::fs::create_dir(&home).unwrap();
+        std::fs::create_dir_all(stage.join("projection/.codex/skills")).unwrap();
+        std::fs::write(outside.join("sentinel"), "unchanged").unwrap();
+        let inode = std::fs::metadata(outside.join("sentinel")).unwrap().ino();
+        symlink(&outside, home.join(".codex")).unwrap();
+        std::fs::write(stage.join("manifest.json"), r#"[".codex/skills"]"#).unwrap();
+        std::fs::write(
+            stage.join("projection").join(PROVIDER_PROJECTION_MANIFEST),
+            r#"[".codex",".codex/skills"]"#,
+        )
+        .unwrap();
+        assert!(apply_staged_provider_config(&stage, &home).is_err());
+        assert_eq!(
+            std::fs::metadata(outside.join("sentinel")).unwrap().ino(),
+            inode
+        );
+        assert_eq!(
+            std::fs::read(outside.join("sentinel")).unwrap(),
+            b"unchanged"
+        );
+        assert!(!outside.join("skills").exists());
+    }
+
+    #[test]
+    fn provider_config_spawned_host_preparation_emits_safe_jsonl() {
+        // Re-exec an existing behavior test so the production preparation and
+        // ownership helpers run in a fresh process with no tracing subscriber.
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "tests::provider_config_first_amplifier_launch_transfers_exact_created_state_before_copy", "--nocapture"])
+            .output().unwrap();
+        assert!(output.status.success(), "{output:?}");
+        let events = std::str::from_utf8(&output.stderr)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        for name in [
+            "provider.environment.ownership.started",
+            "provider.environment.ownership.completed",
+            "provider.environment.copy.started",
+            "provider.environment.copy.completed",
+        ] {
+            let event = events
+                .iter()
+                .find(|event| event["event"] == name && event["stage"] == "session_host")
+                .expect("spawned preparation must emit each event");
+            assert_eq!(event["provider"], "amplifier");
+        }
+        // The existing selected-resource failure regression runs both a real
+        // successful copy and a missing selected input in the fresh process.
+        let failed = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "tests::provider_config_exact_resume_refreshes_changes_and_removes_stale_projection", "--nocapture"])
+            .output().unwrap();
+        assert!(failed.status.success(), "{failed:?}");
+        let events = std::str::from_utf8(&failed.stderr)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        let event = events
+            .iter()
+            .find(|event| {
+                event["event"] == "provider.environment.copy.failed"
+                    && event["stage"] == "session_host"
+            })
+            .expect("spawned failed preparation must emit typed error");
+        assert_eq!(event["provider"], "claude");
+        assert_eq!(event["relative_path"], ".claude/settings.json");
+        assert_eq!(event["operation"], "select");
+        assert!(event["corrective_message"]
+            .as_str()
+            .unwrap()
+            .contains("repair"));
+        assert!(event["elapsed_ms"].as_u64().is_some());
+    }
+
     #[test]
     fn provider_identity_command_uses_clear_groups_only_when_switching_identity() {
         let uid = unsafe { libc::geteuid() };
@@ -3666,9 +3962,67 @@ mod tests {
         };
         thread_local! {pub(crate) static OPERATIONS: RefCell<Vec<PathBuf>> = const {RefCell::new(Vec::new())};}
         fn handoff(home: &Path, ledger: &[PathBuf]) -> Result<(), String> {
-            transfer_created_paths(home, ledger, unsafe { libc::geteuid() }, unsafe {
-                libc::getegid()
-            })
+            transfer_created_paths(
+                "amplifier",
+                home,
+                ledger,
+                unsafe { libc::geteuid() },
+                unsafe { libc::getegid() },
+            )
+        }
+        #[test]
+        fn initial_home_becomes_private_before_handoff_and_refresh_keeps_its_inode() {
+            use std::os::unix::fs::MetadataExt;
+            let root = tempfile::tempdir().unwrap();
+            let home = root.path().join("provider");
+            std::fs::create_dir(&home).unwrap();
+            std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o755)).unwrap();
+            std::fs::write(home.join("provider-sibling"), "durable").unwrap();
+            let inode = std::fs::metadata(&home).unwrap().ino();
+            let sibling = std::fs::metadata(home.join("provider-sibling")).unwrap();
+            let inputs = root.path().join("inputs");
+            std::fs::create_dir(&inputs).unwrap();
+            let ledger = write_provider_bootstrap_files("codex", &[], &home, &inputs).unwrap();
+            handoff(&home, &ledger).unwrap();
+            let initialized = std::fs::metadata(&home).unwrap();
+            assert_eq!(initialized.mode() & 0o777, 0o700);
+            assert_eq!(initialized.ino(), inode);
+            assert_eq!(initialized.uid(), unsafe { libc::geteuid() });
+            assert_eq!(initialized.gid(), unsafe { libc::getegid() });
+            let stage = root.path().join("stage");
+            std::fs::create_dir_all(stage.join("projection")).unwrap();
+            std::fs::write(stage.join("manifest.json"), "[]").unwrap();
+            std::fs::write(
+                stage.join("projection").join(PROVIDER_PROJECTION_MANIFEST),
+                "[]",
+            )
+            .unwrap();
+            apply_staged_provider_config(&stage, &home).unwrap();
+            let refreshed = std::fs::metadata(&home).unwrap();
+            assert_eq!(
+                (
+                    refreshed.ino(),
+                    refreshed.uid(),
+                    refreshed.gid(),
+                    refreshed.mode()
+                ),
+                (
+                    initialized.ino(),
+                    initialized.uid(),
+                    initialized.gid(),
+                    initialized.mode()
+                )
+            );
+            assert_eq!(
+                std::fs::metadata(home.join("provider-sibling"))
+                    .unwrap()
+                    .ino(),
+                sibling.ino()
+            );
+            assert_eq!(
+                std::fs::read(home.join("provider-sibling")).unwrap(),
+                b"durable"
+            );
         }
         #[test]
         fn all_selected_entries_above_ten_thousand_remain_runnable() {
@@ -3705,6 +4059,7 @@ mod tests {
             let mut ledger = ensured.created_paths;
             ledger.extend(
                 write_provider_bootstrap_files(
+                    "amplifier",
                     &[ProviderBootstrapFile {
                         source_path: inputs.join("provider-0").to_string_lossy().into_owned(),
                         provider_relative_path: "bootstrap/config.json".into(),
@@ -3781,7 +4136,7 @@ mod tests {
                     provider_relative_path: "bootstrap/second.json".into(),
                 },
             ];
-            assert!(write_provider_bootstrap_files(&files, &home, &inputs).is_err());
+            assert!(write_provider_bootstrap_files("amplifier", &files, &home, &inputs).is_err());
             assert!(!home.join("bootstrap").exists());
             assert_eq!(std::fs::read(home.join("sibling")).unwrap(), b"sentinel");
         }
@@ -3812,7 +4167,7 @@ mod tests {
                     provider_relative_path: "bootstrap/second.json".into(),
                 },
             ];
-            assert!(write_provider_bootstrap_files(&files, &home, &inputs).is_err());
+            assert!(write_provider_bootstrap_files("amplifier", &files, &home, &inputs).is_err());
             assert_eq!(
                 std::fs::read(&first).expect("prior config must survive failed bootstrap"),
                 b"prior-config"
@@ -3829,7 +4184,8 @@ mod tests {
             );
             assert!(!home.join("bootstrap/second.json").exists());
             std::fs::write(inputs.join("provider-1"), "second-config").unwrap();
-            let owned = write_provider_bootstrap_files(&files, &home, &inputs).unwrap();
+            let owned =
+                write_provider_bootstrap_files("amplifier", &files, &home, &inputs).unwrap();
             assert!(
                 owned.contains(&first),
                 "replacement inode needs exact ownership handoff"
@@ -3886,6 +4242,7 @@ mod tests {
             }
             let mut published = 0;
             let failure = write_provider_bootstrap_files_with_publish(
+                "amplifier",
                 &files,
                 &home,
                 &inputs,
@@ -3923,7 +4280,8 @@ mod tests {
                 1,
                 "attempt staging/backup paths must be cleaned"
             );
-            let owned = write_provider_bootstrap_files(&files, &home, &inputs).unwrap();
+            let owned =
+                write_provider_bootstrap_files("amplifier", &files, &home, &inputs).unwrap();
             assert!(owned.contains(&first));
             assert!(owned.contains(&last));
             assert!(owned.contains(&home.join("new-parent")));
@@ -4028,7 +4386,13 @@ mod tests {
             },
             |terminal, ledger| {
                 assert!(!home.join(".amplifier/skills").exists());
-                transfer_created_paths(&home, ledger, terminal.run_as_uid, terminal.run_as_gid)?;
+                transfer_created_paths(
+                    &terminal.mode,
+                    &home,
+                    ledger,
+                    terminal.run_as_uid,
+                    terminal.run_as_gid,
+                )?;
                 handed_off.set(true);
                 Ok(())
             },
