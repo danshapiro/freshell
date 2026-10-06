@@ -27,6 +27,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 const CAPABILITY_PATH: &str = ".freshell/mcp-capability.json";
 const GRANT_LIFETIME_SECS: u64 = 30 * 24 * 60 * 60;
 const RENEWAL_WINDOW_SECS: u64 = 7 * 24 * 60 * 60;
+mod source_stage;
 
 #[derive(Clone, Copy, Default)]
 pub(crate) struct OpencodeEphemeralInput<'a> {
@@ -35,6 +36,8 @@ pub(crate) struct OpencodeEphemeralInput<'a> {
     pub tui_source: Option<&'a ProviderConfigReference>,
     pub cwd: Option<&'a Path>,
     pub workspace: Option<&'a Path>,
+    pub source_plan:
+        Option<&'a [crate::managed_provider_references::sources::PlannedSourceOccurrence]>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -917,6 +920,14 @@ fn stage_provider_root(
             bytes = report.bytes,
             elapsed_ms = started.elapsed().as_millis() as u64
         );
+        if let Some(plan) = opencode_input.source_plan {
+            source_stage::stage(
+                &temporary,
+                home,
+                opencode_input.cwd.ok_or("source plan requires cwd")?,
+                plan,
+            )?;
+        }
         allow_controller_stage_read(&temporary)?;
         std::fs::rename(&temporary, &staged).map_err(|error| error.to_string())?;
         Ok(staged.clone())
@@ -1558,12 +1569,20 @@ mod tests {
             os::unix::fs::{symlink, MetadataExt, PermissionsExt},
             process::Command,
         };
-        let root = tempfile::tempdir().unwrap();
+        let root = executable_fixture_directory();
         let original = root.path().join("original");
         let external = root.path().join("external-skills");
         let discovered = original.join(".agents/skills");
         for directory in [&external, &discovered] {
             fs::create_dir_all(directory.join("fixture/scripts")).unwrap();
+            // Give this synthetic package its own native resolution boundary;
+            // an executable tempdir under /workspace must not inherit the
+            // repository's unrelated installed dependency tree.
+            fs::write(
+                directory.join("package.json"),
+                r#"{"name":"synthetic-codex-skills","private":true,"type":"commonjs"}"#,
+            )
+            .unwrap();
             fs::write(directory.join("fixture/SKILL.md"), "fixture").unwrap();
             fs::write(directory.join("fixture/resource"), "resource-nonce\n").unwrap();
             let script = directory.join("fixture/scripts/run");
@@ -2338,6 +2357,7 @@ mod tests {
                     tui_source: Some(&tui_source),
                     cwd: Some(home.path()),
                     workspace: Some(home.path()),
+                    source_plan: None,
                 },
                 None,
             )
@@ -2381,6 +2401,237 @@ mod tests {
     }
 
     #[test]
+    fn managed_provider_source_stage_retains_unexpanded_direct_origins() {
+        let owned = tempfile::tempdir().unwrap();
+        let home = owned.path().join("home");
+        let workspace = owned.path().join("workspace");
+        let config = workspace.join("opencode.json");
+        let direct = r#"{"instructions":["{file:rules}"],"model":"{env:MODEL}"}"#;
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::write(&config, direct).unwrap();
+        std::fs::write(workspace.join("rules"), "synthetic-private-selected-value").unwrap();
+        use crate::managed_provider_references::sources::*;
+        let plan = plan_opencode_sources(
+            vec![SourceOccurrence {
+                logical_path: config.clone(),
+                canonical_source: config.clone(),
+                lane: SourceLane::Main,
+            }],
+            &workspace,
+            &home,
+            &|_, _, _| None,
+        )
+        .unwrap();
+        let staged = stage_provider_root(
+            &owned.path().join("capabilities"),
+            "grant-source-stage",
+            "opencode",
+            &home,
+            &[],
+            OpencodeEphemeralInput {
+                cwd: Some(&workspace),
+                workspace: Some(&workspace),
+                source_plan: Some(&plan),
+                ..Default::default()
+            },
+            None,
+        )
+        .unwrap();
+        let manifest: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(staged.join(".freshell/input-manifest.json"))
+                .expect("preparation must publish its source manifest before the capability"),
+        )
+        .unwrap();
+        let source = &manifest["sources"][0];
+        assert_eq!(source["logicalPath"], config.to_string_lossy().as_ref());
+        assert_eq!(source["referencedVariables"], serde_json::json!(["MODEL"]), "host refresh must retain every finite source input, including variables that can introduce a later file token");
+        let raw = std::fs::read_to_string(
+            staged.join(source["unexpandedRelativePath"].as_str().unwrap()),
+        )
+        .unwrap();
+        assert_eq!(
+            raw, direct,
+            "direct recipes also need the original source for host selection revalidation"
+        );
+        let template =
+            std::fs::read_to_string(staged.join(source["templateRelativePath"].as_str().unwrap()))
+                .unwrap();
+        assert!(template.contains("{env:MODEL}"));
+        assert!(template.contains("{file:/home/freshell/provider/.freshell/references/0}"));
+        assert!(
+            !std::fs::read_to_string(staged.join(".freshell/input-manifest.json"))
+                .unwrap()
+                .contains("synthetic-private-selected-value")
+        );
+        assert_eq!(std::fs::read_to_string(&config).unwrap(), direct);
+        std::fs::remove_file(config).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(
+                staged.join(source["unexpandedRelativePath"].as_str().unwrap())
+            )
+            .unwrap(),
+            direct
+        );
+    }
+
+    #[test]
+    fn managed_provider_source_stage_generated_view_replays_without_original_tree() {
+        use crate::managed_provider_references::sources::*;
+        use freshell_platform::opencode_recipe::{GeneratedFileRecipe, SourceManifest};
+        let owned = tempfile::tempdir().unwrap();
+        let home = owned.path().join("home");
+        let workspace = owned.path().join("workspace");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&workspace).unwrap();
+        let config = workspace.join("tui.json");
+        let raw = r#"{"message":"{env:INTRO}"}"#;
+        std::fs::write(&config, raw).unwrap();
+        std::fs::write(workspace.join("rules"), "synthetic-file-value").unwrap();
+        let lookup =
+            |name: &str| (name == "INTRO").then(|| "synthetic-child-value{file:rules}".into());
+        let plan = plan_opencode_sources(
+            vec![SourceOccurrence {
+                logical_path: config.clone(),
+                canonical_source: config.clone(),
+                lane: SourceLane::Tui,
+            }],
+            &workspace,
+            &home,
+            &|_, _, name| lookup(name),
+        )
+        .unwrap();
+        let store = CapabilityStore::default();
+        let directory = owned.path().join("capabilities");
+        std::fs::create_dir(&directory).unwrap();
+        let grant = store
+            .issue(
+                SoulId::new(),
+                &directory,
+                "http://host.docker.internal:4000".into(),
+                Some(("opencode", &home, &[])),
+                OpencodeEphemeralInput {
+                    cwd: Some(&workspace),
+                    workspace: Some(&workspace),
+                    source_plan: Some(&plan),
+                    ..Default::default()
+                },
+                None,
+            )
+            .unwrap();
+        let staged = staged_provider_root_path(&directory, &grant.grant_id).unwrap();
+        let metadata = std::fs::read(staged.join(".freshell/input-manifest.json")).unwrap();
+        let manifest: SourceManifest = serde_json::from_slice(&metadata).unwrap();
+        let view = &manifest.sources[0];
+        assert!(view.lane == freshell_platform::opencode_recipe::SourceLane::Tui);
+        let raw_view =
+            std::fs::read_to_string(staged.join(&view.unexpanded_relative_path)).unwrap();
+        assert_eq!(raw_view, raw);
+        let template = std::fs::read_to_string(staged.join(&view.template_relative_path)).unwrap();
+        assert!(!template.contains("synthetic-child-value"));
+        assert!(!String::from_utf8(metadata)
+            .unwrap()
+            .contains("synthetic-child-value"));
+        assert!(!serde_json::to_string(&grant)
+            .unwrap()
+            .contains("synthetic-child-value"));
+        std::fs::remove_dir_all(&workspace).unwrap();
+        let recipe = GeneratedFileRecipe {
+            generated_name: view.generated_name.clone().unwrap(),
+            unexpanded_source: raw_view,
+            declaring_config: view.logical_path.clone(),
+            cwd: manifest.cwd.clone(),
+            original_home: manifest.original_home.clone(),
+            occurrences: view.occurrences.clone(),
+        };
+        assert_eq!(
+            freshell_platform::opencode_recipe::evaluate(&recipe, &lookup).unwrap(),
+            r#"{"message":"synthetic-child-value{file:/home/freshell/provider/.freshell/references/0}"}"#
+        );
+        assert!(
+            freshell_platform::opencode_recipe::evaluate(&recipe, &|name| (name == "INTRO")
+                .then(|| "synthetic-child-value{file:other}".into()))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn managed_provider_source_stage_failure_preserves_prior_capability_and_views() {
+        use crate::managed_provider_references::sources::*;
+        let owned = tempfile::tempdir().unwrap();
+        let directory = owned.path().join("capabilities");
+        let workspace = owned.path().join("workspace");
+        let home = owned.path().join("home");
+        for path in [&directory, &workspace, &home] {
+            std::fs::create_dir(path).unwrap();
+        }
+        let config = workspace.join("opencode.json");
+        std::fs::write(&config, r#"{"instructions":["{file:rules}"]}"#).unwrap();
+        std::fs::write(workspace.join("rules"), "synthetic-selected-file").unwrap();
+        let mut plan = plan_opencode_sources(
+            vec![SourceOccurrence {
+                logical_path: config.clone(),
+                canonical_source: config,
+                lane: SourceLane::Main,
+            }],
+            &workspace,
+            &home,
+            &|_, _, _| None,
+        )
+        .unwrap();
+        let soul = SoulId::new();
+        let store = CapabilityStore::default();
+        let prior = store
+            .issue(
+                soul.clone(),
+                &directory,
+                "http://host.docker.internal:4000".into(),
+                Some(("opencode", &home, &[])),
+                OpencodeEphemeralInput {
+                    cwd: Some(&workspace),
+                    workspace: Some(&workspace),
+                    source_plan: Some(&plan),
+                    ..Default::default()
+                },
+                None,
+            )
+            .unwrap();
+        let old_stage = staged_provider_root_path(&directory, &prior.grant_id).unwrap();
+        let old_manifest = std::fs::read(old_stage.join(".freshell/input-manifest.json")).unwrap();
+        plan[0].references.selections[0].runtime_destination =
+            "/home/freshell/provider/.freshell/references/99".into();
+        assert!(store
+            .issue(
+                soul,
+                &directory,
+                "http://host.docker.internal:4000".into(),
+                Some(("opencode", &home, &[])),
+                OpencodeEphemeralInput {
+                    cwd: Some(&workspace),
+                    workspace: Some(&workspace),
+                    source_plan: Some(&plan),
+                    ..Default::default()
+                },
+                None
+            )
+            .is_err());
+        assert_eq!(
+            std::fs::read(old_stage.join(".freshell/input-manifest.json")).unwrap(),
+            old_manifest
+        );
+        assert!(grant_path(&directory, &prior.grant_id).unwrap().is_file());
+        assert_eq!(store.grants.lock().unwrap().len(), 1);
+        assert_eq!(std::fs::read_dir(&directory).unwrap().count(), 1);
+        assert_eq!(
+            std::fs::read_dir(owned.path().join("provider-roots"))
+                .unwrap()
+                .count(),
+            1,
+            "failed preparation must remove only its fresh temporary stage"
+        );
+    }
+
+    #[test]
     fn opencode_private_inputs_survive_restarting_after_container_exits() {
         let control = tempfile::tempdir().unwrap();
         let capabilities = control.path().join("mcp-capabilities");
@@ -2410,6 +2661,7 @@ mod tests {
                     tui_source: Some(&tui_source),
                     cwd: Some(home.path()),
                     workspace: Some(home.path()),
+                    source_plan: None,
                 },
                 None,
             )

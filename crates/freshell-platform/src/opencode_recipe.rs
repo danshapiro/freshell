@@ -22,6 +22,41 @@ pub struct GeneratedFileRecipe {
     pub occurrences: Vec<ApprovedFileOccurrence>,
 }
 
+/// Private filesystem metadata linking one native loader occurrence to its
+/// original source view. Documents and expanded values are never in this DTO.
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SourceManifest {
+    pub version: u8,
+    pub cwd: PathBuf,
+    pub original_home: PathBuf,
+    pub sources: Vec<SourceView>,
+    pub files: Vec<SelectedSourceFile>,
+}
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SourceView {
+    pub logical_path: PathBuf,
+    pub lane: SourceLane,
+    pub unexpanded_relative_path: String,
+    pub template_relative_path: String,
+    pub generated_name: Option<String>,
+    pub occurrences: Vec<ApprovedFileOccurrence>,
+    pub referenced_variables: Vec<String>,
+}
+#[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SourceLane {
+    Main,
+    Tui,
+}
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SelectedSourceFile {
+    pub source_id: u16,
+    pub canonical_source: PathBuf,
+}
+
 pub fn evaluate(
     recipe: &GeneratedFileRecipe,
     env: &dyn Fn(&str) -> Option<String>,

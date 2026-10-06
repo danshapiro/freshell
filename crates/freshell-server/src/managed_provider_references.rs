@@ -45,10 +45,25 @@ pub use freshell_platform::opencode_recipe::{ApprovedFileOccurrence, GeneratedFi
 
 pub struct ResolvedFileReferencePlan {
     pub template: String,
+    // Generated recipes already own the raw view. Keep one raw view for
+    // direct references too; a rewritten template cannot revalidate selection.
+    unexpanded_direct_source: Option<String>,
     pub selections: Vec<FileReferenceSelection>,
     pub referenced_variables: Vec<String>,
     pub recipes: Vec<GeneratedFileRecipe>,
     pub occurrences: Vec<ApprovedFileOccurrence>,
+    pub substitution_events: usize,
+}
+impl ResolvedFileReferencePlan {
+    pub fn unexpanded_source(&self) -> &str {
+        self.unexpanded_direct_source.as_deref().unwrap_or_else(|| {
+            &self
+                .recipes
+                .first()
+                .expect("generated plan owns its source")
+                .unexpanded_source
+        })
+    }
 }
 
 pub fn resolve_file_references(
@@ -80,7 +95,9 @@ pub(super) fn resolve_file_references_allocated(
     let mut generated = false;
     let mut planned_bytes = 0u64;
     let mut aliases = std::collections::BTreeSet::new();
-    let mut variables = std::collections::BTreeSet::new();
+    let variables = std::cell::RefCell::new(std::collections::BTreeSet::new());
+    let substitution_events = std::cell::Cell::new(0usize);
+    let input_error = std::cell::Cell::new(None);
     let fail = |ordinal, variables: Vec<String>, cause| ReferenceError {
         operation: "resolve",
         field: "OpenCode file",
@@ -89,18 +106,28 @@ pub(super) fn resolve_file_references_allocated(
         variables,
         cause,
     };
-    let transformed = transform_file_tokens(raw, env, |token| {
+    let lookup = |name: &str| {
+        let mut variables = variables.borrow_mut();
+        if variables.len() >= 128 && !variables.contains(name) {
+            input_error.set(Some("referenced variable count exceeds 128"));
+            return None;
+        }
+        variables.insert(name.to_owned());
+        substitution_events.set(substitution_events.get() + 1);
+        env(name)
+    };
+    let transformed = transform_file_tokens(raw, &lookup, |token| {
         let names: Vec<String> = token
             .variables
             .iter()
             .map(|name| name.to_string())
             .collect();
-        variables.extend(names.iter().cloned());
-        if variables.len() > 128 {
+        substitution_events.set(substitution_events.get() + 1);
+        if substitution_events.get() > 8192 {
             return Err(fail(
                 token.ordinal,
                 names,
-                "referenced variable count exceeds 128",
+                "source substitution event count exceeds 8192",
             ));
         }
         generated |= !token.direct_expression;
@@ -196,6 +223,9 @@ pub(super) fn resolve_file_references_allocated(
             "configuration source, expansion or event profile limit exceeded",
         ),
     })?;
+    if let Some(cause) = input_error.get() {
+        return Err(fail(0, Vec::new(), cause));
+    }
     let (template, recipes) = if generated {
         let generated_name = format!("FRESHELL_CONFIG_REFERENCE_{recipe_ordinal}");
         if transformed.len() > 64 * 1024 {
@@ -237,10 +267,12 @@ pub(super) fn resolve_file_references_allocated(
     drop(transformed);
     Ok(ResolvedFileReferencePlan {
         template,
+        unexpanded_direct_source: (!generated).then(|| raw.to_owned()),
         selections,
-        referenced_variables: variables.into_iter().collect(),
+        referenced_variables: variables.into_inner().into_iter().collect(),
         recipes,
         occurrences,
+        substitution_events: substitution_events.get(),
     })
 }
 

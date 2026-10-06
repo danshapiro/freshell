@@ -140,6 +140,11 @@ if [ "${RUNTIME_SUITE}" -eq 1 ]; then
     --read-only
     --tmpfs /tmp:rw,nosuid,nodev,size=512m
     --tmpfs /home/sandbox/.cache:rw,nosuid,nodev,size=256m
+    # Executable fixtures need a private package-lookup boundary. Reuse the
+    # same sandbox-owned target volume outside /workspace, where native
+    # ancestor lookup would otherwise select the repo's real node_modules.
+    -v freshell-sandbox-cargo-target:/freshell-test-artifacts
+    -e FRESHELL_TEST_EXECUTABLE_TMP_DIR=/freshell-test-artifacts
     --security-opt no-new-privileges
     -e FRESHELL_SANDBOX_MODE=runtime-suite
   )

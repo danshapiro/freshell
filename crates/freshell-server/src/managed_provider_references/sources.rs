@@ -256,11 +256,7 @@ pub fn plan_opencode_sources(
         recipe_count += references.recipes.len();
         retained_view_bytes = retained_view_bytes
             .checked_add(references.template.len())
-            .and_then(|bytes| {
-                references.recipes.iter().try_fold(bytes, |bytes, recipe| {
-                    bytes.checked_add(recipe.unexpanded_source.len())
-                })
-            })
+            .and_then(|bytes| bytes.checked_add(references.unexpanded_source().len()))
             .ok_or_else(|| fail("source-view byte count overflow"))?;
         if retained_view_bytes > 64 * 1024 * 1024 {
             return Err(fail("simultaneous retained source views exceed 64 MiB"));
@@ -272,7 +268,7 @@ pub fn plan_opencode_sources(
                 .map(|occurrence| occurrence.approved_alias.clone()),
         );
         variables.extend(references.referenced_variables.iter().cloned());
-        event_count += references.occurrences.len();
+        event_count += references.substitution_events;
         if recipe_count > 128 || aliases.len() > 256 || variables.len() > 128 || event_count > 8192
         {
             return Err(fail(

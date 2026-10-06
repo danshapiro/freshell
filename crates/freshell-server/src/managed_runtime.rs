@@ -206,6 +206,7 @@ impl ManagedTerminalController for ServerManagedRuntimeController {
                     tui_source: tui_source.as_ref(),
                     cwd: Some(&cwd),
                     workspace: Some(&workspace),
+                    source_plan: None,
                 }
             } else {
                 Default::default()
