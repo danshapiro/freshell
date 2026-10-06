@@ -330,6 +330,16 @@ async fn apply_prepared_callback(
         )
         .map_err(|_| "replacement provider context exceeds control metadata profile".into());
     }
+    let accepted_manifest = read_prior_source_manifest(
+        store,
+        directory,
+        &callback.soul_id,
+        callback.prior_context.as_ref(),
+    )?;
+    let home = accepted_manifest
+        .as_ref()
+        .map(|manifest| manifest.original_home.as_path())
+        .unwrap_or(home);
     let workspace = callback
         .workspace
         .as_deref()
@@ -342,6 +352,17 @@ async fn apply_prepared_callback(
         .filter(|reference| !reference.profile.is_configuration_file())
         .collect();
     let original = |name: &str| std::env::var(name).ok();
+    let selected_sources=accepted_manifest.as_ref().map(|manifest|{
+        manifest.sources.iter().enumerate().map(|(ordinal,source)|{
+            let canonical=std::fs::canonicalize(&source.logical_path)
+                .map_err(|_|format!("prior selected configuration source {ordinal} is unavailable; repair it before reissue"))?;
+            Ok(crate::managed_provider_references::sources::SourceOccurrence {
+                logical_path:source.logical_path.clone(),canonical_source:canonical,
+                lane:match source.lane {freshell_platform::opencode_recipe::SourceLane::Main=>crate::managed_provider_references::sources::SourceLane::Main,
+                    freshell_platform::opencode_recipe::SourceLane::Tui=>crate::managed_provider_references::sources::SourceLane::Tui},
+            })
+        }).collect::<Result<Vec<_>,String>>()
+    }).transpose()?;
     let prepared = crate::managed_provider_references::prepare_managed_opencode_with_publisher(
         crate::managed_provider_references::OpencodePreparation {
             client,
@@ -358,6 +379,7 @@ async fn apply_prepared_callback(
                     .as_deref()
                     .ok_or("replacement provider preparation requires attempt authority")?,
             ),
+            selected_sources,
         },
         |soul, home, context, input| {
             let input = OpencodeEphemeralInput {
@@ -387,6 +409,67 @@ async fn apply_prepared_callback(
         freshell_runtime_protocol::MAX_CONTROL_FRAME_BYTES,
     )
     .map_err(|_| "replacement provider context exceeds control metadata profile".into())
+}
+
+fn read_prior_source_manifest(
+    store: &CapabilityStore,
+    directory: &Path,
+    soul: &SoulId,
+    context: Option<&freshell_runtime_protocol::ProviderLaunchContext>,
+) -> Result<Option<freshell_platform::opencode_recipe::SourceManifest>, String> {
+    let Some(context) = context else {
+        return Ok(None);
+    };
+    context
+        .validate("opencode")
+        .map_err(|_| "prior provider source context metadata invalid")?;
+    let Some(inputs) = context.prepared_inputs.as_ref() else {
+        return Ok(None);
+    };
+    let capability = context
+        .mcp_capability
+        .as_ref()
+        .ok_or("prior source context lacks generation authority")?;
+    let owned = store
+        .grants
+        .lock()
+        .unwrap()
+        .get(&capability.grant_id)
+        .is_some_and(|grant| grant.soul_id == *soul);
+    if !owned {
+        return Err("prior provider source context belongs to another owner".into());
+    }
+    let root = staged_provider_root_path(directory, &capability.grant_id)?;
+    let path = root.join(&inputs.manifest.relative_path);
+    if !std::fs::symlink_metadata(&path)
+        .is_ok_and(|metadata| metadata.is_file() && !metadata.file_type().is_symlink())
+    {
+        return Err("prior source manifest must be a physical private file".into());
+    }
+    use std::io::Read;
+    let mut bytes = Vec::new();
+    std::fs::File::open(path)
+        .map_err(|_| "prior source manifest unavailable")?
+        .take(64 * 1024 * 1024 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| "prior source manifest read failed")?;
+    if bytes.len() > 64 * 1024 * 1024
+        || format!("{:x}", sha2::Sha256::digest(&bytes)) != inputs.manifest.sha256
+    {
+        return Err("prior source manifest profile or identity changed".into());
+    }
+    let manifest: freshell_platform::opencode_recipe::SourceManifest =
+        serde_json::from_slice(&bytes).map_err(|_| "prior source manifest metadata invalid")?;
+    if manifest.version != 1
+        || manifest.sources.len() > 8192
+        || manifest.files.len() > 128
+        || manifest.frozen_inputs.len() > 128
+        || !manifest.original_home.is_absolute()
+        || !manifest.cwd.is_absolute()
+    {
+        return Err("prior source manifest origin profile invalid".into());
+    }
+    Ok(Some(manifest))
 }
 
 fn apply_callback(
@@ -3131,6 +3214,158 @@ except Exception as error:
         assert!(!serde_json::to_string(&second)
             .unwrap()
             .contains("nested-secret-byte"));
+    }
+
+    #[tokio::test]
+    async fn managed_provider_replacement_keeps_accepted_original_home_origin() {
+        use crate::managed_provider_references::sources::*;
+        let owned = tempfile::tempdir().unwrap();
+        let home = owned.path().join("accepted-home");
+        let later_home = owned.path().join("later-controller-home");
+        let workspace = owned.path().join("workspace");
+        let config = home.join(".config/opencode/opencode.json");
+        std::fs::create_dir_all(config.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(later_home.join(".config/opencode")).unwrap();
+        std::fs::create_dir(&workspace).unwrap();
+        let raw = r#"{"agent":{"probe":{"prompt":"{file:rules}"}}}"#;
+        std::fs::write(&config, raw).unwrap();
+        let rules = config.parent().unwrap().join("rules");
+        std::fs::write(&rules, "ACCEPTED_HOME_RESOURCE_NONCE").unwrap();
+        let explicit = home.join("selected-explicit/custom.jsonc");
+        std::fs::create_dir_all(explicit.parent().unwrap()).unwrap();
+        let explicit_raw = r#"{"agent":{"extra":{"prompt":"{file:rules}"}}}"#;
+        std::fs::write(&explicit, explicit_raw).unwrap();
+        let explicit_rules = explicit.parent().unwrap().join("rules");
+        std::fs::write(&explicit_rules, "EXPLICIT_ORIGIN_RESOURCE_NONCE").unwrap();
+        let plan = plan_opencode_sources(
+            vec![
+                SourceOccurrence {
+                    logical_path: config.clone(),
+                    canonical_source: config.clone(),
+                    lane: SourceLane::Main,
+                },
+                SourceOccurrence {
+                    logical_path: explicit.clone(),
+                    canonical_source: explicit.clone(),
+                    lane: SourceLane::Main,
+                },
+            ],
+            &workspace,
+            &home,
+            &|_, _, _| None,
+        )
+        .unwrap();
+        let context = crate::managed_provider_bootstrap::provider_launch_context_from_home(
+            "opencode", &workspace, &home, None,
+        )
+        .unwrap()
+        .unwrap();
+        let references = [rules.clone(), explicit_rules.clone()]
+            .into_iter()
+            .enumerate()
+            .map(
+                |(index, path)| freshell_runtime_protocol::ProviderSecretReference {
+                    source_path: path.to_str().unwrap().into(),
+                    profile:
+                        freshell_runtime_protocol::ProviderSecretProfile::OpencodeConfigurationFile,
+                    provider_relative_path: Some(format!(".freshell/references/{index}")),
+                },
+            )
+            .collect::<Vec<_>>();
+        let directory = owned.path().join("control/mcp-capabilities");
+        std::fs::create_dir_all(&directory).unwrap();
+        let store = CapabilityStore::default();
+        let soul = SoulId::new();
+        let prior = store
+            .issue(
+                soul.clone(),
+                &directory,
+                "http://host.docker.internal:4000".into(),
+                Some(("opencode", &home, &context.config)),
+                OpencodeEphemeralInput {
+                    cwd: Some(&workspace),
+                    workspace: Some(&workspace),
+                    source_plan: Some(&plan),
+                    launch_context: Some(&context),
+                    secret_references: Some(&references),
+                    ..Default::default()
+                },
+                None,
+            )
+            .unwrap();
+        let accepted = read_prepared_context(&directory, &prior).unwrap();
+        let prior_stage = staged_provider_root_path(&directory, &prior.grant_id).unwrap();
+        let manifest_path = prior_stage.join(".freshell/input-manifest.json");
+        let manifest_bytes = std::fs::read(&manifest_path).unwrap();
+        let manifest_before: serde_json::Value = serde_json::from_slice(&manifest_bytes).unwrap();
+        let callback=serde_json::to_vec(&serde_json::json!({"action":"issue","controlSecret":"fixture-control","soulId":soul,
+            "provider":"opencode","workspace":workspace,"cwd":workspace,"priorContext":accepted,"providerSecretReferences":references,
+            "authLookupAuthority":"fixture-owned-attempt"})).unwrap();
+        let client = freshell_runtime_client::RuntimeClient::new(
+            owned.path().join("unused.sock"),
+            "fixture-control",
+        );
+        let mut foreign: serde_json::Value = serde_json::from_slice(&callback).unwrap();
+        foreign["soulId"] = serde_json::json!(SoulId::new());
+        assert!(
+            apply_prepared_callback(
+                &serde_json::to_vec(&foreign).unwrap(),
+                "fixture-control",
+                &store,
+                &directory,
+                "http://host.docker.internal:4000",
+                &later_home,
+                &client
+            )
+            .await
+            .is_err(),
+            "another soul cannot select this private origin manifest"
+        );
+        let mut corrupted = manifest_before;
+        corrupted["originalHome"] = serde_json::json!(later_home);
+        std::fs::write(&manifest_path, serde_json::to_vec(&corrupted).unwrap()).unwrap();
+        assert!(
+            apply_prepared_callback(
+                &callback,
+                "fixture-control",
+                &store,
+                &directory,
+                "http://host.docker.internal:4000",
+                &later_home,
+                &client
+            )
+            .await
+            .is_err(),
+            "origin metadata must retain its approved manifest identity"
+        );
+        std::fs::write(&manifest_path, &manifest_bytes).unwrap();
+        let reply = apply_prepared_callback(
+            &callback,
+            "fixture-control",
+            &store,
+            &directory,
+            "http://host.docker.internal:4000",
+            &later_home,
+            &client,
+        )
+        .await
+        .unwrap();
+        let ready: freshell_runtime_protocol::PreparedProviderContext =
+            serde_json::from_slice(&reply).unwrap();
+        assert_eq!(ready.provider_secret_references.len(),2,"reissue must keep accepted original HOME and ordered explicit sources instead of rediscovering the controller environment");
+        assert_eq!(
+            ready.provider_secret_references[0].source_path,
+            rules.to_str().unwrap()
+        );
+        assert_eq!(
+            ready.provider_secret_references[1].source_path,
+            explicit_rules.to_str().unwrap()
+        );
+        assert_eq!(std::fs::read_to_string(&config).unwrap(), raw);
+        assert_eq!(std::fs::read_to_string(&explicit).unwrap(), explicit_raw);
+        assert!(staged_provider_root_path(&directory, &prior.grant_id)
+            .unwrap()
+            .is_dir());
     }
 
     #[tokio::test]

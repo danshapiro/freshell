@@ -467,6 +467,7 @@ impl HostedFreshAgentProxy {
                     original: &original,
                     references: provider_secret_references,
                     auth_authority: None,
+                    selected_sources: None,
                 },
             )
             .await

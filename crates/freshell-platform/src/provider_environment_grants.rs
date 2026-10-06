@@ -584,6 +584,13 @@ pub fn resolve_opencode_auth_environment(
         let Some(key) = value.get("key").and_then(serde_json::Value::as_str) else {
             continue;
         };
+        if key.starts_with(crate::opencode_config::GENERATED_CONFIG_REFERENCE_PREFIX) {
+            let mut error =
+                fail("well-known auth key occupies the reserved generated configuration namespace");
+            error.field = Some("auth.wellknown.key");
+            error.source_ordinal = Some(ordinal);
+            return Err(error);
+        }
         if !needed.iter().any(|name| name == key) {
             continue;
         }
@@ -650,6 +657,20 @@ mod tests {
         .unwrap_err();
         assert!(!format!("{err:?} {err}").contains("sentinel-private"));
     }
+    #[test]
+    fn auth_generated_namespace_collision_is_checked_before_selected_value_filtering() {
+        let raw = r#"{"shadow":{"type":"wellknown","key":"FRESHELL_CONFIG_REFERENCE_0","token":"PRIVATE_GENERATED_SHADOW_SENTINEL"},"selected":{"type":"wellknown","key":"RULE_ROOT","token":"/synthetic/rules"}}"#;
+        let error=resolve_opencode_auth_environment(raw,&["RULE_ROOT".into()])
+            .expect_err("native authEnv must not shadow child-only generated config variables even when that auth key was not selected");
+        assert!(!format!("{error:?} {error}").contains("PRIVATE_GENERATED_SHADOW_SENTINEL"));
+        // JS duplicate-property semantics apply before namespace inspection;
+        // the obsolete entry contributes neither an overlay nor a collision.
+        let replaced = r#"{"shadow":{"type":"wellknown","key":"FRESHELL_CONFIG_REFERENCE_0","token":"PRIVATE_GENERATED_SHADOW_SENTINEL"},"shadow":{"type":"api","key":"synthetic-api"},"selected":{"type":"wellknown","key":"RULE_ROOT","token":"/synthetic/rules"}}"#;
+        let values = resolve_opencode_auth_environment(replaced, &["RULE_ROOT".into()]).unwrap();
+        assert_eq!(values.len(), 1);
+        assert_eq!(values["RULE_ROOT"], "/synthetic/rules");
+    }
+
     #[test]
     fn selected_native_auth_lookup_keeps_js_duplicate_key_order_and_excludes_unrequested_values() {
         let raw = r#"{"first":{"type":"wellknown","key":"CA_PATH","token":"first-path"},"second":{"type":"wellknown","key":"CA_PATH","token":"second-path"},"first":{"type":"wellknown","key":"CA_PATH","token":"last-first-path"},"unrequested":{"type":"wellknown","key":"PRIVATE_UNUSED","token":"sentinel-private-unused"}}"#;

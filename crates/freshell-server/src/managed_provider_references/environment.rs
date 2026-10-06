@@ -23,6 +23,14 @@ impl SourceEnvironment {
         freshell_runtime_protocol::validate_provider_secrets("opencode", references)
             .map_err(|error| error.message)?;
         freshell_platform::native_auth_exchange::validate_keys(&names).map_err(str::to_string)?;
+        // Probe only the finite internal names. Retain neither the unrelated
+        // original/request values nor an ambient environment snapshot.
+        for ordinal in 0..freshell_platform::opencode_config::MAX_GENERATED_CONFIG_REFERENCES {
+            let name = freshell_platform::opencode_config::generated_config_reference_name(ordinal);
+            if original(&name).is_some() {
+                return Err("original/request input occupies the reserved generated configuration namespace".into());
+            }
+        }
         let mut ambient = BTreeMap::new();
         let mut ambient_bytes = 0usize;
         for name in &names {
@@ -165,7 +173,8 @@ impl SourceEnvironment {
             if matches!(
                 name.as_str(),
                 "AUTH_TOKEN" | "FRESHELL_TOKEN" | "FRESHELL_URL"
-            ) || name.starts_with("FRESHELL_CONFIG_REFERENCE_")
+            ) || name
+                .starts_with(freshell_platform::opencode_config::GENERATED_CONFIG_REFERENCE_PREFIX)
             {
                 return Err("selected original source input collides with controller authentication or generated names".into());
             }
@@ -180,6 +189,37 @@ impl SourceEnvironment {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn managed_provider_source_environment_rejects_unselected_typed_auth_generated_key() {
+        let owned = tempfile::tempdir().unwrap();
+        let path = owned.path().join("auth.json");
+        let raw = r#"{"shadow":{"type":"wellknown","key":"FRESHELL_CONFIG_REFERENCE_0","token":"PRIVATE_TYPED_SHADOW_SENTINEL"},"selected":{"type":"wellknown","key":"RULE_ROOT","token":"/synthetic/selected"}}"#;
+        std::fs::write(&path, raw).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let references = [ProviderSecretReference {
+            source_path: path.to_str().unwrap().into(),
+            profile: ProviderSecretProfile::OpencodeOnecliAuthFile,
+            provider_relative_path: None,
+        }];
+        let error = SourceEnvironment::read(vec!["RULE_ROOT".into()], &references, &|_| None)
+            .err()
+            .expect(
+                "typed auth must check native generated-name overlays before source publication",
+            );
+        assert!(!error.contains("PRIVATE_TYPED_SHADOW_SENTINEL"));
+        assert_eq!(std::fs::read_to_string(path).unwrap(), raw);
+    }
+
+    #[test]
+    fn managed_provider_source_environment_rejects_unselected_request_generated_namespace() {
+        let original = |name: &str| match name {
+            "FRESHELL_CONFIG_REFERENCE_0" => Some("PRIVATE_REQUEST_SHADOW_SENTINEL".into()),
+            _ => None,
+        };
+        let error=SourceEnvironment::read(vec!["RULE_ROOT".into()],&[],&original).err()
+            .expect("an unselected original/request value must not occupy the generated configuration namespace");
+        assert!(!error.contains("PRIVATE_REQUEST_SHADOW_SENTINEL"));
+    }
     use freshell_runtime_protocol::ProviderSecretProfile;
     use std::os::unix::fs::PermissionsExt;
     #[test]
@@ -301,7 +341,10 @@ mod tests {
         let environment = SourceEnvironment::read(
             vec!["NODE_EXTRA_CA_CERTS".into(), "PATH_INPUT".into()],
             &references,
-            &|_| Some("/synthetic/ambient".into()),
+            &|name| {
+                matches!(name, "PATH_INPUT" | "NODE_EXTRA_CA_CERTS")
+                    .then(|| "/synthetic/ambient".into())
+            },
         )
         .unwrap();
         assert_eq!(

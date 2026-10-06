@@ -6,6 +6,12 @@
 use serde_json::Value;
 use std::path::{Path, PathBuf};
 
+pub const GENERATED_CONFIG_REFERENCE_PREFIX: &str = "FRESHELL_CONFIG_REFERENCE_";
+pub const MAX_GENERATED_CONFIG_REFERENCES: usize = 128;
+pub fn generated_config_reference_name(ordinal: usize) -> String {
+    format!("{GENERATED_CONFIG_REFERENCE_PREFIX}{ordinal}")
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ConfigSource {
     pub path: PathBuf,

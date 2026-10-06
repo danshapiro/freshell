@@ -264,7 +264,8 @@ pub(super) fn resolve_file_references_from_view_relocated(
     let transformed_length = transformed.len();
     drop(transformed);
     let (template, recipes) = if generated {
-        let generated_name = format!("FRESHELL_CONFIG_REFERENCE_{recipe_ordinal}");
+        let generated_name =
+            freshell_platform::opencode_config::generated_config_reference_name(recipe_ordinal);
         if transformed_length > 64 * 1024 {
             return Err(fail(
                 0,
@@ -712,6 +713,7 @@ pub(crate) struct OpencodePreparation<'a> {
     pub original: &'a (dyn Fn(&str) -> Option<String> + Sync),
     pub references: Vec<freshell_runtime_protocol::ProviderSecretReference>,
     pub auth_authority: Option<&'a str>,
+    pub selected_sources: Option<Vec<sources::SourceOccurrence>>,
 }
 
 pub(crate) async fn prepare_managed_opencode(
@@ -743,6 +745,7 @@ pub(crate) async fn prepare_managed_opencode_with_publisher(
         original,
         mut references,
         auth_authority,
+        selected_sources,
     } = request;
     use sources::*;
     if original("OPENCODE_CONFIG_CONTENT").is_some_and(|value| !value.is_empty())
@@ -771,14 +774,18 @@ pub(crate) async fn prepare_managed_opencode_with_publisher(
         None,
     )?
     .ok_or("OpenCode provider preparation unavailable")?;
-    let selected = discover_opencode(OpencodeDiscovery {
-        home,
-        cwd,
-        worktree: workspace,
-        config_root: &config_root,
-        env: original,
-    })
-    .map_err(str::to_string)?;
+    let selected = if let Some(sources) = selected_sources {
+        sources
+    } else {
+        discover_opencode(OpencodeDiscovery {
+            home,
+            cwd,
+            worktree: workspace,
+            config_root: &config_root,
+            env: original,
+        })
+        .map_err(str::to_string)?
+    };
     let loaded = read_opencode_sources(selected).map_err(|error| error.to_string())?;
     if loaded
         .iter()

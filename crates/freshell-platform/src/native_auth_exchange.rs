@@ -136,6 +136,18 @@ mod tests {
     };
 
     #[test]
+    fn native_auth_reserved_generated_key_cannot_escape_the_finite_lookup_filter() {
+        let owned = tempfile::tempdir().unwrap();
+        let path = owned.path().join(".local/share/opencode/auth.json");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let raw = r#"{"shadow":{"type":"wellknown","key":"FRESHELL_CONFIG_REFERENCE_0","token":"PRIVATE_NATIVE_SHADOW_SENTINEL"},"selected":{"type":"wellknown","key":"PATH_INPUT","token":"/synthetic/selected"}}"#;
+        std::fs::write(&path, raw).unwrap();
+        let error = read_selected_native_auth(owned.path(), &["PATH_INPUT".into()]).unwrap_err();
+        assert!(!error.contains("PRIVATE_NATIVE_SHADOW_SENTINEL"));
+        assert_eq!(std::fs::read_to_string(path).unwrap(), raw);
+    }
+
+    #[test]
     fn selected_native_auth_values_travel_only_through_the_private_exchange() {
         let temp = tempfile::tempdir().unwrap();
         let home = temp.path().join("owned-home");
