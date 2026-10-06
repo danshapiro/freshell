@@ -143,8 +143,12 @@ pub fn prepare(
                     .map(str::to_string)
             }
         };
-        let value = freshell_platform::opencode_recipe::evaluate(&recipe, &lookup)
-            .map_err(str::to_string)?;
+        let value = if source.generated_name.is_some() {
+            freshell_platform::opencode_recipe::evaluate(&recipe, &lookup)
+        } else {
+            freshell_platform::opencode_recipe::evaluate_document(&recipe, &lookup)
+        }
+        .map_err(str::to_string)?;
         if let Some(name) = source.generated_name {
             if secrets.environment.contains_key(&name)
                 || auth.contains_key(&name)
@@ -188,7 +192,7 @@ mod tests {
         std::fs::create_dir(&home).unwrap();
         let raw = r#"{"instructions":["{env:INSERT}"]}"#;
         std::fs::write(stage.join(".freshell/source-views/source-0"), raw).unwrap();
-        let manifest = SourceManifest {
+        let mut manifest = SourceManifest {
             version: 1,
             cwd: "/original-unavailable/project".into(),
             original_home: "/original-unavailable/home".into(),
@@ -222,7 +226,7 @@ mod tests {
             provider_relative_path: ".freshell/mcp-capability.json".into(),
             host_gateway_address: None,
         };
-        let context = ProviderLaunchContext {
+        let mut context = ProviderLaunchContext {
             prepared_inputs: Some(PreparedProviderInputs {
                 generation_id: capability.grant_id.clone(),
                 initial_auth_reservation: None,
@@ -277,6 +281,54 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(stage.join(".freshell/source-views/source-0")).unwrap(),
             raw
+        );
+        // Direct sources are filesystem documents, not generated child env values.
+        // A complete accepted file reference remains valid in a source above 64 KiB.
+        let large_raw = format!("{}{}", " ".repeat(128 * 1024), raw);
+        std::fs::write(stage.join(".freshell/source-views/source-0"), &large_raw).unwrap();
+        manifest.sources[0].generated_name = None;
+        let bytes = serde_json::to_vec(&manifest).unwrap();
+        std::fs::write(stage.join(".freshell/input-manifest.json"), &bytes).unwrap();
+        context.prepared_inputs.as_mut().unwrap().manifest.sha256 =
+            format!("{:x}", Sha256::digest(&bytes));
+        let generated = prepare(Some(&context), &mut secrets, &frozen, &stage, &home)
+            .expect("direct source must use the 16 MiB document profile");
+        assert!(generated.is_empty());
+        assert_eq!(
+            std::fs::read(stage.join(".freshell/source-views/source-0")).unwrap(),
+            large_raw.as_bytes()
+        );
+        let document_limit = 16 * 1024 * 1024;
+        let occurrences = std::mem::take(&mut manifest.sources[0].occurrences);
+        let bytes = serde_json::to_vec(&manifest).unwrap();
+        std::fs::write(stage.join(".freshell/input-manifest.json"), &bytes).unwrap();
+        context.prepared_inputs.as_mut().unwrap().manifest.sha256 =
+            format!("{:x}", Sha256::digest(&bytes));
+        let at_limit = format!("{}{{}}", " ".repeat(document_limit - 2));
+        std::fs::write(stage.join(".freshell/source-views/source-0"), &at_limit).unwrap();
+        assert!(prepare(Some(&context), &mut secrets, &frozen, &stage, &home).is_ok());
+        std::fs::write(
+            stage.join(".freshell/source-views/source-0"),
+            format!(" {at_limit}"),
+        )
+        .unwrap();
+        assert!(
+            prepare(Some(&context), &mut secrets, &frozen, &stage, &home).is_err(),
+            "direct source growth above the 16 MiB profile must fail before dispatch"
+        );
+        std::fs::write(stage.join(".freshell/source-views/source-0"), &large_raw).unwrap();
+
+        manifest.sources[0].occurrences = occurrences;
+        manifest.sources[0].generated_name = Some("FRESHELL_CONFIG_REFERENCE_0".into());
+        let bytes = serde_json::to_vec(&manifest).unwrap();
+        std::fs::write(stage.join(".freshell/input-manifest.json"), &bytes).unwrap();
+        context.prepared_inputs.as_mut().unwrap().manifest.sha256 =
+            format!("{:x}", Sha256::digest(&bytes));
+        assert!(
+            prepare(Some(&context), &mut secrets, &frozen, &stage, &home)
+                .unwrap_err()
+                .contains("64 KiB"),
+            "generated child values retain the declared stricter limit"
         );
     }
 }

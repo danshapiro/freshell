@@ -65,7 +65,21 @@ pub struct SelectedSourceFile {
     pub canonical_source: PathBuf,
 }
 
+/// Evaluate a generated child environment value under its 64 KiB value profile.
 pub fn evaluate(
+    recipe: &GeneratedFileRecipe,
+    env: &dyn Fn(&str) -> Option<String>,
+) -> Result<String, &'static str> {
+    let text = evaluate_document(recipe, env)?;
+    if text.len() > 64 * 1024 {
+        return Err("generated configuration exceeds 64 KiB child value limit");
+    }
+    Ok(text)
+}
+
+/// Validate a direct source using the transformer’s 16 MiB document profile.
+/// Direct filesystem sources never become child environment values.
+pub fn evaluate_document(
     recipe: &GeneratedFileRecipe,
     env: &dyn Fn(&str) -> Option<String>,
 ) -> Result<String, &'static str> {
@@ -93,9 +107,6 @@ pub fn evaluate(
     })?;
     if observed != recipe.occurrences.len() {
         return Err(changed);
-    }
-    if text.len() > 64 * 1024 {
-        return Err("generated configuration exceeds 64 KiB child value limit");
     }
     Ok(text)
 }
