@@ -32,6 +32,8 @@ pub struct SourceManifest {
     pub original_home: PathBuf,
     pub sources: Vec<SourceView>,
     pub files: Vec<SelectedSourceFile>,
+    #[serde(default)]
+    pub frozen_inputs: Vec<String>,
 }
 #[derive(Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -43,6 +45,10 @@ pub struct SourceView {
     pub generated_name: Option<String>,
     pub occurrences: Vec<ApprovedFileOccurrence>,
     pub referenced_variables: Vec<String>,
+    #[serde(default)]
+    pub path_variables: Vec<String>,
+    #[serde(default)]
+    pub original_form: bool,
 }
 #[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

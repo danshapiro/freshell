@@ -448,31 +448,57 @@ impl HostedFreshAgentProxy {
         let session_type = session_type_wire(message.session_type);
         let request_id = stable_request_id(&message.request_id).map_err(|_| ())?;
         let provider_bootstrap_files = provider_bootstrap_files(&provider).map_err(|_| ())?;
-        let provider_secret_references =
+        let mut provider_secret_references =
             crate::managed_provider_bootstrap::named_provider_onecli_references(provider.as_str())
                 .map_err(|_| ())?;
-        let mcp_capability = crate::managed_mcp_capability::issue_mcp_capability(
-            &soul,
-            provider.as_str(),
-            crate::managed_mcp_capability::OpencodeEphemeralInput {
-                cwd: Some(&cwd),
-                workspace: Some(&workspace),
-                ..Default::default()
-            },
-        )
-        .map_err(|error| {
-            tracing::warn!(%error, "fresh_agent.create.capability_failed");
-        })?;
-        let mut provider_launch_context =
-            crate::managed_provider_bootstrap::provider_launch_context_for_managed_at(
-                provider.as_str(),
-                &workspace,
+        let (mcp_capability, mut provider_launch_context) = if provider == FreshProvider::Opencode {
+            let home = std::env::var_os("HOME")
+                .map(std::path::PathBuf::from)
+                .ok_or(())?;
+            let original = |name: &str| std::env::var(name).ok();
+            let prepared = crate::managed_provider_references::prepare_managed_opencode(
+                &self.client,
+                &soul,
+                &message.request_id,
+                &home,
                 &cwd,
-                Some(mcp_capability.clone()),
+                &workspace,
+                &original,
+                provider_secret_references,
+                None,
+            )
+            .await
+            .map_err(|error| {
+                tracing::warn!(event="fresh_agent.create.provider_inputs_failed",%error);
+            })?;
+            provider_secret_references = prepared.references;
+            let capability = prepared.context.mcp_capability.clone().ok_or(())?;
+            (capability, Some(prepared.context))
+        } else {
+            let mcp_capability = crate::managed_mcp_capability::issue_mcp_capability(
+                &soul,
+                provider.as_str(),
+                crate::managed_mcp_capability::OpencodeEphemeralInput {
+                    cwd: Some(&cwd),
+                    workspace: Some(&workspace),
+                    ..Default::default()
+                },
             )
             .map_err(|error| {
-                tracing::warn!(event="fresh_agent.create.provider_environment_failed", %error);
+                tracing::warn!(%error, "fresh_agent.create.capability_failed");
             })?;
+            let provider_launch_context =
+                crate::managed_provider_bootstrap::provider_launch_context_for_managed_at(
+                    provider.as_str(),
+                    &workspace,
+                    &cwd,
+                    Some(mcp_capability.clone()),
+                )
+                .map_err(|error| {
+                    tracing::warn!(event="fresh_agent.create.provider_environment_failed", %error);
+                })?;
+            (mcp_capability, provider_launch_context)
+        };
         // Fresh agents use the direct provider transports, which currently do
         // not inject Freshell's terminal MCP server. Retain ordinary provider
         // MCP/config files, plugins, and the staged user root; only remove

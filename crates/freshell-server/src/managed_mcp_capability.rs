@@ -39,6 +39,11 @@ pub(crate) struct OpencodeEphemeralInput<'a> {
     pub workspace: Option<&'a Path>,
     pub source_plan:
         Option<&'a [crate::managed_provider_references::sources::PlannedSourceOccurrence]>,
+    pub initial_auth_reservation: Option<&'a str>,
+    pub secret_references: Option<&'a [freshell_runtime_protocol::ProviderSecretReference]>,
+    pub config_root: Option<&'a Path>,
+    pub launch_context: Option<&'a freshell_runtime_protocol::ProviderLaunchContext>,
+    pub frozen_inputs: Option<&'a [String]>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -749,7 +754,15 @@ fn stage_provider_root(
                 .filter(|value| !value.is_empty())
                 .map(PathBuf::from)
                 .unwrap_or_else(|| home.join(".config"));
-            (config_home.join("opencode"), config_home)
+            let root = opencode_input
+                .config_root
+                .map(Path::to_path_buf)
+                .unwrap_or_else(|| config_home.join("opencode"));
+            let boundary = root
+                .parent()
+                .ok_or("managed config root parent unavailable")?
+                .to_owned();
+            (root, boundary)
         } else {
             (home.join(provider_dir), home.to_path_buf())
         };
@@ -802,10 +815,18 @@ fn stage_provider_root(
                 excluded.push(canonical);
             }
         }
+        let fallback_secrets;
+        let secret_references = if let Some(references) = opencode_input.secret_references {
+            references
+        } else {
+            fallback_secrets =
+                crate::managed_provider_bootstrap::named_provider_onecli_references(provider)?;
+            &fallback_secrets
+        };
         excluded.extend(
-            crate::managed_provider_bootstrap::named_provider_onecli_references(provider)?
-                .into_iter()
-                .map(|reference| PathBuf::from(reference.source_path)),
+            secret_references
+                .iter()
+                .map(|reference| PathBuf::from(&reference.source_path)),
         );
         let amplifier_resources = if provider == "amplifier" {
             Some(amplifier_resources::prepare(
@@ -950,6 +971,7 @@ fn stage_provider_root(
                 home,
                 opencode_input.cwd.ok_or("source plan requires cwd")?,
                 plan,
+                opencode_input.frozen_inputs.unwrap_or(&[]),
             )?;
         }
         allow_controller_stage_read(&temporary)?;
@@ -1190,6 +1212,59 @@ impl CapabilityStore {
                 )
             })
             .transpose()?;
+        if let (Some(root), Some(plan)) = (&staged_provider_root, opencode_input.source_plan) {
+            let reference = McpCapabilityReference {
+                grant_id: grant_id.clone(),
+                endpoint: endpoint.clone(),
+                provider_relative_path: CAPABILITY_PATH.into(),
+                host_gateway_address: routed_host_ipv4(),
+            };
+            let home = source
+                .ok_or("prepared source requires original provider HOME")?
+                .1;
+            let prepared = source_stage::describe(
+                root,
+                home,
+                plan,
+                &soul_id,
+                &reference,
+                opencode_input.initial_auth_reservation,
+                opencode_input.config_root,
+            )
+            .and_then(|inputs| {
+                if let Some(context) = opencode_input.launch_context {
+                    let mut context = context.clone();
+                    context.mcp_capability = Some(reference.clone());
+                    context.config.retain(|selected| {
+                        let destination = format!(
+                            "/home/freshell/provider/{}",
+                            selected.provider_relative_path
+                        );
+                        !inputs.config_binds.iter().any(|bind| {
+                            bind.logical_destination == destination
+                                || bind.effective_destination == destination
+                        })
+                    });
+                    context.prepared_inputs = Some(inputs);
+                    context
+                        .validate("opencode")
+                        .map_err(|error| error.message)?;
+                    let bytes = freshell_runtime_protocol::bounded_json_bytes(
+                        &context,
+                        freshell_runtime_protocol::MAX_CONTROL_FRAME_BYTES,
+                    )
+                    .map_err(|_| "complete prepared context exceeds metadata profile")?;
+                    let path = root.join(".freshell/prepared-context.json");
+                    write_private_bytes(&path, &bytes)?;
+                    allow_controller_stage_read(&path)?;
+                }
+                Ok(())
+            });
+            if let Err(error) = prepared {
+                let _ = std::fs::remove_dir_all(root);
+                return Err(error);
+            }
+        }
         let grant = Grant {
             preparation: Some(InputPreparation {
                 phase: InputPreparationPhase::Pending,
@@ -1452,6 +1527,51 @@ pub(crate) fn issue_mcp_capability(
         opencode_input,
         None,
     )
+}
+
+pub(crate) fn issue_prepared_opencode_context(
+    soul: &SoulId,
+    home: &Path,
+    context: &freshell_runtime_protocol::ProviderLaunchContext,
+    input: OpencodeEphemeralInput<'_>,
+) -> Result<freshell_runtime_protocol::ProviderLaunchContext, String> {
+    let input = OpencodeEphemeralInput {
+        launch_context: Some(context),
+        ..input
+    };
+    let directory = capability_dir()?;
+    let capability = store().issue(
+        soul.clone(),
+        &directory,
+        endpoint()?,
+        Some(("opencode", home, &context.config)),
+        input,
+        None,
+    )?;
+    let result = (|| {
+        use std::io::Read;
+        let stage = staged_provider_root_path(&directory, &capability.grant_id)?;
+        let mut bytes = Vec::new();
+        std::fs::File::open(stage.join(".freshell/prepared-context.json"))
+            .map_err(|_| "complete prepared provider context unavailable")?
+            .take((freshell_runtime_protocol::MAX_CONTROL_FRAME_BYTES + 1) as u64)
+            .read_to_end(&mut bytes)
+            .map_err(|_| "complete prepared provider context read failed")?;
+        if bytes.len() > freshell_runtime_protocol::MAX_CONTROL_FRAME_BYTES {
+            return Err("complete prepared provider context exceeds metadata profile".into());
+        }
+        let context: freshell_runtime_protocol::ProviderLaunchContext =
+            serde_json::from_slice(&bytes)
+                .map_err(|_| "complete prepared provider context metadata invalid")?;
+        if context.mcp_capability.as_ref() != Some(&capability) {
+            return Err("complete prepared context changed generation before publication".into());
+        }
+        Ok(context)
+    })();
+    if result.is_err() {
+        let _ = store().revoke(&capability.grant_id, &directory);
+    }
+    result
 }
 
 /// A web-server restart restores only grants whose exact incarnation remains
@@ -2665,6 +2785,7 @@ except Exception as error:
                     cwd: Some(home.path()),
                     workspace: Some(home.path()),
                     source_plan: None,
+                    ..Default::default()
                 },
                 None,
             )
@@ -2705,6 +2826,85 @@ except Exception as error:
         assert!(!serde_json::to_string(&second)
             .unwrap()
             .contains("nested-secret-byte"));
+    }
+
+    #[test]
+    fn managed_provider_source_preparation_publishes_complete_descriptor_before_capability() {
+        use crate::managed_provider_references::sources::*;
+        let owned = tempfile::tempdir().unwrap();
+        let home = owned.path().join("home");
+        let workspace = owned.path().join("workspace");
+        let config_root = home.join(".config/opencode");
+        std::fs::create_dir_all(&config_root).unwrap();
+        std::fs::create_dir(&workspace).unwrap();
+        let config = config_root.join("opencode.json");
+        let raw = r#"{"instructions":["{file:rules}"]}"#;
+        std::fs::write(&config, raw).unwrap();
+        std::fs::write(config_root.join("rules"), "PRIVATE_REFERENCED_NONCE").unwrap();
+        let plan = plan_opencode_sources(
+            vec![SourceOccurrence {
+                logical_path: config.clone(),
+                canonical_source: config.clone(),
+                lane: SourceLane::Main,
+            }],
+            &workspace,
+            &home,
+            &|_, _, _| None,
+        )
+        .unwrap();
+        let context = crate::managed_provider_bootstrap::provider_launch_context_from_home(
+            "opencode", &workspace, &home, None,
+        )
+        .unwrap()
+        .unwrap();
+        let store = CapabilityStore::default();
+        let capabilities = owned.path().join("capabilities");
+        std::fs::create_dir(&capabilities).unwrap();
+        let soul = SoulId::new();
+        let capability = store
+            .issue(
+                soul.clone(),
+                &capabilities,
+                "http://host.docker.internal:4000".into(),
+                Some(("opencode", &home, &context.config)),
+                OpencodeEphemeralInput {
+                    cwd: Some(&workspace),
+                    workspace: Some(&workspace),
+                    source_plan: Some(&plan),
+                    launch_context: Some(&context),
+                    ..Default::default()
+                },
+                None,
+            )
+            .unwrap();
+        let staged = staged_provider_root_path(&capabilities, &capability.grant_id).unwrap();
+        let metadata = std::fs::read(staged.join(".freshell/prepared-inputs.json")).expect(
+            "complete prepared input descriptor must exist when its capability is published",
+        );
+        let inputs: freshell_runtime_protocol::PreparedProviderInputs =
+            serde_json::from_slice(&metadata).unwrap();
+        inputs.validate(Some(&capability)).unwrap();
+        let ready: freshell_runtime_protocol::ProviderLaunchContext = serde_json::from_slice(
+            &std::fs::read(staged.join(".freshell/prepared-context.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(ready.prepared_inputs.as_ref(), Some(&inputs));
+        assert_eq!(ready.mcp_capability.as_ref(), Some(&capability));
+        assert!(!ready.config.iter().any(|selected|selected.provider_relative_path==".config/opencode/opencode.json"),"ordinary HOME copying must not overwrite the exact read-only prepared config mount");
+        assert_eq!(inputs.manifest.source_count, 1);
+        assert_eq!(inputs.config_binds.len(), 1);
+        assert_eq!(
+            inputs.config_binds[0].logical_destination,
+            "/home/freshell/provider/.config/opencode/opencode.json"
+        );
+        assert_eq!(
+            inputs.indexed_files.as_ref().unwrap().volume_name,
+            freshell_runtime_protocol::indexed_provider_volume_name(&soul, &capability.grant_id)
+        );
+        assert!(!metadata
+            .windows(b"PRIVATE_REFERENCED_NONCE".len())
+            .any(|bytes| bytes == b"PRIVATE_REFERENCED_NONCE"));
+        assert_eq!(std::fs::read_to_string(config).unwrap(), raw);
     }
 
     #[test]
@@ -2969,6 +3169,7 @@ except Exception as error:
                     cwd: Some(home.path()),
                     workspace: Some(home.path()),
                     source_plan: None,
+                    ..Default::default()
                 },
                 None,
             )

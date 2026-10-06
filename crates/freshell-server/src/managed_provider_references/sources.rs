@@ -304,6 +304,21 @@ pub fn plan_loaded_opencode_sources(
     home: &Path,
     lookup: &dyn Fn(SourceLane, &Path, &str) -> Option<String>,
 ) -> Result<Vec<PlannedSourceOccurrence>, super::ReferenceError> {
+    plan_loaded_opencode_sources_relocated(
+        sources,
+        cwd,
+        home,
+        lookup,
+        &std::collections::BTreeMap::new(),
+    )
+}
+pub fn plan_loaded_opencode_sources_relocated(
+    sources: Vec<LoadedSourceOccurrence>,
+    cwd: &Path,
+    home: &Path,
+    lookup: &dyn Fn(SourceLane, &Path, &str) -> Option<String>,
+    relocated_files: &std::collections::BTreeMap<PathBuf, PathBuf>,
+) -> Result<Vec<PlannedSourceOccurrence>, super::ReferenceError> {
     let original_names = source_environment_names(&sources)?;
     let mut result = Vec::new();
     let mut selected = std::collections::BTreeMap::<PathBuf, String>::new();
@@ -347,7 +362,7 @@ pub fn plan_loaded_opencode_sources(
             selected.insert(canonical.to_owned(), destination.clone());
             Ok(destination)
         };
-        let references = super::resolve_file_references_from_view(
+        let references = super::resolve_file_references_from_view_relocated(
             &loaded.view,
             Some(loaded.view.clone()),
             super::FileSourceOrigin {
@@ -358,6 +373,7 @@ pub fn plan_loaded_opencode_sources(
             &|name| lookup(source.lane, &source.logical_path, name),
             recipe_count,
             &mut allocate,
+            relocated_files,
         )?;
         if references
             .recipes

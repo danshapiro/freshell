@@ -175,7 +175,7 @@ impl ManagedTerminalController for ServerManagedRuntimeController {
             // server's resolved child environment wholesale (which can carry
             // AUTH_TOKEN, provider API keys, cloud credentials, proxy creds, ...).
             let env = managed_provider_env(&request.mode, &request.env);
-            let provider_secret_references = {
+            let mut provider_secret_references = {
                 crate::managed_provider_bootstrap::named_provider_onecli_references(&request.mode)?
             };
             let args = managed_provider_args(&request.mode, request.spec.args)?;
@@ -207,6 +207,7 @@ impl ManagedTerminalController for ServerManagedRuntimeController {
                     cwd: Some(&cwd),
                     workspace: Some(&workspace),
                     source_plan: None,
+                    ..Default::default()
                 }
             } else {
                 crate::managed_mcp_capability::OpencodeEphemeralInput {
@@ -215,25 +216,59 @@ impl ManagedTerminalController for ServerManagedRuntimeController {
                     ..Default::default()
                 }
             };
-            let mcp_capability = matches!(
-                request.mode.as_str(),
-                "claude" | "codex" | "opencode" | "amplifier"
-            )
-            .then(|| {
-                crate::managed_mcp_capability::issue_mcp_capability(
+            let (mcp_capability, mut provider_launch_context) = if request.mode == "opencode" {
+                let home = request
+                    .env
+                    .get("HOME")
+                    .map(std::path::PathBuf::from)
+                    .or_else(|| std::env::var_os("HOME").map(std::path::PathBuf::from))
+                    .ok_or("managed provider HOME unavailable")?;
+                let original = |name: &str| {
+                    request
+                        .env
+                        .get(name)
+                        .cloned()
+                        .or_else(|| std::env::var(name).ok())
+                };
+                let prepared = crate::managed_provider_references::prepare_managed_opencode(
+                    &self.client,
                     &soul_id,
-                    &request.mode,
-                    opencode_input,
-                )
-            })
-            .transpose()?;
-            let mut provider_launch_context =
-                crate::managed_provider_bootstrap::provider_launch_context_for_managed_at(
-                    &request.mode,
-                    &workspace,
+                    create_key,
+                    &home,
                     &cwd,
-                    mcp_capability.clone(),
-                )?;
+                    &workspace,
+                    &original,
+                    provider_secret_references,
+                    None,
+                )
+                .await?;
+                provider_secret_references = prepared.references;
+                (
+                    prepared.context.mcp_capability.clone(),
+                    Some(prepared.context),
+                )
+            } else {
+                let mcp_capability = matches!(
+                    request.mode.as_str(),
+                    "claude" | "codex" | "opencode" | "amplifier"
+                )
+                .then(|| {
+                    crate::managed_mcp_capability::issue_mcp_capability(
+                        &soul_id,
+                        &request.mode,
+                        opencode_input,
+                    )
+                })
+                .transpose()?;
+                let provider_launch_context =
+                    crate::managed_provider_bootstrap::provider_launch_context_for_managed_at(
+                        &request.mode,
+                        &workspace,
+                        &cwd,
+                        mcp_capability.clone(),
+                    )?;
+                (mcp_capability, provider_launch_context)
+            };
             if let Some(context) = provider_launch_context.as_mut() {
                 if let freshell_runtime_protocol::ProviderPreparation::Opencode {
                     inline_config,

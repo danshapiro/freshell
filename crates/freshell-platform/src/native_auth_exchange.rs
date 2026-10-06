@@ -47,7 +47,7 @@ impl std::io::Write for BoundedFrame {
 
 /// The only serialized auth reply is sent directly to this private socket.
 #[cfg(unix)]
-fn selected_native_auth(
+pub fn read_selected_native_auth(
     home: &Path,
     keys: &[String],
 ) -> Result<BTreeMap<String, String>, &'static str> {
@@ -115,7 +115,7 @@ pub fn serve(home: &Path, socket: &Path) -> Result<(), &'static str> {
         .map_err(|_| "native auth request unavailable")?;
     let keys: Vec<String> =
         serde_json::from_slice(&request).map_err(|_| "native auth request invalid")?;
-    let selected = selected_native_auth(home, &keys)?;
+    let selected = read_selected_native_auth(home, &keys)?;
     let mut frame = BoundedFrame(Vec::new());
     serde_json::to_writer(&mut frame, &selected).map_err(|_| "native auth reply exceeds limit")?;
     stream
@@ -195,16 +195,16 @@ mod tests {
         std::fs::write(&outside, "PRIVATE_SENTINEL").unwrap();
         symlink(&outside, &path).unwrap();
         assert_eq!(
-            selected_native_auth(&home, &[]).unwrap_err(),
+            read_selected_native_auth(&home, &[]).unwrap_err(),
             "native auth file escaped owned HOME"
         );
         std::fs::remove_file(&path).unwrap();
         std::fs::write(&path, vec![b' '; 128 * 1024 + 1]).unwrap();
         assert_eq!(
-            selected_native_auth(&home, &[]).unwrap_err(),
+            read_selected_native_auth(&home, &[]).unwrap_err(),
             "native auth file exceeds limit"
         );
         std::fs::remove_file(&path).unwrap();
-        assert!(selected_native_auth(&home, &[]).unwrap().is_empty());
+        assert!(read_selected_native_auth(&home, &[]).unwrap().is_empty());
     }
 }

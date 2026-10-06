@@ -9,6 +9,7 @@ pub(super) fn stage(
     home: &Path,
     cwd: &Path,
     plan: &[PlannedSourceOccurrence],
+    frozen_inputs: &[String],
 ) -> Result<(), String> {
     let mut manifest = SourceManifest {
         version: 1,
@@ -16,6 +17,7 @@ pub(super) fn stage(
         original_home: home.into(),
         sources: Vec::new(),
         files: Vec::new(),
+        frozen_inputs: frozen_inputs.to_vec(),
     };
     private_directory(&root.join(".freshell/source-views"))?;
     private_directory(&root.join(".freshell/templates"))?;
@@ -69,6 +71,8 @@ pub(super) fn stage(
                 .map(|recipe| recipe.generated_name.clone()),
             occurrences: source.references.occurrences.clone(),
             referenced_variables: source.references.referenced_variables.clone(),
+            path_variables: source.references.path_variables.clone(),
+            original_form: false,
         });
     }
     for (expected, (source_id, canonical_source)) in files.into_iter().enumerate() {
@@ -80,10 +84,144 @@ pub(super) fn stage(
             canonical_source,
         });
     }
-    let metadata = freshell_runtime_protocol::bounded_json_bytes(
-        &manifest,
-        freshell_runtime_protocol::MAX_CONTROL_FRAME_BYTES,
-    )
-    .map_err(|_| "source manifest metadata profile exceeded")?;
+    let metadata = freshell_runtime_protocol::bounded_json_bytes(&manifest, 64 * 1024 * 1024)
+        .map_err(|_| "source manifest metadata profile exceeded")?;
     write_private_bytes(&root.join(".freshell/input-manifest.json"), &metadata)
+}
+
+pub(super) fn describe(
+    root: &Path,
+    home: &Path,
+    plan: &[PlannedSourceOccurrence],
+    soul: &freshell_runtime_protocol::SoulId,
+    capability: &freshell_runtime_protocol::McpCapabilityReference,
+    initial_auth_reservation: Option<&str>,
+    config_root: Option<&Path>,
+) -> Result<freshell_runtime_protocol::PreparedProviderInputs, String> {
+    use freshell_runtime_protocol::*;
+    use sha2::{Digest, Sha256};
+    use std::io::Read;
+    let runtime_home = Path::new("/home/freshell/provider");
+    let default_global = home.join(".config/opencode");
+    let global = config_root.unwrap_or(&default_global);
+    let mut sources = BTreeMap::new();
+    let mut binds = Vec::new();
+    let mut recipes = 0usize;
+    let mut canonical_occurrences = BTreeMap::<&Path, usize>::new();
+    for occurrence in plan {
+        *canonical_occurrences
+            .entry(&occurrence.source.canonical_source)
+            .or_default() += 1;
+    }
+    for (ordinal, occurrence) in plan.iter().enumerate() {
+        if canonical_occurrences[occurrence.source.canonical_source.as_path()] > 1 {
+            return Err(
+                "shared source preparation requires its original-form aliases before publication"
+                    .into(),
+            );
+        }
+        let logical = &occurrence.source.logical_path;
+        let destination = if let Ok(relative) = logical.strip_prefix(global) {
+            runtime_home.join(".config/opencode").join(relative)
+        } else {
+            logical
+                .strip_prefix(home)
+                .map(|relative| runtime_home.join(relative))
+                .unwrap_or_else(|_| logical.clone())
+        };
+        let effective = if let Ok(relative) = logical.strip_prefix(&global) {
+            let physical = std::fs::canonicalize(root.join(relative))
+                .map_err(|_| "selected global config is unavailable in its private stage")?;
+            let relative = physical
+                .strip_prefix(root)
+                .map_err(|_| "selected global config escaped its owned stage")?;
+            if relative.starts_with(".freshell/resources") {
+                runtime_home.join(relative)
+            } else {
+                runtime_home.join(".config/opencode").join(relative)
+            }
+        } else {
+            occurrence
+                .source
+                .canonical_source
+                .strip_prefix(home)
+                .map(|relative| runtime_home.join(relative))
+                .unwrap_or_else(|_| occurrence.source.canonical_source.clone())
+        };
+        binds.push(ProviderConfigBind {
+            source_relative_path: format!(".freshell/templates/source-{ordinal}"),
+            logical_destination: destination
+                .to_str()
+                .ok_or("config destination is not UTF-8")?
+                .into(),
+            effective_destination: effective
+                .to_str()
+                .ok_or("config destination is not UTF-8")?
+                .into(),
+        });
+        recipes = recipes
+            .checked_add(occurrence.references.recipes.len())
+            .ok_or("source recipe count overflow")?;
+        for selected in &occurrence.references.selections {
+            let id = selected
+                .runtime_destination
+                .strip_prefix("/home/freshell/provider/.freshell/references/")
+                .and_then(|id| id.parse::<u16>().ok())
+                .filter(|id| *id < 128)
+                .ok_or("invalid selected source index")?;
+            if sources
+                .insert(id, &selected.canonical_source)
+                .is_some_and(|prior| prior != &selected.canonical_source)
+            {
+                return Err("selected source identity changed under one index".into());
+            }
+        }
+    }
+    let mut file = std::fs::File::open(root.join(".freshell/input-manifest.json"))
+        .map_err(|_| "prepared source manifest unavailable")?
+        .take(64 * 1024 * 1024 + 1);
+    let mut hash = Sha256::new();
+    let mut used = 0usize;
+    let mut buffer = [0; 64 * 1024];
+    loop {
+        let size = file
+            .read(&mut buffer)
+            .map_err(|_| "prepared source manifest read failed")?;
+        if size == 0 {
+            break;
+        }
+        used = used
+            .checked_add(size)
+            .ok_or("source manifest size overflow")?;
+        if used > 64 * 1024 * 1024 {
+            return Err("source manifest metadata exceeds 64 MiB".into());
+        }
+        hash.update(&buffer[..size]);
+    }
+    let inputs = PreparedProviderInputs {
+        generation_id: capability.grant_id.clone(),
+        initial_auth_reservation: initial_auth_reservation.map(str::to_string),
+        manifest: ProviderInputManifestReference {
+            relative_path: ".freshell/input-manifest.json".into(),
+            sha256: format!("{:x}", hash.finalize()),
+            source_count: u16::try_from(sources.len())
+                .map_err(|_| "selected source count overflow")?,
+            alias_count: 0,
+            recipe_count: u16::try_from(recipes).map_err(|_| "recipe count overflow")?,
+        },
+        config_binds: binds,
+        resource_mounts: Vec::new(),
+        indexed_files: (!sources.is_empty()).then(|| IndexedProviderFiles {
+            volume_name: indexed_provider_volume_name(soul, &capability.grant_id),
+            aliases: Vec::new(),
+        }),
+    };
+    inputs
+        .validate(Some(capability))
+        .map_err(|error| error.message)?;
+    let metadata = bounded_json_bytes(&inputs, MAX_CONTROL_FRAME_BYTES)
+        .map_err(|_| "prepared descriptor exceeds control profile")?;
+    write_private_bytes(&root.join(".freshell/prepared-inputs.json"), &metadata)?;
+    super::allow_controller_stage_read(&root.join(".freshell/prepared-inputs.json"))?;
+    Ok(inputs)
 }

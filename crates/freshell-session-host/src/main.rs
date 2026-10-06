@@ -1,6 +1,7 @@
 mod command_journal;
 mod control;
 mod output_journal;
+mod provider_input_preparation;
 mod provider_secret_resolution;
 mod providers;
 mod pty;
@@ -803,7 +804,7 @@ async fn grant_execution(
         execution_generation,
         grant_id,
         fixture,
-        provider_path_inputs: _provider_path_inputs,
+        provider_path_inputs,
         terminal,
         fresh_agent,
         resume_spec,
@@ -843,6 +844,77 @@ async fn grant_execution(
             "host boot already consumed a different grant",
         ));
     }
+
+    // Resolve every mounted grant once before consuming the execution grant.
+    // A changed source selection remains a pre-dispatch preparation failure.
+    let source = terminal
+        .as_ref()
+        .map(|launch| {
+            (
+                launch.mode.as_str(),
+                launch.provider_secret_references.as_slice(),
+                launch.provider_launch_context.as_ref(),
+            )
+        })
+        .or_else(|| {
+            fresh_agent.as_ref().map(|launch| {
+                (
+                    launch.provider.as_str(),
+                    launch.provider_secret_references.as_slice(),
+                    launch.provider_launch_context.as_ref(),
+                )
+            })
+        });
+    let mut prepared_secrets = if let Some((provider, references, context)) = source {
+        let mut secrets = provider_secret_resolution::resolve_child_secrets(
+            provider,
+            references,
+            Path::new("/run/freshell-secrets"),
+        )
+        .map_err(|error| {
+            RuntimeError::new(
+                RuntimeErrorCode::HostUnreachable,
+                format!("resolve managed provider credentials: {error}"),
+            )
+        })?;
+        if provider == "opencode" {
+            let generated = provider_input_preparation::prepare(
+                context,
+                &mut secrets,
+                &provider_path_inputs,
+                &state
+                    .provider_config_paths
+                    .private_mount
+                    .join("user-provider"),
+                &state.provider_config_paths.provider_home,
+            )
+            .map_err(|error| {
+                RuntimeError::new(
+                    if error.starts_with("configuration reference selection changed") {
+                        RuntimeErrorCode::ProviderInputsChanged
+                    } else {
+                        RuntimeErrorCode::HostUnreachable
+                    },
+                    error,
+                )
+            })?;
+            secrets.environment.extend(generated);
+        } else if !provider_path_inputs.is_empty() {
+            return Err(RuntimeError::new(
+                RuntimeErrorCode::InvalidRequest,
+                "private source input binding belongs to another provider",
+            ));
+        }
+        Some(secrets)
+    } else {
+        if !provider_path_inputs.is_empty() {
+            return Err(RuntimeError::new(
+                RuntimeErrorCode::InvalidRequest,
+                "private source input binding has no provider workload",
+            ));
+        }
+        None
+    };
 
     persisted.max_control_epoch = control_epoch;
     persisted.max_execution_generation = execution_generation;
@@ -928,15 +1000,10 @@ async fn grant_execution(
                 )
                 .map_err(|error| RuntimeError::new(RuntimeErrorCode::HostUnreachable, error))?;
             }
-            let resolved_secrets = provider_secret_resolution::resolve_child_secrets(
-                &terminal.mode,
-                &terminal.provider_secret_references,
-                Path::new("/run/freshell-secrets"),
-            )
-            .map_err(|error| {
+            let resolved_secrets = prepared_secrets.take().ok_or_else(|| {
                 RuntimeError::new(
                     RuntimeErrorCode::HostUnreachable,
-                    format!("resolve managed provider credentials: {error}"),
+                    "prepared terminal credentials unavailable",
                 )
             })?;
             prepare_provider_files(
@@ -1052,15 +1119,10 @@ async fn grant_execution(
                 )
                 .map_err(|error| RuntimeError::new(RuntimeErrorCode::HostUnreachable, error))?;
             }
-            let mut resolved_secrets = provider_secret_resolution::resolve_child_secrets(
-                launch.provider.as_str(),
-                &launch.provider_secret_references,
-                Path::new("/run/freshell-secrets"),
-            )
-            .map_err(|error| {
+            let mut resolved_secrets = prepared_secrets.take().ok_or_else(|| {
                 RuntimeError::new(
                     RuntimeErrorCode::HostUnreachable,
-                    format!("resolve hosted OneCLI grant: {error}"),
+                    "prepared fresh-agent credentials unavailable",
                 )
             })?;
             prepare_provider_files(
@@ -3898,6 +3960,38 @@ mod tests {
             handle_native_fixture_request(&dir, "soul-test", NativeFixtureRequest::History)
                 .unwrap();
         assert_eq!(history.history, vec!["create", "resume"]);
+    }
+
+    #[tokio::test]
+    async fn provider_secret_missing_prepared_source_does_not_consume_execution_grant() {
+        let state = test_host_state();
+        let generation = format!("grant-{}", uuid::Uuid::new_v4());
+        let terminal:TerminalLaunchSpec=serde_json::from_value(serde_json::json!({
+            "terminalId":"synthetic-preparation","streamId":"synthetic-stream","mode":"opencode","program":"/usr/bin/true","args":[],"env":{},
+            "cwd":"/tmp","workspacePath":"/tmp","runAsUid":65534,"runAsGid":0,"cols":80,"rows":24,"projectKey":"synthetic",
+            "providerLaunchContext":{"preparation":{"opencode":{"project_config":[],"inline_config":false}},
+                "mcpCapability":{"grantId":generation,"endpoint":"http://host.docker.internal:4000","providerRelativePath":".freshell/mcp-capability.json"},
+                "preparedInputs":{"generationId":generation,"manifest":{"relativePath":".freshell/input-manifest.json","sha256":"a".repeat(64),"sourceCount":0,"aliasCount":0,"recipeCount":0}}}
+        })).unwrap();
+        let result = grant_execution(
+            &state,
+            GrantExecutionRequest {
+                soul_id: SoulId::new(),
+                control_epoch: 1,
+                execution_generation: 1,
+                grant_id: GrantId::new(),
+                fixture: None,
+                provider_path_inputs: Default::default(),
+                terminal: Some(terminal),
+                fresh_agent: None,
+                resume_spec: None,
+            },
+        )
+        .await;
+        assert!(result.is_err());
+        let persisted = state.persisted.lock().await;
+        assert!(persisted.grant_id.is_none(),"source preflight failure must leave the grant unconsumed and safe to reprepare before dispatch");
+        assert_eq!(persisted.worker_launch_count, 0);
     }
 
     #[tokio::test]

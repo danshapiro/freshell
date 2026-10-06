@@ -70,7 +70,7 @@ fn provider_launch_context_from_home_at(
     )
 }
 
-fn provider_launch_context_from_home_at_with_xdg(
+pub(crate) fn provider_launch_context_from_home_at_with_xdg(
     provider: &str,
     workspace: &Path,
     project_dir: &Path,
