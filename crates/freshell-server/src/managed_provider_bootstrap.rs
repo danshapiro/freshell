@@ -410,6 +410,7 @@ pub fn named_provider_onecli_references(
                 .to_string_lossy()
                 .into_owned();
             references.push(ProviderSecretReference {
+                provider_relative_path: None,
                 source_path,
                 profile,
             });

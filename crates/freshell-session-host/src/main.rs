@@ -890,6 +890,7 @@ async fn grant_execution(
             prepare_provider_files(
                 &terminal.mode,
                 &resolved_secrets.provider_files,
+                &resolved_secrets.configuration_files,
                 terminal.run_as_uid,
                 terminal.run_as_gid,
             )
@@ -1008,6 +1009,7 @@ async fn grant_execution(
             prepare_provider_files(
                 launch.provider.as_str(),
                 &resolved_secrets.provider_files,
+                &resolved_secrets.configuration_files,
                 launch.run_as_uid,
                 launch.run_as_gid,
             )
@@ -1938,6 +1940,7 @@ fn prepare_provider_context_at(
 fn prepare_provider_files(
     provider: &str,
     provider_files: &[(&str, Vec<u8>)],
+    configuration_files: &[(String, PathBuf)],
     run_as_uid: u32,
     run_as_gid: u32,
 ) -> Result<(), String> {
@@ -1945,7 +1948,7 @@ fn prepare_provider_files(
     std::fs::create_dir_all(auth_dir).map_err(|error| error.to_string())?;
     set_mode(auth_dir, 0o711)?;
     let home = Path::new("/home/freshell/provider");
-    if !home.exists() && provider_files.is_empty() {
+    if !home.exists() && provider_files.is_empty() && configuration_files.is_empty() {
         return Ok(());
     }
     let legacy_relative = match provider {
@@ -2008,6 +2011,79 @@ fn prepare_provider_files(
                 destination.to_str().ok_or("auth path is not UTF-8")?,
             ],
         )?;
+    }
+    let mut aggregate = 0u64;
+    for (index, (relative, source)) in configuration_files.iter().enumerate() {
+        let destination = home.join(relative);
+        let target = auth_dir.join(format!("configuration-{index}"));
+        let temporary = auth_dir.join(format!(
+            "configuration-{index}-tmp-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let result = (|| {
+            use std::io::Read;
+            use std::os::unix::fs::OpenOptionsExt;
+            let input = std::fs::File::open(source)
+                .map_err(|_| "configuration-file grant is unavailable")?;
+            let mut output = std::fs::OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .mode(0o600)
+                .open(&temporary)
+                .map_err(|_| "configuration-file publication failed")?;
+            let bytes = std::io::copy(&mut input.take(16 * 1024 * 1024 + 1), &mut output)
+                .map_err(|_| "configuration-file publication read failed")?;
+            aggregate = aggregate
+                .checked_add(bytes)
+                .ok_or("configuration-file size overflow")?;
+            if bytes > 16 * 1024 * 1024 || aggregate > 32 * 1024 * 1024 {
+                return Err("configuration-file grant exceeds per-source or aggregate limit");
+            }
+            output
+                .sync_all()
+                .map_err(|_| "configuration-file publication sync failed")?;
+            set_owner(&temporary, run_as_uid, run_as_gid)
+                .map_err(|_| "configuration-file ownership failed")?;
+            std::fs::rename(&temporary, &target)
+                .map_err(|_| "configuration-file publication failed")?;
+            let parent = destination
+                .parent()
+                .ok_or("configuration-file destination has no parent")?;
+            run_provider_path_command(
+                run_as_uid,
+                run_as_gid,
+                "/usr/bin/mkdir",
+                &[
+                    "-p",
+                    "--",
+                    parent
+                        .to_str()
+                        .ok_or("configuration-file parent is not UTF-8")?,
+                ],
+            )
+            .map_err(|_| "configuration-file parent creation failed")?;
+            run_provider_path_command(
+                run_as_uid,
+                run_as_gid,
+                "/usr/bin/ln",
+                &[
+                    "-sfnT",
+                    "--",
+                    target
+                        .to_str()
+                        .ok_or("configuration-file target is not UTF-8")?,
+                    destination
+                        .to_str()
+                        .ok_or("configuration-file destination is not UTF-8")?,
+                ],
+            )
+            .map_err(|_| "configuration-file link publication failed")?;
+            Ok(())
+        })();
+        if result.is_err() {
+            let _ = std::fs::remove_file(&temporary);
+        }
+        result.map_err(str::to_string)?;
     }
     Ok(())
 }

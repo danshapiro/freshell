@@ -74,6 +74,8 @@ fn workload_mounts(
     context: Option<&ProviderLaunchContext>,
     provider: &str,
 ) -> Result<TerminalMounts, String> {
+    freshell_runtime_protocol::validate_provider_secrets(provider, secret_references)
+        .map_err(|error| error.message)?;
     let workspace = canonical_dir(Path::new(workspace_path), "workspace")?;
     if workspace != Path::new(workspace_path) {
         return Err("workspace path must already be canonical".into());
@@ -118,12 +120,13 @@ fn workload_mounts(
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            if std::fs::metadata(&source)
-                .map_err(|error| error.to_string())?
-                .permissions()
-                .mode()
-                & 0o077
-                != 0
+            if !secret.profile.is_configuration_file()
+                && std::fs::metadata(&source)
+                    .map_err(|error| error.to_string())?
+                    .permissions()
+                    .mode()
+                    & 0o077
+                    != 0
             {
                 return Err("provider OneCLI grant must be private".into());
             }
@@ -382,6 +385,7 @@ mod provider_secret_tests {
         }))
         .unwrap();
         launch.provider_secret_references = vec![ProviderSecretReference {
+            provider_relative_path: None,
             source_path: canonical_grant.to_string_lossy().into_owned(),
             profile: ProviderSecretProfile::ClaudeOnecliEnvironment,
         }];

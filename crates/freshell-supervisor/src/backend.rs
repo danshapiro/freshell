@@ -1677,6 +1677,7 @@ mod tests {
             provider_permission_mode: None,
             provider_bootstrap_files: Vec::new(),
             provider_secret_references: vec![ProviderSecretReference {
+                provider_relative_path: None,
                 source_path: keys.to_string_lossy().into_owned(),
                 profile: ProviderSecretProfile::AmplifierOnecliLunarouteGlm53,
             }],

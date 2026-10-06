@@ -913,6 +913,10 @@ pub struct ProviderBootstrapFile {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ProviderSecretProfile {
+    ClaudeConfigurationFile,
+    CodexConfigurationFile,
+    OpencodeConfigurationFile,
+    AmplifierConfigurationFile,
     ClaudeOnecliEnvironment,
     ClaudeOnecliAuthFile,
     CodexOnecliEnvironment,
@@ -936,16 +940,32 @@ pub enum ProviderSecretProfile {
 impl ProviderSecretProfile {
     pub fn provider(self) -> &'static str {
         match self {
-            Self::ClaudeOnecliEnvironment | Self::ClaudeOnecliAuthFile => "claude",
-            Self::CodexOnecliEnvironment | Self::CodexOnecliAuthFile => "codex",
+            Self::ClaudeOnecliEnvironment
+            | Self::ClaudeOnecliAuthFile
+            | Self::ClaudeConfigurationFile => "claude",
+            Self::CodexOnecliEnvironment
+            | Self::CodexOnecliAuthFile
+            | Self::CodexConfigurationFile => "codex",
             Self::OpencodeOnecliEnvironment
             | Self::OpencodeOnecliAuthFile
-            | Self::OpencodeOnecliCaFile => "opencode",
+            | Self::OpencodeOnecliCaFile
+            | Self::OpencodeConfigurationFile => "opencode",
             Self::AmplifierOnecliEnvironment
+            | Self::AmplifierConfigurationFile
             | Self::AmplifierOnecliKeysFile
             | Self::AmplifierOnecliLunarouteGlm53
             | Self::LegacyAmplifierOnecliAnthropicHaikuLow => "amplifier",
         }
+    }
+
+    pub fn is_configuration_file(self) -> bool {
+        matches!(
+            self,
+            Self::ClaudeConfigurationFile
+                | Self::CodexConfigurationFile
+                | Self::OpencodeConfigurationFile
+                | Self::AmplifierConfigurationFile
+        )
     }
 
     pub fn auth_relative_path(self) -> Option<&'static str> {
@@ -975,6 +995,8 @@ pub struct ProviderSecretReference {
     /// session host reads its read-only mount immediately before child spawn.
     pub source_path: String,
     pub profile: ProviderSecretProfile,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_relative_path: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1482,6 +1504,62 @@ mod provider_launch_context_tests {
     }
 
     #[test]
+    fn configuration_file_grants_allow_many_unique_destinations_in_both_launch_routes() {
+        let references: Vec<_> = (0..128)
+            .map(|index| ProviderSecretReference {
+                source_path: format!("/private/reference-{index}"),
+                profile: ProviderSecretProfile::OpencodeConfigurationFile,
+                provider_relative_path: Some(format!(".freshell/references/{index}")),
+            })
+            .collect();
+        assert!(validate_provider_secrets("opencode", &references).is_ok());
+        let mut terminal: TerminalLaunchSpec = serde_json::from_value(serde_json::json!({
+            "terminalId":"terminal", "streamId":"stream", "mode":"opencode",
+            "program":"opencode", "cwd":"/workspace", "runAsUid":65534,
+            "runAsGid":0, "cols":80, "rows":24, "projectKey":"project",
+            "workspacePath":"/workspace"
+        }))
+        .unwrap();
+        terminal.provider_secret_references = references.clone();
+        assert!(terminal.validate().is_ok());
+        let mut fresh: FreshAgentLaunchSpec = serde_json::from_value(serde_json::json!({
+            "sessionId":"presentation", "provider":"opencode", "sessionType":"freshopencode",
+            "runtimeVariant":"pinned", "providerStoreId":"store", "cwd":"/workspace",
+            "workspacePath":"/workspace", "runAsUid":65534, "runAsGid":0
+        }))
+        .unwrap();
+        fresh.provider_secret_references = references;
+        assert!(fresh.validate().is_ok());
+    }
+    #[test]
+    fn configuration_file_grants_reject_cross_provider_duplicate_and_unsafe_destinations() {
+        let reference = ProviderSecretReference {
+            source_path: "/private/reference".into(),
+            profile: ProviderSecretProfile::ClaudeConfigurationFile,
+            provider_relative_path: Some(".freshell/references/one".into()),
+        };
+        assert!(validate_provider_secrets("claude", &[reference.clone()]).is_ok());
+        assert!(validate_provider_secrets("codex", &[reference.clone()]).is_err());
+        assert!(
+            validate_provider_secrets("claude", &[reference.clone(), reference.clone()]).is_err()
+        );
+        for path in [
+            ".claude/auth.json",
+            ".freshell/references/../one",
+            ".freshell/references/one/two",
+            "/absolute",
+            ".freshell/references/",
+        ] {
+            let mut invalid = reference.clone();
+            invalid.provider_relative_path = Some(path.into());
+            assert!(validate_provider_secrets("claude", &[invalid]).is_err());
+        }
+        let mut legacy = reference;
+        legacy.profile = ProviderSecretProfile::ClaudeOnecliAuthFile;
+        assert!(validate_provider_secrets("claude", &[legacy]).is_err());
+    }
+
+    #[test]
     fn onecli_profiles_match_only_their_named_provider() {
         for (provider, profiles) in [
             (
@@ -1516,6 +1594,7 @@ mod provider_launch_context_tests {
         ] {
             for profile in profiles {
                 let references = [ProviderSecretReference {
+                    provider_relative_path: None,
                     source_path: "/private/onecli-grant".into(),
                     profile,
                 }];
@@ -1526,6 +1605,7 @@ mod provider_launch_context_tests {
         assert!(validate_provider_secrets(
             "amplifier",
             &[ProviderSecretReference {
+                provider_relative_path: None,
                 source_path: "/private/legacy".into(),
                 profile: ProviderSecretProfile::LegacyAmplifierOnecliAnthropicHaikuLow,
             }]
@@ -1692,7 +1772,6 @@ impl FreshAgentLaunchSpec {
                         .is_some_and(|native| native != &reference.session_id)
             })
             || self.provider_bootstrap_files.len() > 16
-            || self.provider_secret_references.len() > 4
         {
             return Err(RuntimeError::new(
                 RuntimeErrorCode::InvalidRequest,
@@ -1878,10 +1957,7 @@ impl TerminalLaunchSpec {
                 "managed terminal launch has an empty/root-uid required field",
             ));
         }
-        if self.env.len() > 512
-            || self.args.len() > 512
-            || self.provider_bootstrap_files.len() > 16
-            || self.provider_secret_references.len() > 4
+        if self.env.len() > 512 || self.args.len() > 512 || self.provider_bootstrap_files.len() > 16
         {
             return Err(RuntimeError::new(
                 RuntimeErrorCode::InvalidRequest,
@@ -2139,26 +2215,56 @@ fn safe_selector(value: &str) -> bool {
         })
 }
 
-fn validate_provider_secrets(
+pub fn validate_provider_secrets(
     provider: &str,
     references: &[ProviderSecretReference],
 ) -> Result<(), RuntimeError> {
-    let mut seen = std::collections::BTreeSet::new();
+    let invalid = || {
+        RuntimeError::new(
+            RuntimeErrorCode::InvalidRequest,
+            "managed provider grant profile, destination or capacity is invalid",
+        )
+    };
+    if references.len() > 132 {
+        return Err(invalid());
+    }
+    let mut legacy_profiles = std::collections::BTreeSet::new();
+    let mut destinations = std::collections::BTreeSet::new();
     for reference in references {
         if reference.profile.provider() != provider
             || !std::path::Path::new(&reference.source_path).is_absolute()
             || reference.source_path.len() > 1024
             || reference.source_path.chars().any(char::is_control)
-            || !seen.insert(reference.profile as u8)
             || matches!(
                 reference.profile,
                 ProviderSecretProfile::LegacyAmplifierOnecliAnthropicHaikuLow
             )
         {
-            return Err(RuntimeError::new(
-                RuntimeErrorCode::InvalidRequest,
-                "managed OneCLI profile is unsafe or belongs to another provider",
-            ));
+            return Err(invalid());
+        }
+        if reference.profile.is_configuration_file() {
+            let destination = reference
+                .provider_relative_path
+                .as_deref()
+                .ok_or_else(invalid)?;
+            let id = destination
+                .strip_prefix(".freshell/references/")
+                .ok_or_else(invalid)?;
+            if id.is_empty()
+                || id.len() > 128
+                || !id
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'))
+                || !destinations.insert(destination)
+                || destinations.len() > 128
+            {
+                return Err(invalid());
+            }
+        } else if reference.provider_relative_path.is_some()
+            || !legacy_profiles.insert(reference.profile as u8)
+            || legacy_profiles.len() > 4
+        {
+            return Err(invalid());
         }
     }
     Ok(())

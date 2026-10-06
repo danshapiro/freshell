@@ -2089,6 +2089,7 @@ mod tests {
                 }],
             }),
             provider_secret_references: vec![freshell_runtime_protocol::ProviderSecretReference {
+                provider_relative_path: None,
                 source_path: "/run/freshell-secrets/onecli/env".into(),
                 profile: match provider {
                     FreshProvider::Claude => {
@@ -2686,6 +2687,7 @@ mod tests {
                     }],
                 }),
                 provider_secret_references: vec![freshell_runtime_protocol::ProviderSecretReference {
+                    provider_relative_path: None,
                     source_path: "/run/freshell-secrets/onecli".into(),
                     profile: match provider {
                         FreshProvider::Claude => freshell_runtime_protocol::ProviderSecretProfile::ClaudeOnecliEnvironment,

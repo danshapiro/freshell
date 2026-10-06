@@ -3044,6 +3044,7 @@ mod tests {
             provider_permission_mode: None,
             provider_bootstrap_files: Vec::new(),
             provider_secret_references: vec![freshell_runtime_protocol::ProviderSecretReference {
+                provider_relative_path: None,
                 source_path: keys.to_string_lossy().into_owned(),
                 profile:
                     freshell_runtime_protocol::ProviderSecretProfile::AmplifierOnecliLunarouteGlm53,

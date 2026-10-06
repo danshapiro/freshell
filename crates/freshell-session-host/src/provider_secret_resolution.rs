@@ -8,6 +8,7 @@ const MAX_KEYS_BYTES: u64 = 128 * 1024;
 pub struct ResolvedProviderSecrets {
     pub environment: BTreeMap<String, String>,
     pub provider_files: Vec<(&'static str, Vec<u8>)>,
+    pub configuration_files: Vec<(String, std::path::PathBuf)>,
 }
 
 pub fn resolve_child_secrets(
@@ -15,12 +16,41 @@ pub fn resolve_child_secrets(
     references: &[ProviderSecretReference],
     mount_root: &Path,
 ) -> Result<ResolvedProviderSecrets, String> {
+    freshell_runtime_protocol::validate_provider_secrets(provider, references)
+        .map_err(|error| error.message)?;
     let mut resolved = ResolvedProviderSecrets::default();
+    let mut configuration_bytes = 0u64;
     for (index, reference) in references.iter().enumerate() {
         if reference.profile.provider() != provider {
             return Err("OneCLI profile belongs to another provider".into());
         }
         let mount = mount_root.join(format!("provider-{index}"));
+        if reference.profile.is_configuration_file() {
+            let metadata = fs::symlink_metadata(&mount)
+                .map_err(|_| "configuration-file grant is unavailable")?;
+            if !metadata.is_file()
+                || metadata.file_type().is_symlink()
+                || metadata.len() > 16 * 1024 * 1024
+            {
+                return Err(
+                    "configuration-file grant must be a bounded regular file (16 MiB)".into(),
+                );
+            }
+            configuration_bytes = configuration_bytes
+                .checked_add(metadata.len())
+                .ok_or("configuration-file grant size overflow")?;
+            if configuration_bytes > 32 * 1024 * 1024 {
+                return Err("configuration-file grants exceed 32 MiB aggregate limit".into());
+            }
+            resolved.configuration_files.push((
+                reference
+                    .provider_relative_path
+                    .clone()
+                    .ok_or("configuration-file grant destination missing")?,
+                mount,
+            ));
+            continue;
+        }
         let metadata = fs::symlink_metadata(&mount)
             .map_err(|error| format!("OneCLI grant is unavailable: {error}"))?;
         if !metadata.is_file()
@@ -88,6 +118,22 @@ mod tests {
     use freshell_runtime_protocol::ProviderSecretReference;
 
     #[test]
+    fn configuration_file_grants_use_large_profile_without_expanding_payload_into_environment() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join("provider-0"), vec![b'x'; 128 * 1024 + 1]).unwrap();
+        let reference = ProviderSecretReference {
+            source_path: "/synthetic/config-source".into(),
+            profile: ProviderSecretProfile::OpencodeConfigurationFile,
+            provider_relative_path: Some(".freshell/references/0".into()),
+        };
+        let resolved = resolve_child_secrets("opencode", &[reference], temp.path()).unwrap();
+        assert!(resolved.environment.is_empty());
+        assert!(resolved.provider_files.is_empty());
+        assert_eq!(resolved.configuration_files.len(), 1);
+        assert_eq!(resolved.configuration_files[0].0, ".freshell/references/0");
+    }
+
+    #[test]
     fn provider_secret_profiles_accept_only_their_provider_and_keep_controls_out_of_child() {
         let cases = [
             (
@@ -119,6 +165,7 @@ mod tests {
             )
             .unwrap();
             let references = [ProviderSecretReference {
+                provider_relative_path: None,
                 source_path: root
                     .path()
                     .join("provider-0")
@@ -165,6 +212,7 @@ mod tests {
         )
         .unwrap();
         let reference = ProviderSecretReference {
+            provider_relative_path: None,
             source_path: mount.to_string_lossy().into_owned(),
             profile: ProviderSecretProfile::OpencodeOnecliEnvironment,
         };
@@ -242,6 +290,7 @@ mod tests {
             )
             .unwrap();
             let reference = ProviderSecretReference {
+                provider_relative_path: None,
                 source_path: mount.to_string_lossy().into_owned(),
                 profile,
             };
@@ -296,6 +345,7 @@ mod tests {
             let mount = root.path().join("provider-0");
             fs::write(&mount, "fake-OneCLI-auth-file").unwrap();
             let references = [ProviderSecretReference {
+                provider_relative_path: None,
                 source_path: mount.to_string_lossy().into_owned(),
                 profile,
             }];
@@ -330,6 +380,7 @@ mod tests {
             )
             .unwrap();
             let reference = ProviderSecretReference {
+                provider_relative_path: None,
                 source_path: mount.to_string_lossy().into_owned(),
                 profile: ProviderSecretProfile::OpencodeOnecliEnvironment,
             };
@@ -409,6 +460,7 @@ mod tests {
     #[test]
     fn serialised_launch_contains_references_but_never_resolved_secret_bytes() {
         let reference = freshell_runtime_protocol::ProviderSecretReference {
+            provider_relative_path: None,
             source_path: "/private/keys.env".into(),
             profile: ProviderSecretProfile::AmplifierOnecliLunarouteGlm53,
         };
