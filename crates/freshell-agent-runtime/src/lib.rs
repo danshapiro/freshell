@@ -7,11 +7,13 @@
 
 use freshell_runtime_protocol::{
     AllocationState, DurablePosition, EvidenceStoreState, IdentityProvenance, ProviderSessionRef,
-    RecoveryBlockReason, RecoveryEvidenceVerdict, RecoveryPath, RecoveryPathEvidence, ResumeSpec,
-    RetryHint, RuntimeError, RuntimeErrorCode, TerminalLaunchSpec, RESUME_SPEC_SCHEMA_VERSION,
+    RecoveryBlockReason, RecoveryEvidenceVerdict, RecoveryPath, RecoveryPathEvidence,
+    RecoveryProbe, ResumeSpec, RetryHint, RuntimeError, RuntimeErrorCode, TerminalLaunchSpec,
+    RESUME_SPEC_SCHEMA_VERSION,
 };
 use rusqlite::{Connection, OpenFlags};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, VecDeque},
     fs,
@@ -38,6 +40,32 @@ pub const PROVIDER_HOME: &str = "/home/freshell/provider";
 pub const MAX_SUCCESSFUL_RECOVERIES_PER_HOUR: u64 = 5;
 pub const RECOVERY_WINDOW_MS: i64 = 60 * 60 * 1_000;
 pub const AUTOMATIC_RETRY_DELAYS_MS: [u64; 2] = [2_000, 10_000];
+
+/// Missing identity cannot identify which provider history must be inspected.
+pub fn unverified_native_probe() -> RecoveryProbe {
+    RecoveryProbe::Blocked {
+        path: RecoveryPath::NativeResume,
+        reason: RecoveryBlockReason::StoreUnreadable,
+        retry_hint: RetryHint {
+            automatic_after_ms: None,
+            manual_retry: true,
+            repair: Some("provider identity or exact storage census has not been verified".into()),
+        },
+        evidence: Vec::new(),
+    }
+}
+
+/// Body-free binding for a complete exact-store negative captured by a reader.
+pub fn native_absence_reference(
+    provider: &str,
+    store: &str,
+    native_id: &str,
+    evidence_revision: u64,
+) -> String {
+    let fields = serde_json::to_vec(&(provider, store, native_id, evidence_revision))
+        .expect("census fields serialize");
+    format!("nativeAbsenceCensus=sha256:{:x}", Sha256::digest(fields))
+}
 
 /// Whether a provider's durable-soul behavior has actually been proven by a
 /// live, candidate-bound certification campaign.
@@ -604,7 +632,7 @@ fn strip_value_flags(args: &[String], flags: &[&str]) -> Vec<String> {
 }
 
 pub fn probe_provider_store(provider_home: &Path, spec: &ResumeSpec) -> ProviderStoreProbe {
-    match fs::metadata(provider_home) {
+    match fs::symlink_metadata(provider_home) {
         Ok(metadata) if metadata.is_dir() => {}
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             return blocked(
@@ -624,7 +652,7 @@ pub fn probe_provider_store(provider_home: &Path, spec: &ResumeSpec) -> Provider
         }
     }
     let expected = spec.provider_session.native_session_id.as_str();
-    if expected.is_empty() {
+    if expected.trim().is_empty() {
         return blocked(
             RecoveryBlockReason::AmbiguousIdentity,
             "native identity is unrecorded",
@@ -632,11 +660,24 @@ pub fn probe_provider_store(provider_home: &Path, spec: &ResumeSpec) -> Provider
             None,
         );
     }
-    match spec.provider_session.provider.as_str() {
+    if spec.provider_session.provider == "amplifier"
+        && spec
+            .environment
+            .get("AMPLIFIER_HOME")
+            .is_some_and(|selected| selected != &format!("{}/.amplifier", spec.provider_home))
+    {
+        return blocked(
+            RecoveryBlockReason::StoreUnreadable,
+            "selected provider environment points to an uninspected store",
+            Vec::new(),
+            None,
+        );
+    }
+    let mut result = match spec.provider_session.provider.as_str() {
         "phase1-fixture" | "native-session-fixture" => {
             probe_native_fixture(provider_home, expected)
         }
-        "claude" => probe_bounded_tree(
+        "claude" | "kilroy" => probe_bounded_tree(
             &spec
                 .environment
                 .get("CLAUDE_CONFIG_DIR")
@@ -662,11 +703,35 @@ pub fn probe_provider_store(provider_home: &Path, spec: &ResumeSpec) -> Provider
             vec![format!("provider={other}")],
             None,
         ),
+    };
+    if let ProviderStoreProbe::DefinitivelyUnavailable {
+        evidence,
+        negative_paths,
+        ..
+    } = &mut result
+    {
+        let reference = native_absence_reference(
+            &spec.provider_session.provider,
+            &spec.provider_session.provider_store_id,
+            expected,
+            spec.evidence_revision,
+        );
+        evidence.push(reference.clone());
+        for row in negative_paths.iter_mut().filter(|row| {
+            row.path == RecoveryPath::NativeResume
+                && row.verdict == RecoveryEvidenceVerdict::DefinitiveNegative
+        }) {
+            row.evidence_refs.push(reference.clone());
+        }
     }
+    result
 }
 
 fn probe_native_fixture(provider_home: &Path, expected: &str) -> ProviderStoreProbe {
     let path = provider_home.join("native-session-state.json");
+    if let Err(probe) = inspect_native_path(provider_home, &path) {
+        return probe;
+    }
     match fs::symlink_metadata(&path) {
         Ok(metadata)
             if metadata.is_file()
@@ -743,6 +808,9 @@ fn probe_native_fixture_checkpoint(
     primary_path: &Path,
 ) -> ProviderStoreProbe {
     let directory = provider_home.join(".freshell/checkpoints/native-session");
+    if let Err(probe) = inspect_native_path(provider_home, &directory) {
+        return probe;
+    }
     match fs::symlink_metadata(&directory) {
         Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {}
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -937,6 +1005,47 @@ fn native_fixture_absence(
     result
 }
 
+// Inspect the selected path's ancestors before treating absence as evidence.
+// Configured absolute stores may be outside the default provider HOME.
+fn inspect_native_path(provider_home: &Path, path: &Path) -> Result<bool, ProviderStoreProbe> {
+    let (mut current, relative) = if let Ok(relative) = path.strip_prefix(provider_home) {
+        (provider_home.to_path_buf(), relative)
+    } else if path.is_absolute() {
+        (std::path::PathBuf::new(), path)
+    } else {
+        return Err(blocked(
+            RecoveryBlockReason::StoreUnreadable,
+            "selected provider store has no established absolute root",
+            Vec::new(),
+            None,
+        ));
+    };
+    for component in relative.components() {
+        current.push(component);
+        match fs::symlink_metadata(&current) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(blocked(
+                    RecoveryBlockReason::AmbiguousIdentity,
+                    "provider store path is not canonical",
+                    vec![path.display().to_string()],
+                    None,
+                ))
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(_) => {
+                return Err(blocked(
+                    RecoveryBlockReason::StoreUnreadable,
+                    "provider store path could not be inspected",
+                    vec![path.display().to_string()],
+                    Some("repair provider-state volume permissions"),
+                ))
+            }
+        }
+    }
+    Ok(true)
+}
+
 fn probe_opencode(provider_home: &Path, expected: &str, spec: &ResumeSpec) -> ProviderStoreProbe {
     // OpenCode v1.18's relative OPENCODE_DB is relative to its XDG data
     // directory. Channel is compiled into the executable, not an environment
@@ -1000,7 +1109,29 @@ fn probe_opencode(provider_home: &Path, expected: &str, spec: &ResumeSpec) -> Pr
             None,
         );
     }
-    match fs::metadata(&path) {
+    let present = match inspect_native_path(provider_home, &path) {
+        Ok(present) => present,
+        Err(probe) => return probe,
+    };
+    if !present {
+        for suffix in ["-wal", "-shm", "-journal"] {
+            let mut companion = path.as_os_str().to_os_string();
+            companion.push(suffix);
+            match inspect_native_path(provider_home, Path::new(&companion)) {
+                Ok(false) => {}
+                Ok(true) => {
+                    return blocked(
+                        RecoveryBlockReason::StoreUnreadable,
+                        "OpenCode database is missing but retained SQLite storage remains",
+                        vec![path.display().to_string()],
+                        None,
+                    )
+                }
+                Err(probe) => return probe,
+            }
+        }
+    }
+    match fs::symlink_metadata(&path) {
         Ok(metadata) if metadata.is_file() => {}
         Err(error) if error.kind() == std::io::ErrorKind::NotFound && authoritative => {
             return inspected_absence(
@@ -1044,15 +1175,25 @@ fn probe_opencode(provider_home: &Path, expected: &str, spec: &ResumeSpec) -> Pr
         Ok(true) => ProviderStoreProbe::Ready {
             evidence: vec![path.display().to_string(), format!("session.id={expected}")],
         },
-        Ok(false) if authoritative => inspected_absence(
-            format!("OpenCode effective database has no exact session row {expected}"),
-            vec![
-                path.display().to_string(),
-                format!("exactSessionQuery={expected}"),
-            ],
-            EvidenceStoreState::PresentReadable,
-            &[RecoveryPath::NativeResume, RecoveryPath::CheckpointRestore],
-        ),
+        Ok(false) if authoritative => {
+            let census = path.canonicalize().ok().and_then(|canonical| {
+                let source_store =
+                    hex::encode(Sha256::digest(canonical.to_string_lossy().as_bytes()));
+                freshell_sessions::opencode_transfer::HostOpenCodeInventory::new(canonical)
+                    .inspect_exact_origin(&source_store, expected)
+                    .ok()
+            });
+            match census {
+                Some(census) if !census.available() => inspected_absence(
+                    format!("qualified OpenCode database has no exact session row or retained references for {expected}"),
+                    vec![path.display().to_string(), format!("nativeStoreCensus=sha256:{}", census.inventory_fingerprint())],
+                    EvidenceStoreState::PresentReadable,
+                    &[RecoveryPath::NativeResume, RecoveryPath::CheckpointRestore]),
+                _ => blocked(RecoveryBlockReason::StoreUnreadable,
+                    "exact OpenCode store census is incomplete or unqualified",
+                    vec![path.display().to_string()], None),
+            }
+        }
         Ok(false) => blocked(
             RecoveryBlockReason::AmbiguousIdentity,
             "OpenCode effective channel database is unrecorded; default no-match is not absence",
@@ -1072,6 +1213,9 @@ fn probe_amplifier(provider_home: &Path, expected: &str) -> ProviderStoreProbe {
     const MAX_INSPECTED_METADATA_BYTES: u64 = 1024 * 1024;
 
     let root = provider_home.join(".amplifier/projects");
+    if let Err(probe) = inspect_native_path(provider_home, &root) {
+        return probe;
+    }
     // This tree alone does not establish all effective Amplifier stores.
     // Exact readable positives are usable; an unrecorded store is unknown.
     let mut incomplete = false;
@@ -1330,6 +1474,18 @@ fn probe_amplifier(provider_home: &Path, expected: &str) -> ProviderStoreProbe {
 }
 
 fn probe_bounded_tree(root: &Path, expected: &str) -> ProviderStoreProbe {
+    if let Err(probe) = inspect_native_path(Path::new(""), root) {
+        return probe;
+    }
+    if fs::symlink_metadata(root).is_ok_and(|metadata| !metadata.is_dir()) {
+        return blocked(
+            RecoveryBlockReason::StoreUnreadable,
+            "provider store root is not a directory",
+            vec![root.display().to_string()],
+            None,
+        );
+    }
+    let mut matches = Vec::new();
     let mut queue = VecDeque::from([(root.to_path_buf(), 0_u8)]);
     let mut visited = 0_usize;
     while let Some((path, depth)) = queue.pop_front() {
@@ -1381,9 +1537,7 @@ fn probe_bounded_tree(root: &Path, expected: &str) -> ProviderStoreProbe {
                 .and_then(|mut file| file.read(&mut [0_u8; 1]))
                 .is_ok()
             {
-                return ProviderStoreProbe::Ready {
-                    evidence: vec![path.display().to_string()],
-                };
+                matches.push(path.display().to_string());
             }
             continue;
         }
@@ -1397,14 +1551,17 @@ fn probe_bounded_tree(root: &Path, expected: &str) -> ProviderStoreProbe {
             .windows(expected.len())
             .any(|w| w == expected.as_bytes());
         if content_match {
-            return ProviderStoreProbe::Ready {
-                evidence: vec![path.display().to_string()],
-            };
+            matches.push(path.display().to_string());
         }
     }
-    blocked(RecoveryBlockReason::AmbiguousIdentity,
-        "complete effective provider native/checkpoint stores are unrecorded; tree no-match is not absence",
-        vec![root.display().to_string()], None)
+    match matches.len() {
+        0 => blocked(RecoveryBlockReason::AmbiguousIdentity,
+            "complete effective provider native/checkpoint stores are unrecorded; tree no-match is not absence",
+            vec![root.display().to_string()], None),
+        1 => ProviderStoreProbe::Ready { evidence: matches },
+        _ => blocked(RecoveryBlockReason::AmbiguousIdentity,
+            "provider identity has multiple candidate artifacts", matches, None),
+    }
 }
 
 fn blocked(
@@ -1704,10 +1861,14 @@ mod tests {
         let path = data.join("opencode/selected.db");
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         let db = Connection::open(&path).unwrap();
-        db.execute("CREATE TABLE session(id TEXT PRIMARY KEY)", [])
+        db.execute_batch(freshell_sessions::opencode_transfer::pinned_destination_schema_sql())
             .unwrap();
-        db.execute("INSERT INTO session(id) VALUES ('exact')", [])
-            .unwrap();
+        for migration in freshell_sessions::opencode_transfer::pinned_destination_migration_ids() {
+            db.execute("INSERT INTO migration VALUES (?1,0)", [migration])
+                .unwrap();
+        }
+        db.execute("INSERT INTO project(id,worktree,time_created,time_updated,sandboxes) VALUES ('prj','/synthetic',1,1,'[]')", []).unwrap();
+        db.execute("INSERT INTO session(id,slug,project_id,directory,title,version,time_created,time_updated) VALUES ('exact','slug','prj','/synthetic','synthetic','1.18.21',1,1)", []).unwrap();
         assert!(
             matches!(
                 probe_provider_store(home.path(), &spec),
@@ -1728,10 +1889,54 @@ mod tests {
         };
         assert_eq!(store_state, EvidenceStoreState::PresentReadable);
         assert_eq!(negative_paths.len(), 2);
+        let native = negative_paths
+            .iter()
+            .find(|row| row.path == RecoveryPath::NativeResume)
+            .unwrap();
+        assert!(
+            native.evidence_refs.contains(&native_absence_reference(
+                "opencode",
+                &spec.provider_session.provider_store_id,
+                "exact",
+                spec.evidence_revision,
+            )),
+            "the path-specific native verdict must retain its identity and revision binding"
+        );
         assert!(negative_paths.iter().all(|row| row
             .evidence_refs
             .iter()
             .any(|reference| reference == &path.display().to_string())));
+    }
+
+    #[test]
+    fn recovery_store_opencode_custom_database_companions_prevent_absence() {
+        let home = tempfile::tempdir().unwrap();
+        let path = home.path().join("selected.db");
+        let mut spec = resume_spec_for_test("opencode", "exact", home.path());
+        spec.environment
+            .insert("OPENCODE_DB".into(), path.display().to_string());
+        assert!(matches!(
+            probe_provider_store(home.path(), &spec),
+            ProviderStoreProbe::DefinitivelyUnavailable { .. }
+        ));
+        for suffix in ["-wal", "-shm", "-journal"] {
+            let companion = home.path().join(format!("selected.db{suffix}"));
+            fs::write(&companion, b"retained selected database storage").unwrap();
+            let result = probe_provider_store(home.path(), &spec);
+            assert!(
+                matches!(result, ProviderStoreProbe::Blocked { .. }),
+                "{suffix}: {result:?}"
+            );
+            assert_eq!(
+                fs::read(&companion).unwrap(),
+                b"retained selected database storage"
+            );
+            fs::remove_file(companion).unwrap();
+        }
+        assert!(matches!(
+            probe_provider_store(home.path(), &spec),
+            ProviderStoreProbe::DefinitivelyUnavailable { .. }
+        ));
     }
 
     #[test]
@@ -2248,6 +2453,441 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn incomplete_native_census_cannot_certify_absence() {
+        for provider in ["claude", "codex", "amplifier"] {
+            for fault in ["depth", "symlink", "bytes"] {
+                if provider == "amplifier" && fault == "bytes" {
+                    continue;
+                }
+                let dir = tempfile::tempdir().unwrap();
+                let root = dir.path().join(match provider {
+                    "claude" => ".claude/projects",
+                    "codex" => ".codex/sessions",
+                    _ => ".amplifier/projects",
+                });
+                fs::create_dir_all(&root).unwrap();
+                match fault {
+                    "depth" => {
+                        let mut deep = root.clone();
+                        for _ in 0..10 {
+                            deep.push("nested");
+                        }
+                        fs::create_dir_all(&deep).unwrap();
+                        fs::write(deep.join("uninspected.jsonl"), "saved-exact-root").unwrap();
+                    }
+                    "bytes" => {
+                        fs::write(root.join("large.jsonl"), vec![b'x'; 1024 * 1024 + 1]).unwrap();
+                    }
+                    "symlink" => {
+                        #[cfg(unix)]
+                        std::os::unix::fs::symlink(
+                            dir.path().join("missing"),
+                            root.join("uninspected"),
+                        )
+                        .unwrap();
+                    }
+                    _ => unreachable!(),
+                }
+                let spec = build_resume_spec(ResumeSpecInput {
+                    provider,
+                    provider_store_id: "store-one",
+                    native_session_id: "saved-exact-root",
+                    terminal: &terminal(provider, &[]),
+                    provider_version: None,
+                    creation_seed_ref: "seed".into(),
+                    checkpoint_revision: 0,
+                    evidence_revision: 1,
+                    never_dispatched: false,
+                })
+                .unwrap();
+                let probe = probe_provider_store(dir.path(), &spec);
+                assert!(
+                    matches!(probe, ProviderStoreProbe::Blocked { .. }),
+                    "{provider}/{fault}: {probe:?}"
+                );
+                assert!(root.is_dir());
+            }
+        }
+    }
+
+    #[test]
+    fn native_artifact_reader_failure_or_encoded_identity_cannot_certify_absence() {
+        for provider in ["claude", "codex"] {
+            for bytes in [
+                b"{partial native artifact".as_slice(),
+                br#"{"sessionId":"saved-exact-\u0072oot"}"#.as_slice(),
+            ] {
+                let dir = tempfile::tempdir().unwrap();
+                let root = dir.path().join(if provider == "claude" {
+                    ".claude/projects"
+                } else {
+                    ".codex/sessions"
+                });
+                fs::create_dir_all(&root).unwrap();
+                fs::write(root.join("unknown.jsonl"), bytes).unwrap();
+                let spec = build_resume_spec(ResumeSpecInput {
+                    provider,
+                    provider_store_id: "store",
+                    native_session_id: "saved-exact-root",
+                    terminal: &terminal(provider, &[]),
+                    provider_version: None,
+                    creation_seed_ref: "seed".into(),
+                    checkpoint_revision: 0,
+                    evidence_revision: 1,
+                    never_dispatched: false,
+                })
+                .unwrap();
+                let probe = probe_provider_store(dir.path(), &spec);
+                assert!(
+                    matches!(probe, ProviderStoreProbe::Blocked { .. }),
+                    "{provider}: {probe:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn partial_opencode_store_cannot_certify_native_absence() {
+        for fault in [
+            "partial_schema",
+            "unqualified_migrations",
+            "retained_history",
+            "orphan_wal",
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let db = dir.path().join(".local/share/opencode/opencode.db");
+            fs::create_dir_all(db.parent().unwrap()).unwrap();
+            if fault == "orphan_wal" {
+                fs::write(
+                    db.with_file_name("opencode.db-wal"),
+                    "retained native storage",
+                )
+                .unwrap();
+            } else {
+                let connection = Connection::open(&db).unwrap();
+                if fault == "partial_schema" {
+                    connection
+                        .execute("CREATE TABLE session(id TEXT PRIMARY KEY)", [])
+                        .unwrap();
+                } else {
+                    connection
+                        .execute_batch(
+                            freshell_sessions::opencode_transfer::pinned_destination_schema_sql(),
+                        )
+                        .unwrap();
+                    if fault == "retained_history" {
+                        for migration in
+                            freshell_sessions::opencode_transfer::pinned_destination_migration_ids()
+                        {
+                            connection
+                                .execute("INSERT INTO migration VALUES (?1,0)", [migration])
+                                .unwrap();
+                        }
+                        connection.execute("INSERT INTO event_sequence(aggregate_id,seq,owner_id) VALUES ('ses_absent',1,'retained')", []).unwrap();
+                    }
+                }
+            }
+            let mut spec = build_resume_spec(ResumeSpecInput {
+                provider: "opencode",
+                provider_store_id: "store",
+                native_session_id: "ses_absent",
+                terminal: &terminal("opencode", &[]),
+                provider_version: None,
+                creation_seed_ref: "seed".into(),
+                checkpoint_revision: 0,
+                evidence_revision: 1,
+                never_dispatched: false,
+            })
+            .unwrap();
+            spec.environment
+                .insert("OPENCODE_DISABLE_CHANNEL_DB".into(), "1".into());
+            let probe = probe_provider_store(dir.path(), &spec);
+            assert!(
+                matches!(probe, ProviderStoreProbe::Blocked { .. }),
+                "{fault}: {probe:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn native_census_inspection_error_is_unknown_and_exact_absence_remains_negative() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join(".local/share/opencode");
+        fs::create_dir_all(&root).unwrap();
+        let db = root.join("opencode.db");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink("opencode.db", &db).unwrap();
+        let mut spec = build_resume_spec(ResumeSpecInput {
+            provider: "opencode",
+            provider_store_id: "store",
+            native_session_id: "ses_absent",
+            terminal: &terminal("opencode", &[]),
+            provider_version: None,
+            creation_seed_ref: "seed".into(),
+            checkpoint_revision: 0,
+            evidence_revision: 1,
+            never_dispatched: false,
+        })
+        .unwrap();
+        spec.environment
+            .insert("OPENCODE_DISABLE_CHANNEL_DB".into(), "1".into());
+        assert!(matches!(
+            probe_provider_store(dir.path(), &spec),
+            ProviderStoreProbe::Blocked { .. }
+        ));
+        fs::remove_file(&db).unwrap();
+        let connection = Connection::open(&db).unwrap();
+        connection
+            .execute_batch(freshell_sessions::opencode_transfer::pinned_destination_schema_sql())
+            .unwrap();
+        for migration in freshell_sessions::opencode_transfer::pinned_destination_migration_ids() {
+            connection
+                .execute("INSERT INTO migration VALUES (?1,0)", [migration])
+                .unwrap();
+        }
+        connection
+            .execute("INSERT INTO project(id,worktree,time_created,time_updated,sandboxes) VALUES ('prj','/synthetic',1,1,'[]')", [])
+            .unwrap();
+        connection
+            .execute("INSERT INTO session(id,slug,project_id,directory,title,version,time_created,time_updated) VALUES ('ses_other','slug','prj','/synthetic','synthetic','1.18.21',1,1)", [])
+            .unwrap();
+        let probe = probe_provider_store(dir.path(), &spec);
+        assert!(
+            matches!(
+                probe,
+                ProviderStoreProbe::DefinitivelyUnavailable {
+                    store_state: EvidenceStoreState::PresentReadable,
+                    ..
+                }
+            ),
+            "{probe:?}"
+        );
+        assert!(matches!(
+            probe_provider_store(&dir.path().join("missing-mount"), &spec),
+            ProviderStoreProbe::Blocked { .. }
+        ));
+    }
+
+    #[test]
+    fn native_fixture_partial_checkpoint_cannot_certify_absence() {
+        let dir = tempfile::tempdir().unwrap();
+        let checkpoints = dir.path().join(".freshell/checkpoints/native-session");
+        fs::create_dir_all(&checkpoints).unwrap();
+        fs::write(checkpoints.join("3.json"), vec![b'x'; 1024 * 1024 + 1]).unwrap();
+        let mut spec = build_resume_spec(ResumeSpecInput {
+            provider: "opencode",
+            provider_store_id: "store",
+            native_session_id: "fixture-exact",
+            terminal: &terminal("opencode", &[]),
+            provider_version: None,
+            creation_seed_ref: "seed".into(),
+            checkpoint_revision: 3,
+            evidence_revision: 1,
+            never_dispatched: false,
+        })
+        .unwrap();
+        spec.provider_session.provider = "native-session-fixture".into();
+        assert!(matches!(
+            probe_provider_store(dir.path(), &spec),
+            ProviderStoreProbe::Blocked { .. }
+        ));
+    }
+
+    #[test]
+    fn native_census_noncanonical_home_or_root_cannot_certify_absence() {
+        for provider in ["claude", "codex", "amplifier"] {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path().join(match provider {
+                "claude" => ".claude/projects",
+                "codex" => ".codex/sessions",
+                _ => ".amplifier/projects",
+            });
+            fs::create_dir_all(root.parent().unwrap()).unwrap();
+            fs::write(&root, "incomplete store representation").unwrap();
+            let spec = build_resume_spec(ResumeSpecInput {
+                provider,
+                provider_store_id: "store",
+                native_session_id: "saved-exact-root",
+                terminal: &terminal(provider, &[]),
+                provider_version: None,
+                creation_seed_ref: "seed".into(),
+                checkpoint_revision: 0,
+                evidence_revision: 1,
+                never_dispatched: false,
+            })
+            .unwrap();
+            assert!(
+                matches!(
+                    probe_provider_store(dir.path(), &spec),
+                    ProviderStoreProbe::Blocked { .. }
+                ),
+                "{provider}: non-directory store is unknown"
+            );
+        }
+        #[cfg(unix)]
+        {
+            let dir = tempfile::tempdir().unwrap();
+            let home = dir.path().join("linked-home");
+            std::os::unix::fs::symlink(dir.path(), &home).unwrap();
+            let spec = build_resume_spec(ResumeSpecInput {
+                provider: "opencode",
+                provider_store_id: "store",
+                native_session_id: "ses_exact",
+                terminal: &terminal("opencode", &[]),
+                provider_version: None,
+                creation_seed_ref: "seed".into(),
+                checkpoint_revision: 0,
+                evidence_revision: 1,
+                never_dispatched: false,
+            })
+            .unwrap();
+            assert!(matches!(
+                probe_provider_store(&home, &spec),
+                ProviderStoreProbe::Blocked { .. }
+            ));
+        }
+    }
+
+    #[test]
+    fn native_census_cannot_certify_an_uninspected_environment_or_ambiguous_root() {
+        for provider in ["claude", "codex", "amplifier", "opencode"] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut spec = build_resume_spec(ResumeSpecInput {
+                provider,
+                provider_store_id: "store",
+                native_session_id: "saved-exact-root",
+                terminal: &terminal(provider, &[]),
+                provider_version: None,
+                creation_seed_ref: "seed".into(),
+                checkpoint_revision: 0,
+                evidence_revision: 1,
+                never_dispatched: false,
+            })
+            .unwrap();
+            let key = match provider {
+                "claude" => "CLAUDE_CONFIG_DIR",
+                "codex" => "CODEX_HOME",
+                "amplifier" => "AMPLIFIER_HOME",
+                _ => "OPENCODE_DB",
+            };
+            let selected = dir.path().join("uninspectable-selected-store");
+            #[cfg(unix)]
+            std::os::unix::fs::symlink(&selected, &selected).unwrap();
+            #[cfg(not(unix))]
+            fs::create_dir(&selected).unwrap();
+            spec.environment
+                .insert(key.into(), selected.display().to_string());
+            assert!(
+                matches!(
+                    probe_provider_store(dir.path(), &spec),
+                    ProviderStoreProbe::Blocked { .. }
+                ),
+                "{provider}: alternate environment must stay unknown"
+            );
+            spec.environment.remove(key);
+            if provider == "opencode" {
+                continue;
+            }
+            let root = dir.path().join(match provider {
+                "claude" => ".claude/projects",
+                "codex" => ".codex/sessions",
+                _ => ".amplifier/projects",
+            });
+            for project in ["one", "two"] {
+                let project = root.join(project);
+                fs::create_dir_all(&project).unwrap();
+                if provider == "amplifier" {
+                    fs::create_dir(project.join("saved-exact-root")).unwrap();
+                } else {
+                    fs::write(project.join("history.jsonl"), "saved-exact-root").unwrap();
+                }
+            }
+            assert!(
+                matches!(
+                    probe_provider_store(dir.path(), &spec),
+                    ProviderStoreProbe::Blocked {
+                        reason: RecoveryBlockReason::AmbiguousIdentity,
+                        ..
+                    }
+                ),
+                "{provider}: duplicate exact candidates must stay unknown"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn native_census_unreadable_artifacts_cannot_certify_absence() {
+        use std::os::unix::{fs::PermissionsExt, process::CommandExt};
+        const CHILD_ROOT: &str = "FRESHELL_TEST_NATIVE_CENSUS_UNREADABLE_ROOT";
+        if let Some(root) = std::env::var_os(CHILD_ROOT) {
+            for provider in ["claude", "codex", "amplifier", "opencode"] {
+                let spec = build_resume_spec(ResumeSpecInput {
+                    provider,
+                    provider_store_id: "store",
+                    native_session_id: "saved-exact-root",
+                    terminal: &terminal(provider, &[]),
+                    provider_version: None,
+                    creation_seed_ref: "seed".into(),
+                    checkpoint_revision: 0,
+                    evidence_revision: 1,
+                    never_dispatched: false,
+                })
+                .unwrap();
+                assert!(
+                    matches!(
+                        probe_provider_store(Path::new(&root), &spec),
+                        ProviderStoreProbe::Blocked { .. }
+                    ),
+                    "{provider}: unreadable artifact must remain unknown"
+                );
+            }
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o755)).unwrap();
+        let mut unreadable = Vec::new();
+        for root in [
+            ".claude/projects",
+            ".codex/sessions",
+            ".amplifier/projects",
+            ".local/share/opencode",
+        ] {
+            let root = dir.path().join(root);
+            fs::create_dir_all(&root).unwrap();
+            let path = if root.ends_with("projects")
+                && root.to_string_lossy().contains(".amplifier")
+                || root.ends_with("opencode")
+            {
+                root
+            } else {
+                let path = root.join("history.jsonl");
+                fs::write(&path, "unreadable retained content").unwrap();
+                path
+            };
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o0)).unwrap();
+            unreadable.push(path);
+        }
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+        child
+            .args([
+                "--exact",
+                "tests::native_census_unreadable_artifacts_cannot_certify_absence",
+                "--nocapture",
+            ])
+            .env(CHILD_ROOT, dir.path());
+        // Root test runners must inspect as an ordinary workload user too.
+        if unsafe { libc::geteuid() } == 0 {
+            child.uid(65534).gid(65534);
+        }
+        let result = child.status().unwrap();
+        for path in unreadable {
+            fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        assert!(result.success());
     }
 
     #[test]

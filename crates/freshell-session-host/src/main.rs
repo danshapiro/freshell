@@ -1146,8 +1146,11 @@ async fn probe_without_identity(
             negative_paths: Vec::new(),
         });
     }
+    if !shell_policy {
+        return Ok(freshell_agent_runtime::unverified_native_probe());
+    }
     Ok(RecoveryProbe::Blocked {
-        path:if shell_policy {RecoveryPath::Reattach} else {RecoveryPath::NativeResume},
+        path: RecoveryPath::Reattach,
         reason:RecoveryBlockReason::AmbiguousIdentity,
         retry_hint:RetryHint {automatic_after_ms:None,manual_retry:true,repair:Some(if shell_policy {"verify the exact shell process has ended, then retry"} else {"capture the exact native identity and inspect its provider stores, then retry"}.into())},
         evidence:vec![if shell_policy {"shell process termination is unconfirmed"} else {"native identity is unrecorded; required provider-store absence has not been established"}.into()],
@@ -1459,10 +1462,14 @@ async fn grant_execution(
         persisted.grant_id = Some(grant_id.clone());
         persisted.provider = provider.clone();
         persisted.worker_pid = None;
-        if let Some(receipt) = transfer_readiness_receipt.clone() { persisted.opencode_transfer_receipt = Some(receipt); }
+        if let Some(receipt) = transfer_readiness_receipt.clone() {
+            persisted.opencode_transfer_receipt = Some(receipt);
+        }
         let result = write_state(&state.state_dir, persisted).map_err(registry_like_error);
         #[cfg(test)]
-        if result.is_ok() { opencode_host_crash_checkpoint("grant.after_state_persist_before_pty"); }
+        if result.is_ok() {
+            opencode_host_crash_checkpoint("grant.after_state_persist_before_pty");
+        }
         result
     };
 
@@ -1614,11 +1621,13 @@ async fn grant_execution(
             )
             .await?;
             if let Some(gate) = transfer_phase_gate.as_ref() {
-                gate.ensure_next(OpenCodeTransferPhase::GrantConsumed).map_err(opencode_transfer_phase_error)?;
+                gate.ensure_next(OpenCodeTransferPhase::GrantConsumed)
+                    .map_err(opencode_transfer_phase_error)?;
             }
             consume_grant(&mut persisted)?;
             if let Some(gate) = transfer_phase_gate.as_mut() {
-                gate.advance(OpenCodeTransferPhase::GrantConsumed).expect("OpenCode transfer grant phase was prevalidated");
+                gate.advance(OpenCodeTransferPhase::GrantConsumed)
+                    .expect("OpenCode transfer grant phase was prevalidated");
             }
             let prepared = providers::start_terminal_sidecar(prepared)
                 .await
@@ -3207,7 +3216,10 @@ fn prepare_provider_state_for_fresh_launch(
     prepare_files: impl Fn(&TerminalLaunchSpec) -> Result<(), String>,
 ) -> Result<(), RuntimeError> {
     prepare_provider_state_for_fresh_launch_at(
-        terminal, &ProviderConfigPaths::default(), Path::new("/run/freshell-bootstrap"), prepare_files,
+        terminal,
+        &ProviderConfigPaths::default(),
+        Path::new("/run/freshell-bootstrap"),
+        prepare_files,
     )
 }
 
@@ -3273,9 +3285,7 @@ fn prepare_provider_state_for_fresh_launch_at(
             terminal.run_as_gid,
         )
         .and_then(|_| prepare_files(terminal))
-        .and_then(|_| {
-            prepare_provider_context_for_fresh_launch(terminal, paths)
-        })
+        .and_then(|_| prepare_provider_context_for_fresh_launch(terminal, paths))
         .and_then(|_| providers::prepare_amplifier_state_as_owner(terminal))
         .map_err(|error| {
             RuntimeError::new(
@@ -3289,7 +3299,9 @@ fn prepare_provider_state_for_fresh_launch_at(
         terminal,
         |terminal| {
             let mut created = providers::prepare_provider_state_before_bootstrap_at(
-                terminal, &paths.provider_home, &paths.private_mount.join("user-provider"),
+                terminal,
+                &paths.provider_home,
+                &paths.private_mount.join("user-provider"),
             )?;
             let bootstrap = if terminal.provider_bootstrap_files.is_empty()
                 && terminal
@@ -8432,11 +8444,17 @@ mod tests {
             ProviderSecretProfile::CodexOnecliAuthFile,
             ProviderSecretProfile::CodexOnecliCaFile,
         ]
-        .into_iter().enumerate().map(|(index, profile)| ProviderSecretReference {
-            source_path: mounts.join(format!("provider-{index}")).to_string_lossy().into_owned(),
+        .into_iter()
+        .enumerate()
+        .map(|(index, profile)| ProviderSecretReference {
+            source_path: mounts
+                .join(format!("provider-{index}"))
+                .to_string_lossy()
+                .into_owned(),
             profile,
             provider_relative_path: None,
-        }).collect::<Vec<_>>();
+        })
+        .collect::<Vec<_>>();
         let resolved =
             provider_secret_resolution::resolve_child_secrets("codex", &refs, &mounts).unwrap();
         assert_eq!(
@@ -9878,7 +9896,10 @@ mod tests {
 
     #[test]
     fn provider_native_auth_failed_replacement_retains_prior_usable_destination() {
-        use std::{fs, os::unix::fs::{MetadataExt, PermissionsExt}};
+        use std::{
+            fs,
+            os::unix::fs::{MetadataExt, PermissionsExt},
+        };
         let root = tempfile::tempdir().unwrap();
         let home = root.path().join("home");
         let auth_dir = root.path().join("auth");
@@ -12352,8 +12373,8 @@ mod tests {
             let grant = GrantId::new();
             for attempt in 0..2 {
                 let error = grant_execution(
-            &state,
-            GrantExecutionRequest {
+                    &state,
+                    GrantExecutionRequest {
                         soul_id: SoulId::new(),
                         control_epoch: 1,
                         execution_generation: 1,
@@ -12364,8 +12385,8 @@ mod tests {
                         fresh_agent: fresh.clone(),
                         resume_spec: Some(resume.clone()),
                     },
-            &SystemGrantExecutionEffects,
-        )
+                    &SystemGrantExecutionEffects,
+                )
                 .await
                 .unwrap_err();
                 assert_eq!(
@@ -12425,8 +12446,8 @@ mod tests {
             .enumerate()
             {
                 let error = grant_execution(
-            &state,
-            GrantExecutionRequest {
+                    &state,
+                    GrantExecutionRequest {
                         soul_id: SoulId::new(),
                         control_epoch: 1,
                         execution_generation: 1,
@@ -12437,8 +12458,8 @@ mod tests {
                         fresh_agent: None,
                         resume_spec: Some(resume.clone()),
                     },
-            &SystemGrantExecutionEffects,
-        )
+                    &SystemGrantExecutionEffects,
+                )
                 .await
                 .unwrap_err();
                 assert_eq!(
@@ -12564,6 +12585,7 @@ mod tests {
             _: &TerminalLaunchSpec,
             _: std::collections::BTreeMap<String, String>,
             _: Option<providers::PreparedCodexLaunch>,
+            _: Option<String>,
         ) -> Result<SpawnedTerminalPty, RuntimeError> {
             panic!("fresh publication must not spawn a PTY")
         }
@@ -12579,6 +12601,7 @@ mod tests {
                 decisions: AtomicUsize::new(0),
                 operations: AtomicUsize::new(0),
                 captures: AtomicUsize::new(0),
+                checkpoint_attempts: std::sync::Mutex::new(Vec::new()),
                 stops: AtomicUsize::new(0),
             });
             freshell_agent_runtime::host_actor::FreshAgentHostActor::open(
@@ -12622,6 +12645,7 @@ mod tests {
                 mcp_args: Vec::new(),
             },
             mcp_capability: None,
+            prepared_inputs: None,
             config: vec![ProviderConfigReference {
                 root: ProviderConfigRoot::Workspace,
                 relative_path: "opencode.json".into(),
@@ -12735,6 +12759,7 @@ mod tests {
                     execution_generation: 9,
                     grant_id: GrantId::new(),
                     fixture: None,
+                    provider_path_inputs: Default::default(),
                     terminal: None,
                     fresh_agent: Some(Box::new(launch.clone())),
                     resume_spec: Some(Box::new(resume.clone())),
@@ -12812,6 +12837,7 @@ mod tests {
                     execution_generation: 10,
                     grant_id: GrantId::new(),
                     fixture: None,
+                    provider_path_inputs: Default::default(),
                     terminal: None,
                     fresh_agent: Some(Box::new(launch)),
                     resume_spec: Some(Box::new(resume)),
@@ -13092,6 +13118,45 @@ mod tests {
         std::fs::write(dir.join("host.sock"), b"").unwrap();
         let value = security_probe(&dir);
         assert_eq!(value["ownSocketVisible"], true);
+    }
+
+    #[tokio::test]
+    async fn dispatched_missing_identity_probe_preserves_host_state() {
+        let state = test_host_state();
+        let retained = state.state_dir.join("retained-output");
+        std::fs::write(&retained, "existing output").unwrap();
+        let result = dispatch(
+            authenticated_host_envelope(
+                &state,
+                HostCommand::ProbeRecovery {
+                    incarnation_id: state.incarnation_id.clone(),
+                    resume_spec: None,
+                    creation_seed_ref: "retained-seed".into(),
+                    never_dispatched: false,
+                    run_as_uid: 65534,
+                    run_as_gid: 0,
+                },
+            ),
+            &state,
+        )
+        .await
+        .unwrap();
+        assert!(
+            matches!(
+                result,
+                HostResult::RecoveryProbe(RecoveryProbe::Blocked {
+                    reason: freshell_runtime_protocol::RecoveryBlockReason::StoreUnreadable,
+                    ..
+                })
+            ),
+            "{result:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(retained).unwrap(),
+            "existing output"
+        );
+        assert!(state.pty.lock().await.is_none());
+        assert!(state.fresh_agent.lock().await.is_none());
     }
 
     fn test_host_state() -> Arc<HostState> {
@@ -14189,8 +14254,8 @@ mod tests {
         std::fs::create_dir(&runtime_dir).map_err(|error| error.to_string())?;
         let image_ref = descriptor.target_image_ref.clone();
         let backend_spec = freshell_supervisor::backend::CreateRuntimeSpec {
-                initial_input_reservation: None,
-                prior_provider_owner: None,
+            initial_input_reservation: None,
+            prior_provider_owner: None,
             installation_id: freshell_runtime_protocol::InstallationId::parse(
                 "synthetic-installation",
             )

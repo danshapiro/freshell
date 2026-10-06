@@ -146,6 +146,8 @@ pub enum LossDecisionError {
     AlreadyTerminal,
     #[error("loss certification requires a previously verified materialized identity")]
     UnverifiedMaterialization,
+    #[error("loss certification requires an exact provider-native identity")]
+    MissingNativeIdentity,
     #[error("pristine-seed recovery is still available because no input was dispatched")]
     PristineSeedAvailable,
     #[error("a verified native resume specification is still available")]
@@ -282,6 +284,14 @@ impl LostDecision {
         if context.allocation_state != freshell_runtime_protocol::AllocationState::VerifiedDurable {
             return Err(LossDecisionError::UnverifiedMaterialization);
         }
+        if context.provider != "shell"
+            && context
+                .native_session_id
+                .as_deref()
+                .is_none_or(|id| id.trim().is_empty())
+        {
+            return Err(LossDecisionError::MissingNativeIdentity);
+        }
         if !context.native_import_is_definitively_negative() {
             return Err(LossDecisionError::NativeImportAvailableOrUnknown);
         }
@@ -310,6 +320,7 @@ impl LostDecision {
             ));
         }
         validate_path_inventory(applicable_paths, &input.path_evidence)?;
+        validate_native_absence(context, &input.path_evidence)?;
         validate_analysis(&input.analysis)?;
 
         let state = if context.provider == "shell" {
@@ -456,6 +467,21 @@ fn validate_loss_capture(
         )
         .optional()?
         .ok_or_else(|| RegistryError::UnknownSoul(certificate.soul_id.clone()))?;
+    if provider != "shell" {
+        let reference = freshell_agent_runtime::native_absence_reference(
+            &provider,
+            &store,
+            native_session_id.as_deref().unwrap_or(""),
+            evidence_revision,
+        );
+        if !certificate.recovery_paths.iter().any(|row| {
+            row.path == RecoveryPath::NativeResume && row.evidence_refs.contains(&reference)
+        }) {
+            return Err(RegistryError::LossCertificationBlocked(
+                "native absence census is unqualified or stale".into(),
+            ));
+        }
+    }
     let native_session_hash =
         hash_native_session_reference(&provider, &store, native_session_id.as_deref());
     let import_capture_matches = native_import_state == capture.native_import_state.as_str()
@@ -471,6 +497,10 @@ fn validate_loss_capture(
             && current_incident.as_deref() == Some(certificate.incident_id.as_str())
             && recovery_attempt_id.is_none());
     if capture.allocation_state != freshell_runtime_protocol::AllocationState::VerifiedDurable
+        || (provider != "shell"
+            && native_session_id
+                .as_deref()
+                .is_none_or(|id| id.trim().is_empty()))
         || allocation_state != "verified_durable"
         || control_epoch != capture.control_epoch
         || identity_revision != capture.identity_revision
@@ -519,6 +549,53 @@ fn validate_path_inventory(
         }
     }
     Ok(())
+}
+
+pub(crate) fn validate_native_absence(
+    context: &RecoveryContext,
+    paths: &[RecoveryPathEvidence],
+) -> Result<(), LossDecisionError> {
+    if context.provider == "shell" {
+        return Ok(());
+    }
+    context
+        .native_session_id
+        .as_deref()
+        .filter(|id| !id.trim().is_empty())
+        .ok_or(LossDecisionError::MissingNativeIdentity)?;
+    if !paths.iter().any(|row| {
+        row.path == RecoveryPath::NativeResume
+            && row.verdict == RecoveryEvidenceVerdict::DefinitiveNegative
+            && native_absence_matches(context, row.store_state, &row.evidence_refs)
+    }) {
+        return Err(LossDecisionError::UnknownPathEvidence("native_resume"));
+    }
+    Ok(())
+}
+
+pub(crate) fn native_absence_matches(
+    context: &RecoveryContext,
+    store_state: EvidenceStoreState,
+    evidence: &[String],
+) -> bool {
+    if context.provider == "shell" {
+        return true;
+    }
+    matches!(
+        store_state,
+        EvidenceStoreState::Missing | EvidenceStoreState::PresentReadable
+    ) && context
+        .native_session_id
+        .as_deref()
+        .filter(|id| !id.trim().is_empty())
+        .is_some_and(|id| {
+            evidence.contains(&freshell_agent_runtime::native_absence_reference(
+                &context.provider,
+                &context.provider_store_id,
+                id,
+                context.evidence_revision,
+            ))
+        })
 }
 
 fn validate_analysis(analysis: &IncidentAnalysis) -> Result<(), LossDecisionError> {
@@ -1242,6 +1319,21 @@ impl Registry {
                     RegistryError::IncidentNotFound(incident_id.clone())
                 })?;
             let certificate: LostDecisionCertificate = serde_json::from_str(&certificate_json)?;
+            if certificate.provider != "shell" {
+                let (provider, store, native_id, revision): (String, String, Option<String>, u64) = tx.query_row(
+                    "SELECT provider,provider_store_id,native_session_id,evidence_revision FROM souls WHERE soul_id=?1",
+                    params![soul_id], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                )?;
+                let reference = native_id.as_deref().filter(|id| !id.trim().is_empty()).map(|id|
+                    freshell_agent_runtime::native_absence_reference(&provider, &store, id, revision));
+                if provider != certificate.provider || store != certificate.provider_store_id
+                    || hash_native_session_reference(&provider, &store, native_id.as_deref()) != certificate.native_session_ref_hash
+                    || reference.is_none_or(|reference| !certificate.recovery_paths.iter().any(|row|
+                        row.path == RecoveryPath::NativeResume && row.evidence_refs.contains(&reference)))
+                {
+                    return Err(RegistryError::LossCertificationBlocked("historical native absence census is unqualified or stale".into()));
+                }
+            }
             if current_state == "closed" {
                 let persisted_cleanup: LossCleanupReport = serde_json::from_str(&persisted_cleanup_json)?;
                 let kind = if persisted_cleanup.graceful_attempt == "not_required" {

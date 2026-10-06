@@ -1730,8 +1730,16 @@ impl Supervisor {
                         }
                     }
                     if !status.exited {
-                        if !native_observation_qualified && context.provider != "shell" && context.fixture.is_none() {
-                            return self.retained_store_compatibility_probe(context, "retained_native_observation_unqualified").await;
+                        if !native_observation_qualified
+                            && context.provider != "shell"
+                            && context.fixture.is_none()
+                        {
+                            return self
+                                .retained_store_compatibility_probe(
+                                    context,
+                                    "retained_native_observation_unqualified",
+                                )
+                                .await;
                         }
                         if context.provider != "shell" && context.resume_spec.is_none() {
                             self.capture_live_resume_evidence(&context, &host, &status)
@@ -1953,7 +1961,6 @@ impl Supervisor {
         }
         attempts.insert(key, now);
         true
-
     }
 
     async fn retained_store_compatibility_probe(
@@ -3380,7 +3387,17 @@ impl Supervisor {
             let row = match path {
                 RecoveryPath::Reattach => self.prove_reattach_unavailable(context).await?,
                 RecoveryPath::NativeResume | RecoveryPath::CheckpointRestore => {
-                    checkpoints::inspected_negative(native_probe, *path)?
+                    let row = checkpoints::inspected_negative(native_probe, *path)?;
+                    if *path == RecoveryPath::NativeResume
+                        && !crate::loss_report::native_absence_matches(
+                            context,
+                            row.store_state,
+                            &row.evidence_refs,
+                        )
+                    {
+                        return Err(freshell_agent_runtime::unverified_native_probe());
+                    }
+                    row
                 }
                 RecoveryPath::PristineSeed => {
                     if pristine_seed_is_safe(
@@ -3473,7 +3490,22 @@ impl Supervisor {
             let (reason_code, evidence_refs) =
                 normalized_negative_evidence(row.path, row.store_state, &row.evidence_refs);
             row.reason_code = reason_code;
+            let qualified_refs: Vec<_> = row
+                .evidence_refs
+                .iter()
+                .filter(|reference| {
+                    reference
+                        .split_once("=sha256:")
+                        .is_some_and(|(kind, digest)| {
+                            matches!(kind, "nativeAbsenceCensus" | "nativeStoreCensus")
+                                && digest.len() == 64
+                                && digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+                        })
+                })
+                .cloned()
+                .collect();
             row.evidence_refs = evidence_refs;
+            row.evidence_refs.extend(qualified_refs);
             evidence.push(row);
         }
         Ok(evidence)
@@ -3629,6 +3661,25 @@ impl Supervisor {
                 .map_err(map_registry)?;
             let lifecycle_lock = self.lifecycle_lock(&certificate.soul_id).await;
             let _guard = lifecycle_lock.lock().await;
+            let context = self
+                .registry
+                .recovery_context(certificate.soul_id.clone())
+                .await
+                .map_err(map_registry)?;
+            if crate::loss_report::validate_native_absence(&context, &certificate.recovery_paths)
+                .is_err()
+            {
+                crate::service::append_event(
+                    &self.config.lifecycle_log,
+                    "supervisor.loss.historical_certification_blocked",
+                    serde_json::json!({"severity":"warn","soulId":certificate.soul_id,
+                        "incarnationId":certificate.cleanup_target.incarnation_id,"incidentId":incident_id,
+                        "intentRevision":context.intent_revision,"identityRevision":context.identity_revision,
+                        "evidenceRevision":context.evidence_revision,"controlEpoch":context.control_epoch,
+                        "reason":"native_absence_census_unverified","cleanupContinued":false}),
+                );
+                continue;
+            }
             let handle = self
                 .registry
                 .owned_handle(certificate.cleanup_target.incarnation_id.clone())
@@ -4090,15 +4141,23 @@ fn fresh_agent_replay_settings(
 }
 
 pub(crate) fn after_native_probe(context: &RecoveryContext, probe: RecoveryProbe) -> RecoveryProbe {
-    if matches!(probe, RecoveryProbe::PristineSeedReady { .. }) && !context.permits_pristine_seed() {
-        return blocked(RecoveryPath::PristineSeed, RecoveryBlockReason::StoreUnreadable, "native identity or import prevents pristine seed", None);
+    if matches!(probe, RecoveryProbe::PristineSeedReady { .. }) && !context.permits_pristine_seed()
+    {
+        return blocked(
+            RecoveryPath::PristineSeed,
+            RecoveryBlockReason::StoreUnreadable,
+            "native identity or import prevents pristine seed",
+            None,
+        );
     }
     if !matches!(probe, RecoveryProbe::DefinitivelyUnavailable { .. }) {
         return probe;
     }
     if pristine_seed_is_safe(
-        context.never_dispatched, context.native_session_id.as_deref(),
-        context.native_import_state, context.native_import_absence_is_authoritative(),
+        context.never_dispatched,
+        context.native_session_id.as_deref(),
+        context.native_import_state,
+        context.native_import_absence_is_authoritative(),
     ) {
         return RecoveryProbe::PristineSeedReady {
             seed: context.creation_seed_ref.clone(),
@@ -4108,8 +4167,12 @@ pub(crate) fn after_native_probe(context: &RecoveryContext, probe: RecoveryProbe
             ),
         };
     }
-    if let Err(blocked) = checkpoints::inspected_negative(&probe, RecoveryPath::NativeResume) {
-        return blocked;
+    let row = match checkpoints::inspected_negative(&probe, RecoveryPath::NativeResume) {
+        Ok(row) => row,
+        Err(blocked) => return blocked,
+    };
+    if !crate::loss_report::native_absence_matches(context, row.store_state, &row.evidence_refs) {
+        return freshell_agent_runtime::unverified_native_probe();
     }
     match checkpoints::probe_after_provider(context, &probe) {
         RecoveryProbe::DefinitivelyUnavailable { .. } => probe,
@@ -4143,8 +4206,10 @@ fn live_reattach_probe(
 /// inspection. Final loss certification independently rechecks that proof.
 fn shell_terminal_end_probe(context: &RecoveryContext) -> RecoveryProbe {
     if pristine_seed_is_safe(
-        context.never_dispatched, context.native_session_id.as_deref(),
-        context.native_import_state, context.native_import_absence_is_authoritative(),
+        context.never_dispatched,
+        context.native_session_id.as_deref(),
+        context.native_import_state,
+        context.native_import_absence_is_authoritative(),
     ) {
         return RecoveryProbe::PristineSeedReady {
             seed: context.creation_seed_ref.clone(),
@@ -4198,11 +4263,17 @@ pub(crate) fn offline_probe(context: &RecoveryContext) -> Result<RecoveryProbe, 
             Err(probe) => Ok(probe),
         };
     }
-    if let Some(spec) = context.resume_spec.clone() {
-        return Ok(RecoveryProbe::ResumeReady {
-            evidence_revision: spec.evidence_revision,
-            resume_spec: Box::new(spec),
-        });
+    if context.resume_spec.is_some() {
+        return Ok(
+            match resume_catalog::exact_resume_candidate(context, None) {
+                Ok(Some(spec)) => RecoveryProbe::ResumeReady {
+                    evidence_revision: spec.evidence_revision,
+                    resume_spec: Box::new(spec),
+                },
+                Ok(None) => freshell_agent_runtime::unverified_native_probe(),
+                Err(probe) => probe,
+            },
+        );
     }
     if context.native_session_id.is_some() {
         return Ok(blocked(
@@ -4226,12 +4297,7 @@ pub(crate) fn offline_probe(context: &RecoveryContext) -> Result<RecoveryProbe, 
             ),
         });
     }
-    Ok(blocked(
-        RecoveryPath::NativeResume,
-        RecoveryBlockReason::AmbiguousIdentity,
-        "native identity/resume metadata is unrecorded or unverified; provider store absence has not been established",
-        None,
-    ))
+    Ok(freshell_agent_runtime::unverified_native_probe())
 }
 
 fn pristine_seed_is_safe(
@@ -4278,6 +4344,7 @@ fn preflight_diagnostic_repair(repair: Option<&str>) -> Option<&'static str> {
     // A native transport error may carry arbitrary upstream data. Log only
     // recognized static causes; the authenticated response retains its hint.
     const SAFE_HINTS: &[&str] = &[
+        "provider identity or exact storage census has not been verified",
         "runtime gained extra, duplicate, or missing mounts",
         "runtime mount topology changed",
         "owned_launch_policy_mismatch",
@@ -4851,6 +4918,42 @@ pub(crate) mod tests {
         ));
     }
 
+    #[tokio::test]
+    async fn dispatched_shell_retains_its_terminal_end_policy_with_no_native_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry = crate::registry::Registry::open(dir.path(), None).unwrap();
+        let soul = SoulId::new();
+        let launch =
+            crate::registry::tests::materialize_test_runtime(&registry, soul.clone()).await;
+        let conn = crate::registry::open_connection(registry.database_path()).unwrap();
+        conn.execute(
+            "UPDATE souls SET provider='shell',native_session_id=NULL WHERE soul_id=?1",
+            [soul.as_str()],
+        )
+        .unwrap();
+        conn.execute("INSERT INTO input_commands (soul_id,request_id,payload_digest,protected_payload,incarnation_id,state,created_at,updated_at) VALUES (?1,'dispatched','test',X'00',?2,'completed',1,1)", rusqlite::params![soul.as_str(),launch.incarnation_id.as_str()]).unwrap();
+        let context = registry.recovery_context(soul).await.unwrap();
+        // The offline route is entered after the owned backend is confirmed ended.
+        let probe = offline_probe(&context).unwrap();
+        assert!(
+            matches!(probe, RecoveryProbe::DefinitivelyUnavailable { .. }),
+            "{probe:?}"
+        );
+        let handle = ReattachHandle {
+            incarnation_id: context.prior_handle.incarnation_id().clone(),
+            host_boot_id: freshell_runtime_protocol::HostBootId::new(),
+            container_id: context.prior_handle.container_id().into(),
+        };
+        assert!(matches!(
+            retained_runtime_probe(true, handle.clone(), probe.clone(), false),
+            RecoveryProbe::DefinitivelyUnavailable { .. }
+        ));
+        assert!(matches!(
+            retained_runtime_probe(false, handle, probe, false),
+            RecoveryProbe::ReattachReady { .. }
+        ));
+    }
+
     struct ObservedRuntime(BackendRuntimeState);
 
     #[async_trait::async_trait]
@@ -4935,6 +5038,19 @@ pub(crate) mod tests {
             evidence: vec![],
             store_state: EvidenceStoreState::Missing,
         }
+    }
+
+    pub(crate) async fn revalidate_previously_negative_loss(
+        supervisor: &Supervisor,
+        soul_id: SoulId,
+    ) -> Result<RecoveryResult, RuntimeError> {
+        supervisor
+            .certify_and_cleanup_loss(
+                soul_id,
+                RecoveryTrigger::StartupReconcile,
+                absent_native_probe(),
+            )
+            .await
     }
 
     #[tokio::test]

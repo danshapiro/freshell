@@ -1092,11 +1092,14 @@ impl Registry {
     }
 
     pub async fn mark_running(&self, incarnation_id: IncarnationId) -> Result<(), RegistryError> {
-        self.mark_running_with_provider_preparation(incarnation_id, false).await
+        self.mark_running_with_provider_preparation(incarnation_id, false)
+            .await
     }
 
     pub(crate) async fn mark_running_with_provider_preparation(
-        &self, incarnation_id: IncarnationId, preparation_accepted: bool,
+        &self,
+        incarnation_id: IncarnationId,
+        preparation_accepted: bool,
     ) -> Result<(), RegistryError> {
         let id = incarnation_id.clone();
         let soul: String = self
@@ -1111,15 +1114,24 @@ impl Registry {
         let soul =
             SoulId::parse(soul).map_err(|_| RegistryError::Integrity("invalid soul id".into()))?;
         let fence = self.recovery_write_fence(soul.clone()).await?;
-        self.mark_running_observed_with_provider_preparation(soul, incarnation_id, fence, preparation_accepted)
-            .await
-            .map(|_| ())
+        self.mark_running_observed_with_provider_preparation(
+            soul,
+            incarnation_id,
+            fence,
+            preparation_accepted,
+        )
+        .await
+        .map(|_| ())
     }
 
     pub(crate) async fn mark_running_observed(
-        &self, soul: SoulId, incarnation_id: IncarnationId, fence: RecoveryWriteFence,
+        &self,
+        soul: SoulId,
+        incarnation_id: IncarnationId,
+        fence: RecoveryWriteFence,
     ) -> Result<RecoveryWriteFence, RegistryError> {
-        self.mark_running_observed_with_provider_preparation(soul, incarnation_id, fence, false).await
+        self.mark_running_observed_with_provider_preparation(soul, incarnation_id, fence, false)
+            .await
     }
 
     pub(crate) async fn mark_running_observed_with_provider_preparation(
@@ -2024,11 +2036,21 @@ impl Registry {
     /// remain usable for a retry after its soul is blocked, including when a
     /// failed cleanup left it stopping; `None` means its source or state changed.
     pub async fn store_verified_resume_spec_for_live_incarnation(
-        &self, soul_id: SoulId, incarnation_id: IncarnationId,
-        expected_evidence_revision: u64, resume_spec: ResumeSpec,
+        &self,
+        soul_id: SoulId,
+        incarnation_id: IncarnationId,
+        expected_evidence_revision: u64,
+        resume_spec: ResumeSpec,
     ) -> Result<Option<ResumeSpec>, RegistryError> {
         let fence = self.recovery_write_fence(soul_id.clone()).await?;
-        self.store_verified_resume_spec_for_live_incarnation_fenced(soul_id, incarnation_id, expected_evidence_revision, resume_spec, fence).await
+        self.store_verified_resume_spec_for_live_incarnation_fenced(
+            soul_id,
+            incarnation_id,
+            expected_evidence_revision,
+            resume_spec,
+            fence,
+        )
+        .await
     }
 
     pub async fn store_verified_resume_spec_for_live_incarnation_fenced(
@@ -7641,7 +7663,46 @@ pub(crate) mod tests {
         );
 
         let supervisor = crate::recovery::tests::missing_supervisor(&dir, registry.clone());
-        let negative = crate::recovery::tests::absent_native_probe();
+        let negative_for = |context: &RecoveryContext| {
+            let provider_home = tempfile::tempdir().unwrap();
+            let terminal = serde_json::from_value(serde_json::json!({
+                "terminalId":"native-census", "streamId":"native-census", "mode":"opencode",
+                "program":"opencode", "cwd":"/workspace", "workspacePath":"/workspace",
+                "env":{"HOME":"/home/freshell/provider","OPENCODE_DISABLE_CHANNEL_DB":"1"}, "runAsUid":65534, "runAsGid":0,
+                "cols":80, "rows":24, "projectKey":"test"
+            }))
+            .unwrap();
+            let spec = freshell_agent_runtime::build_resume_spec(
+                freshell_agent_runtime::ResumeSpecInput {
+                    provider: &context.provider,
+                    provider_store_id: &context.provider_store_id,
+                    native_session_id: context.native_session_id.as_deref().unwrap(),
+                    terminal: &terminal,
+                    provider_version: None,
+                    creation_seed_ref: context.creation_seed_ref.clone(),
+                    checkpoint_revision: 0,
+                    evidence_revision: context.evidence_revision,
+                    never_dispatched: false,
+                },
+            )
+            .unwrap();
+            match freshell_agent_runtime::probe_provider_store(provider_home.path(), &spec) {
+                freshell_agent_runtime::ProviderStoreProbe::DefinitivelyUnavailable {
+                    reason,
+                    evidence,
+                    store_state,
+                    negative_paths,
+                } => freshell_runtime_protocol::RecoveryProbe::DefinitivelyUnavailable {
+                    path: RecoveryPath::NativeResume,
+                    reason,
+                    evidence,
+                    store_state,
+                    negative_paths,
+                },
+                other => panic!("expected actual complete absent store census: {other:?}"),
+            }
+        };
+        let negative = negative_for(&absent);
         let paths = supervisor
             .collect_loss_path_evidence(&absent, &negative)
             .await
@@ -7662,7 +7723,7 @@ pub(crate) mod tests {
         assert!(!available.native_import_absence_is_authoritative());
         assert!(matches!(
             supervisor
-                .collect_loss_path_evidence(&available, &negative)
+                .collect_loss_path_evidence(&available, &negative_for(&available))
                 .await,
             Err(freshell_runtime_protocol::RecoveryProbe::Blocked {
                 path: RecoveryPath::NativeImport,
