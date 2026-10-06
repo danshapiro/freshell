@@ -100,7 +100,7 @@ async fn prepared_context_in_registry(
         .prepare_launch(LaunchPreparation {
             soul_id: soul_id.clone(),
             provider: "opencode".into(),
-            provider_store_id: "store-test".into(),
+            provider_store_id: soul_id.to_string(),
             native_session_id: Some("ses_test_exact".into()),
             creation_seed_ref: "seed-test".into(),
             request_id: freshell_runtime_protocol::RequestId::new(),
@@ -520,6 +520,66 @@ async fn closed_incident_retry_uses_persisted_cleanup_notice_semantics() {
     assert_eq!(retry.kind, NoticeKind::CleanupSucceeded);
 }
 
+fn test_repair_scope(
+    registry: &Registry,
+    targets: &[freshell_runtime_protocol::LostSoulRepairTarget],
+) -> freshell_runtime_protocol::RepairBatchScope {
+    use freshell_runtime_protocol::{RepairBatchRoot, RepairBatchScope, RepairBatchTarget};
+    use sha2::{Digest, Sha256};
+    let conn = Connection::open(registry.database_path()).unwrap();
+    let members = targets.iter().map(|target| {
+        let (root_session_id, incident_revision, identity_revision, native_import_revision, evidence_revision): (String, u64, u64, u64, u64) = conn.query_row(
+            "SELECT COALESCE(s.native_import_root_session_id,s.native_session_id),l.intent_revision,s.identity_revision,s.native_import_revision,s.evidence_revision FROM souls s JOIN loss_incidents l ON l.incident_id=s.loss_incident_id WHERE s.soul_id=?1",
+            params![target.soul_id.as_str()], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?)),
+        ).unwrap();
+        let provider_store_id=conn.query_row("SELECT provider_store_id FROM souls WHERE soul_id=?1",[target.soul_id.as_str()],|row|row.get(0)).unwrap();
+        RepairBatchTarget { provider_store_id,target: target.clone(), root_session_id, incident_revision, identity_revision, native_import_revision, evidence_revision }
+    }).collect::<Vec<_>>();
+    let roots = members
+        .iter()
+        .map(|member| member.root_session_id.clone())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .map(|root| {
+            let graph_digest = root
+                .strip_prefix("ses_repair_root_")
+                .map(|index| {
+                    format!(
+                        "{:x}",
+                        Sha256::digest(format!("generation-{index}").as_bytes())
+                    )
+                })
+                .unwrap_or_else(|| "b".repeat(64));
+            let eligible_owners = members
+                .iter()
+                .filter(|member| member.root_session_id == root)
+                .map(|member| member.target.soul_id.clone())
+                .collect::<Vec<_>>();
+            let canonical_soul_id = if eligible_owners.len() == 1 {
+                Some(eligible_owners[0].clone())
+            } else {
+                None
+            };
+            RepairBatchRoot {
+                eligible_owners,
+                canonical_soul_id,
+                root_session_id: root,
+                graph_digest,
+            }
+        })
+        .collect();
+    let mut scope = RepairBatchScope {
+        scope_id: String::new(),
+        source_store_id: "a".repeat(64),
+        source_fingerprint: "c".repeat(64),
+        targets: members,
+        roots,
+    };
+    scope.source_fingerprint = scope.source_descriptor_digest();
+    scope.scope_id = scope.descriptor_digest();
+    scope
+}
+
 #[tokio::test]
 async fn stopped_repair_checks_every_exact_loss_revision_before_source_access() {
     use freshell_runtime_protocol::{
@@ -547,12 +607,15 @@ async fn stopped_repair_checks_every_exact_loss_revision_before_source_access() 
             expected_intent_revision: prepared.committed_intent_revision,
         });
     }
+    let scope = test_repair_scope(&registry, &targets);
     targets[4].expected_intent_revision += 1;
     let supervisor = crate::recovery::tests::missing_supervisor(&dir, registry.clone());
     let result = supervisor
         .restore_lost_souls(
             RequestId::new(),
             RestoreLostSoulsRequest {
+                scope_id: scope.scope_id.clone(),
+                source: scope.source_selection(),
                 targets,
                 canonical_owners: Vec::new(),
                 expected_control_epoch: Some(registry.control_epoch()),
@@ -591,14 +654,23 @@ async fn stopped_repair_retry_after_withdrawal_cas_resumes_without_lost_row_vali
             expected_intent_revision: prepared.committed_intent_revision,
         });
     }
+    let conn = Connection::open(registry.database_path()).unwrap();
+    for target in &targets {
+        conn.execute("UPDATE souls SET native_import_state='legacy_unknown',native_import_authority='legacy_unknown' WHERE soul_id=?1", params![target.soul_id.as_str()]).unwrap();
+        conn.execute("UPDATE loss_incidents SET captured_native_import_state='legacy_unknown',captured_native_import_authority='legacy_unknown',captured_native_import_complete=0 WHERE incident_id=?1", params![target.incident_id.as_str()]).unwrap();
+    }
+    drop(conn);
     let operation_id = RequestId::new();
+    let scope = test_repair_scope(&registry, &targets);
     let request = RestoreLostSoulsRequest {
+        scope_id: scope.scope_id.clone(),
+        source: scope.source_selection(),
         targets: targets.clone(),
         canonical_owners: Vec::new(),
         expected_control_epoch: Some(registry.control_epoch()),
     };
     let prepared = registry
-        .prepare_stopped_repair_operation(operation_id.clone(), request.clone())
+        .prepare_stopped_repair_operation(operation_id.clone(), request.clone(), scope.clone())
         .await
         .unwrap();
     assert_eq!(prepared.status, "importing");
@@ -621,14 +693,14 @@ async fn stopped_repair_retry_after_withdrawal_cas_resumes_without_lost_row_vali
     }
 
     let resumed = registry
-        .prepare_stopped_repair_operation(operation_id, request)
+        .prepare_stopped_repair_operation(operation_id, request, scope)
         .await
         .unwrap();
     assert_eq!(resumed.status, "withdraw_pending");
 }
 
 #[tokio::test]
-async fn stopped_repair_first_cas_completes_seven_roots_and_withdraws_only_false_loss_records() {
+async fn restore_lost_souls_nine_first_cas() {
     use freshell_runtime_protocol::{
         opencode_target_build_receipt, opencode_transfer_bundle_digest, IncidentId,
         LostSoulRepairTarget, NoticeKind, OpenCodeAdoptionBaseline, OpenCodeTransferDescriptor,
@@ -644,7 +716,7 @@ async fn stopped_repair_first_cas_completes_seven_roots_and_withdraws_only_false
     let mut targets = Vec::new();
     let mut contexts = Vec::new();
 
-    for index in 0..8 {
+    for index in 0..9 {
         let context = prepared_context_in_registry(&registry, dir.path()).await;
         let prepared = registry
             .prepare_loss(decision_for(&registry, &context).unwrap())
@@ -659,7 +731,7 @@ async fn stopped_repair_first_cas_completes_seven_roots_and_withdraws_only_false
             .await
             .unwrap();
 
-        let root_index = index.min(6);
+        let root_index = if index == 8 { 0 } else { index.min(6) };
         let root_session_id = format!("ses_repair_root_{root_index}");
         let terminal_spec = serde_json::json!({
             "terminalId": format!("term-repair-{index}"),
@@ -728,7 +800,7 @@ async fn stopped_repair_first_cas_completes_seven_roots_and_withdraws_only_false
 
     let owner_id = "repair-test-owner";
     let workspace_id = "test-project";
-    for index in [6, 7] {
+    for index in [0, 8, 6, 7] {
         registry
             .upsert_view_intent(UpsertViewIntentRequest {
                 soul_id: targets[index].soul_id.clone(),
@@ -747,6 +819,28 @@ async fn stopped_repair_first_cas_completes_seven_roots_and_withdraws_only_false
             .unwrap();
     }
     let explicit_duplicate_view = ViewIntentId::parse("view-repair-duplicate-explicit").unwrap();
+    for index in [0, 8, 6] {
+        registry
+            .upsert_view_intent(UpsertViewIntentRequest {
+                soul_id: targets[index].soul_id.clone(),
+                view_id: Some(
+                    ViewIntentId::parse(format!("view-repair-balanced-{index}")).unwrap(),
+                ),
+                intent: ViewIntentRequest {
+                    owner_id: owner_id.into(),
+                    workspace_id: workspace_id.into(),
+                    kind: ViewIntentKind::Explicit,
+                    preferred_tab_id: Some(format!("tab-explicit-{index}")),
+                    preferred_pane_id: Some(format!("pane-explicit-{index}")),
+                    ..ViewIntentRequest::default()
+                },
+                expected_revision: None,
+                expected_soul_intent_revision: targets[index].expected_intent_revision,
+                expected_control_epoch: None,
+            })
+            .await
+            .unwrap();
+    }
     registry
         .upsert_view_intent(UpsertViewIntentRequest {
             soul_id: targets[7].soul_id.clone(),
@@ -767,13 +861,23 @@ async fn stopped_repair_first_cas_completes_seven_roots_and_withdraws_only_false
         .unwrap();
 
     let operation_id = RequestId::new();
+    let scope = test_repair_scope(&registry, &targets);
     let request = RestoreLostSoulsRequest {
+        scope_id: scope.scope_id.clone(),
+        source: scope.source_selection(),
         targets: targets.clone(),
-        canonical_owners: Vec::new(),
+        canonical_owners: [0usize, 6]
+            .into_iter()
+            .map(|index| freshell_runtime_protocol::CanonicalOwnerChoice {
+                root_session_id: format!("ses_repair_root_{index}"),
+                soul_id: targets[index].soul_id.clone(),
+                expected_intent_revision: targets[index].expected_intent_revision,
+            })
+            .collect(),
         expected_control_epoch: Some(registry.control_epoch()),
     };
     let operation = registry
-        .prepare_stopped_repair_operation(operation_id.clone(), request)
+        .prepare_stopped_repair_operation(operation_id.clone(), request, scope)
         .await
         .unwrap();
     assert_eq!(operation.status, "importing");
@@ -783,10 +887,7 @@ async fn stopped_repair_first_cas_completes_seven_roots_and_withdraws_only_false
         let context = &contexts[root_index];
         let target = &targets[root_index];
         let root_session_id = format!("ses_repair_root_{root_index}");
-        let source_store_id = format!(
-            "{:x}",
-            Sha256::digest(format!("host-store-{root_index}").as_bytes())
-        );
+        let source_store_id = "a".repeat(64);
         let source_generation = format!(
             "{:x}",
             Sha256::digest(format!("generation-{root_index}").as_bytes())
@@ -985,8 +1086,8 @@ async fn stopped_repair_first_cas_completes_seven_roots_and_withdraws_only_false
 
     assert_eq!(result.operation_id, operation_id);
     assert_eq!(result.status, SoulRepairStatus::Complete);
-    assert_eq!(result.repaired_target_count, 8);
-    assert_eq!(result.total_target_count, 8);
+    assert_eq!(result.repaired_target_count, 9);
+    assert_eq!(result.total_target_count, 9);
     assert_eq!(result.roots.len(), 7);
     assert!(result.roots.iter().all(|root| {
         root.canonical_soul_id.is_some()
@@ -1249,6 +1350,20 @@ async fn stopped_repair_first_cas_completes_seven_roots_and_withdraws_only_false
         )
         .unwrap();
     assert_eq!(duplicate_authority, "retired_duplicate");
+    let second_duplicate:(String,String,Option<String>)=conn.query_row("SELECT recovery_state,native_import_authority,loss_incident_id FROM souls WHERE soul_id=?1",[targets[8].soul_id.as_str()],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?))).unwrap();
+    assert_eq!(
+        second_duplicate,
+        ("stopped".into(), "retired_duplicate".into(), None)
+    );
+    let rebound: String = conn
+        .query_row(
+            "SELECT soul_id FROM view_intents WHERE view_id='view-repair-balanced-8'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(rebound,targets[0].soul_id.as_str(),"the second duplicate's explicit view survives on its deliberately selected canonical owner");
+    assert_eq!(conn.query_row("SELECT count(*) FROM view_intents WHERE kind='automatic_primary' AND owner_id=?1 AND workspace_id=?2 AND soul_id IN (?3,?4)",params![owner_id,workspace_id,targets[0].soul_id.as_str(),targets[8].soul_id.as_str()],|row|row.get::<_,u64>(0)).unwrap(),1);
 
     let explicit_owner: (String, String, u64) = conn
         .query_row(
@@ -1619,4 +1734,666 @@ fn ownership_capability_types_remain_in_supervisor_crate() {
     let _ = std::any::TypeId::of::<AllocationState>();
     let _ = std::any::TypeId::of::<DurabilityState>();
     let _ = std::any::TypeId::of::<RecoveryBlockReason>();
+}
+
+async fn stopped_legacy_fixture_target(
+    registry: &Registry,
+    root: &std::path::Path,
+    native_root: &str,
+) -> freshell_runtime_protocol::LostSoulRepairTarget {
+    let context = prepared_context_in_registry(registry, root).await;
+    let conn = Connection::open(registry.database_path()).unwrap();
+    conn.execute(
+        "UPDATE souls SET native_session_id=?1 WHERE soul_id=?2",
+        params![native_root, context.soul_id.as_str()],
+    )
+    .unwrap();
+    drop(conn);
+    let context = registry.recovery_context(context.soul_id).await.unwrap();
+    let prepared = registry
+        .prepare_loss(decision_for(registry, &context).unwrap())
+        .await
+        .unwrap();
+    registry
+        .finalize_loss_cleanup(
+            prepared.certificate.incident_id.clone(),
+            freshell_runtime_protocol::StopOutcome::VerifiedEmpty,
+            cleanup(&prepared),
+        )
+        .await
+        .unwrap();
+    let conn = Connection::open(registry.database_path()).unwrap();
+    conn.execute("UPDATE souls SET native_import_state='legacy_unknown',native_import_authority='legacy_unknown',native_import_source_store_id=NULL,native_import_root_session_id=NULL,native_import_source_generation=NULL,native_import_schema_fingerprint=NULL,native_import_migration_fingerprint=NULL,native_import_complete_inventory=0 WHERE soul_id=?1",[prepared.certificate.soul_id.as_str()]).unwrap();
+    conn.execute("UPDATE loss_incidents SET captured_native_import_state='legacy_unknown',captured_native_import_authority='legacy_unknown',captured_native_import_complete=0,captured_source_store_id=NULL,captured_root_session_id=NULL,captured_source_generation=NULL,captured_source_schema_fingerprint=NULL,captured_migration_fingerprint=NULL WHERE incident_id=?1",[prepared.certificate.incident_id.as_str()]).unwrap();
+    freshell_runtime_protocol::LostSoulRepairTarget {
+        soul_id: prepared.certificate.soul_id,
+        incident_id: prepared.certificate.incident_id,
+        expected_intent_revision: prepared.committed_intent_revision,
+    }
+}
+
+#[tokio::test]
+async fn durable_souls_stopped_scope_freezes_deliberate_owner_choices() {
+    use freshell_runtime_protocol::{CanonicalOwnerChoice, RequestId, RestoreLostSoulsRequest};
+    let dir = tempfile::tempdir().unwrap();
+    let registry = Registry::open(dir.path(), None).unwrap();
+    let mut targets = Vec::new();
+    for _ in 0..2 {
+        targets.push(
+            stopped_legacy_fixture_target(&registry, dir.path(), "ses_fixture_root_alpha").await,
+        );
+    }
+    let scope = test_repair_scope(&registry, &targets);
+    let root = scope.roots[0].root_session_id.clone();
+    let request = RestoreLostSoulsRequest {
+        scope_id: scope.scope_id.clone(),
+        source: scope.source_selection(),
+        targets: targets.clone(),
+        canonical_owners: vec![CanonicalOwnerChoice {
+            root_session_id: root.clone(),
+            soul_id: targets[0].soul_id.clone(),
+            expected_intent_revision: targets[0].expected_intent_revision,
+        }],
+        expected_control_epoch: Some(registry.control_epoch()),
+    };
+    let operation = RequestId::new();
+    registry
+        .prepare_stopped_repair_operation(operation.clone(), request.clone(), scope.clone())
+        .await
+        .unwrap();
+    let mut changed = request.clone();
+    changed.canonical_owners[0].soul_id = targets[1].soul_id.clone();
+    changed.canonical_owners[0].expected_intent_revision = targets[1].expected_intent_revision;
+    assert!(
+        registry
+            .prepare_stopped_repair_operation(operation.clone(), changed, scope.clone())
+            .await
+            .is_err(),
+        "a retry cannot select a different canonical managed store under the original operation"
+    );
+    let mut removed = request.clone();
+    removed.canonical_owners.clear();
+    assert!(
+        registry
+            .prepare_stopped_repair_operation(operation.clone(), removed, scope.clone())
+            .await
+            .is_err(),
+        "durable deliberate selection cannot disappear on retry"
+    );
+    registry
+        .prepare_stopped_repair_operation(operation.clone(), request.clone(), scope.clone())
+        .await
+        .unwrap();
+    registry
+        .upsert_view_intent(freshell_runtime_protocol::UpsertViewIntentRequest {
+            soul_id: targets[1].soul_id.clone(),
+            view_id: None,
+            intent: freshell_runtime_protocol::ViewIntentRequest {
+                owner_id: "fixture-owner-drift".into(),
+                workspace_id: "test-project".into(),
+                kind: freshell_runtime_protocol::ViewIntentKind::Explicit,
+                ..Default::default()
+            },
+            expected_revision: None,
+            expected_soul_intent_revision: targets[1].expected_intent_revision,
+            expected_control_epoch: None,
+        })
+        .await
+        .unwrap();
+    assert!(registry.prepare_stopped_repair_operation(operation,request,scope).await.is_err(),"changed explicit owner evidence invalidates the frozen owner selection before receipts or retirement");
+}
+
+#[tokio::test]
+async fn durable_souls_schema_seven_nine_rows_remain_unbound_until_verified_repair() {
+    use freshell_runtime_protocol::{
+        CanonicalOwnerChoice, RepairBatchSourceSelection, RequestId, RestoreLostSoulsRequest,
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let registry = Registry::open(dir.path(), None).unwrap();
+    let names = [
+        "ses_fixture_root_alpha",
+        "ses_fixture_root_beta",
+        "ses_fixture_root_gamma",
+        "ses_fixture_root_delta",
+        "ses_fixture_root_epsilon",
+        "ses_fixture_root_zeta",
+        "ses_fixture_root_eta",
+    ];
+    let mut targets = Vec::new();
+    for index in 0..9 {
+        let root = if index == 7 {
+            names[0]
+        } else if index == 8 {
+            names[1]
+        } else {
+            names[index]
+        };
+        targets.push(stopped_legacy_fixture_target(&registry, dir.path(), root).await);
+    }
+    let database = registry.database_path().to_path_buf();
+    drop(registry);
+    let conn = Connection::open(&database).unwrap();
+    conn.pragma_update(None, "foreign_keys", false).unwrap();
+    for table in [
+        "stopped_repair_root_receipts",
+        "stopped_repair_withdrawals",
+        "stopped_repair_operations",
+        "native_origin_owners",
+    ] {
+        conn.execute_batch(&format!("DROP TABLE {table};")).unwrap();
+    }
+    for column in [
+        "identity_revision",
+        "native_import_revision",
+        "native_import_state",
+        "native_import_source_store_id",
+        "native_import_root_session_id",
+        "native_import_source_generation",
+        "native_import_schema_fingerprint",
+        "native_import_migration_fingerprint",
+        "native_import_complete_inventory",
+        "native_import_authority",
+    ] {
+        conn.execute_batch(&format!("ALTER TABLE souls DROP COLUMN {column};"))
+            .unwrap();
+    }
+    for column in [
+        "captured_control_epoch",
+        "captured_identity_revision",
+        "captured_evidence_revision",
+        "captured_native_import_revision",
+        "captured_native_import_state",
+        "captured_source_store_id",
+        "captured_root_session_id",
+        "captured_source_generation",
+        "captured_source_schema_fingerprint",
+        "captured_migration_fingerprint",
+        "captured_native_import_complete",
+        "captured_native_import_authority",
+    ] {
+        conn.execute_batch(&format!("ALTER TABLE loss_incidents DROP COLUMN {column};"))
+            .unwrap();
+    }
+    conn.execute(
+        "UPDATE installation SET schema_version=7 WHERE singleton=1",
+        [],
+    )
+    .unwrap();
+    assert_eq!(conn.query_row("SELECT count(*) FROM pragma_table_info('souls') WHERE name IN ('identity_revision','native_import_revision')",[],|row|row.get::<_,u64>(0)).unwrap(),0);
+    assert_eq!(conn.query_row("SELECT count(*) FROM souls WHERE desired_state='stopped' AND recovery_state='lost' AND intent_revision=2",[],|row|row.get::<_,u64>(0)).unwrap(),9);
+    assert_eq!(conn.query_row("SELECT count(*) FROM loss_incidents WHERE intent_revision=1 AND cleanup_state='closed'",[],|row|row.get::<_,u64>(0)).unwrap(),9);
+    drop(conn);
+    let registry = Registry::open(dir.path(), None)
+        .expect("production opener migrates the actual absent-column/table shape");
+    let source = RepairBatchSourceSelection {
+        source_store_id: "a".repeat(64),
+        root_session_ids: names.iter().map(|name| name.to_string()).collect(),
+    };
+    let members = registry.repair_scope_members(source.clone()).await.unwrap();
+    assert_eq!(members.len(), 9);
+    for target in &targets {
+        let context = registry
+            .recovery_context(target.soul_id.clone())
+            .await
+            .unwrap();
+        assert_eq!(
+            context.native_import_state,
+            NativeImportState::LegacyUnknown
+        );
+        assert_eq!(context.native_import_authority, "legacy_unknown");
+        assert!(!context.native_import_complete_inventory);
+        assert!(context.native_import_source_store_id.is_none());
+        assert!(context.native_import_source_generation.is_none());
+        // This revision records the pre-existing identity string; it proves
+        // neither provider observation nor source absence/import completion.
+        assert_eq!(context.identity_revision, 1);
+        assert_eq!(context.native_import_revision, 0);
+    }
+    let scope = test_repair_scope(&registry, &targets);
+    assert_eq!(scope.roots.len(), 7);
+    for root in names.iter().take(2) {
+        let candidates = registry
+            .stopped_repair_owner_candidates(root.to_string())
+            .await
+            .unwrap();
+        assert_eq!(candidates.len(), 2);
+        assert!(
+            matches!(crate::recovery::choose_canonical_root_owner(&candidates,&source.source_store_id,root,&scope.roots.iter().find(|selected|selected.root_session_id==*root).unwrap().graph_digest,None).unwrap(),crate::recovery::CanonicalRootOwnerSelection::ChoiceRequired(ref alternatives) if alternatives.len()==2)
+        );
+    }
+    let request = RestoreLostSoulsRequest {
+        scope_id: scope.scope_id.clone(),
+        source,
+        targets: targets.clone(),
+        canonical_owners: [0usize, 1]
+            .into_iter()
+            .map(|index| CanonicalOwnerChoice {
+                root_session_id: names[index].into(),
+                soul_id: targets[index].soul_id.clone(),
+                expected_intent_revision: 2,
+            })
+            .collect(),
+        expected_control_epoch: Some(registry.control_epoch()),
+    };
+    let operation = RequestId::new();
+    registry
+        .prepare_stopped_repair_operation(operation.clone(), request, scope)
+        .await
+        .unwrap();
+    assert!(registry.finalize_stopped_repair_batch(operation,targets.clone(),Vec::new(),dir.path().join("incidents"),dir.path().join("lifecycle.jsonl")).await.is_err(),"legacy zero revisions cannot certify restoration without exact completed import/read receipts");
+    let conn = Connection::open(registry.database_path()).unwrap();
+    assert_eq!(
+        conn.query_row("SELECT count(*) FROM loss_incidents", [], |row| row
+            .get::<_, u64>(0))
+            .unwrap(),
+        9
+    );
+    assert_eq!(
+        conn.query_row("SELECT count(*) FROM native_origin_owners", [], |row| row
+            .get::<_, u64>(
+            0
+        ))
+        .unwrap(),
+        0
+    );
+}
+
+#[tokio::test]
+async fn durable_souls_server_resolved_scope_rejects_tenth_drift_before_writes() {
+    use freshell_runtime_protocol::{
+        CanonicalOwnerChoice, PreflightLostSoulsRequest, RepairBatchSourceSelection, RequestId,
+        RestoreLostSoulsRequest,
+    };
+    use freshell_sessions::opencode_transfer::{
+        pinned_destination_migration_ids, pinned_destination_schema_sql, HostOpenCodeInventory,
+    };
+    use sha2::{Digest, Sha256};
+    let dir = tempfile::tempdir().unwrap();
+    let registry = Registry::open(dir.path(), None).unwrap();
+    let workspace = dir.path().join("workspace");
+    std::fs::create_dir(&workspace).unwrap();
+    let names = [
+        "ses_fixture_root_alpha",
+        "ses_fixture_root_beta",
+        "ses_fixture_root_gamma",
+        "ses_fixture_root_delta",
+        "ses_fixture_root_epsilon",
+        "ses_fixture_root_zeta",
+        "ses_fixture_root_eta",
+    ];
+    let database = dir.path().join("source.sqlite");
+    let native = Connection::open(&database).unwrap();
+    native
+        .execute_batch(pinned_destination_schema_sql())
+        .unwrap();
+    for migration in pinned_destination_migration_ids() {
+        native
+            .execute(
+                "INSERT INTO migration(id,time_completed) VALUES (?1,1)",
+                [migration],
+            )
+            .unwrap();
+    }
+    native.execute("INSERT INTO project(id,worktree,time_created,time_updated,sandboxes) VALUES ('fixture-project',?1,1,1,'[]')",[workspace.to_string_lossy().as_ref()]).unwrap();
+    native.execute("INSERT INTO project_directory(project_id,directory,time_created) VALUES ('fixture-project',?1,1)",[workspace.to_string_lossy().as_ref()]).unwrap();
+    for root in names {
+        native.execute("INSERT INTO session(id,project_id,slug,directory,title,version,time_created,time_updated) VALUES (?1,'fixture-project','fixture',?2,'synthetic scope','1.18.21',1,1)",params![root,workspace.to_string_lossy().as_ref()]).unwrap();
+    }
+    drop(native);
+    let mut targets = Vec::new();
+    for index in 0..9 {
+        let root = if index == 7 {
+            names[0]
+        } else if index == 8 {
+            names[1]
+        } else {
+            names[index]
+        };
+        targets.push(stopped_legacy_fixture_target(&registry, dir.path(), root).await);
+    }
+    let install_workspace = |target: &freshell_runtime_protocol::LostSoulRepairTarget| {
+        let conn = Connection::open(registry.database_path()).unwrap();
+        let raw: Option<String> = conn
+            .query_row(
+                "SELECT terminal_spec FROM incarnations WHERE soul_id=?1",
+                [target.soul_id.as_str()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let mut terminal=raw.map(|raw|serde_json::from_str::<serde_json::Value>(&raw).unwrap()).unwrap_or_else(||serde_json::json!({"terminalId":format!("terminal-{}",target.soul_id),"streamId":format!("stream-{}",target.soul_id),"mode":"opencode","program":"opencode","env":{},"runAsUid":65534,"runAsGid":0,"cols":80,"rows":24,"projectKey":"test-project"}));
+        terminal["workspacePath"] = serde_json::json!(workspace);
+        terminal["cwd"] = serde_json::json!(workspace);
+        #[cfg(unix)]
+        {
+            terminal["runAsUid"] = serde_json::json!(unsafe { libc::geteuid() });
+            terminal["runAsGid"] = serde_json::json!(unsafe { libc::getegid() });
+        }
+        #[cfg(not(unix))]
+        {
+            terminal["runAsUid"] = serde_json::json!(0);
+            terminal["runAsGid"] = serde_json::json!(0);
+        }
+        conn.execute(
+            "UPDATE incarnations SET terminal_spec=?1 WHERE soul_id=?2",
+            params![terminal.to_string(), target.soul_id.as_str()],
+        )
+        .unwrap();
+    };
+    for target in &targets {
+        install_workspace(target);
+    }
+    let source = RepairBatchSourceSelection {
+        source_store_id: format!(
+            "{:x}",
+            Sha256::digest(
+                database
+                    .canonicalize()
+                    .unwrap()
+                    .to_string_lossy()
+                    .as_bytes()
+            )
+        ),
+        root_session_ids: names.iter().map(|root| root.to_string()).collect(),
+    };
+    let supervisor = crate::recovery::tests::missing_supervisor(&dir, registry.clone());
+    let inventory = HostOpenCodeInventory::new(database.clone())
+        .with_trusted_mount_for_selected_session(workspace.clone());
+    let source_before = std::fs::read(&database).unwrap();
+    let unrelated =
+        stopped_legacy_fixture_target(&registry, dir.path(), "ses_fixture_unrelated_root").await;
+    let scope = supervisor
+        .preflight_lost_souls_from_inventory(
+            PreflightLostSoulsRequest {
+                source: source.clone(),
+                expected_control_epoch: Some(registry.control_epoch()),
+            },
+            inventory.clone(),
+        )
+        .await
+        .expect("independently resolved nine-target preview from one consistent source capture");
+    assert_eq!(scope.targets.len(), 9);
+    assert_eq!(scope.roots.len(), 7);
+    let old_request = RestoreLostSoulsRequest {
+        scope_id: scope.scope_id.clone(),
+        source: source.clone(),
+        targets: targets.clone(),
+        canonical_owners: [0usize, 1]
+            .into_iter()
+            .map(|index| CanonicalOwnerChoice {
+                root_session_id: names[index].into(),
+                soul_id: targets[index].soul_id.clone(),
+                expected_intent_revision: 2,
+            })
+            .collect(),
+        expected_control_epoch: Some(registry.control_epoch()),
+    };
+    let conn = Connection::open(registry.database_path()).unwrap();
+    let original_store: String = conn
+        .query_row(
+            "SELECT provider_store_id FROM souls WHERE soul_id=?1",
+            [targets[2].soul_id.as_str()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    conn.execute(
+        "UPDATE souls SET provider_store_id='substituted-destination-store' WHERE soul_id=?1",
+        [targets[2].soul_id.as_str()],
+    )
+    .unwrap();
+    assert!(
+        registry
+            .prepare_stopped_repair_operation(RequestId::new(), old_request.clone(), scope.clone())
+            .await
+            .is_err(),
+        "a changed destination store invalidates the inspected exact member before import writes"
+    );
+    conn.execute(
+        "UPDATE souls SET provider_store_id=?1 WHERE soul_id=?2",
+        params![original_store, targets[2].soul_id.as_str()],
+    )
+    .unwrap();
+    drop(conn);
+    let tenth = stopped_legacy_fixture_target(&registry, dir.path(), names[0]).await;
+    install_workspace(&tenth);
+    assert!(
+        registry
+            .prepare_stopped_repair_operation(RequestId::new(), old_request.clone(), scope.clone())
+            .await
+            .is_err(),
+        "fresh eligible tenth target invalidates the old scope before operation or import writes"
+    );
+    let conn = Connection::open(registry.database_path()).unwrap();
+    assert_eq!(
+        conn.query_row(
+            "SELECT count(*) FROM stopped_repair_operations",
+            [],
+            |row| row.get::<_, u64>(0)
+        )
+        .unwrap(),
+        0
+    );
+    drop(conn);
+    let fresh = supervisor
+        .preflight_lost_souls_from_inventory(
+            PreflightLostSoulsRequest {
+                source,
+                expected_control_epoch: Some(registry.control_epoch()),
+            },
+            inventory,
+        )
+        .await
+        .unwrap();
+    assert_eq!(fresh.targets.len(), 10);
+    assert_eq!(fresh.roots.len(), 7);
+    assert_ne!(fresh.scope_id, scope.scope_id);
+    assert_eq!(fresh.source_fingerprint, scope.source_fingerprint);
+    let mut current = old_request;
+    current.scope_id = fresh.scope_id.clone();
+    current.targets.push(tenth);
+    let operation = RequestId::new();
+    registry
+        .prepare_stopped_repair_operation(operation.clone(), current.clone(), fresh.clone())
+        .await
+        .unwrap();
+    let mut receipts = Vec::new();
+    for (index, root) in names.iter().enumerate() {
+        use freshell_agent_runtime::opencode_transfer::{
+            import_bundle_payload, verify_installed_store, InstalledStoreReaderContext,
+        };
+        use freshell_runtime_protocol::{
+            opencode_target_build_receipt, opencode_transfer_bundle_digest,
+            OpenCodeAdoptionBaseline, OpenCodeTransferDescriptor, OpenCodeTransferFile,
+            OPENCODE_TRANSFER_DESTINATION_DB,
+        };
+        let context = registry
+            .recovery_context(targets[index].soul_id.clone())
+            .await
+            .unwrap();
+        let snapshot = freshell_sessions::opencode_transfer::export_exact_session(
+            &HostOpenCodeInventory::new(database.clone())
+                .with_trusted_mount_for_selected_session(workspace.clone()),
+            root,
+            freshell_sessions::opencode_transfer::ExportOptions::new(
+                dir.path().join("ten-root-extractions"),
+            ),
+        )
+        .unwrap();
+        let manifest = snapshot.manifest();
+        assert_eq!(
+            manifest.generation,
+            fresh
+                .roots
+                .iter()
+                .find(|selected| selected.root_session_id == *root)
+                .unwrap()
+                .graph_digest
+        );
+        let image = context.prior_handle.image_ref().to_owned();
+        let mut descriptor = OpenCodeTransferDescriptor {
+            transfer_id: format!("ten-root-{index}"),
+            provider: "opencode".into(),
+            source_store_id: manifest.source_store_id.clone(),
+            root_session_id: root.to_string(),
+            source_generation: manifest.generation.clone(),
+            provider_schema: manifest.provider_schema.clone(),
+            source_schema_fingerprint: manifest.source_schema_fingerprint.clone(),
+            migration_journal_fingerprint: manifest.migration_journal_fingerprint.clone(),
+            destination_store_id: context.provider_store_id.clone(),
+            destination_database_path: OPENCODE_TRANSFER_DESTINATION_DB.into(),
+            target_image_ref: image.clone(),
+            target_build_receipt: opencode_target_build_receipt(&image, "opencode-1.18.21"),
+            incarnation_id: context.prior_handle.incarnation_id().to_string(),
+            manifest_json: serde_json::to_string(manifest).unwrap(),
+            files: vec![OpenCodeTransferFile {
+                index: 0,
+                relative_path: "payload.json".into(),
+                size_bytes: manifest.payload_bytes,
+                sha256: manifest.payload_sha256.clone(),
+            }],
+            total_bytes: manifest.payload_bytes,
+            bundle_sha256: String::new(),
+        };
+        descriptor.bundle_sha256 =
+            opencode_transfer_bundle_digest(&descriptor.manifest_json, &descriptor.files);
+        let home = dir.path().join(format!("ten-provider-{index}"));
+        let data = home.join(".local/share");
+        let config = home.join(".config");
+        std::fs::create_dir_all(&config).unwrap();
+        let destination = data.join("opencode/opencode.db");
+        let imported = import_bundle_payload(
+            &descriptor,
+            snapshot.open_payload().unwrap(),
+            &destination,
+            &workspace,
+        )
+        .unwrap();
+        #[cfg(unix)]
+        let (uid, gid) = unsafe { (libc::geteuid(), libc::getegid()) };
+        #[cfg(not(unix))]
+        let (uid, gid) = (0, 0);
+        let readable = verify_installed_store(
+            &descriptor,
+            &InstalledStoreReaderContext {
+                database_path: &destination,
+                workspace_root: &workspace,
+                provider_uid: uid,
+                provider_gid: gid,
+                home: &home,
+                xdg_data_home: &data,
+                xdg_config_home: &config,
+                cwd: &workspace,
+            },
+        )
+        .unwrap();
+        assert_eq!(readable.structural_sha256, imported.structural_sha256);
+        assert_eq!(imported.row_count, manifest.row_count as u64);
+        assert!(imported.row_count > 0);
+        let execution_generation: u64 = Connection::open(registry.database_path())
+            .unwrap()
+            .query_row(
+                "SELECT execution_generation FROM incarnations WHERE incarnation_id=?1",
+                [context.prior_handle.incarnation_id().as_str()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let receipt = crate::registry::StoppedRepairRootReceipt {
+            root_session_id: root.to_string(),
+            canonical_soul_id: targets[index].soul_id.clone(),
+            transfer_id: descriptor.transfer_id.clone(),
+            adoption_baseline: OpenCodeAdoptionBaseline {
+                descriptor: descriptor.clone(),
+                manifest_sha256: format!(
+                    "{:x}",
+                    Sha256::digest(descriptor.manifest_json.as_bytes())
+                ),
+            },
+            destination_store_id: context.provider_store_id.clone(),
+            source_store_id: descriptor.source_store_id.clone(),
+            source_generation: descriptor.source_generation.clone(),
+            bundle_sha256: descriptor.bundle_sha256.clone(),
+            source_schema_fingerprint: descriptor.source_schema_fingerprint.clone(),
+            migration_journal_fingerprint: descriptor.migration_journal_fingerprint.clone(),
+            target_image_ref: descriptor.target_image_ref.clone(),
+            target_build_receipt: descriptor.target_build_receipt.clone(),
+            row_count: imported.row_count,
+            asset_count: imported.asset_count,
+            structural_sha256: imported.structural_sha256,
+            provider_uid: context.terminal.as_ref().unwrap().run_as_uid,
+            provider_gid: context.terminal.as_ref().unwrap().run_as_gid,
+            reader_environment_sha256: format!(
+                "{:x}",
+                Sha256::digest(serde_json::to_vec(&readable).unwrap())
+            ),
+            captured_identity_revision: context.identity_revision,
+            captured_evidence_revision: context.evidence_revision,
+            captured_intent_revision: context.intent_revision,
+            captured_native_import_revision: context.native_import_revision,
+            captured_native_import_state: context.native_import_state.as_str().into(),
+            captured_native_import_authority: context.native_import_authority.clone(),
+            incarnation_id: context.prior_handle.incarnation_id().clone(),
+            execution_generation,
+        };
+        registry
+            .persist_stopped_repair_root_receipt(
+                operation.clone(),
+                targets[index].clone(),
+                context,
+                receipt.clone(),
+            )
+            .await
+            .unwrap();
+        receipts.push(receipt);
+    }
+    assert_eq!(
+        receipts.len(),
+        7,
+        "each independently resolved root is imported and read exactly once"
+    );
+    let result = registry
+        .finalize_stopped_repair_batch(
+            operation.clone(),
+            current.targets.clone(),
+            receipts.clone(),
+            dir.path().join("incidents"),
+            dir.path().join("lifecycle.jsonl"),
+        )
+        .await
+        .unwrap();
+    assert_eq!(result.total_target_count, 10);
+    assert_eq!(result.repaired_target_count, 10);
+    assert_eq!(result.roots.len(), 7);
+    assert_eq!(
+        registry
+            .finalize_stopped_repair_batch(
+                operation,
+                current.targets,
+                receipts,
+                dir.path().join("incidents"),
+                dir.path().join("lifecycle.jsonl")
+            )
+            .await
+            .unwrap(),
+        result
+    );
+    assert_eq!(std::fs::read(database).unwrap(), source_before);
+    let retained = registry
+        .recovery_context(unrelated.soul_id.clone())
+        .await
+        .unwrap();
+    assert_eq!(
+        retained.recovery_state,
+        freshell_runtime_protocol::RecoveryState::Lost
+    );
+    assert_eq!(retained.intent_revision, unrelated.expected_intent_revision);
+    assert_eq!(
+        Connection::open(registry.database_path())
+            .unwrap()
+            .query_row(
+                "SELECT loss_incident_id FROM souls WHERE soul_id=?1",
+                [unrelated.soul_id.as_str()],
+                |row| row.get::<_, String>(0)
+            )
+            .unwrap(),
+        unrelated.incident_id.as_str()
+    );
 }

@@ -532,11 +532,15 @@ impl Supervisor {
                         .map_err(map_registry)?,
                 ))
             }
+            AdminCommand::PreflightLostSouls(request) => self
+                .preflight_lost_souls(request)
+                .await
+                .map(AdminResult::PreflightLostSouls),
             AdminCommand::RestoreLostSouls(request) => {
                 self.registry
                     .assert_epoch(request.expected_control_epoch)
                     .map_err(map_registry)?;
-                request.validate_exact_batch()?;
+                request.validate_payload()?;
                 self.restore_lost_souls(envelope.request_id, request)
                     .await
                     .map(AdminResult::RestoreLostSouls)

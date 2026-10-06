@@ -823,7 +823,11 @@ async fn real_gateway_pre_native_opencode_projects_only_current_empty_owned_regi
 }
 
 #[tokio::test]
+#[allow(clippy::await_holding_lock)] // Global HOME lock spans set/use/restore.
 async fn real_gateway_managed_snapshot_failure_reads_owned_history_and_refuses_wrong_local_store() {
+    // Acquire the shared HOME lock before the Claude lock, matching readers.
+    let _home_guard = crate::session_directory::HOME_ENV_TEST_LOCK.lock().unwrap();
+    let _claude_guard = crate::test_env_lock::CLAUDE_ENV_TEST_LOCK.lock().await;
     let _lock = SNAPSHOT_OUTAGE_ENV_LOCK.lock().await;
     let dir = tempfile::tempdir().unwrap();
     let _env = SnapshotTestEnv::isolate(dir.path());
@@ -1003,7 +1007,11 @@ async fn real_gateway_managed_snapshot_failure_reads_owned_history_and_refuses_w
 }
 
 #[tokio::test]
+#[allow(clippy::await_holding_lock)] // Global HOME lock spans set/use/restore.
 async fn real_gateway_outage_preserves_exact_cold_native_history_without_live_authority() {
+    // Acquire the shared HOME lock before the Claude lock, matching readers.
+    let _home_guard = crate::session_directory::HOME_ENV_TEST_LOCK.lock().unwrap();
+    let _claude_guard = crate::test_env_lock::CLAUDE_ENV_TEST_LOCK.lock().await;
     let _lock = SNAPSHOT_OUTAGE_ENV_LOCK.lock().await;
     let dir = tempfile::tempdir().unwrap();
     let _env = SnapshotTestEnv::isolate(dir.path());
@@ -1170,7 +1178,11 @@ async fn real_gateway_outage_preserves_exact_cold_native_history_without_live_au
 }
 
 #[tokio::test]
+#[allow(clippy::await_holding_lock)] // Global HOME lock spans set/use/restore.
 async fn real_gateway_outage_keeps_a_registered_local_provider_snapshot_live() {
+    // Acquire the shared HOME lock before the Claude lock, matching readers.
+    let _home_guard = crate::session_directory::HOME_ENV_TEST_LOCK.lock().unwrap();
+    let _claude_guard = crate::test_env_lock::CLAUDE_ENV_TEST_LOCK.lock().await;
     let _lock = SNAPSHOT_OUTAGE_ENV_LOCK.lock().await;
     let dir = tempfile::tempdir().unwrap();
     let _env = SnapshotTestEnv::isolate(dir.path());

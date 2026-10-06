@@ -19,7 +19,8 @@ use freshell_runtime_protocol::{
     OpenCodeTransferFile, MAX_OPENCODE_TRANSFER_BUNDLE_BYTES,
 };
 use freshell_sessions::opencode_transfer::{
-    OpenCodeTransferManifest, SerializedAssetMetadata, SerializedRow, SerializedSqlValue,
+    NativeMessageBaseline, NativeRevertBoundary, OpenCodeTransferManifest, SerializedAssetMetadata,
+    SerializedRow, SerializedSqlValue,
 };
 use rusqlite::{
     params_from_iter,
@@ -45,7 +46,7 @@ pub trait DestinationCapacityProvider {
     fn available_bytes(&self, existing_directory: &Path) -> io::Result<u64>;
 }
 
-struct FilesystemCapacityProvider;
+pub struct FilesystemCapacityProvider;
 
 impl DestinationCapacityProvider for FilesystemCapacityProvider {
     fn available_bytes(&self, existing_directory: &Path) -> io::Result<u64> {
@@ -111,6 +112,8 @@ pub struct ImportReceipt {
     pub row_count: u64,
     pub asset_count: u64,
     pub structural_sha256: String,
+    #[serde(default)]
+    pub saved_snapshot_summary: freshell_sessions::opencode_transfer::SavedSnapshotSummary,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -133,6 +136,8 @@ pub struct InstalledStoreReadable {
     pub row_count: u64,
     pub asset_count: u64,
     pub structural_sha256: String,
+    #[serde(default)]
+    pub saved_snapshot_summary: freshell_sessions::opencode_transfer::SavedSnapshotSummary,
 }
 
 /// The current root tail verified against the immutable import manifest and
@@ -160,6 +165,8 @@ pub struct CurrentOpenCodeEvidence {
     pub root_tail: VerifiedRootTail,
     pub row_count: u64,
     pub asset_count: u64,
+    #[serde(default)]
+    pub saved_snapshot_summary: freshell_sessions::opencode_transfer::SavedSnapshotSummary,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -279,9 +286,17 @@ pub fn import_bundle_payload_with_capacity<R: Read>(
             transaction: &transaction,
             manifest: &manifest,
             row_index: &mut row_index,
+            destination_database,
         }
         .deserialize(&mut deserializer)
-        .map_err(|_| {
+        .map_err(|error| {
+            if error.to_string().starts_with(
+                "OpenCode import is blocked: destination has a conflicting native primary key",
+            ) {
+                return OpenCodeImportError::Blocked(
+                    "destination has a conflicting native primary key".into(),
+                );
+            }
             OpenCodeImportError::Blocked("staged payload structure or row digest is invalid".into())
         })?;
         deserializer.end().map_err(|_| {
@@ -297,7 +312,15 @@ pub fn import_bundle_payload_with_capacity<R: Read>(
     }
     validate_foreign_keys(&transaction)?;
     verify_manifest_rows(&transaction, &manifest)?;
+    verify_exact_installed_closure(&transaction, &manifest)?;
     let session_rows = read_manifest_session_rows(&transaction, &manifest)?;
+    freshell_sessions::opencode_transfer::verify_saved_snapshot_references(
+        &manifest.saved_snapshots,
+        &session_rows,
+        destination_database,
+        workspace_root,
+    )
+    .map_err(|error| OpenCodeImportError::Blocked(error.to_string()))?;
     freshell_sessions::opencode_transfer::verify_asset_references(
         &manifest.assets,
         &session_rows,
@@ -394,8 +417,16 @@ pub fn verify_installed_store(
     connection.pragma_update(None, "query_only", "ON")?;
     verify_destination_schema(&connection)?;
     verify_manifest_rows(&connection, &manifest)?;
+    verify_exact_installed_closure(&connection, &manifest)?;
     validate_foreign_keys(&connection)?;
     let session_rows = read_manifest_session_rows(&connection, &manifest)?;
+    freshell_sessions::opencode_transfer::verify_saved_snapshot_references(
+        &manifest.saved_snapshots,
+        &session_rows,
+        database_path,
+        workspace_root,
+    )
+    .map_err(|error| OpenCodeImportError::Blocked(error.to_string()))?;
     freshell_sessions::opencode_transfer::verify_asset_references(
         &manifest.assets,
         &session_rows,
@@ -408,6 +439,9 @@ pub fn verify_installed_store(
     })?;
     let structural_sha256 = structural_digest(&manifest);
     Ok(InstalledStoreReadable {
+        saved_snapshot_summary: freshell_sessions::opencode_transfer::saved_snapshot_summary(
+            &manifest,
+        ),
         version: 1,
         transfer_id: descriptor.transfer_id.clone(),
         destination_store_id: descriptor.destination_store_id.clone(),
@@ -471,10 +505,14 @@ pub fn verify_current_store(
         if current_rows.contains_key(&key) {
             continue;
         }
+        if matches!(baseline.table.as_str(), "message" | "part") {
+            continue;
+        }
         let row = read_row_by_key(&transaction, &baseline.table, &baseline.key)?;
         current_rows.insert(key, row);
     }
-    verify_typed_current_rows(&manifest, &current_rows)?;
+    let verified_removals = verify_native_cleanup_transitions(&manifest, &current_rows)?;
+    verify_typed_current_rows(&manifest, &current_rows, &verified_removals)?;
     let current_event_rows = current_rows
         .values()
         .filter(|row| row.table == "event")
@@ -496,7 +534,7 @@ pub fn verify_current_store(
         .filter(|row| row.table == "session_message")
         .cloned()
         .collect::<Vec<_>>();
-    verify_current_references(&manifest, &current_rows, workspace_root)?;
+    verify_current_references(&manifest, &current_rows, database_path, workspace_root)?;
     let root_tail = derive_root_tail(
         &manifest.root_session_id,
         &current_session_rows,
@@ -506,6 +544,9 @@ pub fn verify_current_store(
     let evidence_generation = current_evidence_generation(descriptor, &current_rows, &manifest)?;
     transaction.commit()?;
     Ok(CurrentOpenCodeEvidence {
+        saved_snapshot_summary: freshell_sessions::opencode_transfer::saved_snapshot_summary(
+            &manifest,
+        ),
         version: 1,
         transfer_id: descriptor.transfer_id.clone(),
         destination_store_id: descriptor.destination_store_id.clone(),
@@ -684,6 +725,7 @@ fn read_current_session_rows(
 fn verify_typed_current_rows(
     manifest: &OpenCodeTransferManifest,
     current_rows: &BTreeMap<(String, Vec<SerializedSqlValue>), SerializedRow>,
+    verified_removals: &BTreeSet<(String, Vec<SerializedSqlValue>)>,
 ) -> Result<(), OpenCodeImportError> {
     let events = current_rows
         .values()
@@ -700,6 +742,9 @@ fn verify_typed_current_rows(
     let mut changed_rows = Vec::new();
     for (key, digest) in &baseline {
         let Some(current) = current_rows.get(key) else {
+            if verified_removals.contains(key) {
+                continue;
+            }
             return Err(OpenCodeImportError::Blocked(
                 "an imported native row or edge was deleted".into(),
             ));
@@ -715,10 +760,34 @@ fn verify_typed_current_rows(
         if digest_serialized_row(current)? == digest.sha256 {
             continue;
         }
+        // Pinned Project.fromDirectory refreshes this discovery timestamp on
+        // every native open. It carries no identity or conversation authority.
+        if current.table == "project" {
+            let (columns, _) = current_row_field_digests(current)?;
+            if columns.len() == digest.column_sha256.len()
+                && columns.iter().all(|(column, hash)| {
+                    column == "time_updated" || digest.column_sha256.get(column) == Some(hash)
+                })
+                && digest.transition_cursor.is_some_and(|old| {
+                    value_integer(current, "time_updated").is_some_and(|now| now >= old)
+                })
+            {
+                continue;
+            }
+        }
         if !baseline_row_change_is_typed(digest, current)? {
-            return Err(OpenCodeImportError::Blocked(
-                "an imported native row changed outside a supported transition".into(),
-            ));
+            let (columns, _) = current_row_field_digests(current)?;
+            let changed_columns = columns
+                .iter()
+                .filter_map(|(column, hash)| {
+                    (digest.column_sha256.get(column) != Some(hash)).then_some(column.as_str())
+                })
+                .collect::<Vec<_>>();
+            return Err(OpenCodeImportError::Blocked(format!(
+                "an imported native {} row changed outside a supported transition (columns: {})",
+                current.table,
+                changed_columns.join(",")
+            )));
         }
         changed_rows.push(current.clone());
     }
@@ -766,12 +835,301 @@ fn verify_typed_current_rows(
             continue;
         }
         if !row_has_supporting_transition(row, &events)? {
-            return Err(OpenCodeImportError::Blocked(
-                "a native row transition has no matching provider event".into(),
-            ));
+            return Err(OpenCodeImportError::Blocked(format!(
+                "a native {} row transition has no matching provider event",
+                row.table
+            )));
         }
     }
     Ok(())
+}
+
+#[derive(Default)]
+struct NativeCleanupState {
+    revert: Option<NativeRevertBoundary>,
+    messages: BTreeMap<String, NativeMessageBaseline>,
+    pending: Option<NativeCleanupRemovalSet>,
+}
+
+struct NativeCleanupRemovalSet {
+    messages: BTreeSet<String>,
+    parts: BTreeSet<(String, String)>,
+}
+
+fn native_cleanup_refusal() -> OpenCodeImportError {
+    OpenCodeImportError::Blocked(
+        "native removals do not match a complete saved revert/cleanup transition".into(),
+    )
+}
+
+fn expected_native_cleanup(
+    state: &NativeCleanupState,
+) -> Result<NativeCleanupRemovalSet, OpenCodeImportError> {
+    let revert = state.revert.as_ref().ok_or_else(native_cleanup_refusal)?;
+    let mut ordered = state.messages.values().collect::<Vec<_>>();
+    for message in &ordered {
+        serialized_sql_number(&message.time_created).ok_or_else(native_cleanup_refusal)?;
+    }
+    ordered.sort_by(|left, right| {
+        compare_sql_numbers(
+            serialized_sql_number(&left.time_created).unwrap(),
+            serialized_sql_number(&right.time_created).unwrap(),
+        )
+        .then_with(|| left.message_id.cmp(&right.message_id))
+    });
+    let boundary = ordered
+        .iter()
+        .position(|message| message.message_id == revert.message_id)
+        .ok_or_else(native_cleanup_refusal)?;
+    let messages = ordered
+        .iter()
+        .skip(boundary + usize::from(revert.part_id.is_some()))
+        .map(|message| message.message_id.clone())
+        .collect();
+    let parts = if let Some(part_id) = &revert.part_id {
+        let part_boundary = ordered[boundary]
+            .part_ids
+            .iter()
+            .position(|id| id == part_id)
+            .ok_or_else(native_cleanup_refusal)?;
+        ordered[boundary]
+            .part_ids
+            .iter()
+            .skip(part_boundary)
+            .map(|id| (revert.message_id.clone(), id.clone()))
+            .collect()
+    } else {
+        BTreeSet::new()
+    };
+    Ok(NativeCleanupRemovalSet { messages, parts })
+}
+
+fn native_revert_boundary(
+    value: &serde_json::Value,
+) -> Result<NativeRevertBoundary, OpenCodeImportError> {
+    Ok(NativeRevertBoundary {
+        message_id: value
+            .get("messageID")
+            .and_then(serde_json::Value::as_str)
+            .filter(|id| !id.is_empty())
+            .ok_or_else(native_cleanup_refusal)?
+            .into(),
+        part_id: value
+            .get("partID")
+            .map(|id| {
+                id.as_str()
+                    .filter(|id| !id.is_empty())
+                    .map(str::to_string)
+                    .ok_or_else(native_cleanup_refusal)
+            })
+            .transpose()?,
+    })
+}
+
+/// Replay only pinned native V1 message/part/revert state. A removal becomes
+/// authorized only after every exact boundary removal and its native clear
+/// event exist. The original manifest remains immutable throughout.
+fn verify_native_cleanup_transitions(
+    manifest: &OpenCodeTransferManifest,
+    rows: &BTreeMap<(String, Vec<SerializedSqlValue>), SerializedRow>,
+) -> Result<BTreeSet<(String, Vec<SerializedSqlValue>)>, OpenCodeImportError> {
+    let baseline_events = manifest
+        .rows
+        .iter()
+        .filter(|row| row.table == "event")
+        .map(|row| row.key.clone())
+        .collect::<BTreeSet<_>>();
+    let mut events = rows
+        .values()
+        .filter(|row| row.table == "event" && !baseline_events.contains(&row.key))
+        .collect::<Vec<_>>();
+    events.sort_by(|left, right| {
+        value_text(left, "aggregate_id")
+            .unwrap_or_default()
+            .cmp(&value_text(right, "aggregate_id").unwrap_or_default())
+            .then_with(|| value_integer(left, "seq").cmp(&value_integer(right, "seq")))
+    });
+    if manifest.native_cleanup_baselines.is_empty() {
+        if events.iter().any(|row| {
+            value_text(row, "type").ok().flatten().is_some_and(|kind| {
+                matches!(
+                    pinned_event_kind(&kind),
+                    Some("message.removed" | "message.part.removed")
+                )
+            })
+        }) {
+            return Err(native_cleanup_refusal());
+        }
+        return Ok(BTreeSet::new());
+    }
+    let mut states = BTreeMap::new();
+    for baseline in &manifest.native_cleanup_baselines {
+        let state = NativeCleanupState {
+            revert: baseline.revert.clone(),
+            messages: baseline
+                .messages
+                .iter()
+                .map(|message| (message.message_id.clone(), message.clone()))
+                .collect(),
+            pending: None,
+        };
+        if states.insert(baseline.session_id.clone(), state).is_some() {
+            return Err(native_cleanup_refusal());
+        }
+    }
+    let mut deleted = BTreeSet::new();
+    let row_key = |table: &str, id: &str| {
+        (
+            table.to_string(),
+            vec![SerializedSqlValue::Text {
+                value: id.to_string(),
+            }],
+        )
+    };
+    for event in events {
+        let raw_kind = value_text(event, "type")?.unwrap_or_default();
+        let Some(kind) = pinned_event_kind(&raw_kind) else {
+            return Err(native_cleanup_refusal());
+        };
+        let data = parse_event_data(event)?;
+        let session_id = data
+            .get("sessionID")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(native_cleanup_refusal)?;
+        let state = states
+            .entry(session_id.to_string())
+            .or_insert_with(NativeCleanupState::default);
+        match kind {
+            "message.updated" => {
+                if state.pending.is_some() {
+                    return Err(native_cleanup_refusal());
+                }
+                let info = data.get("info").ok_or_else(native_cleanup_refusal)?;
+                let id = info
+                    .get("id")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or_else(native_cleanup_refusal)?;
+                let time = info
+                    .get("time")
+                    .and_then(|time| time.get("created"))
+                    .ok_or_else(native_cleanup_refusal)?;
+                let time_created = if let Some(value) = time.as_i64() {
+                    SerializedSqlValue::Integer { value }
+                } else {
+                    let value = time
+                        .as_f64()
+                        .filter(|number| number.is_finite())
+                        .ok_or_else(native_cleanup_refusal)?;
+                    SerializedSqlValue::Real {
+                        bits: format!("{:016x}", value.to_bits()),
+                    }
+                };
+                if let Some(existing) = state.messages.get(id) {
+                    if compare_sql_numbers(
+                        serialized_sql_number(&existing.time_created)
+                            .ok_or_else(native_cleanup_refusal)?,
+                        serialized_sql_number(&time_created).ok_or_else(native_cleanup_refusal)?,
+                    ) != Ordering::Equal
+                    {
+                        return Err(native_cleanup_refusal());
+                    }
+                } else {
+                    state.messages.insert(
+                        id.into(),
+                        NativeMessageBaseline {
+                            message_id: id.into(),
+                            time_created,
+                            part_ids: Vec::new(),
+                        },
+                    );
+                }
+            }
+            "message.part.updated" => {
+                if state.pending.is_some() {
+                    return Err(native_cleanup_refusal());
+                }
+                let part = data.get("part").ok_or_else(native_cleanup_refusal)?;
+                let message_id = part
+                    .get("messageID")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or_else(native_cleanup_refusal)?;
+                let id = part
+                    .get("id")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or_else(native_cleanup_refusal)?;
+                let message = state
+                    .messages
+                    .get_mut(message_id)
+                    .ok_or_else(native_cleanup_refusal)?;
+                if !message.part_ids.iter().any(|existing| existing == id) {
+                    message.part_ids.push(id.into());
+                    message.part_ids.sort();
+                }
+            }
+            "message.removed" | "message.part.removed" => {
+                if state.pending.is_none() {
+                    state.pending = Some(expected_native_cleanup(state)?);
+                }
+                let pending = state.pending.as_mut().unwrap();
+                let message_id = data
+                    .get("messageID")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or_else(native_cleanup_refusal)?;
+                if kind == "message.removed" {
+                    if !pending.messages.remove(message_id) {
+                        return Err(native_cleanup_refusal());
+                    }
+                    let removed = state
+                        .messages
+                        .remove(message_id)
+                        .ok_or_else(native_cleanup_refusal)?;
+                    deleted.insert(row_key("message", message_id));
+                    for part in removed.part_ids {
+                        deleted.insert(row_key("part", &part));
+                    }
+                } else {
+                    let part_id = data
+                        .get("partID")
+                        .and_then(serde_json::Value::as_str)
+                        .ok_or_else(native_cleanup_refusal)?;
+                    if !pending.parts.remove(&(message_id.into(), part_id.into())) {
+                        return Err(native_cleanup_refusal());
+                    }
+                    let message = state
+                        .messages
+                        .get_mut(message_id)
+                        .ok_or_else(native_cleanup_refusal)?;
+                    message.part_ids.retain(|id| id != part_id);
+                    deleted.insert(row_key("part", part_id));
+                }
+            }
+            "session.updated" => {
+                let info = data.get("info").ok_or_else(native_cleanup_refusal)?;
+                let next = info
+                    .get("revert")
+                    .filter(|value| !value.is_null())
+                    .map(native_revert_boundary)
+                    .transpose()?;
+                if let Some(pending) = &state.pending {
+                    if next.is_some() || !pending.messages.is_empty() || !pending.parts.is_empty() {
+                        return Err(native_cleanup_refusal());
+                    }
+                    state.pending = None;
+                }
+                state.revert = next;
+            }
+            _ => {}
+        }
+    }
+    if states.values().any(|state| state.pending.is_some()) {
+        return Err(native_cleanup_refusal());
+    }
+    for key in &deleted {
+        if rows.contains_key(key) {
+            return Err(native_cleanup_refusal());
+        }
+    }
+    Ok(deleted)
 }
 
 fn verify_todowrite_projection(
@@ -2479,10 +2837,9 @@ fn baseline_row_change_is_typed(
         if old_digest == new_digest {
             continue;
         }
-        if current.table == "session" && column == "revert" {
-            if !allowed_scalar_column(current.table.as_str(), column) {
-                return Ok(false);
-            }
+        if current.table == "session" && allowed_scalar_column("session", column) {
+            // Session.Info commits the complete scalar/JSON column below,
+            // including a native NULL -> model object or cleared revert.
         } else if baseline
             .json_node_sha256
             .keys()
@@ -2939,9 +3296,13 @@ enum SqlNumber {
 }
 
 fn sql_number(row: &SerializedRow, key: &str) -> Option<SqlNumber> {
-    match row.values.get(key) {
-        Some(SerializedSqlValue::Integer { value }) => Some(SqlNumber::Integer(*value)),
-        Some(SerializedSqlValue::Real { bits }) => {
+    row.values.get(key).and_then(serialized_sql_number)
+}
+
+fn serialized_sql_number(value: &SerializedSqlValue) -> Option<SqlNumber> {
+    match value {
+        SerializedSqlValue::Integer { value } => Some(SqlNumber::Integer(*value)),
+        SerializedSqlValue::Real { bits } => {
             let bits = u64::from_str_radix(bits, 16).ok()?;
             let value = f64::from_bits(bits);
             value.is_finite().then_some(SqlNumber::Real(value))
@@ -3169,7 +3530,12 @@ fn session_row_matches_info(row: &SerializedRow, info: &serde_json::Value) -> bo
         let Some(actual) = sql_column_as_json(row, column) else {
             return false;
         };
-        actual == session_info_column(info, column)
+        let expected = session_info_column(info, column);
+        if actual.is_number() && expected.is_number() {
+            sql_number_matches_json(row, column, &expected)
+        } else {
+            actual == expected
+        }
     })
 }
 
@@ -3328,12 +3694,6 @@ fn verify_current_event_chains(
         }
         if baseline.contains(&(event.table.clone(), event.key.clone())) {
             continue;
-        }
-        if matches!(event_type, "message.removed" | "message.part.removed") {
-            return Err(OpenCodeImportError::Blocked(
-                "provider transcript removals are blocked until an exact revert boundary is proven"
-                    .into(),
-            ));
         }
         if event_type == "session.deleted" {
             return Err(OpenCodeImportError::Blocked(
@@ -4093,9 +4453,17 @@ fn value_integer_required(row: &SerializedRow, key: &str) -> Result<i64, OpenCod
 fn verify_current_references(
     manifest: &OpenCodeTransferManifest,
     current_rows: &BTreeMap<(String, Vec<SerializedSqlValue>), SerializedRow>,
+    database_path: &Path,
     workspace_root: &Path,
 ) -> Result<(), OpenCodeImportError> {
     let rows = current_rows.values().cloned().collect::<Vec<_>>();
+    freshell_sessions::opencode_transfer::verify_saved_snapshot_references(
+        &manifest.saved_snapshots,
+        &rows,
+        database_path,
+        workspace_root,
+    )
+    .map_err(|error| OpenCodeImportError::Blocked(error.to_string()))?;
     freshell_sessions::opencode_transfer::verify_asset_references(
         &manifest.assets,
         &rows,
@@ -4528,6 +4896,32 @@ fn verify_manifest_rows(
     Ok(())
 }
 
+fn verify_exact_installed_closure(
+    connection: &Connection,
+    manifest: &OpenCodeTransferManifest,
+) -> Result<(), OpenCodeImportError> {
+    let ids = read_descendant_session_ids(connection, &manifest.root_session_id)?;
+    let actual = read_current_session_rows(connection, &ids)?;
+    let expected_keys = manifest
+        .rows
+        .iter()
+        .map(|row| (row.table.clone(), row.key.clone()))
+        .collect::<BTreeSet<_>>();
+    if actual.keys().cloned().collect::<BTreeSet<_>>() != expected_keys {
+        return Err(OpenCodeImportError::Blocked(
+            "installed store has an unreceipted extra native graph".into(),
+        ));
+    }
+    freshell_sessions::opencode_transfer::verify_native_cleanup_baselines(
+        &manifest.native_cleanup_baselines,
+        &actual.into_values().collect::<Vec<_>>(),
+    )
+    .map_err(|_| {
+        OpenCodeImportError::Blocked("native cleanup baseline ordering or boundary differs".into())
+    })?;
+    Ok(())
+}
+
 fn read_manifest_session_rows(
     connection: &Connection,
     manifest: &OpenCodeTransferManifest,
@@ -4752,6 +5146,9 @@ fn receipt_for(
     structural_sha256: String,
 ) -> ImportReceipt {
     ImportReceipt {
+        saved_snapshot_summary: freshell_sessions::opencode_transfer::saved_snapshot_summary(
+            manifest,
+        ),
         version: 1,
         transfer_id: descriptor.transfer_id.clone(),
         destination_store_id: descriptor.destination_store_id.clone(),
@@ -4827,6 +5224,7 @@ struct PayloadSeed<'a, 'connection> {
     transaction: &'a Transaction<'connection>,
     manifest: &'a OpenCodeTransferManifest,
     row_index: &'a mut usize,
+    destination_database: &'a Path,
 }
 
 impl<'de, 'a, 'connection> de::DeserializeSeed<'de> for PayloadSeed<'a, 'connection> {
@@ -4857,6 +5255,7 @@ impl<'de, 'a, 'connection> de::Visitor<'de> for PayloadVisitor<'a, 'connection> 
         let mut root = None;
         let mut rows_seen = false;
         let mut assets = None;
+        let mut snapshot_objects_seen = false;
         while let Some(key) = map.next_key::<String>()? {
             match key.as_str() {
                 "version" if version.is_none() => version = Some(map.next_value::<u32>()?),
@@ -4872,6 +5271,13 @@ impl<'de, 'a, 'connection> de::Visitor<'de> for PayloadVisitor<'a, 'connection> 
                 "assets" if assets.is_none() => {
                     assets = Some(map.next_value::<Vec<SerializedAssetMetadata>>()?);
                 }
+                "snapshot_objects" if !snapshot_objects_seen => {
+                    snapshot_objects_seen = true;
+                    map.next_value_seed(SnapshotObjectsSeed {
+                        manifest: self.0.manifest,
+                        destination_database: self.0.destination_database,
+                    })?;
+                }
                 _ => {
                     let _: de::IgnoredAny = map.next_value()?;
                 }
@@ -4882,9 +5288,75 @@ impl<'de, 'a, 'connection> de::Visitor<'de> for PayloadVisitor<'a, 'connection> 
             || !rows_seen
             || assets.as_deref() != Some(self.0.manifest.assets.as_slice())
             || *self.0.row_index != self.0.manifest.rows.len()
+            || (!snapshot_objects_seen
+                && self
+                    .0
+                    .manifest
+                    .saved_snapshots
+                    .iter()
+                    .any(|reference| !reference.objects.is_empty()))
         {
             return Err(de::Error::custom(
                 "payload metadata disagrees with its manifest",
+            ));
+        }
+        Ok(())
+    }
+}
+
+struct SnapshotObjectsSeed<'a> {
+    manifest: &'a OpenCodeTransferManifest,
+    destination_database: &'a Path,
+}
+
+impl<'de> de::DeserializeSeed<'de> for SnapshotObjectsSeed<'_> {
+    type Value = ();
+    fn deserialize<D: de::Deserializer<'de>>(self, deserializer: D) -> Result<(), D::Error> {
+        deserializer.deserialize_seq(self)
+    }
+}
+
+impl<'de> de::Visitor<'de> for SnapshotObjectsSeed<'_> {
+    type Value = ();
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("the exact retained snapshot object closure")
+    }
+    fn visit_seq<A: de::SeqAccess<'de>>(self, mut sequence: A) -> Result<(), A::Error> {
+        let mut seen = BTreeSet::new();
+        while let Some(object) = sequence
+            .next_element::<freshell_sessions::opencode_transfer::SerializedSnapshotObject>(
+        )? {
+            if !seen.insert((
+                object.project_id.clone(),
+                object.worktree_sha1.clone(),
+                object.object_id.clone(),
+            )) {
+                return Err(de::Error::custom("duplicate snapshot object"));
+            }
+            freshell_sessions::opencode_transfer::install_snapshot_object(
+                &object,
+                &self.manifest.saved_snapshots,
+                self.destination_database,
+            )
+            .map_err(de::Error::custom)?;
+        }
+        let expected = self
+            .manifest
+            .saved_snapshots
+            .iter()
+            .flat_map(|reference| {
+                reference.objects.iter().map(|object| {
+                    (
+                        reference.project_id.clone(),
+                        reference.worktree_sha1.clone(),
+                        object.object_id.clone(),
+                    )
+                })
+            })
+            .collect::<BTreeSet<_>>();
+        if seen != expected {
+            return Err(de::Error::custom(
+                "snapshot payload does not match the exact retained closure",
             ));
         }
         Ok(())

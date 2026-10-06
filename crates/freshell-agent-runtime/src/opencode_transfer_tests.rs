@@ -1764,13 +1764,16 @@ fn conflicting_primary_key_rolls_back_without_overwriting_destination_data() {
         .unwrap();
     drop(connection);
 
-    assert!(import_bundle(
+    let refusal = import_bundle(
         &fixture.descriptor,
         &fixture.staged_directory,
         &fixture.destination_database,
         &fixture.workspace,
     )
-    .is_err());
+    .unwrap_err();
+    assert!(
+        matches!(refusal,OpenCodeImportError::Blocked(reason) if reason=="destination has a conflicting native primary key")
+    );
     let connection = Connection::open(&fixture.destination_database).unwrap();
     assert_eq!(
         connection
@@ -1967,6 +1970,346 @@ fn installed_store_probe_reopens_exact_database_read_only_and_returns_no_body() 
     assert!(!serde_json::to_string(&receipt)
         .unwrap()
         .contains("UNIQUE_SYNTHETIC_CONVERSATION_BODY"));
+}
+
+fn reexport_owned_fixture(fixture: &mut Fixture) {
+    let snapshot = export_exact_session(
+        &HostOpenCodeInventory::new(fixture.root.join("source.sqlite"))
+            .with_trusted_mount_for_selected_session(fixture.workspace.clone()),
+        "ses_root",
+        ExportOptions::new(fixture.root.join("reexport")),
+    )
+    .unwrap();
+    let mut bytes = Vec::new();
+    snapshot
+        .open_payload()
+        .unwrap()
+        .read_to_end(&mut bytes)
+        .unwrap();
+    fixture.descriptor.manifest_json = serde_json::to_string(snapshot.manifest()).unwrap();
+    fixture.descriptor.source_generation = snapshot.manifest().generation.clone();
+    fixture.descriptor.total_bytes = bytes.len() as u64;
+    fixture.descriptor.files[0].size_bytes = bytes.len() as u64;
+    fixture.descriptor.files[0].sha256 = sha256(&bytes);
+    fixture.descriptor.bundle_sha256 = opencode_transfer_bundle_digest(
+        &fixture.descriptor.manifest_json,
+        &fixture.descriptor.files,
+    );
+    fs::write(fixture.staged_directory.join("entry-0000.bin"), bytes).unwrap();
+    fs::write(
+        fixture.staged_directory.join("descriptor.json"),
+        serde_json::to_vec(&StageMetadata {
+            descriptor: fixture.descriptor.clone(),
+        })
+        .unwrap(),
+    )
+    .unwrap();
+    fs::write(
+        fixture.staged_directory.join("READY"),
+        fixture.descriptor.bundle_sha256.as_bytes(),
+    )
+    .unwrap();
+}
+
+fn saved_revert_fixture(part: bool) -> Fixture {
+    let mut fixture = fixture_with_baseline_event();
+    let source = Connection::open(fixture.root.join("source.sqlite")).unwrap();
+    for index in 1..4 {
+        let message_id = format!("msg_cleanup_{index}");
+        source.execute("INSERT INTO message(id,session_id,time_created,time_updated,data) VALUES (?1,'ses_root',?2,?2,?3)", params![message_id,index+1,serde_json::json!({"role":"user","agent":"build","model":{"providerID":"provider-one","modelID":"model-one"},"time":{"created":index+1}}).to_string()]).unwrap();
+        for suffix in ["a", "b"] {
+            source.execute("INSERT INTO part(id,message_id,session_id,time_created,time_updated,data) VALUES (?1,?2,'ses_root',?3,?3,?4)",params![format!("prt_cleanup_{index}_{suffix}"),message_id,index+1,serde_json::json!({"type":"text","text":"synthetic saved-boundary part"}).to_string()]).unwrap();
+        }
+    }
+    let mut revert = serde_json::json!({"messageID":"msg_cleanup_2","snapshot":"1234567890abcdef1234567890abcdef12345678"});
+    if part {
+        revert["partID"] = serde_json::json!("prt_cleanup_2_b");
+    }
+    source
+        .execute(
+            "UPDATE session SET revert=?1 WHERE id='ses_root'",
+            [revert.to_string()],
+        )
+        .unwrap();
+    drop(source);
+    reexport_owned_fixture(&mut fixture);
+    fixture
+}
+
+fn run_saved_revert_cleanup(part: bool) -> Fixture {
+    let fixture = saved_revert_fixture(part);
+    let original_source = fs::read(fixture.root.join("source.sqlite")).unwrap();
+    let original_manifest = fixture.descriptor.manifest_json.clone();
+    let original_payload = fs::read(fixture.staged_directory.join("entry-0000.bin")).unwrap();
+    import_bundle_payload(
+        &fixture.descriptor,
+        original_payload.as_slice(),
+        &fixture.destination_database,
+        &fixture.workspace,
+    )
+    .unwrap();
+    let connection = Connection::open(&fixture.destination_database).unwrap();
+    connection
+        .pragma_update(None, "foreign_keys", true)
+        .unwrap();
+    let mut seq = 1;
+    for message_id in if part {
+        vec!["msg_cleanup_3"]
+    } else {
+        vec!["msg_cleanup_2", "msg_cleanup_3"]
+    } {
+        append_durable_event(
+            &connection,
+            seq,
+            &format!("evt_cleanup_{seq}"),
+            "message.removed.1",
+            serde_json::json!({"sessionID":"ses_root","messageID":message_id}),
+        );
+        connection
+            .execute("DELETE FROM message WHERE id=?1", [message_id])
+            .unwrap();
+        seq += 1;
+    }
+    if part {
+        append_durable_event(
+            &connection,
+            seq,
+            &format!("evt_cleanup_{seq}"),
+            "message.part.removed.1",
+            serde_json::json!({"sessionID":"ses_root","messageID":"msg_cleanup_2","partID":"prt_cleanup_2_b"}),
+        );
+        connection
+            .execute("DELETE FROM part WHERE id='prt_cleanup_2_b'", [])
+            .unwrap();
+        seq += 1;
+    }
+    let info = serde_json::json!({"id":"ses_root","slug":"synthetic-slug","projectID":"project-one","directory":fixture.workspace.to_string_lossy(),"title":"synthetic title","version":"1.18.21","agent":"build","model":{"providerID":"provider-one","id":"model-one"},"cost":0,"tokens":{"input":0,"output":0,"reasoning":0,"cache":{"read":0,"write":0}},"time":{"created":1,"updated":10}});
+    append_durable_event(
+        &connection,
+        seq,
+        "evt_cleanup_cleared",
+        "session.updated.1",
+        serde_json::json!({"sessionID":"ses_root","info":info}),
+    );
+    connection.execute("UPDATE session SET revert=NULL,time_updated=10,agent='build',model='{\"providerID\":\"provider-one\",\"id\":\"model-one\"}' WHERE id='ses_root'",[]).unwrap();
+    append_v1_user_message(
+        &connection,
+        seq + 1,
+        "evt_cleanup_new_input",
+        "msg_cleanup_continuation",
+        serde_json::json!(20),
+        20,
+        20,
+    );
+    drop(connection);
+    let current = verify_current_store(
+        &fixture.descriptor,
+        &fixture.destination_database,
+        &fixture.workspace,
+    )
+    .unwrap();
+    assert_eq!(
+        current.root_tail,
+        VerifiedRootTail::Message {
+            message_id: "msg_cleanup_continuation".into()
+        }
+    );
+    assert_eq!(fixture.descriptor.manifest_json, original_manifest);
+    assert_eq!(
+        fs::read(fixture.staged_directory.join("entry-0000.bin")).unwrap(),
+        original_payload
+    );
+    assert_eq!(
+        fs::read(fixture.root.join("source.sqlite")).unwrap(),
+        original_source
+    );
+    fixture
+}
+
+#[test]
+fn durable_souls_native_project_discovery_touch_preserves_identity() {
+    let fixture = fixture_with_baseline_event();
+    let payload = fs::read(fixture.staged_directory.join("entry-0000.bin")).unwrap();
+    import_bundle_payload(
+        &fixture.descriptor,
+        payload.as_slice(),
+        &fixture.destination_database,
+        &fixture.workspace,
+    )
+    .unwrap();
+    let connection = Connection::open(&fixture.destination_database).unwrap();
+    connection
+        .execute("UPDATE project SET time_updated=20", [])
+        .unwrap();
+    verify_current_store(
+        &fixture.descriptor,
+        &fixture.destination_database,
+        &fixture.workspace,
+    )
+    .expect("pinned fromDirectory touches project time without altering history");
+    connection
+        .execute("UPDATE project SET worktree='/substituted-workspace'", [])
+        .unwrap();
+    assert!(verify_current_store(
+        &fixture.descriptor,
+        &fixture.destination_database,
+        &fixture.workspace
+    )
+    .is_err());
+}
+
+#[test]
+fn durable_souls_saved_full_revert_cleanup_preserves_immutable_baseline() {
+    let fixture = run_saved_revert_cleanup(false);
+    let connection = Connection::open(&fixture.destination_database).unwrap();
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT count(*) FROM message WHERE id IN ('msg_cleanup_2','msg_cleanup_3')",
+                [],
+                |row| row.get::<_, u64>(0)
+            )
+            .unwrap(),
+        0
+    );
+    connection
+        .execute("DELETE FROM message WHERE id='msg_one'", [])
+        .unwrap();
+    assert!(
+        verify_current_store(
+            &fixture.descriptor,
+            &fixture.destination_database,
+            &fixture.workspace
+        )
+        .is_err(),
+        "a deleted preserved prefix needs its own exact native authority"
+    );
+}
+
+#[test]
+fn durable_souls_saved_part_revert_cleanup_preserves_prefix_parts() {
+    let fixture = run_saved_revert_cleanup(true);
+    let connection = Connection::open(&fixture.destination_database).unwrap();
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT count(*) FROM part WHERE id='prt_cleanup_2_a'",
+                [],
+                |row| row.get::<_, u64>(0)
+            )
+            .unwrap(),
+        1
+    );
+    connection
+        .execute("DELETE FROM event WHERE id='evt_cleanup_cleared'", [])
+        .unwrap();
+    assert!(
+        verify_current_store(
+            &fixture.descriptor,
+            &fixture.destination_database,
+            &fixture.workspace
+        )
+        .is_err(),
+        "missing native clear or sequence evidence refuses current qualification"
+    );
+}
+
+#[test]
+fn durable_souls_rehearsal_pipeline_refuses_unreceipted_extra_native_rows() {
+    let fixture = fixture();
+    let payload = fs::read(fixture.staged_directory.join("entry-0000.bin")).unwrap();
+    import_bundle_payload(
+        &fixture.descriptor,
+        payload.as_slice(),
+        &fixture.destination_database,
+        &fixture.workspace,
+    )
+    .unwrap();
+    let connection = Connection::open(&fixture.destination_database).unwrap();
+    connection.execute("INSERT INTO message(id,session_id,time_created,time_updated,data) VALUES ('msg_unreceipted','ses_root',3,3,'{\"role\":\"user\",\"opaque\":\"unreceipted extra history\"}')",[]).unwrap();
+    drop(connection);
+    assert!(
+        import_bundle_payload(
+            &fixture.descriptor,
+            payload.as_slice(),
+            &fixture.destination_database,
+            &fixture.workspace
+        )
+        .is_err(),
+        "exact repair cannot certify an unreceipted extra graph as the imported baseline"
+    );
+    let connection = Connection::open(&fixture.destination_database).unwrap();
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT data FROM message WHERE id='msg_unreceipted'",
+                [],
+                |row| row.get::<_, String>(0)
+            )
+            .unwrap(),
+        "{\"role\":\"user\",\"opaque\":\"unreceipted extra history\"}"
+    );
+}
+
+#[test]
+fn durable_souls_rehearsal_pipeline_complete_native_rows_assets_and_reader_context() {
+    let fixture = fixture();
+    let source_before = fs::read(fixture.root.join("source.sqlite")).unwrap();
+    let payload = fs::read(fixture.staged_directory.join("entry-0000.bin")).unwrap();
+    let imported = import_bundle_payload(
+        &fixture.descriptor,
+        payload.as_slice(),
+        &fixture.destination_database,
+        &fixture.workspace,
+    )
+    .unwrap();
+    let home = fixture.destination_database.ancestors().nth(4).unwrap();
+    let data_home = home.join(".local/share");
+    let config_home = home.join(".config");
+    fs::create_dir_all(&config_home).unwrap();
+    let reader = InstalledStoreReaderContext {
+        database_path: &fixture.destination_database,
+        workspace_root: &fixture.workspace,
+        provider_uid: rehearsal_current_identity().0,
+        provider_gid: rehearsal_current_identity().1,
+        home,
+        xdg_data_home: &data_home,
+        xdg_config_home: &config_home,
+        cwd: &fixture.workspace,
+    };
+    let read = verify_installed_store(&fixture.descriptor, &reader).unwrap();
+    assert_eq!(read.structural_sha256, imported.structural_sha256);
+    let native_payload: serde_json::Value = serde_json::from_slice(&payload).unwrap();
+    let connection = Connection::open(&fixture.destination_database).unwrap();
+    for expected in native_payload["rows"].as_array().unwrap() {
+        let row: SerializedRow = serde_json::from_value(expected.clone()).unwrap();
+        assert_eq!(
+            read_row_by_key(&connection, &row.table, &row.key).unwrap(),
+            row
+        );
+    }
+    let mut wrong = reader;
+    wrong.provider_uid += 1;
+    wrong.xdg_data_home = &config_home;
+    assert!(verify_installed_store(&fixture.descriptor, &wrong).is_err());
+    assert_eq!(
+        fs::read(fixture.root.join("source.sqlite")).unwrap(),
+        source_before
+    );
+    streamed_provider_import_hashes_the_pipe_and_rolls_back_a_truncated_payload();
+    destination_capacity_is_checked_before_parent_or_database_creation();
+    conflicting_primary_key_rolls_back_without_overwriting_destination_data();
+}
+
+fn rehearsal_current_identity() -> (u32, u32) {
+    #[cfg(unix)]
+    {
+        unsafe { (libc::geteuid(), libc::getegid()) }
+    }
+    #[cfg(not(unix))]
+    {
+        (0, 0)
+    }
 }
 
 #[test]
@@ -2492,4 +2835,312 @@ fn durable_v2_event_schema_accepts_each_pinned_kind_and_schema_authorized_json()
             "invalid nested or optional field accepted for {event_type}"
         );
     }
+}
+
+fn write_owned_git_object(store: &Path, kind: &str, bytes: &[u8]) -> String {
+    use sha2::Digest;
+    use std::io::Write;
+    let mut raw = format!("{kind} {}\0", bytes.len()).into_bytes();
+    raw.extend_from_slice(bytes);
+    let oid = hex::encode(sha1::Sha1::digest(&raw));
+    let mut encoder = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+    encoder.write_all(&raw).unwrap();
+    let directory = store.join(&oid[..2]);
+    fs::create_dir_all(&directory).unwrap();
+    fs::write(directory.join(&oid[2..]), encoder.finish().unwrap()).unwrap();
+    oid
+}
+
+#[test]
+fn durable_souls_rehearsal_pipeline_transfers_exact_native_snapshot_closure() {
+    use sha2::Digest;
+    let mut fixture = saved_revert_fixture(false);
+    let bucket_id = hex::encode(sha1::Sha1::digest(
+        fixture
+            .workspace
+            .canonicalize()
+            .unwrap()
+            .to_string_lossy()
+            .as_bytes(),
+    ));
+    let source_store = fixture
+        .root
+        .join("snapshot/project-one")
+        .join(&bucket_id)
+        .join("objects");
+    let body = b"synthetic retained snapshot bytes";
+    let blob = write_owned_git_object(&source_store, "blob", body);
+    let mut entry = b"100644 asset.txt\0".to_vec();
+    entry.extend(hex::decode(&blob).unwrap());
+    let nested = write_owned_git_object(&source_store, "tree", &entry);
+    let mut root_entry = b"40000 nested\0".to_vec();
+    root_entry.extend(hex::decode(&nested).unwrap());
+    let tree = write_owned_git_object(&source_store, "tree", &root_entry);
+    let source = Connection::open(fixture.root.join("source.sqlite")).unwrap();
+    source
+        .execute(
+            "UPDATE session SET revert=?1 WHERE id='ses_root'",
+            [serde_json::json!({"messageID":"msg_cleanup_2","snapshot":tree}).to_string()],
+        )
+        .unwrap();
+    drop(source);
+    let source = Connection::open(fixture.root.join("source.sqlite")).unwrap();
+    source.execute("UPDATE part SET data=json_set(data,'$.type','step-start','$.snapshot',?1) WHERE id=(SELECT id FROM part LIMIT 1)",[&tree]).unwrap();
+    drop(source);
+    let before = fs::read(fixture.root.join("source.sqlite")).unwrap();
+    reexport_owned_fixture(&mut fixture);
+    let manifest: OpenCodeTransferManifest =
+        serde_json::from_str(&fixture.descriptor.manifest_json).unwrap();
+    assert_eq!(
+        manifest.saved_snapshots[0].availability,
+        freshell_sessions::opencode_transfer::SavedSnapshotAvailability::RetainedClosure
+    );
+    assert_eq!(manifest.saved_snapshots[0].objects.len(), 3);
+    let payload = fs::read(fixture.staged_directory.join("entry-0000.bin")).unwrap();
+    import_bundle_payload(
+        &fixture.descriptor,
+        payload.as_slice(),
+        &fixture.destination_database,
+        &fixture.workspace,
+    )
+    .unwrap();
+    let destination_store = fixture
+        .destination_database
+        .parent()
+        .unwrap()
+        .join("snapshot/project-one")
+        .join(&bucket_id)
+        .join("objects");
+    for oid in [&tree, &nested, &blob] {
+        assert_eq!(
+            fs::read(destination_store.join(&oid[..2]).join(&oid[2..])).unwrap(),
+            fs::read(source_store.join(&oid[..2]).join(&oid[2..])).unwrap()
+        );
+    }
+    verify_current_store(
+        &fixture.descriptor,
+        &fixture.destination_database,
+        &fixture.workspace,
+    )
+    .unwrap();
+    let conflict = destination_store.join(&blob[..2]).join(&blob[2..]);
+    fs::write(&conflict, b"conflicting retained object").unwrap();
+    assert!(import_bundle_payload(
+        &fixture.descriptor,
+        payload.as_slice(),
+        &fixture.destination_database,
+        &fixture.workspace
+    )
+    .is_err());
+    assert_eq!(fs::read(&conflict).unwrap(), b"conflicting retained object");
+    assert!(verify_current_store(
+        &fixture.descriptor,
+        &fixture.destination_database,
+        &fixture.workspace
+    )
+    .is_err());
+    assert_eq!(
+        fs::read(fixture.root.join("source.sqlite")).unwrap(),
+        before
+    );
+    fs::remove_file(source_store.join(&blob[..2]).join(&blob[2..])).unwrap();
+    assert!(export_exact_session(
+        &HostOpenCodeInventory::new(fixture.root.join("source.sqlite"))
+            .with_trusted_mount_for_selected_session(fixture.workspace.clone()),
+        "ses_root",
+        ExportOptions::new(fixture.root.join("broken-closure"))
+    )
+    .is_err());
+}
+
+#[test]
+fn durable_souls_rehearsal_pipeline_qualified_copy_retains_original_source_authority() {
+    use freshell_sessions::opencode_transfer::{
+        capture_qualified_snapshot, qualify_existing_snapshot,
+    };
+    let fixture = fixture();
+    let source_path = fixture.root.join("source.sqlite");
+    let source_before = fs::read(&source_path).unwrap();
+    let inventory = HostOpenCodeInventory::new(source_path.clone())
+        .with_trusted_mount_for_selected_session(fixture.workspace.clone());
+    let roots = vec!["ses_root".to_string()];
+    let snapshot_path = fixture.root.join("qualified-source.sqlite");
+    let qualified = capture_qualified_snapshot(
+        &inventory,
+        &roots,
+        &snapshot_path,
+        ExportOptions::new(fixture.root.join("capture-extractions")),
+    )
+    .unwrap();
+    let ordinary = export_exact_session(
+        &HostOpenCodeInventory::new(snapshot_path.clone())
+            .with_trusted_mount_for_selected_session(fixture.workspace.clone()),
+        "ses_root",
+        ExportOptions::new(fixture.root.join("ordinary-copy-extractions")),
+    )
+    .unwrap();
+    let exported = export_exact_session(
+        &qualified.inventory(),
+        "ses_root",
+        ExportOptions::new(fixture.root.join("qualified-copy-extractions")),
+    )
+    .unwrap();
+    assert_eq!(
+        exported.manifest().source_store_id,
+        fixture.descriptor.source_store_id,
+        "a qualified consistent copy keeps the independently resolved original source identity"
+    );
+    assert_ne!(
+        ordinary.manifest().source_store_id,
+        exported.manifest().source_store_id,
+        "an unqualified copy cannot inherit provenance from a path string"
+    );
+    assert_eq!(
+        exported.manifest().generation,
+        fixture.descriptor.source_generation
+    );
+    let verified = qualify_existing_snapshot(
+        &inventory,
+        &roots,
+        &snapshot_path,
+        ExportOptions::new(fixture.root.join("existing-copy-extractions")),
+    )
+    .unwrap();
+    assert_eq!(
+        verified.receipt().source_store_id,
+        qualified.receipt().source_store_id
+    );
+    assert_eq!(fs::read(&source_path).unwrap(), source_before);
+    let snapshot = Connection::open(&snapshot_path).unwrap();
+    snapshot
+        .execute(
+            "UPDATE part SET data='{\"type\":\"text\",\"text\":\"substituted private copy\"}'",
+            [],
+        )
+        .unwrap();
+    drop(snapshot);
+    assert!(export_exact_session(
+        &qualified.inventory(),
+        "ses_root",
+        ExportOptions::new(fixture.root.join("changed-copy-extractions"))
+    )
+    .is_err());
+    assert!(qualify_existing_snapshot(
+        &inventory,
+        &roots,
+        &snapshot_path,
+        ExportOptions::new(fixture.root.join("divergent-copy-extractions"))
+    )
+    .is_err());
+    assert_eq!(fs::read(&source_path).unwrap(), source_before);
+}
+
+#[test]
+fn durable_souls_rehearsal_pipeline_refuses_source_reference_digest_root_and_copy_faults() {
+    let mut fixture = fixture();
+    let asset = fixture.workspace.join("rehearsal-asset.txt");
+    fs::write(&asset, b"synthetic immutable workspace asset").unwrap();
+    let path = asset
+        .canonicalize()
+        .unwrap()
+        .to_string_lossy()
+        .replace('\\', "/");
+    let url = if cfg!(windows) {
+        format!("file:///{path}")
+    } else {
+        format!("file://{path}")
+    };
+    let source = Connection::open(fixture.root.join("source.sqlite")).unwrap();
+    source.execute("UPDATE part SET data=?1",[serde_json::json!({"type":"file","mime":"text/plain","filename":"rehearsal-asset.txt","url":url}).to_string()]).unwrap();
+    drop(source);
+    reexport_owned_fixture(&mut fixture);
+    let before = fs::read(fixture.root.join("source.sqlite")).unwrap();
+    let payload = fs::read(fixture.staged_directory.join("entry-0000.bin")).unwrap();
+    let manifest: OpenCodeTransferManifest =
+        serde_json::from_str(&fixture.descriptor.manifest_json).unwrap();
+    assert_eq!(manifest.assets.len(), 1);
+    import_bundle_payload(
+        &fixture.descriptor,
+        payload.as_slice(),
+        &fixture.destination_database,
+        &fixture.workspace,
+    )
+    .unwrap();
+    for (label, descriptor) in [
+        ("root", {
+            let mut d = fixture.descriptor.clone();
+            d.root_session_id = "ses_substituted_root".into();
+            d
+        }),
+        ("digest", {
+            let mut d = fixture.descriptor.clone();
+            d.files[0].sha256 = "0".repeat(64);
+            d.bundle_sha256 = opencode_transfer_bundle_digest(&d.manifest_json, &d.files);
+            d
+        }),
+        ("source", {
+            let mut d = fixture.descriptor.clone();
+            d.source_store_id = "f".repeat(64);
+            d
+        }),
+    ] {
+        let destination = fixture.root.join(format!("refused-{label}/opencode.db"));
+        assert!(import_bundle_payload(
+            &descriptor,
+            payload.as_slice(),
+            &destination,
+            &fixture.workspace
+        )
+        .is_err());
+        assert!(
+            !destination.exists(),
+            "binding refusal must precede destination writes"
+        );
+    }
+    struct FailedCopy;
+    impl std::io::Read for FailedCopy {
+        fn read(&mut self, _bytes: &mut [u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::other(
+                "deterministic owned input-copy failure",
+            ))
+        }
+    }
+    let destination = fixture.root.join("copy-failure/opencode.db");
+    assert!(import_bundle_payload(
+        &fixture.descriptor,
+        FailedCopy,
+        &destination,
+        &fixture.workspace
+    )
+    .is_err());
+    let connection = Connection::open(&destination).unwrap();
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT count(*) FROM sqlite_master WHERE type='table'",
+                [],
+                |row| row.get::<_, u64>(0)
+            )
+            .unwrap(),
+        0
+    );
+    fs::write(&asset, b"changed workspace reference after export").unwrap();
+    let destination = fixture.root.join("asset-failure/opencode.db");
+    assert!(import_bundle_payload(
+        &fixture.descriptor,
+        payload.as_slice(),
+        &destination,
+        &fixture.workspace
+    )
+    .is_err());
+    assert!(verify_current_store(
+        &fixture.descriptor,
+        &fixture.destination_database,
+        &fixture.workspace
+    )
+    .is_err());
+    assert_eq!(
+        fs::read(fixture.root.join("source.sqlite")).unwrap(),
+        before
+    );
 }

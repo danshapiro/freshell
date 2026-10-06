@@ -34,7 +34,8 @@ use freshell_runtime_protocol::{
     MAX_OPENCODE_TRANSFER_CHUNK_BYTES, OPENCODE_TRANSFER_DESTINATION_DB,
 };
 use freshell_sessions::opencode_transfer::{
-    export_exact_session, ExportOptions, HostOpenCodeInventory, OpenCodeNativeSnapshot,
+    capture_qualified_batch, export_exact_session, ExportOptions, HostOpenCodeInventory,
+    OpenCodeNativeSnapshot,
 };
 use sha2::{Digest, Sha256};
 use std::{
@@ -158,7 +159,7 @@ fn validate_native_identity_wait(
 }
 
 #[derive(Debug)]
-enum CanonicalRootOwnerSelection<'a> {
+pub(crate) enum CanonicalRootOwnerSelection<'a> {
     Chosen(&'a StoppedRepairOwnerCandidate),
     ChoiceRequired(Vec<SoulId>),
 }
@@ -175,7 +176,7 @@ enum StoppedRepairRootPreflight {
     OwnerChoiceRequired(Vec<SoulId>),
 }
 
-fn choose_canonical_root_owner<'a>(
+pub(crate) fn choose_canonical_root_owner<'a>(
     candidates: &'a [StoppedRepairOwnerCandidate],
     source_store_id: &str,
     root_session_id: &str,
@@ -289,12 +290,14 @@ fn stopped_repair_blocked(reason_code: &'static str) -> RuntimeError {
 }
 
 fn pending_stopped_repair_result(
+    scope_id: &str,
     operation_id: freshell_runtime_protocol::RequestId,
     target_count: usize,
     progress: BTreeMap<String, RestoreLostSoulRootResult>,
 ) -> RestoreLostSoulsResult {
     RestoreLostSoulsResult {
         operation_id,
+        scope_id: scope_id.to_string(),
         status: SoulRepairStatus::Pending,
         repaired_target_count: 0,
         total_target_count: target_count as u32,
@@ -303,12 +306,14 @@ fn pending_stopped_repair_result(
 }
 
 fn owner_decision_stopped_repair_result(
+    scope_id: &str,
     operation_id: freshell_runtime_protocol::RequestId,
     target_count: usize,
     progress: BTreeMap<String, RestoreLostSoulRootResult>,
 ) -> RestoreLostSoulsResult {
     RestoreLostSoulsResult {
         operation_id,
+        scope_id: scope_id.to_string(),
         status: SoulRepairStatus::OwnerDecisionRequired,
         repaired_target_count: 0,
         total_target_count: target_count as u32,
@@ -469,6 +474,8 @@ fn verified_stopped_repair_receipt(
         || imported.bundle_sha256 != descriptor.bundle_sha256
         || imported.row_count != manifest.row_count as u64
         || imported.asset_count != manifest.assets.len() as u64
+        || imported.saved_snapshot_summary
+            != freshell_sessions::opencode_transfer::saved_snapshot_summary(manifest)
         || imported.structural_sha256.is_empty()
         || readable.version != 1
         || readable.transfer_id != descriptor.transfer_id
@@ -486,6 +493,7 @@ fn verified_stopped_repair_receipt(
         || readable.cwd != cwd.to_string_lossy()
         || readable.row_count != imported.row_count
         || readable.asset_count != imported.asset_count
+        || readable.saved_snapshot_summary != imported.saved_snapshot_summary
         || readable.structural_sha256 != imported.structural_sha256
         || !is_lower_hex_sha256(&imported.structural_sha256)
     {
@@ -538,12 +546,170 @@ fn verified_stopped_repair_receipt(
 }
 
 impl Supervisor {
+    pub(crate) async fn preflight_lost_souls(
+        &self,
+        request: freshell_runtime_protocol::PreflightLostSoulsRequest,
+    ) -> Result<freshell_runtime_protocol::RepairBatchScope, RuntimeError> {
+        self.registry
+            .assert_epoch(request.expected_control_epoch)
+            .map_err(map_registry)?;
+        let inventory = tokio::task::spawn_blocking(
+            HostOpenCodeInventory::from_process_environment_discovering_channels,
+        )
+        .await
+        .map_err(|_| stopped_repair_blocked("source_inventory_worker_failed"))?
+        .map_err(|_| stopped_repair_blocked("source_inventory_unreadable"))?;
+        self.preflight_lost_souls_from_inventory(request, inventory)
+            .await
+    }
+
+    pub(crate) async fn preflight_lost_souls_from_inventory(
+        &self,
+        request: freshell_runtime_protocol::PreflightLostSoulsRequest,
+        inventory: HostOpenCodeInventory,
+    ) -> Result<freshell_runtime_protocol::RepairBatchScope, RuntimeError> {
+        self.registry
+            .assert_epoch(request.expected_control_epoch)
+            .map_err(map_registry)?;
+        let targets = self
+            .registry
+            .repair_scope_members(request.source.clone())
+            .await
+            .map_err(map_registry)?;
+        let mut groups = BTreeMap::<
+            String,
+            Vec<(
+                freshell_runtime_protocol::LostSoulRepairTarget,
+                RecoveryContext,
+            )>,
+        >::new();
+        for member in &targets {
+            let context = self
+                .registry
+                .recovery_context(member.target.soul_id.clone())
+                .await
+                .map_err(map_registry)?;
+            if context.identity_revision != member.identity_revision
+                || context.intent_revision != member.target.expected_intent_revision
+                || context.provider_store_id != member.provider_store_id
+                || context.native_import_revision != member.native_import_revision
+                || context.evidence_revision != member.evidence_revision
+            {
+                return Err(stopped_repair_blocked(
+                    "target_scope_changed_during_preflight",
+                ));
+            }
+            groups
+                .entry(member.root_session_id.clone())
+                .or_default()
+                .push((member.target.clone(), context));
+        }
+        let inventory = self
+            .capture_stopped_opencode_batch(&groups, inventory)
+            .await?;
+        let mut roots = Vec::new();
+        for (root, contexts) in &groups {
+            let snapshot = self
+                .export_stopped_opencode_root(root, contexts, &inventory)
+                .await?;
+            let manifest = snapshot.manifest();
+            if manifest.source_store_id != request.source.source_store_id {
+                return Err(stopped_repair_blocked("source_store_reference_mismatch"));
+            }
+            let candidates = self
+                .registry
+                .stopped_repair_owner_candidates(root.clone())
+                .await
+                .map_err(map_registry)?;
+            let selection = choose_canonical_root_owner(
+                &candidates,
+                &manifest.source_store_id,
+                root,
+                &manifest.generation,
+                None,
+            )
+            .map_err(|_| stopped_repair_blocked("canonical_owner_receipt_conflict"))?;
+            let (eligible_owners, canonical_soul_id) = match selection {
+                CanonicalRootOwnerSelection::Chosen(owner) => {
+                    (vec![owner.soul_id.clone()], Some(owner.soul_id.clone()))
+                }
+                CanonicalRootOwnerSelection::ChoiceRequired(owners) => (owners, None),
+            };
+            if eligible_owners.is_empty()
+                || eligible_owners
+                    .iter()
+                    .any(|owner| !contexts.iter().any(|(target, _)| target.soul_id == *owner))
+            {
+                return Err(stopped_repair_blocked(
+                    "canonical_owner_outside_exact_batch",
+                ));
+            }
+            roots.push(freshell_runtime_protocol::RepairBatchRoot {
+                root_session_id: root.clone(),
+                graph_digest: manifest.generation.clone(),
+                eligible_owners,
+                canonical_soul_id,
+            });
+        }
+        let mut scope = freshell_runtime_protocol::RepairBatchScope {
+            scope_id: String::new(),
+            source_store_id: request.source.source_store_id,
+            source_fingerprint: String::new(),
+            targets,
+            roots,
+        };
+        scope.source_fingerprint = scope.source_descriptor_digest();
+        scope.scope_id = scope.descriptor_digest();
+        // Preflight creates no registry operation, and a concurrent change
+        // must invalidate the preview before it can be presented for choices.
+        if self
+            .registry
+            .repair_scope_members(scope.source_selection())
+            .await
+            .map_err(map_registry)?
+            != scope.targets
+        {
+            return Err(stopped_repair_blocked(
+                "target_scope_changed_during_preflight",
+            ));
+        }
+        Ok(scope)
+    }
+
     pub(crate) async fn restore_lost_souls(
         &self,
         operation_id: freshell_runtime_protocol::RequestId,
         request: RestoreLostSoulsRequest,
     ) -> Result<RestoreLostSoulsResult, RuntimeError> {
-        request.validate_exact_batch()?;
+        let scope = match self
+            .registry
+            .stopped_repair_operation_scope(operation_id.clone())
+            .await
+            .map_err(map_registry)?
+        {
+            Some(scope) => scope,
+            None => {
+                for target in &request.targets {
+                    let context = self
+                        .registry
+                        .recovery_context(target.soul_id.clone())
+                        .await
+                        .map_err(map_registry)?;
+                    if context.intent_revision != target.expected_intent_revision {
+                        return Err(map_registry(RegistryError::StaleIntentRevision {
+                            expected: target.expected_intent_revision,
+                            current: context.intent_revision,
+                        }));
+                    }
+                }
+                self.preflight_lost_souls(freshell_runtime_protocol::PreflightLostSoulsRequest {
+                    source: request.source.clone(),
+                    expected_control_epoch: request.expected_control_epoch,
+                })
+                .await?
+            }
+        };
+        request.validate_exact_batch(&scope)?;
         let targets = request.targets.clone();
         let owner_choices = request
             .canonical_owners
@@ -552,7 +718,7 @@ impl Supervisor {
             .collect::<BTreeMap<_, _>>();
         let operation = self
             .registry
-            .prepare_stopped_repair_operation(operation_id.clone(), request)
+            .prepare_stopped_repair_operation(operation_id.clone(), request, scope.clone())
             .await
             .map_err(map_registry)?;
         if operation.status == "complete" {
@@ -662,8 +828,9 @@ impl Supervisor {
                 )
             })
             .collect::<BTreeMap<_, _>>();
-        if groups.len() != 7 {
+        if groups.len() != scope.roots.len() {
             return Ok(pending_stopped_repair_result(
+                &scope.scope_id,
                 operation_id,
                 targets.len(),
                 progress,
@@ -685,6 +852,21 @@ impl Supervisor {
             Ok(Ok(inventory)) => inventory,
             _ => {
                 return Ok(pending_stopped_repair_result(
+                    &scope.scope_id,
+                    operation_id,
+                    targets.len(),
+                    progress,
+                ))
+            }
+        };
+        let inventory = match self
+            .capture_stopped_opencode_batch(&groups, inventory)
+            .await
+        {
+            Ok(inventory) => inventory,
+            Err(_) => {
+                return Ok(pending_stopped_repair_result(
+                    &scope.scope_id,
                     operation_id,
                     targets.len(),
                     progress,
@@ -707,6 +889,14 @@ impl Supervisor {
                 .await
             {
                 Ok(StoppedRepairRootPreflight::Ready(prepared)) => {
+                    if prepared.snapshot.manifest().source_store_id != scope.source_store_id
+                        || !scope.roots.iter().any(|scoped| {
+                            scoped.root_session_id == *root
+                                && scoped.graph_digest == prepared.snapshot.manifest().generation
+                        })
+                    {
+                        return Err(stopped_repair_blocked("source_scope_changed_before_import"));
+                    }
                     progress
                         .get_mut(root)
                         .expect("root progress initialized")
@@ -738,6 +928,7 @@ impl Supervisor {
 
         if owner_decision_required {
             return Ok(owner_decision_stopped_repair_result(
+                &scope.scope_id,
                 operation_id,
                 targets.len(),
                 progress,
@@ -745,6 +936,7 @@ impl Supervisor {
         }
         if preflight_blocked || prepared_roots.len() != groups.len() {
             return Ok(pending_stopped_repair_result(
+                &scope.scope_id,
                 operation_id,
                 targets.len(),
                 progress,
@@ -782,6 +974,7 @@ impl Supervisor {
                         .expect("root progress initialized")
                         .reason_code = stopped_repair_error_reason_code(&error);
                     return Ok(pending_stopped_repair_result(
+                        &scope.scope_id,
                         operation_id,
                         targets.len(),
                         progress,
@@ -794,12 +987,13 @@ impl Supervisor {
             .stopped_repair_root_receipts(operation_id.clone())
             .await
             .map_err(map_registry)?;
-        if receipts.len() != 7
+        if receipts.len() != scope.roots.len()
             || receipts
                 .iter()
                 .any(|receipt| !verified_roots.iter().any(|current| current == receipt))
         {
             return Ok(pending_stopped_repair_result(
+                &scope.scope_id,
                 operation_id,
                 targets.len(),
                 progress,
@@ -816,7 +1010,7 @@ impl Supervisor {
         .map_err(map_registry)
     }
 
-    async fn preflight_stopped_opencode_root(
+    async fn export_stopped_opencode_root(
         &self,
         root_session_id: &str,
         target_contexts: &[(
@@ -824,9 +1018,7 @@ impl Supervisor {
             RecoveryContext,
         )],
         inventory: &HostOpenCodeInventory,
-        all_targets: &[freshell_runtime_protocol::LostSoulRepairTarget],
-        owner_choice: Option<&SoulId>,
-    ) -> Result<StoppedRepairRootPreflight, RuntimeError> {
+    ) -> Result<OpenCodeNativeSnapshot, RuntimeError> {
         let mut trusted_workspaces = Vec::<PathBuf>::new();
         for (_, context) in target_contexts {
             let workspace = context
@@ -860,6 +1052,58 @@ impl Supervisor {
         .await
         .map_err(|_| stopped_repair_blocked("source_export_worker_failed"))?
         .map_err(|_| stopped_repair_blocked("source_not_exactly_resolvable"))?;
+        Ok(snapshot)
+    }
+
+    async fn capture_stopped_opencode_batch(
+        &self,
+        groups: &BTreeMap<
+            String,
+            Vec<(
+                freshell_runtime_protocol::LostSoulRepairTarget,
+                RecoveryContext,
+            )>,
+        >,
+        mut inventory: HostOpenCodeInventory,
+    ) -> Result<HostOpenCodeInventory, RuntimeError> {
+        for (_, context) in groups.values().flatten() {
+            let workspace = context
+                .terminal
+                .as_ref()
+                .map(|terminal| PathBuf::from(&terminal.workspace_path))
+                .ok_or_else(|| stopped_repair_blocked("terminal_workspace_missing"))?
+                .canonicalize()
+                .map_err(|_| stopped_repair_blocked("terminal_workspace_missing"))?;
+            inventory = inventory.with_trusted_mount_for_selected_session(workspace);
+        }
+        let roots = groups.keys().cloned().collect::<Vec<_>>();
+        let extraction_root = self
+            .config
+            .runtime_root
+            .join("stopped-opencode-repair-extractions");
+        tokio::task::spawn_blocking(move || {
+            capture_qualified_batch(&inventory, &roots, ExportOptions::new(extraction_root))
+                .map(|capture| capture.inventory())
+        })
+        .await
+        .map_err(|_| stopped_repair_blocked("source_capture_worker_failed"))?
+        .map_err(|_| stopped_repair_blocked("source_not_exactly_resolvable"))
+    }
+
+    async fn preflight_stopped_opencode_root(
+        &self,
+        root_session_id: &str,
+        target_contexts: &[(
+            freshell_runtime_protocol::LostSoulRepairTarget,
+            RecoveryContext,
+        )],
+        inventory: &HostOpenCodeInventory,
+        all_targets: &[freshell_runtime_protocol::LostSoulRepairTarget],
+        owner_choice: Option<&SoulId>,
+    ) -> Result<StoppedRepairRootPreflight, RuntimeError> {
+        let snapshot = self
+            .export_stopped_opencode_root(root_session_id, target_contexts, inventory)
+            .await?;
         let manifest = snapshot.manifest().clone();
         if manifest.root_session_id != root_session_id
             || manifest.provider_schema != "opencode-1.18.21"

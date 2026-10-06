@@ -603,11 +603,107 @@ pub struct LostSoulRepairTarget {
 pub struct CanonicalOwnerChoice {
     pub root_session_id: String,
     pub soul_id: SoulId,
+    pub expected_intent_revision: u64,
+}
+
+/// Exact source selection. Its members are independently resolved by the
+/// supervisor; callers cannot supply the expected set of lost souls.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RepairBatchSourceSelection {
+    pub source_store_id: String,
+    pub root_session_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RepairBatchTarget {
+    pub target: LostSoulRepairTarget,
+    pub provider_store_id: String,
+    pub root_session_id: String,
+    pub incident_revision: u64,
+    pub identity_revision: u64,
+    pub native_import_revision: u64,
+    pub evidence_revision: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RepairBatchRoot {
+    pub root_session_id: String,
+    pub graph_digest: String,
+    pub eligible_owners: Vec<SoulId>,
+    pub canonical_soul_id: Option<SoulId>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RepairBatchScope {
+    pub scope_id: String,
+    pub source_store_id: String,
+    pub source_fingerprint: String,
+    pub targets: Vec<RepairBatchTarget>,
+    pub roots: Vec<RepairBatchRoot>,
+}
+
+impl RepairBatchScope {
+    pub fn source_descriptor_digest(&self) -> String {
+        let mut roots = self
+            .roots
+            .iter()
+            .map(|root| (&root.root_session_id, &root.graph_digest))
+            .collect::<Vec<_>>();
+        roots.sort();
+        hex::encode(Sha256::digest(
+            serde_json::to_vec(&(&self.source_store_id, roots))
+                .expect("source descriptor serializes"),
+        ))
+    }
+    pub fn source_selection(&self) -> RepairBatchSourceSelection {
+        RepairBatchSourceSelection {
+            source_store_id: self.source_store_id.clone(),
+            root_session_ids: self
+                .roots
+                .iter()
+                .map(|root| root.root_session_id.clone())
+                .collect(),
+        }
+    }
+
+    pub fn descriptor_digest(&self) -> String {
+        let mut descriptor = self.clone();
+        descriptor.scope_id.clear();
+        descriptor.targets.sort_by(|left, right| {
+            left.target
+                .soul_id
+                .as_str()
+                .cmp(right.target.soul_id.as_str())
+        });
+        descriptor
+            .roots
+            .sort_by(|left, right| left.root_session_id.cmp(&right.root_session_id));
+        for root in &mut descriptor.roots {
+            root.eligible_owners
+                .sort_by(|left, right| left.as_str().cmp(right.as_str()));
+        }
+        hex::encode(Sha256::digest(
+            serde_json::to_vec(&descriptor).expect("scope descriptor serializes"),
+        ))
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PreflightLostSoulsRequest {
+    pub source: RepairBatchSourceSelection,
+    pub expected_control_epoch: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct RestoreLostSoulsRequest {
+    pub scope_id: String,
+    pub source: RepairBatchSourceSelection,
     pub targets: Vec<LostSoulRepairTarget>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub canonical_owners: Vec<CanonicalOwnerChoice>,
@@ -616,10 +712,20 @@ pub struct RestoreLostSoulsRequest {
 }
 
 impl RestoreLostSoulsRequest {
-    pub fn validate_exact_batch(&self) -> Result<(), RuntimeError> {
+    pub fn validate_payload(&self) -> Result<(), RuntimeError> {
         let mut souls = std::collections::BTreeSet::new();
         let mut incidents = std::collections::BTreeSet::new();
-        if self.targets.len() != 8
+        if self.targets.is_empty()
+            || !is_lower_hex_sha256(&self.scope_id)
+            || !is_lower_hex_sha256(&self.source.source_store_id)
+            || self.source.root_session_ids.is_empty()
+            || self
+                .source
+                .root_session_ids
+                .iter()
+                .collect::<std::collections::BTreeSet<_>>()
+                .len()
+                != self.source.root_session_ids.len()
             || self.targets.iter().any(|target| {
                 target.expected_intent_revision == 0
                     || !souls.insert(target.soul_id.as_str())
@@ -628,7 +734,7 @@ impl RestoreLostSoulsRequest {
         {
             return Err(RuntimeError::new(
                 RuntimeErrorCode::InvalidRequest,
-                "stopped restoration requires exactly eight distinct soul and incident targets with positive intent revisions",
+                "stopped restoration requires a qualified scope and distinct revisioned soul and incident targets",
             ));
         }
         let mut roots = std::collections::BTreeSet::new();
@@ -648,6 +754,95 @@ impl RestoreLostSoulsRequest {
         }
         Ok(())
     }
+
+    pub fn validate_exact_batch(&self, scope: &RepairBatchScope) -> Result<(), RuntimeError> {
+        self.validate_payload()?;
+        let refused = || {
+            RuntimeError::new(
+                RuntimeErrorCode::InvalidRequest,
+                "stopped restoration differs from the independently resolved exact scope",
+            )
+        };
+        let mut expected = scope
+            .targets
+            .iter()
+            .map(|member| member.target.clone())
+            .collect::<Vec<_>>();
+        let mut submitted = self.targets.clone();
+        expected.sort_by(|left, right| left.soul_id.as_str().cmp(right.soul_id.as_str()));
+        submitted.sort_by(|left, right| left.soul_id.as_str().cmp(right.soul_id.as_str()));
+        let mut selection = self.source.clone();
+        selection.root_session_ids.sort();
+        let mut expected_selection = scope.source_selection();
+        expected_selection.root_session_ids.sort();
+        if self.scope_id != scope.scope_id
+            || scope.scope_id != scope.descriptor_digest()
+            || scope.source_fingerprint != scope.source_descriptor_digest()
+            || expected != submitted
+            || selection != expected_selection
+            || scope
+                .roots
+                .iter()
+                .map(|root| root.root_session_id.as_str())
+                .collect::<std::collections::BTreeSet<_>>()
+                .len()
+                != scope.roots.len()
+            || scope.targets.iter().any(|member| {
+                !scope
+                    .roots
+                    .iter()
+                    .any(|root| root.root_session_id == member.root_session_id)
+            })
+            || scope
+                .targets
+                .iter()
+                .any(|member| member.provider_store_id.trim().is_empty())
+            || scope.roots.iter().any(|root| {
+                !is_lower_hex_sha256(&root.graph_digest)
+                    || root.eligible_owners.is_empty()
+                    || root
+                        .eligible_owners
+                        .iter()
+                        .collect::<std::collections::BTreeSet<_>>()
+                        .len()
+                        != root.eligible_owners.len()
+                    || root
+                        .canonical_soul_id
+                        .as_ref()
+                        .is_some_and(|owner| !root.eligible_owners.contains(owner))
+            })
+        {
+            return Err(refused());
+        }
+        for choice in &self.canonical_owners {
+            let root = scope
+                .roots
+                .iter()
+                .find(|root| root.root_session_id == choice.root_session_id)
+                .ok_or_else(refused)?;
+            if !root.eligible_owners.contains(&choice.soul_id)
+                || root
+                    .canonical_soul_id
+                    .as_ref()
+                    .is_some_and(|owner| owner != &choice.soul_id)
+                || !scope.targets.iter().any(|member| {
+                    member.target.soul_id == choice.soul_id
+                        && member.root_session_id == choice.root_session_id
+                        && member.target.expected_intent_revision == choice.expected_intent_revision
+                })
+            {
+                return Err(refused());
+            }
+        }
+        Ok(())
+    }
+}
+
+fn is_lower_hex_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -689,6 +884,7 @@ pub struct RestoreLostSoulRootResult {
 #[serde(rename_all = "camelCase")]
 pub struct RestoreLostSoulsResult {
     pub operation_id: RequestId,
+    pub scope_id: String,
     pub status: SoulRepairStatus,
     pub repaired_target_count: u32,
     pub total_target_count: u32,
@@ -2317,7 +2513,7 @@ pub fn validate_managed_terminal_args(mode: &str, args: &[String]) -> Result<(),
                     digest.as_str(),
                     "aa8900bab7bd9bcbb64634d60593a9217c1639b539cea23318122b3428d123c6"
                         | "d2dcb96c036160b2469bcd732fdc8d767dd481f9c0c864ce47d58ed057652c4d"
-                )
+                ) || [freshell_platform::cli_launch::ProviderTarget::Unix,freshell_platform::cli_launch::ProviderTarget::Windows].into_iter().any(|target|value==&freshell_platform::cli_launch::claude_settings_json(target))
             }
             ("claude", "--mcp-config") => matches!(
                 value.as_str(),
@@ -3466,6 +3662,7 @@ pub enum AdminCommand {
     PendingNotices(PendingNoticesRequest),
     NoticeReceipt(NoticeReceiptRequest),
     IncidentSummary(IncidentSummaryRequest),
+    PreflightLostSouls(PreflightLostSoulsRequest),
     RestoreLostSouls(RestoreLostSoulsRequest),
     MetricsSnapshot,
     MigrationPlan(MigrationPlanRequest),
@@ -3622,6 +3819,7 @@ pub enum AdminResult {
     PendingNotices(Vec<RuntimeNotice>),
     NoticeReceiptRecorded,
     IncidentSummary(LossIncidentSummary),
+    PreflightLostSouls(RepairBatchScope),
     RestoreLostSouls(RestoreLostSoulsResult),
     MetricsSnapshot(RuntimeMetricsSnapshot),
     MigrationPlan(MigrationPlan),
@@ -4012,27 +4210,89 @@ mod tests {
     }
 
     #[test]
-    fn stopped_repair_request_requires_eight_distinct_revisioned_targets() {
-        let request = RestoreLostSoulsRequest {
-            targets: (0..8)
-                .map(|_| LostSoulRepairTarget {
-                    soul_id: SoulId::new(),
-                    incident_id: IncidentId::new(),
-                    expected_intent_revision: 1,
+    fn stopped_repair_exact_batch_nine() {
+        let members = (0..9)
+            .map(|index| RepairBatchTarget {
+                target: LostSoulRepairTarget {
+                    soul_id: SoulId::parse(format!("soul-fixture-{index}")).unwrap(),
+                    incident_id: IncidentId::parse(format!("incident-fixture-{index}")).unwrap(),
+                    expected_intent_revision: 2,
+                },
+                root_session_id: format!("ses_fixture_root_{}", index % 7),
+                provider_store_id: format!("store-fixture-{index}"),
+                incident_revision: 1,
+                identity_revision: 0,
+                native_import_revision: 0,
+                evidence_revision: 0,
+            })
+            .collect::<Vec<_>>();
+        let mut scope = RepairBatchScope {
+            scope_id: String::new(),
+            source_store_id: "a".repeat(64),
+            source_fingerprint: "b".repeat(64),
+            targets: members,
+            roots: (0..7)
+                .map(|index| RepairBatchRoot {
+                    root_session_id: format!("ses_fixture_root_{index}"),
+                    graph_digest: "c".repeat(64),
+                    eligible_owners: vec![SoulId::parse(format!("soul-fixture-{index}")).unwrap()],
+                    canonical_soul_id: None,
                 })
+                .collect(),
+        };
+        scope.source_fingerprint = scope.source_descriptor_digest();
+        scope.scope_id = scope.descriptor_digest();
+        let request = RestoreLostSoulsRequest {
+            scope_id: scope.scope_id.clone(),
+            source: scope.source_selection(),
+            targets: scope
+                .targets
+                .iter()
+                .map(|member| member.target.clone())
                 .collect(),
             canonical_owners: Vec::new(),
             expected_control_epoch: Some(1),
         };
-        assert!(request.validate_exact_batch().is_ok());
-
-        let mut duplicate_soul = request.clone();
-        duplicate_soul.targets[7].soul_id = duplicate_soul.targets[0].soul_id.clone();
-        assert!(duplicate_soul.validate_exact_batch().is_err());
-
-        let mut stale_revision = request;
-        stale_revision.targets[0].expected_intent_revision = 0;
-        assert!(stale_revision.validate_exact_batch().is_err());
+        assert!(request.validate_exact_batch(&scope).is_ok());
+        let mut eight = request.clone();
+        eight.targets.pop();
+        assert!(eight.validate_exact_batch(&scope).is_err());
+        let mut ten = request.clone();
+        let mut tenth = scope.targets[0].clone();
+        tenth.target.soul_id = SoulId::parse("soul-fixture-tenth").unwrap();
+        tenth.target.incident_id = IncidentId::parse("incident-fixture-tenth").unwrap();
+        ten.targets.push(tenth.target.clone());
+        assert!(ten.validate_exact_batch(&scope).is_err());
+        let mut fresh_scope = scope.clone();
+        fresh_scope.targets.push(tenth);
+        fresh_scope.source_fingerprint = fresh_scope.source_descriptor_digest();
+        fresh_scope.scope_id = fresh_scope.descriptor_digest();
+        ten.scope_id = fresh_scope.scope_id.clone();
+        assert!(ten.validate_exact_batch(&fresh_scope).is_ok());
+        for mutate in [
+            |request: &mut RestoreLostSoulsRequest| {
+                request.targets[1].soul_id = request.targets[0].soul_id.clone();
+            },
+            |request: &mut RestoreLostSoulsRequest| {
+                request.targets[1].incident_id = request.targets[0].incident_id.clone();
+            },
+            |request: &mut RestoreLostSoulsRequest| {
+                request.targets[0].expected_intent_revision += 1;
+            },
+            |request: &mut RestoreLostSoulsRequest| {
+                request.source.root_session_ids.pop();
+            },
+            |request: &mut RestoreLostSoulsRequest| {
+                request.source.source_store_id = "d".repeat(64);
+            },
+            |request: &mut RestoreLostSoulsRequest| {
+                request.scope_id = "e".repeat(64);
+            },
+        ] {
+            let mut invalid = request.clone();
+            mutate(&mut invalid);
+            assert!(invalid.validate_exact_batch(&scope).is_err());
+        }
     }
 
     #[test]

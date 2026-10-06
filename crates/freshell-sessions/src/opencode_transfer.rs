@@ -11,7 +11,7 @@ use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
 use std::time::Duration;
 
 use rusqlite::backup::Backup;
@@ -164,6 +164,7 @@ pub struct HostOpenCodeInventory {
     workspace_mounts: Vec<WorkspaceMountMapping>,
     trusted_directory_mounts: Vec<PathBuf>,
     discovery_root: Option<PathBuf>,
+    qualified_snapshot: Option<Box<QualifiedSourceSnapshot>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -189,6 +190,9 @@ struct ResolvedWorkspaceMount {
 }
 
 impl HostOpenCodeInventory {
+    pub fn declared_default_database(&self) -> &Path {
+        &self.default_database
+    }
     pub fn new(default_database: PathBuf) -> Self {
         Self {
             effective_database_override: None,
@@ -198,6 +202,7 @@ impl HostOpenCodeInventory {
             workspace_mounts: Vec::new(),
             trusted_directory_mounts: Vec::new(),
             discovery_root: None,
+            qualified_snapshot: None,
         }
     }
 
@@ -294,7 +299,9 @@ impl HostOpenCodeInventory {
     /// Native project/workspace IDs are read from the immutable source
     /// snapshot inside the exporter; callers never supply source identity.
     pub fn with_trusted_mount_for_selected_session(mut self, managed_mount: PathBuf) -> Self {
-        self.trusted_directory_mounts.push(managed_mount);
+        if !self.trusted_directory_mounts.contains(&managed_mount) {
+            self.trusted_directory_mounts.push(managed_mount);
+        }
         self
     }
 
@@ -344,6 +351,9 @@ impl HostOpenCodeInventory {
     }
 
     fn tool_output_directory(&self, selected_database: &Path) -> PathBuf {
+        if let Some(snapshot) = &self.qualified_snapshot {
+            return snapshot.tool_output_directory.clone();
+        }
         let data_home_database = if self
             .effective_database_override
             .as_ref()
@@ -358,6 +368,241 @@ impl HostOpenCodeInventory {
             .unwrap_or_else(|| Path::new("."))
             .join("tool-output")
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QualifiedSnapshotRoot {
+    pub root_session_id: String,
+    pub graph_fingerprint: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QualifiedSnapshotReceipt {
+    pub canonical_source_database: PathBuf,
+    pub source_store_id: String,
+    pub snapshot_sha256: String,
+    pub snapshot_bytes: u64,
+    pub source_schema_fingerprint: String,
+    pub migration_journal_fingerprint: String,
+    pub roots: Vec<QualifiedSnapshotRoot>,
+}
+
+/// Only independent source resolution and a complete consistent capture can
+/// construct this value. A caller cannot override a source-store identity.
+#[derive(Debug, Clone)]
+pub struct QualifiedSourceSnapshot {
+    path: PathBuf,
+    receipt: QualifiedSnapshotReceipt,
+    tool_output_directory: PathBuf,
+    workspace_mounts: Vec<WorkspaceMountMapping>,
+    trusted_directory_mounts: Vec<PathBuf>,
+    _capture_guard: Option<std::sync::Arc<TempDir>>,
+}
+
+impl QualifiedSourceSnapshot {
+    pub fn receipt(&self) -> &QualifiedSnapshotReceipt {
+        &self.receipt
+    }
+    pub fn inventory(&self) -> HostOpenCodeInventory {
+        let mut inventory = HostOpenCodeInventory::new(self.path.clone());
+        inventory.workspace_mounts = self.workspace_mounts.clone();
+        inventory.trusted_directory_mounts = self.trusted_directory_mounts.clone();
+        inventory.qualified_snapshot = Some(Box::new(self.clone()));
+        inventory
+    }
+}
+
+pub fn source_graph_fingerprint(
+    manifest: &OpenCodeTransferManifest,
+) -> Result<String, TransferError> {
+    digest_serializable(&(
+        &manifest.provider_schema,
+        &manifest.source_schema_fingerprint,
+        &manifest.migration_journal_fingerprint,
+        &manifest.rows,
+        &manifest.assets,
+        &manifest.native_cleanup_baselines,
+        &manifest.saved_snapshots,
+    ))
+}
+
+pub fn capture_qualified_snapshot(
+    inventory: &HostOpenCodeInventory,
+    roots: &[String],
+    snapshot_file: &Path,
+    options: ExportOptions,
+) -> Result<QualifiedSourceSnapshot, TransferError> {
+    if roots.is_empty()
+        || roots.len() > MAX_SOURCE_CANDIDATES
+        || roots.iter().collect::<BTreeSet<_>>().len() != roots.len()
+        || !snapshot_file.is_absolute()
+        || snapshot_file.exists()
+    {
+        return Err(TransferError::Blocked(
+            "exact distinct roots and a fresh absolute private snapshot required".into(),
+        ));
+    }
+    let source_path = resolve_exact_source(inventory, &roots[0])?.canonicalize()?;
+    for root in roots {
+        if resolve_exact_source(inventory, root)?.canonicalize()? != source_path {
+            return Err(TransferError::Blocked(
+                "selected roots do not share one independently resolved source".into(),
+            ));
+        }
+    }
+    let source = open_source_read_only(&source_path)?;
+    let mut private = OpenOptions::new();
+    private.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        private.mode(0o600);
+    }
+    private.open(snapshot_file)?.sync_all()?;
+    create_online_backup(&source, snapshot_file)?;
+    let snapshot = Connection::open_with_flags(
+        snapshot_file,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )?;
+    validate_known_schema(&snapshot)?;
+    let bytes = fs::metadata(snapshot_file)?.len();
+    let mut qualified = QualifiedSourceSnapshot {
+        path: snapshot_file.canonicalize()?,
+        receipt: QualifiedSnapshotReceipt {
+            source_store_id: digest(source_path.to_string_lossy().as_bytes()),
+            canonical_source_database: source_path.clone(),
+            snapshot_sha256: hash_file(snapshot_file)?,
+            snapshot_bytes: bytes,
+            source_schema_fingerprint: schema_fingerprint(&snapshot)?,
+            migration_journal_fingerprint: migration_fingerprint(&snapshot)?,
+            roots: roots
+                .iter()
+                .map(|root| QualifiedSnapshotRoot {
+                    root_session_id: root.clone(),
+                    graph_fingerprint: String::new(),
+                })
+                .collect(),
+        },
+        tool_output_directory: inventory.tool_output_directory(&source_path),
+        workspace_mounts: inventory.workspace_mounts.clone(),
+        trusted_directory_mounts: inventory.trusted_directory_mounts.clone(),
+        _capture_guard: None,
+    };
+    drop(snapshot);
+    for (index, root) in roots.iter().enumerate() {
+        let exported = export_exact_session(&qualified.inventory(), root, options.clone())?;
+        qualified.receipt.roots[index].graph_fingerprint =
+            source_graph_fingerprint(exported.manifest())?;
+    }
+    qualified
+        .receipt
+        .roots
+        .sort_by(|left, right| left.root_session_id.cmp(&right.root_session_id));
+    Ok(qualified)
+}
+
+/// Keep one consistent capture alive for a complete read-only batch. The
+/// existing extraction-owner recovery handles interrupted captures as well.
+pub fn capture_qualified_batch(
+    inventory: &HostOpenCodeInventory,
+    roots: &[String],
+    options: ExportOptions,
+) -> Result<QualifiedSourceSnapshot, TransferError> {
+    let parent = prepare_extraction_root(&options.extraction_root)?;
+    recover_interrupted_extractions(&parent)?;
+    let directory = Builder::new()
+        .prefix(&format!("{EXTRACT_DIR_PREFIX}{}-", std::process::id()))
+        .tempdir_in(&parent)?;
+    write_owner_pid(directory.path())?;
+    let mut qualified = capture_qualified_snapshot(
+        inventory,
+        roots,
+        &directory.path().join("snapshot.sqlite"),
+        options,
+    )?;
+    qualified._capture_guard = Some(std::sync::Arc::new(directory));
+    Ok(qualified)
+}
+
+/// An existing private copy gets original authority only by matching an
+/// independently captured current source's complete selected-root closure.
+pub fn qualify_existing_snapshot(
+    inventory: &HostOpenCodeInventory,
+    roots: &[String],
+    snapshot_file: &Path,
+    options: ExportOptions,
+) -> Result<QualifiedSourceSnapshot, TransferError> {
+    let parent = prepare_extraction_root(&options.extraction_root)?;
+    let current = tempfile::tempdir_in(parent)?;
+    let trusted = capture_qualified_snapshot(
+        inventory,
+        roots,
+        &current.path().join("current.sqlite"),
+        options.clone(),
+    )?;
+    let metadata = fs::symlink_metadata(snapshot_file)?;
+    if !metadata.is_file()
+        || metadata.file_type().is_symlink()
+        || !snapshot_file.is_absolute()
+        || snapshot_file.canonicalize()? != snapshot_file
+    {
+        return Err(TransferError::Blocked(
+            "qualified snapshot must be an exact private regular file".into(),
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if metadata.mode() & 0o077 != 0 || metadata.uid() != unsafe { libc::geteuid() } {
+            return Err(TransferError::Blocked(
+                "snapshot ownership or privacy differs".into(),
+            ));
+        }
+    }
+    let snapshot = Connection::open_with_flags(
+        snapshot_file,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )?;
+    validate_known_schema(&snapshot)?;
+    if schema_fingerprint(&snapshot)? != trusted.receipt.source_schema_fingerprint
+        || migration_fingerprint(&snapshot)? != trusted.receipt.migration_journal_fingerprint
+    {
+        return Err(TransferError::Blocked(
+            "snapshot schema or migrations differ from the independently captured source".into(),
+        ));
+    }
+    drop(snapshot);
+    let mut qualified = trusted.clone();
+    qualified.path = snapshot_file.to_path_buf();
+    qualified.receipt.snapshot_bytes = metadata.len();
+    qualified.receipt.snapshot_sha256 = hash_file(snapshot_file)?;
+    for root in &trusted.receipt.roots {
+        let exported = export_exact_session(
+            &qualified.inventory(),
+            &root.root_session_id,
+            options.clone(),
+        )?;
+        if source_graph_fingerprint(exported.manifest())? != root.graph_fingerprint {
+            return Err(TransferError::Blocked(
+                "snapshot root closure differs from independent source authority".into(),
+            ));
+        }
+    }
+    Ok(qualified)
+}
+
+fn hash_file(path: &Path) -> Result<String, TransferError> {
+    let mut file = File::open(path)?;
+    let mut hash = Sha256::new();
+    let mut buffer = [0; 64 * 1024];
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        hash.update(&buffer[..read]);
+    }
+    Ok(hex::encode(hash.finalize()))
 }
 
 /// Body-free census produced only by reading the complete declared host inventory.
@@ -548,9 +793,177 @@ pub struct OpenCodeTransferManifest {
     pub row_count: usize,
     pub rows: Vec<RowDigest>,
     pub assets: Vec<SerializedAssetMetadata>,
+    /// Body-free native ordering and saved boundary evidence. Older manifests
+    /// omit it and cannot authorize removal of imported messages or parts.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub native_cleanup_baselines: Vec<NativeCleanupBaseline>,
+    /// Exact saved references remain history even when their undo object is
+    /// unavailable in the qualified retained stores.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub saved_snapshots: Vec<SavedSnapshotReference>,
     pub payload_bytes: u64,
     pub payload_sha256: String,
     pub generation: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SavedSnapshotAvailability {
+    RetainedClosure,
+    UnavailableInQualifiedLocations,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum SavedSnapshotSummary {
+    #[default]
+    LegacyUnqualified,
+    QualifiedReferences {
+        retained_closure_count: u64,
+        unavailable_reference_count: u64,
+    },
+}
+
+pub fn saved_snapshot_summary(manifest: &OpenCodeTransferManifest) -> SavedSnapshotSummary {
+    if manifest.native_cleanup_baselines.is_empty() {
+        return SavedSnapshotSummary::LegacyUnqualified;
+    }
+    SavedSnapshotSummary::QualifiedReferences {
+        retained_closure_count: manifest
+            .saved_snapshots
+            .iter()
+            .filter(|reference| {
+                reference.availability == SavedSnapshotAvailability::RetainedClosure
+            })
+            .count() as u64,
+        unavailable_reference_count: manifest
+            .saved_snapshots
+            .iter()
+            .filter(|reference| {
+                reference.availability == SavedSnapshotAvailability::UnavailableInQualifiedLocations
+            })
+            .count() as u64,
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SnapshotObjectMetadata {
+    pub object_id: String,
+    pub compressed_bytes: u64,
+    pub compressed_sha256: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SavedSnapshotReference {
+    pub session_id: String,
+    pub project_id: String,
+    pub worktree_sha1: String,
+    pub tree: String,
+    pub availability: SavedSnapshotAvailability,
+    pub objects: Vec<SnapshotObjectMetadata>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SerializedSnapshotObject {
+    pub project_id: String,
+    pub worktree_sha1: String,
+    pub object_id: String,
+    pub compressed_hex: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NativeRevertBoundary {
+    pub message_id: String,
+    pub part_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NativeMessageBaseline {
+    pub message_id: String,
+    pub time_created: SerializedSqlValue,
+    pub part_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NativeCleanupBaseline {
+    pub session_id: String,
+    pub revert: Option<NativeRevertBoundary>,
+    pub messages: Vec<NativeMessageBaseline>,
+}
+
+fn capture_native_cleanup_baselines(
+    rows: &[SerializedRow],
+) -> Result<Vec<NativeCleanupBaseline>, TransferError> {
+    let mut parts = HashMap::<String, Vec<String>>::new();
+    for row in rows.iter().filter(|row| row.table == "part") {
+        parts
+            .entry(required_text(row, "message_id")?)
+            .or_default()
+            .push(required_text(row, "id")?);
+    }
+    for ids in parts.values_mut() {
+        ids.sort();
+    }
+    let mut messages = HashMap::<String, Vec<NativeMessageBaseline>>::new();
+    for row in rows.iter().filter(|row| row.table == "message") {
+        let message_id = required_text(row, "id")?;
+        messages
+            .entry(required_text(row, "session_id")?)
+            .or_default()
+            .push(NativeMessageBaseline {
+                part_ids: parts.remove(&message_id).unwrap_or_default(),
+                message_id,
+                time_created: row.values.get("time_created").cloned().ok_or_else(|| {
+                    TransferError::Blocked("native message ordering is missing".into())
+                })?,
+            });
+    }
+    for selected in messages.values_mut() {
+        selected.sort_by(|left, right| left.message_id.cmp(&right.message_id));
+    }
+    let mut baselines = rows
+        .iter()
+        .filter(|row| row.table == "session")
+        .map(|session| {
+            let session_id = required_text(session, "id")?;
+            let revert = value_text(session, "revert")?
+                .map(|raw| serde_json::from_str::<serde_json::Value>(&raw))
+                .transpose()
+                .map_err(|_| TransferError::Blocked("saved native revert is malformed".into()))?
+                .and_then(|value| {
+                    value
+                        .get("messageID")
+                        .and_then(serde_json::Value::as_str)
+                        .map(|message_id| NativeRevertBoundary {
+                            message_id: message_id.into(),
+                            part_id: value
+                                .get("partID")
+                                .and_then(serde_json::Value::as_str)
+                                .map(str::to_string),
+                        })
+                });
+            let selected_messages = messages.remove(&session_id).unwrap_or_default();
+            Ok(NativeCleanupBaseline {
+                session_id,
+                revert,
+                messages: selected_messages,
+            })
+        })
+        .collect::<Result<Vec<_>, TransferError>>()?;
+    baselines.sort_by(|left, right| left.session_id.cmp(&right.session_id));
+    Ok(baselines)
+}
+
+pub fn verify_native_cleanup_baselines(
+    expected: &[NativeCleanupBaseline],
+    rows: &[SerializedRow],
+) -> Result<(), TransferError> {
+    if !expected.is_empty() && capture_native_cleanup_baselines(rows)? != expected {
+        return Err(TransferError::Blocked(
+            "native cleanup baseline differs from the complete installed rows".into(),
+        ));
+    }
+    Ok(())
 }
 
 /// The exact DDL and migration IDs qualified for the supported OpenCode
@@ -744,6 +1157,21 @@ pub fn export_exact_session(
     }
 
     let source_path = resolve_exact_source(inventory, root_session_id)?;
+    if let Some(qualified) = &inventory.qualified_snapshot {
+        if source_path.canonicalize()? != qualified.path
+            || fs::metadata(&qualified.path)?.len() != qualified.receipt.snapshot_bytes
+            || hash_file(&qualified.path)? != qualified.receipt.snapshot_sha256
+            || !qualified
+                .receipt
+                .roots
+                .iter()
+                .any(|root| root.root_session_id == root_session_id)
+        {
+            return Err(TransferError::Blocked(
+                "qualified snapshot bytes, selected root or source binding changed".into(),
+            ));
+        }
+    }
     let source = open_source_read_only(&source_path)?;
     let extraction_root = prepare_extraction_root(&options.extraction_root)?;
     recover_interrupted_extractions(&extraction_root)?;
@@ -751,8 +1179,24 @@ pub fn export_exact_session(
         .prefix(&format!("{EXTRACT_DIR_PREFIX}{}-", std::process::id()))
         .tempdir_in(&extraction_root)?;
     write_owner_pid(extraction.path())?;
-    let snapshot_path = extraction.path().join("snapshot.sqlite");
-    create_online_backup(&source, &snapshot_path)?;
+    // A qualified, immutable private capture already has a byte/closure fence.
+    // Avoid copying the entire host store again for every selected root.
+    let owns_snapshot = inventory.qualified_snapshot.is_none();
+    let snapshot_path = if owns_snapshot {
+        extraction.path().join("snapshot.sqlite")
+    } else {
+        source_path.clone()
+    };
+    if owns_snapshot {
+        create_online_backup(&source, &snapshot_path)?;
+    }
+    if let Some(qualified) = &inventory.qualified_snapshot {
+        if hash_file(&qualified.path)? != qualified.receipt.snapshot_sha256 {
+            return Err(TransferError::Blocked(
+                "qualified source snapshot changed during export".into(),
+            ));
+        }
+    }
 
     let result: Result<(PathBuf, OpenCodeTransferManifest), TransferError> = (|| {
         let snapshot = Connection::open_with_flags(
@@ -760,6 +1204,7 @@ pub fn export_exact_session(
             OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
         )?;
         snapshot.busy_timeout(Duration::from_secs(5))?;
+        snapshot.execute_batch("BEGIN DEFERRED")?;
         validate_known_schema(&snapshot)?;
         let source_schema_fingerprint = schema_fingerprint(&snapshot)?;
         let migration_journal_fingerprint = migration_fingerprint(&snapshot)?;
@@ -774,8 +1219,28 @@ pub fn export_exact_session(
             inventory.tool_output_directory(&source_path),
             &workspace_mounts,
         );
+        asset_resolver.snapshot_data_home = inventory
+            .tool_output_directory(&source_path)
+            .parent()
+            .map(Path::to_path_buf);
+        asset_resolver.snapshot_projects = rows
+            .iter()
+            .filter(|row| row.table == "session")
+            .map(|row| Ok((required_text(row, "id")?, required_text(row, "project_id")?)))
+            .collect::<Result<HashMap<_, _>, TransferError>>()?;
         asset_resolver.resolve_rows(&mut rows)?;
         let assets = asset_resolver.metadata();
+        let saved_snapshots = asset_resolver
+            .saved_snapshots
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        let snapshot_objects = asset_resolver
+            .snapshot_objects
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        let native_cleanup_baselines = capture_native_cleanup_baselines(&rows)?;
         let payload_path = extraction.path().join("bundle.json");
         let mut row_digests = Vec::with_capacity(rows.len());
         let (payload_bytes, payload_sha256) = {
@@ -789,6 +1254,7 @@ pub fn export_exact_session(
                     root_session_id,
                     rows: &rows,
                     assets: &assets,
+                    snapshot_objects: &snapshot_objects,
                 },
             );
             if writer.limit_exceeded {
@@ -811,11 +1277,15 @@ pub fn export_exact_session(
                 json_node_sha256: serialized_json_node_digests(row)?,
                 transition_cursor: match row.table.as_str() {
                     "event_sequence" => value_integer(row, "seq")?,
+                    "project" => value_integer(row, "time_updated")?,
                     _ => None,
                 },
             });
         }
-        let source_store_id = digest(source_path.canonicalize()?.to_string_lossy().as_bytes());
+        let source_store_id = match &inventory.qualified_snapshot {
+            Some(qualified) => qualified.receipt.source_store_id.clone(),
+            None => digest(source_path.canonicalize()?.to_string_lossy().as_bytes()),
+        };
         let mut manifest = OpenCodeTransferManifest {
             version: EXPORT_VERSION,
             provider_schema: OPENCODE_SCHEMA_VERSION.to_string(),
@@ -827,6 +1297,8 @@ pub fn export_exact_session(
             row_count: row_digests.len(),
             rows: row_digests,
             assets,
+            native_cleanup_baselines,
+            saved_snapshots,
             payload_bytes,
             payload_sha256,
             generation: String::new(),
@@ -834,12 +1306,41 @@ pub fn export_exact_session(
         let manifest_bytes = serde_json::to_vec(&manifest)
             .map_err(|error| TransferError::Serialization(error.to_string()))?;
         manifest.generation = digest(&manifest_bytes);
+        if let Some(qualified) = &inventory.qualified_snapshot {
+            let root = qualified
+                .receipt
+                .roots
+                .iter()
+                .find(|root| root.root_session_id == root_session_id)
+                .ok_or_else(|| {
+                    TransferError::Blocked("export root is outside the qualified snapshot".into())
+                })?;
+            if manifest.source_schema_fingerprint != qualified.receipt.source_schema_fingerprint
+                || manifest.migration_journal_fingerprint
+                    != qualified.receipt.migration_journal_fingerprint
+                || (!root.graph_fingerprint.is_empty()
+                    && source_graph_fingerprint(&manifest)? != root.graph_fingerprint)
+            {
+                return Err(TransferError::Blocked(
+                    "qualified snapshot root closure or schema changed".into(),
+                ));
+            }
+        }
         Ok((payload_path, manifest))
     })();
 
     // The backup and its SQLite sidecars are extraction-only. They are
     // removed before an export can be returned or published to another host.
-    remove_snapshot_files(&snapshot_path)?;
+    if owns_snapshot {
+        remove_snapshot_files(&snapshot_path)?;
+    }
+    if let Some(qualified) = &inventory.qualified_snapshot {
+        if hash_file(&qualified.path)? != qualified.receipt.snapshot_sha256 {
+            return Err(TransferError::Blocked(
+                "qualified snapshot changed while its complete root was serialized".into(),
+            ));
+        }
+    }
     let (payload_path, manifest) = result?;
     Ok(OpenCodeNativeSnapshot {
         manifest,
@@ -854,6 +1355,7 @@ struct TransferPayload<'a> {
     root_session_id: &'a str,
     rows: &'a [SerializedRow],
     assets: &'a [SerializedAssetMetadata],
+    snapshot_objects: &'a [SerializedSnapshotObject],
 }
 
 struct HashingWriter<'a, W> {
@@ -979,6 +1481,10 @@ struct AssetResolver<'a> {
     tool_output_root: PathBuf,
     workspace_mounts: &'a HashMap<String, ResolvedWorkspaceMount>,
     assets: BTreeMap<String, SerializedAssetMetadata>,
+    snapshot_data_home: Option<PathBuf>,
+    snapshot_projects: HashMap<String, String>,
+    saved_snapshots: BTreeMap<(String, String), SavedSnapshotReference>,
+    snapshot_objects: BTreeMap<(String, String, String), SerializedSnapshotObject>,
 }
 
 impl<'a> AssetResolver<'a> {
@@ -990,6 +1496,10 @@ impl<'a> AssetResolver<'a> {
             tool_output_root,
             workspace_mounts,
             assets: BTreeMap::new(),
+            snapshot_data_home: None,
+            snapshot_projects: HashMap::new(),
+            saved_snapshots: BTreeMap::new(),
+            snapshot_objects: BTreeMap::new(),
         }
     }
 
@@ -1009,6 +1519,11 @@ impl<'a> AssetResolver<'a> {
             };
             for column in columns {
                 let session_id = session_id_for_reference_row(row)?;
+                let event_kind = if row.table == "event" {
+                    value_text(row, "type")?
+                } else {
+                    None
+                };
                 let nullable = row.table == "session" && *column == "revert";
                 let value = match row.values.get_mut(*column) {
                     Some(SerializedSqlValue::Text { value }) => value,
@@ -1039,8 +1554,32 @@ impl<'a> AssetResolver<'a> {
                             row.table, column
                         ))
                     })?;
-                let tree_reference_context = row.table == "session" && *column == "revert";
-                if self.walk_json(&mut decoded, tree_reference_context, &session_id)? {
+                let changed = match (row.table.as_str(), *column) {
+                    ("part", "data") => self.walk_native_part(&mut decoded, &session_id)?,
+                    ("session", "revert") => {
+                        self.resolve_revert_reference(&decoded, &session_id)?
+                    }
+                    ("event", "data") => {
+                        self.resolve_event_assets(&mut decoded, event_kind.as_deref(), &session_id)?
+                    }
+                    ("session_message", "data") | ("session_input", "prompt") => {
+                        self.resolve_message_parts(&mut decoded, &session_id)?
+                    }
+                    ("session_context_epoch", "snapshot") => {
+                        let mut changed = false;
+                        if let Some(messages) = decoded
+                            .get_mut("messages")
+                            .and_then(serde_json::Value::as_array_mut)
+                        {
+                            for message in messages {
+                                changed |= self.resolve_message_parts(message, &session_id)?;
+                            }
+                        }
+                        changed
+                    }
+                    _ => false,
+                };
+                if changed {
                     *value = serde_json::to_string(&decoded)
                         .map_err(|error| TransferError::Serialization(error.to_string()))?;
                 }
@@ -1049,10 +1588,84 @@ impl<'a> AssetResolver<'a> {
         Ok(())
     }
 
-    fn walk_json(
+    fn resolve_message_parts(
         &mut self,
         value: &mut serde_json::Value,
-        tree_reference_context: bool,
+        session_id: &str,
+    ) -> Result<bool, TransferError> {
+        let mut changed = false;
+        if let Some(parts) = value
+            .get_mut("parts")
+            .and_then(serde_json::Value::as_array_mut)
+        {
+            for part in parts {
+                changed |= self.walk_native_part(part, session_id)?;
+            }
+        }
+        Ok(changed)
+    }
+
+    fn resolve_revert_reference(
+        &mut self,
+        value: &serde_json::Value,
+        session_id: &str,
+    ) -> Result<bool, TransferError> {
+        if let Some(reference) = value.get("snapshot").or_else(|| value.get("tree")) {
+            let tree = reference.as_str().ok_or_else(|| {
+                TransferError::Blocked("revert snapshot reference is not a Git object ID".into())
+            })?;
+            self.record_saved_snapshot(tree, session_id)?;
+        }
+        Ok(false)
+    }
+
+    fn resolve_event_assets(
+        &mut self,
+        value: &mut serde_json::Value,
+        event_kind: Option<&str>,
+        session_id: &str,
+    ) -> Result<bool, TransferError> {
+        match event_kind {
+            Some("message.part.updated" | "message.part.updated.1") => value
+                .get_mut("part")
+                .map(|part| self.walk_native_part(part, session_id))
+                .transpose()
+                .map(|changed| changed.unwrap_or(false)),
+            Some(
+                "session.created" | "session.created.1" | "session.updated" | "session.updated.1",
+            ) => {
+                if let Some(revert) = value.get("info").and_then(|info| info.get("revert")) {
+                    self.resolve_revert_reference(revert, session_id)?;
+                }
+                Ok(false)
+            }
+            Some("session.next.prompt.admitted.1" | "session.next.prompted.1") => value
+                .get_mut("prompt")
+                .map(|prompt| self.resolve_message_parts(prompt, session_id))
+                .transpose()
+                .map(|changed| changed.unwrap_or(false)),
+            Some("session.next.tool.success.1") => {
+                let mut changed = false;
+                if let Some(content) = value
+                    .get_mut("content")
+                    .and_then(serde_json::Value::as_array_mut)
+                {
+                    for part in content {
+                        changed |= self.walk_native_part(part, session_id)?;
+                    }
+                }
+                Ok(changed)
+            }
+            _ => Ok(false),
+        }
+    }
+
+    /// Only a native FilePart URL and completed-tool attachment list grant
+    /// asset authority. Tool metadata/input and FilePart.source attribution
+    /// remain exact payload values; arbitrary dictionaries are never assets.
+    fn walk_native_part(
+        &mut self,
+        value: &mut serde_json::Value,
         session_id: &str,
     ) -> Result<bool, TransferError> {
         match value {
@@ -1088,8 +1701,8 @@ impl<'a> AssetResolver<'a> {
                         })?;
                     self.record_git_tree(tree, session_id)?;
                 }
-                if tree_reference_context {
-                    if let Some(reference) = object.get("snapshot").or_else(|| object.get("tree")) {
+                if matches!(kind.as_deref(), Some("step-start" | "step-finish")) {
+                    if let Some(reference) = object.get("snapshot") {
                         let tree = reference.as_str().ok_or_else(|| {
                             TransferError::Blocked(
                                 "revert snapshot reference is not a Git object ID".into(),
@@ -1098,19 +1711,29 @@ impl<'a> AssetResolver<'a> {
                         self.record_git_tree(tree, session_id)?;
                     }
                 }
-                for nested in object.values_mut() {
-                    changed |= self.walk_json(nested, false, session_id)?;
+                if kind.as_deref() == Some("tool") {
+                    if let Some(state) = object.get_mut("state") {
+                        if let Some(output) =
+                            state.get("output").and_then(serde_json::Value::as_str)
+                        {
+                            let mut text = output.to_string();
+                            if self.rewrite_tool_output_markers(&mut text)? {
+                                state["output"] = serde_json::Value::String(text);
+                                changed = true;
+                            }
+                        }
+                        if let Some(attachments) = state
+                            .get_mut("attachments")
+                            .and_then(serde_json::Value::as_array_mut)
+                        {
+                            for attachment in attachments {
+                                changed |= self.walk_native_part(attachment, session_id)?;
+                            }
+                        }
+                    }
                 }
                 Ok(changed)
             }
-            serde_json::Value::Array(values) => {
-                let mut changed = false;
-                for nested in values {
-                    changed |= self.walk_json(nested, tree_reference_context, session_id)?;
-                }
-                Ok(changed)
-            }
-            serde_json::Value::String(text) => self.rewrite_tool_output_markers(text),
             _ => Ok(false),
         }
     }
@@ -1231,11 +1854,29 @@ impl<'a> AssetResolver<'a> {
     }
 
     fn record_git_tree(&mut self, tree: &str, session_id: &str) -> Result<(), TransferError> {
+        self.record_saved_snapshot(tree, session_id)?;
+        if self
+            .saved_snapshots
+            .get(&(session_id.to_string(), tree.to_string()))
+            .is_none_or(|reference| {
+                reference.availability != SavedSnapshotAvailability::RetainedClosure
+            })
+        {
+            return Err(TransferError::Blocked(
+                "native snapshot part lacks its complete retained tree closure".into(),
+            ));
+        }
         let mount = self.workspace_mounts.get(session_id).ok_or_else(|| {
             TransferError::Blocked(
                 "snapshot reference cannot be verified without a trusted mapping for the selected workspace".into(),
             )
         })?;
+        // A provider snapshot bucket is independently authoritative. A
+        // workspace repository, when present, also retains its old shared
+        // workspace reference commitment.
+        if !mount.canonical_root.join(".git").is_dir() {
+            return Ok(());
+        }
         let store = inspect_git_tree(&mount.canonical_root, tree)?;
         let identity_bytes = serde_json::to_vec(&mount.identity)
             .map_err(|error| TransferError::Serialization(error.to_string()))?;
@@ -1259,6 +1900,690 @@ impl<'a> AssetResolver<'a> {
             .insert(metadata.target_relative_path.clone(), metadata);
         Ok(())
     }
+
+    fn record_saved_snapshot(&mut self, tree: &str, session_id: &str) -> Result<(), TransferError> {
+        if tree.len() != 40 || !tree.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err(TransferError::Blocked(
+                "saved snapshot is not a SHA1 tree reference".into(),
+            ));
+        }
+        let mount = self.workspace_mounts.get(session_id).ok_or_else(|| {
+            TransferError::Blocked("saved snapshot lacks an exact qualified workspace".into())
+        })?;
+        let project_id = self
+            .snapshot_projects
+            .get(session_id)
+            .ok_or_else(|| {
+                TransferError::Blocked("saved snapshot lacks its native project".into())
+            })?
+            .clone();
+        checked_relative_path(&project_id)?;
+        let worktree_sha1 = hex::encode(sha1::Sha1::digest(
+            mount.canonical_root.to_string_lossy().as_bytes(),
+        ));
+        let data_home = self.snapshot_data_home.as_ref().ok_or_else(|| {
+            TransferError::Blocked("saved snapshot lacks original datahome".into())
+        })?;
+        let native_bucket = data_home
+            .join("snapshot")
+            .join(&project_id)
+            .join(&worktree_sha1);
+        let workspace_store = snapshot_workspace_objects(&mount.canonical_root)?;
+        let stores = qualified_snapshot_stores(&native_bucket, &workspace_store)?;
+        let closure = read_snapshot_closure(&stores, tree)?;
+        let mut objects = Vec::new();
+        if let Some(closure) = closure {
+            for (object_id, compressed) in closure {
+                objects.push(SnapshotObjectMetadata {
+                    object_id: object_id.clone(),
+                    compressed_bytes: compressed.len() as u64,
+                    compressed_sha256: digest(&compressed),
+                });
+                self.snapshot_objects.insert(
+                    (project_id.clone(), worktree_sha1.clone(), object_id.clone()),
+                    SerializedSnapshotObject {
+                        project_id: project_id.clone(),
+                        worktree_sha1: worktree_sha1.clone(),
+                        object_id,
+                        compressed_hex: hex::encode(compressed),
+                    },
+                );
+            }
+        }
+        let availability = if objects.is_empty() {
+            SavedSnapshotAvailability::UnavailableInQualifiedLocations
+        } else {
+            SavedSnapshotAvailability::RetainedClosure
+        };
+        self.saved_snapshots.insert(
+            (session_id.to_string(), tree.to_string()),
+            SavedSnapshotReference {
+                session_id: session_id.into(),
+                project_id,
+                worktree_sha1,
+                tree: tree.into(),
+                availability,
+                objects,
+            },
+        );
+        Ok(())
+    }
+}
+
+fn snapshot_workspace_objects(workspace: &Path) -> Result<PathBuf, TransferError> {
+    let marker = workspace.join(".git");
+    let metadata = match fs::symlink_metadata(&marker) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(marker.join("objects")),
+        Err(error) => return Err(error.into()),
+        Ok(metadata) => metadata,
+    };
+    if metadata.file_type().is_symlink() {
+        return Err(TransferError::Blocked(
+            "snapshot Git directory marker is redirected".into(),
+        ));
+    }
+    let mut git_dir = if metadata.is_dir() {
+        marker
+    } else if metadata.is_file() {
+        let pointer = fs::read_to_string(&marker)?;
+        let relative = pointer.trim().strip_prefix("gitdir: ").ok_or_else(|| {
+            TransferError::Blocked("snapshot Git directory pointer is invalid".into())
+        })?;
+        let target = PathBuf::from(relative);
+        if target.is_absolute() {
+            target
+        } else {
+            workspace.join(target)
+        }
+    } else {
+        return Err(TransferError::Blocked(
+            "snapshot Git directory marker is invalid".into(),
+        ));
+    };
+    git_dir = git_dir.canonicalize()?;
+    if let Some(common) = read_alternates_file(&git_dir.join("commondir"))? {
+        let common = PathBuf::from(common.trim());
+        git_dir = if common.is_absolute() {
+            common
+        } else {
+            git_dir.join(common)
+        }
+        .canonicalize()?;
+    }
+    if let Some(config) = read_alternates_file(&git_dir.join("config"))? {
+        if config.lines().any(|line| {
+            line.trim().to_ascii_lowercase().starts_with("objectformat")
+                && !line.to_ascii_lowercase().ends_with("sha1")
+        }) {
+            return Err(TransferError::Blocked(
+                "saved snapshot source uses an unsupported Git object format".into(),
+            ));
+        }
+    }
+    Ok(git_dir.join("objects"))
+}
+
+fn qualified_snapshot_stores(
+    native_bucket: &Path,
+    workspace_objects: &Path,
+) -> Result<Vec<PathBuf>, TransferError> {
+    let mut stores = Vec::new();
+    for path in [
+        native_bucket.join("objects"),
+        workspace_objects.to_path_buf(),
+    ] {
+        match fs::symlink_metadata(&path) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error.into()),
+            Ok(metadata) if !metadata.is_dir() || metadata.file_type().is_symlink() => {
+                return Err(TransferError::Blocked(
+                    "qualified snapshot object store is not a directory".into(),
+                ))
+            }
+            Ok(_) => {}
+        }
+        // Every component must resolve as written, so a retained store cannot
+        // silently redirect into an unrelated location.
+        if path.canonicalize()? != path {
+            return Err(TransferError::Blocked(
+                "qualified snapshot store contains a redirected component".into(),
+            ));
+        }
+        if let Some(alternates) = read_alternates_file(&path.join("info/alternates"))? {
+            for alternate in alternates.lines().filter(|line| !line.trim().is_empty()) {
+                let alternate = PathBuf::from(alternate);
+                let alternate = if alternate.is_absolute() {
+                    alternate
+                } else {
+                    path.join(alternate)
+                };
+                let qualified_workspace = workspace_objects
+                    .parent()
+                    .and_then(Path::parent)
+                    .ok_or_else(|| {
+                        TransferError::Blocked("snapshot alternate lacks source context".into())
+                    })?;
+                let alternate = alternate.canonicalize()?;
+                if !alternate.starts_with(qualified_workspace) {
+                    return Err(TransferError::Blocked(
+                        "saved snapshot alternate is outside its qualified source repository"
+                            .into(),
+                    ));
+                }
+                if read_alternates_file(&alternate.join("info/alternates"))?
+                    .is_some_and(|nested| nested.lines().any(|line| !line.trim().is_empty()))
+                {
+                    return Err(TransferError::Blocked(
+                        "nested saved snapshot alternates are unsupported".into(),
+                    ));
+                }
+                stores.push(alternate);
+            }
+        }
+        stores.push(path);
+    }
+    Ok(stores)
+}
+
+fn read_snapshot_object(
+    stores: &[PathBuf],
+    object_id: &str,
+) -> Result<Option<Vec<u8>>, TransferError> {
+    if object_id.len() != 40 || !object_id.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(TransferError::Blocked(
+            "snapshot closure has an invalid object ID".into(),
+        ));
+    }
+    for store in stores {
+        let path = store.join(&object_id[..2]).join(&object_id[2..]);
+        match fs::symlink_metadata(&path) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error.into()),
+            Ok(metadata)
+                if !metadata.is_file()
+                    || metadata.file_type().is_symlink()
+                    || path.canonicalize()? != path =>
+            {
+                return Err(TransferError::Blocked(
+                    "saved snapshot object is not an exact regular file".into(),
+                ))
+            }
+            Ok(metadata) if metadata.len() > MAX_BUNDLE_BYTES => {
+                return Err(TransferError::Blocked(
+                    "saved snapshot object exceeds the transfer bound".into(),
+                ))
+            }
+            Ok(_) => return Ok(Some(fs::read(path)?)),
+        }
+    }
+    // Packed objects use the native decoder only after storage confinement;
+    // ordinary owned loose-object fixtures need no external CLI.
+    for store in stores {
+        let pack = store.join("pack");
+        if pack.exists() && fs::read_dir(&pack)?.next().is_some() {
+            let git_dir = store.parent().ok_or_else(|| {
+                TransferError::Blocked("snapshot store lacks native Git directory".into())
+            })?;
+            inspect_git_pack_directory(git_dir, store)?;
+            let repository = GitRepository {
+                work_tree: git_dir.to_path_buf(),
+                git_dir: git_dir.to_path_buf(),
+            };
+            let mut command = sanitized_git_command();
+            command
+                .arg("--git-dir")
+                .arg(&repository.git_dir)
+                .arg("--work-tree")
+                .arg(&repository.work_tree)
+                .arg("cat-file")
+                .arg("--batch")
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+            let mut child = command.spawn()?;
+            child
+                .stdin
+                .take()
+                .ok_or_else(|| {
+                    TransferError::Blocked("packed snapshot decoder input is unavailable".into())
+                })?
+                .write_all(format!("{object_id}\n").as_bytes())?;
+            let output = child.wait_with_output()?;
+            if !output.status.success() {
+                return Err(TransferError::Blocked(
+                    "packed snapshot decoder failed".into(),
+                ));
+            }
+            let Some((kind, body)) = decode_packed_snapshot_response(object_id, &output.stdout)?
+            else {
+                continue;
+            };
+            let mut encoder =
+                flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+            write!(encoder, "{kind} {}\0", body.len())?;
+            encoder.write_all(body)?;
+            return Ok(Some(encoder.finish()?));
+        }
+    }
+    Ok(None)
+}
+
+fn decode_packed_snapshot_response<'a>(
+    object_id: &str,
+    output: &'a [u8],
+) -> Result<Option<(&'a str, &'a [u8])>, TransferError> {
+    let newline = output
+        .iter()
+        .position(|byte| *byte == b'\n')
+        .ok_or_else(|| {
+            TransferError::Blocked("packed snapshot decoder returned an incomplete header".into())
+        })?;
+    let header = std::str::from_utf8(&output[..newline]).map_err(|_| {
+        TransferError::Blocked("packed snapshot decoder returned a nontext header".into())
+    })?;
+    let fields = header.split(' ').collect::<Vec<_>>();
+    if fields.as_slice() == [object_id, "missing"] && output.len() == newline + 1 {
+        return Ok(None);
+    }
+    if fields.len() != 3 || fields[0] != object_id || !matches!(fields[1], "tree" | "blob") {
+        return Err(TransferError::Blocked(
+            "packed snapshot decoder returned an unsupported object".into(),
+        ));
+    }
+    let length = fields[2].parse::<usize>().map_err(|_| {
+        TransferError::Blocked("packed snapshot decoder returned an invalid size".into())
+    })?;
+    if length as u64 > MAX_BUNDLE_BYTES
+        || output.len().checked_sub(newline + 1) != length.checked_add(1)
+        || output.last() != Some(&b'\n')
+    {
+        return Err(TransferError::Blocked(
+            "packed snapshot decoder returned an incomplete or oversized object".into(),
+        ));
+    }
+    Ok(Some((fields[1], &output[newline + 1..output.len() - 1])))
+}
+
+#[cfg(test)]
+mod packed_snapshot_response_tests {
+    use super::*;
+
+    #[test]
+    fn durable_souls_saved_snapshot_uses_qualified_linked_worktree_common_objects() {
+        let fixture = tempfile::tempdir().unwrap();
+        let workspace = fixture.path().join("workspace");
+        let common = fixture.path().join("repo/.git");
+        let worktree = common.join("worktrees/owned");
+        fs::create_dir_all(&workspace).unwrap();
+        fs::create_dir_all(&worktree).unwrap();
+        fs::create_dir_all(common.join("objects")).unwrap();
+        fs::write(
+            workspace.join(".git"),
+            format!("gitdir: {}\n", worktree.display()),
+        )
+        .unwrap();
+        fs::write(worktree.join("commondir"), "../..\n").unwrap();
+        fs::write(
+            common.join("config"),
+            "[core]\nrepositoryformatversion = 0\n",
+        )
+        .unwrap();
+        assert_eq!(
+            snapshot_workspace_objects(&workspace).unwrap(),
+            common.canonicalize().unwrap().join("objects")
+        );
+        fs::write(
+            common.join("config"),
+            "[extensions]\nobjectFormat = sha256\n",
+        )
+        .unwrap();
+        assert!(snapshot_workspace_objects(&workspace).is_err());
+        fs::write(workspace.join(".git"), "unknown pointer\n").unwrap();
+        assert!(snapshot_workspace_objects(&workspace).is_err());
+    }
+
+    #[test]
+    fn durable_souls_packed_snapshot_distinguishes_absent_from_malformed_objects() {
+        let id = "0123456789012345678901234567890123456789";
+        assert!(
+            decode_packed_snapshot_response(id, format!("{id} missing\n").as_bytes())
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            decode_packed_snapshot_response(id, format!("{id} blob 3\nabc\n").as_bytes()).unwrap(),
+            Some(("blob", b"abc".as_slice()))
+        );
+        for response in [
+            format!("{id} missing\nextra"),
+            format!("{id} blob 4\nabc\n"),
+            format!("{id} commit 3\nabc\n"),
+            "other blob 3\nabc\n".to_string(),
+        ] {
+            assert!(decode_packed_snapshot_response(id, response.as_bytes()).is_err());
+        }
+    }
+}
+
+fn decode_snapshot_object(
+    object_id: &str,
+    compressed: &[u8],
+) -> Result<(String, Vec<u8>), TransferError> {
+    let mut raw = Vec::new();
+    flate2::read::ZlibDecoder::new(compressed)
+        .take(MAX_BUNDLE_BYTES + 1)
+        .read_to_end(&mut raw)?;
+    if raw.len() as u64 > MAX_BUNDLE_BYTES || hex::encode(sha1::Sha1::digest(&raw)) != object_id {
+        return Err(TransferError::Blocked(
+            "snapshot object bytes do not match their content identity".into(),
+        ));
+    }
+    let nul = raw
+        .iter()
+        .position(|byte| *byte == 0)
+        .ok_or_else(|| TransferError::Blocked("snapshot object lacks its native header".into()))?;
+    let header = std::str::from_utf8(&raw[..nul])
+        .map_err(|_| TransferError::Blocked("snapshot object header is invalid".into()))?;
+    let (kind, size) = header
+        .split_once(' ')
+        .ok_or_else(|| TransferError::Blocked("snapshot object header is invalid".into()))?;
+    if !matches!(kind, "tree" | "blob") || size.parse::<usize>().ok() != Some(raw.len() - nul - 1) {
+        return Err(TransferError::Blocked(
+            "snapshot object has unsupported kind or length".into(),
+        ));
+    }
+    Ok((kind.to_string(), raw[nul + 1..].to_vec()))
+}
+
+fn snapshot_tree_children(bytes: &[u8]) -> Result<Vec<(String, bool)>, TransferError> {
+    let mut cursor = 0;
+    let mut children = Vec::new();
+    while cursor < bytes.len() {
+        let space = bytes[cursor..]
+            .iter()
+            .position(|byte| *byte == b' ')
+            .map(|n| cursor + n)
+            .ok_or_else(|| TransferError::Blocked("snapshot tree entry mode is absent".into()))?;
+        let nul = bytes[space + 1..]
+            .iter()
+            .position(|byte| *byte == 0)
+            .map(|n| space + 1 + n)
+            .ok_or_else(|| TransferError::Blocked("snapshot tree entry name is absent".into()))?;
+        let mode = std::str::from_utf8(&bytes[cursor..space]).unwrap_or("");
+        let name = &bytes[space + 1..nul];
+        if !matches!(mode, "40000" | "040000" | "100644" | "100755" | "120000")
+            || name.is_empty()
+            || name == b"."
+            || name == b".."
+            || name.contains(&b'/')
+            || nul + 21 > bytes.len()
+        {
+            return Err(TransferError::Blocked(
+                "snapshot tree contains an unsupported entry".into(),
+            ));
+        }
+        children.push((
+            hex::encode(&bytes[nul + 1..nul + 21]),
+            matches!(mode, "40000" | "040000"),
+        ));
+        cursor = nul + 21;
+    }
+    Ok(children)
+}
+
+fn read_snapshot_closure(
+    stores: &[PathBuf],
+    tree: &str,
+) -> Result<Option<BTreeMap<String, Vec<u8>>>, TransferError> {
+    let Some(root) = read_snapshot_object(stores, tree)? else {
+        return Ok(None);
+    };
+    let mut pending = vec![(tree.to_string(), true, Some(root))];
+    let mut closure = BTreeMap::new();
+    let mut total = 0u64;
+    while let Some((id, is_tree, known)) = pending.pop() {
+        if closure.contains_key(&id) {
+            continue;
+        }
+        let compressed = known
+            .or(read_snapshot_object(stores, &id)?)
+            .ok_or_else(|| {
+                TransferError::Blocked("retained snapshot has an incomplete tree closure".into())
+            })?;
+        total = total
+            .checked_add(compressed.len() as u64)
+            .filter(|size| *size <= MAX_BUNDLE_BYTES / 2)
+            .ok_or_else(|| {
+                TransferError::Blocked("snapshot closure exceeds its encoded transfer bound".into())
+            })?;
+        let (kind, bytes) = decode_snapshot_object(&id, &compressed)?;
+        if (kind == "tree") != is_tree {
+            return Err(TransferError::Blocked(
+                "snapshot closure object kind differs from its tree edge".into(),
+            ));
+        }
+        if is_tree {
+            for (id, is_tree) in snapshot_tree_children(&bytes)? {
+                pending.push((id, is_tree, None));
+            }
+        }
+        closure.insert(id, compressed);
+    }
+    Ok(Some(closure))
+}
+
+/// Publish one immutable, content-addressed object. An interrupted database
+/// import can leave identical objects; it cannot leave a completion receipt.
+pub fn install_snapshot_object(
+    object: &SerializedSnapshotObject,
+    references: &[SavedSnapshotReference],
+    destination_database: &Path,
+) -> Result<(), TransferError> {
+    checked_relative_path(&object.project_id)?;
+    if object.worktree_sha1.len() != 40
+        || !object
+            .worktree_sha1
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit())
+    {
+        return Err(TransferError::Blocked(
+            "snapshot native bucket identity is invalid".into(),
+        ));
+    }
+    let expected = references
+        .iter()
+        .filter(|reference| {
+            reference.project_id == object.project_id
+                && reference.worktree_sha1 == object.worktree_sha1
+        })
+        .flat_map(|reference| &reference.objects)
+        .find(|metadata| metadata.object_id == object.object_id)
+        .ok_or_else(|| {
+            TransferError::Blocked("snapshot object is outside the exact saved closure".into())
+        })?;
+    let bytes = hex::decode(&object.compressed_hex)
+        .map_err(|_| TransferError::Blocked("snapshot object encoding is invalid".into()))?;
+    if bytes.len() as u64 != expected.compressed_bytes
+        || digest(&bytes) != expected.compressed_sha256
+    {
+        return Err(TransferError::Blocked(
+            "snapshot object transport digest differs".into(),
+        ));
+    }
+    decode_snapshot_object(&object.object_id, &bytes)?;
+    let bucket = destination_database
+        .parent()
+        .ok_or_else(|| {
+            TransferError::Blocked("snapshot destination lacks provider datahome".into())
+        })?
+        .join("snapshot")
+        .join(&object.project_id)
+        .join(&object.worktree_sha1);
+    snapshot_create_directory(&bucket.join("objects").join(&object.object_id[..2]))?;
+    snapshot_create_directory(&bucket.join("refs/heads"))?;
+    publish_snapshot_file(&bucket.join("HEAD"), b"ref: refs/heads/master\n", false)?;
+    publish_snapshot_file(
+        &bucket.join("config"),
+        b"[core]\n\trepositoryformatversion = 0\n\tbare = false\n\tfilemode = true\n",
+        false,
+    )?;
+    let target = bucket
+        .join("objects")
+        .join(&object.object_id[..2])
+        .join(&object.object_id[2..]);
+    publish_snapshot_file(&target, &bytes, true)?;
+    Ok(())
+}
+
+fn snapshot_create_directory(path: &Path) -> Result<(), TransferError> {
+    let mut missing = Vec::new();
+    let mut current = path;
+    loop {
+        match fs::symlink_metadata(current) {
+            Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => break,
+            Ok(_) => {
+                return Err(TransferError::Blocked(
+                    "snapshot destination contains a non-directory component".into(),
+                ))
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                missing.push(current.to_path_buf());
+                current = current.parent().ok_or_else(|| {
+                    TransferError::Blocked("snapshot destination has no existing parent".into())
+                })?;
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+    if current.canonicalize()? != current {
+        return Err(TransferError::Blocked(
+            "snapshot destination parent is redirected".into(),
+        ));
+    }
+    for directory in missing.into_iter().rev() {
+        fs::create_dir(&directory)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&directory, fs::Permissions::from_mode(0o700))?;
+        }
+    }
+    Ok(())
+}
+
+fn publish_snapshot_file(path: &Path, bytes: &[u8], object: bool) -> Result<(), TransferError> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            if !metadata.is_file()
+                || metadata.file_type().is_symlink()
+                || path.canonicalize()? != path
+            {
+                return Err(TransferError::Blocked(
+                    "snapshot destination is not an exact regular file".into(),
+                ));
+            }
+            if object && fs::read(path)? != bytes {
+                return Err(TransferError::Blocked(
+                    "snapshot destination object conflicts with retained content".into(),
+                ));
+            }
+            return Ok(());
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    let parent = path
+        .parent()
+        .ok_or_else(|| TransferError::Blocked("snapshot file lacks parent".into()))?;
+    let mut staged = tempfile::NamedTempFile::new_in(parent)?;
+    staged.write_all(bytes)?;
+    staged.as_file().sync_all()?;
+    staged
+        .persist_noclobber(path)
+        .map_err(|error| TransferError::Io(error.error.to_string()))?;
+    #[cfg(unix)]
+    File::open(parent)?.sync_all()?;
+    Ok(())
+}
+
+pub fn verify_saved_snapshot_references(
+    references: &[SavedSnapshotReference],
+    rows: &[SerializedRow],
+    destination_database: &Path,
+    workspace: &Path,
+) -> Result<(), TransferError> {
+    let mounts = resolve_workspace_mounts(rows, &[], &[workspace.to_path_buf()])?;
+    let mut keys = BTreeSet::new();
+    for reference in references {
+        let session = rows
+            .iter()
+            .find(|row| {
+                row.table == "session"
+                    && value_text(row, "id").ok().flatten().as_deref()
+                        == Some(&reference.session_id)
+            })
+            .ok_or_else(|| {
+                TransferError::Blocked(
+                    "saved snapshot session is outside the selected graph".into(),
+                )
+            })?;
+        let mount = mounts.get(&reference.session_id).ok_or_else(|| {
+            TransferError::Blocked("saved snapshot workspace mapping is unavailable".into())
+        })?;
+        if required_text(session, "project_id")? != reference.project_id
+            || hex::encode(sha1::Sha1::digest(
+                mount.canonical_root.to_string_lossy().as_bytes(),
+            )) != reference.worktree_sha1
+            || reference.tree.len() != 40
+            || !reference.tree.bytes().all(|byte| byte.is_ascii_hexdigit())
+            || !keys.insert((&reference.session_id, &reference.tree))
+        {
+            return Err(TransferError::Blocked(
+                "saved snapshot identity differs from the exact native graph".into(),
+            ));
+        }
+        match reference.availability {
+            SavedSnapshotAvailability::UnavailableInQualifiedLocations
+                if reference.objects.is_empty() => {}
+            SavedSnapshotAvailability::RetainedClosure if !reference.objects.is_empty() => {
+                let bucket = destination_database
+                    .parent()
+                    .ok_or_else(|| {
+                        TransferError::Blocked(
+                            "snapshot destination has no provider datahome".into(),
+                        )
+                    })?
+                    .join("snapshot")
+                    .join(&reference.project_id)
+                    .join(&reference.worktree_sha1);
+                let stores = qualified_snapshot_stores(&bucket, &bucket.join("objects"))?;
+                let closure =
+                    read_snapshot_closure(&stores, &reference.tree)?.ok_or_else(|| {
+                        TransferError::Blocked(
+                            "retained snapshot is unavailable from the destination native store"
+                                .into(),
+                        )
+                    })?;
+                if closure.keys().collect::<BTreeSet<_>>()
+                    != reference
+                        .objects
+                        .iter()
+                        .map(|object| &object.object_id)
+                        .collect::<BTreeSet<_>>()
+                {
+                    return Err(TransferError::Blocked(
+                        "destination snapshot closure differs from retained objects".into(),
+                    ));
+                }
+            }
+            _ => {
+                return Err(TransferError::Blocked(
+                    "saved snapshot availability disagrees with its retained closure".into(),
+                ))
+            }
+        }
+    }
+    Ok(())
 }
 
 fn decode_file_url(url: &str) -> Result<PathBuf, TransferError> {
@@ -2375,22 +3700,23 @@ fn validate_known_schema(connection: &Connection) -> Result<(), TransferError> {
             "source data-migration journal has an unrecognized shape".into(),
         ));
     }
-    let expected_schema = pinned_schema_fingerprint(
+    qualify_schema_relationships(
+        connection,
         actual.contains("message_seq"),
         actual.contains("provider_config"),
     )?;
-    if schema_fingerprint(connection)? != expected_schema {
-        return Err(TransferError::Blocked(
-            "source DDL does not match the pinned OpenCode v1.18.21 schema".into(),
-        ));
-    }
     Ok(())
 }
 
-fn pinned_schema_fingerprint(
+/// Qualify only the pinned SQLite schema. Formatting and type-keyword case
+/// are not relationships; columns, keys, nullability, defaults, table flags,
+/// foreign keys, index expressions/collations and the object inventory are.
+/// Unsupported constraint forms are refused instead of normalizing SQL.
+fn qualify_schema_relationships(
+    actual: &Connection,
     include_message_seq: bool,
     include_provider_config: bool,
-) -> Result<String, TransferError> {
+) -> Result<(), TransferError> {
     let expected = Connection::open_in_memory()?;
     expected.execute_batch(PINNED_SCHEMA_SQL)?;
     if include_message_seq {
@@ -2402,7 +3728,151 @@ fn pinned_schema_fingerprint(
         expected
             .execute_batch("CREATE TABLE provider_config (id TEXT PRIMARY KEY, value TEXT);")?;
     }
-    schema_fingerprint(&expected)
+    let objects =
+        |connection: &Connection| -> Result<Vec<(String, String, String, String)>, TransferError> {
+            let mut statement = connection.prepare("SELECT type,name,tbl_name,sql FROM sqlite_master WHERE name NOT LIKE 'sqlite_%' AND sql IS NOT NULL ORDER BY type,name,tbl_name")?;
+            let rows = statement
+                .query_map([], |row| {
+                    Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(rows)
+        };
+    let actual_objects = objects(actual)?;
+    let expected_objects = objects(&expected)?;
+    let identities = |objects: &[(String, String, String, String)]| {
+        objects
+            .iter()
+            .map(|(kind, name, table, _)| (kind.clone(), name.clone(), table.clone()))
+            .collect::<Vec<_>>()
+    };
+    if identities(&actual_objects) != identities(&expected_objects) {
+        return Err(TransferError::Blocked(
+            "source schema object inventory differs from pinned OpenCode".into(),
+        ));
+    }
+    for (kind, name, _, sql) in &actual_objects {
+        let upper = sql.to_ascii_uppercase();
+        if upper
+            .split(|character: char| !character.is_ascii_alphanumeric() && character != '_')
+            .any(|word| {
+                matches!(
+                    word,
+                    "CHECK"
+                        | "COLLATE"
+                        | "DEFERRABLE"
+                        | "INITIALLY"
+                        | "AUTOINCREMENT"
+                        | "CONFLICT"
+                        | "GENERATED"
+                        | "STRICT"
+                        | "WITHOUT"
+                )
+            })
+        {
+            return Err(TransferError::Blocked(
+                "source schema has an unqualified constraint form".into(),
+            ));
+        }
+        let quoted = name.replace('"', "\"\"");
+        if kind == "table" {
+            let metadata = |connection: &Connection| -> Result<Vec<SerializedRow>, TransferError> {
+                let mut columns =
+                    schema_pragma_rows(connection, &format!("PRAGMA table_xinfo(\"{quoted}\")"))?;
+                for column in &mut columns {
+                    if let Some(SerializedSqlValue::Text { value }) = column.values.get_mut("type")
+                    {
+                        *value = value.to_ascii_uppercase();
+                    }
+                }
+                let mut relationships = columns;
+                relationships.extend(schema_pragma_rows(
+                    connection,
+                    &format!("PRAGMA foreign_key_list(\"{quoted}\")"),
+                )?);
+                relationships.extend(schema_pragma_rows(connection, &format!("SELECT type,ncol,wr,strict FROM pragma_table_list WHERE schema='main' AND name='{quoted}'"))?);
+                let mut indexes =
+                    schema_pragma_rows(connection, &format!("PRAGMA index_list(\"{quoted}\")"))?;
+                for index in &mut indexes {
+                    index.values.remove("seq");
+                }
+                indexes.sort_by(|left, right| left.values.cmp(&right.values));
+                for index in &indexes {
+                    if let Some(SerializedSqlValue::Text { value }) = index.values.get("name") {
+                        let value = value.replace('"', "\"\"");
+                        relationships.extend(schema_pragma_rows(
+                            connection,
+                            &format!("PRAGMA index_xinfo(\"{value}\")"),
+                        )?);
+                    }
+                }
+                relationships.extend(indexes);
+                Ok(relationships)
+            };
+            if metadata(actual)? != metadata(&expected)? {
+                return Err(TransferError::Blocked(format!(
+                    "source schema relationships differ for pinned table {name}"
+                )));
+            }
+        } else if kind == "index" {
+            // The pinned indexes contain only their exact named columns. A
+            // new expression or partial predicate has no qualified contract.
+            if schema_pragma_rows(actual, &format!("PRAGMA index_xinfo(\"{quoted}\")"))?
+                != schema_pragma_rows(&expected, &format!("PRAGMA index_xinfo(\"{quoted}\")"))?
+            {
+                return Err(TransferError::Blocked(
+                    "source index relationships differ".into(),
+                ));
+            }
+        } else {
+            return Err(TransferError::Blocked(
+                "source has an unqualified view or trigger".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn schema_pragma_rows(
+    connection: &Connection,
+    sql: &str,
+) -> Result<Vec<SerializedRow>, TransferError> {
+    let mut statement = connection.prepare(sql)?;
+    let columns = statement
+        .column_names()
+        .iter()
+        .map(|name| name.to_string())
+        .collect::<Vec<_>>();
+    let rows = statement
+        .query_map([], |row| {
+            let values = columns
+                .iter()
+                .enumerate()
+                .map(|(index, name)| {
+                    let value = match row.get_ref(index)? {
+                        ValueRef::Null => SerializedSqlValue::Null,
+                        ValueRef::Integer(value) => SerializedSqlValue::Integer { value },
+                        ValueRef::Real(value) => SerializedSqlValue::Real {
+                            bits: format!("{:016x}", value.to_bits()),
+                        },
+                        ValueRef::Text(value) => SerializedSqlValue::Text {
+                            value: String::from_utf8_lossy(value).into_owned(),
+                        },
+                        ValueRef::Blob(value) => SerializedSqlValue::Blob {
+                            hex: hex::encode(value),
+                        },
+                    };
+                    Ok((name.clone(), value))
+                })
+                .collect::<Result<BTreeMap<_, _>, rusqlite::Error>>()?;
+            Ok(SerializedRow {
+                table: "schema_relationship".into(),
+                key: Vec::new(),
+                values,
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(rows)
 }
 
 fn table_columns(connection: &Connection, table: &str) -> Result<Vec<String>, TransferError> {

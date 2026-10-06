@@ -165,6 +165,15 @@ async fn fixture_fresh_soul(
         .mark_running(prepared.incarnation_id)
         .await
         .unwrap();
+    // The backend fixture represents a previously observed durable native
+    // store; process launch alone deliberately no longer certifies it.
+    rusqlite::Connection::open(root.join("runtime.sqlite3"))
+        .unwrap()
+        .execute(
+            "UPDATE souls SET allocation_state='verified_durable' WHERE soul_id=?1",
+            [soul_id.as_str()],
+        )
+        .unwrap();
     if !certify_loss {
         let view = registry.inventory().await.unwrap().pop().unwrap();
         assert_eq!(view.desired_state, DesiredState::Running);
@@ -181,6 +190,11 @@ async fn fixture_fresh_soul(
             RecoveryPath::NativeResume,
             EvidenceStoreState::Missing,
             "provider_store_missing",
+        ),
+        (
+            RecoveryPath::NativeImport,
+            EvidenceStoreState::NotApplicable,
+            "no_native_import_configured",
         ),
         (
             RecoveryPath::CheckpointRestore,
@@ -520,13 +534,15 @@ async fn restored_web_stops_persisted_lost_soul_only_after_verified_cleanup() {
     assert_eq!(backend.stopped.lock().unwrap().len(), 1);
 
     backend.uncertain.store(false, Ordering::SeqCst);
-    let (status, verified) = stop(&restored, &before, before.intent_revision).await;
+    let returned_revision = uncertain["soul"]["intentRevision"].as_u64().unwrap();
+    assert_eq!(returned_revision, before.intent_revision + 1);
+    let (status, verified) = stop(&restored, &before, returned_revision).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(verified["outcome"], "verified_empty");
     assert_eq!(verified["soul"]["cleanupState"], "verified_empty");
     assert_eq!(verified["soul"]["recoveryState"], "lost");
     assert_eq!(verified["soul"]["nativeSessionId"], "retained-thread");
-    assert_eq!(verified["soul"]["intentRevision"], before.intent_revision);
+    assert_eq!(verified["soul"]["intentRevision"], returned_revision + 1);
     assert_eq!(
         *backend.stopped.lock().unwrap(),
         vec![(before.soul_id.clone(), before.incarnation_id.clone()); 2]
@@ -561,7 +577,7 @@ async fn running_soul_uncertain_stop_returns_the_revision_for_immediate_retry() 
     let (status, verified) = stop(&router, &before, returned_revision).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(verified["outcome"], "verified_empty");
-    assert_eq!(verified["soul"]["intentRevision"], returned_revision);
+    assert_eq!(verified["soul"]["intentRevision"], returned_revision + 1);
     assert_eq!(verified["soul"]["nativeSessionId"], "retained-thread");
     assert_eq!(
         *backend.stopped.lock().unwrap(),
@@ -905,7 +921,7 @@ async fn restore_lost_souls_route_requires_auth_and_runtime_connection() {
     .await
     .unwrap();
     let app = router(state);
-    let targets = (0..8)
+    let targets = (0..9)
         .map(|_| {
             json!({
                 "soulId": SoulId::new(),
@@ -916,6 +932,8 @@ async fn restore_lost_souls_route_requires_auth_and_runtime_connection() {
         .collect::<Vec<_>>();
     let body = json!({
         "idempotencyKey": RequestId::new(),
+        "scopeId": "a".repeat(64),
+        "source": {"sourceStoreId": "b".repeat(64), "rootSessionIds": ["ses_fixture_root_alpha"]},
         "targets": targets
     })
     .to_string();
@@ -947,4 +965,61 @@ async fn restore_lost_souls_route_requires_auth_and_runtime_connection() {
         .await
         .unwrap();
     assert_eq!(unavailable.status(), StatusCode::SERVICE_UNAVAILABLE);
+}
+
+#[tokio::test]
+async fn durable_souls_routes_refuse_actual_stale_preview_and_unknown_members_without_writes() {
+    let temp = tempfile::tempdir().unwrap();
+    let registry = Registry::open(temp.path(), None).unwrap();
+    let (socket, control) = start_control(
+        temp.path(),
+        registry.clone(),
+        Arc::new(StopBackend::default()),
+    )
+    .await;
+    let app = web_router(&socket, temp.path()).await;
+    for (route, body) in [
+        (
+            "/api/runtime/soul-loss-repairs/preflight",
+            json!({"sourceStoreId":"a".repeat(64),"rootSessionIds":["ses_fixture_root"],"expectedControlEpoch":registry.control_epoch()+1}),
+        ),
+        (
+            "/api/runtime/soul-loss-repairs",
+            json!({"idempotencyKey":RequestId::new(),"scopeId":"b".repeat(64),"source":{"sourceStoreId":"a".repeat(64),"rootSessionIds":["ses_fixture_root"]},"targets":[{"soulId":SoulId::new(),"incidentId":IncidentId::new(),"expectedIntentRevision":2}]}),
+        ),
+    ] {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(route)
+                    .header("x-auth-token", "web-token")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(!response.status().is_success());
+        assert_ne!(
+            response.status(),
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "valid wire requests reach real supervisor validation"
+        );
+    }
+    assert!(registry.inventory().await.unwrap().is_empty());
+    let connection = rusqlite::Connection::open(temp.path().join("runtime.sqlite3")).unwrap();
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT count(*) FROM stopped_repair_operations",
+                [],
+                |row| row.get::<_, u64>(0)
+            )
+            .unwrap(),
+        0
+    );
+    control.abort();
+    let _ = control.await;
 }

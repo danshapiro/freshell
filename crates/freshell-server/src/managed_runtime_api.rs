@@ -340,6 +340,10 @@ pub fn router(state: ManagedRuntimeApiState) -> Router {
         .route("/api/runtime/souls/{soul_id}/retry", post(retry_soul))
         .route("/api/runtime/souls/{soul_id}/stop", post(stop_soul))
         .route("/api/runtime/soul-loss-repairs", post(restore_lost_souls))
+        .route(
+            "/api/runtime/soul-loss-repairs/preflight",
+            post(preflight_lost_souls),
+        )
         .route("/api/runtime/souls/{soul_id}/limits", patch(update_limits))
         .route(
             "/api/runtime/incidents/{incident_id}/summary",
@@ -570,6 +574,8 @@ async fn stop_soul(
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct RestoreLostSoulsBody {
     idempotency_key: String,
+    scope_id: String,
+    source: freshell_runtime_protocol::RepairBatchSourceSelection,
     targets: Vec<LostSoulRepairTarget>,
     #[serde(default)]
     canonical_owners: Vec<freshell_runtime_protocol::CanonicalOwnerChoice>,
@@ -588,11 +594,13 @@ async fn restore_lost_souls(
         Err(error) => return bad_request(error.to_string()),
     };
     let request = freshell_runtime_protocol::RestoreLostSoulsRequest {
+        scope_id: body.scope_id.clone(),
+        source: body.source.clone(),
         targets: body.targets.clone(),
         canonical_owners: body.canonical_owners.clone(),
         expected_control_epoch: None,
     };
-    if let Err(error) = request.validate_exact_batch() {
+    if let Err(error) = request.validate_payload() {
         return bad_request(error.message);
     }
     let client = match runtime_client(&state) {
@@ -600,10 +608,45 @@ async fn restore_lost_souls(
         Err(rejection) => return rejection.into_response(),
     };
     match client
-        .restore_lost_souls(request_id, body.targets, body.canonical_owners)
+        .restore_lost_souls(
+            request_id,
+            body.scope_id,
+            body.source,
+            body.targets,
+            body.canonical_owners,
+        )
         .await
     {
         Ok(result) => Json(result).into_response(),
+        Err(error) => client_error(error),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PreflightLostSoulsBody {
+    #[serde(flatten)]
+    source: freshell_runtime_protocol::RepairBatchSourceSelection,
+    expected_control_epoch: Option<u64>,
+}
+
+async fn preflight_lost_souls(
+    State(state): State<ManagedRuntimeApiState>,
+    headers: HeaderMap,
+    Json(body): Json<PreflightLostSoulsBody>,
+) -> Response {
+    if !is_authed(&headers, &state.auth_token) {
+        return unauthorized();
+    }
+    let client = match runtime_client(&state) {
+        Ok(client) => client,
+        Err(rejection) => return rejection.into_response(),
+    };
+    match client
+        .preflight_lost_souls_at_epoch(body.source, body.expected_control_epoch)
+        .await
+    {
+        Ok(scope) => Json(scope).into_response(),
         Err(error) => client_error(error),
     }
 }
