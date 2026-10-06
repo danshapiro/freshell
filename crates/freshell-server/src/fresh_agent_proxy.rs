@@ -469,7 +469,10 @@ impl HostedFreshAgentProxy {
                 &workspace,
                 &cwd,
                 Some(mcp_capability.clone()),
-            );
+            )
+            .map_err(|error| {
+                tracing::warn!(event="fresh_agent.create.provider_environment_failed", %error);
+            })?;
         // Fresh agents use the direct provider transports, which currently do
         // not inject Freshell's terminal MCP server. Retain ordinary provider
         // MCP/config files, plugins, and the staged user root; only remove

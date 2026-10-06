@@ -61,6 +61,7 @@ pub mod mcp_inject;
 pub mod opencode_config;
 pub mod opencode_plugin;
 pub mod path;
+pub mod provider_environment;
 pub mod resume_gate;
 pub mod spawn;
 

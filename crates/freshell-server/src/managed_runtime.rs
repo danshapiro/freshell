@@ -228,7 +228,7 @@ impl ManagedTerminalController for ServerManagedRuntimeController {
                     &workspace,
                     &cwd,
                     mcp_capability.clone(),
-                );
+                )?;
             if let Some(context) = provider_launch_context.as_mut() {
                 if let freshell_runtime_protocol::ProviderPreparation::Opencode {
                     inline_config,

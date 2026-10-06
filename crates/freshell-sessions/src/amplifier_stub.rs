@@ -85,6 +85,7 @@ pub fn resolve_amplifier_home() -> Option<PathBuf> {
 /// slug, so spawning at the requested cwd would silently find nothing.
 #[derive(Debug, Clone)]
 pub struct EnsuredSession {
+    pub created_paths: Vec<PathBuf>,
     pub session_dir: PathBuf,
     pub created: bool,
     pub found_under_divergent_slug: bool,
@@ -115,11 +116,104 @@ pub struct EnsuredSession {
 /// resolves safely); plus empty `transcript.jsonl` and empty
 /// `events.jsonl` (the latter so the activity hub's create-time resolver
 /// attach finds a file — see the module design note).
+/// Records only successful create operations; pre-existing directories never
+/// confer ownership authority. Failed attempts remove only their own inodes.
+fn create_directories_recorded(path: &Path, created: &mut Vec<PathBuf>) -> std::io::Result<()> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => return Ok(()),
+        Ok(_) => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "session parent must be a physical directory",
+            ))
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+    if let Some(parent) = path.parent() {
+        create_directories_recorded(parent, created)?;
+    }
+    if created.len() >= freshell_platform::provider_environment::CopyLimits::default().max_entries {
+        return Err(std::io::Error::other(
+            "created provider paths exceed the shared entry bound",
+        ));
+    }
+    let mut builder = std::fs::DirBuilder::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    match builder.create(path) {
+        Ok(()) => {
+            created.push(path.to_path_buf());
+            Ok(())
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            let metadata = std::fs::symlink_metadata(path)?;
+            if metadata.is_dir() && !metadata.file_type().is_symlink() {
+                Ok(())
+            } else {
+                Err(error)
+            }
+        }
+        Err(error) => Err(error),
+    }
+}
+fn create_file_recorded(
+    path: &Path,
+    bytes: &[u8],
+    created: &mut Vec<PathBuf>,
+) -> std::io::Result<()> {
+    use std::io::Write;
+    if created.len() >= freshell_platform::provider_environment::CopyLimits::default().max_entries {
+        return Err(std::io::Error::other(
+            "created provider paths exceed the shared entry bound",
+        ));
+    }
+    let mut options = std::fs::OpenOptions::new();
+    options.create_new(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(path)?;
+    created.push(path.to_path_buf());
+    file.write_all(bytes)
+}
+fn rollback_created_paths(created: &[PathBuf]) {
+    for path in created.iter().rev() {
+        if let Ok(metadata) = std::fs::symlink_metadata(path) {
+            if metadata.is_dir() {
+                let _ = std::fs::remove_dir(path);
+            } else {
+                let _ = std::fs::remove_file(path);
+            }
+        }
+    }
+}
+
 pub fn ensure_session(
     amplifier_home: &Path,
     session_id: &str,
     cwd: &str,
     terminal_id: &str,
+) -> std::io::Result<EnsuredSession> {
+    ensure_session_with_writer(
+        amplifier_home,
+        session_id,
+        cwd,
+        terminal_id,
+        create_file_recorded,
+    )
+}
+fn ensure_session_with_writer(
+    amplifier_home: &Path,
+    session_id: &str,
+    cwd: &str,
+    terminal_id: &str,
+    mut write_file: impl FnMut(&Path, &[u8], &mut Vec<PathBuf>) -> std::io::Result<()>,
 ) -> std::io::Result<EnsuredSession> {
     // Path-safety gate (defense in depth): the id is joined into
     // filesystem paths (`projects/<slug>/sessions/<session_id>`) that this
@@ -183,6 +277,7 @@ pub fn ensure_session(
                     );
                 }
                 return Ok(EnsuredSession {
+                    created_paths: Vec::new(),
                     session_dir: candidate,
                     created: false,
                     found_under_divergent_slug: divergent,
@@ -196,7 +291,11 @@ pub fn ensure_session(
         .join(expected_slug)
         .join("sessions")
         .join(session_id);
-    std::fs::create_dir_all(&dir)?;
+    let mut created_paths = Vec::new();
+    if let Err(error) = create_directories_recorded(&dir, &mut created_paths) {
+        rollback_created_paths(&created_paths);
+        return Err(error);
+    }
     let mut metadata = serde_json::json!({
         "session_id": session_id,
         "created": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
@@ -220,30 +319,22 @@ pub fn ensure_session(
     if let Some(bundle) = crate::bundle_config::resolve_active_bundle(amplifier_home, &resolved) {
         metadata["bundle"] = serde_json::Value::String(bundle);
     }
-    // The three stub-file writes below can fail partway through (ENOSPC,
-    // permissions, ...) after create_dir_all already succeeded. On that
-    // path, best-effort roll back the directory rather than leaving a
-    // metadata-less dir behind: such a dir has no parseable metadata.json,
-    // so `stub_is_unused` conservatively KEEPS it forever (never GC-able),
-    // and a later `ensure_session` call for the same id would silently
-    // ADOPT it via the bare `candidate.is_dir()` check above, treating a
-    // half-written stub as a legitimate find. Council-scoped: ONE
-    // best-effort `remove_dir_all` — no atomic-write/rollback scaffolding.
-    // The rollback's own error is ignored; the original write error wins.
     let write_result: std::io::Result<()> = (|| {
-        std::fs::write(
-            dir.join("metadata.json"),
-            serde_json::to_string_pretty(&metadata)?,
+        write_file(
+            &dir.join("metadata.json"),
+            serde_json::to_string_pretty(&metadata)?.as_bytes(),
+            &mut created_paths,
         )?;
-        std::fs::write(dir.join("transcript.jsonl"), "")?;
-        std::fs::write(dir.join("events.jsonl"), "")?;
+        write_file(&dir.join("transcript.jsonl"), b"", &mut created_paths)?;
+        write_file(&dir.join("events.jsonl"), b"", &mut created_paths)?;
         Ok(())
     })();
-    if let Err(e) = write_result {
-        let _ = std::fs::remove_dir_all(&dir);
-        return Err(e);
+    if let Err(error) = write_result {
+        rollback_created_paths(&created_paths);
+        return Err(error);
     }
     Ok(EnsuredSession {
+        created_paths,
         session_dir: dir,
         created: true,
         found_under_divergent_slug: false,
@@ -1020,6 +1111,118 @@ mod tests {
         .unwrap();
         assert!(meta.get("bundle").is_none());
         let _ = std::fs::remove_dir_all(&home);
+    }
+    mod created_path_ledger {
+
+        use super::*;
+        struct Fixture(PathBuf);
+        impl Fixture {
+            fn path(&self) -> &Path {
+                &self.0
+            }
+        }
+        impl Drop for Fixture {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        fn fixture() -> Fixture {
+            Fixture(unique_temp_home("created-path-ledger"))
+        }
+        use std::collections::BTreeSet;
+        #[test]
+        fn created_path_ledger_records_exact_new_parents_and_leaves() {
+            let root = fixture();
+            let home = root.path().join("provider/.amplifier");
+            let ensured =
+                ensure_session(&home, "session", root.path().to_str().unwrap(), "terminal")
+                    .unwrap();
+            let mut expected = BTreeSet::new();
+            for path in ensured
+                .session_dir
+                .ancestors()
+                .take_while(|path| *path != root.path())
+            {
+                expected.insert(path.to_path_buf());
+            }
+            for name in ["metadata.json", "transcript.jsonl", "events.jsonl"] {
+                expected.insert(ensured.session_dir.join(name));
+            }
+            assert_eq!(
+                ensured
+                    .created_paths
+                    .iter()
+                    .cloned()
+                    .collect::<BTreeSet<_>>(),
+                expected
+            );
+            assert!(ensured.created_paths.iter().all(|path| path.exists()));
+        }
+        #[test]
+        fn created_path_ledger_omits_preexisting_parents_and_adopted_siblings() {
+            let root = fixture();
+            let home = root.path().join(".amplifier");
+            std::fs::create_dir(&home).unwrap();
+            std::fs::write(home.join("sibling"), "sentinel").unwrap();
+            let first = ensure_session(&home, "session", root.path().to_str().unwrap(), "terminal")
+                .unwrap();
+            assert!(!first.created_paths.contains(&home));
+            assert_eq!(first.created_paths.len(), 7);
+            let adopted =
+                ensure_session(&home, "session", root.path().to_str().unwrap(), "terminal")
+                    .unwrap();
+            assert!(!adopted.created);
+            assert!(adopted.created_paths.is_empty());
+            assert_eq!(std::fs::read(home.join("sibling")).unwrap(), b"sentinel");
+        }
+        #[test]
+        fn partial_stub_write_rolls_back_only_this_attempts_created_paths() {
+            let root = fixture();
+            let home = root.path().join(".amplifier");
+            std::fs::create_dir(&home).unwrap();
+            std::fs::write(home.join("sibling"), "sentinel").unwrap();
+            let mut written = Vec::new();
+            let result = ensure_session_with_writer(
+                &home,
+                "session",
+                root.path().to_str().unwrap(),
+                "terminal",
+                |path, bytes, created| {
+                    if path.file_name().unwrap() == "events.jsonl" {
+                        return Err(std::io::Error::other("synthetic fixture write failure"));
+                    }
+                    create_file_recorded(path, bytes, created)?;
+                    written.push(path.to_owned());
+                    Ok(())
+                },
+            );
+            assert!(result.is_err());
+            assert_eq!(written.len(), 2);
+            assert!(written.iter().all(|path| !path.exists()));
+            assert!(!home.join("projects").exists());
+            assert_eq!(std::fs::read(home.join("sibling")).unwrap(), b"sentinel");
+            let retry = ensure_session(&home, "session", root.path().to_str().unwrap(), "terminal")
+                .unwrap();
+            assert!(retry.created);
+            assert!(!retry.created_paths.contains(&home));
+            assert!(!retry.created_paths.contains(&home.join("sibling")));
+        }
+        #[test]
+        fn created_path_ledger_failed_creation_grants_no_surviving_authority() {
+            let root = fixture();
+            let home = root.path().join(".amplifier");
+            std::fs::create_dir(&home).unwrap();
+            std::fs::write(home.join("projects"), "blocking-file").unwrap();
+            assert!(
+                ensure_session(&home, "session", root.path().to_str().unwrap(), "terminal")
+                    .is_err()
+            );
+            assert_eq!(
+                std::fs::read(home.join("projects")).unwrap(),
+                b"blocking-file"
+            );
+            assert_eq!(std::fs::read_dir(&home).unwrap().count(), 1);
+        }
     }
 }
 

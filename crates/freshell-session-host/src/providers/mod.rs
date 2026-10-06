@@ -33,9 +33,9 @@ pub struct PreparedTerminal {
 
 pub fn prepare_provider_state_before_bootstrap(
     terminal: &mut freshell_runtime_protocol::TerminalLaunchSpec,
-) -> Result<(), String> {
+) -> Result<Vec<std::path::PathBuf>, String> {
     if terminal.mode != "amplifier" {
-        return Ok(());
+        return Ok(Vec::new());
     }
     let session_id = terminal
         .resume_session_id
@@ -55,7 +55,7 @@ pub fn prepare_provider_state_before_bootstrap(
     if let Some(recorded_cwd) = ensured.working_dir_of_existing {
         terminal.cwd = recorded_cwd;
     }
-    Ok(())
+    Ok(ensured.created_paths)
 }
 
 pub async fn prepare_terminal(
