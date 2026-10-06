@@ -37,6 +37,7 @@ pub struct TerminalMounts {
     pub git_common_dir: Option<PathBuf>,
     pub provider_bootstrap_files: Vec<PathBuf>,
     pub provider_secret_files: Vec<PathBuf>,
+    pub indexed_secret_sources: std::collections::BTreeMap<usize, u16>,
     pub provider_user_root: Option<PathBuf>,
     pub mcp_capability_file: Option<PathBuf>,
     pub input_manifest: Option<PathBuf>,
@@ -129,7 +130,12 @@ fn workload_mounts(
         provider_bootstrap_files.push(source);
     }
     let mut provider_secret_files = Vec::with_capacity(secret_references.len());
-    for secret in secret_references {
+    let mut indexed_secret_sources = std::collections::BTreeMap::new();
+    let indexed = context
+        .and_then(|context| context.prepared_inputs.as_ref())
+        .is_some_and(|inputs| inputs.indexed_files.is_some());
+    let mut source_id = 0u16;
+    for (index, secret) in secret_references.iter().enumerate() {
         let source = std::fs::canonicalize(&secret.source_path)
             .map_err(|error| format!("provider secret reference: {error}"))?;
         if !source.is_file() || source != Path::new(&secret.source_path) {
@@ -151,6 +157,10 @@ fn workload_mounts(
         }
         reject_management_path(&source)?;
         provider_secret_files.push(source);
+        if indexed && secret.profile.is_configuration_file() {
+            indexed_secret_sources.insert(index, source_id);
+            source_id += 1;
+        }
     }
     let provider_user_root =
         if let Some(capability) = context.and_then(|context| context.mcp_capability.as_ref()) {
@@ -218,6 +228,7 @@ fn workload_mounts(
         git_common_dir,
         provider_bootstrap_files,
         provider_secret_files,
+        indexed_secret_sources,
         provider_user_root,
         mcp_capability_file,
         input_manifest: prepared.input_manifest,

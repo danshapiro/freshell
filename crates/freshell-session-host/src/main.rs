@@ -941,6 +941,11 @@ async fn grant_execution(
                 &resolved_secrets.configuration_files,
                 terminal.run_as_uid,
                 terminal.run_as_gid,
+                terminal
+                    .provider_launch_context
+                    .as_ref()
+                    .and_then(|context| context.prepared_inputs.as_ref())
+                    .is_some_and(|inputs| inputs.indexed_files.is_some()),
             )
             .map_err(|error| {
                 RuntimeError::new(
@@ -1060,6 +1065,11 @@ async fn grant_execution(
                 &resolved_secrets.configuration_files,
                 launch.run_as_uid,
                 launch.run_as_gid,
+                launch
+                    .provider_launch_context
+                    .as_ref()
+                    .and_then(|context| context.prepared_inputs.as_ref())
+                    .is_some_and(|inputs| inputs.indexed_files.is_some()),
             )
             .map_err(|error| {
                 RuntimeError::new(
@@ -1991,6 +2001,7 @@ fn prepare_provider_files(
     configuration_files: &[(String, PathBuf)],
     run_as_uid: u32,
     run_as_gid: u32,
+    indexed_configuration: bool,
 ) -> Result<(), String> {
     prepare_provider_files_at(
         Path::new("/home/freshell/provider"),
@@ -2000,6 +2011,7 @@ fn prepare_provider_files(
         configuration_files,
         run_as_uid,
         run_as_gid,
+        indexed_configuration,
     )
 }
 
@@ -2011,12 +2023,15 @@ fn prepare_provider_files_at(
     configuration_files: &[(String, PathBuf)],
     run_as_uid: u32,
     run_as_gid: u32,
+    indexed_configuration: bool,
 ) -> Result<(), String> {
     if provider_files.is_empty() && configuration_files.is_empty() {
         return Ok(());
     }
-    std::fs::create_dir_all(auth_dir).map_err(|error| error.to_string())?;
-    set_mode(auth_dir, 0o711)?;
+    if !provider_files.is_empty() || !indexed_configuration {
+        std::fs::create_dir_all(auth_dir).map_err(|error| error.to_string())?;
+        set_mode(auth_dir, 0o711)?;
+    }
     // Retain native auth until a matching typed grant has been written and
     // owned. The final destination replacement occurs only for that grant.
     for (index, (relative, contents)) in provider_files.iter().enumerate() {
@@ -2062,6 +2077,29 @@ fn prepare_provider_files_at(
     let mut aggregate = 0u64;
     for (index, (relative, source)) in configuration_files.iter().enumerate() {
         let destination = home.join(relative);
+        if indexed_configuration {
+            use std::io::Read;
+            let metadata = std::fs::symlink_metadata(source)
+                .map_err(|_| "indexed configuration-file mount unavailable")?;
+            if !metadata.is_file() {
+                return Err("indexed configuration-file mount is not regular".into());
+            }
+            let bytes = std::io::copy(
+                &mut std::fs::File::open(source)
+                    .map_err(|_| "indexed configuration-file mount unreadable")?
+                    .take(16 * 1024 * 1024 + 1),
+                &mut std::io::sink(),
+            )
+            .map_err(|_| "indexed configuration-file read failed")?;
+            aggregate = aggregate
+                .checked_add(bytes)
+                .ok_or("indexed configuration-file size overflow")?;
+            if bytes > 16 * 1024 * 1024 || aggregate > 32 * 1024 * 1024 {
+                return Err("indexed configuration-file actual bytes exceed profile".into());
+            }
+            publish_configuration_link(&destination, source, run_as_uid, run_as_gid)?;
+            continue;
+        }
         let target = auth_dir.join(format!("configuration-{index}"));
         let temporary = auth_dir.join(format!(
             "configuration-{index}-tmp-{}",
@@ -2093,38 +2131,7 @@ fn prepare_provider_files_at(
                 .map_err(|_| "configuration-file ownership failed")?;
             std::fs::rename(&temporary, &target)
                 .map_err(|_| "configuration-file publication failed")?;
-            let parent = destination
-                .parent()
-                .ok_or("configuration-file destination has no parent")?;
-            run_provider_path_command(
-                run_as_uid,
-                run_as_gid,
-                "/usr/bin/mkdir",
-                &[
-                    "-p",
-                    "--",
-                    parent
-                        .to_str()
-                        .ok_or("configuration-file parent is not UTF-8")?,
-                ],
-            )
-            .map_err(|_| "configuration-file parent creation failed")?;
-            run_provider_path_command(
-                run_as_uid,
-                run_as_gid,
-                "/usr/bin/ln",
-                &[
-                    "-sfnT",
-                    "--",
-                    target
-                        .to_str()
-                        .ok_or("configuration-file target is not UTF-8")?,
-                    destination
-                        .to_str()
-                        .ok_or("configuration-file destination is not UTF-8")?,
-                ],
-            )
-            .map_err(|_| "configuration-file link publication failed")?;
+            publish_configuration_link(&destination, &target, run_as_uid, run_as_gid)?;
             Ok(())
         })();
         if result.is_err() {
@@ -2133,6 +2140,46 @@ fn prepare_provider_files_at(
         result.map_err(str::to_string)?;
     }
     Ok(())
+}
+
+fn publish_configuration_link(
+    destination: &Path,
+    target: &Path,
+    uid: u32,
+    gid: u32,
+) -> Result<(), &'static str> {
+    let parent = destination
+        .parent()
+        .ok_or("configuration-file destination has no parent")?;
+    run_provider_path_command(
+        uid,
+        gid,
+        "/usr/bin/mkdir",
+        &[
+            "-p",
+            "--",
+            parent
+                .to_str()
+                .ok_or("configuration-file parent is not UTF-8")?,
+        ],
+    )
+    .map_err(|_| "configuration-file parent creation failed")?;
+    run_provider_path_command(
+        uid,
+        gid,
+        "/usr/bin/ln",
+        &[
+            "-sfnT",
+            "--",
+            target
+                .to_str()
+                .ok_or("configuration-file target is not UTF-8")?,
+            destination
+                .to_str()
+                .ok_or("configuration-file destination is not UTF-8")?,
+        ],
+    )
+    .map_err(|_| "configuration-file link publication failed")
 }
 
 fn run_provider_path_command(
@@ -2855,6 +2902,7 @@ mod tests {
             &[],
             uid,
             gid,
+            false,
         )
         .unwrap();
         assert_eq!(std::fs::read_to_string(&auth).unwrap(), native);
@@ -2866,6 +2914,7 @@ mod tests {
             &[],
             uid,
             gid,
+            false,
         )
         .unwrap();
         assert_eq!(std::fs::read_to_string(&auth).unwrap(), native);
@@ -2878,6 +2927,7 @@ mod tests {
             &[],
             uid,
             gid,
+            false,
         )
         .unwrap();
         assert_eq!(std::fs::read(&auth).unwrap(), replacement);
@@ -2887,6 +2937,54 @@ mod tests {
             .is_symlink());
     }
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn provider_secret_indexed_configuration_consumer_keeps_the_mounted_inode_without_a_second_copy(
+    ) {
+        use sha2::{Digest, Sha256};
+        use std::os::unix::fs::MetadataExt;
+        let fixture = tempfile::tempdir().unwrap();
+        let home = fixture.path().join("home");
+        let private = fixture.path().join("legacy-private-copy");
+        let mounted = fixture.path().join("published-index-0");
+        std::fs::create_dir(&home).unwrap();
+        std::fs::write(&mounted, b"PRIVATE_INDEXED_GENERATION_SENTINEL").unwrap();
+        let (uid, gid) = unsafe { (libc::geteuid(), libc::getegid()) };
+        prepare_provider_files_at(
+            &home,
+            &private,
+            "opencode",
+            &[],
+            &[(".freshell/references/0".into(), mounted.clone())],
+            uid,
+            gid,
+            true,
+        )
+        .unwrap();
+        let selected = home.join(".freshell/references/0");
+        let receipt=std::process::Command::new("node").env_clear()
+            .env("PATH",std::env::var_os("PATH").unwrap())
+            .args(["-e","process.stdout.write(require('crypto').createHash('sha256').update(require('fs').readFileSync(process.argv[1])).digest('hex'))"])
+            .arg(&selected).output().unwrap();
+        assert!(receipt.status.success());
+        assert_eq!(
+            String::from_utf8(receipt.stdout).unwrap(),
+            format!(
+                "{:x}",
+                Sha256::digest(b"PRIVATE_INDEXED_GENERATION_SENTINEL")
+            )
+        );
+        assert_eq!(
+            std::fs::metadata(&selected).unwrap().ino(),
+            std::fs::metadata(&mounted).unwrap().ino()
+        );
+        assert_eq!(std::fs::read_link(&selected).unwrap(), mounted);
+        assert!(
+            !private.exists(),
+            "indexed publication must not make another private payload copy"
+        );
+    }
 
     #[cfg(unix)]
     #[test]

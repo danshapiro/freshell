@@ -34,6 +34,19 @@ pub(super) fn mount_descriptors(
         )?;
     }
     if let Some(files) = &mounts.indexed_files {
+        for (index, source_id) in &mounts.indexed_secret_sources {
+            if *index >= mounts.provider_secret_files.len() || *source_id >= 128 {
+                return Err(BackendError::InvalidConfig(
+                    "prepared private input index is invalid".into(),
+                ));
+            }
+            let destination = format!("/run/freshell-secrets/provider-{index}");
+            add(
+                &destination,
+                json!({"Type":"volume","Source":files.volume_name,"Target":destination,"ReadOnly":true,
+                "VolumeOptions":{"NoCopy":true,"Subpath":format!("files/source-{source_id}")}}),
+            )?;
+        }
         for alias in &files.aliases {
             add(
                 &alias.effective_destination,
@@ -41,6 +54,10 @@ pub(super) fn mount_descriptors(
                 "VolumeOptions":{"NoCopy":true,"Subpath":format!("files/source-{}",alias.source_id)}}),
             )?;
         }
+    } else if !mounts.indexed_secret_sources.is_empty() {
+        return Err(BackendError::InvalidConfig(
+            "prepared private input volume is missing".into(),
+        ));
     }
     Ok(selected.into_values().collect())
 }
@@ -138,6 +155,7 @@ mod tests {
             git_common_dir: None,
             provider_bootstrap_files: vec![],
             provider_secret_files: vec![],
+            indexed_secret_sources: BTreeMap::new(),
             provider_user_root: None,
             mcp_capability_file: None,
             input_manifest: None,
@@ -182,6 +200,36 @@ mod tests {
             ),
         ]);
         (mounts, actual, volumes)
+    }
+
+    #[test]
+    fn provider_prepared_indexed_secret_read_uses_the_published_generation() {
+        let (mut mounts, mut actual, volumes) = fixture();
+        mounts.provider_secret_files = vec!["/approved/controller-source".into()];
+        mounts.indexed_secret_sources.insert(0, 0);
+        let descriptors = mount_descriptors(&mounts, "owned-provider").unwrap();
+        let private=descriptors.iter().find(|mount|mount["Target"]=="/run/freshell-secrets/provider-0")
+            .expect("host input must bind the already-published generation, not the changing controller source");
+        assert_eq!(private["Type"], "volume");
+        assert_eq!(
+            private["Source"],
+            "freshell-inputs-aaaaaaaaaaaaaaaaaaaaaaaa"
+        );
+        assert_eq!(private["VolumeOptions"]["Subpath"], "files/source-0");
+        assert_eq!(private["ReadOnly"], true);
+        actual["HostConfig"]["Mounts"] = json!(descriptors);
+        actual["Mounts"].as_array_mut().unwrap().push(json!({"Type":"volume","Name":"freshell-inputs-aaaaaaaaaaaaaaaaaaaaaaaa","Source":"/docker/volumes/freshell-inputs-aaaaaaaaaaaaaaaaaaaaaaaa/_data","Destination":"/run/freshell-secrets/provider-0","RW":false}));
+        verify(&actual, &mounts, "owned-provider", &volumes).unwrap();
+        actual["Mounts"].as_array_mut().unwrap().push(json!({"Type":"bind","Source":"/fixture/workspace","Destination":"/fixture/workspace","RW":true}));
+        super::super::verify_workload_mounts(actual["Mounts"].as_array().unwrap(), &mounts)
+            .unwrap();
+        actual["HostConfig"]["Mounts"]
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .find(|mount| mount["Target"] == "/run/freshell-secrets/provider-0")
+            .unwrap()["VolumeOptions"]["Subpath"] = json!("files/source-1");
+        assert!(verify(&actual, &mounts, "owned-provider", &volumes).is_err());
     }
     #[test]
     fn provider_prepared_adoption_checks_subpaths_nocopy_and_actual_volume_options() {

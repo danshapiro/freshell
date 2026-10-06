@@ -697,6 +697,9 @@ impl RuntimeBackend for DockerEngineBackend {
                 ));
             }
             for (index, source) in mounts.provider_secret_files.iter().enumerate() {
+                if mounts.indexed_secret_sources.contains_key(&index) {
+                    continue;
+                }
                 binds.push(format!(
                     "{}:/run/freshell-secrets/provider-{index}:ro",
                     source.display()
@@ -1389,6 +1392,11 @@ fn verify_workload_mounts(
         }
     }
     for (index, source) in expected.provider_secret_files.iter().enumerate() {
+        // The prepared mount verifier establishes the owned tmpfs/subpath
+        // identity for these inputs; they are no longer controller binds.
+        if expected.indexed_secret_sources.contains_key(&index) {
+            continue;
+        }
         let source_text = source.to_string_lossy();
         let destination = format!("/run/freshell-secrets/provider-{index}");
         let found = mounts.iter().any(|mount| {

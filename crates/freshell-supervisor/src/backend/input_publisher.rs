@@ -722,6 +722,7 @@ mod tests {
             git_common_dir: None,
             provider_bootstrap_files: vec![],
             provider_secret_files: vec![source.clone()],
+            indexed_secret_sources: BTreeMap::from([(0, 0)]),
             provider_user_root: None,
             mcp_capability_file: None,
             input_manifest: None,
