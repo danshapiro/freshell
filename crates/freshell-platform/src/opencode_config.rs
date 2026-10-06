@@ -716,10 +716,38 @@ pub fn file_reference_path(
     home: &Path,
 ) -> PathBuf {
     if let Some(relative) = path.strip_prefix("~/") {
-        home.join(relative)
-    } else if Path::new(path).is_absolute() {
-        path.into()
-    } else {
-        declaring_config.parent().unwrap_or(cwd).join(path)
+        return lexical_path(&home.join(relative.trim_start_matches('/')));
     }
+    if Path::new(path).is_absolute() {
+        return path.into();
+    }
+    let declaring_parent = declaring_config
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty());
+    let parent = match declaring_parent {
+        Some(parent) if parent.is_absolute() => parent.to_owned(),
+        Some(parent) => cwd.join(parent),
+        None => cwd.to_owned(),
+    };
+    // Node path.resolve normalizes '..' before filesystem symlinks are read.
+    lexical_path(&parent.join(path))
+}
+
+fn lexical_path(path: &Path) -> PathBuf {
+    use std::path::Component;
+    let mut result = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if matches!(result.components().next_back(), Some(Component::Normal(_))) {
+                    result.pop();
+                } else if !result.has_root() {
+                    result.push(component.as_os_str());
+                }
+            }
+            other => result.push(other.as_os_str()),
+        }
+    }
+    result
 }

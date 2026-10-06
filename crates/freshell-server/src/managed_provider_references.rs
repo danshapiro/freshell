@@ -582,4 +582,54 @@ process.stdout.write(JSON.stringify(receipts));
         );
         assert_eq!(plan.recipes[0].unexpanded_source, "{env:OPENAI_API_KEY}");
     }
+    #[test]
+    fn managed_provider_references_virtual_inline_uses_instance_cwd() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join("rules"), "inline-instance-nonce").unwrap();
+        let plan = resolve_file_references(
+            r#"{"x":"{file:rules}"}"#,
+            FileSourceOrigin {
+                declaring_config: Path::new("OPENCODE_CONFIG_CONTENT"),
+                cwd: temp.path(),
+                original_home: temp.path(),
+            },
+            &|_| None,
+        )
+        .unwrap();
+        assert_eq!(
+            consume(&plan, &temp.path().join("runtime")),
+            vec![digest("inline-instance-nonce")]
+        );
+    }
+    #[test]
+    fn managed_provider_references_relative_parent_is_lexical_before_following_directory_symlink() {
+        let temp = tempfile::tempdir().unwrap();
+        let logical = temp.path().join("logical");
+        let actual = temp.path().join("actual/config");
+        std::fs::create_dir_all(&logical).unwrap();
+        std::fs::create_dir_all(&actual).unwrap();
+        std::fs::write(logical.join("rules"), "native-lexical-origin-nonce").unwrap();
+        std::fs::write(
+            temp.path().join("actual/rules"),
+            "wrong-physical-origin-nonce",
+        )
+        .unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&actual, logical.join("linked")).unwrap();
+        let source = logical.join("linked/opencode.json");
+        let plan = resolve_file_references(
+            r#"{"x":"{file:../rules}"}"#,
+            FileSourceOrigin {
+                declaring_config: &source,
+                cwd: temp.path(),
+                original_home: temp.path(),
+            },
+            &|_| None,
+        )
+        .unwrap();
+        assert_eq!(
+            consume(&plan, &temp.path().join("runtime")),
+            vec![digest("native-lexical-origin-nonce")]
+        );
+    }
 }
