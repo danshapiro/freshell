@@ -71,6 +71,14 @@ struct SpawnedTerminalPty {
 
 #[async_trait::async_trait]
 trait GrantExecutionEffects: Sync {
+    async fn open_fresh_agent(
+        &self,
+        state_dir: &Path,
+        launch: FreshAgentLaunchSpec,
+    ) -> Result<Arc<freshell_agent_runtime::host_actor::FreshAgentHostActor>, String> {
+        providers::open_hosted_fresh_agent(state_dir, launch).await
+    }
+
     fn run_opencode_provider_helper(
         &self,
         terminal: &TerminalLaunchSpec,
@@ -1298,8 +1306,15 @@ async fn grant_execution(
                     &state.provider_config_paths,
                 )
                 .map_err(|error| {
-                    append_event_with_secret(&state.state_dir, &state.secret, "host.provider_config_publication_blocked", serde_json::json!({"severity":"warn","soulId":soul_id,"incarnationId":state.incarnation_id,"controlEpoch":control_epoch,"executionGeneration":execution_generation,"provider":terminal.mode,"reason":"selected_dependency_unavailable"})).ok();
-                    RuntimeError::new(RuntimeErrorCode::HostUnreachable,format!("capability_pending: provider configuration publication failed: {error}"))
+                    provider_config_publication_error(
+                        state,
+                        &soul_id,
+                        control_epoch,
+                        execution_generation,
+                        &terminal.mode,
+                        resume_spec.as_ref(),
+                        error,
+                    )
                 })?;
             }
             let resolved_secrets = provider_secret_resolution::resolve_child_secrets(
@@ -1430,7 +1445,17 @@ async fn grant_execution(
                     launch.run_as_gid,
                     &state.provider_config_paths,
                 )
-                .map_err(|error| RuntimeError::new(RuntimeErrorCode::HostUnreachable, error))?;
+                .map_err(|error| {
+                    provider_config_publication_error(
+                        state,
+                        &soul_id,
+                        control_epoch,
+                        execution_generation,
+                        launch.provider.as_str(),
+                        resume_spec.as_ref(),
+                        error,
+                    )
+                })?;
             }
             let mut resolved_secrets = provider_secret_resolution::resolve_child_secrets(
                 launch.provider.as_str(),
@@ -1462,7 +1487,8 @@ async fn grant_execution(
             .map_err(|error| RuntimeError::new(RuntimeErrorCode::HostUnreachable, error))?;
             freshell_platform::managed_child_secrets::install(resolved_secrets.environment)
                 .map_err(|error| RuntimeError::new(RuntimeErrorCode::HostUnreachable, error))?;
-            let actor = providers::open_hosted_fresh_agent(&state.state_dir, launch.clone())
+            let actor = effects
+                .open_fresh_agent(&state.state_dir, launch.clone())
                 .await
                 .map_err(|error| {
                     RuntimeError::new(
@@ -1520,6 +1546,37 @@ fn adoption_status_for_required(required: bool) -> OpenCodeAdoptionStatus {
     } else {
         OpenCodeAdoptionStatus::NotRequired
     }
+}
+
+fn provider_config_publication_error(
+    state: &HostState,
+    soul_id: &SoulId,
+    control_epoch: u64,
+    execution_generation: u64,
+    provider: &str,
+    resume: Option<&ResumeSpec>,
+    error: String,
+) -> RuntimeError {
+    // Classification comes from this publication boundary, never from native
+    // error wording. The event carries fenced references, not raw diagnostics.
+    append_event_with_secret(
+        &state.state_dir,
+        &state.secret,
+        "host.provider_config_publication_blocked",
+        serde_json::json!({
+            "severity":"warn", "soulId":soul_id, "incarnationId":state.incarnation_id,
+            "controlEpoch":control_epoch, "executionGeneration":execution_generation,
+            "provider":provider, "reason":"selected_dependency_unavailable",
+            "providerSession":resume.map(|resume| &resume.provider_session),
+            "evidenceRevision":resume.map(|resume| resume.evidence_revision),
+            "checkpointRevision":resume.map(|resume| resume.checkpoint_revision),
+        }),
+    )
+    .ok();
+    RuntimeError::new(
+        RuntimeErrorCode::HostUnreachable,
+        format!("capability_pending: provider configuration publication failed: {error}"),
+    )
 }
 
 const OPENCODE_TRANSFER_MOUNT: &str = "/run/freshell-opencode-transfer";
@@ -5440,6 +5497,309 @@ mod tests {
         let error = dispatch(envelope, &state).await.unwrap_err();
         assert_eq!(error.code, RuntimeErrorCode::OwnershipMismatch);
         assert!(state.child.lock().await.is_none());
+    }
+
+    struct ConfigPublicationGrantEffects {
+        opens: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl GrantExecutionEffects for ConfigPublicationGrantEffects {
+        fn run_opencode_provider_helper(
+            &self,
+            _: &TerminalLaunchSpec,
+            _: &OpenCodeTransferDescriptor,
+            _: &Path,
+            _: &Path,
+            _: &str,
+            _: Option<&Path>,
+        ) -> Result<Vec<u8>, String> {
+            panic!("fresh publication must not run a terminal helper")
+        }
+
+        async fn spawn_terminal_pty(
+            &self,
+            _: &Path,
+            _: &IncarnationId,
+            _: &TerminalLaunchSpec,
+            _: std::collections::BTreeMap<String, String>,
+            _: Option<providers::PreparedCodexLaunch>,
+        ) -> Result<SpawnedTerminalPty, RuntimeError> {
+            panic!("fresh publication must not spawn a PTY")
+        }
+
+        async fn open_fresh_agent(
+            &self,
+            state_dir: &Path,
+            launch: FreshAgentLaunchSpec,
+        ) -> Result<Arc<freshell_agent_runtime::host_actor::FreshAgentHostActor>, String> {
+            self.opens.fetch_add(1, Ordering::SeqCst);
+            let transport = Arc::new(RpcFixtureTransport {
+                dispatches: AtomicUsize::new(0),
+                decisions: AtomicUsize::new(0),
+                operations: AtomicUsize::new(0),
+                captures: AtomicUsize::new(0),
+                stops: AtomicUsize::new(0),
+            });
+            freshell_agent_runtime::host_actor::FreshAgentHostActor::open(
+                state_dir.join("publication-agent"),
+                FreshAgentProfile {
+                    provider: FreshProvider::Claude,
+                    runtime_variant: launch.runtime_variant,
+                    cwd: launch.cwd,
+                    model: launch.model,
+                    effort: launch.effort,
+                    permission_mode: launch.permission_mode,
+                    sandbox: launch.sandbox,
+                    provider_store_id: launch.provider_store_id,
+                    native_session_id: launch.native_session_id,
+                    plugins: launch.plugins,
+                    model_selection: launch.model_selection,
+                    session_ref: launch.session_ref,
+                    provider_launch_context: launch.provider_launch_context,
+                    provider_secret_references: launch.provider_secret_references,
+                },
+                transport,
+            )
+            .await
+            .map_err(|error| error.to_string())
+        }
+    }
+
+    #[tokio::test]
+    async fn provider_config_fresh_exact_resume_grant_blocks_before_transport_and_repairs() {
+        use freshell_runtime_protocol::{
+            ProviderConfigReference, ProviderConfigRoot, ProviderLaunchContext, ProviderPreparation,
+        };
+        use std::os::unix::fs::MetadataExt;
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("provider-home");
+        std::fs::create_dir(&home).unwrap();
+        let source = root.path().join("opencode.json");
+        std::fs::write(&source, br#"{"theme":"prior"}"#).unwrap();
+        let context = ProviderLaunchContext {
+            preparation: ProviderPreparation::Claude {
+                mcp_args: Vec::new(),
+            },
+            mcp_capability: None,
+            config: vec![ProviderConfigReference {
+                root: ProviderConfigRoot::Workspace,
+                relative_path: "opencode.json".into(),
+                provider_relative_path: ".claude/settings.json".into(),
+                format: "json".into(),
+            }],
+        };
+        let uid = unsafe { libc::geteuid() };
+        let gid = unsafe { libc::getegid() };
+        assert_ne!(
+            uid, 0,
+            "default regression uses the current unprivileged filesystem identity"
+        );
+        copy_provider_config_references(
+            &context,
+            "claude",
+            root.path(),
+            root.path(),
+            &home,
+            uid,
+            gid,
+        )
+        .unwrap();
+        let projection = home.join(".claude/settings.json");
+        let inode = std::fs::metadata(&projection).unwrap().ino();
+        let manifest = std::fs::read(home.join(".freshell-config-projection.json")).unwrap();
+        let database = home.join("native-store.sqlite3");
+        let connection = rusqlite::Connection::open(&database).unwrap();
+        connection.execute_batch("CREATE TABLE session(id TEXT PRIMARY KEY); INSERT INTO session VALUES('fixture-native-thread');").unwrap();
+        drop(connection);
+        let store_bytes = std::fs::read(&database).unwrap();
+        let store_inode = std::fs::metadata(&database).unwrap().ino();
+        let mut state = test_host_state();
+        Arc::get_mut(&mut state).unwrap().provider_config_paths = ProviderConfigPaths {
+            private_mount: root.path().join("private"),
+            provider_home: home.clone(),
+        };
+        let launch = FreshAgentLaunchSpec {
+            session_id: "fresh-fixture".into(),
+            provider: freshell_runtime_protocol::FreshProvider::Claude,
+            session_type: "freshclaude".into(),
+            runtime_variant: "sdk".into(),
+            provider_store_id: "store-fresh-config".into(),
+            cwd: root.path().to_string_lossy().into_owned(),
+            workspace_path: root.path().to_string_lossy().into_owned(),
+            git_common_dir: None,
+            run_as_uid: uid,
+            run_as_gid: gid,
+            model: None,
+            effort: None,
+            permission_mode: None,
+            sandbox: None,
+            native_session_id: Some("fixture-native-thread".into()),
+            plugins: None,
+            model_selection: None,
+            session_ref: None,
+            fixture_transport: None,
+            provider_bootstrap_files: Vec::new(),
+            provider_secret_references: Vec::new(),
+            provider_launch_context: Some(context.clone()),
+        };
+        let resume = ResumeSpec {
+            schema_version: freshell_runtime_protocol::RESUME_SPEC_SCHEMA_VERSION,
+            provider_session: freshell_runtime_protocol::ProviderSessionRef {
+                provider: "claude".into(),
+                provider_store_id: launch.provider_store_id.clone(),
+                native_session_id: launch.native_session_id.clone().unwrap(),
+            },
+            mode: launch.session_type.clone(),
+            runtime_variant: launch.runtime_variant.clone(),
+            fixture_transport: None,
+            opencode_adoption_baseline: None,
+            program: "opencode".into(),
+            resume_argv: Vec::new(),
+            provider_home: home.to_string_lossy().into_owned(),
+            provider_volume: None,
+            cwd: launch.cwd.clone(),
+            workspace_path: launch.workspace_path.clone(),
+            project_key: None,
+            runtime_profile: None,
+            environment: Default::default(),
+            model: None,
+            reasoning_effort: None,
+            permission_mode: None,
+            image_ref: None,
+            provider_version: None,
+            credential_references: Vec::new(),
+            identity_provenance: freshell_runtime_protocol::IdentityProvenance::ProviderObserved,
+            durable_position: Default::default(),
+            checkpoint_references: Vec::new(),
+            creation_seed_ref: "seed-fresh-config".into(),
+            checkpoint_revision: 3,
+            allocation_state: freshell_runtime_protocol::AllocationState::VerifiedDurable,
+            evidence_revision: 5,
+            never_dispatched: false,
+        };
+        let soul = SoulId::new();
+        let effects = ConfigPublicationGrantEffects {
+            opens: AtomicUsize::new(0),
+        };
+        let hidden = root.path().join("unavailable");
+        std::fs::rename(&source, &hidden).unwrap();
+        let error = dispatch_with_effects(
+            authenticated_host_envelope(
+                &state,
+                HostCommand::GrantExecution {
+                    incarnation_id: state.incarnation_id.clone(),
+                    soul_id: soul.clone(),
+                    host_boot_id: state.host_boot_id.clone(),
+                    control_epoch: 7,
+                    execution_generation: 9,
+                    grant_id: GrantId::new(),
+                    fixture: None,
+                    terminal: None,
+                    fresh_agent: Some(Box::new(launch.clone())),
+                    resume_spec: Some(Box::new(resume.clone())),
+                },
+            ),
+            &state,
+            &effects,
+        )
+        .await
+        .expect_err("selected publication must refuse the fresh execution grant");
+        assert_eq!(error.code, RuntimeErrorCode::HostUnreachable);
+        assert!(
+            error
+                .message
+                .starts_with("capability_pending: provider configuration publication failed:"),
+            "CAPABILITY_PENDING must not depend on native error text: {}",
+            error.message
+        );
+        assert_eq!(state.persisted.lock().await.worker_launch_count, 0);
+        assert!(state.persisted.lock().await.worker_pid.is_none());
+        assert!(state.child.lock().await.is_none());
+        assert!(state.pty.lock().await.is_none());
+        assert!(state.fresh_agent.lock().await.is_none());
+        assert_eq!(
+            effects.opens.load(Ordering::SeqCst),
+            0,
+            "blocked publication must not even attempt transport open"
+        );
+        assert_eq!(std::fs::read(&projection).unwrap(), br#"{"theme":"prior"}"#);
+        assert_eq!(std::fs::metadata(&projection).unwrap().ino(), inode);
+        assert_eq!(
+            std::fs::read(home.join(".freshell-config-projection.json")).unwrap(),
+            manifest
+        );
+        assert_eq!(std::fs::read(&database).unwrap(), store_bytes);
+        assert_eq!(std::fs::metadata(&database).unwrap().ino(), store_inode);
+        let events = std::fs::read_to_string(state.state_dir.join("host-lifecycle.jsonl")).unwrap();
+        let event = events
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .find(|value| value["event"] == "host.provider_config_publication_blocked")
+            .expect("fresh refusal must emit the shared fenced publication event");
+        let data = &event["data"];
+        assert_eq!(data["severity"], "warn");
+        assert_eq!(data["soulId"], soul.to_string());
+        assert_eq!(data["incarnationId"], state.incarnation_id.to_string());
+        assert_eq!(data["controlEpoch"], 7);
+        assert_eq!(data["executionGeneration"], 9);
+        assert_eq!(data["provider"], "claude");
+        assert_eq!(data["reason"], "selected_dependency_unavailable");
+        assert_eq!(
+            data["providerSession"],
+            serde_json::to_value(&resume.provider_session).unwrap()
+        );
+        assert_eq!(data["evidenceRevision"], 5);
+        assert_eq!(data["checkpointRevision"], 3);
+        assert!(
+            !events.contains(root.path().to_str().unwrap()),
+            "event must not include raw filesystem diagnostics"
+        );
+        std::fs::rename(&hidden, &source).unwrap(); // repair only the selected fixture dependency
+                                                    // A consumed failed grant stays fenced. Its replacement host retries
+                                                    // the same saved session/context/HOME with only the dependency repaired.
+        let mut repaired = test_host_state();
+        Arc::get_mut(&mut repaired).unwrap().provider_config_paths =
+            state.provider_config_paths.clone();
+        let result = dispatch_with_effects(
+            authenticated_host_envelope(
+                &repaired,
+                HostCommand::GrantExecution {
+                    incarnation_id: repaired.incarnation_id.clone(),
+                    soul_id: soul.clone(),
+                    host_boot_id: repaired.host_boot_id.clone(),
+                    control_epoch: 8,
+                    execution_generation: 10,
+                    grant_id: GrantId::new(),
+                    fixture: None,
+                    terminal: None,
+                    fresh_agent: Some(Box::new(launch)),
+                    resume_spec: Some(Box::new(resume)),
+                },
+            ),
+            &repaired,
+            &effects,
+        )
+        .await
+        .expect("repaired selected publication must accept the replacement fresh grant");
+        assert!(matches!(
+            result,
+            HostResult::GrantAccepted {
+                worker_launch_count: 1,
+                ..
+            }
+        ));
+        assert_eq!(effects.opens.load(Ordering::SeqCst), 1);
+        assert_eq!(repaired.persisted.lock().await.worker_launch_count, 1);
+        assert_eq!(
+            std::fs::read(&projection).unwrap(),
+            std::fs::read(&source).unwrap()
+        );
+        assert_eq!(std::fs::read(&database).unwrap(), store_bytes);
+        assert_eq!(std::fs::metadata(&database).unwrap().ino(), store_inode);
+        assert!(state.fresh_agent.lock().await.is_none());
+        let actor = repaired.fresh_agent.lock().await.take().unwrap();
+        actor.stop().await.unwrap();
     }
 
     #[tokio::test]
