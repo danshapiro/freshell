@@ -272,22 +272,8 @@ impl ManagedTerminalController for ServerManagedRuntimeController {
                         let jsonc = opencode_input
                             .tui_config_path
                             .is_some_and(|path| path.to_ascii_lowercase().ends_with(".jsonc"));
-                        *tui_config = Some(freshell_runtime_protocol::ProviderConfigReference {
-                            root: freshell_runtime_protocol::ProviderConfigRoot::Ephemeral,
-                            relative_path: if jsonc {
-                                "tui-config.jsonc"
-                            } else {
-                                "tui-config.json"
-                            }
-                            .into(),
-                            provider_relative_path: if jsonc {
-                                ".freshell/opencode/user-tui.jsonc"
-                            } else {
-                                ".freshell/opencode/user-tui.json"
-                            }
-                            .into(),
-                            format: if jsonc { "jsonc" } else { "json" }.into(),
-                        });
+                        *tui_config =
+                            Some(crate::managed_mcp_capability::opencode_tui_reference(jsonc));
                         *context_tui_source = tui_source.clone();
                     }
                 }
