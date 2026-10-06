@@ -161,13 +161,13 @@ pub fn serve(home: &Path, socket: &Path) -> Result<(), &'static str> {
         std::fs::symlink_metadata(home).map_err(|_| "provider mountpoint HOME unavailable")?;
     // The retained provider identity performs its own writes. The initial
     // empty volume is the only root-owned inode this helper may transfer.
-    if root.uid() == 65534 && root.gid() == 0 {
-        if unsafe { libc::setgroups(0, std::ptr::null()) } != 0
+    if root.uid() == 65534
+        && root.gid() == 0
+        && (unsafe { libc::setgroups(0, std::ptr::null()) } != 0
             || unsafe { libc::setgid(0) } != 0
-            || unsafe { libc::setuid(65534) } != 0
-        {
-            return Err("provider mountpoint identity transition failed");
-        }
+            || unsafe { libc::setuid(65534) } != 0)
+    {
+        return Err("provider mountpoint identity transition failed");
     }
     let mut stream =
         UnixStream::connect(socket).map_err(|_| "provider mountpoint exchange unavailable")?;

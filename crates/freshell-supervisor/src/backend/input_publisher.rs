@@ -95,21 +95,50 @@ pub(super) fn owned_helper(actual: &Value, expected: &Value) -> bool {
         .is_some_and(|(actual, expected)| {
             actual.len() == expected.len()
                 && actual.iter().zip(expected).all(|(actual, expected)| {
-                    ["Type", "Source", "Target", "ReadOnly"]
+                    ["Type", "Source", "Target"]
                         .iter()
                         .all(|key| actual[key] == expected[key])
+                        && mount_readonly(&actual["ReadOnly"])
+                            == mount_readonly(&expected["ReadOnly"])
                         && actual["VolumeOptions"]["NoCopy"] == expected["VolumeOptions"]["NoCopy"]
                         && actual["VolumeOptions"]["Subpath"].as_str().unwrap_or("")
                             == expected["VolumeOptions"]["Subpath"].as_str().unwrap_or("")
                 })
         });
-    ["Image", "User", "Tty", "Entrypoint", "Cmd", "Labels"]
+    ["Image", "User", "Tty", "Entrypoint", "Cmd"]
         .iter()
         .all(|key| actual["Config"][key] == expected[key])
+        && owned_labels(&actual["Config"]["Labels"], &expected["Labels"])
         && environment(&actual["Config"]["Env"])
             .is_some_and(|actual| Some(actual) == environment(&expected["Env"]))
         && mounts_match
         && actual["HostConfig"]["LogConfig"]["Type"] == "none"
+}
+
+pub(super) fn mount_readonly(value: &Value) -> Option<bool> {
+    if value.is_null() {
+        Some(false)
+    } else {
+        value.as_bool()
+    }
+}
+fn owned_labels(actual: &Value, expected: &Value) -> bool {
+    let expected = expected.as_object();
+    let Some(actual) = actual.as_object() else {
+        return actual.is_null() && expected.is_none_or(|labels| labels.is_empty());
+    };
+    expected.is_none_or(|labels| {
+        labels
+            .iter()
+            .all(|(key, value)| actual.get(key) == Some(value))
+    }) && actual
+        .iter()
+        .filter(|(key, _)| {
+            key.starts_with("com.freshell.")
+                || key.starts_with("freshell.")
+                || key.as_str() == "project"
+        })
+        .all(|(key, value)| expected.and_then(|labels| labels.get(key)) == Some(value))
 }
 
 impl DockerEngineBackend {
@@ -661,6 +690,39 @@ impl DockerEngineBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn provider_input_helper_accepts_docker_inherited_labels_and_omitted_false_without_losing_owner_fences(
+    ) {
+        let expected = json!({"Image":"sha256:fixture","User":"0:0","Tty":false,"Entrypoint":["/runtime/host"],"Cmd":["prepare-provider-mountpoints"],
+            "Env":["PATH="],"Labels":{"com.freshell.soul-id":"soul-owned"},
+            "HostConfig":{"LogConfig":{"Type":"none"},"Mounts":[{"Type":"volume","Source":"owned-provider","Target":"/home/freshell/provider","ReadOnly":false,"VolumeOptions":{"NoCopy":true}}]}});
+        let mut actual = json!({"Config":expected,"HostConfig":expected["HostConfig"]});
+        actual["Config"]["Labels"]["org.opencontainers.image.version"] = json!("24.04");
+        actual["HostConfig"]["Mounts"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("ReadOnly");
+        assert!(owned_helper(&actual,&expected),"native Docker omitted defaults and inherited image labels preserve the exact helper owner");
+        for field in ["owner", "source", "nocopy", "readonly", "extra-owner"] {
+            let mut changed = actual.clone();
+            match field {
+                "owner" => changed["Config"]["Labels"]["com.freshell.soul-id"] = json!("foreign"),
+                "source" => {
+                    changed["HostConfig"]["Mounts"][0]["Source"] = json!("foreign-provider")
+                }
+                "nocopy" => {
+                    changed["HostConfig"]["Mounts"][0]["VolumeOptions"]["NoCopy"] = json!(false)
+                }
+                "readonly" => changed["HostConfig"]["Mounts"][0]["ReadOnly"] = json!(true),
+                _ => {
+                    changed["Config"]["Labels"]["com.freshell.incarnation-id"] =
+                        json!("foreign-attempt")
+                }
+            }
+            assert!(!owned_helper(&changed, &expected), "{field}");
+        }
+    }
     use std::sync::{Arc, Mutex};
     use tokio::net::UnixListener;
 

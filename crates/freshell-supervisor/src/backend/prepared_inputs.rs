@@ -99,9 +99,11 @@ pub(super) fn verify(
         }
         let declaration = declarations[0];
         let report = reports[0];
-        if ["Type", "Source", "Target", "ReadOnly"]
+        if ["Type", "Source", "Target"]
             .iter()
             .any(|key| declaration[key] != mount[key])
+            || input_publisher::mount_readonly(&declaration["ReadOnly"])
+                != input_publisher::mount_readonly(&mount["ReadOnly"])
             || report["Type"] != mount["Type"]
             || report["RW"].as_bool() != mount["ReadOnly"].as_bool().map(|readonly| !readonly)
         {
@@ -200,6 +202,29 @@ mod tests {
             ),
         ]);
         (mounts, actual, volumes)
+    }
+
+    #[test]
+    fn provider_prepared_adoption_accepts_docker_omitted_writable_default() {
+        let (mounts, mut actual, volumes) = fixture();
+        actual["HostConfig"]["Mounts"]
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .find(|mount| mount["ReadOnly"] == false)
+            .unwrap()
+            .as_object_mut()
+            .unwrap()
+            .remove("ReadOnly");
+        verify(&actual, &mounts, "owned-provider", &volumes)
+            .expect("Docker's absent ReadOnly field means the exact selected writable directory");
+        actual["HostConfig"]["Mounts"]
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .find(|mount| mount["Target"] == "/outside/plugin")
+            .unwrap()["ReadOnly"] = json!(true);
+        assert!(verify(&actual, &mounts, "owned-provider", &volumes).is_err());
     }
 
     #[test]

@@ -25,6 +25,12 @@ function equalRecord(actual: unknown, expected: Record<string, unknown>): boolea
     && Object.entries(expected).every(([key, value]) => record[key] === value)
 }
 
+function ownedHelperLabels(actual:Record<string,unknown> | undefined,expected:Record<string,unknown>):boolean {
+  return !!actual && Object.entries(expected).every(([key,value])=>actual[key]===value)
+    && Object.entries(actual).filter(([key])=>key.startsWith('com.freshell.') || key.startsWith('freshell.') || key==='project')
+      .every(([key,value])=>expected[key]===value)
+}
+
 function privateHelperEnvironment(value: unknown, home: boolean): boolean {
   if (!Array.isArray(value) || value.length > 128) return false
   const names = new Set<string>()
@@ -115,6 +121,7 @@ export type RestrictedDockerBrokerPolicy = {
   allowedWorkspaceRoots?: Set<string>
   allowedProviderUserRoots?: Set<string>
   allowedBootstrapFiles?: Set<string>
+  allowedHostGatewayAddresses?: Set<string>
   testRunId: string
   logPath: string
 }
@@ -134,6 +141,16 @@ export type PreparedInputAuthorization = {
   indexedSecretSources: { grantIndex: number; sourceId: number }[]
 }
 
+export type InitialProviderVolumeAuthorization = {
+  installationId:string
+  soulId:string
+  providerVolumeName:string
+  imageRef:string
+  hostBinaryPath:string
+  binarySha256:string
+  daemonId:string
+}
+
 type DockerResponse = {
   statusCode: number
   headers: http.IncomingHttpHeaders
@@ -141,6 +158,7 @@ type DockerResponse = {
 }
 
 export class RestrictedDockerBroker {
+  private readonly initialProviderVolumes = new Map<string,InitialProviderVolumeAuthorization>()
   private readonly preparedInputs = new Map<string, PreparedInputAuthorization>()
   private readonly inputVolumes = new Set<string>()
   private readonly inputPublishers = new Map<string, {
@@ -156,6 +174,19 @@ export class RestrictedDockerBroker {
   private stopFailuresRemaining = 0
 
   constructor(private readonly policy: RestrictedDockerBrokerPolicy) {}
+
+  authorizeInitialProviderVolume(input:InitialProviderVolumeAuthorization):void {
+    const stable=`freshell-provider-${createHash('sha256').update(`${input.installationId}\0${input.soulId}`).digest('hex').slice(0,24)}`
+    if (input.providerVolumeName!==stable || !/^[a-zA-Z0-9_-]{1,128}$/.test(input.installationId)
+      || !/^[a-zA-Z0-9_-]{1,128}$/.test(input.soulId) || !/^[a-f0-9]{64}$/.test(input.binarySha256)
+      || !/^[a-zA-Z0-9:_-]{1,128}$/.test(input.daemonId)
+      || !this.policy.allowedHostBinaryPaths.has(input.hostBinaryPath) || !this.policy.allowedImageRefs.has(input.imageRef)) {
+      throw new Error('initial provider source is outside this fixture run')
+    }
+    const previous=this.initialProviderVolumes.get(stable)
+    if (previous && !equalRecord(input,previous)) throw new Error('initial provider source ownership changed')
+    this.initialProviderVolumes.set(stable,{...input})
+  }
 
   authorizePreparedInputs(input: PreparedInputAuthorization): void {
     const safeId = (value: string) => /^[a-zA-Z0-9_-]{1,128}$/.test(value)
@@ -287,7 +318,8 @@ export class RestrictedDockerBroker {
     }
 
     const volume = url.match(/^\/v1\.47\/volumes\/(freshell-provider-[a-f0-9]{24})$/)?.[1]
-    if (method === 'GET' && volume && this.receipts().some((receipt) => receipt.providerVolumeName === volume)) {
+    if (method === 'GET' && volume && (this.initialProviderVolumes.has(volume)
+      || this.receipts().some((receipt) => receipt.providerVolumeName === volume))) {
       await this.forwardAndReply(request, response, body, { destructive: false })
       return
     }
@@ -312,6 +344,25 @@ export class RestrictedDockerBroker {
     if (method==='POST' && url===`${DOCKER_API_PREFIX}/volumes/create`) {
       let parsed:Record<string,any>={}
       try {parsed=JSON.parse(body.toString())} catch {}
+      const initial=this.initialProviderVolumes.get(parsed.Name)
+      if (initial) {
+        const labels=parsed.Labels ?? {}
+        const expected={
+          'com.freshell.installation-id':initial.installationId,'com.freshell.soul-id':initial.soulId,
+          'freshell.input.reservation':labels['freshell.input.reservation'],
+          'freshell.input.incarnation':labels['freshell.input.incarnation'],'freshell.input.intent':'1',
+          'freshell.input.daemon':initial.daemonId,'freshell.input.image':initial.imageRef,
+          'freshell.input.binary-sha256':initial.binarySha256,
+        }
+        if (Object.keys(parsed).length!==3 || parsed.Driver!=='local' || !equalRecord(labels,expected)
+          || !/^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/.test(labels['freshell.input.reservation'])
+          || !/^[a-zA-Z0-9_-]{1,128}$/.test(labels['freshell.input.incarnation'])) {
+          this.block(response,method,url,403,'initial volume must match the exact reserved soul source',true)
+          return
+        }
+        await this.forwardAndReply(request,response,body,{destructive:false})
+        return
+      }
       const input=[...this.preparedInputs.values()].find((candidate)=>candidate.indexedFiles?.volumeName===parsed.Name)
       if (!input || Object.keys(parsed).length!==4 || parsed.Driver!=='local'
         || !equalRecord(parsed.DriverOpts,{type:'tmpfs',device:'tmpfs',o:INDEXED_TMPFS_OPTIONS}) || !equalRecord(parsed.Labels,indexedLabels(input))) {
@@ -335,11 +386,12 @@ export class RestrictedDockerBroker {
         const environment=(entries:unknown)=>Array.isArray(entries)?JSON.stringify([...entries].sort()):undefined
         const ownedConfig=inspected.statusCode===404 || (inspected.statusCode===200 && ['Image','User','Tty'].every((key)=>actual.Config?.[key]===owned.expected[key])
           && ['Entrypoint','Cmd'].every((key)=>JSON.stringify(actual.Config?.[key])===JSON.stringify(owned.expected[key]))
-          && equalRecord(actual.Config?.Labels,owned.expected.Labels)
+          && ownedHelperLabels(actual.Config?.Labels,owned.expected.Labels)
           && environment(actual.Config?.Env)===environment(owned.expected.Env)
           && Array.isArray(actual.HostConfig?.Mounts) && actual.HostConfig.Mounts.length===3
           && owned.expected.HostConfig.Mounts.every((expected:Record<string,any>)=>actual.HostConfig.Mounts.some((mount:Record<string,any>)=>
-            ['Type','Source','Target','ReadOnly'].every((key)=>mount[key]===expected[key])
+            ['Type','Source','Target'].every((key)=>mount[key]===expected[key])
+            && (mount.ReadOnly ?? false)===(expected.ReadOnly ?? false)
             && (expected.Type!=='volume' || (mount.VolumeOptions?.NoCopy===true && (mount.VolumeOptions.Subpath ?? '')==='' && !mount.VolumeOptions.DriverConfig))))
           && actual.HostConfig?.LogConfig?.Type==='none')
         if (!ownedConfig) {
@@ -530,6 +582,7 @@ export class RestrictedDockerBroker {
     const localAddresses = new Set(Object.values(os.networkInterfaces()).flatMap((interfaces) => (
       interfaces?.filter((network) => network.family === 'IPv4' && !network.internal).map((network) => network.address) ?? []
     )))
+    for (const address of this.policy.allowedHostGatewayAddresses ?? []) localAddresses.add(address)
     if (extraHosts.some((entry: unknown) => {
       if (entry === 'host.docker.internal:host-gateway') return false
       if (typeof entry !== 'string' || !entry.startsWith('host.docker.internal:')) return true

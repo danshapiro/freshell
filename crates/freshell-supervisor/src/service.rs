@@ -85,6 +85,9 @@ impl Drop for AuthLookupScope {
     }
 }
 
+type ProviderPathInputBindings =
+    HashMap<(SoulId, String), (freshell_runtime_protocol::ProviderPathInputs, Instant)>;
+
 #[derive(Clone)]
 pub struct Supervisor {
     pub(crate) registry: Registry,
@@ -95,11 +98,7 @@ pub struct Supervisor {
     /// lock: its durable intent revision must be able to preempt recovery.
     pub(crate) recovery_locks: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
     auth_lookup_authorities: Arc<StdMutex<HashMap<String, AuthLookupAuthority>>>,
-    provider_path_inputs: Arc<
-        StdMutex<
-            HashMap<(SoulId, String), (freshell_runtime_protocol::ProviderPathInputs, Instant)>,
-        >,
-    >,
+    provider_path_inputs: Arc<StdMutex<ProviderPathInputBindings>>,
 }
 
 impl Supervisor {

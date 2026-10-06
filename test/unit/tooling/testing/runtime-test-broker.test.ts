@@ -209,6 +209,16 @@ describe('managed provider tmpfs', () => {
 })
 
 describe('managed provider host gateway', () => {
+  it('allows only the exact owned controller gateway supplied by the closed fixture',async()=>{
+    await withHttpBroker(async({request,forwarded})=>{
+      const accepted=createBody([...ordinaryBinds,actorBind],undefined,['host.docker.internal:172.17.0.241']);
+      expect((await request('POST','/v1.47/containers/create?name=owned-controller',accepted)).status).toBe(201);
+      const before=forwarded.length;
+      const refused=createBody([...ordinaryBinds,actorBind],undefined,['host.docker.internal:172.17.0.242']);
+      expect((await request('POST','/v1.47/containers/create?name=foreign-controller',refused)).status).toBe(403);
+      expect(forwarded).toHaveLength(before);
+    },new Set(['172.17.0.241']));
+  });
   it('accepts the rootless daemon mapping to a local host address', () => {
     const validate = (body: Buffer): { ok: boolean } => (
       broker() as unknown as { validateCreate(body: Buffer): { ok: boolean } }
@@ -332,6 +342,35 @@ function publisherBody(input:PreparedInputAuthorization):any {
 }
 
 describe('fixed indexed publisher broker',()=>{
+  it('observes and creates only the explicitly reserved initial soul volume before any workload receipt',async()=>{
+    await withHttpBroker(async ({request,forwarded,broker:instance})=>{
+      const installationId='installation-one',soulId='soul-initial';
+      const providerVolumeName=`freshell-provider-${createHash('sha256').update(`${installationId}\0${soulId}`).digest('hex').slice(0,24)}`;
+      const authorization={installationId,soulId,providerVolumeName,imageRef:'sha256:fixture-image',hostBinaryPath:'/tmp/owned/freshell-session-host',binarySha256:'a'.repeat(64),daemonId:'fixture-daemon'};
+      instance.authorizeInitialProviderVolume(authorization);
+      expect((await request('GET',`/v1.47/volumes/${providerVolumeName}`)).status).toBe(200);
+      const body={Name:providerVolumeName,Driver:'local',Labels:{
+        'com.freshell.installation-id':installationId,'com.freshell.soul-id':soulId,
+        'freshell.input.reservation':'11111111-1111-4111-8111-111111111111',
+        'freshell.input.incarnation':'incarnation-initial','freshell.input.intent':'1',
+        'freshell.input.daemon':authorization.daemonId,'freshell.input.image':authorization.imageRef,
+        'freshell.input.binary-sha256':authorization.binarySha256,
+      }};
+      expect((await request('POST','/v1.47/volumes/create',body)).status).toBe(201);
+      const before=forwarded.length;
+      for (const mutate of [
+        (value:any)=>value.Name='freshell-provider-'+ 'f'.repeat(24),
+        (value:any)=>value.DriverOpts={type:'tmpfs'},
+        (value:any)=>value.Labels['freshell.input.daemon']='changed',
+        (value:any)=>value.Labels['freshell.input.binary-sha256']='b'.repeat(64),
+        (value:any)=>value.Labels['freshell.input.reservation']='arbitrary',
+      ]) {
+        const changed=structuredClone(body);mutate(changed);
+        expect((await request('POST','/v1.47/volumes/create',changed)).status).toBe(403);
+        expect(forwarded).toHaveLength(before);
+      }
+    });
+  });
   it('allows the fixed owned mountpoint helper before workload creation and refuses extra authority',async()=>{
     await withHttpBroker(async ({request,forwarded,broker:instance})=>{
       const input=publisherAuthorization();instance.authorizePreparedInputs(input);
@@ -414,7 +453,7 @@ describe('fixed indexed publisher broker',()=>{
   });
 });
 
-async function withHttpBroker(run: (fixture: BrokerHttpFixture) => Promise<void>) {
+async function withHttpBroker(run: (fixture: BrokerHttpFixture) => Promise<void>,gateways?:Set<string>) {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'frs-broker-history-'))
   const socket = path.join(dir, 'docker.sock')
   const proxy = path.join(dir, 'broker.sock')
@@ -438,7 +477,10 @@ async function withHttpBroker(run: (fixture: BrokerHttpFixture) => Promise<void>
     }
     if (req.method==='GET' && req.url?.includes('-publisher/json')) {
       const config=forwarded.findLast((request)=>request.url.includes('/containers/create?') && request.body?.Cmd?.[0]==='publish-provider-inputs')!.body;
-      res.statusCode=200;res.end(JSON.stringify({Config:foreignHelper?{...config,User:'0:0'}:config,HostConfig:config.HostConfig}));return;
+      const inspected=structuredClone(config);
+      inspected.Labels['org.opencontainers.image.version']='24.04';
+      for (const mount of inspected.HostConfig.Mounts) if (mount.ReadOnly===false) delete mount.ReadOnly;
+      res.statusCode=200;res.end(JSON.stringify({Config:foreignHelper?{...inspected,User:'0:0'}:inspected,HostConfig:inspected.HostConfig}));return;
     }
     if (req.url?.startsWith('/v1.47/containers/create?')) {
       if (body.Entrypoint?.[0] === '/runtime/freshell-session-host' && loseAck) {
@@ -459,6 +501,7 @@ async function withHttpBroker(run: (fixture: BrokerHttpFixture) => Promise<void>
       : req.url?.includes('/logs?') ? '{"threadId":"native-owned"}' : JSON.stringify({ Name: providerVolume }))
   })
   const instance = new RestrictedDockerBroker({
+    allowedHostGatewayAddresses:gateways,
     realSocketPath: socket,
     proxySocketPath: proxy,
     runtimeRootPrefix: '/tmp/owned/r',

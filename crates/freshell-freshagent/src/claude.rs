@@ -9580,7 +9580,7 @@ async fn spawn_sidecar() -> Result<(Child, ChildStdin, ChildStdout, String), Str
         } else {
             &[]
         };
-        freshell_platform::provider_exec::check_command(cmd.as_std(), true, &additional)
+        freshell_platform::provider_exec::check_command(cmd.as_std(), true, additional)
             .map_err(|error| error.to_string())?;
     }
     let mut child = cmd.spawn().map_err(|e| {

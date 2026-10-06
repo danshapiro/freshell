@@ -1101,6 +1101,10 @@ async fn grant_execution(
                     &launch.provider_bootstrap_files,
                     launch.run_as_uid,
                     launch.run_as_gid,
+                    launch
+                        .provider_launch_context
+                        .as_ref()
+                        .is_some_and(|context| context.prepared_inputs.is_some()),
                 )
                 .map_err(|error| {
                     RuntimeError::new(
@@ -1214,12 +1218,26 @@ fn prepare_provider_state_for_fresh_launch(
         terminal,
         |terminal| {
             let mut created = providers::prepare_provider_state_before_bootstrap(terminal)?;
-            match write_provider_bootstrap_files(
-                &terminal.mode,
-                &terminal.provider_bootstrap_files,
-                Path::new("/home/freshell/provider"),
-                Path::new("/run/freshell-bootstrap"),
-            ) {
+            let bootstrap = if terminal.provider_bootstrap_files.is_empty()
+                && terminal
+                    .provider_launch_context
+                    .as_ref()
+                    .is_some_and(|context| context.prepared_inputs.is_some())
+            {
+                verify_initialized_provider_home(
+                    Path::new("/home/freshell/provider"),
+                    terminal.run_as_uid,
+                    terminal.run_as_gid,
+                )
+            } else {
+                write_provider_bootstrap_files(
+                    &terminal.mode,
+                    &terminal.provider_bootstrap_files,
+                    Path::new("/home/freshell/provider"),
+                    Path::new("/run/freshell-bootstrap"),
+                )
+            };
+            match bootstrap {
                 Ok(bootstrap) => created.extend(bootstrap),
                 Err(error) => {
                     rollback_created_provider_paths(&created);
@@ -1348,14 +1366,14 @@ fn prepare_provider_bootstrap_files(
     files: &[ProviderBootstrapFile],
     run_as_uid: u32,
     run_as_gid: u32,
+    initialized: bool,
 ) -> Result<(), String> {
     let home = Path::new("/home/freshell/provider");
-    let created = write_provider_bootstrap_files(
-        provider,
-        files,
-        home,
-        Path::new("/run/freshell-bootstrap"),
-    )?;
+    let created = if initialized && files.is_empty() {
+        verify_initialized_provider_home(home, run_as_uid, run_as_gid)
+    } else {
+        write_provider_bootstrap_files(provider, files, home, Path::new("/run/freshell-bootstrap"))
+    }?;
     transfer_created_paths(provider, home, &created, run_as_uid, run_as_gid)
 }
 
@@ -1425,6 +1443,26 @@ fn write_provider_bootstrap_files(
         source_root,
         |source, destination| std::fs::rename(source, destination),
     )
+}
+
+fn verify_initialized_provider_home(
+    home: &Path,
+    uid: u32,
+    gid: u32,
+) -> Result<Vec<PathBuf>, String> {
+    use std::os::unix::fs::MetadataExt;
+    let metadata =
+        std::fs::symlink_metadata(home).map_err(|_| "initialized provider HOME unavailable")?;
+    if !metadata.is_dir()
+        || metadata.file_type().is_symlink()
+        || metadata.uid() != uid
+        || metadata.gid() != gid
+        || metadata.mode() & 0o777 != 0o700
+        || std::fs::canonicalize(home).map_err(|_| "initialized provider HOME unavailable")? != home
+    {
+        return Err("initialized provider HOME physical ownership changed".into());
+    }
+    Ok(Vec::new())
 }
 
 fn write_provider_bootstrap_files_with_publish(
@@ -2140,7 +2178,7 @@ fn prepare_provider_context_at(
 }
 
 fn prepare_provider_files(
-    provider: &str,
+    _provider: &str,
     provider_files: &[(&str, Vec<u8>)],
     configuration_files: &[(String, PathBuf)],
     run_as_uid: u32,
@@ -2150,7 +2188,6 @@ fn prepare_provider_files(
     prepare_provider_files_at(
         Path::new("/home/freshell/provider"),
         Path::new("/tmp/freshell-provider-auth"),
-        provider,
         provider_files,
         configuration_files,
         run_as_uid,
@@ -2162,7 +2199,6 @@ fn prepare_provider_files(
 fn prepare_provider_files_at(
     home: &Path,
     auth_dir: &Path,
-    _provider: &str,
     provider_files: &[(&str, Vec<u8>)],
     configuration_files: &[(String, PathBuf)],
     run_as_uid: u32,
@@ -2222,19 +2258,12 @@ fn prepare_provider_files_at(
     for (index, (relative, source)) in configuration_files.iter().enumerate() {
         let destination = home.join(relative);
         if indexed_configuration {
-            use std::io::Read;
             let metadata = std::fs::symlink_metadata(source)
                 .map_err(|_| "indexed configuration-file mount unavailable")?;
             if !metadata.is_file() {
                 return Err("indexed configuration-file mount is not regular".into());
             }
-            let bytes = std::io::copy(
-                &mut std::fs::File::open(source)
-                    .map_err(|_| "indexed configuration-file mount unreadable")?
-                    .take(16 * 1024 * 1024 + 1),
-                &mut std::io::sink(),
-            )
-            .map_err(|_| "indexed configuration-file read failed")?;
+            let bytes = count_configuration_bytes_as_provider(source, run_as_uid, run_as_gid)?;
             aggregate = aggregate
                 .checked_add(bytes)
                 .ok_or("indexed configuration-file size overflow")?;
@@ -2284,6 +2313,64 @@ fn prepare_provider_files_at(
         result.map_err(str::to_string)?;
     }
     Ok(())
+}
+
+fn count_configuration_bytes_as_provider(
+    source: &Path,
+    uid: u32,
+    gid: u32,
+) -> Result<u64, &'static str> {
+    let limit = 16 * 1024 * 1024 + 1;
+    if uid == unsafe { libc::geteuid() } && gid == unsafe { libc::getegid() } {
+        use std::io::Read;
+        return std::io::copy(
+            &mut std::fs::File::open(source)
+                .map_err(|_| "indexed configuration-file mount unreadable")?
+                .take(limit),
+            &mut std::io::sink(),
+        )
+        .map_err(|_| "indexed configuration-file read failed");
+    }
+    // The indexed publisher owns 0600 files as the provider identity. Keep
+    // actual-byte validation under that identity; pipe bytes only to a sink.
+    let mut command = std::process::Command::new("/usr/bin/setpriv");
+    command
+        .args(provider_identity_args(uid, gid))
+        .args([
+            "/usr/bin/head",
+            "-c",
+            "16777217",
+            "--",
+            source
+                .to_str()
+                .ok_or("indexed configuration-file path is not UTF-8")?,
+        ])
+        .env_clear()
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    #[cfg(target_os = "linux")]
+    freshell_platform::provider_exec::check_command(&command, false, &["/usr/bin/head"])
+        .map_err(|_| "indexed configuration-file provider exec profile invalid")?;
+    let mut child = command
+        .spawn()
+        .map_err(|_| "indexed configuration-file provider read failed to start")?;
+    let bytes = std::io::copy(
+        &mut child
+            .stdout
+            .take()
+            .ok_or("indexed configuration-file private stream unavailable")?,
+        &mut std::io::sink(),
+    )
+    .map_err(|_| "indexed configuration-file provider read failed")?;
+    if !child
+        .wait()
+        .map_err(|_| "indexed configuration-file provider read failed")?
+        .success()
+    {
+        return Err("indexed configuration-file provider read failed");
+    }
+    Ok(bytes)
 }
 
 fn publish_configuration_link(
@@ -3035,6 +3122,29 @@ mod tests {
         .expect("owned executable fixture directory")
     }
     #[test]
+    fn provider_config_precreated_home_needs_no_empty_bootstrap_handoff() {
+        use super::*;
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("home");
+        std::fs::create_dir(&home).unwrap();
+        std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::write(home.join("retained"), "retained-provider-state").unwrap();
+        let before = std::fs::metadata(&home).unwrap();
+        let (uid, gid) = unsafe { (libc::geteuid(), libc::getegid()) };
+        let ledger = verify_initialized_provider_home(&home, uid, gid).unwrap();
+        assert!(ledger.is_empty(),"an already initialized HOME must not be put in the trusted initial ownership ledger again");
+        let after = std::fs::metadata(&home).unwrap();
+        assert_eq!(
+            (after.ino(), after.uid(), after.gid(), after.mode()),
+            (before.ino(), before.uid(), before.gid(), before.mode())
+        );
+        assert_eq!(
+            std::fs::read_to_string(home.join("retained")).unwrap(),
+            "retained-provider-state"
+        );
+    }
+    #[test]
     fn provider_native_auth_survives_without_matching_typed_replacement() {
         use super::*;
         let root = tempfile::tempdir().unwrap();
@@ -3048,7 +3158,6 @@ mod tests {
         prepare_provider_files_at(
             &home,
             &root.path().join("empty-auth"),
-            "opencode",
             &[],
             &[],
             uid,
@@ -3060,7 +3169,6 @@ mod tests {
         prepare_provider_files_at(
             &home,
             &root.path().join("ca-only"),
-            "opencode",
             &[(".freshell/opencode/ca.pem", b"synthetic-ca".to_vec())],
             &[],
             uid,
@@ -3073,7 +3181,6 @@ mod tests {
         prepare_provider_files_at(
             &home,
             &root.path().join("typed-auth"),
-            "opencode",
             &[(".local/share/opencode/auth.json", replacement.to_vec())],
             &[],
             uid,
@@ -3105,7 +3212,6 @@ mod tests {
         prepare_provider_files_at(
             &home,
             &private,
-            "opencode",
             &[],
             &[(".freshell/references/0".into(), mounted.clone())],
             uid,
@@ -4591,7 +4697,7 @@ mod tests {
         }
         #[test]
         fn all_selected_entries_above_ten_thousand_remain_runnable() {
-            let root = tempfile::tempdir().unwrap();
+            let root = super::executable_fixture();
             let source = root.path().join("source");
             std::fs::create_dir(&source).unwrap();
             for index in 0..10_005 {

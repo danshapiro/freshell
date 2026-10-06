@@ -43,6 +43,8 @@ mod managed_mcp_capability;
 mod managed_ports;
 #[cfg(feature = "managed-runtime-v1")]
 mod managed_provider_bootstrap;
+#[cfg(all(test, unix, feature = "managed-provider-qualification"))]
+mod managed_provider_launch_tests;
 #[cfg(feature = "managed-runtime-v1")]
 mod managed_provider_references;
 #[cfg(feature = "managed-runtime-v1")]

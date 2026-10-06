@@ -37,6 +37,11 @@ if [ "${1:-}" = "--provider-mountpoints" ]; then
   exec python3 "${REPO_ROOT}/scripts/testing/managed-provider-mountpoints-sandbox.py" "$@"
 fi
 
+if [ "${1:-}" = "--provider-launches" ]; then
+  shift
+  exec python3 "${REPO_ROOT}/scripts/testing/managed-provider-launch-sandbox.py" "$@"
+fi
+
 if [ "${1:-}" = "--provider-inputs" ]; then
   shift
   exec python3 "${REPO_ROOT}/scripts/testing/probe-provider-config-readonly-home.py" --indexed-inputs "$@"
