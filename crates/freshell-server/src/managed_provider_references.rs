@@ -47,7 +47,7 @@ pub struct ResolvedFileReferencePlan {
     pub template: String,
     // Generated recipes already own the raw view. Keep one raw view for
     // direct references too; a rewritten template cannot revalidate selection.
-    unexpanded_direct_source: Option<String>,
+    unexpanded_direct_source: Option<std::sync::Arc<String>>,
     pub selections: Vec<FileReferenceSelection>,
     pub referenced_variables: Vec<String>,
     pub recipes: Vec<GeneratedFileRecipe>,
@@ -81,6 +81,17 @@ pub fn resolve_file_references(
 
 pub(super) fn resolve_file_references_allocated(
     raw: &str,
+    origin: FileSourceOrigin<'_>,
+    env: &dyn Fn(&str) -> Option<String>,
+    recipe_ordinal: usize,
+    allocate: &mut dyn FnMut(&Path) -> Result<String, &'static str>,
+) -> Result<ResolvedFileReferencePlan, ReferenceError> {
+    resolve_file_references_from_view(raw, None, origin, env, recipe_ordinal, allocate)
+}
+
+pub(super) fn resolve_file_references_from_view(
+    raw: &str,
+    source_view: Option<std::sync::Arc<String>>,
     origin: FileSourceOrigin<'_>,
     env: &dyn Fn(&str) -> Option<String>,
     recipe_ordinal: usize,
@@ -226,9 +237,11 @@ pub(super) fn resolve_file_references_allocated(
     if let Some(cause) = input_error.get() {
         return Err(fail(0, Vec::new(), cause));
     }
+    let transformed_length = transformed.len();
+    drop(transformed);
     let (template, recipes) = if generated {
         let generated_name = format!("FRESHELL_CONFIG_REFERENCE_{recipe_ordinal}");
-        if transformed.len() > 64 * 1024 {
+        if transformed_length > 64 * 1024 {
             return Err(fail(
                 0,
                 Vec::new(),
@@ -264,10 +277,10 @@ pub(super) fn resolve_file_references_allocated(
         template.push_str(&raw[cursor..]);
         (template, Vec::new())
     };
-    drop(transformed);
     Ok(ResolvedFileReferencePlan {
         template,
-        unexpanded_direct_source: (!generated).then(|| raw.to_owned()),
+        unexpanded_direct_source: (!generated)
+            .then(|| source_view.unwrap_or_else(|| std::sync::Arc::new(raw.to_owned()))),
         selections,
         referenced_variables: variables.into_inner().into_iter().collect(),
         recipes,

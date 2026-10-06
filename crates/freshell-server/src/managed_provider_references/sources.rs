@@ -189,21 +189,20 @@ pub struct PlannedSourceOccurrence {
     pub references: super::ResolvedFileReferencePlan,
 }
 
-pub fn plan_opencode_sources(
+pub struct LoadedSourceOccurrence {
+    pub source: SourceOccurrence,
+    pub view: std::sync::Arc<String>,
+}
+
+/// Retain one bounded canonical read while keeping every native logical origin.
+/// Authentication lookup can select its finite keys from these same views.
+pub fn read_opencode_sources(
     sources: Vec<SourceOccurrence>,
-    cwd: &Path,
-    home: &Path,
-    lookup: &dyn Fn(SourceLane, &Path, &str) -> Option<String>,
-) -> Result<Vec<PlannedSourceOccurrence>, super::ReferenceError> {
+) -> Result<Vec<LoadedSourceOccurrence>, super::ReferenceError> {
     use std::io::Read;
-    let mut result = Vec::new();
-    let mut selected = std::collections::BTreeMap::<PathBuf, String>::new();
-    let mut selected_bytes = 0u64;
-    let mut recipe_count = 0usize;
-    let mut aliases = std::collections::BTreeSet::new();
-    let mut variables = std::collections::BTreeSet::new();
-    let mut event_count = 0usize;
-    let mut retained_view_bytes = 0usize;
+    let mut loaded = Vec::new();
+    let mut canonical = std::collections::BTreeMap::<PathBuf, std::sync::Arc<String>>::new();
+    let mut retained = 0usize;
     for (ordinal, source) in sources.into_iter().enumerate() {
         let fail = |cause| super::ReferenceError {
             operation: "read",
@@ -213,15 +212,117 @@ pub fn plan_opencode_sources(
             variables: vec![],
             cause,
         };
-        let mut raw = String::new();
-        std::fs::File::open(&source.canonical_source)
-            .map_err(|_| fail("selected source read failed"))?
-            .take(16 * 1024 * 1024 + 1)
-            .read_to_string(&mut raw)
-            .map_err(|_| fail("selected source read failed or is not UTF-8"))?;
-        if raw.len() > 16 * 1024 * 1024 {
-            return Err(fail("selected source exceeds source-view limit"));
+        if ordinal >= 8192 {
+            return Err(fail("source occurrence budget exceeded"));
         }
+        let view = if let Some(view) = canonical.get(&source.canonical_source) {
+            view.clone()
+        } else {
+            let remaining = (64 * 1024 * 1024usize)
+                .checked_sub(retained)
+                .ok_or_else(|| fail("source-view byte count overflow"))?;
+            let limit = remaining.min(16 * 1024 * 1024);
+            let mut raw = String::new();
+            std::fs::File::open(&source.canonical_source)
+                .map_err(|_| fail("selected source read failed"))?
+                .take(limit as u64 + 1)
+                .read_to_string(&mut raw)
+                .map_err(|_| fail("selected source read failed or is not UTF-8"))?;
+            if raw.len() > limit {
+                return Err(fail("selected source exceeds source-view limit"));
+            }
+            let view = std::sync::Arc::new(raw);
+            canonical.insert(source.canonical_source.clone(), view.clone());
+            view
+        };
+        retained = retained
+            .checked_add(view.len())
+            .ok_or_else(|| fail("source-view byte count overflow"))?;
+        if retained > 64 * 1024 * 1024 {
+            return Err(fail("simultaneous retained source views exceed 64 MiB"));
+        }
+        loaded.push(LoadedSourceOccurrence { source, view });
+    }
+    Ok(loaded)
+}
+
+pub fn source_environment_names(
+    sources: &[LoadedSourceOccurrence],
+) -> Result<Vec<String>, super::ReferenceError> {
+    let mut names = std::collections::BTreeSet::new();
+    let mut events = 0usize;
+    for (ordinal, source) in sources.iter().enumerate() {
+        let fail = |cause| super::ReferenceError {
+            operation: "select",
+            field: "OpenCode source",
+            source_ordinal: ordinal,
+            declaring_source: source.source.logical_path.clone(),
+            variables: vec![],
+            cause,
+        };
+        let mut cursor = 0;
+        while let Some(relative) = source.view[cursor..].find("{env:") {
+            let start = cursor + relative + 5;
+            let Some(close) = source.view[start..]
+                .find('}')
+                .map(|relative| start + relative)
+            else {
+                break;
+            };
+            cursor = close + 1;
+            let name = &source.view[start..close];
+            if name.is_empty() {
+                continue;
+            }
+            if name.len() > 128 || name.chars().any(char::is_control) {
+                return Err(fail("referenced variable name profile exceeded"));
+            }
+            events = events
+                .checked_add(1)
+                .ok_or_else(|| fail("substitution event count overflow"))?;
+            if events > 8192 || names.len() >= 128 && !names.contains(name) {
+                return Err(fail("combined source variable or event limit exceeded"));
+            }
+            names.insert(name.to_owned());
+        }
+    }
+    Ok(names.into_iter().collect())
+}
+
+pub fn plan_opencode_sources(
+    sources: Vec<SourceOccurrence>,
+    cwd: &Path,
+    home: &Path,
+    lookup: &dyn Fn(SourceLane, &Path, &str) -> Option<String>,
+) -> Result<Vec<PlannedSourceOccurrence>, super::ReferenceError> {
+    plan_loaded_opencode_sources(read_opencode_sources(sources)?, cwd, home, lookup)
+}
+
+pub fn plan_loaded_opencode_sources(
+    sources: Vec<LoadedSourceOccurrence>,
+    cwd: &Path,
+    home: &Path,
+    lookup: &dyn Fn(SourceLane, &Path, &str) -> Option<String>,
+) -> Result<Vec<PlannedSourceOccurrence>, super::ReferenceError> {
+    let original_names = source_environment_names(&sources)?;
+    let mut result = Vec::new();
+    let mut selected = std::collections::BTreeMap::<PathBuf, String>::new();
+    let mut selected_bytes = 0u64;
+    let mut recipe_count = 0usize;
+    let mut aliases = std::collections::BTreeSet::new();
+    let mut variables = std::collections::BTreeSet::new();
+    let mut event_count = 0usize;
+    let mut retained_view_bytes = 0usize;
+    for (ordinal, loaded) in sources.into_iter().enumerate() {
+        let source = loaded.source;
+        let fail = |cause| super::ReferenceError {
+            operation: "read",
+            field: "OpenCode source",
+            source_ordinal: ordinal,
+            declaring_source: source.logical_path.clone(),
+            variables: vec![],
+            cause,
+        };
         let mut allocate = |canonical: &Path| {
             if let Some(destination) = selected.get(canonical) {
                 return Ok(destination.clone());
@@ -229,9 +330,13 @@ pub fn plan_opencode_sources(
             if selected.len() >= 128 {
                 return Err("configuration reference count exceeds 128 across sources");
             }
-            selected_bytes += std::fs::metadata(canonical)
-                .map_err(|_| "selected source metadata failed")?
-                .len();
+            selected_bytes = selected_bytes
+                .checked_add(
+                    std::fs::metadata(canonical)
+                        .map_err(|_| "selected source metadata failed")?
+                        .len(),
+                )
+                .ok_or("selected reference size overflow")?;
             if selected_bytes > 32 * 1024 * 1024 {
                 return Err("configuration references exceed 32 MiB across sources");
             }
@@ -242,8 +347,9 @@ pub fn plan_opencode_sources(
             selected.insert(canonical.to_owned(), destination.clone());
             Ok(destination)
         };
-        let references = super::resolve_file_references_allocated(
-            &raw,
+        let references = super::resolve_file_references_from_view(
+            &loaded.view,
+            Some(loaded.view.clone()),
             super::FileSourceOrigin {
                 declaring_config: &source.logical_path,
                 cwd,
@@ -253,7 +359,18 @@ pub fn plan_opencode_sources(
             recipe_count,
             &mut allocate,
         )?;
-        recipe_count += references.recipes.len();
+        if references
+            .recipes
+            .iter()
+            .any(|recipe| original_names.contains(&recipe.generated_name))
+        {
+            return Err(fail(
+                "generated configuration name collides with an original source input",
+            ));
+        }
+        recipe_count = recipe_count
+            .checked_add(references.recipes.len())
+            .ok_or_else(|| fail("source recipe count overflow"))?;
         retained_view_bytes = retained_view_bytes
             .checked_add(references.template.len())
             .and_then(|bytes| bytes.checked_add(references.unexpanded_source().len()))
@@ -261,14 +378,21 @@ pub fn plan_opencode_sources(
         if retained_view_bytes > 64 * 1024 * 1024 {
             return Err(fail("simultaneous retained source views exceed 64 MiB"));
         }
-        aliases.extend(
-            references
-                .occurrences
-                .iter()
-                .map(|occurrence| occurrence.approved_alias.clone()),
-        );
-        variables.extend(references.referenced_variables.iter().cloned());
-        event_count += references.substitution_events;
+        for occurrence in &references.occurrences {
+            if aliases.len() >= 256 && !aliases.contains(&occurrence.approved_alias) {
+                return Err(fail("configuration alias count exceeds 256 across sources"));
+            }
+            aliases.insert(occurrence.approved_alias.clone());
+        }
+        for name in &references.referenced_variables {
+            if variables.len() >= 128 && !variables.contains(name) {
+                return Err(fail("referenced variable count exceeds 128 across sources"));
+            }
+            variables.insert(name.clone());
+        }
+        event_count = event_count
+            .checked_add(references.substitution_events)
+            .ok_or_else(|| fail("source substitution event count overflow"))?;
         if recipe_count > 128 || aliases.len() > 256 || variables.len() > 128 || event_count > 8192
         {
             return Err(fail(
@@ -286,6 +410,106 @@ mod tests {
     use sha2::{Digest, Sha256};
     fn digest(path: &Path) -> String {
         format!("{:x}", Sha256::digest(std::fs::read(path).unwrap()))
+    }
+    #[test]
+    fn managed_provider_references_shared_source_is_read_once_before_auth_lookup() {
+        let owned = tempfile::tempdir().unwrap();
+        let left = owned.path().join("left");
+        let right = owned.path().join("right");
+        std::fs::create_dir(&left).unwrap();
+        std::fs::create_dir(&right).unwrap();
+        std::fs::write(left.join("rules"), b"LEFT_PRIVATE_PAYLOAD").unwrap();
+        std::fs::write(right.join("rules"), b"RIGHT_PRIVATE_PAYLOAD").unwrap();
+        let shared = owned.path().join("shared.json");
+        let raw = r#"{"model":"{env:MODEL}","instructions":["{file:./rules}"]}"#;
+        std::fs::write(&shared, raw).unwrap();
+        let sources = vec![
+            SourceOccurrence {
+                logical_path: left.join("opencode.json"),
+                canonical_source: shared.clone(),
+                lane: SourceLane::Main,
+            },
+            SourceOccurrence {
+                logical_path: right.join("opencode.json"),
+                canonical_source: shared.clone(),
+                lane: SourceLane::Main,
+            },
+        ];
+        let lookups = std::cell::Cell::new(0);
+        let plans = plan_opencode_sources(sources, owned.path(), owned.path(), &|_, _, name| {
+            if name == "MODEL" {
+                if lookups.get() == 0 {
+                    std::fs::write(&shared, r#"{"model":"CHANGED_SOURCE"}"#).unwrap();
+                }
+                lookups.set(lookups.get() + 1);
+                Some("synthetic-model".into())
+            } else {
+                None
+            }
+        })
+        .unwrap();
+        assert_eq!(plans.len(), 2);
+        assert_eq!(plans[0].references.unexpanded_source(), raw);
+        assert_eq!(plans[1].references.unexpanded_source(),raw,
+            "auth selection and planning must share the same bounded source read for every canonical source occurrence");
+        assert_eq!(
+            plans[0].references.selections[0].canonical_source,
+            left.join("rules")
+        );
+        assert_eq!(
+            plans[1].references.selections[0].canonical_source,
+            right.join("rules"),
+            "one canonical read must retain both logical declaring parents"
+        );
+        assert_eq!(lookups.get(), 2);
+    }
+
+    #[test]
+    fn managed_provider_references_retained_views_select_keys_and_reject_cross_source_name_collision(
+    ) {
+        let owned = tempfile::tempdir().unwrap();
+        std::fs::write(owned.path().join("rules"), b"PRIVATE_RULES").unwrap();
+        let first = owned.path().join("opencode.json");
+        let second = owned.path().join("tui.json");
+        std::fs::write(
+            &first,
+            r#"{"instructions":["{env:INSERT}"],"model":"{env:MODEL}"}"#,
+        )
+        .unwrap();
+        std::fs::write(&second, r#"{"model":"{env:FRESHELL_CONFIG_REFERENCE_0}"}"#).unwrap();
+        let sources = vec![
+            SourceOccurrence {
+                logical_path: first.clone(),
+                canonical_source: first.clone(),
+                lane: SourceLane::Main,
+            },
+            SourceOccurrence {
+                logical_path: second.clone(),
+                canonical_source: second,
+                lane: SourceLane::Tui,
+            },
+        ];
+        let loaded = read_opencode_sources(sources).unwrap();
+        assert_eq!(
+            source_environment_names(&loaded).unwrap(),
+            vec!["FRESHELL_CONFIG_REFERENCE_0", "INSERT", "MODEL"]
+        );
+        std::fs::remove_file(first).unwrap();
+        let error = plan_loaded_opencode_sources(
+            loaded,
+            owned.path(),
+            owned.path(),
+            &|_, _, name| (name == "INSERT").then(|| "{file:rules}".into()),
+        )
+        .err()
+        .expect(
+            "an original selected source variable cannot become an unrelated generated document",
+        );
+        assert_eq!(
+            error.cause,
+            "generated configuration name collides with an original source input"
+        );
+        assert!(!error.to_string().contains("PRIVATE_RULES"));
     }
     #[test]
     fn managed_provider_references_discovery_keeps_native_order_origins_and_tui_ancestors() {
