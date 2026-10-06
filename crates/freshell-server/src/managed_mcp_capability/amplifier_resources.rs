@@ -132,12 +132,17 @@ pub(super) fn prepare(
         if bundle_raw.len() > 16 * 1024 * 1024 {
             return Err("Amplifier selected bundle source exceeds 16 MiB".into());
         }
-        if canonical
+        let yaml = if canonical
             .extension()
-            .is_some_and(|extension| extension == "yaml" || extension == "yml")
+            .is_some_and(|extension| extension == "md")
         {
-            bound_yaml_expansion(&bundle_raw)?;
-            let bundle_documents = MarkedYamlOwned::load_from_str(&bundle_raw)
+            markdown_frontmatter(&bundle_raw)
+        } else {
+            Some((bundle_raw.as_str(), 0))
+        };
+        if let Some((yaml, header_offset)) = yaml {
+            bound_yaml_expansion(yaml)?;
+            let bundle_documents = MarkedYamlOwned::load_from_str(yaml)
                 .map_err(|_| "Amplifier selected bundle YAML is invalid")?;
             if bundle_documents.len() != 1 {
                 return Err("Amplifier selected bundle requires one YAML document".into());
@@ -181,8 +186,12 @@ pub(super) fn prepare(
                                 .ok_or("Amplifier context destination is not UTF-8")?,
                         )
                         .map_err(|_| "Amplifier context destination could not be encoded")?;
-                        let start = source_offset(&bundle_raw, node.span.start)?;
-                        let end = source_offset(&bundle_raw, node.span.end)?;
+                        let start = header_offset
+                            .checked_add(source_offset(yaml, node.span.start)?)
+                            .ok_or("Amplifier Markdown source offset overflow")?;
+                        let end = header_offset
+                            .checked_add(source_offset(yaml, node.span.end)?)
+                            .ok_or("Amplifier Markdown source offset overflow")?;
                         bundle_replacements.push((start, end, replacement));
                     }
                     if result.selections.len() >= 8192 {
@@ -235,6 +244,16 @@ pub(super) fn prepare(
     }
     result.rewritten_settings = Some(template);
     Ok(result)
+}
+
+fn markdown_frontmatter(raw: &str) -> Option<(&str, usize)> {
+    static HEADER: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let expression = HEADER.get_or_init(|| {
+        regex::Regex::new(r"(?s)\A---\s*\n(.*?)\n---\s*\n?")
+            .expect("fixed native Markdown frontmatter expression")
+    });
+    let header = expression.captures(raw)?.get(1)?;
+    Some((header.as_str(), header.start()))
 }
 
 fn native_mapping_value<'a>(

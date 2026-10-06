@@ -1610,6 +1610,8 @@ mod tests {
         };
         use sha2::{Digest, Sha256};
         for case in [
+            "markdown-bundle",
+            "markdown-absolute-context",
             "collection-alias",
             "merge-key",
             "relative-context",
@@ -1640,25 +1642,33 @@ mod tests {
                 bundle.join("context.txt")
             };
             std::fs::write(&context, payload).unwrap();
-            let context_reference = if case == "absolute-context" {
-                context.to_string_lossy().into_owned()
-            } else if case == "parent-context" {
-                "../context.txt".into()
+            let context_reference =
+                if matches!(case, "absolute-context" | "markdown-absolute-context") {
+                    context.to_string_lossy().into_owned()
+                } else if case == "parent-context" {
+                    "../context.txt".into()
+                } else {
+                    "./context.txt".into()
+                };
+            let bundle_name = if case.starts_with("markdown-") {
+                "bundle.md"
             } else {
-                "./context.txt".into()
+                "bundle.yaml"
             };
-            std::fs::write(
-                bundle.join("bundle.yaml"),
-                format!(
-                    "bundle:\n  name: source-probe\n  version: 1.0.0\ncontext:\n  probe: {}\n",
-                    serde_json::to_string(&context_reference).unwrap()
-                ),
-            )
-            .unwrap();
+            let header = format!(
+                "bundle:\n  name: source-probe\n  version: 1.0.0\ncontext:\n  probe: {}\n",
+                serde_json::to_string(&context_reference).unwrap()
+            );
+            let document = if case.starts_with("markdown-") {
+                format!("---\n{header}---\n# Native retained instructions\nplain body source\n")
+            } else {
+                header
+            };
+            std::fs::write(bundle.join(bundle_name), document).unwrap();
             let selected = if case == "directory-source" {
                 bundle.clone()
             } else {
-                bundle.join("bundle.yaml")
+                bundle.join(bundle_name)
             };
             let quoted = serde_json::to_string(&format!("file://{}", selected.display())).unwrap();
             let settings = if case == "scalar-alias" {
@@ -1723,8 +1733,13 @@ async def consume():
     resource = Path(bundle.context['probe'])
     phase = 'native_context_read'
     data = resource.read_bytes()
+    body_digest = None
+    if selected.endswith('.md'):
+        from amplifier_foundation.io import parse_frontmatter
+        _, body = parse_frontmatter(Path(selected[len('file://'):]).read_text())
+        body_digest = hashlib.sha256(body.encode()).hexdigest()
     adjacent = settings.get_merged_settings().get('adjacent', {}).get('active')
-    print(json.dumps({'ok':True,'digest':hashlib.sha256(data).hexdigest(), 'adjacentDigest':hashlib.sha256(adjacent.encode()).hexdigest() if isinstance(adjacent,str) else None}))
+    print(json.dumps({'ok':True,'digest':hashlib.sha256(data).hexdigest(), 'bodyDigest':body_digest, 'adjacentDigest':hashlib.sha256(adjacent.encode()).hexdigest() if isinstance(adjacent,str) else None}))
 try:
     asyncio.run(consume())
 except Exception as error:
@@ -1756,6 +1771,16 @@ except Exception as error:
                 receipt["errorClass"]
             );
             assert_eq!(receipt["digest"], format!("{:x}", Sha256::digest(payload)));
+            if case.starts_with("markdown-") {
+                assert_eq!(
+                    receipt["bodyDigest"],
+                    format!(
+                        "{:x}",
+                        Sha256::digest(b"# Native retained instructions\nplain body source\n")
+                    ),
+                    "native frontmatter parsing must retain the transported Markdown body"
+                );
+            }
             if matches!(case, "collection-alias" | "merge-key") {
                 assert_eq!(receipt["adjacentDigest"],format!("{:x}",Sha256::digest(format!("file://{}",selected.display()).as_bytes())),
                 "rewriting a recognized bundle source must retain the neighboring native alias value");
