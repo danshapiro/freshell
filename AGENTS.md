@@ -325,4 +325,6 @@ All components **must** be accessible for browser-use automation and WCAG compli
 
 ## Subagent polling policy
 
+Managed provider environment and recovery repair: [implementation plan](docs/plans/2026-10-05-managed-provider-environment.md).
+
 When idle-waiting on subagents, always call `wait_agent` with `timeout_ms=3600000` (the 1-hour maximum). `wait_agent` wakes immediately on any subagent message or completion, so long timeouts add no latency — but every wait return (including a no-op timeout) costs a full model turn that re-sends the entire context. Never poll on shorter timeouts. Have workers `send_message` to `/root` at milestones so the parent wakes exactly when there is news.
