@@ -1460,6 +1460,20 @@ impl Registry {
         .await
     }
 
+    pub(crate) async fn validate_auth_lookup_attempt(
+        &self,
+        start: RecoveryStart,
+    ) -> Result<bool, RegistryError> {
+        self.run_blocking(move |conn| {
+            let current:bool = conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM souls WHERE soul_id=?1 AND desired_state='running' AND recovery_state='recovering' AND intent_revision=?2 AND recovery_attempt_id=?3)",
+                params![start.context.soul_id.as_str(),start.context.intent_revision,start.attempt_id.as_str()],
+                |row|row.get(0),
+            )?;
+            Ok(current)
+        }).await
+    }
+
     pub async fn prepare_replacement(
         &self,
         start: RecoveryStart,

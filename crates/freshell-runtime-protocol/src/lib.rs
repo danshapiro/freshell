@@ -2687,6 +2687,7 @@ pub struct QualificationWriterClaimEvidence {
 #[serde(tag = "method", content = "params", rename_all = "snake_case")]
 pub enum AdminCommand {
     Health,
+    NativeAuthLookup(NativeAuthLookupRequest),
     Launch(Box<LaunchRequest>),
     Stop(StopRequest),
     Inventory,
@@ -2719,6 +2720,28 @@ pub enum AdminCommand {
     RuntimeMetrics(RuntimeMetricsRequest),
     ProbeRecovery(RecoveryProbeRequest),
     Recover(RecoverRequest),
+}
+
+/// Transient nested callback request; the authority is scoped by the supervisor
+/// to the recovery attempt whose lifecycle lock is already held.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct NativeAuthLookupRequest {
+    pub expected_control_epoch: Option<u64>,
+    pub soul_id: SoulId,
+    pub attempt_authority: String,
+    pub keys: Vec<String>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct NativeAuthValues(pub std::collections::BTreeMap<String, String>);
+impl fmt::Debug for NativeAuthValues {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("NativeAuthValues")
+            .field("selected_count", &self.0.len())
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -2835,6 +2858,7 @@ pub struct LaunchResult {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "data", rename_all = "snake_case")]
 pub enum AdminResult {
+    NativeAuthLookup(NativeAuthValues),
     Health {
         control_epoch: u64,
         installation_id: InstallationId,
@@ -3103,6 +3127,57 @@ where
     write_frame_with_limit(writer, value, MAX_CONTROL_FRAME_BYTES).await
 }
 
+pub fn bounded_json_bytes<T: Serialize>(value: &T, limit: usize) -> Result<Vec<u8>, FrameError> {
+    struct BoundedWriter {
+        bytes: Vec<u8>,
+        limit: usize,
+        overflow: bool,
+    }
+    impl std::io::Write for BoundedWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            let Some(required) = self
+                .bytes
+                .len()
+                .checked_add(bytes.len())
+                .filter(|n| *n <= self.limit)
+            else {
+                self.overflow = true;
+                return Err(std::io::Error::other("control frame exceeds limit"));
+            };
+            if required > self.bytes.capacity() {
+                let capacity = self
+                    .bytes
+                    .capacity()
+                    .saturating_mul(2)
+                    .max(required)
+                    .min(self.limit);
+                self.bytes
+                    .try_reserve_exact(capacity - self.bytes.len())
+                    .map_err(std::io::Error::other)?;
+            }
+            self.bytes.extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let limit = limit.min(u32::MAX as usize);
+    let mut writer = BoundedWriter {
+        bytes: Vec::with_capacity(limit.min(4096)),
+        limit,
+        overflow: false,
+    };
+    if let Err(error) = serde_json::to_writer(&mut writer, value) {
+        return Err(if writer.overflow {
+            FrameError::TooLarge
+        } else {
+            FrameError::Json(error)
+        });
+    }
+    Ok(writer.bytes)
+}
+
 pub async fn write_frame_with_limit<W, T>(
     writer: &mut W,
     value: &T,
@@ -3112,10 +3187,7 @@ where
     W: AsyncWrite + Unpin,
     T: Serialize,
 {
-    let bytes = serde_json::to_vec(value)?;
-    if bytes.len() > limit {
-        return Err(FrameError::TooLarge);
-    }
+    let bytes = bounded_json_bytes(value, limit)?;
     writer
         .write_all(&(bytes.len() as u32).to_be_bytes())
         .await?;
@@ -3151,6 +3223,35 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn provider_preparation_serialization_stops_before_materializing_oversized_metadata() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct Many<'a>(&'a AtomicUsize);
+        impl Serialize for Many<'_> {
+            fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+                use serde::ser::SerializeSeq;
+                let mut seq = serializer.serialize_seq(Some(100_000))?;
+                for _ in 0..100_000 {
+                    self.0.fetch_add(1, Ordering::SeqCst);
+                    seq.serialize_element("metadata")?;
+                }
+                seq.end()
+            }
+        }
+        let count = AtomicUsize::new(0);
+        assert!(matches!(
+            bounded_json_bytes(&Many(&count), 1024),
+            Err(FrameError::TooLarge)
+        ));
+        assert!(
+            count.load(Ordering::SeqCst) < 200,
+            "oversized metadata was fully materialized before its bound"
+        );
+        let exact = serde_json::json!({"prepared":"metadata"});
+        let bytes = serde_json::to_vec(&exact).unwrap();
+        assert_eq!(bounded_json_bytes(&exact, bytes.len()).unwrap(), bytes);
+    }
 
     #[test]
     fn durable_terminal_argument_recipe_preserves_provider_options_and_legacy_modes() {

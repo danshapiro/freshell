@@ -632,7 +632,7 @@ impl Supervisor {
                         }
                     });
                 let refreshed_capability = self
-                    .issue_replacement_mcp_capability(&soul_id, &terminal.mode, tui_source, &terminal.workspace_path)
+                    .issue_replacement_mcp_capability(&start, &terminal.mode, tui_source, &terminal.workspace_path)
                     .await
                     .and_then(|reference| {
                         crate::backend::docker::staged_provider_root_for_grant(

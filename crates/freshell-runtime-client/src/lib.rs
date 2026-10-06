@@ -51,6 +51,26 @@ pub struct RuntimeClient {
 }
 
 impl RuntimeClient {
+    pub async fn native_auth_lookup(
+        &self,
+        soul_id: SoulId,
+        attempt_authority: String,
+        keys: Vec<String>,
+    ) -> Result<freshell_runtime_protocol::NativeAuthValues, ClientError> {
+        let request = freshell_runtime_protocol::NativeAuthLookupRequest {
+            expected_control_epoch: Some(self.current_epoch().await?),
+            soul_id,
+            attempt_authority,
+            keys,
+        };
+        match self
+            .request(RequestId::new(), AdminCommand::NativeAuthLookup(request))
+            .await?
+        {
+            AdminResult::NativeAuthLookup(values) => Ok(values),
+            _ => Err(ClientError::UnexpectedResult),
+        }
+    }
     pub async fn from_secret_file(
         socket_path: impl Into<PathBuf>,
         secret_file: impl Into<PathBuf>,

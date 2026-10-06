@@ -157,10 +157,13 @@ pub(crate) async fn spawn_callback_server() -> Result<(), String> {
                 let mut bytes = Vec::new();
                 let result = async {
                     (&mut socket)
-                        .take(8192)
+                        .take((freshell_runtime_protocol::MAX_CONTROL_FRAME_BYTES + 1) as u64)
                         .read_to_end(&mut bytes)
                         .await
                         .map_err(|error| error.to_string())?;
+                    if bytes.len() > freshell_runtime_protocol::MAX_CONTROL_FRAME_BYTES {
+                        return Err("managed provider callback exceeds metadata limit".into());
+                    }
                     let expected = &SETTINGS
                         .get()
                         .ok_or("managed MCP controller is unconfigured")?
@@ -230,6 +233,7 @@ struct CapabilityCallback {
     provider: Option<String>,
     tui_source: Option<ProviderConfigReference>,
     workspace: Option<PathBuf>,
+    auth_lookup_authority: Option<String>,
 }
 
 fn apply_callback(
@@ -244,6 +248,9 @@ fn apply_callback(
         .map_err(|_| "managed provider callback metadata is invalid")?;
     if !freshell_api::check_auth(Some(&callback.control_secret), expected_control_secret) {
         return Err("managed runtime callback unauthorized".into());
+    }
+    if callback.auth_lookup_authority.is_some() && callback.action != "issue" {
+        return Err("native auth lookup authority belongs only to provider preparation".into());
     }
     match callback.action.as_str() {
         "issue" => {

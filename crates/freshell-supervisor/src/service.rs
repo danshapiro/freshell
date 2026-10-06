@@ -60,6 +60,29 @@ struct McpCapabilityRequest<'a> {
     provider: Option<&'a str>,
     tui_source: Option<&'a freshell_runtime_protocol::ProviderConfigReference>,
     workspace: Option<&'a str>,
+    auth_lookup_authority: Option<&'a str>,
+}
+
+#[derive(Clone)]
+struct AuthLookupAuthority {
+    start: crate::registry::RecoveryStart,
+    expires: Instant,
+}
+struct AuthLookupScope {
+    authorities: Arc<StdMutex<HashMap<String, AuthLookupAuthority>>>,
+    key: String,
+}
+
+#[cfg(test)]
+#[path = "native_auth_lookup_tests.rs"]
+mod native_auth_lookup_tests;
+impl Drop for AuthLookupScope {
+    fn drop(&mut self) {
+        self.authorities
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&self.key);
+    }
 }
 
 #[derive(Clone)]
@@ -71,6 +94,7 @@ pub struct Supervisor {
     /// remain independently recoverable. Stop intentionally does not take this
     /// lock: its durable intent revision must be able to preempt recovery.
     pub(crate) recovery_locks: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
+    auth_lookup_authorities: Arc<StdMutex<HashMap<String, AuthLookupAuthority>>>,
 }
 
 impl Supervisor {
@@ -117,6 +141,7 @@ impl Supervisor {
             backend,
             config: Arc::new(config),
             recovery_locks: Arc::new(Mutex::new(HashMap::new())),
+            auth_lookup_authorities: Arc::new(StdMutex::new(HashMap::new())),
         })
     }
 
@@ -162,6 +187,14 @@ impl Supervisor {
             ));
         }
         match envelope.body {
+            AdminCommand::NativeAuthLookup(request) => {
+                self.registry
+                    .assert_epoch(request.expected_control_epoch)
+                    .map_err(map_registry)?;
+                self.lookup_native_auth(request)
+                    .await
+                    .map(AdminResult::NativeAuthLookup)
+            }
             AdminCommand::Health => Ok(AdminResult::Health {
                 control_epoch: self.registry.control_epoch(),
                 installation_id: self.registry.installation_id().clone(),
@@ -521,6 +554,98 @@ impl Supervisor {
                 self.recover(request).await.map(AdminResult::Recovery)
             }
         }
+    }
+
+    fn auth_lookup_scope(&self, start: &crate::registry::RecoveryStart) -> AuthLookupScope {
+        let key = uuid::Uuid::new_v4().to_string();
+        let mut authorities = self
+            .auth_lookup_authorities
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        authorities.retain(|_, authority| authority.expires > Instant::now());
+        authorities.insert(
+            key.clone(),
+            AuthLookupAuthority {
+                start: start.clone(),
+                expires: Instant::now() + Duration::from_secs(30),
+            },
+        );
+        AuthLookupScope {
+            authorities: self.auth_lookup_authorities.clone(),
+            key,
+        }
+    }
+
+    async fn lookup_native_auth(
+        &self,
+        request: freshell_runtime_protocol::NativeAuthLookupRequest,
+    ) -> Result<freshell_runtime_protocol::NativeAuthValues, RuntimeError> {
+        let denied = || {
+            RuntimeError::new(
+                RuntimeErrorCode::InvalidRequest,
+                "native auth lookup requires the current provider preparation attempt",
+            )
+        };
+        freshell_platform::native_auth_exchange::validate_keys(&request.keys)
+            .map_err(|_| denied())?;
+        if request.attempt_authority.len() != 36 {
+            return Err(denied());
+        }
+        let authority = {
+            let authorities = self
+                .auth_lookup_authorities
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            authorities
+                .get(&request.attempt_authority)
+                .filter(|authority| authority.expires > Instant::now())
+                .cloned()
+                .ok_or_else(denied)?
+        };
+        if authority.start.context.soul_id != request.soul_id
+            || authority.start.context.provider != "opencode"
+            || !self
+                .registry
+                .validate_auth_lookup_attempt(authority.start.clone())
+                .await
+                .map_err(map_registry)?
+        {
+            return Err(denied());
+        }
+        // The recovery owner already holds the soul lock. This operation uses
+        // its short-lived authority and drops the map/registry locks before IPC.
+        let values = tokio::time::timeout(
+            Duration::from_secs(25),
+            self.backend.read_native_auth(
+                &authority.start.context.prior_handle,
+                &request.keys,
+                &self.config.host_binary_path,
+            ),
+        )
+        .await
+        .map_err(|_| {
+            RuntimeError::new(
+                RuntimeErrorCode::HostUnreachable,
+                "native auth lookup timed out",
+            )
+        })?
+        .map_err(|_| {
+            RuntimeError::new(
+                RuntimeErrorCode::HostUnreachable,
+                "native auth owned lookup failed",
+            )
+        })?;
+        freshell_platform::native_auth_exchange::validate_selected(&request.keys, &values)
+            .map_err(|_| denied())?;
+        if !self
+            .registry
+            .validate_auth_lookup_attempt(authority.start)
+            .await
+            .map_err(map_registry)?
+        {
+            return Err(denied());
+        }
+        Ok(freshell_runtime_protocol::NativeAuthValues(values))
     }
 
     async fn launch(
@@ -1708,6 +1833,7 @@ impl Supervisor {
                 provider: None,
                 tui_source: None,
                 workspace: None,
+                auth_lookup_authority: None,
             })
             .await?;
         if response != b"ok" {
@@ -1749,20 +1875,22 @@ impl Supervisor {
 
     pub(crate) async fn issue_replacement_mcp_capability(
         &self,
-        soul_id: &SoulId,
+        start: &crate::registry::RecoveryStart,
         provider: &str,
         tui_source: Option<&freshell_runtime_protocol::ProviderConfigReference>,
         workspace: &str,
     ) -> Result<freshell_runtime_protocol::McpCapabilityReference, RuntimeError> {
+        let scope = self.auth_lookup_scope(start);
         let response = self
             .mcp_capability_callback(McpCapabilityRequest {
                 action: "issue",
-                soul_id,
+                soul_id: &start.context.soul_id,
                 incarnation_id: None,
                 grant_id: None,
                 provider: Some(provider),
                 tui_source,
                 workspace: Some(workspace),
+                auth_lookup_authority: Some(&scope.key),
             })
             .await?;
         serde_json::from_slice(&response).map_err(|_| {
@@ -1783,16 +1911,20 @@ impl Supervisor {
                 "invalid managed runtime control secret",
             ));
         }
-        let body = serde_json::to_vec(&serde_json::json!({
-            "action": request.action,
-            "controlSecret": self.config.control_secret,
-            "soulId": request.soul_id,
-            "incarnationId": request.incarnation_id,
-            "grantId": request.grant_id,
-            "provider": request.provider,
-            "tuiSource": request.tui_source,
-            "workspace": request.workspace,
-        }))
+        let body = freshell_runtime_protocol::bounded_json_bytes(
+            &serde_json::json!({
+                "action": request.action,
+                "controlSecret": self.config.control_secret,
+                "soulId": request.soul_id,
+                "incarnationId": request.incarnation_id,
+                "grantId": request.grant_id,
+                "provider": request.provider,
+                "tuiSource": request.tui_source,
+                "workspace": request.workspace,
+                "authLookupAuthority": request.auth_lookup_authority,
+            }),
+            freshell_runtime_protocol::MAX_CONTROL_FRAME_BYTES,
+        )
         .map_err(|error| RuntimeError::new(RuntimeErrorCode::InvalidRequest, error.to_string()))?;
         let callback_socket = self.config.control_socket_path.with_file_name("mcp.sock");
         let exchange = async {
@@ -1800,10 +1932,18 @@ impl Supervisor {
             socket.write_all(&body).await?;
             socket.shutdown().await?;
             let mut response = Vec::new();
-            socket.read_to_end(&mut response).await?;
+            (&mut socket)
+                .take((freshell_runtime_protocol::MAX_CONTROL_FRAME_BYTES + 1) as u64)
+                .read_to_end(&mut response)
+                .await?;
+            if response.len() > freshell_runtime_protocol::MAX_CONTROL_FRAME_BYTES {
+                return Err(std::io::Error::other(
+                    "provider preparation reply exceeds limit",
+                ));
+            }
             Ok::<_, std::io::Error>(response)
         };
-        let response = tokio::time::timeout(Duration::from_secs(5), exchange)
+        let response = tokio::time::timeout(Duration::from_secs(35), exchange)
             .await
             .map_err(|_| {
                 RuntimeError::new(
