@@ -457,15 +457,17 @@ impl HostedFreshAgentProxy {
                 .ok_or(())?;
             let original = |name: &str| std::env::var(name).ok();
             let prepared = crate::managed_provider_references::prepare_managed_opencode(
-                &self.client,
-                &soul,
-                &message.request_id,
-                &home,
-                &cwd,
-                &workspace,
-                &original,
-                provider_secret_references,
-                None,
+                crate::managed_provider_references::OpencodePreparation {
+                    client: &self.client,
+                    soul: &soul,
+                    creation_seed: &message.request_id,
+                    home: &home,
+                    cwd: &cwd,
+                    workspace: &workspace,
+                    original: &original,
+                    references: provider_secret_references,
+                    auth_authority: None,
+                },
             )
             .await
             .map_err(|error| {

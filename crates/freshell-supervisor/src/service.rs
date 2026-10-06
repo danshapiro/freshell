@@ -61,6 +61,9 @@ struct McpCapabilityRequest<'a> {
     tui_source: Option<&'a freshell_runtime_protocol::ProviderConfigReference>,
     workspace: Option<&'a str>,
     auth_lookup_authority: Option<&'a str>,
+    cwd: Option<&'a str>,
+    prior_context: Option<&'a freshell_runtime_protocol::ProviderLaunchContext>,
+    provider_secret_references: Option<&'a [freshell_runtime_protocol::ProviderSecretReference]>,
 }
 
 #[derive(Clone)]
@@ -1974,6 +1977,9 @@ impl Supervisor {
                 tui_source: None,
                 workspace: None,
                 auth_lookup_authority: None,
+                cwd: None,
+                prior_context: None,
+                provider_secret_references: None,
             })
             .await?;
         if response != b"ok" {
@@ -2043,9 +2049,17 @@ impl Supervisor {
         &self,
         start: &crate::registry::RecoveryStart,
         provider: &str,
-        tui_source: Option<&freshell_runtime_protocol::ProviderConfigReference>,
+        context: &freshell_runtime_protocol::ProviderLaunchContext,
+        references: &[freshell_runtime_protocol::ProviderSecretReference],
+        cwd: &str,
         workspace: &str,
-    ) -> Result<freshell_runtime_protocol::McpCapabilityReference, RuntimeError> {
+    ) -> Result<freshell_runtime_protocol::PreparedProviderContext, RuntimeError> {
+        let tui_source = match &context.preparation {
+            freshell_runtime_protocol::ProviderPreparation::Opencode { tui_source, .. } => {
+                tui_source.as_ref()
+            }
+            _ => None,
+        };
         let scope = self.auth_lookup_scope(start);
         let response = self
             .mcp_capability_callback(McpCapabilityRequest {
@@ -2057,14 +2071,20 @@ impl Supervisor {
                 tui_source,
                 workspace: Some(workspace),
                 auth_lookup_authority: Some(&scope.key),
+                cwd: Some(cwd),
+                prior_context: Some(context),
+                provider_secret_references: Some(references),
             })
             .await?;
-        serde_json::from_slice(&response).map_err(|_| {
-            RuntimeError::new(
-                RuntimeErrorCode::HostUnreachable,
-                "capability_pending: server returned an invalid scoped grant reference",
-            )
-        })
+        let prepared: freshell_runtime_protocol::PreparedProviderContext =
+            serde_json::from_slice(&response).map_err(|_| {
+                RuntimeError::new(
+                    RuntimeErrorCode::HostUnreachable,
+                    "capability_pending: server returned an invalid scoped grant reference",
+                )
+            })?;
+        prepared.validate(provider)?;
+        Ok(prepared)
     }
 
     async fn mcp_capability_callback(
@@ -2088,6 +2108,9 @@ impl Supervisor {
                 "tuiSource": request.tui_source,
                 "workspace": request.workspace,
                 "authLookupAuthority": request.auth_lookup_authority,
+                "cwd":request.cwd,
+                "priorContext":request.prior_context,
+                "providerSecretReferences":request.provider_secret_references,
             }),
             freshell_runtime_protocol::MAX_CONTROL_FRAME_BYTES,
         )

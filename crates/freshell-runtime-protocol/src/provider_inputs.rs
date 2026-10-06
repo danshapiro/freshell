@@ -4,6 +4,31 @@ use crate::{McpCapabilityReference, RuntimeError, RuntimeErrorCode, SoulId};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+/// One immutable preparation result for every launch and replacement route.
+/// Source documents and selected payloads stay in their private filesystem.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PreparedProviderContext {
+    pub provider_launch_context: crate::ProviderLaunchContext,
+    pub provider_secret_references: Vec<crate::ProviderSecretReference>,
+}
+impl PreparedProviderContext {
+    pub fn validate(&self, provider: &str) -> Result<(), RuntimeError> {
+        crate::bounded_json_bytes(self, crate::MAX_CONTROL_FRAME_BYTES).map_err(|_| {
+            RuntimeError::new(
+                RuntimeErrorCode::InvalidRequest,
+                "prepared provider context exceeds control metadata profile",
+            )
+        })?;
+        self.provider_launch_context.validate(provider)?;
+        crate::validate_provider_secrets(provider, &self.provider_secret_references)?;
+        if let Some(inputs) = &self.provider_launch_context.prepared_inputs {
+            inputs.validate_references(&self.provider_secret_references)?;
+        }
+        Ok(())
+    }
+}
+
 /// Transient frozen path inputs travel only through authenticated process IPC.
 /// This type must never be embedded in a durable launch specification.
 #[derive(Clone, Default, PartialEq, Eq, Serialize)]
@@ -483,6 +508,48 @@ mod tests {
             host_gateway_address: None,
         }
     }
+    #[test]
+    fn provider_prepared_complete_context_rejects_mixed_generation_and_reference_vectors() {
+        let value = PreparedProviderContext {
+            provider_launch_context: crate::ProviderLaunchContext {
+                prepared_inputs: Some(prepared()),
+                preparation: crate::ProviderPreparation::Codex {
+                    tui_args: vec![],
+                    sidecar_args: vec![],
+                },
+                mcp_capability: Some(capability()),
+                config: vec![],
+            },
+            provider_secret_references: (0..2)
+                .map(|index| crate::ProviderSecretReference {
+                    source_path: format!("/private/source-{index}"),
+                    profile: crate::ProviderSecretProfile::CodexConfigurationFile,
+                    provider_relative_path: Some(format!(".freshell/references/{index}")),
+                })
+                .collect(),
+        };
+        let wire = crate::bounded_json_bytes(&value, crate::MAX_CONTROL_FRAME_BYTES).unwrap();
+        let mut received: PreparedProviderContext = serde_json::from_slice(&wire).unwrap();
+        received.validate("codex").unwrap();
+        assert!(received.validate("opencode").is_err());
+        received.provider_secret_references.swap(0, 1);
+        assert!(
+            received.validate("codex").is_err(),
+            "stale/new indexed reference vectors cannot accompany a prepared generation"
+        );
+        received = value;
+        received
+            .provider_launch_context
+            .mcp_capability
+            .as_mut()
+            .unwrap()
+            .grant_id = "grant-different".into();
+        assert!(
+            received.validate("codex").is_err(),
+            "one complete reply must retain its exact generation authority"
+        );
+    }
+
     #[test]
     fn provider_prepared_mounts_reject_different_sources_over_one_effective_inode() {
         let mut value = prepared();

@@ -231,15 +231,17 @@ impl ManagedTerminalController for ServerManagedRuntimeController {
                         .or_else(|| std::env::var(name).ok())
                 };
                 let prepared = crate::managed_provider_references::prepare_managed_opencode(
-                    &self.client,
-                    &soul_id,
-                    create_key,
-                    &home,
-                    &cwd,
-                    &workspace,
-                    &original,
-                    provider_secret_references,
-                    None,
+                    crate::managed_provider_references::OpencodePreparation {
+                        client: &self.client,
+                        soul: &soul_id,
+                        creation_seed: create_key,
+                        home: &home,
+                        cwd: &cwd,
+                        workspace: &workspace,
+                        original: &original,
+                        references: provider_secret_references,
+                        auth_authority: None,
+                    },
                 )
                 .await?;
                 provider_secret_references = prepared.references;

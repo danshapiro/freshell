@@ -92,7 +92,7 @@ impl SourceEnvironment {
             .cloned()
     }
     pub fn needs_native_auth(&self) -> bool {
-        self.auth.is_none()
+        self.auth.is_none() && !self.names.is_empty()
     }
     pub fn names(&self) -> &[String] {
         &self.names

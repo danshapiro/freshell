@@ -335,6 +335,146 @@ async fn provider_native_auth_nested_callback_uses_current_attempt_without_reloc
         _ => panic!("unexpected auth reply"),
     }
     assert_eq!(backend.0.load(Ordering::SeqCst), 1);
+    // Exercise the real callback and private control sockets while the same
+    // soul's lifecycle lock is held. The nested lookup must use its scoped
+    // attempt and the response must retain one complete generation/vector.
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let control_task = tokio::spawn({
+        let supervisor = supervisor.clone();
+        let path = supervisor.config.control_socket_path.clone();
+        async move { crate::service::serve_control(supervisor, &path).await }
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while !supervisor.config.control_socket_path.exists() {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let callback_listener = tokio::net::UnixListener::bind(
+        supervisor
+            .config
+            .control_socket_path
+            .with_file_name("mcp.sock"),
+    )
+    .unwrap();
+    let control_socket = supervisor.config.control_socket_path.clone();
+    let epoch = supervisor.registry.control_epoch();
+    let callback_soul = soul.clone();
+    let generation = format!("grant-{}", uuid::Uuid::new_v4());
+    let reference = McpCapabilityReference {
+        grant_id: generation.clone(),
+        endpoint: "http://host.docker.internal:4000".into(),
+        provider_relative_path: ".freshell/mcp-capability.json".into(),
+        host_gateway_address: None,
+    };
+    let context = ProviderLaunchContext {
+        preparation: ProviderPreparation::Opencode {
+            project_config: vec![],
+            tui_config: None,
+            tui_source: None,
+            inline_config: false,
+        },
+        config: vec![],
+        mcp_capability: Some(reference.clone()),
+        prepared_inputs: None,
+    };
+    let mut reply_context = context.clone();
+    reply_context.prepared_inputs = Some(PreparedProviderInputs {
+        generation_id: generation.clone(),
+        initial_auth_reservation: None,
+        manifest: ProviderInputManifestReference {
+            relative_path: ".freshell/input-manifest.json".into(),
+            sha256: "a".repeat(64),
+            source_count: 6,
+            alias_count: 6,
+            recipe_count: 0,
+        },
+        config_binds: vec![],
+        resource_mounts: vec![],
+        indexed_files: Some(IndexedProviderFiles {
+            volume_name: indexed_provider_volume_name(&soul, &generation),
+            aliases: (0..6)
+                .map(|index| IndexedProviderFileAlias {
+                    source_id: index,
+                    logical_destination: format!("/fixture/source-{index}"),
+                    effective_destination: format!("/fixture/source-{index}"),
+                })
+                .collect(),
+        }),
+    });
+    let references = (0..6)
+        .map(|index| ProviderSecretReference {
+            source_path: format!("/private/source-{index}"),
+            profile: ProviderSecretProfile::OpencodeConfigurationFile,
+            provider_relative_path: Some(format!(".freshell/references/{index}")),
+        })
+        .collect::<Vec<_>>();
+    let reply = PreparedProviderContext {
+        provider_launch_context: reply_context,
+        provider_secret_references: references.clone(),
+    };
+    let callback_task = tokio::spawn(async move {
+        let (mut stream, _) = callback_listener.accept().await.unwrap();
+        let mut bytes = Vec::new();
+        (&mut stream)
+            .take((MAX_CONTROL_FRAME_BYTES + 1) as u64)
+            .read_to_end(&mut bytes)
+            .await
+            .unwrap();
+        let request: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(request["soulId"], callback_soul.as_str());
+        assert_eq!(request["cwd"], "/fixture/instance");
+        assert!(request["priorContext"].is_object());
+        let mut control = tokio::net::UnixStream::connect(control_socket)
+            .await
+            .unwrap();
+        let mut envelope = Envelope::new(
+            RequestId::new(),
+            ControlRole::Web,
+            AdminCommand::NativeAuthLookup(NativeAuthLookupRequest {
+                expected_control_epoch: Some(epoch),
+                soul_id: callback_soul,
+                attempt_authority: request["authLookupAuthority"].as_str().unwrap().into(),
+                keys: vec!["PATH_INPUT".into()],
+            }),
+        );
+        envelope.auth = Some(secret.into());
+        write_frame(&mut control, &envelope).await.unwrap();
+        let response: AdminReply = read_frame(&mut control).await.unwrap();
+        let AdminResult::NativeAuthLookup(values) = response.result.unwrap() else {
+            panic!("unexpected nested private RPC result")
+        };
+        assert_eq!(values.0["PATH_INPUT"], "/synthetic/selected");
+        let bytes = bounded_json_bytes(&reply, MAX_CONTROL_FRAME_BYTES).unwrap();
+        stream.write_all(&bytes).await.unwrap();
+    });
+    let returned = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        supervisor.issue_replacement_mcp_capability(
+            &start,
+            "opencode",
+            &context,
+            &[],
+            "/fixture/instance",
+            "/fixture/workspace",
+        ),
+    )
+    .await
+    .expect("complete callback lookup reacquired the held soul lock")
+    .unwrap();
+    assert_eq!(returned.provider_secret_references, references);
+    assert_eq!(
+        returned
+            .provider_launch_context
+            .prepared_inputs
+            .unwrap()
+            .generation_id,
+        generation
+    );
+    callback_task.await.unwrap();
+    control_task.abort();
+    assert_eq!(backend.0.load(Ordering::SeqCst), 2);
     assert!(supervisor
         .dispatch(request(SoulId::new(), key.clone()))
         .await
@@ -364,7 +504,7 @@ async fn provider_native_auth_nested_callback_uses_current_attempt_without_reloc
         .is_err());
     assert_eq!(
         backend.0.load(Ordering::SeqCst),
-        1,
+        2,
         "expired/foreign/stopped attempt must never inspect auth"
     );
 }

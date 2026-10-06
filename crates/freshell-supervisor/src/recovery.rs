@@ -572,6 +572,7 @@ impl Supervisor {
             start.context.terminal.clone()
         };
         let mut replacement_terminal = replacement_terminal;
+        let mut replacement_fresh = fresh_without_raw_bootstrap(start.context.fresh_agent.clone());
         if replacement_terminal.as_ref().is_some_and(|terminal| {
             matches!(
                 terminal.mode.as_str(),
@@ -610,43 +611,45 @@ impl Supervisor {
                 incident_id: None,
             });
         }
-        if let Some(terminal) = replacement_terminal.as_mut() {
-            if terminal
-                .provider_launch_context
-                .as_ref()
-                .and_then(|context| context.mcp_capability.as_ref())
-                .is_some()
-            {
-                let tui_source = terminal
-                    .provider_launch_context
-                    .as_ref()
-                    .and_then(|context| {
-                        if let freshell_runtime_protocol::ProviderPreparation::Opencode {
-                            tui_source,
-                            ..
-                        } = &context.preparation
-                        {
-                            tui_source.as_ref()
-                        } else {
-                            None
-                        }
-                    });
-                let refreshed_capability = self
-                    .issue_replacement_mcp_capability(&start, &terminal.mode, tui_source, &terminal.workspace_path)
-                    .await
-                    .and_then(|reference| {
-                        crate::backend::docker::staged_provider_root_for_grant(
-                            &reference.grant_id,
+        let replacement_context = replacement_terminal
+            .as_ref()
+            .and_then(|terminal| {
+                terminal.provider_launch_context.as_ref().map(|context| {
+                    (
+                        terminal.mode.clone(),
+                        context.clone(),
+                        terminal.provider_secret_references.clone(),
+                        terminal.cwd.clone(),
+                        terminal.workspace_path.clone(),
+                    )
+                })
+            })
+            .or_else(|| {
+                replacement_fresh.as_ref().and_then(|agent| {
+                    agent.provider_launch_context.as_ref().map(|context| {
+                        (
+                            agent.provider.as_str().to_owned(),
+                            context.clone(),
+                            agent.provider_secret_references.clone(),
+                            agent.cwd.clone(),
+                            agent.workspace_path.clone(),
                         )
-                        .map(|staged_root| (reference, staged_root))
-                        .map_err(|error| {
-                            RuntimeError::new(
-                                    RuntimeErrorCode::HostUnreachable,
-                                    format!("capability_pending: staged provider root unavailable: {error}"),
-                                )
-                        })
-                    });
-                let (reference, staged_root) = match refreshed_capability {
+                    })
+                })
+            });
+        if let Some((provider, context, references, cwd, workspace)) = replacement_context {
+            if context.mcp_capability.is_some() {
+                let refreshed_capability = self
+                    .issue_replacement_mcp_capability(
+                        &start,
+                        &provider,
+                        &context,
+                        &references,
+                        &cwd,
+                        &workspace,
+                    )
+                    .await;
+                let prepared_context = match refreshed_capability {
                     Ok(refreshed) => refreshed,
                     Err(error) => {
                         let reason = RecoveryBlockReason::CapabilityPending;
@@ -673,8 +676,11 @@ impl Supervisor {
                         });
                     }
                 };
-                replace_terminal_mcp_reference(terminal, reference);
-                refresh_terminal_provider_config(terminal, &staged_root);
+                install_prepared_provider_context(
+                    replacement_terminal.as_mut(),
+                    replacement_fresh.as_mut(),
+                    prepared_context,
+                )?;
             }
         }
         let prepared = match self
@@ -682,7 +688,7 @@ impl Supervisor {
             .prepare_replacement(
                 start.clone(),
                 replacement_terminal,
-                fresh_without_raw_bootstrap(start.context.fresh_agent.clone()),
+                replacement_fresh,
                 resume_spec.clone(),
                 path,
             )
@@ -2097,6 +2103,32 @@ fn replace_terminal_mcp_reference(
     }
 }
 
+fn install_prepared_provider_context(
+    terminal: Option<&mut TerminalLaunchSpec>,
+    fresh: Option<&mut freshell_runtime_protocol::FreshAgentLaunchSpec>,
+    prepared: freshell_runtime_protocol::PreparedProviderContext,
+) -> Result<(), RuntimeError> {
+    match (terminal, fresh) {
+        (Some(terminal), None) => {
+            prepared.validate(&terminal.mode)?;
+            terminal.provider_launch_context = Some(prepared.provider_launch_context);
+            terminal.provider_secret_references = prepared.provider_secret_references;
+        }
+        (None, Some(agent)) => {
+            prepared.validate(agent.provider.as_str())?;
+            agent.provider_launch_context = Some(prepared.provider_launch_context);
+            agent.provider_secret_references = prepared.provider_secret_references;
+        }
+        _ => {
+            return Err(RuntimeError::new(
+                RuntimeErrorCode::InvalidRequest,
+                "complete provider replacement requires exactly one workload",
+            ))
+        }
+    }
+    Ok(())
+}
+
 fn refresh_provider_context_from_user_root(
     context: &mut freshell_runtime_protocol::ProviderLaunchContext,
     provider: &str,
@@ -2436,11 +2468,81 @@ mod tests {
         );
         let reference = replacement
             .provider_launch_context
+            .as_ref()
             .unwrap()
             .mcp_capability
+            .as_ref()
             .unwrap();
         assert_eq!(reference.grant_id, "grant-new");
         assert_eq!(reference.endpoint, "http://host.docker.internal:4001");
+        let generation = format!("grant-{}", uuid::Uuid::new_v4());
+        let references = (0..6)
+            .map(|index| freshell_runtime_protocol::ProviderSecretReference {
+                source_path: format!("/private/current-source-{index}"),
+                profile:
+                    freshell_runtime_protocol::ProviderSecretProfile::OpencodeConfigurationFile,
+                provider_relative_path: Some(format!(".freshell/references/{index}")),
+            })
+            .collect::<Vec<_>>();
+        let mut context = replacement
+            .provider_launch_context
+            .as_ref()
+            .unwrap()
+            .clone();
+        context.mcp_capability.as_mut().unwrap().grant_id = generation.clone();
+        context.prepared_inputs = Some(freshell_runtime_protocol::PreparedProviderInputs {
+            generation_id: generation.clone(),
+            initial_auth_reservation: None,
+            manifest: freshell_runtime_protocol::ProviderInputManifestReference {
+                relative_path: ".freshell/input-manifest.json".into(),
+                sha256: "a".repeat(64),
+                source_count: 6,
+                alias_count: 0,
+                recipe_count: 0,
+            },
+            config_binds: vec![],
+            resource_mounts: vec![],
+            indexed_files: Some(freshell_runtime_protocol::IndexedProviderFiles {
+                volume_name: freshell_runtime_protocol::indexed_provider_volume_name(
+                    &SoulId::new(),
+                    &generation,
+                ),
+                aliases: vec![],
+            }),
+        });
+        let complete = freshell_runtime_protocol::PreparedProviderContext {
+            provider_launch_context: context,
+            provider_secret_references: references.clone(),
+        };
+        let mut fresh:freshell_runtime_protocol::FreshAgentLaunchSpec=serde_json::from_value(serde_json::json!({
+            "sessionId":"fresh-replacement","provider":"opencode","sessionType":"freshopencode","runtimeVariant":"opencode-serve",
+            "providerStoreId":"store","cwd":"/workspace","workspacePath":"/workspace","runAsUid":65534,"runAsGid":0
+        })).unwrap();
+        install_prepared_provider_context(Some(&mut replacement), None, complete.clone()).unwrap();
+        install_prepared_provider_context(None, Some(&mut fresh), complete).unwrap();
+        assert_eq!(replacement.provider_secret_references, references);
+        assert_eq!(fresh.provider_secret_references, references);
+        assert_eq!(
+            replacement
+                .provider_launch_context
+                .unwrap()
+                .prepared_inputs
+                .unwrap()
+                .generation_id,
+            generation
+        );
+        assert_eq!(
+            fresh
+                .provider_launch_context
+                .unwrap()
+                .prepared_inputs
+                .unwrap()
+                .generation_id,
+            generation
+        );
+        assert_eq!(replacement.program, terminal.program);
+        assert_eq!(replacement.args, terminal.args);
+        assert!(replacement.provider_bootstrap_files.is_empty());
     }
 
     #[test]

@@ -702,17 +702,48 @@ pub(crate) struct PreparedManagedOpencode {
 
 /// Terminal, fresh and scoped replacement callers share this one preparation.
 /// The original lookup and decoded grants never enter the returned metadata.
+pub(crate) struct OpencodePreparation<'a> {
+    pub client: &'a freshell_runtime_client::RuntimeClient,
+    pub soul: &'a freshell_runtime_protocol::SoulId,
+    pub creation_seed: &'a str,
+    pub home: &'a Path,
+    pub cwd: &'a Path,
+    pub workspace: &'a Path,
+    pub original: &'a (dyn Fn(&str) -> Option<String> + Sync),
+    pub references: Vec<freshell_runtime_protocol::ProviderSecretReference>,
+    pub auth_authority: Option<&'a str>,
+}
+
 pub(crate) async fn prepare_managed_opencode(
-    client: &freshell_runtime_client::RuntimeClient,
-    soul: &freshell_runtime_protocol::SoulId,
-    creation_seed: &str,
-    home: &Path,
-    cwd: &Path,
-    workspace: &Path,
-    original: &(dyn Fn(&str) -> Option<String> + Sync),
-    mut references: Vec<freshell_runtime_protocol::ProviderSecretReference>,
-    auth_authority: Option<&str>,
+    request: OpencodePreparation<'_>,
 ) -> Result<PreparedManagedOpencode, String> {
+    prepare_managed_opencode_with_publisher(
+        request,
+        crate::managed_mcp_capability::issue_prepared_opencode_context,
+    )
+    .await
+}
+
+pub(crate) async fn prepare_managed_opencode_with_publisher(
+    request: OpencodePreparation<'_>,
+    publish: impl FnOnce(
+        &freshell_runtime_protocol::SoulId,
+        &Path,
+        &freshell_runtime_protocol::ProviderLaunchContext,
+        crate::managed_mcp_capability::OpencodeEphemeralInput<'_>,
+    ) -> Result<freshell_runtime_protocol::ProviderLaunchContext, String>,
+) -> Result<PreparedManagedOpencode, String> {
+    let OpencodePreparation {
+        client,
+        soul,
+        creation_seed,
+        home,
+        cwd,
+        workspace,
+        original,
+        mut references,
+        auth_authority,
+    } = request;
     use sources::*;
     if original("OPENCODE_CONFIG_CONTENT").is_some_and(|value| !value.is_empty())
         || original("OPENCODE_TUI_CONFIG").is_some_and(|value| !value.is_empty())
@@ -820,7 +851,7 @@ pub(crate) async fn prepare_managed_opencode(
     }
     freshell_runtime_protocol::validate_provider_secrets("opencode", &references)
         .map_err(|error| error.message)?;
-    let context = crate::managed_mcp_capability::issue_prepared_opencode_context(
+    let context = publish(
         soul,
         home,
         &base,
@@ -839,12 +870,14 @@ pub(crate) async fn prepare_managed_opencode(
         .mcp_capability
         .as_ref()
         .ok_or("prepared source capability unavailable")?;
-    if let Err(error) = client
-        .bind_provider_path_inputs(soul.clone(), capability.grant_id.clone(), frozen)
-        .await
-    {
-        let _ = crate::managed_mcp_capability::revoke_mcp_capability(&capability.grant_id);
-        return Err(error.to_string());
+    if !frozen.is_empty() {
+        if let Err(error) = client
+            .bind_provider_path_inputs(soul.clone(), capability.grant_id.clone(), frozen)
+            .await
+        {
+            let _ = crate::managed_mcp_capability::revoke_mcp_capability(&capability.grant_id);
+            return Err(error.to_string());
+        }
     }
     context
         .prepared_inputs
