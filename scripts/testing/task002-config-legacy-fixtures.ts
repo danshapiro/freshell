@@ -56,6 +56,12 @@ function ownedRecord(h: RuntimeHarness, s: SupervisorInstance, soulId: string): 
     "import sqlite3,json,sys; c=sqlite3.connect('file:/var/lib/freshell-supervisor/runtime.sqlite3?mode=ro',uri=True); c.row_factory=sqlite3.Row; i=c.execute('SELECT * FROM incarnations WHERE soul_id=? ORDER BY created_at DESC LIMIT 1',(sys.argv[1],)).fetchone(); a=c.execute('SELECT count(*) FROM recovery_attempts WHERE soul_id=?',(sys.argv[1],)).fetchone()[0]; w=c.execute('SELECT count(*) FROM writer_claims WHERE soul_id=?',(sys.argv[1],)).fetchone()[0]; print(json.dumps({'incarnation':dict(i),'attemptCount':a,'writerClaims':w}))", soulId]))
 }
 
+function mountSnapshot(mounts: unknown[]): string {
+  // Docker returns this list from a map; order is not mount identity. Keep
+  // every complete record and duplicate while comparing the same topology.
+  return JSON.stringify(mounts.map(mount => JSON.stringify(mount)).sort())
+}
+
 const SWAP_NEGATIVE_CONTAINER = String.raw`
 import sqlite3,sys,json
 soul,incarnation,original,negative,digest,direction=sys.argv[1:]
@@ -133,10 +139,12 @@ async function legacyNegativeMounts(
         `${fault} preserves every saved field, digest, root, store and incarnation count`)
       const actual = h.inspectContainer(originalId)
       h.assert(caseId, actual.State.Running === true && actual.State.Pid === writerPid
-        && actual.Image === source.Image && JSON.stringify(actual.Mounts) === JSON.stringify(source.Mounts)
-        && JSON.stringify(nativeGraph()) === JSON.stringify(graph)
+        && actual.Image === source.Image, `${fault} preserves the exact healthy original process and image`)
+      h.assert(caseId, mountSnapshot(actual.Mounts) === mountSnapshot(source.Mounts),
+        `${fault} preserves every original mount field and duplicate`, { sourceMounts: source.Mounts, actualMounts: actual.Mounts })
+      h.assert(caseId, JSON.stringify(nativeGraph()) === JSON.stringify(graph)
         && (await retainedHostStatus(h, first, launch, true)).exited === false,
-        `${fault} preserves the exact healthy original provider`)
+        `${fault} preserves the exact native graph and authenticated alive status`)
       h.assert(caseId, h.inspectContainer(negativeId).State.Status === 'created'
         && h.broker.destructiveRequestsFor(negativeId).length === 0,
         `${fault} negative enclosure never starts and acquires no mutation authority`)

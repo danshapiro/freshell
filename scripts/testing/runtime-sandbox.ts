@@ -1273,14 +1273,26 @@ export class RuntimeHarness {
           ? value.map((cap: string) => cap.replace(/^CAP_/, '')).sort() : value
         return JSON.stringify(normalized(bad.HostConfig[key])) !== JSON.stringify(normalized(host[key]))
       })
+      const environmentNames = (entries: string[]) => entries.map(entry => entry.split('=', 1)[0])
+      const environmentShape = {
+        originalNames: environmentNames(config.Env ?? []), actualNames: environmentNames(bad.Config.Env ?? []),
+        originalUnique: new Set(environmentNames(config.Env ?? [])).size === (config.Env ?? []).length,
+        actualUnique: new Set(environmentNames(bad.Config.Env ?? [])).size === (bad.Config.Env ?? []).length,
+        completeEntriesEqualIgnoringOrder: JSON.stringify([...(config.Env ?? [])].sort()) === JSON.stringify([...(bad.Config.Env ?? [])].sort()),
+      }
+      this.writeArtifact(`task2-negative-${fault}-environment-shape.json`, environmentShape)
+      // Unique environment names have no ordering semantics. Refuse duplicate
+      // names (where order can choose a value), and compare every exact entry.
+      const environmentPreserved = environmentShape.originalUnique && environmentShape.actualUnique
+        && environmentShape.completeEntriesEqualIgnoringOrder
       if (bad.State.Running || bad.State.Status !== 'created' || bad.State.Pid !== 0
         || bad.Id !== id || bad.Image !== original.Image || bad.HostConfig.ReadonlyRootfs !== true
         || preservedHostMismatch.length !== 0
         || JSON.stringify([...bad.HostConfig.Binds].sort()) !== JSON.stringify([...binds].sort())
         || JSON.stringify(bad.HostConfig.Tmpfs) !== JSON.stringify(tmpfs)
-        || JSON.stringify(bad.Config.Env) !== JSON.stringify(config.Env)
+        || !environmentPreserved
         || JSON.stringify(bad.Config.Cmd) !== JSON.stringify(config.Cmd))
-        throw new Error(`never-started negative fixture shape differs (host fields: ${preservedHostMismatch.join(',')}; binds: ${JSON.stringify([...bad.HostConfig.Binds].sort()) === JSON.stringify([...binds].sort())}; tmpfs: ${JSON.stringify(bad.HostConfig.Tmpfs) === JSON.stringify(tmpfs)}; env: ${JSON.stringify(bad.Config.Env) === JSON.stringify(config.Env)}; command: ${JSON.stringify(bad.Config.Cmd) === JSON.stringify(config.Cmd)})`)
+        throw new Error(`never-started negative fixture shape differs (host fields: ${preservedHostMismatch.join(',')}; binds: ${JSON.stringify([...bad.HostConfig.Binds].sort()) === JSON.stringify([...binds].sort())}; tmpfs: ${JSON.stringify(bad.HostConfig.Tmpfs) === JSON.stringify(tmpfs)}; env: ${environmentPreserved}; command: ${JSON.stringify(bad.Config.Cmd) === JSON.stringify(config.Cmd)})`)
       this.broker.admitTask2LegacyNegativeInspection(bad, original)
       this.recordLifecycle('task2.legacy_negative.created', { severity: 'info', fault, containerId: id, ownerContainerId: originalId })
       return id
