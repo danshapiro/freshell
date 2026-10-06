@@ -2397,3 +2397,212 @@ async fn durable_souls_server_resolved_scope_rejects_tenth_drift_before_writes()
         unrelated.incident_id.as_str()
     );
 }
+
+async fn check_persisted_repair_source_failure(failure: &str) {
+    use freshell_runtime_protocol::{
+        PreflightLostSoulsRequest, RepairBatchSourceSelection, RequestId, RestoreLostSoulsRequest,
+        RuntimeError, RuntimeErrorCode, SoulRepairStatus,
+    };
+    use freshell_sessions::opencode_transfer::{
+        pinned_destination_migration_ids, pinned_destination_schema_sql, HostOpenCodeInventory,
+    };
+    use sha2::{Digest, Sha256};
+    let dir = tempfile::tempdir().unwrap();
+    let registry = Registry::open(dir.path(), None).unwrap();
+    let workspace = dir.path().join("workspace");
+    std::fs::create_dir(&workspace).unwrap();
+    let database = dir.path().join("source.sqlite");
+    let source = Connection::open(&database).unwrap();
+    source
+        .execute_batch(pinned_destination_schema_sql())
+        .unwrap();
+    for migration in pinned_destination_migration_ids() {
+        source
+            .execute(
+                "INSERT INTO migration(id,time_completed) VALUES (?1,1)",
+                [migration],
+            )
+            .unwrap();
+    }
+    source.execute("INSERT INTO project(id,worktree,time_created,time_updated,sandboxes) VALUES ('fixture-project',?1,1,1,'[]')", [workspace.to_string_lossy().as_ref()]).unwrap();
+    source.execute("INSERT INTO project_directory(project_id,directory,time_created) VALUES ('fixture-project',?1,1)", [workspace.to_string_lossy().as_ref()]).unwrap();
+    let root = "ses_fixture_source_failure";
+    source.execute("INSERT INTO session(id,project_id,slug,directory,title,version,time_created,time_updated) VALUES (?1,'fixture-project','fixture',?2,'synthetic source','1.18.21',1,1)", params![root,workspace.to_string_lossy().as_ref()]).unwrap();
+    drop(source);
+    let target = stopped_legacy_fixture_target(&registry, dir.path(), root).await;
+    let conn = Connection::open(registry.database_path()).unwrap();
+    let terminal = serde_json::json!({"terminalId":"terminal-source-failure","streamId":"stream-source-failure","mode":"opencode","program":"opencode","env":{},"runAsUid":65534,"runAsGid":0,"cols":80,"rows":24,"projectKey":"test-project","workspacePath":workspace,"cwd":workspace});
+    conn.execute(
+        "UPDATE incarnations SET terminal_spec=?1 WHERE soul_id=?2",
+        params![terminal.to_string(), target.soul_id.as_str()],
+    )
+    .unwrap();
+    drop(conn);
+    let supervisor = crate::recovery::tests::missing_supervisor(&dir, registry.clone());
+    let inventory = HostOpenCodeInventory::new(database.clone())
+        .with_trusted_mount_for_selected_session(workspace.clone());
+    let selection = RepairBatchSourceSelection {
+        source_store_id: format!(
+            "{:x}",
+            Sha256::digest(
+                database
+                    .canonicalize()
+                    .unwrap()
+                    .to_string_lossy()
+                    .as_bytes()
+            )
+        ),
+        root_session_ids: vec![root.into()],
+    };
+    let scope = supervisor
+        .preflight_lost_souls_from_inventory(
+            PreflightLostSoulsRequest {
+                source: selection.clone(),
+                expected_control_epoch: Some(registry.control_epoch()),
+            },
+            inventory.clone(),
+        )
+        .await
+        .unwrap();
+    let request = RestoreLostSoulsRequest {
+        scope_id: scope.scope_id.clone(),
+        source: selection,
+        targets: vec![target.clone()],
+        canonical_owners: vec![],
+        expected_control_epoch: Some(registry.control_epoch()),
+    };
+    let operation = RequestId::new();
+    registry
+        .prepare_stopped_repair_operation(operation.clone(), request.clone(), scope.clone())
+        .await
+        .unwrap();
+    let before = registry
+        .recovery_context(target.soul_id.clone())
+        .await
+        .unwrap();
+    let reason = match failure {
+        "inventory" => "source_inventory_unreadable",
+        "worker" => "source_inventory_worker_failed",
+        "capture" => "source_not_exactly_resolvable",
+        _ => "source_scope_changed_before_import",
+    };
+    let injected = match failure {
+        "inventory" => {
+            let not_directory = dir.path().join("unreadable-datahome");
+            std::fs::write(&not_directory, b"private diagnostic fixture").unwrap();
+            HostOpenCodeInventory::discover_in_data_home(&not_directory).map_err(|error| {
+                RuntimeError::new(
+                    RuntimeErrorCode::RecoveryBlocked,
+                    format!("private diagnostic fixture: {error}"),
+                )
+            })
+        }
+        "worker" => Err(RuntimeError::new(
+            RuntimeErrorCode::RecoveryBlocked,
+            format!("stopped OpenCode repair is pending ({reason})"),
+        )),
+        "capture" => Ok(HostOpenCodeInventory::new(
+            dir.path().join("missing.sqlite"),
+        )),
+        _ => {
+            let source = Connection::open(&database).unwrap();
+            source
+                .execute(
+                    "UPDATE session SET title='private changed transcript marker'",
+                    [],
+                )
+                .unwrap();
+            Ok(inventory)
+        }
+    };
+    let source_before = std::fs::read(&database).unwrap();
+    let result = supervisor
+        .restore_lost_souls_with_inventory(operation.clone(), request, async { injected })
+        .await
+        .unwrap();
+    assert_eq!(result.status, SoulRepairStatus::Pending, "{failure}");
+    assert_eq!(result.roots.len(), 1);
+    assert_eq!(
+        result.roots[0].reason_code.as_deref(),
+        Some(reason),
+        "{failure}"
+    );
+    assert_eq!(result.repaired_target_count, 0);
+    let after = registry
+        .recovery_context(target.soul_id.clone())
+        .await
+        .unwrap();
+    assert_eq!(after.desired_state, before.desired_state);
+    assert_eq!(after.intent_revision, before.intent_revision);
+    assert_eq!(after.identity_revision, before.identity_revision);
+    assert_eq!(after.native_import_revision, before.native_import_revision);
+    assert_eq!(
+        after.native_import_authority,
+        before.native_import_authority
+    );
+    assert!(registry
+        .stopped_repair_root_receipts(operation.clone())
+        .await
+        .unwrap()
+        .is_empty());
+    assert_eq!(std::fs::read(&database).unwrap(), source_before);
+    let log = std::fs::read_to_string(dir.path().join("lifecycle.jsonl")).unwrap();
+    let events = log
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .filter(|event| event["event"] == "supervisor.stopped_repair.source_failed")
+        .collect::<Vec<_>>();
+    assert_eq!(events.len(), 1, "{failure}");
+    let event = &events[0]["data"];
+    assert_eq!(event["severity"], "error");
+    assert_eq!(event["reasonCode"], reason);
+    assert_eq!(event["operationId"], operation.as_str());
+    assert_eq!(event["scopeId"], scope.scope_id);
+    assert_eq!(event["sourceStoreId"], scope.source_store_id);
+    assert_eq!(event["sourceFingerprint"], scope.source_fingerprint);
+    assert_eq!(event["soulId"], target.soul_id.as_str());
+    assert_eq!(
+        event["incarnationId"],
+        before.prior_handle.incarnation_id().as_str()
+    );
+    assert_eq!(event["intentRevision"], target.expected_intent_revision);
+    assert_eq!(event["incidentId"], target.incident_id.as_str());
+    assert_eq!(
+        event["incidentRevision"],
+        scope.targets[0].incident_revision
+    );
+    assert_eq!(
+        event["identityRevision"],
+        scope.targets[0].identity_revision
+    );
+    assert_eq!(
+        event["nativeImportRevision"],
+        scope.targets[0].native_import_revision
+    );
+    assert_eq!(
+        event["evidenceRevision"],
+        scope.targets[0].evidence_revision
+    );
+    assert_eq!(event["rootSessionId"], root);
+    assert_eq!(event["sourceGeneration"], scope.roots[0].graph_digest);
+    assert!(!log.contains("private changed transcript marker"));
+    assert!(!log.contains("private diagnostic fixture"));
+    assert!(!log.contains("synthetic-secret"));
+}
+
+#[tokio::test]
+async fn durable_souls_persisted_repair_inventory_failure() {
+    check_persisted_repair_source_failure("inventory").await;
+}
+#[tokio::test]
+async fn durable_souls_persisted_repair_worker_failure() {
+    check_persisted_repair_source_failure("worker").await;
+}
+#[tokio::test]
+async fn durable_souls_persisted_repair_capture_failure() {
+    check_persisted_repair_source_failure("capture").await;
+}
+#[tokio::test]
+async fn durable_souls_persisted_repair_source_mismatch() {
+    check_persisted_repair_source_failure("mismatch").await;
+}

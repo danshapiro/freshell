@@ -46,6 +46,14 @@ use std::{
 };
 use tokio::time::{sleep, Duration, Instant};
 
+type StoppedRepairGroups = BTreeMap<
+    String,
+    Vec<(
+        freshell_runtime_protocol::LostSoulRepairTarget,
+        RecoveryContext,
+    )>,
+>;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum NativeIdentityWait {
     Observed {
@@ -576,13 +584,7 @@ impl Supervisor {
             .repair_scope_members(request.source.clone())
             .await
             .map_err(map_registry)?;
-        let mut groups = BTreeMap::<
-            String,
-            Vec<(
-                freshell_runtime_protocol::LostSoulRepairTarget,
-                RecoveryContext,
-            )>,
-        >::new();
+        let mut groups = StoppedRepairGroups::new();
         for member in &targets {
             let context = self
                 .registry
@@ -681,6 +683,23 @@ impl Supervisor {
         operation_id: freshell_runtime_protocol::RequestId,
         request: RestoreLostSoulsRequest,
     ) -> Result<RestoreLostSoulsResult, RuntimeError> {
+        self.restore_lost_souls_with_inventory(operation_id, request, async {
+            tokio::task::spawn_blocking(
+                HostOpenCodeInventory::from_process_environment_discovering_channels,
+            )
+            .await
+            .map_err(|_| stopped_repair_blocked("source_inventory_worker_failed"))?
+            .map_err(|_| stopped_repair_blocked("source_inventory_unreadable"))
+        })
+        .await
+    }
+
+    pub(crate) async fn restore_lost_souls_with_inventory(
+        &self,
+        operation_id: freshell_runtime_protocol::RequestId,
+        request: RestoreLostSoulsRequest,
+        source_inventory: impl std::future::Future<Output = Result<HostOpenCodeInventory, RuntimeError>>,
+    ) -> Result<RestoreLostSoulsResult, RuntimeError> {
         let scope = match self
             .registry
             .stopped_repair_operation_scope(operation_id.clone())
@@ -774,13 +793,7 @@ impl Supervisor {
             _repair_guards.push(lifecycle_lock.lock_owned().await);
         }
 
-        let mut groups = BTreeMap::<
-            String,
-            Vec<(
-                freshell_runtime_protocol::LostSoulRepairTarget,
-                RecoveryContext,
-            )>,
-        >::new();
+        let mut groups = StoppedRepairGroups::new();
         for target in &targets {
             let context = self
                 .registry
@@ -844,19 +857,20 @@ impl Supervisor {
             ));
         }
 
-        let inventory = match tokio::task::spawn_blocking(
-            HostOpenCodeInventory::from_process_environment_discovering_channels,
-        )
-        .await
-        {
-            Ok(Ok(inventory)) => inventory,
-            _ => {
-                return Ok(pending_stopped_repair_result(
-                    &scope.scope_id,
+        let inventory = match source_inventory.await {
+            Ok(inventory) => inventory,
+            Err(error) => {
+                let reason = match stopped_repair_error_reason_code(&error).as_deref() {
+                    Some("source_inventory_worker_failed") => "source_inventory_worker_failed",
+                    _ => "source_inventory_unreadable",
+                };
+                return Ok(self.pending_stopped_repair_source_failure(
+                    &scope,
                     operation_id,
-                    targets.len(),
+                    &groups,
                     progress,
-                ))
+                    reason,
+                ));
             }
         };
         let inventory = match self
@@ -864,13 +878,19 @@ impl Supervisor {
             .await
         {
             Ok(inventory) => inventory,
-            Err(_) => {
-                return Ok(pending_stopped_repair_result(
-                    &scope.scope_id,
+            Err(error) => {
+                let reason = match stopped_repair_error_reason_code(&error).as_deref() {
+                    Some("terminal_workspace_missing") => "terminal_workspace_missing",
+                    Some("source_capture_worker_failed") => "source_capture_worker_failed",
+                    _ => "source_not_exactly_resolvable",
+                };
+                return Ok(self.pending_stopped_repair_source_failure(
+                    &scope,
                     operation_id,
-                    targets.len(),
+                    &groups,
                     progress,
-                ))
+                    reason,
+                ));
             }
         };
 
@@ -895,7 +915,13 @@ impl Supervisor {
                                 && scoped.graph_digest == prepared.snapshot.manifest().generation
                         })
                     {
-                        return Err(stopped_repair_blocked("source_scope_changed_before_import"));
+                        return Ok(self.pending_stopped_repair_source_failure(
+                            &scope,
+                            operation_id,
+                            &groups,
+                            progress,
+                            "source_scope_changed_before_import",
+                        ));
                     }
                     progress
                         .get_mut(root)
@@ -1055,15 +1081,53 @@ impl Supervisor {
         Ok(snapshot)
     }
 
+    fn pending_stopped_repair_source_failure(
+        &self,
+        scope: &freshell_runtime_protocol::RepairBatchScope,
+        operation_id: freshell_runtime_protocol::RequestId,
+        groups: &StoppedRepairGroups,
+        mut progress: BTreeMap<String, RestoreLostSoulRootResult>,
+        reason_code: &'static str,
+    ) -> RestoreLostSoulsResult {
+        for root in progress.values_mut() {
+            root.reason_code = Some(reason_code.to_string());
+        }
+        for (root, targets) in groups {
+            let generation = scope
+                .roots
+                .iter()
+                .find(|member| member.root_session_id == *root)
+                .map(|member| member.graph_digest.as_str());
+            for (target, context) in targets {
+                let captured = scope
+                    .targets
+                    .iter()
+                    .find(|member| member.target.soul_id == target.soul_id);
+                crate::service::append_event(
+                    &self.config.lifecycle_log,
+                    "supervisor.stopped_repair.source_failed",
+                    serde_json::json!({
+                        "severity": "error", "reasonCode": reason_code,
+                        "operationId": operation_id, "scopeId": scope.scope_id,
+                        "sourceStoreId": scope.source_store_id, "sourceFingerprint": scope.source_fingerprint,
+                        "rootSessionId": root, "sourceGeneration": generation,
+                        "soulId": target.soul_id, "incarnationId": context.prior_handle.incarnation_id(),
+                        "intentRevision": target.expected_intent_revision,
+                        "incidentId": target.incident_id,
+                        "incidentRevision": captured.map(|member| member.incident_revision),
+                        "identityRevision": captured.map(|member| member.identity_revision),
+                        "nativeImportRevision": captured.map(|member| member.native_import_revision),
+                        "evidenceRevision": captured.map(|member| member.evidence_revision),
+                    }),
+                );
+            }
+        }
+        pending_stopped_repair_result(&scope.scope_id, operation_id, scope.targets.len(), progress)
+    }
+
     async fn capture_stopped_opencode_batch(
         &self,
-        groups: &BTreeMap<
-            String,
-            Vec<(
-                freshell_runtime_protocol::LostSoulRepairTarget,
-                RecoveryContext,
-            )>,
-        >,
+        groups: &StoppedRepairGroups,
         mut inventory: HostOpenCodeInventory,
     ) -> Result<HostOpenCodeInventory, RuntimeError> {
         for (_, context) in groups.values().flatten() {
