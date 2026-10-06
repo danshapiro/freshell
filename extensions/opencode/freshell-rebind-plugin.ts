@@ -467,7 +467,6 @@ export function createObservationEmitter(
       }
       const signature = JSON.stringify(observation)
       if (signature === lastEmitted) return
-      lastEmitted = signature
       seq += 1
       const nonce = `${String(now()).padStart(14, '0')}-${String(seq).padStart(6, '0')}-${process.pid}`
       write(
@@ -479,6 +478,8 @@ export function createObservationEmitter(
           adoption_observation: observation,
         }),
       )
+      // A failed publication must remain eligible for the next observation.
+      lastEmitted = signature
     } catch {
       // Version drift and local I/O errors leave adoption blocked and quiet.
     } finally {
