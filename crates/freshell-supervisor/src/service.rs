@@ -64,6 +64,7 @@ struct McpCapabilityRequest<'a> {
     provider: Option<&'a str>,
     tui_source: Option<&'a freshell_runtime_protocol::ProviderConfigReference>,
     workspace: Option<&'a str>,
+    cwd: Option<&'a str>,
 }
 
 #[derive(Clone)]
@@ -1063,6 +1064,9 @@ impl Supervisor {
                         runtime_dir,
                         host_binary_path: self.config.host_binary_path.clone(),
                         immutable_config_digest: created.immutable_config_digest,
+                        launch_policy: Some(
+                            freshell_runtime_protocol::RuntimeLaunchPolicy::ProviderVolumeV1,
+                        ),
                     },
                 )
                 .await
@@ -2127,6 +2131,7 @@ impl Supervisor {
                 provider: None,
                 tui_source: None,
                 workspace: None,
+                cwd: None,
             })
             .await?;
         if response != b"ok" {
@@ -2144,7 +2149,8 @@ impl Supervisor {
         provider: &str,
         tui_source: Option<&freshell_runtime_protocol::ProviderConfigReference>,
         workspace: &str,
-    ) -> Result<freshell_runtime_protocol::McpCapabilityReference, RuntimeError> {
+        cwd: &str,
+    ) -> Result<freshell_runtime_protocol::ProviderReplacementPreparation, RuntimeError> {
         let response = self
             .mcp_capability_callback(McpCapabilityRequest {
                 action: "issue",
@@ -2154,12 +2160,13 @@ impl Supervisor {
                 provider: Some(provider),
                 tui_source,
                 workspace: Some(workspace),
+                cwd: Some(cwd),
             })
             .await?;
         serde_json::from_slice(&response).map_err(|_| {
             RuntimeError::new(
                 RuntimeErrorCode::HostUnreachable,
-                "capability_pending: server returned an invalid scoped grant reference",
+                "capability_pending: server returned an invalid exact provider preparation",
             )
         })
     }
@@ -2183,6 +2190,7 @@ impl Supervisor {
             "provider": request.provider,
             "tuiSource": request.tui_source,
             "workspace": request.workspace,
+            "cwd":request.cwd,
         }))
         .map_err(|error| RuntimeError::new(RuntimeErrorCode::InvalidRequest, error.to_string()))?;
         let callback_socket = self.config.control_socket_path.with_file_name("mcp.sock");
@@ -2191,7 +2199,15 @@ impl Supervisor {
             socket.write_all(&body).await?;
             socket.shutdown().await?;
             let mut response = Vec::new();
-            socket.read_to_end(&mut response).await?;
+            (&mut socket)
+                .take(256 * 1024 + 1)
+                .read_to_end(&mut response)
+                .await?;
+            if response.len() > 256 * 1024 {
+                return Err(std::io::Error::other(
+                    "provider preparation response exceeds its bound",
+                ));
+            }
             Ok::<_, std::io::Error>(response)
         };
         let response = tokio::time::timeout(Duration::from_secs(5), exchange)
@@ -2410,7 +2426,7 @@ impl Supervisor {
                             host_boot_id,
                             proof,
                             effective_limits,
-                            ..
+                            capabilities,
                         } => {
                             let expected =
                                 host_proof(&secret, &challenge, &host_boot_id, incarnation_id);
@@ -2424,6 +2440,7 @@ impl Supervisor {
                                 host_boot_id,
                                 secret,
                                 effective_limits,
+                                capabilities,
                             });
                         }
                         _ => {
@@ -2749,6 +2766,7 @@ fn ensure_host_actor_state_dir(
 
 #[derive(Clone)]
 pub(crate) struct AuthenticatedHost {
+    pub(crate) capabilities: Vec<String>,
     host_boot_id: HostBootId,
     secret: Vec<u8>,
     effective_limits: RuntimeLimits,
@@ -3540,6 +3558,7 @@ mod stop_intent_order_tests {
                     runtime_dir: dir.path().join("runtime"),
                     host_binary_path: dir.path().join("runtime/session-host"),
                     immutable_config_digest: "stop-order-config".into(),
+                    launch_policy: None,
                 },
             )
             .await
@@ -4323,6 +4342,177 @@ mod native_observation_ipc_tests {
             }
         }
     }
+    #[tokio::test]
+    async fn unreachable_legacy_host_with_exact_recorded_root_requires_compatibility_without_saved_recipe(
+    ) {
+        use freshell_runtime_protocol::{RecoveryBlockReason, RecoveryProbe};
+        let dir = tempfile::tempdir().unwrap();
+        let registry = Registry::open(dir.path().join("registry"), None).unwrap();
+        let soul = SoulId::new();
+        let launch =
+            crate::registry::tests::materialize_test_runtime(&registry, soul.clone()).await;
+        let runtime = dir.path().join("unreachable-host");
+        std::fs::create_dir(&runtime).unwrap();
+        std::fs::write(runtime.join("secret"), b"synthetic-secret").unwrap();
+        let conn = Connection::open(dir.path().join("registry/runtime.sqlite3")).unwrap();
+        conn.execute("UPDATE souls SET provider='opencode',native_session_id='ses_legacy_exact' WHERE soul_id=?1",params![soul.as_str()]).unwrap();
+        conn.execute(
+            "UPDATE incarnations SET runtime_dir=?1,fixture_kind=NULL WHERE incarnation_id=?2",
+            params![runtime.to_string_lossy(), launch.incarnation_id.as_str()],
+        )
+        .unwrap();
+        let supervisor = crate::recovery::tests::supervisor_with_runtime_state(
+            &dir,
+            registry.clone(),
+            crate::backend::BackendRuntimeState::Running,
+        );
+        assert!(registry
+            .recovery_context(soul.clone())
+            .await
+            .unwrap()
+            .resume_spec
+            .is_none());
+        let probe = supervisor.probe_recovery(soul.clone()).await.unwrap();
+        // Without any terminal adapter this remains blocked; host reachability
+        // must not bypass current-image compatibility or authorize a new root.
+        assert!(
+            matches!(
+                probe,
+                RecoveryProbe::Blocked {
+                    reason: RecoveryBlockReason::ImplementationUnavailable,
+                    ..
+                }
+            ),
+            "{probe:?}"
+        );
+        assert_eq!(
+            registry
+                .recovery_context(soul)
+                .await
+                .unwrap()
+                .native_session_id
+                .as_deref(),
+            Some("ses_legacy_exact")
+        );
+        assert!(std::fs::read_to_string(dir.path().join("lifecycle.jsonl"))
+            .unwrap()
+            .contains("retained_host_unreachable"));
+    }
+
+    #[tokio::test]
+    async fn capability_unknown_retained_host_cannot_publish_status_identity_or_reattach() {
+        use freshell_runtime_protocol::{RecoveryBlockReason, RecoveryProbe};
+        for capabilities in [
+            vec![],
+            vec!["owned-provider-config-v1".into()],
+            vec!["provider-store-probe-v1".into()],
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let registry = Registry::open(dir.path().join("registry"), None).unwrap();
+            let soul = SoulId::new();
+            let launch =
+                crate::registry::tests::materialize_test_runtime(&registry, soul.clone()).await;
+            let runtime = dir.path().join("host");
+            std::fs::create_dir(&runtime).unwrap();
+            std::fs::write(runtime.join("secret"), b"synthetic-secret").unwrap();
+            let conn = Connection::open(dir.path().join("registry/runtime.sqlite3")).unwrap();
+            conn.execute(
+                "UPDATE souls SET provider='opencode' WHERE soul_id=?1",
+                params![soul.as_str()],
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE incarnations SET runtime_dir=?1,fixture_kind=NULL WHERE incarnation_id=?2",
+                params![runtime.to_string_lossy(), launch.incarnation_id.as_str()],
+            )
+            .unwrap();
+            let supervisor = crate::recovery::tests::supervisor_with_runtime_state(
+                &dir,
+                registry.clone(),
+                crate::backend::BackendRuntimeState::Running,
+            );
+            let listener = UnixListener::bind(runtime.join("host.sock")).unwrap();
+            let requested_limits = registry
+                .recovery_context(soul.clone())
+                .await
+                .unwrap()
+                .requested_limits;
+            let responder = tokio::spawn(async move {
+                let boot = HostBootId::new();
+                loop {
+                    let Ok(Ok((mut socket, _))) =
+                        tokio::time::timeout(Duration::from_secs(1), listener.accept()).await
+                    else {
+                        break;
+                    };
+                    let request: Envelope<HostCommand> = read_frame(&mut socket).await.unwrap();
+                    let result = match request.body {
+                        HostCommand::Hello {
+                            incarnation_id,
+                            challenge,
+                        } => HostResult::Hello {
+                            proof: host_proof(
+                                b"synthetic-secret",
+                                &challenge,
+                                &boot,
+                                &incarnation_id,
+                            ),
+                            host_boot_id: boot.clone(),
+                            capabilities: capabilities.clone(),
+                            effective_limits: requested_limits,
+                        },
+                        HostCommand::Status { .. } => HostResult::Status {
+                            host_boot_id: boot.clone(),
+                            worker_pid: Some(123),
+                            worker_launch_count: 1,
+                            max_control_epoch: 1,
+                            max_execution_generation: 1,
+                            fixture_evidence: serde_json::json!({}),
+                            exited: false,
+                            native_session_id: Some("ses_unqualified_status".into()),
+                            opencode_transfer_receipt: None,
+                            opencode_adoption: Default::default(),
+                        },
+                        HostCommand::ProbeRecovery { .. } => {
+                            HostResult::RecoveryProbe(crate::recovery::tests::absent_native_probe())
+                        }
+                        _ => panic!("unexpected host command"),
+                    };
+                    write_frame(
+                        &mut socket,
+                        &HostReply {
+                            request_id: request.request_id,
+                            result: Ok(result),
+                        },
+                    )
+                    .await
+                    .unwrap();
+                }
+            });
+            let probe = supervisor.probe_recovery(soul.clone()).await.unwrap();
+            responder.await.unwrap();
+            let preserved = registry.recovery_context(soul).await.unwrap();
+            assert_eq!(
+                preserved.native_session_id, None,
+                "unknown feature semantics cannot certify status identity"
+            );
+            assert!(
+                matches!(
+                    probe,
+                    RecoveryProbe::Blocked {
+                        reason: RecoveryBlockReason::CapabilityPending,
+                        ..
+                    }
+                ),
+                "{probe:?}"
+            );
+            assert_eq!(
+                preserved.prior_handle.incarnation_id(),
+                &launch.incarnation_id
+            );
+        }
+    }
+
     #[tokio::test]
     async fn status_id_prevents_seed_and_late_probe_cannot_authorize_reattach() {
         use freshell_runtime_protocol::{

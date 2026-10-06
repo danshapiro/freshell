@@ -73,6 +73,26 @@ RUN apt-get update \
  && /opt/amplifier-src/.venv/bin/python -c 'import importlib.metadata as m; assert m.version("openai") == "2.8.1"; assert m.version("openai-harmony") == "0.0.8"; assert m.version("amplifier-module-provider-vllm") == "1.0.0"' \
  && /lib/x86_64-linux-gnu/libc.so.6 | grep -F '2.39'
 
+# Preinstall the ordinary bundle modules so read-only provider runtimes
+# resolve source-less references without a runtime dependency installer.
+ARG AMPLIFIER_LOOP_BASIC_COMMIT=ae0954cc41be54afef3ca97181a0876a29ad1b4c
+ARG AMPLIFIER_CONTEXT_SIMPLE_COMMIT=c7ec55db96888200ba619adedc857278daf787c5
+ARG AMPLIFIER_HOOKS_LOGGING_COMMIT=a4efafc834938ea53006808313e840b1136cb296
+RUN git clone --filter=blob:none https://github.com/microsoft/amplifier-module-loop-basic /opt/amplifier-loop-basic \
+ && git -C /opt/amplifier-loop-basic checkout --detach "${AMPLIFIER_LOOP_BASIC_COMMIT}" \
+ && git -C /opt/amplifier-loop-basic rev-parse HEAD | grep -Fx "${AMPLIFIER_LOOP_BASIC_COMMIT}" \
+ && git clone --filter=blob:none https://github.com/microsoft/amplifier-module-context-simple /opt/amplifier-context-simple \
+ && git -C /opt/amplifier-context-simple checkout --detach "${AMPLIFIER_CONTEXT_SIMPLE_COMMIT}" \
+ && git -C /opt/amplifier-context-simple rev-parse HEAD | grep -Fx "${AMPLIFIER_CONTEXT_SIMPLE_COMMIT}" \
+ && git clone --filter=blob:none https://github.com/microsoft/amplifier-module-hooks-logging /opt/amplifier-hooks-logging \
+ && git -C /opt/amplifier-hooks-logging checkout --detach "${AMPLIFIER_HOOKS_LOGGING_COMMIT}" \
+ && git -C /opt/amplifier-hooks-logging rev-parse HEAD | grep -Fx "${AMPLIFIER_HOOKS_LOGGING_COMMIT}" \
+ && /opt/uv/bin/uv pip install --python /opt/amplifier-src/.venv/bin/python --no-deps /opt/amplifier-loop-basic /opt/amplifier-context-simple /opt/amplifier-hooks-logging \
+ && rm -rf /opt/amplifier-loop-basic/.git \
+ && rm -rf /opt/amplifier-context-simple/.git \
+ && rm -rf /opt/amplifier-hooks-logging/.git \
+ && /opt/amplifier-src/.venv/bin/python -c 'import importlib.metadata as m; assert m.version("amplifier-app-cli") == "0.1.1"; assert m.version("amplifier-core") == "1.6.0"; assert m.version("amplifier-foundation") == "1.0.0"; assert m.version("openai") == "2.8.1"; assert m.version("openai-harmony") == "0.0.8"; assert m.version("amplifier-module-provider-vllm") == "1.0.0"'
+
 # FreshClaude/Kilroy run inside the soul host, so their JS SDK bridge and its
 # pinned dependency must be part of the workload image rather than resolved
 # through a web-server worktree path.

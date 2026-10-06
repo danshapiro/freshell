@@ -22,6 +22,7 @@ export type BrokerReceipt = {
 
 export type BrokerEvent = {
   at: string
+  severity: 'info' | 'warn'
   method: string
   url: string
   decision: 'forward' | 'block' | 'inject_failure'
@@ -42,6 +43,7 @@ export type RestrictedDockerBrokerPolicy = {
   allowedHostBinaryPaths: Set<string>
   allowedImageRefs: Set<string>
   allowTerminalWorkloads?: boolean
+  allowTask2LegacyNegativeFixtures?: boolean
   allowedWorkspaceRoots?: Set<string>
   allowedProviderUserRoots?: Set<string>
   allowedBootstrapFiles?: Set<string>
@@ -56,6 +58,7 @@ type DockerResponse = {
 }
 
 export class RestrictedDockerBroker {
+  private readonly task2LegacyNegativeInspectionOwners = new Map<string, string>()
   private readonly knownContainerIds = new Set<string>()
   private readonly receiptsById = new Map<string, BrokerReceipt>()
   private readonly historyHelpers = new Map<string, { owner: BrokerReceipt; containerId?: string }>()
@@ -89,6 +92,35 @@ export class RestrictedDockerBroker {
     return this.events.filter((event) => event.destructive && event.containerId === containerId)
   }
 
+  // Test-only inspector admission; these IDs confer no runtime mutation rights
+  // and deliberately never join receiptIds()/receipts()/knownContainerIds.
+  admitTask2LegacyNegativeInspection(inspected: Record<string, any>, original: Record<string, any>): void {
+    const ownerId = original.Id
+    const owner = this.receiptsById.get(ownerId), id = inspected.Id
+    const labels = inspected.Config?.Labels ?? {}
+    const originalLabels = original.Config?.Labels ?? {}
+    if (!this.policy.allowTask2LegacyNegativeFixtures || !owner || !/^[a-f0-9]{64}$/.test(id)
+      || this.knownContainerIds.has(id) || this.task2LegacyNegativeInspectionOwners.has(id)
+      || inspected.Image !== owner.imageRef || inspected.State?.Status !== 'created'
+      || inspected.State?.Running !== false || inspected.State?.Pid !== 0
+      || labels['com.freshell.runtime-test-run-id'] !== this.policy.testRunId
+      || labels['com.freshell.managed'] !== 'true' || labels.project !== 'freshell'
+      || labels['com.freshell.soul-id'] !== owner.soulId
+      || labels['com.freshell.incarnation-id'] !== owner.incarnationId
+      || original.Image !== owner.imageRef
+      || originalLabels['com.freshell.soul-id'] !== owner.soulId
+      || originalLabels['com.freshell.incarnation-id'] !== owner.incarnationId
+      || originalLabels['com.freshell.runtime-test-run-id'] !== this.policy.testRunId
+      || !originalLabels['com.freshell.installation-id']
+      || labels['com.freshell.installation-id'] !== originalLabels['com.freshell.installation-id']
+      || !['extra_mount', 'missing_tmpfs', 'missing_binary', 'foreign_binary'].includes(labels['com.freshell.task2-negative']))
+      throw new Error('exact never-started Task2 negative inspector fixture required')
+    this.task2LegacyNegativeInspectionOwners.set(id, ownerId)
+  }
+
+  forgetTask2LegacyNegativeInspection(containerId: string): void {
+    this.task2LegacyNegativeInspectionOwners.delete(containerId)
+  }
   failNextStop(count = 1): void {
     this.stopFailuresRemaining = Math.max(0, count)
   }
@@ -231,6 +263,12 @@ export class RestrictedDockerBroker {
     }
 
     if (target) {
+      const negativeOwner = this.task2LegacyNegativeInspectionOwners.get(target.containerId)
+      if (negativeOwner && method === 'GET' && target.action === 'json') {
+        await this.forwardAndReply(request, response, body, { destructive: false,
+          containerId: target.containerId, ownerContainerId: negativeOwner })
+        return
+      }
       const known = this.knownContainerIds.has(target.containerId)
       if (!known) {
         this.block(response, method, url, 403, 'container id is not in this broker run receipt set', destructive, target.containerId)
@@ -422,25 +460,51 @@ export class RestrictedDockerBroker {
     const host = parsed.HostConfig ?? {}
     if (Object.keys(parsed.Labels ?? {}).length !== 0) return
     const same = (actual: unknown, expected: unknown) => JSON.stringify(actual) === JSON.stringify(expected)
-    if (parsed.User !== '65534:0' || parsed.Tty !== true
-      || !same(parsed.Entrypoint, ['/runtime/freshell-session-host'])
-      || !same(parsed.Env, ['HOME=/home/freshell/provider'])) return
+    if (parsed.User !== '65534:0'
+      || !same(parsed.Entrypoint, ['/runtime/freshell-session-host'])) return
     const cmd = parsed.Cmd
-    if (!Array.isArray(cmd) || cmd.length !== 7 || cmd[0] !== 'native-history-only'
+    const retained = Array.isArray(cmd) && cmd.length === 2 && cmd[0] === 'retained-opencode-store-worker'
+    if (parsed.Tty !== !retained) return
+    let selected: Record<string, any> | undefined
+    if (retained) {
+      if (typeof cmd[1] !== 'string' || Buffer.byteLength(cmd[1]) > 8192) return
+      try { selected = JSON.parse(cmd[1]) } catch { return }
+      if (!selected || Object.keys(selected).sort().join(',') !== 'cwd,imageRef,nativeSessionId,providerGid,providerHome,providerStoreId,providerUid,workspacePath'
+        || selected.imageRef !== parsed.Image || !/^sha256:[a-f0-9]{64}$/.test(selected.imageRef)
+        || selected.providerHome !== '/home/freshell/provider' || selected.providerUid !== 65534 || selected.providerGid !== 0
+        || typeof selected.providerStoreId !== 'string' || !selected.providerStoreId || selected.providerStoreId.length > 256
+        || typeof selected.nativeSessionId !== 'string' || !/^ses_[A-Za-z0-9_-]{1,252}$/.test(selected.nativeSessionId)
+        || typeof selected.workspacePath !== 'string' || path.normalize(selected.workspacePath) !== selected.workspacePath || !this.isAllowedWorkspacePath(selected.workspacePath)
+        || typeof selected.cwd !== 'string' || path.normalize(selected.cwd) !== selected.cwd
+        || !(selected.cwd === selected.workspacePath || isStrictDescendant(selected.cwd, selected.workspacePath))
+        || parsed.WorkingDir !== selected.cwd
+        || !same(parsed.Env, ['HOME=/home/freshell/provider', 'XDG_DATA_HOME=/home/freshell/provider/.local/share', 'XDG_CONFIG_HOME=/home/freshell/provider/.config', 'OPENCODE_DB=/home/freshell/provider/.local/share/opencode/opencode.db'])) return
+    } else if (!Array.isArray(cmd) || cmd.length !== 7 || cmd[0] !== 'native-history-only'
       || cmd[1] !== '--provider' || !['claude', 'kilroy', 'codex', 'opencode'].includes(cmd[2])
       || cmd[3] !== '--session-id' || typeof cmd[4] !== 'string' || !cmd[4]
-      || cmd[5] !== '--provider-home' || cmd[6] !== '/home/freshell/provider') return
+      || cmd[5] !== '--provider-home' || cmd[6] !== '/home/freshell/provider'
+      || !same(parsed.Env, ['HOME=/home/freshell/provider'])) return
     if (host.NetworkMode !== 'none' || host.ReadonlyRootfs !== true || host.Privileged === true
       || (host.PidMode ?? '') !== '' || (host.Binds?.length ?? 0) !== 0 || (host.CapAdd?.length ?? 0) !== 0
       || !same(host.CapDrop, ['ALL']) || !same(host.SecurityOpt, ['no-new-privileges'])
       || host.Memory !== 256 * 1024 * 1024 || host.MemorySwap !== 256 * 1024 * 1024
       || host.NanoCpus !== 500_000_000 || host.PidsLimit !== 32
-      || !same(host.Tmpfs, { '/tmp': 'rw,noexec,nosuid,nodev,size=16m' })) return
+      || !same(host.Tmpfs, { '/tmp': retained ? 'rw,noexec,nosuid,nodev,size=64m' : 'rw,noexec,nosuid,nodev,size=16m' })) return
     const mounts = host.Mounts
-    if (!Array.isArray(mounts) || mounts.length !== 2) return
+    if (!Array.isArray(mounts) || (retained ? ![3, 4].includes(mounts.length) : mounts.length !== 2)) return
     const binary = mounts.find((mount) => mount.Type === 'bind' && mount.Target === '/runtime/freshell-session-host' && mount.ReadOnly === true)
     const volume = mounts.find((mount) => mount.Type === 'volume' && mount.Target === '/home/freshell/provider' && mount.ReadOnly === true)
     if (!binary || !volume || !this.policy.allowedHostBinaryPaths.has(binary.Source) || !this.policy.allowedImageRefs.has(parsed.Image)) return
+    if (retained) {
+      const workspace = mounts.find((mount) => mount.Type === 'bind' && mount.Source === selected!.workspacePath && mount.Target === selected!.workspacePath && mount.ReadOnly === true)
+      if (!workspace || new Set(mounts.map((mount) => mount.Target)).size !== mounts.length) return
+      if (mounts.length === 4) {
+        const git = mounts.find((mount) => mount !== binary && mount !== volume && mount !== workspace)
+        if (!git || git.Type !== 'bind' || git.ReadOnly !== true || git.Source !== git.Target
+          || !this.isAllowedWorkspacePath(git.Source) || isStrictDescendant(git.Source, workspace.Source)) return
+      }
+      return this.receipts().find((receipt) => receipt.providerVolumeName === volume.Source && receipt.workspacePath === workspace.Source)
+    }
     return this.receipts().find((receipt) => receipt.providerVolumeName === volume.Source
       && receipt.imageRef === parsed.Image && receipt.hostBinaryPath === binary.Source)
   }
@@ -453,9 +517,9 @@ export class RestrictedDockerBroker {
     return false
   }
 
-  private async forwardAndReply(request: IncomingMessage, response: ServerResponse, body: Buffer, event: { destructive: boolean; containerId?: string }): Promise<void> {
+  private async forwardAndReply(request: IncomingMessage, response: ServerResponse, body: Buffer, event: { destructive: boolean; containerId?: string; ownerContainerId?: string }): Promise<void> {
     const forwarded = await this.forward(request, body)
-    this.record({ method: request.method ?? 'GET', url: request.url ?? '/', decision: 'forward', destructive: event.destructive, unsafeAttempt: false, containerId: event.containerId })
+    this.record({ method: request.method ?? 'GET', url: request.url ?? '/', decision: 'forward', destructive: event.destructive, unsafeAttempt: false, containerId: event.containerId, ownerContainerId: event.ownerContainerId })
     replyDocker(response, forwarded)
   }
 
@@ -484,8 +548,8 @@ export class RestrictedDockerBroker {
     response.end(JSON.stringify({ message: reason }))
   }
 
-  private record(event: Omit<BrokerEvent, 'at'>): void {
-    const full: BrokerEvent = { at: new Date().toISOString(), ...event }
+  private record(event: Omit<BrokerEvent, 'at' | 'severity'>): void {
+    const full: BrokerEvent = { at: new Date().toISOString(), severity: event.decision === 'forward' ? 'info' : 'warn', ...event }
     this.events.push(full)
     fs.appendFileSync(this.policy.logPath, `${JSON.stringify(full)}\n`, { mode: 0o600 })
     fs.chmodSync(this.policy.logPath, 0o600)

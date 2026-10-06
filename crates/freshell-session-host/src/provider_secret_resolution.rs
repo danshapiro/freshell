@@ -17,6 +17,8 @@ const ALLOWED_NAMES: &[&str] = &[
     "GOOGLE_GENERATIVE_AI_API_KEY",
     "HTTP_PROXY",
     "HTTPS_PROXY",
+    "VLLM_API_KEY",
+    "VLLM_BASE_URL",
     "LUNAROUTE_API_KEY",
     "LUNAROUTE_BASE_URL",
     "NODE_EXTRA_CA_CERTS",
@@ -53,41 +55,164 @@ pub fn resolve_child_secrets(
     mount_root: &Path,
 ) -> Result<ResolvedProviderSecrets, String> {
     let mut resolved = ResolvedProviderSecrets::default();
+    let mut environment_grants = Vec::new();
+    let mut native_auth = false;
+    let mut oauth_auth = false;
+    let mut mounted_ca = false;
+    let mut seen = std::collections::BTreeSet::new();
     for (index, reference) in references.iter().enumerate() {
         if reference.profile.provider() != provider {
             return Err("OneCLI profile belongs to another provider".into());
         }
         let mount = mount_root.join(format!("provider-{index}"));
-        let metadata = fs::symlink_metadata(&mount)
-            .map_err(|error| format!("OneCLI grant is unavailable: {error}"))?;
+        let metadata = fs::symlink_metadata(&mount).map_err(|_| "OneCLI grant is unavailable")?;
         if !metadata.is_file()
             || metadata.file_type().is_symlink()
             || metadata.len() > MAX_KEYS_BYTES
         {
             return Err("OneCLI grant must be a bounded regular file".into());
         }
-        let raw = fs::read(&mount).map_err(|error| format!("read OneCLI grant: {error}"))?;
+        let raw = fs::read(&mount).map_err(|_| "read OneCLI grant failed")?;
         if let Some(relative) = reference.profile.provider_file_relative_path() {
-            if raw.is_empty() {
-                return Err("OneCLI provider-file grant is empty".into());
+            if raw.is_empty() || !seen.insert(relative) {
+                return Err("OneCLI provider-file grant is empty or duplicated".into());
+            }
+            if reference.profile.auth_relative_path().is_some() {
+                oauth_auth = validate_native_auth(provider, &raw)?;
+                native_auth = true;
+            } else {
+                mounted_ca = true;
             }
             resolved.provider_files.push((relative, raw));
         } else {
-            let text =
-                std::str::from_utf8(&raw).map_err(|_| "OneCLI environment grant is not UTF-8")?;
-            for (name, value) in resolve_profile(reference.profile, text)? {
-                if resolved.environment.insert(name, value).is_some() {
-                    return Err("OneCLI grants set the same child environment key".into());
-                }
+            environment_grants.push((reference.profile, raw));
+        }
+    }
+    for (profile, raw) in environment_grants {
+        let text =
+            std::str::from_utf8(&raw).map_err(|_| "OneCLI environment grant is not UTF-8")?;
+        for (name, value) in resolve_profile_with_native_auth(profile, text, native_auth)? {
+            if resolved.environment.insert(name, value).is_some() {
+                return Err("OneCLI grants set the same child environment key".into());
             }
+        }
+    }
+    if oauth_auth
+        && resolved.environment.keys().any(|name| {
+            matches!(
+                (provider, name.as_str()),
+                ("codex", "OPENAI_API_KEY")
+                    | ("claude", "ANTHROPIC_API_KEY")
+                    | ("opencode", "OPENAI_API_KEY")
+            )
+        })
+    {
+        return Err("OneCLI native OAuth conflicts with environment API-key auth mode".into());
+    }
+    if resolved.environment.contains_key("ANTHROPIC_API_KEY")
+        && resolved.environment.contains_key("CLAUDE_CODE_OAUTH_TOKEN")
+    {
+        return Err("OneCLI Claude environment auth modes conflict".into());
+    }
+    const NATIVE_CA: &str = "/home/freshell/provider/.config/onecli/gateway-ca.pem";
+    for name in CERTIFICATE_CHILD_NAMES {
+        if let Some(value) = resolved.environment.get(*name) {
+            if !mounted_ca || value != NATIVE_CA {
+                return Err("OneCLI native trust path has no exact typed CA mount".into());
+            }
+        }
+    }
+    if mounted_ca {
+        let names: &[&str] = match provider {
+            "claude" | "opencode" => &["NODE_EXTRA_CA_CERTS"],
+            "codex" => &["SSL_CERT_FILE"],
+            "amplifier" => &["SSL_CERT_FILE", "REQUESTS_CA_BUNDLE"],
+            _ => return Err("unsupported OneCLI CA provider".into()),
+        };
+        for name in names {
+            resolved
+                .environment
+                .insert((*name).into(), NATIVE_CA.into());
         }
     }
     Ok(resolved)
 }
 
+fn validate_native_auth(provider: &str, raw: &[u8]) -> Result<bool, String> {
+    let invalid = || "OneCLI typed native auth has an unsupported provider shape".to_owned();
+    if provider == "amplifier" {
+        let parsed = parse_keys_env(std::str::from_utf8(raw).map_err(|_| invalid())?)?;
+        if parsed.keys().any(|name| name.ends_with("_API_KEY")) {
+            return Ok(false);
+        }
+        return Err(invalid());
+    }
+    let native: serde_json::Value = serde_json::from_slice(raw).map_err(|_| invalid())?;
+    let string = |value: &serde_json::Value, name: &str| {
+        value
+            .get(name)
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|value| !value.is_empty())
+    };
+    match provider {
+        "codex"
+            if native["auth_mode"] == "chatgpt"
+                && native["OPENAI_API_KEY"].is_null()
+                && ["access_token", "refresh_token", "id_token", "account_id"]
+                    .iter()
+                    .all(|name| string(&native["tokens"], name))
+                && string(&native, "last_refresh") =>
+        {
+            Ok(true)
+        }
+        "codex"
+            if string(&native, "OPENAI_API_KEY")
+                && matches!(native["auth_mode"].as_str(), Some("apikey" | "api_key")) =>
+        {
+            Ok(false)
+        }
+        "claude"
+            if string(&native["claudeAiOauth"], "accessToken")
+                && string(&native["claudeAiOauth"], "refreshToken") =>
+        {
+            Ok(true)
+        }
+        "opencode" => {
+            let Some(entries) = native.as_object().filter(|entries| !entries.is_empty()) else {
+                return Err(invalid());
+            };
+            let mut oauth = false;
+            for entry in entries.values() {
+                match entry["type"].as_str() {
+                    Some("oauth")
+                        if string(entry, "access")
+                            && string(entry, "refresh")
+                            && entry["expires"].as_i64().is_some_and(|expiry| expiry > 0) =>
+                    {
+                        oauth = true
+                    }
+                    Some("api") if string(entry, "key") => {}
+                    _ => return Err(invalid()),
+                }
+            }
+            Ok(oauth)
+        }
+        _ => Err(invalid()),
+    }
+}
+
+#[cfg(test)]
 fn resolve_profile(
     profile: ProviderSecretProfile,
     raw: &str,
+) -> Result<BTreeMap<String, String>, String> {
+    resolve_profile_with_native_auth(profile, raw, false)
+}
+
+fn resolve_profile_with_native_auth(
+    profile: ProviderSecretProfile,
+    raw: &str,
+    native_auth: bool,
 ) -> Result<BTreeMap<String, String>, String> {
     let parsed = parse_keys_env(raw)?;
     match profile {
@@ -95,11 +220,11 @@ fn resolve_profile(
             resolve_provider_environment(
                 &parsed,
                 &["ANTHROPIC_API_KEY", "ANTHROPIC_BASE_URL", "CLAUDE_CODE_OAUTH_TOKEN"],
-                false,
+                false, native_auth,
             )
         }
         ProviderSecretProfile::CodexOnecliEnvironment => {
-            resolve_provider_environment(&parsed, &["OPENAI_API_KEY", "OPENAI_BASE_URL"], false)
+            resolve_provider_environment(&parsed, &["OPENAI_API_KEY", "OPENAI_BASE_URL"], false, native_auth)
         }
         ProviderSecretProfile::OpencodeOnecliEnvironment => {
             resolve_provider_environment(
@@ -115,7 +240,7 @@ fn resolve_profile(
                     "OPENROUTER_API_KEY",
                     "OPENCODE_API_KEY",
                 ],
-                true,
+                true, native_auth,
             )
         }
         ProviderSecretProfile::AmplifierOnecliEnvironment => {
@@ -126,7 +251,7 @@ fn resolve_profile(
                     "ANTHROPIC_BASE_URL",
                     "OPENAI_API_KEY",
                     "OPENAI_BASE_URL",
-                    "LUNAROUTE_API_KEY",
+                    "VLLM_API_KEY", "VLLM_BASE_URL", "LUNAROUTE_API_KEY",
                     "LUNAROUTE_BASE_URL",
                     "GLM_RUNPOD_API_KEY",
                     "GLM_RUNPOD_BASE_URL",
@@ -134,12 +259,15 @@ fn resolve_profile(
                     "GEMINI_API_KEY",
                     "OPENROUTER_API_KEY",
                 ],
-                false,
+                false, native_auth,
             )
         }
         ProviderSecretProfile::ClaudeOnecliAuthFile
         | ProviderSecretProfile::CodexOnecliAuthFile
         | ProviderSecretProfile::OpencodeOnecliAuthFile
+        | ProviderSecretProfile::ClaudeOnecliCaFile
+        | ProviderSecretProfile::CodexOnecliCaFile
+        | ProviderSecretProfile::AmplifierOnecliCaFile
         | ProviderSecretProfile::OpencodeOnecliCaFile
         | ProviderSecretProfile::AmplifierOnecliKeysFile => Err("OneCLI auth-file grant cannot be parsed as an environment profile".into()),
         ProviderSecretProfile::AmplifierOnecliLunarouteGlm53 => {
@@ -194,6 +322,7 @@ fn resolve_provider_environment(
     parsed: &BTreeMap<String, String>,
     provider_names: &[&str],
     allow_opencode_proxy_settings: bool,
+    native_auth: bool,
 ) -> Result<BTreeMap<String, String>, String> {
     let mut child = BTreeMap::new();
     for (name, value) in parsed {
@@ -228,9 +357,10 @@ fn resolve_provider_environment(
         }
     }
     if child.is_empty()
-        || !child
-            .keys()
-            .any(|name| provider_names.contains(&name.as_str()))
+        || (!native_auth
+            && !child
+                .keys()
+                .any(|name| provider_names.contains(&name.as_str())))
     {
         return Err("OneCLI environment profile has no provider values".into());
     }
@@ -438,6 +568,68 @@ mod tests {
     use freshell_runtime_protocol::ProviderSecretReference;
 
     #[test]
+    fn typed_codex_oauth_accepts_proxy_only_transport_without_changing_auth_mode() {
+        let root = tempfile::tempdir().unwrap();
+        fs::write(
+            root.path().join("provider-0"),
+            "HTTPS_PROXY=http://agent:fixture@192.0.2.10:10255\n",
+        )
+        .unwrap();
+        fs::write(root.path().join("provider-1"), r#"{"auth_mode":"chatgpt","OPENAI_API_KEY":null,"tokens":{"id_token":"native-shaped-id","access_token":"fixture-access","refresh_token":"fixture-refresh","account_id":"fixture-account"},"last_refresh":"2026-10-06T00:00:00Z"}"#).unwrap();
+        let references = [
+            ProviderSecretProfile::CodexOnecliEnvironment,
+            ProviderSecretProfile::CodexOnecliAuthFile,
+        ]
+        .map(|profile| ProviderSecretReference {
+            source_path: String::new(),
+            profile,
+        });
+        let resolved = resolve_child_secrets("codex", &references, root.path())
+            .expect("typed native OAuth permits proxy-only transport");
+        assert!(!resolved.environment.contains_key("OPENAI_API_KEY"));
+        assert_eq!(resolved.provider_files[0].0, ".codex/auth.json");
+        let native: serde_json::Value =
+            serde_json::from_slice(&resolved.provider_files[0].1).unwrap();
+        assert_eq!(native["auth_mode"], "chatgpt");
+        fs::write(
+            root.path().join("provider-0"),
+            "OPENAI_API_KEY=conflicting-mode\nHTTPS_PROXY=http://192.0.2.10:10255\n",
+        )
+        .unwrap();
+        assert!(resolve_child_secrets("codex", &references, root.path()).is_err());
+    }
+
+    #[test]
+    fn proxy_only_transport_does_not_accept_malformed_native_auth_or_unmounted_ca() {
+        let root = tempfile::tempdir().unwrap();
+        let references = [
+            ProviderSecretProfile::CodexOnecliEnvironment,
+            ProviderSecretProfile::CodexOnecliAuthFile,
+        ]
+        .map(|profile| ProviderSecretReference {
+            source_path: String::new(),
+            profile,
+        });
+        fs::write(
+            root.path().join("provider-0"),
+            "HTTPS_PROXY=http://192.0.2.10:10255\n",
+        )
+        .unwrap();
+        fs::write(
+            root.path().join("provider-1"),
+            r#"{"auth_mode":"chatgpt","tokens":{}}"#,
+        )
+        .unwrap();
+        assert!(resolve_child_secrets("codex", &references, root.path()).is_err());
+        fs::write(
+            root.path().join("provider-0"),
+            "OPENAI_API_KEY=fixture\nSSL_CERT_FILE=/unmounted/gateway.pem\n",
+        )
+        .unwrap();
+        assert!(resolve_child_secrets("codex", &references[..1], root.path()).is_err());
+    }
+
+    #[test]
     fn provider_secret_profiles_accept_only_their_provider_and_keep_controls_out_of_child() {
         let cases = [
             (
@@ -519,7 +711,12 @@ mod tests {
             profile: ProviderSecretProfile::OpencodeOnecliEnvironment,
         };
 
-        let resolved = resolve_child_secrets("opencode", &[reference], root.path()).unwrap();
+        fs::write(root.path().join("provider-1"), "fixture-ca").unwrap();
+        let ca = ProviderSecretReference {
+            source_path: String::new(),
+            profile: ProviderSecretProfile::OpencodeOnecliCaFile,
+        };
+        let resolved = resolve_child_secrets("opencode", &[reference, ca], root.path()).unwrap();
 
         assert_eq!(
             resolved.environment.get("OPENAI_BASE_URL").unwrap(),
@@ -644,16 +841,39 @@ mod tests {
         for (provider, profile, expected) in cases {
             let root = tempfile::tempdir().unwrap();
             let mount = root.path().join("provider-0");
-            fs::write(&mount, "fake-OneCLI-auth-file").unwrap();
+            let auth = match provider {
+                "claude" => {
+                    r#"{"claudeAiOauth":{"accessToken":"fixture-access","refreshToken":"fixture-refresh"}}"#
+                }
+                "codex" => {
+                    r#"{"auth_mode":"chatgpt","OPENAI_API_KEY":null,"tokens":{"id_token":"fixture-id","access_token":"fixture-access","refresh_token":"fixture-refresh","account_id":"fixture-account"},"last_refresh":"2026-10-06T00:00:00Z"}"#
+                }
+                "opencode" if profile.auth_relative_path().is_some() => {
+                    r#"{"openai":{"type":"oauth","access":"fixture-access","refresh":"fixture-refresh","expires":1790000000000}}"#
+                }
+                "amplifier" => "VLLM_API_KEY=fixture-key\n",
+                _ => "fixture-ca",
+            };
+            fs::write(&mount, auth).unwrap();
             let references = [ProviderSecretReference {
                 source_path: mount.to_string_lossy().into_owned(),
                 profile,
             }];
             let resolved = resolve_child_secrets(provider, &references, root.path()).unwrap();
-            assert!(resolved.environment.is_empty());
+            if profile.auth_relative_path().is_some() {
+                assert!(resolved.environment.is_empty());
+            } else {
+                assert_eq!(
+                    resolved
+                        .environment
+                        .get("NODE_EXTRA_CA_CERTS")
+                        .map(String::as_str),
+                    Some("/home/freshell/provider/.config/onecli/gateway-ca.pem")
+                );
+            }
             assert_eq!(
                 resolved.provider_files,
-                vec![(expected, b"fake-OneCLI-auth-file".to_vec())]
+                vec![(expected, auth.as_bytes().to_vec())]
             );
             assert!(resolve_child_secrets("wrong-provider", &references, root.path()).is_err());
         }

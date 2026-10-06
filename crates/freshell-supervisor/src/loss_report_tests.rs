@@ -126,6 +126,7 @@ async fn prepared_context_in_registry(
                 runtime_dir: root.join("runtime"),
                 host_binary_path: root.join("runtime/host"),
                 immutable_config_digest: format!("sha256:{}", "c".repeat(64)),
+                launch_policy: None,
             },
         )
         .await

@@ -21,7 +21,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-pub const SCHEMA_VERSION: u32 = 11;
+pub const SCHEMA_VERSION: u32 = 12;
 const ACTIVE_STATES: &str = "'prepared','created','starting','running','stopping'";
 
 type ExistingSoulLaunchRow = (
@@ -260,6 +260,7 @@ pub struct BackendCreatedRecord {
     pub runtime_dir: PathBuf,
     pub host_binary_path: PathBuf,
     pub immutable_config_digest: String,
+    pub launch_policy: Option<freshell_runtime_protocol::RuntimeLaunchPolicy>,
 }
 
 #[derive(Debug, Clone)]
@@ -287,6 +288,7 @@ pub struct OwnedRuntimeHandle {
     runtime_dir: PathBuf,
     host_binary_path: PathBuf,
     immutable_config_digest: String,
+    launch_policy: Option<freshell_runtime_protocol::RuntimeLaunchPolicy>,
     requested_limits: RuntimeLimits,
     fixture: Option<FixtureKind>,
     terminal: Option<TerminalLaunchSpec>,
@@ -326,6 +328,7 @@ impl OwnedRuntimeHandle {
             runtime_dir,
             host_binary_path,
             immutable_config_digest,
+            launch_policy: None,
             requested_limits,
             fixture,
             terminal,
@@ -366,6 +369,16 @@ impl OwnedRuntimeHandle {
     }
     pub fn immutable_config_digest(&self) -> &str {
         &self.immutable_config_digest
+    }
+    pub fn launch_policy(&self) -> Option<freshell_runtime_protocol::RuntimeLaunchPolicy> {
+        self.launch_policy
+    }
+    pub(crate) fn with_launch_policy(
+        mut self,
+        policy: Option<freshell_runtime_protocol::RuntimeLaunchPolicy>,
+    ) -> Self {
+        self.launch_policy = policy;
+        self
     }
     pub fn requested_limits(&self) -> RuntimeLimits {
         self.requested_limits
@@ -1005,8 +1018,8 @@ impl Registry {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
             let now = now_millis();
             let changed = tx.execute(
-                "UPDATE incarnations SET docker_daemon_id=?1,container_id=?2,image_ref=?3,runtime_dir=?4,host_binary_path=?5,immutable_config_digest=?6,launch_state='created',updated_at=?7 WHERE incarnation_id=?8 AND launch_state='prepared' AND container_id IS NULL AND EXISTS (SELECT 1 FROM souls WHERE soul_id=incarnations.soul_id AND desired_state='running')",
-                params![created.daemon_id.as_str(), created.container_id, created.image_ref, created.runtime_dir.to_string_lossy(), created.host_binary_path.to_string_lossy(), created.immutable_config_digest, now, incarnation_id.as_str()],
+                "UPDATE incarnations SET docker_daemon_id=?1,container_id=?2,image_ref=?3,runtime_dir=?4,host_binary_path=?5,immutable_config_digest=?6,launch_policy=?9,launch_state='created',updated_at=?7 WHERE incarnation_id=?8 AND launch_state='prepared' AND container_id IS NULL AND EXISTS (SELECT 1 FROM souls WHERE soul_id=incarnations.soul_id AND desired_state='running')",
+                params![created.daemon_id.as_str(), created.container_id, created.image_ref, created.runtime_dir.to_string_lossy(), created.host_binary_path.to_string_lossy(), created.immutable_config_digest, now, incarnation_id.as_str(), created.launch_policy.map(|policy|serde_json::to_string(&policy)).transpose()?],
             )?;
             if changed != 1 { return Err(RegistryError::InvalidState(format!("cannot commit CREATED for {incarnation_id}"))); }
             tx.execute("UPDATE commands SET state='created',updated_at=?1 WHERE incarnation_id=?2", params![now, incarnation_id.as_str()])?;
@@ -3283,6 +3296,7 @@ fn create_schema(
             runtime_dir TEXT,
             host_binary_path TEXT,
             immutable_config_digest TEXT,
+            launch_policy TEXT,
             launch_state TEXT NOT NULL,
             host_boot_id TEXT,
             execution_generation INTEGER NOT NULL,
@@ -3960,6 +3974,15 @@ fn migrate_schema(conn: &mut Connection) -> Result<(), RegistryError> {
         tx.commit()?;
         schema = 11;
     }
+    if schema == 11 {
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if !column_exists(&tx, "incarnations", "launch_policy")? {
+            tx.execute_batch("ALTER TABLE incarnations ADD COLUMN launch_policy TEXT;")?;
+        }
+        tx.execute_batch("UPDATE installation SET schema_version=12,inventory_revision=inventory_revision+1 WHERE singleton=1;")?;
+        tx.commit()?;
+        schema = 12;
+    }
     if schema != SCHEMA_VERSION {
         return Err(RegistryError::Integrity(format!(
             "unsupported older schema {schema}"
@@ -4350,11 +4373,12 @@ pub(crate) fn load_owned_handle(
         Option<String>,
         String,
         String,
+        Option<String>,
     );
     let raw: OwnedRow = conn.query_row(
-        "SELECT i.soul_id,i.launch_nonce,i.docker_daemon_id,i.container_id,i.image_ref,i.runtime_dir,i.host_binary_path,i.immutable_config_digest,i.requested_limits,i.launch_state,i.fixture_kind,i.terminal_spec,i.fresh_agent_spec,s.provider_volume_name,s.provider_store_id FROM incarnations i JOIN souls s ON s.soul_id=i.soul_id WHERE i.incarnation_id=?1",
+        "SELECT i.soul_id,i.launch_nonce,i.docker_daemon_id,i.container_id,i.image_ref,i.runtime_dir,i.host_binary_path,i.immutable_config_digest,i.requested_limits,i.launch_state,i.fixture_kind,i.terminal_spec,i.fresh_agent_spec,s.provider_volume_name,s.provider_store_id,i.launch_policy FROM incarnations i JOIN souls s ON s.soul_id=i.soul_id WHERE i.incarnation_id=?1",
         params![incarnation_id.as_str()],
-        |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?,row.get(6)?,row.get(7)?,row.get(8)?,row.get(9)?,row.get(10)?,row.get(11)?,row.get(12)?,row.get(13)?,row.get(14)?)),
+        |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?,row.get(6)?,row.get(7)?,row.get(8)?,row.get(9)?,row.get(10)?,row.get(11)?,row.get(12)?,row.get(13)?,row.get(14)?,row.get(15)?)),
     ).optional()?.ok_or_else(|| RegistryError::UnknownIncarnation(incarnation_id.clone()))?;
     if raw.9 == "prepared" {
         return Err(RegistryError::InvalidState(
@@ -4392,6 +4416,11 @@ pub(crate) fn load_owned_handle(
         terminal,
         fresh_agent,
         raw.13,
+    )
+    .with_launch_policy(
+        raw.15
+            .map(|value| serde_json::from_str(&value))
+            .transpose()?,
     ))
 }
 
@@ -5646,6 +5675,7 @@ pub(crate) mod tests {
                     runtime_dir: root.join("runtime"),
                     host_binary_path: root.join("freshell-session-host"),
                     immutable_config_digest: "synthetic-config-digest".into(),
+                    launch_policy: None,
                 },
             )
             .await
@@ -5694,6 +5724,83 @@ pub(crate) mod tests {
         drop(conn);
 
         assert!(registry.opencode_transfer_stage_references().await.is_err());
+    }
+
+    #[tokio::test]
+    async fn launch_policy_survives_commit_reopen_and_legacy_epoch_upgrade() {
+        let root = tempfile::tempdir().unwrap();
+        let registry = Registry::open(root.path(), None).unwrap();
+        assert_eq!(registry.control_epoch(), 1);
+        let soul = SoulId::new();
+        let prepared = registry
+            .prepare_launch(prep(soul.clone(), RequestId::new(), "profile-persistence"))
+            .await
+            .unwrap();
+        registry
+            .commit_created(
+                prepared.incarnation_id.clone(),
+                BackendCreatedRecord {
+                    daemon_id: DockerDaemonId::new(),
+                    container_id: "a".repeat(64),
+                    image_ref: format!("sha256:{}", "b".repeat(64)),
+                    runtime_dir: root.path().join("incarnation"),
+                    host_binary_path: root.path().join("host"),
+                    immutable_config_digest: "saved-modern-digest".into(),
+                    launch_policy: Some(
+                        freshell_runtime_protocol::RuntimeLaunchPolicy::ProviderVolumeV1,
+                    ),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            registry
+                .owned_handle(prepared.incarnation_id.clone())
+                .await
+                .unwrap()
+                .launch_policy(),
+            Some(freshell_runtime_protocol::RuntimeLaunchPolicy::ProviderVolumeV1)
+        );
+        drop(registry);
+        let registry = Registry::open(root.path(), None).unwrap();
+        assert_eq!(registry.control_epoch(), 2);
+        let modern = registry
+            .owned_handle(prepared.incarnation_id.clone())
+            .await
+            .unwrap();
+        assert_eq!(
+            modern.launch_policy(),
+            Some(freshell_runtime_protocol::RuntimeLaunchPolicy::ProviderVolumeV1)
+        );
+        assert_eq!(modern.immutable_config_digest(), "saved-modern-digest");
+        drop(registry);
+        let conn = open_connection(&root.path().join("runtime.sqlite3")).unwrap();
+        conn.execute_batch("ALTER TABLE incarnations DROP COLUMN launch_policy; UPDATE installation SET schema_version=11; UPDATE incarnations SET immutable_config_digest='saved-legacy-digest';").unwrap();
+        drop(conn);
+        let registry = Registry::open(root.path(), None).unwrap();
+        assert_eq!(registry.control_epoch(), 3);
+        let legacy = registry
+            .owned_handle(prepared.incarnation_id.clone())
+            .await
+            .unwrap();
+        assert_eq!(legacy.launch_policy(), None);
+        assert_eq!(legacy.immutable_config_digest(), "saved-legacy-digest");
+        assert_eq!(legacy.container_id(), modern.container_id());
+        assert_eq!(legacy.image_ref(), modern.image_ref());
+        let conn = open_connection(&root.path().join("runtime.sqlite3")).unwrap();
+        conn.execute(
+            "UPDATE incarnations SET launch_policy=?1",
+            ["\"unknown_future_policy\""],
+        )
+        .unwrap();
+        drop(conn);
+        assert!(
+            registry
+                .owned_handle(prepared.incarnation_id)
+                .await
+                .is_err(),
+            "unknown policies cannot silently become legacy"
+        );
     }
 
     pub(crate) async fn materialize_test_runtime(

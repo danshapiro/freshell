@@ -31,11 +31,13 @@ pub struct PreparedTerminal {
     pub child_env: std::collections::BTreeMap<String, String>,
 }
 
-pub fn prepare_provider_state_before_bootstrap(
+pub fn prepare_provider_state_before_bootstrap_at(
     terminal: &mut freshell_runtime_protocol::TerminalLaunchSpec,
-) -> Result<(), String> {
+    provider_home: &std::path::Path,
+    selected_user_root: &std::path::Path,
+) -> Result<Vec<std::path::PathBuf>, String> {
     if terminal.mode != "amplifier" {
-        return Ok(());
+        return Ok(Vec::new());
     }
     let session_id = terminal
         .resume_session_id
@@ -44,18 +46,33 @@ pub fn prepare_provider_state_before_bootstrap(
         .ok_or_else(|| {
             "managed Amplifier launch requires one exact launcher-assigned session id".to_string()
         })?;
-    let provider_home = std::path::Path::new("/home/freshell/provider/.amplifier");
-    let ensured = freshell_sessions::amplifier_stub::ensure_session(
-        provider_home,
+    let amplifier_home = provider_home.join(".amplifier");
+    let settings_home = if terminal
+        .provider_launch_context
+        .as_ref()
+        .is_some_and(|context| {
+            context.config.iter().any(|reference| {
+                reference.root == freshell_runtime_protocol::ProviderConfigRoot::UserProvider
+                    && reference.relative_path == "settings.yaml"
+                    && reference.provider_relative_path == ".amplifier/settings.yaml"
+            })
+        }) {
+        selected_user_root
+    } else {
+        &amplifier_home
+    };
+    let ensured = freshell_sessions::amplifier_stub::ensure_session_with_settings_home(
+        &amplifier_home,
         session_id,
         &terminal.cwd,
         &terminal.terminal_id,
+        settings_home,
     )
     .map_err(|error| format!("prepare Amplifier session stub: {error}"))?;
     if let Some(recorded_cwd) = ensured.working_dir_of_existing {
         terminal.cwd = recorded_cwd;
     }
-    Ok(())
+    Ok(ensured.created_paths)
 }
 
 pub async fn prepare_terminal(

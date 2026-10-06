@@ -82,6 +82,70 @@ enum NativeIdentityWait {
 const NATIVE_IDENTITY_STARTUP_TIMEOUT: Duration = Duration::from_secs(8);
 const OPENCODE_ADOPTION_READINESS_TIMEOUT: Duration = Duration::from_secs(180);
 
+fn retained_runtime_probe(
+    exited: bool,
+    handle: ReattachHandle,
+    captured: RecoveryProbe,
+    native_store_required: bool,
+) -> RecoveryProbe {
+    if exited {
+        return captured;
+    }
+    if !native_store_required {
+        return RecoveryProbe::ReattachReady {
+            handle,
+            protocol_version: CONTROL_PROTOCOL_VERSION,
+        };
+    }
+    match captured {
+        RecoveryProbe::ResumeReady { .. } | RecoveryProbe::PristineSeedReady { .. } => {
+            RecoveryProbe::ReattachReady {
+                handle,
+                protocol_version: CONTROL_PROTOCOL_VERSION,
+            }
+        }
+        RecoveryProbe::DefinitivelyUnavailable { .. } => blocked(
+            RecoveryPath::Reattach,
+            RecoveryBlockReason::StoreUnreadable,
+            "running provider has no qualified current store",
+            Some(2000),
+        ),
+        other => other,
+    }
+}
+
+fn retained_host_features_known(host: &crate::service::AuthenticatedHost) -> bool {
+    ["owned-provider-config-v1", "provider-store-probe-v1"]
+        .iter()
+        .all(|required| {
+            host.capabilities
+                .iter()
+                .any(|capability| capability == required)
+        })
+}
+fn retained_status_observed(
+    context: &RecoveryContext,
+    host: &crate::service::AuthenticatedHost,
+    status: &crate::service::HostStatus,
+) -> bool {
+    if context.provider == "opencode" {
+        host.capabilities
+            .iter()
+            .any(|value| value == "opencode-adoption-observation-v1")
+            && matches!(&status.opencode_adoption,freshell_runtime_protocol::OpenCodeAdoptionStatus::Observed{observation} if Some(observation.root_session_id.as_str())==status.native_session_id.as_deref() && context.native_session_id.as_deref().is_none_or(|expected|expected==observation.root_session_id) && &observation.incarnation_id==context.prior_handle.incarnation_id() && observation.hydrated)
+    } else {
+        host.capabilities
+            .iter()
+            .any(|value| value == "native-identity-observation-v1")
+            && status.native_session_id.as_deref().is_some_and(|observed| {
+                context
+                    .native_session_id
+                    .as_deref()
+                    .is_none_or(|expected| expected == observed)
+            })
+    }
+}
+
 fn native_identity_wait_timeout(opencode_adoption_required: bool) -> Duration {
     if opencode_adoption_required {
         OPENCODE_ADOPTION_READINESS_TIMEOUT
@@ -1508,7 +1572,39 @@ impl Supervisor {
                 }),
             );
         }
-        Ok((after_native_probe(&context, probe), context))
+        let probe = after_native_probe(&context, probe);
+        let (block_reason, repair) = match &probe {
+            RecoveryProbe::Blocked {
+                reason, retry_hint, ..
+            } => (Some(reason), retry_hint.repair.as_deref()),
+            _ => (None, None),
+        };
+        crate::service::append_event(
+            &self.config.lifecycle_log,
+            "supervisor.recovery.preflight",
+            serde_json::json!({
+                "severity": if block_reason.is_some() {"warn"} else {"info"},
+                "soulId": context.soul_id,
+                "incarnationId": context.prior_handle.incarnation_id(),
+                "intentRevision": context.intent_revision,
+                "identityRevision": context.identity_revision,
+                "evidenceRevision": context.evidence_revision,
+                "controlEpoch": context.control_epoch,
+                "launchPolicy": context.prior_handle.launch_policy(),
+                "classification": match &probe {
+                    RecoveryProbe::Blocked { .. } => "blocked",
+                    RecoveryProbe::ReattachReady { .. } => "reattach_ready",
+                    RecoveryProbe::ResumeReady { .. } => "resume_ready",
+                    RecoveryProbe::PristineSeedReady { .. } => "pristine_seed_ready",
+                    RecoveryProbe::DefinitivelyUnavailable { .. } => "definitively_unavailable",
+                },
+                "blockReason": block_reason,
+                "repair": preflight_diagnostic_repair(repair),
+                "matcherReason": preflight_diagnostic_repair(repair),
+                "attemptReserved": false,
+            }),
+        );
+        Ok((probe, context))
     }
 
     async fn probe_recovery_context(
@@ -1532,7 +1628,15 @@ impl Supervisor {
                     RecoveryBlockReason::OldRuntimeNotEmpty,
                     &message,
                     None,
-                ))
+                ));
+            }
+            Err(BackendError::PolicyMismatch(message)) => {
+                return Ok(blocked(
+                    RecoveryPath::Reattach,
+                    RecoveryBlockReason::CapabilityPending,
+                    &message,
+                    None,
+                ));
             }
             Err(error) => {
                 return Ok(blocked(
@@ -1553,6 +1657,17 @@ impl Supervisor {
                 .await
             {
                 Ok(host) => {
+                    if context.provider != "shell"
+                        && context.fixture.is_none()
+                        && !retained_host_features_known(&host)
+                    {
+                        return self
+                            .retained_store_compatibility_probe(
+                                context,
+                                "retained_host_capability_unknown",
+                            )
+                            .await;
+                    }
                     let status = match self
                         .host_status(
                             context.prior_handle.incarnation_id().clone(),
@@ -1562,7 +1677,21 @@ impl Supervisor {
                         .await
                     {
                         Ok(status) => status,
-                        Err(_) if context.resume_spec.is_some() => return offline_probe(context),
+                        Err(_)
+                            if context.fixture.is_none()
+                                && context.provider == "opencode"
+                                && context.native_session_id.is_some() =>
+                        {
+                            return self
+                                .retained_store_compatibility_probe(
+                                    context,
+                                    "retained_host_status_unreachable",
+                                )
+                                .await;
+                        }
+                        Err(_) if context.resume_spec.is_some() => {
+                            return offline_probe(context);
+                        }
                         Err(error) => {
                             return Ok(blocked(
                                 RecoveryPath::Reattach,
@@ -1572,7 +1701,14 @@ impl Supervisor {
                             ));
                         }
                     };
-                    if let Some(native_session_id) = status.native_session_id.as_ref() {
+                    let native_observation_qualified = context.fixture.is_some()
+                        || context.provider == "shell"
+                        || retained_status_observed(context, &host, &status);
+                    if let Some(native_session_id) = status
+                        .native_session_id
+                        .as_ref()
+                        .filter(|_| native_observation_qualified)
+                    {
                         self.registry
                             .record_native_session_fenced(
                                 context.soul_id.clone(),
@@ -1590,7 +1726,10 @@ impl Supervisor {
                     }
                     let candidate = match resume_catalog::exact_resume_candidate(
                         &*context,
-                        status.native_session_id.as_deref(),
+                        status
+                            .native_session_id
+                            .as_deref()
+                            .filter(|_| native_observation_qualified),
                     ) {
                         Ok(candidate) => candidate,
                         Err(probe) => return Ok(probe),
@@ -1629,19 +1768,46 @@ impl Supervisor {
                         other => other,
                     };
 
-                    if !status.exited {
-                        return Ok(RecoveryProbe::ReattachReady {
-                            handle: ReattachHandle {
-                                incarnation_id: context.prior_handle.incarnation_id().clone(),
-                                host_boot_id: status.host_boot_id,
-                                container_id: context.prior_handle.container_id().to_string(),
-                            },
-                            protocol_version: CONTROL_PROTOCOL_VERSION,
-                        });
+                    if !status.exited
+                        && context.provider != "shell"
+                        && context.fixture.is_none()
+                        && !native_observation_qualified
+                        && matches!(
+                            &captured,
+                            RecoveryProbe::ResumeReady { .. }
+                                | RecoveryProbe::PristineSeedReady { .. }
+                        )
+                    {
+                        return self
+                            .retained_store_compatibility_probe(
+                                context,
+                                "retained_native_observation_unqualified",
+                            )
+                            .await;
                     }
-                    return Ok(after_native_probe(context, captured));
+                    return Ok(retained_runtime_probe(
+                        status.exited,
+                        ReattachHandle {
+                            incarnation_id: context.prior_handle.incarnation_id().clone(),
+                            host_boot_id: status.host_boot_id,
+                            container_id: context.prior_handle.container_id().to_owned(),
+                        },
+                        after_native_probe(context, captured),
+                        context.provider != "shell" && context.fixture.is_none(),
+                    ));
                 }
-                Err(_) if context.resume_spec.is_some() => return offline_probe(context),
+                Err(_)
+                    if context.fixture.is_none()
+                        && context.provider == "opencode"
+                        && context.native_session_id.is_some() =>
+                {
+                    return self
+                        .retained_store_compatibility_probe(context, "retained_host_unreachable")
+                        .await;
+                }
+                Err(_) if context.resume_spec.is_some() => {
+                    return offline_probe(context);
+                }
                 Err(error) => {
                     return Ok(blocked(
                         RecoveryPath::Reattach,
@@ -1657,6 +1823,14 @@ impl Supervisor {
             inspection.state,
             BackendRuntimeState::Exited | BackendRuntimeState::Dead | BackendRuntimeState::Missing
         ) {
+            if context.fixture.is_none()
+                && context.provider == "opencode"
+                && context.native_session_id.is_some()
+            {
+                return self
+                    .retained_store_compatibility_probe(context, "retained_host_exited")
+                    .await;
+            }
             return offline_probe(context);
         }
 
@@ -1669,6 +1843,97 @@ impl Supervisor {
             ),
             Some(2_000),
         ))
+    }
+
+    async fn retained_store_compatibility_probe(
+        &self,
+        context: &RecoveryContext,
+        reason: &str,
+    ) -> Result<RecoveryProbe, RuntimeError> {
+        crate::service::append_event(
+            &self.config.lifecycle_log,
+            "supervisor.recovery.retained_qualification_started",
+            serde_json::json!({
+                "severity": "info",
+                "soulId": context.soul_id,
+                "incarnationId": context.prior_handle.incarnation_id(),
+                "intentRevision": context.intent_revision,
+                "identityRevision": context.identity_revision,
+                "evidenceRevision": context.evidence_revision,
+                "controlEpoch": context.control_epoch,
+                "reason": reason,
+                "attemptReserved": false,
+            }),
+        );
+        let candidate = resume_catalog::exact_resume_candidate(context, None);
+        let result = match candidate {
+            Ok(Some(spec)) if context.provider == "opencode" && context.fixture.is_none() => {
+                let identity = context
+                    .terminal
+                    .as_ref()
+                    .map(|terminal| (terminal.run_as_uid, terminal.run_as_gid))
+                    .or_else(|| {
+                        context
+                            .fresh_agent
+                            .as_ref()
+                            .map(|agent| (agent.run_as_uid, agent.run_as_gid))
+                    });
+                if let Some((uid, gid)) = identity {
+                    let request = freshell_runtime_protocol::RetainedStoreCompatibilityRequest {
+                        provider_store_id: context.provider_store_id.clone(),
+                        native_session_id: spec.provider_session.native_session_id.clone(),
+                        image_ref: self.config.image_ref.clone(),
+                        provider_home: spec.provider_home.clone(),
+                        workspace_path: spec.workspace_path.clone(),
+                        cwd: spec.cwd.clone(),
+                        provider_uid: uid,
+                        provider_gid: gid,
+                    };
+                    match self
+                        .backend
+                        .qualify_retained_opencode(
+                            &context.prior_handle,
+                            &request,
+                            &self.config.host_binary_path,
+                        )
+                        .await
+                    {
+                        Ok(receipt) => {
+                            crate::service::append_event(
+                                &self.config.lifecycle_log,
+                                "supervisor.recovery.retained_store_compatible",
+                                serde_json::json!({"severity":"info","soulId":context.soul_id,"incarnationId":context.prior_handle.incarnation_id(),"intentRevision":context.intent_revision,"evidenceRevision":context.evidence_revision,"controlEpoch":context.control_epoch,"launchPolicy":context.prior_handle.launch_policy(),"reason":reason,"receipt":receipt,"attemptReserved":false}),
+                            );
+                            RecoveryProbe::ResumeReady {
+                                resume_spec: Box::new(spec),
+                                evidence_revision: context.evidence_revision,
+                            }
+                        }
+                        Err(error) => blocked(
+                            RecoveryPath::NativeResume,
+                            RecoveryBlockReason::StoreUnreadable,
+                            &format!("current-image retained-store qualification failed: {error}"),
+                            Some(2000),
+                        ),
+                    }
+                } else {
+                    blocked(
+                        RecoveryPath::NativeResume,
+                        RecoveryBlockReason::CapabilityPending,
+                        "retained provider identity is unavailable",
+                        Some(2000),
+                    )
+                }
+            }
+            Err(probe) if context.native_session_id.is_some() => probe,
+            _ => blocked(
+                RecoveryPath::NativeResume,
+                RecoveryBlockReason::CapabilityPending,
+                reason,
+                Some(2000),
+            ),
+        };
+        Ok(result)
     }
 
     async fn probe_host_store(
@@ -2125,16 +2390,25 @@ impl Supervisor {
             start.context.terminal.clone()
         };
         let mut replacement_terminal = replacement_terminal;
-        if replacement_terminal.as_ref().is_some_and(|terminal| {
-            matches!(
-                terminal.mode.as_str(),
-                "claude" | "codex" | "opencode" | "amplifier"
-            ) && terminal
-                .provider_launch_context
-                .as_ref()
-                .and_then(|context| context.mcp_capability.as_ref())
-                .is_none()
-        }) {
+        let exact_legacy_opencode = start.context.prior_handle.launch_policy().is_none()
+            && start.context.fixture.is_none()
+            && start.context.provider == "opencode"
+            && resume_spec.is_some()
+            && replacement_terminal.as_ref().is_some_and(|terminal| {
+                terminal.mode == "opencode" && terminal.provider_launch_context.is_none()
+            });
+        if !exact_legacy_opencode
+            && replacement_terminal.as_ref().is_some_and(|terminal| {
+                matches!(
+                    terminal.mode.as_str(),
+                    "claude" | "codex" | "opencode" | "amplifier"
+                ) && terminal
+                    .provider_launch_context
+                    .as_ref()
+                    .and_then(|context| context.mcp_capability.as_ref())
+                    .is_none()
+            })
+        {
             let reason = RecoveryBlockReason::CapabilityPending;
             self.registry
                 .mark_recovery_blocked(
@@ -2170,6 +2444,7 @@ impl Supervisor {
                 .as_ref()
                 .and_then(|context| context.mcp_capability.as_ref())
                 .is_some()
+                || exact_legacy_opencode
             {
                 let tui_source = terminal
                     .provider_launch_context
@@ -2186,13 +2461,14 @@ impl Supervisor {
                         }
                     });
                 let refreshed_capability = self
-                    .issue_replacement_mcp_capability(&soul_id, &terminal.mode, tui_source, &terminal.workspace_path)
+                    .issue_replacement_mcp_capability(&soul_id, &terminal.mode, tui_source, &terminal.workspace_path, &terminal.cwd)
                     .await
-                    .and_then(|reference| {
+                    .and_then(|context| {
+                        let reference=context.context.mcp_capability.as_ref().ok_or_else(||RuntimeError::new(RuntimeErrorCode::HostUnreachable,"capability_pending: exact provider preparation omitted its scoped grant"))?;
                         crate::backend::docker::staged_provider_root_for_grant(
                             &reference.grant_id,
                         )
-                        .map(|staged_root| (reference, staged_root))
+                        .map(|staged_root| (context, staged_root))
                         .map_err(|error| {
                             RuntimeError::new(
                                     RuntimeErrorCode::HostUnreachable,
@@ -2200,7 +2476,7 @@ impl Supervisor {
                                 )
                         })
                     });
-                let (reference, staged_root) = match refreshed_capability {
+                let (context, _staged_root) = match refreshed_capability {
                     Ok(refreshed) => refreshed,
                     Err(error) => {
                         let reason = RecoveryBlockReason::CapabilityPending;
@@ -2228,8 +2504,7 @@ impl Supervisor {
                         });
                     }
                 };
-                replace_terminal_mcp_reference(terminal, reference);
-                refresh_terminal_provider_config(terminal, &staged_root);
+                install_replacement_provider_context(terminal, context)?;
             }
         }
         let prepared = match self
@@ -3156,6 +3431,9 @@ impl Supervisor {
                             Some(2_000),
                         )
                     })?;
+                if context.provider!="shell" && context.fixture.is_none() && !retained_host_features_known(&host) {
+                    return Err(blocked(RecoveryPath::Reattach,RecoveryBlockReason::CapabilityPending,"retained_host_capability_unknown",Some(2000)));
+                }
                 let status = self
                     .host_status(
                         context.prior_handle.incarnation_id().clone(),
@@ -3172,14 +3450,17 @@ impl Supervisor {
                         )
                     })?;
                 if !status.exited {
-                    return Err(RecoveryProbe::ReattachReady {
-                        handle: ReattachHandle {
-                            incarnation_id: context.prior_handle.incarnation_id().clone(),
-                            host_boot_id: status.host_boot_id,
-                            container_id: context.prior_handle.container_id().to_string(),
-                        },
-                        protocol_version: CONTROL_PROTOCOL_VERSION,
-                    });
+                    let handle=ReattachHandle{incarnation_id:context.prior_handle.incarnation_id().clone(),host_boot_id:status.host_boot_id.clone(),container_id:context.prior_handle.container_id().into()};
+                    if context.provider!="shell" && context.fixture.is_none() {
+                        let candidate=resume_catalog::exact_resume_candidate(context,None)?;
+                        let captured=self.probe_host_store(context,&host,candidate).await.map_err(|error|blocked(RecoveryPath::Reattach,RecoveryBlockReason::StoreUnreadable,&error.message,Some(2000)))?;
+                        let captured=after_native_probe(context,captured);
+                        if !retained_status_observed(context,&host,&status) && matches!(&captured,RecoveryProbe::ResumeReady{..}|RecoveryProbe::PristineSeedReady{..}) {
+                            return Err(blocked(RecoveryPath::Reattach,RecoveryBlockReason::CapabilityPending,"retained_native_observation_unqualified",Some(2000)));
+                        }
+                        return Err(retained_runtime_probe(false,handle,captured,true));
+                    }
+                    return Err(retained_runtime_probe(false,handle,RecoveryProbe::PristineSeedReady{seed:"fixture".into(),never_dispatched_proof:"fixture".into()},false));
                 }
                 Ok(RecoveryPathEvidence {
                     path: RecoveryPath::Reattach,
@@ -3856,6 +4137,34 @@ fn blocked(
     }
 }
 
+fn preflight_diagnostic_repair(repair: Option<&str>) -> Option<&'static str> {
+    let repair = repair?;
+    // A native transport error may carry arbitrary upstream data. Log only
+    // recognized static causes; the authenticated response retains its hint.
+    const SAFE_HINTS: &[&str] = &[
+        "runtime gained extra, duplicate, or missing mounts",
+        "runtime mount topology changed",
+        "owned_launch_policy_mismatch",
+        "repair the soul-local OpenCode database",
+    ];
+    if let Some(hint) = SAFE_HINTS.iter().find(|hint| **hint == repair) {
+        return Some(hint);
+    }
+    const SOURCE_CODES: &[&str] = &[
+        "source_io_unavailable",
+        "sqlite_source_unavailable",
+        "native_row_unreadable",
+        "unsupported_schema_or_migration",
+        "workspace_or_asset_unavailable",
+        "exact_graph_unavailable",
+        "source_qualification_pending",
+    ];
+    SOURCE_CODES
+        .iter()
+        .find(|code| repair.contains(&format!("retained OpenCode qualification blocked ({code})")))
+        .copied()
+}
+
 fn recovery_activation_failure_data(
     soul_id: &SoulId,
     prior_incarnation_id: &freshell_runtime_protocol::IncarnationId,
@@ -3874,6 +4183,7 @@ fn recovery_activation_failure_data(
         "blockReason": reason,
         "errorCode": error.code,
         "errorClass": "provider_activation_failed",
+        "severity": "warn",
     })
 }
 
@@ -3930,149 +4240,22 @@ fn terminal_without_first_boot_state(
     })
 }
 
-fn refresh_terminal_provider_config(
+fn install_replacement_provider_context(
     terminal: &mut TerminalLaunchSpec,
-    user_root: &std::path::Path,
-) {
-    let Some(context) = terminal.provider_launch_context.as_mut() else {
-        return;
-    };
-    refresh_provider_context_from_user_root(
-        context,
-        &terminal.mode,
-        std::path::Path::new(&terminal.workspace_path),
-        std::path::Path::new(&terminal.cwd),
-        user_root,
-    );
-}
-
-fn replace_terminal_mcp_reference(
-    terminal: &mut TerminalLaunchSpec,
-    reference: freshell_runtime_protocol::McpCapabilityReference,
-) {
-    if let Some(context) = terminal.provider_launch_context.as_mut() {
-        context.mcp_capability = Some(reference);
+    preparation: freshell_runtime_protocol::ProviderReplacementPreparation,
+) -> Result<(), RuntimeError> {
+    let context = preparation.context;
+    if context.preparation.provider() != terminal.mode || context.mcp_capability.is_none() {
+        return Err(RuntimeError::new(
+            RuntimeErrorCode::HostUnreachable,
+            "capability_pending: exact provider preparation does not match the selected provider",
+        ));
     }
-}
-
-fn refresh_provider_context_from_user_root(
-    context: &mut freshell_runtime_protocol::ProviderLaunchContext,
-    provider: &str,
-    workspace: &std::path::Path,
-    project_dir: &std::path::Path,
-    user_root: &std::path::Path,
-) {
-    use freshell_runtime_protocol::{
-        ProviderConfigReference, ProviderConfigRoot, ProviderPreparation,
-    };
-    let (provider_dir, directories): (&str, &[&str]) = match provider {
-        "claude" => (
-            ".claude",
-            &["plugins", "skills", "commands", "hooks", "agents"],
-        ),
-        "codex" => (".codex", &["skills", "rules"]),
-        "opencode" => (
-            ".config/opencode",
-            &["plugin", "plugins", "agents", "commands", "skills"],
-        ),
-        "amplifier" => (".amplifier", &["bundles", "skills", "agents"]),
-        _ => return,
-    };
-    let mut config = Vec::new();
-    if let Ok(canonical_root) = std::fs::canonicalize(user_root) {
-        if let Ok(entries) = std::fs::read_dir(&canonical_root) {
-            for entry in entries.flatten() {
-                let name = entry.file_name();
-                let Some(name) = name.to_str() else { continue };
-                let Some(source) = safe_provider_config_source(&canonical_root, &entry.path())
-                else {
-                    continue;
-                };
-                let format = if source.is_dir() {
-                    if !directories.contains(&name) {
-                        continue;
-                    }
-                    "directory"
-                } else if source.is_file() {
-                    match source.extension().and_then(|ext| ext.to_str()) {
-                        Some("json") => "json",
-                        Some("jsonc") => "jsonc",
-                        Some("toml") => "toml",
-                        Some("yaml" | "yml") => "yaml",
-                        Some("md") => "text",
-                        _ => continue,
-                    }
-                } else {
-                    continue;
-                };
-                if matches!(
-                    name.to_ascii_lowercase().as_str(),
-                    "auth.json" | ".credentials.json" | "keys.env" | ".env" | "token.json"
-                ) {
-                    continue;
-                }
-                config.push(ProviderConfigReference {
-                    root: ProviderConfigRoot::UserProvider,
-                    relative_path: name.to_string(),
-                    provider_relative_path: format!("{provider_dir}/{name}"),
-                    format: format.into(),
-                });
-            }
-        }
+    terminal.provider_launch_context = Some(context);
+    if !preparation.secret_references.is_empty() {
+        terminal.provider_secret_references = preparation.secret_references;
     }
-    config.sort_by(|left, right| {
-        left.provider_relative_path
-            .cmp(&right.provider_relative_path)
-    });
-    context.config = config;
-
-    if let ProviderPreparation::Opencode { project_config, .. } = &mut context.preparation {
-        project_config.clear();
-        let Ok(canonical_workspace) = std::fs::canonicalize(workspace) else {
-            return;
-        };
-        let Ok(project_relative) = project_dir.strip_prefix(workspace) else {
-            return;
-        };
-        for name in [
-            "opencode.json",
-            "opencode.jsonc",
-            ".opencode/opencode.json",
-            ".opencode/opencode.jsonc",
-        ] {
-            let relative_path = project_relative.join(name);
-            let Some(relative_path) = relative_path
-                .to_str()
-                .map(|path| path.replace(std::path::MAIN_SEPARATOR, "/"))
-            else {
-                continue;
-            };
-            let candidate = workspace.join(&relative_path);
-            if safe_provider_config_source(&canonical_workspace, &candidate)
-                .is_some_and(|path| path.is_file())
-            {
-                project_config.push(ProviderConfigReference {
-                    root: ProviderConfigRoot::Workspace,
-                    relative_path: relative_path.clone(),
-                    provider_relative_path: format!(".config/opencode/project/{relative_path}"),
-                    format: if name.ends_with(".jsonc") {
-                        "jsonc"
-                    } else {
-                        "json"
-                    }
-                    .into(),
-                });
-            }
-        }
-    }
-}
-
-fn safe_provider_config_source(
-    root: &std::path::Path,
-    candidate: &std::path::Path,
-) -> Option<std::path::PathBuf> {
-    let canonical = std::fs::canonicalize(candidate).ok()?;
-    canonical.starts_with(root).then_some(canonical)
+    Ok(())
 }
 
 fn fresh_without_raw_bootstrap(
@@ -4347,6 +4530,49 @@ pub(crate) mod tests {
             if owner.soul_id == candidates[0].soul_id));
     }
 
+    #[test]
+    fn retained_runtime_alive_never_bypasses_blocked_store_reader() {
+        let handle = ReattachHandle {
+            incarnation_id: IncarnationId::new(),
+            host_boot_id: freshell_runtime_protocol::HostBootId::new(),
+            container_id: "exact-retained-container".into(),
+        };
+        let probe = blocked(
+            RecoveryPath::NativeResume,
+            RecoveryBlockReason::StoreUnreadable,
+            "fixture config permission unavailable",
+            Some(2000),
+        );
+        assert!(matches!(
+            retained_runtime_probe(false, handle.clone(), probe, true),
+            RecoveryProbe::Blocked {
+                reason: RecoveryBlockReason::StoreUnreadable,
+                ..
+            }
+        ));
+        let unavailable = RecoveryProbe::DefinitivelyUnavailable {
+            path: RecoveryPath::NativeResume,
+            reason: "store inspection incomplete".into(),
+            evidence: vec![],
+            store_state: freshell_runtime_protocol::EvidenceStoreState::Missing,
+        };
+        assert!(matches!(
+            retained_runtime_probe(false, handle.clone(), unavailable, true),
+            RecoveryProbe::Blocked {
+                reason: RecoveryBlockReason::StoreUnreadable,
+                ..
+            }
+        ));
+        let pristine = RecoveryProbe::PristineSeedReady {
+            seed: "proven-seed".into(),
+            never_dispatched_proof: "durable-empty-journal".into(),
+        };
+        assert!(matches!(
+            retained_runtime_probe(false, handle, pristine, true),
+            RecoveryProbe::ReattachReady { .. }
+        ));
+    }
+
     struct ObservedRuntime(BackendRuntimeState);
 
     #[async_trait::async_trait]
@@ -4551,6 +4777,26 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn preflight_diagnostics_preserve_safe_causes_without_native_bodies_or_credentials() {
+        assert_eq!(
+            preflight_diagnostic_repair(Some(
+                "Bearer private-credential; synthetic native message"
+            )),
+            None
+        );
+        assert_eq!(
+            preflight_diagnostic_repair(Some("runtime mount topology changed")),
+            Some("runtime mount topology changed")
+        );
+        assert_eq!(
+            preflight_diagnostic_repair(Some("repair the soul-local OpenCode database")),
+            Some("repair the soul-local OpenCode database")
+        );
+        assert_eq!(preflight_diagnostic_repair(Some("private upstream response; retained OpenCode qualification blocked (sqlite_source_unavailable); preserve the store")), Some("sqlite_source_unavailable"));
+        assert_eq!(preflight_diagnostic_repair(None), None);
+    }
+
+    #[test]
     fn recovery_activation_diagnostic_links_generic_block_to_exact_failure() {
         let soul_id = SoulId::new();
         let prior = IncarnationId::new();
@@ -4579,6 +4825,7 @@ pub(crate) mod tests {
         assert_eq!(data["blockReason"], "PROVIDER_UNAVAILABLE");
         assert_eq!(data["errorCode"], "HOST_UNREACHABLE");
         assert_eq!(data["errorClass"], "provider_activation_failed");
+        assert_eq!(data["severity"], "warn");
         assert!(!data.to_string().contains("operation not permitted"));
     }
 
@@ -4743,15 +4990,21 @@ pub(crate) mod tests {
                 }),
                 config: Vec::new(),
             });
-        replace_terminal_mcp_reference(
+        let mut current_context = replacement.provider_launch_context.clone().unwrap();
+        current_context.mcp_capability = Some(freshell_runtime_protocol::McpCapabilityReference {
+            grant_id: "grant-new".into(),
+            endpoint: "http://host.docker.internal:4001".into(),
+            provider_relative_path: ".freshell/mcp-capability.json".into(),
+            host_gateway_address: None,
+        });
+        install_replacement_provider_context(
             &mut replacement,
-            freshell_runtime_protocol::McpCapabilityReference {
-                grant_id: "grant-new".into(),
-                endpoint: "http://host.docker.internal:4001".into(),
-                provider_relative_path: ".freshell/mcp-capability.json".into(),
-                host_gateway_address: None,
+            freshell_runtime_protocol::ProviderReplacementPreparation {
+                context: current_context,
+                secret_references: vec![],
             },
-        );
+        )
+        .unwrap();
         let reference = replacement
             .provider_launch_context
             .unwrap()
@@ -4759,65 +5012,5 @@ pub(crate) mod tests {
             .unwrap();
         assert_eq!(reference.grant_id, "grant-new");
         assert_eq!(reference.endpoint, "http://host.docker.internal:4001");
-    }
-
-    #[test]
-    fn recovery_refreshes_provider_config_from_nondefault_xdg_root() {
-        use freshell_runtime_protocol::{ProviderLaunchContext, ProviderPreparation};
-        let workspace = tempfile::tempdir().unwrap();
-        let home = tempfile::tempdir().unwrap();
-        let user_root = home.path().join("custom-xdg/opencode");
-        std::fs::create_dir_all(&user_root).unwrap();
-        std::fs::write(user_root.join("old.jsonc"), "{}").unwrap();
-        let mut context = ProviderLaunchContext {
-            preparation: ProviderPreparation::Opencode {
-                project_config: vec![],
-                tui_config: None,
-                tui_source: None,
-                inline_config: false,
-            },
-            mcp_capability: None,
-            config: vec![],
-        };
-        refresh_provider_context_from_user_root(
-            &mut context,
-            "opencode",
-            workspace.path(),
-            workspace.path(),
-            &user_root,
-        );
-        assert!(context
-            .config
-            .iter()
-            .any(|reference| reference.relative_path == "old.jsonc"));
-        std::fs::remove_file(user_root.join("old.jsonc")).unwrap();
-        std::fs::write(user_root.join("new-provider.jsonc"), "{}").unwrap();
-        std::fs::write(workspace.path().join("opencode.jsonc"), "{}").unwrap();
-        refresh_provider_context_from_user_root(
-            &mut context,
-            "opencode",
-            workspace.path(),
-            workspace.path(),
-            &user_root,
-        );
-        assert!(!context
-            .config
-            .iter()
-            .any(|reference| reference.relative_path == "old.jsonc"));
-        assert!(context
-            .config
-            .iter()
-            .any(|reference| reference.relative_path == "new-provider.jsonc"));
-        assert!(context.config.iter().all(|reference| {
-            reference
-                .provider_relative_path
-                .starts_with(".config/opencode/")
-        }));
-        let ProviderPreparation::Opencode { project_config, .. } = &context.preparation else {
-            panic!("wrong provider")
-        };
-        assert!(project_config
-            .iter()
-            .any(|reference| reference.relative_path == "opencode.jsonc"));
     }
 }

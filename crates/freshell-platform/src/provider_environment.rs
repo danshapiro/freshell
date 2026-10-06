@@ -1139,8 +1139,13 @@ mod tests {
             source: source.path().join("config.json"),
             destination_relative: PathBuf::from("config.json"),
         };
-        let publication =
-            stage_environment(&[selection.clone()], &home, &[], Default::default()).unwrap();
+        let publication = stage_environment(
+            std::slice::from_ref(&selection),
+            &home,
+            &[],
+            Default::default(),
+        )
+        .unwrap();
         assert_eq!(fs::read(home.join("config.json")).unwrap(), b"new");
         drop(publication);
         assert!(

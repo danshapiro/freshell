@@ -166,6 +166,7 @@ async fn fixture_fresh_soul_with_cleanup(
                 runtime_dir: root.join("runtime"),
                 host_binary_path: root.join("host"),
                 immutable_config_digest: format!("sha256:{}", "c".repeat(64)),
+                launch_policy: None,
             },
         )
         .await
