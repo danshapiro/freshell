@@ -1871,13 +1871,15 @@ impl<'a> AssetResolver<'a> {
                 "snapshot reference cannot be verified without a trusted mapping for the selected workspace".into(),
             )
         })?;
-        // A provider snapshot bucket is independently authoritative. A
-        // workspace repository, when present, also retains its old shared
-        // workspace reference commitment.
+        // The retained native closure is sufficient authority. Add a separate
+        // workspace commitment only when that repository can verify this exact
+        // tree; ordinary native snapshot trees need not exist in workspace Git.
         if !mount.canonical_root.join(".git").is_dir() {
             return Ok(());
         }
-        let store = inspect_git_tree(&mount.canonical_root, tree)?;
+        let Ok(store) = inspect_git_tree(&mount.canonical_root, tree) else {
+            return Ok(());
+        };
         let identity_bytes = serde_json::to_vec(&mount.identity)
             .map_err(|error| TransferError::Serialization(error.to_string()))?;
         let source_identity = format!("workspace:{}:{}", digest(&identity_bytes), store.identity);

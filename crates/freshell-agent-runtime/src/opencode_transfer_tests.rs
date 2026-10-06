@@ -2855,6 +2855,23 @@ fn write_owned_git_object(store: &Path, kind: &str, bytes: &[u8]) -> String {
 fn durable_souls_rehearsal_pipeline_transfers_exact_native_snapshot_closure() {
     use sha2::Digest;
     let mut fixture = saved_revert_fixture(false);
+    // Construct an ordinary repository without invoking an external CLI. Its
+    // committed tree is deliberately different from the native snapshot tree.
+    let git_dir = fixture.workspace.join(".git");
+    fs::create_dir_all(git_dir.join("refs/heads")).unwrap();
+    fs::write(git_dir.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+    fs::write(
+        git_dir.join("config"),
+        "[core]\nrepositoryformatversion = 0\nbare = false\n",
+    )
+    .unwrap();
+    let committed_tree = write_owned_git_object(&git_dir.join("objects"), "tree", b"");
+    let commit = write_owned_git_object(
+        &git_dir.join("objects"),
+        "commit",
+        format!("tree {committed_tree}\nauthor Fixture <fixture@example.invalid> 1 +0000\ncommitter Fixture <fixture@example.invalid> 1 +0000\n\nfixture\n").as_bytes(),
+    );
+    fs::write(git_dir.join("refs/heads/main"), format!("{commit}\n")).unwrap();
     let bucket_id = hex::encode(sha1::Sha1::digest(
         fixture
             .workspace
@@ -2876,6 +2893,12 @@ fn durable_souls_rehearsal_pipeline_transfers_exact_native_snapshot_closure() {
     let mut root_entry = b"40000 nested\0".to_vec();
     root_entry.extend(hex::decode(&nested).unwrap());
     let tree = write_owned_git_object(&source_store, "tree", &root_entry);
+    assert_ne!(tree, committed_tree);
+    assert!(!git_dir
+        .join("objects")
+        .join(&tree[..2])
+        .join(&tree[2..])
+        .exists());
     let source = Connection::open(fixture.root.join("source.sqlite")).unwrap();
     source
         .execute(
@@ -2896,6 +2919,10 @@ fn durable_souls_rehearsal_pipeline_transfers_exact_native_snapshot_closure() {
         freshell_sessions::opencode_transfer::SavedSnapshotAvailability::RetainedClosure
     );
     assert_eq!(manifest.saved_snapshots[0].objects.len(), 3);
+    assert!(!manifest
+        .assets
+        .iter()
+        .any(|asset| asset.kind == "git_tree_reference"));
     let payload = fs::read(fixture.staged_directory.join("entry-0000.bin")).unwrap();
     import_bundle_payload(
         &fixture.descriptor,
@@ -2923,6 +2950,21 @@ fn durable_souls_rehearsal_pipeline_transfers_exact_native_snapshot_closure() {
         &fixture.workspace,
     )
     .unwrap();
+    let home = fixture.destination_database.ancestors().nth(4).unwrap();
+    let xdg_data_home = home.join(".local/share");
+    let xdg_config_home = home.join(".config");
+    fs::create_dir_all(&xdg_config_home).unwrap();
+    let reader = InstalledStoreReaderContext {
+        database_path: &fixture.destination_database,
+        workspace_root: &fixture.workspace,
+        provider_uid: unsafe { libc::geteuid() },
+        provider_gid: unsafe { libc::getegid() },
+        home,
+        xdg_data_home: &xdg_data_home,
+        xdg_config_home: &xdg_config_home,
+        cwd: &fixture.workspace,
+    };
+    verify_installed_store(&fixture.descriptor, &reader).unwrap();
     let conflict = destination_store.join(&blob[..2]).join(&blob[2..]);
     fs::write(&conflict, b"conflicting retained object").unwrap();
     assert!(import_bundle_payload(
