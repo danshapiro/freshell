@@ -83,6 +83,16 @@ struct InputPreparation {
     prior_grant_ids: Vec<String>,
 }
 
+pub(crate) fn opencode_tui_reference(jsonc: bool) -> ProviderConfigReference {
+    let format = if jsonc { "jsonc" } else { "json" };
+    ProviderConfigReference {
+        root: ProviderConfigRoot::Ephemeral,
+        relative_path: format!("tui-config.{format}"),
+        provider_relative_path: format!(".freshell/opencode/user-tui.{format}"),
+        format: format.into(),
+    }
+}
+
 #[derive(Clone)]
 struct Grant {
     soul_id: SoulId,
@@ -1135,17 +1145,7 @@ fn apply_callback(
                 *inline_config = stage.join("ephemeral/inline-config.json").is_file();
                 for name in ["tui-config.json", "tui-config.jsonc"] {
                     if stage.join("ephemeral").join(name).is_file() {
-                        *tui_config = Some(ProviderConfigReference {
-                            root: ProviderConfigRoot::Ephemeral,
-                            relative_path: format!("ephemeral/{name}"),
-                            provider_relative_path: format!(".config/opencode/{name}"),
-                            format: if name.ends_with("jsonc") {
-                                "jsonc"
-                            } else {
-                                "json"
-                            }
-                            .into(),
-                        });
+                        *tui_config = Some(opencode_tui_reference(name.ends_with("jsonc")));
                         break;
                     }
                 }
@@ -12398,6 +12398,94 @@ process.stdout.write(readFileSync(new URL('./resource',import.meta.url),'utf8')+
             1,
             "failed preparation must remove only its fresh temporary stage"
         );
+    }
+
+    fn check_replacement_callback_selected_tui_recipe(format: &str) {
+        let control = tempfile::tempdir().unwrap();
+        let capabilities = control.path().join("capabilities");
+        std::fs::create_dir(&capabilities).unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let selected = home.path().join(format!("selected-tui.{format}"));
+        std::fs::write(&selected, r#"{"theme":"prior"}"#).unwrap();
+        let source = approved_tui_source(
+            selected.to_str().unwrap(),
+            home.path(),
+            home.path(),
+            home.path(),
+        )
+        .unwrap();
+        let store = CapabilityStore::default();
+        let soul = SoulId::new();
+        store
+            .issue(
+                soul.clone(),
+                &capabilities,
+                "http://host.docker.internal:4000".into(),
+                Some(("opencode", home.path(), &[])),
+                OpencodeEphemeralInput {
+                    tui_source: Some(&source),
+                    workspace: Some(home.path()),
+                    ..Default::default()
+                },
+                None,
+            )
+            .unwrap();
+        let refreshed = if format == "jsonc" {
+            "{ // refreshed\n\"theme\":\"current\"}"
+        } else {
+            r#"{"theme":"current"}"#
+        };
+        std::fs::write(&selected, refreshed).unwrap();
+        let request = serde_json::to_vec(&serde_json::json!({
+            "action":"issue", "controlSecret":"test-control-secret", "soulId":soul,
+            "provider":"opencode", "workspace":home.path(), "cwd":home.path(), "tuiSource":source,
+        }))
+        .unwrap();
+        let response = apply_callback(
+            &request,
+            "test-control-secret",
+            &store,
+            &capabilities,
+            "http://host.docker.internal:4000",
+            home.path(),
+        )
+        .unwrap();
+        let replacement: freshell_runtime_protocol::ProviderReplacementPreparation =
+            serde_json::from_slice(&response).unwrap();
+        replacement
+            .context
+            .validate("opencode")
+            .expect("replacement callback must return a host-valid selected TUI recipe");
+        let freshell_runtime_protocol::ProviderPreparation::Opencode {
+            tui_config: Some(reference),
+            tui_source: Some(current_source),
+            ..
+        } = &replacement.context.preparation
+        else {
+            panic!("selected TUI omitted")
+        };
+        let grant = replacement.context.mcp_capability.as_ref().unwrap();
+        let stage = staged_provider_root_path(&capabilities, &grant.grant_id).unwrap();
+        // Resolve exactly as the host does; a doubled ephemeral prefix fails.
+        assert_eq!(
+            std::fs::read_to_string(stage.join("ephemeral").join(&reference.relative_path))
+                .unwrap(),
+            refreshed
+        );
+        assert_eq!(
+            reference.provider_relative_path,
+            current_source.provider_relative_path
+        );
+    }
+
+    #[test]
+    fn replacement_callback_selected_tui_recipe_json() {
+        check_replacement_callback_selected_tui_recipe("json");
+    }
+
+    #[test]
+    fn replacement_callback_selected_tui_recipe_jsonc() {
+        check_replacement_callback_selected_tui_recipe("jsonc");
     }
 
     #[test]

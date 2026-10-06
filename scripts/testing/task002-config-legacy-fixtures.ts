@@ -201,13 +201,14 @@ async function producer(h: RuntimeHarness, supervisor: SupervisorInstance, scena
   return server
 }
 
-async function selectedPreparation(supervisor: SupervisorInstance, soulId: string, workspace: string): Promise<any> {
+async function selectedPreparation(supervisor: SupervisorInstance, soulId: string, workspace: string, tuiFormat: 'json' | 'jsonc'): Promise<any> {
   return await new Promise((resolve,reject) => {
     const socket=net.createConnection(path.join(path.dirname(supervisor.controlSocket), 'mcp.sock'))
     const chunks:Buffer[]=[]; let bytes=0
     socket.setTimeout(10000,()=>socket.destroy(new Error('configuration producer timed out')))
     socket.on('error',reject)
-    socket.on('connect',()=>socket.end(JSON.stringify({action:'issue',controlSecret:supervisor.controlSecret,soulId,provider:'opencode',workspace,cwd:workspace})))
+    socket.on('connect',()=>socket.end(JSON.stringify({action:'issue',controlSecret:supervisor.controlSecret,soulId,provider:'opencode',workspace,cwd:workspace,
+      tuiSource:{root:'workspace',relativePath:`selected-tui.${tuiFormat}`,providerRelativePath:`.freshell/opencode/user-tui.${tuiFormat}`,format:tuiFormat}})))
     socket.on('data',chunk=>{ bytes+=chunk.length; if(bytes>256*1024)socket.destroy(new Error('configuration producer receipt exceeds bound'));else chunks.push(chunk) })
     socket.on('end',()=>{try {resolve(JSON.parse(Buffer.concat(chunks).toString('utf8')))}catch {reject(new Error('configuration producer refused selected fixture inputs'))}})
   })
@@ -238,11 +239,11 @@ export type Task2RetainedBrowserHooks = {
 }
 
 export async function runTask2RetainedFixture(
-  h: RuntimeHarness, legacy: boolean, browser?: Task2RetainedBrowserHooks,
+  h: RuntimeHarness, legacy: boolean, browser?: Task2RetainedBrowserHooks, tuiFormat: 'json' | 'jsonc' = 'jsonc',
 ): Promise<void> {
   if (process.env.FRESHELL_RUNTIME_SYNTHETIC_RESUME !== '1') throw new Error('exact synthetic fixture gate is required')
   const caseId = selected[legacy ? 1 : 0]
-  const scenarioId = `task2-${legacy ? 'legacy' : 'config'}`
+  const scenarioId = `task2-${legacy ? 'legacy' : `config-${tuiFormat}`}`
   const workspace = path.join(h.testRoot, 'fixture-workspace', scenarioId)
   fs.mkdirSync(workspace, { recursive: true, mode: 0o777 }); fs.chmodSync(workspace, 0o777)
   // UID65534 must traverse the owned fixture parent; never chmod operator paths.
@@ -253,6 +254,10 @@ export async function runTask2RetainedFixture(
   const configFile = path.join(workspace, 'opencode.json')
   fs.writeFileSync(configFile, '{"plugin":[]}', { mode: 0o644 })
   fs.chmodSync(configFile, 0o644)
+  const tuiFile = path.join(workspace, `selected-tui.${tuiFormat}`)
+  const initialTui = '{"theme":"task2-prior"}'
+  const refreshedTui = tuiFormat === 'jsonc' ? '{ // refreshed selected TUI\n"theme":"task2-current"}' : '{"theme":"task2-current"}'
+  if (!legacy) { fs.writeFileSync(tuiFile, initialTui, { mode: 0o644 }); fs.chmodSync(tuiFile, 0o644) }
   const first = await h.startSupervisor({ scenarioId, waitForHealth: !legacy,
     ...(legacy ? { binaryPath: path.join(h.buildDir, 'task002-legacy-supervisor'), hostBinaryPath: path.join(h.buildDir, 'task002-prefixed-session-host') } : {}) })
   if (legacy) await h.waitForFile(first.controlSocket)
@@ -261,7 +266,7 @@ export async function runTask2RetainedFixture(
   const soulId = newSoul()
   let web = legacy ? undefined : await producer(h, first, scenarioId)
   try {
-  const preparation = legacy ? undefined : await selectedPreparation(first,soulId,workspace)
+  const preparation = legacy ? undefined : await selectedPreparation(first,soulId,workspace,tuiFormat)
   const terminal = {
     terminalId: `terminal-${randomUUID()}`, streamId: `stream-${randomUUID()}`, mode: 'opencode', program: 'opencode',
     args: [], cwd: workspace, workspacePath: workspace,
@@ -274,6 +279,8 @@ export async function runTask2RetainedFixture(
     terminal, limits: {cpuMilli:2000,memoryBytes:4*1024*1024*1024,swapBytes:0,pidsMax:512}, profile: 'default_agent', expectedControlEpoch: 1 })
   const launch = data(await (legacy ? oldOk(h, first, body) : h.adminOk(first, body)), 'launch')
   const containerId = launch.view.containerId
+  const readPublishedTui = (id: string) => h.execOwnedContainerAsExact(id, '65534:0', ['cat', `${HOME}/.freshell/opencode/user-tui.${tuiFormat}`])
+  if (!legacy) h.assert(caseId, readPublishedTui(containerId) === initialTui, `${tuiFormat} actual callback recipe publishes selected TUI bytes under provider identity`)
   const inspected = h.inspectContainer(containerId)
   h.assert(caseId, /^[a-f0-9]{64}$/.test(containerId) && inspected.Id === containerId, 'saved enclosure uses full exact container identity')
   h.assert(caseId, inspected.Image === h.imageRef, 'saved enclosure uses exact immutable image')
@@ -330,7 +337,7 @@ export async function runTask2RetainedFixture(
   const qualified = data(await h.adminOk(current, h.probeRecoveryBody(soulId, 3)), 'recovery_probe')
   h.writeArtifact(`${scenarioId}-preflight-status.json`,{kind:qualified.kind,reason:qualified.data?.reason,repair:qualified.data?.retry_hint?.repair})
   h.assert(caseId, qualified.kind === 'resume_ready', 'current-image worker qualifies actual full retained synthetic graph before reservation')
-  if (!legacy) fs.chmodSync(configFile, 0)
+  if (!legacy) { fs.chmodSync(configFile, 0); fs.writeFileSync(tuiFile, refreshedTui) }
   let receipts = h.broker.receiptIds()
   if (!legacy) {
     const failed = browser ? await browser.retry(browserContext(), 'config_fault')
@@ -354,6 +361,7 @@ export async function runTask2RetainedFixture(
   const live = created.filter(receipt => h.inspectContainer(receipt.containerId).State.Running)
   h.assert(caseId, after.incarnation.soul_id === soulId && after.incarnation.container_id !== containerId && created.length === 1 && live.length === 1, 'exact repaired retry produces one current enclosure')
   h.assert(caseId, after.writerClaims === 1, 'registry commits one writer claim')
+  if (!legacy) h.assert(caseId, readPublishedTui(live[0]!.containerId) === refreshedTui, `${tuiFormat} replacement callback and host refresh publish current selected TUI bytes`)
   h.assert(caseId, created.every(receipt => receipt.providerVolumeName === inspected.Mounts.find((m: any) => m.Destination === HOME)?.Name), 'every attempted replacement keeps exact provider volume')
   h.assert(caseId, h.inspectContainer(containerId).State.Running === false, 'old enclosure is empty before current writer runs')
   const actual = h.execOwnedContainerAsExact(live[0]!.containerId, '65534:0', ['python3', '-c',
@@ -367,7 +375,7 @@ export async function runTask2RetainedFixture(
 export async function runTask2Fixtures(h: RuntimeHarness): Promise<void> {
   const executed: string[] = [], failed: string[] = []
   const cases: [string, () => Promise<void>][] = [
-    [selected[0], () => runTask2RetainedFixture(h, false)], [selected[1], () => runTask2RetainedFixture(h, true)],
+    [selected[0], async () => { await runTask2RetainedFixture(h, false, undefined, 'json'); await runTask2RetainedFixture(h, false, undefined, 'jsonc') }], [selected[1], () => runTask2RetainedFixture(h, true)],
     [selected[2], async () => {
       const s = await h.startSupervisor({ scenarioId: 'task2-onewriter' }), soulId = newSoul()
       const launch = data(await h.adminOk(s, h.launchBody({ soulId, provider: 'native-session-fixture', fixture: 'native_session' })), 'launch')
