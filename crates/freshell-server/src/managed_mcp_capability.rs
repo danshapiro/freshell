@@ -1610,6 +1610,8 @@ mod tests {
         };
         use sha2::{Digest, Sha256};
         for case in [
+            "context-include",
+            "context-include-leading-slash",
             "markdown-bundle",
             "markdown-absolute-context",
             "collection-alias",
@@ -1655,10 +1657,14 @@ mod tests {
             } else {
                 "bundle.yaml"
             };
-            let header = format!(
-                "bundle:\n  name: source-probe\n  version: 1.0.0\ncontext:\n  probe: {}\n",
-                serde_json::to_string(&context_reference).unwrap()
-            );
+            let header = if case.starts_with("context-include") {
+                format!("bundle:\n  name: source-probe\n  version: 1.0.0\ncontext:\n  include: [{}context.txt]\n",if case=="context-include-leading-slash" {"/"}else{""})
+            } else {
+                format!(
+                    "bundle:\n  name: source-probe\n  version: 1.0.0\ncontext:\n  probe: {}\n",
+                    serde_json::to_string(&context_reference).unwrap()
+                )
+            };
             let document = if case.starts_with("markdown-") {
                 format!("---\n{header}---\n# Native retained instructions\nplain body source\n")
             } else {
@@ -1730,7 +1736,7 @@ async def consume():
     bundle = await load_bundle(selected, registry=BundleRegistry(strict=True))
     phase = 'native_context_resolution'
     bundle.resolve_pending_context()
-    resource = Path(bundle.context['probe'])
+    resource = Path(bundle.context.get('probe') or next(iter(bundle.context.values())))
     phase = 'native_context_read'
     data = resource.read_bytes()
     body_digest = None

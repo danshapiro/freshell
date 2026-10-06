@@ -154,62 +154,81 @@ pub(super) fn prepare(
                 .and_then(|node| node.data.as_mapping())
             {
                 for (name, node) in context {
-                    if name.data.as_str() == Some("include") {
-                        continue;
-                    }
-                    let Some(value) = node.data.as_str() else {
-                        continue;
-                    };
-                    let path = Path::new(value);
-                    let selected = if path.is_absolute() {
-                        path.to_owned()
+                    let include = name.data.as_str() == Some("include");
+                    let entries = if include {
+                        node.data
+                            .as_sequence()
+                            .ok_or("Amplifier context.include must be a sequence")?
+                            .as_slice()
                     } else {
-                        root.join(path)
+                        std::slice::from_ref(node)
                     };
-                    let independent = path.is_absolute()
-                        || path
-                            .components()
-                            .any(|component| matches!(component, std::path::Component::ParentDir));
-                    let destination = if independent {
-                        PathBuf::from(format!(
-                            ".freshell/resources/amplifier-context-{}",
-                            result.selections.len()
-                        ))
-                    } else {
-                        relative.join(path)
-                    };
-                    if independent {
-                        let runtime = Path::new("/home/freshell/provider").join(&destination);
-                        let replacement = serde_json::to_string(
-                            runtime
-                                .to_str()
-                                .ok_or("Amplifier context destination is not UTF-8")?,
-                        )
-                        .map_err(|_| "Amplifier context destination could not be encoded")?;
-                        let start = header_offset
-                            .checked_add(source_offset(yaml, node.span.start)?)
-                            .ok_or("Amplifier Markdown source offset overflow")?;
-                        let end = header_offset
-                            .checked_add(source_offset(yaml, node.span.end)?)
-                            .ok_or("Amplifier Markdown source offset overflow")?;
-                        bundle_replacements.push((start, end, replacement));
+                    for node in entries {
+                        let Some(value) = node.data.as_str() else {
+                            continue;
+                        };
+                        let value = if include {
+                            value.trim_start_matches('/')
+                        } else {
+                            value
+                        };
+                        if include && value.contains(':') {
+                            return Err("Amplifier namespace context requires its retained source-base projection".into());
+                        }
+                        let path = Path::new(value);
+                        let selected = if path.is_absolute() {
+                            path.to_owned()
+                        } else {
+                            root.join(path)
+                        };
+                        let independent = path.is_absolute()
+                            || path.components().any(|component| {
+                                matches!(component, std::path::Component::ParentDir)
+                            });
+                        if include && independent {
+                            return Err("Amplifier context.include outside its source base requires an independent namespace projection".into());
+                        }
+                        let destination = if independent {
+                            PathBuf::from(format!(
+                                ".freshell/resources/amplifier-context-{}",
+                                result.selections.len()
+                            ))
+                        } else {
+                            relative.join(path)
+                        };
+                        if independent {
+                            let runtime = Path::new("/home/freshell/provider").join(&destination);
+                            let replacement = serde_json::to_string(
+                                runtime
+                                    .to_str()
+                                    .ok_or("Amplifier context destination is not UTF-8")?,
+                            )
+                            .map_err(|_| "Amplifier context destination could not be encoded")?;
+                            let start = header_offset
+                                .checked_add(source_offset(yaml, node.span.start)?)
+                                .ok_or("Amplifier Markdown source offset overflow")?;
+                            let end = header_offset
+                                .checked_add(source_offset(yaml, node.span.end)?)
+                                .ok_or("Amplifier Markdown source offset overflow")?;
+                            bundle_replacements.push((start, end, replacement));
+                        }
+                        if result.selections.len() >= 8192 {
+                            return Err("Amplifier source selection event budget exceeded".into());
+                        }
+                        let canonical_context = std::fs::canonicalize(&selected).map_err(|_| {
+                            "Amplifier selected context is missing, inaccessible or cyclic"
+                        })?;
+                        if excluded
+                            .iter()
+                            .any(|path| canonical_context.starts_with(path))
+                        {
+                            return Err("Amplifier selected context aliases credentials or native state; use the approved private grant source".into());
+                        }
+                        result.selections.push(CopySelection {
+                            source: selected,
+                            destination_relative: destination,
+                        });
                     }
-                    if result.selections.len() >= 8192 {
-                        return Err("Amplifier source selection event budget exceeded".into());
-                    }
-                    let canonical_context = std::fs::canonicalize(&selected).map_err(|_| {
-                        "Amplifier selected context is missing, inaccessible or cyclic"
-                    })?;
-                    if excluded
-                        .iter()
-                        .any(|path| canonical_context.starts_with(path))
-                    {
-                        return Err("Amplifier selected context aliases credentials or native state; use the approved private grant source".into());
-                    }
-                    result.selections.push(CopySelection {
-                        source: selected,
-                        destination_relative: destination,
-                    });
                 }
             }
             {
